@@ -19,6 +19,7 @@ through a bit-sliced SIMD filter index rather than a B-tree.
 | | |
 |---|---|
 | **PostgreSQL wire protocol** | Simple and extended query protocols, bound parameters, SCRAM-SHA-256, TLS. Drivers and ORMs work as-is — see [SQL surface](#sql-surface) |
+| **Type system** | 40 PostgreSQL types, including intervals, MAC and bit strings, the seven geometric types and the six ranges — each with its real wire OID |
 | **Transactions** | MVCC snapshots, `READ COMMITTED` / `REPEATABLE READ`, savepoints, first-updater-wins conflicts |
 | **Durability** | Write-ahead log with checkpoints, and a `synchronous_commit` knob with the trade stated exactly |
 | **Filter index** | Bit-sliced fingerprints, 512 rows per SIMD register, plus zone maps for ranges. Adaptive and runtime-tunable |
@@ -26,7 +27,9 @@ through a bit-sliced SIMD filter index rather than a B-tree.
 | **JSON** | Documents stored as binary values, with path indexing |
 | **Replication** | Multi-primary, statement-shipping, HLC-ordered, over TLS 1.3 |
 | **Backup** | Snapshot and point-in-time recovery to any S3-compatible store |
+| **Branches** | A database copied live (or from a past point), then reset, promoted, diffed and three-way merged back |
 | **Storage pools** | One database across several directories, with a placement policy and mirrored backups |
+| **Key/value storage** | A database kept in an object store instead of files, per table, alongside file and in-memory tables |
 | **PostgreSQL import** | One-shot migration of a live PostgreSQL database |
 | **rdb_studio** | A desktop console that also speaks to PostgreSQL |
 
@@ -36,7 +39,18 @@ deliberately not built.
 
 ### Guide on how to run
 
-rasterizeddb_server-PLATFORM-x64.exe --location /your-location/bla-bla --concurrent_threads 16 --batch_size 16000
+Download the archive for your platform from the [releases](https://github.com/milen-denev/rasterizeddb/releases) (tags `v*`):
+
+| Platform | Archive | CPU |
+|---|---|---|
+| Linux x86-64 | `rasterizeddb-server-<version>-linux-x86_64.tar.gz` | x86-64-v3 (AVX2: Intel Haswell / AMD Excavator or later) |
+| Linux ARM64 | `rasterizeddb-server-<version>-linux-arm64.tar.gz` | any ARMv8-A (Graviton, Ampere, Raspberry Pi 4/5, ...) |
+| Windows x86-64 | `rasterizeddb-server-<version>-windows-x86_64.zip` | x86-64-v3 (AVX2) |
+| Windows ARM64 | `rasterizeddb-server-<version>-windows-arm64.zip` | any ARMv8-A (Snapdragon X, ...) |
+
+Linux builds need glibc 2.39 or newer. Unix sockets (`--rdb-socket`, `--pg-socket`, peer authentication) exist on Linux only; on Windows use TCP.
+
+rasterizeddb --location /your-location/bla-bla --concurrent_threads 16 --batch_size 16000
 
 *batch_size*: recommended value is 16K, but you can play around with more or less depending on your case. The lesser the number of rows, the lower the batch size must be.
 *concurrent_threads*: must equal to the number of CPU threads of lower.
@@ -48,15 +62,24 @@ does not carry its code, its dependencies, or its match arms. The current
 default set turns most of them on:
 
 ```toml
-default = ["memory_pool_reuse", "replication_compression",
-           "s3_backup", "pg_import", "storage_pools"]
+default = ["memory_pool_reuse", "replication_compression", "s3_backup",
+           "pg_import", "storage_pools", "kv_storage", "kv_storage_s3",
+           "query_stats", "kv_cache", "persistent_indexes", "mysql_wire",
+           "mssql_wire", "db_branching"]
 ```
 
 | Feature | Default | What it adds |
 |---|---|---|
-| `s3_backup` | on | Backup, restore and PITR to an object store, and the `BACKUP`/`RESTORE` statements |
+| `s3_backup` | on | Backup, restore and PITR to an object store, and the `BACKUP`/`RESTORE` statements. Implies `storage_pools` |
 | `pg_import` | on | The PostgreSQL frontend client and `IMPORT DATABASE FROM POSTGRES` |
 | `storage_pools` | on | Multi-directory placement, mirroring, and the `STORAGE` statements |
+| `kv_storage` | on | A table kept in a key/value store rather than in files, and the `kv:` placement spec. Implies `storage_pools` |
+| `kv_storage_s3` | on | The S3 backing store for `kv_storage`. Implies `kv_storage` and `s3_backup` |
+| `kv_cache` | on | A Redis-compatible key/value store: `KV …` statements, and the Redis protocol on `--kv-port` |
+| `mysql_wire` | on | The MySQL / MariaDB client protocol on `--mysql-port` / `--mysql-socket` |
+| `mssql_wire` | on | The SQL Server (TDS) client protocol on `--mssql-port` / `--mssql-socket` |
+| `query_stats` | on | `SHOW QUERIES`, `SHOW QUERY STATS` and `pg_stat_statements` |
+| `db_branching` | on | `CREATE BRANCH`, `RESET`/`PROMOTE`/`DROP BRANCH`, `SHOW BRANCH DIFF`, `MERGE BRANCH`, `AS OF`. Implies `s3_backup` |
 | `replication_compression` | on | Zstd on replication links; a node without it still interoperates, uncompressed |
 | `memory_pool_reuse` | on | Thread-local free lists in the buffer pool |
 | `enable_long_row` | off | Rows above the standard width cap |
@@ -105,6 +128,81 @@ Authentication defaults to SCRAM-SHA-256; `--pg-auth` also accepts `md5`,
 `password` and `trust`. Both the simple and the extended query protocols are
 implemented, which is what lets prepared statements and ORMs work.
 
+`--protocol both` serves this and the native protocol (`rasterizeddb_client`)
+from one process, on one catalogue. The `--pg-*` flags configure this listener
+and `--rdb-*` the native one (`--rdb-addr 0.0.0.0 --rdb-port 61170` to reach it
+from another host). The two share the role catalogue, which is seeded from
+`--pg-user`/`--pg-password`, so the same role logs in on either; the native
+protocol answers SCRAM only, so keep `--pg-auth scram-sha-256` there. A
+native connection uses `--pg-default-db` unless its client names another
+database (`Options::database`); as on pgwire, a login is checked against the
+roles of the database it names.
+
+### MySQL and SQL Server network compatibility
+
+Beside PostgreSQL, the server speaks the **MySQL / MariaDB** client protocol
+and the **SQL Server** protocol (TDS 7.4, and TDS 8.0's TLS-first mode). Each
+is off until it is given a port or a unix socket, and all of them run at once,
+on the same databases and the same roles:
+
+```sh
+cargo run -p rasterizeddb_core -- --location <PATH> --protocol all \
+    --pg-port 5432 --pg-password <password> \
+    --mysql-port 3306 --mysql-socket /run/rdb/mysql.sock \
+    --mssql-port 1433
+
+mysql -h 127.0.0.1 -P 3306 -u rasterized -p postgres
+sqlcmd -S 127.0.0.1,1433 -U rasterized -P <password> -d postgres -C
+```
+
+`--protocol all` (or `both`) also serves the native protocol beside pgwire.
+A MySQL "database" and a SQL Server database are the engine's databases;
+`master` (and the other SQL Server system databases) is the default one.
+
+| Flag | Default | |
+|---|---|---|
+| `--mysql-port`, `--mssql-port` | off | TCP port to serve on |
+| `--mysql-addr`, `--mssql-addr` | `127.0.0.1` | Address to listen on |
+| `--mysql-socket`, `--mssql-socket` | off | Unix socket (`--socket-mode`, `--socket-group` apply) |
+| `--mysql-auth`, `--mssql-auth` | `password` | `password` or `trust` |
+| `--mysql-socket-auth`, `--mssql-socket-auth` | the TCP method | Authentication on the socket |
+| `--mysql-tls`, `--mssql-tls` | `prefer` | `disable`, `prefer` or `require` |
+| `--mysql-cert`/`--mysql-key`, `--mssql-cert`/`--mssql-key` | `--pg-cert`/`--pg-key`, else self-signed | TLS certificate |
+
+Logins are checked against the role catalogue the PostgreSQL listener uses
+(`CREATE USER` there, or over any protocol). MySQL clients authenticate with
+`caching_sha2_password`, MySQL 8's default: a role's first login sends its
+password over TLS (or the unix socket), later ones use the fast scramble. SQL
+Server clients use SQL Server authentication; Windows authentication is not
+offered.
+
+Each connection is translated onto an engine session, so transactions,
+isolation, prepared statements and cancellation behave as they do over
+PostgreSQL. Both dialects are rewritten into the engine's: MySQL's backticks,
+`LIMIT a, b`, `AUTO_INCREMENT`, `ON DUPLICATE KEY UPDATE`, `INSERT IGNORE`,
+`SHOW …`, `@@variables` and functions; T-SQL's `[brackets]`, `TOP`,
+`OFFSET … FETCH`, `IDENTITY`, `OUTPUT INSERTED`, `+` concatenation, batches
+with variables, `IF`/`WHILE`/`TRY…CATCH`, `sp_executesql` and the RPC calls
+drivers make, and the `sys.*` / `INFORMATION_SCHEMA` views. An error inside a
+transaction fails only its statement, as in both of those databases.
+
+What the engine does not have, the front ends keep: stored procedures (T-SQL
+and MySQL's language, with cursors and handlers), temporary tables (`#t`,
+table variables, `CREATE TEMPORARY TABLE`), cursors (T-SQL's and MySQL's
+`COM_STMT_FETCH`), T-SQL's `MERGE`, `FOR JSON` / `FOR XML PATH`, bulk load
+(`SqlBulkCopy`), MySQL's `LOAD DATA LOCAL INFILE` and
+`ON UPDATE CURRENT_TIMESTAMP`. See
+[docs/mysql-and-sql-server.md](docs/mysql-and-sql-server.md) for what each
+dialect is translated into, and what is refused rather than answered
+differently.
+
+Verified with the `mysql` 8.4 and `mariadb` 11.4 clients, a `mysqldump`
+loaded as is, sqlx-mysql, SQLAlchemy 2 + PyMySQL, Microsoft.Data.SqlClient,
+Dapper, EF Core 10, tiberius and ODBC `sqlcmd`. Text compares as bytes (the
+servers report `utf8mb4_bin` / `Latin1_General_BIN2`), not case-insensitively.
+See [`docs/mysql-and-sql-server.md`](docs/mysql-and-sql-server.md) for what is
+translated, what is refused, and why.
+
 ### SQL surface
 
 The dialect is PostgreSQL's. What is implemented:
@@ -113,7 +211,12 @@ The dialect is PostgreSQL's. What is implemented:
   case-insensitive resolution, arithmetic, `SELECT DISTINCT`.
 - **Filtering** — every comparison operator on every scalar type, `AND`/`OR`
   with parentheses, `IN`, `NOT IN`, `BETWEEN`, `LIKE` and `ILIKE` with the full
-  pattern language.
+  pattern language, and `SIMILAR TO` with alternation, grouping, quantifiers
+  and bracket expressions.
+- **Structural operators** — `@>`, `<@` and `&&` over documents, arrays, ranges
+  and geometry; `<<`, `<<=`, `>>` and `>>=` over networks; `@@` for text search.
+  An operator with no meaning for its operands is an **error**, not `false` —
+  answering `false` would drop every row and look like an empty table.
 - **Joins** — `INNER` and `LEFT JOIN`, any number of relations, aliases, and
   **composite keys** (`ON a.x = b.x AND a.y = b.y`), which every junction table
   needs. Executed as a hash join over materialised rows, each relation scanned
@@ -122,9 +225,19 @@ The dialect is PostgreSQL's. What is implemented:
 - **Aggregates** — `COUNT`, `SUM`, `MIN`, `MAX`, `AVG` with `GROUP BY` and
   `HAVING`, over a single table or a join. `SUM` and `AVG` over an exact type
   stay exact, so a money column keeps its cents.
-- **Window functions** — `ROW_NUMBER() OVER (PARTITION BY … ORDER BY …)`. Not an
-  aggregate: every row survives and gains a column computed from the rows
-  around it.
+- **Window functions** — the ranking calls (`ROW_NUMBER`, `RANK`, `DENSE_RANK`,
+  `PERCENT_RANK`, `CUME_DIST`), the value calls (`LAG`, `LEAD`, `FIRST_VALUE`,
+  `LAST_VALUE`, `NTH_VALUE`) and the aggregates over a window, with `ROWS` and
+  `RANGE` frames. Not an aggregate: every row survives and gains a column
+  computed from the rows around it. The default frame follows PostgreSQL's, so
+  `SUM(x) OVER (ORDER BY t)` is a running total and `SUM(x) OVER ()` is the
+  partition total.
+- **Full-text search** — `to_tsvector`, `to_tsquery`, `plainto_tsquery`,
+  `phraseto_tsquery`, `websearch_to_tsquery`, `ts_rank` and `@@`, with
+  PostgreSQL's `english` stop-word list and Snowball stemmer, so a query for
+  `runs` finds a document that said `running`. `CREATE INDEX … USING gin
+  (to_tsvector('english', title || ' ' || body))` indexes it: a match over
+  any of those columns in that configuration is answered from the index.
 - **CTEs** — `WITH name AS (SELECT …)`, materialised, which gives PostgreSQL's
   pre-12 semantics: an optimisation fence, evaluated once however many times it
   is referenced.
@@ -137,15 +250,49 @@ The dialect is PostgreSQL's. What is implemented:
   `DELETE`, `DELETE … USING`, `ON CONFLICT DO UPDATE`, and `RETURNING` on all of
   them — where a returned item may be an expression, not only a column.
 - **Expressions** — `CASE WHEN`, `COALESCE`, `NULLIF`, `LEAST`, `GREATEST`,
-  `MOD`, and `::` casts, in projections, predicates and `RETURNING`.
+  `MOD`, `array_length`, `array_ndims`, and `::` casts — over a column as well
+  as a literal — in projections, predicates and `RETURNING`.
+- **Interval arithmetic** — `timestamp - timestamp` is an `interval`, and
+  `timestamp ± interval` moves the **calendar**: 31 January plus a month is
+  28 February, not 3 March.
 - **Constraints** — `NOT NULL`, defaults (kept as text, so
-  `DEFAULT CURRENT_TIMESTAMP` means the time of the insert), primary keys,
-  single- and multi-column `UNIQUE`, and foreign keys, which are **enforced**
-  rather than merely accepted.
+  `DEFAULT CURRENT_TIMESTAMP` means the time of the insert, and likewise
+  `clock_timestamp()`, `CURRENT_DATE` and `CURRENT_TIME`), primary keys,
+  single- and multi-column `UNIQUE`, foreign keys, and `CHECK` — all
+  **enforced** rather than merely accepted. A `CHECK` that evaluates to NULL
+  passes, which is PostgreSQL's rule and the opposite of a `WHERE` clause.
+- **Generated columns** — `GENERATED ALWAYS AS (…) STORED`, computed from the
+  row as it will be stored, so it sees the values defaults filled in. A
+  client-supplied value for one is refused, as PostgreSQL refuses it.
+- **Serial columns** — `SERIAL`, `SMALLSERIAL` and `BIGSERIAL`, expanded to
+  what PostgreSQL expands them to: an integer column, `NOT NULL`, defaulting to
+  the next value of a sequence made with the table. As in PostgreSQL, a value
+  written explicitly into the column does not advance the sequence, so a later
+  default can repeat it. After a restart a plain table's sequence resumes above
+  the largest value stored, while a hash-partitioned table's resumes from a
+  durable reservation: exactly after a clean shutdown, and up to 1,024 values
+  further after a crash (a gap, as PostgreSQL's sequences leave). Only the
+  table whose `SERIAL` made the sequence reserves it: a second table that shares
+  it through a hand-written `DEFAULT nextval('…')` does not.
 - **DDL** — `CREATE`/`DROP TABLE`, `CREATE DATABASE`, `ALTER TABLE` including
   `ADD`/`DROP`/`RENAME COLUMN` and `ALTER … TYPE … USING`.
 - **Catalogue** — PostgreSQL's catalogue relations are produced on demand when a
   statement names one, so tools that introspect `pg_catalog` work.
+- **`pg_stat_statements`** — the same view PostgreSQL's extension provides,
+  built from the engine's own statement log, plus a `rows_scanned` column
+  PostgreSQL has no counterpart for.
+
+The notable gaps, each pinned by a test in `rasterizeddb_compat` that names it
+rather than being left to be discovered:
+
+- `LATERAL` set-returning functions in `FROM`, and `WITH ORDINALITY`.
+- Function calls inside a `WHERE` clause. The scan's comparison path takes
+  column bytes and literals and has nowhere to evaluate an expression per row —
+  which is why `to_tsvector(…)` works in a select list but not in a predicate.
+- A join `ON` that is an `OR` of predicates.
+- The `jsonb_path_query` family, and multi-dimensional array subscripts.
+
+`cargo test -p rasterizeddb_compat -- --ignored` runs them as a work list.
 
 See [docs/postgres-compatibility.md](docs/postgres-compatibility.md) for the
 type mapping, the exact semantics, and what is not supported.
@@ -202,6 +349,21 @@ replay stops at the first one it cannot read whole, so what is lost is whole
 transactions off the end of the log, never half of one. It is a durability
 knob, not a consistency one.
 
+### Indexes
+
+`CREATE INDEX` builds a real B-tree or hash index over one or more columns,
+and every `PRIMARY KEY`, `UNIQUE` column and composite unique constraint gets
+one implicitly. With no `USING`, the method is chosen from the column types:
+a hash where only equality is ever asked (UUID, JSONB), a B-tree everywhere
+else. A query uses an index for `=`, `IN`, ranges, `BETWEEN` and prefix
+`LIKE`, and a `UNIQUE` check probes it rather than scanning. Point reads by
+primary key are 5–6.6× faster than without, and upserts 4.8×.
+
+An index may only ever return too much, never too little: the scan rechecks
+every candidate. An end-to-end test runs an indexed and an unindexed table
+through the same random writes and requires identical answers. See
+[docs/indexes.md](docs/indexes.md).
+
 ### The filter index
 
 Scans are pruned by a bit-level index rather than a B-tree. It is a positional
@@ -252,6 +414,24 @@ VACUUM FULL;        -- compact in place and return space to the filesystem
 SHOW TABLE STATS users;   -- includes how much is reclaimable
 ```
 
+Pointer slots are given back only by `VACUUM FULL`, so a background task runs
+it on a table or partition whose slots are mostly dead: at least 2 048 slots,
+and either 8× its live rows or a quarter dead (the latter up to 131 072 slots,
+so it never stops a large table for long), each at most once per 10 minutes,
+skipping one that is in use. Every threshold is a hot `SET CONFIG` key and a
+flag:
+
+```sql
+SET CONFIG auto_compact.dead_fraction = 0.3;   -- also enabled, interval_secs,
+                                               -- min_slots, ratio, cooldown_secs,
+                                               -- dead_fraction_max_slots
+```
+
+```sh
+rasterizeddb_core --location <PATH> --auto-compact on --auto-compact-min-slots 4096 \
+    --auto-compact-dead-fraction 0.3 --auto-compact-cooldown-secs 900
+```
+
 See [docs/space-reclamation.md](docs/space-reclamation.md).
 
 ### JSON documents
@@ -271,8 +451,10 @@ adding a second index structure.
 
 ### Native protocol authentication
 
-The native protocol — what `DbClient` speaks — reads the same role catalogue as
-pgwire, so one `CREATE USER` works for both:
+The native protocol reads the same role catalogue as pgwire, so one
+`CREATE USER` works for both. Its client is the
+[`rasterizeddb_client`](rasterizeddb_client) crate, which does not compile the
+engine:
 
 ```sh
 cargo run -p rasterizeddb_core -- --location <PATH> \
@@ -280,8 +462,45 @@ cargo run -p rasterizeddb_core -- --location <PATH> \
 ```
 
 ```rust
-let client = DbClient::new_authenticated(Some("127.0.0.1"), "superuser", "<password>").await?;
+use rasterizeddb_client::{Client, Login, Options};
+
+let client = Client::connect(
+    "127.0.0.1:61170",
+    Options {
+        login: Login::password("superuser", "<password>"),
+        ..Options::default()
+    },
+)
+.await?;
 ```
+
+`Login::Password` runs SCRAM-SHA-256 bound to the connection, so the password
+never crosses the wire, and it refuses a server that lets the connection in
+without proving it holds the verifier. On a unix socket (`--rdb-socket`),
+`Login::Peer` logs in as the operating-system user, and `Login::Trust` sends no
+credentials.
+
+`Options::database` picks the database, as the `/name` of a PostgreSQL URL
+does. Password and peer logins name it in the login and are checked against
+that database's roles; a trust connection selects it with its first request.
+Every connection the client opens uses it, a reopened one and each
+transaction's included. A name that does not exist fails `connect` (3D000),
+and so does a server too old to select a database: neither quietly gives you
+the default database.
+
+TCP is TLS. The server makes itself a self-signed certificate at every start
+unless given one with `--rdb-cert`/`--rdb-key`; a client that should verify it
+sets `Options::trust` (`rasterizeddb_client::load_ca("ca.pem")?` for a private
+CA, `Trust::WebPki` for a public one). The default encrypts without
+authenticating the server.
+
+The client shares its connections (`Options::connections`, one by default)
+between all the statements in flight, which is the faster arrangement whenever
+more than one is: 4 concurrent callers ran 12% more point queries a second over
+one shared connection than over a pool of their own, and 128 ran 33% more. A
+statement that fails in transit (a dropped connection, a timeout) is reported,
+never sent again: the server may already have carried it out, and a repeated
+`INSERT` is a duplicate row.
 
 Prefer the `RASTERIZEDDB_PASSWORD` environment variable to `--rdb-password`: a
 password on the command line is visible in `ps` to every other user on the
@@ -311,6 +530,47 @@ loopback listener accepts any caller and says so loudly at start-up: a database
 nobody can open is not a secure database. It starts requiring a password the
 moment there is one to require, and never stops again.
 
+### Unix sockets
+
+Every listener can also be served on a unix socket, for clients on the same
+machine, and its TCP port can be turned off. On a socket there is no TCP stack
+and no TLS: only root can watch a local socket, and who may connect is decided
+by the socket file's permissions and group.
+
+| Listener | Socket | Turn TCP off | How callers on the socket log in |
+|---|---|---|---|
+| Native (`rasterizeddb_client`) | `--rdb-socket PATH` | `--rdb-tcp off` | `--rdb-socket-auth` (defaults to `--rdb-auth`) |
+| Redis protocol | `--kv-socket PATH` | leave out `--kv-port` | `--kv-auth` |
+| PostgreSQL | `--pg-socket-dir DIR` | `--pg-tcp off` | `--pg-socket-auth` (defaults to `--pg-auth`) |
+
+`--pg-socket-dir` creates `DIR/.s.PGSQL.<pg-port>`, the name every PostgreSQL
+client looks for: `psql "host=DIR port=5432"`, tokio-postgres's `host_path`,
+sqlx's `socket`, and rdb_studio with the directory as its host. A TLS request
+there is answered "no" whatever `--pg-tls` says, as PostgreSQL does, so the
+default `--pg-tls require` applies to TCP only.
+
+`--socket-mode` (octal, default `600`: this server's user only) and
+`--socket-group NAME` apply to every socket. Connecting needs write permission,
+so `--socket-mode 660 --socket-group app` admits the members of `app`, which is
+how a service running as another user is given access.
+
+- **`peer`**, offered on sockets only: a role may log in without a password when
+  its name is the operating-system user connecting, which the kernel reports.
+  The role must exist and be allowed to log in.
+- **`trust`** is allowed on a socket only when its mode admits nobody outside
+  its owner and group (`660` yes, `666` no), as it is allowed on TCP only on
+  loopback.
+- A socket file left behind by a server that did not shut down is replaced at
+  start-up. One another server is listening on, or a path that is not a socket,
+  is refused rather than taken. The file is removed at shutdown.
+- A socket's path has to fit a socket address: about 107 bytes on Linux.
+
+Measured on one machine with 64-byte requests, a unix socket doubled the
+requests one connection could carry (81,000 to 160,000 a second, median
+latency 12 µs to 5 µs). A single point query's median latency fell from 67 µs
+to 56 µs. Under heavy concurrent load the query engine, not the transport, is
+the limit, and the two perform the same.
+
 ### rdb_studio — the desktop console
 
 A pgAdmin-style console for RasterizedDB, written in [iced](https://iced.rs).
@@ -322,10 +582,11 @@ cargo run -p rdb_studio -- my-profile  # open a saved one straight away
 ```
 
 Live dashboard, database and table statistics, a schema map drawn from the
-foreign keys, an editable data browser, a SQL editor, S3 backup and restore, a
-storage view for placing tables across disks, a replication view, and a
-configuration screen that knows which settings a running server can actually
-change. See [rdb_studio/README.md](rdb_studio/README.md).
+foreign keys, an editable data browser, a SQL editor, an activity screen showing
+what the server has been running and how much of each table it had to read, S3
+backup and restore, a storage view for placing tables across disks, a
+replication view, and a configuration screen that knows which settings a running
+server can actually change. See [rdb_studio/README.md](rdb_studio/README.md).
 
 It reads the introspection statements the engine gained for it —
 `SHOW TABLES`, `SHOW DATABASE STATS`, `SHOW SCHEMA MAP`, `SHOW CONFIG`,
@@ -333,13 +594,17 @@ It reads the introspection statements the engine gained for it —
 
 ```sql
 SHOW DATABASE STATS;
-SHOW TABLES;
+SHOW TABLES;                  -- with a storage column: memory, file, s3, ...
 SHOW TABLE STATS users;
 SHOW COLUMNS FROM users;      -- or DESCRIBE users
 SHOW SCHEMA MAP;
 SHOW DATABASES;
 SHOW CONFIG;                  -- with a hot_reload column per setting
 SET CONFIG filter.max_f = 14; -- applied live
+SHOW QUERIES;                 -- the last statements, with time and rows scanned
+SHOW QUERIES 20;              -- just the last twenty
+SHOW QUERY STATS;             -- one row per statement shape, slowest first
+RESET QUERY STATS;            -- forget both
 SHOW BACKUP STATUS;           -- configured? healthy? how far can a restore reach?
 SHOW REPLICATION STATS;       -- node state and counters, as rows
 SHOW REPLICATION PEER STATUS; -- a row per peer
@@ -456,13 +721,36 @@ STORAGE REBALANCE DRY RUN;                -- what it would move, and why
 STORAGE REBALANCE;                        -- do it
 STORAGE DROP LOCATION '/mnt/nvme1';       -- refused while it still holds tables
 
-SHOW STORAGE;                             -- a line per location, with free space
+SHOW STORAGE;                             -- a line per location and store, with free space
 SHOW STORAGE STATS;                       -- pool-wide figures as columns
 SHOW STORAGE LOCATIONS;                   -- a row per location
+SHOW STORAGE STORES;                      -- a row per key/value store
 SHOW STORAGE PLACEMENTS;                  -- which directory each table is in
 SHOW STORAGE POLICY;
 SHOW STORAGE KEYS;
 ```
+
+A directory is not the only thing a table can sit on. An object store is defined
+by statement too, and then a table is placed on it or converted onto it:
+
+```sql
+STORAGE ADD STORE archive S3 WITH (
+    ENDPOINT          = 'https://s3.us-east-1.amazonaws.com',
+    BUCKET            = 'my-bucket',
+    PREFIX            = 'rdb/archive',
+    ACCESS_KEY_ID     = 'AKIA...',        -- or leave both out and it signs with
+    SECRET_ACCESS_KEY = '...');           -- the server's AWS_* environment
+
+STORAGE PLACE TABLE events AT 'kv:archive';   -- before CREATE TABLE
+STORAGE MOVE TABLE orders TO 'kv:archive';    -- ... or convert one that exists
+STORAGE MOVE TABLE orders TO 'memory:';       -- files, memory, kv, S3: one statement
+STORAGE MOVE TABLE orders TO '/mnt/nvme2';    -- and back
+```
+
+The copy is provider to provider, so every pairing of backends is the same
+operation. What differs is what the table gains or loses by arriving — backups,
+the write-ahead log, the free-space policy are features about *files* — and each
+move says which. See [docs/kv-storage.md](docs/kv-storage.md).
 
 Unlike the replication statements, these are **persisted**: where each table
 lives is recorded in `db_storage.cfg` in the database directory, and a location
@@ -486,6 +774,52 @@ PostgreSQL has no placement policy to change.
 See [docs/storage-pools.md](docs/storage-pools.md) for the on-disk format, what
 a crash leaves behind at each step, and what a mirrored backup does and does not
 guarantee.
+
+### Key/value storage
+
+Off by default (`kv_storage`, and `kv_storage_s3` for the S3 backing store). A
+whole second storage backend — chunked objects, a delta log, a page cache and a
+compactor — so a build that only ever writes files does not carry it or the
+extra match arm on every storage call.
+
+Placement is **per table**, so one database can hold file, in-memory and
+object-store tables side by side. A table's spec in `db_storage.cfg` widens
+from a directory path to a backend:
+
+```sql
+STORAGE PLACE TABLE events AT 'kv:archive';
+STORAGE PLACE TABLE scratch AT 'memory:';
+STORAGE PLACE TABLE orders  AT '/mnt/nvme1';
+```
+
+A non-file table gets **no file-based features**: no backup, no relocation, no
+WAL, and the free-space policy skips it. Those are guards rather than
+omissions — a snapshot logs what it excluded instead of quietly leaving it out.
+
+See [docs/kv-storage.md](docs/kv-storage.md) for the object layout, the
+compactor, and the two limits stated rather than left implicit: one writer per
+store prefix, and no local disk cache tier.
+
+### Redis-compatible key/value store
+
+The `kv_cache` feature, in the default build and dormant until used. Any Redis
+client connects to `--kv-port` unchanged: RESP2 and RESP3, pipelining,
+`MULTI`/`EXEC`/`WATCH`, pub/sub, blocking list pops, 16 databases, and 157
+commands across strings, hashes, lists, sets and sorted sets. `AUTH` checks the
+database's own roles. The same store answers SQL on the PostgreSQL port:
+
+```sql
+KV SET session:42 '{"user":7}' EX 3600;
+KV GET session:42;
+KV ZRANGE board 0 9 REV WITHSCORES;   -- (member, score) rows
+```
+
+It runs every core where Redis runs one: 1024 lock-striped shards, each command
+atomic on its key, and multi-key commands and `EXEC` atomic across theirs.
+`maxmemory` and Redis's eviction policies bound it, and `SAVE` and
+`--kv-persist` snapshot it. See [docs/kv-cache.md](docs/kv-cache.md) for the
+command list, what is not implemented, the design, and measurements against
+Redis and Valkey.
 
 ### S3 backup and point-in-time recovery
 
@@ -525,6 +859,34 @@ rasterizeddb_core --location /var/lib/rasterized \
 `--restore-replace` renames the existing directory aside rather than deleting
 it. See [docs/s3-backup.md](docs/s3-backup.md) for the design, the full flag
 list, and what it costs in API requests.
+
+### Database branches
+
+A branch is a database made as a consistent copy of another while it keeps
+taking writes, which then diverges from it:
+
+```sql
+CREATE BRANCH dev FROM prod;                 -- or CREATE DATABASE dev TEMPLATE prod
+CREATE BRANCH yesterday FROM prod AS OF TIMESTAMP '2026-11-18 09:00+00';  -- from the S3 backup
+SHOW BRANCHES;
+SHOW BRANCH DIFF dev;                        -- what a merge would do, per table
+MERGE BRANCH dev;                            -- ON CONFLICT FAIL | BRANCH WINS | PARENT WINS, ALLOW DROP
+RESET BRANCH dev;                            -- copy the parent again
+PROMOTE BRANCH dev;                          -- swap it in under the parent's name
+DROP BRANCH dev;
+```
+
+Clients connect to a branch by name. Files are cloned where the filesystem
+shares blocks (btrfs, XFS) and copied in full elsewhere; each branch also keeps
+a merge base, a copy of itself as made, unless created `WITHOUT BASE`. A merge
+replays the schema changes the branch recorded, then compares rows three ways
+and writes them to the parent in one transaction, a page at a time; any
+conflict fails it whole by default. Rows the branch inserted under a `SERIAL`
+key take new numbers from the parent's sequence, with their references. A
+branch can be branched again (`CREATE BRANCH feature FROM dev`); dropping a
+middle branch moves its branches to its parent. Tables on a key/value store
+come over as the branch's own. rdb_studio has a BRANCHES tab, with the tree,
+for all of it. See [docs/branching.md](docs/branching.md).
 
 ### Importing a PostgreSQL database
 
@@ -589,7 +951,7 @@ full grammar, and what it does not do.
 
 ### Guide on how to run the client-side
 
-Refer to *test_client/src/main.rs* for examples! 
+The native-protocol client SDK is [`rasterizeddb_client`](rasterizeddb_client/README.md) on crates.io: typed queries, transactions, an ORM, migrations and the key/value API. Any PostgreSQL, MySQL or SQL Server driver works against the matching listener too.
 
 ### Vision
 
@@ -639,12 +1001,18 @@ An official Rust ORM is in development, with a C# ORM planned afterward. These t
 #### Stability
 Currently, Rasterized DB is not stable. Table formats, storage engines, and query processing internals are likely to change until version 1.0.0. Use it at your own risk in production environments.
 
-### How to use the current API?
+### Running the database inside a Rust application
+
+[`rasterizeddb_embedded`](rasterizeddb_embedded/README.md) runs the whole engine in-process and hands you a `rasterizeddb_client::Client` for it:
 
 ```rust
-// COMING SOON
-// Please refer to the main.rs and core/mock_table.rs and core/mock_helpers.rs to see API in use.
+let db = rasterizeddb_embedded::Builder::open("./data").start().await?;
+let client = db.connect().await?;
+client.execute("CREATE TABLE IF NOT EXISTS notes (id BIGINT, body TEXT)", &[]).await?;
+db.shutdown().await?;
 ```
+
+How releases are cut (crates and executables): [docs/releasing.md](docs/releasing.md).
 
 ##### Sponsor
 

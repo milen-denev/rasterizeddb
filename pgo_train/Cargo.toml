@@ -1,0 +1,15 @@
+[package]
+name = "pgo_train"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-only"
+description = "The release build's training run: drives a server binary through a mixed workload so PGO and BOLT learn from real queries"
+
+[dependencies]
+rasterizeddb_client = { path = "../rasterizeddb_client", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "process"] }
+tokio-postgres = "0.7.18"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

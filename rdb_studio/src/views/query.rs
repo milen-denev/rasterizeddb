@@ -16,45 +16,80 @@
 //!
 //! Several statements sent together are one exchange, so they get one figure
 //! between them rather than a fabricated split.
+//!
+//! # The editor
+//!
+//! SQL is coloured as it is typed ([`crate::sqlhl`]) and checked as it is typed
+//! ([`crate::sqllint`]); what the checker finds is marked in the text and
+//! listed under it, and clicking a finding puts the cursor on it. Findings
+//! never stop anything from running: the server is the authority on what is
+//! valid, and a warning about a missing `WHERE` is a question, not a veto.
+//!
+//! The keys, beyond plain typing:
+//!
+//! | Keys | Does |
+//! |---|---|
+//! | Ctrl+Enter | runs everything |
+//! | Ctrl+Shift+Enter | runs the statement the cursor is in |
+//! | Enter | a new line at the same indentation, one deeper after `(` |
+//! | Tab / Shift+Tab | indent / unindent — the selected lines, if any |
+//! | Ctrl+/ | comments the lines out, or back in |
+//! | Ctrl+Space | completes the table, column or keyword being typed |
+//! | Ctrl+Shift+F | formats |
+//! | Ctrl+S | saves to a `.sql` file |
 
-use iced::widget::{Space, column, container, row, rule, scrollable, text, text_editor};
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use iced::widget::text_editor::{Action, Binding, Edit};
+use iced::widget::{
+    Space, button, column, container, pick_list, row, rule, scrollable, text, text_editor,
+};
 use iced::{Center, Element, Fill, Length};
 
-use crate::app::{Message, Studio, Template};
+use crate::app::{Message, RowLimit, Studio, Template};
 use crate::export::Format;
-use crate::model::{Outcome, age, duration};
+use crate::model::{Flavor, Outcome, age, duration};
+use crate::sqlhl;
+use crate::sqllint::{self, Diagnostic, Severity};
 use crate::theme;
 
 use super::{framed, plain_cell, result_grid, small_button};
 
+/// The editor's widget id, so a click on a finding can hand it the focus.
+pub fn editor_id() -> iced::widget::Id {
+    iced::widget::Id::new("sql-editor")
+}
+
 pub fn view(studio: &Studio) -> Element<'_, Message> {
+    let (settings, diagnostics) = analyse(studio);
+
     let editor = text_editor(&studio.editor)
+        .id(editor_id())
+        .placeholder("-- SQL here. Ctrl+Enter runs it all; Ctrl+Shift+Enter, the statement under the cursor.")
         .on_action(Message::EditorAction)
         .font(theme::MONO)
         .size(13)
         .padding(10)
-        .height(Length::Fixed(230.0))
-        .key_binding(|press| {
-            use iced::keyboard::key;
-            // Ctrl/Cmd+Enter runs the whole buffer. A bare Enter has to stay a
-            // newline: this is an editor for statements that span lines, and a
-            // console that ran on Enter would fire half a statement every time.
-            if press.key == iced::keyboard::Key::Named(key::Named::Enter)
-                && (press.modifiers.command() || press.modifiers.control())
-            {
-                return Some(text_editor::Binding::Custom(Message::RunQuery));
-            }
-            text_editor::Binding::from_key_press(press)
-        });
+        .height(Length::Fixed(if studio.editor_tall { 560.0 } else { 260.0 }))
+        .style(theme::editor)
+        .highlight_with::<sqlhl::Sql>(settings, sqlhl::format)
+        .key_binding(key_binding);
 
-    let panel = column![
+    let mut panel = column![
         toolbar(studio),
-        container(editor).style(theme::panel).width(Fill),
-        footer(studio),
-        rule::horizontal(1).style(theme::hairline),
-        results(studio),
+        container(editor).width(Fill),
     ]
     .spacing(8);
+    if !studio.completions.is_empty() {
+        panel = panel.push(completion_list(studio));
+    }
+    if !diagnostics.is_empty() {
+        panel = panel.push(problems(&diagnostics));
+    }
+    let panel = panel.push(footer(studio, &diagnostics))
+        .push(rule::horizontal(1).style(theme::hairline))
+        .push(results(studio));
 
     row![
         container(framed("SQL", None, panel.into())).width(Fill),
@@ -65,11 +100,149 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
 }
 
 // ---------------------------------------------------------------------------
+// Editing
+// ---------------------------------------------------------------------------
+
+/// The highlighter's settings and the linter's findings, from one pass over
+/// the buffer and what the console knows about the database.
+fn analyse(studio: &Studio) -> (sqlhl::Settings, Vec<Diagnostic>) {
+    let text = studio.editor.text();
+    let tables: HashSet<String> = studio.tables.iter().map(|t| t.name.to_lowercase()).collect();
+    let columns: HashSet<String> = studio.columns.iter().map(|c| c.name.to_lowercase()).collect();
+    let names: HashSet<String> = tables.union(&columns).cloned().collect();
+
+    // Only RasterizedDB's table list is the whole truth: PostgreSQL's leaves
+    // out views, and every one of them would be called unknown.
+    let authoritative = studio.flavor() == Flavor::Rasterized && !tables.is_empty();
+    let diagnostics = sqllint::lint(
+        &text,
+        sqllint::Context { tables: authoritative.then_some(&tables), names: Some(&names) },
+    );
+
+    let settings = sqlhl::Settings {
+        tables: Arc::new(tables),
+        columns: Arc::new(columns),
+        marks: Arc::new(sqlhl::Settings::marks_from(&diagnostics)),
+    };
+    (settings, diagnostics)
+}
+
+fn key_binding(press: text_editor::KeyPress) -> Option<Binding<Message>> {
+    use iced::keyboard::Key;
+    use iced::keyboard::key::Named;
+
+    let command = press.modifiers.command() || press.modifiers.control();
+    let shift = press.modifiers.shift();
+
+    // Running works wherever the focus is on this screen. A bare Enter has to
+    // stay a newline: this is an editor for statements that span lines, and a
+    // console that ran on Enter would fire half a statement every time.
+    if let Key::Named(Named::Space) = press.key.as_ref()
+        && command
+        && matches!(press.status, text_editor::Status::Focused { .. })
+    {
+        return Some(Binding::Custom(Message::Complete));
+    }
+    if let Key::Named(Named::Enter) = press.key.as_ref() {
+        if command && shift {
+            return Some(Binding::Custom(Message::RunStatement));
+        }
+        if command {
+            return Some(Binding::Custom(Message::RunQuery));
+        }
+    }
+
+    // Everything else edits, and only the editor that has the focus: a Tab
+    // pressed in the sidebar's filter must not indent the SQL.
+    if !matches!(press.status, text_editor::Status::Focused { .. }) {
+        return Binding::from_key_press(press);
+    }
+
+    let letter = press.key.to_latin(press.physical_key);
+    let edit = |edit| Some(Binding::Custom(Message::EditorAction(Action::Edit(edit))));
+    match press.key.as_ref() {
+        Key::Named(Named::Enter) if !press.modifiers.alt() => {
+            Some(Binding::Custom(Message::EditorNewline))
+        }
+        Key::Named(Named::Tab) if shift => edit(Edit::Unindent),
+        Key::Named(Named::Tab) if !command => edit(Edit::Indent),
+        Key::Character("/") if command => Some(Binding::Custom(Message::ToggleComment)),
+        _ if command && shift && letter == Some('f') => Some(Binding::Custom(Message::FormatSql)),
+        _ if command && !shift && letter == Some('s') => {
+            Some(Binding::Custom(Message::SaveSqlFile))
+        }
+        _ => Binding::from_key_press(press),
+    }
+}
+
+/// What Ctrl+Space found for the word before the cursor, one click each.
+fn completion_list(studio: &Studio) -> Element<'_, Message> {
+    const SHOWN: usize = 40;
+    let mut list = row![text("complete").size(10).color(theme::TEXT_FAINT)]
+        .spacing(4)
+        .align_y(Center);
+    for choice in studio.completions.iter().take(SHOWN) {
+        list = list.push(small_button(choice.clone(), Some(Message::ApplyCompletion(choice.clone()))));
+    }
+    if studio.completions.len() > SHOWN {
+        list = list.push(
+            text(format!("+{} more — type more of the name", studio.completions.len() - SHOWN))
+                .size(10)
+                .color(theme::TEXT_FAINT),
+        );
+    }
+    scrollable(list)
+        .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default()))
+        .style(theme::scroller)
+        .into()
+}
+
+/// What the linter found, one clickable line each.
+fn problems<'a>(diagnostics: &[Diagnostic]) -> Element<'a, Message> {
+    let mut list = column![].spacing(1);
+    for diagnostic in diagnostics {
+        let (mark, colour) = match diagnostic.severity {
+            Severity::Error => ("✗", theme::BAD),
+            Severity::Warning => ("▲", theme::WARN),
+        };
+        list = list.push(
+            button(
+                row![
+                    text(mark).size(10).font(theme::MONO).color(colour),
+                    text(format!("{}:{}", diagnostic.line + 1, diagnostic.start + 1))
+                        .size(10)
+                        .font(theme::MONO)
+                        .color(theme::TEXT_FAINT)
+                        .width(Length::Fixed(52.0)),
+                    text(diagnostic.message.clone()).size(11).color(theme::TEXT),
+                ]
+                .spacing(8)
+                .align_y(Center),
+            )
+            .width(Fill)
+            .padding([2, 8])
+            .style(theme::tree_item(false))
+            .on_press(Message::JumpTo(diagnostic.line, diagnostic.start)),
+        );
+    }
+
+    container(scrollable(list).style(theme::scroller))
+        .max_height(92.0)
+        .width(Fill)
+        .padding(2)
+        .style(theme::panel)
+        .into()
+}
+
+// ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
 
 fn toolbar(studio: &Studio) -> Element<'_, Message> {
     let has_table = studio.selected_table.is_some();
+    // One run at a time: the editor's connection takes one, and a second
+    // would have no way to be cancelled.
+    let idle = studio.query_cancel.is_none();
 
     let mut templates = row![
         text("insert a statement for")
@@ -93,11 +266,26 @@ fn toolbar(studio: &Studio) -> Element<'_, Message> {
     container(
         column![
             row![
-                super::primary_button("RUN   CTRL+ENTER", Some(Message::RunQuery)),
-                small_button("RUN SELECTION", Some(Message::RunSelection)),
+                super::primary_button("RUN   CTRL+ENTER", idle.then_some(Message::RunQuery)),
+                small_button("RUN STATEMENT", idle.then_some(Message::RunStatement)),
+                small_button("RUN SELECTION", idle.then_some(Message::RunSelection)),
+                small_button(
+                    if studio.cancel_sent { "CANCELLING…" } else { "CANCEL" },
+                    (!idle && !studio.cancel_sent).then_some(Message::CancelQuery),
+                ),
                 small_button("FORMAT", Some(Message::FormatSql)),
+                small_button("COMMENT", Some(Message::ToggleComment)),
                 small_button("CLEAR", Some(Message::ClearEditor)),
+                transaction_pill(studio),
                 Space::new().width(Fill),
+                text("keep").size(10).color(theme::TEXT_FAINT),
+                pick_list(&RowLimit::ALL[..], Some(studio.row_limit), Message::SetRowLimit)
+                    .text_size(11)
+                    .padding([2, 6]),
+                small_button(
+                    if studio.editor_tall { "SHORTER" } else { "TALLER" },
+                    Some(Message::ToggleEditorSize),
+                ),
                 small_button("OPEN .SQL", Some(Message::OpenSqlFile)),
                 small_button("SAVE .SQL", Some(Message::SaveSqlFile)),
             ]
@@ -113,13 +301,55 @@ fn toolbar(studio: &Studio) -> Element<'_, Message> {
     .into()
 }
 
-fn footer(studio: &Studio) -> Element<'_, Message> {
+/// Where the editor's own transaction stands, when it is in one: a block left
+/// open is easy to forget, and everything run after it is inside it.
+fn transaction_pill<'a>(studio: &Studio) -> Element<'a, Message> {
+    use rasterizeddb_client::TransactionStatus;
+    let (label, colour) = match studio.editor_transaction {
+        Some(TransactionStatus::InBlock) => ("IN TRANSACTION", theme::WARN),
+        Some(TransactionStatus::Failed) => ("TRANSACTION FAILED — ROLLBACK", theme::BAD),
+        _ => return Space::new().width(0).into(),
+    };
+    container(text(label).size(10).font(theme::MONO).color(colour))
+        .padding([2, 6])
+        .style(theme::panel)
+        .into()
+}
+
+fn footer<'a>(studio: &'a Studio, diagnostics: &[Diagnostic]) -> Element<'a, Message> {
+    let cursor = studio.editor.cursor().position;
+    // The cursor's column is a byte offset; people count characters.
+    let column = studio
+        .editor
+        .line(cursor.line)
+        .map(|line| line.text.get(..cursor.column).map_or(cursor.column, |s| s.chars().count()))
+        .unwrap_or(0);
+
+    let errors = diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
+    let warnings = diagnostics.len() - errors;
+    let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+
     row![
-        text(format!("{} lines", studio.editor.line_count()))
+        text(format!("Ln {}, Col {}", cursor.line + 1, column + 1))
+            .size(10)
+            .font(theme::MONO)
+            .color(theme::TEXT_DIM),
+        text(format!("· {} lines", studio.editor.line_count()))
             .size(10)
             .font(theme::MONO)
             .color(theme::TEXT_FAINT),
+        if diagnostics.is_empty() {
+            text("· no problems").size(10).font(theme::MONO).color(theme::TEXT_FAINT)
+        } else {
+            text(format!("· {} · {}", plural(errors, "error"), plural(warnings, "warning")))
+                .size(10)
+                .font(theme::MONO)
+                .color(if errors > 0 { theme::BAD } else { theme::WARN })
+        },
         Space::new().width(Fill),
+        text("Ctrl+Space complete · Ctrl+/ comment · Tab indent · Ctrl+Shift+F format")
+            .size(10)
+            .color(theme::TEXT_FAINT),
         match studio.last_elapsed {
             None => text(String::new()).size(10),
             Some(elapsed) => text(format!("last run: {} round trip", duration(elapsed)))
@@ -137,7 +367,40 @@ fn footer(studio: &Studio) -> Element<'_, Message> {
 // Results
 // ---------------------------------------------------------------------------
 
+/// What the last run's statements raised as notices, if any did.
+fn notices(studio: &Studio) -> Option<Element<'_, Message>> {
+    if studio.query_notices.is_empty() {
+        return None;
+    }
+    let mut list = column![].spacing(2);
+    for notice in &studio.query_notices {
+        list = list.push(
+            row![
+                text("NOTICE").size(10).font(theme::MONO).color(theme::WARN),
+                text(notice.clone()).size(11).font(theme::MONO).color(theme::TEXT),
+            ]
+            .spacing(8),
+        );
+    }
+    Some(
+        container(scrollable(list).style(theme::scroller))
+            .max_height(110.0)
+            .width(Fill)
+            .padding(6)
+            .style(theme::panel)
+            .into(),
+    )
+}
+
 fn results(studio: &Studio) -> Element<'_, Message> {
+    let body = results_body(studio);
+    match notices(studio) {
+        Some(notices) => column![notices, body].spacing(8).into(),
+        None => body,
+    }
+}
+
+fn results_body(studio: &Studio) -> Element<'_, Message> {
     if let Some(error) = &studio.query_error {
         let mut panel = column![text(error.clone()).size(12).font(theme::MONO)].spacing(4);
         if let Some(elapsed) = studio.last_elapsed {
@@ -234,18 +497,29 @@ fn results(studio: &Studio) -> Element<'_, Message> {
 
                 let grid_view = result_grid(
                     grid,
-                    super::GridLayout::new(studio, "query"),
+                    super::GridLayout::new(studio, super::QUERY_SCOPE),
                     |_| false,
                     |_, _, value| plain_cell(value, false),
                     None,
                 );
 
+                let heading = match grid.total {
+                    // The row limit kept the first ones; saying only "1,000
+                    // rows" would read as the whole answer.
+                    Some(total) => text(format!(
+                        "statement {} — the first {} of {} rows (the row limit); copies and \
+                         exports hold these only",
+                        index + 1,
+                        crate::model::count(grid.rows.len() as u64),
+                        crate::model::count(total),
+                    ))
+                    .color(theme::WARN),
+                    None => text(format!("statement {} — {}", index + 1, grid.tag))
+                        .color(theme::TEXT_FAINT),
+                };
                 column![
                     row![
-                        text(format!("statement {} — {}", index + 1, grid.tag))
-                            .size(11)
-                            .font(theme::MONO)
-                            .color(theme::TEXT_FAINT),
+                        heading.size(11).font(theme::MONO),
                         Space::new().width(Fill),
                         copies,
                     ]

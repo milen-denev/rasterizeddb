@@ -9,7 +9,7 @@ use iced::widget::{Space, column, container, pick_list, row, rule, scrollable, t
 use iced::{Center, Element, Fill, Length};
 
 use crate::app::{Message, Studio};
-use crate::model::{Flavor, TlsMode};
+use crate::model::{Flavor, NativeLogin, PasswordStore, TlsMode, Transport};
 use crate::theme;
 
 use super::{field, primary_button, small_button, toggle};
@@ -18,13 +18,68 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
     // Bound rather than inlined: the widget borrows the string it is given, so
     // a temporary here would not outlive the element that reads it.
     let port = studio.form.port.to_string();
+    let native = studio.form.effective_transport() == Transport::Native;
+
+    // What protects the link, and how to log in, differ by protocol: the
+    // native protocol is always TLS over TCP and logs in by an explicit
+    // method; the wire protocol negotiates both.
+    let security: Element<'_, Message> = if native {
+        labelled(
+            "Login",
+            pick_list(
+                NativeLogin::ALL,
+                Some(studio.form.login),
+                Message::FormLogin,
+            )
+            .padding([6, 8])
+            .text_size(13)
+            .width(Length::Fixed(140.0))
+            .into(),
+        )
+    } else {
+        labelled(
+            "TLS",
+            pick_list(TlsMode::ALL, Some(studio.form.tls), Message::FormTls)
+                .padding([6, 8])
+                .text_size(13)
+                .width(Length::Fixed(140.0))
+                .into(),
+        )
+    };
+    let protocol: Element<'_, Message> = if studio.form.flavor == Flavor::Rasterized {
+        labelled(
+            "Protocol",
+            pick_list(
+                Transport::ALL,
+                Some(studio.form.transport),
+                Message::FormTransport,
+            )
+            .padding([6, 8])
+            .text_size(13)
+            .width(Length::Fixed(160.0))
+            .into(),
+        )
+    } else {
+        Space::new().width(0).into()
+    };
 
     let form = column![
         heading(),
         row![
             column![
                 field("Profile name", &studio.form.name, Message::FormName),
-                field("Host", &studio.form.host, Message::FormHost),
+                // Native: a path is the socket file (`--rdb-socket`). Wire: a
+                // directory such as /run/rasterizeddb reaches the server's
+                // unix socket (`--pg-socket-dir`) instead of a host.
+                field(
+                    if native {
+                        "Host or socket file"
+                    } else {
+                        "Host or socket directory"
+                    },
+                    &studio.form.host,
+                    Message::FormHost,
+                ),
                 field("Port", &port, Message::FormPort),
             ]
             .spacing(10)
@@ -47,23 +102,28 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
                     .width(Length::Fixed(180.0))
                     .into(),
             ),
-            labelled(
-                "TLS",
-                pick_list(TlsMode::ALL, Some(studio.form.tls), Message::FormTls)
-                    .padding([6, 8])
-                    .text_size(13)
-                    .width(Length::Fixed(140.0))
-                    .into(),
-            ),
-            column![
-                Space::new().height(16),
-                toggle("Save password", studio.form.save_password, Message::FormSavePassword),
-            ],
+            protocol,
+            security,
             Space::new().width(Fill),
         ]
         .spacing(16)
         .align_y(iced::alignment::Vertical::Bottom),
-        tls_note(studio.form.tls),
+        row![
+            column![
+                Space::new().height(16),
+                toggle("Save password", studio.form.save_password, Message::FormSavePassword),
+            ],
+            password_store(studio),
+            Space::new().width(Fill),
+        ]
+        .spacing(16)
+        .align_y(iced::alignment::Vertical::Bottom),
+        verification(studio),
+        if native {
+            native_note(studio.form.login, &studio.form.host)
+        } else {
+            tls_note(studio.form.tls)
+        },
         row![
             primary_button(
                 if studio.connecting { "CONNECTING…" } else { "CONNECT" },
@@ -95,7 +155,7 @@ fn heading() -> Element<'static, Message> {
             text("_studio").size(30).font(theme::MONO).color(theme::TEXT),
         ],
         container(Space::new().height(3)).width(96).style(theme::accent_underline),
-        text("RasterizedDB and PostgreSQL, over one wire protocol.")
+        text("RasterizedDB over its native protocol, and PostgreSQL over the wire protocol.")
             .size(13)
             .color(theme::TEXT_DIM),
     ]
@@ -116,6 +176,25 @@ fn secret<'a>(label: &'a str, value: &'a str) -> Element<'a, Message> {
     ]
     .spacing(4)
     .into()
+}
+
+/// Where a saved password goes, shown only while it is being saved.
+fn password_store(studio: &Studio) -> Element<'_, Message> {
+    if !studio.form.save_password {
+        return Space::new().width(0).into();
+    }
+    labelled(
+        "Keep it in",
+        pick_list(
+            PasswordStore::ALL,
+            Some(studio.form.password_store()),
+            Message::FormPasswordStore,
+        )
+        .padding([6, 8])
+        .text_size(13)
+        .width(Length::Fixed(200.0))
+        .into(),
+    )
 }
 
 fn labelled<'a>(label: &'a str, control: Element<'a, Message>) -> Element<'a, Message> {
@@ -159,6 +238,85 @@ fn tls_note(mode: TlsMode) -> Element<'static, Message> {
         .into()
 }
 
+/// What a native connection's link and login will do.
+/// Whether the server must prove who it is, and against which authority.
+/// Nothing to verify over a unix socket, which carries no TLS.
+fn verification(studio: &Studio) -> Element<'_, Message> {
+    if crate::conn::is_socket_dir(&studio.form.host) {
+        return Space::new().height(0).into();
+    }
+    let mut line = row![toggle(
+        "Verify the server's certificate",
+        studio.form.verify_server,
+        Message::FormVerify
+    )]
+    .spacing(16)
+    .align_y(Center);
+    if studio.form.verify_server {
+        line = line.push(
+            column![
+                text("CA file (PEM); empty for the public authorities")
+                    .size(11)
+                    .font(theme::MONO)
+                    .color(theme::TEXT_DIM),
+                iced::widget::text_input("/etc/rasterizeddb/ca.pem", &studio.form.ca_file)
+                    .on_input(Message::FormCaFile)
+                    .padding([6, 8])
+                    .size(13)
+                    .font(theme::MONO)
+                    .style(theme::input),
+            ]
+            .spacing(4)
+            .width(Fill),
+        );
+    }
+    line.into()
+}
+
+fn native_note(login: NativeLogin, host: &str) -> Element<'static, Message> {
+    let socket = crate::conn::is_socket_dir(host);
+    let link = if socket {
+        "A unix socket: no TLS, and none needed — only root can watch it."
+    } else {
+        "TLS, always. The certificate is not verified, so this protects against reading the \
+         traffic, not against a server impersonating the real one."
+    };
+    let how = match login {
+        NativeLogin::Password => {
+            "Password: SCRAM-SHA-256 bound to the connection; the server has to prove it holds the \
+             password's verifier."
+        }
+        NativeLogin::Peer => {
+            "Peer: the operating-system user this console runs as, on a socket under \
+             --rdb-socket-auth peer. User, if set, must be that name."
+        }
+        NativeLogin::Trust => {
+            "Trust: no login, for a listener under trust authentication. Against one that asks for a \
+             password the connection opens and the first statement is refused."
+        }
+    };
+    let warn = !socket && login == NativeLogin::Peer;
+    container(
+        column![
+            text(link).size(11).color(theme::TEXT_DIM),
+            text(how)
+                .size(11)
+                .color(if warn { theme::WARN } else { theme::TEXT_DIM }),
+            text(
+                "Database is the one opened; a server older than database selection over \
+                 native serves only its default one there."
+            )
+            .size(11)
+            .color(theme::TEXT_DIM),
+        ]
+        .spacing(4),
+    )
+    .padding([6, 8])
+    .width(Fill)
+    .style(theme::panel_flat)
+    .into()
+}
+
 fn error(studio: &Studio) -> Element<'_, Message> {
     match &studio.connect_error {
         None => Space::new().height(0).into(),
@@ -186,8 +344,13 @@ fn saved(studio: &Studio) -> Element<'_, Message> {
         let summary = column![
             text(&profile.name).size(13).font(theme::MONO),
             text(format!(
-                "{}@{}:{}/{} · {}",
-                profile.user, profile.host, profile.port, profile.database, profile.flavor
+                "{}@{}:{}/{} · {} · {}",
+                profile.user,
+                profile.host,
+                profile.port,
+                profile.database,
+                profile.flavor,
+                profile.effective_transport()
             ))
             .size(10)
             .color(theme::TEXT_FAINT),

@@ -87,9 +87,11 @@ async fn concurrent_handlers_updating_one_row_all_succeed() {
     assert!(title.starts_with('t'), "holds one of the writes: {}", title);
 }
 
-/// Inside an explicit block the client owns the transaction, so a conflict is
-/// still reported rather than replayed — replaying one statement of a block
-/// would break the atomicity the block was opened for.
+/// Inside an explicit block the statement waits for the transaction it met,
+/// as PostgreSQL's does, and replays once it ends. Here one client holds `a`
+/// open until `b` returns, so `b` would wait for it forever, as on
+/// PostgreSQL: `lock_timeout` ends the wait (55P03). Whatever ends it, the
+/// replay's internal marker never reaches the client.
 #[tokio::test]
 async fn a_conflict_inside_a_block_is_still_reported() {
     let (_s, pool) = server().await;
@@ -104,8 +106,11 @@ async fn a_conflict_inside_a_block_is_still_reported() {
         .expect("first writer wins");
 
     let mut b = pool.begin().await.expect("begin b");
+    b.execute(sqlx::raw_sql("SET lock_timeout = '300ms'")).await.expect("lock_timeout");
     let conflict = b.execute(sqlx::raw_sql("UPDATE t SET n = 2 WHERE id = 1")).await;
     let err = conflict.expect_err("a conflict inside a block must be reported");
+    let code = err.as_database_error().and_then(|d| d.code().map(|c| c.to_string()));
+    assert_eq!(code.as_deref(), Some("55P03"), "the wait ends at lock_timeout: {err}");
     // The replay's internal marker must never reach a client.
     let text = err.to_string();
     assert!(
@@ -113,11 +118,7 @@ async fn a_conflict_inside_a_block_is_still_reported() {
         "internal marker leaked to the client: {}",
         text
     );
-    assert!(
-        text.contains("could not serialize access"),
-        "the conflict is still reported as one: {}",
-        text
-    );
+    assert!(text.contains("lock timeout"), "reported as the lock timeout it is: {}", text);
     let _ = b.rollback().await;
     a.commit().await.expect("commit a");
 }

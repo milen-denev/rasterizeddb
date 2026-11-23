@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 
+use rasterizeddb_core::core::backup::BackupConfig;
 use rasterizeddb_core::core::backup::manifest::RecoveryTarget;
 use rasterizeddb_core::core::backup::s3::{Credentials, Endpoint};
-use rasterizeddb_core::core::backup::BackupConfig;
 
 /// zstd's ceiling. Above 19 it enters "ultra" territory, where memory and time
 /// climb steeply for a ratio that on database files barely moves.
@@ -107,7 +107,11 @@ pub struct BackupArgs {
     /// with no snapshot at all gets one immediately whatever this is set to —
     /// the log starts archiving as soon as the server does, and segments with
     /// no snapshot under them restore nothing.
-    #[arg(long = "s3-snapshot-interval-secs", value_name = "N", default_value_t = 86_400)]
+    #[arg(
+        long = "s3-snapshot-interval-secs",
+        value_name = "N",
+        default_value_t = 86_400
+    )]
     pub snapshot_interval_secs: u64,
 
     /// Seconds between log archive flushes, or 0 for manual only
@@ -148,6 +152,17 @@ pub struct BackupArgs {
     #[arg(long = "s3-rollover-hours", value_name = "HOURS", default_value_t = 0)]
     pub rollover_hours: u64,
 
+    /// Store files of at least this many MiB as objects of their own, so a
+    /// later snapshot reuses any whose bytes have not changed instead of
+    /// uploading them again (default: 0, off — every snapshot is one
+    /// self-contained archive).
+    ///
+    /// A catalogue holding such snapshots is written as manifest version 2,
+    /// which builds without this feature refuse rather than restore from
+    /// partially. Rollovers always take a full snapshot.
+    #[arg(long = "s3-incremental-min-mb", value_name = "MIB", default_value_t = 0)]
+    pub incremental_min_mb: u64,
+
     /// Staged log bytes after which archiving is suspended, in MiB
     /// (default: 4096). 0 disables the ceiling.
     ///
@@ -167,6 +182,21 @@ pub struct BackupArgs {
     /// schedule.
     #[arg(long = "s3-backup-now", default_value_t = false)]
     pub backup_now: bool,
+
+    /// Start even when the bucket does not answer, instead of refusing to.
+    ///
+    /// Without it, a bucket that cannot be reached at boot stops the server
+    /// ("could not start backups"), so an S3 outage during a reboot keeps the
+    /// database down. With it, the server starts, holds the log in its
+    /// staging directory (under --s3-staging-max-mb), uploads nothing, and
+    /// reads the catalogue in the background until the bucket answers; then
+    /// the held log is uploaded and the schedules start. SHOW BACKUP STATUS
+    /// reports `catalogue = unreachable` meanwhile.
+    ///
+    /// A bucket that answers with another database's backups still refuses
+    /// the start: that is a misconfiguration, not an outage.
+    #[arg(long = "s3-start-offline", default_value_t = false)]
+    pub start_offline: bool,
 
     // ---- restore ----------------------------------------------------------
     /// Restore from S3 before opening any table, replacing the database at
@@ -298,6 +328,7 @@ impl BackupArgs {
             retain_snapshots: self.retain_snapshots,
             rollover_interval_secs: self.rollover_hours.saturating_mul(3600),
             staging_max_bytes: self.staging_max_mb * 1024 * 1024,
+            incremental_min_bytes: self.incremental_min_mb.saturating_mul(1024 * 1024),
         })
     }
 
@@ -326,13 +357,14 @@ impl BackupArgs {
             return Ok(RecoveryTarget::Snapshot(id.clone()));
         }
         if let Some(text) = &self.restore_at_time {
-            let unix = rasterizeddb_core::core::backup::timeutil::parse_rfc3339(text)
-                .ok_or_else(|| {
+            let unix = rasterizeddb_core::core::backup::timeutil::parse_rfc3339(text).ok_or_else(
+                || {
                     format!(
                         "--restore-at-time {text:?} is not a timestamp; \
                          expected something like '2026-08-20T10:00:00Z'"
                     )
-                })?;
+                },
+            )?;
             return Ok(RecoveryTarget::Time(unix));
         }
         Ok(RecoveryTarget::Latest)

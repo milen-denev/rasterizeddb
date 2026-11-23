@@ -20,7 +20,7 @@ use crate::core::rql::lexer_s1::recognize_query_purpose;
 
 use super::config::{Compression, CompressionMode, PeerConfig, ReplicationConfig, SyncMode};
 
-use super::test_support::free_port;
+use super::test_support::listener;
 
 /// Settings that make a test converge in a moment rather than in the seconds a
 /// production default would take.
@@ -34,8 +34,14 @@ fn brisk(config: &mut ReplicationConfig) {
     config.ack_timeout = Duration::from_secs(5);
 }
 
-/// Builds an in-memory node and starts its replication.
-async fn node(node_id: u64, port: u16, peers: Vec<PeerConfig>) -> Arc<Database> {
+/// Builds an in-memory node and starts its replication on `bound`, a
+/// listener from [`listener`] and its port.
+async fn node(
+    node_id: u64,
+    bound: (std::net::TcpListener, u16),
+    peers: Vec<PeerConfig>,
+) -> Arc<Database> {
+    let (socket, port) = bound;
     let database = super::test_support::in_memory_database().await;
 
     let mut config = ReplicationConfig {
@@ -50,6 +56,7 @@ async fn node(node_id: u64, port: u16, peers: Vec<PeerConfig>) -> Arc<Database> 
         .replication
         .set_config(config)
         .expect("the test configuration should be valid");
+    database.replication.serve_on(socket);
     Database::start_replication(database.clone()).expect("replication should start");
 
     database
@@ -85,7 +92,11 @@ async fn users(database: &Arc<Database>) -> Option<Vec<String>> {
     let mut names: Vec<String> = rows
         .iter()
         .filter_map(|row| row.columns.get(1))
-        .map(|column| String::from_utf8_lossy(column.data.into_slice()).trim_end_matches('\0').to_string())
+        .map(|column| {
+            String::from_utf8_lossy(column.data.into_slice())
+                .trim_end_matches('\0')
+                .to_string()
+        })
         .collect();
     names.sort();
     Some(names)
@@ -117,17 +128,18 @@ where
 
 /// Two nodes, each configured with the other.
 async fn pair() -> (Arc<Database>, Arc<Database>) {
-    let (port_one, port_two) = (free_port(), free_port());
+    let (bound_one, bound_two) = (listener(), listener());
+    let (port_one, port_two) = (bound_one.1, bound_two.1);
 
     let one = node(
         1,
-        port_one,
+        bound_one,
         vec![PeerConfig::new("two", format!("127.0.0.1:{}", port_two))],
     )
     .await;
     let two = node(
         2,
-        port_two,
+        bound_two,
         vec![PeerConfig::new("one", format!("127.0.0.1:{}", port_one))],
     )
     .await;
@@ -160,7 +172,11 @@ async fn both_nodes_accept_writes_and_converge() {
     .await;
 
     run_ok(&one, "INSERT INTO repl_users (id, name) VALUES (1, 'ada')").await;
-    run_ok(&two, "INSERT INTO repl_users (id, name) VALUES (2, 'grace')").await;
+    run_ok(
+        &two,
+        "INSERT INTO repl_users (id, name) VALUES (2, 'grace')",
+    )
+    .await;
 
     let expected = vec!["ada".to_string(), "grace".to_string()];
     eventually("node one to hold both rows", || async {
@@ -215,7 +231,10 @@ async fn a_multi_statement_transaction_arrives_whole() {
     for (id, name) in [(1, "ada"), (2, "grace"), (3, "edsger")] {
         run_ok(
             &one,
-            &format!("INSERT INTO repl_users (id, name) VALUES ({}, '{}')", id, name),
+            &format!(
+                "INSERT INTO repl_users (id, name) VALUES ({}, '{}')",
+                id, name
+            ),
         )
         .await;
     }
@@ -233,7 +252,11 @@ async fn an_update_and_a_delete_replicate_as_well_as_an_insert() {
 
     run_ok(&one, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
     run_ok(&one, "INSERT INTO repl_users (id, name) VALUES (1, 'ada')").await;
-    run_ok(&one, "INSERT INTO repl_users (id, name) VALUES (2, 'grace')").await;
+    run_ok(
+        &one,
+        "INSERT INTO repl_users (id, name) VALUES (2, 'grace')",
+    )
+    .await;
 
     eventually("both rows to reach node two", || async {
         users(&two).await.map(|rows| rows.len()) == Some(2)
@@ -261,7 +284,10 @@ async fn a_peer_that_was_paused_catches_up_when_it_resumes() {
     })
     .await;
 
-    let link = one.replication.peer("two").expect("node one knows node two");
+    let link = one
+        .replication
+        .peer("two")
+        .expect("node one knows node two");
     link.set_paused(true);
     // Let the pause take effect before writing anything behind it.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -269,7 +295,10 @@ async fn a_peer_that_was_paused_catches_up_when_it_resumes() {
     for id in 1..=5 {
         run_ok(
             &one,
-            &format!("INSERT INTO repl_users (id, name) VALUES ({}, 'user{}')", id, id),
+            &format!(
+                "INSERT INTO repl_users (id, name) VALUES ({}, 'user{}')",
+                id, id
+            ),
         )
         .await;
     }
@@ -290,7 +319,8 @@ async fn a_peer_that_was_paused_catches_up_when_it_resumes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transactions_replicate_uncompressed_when_compression_is_off() {
-    let (port_one, port_two) = (free_port(), free_port());
+    let (bound_one, bound_two) = (listener(), listener());
+    let (port_one, port_two) = (bound_one.1, bound_two.1);
 
     let plain = Compression {
         mode: CompressionMode::Off,
@@ -298,7 +328,8 @@ async fn transactions_replicate_uncompressed_when_compression_is_off() {
         ..Default::default()
     };
 
-    let build = |node_id: u64, port: u16, peer_port: u16| async move {
+    let build = |node_id: u64, bound: (std::net::TcpListener, u16), peer_port: u16| async move {
+        let (socket, port) = bound;
         let database = super::test_support::in_memory_database().await;
         let mut config = ReplicationConfig {
             node_id,
@@ -309,18 +340,25 @@ async fn transactions_replicate_uncompressed_when_compression_is_off() {
         };
         brisk(&mut config);
         database.replication.set_config(config).unwrap();
+        database.replication.serve_on(socket);
         Database::start_replication(database.clone()).unwrap();
         database
     };
 
-    let one = build(1, port_one, port_two).await;
-    let two = build(2, port_two, port_one).await;
+    let one = build(1, bound_one, port_two).await;
+    let two = build(2, bound_two, port_one).await;
 
     run_ok(&one, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
     run_ok(&one, "INSERT INTO repl_users (id, name) VALUES (1, 'ada')").await;
 
     eventually("the row to reach node two uncompressed", || async {
         users(&two).await.as_deref() == Some(&["ada".to_string()][..])
+    })
+    .await;
+    // The sender counts a batch once the peer's reply is back, and the peer
+    // applies it before replying: the row can be visible before it is counted.
+    eventually("the batch to be counted", || async {
+        one.replication.stats().bytes_raw.load(std::sync::atomic::Ordering::Relaxed) > 0
     })
     .await;
 
@@ -339,7 +377,8 @@ async fn transactions_replicate_uncompressed_when_compression_is_off() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "replication_compression")]
 async fn a_batch_of_statements_is_compressed_on_the_wire() {
-    let (port_one, port_two) = (free_port(), free_port());
+    let (bound_one, bound_two) = (listener(), listener());
+    let (port_one, port_two) = (bound_one.1, bound_two.1);
 
     let squeeze = Compression {
         mode: CompressionMode::Always,
@@ -350,7 +389,8 @@ async fn a_batch_of_statements_is_compressed_on_the_wire() {
         ..Default::default()
     };
 
-    let build = |node_id: u64, port: u16, peer_port: u16| async move {
+    let build = |node_id: u64, bound: (std::net::TcpListener, u16), peer_port: u16| async move {
+        let (socket, port) = bound;
         let database = super::test_support::in_memory_database().await;
         let mut config = ReplicationConfig {
             node_id,
@@ -364,12 +404,13 @@ async fn a_batch_of_statements_is_compressed_on_the_wire() {
         // compressor has something repetitive to work with.
         config.batch_linger = Duration::from_millis(50);
         database.replication.set_config(config).unwrap();
+        database.replication.serve_on(socket);
         Database::start_replication(database.clone()).unwrap();
         database
     };
 
-    let one = build(1, port_one, port_two).await;
-    let two = build(2, port_two, port_one).await;
+    let one = build(1, bound_one, port_two).await;
+    let two = build(2, bound_two, port_one).await;
 
     run_ok(&one, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
     for id in 1..=200 {
@@ -421,7 +462,10 @@ async fn resending_the_same_transaction_changes_nothing() {
 
     // Force the link down and back up, which replays the catch-up from the log
     // over records node two already has.
-    let link = one.replication.peer("two").expect("node one knows node two");
+    let link = one
+        .replication
+        .peer("two")
+        .expect("node one knows node two");
     link.set_paused(true);
     tokio::time::sleep(Duration::from_millis(100)).await;
     link.set_paused(false);
@@ -443,7 +487,9 @@ async fn the_status_view_reports_a_connected_peer() {
         let lines = super::sql::execute("SHOW REPLICATION PEERS", &one)
             .await
             .expect("the status view should render");
-        lines.iter().any(|line| line.contains("two") && line.contains("up"))
+        lines
+            .iter()
+            .any(|line| line.contains("two") && line.contains("up"))
     })
     .await;
 }
@@ -451,11 +497,13 @@ async fn the_status_view_reports_a_connected_peer() {
 /// A cluster name is a misconfiguration guard, and it has to actually guard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nodes_in_different_clusters_do_not_replicate() {
-    let (port_one, port_two) = (free_port(), free_port());
+    let (bound_one, bound_two) = (listener(), listener());
+    let (port_one, port_two) = (bound_one.1, bound_two.1);
 
-    let build = |node_id: u64, port: u16, peer_port: u16, cluster: &str| {
+    let build = |node_id: u64, bound: (std::net::TcpListener, u16), peer_port: u16, cluster: &str| {
         let cluster = cluster.to_string();
         async move {
+            let (socket, port) = bound;
             let database = super::test_support::in_memory_database().await;
             let mut config = ReplicationConfig {
                 node_id,
@@ -466,13 +514,14 @@ async fn nodes_in_different_clusters_do_not_replicate() {
             };
             brisk(&mut config);
             database.replication.set_config(config).unwrap();
+            database.replication.serve_on(socket);
             Database::start_replication(database.clone()).unwrap();
             database
         }
     };
 
-    let one = build(1, port_one, port_two, "east").await;
-    let two = build(2, port_two, port_one, "west").await;
+    let one = build(1, bound_one, port_two, "east").await;
+    let two = build(2, bound_two, port_one, "west").await;
 
     run_ok(&one, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
     run_ok(&one, "INSERT INTO repl_users (id, name) VALUES (1, 'ada')").await;
@@ -488,18 +537,26 @@ async fn nodes_in_different_clusters_do_not_replicate() {
 /// The whole surface, driven the way an operator would drive it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cluster_can_be_built_entirely_from_sql() {
-    let (port_one, port_two) = (free_port(), free_port());
+    let (bound_one, bound_two) = (listener(), listener());
+    let (port_one, port_two) = (bound_one.1, bound_two.1);
 
-    let bare = |node_id: u64, port: u16| async move {
+    // The sockets are handed over now and picked up by `REPLICATION ENABLE`.
+    let bare = |node_id: u64, bound: (std::net::TcpListener, u16)| async move {
+        let (socket, port) = bound;
         let database = super::test_support::in_memory_database().await;
-        let mut config = ReplicationConfig { node_id, listen_port: port, ..Default::default() };
+        let mut config = ReplicationConfig {
+            node_id,
+            listen_port: port,
+            ..Default::default()
+        };
         brisk(&mut config);
         database.replication.set_config(config).unwrap();
+        database.replication.serve_on(socket);
         database
     };
 
-    let one = bare(1, port_one).await;
-    let two = bare(2, port_two).await;
+    let one = bare(1, bound_one).await;
+    let two = bare(2, bound_two).await;
 
     for (database, peer_port) in [(&one, port_two), (&two, port_one)] {
         run_ok(
@@ -540,7 +597,11 @@ async fn a_listener_that_cannot_bind_says_so_and_stays_retryable() {
     let port = occupied.local_addr().expect("a bound address").port();
 
     let database = super::test_support::in_memory_database().await;
-    let mut config = ReplicationConfig { node_id: 1, listen_port: port, ..Default::default() };
+    let mut config = ReplicationConfig {
+        node_id: 1,
+        listen_port: port,
+        ..Default::default()
+    };
     brisk(&mut config);
     database.replication.set_config(config).unwrap();
 
@@ -554,9 +615,27 @@ async fn a_listener_that_cannot_bind_says_so_and_stays_retryable() {
 
     // The claim on the listener has to have been given back, or the node can
     // never bind for the rest of the process's life.
+    //
+    // Retried on a socket of its own rather than on the port just freed, which
+    // a test running in parallel could be handed in between. That also makes
+    // the retry observable: a start that skipped the bind because the claim
+    // was still held reports success too, but leaves the socket untaken.
     drop(occupied);
+    let (socket, port) = listener();
+    database
+        .replication
+        .update_config(|config| {
+            config.listen_port = port;
+            Ok(())
+        })
+        .unwrap();
+    database.replication.serve_on(socket);
     Database::start_replication(database.clone())
-        .expect("with the port free, a second attempt should succeed");
+        .expect("with a free socket, a second attempt should succeed");
+    assert!(
+        database.replication.take_bound_listener().is_none(),
+        "the second attempt must have bound, not skipped the listener as already claimed"
+    );
 }
 
 /// `REPLICATION RESYNC` has to drain the backlog, not take the first answer.
@@ -564,11 +643,12 @@ async fn a_listener_that_cannot_bind_says_so_and_stays_retryable() {
 /// and stops without saying so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resync_pulls_every_batch_and_not_just_the_first() {
-    let (port_source, port_puller) = (free_port(), free_port());
+    let (bound_source, (socket_puller, port_puller)) = (listener(), listener());
+    let port_source = bound_source.1;
 
     // The source has no peers, so it never pushes: everything the puller gets,
     // it got by pulling.
-    let source = node(1, port_source, Vec::new()).await;
+    let source = node(1, bound_source, Vec::new()).await;
 
     let puller = super::test_support::in_memory_database().await;
     let mut config = ReplicationConfig {
@@ -576,25 +656,43 @@ async fn a_resync_pulls_every_batch_and_not_just_the_first() {
         listen_port: port_puller,
         // Two records per answer, so ten records take several rounds.
         batch_max_records: 2,
-        peers: vec![PeerConfig::new("source", format!("127.0.0.1:{}", port_source))],
+        peers: vec![PeerConfig::new(
+            "source",
+            format!("127.0.0.1:{}", port_source),
+        )],
         ..Default::default()
     };
     brisk(&mut config);
     puller.replication.set_config(config).unwrap();
+    puller.replication.serve_on(socket_puller);
     Database::start_replication(puller.clone()).unwrap();
 
-    run_ok(&source, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
+    run_ok(
+        &source,
+        "CREATE TABLE repl_users (id INTEGER, name VARCHAR)",
+    )
+    .await;
     for id in 1..=9 {
         run_ok(
             &source,
-            &format!("INSERT INTO repl_users (id, name) VALUES ({}, 'user{}')", id, id),
+            &format!(
+                "INSERT INTO repl_users (id, name) VALUES ({}, 'user{}')",
+                id, id
+            ),
         )
         .await;
     }
-    assert_eq!(source.replication.local_seq(), 10, "one CREATE plus nine INSERTs");
+    assert_eq!(
+        source.replication.local_seq(),
+        10,
+        "one CREATE plus nine INSERTs"
+    );
 
     // Nothing should have arrived on its own.
-    assert!(users(&puller).await.is_none(), "the source has no peers, so it pushes nothing");
+    assert!(
+        users(&puller).await.is_none(),
+        "the source has no peers, so it pushes nothing"
+    );
 
     // Wait for the link so the peer's node id is known, which RESYNC needs.
     eventually("the puller's link to the source", || async {
@@ -623,10 +721,16 @@ async fn a_resync_pulls_every_batch_and_not_just_the_first() {
 /// node in the middle. Also the first test with three nodes at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn a_chain_carries_a_transaction_to_a_node_the_origin_cannot_see() {
-    let (port_a, port_b, port_c) = (free_port(), free_port(), free_port());
+    let (bound_a, (socket_b, port_b), bound_c) = (listener(), listener(), listener());
+    let (port_a, port_c) = (bound_a.1, bound_c.1);
 
     // A ── B ── C, and A has never heard of C.
-    let a = node(1, port_a, vec![PeerConfig::new("b", format!("127.0.0.1:{}", port_b))]).await;
+    let a = node(
+        1,
+        bound_a,
+        vec![PeerConfig::new("b", format!("127.0.0.1:{}", port_b))],
+    )
+    .await;
 
     let b = super::test_support::in_memory_database().await;
     let mut config = ReplicationConfig {
@@ -641,9 +745,15 @@ async fn a_chain_carries_a_transaction_to_a_node_the_origin_cannot_see() {
     };
     brisk(&mut config);
     b.replication.set_config(config).unwrap();
+    b.replication.serve_on(socket_b);
     Database::start_replication(b.clone()).unwrap();
 
-    let c = node(3, port_c, vec![PeerConfig::new("b", format!("127.0.0.1:{}", port_b))]).await;
+    let c = node(
+        3,
+        bound_c,
+        vec![PeerConfig::new("b", format!("127.0.0.1:{}", port_b))],
+    )
+    .await;
 
     // Let every link finish its handshake before anything is written, so the
     // relay knows which peer is which.
@@ -663,9 +773,21 @@ async fn a_chain_carries_a_transaction_to_a_node_the_origin_cannot_see() {
     // And the relay must not have sent it back where it came from and had it
     // applied twice.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(users(&a).await.map(|rows| rows.len()), Some(1), "the origin");
-    assert_eq!(users(&b).await.map(|rows| rows.len()), Some(1), "the middle");
-    assert_eq!(users(&c).await.map(|rows| rows.len()), Some(1), "the far end");
+    assert_eq!(
+        users(&a).await.map(|rows| rows.len()),
+        Some(1),
+        "the origin"
+    );
+    assert_eq!(
+        users(&b).await.map(|rows| rows.len()),
+        Some(1),
+        "the middle"
+    );
+    assert_eq!(
+        users(&c).await.map(|rows| rows.len()),
+        Some(1),
+        "the far end"
+    );
     assert_eq!(
         c.replication.applied().high_water(1),
         2,
@@ -676,7 +798,8 @@ async fn a_chain_carries_a_transaction_to_a_node_the_origin_cannot_see() {
 /// A synchronous commit returns only once a peer has actually taken the record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_synchronous_commit_waits_for_the_peer() {
-    let (port_one, port_two) = (free_port(), free_port());
+    let ((socket_one, port_one), bound_two) = (listener(), listener());
+    let port_two = bound_two.1;
 
     let one = super::test_support::in_memory_database().await;
     let mut config = ReplicationConfig {
@@ -688,12 +811,21 @@ async fn a_synchronous_commit_waits_for_the_peer() {
     };
     brisk(&mut config);
     one.replication.set_config(config).unwrap();
+    one.replication.serve_on(socket_one);
     Database::start_replication(one.clone()).unwrap();
 
-    let two = node(2, port_two, vec![PeerConfig::new("one", format!("127.0.0.1:{}", port_one))]).await;
+    let two = node(
+        2,
+        bound_two,
+        vec![PeerConfig::new("one", format!("127.0.0.1:{}", port_one))],
+    )
+    .await;
 
     eventually("the link to come up", || async {
-        one.replication.peer("two").map(|p| p.is_connected()).unwrap_or(false)
+        one.replication
+            .peer("two")
+            .map(|p| p.is_connected())
+            .unwrap_or(false)
     })
     .await;
 
@@ -708,7 +840,10 @@ async fn a_synchronous_commit_waits_for_the_peer() {
         "a synchronous commit must not return before the peer has the record"
     );
     assert_eq!(
-        one.replication.stats().ack_timeouts.load(std::sync::atomic::Ordering::Relaxed),
+        one.replication
+            .stats()
+            .ack_timeouts
+            .load(std::sync::atomic::Ordering::Relaxed),
         0,
         "nothing should have timed out"
     );
@@ -718,7 +853,7 @@ async fn a_synchronous_commit_waits_for_the_peer() {
 /// local commit has happened, and the wait is bounded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_synchronous_commit_gives_up_on_a_peer_that_is_not_there() {
-    let port = free_port();
+    let (socket, port) = listener();
 
     let one = super::test_support::in_memory_database().await;
     let mut config = ReplicationConfig {
@@ -732,6 +867,7 @@ async fn a_synchronous_commit_gives_up_on_a_peer_that_is_not_there() {
     brisk(&mut config);
     config.ack_timeout = Duration::from_millis(300);
     one.replication.set_config(config).unwrap();
+    one.replication.serve_on(socket);
     Database::start_replication(one.clone()).unwrap();
 
     let started = std::time::Instant::now();
@@ -750,7 +886,11 @@ async fn a_synchronous_commit_gives_up_on_a_peer_that_is_not_there() {
         "the local write stands regardless of what the peer did"
     );
     assert!(
-        one.replication.stats().ack_timeouts.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        one.replication
+            .stats()
+            .ack_timeouts
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0,
         "and the give-up should be visible in the statistics"
     );
 }
@@ -758,61 +898,111 @@ async fn a_synchronous_commit_gives_up_on_a_peer_that_is_not_there() {
 /// A commit becomes visible to the cluster only once its outcome is durable.
 ///
 /// The autocommit path commits, flushes the outcome record, and reports failure
-/// if that flush did not work — rolling the transaction back. Publishing inside
-/// the commit put the transaction on the wire *before* that check, so a flush
-/// failure left the peers holding a write this node had disowned, with no way to
-/// recall it. The ordering is the fix, and this pins it: committing alone must
-/// publish nothing.
+/// if that flush did not work — rolling the transaction back. A transaction on
+/// the wire before that check left the peers holding a write this node had
+/// disowned, with no way to recall it. So a commit writes the record and takes
+/// its place in the stream, and nothing more: it is not for sending until the
+/// transaction is published.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn committing_publishes_nothing_until_the_outcome_is_durable() {
+async fn committing_releases_nothing_until_the_outcome_is_durable() {
     let database = super::test_support::in_memory_database().await;
-    let mut config =
-        ReplicationConfig { node_id: 1, listen_port: free_port(), ..Default::default() };
+    let mut config = ReplicationConfig {
+        node_id: 1,
+        // Never bound: this node's replication is not started.
+        listen_port: listener().1,
+        ..Default::default()
+    };
     brisk(&mut config);
     database.replication.set_config(config).unwrap();
     database.replication.open_storage(None).unwrap();
     database.replication.set_active(true);
 
-    run_ok(&database, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
-    let published_before = database.replication.local_seq();
+    run_ok(
+        &database,
+        "CREATE TABLE repl_users (id INTEGER, name VARCHAR)",
+    )
+    .await;
+    let released_before = database.replication.released_through();
+    assert_eq!(released_before, database.replication.local_seq());
 
     // A write in a transaction the caller owns, as an explicit block does.
     let tx = database.transactions.begin();
     let purpose =
         recognize_query_purpose("INSERT INTO repl_users (id, name) VALUES (1, 'ada')").unwrap();
-    let response =
-        crate::core::rql::executor::execute_in_txn(purpose, database.clone(), tx).await;
+    let response = crate::core::rql::executor::execute_in_txn(purpose, database.clone(), tx).await;
     assert_ne!(response.first(), Some(&3), "the insert should have worked");
 
     let family = database.commit_transaction(tx);
     assert_eq!(
         database.replication.local_seq(),
-        published_before,
+        released_before + 1,
+        "the commit takes the transaction's place in the stream"
+    );
+    assert_eq!(
+        database.replication.released_through(),
+        released_before,
         "committing must not put the transaction on the wire — the outcome is not durable yet"
     );
 
     database.publish_transaction(family).await;
     assert_eq!(
-        database.replication.local_seq(),
-        published_before + 1,
+        database.replication.released_through(),
+        released_before + 1,
         "publishing is what hands it to the cluster"
     );
 }
 
-/// And the other half: a transaction that is aborted publishes nothing, so the
+/// A committed transaction whose family is dropped without being published is
+/// released all the same: left open, its record would hold back every
+/// transaction after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_committed_transaction_nobody_published_does_not_hold_the_stream() {
+    let database = super::test_support::in_memory_database().await;
+    let mut config = ReplicationConfig {
+        node_id: 1,
+        listen_port: listener().1,
+        ..Default::default()
+    };
+    brisk(&mut config);
+    database.replication.set_config(config).unwrap();
+    database.replication.open_storage(None).unwrap();
+    database.replication.set_active(true);
+    run_ok(&database, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
+    let before = database.replication.released_through();
+
+    let tx = database.transactions.begin();
+    let purpose =
+        recognize_query_purpose("INSERT INTO repl_users (id, name) VALUES (1, 'ada')").unwrap();
+    crate::core::rql::executor::execute_in_txn(purpose, database.clone(), tx).await;
+    drop(database.commit_transaction(tx));
+
+    run_ok(&database, "INSERT INTO repl_users (id, name) VALUES (2, 'grace')").await;
+    assert_eq!(database.replication.released_through(), before + 2);
+}
+
+/// And the other half: a transaction that is aborted ships nothing, so the
 /// rollback the durability check performs cannot leak a write to the peers.
+/// Its place in the stream is kept by a record that carries nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_aborted_transaction_is_never_published() {
     let database = super::test_support::in_memory_database().await;
-    let mut config =
-        ReplicationConfig { node_id: 1, listen_port: free_port(), ..Default::default() };
+    let mut config = ReplicationConfig {
+        node_id: 1,
+        // Never bound: this node's replication is not started.
+        listen_port: listener().1,
+        ..Default::default()
+    };
     brisk(&mut config);
     database.replication.set_config(config).unwrap();
     database.replication.open_storage(None).unwrap();
     database.replication.set_active(true);
 
-    run_ok(&database, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
-    let published_before = database.replication.local_seq();
+    run_ok(
+        &database,
+        "CREATE TABLE repl_users (id INTEGER, name VARCHAR)",
+    )
+    .await;
+    let before = database.replication.local_seq();
 
     let tx = database.transactions.begin();
     let purpose =
@@ -824,12 +1014,19 @@ async fn an_aborted_transaction_is_never_published() {
     database.abort_transaction(tx);
     database.publish_transaction(family).await;
 
-    assert_eq!(
-        database.replication.local_seq(),
-        published_before,
+    let log = database.replication.log().unwrap();
+    let (records, _) = log.read_after(1, before, 10, 1 << 20).unwrap();
+    assert_eq!(records.len(), 1, "the sequence it was given is still in the stream");
+    assert!(
+        records[0].is_void() && records[0].statements.is_empty(),
         "an aborted transaction must leave nothing for the peers, even if publish is called"
     );
-    assert_eq!(database.replication.open_captures(), 0, "and no buffer behind");
+    assert_eq!(database.replication.released_through(), before + 1);
+    assert_eq!(
+        database.replication.open_captures(),
+        0,
+        "and no buffer behind"
+    );
 }
 
 /// A block with savepoints is several transaction ids, and all of them have to
@@ -845,17 +1042,20 @@ async fn writes_inside_a_savepoint_replicate_with_the_block() {
     let (one, two) = pair().await;
 
     run_ok(&one, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
-    eventually("the table to reach node two", || async { users(&two).await.is_some() }).await;
+    eventually("the table to reach node two", || async {
+        users(&two).await.is_some()
+    })
+    .await;
 
     // A block that writes, opens a savepoint, writes inside it, and commits.
     let tx = one.transactions.begin();
-    let outer = recognize_query_purpose("INSERT INTO repl_users (id, name) VALUES (1, 'outer')")
-        .unwrap();
+    let outer =
+        recognize_query_purpose("INSERT INTO repl_users (id, name) VALUES (1, 'outer')").unwrap();
     crate::core::rql::executor::execute_in_txn(outer, one.clone(), tx).await;
 
     let sub = one.transactions.begin_savepoint(tx);
-    let inner = recognize_query_purpose("INSERT INTO repl_users (id, name) VALUES (2, 'inner')")
-        .unwrap();
+    let inner =
+        recognize_query_purpose("INSERT INTO repl_users (id, name) VALUES (2, 'inner')").unwrap();
     crate::core::rql::executor::execute_in_txn(inner, one.clone(), sub).await;
     one.transactions.release_savepoint(sub);
 
@@ -864,9 +1064,10 @@ async fn writes_inside_a_savepoint_replicate_with_the_block() {
     one.publish_transaction(family).await;
 
     let expected = vec!["inner".to_string(), "outer".to_string()];
-    eventually("both the outer and the savepoint write to reach node two", || async {
-        users(&two).await.as_ref() == Some(&expected)
-    })
+    eventually(
+        "both the outer and the savepoint write to reach node two",
+        || async { users(&two).await.as_ref() == Some(&expected) },
+    )
     .await;
 }
 
@@ -876,11 +1077,14 @@ async fn writes_rolled_back_to_a_savepoint_are_not_replicated() {
     let (one, two) = pair().await;
 
     run_ok(&one, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
-    eventually("the table to reach node two", || async { users(&two).await.is_some() }).await;
+    eventually("the table to reach node two", || async {
+        users(&two).await.is_some()
+    })
+    .await;
 
     let tx = one.transactions.begin();
-    let kept = recognize_query_purpose("INSERT INTO repl_users (id, name) VALUES (1, 'kept')")
-        .unwrap();
+    let kept =
+        recognize_query_purpose("INSERT INTO repl_users (id, name) VALUES (1, 'kept')").unwrap();
     crate::core::rql::executor::execute_in_txn(kept, one.clone(), tx).await;
 
     let sub = one.transactions.begin_savepoint(tx);
@@ -912,5 +1116,37 @@ async fn writes_rolled_back_to_a_savepoint_are_not_replicated() {
         Some(&expected),
         "and it is not on the origin either"
     );
-    assert_eq!(one.replication.open_captures(), 0, "no capture buffer should be left behind");
+    assert_eq!(
+        one.replication.open_captures(),
+        0,
+        "no capture buffer should be left behind"
+    );
+}
+
+/// `CREATE TABLE … AS` replicates as the statements it ran (the CREATE and
+/// the fill), not as its own text: the peer stores the values this node
+/// computed. `now()` would differ if the peer ran the query again, and a
+/// peer applying both the text and the fill would hold every row twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_table_as_replicates_the_values_it_computed() {
+    let (one, two) = pair().await;
+
+    run_ok(&one, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
+    run_ok(&one, "INSERT INTO repl_users (id, name) VALUES (1, 'ada'), (2, 'bob')").await;
+    run_ok(&one, "CREATE TABLE repl_copy AS SELECT id, name, now() AS at FROM repl_users").await;
+
+    let read = |database: Arc<Database>| async move {
+        let response = run(&database, "SELECT id, name, at FROM repl_copy ORDER BY id").await;
+        (response.first() == Some(&2)).then_some(response)
+    };
+    let here = read(one.clone()).await.expect("the copy on node one");
+    let rows = crate::core::row::row::vec_into_rows(&here[1..]).unwrap();
+    assert_eq!(rows.len(), 2);
+    eventually("the copy to reach node two with the same values", || {
+        let (two, here) = (two.clone(), here.clone());
+        async move { read(two).await.as_deref() == Some(&here[..]) }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(read(two.clone()).await.as_deref(), Some(&here[..]), "node two changed after converging");
 }

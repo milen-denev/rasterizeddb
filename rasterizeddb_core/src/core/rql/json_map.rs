@@ -93,7 +93,13 @@ fn short_hash(text: &str) -> String {
 pub fn column_name_for_key(key: &str) -> String {
     let filtered: String = key
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
 
     let usable = !filtered.is_empty()
@@ -145,14 +151,23 @@ pub fn infer(value: &Value) -> Inferred {
         Value::Number(n) => {
             // An integer stays exact; only a fractional value becomes a double.
             if let Some(u) = n.as_u64() {
-                Inferred::Scalar { db_type: DbType::U64, literal: u.to_string() }
+                Inferred::Scalar {
+                    db_type: DbType::U64,
+                    literal: u.to_string(),
+                }
             } else if let Some(i) = n.as_i64() {
                 // Negative integers do not fit the unsigned column, so they
                 // take the signed one rather than being silently wrapped.
-                Inferred::Scalar { db_type: DbType::I64, literal: i.to_string() }
+                Inferred::Scalar {
+                    db_type: DbType::I64,
+                    literal: i.to_string(),
+                }
             } else {
                 let f = n.as_f64().unwrap_or(0.0);
-                Inferred::Scalar { db_type: DbType::F64, literal: f.to_string() }
+                Inferred::Scalar {
+                    db_type: DbType::F64,
+                    literal: f.to_string(),
+                }
             }
         }
         Value::String(s) => {
@@ -170,7 +185,10 @@ pub fn infer(value: &Value) -> Inferred {
                     literal: value_codec::quote_sql(s),
                 };
             }
-            Inferred::Scalar { db_type: DbType::STRING, literal: value_codec::quote_sql(s) }
+            Inferred::Scalar {
+                db_type: DbType::STRING,
+                literal: value_codec::quote_sql(s),
+            }
         }
         Value::Array(items) => Inferred::Scalar {
             db_type: DbType::ARRAY,
@@ -192,7 +210,10 @@ fn looks_like_timestamp(text: &str) -> bool {
     }
     let date_part = trimmed.split(['T', 't', ' ']).next().unwrap_or("");
     let pieces: Vec<&str> = date_part.split('-').collect();
-    if pieces.len() != 3 || !pieces.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    if pieces.len() != 3
+        || !pieces
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
     {
         return false;
     }
@@ -226,7 +247,10 @@ fn array_literal(items: &[Value]) -> String {
             || text.eq_ignore_ascii_case("NULL")
             || text.contains([',', '{', '}', '"', '\\', ' ']);
         if needs_quotes {
-            parts.push(format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\"")));
+            parts.push(format!(
+                "\"{}\"",
+                text.replace('\\', "\\\\").replace('"', "\\\"")
+            ));
         } else {
             parts.push(text);
         }
@@ -323,7 +347,10 @@ impl JsonColumn {
             ));
         }
         let read = |at: usize| -> Result<String, String> {
-            let end = raw[at..at + 129].iter().position(|&b| b == 0).unwrap_or(128);
+            let end = raw[at..at + 129]
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(128);
             std::str::from_utf8(&raw[at..at + end])
                 .map(str::to_string)
                 .map_err(|e| format!("invalid UTF-8 in JSON column record: {}", e))
@@ -345,11 +372,11 @@ fn sidecar_name<S: crate::core::storage_providers::traits::StorageIO>(
 /// Reads a table's JSON column registrations.
 pub async fn load<S: crate::core::storage_providers::traits::StorageIO>(
     schema_io: rclite::Arc<S>,
-) -> smallvec::SmallVec<[JsonColumn; 4]> {
+) -> Vec<JsonColumn> {
     let io = schema_io.create_new(sidecar_name(&schema_io)).await;
     let len = io.get_len().await;
 
-    let mut out: smallvec::SmallVec<[JsonColumn; 4]> = smallvec::SmallVec::new();
+    let mut out: Vec<JsonColumn> = Vec::new();
     if len < JSON_COLUMN_SIZE {
         return out;
     }
@@ -357,8 +384,17 @@ pub async fn load<S: crate::core::storage_providers::traits::StorageIO>(
     let mut buffer = vec![0u8; JSON_COLUMN_SIZE as usize];
     for i in 0..(len / JSON_COLUMN_SIZE) {
         let mut position = i * JSON_COLUMN_SIZE;
-        if io.read_data_into_buffer(&mut position, &mut buffer).await.is_err() {
+        if io
+            .read_data_into_buffer(&mut position, &mut buffer)
+            .await
+            .is_err()
+        {
             break;
+        }
+        // A record of zeros is an append a power cut kept the length of and
+        // dropped (`torn_tail::is_unwritten`), never a declaration.
+        if crate::core::torn_tail::is_unwritten(&buffer) {
+            continue;
         }
         match JsonColumn::from_vec(&buffer) {
             Ok(entry) => {
@@ -379,8 +415,20 @@ pub async fn append<S: crate::core::storage_providers::traits::StorageIO>(
     schema_io: rclite::Arc<S>,
     entry: &JsonColumn,
 ) -> std::io::Result<()> {
-    let io = schema_io.create_new(sidecar_name(&schema_io)).await;
-    io.append_data(&entry.into_vec(), true).await;
+    let mut writes = crate::core::torn_tail::SidecarWrites::default();
+    stage(&*schema_io, &mut writes, entry)?;
+    writes.commit(&*schema_io).await
+}
+
+/// Adds `entry`'s record to `writes`, the statement's sidecar records, which
+/// commit as one transaction (`torn_tail::SidecarWrites`): one log sync for
+/// all of them, and after a cut all of them or none.
+pub fn stage<S: crate::core::storage_providers::traits::StorageIO>(
+    schema_io: &S,
+    writes: &mut crate::core::torn_tail::SidecarWrites,
+    entry: &JsonColumn,
+) -> std::io::Result<()> {
+    writes.add(crate::core::torn_tail::sidecar_name(schema_io, "JSON.db"), &entry.into_vec());
     Ok(())
 }
 
@@ -486,7 +534,11 @@ mod tests {
         let a = shadow_table_name("users", "profile");
         let b = shadow_table_name("users", "settings");
         assert_ne!(a, b);
-        assert_eq!(a, shadow_table_name("users", "profile"), "must be stable across runs");
+        assert_eq!(
+            a,
+            shadow_table_name("users", "profile"),
+            "must be stable across runs"
+        );
         assert!(is_shadow_table(&a));
         assert!(!is_shadow_table("users"));
         assert!(a.len() <= MAX_NAME_LEN);
@@ -523,7 +575,10 @@ mod tests {
         assert_eq!(widen(&DbType::F64, &DbType::U64), None);
         // Anything genuinely incompatible becomes text.
         assert_eq!(widen(&DbType::U64, &DbType::STRING), Some(DbType::STRING));
-        assert_eq!(widen(&DbType::DATETIME, &DbType::INET), Some(DbType::STRING));
+        assert_eq!(
+            widen(&DbType::DATETIME, &DbType::INET),
+            Some(DbType::STRING)
+        );
     }
 
     #[test]

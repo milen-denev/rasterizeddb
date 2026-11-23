@@ -93,8 +93,7 @@ fn bench_appends(c: &mut Criterion) {
                         // `write_row` does it.
                         let txn = rows_io.begin_txn();
                         let _ = rows_io.append_data_txn(txn, black_box(&row)).await;
-                        let (_, token) =
-                            ptrs_io.append_data_txn(txn, black_box(&record)).await;
+                        let (_, token) = ptrs_io.append_data_txn(txn, black_box(&record)).await;
                         ptrs_io.commit_durable(token).await.unwrap();
                     }
                 })

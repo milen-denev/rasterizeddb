@@ -1,5 +1,4 @@
 use std::{
-    arch::x86_64::{_MM_HINT_T0, _mm_prefetch},
     hint::black_box,
     sync::Arc,
     thread,
@@ -8,6 +7,7 @@ use std::{
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rasterizeddb_core::cache::atomic_cache::AtomicGenericCache;
+use rasterizeddb_core::instructions::prefetch_read_l1;
 
 // Test data generation
 fn generate_test_keys(count: usize, pattern: &str) -> Vec<u64> {
@@ -51,10 +51,8 @@ fn bench_insert_throughput(c: &mut Criterion) {
         let values = generate_test_values(*size);
 
         // Prefetch data
-        unsafe {
-            _mm_prefetch::<_MM_HINT_T0>(keys.as_ptr() as *const i8);
-            _mm_prefetch::<_MM_HINT_T0>(values.as_ptr() as *const i8);
-        }
+        prefetch_read_l1(keys.as_ptr() as *const u8);
+        prefetch_read_l1(values.as_ptr() as *const u8);
 
         group.bench_with_input(BenchmarkId::new("sequential", size), size, |b, _| {
             b.iter(|| {
@@ -95,9 +93,7 @@ fn bench_get_throughput(c: &mut Criterion) {
             let _ = cache.insert(*key, *value);
         }
 
-        unsafe {
-            _mm_prefetch::<_MM_HINT_T0>(keys.as_ptr() as *const i8);
-        }
+        prefetch_read_l1(keys.as_ptr() as *const u8);
 
         group.bench_with_input(BenchmarkId::new("100_percent_hit", size), size, |b, _| {
             b.iter(|| {

@@ -15,8 +15,20 @@ use super::schema::SchemaField;
 /// no row data — so copying it costs nothing next to the scan it configures.
 #[derive(Debug, Clone)]
 pub struct RowFetch {
-    pub columns_fetching_data: SmallVec<[ColumnFetchingData; 32]>,
+    pub columns_fetching_data: FetchColumns,
 }
+
+/// How many columns a [`RowFetch`] lists before spilling to the heap.
+///
+/// Was 32, which made every `RowFetch` 776 bytes whatever it listed, and a
+/// `QueryRows` (two of them) 2,160. Both are moved by value down the read
+/// path, and on 2026-11-21 copying such state was 14% of a native point
+/// read's server CPU. 12, as for [`ROW_INLINE_COLUMNS`] and for the same
+/// application widths: 296 bytes, and a wider fetch costs one allocation.
+pub const FETCH_INLINE_COLUMNS: usize = 12;
+
+/// The columns of a [`RowFetch`]. Spell the type through this alias.
+pub type FetchColumns = SmallVec<[ColumnFetchingData; FETCH_INLINE_COLUMNS]>;
 
 #[derive(Debug, Clone)]
 pub struct ColumnFetchingData {
@@ -37,10 +49,25 @@ pub struct ColumnWritePayload {
     pub size: u32,
 }
 
+/// How many columns a `Row` holds before spilling to the heap.
+///
+/// Was 32, which made every `Row` ~1.5 KB whatever it held: a scan of a
+/// five-column table materialised 1,560 bytes per row. 12 was chosen from
+/// measurement (`examples/row_inline_capacity_bench.rs`, 1M rows): against 32
+/// it is 2x faster to materialise and fold rows of 4–12 columns, ties at 20,
+/// and still wins at 40; against 8 it gives up ~25% at 4–8 columns and wins
+/// 15–60% at 12. The application schemas fetch 2–22 columns (companions
+/// included), so 12 has the smallest worst-case loss.
+pub const ROW_INLINE_COLUMNS: usize = 12;
+
+/// A row's columns. Spell the type through this alias so the inline capacity
+/// is changed in one place.
+pub type RowColumns = SmallVec<[Column; ROW_INLINE_COLUMNS]>;
+
 #[derive(Debug, Default, Clone)]
 pub struct Row {
     pub position: u64,
-    pub columns: SmallVec<[Column; 32]>,
+    pub columns: RowColumns,
     #[cfg(feature = "enable_long_row")]
     pub length: u64,
     #[cfg(not(feature = "enable_long_row"))]
@@ -75,7 +102,7 @@ impl Row {
             // pass indices keeps working.
             let field = schema
                 .iter()
-                .find(|f| f.write_order == col.schema_id)
+                .find(|f| f.write_order == u64::from(col.schema_id))
                 .or_else(|| schema.get(col.schema_id as usize))?;
             if field.name == *column_name {
                 Some(col.data.clone())
@@ -143,7 +170,9 @@ impl Row {
                 std::ptr::copy_nonoverlapping((column_size as u64).to_le_bytes().as_ptr(), p, 8);
                 p = p.add(8);
 
-                std::ptr::copy_nonoverlapping(column.schema_id.to_le_bytes().as_ptr(), p, 8);
+                // Still 8 bytes on the wire: widened, never a 4-byte read
+                // stretched over 8.
+                std::ptr::copy_nonoverlapping(u64::from(column.schema_id).to_le_bytes().as_ptr(), p, 8);
                 p = p.add(8);
 
                 if column_size > 0 {
@@ -184,6 +213,9 @@ impl Row {
             cursor.read_exact(&mut column_data)?;
 
             let column_type = DbType::from_byte(cursor.read_u8()?);
+            // A column id past 32 bits is not one DDL can have handed out, so
+            // the buffer is damaged; refused rather than truncated.
+            let schema_id = u32::try_from(schema_id).map_err(|_| truncated_row())?;
             columns.push(Column {
                 schema_id,
                 data: column_data_mb,
@@ -201,48 +233,40 @@ impl Row {
         cursor: &mut std::io::Cursor<&[u8]>,
         global_position: &mut u64,
     ) -> std::io::Result<Self> {
-        #[cfg(feature = "enable_long_row")]
-        let length = cursor.read_u64::<byteorder::LittleEndian>().unwrap();
+        let bytes: &[u8] = cursor.get_ref();
+        let start = usize::try_from(*global_position).map_err(|_| truncated_row())?;
+        let rest = bytes.get(start..).ok_or_else(truncated_row)?;
+        let len = serialized_row_len(rest)?;
+        let row = Row::decode(&rest[..len])?;
+        let end = start + len;
+        cursor.set_position(end as u64);
+        *global_position = end as u64;
+        Ok(row)
+    }
 
-        #[cfg(not(feature = "enable_long_row"))]
-        let length = cursor.read_u32::<byteorder::LittleEndian>().unwrap();
-
-        let mut columns = SmallVec::new();
-
-        #[cfg(feature = "enable_long_row")]
-        const ADD_LENGTH: u64 = 8;
-
-        #[cfg(not(feature = "enable_long_row"))]
-        const ADD_LENGTH: u64 = 4;
-
-        let mut current_position = global_position.clone() + ADD_LENGTH;
-        let end_position = current_position + length as u64;
-
-        cursor.set_position(current_position);
-
-        loop {
-            if current_position == end_position {
-                break;
+    /// Decodes exactly one serialized row: its length header and that many
+    /// payload bytes. `bytes` may run on past the row; the rest is ignored.
+    ///
+    /// Every length is checked against the buffer before it is used. A column
+    /// size read from a damaged buffer used to be handed straight to the
+    /// allocator and then to an `unwrap`ped read, so corruption was a panic —
+    /// or, with a large enough size, an allocation failure.
+    pub fn decode(bytes: &[u8]) -> std::io::Result<Self> {
+        let cells = serialized_cells(bytes)?;
+        let length = cells.length;
+        let mut columns: RowColumns = SmallVec::new();
+        for cell in cells {
+            let cell = cell?;
+            let mut data = MEMORY_POOL.acquire(cell.data.len());
+            if !cell.data.is_empty() {
+                data.into_slice_mut().copy_from_slice(cell.data);
             }
-
-            let column_size = cursor.read_u64::<byteorder::LittleEndian>().unwrap();
-            let schema_id = cursor.read_u64::<byteorder::LittleEndian>().unwrap();
-
-            let mut column_data_mb = MEMORY_POOL.acquire(column_size as usize);
-            let mut column_data = column_data_mb.into_slice_mut();
-            cursor.read_exact(&mut column_data).unwrap();
-
-            let column_type = DbType::from_byte(cursor.read_u8().unwrap());
             columns.push(Column {
-                schema_id,
-                data: column_data_mb,
-                column_type,
+                schema_id: cell.schema_id,
+                data,
+                column_type: cell.column_type,
             });
-
-            current_position = current_position + 8 + 8 + column_size + 1;
         }
-
-        *global_position += current_position as u64;
 
         Ok(Row {
             position: 0,
@@ -250,6 +274,223 @@ impl Row {
             length,
         })
     }
+}
+
+/// One column of a serialized row, borrowed from the buffer.
+pub struct SerializedCell<'a> {
+    pub schema_id: u32,
+    pub column_type: DbType,
+    pub data: &'a [u8],
+}
+
+/// The columns of one serialized row, read in place — nothing is copied or
+/// allocated. What a consumer that only reads the values (the wire encoder)
+/// uses instead of decoding the row into a `Row`.
+pub struct SerializedCells<'a> {
+    bytes: &'a [u8],
+    position: usize,
+    end: usize,
+    /// The row's length header, as `Row::length` carries it.
+    #[cfg(feature = "enable_long_row")]
+    pub length: u64,
+    #[cfg(not(feature = "enable_long_row"))]
+    pub length: u32,
+}
+
+/// Reads the columns of the serialized row at the front of `bytes` (its
+/// length header included; anything after the row is ignored).
+///
+/// Every length is checked against the buffer before it is used. A column
+/// size read from a damaged buffer used to be handed straight to the
+/// allocator and then to an `unwrap`ped read, so corruption was a panic —
+/// or, with a large enough size, an allocation failure.
+pub fn serialized_cells(bytes: &[u8]) -> std::io::Result<SerializedCells<'_>> {
+    let header = bytes.get(..ROW_LEN_HEADER).ok_or_else(truncated_row)?;
+    #[cfg(feature = "enable_long_row")]
+    let length = u64::from_le_bytes(header.try_into().unwrap());
+    #[cfg(not(feature = "enable_long_row"))]
+    let length = u32::from_le_bytes(header.try_into().unwrap());
+
+    let end = usize::try_from(length)
+        .ok()
+        .and_then(|l| l.checked_add(ROW_LEN_HEADER))
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(truncated_row)?;
+    Ok(SerializedCells {
+        bytes,
+        position: ROW_LEN_HEADER,
+        end,
+        length,
+    })
+}
+
+impl<'a> Iterator for SerializedCells<'a> {
+    type Item = std::io::Result<SerializedCell<'a>>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let p = self.position;
+        if p >= self.end {
+            return None;
+        }
+        let bytes = self.bytes;
+        let end = self.end;
+        // A failure ends the iteration: nothing after a bad length is
+        // trustworthy.
+        self.position = end;
+        if end - p < COLUMN_OVERHEAD {
+            return Some(Err(truncated_row()));
+        }
+        let size = u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap());
+        let schema_id = u64::from_le_bytes(bytes[p + 8..p + 16].try_into().unwrap());
+        // Serialized as 8 bytes for format stability; a value past 32 bits
+        // cannot be a column id, so the buffer is damaged.
+        let Ok(schema_id) = u32::try_from(schema_id) else {
+            return Some(Err(truncated_row()));
+        };
+        let Some(size) = usize::try_from(size)
+            .ok()
+            .filter(|s| *s <= end - p - COLUMN_OVERHEAD)
+        else {
+            return Some(Err(truncated_row()));
+        };
+        let data_at = p + 16;
+        let column_type = DbType::from_byte(bytes[data_at + size]);
+        self.position = data_at + size + 1;
+        Some(Ok(SerializedCell {
+            schema_id,
+            column_type,
+            data: &bytes[data_at..data_at + size],
+        }))
+    }
+}
+
+#[cfg(feature = "enable_long_row")]
+const ROW_LEN_HEADER: usize = 8;
+#[cfg(not(feature = "enable_long_row"))]
+const ROW_LEN_HEADER: usize = 4;
+
+/// Per column: an 8-byte size, an 8-byte schema id and a 1-byte type tag,
+/// around the data itself.
+const COLUMN_OVERHEAD: usize = 8 + 8 + 1;
+
+fn truncated_row() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "a serialized row is truncated or its lengths are inconsistent",
+    )
+}
+
+/// The byte length of the serialized row at the front of `bytes`, header
+/// included, checked against the buffer.
+#[inline]
+fn serialized_row_len(bytes: &[u8]) -> std::io::Result<usize> {
+    let header = bytes.get(..ROW_LEN_HEADER).ok_or_else(truncated_row)?;
+    #[cfg(feature = "enable_long_row")]
+    let payload = u64::from_le_bytes(header.try_into().unwrap());
+    #[cfg(not(feature = "enable_long_row"))]
+    let payload = u32::from_le_bytes(header.try_into().unwrap()) as u64;
+    usize::try_from(payload)
+        .ok()
+        .and_then(|p| p.checked_add(ROW_LEN_HEADER))
+        .filter(|len| *len <= bytes.len())
+        .ok_or_else(truncated_row)
+}
+
+/// The rows of a serialized result, one slice each (header included), found by
+/// walking the length headers — nothing is decoded.
+///
+/// Unlike [`count_serialized_rows`], a buffer that ends partway through a row
+/// is an error rather than the end: this feeds rows to a client, and a short
+/// answer must not pass for a complete one.
+pub struct SerializedRows<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> Iterator for SerializedRows<'a> {
+    type Item = std::io::Result<&'a [u8]>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.position >= self.bytes.len() {
+            return None;
+        }
+        let rest = &self.bytes[self.position..];
+        match serialized_row_len(rest) {
+            Ok(len) => {
+                self.position += len;
+                Some(Ok(&rest[..len]))
+            }
+            Err(e) => {
+                // One error, then done: there is no next row to find after a
+                // header that cannot be trusted.
+                self.position = self.bytes.len();
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+pub fn serialized_rows(bytes: &[u8]) -> SerializedRows<'_> {
+    SerializedRows { bytes, position: 0 }
+}
+
+/// What a serialized row is deduplicated by when some of its columns hold
+/// documents: each cell's id, type and bytes, as comparing the rows' bytes
+/// would see them, except that a document cell — one typed `jsonb`, or one
+/// `document(position)` names — is keyed by its value, so `{"a":1}` and
+/// `{"a":1.0}` are one row to `DISTINCT` and `UNION`, as `=` says they are. A
+/// document's type tag is left out of its key: a scan reports a stored
+/// document as text and a computed one as `jsonb`, and the two are the same
+/// value. A NULL keeps its tag, so it never meets a value.
+///
+/// `None` when the row cannot be read; the caller then compares its bytes.
+pub fn value_key(row: &[u8], document: impl Fn(usize) -> bool) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(row.len() + 16);
+    for (position, cell) in serialized_cells(row).ok()?.enumerate() {
+        let cell = cell.ok()?;
+        out.extend_from_slice(&cell.schema_id.to_le_bytes());
+        if cell.column_type == DbType::JSONB
+            || (cell.column_type != DbType::NULL && document(position))
+        {
+            out.push(u8::MAX);
+            crate::core::jsonb::push_group_key(cell.data, &mut out);
+        } else if let Some(canonical) = (cell.column_type == DbType::DECIMAL)
+            .then(|| crate::core::value_codec::canonical_numeric_cell(cell.data))
+            .flatten()
+        {
+            // A NUMERIC carrying its own scale by its value: 1.5 is 1.50.
+            out.extend_from_slice(&(canonical.len() as u32).to_le_bytes());
+            out.extend_from_slice(&canonical);
+        } else if cell.column_type == DbType::CHAR {
+            // A legacy `CHAR` by its one stored form
+            // (`value_codec::legacy_char_canonical`).
+            out.push(DbType::CHAR.to_byte());
+            out.extend_from_slice(&crate::core::value_codec::legacy_char_canonical(cell.data));
+        } else {
+            out.push(cell.column_type.to_byte());
+            out.extend_from_slice(&(cell.data.len() as u32).to_le_bytes());
+            out.extend_from_slice(cell.data);
+        }
+    }
+    Some(out)
+}
+
+/// Everything after the first `n` rows of a serialized result, as a subslice.
+///
+/// What `OFFSET` needs when it is the only reason to touch the rows: the rows
+/// it drops are walked by their length headers and never decoded, and the
+/// page that remains is already in the wire format. Fewer than `n` rows leaves
+/// nothing.
+pub fn skip_serialized_rows(bytes: &[u8], n: u64) -> std::io::Result<&[u8]> {
+    let mut position = 0usize;
+    let mut skipped = 0u64;
+    while skipped < n && position < bytes.len() {
+        position += serialized_row_len(&bytes[position..])?;
+        skipped += 1;
+    }
+    Ok(&bytes[position..])
 }
 
 pub fn rows_into_vec(rows: Vec<Row>) -> Vec<u8> {
@@ -263,29 +504,101 @@ pub fn rows_into_vec(rows: Vec<Row>) -> Vec<u8> {
     vec
 }
 
-pub fn vec_into_rows(bytes: &[u8]) -> std::io::Result<Vec<Row>> {
-    let mut rows = Vec::new();
-    let mut cursor = std::io::Cursor::new(bytes);
+/// How many rows a serialized result holds, without decoding any of them.
+///
+/// Each row is a length header followed by that many bytes, so counting is a
+/// walk of the headers. The statement log needs the figure for every result the
+/// native protocol returns, and decoding a million-row answer to count it would
+/// cost more than producing it did.
+///
+/// A truncated or malformed buffer stops the walk rather than failing: this
+/// answers a statistic, and a wrong count is not worth turning into an error
+/// the caller would have to handle on the way out of a statement that worked.
+pub fn count_serialized_rows(bytes: &[u8]) -> u64 {
+    #[cfg(feature = "enable_long_row")]
+    const LEN_HEADER: usize = 8;
+    #[cfg(not(feature = "enable_long_row"))]
+    const LEN_HEADER: usize = 4;
 
-    let mut global_position = 0;
-    let len = bytes.len() as u64;
+    let mut position = 0usize;
+    let mut rows = 0u64;
+    while position + LEN_HEADER <= bytes.len() {
+        #[cfg(feature = "enable_long_row")]
+        let payload =
+            u64::from_le_bytes(bytes[position..position + LEN_HEADER].try_into().unwrap()) as usize;
+        #[cfg(not(feature = "enable_long_row"))]
+        let payload =
+            u32::from_le_bytes(bytes[position..position + LEN_HEADER].try_into().unwrap()) as usize;
 
-    // Fix: Loop until all bytes are consumed
-    while (cursor.position() as u64) < len {
-        let row = Row::from_cursor(&mut cursor, &mut global_position)?;
-        rows.push(row);
-        // Ensure global_position is updated to cursor's position
-        global_position = cursor.position() as u64;
+        let next = position + LEN_HEADER + payload;
+        if next > bytes.len() {
+            break;
+        }
+        position = next;
+        rows += 1;
     }
+    rows
+}
 
+pub fn vec_into_rows(bytes: &[u8]) -> std::io::Result<Vec<Row>> {
+    // Not pre-sized, deliberately. Counting the rows first so the vector is
+    // allocated once looks like a win for a 1.5 KB element and measured as
+    // none (1M rows, 2 and 6 columns: 374 vs 370 ms, 421 vs 420 ms — see
+    // `examples/result_pipeline_bench.rs decode`): a buffer that size is
+    // mmap'ed, and glibc grows it with `mremap`, which moves no bytes.
+    let mut rows = Vec::new();
+    for row in serialized_rows(bytes) {
+        rows.push(Row::decode(row?)?);
+    }
     Ok(rows)
 }
 
+/// One value of a row.
+///
+/// 32 bytes, from 48: a 24-byte `MemoryBlock`, the type tag and a 32-bit
+/// `schema_id`. `schema_id` is the column's `SchemaField::write_order`, which
+/// is a `u64` in the schema; DDL refuses to hand out a write order that does
+/// not fit 32 bits (`check_write_order`), and every conversion goes through
+/// [`schema_id_of`], which refuses rather than truncates. Compare the other way
+/// by widening (`u64::from(column.schema_id) == field.write_order`).
 #[derive(Debug, Clone)]
 pub struct Column {
-    pub schema_id: u64,
+    pub schema_id: u32,
     pub data: MemoryBlock,
     pub column_type: DbType,
+}
+
+const _: () = assert!(std::mem::size_of::<Column>() == 32);
+
+/// The largest write order a column can have: `Column::schema_id` is 32 bits.
+pub const MAX_WRITE_ORDER: u64 = u32::MAX as u64;
+
+/// A schema write order as a `Column::schema_id`.
+///
+/// Panics past `u32::MAX` instead of truncating: a truncated id names a
+/// different column, and every lookup by it would then read the wrong value
+/// without any error. DDL refuses such write orders before any row can carry
+/// one (see `check_write_order`), so reaching the panic is a bug.
+#[inline(always)]
+pub fn schema_id_of(write_order: u64) -> u32 {
+    match u32::try_from(write_order) {
+        Ok(id) => id,
+        Err(_) => panic!(
+            "write order {} does not fit a column id (max {})",
+            write_order, MAX_WRITE_ORDER
+        ),
+    }
+}
+
+/// Refuses a write order a `Column` cannot carry. Called where DDL assigns one.
+pub fn check_write_order(write_order: u64) -> Result<(), String> {
+    if write_order > MAX_WRITE_ORDER {
+        return Err(format!(
+            "the table has used up its column ids: write order {} exceeds {}",
+            write_order, MAX_WRITE_ORDER
+        ));
+    }
+    Ok(())
 }
 
 impl Column {
@@ -314,7 +627,7 @@ pub fn column_vec_into_vec<'a>(
         // placeholder and much harder to trace back to here.
         let name = schema
             .iter()
-            .find(|f| f.write_order == column.schema_id)
+            .find(|f| f.write_order == u64::from(column.schema_id))
             .or_else(|| schema.get(column.schema_id as usize))
             .map(|f| Cow::Borrowed(f.name.as_str()))
             .unwrap_or_else(|| Cow::Owned(format!("column_{}", column.schema_id)));
@@ -330,12 +643,15 @@ pub enum ReturnResult {
 #[cfg(test)]
 mod row_tests {
     use super::*;
-    use crate::core::{db_type::DbType, tokenizer::query_tokenizer::{numeric_to_mb, str_to_mb, NumericValue}};
+    use crate::core::{
+        db_type::DbType,
+        tokenizer::query_tokenizer::{NumericValue, numeric_to_mb, str_to_mb},
+    };
 
     fn make_numeric_column(schema_id: u64, value: NumericValue, column_type: DbType) -> Column {
         let mb = numeric_to_mb(&value);
         Column {
-            schema_id,
+            schema_id: crate::core::row::row::schema_id_of(schema_id),
             data: mb,
             column_type,
         }
@@ -344,7 +660,7 @@ mod row_tests {
     fn make_string_column(schema_id: u64, value: &str, column_type: DbType) -> Column {
         let mb = str_to_mb(value);
         Column {
-            schema_id,
+            schema_id: crate::core::row::row::schema_id_of(schema_id),
             data: mb,
             column_type,
         }
@@ -359,11 +675,7 @@ mod row_tests {
     #[cfg(not(feature = "enable_long_row"))]
     type TestRowLen = u32;
 
-    fn make_test_row(
-        position: u64,
-        columns: SmallVec<[Column; 32]>,
-        length: TestRowLen,
-    ) -> Row {
+    fn make_test_row(position: u64, columns: RowColumns, length: TestRowLen) -> Row {
         Row {
             position,
             columns,
@@ -513,6 +825,46 @@ mod row_tests {
         let row2 = Row::from_vec(&vec).unwrap();
         assert_eq!(row2.columns.len(), 1);
         assert_eq!(row2.columns[0].data.into_slice(), large_str.as_bytes());
+    }
+
+    /// The statement log counts a native-protocol result rather than decoding
+    /// it, so the walk of the length headers has to agree with the decoder on
+    /// every shape — including rows of different widths in one buffer, which is
+    /// what a `RETURNING` over a mixed schema produces.
+    #[test]
+    fn counting_rows_agrees_with_decoding_them() {
+        for widths in [vec![1usize], vec![1, 3, 2], vec![4, 4, 4, 4], vec![]] {
+            let mut rows = Vec::new();
+            for (i, width) in widths.iter().enumerate() {
+                let columns: RowColumns = (0..*width)
+                    .map(|c| {
+                        make_string_column(
+                            c as u64,
+                            &format!("r{}c{}{}", i, c, "x".repeat(c * 7)),
+                            DbType::STRING,
+                        )
+                    })
+                    .collect();
+                rows.push(make_test_row(i as u64, columns, 0));
+            }
+            let bytes = rows_into_vec(rows);
+            assert_eq!(
+                count_serialized_rows(&bytes),
+                vec_into_rows(&bytes).unwrap().len() as u64,
+                "widths {:?}",
+                widths
+            );
+        }
+
+        // A buffer cut short stops the walk rather than counting a row that is
+        // not all there.
+        let bytes = rows_into_vec(vec![make_test_row(
+            0,
+            smallvec::smallvec![make_string_column(0, "whole", DbType::STRING)],
+            0,
+        )]);
+        assert_eq!(count_serialized_rows(&bytes), 1);
+        assert_eq!(count_serialized_rows(&bytes[..bytes.len() - 1]), 0);
     }
 
     #[test]

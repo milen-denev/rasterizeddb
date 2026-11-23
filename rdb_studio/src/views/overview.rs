@@ -206,6 +206,7 @@ mod tests {
             hot: true,
             set_with: String::new(),
             help: String::new(),
+            ..ConfigEntry::default()
         }
     }
 

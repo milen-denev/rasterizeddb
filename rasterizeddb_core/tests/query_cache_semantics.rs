@@ -87,8 +87,14 @@ async fn setup(dir: &str, table: &str) -> Arc<Database> {
         .add_table(CreateTable {
             table_name: table.to_string(),
             columns: vec![
-                CreateColumnData { name: "id".into(), data_type: DbType::U64 },
-                CreateColumnData { name: "age".into(), data_type: DbType::I32 },
+                CreateColumnData {
+                    name: "id".into(),
+                    data_type: DbType::U64,
+                },
+                CreateColumnData {
+                    name: "age".into(),
+                    data_type: DbType::I32,
+                },
             ],
             is_immutable: false,
             foreign_keys: Vec::new(),
@@ -96,14 +102,16 @@ async fn setup(dir: &str, table: &str) -> Arc<Database> {
             primary_key: None,
             json_columns: Vec::new(),
             unique_columns: Vec::new(),
-        unique_keys: Vec::new(),
+            unique_keys: Vec::new(),
             type_modifiers: Vec::new(),
+            generated: Vec::new(),
+            checks: Vec::new(),
             if_not_exists: false,
         })
         .await
         .expect("create table");
 
-    let t = database.tables.get(table).expect("table").value().clone();
+    let t = database.table_for_tests(table).expect("table");
     for id in 1..=ROW_COUNT {
         // Age descends as id ascends, so ORDER BY age has to actually reorder.
         t.insert_row(row(id, (ROW_COUNT - id) as i32))
@@ -179,7 +187,12 @@ async fn repeated_queries_are_served_from_the_cache() {
 
     // A write retires the entry, so the next read misses and re-stores.
     let resp = run(&db, "DELETE FROM t_hit WHERE id = 1").await;
-    assert_ne!(resp.first().copied(), Some(3u8), "delete failed: {:?}", resp);
+    assert_ne!(
+        resp.first().copied(),
+        Some(3u8),
+        "delete failed: {:?}",
+        resp
+    );
     assert_eq!(row_count(&run(&db, ALL).await), ROW_COUNT as usize - 1);
     let (h3, _, s3) = query_cache::stats();
     assert_eq!(h3, h2, "a stale entry must not count as a hit");
@@ -242,7 +255,10 @@ async fn order_by_survives_a_cache_hit() {
 
     clear_cache();
     let cold = column_i32(&run(&db, SORTED).await, 1);
-    assert!(cold.windows(2).all(|w| w[0] <= w[1]), "cold scan is unsorted");
+    assert!(
+        cold.windows(2).all(|w| w[0] <= w[1]),
+        "cold scan is unsorted"
+    );
 
     // Warm the entry with the unordered query, then ask for it ordered.
     clear_cache();
@@ -263,7 +279,7 @@ async fn writes_invalidate_cached_answers() {
     init_globals();
     let dir = tempfile::tempdir().unwrap();
     let db = setup(dir.path().to_str().unwrap(), "t_write").await;
-    let table = db.tables.get("t_write").unwrap().value().clone();
+    let table = db.table_for_tests("t_write").unwrap();
 
     const ALL: &str = "SELECT id, age FROM t_write WHERE id > 0";
 
@@ -274,7 +290,12 @@ async fn writes_invalidate_cached_answers() {
 
     // DELETE: the removed row must not be served out of the warm entry.
     let resp = run(&db, "DELETE FROM t_write WHERE id = 7").await;
-    assert_ne!(resp.first().copied(), Some(3u8), "delete failed: {:?}", resp);
+    assert_ne!(
+        resp.first().copied(),
+        Some(3u8),
+        "delete failed: {:?}",
+        resp
+    );
     let after_delete = column_u64(&run(&db, ALL).await, 0);
     assert_eq!(after_delete.len(), ROW_COUNT as usize - 1);
     assert!(
@@ -283,7 +304,10 @@ async fn writes_invalidate_cached_answers() {
     );
 
     // INSERT: a new match must show up.
-    table.insert_row(row(ROW_COUNT + 1, 500)).await.expect("insert");
+    table
+        .insert_row(row(ROW_COUNT + 1, 500))
+        .await
+        .expect("insert");
     let after_insert = column_u64(&run(&db, ALL).await, 0);
     assert_eq!(after_insert.len(), ROW_COUNT as usize);
     assert!(
@@ -304,22 +328,30 @@ async fn entries_are_not_shared_across_tables_or_clauses() {
     db.add_table(CreateTable {
         table_name: "t_b".into(),
         columns: vec![
-            CreateColumnData { name: "id".into(), data_type: DbType::U64 },
-            CreateColumnData { name: "age".into(), data_type: DbType::I32 },
+            CreateColumnData {
+                name: "id".into(),
+                data_type: DbType::U64,
+            },
+            CreateColumnData {
+                name: "age".into(),
+                data_type: DbType::I32,
+            },
         ],
         is_immutable: false,
         foreign_keys: Vec::new(),
         defaults: Vec::new(),
-            primary_key: None,
+        primary_key: None,
         json_columns: Vec::new(),
         unique_columns: Vec::new(),
         unique_keys: Vec::new(),
-            type_modifiers: Vec::new(),
+        type_modifiers: Vec::new(),
+        generated: Vec::new(),
+        checks: Vec::new(),
         if_not_exists: false,
     })
     .await
     .expect("create t_b");
-    let b = db.tables.get("t_b").unwrap().value().clone();
+    let b = db.table_for_tests("t_b").unwrap();
     for id in 1..=3u64 {
         b.insert_row(row(id, id as i32)).await.expect("insert");
     }
@@ -352,4 +384,54 @@ async fn entries_are_not_shared_across_tables_or_clauses() {
         row_count(&run(&db, "SELECT id, age FROM t_a WHERE id > 0").await),
         ROW_COUNT as usize
     );
+}
+
+/// Each row served from a cached top-N must carry its own payload.
+///
+/// The cached path no longer fetches the payload while it sorts: with an
+/// `ORDER BY … LIMIT` it reads the sort key, keeps the pointer, and reads the
+/// rest afterwards for the rows that survived. `order_by_survives_a_cache_hit`
+/// above checks the sort column, which is the one column that cannot detect a
+/// row stitched to the wrong pointer — so this checks the *other* column, and
+/// checks it against the same ordering uncapped rather than against the
+/// `id + age == ROW_COUNT` invariant the fixture happens to satisfy. A payload
+/// read through the wrong pointer is a real row and satisfies that invariant
+/// perfectly; it is simply the wrong row, and only the uncapped answer says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cached_top_n_keeps_each_row_with_its_own_payload() {
+    let _serial = SERIAL.lock().await;
+    init_globals();
+    let dir = tempfile::tempdir().unwrap();
+    let db = setup(dir.path().to_str().unwrap(), "t_pairs").await;
+
+    const ALL: &str = "SELECT id, age FROM t_pairs WHERE id > 0";
+    const SORTED: &str = "SELECT id, age FROM t_pairs WHERE id > 0 ORDER BY age ASC";
+
+    clear_cache();
+    let full = run(&db, SORTED).await;
+    let full_ids = column_u64(&full, 0);
+    let full_ages = column_i32(&full, 1);
+    assert_eq!(full_ids.len(), ROW_COUNT as usize, "the uncapped answer is short");
+
+    // Warm the entry with the unordered clause, so every page below is served
+    // from the cache rather than rescanned.
+    clear_cache();
+    let _ = run(&db, ALL).await;
+
+    for cap in [1usize, 3, 10, ROW_COUNT as usize] {
+        let sql = format!("{SORTED} LIMIT {cap}");
+        let page = run(&db, &sql).await;
+        let want = cap.min(ROW_COUNT as usize);
+        assert_eq!(
+            column_u64(&page, 0),
+            full_ids[..want].to_vec(),
+            "LIMIT {cap}: ids differ from the uncapped ordering, so a row was \
+             paired with another row's payload"
+        );
+        assert_eq!(
+            column_i32(&page, 1),
+            full_ages[..want].to_vec(),
+            "LIMIT {cap}: ages differ from the uncapped ordering"
+        );
+    }
 }

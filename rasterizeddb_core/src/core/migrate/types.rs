@@ -246,7 +246,10 @@ pub fn map_column(column: &SourceColumn, json: JsonMapping) -> Mapping {
             declared: "NUMERIC".to_string(),
             conversion: Conversion::Decimal,
             select_cast: Some("::numeric"),
-            note: Some("money became NUMERIC, read as an exact amount without its currency symbol".to_string()),
+            note: Some(
+                "money became NUMERIC, read as an exact amount without its currency symbol"
+                    .to_string(),
+            ),
             decimal_scale: None,
         },
 
@@ -261,9 +264,10 @@ pub fn map_column(column: &SourceColumn, json: JsonMapping) -> Mapping {
 
         "bytea" => Mapping::plain(DbType::BYTEA, "BYTEA", Conversion::Bytea),
 
-        "timestamp" | "timestamptz" => {
-            Mapping::plain(DbType::DATETIME, "TIMESTAMP", Conversion::Timestamp)
-        }
+        // Declared as each is: `TIMESTAMP` alone is a `timestamp` (without
+        // time zone) here as there, so `timestamptz` has to say so.
+        "timestamp" => Mapping::plain(DbType::DATETIME, "TIMESTAMP", Conversion::Timestamp),
+        "timestamptz" => Mapping::plain(DbType::DATETIME, "TIMESTAMPTZ", Conversion::Timestamp),
         "date" => Mapping::noted(
             DbType::DATETIME,
             "TIMESTAMP",
@@ -271,14 +275,33 @@ pub fn map_column(column: &SourceColumn, json: JsonMapping) -> Mapping {
             "date became TIMESTAMP at midnight; this engine has no date-only type".to_string(),
         ),
 
-        "text" | "varchar" | "bpchar" | "name" | "citext" | "xml" => {
-            Mapping::plain(DbType::STRING, "TEXT", Conversion::Text)
-        }
-        // `"char"` is PostgreSQL's internal one-byte type, and `bpchar` is
-        // `character(n)`. Neither is this engine's `CHAR`, which holds one
-        // Unicode scalar in four bytes, so both go to `TEXT` — a `character(3)`
-        // stored as `CHAR` would keep three bytes of a four-byte cell and read
-        // back with the tail of whatever the encoder left.
+        // `character(n)` and `character varying(n)` are types here with their
+        // declared length (`type_modifier::TextTypmod`), so they keep it: a
+        // `char(5)` value is held to five characters, stored without its
+        // trailing spaces, compared blank-padded and shown padded, as in
+        // PostgreSQL. `COPY` sends a `char(5)` 'ab' as 'ab   ', which the
+        // column stores as 'ab'. Both were TEXT, so 'ab' no longer matched
+        // a key copied across padded, and nothing held the length.
+        "bpchar" => match text_length(column.type_modifier) {
+            Some(n) => Mapping::plain(DbType::STRING, &format!("CHARACTER({n})"), Conversion::Text),
+            // A bare `bpchar` has no length to hold or pad to.
+            None => Mapping::noted(
+                DbType::STRING,
+                "BPCHAR",
+                Conversion::Text,
+                "bpchar without a length became BPCHAR, which compares as PostgreSQL's does but \
+                 does not keep a value's trailing spaces"
+                    .to_string(),
+            ),
+        },
+        "varchar" => match text_length(column.type_modifier) {
+            Some(n) => Mapping::plain(DbType::STRING, &format!("VARCHAR({n})"), Conversion::Text),
+            None => Mapping::plain(DbType::STRING, "VARCHAR", Conversion::Text),
+        },
+        "text" | "name" | "citext" | "xml" => Mapping::plain(DbType::STRING, "TEXT", Conversion::Text),
+        // `"char"` is PostgreSQL's internal one-byte type, which has no
+        // counterpart here: it is not `character(1)`, which holds a
+        // character rather than a byte.
         "char" => Mapping::noted(
             DbType::STRING,
             "TEXT",
@@ -345,9 +368,9 @@ pub fn map_column(column: &SourceColumn, json: JsonMapping) -> Mapping {
         // Types with a faithful text rendering and no counterpart here. Listed
         // rather than left to the fallback so that the report says what they
         // were instead of calling them unrecognised.
-        "time" | "timetz" | "interval" | "macaddr" | "macaddr8" | "bit" | "varbit"
-        | "tsvector" | "tsquery" | "point" | "line" | "lseg" | "box" | "path" | "polygon"
-        | "circle" | "pg_lsn" | "txid_snapshot" => Mapping::noted(
+        "time" | "timetz" | "interval" | "macaddr" | "macaddr8" | "bit" | "varbit" | "tsvector"
+        | "tsquery" | "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle"
+        | "pg_lsn" | "txid_snapshot" => Mapping::noted(
             DbType::STRING,
             "TEXT",
             Conversion::Text,
@@ -434,29 +457,37 @@ pub fn literal(mapping: &Mapping, value: Option<&str>) -> Result<String, String>
 
         Conversion::Decimal => {
             if matches!(value, "NaN" | "Infinity" | "-Infinity") {
-                return Err(format!(
-                    "NUMERIC '{}' has no representation here: this engine's DECIMAL is an exact \
-                     fixed-point number and has no not-a-number or infinity",
-                    value
-                ));
+                // The engine's one refusal of them, on every path in.
+                return Err(format!("NUMERIC '{}': {}", value, value_codec::NUMERIC_SPECIAL_REFUSAL));
             }
+            // An unconstrained `numeric` is created here as a column that keeps
+            // each value at its own scale (`value_codec::own_scale_cell`): any
+            // value of up to 38 digits and 38 places carries over whole.
             let representable = match mapping.decimal_scale {
                 Some(scale) => value_codec::parse_decimal_scaled(value, scale).is_some(),
-                None => value_codec::encode_literal(&mapping.db_type, value).is_some(),
+                None => value_codec::own_scale_cell(value).is_some(),
             };
             if representable {
                 Ok(quote(value))
             } else {
-                Err(format!(
-                    "NUMERIC {} cannot be carried over exactly: this column keeps {} decimal \
-                     places and a magnitude below about 1.7e29",
-                    value,
-                    mapping.decimal_scale.unwrap_or(value_codec::DECIMAL_SCALE)
-                ))
+                Err(match mapping.decimal_scale {
+                    Some(scale) => format!(
+                        "NUMERIC {} cannot be carried over exactly: this column keeps {} decimal \
+                         places and a magnitude below about 1.7e29",
+                        value, scale
+                    ),
+                    None => format!(
+                        "NUMERIC {} cannot be carried over exactly: this engine's NUMERIC carries at \
+                         most 38 digits and 38 decimal places",
+                        value
+                    ),
+                })
             }
         }
 
-        Conversion::Uuid => checked(mapping, value).map_err(|_| format!("{:?} is not a UUID", value)),
+        Conversion::Uuid => {
+            checked(mapping, value).map_err(|_| format!("{:?} is not a UUID", value))
+        }
 
         Conversion::Inet => checked(mapping, value)
             .map_err(|_| format!("{:?} is not an IP address or network", value)),
@@ -528,17 +559,12 @@ fn integer_range(db_type: &DbType) -> (i128, i128) {
 /// engine's parser reads a doubled quote as one and treats every other byte —
 /// backslashes, parentheses, newlines, semicolons, comment markers — as data.
 /// Each of those was tried against the executor before this was written.
+///
+/// The same quoting the wire layer's parameter inlining does, so it is that
+/// function: the text between quotes is copied in runs rather than a
+/// character at a time, which matters for an import pushing wide rows.
 pub fn quote(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('\'');
-    for c in value.chars() {
-        if c == '\'' {
-            out.push('\'');
-        }
-        out.push(c);
-    }
-    out.push('\'');
-    out
+    crate::pg_params::quote_literal(value)
 }
 
 /// Quotes an identifier for a statement this engine will parse.
@@ -557,7 +583,10 @@ pub fn identifier(name: &str) -> String {
 /// reliably reads one.
 pub fn is_plain_identifier(name: &str) -> bool {
     !name.is_empty()
-        && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -580,8 +609,20 @@ pub fn numeric_scale(type_modifier: i32) -> Option<i32> {
     if type_modifier < 4 {
         return None;
     }
-    // `atttypmod` is `((precision << 16) | scale) + 4`.
-    Some((type_modifier - 4) & 0xffff)
+    // `atttypmod` is `((precision << 16) | (scale & 0x7ff)) + 4`: the scale
+    // is eleven bits, signed, since PostgreSQL 15 allows `numeric(5, -2)`
+    // (`numeric_typmod_scale`). Read as sixteen unsigned bits, -2 was 2046
+    // and the import refused the column as too many decimal places.
+    Some((((type_modifier - 4) & 0x7ff) ^ 1024) - 1024)
+}
+
+/// The declared length of a `character(n)` or `character varying(n)`:
+/// `atttypmod` is `n + 4`, and -1 when no length was declared. `None` for
+/// one past what a column here can declare, which PostgreSQL's own limit
+/// keeps from happening.
+pub fn text_length(type_modifier: i32) -> Option<u32> {
+    let n = u32::try_from(type_modifier.checked_sub(4)?).ok()?;
+    (n >= 1 && n <= crate::core::rql::type_modifier::MAX_TEXT_LENGTH).then_some(n)
 }
 
 /// The declared precision of a `numeric(p, s)`.
@@ -627,16 +668,50 @@ mod tests {
             ("float8", "DOUBLE PRECISION", DbType::F64),
             ("numeric", "NUMERIC", DbType::DECIMAL),
             ("text", "TEXT", DbType::STRING),
-            ("varchar", "TEXT", DbType::STRING),
+            ("varchar", "VARCHAR", DbType::STRING),
             ("uuid", "UUID", DbType::UUID),
             ("inet", "INET", DbType::INET),
             ("bytea", "BYTEA", DbType::BYTEA),
-            ("timestamptz", "TIMESTAMP", DbType::DATETIME),
+            ("timestamp", "TIMESTAMP", DbType::DATETIME),
+            ("timestamptz", "TIMESTAMPTZ", DbType::DATETIME),
         ] {
             let m = mapping_of(pg);
             assert_eq!(m.declared, declared, "{}", pg);
             assert_eq!(m.db_type, db_type, "{}", pg);
         }
+    }
+
+    /// `character(n)` and `character varying(n)` keep their length, read
+    /// from `atttypmod` (`n + 4`; -1 for none). They were TEXT, so nothing
+    /// held the length and a `char(n)` key lost its blank-padded equality.
+    #[test]
+    fn character_types_keep_their_declared_length() {
+        for (pg, typmod, declared) in [
+            ("bpchar", 9, "CHARACTER(5)"),
+            ("bpchar", 5, "CHARACTER(1)"),
+            ("bpchar", -1, "BPCHAR"),
+            ("varchar", 259, "VARCHAR(255)"),
+            ("varchar", -1, "VARCHAR"),
+            ("text", -1, "TEXT"),
+        ] {
+            let mut c = column(pg);
+            c.type_modifier = typmod;
+            let m = map_column(&c, JsonMapping::Text);
+            assert_eq!((m.declared.as_str(), m.db_type.clone(), m.conversion), (declared, DbType::STRING, Conversion::Text), "{pg}({typmod})");
+            // The declaration is one this engine reads back as that type.
+            let tokens: Vec<&str> = m.declared.split_whitespace().collect();
+            assert_eq!(
+                crate::core::rql::lexer_alter::parse_column_type(&tokens).map(|(t, _)| t),
+                Ok(DbType::STRING),
+                "{}",
+                m.declared
+            );
+        }
+        // `"char"`, the one-byte type, is not `character(1)`.
+        assert_eq!(mapping_of("char").declared, "TEXT");
+        assert_eq!(text_length(4), None);
+        assert_eq!(text_length(-1), None);
+        assert_eq!(text_length(14), Some(10));
     }
 
     #[test]
@@ -702,7 +777,10 @@ mod tests {
         assert_eq!(lit("int2", "32767").unwrap(), "32767");
         assert_eq!(lit("int2", "-32768").unwrap(), "-32768");
         assert!(lit("int2", "32768").unwrap_err().contains("does not fit"));
-        assert_eq!(lit("int8", "9223372036854775807").unwrap(), "9223372036854775807");
+        assert_eq!(
+            lit("int8", "9223372036854775807").unwrap(),
+            "9223372036854775807"
+        );
         assert!(lit("int4", "notanumber").is_err());
     }
 
@@ -710,7 +788,10 @@ mod tests {
     /// zero by the insert path, which then reports success.
     #[test]
     fn values_the_engine_would_silently_zero_are_refused() {
-        assert!(lit("numeric", "0.1234567891").is_err(), "ten decimal places");
+        assert!(
+            lit("numeric", "0.123456789012345678901234567890123456789").is_err(),
+            "39 decimal places: past what a NUMERIC cell holds"
+        );
         assert!(lit("numeric", "NaN").is_err());
         assert!(lit("numeric", "1e40").is_err(), "past the DECIMAL range");
         assert!(lit("uuid", "not-a-uuid").is_err());
@@ -724,6 +805,13 @@ mod tests {
         assert_eq!(lit("numeric", "123.45").unwrap(), "'123.45'");
         assert_eq!(lit("numeric", "0.123456789").unwrap(), "'0.123456789'");
         assert_eq!(lit("numeric", "-1.5").unwrap(), "'-1.5'");
+        // An unconstrained numeric goes into a column that keeps each value's
+        // own scale: past nine places too, to 38.
+        assert_eq!(lit("numeric", "0.1234567891").unwrap(), "'0.1234567891'");
+        assert_eq!(
+            lit("numeric", "0.12345678901234567890123456789012345678").unwrap(),
+            "'0.12345678901234567890123456789012345678'"
+        );
         assert_eq!(
             lit("uuid", "550e8400-e29b-41d4-a716-446655440000").unwrap(),
             "'550e8400-e29b-41d4-a716-446655440000'"
@@ -750,7 +838,11 @@ mod tests {
     fn bytea_has_to_be_hex() {
         assert_eq!(lit("bytea", "\\x48656c6c6f").unwrap(), "'\\x48656c6c6f'");
         assert_eq!(lit("bytea", "\\x").unwrap(), "'\\x'");
-        assert!(lit("bytea", "Hello").unwrap_err().contains("rather than hex"));
+        assert!(
+            lit("bytea", "Hello")
+                .unwrap_err()
+                .contains("rather than hex")
+        );
     }
 
     #[test]
@@ -772,6 +864,9 @@ mod tests {
         assert_eq!(numeric_precision(typmod), Some(10));
         assert_eq!(numeric_scale(typmod), Some(2));
         assert_eq!(numeric_scale(-1), None);
+        // numeric(5, -2) and numeric(3, 5), as PostgreSQL 17 records them.
+        assert_eq!((numeric_precision(329730), numeric_scale(329730)), (Some(5), Some(-2)));
+        assert_eq!(numeric_scale(((3 << 16) | 5) + 4), Some(5));
     }
 
     #[test]

@@ -1,0 +1,193 @@
+name: Release - server and Studio executables
+
+# Channel 3 of 3. Tag `v<version>` (the version in
+# rasterizeddb_core/Cargo.toml) builds the server and RasterizedDB Studio
+# (rdb_studio) for four targets on native runners, smoke-tests each server
+# binary (start, write, kill -9, restart, read), and attaches the archives
+# and their SHA-256 sums to the GitHub release:
+#
+#   rasterizeddb-server-<version>-linux-x86_64.tar.gz     (x86-64-v3: AVX2 CPUs)
+#   rasterizeddb-server-<version>-linux-arm64.tar.gz      (armv8-a)
+#   rasterizeddb-server-<version>-windows-x86_64.zip      (x86-64-v3: AVX2 CPUs)
+#   rasterizeddb-server-<version>-windows-arm64.zip       (armv8-a)
+#   rdb-studio-<version>-<same four platforms>.tar.gz / .zip
+#
+# Studio is a desktop application (iced): it is built in the release profile
+# without PGO, and only built here, since it cannot start without a display.
+# Its archives carry the release's version; rdb_studio is versioned with the
+# server (1.0.0 at the first release).
+#
+# Every binary is built with profile-guided optimisation: an instrumented
+# build runs pgo_train's workload (both protocols, loads, point reads and
+# writes, scans, aggregates, joins, transactions), and the release build uses
+# that profile. Linux binaries are then BOLTed, trained the same way
+# (.github/scripts/pgo-build.sh).
+#
+# Linux builds link glibc dynamically and run on glibc 2.39 or newer
+# (Ubuntu 24.04, Debian 13, RHEL 10). Run it by hand to build and test
+# the binaries without making a release; a pull request that changes the
+# build runs it too, also without a release.
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release-binaries.yml"
+      - ".github/scripts/pgo-build.sh"
+      - ".github/scripts/smoke.sh"
+      - "pgo_train/**"
+  workflow_dispatch:
+    inputs:
+      pgo:
+        description: "Build with PGO (and BOLT on Linux); off builds a plain release binary"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_MIN_STACK: "33554432"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    # Three release builds with fat LTO (instrumented, optimised, plus the
+    # training driver) and two training runs.
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, archive: tar.gz }
+          - { name: linux-arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, archive: tar.gz }
+          - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc, archive: zip }
+          - { name: windows-arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc, archive: zip }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          target: ${{ matrix.target }}
+
+      # A pre-release tag (v1.0.0-rc.1) matches the version without its
+      # suffix and makes a GitHub pre-release.
+      - name: The tag matches the server version
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          ALLOW_PRERELEASE: 1
+        run: bash .github/scripts/check-version.sh v rasterizeddb_core
+
+      # Per-target rustflags (32 MiB main-thread stack; x86-64-v3 on x86-64)
+      # come from .cargo/config.toml, so RUSTFLAGS must stay unset here;
+      # pgo-build.sh adds its flags with --config, which appends to them.
+      - name: PGO and BOLT tools
+        if: github.event_name != 'workflow_dispatch' || inputs.pgo
+        shell: bash
+        run: |
+          rustup component add llvm-tools
+          if [ "${{ runner.os }}" = Linux ]; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q bolt-20
+            echo "LLVM_BOLT=$(command -v llvm-bolt-20 || echo /usr/lib/llvm-20/bin/llvm-bolt)" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build (release profile, fat LTO, PGO; BOLT on Linux)
+        if: github.event_name != 'workflow_dispatch' || inputs.pgo
+        shell: bash
+        run: bash .github/scripts/pgo-build.sh ${{ matrix.target }}
+
+      - name: Build (release profile, fat LTO, no PGO)
+        if: github.event_name == 'workflow_dispatch' && !inputs.pgo
+        run: cargo build --locked --release --target ${{ matrix.target }} -p rasterizeddb_core --bin rasterizeddb_core
+
+      - name: Smoke test the release binary
+        shell: bash
+        run: |
+          cargo build --locked --target ${{ matrix.target }} -p rasterizeddb_client --example quickstart
+          ext="${{ runner.os == 'Windows' && '.exe' || '' }}"
+          bash .github/scripts/smoke.sh \
+            "target/${{ matrix.target }}/release/rasterizeddb_core$ext" \
+            "target/${{ matrix.target }}/debug/examples/quickstart$ext"
+
+      # Studio: the release profile, no PGO (its time goes to the GPU and the
+      # network, not to code a training run would cover). Built, not run: it
+      # opens a window at start.
+      - name: Build RasterizedDB Studio (release profile)
+        run: cargo build --locked --release --target ${{ matrix.target }} -p rdb_studio
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          version="$(cargo pkgid -p rasterizeddb_core | sed 's/.*[#@]//')"
+          ext="${{ runner.os == 'Windows' && '.exe' || '' }}"
+          # pack <name>: archives dist/<name> as the matrix says, prints the file.
+          pack() {
+            if [ "${{ matrix.archive }}" = zip ]; then
+              pwsh -NoProfile -Command "Compress-Archive -Path '$1' -DestinationPath '$1.zip'" >/dev/null
+              echo "dist/$1.zip"
+            else
+              tar czf "$1.tar.gz" "$1" >/dev/null
+              echo "dist/$1.tar.gz"
+            fi
+          }
+          server="rasterizeddb-server-$version-${{ matrix.name }}"
+          mkdir -p "dist/$server"
+          cp "target/${{ matrix.target }}/release/rasterizeddb_core$ext" "dist/$server/rasterizeddb$ext"
+          cp README.md LICENSE-GPL "dist/$server/"
+          studio="rdb-studio-$version-${{ matrix.name }}"
+          mkdir -p "dist/$studio"
+          cp "target/${{ matrix.target }}/release/rdb_studio$ext" "dist/$studio/rdb-studio$ext"
+          cp rdb_studio/README.md "dist/$studio/README.md"
+          cp LICENSE-GPL "dist/$studio/"
+          cd dist
+          {
+            echo "server=$(pack "$server")"
+            echo "studio=$(pack "$studio")"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ steps.package.outputs.server }}
+            ${{ steps.package.outputs.studio }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum rasterizeddb-server-* rdb-studio-* > SHA256SUMS && cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: "RasterizedDB ${{ github.ref_name }}"
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/rasterizeddb-server-*
+            dist/rdb-studio-*
+            dist/SHA256SUMS
+          body: |
+            The RasterizedDB server for Linux and Windows, x86-64 and ARM64.
+
+            | Platform | Archive | CPU |
+            |---|---|---|
+            | Linux x86-64 | `linux-x86_64.tar.gz` | x86-64-v3 (AVX2: Intel Haswell / AMD Excavator or later) |
+            | Linux ARM64 | `linux-arm64.tar.gz` | any ARMv8-A |
+            | Windows x86-64 | `windows-x86_64.zip` | x86-64-v3 (AVX2) |
+            | Windows ARM64 | `windows-arm64.zip` | any ARMv8-A |
+
+            Built with fat LTO and profile-guided optimisation; the Linux binaries are also optimised with BOLT. Linux binaries need glibc 2.39+. Start with `rasterizeddb --location <dir>` (or `--in-memory`); `rasterizeddb --help` lists every option. Verify a download with `sha256sum -c SHA256SUMS`.
+
+            **RasterizedDB Studio** (`rdb-studio-*`), the desktop console for RasterizedDB and PostgreSQL, is in the same four builds: dashboard, tables and schema, data editing, queries, activity, benchmarks, backups, branches, replication, migration, key/value browsing, roles and configuration. Run `rdb-studio` (`rdb-studio.exe` on Windows). It needs a desktop session: on Linux a Wayland or X11 session with a Vulkan or OpenGL driver, glibc 2.39+; the x86-64 builds need an AVX2 CPU like the server. Saved passwords go to the OS credential store (the Secret Service on Linux, Credential Manager on Windows).

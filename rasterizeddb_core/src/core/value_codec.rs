@@ -29,6 +29,11 @@ pub const INET_LEN: usize = 18;
 /// matches what Postgres' input function takes for the common cases.
 pub fn parse_uuid(text: &str) -> Option<[u8; UUID_LEN]> {
     let s = text.trim();
+    // `{…}` around the whole, as `uuid_in` accepts; it was refused.
+    let s = match s.strip_prefix('{') {
+        Some(inner) => inner.strip_suffix('}')?,
+        None => s,
+    };
     let mut out = [0u8; UUID_LEN];
     let mut n = 0usize;
     let mut hi: Option<u8> = None;
@@ -51,7 +56,11 @@ pub fn parse_uuid(text: &str) -> Option<[u8; UUID_LEN]> {
         }
     }
 
-    if n == UUID_LEN && hi.is_none() { Some(out) } else { None }
+    if n == UUID_LEN && hi.is_none() {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// Renders 16 octets in the canonical 8-4-4-4-12 lowercase form.
@@ -65,6 +74,18 @@ pub fn format_uuid(raw: &[u8]) -> String {
         s.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap());
     }
     s
+}
+
+/// A version 4, variant 1 UUID (RFC 4122) from the cryptographic generator.
+///
+/// `gen_random_uuid()` values end up as keys and tokens that applications
+/// treat as unguessable, which a `fastrand` stream is not.
+pub fn random_uuid_v4() -> [u8; UUID_LEN] {
+    let mut bytes = [0u8; UUID_LEN];
+    crate::auth::fill_random(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    bytes
 }
 
 // ---------------------------------------------------------------- INET
@@ -131,6 +152,98 @@ pub fn format_inet(raw: &[u8]) -> Option<String> {
     }
 }
 
+// ------------------------------------------------------- digit writers
+
+/// `10^i` for every power that fits a `u64`.
+const POW10_U64: [u64; 20] = {
+    let mut table = [1u64; 20];
+    let mut i = 1;
+    while i < 20 {
+        table[i] = table[i - 1] * 10;
+        i += 1;
+    }
+    table
+};
+
+/// `"00" "01" … "99"`: two decimal digits per lookup.
+const TWO_DIGITS: &[u8; 200] = b"\
+0001020304050607080910111213141516171819\
+2021222324252627282930313233343536373839\
+4041424344454647484950515253545556575859\
+6061626364656667686970717273747576777879\
+8081828384858687888990919293949596979899";
+
+/// Appends `n` (below 100) as exactly two digits.
+#[inline]
+fn push_two(out: &mut Vec<u8>, n: usize) {
+    let i = n * 2;
+    out.extend_from_slice(&TWO_DIGITS[i..i + 2]);
+}
+
+/// Writes the digits of `n` right-aligned into `buf`, returning where they
+/// start.
+#[inline]
+fn digits_u64(buf: &mut [u8; 20], mut n: u64) -> usize {
+    let mut cur = 20;
+    while n >= 10_000 {
+        let rem = (n % 10_000) as usize;
+        n /= 10_000;
+        cur -= 4;
+        buf[cur..cur + 2].copy_from_slice(&TWO_DIGITS[(rem / 100) * 2..(rem / 100) * 2 + 2]);
+        buf[cur + 2..cur + 4].copy_from_slice(&TWO_DIGITS[(rem % 100) * 2..(rem % 100) * 2 + 2]);
+    }
+    let mut n = n as usize;
+    if n >= 100 {
+        let i = (n % 100) * 2;
+        n /= 100;
+        cur -= 2;
+        buf[cur..cur + 2].copy_from_slice(&TWO_DIGITS[i..i + 2]);
+    }
+    if n >= 10 {
+        cur -= 2;
+        buf[cur..cur + 2].copy_from_slice(&TWO_DIGITS[n * 2..n * 2 + 2]);
+    } else {
+        cur -= 1;
+        buf[cur] = b'0' + n as u8;
+    }
+    cur
+}
+
+/// Appends `n` in decimal — what `n.to_string()` would say.
+#[inline]
+pub fn write_u64(out: &mut Vec<u8>, n: u64) {
+    let mut buf = [0u8; 20];
+    let start = digits_u64(&mut buf, n);
+    out.extend_from_slice(&buf[start..]);
+}
+
+/// Appends `n` in decimal — what `n.to_string()` would say.
+#[inline]
+pub fn write_i64(out: &mut Vec<u8>, n: i64) {
+    if n < 0 {
+        out.push(b'-');
+    }
+    write_u64(out, n.unsigned_abs());
+}
+
+/// Appends `n` in decimal — what `n.to_string()` would say.
+pub fn write_i128(out: &mut Vec<u8>, n: i128) {
+    match i64::try_from(n) {
+        Ok(small) => write_i64(out, small),
+        Err(_) => out.extend_from_slice(n.to_string().as_bytes()),
+    }
+}
+
+/// Appends `n` zero-padded to `width` digits — `format!("{:0width$}", n)` for
+/// an `n` that fits the width, which every caller guarantees.
+#[inline]
+fn write_u64_padded(out: &mut Vec<u8>, n: u64, width: usize) {
+    let mut buf = [b'0'; 20];
+    let start = digits_u64(&mut buf, n);
+    debug_assert!(20 - start <= width && width <= 20);
+    out.extend_from_slice(&buf[(20 - width).min(start)..]);
+}
+
 // ------------------------------------------------------------ DATETIME
 
 /// Microseconds between the Unix epoch and Postgres' 2000-01-01 epoch.
@@ -169,14 +282,41 @@ pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 /// an optional trailing `Z` or `±HH[:MM]` offset. A bare integer is taken as
 /// microseconds already, so existing callers that stored epoch values keep
 /// working.
+/// Days in `month` of the proleptic Gregorian `year`.
+pub fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+        _ => 28,
+    }
+}
+
 pub fn parse_timestamp_us(text: &str) -> Option<i64> {
+    parse_timestamp(text, true)
+}
+
+/// [`parse_timestamp_us`] for a `timestamp` (without time zone): a trailing
+/// zone (`Z`, `+02`, `-05:30`) is accepted and *discarded*, as PostgreSQL's
+/// `timestamp_in` discards it, so `'2024-01-01 10:00:00+02'` is 10:00 and not
+/// the 08:00 UTC instant it names.
+pub fn parse_timestamp_local_us(text: &str) -> Option<i64> {
+    parse_timestamp(text, false)
+}
+
+/// The text as a timestamp, a trailing zone converted to UTC when
+/// `apply_zone`, read and dropped otherwise.
+fn parse_timestamp(text: &str, apply_zone: bool) -> Option<i64> {
     let s = text.trim();
     if s.is_empty() {
         return None;
     }
 
     // Bare integer: already an epoch value.
-    if s.chars().enumerate().all(|(i, c)| c.is_ascii_digit() || (i == 0 && c == '-')) {
+    if s.chars()
+        .enumerate()
+        .all(|(i, c)| c.is_ascii_digit() || (i == 0 && c == '-'))
+    {
         return s.parse::<i64>().ok();
     }
 
@@ -201,7 +341,11 @@ pub fn parse_timestamp_us(text: &str) -> Option<i64> {
                     // `+02`
                     1 | 2 => (digits.parse::<i64>().ok()?, 0),
                     // `+0200`
-                    4 => (digits[..2].parse::<i64>().ok()?, digits[2..].parse::<i64>().ok()?),
+                    // `get`: four bytes need not be four characters.
+                    4 => (
+                        digits.get(..2)?.parse::<i64>().ok()?,
+                        digits.get(2..)?.parse::<i64>().ok()?,
+                    ),
                     _ => return None,
                 },
             };
@@ -223,28 +367,44 @@ pub fn parse_timestamp_us(text: &str) -> Option<i64> {
     if date_iter.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
+    // `2026-02-30` is refused, as PostgreSQL refuses it. Range-checking the day
+    // against 31 alone let it through, and the day count then rolled it over to
+    // 2 March: a different date, stored as if it were the one written.
+    if day > days_in_month(year, month) {
+        return None;
+    }
 
     let (mut hour, mut minute, mut second, mut micros) = (0i64, 0i64, 0i64, 0i64);
     if !time_part.is_empty() {
         let mut time_iter = time_part.split(':');
         hour = time_iter.next()?.parse().ok()?;
-        minute = time_iter.next().map(str::parse::<i64>).transpose().ok()?.unwrap_or(0);
+        minute = time_iter
+            .next()
+            .map(str::parse::<i64>)
+            .transpose()
+            .ok()?
+            .unwrap_or(0);
         if let Some(sec_field) = time_iter.next() {
             match sec_field.split_once('.') {
                 Some((whole, frac)) => {
                     second = whole.parse().ok()?;
-                    // Pad or truncate the fraction to exactly 6 digits.
-                    let mut f = String::with_capacity(6);
-                    for c in frac.chars().take(6) {
-                        if !c.is_ascii_digit() {
-                            return None;
+                    if frac.is_empty() || !frac.bytes().all(|c| c.is_ascii_digit()) {
+                        return None;
+                    }
+                    // Rounded to the microsecond as PostgreSQL rounds it
+                    // (`rint(strtod(".ffff") * 1e6)`, ties to even), not cut:
+                    // `.4999995` is `.500000`, which `::timestamp(0)` then
+                    // rounds up to the next second.
+                    micros = if frac.len() <= 6 {
+                        let mut f = frac.to_string();
+                        while f.len() < 6 {
+                            f.push('0');
                         }
-                        f.push(c);
-                    }
-                    while f.len() < 6 {
-                        f.push('0');
-                    }
-                    micros = f.parse().ok()?;
+                        f.parse().ok()?
+                    } else {
+                        let fraction: f64 = format!("0.{frac}").parse().ok()?;
+                        (fraction * 1_000_000.0).round_ties_even() as i64
+                    };
                 }
                 None => second = sec_field.parse().ok()?,
             }
@@ -257,6 +417,9 @@ pub fn parse_timestamp_us(text: &str) -> Option<i64> {
         }
     }
 
+    if !apply_zone {
+        offset_minutes = 0;
+    }
     let days = days_from_civil(year, month, day);
     let secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
     Some((secs - offset_minutes * 60) * 1_000_000 + micros)
@@ -267,6 +430,50 @@ pub fn parse_timestamp_us(text: &str) -> Option<i64> {
 /// The fractional part is dropped when zero and trailing zeroes are trimmed,
 /// matching Postgres' own output.
 pub fn format_timestamp_us(us: i64) -> String {
+    let mut out = Vec::with_capacity(26);
+    format_timestamp_us_into(us, &mut out);
+    String::from_utf8(out).expect("a timestamp renders as ASCII")
+}
+
+/// [`format_timestamp_us`], appended to `out` without a `format!` per field.
+pub fn format_timestamp_us_into(us: i64, out: &mut Vec<u8>) {
+    let secs = us.div_euclid(1_000_000);
+    let frac = us.rem_euclid(1_000_000);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400) as usize;
+    let (y, m, d) = civil_from_days(days);
+
+    if (0..=9999).contains(&y) {
+        let y = y as usize;
+        push_two(out, y / 100);
+        push_two(out, y % 100);
+    } else {
+        // `{:04}` counts a sign in the width: year -5 prints as `-005`.
+        out.extend_from_slice(format!("{:04}", y).as_bytes());
+    }
+    out.push(b'-');
+    push_two(out, m as usize);
+    out.push(b'-');
+    push_two(out, d as usize);
+    out.push(b' ');
+    push_two(out, tod / 3_600);
+    out.push(b':');
+    push_two(out, (tod % 3_600) / 60);
+    out.push(b':');
+    push_two(out, tod % 60);
+
+    if frac != 0 {
+        out.push(b'.');
+        write_u64_padded(out, frac as u64, 6);
+        // Trailing zeroes trimmed; `frac` is non-zero, so a digit survives.
+        while out.last() == Some(&b'0') {
+            out.pop();
+        }
+    }
+}
+
+#[cfg(test)]
+fn format_timestamp_us_legacy(us: i64) -> String {
     let secs = us.div_euclid(1_000_000);
     let frac = us.rem_euclid(1_000_000);
     let days = secs.div_euclid(86_400);
@@ -310,8 +517,8 @@ const DECIMAL_SCALE_FACTOR: i128 = 1_000_000_000;
 /// Parses a decimal literal into unscaled `i128` units.
 ///
 /// Accepts an optional sign, digits, an optional fractional part, and an
-/// optional exponent. Fractional digits beyond [`DECIMAL_SCALE`] are rejected
-/// rather than rounded away: silently dropping precision from a money value is
+/// optional exponent. Nonzero fractional digits beyond [`DECIMAL_SCALE`] are
+/// rejected rather than rounded away: silently dropping precision from a money value is
 /// worse than refusing it.
 /// Parses a decimal literal at a given scale.
 ///
@@ -352,9 +559,24 @@ pub fn parse_decimal_scaled(text: &str, scale: u32) -> Option<i128> {
     if int_part.is_empty() && frac_part.is_empty() {
         return None;
     }
-    if !int_part.bytes().all(|b| b.is_ascii_digit()) || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
     {
         return None;
+    }
+
+    // Fast path: no exponent, and few enough digits to gather in a `u64`.
+    // Exactly the steps below, without building the digit string: dropping
+    // excess places is dividing by ten per digit dropped.
+    if exponent == 0 && int_part.len() + frac_part.len() <= 19 {
+        let mut value = gather_digits(int_part, frac_part);
+        let mut frac_len = frac_part.len() as u32;
+        if frac_len > scale {
+            value /= POW10_U64[(frac_len - scale) as usize];
+            frac_len = scale;
+        }
+        let unscaled = (value as i128).checked_mul(10i128.checked_pow(scale - frac_len)?)?;
+        return Some(if negative { -unscaled } else { unscaled });
     }
 
     let mut digits = String::with_capacity(int_part.len() + frac_part.len());
@@ -376,9 +598,271 @@ pub fn parse_decimal_scaled(text: &str, scale: u32) -> Option<i128> {
         frac_len -= 1;
     }
 
-    let mut unscaled: i128 = if digits.is_empty() { 0 } else { digits.parse().ok()? };
+    let mut unscaled: i128 = if digits.is_empty() {
+        0
+    } else {
+        digits.parse().ok()?
+    };
     unscaled = unscaled.checked_mul(10i128.checked_pow(scale - frac_len)?)?;
     Some(if negative { -unscaled } else { unscaled })
+}
+
+/// The integer PostgreSQL assigns to an integer column for a number literal
+/// written with a fraction or an exponent: `2.5` and `-2.5` (numeric) round
+/// half away from zero to 3 and -3, `1.5::float8` (or `::real`) half to
+/// even, as `rint`. `None` for anything else: an integer already, a quoted
+/// string (`'2.5'`, which PostgreSQL refuses for an integer), an expression,
+/// or a value no `i128` holds. The caller encodes the result at the column's
+/// type, which refuses it past the type's range.
+pub fn integer_from_number_literal(text: &str) -> Option<String> {
+    let t = text.trim();
+    let lower = t.to_ascii_lowercase();
+    let (body, float) = match lower.find("::") {
+        Some(at) => {
+            let cast = lower[at + 2..].trim();
+            let float = match cast {
+                "float8" | "float4" | "real" | "double precision" | "float" => true,
+                "numeric" | "decimal" => false,
+                _ => return None,
+            };
+            (t[..at].trim(), float)
+        }
+        None => (t, false),
+    };
+    let body = body.strip_prefix('(').and_then(|b| b.strip_suffix(')')).map(str::trim).unwrap_or(body);
+    let unsigned = body.strip_prefix(['-', '+']).unwrap_or(body);
+    if unsigned.is_empty()
+        || !unsigned.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'-' | b'+'))
+        || !unsigned.bytes().next().is_some_and(|b| b.is_ascii_digit() || b == b'.')
+        || !unsigned.contains(['.', 'e', 'E'])
+    {
+        return None;
+    }
+    if float || body.contains(['e', 'E']) {
+        let f: f64 = body.parse().ok()?;
+        let r = if float { f.round_ties_even() } else { f.round() };
+        if !r.is_finite() || r.abs() >= 1e38 {
+            return None;
+        }
+        return Some(format!("{}", r as i128));
+    }
+    parse_decimal_rounded(body, 0).map(|v| v.to_string())
+}
+
+/// Parses a decimal literal at `scale`, rounding the places past it half away
+/// from zero — PostgreSQL's rule for a value assigned to `NUMERIC(p, s)` and
+/// for a cast to one. [`parse_decimal_scaled`] truncates instead, which is
+/// what a comparison has to see the literal's digits through, and was wrong
+/// for storage: `20.169` and `20.165` into `NUMERIC(12,2)` both stored 20.16.
+///
+/// Only the first dropped digit decides half away from zero, so the literal is
+/// read one place deeper than `scale` (two when that would land on the engine
+/// scale, whose reader refuses extra places rather than truncating them) and
+/// rounded from there.
+pub fn parse_decimal_rounded(text: &str, scale: u32) -> Option<i128> {
+    let deeper = if scale + 1 == DECIMAL_SCALE { scale + 2 } else { scale + 1 };
+    let Some(raw) = parse_decimal_scaled(text, deeper) else {
+        // One place deeper does not fit an i128: a value of 38 digits, which
+        // a NUMERIC(38, s) holds. Refused here, the INSERT reported a
+        // precision overflow for 99999999999999999999999999999999999998.
+        // Read at the scale itself, exact when no digit past it is written
+        // (nothing to round); anything else is still refused.
+        return (!digits_past_scale(text, scale)).then(|| parse_decimal_scaled(text, scale)).flatten();
+    };
+    let divisor = 10i128.pow(deeper - scale);
+    let (quotient, remainder) = (raw / divisor, raw % divisor);
+    if remainder.unsigned_abs() * 2 >= divisor.unsigned_abs() {
+        quotient.checked_add(raw.signum())
+    } else {
+        Some(quotient)
+    }
+}
+
+/// Whether `text` writes a nonzero digit past `scale` places, or anything
+/// this cannot tell without parsing (an exponent).
+fn digits_past_scale(text: &str, scale: u32) -> bool {
+    let t = text.trim();
+    if t.contains(['e', 'E']) {
+        return true;
+    }
+    match t.split_once('.') {
+        Some((_, frac)) => frac.bytes().skip(scale as usize).any(|b| b != b'0'),
+        None => false,
+    }
+}
+
+/// Refuses a value held at `scale` that a `NUMERIC(precision, scale)` column
+/// cannot hold: PostgreSQL's `numeric field overflow`, SQLSTATE 22003. The
+/// precision was recorded and never enforced, so `NUMERIC(12,2)` stored
+/// 100000000000.00, twelve integer digits where it declares room for ten.
+///
+/// Checked after rounding to the scale, as PostgreSQL checks it:
+/// `9999999999.995` rounds to 10000000000.00 and overflows, while
+/// `9999999999.994` fits. A precision this engine cannot represent, or one
+/// below the scale, is not checked.
+pub fn check_numeric_precision(unscaled: i128, precision: u32, scale: u32) -> Result<(), String> {
+    if precision == 0 || precision > 38 || precision < scale {
+        return Ok(());
+    }
+    if unscaled.unsigned_abs() >= 10u128.pow(precision) {
+        return Err(format!(
+            "numeric field overflow: a field with precision {}, scale {} must round to an \
+             absolute value less than 10^{}",
+            precision,
+            scale,
+            precision - scale
+        ));
+    }
+    Ok(())
+}
+
+/// A `double precision` value's text, as PostgreSQL's `float8out` writes it
+/// (`extra_float_digits` at its default of 1): the shortest digits that read
+/// back as the same float, in fixed notation when the decimal exponent is
+/// from -4 to 14 and in exponential notation otherwise, with a sign and at
+/// least two exponent digits — `1e+20`, `1e-07`, `0.1`, `123456789012345`.
+/// `NaN`, `Infinity` and `-Infinity` by name, and `-0` for negative zero.
+///
+/// Rust's own rendering never switches to an exponent: `1e20` was written
+/// `100000000000000000000`, which also failed a `varchar(6)` PostgreSQL's
+/// six-character `1e+20` fits.
+pub fn pg_float8_text(v: f64) -> String {
+    let mut out = Vec::with_capacity(24);
+    pg_float8_text_into(v, &mut out);
+    String::from_utf8(out).expect("a float renders as ASCII")
+}
+
+/// [`pg_float8_text`], appended to `out` with no allocation of its own.
+pub fn pg_float8_text_into(v: f64, out: &mut Vec<u8>) {
+    if let Some(name) = float_name(v.is_nan(), v.is_infinite(), v.is_sign_negative(), v == 0.0) {
+        out.extend_from_slice(name.as_bytes());
+        return;
+    }
+    let mut buf = ryu::Buffer::new();
+    pg_float_text_into(buf.format_finite(v).as_bytes(), 15, out);
+}
+
+/// A `real` read as `double precision` — `float4_float8`, exact — as the
+/// double's own shortest text: `'0.1'::real` is 0.10000000149011612. The one
+/// source for every place a `real` meets a double through text (a predicate
+/// literal, a value written into a `float8` column, a `DEFAULT`, an `IN`
+/// list), so they all read the same number.
+pub fn widened_real_text(v: f32) -> String {
+    pg_float8_text(f64::from(v))
+}
+
+/// A `real` value's text, as `float4out` writes it: [`pg_float8_text`]'s
+/// rule with the float's own shortest digits, and fixed notation for
+/// exponents from -4 to 5 — `3.4e+38`, `100000`, `1e+06`.
+pub fn pg_float4_text(v: f32) -> String {
+    let mut out = Vec::with_capacity(16);
+    pg_float4_text_into(v, &mut out);
+    String::from_utf8(out).expect("a float renders as ASCII")
+}
+
+/// [`pg_float4_text`], appended to `out` with no allocation of its own.
+pub fn pg_float4_text_into(v: f32, out: &mut Vec<u8>) {
+    if let Some(name) = float_name(v.is_nan(), v.is_infinite(), v.is_sign_negative(), v == 0.0) {
+        out.extend_from_slice(name.as_bytes());
+        return;
+    }
+    let mut buf = ryu::Buffer::new();
+    pg_float_text_into(buf.format_finite(v).as_bytes(), 6, out);
+}
+
+fn float_name(nan: bool, infinite: bool, negative: bool, zero: bool) -> Option<&'static str> {
+    if nan {
+        Some("NaN")
+    } else if infinite {
+        Some(if negative { "-Infinity" } else { "Infinity" })
+    } else if zero {
+        Some(if negative { "-0" } else { "0" })
+    } else {
+        None
+    }
+}
+
+/// Re-renders ryu's shortest digits (`1e20`, `1.5e-7`, `0.0001`,
+/// `123456789012345.0`) as PostgreSQL writes them: fixed notation when the
+/// decimal exponent of the first digit is from -4 to `fixed_below - 1`,
+/// exponential with a sign and at least two exponent digits otherwise.
+fn pg_float_text_into(shortest: &[u8], fixed_below: i32, out: &mut Vec<u8>) {
+    let (negative, body) = match shortest.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, shortest),
+    };
+    // The significant digits, without leading or trailing zeros, and the
+    // decimal exponent of the first of them. At most 17 digits.
+    let mut digits = [0u8; 24];
+    let mut n = 0usize;
+    let exp: i32;
+    match body.iter().position(|b| *b == b'e' || *b == b'E') {
+        Some(at) => {
+            for &b in &body[..at] {
+                if b != b'.' {
+                    digits[n] = b;
+                    n += 1;
+                }
+            }
+            exp = std::str::from_utf8(&body[at + 1..]).ok().and_then(|e| e.parse().ok()).unwrap_or(0);
+        }
+        None => {
+            let point = body.iter().position(|b| *b == b'.').unwrap_or(body.len());
+            let (int, frac) = (&body[..point], body.get(point + 1..).unwrap_or(&[]));
+            let lead = int.iter().take_while(|b| **b == b'0').count();
+            if lead < int.len() {
+                exp = (int.len() - lead) as i32 - 1;
+                for &b in int[lead..].iter().chain(frac) {
+                    digits[n] = b;
+                    n += 1;
+                }
+            } else {
+                let zeros = frac.iter().take_while(|b| **b == b'0').count();
+                exp = -(zeros as i32) - 1;
+                for &b in &frac[zeros..] {
+                    digits[n] = b;
+                    n += 1;
+                }
+            }
+        }
+    }
+    while n > 1 && digits[n - 1] == b'0' {
+        n -= 1;
+    }
+    let digits = &digits[..n];
+    if negative {
+        out.push(b'-');
+    }
+    if (-4..fixed_below).contains(&exp) {
+        if exp >= 0 {
+            let whole = exp as usize + 1;
+            if digits.len() <= whole {
+                out.extend_from_slice(digits);
+                out.extend(std::iter::repeat_n(b'0', whole - digits.len()));
+            } else {
+                out.extend_from_slice(&digits[..whole]);
+                out.push(b'.');
+                out.extend_from_slice(&digits[whole..]);
+            }
+        } else {
+            out.extend_from_slice(b"0.");
+            out.extend(std::iter::repeat_n(b'0', (-exp - 1) as usize));
+            out.extend_from_slice(digits);
+        }
+    } else {
+        out.push(digits[0]);
+        if digits.len() > 1 {
+            out.push(b'.');
+            out.extend_from_slice(&digits[1..]);
+        }
+        out.push(b'e');
+        out.push(if exp < 0 { b'-' } else { b'+' });
+        let magnitude = exp.unsigned_abs();
+        if magnitude < 10 {
+            out.push(b'0');
+        }
+        write_u64(out, u64::from(magnitude));
+    }
 }
 
 /// Renders an unscaled value held at `scale`, keeping every declared place.
@@ -387,8 +871,45 @@ pub fn parse_decimal_scaled(text: &str, scale: u32) -> Option<i128> {
 /// `10.5000` came back as `10.5`. The declared places are significant — they
 /// are what the column promised — so they are kept.
 pub fn format_decimal_scaled(unscaled: i128, scale: u32) -> String {
+    let mut out = Vec::with_capacity(24);
+    format_decimal_scaled_into(unscaled, scale, &mut out);
+    String::from_utf8(out).expect("a decimal renders as ASCII")
+}
+
+/// [`format_decimal_scaled`], appended to `out`.
+///
+/// A magnitude that fits a `u64` — nearly every stored value — is split with
+/// 64-bit arithmetic; the 128-bit path below is a library call per division.
+pub fn format_decimal_scaled_into(unscaled: i128, scale: u32, out: &mut Vec<u8>) {
     if scale == 0 {
-        return (unscaled / 10i128.pow(DECIMAL_SCALE)).to_string();
+        write_i128(out, unscaled);
+        return;
+    }
+    let magnitude = unscaled.unsigned_abs();
+    if scale <= 19 && magnitude <= u64::MAX as u128 {
+        let m = magnitude as u64;
+        let factor = POW10_U64[scale as usize];
+        // Negative implies a non-zero magnitude, so `-0.00` cannot arise.
+        if unscaled < 0 {
+            out.push(b'-');
+        }
+        write_u64(out, m / factor);
+        out.push(b'.');
+        write_u64_padded(out, m % factor, scale as usize);
+        return;
+    }
+    out.extend_from_slice(format_decimal_scaled_wide(unscaled, scale).as_bytes());
+}
+
+/// The general form of [`format_decimal_scaled`], for magnitudes past `u64`
+/// and scales past 19.
+fn format_decimal_scaled_wide(unscaled: i128, scale: u32) -> String {
+    // Scale 0 is `NUMERIC(10)`: stored as the integer itself, exactly as
+    // `parse_decimal_scaled(_, 0)` wrote it and `encode_pg_numeric_scaled(_, 0)`
+    // sends it. Dividing by the engine default here printed `42` as `0` over
+    // the text protocol while the binary protocol said `42`.
+    if scale == 0 {
+        return unscaled.to_string();
     }
     let negative = unscaled < 0;
     let magnitude = unscaled.unsigned_abs();
@@ -405,6 +926,17 @@ pub fn format_decimal_scaled(unscaled: i128, scale: u32) -> String {
     out.push('.');
     out.push_str(&format!("{:0width$}", frac_part, width = scale as usize));
     out
+}
+
+/// The value of the digits of `int_part` then `frac_part`, which the caller
+/// has checked are ASCII digits and at most 19 of them together.
+#[inline]
+fn gather_digits(int_part: &str, frac_part: &str) -> u64 {
+    let mut value = 0u64;
+    for b in int_part.bytes().chain(frac_part.bytes()) {
+        value = value * 10 + u64::from(b - b'0');
+    }
+    value
 }
 
 pub fn parse_decimal(text: &str) -> Option<i128> {
@@ -435,9 +967,27 @@ pub fn parse_decimal(text: &str) -> Option<i128> {
     if int_part.is_empty() && frac_part.is_empty() {
         return None;
     }
-    if !int_part.bytes().all(|b| b.is_ascii_digit()) || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
     {
         return None;
+    }
+    // Zeros at the end of the fraction are no places the value needs: an
+    // exact value written at more places than nine (`0.200000000000`, a
+    // NUMERIC(20,12)'s text) is that value, where only a nonzero digit past
+    // nine is refused. It was refused whole, as a precision overflow.
+    let frac_part = if frac_part.len() > DECIMAL_SCALE as usize { frac_part.trim_end_matches('0') } else { frac_part };
+
+    // Fast path: no exponent, and few enough digits to gather in a `u64`.
+    if exponent == 0 && int_part.len() + frac_part.len() <= 19 {
+        let frac_len = frac_part.len() as u32;
+        if frac_len > DECIMAL_SCALE {
+            return None;
+        }
+        let value = gather_digits(int_part, frac_part) as i128;
+        // Below 10^19 times 10^9: cannot overflow.
+        let unscaled = value * 10i128.pow(DECIMAL_SCALE - frac_len);
+        return Some(if negative { -unscaled } else { unscaled });
     }
 
     // Fold the exponent into the digit string so only one scaling step remains.
@@ -458,13 +1008,48 @@ pub fn parse_decimal(text: &str) -> Option<i128> {
         return None;
     }
 
-    let mut unscaled: i128 = if digits.is_empty() { 0 } else { digits.parse().ok()? };
+    let mut unscaled: i128 = if digits.is_empty() {
+        0
+    } else {
+        digits.parse().ok()?
+    };
     unscaled = unscaled.checked_mul(10i128.checked_pow(DECIMAL_SCALE - frac_len)?)?;
     Some(if negative { -unscaled } else { unscaled })
 }
 
 /// Renders unscaled units back to text, trimming trailing fractional zeroes.
 pub fn format_decimal(unscaled: i128) -> String {
+    let mut out = Vec::with_capacity(24);
+    format_decimal_into(unscaled, &mut out);
+    String::from_utf8(out).expect("a decimal renders as ASCII")
+}
+
+/// [`format_decimal`], appended to `out`.
+pub fn format_decimal_into(unscaled: i128, out: &mut Vec<u8>) {
+    let magnitude = unscaled.unsigned_abs();
+    if magnitude <= u64::MAX as u128 {
+        let m = magnitude as u64;
+        // Division by a constant: a multiply and a shift.
+        let int_part = m / 1_000_000_000;
+        let frac_part = m % 1_000_000_000;
+        if unscaled < 0 {
+            out.push(b'-');
+        }
+        write_u64(out, int_part);
+        if frac_part != 0 {
+            out.push(b'.');
+            write_u64_padded(out, frac_part, DECIMAL_SCALE as usize);
+            while out.last() == Some(&b'0') {
+                out.pop();
+            }
+        }
+        return;
+    }
+    out.extend_from_slice(format_decimal_wide(unscaled).as_bytes());
+}
+
+/// The general form of [`format_decimal`], for magnitudes past `u64`.
+fn format_decimal_wide(unscaled: i128) -> String {
     let negative = unscaled < 0;
     let magnitude = unscaled.unsigned_abs();
     let scale = DECIMAL_SCALE_FACTOR as u128;
@@ -508,6 +1093,170 @@ pub fn encode_pg_numeric(unscaled: i128) -> Vec<u8> {
 /// through a prepared statement while the identical query over the simple
 /// protocol returned `5.00`, because only one of the two paths knew the scale.
 pub fn encode_pg_numeric_scaled(unscaled: i128, scale: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + 2 * 10);
+    encode_pg_numeric_scaled_into(unscaled, scale, &mut out);
+    out
+}
+
+/// [`encode_pg_numeric_scaled`], appended to `out`.
+///
+/// Two fixes over the original, both silent wrong answers that a client
+/// decoded as a different number:
+///
+/// - **A value below 0.0001 kept weight -1.** Leading all-zero fractional
+///   groups were dropped without moving the weight, so `0.00005` reached the
+///   client as `0.5`.
+/// - **Scales 37 and 38 overflowed.** The fraction was padded to whole groups
+///   by multiplying it up, which passes `u128::MAX` at those scales; the
+///   groups are now cut out by division instead.
+pub fn encode_pg_numeric_scaled_into(unscaled: i128, scale: u32, out: &mut Vec<u8>) {
+    if scale > 38 {
+        // Past `i128`'s precision; kept exactly as it always behaved.
+        out.extend_from_slice(&encode_pg_numeric_scaled_legacy(unscaled, scale));
+        return;
+    }
+    encode_pg_numeric_parts_into(unscaled < 0, unscaled.unsigned_abs(), scale, out);
+}
+
+/// An unsigned 128-bit integer as binary `numeric` at scale 0.
+///
+/// `UBIGINT`, `HUGEINT` and `UHUGEINT` are advertised as `numeric`, as
+/// PostgreSQL does for any integer wider than `bigint`; a `UHUGEINT` above
+/// `i128::MAX` cannot pass through the signed encoder, so the magnitude goes
+/// in directly.
+pub fn encode_pg_numeric_u128_into(value: u128, out: &mut Vec<u8>) {
+    encode_pg_numeric_parts_into(false, value, 0, out);
+}
+
+/// A signed 128-bit integer as binary `numeric` at scale 0.
+pub fn encode_pg_numeric_i128_into(value: i128, out: &mut Vec<u8>) {
+    encode_pg_numeric_parts_into(value < 0, value.unsigned_abs(), 0, out);
+}
+
+/// The encoder proper: a sign and a magnitude at `scale` (at most 38).
+fn encode_pg_numeric_parts_into(negative: bool, magnitude: u128, scale: u32, out: &mut Vec<u8>) {
+    // Room for 10 integer groups (39 digits) and 10 fractional (38 digits).
+    let mut groups = [0u16; 20];
+    let int_count;
+    let frac_groups = scale.div_ceil(4) as usize;
+    let pad = (frac_groups * 4 - scale as usize) as u32;
+    let dscale;
+
+    if scale <= 16 && magnitude <= u64::MAX as u128 {
+        // The common case, in 64-bit arithmetic: every division below is by a
+        // constant or a table entry, not a 128-bit library call.
+        let m = magnitude as u64;
+        let factor = POW10_U64[scale as usize];
+        let (mut int_part, frac_part) = (m / factor, m % factor);
+
+        let mut rev = [0u16; 5];
+        let mut k = 0;
+        while int_part > 0 {
+            rev[k] = (int_part % 10_000) as u16;
+            int_part /= 10_000;
+            k += 1;
+        }
+        for i in 0..k {
+            groups[i] = rev[k - 1 - i];
+        }
+        int_count = k;
+
+        // Padded to whole groups; below 10^16, so it cannot overflow.
+        let mut padded = frac_part * POW10_U64[pad as usize];
+        for g in (0..frac_groups).rev() {
+            groups[int_count + g] = (padded % 10_000) as u16;
+            padded /= 10_000;
+        }
+
+        let mut d = scale;
+        let mut f = frac_part;
+        while d > 0 && f % 10 == 0 {
+            f /= 10;
+            d -= 1;
+        }
+        dscale = d;
+    } else {
+        let factor = 10u128.pow(scale);
+        let (mut int_part, frac_part) = (magnitude / factor, magnitude % factor);
+
+        let mut rev = [0u16; 10];
+        let mut k = 0;
+        while int_part > 0 {
+            rev[k] = (int_part % 10_000) as u16;
+            int_part /= 10_000;
+            k += 1;
+        }
+        for i in 0..k {
+            groups[i] = rev[k - 1 - i];
+        }
+        int_count = k;
+
+        // Least significant group first. It holds only `4 - pad` real digits,
+        // shifted up by `pad`; every other group holds four.
+        let mut rest = frac_part;
+        for g in (0..frac_groups).rev() {
+            let group = if g == frac_groups - 1 {
+                let unit = 10u128.pow(4 - pad);
+                let v = (rest % unit) * 10u128.pow(pad);
+                rest /= unit;
+                v
+            } else {
+                let v = rest % 10_000;
+                rest /= 10_000;
+                v
+            };
+            groups[int_count + g] = group as u16;
+        }
+
+        let mut d = scale;
+        let mut f = frac_part;
+        while d > 0 && f % 10 == 0 {
+            f /= 10;
+            d -= 1;
+        }
+        dscale = d;
+    }
+
+    let total = int_count + frac_groups;
+    // `weight` is the base-10000 exponent of the leading digit.
+    let mut weight: i16 = if int_count == 0 {
+        -1
+    } else {
+        int_count as i16 - 1
+    };
+    // Trailing all-zero groups carry no information.
+    let mut end = total;
+    while end > 1 && groups[end - 1] == 0 {
+        end -= 1;
+    }
+    // Leading zero groups only occur below 1. Each one dropped moves the
+    // first digit a group further right, which the weight has to say.
+    let mut start = 0;
+    while end - start > 1 && groups[start] == 0 {
+        start += 1;
+        weight -= 1;
+    }
+    let digits: &[u16] = if end - start == 1 && groups[start] == 0 {
+        &[]
+    } else {
+        &groups[start..end]
+    };
+
+    let sign: u16 = if negative { 0x4000 } else { 0 };
+    out.reserve(8 + digits.len() * 2);
+    out.extend_from_slice(&(digits.len() as i16).to_be_bytes());
+    out.extend_from_slice(&weight.to_be_bytes());
+    out.extend_from_slice(&sign.to_be_bytes());
+    out.extend_from_slice(&(dscale as i16).to_be_bytes());
+    for d in digits {
+        out.extend_from_slice(&d.to_be_bytes());
+    }
+}
+
+/// The original encoder. Production only reaches it past scale 38, where it
+/// behaves as it always did; tests use it as the reference the rewrite is
+/// measured against.
+fn encode_pg_numeric_scaled_legacy(unscaled: i128, scale: u32) -> Vec<u8> {
     let sign: u16 = if unscaled < 0 { 0x4000 } else { 0 };
     let magnitude = unscaled.unsigned_abs();
 
@@ -537,7 +1286,11 @@ pub fn encode_pg_numeric_scaled(unscaled: i128, scale: u32) -> Vec<u8> {
     }
 
     // `weight` is the base-10000 exponent of the leading digit.
-    let weight: i16 = if int_digits.is_empty() { -1 } else { int_digits.len() as i16 - 1 };
+    let weight: i16 = if int_digits.is_empty() {
+        -1
+    } else {
+        int_digits.len() as i16 - 1
+    };
 
     let mut digits = int_digits;
     digits.extend_from_slice(&frac_digits);
@@ -579,7 +1332,7 @@ pub fn encode_pg_numeric_scaled(unscaled: i128, scale: u32) -> Vec<u8> {
 // ----------------------------------------------------------- ARRAY / BYTEA
 
 /// Element OID written into an array whose elements came from a text literal.
-const OID_TEXT: i32 = 25;
+pub(crate) const OID_TEXT: i32 = 25;
 
 /// Encodes a Postgres array literal (`{a,b,NULL}`) into the binary array
 /// representation.
@@ -589,159 +1342,926 @@ const OID_TEXT: i32 = 25;
 /// by its bytes — with length `-1` marking `NULL`. Carrying the element OID in
 /// the value is what lets one storage type serve arrays of anything.
 pub fn parse_array_literal(text: &str) -> Option<Vec<u8>> {
-    let elements = parse_array_elements(text)?;
+    parse_array_literal_as(text, OID_TEXT)
+}
 
-    let mut out = Vec::with_capacity(20 + elements.len() * 8);
-    out.extend_from_slice(&1i32.to_be_bytes()); // one dimension
-    let has_null = elements.iter().any(Option::is_none);
+/// [`parse_array_literal`], its elements' text kept as written, under element
+/// OID `oid`: what an array whose elements are known to be of one type
+/// (`array_agg` of an integer column) is built as, so it orders as that type
+/// does ([`array_order`]).
+pub fn parse_array_literal_as(text: &str, oid: i32) -> Option<Vec<u8>> {
+    let parsed = parse_nested_array(text)?;
+    Some(build_array_dims(oid, &parsed.dims, parsed.elements.iter().map(|e| e.as_deref().map(str::as_bytes))))
+}
+
+/// An array literal read: its dimensions' lengths, outermost first (none
+/// for an empty array), and its elements in row-major order (`None` a
+/// NULL).
+pub struct NestedArray {
+    pub dims: Vec<usize>,
+    pub elements: Vec<Option<String>>,
+}
+
+/// One level of a literal: sub-arrays, or elements.
+enum Level {
+    Arrays(Vec<Level>),
+    Elements(Vec<Option<String>>),
+}
+
+/// `{a,"b,c",NULL}`, `{{1,2},{3,4}}`: PostgreSQL's array input, as many
+/// dimensions as it nests, each level's sub-arrays all of one shape.
+/// `None` for anything else — a ragged nesting (`{{1},{2,3}}`), elements
+/// beside sub-arrays, an unbalanced brace or quote.
+///
+/// The nesting was not read: `'{{a,b},{c,d}}'` in a `text[]` column was
+/// stored as four elements `{a`, `b}`, `{c`, `d}`, and printed back as
+/// `{"{a","b}","{c","d}"}`.
+pub fn parse_nested_array(text: &str) -> Option<NestedArray> {
+    let chars: Vec<char> = text.trim().chars().collect();
+    let mut at = 0usize;
+    let level = parse_level(&chars, &mut at)?;
+    if chars[at..].iter().any(|c| !c.is_whitespace()) {
+        return None;
+    }
+    let mut dims = Vec::new();
+    let mut elements = Vec::new();
+    if !flatten_level(&level, 0, &mut dims, &mut elements) {
+        return None;
+    }
+    // Any empty level makes the whole array empty, as PostgreSQL reads
+    // `{{}}`.
+    if dims.contains(&0) {
+        return Some(NestedArray { dims: Vec::new(), elements: Vec::new() });
+    }
+    Some(NestedArray { dims, elements })
+}
+
+fn parse_level(chars: &[char], at: &mut usize) -> Option<Level> {
+    while *at < chars.len() && chars[*at].is_whitespace() {
+        *at += 1;
+    }
+    if chars.get(*at) != Some(&'{') {
+        return None;
+    }
+    *at += 1;
+    let mut arrays: Vec<Level> = Vec::new();
+    let mut elements: Vec<Option<String>> = Vec::new();
+    loop {
+        while *at < chars.len() && chars[*at].is_whitespace() {
+            *at += 1;
+        }
+        match chars.get(*at)? {
+            '}' if arrays.is_empty() && elements.is_empty() => {
+                *at += 1;
+                return Some(Level::Elements(Vec::new()));
+            }
+            '{' => {
+                if !elements.is_empty() {
+                    return None;
+                }
+                arrays.push(parse_level(chars, at)?);
+            }
+            _ => {
+                if !arrays.is_empty() {
+                    return None;
+                }
+                elements.push(parse_scalar(chars, at)?);
+            }
+        }
+        while *at < chars.len() && chars[*at].is_whitespace() {
+            *at += 1;
+        }
+        match chars.get(*at)? {
+            ',' => *at += 1,
+            '}' => {
+                *at += 1;
+                return Some(if arrays.is_empty() { Level::Elements(elements) } else { Level::Arrays(arrays) });
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// One element: quoted (exact, `\` escaping), or unquoted up to a `,` or
+/// `}` (trimmed; an unquoted `NULL` is the null element).
+fn parse_scalar(chars: &[char], at: &mut usize) -> Option<Option<String>> {
+    let mut out = String::new();
+    if chars.get(*at) == Some(&'"') {
+        *at += 1;
+        loop {
+            match chars.get(*at)? {
+                '\\' => {
+                    *at += 1;
+                    out.push(*chars.get(*at)?);
+                }
+                '"' => {
+                    *at += 1;
+                    return Some(Some(out));
+                }
+                c => out.push(*c),
+            }
+            *at += 1;
+        }
+    }
+    while let Some(c) = chars.get(*at) {
+        match c {
+            ',' | '}' => break,
+            '{' | '"' => return None,
+            '\\' => {
+                *at += 1;
+                out.push(*chars.get(*at)?);
+            }
+            c => out.push(*c),
+        }
+        *at += 1;
+    }
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(if trimmed.eq_ignore_ascii_case("NULL") { None } else { Some(trimmed.to_string()) })
+}
+
+/// Flattens `level` at `depth`, recording each depth's length the first
+/// time and checking every later sub-array against it.
+fn flatten_level(level: &Level, depth: usize, dims: &mut Vec<usize>, out: &mut Vec<Option<String>>) -> bool {
+    let len = match level {
+        Level::Arrays(a) => a.len(),
+        Level::Elements(e) => e.len(),
+    };
+    match dims.get(depth) {
+        Some(&d) if d != len => return false,
+        Some(_) => {}
+        None => dims.push(len),
+    }
+    match level {
+        Level::Elements(e) => {
+            // Elements only at the innermost depth.
+            if dims.len() != depth + 1 && len > 0 {
+                return false;
+            }
+            out.extend(e.iter().cloned());
+            true
+        }
+        Level::Arrays(a) => a.iter().all(|sub| flatten_level(sub, depth + 1, dims, out)),
+    }
+}
+
+/// [`build_array`] with each dimension's length (lower bounds 1); no
+/// dimensions is the empty array.
+pub fn build_array_dims<'a>(oid: i32, dims: &[usize], elements: impl Iterator<Item = Option<&'a [u8]>> + Clone) -> Vec<u8> {
+    if dims.is_empty() {
+        let mut out = Vec::with_capacity(12);
+        out.extend_from_slice(&0i32.to_be_bytes());
+        out.extend_from_slice(&0i32.to_be_bytes());
+        out.extend_from_slice(&oid.to_be_bytes());
+        return out;
+    }
+    let has_null = elements.clone().any(|e| e.is_none());
+    let mut out = Vec::with_capacity(12 + dims.len() * 8);
+    out.extend_from_slice(&(dims.len() as i32).to_be_bytes());
     out.extend_from_slice(&i32::from(has_null).to_be_bytes());
-    out.extend_from_slice(&OID_TEXT.to_be_bytes());
-    out.extend_from_slice(&(elements.len() as i32).to_be_bytes());
-    out.extend_from_slice(&1i32.to_be_bytes()); // lower bound, as Postgres uses
-
-    for element in &elements {
+    out.extend_from_slice(&oid.to_be_bytes());
+    for d in dims {
+        out.extend_from_slice(&(*d as i32).to_be_bytes());
+        out.extend_from_slice(&1i32.to_be_bytes());
+    }
+    for element in elements {
         match element {
             None => out.extend_from_slice(&(-1i32).to_be_bytes()),
             Some(value) => {
                 out.extend_from_slice(&(value.len() as i32).to_be_bytes());
-                out.extend_from_slice(value.as_bytes());
+                out.extend_from_slice(value);
             }
         }
     }
-
-    Some(out)
+    out
 }
 
-/// Splits `{a,"b,c",NULL}` into its elements. `None` is an unquoted `NULL`.
-fn parse_array_elements(text: &str) -> Option<Vec<Option<String>>> {
-    let trimmed = text.trim();
-    let inner = trimmed.strip_prefix('{')?.strip_suffix('}')?;
-    if inner.trim().is_empty() {
-        return Some(Vec::new());
-    }
-
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    let mut was_quoted = false;
-    let mut chars = inner.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' if quoted => {
-                // Inside quotes a backslash escapes the next character.
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
-            }
-            '"' => {
-                quoted = !quoted;
-                was_quoted = true;
-            }
-            ',' if !quoted => {
-                out.push(finish_array_element(&current, was_quoted));
-                current.clear();
-                was_quoted = false;
-            }
-            _ => current.push(c),
-        }
-    }
-    if quoted {
-        return None;
-    }
-    out.push(finish_array_element(&current, was_quoted));
-
-    Some(out)
-}
-
-fn finish_array_element(raw: &str, was_quoted: bool) -> Option<String> {
-    // Only an *unquoted* NULL is the null element; `"NULL"` is the four-letter
-    // string, exactly as Postgres reads it.
-    if !was_quoted && raw.trim().eq_ignore_ascii_case("NULL") {
-        return None;
-    }
-    Some(if was_quoted { raw.to_string() } else { raw.trim().to_string() })
-}
-
-/// Renders the binary array representation back to `{a,b,NULL}`.
-pub fn format_array(raw: &[u8]) -> Option<String> {
+/// A stored array's element OID, dimensions and elements (row-major); `None`
+/// for bytes that are not one.
+pub fn decode_array_dims(raw: &[u8]) -> Option<(i32, Vec<usize>, Vec<Option<&[u8]>>)> {
     if raw.is_empty() {
-        return Some("{}".to_string());
+        return Some((0, Vec::new(), Vec::new()));
     }
-    if raw.len() < 20 {
-        return None;
-    }
-
-    let be32 = |at: usize| -> i32 {
-        i32::from_be_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]])
-    };
-
-    let ndim = be32(0);
+    let be32 = |at: usize| -> Option<i32> { Some(i32::from_be_bytes(raw.get(at..at + 4)?.try_into().ok()?)) };
+    let ndim = usize::try_from(be32(0)?).ok()?;
+    let oid = be32(8)?;
     if ndim == 0 {
-        return Some("{}".to_string());
+        return Some((oid, Vec::new(), Vec::new()));
     }
-    if ndim != 1 {
-        // Multi-dimensional arrays round-trip as stored but are not rendered.
+    if ndim > 6 {
         return None;
     }
-
-    let count = be32(12).max(0) as usize;
-    let mut at = 20usize;
-    let mut parts: Vec<String> = Vec::with_capacity(count);
-
+    let mut dims = Vec::with_capacity(ndim);
+    for d in 0..ndim {
+        dims.push(usize::try_from(be32(12 + d * 8)?).ok()?);
+    }
+    let count = dims.iter().try_fold(1usize, |acc, d| acc.checked_mul(*d))?;
+    let mut at = 12 + ndim * 8;
+    let mut out = Vec::with_capacity(count.min(raw.len() / 4));
     for _ in 0..count {
-        if at + 4 > raw.len() {
-            return None;
-        }
-        let len = be32(at);
+        let len = be32(at)?;
         at += 4;
         if len < 0 {
-            parts.push("NULL".to_string());
+            out.push(None);
             continue;
         }
-        let len = len as usize;
-        if at + len > raw.len() {
-            return None;
-        }
-        let value = String::from_utf8_lossy(&raw[at..at + len]).into_owned();
-        at += len;
-
-        // Quote when the value could otherwise be misread as syntax.
-        let needs_quotes = value.is_empty()
-            || value.eq_ignore_ascii_case("NULL")
-            || value.contains([',', '{', '}', '"', '\\', ' ']);
-        if needs_quotes {
-            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-            parts.push(format!("\"{}\"", escaped));
-        } else {
-            parts.push(value);
-        }
+        let end = at.checked_add(len as usize)?;
+        out.push(Some(raw.get(at..end)?));
+        at = end;
     }
-
-    Some(format!("{{{}}}", parts.join(",")))
+    Some((oid, dims, out))
 }
 
-/// Decodes Postgres' `\x`-prefixed hex form, or the literal bytes.
-pub fn parse_bytea_literal(text: &str) -> Option<Vec<u8>> {
-    let trimmed = text.trim();
-    let Some(hex) = trimmed.strip_prefix("\\x") else {
-        return Some(trimmed.as_bytes().to_vec());
-    };
-    if hex.len() % 2 != 0 {
+/// A one-dimensional binary array of `elements` (`None` a NULL) under `oid`.
+fn build_array<'a>(oid: i32, elements: impl ExactSizeIterator<Item = Option<&'a [u8]>> + Clone) -> Vec<u8> {
+    let count = elements.len();
+    let mut out = Vec::with_capacity(20 + count * 8);
+    out.extend_from_slice(&1i32.to_be_bytes()); // one dimension
+    let has_null = elements.clone().any(|e| e.is_none());
+    out.extend_from_slice(&i32::from(has_null).to_be_bytes());
+    out.extend_from_slice(&oid.to_be_bytes());
+    out.extend_from_slice(&(count as i32).to_be_bytes());
+    out.extend_from_slice(&1i32.to_be_bytes()); // lower bound, as Postgres uses
+    for element in elements {
+        match element {
+            None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+            Some(value) => {
+                out.extend_from_slice(&(value.len() as i32).to_be_bytes());
+                out.extend_from_slice(value);
+            }
+        }
+    }
+    out
+}
+
+/// A stored one-dimensional array's element OID and elements (`None` a
+/// NULL); an empty array is OID 0 and no elements. `None` for bytes that are
+/// not one, or that have more than one dimension.
+pub fn decode_array(raw: &[u8]) -> Option<(i32, Vec<Option<&[u8]>>)> {
+    decode_array_dims(raw).map(|(oid, _, elements)| (oid, elements))
+}
+
+
+/// A stored array as `text[]`'s binary form: its bytes, with the element OID
+/// set to text's. Elements are always stored as text; the OID a typed
+/// column's arrays carry is for ordering them ([`array_order`]).
+pub fn as_text_array(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    push_text_array(raw, &mut out);
+    out
+}
+
+/// [`as_text_array`], appended to `out`. Bytes that are not an array are
+/// appended as they are.
+pub fn push_text_array(raw: &[u8], out: &mut Vec<u8>) {
+    let start = out.len();
+    out.extend_from_slice(raw);
+    if raw.len() >= 12 && decode_array(raw).is_some() {
+        out[start + 8..start + 12].copy_from_slice(&OID_TEXT.to_be_bytes());
+    }
+}
+
+/// The element OID an array of `element` values is built under, so it
+/// orders as that type does ([`array_order`]); text's for any type whose
+/// elements order as text.
+pub fn array_oid_for(element: &crate::core::db_type::DbType) -> i32 {
+    let oid = element.pg_oid() as i32;
+    if element_type_of_oid(oid).is_some() { oid } else { OID_TEXT }
+}
+
+/// The element type a stored array's element OID names; `None` for text and
+/// for an OID no column type here has.
+pub fn array_element_type(raw: &[u8]) -> Option<crate::core::db_type::DbType> {
+    let (oid, _) = decode_array(raw)?;
+    element_type_of_oid(oid)
+}
+
+/// The type an element of an array of `element` values is read back as
+/// (`a[1]`): the type its OID names, so `smallint` and the engine's one-byte
+/// integer alike come back as `smallint`; `None` (text) for one whose OID
+/// names none.
+pub fn element_read_type(element: &crate::core::db_type::DbType) -> Option<crate::core::db_type::DbType> {
+    element_type_of_oid(array_oid_for(element))
+}
+
+/// An array's element `index` (1-based, as PostgreSQL's arrays here
+/// always are): `Some(None)` for a NULL element or one past either end,
+/// `None` for bytes that are not an array.
+pub fn array_element_at(raw: &[u8], index: i64) -> Option<Option<Vec<u8>>> {
+    array_element_at_all(raw, &[index])
+}
+
+/// `raw[i][j]…`, one index per dimension (1-based): `Some(None)` for a
+/// NULL element, an index past either end, or a count of indexes other
+/// than the array's dimensions (PostgreSQL's NULL there too).
+pub fn array_element_at_all(raw: &[u8], indexes: &[i64]) -> Option<Option<Vec<u8>>> {
+    let (_, dims, elements) = decode_array_dims(raw)?;
+    if indexes.len() != dims.len() {
+        return Some(None);
+    }
+    let mut flat = 0usize;
+    for (i, d) in indexes.iter().zip(&dims) {
+        if *i < 1 || *i as u64 > *d as u64 {
+            return Some(None);
+        }
+        flat = flat * d + (*i - 1) as usize;
+    }
+    Some(elements.get(flat).copied().flatten().map(<[u8]>::to_vec))
+}
+
+/// `raw[lo:hi]`, clamped to the array, as PostgreSQL slices one: empty
+/// when nothing is left. Under the array's own element OID.
+pub fn array_slice(raw: &[u8], lo: i64, hi: i64) -> Option<Vec<u8>> {
+    let (oid, dims, elements) = decode_array_dims(raw)?;
+    // A slice of a multidimensional array is not read here (the caller
+    // refuses it).
+    if dims.len() > 1 {
         return None;
     }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    let bytes = hex.as_bytes();
-    for pair in bytes.chunks(2) {
-        let hi = (pair[0] as char).to_digit(16)?;
-        let lo = (pair[1] as char).to_digit(16)?;
-        out.push((hi * 16 + lo) as u8);
+    let lo = lo.max(1);
+    let hi = hi.min(elements.len() as i64);
+    if lo > hi {
+        return parse_array_literal("{}");
     }
+    let part = &elements[(lo - 1) as usize..hi as usize];
+    Some(build_array(if oid == 0 { OID_TEXT } else { oid }, part.iter().copied()))
+}
+
+/// The element type an array's element OID names, for ordering its elements
+/// as that type; `None` for text, and for an OID no column type here has.
+fn element_type_of_oid(oid: i32) -> Option<crate::core::db_type::DbType> {
+    use crate::core::db_type::DbType;
+    Some(match oid {
+        16 => DbType::BOOL,
+        20 => DbType::I64,
+        21 => DbType::I16,
+        23 => DbType::I32,
+        700 => DbType::F32,
+        701 => DbType::F64,
+        1700 => DbType::DECIMAL,
+        2950 => DbType::UUID,
+        869 => DbType::INET,
+        1082 => DbType::DATE,
+        1083 => DbType::TIME,
+        1266 => DbType::TIMETZ,
+        1114 => DbType::TIMESTAMP,
+        1184 => DbType::DATETIME,
+        1186 => DbType::INTERVAL,
+        829 => DbType::MACADDR,
+        774 => DbType::MACADDR8,
+        1560 => DbType::BIT,
+        1562 => DbType::VARBIT,
+        _ => return None,
+    })
+}
+
+/// An array value assigned to a column of element type `element`
+/// (`type_modifier::TextTypmod::Element`), as PostgreSQL's `array_in` reads
+/// it: every element read as that type, refused as the type refuses it
+/// (`'{1,x}'` into `integer[]`: 22P02), and kept in the type's own text
+/// (`'{01,+2}'` is `{1,2}`, `'{yes,off}'` is `{t,f}`), under the type's
+/// OID. `Ok(None)` when the bytes are already that; bytes that are not a
+/// one-dimensional array are left alone.
+///
+/// Every array column was untyped text: `'{1,x}'` was stored in an `INT[]`
+/// column, `{01,2}` sorted after `{10}`, and `max` compared text.
+pub fn hold_array_elements(raw: &[u8], element: &crate::core::db_type::DbType) -> Result<Option<Vec<u8>>, String> {
+    hold_array_elements_to(raw, element, None, false)
+}
+
+/// [`hold_array_elements`], each element also held to the column's element
+/// modifier (`numeric(10,2)[]`: rounded to two places and refused past ten
+/// digits), as [`crate::core::rql::type_modifier::hold_element`] does it;
+/// `explicit` for a cast.
+pub fn hold_array_elements_to(
+    raw: &[u8],
+    element: &crate::core::db_type::DbType,
+    modifier: Option<crate::core::rql::type_modifier::ElementModifier>,
+    explicit: bool,
+) -> Result<Option<Vec<u8>>, String> {
+    use crate::core::db_type::DbType;
+    let Some((oid, dims, elements)) = decode_array_dims(raw) else { return Ok(None) };
+    if elements.is_empty() {
+        return Ok(None);
+    }
+    let target = element.pg_oid() as i32;
+    let mut held: Vec<Option<Vec<u8>>> = Vec::with_capacity(elements.len());
+    for e in &elements {
+        let Some(bytes) = e else {
+            held.push(None);
+            continue;
+        };
+        let text = std::str::from_utf8(bytes).map_err(|_| refusal_message(element, &String::from_utf8_lossy(bytes)))?;
+        let encoded = encode_element(element, text).ok_or_else(|| refusal_message(element, text))?;
+        let mut canonical =
+            crate::pgwire::format_column_text_scaled(element.clone(), &encoded, None).unwrap_or_else(|| text.to_string());
+        // A `numeric` keeps the places it was written with, as PostgreSQL's
+        // does (`1.50` stays `1.50`, `01.0` is `1.0`); the formatter drops
+        // trailing zeros.
+        if *element == DbType::DECIMAL
+            && !text.contains(['e', 'E'])
+            && let Some((_, frac)) = text.trim().split_once('.')
+        {
+            let written = frac.trim_end().len();
+            let shown = canonical.split_once('.').map_or(0, |(_, f)| f.len());
+            if written > shown {
+                if shown == 0 {
+                    canonical.push('.');
+                }
+                canonical.extend(std::iter::repeat_n('0', written - shown));
+            }
+        }
+        if let Some(modifier) = modifier {
+            canonical = crate::core::rql::type_modifier::hold_element(element, &encoded, canonical, modifier, explicit)?;
+        }
+        held.push(Some(canonical.into_bytes()));
+    }
+    let rebuilt = build_array_dims(target, &dims, held.iter().map(|e| e.as_deref()));
+    Ok((rebuilt != raw || oid != target).then_some(rebuilt))
+}
+
+/// One array element's text read as `element`, as that type's input function
+/// reads it, into the bytes a column of the type stores; `None` when the type
+/// refuses it. The numbers and `boolean` are read here (`encode_literal`
+/// leaves them to the tokenizer, which never sees an element); every other
+/// type as [`encode_literal`] reads a literal.
+pub fn encode_element(element: &crate::core::db_type::DbType, text: &str) -> Option<Vec<u8>> {
+    use crate::core::db_type::DbType;
+    // Text, as it is: its spaces are its own (`varchar(3)[]`'s elements,
+    // held to a length).
+    if *element == DbType::STRING {
+        return Some(text.as_bytes().to_vec());
+    }
+    let t = text.trim_matches(|c: char| c.is_ascii_whitespace());
+    fn integer(t: &str) -> Option<i128> {
+        let (negative, digits) = match t.as_bytes().first()? {
+            b'-' => (true, &t[1..]),
+            b'+' => (false, &t[1..]),
+            _ => (false, t),
+        };
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) || digits.len() > 38 {
+            return None;
+        }
+        let v: i128 = digits.parse().ok()?;
+        Some(if negative { -v } else { v })
+    }
+    Some(match element {
+        DbType::I8 => i8::try_from(integer(t)?).ok()?.to_le_bytes().to_vec(),
+        DbType::I16 => i16::try_from(integer(t)?).ok()?.to_le_bytes().to_vec(),
+        DbType::I32 => i32::try_from(integer(t)?).ok()?.to_le_bytes().to_vec(),
+        DbType::I64 => i64::try_from(integer(t)?).ok()?.to_le_bytes().to_vec(),
+        DbType::I128 => integer(t)?.to_le_bytes().to_vec(),
+        DbType::U8 => u8::try_from(integer(t)?).ok()?.to_le_bytes().to_vec(),
+        DbType::U16 => u16::try_from(integer(t)?).ok()?.to_le_bytes().to_vec(),
+        DbType::U32 => u32::try_from(integer(t)?).ok()?.to_le_bytes().to_vec(),
+        DbType::U64 => u64::try_from(integer(t)?).ok()?.to_le_bytes().to_vec(),
+        DbType::U128 => u128::try_from(integer(t)?).ok()?.to_le_bytes().to_vec(),
+        DbType::F32 | DbType::F64 => {
+            // Rust reads `inf`, `infinity` and `nan` in any case, as
+            // PostgreSQL's `float8in` does; neither takes hex or a bare `.`.
+            if t.is_empty() || t.starts_with("0x") || t == "." {
+                return None;
+            }
+            let v: f64 = t.parse().ok()?;
+            if *element == DbType::F32 {
+                let narrowed = v as f32;
+                if narrowed.is_infinite() && v.is_finite() {
+                    return None;
+                }
+                narrowed.to_le_bytes().to_vec()
+            } else {
+                v.to_le_bytes().to_vec()
+            }
+        }
+        DbType::BOOL => {
+            // `boolin`: a unique prefix of true/yes/false/no, `on`/`off`
+            // (two letters at least), `1` or `0`, in any case.
+            let l = t.to_ascii_lowercase();
+            let is = |word: &str, at_least: usize| l.len() >= at_least && word.starts_with(l.as_str());
+            let value = if is("true", 1) || is("yes", 1) || is("on", 2) || l == "1" {
+                true
+            } else if is("false", 1) || is("no", 1) || is("off", 2) || l == "0" {
+                false
+            } else {
+                return None;
+            };
+            vec![u8::from(value)]
+        }
+        _ => return encode_literal(element, text),
+    })
+}
+
+/// PostgreSQL's array order (`array_cmp`): element by element, each pair as
+/// the elements' type orders it (an untyped array's elements as text), a
+/// NULL element after every value; then the shorter array first. Bytes that
+/// are not a one-dimensional array sort after every array, by their bytes,
+/// so the order stays total for a sort.
+///
+/// Arrays were ordered by their stored bytes, which put the element count
+/// first: `'{z}'` sorted before `'{a,b}'`, and `{10}` after `{9}` as text.
+pub fn array_order(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (Some((oid_a, ea)), Some((oid_b, eb))) = (decode_array(a), decode_array(b)) else {
+        return match (decode_array(a).is_some(), decode_array(b).is_some()) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => a.cmp(b),
+        };
+    };
+    let typed = element_type_of_oid(oid_a).or_else(|| element_type_of_oid(oid_b));
+    for (x, y) in ea.iter().zip(eb.iter()) {
+        let order = match (x, y) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(x), Some(y)) => element_order(typed.as_ref(), x, y),
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    // Equal as far as both go: the one with fewer elements first, then by
+    // their dimensions, as PostgreSQL's `array_cmp` does.
+    ea.len().cmp(&eb.len()).then_with(|| {
+        let da = decode_array_dims(a).map(|(_, d, _)| d).unwrap_or_default();
+        let db = decode_array_dims(b).map(|(_, d, _)| d).unwrap_or_default();
+        da.len().cmp(&db.len()).then_with(|| da.cmp(&db))
+    })
+}
+
+/// Two elements' text, as `typed` orders them when both read as it, else as
+/// text.
+/// Whether two elements of an array of element type `oid` are equal, as
+/// that type compares them (`'1.0'` and `'1'` in a `numeric[]`).
+pub fn array_elements_equal(oid: i32, x: &[u8], y: &[u8]) -> bool {
+    element_order(element_type_of_oid(oid).as_ref(), x, y) == std::cmp::Ordering::Equal
+}
+
+fn element_order(typed: Option<&crate::core::db_type::DbType>, x: &[u8], y: &[u8]) -> std::cmp::Ordering {
+    if let Some(t) = typed
+        && let (Ok(xs), Ok(ys)) = (std::str::from_utf8(x), std::str::from_utf8(y))
+        && let (Some(xe), Some(ye)) = (encode_element(t, xs), encode_element(t, ys))
+    {
+        return crate::core::processor::concurrent_processor::compare_bytes_as_type(t.clone(), &xe, &ye);
+    }
+    x.cmp(y)
+}
+
+/// `a || b` over two stored arrays, PostgreSQL's `array_cat` for one
+/// dimension: the elements of `a`, then those of `b`. An empty side gives
+/// the other. Elements of one type are spliced as they are stored; integer
+/// and floating types of different widths meet at the wider one (`int8[] ||
+/// numeric[]` is `numeric[]`), and a `text[]` side, which is also what an
+/// untyped `ARRAY['1']` builds, takes the other side's type when its
+/// elements read as it.
+pub fn array_cat(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
+    let unreadable = || "could not read an array operand of ||".to_string();
+    let (oid_a, dims_a, elements_a) = decode_array_dims(a).ok_or_else(unreadable)?;
+    let (oid_b, dims_b, elements_b) = decode_array_dims(b).ok_or_else(unreadable)?;
+    if elements_a.is_empty() {
+        return Ok(b.to_vec());
+    }
+    if elements_b.is_empty() {
+        return Ok(a.to_vec());
+    }
+    if dims_a.len() > 1 || dims_b.len() > 1 {
+        return Err("|| over multidimensional arrays is not supported yet".to_string());
+    }
+    let all_null = |e: &[Option<&[u8]>]| e.iter().all(Option::is_none);
+    let splice = |oid: i32| {
+        build_array_dims(oid, &[elements_a.len() + elements_b.len()], elements_a.iter().chain(elements_b.iter()).copied())
+    };
+    if oid_a == oid_b || all_null(&elements_b) {
+        return Ok(splice(oid_a));
+    }
+    if all_null(&elements_a) {
+        return Ok(splice(oid_b));
+    }
+    // The numeric types in PostgreSQL's implicit-cast order.
+    const WIDENING: [i32; 6] = [21, 23, 20, 1700, 700, 701];
+    let rank = |oid: i32| WIDENING.iter().position(|&o| o == oid);
+    let target = match (rank(oid_a), rank(oid_b)) {
+        (Some(x), Some(y)) => WIDENING[x.max(y)],
+        _ if oid_a == 25 => oid_b,
+        _ if oid_b == 25 => oid_a,
+        _ => return Err(format!("operator does not exist: array of type {oid_a} || array of type {oid_b}")),
+    };
+    let (text_a, text_b) = (format_array(a).ok_or_else(unreadable)?, format_array(b).ok_or_else(unreadable)?);
+    let literal = format!("{{{},{}}}", &text_a[1..text_a.len() - 1], &text_b[1..text_b.len() - 1]);
+    parse_array_literal_as(&literal, target).ok_or_else(|| format!("malformed array literal: \"{literal}\""))
+}
+
+/// Renders the binary array representation back to `{a,b,NULL}`, nested as
+/// it has dimensions (`{{1,2},{3,4}}`).
+pub fn format_array(raw: &[u8]) -> Option<String> {
+    let (oid, dims, elements) = decode_array_dims(raw)?;
+    if dims.is_empty() {
+        return Some("{}".to_string());
+    }
+    // A boolean element is `t` or `f`, as PostgreSQL's `boolout` writes it
+    // inside an array; the element text kept is the spelling it came in as
+    // (`array_agg(f)` printed `{true,false}`).
+    let boolean = oid == 16;
+    let rendered: Vec<String> = elements
+        .iter()
+        .map(|e| match e {
+            None => "NULL".to_string(),
+            Some(bytes) => {
+                let mut value = String::from_utf8_lossy(bytes).into_owned();
+                if boolean {
+                    match value.to_ascii_lowercase().as_str() {
+                        "true" | "t" => value = "t".to_string(),
+                        "false" | "f" => value = "f".to_string(),
+                        _ => {}
+                    }
+                }
+                // Quote when the value could otherwise be misread as syntax.
+                let needs_quotes = value.is_empty()
+                    || value.eq_ignore_ascii_case("NULL")
+                    || value.contains([',', '{', '}', '"', '\\', ' ']);
+                if needs_quotes {
+                    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+                } else {
+                    value
+                }
+            }
+        })
+        .collect();
+    let mut out = String::new();
+    write_nested(&dims, &rendered, &mut out);
     Some(out)
+}
+
+/// `{…}` for the first dimension of `dims` over `items`, nesting the rest.
+fn write_nested(dims: &[usize], items: &[String], out: &mut String) {
+    out.push('{');
+    if dims.len() <= 1 {
+        out.push_str(&items.join(","));
+    } else {
+        let stride = items.len() / dims[0].max(1);
+        for (n, chunk) in items.chunks(stride.max(1)).enumerate() {
+            if n > 0 {
+                out.push(',');
+            }
+            write_nested(&dims[1..], chunk, out);
+        }
+    }
+    out.push('}');
+}
+
+/// Decodes a `bytea` value's text form: [`byteain`], with the reason dropped.
+pub fn parse_bytea_literal(text: &str) -> Option<Vec<u8>> {
+    byteain(text).ok()
+}
+
+/// PostgreSQL's `byteain`, byte for byte.
+///
+/// Two formats, chosen by the first two characters and nothing else:
+///
+/// * **hex** — `\x` (lower-case `x` only), then pairs of hex digits in either
+///   case. Whitespace (space, tab, newline, carriage return) may sit *between*
+///   pairs but not inside one; an odd digit count is an error.
+/// * **escape** — every byte is itself, except a backslash, which must start
+///   `\\` (one backslash) or `\nnn` (three octal digits, the first `0`-`3`).
+///   Any other backslash is an error. Nothing is trimmed: `' ab '` is four
+///   bytes.
+///
+/// The previous parser trimmed, copied backslash escapes through literally and
+/// refused whitespace between hex pairs — each one a different stored value
+/// for input PostgreSQL accepts, reported as success.
+///
+/// The error text is PostgreSQL's.
+pub fn byteain(text: &str) -> Result<Vec<u8>, String> {
+    let input = text.as_bytes();
+    if let Some(hex) = input.strip_prefix(b"\\x") {
+        let mut out = Vec::with_capacity(hex.len() / 2);
+        let mut i = 0usize;
+        while i < hex.len() {
+            let c = hex[i];
+            if matches!(c, b' ' | b'\n' | b'\t' | b'\r') {
+                i += 1;
+                continue;
+            }
+            let hi = hex_digit(c).ok_or_else(|| invalid_hex_digit(text, 2 + i))?;
+            i += 1;
+            let Some(&c2) = hex.get(i) else {
+                return Err("invalid hexadecimal data: odd number of digits".to_string());
+            };
+            let lo = hex_digit(c2).ok_or_else(|| invalid_hex_digit(text, 2 + i))?;
+            i += 1;
+            out.push((hi << 4) | lo);
+        }
+        return Ok(out);
+    }
+
+    // Escape format. Copied in runs between backslashes: most values have none.
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < input.len() {
+        let Some(p) = memchr::memchr(b'\\', &input[i..]) else {
+            out.extend_from_slice(&input[i..]);
+            break;
+        };
+        out.extend_from_slice(&input[i..i + p]);
+        let at = i + p;
+        let d = |k: usize| input.get(at + k).copied().unwrap_or(0);
+        if (b'0'..=b'3').contains(&d(1))
+            && (b'0'..=b'7').contains(&d(2))
+            && (b'0'..=b'7').contains(&d(3))
+        {
+            out.push(((d(1) - b'0') << 6) | ((d(2) - b'0') << 3) | (d(3) - b'0'));
+            i = at + 4;
+        } else if d(1) == b'\\' {
+            out.push(b'\\');
+            i = at + 2;
+        } else {
+            return Err("invalid input syntax for type bytea".to_string());
+        }
+    }
+    Ok(out)
+}
+
+#[inline]
+fn hex_digit(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// PostgreSQL names the offending character, which may be multi-byte.
+fn invalid_hex_digit(text: &str, at: usize) -> String {
+    let ch = text[at..].chars().next().unwrap_or('?');
+    format!("invalid hexadecimal digit: {}", double_quoted(&ch.to_string()))
+}
+
+/// `text` in double quotes, its own double quotes doubled: how a message
+/// quotes a value the client wrote. Embedded as it was, a `"` inside it
+/// ended the quoted span early for anything reading the message
+/// (`sqlstate_for` skips quoted text), and the client's words after it read
+/// as the message's own: `'a" could not serialize access "b'` written to a
+/// bigint answered 40001, and a retry loop resent it forever.
+pub fn double_quoted(text: &str) -> String {
+    format!("\"{}\"", text.replace('"', "\"\""))
+}
+
+/// The bytes a `bytea` column stores for a SQL literal as written in a
+/// statement: `'…'` (doubled quotes collapsed), `E'…'` (backslash escapes
+/// resolved first, as PostgreSQL's lexer does before `byteain` sees the text),
+/// `BYTEA '…'`, or an unquoted value taken as it is.
+///
+/// Quoting is undone exactly once. The insert path used to collapse the quotes
+/// and then hand the result to [`encode_literal`], which stripped an outer pair
+/// a second time — so a value that itself began and ended with `'` lost both.
+pub fn encode_bytea_sql(literal: &str) -> Result<Vec<u8>, String> {
+    let t = literal.trim();
+    let b = t.as_bytes();
+    if b.len() >= 3 && matches!(b[0], b'E' | b'e') && b[1] == b'\'' && b[b.len() - 1] == b'\'' {
+        let text = unescape_e_string(&t[2..t.len() - 1])?;
+        return byteain(&text);
+    }
+    if b.len() >= 2 && b[0] == b'\'' && b[b.len() - 1] == b'\'' {
+        return byteain(&unquote_sql(t));
+    }
+    if b.first().is_some_and(|c| c.is_ascii_alphabetic()) {
+        let stripped = strip_type_prefix(t);
+        if stripped.len() != t.len() {
+            return encode_bytea_sql(stripped);
+        }
+    }
+    byteain(t)
+}
+
+/// Resolves the backslash escapes of a PostgreSQL escape string (`E'…'`), given
+/// the text between the quotes: `\b \f \n \r \t \v`, `\ooo` octal, `\xhh` hex,
+/// `\uXXXX` / `\UXXXXXXXX` code points, `\'` and `''` for a quote, and any
+/// other `\c` for `c`. The result must be valid UTF-8 without a NUL byte, as
+/// PostgreSQL requires of every string under a UTF-8 server encoding.
+pub fn unescape_e_string(inner: &str) -> Result<String, String> {
+    let s = inner.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut i = 0usize;
+    let mut pending_high: Option<u32> = None;
+    let push_cp = |out: &mut Vec<u8>, cp: u32| -> Result<(), String> {
+        let c = char::from_u32(cp).ok_or_else(|| "invalid Unicode escape value".to_string())?;
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        Ok(())
+    };
+    while i < s.len() {
+        let c = s[i];
+        if c == b'\'' {
+            // Only `''` can appear inside a well-formed literal.
+            out.push(b'\'');
+            i += if s.get(i + 1) == Some(&b'\'') { 2 } else { 1 };
+            continue;
+        }
+        if c != b'\\' {
+            if pending_high.is_some() {
+                return Err("invalid Unicode surrogate pair".to_string());
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let Some(&e) = s.get(i + 1) else {
+            return Err("unterminated quoted string".to_string());
+        };
+        if pending_high.is_some() && e != b'u' && e != b'U' {
+            return Err("invalid Unicode surrogate pair".to_string());
+        }
+        match e {
+            b'0'..=b'7' => {
+                let mut v: u32 = 0;
+                let mut k = i + 1;
+                while k < s.len() && k < i + 4 && (b'0'..=b'7').contains(&s[k]) {
+                    v = v * 8 + u32::from(s[k] - b'0');
+                    k += 1;
+                }
+                out.push(v as u8);
+                i = k;
+            }
+            b'x' if s.get(i + 2).is_some_and(|c| c.is_ascii_hexdigit()) => {
+                let mut v: u8 = 0;
+                let mut k = i + 2;
+                while k < s.len() && k < i + 4 && s[k].is_ascii_hexdigit() {
+                    v = (v << 4) | hex_digit(s[k]).unwrap_or(0);
+                    k += 1;
+                }
+                out.push(v);
+                i = k;
+            }
+            b'u' | b'U' => {
+                let n = if e == b'u' { 4 } else { 8 };
+                let digits = s
+                    .get(i + 2..i + 2 + n)
+                    .filter(|d| d.iter().all(u8::is_ascii_hexdigit))
+                    .ok_or_else(|| "invalid Unicode escape".to_string())?;
+                let cp = digits
+                    .iter()
+                    .fold(0u32, |a, &d| (a << 4) | u32::from(hex_digit(d).unwrap_or(0)));
+                i += 2 + n;
+                let low = (0xDC00..=0xDFFF).contains(&cp);
+                match pending_high.take() {
+                    None if (0xD800..=0xDBFF).contains(&cp) => pending_high = Some(cp),
+                    None if low => return Err("invalid Unicode surrogate pair".to_string()),
+                    None if cp == 0 => return Err("invalid Unicode escape value".to_string()),
+                    None => push_cp(&mut out, cp)?,
+                    Some(hi) if low => {
+                        push_cp(&mut out, 0x10000 + ((hi - 0xD800) << 10) + (cp - 0xDC00))?
+                    }
+                    Some(_) => return Err("invalid Unicode surrogate pair".to_string()),
+                }
+            }
+            _ => {
+                out.push(match e {
+                    b'b' => 0x08,
+                    b'f' => 0x0c,
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'v' => 0x0b,
+                    other => other,
+                });
+                i += 2;
+            }
+        }
+    }
+    if pending_high.is_some() {
+        return Err("invalid Unicode surrogate pair".to_string());
+    }
+    if out.contains(&0) {
+        return Err("invalid byte sequence for encoding \"UTF8\": 0x00".to_string());
+    }
+    String::from_utf8(out).map_err(|_| "invalid byte sequence for encoding \"UTF8\"".to_string())
 }
 
 /// Renders bytes as Postgres' `\x` hex form.
 pub fn format_bytea(raw: &[u8]) -> String {
+    let mut out = Vec::with_capacity(raw.len() * 2 + 2);
+    format_bytea_into(raw, &mut out);
+    String::from_utf8(out).expect("hex is ASCII")
+}
+
+/// [`format_bytea`], appended to `out`: a table lookup per nibble into space
+/// sized once, rather than `char::from_digit` and a `String::push` each.
+pub fn format_bytea_into(raw: &[u8], out: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.extend_from_slice(b"\\x");
+    let start = out.len();
+    out.resize(start + raw.len() * 2, 0);
+    for (pair, b) in out[start..].chunks_exact_mut(2).zip(raw) {
+        pair[0] = HEX[(b >> 4) as usize];
+        pair[1] = HEX[(b & 0x0f) as usize];
+    }
+}
+
+#[cfg(test)]
+fn format_bytea_legacy(raw: &[u8]) -> String {
     let mut out = String::with_capacity(raw.len() * 2 + 2);
     out.push_str("\\x");
     for b in raw {
@@ -749,6 +2269,96 @@ pub fn format_bytea(raw: &[u8]) -> String {
         out.push(char::from_digit(u32::from(b & 0x0f), 16).unwrap());
     }
     out
+}
+
+// ------------------------------------------------------- legacy CHAR
+
+/// The width of a legacy `CHAR` cell ([`DbType::CHAR`]).
+///
+/// [`DbType::CHAR`]: crate::core::db_type::DbType::CHAR
+pub const LEGACY_CHAR_WIDTH: usize = 4;
+
+/// The text a legacy `CHAR` cell holds.
+///
+/// Builds before `character(n)` was a type made bare `CHAR` and `CHAR(1)`
+/// this four-byte type, and every write path stored the value's **UTF-8
+/// bytes**, cut at four and padded with zeros: `'é'` is `c3 a9 00 00`. Every
+/// reader decoded those four bytes as a little-endian code point instead,
+/// so `'é'` came back as U+A9C3 `'꧃'`, `'€'` as the number 11305698 and
+/// `'ab'` as `'扡'`. Nothing was lost on the way in for a value of at most
+/// four bytes — any one character — so reading the bytes as what they are
+/// gives every such value back. A longer one was cut by the write
+/// (`'abcde'` is `'abcd'`); what survives is read up to the last whole
+/// character (`'aé€'`, cut inside the euro sign, is `'aé'`).
+///
+/// Read as `character(1)` reads a value, which a bare `CHAR` is: without
+/// trailing spaces. An older build stored `''` as four zeros and `' '` and
+/// `'a '` with their spaces, so one value had several cells; this is the
+/// one text every display, comparison and group reads for all of them.
+pub fn legacy_char_text(bytes: &[u8]) -> &str {
+    let end = bytes.iter().rposition(|b| *b != 0).map_or(0, |at| at + 1);
+    let bytes = &bytes[..end];
+    let text = match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or_default(),
+    };
+    text.trim_end_matches(' ')
+}
+
+/// A legacy `CHAR` cell in its one stored form ([`legacy_char_text`],
+/// zero-padded): what [`legacy_char_assign`] writes, so a cell of either
+/// age compares, groups and sorts by it.
+pub fn legacy_char_canonical(bytes: &[u8]) -> [u8; LEGACY_CHAR_WIDTH] {
+    let text = legacy_char_text(bytes).as_bytes();
+    let mut out = [0u8; LEGACY_CHAR_WIDTH];
+    let n = text.len().min(LEGACY_CHAR_WIDTH);
+    out[..n].copy_from_slice(&text[..n]);
+    out
+}
+
+/// A legacy `CHAR` value as it is shown: `character(1)`'s padding, so the
+/// blank value is `' '` whichever cell holds it.
+pub fn legacy_char_display(bytes: &[u8]) -> &str {
+    match legacy_char_text(bytes) {
+        "" => " ",
+        text => text,
+    }
+}
+
+/// `text` assigned to a legacy `CHAR` column, as PostgreSQL assigns to a
+/// `CHAR`, which is `character(1)`: one character, the rest only spaces
+/// (`'x  '` is `'x'`). Anything longer is 22001, where the cell kept its
+/// first four bytes and reported success. One character always fits the
+/// four bytes. Stored without trailing spaces, as `character(n)` is
+/// ([`legacy_char_canonical`]): the blank value is four zeros, shown `' '`.
+pub fn legacy_char_assign(text: &str) -> Result<[u8; LEGACY_CHAR_WIDTH], String> {
+    let mut chars = text.chars();
+    let first = chars.next().filter(|c| *c != ' ');
+    if chars.any(|c| c != ' ') {
+        return Err("value too long for type character(1)".to_string());
+    }
+    let mut out = [0u8; LEGACY_CHAR_WIDTH];
+    if let Some(first) = first {
+        first.encode_utf8(&mut out);
+    }
+    Ok(out)
+}
+
+/// A literal compared with a legacy `CHAR` column, in the form the column
+/// stores: as [`legacy_char_assign`] stores it, or for text no assignment
+/// takes, its bytes as an older build stored them (`'ab'` finds the `'ab'`
+/// it kept). `None` past four bytes, which no cell holds. It was the
+/// literal's code point, which no stored value of a non-ASCII character
+/// ever equalled: `c = 'é'` found nothing.
+pub fn legacy_char_literal(text: &str) -> Option<[u8; LEGACY_CHAR_WIDTH]> {
+    let text = text.trim_end_matches(' ');
+    legacy_char_assign(text).ok().or_else(|| {
+        (text.len() <= LEGACY_CHAR_WIDTH).then(|| {
+            let mut out = [0u8; LEGACY_CHAR_WIDTH];
+            out[..text.len()].copy_from_slice(text.as_bytes());
+            out
+        })
+    })
 }
 
 // ------------------------------------------------------- literal coercion
@@ -776,29 +2386,59 @@ pub fn coerce_literal(
         return Some(bytes.to_vec());
     }
 
+    // A legacy `CHAR` is text in four bytes (`legacy_char_text`), and goes on
+    // as its text. Read as a `u32` it became a number: `'A'` was `65`.
+    if *from == DbType::CHAR {
+        return coerce_literal(legacy_char_text(bytes).as_bytes(), &DbType::STRING, to);
+    }
+    // A number becoming one is its digits, as PostgreSQL's assignment to a
+    // `CHAR` writes them; it was the code point the number spelled.
+    if *to == DbType::CHAR && *from != DbType::STRING {
+        let v = decode_integer(bytes, from)?;
+        return legacy_char_literal(&v.to_string()).map(|b| b.to_vec());
+    }
+
     // Text literals carry their own syntax, so they are re-parsed at the target
     // type rather than reinterpreted bit-for-bit.
     if matches!(from, DbType::STRING) {
         let text = std::str::from_utf8(bytes).ok()?;
         return match to {
             DbType::STRING => Some(bytes.to_vec()),
-            DbType::UUID | DbType::INET | DbType::DATETIME | DbType::DECIMAL
+            DbType::UUID
+            | DbType::INET
+            | DbType::DATETIME
+            | DbType::TIMESTAMP
+            | DbType::DECIMAL
             | DbType::JSONB => encode_literal(to, text),
+            _ if has_text_literal(to) => encode_literal(to, text),
             DbType::BOOL => match text.trim().to_ascii_lowercase().as_str() {
                 "true" | "t" | "yes" | "y" | "on" | "1" => Some(vec![1]),
                 "false" | "f" | "no" | "n" | "off" | "0" => Some(vec![0]),
                 _ => None,
             },
-            DbType::CHAR => {
-                let c = text.chars().next()?;
-                if text.chars().count() != 1 {
-                    return None;
-                }
-                Some((c as u32).to_le_bytes().to_vec())
-            }
-            _ => encode_integer(text.trim().parse::<i128>().ok()?, to)
-                .or_else(|| encode_float(text.trim().parse::<f64>().ok()?, to)),
+            DbType::CHAR => legacy_char_literal(text).map(|b| b.to_vec()),
+            // Not `parse::<i128>().ok()?`: that `?` returned from the whole
+            // function for any text that is not an integer, so the float
+            // fallback never ran and `f = '1.5'`, `f = 'NaN'` and
+            // `f > 'Infinity'` were refused outright.
+            _ => text
+                .trim()
+                .parse::<i128>()
+                .ok()
+                .and_then(|v| encode_integer(v, to))
+                .or_else(|| match to {
+                    DbType::F32 => parse_float4(text).map(|v| v.to_le_bytes().to_vec()),
+                    _ => encode_float(parse_float8(text)?, to),
+                }),
         };
+    }
+
+    // A NUMERIC at the engine scale read as a float, through its text so it
+    // is rounded once: NUMERIC arithmetic meeting a float column is float
+    // arithmetic, as in PostgreSQL.
+    if matches!(from, DbType::DECIMAL) && matches!(to, DbType::F32 | DbType::F64) {
+        let raw = i128::from_le_bytes(bytes.try_into().ok()?);
+        return encode_float(format_decimal(raw).parse::<f64>().ok()?, to);
     }
 
     // A numeric literal keeps its value and changes its width.
@@ -823,7 +2463,11 @@ pub fn coerce_literal(
         }
         return encode_float(v, to).or_else(|| {
             // An integral float compared against an integer column is exact.
-            if v.fract() == 0.0 { encode_integer(v as i128, to) } else { None }
+            if v.fract() == 0.0 {
+                encode_integer(v as i128, to)
+            } else {
+                None
+            }
         });
     }
 
@@ -848,7 +2492,7 @@ fn decode_integer(bytes: &[u8], ty: &crate::core::db_type::DbType) -> Option<i12
         DbType::I128 | DbType::DECIMAL => i128::from_le_bytes(le::<16>(bytes)?),
         DbType::U8 | DbType::BOOL => u8::from_le_bytes(le::<1>(bytes)?) as i128,
         DbType::U16 => u16::from_le_bytes(le::<2>(bytes)?) as i128,
-        DbType::U32 | DbType::CHAR => u32::from_le_bytes(le::<4>(bytes)?) as i128,
+        DbType::U32 => u32::from_le_bytes(le::<4>(bytes)?) as i128,
         DbType::U64 => u64::from_le_bytes(le::<8>(bytes)?) as i128,
         DbType::U128 => u128::from_le_bytes(le::<16>(bytes)?) as i128,
         _ => return None,
@@ -887,12 +2531,42 @@ fn encode_integer(v: i128, to: &crate::core::db_type::DbType) -> Option<Vec<u8>>
             _ => return None,
         },
         DbType::U16 => u16::try_from(v).ok()?.to_le_bytes().to_vec(),
-        DbType::U32 | DbType::CHAR => u32::try_from(v).ok()?.to_le_bytes().to_vec(),
+        DbType::U32 => u32::try_from(v).ok()?.to_le_bytes().to_vec(),
         DbType::U64 => u64::try_from(v).ok()?.to_le_bytes().to_vec(),
         DbType::U128 => u128::try_from(v).ok()?.to_le_bytes().to_vec(),
         DbType::DECIMAL => v.checked_mul(DECIMAL_SCALE_FACTOR)?.to_le_bytes().to_vec(),
         _ => return None,
     })
+}
+
+/// `float8in`: a number's text as a double, or `None` past the range a
+/// double holds. `1e400` is not infinity and `1e-400` is not zero; PostgreSQL
+/// refuses both as out of range. `Infinity`, `-inf` and `NaN` are the values
+/// they spell; a subnormal is kept.
+pub fn parse_float8(text: &str) -> Option<f64> {
+    let v = text.trim().parse::<f64>().ok()?;
+    float_in_range(text, v.is_infinite(), v == 0.0).then_some(v)
+}
+
+/// [`parse_float8`] for `real` (`float4in`), against a `real`'s range.
+pub fn parse_float4(text: &str) -> Option<f32> {
+    let v = text.trim().parse::<f32>().ok()?;
+    float_in_range(text, v.is_infinite(), v == 0.0).then_some(v)
+}
+
+/// Whether a float parsed from `text` is the number written: not an
+/// overflow to infinity from a finite spelling, nor an underflow to zero
+/// from a number with a digit that is not zero.
+fn float_in_range(text: &str, infinite: bool, zero: bool) -> bool {
+    let body = text.trim().trim_start_matches(['+', '-']).to_ascii_lowercase();
+    if infinite {
+        return body == "inf" || body == "infinity";
+    }
+    if zero {
+        let mantissa = body.split('e').next().unwrap_or("");
+        return !mantissa.bytes().any(|b| (b'1'..=b'9').contains(&b));
+    }
+    true
 }
 
 fn encode_float(v: f64, to: &crate::core::db_type::DbType) -> Option<Vec<u8>> {
@@ -902,6 +2576,224 @@ fn encode_float(v: f64, to: &crate::core::db_type::DbType) -> Option<Vec<u8>> {
         DbType::F64 => v.to_le_bytes().to_vec(),
         _ => return None,
     })
+}
+
+tokio::task_local! {
+    /// The text of every untyped parameter the running statement had inlined
+    /// unquoted because it looks like a number
+    /// (`pg_params::untyped_number_texts`).
+    static UNTYPED_PARAMS: Vec<String>;
+}
+
+/// Runs `f` as a statement whose untyped number-looking parameters were
+/// inlined as `texts`: [`written_constant_text`] leaves them as sent.
+pub fn with_untyped_params<F: std::future::Future>(texts: Vec<String>, f: F) -> impl std::future::Future<Output = F::Output> {
+    UNTYPED_PARAMS.scope(texts, f)
+}
+
+/// [`numeric_constant_text`] for a constant *written in the statement*:
+/// `None` for the text of an untyped parameter the statement was bound with.
+///
+/// A parameter's text is stored in a text column as it was sent, as
+/// PostgreSQL stores an unknown-typed value there; only a constant the
+/// statement spells (`VALUES (1e1)`) is its value's text. The two meet as the
+/// same unquoted text once a number-looking parameter is inlined, so the
+/// parameter's is recognised by what it was: `'007'` bound to
+/// `INSERT INTO t AS q (v) VALUES ($1)` or `INSERT … SELECT 6, $1` stored 7.
+/// A constant written in the statement with exactly a bound parameter's text
+/// is then left as written too, which is how every such value used to be
+/// stored. That happens only where the parameter is inlined unquoted, which
+/// a text slot it is the whole value of never is (Bind types it `text`):
+/// `INSERT INTO dx SELECT 1, $1, 007` into two text columns bound with '007'
+/// stores '007' for both, where PostgreSQL stores '007' and '7'; and
+/// `INSERT INTO dn VALUES (1, $1, 007)` with `$1` in an INT column stores
+/// n = 7 and '007' for the written constant, where PostgreSQL stores '7'.
+/// Telling them apart needs the parameter's position carried past the
+/// inlining, which this does not do. (`SET c = DEFAULT` is not affected: a
+/// constant default is spliced in as its evaluated, quoted text.)
+pub fn written_constant_text(raw: &str) -> Option<String> {
+    let rendered = numeric_constant_text(raw)?;
+    let raw = raw.trim();
+    let bound = UNTYPED_PARAMS
+        .try_with(|texts| texts.iter().any(|t| t.trim() == raw))
+        .unwrap_or(false);
+    (!bound).then_some(rendered)
+}
+
+/// An unquoted numeric constant (`1e1`, `+9`, `007`, `1.50`, `0x1F`,
+/// `1_000`), as PostgreSQL renders it when the constant is assigned to a text
+/// column: the value's text, not its spelling. `None` for anything that is
+/// not one (a quoted string, an identifier, an expression), which is then
+/// stored as it always was.
+///
+/// The constant is an `integer` (or `bigint`, or a `numeric` past that)
+/// without a point or an exponent, shown without its leading zeros or `+`;
+/// otherwise a `numeric`, shown at the scale its digits give it (`numeric_in`:
+/// the digits after the point less the exponent, never below zero), so
+/// `1.50` keeps its zero, `1e1` is `10`, `1.50e1` is `15.0` and `100e-2` is
+/// `1.00`. Unary signs apply as operators, so `- 5` is `-5` and `- - 3` is
+/// `3`; a zero has no sign (`-0.0` is `0.0`). A hexadecimal, octal or binary
+/// integer (`0x1F`, `0o17`, `0b101`) is its decimal value, and `_` may
+/// separate digits, as PostgreSQL 16 allows.
+///
+/// Stored as written, `1e1` read back as `'1e1'` and `+9` as `'+9'`: text
+/// that is not what PostgreSQL stores, reported as success.
+///
+/// A constant whose exponent puts it past `numeric`'s range (which PostgreSQL
+/// refuses as an overflow) is `None` too.
+pub fn numeric_constant_text(raw: &str) -> Option<String> {
+    let mut rest = raw.trim();
+    let mut negative = false;
+    // Unary signs, each an operator of its own, whitespace allowed between.
+    while let Some(c @ ('+' | '-')) = rest.chars().next() {
+        if rest.starts_with("--") {
+            // A comment, not two signs.
+            return None;
+        }
+        if c == '-' {
+            negative = !negative;
+        }
+        rest = rest[1..].trim_start();
+    }
+    let body = rest;
+    if body.is_empty() {
+        return None;
+    }
+
+    // Digits with single `_` separators between them; `leading` allows one
+    // `_` before the first digit (after a base prefix).
+    fn digits_of(text: &str, radix: u32, leading: bool) -> Option<String> {
+        let text = if leading { text.strip_prefix('_').unwrap_or(text) } else { text };
+        if text.is_empty() || text.starts_with('_') || text.ends_with('_') || text.contains("__") {
+            return None;
+        }
+        let out: String = text.chars().filter(|c| *c != '_').collect();
+        out.chars().all(|c| c.is_digit(radix)).then_some(out)
+    }
+    // `digits` (most significant first) in `radix`, as decimal digits. Held
+    // in limbs of nine decimal digits and fed several input digits at a time,
+    // so a long constant costs a small fraction of a digit-by-digit pass.
+    fn to_decimal(digits: &str, radix: u32) -> String {
+        const LIMB: u64 = 1_000_000_000;
+        let per_step = match radix {
+            16 => 7,
+            8 => 9,
+            _ => 30,
+        };
+        let mut limbs: Vec<u64> = vec![0]; // little-endian, base 10^9
+        let values: Vec<u64> = digits.chars().map(|c| u64::from(c.to_digit(radix).unwrap_or(0))).collect();
+        for chunk in values.chunks(per_step) {
+            let scale = u64::from(radix).pow(chunk.len() as u32);
+            let mut carry = chunk.iter().fold(0u64, |acc, d| acc * u64::from(radix) + d);
+            for limb in limbs.iter_mut() {
+                let v = *limb * scale + carry;
+                *limb = v % LIMB;
+                carry = v / LIMB;
+            }
+            while carry > 0 {
+                limbs.push(carry % LIMB);
+                carry /= LIMB;
+            }
+        }
+        let mut out = String::with_capacity(limbs.len() * 9);
+        let mut it = limbs.iter().rev();
+        if let Some(top) = it.next() {
+            out.push_str(&top.to_string());
+        }
+        for limb in it {
+            out.push_str(&format!("{limb:09}"));
+        }
+        out
+    }
+    let signed = |magnitude: String| -> String {
+        let magnitude = match magnitude.trim_start_matches('0') {
+            "" => "0".to_string(),
+            m => m.to_string(),
+        };
+        if negative && magnitude != "0" { format!("-{magnitude}") } else { magnitude }
+    };
+
+    let lower = body.to_ascii_lowercase();
+    for (prefix, radix) in [("0x", 16), ("0o", 8), ("0b", 2)] {
+        if let Some(digits) = lower.strip_prefix(prefix) {
+            let digits = digits_of(digits, radix, true)?;
+            return Some(signed(to_decimal(&digits, radix)));
+        }
+    }
+
+    // `int[.frac][e[+-]exp]`, either side of the point possibly empty, not
+    // both.
+    let (mantissa, exponent) = match lower.find('e') {
+        Some(at) => (&lower[..at], Some(&lower[at + 1..])),
+        None => (lower.as_str(), None),
+    };
+    let (int_text, frac_text) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (mantissa, None),
+    };
+    let int_digits = if int_text.is_empty() { String::new() } else { digits_of(int_text, 10, false)? };
+    let frac_digits = match frac_text {
+        Some("") | None => String::new(),
+        Some(f) => digits_of(f, 10, false)?,
+    };
+    if int_digits.is_empty() && frac_digits.is_empty() {
+        return None;
+    }
+    let exponent: i64 = match exponent {
+        None => 0,
+        Some(e) => {
+            let (sign, e) = match e.strip_prefix('-') {
+                Some(e) => (-1, e),
+                None => (1, e.strip_prefix('+').unwrap_or(e)),
+            };
+            let e = digits_of(e, 10, false)?;
+            if e.len() > 9 {
+                return None;
+            }
+            sign * e.parse::<i64>().ok()?
+        }
+    };
+    if frac_text.is_none() && exponent == 0 && !lower.contains('e') {
+        // No point and no exponent: an integer.
+        return Some(signed(int_digits));
+    }
+
+    // `numeric_in`: the display scale is the written fraction less the
+    // exponent; the value moves the point by the exponent.
+    let scale = frac_digits.len() as i64 - exponent;
+    let scale = scale.max(0);
+    let digits = format!("{int_digits}{frac_digits}");
+    let point = int_digits.len() as i64 + exponent;
+    // `numeric`'s limits: 131072 digits before the point, 16383 after.
+    if point > 131_072 || scale > 16_383 {
+        return None;
+    }
+    let len = digits.len() as i64;
+    let whole: String = if point <= 0 {
+        "0".to_string()
+    } else if point >= len {
+        format!("{digits}{}", "0".repeat((point - len) as usize))
+    } else {
+        digits[..point as usize].to_string()
+    };
+    let mut fraction: String = if point < 0 {
+        format!("{}{digits}", "0".repeat((-point) as usize))
+    } else if point < len {
+        digits[point as usize..].to_string()
+    } else {
+        String::new()
+    };
+    while (fraction.len() as i64) < scale {
+        fraction.push('0');
+    }
+    fraction.truncate(scale as usize);
+    let zero = digits.bytes().all(|b| b == b'0');
+    let whole = match whole.trim_start_matches('0') {
+        "" => "0".to_string(),
+        w => w.to_string(),
+    };
+    let sign = if negative && !zero { "-" } else { "" };
+    Some(if fraction.is_empty() { format!("{sign}{whole}") } else { format!("{sign}{whole}.{fraction}") })
 }
 
 /// Single-quotes a value, doubling any quote it contains, so it cannot escape
@@ -928,29 +2820,130 @@ pub fn unquote_sql(s: &str) -> std::borrow::Cow<'_, str> {
     };
 
     let inner = &trimmed[1..trimmed.len() - 1];
-    let single = quote.to_string();
-    let doubled = format!("{}{}", quote, quote);
-    if inner.contains(&doubled) {
-        Cow::Owned(inner.replace(&doubled, &single))
-    } else {
-        Cow::Borrowed(inner)
+    // Collapses each doubled quote, scanning left to right without overlap —
+    // what `str::replace("''", "'")` does — but without building the two
+    // needle strings on every call, and without allocating at all when there
+    // is nothing to collapse, which is nearly every value.
+    let q = quote as u8;
+    let bytes = inner.as_bytes();
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
+    let mut at = 0usize;
+    while let Some(p) = memchr::memchr(q, &bytes[at..]) {
+        let k = at + p;
+        if bytes.get(k + 1) == Some(&q) {
+            // `k` and `k + 1` are ASCII quotes, so every slice here ends on a
+            // character boundary.
+            let buf = out.get_or_insert_with(|| String::with_capacity(inner.len()));
+            buf.push_str(&inner[copied..=k]);
+            copied = k + 2;
+            at = k + 2;
+        } else {
+            at = k + 1;
+        }
+    }
+    match out {
+        None => Cow::Borrowed(inner),
+        Some(mut buf) => {
+            buf.push_str(&inner[copied..]);
+            Cow::Owned(buf)
+        }
+    }
+}
+
+#[cfg(test)]
+mod unquote_sql_reference {
+    /// `unquote_sql` as it was, two allocations per call.
+    fn reference(s: &str) -> std::borrow::Cow<'_, str> {
+        use std::borrow::Cow;
+        let trimmed = s.trim();
+        let mut chars = trimmed.chars();
+        let quote = match chars.next() {
+            Some(q @ ('\'' | '"')) if trimmed.len() >= 2 && trimmed.ends_with(q) => q,
+            _ => return Cow::Borrowed(trimmed),
+        };
+        let inner = &trimmed[1..trimmed.len() - 1];
+        let single = quote.to_string();
+        let doubled = format!("{}{}", quote, quote);
+        if inner.contains(&doubled) {
+            Cow::Owned(inner.replace(&doubled, &single))
+        } else {
+            Cow::Borrowed(inner)
+        }
+    }
+
+    #[test]
+    fn matches_the_reference() {
+        let pieces = ["'", "''", "'''", "\"", "\"\"", "a", "日本", " ", "\\", "🙂", "x'y", "NULL"];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..50_000 {
+            let mut s = String::new();
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let n = (state % 9) as usize;
+            for k in 0..n {
+                s.push_str(pieces[((state >> (k * 4)) % pieces.len() as u64) as usize]);
+            }
+            for wrapped in [s.clone(), format!("'{s}'"), format!("\"{s}\""), format!("  '{s}' ")] {
+                assert_eq!(super::unquote_sql(&wrapped), reference(&wrapped), "{:?}", wrapped);
+            }
+        }
     }
 }
 
 pub fn quote_sql(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push('\'');
+    // The same quoting as the wire layer's parameter inlining: the text
+    // between quotes is copied in runs found with `memchr`, not a character
+    // at a time. Every value of an `IN (SELECT …)` list passes through here.
+    crate::pg_params::quote_literal(s)
+}
+
+#[cfg(test)]
+mod quote_sql_reference {
+    /// `quote_sql` as it was, a character at a time.
+    fn reference(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('\'');
+        for c in s.chars() {
+            if c == '\'' {
+                out.push('\'');
+            }
+            out.push(c);
         }
-        out.push(c);
+        out.push('\'');
+        out
     }
-    out.push('\'');
-    out
+
+    #[test]
+    fn matches_the_reference() {
+        let pieces = ["'", "''", "a", "日本", " ", "\\", "🙂", "\"", "x'y", "", "\n"];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..20_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let mut s = String::new();
+            for k in 0..(state % 9) as usize {
+                s.push_str(pieces[((state >> (k * 5)) % pieces.len() as u64) as usize]);
+            }
+            assert_eq!(super::quote_sql(&s), reference(&s), "{:?}", s);
+        }
+    }
 }
 
 /// Strips one layer of matching single or double quotes, if present.
+/// One matching pair of SQL string quotes, and only those.
+pub fn strip_single_quotes(s: &str) -> &str {
+    let t = s.trim();
+    let bytes = t.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'' {
+        &t[1..t.len() - 1]
+    } else {
+        t
+    }
+}
+
 pub fn strip_quotes(s: &str) -> &str {
     let t = s.trim();
     let bytes = t.as_bytes();
@@ -971,24 +2964,517 @@ pub fn strip_quotes(s: &str) -> &str {
 /// A literal that does not parse is rejected rather than coerced: silently
 /// storing a zero for `'not-a-uuid'` would make the value indistinguishable
 /// from a legitimately zero UUID.
+/// Drops a leading type name from `TYPE 'literal'`, leaving the quoted part.
+///
+/// Only when what follows really is a quoted string — so a bare word, or a
+/// literal that merely begins with letters, is returned untouched.
+pub fn strip_type_prefix(literal: &str) -> &str {
+    let trimmed = literal.trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.first().is_none_or(|b| !b.is_ascii_alphabetic()) {
+        return literal;
+    }
+    let mut i = 0usize;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    let rest = trimmed[i..].trim_start();
+    if rest.starts_with('\'') && rest.ends_with('\'') && rest.len() >= 2 {
+        return rest;
+    }
+    literal
+}
+
+/// A `DECIMAL` result cell that carries its own display scale: the
+/// sixteen-byte unscaled value, then one byte of scale.
+///
+/// A stored `DECIMAL` is sixteen bytes at its column's scale. A computed
+/// `numeric` whose scale PostgreSQL picks *per value* — `AVG`, where
+/// `numeric_div` gives `avg(1,2,2)` sixteen places and `avg(0,1)` twenty —
+/// cannot be described by one column scale, so its cells say their own. Only
+/// result rows carry this form; every reader of `DECIMAL` result bytes goes
+/// through [`split_decimal_cell`], which accepts both.
+/// The slot width of an unconstrained NUMERIC column that keeps each value at
+/// its own scale: the sixteen-byte value and its scale byte, the cell of
+/// [`decimal_cell_with_scale`]. A column created before it holds sixteen bytes
+/// at [`DECIMAL_SCALE`] places, and the field's recorded size says which.
+pub const NUMERIC_OWN_SCALE_SIZE: u32 = 17;
+
+/// The scale a column that keeps each value's own scale is listed under where
+/// a planner passes `(write order, declared scale)` pairs for the NUMERIC
+/// columns (`sarg::extract_with_scales`): no declared scale, and its literal
+/// is the own-scale cell of [`own_scale_cell`].
+pub const OWN_SCALE_SENTINEL: u32 = u32::MAX;
+
+/// A float's one key per value, as `=` sees it: -0 is 0, and every NaN is one
+/// NaN (PostgreSQL's `float8eq` and its hash say both). `None` when the bytes
+/// are already that form, or are not a float of `db_type`'s width.
+pub fn canonical_float_cell(db_type: &crate::core::db_type::DbType, bytes: &[u8]) -> Option<Vec<u8>> {
+    use crate::core::db_type::DbType;
+    match db_type {
+        DbType::F64 => {
+            let v = f64::from_le_bytes(bytes.try_into().ok()?);
+            if v == 0.0 && v.is_sign_negative() {
+                Some(0f64.to_le_bytes().to_vec())
+            } else if v.is_nan() && v.to_bits() != f64::NAN.to_bits() {
+                Some(f64::NAN.to_le_bytes().to_vec())
+            } else {
+                None
+            }
+        }
+        DbType::F32 => {
+            let v = f32::from_le_bytes(bytes.try_into().ok()?);
+            if v == 0.0 && v.is_sign_negative() {
+                Some(0f32.to_le_bytes().to_vec())
+            } else if v.is_nan() && v.to_bits() != f32::NAN.to_bits() {
+                Some(f32::NAN.to_le_bytes().to_vec())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Each `NUMERIC` column's scale where it is not the engine default, as
+/// `(write_order, scale)`: what `sarg` needs to encode a literal where the
+/// column stores it. A column that keeps each value's own scale is listed
+/// with [`OWN_SCALE_SENTINEL`].
+///
+/// One reader for every structure that compares a literal with stored
+/// `NUMERIC` bytes (the filter index, the secondary indexes, the scan's
+/// batch prefilter): two of them encoding the same literal at different
+/// scales is a wrong answer, not a missed optimisation.
+pub fn decimal_scales(fields: &[crate::core::row::schema::SchemaField]) -> smallvec::SmallVec<[(u32, u32); 4]> {
+    fields
+        .iter()
+        .filter(|f| f.db_type == crate::core::db_type::DbType::DECIMAL)
+        .filter_map(|f| {
+            // A column that keeps each value's own scale, by its sentinel.
+            if keeps_own_scale(f) {
+                return Some((f.write_order as u32, OWN_SCALE_SENTINEL));
+            }
+            f.scale.filter(|s| *s != DECIMAL_SCALE).map(|s| (f.write_order as u32, s))
+        })
+        .collect()
+}
+
+/// Whether `field` is an unconstrained NUMERIC column that keeps each value
+/// at its own scale ([`NUMERIC_OWN_SCALE_SIZE`]).
+#[inline]
+pub fn keeps_own_scale(field: &crate::core::row::schema::SchemaField) -> bool {
+    field.db_type == crate::core::db_type::DbType::DECIMAL && field.size == NUMERIC_OWN_SCALE_SIZE
+}
+
+/// The refusal of a value with a nonzero digit past nine places bound for an
+/// unconstrained NUMERIC column created before such columns kept each
+/// value's scale: what the column keeps, and how to make it keep more.
+/// `value` is the value as shown (`"0.1234567891"`, or `of this expression`).
+pub fn old_numeric_refusal(value: &str, column: &str) -> String {
+    format!(
+        "numeric value {value} has more than the {DECIMAL_SCALE} decimal places column \"{column}\" keeps (not \
+         supported): it was created before an unconstrained NUMERIC kept each value's scale; declare it \
+         NUMERIC(p, s), or convert it with ALTER TABLE … ALTER COLUMN \"{column}\" TYPE NUMERIC"
+    )
+}
+
+/// The refusal of NaN and the infinities as a NUMERIC: PostgreSQL stores
+/// them (and refuses an infinity in a NUMERIC(p, s), 22003); this engine
+/// has no NUMERIC NaN or infinity, and refuses both on every path in
+/// (0A000), never stores a number for them. A known difference.
+pub const NUMERIC_SPECIAL_REFUSAL: &str = "numeric NaN and infinity are not supported";
+
+/// NaN or an infinity, when `text` spells one as `numeric_in` and
+/// `float8in` read them (`NaN`, `Infinity`, `-inf`, any case).
+pub fn numeric_special(text: &str) -> Option<f64> {
+    let t = text.trim().trim_matches('\'').trim();
+    if !t.bytes().any(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    t.parse::<f64>().ok().filter(|v| !v.is_finite())
+}
+
+/// [`NUMERIC_SPECIAL_REFUSAL`], or PostgreSQL's own 22003 for an infinity
+/// bound for a NUMERIC(p, s), which PostgreSQL refuses too.
+pub fn numeric_special_refusal(v: f64, constrained: bool) -> String {
+    if v.is_infinite() && constrained {
+        "numeric field overflow: a field with a declared precision and scale cannot hold an infinite value".to_string()
+    } else {
+        NUMERIC_SPECIAL_REFUSAL.to_string()
+    }
+}
+
+/// The refusal of a value past what a column that keeps each value's own
+/// scale holds: 38 digits, 38 places.
+pub fn own_scale_refusal(value: &str, column: &str) -> String {
+    format!(
+        "numeric value {value} needs more than the 38 digits or 38 decimal places column \"{column}\" holds \
+         (not supported)"
+    )
+}
+
+/// [`refusal_message`] for a value bound for `field`, naming it: an
+/// unconstrained NUMERIC's own refusal (the limit its format has), every
+/// other with the column after it.
+pub fn refusal_for_column(field: &crate::core::row::schema::SchemaField, value: &str) -> String {
+    let text = value.trim().trim_matches('\'').trim();
+    if field.db_type == crate::core::db_type::DbType::DECIMAL {
+        if let Some(v) = numeric_special(text) {
+            return numeric_special_refusal(v, field.scale.is_some());
+        }
+    }
+    if keeps_own_scale(field) && text.parse::<f64>().is_ok() {
+        return own_scale_refusal(&double_quoted(text), &field.name);
+    }
+    if field.db_type == crate::core::db_type::DbType::DECIMAL
+        && field.scale.is_none()
+        && text.parse::<f64>().is_ok()
+        && digits_past_scale(text, DECIMAL_SCALE)
+        && !text.contains(['e', 'E'])
+    {
+        return old_numeric_refusal(&double_quoted(text), &field.name);
+    }
+    // The declared type: a `json` column's refusal names `json`, not the
+    // text it is stored as.
+    format!("{} for column \"{}\"", refusal_message(&field.literal_type(), value), field.name)
+}
+
+/// A written number as the cell of a column that keeps its own scale
+/// ([`NUMERIC_OWN_SCALE_SIZE`]), at the display scale `numeric_in` gives it:
+/// `1.50` is 150 at two places, `1e-10` 1 at ten. `None` for text that is not
+/// such a number, or past what the cell holds (38 digits, 38 places).
+pub fn own_scale_cell(text: &str) -> Option<Vec<u8>> {
+    let t = text.trim().trim_matches('\'').trim_matches('"').trim();
+    crate::core::rql::pg_numeric::parse_text(t).map(|v| v.to_cell())
+}
+
+/// Two NUMERIC cells compared by value, where either may carry its own scale
+/// ([`decimal_cell_with_scale`]): a seventeen-byte cell at the scale it
+/// carries, a sixteen-byte one at [`DECIMAL_SCALE`] (the engine's, which is
+/// what every sixteen-byte operand meeting an own-scale cell is at: an
+/// arithmetic result, a column lifted there, a column created before cells
+/// kept their scale). `None` when either is not a NUMERIC cell.
+pub fn numeric_cell_cmp(a: &[u8], b: &[u8]) -> Option<std::cmp::Ordering> {
+    use crate::core::rql::pg_numeric::PgNum;
+    let read = |c: &[u8]| -> Option<PgNum> {
+        let (m, own) = split_decimal_cell(c)?;
+        Some(PgNum { m, s: own.unwrap_or(DECIMAL_SCALE) })
+    };
+    Some(read(a)?.cmp_value(read(b)?))
+}
+
+/// A cell carrying its own scale ([`decimal_cell_with_scale`]) in its one
+/// form per value: the zeros at the end of its fraction dropped, so 1.5 and
+/// 1.50 are the same bytes. What a group, a DISTINCT, a set operation, a join
+/// or a unique check keys such a cell by, where its bytes alone keyed equal
+/// values apart. `None` for anything else.
+pub fn canonical_numeric_cell(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() != 17 {
+        return None;
+    }
+    let (mut m, own) = split_decimal_cell(bytes)?;
+    let mut s = own?;
+    while s > 0 && m % 10 == 0 {
+        m /= 10;
+        s -= 1;
+    }
+    Some(decimal_cell_with_scale(if m == 0 { 0 } else { m }, s))
+}
+
+pub fn decimal_cell_with_scale(unscaled: i128, scale: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(17);
+    out.extend_from_slice(&unscaled.to_le_bytes());
+    out.push(scale.min(u8::MAX as u32) as u8);
+    out
+}
+
+/// The value of a `DECIMAL` cell, and the scale it carries when it is the
+/// seventeen-byte form of [`decimal_cell_with_scale`] (`None` for an ordinary
+/// sixteen-byte cell, which is at its column's scale).
+pub fn split_decimal_cell(bytes: &[u8]) -> Option<(i128, Option<u32>)> {
+    match bytes.len() {
+        16 => Some((i128::from_le_bytes(bytes.try_into().ok()?), None)),
+        // A display scale past what an i128 can carry is not a cell this
+        // engine writes (AVG caps it at 38); treat it as malformed rather than
+        // let a formatter compute 10^scale and overflow.
+        17 if bytes[16] <= 38 => Some((
+            i128::from_le_bytes(bytes[..16].try_into().ok()?),
+            Some(u32::from(bytes[16])),
+        )),
+        _ => None,
+    }
+}
+
+/// PostgreSQL's binary `numeric` for `unscaled / 10^scale`, with the display
+/// scale *kept* at `scale`. [`encode_pg_numeric_scaled`] trims trailing zeros
+/// from it; a value whose scale is part of the answer — `0.50000000000000000000`
+/// from `AVG` — has to keep them, as PostgreSQL's own does.
+pub fn encode_pg_numeric_with_dscale(unscaled: i128, scale: u32) -> Vec<u8> {
+    let mut out = encode_pg_numeric_scaled(unscaled, scale);
+    if out.len() >= 8 {
+        out[6..8].copy_from_slice(&(scale as i16).to_be_bytes());
+    }
+    out
+}
+
+/// An unsigned count as the `bigint` PostgreSQL reports it in.
+///
+/// Counts here are `u64`; PostgreSQL has no unsigned type, so admin views
+/// report them as `bigint`. Reinterpreting the bytes — `n.to_le_bytes()` sent
+/// under an `int8` OID, or `n as i64` — turns anything above `i64::MAX` into a
+/// negative number. This saturates instead: `i64::MAX` is a value no real
+/// count reaches, so it reads as "past the range" rather than as a plausible
+/// figure, and the clamp is logged.
+pub fn count_as_bigint(n: u64) -> i64 {
+    match i64::try_from(n) {
+        Ok(v) => v,
+        Err(_) => {
+            log::warn!(
+                "count {} exceeds bigint; reported as {} (saturated)",
+                n,
+                i64::MAX
+            );
+            i64::MAX
+        }
+    }
+}
+
+/// The PostgreSQL name of a column type, as its input errors spell it.
+pub fn pg_input_type_name(db_type: &crate::core::db_type::DbType) -> &'static str {
+    use crate::core::db_type::DbType;
+    match db_type {
+        DbType::I8 | DbType::U8 | DbType::I16 => "smallint",
+        DbType::U16 | DbType::I32 => "integer",
+        DbType::U32 | DbType::I64 => "bigint",
+        DbType::U64 | DbType::I128 | DbType::U128 | DbType::DECIMAL => "numeric",
+        DbType::F32 => "real",
+        DbType::F64 => "double precision",
+        DbType::BOOL => "boolean",
+        DbType::UUID => "uuid",
+        DbType::INET => "inet",
+        DbType::DATETIME | DbType::TIMESTAMP => "timestamp",
+        DbType::DATE => "date",
+        DbType::TIME => "time",
+        DbType::TIMETZ => "time with time zone",
+        DbType::INTERVAL => "interval",
+        DbType::JSONB | DbType::JSON | DbType::JSONTEXT => "json",
+        DbType::BYTEA => "bytea",
+        DbType::MACADDR => "macaddr",
+        DbType::MACADDR8 => "macaddr8",
+        DbType::BIT => "bit",
+        DbType::VARBIT => "bit varying",
+        DbType::POINT => "point",
+        DbType::LINE => "line",
+        DbType::LSEG => "lseg",
+        DbType::BOX => "box",
+        DbType::PATH => "path",
+        DbType::POLYGON => "polygon",
+        DbType::CIRCLE => "circle",
+        DbType::INT4RANGE => "int4range",
+        DbType::INT8RANGE => "int8range",
+        DbType::NUMRANGE => "numrange",
+        DbType::TSRANGE => "tsrange",
+        DbType::TSTZRANGE => "tstzrange",
+        DbType::DATERANGE => "daterange",
+        DbType::CHAR | DbType::STRING => "text",
+        _ => "unknown",
+    }
+}
+
+/// Why `literal` cannot be stored in a column of `db_type`, in PostgreSQL's
+/// words, so the SQLSTATE the wire layer derives from the text is PostgreSQL's
+/// too: `invalid input syntax for type …` (22P02, or 22007 for a date/time),
+/// `value "…" is out of range for type …` (22003), `date/time field value out
+/// of range` (22008), `malformed array literal` (22P02), and `byteain`'s own
+/// errors. `literal` is the value as written, quotes and all.
+///
+/// Called only after a conversion has already refused the value — it explains
+/// a refusal, it never decides one.
+pub fn refusal_message(db_type: &crate::core::db_type::DbType, literal: &str) -> String {
+    use crate::core::db_type::DbType;
+    let text = unquote_sql(literal.trim());
+    let text = text.as_ref();
+    let name = pg_input_type_name(db_type);
+    let syntax = || format!("invalid input syntax for type {}: {}", name, double_quoted(text));
+    let integral = {
+        let t = text.trim();
+        let digits = t.strip_prefix(['-', '+']).unwrap_or(t);
+        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+    };
+    match db_type {
+        DbType::I8
+        | DbType::I16
+        | DbType::I32
+        | DbType::I64
+        | DbType::I128
+        | DbType::U8
+        | DbType::U16
+        | DbType::U32
+        | DbType::U64
+        | DbType::U128 => {
+            if integral {
+                format!("value {} is out of range for type {}", double_quoted(text.trim()), name)
+            } else {
+                syntax()
+            }
+        }
+        DbType::F32 | DbType::F64 => match text.trim().parse::<f64>() {
+            Ok(_) => format!("{} is out of range for type {}", double_quoted(text.trim()), name),
+            Err(_) => syntax(),
+        },
+        DbType::DECIMAL if numeric_special(text).is_some() => NUMERIC_SPECIAL_REFUSAL.to_string(),
+        DbType::DECIMAL => match text.trim().parse::<f64>() {
+            // More places than the nine an unconstrained `NUMERIC` keeps here
+            // (`INSERT INTO un SELECT a + 0.0000000000001` from a
+            // NUMERIC(20,12)): no overflow, which 22003 said; a limit.
+            Ok(_) if digits_past_scale(text, DECIMAL_SCALE) && !text.contains(['e', 'E']) => format!(
+                "numeric value {} has more than the {} decimal places a NUMERIC keeps here (not supported)",
+                double_quoted(text.trim()),
+                DECIMAL_SCALE
+            ),
+            Ok(_) => format!("numeric field overflow: {} does not fit the column's precision", double_quoted(text.trim())),
+            Err(_) => syntax(),
+        },
+        DbType::BYTEA => encode_bytea_sql(literal)
+            .err()
+            .unwrap_or_else(|| "invalid input syntax for type bytea".to_string()),
+        DbType::JSONB | DbType::JSON => match crate::core::jsonb::encode_text(text) {
+            // Well-formed JSON whose number `numeric` cannot hold: PostgreSQL
+            // reports that as an overflow, not as bad syntax.
+            Err(e) if e.starts_with(crate::core::jsonb::NUMERIC_OVERFLOW) => {
+                crate::core::jsonb::NUMERIC_OVERFLOW.to_string()
+            }
+            Err(e) => format!("invalid input syntax for type json: {}", e),
+            Ok(_) => syntax(),
+        },
+        DbType::ARRAY => format!("malformed array literal: {}", double_quoted(text)),
+        DbType::DATETIME | DbType::TIMESTAMP | DbType::DATE | DbType::TIME | DbType::TIMETZ => {
+            // Shaped like a date/time but not one (`2026-13-45`): a field is
+            // out of range. Anything else is not a date/time at all.
+            let shaped = text.bytes().any(|b| b.is_ascii_digit())
+                && text
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || b" -:./T+Z".contains(&b));
+            if shaped {
+                format!("date/time field value out of range: {}", double_quoted(text))
+            } else {
+                syntax()
+            }
+        }
+        // `[5,1)`: PostgreSQL's 22000, where the reader once stored `empty`.
+        DbType::INT4RANGE | DbType::INT8RANGE | DbType::NUMRANGE | DbType::TSRANGE | DbType::TSTZRANGE | DbType::DATERANGE
+            if crate::core::range_ops::literal_bounds_cross(db_type, text) =>
+        {
+            crate::core::range_ops::CROSSED_BOUNDS.to_string()
+        }
+        _ => syntax(),
+    }
+}
+
 pub fn encode_literal(db_type: &crate::core::db_type::DbType, literal: &str) -> Option<Vec<u8>> {
     use crate::core::db_type::DbType;
 
-    let text = strip_quotes(literal);
+    // `INTERVAL '1 day'`, `POINT '(1,2)'` — PostgreSQL's typed-literal form,
+    // which reaches an `INSERT` with the type name still attached because the
+    // value parser hands the literal over as written.
+    //
+    // Stripped here rather than in each type's parser: without it,
+    // `INTERVAL '1 hour'` was handed to the interval reader as the whole
+    // string, parsed as nothing, and stored as a zero interval. The insert
+    // succeeded and the column read `00:00:00`.
+    if *db_type == DbType::BYTEA {
+        return encode_bytea_sql(literal).ok();
+    }
+    let literal = strip_type_prefix(literal);
+    // A document keeps its double quotes: `"t1"` is the JSON string `t1`,
+    // not an identifier quoting. Stripping them handed `t1` to the encoder,
+    // which is not JSON, so `doc @> '"t1"'` failed every row it was tested
+    // against.
+    let text = if matches!(db_type, DbType::JSONB | DbType::JSON) {
+        strip_single_quotes(literal)
+    } else {
+        strip_quotes(literal)
+    };
     match db_type {
         DbType::UUID => parse_uuid(text).map(|b| b.to_vec()),
         DbType::INET => parse_inet(text).map(|b| b.to_vec()),
         DbType::DATETIME => parse_timestamp_us(text).map(|us| us.to_le_bytes().to_vec()),
+        // A `timestamp` column's: the same eight bytes, its zone discarded.
+        DbType::TIMESTAMP => parse_timestamp_local_us(text).map(|us| us.to_le_bytes().to_vec()),
         DbType::DECIMAL => parse_decimal(text).map(|v| v.to_le_bytes().to_vec()),
         DbType::ARRAY => parse_array_literal(text),
-        DbType::BYTEA => parse_bytea_literal(text),
+        // Answered above, from the literal as written rather than from `text`:
+        // an `E'…'` string has to have its escapes resolved before `byteain`
+        // reads it, and `strip_type_prefix` takes the `E` for a type name.
+        DbType::BYTEA => encode_bytea_sql(literal).ok(),
         // A document is validated by encoding it: text that is not JSON has no
         // encoding, so it is refused here rather than stored and found later.
-        DbType::JSONB => serde_json::from_str::<serde_json::Value>(text)
-            .ok()
-            .map(|document| crate::core::jsonb::encode(&document)),
+        DbType::JSONB => crate::core::jsonb::encode_text(text).ok(),
+
+        // Everything below stores the bytes PostgreSQL puts on the wire, so
+        // each of these is a text parser and the binary result path is a copy.
+        // See `crate::core::pg_types` for why that choice differs from the one
+        // the types above make.
+        DbType::INTERVAL => {
+            crate::core::pg_types::parse_interval(text).map(crate::core::pg_types::encode_interval)
+        }
+        DbType::MACADDR => crate::core::pg_types::parse_macaddr::<6>(text).map(|b| b.to_vec()),
+        DbType::MACADDR8 => crate::core::pg_types::parse_macaddr::<8>(text).map(|b| b.to_vec()),
+        // A `BIT(n)` literal PostgreSQL accepts is already `n` bits long — it
+        // rejects any other length — so no declared width has to reach here.
+        DbType::BIT | DbType::VARBIT => crate::core::pg_types::parse_bit_string(text, None),
+        DbType::DATE => crate::core::pg_types::parse_date(text).map(|d| d.to_be_bytes().to_vec()),
+        DbType::TIME => crate::core::pg_types::parse_time(text).map(|t| t.to_be_bytes().to_vec()),
+        DbType::TIMETZ => crate::core::pg_types::parse_timetz(text),
+        DbType::POINT => crate::core::pg_types::parse_point(text),
+        DbType::LINE => crate::core::pg_types::parse_line(text),
+        DbType::LSEG => crate::core::pg_types::parse_lseg(text),
+        DbType::BOX => crate::core::pg_types::parse_box(text),
+        DbType::PATH => crate::core::pg_types::parse_path(text),
+        DbType::POLYGON => crate::core::pg_types::parse_polygon(text),
+        DbType::CIRCLE => crate::core::pg_types::parse_circle(text),
+        DbType::INT4RANGE
+        | DbType::INT8RANGE
+        | DbType::NUMRANGE
+        | DbType::TSRANGE
+        | DbType::TSTZRANGE
+        | DbType::DATERANGE => crate::core::pg_types::parse_range(db_type, text),
+
         _ => None,
     }
+}
+
+/// Whether a type's literal form is text that [`encode_literal`] parses.
+///
+/// The insert and update paths both branch on this rather than listing the
+/// types twice, which is what stops the two from drifting apart on which
+/// literals they accept — they already had, once, over doubled quotes.
+pub fn has_text_literal(db_type: &crate::core::db_type::DbType) -> bool {
+    use crate::core::db_type::DbType;
+    matches!(
+        db_type,
+        DbType::INTERVAL
+            | DbType::MACADDR
+            | DbType::MACADDR8
+            | DbType::BIT
+            | DbType::VARBIT
+            | DbType::DATE
+            | DbType::TIME
+            | DbType::TIMETZ
+            | DbType::POINT
+            | DbType::LINE
+            | DbType::LSEG
+            | DbType::BOX
+            | DbType::PATH
+            | DbType::POLYGON
+            | DbType::CIRCLE
+            | DbType::INT4RANGE
+            | DbType::INT8RANGE
+            | DbType::NUMRANGE
+            | DbType::TSRANGE
+            | DbType::TSTZRANGE
+            | DbType::DATERANGE
+    )
 }
 
 #[cfg(test)]
@@ -1007,9 +3493,18 @@ mod tests {
     #[test]
     fn uuid_rejects_malformed_input() {
         assert!(parse_uuid("not-a-uuid").is_none());
-        assert!(parse_uuid("3f2504e0-4f89-11d3-9a0c-0305e82c33").is_none(), "too short");
-        assert!(parse_uuid("3f2504e0-4f89-11d3-9a0c-0305e82c330101").is_none(), "too long");
-        assert!(parse_uuid("3f2504e0-4f89-11d3-9a0c-0305e82c330").is_none(), "odd nibble count");
+        assert!(
+            parse_uuid("3f2504e0-4f89-11d3-9a0c-0305e82c33").is_none(),
+            "too short"
+        );
+        assert!(
+            parse_uuid("3f2504e0-4f89-11d3-9a0c-0305e82c330101").is_none(),
+            "too long"
+        );
+        assert!(
+            parse_uuid("3f2504e0-4f89-11d3-9a0c-0305e82c330").is_none(),
+            "odd nibble count"
+        );
     }
 
     #[test]
@@ -1038,7 +3533,10 @@ mod tests {
     #[test]
     fn inet_rejects_bad_addresses_and_prefixes() {
         assert!(parse_inet("999.1.1.1").is_none());
-        assert!(parse_inet("10.0.0.1/33").is_none(), "prefix wider than IPv4");
+        assert!(
+            parse_inet("10.0.0.1/33").is_none(),
+            "prefix wider than IPv4"
+        );
         assert!(parse_inet("::1/129").is_none(), "prefix wider than IPv6");
         assert!(parse_inet("").is_none());
     }
@@ -1054,7 +3552,10 @@ mod tests {
 
     #[test]
     fn inet_distinguishes_a_host_from_its_network() {
-        assert_ne!(parse_inet("10.0.0.0").unwrap(), parse_inet("10.0.0.0/24").unwrap());
+        assert_ne!(
+            parse_inet("10.0.0.0").unwrap(),
+            parse_inet("10.0.0.0/24").unwrap()
+        );
     }
 
     #[test]
@@ -1063,25 +3564,128 @@ mod tests {
         assert_eq!(parse_timestamp_us("2026-08-20").unwrap(), expected);
         assert_eq!(parse_timestamp_us("2026-08-20 00:00:00").unwrap(), expected);
         assert_eq!(parse_timestamp_us("2026-08-20T00:00:00").unwrap(), expected);
-        assert_eq!(parse_timestamp_us("2026-08-20T00:00:00Z").unwrap(), expected);
+        assert_eq!(
+            parse_timestamp_us("2026-08-20T00:00:00Z").unwrap(),
+            expected
+        );
         assert_eq!(parse_timestamp_us("2026-08-20 00:00").unwrap(), expected);
     }
 
     #[test]
     fn timestamp_applies_the_zone_offset() {
         let utc = parse_timestamp_us("2026-08-20 12:00:00Z").unwrap();
-        assert_eq!(parse_timestamp_us("2026-08-20 14:00:00+02:00").unwrap(), utc);
+        assert_eq!(
+            parse_timestamp_us("2026-08-20 14:00:00+02:00").unwrap(),
+            utc
+        );
         assert_eq!(parse_timestamp_us("2026-08-20 14:00:00+0200").unwrap(), utc);
         assert_eq!(parse_timestamp_us("2026-08-20 10:00:00-02").unwrap(), utc);
+    }
+
+    /// Each against PostgreSQL 17: `INSERT INTO t (v text) VALUES (<raw>)`
+    /// then `SELECT v`.
+    #[test]
+    fn a_numeric_constant_renders_as_postgresql_assigns_it_to_text() {
+        for (raw, pg) in [
+            ("1e1", "10"),
+            ("+9", "9"),
+            ("1.50", "1.50"),
+            ("007", "7"),
+            ("-0", "0"),
+            ("-0.0", "0.0"),
+            ("1.5e-3", "0.0015"),
+            ("1.50e1", "15.0"),
+            (".5", "0.5"),
+            ("5.", "5"),
+            ("00.10", "0.10"),
+            ("-007", "-7"),
+            ("1E+2", "100"),
+            ("99999999999999999999", "99999999999999999999"),
+            ("0x1F", "31"),
+            ("0X1f", "31"),
+            ("0x_1F", "31"),
+            ("1_000", "1000"),
+            ("1_000.000_1", "1000.0001"),
+            ("1e1_0", "10000000000"),
+            ("0o17", "15"),
+            ("0b101", "5"),
+            ("-0x10", "-16"),
+            ("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", "87112285931760246646623899502532662132735"),
+            ("- 5", "-5"),
+            ("+-5", "-5"),
+            ("- - 3", "3"),
+            ("+ -.5", "-0.5"),
+            ("1e0", "1"),
+            ("0e5", "0"),
+            ("0.0e3", "0"),
+            ("100e-2", "1.00"),
+            ("2147483648", "2147483648"),
+            ("1.0e-0", "1.0"),
+            ("-1e1", "-10"),
+            ("12.340e-1", "1.2340"),
+            ("+1.5", "1.5"),
+            ("1.5e+0", "1.5"),
+            ("9223372036854775808", "9223372036854775808"),
+            ("0.000", "0.000"),
+            ("00", "0"),
+            ("123.456e-20", "0.00000000000000000123456"),
+        ] {
+            assert_eq!(numeric_constant_text(raw).as_deref(), Some(pg), "{raw}");
+        }
+        assert_eq!(numeric_constant_text("1e400").map(|t| t.len()), Some(401));
+        // Long non-decimal constants, through the limb conversion.
+        let long_hex = numeric_constant_text(&format!("0x{}", "F".repeat(2000))).unwrap();
+        assert_eq!((long_hex.len(), &long_hex[..20], &long_hex[long_hex.len() - 20..]), (2409, "17376620319380945659", "29880747677634789375"));
+        assert_eq!(numeric_constant_text(&format!("0o{}", "7".repeat(50))).as_deref(), Some("1427247692705959881058285969449495136382746623"));
+        assert_eq!(numeric_constant_text(&format!("0b{}", "1".repeat(100))).as_deref(), Some("1267650600228229401496703205375"));
+        // Not numeric constants (PostgreSQL refuses the malformed ones; here
+        // they are left to the paths that read them as before).
+        for raw in ["'1e1'", "1_", "1__0", "1e", ".e1", "1e+", "abc", "--5", "1.2.3", "0x", "0x1G", "", "-", "1e5000000000"] {
+            assert_eq!(numeric_constant_text(raw), None, "{raw}");
+        }
+    }
+
+    /// `timestamp_in`: the zone is read and discarded, and the encoder a
+    /// `timestamp` column's literal goes through (`DbType::TIMESTAMP`) is
+    /// this one.
+    #[test]
+    fn a_local_timestamp_discards_the_zone() {
+        let wall = parse_timestamp_us("2026-08-20 14:00:00").unwrap();
+        for text in ["2026-08-20 14:00:00+02:00", "2026-08-20 14:00:00+0200", "2026-08-20 14:00:00-05:30", "2026-08-20T14:00:00Z"] {
+            assert_eq!(parse_timestamp_local_us(text), Some(wall), "{text}");
+        }
+        assert_eq!(
+            encode_literal(&crate::core::db_type::DbType::TIMESTAMP, "'2026-08-20 14:00:00+02'"),
+            Some(wall.to_le_bytes().to_vec())
+        );
+        assert_eq!(parse_timestamp_local_us("2026-02-30 00:00:00+02"), None);
     }
 
     #[test]
     fn timestamp_keeps_sub_second_precision() {
         let base = parse_timestamp_us("2026-08-20 00:00:00").unwrap();
-        assert_eq!(parse_timestamp_us("2026-08-20 00:00:00.5").unwrap(), base + 500_000);
-        assert_eq!(parse_timestamp_us("2026-08-20 00:00:00.000001").unwrap(), base + 1);
-        // More than microsecond precision is truncated, not rejected.
-        assert_eq!(parse_timestamp_us("2026-08-20 00:00:00.1234567").unwrap(), base + 123_456);
+        assert_eq!(
+            parse_timestamp_us("2026-08-20 00:00:00.5").unwrap(),
+            base + 500_000
+        );
+        assert_eq!(
+            parse_timestamp_us("2026-08-20 00:00:00.000001").unwrap(),
+            base + 1
+        );
+        // More than microsecond precision is rounded as PostgreSQL rounds
+        // it, not truncated and not rejected.
+        assert_eq!(
+            parse_timestamp_us("2026-08-20 00:00:00.1234567").unwrap(),
+            base + 123_457
+        );
+        assert_eq!(
+            parse_timestamp_us("2026-08-20 00:00:00.4999995").unwrap(),
+            base + 500_000
+        );
+        assert_eq!(
+            parse_timestamp_us("2026-08-20 00:00:00.9999996").unwrap(),
+            base + 1_000_000
+        );
     }
 
     #[test]
@@ -1115,14 +3719,25 @@ mod tests {
     fn timestamp_rejects_nonsense() {
         assert!(parse_timestamp_us("2026-13-01").is_none(), "month 13");
         assert!(parse_timestamp_us("2026-01-32").is_none(), "day 32");
-        assert!(parse_timestamp_us("2026-01-01 25:00:00").is_none(), "hour 25");
+        assert!(
+            parse_timestamp_us("2026-01-01 25:00:00").is_none(),
+            "hour 25"
+        );
         assert!(parse_timestamp_us("not a date").is_none());
         assert!(parse_timestamp_us("2026-01").is_none(), "no day");
     }
 
     #[test]
     fn decimal_round_trips_through_text() {
-        for s in ["0", "1", "-1", "20.5", "-0.000000001", "1234567.891", "1000000.25"] {
+        for s in [
+            "0",
+            "1",
+            "-1",
+            "20.5",
+            "-0.000000001",
+            "1234567.891",
+            "1000000.25",
+        ] {
             let v = parse_decimal(s).unwrap();
             assert_eq!(format_decimal(v), s, "{}", s);
         }
@@ -1176,10 +3791,124 @@ mod tests {
     #[test]
     fn pg_numeric_reports_only_the_scale_a_value_needs() {
         let raw = encode_pg_numeric(parse_decimal("19").unwrap());
-        assert_eq!(i16::from_be_bytes([raw[6], raw[7]]), 0, "dscale for a whole number");
+        assert_eq!(
+            i16::from_be_bytes([raw[6], raw[7]]),
+            0,
+            "dscale for a whole number"
+        );
 
         let raw = encode_pg_numeric(parse_decimal("1930.50").unwrap());
-        assert_eq!(i16::from_be_bytes([raw[6], raw[7]]), 1, "trailing zeroes trimmed");
+        assert_eq!(
+            i16::from_be_bytes([raw[6], raw[7]]),
+            1,
+            "trailing zeroes trimmed"
+        );
+    }
+
+    /// Each `(value, PostgreSQL 17's ::text)`.
+    #[test]
+    fn floats_are_written_as_postgresql_writes_them() {
+        let doubles: &[(f64, &str)] = &[
+            (1e20, "1e+20"),
+            (1e-7, "1e-07"),
+            (0.1, "0.1"),
+            (123456789012345.0, "123456789012345"),
+            (1e15, "1e+15"),
+            (1e16, "1e+16"),
+            (0.0001, "0.0001"),
+            (1e-5, "1e-05"),
+            (1.0 / 3.0, "0.3333333333333333"),
+            (2.5, "2.5"),
+            (100.0, "100"),
+            (-1.5e-10, "-1.5e-10"),
+            (f64::MAX, "1.7976931348623157e+308"),
+            (5e-324, "5e-324"),
+            (1234567.891, "1234567.891"),
+            (0.000123456, "0.000123456"),
+            (-0.0, "-0"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+            (99999999999999.9, "99999999999999.9"),
+            (999999999999999.9, "999999999999999.9"),
+            (720419008450196.2, "720419008450196.2"),
+        ];
+        for (v, pg) in doubles {
+            assert_eq!(pg_float8_text(*v), *pg, "{v:e}");
+        }
+        let reals: &[(f32, &str)] = &[
+            (3.4e38, "3.4e+38"),
+            (1e-7, "1e-07"),
+            (0.1, "0.1"),
+            (100000.0, "100000"),
+            (1e6, "1e+06"),
+            (123456.0, "123456"),
+            (1.5, "1.5"),
+            (1e-4, "0.0001"),
+            (1e-5, "1e-05"),
+            (0.333333333, "0.33333334"),
+            (-0.0, "-0"),
+            (f32::NAN, "NaN"),
+            (f32::INFINITY, "Infinity"),
+            (16777217.0, "1.6777216e+07"),
+            (1234567.0, "1.234567e+06"),
+            (2634014.3, "2.6340142e+06"),
+        ];
+        for (v, pg) in reals {
+            assert_eq!(pg_float4_text(*v), *pg, "{v:e}");
+        }
+    }
+
+    /// The ryu-based writer against a plain one built on Rust's own
+    /// shortest digits (`{:e}`), over random bit patterns: the same text
+    /// (but for ties between two shortest strings, where ryu picks what
+    /// PostgreSQL picks), and it reads back as the same float.
+    #[test]
+    fn the_float_writer_agrees_with_rusts_shortest_digits() {
+        fn reference(sci: String, fixed_below: i32) -> String {
+            let (mantissa, exp) = sci.split_once('e').unwrap();
+            let exp: i32 = exp.parse().unwrap();
+            let (sign, mantissa) = mantissa.strip_prefix('-').map_or(("", mantissa), |m| ("-", m));
+            let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+            let body = if (-4..fixed_below).contains(&exp) {
+                if exp >= 0 {
+                    let whole = exp as usize + 1;
+                    if digits.len() <= whole {
+                        format!("{digits}{}", "0".repeat(whole - digits.len()))
+                    } else {
+                        format!("{}.{}", &digits[..whole], &digits[whole..])
+                    }
+                } else {
+                    format!("0.{}{digits}", "0".repeat((-exp - 1) as usize))
+                }
+            } else {
+                format!("{mantissa}e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.unsigned_abs())
+            };
+            format!("{sign}{body}")
+        }
+        let mut rng = fastrand::Rng::with_seed(0x5eed);
+        for _ in 0..200_000 {
+            let v = f64::from_bits(rng.u64(..));
+            if !v.is_finite() || v == 0.0 {
+                continue;
+            }
+            // Same digits, except where two shortest strings both read back
+            // and the two pick differently (720419008450196.2: ryu and
+            // PostgreSQL .2, Rust .3): there the same length, and the round
+            // trip.
+            let ours = pg_float8_text(v);
+            let theirs = reference(format!("{:e}", v), 15);
+            assert!(ours == theirs || ours.len() == theirs.len(), "{v:e}: {ours} vs {theirs}");
+            assert_eq!(ours.parse::<f64>().unwrap(), v);
+            // For `real` the two pick differently between two shortest
+            // digit strings that both read back (2634014.3: Rust
+            // 2.6340143e6, ryu and PostgreSQL 2.6340142e+06), so only the
+            // round trip is checked here; the table above pins PostgreSQL's.
+            let w = f32::from_bits(rng.u32(..));
+            if w.is_finite() && w != 0.0 {
+                assert_eq!(pg_float4_text(w).parse::<f32>().unwrap(), w, "{w:e}");
+            }
+        }
     }
 
     #[test]
@@ -1207,11 +3936,30 @@ mod tests {
     #[test]
     fn encode_literal_covers_every_type_it_claims() {
         use crate::core::db_type::DbType;
-        assert_eq!(encode_literal(&DbType::UUID, "'00000000-0000-0000-0000-000000000000'").unwrap().len(), UUID_LEN);
-        assert_eq!(encode_literal(&DbType::INET, "'10.0.0.1'").unwrap().len(), INET_LEN);
-        assert_eq!(encode_literal(&DbType::DATETIME, "'2026-08-20'").unwrap().len(), 8);
-        assert_eq!(encode_literal(&DbType::DECIMAL, "'20.00'").unwrap().len(), 16);
-        assert!(encode_literal(&DbType::I32, "7").is_none(), "numeric types stay with their caller");
+        assert_eq!(
+            encode_literal(&DbType::UUID, "'00000000-0000-0000-0000-000000000000'")
+                .unwrap()
+                .len(),
+            UUID_LEN
+        );
+        assert_eq!(
+            encode_literal(&DbType::INET, "'10.0.0.1'").unwrap().len(),
+            INET_LEN
+        );
+        assert_eq!(
+            encode_literal(&DbType::DATETIME, "'2026-08-20'")
+                .unwrap()
+                .len(),
+            8
+        );
+        assert_eq!(
+            encode_literal(&DbType::DECIMAL, "'20.00'").unwrap().len(),
+            16
+        );
+        assert!(
+            encode_literal(&DbType::I32, "7").is_none(),
+            "numeric types stay with their caller"
+        );
         assert!(encode_literal(&DbType::UUID, "'nonsense'").is_none());
     }
 
@@ -1251,8 +3999,14 @@ mod tests {
     #[test]
     fn coercion_maps_boolean_spellings_onto_one_byte() {
         use crate::core::db_type::DbType;
-        assert_eq!(coerce_literal(b"true", &DbType::STRING, &DbType::BOOL).unwrap(), vec![1]);
-        assert_eq!(coerce_literal(b"f", &DbType::STRING, &DbType::BOOL).unwrap(), vec![0]);
+        assert_eq!(
+            coerce_literal(b"true", &DbType::STRING, &DbType::BOOL).unwrap(),
+            vec![1]
+        );
+        assert_eq!(
+            coerce_literal(b"f", &DbType::STRING, &DbType::BOOL).unwrap(),
+            vec![0]
+        );
         assert_eq!(
             coerce_literal(&1i32.to_le_bytes(), &DbType::I32, &DbType::BOOL).unwrap(),
             vec![1]
@@ -1273,16 +4027,77 @@ mod tests {
     fn coercion_is_a_no_op_when_types_already_agree() {
         use crate::core::db_type::DbType;
         let lit = 7i64.to_le_bytes();
-        assert_eq!(coerce_literal(&lit, &DbType::I64, &DbType::I64).unwrap(), lit.to_vec());
+        assert_eq!(
+            coerce_literal(&lit, &DbType::I64, &DbType::I64).unwrap(),
+            lit.to_vec()
+        );
+    }
+
+    /// The cells an older build wrote for a legacy `CHAR` — the value's
+    /// UTF-8, cut at four bytes and zero-padded (f89ed7ad's files, byte for
+    /// byte) — read back as the text; new writes are `character(1)`; a
+    /// literal meets the cell in the form the cell has.
+    #[test]
+    fn a_legacy_char_cell_is_text_in_four_bytes() {
+        use crate::core::db_type::DbType;
+        for (cell, text) in [
+            ([0x41, 0, 0, 0], "A"),
+            ([0xc3, 0xa9, 0, 0], "é"),
+            ([0xe2, 0x82, 0xac, 0], "€"),
+            ([0xf0, 0x9f, 0x98, 0x80], "😀"),
+            ([0x61, 0x62, 0, 0], "ab"),
+            ([0x61, 0x62, 0x63, 0x64], "abcd"),
+            ([0x20, 0, 0, 0], ""),
+            ([0, 0, 0, 0], ""),
+            ([0x61, 0x20, 0, 0], "a"),
+            // 'aé€' cut inside the euro sign: what survives whole.
+            ([0x61, 0xc3, 0xa9, 0xe2], "aé"),
+        ] {
+            assert_eq!(legacy_char_text(&cell), text, "{cell:02x?}");
+        }
+        assert_eq!(legacy_char_assign("é"), Ok([0xc3, 0xa9, 0, 0]));
+        assert_eq!(legacy_char_assign("x  "), Ok([0x78, 0, 0, 0]));
+        assert_eq!(legacy_char_assign(""), Ok([0, 0, 0, 0]));
+        assert_eq!(legacy_char_assign(" "), Ok([0, 0, 0, 0]));
+        // Every cell of one value has one stored form, and one display.
+        for cell in [[0u8, 0, 0, 0], [0x20, 0, 0, 0], [0x20, 0x20, 0, 0]] {
+            assert_eq!(legacy_char_canonical(&cell), [0, 0, 0, 0]);
+            assert_eq!(legacy_char_display(&cell), " ");
+        }
+        assert_eq!(legacy_char_canonical(&[0x61, 0x20, 0, 0]), [0x61, 0, 0, 0]);
+        assert_eq!(legacy_char_canonical(&[0x61, 0xc3, 0xa9, 0xe2]), [0x61, 0xc3, 0xa9, 0]);
+        assert_eq!(legacy_char_assign("😀"), Ok([0xf0, 0x9f, 0x98, 0x80]));
+        assert!(legacy_char_assign("ab").is_err());
+        assert!(legacy_char_assign("abcde").is_err());
+        assert!(legacy_char_assign("a b").is_err());
+        assert_eq!(legacy_char_literal("é"), Some([0xc3, 0xa9, 0, 0]));
+        assert_eq!(legacy_char_literal("ab"), Some([0x61, 0x62, 0, 0]));
+        assert_eq!(legacy_char_literal("abcde"), None);
+        // Through the comparison coercion, and out of it as text.
+        assert_eq!(coerce_literal("é".as_bytes(), &DbType::STRING, &DbType::CHAR), Some(vec![0xc3, 0xa9, 0, 0]));
+        assert_eq!(coerce_literal(&[0x41, 0, 0, 0], &DbType::CHAR, &DbType::STRING), Some(b"A".to_vec()));
+        assert_eq!(coerce_literal(&5i32.to_le_bytes(), &DbType::I32, &DbType::CHAR), Some(vec![b'5', 0, 0, 0]));
     }
 
     #[test]
     fn coercion_result_width_always_matches_the_target() {
         use crate::core::db_type::DbType;
         for to in [
-            DbType::I8, DbType::I16, DbType::I32, DbType::I64, DbType::I128,
-            DbType::U8, DbType::U16, DbType::U32, DbType::U64, DbType::U128,
-            DbType::F32, DbType::F64, DbType::BOOL, DbType::CHAR, DbType::DECIMAL,
+            DbType::I8,
+            DbType::I16,
+            DbType::I32,
+            DbType::I64,
+            DbType::I128,
+            DbType::U8,
+            DbType::U16,
+            DbType::U32,
+            DbType::U64,
+            DbType::U128,
+            DbType::F32,
+            DbType::F64,
+            DbType::BOOL,
+            DbType::CHAR,
+            DbType::DECIMAL,
             DbType::DATETIME,
         ] {
             let out = coerce_literal(&1i32.to_le_bytes(), &DbType::I32, &to)
@@ -1294,6 +4109,17 @@ mod tests {
                 to
             );
         }
+    }
+
+    #[test]
+    fn a_json_string_literal_keeps_its_quotes() {
+        use crate::core::db_type::DbType;
+        // The WHERE path hands the literal over unquoted; the INSERT path
+        // with its SQL quotes. Both are the JSON string `t1`.
+        let want = crate::core::jsonb::encode_text("\"t1\"").unwrap();
+        assert_eq!(encode_literal(&DbType::JSONB, "\"t1\""), Some(want.clone()));
+        assert_eq!(encode_literal(&DbType::JSONB, "'\"t1\"'"), Some(want));
+        assert_eq!(encode_literal(&DbType::JSONB, "t1"), None);
     }
 
     #[test]
@@ -1347,10 +4173,54 @@ mod scaled_decimal_tests {
         assert_eq!(format_decimal_scaled(v, 4), "150.0000");
     }
 
+    /// `NUMERIC(10)` is scale 0. Text and binary must say the same thing; the
+    /// text path used to divide by 10^9 and print `42` as `0`.
+    #[test]
+    fn scale_zero_text_agrees_with_binary() {
+        for (literal, text) in [("42", "42"), ("-7", "-7"), ("0", "0"), ("12345678901", "12345678901")] {
+            let v = parse_decimal_scaled(literal, 0).unwrap();
+            assert_eq!(format_decimal_scaled(v, 0), text);
+            let binary = crate::core::pg_types::decode_pg_numeric(&encode_pg_numeric_scaled(v, 0));
+            assert_eq!(binary.as_deref(), Some(text), "binary form of {literal}");
+        }
+    }
+
     #[test]
     fn a_non_numeric_literal_is_still_refused() {
         assert!(parse_decimal_scaled("abc", 16).is_none());
         assert!(parse_decimal_scaled("", 16).is_none());
+    }
+
+    /// PostgreSQL's answers for `NUMERIC(12,2)`, `NUMERIC(10,8)` and the
+    /// engine scale: half away from zero, decided by the first dropped digit.
+    #[test]
+    fn an_assigned_literal_rounds_half_away_from_zero() {
+        for (text, scale, want) in [
+            ("20.169", 2, 2017),
+            ("20.165", 2, 2017),
+            ("-20.165", 2, -2017),
+            ("20.1649999", 2, 2016),
+            ("0.005", 2, 1),
+            ("-0.005", 2, -1),
+            ("1.5", 0, 2),
+            ("-2.5", 0, -3),
+            ("1.123456785", 8, 112345679),
+            ("0.1234567895", 9, 123456790),
+            ("7", 2, 700),
+        ] {
+            assert_eq!(parse_decimal_rounded(text, scale), Some(want), "{text} at {scale}");
+        }
+        assert!(parse_decimal_rounded("abc", 2).is_none());
+    }
+
+    #[test]
+    fn the_declared_precision_bounds_the_integer_digits() {
+        assert!(check_numeric_precision(999_999_999_999, 12, 2).is_ok());
+        let err = check_numeric_precision(1_000_000_000_000, 12, 2).unwrap_err();
+        assert!(err.starts_with("numeric field overflow"), "{err}");
+        assert!(check_numeric_precision(-1_000_000_000_000, 12, 2).is_err());
+        // Unchecked where nothing was declared.
+        assert!(check_numeric_precision(i128::MAX, 0, 2).is_ok());
     }
 }
 
@@ -1472,5 +4342,715 @@ mod truncate_tests {
             let twice = truncate_timestamp_us(once, unit).unwrap();
             assert_eq!(once, twice, "unit {}", unit);
         }
+    }
+}
+
+/// The output-side rewrites (digit writers, decimal and numeric encoders,
+/// timestamps, bytea, decimal parsing) against the implementations they
+/// replaced, over generated inputs and the edges that matter.
+#[cfg(test)]
+mod wire_fast_path_tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            // xorshift64*
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Unscaled values: every power of ten and its neighbours, the `u64` and
+    /// `i64` boundaries, the `i128` extremes, and random magnitudes of every
+    /// bit length, each with both signs.
+    fn sample_values() -> Vec<i128> {
+        let mut v: Vec<i128> = vec![0, 1, 9, 10, 99, 100, 9999, 10_000, 10_001, 5, 50_000];
+        let mut p: i128 = 1;
+        for _ in 0..=38 {
+            v.extend([p - 1, p, p + 1, p.saturating_mul(5), p / 2]);
+            p = p.saturating_mul(10);
+        }
+        for b in [u64::MAX as i128, i64::MAX as i128, i64::MIN as i128] {
+            v.extend([b - 1, b, b + 1]);
+        }
+        v.extend([i128::MAX, i128::MAX - 1, i128::MIN + 1, i128::MIN]);
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..4000 {
+            let hi = rng.next() as u128;
+            let lo = rng.next() as u128;
+            let shift = rng.below(128) as u32;
+            v.push((((hi << 64) | lo) >> shift) as i128);
+        }
+        let negated: Vec<i128> = v.iter().filter_map(|x| x.checked_neg()).collect();
+        v.extend(negated);
+        v
+    }
+
+    #[test]
+    fn digit_writers_match_to_string() {
+        let mut rng = Rng(7);
+        let mut values: Vec<u64> = vec![0, 1, 9, 10, 99, 100, 999, 1000, 9999, 10_000, u64::MAX, u64::MAX - 1];
+        for k in 0..20 {
+            values.extend([POW10_U64[k], POW10_U64[k] - 1, POW10_U64[k] + 1]);
+        }
+        for _ in 0..20_000 {
+            values.push(rng.next() >> rng.below(64));
+        }
+        for &n in &values {
+            let mut out = Vec::new();
+            write_u64(&mut out, n);
+            assert_eq!(out, n.to_string().as_bytes());
+            let s = n as i64;
+            out.clear();
+            write_i64(&mut out, s);
+            assert_eq!(out, s.to_string().as_bytes());
+            for width in 1..=20usize {
+                if (n as u128) < 10u128.pow(width as u32) {
+                    out.clear();
+                    write_u64_padded(&mut out, n, width);
+                    assert_eq!(out, format!("{:0width$}", n, width = width).as_bytes());
+                }
+            }
+        }
+        for v in sample_values() {
+            let mut out = Vec::new();
+            write_i128(&mut out, v);
+            assert_eq!(out, v.to_string().as_bytes());
+        }
+    }
+
+    #[test]
+    fn decimal_text_matches_the_wide_implementation() {
+        for v in sample_values() {
+            for scale in 0..=38u32 {
+                let mut out = Vec::new();
+                format_decimal_scaled_into(v, scale, &mut out);
+                assert_eq!(
+                    String::from_utf8(out).unwrap(),
+                    format_decimal_scaled_wide(v, scale),
+                    "value {v} scale {scale}"
+                );
+            }
+            assert_eq!(format_decimal(v), format_decimal_wide(v), "value {v}");
+        }
+    }
+
+    /// Whether the original encoder got this value right. It did not when the
+    /// value was below 0.0001 (weight not moved past dropped zero groups), and
+    /// overflowed at scales 37 and 38.
+    fn legacy_is_correct(v: i128, scale: u32) -> bool {
+        if scale >= 37 {
+            return false;
+        }
+        let factor = 10u128.pow(scale);
+        let magnitude = v.unsigned_abs();
+        let int_part = magnitude / factor;
+        let frac_part = magnitude % factor;
+        if int_part == 0 && frac_part != 0 {
+            let padded = scale.div_ceil(4) * 4;
+            // The leading fractional group is zero exactly when the value is
+            // below 0.0001.
+            let leading = frac_part * 10u128.pow(padded - scale) / 10u128.pow(padded - 4);
+            return leading != 0;
+        }
+        true
+    }
+
+    #[test]
+    fn wide_integers_encode_as_scale_zero_numeric() {
+        let decode = |raw: &[u8]| -> (bool, u128, i16) {
+            let be16 = |at: usize| i16::from_be_bytes([raw[at], raw[at + 1]]);
+            let (n, weight, sign, dscale) = (be16(0) as usize, be16(2), be16(4) as u16, be16(6));
+            assert_eq!(dscale, 0);
+            let mut v: u128 = 0;
+            for i in 0..n {
+                v = v * 10_000 + be16(8 + 2 * i) as u128;
+            }
+            for _ in 0..(weight as i32 + 1 - n as i32).max(0) {
+                v *= 10_000;
+            }
+            (sign == 0x4000, v, weight)
+        };
+        for v in [0u128, 1, 10_000, 120_000, u64::MAX as u128, i128::MAX as u128, u128::MAX] {
+            let mut out = Vec::new();
+            encode_pg_numeric_u128_into(v, &mut out);
+            assert_eq!(decode(&out).1, v, "{v}");
+            assert!(!decode(&out).0);
+        }
+        for v in [i128::MIN, -1, i128::MAX] {
+            let mut out = Vec::new();
+            encode_pg_numeric_i128_into(v, &mut out);
+            let (neg, mag, _) = decode(&out);
+            assert_eq!((neg, mag), (v < 0, v.unsigned_abs()), "{v}");
+            // The same bytes the scaled encoder gives at scale 0.
+            assert_eq!(out, encode_pg_numeric_scaled(v, 0));
+        }
+    }
+
+    #[test]
+    fn numeric_binary_matches_the_original_where_it_was_right() {
+        let mut compared = 0usize;
+        for v in sample_values() {
+            for scale in 0..=38u32 {
+                let new = encode_pg_numeric_scaled(v, scale);
+                if legacy_is_correct(v, scale) {
+                    assert_eq!(new, encode_pg_numeric_scaled_legacy(v, scale), "value {v} scale {scale}");
+                    compared += 1;
+                }
+                // And, everywhere, it decodes back to the value it encodes.
+                // (`i128::MIN`'s magnitude does not parse back as an `i128`.)
+                if v == i128::MIN {
+                    continue;
+                }
+                let text = crate::core::pg_types::decode_pg_numeric(&new)
+                    .unwrap_or_else(|| panic!("undecodable: value {v} scale {scale}"));
+                assert_eq!(
+                    parse_decimal_scaled(&text, scale),
+                    Some(v),
+                    "value {v} scale {scale} decoded as {text}"
+                );
+            }
+        }
+        assert!(compared > 100_000, "the comparison must cover most inputs ({compared})");
+    }
+
+    /// The two cases the original got wrong, pinned to PostgreSQL's layout.
+    #[test]
+    fn numeric_binary_below_one_ten_thousandth_moves_the_weight() {
+        // 0.00005 = 0.0000 5000: one digit, weight -2, dscale 5.
+        let v = parse_decimal_scaled("0.00005", 9).unwrap();
+        let header = |b: &[u8]| -> [i16; 4] {
+            [0, 2, 4, 6].map(|i| i16::from_be_bytes([b[i], b[i + 1]]))
+        };
+        let enc = encode_pg_numeric_scaled(v, 9);
+        assert_eq!(header(&enc), [1, -2, 0, 5]);
+        assert_eq!(&enc[8..], &5000u16.to_be_bytes());
+        // -0.000000001 = -0.0000 0000 1000: weight -3.
+        let enc = encode_pg_numeric_scaled(-1, 9);
+        assert_eq!(header(&enc), [1, -3, 0x4000u16 as i16, 9]);
+        assert_eq!(&enc[8..], &1000u16.to_be_bytes());
+        assert_eq!(crate::core::pg_types::decode_pg_numeric(&enc).as_deref(), Some("-0.000000001"));
+        // Zero keeps the original's shape: no digits, weight -1.
+        assert_eq!(header(&encode_pg_numeric_scaled(0, 9)), [0, -1, 0, 0]);
+        assert_eq!(header(&encode_pg_numeric_scaled(0, 0)), [0, -1, 0, 0]);
+        // Scale 38, which overflowed: the largest fraction there is.
+        let v = 10i128.pow(38) - 1;
+        let enc = encode_pg_numeric_scaled(v, 38);
+        assert_eq!(
+            crate::core::pg_types::decode_pg_numeric(&enc).as_deref(),
+            Some("0.99999999999999999999999999999999999999")
+        );
+    }
+
+    #[test]
+    fn timestamps_match_the_original() {
+        let mut values: Vec<i64> = vec![0, 1, -1, 999_999, -999_999, 1_000_000, -1_000_000, 10, 100_000, 120, i64::MAX, i64::MIN];
+        // Year boundaries: 0000, 0999/1000, 9999/10000, and BC.
+        for (y, m, d) in [(0, 1, 1), (1, 1, 1), (999, 12, 31), (1000, 1, 1), (1970, 1, 1), (2000, 2, 29), (9999, 12, 31), (10000, 1, 1), (-1, 12, 31), (-5, 6, 15), (-10000, 1, 1), (275_000, 1, 1)] {
+            let base = days_from_civil(y, m, d) * 86_400_000_000;
+            values.extend([base, base - 1, base + 1, base + 86_399_999_999, base + 500_000, base + 123_456]);
+        }
+        let mut rng = Rng(0xDEAD_BEEF);
+        for _ in 0..50_000 {
+            let span = 400 * 366 * 86_400_000_000i64; // ~400 years either side of 1970
+            values.push((rng.next() % (2 * span as u64)) as i64 - span);
+            values.push(rng.next() as i64);
+        }
+        for us in values {
+            assert_eq!(format_timestamp_us(us), format_timestamp_us_legacy(us), "us {us}");
+        }
+    }
+
+    #[test]
+    fn bytea_hex_matches_the_original() {
+        let mut rng = Rng(3);
+        let all: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(format_bytea(&all), format_bytea_legacy(&all));
+        assert_eq!(format_bytea(&[]), "\\x");
+        for _ in 0..2000 {
+            let len = rng.below(300) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+            assert_eq!(format_bytea(&bytes), format_bytea_legacy(&bytes));
+        }
+    }
+
+    /// Decimal literals: digits of every length around the 19-digit fast-path
+    /// limit, signs, fractions longer than the scale, exponents, whitespace,
+    /// and junk.
+    fn sample_literals() -> Vec<String> {
+        let mut rng = Rng(11);
+        let mut out: Vec<String> = [
+            "", " ", "-", "+", ".", "-.", "0", "-0", "+0", "0.0", ".5", "5.", "-.5", "1e5", "1E-3",
+            "1.5e2", "1.2.3", "12a", "1_000", " 42 ", "\t-7.25\n", "e5", "1e", "1e+", "--1", "+-1",
+            "00000000000000000000000000000000000001", "9999999999999999999", "10000000000000000000",
+            "18446744073709551615", "18446744073709551616", "-9223372036854775808",
+            "170141183460469231731687303715884105727", "170141183460469231731687303715884105728",
+            "0.000000001", "0.0000000001", "123456789.123456789", "1.2345678901234567890123",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for _ in 0..20_000 {
+            let mut s = String::new();
+            match rng.below(4) {
+                0 => s.push('-'),
+                1 => s.push('+'),
+                _ => {}
+            }
+            let int_len = rng.below(24) as usize;
+            for _ in 0..int_len {
+                s.push((b'0' + rng.below(10) as u8) as char);
+            }
+            if rng.below(3) != 0 {
+                s.push('.');
+                let frac_len = rng.below(24) as usize;
+                for _ in 0..frac_len {
+                    s.push((b'0' + rng.below(10) as u8) as char);
+                }
+            }
+            match rng.below(10) {
+                0 => s.push_str(&format!("e{}", rng.below(30) as i64 - 15)),
+                1 => s.push_str("e0"),
+                2 => s.insert(s.len() / 2, 'x'),
+                3 => s = format!("  {}  ", s),
+                _ => {}
+            }
+            out.push(s);
+        }
+        out
+    }
+
+    #[test]
+    fn decimal_parsing_matches_the_original() {
+        for text in sample_literals() {
+            assert_eq!(parse_decimal(&text), parse_decimal_legacy(&text), "{text:?}");
+            for scale in 0..=38u32 {
+                assert_eq!(
+                    parse_decimal_scaled(&text, scale),
+                    parse_decimal_scaled_legacy(&text, scale),
+                    "{text:?} at scale {scale}"
+                );
+            }
+        }
+    }
+
+    /// Old-vs-new timings, interleaved. Run with
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored wire_codec_bench --nocapture`.
+    #[test]
+    #[ignore]
+    fn wire_codec_bench() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn time<F: FnMut() -> usize>(mut f: F) -> f64 {
+            let t = Instant::now();
+            let n = f();
+            t.elapsed().as_nanos() as f64 / n as f64
+        }
+        fn pair(name: &str, rounds: usize, mut old: impl FnMut() -> usize, mut new: impl FnMut() -> usize) {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            for _ in 0..rounds {
+                a.push(time(&mut old));
+                b.push(time(&mut new));
+            }
+            a.sort_by(f64::total_cmp);
+            b.sort_by(f64::total_cmp);
+            println!(
+                "{name:<28} old {:>8.1} ns  new {:>8.1} ns  ({:.2}x)",
+                a[rounds / 2],
+                b[rounds / 2],
+                a[rounds / 2] / b[rounds / 2]
+            );
+        }
+
+        let mut rng = Rng(42);
+        // Money-like values: up to 10^12 units at scale 2, and scale-9 values.
+        let money: Vec<i128> = (0..4096).map(|_| (rng.next() % 1_000_000_000_000) as i128 - 500_000_000_000).collect();
+        let scale9: Vec<i128> = (0..4096).map(|_| (rng.next() % 1_000_000_000_000_000) as i128).collect();
+        let stamps: Vec<i64> = (0..4096).map(|_| 1_700_000_000_000_000 + (rng.next() % 100_000_000_000_000) as i64).collect();
+        let blobs: Vec<Vec<u8>> = (0..256).map(|_| (0..64).map(|_| rng.next() as u8).collect()).collect();
+        let literals: Vec<String> = money.iter().map(|v| format_decimal_scaled(*v, 2)).collect();
+
+        pair("numeric binary scale 2", 15, || {
+            for v in &money { black_box(encode_pg_numeric_scaled_legacy(black_box(*v), 2)); }
+            money.len()
+        }, || {
+            let mut out = Vec::with_capacity(32);
+            for v in &money { out.clear(); encode_pg_numeric_scaled_into(black_box(*v), 2, &mut out); black_box(&out); }
+            money.len()
+        });
+        pair("numeric binary scale 9", 15, || {
+            for v in &scale9 { black_box(encode_pg_numeric_scaled_legacy(black_box(*v), 9)); }
+            scale9.len()
+        }, || {
+            let mut out = Vec::with_capacity(32);
+            for v in &scale9 { out.clear(); encode_pg_numeric_scaled_into(black_box(*v), 9, &mut out); black_box(&out); }
+            scale9.len()
+        });
+        pair("numeric text scale 2", 15, || {
+            for v in &money { black_box(format_decimal_scaled_wide(black_box(*v), 2)); }
+            money.len()
+        }, || {
+            let mut out = Vec::with_capacity(32);
+            for v in &money { out.clear(); format_decimal_scaled_into(black_box(*v), 2, &mut out); black_box(&out); }
+            money.len()
+        });
+        pair("numeric text default scale", 15, || {
+            for v in &scale9 { black_box(format_decimal_wide(black_box(*v))); }
+            scale9.len()
+        }, || {
+            let mut out = Vec::with_capacity(32);
+            for v in &scale9 { out.clear(); format_decimal_into(black_box(*v), &mut out); black_box(&out); }
+            scale9.len()
+        });
+        pair("numeric parse scale 2", 15, || {
+            for t in &literals { black_box(parse_decimal_scaled_legacy(black_box(t), 2)); }
+            literals.len()
+        }, || {
+            for t in &literals { black_box(parse_decimal_scaled(black_box(t), 2)); }
+            literals.len()
+        });
+        pair("timestamp text", 15, || {
+            for us in &stamps { black_box(format_timestamp_us_legacy(black_box(*us))); }
+            stamps.len()
+        }, || {
+            let mut out = Vec::with_capacity(32);
+            for us in &stamps { out.clear(); format_timestamp_us_into(black_box(*us), &mut out); black_box(&out); }
+            stamps.len()
+        });
+        pair("bytea hex 64 B", 15, || {
+            for b in &blobs { black_box(format_bytea_legacy(black_box(b))); }
+            blobs.len()
+        }, || {
+            let mut out = Vec::with_capacity(160);
+            for b in &blobs { out.clear(); format_bytea_into(black_box(b), &mut out); black_box(&out); }
+            blobs.len()
+        });
+    }
+
+    /// The originals, verbatim, as references.
+    fn parse_decimal_scaled_legacy(text: &str, scale: u32) -> Option<i128> {
+        if scale == DECIMAL_SCALE {
+            return parse_decimal_legacy(text);
+        }
+
+        // Parsed *directly* at the declared scale. Going via `parse_decimal` and
+        // rescaling would truncate to nine places first, so a `NUMERIC(38,16)`
+        // holding `1.2345678901234567` lost its tail before it was ever widened —
+        // and `parse_decimal` rejects more than nine places outright, which
+        // surfaced as "Cannot insert row due to schema mismatch".
+        let s = text.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let (negative, rest) = match s.as_bytes()[0] {
+            b'-' => (true, &s[1..]),
+            b'+' => (false, &s[1..]),
+            _ => (false, s),
+        };
+        if rest.is_empty() {
+            return None;
+        }
+
+        let (mantissa, exponent) = match rest.find(['e', 'E']) {
+            Some(i) => (&rest[..i], rest[i + 1..].parse::<i32>().ok()?),
+            None => (rest, 0),
+        };
+        let (int_part, frac_part) = match mantissa.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (mantissa, ""),
+        };
+        if int_part.is_empty() && frac_part.is_empty() {
+            return None;
+        }
+        if !int_part.bytes().all(|b| b.is_ascii_digit())
+            || !frac_part.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+
+        let mut digits = String::with_capacity(int_part.len() + frac_part.len());
+        digits.push_str(int_part);
+        digits.push_str(frac_part);
+        let mut frac_len = frac_part.len() as i32 - exponent;
+        if frac_len < 0 {
+            for _ in 0..(-frac_len) {
+                digits.push('0');
+            }
+            frac_len = 0;
+        }
+        let mut frac_len = frac_len as u32;
+
+        // More places than the column declared: drop the excess digits rather than
+        // refuse the value, which is what a narrower column asks for.
+        while frac_len > scale {
+            digits.pop();
+            frac_len -= 1;
+        }
+
+        let mut unscaled: i128 = if digits.is_empty() {
+            0
+        } else {
+            digits.parse().ok()?
+        };
+        unscaled = unscaled.checked_mul(10i128.checked_pow(scale - frac_len)?)?;
+        Some(if negative { -unscaled } else { unscaled })
+    }
+    fn parse_decimal_legacy(text: &str) -> Option<i128> {
+        let s = text.trim();
+        if s.is_empty() {
+            return None;
+        }
+
+        let (negative, rest) = match s.as_bytes()[0] {
+            b'-' => (true, &s[1..]),
+            b'+' => (false, &s[1..]),
+            _ => (false, s),
+        };
+        if rest.is_empty() {
+            return None;
+        }
+
+        // Split off an exponent, which shifts the decimal point.
+        let (mantissa, exponent) = match rest.find(['e', 'E']) {
+            Some(i) => (&rest[..i], rest[i + 1..].parse::<i32>().ok()?),
+            None => (rest, 0),
+        };
+
+        let (int_part, frac_part) = match mantissa.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (mantissa, ""),
+        };
+        if int_part.is_empty() && frac_part.is_empty() {
+            return None;
+        }
+        if !int_part.bytes().all(|b| b.is_ascii_digit())
+            || !frac_part.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        // Zeros past nine places are no places the value needs: accepted
+        // since round-2 review B2, as `parse_decimal` now accepts them.
+        let frac_part = if frac_part.len() > DECIMAL_SCALE as usize { frac_part.trim_end_matches('0') } else { frac_part };
+
+        // Fold the exponent into the digit string so only one scaling step remains.
+        let mut digits = String::with_capacity(int_part.len() + frac_part.len());
+        digits.push_str(int_part);
+        digits.push_str(frac_part);
+        let mut frac_len = frac_part.len() as i32 - exponent;
+
+        if frac_len < 0 {
+            // The exponent moved the point right past every digit we have.
+            for _ in 0..(-frac_len) {
+                digits.push('0');
+            }
+            frac_len = 0;
+        }
+        let frac_len = frac_len as u32;
+        if frac_len > DECIMAL_SCALE {
+            return None;
+        }
+
+        let mut unscaled: i128 = if digits.is_empty() {
+            0
+        } else {
+            digits.parse().ok()?
+        };
+        unscaled = unscaled.checked_mul(10i128.checked_pow(DECIMAL_SCALE - frac_len)?)?;
+        Some(if negative { -unscaled } else { unscaled })
+    }
+}
+
+#[cfg(test)]
+mod count_as_bigint_tests {
+    use super::count_as_bigint;
+
+    /// A count past `i64::MAX` saturates; it never wraps to a negative.
+    #[test]
+    fn counts_saturate_at_bigint_max_and_never_go_negative() {
+        assert_eq!(count_as_bigint(0), 0);
+        assert_eq!(count_as_bigint(42), 42);
+        assert_eq!(count_as_bigint(i64::MAX as u64), i64::MAX);
+        assert_eq!(count_as_bigint(i64::MAX as u64 + 1), i64::MAX);
+        assert_eq!(count_as_bigint(u64::MAX), i64::MAX);
+        // What the byte reinterpretation it replaced produced.
+        assert_eq!(i64::from_le_bytes(u64::MAX.to_le_bytes()), -1);
+    }
+}
+
+#[cfg(test)]
+mod byteain_tests {
+    use super::*;
+
+    #[test]
+    fn escape_format_matches_postgres() {
+        let ok: &[(&str, &[u8])] = &[
+            (" ab ", b" ab "),
+            ("", b""),
+            ("\\001", &[1]),
+            ("\\000", &[0]),
+            ("\\377", &[0xff]),
+            ("\\\\", b"\\"),
+            ("a\\\\b", b"a\\b"),
+            ("\\101\\102C", b"ABC"),
+            ("\\0012", &[1, b'2']),
+            ("é", "é".as_bytes()),
+        ];
+        for (input, want) in ok {
+            assert_eq!(byteain(input).as_deref(), Ok(*want), "{:?}", input);
+        }
+        for bad in ["\\", "a\\b", "\\400", "\\01", "\\0", "x\\", "\\X00", "\\8"] {
+            assert_eq!(
+                byteain(bad),
+                Err("invalid input syntax for type bytea".to_string()),
+                "{:?}",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn hex_format_matches_postgres() {
+        let ok: &[(&str, &[u8])] = &[
+            ("\\x", b""),
+            ("\\xdead", &[0xde, 0xad]),
+            ("\\xDeAd", &[0xde, 0xad]),
+            ("\\x de ad ", &[0xde, 0xad]),
+            ("\\x\tde\n\rad", &[0xde, 0xad]),
+            ("\\x   ", b""),
+        ];
+        for (input, want) in ok {
+            assert_eq!(byteain(input).as_deref(), Ok(*want), "{:?}", input);
+        }
+        assert_eq!(
+            byteain("\\x0").unwrap_err(),
+            "invalid hexadecimal data: odd number of digits"
+        );
+        assert_eq!(
+            byteain("\\xd e").unwrap_err(),
+            "invalid hexadecimal digit: \" \""
+        );
+        assert_eq!(byteain("\\xzz").unwrap_err(), "invalid hexadecimal digit: \"z\"");
+        assert_eq!(byteain("\\x0é").unwrap_err(), "invalid hexadecimal digit: \"é\"");
+    }
+
+    #[test]
+    fn every_byte_round_trips_through_both_formats() {
+        let all: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(byteain(&format_bytea(&all)).unwrap(), all);
+        let escaped: String = all.iter().map(|b| format!("\\{:03o}", b)).collect();
+        assert_eq!(byteain(&escaped).unwrap(), all);
+    }
+
+    #[test]
+    fn sql_literals_are_unquoted_exactly_once() {
+        assert_eq!(encode_bytea_sql("'it''s'").unwrap(), b"it's");
+        assert_eq!(encode_bytea_sql("'''ab'''").unwrap(), b"'ab'");
+        assert_eq!(encode_bytea_sql("E'\\\\001'").unwrap(), [1]);
+        assert_eq!(encode_bytea_sql("E'\\001'").unwrap(), [1]);
+        assert_eq!(encode_bytea_sql("e'\\\\x0a0B'").unwrap(), [0x0a, 0x0b]);
+        assert_eq!(encode_bytea_sql("E'a\\'b'").unwrap(), b"a'b");
+        assert_eq!(encode_bytea_sql("BYTEA '\\xff'").unwrap(), [0xff]);
+        assert_eq!(encode_bytea_sql("'\\x de ad'").unwrap(), [0xde, 0xad]);
+        // `E'\\'` is one backslash after the lexer: a lone backslash to byteain.
+        assert!(encode_bytea_sql("E'\\\\'").is_err());
+        assert!(encode_bytea_sql("'\\'").is_err());
+        // encode_literal answers the same for BYTEA, E-strings included.
+        use crate::core::db_type::DbType;
+        assert_eq!(encode_literal(&DbType::BYTEA, "E'\\\\001'").unwrap(), [1]);
+        assert_eq!(encode_literal(&DbType::BYTEA, "' ab '").unwrap(), b" ab ");
+        assert!(encode_literal(&DbType::BYTEA, "'\\x0'").is_none());
+    }
+
+    #[test]
+    fn escape_strings_resolve_like_the_postgres_lexer() {
+        let ok: &[(&str, &str)] = &[
+            ("a\\nb", "a\nb"),
+            ("\\b\\f\\r\\t\\v", "\u{8}\u{c}\r\t\u{b}"),
+            ("\\101", "A"),
+            ("\\x41\\x4", "A\u{4}"),
+            ("\\xg", "xg"),
+            ("\\u00e9", "é"),
+            ("\\U0001F600", "😀"),
+            ("\\uD83D\\uDE00", "😀"),
+            ("it''s", "it's"),
+            ("\\q", "q"),
+            ("\\\\", "\\"),
+            ("\\é", "é"),
+        ];
+        for (input, want) in ok {
+            assert_eq!(unescape_e_string(input).as_deref(), Ok(*want), "{:?}", input);
+        }
+        for bad in ["\\000", "\\xff", "\\uD83D", "\\uDE00", "\\u12", "\\"] {
+            assert!(unescape_e_string(bad).is_err(), "{:?}", bad);
+        }
+    }
+}
+
+/// Whether `text` is one JSON document, as PostgreSQL's `json_in` accepts it,
+/// with its reason in PostgreSQL's words when not. Leading and trailing
+/// whitespace is allowed and kept by the caller, as `json` keeps it.
+pub fn check_json_text(text: &str) -> Result<(), String> {
+    serde_json::from_str::<serde::de::IgnoredAny>(text)
+        .map(|_| ())
+        .map_err(|e| format!("invalid input syntax for type json: {e}"))
+}
+
+#[cfg(test)]
+mod typed_array_tests {
+    use super::*;
+    use crate::core::db_type::DbType;
+
+    #[test]
+    fn elements_read_as_their_type_does() {
+        for (t, ok, bad) in [
+            (DbType::I32, vec!["1", " +2 ", "-007", "2147483647"], vec!["x", "1.5", "", "2147483648", "1 2"]),
+            (DbType::I16, vec!["32767"], vec!["32768"]),
+            (DbType::BOOL, vec!["t", "TRUE", "yes", "y", "on", "1", "f", "no", "off", "0", " tr "], vec!["maybe", "o", "2", "yess"]),
+            (DbType::F64, vec!["1.5", "1e20", "-0", "NaN", "Infinity", "-inf"], vec!["x", ".", "0x10", ""]),
+        ] {
+            for v in ok {
+                assert!(encode_element(&t, v).is_some(), "{t:?} must read {v:?}");
+            }
+            for v in bad {
+                assert!(encode_element(&t, v).is_none(), "{t:?} must refuse {v:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_held_array_is_canonical_and_typed() {
+        let raw = parse_array_literal("{01,+2,NULL}").unwrap();
+        let held = hold_array_elements(&raw, &DbType::I32).unwrap().expect("changed");
+        assert_eq!(format_array(&held).unwrap(), "{1,2,NULL}");
+        assert_eq!(array_element_type(&held), Some(DbType::I32));
+        // Already held: nothing to do.
+        assert_eq!(hold_array_elements(&held, &DbType::I32).unwrap(), None);
+        let e = hold_array_elements(&parse_array_literal("{1,x}").unwrap(), &DbType::I32).unwrap_err();
+        assert!(e.contains("invalid input syntax for type integer: \"x\""), "{e}");
+        // `text[]` in binary: the stored bytes under the text OID.
+        assert_eq!(array_element_type(&as_text_array(&held)), None);
+        assert_eq!(format_array(&as_text_array(&held)).unwrap(), "{1,2,NULL}");
+    }
+
+    #[test]
+    fn arrays_order_as_postgresql_orders_them() {
+        use std::cmp::Ordering::*;
+        let int = |t: &str| hold_array_elements(&parse_array_literal(t).unwrap(), &DbType::I32).unwrap().unwrap_or_else(|| parse_array_literal(t).unwrap());
+        let text = |t: &str| parse_array_literal(t).unwrap();
+        assert_eq!(array_order(&int("{9}"), &int("{10}")), Less);
+        assert_eq!(array_order(&int("{9,1}"), &int("{10}")), Less);
+        assert_eq!(array_order(&int("{9}"), &int("{9,1}")), Less);
+        assert_eq!(array_order(&int("{NULL}"), &int("{100}")), Greater);
+        assert_eq!(array_order(&int("{}"), &int("{-3}")), Less);
+        assert_eq!(array_order(&text("{z}"), &text("{a,b}")), Greater);
+        assert_eq!(array_order(&text("{10}"), &text("{9}")), Less);
+        assert_eq!(array_order(&int("{1,2}"), &int("{01,2}")), Equal);
     }
 }

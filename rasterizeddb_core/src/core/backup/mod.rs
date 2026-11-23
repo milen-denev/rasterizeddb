@@ -81,12 +81,26 @@ use std::time::Duration;
 use log::{debug, error, info, warn};
 use tokio::sync::{RwLock, Semaphore};
 
+pub mod activity;
+#[cfg(all(test, feature = "s3_backup"))]
+mod activity_tests;
+#[cfg(all(test, feature = "s3_backup"))]
+mod staging_ceiling_tests;
+#[cfg(all(test, feature = "s3_backup"))]
+mod offline_start_tests;
 pub mod archive;
+pub mod cold;
 pub mod manifest;
+
 #[cfg(test)]
 mod pitr_tests;
+#[cfg(test)]
+mod upload_window_tests;
 pub mod restore;
 pub mod s3;
+/// An in-process S3 for tests; see its module docs.
+#[doc(hidden)]
+pub mod fake_s3;
 pub mod timeutil;
 
 use manifest::{Manifest, RecoveryTarget, SegmentEntry, SnapshotEntry};
@@ -98,6 +112,30 @@ pub const STAGING_DIR: &str = "wal_archive";
 /// File holding this database's backup identity.
 const INSTANCE_FILE: &str = "backup_instance.id";
 
+/// Stream key, and archive directory, of a storage location outside the
+/// backed-up directory: this followed by a hash of the location's path.
+///
+/// Not a path relative to the directory, so it cannot collide with the stream
+/// of a database created inside it — the restore puts such a location's files
+/// somewhere under a different name ([`RESTORED_LOCATION_PREFIX`]).
+pub const LOCATION_KEY_PREFIX: &str = "~loc-";
+
+/// What a restore into a new directory names the subdirectory a location's
+/// files are placed in. They cannot go back where they came from: that is the
+/// source's disk, still in use.
+pub const RESTORED_LOCATION_PREFIX: &str = "pool-location-";
+
+/// The stream key of the storage location at `path`.
+fn location_key(path: &str) -> String {
+    format!(
+        "{LOCATION_KEY_PREFIX}{:016x}",
+        crate::core::wal::file_id_for_name(&crate::core::wal::dir_key(path))
+    )
+}
+
+/// `rasterized.wal.floors`: see [`crate::core::torn_tail::Floors`].
+const FLOORS_FILE: &str = "rasterized.wal.floors";
+
 /// Files never captured in a snapshot.
 ///
 /// The live log is excluded because it is replayed *into* a restore rather than
@@ -106,6 +144,9 @@ const INSTANCE_FILE: &str = "backup_instance.id";
 /// id belongs to the database that made the backup, not the one restoring it.
 const EXCLUDED: &[&str] = &[
     crate::core::wal::DEFAULT_WAL_NAME,
+    // The durable floors name the source's files by inode; a restore's are
+    // new files, and its first open records their own.
+    FLOORS_FILE,
     INSTANCE_FILE,
     "temp.db",
     // Holds copies of what is being uploaded, one subdirectory per log.
@@ -113,7 +154,28 @@ const EXCLUDED: &[&str] = &[
     // dropped its `.wseg` files by suffix but kept a `.partial` copy of a log
     // that happened to be mid-flight.
     STAGING_DIR,
+    // A snapshot's copy of its cold tables, which it lists itself.
+    cold::COLD_DIR,
+    // Sweeps of dropped key/value files still to finish. A restored copy that
+    // resumed one would delete from the store the live server still uses.
+    "db_kv_erase.pending",
+    "db_kv_erase.pending.tmp",
+    // Branches' merge bases: closed copies of databases the snapshot already
+    // holds, needed only by a merge on this host.
+    ".rdb_branch_bases",
 ];
+
+/// Whether a file is left out of every snapshot: [`EXCLUDED`], and the
+/// index-store files (`.ixs`, `.ixm` and their `.tmp`s; persistent indexes
+/// §10). An open trusts a snapshot its marker log proves (B14), and a fuzzy
+/// walk could pair a copied `CLEAN` with rows changed after it; a restore
+/// rebuilds instead. `rdb.ixe` is kept: it is WAL'd.
+fn excluded_file(name: &str) -> bool {
+    EXCLUDED.contains(&name)
+        || crate::core::index_store::file_gate::INDEX_STORE_SUFFIXES
+            .iter()
+            .any(|s| name.ends_with(s))
+}
 
 /// S3 minimum for any part but the last.
 const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
@@ -186,6 +248,16 @@ pub struct BackupConfig {
     /// is worse, so past this ceiling checkpoints go back to discarding the log
     /// and the operator is told loudly.
     pub staging_max_bytes: u64,
+    /// Files at least this large are stored as objects of their own, and a
+    /// later snapshot whose copy of one hashes the same reuses the object
+    /// instead of uploading it again. 0 — the default — takes every snapshot
+    /// as one self-contained archive, as before.
+    ///
+    /// What this trades: a snapshot of a mostly-idle database uploads only
+    /// what changed, but its restore then depends on objects earlier
+    /// snapshots wrote (retention keeps them while referenced), and files
+    /// outside the archive lose long-distance matching against each other.
+    pub incremental_min_bytes: u64,
 }
 
 impl BackupConfig {
@@ -221,6 +293,110 @@ pub async fn compaction_permit() -> tokio::sync::RwLockReadGuard<'static, ()> {
     compaction_gate().read().await
 }
 
+/// Keeps a log barrier and the deletion it announces on one side of the
+/// point a snapshot's copy begins.
+///
+/// A point-in-time restore empties a restored file at its barrier only when
+/// the barrier committed after that point (see
+/// [`crate::core::wal::Wal::recover_restoring`]): the copy then may hold the
+/// deleted file. That is right only if the deletion is on the same side as
+/// the barrier. A barrier just before the point with its file deleted after
+/// the copy read it left the deleted file's bytes in a copy the restore took
+/// for the next file's.
+///
+/// Its own gate, not the compaction gate. A snapshot holds that one for its
+/// whole upload, minutes over a slow link, and every `DROP`, rename, move
+/// and `ALTER` rewrite waited that long, process-wide. A barrier and its
+/// deletion both after the point are emptied correctly however long the
+/// copy runs, so the snapshot holds this gate only while it cuts the logs
+/// and reads where its copy begins.
+static DELETION_GATE: OnceLock<RwLock<()>> = OnceLock::new();
+
+fn deletion_gate() -> &'static RwLock<()> {
+    DELETION_GATE.get_or_init(|| RwLock::new(()))
+}
+
+/// Held shared from a log barrier through the deletion of the files it
+/// voided; see [`DELETION_GATE`].
+pub async fn deletion_permit() -> tokio::sync::RwLockReadGuard<'static, ()> {
+    deletion_gate().read().await
+}
+
+/// Keeps a rename and a move from running while a snapshot copies files.
+///
+/// Both copy a table's files to new ones with no log record behind the
+/// copy, then delete the old ones. During a snapshot's upload the old files
+/// are ones it listed, and the new ones are not in it: the copy failed on
+/// the first missing file, and could not leave it out, because nothing but
+/// that file holds its bytes, not the log a restore replays, so the table
+/// would be missing from the snapshot and every point-in-time restore after
+/// it. A `DROP` is different and does not wait (see [`DELETION_GATE`]).
+///
+/// A snapshot takes it exclusively first, before the compaction gate, and
+/// holds it until it has listed its files again after the copy; a rename or
+/// a move holds it shared from start to finish, and takes the deletion gate
+/// inside it, so the order is the same on both sides.
+static RELOCATION_GATE: OnceLock<RwLock<()>> = OnceLock::new();
+
+fn relocation_gate() -> &'static RwLock<()> {
+    RELOCATION_GATE.get_or_init(|| RwLock::new(()))
+}
+
+/// Held shared by a rename or a move for its whole run; see
+/// [`RELOCATION_GATE`].
+pub async fn relocation_permit() -> tokio::sync::RwLockReadGuard<'static, ()> {
+    relocation_gate().read().await
+}
+
+/// The three gates as a snapshot's copy holds them, for any other copy of a
+/// live database's files (`CREATE BRANCH`). Taken in the snapshot's order —
+/// relocation, compaction, deletion — so the two can never deadlock.
+///
+/// The deletion gate is held only until the copy's starting point is fixed
+/// ([`CopyGates::release_deletion`]), for the reason [`DELETION_GATE`] gives;
+/// the other two for the whole copy.
+pub(crate) struct CopyGates {
+    _relocation: tokio::sync::RwLockWriteGuard<'static, ()>,
+    _compaction: tokio::sync::RwLockWriteGuard<'static, ()>,
+    deletion: Option<tokio::sync::RwLockWriteGuard<'static, ()>>,
+}
+
+impl CopyGates {
+    pub(crate) async fn hold() -> CopyGates {
+        let relocation = relocation_gate().write().await;
+        let compaction = compaction_gate().write().await;
+        let deletion = deletion_gate().write().await;
+        CopyGates {
+            _relocation: relocation,
+            _compaction: compaction,
+            deletion: Some(deletion),
+        }
+    }
+
+    pub(crate) fn release_deletion(&mut self) {
+        self.deletion = None;
+    }
+}
+
+/// Whether a file is left out of a copy of a database's files: everything a
+/// snapshot leaves out, and the staged log segments.
+pub(crate) fn excluded_from_copy(name: &str) -> bool {
+    excluded_file(name) || name.ends_with(crate::core::wal::SEGMENT_SUFFIX)
+}
+
+/// The deletion gate as a snapshot holds it while it fixes where its copy
+/// begins, for tests.
+#[cfg(test)]
+pub(crate) async fn hold_snapshot_gate() -> tokio::sync::RwLockWriteGuard<'static, ()> {
+    deletion_gate().write().await
+}
+
+/// The compaction gate as a snapshot's copy holds it, for tests.
+#[cfg(test)]
+pub(crate) async fn hold_compaction_gate() -> tokio::sync::RwLockWriteGuard<'static, ()> {
+    compaction_gate().write().await
+}
+
 static SERVICE: OnceLock<Arc<BackupService>> = OnceLock::new();
 
 /// The configured backup service, if one was installed at start-up.
@@ -239,6 +415,10 @@ pub struct SnapshotReport {
     pub start_lsn: u64,
     pub end_lsn: u64,
     pub elapsed: Duration,
+    /// Tables on a key/value store this snapshot copied.
+    pub cold_tables: usize,
+    /// Tables it does not contain; see [`manifest::SnapshotEntry::uncovered`].
+    pub uncovered: Vec<String>,
 }
 
 impl SnapshotReport {
@@ -260,6 +440,50 @@ pub struct ArchiveReport {
     pub first_lsn: u64,
     pub last_lsn: u64,
 }
+
+/// Whether the service has read its catalogue from the bucket.
+///
+/// A server started with `--s3-start-offline` while the bucket did not answer
+/// runs on a placeholder until it does. Until then every S3 write is refused:
+/// the first publish would replace the real catalogue — every snapshot and
+/// bundle it lists — with the empty placeholder. Checkpoints still stage the
+/// log, under the staging ceiling, so nothing written meanwhile is lost to
+/// the archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogueState {
+    Loaded,
+    /// Not reached yet; retried in the background.
+    Unreachable {
+        since: u64,
+        attempts: u32,
+        last_error: String,
+    },
+    /// The bucket answered with a catalogue this server must not write over
+    /// (another instance's, or one it cannot read). Not retried: it takes an
+    /// operator, as it would have refused the start.
+    Refused { at: u64, reason: String },
+}
+
+/// Why the catalogue could not be read.
+enum CatalogueError {
+    /// The bucket did not answer, or answered with an error: worth retrying.
+    Unreachable(io::Error),
+    /// It answered with something this server must not write over.
+    Refused(io::Error),
+}
+
+/// First wait before retrying a catalogue the start could not reach, and the
+/// slowest it backs off to.
+const CATALOGUE_RETRY_START: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(10)
+};
+const CATALOGUE_RETRY_CEILING: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(300)
+};
 
 pub struct BackupService {
     config: BackupConfig,
@@ -284,7 +508,44 @@ pub struct BackupService {
     /// Set when the staging directory hit its ceiling and checkpoints were told
     /// to stop handing over segments. Cleared once it drains.
     archiving_suspended: CacheGuard<AtomicBool>,
+    /// Every log this service pointed at its staging directory. Suspension
+    /// detaches these as well as the logs it can name now: a location whose
+    /// pool file stopped parsing cannot be named, and its log kept staging
+    /// past the ceiling that exists to protect the disk.
+    attached: std::sync::Mutex<Vec<std::sync::Weak<crate::core::wal::Wal>>>,
+    /// The last attempt of each operation and the next scheduled one, for
+    /// `SHOW BACKUP STATUS`; see [`activity`].
+    activity: activity::ActivityLog,
+    /// See [`CatalogueState`].
+    catalogue: std::sync::Mutex<CatalogueState>,
 }
+
+/// How long `BACKUP WAL` waits for a declining checkpoint to cut its log: a
+/// checkpoint already running ends in well under this, and a transaction
+/// still holding in-place writes past it fails the barrier rather than
+/// leaving its own commits' records out of it unsaid.
+const BARRIER_PATIENCE: Duration = Duration::from_secs(30);
+
+/// Checkpoints `wal` until a checkpoint cuts it (see [`Wal::checkpoint`]'s
+/// declines), for up to `patience`. Blocking: run on a blocking thread.
+fn cut_until_done(wal: &crate::core::wal::Wal, patience: Duration) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + patience;
+    loop {
+        if wal.checkpoint()? {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "its checkpoint kept declining for {} s (another checkpoint running, a hold on \
+                 the log, or a transaction with in-place writes still open), so the commits \
+                 before this point were not cut and are not in the archive",
+                patience.as_secs()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 
 impl BackupService {
     /// Builds the service, reads or creates the catalogue, and points the log's
@@ -293,6 +554,22 @@ impl BackupService {
     /// Returns an error rather than degrading: an operator who asked for
     /// backups and silently got none is worse off than one who fails to start.
     pub async fn connect(config: BackupConfig, location: &str) -> io::Result<Arc<Self>> {
+        Self::open(config, location, false).await
+    }
+
+    /// [`Self::connect`], except that a bucket which does not answer does not
+    /// stop the start (`--s3-start-offline`). The service then stages the log
+    /// locally, refuses every S3 write, and reads the catalogue in the
+    /// background ([`Self::spawn_background`]) until the bucket answers.
+    ///
+    /// A bucket that answers with another instance's catalogue, or one this
+    /// build cannot read, still fails: that is a misconfiguration, not an
+    /// outage, and waiting would not end it.
+    pub async fn connect_waiting(config: BackupConfig, location: &str) -> io::Result<Arc<Self>> {
+        Self::open(config, location, true).await
+    }
+
+    async fn open(config: BackupConfig, location: &str, wait_for_bucket: bool) -> io::Result<Arc<Self>> {
         if location.is_empty() {
             return Err(io::Error::other(
                 "backup needs a file-backed database; an in-memory one has nothing to snapshot",
@@ -313,35 +590,31 @@ impl BackupService {
         // One GET tells us whether this prefix is already in use and, if so, by
         // whom. Two servers sharing a prefix would overwrite each other's
         // catalogue and leave both unrestorable.
-        let manifest_key = config.key(manifest::MANIFEST_KEY);
-        let manifest = match client.get_object(&manifest_key).await {
-            Ok(bytes) => {
-                let existing = Manifest::decode(&bytes)?;
-                if existing.instance_id != instance_id {
-                    return Err(io::Error::other(format!(
-                        "s3://{}/{} already holds backups for instance {}, but this database is {}. \
-                         Point --s3-prefix somewhere else, or restore from that prefix instead.",
-                        config.bucket, manifest_key, existing.instance_id, instance_id
-                    )));
-                }
-                info!(
-                    "Backup catalogue found at s3://{}/{}: {} snapshots, {} segment bundles",
+        let (manifest, state) = match read_catalogue(&client, &config, &instance_id).await {
+            Ok(manifest) => (manifest, CatalogueState::Loaded),
+            Err(CatalogueError::Unreachable(e)) if wait_for_bucket => {
+                // `error!`: the server's default level, and backups not
+                // running is what an operator has to see at it.
+                error!(
+                    "The backup catalogue at s3://{}/{} could not be read ({e}). Starting anyway \
+                     (--s3-start-offline): the log is held in {} and nothing is uploaded until \
+                     the bucket answers; retrying in the background.",
                     config.bucket,
-                    manifest_key,
-                    existing.snapshots.len(),
-                    existing.segments.len()
+                    config.key(manifest::MANIFEST_KEY),
+                    Path::new(location).join(STAGING_DIR).display()
                 );
-                existing
+                (
+                    Manifest::new(instance_id.clone()),
+                    CatalogueState::Unreachable {
+                        since: timeutil::now_unix(),
+                        attempts: 1,
+                        last_error: e.to_string(),
+                    },
+                )
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                info!(
-                    "No backup catalogue at s3://{}/{}; starting a new one for instance {}",
-                    config.bucket, manifest_key, instance_id
-                );
-                Manifest::new(instance_id.clone())
-            }
-            Err(e) => return Err(e),
+            Err(CatalogueError::Unreachable(e) | CatalogueError::Refused(e)) => return Err(e),
         };
+        let loaded = state == CatalogueState::Loaded;
 
         let service = Arc::new(Self {
             config,
@@ -353,7 +626,16 @@ impl BackupService {
             archive_lock: tokio::sync::Mutex::new(()),
             shutting_down: AtomicBool::new(false).into(),
             archiving_suspended: AtomicBool::new(false).into(),
+            attached: std::sync::Mutex::new(Vec::new()),
+            activity: Default::default(),
+            catalogue: std::sync::Mutex::new(state.clone()),
         });
+        if let CatalogueState::Unreachable { last_error, .. } = &state {
+            service
+                .activity
+                .begin(activity::Operation::Catalogue)
+                .finish(&Err::<(), _>(io::Error::other(last_error.clone())), |_| String::new());
+        }
 
         // Sweep first, then hook, and the order is load-bearing rather than
         // stylistic. `DatabaseCatalog::open` installs the log of every existing
@@ -374,8 +656,148 @@ impl BackupService {
                 service.attach_new_log(dir, wal);
             }
         });
-        service.abandon_orphaned_uploads().await;
+        if loaded {
+            service.abandon_orphaned_uploads().await;
+        }
         Ok(service)
+    }
+
+    /// Where the catalogue stands; see [`CatalogueState`].
+    pub fn catalogue_state(&self) -> CatalogueState {
+        self.catalogue.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// `Ok` once the catalogue is loaded; otherwise why nothing may be written
+    /// to the bucket yet.
+    fn require_catalogue(&self) -> io::Result<()> {
+        match self.catalogue_state() {
+            CatalogueState::Loaded => Ok(()),
+            CatalogueState::Unreachable {
+                since,
+                attempts,
+                last_error,
+            } => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!(
+                    "the backup catalogue at s3://{}/{} has not been read since this server started \
+                     at {} ({} attempt(s); last: {}). The log is held in {} and uploads start once \
+                     the bucket answers.",
+                    self.config.bucket,
+                    self.config.key(manifest::MANIFEST_KEY),
+                    timeutil::format_rfc3339(since),
+                    attempts,
+                    last_error,
+                    self.staging_dir().display()
+                ),
+            )),
+            CatalogueState::Refused { reason, .. } => Err(io::Error::other(format!(
+                "backups are stopped: {reason}"
+            ))),
+        }
+    }
+
+    /// One attempt at reading the catalogue the start could not reach.
+    /// `true` when there is nothing left to retry: loaded, or refused for good.
+    async fn retry_catalogue(self: &Arc<Self>) -> bool {
+        let attempt = self.activity.begin(activity::Operation::Catalogue);
+        let outcome = read_catalogue(&self.client, &self.config, &self.instance_id).await;
+        let mut state = self.catalogue.lock().unwrap_or_else(|e| e.into_inner());
+        match outcome {
+            Ok(manifest) => {
+                // Nothing wrote to the placeholder: every path that records a
+                // snapshot or a bundle is behind `require_catalogue`.
+                let (snapshots, segments) = (manifest.snapshots.len(), manifest.segments.len());
+                // `try_lock`: nothing else takes it while the catalogue is
+                // unloaded, and a std lock is held here.
+                match self.manifest.try_lock() {
+                    Ok(mut current) => *current = manifest,
+                    Err(_) => {
+                        drop(state);
+                        attempt.finish(
+                            &Err::<(), _>(io::Error::other("the catalogue was busy; retrying")),
+                            |_| String::new(),
+                        );
+                        return false;
+                    }
+                }
+                *state = CatalogueState::Loaded;
+                drop(state);
+                info!(
+                    "Backup catalogue read at s3://{}/{} ({snapshots} snapshots, {segments} bundles); \
+                     uploads start now",
+                    self.config.bucket,
+                    self.config.key(manifest::MANIFEST_KEY)
+                );
+                attempt.finish(&Ok::<(), io::Error>(()), |_| {
+                    format!("{snapshots} snapshot(s), {segments} bundle(s)")
+                });
+                true
+            }
+            Err(CatalogueError::Unreachable(e)) => {
+                if let CatalogueState::Unreachable {
+                    attempts,
+                    last_error,
+                    ..
+                } = &mut *state
+                {
+                    *attempts += 1;
+                    *last_error = e.to_string();
+                }
+                drop(state);
+                debug!("The backup catalogue is still unreachable: {e}");
+                attempt.finish(&Err::<(), _>(e), |_| String::new());
+                false
+            }
+            Err(CatalogueError::Refused(e)) => {
+                *state = CatalogueState::Refused {
+                    at: timeutil::now_unix(),
+                    reason: e.to_string(),
+                };
+                drop(state);
+                error!(
+                    "The bucket answered, and backups are STOPPED: {e}. The log stays in staging \
+                     until the ceiling suspends archiving. Fix the prefix and restart."
+                );
+                attempt.finish(&Err::<(), _>(e), |_| String::new());
+                true
+            }
+        }
+    }
+
+    /// Reads the catalogue until it loads, watching the staging ceiling
+    /// meanwhile, then starts the schedules.
+    fn spawn_catalogue_retry(self: &Arc<Self>) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut wait = CATALOGUE_RETRY_START;
+            loop {
+                service.activity.schedule(activity::Operation::Catalogue, next_after(wait));
+                // In short steps, so the ceiling is checked while waiting:
+                // checkpoints stage the log the whole time.
+                let until = std::time::Instant::now() + wait;
+                loop {
+                    let left = until.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    tokio::time::sleep(left.min(Duration::from_secs(10))).await;
+                    if service.shutting_down.load(Ordering::Acquire) {
+                        return;
+                    }
+                    service.enforce_staging_ceiling();
+                }
+                service.activity.schedule(activity::Operation::Catalogue, activity::Next::Now);
+                if service.retry_catalogue().await {
+                    service.activity.schedule(activity::Operation::Catalogue, activity::Next::NotScheduled);
+                    if service.catalogue_state() == CatalogueState::Loaded {
+                        service.abandon_orphaned_uploads().await;
+                        service.spawn_schedules();
+                    }
+                    return;
+                }
+                wait = (wait * 2).min(CATALOGUE_RETRY_CEILING);
+            }
+        });
     }
 
     /// Aborts multipart uploads left behind by a previous run.
@@ -416,17 +838,159 @@ impl BackupService {
     /// *table name*: two databases each holding `users` name it identically,
     /// and a merged replay would write one's records into the other's file.
     ///
-    /// Logs registered for storage locations *outside* this directory are not
-    /// streams: their files are on another disk and no snapshot copies them, so
-    /// archiving their records would produce a log with nothing to replay into.
+    /// A storage location *outside* this directory that holds tables is a
+    /// stream too, keyed by [`location_key`]: the snapshot copies its files, so
+    /// its records have somewhere to replay into. Any other log outside it —
+    /// another installation's, a backup location's — is not.
     fn log_streams(&self) -> Vec<(String, Arc<crate::core::wal::Wal>)> {
+        let (streams, problems) = self.log_streams_checked();
+        for problem in &problems {
+            error!("Backup of {}: {problem}", self.location);
+        }
+        streams
+    }
+
+    /// [`Self::log_streams`], with what kept a log from being named.
+    ///
+    /// Degrades per database: a pool file that cannot be parsed costs that
+    /// database's locations, never the root's log or anyone else's. Failing
+    /// the whole list stopped every cut, every suspension at the staging
+    /// ceiling and every resume, for every database, over one file. A snapshot
+    /// is still refused while any problem stands — it would leave out tables.
+    fn log_streams_checked(&self) -> (Vec<(String, Arc<crate::core::wal::Wal>)>, Vec<String>) {
         let root = crate::core::wal::dir_key(&self.location);
+        let (locations, mut problems) = self.pool_locations();
         let mut streams: Vec<(String, Arc<crate::core::wal::Wal>)> = crate::core::wal::registered()
             .into_iter()
-            .filter_map(|(dir, wal)| stream_key(&root, &dir).map(|key| (key, wal)))
+            .filter_map(|(dir, wal)| {
+                stream_key(&root, &dir)
+                    .or_else(|| {
+                        locations
+                            .iter()
+                            .find(|(_, path)| crate::core::wal::dir_key(path) == dir)
+                            .map(|(key, _)| key.clone())
+                    })
+                    .map(|key| (key, wal))
+            })
             .collect();
         streams.sort_by(|a, b| a.0.cmp(&b.0));
-        streams
+        // Two logs under one key would share a staging directory and a bundle
+        // stream, and a restore would replay one's records into the other's
+        // files. Neither is archived.
+        let mut clashing: Vec<String> = streams
+            .windows(2)
+            .filter(|pair| pair[0].0 == pair[1].0)
+            .map(|pair| pair[0].0.clone())
+            .collect();
+        clashing.dedup();
+        for key in &clashing {
+            problems.push(format!(
+                "two write-ahead logs map to the backup stream {key:?}; neither is archived"
+            ));
+        }
+        streams.retain(|(key, _)| !clashing.contains(key));
+        (streams, problems)
+    }
+
+    /// The storage locations outside this directory that hold tables, as
+    /// `(stream key, path)` sorted by key, and what could not be read.
+    ///
+    /// Read from the pool file of every database here — the one at the
+    /// location itself and each created with `CREATE DATABASE`, which has its
+    /// own. Snapshots walked only this directory and these locations were left
+    /// out of every one of them, silently; a restore came back without the
+    /// tables on them. A location inside this directory is not listed: the
+    /// walk already copies it and its log is already a stream.
+    ///
+    /// A location two databases share is listed once. Its whole directory is
+    /// copied, flat, so whatever else is kept there comes along: files cannot
+    /// be told apart by table without a list of suffixes, and a list is how
+    /// sidecars get missed (`RENAMED_SUFFIXES` has been short twice).
+    ///
+    /// A pool file that cannot be read skips that database's locations only.
+    fn pool_locations(&self) -> (Vec<(String, String)>, Vec<String>) {
+        let root = Path::new(&self.location);
+        let root_key = crate::core::wal::dir_key(&self.location);
+        let mut problems: Vec<String> = Vec::new();
+        let mut databases = vec![root.to_path_buf()];
+        match std::fs::read_dir(root) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                        continue;
+                    };
+                    if EXCLUDED.contains(&name.as_str())
+                        || !entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    if entry.path().join(crate::core::storage::POOL_FILE).is_file() {
+                        databases.push(entry.path());
+                    }
+                }
+            }
+            Err(e) => problems.push(format!(
+                "{} cannot be listed ({e}), so its created databases' storage locations are unknown",
+                self.location
+            )),
+        }
+
+        let mut out: Vec<(String, String)> = Vec::new();
+        for database in databases {
+            let paths = match crate::core::storage::data_locations(&database) {
+                Ok(paths) => paths,
+                Err(e) => {
+                    problems.push(e.to_string());
+                    continue;
+                }
+            };
+            for path in paths {
+                if stream_key(&root_key, &path).is_some() {
+                    continue;
+                }
+                let key = location_key(&path);
+                match out.iter().find(|(k, _)| *k == key) {
+                    Some((_, seen))
+                        if crate::core::wal::dir_key(seen) == crate::core::wal::dir_key(&path) => {}
+                    Some((_, seen)) => problems.push(format!(
+                        "storage locations {seen} and {path} hash to the same backup key {key}; \
+                         this backup cannot tell their files apart"
+                    )),
+                    None => out.push((key, path)),
+                }
+            }
+        }
+        out.sort();
+        (out, problems)
+    }
+
+    /// [`Self::pool_locations`] for a snapshot, which must not leave any out.
+    fn pool_locations_for_snapshot(&self) -> io::Result<Vec<(String, String)>> {
+        let (locations, problems) = self.pool_locations();
+        if problems.is_empty() {
+            Ok(locations)
+        } else {
+            Err(io::Error::other(format!(
+                "a snapshot of {} would leave out tables kept on other disks: {}",
+                self.location,
+                problems.join("; ")
+            )))
+        }
+    }
+
+    /// Points `wal`'s checkpoints at `key`'s staging directory, and remembers
+    /// it for suspension.
+    fn archive_log(&self, key: &str, wal: &Arc<crate::core::wal::Wal>) -> io::Result<()> {
+        wal.set_archive_dir(Some(self.staging_dir_for(key)))?;
+        let mut attached = self.attached.lock().unwrap_or_else(|e| e.into_inner());
+        attached.retain(|w| w.strong_count() > 0);
+        if !attached
+            .iter()
+            .any(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(wal)))
+        {
+            attached.push(Arc::downgrade(wal));
+        }
+        Ok(())
     }
 
     /// Points every log's checkpoints at its staging directory, so the records
@@ -447,9 +1011,12 @@ impl BackupService {
             );
         }
         for (key, wal) in streams {
-            wal.set_archive_dir(Some(self.staging_dir_for(&key)))?;
+            self.archive_log(&key, &wal)?;
             if !key.is_empty() {
-                debug!("Archiving the log of database {} under {}", key, self.location);
+                debug!(
+                    "Archiving the log of database {} under {}",
+                    key, self.location
+                );
             }
         }
         Ok(())
@@ -464,23 +1031,81 @@ impl BackupService {
     /// backup reports success over what is left.
     fn attach_new_log(&self, dir: &str, wal: &Arc<crate::core::wal::Wal>) {
         let root = crate::core::wal::dir_key(&self.location);
-        let Some(key) = stream_key(&root, dir) else {
-            // A log outside this location: another installation's, or a
-            // storage location on a disk no snapshot copies.
-            return;
+        let key = match stream_key(&root, dir) {
+            Some(key) => key,
+            // `STORAGE ADD LOCATION` records the location before it opens the
+            // log, so the pool files already name it by the time this runs.
+            None => {
+                let (locations, problems) = self.pool_locations();
+                match locations
+                    .into_iter()
+                    .find(|(_, path)| crate::core::wal::dir_key(path) == dir)
+                {
+                    Some((key, _)) => key,
+                    // Another installation's log, or a backup location's.
+                    None if problems.is_empty() => return,
+                    None => {
+                        error!(
+                            "Could not tell whether the log in {dir} belongs to a storage \
+                             location of {}: {}. Snapshots will refuse to run until the pool \
+                             file can be read.",
+                            self.location,
+                            problems.join("; ")
+                        );
+                        return;
+                    }
+                }
+            }
         };
         if self.archiving_suspended.load(Ordering::Acquire) {
             // Staging is over its ceiling and nothing is being staged; the
             // resume path attaches every stream, this one included.
             return;
         }
-        match wal.set_archive_dir(Some(self.staging_dir_for(&key))) {
+        match self.archive_log(&key, wal) {
             Ok(()) => info!(
                 "Archiving the log of {} under {}",
-                if key.is_empty() { "the default database" } else { key.as_str() },
+                if key.is_empty() {
+                    "the default database"
+                } else {
+                    key.as_str()
+                },
                 self.location
             ),
             Err(e) => error!("Could not archive the log of database {}: {}", key, e),
+        }
+    }
+
+    /// Starts archiving any storage location's log nothing attached yet, ahead
+    /// of its cut.
+    ///
+    /// The install hook only sees a log the moment it is installed. Whether a
+    /// location is a stream can change after that — a backup location turned
+    /// primary — and without this its checkpoints would keep discarding records
+    /// the archive needs. Attached before the cut, so the window opens on an
+    /// archived log.
+    ///
+    /// Locations only. A log under this directory is a stream from the moment
+    /// it exists, so the sweep and the hook already cover it, and one found
+    /// detached was detached on purpose: re-attaching it here would hide that
+    /// from `verify_log_is_archived`, which is what must notice.
+    fn attach_unattached(&self, streams: &[(String, Arc<crate::core::wal::Wal>)]) {
+        for (key, wal) in streams {
+            if !key.starts_with(LOCATION_KEY_PREFIX)
+                || wal.is_archiving()
+                || self.archiving_suspended.load(Ordering::Acquire)
+            {
+                continue;
+            }
+            if let Err(e) = self.archive_log(key, wal) {
+                error!("Could not archive the log of {key}: {e}");
+                continue;
+            }
+            // Suspension may have landed in between; it detaches every
+            // stream, and this one must not be the exception.
+            if self.archiving_suspended.load(Ordering::Acquire) {
+                let _ = wal.set_archive_dir(None);
+            }
         }
     }
 
@@ -521,16 +1146,51 @@ impl BackupService {
 
     // ---- snapshot ----------------------------------------------------------
 
-    /// Takes a full snapshot and makes it restorable.
+    /// Takes a snapshot and makes it restorable.
+    ///
+    /// Incremental when `incremental_min_bytes` is set: see
+    /// [`BackupConfig::incremental_min_bytes`].
     pub async fn snapshot_now(self: &Arc<Self>) -> io::Result<SnapshotReport> {
+        self.take_snapshot(false).await
+    }
+
+    /// `full` refuses to reuse anything an earlier snapshot stored, so the
+    /// result depends on no older object — what a rollover needs before it
+    /// deletes every older generation.
+    async fn take_snapshot(self: &Arc<Self>, full: bool) -> io::Result<SnapshotReport> {
+        self.require_catalogue()?;
         let _one_at_a_time = self.snapshot_lock.lock().await;
+        let attempt = self.activity.begin(activity::Operation::Snapshot);
+        let result = self.take_snapshot_locked(full).await;
+        attempt.finish(&result, |report| {
+            format!(
+                "{}: {} files, {} bytes compressed, in {:.1}s",
+                report.id,
+                report.file_count,
+                report.compressed_bytes,
+                report.elapsed.as_secs_f64()
+            )
+        });
+        result
+    }
+
+    /// [`Self::take_snapshot`] once it holds `snapshot_lock`.
+    async fn take_snapshot_locked(self: &Arc<Self>, full: bool) -> io::Result<SnapshotReport> {
         let started = std::time::Instant::now();
         let started_at = timeutil::now_unix();
 
+        // Exclusive for the whole copy, and first: see `RELOCATION_GATE`.
+        let no_relocation = relocation_gate().write().await;
         // Exclusive for the whole copy: compaction is the one writer whose
         // effects replay cannot reconstruct.
         let _no_compaction = compaction_gate().write().await;
+        // Exclusive only until the copy's start is fixed below: see
+        // `DELETION_GATE`.
+        let no_deletion = deletion_gate().write().await;
 
+        // Before the first cut, so each location's log is a stream of this
+        // snapshot and its window opens with the copy's.
+        let locations = self.pool_locations_for_snapshot()?;
         let streams = self.log_streams();
 
         // Read before the log is cut, so every bundle this snapshot's window
@@ -550,22 +1210,63 @@ impl BackupService {
         // DATABASE` has one of its own and the copy below excludes live logs at
         // any depth — records left in one would be in neither the copy nor the
         // archive.
+        //
+        // A failure here fails the snapshot, though every healthy log has been
+        // cut by then. A snapshot is one restore point for the whole location,
+        // and a database whose log cannot be cut is one whose data files may
+        // not hold what its log says was committed: published, the snapshot
+        // would restore that database wrong and report nothing amiss. The
+        // error names the database, so the others are not left guessing.
         self.checkpoint_all_logs().await?;
         let opened_at: HashMap<String, u64> = streams
             .iter()
             .map(|(key, wal)| (key.clone(), wal.commit_lsn()))
             .collect();
         let start_lsn = opened_at.get("").copied().unwrap_or(0);
+        // No snapshot from here on asks about a drop at or before its window.
+        for (key, wal) in &streams {
+            wal.forget_drops_through(opened_at.get(key).copied().unwrap_or(0));
+        }
+        let dropped = DroppedDuringCopy::new(&streams, &opened_at);
+        // Each window's start is fixed: a barrier from here commits past it,
+        // and its deletion follows it.
+        drop(no_deletion);
 
-        let files = self.snapshot_file_list()?;
+        let mut files = self.snapshot_file_list(&locations)?;
         if files.is_empty() {
             return Err(io::Error::other(format!(
                 "{} holds no database files to snapshot",
                 self.location
             )));
         }
+        // Tables on a key/value store, copied out as one cut while the copy
+        // runs: inside the window, so every transaction the cut holds is
+        // committed in the log a restore replays. Their names may match files
+        // the walk found — what a move to the store left behind — and the copy
+        // is the table.
+        let cold = cold::copy_cold_tables(Path::new(&self.location), timeutil::now_unix).await;
+        files.retain(|(name, _)| !cold.files.iter().any(|(copied, _)| copied == name));
+        files.extend(cold.files.iter().cloned());
+        if !cold.uncovered.is_empty() {
+            warn!(
+                "snapshot of {} does not contain {} table(s), which a restore will not bring back: {}",
+                self.location,
+                cold.uncovered.len(),
+                cold.uncovered
+                    .iter()
+                    .map(|u| format!("{} ({})", u.qualified(), u.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
+        #[cfg(test)]
+        upload_hooks::parked_here(&self.location).await;
 
-        let id = format!("snap-{}-{:08x}", timeutil::format_basic(started_at), fastrand::u32(..));
+        let id = format!(
+            "snap-{}-{:08x}",
+            timeutil::format_basic(started_at),
+            fastrand::u32(..)
+        );
         let key = self.config.key(&format!("snapshots/{id}.rdba.zst"));
 
         info!(
@@ -576,9 +1277,47 @@ impl BackupService {
             start_lsn
         );
 
-        let staged_before = self.staged_lengths()?;
-        let (uncompressed, compressed) = self.upload_snapshot(&key, &files).await?;
-        self.check_staged_appends(&staged_before)?;
+        let staged_before = self.staged_lengths(&locations)?;
+        // Large files first, as objects of their own (or references to ones an
+        // earlier snapshot stored); the rest into this snapshot's archive.
+        let (archived, objects, objects_uncompressed, objects_compressed) =
+            if !full && self.config.incremental_min_bytes > 0 {
+                self.store_large_files(&id, &files, &dropped).await?
+            } else {
+                (files.clone(), Vec::new(), 0, 0)
+            };
+        let (uncompressed, compressed) = self.upload_snapshot(&key, &archived, &dropped).await?;
+        let (uncompressed, compressed) =
+            (uncompressed + objects_uncompressed, compressed + objects_compressed);
+        // A dropped table's sidecar is gone, not folded: whatever it staged
+        // went with the table (see `DroppedDuringCopy`).
+        let staged_before: HashMap<String, u64> = staged_before
+            .into_iter()
+            .filter(|(name, _)| {
+                !files
+                    .iter()
+                    .any(|(listed, path)| listed == name && !path.exists() && dropped.explains(path))
+            })
+            .collect();
+        self.check_staged_appends(&staged_before, &locations)?;
+
+        // A location that started holding tables while the copy ran is in
+        // neither the copy nor this snapshot's list, and a restore would read
+        // its tables as missing. Rare — it takes `STORAGE ADD LOCATION` or a
+        // placement mid-copy — and refused rather than recorded.
+        let appeared: Vec<String> = self
+            .pool_locations_for_snapshot()?
+            .into_iter()
+            .filter(|location| !locations.contains(location))
+            .map(|(_, path)| path)
+            .collect();
+        if !appeared.is_empty() {
+            return Err(io::Error::other(format!(
+                "storage location(s) {} started holding tables while snapshot {id} was being \
+                 copied, so their files are not in it. Discarding it; retry the backup.",
+                appeared.join(", ")
+            )));
+        }
 
         // Cut the logs again. Everything written while the copy ran is now in a
         // staged segment, and each window's `end_lsn` is the point a restore
@@ -588,13 +1327,20 @@ impl BackupService {
         // the copy ran has a log of its own that nothing has cut yet, and
         // leaving it would strand those records. Its window opens at 0, which
         // is the truth — every record it has ever written is in the archive.
+        //
+        // The ends are read before that cut, together (see `read_cut`): with a
+        // location, they are where a restore of this snapshot stops every log,
+        // and read one log at a time they could pair a database's outcome with
+        // a location log that does not yet hold its rows. The cut then stages
+        // everything through them.
+        let ending = self.log_streams();
+        let ends = read_cut(&ending)?;
         self.checkpoint_all_logs().await?;
-        let windows: Vec<manifest::LogWindow> = self
-            .log_streams()
+        let windows: Vec<manifest::LogWindow> = ends
             .into_iter()
-            .map(|(key, wal)| manifest::LogWindow {
+            .map(|(key, end_lsn)| manifest::LogWindow {
                 start_lsn: opened_at.get(&key).copied().unwrap_or(0),
-                end_lsn: wal.commit_lsn(),
+                end_lsn,
                 database: key,
             })
             .collect();
@@ -608,9 +1354,12 @@ impl BackupService {
         // log records that filled it are. Naming it here lets a restore create
         // it empty so replay has somewhere to land.
         let mut names: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
-        for (name, _) in self.snapshot_file_list()? {
+        for (name, _) in self.snapshot_file_list(&locations)? {
             if !names.contains(&name) {
-                debug!("{} appeared during snapshot {}; it will be rebuilt from the log", name, id);
+                debug!(
+                    "{} appeared during snapshot {}; it will be rebuilt from the log",
+                    name, id
+                );
                 names.push(name);
             }
         }
@@ -630,22 +1379,58 @@ impl BackupService {
             file_count: names.len() as u32,
             compression_level: self.config.snapshot_level,
             files: names,
+            objects,
+            locations: locations
+                .iter()
+                .map(|(key, path)| manifest::PoolLocation {
+                    key: key.clone(),
+                    path: path.clone(),
+                })
+                .collect(),
+            cold_tables: cold.tables.clone(),
+            cold_copied_at: cold.copied_at,
+            uncovered: cold.uncovered.clone(),
         };
 
         // Released before the archive flush: that is network work and holding
-        // compaction off for it buys nothing.
+        // compaction off for it buys nothing. A rename or a move after this
+        // point is past the window's end and in no file this snapshot names.
         drop(_no_compaction);
+        drop(no_relocation);
 
         // Upload the window's log immediately. Until it is up there the
         // snapshot object exists but cannot be restored from.
         self.archive_wal_now().await?;
-        self.verify_log_is_archived(&id).await?;
+        self.verify_log_is_archived(&id, &entry.windows).await?;
 
         // Recorded only once the log behind it is known to be in S3, so a
         // catalogue entry always names a snapshot that can actually be
         // restored.
         {
             let mut manifest = self.manifest.lock().await;
+            // A reused object must still be referenced by a snapshot in the
+            // catalogue at the moment this one joins it. A prune running
+            // concurrently plans under this same lock: either it saw this
+            // entry and keeps the object, or it already dropped the last
+            // snapshot naming it and is deleting it — and then this snapshot
+            // would restore from an object that is gone. Refused, not
+            // repaired: the next snapshot simply uploads the file again.
+            let own_prefix = self.config.key(&format!("snapshots/{id}/"));
+            let live: std::collections::HashSet<&str> = manifest
+                .snapshots
+                .iter()
+                .flat_map(|s| s.objects.iter().map(|o| o.key.as_str()))
+                .collect();
+            if let Some(gone) = entry
+                .objects
+                .iter()
+                .find(|o| !o.key.starts_with(&own_prefix) && !live.contains(o.key.as_str()))
+            {
+                return Err(io::Error::other(format!(
+                    "snapshot {id} reused {} for {}, but retention removed it while the                      snapshot ran; the snapshot is abandoned and the next one will upload it",
+                    gone.key, gone.name
+                )));
+            }
             manifest.snapshots.push(entry.clone());
         }
 
@@ -661,6 +1446,8 @@ impl BackupService {
             start_lsn,
             end_lsn,
             elapsed: started.elapsed(),
+            cold_tables: entry.cold_tables.len(),
+            uncovered: entry.uncovered.iter().map(|u| u.qualified()).collect(),
         };
 
         info!(
@@ -686,6 +1473,12 @@ impl BackupService {
             .sum()
     }
 
+    /// The last attempt of each operation, the last error and the next
+    /// scheduled runs.
+    pub fn activity(&self) -> activity::Activity {
+        self.activity.snapshot()
+    }
+
     /// True while checkpoints have been told to stop staging.
     pub fn archiving_is_suspended(&self) -> bool {
         self.archiving_suspended.load(Ordering::Acquire)
@@ -705,12 +1498,20 @@ impl BackupService {
             return;
         };
 
+        let streams = self.log_streams();
         if suspend {
-            for (_, wal) in self.log_streams() {
-                if let Err(e) = wal.set_archive_dir(None) {
-                    error!("Could not suspend log archiving: {e}");
-                    return;
-                }
+            // Every log that can be named, and every one this service ever
+            // attached: one it can no longer name would otherwise go on
+            // filling the disk this exists to protect. Detaching cannot fail.
+            let attached: Vec<Arc<crate::core::wal::Wal>> = self
+                .attached
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .collect();
+            for wal in streams.iter().map(|(_, wal)| wal).chain(attached.iter()) {
+                let _ = wal.set_archive_dir(None);
             }
             self.archiving_suspended.store(true, Ordering::Release);
             error!(
@@ -724,8 +1525,8 @@ impl BackupService {
                 ceiling / 2
             );
         } else {
-            for (key, wal) in self.log_streams() {
-                if let Err(e) = wal.set_archive_dir(Some(self.staging_dir_for(&key))) {
+            for (key, wal) in &streams {
+                if let Err(e) = self.archive_log(key, wal) {
                     error!("Could not resume log archiving: {e}");
                     return;
                 }
@@ -739,37 +1540,10 @@ impl BackupService {
         }
     }
 
-    /// Length of every staged-append sidecar in the database directory.
-    fn staged_lengths(&self) -> io::Result<HashMap<String, u64>> {
-        fn walk(dir: &Path, prefix: &str, lengths: &mut HashMap<String, u64>) -> io::Result<()> {
-            for entry in std::fs::read_dir(dir)?.flatten() {
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else { continue };
-                let Ok(file_type) = entry.file_type() else { continue };
-
-                // Sub-databases have sidecars of their own, and a fold racing
-                // the copy is exactly as undetectable there as at the root.
-                if file_type.is_dir() {
-                    if EXCLUDED.contains(&name) {
-                        continue;
-                    }
-                    walk(&entry.path(), &format!("{prefix}{name}/"), lengths)?;
-                    continue;
-                }
-                if !name.ends_with(".tmp") {
-                    continue;
-                }
-                lengths.insert(
-                    format!("{prefix}{name}"),
-                    entry.metadata().map(|m| m.len()).unwrap_or(0),
-                );
-            }
-            Ok(())
-        }
-
-        let mut lengths = HashMap::new();
-        walk(Path::new(&self.location), "", &mut lengths)?;
-        Ok(lengths)
+    /// Length of every staged-append sidecar in the database directory and in
+    /// the storage locations a snapshot copies.
+    fn staged_lengths(&self, locations: &[(String, String)]) -> io::Result<HashMap<String, u64>> {
+        staged_lengths_in(Path::new(&self.location), locations)
     }
 
     /// Fails the snapshot if a staged-append fold landed while the copy ran.
@@ -783,21 +1557,9 @@ impl BackupService {
     fn check_staged_appends(
         &self,
         before: &std::collections::HashMap<String, u64>,
+        locations: &[(String, String)],
     ) -> io::Result<()> {
-        let after = self.staged_lengths()?;
-        for (name, was) in before {
-            if *was == 0 {
-                continue;
-            }
-            let now = after.get(name).copied().unwrap_or(0);
-            if now < *was {
-                return Err(io::Error::other(format!(
-                    "{name} was folded into its main file while the snapshot was being copied,                      so up to {} bytes are in neither the copy nor the log. Discarding this                      snapshot; retry it.",
-                    was - now
-                )));
-            }
-        }
-        Ok(())
+        folded_while_copying(before, &self.staged_lengths(locations)?)
     }
 
     /// Confirms the log covering a snapshot has actually reached S3.
@@ -814,53 +1576,76 @@ impl BackupService {
     /// So the condition is checked directly rather than inferred: the live log
     /// must be empty and the staging directory drained. A pending transaction
     /// is usually brief, so it is retried before giving up.
-    async fn verify_log_is_archived(self: &Arc<Self>, snapshot_id: &str) -> io::Result<()> {
+    async fn verify_log_is_archived(
+        self: &Arc<Self>,
+        snapshot_id: &str,
+        windows: &[manifest::LogWindow],
+    ) -> io::Result<()> {
         // Asked of every log under the location. A sub-database whose records
         // are still in its own live log leaves its files in the copy without
         // the log that reconciles them, which is the same failure as the root's
         // and just as silent.
-        let live_bytes = || -> u64 {
-            self.log_streams()
-                .iter()
-                .map(|(_, wal)| wal.bytes_since_checkpoint())
-                .sum()
-        };
-        if self.log_streams().is_empty() {
+        //
+        // The question is whether every record *inside each window* is in the
+        // archive — not whether the logs are empty. A checkpoint keeps what
+        // was logged during its own sync pass, so under write load a log is
+        // never empty, and requiring that discarded every snapshot and every
+        // rollover taken while the database was busy.
+        let streams = self.log_streams();
+        if streams.is_empty() {
             // No log at all: nothing to archive, and the caller has already
             // been warned that this database has no point-in-time recovery.
             return Ok(());
         }
+        let window_of = |key: &str| windows.iter().find(|w| w.database == key);
 
         const ATTEMPTS: u32 = 5;
+        let mut short: Vec<String> = Vec::new();
         for attempt in 1..=ATTEMPTS {
-            if live_bytes() == 0 && self.staged_bytes() == 0 {
+            // Read before the upload below lists what is staged: whatever a
+            // checkpoint had staged by now is in that listing.
+            short = streams
+                .iter()
+                .filter_map(|(key, wal)| {
+                    let w = window_of(key)?;
+                    (!wal.staged_covers(w.start_lsn, w.end_lsn)).then(|| {
+                        format!(
+                            "{} through LSN {}",
+                            if key.is_empty() { "<default>" } else { key.as_str() },
+                            w.end_lsn
+                        )
+                    })
+                })
+                .collect();
+            // Uploads everything staged so far; a failure here is the error.
+            self.flush_staged_segments().await?;
+            if short.is_empty() {
                 return Ok(());
             }
             if attempt == ATTEMPTS {
                 break;
             }
             debug!(
-                "Snapshot {}: the log is not fully archived yet ({} bytes live, {} staged); \
-                 retrying ({}/{})",
+                "Snapshot {}: not yet staged: {}; retrying ({}/{})",
                 snapshot_id,
-                live_bytes(),
-                self.staged_bytes(),
+                short.join(", "),
                 attempt,
                 ATTEMPTS
             );
             tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
-            self.archive_wal_now().await?;
+            // A checkpoint can decline (another running, an in-place write
+            // pending); cut again.
+            self.checkpoint_all_logs().await?;
         }
 
         // Failing loses a snapshot; publishing would lose the ability to
         // restore one, and only at the moment someone needed it.
         Err(io::Error::other(format!(
             "snapshot {snapshot_id} was copied, but the log covering it could not be archived \
-             ({} bytes still in the live log, {} bytes still staged){}. Discarding it rather \
-             than recording a snapshot that cannot be restored; retry the backup.",
-            live_bytes(),
-            self.staged_bytes(),
-            if self.log_streams().iter().any(|(_, wal)| wal.is_poisoned()) {
+             (not staged: {}){}. Discarding it rather than recording a snapshot that cannot \
+             be restored; retry the backup.",
+            short.join(", "),
+            if streams.iter().any(|(_, wal)| wal.is_poisoned()) {
                 " — the log is poisoned by an earlier flush failure, so durability cannot be \
                  promised until the database is restarted"
             } else {
@@ -878,18 +1663,20 @@ impl BackupService {
     /// database and nothing else, which is the worst way to discover it.
     ///
     /// Names are relative paths with `/` separators, so a restore rebuilds the
-    /// same shape.
-    fn snapshot_file_list(&self) -> io::Result<Vec<(String, PathBuf)>> {
-        fn walk(
-            dir: &Path,
-            prefix: &str,
-            files: &mut Vec<(String, PathBuf)>,
-        ) -> io::Result<()> {
+    /// same shape. A storage location's files are named under its stream key,
+    /// which a restore maps back to a directory (see [`restore`]).
+    fn snapshot_file_list(
+        &self,
+        locations: &[(String, String)],
+    ) -> io::Result<Vec<(String, PathBuf)>> {
+        fn walk(dir: &Path, prefix: &str, files: &mut Vec<(String, PathBuf)>) -> io::Result<()> {
             for entry in std::fs::read_dir(dir)?.flatten() {
                 let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                     continue;
                 };
-                let Ok(file_type) = entry.file_type() else { continue };
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
 
                 if file_type.is_dir() {
                     // The archive staging directory holds copies of what is
@@ -905,7 +1692,7 @@ impl BackupService {
                 if !file_type.is_file() {
                     continue;
                 }
-                if EXCLUDED.contains(&name.as_str())
+                if excluded_file(&name)
                     || name.ends_with(crate::core::wal::SEGMENT_SUFFIX)
                 {
                     continue;
@@ -917,6 +1704,29 @@ impl BackupService {
 
         let mut files = Vec::new();
         walk(Path::new(&self.location), "", &mut files)?;
+        // Flat: tables sit directly in a location, and a recursive walk would
+        // take in whatever else is kept beneath it — another database's
+        // location, say, which that database's own entry already covers.
+        for (key, path) in locations {
+            let entries = std::fs::read_dir(path).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("storage location {path} cannot be read for the snapshot: {e}"),
+                )
+            })?;
+            for entry in entries.flatten() {
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+                    || excluded_file(&name)
+                    || name.ends_with(crate::core::wal::SEGMENT_SUFFIX)
+                {
+                    continue;
+                }
+                files.push((format!("{key}/{name}"), entry.path()));
+            }
+        }
         // Deterministic order, so two snapshots of an unchanged database
         // produce byte-identical archives and are trivially comparable.
         files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -933,6 +1743,7 @@ impl BackupService {
         self: &Arc<Self>,
         key: &str,
         files: &[(String, PathBuf)],
+        dropped: &DroppedDuringCopy,
     ) -> io::Result<(u64, u64)> {
         let part_size = self.part_size_for(files);
         let (tx, rx) = kanal::bounded::<Vec<u8>>(2);
@@ -941,6 +1752,7 @@ impl BackupService {
         let threads = self.compression_threads();
         let long_range = self.config.long_range;
         let owned: Vec<(String, PathBuf)> = files.to_vec();
+        let dropped = dropped.clone();
 
         let producer = tokio::task::spawn_blocking(move || -> io::Result<u64> {
             let sink = PartSink::new(tx, part_size);
@@ -949,7 +1761,15 @@ impl BackupService {
             let mut writer = archive::ArchiveWriter::new(&mut encoder, owned.len() as u32)?;
             let mut total = 0u64;
             for (name, path) in &owned {
-                total += writer.add_file(name, path)?;
+                match std::fs::File::open(path) {
+                    Ok(file) => total += writer.add_open_file(name, file)?,
+                    Err(e) => {
+                        dropped.leave_out(path, e)?;
+                        // The header already counts it. Empty is what a
+                        // restore leaves of it at its barrier anyway.
+                        writer.add_reader(name, 0, &mut io::empty())?;
+                    }
+                }
             }
             writer.finish()?;
 
@@ -970,6 +1790,144 @@ impl BackupService {
         // round the compressor stops with the same channel error.
         let uncompressed = produced?;
         Ok((uncompressed, uploaded?))
+    }
+
+    /// Stores every file of at least `incremental_min_bytes` as an object of
+    /// its own, or references the object an earlier snapshot stored for the
+    /// same bytes. Returns the files left for the archive, the objects, and
+    /// the uncompressed and newly uploaded compressed byte counts.
+    ///
+    /// Two passes over a file that is not reused: one to hash it for the
+    /// lookup, one to compress and upload it, which hashes again. The second
+    /// hash is the one recorded, so the catalogue always describes exactly the
+    /// bytes in the object even if the file changed between passes. Either
+    /// copy is a valid fuzzy copy: both were read after the checkpoint that
+    /// opens this snapshot's replay window.
+    async fn store_large_files(
+        self: &Arc<Self>,
+        id: &str,
+        files: &[(String, PathBuf)],
+        dropped: &DroppedDuringCopy,
+    ) -> io::Result<(Vec<(String, PathBuf)>, Vec<manifest::FileObject>, u64, u64)> {
+        let reusable = self.manifest.lock().await.reusable_objects();
+        let mut archived = Vec::new();
+        let mut objects = Vec::new();
+        let (mut uncompressed, mut compressed) = (0u64, 0u64);
+
+        for (index, (name, path)) in files.iter().enumerate() {
+            // A file left out here is in neither the archive nor an object,
+            // so a restore creates it empty, as its barrier leaves it.
+            let len = match std::fs::metadata(path) {
+                Ok(meta) => meta.len(),
+                Err(e) => {
+                    dropped.leave_out(path, e)?;
+                    continue;
+                }
+            };
+            if len < self.config.incremental_min_bytes {
+                archived.push((name.clone(), path.clone()));
+                continue;
+            }
+            let hashed_path = path.clone();
+            let hashed = tokio::task::spawn_blocking(move || hash_prefix(&hashed_path, len))
+                .await
+                .map_err(|e| io::Error::other(format!("snapshot hasher panicked: {e}")))?;
+            let sha256 = match hashed {
+                Ok(sha256) => sha256,
+                Err(e) => {
+                    dropped.leave_out(path, e)?;
+                    continue;
+                }
+            };
+            uncompressed += len;
+
+            if let Some(key) = reusable.get(&(sha256.clone(), len)) {
+                objects.push(manifest::FileObject {
+                    name: name.clone(),
+                    len,
+                    sha256,
+                    key: key.clone(),
+                });
+                continue;
+            }
+
+            let key = self.config.key(&format!("snapshots/{id}/{index:06}.zst"));
+            let Some((sha256, stored)) = self.upload_file_object(&key, path, len, dropped).await?
+            else {
+                uncompressed -= len;
+                continue;
+            };
+            compressed += stored;
+            objects.push(manifest::FileObject {
+                name: name.clone(),
+                len,
+                sha256,
+                key,
+            });
+        }
+        Ok((archived, objects, uncompressed, compressed))
+    }
+
+    /// Compresses the first `len` bytes of `path` into `key`, hashing exactly
+    /// what it compresses. Returns the hash and the compressed size, or
+    /// `None`, with nothing uploaded, for a file a `DROP` took away first
+    /// (see [`DroppedDuringCopy`]).
+    async fn upload_file_object(
+        self: &Arc<Self>,
+        key: &str,
+        path: &Path,
+        len: u64,
+        dropped: &DroppedDuringCopy,
+    ) -> io::Result<Option<(String, u64)>> {
+        let part_size = self.config.part_size.max(5 * 1024 * 1024);
+        let (tx, rx) = kanal::bounded::<Vec<u8>>(2);
+        let level = self.config.snapshot_level;
+        let threads = self.compression_threads();
+        let long_range = self.config.long_range;
+        let path = path.to_path_buf();
+        let dropped = dropped.clone();
+
+        let producer = tokio::task::spawn_blocking(move || -> io::Result<Option<String>> {
+            use sha2::Digest;
+            // Opened before anything reaches the sink: a file left out sends
+            // no part, and the upload below then writes no object.
+            let file = match std::fs::File::open(&path) {
+                Ok(file) => file,
+                Err(e) => {
+                    dropped.leave_out(&path, e)?;
+                    return Ok(None);
+                }
+            };
+            let sink = PartSink::new(tx, part_size);
+            let mut encoder = new_encoder(sink, level, threads, long_range)?;
+            encoder.set_pledged_src_size(Some(len))?;
+            let mut file = std::io::BufReader::with_capacity(256 * 1024, file);
+            let mut digest = sha2::Sha256::new();
+            let mut chunk = vec![0u8; 1024 * 1024];
+            let mut remaining = len;
+            while remaining > 0 {
+                let want = chunk.len().min(remaining as usize);
+                // Exactly `len`, as the archive does: a file that grows during
+                // the copy is captured at the length it had, and the log
+                // replay supplies the rest.
+                file.read_exact(&mut chunk[..want])?;
+                digest.update(&chunk[..want]);
+                encoder.write_all(&chunk[..want])?;
+                remaining -= want as u64;
+            }
+            encoder.finish()?.finish()?;
+            Ok(Some(to_hex(&digest.finalize())))
+        });
+
+        let uploaded = self.upload_parts(key.to_string(), rx.to_async()).await;
+        let produced = producer
+            .await
+            .map_err(|e| io::Error::other(format!("snapshot compressor panicked: {e}")))?;
+        let Some(sha256) = produced? else {
+            uploaded?;
+            return Ok(None);
+        };
+        Ok(Some((sha256, uploaded?)))
     }
 
     /// Part size that keeps a snapshot inside S3's 10 000-part ceiling.
@@ -1098,47 +2056,195 @@ impl BackupService {
 
     // ---- log archiving -----------------------------------------------------
 
-    /// Cuts the live log and uploads everything staged.
+    /// `BACKUP WAL`: [`Self::archive_wal_now`], insisting that every log is
+    /// cut. The statement's promise is that once it returns, every commit
+    /// made before it is recoverable from S3, and nothing checks that after
+    /// it. A checkpoint declines (`Ok(false)`) while another runs, while a
+    /// hold is taken, or while a transaction holds in-place writes, and a
+    /// decline cuts and stages nothing: taken for a cut, the flush uploaded
+    /// without the newest records and reported success, and a restore came
+    /// back without them (CI, 2026-11-22: 10 rows of 20, the 10 committed
+    /// just before `BACKUP WAL`). Here a declined checkpoint is tried again
+    /// for up to [`BARRIER_PATIENCE`], and a log still uncut fails the flush
+    /// with the reason.
     ///
-    /// This is the point-in-time barrier: once it returns, every commit made
-    /// before it is recoverable from S3.
+    /// Not for the snapshot's own flush: it checks its window reached the
+    /// archive afterwards and discards itself when not, which an error here
+    /// would only delay and rename.
+    pub async fn archive_wal_barrier(self: &Arc<Self>) -> io::Result<ArchiveReport> {
+        self.archive_wal(Some(BARRIER_PATIENCE)).await
+    }
+
+    /// Cuts the live logs as far as their checkpoints will and uploads
+    /// everything staged. A checkpoint that declines leaves its records in
+    /// the live log for a later flush, so this alone is no barrier: a caller
+    /// that needs every earlier commit covered uses
+    /// [`Self::archive_wal_barrier`], or checks the archive afterwards as the
+    /// snapshot does.
     pub async fn archive_wal_now(self: &Arc<Self>) -> io::Result<ArchiveReport> {
+        self.archive_wal(None).await
+    }
+
+    async fn archive_wal(self: &Arc<Self>, insist: Option<Duration>) -> io::Result<ArchiveReport> {
         // Every log, not only the root's: a database created with `CREATE
         // DATABASE` keeps its own, and records left in it are recoverable from
         // nowhere. A checkpoint with nothing to do is cheap.
-        self.checkpoint_all_logs().await?;
-        self.flush_staged_segments().await
+        //
+        // The upload runs even when a cut failed. One database's log refusing
+        // to be cut — a poisoned log refuses until restart — says nothing about
+        // the segments every other database has already staged, and stopping
+        // here stopped point-in-time recovery for all of them. The failure is
+        // still the result, so the caller learns which database is not covered.
+        let cut = self.cut_all_logs(insist).await;
+        let uploaded = self.flush_staged_segments().await;
+        let result = match (cut, uploaded) {
+            (Ok(()), uploaded) => uploaded,
+            (Err(cut), Ok(_)) => Err(cut),
+            (Err(cut), Err(upload)) => Err(io::Error::other(format!(
+                "{cut}; and uploading the segments that were staged failed too: {upload}"
+            ))),
+        };
+        // The upload recorded its own outcome; a cut that failed is this
+        // flush failing too, and the status has to say so, as the caller is
+        // told.
+        if let Err(e) = &result {
+            self.activity.fail_last(activity::Operation::WalFlush, e.to_string());
+        }
+        result
     }
 
     /// Cuts every log under this location, so its records reach staging.
+    ///
+    /// Every log is attempted even after one fails, and the error names each
+    /// that failed. Returning at the first one left every log sorted after it
+    /// uncut, so a single poisoned sub-database stopped the archiving of every
+    /// healthy database beside it until the process restarted.
+    ///
+    /// A log that cannot be named — its database's pool file does not parse —
+    /// is reported the same way, after every other log has been cut.
     async fn checkpoint_all_logs(self: &Arc<Self>) -> io::Result<()> {
-        for (key, wal) in self.log_streams() {
+        self.cut_all_logs(None).await
+    }
+
+    /// [`Self::checkpoint_all_logs`], and with `insist` a checkpoint that
+    /// declines is tried again until it cuts, for up to that long, and a log
+    /// still uncut then is a failure.
+    ///
+    /// A checkpoint declines (`Ok(false)`) while another runs, while a hold
+    /// is taken, or while a transaction holds in-place writes, and a decline
+    /// cuts nothing: the records stay in the live log, unstaged. `BACKUP WAL`
+    /// took any `Ok` for a cut and reported success with its barrier's last
+    /// commits never uploaded. A restore from it came back without them (CI,
+    /// 2026-11-22: 10 rows of 20, the 10 committed just before `BACKUP WAL`,
+    /// while an automatic checkpoint that began before them was running).
+    async fn cut_all_logs(self: &Arc<Self>, insist: Option<Duration>) -> io::Result<()> {
+        let (streams, mut failed) = self.log_streams_checked();
+        self.attach_unattached(&streams);
+        for (key, wal) in streams {
             let w = wal.clone();
-            tokio::task::spawn_blocking(move || w.checkpoint())
+            let outcome = tokio::task::spawn_blocking(move || match insist {
+                None => w.checkpoint().map(|_| ()),
+                Some(patience) => cut_until_done(&w, patience),
+            })
                 .await
                 .map_err(|e| io::Error::other(e.to_string()))
-                .and_then(|r| r)
-                .map_err(|e| {
-                    io::Error::other(format!(
-                        "the log of database {} could not be cut: {e}",
-                        if key.is_empty() { "<default>" } else { key.as_str() }
-                    ))
-                })?;
+                .and_then(|r| r);
+            if let Err(e) = outcome {
+                failed.push(format!(
+                    "the log of database {} could not be cut: {e}",
+                    if key.is_empty() {
+                        "<default>"
+                    } else {
+                        key.as_str()
+                    }
+                ));
+            }
         }
-        Ok(())
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::other(failed.join("; ")))
+        }
+    }
+
+    /// The names of the files `body`'s records write to, from the live log of
+    /// `stream` (see [`SegmentEntry::files`]). A file the log no longer knows
+    /// (dropped since) is left out: its records are voided by the drop's
+    /// barrier on replay.
+    fn file_names_in(&self, stream: &str, body: &[u8]) -> Vec<String> {
+        let ids = crate::core::wal::scan_file_ids(body);
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let Some(wal) = self
+            .log_streams_checked()
+            .0
+            .into_iter()
+            .find(|(key, _)| key == stream)
+            .map(|(_, wal)| wal)
+        else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = wal
+            .registered_files()
+            .into_iter()
+            .filter(|(id, _)| ids.contains(id))
+            .filter_map(|(_, path)| path.file_name().and_then(|n| n.to_str()).map(str::to_string))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Uploads staged segments without cutting the live log first.
     ///
     /// Used by the background task, which does not want to force a checkpoint —
     /// and its fsync of every data file — on a schedule of its own.
+    ///
+    /// Except while a database keeps tables on a storage location: then every
+    /// log is cut behind one [`read_cut`] first, and the cut is recorded once
+    /// the bundles holding it are. Uploading what a database's log staged on
+    /// its own put a transaction's outcome in the archive without the rows its
+    /// location's log still held, and a restore came back with a later commit
+    /// and without an earlier one.
     async fn flush_staged_segments(self: &Arc<Self>) -> io::Result<ArchiveReport> {
+        if let Err(e) = self.require_catalogue() {
+            // Staging goes on growing while nothing may be uploaded.
+            self.enforce_staging_ceiling();
+            return Err(e);
+        }
         let _one_at_a_time = self.archive_lock.lock().await;
+        let attempt = self.activity.begin(activity::Operation::WalFlush);
+        let result = self.flush_staged_segments_locked().await;
+        // After every flush, failed or not. A failed one is the case the
+        // ceiling exists for: checked only on success, a bucket that kept
+        // refusing filled the disk instead of suspending archiving.
+        self.enforce_staging_ceiling();
+        attempt.finish(&result, |report| {
+            if report.bundles == 0 {
+                "nothing staged".to_string()
+            } else {
+                format!(
+                    "{} bundle(s), {} segment(s), {} bytes compressed, LSN {}..{}",
+                    report.bundles,
+                    report.segments,
+                    report.compressed_bytes,
+                    report.first_lsn,
+                    report.last_lsn
+                )
+            }
+        });
+        result
+    }
 
+    /// [`Self::flush_staged_segments`] once it holds `archive_lock`.
+    async fn flush_staged_segments_locked(self: &Arc<Self>) -> io::Result<ArchiveReport> {
+        let cut = self.cut_together().await;
         let staged = self.staged_by_stream()?;
-        if staged.iter().all(|(_, paths)| paths.is_empty()) {
+        if cut.is_none() && staged.iter().all(|(_, paths)| paths.is_empty()) {
             return Ok(ArchiveReport::default());
         }
+        let staged_names: Vec<String> = staged.iter().map(|(name, _)| name.clone()).collect();
 
         let mut report = ArchiveReport::default();
 
@@ -1151,89 +2257,125 @@ impl BackupService {
         // Never across logs, though: each database's records name files by an
         // id derived from a table name, so two databases' streams cannot be
         // told apart once concatenated. One bundle belongs to exactly one.
-        for (database, paths) in staged {
-        for group in group_by_size(&paths, self.config.wal_bundle_bytes)? {
-            let mut body = Vec::new();
-            for path in &group {
-                let mut file = std::fs::File::open(path)?;
-                file.read_to_end(&mut body)?;
-            }
+        // Each bundle's staged files are deleted once it is in S3, so a
+        // failure part-way leaves the bundles before it reachable only
+        // through the catalogue: publish it before reporting the failure, or
+        // a crash before the next flush loses them from every restore.
+        let uploaded: io::Result<()> = async {
+            for (database, paths) in staged {
+                for group in group_by_size(&paths, self.config.wal_bundle_bytes)? {
+                    // Opened first and sized from the handles, so the body is
+                    // allocated once at its final size rather than regrown per
+                    // segment. A staged segment is never appended to, so the sum
+                    // is exact; `read_to_end` still copes if it were not.
+                    let mut files = Vec::with_capacity(group.len());
+                    let mut total = 0usize;
+                    for path in &group {
+                        let file = std::fs::File::open(path)?;
+                        total += file.metadata()?.len() as usize;
+                        files.push(file);
+                    }
+                    let mut body = Vec::with_capacity(total);
+                    for mut file in files {
+                        file.read_to_end(&mut body)?;
+                    }
 
-            let (first_lsn, last_lsn, commits) = crate::core::wal::scan_commit_range(&body);
-            let uncompressed = body.len() as u64;
+                    let (first_lsn, last_lsn, commits) = crate::core::wal::scan_commit_range(&body);
+                    let uncompressed = body.len() as u64;
+                    let files = self.file_names_in(&database, &body);
 
-            let sequence = self.next_segment_sequence().await;
-            // The root's bundles keep the flat layout an older build wrote, so
-            // its catalogue entries and objects line up across the upgrade.
-            let key = self.config.key(&if database.is_empty() {
-                format!("wal/{sequence:016x}-{first_lsn:016x}.wseg.zst")
-            } else {
-                format!("wal/{database}/{sequence:016x}-{first_lsn:016x}.wseg.zst")
-            });
+                    let sequence = self.next_segment_sequence().await;
+                    // The root's bundles keep the flat layout an older build wrote, so
+                    // its catalogue entries and objects line up across the upgrade.
+                    let key = self.config.key(&if database.is_empty() {
+                        format!("wal/{sequence:016x}-{first_lsn:016x}.wseg.zst")
+                    } else {
+                        format!("wal/{database}/{sequence:016x}-{first_lsn:016x}.wseg.zst")
+                    });
 
-            let level = self.config.segment_level;
-            let threads = self.compression_threads();
-            let long_range = self.config.long_range;
-            let compressed = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
-                let mut encoder = new_encoder(Vec::new(), level, threads, long_range)?;
-                encoder.write_all(&body)?;
-                encoder.finish()
-            })
-            .await
-            .map_err(|e| io::Error::other(format!("segment compressor panicked: {e}")))??;
+                    let level = self.config.segment_level;
+                    let threads = self.compression_threads();
+                    let long_range = self.config.long_range;
+                    let compressed = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
+                        compress_bundle(&body, level, threads, long_range)
+                    })
+                    .await
+                    .map_err(|e| io::Error::other(format!("segment compressor panicked: {e}")))??;
 
-            let compressed_bytes = compressed.len() as u64;
-            self.client.put_object(&key, &compressed).await?;
+                    let compressed_bytes = compressed.len() as u64;
+                    self.client.put_object(&key, &compressed).await?;
 
-            {
-                let mut manifest = self.manifest.lock().await;
-                manifest.record_segment(SegmentEntry {
-                    sequence,
-                    database: database.clone(),
-                    key,
-                    archived_at: timeutil::now_unix(),
-                    first_lsn,
-                    last_lsn,
-                    compressed_bytes,
-                    uncompressed_bytes: uncompressed,
-                    segment_count: group.len() as u32,
-                });
-            }
+                    {
+                        let mut manifest = self.manifest.lock().await;
+                        manifest.record_segment(SegmentEntry {
+                            sequence,
+                            database: database.clone(),
+                            key,
+                            archived_at: timeutil::now_unix(),
+                            first_lsn,
+                            last_lsn,
+                            compressed_bytes,
+                            uncompressed_bytes: uncompressed,
+                            segment_count: group.len() as u32,
+                            files,
+                        });
+                    }
 
-            report.bundles += 1;
-            report.segments += group.len() as u32;
-            report.uncompressed_bytes += uncompressed;
-            report.compressed_bytes += compressed_bytes;
-            if first_lsn != 0 && (report.first_lsn == 0 || first_lsn < report.first_lsn) {
-                report.first_lsn = first_lsn;
-            }
-            report.last_lsn = report.last_lsn.max(last_lsn);
+                    report.bundles += 1;
+                    report.segments += group.len() as u32;
+                    report.uncompressed_bytes += uncompressed;
+                    report.compressed_bytes += compressed_bytes;
+                    if first_lsn != 0 && (report.first_lsn == 0 || first_lsn < report.first_lsn) {
+                        report.first_lsn = first_lsn;
+                    }
+                    report.last_lsn = report.last_lsn.max(last_lsn);
 
-            debug!(
-                "Archived {} segments of {} ({} commits, LSN {}..{}) as {} bytes",
-                group.len(),
-                if database.is_empty() { "the default database" } else { database.as_str() },
-                commits,
-                first_lsn,
-                last_lsn,
-                compressed_bytes
-            );
+                    debug!(
+                        "Archived {} segments of {} ({} commits, LSN {}..{}) as {} bytes",
+                        group.len(),
+                        if database.is_empty() {
+                            "the default database"
+                        } else {
+                            database.as_str()
+                        },
+                        commits,
+                        first_lsn,
+                        last_lsn,
+                        compressed_bytes
+                    );
 
-            // Only once the bundle is durably in S3. Deleting first and failing
-            // the upload would lose the records outright.
-            for path in &group {
-                if let Err(e) = std::fs::remove_file(path) {
-                    warn!("Could not remove staged segment {}: {}", path.display(), e);
+                    // Only once the bundle is durably in S3. Deleting first and failing
+                    // the upload would lose the records outright.
+                    for path in &group {
+                        if let Err(e) = std::fs::remove_file(path) {
+                            warn!("Could not remove staged segment {}: {}", path.display(), e);
+                        }
+                    }
                 }
             }
+            Ok(())
         }
+        .await;
+        if let Err(e) = uploaded {
+            if report.bundles > 0
+                && let Err(publish) = self.publish_manifest().await
+            {
+                warn!(
+                    "{} log bundle(s) were archived before a failure, and the catalogue listing \
+                     them could not be published: {publish}",
+                    report.bundles
+                );
+            }
+            return Err(e);
         }
 
-        // Checked after every flush, successful or not: this is the only place
-        // that observes whether uploads are keeping up with checkpoints.
-        self.enforce_staging_ceiling();
+        // Only now: every bundle holding records through the cut is recorded.
+        let recorded = match cut {
+            Some(lsns) => self.record_cut(lsns, &staged_names).await,
+            None => false,
+        };
 
-        if report.bundles > 0 {
+        if report.bundles > 0 || recorded {
             self.publish_manifest().await?;
             info!(
                 "Archived {} log segments in {} bundle(s), {} -> {} bytes, through LSN {}",
@@ -1245,6 +2387,110 @@ impl BackupService {
             );
         }
         Ok(report)
+    }
+
+    /// Reads a [`read_cut`] across every log and cuts them all behind it, when
+    /// some database keeps tables on a storage location. `None` when none does,
+    /// or when this pass cannot produce a cut — the next pass tries again, and
+    /// a restore stops at the newest cut recorded meanwhile.
+    async fn cut_together(self: &Arc<Self>) -> Option<Vec<manifest::CutLsn>> {
+        if self.archiving_suspended.load(Ordering::Acquire) {
+            return None;
+        }
+        let (streams, problems) = self.log_streams_checked();
+        if !streams.iter().any(|(key, _)| key.starts_with(LOCATION_KEY_PREFIX)) {
+            return None;
+        }
+        if !problems.is_empty() {
+            // A log nobody can name is in no cut, and its database's outcomes
+            // would be cut without it.
+            warn!(
+                "Backup of {}: no restore point this pass: {}",
+                self.location,
+                problems.join("; ")
+            );
+            return None;
+        }
+        let lsns = match read_cut(&streams) {
+            Ok(lsns) => lsns,
+            Err(e) => {
+                warn!("Backup of {}: no restore point this pass: {e}", self.location);
+                return None;
+            }
+        };
+        if let Err(e) = self.checkpoint_all_logs().await {
+            warn!("Backup of {}: {e}", self.location);
+        }
+        // A cut is only a restore point once everything through it is staged:
+        // a checkpoint declines while another runs or an in-place write is
+        // pending. `staged_covers` also asks whether anything after its first
+        // argument was dropped unstaged — a snapshot window's question, so it
+        // is passed the largest value and answers only the first.
+        if let Some(((key, _), _)) = streams
+            .iter()
+            .zip(&lsns)
+            .find(|((_, wal), (_, lsn))| !wal.staged_covers(u64::MAX, *lsn))
+        {
+            debug!(
+                "Backup of {}: the log of {key:?} is not staged through the cut; no restore \
+                 point this pass",
+                self.location
+            );
+            return None;
+        }
+        Some(
+            lsns.into_iter()
+                .map(|(database, lsn)| manifest::CutLsn {
+                    database,
+                    lsn: Some(lsn),
+                })
+                .collect(),
+        )
+    }
+
+    /// Records a cut whose bundles are all in the catalogue. Returns whether
+    /// the catalogue changed.
+    ///
+    /// A log the catalogue knows that was not open at the cut wrote nothing
+    /// then, so all of it is before the cut. One that was not
+    /// open then but is now opened during this pass: what it logged since is
+    /// after the cut and what it archived before is not, which one number
+    /// cannot say — so no cut this pass.
+    async fn record_cut(&self, mut lsns: Vec<manifest::CutLsn>, staged: &[String]) -> bool {
+        let open_now: Vec<String> = self.log_streams().into_iter().map(|(key, _)| key).collect();
+        let mut manifest = self.manifest.lock().await;
+        // Every log a snapshot window names too: a cut that leaves one out
+        // cannot serve that snapshot, and its restores would stop at the copy.
+        let mut history = manifest.databases_with_segments();
+        history.extend(staged.iter().cloned());
+        for snapshot in &manifest.snapshots {
+            history.extend(snapshot.windows.iter().map(|w| w.database.clone()));
+        }
+        history.sort();
+        history.dedup();
+        for database in history {
+            if lsns.iter().any(|l| l.database == database) {
+                continue;
+            }
+            if open_now.contains(&database) {
+                debug!(
+                    "Backup of {}: {database:?} opened during the cut; no restore point this pass",
+                    self.location
+                );
+                return false;
+            }
+            lsns.push(manifest::CutLsn {
+                database,
+                lsn: None,
+            });
+        }
+        lsns.sort_by(|a, b| a.database.cmp(&b.database));
+        let segment_sequence = manifest.next_segment_sequence();
+        manifest.record_cut(manifest::LogCut {
+            segment_sequence,
+            archived_at: timeutil::now_unix(),
+            lsns,
+        })
     }
 
     /// Staged segments, one entry per log, each in log order.
@@ -1290,7 +2536,9 @@ impl BackupService {
                 continue;
             }
             let name = entry.file_name();
-            let Some(name) = name.to_str().map(str::to_string) else { continue };
+            let Some(name) = name.to_str().map(str::to_string) else {
+                continue;
+            };
             streams.push((name, segments_in(&entry.path())?));
         }
         streams.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1313,6 +2561,9 @@ impl BackupService {
     // ---- catalogue ---------------------------------------------------------
 
     async fn publish_manifest(&self) -> io::Result<()> {
+        // The last line of defence: publishing the placeholder would replace
+        // every snapshot and bundle the real catalogue lists.
+        self.require_catalogue()?;
         let (key, body) = {
             let mut manifest = self.manifest.lock().await;
             manifest.updated_at = timeutil::now_unix();
@@ -1320,10 +2571,7 @@ impl BackupService {
             // moves would otherwise leave a restore repointing a storage pool
             // at a path this installation no longer uses.
             manifest.source_location = self.location.clone();
-            (
-                self.config.key(manifest::MANIFEST_KEY),
-                manifest.encode(),
-            )
+            (self.config.key(manifest::MANIFEST_KEY), manifest.encode())
         };
         self.client.put_object(&key, &body).await?;
         Ok(())
@@ -1345,6 +2593,7 @@ impl BackupService {
     /// without the configured retention having to say so — the two are separate
     /// policies over the same mechanism.
     pub async fn prune_keeping(self: &Arc<Self>, keep: usize) -> io::Result<u32> {
+        self.require_catalogue()?;
         if keep == 0 {
             return Ok(0);
         }
@@ -1377,7 +2626,18 @@ impl BackupService {
     /// was rather than leaving the bucket empty — the one outcome worse than a
     /// stale backup is no backup.
     pub async fn rollover_now(self: &Arc<Self>) -> io::Result<(SnapshotReport, u32)> {
-        let report = self.snapshot_now().await?;
+        let attempt = self.activity.begin(activity::Operation::Rollover);
+        let result = self.roll_over().await;
+        attempt.finish(&result, |(report, removed)| {
+            format!("{} kept, {} object(s) from earlier generations removed", report.id, removed)
+        });
+        result
+    }
+
+    async fn roll_over(self: &Arc<Self>) -> io::Result<(SnapshotReport, u32)> {
+        // Full, never incremental: the prune below removes every older
+        // generation, and a snapshot that reused their objects would lose them.
+        let report = self.take_snapshot(true).await?;
         let removed = self.prune_keeping(1).await?;
 
         // Stamped only once both halves are done, and published on its own
@@ -1450,6 +2710,15 @@ impl BackupService {
     /// done, not from the moment this process started — see [`first_delay`] for
     /// what that fixes.
     pub fn spawn_background(self: &Arc<Self>) {
+        if self.catalogue_state() == CatalogueState::Loaded {
+            self.spawn_schedules();
+        } else {
+            self.spawn_catalogue_retry();
+        }
+    }
+
+    /// The schedules themselves, once the catalogue is loaded.
+    fn spawn_schedules(self: &Arc<Self>) {
         if self.config.wal_flush_secs > 0 {
             let service = self.clone();
             let interval = Duration::from_secs(service.config.wal_flush_secs);
@@ -1464,11 +2733,14 @@ impl BackupService {
                     None => Duration::ZERO,
                 };
                 loop {
+                    service.activity.schedule(activity::Operation::WalFlush, next_after(delay));
                     tokio::time::sleep(delay).await;
                     delay = interval;
                     if service.shutting_down.load(Ordering::Acquire) {
+                        service.activity.schedule(activity::Operation::WalFlush, activity::Next::NotScheduled);
                         return;
                     }
+                    service.activity.schedule(activity::Operation::WalFlush, activity::Next::Now);
                     // Cut the log first, so the interval means "recoverable to
                     // within this long" rather than "whatever happened to have
                     // been checkpointed".
@@ -1509,11 +2781,24 @@ impl BackupService {
                     Some(_) if interval.is_zero() => None,
                     Some(last) => Some(first_delay(interval, last)),
                 };
+                let mut retrying = false;
                 while let Some(wait) = delay {
+                    service.activity.schedule_snapshot(
+                        next_after(wait),
+                        retrying.then(|| {
+                            format!(
+                                "retrying the base snapshot after a failure, backing off up to {}s; \
+                                 there is nothing to restore from until one succeeds",
+                                retry_ceiling.as_secs()
+                            )
+                        }),
+                    );
                     tokio::time::sleep(wait).await;
                     if service.shutting_down.load(Ordering::Acquire) {
+                        service.activity.schedule_snapshot(activity::Next::NotScheduled, None);
                         return;
                     }
+                    service.activity.schedule_snapshot(activity::Next::Now, None);
                     let failed = match service.snapshot_now().await {
                         Ok(_) => false,
                         Err(e) => {
@@ -1527,7 +2812,8 @@ impl BackupService {
                     // away, by default. Backing off doubles the wait, so a
                     // bucket that is simply misconfigured is not re-uploading
                     // the whole database every minute.
-                    delay = if failed && service.last_snapshot_at().await.is_none() {
+                    retrying = failed && service.last_snapshot_at().await.is_none();
+                    delay = if retrying {
                         let wait = retry;
                         retry = (retry * 2).min(retry_ceiling);
                         Some(wait)
@@ -1538,6 +2824,7 @@ impl BackupService {
                         Some(interval)
                     };
                 }
+                service.activity.schedule_snapshot(activity::Next::NotScheduled, None);
             });
         }
 
@@ -1554,11 +2841,14 @@ impl BackupService {
                     None => interval,
                 };
                 loop {
+                    service.activity.schedule(activity::Operation::Rollover, next_after(delay));
                     tokio::time::sleep(delay).await;
                     delay = interval;
                     if service.shutting_down.load(Ordering::Acquire) {
+                        service.activity.schedule(activity::Operation::Rollover, activity::Next::NotScheduled);
                         return;
                     }
+                    service.activity.schedule(activity::Operation::Rollover, activity::Next::Now);
                     // A failure is logged and the old generation is kept: the
                     // next rollover tries again, and until one succeeds there is
                     // still something to restore from.
@@ -1572,7 +2862,11 @@ impl BackupService {
         // Staged bytes can cross the bundle threshold well before the interval
         // does on a write-heavy database. Checking often and uploading rarely
         // keeps the staging directory bounded without adding requests.
-        if self.config.wal_bundle_bytes > 0 {
+        //
+        // The same tick watches the ceiling, so it runs whenever there is one:
+        // with no bundle trigger and no flush interval nothing else checks it,
+        // and checkpoints go on staging regardless.
+        if self.config.wal_bundle_bytes > 0 || self.config.staging_max_bytes > 0 {
             let service = self.clone();
             tokio::spawn(async move {
                 loop {
@@ -1581,14 +2875,17 @@ impl BackupService {
                         return;
                     }
                     let staged = service.staged_bytes();
-                    if staged >= service.config.wal_bundle_bytes {
+                    let bundle = service.config.wal_bundle_bytes;
+                    if bundle > 0 && staged >= bundle {
                         if let Err(e) = service.flush_staged_segments().await {
                             error!("Log archive flush failed: {e}");
                         }
                     } else {
-                        // A flush would have done this on its way out; without
-                        // it a suspended service that has drained would stay
-                        // suspended until the next bundle-sized burst.
+                        // No flush this tick, so the ceiling is checked here:
+                        // to suspend a staging directory growing with nothing
+                        // uploading it, and to resume one that has drained,
+                        // which would otherwise stay suspended until the next
+                        // bundle-sized burst.
                         service.enforce_staging_ceiling();
                     }
                 }
@@ -1601,6 +2898,265 @@ impl BackupService {
         self.shutting_down.store(true, Ordering::Release);
         if let Err(e) = self.archive_wal_now().await {
             error!("Final log archive on shutdown failed: {e}");
+        }
+    }
+}
+
+/// How often [`read_cut`] tries before giving up on a busy server.
+const CUT_ATTEMPTS: u32 = 10_000;
+
+/// Every log's commit sequence, all at one instant, as `(stream key, LSN)` in
+/// the order of `streams`.
+///
+/// Without a storage location there is nothing to pair — each database has its
+/// own status — and one read of each log is the cut. With one, the rows of a
+/// transaction are in the location's log and its outcome in its database's,
+/// and two independent reads can pair an outcome with a location log that
+/// does not hold its rows yet. So the databases are read first and the
+/// locations after: rows are logged before their outcome, so every outcome the
+/// first read takes in has its rows in the second. The databases are then read
+/// again, and the whole read repeated if any moved: nothing a location logged
+/// between the reads can then rest on an outcome the cut leaves out, since
+/// whatever acts on an outcome — vacuum freeing a deleted version, say — runs
+/// only once that outcome is logged. What a location holds past its read is
+/// rows of transactions still in flight at the cut, as after a crash there.
+fn read_cut(streams: &[(String, Arc<crate::core::wal::Wal>)]) -> io::Result<Vec<(String, u64)>> {
+    let is_location = |key: &str| key.starts_with(LOCATION_KEY_PREFIX);
+    if !streams.iter().any(|(key, _)| is_location(key)) {
+        return Ok(streams
+            .iter()
+            .map(|(key, wal)| (key.clone(), wal.commit_lsn()))
+            .collect());
+    }
+    let read = |locations: bool| -> Vec<u64> {
+        streams
+            .iter()
+            .filter(|(key, _)| is_location(key) == locations)
+            .map(|(_, wal)| wal.commit_lsn())
+            .collect()
+    };
+    for attempt in 0..CUT_ATTEMPTS {
+        let databases = read(false);
+        let locations = read(true);
+        if read(false) == databases {
+            let (mut databases, mut locations) = (databases.into_iter(), locations.into_iter());
+            return Ok(streams
+                .iter()
+                .map(|(key, _)| {
+                    let lsn = if is_location(key) {
+                        locations.next()
+                    } else {
+                        databases.next()
+                    };
+                    (key.clone(), lsn.expect("one reading per log"))
+                })
+                .collect());
+        }
+        if attempt % 64 == 63 {
+            std::thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+    Err(io::Error::other(format!(
+        "could not read the logs at one instant: a database committed during each of \
+         {CUT_ATTEMPTS} attempts"
+    )))
+}
+
+/// See [`BackupService::staged_lengths`]: keyed by the name the snapshot gives
+/// the sidecar, a location's under its stream key.
+fn staged_lengths_in(
+    root: &Path,
+    locations: &[(String, String)],
+) -> io::Result<HashMap<String, u64>> {
+    fn walk(dir: &Path, prefix: &str, lengths: &mut HashMap<String, u64>) -> io::Result<()> {
+        for entry in std::fs::read_dir(dir)?.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+
+            // Sub-databases have sidecars of their own, and a fold racing
+            // the copy is exactly as undetectable there as at the root.
+            if file_type.is_dir() {
+                if EXCLUDED.contains(&name) {
+                    continue;
+                }
+                walk(&entry.path(), &format!("{prefix}{name}/"), lengths)?;
+                continue;
+            }
+            if !name.ends_with(".tmp") {
+                continue;
+            }
+            lengths.insert(
+                format!("{prefix}{name}"),
+                crate::core::sync_path::entry_metadata(&entry).map(|m| m.len()).unwrap_or(0),
+            );
+        }
+        Ok(())
+    }
+
+    let mut lengths = HashMap::new();
+    walk(root, "", &mut lengths)?;
+    // Flat, as the copy is; see `snapshot_file_list`.
+    for (key, path) in locations {
+        for entry in std::fs::read_dir(path)?.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.ends_with(".tmp") && entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+            {
+                lengths.insert(
+                    format!("{key}/{name}"),
+                    crate::core::sync_path::entry_metadata(&entry).map(|m| m.len()).unwrap_or(0),
+                );
+            }
+        }
+    }
+    Ok(lengths)
+}
+
+/// See [`BackupService::check_staged_appends`].
+fn folded_while_copying(before: &HashMap<String, u64>, after: &HashMap<String, u64>) -> io::Result<()> {
+    for (name, was) in before {
+        if *was == 0 {
+            continue;
+        }
+        let now = after.get(name).copied().unwrap_or(0);
+        if now < *was {
+            return Err(io::Error::other(format!(
+                "{name} was folded into its main file while the snapshot was being copied,                      so up to {} bytes are in neither the copy nor the log. Discarding this                      snapshot; retry it.",
+                was - now
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// What a snapshot's copy may find gone: a file a `DROP` deleted after the
+/// copy began.
+///
+/// The deletion gate is held only while a snapshot fixes where its copy
+/// begins, so a `DROP` during the upload deletes files the snapshot already
+/// listed. Such a file needs no copy: its barrier committed past the
+/// window's start, and a restore empties the file there whatever the copy
+/// held (see [`crate::core::wal::Wal::recover_restoring`]). Anything else
+/// gone is not explained and fails the snapshot. A rename or a move is the
+/// case that matters: their copies write no log record, so a file one of
+/// them took away would vanish from the snapshot and from every restore
+/// after it; they wait for the upload instead (see [`RELOCATION_GATE`]).
+#[derive(Clone)]
+struct DroppedDuringCopy {
+    /// Each stream's directory, as [`crate::core::wal::dir_key`] spells it,
+    /// with its log and the start of its window: the database directories
+    /// here and the storage locations outside them alike.
+    windows: Arc<HashMap<String, (Arc<crate::core::wal::Wal>, u64)>>,
+}
+
+impl DroppedDuringCopy {
+    fn new(
+        streams: &[(String, Arc<crate::core::wal::Wal>)],
+        opened_at: &HashMap<String, u64>,
+    ) -> Self {
+        let windows = streams
+            .iter()
+            .filter_map(|(key, wal)| {
+                let dir = wal.path().parent()?.to_str()?;
+                let start = opened_at.get(key).copied().unwrap_or(0);
+                Some((crate::core::wal::dir_key(dir), (wal.clone(), start)))
+            })
+            .collect();
+        DroppedDuringCopy {
+            windows: Arc::new(windows),
+        }
+    }
+
+    /// Whether a `DROP` barrier for `path` committed past the start of the
+    /// window of the directory it is in.
+    fn explains(&self, path: &Path) -> bool {
+        let (Some(dir), Some(name)) = (
+            path.parent().and_then(Path::to_str),
+            path.file_name().and_then(|n| n.to_str()),
+        ) else {
+            return false;
+        };
+        // A table file's `.tmp` staging sibling has no log record and no
+        // barrier of its own; the drop deletes it with the file it stages
+        // for, and is that file's barrier.
+        let name = name.strip_suffix(".tmp").unwrap_or(name);
+        let id = crate::core::wal::file_id_for_name(name);
+        match self.windows.get(&crate::core::wal::dir_key(dir)) {
+            Some((wal, start)) => wal.dropped_after(id, *start),
+            // A database created during the copy: its window opens at 0, as
+            // the catalogue records it.
+            None => crate::core::wal::wal_for(dir).is_some_and(|wal| wal.dropped_after(id, 0)),
+        }
+    }
+
+    /// `Ok` when the copy may leave `path` out after reaching it failed with
+    /// `error`; the error otherwise, a missing file's naming the file.
+    fn leave_out(&self, path: &Path, error: io::Error) -> io::Result<()> {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+        if self.explains(path) {
+            info!(
+                "{} was dropped while the snapshot copied it; left out, as a restore empties \
+                 it at the drop",
+                path.display()
+            );
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "{} was listed for the snapshot and is gone, and no DROP committed during the \
+                 copy explains it: {error}",
+                path.display()
+            ),
+        ))
+    }
+}
+
+/// A snapshot parked between listing its files and copying them, for tests.
+#[cfg(test)]
+pub(crate) mod upload_hooks {
+    use tokio::sync::oneshot;
+
+    struct Park {
+        reached: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    }
+
+    static PARKS: parking_lot::Mutex<Vec<(String, Park)>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Parks the next snapshot of `location` once it has listed its files.
+    /// The first receiver fires when it is parked; the sender releases it.
+    pub(crate) fn park_next(location: &str) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached, parked) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        PARKS.lock().push((
+            location.to_string(),
+            Park {
+                reached,
+                release: released,
+            },
+        ));
+        (parked, release)
+    }
+
+    pub(super) async fn parked_here(location: &str) {
+        let park = {
+            let mut parks = PARKS.lock();
+            parks
+                .iter()
+                .position(|(at, _)| at == location)
+                .map(|i| parks.swap_remove(i).1)
+        };
+        if let Some(park) = park {
+            let _ = park.reached.send(());
+            let _ = park.release.await;
         }
     }
 }
@@ -1632,6 +3188,52 @@ pub async fn install(config: BackupConfig, location: &str) -> io::Result<Arc<Bac
     Ok(service)
 }
 
+/// [`install`] for `--s3-start-offline`: a bucket that does not answer does
+/// not stop the start; see [`BackupService::connect_waiting`].
+pub async fn install_waiting(config: BackupConfig, location: &str) -> io::Result<Arc<BackupService>> {
+    let service = BackupService::connect_waiting(config, location).await?;
+    service.spawn_background();
+    let _ = SERVICE.set(service.clone());
+    Ok(service)
+}
+
+/// Reads the catalogue at the prefix, or a new one when there is none.
+async fn read_catalogue(
+    client: &S3Client,
+    config: &BackupConfig,
+    instance_id: &str,
+) -> Result<Manifest, CatalogueError> {
+    let manifest_key = config.key(manifest::MANIFEST_KEY);
+    match client.get_object(&manifest_key).await {
+        Ok(bytes) => {
+            let existing = Manifest::decode(&bytes).map_err(CatalogueError::Refused)?;
+            if existing.instance_id != instance_id {
+                return Err(CatalogueError::Refused(io::Error::other(format!(
+                    "s3://{}/{} already holds backups for instance {}, but this database is {}. \
+                     Point --s3-prefix somewhere else, or restore from that prefix instead.",
+                    config.bucket, manifest_key, existing.instance_id, instance_id
+                ))));
+            }
+            info!(
+                "Backup catalogue found at s3://{}/{}: {} snapshots, {} segment bundles",
+                config.bucket,
+                manifest_key,
+                existing.snapshots.len(),
+                existing.segments.len()
+            );
+            Ok(existing)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            info!(
+                "No backup catalogue at s3://{}/{}; starting a new one for instance {}",
+                config.bucket, manifest_key, instance_id
+            );
+            Ok(Manifest::new(instance_id.to_string()))
+        }
+        Err(e) => Err(CatalogueError::Unreachable(e)),
+    }
+}
+
 /// Restores from a prefix without a running service, for the CLI's pre-open
 /// path and for cloning into a fresh directory.
 pub async fn restore_from(
@@ -1653,6 +3255,48 @@ pub async fn restore_from(
 // ---- shared plumbing -------------------------------------------------------
 
 /// A zstd encoder configured for this backup.
+/// Hex SHA-256 of the first `len` bytes of `path`.
+pub(crate) fn hash_prefix(path: &Path, len: u64) -> io::Result<String> {
+    use sha2::Digest;
+    let mut file = std::io::BufReader::with_capacity(256 * 1024, std::fs::File::open(path)?);
+    let mut digest = sha2::Sha256::new();
+    let mut chunk = vec![0u8; 1024 * 1024];
+    let mut remaining = len;
+    while remaining > 0 {
+        let want = chunk.len().min(remaining as usize);
+        file.read_exact(&mut chunk[..want])?;
+        digest.update(&chunk[..want]);
+        remaining -= want as u64;
+    }
+    Ok(to_hex(&digest.finalize()))
+}
+
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Compresses one log bundle whose size is known up front.
+///
+/// The size is pledged to the encoder. Without it zstd has to assume an
+/// unbounded stream and sets up the whole configured window — 128 MiB with
+/// long-distance matching — for a bundle that is usually a few megabytes; with
+/// it the window and match tables are sized to the input, and the frame
+/// records the content size. A pledge that turned out wrong fails `finish`
+/// rather than producing a bad frame, and the size here is `body.len()` itself.
+fn compress_bundle(body: &[u8], level: i32, threads: u32, long_range: bool) -> io::Result<Vec<u8>> {
+    // Log records compress well; a quarter is a cheap first guess that saves
+    // the early regrowths without over-reserving much.
+    let mut encoder = new_encoder(Vec::with_capacity(body.len() / 4), level, threads, long_range)?;
+    encoder.set_pledged_src_size(Some(body.len() as u64))?;
+    encoder.write_all(body)?;
+    encoder.finish()
+}
+
 fn new_encoder<W: Write>(
     sink: W,
     level: i32,
@@ -1683,12 +3327,11 @@ fn new_encoder<W: Write>(
     Ok(encoder)
 }
 
-/// Whether the staging ceiling calls for a state change.
-///
-/// `Some(true)` means suspend, `Some(false)` means resume, `None` means leave
-/// it alone. Resumption uses half the ceiling rather than the ceiling itself,
-/// so a directory hovering at the limit does not flap between the two states
-/// once per tick.
+/// The time a task sleeping `delay` from now wakes, rounded up to a second.
+fn next_after(delay: Duration) -> activity::Next {
+    activity::Next::At(timeutil::now_unix() + delay.as_secs() + u64::from(delay.subsec_nanos() > 0))
+}
+
 /// How long a task that runs every `interval` should wait before its first run,
 /// given the unix second its last run finished.
 ///
@@ -1709,6 +3352,12 @@ fn first_delay(interval: Duration, last_finished_at: u64) -> Duration {
     interval.saturating_sub(elapsed)
 }
 
+/// Whether the staging ceiling calls for a state change.
+///
+/// `Some(true)` means suspend, `Some(false)` means resume, `None` means leave
+/// it alone. Resumption uses half the ceiling rather than the ceiling itself,
+/// so a directory hovering at the limit does not flap between the two states
+/// once per tick.
 fn staging_action(staged: u64, ceiling: u64, suspended: bool) -> Option<bool> {
     if ceiling == 0 {
         // No ceiling configured. A service already suspended is still allowed
@@ -1859,8 +3508,87 @@ impl Write for PartSink {
 }
 
 #[cfg(test)]
+mod bundle_tests {
+    use super::*;
+
+    /// Log-shaped bytes: a fixed frame around a few varying fields.
+    fn log_like(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + 64);
+        let mut i = 0u64;
+        while out.len() < len {
+            out.extend_from_slice(&0x4C52_5741u32.to_le_bytes());
+            out.extend_from_slice(&[1, 0, 0, 0]);
+            out.extend_from_slice(&i.to_le_bytes());
+            out.extend_from_slice(&(i * 7919 % 1_000_003).to_le_bytes());
+            out.extend_from_slice(format!("employee_{i}|dept_{}|", i % 32).as_bytes());
+            i += 1;
+        }
+        out.truncate(len);
+        out
+    }
+
+    #[test]
+    fn a_pledged_bundle_round_trips() {
+        for len in [0usize, 1, 4096, 3 << 20] {
+            let body = log_like(len);
+            for threads in [1, 4] {
+                let compressed = compress_bundle(&body, 6, threads, true).unwrap();
+                let back = zstd::stream::decode_all(&compressed[..]).unwrap();
+                assert_eq!(back, body, "len {len} threads {threads}");
+            }
+        }
+    }
+
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored
+    /// bundle_compress_bench --nocapture`. The configured encoder with and
+    /// without the size pledged, on bundles of a few sizes.
+    #[test]
+    #[ignore]
+    fn bundle_compress_bench() {
+        for len in [256 << 10, 4 << 20, 32 << 20] {
+            let body = log_like(len);
+            let iters = (64 << 20) / len.max(1) + 1;
+            for round in 0..3 {
+                let t = std::time::Instant::now();
+                let mut old_size = 0;
+                for _ in 0..iters {
+                    let mut e = new_encoder(Vec::new(), 6, 1, true).unwrap();
+                    e.write_all(&body).unwrap();
+                    old_size = e.finish().unwrap().len();
+                }
+                let old = t.elapsed() / iters as u32;
+                let t = std::time::Instant::now();
+                let mut new_size = 0;
+                for _ in 0..iters {
+                    new_size = compress_bundle(&body, 6, 1, true).unwrap().len();
+                }
+                let new = t.elapsed() / iters as u32;
+                println!(
+                    "{} KiB round {round}: unpledged {old:?} ({old_size} B)  pledged {new:?} ({new_size} B)",
+                    len >> 10
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Persistent indexes §10 (B14): no snapshot carries an index-store
+    /// file, so a restore never pairs a copied `CLEAN` with rows changed
+    /// after it; the WAL'd `rdb.ixe` and every table file are kept.
+    /// Mutation: `excluded_file` checks `EXCLUDED` only.
+    #[test]
+    fn index_store_files_are_left_out_of_snapshots() {
+        for name in ["t.ixs", "t.ixm", "t.ixs.tmp", "t.ixm.tmp", "__pt_00000000000000aa_00000001.ixs"] {
+            assert!(excluded_file(name), "{name} would be backed up");
+        }
+        for name in ["rdb.ixe", "t.db", "t_pointers.db", "t_schema.db", "t.db.tmp", "t_ixs.db"] {
+            assert!(!excluded_file(name), "{name} would be left out");
+        }
+    }
 
     #[test]
     fn a_schedule_resumes_from_the_last_run_rather_than_restarting() {
@@ -1869,7 +3597,10 @@ mod tests {
 
         // The bug this exists for: a restart used to put the next run a whole
         // interval away, so a server restarted daily never snapshotted.
-        assert_eq!(first_delay(day, now - 3600), day - Duration::from_secs(3600));
+        assert_eq!(
+            first_delay(day, now - 3600),
+            day - Duration::from_secs(3600)
+        );
         assert_eq!(first_delay(day, now - 86_000), Duration::from_secs(400));
     }
 
@@ -1912,7 +3643,10 @@ mod tests {
         sink.finish().unwrap();
 
         let parts: Vec<Vec<u8>> = rx.into_iter().collect();
-        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), vec![10, 10, 5]);
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![10, 10, 5]
+        );
     }
 
     #[test]
@@ -2050,21 +3784,34 @@ mod tests {
             retain_snapshots: 7,
             rollover_interval_secs: 0,
             staging_max_bytes: 4 * 1024 * 1024 * 1024,
+            incremental_min_bytes: 0,
         }
     }
 
     #[test]
     fn a_log_in_the_location_itself_is_the_root_stream() {
-        assert_eq!(stream_key("/var/lib/rdb", "/var/lib/rdb"), Some(String::new()));
+        assert_eq!(
+            stream_key("/var/lib/rdb", "/var/lib/rdb"),
+            Some(String::new())
+        );
         // The location may or may not carry a trailing separator; the registry
         // key does not, and neither should the answer.
-        assert_eq!(stream_key("/var/lib/rdb", "/var/lib/rdb/"), Some(String::new()));
+        assert_eq!(
+            stream_key("/var/lib/rdb", "/var/lib/rdb/"),
+            Some(String::new())
+        );
     }
 
     #[test]
     fn a_created_database_is_a_stream_named_after_its_directory() {
-        assert_eq!(stream_key("/var/lib/rdb", "/var/lib/rdb/shop"), Some("shop".to_string()));
-        assert_eq!(stream_key("/var/lib/rdb", "/var/lib/rdb/shop/"), Some("shop".to_string()));
+        assert_eq!(
+            stream_key("/var/lib/rdb", "/var/lib/rdb/shop"),
+            Some("shop".to_string())
+        );
+        assert_eq!(
+            stream_key("/var/lib/rdb", "/var/lib/rdb/shop/"),
+            Some("shop".to_string())
+        );
     }
 
     #[test]
@@ -2079,12 +3826,351 @@ mod tests {
     }
 
     #[test]
-    fn a_storage_location_on_another_disk_is_not_a_stream() {
+    fn a_storage_location_on_another_disk_is_not_a_relative_stream() {
         // Placement can put a table's files outside the backed-up directory,
-        // and those get a log of their own. No snapshot copies them, so
-        // archiving their records would produce a log with nothing to replay
-        // into — worse than not archiving it, because the catalogue would
-        // claim coverage it does not have.
+        // and those get a log of their own. It is a stream, but under its own
+        // key from `pool_locations`, never as a path under the location: that
+        // would name a directory inside the restore that the files are not in.
         assert_eq!(stream_key("/var/lib/rdb", "/mnt/fast/rdb"), None);
+        let key = location_key("/mnt/fast/rdb");
+        assert!(key.starts_with(LOCATION_KEY_PREFIX), "{key}");
+        assert_eq!(
+            key,
+            location_key("/mnt/fast/rdb/"),
+            "a trailing separator is the same place"
+        );
+        assert_ne!(key, location_key("/mnt/fast/rdb2"));
+    }
+
+    /// An S3 stand-in on loopback: answers every request with an empty `200`
+    /// and records its request line, which is all the archive path reads.
+    async fn fake_s3() -> (Endpoint, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            // Bounded: an archive makes a handful of requests, one per
+            // connection because every reply closes it.
+            for _ in 0..64 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    let head_end = loop {
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    let body_len = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < head_end + body_len {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    log.lock()
+                        .unwrap()
+                        .push(head.lines().next().unwrap_or("").to_string());
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        (
+            Endpoint {
+                host: "127.0.0.1".to_string(),
+                port,
+                tls: false,
+            },
+            seen,
+        )
+    }
+
+    /// One database's poisoned log must not stop the others being archived.
+    ///
+    /// A poisoned log refuses every checkpoint until restart. The archive used
+    /// to stop at the first log that failed to cut — logs are walked in name
+    /// order — so every database sorted after it went uncut, and the segments
+    /// already staged by every database went un-uploaded: point-in-time
+    /// recovery ended for databases that were working normally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_poisoned_log_does_not_stop_the_other_databases_being_archived() {
+        let root = tempfile::tempdir().unwrap();
+        let location = root.path().to_str().unwrap().to_string();
+        let mut logs = Vec::new();
+        for name in ["a", "b"] {
+            let dir = root.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            let wal = Arc::new(
+                crate::core::wal::Wal::open(dir.join(crate::core::wal::DEFAULT_WAL_NAME)).unwrap(),
+            );
+            crate::core::wal::install_for(dir.to_str().unwrap(), wal.clone());
+            logs.push((dir, wal));
+        }
+        let (poisoned, healthy) = (logs[0].1.clone(), logs[1].1.clone());
+
+        let (endpoint, requests) = fake_s3().await;
+        let mut config = test_config();
+        config.endpoint = endpoint;
+        config.path_style = true;
+        config.max_attempts = 1;
+        let client = Arc::new(
+            S3Client::new(S3Config {
+                endpoint: config.endpoint.clone(),
+                region: config.region.clone(),
+                bucket: config.bucket.clone(),
+                credentials: config.credentials.clone(),
+                path_style: config.path_style,
+                max_attempts: config.max_attempts,
+            })
+            .unwrap(),
+        );
+        let service = Arc::new(BackupService {
+            config,
+            client,
+            location: location.clone(),
+            instance_id: "rdb-test".to_string(),
+            manifest: tokio::sync::Mutex::new(Manifest::new("rdb-test".to_string())),
+            snapshot_lock: tokio::sync::Mutex::new(()),
+            archive_lock: tokio::sync::Mutex::new(()),
+            shutting_down: CacheGuard::new(AtomicBool::new(false)),
+            archiving_suspended: CacheGuard::new(AtomicBool::new(false)),
+            attached: std::sync::Mutex::new(Vec::new()),
+            activity: Default::default(),
+            catalogue: std::sync::Mutex::new(CatalogueState::Loaded),
+        });
+        service.attach_to_logs().unwrap();
+
+        // "b" commits normally; "a" — sorted first — has one append that
+        // failed and could not be cut back, which poisons it.
+        let txn = healthy.begin();
+        healthy.log(txn, 7, 0, b"healthy").unwrap();
+        healthy.commit_txn(txn).unwrap();
+        crate::core::wal::test_hooks::SHORT_WAL_WRITE.with(|h| h.set(Some(3)));
+        crate::core::wal::test_hooks::FAIL_WAL_ROLLBACK.with(|f| f.set(true));
+        let failed = poisoned.log(poisoned.begin(), 7, 0, b"lost");
+        crate::core::wal::test_hooks::SHORT_WAL_WRITE.with(|h| h.set(None));
+        crate::core::wal::test_hooks::FAIL_WAL_ROLLBACK.with(|f| f.set(false));
+        assert!(failed.is_err());
+        assert!(poisoned.is_poisoned());
+
+        let outcome = service.archive_wal_now().await;
+        for (dir, _) in &logs {
+            crate::core::wal::remove_for(dir.to_str().unwrap());
+        }
+        let err = outcome.expect_err("a log that cannot be cut must still be reported");
+        assert!(err.to_string().contains("database a"), "{err}");
+
+        assert_eq!(
+            healthy.bytes_since_checkpoint(),
+            0,
+            "the healthy database's log was not cut because another database's was poisoned"
+        );
+        let staged_b = service.staging_dir_for("b");
+        let left = std::fs::read_dir(&staged_b)
+            .map(|d| d.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(left, 0, "the healthy database's staged segments were not uploaded");
+        let requests = requests.lock().unwrap().clone();
+        assert!(
+            requests
+                .iter()
+                .any(|line| line.starts_with("PUT") && line.contains("/wal/b/")),
+            "no segment of the healthy database reached the bucket: {:?}",
+            requests
+        );
+    }
+
+    /// A service over `location` that never reaches its bucket.
+    fn offline_service(location: &str, config: BackupConfig) -> Arc<BackupService> {
+        let client = Arc::new(
+            S3Client::new(S3Config {
+                endpoint: config.endpoint.clone(),
+                region: config.region.clone(),
+                bucket: config.bucket.clone(),
+                credentials: config.credentials.clone(),
+                path_style: config.path_style,
+                max_attempts: config.max_attempts,
+            })
+            .unwrap(),
+        );
+        Arc::new(BackupService {
+            config,
+            client,
+            location: location.to_string(),
+            instance_id: "rdb-test".to_string(),
+            manifest: tokio::sync::Mutex::new(Manifest::new("rdb-test".to_string())),
+            snapshot_lock: tokio::sync::Mutex::new(()),
+            archive_lock: tokio::sync::Mutex::new(()),
+            shutting_down: CacheGuard::new(AtomicBool::new(false)),
+            archiving_suspended: CacheGuard::new(AtomicBool::new(false)),
+            attached: std::sync::Mutex::new(Vec::new()),
+            activity: Default::default(),
+            catalogue: std::sync::Mutex::new(CatalogueState::Loaded),
+        })
+    }
+
+    /// Unregisters logs a test installed, however it ends.
+    struct Installed(Vec<String>);
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            for dir in &self.0 {
+                crate::core::wal::remove_for(dir);
+            }
+        }
+    }
+
+    fn install_log(dir: &Path, installed: &mut Installed) -> Arc<crate::core::wal::Wal> {
+        let wal = Arc::new(
+            crate::core::wal::Wal::open(dir.join(crate::core::wal::DEFAULT_WAL_NAME)).unwrap(),
+        );
+        crate::core::wal::install_for(dir.to_str().unwrap(), wal.clone());
+        installed.0.push(dir.to_str().unwrap().to_string());
+        wal
+    }
+
+    fn commit(wal: &crate::core::wal::Wal, bytes: &[u8]) {
+        let txn = wal.begin();
+        wal.log(txn, 7, 0, bytes).unwrap();
+        wal.commit_txn(txn).unwrap();
+    }
+
+    /// A staged append moving into place inside a storage location while the
+    /// copy runs is as torn as one in the database directory, and must refuse
+    /// the snapshot the same way.
+    #[test]
+    fn a_fold_in_a_storage_location_is_seen() {
+        let root = tempfile::tempdir().unwrap();
+        let disk2 = tempfile::tempdir().unwrap();
+        let path = disk2.path().to_str().unwrap().to_string();
+        let key = location_key(&path);
+        let locations = vec![(key.clone(), path)];
+        std::fs::write(disk2.path().join("t.db.tmp"), vec![1u8; 64]).unwrap();
+        std::fs::write(disk2.path().join("t.db"), b"main").unwrap();
+
+        let before = staged_lengths_in(root.path(), &locations).unwrap();
+        assert_eq!(before.get(&format!("{key}/t.db.tmp")), Some(&64), "{before:?}");
+        assert!(!before.contains_key(&format!("{key}/t.db")), "{before:?}");
+
+        // Untouched: nothing to refuse.
+        let same = staged_lengths_in(root.path(), &locations).unwrap();
+        folded_while_copying(&before, &same).unwrap();
+
+        std::fs::write(disk2.path().join("t.db.tmp"), vec![1u8; 8]).unwrap();
+        let shrunk = staged_lengths_in(root.path(), &locations).unwrap();
+        let err = folded_while_copying(&before, &shrunk).unwrap_err();
+        assert!(err.to_string().contains("t.db.tmp"), "{err}");
+
+        std::fs::remove_file(disk2.path().join("t.db.tmp")).unwrap();
+        let gone = staged_lengths_in(root.path(), &locations).unwrap();
+        folded_while_copying(&before, &gone).unwrap_err();
+    }
+
+    /// One database's unparsable pool file costs that database's locations and
+    /// nothing else: the root's log is still cut, a snapshot is refused rather
+    /// than taken without those tables, and the staging ceiling still detaches
+    /// every log — the one that can no longer be named included.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unparsable_pool_file_costs_only_its_own_locations() {
+        let root = tempfile::tempdir().unwrap();
+        let disk2 = tempfile::tempdir().unwrap();
+        let location = root.path().to_str().unwrap().to_string();
+        let shop = root.path().join("shop");
+        std::fs::create_dir(&shop).unwrap();
+        std::fs::write(
+            shop.join(crate::core::storage::POOL_FILE),
+            format!(
+                "version\t1\nlocation\tprimary\t1\tenabled\t{}\n",
+                disk2.path().display()
+            ),
+        )
+        .unwrap();
+
+        let mut installed = Installed(Vec::new());
+        let root_log = install_log(root.path(), &mut installed);
+        let location_log = install_log(disk2.path(), &mut installed);
+
+        let mut config = test_config();
+        config.staging_max_bytes = 1;
+        let service = offline_service(&location, config);
+        service.attach_to_logs().unwrap();
+        assert!(location_log.is_archiving(), "the test proves nothing");
+
+        std::fs::write(shop.join(crate::core::storage::POOL_FILE), "location\tprimary\n").unwrap();
+        commit(&root_log, b"root");
+
+        let err = service
+            .checkpoint_all_logs()
+            .await
+            .expect_err("a database whose locations are unknown must be reported");
+        assert!(err.to_string().contains("shop"), "{err}");
+        assert_eq!(
+            root_log.bytes_since_checkpoint(),
+            0,
+            "the root's log was not cut because another database's pool file is unreadable"
+        );
+        assert!(service.pool_locations_for_snapshot().is_err());
+
+        // The root's staged segment is over the 1-byte ceiling.
+        service.enforce_staging_ceiling();
+        assert!(service.archiving_is_suspended());
+        assert!(!root_log.is_archiving());
+        assert!(
+            !location_log.is_archiving(),
+            "a log this service attached kept staging past the ceiling"
+        );
+    }
+
+    /// A cut is each log's commit sequence; with a location it is read in
+    /// the order that keeps it consistent, and the reading is per log.
+    #[test]
+    fn a_cut_names_every_log_at_its_commit_sequence() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let open = |dir: &Path| {
+            Arc::new(
+                crate::core::wal::Wal::open(dir.join(crate::core::wal::DEFAULT_WAL_NAME)).unwrap(),
+            )
+        };
+        let (root, far) = (open(a.path()), open(b.path()));
+        commit(&root, b"one");
+        commit(&root, b"two");
+        commit(&far, b"three");
+        let streams = vec![
+            (String::new(), root.clone()),
+            ("~loc-00000000000000ff".to_string(), far.clone()),
+        ];
+        let cut = read_cut(&streams).unwrap();
+        assert_eq!(
+            cut,
+            vec![
+                (String::new(), root.commit_lsn()),
+                ("~loc-00000000000000ff".to_string(), far.commit_lsn()),
+            ]
+        );
+        assert_ne!(root.commit_lsn(), far.commit_lsn(), "the readings must not be mixed up");
     }
 }

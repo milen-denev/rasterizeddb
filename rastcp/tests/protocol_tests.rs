@@ -11,14 +11,26 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 
+/// A loopback listener on a port of the kernel's choosing, and its address.
+///
+/// The server is handed the listener itself, never a port number to bind
+/// again: a fixed port can be held by anything else on the machine, and a
+/// port that is let go can be handed to a test running in parallel first.
+fn loopback() -> (std::net::TcpListener, String) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let addr = listener.local_addr().expect("a bound address").to_string();
+    (listener, addr)
+}
+
 // Test custom message protocol
 #[tokio::test]
 async fn test_custom_protocol_handler() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let server_addr = "127.0.0.1";
+    let (listener, server_addr) = loopback();
 
     // Create a server that expects JSON protocol
-    let server = TcpServerBuilder::new(server_addr, 8097)
+    let server = TcpServerBuilder::from_listener(listener)
+        .unwrap()
         .build()
         .await
         .unwrap();
@@ -71,7 +83,7 @@ async fn test_custom_protocol_handler() {
     sleep(Duration::from_millis(100)).await;
 
     // Create a client
-    let mut client = TcpClientBuilder::new(&format!("{}:8097", server_addr))
+    let mut client = TcpClientBuilder::new(&server_addr)
         .build()
         .await
         .unwrap();
@@ -120,14 +132,15 @@ async fn test_custom_protocol_handler() {
 #[tokio::test]
 async fn test_client_disconnect_handling() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let server_addr = "127.0.0.1";
+    let (listener, server_addr) = loopback();
 
     // Message tracking
     let message_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let message_count_clone = message_count.clone();
 
     // Create server
-    let server = TcpServerBuilder::new(server_addr, 8098)
+    let server = TcpServerBuilder::from_listener(listener)
+        .unwrap()
         .build()
         .await
         .unwrap();
@@ -152,7 +165,7 @@ async fn test_client_disconnect_handling() {
 
     // Create multiple clients and test abrupt disconnection
     for i in 0..5 {
-        let mut client = TcpClientBuilder::new(&format!("{}:8098", server_addr))
+        let mut client = TcpClientBuilder::new(&server_addr)
             .build()
             .await
             .unwrap();
@@ -182,7 +195,8 @@ async fn test_custom_protocol_implementation() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // For this test, we'll use a simple TCP server without TLS to test the protocol logic
-    let listener = TcpListener::bind("127.0.0.1:8099").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
 
     // Spawn a server that uses our message protocol directly
     let server_handle = tokio::spawn(async move {
@@ -206,7 +220,7 @@ async fn test_custom_protocol_implementation() {
     sleep(Duration::from_millis(100)).await;
 
     // Connect as a client
-    let mut stream = TcpStream::connect("127.0.0.1:8099").await.unwrap();
+    let mut stream = TcpStream::connect(server_addr).await.unwrap();
 
     // Send valid message
     write_message(&mut stream, b"test message").await.unwrap();
@@ -248,7 +262,9 @@ async fn test_read_message_rejects_oversized_frame() {
 async fn test_client_send_returns_timeout_instead_of_panicking() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let server = TcpServerBuilder::new("127.0.0.1", 8100)
+    let (listener, server_addr) = loopback();
+    let server = TcpServerBuilder::from_listener(listener)
+        .unwrap()
         .request_timeout(Duration::from_secs(1))
         .build()
         .await
@@ -266,7 +282,7 @@ async fn test_client_send_returns_timeout_instead_of_panicking() {
 
     sleep(Duration::from_millis(100)).await;
 
-    let mut client = TcpClientBuilder::new("127.0.0.1:8100")
+    let mut client = TcpClientBuilder::new(&server_addr)
         .timeout(Duration::from_millis(50))
         .build()
         .await
@@ -284,8 +300,16 @@ async fn test_client_send_returns_timeout_instead_of_panicking() {
 async fn test_graceful_shutdown_drains_and_frees_the_port() {
     let _ = env_logger::builder().is_test(true).try_init();
 
+    // Find a free port, then let go of it: the server has to bind it itself,
+    // and bind it again after the shutdown, for the release to be under test.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+
     let server = Arc::new(
-        TcpServerBuilder::new("127.0.0.1", 8101)
+        TcpServerBuilder::new("127.0.0.1", port)
             .shutdown_grace(Duration::from_secs(5))
             .build()
             .await
@@ -299,7 +323,7 @@ async fn test_graceful_shutdown_drains_and_frees_the_port() {
 
     sleep(Duration::from_millis(100)).await;
 
-    let mut client = TcpClientBuilder::new("127.0.0.1:8101").build().await.unwrap();
+    let mut client = TcpClientBuilder::new(&format!("127.0.0.1:{port}")).build().await.unwrap();
     let echoed = client.send(b"ping".to_vec()).await.unwrap();
     assert_eq!(echoed, b"ping".to_vec());
 
@@ -320,8 +344,237 @@ async fn test_graceful_shutdown_drains_and_frees_the_port() {
     // which is what a restart right after Ctrl+C does.
     drop(server);
 
-    TcpServerBuilder::new("127.0.0.1", 8101)
+    TcpServerBuilder::new("127.0.0.1", port)
         .build()
         .await
         .expect("port should be free immediately after a graceful shutdown");
+}
+
+/// A server on a port of its own, with `request_timeout` as given.
+async fn echo_server_with_timeout<F, Fut>(
+    request_timeout: Duration,
+    handler: F,
+) -> (String, tokio::task::JoinHandle<()>)
+where
+    F: Fn(Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
+    Fut: std::future::Future<Output = Vec<u8>> + Send + 'static,
+{
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+
+    let server = TcpServerBuilder::from_listener(listener)
+        .unwrap()
+        .request_timeout(request_timeout)
+        .build()
+        .await
+        .unwrap();
+
+    let handle = tokio::spawn(async move {
+        server.run(handler).await.unwrap();
+    });
+
+    (addr, handle)
+}
+
+// The three tests below pin what the server's request timeout means. It is
+// enforced by one timer per connection rather than one per read, handler call
+// and write, so each of the three ways that could go wrong gets a test: a busy
+// connection cut off because the timer was never moved, and an idle peer or a
+// stuck handler left alone because it was moved too freely.
+
+#[tokio::test]
+async fn test_a_connection_in_use_for_longer_than_the_timeout_stays_open() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let request_timeout = Duration::from_millis(300);
+    let (addr, server_handle) =
+        echo_server_with_timeout(request_timeout, |data| async move { data }).await;
+
+    let mut client = TcpClientBuilder::new(&addr)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .await
+        .unwrap();
+
+    // Five timeouts' worth of requests, none of them slow, each arriving well
+    // inside the timeout of the one before.
+    for round in 0..15u8 {
+        let echoed = client
+            .send(vec![round])
+            .await
+            .unwrap_or_else(|e| panic!("request {round} failed on a busy connection: {e}"));
+        assert_eq!(echoed, vec![round]);
+        sleep(request_timeout / 3).await;
+    }
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_a_connection_idle_for_longer_than_the_timeout_is_closed() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let request_timeout = Duration::from_millis(200);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = Arc::new(
+        TcpServerBuilder::from_listener(listener)
+            .unwrap()
+            .request_timeout(request_timeout)
+            .build()
+            .await
+            .unwrap(),
+    );
+    let serving = server.clone();
+    let server_handle = tokio::spawn(async move { serving.run(|data| async move { data }).await });
+
+    // Two clients, alike except that one asked to have a connection that was
+    // closed under it replaced.
+    let mut client = TcpClientBuilder::new(&addr)
+        .timeout(Duration::from_secs(5))
+        .reconnect_when_idle_closed(true)
+        .build()
+        .await
+        .unwrap();
+    let mut plain = TcpClientBuilder::new(&addr)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(client.send(b"first".to_vec()).await.unwrap(), b"first".to_vec());
+    assert_eq!(plain.send(b"first".to_vec()).await.unwrap(), b"first".to_vec());
+    assert_eq!(server.active_connections(), 2);
+
+    // Silent for three timeouts: the server has to have let go of the slots.
+    sleep(request_timeout * 3).await;
+    assert_eq!(
+        server.active_connections(),
+        0,
+        "the server kept connections that had been idle past its timeout"
+    );
+
+    // The one that asked finds out before it sends, not by sending: the
+    // request goes to a connection opened for it and is answered. Failing
+    // here would leave the caller with an error that does not say whether
+    // the request ran, for a request that was never sent.
+    assert_eq!(
+        client.send(b"second".to_vec()).await.unwrap(),
+        b"second".to_vec(),
+        "a request after an idle spell was sent into the closed connection"
+    );
+    assert_eq!(server.active_connections(), 1);
+
+    // The one that did not is told its connection is gone, and is not moved
+    // to another behind its back. A caller that greets the server on every
+    // connection it opens — the replication link does — depends on that:
+    // moved silently, it would be sending on a connection it never greeted.
+    assert!(
+        plain.send(b"second".to_vec()).await.is_err(),
+        "a client that did not ask for it was given a new connection without being told"
+    );
+    assert!(!plain.is_connected());
+    assert_eq!(server.active_connections(), 1);
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_a_handler_slower_than_the_timeout_ends_the_connection() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let request_timeout = Duration::from_millis(200);
+    let (addr, server_handle) = echo_server_with_timeout(request_timeout, |data| async move {
+        sleep(Duration::from_secs(3)).await;
+        data
+    })
+    .await;
+
+    let mut client = TcpClientBuilder::new(&addr)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let result = client.send(b"slow".to_vec()).await;
+    let took = started.elapsed();
+
+    // The client would wait ten seconds and the handler three; only the
+    // server's own timeout ends this in a fraction of one.
+    assert!(result.is_err(), "a request whose handler timed out was answered");
+    assert!(took >= request_timeout, "the handler was cut off early, after {took:?}");
+    assert!(took < Duration::from_secs(2), "the handler was not cut off, {took:?} elapsed");
+
+    server_handle.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_servers_sharing_a_port_both_take_connections() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // Find a free port, then let go of it: both servers have to bind it
+    // themselves for the option to be what is under test.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+
+    let mut handles = Vec::new();
+    let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut servers = Vec::new();
+
+    for index in 0..2u8 {
+        let server = Arc::new(
+            TcpServerBuilder::new("127.0.0.1", port)
+                .reuse_port(true)
+                .build()
+                .await
+                .unwrap_or_else(|e| panic!("server {index} could not share the port: {e}")),
+        );
+        servers.push(server.clone());
+
+        let served = served.clone();
+        handles.push(tokio::spawn(async move {
+            server
+                .run(move |_data| {
+                    let served = served.clone();
+                    async move {
+                        served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        vec![index]
+                    }
+                })
+                .await
+        }));
+    }
+
+    // Enough connections that the kernel's dealing reaches both.
+    let mut answered_by = [0u32; 2];
+    for _ in 0..64 {
+        let mut client = TcpClientBuilder::new(&format!("127.0.0.1:{port}"))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .await
+            .unwrap();
+        let response = client.send(b"who".to_vec()).await.unwrap();
+        answered_by[response[0] as usize] += 1;
+    }
+
+    assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 64);
+    assert!(
+        answered_by[0] > 0 && answered_by[1] > 0,
+        "one server took every connection: {answered_by:?}"
+    );
+
+    // Without the option the port is not shared, which is the default.
+    assert!(
+        TcpServerBuilder::new("127.0.0.1", port).build().await.is_err(),
+        "a server that did not ask to share the port was given it"
+    );
+
+    for handle in handles {
+        handle.abort();
+    }
 }

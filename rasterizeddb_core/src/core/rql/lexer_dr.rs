@@ -16,7 +16,10 @@ pub struct DeleteRow {
     pub query_row_fetch: RowFetch,
 }
 
-fn extract_where_columns(where_clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> std::collections::HashSet<String> {
+fn extract_where_columns(
+    where_clause: &str,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> std::collections::HashSet<String> {
     let mut where_columns = std::collections::HashSet::new();
     if where_clause.is_empty() {
         return where_columns;
@@ -119,6 +122,29 @@ fn parse_delete_row(
         // clause nobody wrote.
         let where_idx = crate::core::rql::join::find_keyword(sql, "WHERE", 0);
         let _ = &sql_upper;
+        // Every qualifier in the condition names the target or its alias.
+        // One naming no relation was dropped, so `DELETE FROM t WHERE
+        // nosuch.id = 1` deleted t's row 1 (PostgreSQL: 42P01).
+        if let Some(idx) = where_idx {
+            let head: Vec<&str> = sql[..idx].split_whitespace().collect();
+            let mut allowed = crate::core::sql_scan::relation_qualifiers(table_name, None);
+            match head.as_slice() {
+                [_, _, _] => {}
+                [_, _, _, alias] | [_, _, _, _, alias] if head.len() == 4 || head[3].eq_ignore_ascii_case("AS") => {
+                    // Aliased, the table is known only by the alias.
+                    allowed = crate::core::sql_scan::relation_qualifiers(table_name, Some(alias));
+                }
+                _ => {
+                    rejection.replace(format!("syntax error at or near \"{}\"", head.get(4).or(head.get(3)).unwrap_or(&"WHERE")));
+                    return None;
+                }
+            }
+            let allowed: Vec<&str> = allowed.iter().map(String::as_str).collect();
+            if let Some(q) = crate::core::sql_scan::unknown_qualifier(&sql[idx + "WHERE".len()..], &allowed) {
+                rejection.replace(crate::core::sql_scan::missing_from_entry(&q));
+                return None;
+            }
+        }
         let where_clause = if let Some(idx) = where_idx {
             let clause = sql[idx + 5..].trim();
             // Remove leading "WHERE" if present (case-insensitive)
@@ -129,7 +155,39 @@ fn parse_delete_row(
                 clause.to_string()
             }
         } else {
-            String::new()
+            // `DELETE FROM t` with no `WHERE` deletes every row, which is
+            // what PostgreSQL does with it. Only an alias may follow the
+            // table: anything else is a clause this parser did not
+            // recognise, and reading it as "no condition" would turn a
+            // misread statement into one that empties the table.
+            let rest: Vec<&str> = parts.collect();
+            let alias_only = match rest.as_slice() {
+                [] => true,
+                [alias] | [_, alias] => {
+                    (rest.len() == 1 || rest[0].eq_ignore_ascii_case("AS"))
+                        && !alias.eq_ignore_ascii_case("AS")
+                        && alias
+                            .trim_matches('"')
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || c == '_')
+                }
+                _ => false,
+            };
+            if !alias_only || table_name.is_empty() {
+                // `DELETE FROM t WHER id = 1`: a clause this does not know is
+                // a syntax error, never "no condition".
+                if let Some(word) = rest.get(if rest.first().is_some_and(|w| w.eq_ignore_ascii_case("AS")) { 2 } else { 1 }) {
+                    rejection.replace(format!("syntax error at or near \"{}\"", word));
+                }
+                return None;
+            }
+            return Some(DeleteRow {
+                table_name: table_name.to_string(),
+                where_clause: String::new(),
+                query_row_fetch: RowFetch {
+                    columns_fetching_data: SmallVec::new(),
+                },
+            });
         };
         if table_name.is_empty() || where_clause.is_empty() {
             return None;
@@ -139,16 +197,14 @@ fn parse_delete_row(
         // names, the sugar predicate forms, and the guards that stop a `NULL`
         // row satisfying a comparison — which for a `DELETE` decides whether a
         // row is destroyed.
-        let where_clause = match crate::core::tokenizer::predicate_rewrite::rewrite_where(
-            &where_clause,
-            schema,
-        ) {
-            Ok(clause) => clause,
-            Err(reason) => {
-                rejection.replace(reason);
-                return None;
-            }
-        };
+        let where_clause =
+            match crate::core::tokenizer::predicate_rewrite::rewrite_scan_where(&where_clause, schema) {
+                Ok(clause) => clause,
+                Err(reason) => {
+                    rejection.replace(reason);
+                    return None;
+                }
+            };
 
         let where_columns = extract_where_columns(&where_clause, schema);
         let schema_calc = SchemaCalculator::default();
@@ -180,29 +236,37 @@ fn parse_delete_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::rql::lexer_s1::QueryPurpose;
     use crate::core::db_type::DbType;
     use crate::core::row::schema::SchemaField;
+    use crate::core::rql::lexer_s1::QueryPurpose;
 
     fn make_schema() -> SmallVec<[SchemaField; 20]> {
         smallvec::smallvec![
             SchemaField {
                 name: "id".to_string(),
                 db_type: DbType::U64,
+                without_time_zone: false,
+                json_text: false,
                 size: 8,
                 offset: 0,
                 write_order: 0,
                 is_unique: true,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "name".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
+                json_text: false,
                 size: 12,
                 offset: 8,
                 write_order: 1,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
         ]
     }
@@ -211,7 +275,8 @@ mod tests {
     fn test_delete_row_basic() {
         let sql = r#"DELETE FROM users WHERE id = 1"#;
         let qp = QueryPurpose::DeleteRow(sql.to_string());
-        let result = delete_row_from_query_purpose(&qp, &make_schema()).expect("Should parse successfully");
+        let result =
+            delete_row_from_query_purpose(&qp, &make_schema()).expect("Should parse successfully");
         assert_eq!(result.table_name, "users");
         assert_eq!(result.where_clause, "id = 1");
     }
@@ -220,16 +285,32 @@ mod tests {
     fn test_delete_row_with_quotes() {
         let sql = r#"DELETE FROM "my_table" WHERE name = 'Alice'"#;
         let qp = QueryPurpose::DeleteRow(sql.to_string());
-        let result = delete_row_from_query_purpose(&qp, &make_schema()).expect("Should parse successfully");
+        let result =
+            delete_row_from_query_purpose(&qp, &make_schema()).expect("Should parse successfully");
         assert_eq!(result.table_name, "my_table");
         assert_eq!(result.where_clause, "name = 'Alice'");
     }
 
     #[test]
-    fn test_delete_row_missing_where_should_fail() {
-        let sql = r#"DELETE FROM users"#;
-        let qp = QueryPurpose::DeleteRow(sql.to_string());
-        assert!(delete_row_from_query_purpose(&qp, &make_schema()).is_none());
+    fn test_delete_row_without_where_deletes_everything() {
+        for sql in ["DELETE FROM users", "DELETE FROM users u", "DELETE FROM users AS u"] {
+            let qp = QueryPurpose::DeleteRow(sql.to_string());
+            let result = delete_row_from_query_purpose(&qp, &make_schema())
+                .unwrap_or_else(|| panic!("{sql} should parse"));
+            assert_eq!(result.table_name, "users");
+            assert_eq!(result.where_clause, "");
+        }
+        // Anything after the table that is not an alias is a clause nobody
+        // parsed, and must not be read as "no condition".
+        for sql in [
+            "DELETE FROM users WHERE",
+            "DELETE FROM users u v",
+            "DELETE FROM users AS",
+            "DELETE FROM users id = 1",
+        ] {
+            let qp = QueryPurpose::DeleteRow(sql.to_string());
+            assert!(delete_row_from_query_purpose(&qp, &make_schema()).is_none(), "{sql}");
+        }
     }
 
     #[test]

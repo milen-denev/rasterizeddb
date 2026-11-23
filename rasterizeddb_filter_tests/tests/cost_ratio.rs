@@ -91,14 +91,14 @@ async fn bit_test_versus_row_fetch() {
         // takes the skip path.
         let on_name = format!("cost_on_{}", width);
         let filtered = build(dir.path(), &on_name, width).await;
-        assert!(filtered.filters.is_some(), "the filtered table must have filters");
+        assert!(filtered.filters().unwrap().is_some(), "the filtered table must have filters");
         let masked = scan_ns_per_row(&filtered).await;
 
         // Unfiltered: same rows, same query, every record decoded and fetched.
         let off_name = format!("cost_off_{}", width);
         run_sql(&format!("SET FILTER indexed = off FOR TABLE {}", off_name));
         let plain = build(dir.path(), &off_name, width).await;
-        assert!(plain.filters.is_none(), "the unfiltered table must have no filters");
+        assert!(plain.filters().unwrap().is_none(), "the unfiltered table must have no filters");
         let visited = scan_ns_per_row(&plain).await;
 
         println!(

@@ -1,4 +1,8 @@
-use std::{borrow::Cow, cell::UnsafeCell, sync::atomic::{AtomicBool, AtomicU64, AtomicU8}};
+use std::{
+    borrow::Cow,
+    cell::UnsafeCell,
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64},
+};
 
 use branches::{likely, unlikely};
 use cacheguard::CacheGuard;
@@ -8,22 +12,29 @@ use std::sync::Arc as StdArc;
 
 use crate::core::mvcc::Visibility;
 
-use futures::{future::join_all};
+use futures::future::join_all;
 use smallvec::SmallVec;
 
-use tokio::{
-    sync::Semaphore,
-    task,
-};
+use tokio::{sync::Semaphore, task};
 
-use super::{
-    transformer::{ColumnTransformer, Next, TransformerPlan, TransformerProcessor},
-};
+use super::column_scan::{self, CellLayout, ColumnChunk};
+use super::prefilter::{self, BatchPrefilter};
+use super::transformer::{ColumnTransformer, Next, TransformerPlan, TransformerProcessor};
 
 use crate::{
-    cache::query_cache, core::{
-        processor::transformer::RowBlocks, row::{error::EvalError, row::{Row, RowFetch}, row_pointer::{RowPointer, RowPointerIterator}, schema::SchemaField}, storage_providers::traits::StorageIO, tokenizer::query_parser::QueryParser
-    }, memory_pool::MemoryBlock
+    cache::query_cache,
+    core::{
+        processor::transformer::RowBlocks,
+        row::{
+            error::EvalError,
+            row::{Row, RowFetch},
+            row_pointer::{RowPointer, RowPointerIterator},
+            schema::SchemaField,
+        },
+        storage_providers::traits::StorageIO,
+        tokenizer::query_parser::QueryParser,
+    },
+    memory_pool::MemoryBlock,
 };
 
 use crate::core::tokenizer::query_tokenizer::Token;
@@ -40,13 +51,496 @@ pub struct RowPointerWithOffset {
     pub pointer: RowPointer,
 }
 
+/// One resolved `ORDER BY` key.
+pub struct SortKey {
+    /// The column being ordered by.
+    schema_id: usize,
+    descending: bool,
+    /// The `__null_x` companion, when the column is nullable.
+    ///
+    /// A nullable column's stored bytes cannot say whether it is `NULL` — a
+    /// `NULL` timestamp is the type's zeroes, which byte-sorts as 1970 rather
+    /// than where PostgreSQL puts it. The companion is what makes the scan able
+    /// to sort the column at all.
+    null_flag: Option<usize>,
+}
+
+/// An `ORDER BY … LIMIT k` reduced to what a scan worker needs to enforce it.
+pub struct TopN {
+    keys: Vec<SortKey>,
+    /// How many rows each worker keeps.
+    cap: usize,
+}
+
+/// A resolved key list made ready for one sort or selection.
+///
+/// The comparison runs O(n log n) times, and resolving a key from scratch costs
+/// a linear search of the row's columns per side and of the schema for the
+/// type. Here the type is looked up once, and each column's *position* is read
+/// off one sample row and then checked on every use: if the row at hand holds
+/// that column at that position it is used, otherwise the row is searched as
+/// before. So a row whose layout differs from the sample is still compared
+/// correctly, only more slowly — rows of one scan share a layout in practice,
+/// since they come from one fetch list.
+///
+/// The ordering is exactly that of the per-call resolution it replaced: NULL
+/// (by the `__null_` companion) sorts above every value, a column the row does
+/// not carry sorts below one it does, and the stored bytes are compared by the
+/// schema's type, falling back to the left column's own type when the schema
+/// does not name the column. `prepared_sort_agrees_with_per_call_resolution`
+/// pins that.
+pub(crate) struct PreparedSort {
+    keys: SmallVec<[PreparedKey; 4]>,
+}
+
+struct PreparedKey {
+    schema_id: usize,
+    descending: bool,
+    null_flag: Option<usize>,
+    /// The schema's declared type, or `None` to use the column's own.
+    db_type: Option<crate::core::db_type::DbType>,
+    /// Where the sample row held the key column and its companion.
+    pos: usize,
+    flag_pos: usize,
+}
+
+impl PreparedSort {
+    pub(crate) fn new(keys: &[SortKey], schema: &[SchemaField], sample: Option<&Row>) -> Self {
+        let position = |schema_id: usize| {
+            sample
+                .and_then(|row| {
+                    row.columns
+                        .iter()
+                        .position(|c| c.schema_id as usize == schema_id)
+                })
+                .unwrap_or(usize::MAX)
+        };
+        PreparedSort {
+            keys: keys
+                .iter()
+                .map(|key| PreparedKey {
+                    schema_id: key.schema_id,
+                    descending: key.descending,
+                    null_flag: key.null_flag,
+                    db_type: schema
+                        .iter()
+                        .find(|f| f.write_order as usize == key.schema_id)
+                        .map(|f| f.db_type.clone()),
+                    pos: position(key.schema_id),
+                    flag_pos: key.null_flag.map_or(usize::MAX, position),
+                })
+                .collect(),
+        }
+    }
+
+    /// The first column of `row` with `schema_id`, trying `hint` first.
+    #[inline(always)]
+    fn column(row: &Row, schema_id: usize, hint: usize) -> Option<&crate::core::row::row::Column> {
+        match row.columns.get(hint) {
+            Some(c) if c.schema_id as usize == schema_id => Some(c),
+            _ => row
+                .columns
+                .iter()
+                .find(|c| c.schema_id as usize == schema_id),
+        }
+    }
+
+    #[inline(always)]
+    fn is_null(row: &Row, flag: usize, hint: usize) -> bool {
+        Self::column(row, flag, hint)
+            .and_then(|c| c.data.into_slice().first().copied())
+            .is_some_and(|byte| byte != 0)
+    }
+
+    /// Orders two rows by the keys, later keys breaking earlier ties.
+    #[inline]
+    pub(crate) fn compare(&self, a: &Row, b: &Row) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        for key in self.keys.iter() {
+            let ord = match key.null_flag {
+                // A NULL sorts as larger than every value, so it lands last
+                // ascending and first descending — which is where PostgreSQL
+                // puts it, and the reversal below applies to it too. The stored
+                // bytes of a NULL are the type's zeroes and are never compared.
+                Some(flag) => match (
+                    Self::is_null(a, flag, key.flag_pos),
+                    Self::is_null(b, flag, key.flag_pos),
+                ) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => self.compare_values(a, b, key),
+                },
+                None => self.compare_values(a, b, key),
+            };
+            let ord = if key.descending { ord.reverse() } else { ord };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    }
+
+    /// [`Self::compare`] with the left row given as cells: `left(schema_id)`
+    /// is that row's cell of the column and the column's stored type, or
+    /// `None` where the cells do not hold the column. The same order, key by
+    /// key: a set NULL flag above every value, then the values as their type
+    /// orders them, a descending key reversed.
+    #[inline]
+    pub(crate) fn compare_cells<'c>(
+        &self,
+        left: impl Fn(usize) -> Option<(&'c [u8], &'c crate::core::db_type::DbType)>,
+        b: &Row,
+    ) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        for key in self.keys.iter() {
+            let values = || match (left(key.schema_id), Self::column(b, key.schema_id, key.pos)) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (Some((cell, stored)), Some(bc)) => compare_bytes_as_type(
+                    key.db_type.clone().unwrap_or_else(|| stored.clone()),
+                    cell,
+                    bc.data.into_slice(),
+                ),
+            };
+            let ord = match key.null_flag {
+                Some(flag) => match (
+                    left(flag).and_then(|(cell, _)| cell.first().copied()).is_some_and(|byte| byte != 0),
+                    Self::is_null(b, flag, key.flag_pos),
+                ) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => values(),
+                },
+                None => values(),
+            };
+            let ord = if key.descending { ord.reverse() } else { ord };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    }
+
+    #[inline(always)]
+    fn compare_values(&self, a: &Row, b: &Row, key: &PreparedKey) -> std::cmp::Ordering {
+        match (
+            Self::column(a, key.schema_id, key.pos),
+            Self::column(b, key.schema_id, key.pos),
+        ) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (Some(ac), Some(bc)) => compare_bytes_as_type(
+                key.db_type.clone().unwrap_or_else(|| ac.column_type.clone()),
+                ac.data.into_slice(),
+                bc.data.into_slice(),
+            ),
+        }
+    }
+}
+
+impl PreparedSort {
+    /// The order as one normalised integer per row, when it is a single key of
+    /// a fixed-width integer or timestamp type: the key's value mapped so that
+    /// unsigned comparison of the integer is the column's order, with NULL above
+    /// every value and a descending key bit-inverted.
+    ///
+    /// Sorting `(key, row index)` pairs is then a plain integer sort with no
+    /// row access in the comparator — measured 570 → 345 ms for ordering a
+    /// million rows by a BIGINT, permutation included (`result_pipeline_bench
+    /// sortkeys`; LSD radix measured the same as pdqsort, so pdqsort it is).
+    /// Ties fall back to the row index, which is the answer the stable
+    /// comparison sort gives.
+    ///
+    /// `None` whenever the shortcut could disagree with `compare`: more than
+    /// one key, a type outside the list, or any row whose key column is missing
+    /// or too short (`compare` orders those by other rules).
+    fn integer_keys(&self, rows: &[Row]) -> Option<Vec<u128>> {
+        use crate::core::db_type::DbType;
+        let [key] = self.keys.as_slice() else {
+            return None;
+        };
+        if rows.len() > u32::MAX as usize {
+            return None;
+        }
+        let mut out = Vec::with_capacity(rows.len());
+        for (i, row) in rows.iter().enumerate() {
+            let column = Self::column(row, key.schema_id, key.pos)?;
+            let ty = key.db_type.as_ref().unwrap_or(&column.column_type);
+            let b = column.data.into_slice();
+            // `compare_bytes_as_type` reads the first N bytes of each side;
+            // a shorter value takes a different rule, so it is a fallback.
+            let value: u64 = match ty {
+                DbType::I8 => (i8::from_le_bytes(b.get(..1)?.try_into().ok()?) as i64 as u64) ^ (1 << 63),
+                DbType::I16 => (i16::from_le_bytes(b.get(..2)?.try_into().ok()?) as i64 as u64) ^ (1 << 63),
+                DbType::I32 => (i32::from_le_bytes(b.get(..4)?.try_into().ok()?) as i64 as u64) ^ (1 << 63),
+                DbType::I64 | DbType::DATETIME => {
+                    (i64::from_le_bytes(b.get(..8)?.try_into().ok()?) as u64) ^ (1 << 63)
+                }
+                DbType::U8 => b.get(..1)?[0] as u64,
+                DbType::U16 => u16::from_le_bytes(b.get(..2)?.try_into().ok()?) as u64,
+                DbType::U32 => u32::from_le_bytes(b.get(..4)?.try_into().ok()?) as u64,
+                DbType::U64 => u64::from_le_bytes(b.get(..8)?.try_into().ok()?),
+                _ => return None,
+            };
+            let null = key
+                .null_flag
+                .is_some_and(|flag| Self::is_null(row, flag, key.flag_pos));
+            // NULL is greater than every value; the stored bytes of a NULL are
+            // never compared, so they are zeroed out of the key. 65 bits: the
+            // NULL bit above the value.
+            const KEY_BITS: u128 = (1 << 65) - 1;
+            let normalised: u128 = if null { 1 << 64 } else { value as u128 };
+            let normalised = if key.descending { !normalised & KEY_BITS } else { normalised };
+            // The row index rides in the low 32 bits, so one integer compare
+            // orders by key and then by position, and an element is 16 bytes
+            // rather than the 32 a `(u128, u32)` pair pads to.
+            out.push((normalised << 32) | i as u128);
+        }
+        Some(out)
+    }
+}
+
+/// The row order for packed `key << 32 | index` values: the first `cap` of
+/// them when a cap is given, otherwise all. The index breaks ties, so the
+/// order is total and equal to a stable sort by key.
+fn order_from_integer_keys(mut pairs: Vec<u128>, cap: Option<usize>) -> Vec<u32> {
+    if let Some(cap) = cap {
+        if cap == 0 {
+            return Vec::new();
+        }
+        if cap < pairs.len() {
+            pairs.select_nth_unstable(cap - 1);
+            pairs.truncate(cap);
+        }
+    }
+    pairs.sort_unstable();
+    pairs.into_iter().map(|packed| packed as u32).collect()
+}
+
+/// Puts `rows` in the order `order` lists — `order[k]` is the index of the row
+/// that belongs at `k` — moving each row at most once, by following cycles.
+/// `order` must be a permutation of `0..rows.len()`.
+fn apply_row_order(rows: &mut [Row], order: &mut [u32]) {
+    for start in 0..order.len() {
+        if order[start] as usize == start {
+            continue;
+        }
+        let mut cur = start;
+        loop {
+            let next = order[cur] as usize;
+            order[cur] = cur as u32;
+            if next == start {
+                break;
+            }
+            rows.swap(cur, next);
+            cur = next;
+        }
+    }
+}
+
+/// A stable sort of `rows` that moves each row at most once.
+///
+/// A `Row` is ~1.5 KB, and `sort_by` on a `Vec<Row>` moves rows O(n log n)
+/// times and allocates scratch for half of them — 750 MB for a million rows.
+/// Sorting `u32` indices instead and then applying the permutation in place by
+/// following its cycles moves each row at most once and needs 4 bytes of
+/// scratch per row. Stable on the indices is stable on the rows, so the order —
+/// ties included — is exactly what `rows.sort_by(compare)` produces.
+fn sort_rows_indirect(
+    rows: &mut [Row],
+    mut compare: impl FnMut(&Row, &Row) -> std::cmp::Ordering,
+) {
+    if rows.len() < 2 || rows.len() > u32::MAX as usize {
+        rows.sort_by(compare);
+        return;
+    }
+    let mut order: Vec<u32> = (0..rows.len() as u32).collect();
+    order.sort_by(|&i, &j| compare(&rows[i as usize], &rows[j as usize]));
+    // `order[k]` is the index of the row that belongs at `k`. Each cycle is
+    // walked once; a slot is marked done by pointing it at itself.
+    for start in 0..order.len() {
+        if order[start] as usize == start {
+            continue;
+        }
+        let mut cur = start;
+        loop {
+            let next = order[cur] as usize;
+            order[cur] = cur as u32;
+            if next == start {
+                break;
+            }
+            rows.swap(cur, next);
+            cur = next;
+        }
+    }
+}
+
+/// The `k` smallest of `rows` by `compare`, in order — what
+/// `select_nth_unstable_by(k - 1)`, `truncate(k)`, `sort_by` produce — moving
+/// only the `k` survivors rather than partitioning ~1.5 KB rows. Which of
+/// several rows tied at the boundary survives is unspecified, as it is for the
+/// selection this replaces. `k` must be in `1..rows.len()`.
+fn select_rows_indirect(
+    rows: &mut Vec<Row>,
+    k: usize,
+    mut compare: impl FnMut(&Row, &Row) -> std::cmp::Ordering,
+) {
+    debug_assert!(k >= 1 && k < rows.len());
+    if rows.len() > u32::MAX as usize {
+        rows.select_nth_unstable_by(k - 1, &mut compare);
+        rows.truncate(k);
+        rows.sort_by(compare);
+        return;
+    }
+    let mut order: Vec<u32> = (0..rows.len() as u32).collect();
+    order.select_nth_unstable_by(k - 1, |&i, &j| {
+        compare(&rows[i as usize], &rows[j as usize])
+    });
+    order.truncate(k);
+    order.sort_by(|&i, &j| compare(&rows[i as usize], &rows[j as usize]));
+    let mut kept: Vec<Row> = Vec::with_capacity(k);
+    for &i in &order {
+        kept.push(std::mem::take(&mut rows[i as usize]));
+    }
+    *rows = kept;
+}
+
+/// Rows above which an `ORDER BY` sort leaves the async worker; see
+/// [`ConcurrentProcessor::sort_rows_off_the_runtime`]. Below it the sort is
+/// shorter than the hand-off is worth.
+pub(crate) const SORT_OFF_RUNTIME_ROWS: usize = 20_000;
+
+/// Turns the per-batch yield and the off-worker sort off, so the latency
+/// benchmark can measure what they buy. Test builds only.
+#[cfg(test)]
+pub(crate) static LATENCY_GUARDS_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[inline(always)]
+pub(crate) fn latency_guards_on() -> bool {
+    #[cfg(test)]
+    {
+        !LATENCY_GUARDS_OFF.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+/// The first failure a scan's workers met: its code, shared lock-free
+/// across them as before, and for a WHERE expression that could not be
+/// evaluated the evaluator's own message. That one code stands for every
+/// evaluator error the other codes do not name, so without the message an
+/// invalid cast reached the client as "an expression in the WHERE clause
+/// could not be evaluated" with SQLSTATE XX000, where PostgreSQL says
+/// `invalid input syntax for type integer: "abc"` (22P02).
+#[derive(Default)]
+pub struct ScanFailure {
+    code: AtomicU8,
+    detail: parking_lot::Mutex<Option<String>>,
+}
+
+impl ScanFailure {
+    /// Records `e` unless a failure is already recorded. The worker that
+    /// wins keeps the message its own evaluation left on this thread.
+    pub fn record(&self, e: EvalError) {
+        let won = self
+            .code
+            .compare_exchange(0, e.to_code(), std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
+            .is_ok();
+        if won && e == EvalError::ExpressionFailed {
+            *self.detail.lock() = crate::core::row::error::take_expression_failure();
+        }
+    }
+
+    /// The recorded failure as the statement's error, if any.
+    fn outcome(&self) -> Option<std::io::Error> {
+        let e = EvalError::from_code(self.code.load(std::sync::atomic::Ordering::Acquire))?;
+        if e == EvalError::ExpressionFailed {
+            if let Some(detail) = self.detail.lock().take() {
+                return Some(std::io::Error::other(detail));
+            }
+        }
+        Some(e.into())
+    }
+}
+
 pub struct ConcurrentProcessor;
+
+/// A scan's workers: the spawned ones to join, and the outcome of the one
+/// that ran in the statement's own task, if it ran there.
+struct ScanWorkers {
+    spawned: Vec<tokio::task::JoinHandle<()>>,
+    inline: Option<std::result::Result<(), String>>,
+}
+
+impl ScanWorkers {
+    /// Every worker's outcome, a panic as its message.
+    async fn join(self) -> Vec<std::result::Result<(), String>> {
+        let mut out: Vec<std::result::Result<(), String>> = join_all(self.spawned)
+            .await
+            .into_iter()
+            .map(|r| r.map_err(|e| e.to_string()))
+            .collect();
+        out.extend(self.inline);
+        out
+    }
+}
+
+/// What a caught panic said, as a panicked task's `JoinError` says it.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    let said = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic with no message".to_string());
+    format!("task panicked with message {said:?}")
+}
+
+/// The fewest index candidates a scan worker is given. Below this the
+/// cost of another worker outweighs the fetches it would take over.
+const SPARSE_MIN_BATCH: usize = 512;
+
+/// The fewest rows a scan expects to read for the batch prefilter to be built.
+///
+/// The prefilter is an optimisation and nothing more: rows it keeps are still
+/// fetched and evaluated in full, so a scan without one answers the same. It
+/// earns its keep by deciding thousands of rows from one read of the
+/// predicate's columns. Over the handful an index hands back it is an extra
+/// read of columns the fetch reads again a moment later, plus the cost of
+/// planning it: about 2% of a point lookup, whose one candidate nearly always
+/// passes.
+const PREFILTER_MIN_ROWS: u64 = 16;
+
+/// The fewest rows in a batch after which a scan worker yields to the
+/// runtime (the latency guard in `spawn_batch_tasks`). Only a scan's last
+/// batch is ever shorter, and a point lookup's only batch is one row.
+const YIELD_MIN_BATCH: usize = 512;
+
+/// Whether a batch of `batch_len` rows held its worker's thread long enough
+/// to be worth giving back: [`YIELD_MIN_BATCH`] rows, or a full batch where
+/// `--batch-size` is set below that (so a scan of full batches always
+/// yields, whatever the size).
+#[inline(always)]
+fn long_enough_to_yield(batch_len: usize) -> bool {
+    batch_len >= YIELD_MIN_BATCH.min(crate::batch_size().max(1))
+}
+
+/// Whether a scan expecting to read `expected` rows gets a batch prefilter.
+#[inline]
+fn worth_prefiltering(expected: u64) -> bool {
+    expected >= PREFILTER_MIN_ROWS
+}
 
 impl ConcurrentProcessor {
     pub fn new() -> Self {
         Self {}
     }
-
 
     /// Turns a finished worker fleet into a query-level error when something
     /// went wrong.
@@ -61,12 +555,11 @@ impl ConcurrentProcessor {
     /// had already matched with it — and `join_all`'s ignored `Result` meant the
     /// query then returned that truncated set as a success.
     fn check_worker_outcome(
-        join_results: Vec<std::result::Result<(), tokio::task::JoinError>>,
-        eval_error: &AtomicU8,
+        join_results: Vec<std::result::Result<(), String>>,
+        eval_error: &ScanFailure,
     ) -> std::io::Result<()> {
-        if let Some(e) = EvalError::from_code(eval_error.load(std::sync::atomic::Ordering::Acquire))
-        {
-            return Err(e.into());
+        if let Some(e) = eval_error.outcome() {
+            return Err(e);
         }
 
         for r in join_results {
@@ -107,8 +600,77 @@ impl ConcurrentProcessor {
     ) -> Option<Vec<Row>> {
         let entry = query_cache::lookup(table_name, where_query, generation?, limit)?;
 
-        let mut collected_rows = Vec::with_capacity(entry.pointers.len());
+        // The pointers this entry holds were read by the scan that built it,
+        // but they are read *again* here — every one of them is visibility
+        // tested and fetched below. Counting them keeps `rows_scanned` telling
+        // the truth about what a statement did: without this a cached
+        // `ORDER BY … LIMIT` reported reading nothing while spending most of a
+        // second reading a million rows, which is indistinguishable from the
+        // materialisation blind spot `query_stats` already documents.
+        #[cfg(feature = "query_stats")]
+        crate::core::query_stats::note_rows_scanned(entry.pointers.len() as u64);
+
+        // The same bound the scan path applies in its workers. Without it this
+        // path fetched and cloned *every* matching row and only then sorted and
+        // truncated: a `LIMIT 200` over a million-row table built a million-row
+        // `Vec<Row>` to return two hundred. Since `Row` is ~1.5 KB that is over
+        // a gigabyte, and it made the cache — which exists to make queries
+        // faster — 4.8x *slower* than rescanning: 690-747 ms against 155 ms for
+        // the identical statement with the cache off.
+        //
+        // `top_n_spec` returns `None` when there is nothing to keep rows out
+        // with (no ordering, or no cap), and then this behaves exactly as
+        // before: everything is accumulated, because everything is wanted.
+        let top_n = Self::top_n_spec(schema_arc, order_by, limit);
+
+        // Declining a hit, on purpose, when rescanning is the faster answer.
+        //
+        // This loop is **serial**: one `await` per pointer on one task. The scan
+        // path fetches the same rows across every worker at once, so a cache hit
+        // trades parallelism for not re-reading the pointer file. That is a good
+        // trade whenever the fetch is small, and a bad one for `ORDER BY … LIMIT
+        // k` over a large match set, where the ordering forbids stopping early
+        // and every matched row is fetched under either plan. Measured on a
+        // million-row table, `ORDER BY … LIMIT 200`, with the worker-side bound
+        // in place on both sides:
+        //
+        //     rescan (parallel, 12 workers)    178 ms
+        //     cache hit (serial fetch)         356 ms
+        //
+        // Only ordered queries are declined. Without an `ORDER BY` the caller
+        // stops at the cap, the fetch really is small, and this cache is doing
+        // the job it was built for.
+        //
+        // The ratio decides it rather than an absolute size: a cap that is a
+        // large fraction of the match set fetches most of it either way, and
+        // then the saved pointer read is pure profit. The floor keeps small
+        // tables — where the whole entry is a few pages and a rescan costs more
+        // than the fetch — on the fast path regardless.
+        if let Some(top) = top_n.as_ref() {
+            const RESCAN_MIN_POINTERS: usize = 20_000;
+            const RESCAN_CAP_RATIO: usize = 50;
+            if entry.pointers.len() >= RESCAN_MIN_POINTERS
+                && entry.pointers.len() / top.cap.max(1) >= RESCAN_CAP_RATIO
+            {
+                return None;
+            }
+        }
+
+        let mut collected_rows = match top_n.as_ref() {
+            // Bounded, so the allocation no longer scales with the match set.
+            // Twice the cap is the trim threshold below, so this is the high
+            // water mark rather than a guess.
+            Some(top) => Vec::with_capacity(top.cap.saturating_mul(2).min(entry.pointers.len())),
+            None => Vec::with_capacity(entry.pointers.len()),
+        };
         let mut row = Row::default();
+        // Same deferral the scan path uses: while the top-N is only choosing
+        // which rows survive, read the sort key and nothing else. This loop is
+        // serial, so the payload it skips is the dominant cost of a hit.
+        let key_fetch = top_n
+            .as_ref()
+            .map(|top| Self::top_n_key_fetch(schema_arc, top));
+        let mut collected_pairs: Vec<(Row, RowPointer)> = Vec::new();
 
         for pointer in entry.pointers.iter() {
             // A cached entry holds the pointers matching the *predicate*, not
@@ -125,8 +687,9 @@ impl ConcurrentProcessor {
                 continue;
             }
 
+            let scan_fetch = key_fetch.as_ref().unwrap_or(requested_row_fetch);
             if pointer
-                .fetch_row_reuse_async(&**io_rows, requested_row_fetch, &mut row)
+                .fetch_row_reuse_async(&**io_rows, scan_fetch, &mut row)
                 .await
                 .is_err()
             {
@@ -134,10 +697,87 @@ impl ConcurrentProcessor {
                 return None;
             }
 
-            collected_rows.push(Row::clone_row(&row));
+            if key_fetch.is_some() {
+                collected_pairs.push((Row::clone_row(&row), pointer.clone()));
+            } else {
+                collected_rows.push(Row::clone_row(&row));
+            }
+
+            // Trimmed at twice the cap rather than every row, so the O(n)
+            // selection is amortised over at least `cap` new rows — the same
+            // bargain the worker loop strikes, and `select_nth_unstable_by`
+            // partitions rather than sorts, which is all the final sort needs.
+            //
+            // That partition is unstable, so which of several *equal* rows
+            // survives the cap is not defined — matching the scan path, which
+            // has always been unstable here (see the note in
+            // `sort_rows_if_needed`). Deliberately matching it: if this path
+            // stayed stable, a query's tie order would depend on whether it hit
+            // the cache, which is invisible state that differs between a warm
+            // and a cold server. Uniform instability is the lesser evil.
+            //
+            // The hazard this leaves is real and predates all of it: paginating
+            // `LIMIT`/`OFFSET` over a non-unique sort key can skip or repeat
+            // rows between pages. The fix for that is a unique tiebreaker in the
+            // `ORDER BY`, not a stable sort in one of the two paths.
+            if let Some(top) = top_n.as_ref() {
+                if key_fetch.is_some() {
+                    if collected_pairs.len() > top.cap.saturating_mul(2) {
+                        let sort = PreparedSort::new(
+                            &top.keys,
+                            schema_arc.as_slice(),
+                            collected_pairs.first().map(|p| &p.0),
+                        );
+                        collected_pairs
+                            .select_nth_unstable_by(top.cap - 1, |a, b| sort.compare(&a.0, &b.0));
+                        collected_pairs.truncate(top.cap);
+                    }
+                } else if collected_rows.len() > top.cap.saturating_mul(2) {
+                    let sort =
+                        PreparedSort::new(&top.keys, schema_arc.as_slice(), collected_rows.first());
+                    collected_rows.select_nth_unstable_by(top.cap - 1, |a, b| sort.compare(a, b));
+                    collected_rows.truncate(top.cap);
+                }
+            }
         }
 
-        Self::sort_rows_if_needed(&mut collected_rows, schema_arc, order_by, limit);
+        // The payload, for the survivors only.
+        if let (Some(_), Some(top)) = (key_fetch.as_ref(), top_n.as_ref()) {
+            if collected_pairs.len() > top.cap {
+                let sort = PreparedSort::new(
+                    &top.keys,
+                    schema_arc.as_slice(),
+                    collected_pairs.first().map(|p| &p.0),
+                );
+                collected_pairs.select_nth_unstable_by(top.cap - 1, |a, b| sort.compare(&a.0, &b.0));
+                collected_pairs.truncate(top.cap);
+            }
+            collected_rows.reserve(collected_pairs.len());
+            for (key_row, pointer) in collected_pairs.drain(..) {
+                if pointer
+                    .fetch_row_reuse_async(&**io_rows, requested_row_fetch, &mut row)
+                    .await
+                    .is_err()
+                {
+                    query_cache::record_abandoned_hit();
+                    return None;
+                }
+                // The extent may have been handed to a writer between the two
+                // reads — see `keys_match`. Here that costs nothing to handle:
+                // abandoning the hit rescans, which is a correct answer rather
+                // than a failed statement.
+                if !Self::keys_match(&key_row, &row, &top.keys) {
+                    query_cache::record_abandoned_hit();
+                    return None;
+                }
+                collected_rows.push(Row::clone_row(&row));
+            }
+        }
+
+        // Still the authority on the answer's order and length: the trim above
+        // only guarantees the survivors are the right *set*, not that they are
+        // in order — the partition leaves them unordered by design.
+        Self::sort_rows_off_the_runtime(&mut collected_rows, schema_arc, order_by, limit);
 
         Some(collected_rows)
     }
@@ -201,9 +841,38 @@ impl ConcurrentProcessor {
     ///
     /// Built before the cache is consulted, because serving a cached answer
     /// still needs the schema to apply `ORDER BY`.
+    ///
+    /// Shared from a small per-thread cache, so a statement over a table this
+    /// thread read recently allocates nothing here. Building it clones every
+    /// field, a `String` each, and on 2026-11-21 that was a measurable part of
+    /// a native point read's allocations. A cached copy is handed out only
+    /// when it equals the fields passed in, compared in full, so a schema
+    /// that changed (an `ALTER`) or a table whose fields happen to sit at a
+    /// reused address can never be served another's.
     #[inline]
     fn schema_arc(table_schema: &[SchemaField]) -> Arc<SmallVec<[SchemaField; 20]>> {
-        Arc::new(table_schema.iter().cloned().collect())
+        const KEPT: usize = 4;
+        thread_local! {
+            static RECENT: std::cell::RefCell<SmallVec<[Arc<SmallVec<[SchemaField; 20]>>; KEPT]>> =
+                std::cell::RefCell::new(SmallVec::new());
+        }
+        RECENT.with(|recent| {
+            let mut recent = recent.borrow_mut();
+            if let Some(i) = recent.iter().position(|kept| kept.as_slice() == table_schema) {
+                let hit = Arc::clone(&recent[i]);
+                if i != 0 {
+                    let entry = recent.remove(i);
+                    recent.insert(0, entry);
+                }
+                return hit;
+            }
+            let made: Arc<SmallVec<[SchemaField; 20]>> = Arc::new(table_schema.iter().cloned().collect());
+            if recent.len() == KEPT {
+                recent.pop();
+            }
+            recent.insert(0, Arc::clone(&made));
+            made
+        })
     }
 
     #[inline]
@@ -243,13 +912,40 @@ impl ConcurrentProcessor {
         });
 
         for field in schema {
-            columns[field.write_order as usize] = (
-                Cow::Borrowed(field.name.as_str()),
-                MemoryBlock::default(),
-            );
+            columns[field.write_order as usize] =
+                (Cow::Borrowed(field.name.as_str()), MemoryBlock::default());
         }
 
         columns
+    }
+
+    /// The batch prefilter for a filtered scan, built from the same tokens as
+    /// its plan; `None` with no `WHERE`, with `--scan-prefilter false`, or when
+    /// nothing in the clause is a comparison it can decide.
+    ///
+    /// `None` too for a scan of fewer than [`PREFILTER_MIN_ROWS`] rows
+    /// (`expected`, the iterator's `expected_records`).
+    fn build_prefilter(
+        no_filter: bool,
+        tokens_arc: &Arc<SmallVec<[Token; 36]>>,
+        schema_arc: &Arc<SmallVec<[SchemaField; 20]>>,
+        query_row_fetch: &RowFetch,
+        expected: u64,
+    ) -> Option<Arc<BatchPrefilter>> {
+        if no_filter || !worth_prefiltering(expected) {
+            return None;
+        }
+        // Where it decides the whole `WHERE`, its mask is the answer: the
+        // workers count the rows it keeps, or read each one once for what the
+        // statement returns, and never fetch a row to evaluate the same
+        // comparisons again. See `BatchPrefilter::is_exact`.
+        let built = BatchPrefilter::build(tokens_arc.as_slice(), schema_arc.as_slice(), query_row_fetch)
+            .map(|built| Arc::new(built.deciding()));
+        #[cfg(test)]
+        if let Some(built) = built.as_ref() {
+            prefilter::note_built(built);
+        }
+        built
     }
 
     /// Compiles the `WHERE` clause into a transformer plan.
@@ -274,8 +970,14 @@ impl ConcurrentProcessor {
 
         {
             let processor_mut = unsafe { &mut *processor_cell.get() };
-            let mut parser = QueryParser::new(tokens_arc.as_ref(), processor_mut);
+            let mut parser = QueryParser::new(tokens_arc.as_ref(), processor_mut)
+                .with_scales(schema_arc.as_slice());
             if let Err(e) = parser.execute(&plan_columns) {
+                // A constant that is not a value of its column's type is
+                // PostgreSQL's input error, in its words (`id = 'a'`).
+                if crate::core::rql::expr::is_input_error(&e) {
+                    return Err(e);
+                }
                 return Err(format!("could not compile the query plan: {}", e));
             }
         }
@@ -302,6 +1004,9 @@ impl ConcurrentProcessor {
         shared_tuple: Arc<(RowFetch, RowFetch)>,
         schema_arc: Arc<SmallVec<[SchemaField; 20]>>,
         compiled_plan: Option<Arc<TransformerPlan>>,
+        // Drops rows the WHERE cannot match before they are fetched, a batch
+        // at a time. `None` when the clause has nothing it can decide.
+        prefilter: Option<Arc<BatchPrefilter>>,
         io_rows_outer: Arc<S>,
         // Exactly ONE of `tx_rows` / `tx_bytes` should be Some, depending on
         // whether the caller wants `Vec<Row>` (e.g. for ORDER BY or row-level
@@ -323,10 +1028,51 @@ impl ConcurrentProcessor {
         // A WHERE expression that is undefined for some row must fail the whole
         // query; letting workers skip the row would return a short result set
         // that is indistinguishable from a complete one.
-        eval_error: Arc<CacheGuard<AtomicU8>>,
+        eval_error: Arc<CacheGuard<ScanFailure>>,
         // Which row versions the workers may emit.
         visibility: Visibility,
-    ) -> Vec<tokio::task::JoinHandle<()>> {
+        // Why this statement should stop, if it should.
+        //
+        // Passed in rather than read from the task-local: a task-local does not
+        // cross `task::spawn`, and the workers are where the per-row work
+        // actually happens. Checking only in the dispatch loop below was not
+        // enough — dispatch hands out every batch long before the workers have
+        // finished them, so the check stopped running while the scan was still
+        // going.
+        cancel: Option<StdArc<crate::core::cancel::StatementCancel>>,
+        // `ORDER BY … LIMIT k`: each worker keeps only its own best `k` rows.
+        //
+        // A worker's discarded row cannot be in the global best `k` — it lost
+        // to `k` rows this same worker is still holding — so the union of the
+        // workers' survivors always contains the true answer, and the final
+        // sort picks it out of that. Without this the scan accumulated every
+        // matched row before sorting, which is how returning three rows from a
+        // 940k-row table cost gigabytes.
+        top_n: Option<Arc<TopN>>,
+        // `SELECT COUNT(*)`: the answer is how many rows matched, so no row is
+        // built, fetched or kept — the workers add to this instead.
+        //
+        // Only ever set for a plan whose every output is a bare `COUNT` (see
+        // `aggregate::is_row_count_only`). Anything reading a column value,
+        // grouping, or filtering per aggregate has to see the rows and takes
+        // the ordinary path.
+        //
+        // Counted where a row is *emitted*, never where a pointer is
+        // dispatched: the two differ by every row the predicate rejected and
+        // every version this snapshot cannot see. `background_worker_lease` is
+        // eight live rows in tens of thousands of slots, so counting slots
+        // would be wrong by three orders of magnitude on a table someone reads
+        // hourly.
+        count_only: Option<Arc<CacheGuard<AtomicU64>>>,
+        // A scan for cells, not rows (see `column_scan`): where a row would be
+        // fetched to be emitted, the worker notes where it starts instead, and
+        // reads the noted rows' cells at the end of each batch.
+        cells: Option<column_scan::CellSink>,
+        // Returned with the handles, not instead of them: the workers are
+        // already running and must be joined before the error is reported.
+        // `Some` means a pointer read failed and the scan stopped short, so the
+        // rows the workers produced are a prefix and must not be returned.
+    ) -> (ScanWorkers, Option<crate::core::row::error::RowError>) {
         // As many workers as there is work to hand them, never more.
         //
         // This used to spawn `max_permits_threads()` — 16 by default — for
@@ -344,19 +1090,74 @@ impl ConcurrentProcessor {
         //
         // Large scans are unaffected: once there are at least as many batches
         // as threads this is exactly what it was.
-        let batches = iterator
-            .total_records()
-            .div_ceil(crate::batch_size().max(1) as u64)
-            .max(1);
-        let n_workers = crate::max_permits_threads().min(batches as usize).max(1);
+        //
+        // A slot list from an index is cut finer. Its every pointer is a row
+        // to fetch rather than a bit to test, so a few thousand of them are
+        // milliseconds of work, and at `batch_size()` per batch all of it fell
+        // to one worker: an index answer of 5,000 rows ran slower than the
+        // filter's scan of the whole table, which spread across every worker.
+        // Small answers still get one worker; a point lookup is one batch.
+        let threads = crate::max_permits_threads().max(1);
+        let expected = iterator.expected_records();
+        let per_batch = if iterator.has_sparse_candidates() {
+            // Not `clamp`: it panics when the floor is above the ceiling, which
+            // `--batch-size` below the floor makes it.
+            let ceiling = crate::batch_size().max(1);
+            let per = (expected.div_ceil(threads as u64) as usize)
+                .max(SPARSE_MIN_BATCH)
+                .min(ceiling);
+            iterator.set_batch_limit(per);
+            per
+        } else {
+            crate::batch_size().max(1)
+        };
+        let batches = expected.div_ceil(per_batch as u64).max(1);
+        let n_workers = threads.min(batches as usize).max(1);
 
         // Bounded MPMC channel for batch dispatch. Capacity = n_workers gives
         // natural backpressure: the iterator stops reading ahead when every
         // worker has a batch in-hand.
-        let (work_tx, work_rx) =
-            kanal::bounded_async::<Vec<RowPointer>>(n_workers);
+        let (work_tx, work_rx) = kanal::bounded_async::<Vec<RowPointer>>(n_workers);
 
-        let mut worker_handles = Vec::with_capacity(n_workers);
+        // Deferring the payload only makes sense when rows are being produced
+        // and something is throwing most of them away. Bytes mode never sorts,
+        // and a bare count reads no columns at all, so neither qualifies.
+        let deferred_payload: Option<Arc<RowFetch>> = match top_n.as_ref() {
+            Some(top) if tx_rows.is_some() && tx_bytes.is_none() && count_only.is_none() => {
+                Some(Arc::new(Self::top_n_key_fetch(&schema_arc, top)))
+            }
+            _ => None,
+        };
+        // The keys such a scan fetches, as cells: a batch's are read together
+        // and a row is fetched only if its keys could displace one the worker
+        // holds (see the batch's end, below). With each column's stored type,
+        // which a comparison falls back to.
+        let top_keys: Option<StdArc<(CellLayout, Vec<crate::core::db_type::DbType>)>> = deferred_payload
+            .as_ref()
+            .filter(|_| column_scan::top_cells())
+            .and_then(|fetch| {
+                CellLayout::of(fetch).map(|layout| {
+                    StdArc::new((layout, fetch.columns_fetching_data.iter().map(|c| c.column_type.clone()).collect()))
+                })
+            });
+
+        // A scan of one batch runs its worker here, in the statement's own task,
+        // polled together with the dispatch loop below rather than spawned.
+        //
+        // That is every point read and every small scan, and for them the
+        // spawn was a measurable share of the statement: the task's
+        // allocation, the copy of its future into it, a wake on another
+        // thread and the join back. Joining in place is deadlock-free for the
+        // same reason the spawned worker was: the two futures share the task,
+        // the work channel holds a batch, and every output channel is
+        // unbounded, so neither side can wait on the other forever.
+        //
+        // A panic is caught at the join and reported exactly as a panicked
+        // task was, as a worker that terminated abnormally, not unwound
+        // through the connection.
+        let run_inline = batches == 1;
+        let mut inline_worker = None;
+        let mut worker_handles = Vec::with_capacity(if run_inline { 0 } else { n_workers });
 
         for _ in 0..n_workers {
             let work_rx = work_rx.clone();
@@ -367,11 +1168,22 @@ impl ConcurrentProcessor {
             let tx_rp_clone = tx_rp.as_ref().map(|s| s.clone());
             let schema_ref = Arc::clone(&schema_arc);
             let compiled_plan_ref = compiled_plan.as_ref().map(Arc::clone);
+            let prefilter_ref = prefilter.as_ref().map(Arc::clone);
             let io_rows_batch = Arc::clone(&io_rows_outer);
             let limit_counter_ref = Arc::clone(&limit_counter);
             let stop_ref = Arc::clone(&stop_processing);
             let reading_time_ref = Arc::clone(&reading_time_total);
             let eval_error_ref = Arc::clone(&eval_error);
+            let top_n_ref = top_n.as_ref().map(Arc::clone);
+            let deferred_ref = deferred_payload.as_ref().map(Arc::clone);
+            let count_only_ref = count_only.as_ref().map(Arc::clone);
+            let cells_ref = cells.clone();
+            let top_keys_ref = top_keys.clone();
+            // Kept per worker and added once on exit. The shared counter is one
+            // cache line every worker would otherwise write to per row, which is
+            // the contention the `rows_scanned` counter is batched to avoid.
+            let mut counted: u64 = 0;
+            let cancel_ref = cancel.as_ref().map(StdArc::clone);
             let limit_opt = limit;
             let visibility_ref = visibility.clone();
             // Sampled once per worker rather than per row: it is a bound, not a
@@ -379,21 +1191,16 @@ impl ConcurrentProcessor {
             // scan stays consistent with itself either way.
             let horizon_ref = crate::core::vacuum::VersionHorizon::for_visibility(&visibility);
 
-            let h = task::spawn(async move {
+            let worker = crate::core::statement_clock::inherit(async move {
                 let io_rows_ref: &S = &*io_rows_batch;
 
                 // Worker-local Buffer; allocated ONCE and reused across every
                 // batch this worker processes. Same for the processor/parser
                 // and the WHERE-evaluation plan (built once per worker on its
-                // first batch).
-                let mut buffer: Buffer<'_> = Buffer {
-                    hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-                    row: Row::default(),
-                    transformers: SmallVec::new(),
-                    intermediate_results: SmallVec::new(),
-                    bool_buffer: SmallVec::new(),
-                    write_order_to_col: SmallVec::new(),
-                };
+                // first batch). Boxed: inline it is ~11 KB of the task's
+                // future, which `spawn` copies whole at each layer it moves
+                // through before the first poll.
+                let mut buffer: Box<Buffer<'_>> = Buffer::boxed(Row::default());
 
                 let processor_cell = UnsafeCell::new(TransformerProcessor::new(
                     &mut buffer.transformers,
@@ -410,6 +1217,19 @@ impl ConcurrentProcessor {
                 // Row layout for fetched WHERE columns is stable within a query.
                 let mut row_layout_built = false;
 
+                let mut prefilter_scratch = prefilter::Scratch::default();
+                let mut gather = cells_ref.as_ref().map(|sink| column_scan::Gather::new(&sink.layout));
+                // A top-N scan's key cells of the batch in hand, and the rows
+                // they are of.
+                let mut top_cells = top_keys_ref.as_ref().map(|keys| column_scan::Gather::new(&keys.0));
+                let mut top_noted: Vec<RowPointer> = Vec::new();
+                let mut top_turned_away = 0u64;
+                // The mask is the `WHERE`'s answer, not only a superset of it.
+                let mask_decides = prefilter_ref.as_deref().is_some_and(BatchPrefilter::decides);
+                // And nothing is emitted or cached, so the mask is all this
+                // scan needs of a batch.
+                let count_from_mask = mask_decides && count_only_ref.is_some() && tx_rp_clone.is_none();
+
                 // Per-worker result accumulators. Sent ONCE at the end of
                 // this worker's lifetime to avoid per-batch channel sends
                 // (each kanal send takes a parking_lot mutex). Exactly one
@@ -418,8 +1238,26 @@ impl ConcurrentProcessor {
                 let mut acc_rows: Vec<Row> = Vec::new();
                 let mut acc_bytes: Vec<u8> = Vec::new();
                 let mut acc_ptrs: Vec<RowPointer> = Vec::new();
+                // Key-only rows plus the pointer to read the payload back from,
+                // used in place of `acc_rows` while a top-N is deferring it.
+                let mut acc_pairs: Vec<(Row, RowPointer)> = Vec::new();
+                // The top-N's comparator, and whether `acc_pairs` has been
+                // trimmed yet — see `keep_for_top_n`.
+                let mut top_sort: Option<PreparedSort> = None;
+                let mut top_bounded = false;
 
                 while let Ok(pointers) = work_rx.recv().await {
+                    let batch_len = pointers.len();
+                    // Asked before the batch rather than after: the point is not
+                    // to finish this batch faster but to stop starting new ones.
+                    // The error is recorded before the stop flag, so the
+                    // statement fails through `check_worker_outcome` rather than
+                    // returning the rows it happened to reach.
+                    if let Some(reason) = cancel_ref.as_ref().and_then(|c| c.tripped()) {
+                        eval_error_ref.record(reason.eval_error());
+                        stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
                     let batch_read_start = std::time::Instant::now();
 
                     if no_filter {
@@ -477,44 +1315,62 @@ impl ConcurrentProcessor {
 
                             if unlikely(enforce_limit_early) {
                                 if let Some(limit_val) = limit_opt {
-                                    if limit_counter_ref
-                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    if limit_counter_ref.load(std::sync::atomic::Ordering::Relaxed)
                                         >= limit_val
                                     {
-                                        stop_ref.store(
-                                            true,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
+                                        stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
                                         break;
                                     }
                                 }
                             }
 
                             let (_, requested_row_fetch) = &*tuple_clone;
+                            let scan_fetch = deferred_ref.as_deref().unwrap_or(requested_row_fetch);
 
-                            if unlikely(pointer
-                                .fetch_row_reuse_async(
-                                    io_rows_ref,
-                                    requested_row_fetch,
-                                    &mut buffer.row,
-                                )
-                                .await
-                                .is_err())
-                            {
+                            // Nothing reads a column, so nothing is read. With
+                            // no predicate this branch is the whole query, and
+                            // skipping the fetch is what turns `COUNT(*)` from
+                            // a full table read into a pointer walk.
+                            if count_only_ref.is_some() {
+                                counted += 1;
+                                continue;
+                            }
+
+                            // A top-N scan decides at the batch's end, on
+                            // its keys' cells, whether this row is fetched.
+                            if let Some(keys) = top_cells.as_mut() {
+                                if likely(pointer.check_column_range().is_ok()) {
+                                    keys.note(pointer.position, pointer.length as u64);
+                                    top_noted.push(pointer.clone());
+                                }
+                                continue;
+                            }
+
+                            // A scan for cells reads this row's with the rest
+                            // of the batch's. A pointer the fetch below would
+                            // refuse is left out here as it is there.
+                            if let Some(gather) = gather.as_mut() {
+                                if likely(pointer.check_column_range().is_ok()) {
+                                    gather.note(pointer.position, pointer.length as u64);
+                                }
+                                continue;
+                            }
+
+                            if unlikely(
+                                pointer
+                                    .fetch_row_reuse_async(io_rows_ref, scan_fetch, &mut buffer.row)
+                                    .await
+                                    .is_err(),
+                            ) {
                                 continue;
                             }
 
                             if unlikely(enforce_limit_early) {
                                 if let Some(limit_val) = limit_opt {
-                                    let prev = limit_counter_ref.fetch_add(
-                                        1,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
+                                    let prev = limit_counter_ref
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     if unlikely(prev + 1 >= limit_val) {
-                                        stop_ref.store(
-                                            true,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
+                                        stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
                                     }
                                     // Skip the emit if we already reached the
                                     // limit on a sibling worker. Without this
@@ -530,16 +1386,84 @@ impl ConcurrentProcessor {
 
                             if likely(bytes_mode) {
                                 buffer.row.extend_serialized(&mut acc_bytes);
+                            } else if let (Some(_), Some(top)) = (deferred_ref.as_ref(), top_n_ref.as_ref()) {
+                                Self::keep_for_top_n(
+                                    top,
+                                    schema_ref.as_slice(),
+                                    &mut top_sort,
+                                    &mut top_bounded,
+                                    &mut acc_pairs,
+                                    &mut buffer.row,
+                                    pointer,
+                                );
                             } else {
                                 acc_rows.push(std::mem::take(&mut buffer.row));
                             }
                         }
                     } else {
                         // WHERE-filtered path
-                        let (query_row_fetch, requested_row_fetch) =
-                            &*tuple_clone;
+                        let (query_row_fetch, requested_row_fetch) = &*tuple_clone;
 
-                        for pointer in pointers.iter() {
+                        // Rows the predicate's simple comparisons rule out,
+                        // decided for the whole batch before any is fetched.
+                        // A superset: see `prefilter`. It reads nothing the
+                        // loop below would skip unread.
+                        let keep = match prefilter_ref.as_deref() {
+                            Some(pf)
+                                if pf.select(
+                                    pointers.iter(),
+                                    |p| {
+                                        p.deleted
+                                            || horizon_ref.is_reclaimable(p.deleted, p.xmin, p.xmax)
+                                    },
+                                    &mut prefilter_scratch,
+                                ) =>
+                            {
+                                pf.run(pointers.len(), io_rows_ref, &mut prefilter_scratch).await
+                            }
+                            _ => None,
+                        };
+
+                        // A count whose `WHERE` the mask decides whole: the
+                        // kept rows are the matches, so they are counted here
+                        // and none is fetched. The same three tests the loop
+                        // below makes of a matched row, in the same order:
+                        // not deleted, not reclaimable (the mask leaves those
+                        // rows' bits set without reading them), and visible
+                        // to this snapshot. A batch whose column read failed
+                        // has no mask and takes the loop below.
+                        let mut unprocessed: &[RowPointer] = &pointers[..];
+                        if let (Some(keep), true) = (keep, count_from_mask) {
+                            let mut matched = 0u64;
+                            for (batch_index, pointer) in pointers.iter().enumerate() {
+                                if prefilter::kept(keep, batch_index)
+                                    && !pointer.deleted
+                                    && !horizon_ref.is_reclaimable(
+                                        pointer.deleted,
+                                        pointer.xmin,
+                                        pointer.xmax,
+                                    )
+                                    && visibility_ref.visible(
+                                        pointer.deleted,
+                                        pointer.xmin,
+                                        pointer.xmax,
+                                    )
+                                {
+                                    matched += 1;
+                                }
+                            }
+                            counted += matched;
+                            if let Some(pf) = prefilter_ref.as_deref() {
+                                pf.note_decided(matched);
+                            }
+                            unprocessed = &[];
+                        }
+                        // Any other scan with such a mask: a kept row matches,
+                        // so it is not fetched and interpreted to find out.
+                        let decided = mask_decides && keep.is_some();
+                        let mut decided_rows = 0u64;
+
+                        for (batch_index, pointer) in unprocessed.iter().enumerate() {
                             if unlikely(stop_ref.load(std::sync::atomic::Ordering::Relaxed)) {
                                 break;
                             }
@@ -577,64 +1501,66 @@ impl ConcurrentProcessor {
                                 continue;
                             }
 
-                            // The reason is logged, not discarded: this fires in
-                            // bursts on a hot row and the pointer alone says
-                            // nothing about whether the read was short, the
-                            // layout disagreed, or the slot had been reused.
-                            if let Err(e) = pointer
-                                .fetch_row_reuse_async(
-                                    io_rows_ref,
-                                    query_row_fetch,
-                                    &mut buffer.row,
-                                )
-                                .await
-                            {
-                                error!(
-                                    "Failed to fetch query row for pointer {:?}: {}",
-                                    pointer, e
-                                );
-                                continue;
+                            // Cannot match, so it is not in the cached set
+                            // either: exactly what evaluating it would decide.
+                            if let Some(keep) = keep {
+                                if !prefilter::kept(keep, batch_index) {
+                                    continue;
+                                }
                             }
 
-                            if !row_layout_built {
-                                build_write_order_map(
-                                    &mut buffer.write_order_to_col,
-                                    &buffer.row,
-                                    schema_ref.as_slice(),
-                                );
-                                row_layout_built = true;
-                            }
+                            let result = if decided {
+                                // Its bit survived the test above.
+                                decided_rows += 1;
+                                true
+                            } else {
+                                // The reason is logged, not discarded: this fires in
+                                // bursts on a hot row and the pointer alone says
+                                // nothing about whether the read was short, the
+                                // layout disagreed, or the slot had been reused.
+                                if let Err(e) = pointer
+                                    .fetch_row_reuse_async(
+                                        io_rows_ref,
+                                        query_row_fetch,
+                                        &mut buffer.row,
+                                    )
+                                    .await
+                                {
+                                    error!(
+                                        "Failed to fetch query row for pointer {:?}: {}",
+                                        pointer, e
+                                    );
+                                    continue;
+                                }
 
-                            let result = {
-                                let processor =
-                                    unsafe { &mut *processor_cell.get() };
-                                processor.execute_row(
-                                    &RowView::new(
+                                if !row_layout_built {
+                                    build_write_order_map(
+                                        &mut buffer.write_order_to_col,
                                         &buffer.row,
-                                        &buffer.write_order_to_col,
-                                    ),
-                                    &mut buffer.bool_buffer,
-                                )
-                            };
+                                        schema_ref.as_slice(),
+                                    );
+                                    row_layout_built = true;
+                                }
 
-                            let result = match result {
-                                Ok(matched) => matched,
-                                Err(e) => {
-                                    // Record the first failure and stop every
-                                    // worker. Continuing would emit whatever
-                                    // this worker matched so far as if the
-                                    // query had succeeded.
-                                    let _ = eval_error_ref.compare_exchange(
-                                        0,
-                                        e.to_code(),
-                                        std::sync::atomic::Ordering::AcqRel,
-                                        std::sync::atomic::Ordering::Acquire,
-                                    );
-                                    stop_ref.store(
-                                        true,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
-                                    break;
+                                let result = {
+                                    let processor = unsafe { &mut *processor_cell.get() };
+                                    processor.execute_row(
+                                        &RowView::new(&buffer.row, &buffer.write_order_to_col),
+                                        &mut buffer.bool_buffer,
+                                    )
+                                };
+
+                                match result {
+                                    Ok(matched) => matched,
+                                    Err(e) => {
+                                        // Record the first failure and stop every
+                                        // worker. Continuing would emit whatever
+                                        // this worker matched so far as if the
+                                        // query had succeeded.
+                                        eval_error_ref.record(e);
+                                        stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        break;
+                                    }
                                 }
                             };
 
@@ -659,11 +1585,51 @@ impl ConcurrentProcessor {
                                     continue;
                                 }
 
-                                if !query_covers_requested {
+                                // Matched the predicate and visible to this
+                                // snapshot, which is exactly what a count
+                                // counts. The payload fetch below is for
+                                // columns nobody is going to read.
+                                if count_only_ref.is_some() {
+                                    counted += 1;
+                                    continue;
+                                }
+
+                                // As in the unfiltered branch: a top-N
+                                // scan decides at the batch's end.
+                                if let Some(keys) = top_cells.as_mut() {
+                                    if likely(pointer.check_column_range().is_ok()) {
+                                        keys.note(pointer.position, pointer.length as u64);
+                                        top_noted.push(pointer.clone());
+                                    }
+                                    continue;
+                                }
+
+                                // As in the unfiltered branch: its cells are
+                                // read with the rest of the batch's.
+                                if let Some(gather) = gather.as_mut() {
+                                    if likely(pointer.check_column_range().is_ok()) {
+                                        gather.note(pointer.position, pointer.length as u64);
+                                    }
+                                    continue;
+                                }
+
+                                // Overrides `query_covers_requested`: reusing
+                                // the WHERE buffer would keep exactly the wide
+                                // payload this deferral exists to skip.
+                                let matched_fetch = deferred_ref
+                                    .as_deref()
+                                    .or((!query_covers_requested).then_some(requested_row_fetch))
+                                    // A row the mask decided was never read.
+                                    // Where the `WHERE` fetch covers what is
+                                    // asked for, its buffer is what is emitted,
+                                    // extra columns and all, so that is the
+                                    // read it is owed.
+                                    .or(decided.then_some(query_row_fetch));
+                                if let Some(matched_fetch) = matched_fetch {
                                     if let Err(e) = pointer
                                         .fetch_row_reuse_async(
                                             io_rows_ref,
-                                            requested_row_fetch,
+                                            matched_fetch,
                                             &mut buffer.row,
                                         )
                                         .await
@@ -680,15 +1646,11 @@ impl ConcurrentProcessor {
 
                                 if unlikely(enforce_limit_early) {
                                     if let Some(limit_val) = limit_opt {
-                                        let prev = limit_counter_ref.fetch_add(
-                                            1,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
+                                        let prev = limit_counter_ref
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         if unlikely(prev + 1 >= limit_val) {
-                                            stop_ref.store(
-                                                true,
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
+                                            stop_ref
+                                                .store(true, std::sync::atomic::Ordering::Relaxed);
                                         }
                                         if unlikely(prev >= limit_val) {
                                             break;
@@ -698,19 +1660,179 @@ impl ConcurrentProcessor {
 
                                 if likely(bytes_mode) {
                                     buffer.row.extend_serialized(&mut acc_bytes);
+                                } else if let (Some(_), Some(top)) =
+                                    (deferred_ref.as_ref(), top_n_ref.as_ref())
+                                {
+                                    Self::keep_for_top_n(
+                                        top,
+                                        schema_ref.as_slice(),
+                                        &mut top_sort,
+                                        &mut top_bounded,
+                                        &mut acc_pairs,
+                                        &mut buffer.row,
+                                        pointer,
+                                    );
                                 } else {
                                     acc_rows.push(std::mem::take(&mut buffer.row));
                                 }
                             }
                         }
+                        if let Some(pf) = prefilter_ref.as_deref() {
+                            pf.note_decided(decided_rows);
+                        }
                     }
 
-                    let elapsed_ns =
-                        batch_read_start.elapsed().as_nanos() as u64;
-                    reading_time_ref.fetch_add(
-                        elapsed_ns,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    // The cells of the rows this batch noted; a row that
+                    // cannot be read is left out, as its fetch would have
+                    // left it out of the rows.
+                    if let Some(gather) = gather.as_mut() {
+                        gather.flush_readable(io_rows_ref).await;
+                    }
+
+                    // A top-N scan's matched rows of this batch, in the order
+                    // the scan met them. Each used to have its keys fetched
+                    // and compared with the worker's `cap`-th best
+                    // (`keep_for_top_n`), nearly always to be dropped. The
+                    // batch's key cells are read together instead, and a row
+                    // whose cells already lose that comparison is turned
+                    // away unfetched; one that wins it, and every row until
+                    // the worker holds `cap`, goes through the fetch and
+                    // `keep_for_top_n` exactly as before. The comparison is
+                    // the same one, against the same row, in the same order,
+                    // so the same rows are kept. A batch whose cells cannot
+                    // be read together is fetched row by row as before.
+                    if let (Some(keys), Some(top), Some(key_fetch), Some(layout)) =
+                        (top_cells.as_mut(), top_n_ref.as_ref(), deferred_ref.as_deref(), top_keys_ref.as_ref())
+                    {
+                        let cells = keys.take_batch(io_rows_ref).await.ok();
+                        for (r, pointer) in top_noted.drain(..).enumerate() {
+                            let pointer = &pointer;
+                            if let (Some(chunk), true) = (cells.as_ref(), top_bounded) {
+                                if let Some(sort) = top_sort.as_ref() {
+                                    let cell = |schema_id: usize| {
+                                        layout.0.position(schema_id as u64).map(|c| {
+                                            let column = &layout.0.columns[c];
+                                            let cell = if column.text {
+                                                chunk.text(c, r)
+                                            } else {
+                                                chunk.cell(c, column.width as usize, r)
+                                            };
+                                            (cell, &layout.1[c])
+                                        })
+                                    };
+                                    if sort.compare_cells(cell, &acc_pairs[top.cap - 1].0) != std::cmp::Ordering::Less {
+                                        top_turned_away += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                            if unlikely(
+                                pointer
+                                    .fetch_row_reuse_async(io_rows_ref, key_fetch, &mut buffer.row)
+                                    .await
+                                    .is_err(),
+                            ) {
+                                continue;
+                            }
+                            Self::keep_for_top_n(
+                                top,
+                                schema_ref.as_slice(),
+                                &mut top_sort,
+                                &mut top_bounded,
+                                &mut acc_pairs,
+                                &mut buffer.row,
+                                pointer,
+                            );
+                        }
+                    }
+
+                    // Keep only this worker's best `cap` rows.
+                    //
+                    // Trimmed at twice the cap rather than every batch, so the
+                    // O(n) selection is amortised over at least `cap` new rows.
+                    // `select_nth_unstable_by` partitions rather than sorts:
+                    // the survivors are unordered, which is all the final sort
+                    // needs from them. The deferred pairs are trimmed as they
+                    // are pushed (`keep_for_top_n`), not here.
+                    if let Some(top) = top_n_ref.as_ref() {
+                        if deferred_ref.is_none() && acc_rows.len() > top.cap.saturating_mul(2) {
+                            let sort = PreparedSort::new(
+                                &top.keys,
+                                schema_ref.as_slice(),
+                                acc_rows.first(),
+                            );
+                            acc_rows
+                                .select_nth_unstable_by(top.cap - 1, |a, b| sort.compare(a, b));
+                            acc_rows.truncate(top.cap);
+                        }
+                    }
+
+                    let elapsed_ns = batch_read_start.elapsed().as_nanos() as u64;
+                    reading_time_ref.fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
+
+                    // A batch is thousands of rows of work with no point at
+                    // which tokio could run anything else: the channel hands
+                    // over the next batch without suspending while one is
+                    // queued, and a row read that hits memory completes
+                    // without suspending either. A big scan therefore held its
+                    // workers' threads for its whole length, and every other
+                    // session's statement on those threads waited behind it.
+                    // One yield per batch costs one reschedule per
+                    // `batch_size()` rows.
+                    //
+                    // Not after a short batch, which held the thread for no
+                    // time worth giving back. A yield is not free: the worker
+                    // thread, with nothing else queued, parks for zero time
+                    // (one `epoll_wait`) to take the task back, and takes it
+                    // back in tokio's searching state, which wakes a second
+                    // worker that finds nothing and parks on the I/O driver.
+                    // The next statement on the connection is then delivered
+                    // to that thread. A point lookup's one-row batch paid all
+                    // of that on every statement: two context switches where
+                    // one would do, and the session moved core each time.
+                    if long_enough_to_yield(batch_len) && latency_guards_on() {
+                        tokio::task::yield_now().await;
+                    }
+                }
+
+                // The one wide read this scan does: `cap` rows rather than
+                // every row the table holds. Everything above fetched a single
+                // sort key per row.
+                if let (Some(_), Some(top)) = (deferred_ref.as_ref(), top_n_ref.as_ref()) {
+                    if acc_pairs.len() > top.cap {
+                        let sort = PreparedSort::new(
+                            &top.keys,
+                            schema_ref.as_slice(),
+                            acc_pairs.first().map(|p| &p.0),
+                        );
+                        acc_pairs
+                            .select_nth_unstable_by(top.cap - 1, |a, b| sort.compare(&a.0, &b.0));
+                        acc_pairs.truncate(top.cap);
+                    }
+                    let (_, requested_row_fetch) = &*tuple_clone;
+                    acc_rows.reserve(acc_pairs.len());
+                    for (key_row, pointer) in acc_pairs.drain(..) {
+                        let mut row = Row::default();
+                        // A row that will not read back is dropped, matching
+                        // what the scan above does with the same failure.
+                        if pointer
+                            .fetch_row_reuse_async(io_rows_ref, requested_row_fetch, &mut row)
+                            .await
+                            .is_ok()
+                        {
+                            if !Self::keys_match(&key_row, &row, &top.keys) {
+                                eval_error_ref.record(EvalError::RowMovedUnderScan);
+                                stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
+                            acc_rows.push(row);
+                        }
+                    }
+                }
+
+                // One add per worker rather than one per row.
+                if let Some(counter) = count_only_ref.as_ref() {
+                    counter.fetch_add(counted, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 // Single send per worker on exit.
@@ -729,9 +1851,20 @@ impl ConcurrentProcessor {
                         let _ = tx_rp.send(acc_ptrs).await;
                     }
                 }
+                column_scan::note_top_rows_turned_away(top_turned_away);
+                if let (Some(gather), Some(sink)) = (gather, cells_ref.as_ref()) {
+                    let chunk = gather.finish();
+                    if chunk.rows > 0 {
+                        let _ = sink.chunks.send(chunk).await;
+                    }
+                }
             });
 
-            worker_handles.push(h);
+            if run_inline {
+                inline_worker = Some(Box::pin(worker));
+            } else {
+                worker_handles.push(task::spawn(worker));
+            }
         }
 
         // Drop our copy of the receiver; once the iterator finishes and we
@@ -743,49 +1876,104 @@ impl ConcurrentProcessor {
         // Drive the iterator inline. No more per-batch task::spawn.
         iterator.reset();
 
-        loop {
-            if stop_processing.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
+        let dispatch = async {
+            let mut pointer_read_error: Option<crate::core::row::error::RowError> = None;
+            // Pointers still expected, to size each batch's allocation by: a
+            // batch is sent away to a worker, so each needs its own.
+            let mut still_expected = expected;
+
+            loop {
+                if stop_processing.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+
+                // Sized to what is left, never more than a batch. This was
+                // `batch_size()` whatever the scan, so a point read through an
+                // index allocated room for 10,000 pointers (~0.6 MB) for its one
+                // row, and the same again for the empty read that ends the loop:
+                // two large-chunk mallocs and frees per statement. The estimate
+                // can fall short (rows appended since it was made); pushes past
+                // it grow the vector.
+                let capacity = (still_expected.min(per_batch as u64) as usize).max(1);
+                let mut pointers: Vec<RowPointer> = Vec::with_capacity(capacity);
+
+                // "No more pointers" and "the read failed" are different answers
+                // and must not share a branch. The end of the table is `Ok` with an
+                // empty batch: the iterator already turns every benign end of data
+                // into that — the declared length reached, a trailing partial
+                // record, and a concurrent append's reserved-but-unwritten tail
+                // (`load_next_chunk`'s `UnexpectedEof` arm). So an `Err` here is a
+                // real I/O failure or corruption, and it fails the statement.
+                //
+                // This used to clear the batch and fall into the `is_empty` break,
+                // which ended the scan as though the table had ended: a truncated
+                // result reported as a success, and — with the query cache on — a
+                // truncated match set stored as a *complete* one, because the stop
+                // flag stayed clear. The batch that failed is discarded rather than
+                // dispatched: the statement is failing, so its rows are not wanted.
+                if let Err(e) = iterator.next_row_pointers_into(&mut pointers).await {
+                    pointer_read_error = Some(e);
+                    stop_processing.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+
+                if pointers.is_empty() {
+                    break;
+                }
+                still_expected = still_expected.saturating_sub(pointers.len() as u64);
+
+                // The candidate rows this statement has had to look at. Counted
+                // here rather than in the workers: this loop runs in the task that
+                // is executing the statement, so the counter is reachable without
+                // being passed down, and one add per batch is not a contended cache
+                // line in the per-row loop. Pointers the filter index excluded were
+                // dropped inside the iterator and so are not counted, which is what
+                // makes the figure show that the index worked.
+                #[cfg(feature = "query_stats")]
+                crate::core::query_stats::note_rows_scanned(pointers.len() as u64);
+
+                // Whether this statement is still allowed to run. Checked here, in
+                // the task executing it, because the signal is a task-local and
+                // does not cross the `task::spawn` that made the workers.
+                //
+                // The error is recorded BEFORE the stop flag is set, and the order
+                // is the whole point: `check_worker_outcome` reads the error, and a
+                // stop flag on its own is indistinguishable from a scan that
+                // finished — so a cancelled statement would return the rows it
+                // happened to reach as though they were the complete answer.
+                if let Some(reason) = crate::core::cancel::tripped() {
+                    eval_error.record(reason.eval_error());
+                    stop_processing.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+
+                if stop_processing.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+
+                // Bounded send: blocks the iterator when all workers are busy.
+                if work_tx.send(pointers).await.is_err() {
+                    break;
+                }
             }
 
-            // Direct allocation; with BATCH_SIZE up to 65536 RowPointers per
-            // batch, this is one alloc per ~thousands of rows — negligible.
-            let mut pointers: Vec<RowPointer> =
-                Vec::with_capacity(crate::batch_size());
+            // Closing work_tx tells workers no more batches are coming.
+            drop(work_tx);
+            pointer_read_error
+        };
 
-            // NOTE: a failed pointer read is silently treated as the end of
-            // the table here — the batch is cleared and the `is_empty` break
-            // below ends the scan, so a truncated result is returned as a
-            // success. The bytes-mode dispatcher in `process_row_pointers`
-            // now propagates instead; doing the same here needs an error
-            // channel out of `spawn_batch_tasks`, which returns handles
-            // rather than a `Result`.
-            if iterator
-                .next_row_pointers_into(&mut pointers)
-                .await
-                .is_err()
-            {
-                pointers.clear();
+        let (pointer_read_error, inline_outcome) = match inline_worker {
+            Some(worker) => {
+                let (pointer_read_error, outcome) = futures::join!(
+                    dispatch,
+                    futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(worker))
+                );
+                (pointer_read_error, Some(outcome.map_err(|payload| panic_message(&*payload))))
             }
+            None => (dispatch.await, None),
+        };
 
-            if pointers.is_empty() {
-                break;
-            }
-
-            if stop_processing.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
-
-            // Bounded send: blocks the iterator when all workers are busy.
-            if work_tx.send(pointers).await.is_err() {
-                break;
-            }
-        }
-
-        // Closing work_tx tells workers no more batches are coming.
-        drop(work_tx);
-
-        worker_handles
+        (ScanWorkers { spawned: worker_handles, inline: inline_outcome }, pointer_read_error)
     }
 
     // Old per-batch spawning loop removed; kept signature-compatible.
@@ -872,6 +2060,263 @@ impl ConcurrentProcessor {
     /// are not the first `k` in sort order. Only an index on the sort column
     /// removes that, and there isn't one.
     ///
+    /// Builds the worker-side top-N for an `ORDER BY … LIMIT`, if there is one.
+    ///
+    /// `None` when the statement has no ordering or no cap — with nothing to
+    /// keep rows *out*, every matched row has to be accumulated.
+    /// The columns a top-N needs in order to decide which rows survive.
+    ///
+    /// The sort keys and their `__null_x` companions, and nothing else. While a
+    /// scan is only choosing the best `cap` rows, every other column it reads is
+    /// thrown away — so on a wide table `SELECT * … ORDER BY … LIMIT 200` spends
+    /// most of its time materialising columns that lose. Measured on a live
+    /// 940,000-row table with 20 columns, the same query cost 664 ms fetching
+    /// everything and 303 ms fetching only the key.
+    fn top_n_key_fetch(schema_arc: &Arc<SmallVec<[SchemaField; 20]>>, top: &TopN) -> RowFetch {
+        let mut fields: Vec<SchemaField> = Vec::new();
+        for key in &top.keys {
+            // The companion is not optional: without it a nullable key sorts by
+            // its stored bytes, which is the bug `null_flag` exists to prevent.
+            for schema_id in std::iter::once(key.schema_id).chain(key.null_flag) {
+                if let Some(field) = schema_arc
+                    .iter()
+                    .find(|f| f.write_order as usize == schema_id)
+                {
+                    if !fields.iter().any(|f| f.write_order == field.write_order) {
+                        fields.push(field.clone());
+                    }
+                }
+            }
+        }
+        crate::core::rql::join::fetch_for(&fields, schema_arc)
+    }
+
+    /// Keeps a matched key row for a worker's top-N, unless it already loses.
+    ///
+    /// `kept` is trimmed to its best `cap` whenever it passes twice that, so
+    /// the O(n) selection is amortised over at least `cap` pushes; from the
+    /// first trim on (`bounded`), `kept[cap - 1]` is the worst row kept — the
+    /// selection leaves it there, and rows are only pushed behind it. A row
+    /// that does not sort before it cannot be among this worker's best `cap`,
+    /// let alone the statement's, so it is dropped with one comparison and its
+    /// buffer goes back to the next fetch. A row tied with the worst is
+    /// dropped too: which of several rows tied at the boundary survives was
+    /// already unspecified (the selection is unstable).
+    ///
+    /// The scan used to push every matched row and trim once per batch: ten
+    /// thousand 1.5 KB rows moved into the vector, partitioned, and all but
+    /// `cap` dropped, per batch per worker. For `ORDER BY created DESC LIMIT
+    /// 20` over a million rows that was half the statement — 30% `memmove`,
+    /// 18% comparisons inside the partition, 5% dropping the losers.
+    #[inline]
+    fn keep_for_top_n(
+        top: &TopN,
+        schema: &[SchemaField],
+        sort: &mut Option<PreparedSort>,
+        bounded: &mut bool,
+        kept: &mut Vec<(Row, RowPointer)>,
+        row: &mut Row,
+        pointer: &RowPointer,
+    ) {
+        let sort = sort.get_or_insert_with(|| PreparedSort::new(&top.keys, schema, Some(row)));
+        if *bounded && sort.compare(row, &kept[top.cap - 1].0) != std::cmp::Ordering::Less {
+            return;
+        }
+        kept.push((std::mem::take(row), pointer.clone()));
+        if kept.len() > top.cap.saturating_mul(2) {
+            kept.select_nth_unstable_by(top.cap - 1, |a, b| sort.compare(&a.0, &b.0));
+            kept.truncate(top.cap);
+            *bounded = true;
+        }
+    }
+
+    fn top_n_spec(
+        schema_arc: &Arc<SmallVec<[SchemaField; 20]>>,
+        order_by: &Option<String>,
+        limit: Option<u64>,
+    ) -> Option<Arc<TopN>> {
+        let cap = limit.filter(|l| *l > 0)? as usize;
+        let keys = Self::resolve_sort_keys(schema_arc, order_by.as_deref()?);
+        if keys.is_empty() {
+            return None;
+        }
+        Some(Arc::new(TopN { keys, cap }))
+    }
+
+    /// The sort keys an `ORDER BY` spec names, as `(schema_id, descending)`.
+    ///
+    /// Shared by the worker-side top-N and the final sort so the two cannot
+    /// disagree about the order they are producing — the same reason the
+    /// partition and the sort below share one comparator.
+    fn resolve_sort_keys(
+        schema_arc: &Arc<SmallVec<[SchemaField; 20]>>,
+        order_spec: &str,
+    ) -> Vec<SortKey> {
+        let mut keys: Vec<SortKey> = Vec::new();
+        for (name, descending) in crate::core::rql::order_by::parse_spec(order_spec) {
+            // Tombstones excluded: ordering by a dropped column's write_order
+            // sorts by a column no fetch includes, which now reads as absent
+            // rather than as another column's bytes — an unordered result
+            // reported as ordered.
+            match schema_arc
+                .iter()
+                .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&name))
+                .map(|f| f.write_order as usize)
+            {
+                Some(schema_id) => keys.push(SortKey {
+                    schema_id,
+                    descending,
+                    // Looked up here rather than carried in the spec: the spec
+                    // is a column list, and the companion is derivable from the
+                    // schema the keys are already being resolved against.
+                    null_flag: crate::core::rql::nullable::flag_field(&name, schema_arc)
+                        .map(|f| f.write_order as usize),
+                }),
+                // The planner resolved every key against this same schema, so
+                // this is unreachable in practice. Dropping just the one key
+                // still sorts by the rest, which beats abandoning the sort.
+                None => log::warn!(
+                    "ORDER BY field '{}' not found in schema; skipping key",
+                    name
+                ),
+            }
+        }
+        keys
+    }
+
+    /// One sort key's stored bytes, when the row carries that column.
+    fn key_bytes(row: &Row, schema_id: usize) -> Option<&[u8]> {
+        row.columns
+            .iter()
+            .find(|c| c.schema_id as usize == schema_id)
+            .map(|c| c.data.into_slice())
+    }
+
+    /// Whether a re-read row still carries the key it was kept for.
+    ///
+    /// A plain `SELECT` registers no running transaction — `effective_tx` is
+    /// `FROZEN_TX` — so `oldest_active` is not pinned while it runs, and the
+    /// reclamation lemma only guarantees that reclaimable and visible are
+    /// exclusive *at the moment of the test*. A row this scan saw as visible
+    /// can therefore be deleted, marked by vacuum, and have its extent handed
+    /// to a writer before the payload is read. Every other path fetches
+    /// immediately after the visibility test and is barely exposed; deferring
+    /// the payload widens that window to the length of the scan.
+    ///
+    /// So the payload is checked against the key it was sorted by. This is not
+    /// a proof — a reused extent could hold the same key bytes — but it turns
+    /// the realistic case from a wrong row served as a right one into a failed
+    /// statement, which is the trade this engine makes everywhere else.
+    fn keys_match(kept: &Row, reread: &Row, keys: &[SortKey]) -> bool {
+        keys.iter().all(|key| {
+            std::iter::once(key.schema_id)
+                .chain(key.null_flag)
+                .all(
+                    |id| match (Self::key_bytes(kept, id), Self::key_bytes(reread, id)) {
+                        (Some(a), Some(b)) => a == b,
+                        // What the payload fetch does not carry, it cannot
+                        // contradict.
+                        _ => true,
+                    },
+                )
+        })
+    }
+
+    /// Whether a row's nullable column holds `NULL`, per its companion.
+    #[cfg(test)]
+    fn column_is_null(row: &Row, flag_schema_id: usize) -> bool {
+        row.columns
+            .iter()
+            .find(|c| c.schema_id as usize == flag_schema_id)
+            .and_then(|c| c.data.into_slice().first().copied())
+            .is_some_and(|byte| byte != 0)
+    }
+
+    /// Orders two rows by a resolved key list, resolving every key's column and
+    /// type again on each call. The comparator [`PreparedSort`] replaced; kept
+    /// as the reference the tests hold it to.
+    #[cfg(test)]
+    fn compare_by_keys(
+        a: &Row,
+        b: &Row,
+        keys: &[SortKey],
+        schema: &[SchemaField],
+    ) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        // Later keys only break the ties the earlier ones left.
+        for key in keys.iter() {
+            let ord = match key.null_flag {
+                // A NULL sorts as larger than every value, so it lands last
+                // ascending and first descending — which is where PostgreSQL
+                // puts it, and the reversal below applies to it too.
+                //
+                // The comparison of the stored bytes is skipped entirely when
+                // either side is NULL: those bytes are the type's zeroes and
+                // mean nothing.
+                Some(flag) => {
+                    let a_null = Self::column_is_null(a, flag);
+                    let b_null = Self::column_is_null(b, flag);
+                    match (a_null, b_null) {
+                        (true, true) => Ordering::Equal,
+                        (true, false) => Ordering::Greater,
+                        (false, true) => Ordering::Less,
+                        (false, false) => compare_rows_by_schema_id(a, b, key.schema_id, schema),
+                    }
+                }
+                None => compare_rows_by_schema_id(a, b, key.schema_id, schema),
+            };
+            let ord = if key.descending { ord.reverse() } else { ord };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    }
+
+    /// Orders and caps rows gathered from several scans of one schema (a
+    /// partitioned table's partitions, `docs/partitioning.md` §8) by the very
+    /// step that ends one scan: the same key resolution, comparator and cap,
+    /// so a merged answer can never order differently from a single table's.
+    /// Each input scan was given the same `order_by` and `limit`, so the rows
+    /// it returned carry every column and NULL companion the keys read.
+    pub(crate) fn sort_rows_for_merge(
+        rows: &mut Vec<Row>,
+        table_schema: &[SchemaField],
+        order_by: &Option<String>,
+        limit: Option<u64>,
+    ) {
+        Self::sort_rows_off_the_runtime(rows, &Self::schema_arc(table_schema), order_by, limit);
+    }
+
+    /// [`Self::sort_rows_if_needed`], with a large sort taken off the async
+    /// worker it is running on.
+    ///
+    /// Sorting a million rows is hundreds of milliseconds of CPU with no await
+    /// in it, and on a tokio worker that is hundreds of milliseconds in which
+    /// every other task queued on that thread — other sessions' point reads —
+    /// cannot run. `block_in_place` hands those tasks to another worker for the
+    /// duration instead. It needs the multi-threaded runtime (the server's); on
+    /// a current-thread runtime there is nowhere to hand them, and the sort runs
+    /// inline as before.
+    fn sort_rows_off_the_runtime(
+        all_rows: &mut Vec<Row>,
+        schema_arc: &Arc<SmallVec<[SchemaField; 20]>>,
+        order_by: &Option<String>,
+        limit: Option<u64>,
+    ) {
+        let large = order_by.is_some() && all_rows.len() >= SORT_OFF_RUNTIME_ROWS;
+        let multi_thread = tokio::runtime::Handle::try_current().is_ok_and(|h| {
+            h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        });
+        if large && multi_thread && latency_guards_on() {
+            tokio::task::block_in_place(|| {
+                Self::sort_rows_if_needed(all_rows, schema_arc, order_by, limit)
+            });
+        } else {
+            Self::sort_rows_if_needed(all_rows, schema_arc, order_by, limit);
+        }
+    }
+
     /// One observable difference, and it is within what SQL allows: `sort_by`
     /// is stable while `select_nth_unstable_by` is not, so which of several
     /// *equal* rows survives the limit may change. `ORDER BY` leaves the order
@@ -898,24 +2343,7 @@ impl ConcurrentProcessor {
         // followed by ASC or DESC. Carrying the keys inside the existing string
         // keeps every signature between the SQL front end and here unchanged;
         // only this function needs to know the sort has keys and directions.
-        let mut keys: Vec<(usize, bool)> = Vec::new();
-        for (name, descending) in crate::core::rql::order_by::parse_spec(order_spec) {
-            // Tombstones excluded: ordering by a dropped column's write_order
-            // sorts by a column no fetch includes, which now reads as absent
-            // rather than as another column's bytes — an unordered result
-            // reported as ordered.
-            match schema_arc
-                .iter()
-                .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&name))
-                .map(|f| f.write_order as usize)
-            {
-                Some(schema_id) => keys.push((schema_id, descending)),
-                // The planner resolved every key against this same schema, so
-                // this is unreachable in practice. Dropping just the one key
-                // still sorts by the rest, which beats abandoning the sort.
-                None => log::warn!("ORDER BY field '{}' not found in schema; skipping key", name),
-            }
-        }
+        let keys = Self::resolve_sort_keys(schema_arc, order_spec);
 
         if keys.is_empty() {
             // Nothing resolvable to sort by; the cap still applies.
@@ -927,17 +2355,28 @@ impl ConcurrentProcessor {
 
         // Shared by both paths so the partition and the final sort cannot
         // disagree about the order they are producing.
-        let compare = |a: &Row, b: &Row| -> std::cmp::Ordering {
-            // Later keys only break the ties the earlier ones left.
-            for (schema_id, descending) in keys.iter() {
-                let ord = compare_rows_by_schema_id(a, b, *schema_id, schema_arc.as_slice());
-                let ord = if *descending { ord.reverse() } else { ord };
-                if ord != std::cmp::Ordering::Equal {
-                    return ord;
+        let sort = PreparedSort::new(&keys, schema_arc.as_slice(), all_rows.first());
+
+        // One integer key: sort the keys, not the rows (see `integer_keys`).
+        if let Some(pairs) = sort.integer_keys(all_rows) {
+            match truncate_to {
+                Some(k) if k < all_rows.len() => {
+                    let order = order_from_integer_keys(pairs, Some(k));
+                    let mut kept: Vec<Row> = Vec::with_capacity(order.len());
+                    for &i in &order {
+                        kept.push(std::mem::take(&mut all_rows[i as usize]));
+                    }
+                    *all_rows = kept;
+                }
+                _ => {
+                    let mut order = order_from_integer_keys(pairs, None);
+                    apply_row_order(all_rows, &mut order);
                 }
             }
-            std::cmp::Ordering::Equal
-        };
+            return;
+        }
+
+        let compare = |a: &Row, b: &Row| sort.compare(a, b);
 
         match truncate_to {
             // Select, then order only the survivors.
@@ -946,16 +2385,274 @@ impl ConcurrentProcessor {
                     all_rows.clear();
                     return;
                 }
-                // Puts the `k` smallest in `[..k]` in unspecified order, in
-                // O(n) rather than sorting everything first.
-                all_rows.select_nth_unstable_by(k - 1, compare);
-                all_rows.truncate(k);
-                all_rows.sort_by(compare);
+                // Selects the `k` smallest in O(n) rather than sorting
+                // everything first — over indices, so only the survivors move.
+                select_rows_indirect(all_rows, k, compare);
             }
             // Asking for at least as many rows as exist: the selection step
             // would be pure overhead.
-            _ => all_rows.sort_by(compare),
+            _ => sort_rows_indirect(all_rows, compare),
         }
+    }
+
+    /// How many rows match, without building any of them.
+    ///
+    /// The answer to `SELECT COUNT(*) [WHERE …]` — see
+    /// [`crate::core::rql::aggregate::is_row_count_only`] for exactly which
+    /// plans may come here. The ordinary aggregate path materialises every
+    /// matching row into a `Vec<Row>` and folds over it, which for a count is
+    /// a gigabyte and a half of `Row` at 1560 bytes each to produce one
+    /// integer; measured on a million-row table that is ~625 ms, against
+    /// ~155 ms for a full five-column `ORDER BY … LIMIT 200` over the *same*
+    /// table. Counting cost four times what sorting did.
+    ///
+    /// No `LIMIT` and no `ORDER BY` are accepted, because neither means
+    /// anything to a count of the whole match set — the caller's `LIMIT`
+    /// applies to the aggregated output, not to its input, and passing it down
+    /// here would truncate the scan and count a prefix.
+    pub async fn process_count<'a, S: StorageIO>(
+        &self,
+        table_name: &str,
+        where_query: &str,
+        query_row_fetch: RowFetch,
+        table_schema: &Vec<SchemaField>,
+        io_rows: Arc<S>,
+        iterator: &mut RowPointerIterator<S>,
+        generation: Option<u64>,
+        visibility: Visibility,
+    ) -> std::io::Result<u64> {
+        let schema_arc = Self::schema_arc(table_schema);
+
+        // A cached entry is the set of pointers matching this predicate, so the
+        // count is how many of them this snapshot can see. Visibility is per
+        // reader and the entry is not, which is why it is retested here rather
+        // than trusted — the same reason `try_collect_cached_rows` retests it.
+        //
+        // No fetch: unlike the row path there is nothing to read out of the
+        // rows, so a cached count never touches the data file at all.
+        if let Some(table_generation) = generation {
+            if let Some(entry) =
+                query_cache::lookup(table_name, where_query, table_generation, None)
+            {
+                #[cfg(feature = "query_stats")]
+                crate::core::query_stats::note_rows_scanned(entry.pointers.len() as u64);
+                return Ok(entry
+                    .pointers
+                    .iter()
+                    .filter(|p| visibility.visible(p.deleted, p.xmin, p.xmax))
+                    .count() as u64);
+            }
+        }
+
+        let (no_filter, tokens_arc) =
+            Self::prepare_query(where_query, &schema_arc).map_err(std::io::Error::other)?;
+        let compiled_plan = if no_filter {
+            None
+        } else {
+            Some(Arc::new(
+                Self::compile_query_plan(&schema_arc, &tokens_arc)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
+            ))
+        };
+
+        // Both halves are the WHERE's own fetch. The second is what a matched
+        // row would have been read into, and a count reads nothing, so there is
+        // no requested set to describe.
+        let shared_tuple: Arc<(RowFetch, RowFetch)> =
+            Arc::new((query_row_fetch.clone(), query_row_fetch));
+
+        let counter: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
+        let limit_counter: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
+        let stop_processing: Arc<CacheGuard<AtomicBool>> = Arc::new(AtomicBool::new(false).into());
+        let eval_error: Arc<CacheGuard<ScanFailure>> = Arc::new(ScanFailure::default().into());
+        let reading_time_total: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
+
+        let (batch_handles, pointer_read_error) = Self::spawn_batch_tasks(
+            iterator,
+            Arc::clone(&shared_tuple),
+            Arc::clone(&schema_arc),
+            compiled_plan,
+            Self::build_prefilter(no_filter, &tokens_arc, &schema_arc, &shared_tuple.0, iterator.expected_records()),
+            Arc::clone(&io_rows),
+            // No row channel and no bytes channel: nothing is emitted.
+            None,
+            None,
+            // No pointer channel either. Storing a cache entry from here would
+            // be sound, but the entry a count builds is one no row query can
+            // use without re-reading everything anyway, and populating it costs
+            // a `RowPointer` clone per match on the path whose whole point is
+            // to touch nothing.
+            None,
+            None,
+            false,
+            no_filter,
+            // Meaningless with no requested fetch; the count path never reaches
+            // the branch that reads it.
+            false,
+            Arc::clone(&limit_counter),
+            Arc::clone(&stop_processing),
+            Arc::clone(&reading_time_total),
+            Arc::clone(&eval_error),
+            visibility,
+            crate::core::cancel::current(),
+            None,
+            Some(Arc::clone(&counter)),
+            None,
+        )
+        .await;
+
+        let join_results = batch_handles.join().await;
+        // After the join, so no worker outlives the statement it served.
+        if let Some(e) = pointer_read_error {
+            return Err(e.into());
+        }
+        Self::check_worker_outcome(join_results, &eval_error)?;
+
+        Ok(counter.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The cells of the rows matching `where_query`, for a statement that
+    /// reads them only as cells: an aggregate over fixed-width columns. See
+    /// [`column_scan`] for what is read and why it is the rows the bytes
+    /// scan would emit.
+    ///
+    /// The query cache is read and filled as [`Self::process_into_bytes`]
+    /// does it: a cached entry is the pointers matching the clause, and the
+    /// cells of those this snapshot sees are read without a scan.
+    ///
+    /// No `LIMIT` and no `ORDER BY`, as for [`Self::process_count`]: both
+    /// belong to the aggregated output.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn process_columns<'a, S: StorageIO>(
+        &self,
+        table_name: &str,
+        where_query: &str,
+        query_row_fetch: RowFetch,
+        layout: StdArc<CellLayout>,
+        table_schema: &[SchemaField],
+        io_rows: Arc<S>,
+        iterator: &mut RowPointerIterator<S>,
+        generation: Option<u64>,
+        visibility: Visibility,
+    ) -> std::io::Result<Vec<ColumnChunk>> {
+        if let Some(table_generation) = generation {
+            if let Some(entry) = query_cache::lookup(table_name, where_query, table_generation, None) {
+                #[cfg(feature = "query_stats")]
+                crate::core::query_stats::note_rows_scanned(entry.pointers.len() as u64);
+                let mut gather = column_scan::Gather::new(&layout);
+                let mut unreadable = false;
+                for pointer in entry.pointers.iter() {
+                    if !visibility.visible(pointer.deleted, pointer.xmin, pointer.xmax) {
+                        continue;
+                    }
+                    if pointer.check_column_range().is_err() {
+                        unreadable = true;
+                        break;
+                    }
+                    gather.note(pointer.position, pointer.length as u64);
+                    if gather.pending() >= column_scan::CACHED_READ_ROWS && gather.flush(&*io_rows).await.is_err() {
+                        unreadable = true;
+                        break;
+                    }
+                }
+                // An unreadable pointer invalidates the entry and the scan
+                // runs for real, as `try_collect_cached_bytes` has it. What
+                // was read of the entry until then is dropped with `gather`.
+                if !unreadable && gather.flush(&*io_rows).await.is_ok() {
+                    let chunk = gather.finish();
+                    return Ok(if chunk.rows > 0 { vec![chunk] } else { Vec::new() });
+                }
+                query_cache::record_abandoned_hit();
+            }
+        }
+
+        let schema_arc = Self::schema_arc(table_schema);
+        let (no_filter, tokens_arc) =
+            Self::prepare_query(where_query, &schema_arc).map_err(std::io::Error::other)?;
+        let compiled_plan = if no_filter {
+            None
+        } else {
+            Some(Arc::new(
+                Self::compile_query_plan(&schema_arc, &tokens_arc)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
+            ))
+        };
+
+        // Both halves are the WHERE's own fetch, as for a count: a matched
+        // row is not fetched, its cells are.
+        let shared_tuple: Arc<(RowFetch, RowFetch)> =
+            Arc::new((query_row_fetch.clone(), query_row_fetch));
+
+        let (tx_cells, rx_cells) = kanal::unbounded_async::<ColumnChunk>();
+        let sink = column_scan::CellSink { layout, chunks: tx_cells };
+
+        let cache_enabled = query_cache::enabled() && generation.is_some();
+        let (tx_rp, rx_rp) = if cache_enabled {
+            let (a, b) = kanal::unbounded_async::<Vec<RowPointer>>();
+            (Some(a), Some(b))
+        } else {
+            (None, None)
+        };
+
+        let limit_counter: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
+        let stop_processing: Arc<CacheGuard<AtomicBool>> = Arc::new(AtomicBool::new(false).into());
+        let eval_error: Arc<CacheGuard<ScanFailure>> = Arc::new(ScanFailure::default().into());
+        let reading_time_total: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
+
+        let (batch_handles, pointer_read_error) = Self::spawn_batch_tasks(
+            iterator,
+            Arc::clone(&shared_tuple),
+            Arc::clone(&schema_arc),
+            compiled_plan,
+            Self::build_prefilter(no_filter, &tokens_arc, &schema_arc, &shared_tuple.0, iterator.expected_records()),
+            Arc::clone(&io_rows),
+            // No row channel and no bytes channel: cells are the answer.
+            None,
+            None,
+            tx_rp.clone(),
+            None,
+            false,
+            no_filter,
+            // The branch that reads it is past the point a cell scan leaves
+            // the row at.
+            false,
+            Arc::clone(&limit_counter),
+            Arc::clone(&stop_processing),
+            Arc::clone(&reading_time_total),
+            Arc::clone(&eval_error),
+            visibility,
+            crate::core::cancel::current(),
+            None,
+            None,
+            Some(sink.clone()),
+        )
+        .await;
+
+        let join_results = batch_handles.join().await;
+        drop(tx_rp);
+        // After the join, so no worker outlives the statement it served.
+        if let Some(e) = pointer_read_error {
+            return Err(e.into());
+        }
+        Self::check_worker_outcome(join_results, &eval_error)?;
+        drop(sink);
+
+        let mut chunks: Vec<ColumnChunk> = Vec::new();
+        if !rx_cells.is_empty() {
+            let _ = rx_cells.drain_into(&mut chunks);
+        }
+        drop(rx_cells);
+
+        if let (Some(rx_rp), Some(generation)) = (rx_rp, generation) {
+            let pointers = Self::drain_row_pointers(rx_rp);
+            // Stored only when the scan ran to its end: a complete match set.
+            // There is no limit for a prefix to be keyed by.
+            if !stop_processing.load(std::sync::atomic::Ordering::Acquire) {
+                query_cache::store(table_name, where_query, generation, None, pointers);
+            }
+        }
+
+        Ok(chunks)
     }
 
     pub async fn process<'a, S: StorageIO>(
@@ -964,7 +2661,7 @@ impl ConcurrentProcessor {
         where_query: &str,
         query_row_fetch: RowFetch,
         requested_row_fetch: RowFetch,
-        table_schema: &Vec<SchemaField>,
+        table_schema: &[SchemaField],
         io_rows: Arc<S>,
         iterator: &mut RowPointerIterator<S>,
         limit: Option<u64>,
@@ -979,10 +2676,7 @@ impl ConcurrentProcessor {
     ) -> std::io::Result<Vec<Row>> {
         let prep_stopwatch = std::time::Instant::now();
 
-        log::info!(
-            "Starting concurrent processing for query: {}",
-            where_query
-        );
+        log::info!("Starting concurrent processing for query: {}", where_query);
 
         let schema_arc = Self::schema_arc(table_schema);
 
@@ -1021,28 +2715,25 @@ impl ConcurrentProcessor {
         // The increment/threshold check is performed inside the `if result { }` section.
         let limit_counter: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
         let stop_processing: Arc<CacheGuard<AtomicBool>> = Arc::new(AtomicBool::new(false).into());
-        let eval_error: Arc<CacheGuard<AtomicU8>> = Arc::new(AtomicU8::new(0).into());
+        let eval_error: Arc<CacheGuard<ScanFailure>> = Arc::new(ScanFailure::default().into());
 
         // Important: for ORDER BY queries, we must not stop early based on LIMIT,
         // otherwise we only sort a prefix of the matching rows.
         let enforce_limit_early = limit.is_some() && order_by.is_none();
 
-        let shared_tuple: Arc<(RowFetch, RowFetch)> = Arc::new((
-            query_row_fetch,
-            requested_row_fetch,
-        ));
+        let shared_tuple: Arc<(RowFetch, RowFetch)> =
+            Arc::new((query_row_fetch, requested_row_fetch));
 
         let io_rows_outer = Arc::clone(&io_rows);
 
-        let (no_filter, tokens_arc) = Self::prepare_query(where_query, &schema_arc)
-            .map_err(std::io::Error::other)?;
+        let (no_filter, tokens_arc) =
+            Self::prepare_query(where_query, &schema_arc).map_err(std::io::Error::other)?;
         let compiled_plan = if no_filter {
             None
         } else {
             Some(Arc::new(
-                Self::compile_query_plan(&schema_arc, &tokens_arc).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-                })?,
+                Self::compile_query_plan(&schema_arc, &tokens_arc)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
             ))
         };
 
@@ -1073,11 +2764,12 @@ impl ConcurrentProcessor {
 
         let reading_time_total: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
 
-        let batch_handles = Self::spawn_batch_tasks(
+        let (batch_handles, pointer_read_error) = Self::spawn_batch_tasks(
             iterator,
             Arc::clone(&shared_tuple),
             Arc::clone(&schema_arc),
             compiled_plan.clone(),
+            Self::build_prefilter(no_filter, &tokens_arc, &schema_arc, &shared_tuple.0, iterator.expected_records()),
             io_rows_outer.clone(),
             Some(tx.clone()),
             None,
@@ -1091,22 +2783,53 @@ impl ConcurrentProcessor {
             Arc::clone(&reading_time_total),
             Arc::clone(&eval_error),
             visibility.clone(),
+            crate::core::cancel::current(),
+            // Applied even while the row pointers are being collected.
+            //
+            // This used to be `if tx_rp.is_some() { None }`, on the reasoning
+            // that a caller enumerating the whole match set needs the rows it
+            // keeps to correspond to the pointers. They do not correspond, and
+            // nothing asks them to: a worker accumulates `acc_ptrs` and
+            // `acc_rows` independently and sends them on separate channels, the
+            // trim below touches only the rows, and the drained pointers have
+            // exactly one consumer — `query_cache::store`. The pointer set stays
+            // complete whether or not the rows are bounded.
+            //
+            // The cost of the old reading was that it disabled the bound
+            // whenever it could possibly matter. `tx_rp` is `Some` exactly when
+            // the query cache is on, which is the production configuration, so
+            // `ORDER BY … LIMIT k` accumulated **every** matched row on every
+            // server that had caching enabled — a million-row `Vec<Row>`, ~1.5 GB
+            // at 1560 bytes each, to return two hundred rows.
+            //
+            // Truncating the scan is a different thing and is still forbidden
+            // here: `enforce_limit_early` is already `limit.is_some() &&
+            // order_by.is_none()`, so an ordered scan runs to completion, does
+            // not set `stopped_early`, and caches a complete match set.
+            Self::top_n_spec(&schema_arc, &order_by, limit),
+            // Rows are the answer here.
+            None,
+            None,
         )
         .await;
 
         // Wait for all batch tasks to complete
-        let join_results = join_all(batch_handles).await;
+        let join_results = batch_handles.join().await;
 
         // Drop the sender to signal that no more rows will be sent
         drop(tx);
 
+        // After the join, so no worker outlives the statement it served.
+        if let Some(e) = pointer_read_error {
+            return Err(e.into());
+        }
         Self::check_worker_outcome(join_results, &eval_error)?;
 
         let mut all_rows = Self::drain_rows(rx);
 
         // The cap is applied inside, as part of the ordering: `ORDER BY … LIMIT k`
         // is a selection problem, not a sort-then-discard one.
-        Self::sort_rows_if_needed(&mut all_rows, &schema_arc, &order_by, limit);
+        Self::sort_rows_off_the_runtime(&mut all_rows, &schema_arc, &order_by, limit);
 
         if let Some(rx_rp) = rx_rp {
             let pointers = Self::drain_row_pointers(rx_rp);
@@ -1123,18 +2846,11 @@ impl ConcurrentProcessor {
             // non-matching rows, which for a selective-late predicate is the
             // entire cost.
             if let Some(generation) = generation {
-                let stopped_early =
-                    stop_processing.load(std::sync::atomic::Ordering::Acquire);
+                let stopped_early = stop_processing.load(std::sync::atomic::Ordering::Acquire);
                 if stopped_early {
                     // Only a prefix, and only meaningful if we know its length.
                     if limit.is_some() {
-                        query_cache::store(
-                            table_name,
-                            where_query,
-                            generation,
-                            limit,
-                            pointers,
-                        );
+                        query_cache::store(table_name, where_query, generation, limit, pointers);
                     }
                 } else {
                     // Ran to completion: a complete match set, which answers
@@ -1165,13 +2881,20 @@ impl ConcurrentProcessor {
     ///
     /// Falls back to row-mode internally when ORDER BY is requested (rows
     /// must be sorted before serialization).
+    ///
+    /// The flag beside the bytes says whether any row may carry columns beyond
+    /// `requested_row_fetch`. Only the path that built the rows can know that,
+    /// so it is reported from here rather than guessed from the parse: the
+    /// executor skips its decode-and-trim pass on `false`, and a `false` over
+    /// rows holding a WHERE-only column sends that column to the client, which
+    /// then drops the connection with "unexpected field count in D message".
     pub async fn process_into_bytes<'a, S: StorageIO>(
         &self,
         table_name: &str,
         where_query: &str,
         query_row_fetch: RowFetch,
         requested_row_fetch: RowFetch,
-        table_schema: &Vec<SchemaField>,
+        table_schema: &[SchemaField],
         io_rows: Arc<S>,
         iterator: &mut RowPointerIterator<S>,
         limit: Option<u64>,
@@ -1179,26 +2902,30 @@ impl ConcurrentProcessor {
         // See [`Self::process`].
         generation: Option<u64>,
         visibility: Visibility,
-    ) -> std::io::Result<Vec<u8>> {
+    ) -> std::io::Result<(Vec<u8>, bool)> {
         // ORDER BY requires materialized Row structs to sort by column value;
         // fall back to the row-mode path and serialize at the end.
         if order_by.is_some() {
-            let rows = self
-                .process(
-                    table_name,
-                    where_query,
-                    query_row_fetch,
-                    requested_row_fetch,
-                    table_schema,
-                    io_rows,
-                    iterator,
-                    limit,
-                    order_by,
-                    generation,
-                    visibility,
-                )
-                .await?;
-            return Ok(crate::core::row::row::rows_into_vec(rows));
+            // Boxed: row mode's future is ~8 KB, and held inline it made every
+            // bytes-mode read's future that much larger, a point lookup's
+            // included, which each layer above copies whole as it moves it.
+            let rows = Box::pin(self.process(
+                table_name,
+                where_query,
+                query_row_fetch,
+                requested_row_fetch,
+                table_schema,
+                io_rows,
+                iterator,
+                limit,
+                order_by,
+                generation,
+                visibility,
+            ))
+            .await?;
+            // Row mode decides for itself which fetch it emits, so nothing
+            // here can promise the rows are only the requested columns.
+            return Ok((crate::core::row::row::rows_into_vec(rows), true));
         }
 
         let prep_stopwatch = std::time::Instant::now();
@@ -1221,7 +2948,8 @@ impl ConcurrentProcessor {
         )
         .await
         {
-            return Ok(bytes);
+            // The cached path fetches `requested_row_fetch` and nothing else.
+            return Ok((bytes, false));
         }
 
         let (tx_b, rx_b) = kanal::unbounded_async::<Vec<u8>>();
@@ -1237,27 +2965,24 @@ impl ConcurrentProcessor {
 
         let limit_counter: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
         let stop_processing: Arc<CacheGuard<AtomicBool>> = Arc::new(AtomicBool::new(false).into());
-        let eval_error: Arc<CacheGuard<AtomicU8>> = Arc::new(AtomicU8::new(0).into());
+        let eval_error: Arc<CacheGuard<ScanFailure>> = Arc::new(ScanFailure::default().into());
         let enforce_limit_early = limit.is_some();
 
-        let shared_tuple: Arc<(RowFetch, RowFetch)> = Arc::new((
-            query_row_fetch,
-            requested_row_fetch,
-        ));
+        let shared_tuple: Arc<(RowFetch, RowFetch)> =
+            Arc::new((query_row_fetch, requested_row_fetch));
 
         let schema_arc = Self::schema_arc(table_schema);
 
         let io_rows_outer = Arc::clone(&io_rows);
 
-        let (no_filter, tokens_arc) = Self::prepare_query(where_query, &schema_arc)
-            .map_err(std::io::Error::other)?;
+        let (no_filter, tokens_arc) =
+            Self::prepare_query(where_query, &schema_arc).map_err(std::io::Error::other)?;
         let compiled_plan = if no_filter {
             None
         } else {
             Some(Arc::new(
-                Self::compile_query_plan(&schema_arc, &tokens_arc).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-                })?,
+                Self::compile_query_plan(&schema_arc, &tokens_arc)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
             ))
         };
 
@@ -1276,6 +3001,13 @@ impl ConcurrentProcessor {
                     .zip(q.iter())
                     .all(|(rc, qc)| qc.schema_id == rc.schema_id)
         };
+        // The only emit that is not exactly `requested_row_fetch`: a covered
+        // query sends the WHERE buffer as it is, requested columns first and
+        // the predicate's own after them. The unfiltered path and the
+        // re-fetch of a matched row both serialize the requested fetch.
+        let overfetched = query_covers_requested
+            && shared_tuple.0.columns_fetching_data.len()
+                > shared_tuple.1.columns_fetching_data.len();
 
         log::info!(
             "Preperation for bytes-mode query completed in {:.2?}",
@@ -1284,11 +3016,12 @@ impl ConcurrentProcessor {
 
         let reading_time_total: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
 
-        let batch_handles = Self::spawn_batch_tasks(
+        let (batch_handles, pointer_read_error) = Self::spawn_batch_tasks(
             iterator,
             Arc::clone(&shared_tuple),
             Arc::clone(&schema_arc),
             compiled_plan.clone(),
+            Self::build_prefilter(no_filter, &tokens_arc, &schema_arc, &shared_tuple.0, iterator.expected_records()),
             io_rows_outer.clone(),
             None,
             Some(tx_b.clone()),
@@ -1302,12 +3035,24 @@ impl ConcurrentProcessor {
             Arc::clone(&reading_time_total),
             Arc::clone(&eval_error),
             visibility.clone(),
+            crate::core::cancel::current(),
+            // Bytes mode never sorts — `process_into_bytes` falls back to the
+            // row-mode path when an ORDER BY is asked for — so there is no key
+            // to keep a top-N by.
+            None,
+            // Bytes mode never serves an aggregate.
+            None,
+            None,
         )
         .await;
 
-        let join_results = join_all(batch_handles).await;
+        let join_results = batch_handles.join().await;
         drop(tx_b);
 
+        // After the join, so no worker outlives the statement it served.
+        if let Some(e) = pointer_read_error {
+            return Err(e.into());
+        }
         Self::check_worker_outcome(join_results, &eval_error)?;
 
         // Drain bytes chunks; pick the largest as the base to avoid copying it.
@@ -1343,18 +3088,11 @@ impl ConcurrentProcessor {
             // See `process`: a prefix is keyed by its limit, a complete set
             // by the bare clause.
             if let Some(generation) = generation {
-                let stopped_early =
-                    stop_processing.load(std::sync::atomic::Ordering::Acquire);
+                let stopped_early = stop_processing.load(std::sync::atomic::Ordering::Acquire);
                 if stopped_early {
                     // Only a prefix, and only meaningful if we know its length.
                     if limit.is_some() {
-                        query_cache::store(
-                            table_name,
-                            where_query,
-                            generation,
-                            limit,
-                            pointers,
-                        );
+                        query_cache::store(table_name, where_query, generation, limit, pointers);
                     }
                 } else {
                     // Ran to completion: a complete match set, which answers
@@ -1372,7 +3110,7 @@ impl ConcurrentProcessor {
             bytes.len()
         );
 
-        Ok(bytes)
+        Ok((bytes, overfetched))
     }
 
     /// Concurrently evaluates a WHERE clause and returns matching row pointers (with their pointer-record offsets).
@@ -1403,7 +3141,7 @@ impl ConcurrentProcessor {
 
         let limit_counter = Arc::new(AtomicU64::new(0));
         let stop_processing = Arc::new(AtomicBool::new(false));
-        let eval_error: Arc<CacheGuard<AtomicU8>> = Arc::new(AtomicU8::new(0).into());
+        let eval_error: Arc<CacheGuard<ScanFailure>> = Arc::new(ScanFailure::default().into());
         // A WHERE clause the planner refuses. Reported through the result
         // rather than by panicking: the panic unwound the task running the
         // statement and the connection with it, where the SELECT path returns
@@ -1433,6 +3171,16 @@ impl ConcurrentProcessor {
         let schema_arc = Arc::new(table_schema);
         let tokens_arc = Arc::new(tokens);
 
+        // As in the SELECT scan, built once for the statement and shared by
+        // every batch. Not for an index's candidate list: those few rows are
+        // already the ones that may match, so there is nothing left to skip
+        // and building it would be the whole cost.
+        let prefilter: Option<Arc<BatchPrefilter>> = if no_filter || iterator.has_sparse_candidates() {
+            None
+        } else {
+            BatchPrefilter::build(tokens_arc.as_slice(), schema_arc.as_slice(), &shared_tuple).map(Arc::new)
+        };
+
         log::info!(
             "Preperation for pointer query completed in {:.2?}",
             prep_stopwatch.elapsed()
@@ -1447,12 +3195,19 @@ impl ConcurrentProcessor {
         // joined so the scan reports the failure instead of a short answer.
         let mut pointer_read_error: Option<crate::core::row::error::RowError> = None;
 
+        // As in the row-mode dispatcher: each batch is sized to the rows
+        // still expected, so a one-row `UPDATE` through an index does not
+        // allocate room for a whole batch (and again for the empty read
+        // that ends the loop).
+        let mut still_expected = iterator.expected_records();
+
         loop {
             if stop_processing.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
 
-            let mut pointers: Vec<RowPointerWithOffset> = Vec::with_capacity(crate::batch_size());
+            let capacity = (still_expected.min(crate::batch_size() as u64) as usize).max(1);
+            let mut pointers: Vec<RowPointerWithOffset> = Vec::with_capacity(capacity);
 
             for _ in 0..crate::batch_size() {
                 match iterator.next_row_pointer_with_offset().await {
@@ -1476,6 +3231,21 @@ impl ConcurrentProcessor {
             if pointers.is_empty() {
                 break;
             }
+            still_expected = still_expected.saturating_sub(pointers.len() as u64);
+
+            // As in the row-mode dispatcher above: the candidate rows this
+            // statement read, counted once per batch in the task running it.
+            #[cfg(feature = "query_stats")]
+            crate::core::query_stats::note_rows_scanned(pointers.len() as u64);
+
+            // As in the row-mode dispatcher above: the error is recorded before
+            // the stop flag, so a cancelled scan fails rather than returning a
+            // prefix of its rows as a complete answer.
+            if let Some(reason) = crate::core::cancel::tripped() {
+                eval_error.record(reason.eval_error());
+                stop_processing.store(true, std::sync::atomic::Ordering::Relaxed);
+                break;
+            }
 
             if stop_processing.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
@@ -1488,6 +3258,7 @@ impl ConcurrentProcessor {
             let tx_clone = tx.clone();
             let schema_ref = Arc::clone(&schema_arc);
             let tokens_ref = Arc::clone(&tokens_arc);
+            let prefilter_ref = prefilter.as_ref().map(Arc::clone);
             let io_rows_batch = Arc::clone(&io_rows_outer);
 
             let limit_opt = limit;
@@ -1501,7 +3272,7 @@ impl ConcurrentProcessor {
             // batch needs its own so the task can own it.
             let visibility_ref = visibility.clone();
 
-            let batch_handle = task::spawn(async move {
+            let batch_handle = task::spawn(crate::core::statement_clock::inherit(async move {
                 // Owned permit acquired in the outer loop; held until task completion.
                 let _batch_permit = batch_permit;
 
@@ -1536,7 +3307,7 @@ impl ConcurrentProcessor {
                                 break;
                             }
 
-                            let reserved = limit_counter_ref.fetch_update(
+                            let reserved = limit_counter_ref.try_update(
                                 std::sync::atomic::Ordering::Relaxed,
                                 std::sync::atomic::Ordering::Relaxed,
                                 // `<`, not `<=`: the counter is the number of rows already
@@ -1564,14 +3335,9 @@ impl ConcurrentProcessor {
                 let io_rows_ref: &S = &*io_rows_batch;
                 let batch_read_start = std::time::Instant::now();
 
-                let mut buffer = Buffer {
-                    hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-                    row,
-                    transformers: SmallVec::new(),
-                    intermediate_results: SmallVec::new(),
-                    bool_buffer: SmallVec::new(),
-                    write_order_to_col: SmallVec::new(),
-                };
+                // Boxed, as in `spawn_batch_tasks`: ~11 KB of the task's
+                // future otherwise.
+                let mut buffer = Buffer::boxed(row);
 
                 // Build a processor and parser once per batch
                 let processor_cell = UnsafeCell::new(TransformerProcessor::new(
@@ -1579,10 +3345,29 @@ impl ConcurrentProcessor {
                     &mut buffer.intermediate_results,
                 ));
                 let processor_mut = unsafe { &mut *processor_cell.get() };
-                let parser_cell = UnsafeCell::new(QueryParser::new(&tokens_ref, processor_mut));
+                let parser_cell = UnsafeCell::new(
+                    QueryParser::new(&tokens_ref, processor_mut).with_scales(schema_ref.as_slice()),
+                );
                 let mut plan_built = false;
 
-                for pwo in pointers.into_iter() {
+                // Rows the WHERE cannot match, decided for the batch before any
+                // is fetched; see `prefilter`. It reads only rows this snapshot
+                // can see, which are the only rows the loop below reads.
+                let mut prefilter_scratch = prefilter::Scratch::default();
+                let keep = match prefilter_ref.as_deref() {
+                    Some(pf)
+                        if pf.select(
+                            pointers.iter().map(|p| &p.pointer),
+                            |p| !visibility_ref.visible(p.deleted, p.xmin, p.xmax),
+                            &mut prefilter_scratch,
+                        ) =>
+                    {
+                        pf.run(pointers.len(), io_rows_ref, &mut prefilter_scratch).await
+                    }
+                    _ => None,
+                };
+
+                for (batch_index, pwo) in pointers.into_iter().enumerate() {
                     if stop_ref.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
@@ -1600,6 +3385,18 @@ impl ConcurrentProcessor {
                         pwo.pointer.xmax,
                     ) {
                         continue;
+                    }
+
+                    // Only once the plan is built: it is compiled from the first
+                    // row this batch fetches, and a clause it refuses has to
+                    // fail the statement on that same row, not vanish because
+                    // the prefilter dropped every row before it was reached.
+                    if plan_built {
+                        if let Some(keep) = keep {
+                            if !prefilter::kept(keep, batch_index) {
+                                continue;
+                            }
+                        }
                     }
 
                     let query_row_fetch = &*tuple_clone;
@@ -1630,7 +3427,10 @@ impl ConcurrentProcessor {
                             for column in columns.iter() {
                                 // Here `schema_id` is write_order.
                                 let write_order = column.schema_id as usize;
-                                if let Some(schema_field) = schema.iter().find(|f| f.write_order as usize == write_order) {
+                                if let Some(schema_field) = schema
+                                    .iter()
+                                    .find(|f| f.write_order as usize == write_order)
+                                {
                                     if let Some(entry) = tmp_vec.get_mut(write_order) {
                                         *entry = (
                                             Cow::Borrowed(schema_field.name.as_str()),
@@ -1668,17 +3468,11 @@ impl ConcurrentProcessor {
                     let result = match result {
                         Ok(matched) => matched,
                         Err(e) => {
-                            let _ = eval_error_ref.compare_exchange(
-                                0,
-                                e.to_code(),
-                                std::sync::atomic::Ordering::AcqRel,
-                                std::sync::atomic::Ordering::Acquire,
-                            );
+                            eval_error_ref.record(e);
                             stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
                             break;
                         }
                     };
-
 
                     if result {
                         if let Some(limit_val) = limit_opt {
@@ -1689,7 +3483,7 @@ impl ConcurrentProcessor {
                                 break;
                             }
 
-                            let reserved = limit_counter_ref.fetch_update(
+                            let reserved = limit_counter_ref.try_update(
                                 std::sync::atomic::Ordering::Relaxed,
                                 std::sync::atomic::Ordering::Relaxed,
                                 // `<`, not `<=`: the counter is the number of rows already
@@ -1711,16 +3505,18 @@ impl ConcurrentProcessor {
                 }
 
                 let elapsed_ns = batch_read_start.elapsed().as_nanos() as u64;
-                reading_time_total_clone.fetch_add(
-                    elapsed_ns,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            });
+                reading_time_total_clone
+                    .fetch_add(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
+            }));
 
             batch_handles.push(batch_handle);
         }
 
-        let join_results = join_all(batch_handles).await;
+        let join_results: Vec<std::result::Result<(), String>> = join_all(batch_handles)
+            .await
+            .into_iter()
+            .map(|r| r.map_err(|e| e.to_string()))
+            .collect();
         drop(tx);
 
         Self::check_worker_outcome(join_results, &eval_error)?;
@@ -1757,6 +3553,7 @@ impl ConcurrentProcessor {
     }
 }
 
+#[cfg(test)]
 fn compare_rows_by_schema_id(
     a: &Row,
     b: &Row,
@@ -1783,28 +3580,53 @@ fn compare_rows_by_schema_id(
     }
 }
 
-pub(crate) fn compare_bytes_as_type(db_type: crate::core::db_type::DbType, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+pub(crate) fn compare_bytes_as_type(
+    db_type: crate::core::db_type::DbType,
+    a: &[u8],
+    b: &[u8],
+) -> std::cmp::Ordering {
     use crate::core::db_type::DbType;
 
     match db_type {
-        // Variable-width values order by their bytes. For an array that is not
-        // a meaningful order, but it is stable, which is what a sort needs.
+        // Variable-width values order by their bytes.
         // `JSON` is reporting-only and never reaches storage, but a match has
         // to be exhaustive and a byte compare is the safe answer.
-        // `JSONB` compares by its encoded bytes, which is a *stable* order and
-        // not the one PostgreSQL defines for `jsonb`. Enough for a sort or a
-        // join key; a query that needs jsonb's own ordering does not have it.
-        DbType::STRING | DbType::BYTEA | DbType::ARRAY | DbType::UNKNOWN | DbType::START
-        | DbType::END | DbType::JSON | DbType::JSONB => a.cmp(b),
+        // An array element by element, as PostgreSQL orders one
+        // (`value_codec::array_order`).
+        DbType::ARRAY | DbType::ARRAYOF(_) => crate::core::value_codec::array_order(a, b),
+        DbType::STRING
+        | DbType::BYTEA
+        | DbType::UNKNOWN
+        | DbType::START
+        | DbType::END
+        | DbType::JSON
+        | DbType::JSONTEXT
+        | DbType::BPCHAR(_) => a.cmp(b),
+        // PostgreSQL's `jsonb` order, by value. The encoded bytes used to be
+        // compared instead: stable, but `{"a":1}` and `{"a":1.0}` were two
+        // values to every sort, window and comparison, `ORDER BY doc` was not
+        // PostgreSQL's order, and `doc < '...'` answered a question about the
+        // encoding. Bytes that are not a document sort after every document,
+        // by their bytes, so the order stays total for a sort.
+        DbType::JSONB => crate::core::jsonb::order(a, b),
         // Fixed-width and big-endian by construction, so a plain byte compare
         // already yields canonical UUID order and address order.
         DbType::UUID | DbType::INET => a.cmp(b),
-        DbType::CHAR => a.cmp(b),
+        // A legacy `CHAR` by its text (`value_codec::legacy_char_text`), so
+        // `'a '`, a cut `'aé€'` and the blank's two cells sort where the
+        // values they show do.
+        DbType::CHAR => crate::core::value_codec::legacy_char_text(a).cmp(crate::core::value_codec::legacy_char_text(b)),
         // Microseconds since the Unix epoch, stored little-endian. Comparing the
         // raw bytes would order by the low byte first, and would sort negative
         // (pre-1970) instants above positive ones.
-        DbType::DATETIME => read_num::<8, i64>(a, b, i64::from_le_bytes),
+        DbType::DATETIME | DbType::TIMESTAMP => read_num::<8, i64>(a, b, i64::from_le_bytes),
         // Fixed-scale unscaled units, so the integer order is the numeric order.
+        // A column that keeps each value's own scale: its cells by value
+        // (`value_codec::numeric_cell_cmp`); its first sixteen bytes alone
+        // ignore the scale byte, and 1.50 sorted above 2.
+        DbType::DECIMAL if a.len() == 17 || b.len() == 17 => {
+            crate::core::value_codec::numeric_cell_cmp(a, b).unwrap_or_else(|| a.cmp(b))
+        }
         DbType::DECIMAL => read_num::<16, i128>(a, b, i128::from_le_bytes),
         DbType::I8 => read_num::<1, i8>(a, b, i8::from_le_bytes),
         DbType::I16 => read_num::<2, i16>(a, b, i16::from_le_bytes),
@@ -1820,14 +3642,95 @@ pub(crate) fn compare_bytes_as_type(db_type: crate::core::db_type::DbType, a: &[
         DbType::F32 => {
             let av = read_float::<4, f32>(a, f32::from_le_bytes);
             let bv = read_float::<4, f32>(b, f32::from_le_bytes);
-            av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+            pg_float_cmp(av as f64, bv as f64)
         }
         DbType::F64 => {
             let av = read_float::<8, f64>(a, f64::from_le_bytes);
             let bv = read_float::<8, f64>(b, f64::from_le_bytes);
-            av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+            pg_float_cmp(av, bv)
         }
         DbType::NULL => std::cmp::Ordering::Equal,
+
+        // The types stored in PostgreSQL's own wire layout. Their bytes are
+        // big-endian, which memcmp orders correctly for the unsigned parts but
+        // not across a sign, so each one that has a meaningful order decodes
+        // rather than compares raw.
+        DbType::INTERVAL => {
+            let key = |b: &[u8]| {
+                crate::core::pg_types::decode_interval(b)
+                    .map(crate::core::pg_types::interval_sort_key)
+                    .unwrap_or(i128::MIN)
+            };
+            key(a).cmp(&key(b))
+        }
+        // Fixed-width octet strings with no sign: byte order is address order.
+        DbType::MACADDR | DbType::MACADDR8 => a.cmp(b),
+        DbType::DATE => read_num::<4, i32>(a, b, i32::from_be_bytes),
+        DbType::TIME => read_num::<8, i64>(a, b, i64::from_be_bytes),
+        // PostgreSQL orders `timetz` by the UTC-normalised time, then by the
+        // offset, so two spellings of the same instant sort together and still
+        // compare distinct.
+        DbType::TIMETZ => {
+            let key = |x: &[u8]| crate::core::pg_types::timetz_sort_key(x).unwrap_or((i64::MIN, 0));
+            key(a).cmp(&key(b))
+        }
+        // Geometric values have no ordering PostgreSQL defines either, so a
+        // byte compare is used for the same reason it is used for an array: it
+        // is stable, which is all a sort or a join key needs.
+        // A bit string orders as PostgreSQL's `bit_cmp`: the packed bits
+        // (most-significant-first, zero-padded) over the bytes both have,
+        // then the shorter first (the big-endian length prefix compares as the
+        // length): B'0001' < B'1' < B'10'. The whole cell compared, prefix
+        // first, ordered by length and put B'1' before B'0001'.
+        DbType::BIT | DbType::VARBIT => match (a.split_at_checked(4), b.split_at_checked(4)) {
+            (Some((la, ba)), Some((lb, bb))) => {
+                let common = ba.len().min(bb.len());
+                ba[..common].cmp(&bb[..common]).then_with(|| la.cmp(lb))
+            }
+            _ => a.cmp(b),
+        },
+        DbType::POINT
+        | DbType::LINE
+        | DbType::LSEG
+        | DbType::BOX
+        | DbType::PATH
+        | DbType::POLYGON
+        | DbType::CIRCLE => a.cmp(b),
+        // A range orders by its lower bound then its upper, which is what
+        // PostgreSQL does. An undecodable or empty range sorts first.
+        DbType::INT4RANGE
+        | DbType::INT8RANGE
+        | DbType::NUMRANGE
+        | DbType::TSRANGE
+        | DbType::TSTZRANGE
+        | DbType::DATERANGE => {
+            let key = |x: &[u8]| {
+                crate::core::pg_types::range_bounds_key(&db_type, x)
+                    .map(|(lo, hi, _, _)| (lo, hi))
+                    .unwrap_or((i128::MIN, i128::MIN))
+            };
+            key(a).cmp(&key(b))
+        }
+    }
+}
+
+/// PostgreSQL's total order on floating point: `NaN` equals `NaN` and is
+/// greater than every other value, infinities included; `-0` equals `+0`.
+///
+/// `partial_cmp` has no answer for `NaN`, and the `Equal` this used to fall
+/// back to made `NaN` equal to *every* value — not an order at all, since
+/// `1 = NaN = 2` while `1 < 2`. A sort given that may return any arrangement,
+/// a selection and a sort over the same rows can disagree about which rows
+/// are the smallest `k`, and the standard library's sort may panic when it
+/// detects the inconsistency. `pg_float_order` pins the semantics.
+pub(crate) fn pg_float_cmp(a: f64, b: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        // Neither is NaN, so this is total, and it treats -0 and +0 as equal.
+        (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
     }
 }
 
@@ -1871,6 +3774,44 @@ pub struct Buffer<'a> {
     /// Precomputed map: write_order -> position in `row.columns`.
     /// `u8::MAX` denotes an absent column. Computed once per batch.
     pub write_order_to_col: SmallVec<[u8; 32]>,
+}
+
+impl Buffer<'_> {
+    /// An empty buffer around `row`, built in its allocation.
+    ///
+    /// `Box::new(Buffer { .. })` builds the value on the stack and copies it
+    /// to the heap, all 11.7 KB of it, nearly every byte of which is the
+    /// unused inline space of an empty `SmallVec`: a point lookup spent more
+    /// on that copy than on reading its row. Written a field at a time, an
+    /// empty `SmallVec` is a store of its length.
+    pub fn boxed(row: Row) -> Box<Self> {
+        let mut slot = Box::<Self>::new_uninit();
+        let buffer = slot.as_mut_ptr();
+        // SAFETY: `buffer` points at the allocation `slot` owns, valid and
+        // aligned for a `Buffer`. Each field is written exactly once, through
+        // a raw place (no reference to uninitialised memory is made), and
+        // every field is written before `assume_init`. The destructuring
+        // below names every field, so one added later fails to compile here
+        // rather than being left unwritten.
+        unsafe {
+            (&raw mut (*buffer).hashtable_buffer).write(UnsafeCell::new(SmallVec::new()));
+            (&raw mut (*buffer).row).write(row);
+            (&raw mut (*buffer).transformers).write(SmallVec::new());
+            (&raw mut (*buffer).intermediate_results).write(SmallVec::new());
+            (&raw mut (*buffer).bool_buffer).write(SmallVec::new());
+            (&raw mut (*buffer).write_order_to_col).write(SmallVec::new());
+            let buffer = slot.assume_init();
+            let Buffer {
+                hashtable_buffer: _,
+                row: _,
+                transformers: _,
+                intermediate_results: _,
+                bool_buffer: _,
+                write_order_to_col: _,
+            } = &*buffer;
+            buffer
+        }
+    }
 }
 
 // A zero-copy view over Row's MemoryBlocks for execution, indexed by schema write_order.
@@ -1933,6 +3874,11 @@ impl<'a> RowBlocks for RowView<'a> {
     fn len(&self) -> usize {
         self.idx_map.len()
     }
+
+    #[inline]
+    fn row(&self) -> Option<&Row> {
+        Some(self.row)
+    }
 }
 
 /// Build / refresh the `write_order -> row column position` map for the columns currently
@@ -1976,6 +3922,41 @@ pub(crate) fn build_write_order_map(
 }
 
 #[cfg(test)]
+mod small_scan_rule_tests {
+    use super::*;
+
+    /// A point lookup's one-row batch, and any batch short of
+    /// `YIELD_MIN_BATCH`, does not give the thread back; a full batch does,
+    /// as does every batch an index answer is cut into.
+    #[test]
+    fn only_a_batch_of_real_work_yields() {
+        for short in [0, 1, 2, 100, YIELD_MIN_BATCH - 1] {
+            assert!(!long_enough_to_yield(short), "{short} rows");
+        }
+        for long in [YIELD_MIN_BATCH, SPARSE_MIN_BATCH, crate::batch_size(), 65_536] {
+            assert!(long_enough_to_yield(long), "{long} rows");
+        }
+    }
+
+    /// The prefilter is left out below `PREFILTER_MIN_ROWS` expected rows and
+    /// built from there up; an unfiltered scan never has one.
+    #[test]
+    fn only_a_scan_of_several_rows_is_prefiltered() {
+        for few in [0, 1, PREFILTER_MIN_ROWS - 1] {
+            assert!(!worth_prefiltering(few), "{few} rows");
+        }
+        for many in [PREFILTER_MIN_ROWS, 10_000, u64::MAX] {
+            assert!(worth_prefiltering(many), "{many} rows");
+        }
+        let schema = Arc::new(SmallVec::new());
+        let tokens = Arc::new(SmallVec::new());
+        let fetch = RowFetch { columns_fetching_data: SmallVec::new() };
+        assert!(ConcurrentProcessor::build_prefilter(true, &tokens, &schema, &fetch, u64::MAX).is_none());
+        assert!(ConcurrentProcessor::build_prefilter(false, &tokens, &schema, &fetch, 1).is_none());
+    }
+}
+
+#[cfg(test)]
 mod order_limit_tests {
     use super::*;
     use crate::core::db_type::DbType;
@@ -1987,13 +3968,28 @@ mod order_limit_tests {
         let mut mb = MEMORY_POOL.acquire(bytes.len());
         mb.into_slice_mut().copy_from_slice(&bytes);
         let mut columns = SmallVec::new();
-        columns.push(Column { schema_id: 0, data: mb, column_type: DbType::I64 });
-        Row { position: v as u64, columns, length: 8 as _ }
+        columns.push(Column {
+            schema_id: 0,
+            data: mb,
+            column_type: DbType::I64,
+        });
+        Row {
+            position: v as u64,
+            columns,
+            length: 8 as _,
+        }
     }
 
     fn schema() -> Arc<SmallVec<[SchemaField; 20]>> {
         let mut f = SmallVec::new();
-        f.push(SchemaField::new("v".to_string(), DbType::I64, 8, 0, 0, false));
+        f.push(SchemaField::new(
+            "v".to_string(),
+            DbType::I64,
+            8,
+            0,
+            0,
+            false,
+        ));
         Arc::new(f)
     }
 
@@ -2012,7 +4008,9 @@ mod order_limit_tests {
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut vs: Vec<i64> = (0..n).collect();
         for i in (1..vs.len()).rev() {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let j = ((state >> 33) as usize) % (i + 1);
             vs.swap(i, j);
         }
@@ -2060,8 +4058,809 @@ mod order_limit_tests {
         assert_eq!(rows.len(), 5);
     }
 
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self, bound: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % bound
+        }
+    }
+
+    fn col(schema_id: u64, column_type: DbType, bytes: &[u8]) -> Column {
+        let mut mb = MEMORY_POOL.acquire(bytes.len());
+        mb.into_slice_mut().copy_from_slice(bytes);
+        Column {
+            schema_id: crate::core::row::row::schema_id_of(schema_id),
+            data: mb,
+            column_type,
+        }
+    }
+
+    /// id I64, name STRING, score F64, n I32 (nullable), __null_n, ts DATETIME.
+    fn wide_schema() -> Arc<SmallVec<[SchemaField; 20]>> {
+        let mut f = SmallVec::new();
+        for (wo, (name, ty, size)) in [
+            ("id", DbType::I64, 8),
+            ("name", DbType::STRING, 0),
+            ("score", DbType::F64, 8),
+            ("n", DbType::I32, 4),
+            ("__null_n", DbType::U8, 1),
+            ("ts", DbType::DATETIME, 8),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            f.push(SchemaField::new(name.to_string(), ty, size, 0, wo as u64, false));
+        }
+        Arc::new(f)
+    }
+
+    /// A row of `wide_schema`, with few distinct values per column so ties are
+    /// common and later keys get exercised.
+    fn wide_row(rng: &mut Rng, position: u64) -> Row {
+        let names = ["", "a", "ab", "b", "Zed", "é", "abc", "aa"];
+        let null = rng.next(4) == 0;
+        let n: i32 = if null { 0 } else { rng.next(7) as i32 - 3 };
+        let mut columns: crate::core::row::row::RowColumns = SmallVec::new();
+        columns.push(col(0, DbType::I64, &(rng.next(5) as i64 - 2).to_le_bytes()));
+        columns.push(col(
+            1,
+            DbType::STRING,
+            names[rng.next(names.len() as u64) as usize].as_bytes(),
+        ));
+        let scores = [-1.5f64, 0.0, 2.25, f64::NAN, -0.0];
+        columns.push(col(2, DbType::F64, &scores[rng.next(5) as usize].to_le_bytes()));
+        columns.push(col(3, DbType::I32, &n.to_le_bytes()));
+        columns.push(col(4, DbType::U8, &[null as u8]));
+        columns.push(col(5, DbType::DATETIME, &(rng.next(4) as i64 * -1_000_003).to_le_bytes()));
+        Row {
+            position,
+            columns,
+            length: 0 as _,
+        }
+    }
+
+    /// Rows that do not share the sample's layout: shuffled, a column missing,
+    /// a column the schema does not name (schema_id 9, typed by the column).
+    fn perturb(rng: &mut Rng, row: &mut Row) {
+        match rng.next(6) {
+            0 => {
+                let len = row.columns.len();
+                for i in (1..len).rev() {
+                    let j = rng.next(i as u64 + 1) as usize;
+                    row.columns.swap(i, j);
+                }
+            }
+            1 => {
+                let at = rng.next(row.columns.len() as u64) as usize;
+                row.columns.remove(at);
+            }
+            2 => row
+                .columns
+                .push(col(9, DbType::I32, &(rng.next(3) as i32 - 1).to_le_bytes())),
+            _ => {}
+        }
+    }
+
+    fn random_keys(rng: &mut Rng) -> Vec<SortKey> {
+        (0..rng.next(3) + 1)
+            .map(|_| {
+                let schema_id = [0usize, 1, 2, 3, 5, 9][rng.next(6) as usize];
+                SortKey {
+                    schema_id,
+                    descending: rng.next(2) == 0,
+                    null_flag: (schema_id == 3 && rng.next(4) != 0).then_some(4),
+                }
+            })
+            .collect()
+    }
+
+    /// The prepared comparator against per-call resolution, over rows whose
+    /// layouts differ from the sample's, keys the schema does not name,
+    /// NULLs, NaN, negative zero and empty strings.
+    #[test]
+    fn prepared_sort_agrees_with_per_call_resolution() {
+        let sc = wide_schema();
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        for round in 0..400 {
+            let keys = random_keys(&mut rng);
+            let mut rows: Vec<Row> = (0..60).map(|i| wide_row(&mut rng, i)).collect();
+            if round % 2 == 0 {
+                for row in rows.iter_mut() {
+                    perturb(&mut rng, row);
+                }
+            }
+            let sample = &rows[rng.next(rows.len() as u64) as usize];
+            let sort = PreparedSort::new(&keys, sc.as_slice(), Some(sample));
+            for a in &rows {
+                for b in &rows {
+                    assert_eq!(
+                        sort.compare(a, b),
+                        ConcurrentProcessor::compare_by_keys(a, b, &keys, sc.as_slice()),
+                        "round {round}"
+                    );
+                }
+            }
+            // No sample at all: every lookup falls back to the search.
+            let blind = PreparedSort::new(&keys, sc.as_slice(), None);
+            assert_eq!(
+                blind.compare(&rows[0], &rows[1]),
+                ConcurrentProcessor::compare_by_keys(&rows[0], &rows[1], &keys, sc.as_slice())
+            );
+        }
+    }
+
+    /// The sort and the capped selection through `sort_rows_if_needed` give the
+    /// same rows, in the same order, as the per-call comparator did — stable
+    /// sort, so even tied rows keep their positions.
+    #[test]
+    fn sort_rows_matches_the_per_call_sort() {
+        let sc = wide_schema();
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for spec in ["name", "n DESC, name", "ts, id DESC, score", "score DESC", "n, id"] {
+            let rows: Vec<Row> = (0..3000).map(|i| wide_row(&mut rng, i)).collect();
+            let keys = ConcurrentProcessor::resolve_sort_keys(&sc, spec);
+            let mut expect: Vec<Row> = rows.iter().map(Row::clone_row).collect();
+            expect.sort_by(|a, b| ConcurrentProcessor::compare_by_keys(a, b, &keys, sc.as_slice()));
+            let mut got = rows;
+            ConcurrentProcessor::sort_rows_if_needed(&mut got, &sc, &Some(spec.to_string()), None);
+            let pos = |v: &[Row]| v.iter().map(|r| r.position).collect::<Vec<_>>();
+            assert_eq!(pos(&got), pos(&expect), "{spec}");
+
+            // Capped: tie order is unspecified there, so compare the key
+            // sequence rather than the positions. `score` carries NaN and -0,
+            // which only works because `pg_float_cmp` makes that a total order.
+            let mut capped: Vec<Row> = expect.iter().map(Row::clone_row).collect();
+            capped.reverse();
+            ConcurrentProcessor::sort_rows_if_needed(
+                &mut capped,
+                &sc,
+                &Some(spec.to_string()),
+                Some(200),
+            );
+            assert_eq!(capped.len(), 200);
+            for (a, b) in capped.iter().zip(expect.iter()) {
+                assert_eq!(
+                    ConcurrentProcessor::compare_by_keys(a, b, &keys, sc.as_slice()),
+                    std::cmp::Ordering::Equal,
+                    "{spec}"
+                );
+            }
+        }
+    }
+
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored
+    /// order_by_bench --nocapture`. 1M rows, 1-3 keys, uncapped and LIMIT 200.
+    #[test]
+    #[ignore]
+    fn order_by_bench() {
+        let sc = wide_schema();
+        let make = || {
+            let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
+            (0..1_000_000u64)
+                .map(|i| {
+                    let mut row = wide_row(&mut rng, i);
+                    // More distinct names than the differential test uses.
+                    let name = format!("customer-{:06}", rng.next(400_000));
+                    row.columns[1] = col(1, DbType::STRING, name.as_bytes());
+                    row
+                })
+                .collect::<Vec<Row>>()
+        };
+        for round in 0..2 {
+            for spec in ["name", "n DESC, name", "ts, id DESC, score"] {
+                for limit in [None, Some(200u64)] {
+                    let keys = ConcurrentProcessor::resolve_sort_keys(&sc, spec);
+                    let mut rows = make();
+                    let t = std::time::Instant::now();
+                    let compare = |a: &Row, b: &Row| {
+                        ConcurrentProcessor::compare_by_keys(a, b, &keys, sc.as_slice())
+                    };
+                    match limit {
+                        Some(k) => {
+                            rows.select_nth_unstable_by(k as usize - 1, compare);
+                            rows.truncate(k as usize);
+                            rows.sort_by(compare);
+                        }
+                        None => rows.sort_by(compare),
+                    }
+                    let old = t.elapsed();
+                    drop(rows);
+                    {
+                        // Old comparator, new row movement: separates the two
+                        // halves of the change.
+                        let mut rows = make();
+                        let t = std::time::Instant::now();
+                        match limit {
+                            Some(k) => select_rows_indirect(&mut rows, k as usize, compare),
+                            None => sort_rows_indirect(&mut rows, compare),
+                        }
+                        println!("    per-call comparator, indirect {:>9.2?}", t.elapsed());
+                    }
+                    let mut rows = make();
+                    let t = std::time::Instant::now();
+                    ConcurrentProcessor::sort_rows_if_needed(
+                        &mut rows,
+                        &sc,
+                        &Some(spec.to_string()),
+                        limit,
+                    );
+                    let new = t.elapsed();
+                    println!(
+                        "round {round} {spec:<20} limit {limit:?}: old {old:>9.2?}  new {new:>9.2?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// PostgreSQL's float order: -inf < … < -0 = +0 < … < +inf < NaN = NaN,
+    /// for both widths, and the comparator is a total order over all of them.
+    #[test]
+    fn pg_float_order() {
+        use std::cmp::Ordering::*;
+        let ascending = [
+            f64::NEG_INFINITY,
+            -2.5,
+            -f64::MIN_POSITIVE,
+            -0.0,
+            0.0,
+            f64::MIN_POSITIVE,
+            1.0,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NAN,
+            -f64::NAN,
+        ];
+        // Rank: -0/+0 share one, every NaN shares the last.
+        let rank = |v: f64| -> usize {
+            if v.is_nan() {
+                99
+            } else if v == 0.0 {
+                3
+            } else {
+                ascending.iter().position(|x| *x == v).unwrap()
+            }
+        };
+        for &a in &ascending {
+            for &b in &ascending {
+                let expect = rank(a).cmp(&rank(b));
+                let f64_ord = compare_bytes_as_type(DbType::F64, &a.to_le_bytes(), &b.to_le_bytes());
+                assert_eq!(f64_ord, expect, "f64 {a} vs {b}");
+                let f32_ord = compare_bytes_as_type(
+                    DbType::F32,
+                    &(a as f32).to_le_bytes(),
+                    &(b as f32).to_le_bytes(),
+                );
+                // f64::MIN_POSITIVE and MAX do not survive the narrowing.
+                if ![f64::MIN_POSITIVE, -f64::MIN_POSITIVE, f64::MAX].contains(&a)
+                    && ![f64::MIN_POSITIVE, -f64::MIN_POSITIVE, f64::MAX].contains(&b)
+                {
+                    assert_eq!(f32_ord, expect, "f32 {a} vs {b}");
+                }
+            }
+        }
+        assert_eq!(pg_float_cmp(f64::NAN, f64::NAN), Equal);
+        assert_eq!(pg_float_cmp(f64::NAN, f64::INFINITY), Greater);
+        assert_eq!(pg_float_cmp(-0.0, 0.0), Equal);
+    }
+
+    /// ORDER BY a nullable float through both the capped and uncapped paths:
+    /// NaN after +inf, NULL after NaN ascending, the mirror descending.
+    #[test]
+    fn nan_null_and_signed_zero_order_capped_and_uncapped() {
+        let mut f = SmallVec::new();
+        f.push(SchemaField::new("id".into(), DbType::I64, 8, 0, 0, false));
+        f.push(SchemaField::new("v".into(), DbType::F64, 8, 0, 1, false));
+        f.push(SchemaField::new("__null_v".into(), DbType::U8, 1, 0, 2, false));
+        let sc: Arc<SmallVec<[SchemaField; 20]>> = Arc::new(f);
+        let values: [(i64, Option<f64>); 9] = [
+            (1, Some(1.5)),
+            (2, Some(f64::NAN)),
+            (3, None),
+            (4, Some(-0.0)),
+            (5, Some(0.0)),
+            (6, Some(f64::INFINITY)),
+            (7, Some(f64::NEG_INFINITY)),
+            (8, Some(f64::NAN)),
+            (9, Some(-2.0)),
+        ];
+        let rows = || -> Vec<Row> {
+            values
+                .iter()
+                .rev()
+                .map(|(id, v)| {
+                    let mut columns: crate::core::row::row::RowColumns = SmallVec::new();
+                    columns.push(col(0, DbType::I64, &id.to_le_bytes()));
+                    columns.push(col(1, DbType::F64, &v.unwrap_or(0.0).to_le_bytes()));
+                    columns.push(col(2, DbType::U8, &[v.is_none() as u8]));
+                    Row {
+                        position: *id as u64,
+                        columns,
+                        length: 0 as _,
+                    }
+                })
+                .collect()
+        };
+        let ids = |rows: &[Row]| rows.iter().map(|r| r.position as i64).collect::<Vec<_>>();
+        let asc = vec![7, 9, 4, 5, 1, 6, 2, 8, 3];
+        let desc = vec![3, 2, 8, 6, 1, 4, 5, 9, 7];
+        for (spec, expect) in [("v, id", &asc), ("v DESC, id", &desc)] {
+            for limit in [None, Some(4u64), Some(1)] {
+                let mut got = rows();
+                ConcurrentProcessor::sort_rows_if_needed(&mut got, &sc, &Some(spec.into()), limit);
+                let want: Vec<i64> =
+                    expect.iter().copied().take(limit.unwrap_or(99) as usize).collect();
+                assert_eq!(ids(&got), want, "{spec} limit {limit:?}");
+            }
+        }
+    }
+
     #[allow(non_snake_case)]
     fn Self_sort(rows: &mut Vec<Row>, sc: &Arc<SmallVec<[SchemaField; 20]>>, k: Option<u64>) {
         ConcurrentProcessor::sort_rows_if_needed(rows, sc, &Some("v".to_string()), k);
+    }
+}
+
+#[cfg(test)]
+mod pointer_read_failure_tests {
+    //! A pointer read that fails mid-scan must fail the statement.
+    //!
+    //! The row-mode dispatcher used to treat it as the end of the table, so a
+    //! scan over an unreadable pointer file returned whatever it had reached as
+    //! a complete, successful answer.
+    use super::*;
+    use crate::core::row::row::RowFetch;
+    use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+    use crate::core::storage_providers::memory::MemoryStorageProvider;
+    use std::io::SeekFrom;
+    use std::sync::atomic::AtomicU32;
+
+    /// An in-memory provider whose reads start failing once `reads_left`
+    /// reaches zero. `u32::MAX` never fails.
+    #[derive(Clone)]
+    struct FailingIO {
+        inner: MemoryStorageProvider,
+        reads_left: StdArc<AtomicU32>,
+    }
+
+    impl FailingIO {
+        fn take_read(&self) -> std::io::Result<()> {
+            let left = self.reads_left.load(std::sync::atomic::Ordering::SeqCst);
+            if left == u32::MAX {
+                return Ok(());
+            }
+            if left == 0 {
+                return Err(std::io::Error::other("injected pointer read failure"));
+            }
+            self.reads_left
+                .store(left - 1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl StorageIO for FailingIO {
+        async fn verify_data(&self, position: u64, buffer: &[u8]) -> bool {
+            self.inner.verify_data(position, buffer).await
+        }
+        async fn write_data(&self, position: u64, buffer: &[u8]) {
+            self.inner.write_data(position, buffer).await
+        }
+        async fn write_data_seek(&self, seek: SeekFrom, buffer: &[u8]) {
+            self.inner.write_data_seek(seek, buffer).await
+        }
+        async fn read_data_into_buffer(
+            &self,
+            position: &mut u64,
+            buffer: &mut [u8],
+        ) -> std::io::Result<()> {
+            self.take_read()?;
+            self.inner.read_data_into_buffer(position, buffer).await
+        }
+        async fn read_vectored(&self, reads: &mut [(u64, &mut [u8])]) -> std::io::Result<()> {
+            self.take_read()?;
+            self.inner.read_vectored(reads).await
+        }
+        async fn append_data(&self, buffer: &[u8], immediate: bool) {
+            self.inner.append_data(buffer, immediate).await
+        }
+        async fn append_data_returning_offset(&self, buffer: &[u8], immediate: bool) -> u64 {
+            self.inner
+                .append_data_returning_offset(buffer, immediate)
+                .await
+        }
+        async fn get_len(&self) -> u64 {
+            self.inner.get_len().await
+        }
+        fn exists(location: &str, table_name: &str) -> bool {
+            MemoryStorageProvider::exists(location, table_name)
+        }
+        async fn create_temp(&self) -> Self {
+            Self {
+                inner: self.inner.create_temp().await,
+                reads_left: self.reads_left.clone(),
+            }
+        }
+        async fn swap_temp(&self, temp_io_sync: &mut Self) {
+            self.inner.swap_temp(&mut temp_io_sync.inner).await
+        }
+        fn get_location(&self) -> Option<String> {
+            self.inner.get_location()
+        }
+        async fn create_new(&self, name: String) -> Self {
+            Self {
+                inner: self.inner.create_new(name).await,
+                reads_left: self.reads_left.clone(),
+            }
+        }
+        fn drop_io(&self) {
+            self.inner.drop_io()
+        }
+        fn get_hash(&self) -> u32 {
+            self.inner.get_hash()
+        }
+        async fn start_service(&self) {}
+        fn get_name(&self) -> String {
+            self.inner.get_name()
+        }
+    }
+
+    /// Two full pointer chunks of live, zero-column records (3047 records a
+    /// chunk), so the first chunk reads and the second does not. The rows
+    /// themselves are never read: the fetch asks for no columns.
+    #[tokio::test]
+    async fn a_failed_pointer_read_fails_the_scan_instead_of_ending_it() {
+        let records = 3047 * 2 + 5;
+        let pointers = FailingIO {
+            inner: MemoryStorageProvider::new("ptr_fail_pointers"),
+            reads_left: StdArc::new(AtomicU32::new(u32::MAX)),
+        };
+        pointers
+            .write_data(0, &vec![0u8; records * ROW_POINTER_RECORD_LEN])
+            .await;
+        let rows_io = Arc::new(FailingIO {
+            inner: MemoryStorageProvider::new("ptr_fail_rows"),
+            reads_left: StdArc::new(AtomicU32::new(u32::MAX)),
+        });
+
+        let fetch = || RowFetch {
+            columns_fetching_data: SmallVec::new(),
+        };
+        let schema: Vec<SchemaField> = Vec::new();
+
+        // Control: with nothing failing, every record is a row.
+        let pointers_arc = Arc::new(pointers.clone());
+        let mut iterator = RowPointerIterator::new(pointers_arc.clone()).await.unwrap();
+        let all = ConcurrentProcessor::new()
+            .process(
+                "t",
+                "",
+                fetch(),
+                fetch(),
+                &schema,
+                rows_io.clone(),
+                &mut iterator,
+                None,
+                None,
+                None,
+                Visibility::All,
+            )
+            .await
+            .expect("an intact pointer file scans");
+        assert_eq!(all.len(), records);
+
+        // The first chunk reads, the second fails.
+        let mut iterator = RowPointerIterator::new(pointers_arc.clone()).await.unwrap();
+        pointers
+            .reads_left
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let outcome = ConcurrentProcessor::new()
+            .process(
+                "t",
+                "",
+                fetch(),
+                fetch(),
+                &schema,
+                rows_io.clone(),
+                &mut iterator,
+                None,
+                None,
+                None,
+                Visibility::All,
+            )
+            .await;
+        match outcome {
+            Ok(rows) => panic!(
+                "a pointer read failure was reported as success with {} of {} rows",
+                rows.len(),
+                records
+            ),
+            Err(e) => assert!(
+                e.to_string().contains("injected pointer read failure"),
+                "unexpected error: {e}"
+            ),
+        }
+
+        // The COUNT(*) path shares the dispatcher and must fail the same way.
+        pointers
+            .reads_left
+            .store(u32::MAX, std::sync::atomic::Ordering::SeqCst);
+        let mut iterator = RowPointerIterator::new(pointers_arc.clone()).await.unwrap();
+        pointers
+            .reads_left
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let counted = ConcurrentProcessor::new()
+            .process_count(
+                "t",
+                "",
+                fetch(),
+                &schema,
+                rows_io.clone(),
+                &mut iterator,
+                None,
+                Visibility::All,
+            )
+            .await;
+        assert!(counted.is_err(), "count reported {:?}", counted.ok());
+    }
+}
+
+#[cfg(test)]
+mod latency_bench {
+    //! Point-read latency while another session runs a big scan or sort.
+
+    use crate::core::database::Database;
+    use crate::core::rql::executor;
+    use crate::core::rql::lexer_s1::recognize_query_purpose;
+    use rclite::Arc;
+    use std::time::{Duration, Instant};
+
+    async fn run(database: &Arc<Database>, sql: &str) -> Vec<u8> {
+        let purpose = recognize_query_purpose(sql).expect("parse");
+        executor::execute(purpose, database.clone()).await
+    }
+
+    fn percentile(sorted: &[Duration], p: f64) -> Duration {
+        sorted[((sorted.len() as f64 - 1.0) * p).round() as usize]
+    }
+
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored
+    /// point_read_latency_under_a_big_scan --nocapture --test-threads 1`.
+    ///
+    /// One session repeatedly scans and sorts a 300k-row table while another
+    /// reads single rows from a small one; the reader's latency is recorded
+    /// with the per-batch yield and the off-worker sort on and off.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn point_read_latency_under_a_big_scan() {
+        // File-backed by default: an in-memory table measures the in-memory
+        // provider's locking rather than the scheduler — every stall the
+        // in-memory runs showed was four workers parked on that provider's
+        // buffer lock. `LATENCY_BENCH_MEMORY=1` keeps the in-memory mode, so
+        // a change to that provider stays measurable.
+        let in_memory = std::env::var("LATENCY_BENCH_MEMORY").is_ok_and(|v| v == "1");
+        let dir = format!("/var/tmp/latency_bench_{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&dir);
+        let database = Arc::new(if in_memory {
+            Database::new_with_backend("latency_bench", true).await
+        } else {
+            Database::new_with_backend(&dir, false).await
+        });
+        println!("latency bench: {} backend", if in_memory { "in-memory" } else { "file" });
+        // Removed however the test ends.
+        struct RemoveDir(String);
+        impl Drop for RemoveDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = RemoveDir(dir);
+        run(&database, "CREATE TABLE big (id BIGINT NOT NULL, v BIGINT NOT NULL, s TEXT NOT NULL)").await;
+        run(&database, "CREATE TABLE small (id BIGINT NOT NULL, s TEXT NOT NULL)").await;
+        let rows = 300_000u64;
+        for chunk in 0..(rows / 1000) {
+            let values: Vec<String> = (0..1000u64)
+                .map(|k| {
+                    let i = chunk * 1000 + k;
+                    format!("({i}, {}, 'row {i} padding padding')", (i * 7919) % rows)
+                })
+                .collect();
+            run(&database, &format!("INSERT INTO big (id, v, s) VALUES {}", values.join(", "))).await;
+        }
+        let values: Vec<String> = (0..100u64).map(|i| format!("({i}, 's{i}')")).collect();
+        run(&database, &format!("INSERT INTO small (id, s) VALUES {}", values.join(", "))).await;
+
+        for round in 0..2 {
+            for guards in [false, true] {
+                super::LATENCY_GUARDS_OFF.store(!guards, std::sync::atomic::Ordering::Relaxed);
+                for load in [
+                    "SELECT * FROM big WHERE v >= 0",
+                    "SELECT * FROM big ORDER BY v",
+                    // The executor's post-scan loop (a constant makes every row
+                    // pass through it) and its expression sort (explicit NULLS
+                    // placement routes there).
+                    "SELECT id, v, s, 1 AS one FROM big WHERE v >= 0",
+                    "SELECT * FROM big ORDER BY v DESC NULLS LAST",
+                ] {
+                    // The load alone first: what the guards cost it.
+                    let t = Instant::now();
+                    for _ in 0..3 {
+                        std::hint::black_box(run(&database, load).await);
+                    }
+                    let alone = t.elapsed() / 3;
+
+                    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let mut loaders = Vec::new();
+                    for _ in 0..2 {
+                        let (db, stop) = (database.clone(), stop.clone());
+                        loaders.push(tokio::spawn(async move {
+                            let mut n = 0u32;
+                            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                std::hint::black_box(run(&db, load).await);
+                                n += 1;
+                            }
+                            n
+                        }));
+                    }
+                    // No timers anywhere in the measurement: a sleeping task
+                    // is woken by a worker that parks, and starving the
+                    // workers is the very thing being measured.
+                    let mut latencies = Vec::new();
+                    let started = Instant::now();
+                    let mut k = 0u64;
+                    while latencies.len() < 400 && started.elapsed() < Duration::from_secs(20) {
+                        let t = Instant::now();
+                        let r = run(&database, &format!("SELECT s FROM small WHERE id = {}", k % 100)).await;
+                        latencies.push(t.elapsed());
+                        assert_eq!(r.first(), Some(&2));
+                        k += 1;
+                    }
+                    let window = started.elapsed();
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let mut scans = 0;
+                    for l in loaders {
+                        scans += l.await.unwrap();
+                    }
+                    latencies.sort();
+                    println!(
+                        "round {round} guards {:<3} {:<30} alone {:>8.1?} | reads {:>4} in {:>6.1?}  p50 {:>9.1?}  p99 {:>9.1?}  max {:>9.1?}  (load ran {scans}x)",
+                        if guards { "on" } else { "off" },
+                        load,
+                        alone,
+                        latencies.len(),
+                        window,
+                        percentile(&latencies, 0.50),
+                        percentile(&latencies, 0.99),
+                        latencies.last().unwrap(),
+                    );
+                }
+            }
+        }
+        super::LATENCY_GUARDS_OFF.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod integer_key_sort_tests {
+    //! The integer-key shortcut in `sort_rows_if_needed` against a stable
+    //! comparison sort by `PreparedSort::compare` — the order it replaced — over
+    //! heavy ties, NULLs, signed and unsigned widths, timestamps either side of
+    //! 1970, both directions, with and without a cap.
+    use super::*;
+    use crate::core::db_type::DbType;
+    use crate::core::row::row::{Column, Row};
+    use crate::memory_pool::MEMORY_POOL;
+
+    const FIELDS: [(&str, DbType, u32); 7] = [
+        ("v", DbType::I64, 8),
+        ("__null_v", DbType::BOOL, 1),
+        ("w", DbType::I32, 4),
+        ("u", DbType::U8, 1),
+        ("ts", DbType::DATETIME, 8),
+        ("big", DbType::U64, 8),
+        ("id", DbType::U64, 8),
+    ];
+
+    fn schema() -> Arc<SmallVec<[SchemaField; 20]>> {
+        Arc::new(
+            FIELDS
+                .iter()
+                .enumerate()
+                .map(|(i, (n, t, size))| SchemaField::new(n.to_string(), t.clone(), *size, 0, i as u64, false))
+                .collect(),
+        )
+    }
+
+    fn col(id: u64, ty: DbType, bytes: &[u8]) -> Column {
+        let mut data = MEMORY_POOL.acquire(bytes.len());
+        data.into_slice_mut().copy_from_slice(bytes);
+        Column {
+            schema_id: crate::core::row::row::schema_id_of(id),
+            data,
+            column_type: ty,
+        }
+    }
+
+    fn rows(n: usize, seed: u64) -> Vec<Row> {
+        let mut state = seed | 1;
+        let mut next = move |m: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % m
+        };
+        (0..n)
+            .map(|id| {
+                let mut columns = SmallVec::new();
+                let null = next(5) == 0;
+                let v: i64 = [i64::MIN, -3, -1, 0, 1, 2, i64::MAX][next(7) as usize];
+                columns.push(col(0, DbType::I64, &(if null { 0 } else { v }).to_le_bytes()));
+                columns.push(col(1, DbType::BOOL, &[null as u8]));
+                columns.push(col(2, DbType::I32, &(next(9) as i32 - 4).to_le_bytes()));
+                columns.push(col(3, DbType::U8, &[[0u8, 1, 127, 128, 255][next(5) as usize]]));
+                columns.push(col(4, DbType::DATETIME, &((next(6) as i64 - 3) * 86_400_000_000).to_le_bytes()));
+                columns.push(col(5, DbType::U64, &[0u64, 1, u64::MAX, 1 << 63][next(4) as usize].to_le_bytes()));
+                columns.push(col(6, DbType::U64, &(id as u64).to_le_bytes()));
+                Row {
+                    position: id as u64,
+                    columns,
+                    length: 0,
+                }
+            })
+            .collect()
+    }
+
+    fn reference(mut rows: Vec<Row>, sc: &Arc<SmallVec<[SchemaField; 20]>>, spec: &str) -> Vec<u64> {
+        let keys = ConcurrentProcessor::resolve_sort_keys(sc, spec);
+        let sort = PreparedSort::new(&keys, sc.as_slice(), rows.first());
+        rows.sort_by(|a, b| sort.compare(a, b));
+        rows.iter().map(|r| r.position).collect()
+    }
+
+    #[test]
+    fn integer_keys_order_exactly_as_the_stable_comparison_sort() {
+        let sc = schema();
+        let mut checked = 0;
+        for (n, seed) in [(0usize, 1u64), (1, 2), (17, 3), (600, 4), (5000, 5)] {
+            for column in ["v", "w", "u", "ts", "big"] {
+                for dir in ["", " ASC", " DESC"] {
+                    let spec = format!("{column}{dir}");
+                    let want = reference(rows(n, seed), &sc, &spec);
+                    // The shortcut must actually be the path taken.
+                    let probe = rows(n.max(1), seed);
+                    let keys = ConcurrentProcessor::resolve_sort_keys(&sc, &spec);
+                    assert!(
+                        PreparedSort::new(&keys, sc.as_slice(), probe.first())
+                            .integer_keys(&probe)
+                            .is_some(),
+                        "{spec} did not take the integer path"
+                    );
+                    for cap in [None, Some(0u64), Some(1), Some(3), Some(n as u64 / 2), Some(n as u64), Some(n as u64 + 2)] {
+                        let mut got = rows(n, seed);
+                        ConcurrentProcessor::sort_rows_if_needed(&mut got, &sc, &Some(spec.clone()), cap);
+                        let got: Vec<u64> = got.iter().map(|r| r.position).collect();
+                        let k = cap.map_or(n, |c| (c as usize).min(n));
+                        assert_eq!(got, want[..k], "{spec} cap {cap:?} n {n}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 400);
+    }
+
+    /// Two keys, or a key some row lacks, keep the comparison sort.
+    #[test]
+    fn shapes_it_cannot_order_fall_back() {
+        let sc = schema();
+        let r = rows(10, 9);
+        let two = ConcurrentProcessor::resolve_sort_keys(&sc, "w, id");
+        assert!(PreparedSort::new(&two, sc.as_slice(), r.first()).integer_keys(&r).is_none());
+        let mut short = rows(10, 9);
+        short[4].columns.retain(|c| c.schema_id != 2);
+        let one = ConcurrentProcessor::resolve_sort_keys(&sc, "w");
+        assert!(PreparedSort::new(&one, sc.as_slice(), short.first()).integer_keys(&short).is_none());
     }
 }

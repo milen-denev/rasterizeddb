@@ -64,6 +64,10 @@ pub enum FrameKind {
     Pong = 7,
     /// A refusal, with a reason a human can read.
     Error = 8,
+    /// "What do your tables hold?" — for comparing two nodes row for row.
+    Digest = 9,
+    /// The answer to a `Digest`.
+    DigestAck = 10,
 }
 
 impl FrameKind {
@@ -78,6 +82,8 @@ impl FrameKind {
             6 => FrameKind::Ping,
             7 => FrameKind::Pong,
             8 => FrameKind::Error,
+            9 => FrameKind::Digest,
+            10 => FrameKind::DigestAck,
             _ => return None,
         })
     }
@@ -95,6 +101,8 @@ impl fmt::Display for FrameKind {
             FrameKind::Ping => "PING",
             FrameKind::Pong => "PONG",
             FrameKind::Error => "ERROR",
+            FrameKind::Digest => "DIGEST",
+            FrameKind::DigestAck => "DIGEST-ACK",
         })
     }
 }
@@ -104,6 +112,11 @@ pub const FLAG_MORE: u8 = 1 << 0;
 /// Set on a record that reached its sender from a third node rather than
 /// originating there — a relayed transaction.
 pub const FLAG_RELAYED: u8 = 1 << 0;
+
+/// Record flag: this sequence carries nothing. The transaction it was handed
+/// to did not commit, and its place in the stream is kept so the stream has no
+/// holes. A peer applies it by moving past it.
+pub const FLAG_VOID: u8 = 1 << 1;
 
 #[derive(Debug)]
 pub enum ProtocolError {
@@ -134,7 +147,11 @@ impl fmt::Display for ProtocolError {
             ProtocolError::UnknownCodec(c) => write!(f, "unknown codec {}", c),
             ProtocolError::Truncated => f.write_str("frame ended in the middle of a field"),
             ProtocolError::TooLarge(len) => {
-                write!(f, "payload of {} bytes exceeds the {} byte limit", len, MAX_PAYLOAD)
+                write!(
+                    f,
+                    "payload of {} bytes exceeds the {} byte limit",
+                    len, MAX_PAYLOAD
+                )
             }
             ProtocolError::CodecUnavailable(c) => {
                 write!(f, "this build cannot decode {} payloads", c)
@@ -317,12 +334,24 @@ impl TxnRecord {
             tables.push(reader.str()?);
         }
 
-        Ok(TxnRecord { origin, seq, commit_hlc, flags, statements, tables })
+        Ok(TxnRecord {
+            origin,
+            seq,
+            commit_hlc,
+            flags,
+            statements,
+            tables,
+        })
     }
 
     #[inline]
     pub fn is_relayed(&self) -> bool {
         self.flags & FLAG_RELAYED != 0
+    }
+
+    #[inline]
+    pub fn is_void(&self) -> bool {
+        self.flags & FLAG_VOID != 0
     }
 }
 
@@ -451,10 +480,19 @@ impl HelloAck {
         let count = reader.u32()? as usize;
         let mut applied = Vec::with_capacity(count.min(reader.remaining() / 16));
         for _ in 0..count {
-            applied.push(VectorEntry { origin: reader.u64()?, seq: reader.u64()? });
+            applied.push(VectorEntry {
+                origin: reader.u64()?,
+                seq: reader.u64()?,
+            });
         }
 
-        Ok(HelloAck { node_id, cluster_id, codec, clock, applied })
+        Ok(HelloAck {
+            node_id,
+            cluster_id,
+            codec,
+            clock,
+            applied,
+        })
     }
 }
 
@@ -559,17 +597,155 @@ impl PushAck {
             let status = ApplyStatus::from_wire(status_byte)
                 .ok_or(ProtocolError::UnknownFrame(status_byte))?;
             let message = reader.str()?;
-            outcomes.push(ApplyOutcome { origin, seq, status, message });
+            outcomes.push(ApplyOutcome {
+                origin,
+                seq,
+                status,
+                message,
+            });
         }
 
         let count = reader.u32()? as usize;
         let mut applied = Vec::with_capacity(count.min(reader.remaining() / 16));
         for _ in 0..count {
-            applied.push(VectorEntry { origin: reader.u64()?, seq: reader.u64()? });
+            applied.push(VectorEntry {
+                origin: reader.u64()?,
+                seq: reader.u64()?,
+            });
         }
 
-        Ok(PushAck { node_id, clock, outcomes, applied })
+        Ok(PushAck {
+            node_id,
+            clock,
+            outcomes,
+            applied,
+        })
     }
+}
+
+/// What one table holds, reduced to something two nodes can compare.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableDigest {
+    pub name: String,
+    pub rows: u64,
+    /// Over every row's column bytes, and independent of the order the rows
+    /// were read in. Zero when `note` says the contents were not read.
+    pub checksum: u64,
+    /// Empty when the table was read whole; otherwise why it was not.
+    pub note: String,
+}
+
+/// A node's answer to a `Digest`: its tables, and where its streams stood
+/// before and after it read them. The two differ when something was written
+/// or applied meanwhile, and the digests then describe no single moment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeDigest {
+    pub node_id: NodeId,
+    /// How far this node's own stream was released, before and after.
+    pub released: (u64, u64),
+    /// Its transactions still committing, after.
+    pub unreleased: u64,
+    pub applied_before: Vec<VectorEntry>,
+    pub applied_after: Vec<VectorEntry>,
+    pub tables: Vec<TableDigest>,
+}
+
+impl NodeDigest {
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        put_u64(out, self.node_id);
+        put_u64(out, self.released.0);
+        put_u64(out, self.released.1);
+        put_u64(out, self.unreleased);
+        for vector in [&self.applied_before, &self.applied_after] {
+            put_u32(out, vector.len() as u32);
+            for entry in vector {
+                put_u64(out, entry.origin);
+                put_u64(out, entry.seq);
+            }
+        }
+        put_u32(out, self.tables.len() as u32);
+        for table in &self.tables {
+            put_str(out, &table.name);
+            put_u64(out, table.rows);
+            put_u64(out, table.checksum);
+            put_str(out, &table.note);
+        }
+    }
+
+    pub fn decode(reader: &mut Reader<'_>) -> Result<NodeDigest, ProtocolError> {
+        let node_id = reader.u64()?;
+        let released = (reader.u64()?, reader.u64()?);
+        let unreleased = reader.u64()?;
+        let mut vectors = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let count = reader.u32()? as usize;
+            let mut vector = Vec::with_capacity(count.min(reader.remaining() / 16));
+            for _ in 0..count {
+                vector.push(VectorEntry {
+                    origin: reader.u64()?,
+                    seq: reader.u64()?,
+                });
+            }
+            vectors.push(vector);
+        }
+        let applied_after = vectors.pop().expect("two vectors");
+        let applied_before = vectors.pop().expect("two vectors");
+        let count = reader.u32()? as usize;
+        let mut tables = Vec::with_capacity(count.min(reader.remaining() / 24));
+        for _ in 0..count {
+            tables.push(TableDigest {
+                name: reader.str()?,
+                rows: reader.u64()?,
+                checksum: reader.u64()?,
+                note: reader.str()?,
+            });
+        }
+        Ok(NodeDigest {
+            node_id,
+            released,
+            unreleased,
+            applied_before,
+            applied_after,
+            tables,
+        })
+    }
+
+    /// How far this node had applied `origin`'s stream, if that did not move
+    /// while it read its tables.
+    pub fn applied(&self, origin: NodeId) -> Option<u64> {
+        let at = |vector: &[VectorEntry]| {
+            vector
+                .iter()
+                .find(|entry| entry.origin == origin)
+                .map(|entry| entry.seq)
+                .unwrap_or(0)
+        };
+        let (before, after) = (at(&self.applied_before), at(&self.applied_after));
+        (before == after).then_some(after)
+    }
+
+    /// How far this node's own stream stood, if nothing was committed while
+    /// it read its tables.
+    pub fn own(&self) -> Option<u64> {
+        (self.released.0 == self.released.1 && self.unreleased == 0).then_some(self.released.1)
+    }
+}
+
+/// The tables a `Digest` asks about; none means all of them.
+pub fn encode_digest_request(tables: &[String], out: &mut Vec<u8>) {
+    put_u32(out, tables.len() as u32);
+    for table in tables {
+        put_str(out, table);
+    }
+}
+
+pub fn decode_digest_request(reader: &mut Reader<'_>) -> Result<Vec<String>, ProtocolError> {
+    let count = reader.u32()? as usize;
+    let mut tables = Vec::with_capacity(count.min(reader.remaining() / 4));
+    for _ in 0..count {
+        tables.push(reader.str()?);
+    }
+    Ok(tables)
 }
 
 /// "Send me everything you have from `origin` after `after_seq`."
@@ -634,7 +810,12 @@ pub fn parse_header(frame: &[u8]) -> Result<Header, ProtocolError> {
         return Err(ProtocolError::TooLarge(raw_len));
     }
 
-    Ok(Header { kind, codec, flags, raw_len })
+    Ok(Header {
+        kind,
+        codec,
+        flags,
+        raw_len,
+    })
 }
 
 /// Decides whether a payload of this size is worth compressing.
@@ -677,7 +858,9 @@ pub struct FrameCodec {
 
 impl fmt::Debug for FrameCodec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FrameCodec").field("level", &self.level).finish()
+        f.debug_struct("FrameCodec")
+            .field("level", &self.level)
+            .finish()
     }
 }
 
@@ -971,7 +1154,10 @@ mod tests {
                 FrameKind::Push,
                 0,
                 payload,
-                Compression { mode: CompressionMode::Off, ..Default::default() },
+                Compression {
+                    mode: CompressionMode::Off,
+                    ..Default::default()
+                },
                 None,
                 &mut frame,
             )
@@ -982,7 +1168,10 @@ mod tests {
         let (header, body) = codec.decode_frame(&frame, &mut scratch).unwrap();
         assert_eq!(header.kind, FrameKind::Push);
         assert_eq!(body, payload);
-        assert!(scratch.is_empty(), "an uncompressed frame should not touch the scratch buffer");
+        assert!(
+            scratch.is_empty(),
+            "an uncompressed frame should not touch the scratch buffer"
+        );
     }
 
     #[test]
@@ -999,7 +1188,10 @@ mod tests {
                 FrameKind::Push,
                 0,
                 &payload,
-                Compression { mode: CompressionMode::Always, ..Default::default() },
+                Compression {
+                    mode: CompressionMode::Always,
+                    ..Default::default()
+                },
                 None,
                 &mut frame,
             )
@@ -1026,7 +1218,10 @@ mod tests {
 
     #[test]
     fn auto_mode_stops_compressing_once_it_stops_paying() {
-        let compression = Compression { mode: CompressionMode::Auto, ..Default::default() };
+        let compression = Compression {
+            mode: CompressionMode::Auto,
+            ..Default::default()
+        };
         assert!(
             !should_compress(compression, 100_000, Some(0.99)),
             "a 1% saving is not worth the CPU"
@@ -1060,7 +1255,10 @@ mod tests {
     fn an_absurd_declared_length_is_refused_before_allocating() {
         let mut frame = plain_frame(FrameKind::Push, 0, &[]);
         frame[8..12].copy_from_slice(&(MAX_PAYLOAD as u32 + 1).to_le_bytes());
-        assert!(matches!(parse_header(&frame), Err(ProtocolError::TooLarge(_))));
+        assert!(matches!(
+            parse_header(&frame),
+            Err(ProtocolError::TooLarge(_))
+        ));
     }
 
     #[test]
@@ -1111,7 +1309,12 @@ mod tests {
             node_id: 2,
             clock: 42,
             outcomes: vec![
-                ApplyOutcome { origin: 1, seq: 1, status: ApplyStatus::Applied, message: String::new() },
+                ApplyOutcome {
+                    origin: 1,
+                    seq: 1,
+                    status: ApplyStatus::Applied,
+                    message: String::new(),
+                },
                 ApplyOutcome {
                     origin: 1,
                     seq: 2,

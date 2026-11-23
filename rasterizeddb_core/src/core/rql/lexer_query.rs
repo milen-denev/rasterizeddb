@@ -1,11 +1,27 @@
 use log::debug;
 use smallvec::SmallVec;
-use std::collections::HashSet;
 
-use crate::core::{processor::transformer::ComparerOperation, row::{common::simd_compare_strings, row::{ColumnFetchingData, RowFetch}, schema::{SchemaCalculator, SchemaField}}, rql::lexer_s1::QueryPurpose};
-use crate::core::rql::aggregate::{AggFunc, Having, HavingOp, SelectItem};
+use crate::core::rql::aggregate::{AggFunc, SelectItem};
+use crate::core::{
+    processor::transformer::ComparerOperation,
+    row::{
+        common::simd_compare_strings,
+        row::{ColumnFetchingData, RowFetch},
+        schema::{SchemaCalculator, SchemaField},
+    },
+    rql::lexer_s1::QueryPurpose,
+};
 
-#[derive(Debug)]
+/// One key of [`QueryRows::window_order`].
+#[derive(Debug, Clone)]
+pub enum WindowOrderKey {
+    /// The window function at this select position.
+    Window(usize),
+    /// Anything else, evaluated on the row as scanned.
+    Expr(crate::core::rql::expr::Expr),
+}
+
+#[derive(Debug, Clone)]
 pub struct QueryRows {
     pub table_name: String,
     pub query_row_fetch: RowFetch,
@@ -23,6 +39,10 @@ pub struct QueryRows {
     /// deduplicated output, so neither is handed to the scan — they are taken
     /// from `written_limit` / `offset` instead.
     pub distinct: bool,
+    /// `SELECT DISTINCT ON (k, …)`: the first row of each key in the
+    /// statement's order, the keys evaluated on the row as fetched. As with
+    /// [`Self::distinct`], `LIMIT` and `OFFSET` apply to what is kept.
+    pub distinct_on: Vec<crate::core::rql::expr::Expr>,
     /// `LIMIT` exactly as written, before `OFFSET` was folded into it for the
     /// scan. Used by the passes that run after the scan.
     pub written_limit: Option<u64>,
@@ -41,8 +61,11 @@ pub struct QueryRows {
     /// over every row that survived `WHERE`.
     pub window_slots: Vec<(usize, crate::core::rql::window::WindowSpec)>,
     /// Expressions over the row's own columns, each filling one output slot.
-    pub expr_slots:
-        Vec<(usize, crate::core::rql::expr::Expr, crate::core::db_type::DbType)>,
+    pub expr_slots: Vec<(
+        usize,
+        crate::core::rql::expr::Expr,
+        crate::core::db_type::DbType,
+    )>,
     /// `literal_slots` because these are evaluated per row rather than once.
     pub scalar_slots: Vec<(
         usize,
@@ -50,7 +73,12 @@ pub struct QueryRows {
         crate::core::db_type::DbType,
     )>,
     /// The `SELECT` list as written, in output order.
-    pub select_items: Vec<crate::core::rql::aggregate::SelectItem>,
+    ///
+    /// Shared, not owned: a learned prepared parse is copied for every run
+    /// it answers, and copying the list item by item cost each run at least
+    /// two allocations per selected column (its field's name and its label).
+    /// Nothing changes it after the parse.
+    pub select_items: std::sync::Arc<[crate::core::rql::aggregate::SelectItem]>,
     /// For each visible output column, where its nullability companion sits in
     /// the fetched row — or `None` when the column cannot be `NULL`.
     ///
@@ -70,6 +98,13 @@ pub struct QueryRows {
     /// the scan runs unsorted and unbounded and the executor evaluates each
     /// key per row, sorts, and pages. `(expr, descending, nulls_first)`.
     pub order_expressions: Vec<(crate::core::rql::expr::Expr, bool, Option<bool>)>,
+    /// The whole `ORDER BY` when any of its keys names a window function's
+    /// output (`ORDER BY id, rnk`): sorted at the window stage, once the
+    /// window values are computed and before they are put in the rows, a
+    /// window key reading its value and any other key evaluated on the row as
+    /// scanned. `(key, descending, nulls_first)`. Empty otherwise, the keys
+    /// then being [`Self::order_expressions`] or the scan's own.
+    pub window_order: Vec<(WindowOrderKey, bool, Option<bool>)>,
     /// How many of `requested_row_fetch`'s columns the client asked for.
     ///
     /// Sorting reads the key out of the fetched row, so an `ORDER BY` over a
@@ -113,9 +148,19 @@ fn parse_computed_item(
     let mut cursor = 0usize;
 
     for (start, end) in &calls {
+        // A call found inside the previous call's FILTER clause.
+        if *start < cursor {
+            continue;
+        }
         rewritten.push_str(&expr[cursor..*start]);
         let call = &expr[*start..*end];
-        let (func, arg) = parse_aggregate_call(call, schema)?;
+        let (func, arg, arg_expr, call) = parse_aggregate_call(call, schema)?;
+        // `COUNT(*) FILTER (WHERE x) * 100.0 / COUNT(*)`: the clause is this
+        // call's, and the synthetic column replaces both.
+        let (filter, end) = match trailing_filter(expr, *end) {
+            Some((text, past)) => (Some(aggregate_filter(text, schema)?), past),
+            None => (None, *end),
+        };
 
         let slot = inputs.len();
         let ty = func.result_type(arg.as_ref().map(|f| &f.db_type));
@@ -124,31 +169,78 @@ fn parse_computed_item(
             crate::core::rql::aggregate::COMPUTED_INPUT_PREFIX,
             slot
         );
-        synth_schema.push(SchemaField::new(
+        let mut synth_field = SchemaField::new(
             name.clone(),
             ty.clone(),
             ty.get_size(),
             0,
             slot as u64,
             false,
-        ));
-        inputs.push(crate::core::rql::aggregate::ComputedInput { func, arg });
+        );
+        // SUM, MIN and MAX of a `NUMERIC(p, s)` column fold its stored
+        // integers, so their result is at the column's scale; AVG divides at
+        // the engine scale or wider (`AggFunc::decimal_output_scale`). Carried
+        // here so the expression lifts it to the engine scale like a column
+        // read — `MIN(v) + 1` over a `NUMERIC(10,2)` added 1 to 100 as 10^9
+        // to 10^4.
+        if matches!(ty, crate::core::db_type::DbType::DECIMAL) {
+            synth_field.scale = func.synthetic_scale(arg.as_ref());
+        }
+        // MIN and MAX of a `timestamp` (without time zone) column are one
+        // too, so `max(a)::text` has no offset (`expr::yields_timestamp`).
+        if matches!(
+            func,
+            crate::core::rql::aggregate::AggFunc::Min | crate::core::rql::aggregate::AggFunc::Max
+        ) && ty == crate::core::db_type::DbType::DATETIME
+        {
+            synth_field.without_time_zone = arg.as_ref().is_some_and(|f| f.without_time_zone);
+        }
+        synth_schema.push(synth_field);
+        inputs.push(crate::core::rql::aggregate::ComputedInput { func, arg, arg_expr, filter, call });
         rewritten.push_str(&name);
-        cursor = *end;
+        cursor = end;
     }
     rewritten.push_str(&expr[cursor..]);
 
-    let parsed = crate::core::rql::expr::parse(&rewritten, &synth_schema)?;
-    let db_type = crate::core::rql::expr::static_type(&parsed);
+    let (parsed, db_type, _) = parse_over_aggregates(&rewritten, &synth_schema)?;
 
     Ok(Some(SelectItem::Computed {
         expr: parsed,
         inputs,
         db_type,
+        // PostgreSQL's name for it (`FigureColname`): `COALESCE(MAX(x), 0)`
+        // is `coalesce`, an operator over aggregates `?column?`.
         label: alias
             .map(|a| a.to_string())
-            .unwrap_or_else(|| "?column?".to_string()),
+            .unwrap_or_else(|| crate::core::rql::join::pg_column_name(expr)),
     }))
+}
+
+/// An expression over aggregate placeholders (`__agg_0 * 2`), parsed, with
+/// its type and the text that parsed. A condition (`__agg_0 > 0`, `__agg_0
+/// IS NULL`) is read as the CASE that is its value, as a condition over
+/// columns is: the expression grammar has no boolean outside CASE, and the
+/// item failed as "'__agg_0 > 0' is neither a column nor a value". Shared by
+/// the single-table and the join aggregate paths.
+pub(crate) fn parse_over_aggregates(
+    rewritten: &str,
+    synth_schema: &[SchemaField],
+) -> Result<(crate::core::rql::expr::Expr, crate::core::db_type::DbType, String), String> {
+    match crate::core::rql::expr::parse(rewritten, synth_schema) {
+        Ok(parsed) => {
+            let db_type = crate::core::rql::expr::static_type(&parsed);
+            Ok((parsed, db_type, rewritten.to_string()))
+        }
+        Err(e) => {
+            let condition =
+                crate::core::rql::pg_functions::regex_operator_as_call(rewritten).unwrap_or_else(|| rewritten.to_string());
+            let as_value = format!("CASE WHEN {condition} THEN true WHEN NOT ({condition}) THEN false END");
+            match crate::core::rql::expr::parse(&as_value, synth_schema) {
+                Ok(parsed) => Ok((parsed, crate::core::db_type::DbType::BOOL, as_value)),
+                Err(_) => Err(e),
+            }
+        }
+    }
 }
 
 /// Splits `FUNC(args)` into the aggregate and its column argument.
@@ -157,7 +249,7 @@ fn parse_computed_item(
 /// The clause restricts which rows *this* aggregate sees, so it cannot be
 /// folded into the statement's `WHERE` — a statement usually pairs a filtered
 /// aggregate with an unfiltered one, and moving the test would change both.
-fn split_aggregate_filter(item: &str) -> (Option<String>, Option<String>) {
+pub(crate) fn split_aggregate_filter(item: &str) -> (Option<String>, Option<String>) {
     let upper = item.to_ascii_uppercase();
     let mut from = 0usize;
     while let Some(at) = upper[from..].find("FILTER") {
@@ -169,11 +261,10 @@ fn split_aggregate_filter(item: &str) -> (Option<String>, Option<String>) {
             let open = item.len() - trimmed.len();
             if let Some(close) = matching_paren_at(item, open) {
                 let inside = item[open + 1..close].trim();
-                if inside.len() >= 5 && inside[..5].eq_ignore_ascii_case("WHERE") {
+                if inside.len() >= 5 && inside.as_bytes()[..5].eq_ignore_ascii_case(b"WHERE") {
                     // The item with the clause removed, so what follows it — a
                     // cast, an alias — stays attached to the call.
-                    let rebuilt =
-                        format!("{}{}", item[..start].trim_end(), &item[close + 1..]);
+                    let rebuilt = format!("{}{}", item[..start].trim_end(), &item[close + 1..]);
                     return (Some(rebuilt), Some(inside[5..].trim().to_string()));
                 }
             }
@@ -183,30 +274,146 @@ fn split_aggregate_filter(item: &str) -> (Option<String>, Option<String>) {
     (None, None)
 }
 
-fn parse_aggregate_call(
-    call: &str,
+/// `text` past a leading `word` and the space after it, ignoring case.
+pub(crate) fn leading_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    let head = text.get(..word.len())?;
+    let rest = &text[word.len()..];
+    (head.eq_ignore_ascii_case(word) && rest.starts_with(char::is_whitespace)).then(|| rest.trim())
+}
+
+/// An aggregate's argument: the column it names, or — for an argument that
+/// is computed rather than read, `SUM(CAST(NULLIF(data ->> 'y', '') AS
+/// NUMERIC))`, `SUM(CASE WHEN flag THEN 1 ELSE 0 END)` — a field carrying the
+/// expression's type plus the expression. Its type is known right here — the
+/// schema is in hand — so the result type is decided the same way a column's
+/// is, with no placeholder to be filled in later.
+fn aggregate_argument(
+    arg_text: &str,
     schema: &SmallVec<[SchemaField; 20]>,
-) -> Result<(AggFunc, Option<SchemaField>), String> {
-    let open = call.find('(').ok_or_else(|| format!("'{}' is not a call", call))?;
+) -> Result<(SchemaField, Option<crate::core::rql::aggregate::ArgExpression>), String> {
+    let name = arg_text.rsplit('.').next().unwrap_or(arg_text).trim_matches('"');
+    if let Some(field) = schema.iter().find(|f| f.name.eq_ignore_ascii_case(name) && !f.is_deleted) {
+        return Ok((field.clone(), None));
+    }
+    // A comparison is an argument too (`bool_and(id > 0)`, `count(a = b)`):
+    // the expression grammar has no boolean of its own outside CASE, so it
+    // is read as the CASE that is its value, NULL where it is unknown.
+    let parsed = match crate::core::rql::expr::parse(arg_text, schema) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            let as_value = format!("CASE WHEN {arg_text} THEN true WHEN NOT ({arg_text}) THEN false END");
+            crate::core::rql::expr::parse(&as_value, schema)
+                .map_err(|_| format!("Column '{}' not found in schema", arg_text))?
+        }
+    };
+    // A `json` value travels as the text it is stored as; the field says
+    // it is `json`, so `json_agg` writes it as JSON rather than quoting it.
+    let db_type = if crate::core::rql::expr::yields_json_text(&parsed) {
+        crate::core::db_type::DbType::JSONTEXT
+    } else {
+        crate::core::rql::expr::static_type(&parsed)
+    };
+    let reads = expr_reads(&parsed, schema);
+    let field = SchemaField::new(arg_text.to_string(), db_type.clone(), db_type.get_size(), 0, u64::MAX, false);
+    Ok((field, Some(crate::core::rql::aggregate::ArgExpression { expr: parsed, schema: reads })))
+}
+
+/// An `ORDER BY` key inside an aggregate call, over the table's own columns:
+/// the expression and the columns it reads.
+fn aggregate_order_key(
+    text: &str,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> Result<(crate::core::rql::expr::Expr, Vec<SchemaField>), String> {
+    let parsed = crate::core::rql::expr::parse(text, schema)?;
+    let reads = expr_reads(&parsed, schema);
+    Ok((parsed, reads))
+}
+
+type AggregateCallParts = (
+    AggFunc,
+    Option<SchemaField>,
+    Option<crate::core::rql::aggregate::ArgExpression>,
+    Option<Box<crate::core::rql::aggregate::AggCall>>,
+);
+
+fn parse_aggregate_call(call: &str, schema: &SmallVec<[SchemaField; 20]>) -> Result<AggregateCallParts, String> {
+    let open = call
+        .find('(')
+        .ok_or_else(|| format!("'{}' is not a call", call))?;
     let close = call
         .rfind(')')
         .ok_or_else(|| format!("unterminated function call in '{}'", call))?;
     let name = call[..open].trim();
-    let func = AggFunc::parse(name)
-        .ok_or_else(|| format!("function '{}' is not supported yet", name))?;
+    let func =
+        AggFunc::parse(name).ok_or_else(|| format!("function '{}' is not supported yet", name))?;
     let arg_text = call[open + 1..close].trim();
+    if leading_word(arg_text, "DISTINCT").is_some() {
+        return Err("an aggregate over DISTINCT values inside an expression is not supported".to_string());
+    }
+    let (arg_text, second, order) = crate::core::rql::aggregate::split_call_arguments(arg_text)?;
 
     if arg_text == "*" {
         if func != AggFunc::Count {
             return Err(format!("{}(*) is not valid", name.to_uppercase()));
         }
-        return Ok((func, None));
+        return Ok((func, None, None, None));
     }
-    let bare = arg_text.rsplit('.').next().unwrap_or(arg_text).trim_matches('"');
-    if let Some(field) = schema.iter().find(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted) {
-        return Ok((func, Some(field.clone())));
+    let (field, computed) = aggregate_argument(arg_text, schema)?;
+    func.check_argument(Some(&field))?;
+    let extras = crate::core::rql::aggregate::build_call(func, arg_text, second, order, false, &mut |key| {
+        aggregate_order_key(key, schema)
+    })?;
+    Ok((func, Some(field), computed, extras))
+}
+
+/// Whether `expr` is exactly one aggregate call, nothing around it.
+pub(crate) fn is_one_aggregate_call(expr: &str) -> bool {
+    let expr = expr.trim();
+    let calls = find_aggregate_calls(expr);
+    calls.len() == 1 && calls[0] == (0, expr.len())
+}
+
+/// The `FILTER (WHERE …)` right after a call ending at `end`: its condition
+/// text and where the clause ends.
+pub(crate) fn trailing_filter(expr: &str, end: usize) -> Option<(&str, usize)> {
+    let rest = &expr[end..];
+    let after_space = rest.trim_start();
+    let head = after_space.get(..6)?;
+    if !head.eq_ignore_ascii_case("FILTER") {
+        return None;
     }
-    Err(format!("Column '{}' not found in schema", arg_text))
+    let past_word = &after_space[6..];
+    let open_rel = past_word.len() - past_word.trim_start().len();
+    if !past_word[open_rel..].starts_with('(') {
+        return None;
+    }
+    let open = expr.len() - past_word.len() + open_rel;
+    let close = matching_paren_at(expr, open)?;
+    let inside = expr[open + 1..close].trim();
+    let condition = leading_word(inside, "WHERE")?;
+    Some((condition, close + 1))
+}
+
+/// An aggregate's `FILTER (WHERE …)`, with the columns it reads.
+fn aggregate_filter(
+    text: &str,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> Result<crate::core::rql::aggregate::AggregateFilter, String> {
+    let condition = crate::core::rql::expr::parse_cond(text, schema)?;
+    // The condition's columns, plus their NULL companions: the fold has no
+    // schema of its own to tell a NULL from a zero.
+    let mut fields: Vec<SchemaField> = Vec::new();
+    for field in crate::core::rql::expr::cond_columns(&condition) {
+        if let Some(flag) = crate::core::rql::nullable::flag_field(&field.name, schema) {
+            if !fields.iter().any(|f| f.name == flag.name) {
+                fields.push(flag.clone());
+            }
+        }
+        if !fields.iter().any(|f| f.name == field.name) {
+            fields.push(field);
+        }
+    }
+    Ok(crate::core::rql::aggregate::AggregateFilter { condition, schema: fields })
 }
 
 /// Byte ranges of every top-level aggregate call inside `expr`.
@@ -317,7 +524,10 @@ fn parse_select_items(
         // Nullability companions are the engine's, not the client's.
         return Ok(crate::core::rql::nullable::visible_fields(schema)
             .into_iter()
-            .map(|f| SelectItem::Column { label: f.name.clone(), field: f })
+            .map(|f| SelectItem::Column {
+                label: f.name.clone(),
+                field: f,
+            })
             .collect());
     }
 
@@ -329,6 +539,10 @@ fn parse_select_items(
         // is therefore that width times the number of rows, which the ordinary
         // aggregate path can answer.
         let rewritten_size = rewrite_row_size(raw.trim(), schema);
+        // `::double precision` is `::float8`: as two words the second was
+        // read as an alias, and the cast then named a type PostgreSQL does
+        // not have (`double` alone).
+        let rewritten_size = double_precision_casts(&rewritten_size);
         let raw = rewritten_size.as_str();
         let item = raw.trim();
         if item.is_empty() {
@@ -341,29 +555,53 @@ fn parse_select_items(
         // clause behind as `__agg_0 FILTER (WHERE …)`: neither a column nor a
         // value.
         let (item_owned, filter_text) = split_aggregate_filter(item);
-        // A cast around a filtered aggregate — `COUNT(*) FILTER (…)::bigint` —
-        // would make the item an expression *around* a call, which is answered
-        // by a different path that carries no filter. The cast is dropped: it
-        // is a no-op on `COUNT`, and on a `SUM` it only widens what the column
-        // already produces.
-        let item_owned = item_owned.map(|text| {
-            let (head, alias) = split_alias(&text);
-            match crate::core::rql::expr::trailing_cast(head) {
-                Some((call, _)) => match alias {
-                    Some(alias) => format!("{} AS {}", call, alias),
-                    None => call.to_string(),
-                },
-                None => text,
-            }
-        });
+        // A cast around a filtered aggregate — `COUNT(*) FILTER (…)::bigint`,
+        // `(AVG(x) FILTER (…))::float8` — is an expression around the call,
+        // and the computed path below applies it, the FILTER staying with its
+        // call. It was dropped as a no-op, which it is not once the argument
+        // is a numeric (`EXTRACT(EPOCH …)`): the item answered a numeric where
+        // the client asked for, and decodes, a double.
+        // Only a FILTER on the item's one aggregate is the item's. Inside an
+        // expression — `COUNT(*) FILTER (WHERE x) * 100.0 / COUNT(*)` — it
+        // belongs to its own call, which the computed path reads; peeled here
+        // it was applied to nothing, and the ratio answered 100.
+        let (item_owned, filter_text) = match &item_owned {
+            Some(text) if !is_one_aggregate_call(split_alias(text).0) => (None, None),
+            _ => (item_owned, filter_text),
+        };
         let item = item_owned.as_deref().unwrap_or(item);
 
+        // `SELECT ALL a` is `SELECT a`: the default spelled out, which
+        // belongs to the statement and not to its first item ("Column 'ALL
+        // a' not found").
+        let item = match item.get(..4) {
+            Some(head) if head.eq_ignore_ascii_case("ALL ") && out.is_empty() => item[4..].trim_start(),
+            _ => item,
+        };
         let upper = item.to_ascii_uppercase();
         if upper.starts_with("DISTINCT ") || upper == "DISTINCT" {
             if starts_with_distinct_on(item["DISTINCT".len()..].trim_start()) {
                 return Err("SELECT DISTINCT ON is not supported yet".to_string());
             }
             return Err("SELECT DISTINCT is not supported yet".to_string());
+        }
+
+        // `x IS [NOT] NULL` is a boolean. The alias split below read the `IS`
+        // as an alias, so `doc->>'a' IS NULL` came back as the extracted text
+        // in a column named `IS`. It is answered as the CASE it means, by the
+        // expression evaluator, which reads a path's NULL as PostgreSQL does.
+        // Over an aggregate (`sum(v) IS NULL`) the computed path reads it.
+        if let Some((test, alias)) = null_test_item(item).filter(|(test, _)| find_aggregate_calls(test).is_empty()) {
+            let parsed = crate::core::rql::expr::parse(
+                &format!("CASE WHEN {} THEN TRUE ELSE FALSE END", test),
+                schema,
+            )?;
+            out.push(SelectItem::RowExpr {
+                db_type: crate::core::rql::expr::static_type(&parsed),
+                expr: parsed,
+                label: alias.unwrap_or_else(|| "?column?".to_string()),
+            });
+            continue;
         }
 
         // Split off a trailing alias. Only a bare `name` or `AS name` after the
@@ -373,30 +611,18 @@ fn parse_select_items(
 
         let aggregate_filter = match &filter_text {
             None => None,
-            Some(text) => {
-                let condition = crate::core::rql::expr::parse_condition(text, schema)?;
-                // The condition's columns, plus their NULL companions: the fold
-                // has no schema of its own to tell a NULL from a zero.
-                let mut fields: Vec<SchemaField> = Vec::new();
-                for field in crate::core::rql::expr::condition_columns(&condition) {
-                    if let Some(flag) = crate::core::rql::nullable::flag_field(&field.name, schema)
-                    {
-                        if !fields.iter().any(|f| f.name == flag.name) {
-                            fields.push(flag.clone());
-                        }
-                    }
-                    if !fields.iter().any(|f| f.name == field.name) {
-                        fields.push(field);
-                    }
-                }
-                Some(crate::core::rql::aggregate::AggregateFilter { condition, schema: fields })
-            }
+            Some(text) => Some(aggregate_filter(text, schema)?),
         };
 
         // A window function looks like a call but is neither an aggregate nor a
         // scalar: it keeps every row and adds a column computed from the rows
         // around it.
-        if let Some(outcome) = crate::core::rql::window::parse(item, schema) {
+        // An expression around one window call — `revenue - LAG(revenue)
+        // OVER (…)` — before the plain reading, which took the text before
+        // the first `(` as the function's name ("function 'revenue - LAG'").
+        if let Some(outcome) = crate::core::rql::window::parse_around(expr, alias.clone(), schema)
+            .or_else(|| crate::core::rql::window::parse(item, schema))
+        {
             let spec = outcome?;
             out.push(SelectItem::Window {
                 db_type: spec.result_type(),
@@ -409,18 +635,50 @@ fn parse_select_items(
         // Tried before the constant test below: that test reads a leading
         // quote as the whole item, so an expression *beginning* with a literal
         // was truncated to it.
-        if crate::core::rql::expr::needs_evaluation(expr)
-            || looks_like_row_expression(expr)
-        {
-            if let Ok(parsed) = crate::core::rql::expr::parse(expr, schema) {
-                let db_type = crate::core::rql::expr::static_type(&parsed);
-                out.push(SelectItem::RowExpr {
-                    expr: parsed,
-                    db_type,
-                    label: alias.clone().unwrap_or_else(|| "?column?".to_string()),
-                });
-                continue;
+        if crate::core::rql::expr::needs_evaluation(expr) || looks_like_row_expression(expr) {
+            match crate::core::rql::expr::parse(expr, schema) {
+                Ok(parsed) => {
+                    let db_type = crate::core::rql::expr::static_type(&parsed);
+                    out.push(SelectItem::RowExpr {
+                        expr: parsed,
+                        db_type,
+                        label: alias.clone().unwrap_or_else(|| crate::core::rql::join::pg_column_name(expr)),
+                    });
+                    continue;
+                }
+                // A type error is the statement's answer; falling through
+                // would report the item as an unsupported construct instead.
+                Err(e) if e.ends_with(" cannot be matched") => return Err(e),
+                // A cast to a type name PostgreSQL does not have (42704).
+                Err(e) if e.starts_with("type \"") && e.ends_with("\" does not exist") => return Err(e),
+                // No overload for the arguments' types (42883), and what a
+                // known function refuses: falling through reported the
+                // function itself as unknown.
+                Err(e) if e.starts_with("function ") && e.ends_with(") does not exist") => return Err(e),
+                Err(e) if e.starts_with("round ") => return Err(e),
+                Err(_) => {}
             }
+        }
+
+        // A comparison is a boolean value — `n > 1`, `a = b` — which the
+        // expression grammar does not read. Before the constant test, which
+        // takes `'a' = 'b'` for one string literal.
+        // A comparison with no operator for its types (`t = '1'::float8`) is
+        // PostgreSQL's 42883, not an unknown column.
+        if expr.contains(['=', '<', '>']) {
+            if let Err(e) = crate::core::rql::expr::parse_condition(expr, schema) {
+                if e.starts_with("operator does not exist") {
+                    return Err(e);
+                }
+            }
+        }
+        if let Some(parsed) = crate::core::rql::join::comparison_value(expr, schema)? {
+            out.push(SelectItem::RowExpr {
+                db_type: crate::core::rql::expr::static_type(&parsed),
+                expr: parsed,
+                label: alias.unwrap_or_else(|| crate::core::rql::join::pg_column_name(expr)),
+            });
+            continue;
         }
 
         // A constant reads no column: `SELECT 1`, or whatever a scalar
@@ -429,7 +687,7 @@ fn parse_select_items(
             out.push(SelectItem::Literal {
                 bytes,
                 db_type,
-                label: alias.unwrap_or_else(|| "?column?".to_string()),
+                label: alias.unwrap_or_else(|| crate::core::rql::join::pg_column_name(expr)),
             });
             continue;
         }
@@ -453,14 +711,63 @@ fn parse_select_items(
         if crate::core::rql::expr::needs_evaluation(expr)
             || crate::core::rql::lexer_query::looks_like_row_expression(expr)
         {
-            if let Ok(parsed) = crate::core::rql::expr::parse(expr, schema) {
-                let db_type = crate::core::rql::expr::static_type(&parsed);
-                out.push(SelectItem::RowExpr {
-                    expr: parsed,
-                    db_type,
-                    label: alias.unwrap_or_else(|| "?column?".to_string()),
-                });
-                continue;
+            match crate::core::rql::expr::parse(expr, schema) {
+                Ok(parsed) => {
+                    let db_type = crate::core::rql::expr::static_type(&parsed);
+                    out.push(SelectItem::RowExpr {
+                        expr: parsed,
+                        db_type,
+                        label: alias.unwrap_or_else(|| crate::core::rql::join::pg_column_name(expr)),
+                    });
+                    continue;
+                }
+                // A call to a function the evaluator knows, which it could
+                // not read: its reason is the statement's answer. Falling
+                // through, the path below reported the function itself as
+                // unknown — `ROUND(STDDEV(x), 2)` blamed ROUND, and
+                // `EXTRACT(DOW FROM ts)` blamed EXTRACT. Aggregates were
+                // tried above.
+                Err(e) => {
+                    // A constant that is not a value of the type it meets
+                    // (`CASE WHEN n = 'q'`): PostgreSQL's 22P02, not CASE.
+                    if crate::core::rql::expr::is_input_error(&e) {
+                        return Err(e);
+                    }
+                    // A path operator on a column holding no document
+                    // (`text -> unknown`): read on, the item was reported
+                    // as a missing column named after the whole path.
+                    if e.starts_with("operator does not exist") {
+                        return Err(e);
+                    }
+                    if let Some(open) = expr.find('(') {
+                        let head = expr[..open].trim().to_ascii_uppercase();
+                        let known = crate::core::rql::expr::is_function(&head)
+                            || matches!(head.as_str(), "EXTRACT" | "CAST");
+                        if known && AggFunc::parse(&head).is_none() {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // A condition as a value (`s ~ '^H'`, `id > 1 AND ok`): the
+        // expression grammar has no boolean of its own outside CASE, so it is
+        // read as the CASE that is its value, NULL where it is unknown, as
+        // PostgreSQL's boolean is. Not over an aggregate: those take the
+        // computed path above.
+        if find_aggregate_calls(expr).is_empty() {
+            let condition = crate::core::rql::pg_functions::regex_operator_as_call(expr).unwrap_or_else(|| expr.to_string());
+            let as_value = format!("CASE WHEN {condition} THEN true WHEN NOT ({condition}) THEN false END");
+            if crate::core::rql::expr::parse(expr, schema).is_err() {
+                if let Ok(parsed) = crate::core::rql::expr::parse(&as_value, schema) {
+                    out.push(SelectItem::RowExpr {
+                        expr: parsed,
+                        db_type: crate::core::db_type::DbType::BOOL,
+                        label: alias.unwrap_or_else(|| crate::core::rql::join::pg_column_name(expr)),
+                    });
+                    continue;
+                }
             }
         }
 
@@ -473,9 +780,9 @@ fn parse_select_items(
             if let Some((scalar, db_type)) =
                 crate::core::rql::aggregate::ScalarFunc::parse(func_name)
             {
-                let close = expr.rfind(')').ok_or_else(|| {
-                    format!("unterminated function call in '{}'", item)
-                })?;
+                let close = expr
+                    .rfind(')')
+                    .ok_or_else(|| format!("unterminated function call in '{}'", item))?;
                 if !expr[open + 1..close].trim().is_empty() {
                     return Err(format!("{}() takes no arguments", func_name));
                 }
@@ -488,39 +795,48 @@ fn parse_select_items(
             }
 
             let Some(func) = AggFunc::parse(func_name) else {
-                return Err(format!(
-                    "function '{}' is not supported yet",
-                    func_name
-                ));
+                return Err(format!("function '{}' is not supported yet", func_name));
             };
             let close = expr
                 .rfind(')')
                 .ok_or_else(|| format!("unterminated function call in '{}'", item))?;
             let arg_text = expr[open + 1..close].trim();
+            // `COUNT(DISTINCT x)` counts each value once; `ALL` is the default
+            // spelled out. Read as part of the argument, DISTINCT became a
+            // column named `DISTINCT x` and the statement a 42601.
+            let (distinct, arg_text) = match leading_word(arg_text, "DISTINCT") {
+                Some(rest) => (true, rest),
+                None => (false, leading_word(arg_text, "ALL").unwrap_or(arg_text)),
+            };
+            // `string_agg(s, ',' ORDER BY s)`: a second argument and an
+            // ORDER BY inside the call.
+            let (arg_text, second, order) = crate::core::rql::aggregate::split_call_arguments(arg_text)?;
+            if distinct && arg_text == "*" {
+                return Err(format!("{}(DISTINCT *) is not valid", func_name.to_uppercase()));
+            }
 
-            let arg = if arg_text == "*" {
+            let (arg, argument_expression) = if arg_text == "*" {
                 if func != AggFunc::Count {
                     return Err(format!("{}(*) is not valid", func_name.to_uppercase()));
                 }
-                None
+                (None, None)
             } else {
-                let name = arg_text
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or(arg_text)
-                    .trim_matches('"');
-                let field = schema
-                    .iter()
-                    .find(|f| f.name.eq_ignore_ascii_case(name) && !f.is_deleted)
-                    .ok_or_else(|| format!("Column '{}' not found in schema", arg_text))?;
-                Some(field.clone())
+                let (field, computed) = aggregate_argument(arg_text, schema)?;
+                (Some(field), computed)
             };
 
+            func.check_argument(arg.as_ref())?;
+            let call = crate::core::rql::aggregate::build_call(func, arg_text, second, order, distinct, &mut |key| {
+                aggregate_order_key(key, schema)
+            })?;
             out.push(SelectItem::Aggregate {
                 func,
                 arg,
                 label: alias.unwrap_or_else(|| func.name().to_string()),
                 filter: aggregate_filter,
+                arg_expr: argument_expression,
+                distinct,
+                call,
             });
             continue;
         }
@@ -538,13 +854,20 @@ fn parse_select_items(
         }
 
         let name = expr.rsplit('.').next().unwrap_or(expr).trim_matches('"');
+        // The name that is missing, not the item with its alias: `nope AS
+        // "Nope"` was reported as column 'nope AS "Nope"', which no client
+        // reads as a name, and which pgwire then sent as a syntax error
+        // (42601) rather than an undefined column (42703). Only a single
+        // name is reported bare; anything else stays whole, as text the
+        // parser could not read.
+        let missing = if alias.is_some() && is_one_name(expr) { expr } else { item };
         if crate::core::rql::nullable::is_hidden(name) {
-            return Err(format!("Column '{}' not found in schema", item));
+            return Err(format!("Column '{}' not found in schema", missing));
         }
         let field = schema
             .iter()
             .find(|f| f.name.eq_ignore_ascii_case(name) && !f.is_deleted)
-            .ok_or_else(|| format!("Column '{}' not found in schema", item))?;
+            .ok_or_else(|| format!("Column '{}' not found in schema", missing))?;
         out.push(SelectItem::Column {
             label: alias.unwrap_or_else(|| field.name.clone()),
             field: field.clone(),
@@ -626,6 +949,24 @@ fn rewrite_row_size(item: &str, schema: &SmallVec<[SchemaField; 20]>) -> String 
 /// `needs_evaluation` only recognises calls and casts, so a bare `a + b` needs
 /// its own test: an operator at the top level is one.
 pub(crate) fn looks_like_row_expression(text: &str) -> bool {
+    // A bitwise operator, `flags & 1`, `~flags`, `1 << n`: read whole by the
+    // expression parser (`expr::top_level_bitwise`), which tells them from
+    // the operators they are part of. Taken for a column name before.
+    if crate::core::rql::expr::top_level_bitwise(text.trim()).is_some()
+        || crate::core::rql::expr::top_level_structural(text.trim()).is_some()
+        || text.trim_start().strip_prefix('~').is_some_and(|r| !r.starts_with(['*', '~', '=']) && !r.trim().is_empty())
+    {
+        return true;
+    }
+    // A leading minus on anything but a number is unary negation — `-n`,
+    // `-(a + b)` — which no operator test below can see, since nothing
+    // precedes it. It was handed to the column resolver as the name `-n`.
+    if let Some(rest) = text.trim_start().strip_prefix('-') {
+        let rest = rest.trim();
+        if !rest.is_empty() && rest.parse::<f64>().is_err() {
+            return true;
+        }
+    }
     let bytes = text.as_bytes();
     let mut depth = 0i32;
     let mut quote: Option<u8> = None;
@@ -640,7 +981,7 @@ pub(crate) fn looks_like_row_expression(text: &str) -> bool {
                 b'\'' | b'"' => quote = Some(*b),
                 b'(' => depth += 1,
                 b')' => depth -= 1,
-                b'+' | b'*' | b'/' | b'%' if depth == 0 && i > 0 => return true,
+                b'+' | b'*' | b'/' | b'%' | b'^' if depth == 0 && i > 0 => return true,
                 // A `::` cast does too, and it is the only marker for one on a
                 // parenthesised operand: `(id + 1)::bigint` hides its `+` at
                 // depth 1, so without this the item was routed to the column
@@ -681,6 +1022,37 @@ fn is_identifier(text: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Whether `word`, unquoted, is an SQL operator spelled as a word. Such a word
+/// after an operand continues the expression, so it can never be an alias:
+/// `a.n BETWEEN 2 AND 4` read as the column `a.n` aliased `BETWEEN` answered
+/// every row with the integer. Quoted, it is a name like any other.
+fn is_operator_keyword(word: &str) -> bool {
+    const KEYWORDS: [&str; 12] = [
+        "LIKE", "ILIKE", "AND", "OR", "BETWEEN", "IS", "IN", "NOT", "SIMILAR", "ISNULL",
+        "NOTNULL", "COLLATE",
+    ];
+    KEYWORDS.iter().any(|k| word.eq_ignore_ascii_case(k))
+}
+
+/// The alias written in `rest`, the text after an item's expression: nothing,
+/// `AS name`, or one bare name. `Err` when `rest` is anything else, which
+/// means the expression did not end where the caller cut it and the item has
+/// to be read whole.
+pub(crate) fn trailing_alias(rest: &str) -> Result<Option<String>, ()> {
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    match words.as_slice() {
+        [] => Ok(None),
+        [as_kw, name] if as_kw.eq_ignore_ascii_case("AS") => Ok(Some(name.trim_matches('"').to_string())),
+        // Only a name can be an alias. An operator or a number is part of the
+        // expression, so `a + 1` must not come back as the column `a`
+        // aliased `+`, nor `s LIKE 'x%'` as `s` aliased `LIKE`.
+        [name] if is_identifier(name.trim_matches('"')) && !is_operator_keyword(name) => {
+            Ok(Some(name.trim_matches('"').to_string()))
+        }
+        _ => Err(()),
+    }
+}
+
 /// Offset of a top-level ` AS ` in `item`, ignoring quotes and parentheses.
 fn find_top_level_as(item: &str) -> Option<usize> {
     let bytes = item.as_bytes();
@@ -700,11 +1072,10 @@ fn find_top_level_as(item: &str) -> Option<usize> {
                 b'(' => depth += 1,
                 b')' => depth -= 1,
                 b'A' | b'a' if depth == 0 => {
-                    let is_word = i + 2 <= bytes.len()
-                        && (bytes[i + 1] == b'S' || bytes[i + 1] == b's');
+                    let is_word =
+                        i + 2 <= bytes.len() && (bytes[i + 1] == b'S' || bytes[i + 1] == b's');
                     let before_ok = i > 0 && bytes[i - 1].is_ascii_whitespace();
-                    let after_ok = i + 2 >= bytes.len()
-                        || bytes[i + 2].is_ascii_whitespace();
+                    let after_ok = i + 2 >= bytes.len() || bytes[i + 2].is_ascii_whitespace();
                     if is_word && before_ok && after_ok {
                         return Some(i);
                     }
@@ -715,6 +1086,74 @@ fn find_top_level_as(item: &str) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// A select item `<expr> IS [NOT] NULL [[AS] alias]`, as the test's text and
+/// the alias, or `None` when the item is not that shape. A `CASE` block holds
+/// its own `IS` and is left to the expression parser.
+pub(crate) fn null_test_item(item: &str) -> Option<(String, Option<String>)> {
+    if item.trim_start().to_ascii_uppercase().starts_with("CASE") {
+        return None;
+    }
+    let at = crate::core::rql::join::find_keyword(item, "IS", 0)?;
+    let operand = item[..at].trim();
+    if operand.is_empty() {
+        return None;
+    }
+    let words: Vec<&str> = item[at + 2..].split_whitespace().collect();
+    let test_len = match words.as_slice() {
+        [null, ..] if null.eq_ignore_ascii_case("NULL") => 1,
+        [not, null, ..] if not.eq_ignore_ascii_case("NOT") && null.eq_ignore_ascii_case("NULL") => 2,
+        _ => return None,
+    };
+    let alias = match &words[test_len..] {
+        [] => None,
+        [as_kw, name] if as_kw.eq_ignore_ascii_case("AS") => Some(name.trim_matches('"').to_string()),
+        [name] if is_identifier(name.trim_matches('"')) => Some(name.trim_matches('"').to_string()),
+        _ => return None,
+    };
+    Some((format!("{} IS {}", operand, words[..test_len].join(" ")), alias))
+}
+
+/// `text` with each `::double precision` cast written `::float8`, outside
+/// quotes; any other text unchanged (and not copied when there is none).
+fn double_precision_casts(text: &str) -> String {
+    if !text.to_ascii_lowercase().contains("precision") {
+        return text.to_string();
+    }
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            let end = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+            out.push_str(&text[i..end]);
+            i = end;
+            continue;
+        }
+        if text[i..].starts_with("::") {
+            let rest = &text[i + 2..];
+            let lead = rest.len() - rest.trim_start().len();
+            let after = &rest[lead..];
+            if after.get(..6).is_some_and(|w| w.eq_ignore_ascii_case("double")) {
+                let tail = &after[6..];
+                let gap = tail.len() - tail.trim_start().len();
+                let word = &tail[gap..];
+                if gap > 0
+                    && word.get(..9).is_some_and(|w| w.eq_ignore_ascii_case("precision"))
+                    && !word[9..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    out.push_str("::float8");
+                    i += 2 + lead + 6 + gap + 9;
+                    continue;
+                }
+            }
+        }
+        let ch = text[i..].chars().next().expect("in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 pub(crate) fn split_alias(item: &str) -> (&str, Option<String>) {
@@ -728,6 +1167,42 @@ pub(crate) fn split_alias(item: &str) -> (&str, Option<String>) {
         let alias = item[at + 2..].trim().trim_matches('"');
         if !expr.is_empty() && !alias.is_empty() {
             return (expr, Some(alias.to_string()));
+        }
+    }
+
+    // A whole `CASE … END` block with no alias is one expression. Without an
+    // `AS` it fell through to the whitespace split below, which took `CASE`
+    // as the expression and `WHEN` as its alias, so the item was reported as
+    // unsupported.
+    {
+        let t = item.trim();
+        let upper = t.to_ascii_uppercase();
+        // Whole words only: `case_id case_end` is a column and its alias.
+        let starts = upper.starts_with("CASE")
+            && upper[4..].starts_with(|c: char| c.is_ascii_whitespace());
+        let ends = upper.ends_with("END")
+            && upper[..upper.len() - 3].ends_with(|c: char| c.is_ascii_whitespace());
+        if starts && ends {
+            return (t, None);
+        }
+        // A block that does not end the item is followed by an alias or by
+        // more of the expression: `CASE … END label`, `CASE … END || n`,
+        // `CASE … END * 2 + 1`. The whitespace split below took `CASE` for
+        // the expression and `WHEN` for its alias in every one of them.
+        if starts {
+            if let Some(end) = crate::core::rql::expr::case_block_end(t) {
+                let rest = t[end..].trim();
+                let mut words = rest.split_whitespace();
+                let alias = match (words.next(), words.next(), words.next()) {
+                    (Some(a), Some(name), None) if a.eq_ignore_ascii_case("AS") => Some(name),
+                    (Some(name), None, None) => Some(name),
+                    _ => None,
+                };
+                if let Some(name) = alias.filter(|n| is_identifier(n.trim_matches('"'))) {
+                    return (&t[..end], Some(name.trim_matches('"').to_string()));
+                }
+                return (t, None);
+            }
         }
     }
 
@@ -755,28 +1230,15 @@ pub(crate) fn split_alias(item: &str) -> (&str, Option<String>) {
         if i < bytes.len() {
             let end = offset + i + 1;
             let expr = &item[..end];
-            let rest = item[end..].trim();
-            let alias = if rest.is_empty() {
-                None
-            } else {
-                let mut parts = rest.split_whitespace();
-                match parts.next() {
-                    Some(w) if w.eq_ignore_ascii_case("AS") => {
-                        parts.next().map(|a| a.trim_matches('"').to_string())
-                    }
-                    // Only a name can follow a literal as its alias. An
-                    // operator means the literal was the *start* of an
-                    // expression: `'utrn_' || replace(id, '-', '')` was read as
-                    // the literal `'utrn_'` aliased `||`, so every row answered
-                    // with the prefix and the rest was silently discarded.
-                    Some(w) if is_identifier(w.trim_matches('"')) => {
-                        Some(w.trim_matches('"').to_string())
-                    }
-                    Some(_) => return (item.trim(), None),
-                    None => None,
-                }
+            // Only a name can follow a literal as its alias. An operator means
+            // the literal was the *start* of an expression: `'utrn_' ||
+            // replace(id, '-', '')` was read as the literal `'utrn_'` aliased
+            // `||`, so every row answered with the prefix and the rest was
+            // silently discarded.
+            return match trailing_alias(&item[end..]) {
+                Ok(alias) => (expr, alias),
+                Err(()) => (item.trim(), None),
             };
-            return (expr, alias);
         }
     }
 
@@ -805,98 +1267,120 @@ pub(crate) fn split_alias(item: &str) -> (&str, Option<String>) {
             .unwrap_or(trimmed_tail.len());
         let end = item.len() - trimmed_tail.len() + cast_len;
         let expr = item[..end].trim_end();
-        let rest = item[end..].trim();
-        let alias = if rest.is_empty() {
-            None
-        } else {
-            let mut parts = rest.split_whitespace();
-            match parts.next() {
-                Some(w) if w.eq_ignore_ascii_case("AS") => {
-                    parts.next().map(|a| a.trim_matches('"').to_string())
-                }
-                Some(w) if is_identifier(w.trim_matches('"')) => {
-                    Some(w.trim_matches('"').to_string())
-                }
-                _ => return (item.trim(), None),
-            }
+        return match trailing_alias(&item[end..]) {
+            Ok(alias) => (expr, alias),
+            Err(()) => (item.trim(), None),
         };
-        return (expr, alias);
     }
 
     let mut words = tail.split_whitespace();
 
     match (words.next(), words.next()) {
         (Some(first), Some(second)) if first.eq_ignore_ascii_case("AS") => (
-            item[..tail_start].trim_end().trim_end_matches(first).trim_end(),
+            item[..tail_start]
+                .trim_end()
+                .trim_end_matches(first)
+                .trim_end(),
             Some(second.trim_matches('"').to_string()),
         ),
-        (Some(first), None) if tail_start > 0 => {
+        // Only a name is an alias. `coalesce(b, '{}')->'k'` and
+        // `(doc)->>'a'` were read as the call aliased `->'k'`: the path was
+        // dropped and the whole document returned under that label.
+        (Some(first), None)
+            if tail_start > 0
+                && !first.starts_with('"')
+                && !first.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') =>
+        {
+            (item.trim(), None)
+        }
+        // `upper(t) ISNULL` is a test, not `upper(t)` aliased `ISNULL`.
+        (Some(first), None) if tail_start > 0 && !is_operator_keyword(first) => {
             // `COUNT(x) total`
-            (item[..tail_start].trim_end(), Some(first.trim_matches('"').to_string()))
+            (
+                item[..tail_start].trim_end(),
+                Some(first.trim_matches('"').to_string()),
+            )
         }
         _ => {
-            // No parentheses: `col AS name` or `col name`.
+            // No parentheses: `col AS name` or `col name`, and nothing more.
+            // Every word after the alias used to be dropped, so `a.n BETWEEN 2
+            // AND 4` was the column `a.n` aliased `BETWEEN`, and a leading
+            // `NOT flag` the column `NOT` aliased `flag`. Anything longer, or
+            // led by an operator word, is one expression for the caller to
+            // evaluate or refuse.
             let mut parts = item.split_whitespace();
             let head = parts.next().unwrap_or(item);
-            let alias = match parts.next() {
-                Some(w) if w.eq_ignore_ascii_case("AS") => {
-                    parts.next().map(|a| a.trim_matches('"').to_string())
-                }
-                // Only a name can be an alias. An operator or a number is part
-                // of the expression, so `a + 1` must not come back as the
-                // column `a` aliased `+`.
-                Some(w) if is_identifier(w.trim_matches('"')) => {
-                    Some(w.trim_matches('"').to_string())
-                }
-                Some(_) => return (item.trim(), None),
-                None => None,
-            };
-            (head, alias)
+            if is_operator_keyword(head) {
+                return (item.trim(), None);
+            }
+            let rest = &item[item.find(head).map(|at| at + head.len()).unwrap_or(item.len())..];
+            match trailing_alias(rest) {
+                Ok(alias) => (head, alias),
+                Err(()) => (item.trim(), None),
+            }
         }
     }
 }
 
-/// Parses `HAVING <aggregate> <op> <literal>`.
-fn parse_having(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> Result<Having, String> {
-    let text = text.trim();
-    // Find the comparison operator outside the function's parentheses.
-    let bytes = text.as_bytes();
-    let mut depth = 0usize;
-    let mut op_at = None;
-    for (i, b) in bytes.iter().enumerate() {
-        match b {
-            b'(' => depth += 1,
-            b')' => depth = depth.saturating_sub(1),
-            b'=' | b'<' | b'>' | b'!' if depth == 0 => {
-                op_at = Some(i);
-                break;
-            }
-            _ => {}
+/// Parses a `HAVING` clause: the aggregate conditions the fold evaluates, and
+/// the terms over plain columns that the caller moves into `WHERE`. See
+/// [`crate::core::rql::having`], which the join planner shares.
+fn parse_having(
+    text: &str,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> Result<crate::core::rql::having::HavingSplit, String> {
+    crate::core::rql::having::parse(text, &mut |call: &str| {
+        match parse_select_items(call, schema)?.into_iter().next() {
+            Some(item @ SelectItem::Aggregate { .. }) => Ok(item),
+            _ => Err(format!("'{}' is not an aggregate HAVING can test", call)),
         }
-    }
-    let op_at = op_at.ok_or_else(|| {
-        "HAVING must compare an aggregate against a constant, as in `HAVING COUNT(*) > 1`"
-            .to_string()
-    })?;
+    })
+}
 
-    let mut op_end = op_at + 1;
-    if op_end < bytes.len() && matches!(bytes[op_end], b'=' | b'>') {
-        op_end += 1;
-    }
-    let op = HavingOp::parse(&text[op_at..op_end])
-        .ok_or_else(|| format!("unknown comparison operator in HAVING: '{}'", &text[op_at..op_end]))?;
+/// Whether grouping by `field` makes every group a single row of its relation,
+/// so that the relation's other columns are functionally dependent on it.
+///
+/// True for a column that is `UNIQUE` (a `PRIMARY KEY` is too) and NOT NULL —
+/// which here means it has no `__null_` companion. NOT NULL matters: NULLs are
+/// distinct to a unique constraint and one group to the fold.
+///
+/// Uniqueness has to hold under the *fold's* equality, which is byte equality
+/// of the key. Every uniqueness check that treats byte-identical values as
+/// equal guarantees that; and the planner appends the dependent columns to the
+/// group key rather than assuming them constant, so a uniqueness the data does
+/// not actually have splits groups instead of merging rows.
+///
+/// Shared with the join planner, which applies it per relation.
+pub(crate) fn determines_its_relation(
+    field: &SchemaField,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> bool {
+    field.is_unique
+        && !field.is_deleted
+        && crate::core::rql::nullable::flag_field(&field.name, schema).is_none()
+}
 
-    let lhs = text[..op_at].trim();
-    let literal = text[op_end..].trim().to_string();
-    if literal.is_empty() {
-        return Err("HAVING is missing the value to compare against".to_string());
+/// The stored column a `GROUP BY` item names, when the item is exactly a
+/// column reference — `status`, `t.status`, `"Status"`.
+///
+/// Only then. The item used to be cut at its first space and its qualifier
+/// dropped, so `GROUP BY g % 2` grouped by `g`: five groups where there are
+/// two, every count wrong, and no error.
+fn plain_group_column<'s>(
+    item: &str,
+    schema: &'s SmallVec<[SchemaField; 20]>,
+) -> Option<&'s SchemaField> {
+    let item = item.trim();
+    let bare = item.rsplit('.').next().unwrap_or(item);
+    let name = bare.trim_matches('"');
+    let qualifier_ok = item.len() == bare.len()
+        || is_identifier(item[..item.len() - bare.len() - 1].trim_matches('"'));
+    if !qualifier_ok || !(is_identifier(name) || (bare.starts_with('"') && bare.ends_with('"'))) {
+        return None;
     }
-
-    let items = parse_select_items(lhs, schema)?;
-    match items.into_iter().next() {
-        Some(SelectItem::Aggregate { func, arg, .. }) => Ok(Having { func, arg, op, literal }),
-        _ => Err("HAVING must test an aggregate, not a plain column".to_string()),
-    }
+    schema
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case(name) && !f.is_deleted)
 }
 
 /// Resolves every `ORDER BY` key against the schema and renders the spec the
@@ -916,7 +1400,10 @@ fn resolve_order_spec(
         // This spec sorts inside the scan, which compares stored bytes and
         // cannot place NULLs; a placement it cannot honour is refused rather
         // than quietly dropped. (The expression-sort path handles it.)
-        if term.nulls_first.is_some() {
+        // The scan's placement is PostgreSQL's default (NULLs last ascending,
+        // first descending), so spelling that default out is accepted; the
+        // other placement is rewritten at the wire (`distinct_on`).
+        if term.nulls_first.is_some_and(|first| first != term.descending) {
             return Err(
                 "ORDER BY ... NULLS FIRST/LAST is not supported in this position yet".to_string(),
             );
@@ -958,11 +1445,16 @@ fn parse_constant(expr: &str) -> Option<(Vec<u8>, crate::core::db_type::DbType)>
         return None;
     }
 
-    // `NULL` is stored as an empty value, the way every other NULL is here.
     // Without this a bare NULL in a select list was read as a column name and
     // reported as "column 'NULL' not found in schema".
+    //
+    // Typed `NULL`, which is what marks a cell as one; the item still
+    // describes itself as text (`SelectItem::result_type`), as PostgreSQL
+    // does. Typed as text it went out as empty bytes of text — the empty
+    // string, a value — so `SELECT id, NULL` answered `''`, and so did a
+    // scalar subquery that found no row, which is substituted as `NULL`.
     if text.eq_ignore_ascii_case("NULL") {
-        return Some((Vec::new(), DbType::STRING));
+        return Some((Vec::new(), DbType::NULL));
     }
     if text.eq_ignore_ascii_case("TRUE") {
         return Some((vec![1u8], DbType::BOOL));
@@ -971,7 +1463,12 @@ fn parse_constant(expr: &str) -> Option<(Vec<u8>, crate::core::db_type::DbType)>
         return Some((vec![0u8], DbType::BOOL));
     }
 
-    if text.len() >= 2 && text.starts_with('\'') && text.ends_with('\'') {
+    // One literal only when its opening quote closes at the end: `'x' LIKE
+    // 'x%'` begins and ends with a quote too, and was the text `x' LIKE 'x%`.
+    if text.len() >= 2
+        && text.starts_with('\'')
+        && crate::core::rql::expr::closing_quote(text) == Some(text.len() - 1)
+    {
         // `unquote_sql` rather than a slice: a quote inside the literal is
         // written doubled and has to collapse back to one, exactly as on the
         // insert path.
@@ -987,12 +1484,19 @@ fn parse_constant(expr: &str) -> Option<(Vec<u8>, crate::core::db_type::DbType)>
     if let Ok(v) = text.parse::<i64>() {
         return Some((v.to_le_bytes().to_vec(), DbType::I64));
     }
+    // A number with a point or an exponent, or past `bigint`, is PostgreSQL's
+    // `numeric`, exactly as written and at the places written: `2.50` is
+    // 2.50, and a scalar subquery's 0.83333333333333333333 keeps every digit.
+    // Carried as a float it was 2.5, 0.8333333333333334, and
+    // `SELECT 123456789012345678901234` answered 123456789012345690000000.
+    if let Some(v) = crate::core::rql::pg_numeric::parse_text(text) {
+        return Some((v.to_cell(), DbType::DECIMAL));
+    }
     if let Ok(v) = text.parse::<f64>() {
         return Some((v.to_le_bytes().to_vec(), DbType::F64));
     }
     None
 }
-
 
 /// Names the construct in a select item that is not supported, if it is one the
 /// resolver would otherwise report as a missing column.
@@ -1046,41 +1550,38 @@ fn unsupported_expression(expr: &str) -> Option<String> {
 
 /// Splits a SELECT list on commas that are not inside parentheses or quotes.
 fn split_select_items(list: &str) -> Vec<String> {
+    // Each item is the slice between two separating commas, copied once.
+    // Every character used to be pushed onto a growing `String`, and every
+    // statement's dispatch splits a list or three. Byte-wise is exact: the
+    // quotes, parentheses and commas are ASCII, and no byte of a multi-byte
+    // character equals one.
     let mut out = Vec::new();
-    let mut current = String::new();
+    let mut start = 0usize;
     let mut depth = 0usize;
-    let mut quote: Option<char> = None;
-
-    for c in list.chars() {
+    let mut quote: Option<u8> = None;
+    for (i, b) in list.bytes().enumerate() {
         match quote {
             Some(q) => {
-                current.push(c);
-                if c == q {
+                if b == q {
                     quote = None;
                 }
             }
-            None => match c {
-                '\'' | '"' => {
-                    quote = Some(c);
-                    current.push(c);
+            None => match b {
+                b'\'' | b'"' => quote = Some(b),
+                // `ARRAY[a, b]` is one item, as `f(a, b)` is.
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => {
+                    out.push(list[start..i].to_string());
+                    start = i + 1;
                 }
-                '(' => {
-                    depth += 1;
-                    current.push(c);
-                }
-                ')' => {
-                    depth = depth.saturating_sub(1);
-                    current.push(c);
-                }
-                ',' if depth == 0 => {
-                    out.push(std::mem::take(&mut current));
-                }
-                _ => current.push(c),
+                _ => {}
             },
         }
     }
-    if !current.trim().is_empty() {
-        out.push(current);
+    let rest = &list[start..];
+    if !rest.trim().is_empty() {
+        out.push(rest.to_string());
     }
     out
 }
@@ -1093,12 +1594,16 @@ fn split_select_items(list: &str) -> Vec<String> {
 /// * `schema` - Vec<SchemaField> representing the table schema
 ///
 /// # Returns
-/// HashSet<String> - Set of column names found in the WHERE clause
+/// The column names found in the WHERE clause, in a fixed order
 pub(crate) fn extract_where_columns(
     where_clause: &str,
     schema: &SmallVec<[SchemaField; 20]>,
-) -> HashSet<String> {
-    let mut where_columns = HashSet::new();
+) -> std::collections::BTreeSet<String> {
+    // Ordered, not hashed: the fetch built from this set came out in a
+    // different column order on every parse of the same statement, so two
+    // parses of one statement never compared equal reliably, and a prepared
+    // statement's cached parse was refused at random.
+    let mut where_columns = std::collections::BTreeSet::new();
     if where_clause.is_empty() {
         return where_columns;
     }
@@ -1152,10 +1657,108 @@ pub(crate) fn extract_where_columns(
 ///
 /// # Returns
 /// QueryRows - Contains query_row_fetch (WHERE columns), requested_row_fetch (SELECT columns), and WHERE clause
+/// The alias in a single relation's FROM text (`t`, `t x`, `t AS x`),
+/// or a syntax error naming the first word that cannot be there.
+fn relation_alias(from_text: &str) -> Result<Option<String>, String> {
+    let words: Vec<&str> = from_text.split_whitespace().collect();
+    let name_ok = |w: &str| {
+        let w = w.trim_matches('"');
+        !w.is_empty() && w.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    };
+    let at = |w: &str| format!("syntax error at or near \"{}\"", w);
+    match words.as_slice() {
+        [] | [_] => Ok(None),
+        [_, kw, alias] if kw.eq_ignore_ascii_case("AS") => {
+            if name_ok(alias) { Ok(Some(alias.trim_matches('"').to_string())) } else { Err(at(alias)) }
+        }
+        [_, alias] => {
+            if name_ok(alias) && !alias.eq_ignore_ascii_case("AS") {
+                Ok(Some(alias.trim_matches('"').to_string()))
+            } else {
+                Err(at(alias))
+            }
+        }
+        [_, kw, ..] if kw.eq_ignore_ascii_case("AS") => Err(at(words[3])),
+        [_, _, next, ..] => Err(at(next)),
+    }
+}
+
+/// The last parse made inside a [`parse_memo_scope`]: its statement, the
+/// fields it was read against, and what it answered.
+pub struct ParseMemo {
+    sql: String,
+    fields: SmallVec<[SchemaField; 20]>,
+    parsed: Result<QueryRows, String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Parses actually made on this thread, for the memo's tests.
+    static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+tokio::task_local! {
+    /// Boxed so the scope adds a pointer, not a parse, to the future it wraps.
+    static PARSE_MEMO: std::cell::RefCell<Option<Box<ParseMemo>>>;
+}
+
+/// Runs `fut` with a memo of [`row_fetch_from_select_query`]: within it, a
+/// statement read again against the same fields is answered from the last
+/// read instead of parsed again.
+///
+/// The PostgreSQL protocol reads one SELECT three times: to describe its
+/// columns, to find their scales, and to run it. That was a third of a
+/// point query's cost over pgwire, and the reason a simple query cost twice
+/// what the native protocol's did. The parse reads nothing but its two
+/// arguments, so a read with equal arguments has the same answer; a DDL that
+/// changes the table between the describe and the run changes its fields, and
+/// the run parses afresh. One memo per statement: wrap a statement, never a
+/// session.
+///
+/// A plain function returning the scope, not an `async fn` around it, which
+/// would hold `fut` twice.
+pub fn parse_memo_scope<F: std::future::Future>(fut: F) -> tokio::task::futures::TaskLocalFuture<std::cell::RefCell<Option<Box<ParseMemo>>>, F> {
+    PARSE_MEMO.scope(std::cell::RefCell::new(None), fut)
+}
+
+/// Parses a SELECT against `schema`'s fields. See [`parse_memo_scope`].
 pub fn row_fetch_from_select_query(
     query_purpose: &QueryPurpose,
     schema: &SmallVec<[SchemaField; 20]>,
 ) -> Result<QueryRows, String> {
+    let QueryPurpose::QueryRows(qr_data) = query_purpose else {
+        return parse_select_query(query_purpose, schema);
+    };
+    let sql = qr_data.query.as_str();
+    let hit = PARSE_MEMO
+        .try_with(|memo| {
+            memo.borrow()
+                .as_ref()
+                .filter(|m| m.sql == sql && m.fields == *schema)
+                .map(|m| m.parsed.clone())
+        })
+        .ok()
+        .flatten();
+    if let Some(parsed) = hit {
+        return parsed;
+    }
+    let parsed = parse_select_query(query_purpose, schema);
+    let _ = PARSE_MEMO.try_with(|memo| {
+        *memo.borrow_mut() = Some(Box::new(ParseMemo {
+            sql: sql.to_string(),
+            fields: schema.clone(),
+            parsed: parsed.clone(),
+        }));
+    });
+    parsed
+}
+
+fn parse_select_query(
+    query_purpose: &QueryPurpose,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> Result<QueryRows, String> {
+    #[cfg(test)]
+    PARSES.with(|n| n.set(n.get() + 1));
     let sql = match query_purpose {
         QueryPurpose::QueryRows(qr_data) => qr_data.query.trim(),
         _ => return Err("Not a SELECT/QueryRows query".to_string()),
@@ -1194,6 +1797,12 @@ pub fn row_fetch_from_select_query(
     let from_start = {
         let mut found = None;
         let mut quote: Option<u8> = None;
+        // `EXTRACT(EPOCH FROM ts)` puts a `FROM` inside the select list, and it
+        // is not the statement's. Splitting there took the rest of the call as
+        // the relation and reported "relation does not exist" about a statement
+        // whose actual `FROM` names a table that exists — an error naming
+        // nothing the author wrote.
+        let mut depth = 0i32;
         let mut i = select_end;
         while i + 4 <= sql_bytes.len() {
             let c = sql_bytes[i];
@@ -1206,11 +1815,17 @@ pub fn row_fetch_from_select_query(
                 None => {
                     if c == b'\'' || c == b'"' {
                         quote = Some(c);
-                    } else if &sql_bytes[i..i + 4] == b"FROM"
+                    } else if c == b'(' {
+                        depth += 1;
+                    } else if c == b')' {
+                        depth -= 1;
+                    } else if depth == 0
+                        && &sql_bytes[i..i + 4] == b"FROM"
                         && sql_bytes[i - 1].is_ascii_whitespace()
                         && sql_bytes
                             .get(i + 4)
                             .is_some_and(|n| n.is_ascii_whitespace())
+                        && !crate::core::rql::join::follows_distinct(sql_bytes, i)
                     {
                         found = Some(i);
                         break;
@@ -1247,14 +1862,20 @@ pub fn row_fetch_from_select_query(
     // "unsupported keyword 'UNION' in WHERE clause". The branches are combined
     // by `execute_union`, which reads the whole statement; this only has to
     // parse the first one.
-    let union_pos = find_keyword(after_from, "UNION", 0);
+    // `INTERSECT` and `EXCEPT` likewise (`set_ops::Combined::push_set_ops`).
+    let union_pos = ["UNION", "INTERSECT", "EXCEPT"]
+        .into_iter()
+        .filter_map(|word| find_keyword(after_from, word, 0))
+        .min();
 
     // Table name ends at the earliest clause marker.
-    let table_end = [where_pos, order_pos, limit_pos, offset_pos, group_pos, having_pos, union_pos]
-        .into_iter()
-        .flatten()
-        .min()
-        .unwrap_or(after_from.len());
+    let table_end = [
+        where_pos, order_pos, limit_pos, offset_pos, group_pos, having_pos, union_pos,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(after_from.len());
 
     // A JOIN would silently be dropped otherwise: the relation name is taken
     // from the first token after FROM, so `FROM a JOIN b ON …` would scan `a`
@@ -1275,15 +1896,53 @@ pub fn row_fetch_from_select_query(
         .unwrap_or("")
         .trim_matches('"');
 
+    // Only `[AS] alias` may follow the relation before the first clause.
+    // A misspelt clause keyword was read as the alias and everything after
+    // it dropped: `FROM t WHER id = 1` returned every row, and so did `FROM t
+    // LIMT 5` and `FROM t ODER BY id`. PostgreSQL's 42601.
+    // Clauses this does not implement are refused by name (0A000). Read as
+    // an alias and a dropped tail they answered as if absent (`INTERSECT`
+    // returned the first branch whole), and as a syntax error they named the
+    // wrong problem.
+    for clause in ["TABLESAMPLE", "WINDOW"] {
+        if find_keyword(after_from, clause, 0).is_some() {
+            return Err(format!("{clause} is not supported"));
+        }
+    }
+    let alias = relation_alias(&after_from[..table_end])?;
+    // And every qualifier names that relation (or its alias): `WHERE
+    // nosuch.v > 0` read t's `v`. Up to a UNION, whose branches have their
+    // own FROM.
+    let star_list;
+    {
+        let raw = after_from[..table_end].split_whitespace().next().unwrap_or("");
+        // Once aliased, the relation is known only by its alias, as in
+        // PostgreSQL (`FROM t AS x WHERE t.id = 1` is 42P01).
+        let allowed = crate::core::sql_scan::relation_qualifiers(raw, alias.as_deref());
+        let allowed: Vec<&str> = allowed.iter().map(String::as_str).collect();
+        let branch_end = union_pos.unwrap_or(after_from.len()).max(table_end);
+        for text in [columns_part, &after_from[table_end..branch_end]] {
+            if let Some(q) = crate::core::sql_scan::unknown_qualifier(text, &allowed) {
+                return Err(crate::core::sql_scan::missing_from_entry(&q));
+            }
+        }
+        star_list = crate::core::sql_scan::is_qualified_star(columns_part, &allowed);
+    }
+    // `SELECT t.*`, `x.*`, `public.t.*`: the relation's every column, which
+    // is `*` here (it was "Column 't.*' not found").
+    let columns_part = if star_list { "*" } else { columns_part };
+
     // WHERE clause is everything after WHERE up to ORDER BY / LIMIT / OFFSET.
     let where_raw = if let Some(wp) = where_pos {
         let start = wp + "WHERE".len();
-        let end = [order_pos, limit_pos, offset_pos, group_pos, having_pos, union_pos]
-            .into_iter()
-            .flatten()
-            .filter(|p| *p >= start)
-            .min()
-            .unwrap_or(after_from.len());
+        let end = [
+            order_pos, limit_pos, offset_pos, group_pos, having_pos, union_pos,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|p| *p >= start)
+        .min()
+        .unwrap_or(after_from.len());
         after_from[start..end].trim()
     } else {
         ""
@@ -1314,13 +1973,81 @@ pub fn row_fetch_from_select_query(
     // Desugar `IN` / `BETWEEN` / `LIKE`, fold boolean literals, and resolve
     // qualified or quoted column names, so the evaluator only ever sees the
     // basic `column <op> value` grammar it implements.
-    let where_owned = crate::core::tokenizer::predicate_rewrite::rewrite_where(where_raw, schema)?;
+    //
+    // A HAVING term over plain grouping columns — `HAVING status = 'x'` — is
+    // moved into WHERE first. Every row of a group carries the same bytes in a
+    // plain GROUP BY column, so the term holds for the group exactly when it
+    // holds for each of its rows. That is not true of a computed key, nor of a
+    // query without GROUP BY (its one group exists even with no rows), and
+    // both are refused rather than moved.
+    let having_split = match having_raw {
+        None => None,
+        Some(text) => Some(parse_having(text, schema)?),
+    };
+    let mut where_combined: Option<String> = None;
+    if let Some(split) = &having_split {
+        if !split.row_terms.is_empty() {
+            let Some(list) = group_by_raw else {
+                return Err(format!(
+                    "HAVING term '{}' tests no aggregate, and the query has no GROUP BY",
+                    split.row_terms[0].text
+                ));
+            };
+            // `GROUP BY 2` groups by the second select item, so a plain
+            // column there is a plain key here; its alias is not its name.
+            let selected = split_select_items(columns_part);
+            let positional = |item: &str| -> Option<&SchemaField> {
+                let n: usize = item.trim().parse().ok()?;
+                let text = selected.get(n.checked_sub(1)?)?.trim();
+                let text = match crate::core::rql::join::find_keyword(text, "AS", 0) {
+                    Some(at) => text[..at].trim(),
+                    None => text,
+                };
+                plain_group_column(text, schema)
+            };
+            let mut plain: Vec<&SchemaField> =
+                crate::core::rql::join::split_top_level_commas(list)
+                    .iter()
+                    .filter_map(|item| plain_group_column(item, schema).or_else(|| positional(item)))
+                    .collect();
+            // Grouped by a unique NOT NULL column, every column is constant
+            // within a group, so a term over any of them moves into WHERE.
+            if plain.iter().any(|f| determines_its_relation(f, schema)) {
+                plain = schema.iter().filter(|f| !f.is_deleted).collect();
+            }
+            let mut text = if where_raw.trim().is_empty() {
+                String::new()
+            } else {
+                format!("({})", where_raw)
+            };
+            for term in &split.row_terms {
+                for column in &term.columns {
+                    let bare = column.rsplit('.').next().unwrap_or(column).trim_matches('"');
+                    if !plain.iter().any(|f| f.name.eq_ignore_ascii_case(bare)) {
+                        return Err(format!(
+                            "column \"{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                            column.trim_matches('"')
+                        ));
+                    }
+                }
+                if !text.is_empty() {
+                    text.push_str(" AND ");
+                }
+                text.push('(');
+                text.push_str(&term.text);
+                text.push(')');
+            }
+            where_combined = Some(text);
+        }
+    }
+    let where_raw = where_combined.as_deref().unwrap_or(where_raw);
+    let where_owned = crate::core::tokenizer::predicate_rewrite::rewrite_scan_where(where_raw, schema)?;
     let where_part = where_owned.as_str();
 
     // ORDER BY: every sort key, in the order written. Resolution is deferred,
     // because an aggregate query may order by a function result — `ORDER BY
     // COUNT(*)` names nothing in the schema.
-    let order_terms: Vec<crate::core::rql::order_by::SortTerm> = match order_pos {
+    let mut order_terms: Vec<crate::core::rql::order_by::SortTerm> = match order_pos {
         None => Vec::new(),
         Some(op) => {
             let start = after_phrase(after_from, op, &["ORDER", "BY"]);
@@ -1392,6 +2119,7 @@ pub fn row_fetch_from_select_query(
     // `SELECT DISTINCT` is a post-pass over the fetched rows, so the keyword is
     // stripped here and the rest of the list parses normally.
     let columns_upper = columns_part.trim_start().to_ascii_uppercase();
+    let mut distinct_on_text: Option<String> = None;
     let (columns_part, distinct) = if columns_upper.starts_with("DISTINCT ") {
         let rest = columns_part.trim_start()["DISTINCT ".len()..].trim();
         // `DISTINCT ON (...)` is a different operator, not `DISTINCT` with a
@@ -1400,26 +2128,105 @@ pub fn row_fetch_from_select_query(
         // function call and the error blames a function named `on`, sending the
         // reader to look for something that does not exist.
         if starts_with_distinct_on(rest) {
-            return Err(
-                "SELECT DISTINCT ON is not supported yet — it keeps one row per key, \
-                 which plain DISTINCT does not do, so it cannot be treated as one"
-                    .to_string(),
-            );
+            // `ON (k, …)`, then the select list proper.
+            let open = rest.find('(').expect("checked by starts_with_distinct_on");
+            let close = crate::core::rql::expr::matching_paren(rest, open)
+                .ok_or_else(|| "SELECT DISTINCT ON has an unclosed key list".to_string())?;
+            distinct_on_text = Some(rest[open + 1..close].to_string());
+            (rest[close + 1..].trim(), false)
+        } else {
+            (rest, true)
         }
-        (rest, true)
     } else if columns_upper == "DISTINCT" {
         return Err("SELECT DISTINCT is missing its column list".to_string());
     } else {
         (columns_part, false)
     };
 
-    let select_items = parse_select_items(columns_part, schema)?;
+    let mut select_items = parse_select_items(columns_part, schema)?;
+
+    // `DISTINCT ON (k, …)`: each key a select item it names or an expression
+    // over the row. PostgreSQL's rule that an ORDER BY starts with the keys
+    // (42P10) is kept: it is what makes "the first row of each key" mean one
+    // row.
+    let mut distinct_on: Vec<crate::core::rql::expr::Expr> = Vec::new();
+    if let Some(text) = distinct_on_text.as_deref() {
+        if select_items
+            .iter()
+            .any(|i| matches!(i, SelectItem::Window { .. } | SelectItem::Aggregate { .. } | SelectItem::Computed { .. }))
+        {
+            return Err("SELECT DISTINCT ON with an aggregate or a window function is not supported yet".to_string());
+        }
+        let keys: Vec<String> = crate::core::rql::lexer_ct::split_definitions(text)
+            .into_iter()
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .collect();
+        if keys.is_empty() {
+            return Err("SELECT DISTINCT ON needs at least one key".to_string());
+        }
+        // Compared as written, less whitespace, case, a qualifier and any
+        // enclosing parentheses (an ORDER BY expression arrives as `(ts % 2)`).
+        let norm = |t: &str| {
+            let mut t: String = t.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
+            while t.starts_with('(') && crate::core::rql::expr::matching_paren(&t, 0) == Some(t.len() - 1) {
+                t = t[1..t.len() - 1].to_string();
+            }
+            let t = match t.rsplit_once('.') {
+                Some((q, c)) if !q.contains(['(', ' ', '%', '+', '-', '*', '/', '^']) => c.to_string(),
+                _ => t,
+            };
+            t.trim_matches('"').to_string()
+        };
+        if !order_terms.is_empty() {
+            let leading = keys.iter().enumerate().all(|(i, key)| {
+                order_terms.get(i).is_some_and(|t| norm(&t.token) == norm(key))
+            });
+            if !leading {
+                return Err("SELECT DISTINCT ON expressions must match initial ORDER BY expressions".to_string());
+            }
+        }
+        for key in &keys {
+            let bare = key.rsplit('.').next().unwrap_or(key).trim_matches('"');
+            let named = select_items.iter().find(|i| i.label().eq_ignore_ascii_case(bare)).and_then(|i| match i {
+                SelectItem::Column { field, .. } => Some(crate::core::rql::expr::Expr::Column(field.clone())),
+                SelectItem::RowExpr { expr, .. } => Some(expr.clone()),
+                _ => None,
+            });
+            let expr = match named {
+                Some(expr) if !schema.iter().any(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted) => expr,
+                _ => match crate::core::rql::expr::parse(key, schema) {
+                    Ok(expr) => expr,
+                    // A condition is a boolean key: `DISTINCT ON (a > 0)`.
+                    Err(e) => match crate::core::rql::join::comparison_value(key, schema) {
+                        Ok(Some(expr)) => expr,
+                        _ => return Err(format!("DISTINCT ON key '{key}' could not be read: {e}")),
+                    },
+                },
+            };
+            distinct_on.push(expr);
+        }
+    }
+
+    // `ORDER BY 2` names the second select item. Resolved before anything below
+    // looks at a sort key, so every path sees an ordinary one.
+    crate::core::rql::order_by::resolve_ordinals(
+        &mut order_terms,
+        &select_items
+            .iter()
+            .map(|i| i.label().to_string())
+            .collect::<Vec<_>>(),
+    )?;
+    let order_terms = order_terms;
     // A computed item folds aggregates too, so it takes the aggregate path —
     // otherwise its expression would be evaluated against raw scanned rows,
     // before there is any aggregate result for it to read.
-    let has_aggregate = select_items
-        .iter()
-        .any(|i| matches!(i, SelectItem::Aggregate { .. } | SelectItem::Computed { .. }));
+    let has_aggregate = select_items.iter().any(|i| {
+        matches!(
+            i,
+            SelectItem::Aggregate { .. } | SelectItem::Computed { .. }
+        )
+    });
 
     // A grouping key is usually a stored column, but PostgreSQL also accepts
     // a select-list alias — `GROUP BY snapshot_at` where `snapshot_at` labels
@@ -1427,7 +2234,7 @@ pub fn row_fetch_from_select_query(
     // Neither has a scanned column to read, so those become computed keys the
     // fold evaluates per row.
     let mut computed_group_keys: Vec<crate::core::rql::aggregate::ComputedKey> = Vec::new();
-    let group_by: Vec<SchemaField> = match group_by_raw {
+    let mut group_by: Vec<SchemaField> = match group_by_raw {
         None => Vec::new(),
         Some(list) => {
             // Virtual write_orders sit above every real field's, so a
@@ -1438,26 +2245,27 @@ pub fn row_fetch_from_select_query(
             // its own, as `date_trunc('minute', created_at)` does.
             for item_text in crate::core::rql::join::split_top_level_commas(list) {
                 let item = item_text.trim();
-                let name = item
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or("")
-                    .trim_matches('"');
-                if let Some(field) = schema
-                    .iter()
-                    .find(|f| f.name.eq_ignore_ascii_case(name) && !f.is_deleted)
-                {
+                if let Some(field) = plain_group_column(item, schema) {
                     out.push(field.clone());
                     continue;
                 }
 
-                // A name that is no column may label a select item.
-                let labelled = select_items
-                    .iter()
-                    .position(|s| s.label().eq_ignore_ascii_case(item.trim_matches('"')));
+                // A name that is no column may label a select item, and a
+                // number is one by position: `GROUP BY 1`, as reporting tools
+                // and ORMs write it.
+                let labelled = match item.parse::<usize>() {
+                    Ok(n) if n == 0 || n > select_items.len() => {
+                        return Err(format!(
+                            "GROUP BY position {} is not in the select list, which has {} item(s)",
+                            n,
+                            select_items.len()
+                        ));
+                    }
+                    Ok(n) => Some(n - 1),
+                    Err(_) => select_items
+                        .iter()
+                        .position(|s| s.label().eq_ignore_ascii_case(item.trim_matches('"'))),
+                };
                 if let Some(position) = labelled {
                     match &select_items[position] {
                         // An alias of a plain column groups by that column.
@@ -1465,7 +2273,11 @@ pub fn row_fetch_from_select_query(
                             out.push(field.clone());
                             continue;
                         }
-                        SelectItem::RowExpr { expr, db_type, label } => {
+                        SelectItem::RowExpr {
+                            expr,
+                            db_type,
+                            label,
+                        } => {
                             let field = SchemaField::new(
                                 label.clone(),
                                 db_type.clone(),
@@ -1475,14 +2287,12 @@ pub fn row_fetch_from_select_query(
                                 false,
                             );
                             next_virtual += 1;
-                            computed_group_keys.push(
-                                crate::core::rql::aggregate::ComputedKey {
-                                    write_order: field.write_order,
-                                    expr: expr.clone(),
-                                    schema: expr_reads(expr, schema),
-                                    item: Some(position),
-                                },
-                            );
+                            computed_group_keys.push(crate::core::rql::aggregate::ComputedKey {
+                                write_order: field.write_order,
+                                expr: expr.clone(),
+                                schema: expr_reads(expr, schema),
+                                item: Some(position),
+                            });
                             out.push(field);
                             continue;
                         }
@@ -1501,17 +2311,22 @@ pub fn row_fetch_from_select_query(
                 // The expression written out in the GROUP BY. When the select
                 // list carries the same expression, the key echoes into that
                 // item's output slot.
-                if crate::core::rql::expr::needs_evaluation(item)
-                    || looks_like_row_expression(item)
+                // A condition is a key too, `GROUP BY n > 0`, `GROUP BY (a IS
+                // NULL)`: its value TRUE, FALSE or NULL, built as the select
+                // list builds the same item, so the two still match.
+                let written_key = if crate::core::rql::expr::needs_evaluation(item) || looks_like_row_expression(item) {
+                    crate::core::rql::expr::parse(item, schema).ok()
+                } else {
+                    None
+                }
+                .or_else(|| crate::core::rql::join::comparison_value(item, schema).ok().flatten());
                 {
-                    if let Ok(parsed) = crate::core::rql::expr::parse(item, schema) {
+                    if let Some(parsed) = written_key {
                         // `Expr` has no equality of its own; its Debug form is
                         // structural, which is what matching two parses needs.
                         let written = format!("{:?}", parsed);
                         let matching = select_items.iter().position(|s| match s {
-                            SelectItem::RowExpr { expr, .. } => {
-                                format!("{:?}", expr) == written
-                            }
+                            SelectItem::RowExpr { expr, .. } => format!("{:?}", expr) == written,
                             _ => false,
                         });
                         let db_type = crate::core::rql::expr::static_type(&parsed);
@@ -1552,6 +2367,10 @@ pub fn row_fetch_from_select_query(
     // needs no special case: it already emits the grouping key for a plain
     // column, so a plan whose items are all keys yields one row per group.
     let is_grouped = has_aggregate || !group_by.is_empty();
+    // Columns with a nondeterministic collation sort by their key; what
+    // would compare them by their bytes is refused (`collation::plan_single`).
+    let order_terms =
+        crate::core::rql::collation::plan_single(columns_part, schema, order_terms, &group_by, is_grouped, distinct)?;
 
     // HAVING with nothing to group by is the whole table as one group, which
     // only means something if there is an aggregate to test.
@@ -1561,14 +2380,88 @@ pub fn row_fetch_from_select_query(
 
     // Every non-aggregate select item of a grouped query must be a grouping
     // key; otherwise its value is not determined by the group.
+    //
+    // Unless the column is functionally dependent on the grouping (PostgreSQL
+    // since 9.1): grouping by a column that is unique and NOT NULL makes each
+    // group one row, so every other column of the relation is determined.
+    // Django's `.annotate()` and Rails' `group(:id)` emit exactly
+    // `SELECT a.id, a.name, COUNT(*) … GROUP BY a.id`, which was refused. Such a
+    // column is appended to the group key rather than trusted to be constant:
+    // the result is the same when the key really is unique, and still a
+    // correct grouping if it ever is not.
+    let determined_by_key = group_by
+        .iter()
+        .filter(|g| {
+            !computed_group_keys
+                .iter()
+                .any(|k| k.write_order == g.write_order)
+        })
+        .any(|g| determines_its_relation(g, schema));
     if is_grouped {
+        // A row expression that reads no column (`upper('x')`, `now()::date`,
+        // `1 + 2`) is the same for every group, as PostgreSQL allows it
+        // beside an aggregate: evaluated once into a constant. It was refused
+        // as a column that "must appear in GROUP BY".
+        for position in 0..select_items.len() {
+            let SelectItem::RowExpr { expr, label, .. } = &select_items[position] else { continue };
+            if !crate::core::rql::expr::columns_of(expr).is_empty()
+                || computed_group_keys.iter().any(|k| k.item == Some(position))
+            {
+                continue;
+            }
+            let row = crate::core::row::row::Row::default();
+            let (bytes, db_type) = match crate::core::rql::expr::eval(expr, &row, &[])? {
+                crate::core::rql::expr::Value::Data { bytes, db_type } => (bytes, db_type),
+                crate::core::rql::expr::Value::Null => (Vec::new(), crate::core::db_type::DbType::NULL),
+            };
+            let label = label.clone();
+            select_items[position] = SelectItem::Literal { bytes, db_type, label };
+        }
+        // An expression over grouping keys only (`r * 3`, `upper(name)` with
+        // `GROUP BY r, name`) has one value per group, as PostgreSQL allows:
+        // it becomes a key of its own, which groups nothing finer and is
+        // echoed into its slot. It was refused as a column that "must appear
+        // in GROUP BY", the commonest shape of a grouped report.
+        let mut next_virtual = group_by
+            .iter()
+            .map(|g| g.write_order)
+            .chain(schema.iter().map(|f| f.write_order))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        for position in 0..select_items.len() {
+            let SelectItem::RowExpr { expr, db_type, label } = &select_items[position] else { continue };
+            if computed_group_keys.iter().any(|k| k.item == Some(position)) {
+                continue;
+            }
+            let reads = crate::core::rql::expr::columns_of(expr);
+            let grouped = |f: &SchemaField| {
+                group_by.iter().any(|g| g.write_order == f.write_order || g.name.eq_ignore_ascii_case(&f.name))
+            };
+            if reads.is_empty() || !(reads.iter().all(grouped) || determined_by_key) {
+                continue;
+            }
+            let field = SchemaField::new(label.clone(), db_type.clone(), db_type.get_size(), 0, next_virtual, false);
+            next_virtual += 1;
+            computed_group_keys.push(crate::core::rql::aggregate::ComputedKey {
+                write_order: field.write_order,
+                expr: expr.clone(),
+                schema: expr_reads(expr, schema),
+                item: Some(position),
+            });
+            group_by.push(field);
+        }
         for (position, item) in select_items.iter().enumerate() {
             match item {
-                SelectItem::Column { field, label } => {
+                SelectItem::Column { field, label: _ } => {
                     if !group_by.iter().any(|g| g.write_order == field.write_order) {
+                        if determined_by_key {
+                            group_by.push(field.clone());
+                            continue;
+                        }
                         return Err(format!(
-                            "column '{}' must appear in GROUP BY or be used in an aggregate",
-                            label
+                            "column \"{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                            field.name
                         ));
                     }
                 }
@@ -1576,11 +2469,16 @@ pub fn row_fetch_from_select_query(
                 // grouped query it is only determined when it is itself a
                 // grouping key. Refused rather than emitted empty: an empty
                 // value here is a silent wrong answer.
-                SelectItem::RowExpr { label, .. } => {
+                SelectItem::RowExpr { expr, label, .. } => {
                     if !computed_group_keys.iter().any(|k| k.item == Some(position)) {
+                        // The first column it reads that is no key, as
+                        // PostgreSQL names it.
+                        let column = crate::core::rql::expr::columns_of(expr)
+                            .into_iter()
+                            .find(|f| !group_by.iter().any(|g| g.write_order == f.write_order || g.name.eq_ignore_ascii_case(&f.name)))
+                            .map_or_else(|| label.clone(), |f| f.name);
                         return Err(format!(
-                            "column '{}' must appear in GROUP BY or be used in an aggregate",
-                            label
+                            "column \"{column}\" must appear in the GROUP BY clause or be used in an aggregate function"
                         ));
                     }
                 }
@@ -1589,10 +2487,9 @@ pub fn row_fetch_from_select_query(
         }
     }
 
-    let having = match having_raw {
-        None => None,
-        Some(text) => Some(parse_having(text, schema)?),
-    };
+    // Parsed above, before WHERE was rewritten; its plain-column terms are
+    // already part of the WHERE clause.
+    let having = having_split.and_then(|split| split.having);
 
     let aggregate = if is_grouped {
         Some(crate::core::rql::aggregate::AggregatePlan {
@@ -1605,20 +2502,13 @@ pub fn row_fetch_from_select_query(
                 // the input rows are gone by then.
                 let mut keys = Vec::with_capacity(order_terms.len());
                 for term in &order_terms {
-                    // The fold's sort compares finished output bytes and has
-                    // no NULL companion to read, so a placement it cannot
-                    // honour is refused rather than quietly ignored.
-                    if term.nulls_first.is_some() {
-                        return Err(
-                            "ORDER BY ... NULLS FIRST/LAST is not supported for grouped queries yet"
-                                .to_string(),
-                        );
-                    }
+                    // `NULLS FIRST`/`LAST` is carried through: the fold's
+                    // sort reads NULL-ness from each output cell's type.
                     let label =
                         resolve_output_label(&term.token, &select_items).ok_or_else(|| {
                             format!("ORDER BY term '{}' is not in the SELECT list", term.token)
                         })?;
-                    keys.push((label, term.descending));
+                    keys.push((label, term.descending, term.nulls_first));
                 }
                 keys
             },
@@ -1664,8 +2554,11 @@ pub fn row_fetch_from_select_query(
 
     // Row expressions occupy output slots no fetched column fills, and are
     // evaluated per row against the values the scan returned.
-    let mut expr_slots: Vec<(usize, crate::core::rql::expr::Expr, crate::core::db_type::DbType)> =
-        Vec::new();
+    let mut expr_slots: Vec<(
+        usize,
+        crate::core::rql::expr::Expr,
+        crate::core::db_type::DbType,
+    )> = Vec::new();
     for (position, item) in select_items.iter().enumerate() {
         if let SelectItem::RowExpr { expr, db_type, .. } = item {
             expr_slots.push((position, expr.clone(), db_type.clone()));
@@ -1694,21 +2587,40 @@ pub fn row_fetch_from_select_query(
         }
         for item in &select_items {
             match item {
-                SelectItem::Aggregate { arg, filter, .. } => {
-                    if let Some(f) = arg {
-                        if !cols.iter().any(|c| c == &f.name) {
-                            cols.push(f.name.clone());
+                SelectItem::Aggregate {
+                    arg,
+                    filter,
+                    arg_expr,
+                    call,
+                    ..
+                } => {
+                    match arg_expr {
+                        // A computed argument's `arg` names the expression, not
+                        // a column — what has to be fetched is what it reads.
+                        Some(argument) => {
+                            for f in &argument.schema {
+                                if !cols.iter().any(|c| c == &f.name) {
+                                    cols.push(f.name.clone());
+                                }
+                            }
+                        }
+                        None => {
+                            if let Some(f) = arg {
+                                if !cols.iter().any(|c| c == &f.name) {
+                                    cols.push(f.name.clone());
+                                }
+                            }
                         }
                     }
                     // `FILTER (WHERE status = …)` reads a column the aggregate
                     // itself does not, and the fold sees only what the scan
                     // returned — so without this the condition tested a column
                     // that was not there, read as NULL, and rejected every row.
-                    if let Some(filter) = filter {
-                        for f in &filter.schema {
-                            if !cols.iter().any(|c| c == &f.name) {
-                                cols.push(f.name.clone());
-                            }
+                    // An ORDER BY inside the call reads its keys the same way.
+                    let keys = call.iter().flat_map(|c| c.order.iter()).flat_map(|k| k.schema.iter());
+                    for f in filter.iter().flat_map(|f| f.schema.iter()).chain(keys) {
+                        if !cols.iter().any(|c| c == &f.name) {
+                            cols.push(f.name.clone());
                         }
                     }
                 }
@@ -1717,7 +2629,15 @@ pub fn row_fetch_from_select_query(
                 // scan returned, so a column missed here reads back as NULL.
                 SelectItem::Computed { inputs, .. } => {
                     for input in inputs {
-                        if let Some(f) = &input.arg {
+                        // A computed argument's field names the expression;
+                        // what it reads is what the scan fetches.
+                        let mut reads: Vec<&SchemaField> = match &input.arg_expr {
+                            Some(argument) => argument.schema.iter().collect(),
+                            None => input.arg.iter().collect(),
+                        };
+                        reads.extend(input.filter.iter().flat_map(|f| f.schema.iter()));
+                        reads.extend(input.call.iter().flat_map(|c| c.order.iter()).flat_map(|k| k.schema.iter()));
+                        for f in reads {
                             if !cols.iter().any(|c| c == &f.name) {
                                 cols.push(f.name.clone());
                             }
@@ -1727,17 +2647,40 @@ pub fn row_fetch_from_select_query(
                 _ => {}
             }
         }
+        // Every column a HAVING aggregate reads: its argument (or what a
+        // computed argument reads) and what its FILTER reads.
         if let Some(h) = aggregate.as_ref().and_then(|a| a.having.as_ref()) {
-            if let Some(f) = &h.arg {
-                if !cols.iter().any(|c| c == &f.name) {
-                    cols.push(f.name.clone());
+            for item in &h.aggregates {
+                if let SelectItem::Aggregate {
+                    arg,
+                    filter,
+                    arg_expr,
+                    ..
+                } = item
+                {
+                    let mut names: Vec<&str> = Vec::new();
+                    match arg_expr {
+                        Some(argument) => names.extend(argument.schema.iter().map(|f| f.name.as_str())),
+                        None => names.extend(arg.iter().map(|f| f.name.as_str())),
+                    }
+                    if let Some(filter) = filter {
+                        names.extend(filter.schema.iter().map(|f| f.name.as_str()));
+                    }
+                    for name in names {
+                        if !cols.iter().any(|c| c == name) {
+                            cols.push(name.to_string());
+                        }
+                    }
                 }
             }
         }
         // `SELECT COUNT(*)` reads no column at all, but the scan still has to
-        // fetch something per row for the fold to have rows to count.
+        // fetch something per row for the fold to have rows to count. A live
+        // column (`placeholder_column`): a dropped one is not found by name,
+        // and on an empty table, where DROP COLUMN rewrites nothing, its
+        // tombstone is still the first field.
         if cols.is_empty() {
-            if let Some(f) = schema.iter().min_by_key(|f| f.write_order) {
+            if let Some(f) = placeholder_column(schema, |f| f.write_order) {
                 cols.push(f.name.clone());
             }
         }
@@ -1783,8 +2726,7 @@ pub fn row_fetch_from_select_query(
                     }
                     // The nullability companion too, or a NULL reads back as
                     // the column's zero value.
-                    if let Some(flag) =
-                        crate::core::rql::nullable::flag_field(&field.name, schema)
+                    if let Some(flag) = crate::core::rql::nullable::flag_field(&field.name, schema)
                     {
                         if !cols.iter().any(|c| c == &flag.name) {
                             cols.push(flag.name.clone());
@@ -1794,11 +2736,7 @@ pub fn row_fetch_from_select_query(
             }
         }
         if all_literals {
-            if let Some(f) = schema
-                .iter()
-                .filter(|f| !crate::core::rql::nullable::is_hidden(&f.name))
-                .min_by_key(|f| f.size)
-            {
+            if let Some(f) = placeholder_column(schema, |f| f.size) {
                 cols.push(f.name.clone());
             }
         }
@@ -1817,9 +2755,14 @@ pub fn row_fetch_from_select_query(
 
     // A predicate reading a column the projection does not means the scan has
     // to fetch it, and it comes back in the row alongside the requested ones.
-    let predicate_needs_extra_columns = extract_where_columns(where_part, schema)
-        .iter()
-        .any(|name| !requested_columns.iter().any(|c| c.eq_ignore_ascii_case(name)));
+    let predicate_needs_extra_columns =
+        extract_where_columns(where_part, schema)
+            .iter()
+            .any(|name| {
+                !requested_columns
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(name))
+            });
 
     let mut requested_columns = requested_columns;
 
@@ -1850,20 +2793,25 @@ pub fn row_fetch_from_select_query(
     // NULLS FIRST/LAST — is evaluated and sorted after the scan instead.
     let scan_can_sort = order_terms.iter().all(|term| {
         term.nulls_first.is_none() && {
-            let bare = term.token.rsplit('.').next().unwrap_or(&term.token).trim_matches('"');
-            schema.iter().any(|f| {
-                f.name.eq_ignore_ascii_case(bare)
-                    && !f.is_deleted
-                    // A nullable key must not byte-sort: a stored NULL is the
-                    // type's zeroes there, so NULL timestamps sorted as 1970
-                    // instead of last. The expression path reads the
-                    // companion and places NULLs where PostgreSQL does.
-                    && crate::core::rql::nullable::flag_field(&f.name, schema).is_none()
-            })
+            let bare = term
+                .token
+                .rsplit('.')
+                .next()
+                .unwrap_or(&term.token)
+                .trim_matches('"');
+            // A nullable key is allowed now: the scan fetches its `__null_x`
+            // companion (below) and the sort reads it, so a stored NULL is no
+            // longer byte-compared as the type's zeroes. Routing these to the
+            // expression path instead meant the scan ran unbounded — it is
+            // handed no limit there — so `ORDER BY <nullable> LIMIT 3` had to
+            // materialise every matching row to return three.
+            schema
+                .iter()
+                .any(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted)
         }
     });
-    let mut order_expressions: Vec<(crate::core::rql::expr::Expr, bool, Option<bool>)> =
-        Vec::new();
+    let mut order_expressions: Vec<(crate::core::rql::expr::Expr, bool, Option<bool>)> = Vec::new();
+    let mut window_order: Vec<(WindowOrderKey, bool, Option<bool>)> = Vec::new();
 
     // An aggregate query sorts, limits and offsets its own output after the
     // fold, so none of the three is handed to the scan. Passing a limit down
@@ -1884,7 +2832,10 @@ pub fn row_fetch_from_select_query(
         // answer PostgreSQL gives.
         if let Some(order_spec) = order_by.as_deref() {
             for (name, _) in crate::core::rql::order_by::parse_spec(order_spec) {
-                if !requested_columns.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+                if !requested_columns
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&name))
+                {
                     return Err(format!(
                         "for SELECT DISTINCT, ORDER BY term '{}' must appear in the select list",
                         name
@@ -1893,7 +2844,11 @@ pub fn row_fetch_from_select_query(
             }
         }
 
-        (order_by, None, None)
+        // The offset is kept even though the limit is not: the executor
+        // applies both *after* deduplicating (its `distinct` skip/take), which
+        // is where PostgreSQL applies them. Passing `None` here dropped the
+        // clause, so `DISTINCT … OFFSET n` silently returned page one.
+        (order_by, None, offset)
     } else if scan_can_sort {
         let order_by = resolve_order_spec(&order_terms, schema)?;
 
@@ -1901,13 +2856,30 @@ pub fn row_fetch_from_select_query(
         // not selected still has to be fetched.
         if let Some(order_spec) = order_by.as_deref() {
             for (name, _) in crate::core::rql::order_by::parse_spec(order_spec) {
-                if !requested_columns.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+                // A nullable key is only sortable with its companion in the
+                // row, so the companion is fetched too. Both ride after the
+                // visible columns and are trimmed before the client sees the
+                // row, exactly as an unselected sort key already was.
+                if let Some(flag) = crate::core::rql::nullable::flag_field(&name, schema) {
+                    if !requested_columns
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(&flag.name))
+                    {
+                        requested_columns.push(flag.name.clone());
+                    }
+                }
+                if !requested_columns
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&name))
+                {
                     requested_columns.push(name);
                 }
             }
         }
 
-        (order_by, limit, offset)
+        // Under DISTINCT ON the limit counts kept rows, so the scan is not
+        // bounded by it (the executor takes `written_limit` after the keys).
+        (order_by, if distinct_on.is_empty() { limit } else { None }, offset)
     } else {
         // `ORDER BY NULLIF(data->>'2', '')::date ASC NULLS FIRST` — the shape
         // an application sorting on a document field emits. The keys resolve
@@ -1921,6 +2893,16 @@ pub fn row_fetch_from_select_query(
                 .next()
                 .unwrap_or(&term.token)
                 .trim_matches('"');
+            let window_item = select_items.iter().position(|s| {
+                matches!(s, SelectItem::Window { .. }) && s.label().eq_ignore_ascii_case(bare)
+            });
+            let named_column = schema.iter().any(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted);
+            if let (Some(position), false) = (window_item, named_column) {
+                // A window's value exists only once every row is in: the
+                // whole ORDER BY is sorted then (`window_order`).
+                window_order.push((WindowOrderKey::Window(position), term.descending, term.nulls_first));
+                continue;
+            }
             let expr = if let Some(field) = schema
                 .iter()
                 .find(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted)
@@ -1936,33 +2918,86 @@ pub fn row_fetch_from_select_query(
                         crate::core::rql::expr::Expr::Column(field.clone())
                     }
                     SelectItem::RowExpr { expr, .. } => expr.clone(),
-                    _ => {
-                        return Err(format!(
-                            "ORDER BY '{}' cannot be sorted here",
-                            term.token
-                        ))
-                    }
+                    _ => return Err(format!("ORDER BY '{}' cannot be sorted here", term.token)),
                 }
             } else {
-                crate::core::rql::expr::parse(&term.token, schema).map_err(|e| {
-                    format!(
-                        "ORDER BY term '{}' is not a column and could not be read as an expression: {}",
-                        term.token, e
-                    )
-                })?
+                match crate::core::rql::expr::parse(&term.token, schema) {
+                    Ok(expr) => expr,
+                    // PostgreSQL's own refusal, unwrapped, as the select list
+                    // and WHERE report it.
+                    Err(e) if e.starts_with("operator does not exist") => return Err(e),
+                    Err(e) => {
+                        // A condition sorts as the boolean it is: `ORDER BY
+                        // a > 0` (false before true, NULL last).
+                        let mut inner = term.token.trim();
+                        while inner.starts_with('(')
+                            && crate::core::rql::expr::matching_paren(inner, 0) == Some(inner.len() - 1)
+                        {
+                            inner = inner[1..inner.len() - 1].trim();
+                        }
+                        match crate::core::rql::join::comparison_value(inner, schema) {
+                            Ok(Some(expr)) => expr,
+                            _ => {
+                                return Err(format!(
+                                    "ORDER BY term '{}' is not a column and could not be read as an expression: {}",
+                                    term.token, e
+                                ));
+                            }
+                        }
+                    }
+                }
             };
             // The columns the key reads (with their NULL companions) ride
             // after the visible ones and are trimmed before the client sees
             // the row — the same trick a plain unselected sort key uses.
             for f in expr_reads(&expr, schema) {
-                if !requested_columns.iter().any(|c| c.eq_ignore_ascii_case(&f.name)) {
+                if !requested_columns
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&f.name))
+                {
                     requested_columns.push(f.name.clone());
                 }
             }
             order_expressions.push((expr, term.descending, term.nulls_first));
         }
+        // With a window key anywhere, every key is sorted at the window
+        // stage, in the order written, and nothing before it.
+        if !window_order.is_empty() {
+            let mut all: Vec<(WindowOrderKey, bool, Option<bool>)> = Vec::with_capacity(order_terms.len());
+            let mut windows = std::mem::take(&mut window_order).into_iter();
+            let mut exprs = std::mem::take(&mut order_expressions).into_iter();
+            for term in &order_terms {
+                let bare = term.token.rsplit('.').next().unwrap_or(&term.token).trim_matches('"');
+                let is_window = select_items
+                    .iter()
+                    .any(|s| matches!(s, SelectItem::Window { .. }) && s.label().eq_ignore_ascii_case(bare))
+                    && !schema.iter().any(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted);
+                let next = if is_window {
+                    windows.next()
+                } else {
+                    exprs.next().map(|(e, d, n)| (WindowOrderKey::Expr(e), d, n))
+                };
+                all.extend(next);
+            }
+            window_order = all;
+        }
         (None, None, offset)
     };
+
+    // DISTINCT ON's keys are evaluated on the row as fetched, before the
+    // columns only they read are trimmed off.
+    if !distinct_on.is_empty() {
+        if !window_order.is_empty() {
+            return Err("SELECT DISTINCT ON with an ORDER BY over a window function is not supported yet".to_string());
+        }
+        for expr in &distinct_on {
+            for f in expr_reads(expr, schema) {
+                if !requested_columns.iter().any(|c| c.eq_ignore_ascii_case(&f.name)) {
+                    requested_columns.push(f.name.clone());
+                }
+            }
+        }
+    }
 
     // Build requested_row_fetch for SELECT columns
     let mut requested_columns_fetching_data = SmallVec::new();
@@ -2022,10 +3057,21 @@ pub fn row_fetch_from_select_query(
         limit,
         order_by,
         offset,
-        visible_columns,
+        // An ORDER BY sorted at the window stage reads its keys there, from
+        // the row as fetched: nothing is cut before it (the stage truncates
+        // to the select list once its values are in). Cut at the visible
+        // columns, a key on a column not selected read NULL in every row, and
+        // `ORDER BY user_id, rnk` sorted by `rnk` alone.
+        visible_columns: if window_order.iter().any(|(k, _, _)| matches!(k, WindowOrderKey::Expr(_))) && distinct_on.is_empty() {
+            requested_columns.len()
+        } else {
+            visible_columns
+        },
         order_expressions,
+        window_order,
         aggregate,
         distinct,
+        distinct_on,
         written_limit: original_limit,
         null_flag_positions,
         literal_slots,
@@ -2034,8 +3080,33 @@ pub fn row_fetch_from_select_query(
         window_slots,
         predicate_needs_extra_columns,
         row_lock,
-        select_items,
+        select_items: select_items.into(),
     };
+
+    // A row lock names table rows, and these produce rows that are not one
+    // table row each: PostgreSQL refuses the lock (0A000), in this order.
+    // `SELECT DISTINCT state … FOR UPDATE` locked one row per value and left
+    // the rest unlocked, and `SELECT COUNT(*) … FOR UPDATE` locked nothing.
+    if let Some(lock) = &query_rows.row_lock {
+        let refused = if query_rows.distinct {
+            Some("DISTINCT clause")
+        } else if let Some(plan) = &query_rows.aggregate {
+            Some(if !plan.group_by.is_empty() || !plan.computed_keys.is_empty() {
+                "GROUP BY clause"
+            } else if plan.having.is_some() {
+                "HAVING clause"
+            } else {
+                "aggregate functions"
+            })
+        } else if !query_rows.window_slots.is_empty() {
+            Some("window functions")
+        } else {
+            None
+        };
+        if let Some(what) = refused {
+            return Err(lock.not_allowed_with(what));
+        }
+    }
 
     // Debug, not info: this prints the whole `QueryRows` — every fetched
     // column, every select item, the full schema of each — for *every*
@@ -2044,6 +3115,28 @@ pub fn row_fetch_from_select_query(
     debug!("Parsed QueryRows: {:?}", query_rows);
 
     Ok(query_rows)
+}
+
+/// The column a scan fetches when the statement reads none (`COUNT(*)`, a
+/// select list of constants): only so it has something per row. The live,
+/// visible field `key` ranks lowest.
+///
+/// Live is the part that matters. A dropped column keeps its field as a
+/// tombstone, and on an empty table `DROP COLUMN` rewrites nothing, so the
+/// tombstone stays first in write order; and its companion, retired as
+/// `__dropped___null_<c>_<n>` when the name is taken again, no longer reads
+/// as hidden and is a one-byte BOOL, so it was the narrowest. Either way the
+/// pick named a field no lookup finds, and `SELECT 1 FROM t`, `COUNT(*)` and
+/// every CHECK's validation of existing rows failed with "Column … not found
+/// in schema".
+pub(crate) fn placeholder_column<K: Ord>(
+    schema: &[SchemaField],
+    key: impl Fn(&SchemaField) -> K,
+) -> Option<&SchemaField> {
+    schema
+        .iter()
+        .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+        .min_by_key(|f| key(f))
 }
 
 #[cfg(test)]
@@ -2066,6 +3159,55 @@ mod tests {
         let (expr, alias) = split_alias("'plain literal'");
         assert_eq!(expr, "'plain literal'");
         assert_eq!(alias, None);
+    }
+
+    /// Inside a memo scope a statement read again against the same fields
+    /// is not parsed again, and against other fields (a DDL between a
+    /// describe and a run) it is, and answers for those fields.
+    #[test]
+    fn a_memo_parses_a_statement_once_per_set_of_fields() {
+        let schema = make_schema();
+        let purpose = QueryPurpose::QueryRows(crate::core::rql::lexer_s1::QueryRowsData {
+            table_name: "users".to_string(),
+            query: "SELECT id, name FROM users WHERE id = 1".to_string(),
+        });
+        let parses = || PARSES.with(std::cell::Cell::get);
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(parse_memo_scope(async {
+            let before = parses();
+            let first = row_fetch_from_select_query(&purpose, &schema).unwrap();
+            let again = row_fetch_from_select_query(&purpose, &schema).unwrap();
+            assert_eq!(parses() - before, 1, "the second read was parsed again");
+            assert_eq!(format!("{first:?}"), format!("{again:?}"));
+
+            let mut changed = schema.clone();
+            changed[0].db_type = DbType::I32;
+            changed[0].size = 4;
+            let other = row_fetch_from_select_query(&purpose, &changed).unwrap();
+            assert_eq!(parses() - before, 2, "other fields must be parsed against");
+            assert_eq!(format!("{other:?}"), format!("{:?}", parse_select_query(&purpose, &changed).unwrap()));
+            assert_ne!(format!("{other:?}"), format!("{first:?}"), "the fields did not reach the parse");
+
+            // Another statement, then a failing one: each answered for itself.
+            let names = QueryPurpose::QueryRows(crate::core::rql::lexer_s1::QueryRowsData {
+                table_name: "users".to_string(),
+                query: "SELECT name FROM users".to_string(),
+            });
+            let read = row_fetch_from_select_query(&names, &changed).unwrap();
+            assert_eq!(format!("{read:?}"), format!("{:?}", parse_select_query(&names, &changed).unwrap()));
+            let broken = QueryPurpose::QueryRows(crate::core::rql::lexer_s1::QueryRowsData {
+                table_name: "users".to_string(),
+                query: "SELECT nope FROM users".to_string(),
+            });
+            let e1 = row_fetch_from_select_query(&broken, &changed).unwrap_err();
+            let e2 = row_fetch_from_select_query(&broken, &changed).unwrap_err();
+            assert_eq!(e1, e2);
+        }));
+        // Outside a scope every read parses.
+        let before = parses();
+        row_fetch_from_select_query(&purpose, &schema).unwrap();
+        row_fetch_from_select_query(&purpose, &schema).unwrap();
+        assert_eq!(parses() - before, 2);
     }
 
     #[test]
@@ -2100,7 +3242,11 @@ mod tests {
                 .to_string(),
         });
         let parsed = row_fetch_from_select_query(&purpose, &schema).unwrap();
-        assert!(parsed.where_clause.contains('>'), "{:?}", parsed.where_clause);
+        assert!(
+            parsed.where_clause.contains('>'),
+            "{:?}",
+            parsed.where_clause
+        );
         // A grouped query pages after the fold, so the limit rides on the
         // aggregate plan rather than on the scan.
         let plan = parsed.aggregate.as_ref().expect("GROUP BY must be found");
@@ -2185,6 +3331,51 @@ mod tests {
     }
 
     #[test]
+    fn an_operator_word_is_never_an_alias() {
+        // Each of these was its first operand aliased by the keyword, with
+        // the rest of the item dropped.
+        for item in [
+            "a.n BETWEEN 2 AND 4",
+            "s LIKE 'x%'",
+            "a.flag AND b.flag",
+            "a.n IS DISTINCT FROM b.n",
+            "flag IS TRUE",
+            "NOT flag",
+            "n ISNULL",
+            "upper(t) ISNULL",
+            "upper(t) LIKE 'X%'",
+            "'x' LIKE t",
+            "(n)::int BETWEEN 2 AND 4",
+            "a b c",
+        ] {
+            let (expr, alias) = split_alias(item);
+            assert_eq!((expr, alias), (item, None), "{item}");
+        }
+
+        // A name, bare or after `AS`, still is one, and quoted it may be
+        // spelled like a keyword.
+        assert_eq!(split_alias("flag x"), ("flag", Some("x".to_string())));
+        assert_eq!(split_alias("a.flag AS x"), ("a.flag", Some("x".to_string())));
+        assert_eq!(split_alias("flag \"like\""), ("flag", Some("like".to_string())));
+        assert_eq!(split_alias("'lit' x"), ("'lit'", Some("x".to_string())));
+        assert_eq!(split_alias("COUNT(x) total"), ("COUNT(x)", Some("total".to_string())));
+    }
+
+    #[test]
+    fn a_condition_over_aggregates_is_a_boolean_item() {
+        let schema: SmallVec<[SchemaField; 20]> = SmallVec::new();
+        for (expr, label) in [("COUNT(*) > 0", "?column?"), ("count(*) = 2", "?column?")] {
+            match parse_computed_item(expr, &schema, None).expect("parses").expect("computed") {
+                SelectItem::Computed { db_type, label: l, .. } => {
+                    assert_eq!(db_type, crate::core::db_type::DbType::BOOL, "{expr}");
+                    assert_eq!(l, label);
+                }
+                _ => panic!("{expr}: not computed"),
+            }
+        }
+    }
+
+    #[test]
     fn a_parenthesised_operand_under_a_cast_is_an_expression() {
         // `(a + 1)::bigint` hides its `+` at depth 1, so the only marker that
         // it is an expression rather than a column name is the cast. Without
@@ -2205,8 +3396,7 @@ mod tests {
     #[test]
     fn an_expression_over_an_aggregate_becomes_a_computed_item() {
         let schema = make_schema();
-        let items =
-            parse_select_items("COALESCE(MAX(age), 0) + 1 AS next", &schema).unwrap();
+        let items = parse_select_items("COALESCE(MAX(age), 0) + 1 AS next", &schema).unwrap();
         assert_eq!(items.len(), 1);
         match &items[0] {
             SelectItem::Computed { inputs, label, .. } => {
@@ -2272,38 +3462,54 @@ mod tests {
             SchemaField {
                 name: "id".to_string(),
                 db_type: DbType::U64,
+                without_time_zone: false,
+                json_text: false,
                 size: 8,
                 offset: 0,
                 write_order: 0,
                 is_unique: true,
-                is_deleted: false
+                is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "name".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
+                json_text: false,
                 size: 32,
                 offset: 8,
                 write_order: 1,
                 is_unique: false,
-                is_deleted: false
+                is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "age".to_string(),
                 db_type: DbType::U8,
+                without_time_zone: false,
+                json_text: false,
                 size: 1,
                 offset: 40,
                 write_order: 2,
                 is_unique: false,
-                is_deleted: false
+                is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "email".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
+                json_text: false,
                 size: 64,
                 offset: 41,
                 write_order: 3,
                 is_unique: false,
-                is_deleted: false
+                is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
         ]
     }
@@ -2550,4 +3756,20 @@ mod distinct_on_detection {
         assert!(!starts_with_distinct_on("on, id"));
         assert!(!starts_with_distinct_on("on"));
     }
+}
+
+/// Whether `text` is one name, `x`, `t.x` or `"X"`: what an unknown-column
+/// message may report bare.
+fn is_one_name(text: &str) -> bool {
+    !text.is_empty()
+        && text.split('.').all(|part| {
+            let bare = part.strip_prefix('"').and_then(|p| p.strip_suffix('"'));
+            match bare {
+                Some(quoted) => !quoted.is_empty() && !quoted.contains('"'),
+                None => {
+                    part.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+                        && part.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                }
+            }
+        })
 }

@@ -228,7 +228,11 @@ impl SyncMode {
             "sync" | "synchronous" => Some(SyncMode::Quorum(1)),
             "all" | "every" => Some(SyncMode::All),
             _ => {
-                let digits = lowered.strip_prefix("quorum")?.trim().trim_start_matches(':').trim();
+                let digits = lowered
+                    .strip_prefix("quorum")?
+                    .trim()
+                    .trim_start_matches(':')
+                    .trim();
                 digits.parse().ok().map(SyncMode::Quorum)
             }
         }
@@ -284,7 +288,12 @@ pub enum ConflictPolicy {
 
 impl ConflictPolicy {
     pub fn parse(text: &str) -> Option<ConflictPolicy> {
-        match text.trim().to_ascii_lowercase().replace(['-', '_'], " ").as_str() {
+        match text
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_'], " ")
+            .as_str()
+        {
             "abort" | "error" | "reject" => Some(ConflictPolicy::Abort),
             "skip" | "ignore" => Some(ConflictPolicy::Skip),
             "lww" | "last writer wins" | "last write wins" | "latest" => {
@@ -329,7 +338,12 @@ pub enum AuthMode {
 
 impl AuthMode {
     pub fn parse(text: &str) -> Option<AuthMode> {
-        match text.trim().to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+        match text
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_'], "")
+            .as_str()
+        {
             "insecure" | "none" | "off" => Some(AuthMode::Insecure),
             "pinned" | "pin" | "fingerprint" => Some(AuthMode::Pinned),
             "ca" | "mtls" | "mutualtls" | "pki" => Some(AuthMode::Ca),
@@ -384,11 +398,9 @@ impl TlsMaterial {
                     );
                 }
                 if self.peer_fingerprints.is_empty() {
-                    return Err(
-                        "pinned authentication needs the peers' fingerprints: pass \
+                    return Err("pinned authentication needs the peers' fingerprints: pass \
                          --replication-peer-fingerprint once per node"
-                            .to_string(),
-                    );
+                        .to_string());
                 }
                 for value in &self.peer_fingerprints {
                     rastcp::tls::parse_fingerprint(value)
@@ -398,16 +410,13 @@ impl TlsMaterial {
             }
             AuthMode::Ca => {
                 if self.cert_path.is_none() || self.key_path.is_none() {
-                    return Err(
-                        "mutual TLS needs this node's own certificate: pass \
+                    return Err("mutual TLS needs this node's own certificate: pass \
                          --replication-cert and --replication-key"
-                            .to_string(),
-                    );
+                        .to_string());
                 }
                 if self.ca_path.is_none() {
                     return Err(
-                        "mutual TLS needs the cluster authority: pass --replication-ca"
-                            .to_string(),
+                        "mutual TLS needs the cluster authority: pass --replication-ca".to_string(),
                     );
                 }
                 Ok(())
@@ -432,7 +441,10 @@ impl TlsMaterial {
             AuthMode::Insecure => rastcp::tls::Trust::AcceptAny,
             AuthMode::Pinned => rastcp::tls::Trust::Pinned(self.fingerprints()?),
             AuthMode::Ca => {
-                let path = self.ca_path.as_deref().ok_or("no certificate authority configured")?;
+                let path = self
+                    .ca_path
+                    .as_deref()
+                    .ok_or("no certificate authority configured")?;
                 rastcp::tls::Trust::RootCa(
                     rastcp::tls::load_certificates(path).map_err(|e| e.to_string())?,
                 )
@@ -446,7 +458,10 @@ impl TlsMaterial {
             AuthMode::Insecure => rastcp::tls::ClientAuth::None,
             AuthMode::Pinned => rastcp::tls::ClientAuth::RequirePinned(self.fingerprints()?),
             AuthMode::Ca => {
-                let path = self.ca_path.as_deref().ok_or("no certificate authority configured")?;
+                let path = self
+                    .ca_path
+                    .as_deref()
+                    .ok_or("no certificate authority configured")?;
                 rastcp::tls::ClientAuth::RequireCa(
                     rastcp::tls::load_certificates(path).map_err(|e| e.to_string())?,
                 )
@@ -457,8 +472,13 @@ impl TlsMaterial {
     /// This node's own certificate and key, when it has one configured.
     pub fn identity(
         &self,
-    ) -> Result<Option<(Vec<rustls::pki_types::CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>)>, String>
-    {
+    ) -> Result<
+        Option<(
+            Vec<rustls::pki_types::CertificateDer<'static>>,
+            rustls::pki_types::PrivateKeyDer<'static>,
+        )>,
+        String,
+    > {
         let (Some(cert), Some(key)) = (self.cert_path.as_deref(), self.key_path.as_deref()) else {
             return Ok(None);
         };
@@ -568,6 +588,16 @@ pub struct ReplicationConfig {
     pub batch_linger: Duration,
     /// Records a peer's send queue holds before a commit has to wait for it.
     pub queue_capacity: usize,
+    /// Batches of this node's own stream a link keeps in flight before it
+    /// waits for an answer. `1` sends one and waits for it, as every link did
+    /// before this existed.
+    ///
+    /// Waiting for each batch caps a link at one batch per round trip, which
+    /// over a long link is the limit however fast the peer applies. The peer
+    /// still applies the batches one after another and in order; only the
+    /// waiting overlaps. Costs up to `pipeline_depth` × `batch_max_bytes` of
+    /// frames held in flight.
+    pub pipeline_depth: usize,
 
     /// Forward transactions that arrived from one peer on to the others.
     ///
@@ -582,6 +612,19 @@ pub struct ReplicationConfig {
 
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
+    /// How long a peer link may carry nothing before it is asked "are you
+    /// there?". Zero never asks.
+    ///
+    /// The receiving end of a link closes a connection that has been quiet
+    /// for its request timeout. Without this a link is only spoken on when
+    /// there are transactions to send, so the first write after a quiet spell
+    /// finds it closed: the send fails, the link is rebuilt, and that write is
+    /// late by the reconnect delay. It also means a peer that has gone is not
+    /// noticed until there is something to send it.
+    ///
+    /// See [`ReplicationConfig::keepalive_interval`] for what is actually
+    /// used.
+    pub keepalive: Duration,
     /// How long a failed peer link waits before reconnecting, doubling up to
     /// [`ReplicationConfig::reconnect_max`].
     pub reconnect_base: Duration,
@@ -611,10 +654,12 @@ impl Default for ReplicationConfig {
             batch_max_bytes: 1024 * 1024,
             batch_linger: Duration::from_micros(500),
             queue_capacity: 8192,
+            pipeline_depth: 8,
             relay: false,
             log_retention_bytes: 256 * 1024 * 1024,
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
+            keepalive: Duration::from_secs(10),
             reconnect_base: Duration::from_millis(200),
             reconnect_max: Duration::from_secs(30),
             peers: Vec::new(),
@@ -627,6 +672,22 @@ impl ReplicationConfig {
     /// of carrying and comparing a string on every connection.
     pub fn cluster_id(&self) -> u64 {
         cluster_id_of(&self.cluster)
+    }
+
+    /// How often a quiet link is spoken on, or `None` for never.
+    ///
+    /// [`ReplicationConfig::keepalive`], but never more than a third of the
+    /// request timeout: asking less often than the other end waits would let
+    /// the link be closed between two askings, which is the thing this is for
+    /// preventing. A third rather than just under it, so one answer that is
+    /// slow to come does not cost the link. The peers of a cluster are
+    /// expected to share a request timeout; this node's own is the only one
+    /// it knows.
+    pub fn keepalive_interval(&self) -> Option<Duration> {
+        if self.keepalive.is_zero() {
+            return None;
+        }
+        Some(self.keepalive.min(self.request_timeout / 3))
     }
 
     /// Rejects a configuration that cannot work, before anything binds a port.
@@ -642,6 +703,12 @@ impl ReplicationConfig {
         }
         if self.batch_max_records == 0 {
             return Err("batch-max-records must be at least 1".to_string());
+        }
+        if self.pipeline_depth == 0 {
+            return Err(
+                "pipeline_depth must be at least 1: one batch in flight is waiting for each answer"
+                    .to_string(),
+            );
         }
         if self.queue_capacity == 0 {
             return Err("queue-capacity must be at least 1".to_string());
@@ -709,8 +776,14 @@ mod tests {
 
     #[test]
     fn a_bare_codec_name_implies_whether_to_compress() {
-        assert_eq!(Compression::parse("none").unwrap().mode, CompressionMode::Off);
-        assert_eq!(Compression::parse("zstd").unwrap().mode, CompressionMode::Always);
+        assert_eq!(
+            Compression::parse("none").unwrap().mode,
+            CompressionMode::Off
+        );
+        assert_eq!(
+            Compression::parse("zstd").unwrap().mode,
+            CompressionMode::Always
+        );
         assert_eq!(Compression::parse("zstd").unwrap().codec, Codec::Zstd);
     }
 
@@ -760,7 +833,10 @@ mod tests {
 
     #[test]
     fn two_peers_under_one_name_are_rejected() {
-        let mut config = ReplicationConfig { node_id: 1, ..Default::default() };
+        let mut config = ReplicationConfig {
+            node_id: 1,
+            ..Default::default()
+        };
         config.peers.push(PeerConfig::new("a", "1.1.1.1:1"));
         config.peers.push(PeerConfig::new("a", "2.2.2.2:2"));
 

@@ -1,6 +1,6 @@
 [package]
 name = "rasterizeddb_core"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2024"
 repository = "https://github.com/milen-denev/rasterizeddb"
 license = "GPL-3.0-only"
@@ -9,37 +9,68 @@ authors = ["Milen Denev"]
 description = "A schemafull, high-performance database written in Rust, designed for speed and scalability."
 
 [dependencies]
+# `AT TIME ZONE`: zone rules from the system's tz database
+# (/usr/share/zoneinfo). Already in the tree through env_logger; no bundled
+# copy where the host has one, so the server answers with the zones its host
+# knows, as PostgreSQL built --with-system-tzdata does. Windows has no such
+# database: `tzdb-bundle-platform` compiles one in there (and on wasm) only,
+# or no named zone at all resolves on a Windows server.
+jiff = { version = "0.2.43", default-features = false, features = ["std", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
 tokio = { version = "1", features = ["full"] }
 byteorder = "1.5"
 itertools = "0.15"
 ahash = "0.8"
-once_cell = "1.21.3"
-orx-concurrent-vec = "3.10"
+# `HashTable<u32>` for the hash-join build side: indices only, keys read back from the rows.
+hashbrown = { version = "0.17", default-features = false }
+# Bulk scanning of SQL text for the next quote/placeholder byte.
+memchr = "2"
+# Collation keys (`core::rql::collation`): canonical decomposition and
+# combining marks. Already in the tree through `url`/`idna`.
+unicode-normalization = "0.1"
+# NUMERIC exp/ln/log/power (`rql::pg_numeric_math`): their working precision
+# runs past an i128 before the result is rounded back into one.
+num-bigint = "0.5.1"
+num-traits = "0.2"
+# Shortest round-trip float digits for PostgreSQL's float text (`value_codec::pg_float8_text`);
+# already in the tree through serde_json.
+ryu = "1.0.23"
+# POSIX regular expressions (`~`, `~*`, `regexp_like`), for CHECKs `pg_dump` writes.
+regex = "1"
+once_cell = "1.21.4"
 stopwatch = "0.0.7"
 futures = "0.3"
 async-lazy = { version = "0.1", features = ["parking_lot"] }
-dashmap = "6.1"
-log = "0.4"
+dashmap = "6.2"
+# Release builds compile `trace!` out entirely, so the hot-path level checks
+# cost nothing. `debug` is kept: `--log-level debug` is the documented way to
+# see statement text on a live node (pgwire's `Statement:` line). Production
+# defaults to `error`. Note this is unified across the dependency graph, so
+# `--log-level trace` in a release build shows at most debug.
+log = { version = "0.4", features = ["release_max_level_debug"] }
 libmimalloc-sys = "0.1"
-rastcp = { path = "../rastcp" }
+rastcp = { path = "../rastcp", version = "1.0.0" }
 env_logger = "0.11"
 crc = "3.4"
+# CRC-32/ISO-HDLC with PCLMULQDQ: the WAL, replication log, backup archives and
+# KV layout checksums all run through it. Same polynomial as `crc`'s, ~30x the
+# throughput of its default byte-at-a-time table.
+crc32fast = "1.5"
 temp_testdir = "0.2"
 memmap2 = "0.9"
 rand = "0.10"
 memory-stats = "1.2"
-smallvec = { version = "1.15", features = ["union", "write"]}
-arc-swap = "1.8"
-fastrand = "2.3"
-parking_lot = "0.12"
+smallvec = { version = "1.16", features = ["union", "write"]}
+arc-swap = "1.9"
+fastrand = "2.5"
+parking_lot = "0.13"
 libc = "0.2"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 kanal = "0.1"
-rclite = "0.4.1"
+rclite = "0.4.2"
 opool = "0.2.0"
 cacheguard = "0.1.0"
 xutex = "0.2.1"
-branches = "0.4.4"
+branches = "0.5.1"
 
 # pgwire TLS
 rustls = "0.23"
@@ -63,7 +94,7 @@ serde_json = "1"
 # zstd carries the whole snapshot and every archived log segment. It is the
 # only new code pulled in: the S3 client is built on rustls/tokio-rustls/sha2/
 # hmac/base64, which the pgwire listener already required.
-zstd = { version = "0.13", optional = true, features = ["zstdmt"] }
+zstd = { version = "0.14", optional = true, features = ["zstdmt"] }
 # Root certificates for the *client* side of TLS. `rustls` ships none, and
 # rustls-native-certs would add a platform dependency for a store the server
 # has no other use for.
@@ -72,6 +103,14 @@ webpki-roots = { version = "1", optional = true }
 [dev-dependencies]
 criterion = { version = "0.8" }
 tempfile = "3"
+# The native protocol's client, for the tests and `examples/native_bench.rs`
+# that talk to a listener this crate starts. The server itself carries no
+# client.
+rasterizeddb_client = { path = "../rasterizeddb_client", default-features = false }
+# The write gate's source test parses `src/` (core/index_store/gate_source_tests.rs).
+syn = { version = "3", features = ["full", "visit"] }
+proc-macro2 = "1"
+quote = "1"
 
 [[bench]]
 name = "string_instructions_benchmarks"
@@ -112,6 +151,9 @@ harness = false
 [[bench]]
 name = "filter_benchmarks"
 harness = false
+# It mutates a filter, which takes a proof only `test_tokens` can mint here:
+# `cargo bench --features test_tokens`.
+required-features = ["test_tokens"]
 
 [[bench]]
 name = "mmap_scan_benchmarks"
@@ -126,10 +168,39 @@ name = "vacuum_benchmarks"
 harness = false
 
 [features]
-default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools"]
+default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3", "query_stats", "kv_cache", "persistent_indexes", "mysql_wire", "mssql_wire", "db_branching"]
 enable_long_row = []
+
+# Database branches: `CREATE BRANCH`, `RESET`/`PROMOTE`/`DROP BRANCH`,
+# `MERGE BRANCH` and `SHOW BRANCH DIFF` (docs/branching.md). No crate of its
+# own, but it copies a database with `s3_backup`'s copy machinery (its copy
+# gates, the files a copy leaves out, its timestamps), so it needs that feature.
+db_branching = ["s3_backup"]
+
+# Indexes and the filter persisted as snapshots taken at clean points, loaded
+# at open instead of rebuilt (docs/persistent-indexes.md).
+#
+# On by default. A directory that has used them carries `index_store_v1` in
+# its `incompat_features` file, and a build without this feature refuses that
+# directory rather than open files it would not keep correct. It adds no crate
+# of its own.
+persistent_indexes = []
 enable_data_verification = []
 memory_pool_reuse = []
+
+# `index_store::gate::test_mint`: a write ticket for callers that link the
+# library without `cfg(test)` (doctests, `benches/filter_benchmarks.rs`,
+# `rasterizeddb_filter_tests`). Never in a server build: the binary refuses to
+# start with it (docs/persistent-indexes.md §2).
+test_tokens = []
+
+# The power-loss harness (`core::power_loss`: named failpoints, crash images)
+# for callers that link the library without `cfg(test)`: the compat suites,
+# which arm failpoints and image directories under a server running in their
+# own process (docs/persistent-indexes.md §11). `rasterizeddb_compat` enables
+# it as a dev-dependency feature only. Never in a server build: the binary
+# refuses to start with it, like `test_tokens`.
+index_store_failpoints = []
 
 # Compressed transaction exchange between replicating instances.
 #
@@ -160,9 +231,61 @@ pg_import = ["dep:webpki-roots"]
 # is tab-separated text rather than a serialisation format.
 storage_pools = []
 
+# A database kept in a key/value store instead of in files.
+#
+# Off by default. It is a whole second storage backend — chunked objects, a
+# delta log, a page cache and a compactor — and a build that only ever writes
+# files should not carry it or the extra match arm on every storage call. It
+# adds no crate of its own: the backing store is a trait, and the two
+# implementations it ships with (a map, a directory) need nothing new. A key/value
+# store is a storage-pool location (`STORAGE ADD STORE`), so it needs
+# `storage_pools`.
+kv_storage = ["storage_pools"]
+
+# The S3 backing store for `kv_storage`.
+#
+# Separate from `kv_storage` because that feature is useful without a network —
+# it is how the driver is tested — and because this one pulls the SigV4 client
+# and root certificates that `s3_backup` owns.
+kv_storage_s3 = ["kv_storage", "s3_backup"]
+
+# What ran recently, what it cost, and how much of each table it read:
+# `SHOW QUERIES`, `SHOW QUERY STATS` and `pg_stat_statements`.
+#
+# On by default, unlike the rest of these, because a server whose statements
+# cannot be seen cannot be diagnosed and the price is one mutex acquisition per
+# statement plus one relaxed atomic add per batch of ten thousand rows scanned.
+# It is still a feature so a build that measures elsewhere can drop the ring
+# buffer, the aggregate map and the task-local entirely. It adds no crate of its
+# own: the ring is a `VecDeque` behind the `parking_lot` already in the tree, and
+# the timestamps go through the calendar arithmetic `pg_params` already has.
+query_stats = []
+
+# A Redis-compatible key/value store inside the database: `KV …` statements on
+# the PostgreSQL port, and the Redis protocol itself on `--kv-port`.
+#
+# It adds no crate of its own. The store is hashbrown tables behind the
+# `parking_lot` locks already in the tree, the protocol is spoken over the
+# `tokio` the other listeners use, and `AUTH` checks the database's own roles
+# through `auth`. Nothing is allocated until the first `KV` statement or RESP
+# connection, and the port is closed unless `--kv-port` is given.
+kv_cache = []
+
+# The MySQL / MariaDB client protocol (`--mysql-port`, `--mysql-socket`),
+# beside whichever other listeners run. Each connection is translated onto an
+# in-process PostgreSQL session, so it adds no crate of its own: SHA-256 and
+# TLS are the ones pgwire already uses. Dormant until a port or socket is
+# configured.
+mysql_wire = []
+
+# The SQL Server (TDS) client protocol (`--mssql-port`, `--mssql-socket`),
+# built the same way as `mysql_wire`.
+mssql_wire = []
+
 # Snapshot + point-in-time backup to any S3-compatible object store.
 #
 # Off by default: it is the only feature that opens an outbound network
 # connection, and a build that never backs up should not carry a compressor,
-# a root certificate bundle, or the code that signs requests.
-s3_backup = ["dep:zstd", "dep:webpki-roots"]
+# a root certificate bundle, or the code that signs requests. A backup covers
+# every storage location a database has, so it needs `storage_pools`.
+s3_backup = ["dep:zstd", "dep:webpki-roots", "storage_pools"]

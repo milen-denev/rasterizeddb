@@ -45,13 +45,36 @@ pub struct Connection {
     pub port: u16,
     pub database: String,
     pub user: String,
-    /// Kept in the profile only when the user asks for it. A console that
-    /// silently persists passwords is a credential store nobody audited.
+    /// Kept only when the user asks for it, and then where
+    /// [`Connection::password_store`] says. A console that silently persists
+    /// passwords is a credential store nobody audited.
     #[serde(default)]
     pub password: String,
     #[serde(default)]
     pub save_password: bool,
+    /// Where a saved password goes. `None` is a profile saved before there
+    /// was a choice; see [`Connection::password_store`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_store: Option<PasswordStore>,
     pub tls: TlsMode,
+    /// Which protocol carries the statements. A profile saved before there
+    /// was a choice has none written, and was the PostgreSQL wire protocol on
+    /// a pgwire port, so that is what it reads as.
+    #[serde(default = "Transport::saved_before_the_choice")]
+    pub transport: Transport,
+    /// How a native connection logs in. The wire protocol asks the server and
+    /// answers with the password, so it needs no choice.
+    #[serde(default)]
+    pub login: NativeLogin,
+    /// Whether the server's certificate must be signed by `ca_file` (or, with
+    /// none, by a public authority), and name the host. Off by default: a
+    /// server makes itself a self-signed certificate, which nothing verifies.
+    #[serde(default)]
+    pub verify_server: bool,
+    /// A PEM file of the certificate authority that signed the server's
+    /// certificate; empty for the public roots.
+    #[serde(default)]
+    pub ca_file: String,
 }
 
 impl Default for Connection {
@@ -60,13 +83,163 @@ impl Default for Connection {
             name: "local".to_string(),
             flavor: Flavor::Rasterized,
             host: "127.0.0.1".to_string(),
-            port: 5432,
+            port: NATIVE_PORT,
             database: "postgres".to_string(),
             user: "rasterized".to_string(),
             password: String::new(),
             save_password: false,
+            password_store: Some(PasswordStore::Keyring),
             tls: TlsMode::Prefer,
+            transport: Transport::Native,
+            login: NativeLogin::Password,
+            verify_server: false,
+            ca_file: String::new(),
         }
+    }
+}
+
+impl Connection {
+    /// Where this profile's saved password is kept. A profile saved before
+    /// there was a choice kept it in the file, and keeps doing so until the
+    /// user moves it: reading it from the keyring instead would find nothing
+    /// and connect without it. One with no password in the file has nothing
+    /// to lose and takes the keyring.
+    pub fn password_store(&self) -> PasswordStore {
+        match self.password_store {
+            Some(store) => store,
+            None if !self.password.is_empty() => PasswordStore::File,
+            None => PasswordStore::Keyring,
+        }
+    }
+
+    /// Whether this profile's password is kept in the OS keyring.
+    pub fn password_in_keyring(&self) -> bool {
+        self.save_password && self.password_store() == PasswordStore::Keyring
+    }
+
+    /// The transport this profile actually uses: the native protocol is
+    /// RasterizedDB's own, so a PostgreSQL profile always speaks the wire
+    /// protocol whatever was picked.
+    pub fn effective_transport(&self) -> Transport {
+        match self.flavor {
+            Flavor::Postgres => Transport::Wire,
+            Flavor::Rasterized => self.transport,
+        }
+    }
+}
+
+/// Where a saved password is kept.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub enum PasswordStore {
+    /// The operating system's credential store: Keychain on macOS, Credential
+    /// Manager on Windows, the Secret Service (GNOME Keyring, KWallet)
+    /// elsewhere. The profile file holds no password.
+    #[default]
+    Keyring,
+    /// The profile file itself, readable by its owner only: for a machine
+    /// with no credential store, such as a desktop without a Secret Service.
+    File,
+}
+
+impl PasswordStore {
+    pub const ALL: [PasswordStore; 2] = [PasswordStore::Keyring, PasswordStore::File];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            PasswordStore::Keyring => "OS keyring",
+            PasswordStore::File => "profile file (plain text)",
+        }
+    }
+}
+
+impl std::fmt::Display for PasswordStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// The server's native-protocol port (`--rdb-port`'s default).
+pub const NATIVE_PORT: u16 = 61170;
+/// The PostgreSQL wire protocol's port (`--pg-port`'s default).
+pub const WIRE_PORT: u16 = 5432;
+
+/// Which protocol a connection speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum Transport {
+    /// RasterizedDB's own protocol (rastcp), through `rasterizeddb_client`:
+    /// TLS over TCP, or a unix socket file (`--rdb-socket`). One database per
+    /// listener.
+    Native,
+    /// The PostgreSQL wire protocol, through `tokio-postgres`: what
+    /// PostgreSQL itself, and RasterizedDB's pgwire listener, speak.
+    Wire,
+}
+
+impl Transport {
+    pub const ALL: [Transport; 2] = [Transport::Native, Transport::Wire];
+
+    fn saved_before_the_choice() -> Self {
+        Transport::Wire
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Transport::Native => "native",
+            Transport::Wire => "PostgreSQL wire",
+        }
+    }
+
+    /// The port a server listens on for this protocol by default.
+    pub fn default_port(&self) -> u16 {
+        match self {
+            Transport::Native => NATIVE_PORT,
+            Transport::Wire => WIRE_PORT,
+        }
+    }
+}
+
+impl std::fmt::Display for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// How a native connection authenticates. Explicit rather than inferred from
+/// whether a password was typed: a password login to a server that asks for
+/// none is refused (the server never proves it holds the password's
+/// verifier), and a trust login to one that does ask connects and then fails
+/// its first statement, so neither guess fails in an obvious place.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub enum NativeLogin {
+    /// SCRAM-SHA-256 with the user and password.
+    #[default]
+    Password,
+    /// The operating-system user, on a unix socket under `--rdb-socket-auth peer`.
+    Peer,
+    /// No exchange, for a listener under `trust`.
+    Trust,
+}
+
+impl NativeLogin {
+    pub const ALL: [NativeLogin; 3] =
+        [NativeLogin::Password, NativeLogin::Peer, NativeLogin::Trust];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            NativeLogin::Password => "password",
+            NativeLogin::Peer => "peer",
+            NativeLogin::Trust => "trust",
+        }
+    }
+}
+
+impl std::fmt::Display for NativeLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
     }
 }
 
@@ -112,6 +285,9 @@ pub struct Grid {
     pub rows: Vec<Vec<Option<String>>>,
     /// What the server tagged the statement with, e.g. `SELECT 12`.
     pub tag: String,
+    /// How many rows the statement returned, when that is more than `rows`
+    /// holds: the editor's row limit kept only the first ones.
+    pub total: Option<u64>,
 }
 
 impl Grid {
@@ -125,6 +301,15 @@ impl Grid {
     }
 
     pub fn number(&self, row: usize, column: &str) -> Option<u64> {
+        self.value(row, column)?.trim().parse().ok()
+    }
+
+    /// A column of milliseconds, or `None` when the server left it blank.
+    ///
+    /// Separate from [`Grid::number`] rather than folded into it: a duration
+    /// that read as an integer would round every sub-millisecond statement to
+    /// zero, and most statements are sub-millisecond.
+    pub fn real(&self, row: usize, column: &str) -> Option<f64> {
         self.value(row, column)?.trim().parse().ok()
     }
 
@@ -148,6 +333,11 @@ pub struct Stat {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableInfo {
     pub name: String,
+    /// What is holding the table, in the server's own vocabulary — `file`,
+    /// `memory`, `s3`, `mirrored`, `kv-directory`, `kv-memory` from
+    /// RasterizedDB, and `file` / `file-unlogged` / `temporary` from
+    /// PostgreSQL. Empty from a server too old to say.
+    pub storage: String,
     pub row_slots: u64,
     pub columns: u64,
     pub data_bytes: u64,
@@ -161,8 +351,37 @@ pub struct TableInfo {
     pub indexed: bool,
 }
 
+impl TableInfo {
+    pub fn durable(&self) -> bool {
+        storage_is_durable(&self.storage)
+    }
+}
+
+/// Whether a table's contents outlive the process serving them.
+///
+/// Strict on purpose. PostgreSQL's `UNLOGGED` and temporary tables are files on
+/// a disk, and both are *emptied* after a crash — so for the question this
+/// answers, "would this table still be here", they belong with the in-memory
+/// backends and not with the durable ones.
+///
+/// Anything unrecognised counts as durable, including the empty string a server
+/// too old to have the column returns. The alternative would mark every table
+/// on such a server as ephemeral, which is a warning about nothing — and this
+/// is used to colour a badge, where a false alarm costs more than a missing one.
+pub fn storage_is_durable(kind: &str) -> bool {
+    !matches!(kind, "memory" | "kv-memory" | "temporary" | "file-unlogged")
+}
+
+/// A role the server knows: who can log in, and who can do everything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoleInfo {
+    pub name: String,
+    pub can_login: bool,
+    pub superuser: bool,
+}
+
 /// A column of a table.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ColumnInfo {
     pub position: u64,
     pub name: String,
@@ -260,6 +479,87 @@ impl RowKey {
     }
 }
 
+/// One index of a table, as the table pane lists it.
+///
+/// Read from the `CREATE INDEX` statement each server prints for it, which is
+/// the one description both engines give in the same shape — see
+/// [`crate::dialect::parse_index_def`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexInfo {
+    pub name: String,
+    /// `btree`, `hash`, `gin`, … — the server's word, lower-cased.
+    pub method: String,
+    /// What is inside the index's parentheses, as written: column names, or an
+    /// expression such as `((doc->>'status'))`.
+    pub columns: String,
+    pub unique: bool,
+    /// What owns the index, which decides how — and whether — it can go.
+    pub owner: IndexOwner,
+    /// The whole statement the server printed, for the cases the fields above
+    /// flatten: a `WHERE`, an `INCLUDE`, an operator class.
+    pub definition: String,
+}
+
+impl IndexInfo {
+    /// The kind of index, in the words the dialog offers them by.
+    ///
+    /// A B-tree over `->>` is a *path* index: it is how a document field is
+    /// indexed, and listing it as a B-tree over an expression hides the one
+    /// fact anyone reading the list wants.
+    pub fn kind(&self) -> &str {
+        if self.columns.contains("->>") {
+            "path"
+        } else if self.columns.trim_start().starts_with('(') {
+            "expression"
+        } else {
+            &self.method
+        }
+    }
+}
+
+/// Who an index belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexOwner {
+    /// Declared with `CREATE INDEX`; `DROP INDEX` removes it.
+    Declared,
+    /// Brought by a `UNIQUE` constraint, and removed with it.
+    Unique,
+    /// The primary key's, removed with `ALTER TABLE … DROP CONSTRAINT`.
+    Primary,
+}
+
+/// One partition of a hash-partitioned table, from `SHOW PARTITIONS`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionInfo {
+    pub pid: u64,
+    /// The `[lo, hi)` slice of the 64-bit hash space, in the hex the server
+    /// writes. Text because `hi` of the last partition is 2^64, which no
+    /// integer column holds.
+    pub lo: String,
+    pub hi: String,
+    pub location: String,
+    /// `unmaterialized` until a row first lands in it; then it has files.
+    pub state: String,
+    pub row_slots: u64,
+    pub total_bytes: u64,
+}
+
+impl PartitionInfo {
+    /// The share of the hash space this partition covers, as a fraction.
+    ///
+    /// Equal by construction at `CREATE` time, and the column that will show
+    /// it once partitions can be split; `None` when the bounds do not parse.
+    pub fn share(&self) -> Option<f64> {
+        let parse = |s: &str| u128::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+        let (lo, hi) = (parse(&self.lo)?, parse(&self.hi)?);
+        (hi > lo).then(|| (hi - lo) as f64 / (1u128 << 64) as f64)
+    }
+
+    pub fn materialized(&self) -> bool {
+        self.state != "unmaterialized"
+    }
+}
+
 /// One edge of the schema map.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Relationship {
@@ -312,23 +612,149 @@ impl TableNode {
 }
 
 /// One runtime knob, as the configuration screen shows it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ConfigEntry {
     pub section: String,
     pub key: String,
     pub value: String,
-    /// Whether a running server can change it. The screen greys out the rest
-    /// and says what flag to restart with instead of offering an edit that
-    /// would fail.
+    /// Whether a running server can change it.
     pub hot: bool,
+    /// Whether a change to a setting that is *not* hot can be saved for the
+    /// next start. PostgreSQL can for every `postmaster` setting, through
+    /// `ALTER SYSTEM`; RasterizedDB can from the build whose `SHOW CONFIG`
+    /// reports `pending`. Without it the screen shows the flag to restart
+    /// with instead of an edit that would be refused.
+    pub restart_settable: bool,
     pub set_with: String,
     pub help: String,
+    /// The values it takes, `|`-separated, `:N` marking a number — see
+    /// [`ConfigEntry::choices`]. Empty for a free number or text.
+    pub options: String,
+    /// The value saved for the next start, when there is one. PostgreSQL does
+    /// not say what it is, only that there is one: see `pending_restart`.
+    pub pending: String,
+    /// A change is saved and waits for a restart.
+    pub pending_restart: bool,
+    /// Where the running value came from, in the server's words: `default`,
+    /// `command line`, `saved`; PostgreSQL's `configuration file` and the rest.
+    pub source: String,
 }
 
 impl ConfigEntry {
     pub fn qualified(&self) -> String {
         format!("{}.{}", self.section, self.key)
     }
+
+    /// Whether the screen offers an edit at all.
+    pub fn editable(&self) -> bool {
+        self.hot || self.restart_settable
+    }
+
+    /// The values this setting takes, when it takes a fixed set.
+    ///
+    /// The server's `options` when it reports them. Until every server does,
+    /// two fallbacks keep the common cases a dropdown rather than a text box:
+    /// a few RasterizedDB keys whose grammar the help text spells out, and any
+    /// setting whose current value is a boolean, offered in the spelling it
+    /// already uses — `on|off` for `synchronous_commit`, `true|false` for
+    /// `filter.enabled` — so the current value is one of the choices.
+    pub fn choices(&self) -> Vec<ConfigChoice> {
+        let options = if !self.options.trim().is_empty() {
+            self.options.clone()
+        } else if let Some(known) = known_options(&self.qualified()) {
+            known.to_string()
+        } else {
+            match self.value.trim().to_ascii_lowercase().as_str() {
+                "true" | "false" => "true|false".to_string(),
+                "on" | "off" => "on|off".to_string(),
+                _ => return Vec::new(),
+            }
+        };
+        // An empty entry is a value, not a gap: PostgreSQL's
+        // `ssl_max_protocol_version` takes `''`, meaning no maximum, and lists
+        // it among its `enumvals`. Only repeats are dropped.
+        let mut seen = std::collections::HashSet::new();
+        options
+            .split('|')
+            .map(str::trim)
+            .filter(|o| seen.insert(o.to_string()))
+            .map(|o| match o.strip_suffix('N') {
+                Some(stem) if stem.ends_with(':') => ConfigChoice { stem: stem.to_string(), numeric: true },
+                _ => ConfigChoice { stem: o.to_string(), numeric: false },
+            })
+            .collect()
+    }
+}
+
+/// The RasterizedDB keys with a fixed grammar, for a server that does not
+/// report `options` itself. Removable once every server in use does.
+fn known_options(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "replication.compression" => "none|zstd:N|auto:zstd:N",
+        "replication.mode" => "async|sync|all|quorum:N",
+        "replication.conflict" => "abort|skip|last-writer-wins",
+        "index_snapshot.index_storage" => "rebuild|snapshot",
+        "vacuum.enabled" => "on|off",
+        _ => return None,
+    })
+}
+
+/// One value a setting takes. `numeric` ones are a stem and a number:
+/// `quorum:` and `2` are `quorum:2`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigChoice {
+    pub stem: String,
+    pub numeric: bool,
+}
+
+impl ConfigChoice {
+    /// The value this choice and `number` make.
+    pub fn value(&self, number: &str) -> String {
+        if self.numeric {
+            format!("{}{}", self.stem, number.trim())
+        } else {
+            self.stem.clone()
+        }
+    }
+
+    /// Whether `value` is this choice, and with which number. A numeric
+    /// choice also takes its stem bare — `zstd` is `zstd:` with no level,
+    /// which the server reads as its default level.
+    pub fn matches(&self, value: &str) -> Option<String> {
+        let value = value.trim();
+        if !self.numeric {
+            return value.eq_ignore_ascii_case(&self.stem).then(String::new);
+        }
+        if value.eq_ignore_ascii_case(self.stem.trim_end_matches(':')) {
+            return Some(String::new());
+        }
+        let head = value.get(..self.stem.len())?;
+        let number = &value[self.stem.len()..];
+        (head.eq_ignore_ascii_case(&self.stem) && number.chars().all(|c| c.is_ascii_digit()))
+            .then(|| number.to_string())
+    }
+}
+
+impl std::fmt::Display for ConfigChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.numeric {
+            write!(f, "{}…", self.stem.trim_end_matches(':'))
+        } else if self.stem.is_empty() {
+            f.write_str("(none)")
+        } else {
+            f.write_str(&self.stem)
+        }
+    }
+}
+
+/// Which choice `value` is, and its number, or `None` for a value that is
+/// none of them — RasterizedDB's `vacuum.enabled` reads `per table` until
+/// one is picked, and that is shown rather than forced onto a choice.
+pub fn choice_of(choices: &[ConfigChoice], value: &str) -> Option<(usize, String)> {
+    choices
+        .iter()
+        .enumerate()
+        .find_map(|(at, c)| c.matches(value).map(|n| (at, n)))
 }
 
 /// A database on the server.
@@ -739,6 +1165,24 @@ mod tests {
         assert!(RunOutcome::Failed("boom".into()).failed());
     }
 
+    /// The badge answers "would this table still be here", so anything that a
+    /// crash empties belongs with the in-memory backends however it is stored.
+    #[test]
+    fn durability_is_about_surviving_a_crash_not_about_being_a_file() {
+        for durable in ["file", "mirrored", "s3", "kv-directory"] {
+            assert!(storage_is_durable(durable), "{durable} should read as durable");
+        }
+        for ephemeral in ["memory", "kv-memory", "temporary", "file-unlogged"] {
+            assert!(!storage_is_durable(ephemeral), "{ephemeral} outlives nothing");
+        }
+        // A server that does not report the column, and one that reports
+        // something this console has never heard of, both get the benefit of
+        // the doubt: the badge is a warning, and a false one costs more than a
+        // missing one.
+        assert!(storage_is_durable(""));
+        assert!(storage_is_durable("something-new"));
+    }
+
     #[test]
     fn bytes_scale_to_a_readable_unit() {
         assert_eq!(bytes(0), "0 B");
@@ -770,6 +1214,7 @@ mod tests {
     #[test]
     fn a_null_is_not_an_empty_string() {
         let grid = Grid {
+            total: None,
             columns: vec!["a".into()],
             rows: vec![vec![None], vec![Some(String::new())]],
             tag: String::new(),
@@ -1187,6 +1632,147 @@ impl StorageSnapshot {
     }
 }
 
+/// One statement the server has answered, as the activity page lists it.
+///
+/// `rows` and `rows_scanned` are optional because PostgreSQL cannot answer
+/// them for a running statement: `pg_stat_activity` says what a backend is
+/// executing, not what it has read. A figure nobody can produce renders as a
+/// dash rather than as a zero, which would read as "it scanned nothing".
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatementRecord {
+    pub started_at: String,
+    pub duration_ms: f64,
+    pub rows: Option<u64>,
+    pub rows_scanned: Option<u64>,
+    /// Relations this statement had to build before it could answer — one per
+    /// CTE and per derived table — and the time that took. `None` from
+    /// PostgreSQL, which has no equivalent because it does not build them.
+    pub materialised: Option<u64>,
+    pub materialised_ms: Option<f64>,
+    /// `ok` or `error` on RasterizedDB; the backend's state on PostgreSQL.
+    pub status: String,
+    pub database: String,
+    pub username: String,
+    pub statement: String,
+    pub error: String,
+}
+
+impl StatementRecord {
+    pub fn failed(&self) -> bool {
+        !self.error.is_empty() || self.status.eq_ignore_ascii_case("error")
+    }
+
+    pub fn heavy(&self) -> bool {
+        scan_is_heavy(self.rows, self.rows_scanned)
+    }
+}
+
+/// Every execution of one statement shape, folded together.
+///
+/// `rows_scanned`, `errors` and `last_seen` are `None` against PostgreSQL,
+/// whose `pg_stat_statements` has no counterpart for any of them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatementShape {
+    pub queryid: String,
+    pub calls: u64,
+    pub total_ms: f64,
+    pub mean_ms: f64,
+    pub min_ms: f64,
+    pub max_ms: f64,
+    pub stddev_ms: f64,
+    pub rows: Option<u64>,
+    pub rows_scanned: Option<u64>,
+    /// Totals across every execution of this shape. See [`StatementRecord`].
+    pub materialised: Option<u64>,
+    pub materialised_ms: Option<f64>,
+    pub errors: Option<u64>,
+    pub last_seen: String,
+    pub statement: String,
+}
+
+impl StatementShape {
+    pub fn heavy(&self) -> bool {
+        scan_is_heavy(self.rows, self.rows_scanned)
+    }
+}
+
+/// Rows a scan has to read before it is worth pointing at.
+///
+/// The engine scans any table below `filter.min_table_rows` — 10,000 by
+/// default — without consulting its index at all, on the measured argument that
+/// the mask costs more than the read it would save. Flagging those would flag
+/// every statement against a small table, which is every statement on a small
+/// database.
+pub const SCAN_HEAVY_ROWS: u64 = 10_000;
+
+/// How many rows a statement may read per row returned before the ratio is the
+/// interesting thing about it.
+pub const SCAN_HEAVY_RATIO: u64 = 100;
+
+/// Whether a statement read far more than it had to.
+///
+/// This is the reading the `rows_scanned` column exists for: a hundred rows
+/// read for each one returned, over a table large enough for the index to have
+/// been consulted, is a predicate nothing indexes. A statement that returned
+/// nothing is judged as though it had returned one row — a full scan that found
+/// no match is the same missing index, and dividing by zero would otherwise
+/// hide the worst case.
+pub fn scan_is_heavy(rows: Option<u64>, scanned: Option<u64>) -> bool {
+    let (Some(rows), Some(scanned)) = (rows, scanned) else { return false };
+    scanned >= SCAN_HEAVY_ROWS && scanned / rows.max(1) >= SCAN_HEAVY_RATIO
+}
+
+/// Everything the activity page reads, gathered in one round trip.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivitySnapshot {
+    pub recent: Vec<StatementRecord>,
+    /// Whether the server answered the recent-statement question at all.
+    ///
+    /// The same trap as the backup, replication and storage pages: a server
+    /// built without `query_stats` — or from before it existed — does not
+    /// refuse `SHOW QUERIES`. The wire layer answers an unknown `SHOW x` as a
+    /// runtime parameter, with one empty column named after it, which parses
+    /// into an empty list that looks exactly like a server that has run
+    /// nothing.
+    pub recent_supported: bool,
+    pub shapes: Vec<StatementShape>,
+    /// Whether the aggregate answered. On PostgreSQL this is false until
+    /// somebody runs `CREATE EXTENSION pg_stat_statements`.
+    pub shapes_supported: bool,
+}
+
+impl ActivitySnapshot {
+    pub fn failures(&self) -> usize {
+        self.recent.iter().filter(|r| r.failed()).count()
+    }
+
+    /// The slowest statement in the ring, which is the one an operator opened
+    /// this page to find.
+    pub fn slowest(&self) -> Option<&StatementRecord> {
+        self.recent
+            .iter()
+            .max_by(|a, b| a.duration_ms.total_cmp(&b.duration_ms))
+    }
+
+    /// Rows read and rows returned across everything the ring holds.
+    ///
+    /// `None` when the server cannot answer either, rather than a ratio of
+    /// zeroes.
+    pub fn scan_totals(&self) -> Option<(u64, u64)> {
+        let mut any = false;
+        let mut scanned = 0u64;
+        let mut returned = 0u64;
+        for record in &self.recent {
+            if let (Some(r), Some(s)) = (record.rows, record.rows_scanned) {
+                any = true;
+                returned += r;
+                scanned += s;
+            }
+        }
+        any.then_some((scanned, returned))
+    }
+}
+
 /// Everything the backup page needs, gathered in one round trip.
 ///
 /// One message rather than two because the page's first decision — which of
@@ -1580,5 +2166,139 @@ impl Metrics {
         self.series.clear();
         self.previous.clear();
         self.samples = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Branches
+// ---------------------------------------------------------------------------
+
+/// One row of `SHOW BRANCHES`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BranchInfo {
+    pub name: String,
+    pub parent: String,
+    /// Whether the parent still exists under its name: a branch outlives it.
+    pub parent_exists: bool,
+    /// `now`, or the past point it was restored to.
+    pub point: String,
+    pub parent_lsn: u64,
+    /// `reflink`, `copy`, `mixed`, `restore` or `promote`.
+    pub method: String,
+    pub created_at: String,
+    /// Empty when it has never been merged.
+    pub merged_at: String,
+    pub size: u64,
+    /// 0 when it keeps no merge base, and so cannot be merged.
+    pub base: u64,
+    pub sessions: u64,
+    /// Branches between it and its tree's root: 1 for a branch of an
+    /// ordinary database. 0 from a server that predates the column.
+    pub depth: u64,
+    /// Its ancestry, root first: `prod/dev/feature`.
+    pub path: String,
+    /// Branches made from it.
+    pub children: u64,
+    /// Branches it was re-parented through when they were dropped.
+    pub via: String,
+}
+
+impl BranchInfo {
+    pub fn mergeable(&self) -> bool {
+        self.base > 0 && self.parent_exists
+    }
+}
+
+/// One row of `SHOW BRANCH DIFF` (and of a `MERGE BRANCH`'s answer).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BranchDiffRow {
+    pub table: String,
+    /// `schema` or `data`.
+    pub change: String,
+    pub inserts: u64,
+    pub updates: u64,
+    pub deletes: u64,
+    pub conflicts: u64,
+    pub detail: String,
+}
+
+/// Everything the branches page reads.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BranchesSnapshot {
+    /// Whether the server understood `SHOW BRANCHES` at all.
+    pub supported: bool,
+    pub branches: Vec<BranchInfo>,
+}
+
+/// Where a new branch is taken from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BranchPointKind {
+    #[default]
+    Now,
+    Timestamp,
+    Lsn,
+    Snapshot,
+}
+
+impl BranchPointKind {
+    pub const ALL: [BranchPointKind; 4] = [
+        BranchPointKind::Now,
+        BranchPointKind::Timestamp,
+        BranchPointKind::Lsn,
+        BranchPointKind::Snapshot,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BranchPointKind::Now => "NOW",
+            BranchPointKind::Timestamp => "TIMESTAMP",
+            BranchPointKind::Lsn => "LSN",
+            BranchPointKind::Snapshot => "SNAPSHOT",
+        }
+    }
+}
+
+/// What a merge does with a row both sides changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MergePolicy {
+    #[default]
+    Fail,
+    BranchWins,
+    ParentWins,
+}
+
+impl MergePolicy {
+    pub const ALL: [MergePolicy; 3] = [MergePolicy::Fail, MergePolicy::BranchWins, MergePolicy::ParentWins];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MergePolicy::Fail => "FAIL",
+            MergePolicy::BranchWins => "BRANCH WINS",
+            MergePolicy::ParentWins => "PARENT WINS",
+        }
+    }
+}
+
+/// The new-branch form.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BranchForm {
+    pub name: String,
+    /// Empty: the database this console is connected to.
+    pub source: String,
+    pub point: BranchPointKind,
+    /// The timestamp, LSN or snapshot id the point needs.
+    pub value: String,
+    pub keep_base: bool,
+}
+
+impl Default for BranchForm {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            source: String::new(),
+            point: BranchPointKind::Now,
+            value: String::new(),
+            keep_base: true,
+        }
     }
 }

@@ -146,3 +146,34 @@ async fn messages_after_an_error_are_discarded_until_sync() {
         after.iter().filter(|c| **c != 'Z').collect::<Vec<_>>()
     );
 }
+
+/// A simple query that fails must not open a discard window for the batch
+/// after it.
+///
+/// A simple `Query` is its own unit: it ends with `ReadyForQuery` whether it
+/// failed or not, and the protocol's discard-until-`Sync` rule is about the
+/// extended protocol only. When the failure was left recorded as a batch
+/// error, the client's *next* extended batch was swallowed whole —
+/// `Parse`, `Bind`, `Execute` dropped without a reply, then `ReadyForQuery`
+/// at the `Sync` — so a valid query came back as no rows at all.
+#[tokio::test]
+async fn a_failed_simple_query_does_not_swallow_the_next_batch() {
+    use sqlx::{Connection, Executor};
+
+    let server = TestServer::start().await.expect("server should start");
+    let mut c = sqlx::PgConnection::connect(&server.url()).await.expect("connect");
+    c.execute("CREATE TABLE after_simple_error (id INT PRIMARY KEY)").await.unwrap();
+    c.execute("INSERT INTO after_simple_error (id) VALUES (7)").await.unwrap();
+
+    // `execute` with a bare string and no arguments is a simple query.
+    c.execute("SELECT * FROM no_such_table_here")
+        .await
+        .expect_err("the table does not exist");
+
+    // `query_scalar` always goes through Parse/Bind/Execute/Sync.
+    let id: i32 = sqlx::query_scalar("SELECT id FROM after_simple_error")
+        .fetch_one(&mut c)
+        .await
+        .expect("the batch after a failed simple query must be answered");
+    assert_eq!(id, 7);
+}

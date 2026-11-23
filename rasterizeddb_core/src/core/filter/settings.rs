@@ -202,7 +202,8 @@ impl FilterSettings {
         self.checkpoint_interval_secs.load(Ordering::Relaxed).max(1)
     }
     pub fn set_checkpoint_interval_secs(&self, v: u64) {
-        self.checkpoint_interval_secs.store(v.max(1), Ordering::Relaxed);
+        self.checkpoint_interval_secs
+            .store(v.max(1), Ordering::Relaxed);
     }
 
     // -- overrides ----------------------------------------------------------
@@ -227,7 +228,11 @@ impl FilterSettings {
     }
 
     pub fn table_overrides(&self, table: &str) -> Overrides {
-        self.tables.read().get(&key(table)).map(|e| e.table).unwrap_or_default()
+        self.tables
+            .read()
+            .get(&key(table))
+            .map(|e| e.table)
+            .unwrap_or_default()
     }
 
     pub fn column_overrides(&self, table: &str, column: &str) -> Overrides {

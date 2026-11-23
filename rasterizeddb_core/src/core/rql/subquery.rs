@@ -23,10 +23,40 @@ pub struct InSubquery {
     pub start: usize,
     pub end: usize,
     pub inner_sql: String,
+    /// For `NOT IN (SELECT …)`, where the `NOT` begins; `None` for a plain
+    /// `IN` (and for a scalar subquery).
+    pub negated_start: Option<usize>,
+}
+
+/// Whether `sql` has a `(` and holds `word` (uppercase) anywhere, ignoring
+/// ASCII case: what each finder below needs before it can find anything, so
+/// a `false` is exactly their `None`. Literals are not skipped, so a word in
+/// one only costs the full scan it always had. Every statement passes all
+/// three, and most hold neither.
+fn may_hold(sql: &str, word: &[u8]) -> bool {
+    let b = sql.as_bytes();
+    memchr::memchr(b'(', b).is_some()
+        && memchr::memchr2_iter(word[0], word[0].to_ascii_lowercase(), b)
+            .any(|i| b.len() - i >= word.len() && b[i..i + word.len()].eq_ignore_ascii_case(word))
+}
+
+/// Whether `sql` holds a parenthesis and the word `SELECT` at least twice:
+/// the cheapest test that a `SELECT` statement may hold a subquery, asked
+/// before scanning it for one.
+pub fn may_nest_select(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    memchr::memchr(b'(', b).is_some()
+        && memchr::memchr2_iter(b'S', b's', b)
+            .filter(|&i| b.len() - i >= 6 && b[i..i + 6].eq_ignore_ascii_case(b"SELECT"))
+            .nth(1)
+            .is_some()
 }
 
 /// Finds the first `IN (SELECT …)` in a statement, ignoring string literals.
 pub fn find_in_subquery(sql: &str) -> Option<InSubquery> {
+    if !may_hold(sql, b"SELECT") {
+        return None;
+    }
     let bytes = sql.as_bytes();
     let upper = sql.to_ascii_uppercase();
     let mut i = 0usize;
@@ -88,10 +118,19 @@ pub fn find_in_subquery(sql: &str) -> Option<InSubquery> {
                     if depth != 0 {
                         return None;
                     }
+                    let head = sql[..i].trim_end();
+                    let negated_start = (head.len() >= 3
+                        && head.as_bytes()[head.len() - 3..].eq_ignore_ascii_case(b"NOT")
+                        && (head.len() == 3 || {
+                            let b = head.as_bytes()[head.len() - 4];
+                            !b.is_ascii_alphanumeric() && b != b'_' && b != b'"'
+                        }))
+                    .then(|| head.len() - 3);
                     return Some(InSubquery {
                         start: j,
                         end: m,
                         inner_sql: sql[j + 1..m - 1].trim().to_string(),
+                        negated_start,
                     });
                 }
             }
@@ -109,6 +148,20 @@ pub fn find_in_subquery(sql: &str) -> Option<InSubquery> {
 /// It must return exactly one row of one column, which then behaves as a
 /// constant — the same shape a literal select item takes.
 pub fn find_scalar_subquery(sql: &str) -> Option<InSubquery> {
+    scalar_subquery(sql, false)
+}
+
+/// The first scalar subquery that reads the outer row, which
+/// [`find_scalar_subquery`] leaves in place: a statement with no per-row
+/// evaluator for it must refuse it, or its text reaches a value parser.
+pub fn find_correlated_scalar_subquery(sql: &str) -> Option<InSubquery> {
+    scalar_subquery(sql, true)
+}
+
+fn scalar_subquery(sql: &str, correlated: bool) -> Option<InSubquery> {
+    if !may_hold(sql, b"SELECT") {
+        return None;
+    }
     let bytes = sql.as_bytes();
     let upper = sql.to_ascii_uppercase();
 
@@ -156,11 +209,24 @@ pub fn find_scalar_subquery(sql: &str) -> Option<InSubquery> {
                 // is a value. Without that distinction the second subquery of
                 // `… SET c = (SELECT …) WHERE x IS DISTINCT FROM (SELECT …)`
                 // was skipped and reached the parser as the word SELECT.
-                let derived_table = matches!(previous_word.as_str(), "FROM" | "JOIN")
+                // `DELETE … USING (SELECT …) s` names a derived source the
+                // same way; read as a value, a source of two rows was refused
+                // as "returned 2 rows".
+                let derived_table = matches!(previous_word.as_str(), "FROM" | "JOIN" | "USING")
                     && word_before_previous != "DISTINCT";
+                // A parenthesised branch of a `UNION` is a query of its own,
+                // not a value: `(SELECT … LIMIT 2) UNION (SELECT …)`. Taken for
+                // one, a branch of two rows was refused as "returned 2 rows".
+                // A branch opens the statement or follows `UNION [ALL]`.
+                // `INTERSECT` and `EXCEPT` likewise, and `DISTINCT` as `ALL`.
+                let set_word = |w: &str| matches!(w, "UNION" | "INTERSECT" | "EXCEPT");
+                let union_branch = (previous_word.is_empty() && sql[..open].trim().is_empty())
+                    || set_word(&previous_word)
+                    || (matches!(previous_word.as_str(), "ALL" | "DISTINCT") && set_word(&word_before_previous));
                 let is_select = upper[k..].starts_with("SELECT")
                     && !matches!(previous_word.as_str(), "IN" | "EXISTS")
-                    && !derived_table;
+                    && !derived_table
+                    && !union_branch;
 
                 let mut d = 1usize;
                 let mut m = i + 1;
@@ -195,11 +261,12 @@ pub fn find_scalar_subquery(sql: &str) -> Option<InSubquery> {
                     // between two of the *inner* table's own columns. That
                     // returns a plausible number for the wrong question, and
                     // the statement then reports success.
-                    if !is_correlated(&inner_sql) {
+                    if is_correlated(&inner_sql) == correlated {
                         return Some(InSubquery {
                             start: open,
                             end: m,
                             inner_sql,
+                            negated_start: None,
                         });
                     }
                     i = open + 1;
@@ -214,9 +281,7 @@ pub fn find_scalar_subquery(sql: &str) -> Option<InSubquery> {
             }
             c if c.is_ascii_alphanumeric() || c == b'_' => {
                 let start = i;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
                 word_before_previous = std::mem::take(&mut previous_word);
@@ -243,10 +308,19 @@ pub fn find_scalar_subquery(sql: &str) -> Option<InSubquery> {
 /// Deliberately conservative: an unqualified column is not evidence either way,
 /// so only a qualifier that matches none of the subquery's own relations counts.
 pub fn is_correlated(inner_sql: &str) -> bool {
+    !outer_refs(inner_sql).is_empty()
+}
+
+/// The outer row's columns `inner_sql` reads, as `(qualifier, column)` in
+/// the order they appear, by [`is_correlated`]'s rule: a qualified name
+/// whose qualifier is none of the subquery's own relations. Unquoted names
+/// are folded to lowercase.
+pub fn outer_refs(inner_sql: &str) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = Vec::new();
     let from_at = match crate::core::rql::join::find_keyword(inner_sql, "FROM", 0) {
         Some(at) => at,
         // No FROM means no relations of its own, so nothing to correlate with.
-        None => return false,
+        None => return found,
     };
     let after_from = &inner_sql[from_at + "FROM".len()..];
     let end = ["WHERE", "GROUP", "ORDER", "LIMIT", "HAVING"]
@@ -284,26 +358,55 @@ pub fn is_correlated(inner_sql: &str) -> bool {
                 i += 1;
             }
             let word = &inner_sql[start..i];
-            if let Some(dot) = word.find('.') {
-                let qualifier = word[..dot].trim_matches('"');
-                if !qualifier.is_empty()
-                    && !own.iter().any(|n| n.eq_ignore_ascii_case(qualifier))
-                {
-                    return true;
+            // A schema name in front (`public.b.w`, `pg_catalog.count(*)`)
+            // is not a relation: the relation is the part after it, and a
+            // schema-qualified function has none.
+            let mut parts: Vec<&str> = word.split('.').map(|p| p.trim_matches('"')).collect();
+            if parts.len() > 1
+                && ["public", "pg_catalog", "information_schema"].iter().any(|s| parts[0].eq_ignore_ascii_case(s))
+            {
+                parts.remove(0);
+            }
+            if parts.len() > 1 {
+                let qualifier = parts[0];
+                // An own relation named with its schema (`FROM public.b`)
+                // is `b` too.
+                let named = |n: &String| {
+                    n.eq_ignore_ascii_case(qualifier)
+                        || n.rsplit('.').next().is_some_and(|last| last.trim_matches('"').eq_ignore_ascii_case(qualifier))
+                };
+                if !qualifier.is_empty() && !own.iter().any(named) {
+                    let raw: Vec<&str> = word.split('.').collect();
+                    let fold = |p: &str| {
+                        if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_ascii_lowercase() }
+                    };
+                    let column = raw.last().map(|c| fold(c)).unwrap_or_default();
+                    let reference = (fold(raw[raw.len() - parts.len()]), column);
+                    if !found.contains(&reference) {
+                        found.push(reference);
+                    }
                 }
             }
             continue;
         }
         i += 1;
     }
-    false
+    found
 }
 
 /// Renders the single value a scalar subquery returned.
 ///
 /// A subquery in value position must yield at most one row of one column;
 /// Postgres raises an error otherwise rather than picking one arbitrarily.
-pub fn rows_to_scalar(rows: &[Row]) -> Result<String, String> {
+///
+/// `document` says the column is a stored document, as for
+/// [`rows_to_value_list`]: a scan reports one as text, and rendered as text
+/// its encoded bytes were refused as a constant, or compared against `doc` as
+/// a literal no document parses from.
+/// `zoned`: the value, when it is a timestamp, is a `timestamptz`
+/// (`cte::zoned_timestamp_items`), whose literal carries its `+00`, so a text
+/// column it is assigned to or compared with sees PostgreSQL's text.
+pub fn rows_to_scalar(rows: &[Row], document: bool, exact_text: bool, zoned: bool) -> Result<String, String> {
     match rows.len() {
         // No rows makes the expression NULL, and NULL is what it becomes.
         // It used to be an empty string, which is a *value*: `WHERE id = ''`
@@ -314,15 +417,38 @@ pub fn rows_to_scalar(rows: &[Row]) -> Result<String, String> {
         1 => {
             let row = &rows[0];
             if row.columns.len() != 1 {
-                return Err(
-                    "a subquery used as a value must select exactly one column".to_string()
-                );
+                return Err("a subquery used as a value must select exactly one column".to_string());
             }
             let column = &row.columns[0];
-            value_to_literal(&column.column_type, column.data.into_slice()).ok_or_else(|| {
+            let db_type = if document && column.column_type == DbType::STRING {
+                DbType::JSONB
+            } else {
+                column.column_type.clone()
+            };
+            let literal = if zoned && db_type == DbType::DATETIME {
+                zoned_timestamp_literal(column.data.into_slice())
+            } else if matches!(db_type, DbType::F64 | DbType::F32) {
+                // A float stays a float: written back bare, `0.1` is a
+                // `numeric` constant, so `(SELECT max(f) …)` over a float8
+                // column was described and sent as numeric (1700), binary
+                // payload and all, where PostgreSQL sends float8 (701).
+                let bytes = column.data.into_slice();
+                if db_type == DbType::F64 {
+                    <[u8; 8]>::try_from(bytes)
+                        .ok()
+                        .map(|b| format!("{}::float8", value_codec::quote_sql(&value_codec::pg_float8_text(f64::from_le_bytes(b)))))
+                } else {
+                    <[u8; 4]>::try_from(bytes)
+                        .ok()
+                        .map(|b| format!("{}::real", value_codec::quote_sql(&value_codec::pg_float4_text(f32::from_le_bytes(b)))))
+                }
+            } else {
+                subquery_literal(&db_type, column.data.into_slice(), exact_text)
+            };
+            literal.ok_or_else(|| {
                 format!(
                     "subquery returned a {} value that cannot be used as a constant",
-                    column.column_type
+                    db_type
                 )
             })
         }
@@ -345,6 +471,9 @@ pub struct ExistsClause {
 
 /// Finds the first `[NOT] EXISTS (SELECT …)`, ignoring string literals.
 pub fn find_exists(sql: &str) -> Option<ExistsClause> {
+    if !may_hold(sql, b"EXISTS") {
+        return None;
+    }
     let bytes = sql.as_bytes();
     let upper = sql.to_ascii_uppercase();
     let mut i = 0usize;
@@ -367,7 +496,8 @@ pub fn find_exists(sql: &str) -> Option<ExistsClause> {
         }
 
         const KW: usize = "EXISTS".len();
-        let is_word_start = i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
+        let is_word_start =
+            i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
         if is_word_start
             && i + KW <= bytes.len()
             && upper.as_bytes()[i..].starts_with(b"EXISTS")
@@ -422,6 +552,90 @@ pub fn find_exists(sql: &str) -> Option<ExistsClause> {
     None
 }
 
+/// What the trailing `LIMIT` / `OFFSET` of an `EXISTS` body changes about its
+/// answer. `ORDER BY` changes nothing and is not recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExistsBounds {
+    /// `LIMIT n` as written; `None` for no limit or `LIMIT ALL`.
+    pub limit: Option<u64>,
+    /// `OFFSET k`; 0 when absent.
+    pub offset: u64,
+}
+
+/// Splits a top-level `ORDER BY`, `LIMIT`, `OFFSET` (and their SQL:2008
+/// spellings) off the body of an `EXISTS`.
+///
+/// They have to go before the correlated rewrite looks at the `WHERE` clause.
+/// Left in place, `EXISTS (SELECT 1 FROM t WHERE t.a = o.b AND t.on LIMIT 1)` —
+/// the shape Django's `Exists()` emits — became `o.b IN (SELECT a FROM t WHERE
+/// t.on LIMIT 1)`, an `IN` list of ONE value, and every outer row matching any
+/// other value was silently dropped. With the `LIMIT` straight after the
+/// correlation the outer reference itself became `o.b LIMIT 1`.
+///
+/// What they mean for existence:
+/// * `ORDER BY` never changes whether a row exists;
+/// * `LIMIT n` with `n >= 1` never does either, and `LIMIT 0` makes it false;
+/// * `OFFSET k` asks for at least `k + 1` rows, which the caller must honour.
+///
+/// The search is quote- and parenthesis-aware, so a `LIMIT` inside a nested
+/// subquery or a string literal is left alone.
+pub fn strip_exists_tail(clause: &ExistsClause) -> Result<(ExistsClause, ExistsBounds), String> {
+    let normalized =
+        crate::core::tokenizer::pagination::normalize_pagination(clause.inner_sql.trim())?;
+    let mut body: &str = normalized.as_str();
+    let mut bounds = ExistsBounds::default();
+
+    // `normalize_pagination` leaves at most a canonical ` LIMIT n OFFSET m`
+    // tail, in that order, so it is peeled from the end.
+    if let Some((head, n)) = take_count_suffix(body, "OFFSET") {
+        bounds.offset = n;
+        body = head;
+    }
+    if let Some((head, n)) = take_count_suffix(body, "LIMIT") {
+        bounds.limit = Some(n);
+        body = head;
+    }
+
+    // `ORDER BY` is the last clause left once the pagination is gone.
+    if let Some(at) = crate::core::rql::join::find_phrase(body, &["ORDER", "BY"], 0) {
+        body = body[..at].trim_end();
+    }
+
+    Ok((
+        ExistsClause {
+            start: clause.start,
+            end: clause.end,
+            inner_sql: body.trim().to_string(),
+            negated: clause.negated,
+        },
+        bounds,
+    ))
+}
+
+/// `"… <KEYWORD> <digits>"` -> `("…", digits)`, matching the keyword as a
+/// whole, case-insensitive word.
+fn take_count_suffix<'a>(text: &'a str, keyword: &str) -> Option<(&'a str, u64)> {
+    let digits_at = text.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    if digits_at == text.len() {
+        return None;
+    }
+    let count: u64 = text[digits_at..].parse().ok()?;
+    let head = text[..digits_at].trim_end();
+    if head.len() == text[..digits_at].len() || head.len() < keyword.len() {
+        // No whitespace between the keyword and the count.
+        return None;
+    }
+    let kw_at = head.len() - keyword.len();
+    if !head.is_char_boundary(kw_at) || !head[kw_at..].eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    let before = &head[..kw_at];
+    if !before.ends_with(|c: char| c.is_ascii_whitespace()) {
+        return None;
+    }
+    Some((before.trim_end(), count))
+}
+
 /// Rewrites a correlated `EXISTS` into the equivalent `IN` over the inner
 /// relation's join column.
 ///
@@ -432,11 +646,28 @@ pub fn find_exists(sql: &str) -> Option<ExistsClause> {
 /// outer row, and the filter index sees the resulting equalities.
 ///
 /// Returns the replacement text, or an error naming what could not be handled.
-pub fn exists_to_in(clause: &ExistsClause, outer_relations: &[String]) -> Result<String, String> {
-    let inner = clause.inner_sql.trim();
-    let upper = inner.to_ascii_uppercase();
+/// `text` without the parentheses that wrap all of it: `((a = b))` is
+/// `a = b`, `(a) = (b)` is left as it is.
+fn unwrap_parens(text: &str) -> &str {
+    let mut t = text.trim();
+    while t.starts_with('(') && crate::core::sql_scan::matching_close(t, 0) == Some(t.len() - 1) {
+        t = t[1..t.len() - 1].trim();
+    }
+    t
+}
 
-    if !upper.starts_with("SELECT ") {
+pub fn exists_to_in(clause: &ExistsClause, outer_relations: &[String]) -> Result<String, String> {
+    const SELECT_LEN: usize = "SELECT".len();
+    let inner = clause.inner_sql.trim();
+    let inner_text = inner;
+
+    if !inner
+        .get(..SELECT_LEN + 1)
+        .is_some_and(|h| {
+            h.as_bytes()[..SELECT_LEN].eq_ignore_ascii_case(b"SELECT")
+                && h.as_bytes()[SELECT_LEN].is_ascii_whitespace()
+        })
+    {
         return Err("EXISTS must contain a SELECT".to_string());
     }
     let from_at = crate::core::rql::join::find_keyword(inner, "FROM", 0)
@@ -463,6 +694,14 @@ pub fn exists_to_in(clause: &ExistsClause, outer_relations: &[String]) -> Result
         None => return Err(UNCORRELATED.to_string()),
         Some(w) => after_from[w + "WHERE".len()..].trim(),
     };
+    // `GROUP BY` / `HAVING` are not predicates: handed to `split_conjuncts`
+    // they were glued onto the last conjunct, where `o.b GROUP BY a` read as an
+    // outer reference. Split off here, and refused below once the subquery is
+    // known to correlate — the `IN` rewrite has nowhere to put them.
+    let (where_clause, grouping) = split_grouping(where_clause);
+    // Django parenthesises the whole predicate and each outer reference:
+    // `WHERE (U0."tid" = ("t"."id") AND U0."w" < 150)`.
+    let where_clause = unwrap_parens(where_clause);
 
     // Split the inner predicate into the one term that correlates with the
     // outer query and everything else, which stays inside the subquery.
@@ -470,13 +709,13 @@ pub fn exists_to_in(clause: &ExistsClause, outer_relations: &[String]) -> Result
     let mut rest: Vec<String> = Vec::new();
 
     for conjunct in crate::core::rql::join::split_conjuncts(where_clause) {
-        let term = conjunct.trim();
+        let term = unwrap_parens(conjunct.trim());
         let Some(eq) = find_bare_equals(term) else {
             rest.push(term.to_string());
             continue;
         };
-        let lhs = term[..eq].trim();
-        let rhs = term[eq + 1..].trim();
+        let lhs = unwrap_parens(term[..eq].trim());
+        let rhs = unwrap_parens(term[eq + 1..].trim());
 
         let lhs_side = qualifier_of(lhs, &inner, outer_relations);
         let rhs_side = qualifier_of(rhs, &inner, outer_relations);
@@ -496,7 +735,45 @@ pub fn exists_to_in(clause: &ExistsClause, outer_relations: &[String]) -> Result
     }
 
     if correlations.is_empty() {
+        // An outer column the rewrite cannot place is no proof of an
+        // uncorrelated EXISTS: run once with no outer row, it was refused as
+        // 42P01 ("missing FROM-clause entry"), naming a fault the statement
+        // does not have.
+        if let Some(term) = rest.iter().find(|t| names_outer_column(t, &inner, outer_relations)) {
+            return Err(format!(
+                "a correlated EXISTS can compare an outer column only with `=`; '{}' is not supported",
+                term
+            ));
+        }
         return Err(UNCORRELATED.to_string());
+    }
+
+    if !grouping.is_empty() {
+        return Err(
+            "a correlated EXISTS with GROUP BY or HAVING is not supported".to_string(),
+        );
+    }
+
+    // `EXISTS (SELECT COUNT(*) FROM t WHERE t.a = o.b)` — an aggregate with no
+    // GROUP BY yields exactly one row whatever matched, so the EXISTS holds for
+    // every outer row. The `IN` rewrite would instead ask whether a matching
+    // row exists: a plausible, wrong answer.
+    let select_list = &inner_text[SELECT_LEN..from_at];
+    if !crate::core::rql::lexer_query::find_aggregate_calls(select_list).is_empty()
+        && crate::core::rql::join::find_keyword(select_list, "OVER", 0).is_none()
+    {
+        return Ok(uncorrelated_exists_predicate(clause.negated, true).to_string());
+    }
+
+    // An outer column anywhere but an equality — `e2.v > ev.v` — would be
+    // left inside the subquery the rewrite runs once, where it names no row
+    // of its own: the EXISTS matched nothing and reported success. Refused
+    // until it can be answered.
+    if let Some(term) = rest.iter().find(|t| names_outer_column(t, &inner, outer_relations)) {
+        return Err(format!(
+            "a correlated EXISTS can compare an outer column only with `=` so far; '{}' is not supported yet",
+            term
+        ));
     }
 
     // More than one correlation cannot be expressed as `outer IN (SELECT inner)`,
@@ -523,23 +800,53 @@ pub fn exists_to_in(clause: &ExistsClause, outer_relations: &[String]) -> Result
             .to_string()
     };
 
+    // `EXISTS` is two-valued and `IN` is not, and the difference is NULL. A
+    // NULL join value matches nothing, so it is kept out of the list: in it, a
+    // `NOT IN` can never hold, and `NOT EXISTS` would have lost every row. The
+    // rest of the predicate is parenthesised so the extra term cannot bind to
+    // one arm of an `OR`.
     let subquery = if rest.is_empty() {
-        format!("SELECT {} FROM {}", inner_column, relation_text)
+        format!(
+            "SELECT {} FROM {} WHERE {} IS NOT NULL",
+            inner_column, relation_text, inner_column
+        )
     } else {
         format!(
-            "SELECT {} FROM {} WHERE {}",
+            "SELECT {} FROM {} WHERE {} IS NOT NULL AND ({})",
             inner_column,
             relation_text,
+            inner_column,
             rest.join(" AND ")
         )
     };
 
-    Ok(format!(
-        "{} {}IN ({})",
-        outer_ref,
-        if clause.negated { "NOT " } else { "" },
-        subquery
-    ))
+    if clause.negated {
+        // An outer NULL matches no inner row, so `NOT EXISTS` holds for it —
+        // while `NULL NOT IN (…)` is unknown and drops the row.
+        Ok(format!(
+            "({} IS NULL OR {} NOT IN ({}))",
+            outer_ref, outer_ref, subquery
+        ))
+    } else {
+        Ok(format!("{} IN ({})", outer_ref, subquery))
+    }
+}
+
+/// Splits `<predicate> GROUP BY … HAVING …` at its first top-level `GROUP BY`
+/// or `HAVING`, returning `(predicate, grouping)`; `grouping` is empty when
+/// there is neither.
+fn split_grouping(where_clause: &str) -> (&str, &str) {
+    let at = [
+        crate::core::rql::join::find_phrase(where_clause, &["GROUP", "BY"], 0),
+        crate::core::rql::join::find_keyword(where_clause, "HAVING", 0),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    match at {
+        Some(at) => (where_clause[..at].trim_end(), where_clause[at..].trim()),
+        None => (where_clause, ""),
+    }
 }
 
 enum Side {
@@ -559,10 +866,7 @@ pub(crate) const UNCORRELATED: &str = "EXISTS references no outer column";
 /// outer row: "did this return anything". PostgreSQL treats it exactly so, and
 /// `WHERE NOT EXISTS (SELECT 1 FROM t)` — insert only if nothing matched — is a
 /// common seeding idiom.
-pub fn uncorrelated_exists(
-    clause: &ExistsClause,
-    outer_relations: &[String],
-) -> Option<String> {
+pub fn uncorrelated_exists(clause: &ExistsClause, outer_relations: &[String]) -> Option<String> {
     match exists_to_in(clause, outer_relations) {
         Err(e) if e == UNCORRELATED => Some(clause.inner_sql.trim().to_string()),
         _ => None,
@@ -622,7 +926,7 @@ fn exists_parts(
     let names = inner_names(relation_text);
     let where_clause = match where_at {
         None => return Err("an EXISTS with no WHERE clause correlates nothing".to_string()),
-        Some(w) => after_from[w + "WHERE".len()..].trim(),
+        Some(w) => unwrap_parens(after_from[w + "WHERE".len()..].trim()),
     };
 
     let mut outer_refs: Vec<String> = Vec::new();
@@ -630,13 +934,13 @@ fn exists_parts(
     let mut rest: Vec<String> = Vec::new();
 
     for conjunct in crate::core::rql::join::split_conjuncts(where_clause) {
-        let term = conjunct.trim();
+        let term = unwrap_parens(conjunct.trim());
         let Some(eq) = find_bare_equals(term) else {
             rest.push(term.to_string());
             continue;
         };
-        let lhs = term[..eq].trim();
-        let rhs = term[eq + 1..].trim();
+        let lhs = unwrap_parens(term[..eq].trim());
+        let rhs = unwrap_parens(term[eq + 1..].trim());
         match (
             qualifier_of(lhs, &names, outer_relations),
             qualifier_of(rhs, &names, outer_relations),
@@ -689,12 +993,8 @@ fn exists_parts(
 pub fn multi_exists_predicate(
     spec: &MultiCorrelatedExists,
     rows: &[Row],
+    exact_text: &[bool],
 ) -> Result<String, String> {
-    if rows.is_empty() {
-        // Nothing to match: `EXISTS` is false for every row, `NOT EXISTS` true.
-        return Ok(if spec.negated { "1 = 1" } else { "1 = 0" }.to_string());
-    }
-
     let mut groups: Vec<String> = Vec::with_capacity(rows.len());
     for row in rows {
         if row.columns.len() != spec.outer_refs.len() {
@@ -704,9 +1004,20 @@ pub fn multi_exists_predicate(
                 spec.outer_refs.len()
             ));
         }
+        // An inner row with a NULL in a correlated column equals no outer row,
+        // so it can neither satisfy `EXISTS` nor defeat `NOT EXISTS`. Rendered,
+        // it became `a.x = NULL`, which the predicate parser refused.
+        if row
+            .columns
+            .iter()
+            .any(|c| c.column_type == DbType::NULL)
+        {
+            continue;
+        }
         let mut terms: Vec<String> = Vec::with_capacity(row.columns.len());
-        for (outer, column) in spec.outer_refs.iter().zip(row.columns.iter()) {
-            let literal = value_to_literal(&column.column_type, column.data.into_slice())
+        for (at, (outer, column)) in spec.outer_refs.iter().zip(row.columns.iter()).enumerate() {
+            let exact = exact_text.get(at).copied().unwrap_or(true);
+            let literal = subquery_literal(&column.column_type, column.data.into_slice(), exact)
                 .ok_or_else(|| {
                     format!(
                         "the EXISTS subquery returned a {} value that cannot be compared",
@@ -724,7 +1035,27 @@ pub fn multi_exists_predicate(
         groups.push(format!("({})", terms.join(joiner)));
     }
 
+    if groups.is_empty() {
+        // Nothing to match: `EXISTS` is false for every row, `NOT EXISTS` true.
+        return Ok(if spec.negated { "1 = 1" } else { "1 = 0" }.to_string());
+    }
+
     let joiner = if spec.negated { " AND " } else { " OR " };
+    if spec.negated {
+        // An outer row with a NULL in any correlated column matches no inner
+        // row, so `NOT EXISTS` holds for it; `a.x != 1` alone would be unknown
+        // for it and drop it.
+        let nulls: Vec<String> = spec
+            .outer_refs
+            .iter()
+            .map(|outer| format!("{} IS NULL", outer))
+            .collect();
+        return Ok(format!(
+            "({} OR ({}))",
+            nulls.join(" OR "),
+            groups.join(joiner)
+        ));
+    }
     Ok(format!("({})", groups.join(joiner)))
 }
 
@@ -734,14 +1065,16 @@ pub fn multi_exists_predicate(
 /// second relation reads as `Unknown` rather than `Inner`, and the correlation
 /// is never found.
 fn inner_names(relation_text: &str) -> Vec<String> {
+    use crate::core::rql::join::find_keyword;
+    // Split at `JOIN` and cut each piece at its `ON`, both only outside
+    // parentheses: a derived table's own body has keywords of its own.
     let mut pieces: Vec<&str> = Vec::new();
     let mut rest = relation_text;
     loop {
-        let upper = rest.to_ascii_uppercase();
-        match upper.find(" JOIN ") {
+        match find_keyword(rest, "JOIN", 0) {
             Some(at) => {
                 pieces.push(&rest[..at]);
-                rest = &rest[at + " JOIN ".len()..];
+                rest = &rest[at + "JOIN".len()..];
             }
             None => {
                 pieces.push(rest);
@@ -753,35 +1086,165 @@ fn inner_names(relation_text: &str) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for piece in pieces {
         // An `ON` clause belongs to the join, not to the relation it follows.
-        let upper = piece.to_ascii_uppercase();
-        let body = match upper.find(" ON ") {
+        let body = match find_keyword(piece, "ON", 0) {
             Some(at) => &piece[..at],
             None => piece,
         };
+        let mut body = body.trim();
+        if body.len() > 7 && body.as_bytes()[..7].eq_ignore_ascii_case(b"LATERAL") && !body.as_bytes()[7].is_ascii_alphanumeric() {
+            body = body[7..].trim_start();
+        }
+        // A derived table or `(VALUES …)` is named by the alias after its
+        // closing parenthesis, and only by that: read as words, `(SELECT id
+        // FROM mt) AS t` named `id`, so `t.id` counted as an outer column and
+        // `t.id = s.id` was refused as a comparison that is not `=`.
+        if body.starts_with('(') {
+            if let Some(close) = crate::core::sql_scan::matching_close(body, 0) {
+                let mut after = body[close + 1..].trim_start();
+                if after.len() > 2 && after.as_bytes()[..2].eq_ignore_ascii_case(b"AS") && after.as_bytes()[2].is_ascii_whitespace() {
+                    after = after[2..].trim_start();
+                }
+                let alias: &str = after.split(|c: char| c.is_whitespace() || c == '(').next().unwrap_or("");
+                if !alias.is_empty() {
+                    names.push(alias.trim_matches('"').to_string());
+                }
+            }
+            continue;
+        }
         let mut tokens = body.split_whitespace().filter(|t| {
             !matches!(
                 t.to_ascii_uppercase().as_str(),
-                "LEFT" | "RIGHT" | "INNER" | "OUTER" | "CROSS" | "FULL" | "AS"
+                "LEFT" | "RIGHT" | "INNER" | "OUTER" | "CROSS" | "FULL" | "AS" | "NATURAL"
             )
         });
+        // An aliased relation is named by its alias alone, as SQL scopes it:
+        // in `FROM sv s2 WHERE s2.id = sv.id` the `sv` is the outer query's.
+        // Counted as the subquery's own, that correlation read as `s2.id =
+        // s2.id`, the EXISTS as uncorrelated, and it held for every row.
         if let Some(table) = tokens.next() {
-            names.push(table.trim_matches('"').to_string());
-            if let Some(alias) = tokens.next() {
-                names.push(alias.trim_matches('"').to_string());
-            }
+            let name = tokens.next().unwrap_or(table);
+            names.push(name.trim_matches('"').to_string());
         }
     }
     names
 }
 
+/// Whether `term` reads a column qualified by one of the outer relations, a
+/// name the subquery does not give its own relations. Quoted text is skipped.
+fn names_outer_column(term: &str, inner: &[String], outer_relations: &[String]) -> bool {
+    let bytes = term.as_bytes();
+    let is_name = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'"' || !b.is_ascii();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'\'' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if is_name(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && (is_name(bytes[i]) || bytes[i] == b'.') {
+                i += 1;
+            }
+            if matches!(qualifier_of(&term[start..i], inner, outer_relations), Side::Outer)
+                && term[start..i].contains('.')
+            {
+                return true;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether a cast to `target` (one `::type`) is one the evaluator applies
+/// exactly as PostgreSQL does: a type with no modifier, NUMERIC / DECIMAL
+/// with `(p, s)` (rounded, 22003 past the precision), or a text or time type
+/// with the modifier `expr::CastTypmod` applies.
+fn placeable_cast(target: &str) -> bool {
+    let t = target.trim().to_ascii_lowercase();
+    if t.is_empty()
+        || !t.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b' ' | b'(' | b')' | b',' | b'[' | b']' | b'"'))
+    {
+        return false;
+    }
+    let base = t.split('(').next().unwrap_or("").trim().trim_matches('"');
+    // Every modifier the evaluator applies exactly (`expr::CastTypmod`):
+    // `varchar(n)` and `character(n)` cut (and `character(n)` compares
+    // without trailing spaces, as its literals are read), and `timestamp(p)`,
+    // `time(p)`, `timetz(p)` and `interval(p)` round half away from zero.
+    !t.contains('(')
+        || matches!(
+            base,
+            "numeric"
+                | "decimal"
+                | "varchar"
+                | "character varying"
+                | "char varying"
+                | "char"
+                | "character"
+                | "bpchar"
+                | "nchar"
+                | "timestamp"
+                | "timestamptz"
+                | "time"
+                | "timetz"
+                | "interval"
+        )
+}
+
 fn qualifier_of(reference: &str, inner: &[String], outer_relations: &[String]) -> Side {
-    let cleaned = reference.trim().trim_matches('"');
-    let Some((qualifier, _)) = cleaned.rsplit_once('.') else {
+    // A cast of the reference (`t.id::bigint`, `u.y::text`, `x::numeric(10,
+    // 2)`) keeps its side: ORMs write them, and the `IN` rewrite carries the
+    // cast with the column. Only a type may follow `::`.
+    //
+    // Not a cast whose value this engine does not compute as PostgreSQL does
+    // (`placeable_cast`): those keep no side, and the EXISTS is refused
+    // (0A000) rather than answered wrong. The modifiers of `varchar(n)`,
+    // `character(n)`, `timestamp(p)`, `time(p)`, `timetz(p)` and
+    // `interval(p)` are applied (`expr::CastTypmod`), so they place.
+    let cleaned = match reference.trim().split_once("::") {
+        Some((column, cast)) if cast.split("::").all(placeable_cast) => column.trim(),
+        _ => reference.trim(),
+    };
+    // Only a column reference has a side: `t.x + 1` is an expression over
+    // one, which the `IN` rewrite cannot place (it came out as `t.x + 1 IN
+    // (…)`, a syntax error), so it is no correlation.
+    let mut segments: Vec<&str> = Vec::new();
+    let bytes = cleaned.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        if bytes[i] == b'"' {
+            i = crate::core::sql_scan::quoted_end(bytes, i, b'"');
+            segments.push(cleaned[start..i].trim_matches('"'));
+        } else {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'$') || bytes[i] >= 0x80) {
+                i += 1;
+            }
+            if i == start {
+                return Side::Unknown;
+            }
+            segments.push(&cleaned[start..i]);
+        }
+        match bytes.get(i) {
+            None => break,
+            Some(b'.') => i += 1,
+            Some(_) => return Side::Unknown,
+        }
+    }
+    let qualifier = match segments.len() {
         // An unqualified name inside the subquery belongs to the subquery's
         // own relation, which is how SQL resolves it.
-        return Side::Inner;
+        0 | 1 => return Side::Inner,
+        // `q.col`, or `schema.q.col` (Prisma's `"public"."t"."id"`): the
+        // relation is the segment before the column.
+        n => segments[n - 2],
     };
-    let qualifier = qualifier.trim_matches('"');
 
     if inner.iter().any(|n| n.eq_ignore_ascii_case(qualifier)) {
         Side::Inner
@@ -816,6 +1279,20 @@ fn find_bare_equals(term: &str) -> Option<usize> {
     None
 }
 
+/// A value as stored in the column `field`, as the SQL literal for its type:
+/// a `NUMERIC(p, s)` at its declared scale, at which its bytes are held.
+/// [`value_to_literal`] reads a sixteen-byte `NUMERIC` at the engine's nine
+/// places, so a duplicate key's message showed a NUMERIC(8,3) 1.500 as
+/// 0.0000015.
+pub fn stored_value_literal(field: &crate::core::row::schema::SchemaField, bytes: &[u8]) -> Option<String> {
+    if field.db_type == DbType::DECIMAL {
+        if let (Some(scale), Ok(raw)) = (field.scale, <[u8; 16]>::try_from(bytes)) {
+            return Some(value_codec::format_decimal_scaled(i128::from_le_bytes(raw), scale));
+        }
+    }
+    value_to_literal(&field.db_type, bytes)
+}
+
 /// Renders one column value as the SQL literal for its type.
 pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
     fn le<const N: usize>(b: &[u8]) -> Option<[u8; N]> {
@@ -828,14 +1305,33 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
     }
 
     Some(match db_type {
-        DbType::STRING => value_codec::quote_sql(std::str::from_utf8(bytes).ok()?),
+        DbType::STRING | DbType::BPCHAR(_) => value_codec::quote_sql(std::str::from_utf8(bytes).ok()?),
+        // A `json` value is its text as written; quoted, it is read back as
+        // that text again (into a `json` column, checked to be one document).
+        DbType::JSONTEXT => value_codec::quote_sql(std::str::from_utf8(bytes).ok()?),
         DbType::UUID => value_codec::quote_sql(&value_codec::format_uuid(bytes)),
         DbType::INET => value_codec::quote_sql(&value_codec::format_inet(bytes)?),
-        DbType::DATETIME => {
-            value_codec::quote_sql(&value_codec::format_timestamp_us(i64::from_le_bytes(le::<8>(bytes)?)))
+        // A `timestamp` (without time zone) has the same eight bytes and
+        // text; it had no arm, and `(SELECT now()::timestamp)` was refused.
+        DbType::DATETIME | DbType::TIMESTAMP => {
+            value_codec::quote_sql(&value_codec::format_timestamp_us(i64::from_le_bytes(le::<
+                8,
+            >(
+                bytes,
+            )?)))
         }
-        DbType::DECIMAL => value_codec::format_decimal(i128::from_le_bytes(le::<16>(bytes)?)),
-        DbType::BOOL => if bytes.first().copied().unwrap_or(0) != 0 { "1" } else { "0" }.to_string(),
+        // A result value may carry its own display scale (an `AVG`); see
+        // `value_codec::decimal_cell_with_scale`.
+        DbType::DECIMAL => match value_codec::split_decimal_cell(bytes)? {
+            (v, Some(own)) => value_codec::format_decimal_scaled(v, own),
+            (v, None) => value_codec::format_decimal(v),
+        },
+        DbType::BOOL => if bytes.first().copied().unwrap_or(0) != 0 {
+            "1"
+        } else {
+            "0"
+        }
+        .to_string(),
         DbType::I8 => i8::from_le_bytes(le::<1>(bytes)?).to_string(),
         DbType::I16 => i16::from_le_bytes(le::<2>(bytes)?).to_string(),
         DbType::I32 => i32::from_le_bytes(le::<4>(bytes)?).to_string(),
@@ -846,12 +1342,21 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
         DbType::U32 => u32::from_le_bytes(le::<4>(bytes)?).to_string(),
         DbType::U64 => u64::from_le_bytes(le::<8>(bytes)?).to_string(),
         DbType::U128 => u128::from_le_bytes(le::<16>(bytes)?).to_string(),
-        DbType::F32 => f32::from_le_bytes(le::<4>(bytes)?).to_string(),
-        DbType::F64 => f64::from_le_bytes(le::<8>(bytes)?).to_string(),
-        DbType::CHAR => {
-            let code = u32::from_le_bytes(le::<4>(bytes)?);
-            value_codec::quote_sql(&char::from_u32(code)?.to_string())
+        // PostgreSQL's text for the float (`1e+20`, `1e-07`), which reads
+        // back as the same float; a value with no digits (`NaN`,
+        // `Infinity`) is a quoted literal, which a float column reads as one
+        // and a bare word is not.
+        DbType::F32 => {
+            let v = f32::from_le_bytes(le::<4>(bytes)?);
+            let text = value_codec::pg_float4_text(v);
+            if v.is_finite() { text } else { value_codec::quote_sql(&text) }
         }
+        DbType::F64 => {
+            let v = f64::from_le_bytes(le::<8>(bytes)?);
+            let text = value_codec::pg_float8_text(v);
+            if v.is_finite() { text } else { value_codec::quote_sql(&text) }
+        }
+        DbType::CHAR => value_codec::quote_sql(value_codec::legacy_char_text(bytes)),
         // A document that has already been rebuilt — the bytes ARE the JSON
         // text, so it needs quoting and nothing else. Without this arm a
         // shredded JSON column had no literal form and materialising any
@@ -866,9 +1371,50 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
             if bytes.is_empty() {
                 "NULL".to_string()
             } else {
-                value_codec::quote_sql(&crate::core::jsonb::decode(bytes).ok()?.to_string())
+                // Rendered, not decoded: a decoded `Value` holds a fraction
+                // as a `f64`, so `1.000000000000000000001` came back as `1.0`,
+                // and a number past the `f64` range had no literal at all.
+                let mut text = Vec::with_capacity(bytes.len());
+                crate::core::jsonb::render_text_into(bytes, &mut text).ok()?;
+                value_codec::quote_sql(std::str::from_utf8(&text).ok()?)
             }
         }
+        // The types stored in PostgreSQL's own wire layout. Their literal form
+        // is their text form quoted — which is exactly what a client would have
+        // written to put the value there, so the round trip is closed.
+        //
+        // Reaching here matters for more than subqueries: `value_to_literal` is
+        // also what renders a `::text` cast, and without these arms
+        // `hardware_status::text` failed with "BIT cannot be rendered as text"
+        // rather than yielding the bits.
+        DbType::INTERVAL => value_codec::quote_sql(&crate::core::pg_types::format_interval(bytes)?),
+        DbType::MACADDR | DbType::MACADDR8 => {
+            value_codec::quote_sql(&crate::core::pg_types::format_macaddr(bytes))
+        }
+        DbType::BIT | DbType::VARBIT => {
+            value_codec::quote_sql(&crate::core::pg_types::format_bit_string(bytes)?)
+        }
+        DbType::DATE => value_codec::quote_sql(&crate::core::pg_types::format_date(bytes)?),
+        DbType::TIME => value_codec::quote_sql(&crate::core::pg_types::format_time(bytes)?),
+        DbType::TIMETZ => value_codec::quote_sql(&crate::core::pg_types::format_timetz(bytes)?),
+        DbType::POINT => value_codec::quote_sql(&crate::core::pg_types::format_point(bytes)?),
+        DbType::LINE => value_codec::quote_sql(&crate::core::pg_types::format_line(bytes)?),
+        DbType::LSEG => value_codec::quote_sql(&crate::core::pg_types::format_lseg(bytes)?),
+        DbType::BOX => value_codec::quote_sql(&crate::core::pg_types::format_box(bytes)?),
+        DbType::PATH => value_codec::quote_sql(&crate::core::pg_types::format_path(bytes)?),
+        DbType::POLYGON => value_codec::quote_sql(&crate::core::pg_types::format_polygon(bytes)?),
+        DbType::CIRCLE => value_codec::quote_sql(&crate::core::pg_types::format_circle(bytes)?),
+        DbType::INT4RANGE
+        | DbType::INT8RANGE
+        | DbType::NUMRANGE
+        | DbType::TSRANGE
+        | DbType::TSTZRANGE
+        | DbType::DATERANGE => {
+            value_codec::quote_sql(&crate::core::pg_types::format_range(db_type, bytes)?)
+        }
+        // Variable-width types whose literal is their own text syntax.
+        DbType::BYTEA => value_codec::quote_sql(&value_codec::format_bytea(bytes)),
+        DbType::ARRAY => value_codec::quote_sql(&value_codec::format_array(bytes)?),
         // An empty value is how a NULL arrives for a variable-width column.
         // Anything else of an unknown type has no faithful literal, and
         // inventing one would store a value nobody wrote.
@@ -883,8 +1429,348 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
 /// An empty result yields `()`. The `IN` desugaring reads that as a predicate
 /// that cannot hold, which is what `x IN (empty set)` means — rather than a
 /// syntax error, which is what an empty list would be if a user had written it.
-pub fn rows_to_value_list(rows: &[Row]) -> Result<String, String> {
-    let mut parts: Vec<String> = Vec::with_capacity(rows.len());
+///
+/// Duplicates are rendered once: membership does not depend on multiplicity,
+/// and every value in the list becomes one comparison per scanned outer row.
+///
+/// A NULL is left out of the list and reported as the second element instead.
+/// It equals nothing, so for `IN` dropping it is exact in a filter; for
+/// `NOT IN` it makes the predicate never true, which the caller expresses —
+/// rendered as a literal it reached the predicate parser as an unknown
+/// identifier.
+///
+/// `document` says the column is a stored document. A scan reports one as
+/// text, and rendered as text its encoded bytes made a literal no document
+/// parses from, so `doc IN (SELECT doc FROM t)` was refused outright. It is
+/// rendered as the document it is, and duplicates are found by value.
+/// A subquery's value as the literal it is substituted as. A text value
+/// with trailing spaces from a text column (`exact_text`) is written as the
+/// text expression `('…' || '')`: compared with a `character(n)` column
+/// PostgreSQL compares a subquery's text value as text, exactly — in `IN
+/// (SELECT …)` and `= (SELECT …)` alike — where an untyped `'ab  '` is
+/// `'ab'`. An expression keeps that through the rewrite, which reads an `IN`
+/// list's typed literals as the column's type, as a written list is. One
+/// from a `character(n)` or `character varying` column compares
+/// blank-padded and is written untyped. Without trailing spaces the two
+/// readings agree. The exact `('…' || '')` shape is what the rewrite knows
+/// a substituted value by, and keeps exact inside an `IN` list over
+/// `character(n)` (`predicate_rewrite::spell_out_list_or_range`), where a
+/// computed item written in the statement is read blank-padded.
+/// A `timestamptz` value's literal, with the `+00` its text has (the session
+/// is UTC). Read back into a `timestamp` column the zone is discarded and
+/// the value is the same; into a `timestamptz` one it is the same instant.
+pub fn zoned_timestamp_literal(bytes: &[u8]) -> Option<String> {
+    let us = i64::from_le_bytes(bytes.try_into().ok()?);
+    Some(value_codec::quote_sql(&format!("{}+00", value_codec::format_timestamp_us(us))))
+}
+
+pub fn subquery_literal(db_type: &DbType, bytes: &[u8], exact_text: bool) -> Option<String> {
+    // A finite float as a typed `float8` constant, `'0.1'::float8`, a `real`
+    // widened to the double it is (`value_codec::widened_real_text`). The
+    // comparison it lands in is PostgreSQL's float one: a float column reads
+    // the number, and an integer or NUMERIC column is compared through its
+    // nearest double (`predicate_rewrite::exact_against_float`). Written as
+    // bare digits it was a NUMERIC constant: `n IN (SELECT f8 …)` compared a
+    // NUMERIC(30,9) 1234567890.123456789 exactly with 1234567890.1234567 and
+    // missed it, and `f8 IN (SELECT f4 …)` missed every widened value.
+    let float = match *db_type {
+        DbType::F32 => <[u8; 4]>::try_from(bytes)
+            .ok()
+            .map(f32::from_le_bytes)
+            .filter(|v| v.is_finite())
+            .map(value_codec::widened_real_text),
+        DbType::F64 => <[u8; 8]>::try_from(bytes)
+            .ok()
+            .map(f64::from_le_bytes)
+            .filter(|v| v.is_finite())
+            .map(value_codec::pg_float8_text),
+        _ => None,
+    };
+    if let Some(text) = float {
+        return Some(format!("{}::float8", value_codec::quote_sql(&text)));
+    }
+    let literal = value_to_literal(db_type, bytes)?;
+    Some(if exact_text && *db_type == DbType::STRING && bytes.last() == Some(&b' ') {
+        format!("({literal} || '')")
+    } else {
+        literal
+    })
+}
+
+/// A value list from [`rows_to_value_list`] with the NULL it left out put
+/// back: `()` is `(NULL)`, `(1, 2)` is `(1, 2, NULL)`.
+pub fn list_with_null(list: &str) -> String {
+    let list = list.trim();
+    let inner = list.strip_prefix('(').and_then(|l| l.strip_suffix(')')).unwrap_or(list).trim();
+    if inner.is_empty() {
+        "(NULL)".to_string()
+    } else {
+        format!("({inner}, NULL)")
+    }
+}
+
+/// The predicate `x op ANY|ALL (subquery)` is, given the subquery's rows,
+/// with SQL's three values: a NULL among them makes a comparison that no
+/// value decides UNKNOWN, written `x IN (NULL)` (UNKNOWN for every `x`,
+/// which the scan and the evaluator both read three-valued, `NOT` included).
+///
+/// - `ANY`: true when some value passes, so `x > ANY` is `x > min`, `x < ANY`
+///   is `x < max`, `x <> ANY` holds for any `x` once two values differ; no
+///   rows is false. With a NULL: `(… OR x IN (NULL))`.
+/// - `ALL`: false when some value fails, so `x > ALL` is `x > max`, `x = ALL`
+///   is false once two values differ; no rows is true. With a NULL: `(… AND
+///   x IN (NULL))`.
+///
+/// It was refused: `min`/`max` alone hold in a filter but not under `NOT`
+/// when the subquery yields a NULL.
+pub fn quantified_predicate(
+    q: &crate::core::sql_scan::QuantifiedSubquery,
+    rows: &[Row],
+    document: bool,
+    exact_text: bool,
+) -> Result<String, String> {
+    use crate::core::rql::expr::Value;
+    let quantifier = if q.all { "ALL" } else { "ANY" };
+    if rows.is_empty() {
+        return Ok(if q.all { "(1 = 1)" } else { "(1 = 0)" }.to_string());
+    }
+    let mut values: Vec<(Value, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<(u8, Vec<u8>)> = std::collections::HashSet::new();
+    let mut has_null = false;
+    for row in rows {
+        if row.columns.len() != 1 {
+            return Err("subquery has too many columns".to_string());
+        }
+        let column = &row.columns[0];
+        if column.column_type == DbType::NULL {
+            has_null = true;
+            continue;
+        }
+        let bytes = column.data.into_slice();
+        let db_type = if document && column.column_type == DbType::STRING {
+            DbType::JSONB
+        } else {
+            column.column_type.clone()
+        };
+        let key = match (db_type == DbType::DECIMAL)
+            .then(|| crate::core::value_codec::canonical_numeric_cell(bytes))
+            .flatten()
+        {
+            Some(canonical) => canonical,
+            None => bytes.to_vec(),
+        };
+        if !seen.insert((db_type.to_byte(), key)) {
+            continue;
+        }
+        let literal = subquery_literal(&db_type, bytes, exact_text)
+            .ok_or_else(|| format!("subquery returned a {} value that cannot be compared", db_type))?;
+        values.push((Value::Data { bytes: bytes.to_vec(), db_type }, literal));
+    }
+    if document && !matches!(q.op, "=" | "<>") {
+        return Err(format!("{} {quantifier} (subquery) over a json value is not supported", q.op));
+    }
+    let x = q.operand.as_str();
+    let bare = crate::core::rql::window_join::is_bare_reference(x);
+    let unknown = || -> Result<String, String> {
+        if bare {
+            Ok(format!("{x} IN (NULL)"))
+        } else {
+            Err(format!(
+                "{} {quantifier} (subquery) over an expression, when the subquery yields a NULL, is not \
+                 supported yet; compare a column, or filter the NULLs out of the subquery",
+                q.op
+            ))
+        }
+    };
+    let list = |values: &[(Value, String)]| -> String {
+        let mut items: Vec<&str> = values.iter().map(|(_, l)| l.as_str()).collect();
+        if has_null {
+            items.push("NULL");
+        }
+        format!("({})", items.join(", "))
+    };
+    // The value an ordering comparison has to beat: the least for `> ANY`
+    // and `< ALL`, the greatest for `< ANY` and `> ALL`.
+    let extreme = |least: bool| -> Option<&String> {
+        let mut best: Option<&(Value, String)> = None;
+        for v in &values {
+            best = match best {
+                None => Some(v),
+                Some(b) => {
+                    let ord = crate::core::rql::expr::compare_total(&v.0, &b.0)?;
+                    if (least && ord.is_lt()) || (!least && ord.is_gt()) { Some(v) } else { Some(b) }
+                }
+            };
+        }
+        best.map(|(_, l)| l)
+    };
+    let base: Option<String> = match (q.op, q.all) {
+        ("=", false) => return Ok(format!("({x} IN {})", list(&values))),
+        ("<>", true) => return Ok(format!("({x} NOT IN {})", list(&values))),
+        ("<>", false) => match values.len() {
+            0 => None,
+            1 => Some(format!("{x} <> {}", values[0].1)),
+            // Any `x` differs from one of two values; a NULL `x` is UNKNOWN.
+            _ => return Ok(format!("({x} IS NOT NULL OR {})", unknown()?)),
+        },
+        ("=", true) => match values.len() {
+            0 => None,
+            1 => Some(format!("{x} = {}", values[0].1)),
+            // No `x` equals two values; a NULL `x` is UNKNOWN.
+            _ => return Ok(format!("({} AND {x} IS NULL)", unknown()?)),
+        },
+        (op, all) => {
+            let least = matches!(op, ">" | ">=") != all;
+            match values.is_empty() {
+                true => None,
+                false => Some(format!(
+                    "{x} {op} {}",
+                    extreme(least).ok_or_else(|| "the subquery's values cannot be ordered".to_string())?
+                )),
+            }
+        }
+    };
+    Ok(match (base, has_null) {
+        (None, _) => format!("({})", unknown()?),
+        (Some(base), false) => format!("({base})"),
+        (Some(base), true) if q.all => format!("({base} AND {})", unknown()?),
+        (Some(base), true) => format!("({base} OR {})", unknown()?),
+    })
+}
+
+/// When `found`'s `IN` reads a row, `(e1, e2, …) [NOT] IN (SELECT …)`: where
+/// that row's `(` opens and how many values it holds. `None` for a single
+/// operand, a parenthesised one (`(a) IN`) and a call (`lower(a, b) IN`).
+pub fn row_in_operand(sql: &str, found: &InSubquery) -> Option<(usize, usize)> {
+    let head = match found.negated_start {
+        Some(not) => sql[..not].trim_end(),
+        None => {
+            let head = sql[..found.start].trim_end();
+            let cut = head.len().checked_sub(2)?;
+            if !head.get(cut..)?.eq_ignore_ascii_case("IN") {
+                return None;
+            }
+            head[..cut].trim_end()
+        }
+    };
+    if !head.ends_with(')') {
+        return None;
+    }
+    let close = head.len() - 1;
+    let bytes = sql.as_bytes();
+    let mut depth = 0usize;
+    let mut open = None;
+    for i in (0..=close).rev() {
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    open = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let open = open?;
+    // A quote holding a parenthesis misleads the count above: the pair has
+    // to be one by the quote-aware matcher too.
+    if crate::core::sql_scan::matching_close(sql, open) != Some(close) {
+        return None;
+    }
+    let before = sql[..open].trim_end();
+    if before.bytes().last().is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'"') {
+        let word_start = before.bytes().rposition(|b| !(b.is_ascii_alphanumeric() || b == b'_')).map_or(0, |p| p + 1);
+        let word = &before[word_start..];
+        // `WHERE (a, b) IN`, `AND (a, b) IN`: a keyword, not a function's name.
+        if !["WHERE", "AND", "OR", "NOT", "ON", "HAVING", "SELECT", "WHEN", "THEN", "ELSE", "IS"]
+            .iter()
+            .any(|k| word.eq_ignore_ascii_case(k))
+        {
+            return None;
+        }
+    }
+    let arity = crate::core::sql_scan::split_top_level(&sql[open + 1..close], b',').len();
+    (arity >= 2).then_some((open, arity))
+}
+
+/// The rows of a subquery as a row list for `(e1, e2, …) IN (…)`, each row
+/// typed as [`rows_to_value_list`] types one value and a NULL written as
+/// `NULL`, which the row comparison reads three-valued as PostgreSQL does.
+/// `None` when there are no rows: `IN ()` is no SQL, and the caller writes
+/// the predicate's constant instead.
+pub fn rows_to_row_list(rows: &[Row], arity: usize, document: &[bool], exact_text: &[bool]) -> Result<Option<String>, String> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut out = String::with_capacity(2 + rows.len() * 8 * arity);
+    out.push('(');
+    let mut seen: ahash::HashSet<Vec<u8>> = ahash::HashSet::with_capacity_and_hasher(rows.len(), Default::default());
+    let mut first = true;
+    for row in rows {
+        match row.columns.len().cmp(&arity) {
+            std::cmp::Ordering::Greater => return Err("subquery has too many columns".to_string()),
+            std::cmp::Ordering::Less => return Err("subquery has too few columns".to_string()),
+            std::cmp::Ordering::Equal => {}
+        }
+        let mut key = Vec::new();
+        let mut literals: Vec<String> = Vec::with_capacity(arity);
+        for (at, column) in row.columns.iter().enumerate() {
+            if column.column_type == DbType::NULL {
+                key.push(0);
+                literals.push("NULL".to_string());
+                continue;
+            }
+            let bytes = column.data.into_slice();
+            let db_type = if document.get(at).copied().unwrap_or(false) && column.column_type == DbType::STRING {
+                DbType::JSONB
+            } else {
+                column.column_type.clone()
+            };
+            let literal = subquery_literal(&db_type, bytes, exact_text.get(at).copied().unwrap_or(true))
+                .ok_or_else(|| format!("subquery returned a {db_type} value that cannot be compared"))?;
+            key.push(1);
+            key.extend_from_slice(&(literal.len() as u32).to_le_bytes());
+            key.extend_from_slice(literal.as_bytes());
+            literals.push(literal);
+        }
+        if !seen.insert(key) {
+            continue;
+        }
+        if !first {
+            out.push_str(", ");
+        }
+        first = false;
+        out.push('(');
+        out.push_str(&literals.join(", "));
+        out.push(')');
+    }
+    out.push(')');
+    Ok(Some(out))
+}
+
+pub fn rows_to_value_list(rows: &[Row], document: bool, exact_text: bool) -> Result<(String, bool), String> {
+    rows_to_value_list_as(rows, document, exact_text, false)
+}
+
+/// [`rows_to_value_list`]; with `as_double`, an exact number (NUMERIC, an
+/// integer) is written typed float8, for a REAL operand, which PostgreSQL's
+/// `= ANY` compares with it in double precision.
+pub fn rows_to_value_list_as(
+    rows: &[Row],
+    document: bool,
+    exact_text: bool,
+    as_double: bool,
+) -> Result<(String, bool), String> {
+    let mut out = String::with_capacity(2 + rows.len() * 8);
+    out.push('(');
+    let mut had_null = false;
+    let mut first = true;
+    // Keyed by type tag and stored bytes, so equal values of different types
+    // (a UNION can mix them) are never merged.
+    let mut seen: ahash::HashSet<(u8, std::borrow::Cow<[u8]>)> =
+        ahash::HashSet::with_capacity_and_hasher(rows.len(), Default::default());
 
     for row in rows {
         let column = row
@@ -894,22 +1780,89 @@ pub fn rows_to_value_list(rows: &[Row]) -> Result<String, String> {
         if row.columns.len() > 1 {
             return Err("a subquery used with IN must select exactly one column".to_string());
         }
-        let literal = value_to_literal(&column.column_type, column.data.into_slice())
-            .ok_or_else(|| {
-                format!(
-                    "subquery returned a {} value that cannot be compared",
-                    column.column_type
-                )
-            })?;
-        parts.push(literal);
+        if column.column_type == DbType::NULL {
+            had_null = true;
+            continue;
+        }
+        let bytes = column.data.into_slice();
+        let db_type = if document && column.column_type == DbType::STRING {
+            DbType::JSONB
+        } else {
+            column.column_type.clone()
+        };
+        let key = if db_type == DbType::JSONB {
+            let mut key = Vec::with_capacity(bytes.len() + 8);
+            crate::core::jsonb::push_group_key(bytes, &mut key);
+            std::borrow::Cow::Owned(key)
+        } else if let Some(canonical) = (db_type == DbType::DECIMAL)
+            .then(|| crate::core::value_codec::canonical_numeric_cell(bytes))
+            .flatten()
+        {
+            std::borrow::Cow::Owned(canonical)
+        } else {
+            std::borrow::Cow::Borrowed(bytes)
+        };
+        if !seen.insert((db_type.to_byte(), key)) {
+            continue;
+        }
+        let literal = subquery_literal(&db_type, bytes, exact_text).ok_or_else(|| {
+            format!(
+                "subquery returned a {} value that cannot be compared",
+                db_type
+            )
+        })?;
+        let exact_number = matches!(
+            db_type,
+            DbType::DECIMAL
+                | DbType::I8
+                | DbType::I16
+                | DbType::I32
+                | DbType::I64
+                | DbType::U8
+                | DbType::U16
+                | DbType::U32
+                | DbType::U64
+        );
+        let literal = if as_double && exact_number {
+            format!("{}::float8", value_codec::quote_sql(literal.trim_matches('\'')))
+        } else {
+            literal
+        };
+        if !first {
+            out.push_str(", ");
+        }
+        first = false;
+        out.push_str(&literal);
     }
 
-    Ok(format!("({})", parts.join(", ")))
+    out.push(')');
+    Ok((out, had_null))
 }
 
 #[cfg(test)]
 mod correlation_tests {
     use super::*;
+
+    #[test]
+    fn a_row_operand_is_told_from_a_single_one() {
+        let row = |sql: &str| row_in_operand(sql, &find_in_subquery(sql).unwrap()).map(|(open, n)| (sql[open..open + 1].to_string(), open, n));
+        assert_eq!(row("SELECT 1 FROM t WHERE (a, b) IN (SELECT x, y FROM u)"), Some(("(".to_string(), 22, 2)));
+        assert_eq!(row("SELECT 1 FROM t WHERE (a, (b), c) NOT IN (SELECT x, y, z FROM u)"), Some(("(".to_string(), 22, 3)));
+        assert_eq!(row("SELECT 1 FROM t WHERE NOT (a,b) IN (SELECT x, y FROM u)"), Some(("(".to_string(), 26, 2)));
+        assert_eq!(row("SELECT (a, b) IN (SELECT x, y FROM u) FROM t"), Some(("(".to_string(), 7, 2)));
+        assert_eq!(row("SELECT 1 FROM t WHERE a IN (SELECT x FROM u)"), None);
+        assert_eq!(row("SELECT 1 FROM t WHERE (a) IN (SELECT x FROM u)"), None);
+        assert_eq!(row("SELECT 1 FROM t WHERE coalesce(a, b) IN (SELECT x FROM u)"), None);
+        assert_eq!(row("SELECT 1 FROM t WHERE a NOT IN (SELECT x FROM u)"), None);
+        assert_eq!(row("SELECT 1 FROM t WHERE f(')') = 1 AND g(a, b) IN (SELECT x FROM u)"), None);
+    }
+
+    #[test]
+    fn a_null_goes_back_into_the_list() {
+        assert_eq!(list_with_null("()"), "(NULL)");
+        assert_eq!(list_with_null("(1, 2)"), "(1, 2, NULL)");
+        assert_eq!(list_with_null("(('ab ' || ''), 'c')"), "(('ab ' || ''), 'c', NULL)");
+    }
 
     #[test]
     fn a_subquery_reading_an_outer_column_is_correlated() {
@@ -923,7 +1876,9 @@ mod correlation_tests {
     fn a_self_contained_subquery_is_not_correlated() {
         assert!(!is_correlated("SELECT COUNT(*) FROM t"));
         assert!(!is_correlated("SELECT COUNT(*) FROM t WHERE t.x = 1"));
-        assert!(!is_correlated("SELECT COUNT(*) FROM t bl2 WHERE bl2.x = bl2.y"));
+        assert!(!is_correlated(
+            "SELECT COUNT(*) FROM t bl2 WHERE bl2.x = bl2.y"
+        ));
         // Unqualified columns say nothing either way, so they are not evidence.
         assert!(!is_correlated("SELECT COUNT(*) FROM t WHERE x = 1"));
     }
@@ -949,6 +1904,22 @@ mod correlation_tests {
         );
     }
 
+    /// `DELETE … USING (SELECT …) s` names a derived source, as `FROM (…)`
+    /// does: read as a value, a source of two rows failed the statement
+    /// with "returned 2 rows". A scalar subquery in its condition is still
+    /// one.
+    ///
+    /// Mutation: `"USING"` dropped from the derived-table words.
+    #[test]
+    fn a_using_source_is_not_a_scalar_subquery() {
+        assert!(find_scalar_subquery("DELETE FROM t USING (SELECT other FROM u) p WHERE p.other = t.id").is_none());
+        let found = find_scalar_subquery(
+            "DELETE FROM t USING (SELECT other FROM u) p WHERE p.other = t.id AND t.v = (SELECT max(w) FROM u)",
+        )
+        .expect("the value subquery is still found");
+        assert!(found.inner_sql.contains("max(w)"), "{}", found.inner_sql);
+    }
+
     #[test]
     fn an_uncorrelated_scalar_subquery_is_still_found() {
         // The guard must not be so broad that it stops the ordinary case.
@@ -969,8 +1940,8 @@ mod tests {
              JOIN role_ids r ON ur.role_id = r.id WHERE r.domain_id = d.id)",
         )
         .expect("should find the EXISTS");
-        let rewritten =
-            exists_to_in(&clause, &["domain".to_string(), "d".to_string()]).expect("should rewrite");
+        let rewritten = exists_to_in(&clause, &["domain".to_string(), "d".to_string()])
+            .expect("should rewrite");
         // The whole FROM survives, and the projected column keeps its qualifier
         // — `domain_id` alone would be ambiguous across the joined relations.
         assert!(rewritten.contains("JOIN role_ids r"), "{}", rewritten);
@@ -1014,7 +1985,11 @@ mod tests {
             let bytes = v.to_le_bytes();
             let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
-            Column { schema_id, data: mb, column_type: DbType::I32 }
+            Column {
+                schema_id: crate::core::row::row::schema_id_of(schema_id),
+                data: mb,
+                column_type: DbType::I32,
+            }
         }
         fn row(x: i32, y: i32) -> Row {
             Row {
@@ -1029,23 +2004,32 @@ mod tests {
             outer_refs: vec!["a.x".to_string(), "a.y".to_string()],
             negated: true,
         };
-        let predicate = multi_exists_predicate(&spec, &[row(1, 1)]).unwrap();
+        let predicate = multi_exists_predicate(&spec, &[row(1, 1)], &[]).unwrap();
         // De Morgan: "differs in at least one column", per inner row.
-        assert_eq!(predicate, "((a.x != 1 OR a.y != 1))");
+        assert_eq!(
+            predicate,
+            "(a.x IS NULL OR a.y IS NULL OR ((a.x != 1 OR a.y != 1)))"
+        );
 
         // The pair (1,1) must be excluded as a *pair*. A per-column rewrite
         // would also exclude (1,2) and (2,1), which is the bug this replaces.
-        let two = multi_exists_predicate(&spec, &[row(1, 1), row(2, 2)]).unwrap();
-        assert_eq!(two, "((a.x != 1 OR a.y != 1) AND (a.x != 2 OR a.y != 2))");
-
-        let positive = MultiCorrelatedExists { negated: false, ..spec };
+        let two = multi_exists_predicate(&spec, &[row(1, 1), row(2, 2)], &[]).unwrap();
         assert_eq!(
-            multi_exists_predicate(&positive, &[row(1, 1)]).unwrap(),
+            two,
+            "(a.x IS NULL OR a.y IS NULL OR ((a.x != 1 OR a.y != 1) AND (a.x != 2 OR a.y != 2)))"
+        );
+
+        let positive = MultiCorrelatedExists {
+            negated: false,
+            ..spec
+        };
+        assert_eq!(
+            multi_exists_predicate(&positive, &[row(1, 1)], &[]).unwrap(),
             "((a.x = 1 AND a.y = 1))"
         );
 
         // No inner rows: NOT EXISTS holds for everything, EXISTS for nothing.
-        assert_eq!(multi_exists_predicate(&positive, &[]).unwrap(), "1 = 0");
+        assert_eq!(multi_exists_predicate(&positive, &[], &[]).unwrap(), "1 = 0");
     }
 
     #[test]
@@ -1088,8 +2072,86 @@ mod tests {
         assert!(find_in_subquery("SELECT a FROM t WHERE x IN (SELECT y FROM u").is_none());
     }
 
+    fn tail(sql: &str) -> (String, ExistsBounds) {
+        let clause = find_exists(sql).expect("an EXISTS");
+        let (stripped, bounds) = strip_exists_tail(&clause).expect("strips");
+        (stripped.inner_sql, bounds)
+    }
+
+    #[test]
+    fn the_tail_of_an_exists_body_is_lifted_off() {
+        let (body, b) = tail("SELECT 1 FROM o WHERE EXISTS (SELECT 1 FROM t WHERE t.a = o.b AND t.on LIMIT 1)");
+        assert_eq!(body, "SELECT 1 FROM t WHERE t.a = o.b AND t.on");
+        assert_eq!(b, ExistsBounds { limit: Some(1), offset: 0 });
+
+        let (body, b) = tail("SELECT 1 FROM o WHERE EXISTS (SELECT 1 FROM t WHERE t.a = o.b\n ORDER  BY t.id DESC\nlimit 5 offset 2)");
+        assert_eq!(body, "SELECT 1 FROM t WHERE t.a = o.b");
+        assert_eq!(b, ExistsBounds { limit: Some(5), offset: 2 });
+
+        let (_, b) = tail("SELECT 1 FROM o WHERE EXISTS (SELECT 1 FROM t FETCH FIRST ROW ONLY)");
+        assert_eq!(b, ExistsBounds { limit: Some(1), offset: 0 });
+        let (_, b) = tail("SELECT 1 FROM o WHERE EXISTS (SELECT 1 FROM t LIMIT ALL)");
+        assert_eq!(b, ExistsBounds { limit: None, offset: 0 });
+        let (_, b) = tail("SELECT 1 FROM o WHERE NOT EXISTS (SELECT 1 FROM t LIMIT 0)");
+        assert_eq!(b.limit, Some(0));
+
+        // Nested and quoted keywords are not the body's own.
+        let (body, b) = tail(
+            "SELECT 1 FROM o WHERE EXISTS (SELECT 1 FROM t WHERE t.a = o.b AND t.c IN (SELECT c FROM u ORDER BY c LIMIT 3) AND t.n = 'LIMIT 9')",
+        );
+        assert!(body.ends_with("AND t.n = 'LIMIT 9'"), "{body}");
+        assert_eq!(b, ExistsBounds::default());
+    }
+
+    #[test]
+    fn a_correlated_exists_with_a_limit_rewrites_to_a_full_in() {
+        let sql = "SELECT id FROM o WHERE EXISTS (SELECT 1 FROM t WHERE t.a = o.b AND t.on = 1 LIMIT 1)";
+        let (clause, _) = strip_exists_tail(&find_exists(sql).unwrap()).unwrap();
+        let rewritten = exists_to_in(&clause, &["o".to_string()]).unwrap();
+        assert_eq!(rewritten, "o.b IN (SELECT a FROM t WHERE a IS NOT NULL AND (t.on = 1))");
+        assert!(!rewritten.contains("LIMIT"));
+    }
+
+    #[test]
+    fn a_correlated_exists_over_an_ungrouped_aggregate_always_holds() {
+        let clause = find_exists("SELECT id FROM o WHERE EXISTS (SELECT COUNT(*) FROM t WHERE t.a = o.b)").unwrap();
+        assert_eq!(exists_to_in(&clause, &["o".to_string()]).unwrap(), "1 = 1");
+        let clause = find_exists("SELECT id FROM o WHERE NOT EXISTS (SELECT max(t.x) FROM t WHERE t.a = o.b)").unwrap();
+        assert_eq!(exists_to_in(&clause, &["o".to_string()]).unwrap(), "1 = 0");
+        // A window function is not an aggregate: one row per match.
+        let clause = find_exists("SELECT id FROM o WHERE EXISTS (SELECT count(*) OVER () FROM t WHERE t.a = o.b)").unwrap();
+        assert!(exists_to_in(&clause, &["o".to_string()]).unwrap().contains(" IN ("));
+        // GROUP BY in a correlated body is refused rather than mangled.
+        let clause = find_exists("SELECT id FROM o WHERE EXISTS (SELECT 1 FROM t WHERE t.a = o.b GROUP BY a)").unwrap();
+        assert!(exists_to_in(&clause, &["o".to_string()]).is_err());
+    }
+
+    #[test]
+    fn not_in_records_where_its_not_begins() {
+        let sql = "SELECT a FROM t WHERE x NOT  IN (SELECT y FROM u)";
+        let found = find_in_subquery(sql).unwrap();
+        assert_eq!(&sql[found.negated_start.unwrap()..found.start], "NOT  IN ");
+        assert!(find_in_subquery("SELECT a FROM t WHERE x IN (SELECT y FROM u)").unwrap().negated_start.is_none());
+        assert!(find_in_subquery("SELECT a FROM t WHERE knot IN (SELECT y FROM u)").unwrap().negated_start.is_none());
+    }
+
     #[test]
     fn empty_results_render_as_an_empty_list() {
-        assert_eq!(rows_to_value_list(&[]).unwrap(), "()");
+        assert_eq!(rows_to_value_list(&[], false, true).unwrap(), ("()".to_string(), false));
+    }
+
+    /// The cheap guard must never turn a finding into `None`: lower case,
+    /// mixed case and a keyword only after the parenthesis all still match.
+    #[test]
+    fn the_guard_keeps_every_subquery_the_scan_finds() {
+        assert!(find_in_subquery("select a from t where b in (select c from u)").is_some());
+        assert!(find_in_subquery("SELECT a FROM t WHERE b IN (SeLeCt c FROM u)").is_some());
+        assert!(find_scalar_subquery("update t set a = (select max(b) from u)").is_some());
+        assert!(find_exists("select 1 from t where exists (select 1 from u)").is_some());
+        assert!(find_exists("SELECT 1 FROM t WHERE NOT EXISTS (SELECT 1 FROM u)").is_some());
+        // And it says no exactly where the scan could not say yes.
+        for sql in ["UPDATE acc SET balance = 70 WHERE id = 10", "SELECT selection FROM t", "INSERT INTO t VALUES (1)"] {
+            assert!(find_in_subquery(sql).is_none() && find_scalar_subquery(sql).is_none() && find_exists(sql).is_none());
+        }
     }
 }

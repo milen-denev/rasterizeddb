@@ -248,41 +248,65 @@ async fn the_driver_transaction_api_works() {
     assert_eq!(count(&pool, "SELECT id FROM t").await, 1);
 }
 
-/// Two transactions updating the same row must not both succeed. If they did,
-/// each would relocate from the same base version and both replacements would
-/// be visible once committed — the row duplicated, and one update lost.
+/// Two transactions updating the same row must not both succeed as if the
+/// other had not. If they did, each would relocate from the same base
+/// version and both replacements would be visible once committed: the row
+/// duplicated, and one update lost.
+///
+/// At READ COMMITTED (the default) the second updater waits for the first,
+/// as PostgreSQL's does, and then applies its change to the committed row
+/// (`rc_waits`): one row, the second's value. At REPEATABLE READ it is told
+/// to retry once the first commits (40001).
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_updates_to_one_row_do_not_both_win() {
-    let (server, pool) = server().await;
-    table(&pool).await;
-    run(&pool, "INSERT INTO t (id, name) VALUES (1, 'start')").await.expect("insert");
+    for (level, expect) in [("READ COMMITTED", Some("second")), ("REPEATABLE READ", None)] {
+        let (server, pool) = server().await;
+        table(&pool).await;
+        run(&pool, "INSERT INTO t (id, name) VALUES (1, 'start')").await.expect("insert");
 
-    let mut first = conn(&server).await;
-    let mut second = conn(&server).await;
+        let mut first = conn(&server).await;
+        let mut second = conn(&server).await;
 
-    exec(&mut first, "BEGIN").await.expect("begin");
-    exec(&mut second, "BEGIN").await.expect("begin");
+        exec(&mut first, "BEGIN").await.expect("begin");
+        exec(&mut second, &format!("BEGIN ISOLATION LEVEL {level}")).await.expect("begin");
+        // The second's snapshot is taken before the first's update.
+        exec(&mut second, "SELECT 1").await.expect("snapshot");
 
-    exec(&mut first, "UPDATE t SET name = 'first' WHERE id = 1").await.expect("first update");
-    let conflict = exec(&mut second, "UPDATE t SET name = 'second' WHERE id = 1")
-        .await
-        .expect_err("the second updater must be told to retry");
-    assert!(
-        conflict.to_ascii_lowercase().contains("serialize"),
-        "the error must say why it can be retried: {}",
-        conflict
-    );
+        exec(&mut first, "UPDATE t SET name = 'first' WHERE id = 1").await.expect("first update");
+        let waiter = tokio::spawn(async move {
+            let out = exec(&mut second, "UPDATE t SET name = 'second' WHERE id = 1").await;
+            (second, out)
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        exec(&mut first, "COMMIT").await.expect("commit");
+        let (mut second, out) = tokio::time::timeout(std::time::Duration::from_secs(20), waiter)
+            .await
+            .unwrap_or_else(|_| panic!("{level}: the second updater never ended"))
+            .expect("join");
+        match expect {
+            Some(_) => {
+                out.unwrap_or_else(|e| panic!("{level}: the second updater failed: {e}"));
+                exec(&mut second, "COMMIT").await.expect("commit");
+            }
+            None => {
+                let conflict = out.expect_err("the second updater must be told to retry");
+                assert!(
+                    conflict.to_ascii_lowercase().contains("serialize"),
+                    "the error must say why it can be retried: {}",
+                    conflict
+                );
+                exec(&mut second, "ROLLBACK").await.expect("rollback");
+            }
+        }
 
-    exec(&mut first, "COMMIT").await.expect("commit");
-    exec(&mut second, "ROLLBACK").await.expect("rollback");
-
-    // Exactly one row, holding the winner's value.
-    let all = sqlx::query("SELECT name FROM t WHERE id = 1")
-        .fetch_all(&pool)
-        .await
-        .expect("select");
-    assert_eq!(all.len(), 1, "the row must not have been duplicated");
-    assert_eq!(all[0].try_get::<String, _>("name").unwrap(), "first");
+        // Exactly one row, holding the value that won.
+        let all = sqlx::query("SELECT name FROM t WHERE id = 1")
+            .fetch_all(&pool)
+            .await
+            .expect("select");
+        assert_eq!(all.len(), 1, "{level}: the row must not have been duplicated");
+        assert_eq!(all[0].try_get::<String, _>("name").unwrap(), expect.unwrap_or("first"), "{level}");
+    }
 }
 
 /// A conflict against a transaction that then aborts is not a conflict: the
@@ -313,26 +337,45 @@ async fn an_aborted_writer_releases_the_row() {
     assert_eq!(all[0].try_get::<String, _>("name").unwrap(), "second");
 }
 
-/// A delete racing an update is the same conflict by another route.
+/// A delete racing an update is the same conflict by another route. At
+/// READ COMMITTED the deleter waits for the updater; the updater rolls back,
+/// so the delete removes the row. At REPEATABLE READ, against an updater
+/// that commits, the deleter is told to retry.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delete_conflicts_with_a_concurrent_update() {
-    let (server, pool) = server().await;
-    table(&pool).await;
-    run(&pool, "INSERT INTO t (id, name) VALUES (1, 'start')").await.expect("insert");
+    for (level, first_ends) in [("READ COMMITTED", "ROLLBACK"), ("REPEATABLE READ", "COMMIT")] {
+        let (server, pool) = server().await;
+        table(&pool).await;
+        run(&pool, "INSERT INTO t (id, name) VALUES (1, 'start')").await.expect("insert");
 
-    let mut first = conn(&server).await;
-    let mut second = conn(&server).await;
-    exec(&mut first, "BEGIN").await.expect("begin");
-    exec(&mut second, "BEGIN").await.expect("begin");
+        let mut first = conn(&server).await;
+        let mut second = conn(&server).await;
+        exec(&mut first, "BEGIN").await.expect("begin");
+        exec(&mut second, &format!("BEGIN ISOLATION LEVEL {level}")).await.expect("begin");
+        exec(&mut second, "SELECT 1").await.expect("snapshot");
 
-    exec(&mut first, "UPDATE t SET name = 'first' WHERE id = 1").await.expect("update");
-    let conflict = exec(&mut second, "DELETE FROM t WHERE id = 1")
-        .await
-        .expect_err("the deleter must be told to retry");
-    assert!(conflict.to_ascii_lowercase().contains("serialize"), "{}", conflict);
-
-    exec(&mut first, "ROLLBACK").await.expect("rollback");
-    exec(&mut second, "ROLLBACK").await.expect("rollback");
+        exec(&mut first, "UPDATE t SET name = 'first' WHERE id = 1").await.expect("update");
+        let waiter = tokio::spawn(async move {
+            let out = exec(&mut second, "DELETE FROM t WHERE id = 1").await;
+            (second, out)
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        exec(&mut first, first_ends).await.expect("first ends");
+        let (mut second, out) = tokio::time::timeout(std::time::Duration::from_secs(20), waiter)
+            .await
+            .unwrap_or_else(|_| panic!("{level}: the deleter never ended"))
+            .expect("join");
+        if first_ends == "ROLLBACK" {
+            out.unwrap_or_else(|e| panic!("{level}: the delete failed: {e}"));
+            exec(&mut second, "COMMIT").await.expect("commit");
+            assert_eq!(count(&pool, "SELECT id FROM t").await, 0, "{level}: the delete did not land");
+        } else {
+            let conflict = out.expect_err("the deleter must be told to retry");
+            assert!(conflict.to_ascii_lowercase().contains("serialize"), "{}", conflict);
+            exec(&mut second, "ROLLBACK").await.expect("rollback");
+            assert_eq!(count(&pool, "SELECT id FROM t").await, 1, "{level}");
+        }
+    }
 }
 
 /// The default is `READ COMMITTED`: a statement sees whatever has committed by
@@ -1064,6 +1107,24 @@ async fn commit_and_chain_opens_the_next_block() {
     assert_eq!(count(&pool, "SELECT * FROM t").await, 2);
 }
 
+/// A statement that merely ends `AND chain` is not a misplaced `AND CHAIN`.
+/// Every statement used to be matched against the suffix, so a filter on a
+/// boolean column named `chain` was refused with 42601, as was an `UPDATE`
+/// with that `WHERE`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_column_named_chain_is_not_and_chain() {
+    let (server, pool) = server().await;
+    run(&pool, "CREATE TABLE links (id INT PRIMARY KEY, chain BOOLEAN)").await.expect("create");
+    run(&pool, "INSERT INTO links (id, chain) VALUES (1, true), (2, false)").await.expect("insert");
+
+    let mut c = conn(&server).await;
+    exec(&mut c, "SELECT id FROM links WHERE id = 1 AND chain").await.expect("a filter on `chain`");
+    exec(&mut c, "UPDATE links SET id = id WHERE id > 0 and chain").await.expect("an update filtered on `chain`");
+    assert_eq!(count(&pool, "SELECT id FROM links WHERE id > 0 AND chain").await, 1);
+    // The real one is still refused off COMMIT and ROLLBACK, as PostgreSQL does.
+    assert!(exec(&mut c, "BEGIN AND CHAIN").await.is_err());
+}
+
 /// `SHOW` answers the parameters drivers read at start-up from the session,
 /// and refuses one this server does not have rather than answering "".
 #[tokio::test(flavor = "multi_thread")]
@@ -1192,4 +1253,266 @@ async fn rollback_to_savepoint_restores_the_setting() {
     assert_eq!(show(&mut c, "synchronous_commit").await, "off");
     exec(&mut c, "COMMIT").await.expect("commit");
     assert_eq!(show(&mut c, "synchronous_commit").await, "on");
+}
+
+/// `SET default_transaction_isolation` used to be acknowledged and dropped:
+/// the next `BEGIN` ran READ COMMITTED, saw another session's commit, and
+/// `SHOW transaction_isolation` said read committed. Now it is what a
+/// `BEGIN` naming no level inherits, as in PostgreSQL 17, with `RESET`,
+/// `DEFAULT`, `SET LOCAL` and the other spellings, and a value it does not
+/// take is refused (22023) rather than dropped.
+///
+/// Mutation: the `default_transaction_isolation` arm in
+/// `handle_builtin_query` removed (the blanket `SET` takes it: the block sees
+/// the concurrent insert, `SHOW` says read committed).
+#[tokio::test(flavor = "multi_thread")]
+async fn default_transaction_isolation_sets_the_next_blocks_level() {
+    let (server, pool) = server().await;
+    table(&pool).await;
+    run(&pool, "INSERT INTO t (id, name) VALUES (1, 'a')").await.expect("insert");
+
+    let mut c = conn(&server).await;
+    assert_eq!(show(&mut c, "default_transaction_isolation").await, "read committed");
+    exec(&mut c, "SET default_transaction_isolation = 'repeatable read'").await.expect("set");
+    assert_eq!(show(&mut c, "default_transaction_isolation").await, "repeatable read");
+    exec(&mut c, "BEGIN").await.expect("begin");
+    assert_eq!(show(&mut c, "transaction_isolation").await, "repeatable read");
+    assert_eq!(rows(&mut c, "SELECT id FROM t").await, 1);
+    run(&pool, "INSERT INTO t (id, name) VALUES (2, 'b')").await.expect("insert");
+    assert_eq!(rows(&mut c, "SELECT id FROM t").await, 1, "a concurrent insert became visible in a REPEATABLE READ block");
+    exec(&mut c, "COMMIT").await.expect("commit");
+
+    // The other spellings PostgreSQL takes, over the simple protocol too.
+    for (sql, want) in [
+        ("SET default_transaction_isolation TO serializable", "repeatable read"),
+        ("SET SESSION default_transaction_isolation = 'READ COMMITTED'", "read committed"),
+        ("SET default_transaction_isolation = \"repeatable read\"", "repeatable read"),
+        ("SET default_transaction_isolation = 'read uncommitted'", "read committed"),
+        ("SET default_transaction_isolation = 'repeatable read'", "repeatable read"),
+    ] {
+        sqlx::raw_sql(AssertSqlSafe(sql)).execute(&mut c).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(show(&mut c, "default_transaction_isolation").await, want, "{sql}");
+    }
+
+    // A value it does not take is refused and changes nothing.
+    for bad in ["SET default_transaction_isolation = 'bogus'", "SET default_transaction_isolation = repeatable"] {
+        assert_eq!(sqlstate(&mut c, bad).await.as_deref(), Some("22023"), "{bad}");
+        assert_eq!(show(&mut c, "default_transaction_isolation").await, "repeatable read", "{bad}");
+    }
+
+    // SET LOCAL outside a block changes nothing; inside one it lasts until
+    // the block ends.
+    exec(&mut c, "SET LOCAL default_transaction_isolation = 'read committed'").await.expect("set local");
+    assert_eq!(show(&mut c, "default_transaction_isolation").await, "repeatable read");
+    exec(&mut c, "BEGIN").await.expect("begin");
+    exec(&mut c, "SET LOCAL default_transaction_isolation = 'read committed'").await.expect("set local");
+    assert_eq!(show(&mut c, "default_transaction_isolation").await, "read committed");
+    exec(&mut c, "COMMIT").await.expect("commit");
+    assert_eq!(show(&mut c, "default_transaction_isolation").await, "repeatable read");
+
+    // RESET and DEFAULT go back to READ COMMITTED, and a block sees commits again.
+    exec(&mut c, "RESET default_transaction_isolation").await.expect("reset");
+    assert_eq!(show(&mut c, "default_transaction_isolation").await, "read committed");
+    exec(&mut c, "BEGIN").await.expect("begin");
+    assert_eq!(show(&mut c, "transaction_isolation").await, "read committed");
+    let before = rows(&mut c, "SELECT id FROM t").await;
+    run(&pool, "INSERT INTO t (id, name) VALUES (3, 'c')").await.expect("insert");
+    assert_eq!(rows(&mut c, "SELECT id FROM t").await, before + 1, "a READ COMMITTED block missed a commit");
+    exec(&mut c, "COMMIT").await.expect("commit");
+    exec(&mut c, "SET default_transaction_isolation = 'repeatable read'").await.expect("set");
+    exec(&mut c, "SET default_transaction_isolation = DEFAULT").await.expect("default");
+    assert_eq!(show(&mut c, "default_transaction_isolation").await, "read committed");
+
+    // SET SESSION CHARACTERISTICS sets the same thing SHOW reads back.
+    exec(&mut c, "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ").await.expect("set");
+    assert_eq!(show(&mut c, "default_transaction_isolation").await, "repeatable read");
+    exec(&mut c, "RESET default_transaction_isolation").await.expect("reset");
+
+    // SET TRANSACTION outside a block has no transaction to apply to: it
+    // changes nothing (it used to set the session default).
+    exec(&mut c, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await.expect("set transaction");
+    assert_eq!(show(&mut c, "default_transaction_isolation").await, "read committed");
+    exec(&mut c, "BEGIN").await.expect("begin");
+    assert_eq!(show(&mut c, "transaction_isolation").await, "read committed");
+    // `SET transaction_isolation` inside a block is `SET TRANSACTION`.
+    exec(&mut c, "SET transaction_isolation = 'repeatable read'").await.expect("set");
+    assert_eq!(show(&mut c, "transaction_isolation").await, "repeatable read");
+    let before = rows(&mut c, "SELECT id FROM t").await;
+    run(&pool, "INSERT INTO t (id, name) VALUES (4, 'd')").await.expect("insert");
+    assert_eq!(rows(&mut c, "SELECT id FROM t").await, before, "SET transaction_isolation was dropped");
+    exec(&mut c, "COMMIT").await.expect("commit");
+    assert_eq!(sqlstate(&mut c, "SET transaction_isolation = 'bogus'").await.as_deref(), Some("22023"));
+
+    // default_transaction_read_only likewise.
+    exec(&mut c, "SET default_transaction_read_only = on").await.expect("set");
+    assert_eq!(show(&mut c, "default_transaction_read_only").await, "on");
+    assert_eq!(sqlstate(&mut c, "DELETE FROM t WHERE id = 1").await.as_deref(), Some("25006"));
+    assert_eq!(sqlstate(&mut c, "SET default_transaction_read_only = 'maybe'").await.as_deref(), Some("22023"));
+    assert_eq!(show(&mut c, "default_transaction_read_only").await, "on");
+    exec(&mut c, "RESET default_transaction_read_only").await.expect("reset");
+    assert_eq!(show(&mut c, "default_transaction_read_only").await, "off");
+    exec(&mut c, "DELETE FROM t WHERE id = 1").await.expect("a write after the reset");
+}
+
+/// Simple-protocol helpers: nothing here is cached as a prepared statement,
+/// so `DISCARD ALL` deallocating them cannot trip the driver.
+async fn raw(c: &mut sqlx::PgConnection, sql: &str) -> Result<(), String> {
+    use sqlx::Executor;
+    c.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string())))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.as_database_error().and_then(|d| d.code().map(|c| c.to_string())).unwrap_or_else(|| e.to_string()))
+}
+
+async fn raw_show(c: &mut sqlx::PgConnection, parameter: &str) -> String {
+    use sqlx::Executor;
+    let rows = c
+        .fetch_all(sqlx::raw_sql(AssertSqlSafe(format!("SHOW {parameter}"))))
+        .await
+        .unwrap_or_else(|e| panic!("SHOW {parameter}: {e}"));
+    rows[0].try_get::<String, _>(0).unwrap()
+}
+
+/// Every setting a `SET` stores, with a value other than its default.
+const SESSION_SETS: &[(&str, &str)] = &[
+    ("SET default_transaction_isolation = 'repeatable read'", "default_transaction_isolation"),
+    ("SET default_transaction_read_only = on", "default_transaction_read_only"),
+    ("SET statement_timeout = 5000", "statement_timeout"),
+    ("SET lock_timeout = '3s'", "lock_timeout"),
+    ("SET synchronous_commit = off", "synchronous_commit"),
+    ("SET idle_in_transaction_session_timeout = '17s'", "idle_in_transaction_session_timeout"),
+    ("SET idle_session_timeout = '19s'", "idle_session_timeout"),
+    ("SET rdb.shape_change = error", "rdb.shape_change"),
+];
+
+async fn session_settings(c: &mut sqlx::PgConnection) -> Vec<String> {
+    let mut out = Vec::new();
+    for (_, name) in SESSION_SETS {
+        out.push(raw_show(c, name).await);
+    }
+    out
+}
+
+/// A pool clears a connection between borrowers with `DISCARD ALL` (Npgsql
+/// does); both it and `RESET ALL` failed as a syntax error, so once the
+/// transaction characteristics were real, one borrower's `SET
+/// default_transaction_isolation` decided the next borrower's blocks. Now
+/// `RESET ALL` puts every setting a `SET` stores back to its default and
+/// `DISCARD ALL` does that, deallocates the prepared statements and closes
+/// the portals, refused inside a block (25001) as in PostgreSQL 17.
+///
+/// Mutation: `reset_or_discard` answering `DISCARD ALL` without
+/// `reset_all` (the second borrow inherits every setting).
+#[tokio::test(flavor = "multi_thread")]
+async fn discard_all_gives_the_next_borrower_a_clean_session() {
+    let (server, pool) = server().await;
+    table(&pool).await;
+
+    let mut probe = conn(&server).await;
+    let defaults = session_settings(&mut probe).await;
+    drop(probe);
+
+    // One connection, cleared on release the way a pool's reset query does.
+    let pooled = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_release(|c, _| {
+            Box::pin(async move {
+                use sqlx::Executor;
+                c.execute(sqlx::raw_sql("DISCARD ALL")).await?;
+                Ok(true)
+            })
+        })
+        .connect(&server.url())
+        .await
+        .expect("pool");
+    {
+        let mut first = pooled.acquire().await.unwrap();
+        for (set, _) in SESSION_SETS {
+            raw(&mut first, set).await.unwrap_or_else(|e| panic!("{set}: {e}"));
+        }
+        let changed = session_settings(&mut first).await;
+        for (i, (set, _)) in SESSION_SETS.iter().enumerate() {
+            assert_ne!(changed[i], defaults[i], "{set} changed nothing, so this tests nothing");
+        }
+    }
+    {
+        let mut second = pooled.acquire().await.unwrap();
+        assert_eq!(session_settings(&mut second).await, defaults, "the next borrower inherited the last one's settings");
+        raw(&mut second, "BEGIN").await.unwrap();
+        assert_eq!(raw_show(&mut second, "transaction_isolation").await, "read committed");
+        raw(&mut second, "INSERT INTO t (id, name) VALUES (1, 'a')").await.expect("a write after the borrow (not read-only)");
+        raw(&mut second, "COMMIT").await.unwrap();
+    }
+
+    // RESET ALL on its own.
+    let mut c = conn(&server).await;
+    for (set, _) in SESSION_SETS {
+        raw(&mut c, set).await.unwrap();
+    }
+    raw(&mut c, "RESET ALL").await.expect("RESET ALL");
+    assert_eq!(session_settings(&mut c).await, defaults, "RESET ALL left a setting");
+
+    // DISCARD ALL is refused inside a block, which it fails; the others run.
+    raw(&mut c, "BEGIN").await.unwrap();
+    raw(&mut c, "DISCARD PLANS").await.expect("DISCARD PLANS in a block");
+    raw(&mut c, "DISCARD TEMP").await.expect("DISCARD TEMP in a block");
+    raw(&mut c, "DISCARD SEQUENCES").await.expect("DISCARD SEQUENCES in a block");
+    raw(&mut c, "SET default_transaction_read_only = on").await.unwrap();
+    assert_eq!(raw(&mut c, "DISCARD ALL").await, Err("25001".to_string()));
+    assert_eq!(raw(&mut c, "SELECT id FROM t").await, Err("25P02".to_string()), "the refusal did not fail the block");
+    raw(&mut c, "ROLLBACK").await.unwrap();
+    assert_eq!(raw_show(&mut c, "default_transaction_read_only").await, "on", "a refused DISCARD ALL reset something");
+
+    // DISCARD ALL deallocates prepared statements: the driver's cached one
+    // is gone until it prepares again.
+    let mut p = conn(&server).await;
+    let first = sqlx::query("SELECT id FROM t").fetch_all(&mut p).await.expect("prepared");
+    raw(&mut p, "DISCARD ALL").await.expect("DISCARD ALL");
+    assert!(sqlx::query("SELECT id FROM t").fetch_all(&mut p).await.is_err(), "a prepared statement survived DISCARD ALL");
+    use sqlx::Connection;
+    p.clear_cached_statements().await.unwrap();
+    let again = sqlx::query("SELECT id FROM t").fetch_all(&mut p).await.expect("prepared again");
+    assert_eq!(again.len(), first.len());
+}
+
+/// After a statement has run in a block its level is fixed: PostgreSQL 17
+/// refuses `SET transaction_isolation` and `SET TRANSACTION ISOLATION LEVEL`
+/// with 25001 ("must be called before
+/// any query") and fails the block. Here they pinned a snapshot mid-block, so
+/// the block saw other sessions' commits until the SET and none after. The
+/// same level, and a change before any statement, are allowed.
+///
+/// Mutation: `isolation_change_refusal` ignoring `queried`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_isolation_level_is_fixed_once_a_block_has_queried() {
+    let (server, pool) = server().await;
+    table(&pool).await;
+    let mut c = conn(&server).await;
+
+    for set in ["SET transaction_isolation = 'repeatable read'", "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"] {
+        raw(&mut c, "BEGIN").await.unwrap();
+        raw(&mut c, "SELECT id FROM t").await.unwrap();
+        assert_eq!(raw(&mut c, set).await, Err("25001".to_string()), "{set}");
+        assert_eq!(raw(&mut c, "SELECT id FROM t").await, Err("25P02".to_string()), "{set}: the block did not fail");
+        raw(&mut c, "ROLLBACK").await.unwrap();
+    }
+    // The same level after a query, and any level before one.
+    raw(&mut c, "BEGIN").await.unwrap();
+    raw(&mut c, "SELECT id FROM t").await.unwrap();
+    raw(&mut c, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED").await.expect("the same level");
+    raw(&mut c, "COMMIT").await.unwrap();
+    raw(&mut c, "BEGIN").await.unwrap();
+    assert_eq!(raw_show(&mut c, "transaction_isolation").await, "read committed");
+    raw(&mut c, "SET transaction_isolation = 'repeatable read'").await.expect("before any query");
+    raw(&mut c, "COMMIT").await.unwrap();
+    // Through a prepared statement's learned parse too: two executions with
+    // different values teach it, and the one in the block takes the fast
+    // path (`execute_prepared`), which the text path's marking never sees.
+    for v in 0..3 {
+        sqlx::query("SELECT id FROM t WHERE id > $1").bind(v).fetch_all(&mut c).await.unwrap();
+    }
+    raw(&mut c, "BEGIN").await.unwrap();
+    sqlx::query("SELECT id FROM t WHERE id > $1").bind(7).fetch_all(&mut c).await.unwrap();
+    assert_eq!(raw(&mut c, "SET transaction_isolation = 'repeatable read'").await, Err("25001".to_string()), "after a prepared read");
+    raw(&mut c, "ROLLBACK").await.unwrap();
 }

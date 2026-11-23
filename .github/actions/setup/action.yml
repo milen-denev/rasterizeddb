@@ -1,0 +1,28 @@
+name: Rust toolchain and build tools
+description: Stable Rust for one target, the C toolchain its native crates need, and a build cache.
+inputs:
+  target:
+    description: Rust target triple
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ inputs.target }}
+
+    # aws-lc-sys (rustls' provider, and rcgen's) and ring build C and
+    # assembly. On Windows ARM64 that needs clang; the image usually has
+    # LLVM, and this installs it when it does not.
+    - name: clang for Windows ARM64
+      if: runner.os == 'Windows' && runner.arch == 'ARM64'
+      shell: pwsh
+      run: |
+        if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
+          choco install llvm -y --no-progress
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        }
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.target }}

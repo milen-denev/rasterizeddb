@@ -37,9 +37,6 @@ async fn setup(pool: &sqlx::PgPool) {
         .expect("s2");
 }
 
-/// Ignored: the feature does not exist yet — see the refusal test below, which
-/// pins the behaviour that replaced silently dropping the column.
-#[ignore = "open: computed select items over a join are refused, not evaluated"]
 #[tokio::test]
 async fn a_computed_item_is_returned_from_a_join() {
     let (_s, pool) = server().await;
@@ -67,7 +64,6 @@ async fn a_computed_item_is_returned_from_a_join() {
 }
 
 /// Arithmetic, not just a function — same question, different item kind.
-#[ignore = "open: computed select items over a join are refused, not evaluated"]
 #[tokio::test]
 async fn an_arithmetic_item_is_returned_from_a_join() {
     let (_s, pool) = server().await;
@@ -82,34 +78,53 @@ async fn an_arithmetic_item_is_returned_from_a_join() {
     assert_eq!(row.try_get::<i32, _>("plus").expect("plus must be in the result"), 11);
 }
 
-/// Until it is evaluated, it must be refused rather than dropped.
+/// Every computed shape must come back with its column *and* the right value.
 ///
-/// This is the fix: the item used to be set aside for an aggregate stage that
-/// never formed, so the statement succeeded with the column simply absent —
-/// which reaches a client as "no column found for name: eff", an error about
-/// its own query that names nothing leading back here.
+/// This replaces a test that asserted these were refused. The refusal was the
+/// previous fix for a worse bug — the item was set aside for an aggregate stage
+/// that never formed, so the statement succeeded with the column simply absent,
+/// which reaches a client as "no column found for name: eff". They are
+/// evaluated over the combined row now, so the original concern is checked
+/// directly: the column is present and holds what it should.
 #[tokio::test]
-async fn a_computed_item_is_refused_not_dropped() {
+async fn every_computed_shape_is_evaluated_not_dropped() {
     let (_s, pool) = server().await;
     setup(&pool).await;
 
-    for sql in [
-        "SELECT t.id AS id, COALESCE(s.a, t.b) AS eff FROM t JOIN s ON s.t_id = t.id",
-        "SELECT t.id AS id, (t.b + 1) AS plus FROM t JOIN s ON s.t_id = t.id",
-        "SELECT t.id AS id, UPPER(t.name) AS up FROM t JOIN s ON s.t_id = t.id",
-    ] {
-        let err = sqlx::query(sql)
-            .fetch_all(&pool)
-            .await
-            .expect_err(&format!("must be refused, not silently dropped: {}", sql));
-        let text = err.to_string();
-        assert!(
-            text.contains("not supported yet"),
-            "{} -> {}",
-            sql,
-            text
-        );
-    }
+    // Row 1 takes `s.a` (99); row 2's `s.a` is NULL so it falls through to
+    // `t.b` (20) — the fallback, not the emptiness.
+    let rows = sqlx::query(
+        "SELECT t.id AS id, COALESCE(s.a, t.b) AS eff FROM t JOIN s ON s.t_id = t.id ORDER BY t.id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("COALESCE over a join");
+    assert_eq!(
+        rows.iter().map(|r| r.get::<i32, _>("eff")).collect::<Vec<_>>(),
+        vec![99, 20]
+    );
+
+    let rows = sqlx::query(
+        "SELECT t.id AS id, (t.b + 1) AS plus FROM t JOIN s ON s.t_id = t.id ORDER BY t.id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("arithmetic over a join");
+    assert_eq!(
+        rows.iter().map(|r| r.get::<i32, _>("plus")).collect::<Vec<_>>(),
+        vec![11, 21]
+    );
+
+    let rows = sqlx::query(
+        "SELECT t.id AS id, UPPER(t.name) AS up FROM t JOIN s ON s.t_id = t.id ORDER BY t.id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("a text function over a join");
+    assert_eq!(
+        rows.iter().map(|r| r.get::<String, _>("up")).collect::<Vec<_>>(),
+        vec!["ONE".to_string(), "TWO".to_string()]
+    );
 
     // A plain column list still works, so the guard has not widened.
     let rows = sqlx::query("SELECT t.id AS id, s.a AS a FROM t JOIN s ON s.t_id = t.id ORDER BY t.id")

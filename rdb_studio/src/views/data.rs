@@ -53,8 +53,12 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
 
     let grid = result_grid(
         &studio.data,
-        super::GridLayout::new(studio, format!("data:{}", table))
-            .virtualised(studio.data_viewport, Message::DataScrolled),
+        // The server did the sorting: this grid holds one page of the table,
+        // and reordering the page here would rearrange a hundred arbitrary rows
+        // under a heading that claims to order the whole thing.
+        super::GridLayout::new(studio, format!("{}{}", super::DATA_SCOPE, table))
+            .virtualised(studio.data_viewport, Message::DataScrolled)
+            .sorted_by_server(),
         move |index| numeric.get(index).copied().unwrap_or(false),
         move |row_index, column_index, value| {
             let is_editing = editing
@@ -121,6 +125,7 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
 
     let body = column![
         key_note(&key, table),
+        filter_bar(studio),
         insert_row(studio),
         grid,
         footer(studio),
@@ -133,6 +138,7 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
             row![
                 small_button("INSERT ROW", editable.then_some(Message::BeginInsert)),
                 small_button("ADD COLUMN", Some(Message::OpenModal(ModalKind::AddColumn))),
+                small_button("IMPORT CSV", Some(Message::ImportCsv)),
                 small_button("REFRESH", Some(Message::SelectTable(table.to_string()))),
                 // Labelled for what it is. Exporting page 3 and getting a file
                 // called `users.csv` invites someone to think they have the
@@ -179,6 +185,37 @@ fn key_note<'a>(key: &Option<RowKey>, table: &str) -> Element<'a, Message> {
         .style(theme::error_box)
         .into(),
     }
+}
+
+/// A condition the page is read under, as written after `WHERE`.
+fn filter_bar(studio: &Studio) -> Element<'_, Message> {
+    let applied = studio.data_filter_applied.as_ref();
+    let stale = applied.map(|f| f.text()) != Some(studio.data_filter.trim())
+        && !(applied.is_none() && studio.data_filter.trim().is_empty());
+    row![
+        text("WHERE").size(11).font(theme::MONO).color(if applied.is_some() {
+            theme::RUST
+        } else {
+            theme::TEXT_FAINT
+        }),
+        text_input("a condition, e.g.  status = 'open' AND total > 100", &studio.data_filter)
+            .on_input(Message::DataFilter)
+            .on_submit(Message::ApplyDataFilter)
+            .padding([4, 6])
+            .size(12)
+            .font(theme::MONO)
+            .style(theme::input)
+            .width(Fill),
+        small_button("FILTER", stale.then_some(Message::ApplyDataFilter)),
+        small_button(
+            "CLEAR",
+            (applied.is_some() || !studio.data_filter.is_empty())
+                .then_some(Message::ClearDataFilter),
+        ),
+    ]
+    .spacing(6)
+    .align_y(Center)
+    .into()
 }
 
 fn insert_row(studio: &Studio) -> Element<'_, Message> {
@@ -259,9 +296,10 @@ fn footer(studio: &Studio) -> Element<'_, Message> {
         format!("rows {}–{}", count(first as u64 + 1), count((first + shown) as u64))
     };
 
-    let total = match studio.data_total {
-        Some(total) => format!("of {}", count(total)),
-        None => String::new(),
+    let total = match (studio.data_total, studio.data_filter_applied.is_some()) {
+        (Some(total), false) => format!("of {}", count(total)),
+        (Some(total), true) => format!("of {} matching", count(total)),
+        (None, _) => String::new(),
     };
 
     row![

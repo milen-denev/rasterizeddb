@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! "RDBA" u32 | version u8 | pad u8 x3 | entry_count u32
-//! per entry: name_len u16 | name utf-8 | data_len u64 | crc32 u32 | data
+//! per entry: name_len u16 | name utf-8 | data_len u64 | data | crc32 u32
 //! ```
 //!
 //! Written into a zstd stream, so the numbers above are what the *compressor*
@@ -64,24 +64,27 @@ impl<W: Write> ArchiveWriter<W> {
     /// everything written after that. Reading to EOF instead would record a
     /// length that no longer matched the bytes already declared.
     pub fn add_file(&mut self, name: &str, path: &Path) -> io::Result<u64> {
-        let file = File::open(path)?;
+        self.add_open_file(name, File::open(path)?)
+    }
+
+    /// [`ArchiveWriter::add_file`] for a file the caller opened, so it can
+    /// tell a file that is gone from a failure to copy one that is there.
+    pub fn add_open_file(&mut self, name: &str, file: File) -> io::Result<u64> {
         let len = file.metadata()?.len();
         self.add_reader(name, len, &mut BufReader::with_capacity(256 * 1024, file))
     }
 
-    pub fn add_reader(
-        &mut self,
-        name: &str,
-        len: u64,
-        source: &mut impl Read,
-    ) -> io::Result<u64> {
+    pub fn add_reader(&mut self, name: &str, len: u64, source: &mut impl Read) -> io::Result<u64> {
         let name_bytes = name.as_bytes();
         if name_bytes.len() > MAX_NAME_LEN {
-            return Err(io::Error::other(format!("archive entry name too long: {name}")));
+            return Err(io::Error::other(format!(
+                "archive entry name too long: {name}"
+            )));
         }
 
         // Header first, so the reader knows how much to expect.
-        self.sink.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
+        self.sink
+            .write_all(&(name_bytes.len() as u16).to_le_bytes())?;
         self.sink.write_all(name_bytes)?;
         self.sink.write_all(&len.to_le_bytes())?;
 
@@ -154,7 +157,9 @@ pub fn unpack(source: &mut impl Read, target_dir: &Path) -> io::Result<Vec<Entry
         source.read_exact(&mut name_len)?;
         let name_len = u16::from_le_bytes(name_len) as usize;
         if name_len == 0 || name_len > MAX_NAME_LEN {
-            return Err(io::Error::other("snapshot archive has a malformed entry name"));
+            return Err(io::Error::other(
+                "snapshot archive has a malformed entry name",
+            ));
         }
 
         let mut name_bytes = vec![0u8; name_len];
@@ -205,8 +210,35 @@ pub fn unpack(source: &mut impl Read, target_dir: &Path) -> io::Result<Vec<Entry
             )));
         }
 
-        log::debug!("restored {} ({} bytes, entry {}/{})", name, len, index + 1, entry_count);
+        log::debug!(
+            "restored {} ({} bytes, entry {}/{})",
+            name,
+            len,
+            index + 1,
+            entry_count
+        );
         entries.push(Entry { name, len });
+    }
+
+    // To the end of the stream. The per-entry checksum covers an entry's
+    // bytes, not its name or length, and a decompressor verifies its frame
+    // checksum — the one check over everything — only when it reaches the
+    // frame's end. Stopping at the last entry skipped it, so a damaged byte
+    // in a name restored that file under another name and the restore
+    // reported success.
+    let mut rest = [0u8; 4096];
+    let mut trailing = 0u64;
+    loop {
+        let read = source.read(&mut rest)?;
+        if read == 0 {
+            break;
+        }
+        trailing += read as u64;
+    }
+    if trailing > 0 {
+        return Err(io::Error::other(format!(
+            "snapshot archive has {trailing} bytes after its last entry; the backup is corrupt"
+        )));
     }
 
     Ok(entries)
@@ -224,7 +256,7 @@ pub fn unpack(source: &mut impl Read, target_dir: &Path) -> io::Result<Vec<Entry
 /// It used to require a plain file name with no separator at all. That was
 /// safe, and it silently made a nested entry unrestorable, so the two sides had
 /// to be relaxed together.
-fn is_safe_name(name: &str) -> bool {
+pub(crate) fn is_safe_name(name: &str) -> bool {
     if name.is_empty()
         || name.starts_with('/')
         || name.ends_with('/')
@@ -236,7 +268,8 @@ fn is_safe_name(name: &str) -> bool {
     {
         return false;
     }
-    name.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+    name.split('/')
+        .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 #[cfg(test)]
@@ -281,6 +314,45 @@ mod tests {
 
         let err = unpack(&mut buffer.as_slice(), &dir.join("out")).unwrap_err();
         assert!(err.to_string().contains("failed its checksum"), "{err}");
+    }
+
+    /// No damaged byte of a compressed snapshot unpacks into something else:
+    /// it fails, or — a bit of the frame header no content depends on — gives
+    /// back exactly the original. A flip inside a name used to restore that
+    /// file under another name: the entry checksum does not cover names, and
+    /// the decompressor's frame checksum went unread because unpacking stopped
+    /// at the last entry.
+    #[test]
+    fn no_damaged_byte_of_a_compressed_archive_unpacks_differently() {
+        let dir = temp_testdir::TempDir::default();
+        std::fs::write(dir.join("t.db"), b"rows").unwrap();
+        std::fs::write(dir.join("t_pointers.db"), vec![3u8; 64]).unwrap();
+        let mut plain = Vec::new();
+        let mut writer = ArchiveWriter::new(&mut plain, 2).unwrap();
+        writer.add_file("t.db", &dir.join("t.db")).unwrap();
+        writer.add_file("t_pointers.db", &dir.join("t_pointers.db")).unwrap();
+        writer.finish().unwrap();
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        encoder.include_checksum(true).unwrap();
+        encoder.write_all(&plain).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let out = dir.join("out");
+        let mut decoder = zstd::stream::read::Decoder::new(compressed.as_slice()).unwrap();
+        assert_eq!(unpack(&mut decoder, &out).unwrap().len(), 2);
+        for at in 0..compressed.len() {
+            let mut damaged = compressed.clone();
+            damaged[at] ^= 0x01;
+            let _ = std::fs::remove_dir_all(&out);
+            let unpacked = zstd::stream::read::Decoder::new(damaged.as_slice())
+                .and_then(|mut decoder| unpack(&mut decoder, &out));
+            if let Ok(entries) = unpacked {
+                let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+                assert_eq!(names, ["t.db", "t_pointers.db"], "byte {at} of {} damaged", compressed.len());
+                assert_eq!(std::fs::read(out.join("t.db")).unwrap(), b"rows", "byte {at}");
+                assert_eq!(std::fs::read(out.join("t_pointers.db")).unwrap(), vec![3u8; 64], "byte {at}");
+            }
+        }
     }
 
     #[test]

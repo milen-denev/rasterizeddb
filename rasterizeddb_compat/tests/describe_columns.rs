@@ -170,13 +170,14 @@ async fn an_aggregate_over_a_derived_table_announces_its_columns() {
 
     // And the values, because a description that does not match the rows it
     // precedes is the bug in a different costume.
-    let n: i64 = sqlx::query("SELECT COALESCE(SUM(q.total_bytes), 0) AS n FROM (SELECT total_bytes FROM su) AS q")
+    // `sum(bigint)` is a numeric, as in PostgreSQL (it used to be an int8).
+    let n: rust_decimal::Decimal = sqlx::query("SELECT COALESCE(SUM(q.total_bytes), 0) AS n FROM (SELECT total_bytes FROM su) AS q")
         .fetch_one(&pool)
         .await
         .expect("select")
         .try_get("n")
         .expect("readable by name");
-    assert_eq!(n, 600);
+    assert_eq!(n, rust_decimal::Decimal::from(600));
 
     let avg: i64 = sqlx::query(
         "SELECT COALESCE(AVG(q.t)::bigint, 0) AS avg_bytes \

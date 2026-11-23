@@ -1,8 +1,27 @@
+// The pgwire connection future nests every statement path's future, and
+// proving it `Send` walks that whole type: the default limit of 128 was met
+// exactly, so a one-line change to any statement path stopped the crate
+// compiling (E0275, "overflow evaluating the requirement … Send"). A
+// compile-time limit only; nothing at run time depends on it.
+#![recursion_limit = "256"]
+
+use cacheguard::CacheGuard;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-use cacheguard::CacheGuard;
 
 pub(crate) const SERVER_PORT: u16 = 61170;
+
+/// The test-only Cargo features this library was built with. A server binary
+/// refuses to start when this is not empty (`main.rs`): `test_tokens` mints
+/// write tickets for any caller, and `index_store_failpoints` puts named
+/// failpoints and the crash-image recorder on the I/O paths
+/// (docs/persistent-indexes.md §2, §11).
+pub const TEST_ONLY_FEATURES: &[&str] = &[
+    #[cfg(feature = "test_tokens")]
+    "test_tokens",
+    #[cfg(feature = "index_store_failpoints")]
+    "index_store_failpoints",
+];
 
 pub static MAX_PERMITS_THREADS: OnceLock<usize> = OnceLock::new(); // 16 by default
 
@@ -25,7 +44,6 @@ pub static BATCH_SIZE: OnceLock<usize> = OnceLock::new(); // 10K by default
 pub fn batch_size() -> usize {
     BATCH_SIZE.get().copied().unwrap_or(10_000)
 }
-
 
 /// Filter tuning lives in `core::filter::settings`, which is runtime-mutable
 /// so `SET FILTER ...` and the `--filter-*` CLI flags reach the same state.
@@ -58,6 +76,36 @@ pub fn wal_enabled() -> bool {
 #[inline]
 pub fn wal_checkpoint_bytes() -> u64 {
     *WAL_CHECKPOINT_BYTES.get().unwrap_or(&(64 * 1024 * 1024))
+}
+
+/// Bytes of zeros the log is extended by ahead of its append point, so a
+/// commit's `fdatasync` overwrites blocks the file already owns instead of
+/// growing it. 0 turns it off. Default: 1 MiB.
+///
+/// A sync of a file that grew also commits the filesystem journal for the new
+/// length; one of a file that did not is the data flush alone. Measured
+/// 2026-11-19 on ext4/NVMe, one small record per sync: 4.7-4.9 ms growing,
+/// 2.2-2.4 ms into zero-filled space. Zero-filled rather than `fallocate`d:
+/// the first write into an allocated-but-unwritten block commits the journal
+/// too, so a record over 4 KiB gained nothing there (5.0-5.2 ms against
+/// 2.3-2.6 ms zero-filled).
+///
+/// Set by `--wal-prealloc-kb` before any database opens; otherwise read once
+/// from `RASTERIZEDDB_WAL_PREALLOC_KB`, which is how the test routine runs a
+/// suite both ways.
+pub static WAL_PREALLOC_BYTES: OnceLock<u64> = OnceLock::new();
+
+/// The default of [`WAL_PREALLOC_BYTES`].
+pub const DEFAULT_WAL_PREALLOC_BYTES: u64 = 1024 * 1024;
+
+#[inline]
+pub fn wal_prealloc_bytes() -> u64 {
+    *WAL_PREALLOC_BYTES.get_or_init(|| {
+        std::env::var("RASTERIZEDDB_WAL_PREALLOC_KB")
+            .ok()
+            .and_then(|kb| kb.trim().parse::<u64>().ok())
+            .map_or(DEFAULT_WAL_PREALLOC_BYTES, |kb| kb.saturating_mul(1024))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -102,12 +150,67 @@ pub fn wal_checkpoint_bytes() -> u64 {
 /// is set, so the tuning cannot help the one allocation that matters and only
 /// retains the rest.
 ///
-/// **The buffer is the actual bug.** A scan materialises `Vec<Row>` and `Row`
-/// is 1560 bytes whatever it holds, because `columns` is a
-/// `SmallVec<[Column; 32]>` — 32 inline columns for a five-column table. Make
-/// that buffer proportional to the data and none of this tuning is needed.
+/// **The buffer is the actual bug.** A scan materialises `Vec<Row>`, and `Row`
+/// was 1560 bytes whatever it held, because `columns` inlined 32 columns for a
+/// five-column table. It now inlines `row::ROW_INLINE_COLUMNS` (12); making
+/// that buffer proportional to the data is what makes this tuning unneeded.
 ///
 /// Idempotent, and a no-op off glibc.
+/// The glibc malloc arena limit `--malloc-arenas` set; 0 is glibc's default
+/// (8 per core on 64-bit).
+static MALLOC_ARENAS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn malloc_arenas() -> usize {
+    MALLOC_ARENAS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Caps glibc's malloc arenas (`M_ARENA_MAX`), a low-memory mode: each
+/// thread that allocates under contention otherwise gets an arena of its own,
+/// and freed memory stays in it. 0 leaves glibc's default.
+///
+/// A trade, measured on prepared reads and inserts at 16 clients against the
+/// default: 4 arenas cost -20% / -12% for -16% RSS, 1 arena -61% / -53% for
+/// -11%, since every allocating thread then shares one lock. Call before the
+/// runtime starts its threads; arenas already made are not undone. `false`
+/// when the platform has no such knob or glibc refused it.
+pub fn set_malloc_arenas(n: usize) -> bool {
+    if n == 0 {
+        return true;
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // glibc's M_ARENA_MAX, from <malloc.h>.
+        const M_ARENA_MAX: libc::c_int = -8;
+        let Ok(value) = libc::c_int::try_from(n) else {
+            return false;
+        };
+        // SAFETY: mallopt only reads its two integer arguments.
+        if unsafe { libc::mallopt(M_ARENA_MAX, value) } == 1 {
+            MALLOC_ARENAS.store(n, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        false
+    }
+}
+
+/// Returns the free pages of every glibc arena to the kernel
+/// (`malloc_trim(0)`). glibc keeps what a thread frees in that thread's arena,
+/// so work spread over threads that then exit holds its high-water mark; the
+/// index load calls this after a parallel load (`index_store::load`, which
+/// may hold no `unsafe` itself). Elsewhere it does nothing.
+pub fn release_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `malloc_trim` takes no pointers and is thread-safe; it only
+    // hands free pages back.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 pub fn tune_allocator() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -228,7 +331,12 @@ pub fn set_wal_writer_delay_ms(ms: u64) {
 /// local log — answering "off" to any of them would be quietly weaker than what
 /// was asked for.
 pub fn parse_synchronous_commit(value: &str) -> Option<bool> {
-    match value.trim().trim_matches(['\'', '"']).to_ascii_lowercase().as_str() {
+    match value
+        .trim()
+        .trim_matches(['\'', '"'])
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "on" | "true" | "yes" | "1" | "t" | "local" | "remote_write" | "remote_apply" => Some(true),
         "off" | "false" | "no" | "0" | "f" => Some(false),
         _ => None,
@@ -276,6 +384,112 @@ pub static JSON_SHADOW_TABLES: OnceLock<bool> = OnceLock::new();
 /// table with no `DELETE` or `UPDATE` since its last scan skips the sweep
 /// entirely.
 pub static VACUUM_INTERVAL_SECS: OnceLock<u64> = OnceLock::new();
+
+// Automatic compaction (`core::auto_compact`): process-wide and changed live
+// by `SET CONFIG auto_compact.<key>` and seeded by the `--auto-compact-*`
+// flags, so atomics rather than `OnceLock`s. Every pass reads them afresh.
+//
+// The defaults are chosen for a hash-partitioned retention table, the case the
+// first rule (slots ≥ 20 000 *and* ≥ 8× live, nothing else) never reached: a
+// 32-partition telemetry table at 500 000 rows holds ~15 600 slots per
+// partition, 31 % of them dead, so no partition ever passed the floor, and
+// even one that had would have needed 87.5 % dead slots to pass the ratio. Its
+// operator ran a nightly `VACUUM FULL` of every partition at once (5.5 s under
+// ACCESS EXCLUSIVE) because of it, as pointer slots are only ever given back
+// by a compaction.
+//
+// So a relation is now also due when a quarter of its slots are dead
+// ([`auto_compact_dead_fraction`] 0.25: PostgreSQL's autovacuum scale factor
+// is 0.2, and at 0.25 a compaction rewrites at most four slots for each one it
+// gives back), from a floor of 2 048 slots ([`auto_compact_min_slots`]: a
+// pointer file of ~70 KiB, below which there is nothing worth stopping a
+// table for). The dead-fraction rule stops at 131 072 slots
+// ([`auto_compact_dead_fraction_max_slots`], a run of about 1.5–2.5 s at the
+// measured 11–20 µs a slot): a large plain table is not stopped for seconds
+// because a quarter of it turned over, while a partition — the unit a
+// partitioned table is compacted in — stays well under it (131 072 a
+// partition is 4 million rows over 32). The 8× amplification rule keeps no
+// such cap: a heartbeat table at 8 live rows in 38 030 slots is due however
+// large it is, as before. The 600 s cooldown bounds how often any one table
+// or partition is stopped.
+
+static AUTO_COMPACT_ENABLED: AtomicBool = AtomicBool::new(true);
+static AUTO_COMPACT_INTERVAL_SECS: AtomicU64 = AtomicU64::new(60);
+static AUTO_COMPACT_MIN_SLOTS: AtomicU64 = AtomicU64::new(2_048);
+static AUTO_COMPACT_RATIO: AtomicU64 = AtomicU64::new(8);
+static AUTO_COMPACT_DEAD_FRACTION: AtomicU64 = AtomicU64::new(0.25f64.to_bits());
+static AUTO_COMPACT_DEAD_FRACTION_MAX_SLOTS: AtomicU64 = AtomicU64::new(131_072);
+static AUTO_COMPACT_COOLDOWN_SECS: AtomicU64 = AtomicU64::new(600);
+
+/// Whether tables and partitions whose pointer slots are mostly dead are
+/// compacted automatically. Default: on.
+#[inline]
+pub fn auto_compact_enabled() -> bool {
+    AUTO_COMPACT_ENABLED.load(AtomicOrdering::Relaxed)
+}
+/// How often the automatic compaction looks, in seconds. Default: 60.
+#[inline]
+pub fn auto_compact_interval_secs() -> u64 {
+    AUTO_COMPACT_INTERVAL_SECS.load(AtomicOrdering::Relaxed)
+}
+/// The fewest pointer slots a table or partition has before either rule
+/// makes it due. Default: 2 048.
+#[inline]
+pub fn auto_compact_min_slots() -> u64 {
+    AUTO_COMPACT_MIN_SLOTS.load(AtomicOrdering::Relaxed)
+}
+/// Due when the slots are at least this many times the live rows. Default:
+/// 8. 0 turns this rule off.
+#[inline]
+pub fn auto_compact_ratio() -> u64 {
+    AUTO_COMPACT_RATIO.load(AtomicOrdering::Relaxed)
+}
+/// Due when at least this fraction of the slots is dead (0..1). Default:
+/// 0.25. 0 turns this rule off.
+#[inline]
+pub fn auto_compact_dead_fraction() -> f64 {
+    f64::from_bits(AUTO_COMPACT_DEAD_FRACTION.load(AtomicOrdering::Relaxed))
+}
+/// The most slots a table or partition has for the dead-fraction rule to
+/// apply to it. Default: 131 072. 0 is no limit.
+#[inline]
+pub fn auto_compact_dead_fraction_max_slots() -> u64 {
+    AUTO_COMPACT_DEAD_FRACTION_MAX_SLOTS.load(AtomicOrdering::Relaxed)
+}
+/// The least time between two automatic compactions of one table or
+/// partition, in seconds. Default: 600.
+#[inline]
+pub fn auto_compact_cooldown_secs() -> u64 {
+    AUTO_COMPACT_COOLDOWN_SECS.load(AtomicOrdering::Relaxed)
+}
+
+pub fn set_auto_compact_enabled(on: bool) {
+    AUTO_COMPACT_ENABLED.store(on, AtomicOrdering::Relaxed);
+}
+/// At least 1 second.
+pub fn set_auto_compact_interval_secs(secs: u64) {
+    AUTO_COMPACT_INTERVAL_SECS.store(secs.max(1), AtomicOrdering::Relaxed);
+}
+pub fn set_auto_compact_min_slots(n: u64) {
+    AUTO_COMPACT_MIN_SLOTS.store(n, AtomicOrdering::Relaxed);
+}
+pub fn set_auto_compact_ratio(n: u64) {
+    AUTO_COMPACT_RATIO.store(n, AtomicOrdering::Relaxed);
+}
+/// A fraction outside 0..1 (or not a number) is refused.
+pub fn set_auto_compact_dead_fraction(fraction: f64) -> Result<(), String> {
+    if !(0.0..=1.0).contains(&fraction) {
+        return Err(format!("auto_compact.dead_fraction takes 0 to 1, not {fraction}"));
+    }
+    AUTO_COMPACT_DEAD_FRACTION.store(fraction.to_bits(), AtomicOrdering::Relaxed);
+    Ok(())
+}
+pub fn set_auto_compact_dead_fraction_max_slots(n: u64) {
+    AUTO_COMPACT_DEAD_FRACTION_MAX_SLOTS.store(n, AtomicOrdering::Relaxed);
+}
+pub fn set_auto_compact_cooldown_secs(secs: u64) {
+    AUTO_COMPACT_COOLDOWN_SECS.store(secs, AtomicOrdering::Relaxed);
+}
 
 /// Dead bytes below which a scan does not bother publishing a free list.
 /// Default: 8 MiB. Either this or [`VACUUM_MIN_DEAD_RATIO`] being met is enough.
@@ -331,13 +545,19 @@ pub mod core;
 
 pub mod auth;
 pub mod cache;
-pub mod client;
 pub mod configuration;
 pub mod instructions;
+pub mod idle_trim;
 pub mod memory_pool;
 pub mod native_auth;
 pub mod pg_params;
 pub mod pgwire;
+#[cfg(any(feature = "mysql_wire", feature = "mssql_wire"))]
+pub(crate) mod sqlcompat;
+#[cfg(feature = "mysql_wire")]
+pub mod mysql;
+#[cfg(feature = "mssql_wire")]
+pub mod mssql;
 
 /// Multi-primary replication between instances, over `rastcp`.
 pub mod replication;

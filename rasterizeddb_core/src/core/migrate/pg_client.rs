@@ -269,10 +269,16 @@ fn percent_decode(text: &str) -> Result<String, String> {
                 .get(i + 1..i + 3)
                 .ok_or_else(|| format!("{:?} ends in an incomplete % escape", text))?;
             let value = u8::from_str_radix(
-                std::str::from_utf8(hex).map_err(|_| "a % escape is not hexadecimal".to_string())?,
+                std::str::from_utf8(hex)
+                    .map_err(|_| "a % escape is not hexadecimal".to_string())?,
                 16,
             )
-            .map_err(|_| format!("%{} is not a hexadecimal escape", String::from_utf8_lossy(hex)))?;
+            .map_err(|_| {
+                format!(
+                    "%{} is not a hexadecimal escape",
+                    String::from_utf8_lossy(hex)
+                )
+            })?;
             out.push(value);
             i += 3;
         } else {
@@ -280,7 +286,8 @@ fn percent_decode(text: &str) -> Result<String, String> {
             i += 1;
         }
     }
-    String::from_utf8(out).map_err(|_| "a % escape decoded to something that is not UTF-8".to_string())
+    String::from_utf8(out)
+        .map_err(|_| "a % escape decoded to something that is not UTF-8".to_string())
 }
 
 /// A plaintext or TLS connection, buffered, behind one interface.
@@ -488,15 +495,25 @@ impl PgConnection {
                 .with_no_client_auth(),
         };
 
-        let server_name = rustls::pki_types::ServerName::try_from(params.host.clone())
-            .map_err(|_| format!("{:?} is not a name TLS can be verified against", params.host))?;
+        let server_name =
+            rustls::pki_types::ServerName::try_from(params.host.clone()).map_err(|_| {
+                format!(
+                    "{:?} is not a name TLS can be verified against",
+                    params.host
+                )
+            })?;
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        let tls = connector
-            .connect(server_name, tcp)
-            .await
-            .map_err(|e| format!("the TLS handshake with {}:{} failed: {}", params.host, params.port, e))?;
+        let tls = connector.connect(server_name, tcp).await.map_err(|e| {
+            format!(
+                "the TLS handshake with {}:{} failed: {}",
+                params.host, params.port, e
+            )
+        })?;
 
-        Ok(Stream::Tls(Box::new(BufReader::with_capacity(READ_BUFFER, tls))))
+        Ok(Stream::Tls(Box::new(BufReader::with_capacity(
+            READ_BUFFER,
+            tls,
+        ))))
     }
 
     /// Sends the startup message and works through whatever authentication the
@@ -550,7 +567,13 @@ impl PgConnection {
                 // does not do.
                 b'K' => {}
                 b'Z' => return Ok(()),
-                b'E' => return Err(format!("{} refused the connection: {}", self.description, error_text(&message.body))),
+                b'E' => {
+                    return Err(format!(
+                        "{} refused the connection: {}",
+                        self.description,
+                        error_text(&message.body)
+                    ));
+                }
                 b'N' => log_notice(&message.body),
                 other => {
                     return Err(format!(
@@ -923,9 +946,10 @@ impl PgConnection {
 
     async fn read_message(&mut self) -> Result<Message, String> {
         let mut header = [0u8; 5];
-        self.stream.read_exact(&mut header).await.map_err(|e| {
-            format!("{} closed the connection: {}", self.description, e)
-        })?;
+        self.stream
+            .read_exact(&mut header)
+            .await
+            .map_err(|e| format!("{} closed the connection: {}", self.description, e))?;
         let length = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
         if length < 4 {
             return Err(format!(
@@ -943,10 +967,16 @@ impl PgConnection {
         let mut body = vec![0u8; body_len];
         if body_len > 0 {
             self.stream.read_exact(&mut body).await.map_err(|e| {
-                format!("{} closed the connection mid-message: {}", self.description, e)
+                format!(
+                    "{} closed the connection mid-message: {}",
+                    self.description, e
+                )
             })?;
         }
-        Ok(Message { tag: header[0], body })
+        Ok(Message {
+            tag: header[0],
+            body,
+        })
     }
 }
 
@@ -1009,7 +1039,11 @@ fn parse_row_description(body: &[u8]) -> Result<Vec<Field>, String> {
             .ok_or("a truncated RowDescription field")?;
         let type_modifier = read_i32(body, at + 12)?;
         at += 18;
-        fields.push(Field { name, type_oid, type_modifier });
+        fields.push(Field {
+            name,
+            type_oid,
+            type_modifier,
+        });
     }
     Ok(fields)
 }

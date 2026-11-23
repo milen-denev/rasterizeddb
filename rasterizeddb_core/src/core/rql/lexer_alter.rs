@@ -20,14 +20,25 @@ pub enum AlterAction {
         if_not_exists: bool,
         /// The `DEFAULT` expression, as written.
         default: Option<String>,
-        /// Declared `JSON`/`JSONB`, so it is stored as a `UUID` pointing at a
-        /// table of its own — the same mapping `CREATE TABLE` applies.
+        /// Declared `JSON`/`JSONB` while `json_shadow_tables` is on, so it is
+        /// shredded: stored as a `UUID` pointing at a table of its own — the
+        /// same mapping `CREATE TABLE` applies under the knob. Off (the
+        /// default), it is false and `db_type` is `JSONB` or `JSONTEXT`.
         ///
         /// `CREATE TABLE t (payload JSONB)` has worked since the JSON layer
         /// landed; `ALTER TABLE t ADD COLUMN payload JSONB` refused with "no
         /// JSON type", which was both wrong and inconsistent with the statement
         /// beside it.
         json: bool,
+        /// `NUMERIC(p, s)`'s precision and scale. Dropped before, so the column
+        /// stored every value at the engine's scale, 9.
+        modifier: Option<(u16, u16)>,
+        /// `GENERATED ALWAYS AS (…) STORED`'s expression. Dropped before, so
+        /// the column was added and never given a value.
+        generated: Option<String>,
+        /// A declared `character(n)` / `character varying(n)` length
+        /// (`type_modifier::TextTypmod`).
+        text_typmod: Option<crate::core::rql::type_modifier::TextTypmod>,
     },
     DropColumn {
         name: String,
@@ -75,10 +86,15 @@ pub enum AlterAction {
         name: String,
         expression: Option<String>,
     },
+    /// `VALIDATE CONSTRAINT name`: the rows already in the table checked
+    /// against a key added `NOT VALID` (phase 3 P4 round 2).
+    ValidateConstraint {
+        name: String,
+    },
     /// Accepted and not acted on, with the reason.
     ///
-    /// PostgreSQL storage tuning — `SET COMPRESSION`, `SET (autovacuum_…)`,
-    /// `VALIDATE CONSTRAINT` — describes machinery this engine does not have.
+    /// PostgreSQL storage tuning — `SET COMPRESSION`, `SET (autovacuum_…)` —
+    /// describes machinery this engine does not have.
     /// Failing them would stop a migration over a statement whose whole effect
     /// is advisory, and a real schema is full of them: 12 sites in the
     /// application this compatibility work is modelled on.
@@ -132,6 +148,14 @@ fn token_at(s: &str, from: usize) -> Option<(&str, usize)> {
 /// separator, which is why `split_definitions` does the work rather than
 /// `split(',')`.
 pub fn parse_alter_table_actions(sql: &str) -> Result<Vec<AlterTable>, String> {
+    Ok(parse_alter_table_actions_tagged(sql)?.into_iter().map(|(action, _)| action).collect())
+}
+
+/// [`parse_alter_table_actions`], with each action marked `true` when it is a
+/// constraint written on the `ADD COLUMN` before it. Those belong to the
+/// column's definition: when `ADD COLUMN IF NOT EXISTS` finds the column
+/// already there, PostgreSQL adds neither, and neither may run here.
+pub fn parse_alter_table_actions_tagged(sql: &str) -> Result<Vec<(AlterTable, bool)>, String> {
     let trimmed = sql.trim().trim_end_matches(';');
     let upper = trimmed.to_ascii_uppercase();
     if !upper.starts_with("ALTER TABLE") {
@@ -169,7 +193,9 @@ pub fn parse_alter_table_actions(sql: &str) -> Result<Vec<AlterTable>, String> {
 
     let segments = crate::core::rql::lexer_ct::split_definitions(rest);
     if segments.len() <= 1 {
-        return parse_alter_table(sql).map(|action| vec![action]);
+        let action = parse_alter_table(sql)?;
+        let inline = inline_constraints(&action, rest)?;
+        return Ok(std::iter::once((action, false)).chain(inline.into_iter().map(|c| (c, true))).collect());
     }
 
     let mut actions = Vec::with_capacity(segments.len());
@@ -182,12 +208,139 @@ pub fn parse_alter_table_actions(sql: &str) -> Result<Vec<AlterTable>, String> {
                     .to_string(),
             );
         }
-        actions.push(parse_alter_table(&format!(
-            "ALTER TABLE {} {}",
-            table_token, segment
-        ))?);
+        let action = parse_alter_table(&format!("ALTER TABLE {} {}", table_token, segment))?;
+        let inline = inline_constraints(&action, segment)?;
+        actions.push((action, false));
+        actions.extend(inline.into_iter().map(|c| (c, true)));
     }
     Ok(actions)
+}
+
+/// The constraints written on an added column — `UNIQUE`, `PRIMARY KEY`,
+/// `REFERENCES …`, `CHECK (…)` — as the constraint actions that follow it.
+/// [`parse_alter_table`] reads only nullability from the words after the
+/// type, so each was dropped: duplicates went in, and orphans, and values
+/// the check forbids.
+///
+/// Unnamed unless `CONSTRAINT name` is written before one, so the
+/// constraint path names it as it names every unnamed one, numbering on a
+/// collision as PostgreSQL does. They belong to the column: under `IF NOT
+/// EXISTS` the executor runs them only when the column is added
+/// ([`parse_alter_table_actions_tagged`]), and if one fails it drops the
+/// columns the statement added.
+fn inline_constraints(action: &AlterTable, segment: &str) -> Result<Vec<AlterTable>, String> {
+    let AlterAction::AddColumn { name, .. } = &action.action else {
+        return Ok(Vec::new());
+    };
+    let table = &action.table_name;
+    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let clause = |description: String| AlterTable {
+        table_name: table.clone(),
+        action: AlterAction::ConstraintClause { drop: false, description },
+    };
+    let named = |name: Option<String>| name.map(|n| format!("CONSTRAINT {} ", quote(&n))).unwrap_or_default();
+
+    // `CONSTRAINT x` names the constraint whose keyword follows it. Read
+    // from the words as written, before the CHECK clauses come out: taken
+    // after, a check's name was left in front of whatever followed it.
+    let mut names: Vec<(String, String)> = Vec::new();
+    let raw: Vec<&str> = segment.split_whitespace().collect();
+    for i in 0..raw.len().saturating_sub(2) {
+        if raw[i].eq_ignore_ascii_case("CONSTRAINT") {
+            let kind = raw[i + 2].to_ascii_uppercase();
+            let kind = ["CHECK", "UNIQUE", "PRIMARY", "REFERENCES"].into_iter().find(|k| kind.starts_with(k));
+            if let Some(kind) = kind {
+                names.push((kind.to_string(), bare_name(raw[i + 1])));
+            }
+        }
+    }
+    let mut name_for = |kind: &str| {
+        let at = names.iter().position(|(k, _)| k == kind)?;
+        Some(names.remove(at).1)
+    };
+
+    // Every clause that carries an expression or a literal comes out first,
+    // so a DEFAULT 'UNIQUE' or a CHECK naming the word is not read as a key.
+    let (mut text, _) = crate::core::rql::generated::split_clause(segment);
+    let mut checks = Vec::new();
+    loop {
+        let (rest, check) = crate::core::rql::check::split_clause(&text);
+        text = rest;
+        match check {
+            Some(expression) => checks.push(expression),
+            None => break,
+        }
+    }
+    let (text, _) = crate::core::rql::column_default::split_clause(&text);
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let Some(at) = words.iter().position(|w| bare_name(w).eq_ignore_ascii_case(name)) else {
+        return Ok(Vec::new());
+    };
+    // The words after the column's name, without `CONSTRAINT x` (read above)
+    // and without the target a REFERENCES names: `REFERENCES p (unique)` is a
+    // column called unique.
+    let mut after: Vec<&str> = Vec::new();
+    let mut references: Option<usize> = None;
+    let mut i = at + 1;
+    while i < words.len() {
+        let word = words[i];
+        if word.eq_ignore_ascii_case("CONSTRAINT") {
+            i += 2;
+            continue;
+        }
+        if word.eq_ignore_ascii_case("REFERENCES") && references.is_none() {
+            references = Some(i);
+            // The table, then its column list: attached (`p(id)`) or apart.
+            let parens = |w: &str| w.matches('(').count() as i32 - w.matches(')').count() as i32;
+            i += 1;
+            let mut depth = words.get(i).map_or(0, |w| parens(w));
+            i += 1;
+            if depth == 0 && words.get(i).is_some_and(|w| w.starts_with('(')) {
+                depth = parens(words[i]);
+                i += 1;
+            }
+            while i < words.len() && depth > 0 {
+                depth += parens(words[i]);
+                i += 1;
+            }
+            continue;
+        }
+        after.push(word);
+        i += 1;
+    }
+    let upper: Vec<String> = after.iter().map(|w| w.to_ascii_uppercase()).collect();
+    let has = |seq: &[&str]| upper.windows(seq.len()).any(|w| w.iter().map(String::as_str).eq(seq.iter().copied()));
+    // Refused before anything runs: as a constraint after the column, the
+    // refusal would leave the column added.
+    if has(&["NULLS", "NOT", "DISTINCT"]) {
+        return Err(format!(
+            "UNIQUE NULLS NOT DISTINCT is not supported: NULLs are always distinct here, so two rows \
+             with a NULL in column {} never conflict",
+            name
+        ));
+    }
+
+    let mut out = Vec::new();
+    // A primary key is unique already; written both ways, it is the one key.
+    if has(&["PRIMARY", "KEY"]) {
+        out.push(clause(format!("{}PRIMARY KEY ({})", named(name_for("PRIMARY")), quote(name))));
+    } else if upper.iter().any(|w| w == "UNIQUE") {
+        out.push(clause(format!("{}UNIQUE ({})", named(name_for("UNIQUE")), quote(name))));
+    }
+    if let Some(k) = references {
+        // From `REFERENCES` to the end: the target, its columns, the
+        // actions. The foreign key parser reads what it needs.
+        out.push(clause(format!(
+            "{}FOREIGN KEY ({}) {}",
+            named(name_for("REFERENCES")),
+            quote(name),
+            words[k..].join(" ")
+        )));
+    }
+    for expression in checks {
+        out.push(clause(format!("{}CHECK ({})", named(name_for("CHECK")), expression)));
+    }
+    Ok(out)
 }
 
 pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
@@ -213,8 +366,25 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
     let table_name = bare_name(table_token);
 
     // The DEFAULT clause is removed before the action is read, so its
-    // expression cannot be mistaken for a type or a constraint.
+    // expression cannot be mistaken for a type or a constraint. A generation
+    // expression goes first: it is a parenthesised group the DEFAULT and
+    // constraint readers would both take pieces of, as in `CREATE TABLE`.
     let remainder: String = tokens.collect::<Vec<_>>().join(" ");
+    let (remainder, generated) = if remainder.trim_start().to_ascii_uppercase().starts_with("ADD") {
+        crate::core::rql::generated::split_clause(&remainder)
+    } else {
+        (remainder, None)
+    };
+    // `GENERATED … AS IDENTITY` on an added column would have to number the
+    // rows already there; until it does, it is refused rather than read as
+    // no clause (a plain nullable column, NULL in every row).
+    if remainder.trim_start().to_ascii_uppercase().starts_with("ADD")
+        && crate::core::rql::sequence::split_identity_clause(&remainder)?.1.is_some()
+    {
+        return Err("ALTER TABLE ... ADD COLUMN ... GENERATED AS IDENTITY is not supported yet; \
+                    create the table with the identity column instead"
+            .to_string());
+    }
     let (remainder, default) = crate::core::rql::column_default::split_clause(&remainder);
     let rest: Vec<&str> = remainder.split_whitespace().collect();
     if rest.is_empty() {
@@ -233,8 +403,12 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
             // `ADD UNIQUE …` all declare constraints rather than columns.
             if matches!(
                 rest_upper.get(i).map(String::as_str),
-                Some("CONSTRAINT") | Some("FOREIGN") | Some("PRIMARY") | Some("UNIQUE")
-                    | Some("CHECK") | Some("EXCLUDE")
+                Some("CONSTRAINT")
+                    | Some("FOREIGN")
+                    | Some("PRIMARY")
+                    | Some("UNIQUE")
+                    | Some("CHECK")
+                    | Some("EXCLUDE")
             ) {
                 return Ok(AlterTable {
                     table_name,
@@ -258,24 +432,84 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
             i += 1;
 
             let type_tokens: Vec<&str> = rest[i..].to_vec();
-            // A JSON column is a `UUID` on this side of the mapping; the
-            // shadow table is registered by the executor, as it is for CREATE.
-            let json = type_tokens
-                .first()
-                .map(|t| {
-                    let head = t.split('(').next().unwrap_or(t).to_ascii_uppercase();
-                    head == "JSON" || head == "JSONB"
-                })
-                .unwrap_or(false);
-            let (db_type, used) = if json {
-                (DbType::UUID, 1)
+            // A shredded JSON column is a `UUID` on this side of the mapping;
+            // the shadow table is registered by the executor, as it is for
+            // CREATE. Shredded only when `json_shadow_tables` is on, exactly
+            // as at CREATE (`lexer_ct`): otherwise `jsonb` is a stored
+            // document (`DbType::JSONB`) and `json` its text as written
+            // (`DbType::JSONTEXT`), both from `parse_column_type`.
+            //
+            // `jsonb` used to be shredded here whatever the knob said, so a
+            // migration's `ADD COLUMN x JSONB` made a different column from
+            // `CREATE TABLE … (x JSONB)`: refused outright on a partitioned
+            // table, refused an array `DEFAULT '[]'`, and grew a shadow column
+            // per document key. A column's kind is read from its schema (a
+            // `json_columns` entry or not), so columns added the old way keep
+            // reading as they were.
+            let json = crate::json_shadow_tables()
+                && type_tokens
+                    .first()
+                    .map(|t| {
+                        let head = t.split('(').next().unwrap_or(t).to_ascii_uppercase();
+                        head == "JSONB" || head == "JSON"
+                    })
+                    .unwrap_or(false);
+            // The type as written, its array suffix and a modifier however
+            // it is spaced included, and refused when what follows it is no
+            // constraint, as at CREATE (`lexer_ct::column_type_span`).
+            let (phrase, written, used) =
+                crate::core::rql::lexer_ct::column_type_span(&type_tokens)?.ok_or("ADD COLUMN names no type")?;
+            // A SERIAL added here got no sequence: every row, old and new,
+            // read NULL in a column PostgreSQL makes NOT NULL and numbers.
+            if crate::core::rql::sequence::serial_type(&phrase).is_some() {
+                return Err(format!(
+                    "ALTER TABLE ... ADD COLUMN ... {} is not supported yet; create the table with the serial column \
+                     instead",
+                    phrase.split_whitespace().next().unwrap_or("SERIAL").to_ascii_uppercase()
+                ));
+            }
+            let db_type = if json {
+                DbType::UUID
             } else {
-                parse_column_type(&type_tokens)?
+                parse_column_type(&phrase.split_whitespace().collect::<Vec<_>>())?.0
             };
             let constraints = rest_upper[i + used..].join(" ");
-            let nullable = !(constraints.contains("NOT NULL") || constraints.contains("PRIMARY KEY"));
+            let nullable =
+                !(constraints.contains("NOT NULL") || constraints.contains("PRIMARY KEY"));
+            let declared = written;
+            let text_typmod = match crate::core::rql::type_modifier::parse_text_typmod(&declared)
+                .or_else(|| crate::core::rql::type_modifier::parse_time_precision(&declared))
+                .or_else(|| crate::core::rql::type_modifier::parse_array_element(&declared).map(Ok))
+            {
+                Some(Ok(t)) if !json => Some(t),
+                Some(Err(reason)) => return Err(reason),
+                _ => None,
+            };
+            let modifier = match crate::core::rql::type_modifier::parse_numeric_modifier(&declared) {
+                Some(Ok(pair)) => Some(pair),
+                Some(Err(reason)) => return Err(reason),
+                None => None,
+            };
+            if let Some(expression) = generated.as_deref() {
+                if expression.len() > crate::core::rql::generated::MAX_EXPRESSION_LEN {
+                    return Err(format!(
+                        "a generation expression may be at most {} characters",
+                        crate::core::rql::generated::MAX_EXPRESSION_LEN
+                    ));
+                }
+            }
 
-            AlterAction::AddColumn { name, db_type, nullable, if_not_exists, default, json }
+            AlterAction::AddColumn {
+                name,
+                db_type,
+                nullable,
+                if_not_exists,
+                default,
+                json,
+                modifier,
+                generated,
+                text_typmod,
+            }
         }
         "DROP" => {
             let mut i = 1usize;
@@ -309,7 +543,10 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
             // a column. The keyword right after RENAME is what tells them apart.
             if rest_upper.get(i).map(String::as_str) == Some("TO") {
                 let to = bare_name(rest.get(i + 1).ok_or("RENAME TO has no new name")?);
-                return Ok(AlterTable { table_name, action: AlterAction::RenameTable { to } });
+                return Ok(AlterTable {
+                    table_name,
+                    action: AlterAction::RenameTable { to },
+                });
             }
             if rest_upper.get(i).map(String::as_str) == Some("COLUMN") {
                 i += 1;
@@ -331,20 +568,36 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
             let detail_upper = detail.to_ascii_uppercase();
 
             // `SET DEFAULT` arrives with the clause already split off, leaving
-            // a bare `SET`; `DROP DEFAULT` keeps its keyword.
-            if default.is_some() || detail_upper.starts_with("SET") {
+            // a bare `SET`; `DROP DEFAULT` keeps its keyword. Only that `SET`:
+            // `SET NOT NULL` starts with it too, and matched here it became
+            // `DROP DEFAULT`, so the statement dropped the column's default
+            // and enforced nothing, reporting success.
+            if default.is_some() || detail_upper.trim() == "SET" || detail_upper.starts_with("SET DEFAULT") {
                 return Ok(AlterTable {
                     table_name,
-                    action: AlterAction::SetDefault { name, expression: default },
+                    action: AlterAction::SetDefault {
+                        name,
+                        expression: default,
+                    },
                 });
             }
             if detail_upper.starts_with("DROP DEFAULT") {
                 return Ok(AlterTable {
                     table_name,
-                    action: AlterAction::SetDefault { name, expression: None },
+                    action: AlterAction::SetDefault {
+                        name,
+                        expression: None,
+                    },
                 });
             }
 
+            // PostgreSQL's long form of `TYPE`. It used to match the bare
+            // `SET` above and drop the column's default instead.
+            let detail = if detail_upper.starts_with("SET DATA TYPE") {
+                format!("TYPE{}", &detail["SET DATA TYPE".len()..])
+            } else {
+                detail
+            };
             AlterAction::AlterColumn { name, detail }
         }
         // Storage tuning and constraint validation: accepted, not acted on.
@@ -356,9 +609,14 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
         "RESET" => AlterAction::NoOp {
             reason: "table storage options: RasterizedDB manages its own storage",
         },
-        "VALIDATE" => AlterAction::NoOp {
-            reason: "constraints are validated when they are added",
-        },
+        "VALIDATE" if rest_upper.get(1).map(String::as_str) == Some("CONSTRAINT") => {
+            // The name read as every constraint name is (bare or quoted, cut
+            // to its stored form).
+            match crate::core::rql::unique_key::split_constraint_name(&rest[1..].join(" "))? {
+                (Some(name), _) => AlterAction::ValidateConstraint { name },
+                (None, _) => return Err("VALIDATE CONSTRAINT names no constraint".to_string()),
+            }
+        }
         "CLUSTER" | "OWNER" | "ENABLE" | "DISABLE" | "INHERIT" | "NO" => AlterAction::NoOp {
             reason: "PostgreSQL table machinery RasterizedDB does not have",
         },
@@ -374,7 +632,23 @@ pub fn parse_column_type(tokens: &[&str]) -> Result<(DbType, usize), String> {
         return Err("column has no type".to_string());
     }
 
-    let norm = |t: &str| t.split('(').next().unwrap_or(t).trim_matches(',').to_ascii_uppercase();
+    let norm = |t: &str| {
+        t.split(['(', '['])
+            .next()
+            .unwrap_or(t)
+            .trim_matches(',')
+            .to_ascii_uppercase()
+    };
+
+    // An array is written as brackets after the element type — `TEXT[]`,
+    // `REAL[]`, `DOUBLE PRECISION[][]` — and the brackets may sit on any word
+    // of a multi-word type name. One storage type serves every element type and
+    // every dimension count, so all that is needed here is to notice them.
+    let is_array = |count: usize| {
+        tokens[..count.min(tokens.len())]
+            .iter()
+            .any(|t| t.contains('['))
+    };
 
     // Multi-word type names, longest first.
     let two = if tokens.len() >= 2 {
@@ -394,20 +668,78 @@ pub fn parse_column_type(tokens: &[&str]) -> Result<(DbType, usize), String> {
         String::new()
     };
 
-    if four == "TIMESTAMP WITH TIME ZONE" {
-        return Ok((DbType::DATETIME, 4));
+    // `timestamp without time zone` is `timestamp`, `DbType::TIMESTAMP`: a
+    // `DATETIME` whose literals keep their wall-clock time (see
+    // `SchemaField::without_time_zone`). Both were `DATETIME`, so a zone in a
+    // literal was applied to a column that has none: `'10:00+02'` stored 08:00.
+    if four == "TIMESTAMP WITH TIME ZONE" || four == "TIMESTAMP WITHOUT TIME ZONE" {
+        return Ok((
+            if is_array(4) {
+                DbType::ARRAY
+            } else if four == "TIMESTAMP WITHOUT TIME ZONE" {
+                DbType::TIMESTAMP
+            } else {
+                DbType::DATETIME
+            },
+            4,
+        ));
     }
-    if four == "TIMESTAMP WITHOUT TIME ZONE" {
-        return Ok((DbType::DATETIME, 4));
+    // `TIME WITH TIME ZONE` is `timetz` and `TIME WITHOUT TIME ZONE` is `time`.
+    // They were both reaching the one-word arm as `TIME`, so a column declared
+    // with an offset lost it.
+    if four == "TIME WITH TIME ZONE" {
+        return Ok((
+            if is_array(4) {
+                DbType::ARRAY
+            } else {
+                DbType::TIMETZ
+            },
+            4,
+        ));
+    }
+    if four == "TIME WITHOUT TIME ZONE" {
+        return Ok((
+            if is_array(4) {
+                DbType::ARRAY
+            } else {
+                DbType::TIME
+            },
+            4,
+        ));
     }
     if two == "DOUBLE PRECISION" {
-        return Ok((DbType::F64, 2));
+        return Ok((
+            if is_array(2) {
+                DbType::ARRAY
+            } else {
+                DbType::F64
+            },
+            2,
+        ));
     }
     if two == "CHARACTER VARYING" {
-        return Ok((DbType::STRING, 2));
+        return Ok((
+            if is_array(2) {
+                DbType::ARRAY
+            } else {
+                DbType::STRING
+            },
+            2,
+        ));
+    }
+    if two == "BIT VARYING" {
+        return Ok((
+            if is_array(2) {
+                DbType::ARRAY
+            } else {
+                DbType::VARBIT
+            },
+            2,
+        ));
     }
 
     let one = norm(tokens[0]);
+
     let db_type = match one.as_str() {
         // Postgres spellings first, then the engine's own aliases. Unsigned
         // types and the explicit bit widths are not Postgres-native; they are
@@ -421,29 +753,130 @@ pub fn parse_column_type(tokens: &[&str]) -> Result<(DbType, usize), String> {
         "UINT" | "UINT32" | "UINT4" => DbType::U32,
         "USMALLINT" | "UINT16" | "UINT2" => DbType::U16,
         "UTINYINT" | "UINT1" => DbType::U8,
+        // 128-bit integers. `SHOW CREATE TABLE` already wrote these names for
+        // such a column, but nothing parsed them back.
+        "HUGEINT" | "INT128" => DbType::I128,
+        "UHUGEINT" | "UINT128" => DbType::U128,
 
         "REAL" | "FLOAT4" => DbType::F32,
         // Postgres treats a bare FLOAT as double precision.
         "FLOAT8" | "FLOAT" | "DOUBLE" => DbType::F64,
         "TEXT" | "VARCHAR" | "STRING" | "NAME" | "CITEXT" => DbType::STRING,
-        "CHARACTER" | "BPCHAR" => DbType::STRING,
-        "CHAR" => DbType::CHAR,
+        // `character(n)` — `char`, `char(1)` and `nchar` included — is text
+        // held to its length (`type_modifier::TextTypmod`), stored without
+        // its trailing spaces. `CHAR(n)` once mapped to the engine's `CHAR`,
+        // a single codepoint: `'ABCDE'` in a `CHAR(5)` came back as
+        // `'ABCD'`, and `'x '` in a bare `CHAR` was stored as the codepoint
+        // its two bytes spell (`⁸`). Columns created that way keep it.
+        "CHARACTER" | "BPCHAR" | "CHAR" | "NCHAR" => DbType::STRING,
         "NUMERIC" | "DECIMAL" | "MONEY" => DbType::DECIMAL,
         "BOOL" | "BOOLEAN" => DbType::BOOL,
         "UUID" => DbType::UUID,
         "INET" | "CIDR" => DbType::INET,
-        "TIMESTAMP" | "TIMESTAMPTZ" | "DATETIME" | "DATE" | "TIME" | "TIMETZ" => DbType::DATETIME,
+        // `DATE`, `TIME` and `TIMETZ` were all `DATETIME`, so each advertised
+        // `timestamptz` on the wire and a client asking to decode a date or a
+        // time of day refused the column. They are their own types now, stored
+        // in the layout Postgres sends them in.
+        // `TIMESTAMP` alone is PostgreSQL's `timestamp without time zone`.
+        // `DATETIME` is this engine's own word and keeps meaning what it
+        // always did, `timestamptz`.
+        "TIMESTAMP" => DbType::TIMESTAMP,
+        "TIMESTAMPTZ" | "DATETIME" => DbType::DATETIME,
+        "DATE" => DbType::DATE,
+        "TIME" => DbType::TIME,
+        "TIMETZ" => DbType::TIMETZ,
+        "INTERVAL" => DbType::INTERVAL,
+        "MACADDR" => DbType::MACADDR,
+        "MACADDR8" => DbType::MACADDR8,
+        "BIT" => DbType::BIT,
+        "VARBIT" => DbType::VARBIT,
+        "POINT" => DbType::POINT,
+        "LINE" => DbType::LINE,
+        "LSEG" => DbType::LSEG,
+        "BOX" => DbType::BOX,
+        "PATH" => DbType::PATH,
+        "POLYGON" => DbType::POLYGON,
+        "CIRCLE" => DbType::CIRCLE,
+        "INT4RANGE" => DbType::INT4RANGE,
+        "INT8RANGE" => DbType::INT8RANGE,
+        "NUMRANGE" => DbType::NUMRANGE,
+        "TSRANGE" => DbType::TSRANGE,
+        "TSTZRANGE" => DbType::TSTZRANGE,
+        "DATERANGE" => DbType::DATERANGE,
         "BYTEA" => DbType::BYTEA,
         "ARRAY" => DbType::ARRAY,
-        other if other.ends_with("[]") => DbType::ARRAY,
         // A stored document. When `json_shadow_tables` is on, `CREATE TABLE`
         // and `ADD COLUMN` intercept the declaration before it reaches here and
         // build the shredded form instead, so this arm is the stored one.
-        "JSON" | "JSONB" => DbType::JSONB,
+        // `json` keeps its text as written (`DbType::JSONTEXT`); `jsonb` is a
+        // stored document.
+        "JSON" => DbType::JSONTEXT,
+        "JSONB" => DbType::JSONB,
         other => return Err(format!("column type '{}' is not supported yet", other)),
     };
 
+    // The brackets turn any of the above into an array of it.
+    if is_array(1) && db_type != DbType::ARRAY {
+        return Ok((DbType::ARRAY, 1));
+    }
+
     Ok((db_type, 1))
+}
+
+/// The `n` of a `TYPE(n)` or `TYPE(n, m)` declaration.
+///
+/// Only the first number is read: the callers here want a width, and the two
+/// numbers of a `NUMERIC(p, s)` are parsed by
+/// [`crate::core::rql::type_modifier::parse_numeric_modifier`] instead.
+pub fn declared_width(token: &str) -> Option<u32> {
+    let open = token.find('(')?;
+    let close = token[open..].find(')')? + open;
+    token[open + 1..close]
+        .split(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// `DROP TABLE [IF EXISTS] a, b, … [CASCADE | RESTRICT]` as one `DROP
+/// TABLE` per relation, each with the statement's `IF EXISTS` and trailing
+/// option; `None` for a statement that is not a drop of several. Run in one
+/// transaction (the simple protocol's implicit block), they drop all or none,
+/// as PostgreSQL's one statement does.
+pub fn expand_multi_drop(sql: &str) -> Option<Vec<String>> {
+    let trimmed = sql.trim().trim_end_matches(';').trim_end();
+    trimmed.get(..10).filter(|h| h.eq_ignore_ascii_case("DROP TABLE"))?;
+    let mut rest = trimmed[10..].trim_start();
+    if !trimmed[10..].starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut prefix = String::from("DROP TABLE ");
+    if rest.get(..9).is_some_and(|h| h.eq_ignore_ascii_case("IF EXISTS")) && rest[9..].starts_with(char::is_whitespace) {
+        prefix.push_str("IF EXISTS ");
+        rest = rest[9..].trim_start();
+    }
+    // A trailing `CASCADE` / `RESTRICT` applies to every relation.
+    let mut suffix = "";
+    for option in ["CASCADE", "RESTRICT"] {
+        if rest.len() > option.len()
+            && rest[rest.len() - option.len()..].eq_ignore_ascii_case(option)
+            && rest[..rest.len() - option.len()].ends_with(char::is_whitespace)
+        {
+            suffix = option;
+            rest = rest[..rest.len() - option.len()].trim_end();
+        }
+    }
+    let names: Vec<&str> = crate::core::sql_scan::split_top_level(rest, b',').into_iter().map(str::trim).collect();
+    if names.len() < 2 || names.iter().any(|n| n.is_empty()) {
+        return None;
+    }
+    Some(
+        names
+            .iter()
+            .map(|name| if suffix.is_empty() { format!("{prefix}{name}") } else { format!("{prefix}{name} {suffix}") })
+            .collect(),
+    )
 }
 
 /// The relation a `DROP TABLE` names, or `None` when the statement is malformed.
@@ -463,7 +896,9 @@ pub fn parse_drop_table(sql: &str) -> Result<(String, bool), String> {
         token = tokens.next().ok_or("DROP TABLE names no relation")?;
     }
 
-    if sql.matches(',').count() > 0 {
+    // Several names are `expand_multi_drop`'s; a comma inside a quoted name
+    // is the name's.
+    if crate::core::sql_scan::split_top_level(sql, b',').len() > 1 {
         return Err("dropping several tables in one statement is not supported yet".to_string());
     }
 
@@ -478,22 +913,32 @@ pub fn parse_drop_table(sql: &str) -> Result<(String, bool), String> {
 /// a duplicate insert succeeded after one had been created. Expressing it as
 /// the constraint the engine already enforces keeps one implementation.
 ///
-/// `None` when the statement is not one, or is a **partial** unique index
-/// (`… WHERE …`). Partial uniqueness cannot be expressed here, and enforcing it
-/// in full would reject rows PostgreSQL accepts — a stronger constraint is as
-/// wrong as a weaker one, so those stay a declared no-op.
+/// A **partial** unique index (`… WHERE pred`) keeps its predicate:
+/// `ALTER TABLE t ADD CONSTRAINT name UNIQUE (cols) WHERE pred`, which is not
+/// PostgreSQL syntax but is what [`crate::core::rql::unique_key::parse_clause`]
+/// reads as a key that holds among the rows `pred` is true for. It used to be
+/// a declared no-op, and a table that asked for one live account per email
+/// stored any number of them.
+///
+/// `None` when the statement is not one.
 pub fn unique_index_as_constraint(sql: &str) -> Option<String> {
     let trimmed = sql.trim().trim_end_matches(';');
     let upper = trimmed.to_ascii_uppercase();
     if !upper.starts_with("CREATE UNIQUE INDEX") {
         return None;
     }
-    // A partial index keeps the old behaviour.
-    if crate::core::rql::join::find_keyword(trimmed, "WHERE", 0).is_some() {
-        return None;
-    }
 
     let after = &trimmed["CREATE UNIQUE INDEX".len()..];
+    // `CONCURRENTLY` changes how PostgreSQL builds the index, not what it
+    // enforces.
+    let after = {
+        let t = after.trim_start();
+        if t.to_ascii_uppercase().starts_with("CONCURRENTLY ") {
+            &t["CONCURRENTLY".len()..]
+        } else {
+            t
+        }
+    };
     // `IF NOT EXISTS` is carried into the constraint rather than dropped.
     // Losing it made a re-run of a migration fail on the second pass with
     // "constraint already exists" — the exact outcome the clause is written to
@@ -513,26 +958,90 @@ pub fn unique_index_as_constraint(sql: &str) -> Option<String> {
     if name.is_empty() {
         return None;
     }
+    // Quoted again when it is not a bare identifier (a space, a quote): the
+    // constraint arm reads the name it is given (`split_constraint_name`),
+    // and `"mix é 1"` unquoted would be three words.
+    let name = if name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    };
 
-    let rest = after[on_at + "ON".len()..].trim_start();
+    let mut rest = after[on_at + "ON".len()..].trim_start();
+    if rest.to_ascii_uppercase().starts_with("ONLY ") {
+        rest = rest["ONLY".len()..].trim_start();
+    }
     let open = rest.find('(')?;
-    let table = rest[..open].trim().trim_matches('"');
+    // `ON t USING btree (…)`, which is how `pg_dump` writes every index. A
+    // unique index is a B-tree in PostgreSQL, so the method says nothing more.
+    let mut head = rest[..open].trim();
+    if let Some(using_at) = crate::core::rql::join::find_keyword(head, "USING", 0) {
+        head = head[..using_at].trim();
+    }
+    let table = head.trim_matches('"');
     if table.is_empty() {
         return None;
     }
-    let close = rest.rfind(')')?;
+    // The parenthesis that closes the column list, not the last one in the
+    // statement: a predicate has parentheses of its own, and `pg_dump` writes
+    // it as `WHERE (deleted_at IS NULL)`.
+    let close = open + matching_close(&rest[open..])?;
     let columns = rest[open + 1..close].trim();
     if columns.is_empty() {
         return None;
     }
+    let tail = rest[close + 1..].trim();
+    let where_at = crate::core::rql::join::find_keyword(tail, "WHERE", 0);
+    let predicate = match where_at {
+        Some(at) => Some(tail[at + "WHERE".len()..].trim()).filter(|p| !p.is_empty()),
+        None => None,
+    };
+    // `… (cols) NULLS NOT DISTINCT` is carried for the constraint to refuse:
+    // dropped here, the index enforced NULLs as distinct.
+    let nulls = tail[..where_at.unwrap_or(tail.len())]
+        .split_whitespace()
+        .map(|w| w.to_ascii_uppercase())
+        .collect::<Vec<_>>()
+        .windows(3)
+        .any(|w| w == ["NULLS", "NOT", "DISTINCT"]);
 
     Some(format!(
-        "ALTER TABLE {} ADD CONSTRAINT {}{} UNIQUE ({})",
+        "ALTER TABLE {} ADD CONSTRAINT {}{} UNIQUE ({}){}{}",
         table,
         if if_not_exists { "IF NOT EXISTS " } else { "" },
         name,
-        columns
+        columns,
+        if nulls { " NULLS NOT DISTINCT" } else { "" },
+        match predicate {
+            Some(p) => format!(" WHERE {}", p),
+            None => String::new(),
+        }
     ))
+}
+
+/// The offset of the `)` closing the `(` that `text` starts with, outside
+/// quotes.
+fn matching_close(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    for (i, c) in text.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    None
 }
 
 /// Statements the engine accepts without acting on, with the reason.
@@ -553,6 +1062,21 @@ pub fn no_op_reason(sql: &str) -> Option<&'static str> {
         || crate::core::rql::path_index::parse_drop(sql).is_some()
     {
         return None;
+    }
+    // A plain-column `CREATE INDEX` builds a real index now; see
+    // `crate::core::index::ddl`. Partial and expression indexes still fall
+    // through to the no-op below.
+    if crate::core::index::ddl::parse_create(sql).is_some() {
+        return None;
+    }
+    // A partial index that is not unique only narrows an access path, so
+    // accepting it without building anything loses no guarantee: queries
+    // scan, or use another index, and return the same rows. Named apart from
+    // the rest so the log says which kind was set aside.
+    if upper.starts_with("CREATE INDEX")
+        && crate::core::rql::join::find_keyword(sql, "WHERE", 0).is_some()
+    {
+        return Some("partial index: accepted and not built; it constrains nothing, and queries answer the same without it");
     }
     if upper.starts_with("CREATE INDEX")
         || upper.starts_with("CREATE UNIQUE INDEX")
@@ -588,6 +1112,35 @@ pub fn no_op_reason(sql: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    /// `SET NOT NULL` is the nullability arm, never `SET DEFAULT`: matched as
+    /// the bare `SET` that `SET DEFAULT` leaves, it dropped the column's
+    /// default and enforced nothing.
+    #[test]
+    fn set_not_null_is_not_a_default() {
+        let a = parse_alter_table("ALTER TABLE t ALTER COLUMN d SET NOT NULL").unwrap();
+        match a.action {
+            AlterAction::AlterColumn { name, detail } => {
+                assert_eq!(name, "d");
+                assert!(detail.eq_ignore_ascii_case("SET NOT NULL"), "{detail}");
+            }
+            other => panic!("SET NOT NULL parsed as {other:?}"),
+        }
+        let a = parse_alter_table("ALTER TABLE t ALTER COLUMN d SET DEFAULT 5").unwrap();
+        assert!(
+            matches!(&a.action, AlterAction::SetDefault { expression: Some(e), .. } if e == "5"),
+            "{:?}",
+            a.action
+        );
+        let a = parse_alter_table("ALTER TABLE t ALTER COLUMN d DROP DEFAULT").unwrap();
+        assert!(matches!(a.action, AlterAction::SetDefault { expression: None, .. }), "{:?}", a.action);
+        let a = parse_alter_table("ALTER TABLE t ALTER COLUMN d SET DATA TYPE bigint").unwrap();
+        assert!(
+            matches!(&a.action, AlterAction::AlterColumn { detail, .. } if detail.eq_ignore_ascii_case("TYPE bigint")),
+            "{:?}",
+            a.action
+        );
+    }
+
     use super::*;
 
     /// Anything answered here is answered *instead of* the engine, so an entry
@@ -611,8 +1164,7 @@ mod tests {
             "VACUUM FULL t",
         ] {
             let no_op = no_op_reason(sql).is_some();
-            let implemented =
-                crate::core::rql::lexer_s1::recognize_query_purpose(sql).is_some();
+            let implemented = crate::core::rql::lexer_s1::recognize_query_purpose(sql).is_some();
             assert!(
                 !(no_op && implemented),
                 "{sql:?} is treated as a no-op while the engine implements it"
@@ -629,7 +1181,11 @@ mod tests {
              ADD CONSTRAINT fk_b FOREIGN KEY (case_model_id) REFERENCES case_model (id) ON DELETE CASCADE ON UPDATE CASCADE",
         )
         .unwrap();
-        assert_eq!(actions.len(), 2, "both constraints must be parsed, not just the first");
+        assert_eq!(
+            actions.len(),
+            2,
+            "both constraints must be parsed, not just the first"
+        );
         assert!(actions.iter().all(|a| a.table_name == "ccm"));
         for action in &actions {
             match &action.action {
@@ -637,7 +1193,11 @@ mod tests {
                     assert!(!drop);
                     // The comma must not ride along into the action text; that
                     // is what made a supported CASCADE report as unsupported.
-                    assert!(!description.trim_end().ends_with(','), "got {:?}", description);
+                    assert!(
+                        !description.trim_end().ends_with(','),
+                        "got {:?}",
+                        description
+                    );
                 }
                 other => panic!("expected a constraint clause, got {:?}", other),
             }
@@ -689,11 +1249,20 @@ mod tests {
     fn a_list_that_cannot_be_accounted_for_is_refused() {
         // Refusing beats applying the prefix that parsed: a partly-applied
         // ALTER reported as success is the failure mode being avoided.
-        let trailing = parse_alter_table_actions("ALTER TABLE t ADD COLUMN a INT, ADD COLUMN b INT,");
-        assert!(trailing.is_err(), "trailing comma must be refused, got {:?}", trailing);
+        let trailing =
+            parse_alter_table_actions("ALTER TABLE t ADD COLUMN a INT, ADD COLUMN b INT,");
+        assert!(
+            trailing.is_err(),
+            "trailing comma must be refused, got {:?}",
+            trailing
+        );
 
         let empty = parse_alter_table_actions("ALTER TABLE t ADD COLUMN a INT, , ADD COLUMN b INT");
-        assert!(empty.is_err(), "empty action must be refused, got {:?}", empty);
+        assert!(
+            empty.is_err(),
+            "empty action must be refused, got {:?}",
+            empty
+        );
     }
 
     #[test]
@@ -710,6 +1279,9 @@ mod tests {
                 if_not_exists: false,
                 default: None,
                 json: false,
+                modifier: None,
+                generated: None,
+                text_typmod: None,
             }
         );
     }
@@ -718,9 +1290,17 @@ mod tests {
     fn add_column_reads_its_default() {
         let a = parse_alter_table("ALTER TABLE t ADD COLUMN n INTEGER NOT NULL DEFAULT 0").unwrap();
         match a.action {
-            AlterAction::AddColumn { default, nullable, db_type, .. } => {
+            AlterAction::AddColumn {
+                default,
+                nullable,
+                db_type,
+                ..
+            } => {
                 assert_eq!(default.as_deref(), Some("0"));
-                assert!(!nullable, "NOT NULL must survive the DEFAULT being split off");
+                assert!(
+                    !nullable,
+                    "NOT NULL must survive the DEFAULT being split off"
+                );
                 assert_eq!(db_type, DbType::I32);
             }
             other => panic!("{:?}", other),
@@ -730,12 +1310,22 @@ mod tests {
     #[test]
     fn set_and_drop_default_are_recognised() {
         assert_eq!(
-            parse_alter_table("ALTER TABLE t ALTER COLUMN c SET DEFAULT 'x'").unwrap().action,
-            AlterAction::SetDefault { name: "c".into(), expression: Some("'x'".into()) }
+            parse_alter_table("ALTER TABLE t ALTER COLUMN c SET DEFAULT 'x'")
+                .unwrap()
+                .action,
+            AlterAction::SetDefault {
+                name: "c".into(),
+                expression: Some("'x'".into())
+            }
         );
         assert_eq!(
-            parse_alter_table("ALTER TABLE t ALTER COLUMN c DROP DEFAULT").unwrap().action,
-            AlterAction::SetDefault { name: "c".into(), expression: None }
+            parse_alter_table("ALTER TABLE t ALTER COLUMN c DROP DEFAULT")
+                .unwrap()
+                .action,
+            AlterAction::SetDefault {
+                name: "c".into(),
+                expression: None
+            }
         );
     }
 
@@ -743,7 +1333,9 @@ mod tests {
     fn add_column_honours_not_null() {
         let a = parse_alter_table(r#"ALTER TABLE users ADD COLUMN n INTEGER NOT NULL"#).unwrap();
         match a.action {
-            AlterAction::AddColumn { nullable, db_type, .. } => {
+            AlterAction::AddColumn {
+                nullable, db_type, ..
+            } => {
                 assert!(!nullable);
                 assert_eq!(db_type, DbType::I32);
             }
@@ -754,9 +1346,21 @@ mod tests {
     #[test]
     fn parses_multi_word_types() {
         for (sql, expected) in [
-            ("ALTER TABLE t ADD COLUMN c TIMESTAMP WITH TIME ZONE", DbType::DATETIME),
+            (
+                "ALTER TABLE t ADD COLUMN c TIMESTAMP WITH TIME ZONE",
+                DbType::DATETIME,
+            ),
+            (
+                "ALTER TABLE t ADD COLUMN c TIMESTAMP WITHOUT TIME ZONE",
+                DbType::TIMESTAMP,
+            ),
+            ("ALTER TABLE t ADD COLUMN c TIMESTAMP(3)", DbType::TIMESTAMP),
+            ("ALTER TABLE t ADD COLUMN c TIMESTAMPTZ", DbType::DATETIME),
             ("ALTER TABLE t ADD COLUMN c DOUBLE PRECISION", DbType::F64),
-            ("ALTER TABLE t ADD COLUMN c CHARACTER VARYING", DbType::STRING),
+            (
+                "ALTER TABLE t ADD COLUMN c CHARACTER VARYING",
+                DbType::STRING,
+            ),
             ("ALTER TABLE t ADD COLUMN c NUMERIC(10, 2)", DbType::DECIMAL),
             ("ALTER TABLE t ADD COLUMN c UUID", DbType::UUID),
         ] {
@@ -770,16 +1374,31 @@ mod tests {
     #[test]
     fn parses_drop_and_rename_column() {
         assert_eq!(
-            parse_alter_table(r#"ALTER TABLE "t" DROP COLUMN "c""#).unwrap().action,
-            AlterAction::DropColumn { name: "c".into(), if_exists: false }
+            parse_alter_table(r#"ALTER TABLE "t" DROP COLUMN "c""#)
+                .unwrap()
+                .action,
+            AlterAction::DropColumn {
+                name: "c".into(),
+                if_exists: false
+            }
         );
         assert_eq!(
-            parse_alter_table("ALTER TABLE t DROP COLUMN IF EXISTS c").unwrap().action,
-            AlterAction::DropColumn { name: "c".into(), if_exists: true }
+            parse_alter_table("ALTER TABLE t DROP COLUMN IF EXISTS c")
+                .unwrap()
+                .action,
+            AlterAction::DropColumn {
+                name: "c".into(),
+                if_exists: true
+            }
         );
         assert_eq!(
-            parse_alter_table(r#"ALTER TABLE t RENAME COLUMN "a" TO "b""#).unwrap().action,
-            AlterAction::RenameColumn { from: "a".into(), to: "b".into() }
+            parse_alter_table(r#"ALTER TABLE t RENAME COLUMN "a" TO "b""#)
+                .unwrap()
+                .action,
+            AlterAction::RenameColumn {
+                from: "a".into(),
+                to: "b".into()
+            }
         );
     }
 
@@ -821,7 +1440,8 @@ mod tests {
     #[test]
     fn json_names_a_stored_type_while_arrays_and_bytes_are_typed() {
         assert_eq!(parse_column_type(&["JSONB"]).unwrap().0, DbType::JSONB);
-        assert_eq!(parse_column_type(&["JSON"]).unwrap().0, DbType::JSONB);
+        // `json` keeps its text as written (`DbType::JSONTEXT`).
+        assert_eq!(parse_column_type(&["JSON"]).unwrap().0, DbType::JSONTEXT);
         assert_eq!(parse_column_type(&["BYTEA"]).unwrap().0, DbType::BYTEA);
         assert_eq!(parse_column_type(&["TEXT[]"]).unwrap().0, DbType::ARRAY);
         assert_eq!(parse_column_type(&["UUID[]"]).unwrap().0, DbType::ARRAY);
@@ -829,24 +1449,37 @@ mod tests {
 
     #[test]
     fn parses_drop_table() {
-        assert_eq!(parse_drop_table("DROP TABLE users").unwrap(), ("users".into(), false));
+        assert_eq!(
+            parse_drop_table("DROP TABLE users").unwrap(),
+            ("users".into(), false)
+        );
         assert_eq!(
             parse_drop_table(r#"DROP TABLE IF EXISTS "public"."users""#).unwrap(),
             ("users".into(), true)
         );
         assert!(parse_drop_table("DROP TABLE a, b").is_err());
+        assert_eq!(parse_drop_table(r#"DROP TABLE "a,b""#).unwrap(), ("a,b".to_string(), false));
+        assert_eq!(
+            expand_multi_drop(r#"DROP TABLE IF EXISTS a, "b,c", s.d CASCADE;"#).unwrap(),
+            vec!["DROP TABLE IF EXISTS a CASCADE", r#"DROP TABLE IF EXISTS "b,c" CASCADE"#, "DROP TABLE IF EXISTS s.d CASCADE"]
+        );
+        assert_eq!(expand_multi_drop("DROP TABLE a, b RESTRICT").unwrap(), vec!["DROP TABLE a RESTRICT", "DROP TABLE b RESTRICT"]);
+        assert_eq!(expand_multi_drop("DROP TABLE a"), None);
+        assert_eq!(expand_multi_drop(r#"DROP TABLE "a,b""#), None);
+        assert_eq!(expand_multi_drop("DROP TABLESPACE a, b"), None);
     }
 
-    /// An index over an ordinary column is still a no-op — the engine keeps
-    /// its own index over every eligible column, so declaring one adds
-    /// nothing. Index DDL over a *document path* is not, and neither is any
-    /// `DROP INDEX`: a drop names an index without saying what kind it is, and
-    /// answering "accepted, did nothing" to the drop of a path index that does
-    /// exist would be a silent lie. The executor takes every drop and answers
-    /// harmlessly for names it has never stored.
+    /// An index over plain columns is a real B-tree or hash index (see
+    /// `crate::core::index`), and so is one over a *document path*: both
+    /// reach the executor. So does every `DROP INDEX`, since a drop names an
+    /// index without saying what kind it is; the executor answers harmlessly
+    /// for names it never stored. What stays a no-op is what no index here
+    /// can honour: a partial index and an expression index.
     #[test]
     fn index_ddl_is_a_declared_no_op() {
-        assert!(no_op_reason("CREATE INDEX idx ON t (a)").is_some());
+        assert!(no_op_reason("CREATE INDEX idx ON t (a)").is_none());
+        assert!(no_op_reason("CREATE INDEX idx ON t (a) WHERE a > 0").is_some());
+        assert!(no_op_reason("CREATE INDEX idx ON t (lower(a))").is_some());
         assert!(
             no_op_reason("DROP INDEX idx").is_none(),
             "a drop has to reach the executor, which owns path indexes"
@@ -875,6 +1508,14 @@ mod tests {
         // exists" — precisely what the clause is there to prevent, and what a
         // migration that seeds rows relies on to be re-runnable.
         assert_eq!(
+            unique_index_as_constraint("CREATE UNIQUE INDEX IF NOT EXISTS \"mix é 1\" ON t (a)").as_deref(),
+            Some("ALTER TABLE t ADD CONSTRAINT IF NOT EXISTS \"mix é 1\" UNIQUE (a)")
+        );
+        assert_eq!(
+            unique_index_as_constraint("CREATE UNIQUE INDEX 名 ON t (a)").as_deref(),
+            Some("ALTER TABLE t ADD CONSTRAINT 名 UNIQUE (a)")
+        );
+        assert_eq!(
             unique_index_as_constraint(
                 "CREATE UNIQUE INDEX IF NOT EXISTS \"idx\" ON \"t\" (\"a\")"
             )
@@ -891,16 +1532,94 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_unique_index_stays_a_no_op() {
-        // Uniqueness over a subset cannot be expressed here, and enforcing it
-        // in full would reject rows PostgreSQL accepts — wrong in the other
-        // direction. So it stays declared rather than becoming a lie.
-        assert!(
-            unique_index_as_constraint("CREATE UNIQUE INDEX i ON t (a) WHERE b IS NULL")
-                .is_none()
+    fn a_partial_unique_index_keeps_its_predicate() {
+        // It used to be a declared no-op, so duplicates PostgreSQL rejects
+        // were stored. The predicate travels with the key now; enforcing the
+        // key over every row instead would reject rows PostgreSQL accepts.
+        assert_eq!(
+            unique_index_as_constraint("CREATE UNIQUE INDEX i ON t (a) WHERE b IS NULL").as_deref(),
+            Some("ALTER TABLE t ADD CONSTRAINT i UNIQUE (a) WHERE b IS NULL")
         );
+        assert!(no_op_reason("CREATE UNIQUE INDEX i ON t (a) WHERE b IS NULL").is_none());
+        // A constraint written on ADD COLUMN is the action after it, tagged
+        // as the column's; the words of a DEFAULT or CHECK are not read as one.
+        let keys = |sql: &str| -> Vec<String> {
+            parse_alter_table_actions_tagged(sql)
+                .unwrap()
+                .into_iter()
+                .filter_map(|(a, inline)| match a.action {
+                    AlterAction::ConstraintClause { description, .. } => {
+                        assert!(inline, "{description}");
+                        Some(description)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(keys("ALTER TABLE t ADD COLUMN e INT UNIQUE"), ["UNIQUE (\"e\")"]);
+        assert_eq!(
+            keys("ALTER TABLE t ADD COLUMN IF NOT EXISTS e INT CONSTRAINT e_u UNIQUE NOT NULL DEFAULT 0"),
+            ["CONSTRAINT \"e_u\" UNIQUE (\"e\")"]
+        );
+        assert_eq!(keys("ALTER TABLE t ADD f INT PRIMARY KEY"), ["PRIMARY KEY (\"f\")"]);
         assert!(
-            no_op_reason("CREATE UNIQUE INDEX i ON t (a) WHERE b IS NULL").is_some()
+            parse_alter_table_actions("ALTER TABLE t ADD COLUMN a INT, ADD COLUMN b TEXT UNIQUE NULLS NOT DISTINCT")
+                .unwrap_err()
+                .contains("not supported")
+        );
+        assert_eq!(
+            keys("ALTER TABLE t ADD COLUMN p INT REFERENCES par (id) ON DELETE CASCADE UNIQUE CHECK (p > 0)"),
+            [
+                "UNIQUE (\"p\")",
+                "FOREIGN KEY (\"p\") REFERENCES par (id) ON DELETE CASCADE UNIQUE",
+                "CHECK (p > 0)",
+            ]
+        );
+        assert_eq!(
+            keys("ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'UNIQUE' CHECK (c <> 'PRIMARY KEY')"),
+            ["CHECK (c <> 'PRIMARY KEY')"]
+        );
+        // A name belongs to the constraint after it, a check's included, and
+        // never leaks onto the next one; every check is taken.
+        assert_eq!(
+            keys("ALTER TABLE t ADD COLUMN c INT CONSTRAINT c_pos CHECK (c > 0) UNIQUE CHECK (c < 9)"),
+            ["UNIQUE (\"c\")", "CONSTRAINT \"c_pos\" CHECK (c > 0)", "CHECK (c < 9)"]
+        );
+        // The target's column list is no key, attached or apart.
+        assert_eq!(keys("ALTER TABLE t ADD COLUMN q INT REFERENCES p(\"unique\")"), ["FOREIGN KEY (\"q\") REFERENCES p(\"unique\")"]);
+        assert_eq!(keys("ALTER TABLE t ADD COLUMN q INT REFERENCES p ( unique ) ON DELETE SET NULL"), [
+            "FOREIGN KEY (\"q\") REFERENCES p ( unique ) ON DELETE SET NULL"
+        ]);
+        // Written both ways, it is the one key.
+        assert_eq!(keys("ALTER TABLE t ADD COLUMN k INT PRIMARY KEY UNIQUE"), ["PRIMARY KEY (\"k\")"]);
+        assert!(keys("ALTER TABLE t ADD COLUMN unique_id INT").is_empty());
+        // `NULLS NOT DISTINCT` travels to the constraint, which refuses it;
+        // dropped here, the index enforced NULLs as distinct.
+        assert_eq!(
+            unique_index_as_constraint("CREATE UNIQUE INDEX i ON t (a, b) nulls not distinct WHERE c").as_deref(),
+            Some("ALTER TABLE t ADD CONSTRAINT i UNIQUE (a, b) NULLS NOT DISTINCT WHERE c")
+        );
+        // `pg_dump`'s spelling: a method, and a predicate in parentheses. The
+        // column list ends at its own parenthesis, not the predicate's.
+        assert_eq!(
+            unique_index_as_constraint(
+                "CREATE UNIQUE INDEX users_email_live ON public.users USING btree (email) WHERE (deleted_at IS NULL);"
+            )
+            .as_deref(),
+            Some("ALTER TABLE public.users ADD CONSTRAINT users_email_live UNIQUE (email) WHERE (deleted_at IS NULL)")
+        );
+        assert_eq!(
+            unique_index_as_constraint(
+                "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS p ON ONLY pages (tenant_id, slug) WHERE active"
+            )
+            .as_deref(),
+            Some("ALTER TABLE pages ADD CONSTRAINT IF NOT EXISTS p UNIQUE (tenant_id, slug) WHERE active")
+        );
+        // A plain partial index still constrains nothing and is set aside,
+        // saying so.
+        assert!(
+            no_op_reason("CREATE INDEX i ON t (a) WHERE b IS NULL")
+                .is_some_and(|r| r.starts_with("partial index"))
         );
     }
 }

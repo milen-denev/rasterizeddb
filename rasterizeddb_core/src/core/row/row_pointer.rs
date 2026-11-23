@@ -1,7 +1,4 @@
-use std::{
-    io::Cursor,
-    sync::atomic::AtomicU64,
-};
+use std::{io::Cursor, sync::atomic::AtomicU64};
 
 use rclite::Arc;
 
@@ -9,24 +6,24 @@ use super::{error::Result, row::RowWrite};
 use byteorder::{LittleEndian, WriteBytesExt};
 
 #[cfg(feature = "enable_long_row")]
-use crc::{CRC_32_ISO_HDLC, Crc};
+use crate::core::storage_providers::CRC;
 
 use itertools::Itertools;
 use smallvec::SmallVec;
 
+use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX, TxId};
 use crate::{
     core::{
         db_type::DbType,
         filter::CandidateBitmap,
+        index::gallop_to,
         row::row::{Column, Row, RowFetch},
         storage_providers::traits::{BorrowedBytes, StorageIO},
         vacuum::FreeSpace,
     },
     memory_pool::{MEMORY_POOL, MemoryBlock},
 };
-use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX, TxId};
 use branches::unlikely;
-use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 
 #[cfg(feature = "enable_long_row")]
 const TOTAL_LENGTH : usize = 
@@ -73,9 +70,6 @@ const CHUNK_SIZE: usize = TOTAL_LENGTH * 2; // 92 * 2 bytes chunks for debugging
 #[cfg(not(feature = "enable_long_row"))]
 const CHUNK_SIZE: usize = TOTAL_LENGTH * 3047; // ~64KB chunks
 
-// TODO replace with fastcrc32
-#[cfg(feature = "enable_long_row")]
-const CRC: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
 /// Iterates over RowPointers from a StorageIO in 64KB chunks
 pub struct RowPointerIterator<S: StorageIO> {
@@ -108,6 +102,10 @@ pub struct RowPointerIterator<S: StorageIO> {
     /// decoded and its row bytes are never fetched. The mask is always a
     /// *superset* of true matches, so ignoring it costs only performance.
     candidates: Option<Arc<CandidateBitmap>>,
+    /// Pointers handed out per batch, when not `batch_size()`. A slot list
+    /// of a few thousand candidates is cut finer so several workers share it;
+    /// see `ConcurrentProcessor::spawn_batch_tasks`.
+    batch_limit: Option<usize>,
 }
 
 /// The pointer-record length before MVCC stamps were added.
@@ -153,12 +151,41 @@ impl<S: StorageIO> RowPointerIterator<S> {
             chunk_start_position: 0,
             borrowed_chunk: None,
             candidates: None,
+            batch_limit: None,
         };
 
         // Load the first chunk of data
         iterator.load_next_chunk().await?;
 
         Ok(iterator)
+    }
+
+    /// Like [`Self::new`], but reads nothing until the first record is asked
+    /// for.
+    ///
+    /// For the query paths, which attach a candidate mask and then `reset`
+    /// before scanning: the chunk `new` loads up front is thrown away by
+    /// that reset and read again, and with a slot list from an index the
+    /// first read should be the chunk holding a candidate, not slot 0. A
+    /// point lookup paid for two whole chunks to read one record.
+    pub async fn new_deferred(io: Arc<S>) -> Result<Self> {
+        let total_length = {
+            let len = io.get_len().await as usize;
+            len - (len % TOTAL_LENGTH)
+        };
+        Ok(RowPointerIterator {
+            io,
+            position: 0,
+            buffer: MemoryBlock::default(),
+            buffer_index: 0,
+            buffer_valid_length: 0,
+            total_length,
+            end_of_data: false,
+            chunk_start_position: 0,
+            borrowed_chunk: None,
+            candidates: None,
+            batch_limit: None,
+        })
     }
 
     /// Attach (or clear) a candidate mask for the scan about to run.
@@ -168,6 +195,26 @@ impl<S: StorageIO> RowPointerIterator<S> {
     #[inline]
     pub fn set_candidates(&mut self, candidates: Option<Arc<CandidateBitmap>>) {
         self.candidates = candidates;
+        self.end_if_nothing();
+    }
+
+    /// Hands out at most `limit` pointers per batch.
+    pub fn set_batch_limit(&mut self, limit: usize) {
+        self.batch_limit = Some(limit.max(1));
+    }
+
+    /// Whether the candidates are a slot list rather than a mask.
+    pub fn has_sparse_candidates(&self) -> bool {
+        self.candidates.as_ref().is_some_and(|c| c.is_sparse())
+    }
+
+    /// A mask admitting nothing (a constant-false `WHERE`) ends the scan before
+    /// a single pointer is read.
+    #[inline]
+    fn end_if_nothing(&mut self) {
+        if self.candidates.as_ref().is_some_and(|c| c.is_nothing()) {
+            self.end_of_data = true;
+        }
     }
 
     #[inline]
@@ -190,6 +237,20 @@ impl<S: StorageIO> RowPointerIterator<S> {
         (self.total_length / TOTAL_LENGTH) as u64
     }
 
+    /// Records the scan will actually hand out at most: the whole table, or
+    /// with a slot list from an index, its candidates plus whatever was
+    /// appended after the list was made. What the dispatcher sizes its
+    /// workers by, so a point lookup does not spawn a worker per core to
+    /// read one row.
+    pub fn expected_records(&self) -> u64 {
+        let total = self.total_records();
+        match self.candidates.as_ref() {
+            Some(c) if c.is_nothing() => 0,
+            Some(c) if c.is_sparse() => c.count() + total.saturating_sub(c.n_slots()),
+            _ => total,
+        }
+    }
+
     pub fn reset(&mut self) {
         self.position = 0;
         self.buffer_index = 0;
@@ -197,6 +258,14 @@ impl<S: StorageIO> RowPointerIterator<S> {
         self.end_of_data = false;
         self.chunk_start_position = 0;
         self.borrowed_chunk = None;
+        self.end_if_nothing();
+    }
+
+    /// The in-place count of the mapping the current chunk is borrowed from,
+    /// if it is borrowed and can be rewritten under the borrow.
+    #[inline(always)]
+    fn borrowed_seq(&self) -> Option<&crate::core::storage_providers::inplace_seq::InPlaceSeq> {
+        self.borrowed_chunk.as_ref().and_then(|b| b.seq()).map(|seq| &**seq)
     }
 
     /// Bytes of the currently loaded chunk, from the borrowed mapping when the
@@ -256,9 +325,13 @@ impl<S: StorageIO> RowPointerIterator<S> {
     /// Used only when a read has already failed short. Reads the candidate
     /// prefix rather than asking for a length, because the length is the thing
     /// that turned out to be wrong.
-    async fn readable_record_prefix(&mut self, max_records: u64) -> u64 {
+    ///
+    /// Only a *short* read (`UnexpectedEof`) narrows the search. Any other
+    /// failure is an I/O error and is returned: counting it as "not readable"
+    /// shrank the chunk, and with it the scan, without anything reporting it.
+    async fn readable_record_prefix(&mut self, max_records: u64) -> std::io::Result<u64> {
         if max_records == 0 {
-            return 0;
+            return Ok(0);
         }
         // Invariant: `lo` records are readable, `hi` records are not.
         let mut lo = 0u64;
@@ -270,7 +343,8 @@ impl<S: StorageIO> RowPointerIterator<S> {
             let slice = &mut self.buffer.into_slice_mut()[..bytes];
             match self.io.read_data_into_buffer(&mut probe_at, slice).await {
                 Ok(()) => lo = mid,
-                Err(_) => hi = mid,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => hi = mid,
+                Err(e) => return Err(e),
             }
         }
         // `lo` was proven readable by the probe that set it; a `lo` still at 0
@@ -280,11 +354,13 @@ impl<S: StorageIO> RowPointerIterator<S> {
             let bytes = TOTAL_LENGTH;
             let mut probe_at = self.position;
             let slice = &mut self.buffer.into_slice_mut()[..bytes];
-            if self.io.read_data_into_buffer(&mut probe_at, slice).await.is_ok() {
-                lo = 1;
+            match self.io.read_data_into_buffer(&mut probe_at, slice).await {
+                Ok(()) => lo = 1,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                Err(e) => return Err(e),
             }
         }
-        lo
+        Ok(lo)
     }
 
     /// Load the next chunk of data into the buffer
@@ -294,6 +370,18 @@ impl<S: StorageIO> RowPointerIterator<S> {
         self.buffer_index = 0;
         self.buffer_valid_length = 0;
         self.borrowed_chunk = None;
+
+        // A slot list from a secondary index names the few slots worth
+        // reading. Jump to the chunk holding the next one rather than loading
+        // every chunk in between only to skip all of its records: a point
+        // lookup over a million rows reads one chunk, not three hundred.
+        if let Some(c) = self.candidates.as_ref().filter(|c| c.is_sparse()) {
+            let slot = self.position / TOTAL_LENGTH as u64;
+            let target = c.next_candidate(slot).saturating_mul(TOTAL_LENGTH as u64);
+            if target > self.position {
+                self.position = target.min(self.total_length as u64);
+            }
+        }
 
         // Check if we've reached the end of the storage
         if self.position >= self.total_length as u64 {
@@ -309,7 +397,17 @@ impl<S: StorageIO> RowPointerIterator<S> {
             return Ok(());
         }
 
-        let bytes_to_read_raw = std::cmp::min(bytes_remaining, CHUNK_SIZE as u64);
+        let mut bytes_to_read_raw = std::cmp::min(bytes_remaining, CHUNK_SIZE as u64);
+        // With a slot list, read from this candidate to the last one this
+        // chunk would reach, and stop there: the records past it would only
+        // be skipped, and the next load jumps straight to the next candidate.
+        if let Some(c) = self.candidates.as_ref().filter(|c| c.is_sparse()) {
+            let first = self.position / TOTAL_LENGTH as u64;
+            let reach = first + (bytes_to_read_raw / TOTAL_LENGTH as u64);
+            if let Some(last) = c.last_candidate_below(reach).filter(|l| *l >= first) {
+                bytes_to_read_raw = (last - first + 1) * TOTAL_LENGTH as u64;
+            }
+        }
         let bytes_to_read = bytes_to_read_raw - (bytes_to_read_raw % (TOTAL_LENGTH as u64));
         if bytes_to_read == 0 {
             self.end_of_data = true;
@@ -368,7 +466,7 @@ impl<S: StorageIO> RowPointerIterator<S> {
                 // read, rather than trusting any length. Binary search costs at
                 // most ~12 reads and only on this path.
                 let max_records = bytes_to_read / TOTAL_LENGTH as u64;
-                let readable = self.readable_record_prefix(max_records).await;
+                let readable = self.readable_record_prefix(max_records).await?;
                 if readable == 0 {
                     self.end_of_data = true;
                     self.buffer_valid_length = 0;
@@ -378,13 +476,17 @@ impl<S: StorageIO> RowPointerIterator<S> {
                 // Re-read the prefix we proved readable. The probe that ended the
                 // search may have been a *failure*, which can leave the buffer
                 // holding part of a read that did not complete.
+                //
+                // A failure here is an error, not the end of the table. These
+                // records were read successfully a moment ago, so nothing benign
+                // explains losing them — and reporting the end of data here
+                // returned every record before this chunk as the whole answer.
                 let usable = readable * TOTAL_LENGTH as u64;
                 let mut read_at = self.position;
                 let slice = &mut self.buffer.into_slice_mut()[..usable as usize];
-                if self.io.read_data_into_buffer(&mut read_at, slice).await.is_err() {
-                    self.end_of_data = true;
+                if let Err(e) = self.io.read_data_into_buffer(&mut read_at, slice).await {
                     self.buffer_valid_length = 0;
-                    return Ok(());
+                    return Err(e.into());
                 }
 
                 self.buffer_valid_length = usable as usize;
@@ -434,12 +536,28 @@ impl<S: StorageIO> RowPointerIterator<S> {
             // record examined*, paid on the one path where the mask is supposed
             // to be cheaper than the fetch it replaces — the batch path at
             // `next_row_pointers_into` already hoists it for the same reason.
-            let excluded = match self.candidates.as_ref() {
-                Some(bm) => !bm.get(self.current_slot()),
-                None => false,
+            //
+            // The answer is how many records to pass over before the next one
+            // worth decoding. A slot list answers it with one search that
+            // lands on the next listed slot, so every record between two
+            // candidates is passed in one step instead of a search each, and a
+            // candidate costs one search instead of a `get` and then another.
+            // `next_candidate` never returns less than the slot it was given,
+            // and returns that slot itself past `n_slots`, so an appended row
+            // is still decoded.
+            let skip = match self.candidates.as_ref() {
+                Some(bm) if bm.is_sparse() => {
+                    let slot = self.current_slot();
+                    bm.next_candidate(slot) - slot
+                }
+                Some(bm) => u64::from(!bm.get(self.current_slot())),
+                None => 0,
             };
-            if excluded {
-                self.buffer_index += TOTAL_LENGTH;
+            if skip > 0 {
+                // Clamped to the chunk: the next load jumps to the candidate.
+                self.buffer_index = (self.buffer_index as u64)
+                    .saturating_add(skip.saturating_mul(TOTAL_LENGTH as u64))
+                    .min(self.buffer_valid_length as u64) as usize;
                 continue;
             }
 
@@ -451,7 +569,7 @@ impl<S: StorageIO> RowPointerIterator<S> {
             let arr_ref: &[u8; TOTAL_LENGTH] = unsafe {
                 &*(buf_slice.as_ptr().add(self.buffer_index) as *const [u8; TOTAL_LENGTH])
             };
-            let row_pointer = RowPointer::from_slice(arr_ref);
+            let row_pointer = decode_record(self.borrowed_seq(), arr_ref);
 
             self.buffer_index += TOTAL_LENGTH;
 
@@ -465,10 +583,7 @@ impl<S: StorageIO> RowPointerIterator<S> {
 
     /// Get the next RowPointer from the buffer, loading a new chunk if necessary
     pub async fn next_row_pointer(&mut self) -> Result<Option<RowPointer>> {
-        Ok(self
-            .next_row_pointer_with_offset()
-            .await?
-            .map(|(_, p)| p))
+        Ok(self.next_row_pointer_with_offset().await?.map(|(_, p)| p))
     }
 
     /// Get multiple RowPointers at once, up to BATCH_SIZE
@@ -482,8 +597,14 @@ impl<S: StorageIO> RowPointerIterator<S> {
     pub async fn next_row_pointers_into(&mut self, out: &mut Vec<RowPointer>) -> Result<()> {
         out.clear();
 
-        let batch_size = crate::batch_size();
-        out.reserve(batch_size.saturating_sub(out.capacity()));
+        let batch_size = self.batch_limit.unwrap_or_else(crate::batch_size);
+        // A caller that sized `out` knows how many pointers to expect: the
+        // scan's dispatch sizes it to the rows still expected, so a point
+        // read allocates room for one pointer, not a whole batch (10,000 of
+        // them, ~0.6 MB, twice a statement). Pushes past it still grow it.
+        if out.capacity() == 0 {
+            out.reserve(batch_size);
+        }
 
         // Inline the synchronous fast-path of `next_row_pointer_with_offset` so we avoid
         // creating/polling a fresh async future for every pointer. We only `.await` when
@@ -503,15 +624,72 @@ impl<S: StorageIO> RowPointerIterator<S> {
 
             // Drain as many records as we can from the currently loaded chunk without awaiting.
             let buf_ptr = self.chunk_bytes().as_ptr();
+            // Records decoded straight out of the mapping are read under the
+            // file's in-place count (`decode_record`); a copied chunk was
+            // checked when it was copied.
+            let seq = self.borrowed_chunk.as_ref().and_then(|b| b.seq()).cloned();
             // Cloned once per chunk: holding a borrow of `self.candidates` would
             // conflict with mutating `buffer_index` inside the loop.
             let candidates = self.candidates.clone();
+
+            // A slot list is walked with a cursor into it. Asking the list
+            // about each record cost about three binary searches per candidate
+            // (`get` on the candidate, `get` missing on the record after it,
+            // then `next_candidate`), all in the one dispatcher task, which at
+            // 40k candidates is milliseconds of serial work per query.
+            //
+            // The cursor lives only for this drain of this chunk, so nothing
+            // has to be kept in step with `reset`, `seek_to_byte_position`,
+            // `load_next_chunk`, a batch limit or a call to the single-record
+            // path: each drain finds its place again with one search. Within
+            // it the slot only moves forward, so every listed slot before the
+            // cursor is below the current slot, which is what `gallop_to`
+            // needs to land where a fresh search would.
+            if let Some((slots, n_slots)) = candidates
+                .as_deref()
+                .and_then(|bm| bm.sparse_slots().map(|s| (s, bm.n_slots())))
+            {
+                let current = self.current_slot();
+                let mut at = slots.partition_point(|s| *s < current);
+                while produced < batch_size
+                    && self.buffer_index + TOTAL_LENGTH <= self.buffer_valid_length
+                {
+                    let slot = self.current_slot();
+                    // Past `n_slots` every record is a candidate: a row
+                    // appended after the list was made was never indexed.
+                    if slot < n_slots {
+                        at = gallop_to(slots, at, slot);
+                        let next = slots.get(at).copied().unwrap_or(n_slots);
+                        if next != slot {
+                            let skip = (next - slot).saturating_mul(TOTAL_LENGTH as u64);
+                            self.buffer_index = (self.buffer_index as u64)
+                                .saturating_add(skip)
+                                .min(self.buffer_valid_length as u64) as usize;
+                            continue;
+                        }
+                    }
+                    let arr_ref: &[u8; TOTAL_LENGTH] = unsafe {
+                        &*(buf_ptr.add(self.buffer_index) as *const [u8; TOTAL_LENGTH])
+                    };
+                    let row_pointer = decode_record(seq.as_deref(), arr_ref);
+                    self.buffer_index += TOTAL_LENGTH;
+                    if unlikely(row_pointer.deleted) {
+                        continue;
+                    }
+                    out.push(row_pointer);
+                    produced += 1;
+                }
+                continue;
+            }
+
             while produced < batch_size
                 && self.buffer_index + TOTAL_LENGTH <= self.buffer_valid_length
             {
                 if let Some(ref bm) = candidates {
                     let slot = self.current_slot();
                     if !bm.get(slot) {
+                        // A slot list never gets here: it was walked above.
+                        //
                         // Whole-word skip: when no slot in this 64-row group can
                         // match, 64 pointer records are dismissed without
                         // decoding any of them. Both operands are multiples of
@@ -530,7 +708,8 @@ impl<S: StorageIO> RowPointerIterator<S> {
                             // an index clamped to the end of the chunk is safe:
                             // the read never happens if nothing follows.
                             //
-                            // `_mm_prefetch` directly rather than
+                            // `_mm_prefetch` (through `prefetch_read_l1`,
+                            // `prfm pldl1keep` on aarch64) rather than
                             // `branches::prefetch_read_data`, which looks like
                             // the natural choice and is a trap. That crate
                             // numbers LOCALITY backwards from LLVM on stable
@@ -541,16 +720,14 @@ impl<S: StorageIO> RowPointerIterator<S> {
                             // numbering — the same source silently emitting the
                             // opposite instruction depending on the toolchain,
                             // with no diagnostic either way. `_MM_HINT_T0` has
-                            // one meaning on both. This crate already depends on
-                            // `std::arch::x86_64` unconditionally in
-                            // `memory_pool.rs`, so nothing portable is given up.
+                            // one meaning on both.
                             //
                             // T0 is the hint we want and non-temporal is the one
                             // we must not give: the landing address begins the
                             // ~2.3 KB this loop walks immediately and in order.
                             if self.buffer_index + TOTAL_LENGTH <= self.buffer_valid_length {
                                 let landing = unsafe { buf_ptr.add(self.buffer_index) };
-                                unsafe { _mm_prefetch::<_MM_HINT_T0>(landing as *const i8) };
+                                crate::instructions::prefetch_read_l1(landing as *const u8);
                             }
                         } else {
                             self.buffer_index += TOTAL_LENGTH;
@@ -559,10 +736,9 @@ impl<S: StorageIO> RowPointerIterator<S> {
                     }
                 }
 
-                let arr_ref: &[u8; TOTAL_LENGTH] = unsafe {
-                    &*(buf_ptr.add(self.buffer_index) as *const [u8; TOTAL_LENGTH])
-                };
-                let row_pointer = RowPointer::from_slice(arr_ref);
+                let arr_ref: &[u8; TOTAL_LENGTH] =
+                    unsafe { &*(buf_ptr.add(self.buffer_index) as *const [u8; TOTAL_LENGTH]) };
+                let row_pointer = decode_record(seq.as_deref(), arr_ref);
                 self.buffer_index += TOTAL_LENGTH;
 
                 if unlikely(row_pointer.deleted) {
@@ -600,6 +776,69 @@ impl<S: StorageIO> RowPointerIterator<S> {
 
         Some(row_pointer)
     }
+}
+
+/// Where a string column's bytes start: the row's position plus the offset
+/// its 12-byte header holds.
+///
+/// The header is read from disk, and not always from a row: the open-time
+/// filter backfill and index build read rows by pointer without the
+/// compaction gate (their epoch checks discard what they read while rows
+/// move), and a dead slot's extent may hold another row's bytes. An offset
+/// that does not fit is a misread header, the error the range check after
+/// this reports, not an overflow: `+` panicked in debug builds, killing the
+/// backfill and leaving the table unfiltered (`partition_twin` hit it in
+/// most runs). In release it wrapped, and the range check refused it.
+#[inline]
+fn string_position(row_position: u64, header: &[u8]) -> std::io::Result<u64> {
+    let offset = u64::from_le_bytes(header[0..8].try_into().unwrap());
+    row_position.checked_add(offset).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid string offset {offset} in a row at {row_position} (likely misread header)"),
+        )
+    })
+}
+
+/// A string column's cell in a row: where its bytes start, as an offset from
+/// the row's start (eight bytes), and how many there are (four).
+pub(crate) const STRING_HEADER_BYTES: usize = 12;
+
+/// Where a string's bytes are and how many, from its header in a row of
+/// `row_length` bytes at `row_position`. Refused when the size is absurd or
+/// the bytes do not lie inside the row, which is a misread header. An empty
+/// string has no bytes to place and is not range-checked.
+///
+/// The checks [`RowPointer::fetch_row_reuse_async`] makes of a string, for a
+/// reader of cells (`processor::column_scan`) to make alike.
+#[inline]
+pub(crate) fn string_extent(row_position: u64, row_length: u64, header: &[u8]) -> std::io::Result<(u64, usize)> {
+    const MAX_REASONABLE_STRING_BYTES: usize = 64 * 1024 * 1024;
+    let string_row_position = string_position(row_position, header)?;
+    let string_size = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+    if string_size == 0 {
+        return Ok((string_row_position, 0));
+    }
+    if string_size > MAX_REASONABLE_STRING_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid string size {} (too large)", string_size),
+        ));
+    }
+    let row_end = row_position.saturating_add(row_length);
+    if string_row_position < row_position
+        || string_row_position > row_end
+        || string_row_position.saturating_add(string_size as u64) > row_end
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Invalid string range: pos={} size={} row_start={} row_end={} (likely misread header)",
+                string_row_position, string_size, row_position, row_end
+            ),
+        ));
+    }
+    Ok((string_row_position, string_size))
 }
 
 #[derive(Debug, Clone)]
@@ -674,6 +913,23 @@ fn read_stamps(buffer: &[u8]) -> (TxId, TxId) {
 }
 
 impl RowPointer {
+    /// Refuses a row position no column offset can be added to without
+    /// overflowing. A column's offset is a `u32`, so below this bound
+    /// `position + column_offset` cannot wrap; the position comes from a
+    /// pointer record whose checksum is not verified on read, so it is input
+    /// like a string header's offset (`string_position`). One compare per
+    /// fetch rather than one checked add per column.
+    #[inline]
+    pub(crate) fn check_column_range(&self) -> std::io::Result<()> {
+        if unlikely(self.position > u64::MAX - u32::MAX as u64) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid row position {} (likely a misread pointer)", self.position),
+            ));
+        }
+        Ok(())
+    }
+
     /// Gets the current timestamp in milliseconds since UNIX epoch
     pub fn get_timestamp() -> u128 {
         // Get the current timestamp in milliseconds
@@ -769,15 +1025,30 @@ impl RowPointer {
 
         row_write: &RowWrite,
 
+        // The version this one replaces, or `None` for a genuine insert. A
+        // replacement keeps the row's existing id, so it must not draw one from
+        // the sequence: `inherit_metadata` would overwrite it, and the number
+        // would be spent on nothing. That burn made `last_row_id` — reported as
+        // "highest id handed out" — count pointer records rather than rows, and
+        // it read 472 401 against ~1 000 live rows on the first deployment it
+        // was measured on, which is not a figure anything can use.
+        previous: Option<&RowPointer>,
+
         // The transaction this version belongs to. `FROZEN_TX` for a write
         // outside any transaction, which is visible to everyone immediately.
         written_by: TxId,
     ) -> Self {
         #[cfg(feature = "enable_long_row")]
-        let id = last_id.fetch_add(1, std::sync::atomic::Ordering::Acquire) as u128;
+        let id = match previous {
+            Some(previous) => previous.id,
+            None => last_id.fetch_add(1, std::sync::atomic::Ordering::Acquire) as u128,
+        };
 
         #[cfg(not(feature = "enable_long_row"))]
-        let id = last_id.fetch_add(1, std::sync::atomic::Ordering::Acquire);
+        let id = match previous {
+            Some(previous) => previous.id,
+            None => last_id.fetch_add(1, std::sync::atomic::Ordering::Acquire),
+        };
 
         #[cfg(feature = "enable_long_row")]
         let (total_bytes, total_string_size) = {
@@ -987,14 +1258,29 @@ impl RowPointer {
 
         let owns_txn = txn.is_none();
         let txn = txn.unwrap_or_else(|| pointers_io.begin_txn());
-        let token = self
+        // A transaction opened here is ended here on every path: one left open
+        // with a logged in-place stamp holds the log's pending count up, and
+        // the log cannot be checkpointed again for the life of the process.
+        let token = match self
             .save_at_in_txn(&*pointers_io, pointer_record_pos, txn)
-            .await?;
+            .await
+        {
+            Ok(token) => token,
+            Err(e) => {
+                if owns_txn {
+                    pointers_io.abort_txn(txn).await;
+                }
+                return Err(e);
+            }
+        };
         if owns_txn {
             // The tombstone is not a tombstone until it is durable. Reporting a
             // row deleted whose deletion may not survive a restart is how a
             // deleted row comes back.
-            pointers_io.commit_durable(token).await?;
+            if let Err(e) = pointers_io.commit_durable(token).await {
+                pointers_io.abort_txn(txn).await;
+                return Err(e.into());
+            }
         }
         Ok(())
     }
@@ -1112,7 +1398,11 @@ impl RowPointer {
         }
     }
 
-    fn build_row_data(row_write: &RowWrite, total_bytes: usize, total_string_size: usize) -> MemoryBlock {
+    fn build_row_data(
+        row_write: &RowWrite,
+        total_bytes: usize,
+        total_string_size: usize,
+    ) -> MemoryBlock {
         let mut block = MEMORY_POOL.acquire(total_bytes);
         let slice = block.into_slice_mut();
 
@@ -1250,6 +1540,51 @@ impl RowPointer {
     ) -> Result<(RowPointer, Option<u64>)> {
         Self::validate(row_write)?;
 
+        // A transaction opened here is ended here, on every path. The body
+        // below has half a dozen ways out, and any of them taken with an
+        // in-place write already logged left the transaction open — holding
+        // the log's pending count up so it could never be checkpointed again.
+        // So the body runs inside the transaction as if a caller had supplied
+        // it, and this level commits or aborts.
+        if txn.is_none() {
+            let txn = rows_io.begin_txn();
+            let result = Box::pin(self.update_with_pointer_record_pos(
+                pointers_io.clone(),
+                rows_io.clone(),
+                pointer_record_pos,
+                last_id,
+                table_length,
+                #[cfg(feature = "enable_long_row")]
+                cluster,
+                row_write,
+                Some(txn),
+                free_space,
+                written_by,
+            ))
+            .await;
+            return match result {
+                Err(e) => {
+                    pointers_io.abort_txn(txn).await;
+                    Err(e)
+                }
+                Ok((pointer, moved_to)) => {
+                    if let Err(e) = pointers_io.commit_durable(txn).await {
+                        // A relocation that is not durable owns no extent that
+                        // survives a restart; leaving the loan out would shield
+                        // those bytes from every future sweep.
+                        if moved_to.is_some() {
+                            if let Some(free_space) = free_space {
+                                free_space.release_failed_loan(pointer.position);
+                            }
+                        }
+                        pointers_io.abort_txn(txn).await;
+                        return Err(e.into());
+                    }
+                    Ok((pointer, moved_to))
+                }
+            };
+        }
+
         let (new_total_bytes_u64, new_total_string_size) = Self::calculate_total_bytes(row_write);
         let old_len_u64 = self.length as u64;
 
@@ -1274,29 +1609,35 @@ impl RowPointer {
             // Retire the old version and append the replacement. Under
             // versioning that is a stamp rather than a tombstone, so a snapshot
             // older than this update still reads the row it was looking at.
-            self.delete(pointers_io.clone(), pointer_record_pos, Some(txn), written_by)
-                .await?;
-
-            let (new_pointer_record_pos, new_pointer) = RowPointer::write_row_with_pointer_record_pos(
-                pointers_io,
-                rows_io,
-                last_id,
-                table_length,
-                #[cfg(feature = "enable_long_row")]
-                cluster,
-                row_write,
-                // Same transaction: tombstoning the old pointer and appending
-                // the replacement must not be separable by a crash.
+            self.delete(
+                pointers_io.clone(),
+                pointer_record_pos,
                 Some(txn),
-                free_space,
-                // The replacement is the same row, so it keeps the row's
-                // history rather than presenting itself as newly created.
-                Some(&previous),
-                // ...but it is a new *version*, so it is stamped with the
-                // transaction making the change, not the one that inserted it.
                 written_by,
             )
             .await?;
+
+            let (new_pointer_record_pos, new_pointer) =
+                RowPointer::write_row_with_pointer_record_pos(
+                    pointers_io,
+                    rows_io,
+                    last_id,
+                    table_length,
+                    #[cfg(feature = "enable_long_row")]
+                    cluster,
+                    row_write,
+                    // Same transaction: tombstoning the old pointer and appending
+                    // the replacement must not be separable by a crash.
+                    Some(txn),
+                    free_space,
+                    // The replacement is the same row, so it keeps the row's
+                    // history rather than presenting itself as newly created.
+                    Some(&previous),
+                    // ...but it is a new *version*, so it is stamped with the
+                    // transaction making the change, not the one that inserted it.
+                    written_by,
+                )
+                .await?;
 
             if owns_txn {
                 if let Err(e) = pointers_io_for_commit.commit_durable(txn).await {
@@ -1618,17 +1959,21 @@ impl RowPointer {
                 "Row is marked as deleted".into(),
             ));
         }
+        if let Err(e) = self.check_column_range() {
+            return Err(super::error::RowError::InvalidData(e.to_string()));
+        }
 
         // Create a vector to hold all the columns
-        let mut columns: SmallVec<[Column; 32]> = SmallVec::with_capacity(row_fetch.columns_fetching_data.len());
-        
+        let mut columns: crate::core::row::row::RowColumns =
+            SmallVec::with_capacity(row_fetch.columns_fetching_data.len());
+
         // Pre-allocate columns with placeholders
         for _ in 0..row_fetch.columns_fetching_data.len() {
-             columns.push(Column {
-                 schema_id: 0,
-                 data: MemoryBlock::default(),
-                 column_type: DbType::U8,
-             });
+            columns.push(Column {
+                schema_id: 0,
+                data: MemoryBlock::default(),
+                column_type: DbType::U8,
+            });
         }
 
         let mut string_headers_buffer: SmallVec<[u8; 128]> = SmallVec::new();
@@ -1641,11 +1986,11 @@ impl RowPointer {
             } else {
                 let position = self.position + column_data.column_offset as u64;
                 let c_size = column_data.size as usize;
-                
+
                 let block = MEMORY_POOL.acquire(c_size);
                 let col = &mut columns[i];
                 col.data = block;
-                col.schema_id = column_data.schema_id;
+                col.schema_id = crate::core::row::row::schema_id_of(column_data.schema_id);
                 col.column_type = column_data.column_type.clone();
 
                 let ptr = col.data.as_mut_ptr();
@@ -1657,11 +2002,14 @@ impl RowPointer {
 
         if !string_col_indices.is_empty() {
             string_headers_buffer.resize(string_col_indices.len() * 12, 0);
-            
-            for (chunk, &col_idx) in string_headers_buffer.chunks_exact_mut(12).zip(string_col_indices.iter()) {
-                 let column_data = &row_fetch.columns_fetching_data[col_idx];
-                 let position = self.position + column_data.column_offset as u64;
-                 first_pass_reads.push((position, chunk));
+
+            for (chunk, &col_idx) in string_headers_buffer
+                .chunks_exact_mut(12)
+                .zip(string_col_indices.iter())
+            {
+                let column_data = &row_fetch.columns_fetching_data[col_idx];
+                let position = self.position + column_data.column_offset as u64;
+                first_pass_reads.push((position, chunk));
             }
         }
 
@@ -1673,7 +2021,7 @@ impl RowPointer {
                 .await
                 .map_err(super::error::RowError::Io)?;
         }
-        
+
         drop(first_pass_reads);
 
         if !string_col_indices.is_empty() {
@@ -1682,14 +2030,16 @@ impl RowPointer {
             let row_len = self.length as u64;
             let row_end = row_start.saturating_add(row_len);
             const MAX_REASONABLE_STRING_BYTES: usize = 64 * 1024 * 1024;
-            
-            for (chunk, &col_idx) in string_headers_buffer.chunks_exact(12).zip(string_col_indices.iter()) {
-                let string_row_position = self.position
-                    + u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+
+            for (chunk, &col_idx) in string_headers_buffer
+                .chunks_exact(12)
+                .zip(string_col_indices.iter())
+            {
+                let string_row_position = string_position(self.position, chunk)?;
                 let string_size = u32::from_le_bytes(chunk[8..12].try_into().unwrap()) as usize;
 
                 let col = &mut columns[col_idx];
-                col.schema_id = row_fetch.columns_fetching_data[col_idx].schema_id;
+                col.schema_id = crate::core::row::row::schema_id_of(row_fetch.columns_fetching_data[col_idx].schema_id);
                 col.column_type = DbType::STRING;
 
                 if string_size == 0 {
@@ -1721,7 +2071,7 @@ impl RowPointer {
                 let buf = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
                 second_pass_reads.push((string_row_position, buf));
             }
-            
+
             if !second_pass_reads.is_empty() {
                 io.read_vectored(&mut second_pass_reads)
                     .await
@@ -1748,6 +2098,7 @@ impl RowPointer {
         if unlikely(self.deleted) {
             return Err(std::io::Error::other("row is marked as deleted"));
         }
+        self.check_column_range()?;
 
         let columns = &mut row_reuse.columns;
 
@@ -1794,8 +2145,8 @@ impl RowPointer {
                 if unlikely(col.data.into_slice().len() != c_size) {
                     col.data = MEMORY_POOL.acquire(c_size);
                 }
-                
-                col.schema_id = column_data.schema_id;
+
+                col.schema_id = crate::core::row::row::schema_id_of(column_data.schema_id);
                 col.column_type = column_data.column_type.clone();
 
                 let ptr = col.data.as_mut_ptr();
@@ -1807,11 +2158,14 @@ impl RowPointer {
 
         if !string_col_indices.is_empty() {
             string_headers_buffer.resize(string_col_indices.len() * 12, 0);
-            
-            for (chunk, &col_idx) in string_headers_buffer.chunks_exact_mut(12).zip(string_col_indices.iter()) {
-                 let column_data = &row_fetch.columns_fetching_data[col_idx];
-                 let position = self.position + column_data.column_offset as u64;
-                 first_pass_reads.push((position, chunk));
+
+            for (chunk, &col_idx) in string_headers_buffer
+                .chunks_exact_mut(12)
+                .zip(string_col_indices.iter())
+            {
+                let column_data = &row_fetch.columns_fetching_data[col_idx];
+                let position = self.position + column_data.column_offset as u64;
+                first_pass_reads.push((position, chunk));
             }
         }
 
@@ -1820,55 +2174,32 @@ impl RowPointer {
                 io.read_vectored(&mut first_pass_reads).await?;
             }
         }
-        
+
         drop(first_pass_reads);
 
         if !string_col_indices.is_empty() {
             let mut second_pass_reads: SmallVec<[(u64, &mut [u8]); 8]> = SmallVec::new();
-            let row_start = self.position;
-            let row_len = self.length as u64;
-            let row_end = row_start.saturating_add(row_len);
-            const MAX_REASONABLE_STRING_BYTES: usize = 64 * 1024 * 1024;
-            
-            for (chunk, &col_idx) in string_headers_buffer.chunks_exact(12).zip(string_col_indices.iter()) {
-                let string_row_position = self.position
-                    + u64::from_le_bytes(chunk[0..8].try_into().unwrap());
-                let string_size = u32::from_le_bytes(chunk[8..12].try_into().unwrap()) as usize;
-                
+
+            for (chunk, &col_idx) in string_headers_buffer
+                .chunks_exact(12)
+                .zip(string_col_indices.iter())
+            {
+                let (string_row_position, string_size) = string_extent(self.position, self.length as u64, chunk)?;
+
                 let col = &mut columns[col_idx];
 
                 if string_size == 0 {
                     col.data = MemoryBlock::default();
-                    col.schema_id = row_fetch.columns_fetching_data[col_idx].schema_id;
+                    col.schema_id = crate::core::row::row::schema_id_of(row_fetch.columns_fetching_data[col_idx].schema_id);
                     col.column_type = DbType::STRING;
                     continue;
-                }
-
-                if string_size > MAX_REASONABLE_STRING_BYTES {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("Invalid string size {} (too large)", string_size),
-                    ));
-                }
-
-                if string_row_position < row_start
-                    || string_row_position > row_end
-                    || string_row_position.saturating_add(string_size as u64) > row_end
-                {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "Invalid string range: pos={} size={} row_start={} row_end={} (likely misread header)",
-                            string_row_position, string_size, row_start, row_end
-                        ),
-                    ));
                 }
 
                 if col.data.into_slice().len() != string_size {
                     col.data = MEMORY_POOL.acquire(string_size);
                 }
-                
-                col.schema_id = row_fetch.columns_fetching_data[col_idx].schema_id;
+
+                col.schema_id = crate::core::row::row::schema_id_of(row_fetch.columns_fetching_data[col_idx].schema_id);
                 col.column_type = DbType::STRING;
 
                 let ptr = col.data.as_mut_ptr();
@@ -1876,7 +2207,7 @@ impl RowPointer {
                 let buf = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
                 second_pass_reads.push((string_row_position, buf));
             }
-            
+
             if !second_pass_reads.is_empty() {
                 if !io.try_read_vectored_sync(&mut second_pass_reads) {
                     io.read_vectored(&mut second_pass_reads).await?;
@@ -1978,9 +2309,14 @@ impl RowPointer {
             #[cfg(feature = "enable_long_row")]
             cluster,
             row_write,
+            previous,
             written_by,
         );
 
+        // `new` has already taken the id from `previous`; this carries the rest
+        // of the metadata across. Left as a separate step so `inherit_metadata`
+        // stays correct on its own terms rather than depending on `new` having
+        // done half of it.
         if let Some(previous) = previous {
             row_pointer.inherit_metadata(previous);
         }
@@ -2089,14 +2425,31 @@ impl RowPointer {
         // the free list because no live pointer refers to it and every query
         // that could have held one has finished, so writing into it cannot
         // disturb a read in progress.
-        let reclaimed = free_space.and_then(|f| f.alloc(total_bytes as u64));
+        //
+        // Lent with no owner yet: only the record below, once written, may
+        // retire the loan, not an older record at the same start
+        // (`vacuum::Loan::floor`, `FreeSpace::owned_by`).
+        let reclaimed = free_space.and_then(|f| f.alloc_after(total_bytes as u64, u64::MAX));
 
+        // An append is shielded from sweeps from before it writes until its
+        // pointer below is written, when the ticket drops: its bytes are in
+        // the file first, owned by nothing a sweep can see (`vacuum::Appends`).
+        let mut appending = match (reclaimed, free_space) {
+            (None, Some(f)) => Some(f.begin_append()),
+            _ => None,
+        };
         let io_position = match reclaimed {
             Some(position) => {
                 let _ = rows_io.write_data_txn(txn, position, slice).await;
                 position
             }
-            None => rows_io.append_data_txn(txn, slice).await.0,
+            None => {
+                let position = rows_io.append_data_txn(txn, slice).await.0;
+                if let Some(ticket) = appending.as_mut() {
+                    ticket.landed(position, total_bytes as u64);
+                }
+                position
+            }
         };
         row_pointer.position = io_position;
 
@@ -2107,6 +2460,13 @@ impl RowPointer {
             std::sync::atomic::Ordering::AcqRel,
         );
 
+        // Tests: a writer held here has its bytes in place and no pointer yet,
+        // the window a sweep must not publish (`write_park`).
+        #[cfg(test)]
+        if let Some(f) = free_space {
+            write_park::reached(f).await;
+        }
+
         // Write the pointer last, taking its record offset from the same append
         // so later `save_at` / `delete` calls target this record and no other.
         //
@@ -2114,11 +2474,21 @@ impl RowPointer {
         // will ever own it. The loan shields those bytes from every future scan,
         // so without giving it back the space is lost for the life of the
         // process.
-        let (pointer_record_pos, token) = match row_pointer.save_in_txn(&*pointers_io, txn).await {
+        let saved = row_pointer.save_in_txn(&*pointers_io, txn).await;
+        drop(appending);
+        if let (Some(free_space), Some(position), Ok((record, _))) = (free_space, reclaimed, &saved) {
+            free_space.owned_by(position, record / ROW_POINTER_RECORD_LEN as u64);
+        }
+        let (pointer_record_pos, token) = match saved {
             Ok(result) => result,
             Err(e) => {
                 if let (Some(free_space), Some(position)) = (free_space, reclaimed) {
                     free_space.release_failed_loan(position);
+                }
+                // A reclaimed extent was an in-place write: the transaction
+                // holds a pending payload until it ends, and pins the log.
+                if owns_txn {
+                    rows_io.abort_txn(txn).await;
                 }
                 return Err(e);
             }
@@ -2134,6 +2504,7 @@ impl RowPointer {
                 if let (Some(free_space), Some(position)) = (free_space, reclaimed) {
                     free_space.release_failed_loan(position);
                 }
+                pointers_io.abort_txn(txn).await;
                 return Err(e.into());
             }
         }
@@ -2156,6 +2527,62 @@ impl RowPointer {
         }
 
         Ok((pointer_record_pos, row_pointer))
+    }
+}
+
+/// Decodes a pointer record. One straight out of a mapping is decoded under
+/// the file's in-place count, `seq`, and again if a write landed meanwhile:
+/// an UPDATE's `xmax` stamp rewrites it in place, and a decode that caught
+/// half of it read a version as deleted by some older, committed transaction
+/// (`storage_providers::inplace_seq`).
+#[inline(always)]
+fn decode_record(
+    seq: Option<&crate::core::storage_providers::inplace_seq::InPlaceSeq>,
+    record: &[u8; TOTAL_LENGTH],
+) -> RowPointer {
+    match seq {
+        None => RowPointer::from_slice(record),
+        Some(seq) => seq.read(|| RowPointer::from_slice(record)),
+    }
+}
+
+/// Holds one writer of a table between its row bytes and its pointer record,
+/// for tests of what a sweep may publish meanwhile.
+#[cfg(test)]
+pub(crate) mod write_park {
+    use std::sync::Arc;
+
+    use crate::core::vacuum::FreeSpace;
+
+    #[derive(Default)]
+    pub(crate) struct Park {
+        /// Notified once the writer is held.
+        pub parked: tokio::sync::Notify,
+        /// Notify to let it write its pointer.
+        pub release: tokio::sync::Notify,
+    }
+
+    static PARK: parking_lot::Mutex<Option<(usize, Arc<Park>)>> = parking_lot::Mutex::new(None);
+
+    /// Holds the next writer of the table `free_space` belongs to, once.
+    pub(crate) fn arm(free_space: &FreeSpace) -> Arc<Park> {
+        let park = Arc::new(Park::default());
+        *PARK.lock() = Some((free_space as *const _ as usize, park.clone()));
+        park
+    }
+
+    pub(super) async fn reached(free_space: &FreeSpace) {
+        let park = {
+            let mut armed = PARK.lock();
+            match armed.as_ref() {
+                Some((at, _)) if *at == free_space as *const _ as usize => armed.take().map(|(_, p)| p),
+                _ => None,
+            }
+        };
+        if let Some(park) = park {
+            park.parked.notify_one();
+            park.release.notified().await;
+        }
     }
 }
 
@@ -2483,6 +2910,54 @@ mod tests {
         }
     }
 
+    /// A pointer whose position no column offset can be added to is a
+    /// misread pointer, refused by both fetch paths before any add.
+    ///
+    /// Mutation: `check_column_range` always `Ok` panics on the add.
+    #[tokio::test]
+    async fn a_row_position_past_u64_is_an_error_not_an_overflow() {
+        let io = InMemoryIo { data: std::sync::Arc::new(vec![0u8; 64]), declared_len: None };
+        let pointer = create_test_row_pointer(1, u64::MAX - 4, 16, false);
+        let fetch = RowFetch {
+            columns_fetching_data: smallvec::smallvec![ColumnFetchingData {
+                column_offset: 8,
+                column_type: DbType::I64,
+                size: 8,
+                schema_id: 0,
+            }],
+        };
+        let mut row = Row::default();
+        let reused = pointer.fetch_row_reuse_async(&io, &fetch, &mut row).await;
+        assert_eq!(reused.err().map(|e| e.kind()), Some(std::io::ErrorKind::InvalidData));
+        assert!(pointer.fetch_row(Arc::new(io), &fetch).await.is_err());
+    }
+
+    /// A string header whose offset does not fit past the row's position is
+    /// a misread header, refused as one by both fetch paths, not an add that
+    /// overflows (a panic in debug builds, killing the filter backfill).
+    #[tokio::test]
+    async fn a_string_header_offset_past_u64_is_an_error_not_an_overflow() {
+        let position = 64u64;
+        let mut data = vec![0u8; 128];
+        data[64..72].copy_from_slice(&(u64::MAX - 8).to_le_bytes());
+        data[72..76].copy_from_slice(&5u32.to_le_bytes());
+        let io = InMemoryIo { data: std::sync::Arc::new(data), declared_len: None };
+        let pointer = create_test_row_pointer(1, position, 32, false);
+        let fetch = RowFetch {
+            columns_fetching_data: smallvec::smallvec![ColumnFetchingData {
+                column_offset: 0,
+                column_type: DbType::STRING,
+                size: 12,
+                schema_id: 0,
+            }],
+        };
+        let mut row = Row::default();
+        let reused = pointer.fetch_row_reuse_async(&io, &fetch, &mut row).await;
+        assert_eq!(reused.err().map(|e| e.kind()), Some(std::io::ErrorKind::InvalidData));
+        let fetched = pointer.fetch_row(Arc::new(io), &fetch).await;
+        assert!(fetched.is_err(), "fetch_row read a header past u64 as a string");
+    }
+
     #[tokio::test]
     async fn test_row_pointer_iterator_empty() {
         let mock_io = Arc::new(MockStorageProvider::new().await);
@@ -2535,7 +3010,9 @@ mod tests {
         let (pos, mut p) = it.next_row_pointer_with_offset().await.unwrap().unwrap();
         assert_eq!(p.deleted, false);
 
-        p.delete(mock_io.clone(), pos, None, FROZEN_TX).await.unwrap();
+        p.delete(mock_io.clone(), pos, None, FROZEN_TX)
+            .await
+            .unwrap();
 
         let mut read_pos = pos;
         let mut slice: [u8; TOTAL_LENGTH] = [0; TOTAL_LENGTH];
@@ -2573,7 +3050,9 @@ mod tests {
         .unwrap();
 
         // Find pointer record offset.
-        let mut it = RowPointerIterator::new(mock_io_pointers.clone()).await.unwrap();
+        let mut it = RowPointerIterator::new(mock_io_pointers.clone())
+            .await
+            .unwrap();
         let (pos, mut p) = it.next_row_pointer_with_offset().await.unwrap().unwrap();
         assert_eq!(p.id, initial.id);
 
@@ -2646,7 +3125,9 @@ mod tests {
         .unwrap();
 
         // Locate pointer record.
-        let mut it = RowPointerIterator::new(mock_io_pointers.clone()).await.unwrap();
+        let mut it = RowPointerIterator::new(mock_io_pointers.clone())
+            .await
+            .unwrap();
         let (pos, mut p) = it.next_row_pointer_with_offset().await.unwrap().unwrap();
 
         // Bigger update: expand a string.
@@ -2679,7 +3160,9 @@ mod tests {
         assert!(!new_pointer.deleted);
 
         // Iterating should see at least one non-deleted pointer (the appended one).
-        let mut it2 = RowPointerIterator::new(mock_io_pointers.clone()).await.unwrap();
+        let mut it2 = RowPointerIterator::new(mock_io_pointers.clone())
+            .await
+            .unwrap();
         let mut count = 0usize;
         while let Some(_p) = it2.next_row_pointer().await.unwrap() {
             count += 1;
@@ -3153,5 +3636,465 @@ mod over_reported_length {
     #[tokio::test]
     async fn a_wholly_absent_file_yields_nothing() {
         assert_eq!(iterator_over(0, 4).await.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod failed_prefix_reads {
+    //! A chunk whose declared length runs past the bytes there is recovered by
+    //! probing for the readable prefix and re-reading it. A *failed* read on
+    //! that path — as opposed to a short one — must fail the iteration. It used
+    //! to count as "not readable" (a probe) or as the end of the table (the
+    //! re-read), and either way the scan came back short and successful.
+    use super::*;
+    use rclite::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// `data` holds whole records and the length reported is one more record.
+    /// Reads past `data` are short (`UnexpectedEof`). Once the first short read
+    /// has happened, the `fail_at`-th read after it fails outright.
+    #[derive(Clone)]
+    struct FlakyIo {
+        data: std::sync::Arc<Vec<u8>>,
+        reads_since_eof: std::sync::Arc<AtomicU32>,
+        fail_at: u32,
+    }
+
+    impl crate::core::storage_providers::traits::StorageIO for FlakyIo {
+        async fn verify_data(&self, _position: u64, _buffer: &[u8]) -> bool {
+            true
+        }
+        async fn write_data(&self, _position: u64, _buffer: &[u8]) {}
+        async fn write_data_seek(&self, _seek: std::io::SeekFrom, _buffer: &[u8]) {}
+        async fn read_data_into_buffer(
+            &self,
+            position: &mut u64,
+            buffer: &mut [u8],
+        ) -> std::result::Result<(), std::io::Error> {
+            let seen = self.reads_since_eof.load(Ordering::SeqCst);
+            if seen > 0 {
+                self.reads_since_eof.store(seen + 1, Ordering::SeqCst);
+                if seen == self.fail_at {
+                    return Err(std::io::Error::other("injected read failure"));
+                }
+            }
+            let start = *position as usize;
+            let end = start.saturating_add(buffer.len());
+            if end > self.data.len() {
+                if seen == 0 {
+                    self.reads_since_eof.store(1, Ordering::SeqCst);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "short read",
+                ));
+            }
+            buffer.copy_from_slice(&self.data[start..end]);
+            *position += buffer.len() as u64;
+            Ok(())
+        }
+        async fn read_vectored(
+            &self,
+            reads: &mut [(u64, &mut [u8])],
+        ) -> std::result::Result<(), std::io::Error> {
+            for (pos, buf) in reads {
+                let mut p = *pos;
+                self.read_data_into_buffer(&mut p, buf).await?;
+            }
+            Ok(())
+        }
+        async fn append_data(&self, _buffer: &[u8], _immediate: bool) {}
+        async fn append_data_returning_offset(&self, _buffer: &[u8], _immediate: bool) -> u64 {
+            self.data.len() as u64
+        }
+        async fn get_len(&self) -> u64 {
+            (self.data.len() + TOTAL_LENGTH) as u64
+        }
+        fn exists(_location: &str, _table_name: &str) -> bool {
+            false
+        }
+        async fn create_temp(&self) -> Self {
+            self.clone()
+        }
+        async fn swap_temp(&self, _temp_io_sync: &mut Self) {}
+        fn get_location(&self) -> Option<String> {
+            None
+        }
+        async fn create_new(&self, _name: String) -> Self {
+            self.clone()
+        }
+        fn drop_io(&self) {}
+        fn get_hash(&self) -> u32 {
+            0
+        }
+        async fn start_service(&self) {}
+        fn get_name(&self) -> String {
+            "FlakyIo".to_string()
+        }
+    }
+
+    async fn scan(n: usize, fail_at: u32) -> Result<Vec<RowPointer>> {
+        let _ = crate::BATCH_SIZE.get_or_init(|| 1024);
+        let mut bytes = Vec::with_capacity(n * TOTAL_LENGTH);
+        for id in 0..n {
+            let mut p = RowPointer::from_slice(&[0u8; TOTAL_LENGTH]);
+            p.id = (id as u64 + 1).into();
+            p.position = (id * 16) as u64;
+            p.length = 16;
+            p.xmin = FROZEN_TX;
+            bytes.extend_from_slice(p.into_memory_block().into_slice());
+        }
+        let io = Arc::new(FlakyIo {
+            data: std::sync::Arc::new(bytes),
+            reads_since_eof: std::sync::Arc::new(AtomicU32::new(0)),
+            fail_at,
+        });
+        let mut it = RowPointerIterator::new(io).await?;
+        let mut out = Vec::new();
+        loop {
+            let batch = it.next_row_pointers().await?;
+            if batch.is_empty() {
+                return Ok(out);
+            }
+            out.extend(batch);
+        }
+    }
+
+    /// Every position a failure can land on — each probe of the search and the
+    /// re-read after it — gives either the whole table or an error.
+    #[tokio::test]
+    async fn a_failed_read_while_recovering_a_short_chunk_is_an_error() {
+        let n = 320;
+        let mut errors = 0;
+        for fail_at in 1..=24 {
+            match scan(n, fail_at).await {
+                Ok(rows) => assert_eq!(
+                    rows.len(),
+                    n,
+                    "fail_at {fail_at}: a failed read returned {} of {n} records as success",
+                    rows.len()
+                ),
+                Err(e) => {
+                    assert!(e.to_string().contains("injected"), "fail_at {fail_at}: {e}");
+                    errors += 1;
+                }
+            }
+        }
+        // Some positions must actually have hit the recovery path.
+        assert!(errors >= 5, "only {errors} injected failures were reached");
+    }
+}
+
+#[cfg(test)]
+mod sparse_candidate_walk {
+    //! The iterator walks a slot list from an index with a cursor that lives
+    //! for one drain of one chunk. A cursor that lands one candidate late is a
+    //! row silently dropped from a result, so this drives the iterator through
+    //! everything that repositions it — `reset`, `seek_to_byte_position`, a
+    //! batch limit changed mid-scan, the single-record path interleaved with
+    //! batches, chunk reloads, rows appended and picked up by
+    //! `refresh_total_length` — and checks every record it hands out against a
+    //! model of what the candidates admit.
+    use super::*;
+    use rclite::Arc;
+    use std::sync::atomic::Ordering;
+
+    /// Every record of the table is present in `data`; `len` is how many
+    /// bytes the provider currently reports, so rows can be "appended" by
+    /// raising it. With `borrow` the chunks come from the provider's own
+    /// bytes, the path a memory map takes.
+    #[derive(Clone)]
+    struct GrowingIo {
+        data: std::sync::Arc<Vec<u8>>,
+        len: std::sync::Arc<AtomicU64>,
+        borrow: bool,
+    }
+
+    impl crate::core::storage_providers::traits::StorageIO for GrowingIo {
+        async fn verify_data(&self, _position: u64, _buffer: &[u8]) -> bool {
+            true
+        }
+        async fn write_data(&self, _position: u64, _buffer: &[u8]) {}
+        async fn write_data_seek(&self, _seek: std::io::SeekFrom, _buffer: &[u8]) {}
+        async fn read_data_into_buffer(
+            &self,
+            position: &mut u64,
+            buffer: &mut [u8],
+        ) -> std::result::Result<(), std::io::Error> {
+            let start = *position as usize;
+            let end = start.saturating_add(buffer.len());
+            if end > self.len.load(Ordering::SeqCst) as usize {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "EOF"));
+            }
+            buffer.copy_from_slice(&self.data[start..end]);
+            *position += buffer.len() as u64;
+            Ok(())
+        }
+        async fn read_vectored(
+            &self,
+            reads: &mut [(u64, &mut [u8])],
+        ) -> std::result::Result<(), std::io::Error> {
+            for (pos, buf) in reads {
+                let mut p = *pos;
+                self.read_data_into_buffer(&mut p, buf).await?;
+            }
+            Ok(())
+        }
+        fn try_borrow_range(&self, position: u64, len: usize) -> Option<BorrowedBytes> {
+            let end = (position as usize).checked_add(len)?;
+            if !self.borrow || end > self.len.load(Ordering::SeqCst) as usize {
+                return None;
+            }
+            let owner: std::sync::Arc<dyn std::any::Any + Send + Sync> = self.data.clone();
+            // SAFETY: `owner` keeps the vector alive and it is never mutated.
+            Some(unsafe { BorrowedBytes::new(owner, self.data.as_ptr().add(position as usize), len) })
+        }
+        async fn append_data(&self, _buffer: &[u8], _immediate: bool) {}
+        async fn append_data_returning_offset(&self, _buffer: &[u8], _immediate: bool) -> u64 {
+            self.len.load(Ordering::SeqCst)
+        }
+        async fn get_len(&self) -> u64 {
+            self.len.load(Ordering::SeqCst)
+        }
+        fn exists(_location: &str, _table_name: &str) -> bool {
+            false
+        }
+        async fn create_temp(&self) -> Self {
+            self.clone()
+        }
+        async fn swap_temp(&self, _temp_io_sync: &mut Self) {}
+        fn get_location(&self) -> Option<String> {
+            None
+        }
+        async fn create_new(&self, _name: String) -> Self {
+            self.clone()
+        }
+        fn drop_io(&self) {}
+        fn get_hash(&self) -> u32 {
+            0
+        }
+        async fn start_service(&self) {}
+        fn get_name(&self) -> String {
+            "GrowingIo".to_string()
+        }
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            if n == 0 { 0 } else { self.next() % n }
+        }
+    }
+
+    /// Records per chunk, so candidates can be placed on chunk edges.
+    const CHUNK_RECORDS: u64 = (CHUNK_SIZE / TOTAL_LENGTH) as u64;
+
+    /// What the candidates admit at a slot.
+    enum Model {
+        Sparse { listed: std::collections::HashSet<u64>, n_slots: u64 },
+        Leading { upto: u64, n_slots: u64 },
+        Unfiltered,
+    }
+
+    impl Model {
+        fn admits(&self, slot: u64) -> bool {
+            match self {
+                Model::Sparse { listed, n_slots } => slot >= *n_slots || listed.contains(&slot),
+                Model::Leading { upto, n_slots } => slot >= *n_slots || slot < *upto,
+                Model::Unfiltered => true,
+            }
+        }
+    }
+
+    fn slot_of(p: &RowPointer) -> u64 {
+        // `id` is `u128` under `enable_long_row`; ids here are small.
+        p.id as u64 - 1
+    }
+
+    /// One random table, candidate set and script of iterator calls.
+    async fn run_case(seed: u64) {
+        let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+
+        // Mostly within one or two chunks, sometimes across several.
+        let max_records = match r.below(4) {
+            0 => 1 + r.below(40),
+            1 => 1 + r.below(CHUNK_RECORDS * 2),
+            _ => CHUNK_RECORDS + r.below(CHUNK_RECORDS * 3),
+        };
+        let deleted_one_in = [0u64, 2, 7, 50][r.below(4) as usize];
+        let mut deleted = vec![false; max_records as usize];
+        let mut bytes = Vec::with_capacity(max_records as usize * TOTAL_LENGTH);
+        for slot in 0..max_records {
+            let mut p = RowPointer::from_slice(&[0u8; TOTAL_LENGTH]);
+            p.id = (slot + 1).into();
+            p.position = slot * 16;
+            p.length = 16;
+            p.xmin = FROZEN_TX;
+            p.deleted = deleted_one_in != 0 && r.below(deleted_one_in) == 0;
+            deleted[slot as usize] = p.deleted;
+            bytes.extend_from_slice(p.into_memory_block().into_slice());
+        }
+
+        // The table as it was when the iterator was made; the rest arrives
+        // later. `n_slots` is when the index was asked, which may be a little
+        // before or after that.
+        let mut visible = if r.below(3) == 0 { r.below(max_records + 1) } else { max_records };
+        let n_slots = (visible + r.below(4)).saturating_sub(r.below(4) * r.below(visible / 4 + 1));
+
+        let model = match r.below(6) {
+            0 => Model::Unfiltered,
+            1 => Model::Leading { upto: r.below(n_slots + 1), n_slots },
+            _ => {
+                // Densities from a handful of slots to all of them, plus the
+                // slots where a chunk or the list begins and ends.
+                let one_in = [1u64, 2, 3, 40, 500, 5000][r.below(6) as usize];
+                let mut listed = std::collections::HashSet::new();
+                for slot in 0..n_slots {
+                    if r.below(one_in) == 0 {
+                        listed.insert(slot);
+                    }
+                }
+                let edges = [
+                    0,
+                    1,
+                    CHUNK_RECORDS - 1,
+                    CHUNK_RECORDS,
+                    CHUNK_RECORDS + 1,
+                    2 * CHUNK_RECORDS - 1,
+                    2 * CHUNK_RECORDS,
+                    n_slots.saturating_sub(1),
+                ];
+                for edge in edges {
+                    if edge < n_slots && r.below(2) == 0 {
+                        listed.insert(edge);
+                    }
+                }
+                Model::Sparse { listed, n_slots }
+            }
+        };
+        let bitmap = match &model {
+            Model::Sparse { listed, n_slots } => {
+                let mut slots: Vec<u64> = listed.iter().copied().collect();
+                slots.sort_unstable();
+                Some(Arc::new(CandidateBitmap::sparse(slots, *n_slots)))
+            }
+            Model::Leading { upto, n_slots } => {
+                Some(Arc::new(CandidateBitmap::leading(*n_slots, *upto)))
+            }
+            Model::Unfiltered => None,
+        };
+
+        let io = Arc::new(GrowingIo {
+            data: std::sync::Arc::new(bytes),
+            len: std::sync::Arc::new(AtomicU64::new(visible * TOTAL_LENGTH as u64)),
+            borrow: r.below(2) == 0,
+        });
+        let mut it = if r.below(2) == 0 {
+            RowPointerIterator::new_deferred(Arc::clone(&io)).await.unwrap()
+        } else {
+            RowPointerIterator::new(Arc::clone(&io)).await.unwrap()
+        };
+        it.set_candidates(bitmap);
+        it.reset();
+        if r.below(2) == 0 {
+            it.set_batch_limit(1 + r.below(64) as usize);
+        }
+
+        // Where the current pass started, and what it has handed out.
+        let mut start = 0u64;
+        let mut got: Vec<u64> = Vec::new();
+        let mut out = Vec::new();
+        let ctx = |start: u64, visible: u64| {
+            format!("seed {seed}: pass from slot {start}, {visible} of {max_records} records")
+        };
+        // Repositionings are capped so a pass always gets to finish.
+        let mut moves = 0;
+        loop {
+            let op = r.below(40);
+            if op <= 1 {
+                moves += 1;
+            }
+            match op {
+                // Start over, as the processor does before driving a scan.
+                0 if moves <= 4 => {
+                    it.reset();
+                    start = 0;
+                    got.clear();
+                }
+                // Jump to a slot, as a ranged scan does.
+                1 if moves <= 4 => {
+                    start = r.below(visible + 1);
+                    it.seek_to_byte_position(start * TOTAL_LENGTH as u64).await.unwrap();
+                    got.clear();
+                }
+                // Rows appended since the iterator was made.
+                2 => {
+                    visible = (visible + 1 + r.below(CHUNK_RECORDS / 2)).min(max_records);
+                    io.len.store(visible * TOTAL_LENGTH as u64, Ordering::SeqCst);
+                    it.refresh_total_length().await;
+                }
+                3 => it.set_batch_limit(1 + r.below(300) as usize),
+                0 | 1 => {}
+                // The single-record path, between batches.
+                4..=11 => match it.next_row_pointer_with_offset().await.unwrap() {
+                    Some((offset, p)) => {
+                        let slot = slot_of(&p);
+                        assert_eq!(offset, slot * TOTAL_LENGTH as u64, "{}", ctx(start, visible));
+                        got.push(slot);
+                    }
+                    // Rows may still be appended after the end was seen.
+                    None if r.below(3) != 0 => break,
+                    None => {}
+                },
+                _ => {
+                    it.next_row_pointers_into(&mut out).await.unwrap();
+                    if out.is_empty() && r.below(3) != 0 {
+                        break;
+                    }
+                    got.extend(out.iter().map(slot_of));
+                }
+            }
+        }
+        // Drained: nothing more on either path.
+        assert!(
+            it.next_row_pointer_with_offset().await.unwrap().is_none(),
+            "{}",
+            ctx(start, visible)
+        );
+        it.next_row_pointers_into(&mut out).await.unwrap();
+        assert!(out.is_empty(), "{}", ctx(start, visible));
+
+        let want: Vec<u64> = (start..visible)
+            .filter(|s| model.admits(*s) && !deleted[*s as usize])
+            .collect();
+        if got != want {
+            let dropped: Vec<u64> =
+                want.iter().filter(|s| !got.contains(s)).copied().take(10).collect();
+            let extra: Vec<u64> =
+                got.iter().filter(|s| !want.contains(s)).copied().take(10).collect();
+            panic!(
+                "{}: handed out {} records, expected {}; first dropped {dropped:?}, first unexpected {extra:?}",
+                ctx(start, visible),
+                got.len(),
+                want.len()
+            );
+        }
+    }
+
+    /// The iterator hands out exactly the records the candidates admit, in
+    /// slot order: every listed slot that is not deleted, and every slot at
+    /// or past `n_slots`, whatever repositioned it along the way.
+    #[tokio::test]
+    async fn the_walk_yields_exactly_the_candidates() {
+        let _ = crate::BATCH_SIZE.get_or_init(|| 1024);
+        for seed in 1..=600u64 {
+            run_case(seed).await;
+        }
     }
 }

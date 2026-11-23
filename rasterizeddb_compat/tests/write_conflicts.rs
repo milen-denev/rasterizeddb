@@ -130,7 +130,11 @@ async fn a_conflict_never_reports_a_phantom_no_such_row() {
 }
 
 /// Inside an explicit block the client owns the transaction, so a conflict is
-/// its business to resolve — this half is correct today and must stay so.
+/// its business to resolve. Here the one client holds `a` open until `b`
+/// returns, so `b` waits on its own client, which on PostgreSQL waits
+/// forever: `lock_timeout` ends it with 55P03, as it does there. (It used to
+/// end after a fixed 1.5 s with 40001, which also failed every READ
+/// COMMITTED writer whose blocker took longer: `rc_waits`.)
 #[tokio::test]
 async fn a_conflict_inside_an_explicit_block_is_reported() {
     let (_s, pool) = server().await;
@@ -145,8 +149,13 @@ async fn a_conflict_inside_an_explicit_block_is_reported() {
         .expect("first writer wins");
 
     let mut b = pool.begin().await.expect("begin b");
+    b.execute(sqlx::raw_sql("SET lock_timeout = '300ms'")).await.expect("lock_timeout");
     let conflict = b.execute(sqlx::raw_sql("UPDATE t SET n = 2 WHERE id = 1")).await;
-    assert!(conflict.is_err(), "a conflict inside a block must be reported");
+    let code = conflict
+        .err()
+        .and_then(|e| e.as_database_error().and_then(|d| d.code().map(|c| c.to_string())))
+        .expect("a conflict inside a block must be reported");
+    assert_eq!(code, "55P03", "the wait ends at lock_timeout");
     let _ = b.rollback().await;
     a.commit().await.expect("commit a");
 
@@ -207,10 +216,16 @@ async fn a_conflict_inside_an_explicit_block_is_reported() {
 /// instrumentation has to be near-free — cache the flag in a `OnceLock` and
 /// push to a buffer rather than printing — or the bug hides.
 ///
-/// Ignored because it is a live defect, not a pinned behaviour: run it with
-/// `-- --ignored` while working on this. Remove the attribute when a reader
-/// can no longer miss a row it should see.
-#[ignore = "open defect: a concurrent reader can transiently miss an existing row"]
+/// FOUND (2026-10-09), and the trace above was right — the pointer *was*
+/// visible: the scan's reclaimable gate bounded its horizon by `oldest_active`
+/// alone, so once an updater the reader's snapshot still treats as running had
+/// committed and retired, the reader's visible (old) version was skipped as
+/// reclaimable while the new one was rightly invisible. Fixed by bounding the
+/// horizon by the oldest live snapshot (`VersionHorizon::sample`); pinned at
+/// scale by `rasterizeddb_core/tests/reader_miss_stress.rs`.
+/// The gate runs in the scan itself, which is why disabling vacuum changed
+/// nothing. This test is a weak reproducer (0/10 on the old code; the two in
+/// `query_cache_staleness.rs` and `extended_protocol_recovery.rs` caught it).
 #[tokio::test]
 async fn a_concurrent_reader_never_misses_an_existing_row() {
     let (_s, pool) = server().await;

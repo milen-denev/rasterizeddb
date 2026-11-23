@@ -24,6 +24,9 @@ pub enum QueryPurpose {
     /// statement, so the caller is told which clause was wrong instead of
     /// getting a bare syntax error.
     LockTable(Result<crate::core::rql::row_lock::LockTable, String>),
+    /// `TRUNCATE …` as written (`rql::truncate`): the text is what a replica
+    /// runs.
+    Truncate(String),
     /// `SET` / `SHOW` / `RESET FILTER` — tuning the filter index from SQL.
     /// Parsed and executed by `core::filter::sql`.
     FilterControl(String),
@@ -35,6 +38,10 @@ pub enum QueryPurpose {
     /// reported as an unrecognised query, so the operator sees which clause
     /// was wrong instead of a bare syntax error.
     IntrospectError(String),
+    /// `KV <command> …`: a Redis command against the database's key/value
+    /// store. Parsed and executed by [`crate::core::kv_cache::sql`].
+    #[cfg(feature = "kv_cache")]
+    KvCache(String),
     /// `REPLICATION ...` / `SHOW REPLICATION ...` — running the cluster from
     /// SQL. Parsed and executed by [`crate::replication::sql`].
     Replication(String),
@@ -52,6 +59,9 @@ pub enum QueryPurpose {
     /// wrong instead of a bare syntax error.
     #[cfg(feature = "s3_backup")]
     BackupError(String),
+    /// A single-table `SELECT` already parsed: a prepared statement run with
+    /// the parse it cached (see [`crate::core::rql::prepared`]).
+    PreparedRows(Box<crate::core::rql::prepared::PreparedRows>),
 }
 
 /// A `VACUUM` statement.
@@ -70,14 +80,14 @@ pub struct VacuumRequest {
 pub struct InsertRowData {
     pub table_name: String,
     pub query: String,
-    /// `ON CONFLICT … DO NOTHING` was written, so a uniqueness violation is the
+    /// `ON CONFLICT … DO NOTHING` was written, so a violation of its arbiter
+    /// (`on_conflict_target`; any unique key when it names none) is the
     /// statement working rather than failing.
     ///
-    /// The arbiter, if one was given, is not consulted. PostgreSQL uses it to
-    /// pick *which* constraint may conflict and errors when it names none; here
-    /// any uniqueness violation is swallowed. That is more permissive, and the
-    /// difference only shows up for a statement that would have been an error in
-    /// PostgreSQL — never for one that would have succeeded.
+    /// A violation of another key is raised, as PostgreSQL raises it: until
+    /// 2026-11-16 every violation was swallowed, so `ON CONFLICT (rid) DO
+    /// NOTHING` reported 0 rows for a clash on a second unique column, which a
+    /// caller cannot tell from "the row is already there".
     pub on_conflict_do_nothing: bool,
     /// The `DO UPDATE` half of an upsert, when one was written.
     ///
@@ -86,34 +96,82 @@ pub struct InsertRowData {
     /// would have been inserted has been built, so resolving them is the
     /// executor's job.
     pub on_conflict_update: Option<ConflictUpdate>,
+    /// What a `DO NOTHING` names as its target: `ON CONFLICT (a, b) DO
+    /// NOTHING`'s columns or `ON CONSTRAINT name`; empty when it names
+    /// neither. (`DO UPDATE` keeps its own in [`ConflictUpdate::arbiter`].)
+    ///
+    /// Read by the target checks (42P10) at the statement's first dispatch,
+    /// and by every row's conflict, which absorbs only the arbiter's: so a
+    /// statement re-parsed from its tuples or rewritten from its `SELECT`
+    /// carries it (`executor::InsertConflict`).
+    pub on_conflict_target: ConflictTarget,
+}
+
+/// The arbiter a `DO NOTHING` names: columns, a constraint, or neither.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConflictTarget {
+    pub columns: Vec<String>,
+    pub constraint: Option<String>,
+}
+
+impl ConflictTarget {
+    /// Neither columns nor a constraint: every unique key is an arbiter.
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty() && self.constraint.is_none()
+    }
 }
 
 /// The `DO UPDATE SET … [WHERE …]` of an `INSERT … ON CONFLICT`.
 #[derive(Debug, Clone)]
 pub struct ConflictUpdate {
     /// Columns named by the arbiter, `ON CONFLICT (a, b)`. Empty when none was
-    /// written, in which case the conflicting row is found by whichever unique
-    /// column the insert actually collided on.
+    /// written, in which case the conflicting row is found by the constraint
+    /// it names, or else by whichever unique column the insert actually
+    /// collided on.
     pub arbiter: Vec<String>,
+    /// The constraint `ON CONFLICT ON CONSTRAINT name` names, as written
+    /// (unquoted). The executor resolves it to the constraint's columns.
+    pub constraint: Option<String>,
     /// The `SET` list, as written.
     pub assignments: String,
     /// The optional `WHERE` that decides whether the update happens at all.
     pub where_clause: Option<String>,
 }
 
+/// Where an `INSERT`'s `ON CONFLICT … DO UPDATE` clause starts, when it has
+/// one. Its subqueries read `excluded` and the row that conflicted, so they
+/// are the conflict's to run, per conflict, never flattened with the rows
+/// (`pgwire`'s subquery pass took `WHERE EXISTS (… excluded.id)` for an
+/// uncorrelated one and ran it alone: "missing FROM-clause entry for table
+/// \"excluded\"").
+pub(crate) fn conflict_update_at(query: &str) -> Option<usize> {
+    if !crate::core::sql_scan::contains_ignore_ascii_case(query, b"ON CONFLICT") {
+        return None;
+    }
+    let upper = query.to_ascii_uppercase();
+    let at = find_top_level(&upper, "ON CONFLICT")?;
+    upper[at..].contains("DO UPDATE").then_some(at)
+}
+
 /// Splits a trailing `ON CONFLICT …` clause off an `INSERT`.
 ///
-/// Returns the statement without the clause, whether it was `DO NOTHING`, and
-/// the `DO UPDATE` half when there was one.
+/// Returns the statement without the clause, whether it was `DO NOTHING`, the
+/// `DO UPDATE` half when there was one, and what a `DO NOTHING` names as its
+/// target.
 ///
 /// A `RETURNING` after the conflict clause belongs to the statement, not to the
 /// clause, so it is moved back onto the `INSERT`. Cutting at `ON CONFLICT` and
 /// discarding the rest would have dropped it, and the caller would have got no
 /// rows back from a statement that asked for them.
-fn split_on_conflict(query: &str) -> (String, bool, Option<ConflictUpdate>) {
+fn split_on_conflict(query: &str) -> (String, bool, Option<ConflictUpdate>, ConflictTarget) {
+    // The clause is found as `ON CONFLICT` in the uppercased text; a statement
+    // that holds it nowhere, in any case, skips the copy. Every `INSERT` asks.
+    if !crate::core::sql_scan::contains_ignore_ascii_case(query, b"ON CONFLICT") {
+        return (query.to_string(), false, None, ConflictTarget::default());
+    }
     let upper = query.to_ascii_uppercase();
     let Some(at) = find_top_level(&upper, "ON CONFLICT") else {
-        return (query.to_string(), false, None);
+        return (query.to_string(), false, None, ConflictTarget::default());
     };
 
     let clause = &query[at..];
@@ -131,31 +189,23 @@ fn split_on_conflict(query: &str) -> (String, bool, Option<ConflictUpdate>) {
         None => head.to_string(),
     };
 
-    if clause_upper.contains("DO NOTHING") {
-        return (rebuilt, true, None);
+    if let Some(do_at) = clause_upper.find("DO NOTHING") {
+        let (columns, constraint) = conflict_target(clause[..do_at].trim());
+        return (rebuilt, true, None, ConflictTarget { columns, constraint });
     }
 
     let Some(do_at) = clause_upper.find("DO UPDATE") else {
         // Neither form: leave the statement alone so it is reported rather than
         // silently treated as one of them.
-        return (query.to_string(), false, None);
+        return (query.to_string(), false, None, ConflictTarget::default());
     };
 
-    // `ON CONFLICT (a, b) DO UPDATE …`
-    let arbiter_text = clause[..do_at].trim();
-    let arbiter = match (arbiter_text.find('('), arbiter_text.rfind(')')) {
-        (Some(open), Some(close)) if close > open => arbiter_text[open + 1..close]
-            .split(',')
-            .map(|c| c.trim().trim_matches('"').to_string())
-            .filter(|c| !c.is_empty())
-            .collect(),
-        _ => Vec::new(),
-    };
+    let (arbiter, constraint) = conflict_target(clause[..do_at].trim());
 
     let after_do = &clause[do_at + "DO UPDATE".len()..];
     let after_do_upper = &clause_upper[do_at + "DO UPDATE".len()..];
     let Some(set_at) = after_do_upper.find("SET") else {
-        return (query.to_string(), false, None);
+        return (query.to_string(), false, None, ConflictTarget::default());
     };
     let body = &after_do[set_at + "SET".len()..];
     let body_upper = &after_do_upper[set_at + "SET".len()..];
@@ -171,8 +221,60 @@ fn split_on_conflict(query: &str) -> (String, bool, Option<ConflictUpdate>) {
     (
         rebuilt,
         false,
-        Some(ConflictUpdate { arbiter, assignments, where_clause }),
+        Some(ConflictUpdate {
+            arbiter,
+            constraint,
+            assignments,
+            where_clause,
+        }),
+        ConflictTarget::default(),
     )
+}
+
+/// The target of an `ON CONFLICT` clause, `arbiter_text` being the clause up
+/// to its `DO`: the columns of `ON CONFLICT (a, b)`, or the name of `ON
+/// CONFLICT ON CONSTRAINT name`, or neither.
+///
+/// `ON CONFLICT (a) WHERE pred` names a partial unique index. The column list
+/// ends at the parenthesis matching its own: the last one in the clause may be
+/// the predicate's, and reading up to it took `a) WHERE (pred` for a column.
+/// The predicate itself is not needed here; the executor finds the index from
+/// the columns (see `apply_conflict_update`).
+fn conflict_target(arbiter_text: &str) -> (Vec<String>, Option<String>) {
+    let upper = arbiter_text.to_ascii_uppercase();
+    if let Some(on) = find_top_level(&upper, "ON CONSTRAINT") {
+        let name = arbiter_text[on + "ON CONSTRAINT".len()..]
+            .split_whitespace()
+            .next()
+            .map(|n| n.trim_matches('"').to_string())
+            .filter(|n| !n.is_empty());
+        return (Vec::new(), name);
+    }
+    let arbiter_close = arbiter_text.find('(').and_then(|open| {
+        let mut depth = 0usize;
+        arbiter_text[open..].char_indices().find_map(|(i, c)| {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(open + i);
+                    }
+                }
+                _ => {}
+            }
+            None
+        })
+    });
+    let columns = match (arbiter_text.find('('), arbiter_close) {
+        (Some(open), Some(close)) if close > open => arbiter_text[open + 1..close]
+            .split(',')
+            .map(|c| c.trim().trim_matches('"').to_string())
+            .filter(|c| !c.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
+    (columns, None)
 }
 
 /// Finds `needle` in `haystack` outside quotes and parentheses.
@@ -214,6 +316,49 @@ pub struct QueryRowsData {
     pub query: String,
 }
 
+/// The statement with its write target written in the default schema
+/// (`public.k`, `"public"."k"`) as the bare name the catalogue holds, as a
+/// read's FROM already is: Prisma writes every UPDATE and DELETE that way,
+/// and each failed with "Table not found". The target is the word after the
+/// first `skip` words; a qualifier `public.k.id` later in the statement still
+/// names it (`sql_scan::relation_qualifiers`).
+fn unqualify_write_target(sql: &str, skip: usize) -> String {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    for _ in 0..skip {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+    }
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let start = i;
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'(' {
+        if bytes[i] == b'"' {
+            i = crate::core::sql_scan::quoted_end(bytes, i, b'"');
+            continue;
+        }
+        i += 1;
+    }
+    let target = &sql[start..i];
+    let lower = target.to_ascii_lowercase();
+    let rest = if let Some(r) = lower.strip_prefix("\"public\".") {
+        &target[target.len() - r.len()..]
+    } else if let Some(r) = lower.strip_prefix("public.") {
+        &target[target.len() - r.len()..]
+    } else {
+        return sql.to_string();
+    };
+    if rest.is_empty() || rest.contains('.') && !rest.starts_with('"') {
+        return sql.to_string();
+    }
+    format!("{}{}{}", &sql[..start], rest, &sql[i..])
+}
+
 /// Normalises a relation reference into the bare table name.
 ///
 /// ORMs quote every identifier and may schema-qualify it, so the token after
@@ -237,6 +382,19 @@ fn normalize_table_name(raw: &str) -> String {
 /// is left alone.
 pub fn strip_sql_comments(sql: &str) -> String {
     let bytes = sql.as_bytes();
+    // Only a `--` or a `/*` starts what this removes, so text holding neither,
+    // quoted or not, comes back as it is: one copy, where a 125 KB bulk
+    // `INSERT` was pushed byte by byte, twice per statement.
+    // A short statement is scanned directly: building two `memmem`
+    // searchers cost more than the whole scan of a point query's text.
+    let commented = if bytes.len() <= 4096 {
+        bytes.windows(2).any(|w| matches!(w, [b'-', b'-'] | [b'/', b'*']))
+    } else {
+        memchr::memmem::find(bytes, b"--").is_some() || memchr::memmem::find(bytes, b"/*").is_some()
+    };
+    if !commented {
+        return sql.to_string();
+    }
     // Bytes, not chars. `push(byte as char)` re-encoded every byte above 0x7F
     // as two UTF-8 bytes, so a statement carrying any non-ASCII text — an
     // accented name, a currency sign, an emoji — reached the engine
@@ -294,8 +452,6 @@ pub fn strip_sql_comments(sql: &str) -> String {
 }
 
 pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
-    use ComparerOperation::StartsWith;
-    use QueryPurpose::*;
     // Every SQL client terminates a statement with a semicolon. Stripping it
     // once here covers every statement kind, rather than each clause parser
     // having to tolerate one — the `WHERE` lexer rejected it as an unexpected
@@ -305,13 +461,56 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
     // UPDATE — is ordinary SQL, and every clause parser would otherwise have to
     // tolerate one. Without this the whole statement came back as "syntax error
     // or unsupported query".
-    let without_comments = strip_sql_comments(query);
+    // Escape strings (`E'it\'s'`) and dollar-quoted strings are rewritten
+    // into the standard strings they mean before anything scans the text:
+    // every scanner below knows standard strings, and an escaped quote ended
+    // the literal early for all of them. See `sql_scan`. A no-op (borrowed)
+    // for text that has neither, which includes everything the wire layer has
+    // already normalised.
+    let normalized = match crate::core::sql_scan::normalize_string_literals(query) {
+        Ok(text) => text,
+        Err(e) => {
+            log::warn!("statement rejected: {}", e);
+            return None;
+        }
+    };
+    let without_comments = strip_sql_comments(&normalized);
     let query = without_comments.as_str();
     let query_trimmed = query.trim().trim_end_matches(';').trim_end();
-    let query_trimmed = if query_trimmed.is_empty() { query.trim() } else { query_trimmed };
+    let query_trimmed = if query_trimmed.is_empty() {
+        query.trim()
+    } else {
+        query_trimmed
+    };
     let query_upper = query_trimmed.to_ascii_uppercase();
     let query_bytes = query_upper.as_bytes();
 
+    // Every surface below, up to `VACUUM`, owns statements opening with its
+    // own word (`SET`, `SHOW`, `RESET`, `DESCRIBE`, `DESC`, `KV`,
+    // `REPLICATION`, `STORAGE`, `BACKUP`, `RESTORE`), and each copies or
+    // splits the whole text to find out. Queries and DML are most statements
+    // and none of theirs, so they skip the lot.
+    let opening = query_bytes
+        .iter()
+        .position(|b| !b.is_ascii_alphabetic())
+        .map_or(query_bytes, |end| &query_bytes[..end]);
+    let plain = matches!(
+        opening,
+        b"SELECT" | b"INSERT" | b"UPDATE" | b"DELETE" | b"WITH" | b"VALUES"
+    );
+    if !plain {
+        if let Some(purpose) = recognize_surface_statement(query_trimmed) {
+            return Some(purpose);
+        }
+    }
+
+    recognize_core_statement(query_trimmed, query_bytes)
+}
+
+/// The statements of the engine's own surfaces, which share no opening word
+/// with SQL's.
+fn recognize_surface_statement(query_trimmed: &str) -> Option<QueryPurpose> {
+    use QueryPurpose::*;
     // Recognised before the DDL/DML prefixes: `SET`/`SHOW`/`RESET` are not
     // otherwise statement keywords here, and the filter surface owns the whole
     // `... FILTER ...` shape.
@@ -334,6 +533,13 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
         return Some(Storage(query_trimmed.to_string()));
     }
 
+    // `KV` is not a statement keyword anywhere else, and what follows it is a
+    // Redis command, not SQL, so nothing below may try to read it.
+    #[cfg(feature = "kv_cache")]
+    if crate::core::kv_cache::sql::is_kv_statement(query_trimmed) {
+        return Some(KvCache(query_trimmed.to_string()));
+    }
+
     // After the three surfaces above, each of which owns a longer `SHOW`
     // phrase, and before everything below: `SHOW TABLES` and `SET CONFIG` are
     // not otherwise statement keywords here.
@@ -352,7 +558,13 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
         Ok(None) => {}
         Err(message) => return Some(BackupError(message)),
     }
+    None
+}
 
+/// SQL's own statements, by their opening keywords.
+fn recognize_core_statement(query_trimmed: &str, query_bytes: &[u8]) -> Option<QueryPurpose> {
+    use ComparerOperation::StartsWith;
+    use QueryPurpose::*;
     if simd_compare_strings(query_bytes, b"VACUUM", &StartsWith) {
         // `VACUUM`, `VACUUM FULL`, `VACUUM t`, `VACUUM FULL t`. Postgres also
         // accepts a parenthesised option list and a column list; neither adds
@@ -388,7 +600,8 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
 
         Some(Vacuum(VacuumRequest { table_name, full }))
     } else if simd_compare_strings(query_bytes, b"CREATE INDEX", &StartsWith)
-        && crate::core::rql::path_index::parse_create(query_trimmed).is_some()
+        && (crate::core::rql::path_index::parse_create(query_trimmed).is_some()
+            || crate::core::index::ddl::parse_create(query_trimmed).is_some())
     {
         Some(CreateIndex(query_trimmed.to_string()))
     } else if simd_compare_strings(query_bytes, b"DROP INDEX", &StartsWith) {
@@ -410,6 +623,10 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
         } else {
             Some(AddColumn(query_trimmed.to_string()))
         }
+    } else if simd_compare_strings(query_bytes, b"TRUNCATE", &StartsWith)
+        && query_bytes.get(b"TRUNCATE".len()).is_none_or(|b| b.is_ascii_whitespace())
+    {
+        Some(Truncate(query_trimmed.to_string()))
     } else if simd_compare_strings(query_bytes, b"LOCK", &StartsWith) {
         match crate::core::rql::row_lock::parse_lock_table(query_trimmed) {
             Some(outcome) => Some(LockTable(outcome)),
@@ -417,25 +634,63 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
         }
     } else if simd_compare_strings(query_bytes, b"INSERT INTO", &StartsWith) {
         if let Some(table_name_extract) = query_trimmed.split_whitespace().nth(2) {
-            let (query, on_conflict_do_nothing, on_conflict_update) =
+            let (query, on_conflict_do_nothing, on_conflict_update, on_conflict_target) =
                 split_on_conflict(query_trimmed);
             Some(InsertRow(InsertRowData {
                 table_name: normalize_table_name(table_name_extract),
                 query,
                 on_conflict_do_nothing,
                 on_conflict_update,
+                on_conflict_target,
             }))
         } else {
             None
         }
     } else if simd_compare_strings(query_bytes, b"UPDATE", &StartsWith) {
-        Some(UpdateRow(query_trimmed.to_string()))
+        Some(UpdateRow(unqualify_write_target(query_trimmed, 1)))
     } else if simd_compare_strings(query_bytes, b"DELETE FROM", &StartsWith) {
-        Some(DeleteRow(query_trimmed.to_string()))
+        Some(DeleteRow(unqualify_write_target(query_trimmed, 2)))
     } else if simd_compare_strings(query_bytes, b"SELECT", &StartsWith) {
-        // Extract table name after "FROM"
+        // Extract table name after the statement's own "FROM".
+        //
+        // Depth-aware, because a select item may contain one: `EXTRACT(EPOCH
+        // FROM ts)` made the table name `ts)`, which then failed as "relation
+        // does not exist" — naming nothing the author wrote, about a statement
+        // whose real `FROM` names a table that is there.
         let tokens: Vec<&str> = query_trimmed.split_whitespace().collect();
-        if let Some(from_index) = tokens.iter().position(|&t| t.eq_ignore_ascii_case("FROM")) {
+        let from_index = {
+            let mut depth = 0i32;
+            let mut quote: Option<char> = None;
+            let mut found = None;
+            for (at, token) in tokens.iter().enumerate() {
+                // Not the `FROM` of `a IS [NOT] DISTINCT FROM b`.
+                if depth == 0
+                    && quote.is_none()
+                    && token.eq_ignore_ascii_case("FROM")
+                    && !at.checked_sub(1).is_some_and(|p| tokens[p].eq_ignore_ascii_case("DISTINCT"))
+                {
+                    found = Some(at);
+                    break;
+                }
+                for c in token.chars() {
+                    match quote {
+                        Some(q) => {
+                            if c == q {
+                                quote = None;
+                            }
+                        }
+                        None => match c {
+                            '\'' | '"' => quote = Some(c),
+                            '(' => depth += 1,
+                            ')' => depth -= 1,
+                            _ => {}
+                        },
+                    }
+                }
+            }
+            found
+        };
+        if let Some(from_index) = from_index {
             if let Some(table_name_extract) = tokens.get(from_index + 1) {
                 Some(QueryRows(QueryRowsData {
                     table_name: normalize_table_name(table_name_extract),
@@ -444,8 +699,28 @@ pub fn recognize_query_purpose(query: &str) -> Option<QueryPurpose> {
             } else {
                 None
             }
+        } else if let Some(Ok(_)) = crate::core::rql::join::split_union(query_trimmed) {
+            // A set operation of branches with no FROM (`SELECT 1.5 UNION
+            // SELECT 2.25`): a query over no relation, which the executor's
+            // set-operation path runs branch by branch.
+            Some(QueryRows(QueryRowsData { table_name: String::new(), query: query_trimmed.to_string() }))
         } else {
             None
+        }
+    } else if query_bytes.first() == Some(&b'(') {
+        // A `UNION` whose first branch is parenthesised, as it must be to sort
+        // or limit its own rows: `(SELECT … LIMIT 2) UNION SELECT …`. It is a
+        // query over the first branch's relation, like the unparenthesised
+        // form.
+        let Some(Ok(parts)) = crate::core::rql::join::split_union(query_trimmed) else {
+            return None;
+        };
+        match recognize_query_purpose(parts.branches.first()?)? {
+            QueryRows(first) => Some(QueryRows(QueryRowsData {
+                table_name: first.table_name,
+                query: query_trimmed.to_string(),
+            })),
+            _ => None,
         }
     } else {
         None
@@ -483,9 +758,59 @@ mod strip_comment_tests {
 
     #[test]
     fn comments_are_still_removed() {
-        assert_eq!(strip_sql_comments("SELECT 1 -- trailing\nFROM t"), "SELECT 1 \nFROM t");
+        assert_eq!(
+            strip_sql_comments("SELECT 1 -- trailing\nFROM t"),
+            "SELECT 1 \nFROM t"
+        );
         assert_eq!(strip_sql_comments("SELECT /* mid */ 1"), "SELECT   1");
         // A `--` inside a literal is data, not a comment.
-        assert_eq!(strip_sql_comments("SELECT '-- not a comment'"), "SELECT '-- not a comment'");
+        assert_eq!(
+            strip_sql_comments("SELECT '-- not a comment'"),
+            "SELECT '-- not a comment'"
+        );
+    }
+}
+
+#[cfg(test)]
+mod conflict_target_tests {
+    use super::split_on_conflict;
+
+    /// `DO NOTHING` keeps its target's columns or constraint (the target
+    /// checks and the arbiter rule read them), `DO UPDATE` its arbiter, and
+    /// `ON CONSTRAINT` its name; `RETURNING` still moves back onto the
+    /// statement.
+    #[test]
+    fn each_form_keeps_its_target() {
+        let (sql, nothing, update, target) =
+            split_on_conflict("INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (\"a\", B) DO NOTHING RETURNING a");
+        assert_eq!(sql, "INSERT INTO t (a, b) VALUES (1, 2) RETURNING a");
+        assert!(nothing && update.is_none());
+        assert_eq!(target.columns, vec!["a".to_string(), "B".to_string()]);
+        assert_eq!(target.constraint, None);
+
+        let (_, nothing, update, target) =
+            split_on_conflict("INSERT INTO t (a) VALUES (1) ON CONFLICT ON CONSTRAINT t_pkey DO NOTHING");
+        assert!(nothing && update.is_none() && target.columns.is_empty(), "a name is not a column list");
+        assert_eq!(target.constraint.as_deref(), Some("t_pkey"), "the name is kept for the arbiter");
+
+        let (_, _, update, _) = split_on_conflict(
+            "INSERT INTO t (a, n) VALUES (1, 2) ON CONFLICT ON CONSTRAINT \"t_pkey\" DO UPDATE SET n = EXCLUDED.n WHERE t.n < 5",
+        );
+        let update = update.expect("DO UPDATE");
+        assert!(update.arbiter.is_empty());
+        assert_eq!(update.constraint.as_deref(), Some("t_pkey"));
+        assert_eq!(update.assignments, "n = EXCLUDED.n");
+        assert_eq!(update.where_clause.as_deref(), Some("t.n < 5"));
+
+        // A partial index's predicate is not part of the column list.
+        let (_, _, update, _) = split_on_conflict(
+            "INSERT INTO t (a, n) VALUES (1, 2) ON CONFLICT (a) WHERE (n > 0) DO UPDATE SET n = 1",
+        );
+        let update = update.expect("DO UPDATE");
+        assert_eq!(update.arbiter, vec!["a".to_string()]);
+        assert!(update.constraint.is_none());
+
+        let (_, nothing, update, target) = split_on_conflict("INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING");
+        assert!(nothing && update.is_none() && target.is_empty());
     }
 }

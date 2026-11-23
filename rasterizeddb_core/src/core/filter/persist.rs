@@ -26,7 +26,7 @@
 
 use crate::core::db_type::DbType;
 use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
-use crate::core::storage_providers::traits::StorageIO;
+use crate::core::storage_providers::traits::{IOResult, StorageIO};
 
 use super::bloom::SuperBloom;
 use super::column::{ColumnDelta, ColumnFilter, Generation, Hll};
@@ -38,8 +38,63 @@ const MAGIC: &[u8; 8] = b"RDBFLT01";
 // v2 added per-column zone min/max bounds; v3 brought `BOOL` into the index as
 // a bounds-only column, which changes *which* columns a file describes. Older
 // files are rejected rather than upgraded: rebuilding costs one scan and keeps
-// a single code path.
-const FORMAT_VER: u16 = 3;
+// a single code path. v4 records NaN in a float column's zone bounds (as the
+// largest value, PostgreSQL's order); a v3 file's bounds leave NaN out and
+// would prune NaN rows from `f > x`, so it must not be read.
+//
+// v5 adds plane-less generations (`f == 0`, see `column::Generation`), whose
+// length field holds a zone count where a width-`f` generation holds a word
+// count. A v4 file has none, so it reads exactly as before and is accepted —
+// an upgrade costs nothing. A v4 reader refuses a v5 file by its version and
+// rebuilds, which is the safe direction.
+//
+// v6 records vacuum's clear horizon, `cleared_below`, in the superblock
+// (docs/persistent-indexes.md §2, B14): a snapshot's FILTER section carries
+// it, so a reopened table's first vacuum pass does not re-clear every
+// tombstone and take a ticket with no user write (RV2). Earlier files have
+// zeroes there and read as `cleared_below = 0`, which is what every open
+// assumed before, so v4 and v5 still read unchanged.
+/// `pub` since B13: a snapshot's identity records it
+/// (`index_store::identity::VersionTuple::filter_format_ver`).
+pub const FORMAT_VER: u16 = 6;
+/// The oldest version this reader accepts unchanged.
+pub(super) const OLDEST_READABLE_VER: u16 = 4;
+
+/// Version of everything a persisted filter's *contents* are derived by, as
+/// opposed to how they are laid out ([`FORMAT_VER`]).
+///
+/// A persisted filter is trusted at open, so a change to any of these, made
+/// without a bump, prunes matching rows from then on with no error anywhere:
+///
+/// - `hash::canonical_hash` with its ±0.0, NaN-payload and string handling,
+///   the `mix` and `hash_bytes` it uses, and `HashSeed::default`;
+/// - `hash::fingerprint` and the reserved codes `CODE_EMPTY`, `CODE_NULL`,
+///   `CODE_FIRST`;
+/// - the zone bounds: which value `ZoneMap::observe` keeps as min and max,
+///   which is `perform_comparison_operation`'s order (NaN above +Infinity, as
+///   PostgreSQL has it), the padded and truncated string encoding,
+///   `STRING_BOUND_PREFIX`, `round_up`, `successor`, the `UNBOUNDED` sentinel,
+///   and what `zone_may_match` keeps for each `SargOp`;
+/// - the span summary: `SuperBloom`'s `SALT`, `bloom_hash`, the sub-block
+///   formula and the superzone geometry;
+/// - the plane layout `kernels::write_slot` writes and every `probe_fn`
+///   kernel reads (bit `j` of slot `local` at word `j * ZONE_WORDS +
+///   local / 64`, bit `local % 64`), and `ZONE_ROWS`.
+///
+/// `filter::derive_vectors_tests` pins each of them to golden outputs. A
+/// change that moves one fails there.
+///
+/// Nothing on disk records this yet, so a bump on its own rejects no sidecar.
+/// Until it is part of a persisted identity, a derivation change must also
+/// bump [`FORMAT_VER`] and raise [`OLDEST_READABLE_VER`] to it: that is what
+/// makes every sidecar the previous derivation wrote fail to load and be
+/// rebuilt. The golden test holds the three together.
+///
+/// `choose_f` and the HLL are outside it: they pick future zones' widths, so a
+/// change to them costs pruning, never rows. So is a `NUMERIC(p, s)` column's
+/// scale: it is the column's, and the query side's rescaling to it is pinned
+/// by the vectors as well.
+pub const FILTER_DERIVE_VERSION: u32 = 1;
 
 /// Fixed-size superblock. `dirty` lives at a known offset so it can be flipped
 /// with an 8-byte positioned write, without rewriting anything else.
@@ -48,6 +103,8 @@ pub const SUPERBLOCK_LEN: usize = 64;
 pub const DIRTY_OFFSET: u64 = 13;
 /// Byte offset of `base_len` inside the superblock.
 const BASE_LEN_OFFSET: usize = 40;
+/// Byte offset of `cleared_below` inside the superblock (v6).
+const CLEARED_BELOW_OFFSET: usize = 48;
 
 /// Marks the start of a delta record. Deliberately not the file magic: a reader
 /// that finds this where a base image should be, or vice versa, is reading a
@@ -68,7 +125,9 @@ struct Writer {
 
 impl Writer {
     fn new() -> Self {
-        Self { buf: Vec::with_capacity(1 << 16) }
+        Self {
+            buf: Vec::with_capacity(1 << 16),
+        }
     }
     #[inline]
     fn u8(&mut self, v: u8) {
@@ -162,7 +221,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn write_superblock(w: &mut Writer, seed: HashSeed, column_count: u16, n_slots: u64) {
+fn write_superblock(w: &mut Writer, seed: HashSeed, column_count: u16, n_slots: u64, cleared_below: u64) {
     let start = w.buf.len();
     w.bytes(MAGIC);
     w.u16(FORMAT_VER);
@@ -176,14 +235,45 @@ fn write_superblock(w: &mut Writer, seed: HashSeed, column_count: u16, n_slots: 
     debug_assert_eq!(w.buf.len() - start, DIRTY_OFFSET as usize + 27);
     debug_assert_eq!(w.buf.len() - start, BASE_LEN_OFFSET);
     w.u64(0); // base_len — patched once the base image is complete
+    debug_assert_eq!(w.buf.len() - start, CLEARED_BELOW_OFFSET);
+    w.u64(cleared_below);
     w.pad(SUPERBLOCK_LEN - (w.buf.len() - start));
 }
 
 /// Serialize the whole catalog. Columns are written in the caller's order and
 /// validated against the live schema on load.
 pub fn serialize(columns: &[&ColumnFilter], seed: HashSeed, n_slots: u64) -> Vec<u8> {
+    serialize_with(columns, seed, n_slots, 0, ColumnFilter::persistable_valid_upto)
+}
+
+/// [`serialize`] for a snapshot's FILTER section, taken under a seal
+/// (docs/persistent-indexes.md §5, "The frontier"): each column's frontier
+/// is recorded as it stands (`valid_upto`), not dragged back to the first
+/// slot modified since the last `_flt.db` checkpoint. Under the seal no
+/// ticket is held, so memory equals the data the snapshot's identity
+/// describes, and `dirty_min` (which only the runtime checkpoint resets)
+/// says nothing about it; reused as it is, every snapshot would record the
+/// frontier at the first such slot and every clean reopen would backfill
+/// from there. Same layout as [`serialize`], so the base image `deserialize`
+/// reads.
+///
+/// `cleared_below` is vacuum's clear horizon as it stands under the seal
+/// (§2): every reclaimable version whose `xmax` is below it has empty codes
+/// in `columns`. A load restores it ([`Loaded::cleared_below`]) before
+/// vacuum's first tick.
+pub fn serialize_sealed(columns: &[&ColumnFilter], seed: HashSeed, n_slots: u64, cleared_below: u64) -> Vec<u8> {
+    serialize_with(columns, seed, n_slots, cleared_below, ColumnFilter::valid_upto)
+}
+
+fn serialize_with(
+    columns: &[&ColumnFilter],
+    seed: HashSeed,
+    n_slots: u64,
+    cleared_below: u64,
+    frontier: fn(&ColumnFilter) -> u64,
+) -> Vec<u8> {
     let mut w = Writer::new();
-    write_superblock(&mut w, seed, columns.len() as u16, n_slots);
+    write_superblock(&mut w, seed, columns.len() as u16, n_slots, cleared_below);
 
     for col in columns {
         w.u32(col.write_order);
@@ -191,8 +281,10 @@ pub fn serialize(columns: &[&ColumnFilter], seed: HashSeed, n_slots: u64) -> Vec
         w.u8(col.current_f());
         w.u16(0);
         // The persisted frontier is the *effective* one: a slot modified since
-        // the last checkpoint drags it back so the stale region is never trusted.
-        w.u64(col.persistable_valid_upto());
+        // the last checkpoint drags it back so the stale region is never trusted
+        // (`serialize`); a sealed snapshot's is the frontier as it stands
+        // (`serialize_sealed`).
+        w.u64(frontier(col));
         // And the prefix below it that was never indexed at all, which is a
         // separate fact: a table opened with `backfill_on_open = off` has one
         // for its whole life, and a checkpoint that forgot to say so would come
@@ -208,7 +300,8 @@ pub fn serialize(columns: &[&ColumnFilter], seed: HashSeed, n_slots: u64) -> Vec
             w.u64(g.start_zone);
             w.u8(g.f);
             w.pad(7);
-            w.u64(g.words.len() as u64);
+            // A plane-less generation has no words; its extent is its zone count.
+            w.u64(if g.is_planeless() { g.zones } else { g.words.len() as u64 });
             w.words(&g.words);
         }
 
@@ -251,11 +344,7 @@ pub fn serialize(columns: &[&ColumnFilter], seed: HashSeed, n_slots: u64) -> Vec
 /// `from_zone` onward, to be appended after the base and any earlier deltas.
 ///
 /// `from_zones` is parallel to `columns`.
-pub fn serialize_delta(
-    columns: &[&ColumnFilter],
-    from_zones: &[u64],
-    n_slots: u64,
-) -> Vec<u8> {
+pub fn serialize_delta(columns: &[&ColumnFilter], from_zones: &[u64], n_slots: u64) -> Vec<u8> {
     debug_assert_eq!(columns.len(), from_zones.len());
     let mut w = Writer::new();
     w.bytes(DELTA_MAGIC);
@@ -282,12 +371,12 @@ pub fn serialize_delta(
 
         w.u32(d.gens.len() as u32);
         w.u32(0);
-        for (start_zone, f, first_zone, words) in &d.gens {
+        for (start_zone, f, first_zone, zones, words) in &d.gens {
             w.u64(*start_zone);
             w.u8(*f);
             w.pad(7);
             w.u64(*first_zone);
-            w.u64(words.len() as u64);
+            w.u64(if *f == 0 { *zones } else { words.len() as u64 });
             w.words(words);
         }
 
@@ -341,6 +430,9 @@ pub struct Loaded {
     pub valid_len: u64,
     /// Delta records replayed on top of the base image.
     pub deltas: u32,
+    /// Vacuum's clear horizon when the image was sealed (v6; 0 for an
+    /// earlier file or a runtime checkpoint, which never recorded one).
+    pub cleared_below: u64,
 }
 
 /// Append a stopper so replay ends here even if a longer file preceded this
@@ -384,7 +476,10 @@ pub enum LoadReject {
     SchemaMismatch,
     /// The checkpoint describes more slots than the pointer file now holds, so
     /// it cannot be describing this file. See `deserialize`'s `now_slots`.
-    StaleSlotCount { persisted: u64, actual: u64 },
+    StaleSlotCount {
+        persisted: u64,
+        actual: u64,
+    },
 }
 
 /// Parse a sidecar, validating everything that could make its contents lie.
@@ -397,6 +492,20 @@ pub fn deserialize(
     cfg: super::FilterConfig,
     now_slots: u64,
 ) -> Result<Loaded, LoadReject> {
+    let expected: Vec<(u32, DbType, super::FilterConfig)> =
+        expected.iter().map(|(wo, ty)| (*wo, ty.clone(), cfg)).collect();
+    deserialize_columns(buf, seed, &expected, now_slots)
+}
+
+/// [`deserialize`] with each column's own configuration: what a snapshot's
+/// FILTER section is loaded with, so a restored column keeps the width
+/// bounds `SET FILTER … FOR COLUMN` gave it, as a rebuilt one would.
+pub fn deserialize_columns(
+    buf: &[u8],
+    seed: HashSeed,
+    expected: &[(u32, DbType, super::FilterConfig)],
+    now_slots: u64,
+) -> Result<Loaded, LoadReject> {
     if buf.is_empty() {
         return Err(LoadReject::Empty);
     }
@@ -406,7 +515,7 @@ pub fn deserialize(
         return Err(LoadReject::BadMagic);
     }
     let ver = r.u16().ok_or(LoadReject::Truncated)?;
-    if ver != FORMAT_VER {
+    if !(OLDEST_READABLE_VER..=FORMAT_VER).contains(&ver) {
         return Err(LoadReject::Version(ver));
     }
     if r.u16().ok_or(LoadReject::Truncated)? as usize != ZONE_ROWS {
@@ -426,7 +535,11 @@ pub fn deserialize(
     }
     let n_slots = r.u64().ok_or(LoadReject::Truncated)?;
     let base_len = r.u64().ok_or(LoadReject::Truncated)? as usize;
-    r.skip(SUPERBLOCK_LEN - BASE_LEN_OFFSET - 8).ok_or(LoadReject::Truncated)?;
+    let cleared_below_raw = r.u64().ok_or(LoadReject::Truncated)?;
+    // Only v6 writes it; earlier versions' bytes there mean nothing.
+    let cleared_below = if ver >= 6 { cleared_below_raw } else { 0 };
+    r.skip(SUPERBLOCK_LEN - CLEARED_BELOW_OFFSET - 8)
+        .ok_or(LoadReject::Truncated)?;
 
     // The base image must at least contain the superblock and must fit in what
     // we were handed. A corrupt length here would otherwise decide how much of
@@ -449,7 +562,10 @@ pub fn deserialize(
     // leaves them identical. File removal on drop is best-effort, so this is the
     // check that does not depend on it.
     if n_slots > now_slots {
-        return Err(LoadReject::StaleSlotCount { persisted: n_slots, actual: now_slots });
+        return Err(LoadReject::StaleSlotCount {
+            persisted: n_slots,
+            actual: now_slots,
+        });
     }
 
     if column_count != expected.len() {
@@ -457,7 +573,8 @@ pub fn deserialize(
     }
 
     let mut columns = Vec::with_capacity(column_count);
-    for (exp_wo, exp_ty) in expected.iter() {
+    for (exp_wo, exp_ty, cfg) in expected.iter() {
+        let cfg = *cfg;
         let write_order = r.u32().ok_or(LoadReject::Truncated)?;
         // Compare the raw discriminant rather than decoding it: `from_byte`
         // panics on a value it does not recognise, and these bytes come from a
@@ -489,12 +606,21 @@ pub fn deserialize(
             r.skip(7).ok_or(LoadReject::Truncated)?;
             let word_count = r.u64().ok_or(LoadReject::Truncated)? as usize;
 
+            if f == 0 {
+                // Plane-less (v5): the length is a zone count and no words
+                // follow. Never in a v4 file, so one there is corruption.
+                if ver < 5 || word_count > u32::MAX as usize {
+                    return Err(LoadReject::Truncated);
+                }
+                gens.push(Generation::new(start_zone, 0, Vec::new(), word_count as u64));
+                continue;
+            }
             // A corrupt length must not drive a huge allocation.
-            if f == 0 || word_count % (super::kernels::ZONE_WORDS * f as usize) != 0 {
+            if word_count % (super::kernels::ZONE_WORDS * f as usize) != 0 {
                 return Err(LoadReject::Truncated);
             }
             let words = r.words(word_count).ok_or(LoadReject::Truncated)?;
-            gens.push(Generation { start_zone, f, words });
+            gens.push(Generation::new(start_zone, f, words, 0));
         }
 
         let zonemap = match r.u8().ok_or(LoadReject::Truncated)? {
@@ -562,12 +688,20 @@ pub fn deserialize(
     let mut at = base_len;
     let mut applied = 0u32;
     while applied < MAX_DELTAS {
-        let Some(rec) = read_delta(buf, &mut at, &mut columns) else { break };
+        let Some(rec) = read_delta(buf, &mut at, &mut columns) else {
+            break;
+        };
         n_slots = rec;
         applied += 1;
     }
 
-    Ok(Loaded { columns, n_slots, valid_len: at as u64, deltas: applied })
+    Ok(Loaded {
+        columns,
+        n_slots,
+        valid_len: at as u64,
+        deltas: applied,
+        cleared_below,
+    })
 }
 
 /// Parse and apply one delta record at `*at`, advancing it past the record.
@@ -584,7 +718,8 @@ fn read_delta(buf: &[u8], at: &mut usize, columns: &mut [ColumnFilter]) -> Optio
     if &header[0..4] != DELTA_MAGIC {
         return None;
     }
-    if u16::from_le_bytes(header[4..6].try_into().ok()?) != FORMAT_VER {
+    let ver = u16::from_le_bytes(header[4..6].try_into().ok()?);
+    if !(OLDEST_READABLE_VER..=FORMAT_VER).contains(&ver) {
         return None;
     }
     let payload_len = u64::from_le_bytes(header[8..16].try_into().ok()?) as usize;
@@ -624,10 +759,17 @@ fn read_delta(buf: &[u8], at: &mut usize, columns: &mut [ColumnFilter]) -> Optio
             r.skip(7)?;
             let first_zone = r.u64()?;
             let word_count = r.u64()? as usize;
-            if f == 0 || word_count % (super::kernels::ZONE_WORDS * f as usize) != 0 {
+            if f == 0 {
+                if ver < 5 || word_count > u32::MAX as usize {
+                    return None;
+                }
+                gens.push((start_zone, 0, first_zone, word_count as u64, Vec::new()));
+                continue;
+            }
+            if word_count % (super::kernels::ZONE_WORDS * f as usize) != 0 {
                 return None;
             }
-            gens.push((start_zone, f, first_zone, r.words(word_count)?));
+            gens.push((start_zone, f, first_zone, 0, r.words(word_count)?));
         }
 
         let zonemap = match r.u8()? {
@@ -692,4 +834,25 @@ fn read_delta(buf: &[u8], at: &mut usize, columns: &mut [ColumnFilter]) -> Optio
 /// invalidate; see `TableFilters::mark_disk_dirty`.
 pub async fn mark_dirty_on_disk<S: StorageIO>(io: &S) {
     io.write_data(DIRTY_OFFSET, &[1u8]).await;
+}
+
+/// Write `bytes` at `offset` as one transaction, returning `Ok` once its
+/// commit reports it durable.
+///
+/// `StorageIO::write_data` cannot report a failure: the provider logs it and
+/// returns, which is how a checkpoint used to clear `disk_dirty` over a write
+/// that never landed. The transactional form reports it at `commit_durable`.
+/// For the file provider that is the same I/O `write_data` did: a logged one
+/// syncs the record and applies it at commit, and a log-less one overwrites
+/// and flushes. For the KV provider it is a family transaction where
+/// `write_data` was an untransacted flush, and for a mirror the backups are
+/// written before the primary commits.
+///
+/// An `Err` does not mean nothing landed: a KV commit can be in doubt, a
+/// mirror's backups already hold the bytes, and a log-less file has them when
+/// its flush fails. Callers must treat what is on disk as unknown.
+pub async fn write_durably<S: StorageIO>(io: &S, offset: u64, bytes: &[u8]) -> IOResult<()> {
+    let txn = io.begin_txn();
+    let token = io.write_data_txn(txn, offset, bytes).await;
+    io.commit_durable(token).await
 }

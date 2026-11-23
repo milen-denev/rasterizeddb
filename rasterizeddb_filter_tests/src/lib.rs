@@ -9,6 +9,7 @@
 
 use rasterizeddb_core::core::db_type::DbType;
 use rasterizeddb_core::core::filter::{FilterConfig, TableFilters};
+use rasterizeddb_core::core::index_store::gate::Proof;
 use rasterizeddb_core::core::row::row::{
     ColumnFetchingData, ColumnWritePayload, Row, RowFetch, RowWrite,
 };
@@ -229,10 +230,13 @@ pub fn filters_for(spec: &[(&str, DbType)]) -> (SmallVec<[SchemaField; 20]>, Tab
 }
 
 /// Index `rows[slot]` = list of `(write_order, bytes)`.
-pub fn backfill_all(filters: &TableFilters, rows: &[Vec<(u32, Vec<u8>)>]) {
+///
+/// Takes the proof rather than minting one, so this library builds without
+/// `test_tokens`; the tests, which enable it, mint.
+pub fn backfill_all(proof: Proof<'_>, filters: &TableFilters, rows: &[Vec<(u32, Vec<u8>)>]) {
     for (slot, cols) in rows.iter().enumerate() {
         let sv: SmallVec<[(u32, Vec<u8>); 32]> = cols.iter().cloned().collect();
-        filters.backfill_row(slot as u64, &sv);
+        filters.backfill_row(proof, slot as u64, &sv);
     }
 }
 
@@ -288,6 +292,31 @@ pub async fn open_table(
     .await
 }
 
+/// Writes `t`'s filter through the library's own checkpoint
+/// (`TableFilters::try_checkpoint`: a base image, then delta records) to
+/// `<dir>/<table>.sidecar`. A table kept that file as `<table>_flt.db` until
+/// persistent indexes B14 retired it (the filter now persists only as an
+/// index snapshot's FILTER section); the format, and these tests of it, stay
+/// the library's.
+pub async fn checkpoint_sidecar(t: &Table<LocalStorageProvider>, dir: &std::path::Path) {
+    use rasterizeddb_core::core::storage_providers::traits::StorageIO;
+    let io = LocalStorageProvider::new(dir.to_str().unwrap(), Some(&format!("{}.sidecar", t.schema.name))).await;
+    let n = t.io_pointers().unwrap().get_len().await
+        / rasterizeddb_core::core::row::row_pointer::ROW_POINTER_RECORD_LEN as u64;
+    t.filters()
+        .unwrap()
+        .as_ref()
+        .expect("the table has a filter")
+        .try_checkpoint(&io, n)
+        .await
+        .expect("the sidecar checkpoint");
+}
+
+/// Where [`checkpoint_sidecar`] writes `name`'s sidecar.
+pub fn sidecar_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    dir.join(format!("{name}.sidecar"))
+}
+
 pub async fn run(table: &Table<LocalStorageProvider>, where_clause: &str) -> Vec<Row> {
     table
         .query_row(
@@ -318,7 +347,8 @@ pub fn col_bytes(rows: &[Row], schema_id: u64) -> Vec<Vec<u8>> {
         .map(|r| {
             r.columns
                 .iter()
-                .find(|c| c.schema_id == schema_id)
+                // Widened, not narrowed: `schema_id` is a u32 on the row now.
+                .find(|c| u64::from(c.schema_id) == schema_id)
                 .expect("column present")
                 .data
                 .into_slice()

@@ -67,9 +67,7 @@ async fn main() {
         .await;
     }
 
-    eprintln!(
-        "Running {QUERY_ITERATIONS} iterations of full-scan WHERE-filtered query..."
-    );
+    eprintln!("Running {QUERY_ITERATIONS} iterations of full-scan WHERE-filtered query...");
     let t0 = std::time::Instant::now();
     let mut total_bytes = 0usize;
     for _ in 0..QUERY_ITERATIONS {

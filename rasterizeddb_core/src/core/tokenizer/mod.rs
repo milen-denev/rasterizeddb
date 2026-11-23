@@ -1,3 +1,4 @@
+pub(crate) mod collate_rewrite;
 pub mod pagination;
 pub mod predicate_rewrite;
 pub mod query_parser;

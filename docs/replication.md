@@ -10,16 +10,16 @@ Transport: `rastcp` (TLS 1.3). Target: `rasterizeddb_core`, edition 2024.
 | `replication::protocol` — frames, records, negotiation | **Done.** 12-byte header, little-endian, bounds-checked decode |
 | Compressed and uncompressed exchange | **Done.** Zstd behind `replication_compression` (on by default), negotiated per link |
 | `replication::hlc` — hybrid logical clock | **Done.** 48-bit ms + 16-bit counter, monotonic under clock skew |
-| `replication::log` — catch-up history, applied positions | **Done.** CRC-framed, torn-tail recovery, size-bounded compaction |
+| `replication::log` — this node's stream, applied positions | **Done.** Written ahead of the commit through the database's write-ahead log; CRC-framed; size-bounded |
 | `replication::manager` — capture hooks, commit path | **Done.** One relaxed load when replication is off |
-| `replication::peer` — outbound link | **Done.** Batching, linger, adaptive compression, reconnect, catch-up |
-| `replication::server` — inbound listener, apply path | **Done.** Own port, own `rastcp` listener |
-| Peer authentication | **Done.** Mutual certificate pinning or a cluster CA. See §4.3 |
+| `replication::peer` — outbound link | **Done.** Reads the log from where the peer is; batching, linger, adaptive compression, reconnect |
+| `replication::server` — inbound listener, apply path | **Done.** Own port, own `rastcp` listener; one apply at a time per origin, one sync per batch, each transaction once |
+| Peer authentication | **Done.** Mutual certificate pinning or a cluster CA. See §4.4 |
 | `replication::sql` — `REPLICATION …` / `SHOW REPLICATION …` | **Done.** See §7 |
 | CLI flags | **Done.** See §6 |
 | Loop prevention in a mesh | **Done.** See §3.2 |
 | Conflict policies | **Done.** `abort` (default), `skip`, `last-writer-wins`. See §5 |
-| Tests | 146 (unit, end-to-end over real TLS sockets, and 8 authentication tests in `rastcp`) |
+| Tests | 170 in the library (unit, end-to-end over real TLS sockets, power-cut images of both sides), and 8 authentication tests in `rastcp` |
 
 **Known limits** are in §9, and they are not small: this is eventually-consistent
 multi-primary replication, not consensus.
@@ -54,7 +54,7 @@ A record is one committed transaction:
 | Field | Meaning |
 |---|---|
 | `origin` | the node that took the write |
-| `seq` | its position in that node's stream — contiguous, gap-free |
+| `seq` | its position in that node's stream — contiguous, gap-free, in commit order |
 | `commit_hlc` | when it committed, on the cluster's hybrid clock |
 | `statements` | the SQL that ran, in order |
 | `tables` | what it wrote, for the conflict comparison |
@@ -80,9 +80,10 @@ Two hooks, both behind one relaxed atomic load:
 - `note_statement(tx, sql, table)` — called at the point a write is *known to
   have succeeded*, not when it parsed. A statement that failed is never
   replicated.
-- `commit_record(tx)` / `publish(record)` — called from
-  `Database::commit_transaction`, which is what the autocommit path and pgwire's
-  `COMMIT` both go through.
+- `prepare_family(…)`, then `publish_prepared(tx)` — called from
+  `Database::commit_transaction` and `Database::publish_transaction`, which is
+  what the autocommit path and pgwire's `COMMIT` both go through. §3.3 says
+  why there are two.
 
 The buffer is keyed by `TxId`, so a `BEGIN` block accumulating statements over
 several round trips ships as one record and a replica cannot apply half of it.
@@ -91,8 +92,8 @@ several round trips ships as one record and a replica cannot apply half of it.
 sub-transaction's id, not the block's, so publishing on the outer id alone would
 ship what was written outside the savepoints and silently drop what was written
 inside — a replica holding a subset of a transaction that committed whole, with
-nothing reporting a problem. `Database::commit_transaction` therefore returns the
-whole family, and `publish_transaction` consumes it:
+nothing reporting a problem. `Database::commit_transaction` therefore gathers the
+whole family:
 
 - the family is read **at commit**, because a rolled-back savepoint already
   resolves as aborted while its parent runs, and asking afterwards would depend
@@ -124,31 +125,52 @@ numbers that deduplication cannot recognise.
 `a_replicated_transaction_is_not_echoed_back` writes on one node and checks the
 other's local sequence has not moved.
 
-### 3.3 Publish
+### 3.3 Record first, commit, then release
 
-Asynchronous by default: the commit path is a channel send per peer. The queue is
-bounded and a full one *drops* rather than blocking — the record is already in
-the replication log, and the drop raises a catch-up flag the sender acts on. The
-alternative, blocking a commit until a dead peer's queue drains, trades bounded
-catch-up work for unbounded client latency.
+A transaction's record is **written before the transaction commits**, and
+**released to the peers only once that commit is durable**. Three failures
+this order rules out, all of which happened or could be made to:
 
-**Nothing is published before it is durable.** The autocommit path commits,
-flushes the outcome record, and reports failure — rolling back — if that flush
-did not work. Publishing inside the commit put the transaction on the wire before
-that check, so a flush failure left peers holding a write this node had disowned,
-with no way to recall it. The local commit and the publish are therefore separate
-steps, and the sequence number is assigned by the publish: a number burned on a
-transaction that then failed leaves a hole in this node's stream that peers would
-wait forever to have filled.
+- **A committed transaction no peer ever hears of.** The record used to be
+  built after the commit, from a buffer in memory, and appended to a file that
+  was flushed once a second. A crash between the commit and that flush left a
+  transaction that was durable here and unknown everywhere else, with both
+  nodes reporting themselves in step. Now the record is in the replication log
+  and described to the database's write-ahead log *before* the outcome is, and
+  the commit's one sync covers both, record first. Whatever a crash leaves,
+  it leaves the record without the commit (the record is voided at the next
+  start) or both.
+- **A transaction the peers hold and this node disowned.** Nothing is sent
+  before it is durable here: the record, and the outcome it depends on. After
+  a commit that waited for its sync that is immediate; after one that did not
+  (`synchronous_commit = off`) it is the log writer's next round.
+- **Two dependent transactions sent in the wrong order.** The sequence number
+  is taken while the transaction still holds its row locks. A transaction that
+  waited for one of those rows can only be numbered afterwards. Numbered after
+  the locks were released, as it was, the waiter could be numbered first, and
+  a peer ran the `UPDATE` before the `INSERT` it depended on: no rows matched,
+  no error, different data.
 
-Under `--replication-mode sync|quorum:N|all` the commit additionally waits for
-acknowledgements, bounded by `ack_timeout`. The local commit has already
-happened; the timeout bounds how long a slow peer can hold a client's write open.
+A record whose transaction turned out not to commit (its sync failed, or the
+node stopped first) keeps its sequence number and carries nothing: a *void*.
+A peer applies it by moving past it, so a stream never has a hole for anyone
+to wait on.
 
-An acknowledgement counts only when the peer reported the record as *applied* or
-*already held*. One it refused — a conflict, a failed statement, a gap — does not
-count, so a synchronous commit cannot report a durability the cluster does not
-have; the waiter times out instead and the timeout is counted in the status view.
+The cost on the commit path is one positional write and one write-ahead log
+record, under a short lock, and no second `fdatasync`. A record that cannot be
+written fails the commit, before anything is committed.
+
+A statement that changed no row here (an `UPDATE` matching nothing, a schema
+change) has no durable outcome to tie its record to. A schema change's record
+is synced on its own account before the statement returns; a row write that
+changed nothing is not, since a crash loses nothing a peer could be missing.
+
+Under `--replication-mode sync|quorum:N|all` the commit additionally waits
+until that many peers report the transaction applied, bounded by
+`ack_timeout`. The local commit has already happened; the timeout bounds how
+long a slow peer can hold a client's write open. A peer that refuses the
+transaction has not applied it, so the wait times out and the timeout is
+counted in the status view.
 
 ## 4. The wire
 
@@ -195,21 +217,36 @@ and a table clear on every send.
 Compression that *expands* a payload is discarded and the original bytes are
 sent, so a frame is never larger for having tried.
 
-### 4.2 Batching
+### 4.2 The sender reads the log
 
-The sender coalesces whatever has accumulated into one frame, up to a record and
-byte limit, waiting at most `batch_linger` (default 500 µs) for more. This is
-where the throughput comes from: one TLS record, one round trip and one
-compression pass amortised over a batch rather than paid per commit. At low load
-the batch is one record and latency is not traded for throughput nobody asked
-for.
+Each peer's sender reads this node's log from where *the peer says it is*, up
+to the release mark of §3.3, and sends what it finds in one frame: up to a
+record and byte limit, after waiting at most `batch_linger` (default 500 µs)
+for more. One TLS record, one round trip and one compression pass are
+amortised over a batch, and at low load the batch is one record.
 
-Records are sorted by `(origin, seq)` within a batch. Sequence numbers are
-assigned at commit and queued just after, so two transactions committing
-concurrently can reach the queue in the other order; the receiver would refuse
-the inversion as a gap and the sender would backfill it, which converges but
-costs a round trip per inversion. Measured on six concurrent writers, sorting
-took gaps from 53 to 0 and batches from 73 to 61.
+There is no queue between the commit path and a peer. There used to be a
+bounded one, with the log as its overflow, and the two paths disagreed: the
+queue delivered in arrival order, an overflow dropped records and fell back to
+the file, and a relayed record that was dropped was never caught up at all.
+The log is in sequence order and holds everything; its newest few thousand
+records are served from memory.
+
+Every handshake and every acknowledgement carries the peer's own account of
+how far it has applied each origin, and the next read starts there. So a
+refused record is offered again and never passed over, and a peer that was
+rewound is followed back.
+
+A link is in one of three states, shown by `SHOW REPLICATION`:
+
+| State | Meaning |
+|---|---|
+| `up` | the peer is taking what it is sent |
+| `stalled` | the peer refuses the next transaction; it is offered again, less and less often, and the stream picks up by itself once the cause is gone |
+| `needs reseed` | the peer needs history this node no longer holds; **nothing** is sent, because sending the rest would skip the missing part |
+
+One transaction is one record and travels in one frame, up to 64 MiB. A
+transaction whose statements could not fit is refused at commit.
 
 ### 4.3 Measured
 
@@ -308,20 +345,33 @@ combination outright rather than warning about it.
 
 ## 5. The apply path
 
-Per record, in order:
+Records of one origin are applied **one at a time, in order, under that
+origin's lock**: the same record arriving on two connections (a link that
+reconnected while its old request was still being served, a resync during a
+push) is applied by one and reported as already held by the other. A batch
+runs in a task of its own, so a transport timeout cannot cut an apply between
+two statements and leave a transaction open.
+
+Per record:
 
 1. **Own record** (origin is this node) → `Duplicate`, ignore.
 2. **Already applied** (`seq <= high_water`) → `Duplicate`.
-3. **Gap** (`seq > high_water + 1`, and a position exists) → refuse. A record
-   cannot be applied over a hole; the statements before it may be what make it
-   valid. The sender backfills from its log on seeing this.
-4. **Fresh origin** (`high_water == 0`, `seq > 1`) → adopt the stream where it
-   starts, and say loudly that earlier history is not present. A node joining a
-   cluster whose early history is past retention would otherwise stall forever on
-   a gap it cannot close. Seed such a node from a backup.
+3. **Gap** (`seq > high_water + 1`) → refuse. A record cannot be applied over
+   a hole; the statements before it may be what make it valid. This holds from
+   nothing as well: a stream is taken from its first transaction or not at
+   all. (It used to be taken up wherever the first record arrived, which in
+   practice skipped a transaction this node had just refused.)
+4. **Void** (the origin's transaction did not commit) → move past it.
 5. **Superseded** under `last-writer-wins` → `Conflict`, advance past it.
 6. Otherwise: begin a transaction, mark it as an apply, run the statements,
-   commit, record the position, stamp the tables.
+   write the position (§5.2), commit.
+
+The records of a batch share **one `fdatasync`**, and nothing is acknowledged
+before it. The origin commits many writers under one sync; a peer paying one
+each could never keep up, and falling behind is where the other failures
+start. If the sync fails, nothing of the batch is acknowledged and the
+origin's stream is halted until the node is restarted (§5.2). A schema change
+is synced on its own.
 
 ### 5.1 Conflict policies
 
@@ -348,13 +398,64 @@ ends of a link reach the same verdict. Schema changes are never dropped this way
 — a `CREATE TABLE` discarded as superseded would leave everything after it with
 nowhere to go.
 
-### 5.2 Delivery is at-least-once
+When each table was last written is rebuilt at start from the replication log,
+as far back as the log goes. It used to be kept in memory only, so after a
+restart nothing was superseded and the first old record to arrive won over a
+newer row.
 
-The applied position is recorded *after* the transaction commits. A crash in that
-window replays one transaction on restart rather than losing it. Replaying re-runs
-statements that already landed, which the conflict policy then sees — usually as
-a duplicate key. Losing it instead would be silent divergence, which is worse and
-undetectable.
+### 5.2 Each transaction is applied once
+
+Applying a record and noting that it was applied are two writes. Noted first,
+a crash between them loses the transaction; noted after, as it was, the
+transaction is applied again on restart, and a replayed `INSERT` into a table
+without a unique key, or a `SET n = n + 1`, lands twice.
+
+So the note is conditional and goes first. Before an applying transaction
+commits, an *intent* is written through the write-ahead log: "this origin
+moves from `prev` to `seq`, if transaction `tx` committed". The outcome is
+logged after it, in the same log, and one sync covers both. After any crash
+the log holds a prefix, so an outcome is never there without its intent. At
+start each origin's position is its last settled one, moved along its intents
+for as long as each one's transaction committed: exactly the last transaction
+whose rows are there, including when the cut fell part-way through a batch.
+
+A **schema change** is the exception to "written first": it makes itself
+durable over several syncs and is not undone by an abort, so a power cut can
+always leave it done and its position not (35 crash images of 160 in the test
+for it). What is written ahead of it instead is a mark that it was started. A
+node that stops part-way finds the mark at its next start, and when the origin
+offers the record again, a statement of it that fails because its work is
+already there (the table exists, the column exists, the table is already gone)
+is taken as done. Only for that one record, and only after a restart found it
+in flight: at any other time such a failure is a conflict.
+
+The mark covers a record made of schema changes only. A transaction block
+that **mixes schema changes with row writes** is tied to its transaction like
+any other record, and a node that stops part-way through applying one can come
+back with the schema change done and the position before it. The origin then
+offers the block again, its `CREATE` or `ALTER` fails as already done, and the
+link reports `stalled` with that error. That is the expected shape of this
+case (22 crash images of 50 in the test for it), and it is a visible stop, not
+a divergence: in no image was the position ahead of the table or its rows, and
+none applied a row twice. The stream stays stopped for as long as the
+half-applied schema change is on the stalled node; giving that node a fresh
+base copy from the origin (§9.5) clears it. Undoing the change there with a
+statement of your own is not the way out, since on a replicating node that
+statement is itself sent to the origin. Keeping schema changes in their own
+statements, outside blocks that also write rows, avoids the case altogether.
+
+**A log sync that fails** under an applied batch is treated as a failed commit
+sync is everywhere else: the write-ahead log refuses further commits until the
+node is restarted, the origin's stream is halted until then, nothing of the
+batch is acknowledged and nothing is undone. The restart's replay decides what
+survived, and the positions, which ride the same log, come back agreeing with
+the rows.
+
+Only the log's sync counts for this. Once it has succeeded the batch is
+durable and is acknowledged, even if copying the transaction outcomes into the
+status file then fails: the log already holds them, the copy is retried at the
+next sync and redone by a restart's replay, and the failure is logged as an
+error for the operator. The stream is not halted over it.
 
 ## 6. Configuration — CLI
 
@@ -409,6 +510,9 @@ REPLICATION DROP PEER 'berlin'
 REPLICATION PAUSE PEER 'berlin'
 REPLICATION RESUME PEER 'berlin'
 REPLICATION RESYNC PEER 'berlin' FROM 0
+REPLICATION ADOPT PEER 'berlin'      -- only when it holds more of this node's stream than this node does (§8)
+REPLICATION CHECK                    -- compare every table with every peer, row for row (§7.1)
+REPLICATION CHECK PEER 'berlin' TABLE orders
 
 REPLICATION SET compression = 'auto:zstd:1'
 REPLICATION SET mode = 'quorum:1'
@@ -430,6 +534,41 @@ comes up as should always be what its command line says.
 under a live cluster makes its stream ambiguous. The token is never echoed by
 `SHOW`; it reports `(set)` or `(unset)`.
 
+**Where a lagging peer's time goes.** `SHOW REPLICATION STATS` carries three
+counters for this. On the sending node, `push_round_trip_us` is the total time
+its batches took to be acknowledged: the wire both ways and everything the peer
+did in between. On the receiving node, `batches_applied` and `apply_us` are how
+many batches it applied and how long that took. Read both nodes before and
+after a spell of load: if the receiver's `apply_us` is nearly all of the
+sender's `push_round_trip_us`, the peer is short of apply, and no amount of
+network will help it; if it is a small part, look at the link. On two nodes on
+one machine, 16 writers gave an apply of 20.4 ms in a round trip of 20.9 ms.
+
+**Batches in flight.** A link keeps up to `pipeline_depth` batches of its own
+node's stream on the wire before it waits for an answer (8 by default;
+`--replication-pipeline-depth`, or `REPLICATION SET pipeline_depth`). Waiting for
+each answer caps a link at one batch per round trip, which on a long link is the
+whole limit: at a 40 ms round trip, 24 single-transaction batches took 1.03 s
+one at a time and 0.14 s eight at a time. The peer still applies the batches
+one after another and in order — only the waiting overlaps — so on a short link,
+where the apply is most of each round trip, it changes little. A batch the peer
+refuses holds everything behind it exactly as before: the peer applies none of
+the batches already sent after it, and the stream starts again from where the
+peer says it is. `pipeline_depth = 1` waits for each answer.
+
+**A quiet link is kept alive.** A node's link to a peer carries transactions
+when there are some; when it has carried nothing for `keepalive_ms` (10 seconds
+by default) — because there is nothing to send, or because the peer is refusing
+what there is and the next offer is not yet due — it sends a `PING` instead. Two things follow. The receiving end closes
+a connection it has not heard from for its request timeout, so without this the
+first write after a quiet spell would find the link closed, rebuild it, and
+arrive late by the reconnect delay. And a peer that has gone is reported down
+within one interval, where a link that only spoke when it had something to send
+would read "connected" for as long as nothing was written. `REPLICATION SET
+keepalive_ms = 0` turns it off; whatever it is set to, a link is never left
+quiet for more than a third of `request_timeout_ms`. Every build answers a
+`PING`, so a node with this talks to a peer without it.
+
 Example:
 
 ```text
@@ -437,6 +576,7 @@ $ psql -c "SHOW REPLICATION STATUS"
  node 1 of cluster 'rasterizeddb' — enabled
  listening on 127.0.0.1:7441, mode async, conflict abort, compression auto:zstd:1
  local sequence 361, clock 1787234791376.1, 1 peer(s), 0 open capture(s)
+ released to peers through 361, 0 committing or awaiting their sync
  captured 361, published 361, applied 361, duplicates 0
  conflicts 0, failures 0, gaps 0, ack timeouts 0
  61 batch(es), 60 compressed: 52439 bytes of payload went out as 12331 (76.5% smaller)
@@ -445,32 +585,98 @@ $ psql -c "SHOW REPLICATION STATUS"
  two              127.0.0.1:7442           2      up         361      0        0        zstd
 ```
 
-## 8. The two files
+### 7.1 Checking that two nodes hold the same rows
 
-Beside the data, and neither is a source of truth for user data — the WAL and the
-transaction status log remain that.
+`SHOW REPLICATION` compares sequence numbers: how much of each stream a node
+has applied. That is not the same as holding the same rows, and the one time a
+pair diverged here both nodes reported the peer up with a lag of zero.
 
-- **`db_replication.log`** — this node's committed history, so a peer that was
-  down can ask for what it missed. CRC-framed records; a torn tail from a crash
-  is truncated and everything before it survives; a bad checksum stops recovery
-  rather than being trusted. Bounded by `--replication-retention-mb`, compacted
-  by rewriting the newest half under a temp file and a rename. A peer that falls
-  further behind than retention is told to resynchronise rather than served a
-  gap.
-- **`db_replication.state`** — how far this node has applied each origin's
-  stream. Append-only `(origin, seq)` pairs, recovered as the maximum per origin,
-  rewritten when it grows. A torn tail costs at most the most recent advance.
+`REPLICATION CHECK` does not take the stream's word for it. Each node reduces
+every table a client made to a row count and a checksum over its rows'
+**values** (order-independent, so the two nodes need not store rows in the
+same order), and the two are compared. Values, not stored bytes: two nodes
+that both hold a row correctly can lay it out differently, with different
+bytes left under a `NULL`, a dropped column still in one node's layout, or a
+`CHAR(n)` padded on one and not the other. Each live column is read by name,
+a `NULL` counts as a `NULL` whatever lies under it, and a `character(n)` is
+compared without its trailing spaces. Only a `character(n)`: in `text` and
+`varchar` a trailing space is part of the value, and `'a'` against `'a '` is
+a difference:
 
-An **in-memory** database has neither file, and its log is the in-memory window
-alone. It reports that window as its retention boundary, so a peer that falls
-past it is told to resynchronise — the same answer a file-backed node gives when
-retention has dropped what the peer wants, rather than a silently short reply.
+```text
+$ psql -c "REPLICATION CHECK"
+ node 1 and berlin (node 2) are in step: each has applied all the other has committed (5120 from here, 14 from there)
+ 3 table(s) compared: 1 DIFFERENT, 0 on one node only
+ DIFFERENT  orders: 5100 rows here, 5099 on berlin
+```
 
-Both files are **buffered, not flushed per commit**, with a one-second flusher and a
-flush at shutdown. A commit's own durability is already paid for by the WAL;
-adding a second `fsync` to the commit path to protect a catch-up cache would be a
-poor trade. A crash that loses the buffered tail costs a peer its incremental
-catch-up, and it resynchronises instead.
+The comparison only counts when the two nodes are **in step**: nothing was
+committed or applied on either while it read its tables, and each has applied
+all the other has released. Otherwise it is tried again a few times and then
+reported as `NOT in step`, since a table read while a transaction is in flight
+differs for an honest reason. Run it when the nodes are quiet.
+
+What it does not do: a table of more than two million rows is counted but not
+read, because its rows are held in memory while they are hashed; and it says
+which table differs, not which rows.
+
+## 8. The files
+
+Beside the data, all named `db_replication.*`, and none is a source of truth
+for user data — the WAL and the transaction status log remain that.
+
+- **`db_replication.log`**, then **`db_replication.log.<n>`** — this node's
+  stream, and what it relays, in files that are only ever appended to.
+  CRC-framed records, each a positional write described to the database's
+  write-ahead log, so a commit's sync covers its record and a replay (after a
+  crash, or in a restore) puts back whatever a file lost. A record of a
+  transaction that wrote rows names that transaction, and counts only if it
+  committed. Bounded by `--replication-retention-mb`: a file grows to an
+  eighth of the budget, the next one is started, and past the budget the
+  oldest files are removed whole. Nothing is ever copied or rewritten: a file
+  can be rebuilt from the write-ahead log only if everything in it went
+  through that log, and a log that was compacted by copying came back from a
+  restore empty.
+  The budget is for a peer that is away. A file that a **connected** peer has
+  not been sent all of yet is kept past it, up to four times the budget: under
+  a burst the origin's many writers outrun a peer applying one transaction at
+  a time, and letting go of what such a peer still needed turned a few seconds
+  of lag into a node to reseed.
+- **`db_replication.state`** — how far each origin's stream is applied and
+  durable: one checksummed 64-byte slot an origin, overwritten in place. A
+  slot that does not check out stops replication from starting rather than
+  being guessed at. A state file of the earlier format (pairs) is converted
+  at open.
+- **`db_replication.intents`** — the steps of §5.2 not yet settled into a
+  slot. Emptied when nothing is waiting on it.
+
+All three are settled at **every server start that finds them**, whether or
+not replication is switched on: an entry written ahead of a commit that never
+happened is decided by asking how its transaction ended, and that has to be
+asked before anything can forget the answer.
+
+**Restoring this node** from a backup brings these files back with the
+tables, to the same point: the positions especially, since a position older
+than the rows would have the peers' transactions applied a second time. Keep
+them.
+
+**Seeding a different node** from this one's backup must remove every
+`db_replication.*` file from the copy, and from the node it will pair with
+(§9.5): they describe this node's stream and positions, not the new node's.
+
+**A node restored to an earlier point** than its peers have seen is behind its
+own stream: a peer holds transactions of this node that this node no longer
+has. The link reports `needs reseed` and sends nothing, because the peer would
+take every new transaction numbered below what it holds as one it already
+has. Reseed one side from the other; or, to keep both as they are,
+`REPLICATION ADOPT PEER '<name>'` moves this node's sequence past what the
+peer holds.
+
+An **in-memory** database has no files, and its log is the in-memory window
+alone. It reports that window as its retention boundary.
+
+There is **no downgrade** to a build from before this format: an earlier build
+cuts the log at the first record it does not recognise.
 
 ## 9. Limits
 
@@ -510,9 +716,13 @@ multi-primary means.
 ### 9.5 A new node needs a base copy
 
 Replication ships what happens from now on, not what happened before. A node
-joining a cluster that already holds data must be seeded from a backup first;
-otherwise it adopts the stream at whatever point it finds it (§5, step 4) and is
-missing everything earlier.
+joining a cluster that already holds data must be seeded from a backup first,
+with every `db_replication.*` file removed on both sides (§8). A node that
+holds nothing of an origin whose log no longer starts at its first transaction
+is not sent anything: the link reports `needs reseed`.
+
+What every node does for itself at first start — its role catalogue and its
+first role — is not replicated.
 
 ### 9.6 Conflict granularity
 

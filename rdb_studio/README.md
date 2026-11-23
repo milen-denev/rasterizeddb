@@ -1,7 +1,7 @@
 # rdb_studio
 
-A database console for RasterizedDB — and, over the same wire protocol, for
-PostgreSQL.
+A database console for RasterizedDB — over its native protocol by default —
+and, over the PostgreSQL wire protocol, for PostgreSQL.
 
 ```sh
 cargo run -p rdb_studio                # pick a connection
@@ -14,31 +14,102 @@ cargo run -p rdb_studio -- studio-demo # open a saved profile straight away
 |---|---|
 | **Dashboard** | What is the database *doing*, as a live line per metric, plus where the space is going |
 | **Overview** | Every statistic the server reports, grouped, with the six that matter as tiles |
-| **Tables** | Every table with its sizes, and one table's columns, constraints and statistics |
+| **Tables** | Every table with its sizes and what is holding it — memory, files, S3 — and one table's columns, indexes, partitions and statistics |
 | **Schema** | The foreign keys as a layered map, each line anchored at the column it joins |
-| **Data** | A page of rows, editable in place, with insert and delete |
-| **Query** | Several statements at a time, each reporting separately, with timings and a history you can prune |
+| **Data** | A page of rows, editable in place, with insert and delete, a `WHERE` filter, and CSV import |
+| **Query** | Several statements at a time, each reporting separately, with timings, a row limit, cancel, notices, completion and a history you can prune |
+| **Activity** | What the *server* has been running, what each cost, how many rows it had to read to answer, and how much of the time went on relations it had to build first |
+| **Bench** | How fast one statement runs: queries per second and end-to-end latency (mean, median, p90/p95/p99/p99.9, min, max) over N connections of its own, with warm-up, simple or prepared protocol, and runs kept side by side to compare |
 | **Backup** | What is stored in S3, whether archiving is healthy, and restoring from it |
+| **Branches** | Each branch of a database, making one (now or at a past point), and per branch what a merge would do, then merge, reset, promote or drop |
 | **Storage** | Which directories the database writes into, how full each is, and which one holds each table |
 | **Replication** | Whether it is on, who it is talking to, and how far behind they are |
 | **Migrate** | Importing a live PostgreSQL database into this one |
-| **Config** | Every runtime knob, with the ones a running server can change actually editable |
+| **Keys** | RasterizedDB's key/value store: keys scanned a page at a time by pattern, each value read by its type, with its expiry |
+| **Roles** | Who may log in: create a role, set its password, drop it (password hashes are never read) |
+| **Config** | Every runtime knob: the ones a running server can change applied live, restart-only ones saved for the next start where the server can save them, fixed choices as dropdowns |
 
-Databases and tables are created and dropped from the sidebar; columns are added
-from the table detail pane.
+Databases and tables are created and dropped from the sidebar; columns are
+added, renamed, retyped, made (non-)nullable and dropped from the table detail
+pane. A column change is sent as one script — the type and nullability under
+the old name, then the rename — so a refused type change leaves the name alone.
+
+## Indexes and partitions
+
+The table pane's lower half switches between **INDEXES**, **PARTITIONS** (only
+for a partitioned table) and **STATISTICS**.
+
+- **NEW INDEX** writes `CREATE INDEX` for every kind the engine builds: columns
+  in key order by B-tree, hash or the server's own choice; a whole `jsonb`
+  document by GIN (`jsonb_ops` or `jsonb_path_ops`); or one document field,
+  `((doc->'user'->>'id'))`, typed as `user.id`. The dialog shows the statement
+  it will send as it is filled in.
+- Each index says who owns it, which decides how it goes: a declared one by
+  `DROP INDEX`, a unique one or the primary key's with its constraint (`ALTER
+  TABLE … DROP CONSTRAINT`). Every drop is checked against the reloaded list
+  afterwards, because a RasterizedDB server before `fc3849c` answered both with
+  success and kept the index; the status bar says so when that happens.
+- **CHECK INDEXES** (RasterizedDB) runs `rdb_index_check`, the audit of a
+  table's indexes against its rows, and reports its verdict.
+- **NEW TABLE** can partition by hash (RasterizedDB): up to three key columns,
+  leading column first, and a partition count. A key column is made NOT NULL as
+  it is picked, and marking several columns PK makes a composite primary key,
+  which a partitioned table usually needs. PARTITIONS lists each partition's
+  slice of the hash space, whether it has files yet, and its size. ADD COLUMN
+  and NEW INDEX work on a partitioned table as on a plain one: the server
+  applies them to every partition. Only the partition key is fixed.
+- A table whose row slots outnumber its live rows ten to one or more — a small
+  table updated in a loop, where each update leaves a dead version behind —
+  says so above its columns, with both counts. The figures are `SHOW TABLE
+  STATS`' `live_rows` and `slots_per_live_row` (RasterizedDB), which read "not
+  measured" until vacuum has swept the table once; STATISTICS lists them with
+  the rest.
+
+Dialogs stay open until the server answers, and show its refusal where the
+form still is.
+
+## Two protocols
+
+A new RasterizedDB profile connects with the server's **native protocol**
+(rastcp, port 61170 or a `--rdb-socket` file) through `rasterizeddb_client`.
+The **PostgreSQL wire protocol** (`tokio-postgres`, port 5432) is the other
+choice, and the only one for a PostgreSQL server. A profile saved before the
+choice existed keeps the wire protocol: it was saved with a pgwire port.
+
+Every screen works over either, because the native session asks for the
+*simple-query form*: the server runs the text through its PostgreSQL path and
+answers with the messages pgwire would have sent — column names, each cell as
+PostgreSQL's text, command tags, SQLSTATEs, several statements as one implicit
+transaction, `WITH` and derived tables. The engine's plain native answer has no
+column names and tags a `jsonb` document as text, so a console cannot be built
+on it. The form needs a server that has it; an older one refuses it without
+running anything, and the connection screen says so and names the way back.
+
+What differs over native:
+
+| | native | wire |
+|---|---|---|
+| Databases | one per listener: the session takes its name from the server, and switching is refused rather than reconnecting to the same one under another name | any; switching reconnects |
+| Login | chosen: password (SCRAM-SHA-256), peer (unix socket), or trust | negotiated |
+| Link | TLS over TCP, always, the certificate verified when the profile asks (`--rdb-cert`); none on a socket | per the TLS setting |
+| Transaction blocks | the editor's own connection keeps one open across runs; the panels' shared one does not see into it | may span runs (and the panels share the editor's connection) |
+| Long statements | cut off at the server's `--rdb-request-timeout` (30 s by default) | no limit |
+| A connection the server closed | opened again by the next statement | opened again by the next statement, before it is sent; the editor is told that a transaction open on the old one was rolled back |
+| BENCH | `native` (the engine's binary answer, what applications send) and `simple` | `simple` and `prepared` |
 
 ## The two dialects
 
-Both servers speak the PostgreSQL v3 wire protocol, so one transport serves
-both. What differs is *how you ask a database about itself*, and that is the
+Whichever protocol carries it, a result reaches the screens in the same shape
+(see above). What differs is *how you ask a database about itself*, and that is the
 whole of [`src/dialect.rs`](src/dialect.rs):
 
 - **RasterizedDB** answers a statement family added for this:
   `SHOW DATABASE STATS`, `SHOW TABLES`, `SHOW TABLE STATS <t>`,
   `SHOW COLUMNS FROM <t>`, `SHOW SCHEMA MAP`, `SHOW DATABASES`,
   `SHOW CONFIG`, `SHOW CONFIG KEYS`, `SET CONFIG <key> = <value>`,
-  `SHOW BACKUP STATUS`, `SHOW REPLICATION STATS` and
-  `SHOW REPLICATION PEER STATUS`. See
+  `SHOW BACKUP STATUS`, `SHOW REPLICATION STATS`,
+  `SHOW REPLICATION PEER STATUS`, `SHOW QUERIES`, `SHOW QUERY STATS` and
+  `RESET QUERY STATS`. See
   [docs/introspection.md](../docs/introspection.md).
 - **PostgreSQL** answers the equivalent `pg_catalog` / `pg_stat_*` queries.
 
@@ -50,6 +121,17 @@ in a banner that stays up — when the answer disagrees with what you chose.
 Two figures have no PostgreSQL equivalent and are marked rather than faked:
 `reclaimable_bytes` is estimated from `n_dead_tup`, and `filters_ready`
 describes an index only RasterizedDB has.
+
+The activity screen is the sharpest case of the same rule, because there the
+*question* differs and not just a figure. RasterizedDB keeps a ring of finished
+statements; PostgreSQL keeps none, and the nearest thing it has —
+`pg_stat_activity` — is what its backends are executing at this instant. So that
+pane is headed "RUNNING NOW · THIS INSTANT, NOT A HISTORY" there, and the two
+columns nobody can answer for a statement that has not finished — rows returned,
+rows scanned — show as dashes rather than zeroes. The lower pane is
+`pg_stat_statements`, which genuinely is the equivalent of `SHOW QUERY STATS`,
+and the page says so plainly when the extension is not loaded instead of
+rendering an empty table.
 
 ## The query screen
 
@@ -66,6 +148,50 @@ Beyond running SQL:
 - **Open and save `.sql` files** through the desktop's own file chooser, and
   **copy or export results** as CSV, JSON, Markdown or `INSERT` statements.
 - **Export the session history** as a runnable script.
+- **A row limit** (1,000 / 10,000 / 100,000 / none; 10,000 by default) on each
+  result. Rows past it are counted, not kept — the server drops them over
+  native, the console streams past them over the wire — and the result says
+  "the first 10,000 of 52,341 rows", so a capped answer never reads as whole.
+- **Cancel** stops the running statement: over the wire with PostgreSQL's
+  CancelRequest, over native with a CANCEL of the token the run was sent with.
+  The statement ends with SQLSTATE 57014.
+- **Notices** the statements raised are listed above their results.
+- **A transaction pill** says when the editor is inside a block, or a failed
+  one, over native. An open block is kept alive while you think: the server
+  closes a connection idle for its request timeout, which would roll it back.
+
+### The editor
+
+SQL is coloured as you type: keywords, types, functions, strings, numbers and
+comments each get their own colour, and a name that is a table in the connected
+database — or a column of the selected one — is coloured as one, which is also
+the quickest way to notice that a name is *not*.
+
+It is checked as you type, too. What the checker finds is marked in the text and
+listed under the editor; clicking a finding puts the cursor on it. **Errors** are
+things the server will refuse anyway — an unclosed string, comment or bracket, a
+stray comma. **Warnings** are the ones the server will run happily:
+
+- `UPDATE` or `DELETE` with no `WHERE`, which touches every row;
+- `= NULL` / `<> NULL`, which is never true and so silently matches nothing;
+- a statement starting on a new line with no `;` after the one before it;
+- a near-miss keyword — `FORM`, `WHRE`, `SELCT`;
+- against RasterizedDB, a table name that is not in the database. (Not against
+  PostgreSQL, whose table list leaves out views.)
+
+Every rule is written to stay quiet when unsure, and none of them ever stops a
+statement from running — the server is the authority.
+
+| Keys | Does |
+|---|---|
+| Ctrl+Enter | runs everything |
+| Ctrl+Shift+Enter | runs only the statement the cursor is in |
+| Enter | a new line at the same indentation, one deeper after `(` |
+| Tab / Shift+Tab | indent / unindent — the selected lines, if any |
+| Ctrl+/ | comments the lines out, or back in |
+| Ctrl+Space | completes the table, column or keyword before the cursor; several candidates are listed under the editor |
+| Ctrl+Shift+F | formats |
+| Ctrl+S | saves to a `.sql` file |
 
 ### Copying and exporting
 
@@ -99,7 +225,9 @@ one exchange and get one figure between them rather than a fabricated split.
 ### History
 
 Everything the session sent — typed, or issued by a dialog, a backup action or a
-config change — with its duration, its outcome and how long ago. Clicking an
+config change — with its duration, its outcome and how long ago. A string after
+`PASSWORD` is kept as `'********'`, so a `CREATE ROLE` or `ALTER ROLE` never
+leaves its password in the history or its export. Clicking an
 entry **loads it into the editor and does not run it**: the list holds the
 session's `DROP` and `DELETE` statements as readily as its `SELECT`s. Running is
 a separate button. Entries can be copied, deleted one at a time, or cleared.
@@ -218,12 +346,40 @@ browser says so and says what would fix it. The alternative — matching an
 `UPDATE` on the row's own values — writes to every duplicate of the row that was
 clicked, reports success, and is undetectable afterwards.
 
-Columns are dragged to width from the divider in the header, remembered per
-table, and double-clicked back to the default.
-
 For the same reason a page is always ordered by that key. Without an `ORDER BY`
 neither engine promises the same order twice, so page 2 can repeat a row from
 page 1 and skip another.
+
+Past the first page, a table ordered by its key alone is read **after the
+previous page's last key** (`WHERE "id" > 4711 ORDER BY "id" LIMIT 200`)
+rather than at an offset. `OFFSET 90000` makes the server read, order and throw
+away ninety thousand rows for every page that deep; the key needs none of them.
+It applies to integer and text keys, ascending or descending, with or without a
+filter. A page sorted by another column, or keyed by a type whose literal the
+browser does not write exactly (a UUID, a timestamp, `NUMERIC`), still pages at
+an offset. Where a page ended is kept only for the page on screen under the
+same table, filter, order and page size, so a late answer from a page already
+left behind never decides where the next one starts.
+
+Clicking a header in the data browser sorts the **table**, not the page: the
+statement goes back to the server with an `ORDER BY` in front of the key and
+comes back from page one. Sorting the page in hand would rearrange the hundred
+rows that happened to arrive under a heading claiming to order the whole thing.
+
+Columns are dragged to width from the divider in the header, remembered per
+table, and double-clicked back to the default.
+
+The **filter** box above the grid takes a condition as written after `WHERE`.
+It must be one condition — no `;`, balanced parentheses — so the browser's own
+`ORDER BY` and `LIMIT` still apply to it; a `--` comment in it ends before them.
+The footer then counts the matching rows.
+
+**Import CSV** reads a file with a header row into the selected table, matching
+the header to the columns by name. An unquoted empty field is `NULL` and `""`
+the empty string, as the export writes them. Up to 20,000 rows go in one
+request, which is one transaction: a file that size imports whole or not at
+all; a bigger one goes request by request and a refusal stops it with the
+rows before it kept, and the report says which records.
 
 ## Columns
 
@@ -237,6 +393,21 @@ header, double-click it to go back to the default.
 Widths are remembered per grid and, where the columns belong to a table, per
 table — two grids with a `name` column do not share its width, and neither do
 two tables.
+
+Clicking a header sorts by it; clicking again reverses it; a third click puts
+the grid back into the order the server returned. That third state is not
+decoration: a re-sorted grid shows a different order from the one the statement
+produced, and there has to be a way back to it without reconnecting. Rows are
+ordered by what the figure *is*, not by how it was printed — `1.2 GiB` sorts
+above `900 MiB` — and a row with nothing in the sorted column goes to the
+bottom in both directions, because "missing" has no place in an order. Rows the
+column cannot tell apart keep the order they arrived in.
+
+Columns holding a button or a row of badges have nothing to order by and do not
+respond to a click. Sorting the configuration list flattens its sections, since
+the sections are an ordering of their own and keeping them would produce a page
+of one-row groups; the section name is the first half of every key in the
+column beside it, so nothing is hidden.
 
 They are separate pieces rather than one `grid(columns, rows)` call because the
 screens genuinely differ: the table list makes each row a button, the catalogue
@@ -317,6 +488,8 @@ it only when the map moves or the schema changes.
 
 ```sh
 cargo test -p rdb_studio                       # unit tests
+# The OS keyring itself, on a desktop that has one (writes and removes an entry):
+cargo test -p rdb_studio --lib the_os_keyring_round_trips -- --ignored
 
 # Everything the dialect layer sends, against real servers. Each is optional.
 RDB_STUDIO_TEST_PG=postgresql://user:pw@host:5432/db?sslmode=disable \
@@ -329,12 +502,58 @@ column removed in a newer PostgreSQL, a cast that needs quoting, an engine that
 refuses a string literal against an integer key. It writes only to a table it
 creates and drops.
 
+Over native, set `RDB_STUDIO_TEST_RDB` to `rdb://user:pw@127.0.0.1:61170` or
+`rdb://user@/tmp/rdb.sock?login=trust` (`login` is `password`, `peer` or
+`trust`) and the same suite runs over the native protocol.
+
+With `RDB_STUDIO_TEST_RDB` on the wire protocol and `RDB_STUDIO_TEST_RDB_NATIVE`
+on the native one, two more run: the transports must answer identically, and
+the editor's row limit, cancel, notices and cross-run block are checked on
+both. `RDB_STUDIO_TEST_TLS_CA` (the CA that signed the server's `--pg-cert` and
+`--rdb-cert`) and `RDB_STUDIO_TEST_TLS_OTHER_CA` (one that did not) check
+certificate verification. The tests take turns: several create and drop tables
+while another lists them all.
+
 ## Connections on disk
 
-`~/.config/rdb_studio/connections.json`, owner-readable only. A password is
-written only when the profile asks for it.
+The profiles are one JSON file in the user's config directory, readable by its
+owner only:
+
+| Platform | Profiles | Saved passwords (default) |
+|---|---|---|
+| Linux, BSD | `~/.config/rdb_studio/connections.json` | the Secret Service (GNOME Keyring, KWallet) |
+| Windows | `%APPDATA%\rdb_studio\connections.json` | Credential Manager |
+| macOS | `~/Library/Application Support/rdb_studio/connections.json` | Keychain |
+
+A password is kept only when **Save password** is on, and then where **Keep it
+in** says: the **OS keyring** (the default; the file holds no password), or the
+**profile file** in plain text, for a machine with no credential store — a
+Linux desktop without a Secret Service says so when the profile is saved. Each
+keyring entry is filed under the service `rdb_studio`, with the profile's name
+as its account, so it shows up as such in Seahorse, KWallet Manager, Credential
+Manager or Keychain Access.
+
+The keyring is read when a profile is picked (the password field then fills
+in) and when it connects, written when the profile is saved, and cleared when
+**Save password** is turned off, the password moves to the file, or the profile
+is deleted. A keyring that refuses the password fails the save rather than
+saving the profile without it. A profile saved before the keyring existed keeps
+its password in the file until it is moved.
+
+The native protocol's unix socket and peer login are not available on Windows;
+connect over TCP with a password or trust login there.
 
 ## What TLS does here
+
+Over the native protocol, TCP is always TLS and a unix socket never is.
+
+**Verify the server's certificate** (per profile, either protocol) believes
+only a certificate signed by the profile's CA file — or, with none, a public
+authority — that names the host, and never falls back to cleartext. It needs a
+server given a real certificate: `--pg-cert`/`--pg-key` for the wire protocol,
+`--rdb-cert`/`--rdb-key` for the native one. The status bar then says
+`TLS VERIFIED`. Without it:
+
 
 `require` encrypts and **does not authenticate the server**: RasterizedDB
 generates a self-signed certificate when none is configured, and verifying it

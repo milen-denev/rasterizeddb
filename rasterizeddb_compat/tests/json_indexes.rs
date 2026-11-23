@@ -1,0 +1,498 @@
+//! Inverted (`gin`) and path (`((doc->>'k'))`) indexes answer exactly like
+//! an unindexed twin.
+//!
+//! Two tables get the same random documents and the same writes: inserts,
+//! replacements, deletes, `NULL` documents, documents that are arrays or bare
+//! scalars, numbers spelled several ways (`3`, `3.0`, `3e0`, `3.00`, and
+//! values past the `f64` range or precision such as `1e400` and
+//! `1.000000000000000000001`), with predicates on both their value (`@>`)
+//! and their text (`->>`, which prints the scale as written). Only one has
+//! indexes. Every query must return the same ids from both, through
+//! `VACUUM`, `VACUUM FULL` and a restart that rebuilds the indexes from the
+//! rows. An index may only ever return too much; a row missing from the
+//! indexed table's answer is the bug this exists to catch.
+//!
+//! The indexes must also actually have been consulted, which query results
+//! cannot show by design: the engine's lookup counters are read for that.
+
+use rasterizeddb_compat::TestServer;
+use rasterizeddb_core::core::index::{GIN_LOOKUPS, PATH_LOOKUPS};
+use sqlx::{AssertSqlSafe, Row};
+use std::sync::atomic::Ordering;
+
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+const STATUSES: [&str; 5] = ["new", "paid", "shipped", "delivered", "cancelled"];
+
+fn number(r: &mut Lcg, n: u64) -> String {
+    match r.below(6) {
+        0 => format!("{n}"),
+        1 => format!("{n}.0"),
+        2 => format!("{n}e0"),
+        // The scale is kept as written, so `->>` prints these as `3.00` and
+        // `3.0`, while `@>` still calls them equal to `3`.
+        3 => format!("{n}.00"),
+        4 => format!("{}e-1", n * 10),
+        _ => format!("0.{n}e1"),
+    }
+}
+
+/// Values that are equal as numbers but not as text, past the `f64` range
+/// and past its precision: the containment index hashes them by value and
+/// the path index keys them by text, and both must agree with the scan.
+/// The last seven have long positional text and are stored in a short
+/// exponent form instead, which is written out only when printed.
+const BIG: [&str; 21] = [
+    "1e400", "10e399", "1E+400", "1.000000000000000000001", "1.0000000000000000000010", "1", "1.0",
+    "9007199254740993", "9007199254740993.0", "9.007199254740993e15", "9007199254740992", "-0", "0.0",
+    "1e-400", "1e60", "10e59", "1000000000000000000000000000000000000000000000000000000000000",
+    "1.000e-45", "1000e-48", "0e-45", "-0.0e-44",
+];
+
+/// What `->>` prints for some of those, and some text no number prints as.
+const BIG_TEXT: [&str; 13] = [
+    "1", "1.0", "0", "0.0", "-0", "9007199254740993", "9007199254740993.0", "1.000000000000000000001",
+    "1e400", "1000000000000000000000000000000000000000000000000000000000000",
+    "0.000000000000000000000000000000000000000000001000", "0.000000000000000000000000000000000000000000000",
+    "1e60",
+];
+
+/// Whether documents may be `NULL`: they match no JSON operator, indexed or
+/// not.
+const NULL_DOCS: bool = true;
+
+/// A random document, or `NULL`.
+fn document(r: &mut Lcg) -> String {
+    match r.below(20) {
+        0 if NULL_DOCS => return "NULL".into(),
+        0 => return "'{}'".into(),
+        1 => return format!("'[\"t{}\", {}]'", r.below(6), { let n = r.below(4); number(r, n) }),
+        2 => return format!("'\"{}\"'", STATUSES[r.below(5) as usize]),
+        _ => {}
+    }
+    let mut fields = vec![
+        format!("\"status\":\"{}\"", STATUSES[r.below(5) as usize]),
+        format!("\"cat\":{}", { let n = r.below(10); number(r, n) }),
+        format!(
+            "\"user\":{{\"name\":\"u{}\",\"id\":{}}}",
+            r.below(30),
+            { let n = r.below(30); number(r, n) }
+        ),
+    ];
+    let tags: Vec<String> = (0..r.below(4)).map(|_| format!("\"t{}\"", r.below(6))).collect();
+    fields.push(format!("\"tags\":[{}]", tags.join(",")));
+    if r.below(10) == 0 {
+        fields.push("\"promo\":true".into());
+    }
+    if r.below(3) == 0 {
+        fields.push(format!("\"big\":{}", BIG[r.below(BIG.len() as u64) as usize]));
+    }
+    if r.below(8) == 0 {
+        // A key whose value is not a string: `->>` renders it as text.
+        fields.push(format!("\"label\":{}", r.below(3)));
+    } else if r.below(4) == 0 {
+        fields.push("\"label\":null".into());
+    }
+    format!("'{{{}}}'", fields.join(","))
+}
+
+/// A random predicate over the document.
+///
+/// Beside the shapes the indexes answer, it writes the ones they must treat as
+/// opaque or answer only as a superset: `NOT` over any atom (an index that
+/// read a negated comparison as the comparison would return its complement),
+/// `IN` / `NOT IN` / `BETWEEN` and `IS [NOT] NULL` over a path, comparisons
+/// against the empty string (a path that reaches nothing is NULL, which the
+/// path index keeps under the same empty key), and whole-document equality
+/// against numbers spelled another way (the hash index must key `1` and `1.0`
+/// alike, since they are equal).
+fn predicate(r: &mut Lcg) -> String {
+    fn atom(r: &mut Lcg) -> String {
+        match r.below(40) {
+            14 => format!("NOT ({})", atom(r)),
+            // An operand the expression evaluator computes from an indexed
+            // path. Read as the bare path it holds, any of these would let
+            // an index prune rows the evaluator returns.
+            34 => format!(
+                "CASE WHEN doc->>'status' = '{}' THEN doc->>'label' ELSE 'none' END = '{}'",
+                STATUSES[r.below(5) as usize],
+                ["none", "0", "1", "2"][r.below(4) as usize]
+            ),
+            35 => format!("doc->>'status' || '!' = '{}!'", STATUSES[r.below(5) as usize]),
+            36 => format!(
+                "CASE WHEN doc->>'label' IS NULL THEN 'none' ELSE doc->>'label' END {} '{}'",
+                ["=", "<>"][r.below(2) as usize],
+                ["none", "0", "1"][r.below(3) as usize]
+            ),
+            37 => format!(
+                "(doc->>'status', doc->'user'->>'name') = ('{}', 'u{}')",
+                STATUSES[r.below(5) as usize],
+                r.below(30)
+            ),
+            38 => format!(
+                "(doc->>'status', id % 2) IN (('{}', 0), ('{}', 1))",
+                STATUSES[r.below(5) as usize],
+                STATUSES[r.below(5) as usize]
+            ),
+            39 => format!(
+                // Parenthesised, as PostgreSQL needs: `||` and `->>` are one
+                // precedence there, so the bare form is a path over text.
+                "(doc->>'status') || (doc->>'cat') {}IN ('paid1', 'new2', 'shipped3')",
+                if r.below(2) == 0 { "NOT " } else { "" }
+            ),
+            15 => format!(
+                "doc->>'status' {}IN ('{}', '{}')",
+                if r.below(2) == 0 { "NOT " } else { "" },
+                STATUSES[r.below(5) as usize],
+                STATUSES[r.below(5) as usize]
+            ),
+            16 => format!(
+                "{} IS {}NULL",
+                ["doc->>'label'", "doc->'label'", "doc->>'promo'", "doc->'user'->>'name'"][r.below(4) as usize],
+                if r.below(2) == 0 { "NOT " } else { "" }
+            ),
+            17 => format!("doc->>'label' {} ''", ["=", "<>", ">="][r.below(3) as usize]),
+            18 => format!("doc->'cat' = '{}'", { let n = r.below(10); number(r, n) }),
+            19 => format!("doc = '[\"t{}\", {}]'", r.below(6), { let n = r.below(4); number(r, n) }),
+            20 => format!("doc = '\"{}\"'", STATUSES[r.below(5) as usize]),
+            21 => "doc->>'status' BETWEEN 'd' AND 'p'".into(),
+            22 => format!("doc->>'status' NOT LIKE '{}%'", &STATUSES[r.below(5) as usize][..1]),
+            23 => format!("NOT doc->>'status' = '{}'", STATUSES[r.below(5) as usize]),
+            // A column on both sides, or in the list or the range: each one is
+            // guarded for NULL, and none is a key an index can look up.
+            24 => format!("doc IS {}DISTINCT FROM doc", if r.below(2) == 0 { "NOT " } else { "" }),
+            25 => format!(
+                "{}(doc->>'status' = doc->>'status')",
+                if r.below(2) == 0 { "NOT " } else { "" }
+            ),
+            26 => format!("id {}IN (id, {})", if r.below(2) == 0 { "NOT " } else { "" }, r.below(400)),
+            27 => format!("{}(id BETWEEN id AND {})", if r.below(2) == 0 { "NOT " } else { "" }, r.below(400)),
+            28 => format!("doc @> '{{\"big\":{}}}'", BIG[r.below(BIG.len() as u64) as usize]),
+            29 => format!("doc->>'big' = '{}'", BIG_TEXT[r.below(BIG_TEXT.len() as u64) as usize]),
+            // Text equality on a number: only the spelling `->>` prints
+            // matches, so `3.0` and `3` select different rows.
+            30 => format!("doc->>'cat' = '{}'", { let n = r.below(10); number(r, n) }),
+            31 => format!("doc->>'cat' > '{}'", { let n = r.below(10); number(r, n) }),
+            // A container's text is PostgreSQL's `jsonb` output: spaced, keys
+            // shorter first.
+            32 => format!("doc->>'user' = '{{\"id\": {}, \"name\": \"u{}\"}}'", r.below(30), r.below(30)),
+            33 => format!("doc->>'tags' = '[\"t{}\", \"t{}\"]'", r.below(6), r.below(6)),
+            _ => old_atom(r),
+        }
+    }
+    fn old_atom(r: &mut Lcg) -> String {
+        match r.below(14) {
+            0 => format!("doc @> '{{\"status\":\"{}\"}}'", STATUSES[r.below(5) as usize]),
+            1 => format!("doc @> '{{\"cat\":{}}}'", { let n = r.below(10); number(r, n) }),
+            2 => format!("doc @> '{{\"user\":{{\"name\":\"u{}\"}}}}'", r.below(30)),
+            3 => format!("doc @> '{{\"tags\":[\"t{}\"]}}'", r.below(6)),
+            4 => format!("doc @> '[\"t{}\"]'", r.below(6)),
+            5 => format!("doc @> '\"t{}\"'", r.below(6)),
+            6 => "doc ? 'promo'".into(),
+            7 => format!("doc ?| array['promo', 't{}']", r.below(6)),
+            8 => "doc ?& array['status', 'promo']".into(),
+            9 => format!("doc->>'status' = '{}'", STATUSES[r.below(5) as usize]),
+            10 => format!("doc->'user'->>'name' = 'u{}'", r.below(30)),
+            11 => format!("doc->>'status' > '{}'", STATUSES[r.below(5) as usize]),
+            12 => format!("doc->>'label' = '{}'", r.below(3)),
+            _ => format!("id < {}", r.below(400)),
+        }
+    }
+    match r.below(4) {
+        0 => format!("{} AND {}", atom(r), atom(r)),
+        1 => format!("({} OR {})", atom(r), atom(r)),
+        _ => atom(r),
+    }
+}
+
+async fn exec(pool: &sqlx::PgPool, sql: &str) {
+    sqlx::raw_sql(AssertSqlSafe(sql.to_string()))
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
+async fn ids(pool: &sqlx::PgPool, table: &str, clause: &str) -> Vec<i64> {
+    let sql = format!("SELECT id FROM {table} WHERE {clause}");
+    let mut v: Vec<i64> = sqlx::raw_sql(AssertSqlSafe(sql.clone()))
+        .fetch_all(pool)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .iter()
+        .map(|row| row.try_get_unchecked::<String, _>(0).unwrap().parse().unwrap())
+        .collect();
+    v.sort_unstable();
+    v
+}
+
+async fn compare(pool: &sqlx::PgPool, r: &mut Lcg, rounds: usize, stage: &str) {
+    for _ in 0..rounds {
+        let p = predicate(r);
+        let indexed = ids(pool, "ix", &p).await;
+        let plain = ids(pool, "tw", &p).await;
+        assert_eq!(indexed, plain, "{stage}: `{p}` answered differently with indexes");
+    }
+}
+
+const INDEXES: [&str; 10] = [
+    "CREATE INDEX ix_ops ON ix USING gin (doc)",
+    "CREATE INDEX ix_path ON ix USING gin (doc jsonb_path_ops)",
+    "CREATE INDEX ix_status ON ix ((doc->>'status'))",
+    "CREATE INDEX ix_uname ON ix ((doc->'user'->>'name'))",
+    "CREATE INDEX ix_label ON ix ((doc->>'label'))",
+    "CREATE INDEX ix_whole ON ix USING hash (doc)",
+    "CREATE INDEX ix_cat ON ix ((doc->>'cat'))",
+    "CREATE INDEX ix_big ON ix ((doc->>'big'))",
+    "CREATE INDEX ix_user ON ix ((doc->>'user'))",
+    "CREATE INDEX ix_tags ON ix ((doc->>'tags'))",
+];
+
+#[tokio::test(flavor = "multi_thread")]
+async fn indexed_documents_answer_exactly_like_their_unindexed_twin() {
+    // /tmp is a tmpfs here; a restart needs a real directory.
+    let root = format!("/var/tmp/json_indexes_{}", std::process::id());
+    let _ = std::fs::remove_dir_all(&root);
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    let mut r = Lcg(0x6a73_6f6e);
+    let (gin_before, path_before) = (GIN_LOOKUPS.load(Ordering::Relaxed), PATH_LOOKUPS.load(Ordering::Relaxed));
+    {
+        let server = TestServer::start_file_backed(&root).await.expect("server");
+        let pool = server.connect_sqlx().await.expect("connect");
+        for t in ["ix", "tw"] {
+            exec(&pool, &format!("CREATE TABLE {t} (id BIGINT PRIMARY KEY, doc JSONB)")).await;
+        }
+        // Half the rows before the indexes exist, so the build reads them
+        // back, and half after, so the write path adds them.
+        let mut next_id = 0i64;
+        for phase in 0..2 {
+            if phase == 1 {
+                for ddl in INDEXES {
+                    exec(&pool, ddl).await;
+                }
+            }
+            for _ in 0..200 {
+                let d = document(&mut r);
+                for t in ["ix", "tw"] {
+                    exec(&pool, &format!("INSERT INTO {t} (id, doc) VALUES ({next_id}, {d})")).await;
+                }
+                next_id += 1;
+            }
+        }
+        compare(&pool, &mut r, 150, "after inserts").await;
+
+        // Replacements (relocating and, when nothing else reads, in place)
+        // and deletes, the same on both.
+        for _ in 0..150 {
+            let id = r.below(next_id as u64);
+            let stmt = if r.below(4) == 0 {
+                format!("DELETE FROM {{t}} WHERE id = {id}")
+            } else {
+                format!("UPDATE {{t}} SET doc = {} WHERE id = {id}", document(&mut r))
+            };
+            for t in ["ix", "tw"] {
+                exec(&pool, &stmt.replace("{t}", t)).await;
+            }
+        }
+        compare(&pool, &mut r, 150, "after updates and deletes").await;
+
+        exec(&pool, "VACUUM ix").await;
+        exec(&pool, "VACUUM tw").await;
+        compare(&pool, &mut r, 100, "after VACUUM").await;
+        exec(&pool, "VACUUM FULL ix").await;
+        compare(&pool, &mut r, 100, "after VACUUM FULL").await;
+
+        // `@> '{}'` cannot be narrowed; it is answered, not refused.
+        assert_eq!(ids(&pool, "ix", "doc @> '{}'").await, ids(&pool, "tw", "doc @> '{}'").await);
+        pool.close().await;
+        drop(server);
+    }
+    // Rebuilt from the rows at open.
+    let server = TestServer::start_file_backed(&root).await.expect("restart");
+    let pool = server.connect_sqlx().await.expect("connect");
+    compare(&pool, &mut r, 100, "after a restart").await;
+
+    let (gin, path) = (
+        GIN_LOOKUPS.load(Ordering::Relaxed) - gin_before,
+        PATH_LOOKUPS.load(Ordering::Relaxed) - path_before,
+    );
+    assert!(gin > 100, "the gin indexes answered only {gin} lookups");
+    assert!(path > 30, "the path indexes answered only {path} lookups");
+}
+
+async fn count(pool: &sqlx::PgPool, table: &str, clause: &str) -> i64 {
+    let sql = format!("SELECT count(*) FROM {table} WHERE {clause}");
+    let row = sqlx::raw_sql(AssertSqlSafe(sql.clone()))
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    row.try_get_unchecked::<String, _>(0).unwrap().parse().unwrap()
+}
+
+/// A predicate too broad for a slot list but far short of the table
+/// (`doc @> '{"status":"paid"}'`, about a sixth of it) is answered by the
+/// gin indexes as a bitmap, and must still answer exactly like the
+/// unindexed twin: rows listed, rows counted, before and after deletes,
+/// replacements and `VACUUM`.
+///
+/// Thirty thousand rows, because below `candidate_cap`'s floor of 4096
+/// every answer fits a slot list and the bitmap path is never taken. Each
+/// broad query checks the bitmap counter moved, so the comparison cannot
+/// pass by scanning. Only this test's tables are big enough for a bitmap,
+/// so the other tests in this binary cannot move that counter.
+#[tokio::test(flavor = "multi_thread")]
+async fn broad_gin_answers_scan_a_bitmap_and_match_the_twin() {
+    use rasterizeddb_core::core::index::GIN_DENSE_LOOKUPS;
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    for t in ["ix", "tw"] {
+        exec(&pool, &format!("CREATE TABLE {t} (id BIGINT PRIMARY KEY, doc JSONB)")).await;
+    }
+    const ROWS: i64 = 30_000;
+    let mut r = Lcg(0x6272_6f61);
+    // Half before the indexes, so the build reads them back, and half
+    // after, so the write path adds them.
+    let mut next_id = 0i64;
+    while next_id < ROWS {
+        if next_id == ROWS / 2 {
+            exec(&pool, INDEXES[0]).await;
+            exec(&pool, INDEXES[1]).await;
+        }
+        let values: Vec<String> = (next_id..next_id + 1_000)
+            .map(|id| format!("({id}, {})", document(&mut r)))
+            .collect();
+        for t in ["ix", "tw"] {
+            exec(&pool, &format!("INSERT INTO {t} (id, doc) VALUES {}", values.join(", "))).await;
+        }
+        next_id += 1_000;
+    }
+
+    let paid = r#"doc @> '{"status":"paid"}'"#;
+    // The build runs in the background; until it is done queries scan.
+    let mut ready = false;
+    for _ in 0..300 {
+        let before = GIN_DENSE_LOOKUPS.load(Ordering::Relaxed);
+        count(&pool, "ix", paid).await;
+        if GIN_DENSE_LOOKUPS.load(Ordering::Relaxed) > before {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(ready, "the gin indexes never answered `{paid}` as a bitmap");
+
+    // (predicate, whether it must be answered as a bitmap)
+    let mut broad: Vec<(String, bool)> = Vec::new();
+    for s in STATUSES {
+        broad.push((format!(r#"doc @> '{{"status":"{s}"}}'"#), true));
+    }
+    for t in 0..6 {
+        broad.push((format!(r#"doc @> '{{"tags":["t{t}"]}}'"#), true));
+    }
+    broad.extend([
+        // Both too broad for a list, each as a bitmap, intersected.
+        (r#"doc @> '{"status":"paid"}' AND doc @> '{"tags":["t1"]}'"#.to_string(), true),
+        // The primary key's range is too broad as well.
+        (r#"doc @> '{"status":"paid"}' AND id < 20000"#.to_string(), true),
+        (r#"id >= 7000 AND doc @> '{"status":"new"}'"#.to_string(), true),
+        // A union of keys.
+        ("doc ?| array['promo', 't1']".to_string(), true),
+        // Narrow enough for a slot list.
+        (r#"doc @> '{"status":"paid","cat":3}'"#.to_string(), false),
+        // Most of the table: declined, and scanned.
+        ("doc ? 'status'".to_string(), false),
+        ("doc ?& array['status', 'tags']".to_string(), false),
+        (r#"doc @> '{"tags":[]}'"#.to_string(), false),
+        ("doc @> '{}'".to_string(), false),
+        // A union of broad answers is not taken as a bitmap.
+        (r#"(doc @> '{"status":"paid"}' OR doc @> '{"status":"new"}')"#.to_string(), false),
+    ]);
+
+    async fn check(pool: &sqlx::PgPool, broad: &[(String, bool)], stage: &str) {
+        for (p, dense) in broad {
+            let at = || GIN_DENSE_LOOKUPS.load(Ordering::Relaxed);
+            let before = at();
+            let indexed = ids(pool, "ix", p).await;
+            let listed_moved = at() - before;
+            let before = at();
+            let counted = count(pool, "ix", p).await;
+            let counted_moved = at() - before;
+            let plain = ids(pool, "tw", p).await;
+            assert_eq!(indexed, plain, "{stage}: `{p}` answered differently with indexes");
+            assert_eq!(counted, plain.len() as i64, "{stage}: `{p}` counted differently with indexes");
+            for (what, moved) in [("listing", listed_moved), ("count", counted_moved)] {
+                match dense {
+                    true => assert!(moved >= 1, "{stage}: `{p}` {what} was not answered as a bitmap"),
+                    false => assert_eq!(moved, 0, "{stage}: `{p}` {what} was answered as a bitmap"),
+                }
+            }
+        }
+    }
+    check(&pool, &broad, "after inserts").await;
+    compare(&pool, &mut r, 60, "after inserts").await;
+
+    // Deletes and replacements, the same on both: stale items on replaced
+    // slots, dead versions, and after `VACUUM` forgotten slots.
+    for _ in 0..30 {
+        let lo = r.below(ROWS as u64);
+        let stmt = if r.below(3) == 0 {
+            format!("DELETE FROM {{t}} WHERE id >= {lo} AND id < {}", lo + 50)
+        } else {
+            format!(
+                "UPDATE {{t}} SET doc = {} WHERE id >= {lo} AND id < {}",
+                document(&mut r),
+                lo + 50
+            )
+        };
+        for t in ["ix", "tw"] {
+            exec(&pool, &stmt.replace("{t}", t)).await;
+        }
+    }
+    check(&pool, &broad, "after updates and deletes").await;
+    exec(&pool, "VACUUM ix").await;
+    exec(&pool, "VACUUM tw").await;
+    check(&pool, &broad, "after VACUUM").await;
+    compare(&pool, &mut r, 60, "after VACUUM").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gin_ddl_is_validated_and_listed() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    exec(&pool, "CREATE TABLE d (id BIGINT PRIMARY KEY, doc JSONB, note TEXT)").await;
+    exec(&pool, "CREATE INDEX d_gin ON d USING gin (doc jsonb_path_ops)").await;
+    exec(&pool, "CREATE INDEX d_status ON d ((doc->>'status'))").await;
+    for (sql, why) in [
+        ("CREATE INDEX d_bad ON d USING gin (note)", "one jsonb column"),
+        ("CREATE INDEX d_bad ON d USING gin (doc, note)", "one jsonb column"),
+        ("CREATE INDEX d_bad ON d USING gin (doc gin_trgm_ops)", "operator class"),
+    ] {
+        let e = sqlx::raw_sql(AssertSqlSafe(sql)).execute(&pool).await.unwrap_err();
+        assert!(e.to_string().contains(why), "{sql}: {e}");
+    }
+    let defs: Vec<String> = sqlx::raw_sql("SELECT indexdef FROM pg_indexes WHERE tablename = 'd'")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.try_get_unchecked::<String, _>(0).unwrap())
+        .collect();
+    assert!(defs.iter().any(|d| d.contains("USING gin (doc jsonb_path_ops)")), "{defs:?}");
+    assert!(defs.iter().any(|d| d.contains("doc->>'status'") || d.contains("doc ->> 'status'")), "{defs:?}");
+    exec(&pool, "DROP INDEX d_gin").await;
+    exec(&pool, "DROP INDEX d_status").await;
+}

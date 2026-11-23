@@ -1,10 +1,9 @@
 use std::io::{self, SeekFrom};
 
-use super::{
-    file_sync::LocalStorageProvider,
-    memory::MemoryStorageProvider,
-    traits::StorageIO,
-};
+use super::{file_sync::LocalStorageProvider, memory::MemoryStorageProvider, traits::StorageIO};
+
+#[cfg(feature = "kv_storage")]
+use super::kv::KvStorageProvider;
 
 #[derive(Clone)]
 pub enum DbStorageProvider {
@@ -16,15 +15,57 @@ pub enum DbStorageProvider {
     /// one pays nothing for this variant beyond a match arm.
     #[cfg(feature = "storage_pools")]
     Mirror(crate::core::storage::mirror::MirrorStorageProvider),
+    /// A database kept in a key/value store rather than in files — see
+    /// [`crate::core::storage_providers::kv`]. The whole database shares one
+    /// backing store and one page cache, held by the family the provider was
+    /// opened from.
+    #[cfg(feature = "kv_storage")]
+    KeyValue(KvStorageProvider),
 }
 
 impl DbStorageProvider {
+    /// Drops the file `name` of this provider's family. On a key/value store
+    /// a name being swept, or never stored, is left as it is rather than
+    /// opened: opening waits out the sweep, and a sweep that retries until the
+    /// store answers would hold up the DROP that started it.
+    pub async fn drop_file(&self, name: String) {
+        match self {
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(kv) => kv.drop_name(&name).await,
+            _ => self.create_new(name).await.drop_io(),
+        }
+    }
+
+    /// The file's length without awaiting, where that is an atomic (a
+    /// key/value file); `None` for a provider whose length is asked of the
+    /// file system.
+    pub(crate) fn len_now(&self) -> Option<u64> {
+        match self {
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(kv) => Some(kv.len_now()),
+            _ => None,
+        }
+    }
+
     pub async fn new_file(location: &str, table_name: Option<&str>) -> Self {
         Self::File(LocalStorageProvider::new(location, table_name).await)
     }
 
     pub fn new_memory(name: &str) -> Self {
         Self::Memory(MemoryStorageProvider::new(name))
+    }
+
+    /// Opens `name` in an already-configured key/value family.
+    ///
+    /// The family is what carries the backing store, the chunk geometry and the
+    /// shared page budget, so every file of one database must come from the
+    /// same one.
+    #[cfg(feature = "kv_storage")]
+    pub async fn new_key_value(
+        family: std::sync::Arc<super::kv::KvFamily>,
+        name: &str,
+    ) -> std::io::Result<Self> {
+        Ok(Self::KeyValue(KvStorageProvider::open(family, name).await?))
     }
 
     /// Opens `name` in `location` and in every directory in `backups`.
@@ -40,6 +81,78 @@ impl DbStorageProvider {
             crate::core::storage::mirror::MirrorStorageProvider::attach(location, backups, name)
                 .await,
         )
+    }
+
+    /// What is holding these bytes, as a console groups tables by.
+    ///
+    /// One word, and a stable one: it is a value somebody filters and sorts a
+    /// table list by, so it is not prose and it does not carry a path. Where
+    /// the bytes actually are is [`Self::location`], which is prose and may be
+    /// empty.
+    ///
+    /// | value | what it means |
+    /// |---|---|
+    /// | `memory` | in this process, and gone when it exits |
+    /// | `file` | ordinary files in a directory |
+    /// | `mirrored` | files, written to a primary directory and to backups |
+    /// | `s3` | objects in an S3-compatible store |
+    /// | `kv-directory` | the object layout, in a local directory |
+    /// | `kv-memory` | the object layout, in a map |
+    ///
+    /// The three `kv-*` answers are one storage engine over three backing
+    /// stores, and they are kept apart rather than folded into one `object`
+    /// because what an operator does about a slow table differs completely
+    /// between them — a local directory is a disk to look at, and S3 is a
+    /// request count to pay for.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::File(_) => "file",
+            Self::Memory(_) => "memory",
+            #[cfg(feature = "storage_pools")]
+            Self::Mirror(_) => "mirrored",
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.family().store().kind(),
+        }
+    }
+
+    /// Where those bytes are, in the form an operator would act on: a
+    /// directory, a bucket, or nothing at all for a database that has none.
+    pub fn location(&self) -> String {
+        match self {
+            Self::File(p) => p.location.clone(),
+            // Not the empty string, and not the process id either: what matters
+            // about an in-memory table is that it does not survive, and this is
+            // read by someone deciding whether they have a problem.
+            Self::Memory(_) => "(in process memory, not persisted)".to_string(),
+            #[cfg(feature = "storage_pools")]
+            Self::Mirror(p) => {
+                let copies = p.backup_count();
+                format!(
+                    "{} (+{} backup {})",
+                    p.primary().location,
+                    copies,
+                    if copies == 1 { "copy" } else { "copies" }
+                )
+            }
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => {
+                let family = p.family();
+                format!("{}/{}", family.store().describe(), family.config().root)
+            }
+        }
+    }
+
+    /// The key/value family behind this provider, if one is.
+    ///
+    /// The page cache and the request counters live on the family and are
+    /// shared by every file of the database, so they are reported once for the
+    /// database rather than per table.
+    #[cfg(feature = "kv_storage")]
+    pub fn kv_family(&self) -> Option<&std::sync::Arc<super::kv::KvFamily>> {
+        match self {
+            Self::KeyValue(p) => Some(p.family()),
+            _ => None,
+        }
     }
 
     /// Whether this provider keeps backup copies, and how many.
@@ -72,6 +185,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.verify_data(position, buffer).await,
             Self::Memory(p) => p.verify_data(position, buffer).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.verify_data(position, buffer).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.verify_data(position, buffer).await,
         }
@@ -81,6 +196,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.write_data(position, buffer).await,
             Self::Memory(p) => p.write_data(position, buffer).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.write_data(position, buffer).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.write_data(position, buffer).await,
         }
@@ -90,19 +207,19 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.write_data_seek(seek, buffer).await,
             Self::Memory(p) => p.write_data_seek(seek, buffer).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.write_data_seek(seek, buffer).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.write_data_seek(seek, buffer).await,
         }
     }
 
-    async fn read_data_into_buffer(
-        &self,
-        position: &mut u64,
-        buffer: &mut [u8],
-    ) -> io::Result<()> {
+    async fn read_data_into_buffer(&self, position: &mut u64, buffer: &mut [u8]) -> io::Result<()> {
         match self {
             Self::File(p) => p.read_data_into_buffer(position, buffer).await,
             Self::Memory(p) => p.read_data_into_buffer(position, buffer).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.read_data_into_buffer(position, buffer).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.read_data_into_buffer(position, buffer).await,
         }
@@ -112,8 +229,40 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.read_vectored(reads).await,
             Self::Memory(p) => p.read_vectored(reads).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.read_vectored(reads).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.read_vectored(reads).await,
+        }
+    }
+
+    // Forwarded like every other method. Without it this enum took the trait's
+    // default `false`, so every row fetch went through the async
+    // `read_vectored` chain and the providers' own synchronous mmap and
+    // resident-page paths were never reached. Each provider's fast path keeps
+    // its own refusal rules (staged temp data, pages not resident), and a
+    // `false` still sends the caller to `read_vectored` for the same reads.
+    #[inline(always)]
+    fn try_read_vectored_sync(&self, reads: &mut [(u64, &mut [u8])]) -> bool {
+        match self {
+            Self::File(p) => p.try_read_vectored_sync(reads),
+            Self::Memory(p) => p.try_read_vectored_sync(reads),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.try_read_vectored_sync(reads),
+            #[cfg(feature = "storage_pools")]
+            Self::Mirror(p) => p.try_read_vectored_sync(reads),
+        }
+    }
+
+    #[inline(always)]
+    fn try_read_cells_sync(&self, rows: &[(u64, u64)], cells: &[(u32, u32)], out: &mut [&mut Vec<u8>]) -> bool {
+        match self {
+            Self::File(p) => p.try_read_cells_sync(rows, cells, out),
+            Self::Memory(p) => p.try_read_cells_sync(rows, cells, out),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.try_read_cells_sync(rows, cells, out),
+            #[cfg(feature = "storage_pools")]
+            Self::Mirror(p) => p.try_read_cells_sync(rows, cells, out),
         }
     }
 
@@ -121,6 +270,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.append_data(buffer, immediate).await,
             Self::Memory(p) => p.append_data(buffer, immediate).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.append_data(buffer, immediate).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.append_data(buffer, immediate).await,
         }
@@ -130,6 +281,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.append_data_returning_offset(buffer, immediate).await,
             Self::Memory(p) => p.append_data_returning_offset(buffer, immediate).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.append_data_returning_offset(buffer, immediate).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.append_data_returning_offset(buffer, immediate).await,
         }
@@ -139,6 +292,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.begin_txn(),
             Self::Memory(p) => p.begin_txn(),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.begin_txn(),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.begin_txn(),
         }
@@ -148,8 +303,21 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.append_data_txn(txn, buffer).await,
             Self::Memory(p) => p.append_data_txn(txn, buffer).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.append_data_txn(txn, buffer).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.append_data_txn(txn, buffer).await,
+        }
+    }
+
+    fn defers_in_place_writes(&self) -> bool {
+        match self {
+            Self::File(p) => p.defers_in_place_writes(),
+            Self::Memory(p) => p.defers_in_place_writes(),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.defers_in_place_writes(),
+            #[cfg(feature = "storage_pools")]
+            Self::Mirror(p) => p.defers_in_place_writes(),
         }
     }
 
@@ -157,6 +325,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.write_data_txn(txn, position, buffer).await,
             Self::Memory(p) => p.write_data_txn(txn, position, buffer).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.write_data_txn(txn, position, buffer).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.write_data_txn(txn, position, buffer).await,
         }
@@ -166,19 +336,30 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.commit_durable(token).await,
             Self::Memory(p) => p.commit_durable(token).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.commit_durable(token).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.commit_durable(token).await,
         }
     }
 
-    fn try_borrow_range(
-        &self,
-        position: u64,
-        len: usize,
-    ) -> Option<super::traits::BorrowedBytes> {
+    async fn abort_txn(&self, token: u64) {
+        match self {
+            Self::File(p) => p.abort_txn(token).await,
+            Self::Memory(p) => p.abort_txn(token).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.abort_txn(token).await,
+            #[cfg(feature = "storage_pools")]
+            Self::Mirror(p) => p.abort_txn(token).await,
+        }
+    }
+
+    fn try_borrow_range(&self, position: u64, len: usize) -> Option<super::traits::BorrowedBytes> {
         match self {
             Self::File(p) => p.try_borrow_range(position, len),
             Self::Memory(p) => p.try_borrow_range(position, len),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.try_borrow_range(position, len),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.try_borrow_range(position, len),
         }
@@ -188,6 +369,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.truncate(len).await,
             Self::Memory(p) => p.truncate(len).await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.truncate(len).await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.truncate(len).await,
         }
@@ -197,6 +380,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.get_len().await,
             Self::Memory(p) => p.get_len().await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.get_len().await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.get_len().await,
         }
@@ -211,6 +396,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => Self::File(p.create_temp().await),
             Self::Memory(p) => Self::Memory(p.create_temp().await),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => Self::KeyValue(p.create_temp().await),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => Self::Mirror(p.create_temp().await),
         }
@@ -220,6 +407,8 @@ impl StorageIO for DbStorageProvider {
         match (self, temp_io_sync) {
             (Self::File(p), Self::File(tmp)) => p.swap_temp(tmp).await,
             (Self::Memory(p), Self::Memory(tmp)) => p.swap_temp(tmp).await,
+            #[cfg(feature = "kv_storage")]
+            (Self::KeyValue(p), Self::KeyValue(tmp)) => p.swap_temp(tmp).await,
             #[cfg(feature = "storage_pools")]
             (Self::Mirror(p), Self::Mirror(tmp)) => p.swap_temp(tmp).await,
             _ => {
@@ -232,6 +421,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.get_location(),
             Self::Memory(p) => p.get_location(),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.get_location(),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.get_location(),
         }
@@ -242,8 +433,27 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => Self::File(p.create_new_at(location, name).await),
             Self::Memory(p) => Self::Memory(p.create_new_at(location, name).await),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => Self::KeyValue(p.create_new_at(location, name).await),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => Self::Mirror(p.create_new_at(location, name).await),
+        }
+    }
+
+    async fn try_create_new(&self, name: String) -> std::io::Result<Self> {
+        match self {
+            Self::File(p) => Ok(Self::File(p.try_create_new(name).await?)),
+            other => Ok(other.create_new(name).await),
+        }
+    }
+
+    async fn try_create_new_at(&self, location: &str, name: String) -> std::io::Result<Self> {
+        match self {
+            Self::File(p) => Ok(Self::File(p.try_create_new_at(location, name).await?)),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("{name} cannot be created in {location}: only a plain file provider places files by directory"),
+            )),
         }
     }
 
@@ -252,6 +462,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => Self::File(p.create_new(name).await),
             Self::Memory(p) => Self::Memory(p.create_new(name).await),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => Self::KeyValue(p.create_new(name).await),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => Self::Mirror(p.create_new(name).await),
         }
@@ -261,6 +473,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.drop_io(),
             Self::Memory(p) => p.drop_io(),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.drop_io(),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.drop_io(),
         }
@@ -270,6 +484,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.get_hash(),
             Self::Memory(p) => p.get_hash(),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.get_hash(),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.get_hash(),
         }
@@ -279,6 +495,8 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.start_service().await,
             Self::Memory(p) => p.start_service().await,
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.start_service().await,
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.start_service().await,
         }
@@ -288,8 +506,139 @@ impl StorageIO for DbStorageProvider {
         match self {
             Self::File(p) => p.get_name(),
             Self::Memory(p) => p.get_name(),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.get_name(),
             #[cfg(feature = "storage_pools")]
             Self::Mirror(p) => p.get_name(),
         }
+    }
+
+    fn index_store_dir(&self) -> Option<std::path::PathBuf> {
+        match self {
+            Self::File(p) => p.index_store_dir(),
+            // No directory of its own (memory, key/value), or several copies
+            // of one (a mirrored pool): excluded from snapshots (P33).
+            _ => None,
+        }
+    }
+
+    fn attach_write_gate(
+        &self,
+        gate: &std::sync::Arc<crate::core::index_store::file_gate::FileGate>,
+        policy: crate::core::index_store::gated_io::Policy,
+    ) {
+        // The file provider records every write in the census itself, with
+        // the word it registered on (B12).
+        if let Self::File(p) = self {
+            p.attach_write_gate(gate, policy);
+        }
+    }
+
+    async fn land_staged(&self) -> io::Result<()> {
+        // Only a file provider can be sealed (`index_store_dir`).
+        match self {
+            Self::File(p) => p.land_staged().await,
+            _ => Ok(()),
+        }
+    }
+
+    async fn land_background(&self) -> bool {
+        // Only a file provider holds a partition (§3.4), and only its
+        // service lands staged bytes.
+        match self {
+            Self::File(p) => p.land_background().await,
+            _ => false,
+        }
+    }
+    fn kv_state_now(&self) -> Option<super::traits::KvState> {
+        match self {
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.kv_state_now(),
+            _ => None,
+        }
+    }
+
+    fn kv_pause_service(&self) {
+        match self {
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.kv_pause_service(),
+            _ => {}
+        }
+    }
+
+    async fn kv_settled_state(&self) -> io::Result<Option<super::traits::KvState>> {
+        match self {
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.kv_settled_state().await,
+            _ => Ok(None),
+        }
+    }
+
+    async fn kv_write_sidecar(&self, bytes: Vec<u8>) -> io::Result<()> {
+        match self {
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.kv_write_sidecar(bytes).await,
+            _ => {
+                let _ = bytes;
+                Err(io::Error::new(io::ErrorKind::Unsupported, "only a key/value file keeps a snapshot sidecar"))
+            }
+        }
+    }
+
+    async fn kv_read_sidecar(&self) -> io::Result<Option<Vec<u8>>> {
+        match self {
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.kv_read_sidecar().await,
+            _ => Ok(None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A row fetch asks for the synchronous copy first and only awaits
+    /// `read_vectored` when that says no. Through this enum the answer was
+    /// always no, so the file provider's mmap copy was dead code on every
+    /// table. This pins that the backend now reaches it, and that what it
+    /// copies is what the async path reads.
+    #[tokio::test]
+    async fn a_file_backend_serves_resident_reads_synchronously() {
+        // A resident read is one the mapping holds: Windows maps no table
+        // file (`MAPS_FILES`), so there the fast path has nothing to serve.
+        if !crate::core::storage_providers::file_sync::MAPS_FILES {
+            return;
+        }
+        // Written before the provider opens it, so its map covers every byte:
+        // a small append is served from the file rather than remapped (see
+        // `REMAP_GROWTH_THRESHOLD`), and the fast path rightly refuses those.
+        let dir = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.path().join("sync.db"), &data).unwrap();
+        let io = DbStorageProvider::new_file(dir.path().to_str().unwrap(), Some("sync.db")).await;
+        assert_eq!(io.get_len().await, data.len() as u64);
+
+        let mut header = [0u8; 12];
+        let mut body = [0u8; 150];
+        let mut reads = [(40u64, &mut header[..]), (5000u64, &mut body[..])];
+        assert!(
+            io.try_read_vectored_sync(&mut reads),
+            "a resident read on a file backend was refused"
+        );
+        assert_eq!(&header[..], &data[40..52]);
+        assert_eq!(&body[..], &data[5000..5150]);
+
+        let mut header_async = [0u8; 12];
+        let mut body_async = [0u8; 150];
+        let mut reads = [(40u64, &mut header_async[..]), (5000u64, &mut body_async[..])];
+        io.read_vectored(&mut reads).await.unwrap();
+        assert_eq!(header, header_async);
+        assert_eq!(body, body_async);
+
+        // A read running past the end is still refused, which sends the
+        // caller to `read_vectored` and its error rather than a short copy.
+        let mut tail = [0u8; 16];
+        assert!(!io.try_read_vectored_sync(&mut [(8190u64, &mut tail[..])]));
     }
 }

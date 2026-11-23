@@ -29,7 +29,6 @@
 
 use std::fmt;
 use std::future::Future;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -37,6 +36,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::common::{read_message_limited_timeout, write_message_timeout};
 use crate::error::RastcpError;
+use crate::net::Peer;
 
 /// Cap on a single authentication message.
 ///
@@ -54,6 +54,17 @@ pub const CHANNEL_BINDING_LEN: usize = 32;
 /// it. See [`AuthChannel::channel_binding`].
 pub type ChannelBinding = [u8; CHANNEL_BINDING_LEN];
 
+/// What an exchange on a unix socket binds itself to, in place of the TLS
+/// exporter a unix socket does not have.
+///
+/// Channel binding is there to stop a man in the middle relaying an exchange
+/// onto a connection of his own. A unix socket has no middle to stand in:
+/// who may connect to it is decided by the socket file's permissions, and the
+/// kernel names the process at each end. The exchange still mixes this in,
+/// so a proof made on a unix socket is never one that verifies on a TLS
+/// connection, where the binding is that connection's exporter.
+pub const UNIX_CHANNEL_BINDING: ChannelBinding = *b"rastcp unix socket: no exporter.";
+
 /// Who a connection turned out to belong to.
 ///
 /// Produced by a [`ServerAuthenticator`] and handed to every request on that
@@ -65,6 +76,12 @@ pub struct Principal {
     pub user: String,
     /// Whether that name is allowed to do everything.
     pub superuser: bool,
+    /// The database the caller logged in to, when its exchange named one.
+    /// `None` is the server's default. Set only by the exchange, which is
+    /// what decided whose roles the caller was checked against: a server
+    /// whose roles belong to a database must not let a later request move
+    /// the connection to another database's.
+    pub database: Option<String>,
 }
 
 impl Principal {
@@ -72,7 +89,14 @@ impl Principal {
         Self {
             user: user.into(),
             superuser,
+            database: None,
         }
+    }
+
+    /// This principal, as having logged in to `database`.
+    pub fn in_database(mut self, database: impl Into<String>) -> Self {
+        self.database = Some(database.into());
+        self
     }
 
     /// The principal of a server that was never given an authenticator.
@@ -83,6 +107,7 @@ impl Principal {
         Self {
             user: String::new(),
             superuser: false,
+            database: None,
         }
     }
 
@@ -120,7 +145,7 @@ pub struct AuthChannel<'a> {
     io: &'a mut dyn AuthIo,
     timeout: Duration,
     binding: ChannelBinding,
-    peer: SocketAddr,
+    peer: Peer,
 }
 
 impl<'a> AuthChannel<'a> {
@@ -128,7 +153,7 @@ impl<'a> AuthChannel<'a> {
         io: &'a mut dyn AuthIo,
         timeout: Duration,
         binding: ChannelBinding,
-        peer: SocketAddr,
+        peer: Peer,
     ) -> Self {
         Self {
             io,
@@ -161,8 +186,10 @@ impl<'a> AuthChannel<'a> {
         &self.binding
     }
 
-    /// Where the caller is dialling from, for rate limiting and logs.
-    pub fn peer_addr(&self) -> SocketAddr {
+    /// Who is at the other end: an address for a TCP caller, and for a caller
+    /// on a unix socket the user and process the kernel reports — which an
+    /// exchange can rely on, because the caller did not say it.
+    pub fn peer(&self) -> Peer {
         self.peer
     }
 }
@@ -199,6 +226,28 @@ pub trait ServerAuthenticator: Send + Sync + fmt::Debug {
 /// The client half of the same exchange.
 pub trait ClientAuthenticator: Send + Sync + fmt::Debug {
     fn authenticate<'a>(&'a self, channel: &'a mut AuthChannel<'_>) -> AuthFuture<'a, ()>;
+}
+
+/// A request a client sends first on every connection it opens, and what it
+/// makes of the answer.
+///
+/// It goes out after the credential exchange and before any other request,
+/// on the first connection and on every one opened after it (a reconnect
+/// included), framed as the connection's protocol frames requests: on
+/// `rastcp/2` that is a tagged frame like any other. The connection is
+/// handed to callers only once [`ConnectionSetup::accept`] has taken the
+/// answer; an error from it fails the open, and the caller sees that error.
+///
+/// For whatever a connection must be told before it is used and the server
+/// cannot learn from the exchange — the exchange may not run at all, on a
+/// server that asks for no credentials. rastcp does not read the request; to
+/// the server it is the connection's first request.
+pub trait ConnectionSetup: Send + Sync + fmt::Debug {
+    /// The request.
+    fn request(&self) -> Vec<u8>;
+    /// Whether `answer` (the server's reply to [`ConnectionSetup::request`])
+    /// lets the connection be used.
+    fn accept(&self, answer: &[u8]) -> Result<(), RastcpError>;
 }
 
 /// Derives the `tls-exporter` channel binding from a finished handshake.

@@ -6,15 +6,20 @@
 //! question answered. What is here is the shape of the work — pick a table on
 //! the left, pick a lens across the top, read it in the middle.
 
+pub mod activity;
 pub mod backup;
+pub mod bench;
+pub mod branches;
 pub mod config;
 pub mod dashboard;
 pub mod connect;
 pub mod data;
+pub mod keys;
 pub mod overview;
 pub mod migrate;
 pub mod query;
 pub mod replication;
+pub mod roles;
 pub mod schema;
 pub mod storage;
 pub mod tables;
@@ -24,7 +29,7 @@ use iced::widget::{
 };
 use iced::{Center, Element, Fill, Length};
 
-use crate::app::{Message, Modal, ModalKind, Refresh, Status, Studio, Tab};
+use crate::app::{GridSort, Message, Modal, ModalKind, Refresh, Status, Studio, Tab};
 use crate::model::*;
 use crate::theme;
 
@@ -43,7 +48,7 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
             screen,
             // The scrim swallows clicks on what is behind it, which is what
             // makes the dialog modal rather than merely on top.
-            container(modal_view(modal, studio.flavor()))
+            container(modal_view(modal, studio))
                 .style(theme::scrim)
                 .width(Fill)
                 .height(Fill)
@@ -77,8 +82,19 @@ fn titlebar(studio: &Studio) -> Element<'_, Message> {
                 text("·").size(13).color(theme::TEXT_FAINT),
                 text(&session.server).size(13).font(theme::MONO).color(theme::TEXT_DIM),
                 pill(
-                    if session.encrypted { "TLS" } else { "PLAIN" },
-                    if session.encrypted { theme::OK } else { theme::WARN },
+                    match session.transport {
+                        crate::model::Transport::Native => "NATIVE",
+                        crate::model::Transport::Wire => "PG WIRE",
+                    },
+                    theme::TEXT_DIM,
+                ),
+                pill(
+                    session.link(),
+                    if session.link() == "PLAIN" {
+                        theme::WARN
+                    } else {
+                        theme::OK
+                    },
                 ),
             ]
             .spacing(10)
@@ -159,10 +175,15 @@ fn pane(studio: &Studio) -> Element<'_, Message> {
         Tab::Schema => schema::view(studio),
         Tab::Data => data::view(studio),
         Tab::Query => query::view(studio),
+        Tab::Activity => activity::view(studio),
+        Tab::Bench => bench::view(studio),
         Tab::Backup => backup::view(studio),
         Tab::Storage => storage::view(studio),
+        Tab::Branches => branches::view(studio),
         Tab::Replication => replication::view(studio),
         Tab::Migrate => migrate::view(studio),
+        Tab::Keys => keys::view(studio),
+        Tab::Roles => roles::view(studio),
         Tab::Config => config::view(studio),
     };
     container(inner).width(Fill).height(Fill).padding(12).into()
@@ -227,6 +248,25 @@ fn sidebar(studio: &Studio) -> Element<'_, Message> {
         } else {
             "nothing matches"
         }));
+    }
+
+    // Caption the figure once for the whole list rather than per row. Without
+    // it the number sits unlabelled beside a table name and reads as a row
+    // count, which it is not: `row_slots` counts pointer records, so a table
+    // churned by updates shows a figure hundreds of times its live row count
+    // until a `VACUUM FULL`. The wording matches the TABLES tab's column header
+    // so the two surfaces name the same thing the same way.
+    if !filtered.is_empty() {
+        tree = tree.push(
+            container(
+                row![
+                    Space::new().width(Fill),
+                    text("ROW SLOTS").size(9).font(theme::MONO).color(theme::TEXT_FAINT),
+                ]
+                .align_y(Center),
+            )
+            .padding([0, 8]),
+        );
     }
 
     let mut list = column![].spacing(1).width(Fill);
@@ -297,7 +337,9 @@ fn statusbar(studio: &Studio) -> Element<'_, Message> {
 // Modals
 // ---------------------------------------------------------------------------
 
-fn modal_view(modal: &Modal, flavor: Flavor) -> Element<'_, Message> {
+fn modal_view<'a>(modal: &'a Modal, studio: &'a Studio) -> Element<'a, Message> {
+    let flavor = studio.flavor();
+    let pending = studio.modal_pending;
     let body: Element<'_, Message> = match modal {
         Modal::Confirm { title, body, .. } => column![
             dialog_title(title),
@@ -324,6 +366,53 @@ fn modal_view(modal: &Modal, flavor: Flavor) -> Element<'_, Message> {
         // names a point in the past, to the commits after it — so it gets the
         // destructive button, and the body it was built with rather than a
         // generic "are you sure".
+        Modal::ConfirmCsv { table, file, rows, columns, scripts } => column![
+            dialog_title(format!("Import into {}", table)),
+            text(format!(
+                "{} row{} from {}\ninto the column{} {}.",
+                crate::model::count(*rows as u64),
+                if *rows == 1 { "" } else { "s" },
+                file,
+                if columns.len() == 1 { "" } else { "s" },
+                columns.join(", ")
+            ))
+            .size(12)
+            .font(theme::MONO),
+            text(if scripts.len() == 1 {
+                "One request: the file goes in whole, or not at all.".to_string()
+            } else {
+                format!(
+                    "{} requests of up to {} rows; each goes in whole or not at all, and a \
+                     refused one stops the import with the rows before it kept.",
+                    scripts.len(),
+                    crate::model::count(
+                        (crate::import::ROWS_PER_INSERT * crate::import::INSERTS_PER_SCRIPT) as u64
+                    )
+                )
+            })
+            .size(11)
+            .color(theme::TEXT_DIM),
+            text("An empty unquoted field is NULL; \"\" is the empty string.")
+                .size(11)
+                .color(theme::TEXT_DIM),
+            Space::new().height(4),
+            row![
+                Space::new().width(Fill),
+                button(text("CANCEL").size(12).font(theme::MONO))
+                    .padding([7, 14])
+                    .style(theme::secondary)
+                    .on_press(Message::ModalCancel),
+                button(text("IMPORT").size(12).font(theme::MONO))
+                    .padding([7, 14])
+                    .style(theme::primary)
+                    .on_press(Message::ModalSubmit),
+            ]
+            .spacing(8),
+        ]
+        .spacing(12)
+        .width(600)
+        .into(),
+
         Modal::ConfirmImport { body, .. } => column![
             dialog_title("Import database"),
             container(text(body.clone()).size(12).font(theme::MONO))
@@ -379,7 +468,7 @@ fn modal_view(modal: &Modal, flavor: Flavor) -> Element<'_, Message> {
                 v
             )),
             error_line(error),
-            dialog_actions("CREATE"),
+            dialog_actions("CREATE", pending),
         ]
         .spacing(12)
         .width(420)
@@ -414,13 +503,94 @@ fn modal_view(modal: &Modal, flavor: Flavor) -> Element<'_, Message> {
                 .font(theme::MONO)
                 .color(theme::TEXT_FAINT),
             error_line(error),
-            dialog_actions("ADD COLUMN"),
+            dialog_actions("ADD COLUMN", pending),
         ]
         .spacing(12)
         .width(560)
         .into(),
 
-        Modal::CreateTable { name, columns, error } => {
+        Modal::CreateRole { name, password, login, superuser, error } => column![
+            dialog_title("New role"),
+            field("Name", name, |v| Message::ModalField(crate::app::ModalField::Name, v)),
+            secret_field("Password", password, |v| Message::ModalField(
+                crate::app::ModalField::Password,
+                v
+            )),
+            row![
+                toggle("Can log in", *login, |v| Message::ModalToggle(
+                    crate::app::ModalField::Login,
+                    v
+                )),
+                toggle("Superuser", *superuser, |v| Message::ModalToggle(
+                    crate::app::ModalField::Superuser,
+                    v
+                )),
+            ]
+            .spacing(16),
+            text("The password is sent once, kept by the server as a SCRAM verifier, and left \
+                  out of this console's history.")
+                .size(11)
+                .color(theme::TEXT_DIM),
+            error_line(error),
+            dialog_actions("CREATE ROLE", pending),
+        ]
+        .spacing(12)
+        .width(480)
+        .into(),
+
+        Modal::RolePassword { role, password, error } => column![
+            dialog_title(format!("Password for {}", role)),
+            secret_field("New password", password, |v| Message::ModalField(
+                crate::app::ModalField::Password,
+                v
+            )),
+            text("Connections already open keep working; the next login needs the new one.")
+                .size(11)
+                .color(theme::TEXT_DIM),
+            error_line(error),
+            dialog_actions("SET PASSWORD", pending),
+        ]
+        .spacing(12)
+        .width(440)
+        .into(),
+
+        Modal::EditColumn { table, edit, error } => column![
+            dialog_title(format!("Change {}.{}", table, edit.original)),
+            field("Name", &edit.name, |v| Message::ModalField(
+                crate::app::ModalField::Name,
+                v
+            )),
+            field("Type", &edit.data_type, |v| Message::ModalField(
+                crate::app::ModalField::DataType,
+                v
+            )),
+            toggle("Nullable", edit.nullable, |v| Message::ModalToggle(
+                crate::app::ModalField::Nullable,
+                v
+            )),
+            text(match edit.statements(table) {
+                Ok(sql) => format!("Will run:\n{}", sql),
+                Err(why) => why,
+            })
+            .size(11)
+            .font(theme::MONO)
+            .color(theme::TEXT_FAINT),
+            text(
+                "A type change rewrites every row, and is refused if a value does not convert. \
+                 Setting NOT NULL is refused while a row holds NULL."
+            )
+            .size(11)
+            .color(theme::TEXT_DIM),
+            error_line(error),
+            dialog_actions("APPLY", pending),
+        ]
+        .spacing(12)
+        .width(560)
+        .into(),
+
+        Modal::CreateIndex { table, index, error } => index_dialog(studio, table, index, error),
+
+        Modal::CreateTable { name, columns, partitioning, error } => {
             let options = crate::types::choices(flavor);
             let mut list = column![].spacing(8);
             for (index, col) in columns.iter().enumerate() {
@@ -503,9 +673,17 @@ fn modal_view(modal: &Modal, flavor: Flavor) -> Element<'_, Message> {
                 )),
                 section_label("COLUMNS"),
                 scrollable(list).height(Length::Fixed(260.0)).style(theme::scroller),
-                small_button("+ COLUMN", Some(Message::ModalAddColumn)),
+                row![
+                    small_button("+ COLUMN", Some(Message::ModalAddColumn)),
+                    text("Mark several columns PK for a composite primary key.")
+                        .size(10)
+                        .color(theme::TEXT_FAINT),
+                ]
+                .spacing(10)
+                .align_y(Center),
+                partition_section(flavor, columns, partitioning),
                 error_line(error),
-                dialog_actions("CREATE TABLE"),
+                dialog_actions("CREATE TABLE", pending),
             ]
             .spacing(12)
             .width(900)
@@ -528,20 +706,253 @@ fn dialog_title(title: impl Into<String>) -> Element<'static, Message> {
     .into()
 }
 
-fn dialog_actions(confirm: &'static str) -> Element<'static, Message> {
+/// Cancel and confirm. While the statement is with the server the confirm
+/// button says so and cannot be pressed again; cancel still works, and closes
+/// the dialog without waiting.
+fn dialog_actions(confirm: &'static str, pending: bool) -> Element<'static, Message> {
     row![
         Space::new().width(Fill),
         button(text("CANCEL").size(12).font(theme::MONO))
             .padding([7, 14])
             .style(theme::secondary)
             .on_press(Message::ModalCancel),
-        button(text(confirm).size(12).font(theme::MONO))
+        button(text(if pending { "RUNNING…" } else { confirm }).size(12).font(theme::MONO))
             .padding([7, 14])
             .style(theme::primary)
-            .on_press(Message::ModalSubmit),
+            .on_press_maybe((!pending).then_some(Message::ModalSubmit)),
     ]
     .spacing(8)
     .into()
+}
+
+/// A choice shown as a button that is lit while chosen — the column pickers
+/// of the index and partition key forms, where a pick list would hide what is
+/// already chosen. `order` is `Some` while chosen; a place in a key, from 1,
+/// is written in front of the label, and 0 lights it without a number.
+fn chip(label: &str, order: Option<usize>, on_press: Option<Message>) -> Element<'static, Message> {
+    let caption = match order {
+        Some(n) if n > 0 => format!("{} · {}", n, label),
+        _ => label.to_string(),
+    };
+    button(text(caption).size(11).font(theme::MONO))
+        .padding([4, 9])
+        .style(if order.is_some() { theme::primary } else { theme::secondary })
+        .on_press_maybe(on_press)
+        .into()
+}
+
+/// The partitioning half of the new-table dialog.
+///
+/// RasterizedDB only. PostgreSQL's `PARTITION BY HASH` creates a parent that
+/// holds nothing until each child is created with its modulus and remainder,
+/// which is a different act from this one and not what the checkbox would
+/// promise.
+fn partition_section<'a>(
+    flavor: Flavor,
+    columns: &'a [crate::app::NewColumn],
+    partitioning: &'a crate::app::Partitioning,
+) -> Element<'a, Message> {
+    use crate::app::PartitionEdit;
+    if flavor != Flavor::Rasterized {
+        return Space::new().height(0).into();
+    }
+    let enable = toggle("Partition by hash", partitioning.enabled, |v| {
+        Message::PartitionForm(PartitionEdit::Enabled(v))
+    });
+    if !partitioning.enabled {
+        return row![
+            enable,
+            text("spread rows over partitions by a key, so a statement fixing it touches one")
+                .size(10)
+                .color(theme::TEXT_FAINT),
+        ]
+        .spacing(10)
+        .align_y(Center)
+        .into();
+    }
+
+    let mut key = row![].spacing(6).align_y(Center);
+    let full = partitioning.key.len() >= crate::app::MAX_PARTITION_KEY;
+    for (at, column) in columns.iter().enumerate() {
+        if column.name.trim().is_empty() {
+            continue;
+        }
+        let order = partitioning.key.iter().position(|k| *k == at).map(|p| p + 1);
+        let press = (order.is_some() || !full).then_some(Message::PartitionForm(PartitionEdit::Key(at)));
+        key = key.push(chip(column.name.trim(), order, press));
+    }
+
+    column![
+        enable,
+        row![
+            text("KEY").size(10).font(theme::MONO).color(theme::TEXT_DIM).width(Length::Fixed(80.0)),
+            scrollable(key).direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().width(4).scroller_width(4)
+            )),
+        ]
+        .spacing(6)
+        .align_y(Center),
+        row![
+            text("PARTITIONS").size(10).font(theme::MONO).color(theme::TEXT_DIM).width(Length::Fixed(80.0)),
+            text_input("64", &partitioning.count)
+                .on_input(|v| Message::PartitionForm(PartitionEdit::Count(v)))
+                .padding([4, 6])
+                .size(12)
+                .font(theme::MONO)
+                .style(theme::input)
+                .width(Length::Fixed(78.0)),
+            text("1 to 2048; blank is the server's default").size(10).color(theme::TEXT_FAINT),
+        ]
+        .spacing(6)
+        .align_y(Center),
+        text(
+            "Up to three key columns, leading column first: a query fixing only the first still goes to one partition. Key columns are NOT NULL, of an integer, UUID, TEXT or VARCHAR type, and every PRIMARY KEY and UNIQUE must contain all of them. The key cannot be changed after the table is created."
+        )
+        .size(10)
+        .color(theme::TEXT_FAINT),
+    ]
+    .spacing(6)
+    .into()
+}
+
+/// The new-index dialog.
+fn index_dialog<'a>(
+    studio: &'a Studio,
+    table: &'a str,
+    index: &'a crate::app::NewIndex,
+    error: &'a Option<String>,
+) -> Element<'a, Message> {
+    use crate::app::{IndexEdit, IndexKind, IndexMethod};
+    let edit = Message::IndexForm;
+    let documents = studio.document_columns();
+
+    let mut kinds = row![].spacing(6);
+    for kind in IndexKind::ALL {
+        let usable = kind == IndexKind::Columns || !documents.is_empty();
+        kinds = kinds.push(chip(
+            kind.label(),
+            (index.kind == kind).then_some(0),
+            usable.then_some(edit(IndexEdit::Kind(kind))),
+        ));
+    }
+
+    let mut form = column![
+        dialog_title(format!("New index on {}", table)),
+        column![
+            text("Name").size(11).font(theme::MONO).color(theme::TEXT_DIM),
+            text_input("derived from the table and columns", &index.name)
+                .on_input(move |v| edit(IndexEdit::Name(v)))
+                .padding([6, 8])
+                .size(13)
+                .font(theme::MONO)
+                .style(theme::input),
+        ]
+        .spacing(4),
+        column![
+            text("Over").size(11).font(theme::MONO).color(theme::TEXT_DIM),
+            kinds,
+        ]
+        .spacing(4),
+    ]
+    .spacing(12);
+
+    match index.kind {
+        IndexKind::Columns => {
+            let mut picker = row![].spacing(6);
+            for column in &studio.columns {
+                let order = index.columns.iter().position(|c| *c == column.name).map(|p| p + 1);
+                picker = picker.push(chip(&column.name, order, Some(edit(IndexEdit::Column(column.name.clone())))));
+            }
+            form = form
+                .push(
+                    column![
+                        text("Columns, in key order").size(11).font(theme::MONO).color(theme::TEXT_DIM),
+                        scrollable(picker).direction(scrollable::Direction::Horizontal(
+                            scrollable::Scrollbar::new().width(4).scroller_width(4)
+                        )),
+                    ]
+                    .spacing(4),
+                )
+                .push(
+                    column![
+                        text("Method").size(11).font(theme::MONO).color(theme::TEXT_DIM),
+                        row![
+                            pick_list(IndexMethod::ALL, Some(index.method), move |m| edit(IndexEdit::Method(m)))
+                                .padding([6, 8])
+                                .text_size(13)
+                                .width(Length::Fixed(160.0)),
+                            toggle("Unique", index.unique, move |v| edit(IndexEdit::Unique(v))),
+                        ]
+                        .spacing(16)
+                        .align_y(Center),
+                        text(index.method.help()).size(10).color(theme::TEXT_FAINT),
+                        text(if index.unique {
+                            "A unique index is a UNIQUE constraint: it refuses duplicates, and is removed by dropping the constraint."
+                        } else {
+                            ""
+                        })
+                        .size(10)
+                        .color(theme::TEXT_FAINT),
+                    ]
+                    .spacing(4),
+                );
+        }
+        IndexKind::Document | IndexKind::Path => {
+            let mut controls = row![
+                pick_list(documents.clone(), Some(index.document.clone()).filter(|d| !d.is_empty()), move |d| {
+                    edit(IndexEdit::Document(d))
+                })
+                .placeholder("jsonb column")
+                .padding([6, 8])
+                .text_size(13)
+                .width(Length::Fixed(200.0)),
+            ]
+            .spacing(10)
+            .align_y(Center);
+            let help = if index.kind == IndexKind::Document {
+                controls = controls.push(toggle("jsonb_path_ops", index.path_ops, move |v| {
+                    edit(IndexEdit::PathOps(v))
+                }));
+                if index.path_ops {
+                    "jsonb_path_ops: one item per value with its path; answers @> only, with fewer and more selective entries"
+                } else {
+                    "jsonb_ops: every key and value; answers @>, ?, ?| and ?&"
+                }
+            } else {
+                controls = controls.push(
+                    text_input("status   or   user.id", &index.path)
+                        .on_input(move |v| edit(IndexEdit::Path(v)))
+                        .padding([6, 8])
+                        .size(13)
+                        .font(theme::MONO)
+                        .style(theme::input)
+                        .width(Fill),
+                );
+                "a B-tree over the field's text (->>): answers =, ranges and LIKE 'prefix%' on that path; a missing field is NULL and matches nothing"
+            };
+            form = form.push(
+                column![
+                    text(if index.kind == IndexKind::Document { "Document" } else { "Document and path" })
+                        .size(11)
+                        .font(theme::MONO)
+                        .color(theme::TEXT_DIM),
+                    controls,
+                    text(help).size(10).color(theme::TEXT_FAINT),
+                ]
+                .spacing(4),
+            );
+        }
+    }
+
+    let preview = match crate::app::create_index_sql(table, index) {
+        Ok(sql) => format!("Will be written as:  {}", sql),
+        Err(reason) => format!("Not ready: {}", reason),
+    };
+    form.push(text(preview).size(11).font(theme::MONO).color(theme::TEXT_FAINT))
+        .push(error_line(error))
+        .push(dialog_actions("CREATE INDEX", studio.modal_pending))
+        .width(640)
+        .into()
 }
 
 fn error_line(error: &Option<String>) -> Element<'_, Message> {
@@ -620,6 +1031,26 @@ pub fn field<'a>(
         text(label.into()).size(11).font(theme::MONO).color(theme::TEXT_DIM),
         text_input("", value)
             .on_input(on_input)
+            .padding([6, 8])
+            .size(13)
+            .font(theme::MONO)
+            .style(theme::input),
+    ]
+    .spacing(4)
+    .into()
+}
+
+/// [`field`], with what is typed hidden.
+pub fn secret_field<'a>(
+    label: impl Into<String>,
+    value: &str,
+    on_input: impl Fn(String) -> Message + 'a,
+) -> Element<'a, Message> {
+    column![
+        text(label.into()).size(11).font(theme::MONO).color(theme::TEXT_DIM),
+        text_input("", value)
+            .on_input(on_input)
+            .secure(true)
             .padding([6, 8])
             .size(13)
             .font(theme::MONO)
@@ -825,6 +1256,15 @@ pub fn format_metric(metric: &str, value: &str) -> String {
 /// The gap between two columns, which is also the width of the drag handle.
 pub const GRIP: f32 = 5.0;
 
+/// What the data browser's grid scope starts with. Sorting that grid goes back
+/// to the server rather than rearranging the page in hand, and this is how
+/// [`crate::app::Studio::update`] recognises it.
+pub const DATA_SCOPE: &str = "data:";
+
+/// The scope every result set on the query screen is laid out under. Shared, so
+/// that running the same statement again keeps the widths and the sort.
+pub const QUERY_SCOPE: &str = "query";
+
 /// One column of a grid.
 pub struct GridColumn {
     /// Stable identity for the remembered width. Not the header text: a header
@@ -840,6 +1280,11 @@ pub struct GridColumn {
     /// Width before anybody drags it.
     pub width: f32,
     pub right: bool,
+    /// Whether clicking the header sorts by this column. False for the ones
+    /// that hold a button or a row of badges rather than a value — there is no
+    /// order to put `RESTORE…` in, and a header that responds to a click by
+    /// doing nothing is worse than one that does not respond.
+    pub sortable: bool,
 }
 
 impl GridColumn {
@@ -848,12 +1293,19 @@ impl GridColumn {
         header: impl Into<String>,
         width: f32,
     ) -> Self {
-        Self { key: key.into(), header: header.into(), width, right: false }
+        Self { key: key.into(), header: header.into(), width, right: false, sortable: true }
     }
 
     /// A column of figures, which reads down the page only when right-aligned.
     pub fn right(mut self) -> Self {
         self.right = true;
+        self
+    }
+
+    /// A column holding a control or a row of badges rather than a value, which
+    /// nothing can meaningfully be ordered by.
+    pub fn unsortable(mut self) -> Self {
+        self.sortable = false;
         self
     }
 }
@@ -877,17 +1329,41 @@ pub struct GridLayout<'a> {
     pub viewport: Option<(f32, f32)>,
     /// Emitted as the grid scrolls, when it is virtualised.
     pub on_scroll: Option<fn(iced::widget::scrollable::Viewport) -> Message>,
+    /// Which column this grid is sorted by, if the user has picked one.
+    pub sort: Option<&'a GridSort>,
+    /// Whether the *server* applied that sort. Set by the data browser, which
+    /// holds one page of a table: re-sorting the page here would rearrange the
+    /// hundred rows that happened to arrive under a heading claiming to order
+    /// the whole table. The header still shows the arrow; the rows are simply
+    /// left in the order they came in.
+    pub sorted_by_server: bool,
 }
 
 impl<'a> GridLayout<'a> {
     pub fn new(studio: &'a Studio, scope: impl Into<String>) -> Self {
+        let scope = scope.into();
         Self {
             widths: &studio.column_widths,
-            scope: scope.into(),
+            sort: studio.sort.get(&scope),
+            scope,
             resizing: studio.resizing.is_some(),
             viewport: None,
             on_scroll: None,
+            sorted_by_server: false,
         }
+    }
+
+    /// The rows already arrived in the sorted order; the grid should show the
+    /// arrow but not reorder anything. See [`GridLayout::sorted_by_server`].
+    pub fn sorted_by_server(mut self) -> Self {
+        self.sorted_by_server = true;
+        self
+    }
+
+    /// The column this grid is sorted by, and which way, when the grid is the
+    /// one doing the sorting.
+    pub(super) fn client_sort(&self) -> Option<&GridSort> {
+        self.sort.filter(|_| !self.sorted_by_server)
     }
 
     /// Turns on row virtualisation, tracking the scroll position through
@@ -939,6 +1415,148 @@ pub fn grid_total(widths: &[f32]) -> f32 {
     widths.iter().sum::<f32>() + GRIP * widths.len() as f32
 }
 
+// --- sorting
+//
+// Every grid here is sorted the same way and by the same rule: the view hands
+// back one [`SortKey`] per row for whichever column was clicked, and the order
+// is worked out from those. The alternative — sorting the *rendered* cells —
+// looks simpler and is wrong: the cells hold `1.2 GiB` and `900 MiB`, and
+// ordering those as text puts the gigabyte first.
+
+/// One row's value in the column being sorted by, reduced to something two
+/// rows can be ordered by.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SortKey {
+    /// No value: a NULL, a blank, a dash. Sorted last in both directions,
+    /// because "missing" has no place in an order and rows with nothing in the
+    /// column are not what somebody sorting by it is looking for.
+    Empty,
+    Number(f64),
+    Text(String),
+}
+
+impl SortKey {
+    /// A string value, empty ones counting as missing.
+    pub fn text(value: impl AsRef<str>) -> Self {
+        let value = value.as_ref().trim();
+        if value.is_empty() || value == "—" {
+            SortKey::Empty
+        } else {
+            SortKey::Text(value.to_ascii_lowercase())
+        }
+    }
+
+    /// A figure the view already holds as a number, so it orders by magnitude
+    /// rather than by however it was formatted.
+    pub fn number(value: impl Into<f64>) -> Self {
+        SortKey::Number(value.into())
+    }
+
+    /// A cell of a result set, whose type nothing here knows: a value that
+    /// parses as a number is ordered as one, so an `id` column does not run
+    /// 1, 10, 100, 2.
+    pub fn cell(value: Option<&str>) -> Self {
+        match value {
+            None => SortKey::Empty,
+            Some(value) => match value.trim().parse::<f64>() {
+                Ok(number) if number.is_finite() => SortKey::Number(number),
+                _ => SortKey::text(value),
+            },
+        }
+    }
+}
+
+fn compare(a: &SortKey, b: &SortKey, descending: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (SortKey::Empty, SortKey::Empty) => Ordering::Equal,
+        (SortKey::Empty, _) => Ordering::Greater,
+        (_, SortKey::Empty) => Ordering::Less,
+        _ => {
+            let ordering = match (a, b) {
+                (SortKey::Number(a), SortKey::Number(b)) => {
+                    // `total_cmp` rather than `partial_cmp`: a NaN would
+                    // otherwise make the comparator inconsistent, which is a
+                    // panic in `sort_by` and not merely a wrong order.
+                    a.total_cmp(b)
+                }
+                (SortKey::Text(a), SortKey::Text(b)) => a.cmp(b),
+                // Mixed types in one column: numbers first, so a column of
+                // figures with an odd label in it still reads as figures.
+                (SortKey::Number(_), SortKey::Text(_)) => Ordering::Less,
+                (SortKey::Text(_), SortKey::Number(_)) => Ordering::Greater,
+                _ => Ordering::Equal,
+            };
+            if descending { ordering.reverse() } else { ordering }
+        }
+    }
+}
+
+/// Reorders a view's rows to the grid's current sort, if it has one.
+///
+/// The key function is called once per row rather than once per comparison —
+/// it usually allocates, and a comparison-time key on a five-thousand-row grid
+/// is sixty thousand allocations per redraw.
+///
+/// The sort is stable, so rows the column does not tell apart stay in the order
+/// the server returned them.
+pub fn sort_rows<T>(
+    layout: &GridLayout<'_>,
+    rows: &mut Vec<T>,
+    key: impl Fn(&T, &str) -> SortKey,
+) {
+    let Some(sort) = layout.client_sort() else { return };
+    let mut decorated: Vec<(SortKey, T)> =
+        rows.drain(..).map(|row| (key(&row, &sort.column), row)).collect();
+    decorated.sort_by(|(a, _), (b, _)| compare(a, b, sort.descending));
+    rows.extend(decorated.into_iter().map(|(_, row)| row));
+}
+
+/// The order a result set's rows should be shown in, as indices into it.
+///
+/// `None` when the grid is unsorted, which lets the caller skip building the
+/// vector at all — the common case, and the one on the largest grids.
+pub fn sorted_order(layout: &GridLayout<'_>, grid: &Grid) -> Option<Vec<usize>> {
+    order_by(layout.client_sort(), grid)
+}
+
+/// A copy of the result in the order it is on screen.
+///
+/// What is exported and what is copied has to be what was looked at. Someone
+/// sorts a result by cost, exports it, and opens a file in the order the server
+/// happened to return — a file that is not wrong so much as not the thing they
+/// asked for, and nothing in it says so.
+///
+/// Borrows when the grid is unsorted, which is the ordinary case.
+pub fn in_sorted_order<'a>(
+    sort: Option<&GridSort>,
+    grid: &'a Grid,
+) -> std::borrow::Cow<'a, Grid> {
+    match order_by(sort, grid) {
+        None => std::borrow::Cow::Borrowed(grid),
+        Some(order) => std::borrow::Cow::Owned(Grid {
+            total: None,
+            columns: grid.columns.clone(),
+            rows: order.into_iter().map(|index| grid.rows[index].clone()).collect(),
+            tag: grid.tag.clone(),
+        }),
+    }
+}
+
+fn order_by(sort: Option<&GridSort>, grid: &Grid) -> Option<Vec<usize>> {
+    let sort = sort?;
+    let column = grid.columns.iter().position(|name| *name == sort.column)?;
+
+    let mut decorated: Vec<(SortKey, usize)> = (0..grid.rows.len())
+        .map(|index| {
+            let value = grid.rows[index].get(column).and_then(Option::as_deref);
+            (SortKey::cell(value), index)
+        })
+        .collect();
+    decorated.sort_by(|(a, _), (b, _)| compare(a, b, sort.descending));
+    Some(decorated.into_iter().map(|(_, index)| index).collect())
+}
+
 /// The header, with a drag handle after every column.
 pub fn grid_header<'a>(
     layout: &GridLayout<'_>,
@@ -948,22 +1566,41 @@ pub fn grid_header<'a>(
     let mut header = row![].spacing(0);
     for (index, column) in columns.iter().enumerate() {
         let width = widths.get(index).copied().unwrap_or(column.width);
-        header = header.push(
-            container(
-                text(column.header.clone())
-                    .size(10)
-                    .font(theme::MONO)
-                    .color(theme::RUST)
-                    .align_x(if column.right {
-                        iced::alignment::Horizontal::Right
-                    } else {
-                        iced::alignment::Horizontal::Left
-                    })
-                    .width(Fill),
-            )
-            .padding([4, 6])
-            .width(Length::Fixed(width)),
-        );
+        let sorted = layout.sort.filter(|sort| sort.column == column.key);
+
+        // The arrow is the only thing that says which way the grid is ordered,
+        // and it has to be part of the label rather than a second element: the
+        // header is laid out to a fixed width, and an arrow beside the text
+        // would push a right-aligned heading off its own column.
+        let label = text(match sorted {
+            Some(sort) if sort.descending => format!("{} ▼", column.header),
+            Some(_) => format!("{} ▲", column.header),
+            None => column.header.clone(),
+        })
+        .size(10)
+        .font(theme::MONO)
+        .align_x(if column.right {
+            iced::alignment::Horizontal::Right
+        } else {
+            iced::alignment::Horizontal::Left
+        })
+        .width(Fill);
+
+        let cell: Element<'a, Message> = if column.sortable && !column.header.is_empty() {
+            iced::widget::button(label)
+                .padding([4, 6])
+                .width(Fill)
+                .style(theme::sort_header(sorted.is_some()))
+                .on_press(Message::SortColumn(
+                    layout.scope.clone(),
+                    column.key.to_string(),
+                ))
+                .into()
+        } else {
+            container(label.color(theme::RUST)).padding([4, 6]).into()
+        };
+
+        header = header.push(container(cell).width(Length::Fixed(width)));
 
         let key = width_key(&layout.scope, &column.key);
         header = header.push(
@@ -1150,6 +1787,12 @@ pub fn result_grid<'a>(
     let mut header = grid_header(&layout, &columns, &widths);
     let mut total = grid_total(&widths);
 
+    // Display position to source row. `None` — no sort, or a sort the server
+    // already applied — means the two are the same, and a five-thousand-entry
+    // identity vector is not built to say so.
+    let order = sorted_order(&layout, grid);
+    let source = |display: usize| order.as_ref().map_or(display, |order| order[display]);
+
     if trailing.is_some() {
         total += 70.0;
         header = container(
@@ -1176,7 +1819,12 @@ pub fn result_grid<'a>(
         // whole result deserves rather than the length of what is built.
         body = body.push(Space::new().height(Length::Fixed(above)));
     }
-    for row_index in window.clone() {
+    for display in window.clone() {
+        // Everything addressed *by row* — an edit, a delete — is addressed by
+        // the source index, not by where the row happens to be on screen. A
+        // sorted grid that handed out display positions would edit whichever
+        // row used to be there.
+        let row_index = source(display);
         let values = &grid.rows[row_index];
         let cells: Vec<Element<'_, Message>> = values
             .iter()
@@ -1190,7 +1838,7 @@ pub fn result_grid<'a>(
         let row_element = container(line)
             .width(Length::Fixed(total))
             .height(Length::Fixed(ROW_HEIGHT));
-        body = body.push(grid_stripe(row_index, row_element.into()));
+        body = body.push(grid_stripe(display, row_element.into()));
     }
     if below > 0.0 {
         body = body.push(Space::new().height(Length::Fixed(below)));
@@ -1257,6 +1905,16 @@ pub fn metric_grid(
     ];
     let widths = column_widths(&layout, &specs);
     let total = grid_total(&widths);
+
+    // By name to find one, or by value to see which of forty figures is the
+    // large one. The values are mostly numbers written as text, which is why
+    // `SortKey::cell` decides that per value rather than per column.
+    let mut stats: Vec<&Stat> = stats.iter().collect();
+    sort_rows(&layout, &mut stats, |stat, column| match column {
+        "value" => SortKey::cell(Some(&stat.value)),
+        "detail" => SortKey::text(&stat.detail),
+        _ => SortKey::text(&stat.metric),
+    });
 
     let mut body = column![].spacing(0);
     for (index, stat) in stats.iter().enumerate() {
@@ -1372,7 +2030,21 @@ mod tests {
             resizing: false,
             viewport: None,
             on_scroll: None,
+            sort: None,
+            sorted_by_server: false,
         }
+    }
+
+    fn sorted<'a>(
+        widths: &'a HashMap<String, f32>,
+        sort: &'a GridSort,
+        scope: &str,
+    ) -> GridLayout<'a> {
+        GridLayout { sort: Some(sort), ..layout(widths, scope) }
+    }
+
+    fn by(column: &str, descending: bool) -> GridSort {
+        GridSort { column: column.to_string(), descending }
     }
 
     #[test]
@@ -1424,6 +2096,137 @@ mod tests {
     #[test]
     fn a_long_header_widens_its_own_column() {
         assert!(default_width("RECLAIMABLE_BYTES", 2) > default_width("N", 2));
+    }
+
+    // --- sorting
+
+    /// The whole reason the views hand back a key instead of the rendered
+    /// cell: `1.2 GiB` and `900 MiB` order the wrong way round as text.
+    #[test]
+    fn figures_sort_by_magnitude_and_not_by_their_formatting() {
+        let widths = HashMap::new();
+        let sort = by("size", false);
+        let mut rows = vec![("a", 900u64 * 1024 * 1024), ("b", 1288490188), ("c", 512)];
+        sort_rows(&sorted(&widths, &sort, "tables"), &mut rows, |(_, size), _| {
+            SortKey::number(*size as f64)
+        });
+        assert_eq!(rows.iter().map(|(name, _)| *name).collect::<Vec<_>>(), ["c", "a", "b"]);
+    }
+
+    /// Ascending, then descending. The order has to actually reverse, not just
+    /// redraw the arrow.
+    #[test]
+    fn a_second_click_reverses_the_order() {
+        let widths = HashMap::new();
+        let sort = by("name", true);
+        let mut rows = vec!["carol", "alice", "bob"];
+        sort_rows(&sorted(&widths, &sort, "tables"), &mut rows, |row, _| SortKey::text(row));
+        assert_eq!(rows, ["carol", "bob", "alice"]);
+    }
+
+    /// A row with nothing in the sorted column is not what somebody sorting by
+    /// it is looking for, in either direction.
+    #[test]
+    fn missing_values_stay_at_the_bottom_both_ways() {
+        let widths = HashMap::new();
+        for descending in [false, true] {
+            let sort = by("key", descending);
+            let mut rows = vec![Some(2.0), None, Some(1.0), None];
+            sort_rows(&sorted(&widths, &sort, "g"), &mut rows, |row, _| match row {
+                Some(value) => SortKey::number(*value),
+                None => SortKey::Empty,
+            });
+            assert_eq!(&rows[2..], &[None, None], "descending = {descending}");
+        }
+    }
+
+    /// Rows the column does not tell apart keep the order the server sent them
+    /// in, which is the only order left that means anything.
+    #[test]
+    fn ties_keep_the_servers_order() {
+        let widths = HashMap::new();
+        let sort = by("kind", false);
+        let mut rows = vec![("first", "wal"), ("second", "wal"), ("third", "wal")];
+        sort_rows(&sorted(&widths, &sort, "backup"), &mut rows, |(_, kind), _| {
+            SortKey::text(kind)
+        });
+        assert_eq!(
+            rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
+    }
+
+    /// An unsorted grid is left exactly as it arrived — no sort is the state
+    /// every grid starts in and the one the third click returns it to.
+    #[test]
+    fn an_unsorted_grid_is_left_alone() {
+        let widths = HashMap::new();
+        let mut rows = vec!["c", "a", "b"];
+        sort_rows(&layout(&widths, "tables"), &mut rows, |row, _| SortKey::text(row));
+        assert_eq!(rows, ["c", "a", "b"]);
+    }
+
+    fn grid() -> Grid {
+        Grid {
+            total: None,
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![
+                vec![Some("10".into()), Some("carol".into())],
+                vec![Some("2".into()), Some("alice".into())],
+                vec![None, Some("bob".into())],
+            ],
+            tag: String::new(),
+        }
+    }
+
+    /// A result set carries no types, so the values decide: an `id` column
+    /// that ordered as text would run 1, 10, 100, 2.
+    #[test]
+    fn a_result_column_of_numbers_sorts_as_numbers() {
+        let widths = HashMap::new();
+        let sort = by("id", false);
+        let order = sorted_order(&sorted(&widths, &sort, "query"), &grid()).unwrap();
+        assert_eq!(order, vec![1, 0, 2], "the NULL row belongs last");
+    }
+
+    /// The indices are into the result, not positions on screen: an edit or a
+    /// delete addressed by display position would hit the wrong row.
+    #[test]
+    fn a_sorted_result_still_points_at_its_own_rows() {
+        let widths = HashMap::new();
+        let sort = by("name", false);
+        let grid = grid();
+        let order = sorted_order(&sorted(&widths, &sort, "query"), &grid).unwrap();
+        let names: Vec<&str> = order
+            .iter()
+            .map(|index| grid.rows[*index][1].as_deref().unwrap())
+            .collect();
+        assert_eq!(names, ["alice", "bob", "carol"]);
+    }
+
+    /// Run a different statement and the old sort names a column the new
+    /// result does not have. That is not an error and not a panic; it is an
+    /// unsorted grid.
+    #[test]
+    fn a_sort_on_a_column_that_is_gone_orders_nothing() {
+        let widths = HashMap::new();
+        let sort = by("vanished", false);
+        assert!(sorted_order(&sorted(&widths, &sort, "query"), &grid()).is_none());
+    }
+
+    /// The data browser's rows are ordered by the server. Sorting them again
+    /// here would rearrange the page in hand under a heading that claims to
+    /// order the whole table.
+    #[test]
+    fn a_server_sorted_grid_is_not_sorted_twice() {
+        let widths = HashMap::new();
+        let sort = by("id", true);
+        let layout = GridLayout {
+            sorted_by_server: true,
+            ..sorted(&widths, &sort, "data:users")
+        };
+        assert!(sorted_order(&layout, &grid()).is_none());
+        assert!(layout.sort.is_some(), "the header still shows which way it is sorted");
     }
 
     // --- virtualisation

@@ -34,12 +34,26 @@ mod tests;
 
 #[cfg(test)]
 mod integration_tests;
+#[cfg(test)]
+mod nan_bounds_tests;
+#[cfg(test)]
+mod compact_failure_tests;
+// Every scenario in it runs a table on a second storage location.
+#[cfg(all(test, feature = "storage_pools"))]
+mod vacuum_clear_power_loss_tests;
+#[cfg(test)]
+mod vacuum_clear_runs_tests;
+#[cfg(test)]
+mod checkpoint_error_tests;
+#[cfg(test)]
+mod derive_vectors_tests;
 
 use parking_lot::RwLock;
 use smallvec::SmallVec;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::core::db_type::DbType;
+use crate::core::index_store::gate::Proof;
 use crate::core::row::row::RowWrite;
 use crate::core::row::schema::SchemaField;
 use crate::core::storage_providers::traits::StorageIO;
@@ -47,16 +61,32 @@ use crate::core::storage_providers::traits::StorageIO;
 pub use column::{FilterConfig, bitmap_words, choose_f};
 pub use hash::{HashSeed, canonical_hash, is_fingerprintable, is_indexable};
 pub use sarg::SargProgram;
-pub use zonemap::SargOp;
 pub use settings::{FilterSettings, Overrides, Resolved, settings};
+pub use zonemap::SargOp;
 
 use column::ColumnFilter;
+
+/// Slots [`TableFilters::on_delete_runs_at`] clears under one hold of a
+/// column's lock.
+const CLEAR_CHUNK: u64 = 4096;
 
 /// A per-slot candidate bitmap. A set bit means "may match — fetch it".
 #[derive(Clone, Debug)]
 pub struct CandidateBitmap {
     words: Vec<u64>,
     n_slots: u64,
+    /// Admits no slot at all — not even one appended after `n_slots` was
+    /// sampled. Only a `WHERE` clause that no row can satisfy earns this: a
+    /// pruning *index* may exclude only what it has indexed, but a constant
+    /// false predicate excludes every row there will ever be. See
+    /// [`CandidateBitmap::nothing`].
+    nothing: bool,
+    /// The candidates as a sorted slot list, from a secondary index, in place
+    /// of `words`. A point lookup over a large table is a handful of slots,
+    /// and a dense bitmap for it would be one bit per row allocated and
+    /// zeroed for every query. Slots at or past `n_slots` are candidates
+    /// either way.
+    sparse: Option<Box<[u64]>>,
 }
 
 impl CandidateBitmap {
@@ -64,7 +94,128 @@ impl CandidateBitmap {
     pub fn all_candidates(n_slots: u64) -> Self {
         let mut words = vec![u64::MAX; bitmap_words(n_slots)];
         column::mask_tail_pub(&mut words, n_slots);
-        Self { words, n_slots }
+        Self {
+            words,
+            n_slots,
+            nothing: false,
+            sparse: None,
+        }
+    }
+
+    /// Candidates named slot by slot: `slots` sorted and distinct, every one
+    /// below `n_slots`, which is the table length sampled *before* the index
+    /// was asked, so a version appended since stays a candidate.
+    pub fn sparse(slots: Vec<u64>, n_slots: u64) -> Self {
+        debug_assert!(slots.windows(2).all(|w| w[0] < w[1]));
+        Self {
+            words: Vec::new(),
+            n_slots,
+            nothing: false,
+            sparse: Some(slots.into_boxed_slice()),
+        }
+    }
+
+    /// Candidates as one bit per slot below `n_slots`, from a secondary
+    /// index whose answer is too broad for a slot list. `n_slots` is the
+    /// table length sampled *before* the index was asked, as for
+    /// [`CandidateBitmap::sparse`]: past it every slot is a candidate.
+    pub fn dense(mut words: Vec<u64>, n_slots: u64) -> Self {
+        debug_assert_eq!(words.len(), bitmap_words(n_slots));
+        // Words it did not provide are candidates, never exclusions.
+        words.resize(bitmap_words(n_slots), u64::MAX);
+        column::mask_tail_pub(&mut words, n_slots);
+        Self {
+            words,
+            n_slots,
+            nothing: false,
+            sparse: None,
+        }
+    }
+
+    #[inline]
+    pub fn is_sparse(&self) -> bool {
+        self.sparse.is_some()
+    }
+
+    /// The slot list itself, sorted and distinct, for a caller that walks it
+    /// in order with a cursor of its own rather than searching it once per
+    /// slot. `None` for a dense mask. It says nothing about slots at or past
+    /// `n_slots`, which are candidates whether listed or not.
+    #[inline]
+    pub fn sparse_slots(&self) -> Option<&[u64]> {
+        self.sparse.as_deref()
+    }
+
+    /// Every candidate slot below `n_slots`, ascending, whichever form the
+    /// mask takes: so two masks compare as sets with `==`. Slots at or past
+    /// `n_slots` are candidates either way and are not listed; compare
+    /// [`Self::n_slots`] too, or a mask sampled after an append differs from
+    /// one sampled before it. Empty for [`Self::nothing`]. For checks, not
+    /// for a scan: a dense mask is walked bit by bit.
+    pub fn slots(&self) -> Vec<u64> {
+        if self.nothing {
+            return Vec::new();
+        }
+        match &self.sparse {
+            Some(list) => list.iter().copied().filter(|s| *s < self.n_slots).collect(),
+            None => (0..self.n_slots).filter(|s| self.get(*s)).collect(),
+        }
+    }
+
+    /// The first candidate slot at or after `from`. Past `n_slots` every slot
+    /// is a candidate, so this is never more than `max(from, n_slots)`.
+    pub fn next_candidate(&self, from: u64) -> u64 {
+        if self.nothing {
+            return u64::MAX;
+        }
+        if from >= self.n_slots {
+            return from;
+        }
+        match &self.sparse {
+            Some(slots) => {
+                let i = slots.partition_point(|s| *s < from);
+                slots.get(i).copied().unwrap_or(self.n_slots)
+            }
+            None => {
+                let mut slot = from;
+                while slot < self.n_slots {
+                    let w = (slot / 64) as usize;
+                    let word = self.word(w) & (u64::MAX << (slot % 64));
+                    if word != 0 {
+                        return (w as u64) * 64 + word.trailing_zeros() as u64;
+                    }
+                    slot = (w as u64 + 1) * 64;
+                }
+                self.n_slots.max(from)
+            }
+        }
+    }
+
+    /// For a slot list: the last listed candidate below `limit`, so the
+    /// iterator can read from one candidate to the last one a chunk would
+    /// reach, and not a byte further. `None` for a dense mask.
+    pub fn last_candidate_below(&self, limit: u64) -> Option<u64> {
+        let slots = self.sparse.as_ref()?;
+        let i = slots.partition_point(|s| *s < limit.min(self.n_slots));
+        i.checked_sub(1).map(|i| slots[i])
+    }
+
+    /// The mask for a clause no row can satisfy — `1 = 0`, `notnull IS NULL`,
+    /// `x IN ()`. The pointer iterator ends at once on it, so the scan reads
+    /// nothing; see `sarg::constant_truth`.
+    pub fn nothing() -> Self {
+        Self {
+            words: Vec::new(),
+            n_slots: 0,
+            nothing: true,
+            sparse: None,
+        }
+    }
+
+    /// Whether this is [`CandidateBitmap::nothing`].
+    #[inline]
+    pub fn is_nothing(&self) -> bool {
+        self.nothing
     }
 
     /// A mask admitting only slots `[0, upto)`.
@@ -91,7 +242,12 @@ impl CandidateBitmap {
                 *w = (1u64 << rem) - 1;
             }
         }
-        let mut me = Self { words, n_slots };
+        let mut me = Self {
+            words,
+            n_slots,
+            nothing: false,
+            sparse: None,
+        };
         column::mask_tail_pub(&mut me.words, n_slots);
         me
     }
@@ -101,6 +257,22 @@ impl CandidateBitmap {
     /// `other` shorter than `self` clears the uncovered tail rather than
     /// leaving it set: a mask that does not reach a slot has not admitted it.
     pub fn intersect(&mut self, other: &CandidateBitmap) {
+        // A slot list on either side: the answer is a slot list, each slot
+        // kept when the other side admits it.
+        if self.sparse.is_some() || other.sparse.is_some() {
+            let (list, keep_by) = match (&self.sparse, &other.sparse) {
+                (Some(mine), _) => (mine.to_vec(), other),
+                (None, Some(theirs)) => (theirs.to_vec(), &*self),
+                _ => unreachable!(),
+            };
+            let n_slots = self.n_slots;
+            let kept: Vec<u64> = list
+                .into_iter()
+                .filter(|s| *s < n_slots && keep_by.get(*s))
+                .collect();
+            *self = CandidateBitmap::sparse(kept, n_slots);
+            return;
+        }
         for (i, w) in self.words.iter_mut().enumerate() {
             *w &= other.words.get(i).copied().unwrap_or(0);
         }
@@ -109,6 +281,9 @@ impl CandidateBitmap {
 
     #[inline]
     pub fn get(&self, slot: u64) -> bool {
+        if self.nothing {
+            return false;
+        }
         // Past what this bitmap was built to cover: be conservative.
         //
         // Two ways a slot can be uncovered, and only one of them used to be
@@ -131,6 +306,9 @@ impl CandidateBitmap {
         if slot >= self.n_slots {
             return true;
         }
+        if let Some(slots) = &self.sparse {
+            return slots.binary_search(&slot).is_ok();
+        }
         let w = (slot / 64) as usize;
         match self.words.get(w) {
             // Past the end of what the bitmap covers: be conservative.
@@ -147,6 +325,19 @@ impl CandidateBitmap {
     /// slots the bitmap never covered.
     #[inline]
     pub fn word(&self, w: usize) -> u64 {
+        if self.nothing {
+            return 0;
+        }
+        let first = (w as u64) * 64;
+        if let Some(slots) = &self.sparse {
+            let mut word = 0u64;
+            let start = slots.partition_point(|s| *s < first);
+            for s in slots[start..].iter().take_while(|s| **s < first + 64) {
+                word |= 1 << (s - first);
+            }
+            let covered = self.n_slots.saturating_sub(first);
+            return if covered >= 64 { word } else { word | (u64::MAX << covered) };
+        }
         match self.words.get(w) {
             None => u64::MAX,
             Some(word) => {
@@ -169,11 +360,18 @@ impl CandidateBitmap {
 
     /// Number of candidate slots. Useful for deciding whether pruning paid off.
     pub fn count(&self) -> u64 {
+        if let Some(slots) = &self.sparse {
+            return slots.len() as u64;
+        }
         self.words.iter().map(|w| w.count_ones() as u64).sum()
     }
 
+    /// The dense words. Empty for a slot list, which only a secondary index
+    /// produces and none of this method's callers (the filter's own
+    /// persistence and ratio tests) ever receives.
     #[inline]
     pub fn words(&self) -> &[u64] {
+        debug_assert!(self.sparse.is_none(), "words() of a sparse candidate list");
         &self.words
     }
 }
@@ -196,6 +394,9 @@ struct ColumnMeta {
 pub struct TableFilters {
     cfg: FilterConfig,
     seed: HashSeed,
+    /// Private, and must stay so: `ColumnFilter`'s mutators take no proof,
+    /// and this field is what keeps them behind `TableFilters`' own, which do
+    /// (hook C10; pinned by the gate's source test).
     columns: Vec<RwLock<ColumnFilter>>,
     /// Parallel to `columns`. Read without locking.
     meta: Vec<ColumnMeta>,
@@ -212,6 +413,9 @@ pub struct TableFilters {
     /// Whether the on-disk copy is known to be stale. Set before a delete or
     /// update, cleared by a checkpoint.
     disk_dirty: AtomicBool,
+    /// Held while the dirty byte is written, so a second mutation waits for
+    /// the byte rather than seeing the flag set and writing rows first.
+    dirty_marking: tokio::sync::Mutex<()>,
     /// Set by mutations that need a checkpoint sooner than the write threshold
     /// would trigger one.
     checkpoint_requested: AtomicBool,
@@ -240,6 +444,19 @@ pub struct TableFilters {
     /// sound), but it silently throws away a checkpoint, and the fix is one
     /// uncontended lock per checkpoint.
     write_gate: tokio::sync::Mutex<()>,
+    /// Bumped when slot numbers start changing under the filter and again
+    /// when they stop (`Table::compact` phase 2; see
+    /// [`TableFilters::begin_renumbering`]). Work that reads slots and then
+    /// writes what it learned into the planes (a backfill, vacuum's clears)
+    /// reads this first and writes only if it is unchanged, checked under the
+    /// column's lock, so nothing learned under one numbering lands under
+    /// another.
+    ///
+    /// Odd while a renumbering is running, even otherwise. An unchanged odd
+    /// epoch is no licence at all: work that read it is reading slots while
+    /// they move, and the renumbering has not ended to say so yet. See
+    /// [`renumbering`].
+    renumber_epoch: AtomicU64,
 }
 
 impl TableFilters {
@@ -286,7 +503,9 @@ impl TableFilters {
                 span_summary,
             )));
         }
-        let cfg = table.map(|t| settings::settings().resolve(t, "").cfg).unwrap_or(cfg);
+        let cfg = table
+            .map(|t| settings::settings().resolve(t, "").cfg)
+            .unwrap_or(cfg);
         let meta = Self::meta_of(&columns);
 
         Self {
@@ -298,11 +517,13 @@ impl TableFilters {
             writes_since_checkpoint: AtomicU64::new(0),
             slots_at_checkpoint: AtomicU64::new(0),
             disk_dirty: AtomicBool::new(false),
+            dirty_marking: tokio::sync::Mutex::new(()),
             checkpoint_requested: AtomicBool::new(false),
             has_checkpoint: AtomicBool::new(false),
             disk_len: AtomicU64::new(0),
             deltas_since_base: AtomicU32::new(0),
             write_gate: tokio::sync::Mutex::new(()),
+            renumber_epoch: AtomicU64::new(0),
         }
     }
 
@@ -349,11 +570,13 @@ impl TableFilters {
             writes_since_checkpoint: AtomicU64::new(0),
             slots_at_checkpoint: AtomicU64::new(loaded.n_slots),
             disk_dirty: AtomicBool::new(false),
+            dirty_marking: tokio::sync::Mutex::new(()),
             checkpoint_requested: AtomicBool::new(false),
             has_checkpoint: AtomicBool::new(true),
             disk_len: AtomicU64::new(loaded.valid_len),
             deltas_since_base: AtomicU32::new(deltas),
             write_gate: tokio::sync::Mutex::new(()),
+            renumber_epoch: AtomicU64::new(0),
         })
     }
 
@@ -378,7 +601,11 @@ impl TableFilters {
             .iter()
             .map(|c| {
                 let g = c.read();
-                if g.unknown_below() > 0 { 0 } else { g.valid_upto() }
+                if g.unknown_below() > 0 {
+                    0
+                } else {
+                    g.valid_upto()
+                }
             })
             .min()
             .unwrap_or(0)
@@ -390,6 +617,111 @@ impl TableFilters {
         let guards: Vec<_> = self.columns.iter().map(|c| c.read()).collect();
         let refs: Vec<&ColumnFilter> = guards.iter().map(|g| &**g).collect();
         persist::serialize(&refs, self.seed, n_slots)
+    }
+
+    /// The FILTER section of a snapshot taken under a seal
+    /// (`persist::serialize_sealed`; docs/persistent-indexes.md §3 step 5,
+    /// §5), with vacuum's clear horizon `cleared_below` (§2). Read guards
+    /// only.
+    pub fn sealed_image(&self, n_slots: u64, cleared_below: u64) -> Vec<u8> {
+        let guards: Vec<_> = self.columns.iter().map(|c| c.read()).collect();
+        let refs: Vec<&ColumnFilter> = guards.iter().map(|g| &**g).collect();
+        persist::serialize_sealed(&refs, self.seed, n_slots, cleared_below)
+    }
+
+    /// A filter loaded from a snapshot's FILTER section (§4, B14), and the
+    /// `cleared_below` it was sealed with. `self` is the filter a rebuild
+    /// would start from (`for_table` on the live schema and settings): the
+    /// section must describe exactly its columns, in order, by write order
+    /// and type, and each restored column takes its configuration, so a
+    /// loaded filter differs from a rebuilt one only in what it has
+    /// indexed. Any rejection is `Err`: the caller rebuilds.
+    ///
+    /// The caller has proven the section is the one the marker log's
+    /// `CLEAN` vouches for, against files of the identity it records; this
+    /// checks only what the section itself says.
+    pub fn load_sealed(&self, buf: &[u8], now_slots: u64) -> Result<(TableFilters, u64), persist::LoadReject> {
+        let expected: Vec<(u32, DbType, FilterConfig)> = self
+            .columns
+            .iter()
+            .map(|c| {
+                let c = c.read();
+                (c.write_order, c.db_type.clone(), *c.config())
+            })
+            .collect();
+        let loaded = persist::deserialize_columns(buf, self.seed, &expected, now_slots)?;
+        // A sealed image has no delta records; one that replays any is not
+        // what `serialize_sealed` wrote.
+        if loaded.deltas != 0 {
+            return Err(persist::LoadReject::Truncated);
+        }
+        let mut columns = Vec::with_capacity(loaded.columns.len());
+        for col in loaded.columns {
+            columns.push(RwLock::new(col));
+        }
+        let meta = Self::meta_of(&columns);
+        let filters = Self {
+            cfg: self.cfg,
+            seed: self.seed,
+            columns,
+            meta,
+            lookup: self.lookup.clone(),
+            writes_since_checkpoint: AtomicU64::new(0),
+            slots_at_checkpoint: AtomicU64::new(loaded.n_slots),
+            disk_dirty: AtomicBool::new(false),
+            dirty_marking: tokio::sync::Mutex::new(()),
+            checkpoint_requested: AtomicBool::new(false),
+            // Nothing on disk for `mark_disk_dirty` to invalidate: the
+            // snapshot is the marker log's to revoke, never the filter's.
+            has_checkpoint: AtomicBool::new(false),
+            disk_len: AtomicU64::new(0),
+            deltas_since_base: AtomicU32::new(0),
+            write_gate: tokio::sync::Mutex::new(()),
+            renumber_epoch: AtomicU64::new(0),
+        };
+        Ok((filters, loaded.cleared_below))
+    }
+
+    /// Resets every column's checkpoint bookkeeping (`dirty_min`,
+    /// `touched_min`): what a seal does once it has captured the filter
+    /// (§3 step 7, §5), under the seal's transient ticket, since nothing may
+    /// hold one after the `CLEAN`. Only the runtime `_flt.db` checkpoint
+    /// ever read them, and B14 retired it; whether they go is the owner's
+    /// call (§5).
+    pub fn mark_checkpointed(&self, _proof: Proof<'_>) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::mark_checkpointed");
+        for c in &self.columns {
+            c.write().mark_checkpointed();
+        }
+    }
+
+    /// What a snapshot's identity records of this filter's configuration
+    /// (§4, "filter configuration hash equal"): the hash seed, the table's
+    /// width bounds, and per filtered column, in order, its write order,
+    /// type, width bounds, and whether it keeps zone bounds and a span
+    /// summary. A column taken out of the filter, a width changed by `SET
+    /// FILTER`, or a new column all move it. Frozen like the keys: xxh64,
+    /// seed 0, over little-endian fields.
+    pub fn config_hash(&self) -> u64 {
+        let mut b: Vec<u8> = Vec::with_capacity(32 + self.columns.len() * 24);
+        let cfg_bytes = |b: &mut Vec<u8>, c: &FilterConfig| {
+            b.extend_from_slice(&[c.min_f, c.default_f, c.max_f]);
+            b.extend_from_slice(&c.min_selectivity.to_bits().to_le_bytes());
+            b.extend_from_slice(&c.min_table_rows.to_le_bytes());
+        };
+        b.extend_from_slice(&self.seed.k0.to_le_bytes());
+        b.extend_from_slice(&self.seed.k1.to_le_bytes());
+        cfg_bytes(&mut b, &self.cfg);
+        b.extend_from_slice(&(self.columns.len() as u32).to_le_bytes());
+        for c in &self.columns {
+            let c = c.read();
+            b.extend_from_slice(&c.write_order.to_le_bytes());
+            b.push(c.db_type.to_byte());
+            cfg_bytes(&mut b, c.config());
+            b.push(c.zonemap().is_some() as u8);
+            b.push(c.span_summary().is_some() as u8);
+        }
+        crate::core::hash::xxh64(&b, 0)
     }
 
     /// Decide between rewriting the base image and appending a delta, produce
@@ -433,11 +765,17 @@ impl TableFilters {
             // anything, and folding it into a fresh base image shortens the
             // chain. Half is the point where the next full rewrite would have
             // cost the same anyway.
-            if bytes.len() as u64 * 2 >= at { None } else { Some(bytes) }
+            if bytes.len() as u64 * 2 >= at {
+                None
+            } else {
+                Some(bytes)
+            }
         };
 
         let is_base = plan.is_none();
-        let mut bytes = plan.take().unwrap_or_else(|| persist::serialize(&refs, self.seed, n_slots));
+        let mut bytes = plan
+            .take()
+            .unwrap_or_else(|| persist::serialize(&refs, self.seed, n_slots));
         let offset = if is_base { 0 } else { at };
         let end = offset + bytes.len() as u64;
         persist::terminate(&mut bytes);
@@ -471,16 +809,51 @@ impl TableFilters {
     /// replay. A `DELETE` reaches that last case by construction: it invalidates
     /// slots near the start, so its "tail" is the whole file.
     pub async fn checkpoint<S: StorageIO>(&self, io: &S, n_slots: u64) {
+        if let Err(e) = self.try_checkpoint(io, n_slots).await {
+            log::error!(
+                "filter checkpoint failed; the next mutation marks the sidecar dirty and the next checkpoint rewrites it: {}",
+                e
+            );
+        }
+    }
+
+    /// [`TableFilters::checkpoint`], returning the write's error.
+    ///
+    /// A checkpoint is reported done only once its record is durable. A failed
+    /// one may still have landed, or may land later: the KV provider reports a
+    /// put that may yet arrive, a mirror has written its backups before the
+    /// primary's commit fails, and a log-less file has the bytes when its
+    /// flush fails. So after a failure the dirty byte on disk is unknown, not
+    /// unchanged, and the next mutation has to write it: `has_checkpoint` is
+    /// set and `disk_dirty` cleared, as after a success. The pending request
+    /// stays, so the next tick tries again.
+    pub async fn try_checkpoint<S: StorageIO>(&self, io: &S, n_slots: u64) -> std::io::Result<()> {
         // Planning and writing have to be one step: see `write_gate`.
         let _gate = self.write_gate.lock().await;
         if let Some((offset, bytes, _is_base)) = self.plan(n_slots) {
-            io.write_data(offset, &bytes).await;
+            // Test-only: parks a planned checkpoint before its write.
+            #[cfg(test)]
+            checkpoint_test_hooks::planned(self).await;
+            if let Err(e) = persist::write_durably(io, offset, &bytes).await {
+                // `plan` already counted this record as written: the columns
+                // are marked checkpointed and `disk_len` is past it. A delta
+                // planned from there would land beyond bytes that never did,
+                // or inside older records, so the next record is a base image.
+                self.disk_len.store(0, Ordering::Relaxed);
+                // What landed is unknown: a clean base image may be on disk.
+                // These make `mark_disk_dirty` write the byte again before the
+                // next mutation changes a row.
+                self.disk_dirty.store(false, Ordering::Relaxed);
+                self.has_checkpoint.store(true, Ordering::Release);
+                return Err(e);
+            }
         }
         self.writes_since_checkpoint.store(0, Ordering::Relaxed);
         self.slots_at_checkpoint.store(n_slots, Ordering::Relaxed);
         self.disk_dirty.store(false, Ordering::Relaxed);
         self.checkpoint_requested.store(false, Ordering::Relaxed);
         self.has_checkpoint.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Mark the on-disk copy stale before mutating already-checkpointed rows.
@@ -493,10 +866,18 @@ impl TableFilters {
         if !self.has_checkpoint.load(Ordering::Acquire) {
             return;
         }
-        if self.disk_dirty.swap(true, Ordering::Relaxed) {
+        // Set only once the byte is written. Updates no longer all take
+        // turns: one that found the flag set before the byte landed would
+        // write rows a crash could pair with a checkpoint still marked clean.
+        if self.disk_dirty.load(Ordering::Acquire) {
+            return;
+        }
+        let _marking = self.dirty_marking.lock().await;
+        if self.disk_dirty.load(Ordering::Acquire) {
             return;
         }
         persist::mark_dirty_on_disk(io).await;
+        self.disk_dirty.store(true, Ordering::Release);
     }
 
     /// Ask the maintenance task to checkpoint at its next tick.
@@ -581,6 +962,15 @@ impl TableFilters {
         if column.valid_upto() < n_slots {
             return false;
         }
+        // And vouch for them. A demoted prefix (a renumbering began, and
+        // perhaps failed part-way) leaves the frontier where it was, but the
+        // zone bounds below it describe rows by slots they may no longer
+        // occupy: a zone that read as ascending can now hold rows moved in
+        // from a later zone, and `ORDER BY … LIMIT k` bounded by it would
+        // return the wrong rows.
+        if column.unknown_below() > 0 {
+            return false;
+        }
         column
             .zonemap()
             .is_some_and(|zm| zm.is_monotonic_ascending(zonemap::zones_for(n_slots)))
@@ -591,22 +981,198 @@ impl TableFilters {
         self.index_of(write_order).is_some()
     }
 
+    /// Whether `col = value` keeps `slot` a candidate in the column at
+    /// `write_order` (see [`ColumnFilter::admits_eq`]); `None` for a column
+    /// this filter does not index. Read-only.
+    ///
+    /// The superset invariant, per row: a visible row's own value must be
+    /// admitted at its slot, or an equality on that value prunes the row.
+    /// The index snapshot's audit asks exactly this of every visible row
+    /// (docs/persistent-indexes.md §4, B18).
+    pub fn admits_eq(&self, write_order: u32, slot: u64, value: &[u8], n_slots: u64) -> Option<bool> {
+        let idx = self.index_of(write_order)?;
+        Some(self.columns[idx].read().admits_eq(slot, value, n_slots))
+    }
+
     /// Mark slots `[0, slots)` as predating the filter. They stay candidates
     /// until [`Self::clear_unindexed_prefix`] follows a backfill.
-    pub fn set_unindexed_prefix(&self, slots: u64) {
+    pub fn set_unindexed_prefix(&self, _proof: Proof<'_>, slots: u64) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::set_unindexed_prefix");
         for c in &self.columns {
             c.write().set_unindexed_prefix(slots);
         }
     }
 
-    pub fn clear_unindexed_prefix(&self) {
+    pub fn clear_unindexed_prefix(&self, _proof: Proof<'_>) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::clear_unindexed_prefix");
         for c in &self.columns {
             c.write().clear_unindexed_prefix();
         }
     }
 
+    /// See [`TableFilters::begin_renumbering`].
+    #[inline]
+    pub fn renumber_epoch(&self) -> u64 {
+        self.renumber_epoch.load(Ordering::Acquire)
+    }
+
+    /// Called before the first slot is renumbered. Every slot below `n_slots`
+    /// becomes a candidate again, in memory and in every checkpoint written
+    /// from here on (the prefix is persisted, so a reopened table backfills
+    /// it), until a backfill under the new numbering clears it with
+    /// [`TableFilters::clear_unindexed_prefix_at`]. A renumbering that fails
+    /// part-way therefore leaves the filter demoted rather than answering by
+    /// slot numbers that moved.
+    ///
+    /// The epoch is bumped before the columns are demoted, and each column's
+    /// lock is taken after the bump, so an epoch-checked write that saw the
+    /// old epoch has landed before the demotion and before any slot moves.
+    pub fn begin_renumbering(&self, _proof: Proof<'_>, n_slots: u64) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::begin_renumbering");
+        // To the next odd value: always a change, always "running".
+        let _ = self
+            .renumber_epoch
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |e| Some((e | 1) + 2 * (e & 1)));
+        for c in &self.columns {
+            let mut c = c.write();
+            c.demote_below(n_slots);
+            c.forget_backfill_writes();
+        }
+    }
+
+    /// [`TableFilters::begin_renumbering`], ordered against checkpoints, with
+    /// the sidecar's dirty byte written whatever the in-memory flag says.
+    ///
+    /// Under `write_gate`, so a checkpoint planned before this (a base image
+    /// of the old numbering, which then clears `disk_dirty`) has landed before
+    /// the byte is written, and one planned after it sees the demotion and
+    /// persists it. Without the gate the flag can read true while such a
+    /// checkpoint is about to clear it, which is the case
+    /// [`TableFilters::mark_disk_dirty`]'s fast path skips; the byte is
+    /// written unconditionally here so this does not lean on the flag. A crash
+    /// part-way through the renumbering then reopens to a sidecar that is
+    /// either rejected or demoted, never one that trusts the old numbering.
+    pub async fn begin_renumbering_on_disk<S: StorageIO>(
+        &self,
+        proof: Proof<'_>,
+        io: &S,
+        n_slots: u64,
+    ) {
+        crate::core::index_store::census::mutation(proof, self as *const Self as usize, "TableFilters::begin_renumbering_on_disk");
+        let _gate = self.write_gate.lock().await;
+        self.begin_renumbering(proof, n_slots);
+        if self.has_checkpoint.load(Ordering::Acquire) {
+            let _marking = self.dirty_marking.lock().await;
+            persist::mark_dirty_on_disk(io).await;
+            self.disk_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// Called once slot numbers have stopped changing, whether the
+    /// renumbering finished or failed: work that read its epoch during it
+    /// read a mix of both numberings.
+    pub fn end_renumbering(&self, _proof: Proof<'_>) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::end_renumbering");
+        // To the next even value: always a change, never "running".
+        let _ = self
+            .renumber_epoch
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |e| Some((e + 2) & !1));
+        for c in &self.columns {
+            c.write().forget_backfill_writes();
+        }
+    }
+
+    /// Starts keeping every slot a writer sets from the backfill about to
+    /// run (`ColumnFilter::written_during_backfill`), until the guard drops.
+    /// Taken before the backfill reads its first row.
+    pub fn watch_writers(&self, _proof: Proof<'_>) -> BackfillWatch<'_> {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::watch_writers");
+        for c in &self.columns {
+            c.write().begin_backfill();
+        }
+        BackfillWatch { filters: self }
+    }
+
+    /// [`TableFilters::clear_unindexed_prefix`], unless the slots were
+    /// renumbered since `epoch` was read. Returns whether every column was
+    /// cleared.
+    pub fn clear_unindexed_prefix_at(&self, _proof: Proof<'_>, epoch: u64) -> bool {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::clear_unindexed_prefix_at");
+        if renumbering(epoch) {
+            return false;
+        }
+        for c in &self.columns {
+            let mut g = c.write();
+            if self.renumber_epoch() != epoch {
+                return false;
+            }
+            g.clear_unindexed_prefix();
+        }
+        true
+    }
+
+    /// Clears every slot in `runs` (`(first, count)` pairs), unless the slots
+    /// were renumbered since `epoch` was read. Vacuum's deferred clears: the
+    /// slot numbers come from a sweep that read `epoch` before it started.
+    /// Returns whether the clears were applied.
+    ///
+    /// Each column's lock is yielded to waiting inserts and queries every
+    /// [`CLEAR_CHUNK`] slots, and the epoch checked again after each, so a
+    /// large scattered delete does not hold a column for the whole list. Any
+    /// clears applied before a `false` return are still sound: each chunk was
+    /// checked under the numbering it was written in, and the caller re-clears
+    /// on the next sweep.
+    pub fn on_delete_runs_at(&self, _proof: Proof<'_>, epoch: u64, runs: &[(u64, u64)]) -> bool {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::on_delete_runs_at");
+        if renumbering(epoch) {
+            return false;
+        }
+        for cell in &self.columns {
+            let mut g = cell.write();
+            if self.renumber_epoch() != epoch {
+                return false;
+            }
+            let mut in_chunk = 0u64;
+            for &(first, count) in runs {
+                let end = first + count;
+                let mut slot = first;
+                while slot < end {
+                    let stop = end.min(slot + (CLEAR_CHUNK - in_chunk));
+                    for s in slot..stop {
+                        g.set(s, None);
+                    }
+                    in_chunk += stop - slot;
+                    slot = stop;
+                    if in_chunk == CLEAR_CHUNK {
+                        in_chunk = 0;
+                        parking_lot::RwLockWriteGuard::bump(&mut g);
+                        if self.renumber_epoch() != epoch {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        self.note_writes(runs.iter().map(|r| r.1).sum());
+        true
+    }
+
     pub fn is_complete(&self) -> bool {
         self.columns.iter().all(|c| c.read().is_complete())
+    }
+
+    /// Whether any slot in `runs` (`(first, count)` pairs) still holds a
+    /// fingerprint in any column: whether [`TableFilters::on_delete_runs_at`]
+    /// would change anything. Read-only. Vacuum asks it before it takes a
+    /// write ticket for its clears (docs/persistent-indexes.md §2, RV2), so a
+    /// sweep that would only re-clear empty codes (the first after a reopen)
+    /// takes none and writes nothing.
+    pub fn any_codes_in_runs(&self, runs: &[(u64, u64)]) -> bool {
+        self.columns.iter().any(|cell| {
+            let g = cell.read();
+            runs.iter()
+                .any(|&(first, count)| (first..first.saturating_add(count)).any(|s| g.holds_code(s)))
+        })
     }
 
     /// Index every column of a freshly written row.
@@ -614,7 +1180,8 @@ impl TableFilters {
     /// Columns absent from `row_write` are explicitly cleared rather than left
     /// alone: a slot that is reused by a relocating update must not keep the
     /// previous occupant's fingerprint.
-    pub fn on_insert(&self, slot: u64, row_write: &RowWrite) {
+    pub fn on_insert(&self, _proof: Proof<'_>, slot: u64, row_write: &RowWrite) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::on_insert");
         for (i, m) in self.meta.iter().enumerate() {
             // Both of these used to run inside the lock. Finding the payload is
             // a scan of the row's columns, which made maintenance quadratic in
@@ -659,7 +1226,8 @@ impl TableFilters {
     /// immutable, and here they are not. `UPDATE`, `DELETE`, backfill and
     /// reclamation all write into zones long past the frontier, so there is no
     /// immutable tail to publish by pointer swap.
-    pub fn on_insert_batch(&self, rows: &[(u64, &RowWrite)]) {
+    pub fn on_insert_batch(&self, _proof: Proof<'_>, rows: &[(u64, &RowWrite)]) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::on_insert_batch");
         if rows.is_empty() {
             return;
         }
@@ -691,7 +1259,8 @@ impl TableFilters {
 
     /// Clear every column at `slot`. Exact — unlike a Bloom filter, deleting
     /// *improves* the false-positive rate rather than degrading it.
-    pub fn on_delete(&self, slot: u64) {
+    pub fn on_delete(&self, _proof: Proof<'_>, slot: u64) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::on_delete");
         for cell in &self.columns {
             cell.write().set(slot, None);
         }
@@ -712,7 +1281,11 @@ impl TableFilters {
                 // Width 0 means "no fingerprint planes". Two ways to get there:
                 // a gated-out column, maintained but not probed, and a
                 // bounds-only column that never had planes to begin with.
-                let f = if g.is_gated_out() || !g.has_fingerprints() { 0 } else { g.current_f() };
+                let f = if g.is_gated_out() || !g.has_fingerprints() {
+                    0
+                } else {
+                    g.current_f()
+                };
                 (g.write_order, f, g.estimated_distinct(), g.bytes())
             })
             .collect()
@@ -729,7 +1302,12 @@ impl TableFilters {
         let words = bitmap_words(n_slots);
         let mut scratch = vec![0u64; words];
         self.eval(&program.root, n_slots, &mut scratch)
-            .map(|words| CandidateBitmap { words, n_slots })
+            .map(|words| CandidateBitmap {
+                words,
+                n_slots,
+                nothing: false,
+                sparse: None,
+            })
     }
 
     /// Evaluate one node. `None` means "all ones" — no information — which is
@@ -755,7 +1333,9 @@ impl TableFilters {
             MaskExpr::And(branches) => {
                 let mut acc: Option<Vec<u64>> = None;
                 for b in branches {
-                    let Some(m) = self.eval(b, n_slots, scratch) else { continue };
+                    let Some(m) = self.eval(b, n_slots, scratch) else {
+                        continue;
+                    };
                     match acc.as_mut() {
                         Some(a) => {
                             for (d, s) in a.iter_mut().zip(m.iter()) {
@@ -770,6 +1350,12 @@ impl TableFilters {
 
             // Union: a single unknown branch makes the whole union unknown, so
             // bail as soon as one appears rather than building a full bitmap.
+            //
+            // An `IN` list arrives as an `Or` of equalities on one column, and
+            // gets a path of its own — see `eval_in_list`.
+            MaskExpr::Or(branches) if in_list_column(branches).is_some() => {
+                self.eval_in_list(branches, n_slots, scratch)
+            }
             MaskExpr::Or(branches) => {
                 let mut acc: Option<Vec<u64>> = None;
                 for b in branches {
@@ -788,9 +1374,93 @@ impl TableFilters {
         }
     }
 
+    /// The mask for `col IN (v1, …, vN)`: an `Or` whose every branch is
+    /// `col = v` on the same column.
+    ///
+    /// The general `Or` evaluates each branch into a fresh bitmap — a probe and
+    /// a full-bitmap copy per value, so a 50,000-value list over a million rows
+    /// copied ~6 GB to build one mask. Here a short list ORs its probes into
+    /// one accumulator with no copies, and a long one (more than
+    /// [`IN_LIST_PROBE_MAX`] values) is bounded by the list's `[min, max]`
+    /// instead: every matching row lies in that range, so the zones the range
+    /// rules out hold no match. Coarser than the probes, never unsound — and
+    /// any value or column the index cannot speak for makes the whole list
+    /// "no information", as one unknown branch does for `Or`.
+    fn eval_in_list(
+        &self,
+        branches: &[sarg::MaskExpr],
+        n_slots: u64,
+        scratch: &mut [u64],
+    ) -> Option<Vec<u64>> {
+        let write_order = in_list_column(branches)?;
+        let values: Vec<&[u8]> = branches
+            .iter()
+            .filter_map(|b| match b {
+                sarg::MaskExpr::Pred(p) => Some(p.value.as_slice()),
+                _ => None,
+            })
+            .collect();
+        let idx = self.index_of(write_order)?;
+        let guard = self.columns[idx].read();
+
+        if values.len() <= IN_LIST_PROBE_MAX {
+            let mut acc = vec![0u64; scratch.len()];
+            for v in &values {
+                if !guard.probe_pred_into(SargOp::Eq, v, n_slots, scratch) {
+                    return None;
+                }
+                for (d, s) in acc.iter_mut().zip(scratch.iter()) {
+                    *d |= *s;
+                }
+            }
+            return Some(acc);
+        }
+
+        // The list's bounds in the column's own order — the order the zone
+        // bounds were maintained in. A pair the evaluator cannot order gives
+        // up rather than guess.
+        let ty = guard.db_type.clone();
+        let less = |a: &[u8], b: &[u8]| {
+            crate::core::row::logical::perform_comparison_operation(
+                a,
+                b,
+                &ty,
+                &crate::core::processor::transformer::ComparerOperation::Less,
+            )
+            .ok()
+        };
+        let mut lo = values[0];
+        let mut hi = values[0];
+        for v in &values[1..] {
+            if less(v, lo)? {
+                lo = v;
+            }
+            if less(hi, v)? {
+                hi = v;
+            }
+        }
+        if !guard.probe_pred_into(SargOp::Ge, lo, n_slots, scratch) {
+            return None;
+        }
+        let mut acc = scratch.to_vec();
+        if !guard.probe_pred_into(SargOp::Le, hi, n_slots, scratch) {
+            return None;
+        }
+        for (d, s) in acc.iter_mut().zip(scratch.iter()) {
+            *d &= *s;
+        }
+        Some(acc)
+    }
+
     /// Index a row read back from storage, for backfill. `columns` are
     /// `(write_order, bytes)` pairs.
-    pub fn backfill_row(&self, slot: u64, columns: &SmallVec<[(u32, Vec<u8>); 32]>) {
+    pub fn backfill_row(
+        &self,
+        _proof: Proof<'_>,
+        slot: u64,
+        columns: &SmallVec<[(u32, Vec<u8>); 32]>,
+    ) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::backfill_row");
         for (i, m) in self.meta.iter().enumerate() {
             let bytes = columns
                 .iter()
@@ -805,12 +1475,32 @@ impl TableFilters {
     /// A whole-table backfill is the largest batch the engine ever has, and it
     /// is the one place where lock acquisitions dominate rather than merely
     /// appear — see [`Self::on_insert_batch`] for the measurement.
-    pub fn backfill_batch(&self, rows: &[(u64, SmallVec<[(u32, Vec<u8>); 32]>)]) {
+    pub fn backfill_batch(&self, proof: Proof<'_>, rows: &[(u64, SmallVec<[(u32, Vec<u8>); 32]>)]) {
+        crate::core::index_store::census::mutation(proof, self as *const Self as usize, "TableFilters::backfill_batch");
+        self.backfill_batch_at(proof, self.renumber_epoch(), rows);
+    }
+
+    /// [`TableFilters::backfill_batch`], unless the slots were renumbered
+    /// since `epoch` was read: rows read under one numbering must not be
+    /// written under another. Returns whether the batch was applied.
+    pub(crate) fn backfill_batch_at(
+        &self,
+        _proof: Proof<'_>,
+        epoch: u64,
+        rows: &[(u64, SmallVec<[(u32, Vec<u8>); 32]>)],
+    ) -> bool {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableFilters::backfill_batch_at");
+        if renumbering(epoch) {
+            return false;
+        }
         if rows.is_empty() {
-            return;
+            return self.renumber_epoch() == epoch;
         }
         for (i, m) in self.meta.iter().enumerate() {
             let mut f = self.columns[i].write();
+            if self.renumber_epoch() != epoch {
+                return false;
+            }
             for (slot, columns) in rows {
                 let bytes = columns
                     .iter()
@@ -818,6 +1508,97 @@ impl TableFilters {
                     .map(|(_, b)| b.as_slice());
                 f.set_reindex(*slot, bytes);
             }
+            f.backfill_batch_applied();
+        }
+        true
+    }
+}
+
+/// A backfill's hold on [`TableFilters::watch_writers`].
+pub struct BackfillWatch<'a> {
+    filters: &'a TableFilters,
+}
+
+impl Drop for BackfillWatch<'_> {
+    fn drop(&mut self) {
+        for c in &self.filters.columns {
+            c.write().end_backfill();
+        }
+    }
+}
+
+/// Whether `epoch` (a [`TableFilters::renumber_epoch`]) was read while slots
+/// were being renumbered. Work that read it cannot publish what it learned
+/// even while the epoch is unchanged: the renumbering it overlapped has not
+/// ended yet, and the planes it would write, or the prefix it would clear,
+/// would then outlive a renumbering that fails part-way, vouching for rows
+/// read before they moved.
+#[inline]
+pub fn renumbering(epoch: u64) -> bool {
+    epoch & 1 == 1
+}
+
+/// The longest `IN` list whose values are probed one by one; past it the
+/// list's `[min, max]` range is used. See `TableFilters::eval_in_list`.
+pub const IN_LIST_PROBE_MAX: usize = 64;
+
+/// The column an `Or` tests when every branch is `col = v` on that one column
+/// — the shape `x IN (…)` lowers to — with at least two branches.
+fn in_list_column(branches: &[sarg::MaskExpr]) -> Option<u32> {
+    if branches.len() < 2 {
+        return None;
+    }
+    let mut column = None;
+    for b in branches {
+        let sarg::MaskExpr::Pred(p) = b else {
+            return None;
+        };
+        if p.op != SargOp::Eq || column.is_some_and(|c| c != p.write_order) {
+            return None;
+        }
+        column = Some(p.write_order);
+    }
+    column
+}
+
+/// Parks one planned checkpoint of a chosen `TableFilters` between its plan
+/// and its write, for tests that need something to happen in that window.
+#[cfg(test)]
+pub(crate) mod checkpoint_test_hooks {
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    pub(crate) struct Park {
+        /// Notified once the checkpoint has planned and is parked.
+        pub planned: tokio::sync::Notify,
+        /// Notify to let it write.
+        pub release: tokio::sync::Notify,
+    }
+
+    static PARK: parking_lot::Mutex<Option<(usize, Arc<Park>)>> = parking_lot::Mutex::new(None);
+
+    /// Parks the next checkpoint of `filters` that has something to write.
+    /// Unused since persistent indexes B14 retired the table's runtime
+    /// checkpoint (its one test was of `_flt.db`); kept with the library
+    /// checkpoint it parks, whose removal is the owner's call.
+    #[allow(dead_code)]
+    pub(crate) fn arm(filters: &super::TableFilters) -> Arc<Park> {
+        let park = Arc::new(Park::default());
+        *PARK.lock() = Some((filters as *const _ as usize, park.clone()));
+        park
+    }
+
+    pub(super) async fn planned(filters: &super::TableFilters) {
+        let park = {
+            let mut g = PARK.lock();
+            match g.as_ref() {
+                Some((at, _)) if *at == filters as *const _ as usize => g.take().map(|(_, p)| p),
+                _ => None,
+            }
+        };
+        if let Some(park) = park {
+            park.planned.notify_one();
+            park.release.notified().await;
         }
     }
 }
@@ -914,5 +1695,91 @@ mod leading_mask_tests {
         predicate.intersect(&ceiling);
         assert_eq!(predicate.count(), 64);
         assert!(predicate.get(63) && !predicate.get(64));
+    }
+}
+
+/// The `IN`-list mask: the general `Or` (a probe and a full-bitmap copy per
+/// value — the path every list took before) against `eval_in_list`.
+///
+/// `cargo test --release -p rasterizeddb_core --lib -- --ignored in_list_mask_bench --nocapture`
+#[cfg(test)]
+mod in_list_mask_bench {
+    use super::*;
+    use crate::core::index_store::gate::test_mint;
+    use smallvec::SmallVec;
+
+    impl TableFilters {
+        /// The `Or` arm as it was, kept as the reference for the measurement
+        /// and the agreement check below.
+        fn eval_general_or(&self, branches: &[sarg::MaskExpr], n_slots: u64) -> Option<Vec<u64>> {
+            let mut scratch = vec![0u64; bitmap_words(n_slots)];
+            let mut acc: Option<Vec<u64>> = None;
+            for b in branches {
+                let m = self.eval(b, n_slots, &mut scratch)?;
+                match acc.as_mut() {
+                    Some(a) => {
+                        for (d, s) in a.iter_mut().zip(m.iter()) {
+                            *d |= *s;
+                        }
+                    }
+                    None => acc = Some(m),
+                }
+            }
+            acc
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn in_list_mask_bench() {
+        let ticket = test_mint();
+        let proof = Proof::from(&ticket);
+        const N: u64 = 1_000_000;
+        let field = SchemaField::new("x".to_string(), DbType::I64, 8, 0, 0, false);
+        let filters = TableFilters::new(&[field], FilterConfig::default());
+        // Clustered values (the common case of an id), so ranges can prune.
+        let rows: Vec<(u64, SmallVec<[(u32, Vec<u8>); 32]>)> = (0..N)
+            .map(|slot| {
+                let mut c: SmallVec<[(u32, Vec<u8>); 32]> = SmallVec::new();
+                c.push((0, (slot as i64).to_le_bytes().to_vec()));
+                (slot, c)
+            })
+            .collect();
+        filters.backfill_batch(proof, &rows);
+        filters.clear_unindexed_prefix(proof);
+        for n in [10usize, 1_000, 50_000] {
+            // Values spread over a tenth of the table.
+            let branches: Vec<sarg::MaskExpr> = (0..n)
+                .map(|i| {
+                    sarg::MaskExpr::Pred(sarg::SargPredicate {
+                        write_order: 0,
+                        op: SargOp::Eq,
+                        value: (((i as u64 * 100_003) % (N / 10)) as i64).to_le_bytes().to_vec(),
+                    })
+                })
+                .collect();
+            // The general Or at 50,000 values takes many seconds; once is enough.
+            let rounds = if n >= 50_000 { 1 } else { 3 };
+            for round in 0..rounds {
+                let t = std::time::Instant::now();
+                let old = self::TableFilters::eval_general_or(&filters, &branches, N);
+                let old_t = t.elapsed();
+                let t = std::time::Instant::now();
+                let mut scratch = vec![0u64; bitmap_words(N)];
+                let new = filters.eval_in_list(&branches, N, &mut scratch);
+                let new_t = t.elapsed();
+                let (o, w) = (old.unwrap(), new.unwrap());
+                // Sound: everything the old mask admitted, the new one does.
+                for (a, b) in o.iter().zip(w.iter()) {
+                    assert_eq!(a & !b, 0, "the new mask dropped a candidate");
+                }
+                let ones = |v: &[u64]| v.iter().map(|w| w.count_ones() as u64).sum::<u64>();
+                println!(
+                    "IN of {n:>6} over {N} slots, round {round}: general Or {old_t:>10.2?} ({} candidates), in-list {new_t:>10.2?} ({} candidates)",
+                    ones(&o),
+                    ones(&w)
+                );
+            }
+        }
     }
 }

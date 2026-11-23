@@ -26,6 +26,38 @@ pub struct SortTerm {
     pub nulls_first: Option<bool>,
 }
 
+/// Rewrites `ORDER BY 2` into the select item that position names.
+///
+/// SQL lets a sort key be an ordinal into the select list, and it is how a
+/// hand-written query or a migration script usually spells "sort by the second
+/// column". Resolved here, once, into the item's own label, so every consumer
+/// below — the scan's byte sort, the expression sort, the join, the aggregate
+/// fold — sees an ordinary key and none of them needs to know ordinals exist.
+///
+/// Only a bare integer is one. `ORDER BY 1 + 1` is an expression whose value
+/// happens to be a number, and PostgreSQL treats it as such.
+pub fn resolve_ordinals(terms: &mut [SortTerm], labels: &[String]) -> Result<(), String> {
+    for term in terms.iter_mut() {
+        let trimmed = term.token.trim();
+        if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let position: usize = trimmed
+            .parse()
+            .map_err(|_| format!("ORDER BY position '{}' is not a number", trimmed))?;
+        // One-based, and zero is not a position at all.
+        if position == 0 || position > labels.len() {
+            return Err(format!(
+                "ORDER BY position {} is not in the select list, which has {} item(s)",
+                position,
+                labels.len()
+            ));
+        }
+        term.token = labels[position - 1].clone();
+    }
+    Ok(())
+}
+
 /// Splits a comma-separated list on the commas that sit outside parentheses and
 /// quotes, so `COUNT(a, b)` stays one term.
 fn split_terms(clause: &str) -> Vec<String> {
@@ -84,6 +116,51 @@ fn split_term(term: &str) -> (&str, &str) {
     (term, "")
 }
 
+/// `raw` split into an expression key and its trailing modifiers, when an
+/// arithmetic operator joins its first word to what follows; `None` for a
+/// plain key, which keeps reading the words after it as modifiers.
+fn unparenthesised_expression<'a>(raw: &'a str, first: &str, rest: &str) -> Option<(&'a str, &'a str)> {
+    // Comparisons too: `DISTINCT ON (a > 0) … ORDER BY a > 0, id` sorts by
+    // the boolean `a > 0`.
+    const OPERATORS: &[char] = &['+', '-', '*', '/', '%', '^', '|', '<', '>', '=', '!', '&', '#'];
+    if !(rest.starts_with(OPERATORS) || first.ends_with(OPERATORS)) {
+        return None;
+    }
+    // Top-level words and where each starts, outside quotes and parentheses.
+    let mut starts: Vec<usize> = Vec::new();
+    let (mut depth, mut quote, mut in_word) = (0usize, None::<char>, false);
+    for (i, c) in raw.char_indices() {
+        if !in_word && !c.is_whitespace() && depth == 0 && quote.is_none() {
+            starts.push(i);
+        }
+        match c {
+            '\'' | '"' if quote.is_none() => quote = Some(c),
+            c if Some(c) == quote => quote = None,
+            '(' if quote.is_none() => depth += 1,
+            ')' if quote.is_none() => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        in_word = !(c.is_whitespace() && depth == 0 && quote.is_none());
+    }
+    let word = |k: usize| {
+        let end = starts.get(k + 1).copied().unwrap_or(raw.len());
+        raw[starts[k]..end].trim()
+    };
+    let mut cut = starts.len();
+    if cut >= 2
+        && word(cut - 2).eq_ignore_ascii_case("NULLS")
+        && (word(cut - 1).eq_ignore_ascii_case("FIRST") || word(cut - 1).eq_ignore_ascii_case("LAST"))
+    {
+        cut -= 2;
+    }
+    if cut >= 1 && (word(cut - 1).eq_ignore_ascii_case("ASC") || word(cut - 1).eq_ignore_ascii_case("DESC")) {
+        cut -= 1;
+    }
+    let at = starts.get(cut).copied().unwrap_or(raw.len());
+    let expression = raw[..at].trim();
+    (!expression.is_empty()).then(|| (expression, raw[at..].trim()))
+}
+
 /// End index (exclusive) of the `CASE … END` block opening at the start of
 /// `term`, counting nested blocks. A CASE keeps its arms at paren depth zero,
 /// so the whitespace splitter below would otherwise cut it at its first space.
@@ -126,13 +203,27 @@ pub fn parse(clause: &str) -> Result<Vec<SortTerm>, String> {
         if raw.is_empty() {
             return Err("ORDER BY has an empty sort key".to_string());
         }
-        let (token, rest) = if raw.to_ascii_uppercase().starts_with("CASE ") {
+        let parenthesised;
+        // Any whitespace after the keyword, a line break included.
+        let (token, rest) = if raw.get(..4).is_some_and(|w| w.eq_ignore_ascii_case("CASE"))
+            && raw[4..].starts_with(|c: char| c.is_ascii_whitespace())
+        {
             match case_block_end(raw) {
                 Some(end) => (&raw[..end], raw[end..].trim()),
                 None => return Err("ORDER BY has a CASE with no END".to_string()),
             }
         } else {
-            split_term(raw)
+            let (first, rest) = split_term(raw);
+            match unparenthesised_expression(raw, first, rest) {
+                // `n * 2 + 1 DESC` is the key `n * 2 + 1`, sorted the way
+                // its parenthesised form already was. Split at the first
+                // space it was `n`, then "expects ASC or DESC, found '*'".
+                Some((expression, modifiers)) => {
+                    parenthesised = format!("({})", expression);
+                    (parenthesised.as_str(), modifiers)
+                }
+                None => (first, rest),
+            }
         };
         if token.is_empty() {
             return Err("ORDER BY has an empty sort key".to_string());
@@ -161,7 +252,7 @@ pub fn parse(clause: &str) -> Result<Vec<SortTerm>, String> {
                         return Err(format!(
                             "ORDER BY '{}' has NULLS without FIRST or LAST",
                             token
-                        ))
+                        ));
                     }
                 }
             } else if direction_given {
@@ -262,7 +353,10 @@ mod tests {
     fn an_aggregate_call_survives_the_split() {
         assert_eq!(
             keys("COUNT(*) DESC, status"),
-            vec![("COUNT(*)".to_string(), true), ("status".to_string(), false)]
+            vec![
+                ("COUNT(*)".to_string(), true),
+                ("status".to_string(), false)
+            ]
         );
     }
 
@@ -277,7 +371,23 @@ mod tests {
         let t = parse("salary DESC NULLS FIRST").unwrap();
         assert_eq!(t[0].nulls_first, Some(true));
         assert!(t[0].descending);
-        assert!(parse("salary NULLS SIDEWAYS").unwrap_err().contains("FIRST or LAST"));
+        assert!(
+            parse("salary NULLS SIDEWAYS")
+                .unwrap_err()
+                .contains("FIRST or LAST")
+        );
+    }
+
+    /// An expression needs no parentheses: its modifiers are read from the
+    /// end, and the key is the parenthesised form the sort already knows.
+    #[test]
+    fn an_unparenthesised_expression_is_one_key() {
+        assert_eq!(keys("n * 2 + 1"), vec![("(n * 2 + 1)".to_string(), false)]);
+        assert_eq!(keys("n * 2 + 1 DESC, id"), vec![("(n * 2 + 1)".to_string(), true), ("id".to_string(), false)]);
+        let t = parse("a - b DESC NULLS LAST").unwrap();
+        assert_eq!((t[0].token.as_str(), t[0].descending, t[0].nulls_first), ("(a - b)", true, Some(false)));
+        assert_eq!(keys("price*qty"), vec![("price*qty".to_string(), false)]);
+        assert_eq!(keys("lower(name) || 'x' ASC"), vec![("(lower(name) || 'x')".to_string(), false)]);
     }
 
     #[test]
@@ -285,7 +395,11 @@ mod tests {
         assert!(parse("").unwrap_err().contains("no field"));
         assert!(parse("a, , b").unwrap_err().contains("empty sort key"));
         assert!(parse("salary UPWARDS").unwrap_err().contains("ASC or DESC"));
-        assert!(parse("salary DESC junk").unwrap_err().contains("unexpected"));
+        assert!(
+            parse("salary DESC junk")
+                .unwrap_err()
+                .contains("unexpected")
+        );
     }
 
     /// A spec that names no key must read back as no keys.

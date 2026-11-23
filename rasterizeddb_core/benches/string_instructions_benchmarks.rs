@@ -1,6 +1,8 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
-use rasterizeddb_core::core::{processor::transformer::ComparerOperation, row::common::simd_compare_strings};
+use rasterizeddb_core::core::{
+    processor::transformer::ComparerOperation, row::common::simd_compare_strings,
+};
 
 use std::{hint::black_box, str};
 

@@ -87,7 +87,9 @@ fn parse_args() -> Args {
     }
 
     if a.mode.is_empty() || a.dir.is_empty() {
-        eprintln!("usage: profile_rw <write|read> --dir PATH [--rows N] [--iters N] [--workload scan|point|narrow|agg|like|all] [--sync on|off] [--cache on|off] [--tune-alloc on|off]");
+        eprintln!(
+            "usage: profile_rw <write|read> --dir PATH [--rows N] [--iters N] [--workload scan|point|narrow|agg|like|all] [--sync on|off] [--cache on|off] [--tune-alloc on|off]"
+        );
         std::process::exit(2);
     }
     a
@@ -174,7 +176,20 @@ async fn write_mode(database: &Arc<Database>, args: &Args) {
 
 async fn read_mode(database: &Arc<Database>, args: &Args) {
     let workloads: Vec<&str> = if args.workload == "all" {
-        vec!["scan", "point", "narrow", "agg", "like"]
+        vec![
+            "scan",
+            "point",
+            "narrow",
+            "agg",
+            "like",
+            "count",
+            "agg_all",
+            "agg_group",
+            "count_where",
+            "count_narrow",
+            "topn",
+            "topn_narrow",
+        ]
     } else {
         vec![args.workload.as_str()]
     };
@@ -250,6 +265,32 @@ fn query_for(workload: &str, i: u64, rows: usize) -> String {
         "agg" => "SELECT COUNT(*), AVG(salary) FROM bench WHERE age > 44".to_string(),
         // String predicate: the SIMD compare path.
         "like" => "SELECT id, name FROM bench WHERE name LIKE '%42'".to_string(),
+        // A full pass that fetches no row payload at all: every slot is walked
+        // and visibility-tested, and nothing else happens. This is the floor
+        // cost of touching a table, and on the 192.168.1.7 node it is ~600 ns
+        // per slot — 580 ms to count a million rows.
+        "count" => "SELECT COUNT(*) FROM bench".to_string(),
+        // Counts with a predicate the batch prefilter decides whole: half the
+        // table, and about one row in a hundred.
+        // Aggregates the fold reads as cells: over every row, and grouped by
+        // an integer key (about fifty groups).
+        "agg_all" => "SELECT COUNT(*), SUM(salary), MIN(age), MAX(age) FROM bench".to_string(),
+        "agg_group" => "SELECT age, COUNT(*), AVG(salary) FROM bench GROUP BY age".to_string(),
+        "count_where" => "SELECT COUNT(*) FROM bench WHERE age > 44".to_string(),
+        "count_narrow" => "SELECT COUNT(*) FROM bench WHERE age = 42 AND salary > 30000.0".to_string(),
+        // `ORDER BY … LIMIT k`. The sort key defeats the early-exit that makes
+        // a bare `LIMIT` cheap, so this pays the full pass above and then keeps
+        // only k rows. Measured on that node: 1.5 ms without the ORDER BY,
+        // ~860 ms with it, on the same million-row table.
+        "topn" => "SELECT id, age, salary, name FROM bench ORDER BY name LIMIT 200".to_string(),
+        // The same shape with the payload narrowed to the sort key alone. If
+        // the cost were the payload rather than the pass, this would be much
+        // cheaper than `topn`; on the live node it was only ~9 % cheaper, which
+        // is what sent this profiling run looking at the pass instead.
+        "topn_narrow" => "SELECT name FROM bench ORDER BY name LIMIT 200".to_string(),
+        // Any statement, for a shape that has no name here yet:
+        // `--workload "sql:SELECT …"`.
+        other if other.starts_with("sql:") => other["sql:".len()..].to_string(),
         other => {
             eprintln!("unknown workload: {other}");
             std::process::exit(2)

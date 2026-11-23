@@ -1,6 +1,6 @@
 use crate::{
     core::{db_type::DbType, processor::transformer::MathOperation},
-    memory_pool::{MemoryBlock, MEMORY_POOL},
+    memory_pool::{MEMORY_POOL, MemoryBlock},
 };
 
 use super::common::{FromF64, FromLeBytes, IntoF64};
@@ -18,6 +18,9 @@ pub trait CheckedArith: Sized {
     fn arith_add(self, rhs: Self) -> Option<Self>;
     fn arith_sub(self, rhs: Self) -> Option<Self>;
     fn arith_mul(self, rhs: Self) -> Option<Self>;
+    /// The caller has refused a zero divisor; what is left to refuse is the
+    /// one quotient that does not fit, `MIN / -1`.
+    fn arith_div(self, rhs: Self) -> Option<Self>;
 }
 
 macro_rules! impl_checked_arith_int {
@@ -30,6 +33,8 @@ macro_rules! impl_checked_arith_int {
                 fn arith_sub(self, rhs: Self) -> Option<Self> { self.checked_sub(rhs) }
                 #[inline(always)]
                 fn arith_mul(self, rhs: Self) -> Option<Self> { self.checked_mul(rhs) }
+                #[inline(always)]
+                fn arith_div(self, rhs: Self) -> Option<Self> { self.checked_div(rhs) }
             }
         )*
     };
@@ -45,6 +50,8 @@ macro_rules! impl_checked_arith_float {
                 fn arith_sub(self, rhs: Self) -> Option<Self> { Some(self - rhs) }
                 #[inline(always)]
                 fn arith_mul(self, rhs: Self) -> Option<Self> { Some(self * rhs) }
+                #[inline(always)]
+                fn arith_div(self, rhs: Self) -> Option<Self> { Some(self / rhs) }
             }
         )*
     };
@@ -60,12 +67,56 @@ impl_checked_arith_float!(f32, f64);
 /// The function uses a generic approach to handle different numeric types.
 /// `&[u8]` must be in little-endian format.
 #[inline(always)]
+/// An eight-byte little-endian instant, or `None` when the operand is not one.
+fn le_i64(bytes: &[u8]) -> Option<i64> {
+    Some(i64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?))
+}
+
+/// Copies bytes into a pooled block.
+fn block_of(bytes: &[u8]) -> MemoryBlock {
+    let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+    mb.into_slice_mut().copy_from_slice(bytes);
+    mb
+}
+
 pub fn perform_math_operation(
     input1: &[u8],
     input2: &[u8],
     db_type: &DbType,
     operation: &MathOperation,
 ) -> std::result::Result<MemoryBlock, EvalError> {
+    // The temporal operations pair operands of *different* widths on purpose —
+    // an eight-byte instant against a sixteen-byte span — so they are answered
+    // before the equal-width check below.
+    match operation {
+        MathOperation::IntervalBetween => {
+            let (Some(a), Some(b)) = (le_i64(input1), le_i64(input2)) else {
+                return Err(EvalError::OperandSizeMismatch);
+            };
+            let span = crate::core::pg_types::interval_between(a.checked_sub(b).ok_or(EvalError::UnsupportedType)?);
+            return Ok(block_of(&crate::core::pg_types::encode_interval(span)));
+        }
+        MathOperation::ShiftForward | MathOperation::ShiftBackward => {
+            let Some(instant) = le_i64(input1) else {
+                return Err(EvalError::OperandSizeMismatch);
+            };
+            let Some(mut span) = crate::core::pg_types::decode_interval(input2) else {
+                return Err(EvalError::OperandSizeMismatch);
+            };
+            if matches!(operation, MathOperation::ShiftBackward) {
+                span = crate::core::pg_types::Interval {
+                    months: -span.months,
+                    days: -span.days,
+                    micros: -span.micros,
+                };
+            }
+            let shifted = crate::core::pg_types::shift_timestamp(instant, span)
+                .ok_or(EvalError::UnsupportedType)?;
+            return Ok(block_of(&shifted.to_le_bytes()));
+        }
+        _ => {}
+    }
+
     // Checked, not `debug_assert`ed: release builds compile assertions out, and
     // the mismatch then reaches `from_le_bytes`, which panics on a short slice.
     if input1.len() != input2.len() {
@@ -85,10 +136,50 @@ pub fn perform_math_operation(
         DbType::U128 => generic_operation::<u128>(input1, input2, operation),
         DbType::F32 => generic_operation::<f32>(input1, input2, operation),
         DbType::F64 => generic_operation::<f64>(input1, input2, operation),
+        DbType::DECIMAL => decimal_operation(input1, input2, operation),
         // Reported, not panicked: the type comes from a client's query, and a
         // panic here takes down the worker thread evaluating the row.
         _ => Err(EvalError::UnsupportedType),
     }
+}
+
+/// Arithmetic over two `NUMERIC` values, both at the engine scale.
+///
+/// The planner lifts a column read at its declared scale to the engine scale
+/// before it gets here (see `ColumnTransformer::column_1_scale`) and encodes a
+/// literal at the engine scale, so both operands share one. The product and
+/// quotient are the expression evaluator's own (`expr::decimal_mul_engine`),
+/// so `WHERE v * 2 = 200` and `SELECT v * 2` agree to the last digit.
+///
+/// Integer arithmetic on the raw `i128`s was the wrong answer this replaces in
+/// principle — `v * 2` of two scaled values is scaled twice — though in
+/// practice every such predicate was refused before reaching it, the literal
+/// arriving at a different width.
+fn decimal_operation(
+    input1: &[u8],
+    input2: &[u8],
+    operation: &MathOperation,
+) -> std::result::Result<MemoryBlock, EvalError> {
+    let (Ok(a), Ok(b)) = (<[u8; 16]>::try_from(input1), <[u8; 16]>::try_from(input2)) else {
+        return Err(EvalError::OperandSizeMismatch);
+    };
+    let (x, y) = (i128::from_le_bytes(a), i128::from_le_bytes(b));
+    let value = match operation {
+        MathOperation::Add => x.checked_add(y),
+        MathOperation::Subtract => x.checked_sub(y),
+        MathOperation::Multiply => crate::core::rql::expr::decimal_mul_engine(x, y),
+        MathOperation::Divide => {
+            if y == 0 {
+                return Err(EvalError::DivisionByZero);
+            }
+            crate::core::rql::expr::decimal_div_engine(x, y)
+        }
+        // `^` and `|/` over NUMERIC would go through a float here and lose
+        // digits silently; refused instead.
+        _ => return Err(EvalError::UnsupportedType),
+    }
+    .ok_or(EvalError::ArithmeticOverflow)?;
+    Ok(block_of(&value.to_le_bytes()))
 }
 
 #[inline(always)]
@@ -129,8 +220,16 @@ where
             if num2 == T::default() {
                 return Err(EvalError::DivisionByZero);
             }
-            num1 / num2
+            // `-2147483648 / -1` panics in every build profile, and took the
+            // scan worker down with it; PostgreSQL answers it with
+            // `integer out of range`.
+            num1.arith_div(num2).ok_or(EvalError::ArithmeticOverflow)?
         }
+        // Answered before the type dispatch, so reaching them here means the
+        // planner paired a temporal operation with a numeric column.
+        MathOperation::IntervalBetween
+        | MathOperation::ShiftForward
+        | MathOperation::ShiftBackward => return Err(EvalError::UnsupportedType),
         MathOperation::Exponent => {
             let base: f64 = num1.into_f64();
             let exp: f64 = num2.into_f64();
@@ -546,8 +645,8 @@ mod tests {
         let input2_block = to_le_bytes(3i16);
         let input1 = input1_block.into_slice();
         let input2 = input2_block.into_slice();
-        let err = perform_math_operation(input1, input2, &DbType::I32, &MathOperation::Add)
-            .unwrap_err();
+        let err =
+            perform_math_operation(input1, input2, &DbType::I32, &MathOperation::Add).unwrap_err();
         assert_eq!(err, EvalError::OperandSizeMismatch);
     }
 

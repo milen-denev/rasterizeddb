@@ -16,12 +16,14 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use tempfile::TempDir;
 
-use rasterizeddb_core::core::row::row_pointer::{ROW_POINTER_RECORD_LEN, RowPointer, RowPointerIterator};
+use rasterizeddb_core::core::row::row_pointer::{
+    ROW_POINTER_RECORD_LEN, RowPointer, RowPointerIterator,
+};
 use rasterizeddb_core::core::storage_providers::file_sync::LocalStorageProvider;
 use rasterizeddb_core::core::storage_providers::traits::StorageIO;
 
 const FILE_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
-const POINTER_RECORD: usize = 92;             // RowPointer::TOTAL_LENGTH
+const POINTER_RECORD: usize = 92; // RowPointer::TOTAL_LENGTH
 const SCAN_CHUNK: usize = POINTER_RECORD * 3047; // ~280 KiB, the iterator's chunk
 
 fn write_file(path: &std::path::Path, bytes: usize) {
@@ -180,10 +182,10 @@ fn bench_pointer_scan(c: &mut Criterion) {
             .unwrap();
         let mut buf: Vec<u8> = Vec::with_capacity(POINTERS * ROW_POINTER_RECORD_LEN);
         for i in 0..POINTERS as u64 {
-            buf.extend_from_slice(&i.to_le_bytes());              // id
-            buf.extend_from_slice(&64u32.to_le_bytes());          // length
-            buf.extend_from_slice(&(i * 64).to_le_bytes());       // position
-            buf.push(0);                                          // deleted = false
+            buf.extend_from_slice(&i.to_le_bytes()); // id
+            buf.extend_from_slice(&64u32.to_le_bytes()); // length
+            buf.extend_from_slice(&(i * 64).to_le_bytes()); // position
+            buf.push(0); // deleted = false
         }
         file.write_all(&buf).unwrap();
         file.flush().unwrap();

@@ -672,3 +672,71 @@ anyway, for the same reason §9's defaults are pinned — a contract nothing sta
 
 The `WAL commit failed` log line stays alongside the returned error. It is what surfaced the truncation bug from
 a live server, and an operator watching logs should not also have to be reading the client's errors.
+
+## Automatic compaction (2026-11-09)
+
+The reclamation service gives row bytes back but never pointer slots, so a
+table whose rows are updated rather than added to (a heartbeat, a lease, a
+counter) grew its pointer file without bound until someone ran `VACUUM FULL`.
+`core::auto_compact` runs it. Once a minute it looks at every plain table.
+It compacts one whose slots are at least `AUTO_COMPACT_MIN_SLOTS` (20 000)
+and at least `AUTO_COMPACT_RATIO` (8) times its live rows, as the sweep last
+measured them, and no table more often than `AUTO_COMPACT_COOLDOWN_SECS`
+(600). The compaction is the `VACUUM FULL <table>` statement itself, run
+through the executor, so the locking and its interplay with backups and
+replication are an operator's.
+
+Compaction holds ACCESS EXCLUSIVE, so it waits at most 100 ms for the lock.
+A table in use is skipped until the next pass and counted in `SHOW STATS`
+`auto_compactions_skipped_busy`; finished runs are `auto_compactions`. At the
+default floor a run takes about 0.4 s. A database that already holds a
+table far past it (472 k slots on the production node) pays one longer run,
+about 10 s for that table, the first time.
+
+A partitioned table is compacted partition by partition
+(`docs/kv-partitions.md` §3). Every partition open at the pass is measured
+by the same rule, and a due one is compacted alone, under the partitioned
+table's ACCESS EXCLUSIVE with the same 100 ms wait, its cooldown its own. A
+closed partition is not opened for this; it is measured once it is open
+again and a sweep has counted its rows. `AUTO_COMPACT_ENABLED` (default on)
+turns the task off.
+
+### Tunable, and a dead-fraction rule (2026-11-19)
+
+The rule above never fired on a hash-partitioned retention table. A
+32-partition telemetry table at 500 000 rows holds about 15 600 slots a
+partition, 31 % of them dead: under the 20 000-slot floor, and far from 8×
+(that needs 87.5 % dead). Its operator ran a nightly `VACUUM FULL` of every
+partition at once, 5.5 s under ACCESS EXCLUSIVE, because nothing else gave
+the slots back — plain `VACUUM` reuses row bytes, never pointer slots. And
+none of the settings could be changed: they were `OnceLock`s nothing set.
+
+A table or partition is now due when it has at least `min_slots` slots and
+**either** rule holds:
+
+- **amplification**: slots ≥ `ratio` × live rows (an update-heavy table: a
+  heartbeat, a lease, a counter), at any size, as before;
+- **dead fraction**: (slots − live) / slots ≥ `dead_fraction`, on a relation
+  of at most `dead_fraction_max_slots` slots (a retention table, a
+  partition).
+
+| `SET CONFIG` key (hot) | flag | default | why |
+|---|---|---|---|
+| `auto_compact.enabled` | `--auto-compact on\|off` | on | |
+| `auto_compact.interval_secs` | `--auto-compact-interval-secs` | 60 | a change takes effect within 5 s |
+| `auto_compact.min_slots` | `--auto-compact-min-slots` | 2 048 | a ~70 KiB pointer file: below it there is nothing worth stopping a table for |
+| `auto_compact.ratio` | `--auto-compact-ratio` | 8 | unchanged; 0 turns the rule off |
+| `auto_compact.dead_fraction` | `--auto-compact-dead-fraction` | 0.25 | PostgreSQL's autovacuum scale factor is 0.2; at 0.25 a run rewrites at most 4 slots per slot it gives back. 0 turns the rule off |
+| `auto_compact.dead_fraction_max_slots` | `--auto-compact-dead-fraction-max-slots` | 131 072 | a run of about 1.5–2.5 s (11–20 µs a slot measured): a large plain table is not stopped for seconds because a quarter of it turned over, while a partition stays under it up to 4 M rows over 32 partitions. 0 is no limit |
+| `auto_compact.cooldown_secs` | `--auto-compact-cooldown-secs` | 600 | unchanged: bounds how often one table or partition is stopped |
+
+Every key is hot: `SET CONFIG` writes the same atomics the flags seed, and
+each pass reads them afresh. As with every hot key, a change is not
+persisted; add the flag for it to survive a restart. The telemetry
+partitions are due under the defaults (`a_retention_partition_is_due_by_its_dead_fraction`);
+a partition under 2 048 slots, or one a tenth dead, is not
+(`a_small_or_lightly_dead_relation_is_not_due`).
+
+A relation whose dead versions an old snapshot still protects counts them
+dead, and a compaction cannot remove them; such a relation is compacted to
+little effect once per cooldown until the snapshot ends.

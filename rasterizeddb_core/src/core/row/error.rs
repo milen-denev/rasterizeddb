@@ -119,6 +119,46 @@ pub enum EvalError {
     /// `WHERE is_active = true` against an unimplemented type must fail the
     /// query, not the worker evaluating it.
     UnsupportedType,
+    /// The statement outlived `statement_timeout`.
+    ///
+    /// Not an evaluation failure like the others, but it travels the same way:
+    /// the scan reports it through the shared atomic and the statement fails
+    /// with it. That is the whole point — a cancelled scan must surface an
+    /// error, because the alternative is returning the rows it happened to
+    /// reach as though they were the complete answer.
+    StatementTimeout,
+    /// The client that asked for this statement is gone.
+    ClientWentAway,
+    /// A `CancelRequest` with this session's key asked for it to stop.
+    UserCanceled,
+    /// The `WHERE` clause has more comparisons than the compiled boolean
+    /// program can index.
+    ///
+    /// Reported rather than approximated. The index used to be cast to `u16`,
+    /// so a clause with more than 65,535 comparisons wrapped its indices to
+    /// 0, 1, 2 … and produced a *valid-looking* program over the wrong
+    /// comparisons — the predicate silently stopped discriminating and the
+    /// query returned every row. A correlated `EXISTS` materialises one
+    /// comparison per inner row, so any such subquery over a table above that
+    /// size was quietly ignored. The width is now `u32`; this exists so that
+    /// exceeding even that fails the query instead of answering it wrongly.
+    PredicateTooComplex,
+    /// A row's storage was handed to a writer between the scan reading its
+    /// sort key and reading the rest of it.
+    RowMovedUnderScan,
+    /// A `SIMILAR TO` pattern the matcher cannot use. Refused when the
+    /// predicate is planned; this is the safety net at evaluation time.
+    InvalidPattern,
+    /// Matching one value against a `SIMILAR TO` pattern would cost more than
+    /// the matcher allows. PostgreSQL's `54001`.
+    PatternTooComplex,
+    /// An expression evaluated per row in a `WHERE` — a `CASE`, a `||`, a
+    /// `%` — failed for a reason none of the variants above names.
+    ExpressionFailed,
+    /// A `NUMERIC(p, s)` value with more places than the engine's nine, met
+    /// in `WHERE`-clause arithmetic, which runs at nine: refused rather than
+    /// computed without its last digits. PostgreSQL's 0A000 by its words.
+    InexactNumeric,
 }
 
 impl EvalError {
@@ -130,8 +170,24 @@ impl EvalError {
                 "operand size does not match the column type being evaluated"
             }
             EvalError::ArithmeticOverflow => "integer out of range",
-            EvalError::UnsupportedType => {
-                "operation is not supported for this column type"
+            EvalError::UnsupportedType => "operation is not supported for this column type",
+            EvalError::StatementTimeout => "canceling statement due to statement timeout",
+            EvalError::ClientWentAway => {
+                "canceling statement because the client closed the connection"
+            }
+            EvalError::PredicateTooComplex => {
+                "the WHERE clause has too many comparisons to evaluate"
+            }
+            EvalError::RowMovedUnderScan => {
+                "a row was reclaimed while the query was reading it; retry the statement"
+            }
+            EvalError::InvalidPattern => "invalid regular expression in SIMILAR TO",
+            EvalError::PatternTooComplex => crate::core::similar_to::TOO_COMPLEX,
+            EvalError::UserCanceled => "canceling statement due to user request",
+            EvalError::ExpressionFailed => "an expression in the WHERE clause could not be evaluated",
+            EvalError::InexactNumeric => {
+                "a NUMERIC value with more than 9 decimal places cannot be carried exactly by arithmetic \
+                 in a WHERE clause (not supported)"
             }
         }
     }
@@ -145,6 +201,15 @@ impl EvalError {
             EvalError::OperandSizeMismatch => 3,
             EvalError::ArithmeticOverflow => 4,
             EvalError::UnsupportedType => 5,
+            EvalError::StatementTimeout => 6,
+            EvalError::ClientWentAway => 7,
+            EvalError::PredicateTooComplex => 8,
+            EvalError::RowMovedUnderScan => 9,
+            EvalError::InvalidPattern => 10,
+            EvalError::PatternTooComplex => 11,
+            EvalError::UserCanceled => 12,
+            EvalError::ExpressionFailed => 13,
+            EvalError::InexactNumeric => 14,
         }
     }
 
@@ -155,9 +220,53 @@ impl EvalError {
             3 => Some(EvalError::OperandSizeMismatch),
             4 => Some(EvalError::ArithmeticOverflow),
             5 => Some(EvalError::UnsupportedType),
+            6 => Some(EvalError::StatementTimeout),
+            7 => Some(EvalError::ClientWentAway),
+            8 => Some(EvalError::PredicateTooComplex),
+            9 => Some(EvalError::RowMovedUnderScan),
+            10 => Some(EvalError::InvalidPattern),
+            11 => Some(EvalError::PatternTooComplex),
+            12 => Some(EvalError::UserCanceled),
+            13 => Some(EvalError::ExpressionFailed),
+            14 => Some(EvalError::InexactNumeric),
             _ => None,
         }
     }
+}
+
+impl EvalError {
+    /// The variant for an expression evaluator's message, so a division by
+    /// zero inside a `CASE` reports as one rather than as a generic failure.
+    /// The evaluator's errors are text, and only one code crosses the shared
+    /// atomic the scan workers report through.
+    pub fn from_expression(message: &str) -> Self {
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("division by zero") {
+            EvalError::DivisionByZero
+        } else if lower.contains("cannot carry exactly") {
+            EvalError::InexactNumeric
+        } else if lower.contains("out of range") || lower.contains("overflow") {
+            EvalError::ArithmeticOverflow
+        } else {
+            // The message itself cannot cross the one-byte code the scan
+            // workers report through; it is left for the worker that records
+            // this failure ([`take_expression_failure`]), on this thread.
+            LAST_EXPRESSION_FAILURE.with(|m| *m.borrow_mut() = Some(message.to_string()));
+            EvalError::ExpressionFailed
+        }
+    }
+}
+
+thread_local! {
+    static LAST_EXPRESSION_FAILURE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The evaluator's own message for the last [`EvalError::ExpressionFailed`]
+/// made on this thread, taken: "invalid input syntax for type integer:
+/// \"abc\"" rather than the generic text, so the client gets the reason
+/// and its SQLSTATE (22P02) instead of XX000.
+pub fn take_expression_failure() -> Option<String> {
+    LAST_EXPRESSION_FAILURE.with(|m| m.borrow_mut().take())
 }
 
 impl fmt::Display for EvalError {

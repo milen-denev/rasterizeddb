@@ -49,6 +49,37 @@
 //! `file_id` is derived from the file's *name within the database directory*,
 //! never its absolute path, so a database directory can be moved or restored
 //! under a different mount point and its log still replays.
+//!
+//! # Padding
+//!
+//! The file is longer than its records. A record that would grow the file is
+//! preceded by a chunk of zeros past the end ([`crate::WAL_PREALLOC_BYTES`],
+//! 1 MiB), and it and the records after it are written over those zeros. A
+//! sync of a file that grew also commits the filesystem's journal for the new
+//! length, and on ext4 that doubles it: 4.7-4.9 ms against 2.2-2.4 ms for one
+//! small record, measured 2026-11-19, and 135-148 single-row `INSERT`s a
+//! second against 289-353 through the whole engine.
+//!
+//! Nothing in the format changed for it. Replay already stopped at the first
+//! thing that is not a record, and zeros are not one. What changed is every
+//! place that took the end of the file for the end of the log:
+//!
+//! - the append point of a reopened log is the end of its records, found by
+//!   reading them ([`log_extent`]), and a log recovery keeps is resumed at
+//!   the end of the records recovery itself read;
+//! - a tail of nothing but zeros is not a torn tail
+//!   ([`RecoveryStats::truncated_tail`]). Any other byte past the records
+//!   still is, and that log is discarded once replayed, as before. That
+//!   matters more than it did: records now overwrite, so a power cut can
+//!   keep a later page and lose an earlier one, leaving a whole record past
+//!   a gap. Nothing may be appended into such a gap, or the stray record
+//!   could follow the new one exactly and be replayed after it;
+//! - a discarded log is cut to nothing, padding included, in the one change
+//!   of length it always was; the next record pads again.
+//!
+//! A build from before the padding opens such a log safely. It appends at the
+//! end of the file, which only matters if it keeps the log; its recovery sees
+//! the zeros as a torn tail and discards the log once replayed.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -73,6 +104,14 @@ const FORMAT_VERSION: u8 = 1;
 /// id becomes eligible for replay.
 const FLAG_COMMIT: u8 = 1 << 0;
 
+/// Once its transaction commits, every record for this `file_id` logged before
+/// it is void: the file it described was deleted. See [`Wal::forget_files`].
+///
+/// A flag rather than a version bump. A build that predates it reads the
+/// record as a zero-length write and applies nothing, so its replay is the
+/// one it always did rather than a refusal to open the log at all.
+const FLAG_FORGET: u8 = 1 << 1;
+
 /// magic + version + flags + pad + txn + file_id + offset + len + crc
 const HEADER_LEN: usize = 4 + 1 + 1 + 2 + 8 + 8 + 8 + 4 + 4;
 /// Bytes of the header covered by the CRC (everything before the CRC field).
@@ -80,8 +119,18 @@ const HEADER_CRC_LEN: usize = HEADER_LEN - 4;
 
 /// The mark that carries `wal_path`'s commit sequence across a truncation.
 fn lsn_mark_path(wal_path: &Path) -> PathBuf {
+    mark_path(wal_path, LSN_MARK_SUFFIX)
+}
+
+/// The mark that carries `wal_path`'s next transaction id across a
+/// truncation.
+fn txn_mark_path(wal_path: &Path) -> PathBuf {
+    mark_path(wal_path, TXN_MARK_SUFFIX)
+}
+
+fn mark_path(wal_path: &Path, suffix: &str) -> PathBuf {
     let mut name = wal_path.file_name().unwrap_or_default().to_os_string();
-    name.push(LSN_MARK_SUFFIX);
+    name.push(suffix);
     wal_path.with_file_name(name)
 }
 
@@ -92,15 +141,24 @@ fn lsn_mark_path(wal_path: &Path) -> PathBuf {
 /// carries every sequence it has not checkpointed away, and refusing to open a
 /// database over a stray file would be the worse failure.
 fn read_lsn_mark(wal_path: &Path) -> u64 {
-    let path = lsn_mark_path(wal_path);
-    match std::fs::read_to_string(&path) {
+    read_mark(&lsn_mark_path(wal_path), "commit sequence")
+}
+
+/// The first transaction id the last truncation left unissued, or 0 when
+/// there is no usable mark (as [`read_lsn_mark`]).
+fn read_txn_mark(wal_path: &Path) -> u64 {
+    read_mark(&txn_mark_path(wal_path), "transaction id")
+}
+
+fn read_mark(path: &Path, what: &str) -> u64 {
+    match std::fs::read_to_string(path) {
         Ok(text) => match text.trim().parse::<u64>() {
             Ok(lsn) => lsn,
             Err(_) => {
                 log::warn!(
-                    "{} does not hold a commit sequence; the log's own records will have to \
-                     supply it",
-                    path.display()
+                    "{} does not hold a {}; the log's own records will have to supply it",
+                    path.display(),
+                    what
                 );
                 0
             }
@@ -119,20 +177,57 @@ fn read_lsn_mark(wal_path: &Path) -> u64 {
 /// tore across a crash could leave a *lower* number than the one already
 /// issued — which is the one outcome this file exists to prevent.
 fn write_lsn_mark(wal_path: &Path, lsn: u64) -> io::Result<()> {
-    let path = lsn_mark_path(wal_path);
-    let temp = path.with_extension("lsn.partial");
+    write_mark(&lsn_mark_path(wal_path), "lsn.partial", "wal.lsn_mark", lsn)
+}
+
+/// Records `txn` as the floor of the ids a later open hands out, as
+/// [`write_lsn_mark`] does the commit sequence.
+fn write_txn_mark(wal_path: &Path, txn: u64) -> io::Result<()> {
+    write_mark(&txn_mark_path(wal_path), "txn.partial", "wal.txn_mark", txn)
+}
+
+fn write_mark(path: &Path, partial: &str, audit: &'static str, value: u64) -> io::Result<()> {
+    let temp = path.with_extension(partial);
     {
         let mut file = File::create(&temp)?;
-        file.write_all(lsn.to_string().as_bytes())?;
+        file.write_all(value.to_string().as_bytes())?;
+        let _synced = crate::core::sync_audit::note(audit, path);
         file.sync_all()?;
     }
-    std::fs::rename(&temp, &path)?;
-    sync_parent_dir(&path)
+    std::fs::rename(&temp, path)?;
+    sync_parent_dir(path)
 }
 
 /// Refuses absurd record lengths before allocating for them, so a corrupt header
 /// cannot make recovery try to reserve gigabytes.
 const MAX_RECORD_PAYLOAD: usize = 256 * 1024 * 1024;
+
+/// One process-wide order for writers coming to be and for fences being taken:
+/// see [`Incarnation`].
+static INCARNATIONS: AtomicU64 = AtomicU64::new(1);
+
+/// When a file's writer came to be, in the one order [`Wal::forget_files`]
+/// fences are taken in. A writer born before a fence of its file id writes to
+/// the deleted file, and the log refuses its records (see [`Wal::log_from`]):
+/// a record logged after the barrier is not voided by it, and the next open
+/// would write it into whatever file took the name since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Incarnation(u64);
+
+impl Incarnation {
+    /// Exempt from every fence: for callers that are no file's writer.
+    pub const UNFENCED: Incarnation = Incarnation(u64::MAX);
+
+    pub fn new() -> Incarnation {
+        Incarnation(INCARNATIONS.fetch_add(1, Ordering::AcqRel))
+    }
+}
+
+impl Default for Incarnation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Name of the log inside a database directory.
 pub const DEFAULT_WAL_NAME: &str = "rasterized.wal";
@@ -151,6 +246,18 @@ pub const SEGMENT_SUFFIX: &str = ".wseg";
 /// floor, and the records still in the log are anything above it.
 pub const LSN_MARK_SUFFIX: &str = ".lsn";
 
+/// Suffix of the file that carries the next transaction id across a
+/// truncation, as [`LSN_MARK_SUFFIX`] carries the commit sequence.
+///
+/// Ids started again at 1 on every restart after a clean checkpoint, and an
+/// archive joins the logs of several runs end to end. Replay matches a commit
+/// marker to its records by id alone, so a marker of one run committed the
+/// records, and the barriers, of another run's transaction of that id. A
+/// separate file rather than a second number in the commit-sequence mark: a
+/// build that predates it reads that mark as one number, and would lose the
+/// sequence over the extra field.
+pub const TXN_MARK_SUFFIX: &str = ".txn";
+
 /// Extension a segment carries while it is still being copied. Renamed to
 /// [`SEGMENT_SUFFIX`] once complete, so the archiver never uploads a half file.
 pub const SEGMENT_PARTIAL_SUFFIX: &str = ".wseg.partial";
@@ -160,7 +267,16 @@ pub const SEGMENT_PARTIAL_SUFFIX: &str = ".wseg.partial";
 /// Derived from the file name alone, so the id survives the directory being
 /// moved. Renaming a *table* would change it — the engine has no table rename,
 /// and if one is added it must rewrite or checkpoint the log first.
+///
+/// Two names can still share an id. [`Wal::register_file`] refuses the second
+/// one rather than let a replay write one file's records into the other.
 pub fn file_id_for_name(name: &str) -> u64 {
+    // A real 64-bit FNV-1a collision cannot be found by search, so the tests
+    // that need one name it.
+    #[cfg(test)]
+    if let Some(id) = test_hooks::FORCED_FILE_IDS.with(|m| m.borrow().get(name).copied()) {
+        return id;
+    }
     // 64-bit FNV-1a: wider than the CRC32 used for provider hashes, so ids do
     // not start colliding once a database has many files.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -176,6 +292,31 @@ pub fn file_id_for_name(name: &str) -> u64 {
 /// Creating a file writes a directory entry, and that entry is only durable once
 /// the *directory* is flushed. Without this a crash can lose the log file
 /// itself — leaving nothing to replay, which defeats the whole mechanism.
+/// Starts writeback of `len` bytes at `offset` of `file` without waiting
+/// for it (`sync_file_range(SYNC_FILE_RANGE_WRITE)` on Linux, nothing
+/// elsewhere): an index snapshot's capture calls it as it writes, so the
+/// fdatasync after has little left (docs/persistent-indexes.md §3 step 5,
+/// P12). Durability is the fdatasync's; this only spreads the I/O, so its
+/// result is ignored.
+pub fn start_writeback(file: &File, offset: u64, len: u64) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a plain syscall on a descriptor the caller owns; it
+        // reads nothing from this process's memory.
+        unsafe {
+            libc::sync_file_range(
+                file.as_raw_fd(),
+                offset as libc::off64_t,
+                len as libc::off64_t,
+                libc::SYNC_FILE_RANGE_WRITE,
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (file, offset, len);
+}
+
 pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -183,17 +324,12 @@ pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
     if parent.as_os_str().is_empty() {
         return Ok(());
     }
-    // Opening a directory read-only and fsyncing it is the portable-on-Unix way
-    // to flush its entries. On Windows there is no directory handle to sync and
-    // file creation is already ordered, so this is a no-op there.
-    #[cfg(unix)]
-    {
-        let dir = File::open(parent)?;
-        dir.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = parent;
+    // Noted only once there is a handle to flush through: where the volume
+    // cannot flush a directory (see `sync_path`), nothing is flushed, and the
+    // power-loss harness must not take the entries as durable.
+    if let Some(dir) = crate::core::sync_path::open_dir(parent)? {
+        let _synced = crate::core::sync_audit::note("dir", path);
+        crate::core::sync_path::flush_dir(&dir)?;
     }
     Ok(())
 }
@@ -211,8 +347,24 @@ pub struct RecoveryStats {
     pub rolled_back: u64,
     /// Records skipped because their `file_id` is not registered.
     pub unresolved: u64,
+    /// Records skipped because a later committed [`Wal::forget_files`]
+    /// barrier voided them: their file was deleted after they were logged.
+    pub forgotten: u64,
+    /// Restored files emptied at a barrier that committed after their copy
+    /// was taken: see [`Wal::recover_restoring`].
+    pub emptied: u64,
     /// Bytes of trailing garbage ignored — a partial record from a crash.
+    /// Zeros are not garbage: the log is extended with them ahead of its
+    /// append point ([`crate::WAL_PREALLOC_BYTES`]), and a tail of nothing
+    /// else is a log that ends where its records do.
     pub truncated_tail: u64,
+    /// Length of the prefix of whole records, which is where a log kept
+    /// after recovery takes its next record.
+    pub valid_bytes: u64,
+    /// Highest transaction id any record in the log carries. A log that is
+    /// kept after recovery must not see these ids handed out again: its
+    /// commit markers would mark the new transactions committed.
+    pub last_txn: u64,
 }
 
 /// Trailing bytes a scan did not validate, given the log's length and how far
@@ -235,6 +387,18 @@ pub struct RecoveryStats {
 /// where that same truncate would then fire on a log being actively written.
 fn discarded_tail(total: u64, valid: u64) -> u64 {
     total.saturating_sub(valid)
+}
+
+/// Returned by [`Wal::hold_checkpoints`]; checkpoints resume when the last
+/// one is dropped.
+pub struct CheckpointHold {
+    wal: Arc<Wal>,
+}
+
+impl Drop for CheckpointHold {
+    fn drop(&mut self) {
+        self.wal.checkpoint_holds.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// The log.
@@ -266,6 +430,18 @@ pub struct Wal {
     issued: AtomicU64,
     /// Byte offset of the log's append point, maintained under the writer lock.
     write_pos: AtomicU64,
+    /// Length of the log file, maintained under the writer lock: `write_pos`
+    /// plus the zeros [`Wal::reserve_locked`] has put ahead of it. Nothing
+    /// but zeros lies between the two.
+    allocated: AtomicU64,
+    /// How many zeros each extension writes; 0 for none. Read from
+    /// [`crate::wal_prealloc_bytes`] when the log is opened.
+    prealloc: AtomicU64,
+    /// Set when extending the log with zeros failed, so it is not retried for
+    /// every record: the log then grows by its appends, as it did before
+    /// there was any padding. Cleared when the log is next discarded, since
+    /// a full disk is the likely cause and a checkpoint is what frees it.
+    prealloc_failed: AtomicBool,
     /// Highest `issued` value known to be on stable storage.
     durable: AtomicU64,
     /// Serializes the flush so waiters share one.
@@ -273,7 +449,11 @@ pub struct Wal {
     /// Flush handle. Separate from `writer` so a flush in progress does not
     /// block the next record being framed — without that overlap there is no
     /// group left to commit.
-    sync_handle: OnceLock<File>,
+    ///
+    /// Behind a lock rather than set once, because a checkpoint that keeps a
+    /// tail replaces the log file (see [`Wal::checkpoint`]) and the next sync
+    /// must reach the new one. Cloned out and synced with the lock released.
+    sync_handle: Mutex<Option<Arc<File>>>,
     /// Next transaction id. Never reused within a log generation.
     next_txn: AtomicU64,
     /// Monotonic sequence stamped on each commit, in commit order.
@@ -287,9 +467,25 @@ pub struct Wal {
     /// Set while a checkpoint runs, so a burst of writers past the threshold
     /// produces one checkpoint rather than one each.
     checkpointing: AtomicBool,
+    /// Outstanding [`CheckpointHold`]s. While any is held every checkpoint
+    /// declines, so the log keeps every record since the last truncation —
+    /// what a copy taken while writes run replays to become consistent
+    /// (database branching).
+    checkpoint_holds: AtomicU64,
     /// Set when a flush has failed. Durability can no longer be promised, so
     /// every later commit reports an error rather than lying about it.
     poisoned: AtomicBool,
+    /// What poisoned the log, kept so an operator can see it without having
+    /// caught the one log line that announced it. Set once, by the first
+    /// failure; later ones are consequences of it.
+    poison_reason: OnceLock<String>,
+    /// Checkpoints that returned without discarding the log because a
+    /// transaction was open or another checkpoint was running. Expected in
+    /// small numbers; one that only ever grows means the log never shrinks.
+    checkpoints_declined: AtomicU64,
+    /// Checkpoints that returned an error, and the most recent such error.
+    checkpoint_failures: AtomicU64,
+    last_checkpoint_error: Mutex<Option<String>>,
     /// In-place overwrites waiting for their transaction to commit.
     ///
     /// Only overwrites appear here; appends never take this lock, which keeps
@@ -311,6 +507,14 @@ pub struct Wal {
     /// globally: ids are scoped to a directory, so a process holding two
     /// databases must not resolve one's ids against the other's files.
     files: Mutex<HashMap<u64, PathBuf>>,
+    /// Ids that more than one path has claimed, with every claimant. A record
+    /// carries only the id, so replay cannot tell whose it is: such an id takes
+    /// no new records, and a log already holding some is not replayed. Only
+    /// ever grows; changed under the `files` lock.
+    contested: Mutex<HashMap<u64, Vec<PathBuf>>>,
+    /// Set once `contested` is non-empty, so a record pays one load, not a
+    /// lock, to learn its id is not one of them.
+    any_contested: AtomicBool,
     /// Where a checkpoint hands the log's contents before discarding them.
     ///
     /// `None` — the default — is the historical behaviour: a checkpoint proves
@@ -324,6 +528,217 @@ pub struct Wal {
     /// valid in log order, and a lexicographic listing of zero-padded numbers
     /// reproduces it without the archiver having to track state of its own.
     archive_seq: AtomicU64,
+    /// Every commit sequence up to this one is in a staged segment: the
+    /// checkpoints that dropped its records copied them to the archive first.
+    staged_through_lsn: AtomicU64,
+    /// Commit sequences up to this one may have been dropped by a checkpoint
+    /// *without* being staged — archiving was off or the copy failed. A
+    /// snapshot window that reaches below it cannot be made consistent.
+    unstaged_through_lsn: AtomicU64,
+    /// `bytes_since_checkpoint` when [`should_break_transaction`] last told a
+    /// long writer to commit. See there.
+    break_granted_at: AtomicU64,
+    /// Data files that records in the live log describe: what the next
+    /// checkpoint has to sync before it may drop those records. Filled under
+    /// the writer lock as records are framed, taken by a checkpoint at the
+    /// point it fixes what it covers.
+    dirty: Mutex<DirtyFiles>,
+    /// The file id last added to `dirty`, so consecutive records for one file
+    /// do not take that lock. `u64::MAX` when unset. Written under the writer
+    /// lock.
+    last_dirty: AtomicU64,
+    /// `file_id` -> the fences [`Wal::forget_files`] took for it (see
+    /// [`Fence`]). Taken under the writer lock and checked under it by every
+    /// record, so a record is either framed before the barrier (and voided
+    /// by it) or refused. A read-write lock: every record and every held
+    /// apply only read it, and the apply opens its file with it held, so
+    /// readers must not queue behind each other's system calls. Never
+    /// shrinks below one entry per name ever deleted.
+    fences: parking_lot::RwLock<HashMap<u64, Fence>>,
+    /// `file_id` -> the commit sequence of the latest barrier a `DROP` logged
+    /// for it and committed (see [`Wal::forget_dropped_files`]). Kept only
+    /// while checkpoints archive, for the one reader there is: a snapshot
+    /// whose copy finds a listed file gone, which may leave the file out only
+    /// when a `DROP` committed past its start deleted it (see
+    /// [`Wal::dropped_after`]). Trimmed by [`Wal::forget_drops_through`] as
+    /// each snapshot starts.
+    dropped_at: Mutex<HashMap<u64, u64>>,
+    /// The durable floor of each fixed-record file a checkpoint synced, as
+    /// last stored beside the log (see [`crate::core::torn_tail`]). Written
+    /// by checkpoints and by in-place shrinks; read at open, before replay.
+    floors: Mutex<crate::core::torn_tail::Floors>,
+    /// Times the sync handle had to be opened lazily, which only a test that
+    /// clears it should ever cause: `Wal::open` opens it and a keep-tail
+    /// checkpoint installs the new file's.
+    #[cfg(test)]
+    lazy_opens: AtomicU64,
+    /// Callers of [`Wal::commit_through`] past its poison check and about to
+    /// wait for the sync gate, so a test can tell one is queued there.
+    #[cfg(test)]
+    gate_arrivals: AtomicU64,
+}
+
+/// One file id's fences: [`Incarnation`]s taken by [`Wal::forget_files`]
+/// barriers for it, in the order writers come to be.
+///
+/// Kept apart by whether the barrier is known to have committed. A barrier
+/// that never commits voids nothing, so its fence must not outlive it, but
+/// the fence of an earlier, committed barrier for the same id still stands:
+/// a writer born before that one writes to a file deleted long ago.
+#[derive(Clone, Copy, Default, Debug)]
+struct Fence {
+    /// The latest barrier whose commit marker is in the log: the file was
+    /// deleted (or is about to be) after it. 0 for none.
+    committed: u64,
+    /// The latest barrier in the log whose commit marker is not, yet: the
+    /// file is still there, and is deleted only once the barrier commits.
+    /// 0 for none.
+    pending: u64,
+}
+
+impl Fence {
+    /// A record from a writer born at `born` may not be framed. A pending
+    /// barrier refuses it too: framed after the barrier, it would not be
+    /// voided if the barrier then commits, and would replay into the next
+    /// file of the name.
+    fn refuses_record(&self, born: Incarnation) -> bool {
+        born.0 <= self.committed.max(self.pending)
+    }
+
+    /// A held write from a writer born at `born` must not be applied: its
+    /// file was deleted at a committed barrier, and its path names whatever
+    /// file took the name since. Under a pending barrier the file is still
+    /// the writer's, and the write belongs in it whichever way the barrier
+    /// goes: voided by replay with the file if it commits, and replayed, as
+    /// the live apply did, if it does not.
+    fn voids_apply(&self, born: Incarnation) -> bool {
+        born.0 <= self.committed
+    }
+}
+
+/// See [`Wal::dirty`].
+#[derive(Default)]
+struct DirtyFiles {
+    ids: HashSet<u64>,
+    /// Every registered file: set only when the log was opened holding
+    /// records whose headers could not be read, so their files are unknown.
+    all: bool,
+}
+
+/// What a log already on disk holds, read at open.
+struct LogExtent {
+    /// The files its records describe: what this process's first checkpoint
+    /// owes a sync.
+    ids: HashSet<u64>,
+    /// Length of the prefix of whole records.
+    valid: u64,
+    /// Whether everything past `valid` is zeros: padding (or nothing), as
+    /// against the torn tail of a crash.
+    zero_tail: bool,
+}
+
+/// Reads the headers of the log at `path`, `len` bytes long.
+///
+/// A reopened log used to be answered with "every registered file", and the
+/// registry of a reopened directory is every file in it — each table's
+/// `.tmp` staging siblings, the status file, the LSN mark — none of which a
+/// record names. On a database of 2,045 table files that was 4,080 syncs, so
+/// the first checkpoint after any restart with a non-empty log, typically a
+/// `VACUUM FULL`, cost two full passes' worth of device flushes.
+///
+/// Stops where replay stops, at the first record that does not read whole:
+/// records past a torn one are never replayed, so their files are owed
+/// nothing. `None` if the log cannot be read at all, for the caller to fall
+/// back to syncing everything.
+fn log_extent(path: &Path, len: u64) -> Option<LogExtent> {
+    let mut scan = LogScanner::open(path).ok()?;
+    let mut ids = HashSet::new();
+    loop {
+        match scan.next() {
+            // A commit marker names no file, and a barrier describes no bytes.
+            Ok(Some(h)) if h.flags & FLAG_COMMIT != 0 && h.file_id == 0 => {}
+            Ok(Some(h)) if h.flags & FLAG_FORGET != 0 => {}
+            Ok(Some(h)) => {
+                ids.insert(h.file_id);
+            }
+            Ok(None) => break,
+            Err(_) => return None,
+        }
+    }
+    let valid = scan.consumed;
+    let zero_tail = only_zeros(path, valid, len).ok()?;
+    Some(LogExtent { ids, valid, zero_tail })
+}
+
+/// Whether `path` holds nothing but zeros from `from` up to `to` (or its end,
+/// if that comes first). True of an empty range.
+fn only_zeros(path: &Path, from: u64, to: u64) -> io::Result<bool> {
+    if from >= to {
+        return Ok(true);
+    }
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(from))?;
+    let mut left = to - from;
+    let mut buf = vec![0u8; 64 * 1024];
+    while left > 0 {
+        let want = left.min(buf.len() as u64) as usize;
+        let got = match file.read(&mut buf[..want]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if buf[..got].iter().any(|b| *b != 0) {
+            return Ok(false);
+        }
+        left -= got as u64;
+    }
+    Ok(true)
+}
+
+/// Where the records of the log at `path` end: its length without the zeros
+/// written ahead of them. The whole length for a log with a torn tail, which
+/// is appended to at its end.
+///
+/// For the crash harnesses, which build an image of a log by cutting it at a
+/// length: they compare this with the extents its syncs were noted at
+/// ([`crate::core::sync_audit::note_extent`]). The file's own length says
+/// nothing about either.
+#[cfg(test)]
+pub(crate) fn records_len(path: &Path) -> u64 {
+    let len = std::fs::metadata(path).map_or(0, |m| m.len());
+    match log_extent(path, len) {
+        Some(found) if found.zero_tail => found.valid,
+        _ => len,
+    }
+}
+
+/// The bytes of `path` as a crash harness should see them: a log
+/// ([`DEFAULT_WAL_NAME`]) up to [`records_len`], any other file whole.
+#[cfg(test)]
+pub(crate) fn read_records(path: &Path) -> Vec<u8> {
+    let mut bytes = std::fs::read(path).unwrap_or_default();
+    if path.file_name().is_some_and(|n| n == DEFAULT_WAL_NAME) {
+        bytes.truncate(records_len(path) as usize);
+    }
+    bytes
+}
+
+/// What [`Wal::reserve_locked`] writes from.
+static ZEROS: [u8; 64 * 1024] = [0u8; 64 * 1024];
+
+/// Writes `len` zeros at `at`. On Unix the file's cursor stays where it was;
+/// Windows' positional write moves it, so `append_locked` seeks back to the
+/// append point there.
+fn write_zeros_at(file: &File, mut at: u64, mut len: u64) -> io::Result<()> {
+    use crate::core::pos_io::FileExt;
+    while len > 0 {
+        let n = len.min(ZEROS.len() as u64) as usize;
+        file.write_all_at(&ZEROS[..n], at)?;
+        at += n as u64;
+        len -= n as u64;
+    }
+    Ok(())
 }
 
 impl Wal {
@@ -348,33 +763,100 @@ impl Wal {
             sync_parent_dir(&path)?;
         }
 
-        let end = writer.seek(SeekFrom::End(0))?;
+        let len = writer.seek(SeekFrom::End(0))?;
+
+        // Where the records end, which is not where the file does: the log
+        // is extended with zeros ahead of its append point, and a log left
+        // by a crash or kept by recovery still carries them. Appending after
+        // them would put every new record where replay, which stops at the
+        // first thing that is not a record, never looks.
+        //
+        // Only a tail of nothing but zeros is appended into. Anything else
+        // past the records is a torn tail, and a record written over its
+        // start could be followed by a whole stale one further on, which
+        // replay would then take for the next. That log is appended to at
+        // its end, as it always was; `open_and_recover` discards it.
+        let extent = if len == 0 { None } else { log_extent(&path, len) };
+        let end = match &extent {
+            Some(found) if found.zero_tail => found.valid,
+            _ => len,
+        };
+        if end != len {
+            writer.seek(SeekFrom::Start(end))?;
+        }
+
+        // Opened now rather than at the first sync, so no commit's sync can
+        // fail at an `open` after its marker is already in the file (R7).
+        let sync_handle = Arc::new(writer.try_clone()?);
 
         // Whatever the last truncation recorded. Recovery raises it further
         // from the records still in the log; this is only the floor beneath
         // them, and it is all a cleanly checkpointed log leaves behind.
         let resume_lsn = read_lsn_mark(&path);
+        // The same for transaction ids: see `TXN_MARK_SUFFIX`.
+        let resume_txn = read_txn_mark(&path).max(1);
+
+        // Records this process did not write still have to reach their files
+        // before a checkpoint may drop them; their headers say which files.
+        let dirty = if len == 0 {
+            DirtyFiles::default()
+        } else {
+            match extent {
+                Some(found) => DirtyFiles {
+                    ids: found.ids,
+                    all: false,
+                },
+                None => DirtyFiles {
+                    ids: HashSet::new(),
+                    all: true,
+                },
+            }
+        };
+
+        let floors = crate::core::torn_tail::Floors::load(&crate::core::torn_tail::Floors::path_for(&path));
 
         Ok(Self {
             path,
             writer: Mutex::new(writer),
             issued: AtomicU64::new(0),
             write_pos: AtomicU64::new(end),
+            allocated: AtomicU64::new(len),
+            prealloc: AtomicU64::new(crate::wal_prealloc_bytes()),
+            prealloc_failed: AtomicBool::new(false),
             durable: AtomicU64::new(0),
             gate: Mutex::new(()),
-            sync_handle: OnceLock::new(),
-            next_txn: AtomicU64::new(1),
+            sync_handle: Mutex::new(Some(sync_handle)),
+            next_txn: AtomicU64::new(resume_txn),
             commit_lsn: AtomicU64::new(resume_lsn),
             bytes_since_checkpoint: AtomicU64::new(end),
             checkpointing: AtomicBool::new(false),
+            checkpoint_holds: AtomicU64::new(0),
             poisoned: AtomicBool::new(false),
+            poison_reason: OnceLock::new(),
+            checkpoints_declined: AtomicU64::new(0),
+            checkpoint_failures: AtomicU64::new(0),
+            last_checkpoint_error: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             pending_count: AtomicU64::new(0),
             pending_sync: AtomicU64::new(0),
             pending_bytes: AtomicU64::new(0),
             files: Mutex::new(HashMap::new()),
+            contested: Mutex::new(HashMap::new()),
+            any_contested: AtomicBool::new(false),
             archive_dir: Mutex::new(None),
             archive_seq: AtomicU64::new(0),
+            staged_through_lsn: AtomicU64::new(0),
+            unstaged_through_lsn: AtomicU64::new(0),
+            break_granted_at: AtomicU64::new(0),
+            dirty: Mutex::new(dirty),
+            last_dirty: AtomicU64::new(u64::MAX),
+            fences: parking_lot::RwLock::new(HashMap::new()),
+            dropped_at: Mutex::new(HashMap::new()),
+            floors: Mutex::new(floors),
+            #[cfg(test)]
+            lazy_opens: AtomicU64::new(0),
+            #[cfg(test)]
+            gate_arrivals: AtomicU64::new(0),
         })
     }
 
@@ -391,6 +873,77 @@ impl Wal {
         self.poisoned.load(Ordering::Acquire)
     }
 
+    /// The failure that poisoned the log, if one has.
+    pub fn poison_reason(&self) -> Option<String> {
+        self.poison_reason.get().cloned()
+    }
+
+    /// How many checkpoints declined to discard the log, and how many failed.
+    pub fn checkpoint_counts(&self) -> (u64, u64) {
+        (
+            self.checkpoints_declined.load(Ordering::Relaxed),
+            self.checkpoint_failures.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The most recent checkpoint error, if any checkpoint has failed.
+    pub fn last_checkpoint_error(&self) -> Option<String> {
+        self.last_checkpoint_error.lock().clone()
+    }
+
+    /// Stops the log promising durability for the rest of the process.
+    ///
+    /// For any failure after which the log or the data files may no longer
+    /// hold what a commit was told they hold. The reason is recorded before
+    /// the flag is raised, so anyone who sees the flag can also read why.
+    fn poison(&self, why: String) {
+        log::error!(
+            "WAL {} is poisoned and refuses every further commit: {}",
+            self.path.display(),
+            why
+        );
+        let _ = self.poison_reason.set(why);
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    fn poisoned_error(&self) -> io::Error {
+        io::Error::other(format!(
+            "WAL is poisoned by an earlier failure ({}); durability cannot be guaranteed",
+            self.poison_reason
+                .get()
+                .map(String::as_str)
+                .unwrap_or("reason not recorded")
+        ))
+    }
+
+    /// Refuses to drop any record from a poisoned log.
+    ///
+    /// A poisoned log may be the only place some committed bytes still exist:
+    /// a data-file flush or an in-place apply failed, so the data files cannot
+    /// be trusted to hold what the log describes. Dropping records would throw
+    /// away the copy a restart replays from. Called under the writer lock, as
+    /// late as possible before the drop, rather than only by the callers: a
+    /// commit can poison the log between a caller's check and the drop.
+    fn refuse_if_poisoned(&self) -> io::Result<()> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(self.poisoned_error());
+        }
+        Ok(())
+    }
+
+    /// A failure injected at `step` by [`test_hooks::FAIL_WAL_STEP`], for the
+    /// steps no real file fails on demand. Always `Ok` outside tests.
+    #[inline]
+    fn injected(step: &'static str) -> io::Result<()> {
+        #[cfg(test)]
+        if test_hooks::FAIL_WAL_STEP.with(|s| s.get() == Some(step)) {
+            test_hooks::FAIL_WAL_STEP.with(|s| s.set(None));
+            return Err(io::Error::other(format!("injected failure at {step}")));
+        }
+        let _ = step;
+        Ok(())
+    }
+
     /// Highest record sequence known to be on stable storage.
     ///
     /// For a caller holding bytes that may only be copied elsewhere once the
@@ -402,8 +955,84 @@ impl Wal {
     }
 
     /// Associates a data file's id with its path so replay can find it.
-    pub fn register_file(&self, file_id: u64, path: impl Into<PathBuf>) {
+    ///
+    /// Registering the path an id already has is a no-op. A *different* path
+    /// is an error, and the id is contested from then on: every record logged
+    /// under it is refused, and so is every later registration under it, the
+    /// first claimant's included. The refusal cannot stop at the newcomer — a
+    /// record names its file only by id, so the log cannot tell the two
+    /// writers apart, and either one's records would replay into whichever
+    /// file the id resolved to. Replacing the mapping, as this once did, sent
+    /// the earlier file's records into the later one.
+    pub fn register_file(&self, file_id: u64, path: impl Into<PathBuf>) -> io::Result<()> {
+        use std::collections::hash_map::Entry;
+        let path = path.into();
+        let mut files = self.files.lock();
+        if self.any_contested.load(Ordering::Acquire)
+            && let Some(claimants) = self.contested.lock().get_mut(&file_id)
+        {
+            if !claimants.contains(&path) {
+                claimants.push(path);
+            }
+            return Err(contested_error(file_id, claimants));
+        }
+        let held = match files.entry(file_id) {
+            Entry::Vacant(slot) => {
+                slot.insert(path);
+                return Ok(());
+            }
+            // Compared by component, so `dir//t.db` is `dir/t.db`.
+            Entry::Occupied(slot) if *slot.get() == path => return Ok(()),
+            Entry::Occupied(slot) => slot.get().clone(),
+        };
+        let mut contested = self.contested.lock();
+        let claimants = contested.entry(file_id).or_insert_with(|| vec![held]);
+        claimants.push(path);
+        self.any_contested.store(true, Ordering::Release);
+        Err(contested_error(file_id, claimants))
+    }
+
+    /// Points `file_id` at `path` whatever it pointed at before: what a test
+    /// standing a healthy file in for a failed one needs, and what
+    /// [`Wal::register_file`] exists to refuse.
+    #[cfg(test)]
+    pub(crate) fn repoint_file_for_tests(&self, file_id: u64, path: impl Into<PathBuf>) {
         self.files.lock().insert(file_id, path.into());
+    }
+
+    /// Refuses a record for an id two paths have claimed. See
+    /// [`Wal::register_file`].
+    #[inline]
+    fn refuse_if_contested(&self, file_id: u64) -> io::Result<()> {
+        if likely(!self.any_contested.load(Ordering::Acquire)) {
+            return Ok(());
+        }
+        match self.contested.lock().get(&file_id) {
+            None => Ok(()),
+            Some(claimants) => Err(contested_error(file_id, claimants)),
+        }
+    }
+
+    /// Contested ids and their claimants, sorted. See [`Wal::register_file`].
+    pub fn contested_files(&self) -> Vec<(u64, Vec<PathBuf>)> {
+        let mut out: Vec<_> = self
+            .contested
+            .lock()
+            .iter()
+            .map(|(id, paths)| (*id, paths.clone()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The path replay writes `file_id`'s records to. Never one of a contested
+    /// id's claimants: a guess between them is the wrong file half the time.
+    fn resolve_for_replay(&self, file_id: u64) -> Option<PathBuf> {
+        let files = self.files.lock();
+        if self.contested.lock().contains_key(&file_id) {
+            return None;
+        }
+        files.get(&file_id).cloned()
     }
 
     pub fn registered_files(&self) -> Vec<(u64, PathBuf)> {
@@ -428,7 +1057,21 @@ impl Wal {
     /// file when this returns but not yet on stable storage; pass the sequence
     /// to [`Wal::commit_through`] for that.
     pub fn log(&self, txn: u64, file_id: u64, offset: u64, bytes: &[u8]) -> io::Result<u64> {
-        self.log_at(txn, file_id, offset, bytes, None).map(|(seq, _)| seq)
+        self.log_from(txn, file_id, offset, bytes, Incarnation::UNFENCED)
+    }
+
+    /// [`Wal::log`] for a file's writer born at `born`: refused, and nothing
+    /// logged, when the file was deleted since (see [`Wal::forget_files`]).
+    pub fn log_from(
+        &self,
+        txn: u64,
+        file_id: u64,
+        offset: u64,
+        bytes: &[u8],
+        born: Incarnation,
+    ) -> io::Result<u64> {
+        self.log_at(txn, file_id, offset, bytes, None, born)
+            .map(|(seq, _)| seq)
     }
 
     /// As [`Wal::log`], but also reports the payload's offset within the log.
@@ -444,7 +1087,9 @@ impl Wal {
         offset: u64,
         bytes: &[u8],
         pending_path: Option<PathBuf>,
+        born: Incarnation,
     ) -> io::Result<(u64, u64)> {
+        self.refuse_if_contested(file_id)?;
         if bytes.len() > MAX_RECORD_PAYLOAD {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -452,28 +1097,30 @@ impl Wal {
             ));
         }
 
-        let mut header = [0u8; HEADER_LEN];
-        header[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
-        header[4] = FORMAT_VERSION;
-        header[5] = 0;
-        // header[6..8] reserved, left zero
-        header[8..16].copy_from_slice(&txn.to_le_bytes());
-        header[16..24].copy_from_slice(&file_id.to_le_bytes());
-        header[24..32].copy_from_slice(&offset.to_le_bytes());
-        header[32..36].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+        let header = record_header(txn, file_id, offset, bytes);
 
-        let mut digest = CRC.digest();
-        digest.update(&header[0..HEADER_CRC_LEN]);
-        digest.update(bytes);
-        header[HEADER_CRC_LEN..HEADER_LEN].copy_from_slice(&digest.finalize().to_le_bytes());
-
-        // Header and payload go out under one lock: split across two `write_all`
-        // calls a concurrent writer could interleave between them.
+        // Header and payload go out under one lock, and as one `writev`: one
+        // system call per record instead of two. Under the lock either way, so
+        // no concurrent writer can interleave between them.
         let (seq, payload_at) = {
             let mut file = self.writer.lock();
+            // Under the writer lock, as the fence is taken: either this record
+            // precedes the barrier and is voided by it, or it is refused.
+            if self
+                .fences
+                .read()
+                .get(&file_id)
+                .is_some_and(|fence| fence.refuses_record(born))
+            {
+                return Err(io::Error::other(format!(
+                    "refusing a log record for file id {file_id}: its file was deleted after \
+                     this writer opened it, and the record would replay into the next file \
+                     of that name"
+                )));
+            }
             let record_at = self.write_pos.load(Ordering::Relaxed);
-            file.write_all(&header)?;
-            file.write_all(bytes)?;
+            self.append_locked(&mut file, &mut [io::IoSlice::new(&header), io::IoSlice::new(bytes)])?;
+            self.mark_dirty_locked(file_id);
             self.write_pos.store(
                 record_at + (HEADER_LEN + bytes.len()) as u64,
                 Ordering::Relaxed,
@@ -503,6 +1150,8 @@ impl Wal {
                 }
                 entry.push(PendingWrite {
                     path,
+                    file_id,
+                    born,
                     offset,
                     log_offset: payload_at,
                     len: bytes.len(),
@@ -522,9 +1171,14 @@ impl Wal {
 
     /// Logs an in-place overwrite, holding the data-file write until commit.
     ///
-    /// This is the "write-ahead" in write-ahead log, and it only matters for
-    /// overwrites. An append that is cut short leaves harmless garbage past the
-    /// old end of file, which replay overwrites. An *overwrite* that is cut
+    /// This is the "write-ahead" in write-ahead log, and it matters for
+    /// overwrites. An append that is cut short leaves garbage past the old end
+    /// of file, which replay overwrites when the append committed and nothing
+    /// removes when it did not: harmless only in a file whose readers find
+    /// records through something the log does account for (row bytes through
+    /// pointers). The schema sidecars are read record by record, so they are
+    /// appended through here, in place at their end
+    /// ([`crate::core::torn_tail::SidecarWrites`]). An *overwrite* that is cut
     /// short has already destroyed the previous bytes, and a redo-only log has
     /// no undo record to put them back — so the data file must not be touched
     /// until the record describing the new bytes is durable.
@@ -535,6 +1189,19 @@ impl Wal {
         offset: u64,
         bytes: &[u8],
     ) -> io::Result<u64> {
+        self.log_in_place_from(txn, file_id, offset, bytes, Incarnation::UNFENCED)
+    }
+
+    /// [`Wal::log_in_place`] for a file's writer born at `born`; see
+    /// [`Wal::log_from`].
+    pub fn log_in_place_from(
+        &self,
+        txn: u64,
+        file_id: u64,
+        offset: u64,
+        bytes: &[u8],
+        born: Incarnation,
+    ) -> io::Result<u64> {
         // Resolved before the record is written: failing afterwards would
         // leave a logged overwrite that nothing is tracking.
         let path = self.files.lock().get(&file_id).cloned();
@@ -544,7 +1211,7 @@ impl Wal {
             )));
         };
 
-        let (seq, _) = self.log_at(txn, file_id, offset, bytes, Some(path))?;
+        let (seq, _) = self.log_at(txn, file_id, offset, bytes, Some(path), born)?;
         Ok(seq)
     }
 
@@ -594,12 +1261,24 @@ impl Wal {
         // padding on `poisoned` — the load stays in L1, and the branch that
         // follows it stays out of the fall-through path.
         if unlikely(self.poisoned.load(Ordering::Acquire)) {
-            return Err(io::Error::other(
-                "WAL is poisoned by an earlier flush failure; durability cannot be guaranteed",
-            ));
+            return Err(self.poisoned_error());
         }
 
-        let seq = self.log_commit_marker(txn)?;
+        let seq = match self.log_commit_marker(txn) {
+            Ok(seq) => seq,
+            Err(e) => {
+                // No marker reached the log (cut back cleanly, or the log is
+                // poisoned and replay stops at the torn bytes), so `txn` is
+                // uncommitted and none of its held overwrites were applied.
+                // The caller may not abort after a failed commit, so nobody
+                // else will ever take its entry out of `pending`: left there,
+                // `pending_count` stayed raised, every later checkpoint
+                // declined and the log grew until restart, long after the
+                // condition that failed the write had cleared.
+                self.abort_txn(txn);
+                return Err(e);
+            }
+        };
 
         // The common case, and worth not taking a lock for: nothing anywhere is
         // holding payloads, so this commit is certainly append-only. Hinted
@@ -625,7 +1304,17 @@ impl Wal {
             return Ok(seq);
         }
 
-        self.commit_through(seq)?;
+        if let Err(e) = self.commit_through(seq) {
+            // The entry left `pending` above, so `abort_txn` can no longer
+            // find it: give its claim back here, or `pending_count` stays
+            // raised and every later checkpoint declines.
+            if let Some(held) = held {
+                let bytes: u64 = held.iter().map(|w| w.len as u64).sum();
+                self.pending_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                self.pending_count.fetch_sub(1, Ordering::AcqRel);
+            }
+            return Err(e);
+        }
 
         let Some(held) = held else {
             return Ok(seq);
@@ -652,12 +1341,72 @@ impl Wal {
 
         // Only now is it safe to disturb the old bytes: the record describing
         // them is durable, so if we die partway replay finishes the job.
+        //
+        // A failure here is past the point of no return. The commit marker is
+        // durable, so the transaction *is* committed, and the log is now the
+        // only copy of these bytes: the data file has some, none or a torn
+        // part of them. Returning the error alone left the log free to be
+        // checkpointed — and a checkpoint drops the only redo copy, after
+        // which the data file keeps whatever the failed apply left behind.
+        // Poisoning keeps the log, so a restart replays it, and refuses every
+        // later commit rather than building on bytes that are not there.
+        let voided = match self.apply_held(held) {
+            Ok(voided) => voided,
+            Err(e) => {
+                self.poison(format!(
+                    "applying a committed in-place write of transaction {} failed: {}",
+                    txn, e
+                ));
+                return Err(e);
+            }
+        };
+        // Writes to a file deleted since they were logged went nowhere: the
+        // table they belonged to is gone, and replay voids their records too.
+        // Not a poisoning failure, since the log and every file still agree,
+        // but the caller wrote to a table that no longer exists and must not
+        // be told it succeeded.
+        if voided > 0 {
+            return Err(io::Error::other(format!(
+                "{voided} in-place write(s) of transaction {txn} were not applied: their file \
+                 was deleted (its table dropped, renamed or moved) after they were logged"
+            )));
+        }
+
+        Ok(seq)
+    }
+
+    /// Copies each held overwrite's payload from the log into its data file,
+    /// and returns how many it skipped because their file was deleted since
+    /// they were logged.
+    ///
+    /// The fence [`Wal::forget_files`] takes refuses records framed after the
+    /// barrier. A write framed before it was already held here, and its
+    /// commit could come after the drop that took the fence, after the files
+    /// were deleted and a table of that name created again. Opened by path,
+    /// the apply then wrote the dropped table's bytes into the new table's
+    /// file, or created the file again, holding them, when nothing had taken
+    /// the name. Replay voids such a record (it precedes the barrier), so the
+    /// apply skips it too, once the barrier has committed (see
+    /// [`Fence::voids_apply`]). Checked and opened under the fences read
+    /// lock, and `forget_files` marks a barrier committed under the write
+    /// lock before it returns, so before its caller deletes anything: either
+    /// the committed fence is seen, or the file is opened before the
+    /// deletion, and the write lands in the file it was logged for.
+    fn apply_held(&self, held: Vec<PendingWrite>) -> io::Result<usize> {
+        // Released up front for every entry, so an apply that fails partway
+        // does not leave the remainder counted forever.
+        let held_bytes: u64 = held.iter().map(|w| w.len as u64).sum();
+        self.pending_bytes.fetch_sub(held_bytes, Ordering::Relaxed);
+
         let mut log_reader: Option<File> = None;
         let mut buf: Vec<u8> = Vec::new();
+        let mut voided = 0usize;
 
         for w in held {
-            self.pending_bytes.fetch_sub(w.len as u64, Ordering::Relaxed);
-
+            // Persistent indexes §11: an in-place apply failing after its
+            // commit marker is durable (the log is poisoned by the caller).
+            #[cfg(any(test, feature = "index_store_failpoints"))]
+            crate::core::power_loss::failpoint::hit("apply_held_fails_then_shutdown", &w.path)?;
             // The payload is already on stable storage in the log, so read it
             // back from there rather than having kept a second copy in memory.
             let reader = match log_reader {
@@ -683,21 +1432,34 @@ impl Wal {
             // so filter checkpoints never reached disk at all while a WAL was
             // enabled. Replaying the log after a crash would have created the
             // file correctly, which is what made the two paths disagree.
-            let existed = w.path.exists();
-            let mut f = File::options()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(&w.path)?;
-            f.seek(SeekFrom::Start(w.offset))?;
-            f.write_all(&buf)?;
+            let (existed, mut f) = {
+                let fences = self.fences.read();
+                if fences
+                    .get(&w.file_id)
+                    .is_some_and(|fence| fence.voids_apply(w.born))
+                {
+                    voided += 1;
+                    continue;
+                }
+                let existed = w.path.exists();
+                let f = File::options()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .open(&w.path)?;
+                (existed, f)
+            };
+            // As one step to anyone reading the file meanwhile: these bytes
+            // are rewritten in place under readers (`inplace_seq`).
+            crate::core::storage_providers::inplace_seq::for_file(&f, &w.path.to_string_lossy())
+                .write(|| f.seek(SeekFrom::Start(w.offset)).and_then(|_| f.write_all(&buf)))?;
             // A new file is only durable once its directory entry is.
             if !existed {
                 sync_parent_dir(&w.path)?;
             }
         }
 
-        Ok(seq)
+        Ok(voided)
     }
 
     /// Returns once every record up to `seq` is on stable storage.
@@ -707,29 +1469,90 @@ impl Wal {
     /// every record written so far rather than only its own.
     pub fn commit_through(&self, seq: u64) -> io::Result<()> {
         if unlikely(self.poisoned.load(Ordering::Acquire)) {
-            return Err(io::Error::other(
-                "WAL is poisoned by an earlier flush failure; durability cannot be guaranteed",
-            ));
+            return Err(self.poisoned_error());
         }
 
         if self.durable.load(Ordering::Acquire) >= seq {
             return Ok(()); // an earlier flush already covered us
         }
 
+        // Everything from here can park the thread for an fsync — the leader
+        // in `sync_data`, every follower on `gate`. Called from a statement on
+        // a runtime worker, that parked the worker and every task queued on
+        // it: with as many concurrent committers as workers, reads stalled for
+        // whole syncs. See [`blocking_io`].
+        let synced = blocking_io(|| self.commit_through_slow(seq));
+        // Every error is a poisoned log (V4). An error that left the log
+        // unpoisoned leaves a commit marker in the file that the next
+        // committer's sync makes durable, so replay applies a write its caller
+        // was told failed — and a snapshot barrier that trusts an `Ok` after
+        // it would capture memory that never saw that write.
+        debug_assert!(
+            synced.is_ok() || self.is_poisoned(),
+            "commit_through returned an error without poisoning the log: {:?}",
+            synced
+        );
+        synced
+    }
+
+    /// The part of [`Wal::commit_through`] that may block: waiting for the
+    /// gate, and the flush itself. Order and protocol are exactly the ones
+    /// `commit_through` always had; only the thread it blocks changed.
+    fn commit_through_slow(&self, seq: u64) -> io::Result<()> {
+        #[cfg(test)]
+        self.gate_arrivals.fetch_add(1, Ordering::AcqRel);
         let _gate = self.gate.lock();
 
         if self.durable.load(Ordering::Acquire) >= seq {
             return Ok(()); // covered while we waited for the gate
         }
+        // Checked again under the gate: the leader this caller queued behind
+        // may have failed its sync and poisoned the log after the check in
+        // `commit_through`. A second sync could then return `Ok` over pages the
+        // kernel dropped with that error, acknowledging a commit on a log in
+        // an unknown state (V4).
+        if unlikely(self.poisoned.load(Ordering::Acquire)) {
+            return Err(self.poisoned_error());
+        }
 
         let covered = self.issued.load(Ordering::Acquire);
 
-        let handle = match self.sync_handle.get() {
-            Some(h) => h,
-            None => {
-                let h = File::options().read(true).write(true).open(&self.path)?;
-                let _ = self.sync_handle.set(h);
-                self.sync_handle.get().expect("just set")
+        let handle = {
+            let mut slot = self.sync_handle.lock();
+            match &*slot {
+                Some(h) => h.clone(),
+                None => {
+                    // A fallback only: `Wal::open` and every keep-tail
+                    // checkpoint install the handle (R7), so only a test that
+                    // clears it gets here.
+                    //
+                    // Fails as a sync does, by poisoning. Whoever waits here
+                    // already has its commit marker in the file, and the next
+                    // sync anyone takes makes it durable: returning the error
+                    // alone told the committer its transaction failed (a
+                    // drop, that its barrier could never commit, so it put
+                    // the table back) while a crash then replayed it as
+                    // committed.
+                    #[cfg(test)]
+                    self.lazy_opens.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(test)]
+                    let opened = if test_hooks::FAIL_SYNC_OPEN.with(|f| f.replace(false)) {
+                        Err(io::Error::other("injected failure to open the log's sync handle"))
+                    } else {
+                        File::options().read(true).write(true).open(&self.path)
+                    };
+                    #[cfg(not(test))]
+                    let opened = File::options().read(true).write(true).open(&self.path);
+                    let h = match opened {
+                        Ok(file) => Arc::new(file),
+                        Err(e) => {
+                            self.poison(format!("opening the log to sync it failed: {}", e));
+                            return Err(e);
+                        }
+                    };
+                    *slot = Some(h.clone());
+                    h
+                }
             }
         };
 
@@ -740,8 +1563,21 @@ impl Wal {
         // pages after reporting the error, so a second call could return success
         // while the data is gone. Poisoning instead makes every later commit
         // fail loudly rather than silently downgrading durability.
-        if let Err(e) = handle.sync_data() {
-            self.poisoned.store(true, Ordering::Release);
+        // The records written so far, not the file's length: the padding
+        // past them is not what this sync is for, and a crash harness that
+        // cut the log at the file's length would keep every record written
+        // after it. Read before the sync is issued, so it never claims more
+        // than the sync covers.
+        let _synced = crate::core::sync_audit::note_extent("wal.log", &self.path, self.write_pos.load(Ordering::Relaxed));
+        #[cfg(test)]
+        let synced = match test_hooks::FAIL_LOG_SYNC.with(|f| f.take()) {
+            Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+            None => handle.sync_data(),
+        };
+        #[cfg(not(test))]
+        let synced = handle.sync_data();
+        if let Err(e) = synced {
+            self.poison(format!("fdatasync of the log failed: {}", e));
             return Err(e);
         }
 
@@ -772,46 +1608,347 @@ impl Wal {
         self.commit_through(owed)
     }
 
+    /// Makes every record issued so far durable, refusing a poisoned log
+    /// first: an index snapshot's barrier (docs/persistent-indexes.md §3
+    /// step 4, RV4, P26). Never [`Wal::sync_pending`], which returns `Ok` on
+    /// a poisoned log that owes nothing, so a snapshot would be captured
+    /// over memory a failed commit left without its key.
+    pub fn sync_issued(&self) -> io::Result<()> {
+        if unlikely(self.poisoned.load(Ordering::Acquire)) {
+            return Err(self.poisoned_error());
+        }
+        self.commit_through(self.issued.load(Ordering::Acquire))
+    }
+
+    /// The sequence of the newest record written, synced or not: once
+    /// [`Wal::durable_through`] reaches it, everything logged before the call
+    /// is on stable storage. For a caller that may act on a commit only when
+    /// the records before this point are durable, whoever syncs them.
+    pub fn issued_through(&self) -> u64 {
+        self.issued.load(Ordering::Acquire)
+    }
+
     /// Highest commit sequence assigned so far.
     pub fn commit_lsn(&self) -> u64 {
         self.commit_lsn.load(Ordering::Acquire)
     }
 
+    /// Keeps every checkpoint from discarding the log until the returned
+    /// hold is dropped, after waiting out one already running.
+    ///
+    /// For a copy of the database taken while writes run (`CREATE BRANCH`):
+    /// a record logged after the copy read its file is only in the log, and a
+    /// checkpoint would discard it. With the hold, the log at the end of the
+    /// copy holds every record since the last truncation, which is everything
+    /// the copied files may lack. Commits carry on meanwhile; the log only
+    /// grows. Blocking (it may wait for a checkpoint's flushes): call it off
+    /// the async runtime.
+    pub fn hold_checkpoints(self: &Arc<Self>) -> CheckpointHold {
+        self.checkpoint_holds.fetch_add(1, Ordering::SeqCst);
+        while self.checkpointing.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        CheckpointHold { wal: self.clone() }
+    }
+
+    /// Copies the log as it stands into `to`, whole records only, and returns
+    /// the commit sequence it reaches.
+    ///
+    /// The extent is read under the writer lock, so every record before it
+    /// is complete in the file; the copy itself runs with the lock released,
+    /// and anything appended meanwhile is cut off. Only meaningful under a
+    /// [`CheckpointHold`]: a checkpoint replacing the file mid-copy would
+    /// hand back a different log.
+    pub fn copy_log_to(&self, to: &Path) -> io::Result<u64> {
+        let (end, lsn) = {
+            let mut file = self.writer.lock();
+            file.flush()?;
+            (
+                self.write_pos.load(Ordering::Acquire),
+                self.commit_lsn.load(Ordering::Acquire),
+            )
+        };
+        std::fs::copy(&self.path, to)?;
+        let copied = File::options().write(true).open(to)?;
+        if copied.metadata()?.len() > end {
+            copied.set_len(end)?;
+        }
+        copied.sync_data()?;
+        Ok(lsn)
+    }
+
+    /// Writes `bufs` at the append point, which the caller holds the writer
+    /// lock for, and leaves the file exactly as it was if that fails.
+    ///
+    /// A failed write can still have put part of the record in the file — a
+    /// short write on a full disk, EIO midway — and moved the cursor past
+    /// `write_pos`. Left there, the next record lands *after* the partial
+    /// one, so replay stops at the garbage and never reaches it, and every
+    /// offset `write_pos` hands out (an in-place payload's `log_offset`)
+    /// points at the wrong bytes. So the file is cut back to `write_pos` and
+    /// the cursor moved there, and the caller's statement fails. If even that
+    /// fails the log can no longer be trusted, and it is poisoned: the torn
+    /// record would hide every later commit from recovery, including ones
+    /// already acknowledged, and nothing here can repair that.
+    ///
+    /// A failure that *was* cut back does not poison. The log is then exactly
+    /// as it was before the write, every record in it still replays, and only
+    /// the statement that wrote it has lost anything.
+    fn append_locked(&self, file: &mut File, bufs: &mut [io::IoSlice<'_>]) -> io::Result<()> {
+        let at = self.write_pos.load(Ordering::Relaxed);
+        let framed: u64 = bufs.iter().map(|b| b.len() as u64).sum();
+        self.reserve_locked(file, at, framed);
+        // The padding's positional write moved the cursor the record is
+        // written through (Windows only; see `write_zeros_at`).
+        #[cfg(not(unix))]
+        file.seek(SeekFrom::Start(at))?;
+        #[cfg(test)]
+        let written = match test_hooks::SHORT_WAL_WRITE.with(|h| h.take()) {
+            Some(keep) => {
+                let all: Vec<u8> = bufs.iter().flat_map(|b| b.iter().copied()).collect();
+                file.write_all(&all[..keep.min(all.len())])?;
+                Err(io::Error::other("injected short WAL write"))
+            }
+            None => write_all_vectored(file, bufs),
+        };
+        #[cfg(not(test))]
+        let written = write_all_vectored(file, bufs);
+        if let Err(e) = written {
+            #[cfg(test)]
+            let rolled_back = if test_hooks::FAIL_WAL_ROLLBACK.with(|f| f.replace(false)) {
+                Err(io::Error::other("injected failure to cut the log back"))
+            } else {
+                file.set_len(at)
+                    .and_then(|()| file.seek(SeekFrom::Start(at)).map(|_| ()))
+            };
+            #[cfg(not(test))]
+            let rolled_back = file
+                .set_len(at)
+                .and_then(|()| file.seek(SeekFrom::Start(at)).map(|_| ()));
+            match rolled_back {
+                // The cut took the padding past the record with it.
+                Ok(()) => self.allocated.store(at, Ordering::Relaxed),
+                Err(cut) => self.poison(format!(
+                    "appending to the log failed ({}) and the partial record could not be cut \
+                     back: {}",
+                    e, cut
+                )),
+            }
+            return Err(e);
+        }
+        // A record past the padding (a large one, or padding that is off or
+        // failed) grew the file itself.
+        self.allocated.fetch_max(at + framed, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Puts a chunk of zeros ahead of the append point when a record of
+    /// `need` bytes at `at` would otherwise grow the file, so that it and the
+    /// records after it overwrite blocks the file already owns (see
+    /// [`crate::WAL_PREALLOC_BYTES`] for what that buys). Call under the
+    /// writer lock.
+    ///
+    /// The zeros need no sync of their own. They are written before the
+    /// record, and the `fdatasync` that makes the record durable flushes
+    /// them with it; until then a power cut may keep any of them or none,
+    /// and all replay asks of the bytes past the last record is that they
+    /// are not a record. Zeros are not (the magic is wrong), and whatever
+    /// else a crash leaves there is a torn tail, as it was before.
+    ///
+    /// Best effort: no commit fails for want of padding. If the zeros cannot
+    /// be written the log grows by its appends as it always did, and nothing
+    /// tries again until the log is next discarded. A record of a chunk or
+    /// more is not padded for: writing it twice would cost more than the
+    /// journal commit it saves.
+    fn reserve_locked(&self, file: &File, at: u64, need: u64) {
+        {
+            let chunk = self.prealloc.load(Ordering::Relaxed);
+            let allocated = self.allocated.load(Ordering::Relaxed);
+            if chunk == 0
+                || need >= chunk
+                || at + need <= allocated
+                || self.prealloc_failed.load(Ordering::Relaxed)
+            {
+                return;
+            }
+            // From the end of the file, never from `at`: what lies between
+            // the two is zeros already.
+            #[cfg(test)]
+            let filled = if test_hooks::FAIL_PREALLOC.with(|f| f.replace(false)) {
+                Err(io::Error::other("injected failure to extend the log"))
+            } else {
+                write_zeros_at(file, allocated, chunk)
+            };
+            #[cfg(not(test))]
+            let filled = write_zeros_at(file, allocated, chunk);
+            match filled {
+                Ok(()) => {
+                    self.allocated.store(allocated + chunk, Ordering::Relaxed);
+                    #[cfg(test)]
+                    test_hooks::PREALLOCS.with(|n| n.set(n.get() + 1));
+                }
+                Err(e) => {
+                    self.prealloc_failed.store(true, Ordering::Relaxed);
+                    // However much of the chunk landed is zeros past the end.
+                    if let Ok(meta) = file.metadata() {
+                        self.allocated.fetch_max(meta.len(), Ordering::Relaxed);
+                    }
+                    log::warn!(
+                        "Could not extend {} with {} bytes of zeros ({}); it grows by its \
+                         appends until its next checkpoint",
+                        self.path.display(),
+                        chunk,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    /// Sets this log's padding chunk, whatever the process-wide setting
+    /// ([`crate::WAL_PREALLOC_BYTES`]); 0 turns padding off for it. Padding
+    /// already written stays until the log is next cut.
+    ///
+    /// For a caller that opens a log of its own, and for tests: one that
+    /// flipped the process-wide setting would change every log its siblings
+    /// have open.
+    pub fn set_prealloc(&self, bytes: u64) {
+        let _writer = self.writer.lock();
+        self.prealloc.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Moves the append point of a log recovery kept to `at`, the end of the
+    /// records recovery itself read: one scan decides both what was replayed
+    /// and where the next record goes.
+    fn resume_at(&self, at: u64) -> io::Result<()> {
+        let mut file = self.writer.lock();
+        if self.write_pos.load(Ordering::Relaxed) != at {
+            file.seek(SeekFrom::Start(at))?;
+            self.write_pos.store(at, Ordering::Relaxed);
+            self.bytes_since_checkpoint.store(at, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Notes that a record for `file_id` is in the live log. Call under the
+    /// writer lock, after the record is written.
+    #[inline]
+    fn mark_dirty_locked(&self, file_id: u64) {
+        if file_id == u64::MAX || self.last_dirty.load(Ordering::Relaxed) != file_id {
+            self.dirty.lock().ids.insert(file_id);
+            self.last_dirty.store(file_id, Ordering::Relaxed);
+        }
+    }
+
     /// Writes the zero-payload record that marks `txn` as committed.
     fn log_commit_marker(&self, txn: u64) -> io::Result<u64> {
-        let lsn = self.commit_lsn.fetch_add(1, Ordering::AcqRel) + 1;
+        self.log_commit_marker_at(txn).map(|(seq, _)| seq)
+    }
 
-        let mut header = [0u8; HEADER_LEN];
-        header[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
-        header[4] = FORMAT_VERSION;
-        header[5] = FLAG_COMMIT;
-        header[8..16].copy_from_slice(&txn.to_le_bytes());
-        // A marker describes no bytes, so `file_id` and `len` stay zero and the
-        // `offset` field carries the commit sequence instead.
-        header[24..32].copy_from_slice(&lsn.to_le_bytes());
-
-        let mut digest = CRC.digest();
-        digest.update(&header[0..HEADER_CRC_LEN]);
-        header[HEADER_CRC_LEN..HEADER_LEN].copy_from_slice(&digest.finalize().to_le_bytes());
-
-        let seq = {
+    /// [`Wal::log_commit_marker`], with the commit sequence the marker carries
+    /// as well: `(sync sequence, commit LSN)`.
+    fn log_commit_marker_at(&self, txn: u64) -> io::Result<(u64, u64)> {
+        let (seq, lsn) = {
             let mut file = self.writer.lock();
-            file.write_all(&header)?;
-            self.write_pos.fetch_add(HEADER_LEN as u64, Ordering::Relaxed);
-            self.issued.fetch_add(1, Ordering::AcqRel) + 1
+            // Assigned under the writer lock, so commit sequences reach the
+            // file in order and `commit_lsn` read under that lock names every
+            // marker already written — what a checkpoint records as staged.
+            let lsn = self.commit_lsn.fetch_add(1, Ordering::AcqRel) + 1;
+            let header = marker_header(txn, lsn);
+            #[cfg(test)]
+            let written = if test_hooks::FAIL_COMMIT_MARKER.with(|f| f.replace(false)) {
+                Err(io::Error::other("injected commit-marker failure"))
+            } else {
+                self.append_locked(&mut file, &mut [io::IoSlice::new(&header)])
+            };
+            #[cfg(not(test))]
+            let written = self.append_locked(&mut file, &mut [io::IoSlice::new(&header)]);
+            if let Err(e) = written {
+                // Handed out under this lock, so nothing has taken a later
+                // one: give it back rather than leave a hole in the sequence.
+                self.commit_lsn.fetch_sub(1, Ordering::AcqRel);
+                return Err(e);
+            }
+            self.write_pos
+                .fetch_add(HEADER_LEN as u64, Ordering::Relaxed);
+            (self.issued.fetch_add(1, Ordering::AcqRel) + 1, lsn)
         };
 
         self.bytes_since_checkpoint
             .fetch_add(HEADER_LEN as u64, Ordering::Relaxed);
 
-        Ok(seq)
+        Ok((seq, lsn))
     }
 
     /// Logs a single self-contained write and makes it durable.
     pub fn log_and_commit(&self, file_id: u64, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        let seq = self.log_with_marker(file_id, offset, bytes)?;
+        self.commit_through(seq)
+    }
+
+    /// A one-record transaction: the record and its commit marker framed
+    /// together and written in one `writev` under one acquisition of the
+    /// writer lock, where `log` + `commit_txn` took the lock twice and made
+    /// three system calls. Returns the marker's sequence; nothing is synced.
+    ///
+    /// Equivalent to `begin` + `log` + `commit_txn_deferred_seq` for a
+    /// transaction with no in-place payloads — which a fresh transaction
+    /// holding one appended record never has — down to the counters: `issued`
+    /// rises by two, the marker carrying the second.
+    ///
+    /// Torn writes: replay reads records in file order and stops at the first
+    /// one that is short or fails its CRC (`LogScanner::next`), and only a
+    /// marker inside that valid prefix commits anything. A crash mid-write can
+    /// therefore leave (a) a partial record — replay stops before it, the
+    /// transaction has no marker and is not applied; (b) the whole record and
+    /// a partial marker — replay stops at the marker, the record is rolled
+    /// back; or (c) both whole. Those are exactly the states two separate
+    /// writes could leave, and pages persisted out of order collapse to (a) or
+    /// (b) because a gap fails the CRC of the record it falls in.
+    fn log_with_marker(&self, file_id: u64, offset: u64, bytes: &[u8]) -> io::Result<u64> {
+        // `finish_txn` refuses a poisoned log before writing its marker; this
+        // refuses before writing either half, which leaves less behind.
+        if unlikely(self.poisoned.load(Ordering::Acquire)) {
+            return Err(self.poisoned_error());
+        }
+        self.refuse_if_contested(file_id)?;
+        if bytes.len() > MAX_RECORD_PAYLOAD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("WAL record payload of {} bytes is too large", bytes.len()),
+            ));
+        }
         let txn = self.begin();
-        self.log(txn, file_id, offset, bytes)?;
-        self.commit_txn(txn)
+        let header = record_header(txn, file_id, offset, bytes);
+        let framed = (2 * HEADER_LEN + bytes.len()) as u64;
+
+        let seq = {
+            let mut file = self.writer.lock();
+            // Under the lock, as in `log_commit_marker`.
+            let lsn = self.commit_lsn.fetch_add(1, Ordering::AcqRel) + 1;
+            let marker = marker_header(txn, lsn);
+            if let Err(e) = self.append_locked(
+                &mut file,
+                &mut [
+                    io::IoSlice::new(&header),
+                    io::IoSlice::new(bytes),
+                    io::IoSlice::new(&marker),
+                ],
+            ) {
+                // As in `log_commit_marker`: no hole in the sequence.
+                self.commit_lsn.fetch_sub(1, Ordering::AcqRel);
+                return Err(e);
+            }
+            self.mark_dirty_locked(file_id);
+            self.write_pos.fetch_add(framed, Ordering::Relaxed);
+            // Two records, bumped under the lock like their bytes: the marker's
+            // sequence is the second.
+            self.issued.fetch_add(2, Ordering::AcqRel) + 2
+        };
+
+        self.bytes_since_checkpoint
+            .fetch_add(framed, Ordering::Relaxed);
+        Ok(seq)
     }
 
     /// Logs a single self-contained write and marks it committed, leaving the
@@ -829,9 +1966,194 @@ impl Wal {
         offset: u64,
         bytes: &[u8],
     ) -> io::Result<u64> {
+        let seq = self.log_with_marker(file_id, offset, bytes)?;
+        // Owed to `sync_pending`, as `finish_txn` records a deferred commit.
+        self.pending_sync.fetch_max(seq, Ordering::AcqRel);
+        Ok(seq)
+    }
+
+    /// Voids every record this log holds for `file_ids`, for a caller about to
+    /// delete those files. Durable when it returns.
+    ///
+    /// A record names its file only by an id hashed from the file's name, so a
+    /// file deleted and later created again under that name (a dropped table
+    /// recreated, which an `ALTER … ADD COLUMN` rewrite does, or a table
+    /// created under a renamed table's old name) has the id and path the old
+    /// one had. A replay before the next checkpoint (and every open replays)
+    /// wrote the old file's records into the new one, and wherever the new
+    /// file was shorter the old bytes came back, rows included.
+    ///
+    /// Not a checkpoint, though one would void them too: a checkpoint declines
+    /// while any transaction holds an in-place write, the dropping one's
+    /// included, so it cannot be relied on, and it flushes every file written
+    /// since the last one. This is one header per file and one log sync.
+    ///
+    /// Positional: replay skips the records for these ids that precede the
+    /// barrier, whenever their transactions commit, and applies the ones after
+    /// it, which belong to whatever file takes the name next. A barrier whose
+    /// commit marker is lost voids nothing, which is the state before the call.
+    /// A failure that poisoned the log came after the append, so the barrier
+    /// may be durable; a failure that did not left nothing that can commit.
+    ///
+    /// The one sync also makes everything logged before it durable, so a
+    /// caller that needs an earlier record of this log durable first (a
+    /// catalogue tombstone) owes no sync of its own.
+    pub fn forget_files(&self, file_ids: &[u64]) -> io::Result<()> {
+        self.forget(file_ids, false)
+    }
+
+    /// [`Wal::forget_files`] for a `DROP`, whose barrier is also remembered
+    /// for [`Wal::dropped_after`] once it commits.
+    ///
+    /// Only a drop: a snapshot whose copy finds a file gone may leave it out
+    /// when a drop deleted it after the copy began, because a restore empties
+    /// that file at the barrier anyway. A rename or a move copies its files
+    /// without a log record, so a file one of them took away is in no log to
+    /// rebuild it from; it must fail the snapshot rather than vanish from it.
+    pub fn forget_dropped_files(&self, file_ids: &[u64]) -> io::Result<()> {
+        self.forget(file_ids, true)
+    }
+
+    /// Whether a `DROP` barrier for `file_id` committed past commit sequence
+    /// `lsn` (see [`Wal::forget_dropped_files`]). Answered only while
+    /// checkpoints archive; `false` otherwise.
+    pub fn dropped_after(&self, file_id: u64, lsn: u64) -> bool {
+        self.dropped_at
+            .lock()
+            .get(&file_id)
+            .is_some_and(|&at| at > lsn)
+    }
+
+    /// Forgets the drops committed at or before `lsn`: a snapshot starting
+    /// there, and every later one, never asks about them.
+    pub fn forget_drops_through(&self, lsn: u64) {
+        self.dropped_at.lock().retain(|_, at| *at > lsn);
+    }
+
+    fn forget(&self, file_ids: &[u64], dropped: bool) -> io::Result<()> {
+        if file_ids.is_empty() {
+            return Ok(());
+        }
+        if unlikely(self.poisoned.load(Ordering::Acquire)) {
+            return Err(self.poisoned_error());
+        }
+        #[cfg(test)]
+        if test_hooks::FAIL_FORGET.with(|f| f.get())
+            && test_hooks::FORGETS_BEFORE_FAILING.with(|n| {
+                let left = n.get();
+                n.set(left.saturating_sub(1));
+                left == 0
+            })
+        {
+            test_hooks::FAIL_FORGET.with(|f| f.set(false));
+            return Err(io::Error::other("injected failure to log a barrier"));
+        }
+        #[cfg(test)]
+        if test_hooks::FAIL_FORGET_IN.with(|p| {
+            let mut p = p.borrow_mut();
+            let hit = p.as_deref() == Some(self.path.as_path());
+            if hit {
+                *p = None;
+            }
+            hit
+        }) {
+            return Err(io::Error::other("injected failure to log a barrier in this log"));
+        }
         let txn = self.begin();
-        self.log(txn, file_id, offset, bytes)?;
-        self.commit_txn_deferred_seq(txn)
+        let headers: Vec<[u8; HEADER_LEN]> =
+            file_ids.iter().map(|id| forget_header(txn, *id)).collect();
+        let framed = (headers.len() * HEADER_LEN) as u64;
+        let fence = {
+            let mut file = self.writer.lock();
+            let mut bufs: Vec<io::IoSlice<'_>> =
+                headers.iter().map(|h| io::IoSlice::new(h)).collect();
+            self.append_locked(&mut file, &mut bufs)?;
+            // Fenced from here, under the same lock: a writer that opened
+            // these files before now cannot log after the barrier, where it
+            // would not be voided. Only once the barrier is in the file: a
+            // failed append leaves the caller free to keep the table.
+            //
+            // Pending until the marker is written (see `Fence`). Taken in
+            // INCARNATIONS order, so it is the highest pending fence too.
+            let fence = INCARNATIONS.fetch_add(1, Ordering::AcqRel);
+            let mut fences = self.fences.write();
+            for id in file_ids {
+                fences.entry(*id).or_default().pending = fence;
+            }
+            drop(fences);
+            // Not marked dirty: a barrier gives a checkpoint nothing to flush.
+            self.write_pos.fetch_add(framed, Ordering::Relaxed);
+            self.issued
+                .fetch_add(headers.len() as u64, Ordering::AcqRel);
+            fence
+        };
+        self.bytes_since_checkpoint
+            .fetch_add(framed, Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(hook) = test_hooks::AFTER_BARRIER_FENCE.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+        #[cfg(test)]
+        if test_hooks::FAIL_BARRIER_MARKER.with(|f| f.replace(false)) {
+            test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(true));
+        }
+        // Decided by whether the marker was written, never by the outcome
+        // of the commit as a whole: a marker in the file commits the barrier
+        // at the next sync anyone takes, whatever this call's own sync says.
+        //
+        // A marker that was not written (cut back cleanly) leaves a barrier
+        // that can never commit and voids nothing, so its fences go: the
+        // caller puts the table back, and the table's own writers, born
+        // before them, would otherwise have every record refused until a
+        // restart. Fences of earlier, committed barriers for the same ids
+        // stay.
+        let (seq, lsn) = match self.log_commit_marker_at(txn) {
+            Ok(at) => at,
+            Err(e) => {
+                self.settle_fences(file_ids, fence, false);
+                return Err(e);
+            }
+        };
+        // Committed from here as far as the fences go, before the sync and
+        // before the caller deletes anything: see `apply_held`. A sync that
+        // fails then poisons the log (see `commit_through_slow`), which is
+        // what tells the caller the barrier may be durable.
+        self.settle_fences(file_ids, fence, true);
+        // Before the caller deletes anything, as the fences are: a snapshot
+        // asks only once it has found the file gone.
+        if dropped && self.is_archiving() {
+            let mut at = self.dropped_at.lock();
+            for id in file_ids {
+                at.insert(*id, lsn);
+            }
+        }
+        #[cfg(test)]
+        if test_hooks::FAIL_BARRIER_SYNC.with(|f| f.replace(false)) {
+            self.poison("injected fdatasync failure".to_string());
+            return Err(io::Error::other("injected fdatasync failure"));
+        }
+        self.commit_through(seq)
+    }
+
+    /// Settles the pending fence `fence` that [`Wal::forget_files`] took for
+    /// `file_ids`: committed, it becomes their committed fence; otherwise it
+    /// is dropped. A later barrier's pending fence for an id is left alone.
+    fn settle_fences(&self, file_ids: &[u64], fence: u64, committed: bool) {
+        let mut fences = self.fences.write();
+        for id in file_ids {
+            let Some(entry) = fences.get_mut(id) else {
+                continue;
+            };
+            if entry.pending == fence {
+                entry.pending = 0;
+            }
+            if committed {
+                entry.committed = entry.committed.max(fence);
+            }
+            if entry.committed == 0 && entry.pending == 0 {
+                fences.remove(id);
+            }
+        }
     }
 
     /// Bytes of in-place overwrites currently held back, across all open
@@ -847,7 +2169,19 @@ impl Wal {
     /// [`Wal::checkpoint`].
     pub fn truncate(&self) -> io::Result<()> {
         let mut file = self.writer.lock();
-        self.truncate_locked(&mut file)
+        // Before the mark below, which would otherwise record as dropped
+        // records a refused truncation kept.
+        self.refuse_if_poisoned()?;
+        // Not staged: whatever this drops is not in any archive.
+        self.unstaged_through_lsn
+            .fetch_max(self.commit_lsn.load(Ordering::Acquire), Ordering::AcqRel);
+        self.truncate_locked(&mut file)?;
+        // The log is empty, so it describes no file. Recovery truncates after
+        // syncing what it applied, and left the files named by the replayed
+        // records owed a second sync at the next checkpoint.
+        *self.dirty.lock() = DirtyFiles::default();
+        self.last_dirty.store(u64::MAX, Ordering::Relaxed);
+        Ok(())
     }
 
     /// The body of [`Wal::truncate`], for callers that already hold the writer.
@@ -856,6 +2190,8 @@ impl Wal {
     /// appended between the copy and the `set_len` would be discarded without
     /// ever having been archived.
     fn truncate_locked(&self, file: &mut File) -> io::Result<()> {
+        self.refuse_if_poisoned()?;
+
         // Before the log is dropped, never after. A crash in between then
         // leaves a mark that is merely ahead of the log, which the next open
         // reconciles by taking the higher of the two. The other order would
@@ -865,6 +2201,47 @@ impl Wal {
         // Best-effort: failing the checkpoint over it would let the log grow
         // without bound, and the cost of the mark not landing is a sequence
         // that restarts — bad for backups, harmless for durability.
+        self.write_lsn_mark_best_effort();
+
+        file.set_len(0)?;
+        // The append point moves back with the file, at once (Q19). The writer
+        // is not in append mode — records are placed at `write_pos` explicitly
+        // — so leaving it at its pre-truncation value made every later record
+        // report a `log_offset` far past the real end of the log. Appends never
+        // notice, because nothing reads them back; an in-place overwrite reads
+        // its payload from that offset at commit and got "failed to fill whole
+        // buffer" every time. Deterministic after any checkpoint, not a race.
+        // And not after the sync below: a failure there left it stale, and a
+        // later cut-back to it would leave a zero gap that replay stops at.
+        self.write_pos.store(0, Ordering::Relaxed);
+        self.bytes_since_checkpoint.store(0, Ordering::Relaxed);
+        // The padding went with the records. It is put back by the next
+        // record, not here: a log nothing writes to stays empty, and this
+        // stays one atomic change of length.
+        self.allocated.store(0, Ordering::Relaxed);
+        self.prealloc_failed.store(false, Ordering::Relaxed);
+        // From here whether the truncation reached the disk is unknown if
+        // anything fails (fsyncgate): records written from offset zero over a
+        // log the disk may still hold could replay ahead of older ones. So a
+        // failure poisons.
+        let synced = (|| -> io::Result<()> {
+            Self::injected("truncate_seek")?;
+            file.seek(SeekFrom::Start(0))?;
+            let _synced = crate::core::sync_audit::note("wal.truncate", &self.path);
+            Self::injected("truncate_sync")?;
+            file.sync_all()
+        })();
+        if let Err(e) = synced {
+            self.poison(format!("truncating the log failed after it was cut: {}", e));
+            return Err(e);
+        }
+        // Everything issued so far is now vacuously durable.
+        let issued = self.issued.load(Ordering::Acquire);
+        self.durable.fetch_max(issued, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn write_lsn_mark_best_effort(&self) {
         let lsn = self.commit_lsn.load(Ordering::Acquire);
         if lsn > 0 {
             if let Err(e) = write_lsn_mark(&self.path, lsn) {
@@ -876,23 +2253,20 @@ impl Wal {
                 );
             }
         }
-
-        file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-        file.sync_all()?;
-        // The append point moves back with the file. The writer is not in
-        // append mode — records are placed at `write_pos` explicitly — so
-        // leaving it at its pre-truncation value made every later record report
-        // a `log_offset` far past the real end of the log. Appends never notice,
-        // because nothing reads them back; an in-place overwrite reads its
-        // payload from that offset at commit and got "failed to fill whole
-        // buffer" every time. Deterministic after any checkpoint, not a race.
-        self.write_pos.store(0, Ordering::Relaxed);
-        self.bytes_since_checkpoint.store(0, Ordering::Relaxed);
-        // Everything issued so far is now vacuously durable.
-        let issued = self.issued.load(Ordering::Acquire);
-        self.durable.fetch_max(issued, Ordering::AcqRel);
-        Ok(())
+        // Every id this log has handed out is below it, so every id the
+        // dropped records carry is: the next run starts past them all.
+        let txn = self.next_txn.load(Ordering::Acquire);
+        if txn > 1 {
+            if let Err(e) = write_txn_mark(&self.path, txn) {
+                log::error!(
+                    "Could not record the next transaction id for {}: {}. A point-in-time \
+                     restore across the next restart may match one run's commit to another \
+                     run's transaction; durability is not affected.",
+                    self.path.display(),
+                    e
+                );
+            }
+        }
     }
 
     /// Sends every future checkpoint's log contents to `dir` before discarding
@@ -921,6 +2295,24 @@ impl Wal {
         Ok(())
     }
 
+    /// Whether a snapshot window ending at `end_lsn` is fully archived: every
+    /// commit through `end_lsn` has left the live log by way of a staged
+    /// segment, and nothing after `start_lsn` was dropped without one.
+    ///
+    /// Not "the live log is empty": a checkpoint keeps the records logged
+    /// during its own sync pass, so under load the log is never empty, and
+    /// asking for that discarded every snapshot taken while writes ran. Not
+    /// only the window either: a record committed before `start_lsn` can
+    /// still be in the live log, unstaged, if every checkpoint declined — an
+    /// in-place write it carries may not have reached the files the copy
+    /// read, so it too must be in the archive. Records dropped unstaged
+    /// before the window opened are the exception: a checkpoint only drops
+    /// what is already in the data files.
+    pub fn staged_covers(&self, start_lsn: u64, end_lsn: u64) -> bool {
+        self.staged_through_lsn.load(Ordering::Acquire) >= end_lsn
+            && self.unstaged_through_lsn.load(Ordering::Acquire) <= start_lsn
+    }
+
     /// Whether checkpoints are currently archiving.
     pub fn is_archiving(&self) -> bool {
         self.archive_dir.lock().is_some()
@@ -934,17 +2326,23 @@ impl Wal {
     /// that was just cut. On Linux the copy is served by `copy_file_range`, so
     /// the bytes do not travel through user space and a reflinking filesystem
     /// makes it near-free.
-    fn stage_locked(&self, file: &mut File) -> io::Result<()> {
+    ///
+    /// Only the first `upto` bytes: a checkpoint that keeps a tail stages the
+    /// tail with the segment after this one, not twice.
+    ///
+    /// `Ok(true)` when everything up to `upto` is now in staging (or there was
+    /// nothing to stage), `Ok(false)` when archiving is off.
+    fn stage_locked(&self, file: &mut File, upto: u64) -> io::Result<bool> {
         let dir = match self.archive_dir.lock().clone() {
             Some(d) => d,
-            None => return Ok(()),
+            None => return Ok(false),
         };
 
         // An empty log describes nothing; staging it would cost an upload and
         // a manifest rewrite to say so.
         file.flush()?;
-        if file.metadata()?.len() == 0 {
-            return Ok(());
+        if upto == 0 || file.metadata()?.len() == 0 {
+            return Ok(true);
         }
 
         let seq = self.archive_seq.fetch_add(1, Ordering::AcqRel);
@@ -954,13 +2352,44 @@ impl Wal {
         let final_path = dir.join(format!("{:016x}{}", seq, SEGMENT_SUFFIX));
 
         std::fs::copy(&self.path, &partial)?;
-        File::open(&partial)?.sync_data()?;
+        let staged = File::options().write(true).open(&partial)?;
+        if staged.metadata()?.len() > upto {
+            staged.set_len(upto)?;
+        }
+        let _synced = crate::core::sync_audit::note("wal.stage_segment", &final_path);
+        staged.sync_data()?;
+        drop(staged);
         std::fs::rename(&partial, &final_path)?;
         sync_parent_dir(&final_path)?;
-        Ok(())
+        Ok(true)
     }
 
-    /// Flushes every registered data file, then discards the log.
+    /// Gives up `txn` without committing it: its pending in-place overwrites
+    /// are dropped unapplied, and with them its claim on the log.
+    ///
+    /// A transaction that is never committed leaves no commit marker, so
+    /// replay already discards its records; what it also left behind was its
+    /// entry here, which kept `pending_count` raised and every later
+    /// `checkpoint` declined — the log then grew for the life of the process.
+    /// Only for a transaction whose commit was never attempted; `finish_txn`
+    /// calls it itself when the commit marker could not be written.
+    pub fn abort_txn(&self, txn: u64) {
+        let held = self.pending.lock().remove(&txn);
+        if let Some(held) = held {
+            let bytes: u64 = held.iter().map(|w| w.len as u64).sum();
+            self.pending_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            self.pending_count.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Transactions holding pending in-place overwrites. Diagnostic: a
+    /// non-zero value with nothing in flight is a transaction nobody ended.
+    pub fn pending_transactions(&self) -> u64 {
+        self.pending_count.load(Ordering::Acquire)
+    }
+
+    /// Flushes the data files the live log names (those dirtied since the last
+    /// checkpoint), then discards the log.
     ///
     /// Ordering matters: the log may only be dropped once everything it
     /// describes is on stable storage, otherwise a crash right after would lose
@@ -972,7 +2401,29 @@ impl Wal {
     /// Compaction does, and truncated a data file with live records still
     /// describing offsets past the cut, so a crash re-materialised bytes beyond
     /// the new end. `Ok(true)` means the log is gone and the files are flushed.
+    ///
+    /// A poisoned log is never checkpointed; that is an error, not a decline,
+    /// because it will not change until the process restarts.
     pub fn checkpoint(&self) -> io::Result<bool> {
+        let outcome = self.checkpoint_inner();
+        match &outcome {
+            Ok(true) => {}
+            Ok(false) => {
+                self.checkpoints_declined.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                self.checkpoint_failures.fetch_add(1, Ordering::Relaxed);
+                *self.last_checkpoint_error.lock() = Some(e.to_string());
+            }
+        }
+        outcome
+    }
+
+    fn checkpoint_inner(&self) -> io::Result<bool> {
+        // Refused before any data file is touched: nothing a checkpoint does
+        // can be finished on a poisoned log, and the drop refuses too.
+        self.refuse_if_poisoned()?;
+
         // Never while a transaction is still open. Checkpointing discards the
         // log, and a pending overwrite points *into* the log for its payload —
         // truncating underneath it would leave the transaction unable to apply.
@@ -982,7 +2433,11 @@ impl Wal {
         }
 
         // One checkpoint at a time; the rest carry on writing.
-        if self.checkpointing.swap(true, Ordering::AcqRel) {
+        //
+        // `SeqCst`, paired with `hold_checkpoints`: either this sees the
+        // hold and declines, or the hold sees this checkpoint running and
+        // waits for it to end. Never both missing each other.
+        if self.checkpointing.swap(true, Ordering::SeqCst) {
             return Ok(false);
         }
         struct Reset<'a>(&'a AtomicBool);
@@ -992,15 +2447,113 @@ impl Wal {
             }
         }
         let _reset = Reset(&self.checkpointing);
+        if self.checkpoint_holds.load(Ordering::SeqCst) != 0 {
+            return Ok(false);
+        }
 
-        for (_, path) in self.registered_files() {
+        // What the sync pass below will cover: every record issued by now had
+        // its data written before it was logged. Read together, under the lock
+        // that moves both.
+        //
+        // The files to sync are taken at the same point: exactly those that
+        // records before `synced_end` describe. Syncing every registered file
+        // instead cost one device flush per table — ~2.3 ms each on the
+        // deployed disk, 4.7 s a pass at 2,042 files — however few had been
+        // written. A file no record names has nothing this checkpoint drops.
+        let (synced_end, synced_issued, synced_lsn, taken) = {
+            let _writer = self.writer.lock();
+            let taken = std::mem::take(&mut *self.dirty.lock());
+            self.last_dirty.store(u64::MAX, Ordering::Relaxed);
+            (
+                self.write_pos.load(Ordering::Relaxed),
+                self.issued.load(Ordering::Acquire),
+                // Every marker through this sequence is before `synced_end`:
+                // sequences are assigned under this lock.
+                self.commit_lsn.load(Ordering::Acquire),
+                taken,
+            )
+        };
+        // Put back if this checkpoint does not drop the records they cover —
+        // it declined, or a sync failed — so the next one still syncs them.
+        struct Restore<'a> {
+            wal: &'a Wal,
+            taken: Option<DirtyFiles>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                if let Some(taken) = self.taken.take() {
+                    let mut dirty = self.wal.dirty.lock();
+                    dirty.all |= taken.all;
+                    dirty.ids.extend(taken.ids);
+                }
+            }
+        }
+        let mut restore = Restore {
+            wal: self,
+            taken: Some(taken),
+        };
+
+        let paths: Vec<PathBuf> = {
+            let taken = restore.taken.as_ref().expect("just set");
+            if taken.all {
+                self.registered_files().into_iter().map(|(_, p)| p).collect()
+            } else {
+                let files = self.files.lock();
+                taken.ids.iter().filter_map(|id| files.get(id).cloned()).collect()
+            }
+        };
+        // Each fixed-record file's whole-record length as its sync is issued:
+        // durable once the sync returns, and recorded as its floor only once
+        // every sync of the pass has.
+        let mut floors: Vec<(crate::core::torn_tail::FileIdentity, String, u64)> = Vec::new();
+        for path in paths {
             match File::options().read(true).write(true).open(&path) {
-                Ok(f) => f.sync_data()?,
+                Ok(f) => {
+                    if let Some(kind) = crate::core::torn_tail::classify_path(&path)
+                        && let Ok(meta) = f.metadata()
+                    {
+                        let name = path.file_name().unwrap_or_default().to_string_lossy();
+                        floors.push((
+                            crate::core::torn_tail::FileIdentity::of(&path, &meta),
+                            name.into_owned(),
+                            kind.whole(meta.len()),
+                        ));
+                    }
+                    #[cfg(test)]
+                    test_hooks::CHECKPOINT_SYNCS.with(|n| n.set(n.get() + 1));
+                    let _synced = crate::core::sync_audit::note("wal.checkpoint.data_file", &path);
+                    // A failed flush is not something the next checkpoint can
+                    // retry. On Linux the kernel reports the writeback error
+                    // once and may drop the dirty pages with it, so a second
+                    // `fdatasync` can succeed over data that never reached the
+                    // disk — and that success would drop the log, the only
+                    // remaining copy. Poisoning keeps the log for replay and
+                    // stops commits pretending to be durable.
+                    if let Err(e) = f.sync_data() {
+                        self.poison(format!(
+                            "checkpoint could not flush {}: {}",
+                            path.display(),
+                            e
+                        ));
+                        return Err(e);
+                    }
+                }
                 // A file that no longer exists cannot need flushing.
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                // Failing to *open* loses nothing — no flush was attempted, so
+                // no error was consumed — and the next checkpoint may retry.
                 Err(e) => return Err(e),
             }
         }
+
+        self.record_floors(floors);
+
+        #[cfg(test)]
+        test_hooks::AFTER_CHECKPOINT_SYNC.with(|hook| {
+            if let Some(f) = hook.borrow_mut().as_mut() {
+                f();
+            }
+        });
 
         let mut file = self.writer.lock();
 
@@ -1012,19 +2565,185 @@ impl Wal {
         if self.pending_count.load(Ordering::Acquire) != 0 {
             return Ok(false);
         }
+        // Again before staging, since a commit can poison the log while the
+        // sync pass runs: a checkpoint that will not drop the records has no
+        // business staging them and advancing what the archive claims.
+        self.refuse_if_poisoned()?;
 
         // Staged before the truncation and under the same lock: the records are
         // in the data files by now, which is what makes them safe to *drop*,
         // but a snapshot taken while they were being written still needs them
         // to reach a consistent state.
-        if let Err(e) = self.stage_locked(&mut file) {
-            // Losing the segment costs point-in-time coverage, not durability —
-            // the data is already flushed. Failing the checkpoint instead would
-            // let the log grow without bound because a full disk is the most
-            // likely cause.
-            log::error!("WAL segment could not be staged for archiving: {}", e);
+        // Records logged while the files were being synced are past
+        // `synced_end`, and their data may have reached a file after its sync.
+        // Discarding them — and declaring them durable, as a truncation does —
+        // would lose them on a crash. So they are kept: the log is cut back to
+        // exactly that tail, and only what the sync pass covered is dropped.
+        let end = self.write_pos.load(Ordering::Relaxed);
+        match self.stage_locked(&mut file, synced_end) {
+            Ok(true) => {
+                self.staged_through_lsn.fetch_max(synced_lsn, Ordering::AcqRel);
+            }
+            // Not archiving: these records are dropped with no copy.
+            Ok(false) => {
+                self.unstaged_through_lsn.fetch_max(synced_lsn, Ordering::AcqRel);
+            }
+            Err(e) => {
+                // Losing the segment costs point-in-time coverage, not
+                // durability — the data is already flushed. Failing the
+                // checkpoint instead would let the log grow without bound
+                // because a full disk is the most likely cause. Recorded, so
+                // no snapshot window over these records is reported complete.
+                self.unstaged_through_lsn.fetch_max(synced_lsn, Ordering::AcqRel);
+                log::error!("WAL segment could not be staged for archiving: {}", e);
+            }
         }
-        self.truncate_locked(&mut file).map(|()| true)
+        let dropped = if end == synced_end {
+            self.truncate_locked(&mut file)
+        } else {
+            self.keep_tail_locked(&mut file, synced_end, end, synced_issued)
+        };
+        if dropped.is_ok() {
+            // The records those files backed are gone; nothing to put back.
+            restore.taken = None;
+        }
+        dropped.map(|()| true)
+    }
+
+    /// Records the floors a checkpoint's sync pass made durable, and stores
+    /// them before the pass's records are dropped.
+    ///
+    /// Best-effort, as the commit-sequence mark is: a floor only ever
+    /// refuses, so one that does not land costs a check at the next open,
+    /// while failing the checkpoint would let the log grow without bound. The
+    /// floors already stored are no higher than the truth, since every
+    /// in-place shrink lowers them durably first.
+    fn record_floors(&self, synced: Vec<(crate::core::torn_tail::FileIdentity, String, u64)>) {
+        if synced.is_empty() {
+            return;
+        }
+        let mut floors = self.floors.lock();
+        let mut changed = false;
+        for (id, name, floor) in synced {
+            changed |= floors.set(id, &name, floor);
+        }
+        if changed {
+            let at = crate::core::torn_tail::Floors::path_for(&self.path);
+            if let Err(e) = floors.store(&at) {
+                log::error!(
+                    "Could not record the durable floors in {}: {}. The next open checks \
+                     torn files against older floors; durability is not affected.",
+                    at.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    /// Lowers the floor of `path` to `len`, durably, for a shrink in place.
+    /// Called before the file is shortened, so no floor on disk is ever above
+    /// a file's synced length, and again after, to undo a checkpoint that
+    /// sampled the old length in between.
+    pub fn lower_floor(&self, path: &Path, len: u64) -> io::Result<()> {
+        let mut floors = self.floors.lock();
+        crate::core::torn_tail::lower_floor_in(&mut floors, &self.path, path, len)
+    }
+
+    /// The floors as stored, for a test.
+    #[cfg(test)]
+    pub(crate) fn floors(&self) -> crate::core::torn_tail::Floors {
+        self.floors.lock().clone()
+    }
+
+    /// Replaces the log with its records from `from` to `end`, the ones a
+    /// checkpoint's sync pass did not cover, and marks durable only what it
+    /// did cover (`covered_issued`).
+    ///
+    /// Written to a new file and renamed over the log, never shifted in place:
+    /// a crash before the rename leaves the whole old log (replay is redo, so
+    /// its already-flushed head applies again harmlessly), and after it the
+    /// tail alone. Shifting in place would, for a moment, put a torn record at
+    /// offset 0, and replay stops at the first one — taking the tail with it.
+    /// The new file becomes both the writer and the sync handle before this
+    /// returns; a failure after the rename poisons the log.
+    fn keep_tail_locked(
+        &self,
+        file: &mut File,
+        from: u64,
+        end: u64,
+        covered_issued: u64,
+    ) -> io::Result<()> {
+        // Drops the head of the log just as a truncation drops all of it.
+        self.refuse_if_poisoned()?;
+
+        self.write_lsn_mark_best_effort();
+        file.flush()?;
+        let tail_len = end - from;
+        let temp = self.path.with_extension("ckpt");
+        {
+            let mut source = File::open(&self.path)?;
+            source.seek(SeekFrom::Start(from))?;
+            // Announced for crash images, which may undo directory operations
+            // no completed directory sync covers (design §11).
+            #[cfg(test)]
+            crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Create(&temp));
+            let mut target = File::create(&temp)?;
+            let copied = io::copy(&mut (&mut source).take(tail_len), &mut target)?;
+            if copied != tail_len {
+                let _ = std::fs::remove_file(&temp);
+                return Err(io::Error::other(format!(
+                    "checkpoint copied {copied} of the {tail_len}-byte tail of {}",
+                    self.path.display()
+                )));
+            }
+            let _synced = crate::core::sync_audit::note("wal.keep_tail", &self.path);
+            target.sync_data()?;
+        }
+        #[cfg(test)]
+        crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Rename {
+            from: &temp,
+            to: &self.path,
+        });
+        std::fs::rename(&temp, &self.path)?;
+
+        // From here the log's path names the new file while the writer and
+        // the sync handle are still on the old, now unlinked, inode. Any
+        // failure before both are replaced poisons (Q13): left alone, the next
+        // commit would be written and fsynced into a file nothing replays, and
+        // acknowledged. Both are replaced under the writer lock the caller
+        // holds, so no record or sync falls between them.
+        let installed = (|| -> io::Result<()> {
+            #[cfg(any(test, feature = "index_store_failpoints"))]
+            crate::core::power_loss::failpoint::hit("keep_tail_after_rename_fails", &self.path)?;
+            Self::injected("rename_dir_sync")?;
+            sync_parent_dir(&self.path)?;
+            Self::injected("rename_open")?;
+            let mut reopened = File::options().read(true).write(true).open(&self.path)?;
+            Self::injected("rename_seek")?;
+            reopened.seek(SeekFrom::Start(tail_len))?;
+            Self::injected("rename_clone")?;
+            let handle = Arc::new(reopened.try_clone()?);
+            *file = reopened;
+            *self.sync_handle.lock() = Some(handle);
+            Ok(())
+        })();
+        if let Err(e) = installed {
+            self.poison(format!(
+                "a checkpoint replaced the log but could not move onto the new file: {}",
+                e
+            ));
+            return Err(e);
+        }
+
+        self.write_pos.store(tail_len, Ordering::Relaxed);
+        self.bytes_since_checkpoint.store(tail_len, Ordering::Relaxed);
+        // The new file is the tail and nothing else: no padding yet.
+        self.allocated.store(tail_len, Ordering::Relaxed);
+        self.prealloc_failed.store(false, Ordering::Relaxed);
+        // Only what the sync pass covered. The tail is durable too — it was
+        // just synced into the new file — but its own committers will say so.
+        self.durable.fetch_max(covered_issued, Ordering::AcqRel);
+        Ok(())
     }
 
     /// Replays `path`, resolving `file_id` through `resolve`.
@@ -1057,7 +2776,43 @@ impl Wal {
         resolve: impl Fn(u64) -> Option<PathBuf>,
         upto: Option<u64>,
     ) -> io::Result<RecoveryStats> {
-        let path = path.as_ref();
+        Self::replay_log(path.as_ref(), resolve, upto, None)
+    }
+
+    /// [`Wal::recover_upto`] over files restored from a copy taken when the
+    /// commit sequence stood at `copied_at`, rather than over the files the
+    /// log was written against.
+    ///
+    /// A committed barrier says its file was deleted there. Live, the file
+    /// really was, so replay only has to skip the records before it, and the
+    /// records after it rebuild the next file of the name from empty. A
+    /// restored file is the copy's, and when the barrier committed after the
+    /// copy began, the copy holds the deleted file: the records after the
+    /// barrier were written over it, and wherever the new file was shorter
+    /// the deleted file's bytes stayed, rows included. So each such file is
+    /// emptied first, as the deletion left it.
+    ///
+    /// A barrier that committed before the copy began is left alone: the
+    /// copy then holds the new file, which may hold bytes no record describes
+    /// (a rename's or a move's staged copy writes none). The caller must keep
+    /// a barrier and its deletion from straddling the copy's start, which
+    /// the deleting paths do by holding the snapshot gate across both.
+    pub fn recover_restoring(
+        path: impl AsRef<Path>,
+        resolve: impl Fn(u64) -> Option<PathBuf>,
+        upto: Option<u64>,
+        copied_at: u64,
+    ) -> io::Result<RecoveryStats> {
+        Self::replay_log(path.as_ref(), resolve, upto, Some(copied_at))
+    }
+
+    /// [`Wal::recover_upto`], and with `copied_at`, [`Wal::recover_restoring`].
+    fn replay_log(
+        path: &Path,
+        resolve: impl Fn(u64) -> Option<PathBuf>,
+        upto: Option<u64>,
+        copied_at: Option<u64>,
+    ) -> io::Result<RecoveryStats> {
         let mut stats = RecoveryStats::default();
 
         let total = match std::fs::metadata(path) {
@@ -1071,35 +2826,103 @@ impl Wal {
 
         // Pass 1: which transactions reached a commit record?
         let mut committed: HashSet<u64> = HashSet::new();
+        // `(txn, file_id, position)` of every barrier, committed or not.
+        //
+        // With the commit sequence of the marker that committed it, if one
+        // did: the first marker for its transaction *after* it. Never one
+        // before it, nor a later one once that is found: an archive joins the
+        // logs of several runs, and a run whose ids started again (before
+        // the transaction-id mark, or when it could not be written) reissued
+        // the barrier's id. A later run's commit of it then took the barrier
+        // for committed after the copy and the restore emptied the file, and
+        // an earlier run's marker committed a barrier whose own failed.
+        let mut barriers: Vec<(u64, u64, u64, Option<u64>)> = Vec::new();
+        // Barriers whose marker has not been seen yet, by transaction id.
+        let mut awaiting: HashMap<u64, Vec<usize>> = HashMap::new();
         let valid_bytes;
         {
             let mut scan = LogScanner::open(path)?;
+            let mut ordinal = 0u64;
             while let Some(h) = scan.next()? {
+                let at = ordinal;
+                ordinal += 1;
+                stats.last_txn = stats.last_txn.max(h.txn);
                 if h.flags & FLAG_COMMIT != 0 {
+                    // Resolved by this marker either way: one past the
+                    // ceiling did not commit them by it.
+                    let resolved = awaiting.remove(&h.txn);
                     // A marker carries its commit sequence in `offset`.
                     if upto.is_some_and(|ceiling| h.offset > ceiling) {
                         continue;
                     }
                     committed.insert(h.txn);
                     stats.last_commit_lsn = stats.last_commit_lsn.max(h.offset);
+                    for index in resolved.into_iter().flatten() {
+                        barriers[index].3 = Some(h.offset);
+                    }
+                } else if h.flags & FLAG_FORGET != 0 {
+                    awaiting.entry(h.txn).or_default().push(barriers.len());
+                    barriers.push((h.txn, h.file_id, at, None));
                 }
             }
             valid_bytes = scan.consumed;
         }
 
-        // Pass 2: apply the records those transactions own.
+        // Per file, the position of its last committed barrier: its records
+        // before that describe a file that was deleted, and the file under
+        // that name now, if any, is another one. Known only once pass 1 has
+        // seen every marker, since a barrier's commit comes after it.
+        let mut void_before: HashMap<u64, u64> = HashMap::new();
+        // Files a restore empties: see `recover_restoring`.
+        let mut emptied: HashSet<u64> = HashSet::new();
+        for (_, file_id, at, commit_lsn) in barriers {
+            let Some(lsn) = commit_lsn else {
+                continue;
+            };
+            let before = void_before.entry(file_id).or_insert(0);
+            *before = (*before).max(at);
+            if copied_at.is_some_and(|copied| lsn > copied) {
+                emptied.insert(file_id);
+            }
+        }
+        // Before any record is applied, which is the barrier's place in log
+        // order for these ids: none of their records before it is applied.
         let mut open_files: HashMap<u64, Option<File>> = HashMap::new();
+        for file_id in emptied {
+            let Some(target) = resolve(file_id) else {
+                continue;
+            };
+            match File::options().read(true).write(true).open(&target) {
+                Ok(file) => {
+                    file.set_len(0)?;
+                    stats.emptied += 1;
+                    open_files.insert(file_id, Some(file));
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Pass 2: apply the records those transactions own.
         {
             let mut scan = LogScanner::open(path)?;
+            let mut ordinal = 0u64;
             while let Some(h) = scan.next()? {
-                // Commit markers are control records: they describe no bytes and
-                // must not be replayed as if they did.
-                if h.flags & FLAG_COMMIT != 0 {
+                let at = ordinal;
+                ordinal += 1;
+                // Commit markers and barriers are control records: they
+                // describe no bytes and must not be replayed as if they did.
+                if h.flags & (FLAG_COMMIT | FLAG_FORGET) != 0 {
                     continue;
                 }
 
                 if !committed.contains(&h.txn) {
                     stats.rolled_back += 1;
+                    continue;
+                }
+
+                if void_before.get(&h.file_id).is_some_and(|&before| at < before) {
+                    stats.forgotten += 1;
                     continue;
                 }
 
@@ -1149,10 +2972,19 @@ impl Wal {
         // log to itself by design, and `open_and_recover` truncating at the end
         // says so. This is the arithmetic refusing to make a violated
         // assumption worse than it already is.
+        stats.valid_bytes = valid_bytes;
         stats.truncated_tail = discarded_tail(total, valid_bytes);
+        // Zeros past the records are the log's padding, or a record that
+        // never reached the disk at all: nothing was discarded, and nothing
+        // past them can be mistaken for a record. Read up to `total` and no
+        // further, for the reason above.
+        if stats.truncated_tail > 0 && only_zeros(path, valid_bytes, total)? {
+            stats.truncated_tail = 0;
+        }
 
         // Recovery is only complete once what it wrote is itself durable.
         for target in open_files.values_mut().flatten() {
+            let _synced = crate::core::sync_audit::note_file("wal.recover.data_file", target);
             target.sync_data()?;
         }
 
@@ -1252,10 +3084,226 @@ impl LogScanner {
 /// few dozen bytes regardless of row size.
 struct PendingWrite {
     path: PathBuf,
+    /// The file it was logged for, and when that file's writer came to be:
+    /// a fence [`Wal::forget_files`] took for the id since means the file was
+    /// deleted after this was logged, and the apply must not open the path,
+    /// which names whatever file took it since (see [`Wal::apply_held`]).
+    file_id: u64,
+    born: Incarnation,
     offset: u64,
     /// Offset of this record's payload within the log file.
     log_offset: u64,
     len: usize,
+}
+
+/// The header of a data record: magic, version, ids, length and a CRC over the
+/// header's first `HEADER_CRC_LEN` bytes and the payload.
+#[inline]
+fn record_header(txn: u64, file_id: u64, offset: u64, bytes: &[u8]) -> [u8; HEADER_LEN] {
+    let mut header = [0u8; HEADER_LEN];
+    header[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
+    header[4] = FORMAT_VERSION;
+    header[5] = 0;
+    // header[6..8] reserved, left zero
+    header[8..16].copy_from_slice(&txn.to_le_bytes());
+    header[16..24].copy_from_slice(&file_id.to_le_bytes());
+    header[24..32].copy_from_slice(&offset.to_le_bytes());
+    header[32..36].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+
+    let mut digest = CRC.digest();
+    digest.update(&header[0..HEADER_CRC_LEN]);
+    digest.update(bytes);
+    header[HEADER_CRC_LEN..HEADER_LEN].copy_from_slice(&digest.finalize().to_le_bytes());
+    header
+}
+
+/// The zero-payload record voiding `file_id`'s earlier records once `txn`
+/// commits. See [`Wal::forget_files`].
+#[inline]
+fn forget_header(txn: u64, file_id: u64) -> [u8; HEADER_LEN] {
+    let mut header = [0u8; HEADER_LEN];
+    header[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
+    header[4] = FORMAT_VERSION;
+    header[5] = FLAG_FORGET;
+    header[8..16].copy_from_slice(&txn.to_le_bytes());
+    header[16..24].copy_from_slice(&file_id.to_le_bytes());
+
+    let mut digest = CRC.digest();
+    digest.update(&header[0..HEADER_CRC_LEN]);
+    header[HEADER_CRC_LEN..HEADER_LEN].copy_from_slice(&digest.finalize().to_le_bytes());
+    header
+}
+
+/// How many barrier records the log at `path` holds, committed or not: for
+/// tests that pin when a caller writes one.
+#[cfg(test)]
+pub(crate) fn barriers_in(path: &Path) -> usize {
+    let Ok(mut scan) = LogScanner::open(path) else {
+        return 0;
+    };
+    let mut n = 0;
+    while let Ok(Some(h)) = scan.next() {
+        if h.flags & FLAG_FORGET != 0 {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The zero-payload record that marks `txn` committed, carrying `lsn`.
+#[inline]
+fn marker_header(txn: u64, lsn: u64) -> [u8; HEADER_LEN] {
+    let mut header = [0u8; HEADER_LEN];
+    header[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
+    header[4] = FORMAT_VERSION;
+    header[5] = FLAG_COMMIT;
+    header[8..16].copy_from_slice(&txn.to_le_bytes());
+    // A marker describes no bytes, so `file_id` and `len` stay zero and the
+    // `offset` field carries the commit sequence instead.
+    header[24..32].copy_from_slice(&lsn.to_le_bytes());
+
+    let mut digest = CRC.digest();
+    digest.update(&header[0..HEADER_CRC_LEN]);
+    header[HEADER_CRC_LEN..HEADER_LEN].copy_from_slice(&digest.finalize().to_le_bytes());
+    header
+}
+
+/// `write_all` for several buffers in one `writev` where the kernel takes them
+/// whole, which for a regular file it does; a short write continues from where
+/// it stopped, as `write_all` would.
+fn write_all_vectored(file: &mut File, mut bufs: &mut [io::IoSlice<'_>]) -> io::Result<()> {
+    io::IoSlice::advance_slices(&mut bufs, 0);
+    while !bufs.is_empty() {
+        match file.write_vectored(bufs) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole WAL record",
+                ));
+            }
+            Ok(n) => io::IoSlice::advance_slices(&mut bufs, n),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    thread_local! {
+        /// Makes the next commit marker written on this thread fail before
+        /// touching the file, as a full disk would.
+        pub static FAIL_COMMIT_MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+        /// Makes the next `Wal::forget_files` on this thread fail before
+        /// touching the file, as a full disk would.
+        pub static FAIL_FORGET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+        /// How many `Wal::forget_files` calls on this thread `FAIL_FORGET`
+        /// lets through before failing one: the second log of a drop.
+        pub static FORGETS_BEFORE_FAILING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+
+        /// Makes the next `Wal::forget_files` on this thread fail at its
+        /// sync, after the barrier and its commit marker are in the file, and
+        /// poison the log, as a failed `fdatasync` does. What a crash keeps
+        /// of those bytes is then undecided, which is the case to test.
+        pub static FAIL_BARRIER_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+        /// Makes the next `Wal::forget_files` on this thread write its
+        /// barrier and then fail at its commit marker, cut back cleanly as a
+        /// full disk would leave it: the barrier is in the log, uncommitted,
+        /// and the log is not poisoned.
+        pub static FAIL_BARRIER_MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+        /// Makes the next `Wal::forget_files` on this thread *of the log at
+        /// this path* fail before touching the file, as a full disk there
+        /// would. Taken when it fires.
+        pub static FAIL_FORGET_IN: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+
+        /// Chunks of zeros this thread has extended logs with.
+        pub static PREALLOCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+        /// Fails the next extension of the log with zeros, on this thread.
+        pub static FAIL_PREALLOC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+        /// Makes the next WAL write on this thread put only this many bytes
+        /// in the file and then fail, as a full disk or EIO would.
+        pub static SHORT_WAL_WRITE: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+
+        /// Makes the next failed WAL write on this thread also fail to be cut
+        /// back, leaving its partial record in the log: the failure that
+        /// poisons. No real file fails `ftruncate` on demand.
+        pub static FAIL_WAL_ROLLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+        /// `file_id_for_name` answers these names with these ids on this
+        /// thread: the only way to get two names that share one.
+        pub static FORCED_FILE_IDS: std::cell::RefCell<std::collections::HashMap<String, u64>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+
+        /// Makes the next log `fdatasync` on this thread fail with this OS
+        /// error, as a writeback error (`EIO`) or a delayed allocation that
+        /// finds the disk full (`ENOSPC`) does.
+        pub static FAIL_LOG_SYNC: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+
+        /// Makes the named step of the next keep-tail checkpoint or
+        /// truncation on this thread fail: `rename_dir_sync`, `rename_open`,
+        /// `rename_seek` and `rename_clone` come after the keep-tail rename
+        /// returned `Ok`; `truncate_seek` and `truncate_sync` after
+        /// `set_len(0)` did. See `Wal::injected`.
+        pub static FAIL_WAL_STEP: std::cell::Cell<Option<&'static str>> =
+            const { std::cell::Cell::new(None) };
+
+        /// Data files a checkpoint on this thread has synced.
+        pub static CHECKPOINT_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+        /// Runs inside `Wal::checkpoint` after its data-file sync pass and
+        /// before it takes the writer lock: the window a concurrent writer's
+        /// records fall into.
+        pub static AFTER_CHECKPOINT_SYNC: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            const { std::cell::RefCell::new(None) };
+
+        /// Runs inside `Wal::forget_files` once its barrier is in the log and
+        /// its fences are taken, before its commit marker: the window in
+        /// which the barrier's fate is not yet decided. Taken when it runs.
+        pub static AFTER_BARRIER_FENCE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+
+        /// Makes the next opening of a log's sync handle on this thread fail,
+        /// as `EMFILE` would. `Wal::open` and every keep-tail checkpoint
+        /// install the handle, so a sync opens one only after a test clears
+        /// `sync_handle`; this fails that lazy open.
+        pub static FAIL_SYNC_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Directories whose log `open_and_recover` refuses, as it refuses one it
+    /// cannot read, whatever the uid (a mode-000 log refuses nothing to root).
+    /// Keyed by path, not by thread: the opens under test run on their own.
+    pub static REFUSE_RECOVERY: parking_lot::Mutex<Vec<std::path::PathBuf>> =
+        parking_lot::Mutex::new(Vec::new());
+}
+
+/// Runs `f`, which may block on disk I/O, without parking a runtime worker.
+///
+/// On a multi-threaded Tokio runtime this is `block_in_place`: the worker's
+/// queue is handed to another thread for the duration, so the tasks behind it
+/// — other clients' reads above all — keep running while this thread sits in
+/// `fdatasync`. The closure still runs on this thread, synchronously and in
+/// the same order, so nothing about what is durable when changes.
+///
+/// `block_in_place` panics on a current-thread runtime (every plain
+/// `#[tokio::test]`), so there — and outside any runtime, or on a
+/// `spawn_blocking` thread, where blocking is already fine — `f` simply runs.
+#[inline]
+pub(crate) fn blocking_io<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1268,27 +3316,65 @@ struct PendingWrite {
 /// database — every test binary does — and a global would make the second
 /// database log into the first one's directory, so its own recovery would find
 /// nothing to replay and the writes it deferred would be lost.
-static WALS: OnceLock<Mutex<HashMap<String, Arc<Wal>>>> = OnceLock::new();
+///
+/// Read on every storage write (several lookups per row), changed only when a
+/// database is opened, created or dropped. So it is an immutable snapshot
+/// behind an `ArcSwap`: a lookup is a lock-free load and a borrowed-`&str`
+/// probe, with no `String` built and no global mutex taken. A change copies
+/// the map under `WALS_WRITE` and publishes the copy; every lookup that starts
+/// after the store sees it, which is exactly what the mutex gave — a lookup
+/// that raced a `remove_for` could already get the old log back then too.
+static WALS: OnceLock<arc_swap::ArcSwap<Registry>> = OnceLock::new();
 
-fn wals() -> &'static Mutex<HashMap<String, Arc<Wal>>> {
-    WALS.get_or_init(|| Mutex::new(HashMap::new()))
+/// Serialises the copy-and-publish of [`WALS`], so two concurrent changes
+/// cannot each copy the same snapshot and lose the other's edit.
+static WALS_WRITE: Mutex<()> = Mutex::new(());
+
+type Registry = HashMap<String, Arc<Wal>, ahash::RandomState>;
+
+fn wals() -> &'static arc_swap::ArcSwap<Registry> {
+    WALS.get_or_init(|| arc_swap::ArcSwap::from_pointee(Registry::default()))
+}
+
+/// Applies `edit` to a copy of the registry and publishes the copy.
+fn edit_wals<R>(edit: impl FnOnce(&mut Registry) -> R) -> R {
+    let _writer = WALS_WRITE.lock();
+    let mut next: Registry = (**wals().load()).clone();
+    let out = edit(&mut next);
+    wals().store(Arc::new(next));
+    out
+}
+
+/// [`dir_key`] without the allocation, for lookups.
+#[inline]
+fn dir_key_str(dir: &str) -> &str {
+    let trimmed = dir.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() { dir } else { trimmed }
 }
 
 /// Canonical key for a database directory, so the path a provider was built
 /// with and the one the database was opened with agree.
 pub fn dir_key(dir: &str) -> String {
-    let trimmed = dir.trim_end_matches(['/', '\\']);
-    if trimmed.is_empty() {
-        dir.to_string()
-    } else {
-        trimmed.to_string()
-    }
+    dir_key_str(dir).to_string()
 }
 
 /// The log for `dir`, or `None` when that database has none.
 #[inline]
 pub fn wal_for(dir: &str) -> Option<Arc<Wal>> {
-    wals().lock().get(&dir_key(dir)).cloned()
+    wals().load().get(dir_key_str(dir)).cloned()
+}
+
+/// Runs `f` with the log for `dir` borrowed rather than cloned out.
+///
+/// For the storage write path, which looks the log up several times per row:
+/// cloning the `Arc` there is an atomic increment and decrement on one cache
+/// line shared by every writer thread, and under concurrency that bouncing
+/// line — not the lookup — was the cost. Resolved fresh on every call, so a
+/// dropped and recreated directory can never be answered with a stale log.
+#[inline]
+pub fn with_wal_for<R>(dir: &str, f: impl FnOnce(Option<&Wal>) -> R) -> R {
+    let snapshot = wals().load();
+    f(snapshot.get(dir_key_str(dir)).map(|w| &**w))
 }
 
 /// Every installed log, with the directory it belongs to.
@@ -1296,13 +3382,17 @@ pub fn wal_for(dir: &str) -> Option<Arc<Wal>> {
 /// For [`crate::core::log_writer`], which flushes on a timer for commits that
 /// did not wait for a sync of their own and so has no one database to ask.
 pub fn registered() -> Vec<(String, Arc<Wal>)> {
-    wals().lock().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    wals()
+        .load()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 /// Installs the log for `dir`, replacing any previous one.
 pub fn install_for(dir: &str, w: Arc<Wal>) {
     let key = dir_key(dir);
-    wals().lock().insert(key.clone(), w.clone());
+    edit_wals(|m| m.insert(key.clone(), w.clone()));
 
     // Cloned out and the lock released before any hook runs: a hook that looked
     // the log back up — the obvious thing for one to do — would deadlock on a
@@ -1353,11 +3443,38 @@ pub fn on_log_installed(hook: impl Fn(&str, &Arc<Wal>) + Send + Sync + 'static) 
 /// unaffected — the handle closes when the last reference goes, not when the
 /// registry forgets it.
 pub fn remove_for(dir: &str) -> Option<Arc<Wal>> {
-    wals().lock().remove(&dir_key(dir))
+    edit_wals(|m| m.remove(dir_key_str(dir)))
+}
+
+/// `a, b and c`, for an error naming the files that share an id.
+fn describe_paths(paths: &[PathBuf]) -> String {
+    let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {}", rest.join(", "), last),
+        _ => names.join(""),
+    }
+}
+
+/// See [`Wal::register_file`].
+fn contested_error(file_id: u64, claimants: &[PathBuf]) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "WAL file id {file_id:#018x} is claimed by {}; the log takes no \
+             records under it, since replay could not tell whose they were",
+            describe_paths(claimants)
+        ),
+    )
 }
 
 /// Registers every regular file in `dir` with `wal`, so a log left by a previous
 /// run can be resolved before any table has been opened.
+///
+/// Two names sharing an id leave it contested (see [`Wal::register_file`]),
+/// and only the first is counted. That is not an error here: which of them a
+/// listing returns first is arbitrary, so neither may be resolved, but a log
+/// naming neither can still be replayed. [`open_and_recover`] refuses one
+/// that does.
 pub fn register_directory(dir: &str, wal: &Wal) -> io::Result<usize> {
     let mut n = 0;
     let entries = match std::fs::read_dir(dir) {
@@ -1377,11 +3494,55 @@ pub fn register_directory(dir: &str, wal: &Wal) -> io::Result<usize> {
         if name == DEFAULT_WAL_NAME {
             continue;
         }
-        wal.register_file(file_id_for_name(&name), entry.path());
-        n += 1;
+        match wal.register_file(file_id_for_name(&name), entry.path()) {
+            Ok(()) => n += 1,
+            Err(e) => log::error!("WAL in {}: {}", dir, e),
+        }
     }
 
     Ok(n)
+}
+
+/// Refuses replay of a log holding records for a contested id.
+///
+/// The choice that loses nothing. Replaying them into either claimant writes
+/// one file's bytes into the other; skipping them drops committed writes, and
+/// [`open_and_recover`] then truncates the log, the only other copy. Refusing
+/// leaves the log and both files untouched. Settling it is a manual step:
+/// moving one file away uncontests the id, and replay then writes every record
+/// under it to the file that stayed, whichever file they came from. A
+/// contested id the log does not name blocks nothing here; it only refuses
+/// new records.
+fn refuse_ambiguous_replay(dir: &str, wal: &Wal) -> io::Result<()> {
+    let contested = wal.contested_files();
+    if contested.is_empty() {
+        return Ok(());
+    }
+    // `Wal::open` read these from the log's headers, up to where replay stops.
+    let named: Vec<(u64, Vec<PathBuf>)> = {
+        let dirty = wal.dirty.lock();
+        contested
+            .into_iter()
+            .filter(|(id, _)| dirty.all || dirty.ids.contains(id))
+            .collect()
+    };
+    if named.is_empty() {
+        return Ok(());
+    }
+    let which: Vec<String> = named
+        .iter()
+        .map(|(id, paths)| format!("{id:#018x} ({})", describe_paths(paths)))
+        .collect();
+    Err(io::Error::other(format!(
+        "WAL in {dir} holds records for file ids that more than one file claims: {}; \
+         replay could not tell which file they belong to, so nothing was replayed \
+         and the log was left as it was. Normal use cannot produce this: ids are \
+         a 64-bit hash of the file name, unique within one directory. To recover, \
+         move the file no table of this database owns out of {dir} (for a table, \
+         its catalogue entry names it) and open again; the records then replay \
+         into the file that remains. Keep the moved file until the data checks out",
+        which.join("; ")
+    )))
 }
 
 /// Opens the log for `dir`, replaying anything left behind, and installs it.
@@ -1390,34 +3551,93 @@ pub fn register_directory(dir: &str, wal: &Wal) -> io::Result<usize> {
 /// means writes that may not have reached their data files, and skipping it
 /// because the feature was switched off would lose exactly those writes.
 pub fn open_and_recover(dir: &str) -> io::Result<(Arc<Wal>, RecoveryStats)> {
+    #[cfg(test)]
+    if test_hooks::REFUSE_RECOVERY
+        .lock()
+        .iter()
+        .any(|refused| refused.as_path() == Path::new(dir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Permission denied (os error 13), injected: the log cannot be read",
+        ));
+    }
     let wal_path = Path::new(dir).join(DEFAULT_WAL_NAME);
     let wal = Arc::new(Wal::open(&wal_path)?);
     register_directory(dir, &wal)?;
+    refuse_ambiguous_replay(dir, &wal)?;
+
+    // Before replay, never after: replay then rewrites every committed byte
+    // past each cut, and a fragment a replayed record lands beyond cannot
+    // survive inside the record slot it tore. See `crate::core::torn_tail`.
+    cut_torn_tails_before_replay(dir, &wal)?;
 
     let files = wal.clone();
-    let stats = Wal::recover(&wal_path, move |id| {
-        files.files.lock().get(&id).cloned()
-    })?;
+    let stats = Wal::recover(&wal_path, move |id| files.resolve_for_replay(id))?;
 
     // Resume the commit sequence where the previous run left off, so it stays
     // monotonic across restarts and can serve as a durable point-in-time token.
     wal.commit_lsn
         .fetch_max(stats.last_commit_lsn, Ordering::AcqRel);
+    // And transaction ids past every one in the log, which a log kept below
+    // still holds: pass 1 of the next recovery reads committed-ness by id
+    // alone, so an old marker would commit a new transaction's partial writes.
+    wal.next_txn
+        .fetch_max(stats.last_txn.saturating_add(1), Ordering::AcqRel);
 
-    if stats.applied > 0 || stats.rolled_back > 0 || stats.truncated_tail > 0 {
+    // A voided record never needs replaying again, so a log holding only those
+    // is done with as much as one whose records were applied.
+    if stats.applied > 0
+        || stats.rolled_back > 0
+        || stats.truncated_tail > 0
+        || stats.forgotten > 0
+    {
         log::info!(
-            "WAL recovery in {}: applied {}, rolled back {}, unresolved {}, discarded {} trailing bytes",
+            "WAL recovery in {}: applied {}, rolled back {}, voided {}, unresolved {}, discarded {} trailing bytes",
             dir,
             stats.applied,
             stats.rolled_back,
+            stats.forgotten,
             stats.unresolved,
             stats.truncated_tail
         );
         // The log has served its purpose; a fresh one starts empty.
         wal.truncate()?;
+    } else {
+        // Kept: its next record goes where the records this replay read end,
+        // which with padding is short of where the file does.
+        wal.resume_at(stats.valid_bytes)?;
     }
 
     Ok((wal, stats))
+}
+
+/// Cuts each fixed-record file in `dir` back to whole records, refusing below
+/// a durable floor, then clamps the floors to what is there.
+fn cut_torn_tails_before_replay(dir: &str, wal: &Wal) -> io::Result<()> {
+    let mut floors = wal.floors.lock();
+    crate::core::torn_tail::cut_torn_tails(Path::new(dir), &floors)?;
+    if floors.reconcile(Path::new(dir)) {
+        let at = crate::core::torn_tail::Floors::path_for(&wal.path);
+        if let Err(e) = floors.store(&at) {
+            log::error!("Could not update the durable floors in {}: {}", at.display(), e);
+        }
+    }
+    Ok(())
+}
+
+/// [`Wal::lower_floor`] on the log of `dir`; with none installed (logging
+/// switched off), on the floors a past run stored there, which nothing else
+/// would lower before the next open reads them.
+pub fn lower_floor_for(dir: &str, path: &Path, len: u64) -> io::Result<()> {
+    with_wal_for(dir, |w| match w {
+        Some(w) => w.lower_floor(path, len),
+        None => crate::core::torn_tail::lower_floor_on_disk(
+            &Path::new(dir).join(DEFAULT_WAL_NAME),
+            path,
+            len,
+        ),
+    })
 }
 
 /// What a stretch of log bytes covers, without replaying it.
@@ -1449,7 +3669,11 @@ pub fn scan_commit_range(bytes: &[u8]) -> (u64, u64, u64) {
             break;
         }
 
-        let stored_crc = u32::from_le_bytes(header[HEADER_CRC_LEN..HEADER_LEN].try_into().expect("4 bytes"));
+        let stored_crc = u32::from_le_bytes(
+            header[HEADER_CRC_LEN..HEADER_LEN]
+                .try_into()
+                .expect("4 bytes"),
+        );
         let mut digest = CRC.digest();
         digest.update(&header[0..HEADER_CRC_LEN]);
         digest.update(&bytes[offset + HEADER_LEN..offset + HEADER_LEN + len]);
@@ -1474,6 +3698,50 @@ pub fn scan_commit_range(bytes: &[u8]) -> (u64, u64, u64) {
     (first, last, commits)
 }
 
+/// The ids of every file a run of log records writes to, read from the
+/// framing alone, as [`scan_commit_range`] reads it. A backup records the
+/// names behind them with each archived bundle, so a restore can create a
+/// file the snapshot did not hold (one made after it was taken).
+pub fn scan_file_ids(bytes: &[u8]) -> std::collections::BTreeSet<u64> {
+    let mut ids = std::collections::BTreeSet::new();
+    let mut offset = 0usize;
+    while offset + HEADER_LEN <= bytes.len() {
+        let header = &bytes[offset..offset + HEADER_LEN];
+        let magic = u32::from_le_bytes(header[0..4].try_into().expect("4 bytes"));
+        if magic != RECORD_MAGIC || header[4] != FORMAT_VERSION {
+            break;
+        }
+        let len = u32::from_le_bytes(header[32..36].try_into().expect("4 bytes")) as usize;
+        if len > MAX_RECORD_PAYLOAD || offset + HEADER_LEN + len > bytes.len() {
+            break;
+        }
+        if header[5] & FLAG_COMMIT == 0 {
+            ids.insert(u64::from_le_bytes(header[16..24].try_into().expect("8 bytes")));
+        }
+        offset += HEADER_LEN + len;
+    }
+    ids
+}
+
+/// For each file a log at `path` writes to, the lowest offset any of its
+/// records writes at. A restore creates a file the snapshot did not hold only
+/// when this is 0: a log that covers the file from its first byte. One whose
+/// earlier bytes were written around the log (a file built by copying and
+/// renaming, as a replication log's compaction does) would come back as a
+/// hole followed by the logged tail, which reads as nothing at all.
+pub fn file_starts(path: &Path) -> io::Result<std::collections::HashMap<u64, u64>> {
+    let mut starts: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut scan = LogScanner::open(path)?;
+    while let Some(h) = scan.next()? {
+        if h.flags & (FLAG_COMMIT | FLAG_FORGET) != 0 {
+            continue;
+        }
+        let start = starts.entry(h.file_id).or_insert(h.offset);
+        *start = (*start).min(h.offset);
+    }
+    Ok(starts)
+}
+
 /// Whether a long-running statement should commit and open a fresh transaction.
 ///
 /// An open transaction blocks checkpointing — the log cannot be reclaimed while
@@ -1487,14 +3755,39 @@ pub fn should_break_transaction<S: crate::core::storage_providers::traits::Stora
     io: &S,
 ) -> bool {
     match io.get_location().and_then(|loc| wal_for(&loc)) {
-        Some(w) => w.bytes_since_checkpoint() >= crate::wal_checkpoint_bytes(),
+        Some(w) => w.grant_break(crate::wal_checkpoint_bytes()),
         None => false,
+    }
+}
+
+impl Wal {
+    /// Whether a long transaction should commit now so the log can be
+    /// checkpointed: past the threshold, at most once per eighth of it.
+    ///
+    /// It used to answer yes for *every* call once the log passed the
+    /// threshold, and the log stays past it for as long as checkpoints
+    /// decline — so a compaction under write load committed after every row,
+    /// one transaction per row for the rest of the run. Spacing the answers by
+    /// what has been logged since the last yes keeps the batches large while
+    /// still letting the log be cut.
+    fn grant_break(&self, threshold: u64) -> bool {
+        let logged = self.bytes_since_checkpoint.load(Ordering::Relaxed);
+        if logged < threshold {
+            return false;
+        }
+        let last = self.break_granted_at.load(Ordering::Relaxed);
+        // A checkpoint since the last grant reset the counter below it.
+        let due = logged < last || logged - last >= (threshold / 8).max(1);
+        due && self
+            .break_granted_at
+            .compare_exchange(last, logged, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
     }
 }
 
 /// Checkpoints every installed log, for process shutdown.
 pub fn checkpoint_all() -> io::Result<()> {
-    let logs: Vec<Arc<Wal>> = wals().lock().values().cloned().collect();
+    let logs: Vec<Arc<Wal>> = wals().load().values().cloned().collect();
     let mut first_err = None;
     for w in logs {
         if let Err(e) = w.checkpoint() {
@@ -1513,11 +3806,22 @@ mod tests {
     use super::*;
 
     fn temp_dir() -> tempfile::TempDir {
-        tempfile::Builder::new().prefix("rastdb_wal_").tempdir().unwrap()
+        tempfile::Builder::new()
+            .prefix("rastdb_wal_")
+            .tempdir()
+            .unwrap()
     }
 
     fn read_file(p: &Path) -> Vec<u8> {
         std::fs::read(p).unwrap_or_default()
+    }
+
+    /// The records of the log at `p`: the file without the zeros ahead of
+    /// its append point, which is what the file was before it had any.
+    fn records(p: &Path) -> Vec<u8> {
+        let mut raw = read_file(p);
+        raw.truncate(records_len(p) as usize);
+        raw
     }
 
     fn resolver(p: PathBuf) -> impl Fn(u64) -> Option<PathBuf> {
@@ -1608,6 +3912,434 @@ mod tests {
         assert_eq!(read_file(&ptrs), b"PTR");
     }
 
+    /// A committed barrier voids its file's earlier records and only those:
+    /// what comes after it, and every other file's records, still replay. A
+    /// file deleted and created again under one name has one id, so without
+    /// this the deleted file's bytes landed in the new one.
+    #[test]
+    fn a_barrier_voids_only_its_files_earlier_records() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let reborn = dir.path().join("reborn.db");
+        let other = dir.path().join("other.db");
+        let reborn_id = file_id_for_name("reborn.db");
+        let other_id = file_id_for_name("other.db");
+
+        let wal = Wal::open(&wal_path).unwrap();
+        // The first incarnation, longer than the second will be. An uncommitted
+        // transaction spans the barrier and commits after it: voided too, as
+        // the bytes describe the deleted file whenever they commit.
+        let late = wal.begin();
+        wal.log(late, reborn_id, 12, b"LATE").unwrap();
+        wal.log_and_commit(reborn_id, 0, b"OLD-OLD-OLD-").unwrap();
+        wal.log_and_commit(other_id, 0, b"keep").unwrap();
+        wal.forget_files(&[reborn_id]).unwrap();
+        wal.commit_txn(late).unwrap();
+        // The second incarnation, deleted in turn: the last barrier is the one
+        // that counts, or a second rewrite before a checkpoint would bring
+        // this one's bytes into the third.
+        wal.log_and_commit(reborn_id, 0, b"MID-MID").unwrap();
+        wal.forget_files(&[reborn_id]).unwrap();
+        // The third.
+        wal.log_and_commit(reborn_id, 0, b"new").unwrap();
+        wal.log_and_commit(other_id, 4, b"!").unwrap();
+
+        let (r, o) = (reborn.clone(), other.clone());
+        let stats = Wal::recover(&wal_path, move |id| {
+            (id == reborn_id)
+                .then(|| r.clone())
+                .or_else(|| (id == other_id).then(|| o.clone()))
+        })
+        .unwrap();
+        assert_eq!(read_file(&reborn), b"new", "a voided record reached the file");
+        assert_eq!(read_file(&other), b"keep!", "another file's records were voided");
+        assert_eq!(stats.forgotten, 3);
+        assert_eq!(stats.applied, 3);
+    }
+
+    /// A log whose records were all voided is done with, like one whose
+    /// records were applied, and is truncated: kept, its old commit markers
+    /// would outlive the process that wrote them.
+    #[test]
+    fn a_log_of_only_voided_records_is_truncated_by_recovery() {
+        let dir = temp_dir();
+        let dir_str = dir.path().to_string_lossy().into_owned();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let id = file_id_for_name("gone.db");
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_and_commit(id, 0, b"gone").unwrap();
+            wal.forget_files(&[id]).unwrap();
+        }
+        let (_wal, stats) = open_and_recover(&dir_str).unwrap();
+        assert_eq!((stats.applied, stats.forgotten), (0, 1));
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            0,
+            "a log recovery finished with was kept"
+        );
+        remove_for(&dir_str);
+    }
+
+    /// A log recovery keeps (here, one naming a file that is not there) still
+    /// holds its commit markers, which name transactions by id. The next
+    /// process must not hand those ids out again: one of its transactions,
+    /// cut off by a crash before committing, read as committed by the old
+    /// marker and its partial writes were replayed.
+    #[test]
+    fn a_kept_log_does_not_commit_a_later_processs_transaction() {
+        let dir = temp_dir();
+        let dir_str = dir.path().to_string_lossy().into_owned();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        std::fs::write(&data, b"").unwrap();
+        let missing = file_id_for_name("missing.db");
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_and_commit(missing, 0, b"elsewhere").unwrap();
+        }
+        let (wal, stats) = open_and_recover(&dir_str).unwrap();
+        assert_eq!(stats.unresolved, 1);
+        assert!(
+            std::fs::metadata(&wal_path).unwrap().len() > 0,
+            "the log was truncated, so it no longer tests a kept one"
+        );
+        // A transaction cut off before its commit.
+        let txn = wal.begin();
+        wal.log(txn, file_id_for_name("t.db"), 0, b"torn").unwrap();
+        drop(wal);
+        remove_for(&dir_str);
+
+        let (_wal, stats) = open_and_recover(&dir_str).unwrap();
+        assert_eq!(read_file(&data), b"", "an uncommitted transaction was replayed");
+        assert_eq!(stats.applied, 0);
+        remove_for(&dir_str);
+    }
+
+    /// A barrier whose commit marker never reached the log voids nothing, and
+    /// recovery to a point before the barrier committed keeps what it voids:
+    /// the file still existed then.
+    #[test]
+    fn an_uncommitted_or_later_barrier_voids_nothing() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        let id = file_id_for_name("t.db");
+
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.log_and_commit(id, 0, b"kept").unwrap(); // commit sequence 1
+        let before_barrier = records(&wal_path).len() as u64;
+        wal.forget_files(&[id]).unwrap(); // commit sequence 2
+        let with_barrier = records(&wal_path);
+
+        // Cut just before the barrier's marker: a torn tail.
+        let torn = dir.path().join("torn.log");
+        std::fs::write(&torn, &with_barrier[..with_barrier.len() - HEADER_LEN]).unwrap();
+        assert!(with_barrier.len() as u64 > before_barrier + HEADER_LEN as u64);
+        let stats = Wal::recover(&torn, resolver(data.clone())).unwrap();
+        assert_eq!(read_file(&data), b"kept", "an uncommitted barrier voided a record");
+        assert_eq!(stats.forgotten, 0);
+
+        std::fs::remove_file(&data).unwrap();
+        let stats = Wal::recover_upto(&wal_path, resolver(data.clone()), Some(1)).unwrap();
+        assert_eq!(read_file(&data), b"kept", "a barrier past the ceiling voided a record");
+        assert_eq!(stats.forgotten, 0);
+
+        std::fs::remove_file(&data).unwrap();
+        let stats = Wal::recover(&wal_path, resolver(data.clone())).unwrap();
+        assert!(!data.exists(), "replay recreated a file whose records were all voided");
+        assert_eq!(stats.forgotten, 1);
+    }
+
+    /// A barrier names a file but describes no bytes, so a checkpoint owes the
+    /// file nothing for it.
+    #[test]
+    fn a_barrier_gives_a_checkpoint_nothing_to_flush() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        std::fs::write(&data, b"").unwrap();
+        let id = file_id_for_name("t.db");
+
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.register_file(id, &data).unwrap();
+        wal.forget_files(&[id]).unwrap();
+        test_hooks::CHECKPOINT_SYNCS.with(|n| n.set(0));
+        assert!(wal.checkpoint().unwrap());
+        assert_eq!(test_hooks::CHECKPOINT_SYNCS.with(|n| n.get()), 0);
+        drop(wal);
+
+        // Nor does a log reopened with a barrier still in it.
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.forget_files(&[id]).unwrap();
+        drop(wal);
+        assert!(log_extent(&wal_path, std::fs::metadata(&wal_path).unwrap().len()).unwrap().ids.is_empty());
+    }
+
+    /// An in-place write logged before its file was deleted waits for its
+    /// transaction to commit, and the fence only refuses records framed after
+    /// the barrier. Applied at the commit, it opened the path afresh and wrote
+    /// the deleted file's bytes into whatever file had taken the name since,
+    /// or created the file again when none had. Replay voids that record (it
+    /// precedes the barrier), so the live apply skips it too, applies the
+    /// transaction's other writes, and the commit says what it skipped.
+    #[test]
+    fn a_held_overwrite_does_not_reach_a_file_deleted_since_it_was_logged() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let reborn = dir.path().join("reborn.db");
+        let gone = dir.path().join("gone.db");
+        let other = dir.path().join("other.db");
+        std::fs::write(&reborn, b"old-old-old").unwrap();
+        std::fs::write(&gone, b"old").unwrap();
+        std::fs::write(&other, b"....").unwrap();
+        let (reborn_id, gone_id, other_id) = (
+            file_id_for_name("reborn.db"),
+            file_id_for_name("gone.db"),
+            file_id_for_name("other.db"),
+        );
+        let wal = Wal::open(&wal_path).unwrap();
+        for (id, path) in [(reborn_id, &reborn), (gone_id, &gone), (other_id, &other)] {
+            wal.register_file(id, path).unwrap();
+        }
+
+        let born = Incarnation::new();
+        let txn = wal.begin();
+        wal.log_in_place_from(txn, reborn_id, 0, b"GHOST", born).unwrap();
+        wal.log_in_place_from(txn, gone_id, 0, b"GHOST", born).unwrap();
+        wal.log_in_place_from(txn, other_id, 0, b"kept", born).unwrap();
+        // The drop: barrier, files deleted, one name taken again.
+        wal.forget_files(&[reborn_id, gone_id]).unwrap();
+        std::fs::remove_file(&reborn).unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        std::fs::write(&reborn, b"new").unwrap();
+
+        let committed = wal.commit_txn(txn);
+        assert_eq!(read_file(&reborn), b"new", "a held write reached the successor's file");
+        assert!(!gone.exists(), "a held write created a deleted file again");
+        assert_eq!(read_file(&other), b"kept", "the transaction's other write was dropped");
+        assert!(committed.is_err(), "a commit that skipped writes reported success");
+        assert!(!wal.is_poisoned(), "skipping a voided write poisoned the log");
+        // Kept for the replay below: the checkpoint discards the log.
+        let replay_path = dir.path().join("replay.log");
+        std::fs::copy(&wal_path, &replay_path).unwrap();
+        assert!(wal.checkpoint().unwrap(), "the skipped writes left a claim on the log");
+
+        // Replay agrees with the live apply.
+        drop(wal);
+        let paths = [(reborn_id, reborn.clone()), (gone_id, gone.clone()), (other_id, other.clone())];
+        let stats = Wal::recover(&replay_path, move |id| {
+            paths.iter().find(|(p, _)| *p == id).map(|(_, path)| path.clone())
+        })
+        .unwrap();
+        assert_eq!((stats.forgotten, stats.applied), (2, 1));
+        assert_eq!(read_file(&reborn), b"new");
+        assert!(!gone.exists());
+        assert_eq!(read_file(&other), b"kept");
+    }
+
+    /// A barrier whose commit marker could not be written (cut back cleanly,
+    /// the log not poisoned) voids nothing, so it must fence nothing: the
+    /// caller puts the table back, and its writers, born before the fence,
+    /// were refused every record until a restart.
+    #[test]
+    fn a_barrier_whose_commit_failed_fences_no_writer() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        std::fs::write(&data, b"....").unwrap();
+        let id = file_id_for_name("t.db");
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.register_file(id, &data).unwrap();
+        let born = Incarnation::new();
+
+        test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(true));
+        assert!(wal.forget_files(&[id]).is_err(), "the injected marker failure never fired");
+        test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(false));
+        assert!(!wal.is_poisoned(), "a cleanly cut-back marker poisoned the log");
+
+        let txn = wal.begin();
+        wal.log_in_place_from(txn, id, 0, b"live", born)
+            .expect("a writer was refused by a barrier that never committed");
+        wal.commit_txn(txn).unwrap();
+        assert_eq!(read_file(&data), b"live");
+        let txn = wal.begin();
+        wal.log_from(txn, id, 4, b"!", born)
+            .expect("an append was refused by a barrier that never committed");
+        wal.commit_txn(txn).unwrap();
+
+        // A barrier that commits still fences the same writer.
+        wal.forget_files(&[id]).unwrap();
+        assert!(wal.log_from(wal.begin(), id, 0, b"x", born).is_err());
+        drop(wal);
+        let stats = Wal::recover(&wal_path, resolver(data.clone())).unwrap();
+        assert_eq!(stats.forgotten, 2, "the committed barrier voided the wrong records");
+    }
+
+    /// A second barrier for an id that fails at its marker undoes only its
+    /// own fence. Putting the id back to no fence at all let a straggler of
+    /// the incarnation the first, committed barrier deleted log again, and
+    /// apply a held write by path into whatever file holds the name now.
+    #[test]
+    fn a_failed_barrier_keeps_the_fence_an_earlier_one_took() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        std::fs::write(&data, b"....").unwrap();
+        let id = file_id_for_name("t.db");
+        let wal = Arc::new(Wal::open(&wal_path).unwrap());
+        wal.register_file(id, &data).unwrap();
+
+        let old = Incarnation::new();
+        let straggler = wal.begin();
+        wal.log_in_place_from(straggler, id, 0, b"OLD!", old).unwrap();
+        wal.forget_files(&[id]).unwrap();
+        // The file deleted and created again: the next incarnation's writer.
+        std::fs::write(&data, b"new.").unwrap();
+        let mid = Incarnation::new();
+
+        // The second barrier fails at its marker. Inside its window the
+        // straggler commits: its file was deleted at the first barrier.
+        let held = std::rc::Rc::new(std::cell::Cell::new(None));
+        test_hooks::AFTER_BARRIER_FENCE.with(|h| {
+            let (wal, held) = (wal.clone(), held.clone());
+            *h.borrow_mut() = Some(Box::new(move || held.set(Some(wal.commit_txn(straggler).is_ok()))));
+        });
+        test_hooks::FAIL_BARRIER_MARKER.with(|f| f.set(true));
+        assert!(wal.forget_files(&[id]).is_err(), "the injected marker failure never fired");
+        test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(false));
+        assert!(!wal.is_poisoned(), "a cleanly cut-back marker poisoned the log");
+        assert_eq!(held.get(), Some(false), "a write to a file deleted at a committed barrier was applied");
+        assert_eq!(read_file(&data), b"new.", "a straggler wrote into the next incarnation's file");
+
+        assert!(
+            wal.log_from(wal.begin(), id, 0, b"x", old).is_err(),
+            "a writer of the file the first barrier deleted logged again"
+        );
+        let txn = wal.begin();
+        wal.log_in_place_from(txn, id, 0, b"mid!", mid)
+            .expect("the live incarnation's writer was refused by a barrier that never committed");
+        wal.commit_txn(txn).unwrap();
+        assert_eq!(read_file(&data), b"mid!");
+    }
+
+    /// An in-place write committed while a barrier for its file is in the log
+    /// but undecided. The file cannot have been deleted yet (that waits for
+    /// the barrier to commit), so the write belongs in it. Skipped, the live
+    /// file lacked a committed write that replay applies whenever the barrier
+    /// then fails: a statement reported failed came back after a crash, and a
+    /// checkpoint first left a committed transaction half applied.
+    #[test]
+    fn a_write_committed_while_its_barrier_is_undecided_matches_its_replay() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        let before = dir.path().join("before.db");
+        std::fs::write(&data, b"....").unwrap();
+        std::fs::write(&before, b"....").unwrap();
+        let id = file_id_for_name("t.db");
+        let wal = Arc::new(Wal::open(&wal_path).unwrap());
+        wal.register_file(id, &data).unwrap();
+        let born = Incarnation::new();
+
+        let txn = wal.begin();
+        wal.log_in_place_from(txn, id, 0, b"held", born).unwrap();
+        let committed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        test_hooks::AFTER_BARRIER_FENCE.with(|h| {
+            let (wal, committed) = (wal.clone(), committed.clone());
+            *h.borrow_mut() = Some(Box::new(move || {
+                *committed.borrow_mut() = Some(wal.commit_txn(txn).map_err(|e| e.to_string()));
+            }));
+        });
+        test_hooks::FAIL_BARRIER_MARKER.with(|f| f.set(true));
+        assert!(wal.forget_files(&[id]).is_err(), "the injected marker failure never fired");
+        test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(false));
+        assert!(!wal.is_poisoned());
+        assert_eq!(
+            committed.borrow_mut().take(),
+            Some(Ok(())),
+            "a commit inside an undecided barrier's window was refused"
+        );
+        assert_eq!(read_file(&data), b"held", "the live file lacks a committed write");
+
+        let replay = dir.path().join("replay.log");
+        std::fs::copy(&wal_path, &replay).unwrap();
+        Wal::recover(&replay, resolver(before.clone())).unwrap();
+        assert_eq!(read_file(&before), read_file(&data), "the live file and its replay disagree");
+    }
+
+    /// A barrier whose marker is in the log but whose sync failed without
+    /// the sync itself running (opening the sync handle failed, as `EMFILE`
+    /// would) commits at the next sync anyone takes, and replay voids the
+    /// file's earlier records. It must not be taken for one that never
+    /// committed: un-fenced and the table put back, the table wrote on and a
+    /// crash then voided every committed record before the barrier.
+    #[test]
+    fn a_barrier_whose_marker_was_written_is_not_undone_when_its_sync_fails() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        std::fs::write(&data, b"....").unwrap();
+        let id = file_id_for_name("t.db");
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.register_file(id, &data).unwrap();
+        let born = Incarnation::new();
+        let txn = wal.begin();
+        wal.log_from(txn, id, 4, b"live", born).unwrap();
+        wal.commit_txn_deferred(txn).unwrap();
+
+        // `Wal::open` installed the sync handle (R7); cleared, the barrier's
+        // sync opens it lazily, and that open is what fails.
+        *wal.sync_handle.lock() = None;
+        test_hooks::FAIL_SYNC_OPEN.with(|f| f.set(true));
+        let forgot = wal.forget_files(&[id]);
+        let fired = !test_hooks::FAIL_SYNC_OPEN.with(|f| f.replace(false));
+        assert!(fired, "the barrier's sync never opened the handle, so this tests nothing");
+        assert!(forgot.is_err());
+        assert!(
+            wal.is_poisoned(),
+            "a written marker whose sync failed left the log unpoisoned, so the caller \
+             takes the barrier for one that can never commit"
+        );
+        assert!(
+            wal.log_from(wal.begin(), id, 0, b"x", born).is_err(),
+            "a writer of the file was un-fenced though its barrier is in the log, committed"
+        );
+        drop(wal);
+        let stats = Wal::recover(&wal_path, resolver(data.clone())).unwrap();
+        assert_eq!(stats.forgotten, 1, "the barrier did not commit in the log after all");
+    }
+
+    /// Transaction ids started again at 1 on every restart, and an archive
+    /// joins the logs of several runs end to end: a marker of one run then
+    /// committed another run's transaction of the same id, its records and
+    /// its barriers included. The next run's ids start past every id the
+    /// last one handed out.
+    #[test]
+    fn transaction_ids_are_not_reused_across_a_restart() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        std::fs::write(&data, b"").unwrap();
+        let id = file_id_for_name("t.db");
+        let last = {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.register_file(id, &data).unwrap();
+            let mut last = 0;
+            for n in 0..5u8 {
+                last = wal.begin();
+                wal.log(last, id, n as u64, &[n]).unwrap();
+                wal.commit_txn(last).unwrap();
+            }
+            // A clean shutdown's checkpoint leaves no record to recover ids from.
+            assert!(wal.checkpoint().unwrap());
+            last
+        };
+        let wal = Wal::open(&wal_path).unwrap();
+        let next = wal.begin();
+        assert!(next > last, "a restart handed out transaction id {next} again (last was {last})");
+    }
+
     /// The write-ahead ordering: an overwrite must not reach the data file until
     /// its record is durable, or a crash mid-write would destroy the old bytes
     /// with no undo record to restore them.
@@ -1620,7 +4352,7 @@ mod tests {
 
         let wal = Wal::open(&wal_path).unwrap();
         let id = file_id_for_name("table.db");
-        wal.register_file(id, &data);
+        wal.register_file(id, &data).unwrap();
 
         let txn = wal.begin();
         wal.log_in_place(txn, id, 0, b"NEW").unwrap();
@@ -1633,7 +4365,11 @@ mod tests {
 
         wal.commit_txn(txn).unwrap();
 
-        assert_eq!(read_file(&data), b"NEWOLDOLD", "commit applies the overwrite");
+        assert_eq!(
+            read_file(&data),
+            b"NEWOLDOLD",
+            "commit applies the overwrite"
+        );
     }
 
     /// An overwrite whose transaction never commits leaves the old value intact
@@ -1648,7 +4384,7 @@ mod tests {
         {
             let wal = Wal::open(&wal_path).unwrap();
             let id = file_id_for_name("table.db");
-            wal.register_file(id, &data);
+            wal.register_file(id, &data).unwrap();
 
             let txn = wal.begin();
             // Logged, flushed, but never committed - the process "dies" here.
@@ -1685,8 +4421,8 @@ mod tests {
 
         {
             let wal = Wal::open(&wal_path).unwrap();
-            wal.register_file(rows_id, &rows);
-            wal.register_file(ptrs_id, &ptrs);
+            wal.register_file(rows_id, &rows).unwrap();
+            wal.register_file(ptrs_id, &ptrs).unwrap();
 
             // One statement, eight rows, two files per row - and no commit.
             let txn = wal.begin();
@@ -1694,7 +4430,8 @@ mod tests {
                 wal.log_in_place(txn, rows_id, i * 4, b"NEWR").unwrap();
                 wal.log_in_place(txn, ptrs_id, i * 4, b"NEWP").unwrap();
             }
-            wal.commit_through(wal.issued.load(Ordering::Acquire)).unwrap();
+            wal.commit_through(wal.issued.load(Ordering::Acquire))
+                .unwrap();
         }
 
         // Nothing reached the files: overwrites wait for the commit.
@@ -1715,8 +4452,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(stats.applied, 0);
-        assert_eq!(stats.rolled_back, 16, "all sixteen writes belong to the statement");
-        assert_eq!(read_file(&rows), vec![b'.'; 64], "no row may be half-updated");
+        assert_eq!(
+            stats.rolled_back, 16,
+            "all sixteen writes belong to the statement"
+        );
+        assert_eq!(
+            read_file(&rows),
+            vec![b'.'; 64],
+            "no row may be half-updated"
+        );
         assert_eq!(read_file(&ptrs), vec![b'.'; 64]);
     }
 
@@ -1739,6 +4483,807 @@ mod tests {
         assert_eq!(after_first, b"abZZef");
     }
 
+    /// A WAL-backed table of `(id U64, label STRING)` holding `n` rows.
+    async fn logged_table(
+        dir: &Path,
+        n: u64,
+    ) -> (
+        crate::core::row::table::Table<crate::core::storage_providers::file_sync::LocalStorageProvider>,
+        Arc<Wal>,
+    ) {
+        use crate::core::db_type::DbType;
+        use crate::core::row::row::{ColumnWritePayload, RowWrite};
+        use crate::core::rql::lexer_ct::CreateColumnData;
+        let _ = crate::MAX_PERMITS_THREADS.set(4);
+        let _ = crate::BATCH_SIZE.set(512);
+        let dir_str = dir.to_string_lossy().to_string();
+        let wal = Arc::new(Wal::open(dir.join(DEFAULT_WAL_NAME)).unwrap());
+        install_for(&dir_str, wal.clone());
+        let io = rclite::Arc::new(
+            crate::core::storage_providers::file_sync::LocalStorageProvider::new(&dir_str, Some("lt"))
+                .await,
+        );
+        let t = crate::core::row::table::Table::new(
+            "lt",
+            io,
+            vec![
+                CreateColumnData { name: "id".into(), data_type: DbType::U64 },
+                CreateColumnData { name: "label".into(), data_type: DbType::STRING },
+            ],
+        )
+        .await;
+        let payload = |bytes: &[u8], write_order: u32, column_type: DbType| {
+            let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(bytes);
+            let size = column_type.get_size();
+            ColumnWritePayload { data: mb, write_order, column_type, size }
+        };
+        for i in 0..n {
+            let mut rw = RowWrite { columns_writing_data: smallvec::SmallVec::new() };
+            rw.columns_writing_data.push(payload(&i.to_le_bytes(), 0, DbType::U64));
+            rw.columns_writing_data
+                .push(payload(format!("label-{i:04}").as_bytes(), 1, DbType::STRING));
+            t.insert_row(rw).await.unwrap();
+        }
+        (t, wal)
+    }
+
+    /// A storage transaction opened inside a helper must be ended on every
+    /// path. One left open after a failed commit kept the log's pending count
+    /// raised, and no checkpoint could run again — how a deployed node's log
+    /// grew without bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_delete_commit_leaves_no_transaction_open() {
+        use crate::core::row::row_pointer::RowPointerIterator;
+        let dir = temp_dir();
+        let (t, wal) = logged_table(dir.path(), 4).await;
+        let mut it = RowPointerIterator::new(t.io_pointers().unwrap().clone()).await.unwrap();
+        let (pos, mut pointer) = it.next_row_pointer_with_offset().await.unwrap().unwrap();
+
+        test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(true));
+        let outcome = pointer
+            .delete(t.io_pointers().unwrap().clone(), pos, None, crate::core::mvcc::transaction::FROZEN_TX)
+            .await;
+        test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(false));
+        assert!(outcome.is_err(), "the injected commit failure was swallowed");
+        assert_eq!(wal.pending_transactions(), 0, "the failed delete left its transaction open");
+        assert!(wal.checkpoint().unwrap(), "the log can no longer be checkpointed");
+        let _ = remove_for(&dir.path().to_string_lossy());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_in_place_update_commit_leaves_no_transaction_open() {
+        use crate::core::db_type::DbType;
+        use crate::core::row::row::{ColumnWritePayload, RowWrite};
+        use crate::core::row::row_pointer::RowPointerIterator;
+        let dir = temp_dir();
+        let (t, wal) = logged_table(dir.path(), 4).await;
+        let mut it = RowPointerIterator::new(t.io_pointers().unwrap().clone()).await.unwrap();
+        let (pos, mut pointer) = it.next_row_pointer_with_offset().await.unwrap().unwrap();
+        // Same length, outside any transaction: the in-place path.
+        let mut rw = RowWrite { columns_writing_data: smallvec::SmallVec::new() };
+        for (bytes, order, ty) in [
+            (0u64.to_le_bytes().to_vec(), 0u32, DbType::U64),
+            (b"label-XXXX".to_vec(), 1, DbType::STRING),
+        ] {
+            let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            let size = ty.get_size();
+            rw.columns_writing_data.push(ColumnWritePayload { data: mb, write_order: order, column_type: ty, size });
+        }
+
+        test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(true));
+        let outcome = pointer
+            .update_with_pointer_record_pos(
+                t.io_pointers().unwrap().clone(),
+                t.io_rows().unwrap().clone(),
+                pos,
+                &t.data().unwrap().ids.last_row_id,
+                &t.data().unwrap().len,
+                #[cfg(feature = "enable_long_row")]
+                0,
+                &rw,
+                None,
+                None,
+                crate::core::mvcc::transaction::FROZEN_TX,
+            )
+            .await;
+        test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(false));
+        assert!(outcome.is_err(), "the injected commit failure was swallowed");
+        assert_eq!(wal.pending_transactions(), 0, "the failed update left its transaction open");
+        assert!(wal.checkpoint().unwrap(), "the log can no longer be checkpointed");
+        let _ = remove_for(&dir.path().to_string_lossy());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_compaction_commit_leaves_no_transaction_open() {
+        let dir = temp_dir();
+        let (t, wal) = logged_table(dir.path(), 40).await;
+        t.wait_filters_ready().await.unwrap();
+        t.delete_rows(
+            "id < 20",
+            {
+                let calc = crate::core::row::schema::SchemaCalculator;
+                let mut cols = smallvec::SmallVec::new();
+                for f in t.schema.fields.iter() {
+                    let (column_offset, schema_id) = calc.calculate_schema_offset(&f.name, &t.schema.fields);
+                    cols.push(crate::core::row::row::ColumnFetchingData {
+                        column_offset,
+                        column_type: f.db_type.clone(),
+                        size: f.size,
+                        schema_id,
+                    });
+                }
+                crate::core::row::row::RowFetch { columns_fetching_data: cols }
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(true));
+        let outcome = t.compact().await;
+        test_hooks::FAIL_COMMIT_MARKER.with(|f| f.set(false));
+        assert!(outcome.is_err(), "the injected commit failure was swallowed");
+        assert_eq!(wal.pending_transactions(), 0, "the failed compaction left its transaction open");
+        assert!(wal.checkpoint().unwrap(), "the log can no longer be checkpointed");
+        let _ = remove_for(&dir.path().to_string_lossy());
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_log_as_it_was() {
+        // Each write site: a data record, a commit marker, a record+marker.
+        for site in 0..3 {
+            let dir = temp_dir();
+            let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+            let data = dir.path().join("data.db");
+            std::fs::write(&data, vec![0u8; 64]).unwrap();
+            let wal = Wal::open(&wal_path).unwrap();
+            let id = file_id_for_name("data.db");
+            wal.register_file(id, &data).unwrap();
+            wal.log_and_commit(id, 8, b"PRIOR").unwrap();
+            let before = records(&wal_path).len();
+
+            let t = wal.begin();
+            if site == 1 {
+                wal.log(t, id, 0, &[2u8; 300]).unwrap();
+            }
+            test_hooks::SHORT_WAL_WRITE.with(|h| h.set(Some(HEADER_LEN + 20)));
+            let failed = match site {
+                0 => wal.log(t, id, 0, &[2u8; 4096]).map(|_| ()),
+                1 => wal.commit_txn(t),
+                _ => wal.log_and_commit(id, 0, &[2u8; 4096]),
+            };
+            test_hooks::SHORT_WAL_WRITE.with(|h| h.set(None));
+            assert!(failed.is_err(), "site {site}: the injected failure was swallowed");
+            let expect = if site == 1 { before + HEADER_LEN + 300 } else { before };
+            assert_eq!(
+                records(&wal_path).len(),
+                expect,
+                "site {site}: a partial record was left in the log"
+            );
+
+            // The next in-place write reads its payload back from the offset
+            // `write_pos` gave it; after a desync that was foreign bytes.
+            let t3 = wal.begin();
+            wal.log_in_place(t3, id, 0, b"GOOD").unwrap();
+            wal.commit_txn(t3).unwrap();
+            assert_eq!(&read_file(&data)[..4], b"GOOD", "site {site}");
+
+            // And replay reads every later record: nothing sits behind garbage.
+            std::fs::write(&data, vec![0u8; 64]).unwrap();
+            let stats = Wal::recover(&wal_path, resolver(data.clone())).unwrap();
+            assert_eq!(stats.truncated_tail, 0, "site {site}");
+            let bytes = read_file(&data);
+            assert_eq!(&bytes[..4], b"GOOD", "site {site}");
+            assert_eq!(&bytes[8..13], b"PRIOR", "site {site}");
+        }
+    }
+
+    /// A failed write that cannot be cut back leaves a torn record, which
+    /// hides every later commit from recovery: the log must be poisoned, with
+    /// a reason, at each write site.
+    #[test]
+    fn a_failed_write_that_cannot_be_cut_back_poisons_the_log() {
+        for site in 0..3 {
+            let dir = temp_dir();
+            let wal = Wal::open(dir.path().join(DEFAULT_WAL_NAME)).unwrap();
+            let t = wal.begin();
+            if site == 1 {
+                wal.log(t, 1, 0, &[2u8; 30]).unwrap();
+            }
+            test_hooks::SHORT_WAL_WRITE.with(|h| h.set(Some(HEADER_LEN + 2)));
+            test_hooks::FAIL_WAL_ROLLBACK.with(|f| f.set(true));
+            let failed = match site {
+                0 => wal.log(t, 1, 0, &[2u8; 300]).map(|_| ()),
+                1 => wal.commit_txn(t),
+                _ => wal.log_and_commit(1, 0, &[2u8; 300]),
+            };
+            test_hooks::SHORT_WAL_WRITE.with(|h| h.set(None));
+            test_hooks::FAIL_WAL_ROLLBACK.with(|f| f.set(false));
+            assert!(failed.is_err(), "site {site}: the injected failure was swallowed");
+            assert!(wal.is_poisoned(), "site {site}: a torn record was left in a live log");
+            assert!(
+                wal.poison_reason().is_some_and(|r| r.contains("cut back")),
+                "site {site}: {:?}",
+                wal.poison_reason()
+            );
+            assert!(wal.log_and_commit(1, 0, b"later").is_err(), "site {site}");
+        }
+    }
+
+    /// A failed append to a real file that cannot be cut back must poison
+    /// the log. `/dev/full` refuses every write with `ENOSPC`, and `ftruncate`
+    /// on it fails too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_log_append_poisons_the_log() {
+        let wal = Wal::open("/dev/full").unwrap();
+        let txn = wal.begin();
+        assert!(wal.log(txn, 1, 0, b"bytes").is_err());
+        assert!(wal.is_poisoned(), "a failed log append must poison the log");
+        assert!(wal.commit_txn(wal.begin()).is_err());
+    }
+
+    /// fsyncgate: a data file that fails its flush at checkpoint must poison
+    /// the log, and no later checkpoint may drop it.
+    ///
+    /// `/dev/null` stands in for the failing file — `fdatasync` on it fails
+    /// with `EINVAL` every time, the way a writeback error fails it once.
+    /// Re-pointing the id at a healthy file afterwards models what Linux does
+    /// next: the retry succeeds, because the dirty pages that failed are gone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_data_file_flush_at_checkpoint_keeps_the_log() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("table.db");
+        std::fs::write(&data, b"").unwrap();
+
+        let wal = Wal::open(&wal_path).unwrap();
+        let id = file_id_for_name("table.db");
+        wal.register_file(id, &data).unwrap();
+        wal.log_and_commit(id, 0, b"committed").unwrap();
+
+        // A checkpoint syncs only the files records name, so the flaky file
+        // gets one. Never committed, so replay leaves it out.
+        let flaky = file_id_for_name("flaky.db");
+        wal.register_file(flaky, "/dev/null").unwrap();
+        wal.log(wal.begin(), flaky, 0, b"flaky").unwrap();
+        let logged = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(logged > 0);
+
+        assert!(wal.checkpoint().is_err(), "the failed flush must be reported");
+        assert!(wal.is_poisoned(), "a failed data-file flush must poison the log");
+        assert!(wal.poison_reason().unwrap().contains("/dev/null"));
+
+        wal.repoint_file_for_tests(flaky, &data);
+        assert!(
+            wal.checkpoint().is_err(),
+            "a retried checkpoint must not succeed over the failed flush"
+        );
+        assert_eq!(
+            std::fs::metadata(&wal_path).unwrap().len(),
+            logged,
+            "the log is the only copy of what the failed flush lost; it must not be dropped"
+        );
+        assert_eq!(wal.checkpoint_counts().1, 2);
+        assert!(wal.last_checkpoint_error().is_some());
+        assert!(wal.truncate().is_err(), "a poisoned log was truncated directly");
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), logged);
+
+        let txn = wal.begin();
+        wal.log(txn, id, 9, b"later").unwrap();
+        assert!(wal.commit_txn(txn).is_err(), "later commits must fail loudly");
+
+        // And the record the data file may have lost is still there to replay.
+        drop(wal);
+        let stats = Wal::recover(&wal_path, resolver(data.clone())).unwrap();
+        assert_eq!(stats.applied, 1);
+        assert_eq!(read_file(&data), b"committed");
+    }
+
+    /// A committed in-place write whose apply fails must poison the log.
+    ///
+    /// The commit marker is durable by then, so the log holds the only correct
+    /// copy of the bytes; a checkpoint dropping it would leave the data file
+    /// with whatever the failed apply did not write. A directory where the
+    /// data file should be makes the apply's `open` fail.
+    #[test]
+    fn a_failed_in_place_apply_poisons_the_log_and_keeps_it() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let target = dir.path().join("not_a_file");
+        std::fs::create_dir(&target).unwrap();
+
+        let wal = Wal::open(&wal_path).unwrap();
+        let id = file_id_for_name("not_a_file");
+        wal.register_file(id, &target).unwrap();
+
+        let txn = wal.begin();
+        wal.log_in_place(txn, id, 0, b"OVERWRITE").unwrap();
+        assert!(wal.commit_txn(txn).is_err(), "the failed apply must be reported");
+        assert!(wal.is_poisoned(), "a failed apply after the commit marker must poison the log");
+        assert_eq!(wal.pending_bytes(), 0);
+        assert_eq!(wal.pending_transactions(), 0);
+
+        let logged = std::fs::metadata(&wal_path).unwrap().len();
+        // The directory is replaced by a file a checkpoint could flush, so
+        // only the poisoning stands between it and dropping the log.
+        std::fs::remove_dir(&target).unwrap();
+        std::fs::write(&target, b"").unwrap();
+        assert!(wal.checkpoint().is_err());
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), logged);
+
+        drop(wal);
+        let stats = Wal::recover(&wal_path, resolver(target.clone())).unwrap();
+        assert_eq!(stats.applied, 1);
+        assert_eq!(read_file(&target), b"OVERWRITE");
+    }
+
+    /// Declines and failures are counted apart: a decline is expected and
+    /// transient, a failure is not.
+    #[test]
+    fn checkpoint_declines_are_counted() {
+        let dir = temp_dir();
+        let wal = Wal::open(dir.path().join(DEFAULT_WAL_NAME)).unwrap();
+        let data = dir.path().join("t.db");
+        std::fs::write(&data, b"").unwrap();
+        let id = file_id_for_name("t.db");
+        wal.register_file(id, &data).unwrap();
+        let txn = wal.begin();
+        wal.log_in_place(txn, id, 0, b"held").unwrap();
+        assert!(!wal.checkpoint().unwrap(), "a pending overwrite must hold the log");
+        assert_eq!(wal.checkpoint_counts(), (1, 0));
+        wal.abort_txn(txn);
+        assert!(wal.checkpoint().unwrap());
+        assert_eq!(wal.checkpoint_counts(), (1, 0));
+        assert_eq!(wal.last_checkpoint_error(), None);
+    }
+
+    /// A record logged while a checkpoint is syncing the data files may
+    /// describe bytes that reached a file after that file's sync. The
+    /// checkpoint must keep it in the log and must not report it durable.
+    #[test]
+    fn a_checkpoint_keeps_records_logged_during_its_sync() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("data.db");
+        std::fs::write(&data, vec![0u8; 64]).unwrap();
+        let wal = Arc::new(Wal::open(&wal_path).unwrap());
+        let id = file_id_for_name("data.db");
+        wal.register_file(id, &data).unwrap();
+        wal.log_and_commit(id, 0, b"EARLY").unwrap();
+
+        let late_marker = Arc::new(AtomicU64::new(0));
+        {
+            let wal = wal.clone();
+            let late_marker = late_marker.clone();
+            test_hooks::AFTER_CHECKPOINT_SYNC.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    // Logged, its data never written to the file: what a crash
+                    // right after the checkpoint would leave.
+                    let t = wal.begin();
+                    wal.log(t, id, 32, b"LATE").unwrap();
+                    late_marker.store(wal.commit_txn_deferred_seq(t).unwrap(), Ordering::SeqCst);
+                }));
+            });
+        }
+        assert!(wal.checkpoint().unwrap(), "checkpoint declined");
+        test_hooks::AFTER_CHECKPOINT_SYNC.with(|hook| *hook.borrow_mut() = None);
+
+        let marker = late_marker.load(Ordering::SeqCst);
+        assert!(marker > 0);
+        assert!(
+            wal.durable_through() < marker,
+            "the checkpoint reported a record durable that it never synced"
+        );
+        // The log still holds it, and only it: replay restores the bytes.
+        let stats = Wal::recover(&wal_path, resolver(data.clone())).unwrap();
+        assert_eq!(stats.applied, 1, "the record logged during the sync pass was discarded");
+        assert_eq!(&read_file(&data)[32..36], b"LATE");
+
+        // And the log keeps working on the new file: a sync reaches it.
+        wal.commit_through(marker).unwrap();
+        wal.log_and_commit(id, 40, b"AFTER").unwrap();
+        std::fs::write(&data, vec![0u8; 64]).unwrap();
+        let stats = Wal::recover(&wal_path, resolver(data.clone())).unwrap();
+        assert_eq!(stats.applied, 2);
+        assert_eq!(&read_file(&data)[40..45], b"AFTER");
+    }
+
+    /// Which call sites sync what during a VACUUM FULL of one table among
+    /// many, after a restart, with a log well under the checkpoint threshold.
+    /// The deployed node's "two full passes" were one checkpoint over every
+    /// registered file — and `register_directory` registers each table's
+    /// `.tmp` sibling too, doubling the count after any restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vacuum_full_syncs_only_what_it_wrote() {
+        let _ = crate::MAX_PERMITS_THREADS.set(4);
+        let _ = crate::BATCH_SIZE.set(1024);
+        let dir = temp_dir();
+        let dir_str = dir.path().to_string_lossy().to_string();
+        let db = rclite::Arc::new(crate::core::database::Database::new(&dir_str).await);
+        for i in 0..40 {
+            exec_sql(&db, &format!("CREATE TABLE s{i} (id UBIGINT, v VARCHAR);")).await;
+            exec_sql(&db, &format!("INSERT INTO s{i} (id, v) VALUES (1, 'a');")).await;
+        }
+        let values: Vec<String> = (1..=100).map(|i| format!("({i}, 'xxxxxxxx')")).collect();
+        exec_sql(&db, &format!("INSERT INTO s0 (id, v) VALUES {};", values.join(", "))).await;
+        exec_sql(&db, "DELETE FROM s0 WHERE id > 10;").await;
+        drop(db);
+        let _ = remove_for(&dir_str);
+        let db = rclite::Arc::new(crate::core::database::Database::new(&dir_str).await);
+        let wal = wal_for(&dir_str).expect("a log");
+        // Opening tables can briefly hold an in-place write; wait for a cut.
+        let mut cut = false;
+        for _ in 0..200 {
+            if wal.checkpoint().unwrap() {
+                cut = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(cut, "the log could not be checkpointed after reopening");
+        let registered = wal.registered_files().len();
+        // Four files a table holds open since persistent indexes B14 retired
+        // `_flt.db`: rows, pointers, schema, sequence.
+        assert!(registered >= 40 * 4, "only {registered} files registered");
+
+        let watch = crate::core::sync_audit::watch(dir.path());
+        let out = exec_sql(&db, "VACUUM FULL s0;").await;
+        assert_eq!(out[0], 0, "{}", String::from_utf8_lossy(&out[1..]));
+        let seen = watch.take();
+        // The transaction status and id-reservation files belong to the
+        // database, not to any table: a reservation crossing a block during
+        // this window syncs them legitimately (7ae0f93), and counting them as
+        // another table's made the bound below fail under load.
+        let data_syncs: Vec<_> = seen
+            .iter()
+            .filter(|(tag, _)| *tag == "wal.checkpoint.data_file")
+            .filter(|(_, p)| {
+                !p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("db_transactions"))
+            })
+            .collect();
+        eprintln!("{} registered; syncs by site: {:?}", registered, {
+            let mut c = std::collections::BTreeMap::new();
+            for (t, _) in &seen {
+                *c.entry(*t).or_insert(0) += 1;
+            }
+            c
+        });
+        // Only s0's own files: rows, pointers — never the other tables, and
+        // never a `.tmp` sibling.
+        assert!(
+            data_syncs.len() <= 6,
+            "a checkpoint synced {} data files for a one-table VACUUM FULL: {:?}",
+            data_syncs.len(),
+            data_syncs
+        );
+        // Background maintenance (each table's vacuum/forget sweep runs on its
+        // own timer after a reopen) can legitimately dirty another table in
+        // this window, so a stray sync or two is not the regression. The
+        // regression is the old full pass over every registered file (800+
+        // here), which the bound above already excludes. s0's own files must
+        // be among them.
+        // `rdb.ixe` holds s0's slot epoch, which VACUUM FULL bumps through
+        // the log (persistent indexes §6): s0's, not another table's.
+        let ours = |p: &std::path::Path| p.to_string_lossy().contains("s0") || p.ends_with("rdb.ixe");
+        let foreign: Vec<_> = data_syncs.iter().filter(|(_, p)| !ours(p)).collect();
+        assert!(
+            foreign.len() <= 2,
+            "VACUUM FULL s0 synced other tables' files: {:?}",
+            foreign
+        );
+        assert!(
+            data_syncs.iter().any(|(_, p)| ours(p)),
+            "VACUUM FULL s0 did not sync s0's own files: {:?}",
+            data_syncs
+        );
+        drop(watch);
+        let _ = remove_for(&dir_str);
+    }
+
+    /// The VACUUM FULL scenario from the deployed node, small: many tables, a
+    /// log well under the checkpoint threshold, VACUUM FULL on one table.
+    /// `RASTDB_SYNC_SCENARIO_DIR` places it on a real disk (for strace).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn vacuum_full_sync_scenario() {
+        let _ = crate::MAX_PERMITS_THREADS.set(4);
+        let _ = crate::BATCH_SIZE.set(1024);
+        let base = std::env::var("RASTDB_SYNC_SCENARIO_DIR").unwrap_or_else(|_| "/tmp".into());
+        let dir = tempfile::tempdir_in(base).unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+        let db = rclite::Arc::new(crate::core::database::Database::new(&dir_str).await);
+        for i in 0..200 {
+            exec_sql(&db, &format!("CREATE TABLE t{i} (id UBIGINT, v VARCHAR);")).await;
+            exec_sql(&db, &format!("INSERT INTO t{i} (id, v) VALUES (1, 'a');")).await;
+        }
+        let values: Vec<String> = (1..=200).map(|i| format!("({i}, '{}')", "x".repeat(50))).collect();
+        exec_sql(&db, &format!("INSERT INTO t0 (id, v) VALUES {};", values.join(", "))).await;
+        exec_sql(&db, "DELETE FROM t0 WHERE id > 20;").await;
+        // A server is restarted far more often than it is created: reopen, as
+        // the deployed node had been, so `register_directory` runs.
+        let db = if std::env::var("RASTDB_SYNC_SCENARIO_REOPEN").is_ok() {
+            drop(db);
+            let _ = remove_for(&dir_str);
+            rclite::Arc::new(crate::core::database::Database::new(&dir_str).await)
+        } else {
+            db
+        };
+        let wal = wal_for(&dir_str).expect("a log");
+        // Start from a cut log, as on the node.
+        assert!(wal.checkpoint().unwrap());
+        assert!(wal.bytes_since_checkpoint() < crate::wal_checkpoint_bytes());
+        eprintln!(
+            "SCENARIO: {} files registered with the log",
+            wal.registered_files().len()
+        );
+        eprintln!("SCENARIO: VACUUM FULL begins");
+        let out = exec_sql(&db, "VACUUM FULL t0;").await;
+        eprintln!("SCENARIO: VACUUM FULL ends");
+        assert_eq!(out[0], 0, "{}", String::from_utf8_lossy(&out[1..]));
+        let _ = remove_for(&dir_str);
+    }
+
+    /// `VACUUM FULL` while the log cannot be checkpointed used to move every
+    /// row, keep both tails, log a warning nobody sees at the production log
+    /// level, and report success. It must say so, and count it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vacuum_full_says_when_it_could_not_return_space() {
+        let _ = crate::MAX_PERMITS_THREADS.set(4);
+        let _ = crate::BATCH_SIZE.set(1024);
+        let dir = temp_dir();
+        let dir_str = dir.path().to_string_lossy().to_string();
+        let db = rclite::Arc::new(crate::core::database::Database::new(&dir_str).await);
+        exec_sql(&db, "CREATE TABLE t (id UBIGINT, v VARCHAR);").await;
+        let values: Vec<String> = (1..=200).map(|i| format!("({i}, '{}')", "x".repeat(50))).collect();
+        exec_sql(&db, &format!("INSERT INTO t (id, v) VALUES {};", values.join(", "))).await;
+        exec_sql(&db, "DELETE FROM t WHERE id > 20;").await;
+
+        // An open transaction holding an in-place write: every checkpoint
+        // declines while it is there.
+        let wal = wal_for(&dir_str).expect("a log");
+        let scratch = dir.path().join("scratch.db");
+        std::fs::write(&scratch, vec![0u8; 16]).unwrap();
+        let scratch_id = file_id_for_name("scratch.db");
+        wal.register_file(scratch_id, &scratch).unwrap();
+        let pending = wal.begin();
+        wal.log_in_place(pending, scratch_id, 0, b"held").unwrap();
+
+        // It succeeds, as PostgreSQL's does, and says why with a WARNING the
+        // wire layer sends ahead of the completion.
+        let (out, notices) = crate::core::notice::collect(async {
+            let out = exec_sql(&db, "VACUUM FULL t;").await;
+            (out, crate::core::notice::drain())
+        })
+        .await;
+        assert_eq!(out[0], 0, "VACUUM FULL failed: {}", String::from_utf8_lossy(&out[1..]));
+        assert_eq!(notices.len(), 1, "no warning that the space was not returned");
+        assert_eq!((notices[0].severity, notices[0].sqlstate), ("WARNING", "01000"));
+        assert!(notices[0].message.contains("could not return the space"), "{:?}", notices[0]);
+        let table = db.table_for_tests("t").unwrap();
+        assert_eq!(table.vacuum_stats().unwrap().full_untruncated.load(Ordering::Relaxed), 1);
+        // The data is intact.
+        let rows = exec_sql(&db, "SELECT id FROM t WHERE id > 0").await;
+        assert_eq!(crate::core::row::row::vec_into_rows(&rows[1..]).unwrap().len(), 20);
+
+        // Once the log can be cut, the same statement returns the space.
+        wal.commit_txn(pending).unwrap();
+        let notices = crate::core::notice::collect(async {
+            let out = exec_sql(&db, "VACUUM FULL t;").await;
+            assert_eq!(out[0], 0, "{}", String::from_utf8_lossy(&out[1..]));
+            crate::core::notice::drain()
+        })
+        .await;
+        assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(table.vacuum_stats().unwrap().full_untruncated.load(Ordering::Relaxed), 1);
+    }
+
+    /// A checkpoint syncs the files the log's records describe, not every
+    /// registered file: at 2,042 tables that was ~4,700 device flushes a pass.
+    #[test]
+    fn a_checkpoint_syncs_only_the_files_written() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let wal = Wal::open(&wal_path).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..50 {
+            let name = format!("t{i}.db");
+            let path = dir.path().join(&name);
+            std::fs::write(&path, vec![0u8; 16]).unwrap();
+            let id = file_id_for_name(&name);
+            wal.register_file(id, &path).unwrap();
+            ids.push((id, path));
+        }
+        let syncs = || test_hooks::CHECKPOINT_SYNCS.with(|n| n.replace(0));
+        syncs();
+
+        wal.log_and_commit(ids[7].0, 0, b"one").unwrap();
+        wal.log_and_commit(ids[7].0, 3, b"two").unwrap();
+        assert!(wal.checkpoint().unwrap());
+        assert_eq!(syncs(), 1, "one file written, so one file synced");
+
+        assert!(wal.checkpoint().unwrap());
+        assert_eq!(syncs(), 0, "nothing written since the last checkpoint");
+
+        // A declined checkpoint keeps the files owed for the next one.
+        wal.log_and_commit(ids[3].0, 0, b"x").unwrap();
+        let held = wal.begin();
+        wal.log_in_place(held, ids[9].0, 0, b"held").unwrap();
+        assert!(!wal.checkpoint().unwrap());
+        wal.commit_txn(held).unwrap();
+        syncs();
+        assert!(wal.checkpoint().unwrap());
+        assert_eq!(syncs(), 2, "the declined checkpoint's files were forgotten");
+
+        // A log opened with records this process did not write syncs the files
+        // those records name — read from the log — and not every registered
+        // file: a reopened directory registers each table's `.tmp` sibling
+        // too, which made this one checkpoint cost two passes.
+        wal.log_and_commit(ids[1].0, 0, b"left").unwrap();
+        let held = wal.begin();
+        wal.log(held, ids[2].0, 0, b"uncommitted").unwrap();
+        drop(wal);
+        let reopened = Wal::open(&wal_path).unwrap();
+        for (i, (id, path)) in ids.iter().enumerate() {
+            reopened.register_file(*id, path).unwrap();
+            // What `register_directory` finds beside every table file.
+            let tmp = dir.path().join(format!("t{i}.db.tmp"));
+            std::fs::write(&tmp, b"staging").unwrap();
+            reopened.register_file(file_id_for_name(&format!("t{i}.db.tmp")), tmp).unwrap();
+        }
+        syncs();
+        assert!(reopened.checkpoint().unwrap());
+        assert_eq!(
+            syncs(),
+            2,
+            "the files the reopened log's records name, committed or not, and no other"
+        );
+
+        // The read stops where replay does, at a torn tail.
+        reopened.log_and_commit(ids[4].0, 0, b"left").unwrap();
+        drop(reopened);
+        let mut garbage = std::fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
+        garbage.write_all(b"torn tail").unwrap();
+        drop(garbage);
+        let torn = Wal::open(&wal_path).unwrap();
+        for (id, path) in &ids {
+            torn.register_file(*id, path).unwrap();
+        }
+        syncs();
+        assert!(torn.checkpoint().unwrap());
+        assert_eq!(syncs(), 1, "a torn tail names nothing replay would apply");
+
+        // Truncation, as recovery does, leaves nothing owed.
+        torn.log_and_commit(ids[5].0, 0, b"left").unwrap();
+        drop(torn);
+        let recovered = Wal::open(&wal_path).unwrap();
+        for (id, path) in &ids {
+            recovered.register_file(*id, path).unwrap();
+        }
+        recovered.truncate().unwrap();
+        syncs();
+        assert!(recovered.checkpoint().unwrap());
+        assert_eq!(syncs(), 0, "an empty log owes no file a sync");
+    }
+
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored
+    /// checkpoint_file_count_bench --nocapture`, with RASTDB_BENCH_DIR on a
+    /// real disk. A checkpoint of 2,000 registered files with one written.
+    #[test]
+    #[ignore]
+    fn checkpoint_file_count_bench() {
+        let base = std::env::var("RASTDB_BENCH_DIR").unwrap_or_else(|_| "/var/tmp".to_string());
+        let dir = tempfile::tempdir_in(base).unwrap();
+        let wal = Wal::open(dir.path().join(DEFAULT_WAL_NAME)).unwrap();
+        let mut first = 0;
+        for i in 0..2_000 {
+            let name = format!("t{i}.db");
+            let path = dir.path().join(&name);
+            std::fs::write(&path, vec![1u8; 4096]).unwrap();
+            let id = file_id_for_name(&name);
+            if i == 0 {
+                first = id;
+            }
+            wal.register_file(id, &path).unwrap();
+        }
+        // Everything clean on disk before timing.
+        for i in 0..2_000 {
+            crate::core::sync_path::sync_file(&dir.path().join(format!("t{i}.db"))).unwrap();
+        }
+        for round in 0..3 {
+            // What every checkpoint used to do first: sync each registered file.
+            let t = std::time::Instant::now();
+            for (_, path) in wal.registered_files() {
+                File::options().read(true).write(true).open(&path).unwrap().sync_data().unwrap();
+            }
+            let old_pass = t.elapsed();
+            wal.log_and_commit(first, 0, b"dirty").unwrap();
+            let t = std::time::Instant::now();
+            assert!(wal.checkpoint().unwrap());
+            println!(
+                "round {round}: 2000 files, 1 dirty: old sync pass alone {old_pass:?}, \
+                 whole checkpoint now {:?}",
+                t.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_transaction_is_broken_in_batches_not_per_row() {
+        let dir = temp_dir();
+        let wal = Wal::open(dir.path().join(DEFAULT_WAL_NAME)).unwrap();
+        let threshold = 64 * 1024;
+        let record = vec![0u8; 100];
+        let per_record = (HEADER_LEN + record.len()) as u64;
+        // Past the threshold and staying there, as with declined checkpoints.
+        while wal.bytes_since_checkpoint() < threshold {
+            let t = wal.begin();
+            wal.log(t, 1, 0, &record).unwrap();
+        }
+        let mut grants = 0;
+        let rows = 2_000u64;
+        for _ in 0..rows {
+            let t = wal.begin();
+            wal.log(t, 1, 0, &record).unwrap();
+            grants += u64::from(wal.grant_break(threshold));
+        }
+        // One per eighth of the threshold logged, give or take the first.
+        let expected = rows * per_record / (threshold / 8);
+        assert!(
+            grants <= expected + 2,
+            "{grants} breaks for {rows} rows: committing per row, not in batches"
+        );
+        assert!(grants >= 1, "never told to commit");
+        // A checkpoint resets the counter, and the next pass is granted again.
+        assert!(wal.checkpoint().unwrap());
+        while wal.bytes_since_checkpoint() < threshold {
+            let t = wal.begin();
+            wal.log(t, 1, 0, &record).unwrap();
+        }
+        assert!(wal.grant_break(threshold));
+    }
+
+    #[test]
+    fn a_combined_record_and_marker_tears_cleanly_at_every_byte() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("table.db");
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_and_commit(1, 0, b"AAAA").unwrap();
+            let seq = wal.log_and_commit_deferred(1, 4, b"BBBB").unwrap();
+            // Two records went out: the data record and its marker.
+            assert_eq!(seq, 4);
+            wal.sync_pending().unwrap();
+            assert_eq!(wal.durable_through(), 4);
+        }
+        let full = records(&wal_path);
+        let frame = 2 * HEADER_LEN + 4;
+        let start = full.len() - frame;
+        // The frame is one record and one marker, in that order.
+        assert_eq!(full[start + 5], 0);
+        assert_eq!(full[start + HEADER_LEN + 4 + 5], FLAG_COMMIT);
+
+        // Every length a crash could leave of the second write: it commits
+        // only once the whole frame is there, and never applies a torn record.
+        for cut in start..=full.len() {
+            std::fs::write(&wal_path, &full[..cut]).unwrap();
+            let _ = std::fs::remove_file(&data);
+            let stats = Wal::recover(&wal_path, resolver(data.clone())).unwrap();
+            if cut == full.len() {
+                assert_eq!(stats.applied, 2, "cut {cut}");
+                assert_eq!(read_file(&data), b"AAAABBBB");
+            } else {
+                assert_eq!(stats.applied, 1, "cut {cut}: a torn frame was applied");
+                assert_eq!(read_file(&data), b"AAAA", "cut {cut}");
+            }
+        }
+    }
+
     #[test]
     fn stops_at_a_torn_tail_and_keeps_the_prefix() {
         let dir = temp_dir();
@@ -1752,7 +5297,7 @@ mod tests {
         }
 
         // A third record cut off mid-header, as a crash would leave it.
-        let mut raw = read_file(&wal_path);
+        let mut raw = records(&wal_path);
         let intact = raw.len();
         raw.extend_from_slice(&RECORD_MAGIC.to_le_bytes());
         raw.push(FORMAT_VERSION);
@@ -1852,7 +5397,7 @@ mod tests {
         std::fs::write(&data, b"").unwrap();
 
         let wal = Wal::open(&wal_path).unwrap();
-        wal.register_file(file_id_for_name("table.db"), &data);
+        wal.register_file(file_id_for_name("table.db"), &data).unwrap();
         wal.log_and_commit(file_id_for_name("table.db"), 0, b"payload")
             .unwrap();
         assert!(wal.bytes_since_checkpoint() > 0);
@@ -1875,7 +5420,7 @@ mod tests {
 
         let wal = Wal::open(&wal_path).unwrap();
         let id = file_id_for_name("table.db");
-        wal.register_file(id, &data);
+        wal.register_file(id, &data).unwrap();
 
         let txn = wal.begin();
         wal.log_in_place(txn, id, 0, b"NEW").unwrap();
@@ -1896,6 +5441,46 @@ mod tests {
         assert_eq!(wal.bytes_since_checkpoint(), 0);
     }
 
+    /// A hold keeps every checkpoint from discarding the log, and the log a
+    /// held `copy_log_to` hands back replays a copy taken before a write into
+    /// the state after it: what `CREATE BRANCH` rests on.
+    #[test]
+    fn a_checkpoint_hold_keeps_the_log_a_copy_needs() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("table.db");
+        std::fs::write(&data, b"AAAA").unwrap();
+
+        let wal = Arc::new(Wal::open(&wal_path).unwrap());
+        let id = file_id_for_name("table.db");
+        wal.register_file(id, &data).unwrap();
+
+        let hold = wal.hold_checkpoints();
+        // The copy reads the file before the write lands.
+        let copy_dir = temp_dir();
+        let copied = copy_dir.path().join("table.db");
+        std::fs::copy(&data, &copied).unwrap();
+
+        wal.log_and_commit(id, 0, b"BB").unwrap();
+        std::fs::write(&data, b"BBAA").unwrap();
+        assert!(!wal.checkpoint().unwrap(), "a held log was checkpointed");
+        assert!(wal.bytes_since_checkpoint() > 0);
+
+        let log_copy = copy_dir.path().join("replay.wal");
+        let lsn = wal.copy_log_to(&log_copy).unwrap();
+        assert_eq!(lsn, wal.commit_lsn());
+        drop(hold);
+
+        let target = copied.clone();
+        let stats = Wal::recover(&log_copy, move |f| (f == id).then(|| target.clone())).unwrap();
+        assert_eq!(stats.applied, 1);
+        assert_eq!(read_file(&copied), b"BBAA");
+
+        // Released, the next checkpoint proceeds.
+        assert!(wal.checkpoint().unwrap());
+        assert_eq!(wal.bytes_since_checkpoint(), 0);
+    }
+
     /// An in-place write must create its target if it does not exist yet.
     ///
     /// With a WAL enabled, `write_data_txn` deliberately leaves the data file
@@ -1913,11 +5498,14 @@ mod tests {
         let dir = temp_dir();
         let wal_path = dir.path().join(DEFAULT_WAL_NAME);
         let data = dir.path().join("sidecar.db");
-        assert!(!data.exists(), "the point of this test is that it is missing");
+        assert!(
+            !data.exists(),
+            "the point of this test is that it is missing"
+        );
 
         let wal = Wal::open(&wal_path).unwrap();
         let id = file_id_for_name("sidecar.db");
-        wal.register_file(id, &data);
+        wal.register_file(id, &data).unwrap();
 
         let txn = wal.begin();
         wal.log_in_place(txn, id, 0, b"HELLO").unwrap();
@@ -1954,7 +5542,7 @@ mod tests {
 
         let wal = Wal::open(&wal_path).unwrap();
         let id = file_id_for_name("table.db");
-        wal.register_file(id, &data);
+        wal.register_file(id, &data).unwrap();
 
         // Push the log out to a non-trivial length, so a stale `write_pos`
         // lands well past the end of the truncated file rather than close
@@ -2023,7 +5611,7 @@ mod tests {
             let path = dir.path().join(&name);
             std::fs::write(&path, vec![b'.'; 8]).unwrap();
             let id = file_id_for_name(&name);
-            wal.register_file(id, &path);
+            wal.register_file(id, &path).unwrap();
             ids.push((id, path));
         }
 
@@ -2114,8 +5702,7 @@ mod tests {
 
             {
                 let db = rclite::Arc::new(crate::core::database::Database::new(&dir_str).await);
-                let _ =
-                    exec_sql(&db, "CREATE TABLE torn (id UBIGINT, payload VARCHAR);").await;
+                let _ = exec_sql(&db, "CREATE TABLE torn (id UBIGINT, payload VARCHAR);").await;
                 for id in 1..=4u64 {
                     let sql = format!(
                         "INSERT INTO torn (id, payload) VALUES ({}, '{}');",
@@ -2150,7 +5737,7 @@ mod tests {
             assert_eq!(res.first(), Some(&2u8), "seed {}: expected rows", seed);
             let rows = vec_into_rows(&res[1..]).expect("decode rows");
 
-            let table = db.tables.get("torn").expect("table").clone();
+            let table = db.table_for_tests("torn").expect("table").clone();
             let schema = &table.schema.fields;
 
             let mut seen: Vec<u64> = Vec::new();
@@ -2163,7 +5750,9 @@ mod tests {
                         .expect("u64"),
                 );
                 let payload = String::from_utf8_lossy(
-                    row.get_column("payload", schema).expect("payload").into_slice(),
+                    row.get_column("payload", schema)
+                        .expect("payload")
+                        .into_slice(),
                 )
                 .to_string();
                 assert_eq!(
@@ -2200,7 +5789,7 @@ mod tests {
         {
             let wal = Wal::open(dir.path().join(DEFAULT_WAL_NAME)).unwrap();
             let id = file_id_for_name("table.db");
-            wal.register_file(id, &data);
+            wal.register_file(id, &data).unwrap();
 
             assert_eq!(wal.commit_lsn(), 0);
             wal.log_and_commit(id, 0, b"AAAA").unwrap();
@@ -2221,7 +5810,7 @@ mod tests {
         );
 
         let id = file_id_for_name("table.db");
-        wal.register_file(id, &data);
+        wal.register_file(id, &data).unwrap();
         wal.log_and_commit(id, 8, b"CCCC").unwrap();
         assert!(wal.commit_lsn() > before);
     }
@@ -2244,29 +5833,37 @@ mod tests {
         let before;
         {
             let wal = Wal::open(dir.path().join(DEFAULT_WAL_NAME)).unwrap();
-            wal.register_file(id, &data);
+            wal.register_file(id, &data).unwrap();
             wal.log_and_commit(id, 0, b"AAAA").unwrap();
             wal.log_and_commit(id, 4, b"BBBB").unwrap();
             before = wal.commit_lsn();
             assert!(before > 0);
 
-            assert!(wal.checkpoint().unwrap(), "the log should have been discarded");
+            assert!(
+                wal.checkpoint().unwrap(),
+                "the log should have been discarded"
+            );
             assert_eq!(
-                std::fs::metadata(dir.path().join(DEFAULT_WAL_NAME)).unwrap().len(),
+                std::fs::metadata(dir.path().join(DEFAULT_WAL_NAME))
+                    .unwrap()
+                    .len(),
                 0,
                 "nothing is left in the log to recover the sequence from"
             );
         }
 
         let (wal, stats) = open_and_recover(&dir_str).unwrap();
-        assert_eq!(stats.last_commit_lsn, 0, "an empty log recovers no sequence");
+        assert_eq!(
+            stats.last_commit_lsn, 0,
+            "an empty log recovers no sequence"
+        );
         assert_eq!(
             wal.commit_lsn(),
             before,
             "the sequence must resume past everything already issued"
         );
 
-        wal.register_file(id, &data);
+        wal.register_file(id, &data).unwrap();
         wal.log_and_commit(id, 8, b"CCCC").unwrap();
         assert!(wal.commit_lsn() > before, "and keep going up from there");
     }
@@ -2358,6 +5955,402 @@ mod tests {
         wal.log(txn, 1, 2, b"more").unwrap();
         assert!(wal.commit_txn(txn).is_err());
         assert!(wal.is_poisoned());
+    }
+
+    /// A log with one committed record and a registered data file, for the
+    /// failure tests below.
+    fn log_with_data(dir: &tempfile::TempDir) -> (Arc<Wal>, PathBuf, PathBuf, u64) {
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("data.db");
+        std::fs::write(&data, vec![0u8; 64]).unwrap();
+        let wal = Arc::new(Wal::open(&wal_path).unwrap());
+        let id = file_id_for_name("data.db");
+        wal.register_file(id, &data).unwrap();
+        wal.log_and_commit(id, 0, b"EARLY").unwrap();
+        (wal, wal_path, data, id)
+    }
+
+    /// What a poisoned log must refuse after the failure that poisoned it: a
+    /// later commit, whose sync would otherwise make the failed commit's
+    /// marker durable behind its caller's back, and a checkpoint, which would
+    /// drop records the data files may not hold. And the refused commit
+    /// leaves the file at the log's path exactly as it was.
+    fn assert_refuses_everything_after(wal: &Wal, wal_path: &Path, id: u64, what: &str) {
+        assert!(wal.is_poisoned(), "{what}: the error left the log unpoisoned");
+        let before = read_file(wal_path);
+        assert!(wal.log_and_commit(id, 40, b"AFTER").is_err(), "{what}: a later commit succeeded");
+        let t = wal.begin();
+        assert!(wal.commit_txn(t).is_err(), "{what}: a later commit succeeded");
+        assert!(wal.checkpoint().is_err(), "{what}: a checkpoint ran on a poisoned log");
+        assert_eq!(read_file(wal_path), before, "{what}: a refused commit reached the log");
+    }
+
+    /// V4: a failed log `fdatasync` poisons, whatever the error. Linux may
+    /// drop the dirty pages after reporting `EIO`, and a delayed allocation
+    /// reports `ENOSPC` at the sync, so a retry could succeed over bytes that
+    /// are gone.
+    #[test]
+    fn every_log_sync_failure_poisons_the_log() {
+        for errno in [libc::EIO, libc::ENOSPC] {
+            let dir = temp_dir();
+            let (wal, wal_path, _data, id) = log_with_data(&dir);
+            test_hooks::FAIL_LOG_SYNC.with(|f| f.set(Some(errno)));
+            let failed = wal.log_and_commit(id, 8, b"LOST");
+            test_hooks::FAIL_LOG_SYNC.with(|f| f.set(None));
+            assert!(failed.is_err(), "errno {errno}: the injected failure was swallowed");
+            assert!(
+                wal.poison_reason().is_some_and(|r| r.contains("fdatasync")),
+                "errno {errno}: {:?}",
+                wal.poison_reason()
+            );
+            assert_refuses_everything_after(&wal, &wal_path, id, &format!("errno {errno}"));
+        }
+    }
+
+    /// V4 (R7): the lazy open of the sync handle is a `commit_through` error
+    /// like any other, after the commit marker is in the file. Unpoisoned, the
+    /// next committer's sync made that marker durable, so replay applied a
+    /// write its caller was told had failed, and memory never saw it.
+    #[test]
+    fn a_failed_lazy_open_of_the_sync_handle_poisons_the_log() {
+        for site in ["in-place commit", "record and marker"] {
+            let dir = temp_dir();
+            let (wal, wal_path, _data, id) = log_with_data(&dir);
+            let lazy_before = wal.lazy_opens.load(Ordering::Relaxed);
+            // `Wal::open` installed the handle; only a cleared one is opened
+            // lazily, and `FAIL_SYNC_OPEN` fails that open.
+            let fail_next_open = || {
+                *wal.sync_handle.lock() = None;
+                test_hooks::FAIL_SYNC_OPEN.with(|f| f.set(true));
+            };
+            let failed = if site == "in-place commit" {
+                let t = wal.begin();
+                wal.log_in_place(t, id, 0, b"NEWKEY").unwrap();
+                fail_next_open();
+                wal.commit_txn(t)
+            } else {
+                fail_next_open();
+                wal.log_and_commit(id, 8, b"NEWKEY")
+            };
+            let fired = !test_hooks::FAIL_SYNC_OPEN.with(|f| f.replace(false));
+            assert!(fired, "{site}: the injected open failure never fired");
+            assert!(failed.is_err(), "{site}: the injected failure was swallowed");
+            assert_eq!(
+                wal.lazy_opens.load(Ordering::Relaxed),
+                lazy_before + 1,
+                "{site}: the hook did not reach the lazy open"
+            );
+            assert_refuses_everything_after(&wal, &wal_path, id, site);
+        }
+    }
+
+    /// V4: a committer queued on the sync gate behind a leader whose sync
+    /// failed is refused, not synced. It passed the poison check before the
+    /// leader failed; syncing anyway could return `Ok` over pages the kernel
+    /// dropped with the leader's `EIO`, so a commit on a log in an unknown
+    /// state would be acknowledged.
+    #[test]
+    fn a_committer_queued_behind_a_failed_sync_is_refused() {
+        let dir = temp_dir();
+        let (wal, wal_path, _data, id) = log_with_data(&dir);
+        let t = wal.begin();
+        wal.log(t, id, 8, b"QUEUED").unwrap();
+        let seq = wal.commit_txn_deferred_seq(t).unwrap();
+        let durable_before = wal.durable.load(Ordering::Acquire);
+        assert!(durable_before < seq, "nothing is owed, so nothing would queue");
+
+        // The leader's sync is in progress: it holds the gate.
+        let leader = wal.gate.lock();
+        let arrived = wal.gate_arrivals.load(Ordering::Acquire);
+        let follower = {
+            let wal = wal.clone();
+            std::thread::spawn(move || wal.commit_through(seq))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while wal.gate_arrivals.load(Ordering::Acquire) == arrived {
+            assert!(std::time::Instant::now() < deadline, "the follower never reached the gate");
+            std::thread::yield_now();
+        }
+        // The leader's fdatasync fails, as `commit_through_slow` handles it.
+        wal.poison("fdatasync of the log failed: injected EIO in the leader".into());
+        drop(leader);
+
+        let outcome = follower.join().unwrap();
+        assert!(outcome.is_err(), "a commit queued behind a failed sync was acknowledged");
+        assert_eq!(
+            wal.durable.load(Ordering::Acquire),
+            durable_before,
+            "a sync after the failure claimed records durable"
+        );
+        assert_refuses_everything_after(&wal, &wal_path, id, "queued behind a failed sync");
+    }
+
+    /// V4: a partial `writev` whose cut-back fails leaves a torn record in a
+    /// live log, so the log is poisoned, and nothing after it proceeds: no
+    /// commit, no checkpoint. (One that was cut back leaves the log exactly as
+    /// it was and fails only its statement; see
+    /// `a_failed_write_leaves_the_log_as_it_was`.)
+    #[test]
+    fn a_torn_write_refuses_every_later_commit_and_checkpoint() {
+        for site in ["record", "commit marker", "record and marker"] {
+            let dir = temp_dir();
+            let (wal, wal_path, _data, id) = log_with_data(&dir);
+            let t = wal.begin();
+            if site == "commit marker" {
+                wal.log(t, id, 0, &[2u8; 30]).unwrap();
+            }
+            test_hooks::SHORT_WAL_WRITE.with(|h| h.set(Some(HEADER_LEN + 2)));
+            test_hooks::FAIL_WAL_ROLLBACK.with(|f| f.set(true));
+            let failed = match site {
+                "record" => wal.log(t, id, 0, &[2u8; 300]).map(|_| ()),
+                "commit marker" => wal.commit_txn(t),
+                _ => wal.log_and_commit(id, 0, &[2u8; 300]),
+            };
+            test_hooks::SHORT_WAL_WRITE.with(|h| h.set(None));
+            test_hooks::FAIL_WAL_ROLLBACK.with(|f| f.set(false));
+            assert!(failed.is_err(), "{site}: the injected failure was swallowed");
+            assert_refuses_everything_after(&wal, &wal_path, id, site);
+        }
+    }
+
+    /// A keep-tail checkpoint on `wal`: a record is logged during its sync
+    /// pass, so it keeps that record and renames a new log over the old.
+    /// Returns the late record's commit sequence and the checkpoint's result.
+    fn keep_tail_checkpoint(wal: &Arc<Wal>, id: u64) -> (u64, io::Result<bool>) {
+        let late_marker = Arc::new(AtomicU64::new(0));
+        {
+            let wal = wal.clone();
+            let late_marker = late_marker.clone();
+            test_hooks::AFTER_CHECKPOINT_SYNC.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let t = wal.begin();
+                    wal.log(t, id, 32, b"LATE").unwrap();
+                    late_marker.store(wal.commit_txn_deferred_seq(t).unwrap(), Ordering::SeqCst);
+                }));
+            });
+        }
+        let outcome = wal.checkpoint();
+        test_hooks::AFTER_CHECKPOINT_SYNC.with(|hook| *hook.borrow_mut() = None);
+        (late_marker.load(Ordering::SeqCst), outcome)
+    }
+
+    /// V4 (Q13): once the keep-tail rename has returned `Ok`, the log's path
+    /// names the new file, and any failure before the writer and the sync
+    /// handle both reach it poisons. Otherwise the writer, the handle or both
+    /// stay on the unlinked old inode, and a later commit is fsynced, and
+    /// acknowledged, in a file nothing will ever replay.
+    #[test]
+    fn a_failure_after_the_keep_tail_rename_poisons_the_log() {
+        for site in ["rename_dir_sync", "rename_open", "rename_seek", "rename_clone"] {
+            let dir = temp_dir();
+            let (wal, wal_path, data, id) = log_with_data(&dir);
+            test_hooks::FAIL_WAL_STEP.with(|s| s.set(Some(site)));
+            let (late, outcome) = keep_tail_checkpoint(&wal, id);
+            let fired = test_hooks::FAIL_WAL_STEP.with(|s| s.replace(None)).is_none();
+            assert!(late > 0, "{site}: no record was logged during the sync pass");
+            assert!(fired, "{site}: the checkpoint never reached the step");
+            assert!(outcome.is_err(), "{site}: the checkpoint reported success");
+            assert_refuses_everything_after(&wal, &wal_path, id, site);
+
+            // The renamed log holds the tail, and replay restores it.
+            drop(wal);
+            let stats = Wal::recover(&wal_path, resolver(data.clone())).unwrap();
+            assert_eq!(stats.applied, 1, "{site}");
+            assert_eq!(&read_file(&data)[32..36], b"LATE", "{site}");
+        }
+    }
+
+    /// V4 (Q19): once `set_len(0)` has succeeded the log is empty, so the
+    /// append point is reset at once, and a failed seek or `sync_all` after
+    /// it poisons: whether the truncation reached the disk is unknown
+    /// (fsyncgate), and new records written over a log the disk may still
+    /// hold would replay after older ones.
+    #[test]
+    fn a_failure_after_truncation_poisons_the_log_and_resets_the_append_point() {
+        for site in ["truncate_seek", "truncate_sync"] {
+            let dir = temp_dir();
+            let (wal, wal_path, _data, id) = log_with_data(&dir);
+            test_hooks::FAIL_WAL_STEP.with(|s| s.set(Some(site)));
+            let outcome = wal.checkpoint();
+            let fired = test_hooks::FAIL_WAL_STEP.with(|s| s.replace(None)).is_none();
+            assert!(fired, "{site}: the checkpoint never reached the step");
+            assert!(outcome.is_err(), "{site}: the checkpoint reported success");
+            assert_eq!(wal.write_pos.load(Ordering::Relaxed), 0, "{site}: stale append point");
+            assert_eq!(wal.bytes_since_checkpoint(), 0, "{site}");
+            assert_refuses_everything_after(&wal, &wal_path, id, site);
+        }
+    }
+
+    /// The sync handle is opened with the log, and a keep-tail checkpoint
+    /// installs the new file as both writer and sync handle before it lets go
+    /// of the writer lock. A handle left to a lazy open made the first sync
+    /// after every such checkpoint a fresh `open` that could fail (`EMFILE`)
+    /// after a commit marker was already written.
+    #[cfg(unix)]
+    #[test]
+    fn a_keep_tail_checkpoint_installs_the_new_log_as_writer_and_sync_handle() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = temp_dir();
+        let (wal, wal_path, _data, id) = log_with_data(&dir);
+        let (late, outcome) = keep_tail_checkpoint(&wal, id);
+        assert!(outcome.unwrap(), "checkpoint declined");
+        let on_disk = std::fs::metadata(&wal_path).unwrap().ino();
+        let writer = wal.writer.lock().metadata().unwrap().ino();
+        let handle = wal
+            .sync_handle
+            .lock()
+            .as_ref()
+            .map(|h| h.metadata().unwrap().ino());
+        assert_eq!(writer, on_disk, "the writer is not on the renamed log");
+        assert_eq!(handle, Some(on_disk), "the sync handle is not on the renamed log");
+        wal.commit_through(late).unwrap();
+        wal.log_and_commit(id, 40, b"AFTER").unwrap();
+        assert_eq!(wal.lazy_opens.load(Ordering::Relaxed), 0, "a sync opened its handle lazily");
+    }
+
+    /// `block_in_place` panics on a current-thread runtime; the commit path
+    /// runs under every flavour (plain `#[tokio::test]` is current-thread), so
+    /// `blocking_io` must be callable from each without panicking.
+    #[test]
+    fn blocking_io_runs_under_every_runtime_flavour() {
+        assert_eq!(blocking_io(|| 1), 1);
+        let current = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        assert_eq!(current.block_on(async { blocking_io(|| 2) }), 2);
+        let multi = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        assert_eq!(multi.block_on(async { blocking_io(|| 3) }), 3);
+        let on_worker = multi.block_on(async { tokio::spawn(async { blocking_io(|| 4) }).await });
+        assert_eq!(on_worker.unwrap(), 4);
+        let on_blocking =
+            multi.block_on(async { tokio::task::spawn_blocking(|| blocking_io(|| 5)).await });
+        assert_eq!(on_blocking.unwrap(), 5);
+        // And a commit really syncs through it on a worker.
+        let dir = temp_dir();
+        let wal = Arc::new(Wal::open(dir.path().join(DEFAULT_WAL_NAME)).unwrap());
+        let w = wal.clone();
+        multi
+            .block_on(async move { tokio::spawn(async move { w.log_and_commit(1, 0, b"x") }).await })
+            .unwrap()
+            .unwrap();
+        assert_eq!(wal.durable_through(), 2);
+    }
+
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored
+    /// wal_for_bench --nocapture`. The registry lookup every storage write
+    /// makes several of, against the mutex + `String` key it replaced, from
+    /// 1 and 8 threads.
+    #[test]
+    #[ignore]
+    fn wal_for_bench() {
+        let dir = temp_dir();
+        let dir_str = dir.path().to_string_lossy().to_string();
+        let wal = Arc::new(Wal::open(dir.path().join(DEFAULT_WAL_NAME)).unwrap());
+        install_for(&dir_str, wal.clone());
+        // The old registry, kept here as the reference.
+        let old: Arc<Mutex<HashMap<String, Arc<Wal>>>> = Arc::new(Mutex::new(HashMap::new()));
+        old.lock().insert(dir_key(&dir_str), wal);
+        const N: usize = 2_000_000;
+        for threads in [1usize, 8] {
+            for round in 0..3 {
+                let t = std::time::Instant::now();
+                std::thread::scope(|s| {
+                    for _ in 0..threads {
+                        s.spawn(|| {
+                            for _ in 0..N {
+                                std::hint::black_box(
+                                    old.lock().get(&dir_key(std::hint::black_box(&dir_str))).cloned(),
+                                );
+                            }
+                        });
+                    }
+                });
+                let o = t.elapsed();
+                let t = std::time::Instant::now();
+                std::thread::scope(|s| {
+                    for _ in 0..threads {
+                        s.spawn(|| {
+                            for _ in 0..N {
+                                std::hint::black_box(wal_for(std::hint::black_box(&dir_str)));
+                            }
+                        });
+                    }
+                });
+                let n = t.elapsed();
+                let t = std::time::Instant::now();
+                std::thread::scope(|s| {
+                    for _ in 0..threads {
+                        s.spawn(|| {
+                            for _ in 0..N {
+                                with_wal_for(std::hint::black_box(&dir_str), |w| {
+                                    std::hint::black_box(w.map(|w| w.is_poisoned()))
+                                });
+                            }
+                        });
+                    }
+                });
+                let b = t.elapsed();
+                println!(
+                    "threads {threads} round {round}: old {:.1}  wal_for {:.1}  with_wal_for {:.1} ns/lookup",
+                    o.as_nanos() as f64 / N as f64,
+                    n.as_nanos() as f64 / N as f64,
+                    b.as_nanos() as f64 / N as f64
+                );
+            }
+        }
+        let _ = remove_for(&dir_str);
+    }
+
+    /// `DROP DATABASE` then `CREATE DATABASE` of the same name: the second
+    /// database must log to its own, visible log. Resolving to the dropped
+    /// one's (an unlinked file) would report every write durable while a crash
+    /// replayed nothing — durability silently gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recreated_database_logs_to_its_new_log() {
+        use crate::core::database::catalog::DatabaseCatalog;
+        let _ = crate::MAX_PERMITS_THREADS.set(4);
+        let _ = crate::BATCH_SIZE.set(1024);
+
+        let root = temp_dir();
+        let root_str = root.path().to_string_lossy().to_string();
+        let path = root.path().join("d");
+        let path_str = path.to_string_lossy().to_string();
+        let catalog = DatabaseCatalog::open(Some(&root_str), "main").await.unwrap();
+
+        let first = catalog.create("d").await.unwrap();
+        let old = wal_for(&path_str).expect("a created database has a log");
+        exec_sql(&first, "CREATE TABLE t (id UBIGINT, v VARCHAR);").await;
+        exec_sql(&first, "INSERT INTO t (id, v) VALUES (1, 'old'), (2, 'old');").await;
+        drop(first);
+        catalog.drop_database("d", "main").await.unwrap();
+        assert!(wal_for(&path_str).is_none(), "a dropped database still resolves to a log");
+        let old_bytes = old.bytes_since_checkpoint();
+
+        let second = catalog.create("d").await.unwrap();
+        let new = wal_for(&path_str).expect("the recreated database has a log");
+        assert!(!Arc::ptr_eq(&old, &new), "the recreated database resolved to the dropped log");
+        // Trailing separators resolve to the same, new, log.
+        assert!(Arc::ptr_eq(&new, &wal_for(&format!("{path_str}/")).unwrap()));
+
+        let log_file = path.join(DEFAULT_WAL_NAME);
+        let before = records(&log_file).len();
+        exec_sql(&second, "CREATE TABLE t (id UBIGINT, v VARCHAR);").await;
+        let out = exec_sql(&second, "INSERT INTO t (id, v) VALUES (7, 'new');").await;
+        assert_eq!(out.first(), Some(&0u8), "{:?}", String::from_utf8_lossy(&out));
+        let after = records(&log_file).len();
+        assert!(after > before, "the write never reached the visible log ({before} -> {after})");
+        assert_eq!(old.bytes_since_checkpoint(), old_bytes, "a write went to the dropped log");
+        drop(second);
+        drop(catalog);
+
+        // And what a restart replays is the new database's rows only.
+        let reopened = rclite::Arc::new(crate::core::database::Database::new(&path_str).await);
+        let res = exec_sql(&reopened, "SELECT id FROM t WHERE id > 0").await;
+        assert_eq!(res.first(), Some(&2u8));
+        let rows = crate::core::row::row::vec_into_rows(&res[1..]).unwrap();
+        assert_eq!(rows.len(), 1, "expected only the recreated database's row");
+        let _ = remove_for(&path_str);
     }
 
     /// A log must not outlive the directory it describes.
@@ -2452,11 +6445,7 @@ mod tests {
         let _ = crate::core::processor::concurrent_processor::ENABLE_CACHE.set(false);
 
         let db = rclite::Arc::new(crate::core::database::Database::new(&dir).await);
-        let _ = exec_sql(
-            &db,
-            "CREATE TABLE crashy (id UBIGINT, payload VARCHAR);",
-        )
-        .await;
+        let _ = exec_sql(&db, "CREATE TABLE crashy (id UBIGINT, payload VARCHAR);").await;
 
         for id in 1u64.. {
             let sql = format!(
@@ -2483,7 +6472,7 @@ mod tests {
         }
         let rows = vec_into_rows(&res[1..]).expect("decode rows");
 
-        let table = db.tables.get("crashy").expect("table").clone();
+        let table = db.table_for_tests("crashy").expect("table").clone();
         let schema = &table.schema.fields;
 
         rows.into_iter()
@@ -2496,7 +6485,9 @@ mod tests {
                         .expect("u64"),
                 );
                 let payload = String::from_utf8_lossy(
-                    row.get_column("payload", schema).expect("payload").into_slice(),
+                    row.get_column("payload", schema)
+                        .expect("payload")
+                        .into_slice(),
                 )
                 .to_string();
                 (id, payload)
@@ -2641,7 +6632,7 @@ mod tests {
         assert_eq!(res.first(), Some(&2u8), "query should have returned rows");
         let rows = vec_into_rows(&res[1..]).expect("decode rows");
 
-        let table = db.tables.get("durable").expect("table").clone();
+        let table = db.table_for_tests("durable").expect("table").clone();
         let schema = &table.schema.fields;
 
         let mut seen: Vec<u64> = Vec::new();
@@ -2654,7 +6645,9 @@ mod tests {
                     .expect("u64"),
             );
             let payload = String::from_utf8_lossy(
-                row.get_column("payload", schema).expect("payload").into_slice(),
+                row.get_column("payload", schema)
+                    .expect("payload")
+                    .into_slice(),
             )
             .to_string();
             assert_eq!(payload, payload_for(id), "row {} came back corrupted", id);
@@ -2737,16 +6730,15 @@ mod tests {
             return Vec::new();
         };
 
-        let Some(table) = db.tables.get("churn").map(|t| t.clone()) else {
+        let Some(table) = db.table_for_tests("churn") else {
             return Vec::new();
         };
         let schema = &table.schema.fields;
 
         rows.into_iter()
             .filter_map(|row| {
-                let id = u64::from_le_bytes(
-                    row.get_column("id", schema)?.into_slice().try_into().ok()?,
-                );
+                let id =
+                    u64::from_le_bytes(row.get_column("id", schema)?.into_slice().try_into().ok()?);
                 let blob = row.get_column("blob", schema)?;
                 let bytes = blob.into_slice();
                 let distinct: std::collections::BTreeSet<u8> = bytes.iter().copied().collect();
@@ -2754,7 +6746,6 @@ mod tests {
             })
             .collect()
     }
-
 
     /// Same, but with enough traffic to force the log to checkpoint and
     /// truncate underneath. Truncation discards records already applied to their
@@ -2772,7 +6763,10 @@ mod tests {
             let _ = exec_sql(&db, "INSERT INTO t (id, blob) VALUES (1, 'x');").await;
             // Churn until the log has certainly checkpointed at least once.
             for round in 0..400u64 {
-                let sql = format!("UPDATE t SET blob = '{}' WHERE id > 0", blob_of(b'a' + (round % 26) as u8));
+                let sql = format!(
+                    "UPDATE t SET blob = '{}' WHERE id > 0",
+                    blob_of(b'a' + (round % 26) as u8)
+                );
                 let _ = exec_sql(&db, &sql).await;
             }
             if let Some(w) = crate::core::wal::wal_for(&dir_str) {
@@ -2801,7 +6795,10 @@ mod tests {
             let _ = exec_sql(&db, "CREATE TABLE t (id UBIGINT, blob VARCHAR);").await;
             let _ = exec_sql(&db, "INSERT INTO t (id, blob) VALUES (1, 'x');").await;
             let res = exec_sql(&db, "SELECT id FROM t WHERE id > 0").await;
-            assert!(res.len() > 1, "the row must be visible in the session that wrote it");
+            assert!(
+                res.len() > 1,
+                "the row must be visible in the session that wrote it"
+            );
         }
 
         let db = rclite::Arc::new(crate::core::database::Database::new(&dir_str).await);
@@ -2832,7 +6829,11 @@ mod tests {
         let exe = std::env::current_exe().expect("test binary");
 
         let mut child = Command::new(&exe)
-            .args(["--exact", "core::wal::tests::crash_update_child", "--nocapture"])
+            .args([
+                "--exact",
+                "core::wal::tests::crash_update_child",
+                "--nocapture",
+            ])
             .env(CRASH_UPDATE_ENV, &dir_str)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2880,7 +6881,11 @@ mod tests {
         let exe = std::env::current_exe().expect("test binary");
 
         let mut child = Command::new(&exe)
-            .args(["--exact", "core::wal::tests::crash_child_writer", "--nocapture"])
+            .args([
+                "--exact",
+                "core::wal::tests::crash_child_writer",
+                "--nocapture",
+            ])
             .env(CRASH_DIR_ENV, &dir_str)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2947,6 +6952,148 @@ mod tests {
         let wal = Wal::open(dir.path().join(DEFAULT_WAL_NAME)).unwrap();
         let n = register_directory(&dir_str, &wal).unwrap();
         assert_eq!(n, 1, "the log must not be a replay target");
+    }
+
+    /// Makes `file_id_for_name` answer `names` with `id` on this thread until
+    /// dropped.
+    struct ForcedIds;
+    impl ForcedIds {
+        fn new(names: &[&str], id: u64) -> Self {
+            test_hooks::FORCED_FILE_IDS.with(|m| {
+                let mut m = m.borrow_mut();
+                for name in names {
+                    m.insert(name.to_string(), id);
+                }
+            });
+            ForcedIds
+        }
+    }
+    impl Drop for ForcedIds {
+        fn drop(&mut self) {
+            test_hooks::FORCED_FILE_IDS.with(|m| m.borrow_mut().clear());
+        }
+    }
+
+    /// Two paths under one id: the second is refused, and the log takes no
+    /// record under that id from either, since replay would send both to one.
+    #[test]
+    fn a_second_path_under_an_id_is_refused() {
+        let dir = temp_dir();
+        let a = dir.path().join("a.db");
+        let b = dir.path().join("b.db");
+        std::fs::write(&a, b"aaaa").unwrap();
+        std::fs::write(&b, b"bbbb").unwrap();
+        let wal = Wal::open(dir.path().join(DEFAULT_WAL_NAME)).unwrap();
+        let id = 0x5eed;
+        let other = 0xf00d;
+        wal.register_file(id, &a).unwrap();
+        wal.register_file(other, dir.path().join("c.db")).unwrap();
+
+        let err = wal.register_file(id, &b).expect_err("a second path took a held id");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        let msg = err.to_string();
+        assert!(msg.contains("a.db") && msg.contains("b.db"), "{msg}");
+        assert_eq!(wal.registered_files().len(), 2, "the newcomer was registered");
+        assert!(wal.registered_files().contains(&(id, a.clone())));
+
+        // Neither file's records: the log cannot tell them apart.
+        assert!(wal.log(wal.begin(), id, 0, b"x").is_err());
+        assert!(wal.log_and_commit(id, 0, b"x").is_err());
+        assert!(wal.log_in_place(wal.begin(), id, 0, b"x").is_err());
+        assert!(wal.register_file(id, &a).is_err(), "the first claimant was re-admitted");
+        assert_eq!(wal.contested_files(), vec![(id, vec![a.clone(), b.clone()])]);
+        // Nothing reached the log, and other ids are unaffected.
+        assert_eq!(std::fs::metadata(wal.path()).unwrap().len(), 0);
+        wal.log_and_commit(other, 0, b"c").unwrap();
+        assert_eq!(read_file(&a), b"aaaa");
+        assert_eq!(read_file(&b), b"bbbb");
+    }
+
+    #[test]
+    fn registering_the_same_path_again_is_idempotent() {
+        let dir = temp_dir();
+        let data = dir.path().join("table.db");
+        std::fs::write(&data, b"").unwrap();
+        let wal = Wal::open(dir.path().join(DEFAULT_WAL_NAME)).unwrap();
+        let id = file_id_for_name("table.db");
+        wal.register_file(id, &data).unwrap();
+        wal.register_file(id, &data).unwrap();
+        // The form `LocalStorageProvider` builds, against the listing's.
+        let doubled = format!("{}//table.db", dir.path().display());
+        wal.register_file(id, &doubled).unwrap();
+        assert!(wal.contested_files().is_empty());
+        assert_eq!(wal.registered_files(), vec![(id, data.clone())]);
+        wal.log_and_commit(id, 0, b"row").unwrap();
+    }
+
+    /// Startup over two names sharing an id, with the log naming that id:
+    /// refused before anything is replayed, the log left whole.
+    #[test]
+    fn startup_refuses_a_log_naming_two_colliding_files() {
+        let dir = temp_dir();
+        let dir_str = dir.path().to_string_lossy().to_string();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let (a, b, c) = (
+            dir.path().join("a.db"),
+            dir.path().join("b.db"),
+            dir.path().join("c.db"),
+        );
+        std::fs::write(&a, b"aaaa").unwrap();
+        std::fs::write(&b, b"bbbb").unwrap();
+        std::fs::write(&c, b"cccc").unwrap();
+        let _forced = ForcedIds::new(&["a.db", "b.db"], 0x5eed);
+
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_and_commit(0x5eed, 0, b"XX").unwrap();
+            wal.log_and_commit(file_id_for_name("c.db"), 0, b"ZZ").unwrap();
+        }
+        let logged = read_file(&wal_path);
+        assert!(!logged.is_empty());
+
+        let err = open_and_recover(&dir_str)
+            .err()
+            .expect("replayed a log whose records two files claim");
+        let msg = err.to_string();
+        assert!(msg.contains("a.db") && msg.contains("b.db"), "{msg}");
+        assert_eq!(read_file(&wal_path), logged, "the log is the only copy");
+        assert_eq!(read_file(&a), b"aaaa");
+        assert_eq!(read_file(&b), b"bbbb");
+        assert_eq!(read_file(&c), b"cccc", "replay ran in part");
+    }
+
+    /// Colliding names the log does not mention cost nothing at startup, but
+    /// the id takes no records from then on.
+    #[test]
+    fn startup_with_colliding_files_the_log_does_not_name_replays_the_rest() {
+        let dir = temp_dir();
+        let dir_str = dir.path().to_string_lossy().to_string();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let (a, b, c) = (
+            dir.path().join("a.db"),
+            dir.path().join("b.db"),
+            dir.path().join("c.db"),
+        );
+        std::fs::write(&a, b"aaaa").unwrap();
+        std::fs::write(&b, b"bbbb").unwrap();
+        std::fs::write(&c, b"cccc").unwrap();
+        let _forced = ForcedIds::new(&["a.db", "b.db"], 0x5eed);
+
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_and_commit(file_id_for_name("c.db"), 0, b"ZZ").unwrap();
+        }
+
+        let (wal, stats) = open_and_recover(&dir_str).unwrap();
+        assert_eq!(stats.applied, 1);
+        assert_eq!(read_file(&c), b"ZZcc");
+        assert_eq!(wal.contested_files().len(), 1);
+        assert_eq!(wal.contested_files()[0].1.len(), 2);
+        assert!(wal.log_and_commit(0x5eed, 0, b"XX").is_err());
+        assert!(wal.register_file(0x5eed, &a).is_err());
+        assert!(wal.register_file(0x5eed, &b).is_err());
+        assert_eq!(read_file(&a), b"aaaa");
+        assert_eq!(read_file(&b), b"bbbb");
     }
 
     /// A deferred commit is replayable only once the sync is taken.
@@ -3020,9 +7167,7 @@ mod tests {
         wal.poisoned.store(true, Ordering::Release);
         assert!(wal.commit_txn_deferred(txn).is_err());
     }
-
 }
-
 
 #[cfg(test)]
 mod recovery_race_tests {
@@ -3081,7 +7226,10 @@ mod recovery_race_tests {
     /// itself by design. This pins the arithmetic surviving the moment.
     #[test]
     fn recovery_racing_a_writer_does_not_underflow_the_tail_count() {
-        let dir = tempfile::Builder::new().prefix("rastdb_race_").tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("rastdb_race_")
+            .tempdir()
+            .unwrap();
         let path = dir.path().join("race.wal");
         let wal = std::sync::Arc::new(Wal::open(&path).unwrap());
 
@@ -3135,7 +7283,396 @@ mod recovery_race_tests {
         // bare header. Counting only the data records put this ceiling at half
         // the true size and failed a test that was behaving correctly.
         let per_record = (HEADER_LEN + 8) + HEADER_LEN;
-        let ceiling = ((SEED_RECORDS + WRITER_BUDGET) * per_record) as u64;
-        assert!(size <= ceiling, "the log grew to {} bytes, past its {} ceiling", size, ceiling);
+        // And the zeros ahead of the last of them: less than two chunks.
+        let ceiling =
+            ((SEED_RECORDS + WRITER_BUDGET) * per_record) as u64 + 2 * crate::wal_prealloc_bytes();
+        assert!(
+            size <= ceiling,
+            "the log grew to {} bytes, past its {} ceiling",
+            size,
+            ceiling
+        );
+    }
+}
+
+/// The zeros the log puts ahead of its append point
+/// ([`crate::WAL_PREALLOC_BYTES`]): that records land in them, that replay
+/// and the next open find where the records end, and that anything else past
+/// the records is still the torn tail it always was.
+#[cfg(test)]
+mod prealloc_tests {
+    use super::*;
+
+    const CHUNK: u64 = 64 * 1024;
+    /// One `log_and_commit` of four bytes: a record and its marker.
+    const FRAME: u64 = (2 * HEADER_LEN + 4) as u64;
+
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::Builder::new().prefix("rastdb_walpad_").tempdir().unwrap()
+    }
+
+    fn open(path: &Path, chunk: u64) -> Wal {
+        let wal = Wal::open(path).unwrap();
+        wal.set_prealloc(chunk);
+        wal
+    }
+
+    fn len(path: &Path) -> u64 {
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    fn at(wal: &Wal) -> u64 {
+        wal.write_pos.load(Ordering::Relaxed)
+    }
+
+    /// Record `i` of a run: four bytes naming it, at its own offset, so the
+    /// data file says exactly which records were replayed.
+    fn put(wal: &Wal, id: u64, i: u32) {
+        wal.log_and_commit(id, 4 * i as u64, &(i + 1).to_le_bytes()).unwrap();
+    }
+
+    /// Which records of a [`put`] run the data file holds.
+    fn replayed(data: &Path) -> Vec<u32> {
+        let bytes = std::fs::read(data).unwrap_or_default();
+        bytes
+            .chunks(4)
+            .enumerate()
+            .filter(|(_, c)| c.iter().any(|b| *b != 0))
+            .map(|(i, c)| {
+                let mut word = [0u8; 4];
+                word[..c.len()].copy_from_slice(c);
+                assert_eq!(u32::from_le_bytes(word), i as u32 + 1, "record {i} holds another's bytes");
+                i as u32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn records_land_in_the_padding_and_the_file_grows_a_chunk_at_a_time() {
+        let dir = temp_dir();
+        let path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        let wal = open(&path, CHUNK);
+        assert_eq!(len(&path), 0, "a log nothing has written to was padded");
+
+        put(&wal, 1, 0);
+        assert_eq!(len(&path), CHUNK);
+        let mut n = 1u32;
+        while at(&wal) + FRAME <= CHUNK {
+            put(&wal, 1, n);
+            n += 1;
+            assert_eq!(len(&path), CHUNK, "record {n} grew the file");
+        }
+        assert_eq!(at(&wal), n as u64 * FRAME);
+        // The record that does not fit takes the next chunk, from the end of
+        // the file and not from the append point.
+        put(&wal, 1, n);
+        n += 1;
+        assert_eq!(len(&path), 2 * CHUNK);
+
+        let stats = Wal::recover(&path, |_| Some(data.clone())).unwrap();
+        assert_eq!(stats.applied, n as u64);
+        assert_eq!(stats.valid_bytes, n as u64 * FRAME);
+        assert_eq!(stats.truncated_tail, 0, "padding was counted as a torn tail");
+        assert_eq!(replayed(&data), (0..n).collect::<Vec<_>>());
+    }
+
+    /// Off, the file is its records and nothing else, as it was before.
+    #[test]
+    fn a_log_with_padding_off_ends_where_its_records_do() {
+        let dir = temp_dir();
+        let path = dir.path().join(DEFAULT_WAL_NAME);
+        let wal = open(&path, 0);
+        for i in 0..50 {
+            put(&wal, 1, i);
+            assert_eq!(len(&path), (i as u64 + 1) * FRAME);
+        }
+    }
+
+    /// The next open of a padded log, whatever its own setting: a record
+    /// appended at the end of the file would sit past the zeros, where
+    /// replay never looks, and its commit would be lost with no error.
+    #[test]
+    fn a_reopened_log_takes_its_next_record_where_its_records_end() {
+        for reopened_with in [CHUNK, 0] {
+            let dir = temp_dir();
+            let path = dir.path().join(DEFAULT_WAL_NAME);
+            let data = dir.path().join("t.db");
+            {
+                let wal = open(&path, CHUNK);
+                put(&wal, 1, 0);
+                put(&wal, 1, 1);
+            }
+            assert_eq!(len(&path), CHUNK);
+            let wal = open(&path, reopened_with);
+            assert_eq!(at(&wal), 2 * FRAME);
+            put(&wal, 1, 2);
+            drop(wal);
+
+            let stats = Wal::recover(&path, |_| Some(data.clone())).unwrap();
+            assert_eq!(replayed(&data), vec![0, 1, 2], "reopened with {reopened_with}");
+            assert_eq!(stats.truncated_tail, 0);
+        }
+    }
+
+    /// A log recovery keeps (its records name a file that is not there yet)
+    /// used to be kept only when it had no tail at all. Padding is not a
+    /// tail: the log is still kept, and still appended to after its records.
+    #[test]
+    fn a_log_recovery_keeps_is_resumed_after_its_records() {
+        let dir = temp_dir();
+        let dir_str = dir.path().to_string_lossy().to_string();
+        let path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("later.db");
+        let id = file_id_for_name("later.db");
+        {
+            let wal = open(&path, CHUNK);
+            put(&wal, id, 0);
+        }
+        let (wal, stats) = open_and_recover(&dir_str).unwrap();
+        assert_eq!((stats.applied, stats.unresolved, stats.truncated_tail), (0, 1, 0));
+        assert_eq!(len(&path), CHUNK, "a log whose records were never applied was discarded");
+        assert_eq!(at(&wal), FRAME);
+        put(&wal, id, 1);
+        remove_for(&dir_str);
+        drop(wal);
+
+        Wal::recover(&path, |_| Some(data.clone())).unwrap();
+        assert_eq!(replayed(&data), vec![0, 1]);
+    }
+
+    /// The bytes of one committed record a later run of the same log could
+    /// have written: valid in every way but where it lies.
+    fn stray_frame(dir: &Path, id: u64, i: u32) -> Vec<u8> {
+        let path = dir.join("stray.wal");
+        let wal = open(&path, 0);
+        put(&wal, id, i);
+        drop(wal);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        bytes
+    }
+
+    /// What a power cut leaves when it keeps a later page of the log and
+    /// drops an earlier one: the records, a gap of zeros, and a whole
+    /// committed record past it. That is a torn tail. Were the gap taken for
+    /// padding, the next record would be written into it and the stray one
+    /// could follow it exactly, replaying a write nobody was ever told had
+    /// committed, after one that was.
+    #[test]
+    fn a_record_past_a_gap_of_zeros_is_a_torn_tail_and_the_log_is_discarded() {
+        use crate::core::pos_io::FileExt;
+        let dir = temp_dir();
+        let dir_str = dir.path().to_string_lossy().to_string();
+        let path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        std::fs::write(&data, b"").unwrap();
+        let id = file_id_for_name("t.db");
+        {
+            let wal = open(&path, CHUNK);
+            put(&wal, id, 0);
+        }
+        let stray = stray_frame(dir.path(), id, 5);
+        // Exactly one frame further on: where the next record would end.
+        let file = File::options().write(true).open(&path).unwrap();
+        file.write_all_at(&stray, 2 * FRAME).unwrap();
+        drop(file);
+
+        let stats = Wal::recover(&path, |_| Some(data.clone())).unwrap();
+        assert_eq!(stats.applied, 1);
+        assert_eq!(stats.truncated_tail, CHUNK - FRAME);
+        // Opened without recovery it is appended to at its end, as a torn
+        // log always was, never into the gap.
+        assert_eq!(at(&Wal::open(&path).unwrap()), CHUNK);
+
+        let (wal, _) = open_and_recover(&dir_str).unwrap();
+        assert_eq!(len(&path), 0, "a log with a torn tail was kept");
+        put(&wal, id, 1);
+        remove_for(&dir_str);
+        drop(wal);
+        Wal::recover(&path, |_| Some(data.clone())).unwrap();
+        assert_eq!(replayed(&data), vec![0, 1], "the stray record was replayed");
+    }
+
+    /// Any bytes at all in the padding, not only a whole record.
+    #[test]
+    fn one_stray_byte_in_the_padding_is_a_torn_tail() {
+        use crate::core::pos_io::FileExt;
+        let dir = temp_dir();
+        let path = dir.path().join(DEFAULT_WAL_NAME);
+        {
+            let wal = open(&path, CHUNK);
+            put(&wal, 1, 0);
+        }
+        for offset in [FRAME, FRAME + 1, 4096, CHUNK - 1] {
+            let file = File::options().write(true).open(&path).unwrap();
+            file.write_all_at(&[1], offset).unwrap();
+            let stats = Wal::recover(&path, |_| None).unwrap();
+            assert_eq!(stats.truncated_tail, CHUNK - FRAME, "a stray byte at {offset}");
+            assert_eq!(at(&Wal::open(&path).unwrap()), CHUNK, "a stray byte at {offset}");
+            file.write_all_at(&[0], offset).unwrap();
+        }
+        assert_eq!(Wal::recover(&path, |_| None).unwrap().truncated_tail, 0);
+    }
+
+    /// A write that fails is cut back to the append point, and the padding
+    /// past it goes with the cut. The next record puts a chunk back.
+    #[test]
+    fn a_failed_write_takes_the_padding_with_it_and_the_next_puts_it_back() {
+        let dir = temp_dir();
+        let path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        let wal = open(&path, CHUNK);
+        put(&wal, 1, 0);
+
+        test_hooks::SHORT_WAL_WRITE.with(|h| h.set(Some(HEADER_LEN + 2)));
+        let failed = wal.log_and_commit(1, 4, &2u32.to_le_bytes());
+        test_hooks::SHORT_WAL_WRITE.with(|h| h.set(None));
+        assert!(failed.is_err());
+        assert!(!wal.is_poisoned());
+        assert_eq!((at(&wal), len(&path)), (FRAME, FRAME));
+
+        put(&wal, 1, 1);
+        assert_eq!((at(&wal), len(&path)), (2 * FRAME, FRAME + CHUNK));
+        drop(wal);
+        Wal::recover(&path, |_| Some(data.clone())).unwrap();
+        assert_eq!(replayed(&data), vec![0, 1]);
+    }
+
+    /// No commit fails for want of padding, and nothing retries it record by
+    /// record; discarding the log clears that, since a full disk is the
+    /// likely cause and a checkpoint is what frees it.
+    #[test]
+    fn padding_that_cannot_be_written_is_gone_without_until_the_log_is_discarded() {
+        let dir = temp_dir();
+        let path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        let wal = open(&path, CHUNK);
+
+        test_hooks::FAIL_PREALLOC.with(|f| f.set(true));
+        put(&wal, 1, 0);
+        assert!(!test_hooks::FAIL_PREALLOC.with(|f| f.get()), "the extension was never tried");
+        put(&wal, 1, 1);
+        assert_eq!(len(&path), 2 * FRAME, "it was tried again for the next record");
+        assert!(!wal.is_poisoned());
+        Wal::recover(&path, |_| Some(data.clone())).unwrap();
+        assert_eq!(replayed(&data), vec![0, 1]);
+
+        wal.truncate().unwrap();
+        assert_eq!(len(&path), 0);
+        put(&wal, 1, 2);
+        assert_eq!(len(&path), CHUNK);
+    }
+
+    /// Writing a large record twice would cost more than the journal commit
+    /// the padding saves, so it grows the file itself and the next small one
+    /// pads from there.
+    #[test]
+    fn a_record_of_a_chunk_or_more_is_not_padded_for() {
+        let dir = temp_dir();
+        let path = dir.path().join(DEFAULT_WAL_NAME);
+        let wal = open(&path, CHUNK);
+        let extended = || test_hooks::PREALLOCS.with(|n| n.get());
+        let before = extended();
+        wal.log_and_commit(1, 0, &vec![7u8; CHUNK as usize]).unwrap();
+        let big = CHUNK + 2 * HEADER_LEN as u64;
+        assert_eq!((at(&wal), len(&path)), (big, big));
+        // The length alone would not show it: zeros the record then covers
+        // leave the file exactly as long.
+        assert_eq!(extended(), before, "zeros were written under a record that replaced them all");
+        wal.log_and_commit(1, 0, b"tiny").unwrap();
+        assert_eq!((at(&wal), len(&path)), (big + FRAME, big + CHUNK));
+        assert_eq!(extended(), before + 1);
+    }
+
+    /// Every way a power cut can leave a padded log, page by page: each
+    /// unsynced 4 KiB page kept or dropped, as the crash-image model does
+    /// it. Whatever is left, replay applies every record that was synced and
+    /// then a run of the unsynced ones in order with none skipped; and the
+    /// log that goes on from there never replays a record past that run.
+    #[test]
+    fn every_page_mix_of_a_padded_log_replays_a_prefix_and_goes_on_from_it() {
+        use crate::core::power_loss::image::{Rng, mix_pages};
+        const SYNCED: u32 = 150;
+        const TOTAL: u32 = 400;
+        let source = temp_dir();
+        let source_log = source.path().join(DEFAULT_WAL_NAME);
+        let id = file_id_for_name("t.db");
+        let wal = open(&source_log, CHUNK);
+        for i in 0..SYNCED {
+            put(&wal, id, i);
+        }
+        let base = std::fs::read(&source_log).unwrap();
+        for i in SYNCED..TOTAL {
+            put(&wal, id, i);
+        }
+        drop(wal);
+        let current = std::fs::read(&source_log).unwrap();
+        assert_eq!(base.len(), current.len(), "the unsynced records grew the file: pad more");
+
+        let (mut kept_logs, mut discarded_logs, mut partial) = (0, 0, 0);
+        for seed in 0..300u64 {
+            let p = match seed % 3 {
+                0 => 0.5,
+                1 => 0.9,
+                _ => 0.1,
+            };
+            let image = mix_pages(&base, &current, p, false, &mut Rng::new(seed));
+            let dir = temp_dir();
+            let dir_str = dir.path().to_string_lossy().to_string();
+            let path = dir.path().join(DEFAULT_WAL_NAME);
+            let data = dir.path().join("t.db");
+            std::fs::write(&path, &image).unwrap();
+            // Odd seeds find the data file there and replay into it. Even
+            // ones do not, so recovery applies nothing and keeps the log if
+            // it has no torn tail: the one way a log is appended to after
+            // its own old records.
+            let resolved = seed % 2 == 1;
+            if resolved {
+                std::fs::write(&data, b"").unwrap();
+            }
+
+            let (wal, stats) = open_and_recover(&dir_str).unwrap();
+            let seen = (stats.applied + stats.unresolved) as u32;
+            assert!(
+                (SYNCED..=TOTAL).contains(&seen),
+                "seed {seed}: {seen} records read, {SYNCED} were synced"
+            );
+            if seen > SYNCED && seen < TOTAL {
+                partial += 1;
+            }
+            let kept = len(&path) != 0;
+            assert!(!(kept && stats.truncated_tail != 0), "seed {seed}: a log with a torn tail was kept");
+            if kept {
+                kept_logs += 1;
+            } else {
+                discarded_logs += 1;
+            }
+            if resolved {
+                assert!(!kept, "seed {seed}: a replayed log was kept");
+                assert_eq!(
+                    replayed(&data),
+                    (0..seen).collect::<Vec<_>>(),
+                    "seed {seed}: replay skipped a record or took one out of order"
+                );
+            }
+
+            // The run goes on with one more record.
+            put(&wal, id, TOTAL);
+            remove_for(&dir_str);
+            drop(wal);
+            Wal::recover(&path, |_| Some(data.clone())).unwrap();
+            // A kept log still holds what it held; a discarded one, with
+            // nothing applied, lost its records as a torn log always did.
+            let mut expect: Vec<u32> = if resolved || kept { (0..seen).collect() } else { Vec::new() };
+            expect.push(TOTAL);
+            assert_eq!(
+                replayed(&data),
+                expect,
+                "seed {seed}: a record past the ones recovery read came back"
+            );
+        }
+        assert!(kept_logs > 0 && discarded_logs > 0, "kept {kept_logs}, discarded {discarded_logs}");
+        assert!(partial > 0, "no image kept some unsynced records and lost others");
     }
 }

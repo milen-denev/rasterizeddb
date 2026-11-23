@@ -10,6 +10,7 @@ use rasterizeddb_core::core::db_type::DbType;
 use rasterizeddb_core::core::filter::settings::settings;
 use rasterizeddb_core::core::filter::sql;
 use rasterizeddb_core::core::filter::TableFilters;
+use rasterizeddb_core::core::index_store::gate::{Proof, test_mint};
 use rasterizeddb_filter_tests::*;
 
 /// Settings are process-wide, so these tests must not interleave: one test's
@@ -231,6 +232,8 @@ fn invalid_widths_are_clamped_not_inverted() {
 
 #[test]
 fn a_width_override_changes_the_fingerprints_built() {
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
     let _g = fresh();
     run_sql("SET FILTER min_f = 6 FOR COLUMN tune.id").unwrap();
     run_sql("SET FILTER max_f = 6 FOR COLUMN tune.id").unwrap();
@@ -249,7 +252,7 @@ fn a_width_override_changes_the_fingerprints_built() {
             ]
         })
         .collect();
-    backfill_all(&f, &rows);
+    backfill_all(proof, &f, &rows);
 
     let stats = f.stats();
     let id_f = stats.iter().find(|s| s.0 == 0).unwrap().1;
@@ -292,6 +295,8 @@ fn excluding_a_column_stops_it_being_indexed() {
 
 #[test]
 fn disabling_zone_bounds_keeps_fingerprints_and_drops_ranges() {
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
     let _g = fresh();
     run_sql("SET FILTER zone_bounds = off FOR COLUMN tune3.v").unwrap();
 
@@ -300,7 +305,7 @@ fn disabling_zone_bounds_keeps_fingerprints_and_drops_ranges() {
     let n = 4000u64;
     let rows: Vec<Vec<(u32, Vec<u8>)>> =
         (0..n as usize).map(|i| vec![(0u32, (i as u64).to_le_bytes().to_vec())]).collect();
-    backfill_all(&f, &rows);
+    backfill_all(proof, &f, &rows);
 
     let toks = rasterizeddb_core::core::tokenizer::query_tokenizer::tokenize("v = 1234", &fields);
     let p = rasterizeddb_core::core::filter::sarg::extract(&toks, &f).unwrap();
@@ -321,7 +326,7 @@ fn disabling_zone_bounds_keeps_fingerprints_and_drops_ranges() {
     // guard this test already holds.
     settings().reset_column("tune3", "v");
     let f = TableFilters::for_table("tune3", &fields);
-    backfill_all(&f, &rows);
+    backfill_all(proof, &f, &rows);
     let toks = rasterizeddb_core::core::tokenizer::query_tokenizer::tokenize("v > 3900", &fields);
     let p = rasterizeddb_core::core::filter::sarg::extract(&toks, &f).unwrap();
     let bm = f.evaluate(&p, n).expect("bounds on: range should prune");
@@ -330,6 +335,8 @@ fn disabling_zone_bounds_keeps_fingerprints_and_drops_ranges() {
 
 #[test]
 fn a_stricter_selectivity_gate_declines_more_columns() {
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
     let _g = fresh();
     let fields = fields_of(&[("v", DbType::U64)]);
     let n = 3000u64;
@@ -340,21 +347,25 @@ fn a_stricter_selectivity_gate_declines_more_columns() {
 
     run_sql("SET FILTER min_selectivity = 0.5 FOR TABLE gate").unwrap();
     let permissive = TableFilters::for_table("gate", &fields);
-    backfill_all(&permissive, &rows);
+    backfill_all(proof, &permissive, &rows);
     assert!(permissive.stats()[0].1 > 0, "a permissive gate should index it");
 
     run_sql("SET FILTER min_selectivity = 0.001 FOR TABLE gate").unwrap();
     let strict = TableFilters::for_table("gate", &fields);
-    backfill_all(&strict, &rows);
+    backfill_all(proof, &strict, &rows);
     assert_eq!(strict.stats()[0].1, 0, "a strict gate should take it out of service");
 
     // Out of service means probing narrows nothing — not that rows go missing.
     let toks = rasterizeddb_core::core::tokenizer::query_tokenizer::tokenize("v = 7", &fields);
     let p = rasterizeddb_core::core::filter::sarg::extract(&toks, &strict).unwrap();
-    assert!(
-        strict.evaluate(&p, n).is_none(),
-        "a gated-out column must narrow nothing"
-    );
+    // A gated-out column has no fingerprints in service, but its zone bounds
+    // still hold, so it may narrow by bounds alone. What it must never do is
+    // drop a matching row.
+    if let Some(bm) = strict.evaluate(&p, n) {
+        for slot in (0..n).filter(|i| (i % 40) == 7) {
+            assert!(bm.get(slot), "slot {} pruned by a gated-out column", slot);
+        }
+    }
 
     // The permissive one still prunes the same predicate.
     let p2 = rasterizeddb_core::core::filter::sarg::extract(&toks, &permissive).unwrap();
@@ -406,8 +417,8 @@ async fn disabling_the_filter_by_sql_still_answers_correctly() {
     // Turn it off, reopen: no catalog is built, and results are unchanged.
     sql::execute("SET FILTER enabled = off").unwrap();
     let t = open_table(dir.path(), "sqloff", &std_columns()).await;
-    t.wait_filters_ready().await;
-    assert!(t.filters.is_none(), "disabled by SQL should build no catalog");
+    t.wait_filters_ready().await.unwrap();
+    assert!(t.filters().unwrap().is_none(), "disabled by SQL should build no catalog");
     assert_eq!(u64s(&run(&t, "id = 1234").await, 0), vec![1234]);
     assert_eq!(run(&t, "").await.len() as u64, STD_N);
 }
@@ -420,13 +431,13 @@ async fn a_per_table_exclusion_applies_at_open() {
     let dir = tempfile::tempdir().unwrap();
     let t = open_table(dir.path(), "excluded", &std_columns()).await;
     fill_std(&t).await;
-    assert!(t.filters.is_none(), "an excluded table should build no catalog");
+    assert!(t.filters().unwrap().is_none(), "an excluded table should build no catalog");
     // Still correct, just unfiltered.
     assert_eq!(u64s(&run(&t, "id = 7").await, 0), vec![7]);
 
     // A different table is unaffected.
     let other = open_table(dir.path(), "included", &std_columns()).await;
-    assert!(other.filters.is_some(), "the exclusion must not leak to other tables");
+    assert!(other.filters().unwrap().is_some(), "the exclusion must not leak to other tables");
 }
 
 /// The default is a measured number, not a taste, so it gets pinned like one.
@@ -460,6 +471,8 @@ fn the_pruning_ratio_default_is_the_measured_one() {
 /// the change was for: 0.5 threw these away, 0.90 keeps them.
 #[test]
 fn a_moderately_selective_mask_is_now_kept() {
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
     let _g = fresh();
     let fields = fields_of(&[("v", DbType::U64)]);
     let n = 4096u64;
@@ -469,7 +482,7 @@ fn a_moderately_selective_mask_is_now_kept() {
         .map(|i| vec![(0u32, ((i % 3) as u64).to_le_bytes().to_vec())])
         .collect();
     let f = TableFilters::new(&fields, rasterizeddb_core::core::filter::FilterConfig::default());
-    backfill_all(&f, &rows);
+    backfill_all(proof, &f, &rows);
 
     let toks = rasterizeddb_core::core::tokenizer::query_tokenizer::tokenize("v = 0", &fields);
     let Some(p) = rasterizeddb_core::core::filter::sarg::extract(&toks, &f) else {

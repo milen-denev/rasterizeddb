@@ -57,7 +57,13 @@ async fn run(db: &Arc<Database>, q: &str) -> String {
 async fn run_bytes(db: &Arc<Database>, q: &str) -> Vec<u8> {
     let purpose = recognize_query_purpose(q).expect("recognized");
     let out = execute(purpose, db.clone()).await;
-    assert_ne!(out.first(), Some(&3), "{} failed: {}", q, String::from_utf8_lossy(&out[1..]));
+    assert_ne!(
+        out.first(),
+        Some(&3),
+        "{} failed: {}",
+        q,
+        String::from_utf8_lossy(&out[1..])
+    );
     out
 }
 
@@ -74,21 +80,32 @@ async fn rows_loaded_without_a_log_record_survive_the_final_sync_and_a_reopen_bo
 
     {
         let db = Arc::new(Database::new_with_backend(&dir, false).await);
-        run(&db, "CREATE TABLE t (id INT NOT NULL, tag TEXT NULL, doc JSONB NULL)").await;
+        run(
+            &db,
+            "CREATE TABLE t (id INT NOT NULL, tag TEXT NULL, doc JSONB NULL)",
+        )
+        .await;
 
         let guard = bulk_load::begin(&dir);
         assert!(bulk_load::is_active(&dir));
         for i in 0..200 {
             run(
                 &db,
-                &format!(r#"INSERT INTO t (id, tag, doc) VALUES ({}, 'row-{}', '{{"n":{}}}')"#, i, i, i),
+                &format!(
+                    r#"INSERT INTO t (id, tag, doc) VALUES ({}, 'row-{}', '{{"n":{}}}')"#,
+                    i, i, i
+                ),
             )
             .await;
         }
         // Readable while the mode is on: the bytes are in the file, only the
         // record and the flush are missing.
         let mid = run(&db, "SELECT tag FROM t WHERE id = 150").await;
-        assert!(mid.contains("row-150"), "a row written under bulk load is not readable: {}", mid);
+        assert!(
+            mid.contains("row-150"),
+            "a row written under bulk load is not readable: {}",
+            mid
+        );
 
         drop(guard);
         assert!(!bulk_load::is_active(&dir));
@@ -106,7 +123,8 @@ async fn rows_loaded_without_a_log_record_survive_the_final_sync_and_a_reopen_bo
     let doc = run_bytes(&db, "SELECT doc FROM t WHERE id = 199").await;
     let expected = rasterizeddb_core::core::jsonb::encode(&serde_json::json!({"n": 199}));
     assert!(
-        doc.windows(expected.len()).any(|w| w == expected.as_slice()),
+        doc.windows(expected.len())
+            .any(|w| w == expected.as_slice()),
         "document lost across the reopen"
     );
 

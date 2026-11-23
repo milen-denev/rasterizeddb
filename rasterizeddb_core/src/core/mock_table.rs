@@ -7,7 +7,9 @@ use smallvec::SmallVec;
 use stopwatch::Stopwatch;
 
 use crate::{
-    core::{processor::concurrent_processor::ConcurrentProcessor, row::schema::TableSchemaIterator},
+    core::{
+        processor::concurrent_processor::ConcurrentProcessor, row::schema::TableSchemaIterator,
+    },
     memory_pool::MEMORY_POOL,
 };
 

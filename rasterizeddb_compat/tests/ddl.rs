@@ -45,9 +45,39 @@ async fn columns(pool: &sqlx::PgPool, table: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// `SELECT *` on `pool`, its column names, or the error's SQLSTATE.
+async fn try_columns(pool: &sqlx::PgPool, table: &str) -> Result<Vec<String>, String> {
+    use sqlx::{Column, Row};
+    sqlx::query(AssertSqlSafe(format!("SELECT * FROM {}", table)))
+        .fetch_all(pool)
+        .await
+        .map(|rows| {
+            rows.first()
+                .map(|r| r.columns().iter().map(|c| c.name().to_string()).collect())
+                .unwrap_or_default()
+        })
+        .map_err(|e| e.as_database_error().and_then(|d| d.code()).map(|c| c.to_string()).unwrap_or_else(|| e.to_string()))
+}
+
+/// One connection, so a statement it cached before a DDL is the one it runs
+/// after it (a pool of several picks whichever is free, which made the stale
+/// path this test is about run only sometimes).
+async fn one_connection(server: &TestServer, shape_change: Option<&str>) -> sqlx::PgPool {
+    use std::str::FromStr;
+    let mut options = sqlx::postgres::PgConnectOptions::from_str(&server.url()).expect("url");
+    if let Some(mode) = shape_change {
+        options = options.options([("rdb.shape_change", mode)]);
+    }
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("connect")
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn alter_table_adds_renames_and_drops_columns() {
-    let (_s, pool) = server().await;
+    let (s, pool) = server().await;
 
     run(&pool, "CREATE TABLE t (id UUID NOT NULL, name TEXT NOT NULL)")
         .await
@@ -69,18 +99,35 @@ async fn alter_table_adds_renames_and_drops_columns() {
 
     assert_eq!(columns(&pool, "t").await, vec!["id", "name", "remark", "amount"]);
 
+    // sqlx caches a statement's column list and never asks again, nor
+    // re-prepares on 0A000 (memory: sqlx ignores 0A000). Each connection
+    // below caches `SELECT *` before the DROP and runs that same statement
+    // after it.
+    let auto = one_connection(&s, None).await;
+    let rowdescription = one_connection(&s, Some("rowdescription")).await;
+    for client in [&auto, &rowdescription] {
+        assert_eq!(try_columns(client, "t").await, Ok(["id", "name", "remark", "amount"].map(String::from).to_vec()));
+    }
+
     run(&pool, "ALTER TABLE t DROP COLUMN remark").await.expect("drop");
 
-    // A client caches the column list it was described and does not ask again,
-    // so this is only true because the server notices the shape has changed and
-    // puts a fresh `RowDescription` in front of the rows. Without that the
-    // dropped column keeps appearing and every column after it is decoded from
-    // the wrong place.
+    let after = ["id", "name", "amount"].map(String::from).to_vec();
+    // `rowdescription`: the server notices the shape changed and puts a fresh
+    // `RowDescription` in front of the rows, so sqlx sees the dropped column
+    // gone at once. Without it the dropped column keeps appearing and every
+    // column after it is decoded from the wrong place.
     assert_eq!(
-        columns(&pool, "t").await,
-        vec!["id", "name", "amount"],
+        try_columns(&rowdescription, "t").await,
+        Ok(after.clone()),
         "a dropped column must disappear from the client's view"
     );
+    // `auto`, the default (B8b, L10): the stale statement's first use is
+    // refused as PostgreSQL refuses it (0A000), and the same statement run
+    // again without a new Parse gets the fresh description. One error per
+    // stale statement per connection, where PostgreSQL gives sqlx that
+    // error every time; never a row under the old columns.
+    assert_eq!(try_columns(&auto, "t").await, Err("0A000".to_string()), "auto: the first stale use");
+    assert_eq!(try_columns(&auto, "t").await, Ok(after), "auto: the same statement run again");
 }
 
 /// A row is a fixed-width record, so a column added to a table that already
@@ -231,7 +278,8 @@ async fn unique_is_enforced_on_insert_and_update() {
     let err = run(&pool, "INSERT INTO u (id, email) VALUES (2, 'a@x')")
         .await
         .expect_err("a duplicate");
-    assert!(err.contains("UNIQUE"), "the reason must reach the client: {}", err);
+    // PostgreSQL's words: `duplicate key value violates unique constraint "u_email_key"`.
+    assert!(err.contains("violates unique constraint"), "the reason must reach the client: {}", err);
     assert!(err.contains("email"), "and name the column: {}", err);
 
     // An update into a taken value is the same violation by another route.
@@ -239,7 +287,7 @@ async fn unique_is_enforced_on_insert_and_update() {
     let err = run(&pool, "UPDATE u SET email = 'a@x' WHERE id = 3")
         .await
         .expect_err("an update into a taken value");
-    assert!(err.contains("UNIQUE"), "{}", err);
+    assert!(err.contains("violates unique constraint"), "{}", err);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -306,9 +354,10 @@ async fn ddl_runs_and_reports_no_row_count() {
 /// `ALTER TABLE … ADD COLUMN … JSONB` must do what `CREATE TABLE … JSONB` does.
 ///
 /// It used to refuse with "RasterizedDB has no JSON type" — wrong, and
-/// inconsistent with the statement beside it, since a JSON column has been a
-/// `UUID` plus a table of its own since the mapping landed. A migration that
-/// adds a JSON column to an existing table hit it on a fresh install.
+/// inconsistent with the statement beside it. A migration that adds a JSON
+/// column to an existing table hit it on a fresh install. Later it shredded
+/// the column into a table of its own while `CREATE TABLE` stored the
+/// document; both store it now (shredding only under `json_shadow_tables`).
 #[tokio::test(flavor = "multi_thread")]
 async fn add_column_supports_json_like_create_table_does() {
     let (_s, pool) = server().await;
@@ -658,6 +707,11 @@ async fn an_unsupported_expression_names_itself_rather_than_blaming_the_schema()
         // result, so a check anchored on an identifier before `::` would miss
         // it — and three separate functions have to resolve first.
         ("SELECT LEAST(GREATEST(COALESCE(v, 1), 0), 32767)::smallint FROM ue", "10"),
+        // An un-aliased `CASE … END` used to be cut at its first space and read
+        // as `CASE` plus an alias; it was on the unsupported list below until
+        // that was fixed. Asserted as working, with the value it must compute.
+        ("SELECT CASE WHEN v > 5 THEN 1 ELSE 2 END FROM ue", "1"),
+        ("SELECT CASE WHEN v > 10 THEN 'hi' WHEN v > 5 THEN 'mid' ELSE 'lo' END FROM ue", "mid"),
     ] {
         let rows = sqlx::query(sql).fetch_all(&pool).await.unwrap_or_else(|e| panic!("{}: {}", sql, e));
         assert_eq!(rows.len(), 1, "{}", sql);
@@ -674,46 +728,44 @@ async fn an_unsupported_expression_names_itself_rather_than_blaming_the_schema()
         assert_eq!(got, want, "{}", sql);
     }
 
-    for (sql, expected) in [
-        // Still unsupported, and each must name the construct rather than
-        // report a missing column. A cast in the select list works; one in a
-        // WHERE clause does not, and saying so is the difference between a
-        // reader fixing the query and a reader auditing a schema that is fine.
-        ("SELECT id FROM ue WHERE v::TEXT = '10'", "cast"),
-        ("SELECT CAST(v AS TEXT) FROM ue", "cast"),
-        ("SELECT CASE WHEN v > 5 THEN 1 ELSE 2 END FROM ue", "case when"),
-        ("SELECT CASE WHEN v > 10 THEN 'hi' WHEN v > 5 THEN 'mid' ELSE 'lo' END FROM ue", "case when"),
-        ("SELECT DISTINCT ON (id, v) id FROM ue", "distinct on"),
-    ] {
-        let err = run(&pool, sql).await.expect_err(sql).to_ascii_lowercase();
-        assert!(err.contains(expected), "{} -> {}", sql, err);
-        assert!(!err.contains("not found in schema"), "{} blamed the schema: {}", sql, err);
-    }
-
-    // Window functions were on the list above until they were implemented.
-    // Asserted as *working* rather than deleted, so the entry keeps earning its
-    // place: an unsupported-feature list that quietly loses items stops being
-    // evidence of anything.
+    // Window functions, `CAST(x AS type)` and `DISTINCT ON` were on a list of
+    // refusals here until they were implemented. Asserted as *working* rather than deleted, so the
+    // entry keeps earning its place: an unsupported-feature list that quietly
+    // loses items stops being evidence of anything.
+    //
+    // `CAST(…)` was never merely unimplemented — it separates its arguments
+    // with a keyword rather than a comma, so the argument splitter never
+    // reached it, the same way `EXTRACT(EPOCH FROM …)` was not reached.
     for sql in [
         "SELECT ROW_NUMBER() OVER (ORDER BY v) FROM ue",
         "SELECT ROW_NUMBER() OVER (PARTITION BY id ORDER BY v, nm) FROM ue",
+        "SELECT CAST(v AS TEXT) FROM ue",
+        "SELECT CAST(v AS BIGINT) FROM ue",
+        "SELECT DISTINCT ON (id, v) id FROM ue",
     ] {
         run(&pool, sql).await.unwrap_or_else(|e| panic!("{} -> {}", sql, e));
     }
+    // A cast in a `WHERE` was on the list above too. It answers PostgreSQL's
+    // row now, rather than merely not failing.
+    let rows = sqlx::query("SELECT id FROM ue WHERE v::TEXT = '10'")
+        .fetch_all(&pool)
+        .await
+        .expect("a cast in WHERE");
+    let ids: Vec<i32> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(ids, vec![1], "SELECT id FROM ue WHERE v::TEXT = '10'");
 
     // A genuinely missing column must still say so — the check must not swallow
     // the ordinary case it sits in front of.
     let err = run(&pool, "SELECT nosuch FROM ue").await.expect_err("missing column");
-    assert!(err.contains("not found in schema"), "{}", err);
+    assert!(err.contains("column \"nosuch\" does not exist"), "{}", err);
 
     // ...and ordinary select items still work, including aliases, which share
     // the whitespace-splitting the check had to reason about.
     run(&pool, "SELECT v AS alias_name FROM ue").await.expect("alias");
     run(&pool, "SELECT nm FROM ue").await.expect("plain column");
 
-    // Plain `DISTINCT` works, and the `DISTINCT ON` check above must not have
-    // taken it with it — the mirror of that fix would be refusing a query whose
-    // first column merely starts with those letters.
+    // Plain `DISTINCT` works beside `DISTINCT ON`: a query whose first column
+    // merely starts with those letters is not one.
     run(&pool, "SELECT DISTINCT nm, id FROM ue").await.expect("plain distinct");
 }
 
@@ -1149,10 +1201,14 @@ async fn table_storage_options_are_accepted_without_acting() {
         "ALTER TABLE c SET COMPRESSION lz4",
         "ALTER TABLE c SET (autovacuum_enabled = false)",
         "ALTER TABLE c RESET (autovacuum_enabled)",
-        "ALTER TABLE c VALIDATE CONSTRAINT some_fk",
     ] {
         run(&pool, stmt).await.unwrap_or_else(|e| panic!("{}: {}", stmt, e));
     }
+    // VALIDATE CONSTRAINT acts since foreign keys can be added NOT VALID: a
+    // name no constraint has is PostgreSQL's 42704, never a silent success
+    // that leaves a NOT VALID key's orphans unflagged.
+    let err = run(&pool, "ALTER TABLE c VALIDATE CONSTRAINT some_fk").await.expect_err("no such constraint");
+    assert!(err.contains("constraint \"some_fk\" of relation \"c\" does not exist"), "{}", err);
 
     // And the ALTER COLUMN form that *does* act still acts — the no-op arm must
     // not have swallowed it.
@@ -1255,7 +1311,10 @@ async fn the_genuine_no_ops_are_still_accepted() {
     let (_server, pool) = server().await;
 
     for sql in [
-        "CREATE INDEX idx_vac ON pms_case (id)",
+        // A plain column index is real now (see `secondary_indexes.rs`); a
+        // partial one is what stays a no-op, since an index built without its
+        // predicate would answer a different question.
+        "CREATE INDEX idx_vac ON pms_case (id) WHERE id > 0",
         "DROP INDEX idx_vac",
         "CREATE EXTENSION IF NOT EXISTS pgcrypto",
         "CREATE SCHEMA reporting",

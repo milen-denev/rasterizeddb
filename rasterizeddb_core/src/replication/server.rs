@@ -55,6 +55,16 @@ thread_local! {
 /// serving task would report success and then log a failure nobody is watching
 /// for.
 pub fn bind(replication: &StdArc<Replication>) -> std::io::Result<rastcp::server::TcpServer> {
+    bind_on(replication, None)
+}
+
+/// [`bind`], serving `listener` when one is given instead of binding
+/// `listen_addr:listen_port`. The listener comes from
+/// [`Replication::serve_on`], which says why a caller would hand one over.
+pub fn bind_on(
+    replication: &StdArc<Replication>,
+    listener: Option<std::net::TcpListener>,
+) -> std::io::Result<rastcp::server::TcpServer> {
     let config = replication.config();
 
     if let Err(e) = config.validate() {
@@ -65,6 +75,10 @@ pub fn bind(replication: &StdArc<Replication>) -> std::io::Result<rastcp::server
     let mut builder =
         rastcp::server::TcpServerBuilder::new(&config.listen_addr, config.listen_port)
             .request_timeout(config.request_timeout)
+            // One transaction is one record and a record is not split: the
+            // transport must take the largest frame the protocol allows, or a
+            // single large transaction stops its link for good.
+            .max_message_size(protocol::MAX_PAYLOAD + protocol::HEADER_LEN)
             // What callers must prove before they reach the handler. Under
             // anything but `Insecure` an unauthenticated caller never gets to
             // send a frame at all.
@@ -74,6 +88,15 @@ pub fn bind(replication: &StdArc<Replication>) -> std::io::Result<rastcp::server
                     .client_auth(config.auth)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
             );
+    if let Some(listener) = listener {
+        builder = builder.with_listener(listener);
+    }
+
+    // Who is calling is settled once, when the connection opens, and then
+    // known for every frame on it. See [`Greeter`].
+    builder = builder.authenticator(StdArc::new(Greeter {
+        replication: replication.clone(),
+    }));
 
     // Present this node's own certificate rather than a freshly generated one,
     // so the fingerprint the peers pinned stays the same across restarts.
@@ -106,10 +129,13 @@ pub fn bind(replication: &StdArc<Replication>) -> std::io::Result<rastcp::server
     );
     // Printed so setting a cluster up does not need a detour through
     // `openssl`: this is the value the other nodes pin.
-    info!(
-        "Replication certificate fingerprint: {}",
-        rastcp::tls::format_fingerprint(&server.certificate_fingerprint())
-    );
+    // A replication listener is always TCP, and so always has one.
+    if let Some(fingerprint) = server.certificate_fingerprint() {
+        info!(
+            "Replication certificate fingerprint: {}",
+            rastcp::tls::format_fingerprint(&fingerprint)
+        );
+    }
     if !config.auth.authenticates() {
         warn!(
             "Replication authentication is off. The link is encrypted but not authenticated, \
@@ -141,12 +167,15 @@ pub async fn serve(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            flusher.flush();
+            // An fsync is blocking I/O; run on a runtime worker it parks that
+            // worker and every task queued behind it for the whole sync.
+            let flusher = flusher.clone();
+            let _ = tokio::task::spawn_blocking(move || flusher.flush()).await;
         }
     });
 
     let outcome = server
-        .run_with_context(database, handle_frame)
+        .run_with_context_and_principal(database, handle_frame)
         .await
         .map_err(|e| std::io::Error::other(e.to_string()));
 
@@ -159,9 +188,113 @@ pub async fn serve(
     outcome
 }
 
-/// Answers one frame.
-async fn handle_frame(database: Arc<Database>, request: Vec<u8>) -> Vec<u8> {
+/// Greets a connection before anything else is served on it.
+///
+/// A sender's first frame on every connection it opens is a `HELLO`: which
+/// node it is, which cluster it belongs to, and the cluster's token. That used
+/// to be answered like any other request, by a handler that knew nothing of
+/// the connection a frame arrived on — so the token was checked when a caller
+/// chose to present it and at no other time. A caller that never greeted, or
+/// greeted with the wrong token and was refused, could go on to `PULL` this
+/// node's stream or `PUSH` into it on the same connection.
+///
+/// The transport runs this once per connection, before the first request, and
+/// serves nothing on a connection it refuses. It reads the first frame, which
+/// has to be a `HELLO`, checks it exactly as before, and answers it exactly as
+/// before — so a sender, which sends its `HELLO` and waits for the answer,
+/// cannot tell the difference, and a node with this talks to one without it in
+/// either direction. What it adds is the caller's node id, handed to
+/// [`handle_frame`] with every frame that follows.
+#[derive(Debug)]
+struct Greeter {
+    replication: StdArc<Replication>,
+}
+
+impl rastcp::session::ServerAuthenticator for Greeter {
+    fn authenticate<'a>(
+        &'a self,
+        channel: &'a mut rastcp::session::AuthChannel<'_>,
+    ) -> rastcp::session::AuthFuture<'a, rastcp::session::Principal> {
+        Box::pin(async move {
+            let frame = channel.recv().await?;
+
+            let greeting = {
+                let mut scratch = Vec::new();
+                FrameCodec::default()
+                    .decode_frame(&frame, &mut scratch)
+                    .map(|(header, payload)| (header.kind, payload.to_vec()))
+                    .map_err(|e| e.to_string())
+            };
+
+            let (reply, caller) = match greeting {
+                Ok((FrameKind::Hello, payload)) => {
+                    let reply = handle_hello(&self.replication, &payload);
+                    let caller = acknowledged_caller(&payload, &reply);
+                    (reply, caller)
+                }
+                Ok((other, _)) => (
+                    protocol::error_frame(&format!(
+                        "a connection opens with HELLO; this one opened with {}",
+                        other
+                    )),
+                    None,
+                ),
+                Err(e) => {
+                    warn!("Rejecting a replication greeting: {}", e);
+                    (protocol::error_frame(&e), None)
+                }
+            };
+
+            // Answered either way: a caller that is refused is told why, as
+            // it was when the greeting was an ordinary request.
+            channel.send(&reply).await?;
+
+            match caller {
+                Some(node) => Ok(rastcp::session::Principal::new(session_name(node), false)),
+                None => Err(rastcp::error::RastcpError::AuthenticationError(format!(
+                    "the replication greeting from {} was refused",
+                    channel.peer()
+                ))),
+            }
+        })
+    }
+}
+
+/// The node a `HELLO` named, if `reply` — this node's answer to it — is an
+/// acknowledgement and not a refusal.
+fn acknowledged_caller(hello: &[u8], reply: &[u8]) -> Option<NodeId> {
+    let acknowledged =
+        protocol::parse_header(reply).is_ok_and(|header| header.kind == FrameKind::HelloAck);
+    if !acknowledged {
+        return None;
+    }
+
+    Hello::decode(&mut Reader::new(hello)).ok().map(|hello| hello.node_id)
+}
+
+/// The name a greeted connection's caller goes by in the transport.
+fn session_name(node: NodeId) -> String {
+    format!("node:{node}")
+}
+
+/// The node a connection was greeted as, or `None` for a connection that was
+/// served without a greeting — which this listener does not do, and which is
+/// refused all the same rather than trusted on that account.
+fn greeted_node(principal: &rastcp::session::Principal) -> Option<NodeId> {
+    principal.user.strip_prefix("node:")?.parse().ok()
+}
+
+/// Answers one frame from the node `principal` was greeted as.
+async fn handle_frame(
+    database: Arc<Database>,
+    principal: StdArc<rastcp::session::Principal>,
+    request: Vec<u8>,
+) -> Vec<u8> {
     let replication = database.replication.clone();
+
+    let Some(caller) = greeted_node(&principal) else {
+        return protocol::error_frame("this connection was not opened with HELLO");
+    };
 
     // Decode with the thread's codec, then let go of it: the borrow cannot be
     // held across the `await`s below, and the payload has to outlive it, so it
@@ -184,9 +317,20 @@ async fn handle_frame(database: Arc<Database>, request: Vec<u8>) -> Vec<u8> {
     };
 
     match header.kind {
-        FrameKind::Hello => handle_hello(&replication, &payload),
-        FrameKind::Push => handle_push(&database, &replication, &payload).await,
-        FrameKind::Pull => handle_pull(&replication, &payload),
+        // Greeting again on a connection already greeted changes nothing
+        // about who is on it, so it may only be the same node saying so.
+        FrameKind::Hello => {
+            match Hello::decode(&mut Reader::new(&payload)) {
+                Ok(hello) if hello.node_id != caller => protocol::error_frame(&format!(
+                    "this connection was opened by node {}, and cannot be taken over by node {}",
+                    caller, hello.node_id
+                )),
+                _ => handle_hello(&replication, &payload),
+            }
+        }
+        FrameKind::Push => handle_push(&database, &replication, caller, &payload).await,
+        FrameKind::Pull => handle_pull(&replication, caller, &payload),
+        FrameKind::Digest => super::check::answer(&database, &payload).await,
         FrameKind::Ping => {
             let mut out = Vec::with_capacity(8);
             out.extend_from_slice(&replication.clock().now().to_le_bytes());
@@ -221,10 +365,12 @@ fn handle_hello(replication: &StdArc<Replication>, payload: &[u8]) -> Vec<u8> {
         use subtle::ConstantTimeEq;
         let presented = hello.token.as_bytes();
         let expected = config.token.as_bytes();
-        let matches = presented.len() == expected.len()
-            && bool::from(presented.ct_eq(expected));
+        let matches = presented.len() == expected.len() && bool::from(presented.ct_eq(expected));
         if !matches {
-            warn!("Refusing node {}: the replication token does not match", hello.node_id);
+            warn!(
+                "Refusing node {}: the replication token does not match",
+                hello.node_id
+            );
             return protocol::error_frame("authentication failed: replication token mismatch");
         }
     }
@@ -263,6 +409,7 @@ fn handle_hello(replication: &StdArc<Replication>, payload: &[u8]) -> Vec<u8> {
 async fn handle_push(
     database: &Arc<Database>,
     replication: &StdArc<Replication>,
+    caller: NodeId,
     payload: &[u8],
 ) -> Vec<u8> {
     let (sender, records) = match protocol::decode_push(&mut Reader::new(payload)) {
@@ -270,11 +417,41 @@ async fn handle_push(
         Err(e) => return protocol::error_frame(&format!("unreadable PUSH: {}", e)),
     };
 
-    let mut outcomes = Vec::with_capacity(records.len());
-    for record in records {
-        let outcome = apply_record(database, replication, record, sender).await;
-        outcomes.push(outcome);
+    // A batch says who sends it, and that decides what is applied and what is
+    // taken as already held. It has to be the node the connection was opened
+    // by, not whichever node the batch would like to be taken for.
+    if sender != caller {
+        warn!(
+            "Refusing a PUSH sent as node {} on a connection opened by node {}",
+            sender, caller
+        );
+        return protocol::error_frame(&format!(
+            "this connection was opened by node {}; a PUSH on it cannot be sent as node {}",
+            caller, sender
+        ));
     }
+
+    // In a task of its own. The transport drops this future when its request
+    // timeout passes or the connection goes, and an apply dropped between two
+    // statements leaves a transaction open for good, holding its row locks.
+    // The task runs the batch to its end whatever becomes of the request; a
+    // sender that gave up and sent it again waits its turn and is told the
+    // records are already held.
+    let began = std::time::Instant::now();
+    let task = {
+        let database = database.clone();
+        let replication = replication.clone();
+        tokio::spawn(async move { apply_batch(&database, &replication, records, sender).await })
+    };
+    let outcomes = match task.await {
+        Ok(outcomes) => outcomes,
+        Err(e) => return protocol::error_frame(&format!("the apply did not finish: {}", e)),
+    };
+    let stats = replication.stats();
+    stats.batches_applied.fetch_add(1, Ordering::Relaxed);
+    stats
+        .apply_us
+        .fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
 
     let ack = PushAck {
         node_id: replication.node_id(),
@@ -288,11 +465,18 @@ async fn handle_push(
 }
 
 /// Serves history from the log.
-fn handle_pull(replication: &StdArc<Replication>, payload: &[u8]) -> Vec<u8> {
+fn handle_pull(replication: &StdArc<Replication>, caller: NodeId, payload: &[u8]) -> Vec<u8> {
     let request = match Pull::decode(&mut Reader::new(payload)) {
         Ok(request) => request,
         Err(e) => return protocol::error_frame(&format!("unreadable PULL: {}", e)),
     };
+
+    if request.node_id != caller {
+        return protocol::error_frame(&format!(
+            "this connection was opened by node {}; a PULL on it cannot be made as node {}",
+            caller, request.node_id
+        ));
+    }
 
     let Some(log) = replication.log() else {
         return protocol::error_frame("this node keeps no replication log");
@@ -307,9 +491,17 @@ fn handle_pull(replication: &StdArc<Replication>, payload: &[u8]) -> Vec<u8> {
         ));
     }
 
-    let (records, more) = match log.read_after(
+    // Of this node's own stream, only what is settled and durable here: a
+    // puller must not get ahead of what a pushed peer would be sent.
+    let upto = if request.origin == replication.node_id() {
+        replication.released_through()
+    } else {
+        u64::MAX
+    };
+    let (records, more) = match log.read_range(
         request.origin,
         request.after_seq,
+        upto,
         request.max_records as usize,
         request.max_bytes as usize,
     ) {
@@ -336,103 +528,445 @@ fn refuse(record: &TxnRecord, status: ApplyStatus, message: impl Into<String>) -
     }
 }
 
-/// Applies one record, or explains why it was not applied.
-async fn apply_record(
+/// A record applied and committed in memory, waiting for the sync that
+/// makes it durable.
+struct Waiting {
+    owner: crate::core::mvcc::owner::OwnerRelease,
+    record: TxnRecord,
+    /// Where its outcome sits in the batch's answer.
+    answer: usize,
+}
+
+/// The records of one origin applied since the last sync.
+///
+/// Each record is its own transaction, committed in order. What they share is
+/// the `fdatasync`: one a batch, not one a record. The origin commits many
+/// writers under one sync, so a peer paying one each could never keep up with
+/// it, and falling behind is what every other failure here starts from.
+/// Nothing is acknowledged before the sync, and if the sync fails nothing of
+/// the batch is acknowledged at all: the origin's stream is halted and the
+/// position reported goes back to where it stood (see `finish`).
+struct Group {
+    origin: NodeId,
+    /// The position before the first record waiting.
+    before: u64,
+    waiting: Vec<Waiting>,
+}
+
+impl Group {
+    fn new(origin: NodeId) -> Group {
+        Group {
+            origin,
+            before: 0,
+            waiting: Vec::new(),
+        }
+    }
+
+    /// The one sync, and what follows from how it went.
+    fn finish(
+        &mut self,
+        database: &Arc<Database>,
+        replication: &StdArc<Replication>,
+        from_node: NodeId,
+        outcomes: &mut [ApplyOutcome],
+    ) {
+        if self.waiting.is_empty() {
+            return;
+        }
+        let waiting = std::mem::take(&mut self.waiting);
+        // The two halves of `Database::sync_own_location`, told apart,
+        // because only the first decides whether the batch is durable.
+        let synced = database.sync_own_log();
+        if synced.is_ok() {
+            // The log holds the rows, their outcomes and the intents, so the
+            // batch is durable and is acknowledged as such. What can still
+            // fail is the copy of those outcomes into the status file, which
+            // the log already covers: the ranges stay staged and the next
+            // sync, or a restart's replay, writes them. That is a disk worth
+            // an operator's attention (the callee logs it as an error) and
+            // not a reason to stop a stream whose every byte is safe; the
+            // log writer's own round treats it the same way.
+            let _ = database.apply_staged_outcomes();
+        }
+
+        if let Err(e) = synced {
+            // Not undone. These transactions committed in memory and may or
+            // may not be on disk, and a reader may already have seen them;
+            // aborting them here, as this once did, took rows back from under
+            // that reader on the strength of a guess. A failed log sync is
+            // the same event wherever it happens: the write-ahead log refuses
+            // further commits until the node is restarted, and the restart's
+            // replay decides what survived. So this origin's stream is
+            // halted, nothing of the batch is acknowledged, and the position
+            // this node reports goes back to where it stood, so the sender
+            // is told nothing it cannot rely on. The intents are left for
+            // the restart: they ride the same log as the rows.
+            replication.halt_apply(
+                self.origin,
+                format!("a batch of its transactions could not be made durable ({})", e),
+            );
+            replication.applied().retreat(self.origin, self.before);
+            for held in waiting {
+                outcomes[held.answer] = refuse(
+                    &held.record,
+                    ApplyStatus::Failed,
+                    format!(
+                        "the applied rows could not be made durable ({}); this node must be restarted",
+                        e
+                    ),
+                );
+                held.owner.release();
+            }
+            return;
+        }
+
+        // Durable: the slot takes the position the intents brought it to.
+        if let Err(e) = replication.applied().settle(self.origin) {
+            warn!("Could not settle origin {}'s applied position: {}", self.origin, e);
+        }
+        let relay = replication.config().relay;
+        for held in waiting {
+            // Durable: the apply's table locks go now (finding L4).
+            held.owner.release();
+            replication.stamp_tables(&held.record.tables, held.record.commit_hlc, held.record.origin);
+            debug!(
+                "Applied transaction {}:{} ({} statements)",
+                held.record.origin,
+                held.record.seq,
+                held.record.statements.len()
+            );
+            if relay {
+                relay_onwards(replication, held.record, from_node);
+            }
+        }
+    }
+}
+
+/// Logs a record that arrived here for the nodes this one can see and its
+/// sender cannot. The senders read it from the log like any other.
+fn relay_onwards(replication: &StdArc<Replication>, mut record: TxnRecord, _from_node: NodeId) {
+    // Marked, so a reader can tell a transaction that passed through here
+    // from one that started here.
+    record.flags |= protocol::FLAG_RELAYED;
+    if let Some(log) = replication.log() {
+        if let Err(e) = log.append(&record) {
+            warn!(
+                "Could not log relayed transaction {}:{}: {}; the nodes behind this one will \
+                 not get it from here",
+                record.origin, record.seq, e
+            );
+            return;
+        }
+    }
+    replication.relay_logged();
+}
+
+/// Applies a batch of records, in order, and reports on each.
+///
+/// Records of one origin are applied under that origin's lock, so the same
+/// record arriving on two connections is applied by one and found already
+/// held by the other.
+pub(crate) async fn apply_batch(
+    database: &Arc<Database>,
+    replication: &StdArc<Replication>,
+    records: Vec<TxnRecord>,
+    // Which peer handed these over. `NO_SENDER` when they did not come off a
+    // link — a `RESYNC` pull, say.
+    from_node: NodeId,
+) -> Vec<ApplyOutcome> {
+    let mut outcomes: Vec<ApplyOutcome> = Vec::with_capacity(records.len());
+    let mut records = records.into_iter().peekable();
+
+    while let Some(first) = records.next() {
+        let origin = first.origin;
+        let lock = replication.apply_lock(origin);
+        let _turn = lock.lock().await;
+
+        let mut group = Group::new(origin);
+        let mut next = Some(first);
+        while let Some(record) = next.take() {
+            apply_one(database, replication, record, from_node, &mut group, &mut outcomes).await;
+            if records.peek().is_some_and(|following| following.origin == origin) {
+                next = records.next();
+            }
+        }
+        group.finish(database, replication, from_node, &mut outcomes);
+    }
+
+    outcomes
+}
+
+/// Applies one record on its own. For callers with one record in hand.
+#[cfg(test)]
+pub(super) async fn apply_record(
     database: &Arc<Database>,
     replication: &StdArc<Replication>,
     record: TxnRecord,
-    // Which peer handed this over, so relaying does not send it straight back.
-    // `NO_SENDER` when it did not come off a link — a `RESYNC` pull, say.
     from_node: NodeId,
 ) -> ApplyOutcome {
+    apply_batch(database, replication, vec![record], from_node)
+        .await
+        .pop()
+        .expect("one record in, one outcome out")
+}
+
+/// Applies one record into `group`, or explains why it was not applied. Its
+/// outcome is pushed onto `outcomes`.
+async fn apply_one(
+    database: &Arc<Database>,
+    replication: &StdArc<Replication>,
+    record: TxnRecord,
+    from_node: NodeId,
+    group: &mut Group,
+    outcomes: &mut Vec<ApplyOutcome>,
+) {
     let applied = replication.applied();
     let node_id = replication.node_id();
 
     // Our own transaction, arriving back from a relay. Nothing to do.
     if record.origin == node_id {
-        return refuse(&record, ApplyStatus::Duplicate, "");
+        outcomes.push(refuse(&record, ApplyStatus::Duplicate, ""));
+        return;
     }
 
+    if let Some(why) = replication.apply_halted(record.origin) {
+        outcomes.push(refuse(
+            &record,
+            ApplyStatus::Failed,
+            format!("not applying until this node is restarted: {}", why),
+        ));
+        return;
+    }
+
+    // Read under the origin's lock: nobody else moves this position.
     if applied.already_applied(record.origin, record.seq) {
-        return refuse(&record, ApplyStatus::Duplicate, "");
+        outcomes.push(refuse(&record, ApplyStatus::Duplicate, ""));
+        return;
     }
 
     let high_water = applied.high_water(record.origin);
-    if high_water > 0 && record.seq > high_water + 1 {
+    if record.seq > high_water + 1 {
         // A record cannot be applied over a hole: the statements before it may
-        // be what make it valid. The sender backfills on seeing this.
-        return refuse(
+        // be what make it valid. The sender starts again from this node's
+        // position on seeing this.
+        //
+        // From nothing as well. A node that held nothing of an origin used to
+        // take up its stream wherever the first record to arrive happened to
+        // be, on the grounds that the earlier history might be past retention.
+        // What that did in practice was skip a refused transaction: the first
+        // record of a stream was refused as a conflict, the second arrived
+        // with nothing yet applied, and it was adopted as the start. A node
+        // that really is missing an origin's early history is one to reseed,
+        // and the sender says so rather than send it the rest.
+        outcomes.push(refuse(
             &record,
             ApplyStatus::Gap,
             format!("expected sequence {}, got {}", high_water + 1, record.seq),
-        );
-    }
-    if high_water == 0 && record.seq > 1 {
-        // Nothing has ever been applied from this origin and its stream does
-        // not start at the beginning: its early history is beyond retention.
-        // Adopting the stream here is the only way forward, and saying so is
-        // the only honest thing to do about what came before.
-        warn!(
-            "Adopting origin {}'s stream at sequence {}: this node holds nothing earlier, \
-             so transactions before it are not present. Seed this node from a backup of \
-             that origin if the earlier history matters.",
-            record.origin, record.seq
-        );
+        ));
+        return;
     }
 
     replication.clock().observe(record.commit_hlc);
+
+    // A sequence the origin handed to a transaction that did not commit.
+    // There is nothing to run: the stream moves past it.
+    if record.is_void() || record.statements.is_empty() {
+        group.finish(database, replication, from_node, outcomes);
+        let outcome = match applied.record(record.origin, record.seq) {
+            Ok(_) => ApplyOutcome {
+                origin: record.origin,
+                seq: record.seq,
+                status: ApplyStatus::Applied,
+                message: String::new(),
+            },
+            Err(e) => refuse(
+                &record,
+                ApplyStatus::Failed,
+                format!("the applied position could not be written: {}", e),
+            ),
+        };
+        if outcome.status == ApplyStatus::Applied && replication.config().relay {
+            relay_onwards(replication, record, from_node);
+        }
+        outcomes.push(outcome);
+        return;
+    }
 
     let policy = replication.conflict_policy();
     if policy == ConflictPolicy::LastWriterWins && replication.is_superseded(&record) {
         // Every table it writes has a strictly later local write, so applying
         // it would move those rows backwards in time.
+        group.finish(database, replication, from_node, outcomes);
         if let Err(e) = applied.record(record.origin, record.seq) {
             warn!("Could not record the applied position: {}", e);
         }
-        return refuse(
+        outcomes.push(refuse(
             &record,
             ApplyStatus::Conflict,
             "superseded by a later local write",
-        );
+        ));
+        return;
     }
 
-    let tx = database.transactions.begin();
-    replication.enter_apply(tx, record.origin);
+    // A statement that is not a plain row write (a schema change) takes locks
+    // that the records waiting in the group may hold their side of, and is
+    // not undone by an abort. It runs with nothing waiting, and is synced
+    // before anything follows it.
+    let plain = record
+        .statements
+        .iter()
+        .all(|statement| super::manager::plain_row_write(statement));
+    if !plain {
+        group.finish(database, replication, from_node, outcomes);
+    }
 
-    let mut failure: Option<String> = None;
-    for statement in &record.statements {
-        let Some(purpose) = recognize_query_purpose(statement) else {
-            failure = Some(format!("could not parse `{}`", truncate(statement)));
-            break;
-        };
+    // A schema change makes itself durable as it goes, over several syncs,
+    // and is not undone by an abort. So there is no place to write its
+    // position that a power cut cannot separate from it: written after, as
+    // for a row write, the table was there and the position was not in 36
+    // crash images of 160, the origin offered the `CREATE` again, it was
+    // refused as already existing, and the stream stalled until someone
+    // stepped in; written before, the position was there and the table was
+    // not in 46, which nothing would ever have reported.
+    //
+    // What can be made durable ahead of it is the fact that it was started.
+    // A record that is nothing but schema changes is marked as in flight
+    // before it runs. If the node stops before the record's position is
+    // settled, the next start finds the mark, and when the origin offers the
+    // record again, a statement of it that fails because its work is already
+    // there is taken as done.
+    let schema_only = record
+        .statements
+        .iter()
+        .all(|statement| !super::manager::plain_row_write(statement));
+    let stood = applied.high_water(record.origin);
+    let resumed = schema_only && applied.schema_in_flight(record.origin, record.seq);
+    if schema_only {
+        if let Err(e) = applied.mark_schema(record.origin, record.seq) {
+            outcomes.push(refuse(
+                &record,
+                ApplyStatus::Failed,
+                format!("the applied position could not be written: {}", e),
+            ));
+            return;
+        }
+    }
+    // The mark is taken back whenever the record is not applied.
+    let take_back = || {
+        if schema_only {
+            if let Err(e) = applied.rollback(record.origin, stood) {
+                warn!("Could not take the applied position back: {}", e);
+            }
+        }
+    };
 
-        let response = execute_in_txn(purpose, database.clone(), tx).await;
-        if response.first() == Some(&3) {
-            let message = String::from_utf8_lossy(&response[1..]).to_string();
-            match policy {
-                ConflictPolicy::Skip | ConflictPolicy::LastWriterWins => {
-                    warn!(
-                        "Skipping a statement of transaction {}:{}: {} (`{}`)",
+    // A statement that failed on a lock (40P01, 55P03, 57014, 57P01: a
+    // deadlock's victim, a lock or statement timeout, a cancel) applied
+    // nothing wrong; it lost a race with local work. The record is retried
+    // whole, in a fresh transaction, after the failed one is aborted and its
+    // owner released, so a deadlock it was part of is broken (finding L2,
+    // part 2). Never skipped under Skip or LastWriterWins, which would lose
+    // the statement on this node; never advanced past when the retries run
+    // out, so the sender delivers it again.
+    let mut tries = 0usize;
+    let (tx, owner) = loop {
+        let tx = database.transactions.begin();
+        replication.enter_apply(tx, record.origin);
+        // The apply's lock owner: a named internal owner, its transaction's
+        // root, never `FROZEN_TX` (docs/persistent-indexes.md §7 Owner;
+        // finding L2). Released after the last durability step, or on any
+        // way out.
+        let owner = crate::core::mvcc::owner::OwnerRelease::for_root(&database.row_locks, tx);
+
+        let mut failure: Option<String> = None;
+        let mut transient = false;
+        for statement in &record.statements {
+            let Some(purpose) = recognize_query_purpose(statement) else {
+                failure = Some(format!("could not parse `{}`", truncate(statement)));
+                break;
+            };
+
+            // The peer's statement temporaries arrive as its `CREATE TABLE
+            // __cte_…`, which only the peer's own CTE could have issued.
+            let response = crate::core::rql::cte::allowing_temporaries(crate::core::mvcc::owner::under(
+                &database.transactions,
+                tx,
+                crate::core::mvcc::owner::OwnerKind::Replication,
+                execute_in_txn(purpose, database.clone(), tx),
+            ))
+            .await;
+            if response.first() == Some(&3) {
+                let message = String::from_utf8_lossy(&response[1..]).to_string();
+                if lost_a_lock(&message) {
+                    failure = Some(format!("{} (`{}`)", message, truncate(statement)));
+                    transient = true;
+                    break;
+                }
+                if resumed && already_done(&message) {
+                    info!(
+                        "Transaction {}:{} was being applied when this node last stopped; `{}` is \
+                         already in place ({}), and is taken as done",
                         record.origin,
                         record.seq,
-                        message,
-                        truncate(statement)
+                        truncate(statement),
+                        message
                     );
+                    continue;
                 }
-                ConflictPolicy::Abort => {
-                    failure = Some(format!("{} (`{}`)", message, truncate(statement)));
-                    break;
+                match policy {
+                    ConflictPolicy::Skip | ConflictPolicy::LastWriterWins => {
+                        warn!(
+                            "Skipping a statement of transaction {}:{}: {} (`{}`)",
+                            record.origin,
+                            record.seq,
+                            message,
+                            truncate(statement)
+                        );
+                    }
+                    ConflictPolicy::Abort => {
+                        failure = Some(format!("{} (`{}`)", message, truncate(statement)));
+                        break;
+                    }
                 }
             }
         }
-    }
 
-    replication.leave_apply(tx);
+        replication.leave_apply(tx);
 
-    if let Some(message) = failure {
-        database.transactions.abort(tx);
+        let Some(message) = failure else {
+            break (tx, owner);
+        };
+        // What is waiting goes to disk first: the flush below is this
+        // transaction's, and must not be what carries the others' outcomes.
+        group.finish(database, replication, from_node, outcomes);
+        // `Database::abort_transaction`, not the manager's `abort`: the latter
+        // ended the transaction but left its row locks in the lock table and
+        // its capture buffers behind (finding L2).
+        database.abort_transaction(tx);
         if let Err(e) = database.transactions.flush() {
             warn!("Could not make the aborted outcome durable: {}", e);
+        }
+        owner.release();
+        if transient {
+            if tries < APPLY_LOCK_RETRIES {
+                tries += 1;
+                replication.stats().apply_retries.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    "Transaction {}:{} lost a lock ({}); retrying it (try {})",
+                    record.origin, record.seq, message, tries
+                );
+                tokio::time::sleep(apply_lock_backoff(tries)).await;
+                continue;
+            }
+            // Not applied and not advanced past: the sender delivers it again.
+            warn!(
+                "Transaction {}:{} kept losing locks to local work ({}); it will be \
+                 delivered again",
+                record.origin, record.seq, message
+            );
+            take_back();
+            outcomes.push(refuse(&record, ApplyStatus::Failed, message));
+            return;
         }
         // Deliberately *not* advancing the applied position. Under `abort` the
         // stream stops here rather than silently skipping a transaction, which
@@ -443,56 +977,111 @@ async fn apply_record(
              the conflict policy to skip.",
             record.origin, record.seq, message
         );
-        return refuse(&record, ApplyStatus::Conflict, message);
-    }
+        take_back();
+        outcomes.push(refuse(&record, ApplyStatus::Conflict, message));
+        return;
+    };
 
-    database.transactions.commit(tx);
-    if let Err(e) = database.transactions.flush() {
-        warn!("Could not make the transaction outcome durable: {}", e);
-    }
-
-    // Recorded after the commit: a crash in the window between them replays
-    // this transaction rather than losing it. See `super::log`.
-    if let Err(e) = applied.record(record.origin, record.seq) {
-        warn!("Could not record the applied position: {}", e);
-    }
-    replication.stamp_tables(&record.tables, record.commit_hlc, record.origin);
-
-    debug!(
-        "Applied transaction {}:{} ({} statements)",
-        record.origin,
-        record.seq,
-        record.statements.len()
-    );
-
-    // A record that arrived here may still have to reach nodes this one can
-    // see and its sender cannot.
-    let origin = record.origin;
-    let seq = record.seq;
-
-    if replication.config().relay {
-        // Marked before it is either logged or forwarded, so what a third node
-        // receives and what this node's log holds are the same record — and a
-        // reader can tell a transaction that passed through here from one that
-        // started here.
-        let mut relayed = record;
-        relayed.flags |= protocol::FLAG_RELAYED;
-        let relayed = StdArc::new(relayed);
-
-        if let Some(log) = replication.log() {
-            if let Err(e) = log.append(&relayed) {
-                warn!("Could not log a relayed transaction: {}", e);
-            }
+    // The position goes into the log ahead of the commit it depends on, as
+    // "this sequence, if this transaction committed": one sync then covers
+    // the rows, the position and the outcome, and after a crash the position
+    // counts exactly when the rows do (`AppliedState`).
+    let wrote = database.transactions.wrote_family(tx);
+    let before = applied.high_water(record.origin);
+    // The records waiting in the group are synced first: taking this one's
+    // step back starts a new run of intents, and theirs must be in the slot
+    // by then.
+    let give_up = |why: String, group: &mut Group, outcomes: &mut Vec<ApplyOutcome>| {
+        database.abort_transaction(tx);
+        group.finish(database, replication, from_node, outcomes);
+        let before = applied.high_water(record.origin).min(before);
+        if let Err(e) = applied.rollback(record.origin, before) {
+            warn!("Could not take the applied position back: {}", e);
         }
-        replication.relay(relayed, from_node);
-    }
+        if let Err(e) = database.transactions.flush() {
+            warn!("Could not make the aborted outcome durable: {}", e);
+        }
+        // Not recorded as applied, so the record comes again and is applied
+        // then, instead of being skipped for good.
+        refuse(&record, ApplyStatus::Failed, why)
+    };
 
-    ApplyOutcome {
-        origin,
-        seq,
+    // A transaction that wrote no row has no durable outcome to ask about
+    // later; its step is written as one that holds if the steps before it do.
+    if let Err(e) = applied.begin(record.origin, record.seq, if wrote { tx } else { 0 }) {
+        let outcome = give_up(format!("the applied position could not be written: {}", e), group, outcomes);
+        owner.release();
+        outcomes.push(outcome);
+        return;
+    }
+    // Through the same path as a client's commit: rows applied to a table on
+    // another storage location are in that location's log, and they have to
+    // be durable before the outcome exists for any root flush to carry to
+    // disk.
+    if let Err(e) = database.commit_written_transaction(tx) {
+        let outcome = give_up(format!("the applied rows could not be made durable: {}", e), group, outcomes);
+        owner.release();
+        outcomes.push(outcome);
+        return;
+    }
+    if let Err(e) = database.transactions.flush_deferred() {
+        let outcome = give_up(format!("the transaction outcome could not be recorded: {}", e), group, outcomes);
+        owner.release();
+        outcomes.push(outcome);
+        return;
+    }
+    applied.advance(record.origin, record.seq);
+
+    if group.waiting.is_empty() {
+        group.before = before;
+    }
+    outcomes.push(ApplyOutcome {
+        origin: record.origin,
+        seq: record.seq,
         status: ApplyStatus::Applied,
         message: String::new(),
+    });
+    group.waiting.push(Waiting {
+        owner,
+        record,
+        answer: outcomes.len() - 1,
+    });
+    if !plain {
+        group.finish(database, replication, from_node, outcomes);
     }
+}
+
+/// How many times a record that lost a lock is retried before it is handed
+/// back undelivered (finding L2).
+const APPLY_LOCK_RETRIES: usize = 8;
+
+/// The pause before retry `n` of a record that lost a lock: doubling from
+/// 10 ms, capped at 500 ms (about 1.6 s over every retry).
+fn apply_lock_backoff(n: usize) -> std::time::Duration {
+    std::time::Duration::from_millis((10u64 << n.min(6)).min(500))
+}
+
+/// Whether a statement's failure means it lost a lock to local work rather
+/// than that it cannot apply: 40P01 (a deadlock's victim), 55P03 (lock
+/// timeout, NOWAIT), 57014 (a statement timeout or cancel), 57P01 (shutdown).
+/// Classified by the wire's own mapping, so the two never disagree.
+fn lost_a_lock(message: &str) -> bool {
+    matches!(
+        crate::pgwire::sqlstate_for(message),
+        "40P01" | "55P03" | "57014" | "57P01"
+    )
+}
+
+/// Whether a schema change failed because what it makes is already there, or
+/// what it removes is already gone: the answer a statement gets when it ran
+/// before. Classified by the wire's own mapping, as [`lost_a_lock`] is.
+fn already_done(message: &str) -> bool {
+    matches!(
+        crate::pgwire::sqlstate_for(message),
+        // duplicate table, column, object, schema; undefined table, column,
+        // object.
+        "42P07" | "42701" | "42710" | "42P06" | "42P01" | "42703" | "42704"
+    )
 }
 
 /// Keeps a statement short enough for a log line.
@@ -517,15 +1106,17 @@ pub async fn apply_pulled(
 ) -> (usize, usize) {
     let mut applied = 0;
     let mut refused = 0;
-    for record in records {
-        let outcome = apply_record(database, replication, record, NO_SENDER).await;
+    for outcome in apply_batch(database, replication, records, NO_SENDER).await {
         if outcome.status == ApplyStatus::Applied {
             applied += 1;
         } else if !outcome.status.is_settled() {
             refused += 1;
         }
     }
-    replication.stats().applied.fetch_add(applied as u64, Ordering::Relaxed);
+    replication
+        .stats()
+        .applied
+        .fetch_add(applied as u64, Ordering::Relaxed);
     (applied, refused)
 }
 
@@ -538,7 +1129,10 @@ mod tests {
         let database = crate::replication::test_support::in_memory_database().await;
         database
             .replication
-            .set_config(ReplicationConfig { node_id: 1, ..Default::default() })
+            .set_config(ReplicationConfig {
+                node_id: 1,
+                ..Default::default()
+            })
             .unwrap();
         database.replication.open_storage(None).unwrap();
         database.replication.set_active(true);
@@ -557,12 +1151,9 @@ mod tests {
     }
 
     async fn create_table(database: &Arc<Database>) {
-        let purpose = recognize_query_purpose(
-            "CREATE TABLE repl_t (id INTEGER, name VARCHAR)",
-        )
-        .unwrap();
-        let response =
-            crate::core::rql::executor::execute(purpose, database.clone()).await;
+        let purpose =
+            recognize_query_purpose("CREATE TABLE repl_t (id INTEGER, name VARCHAR)").unwrap();
+        let response = crate::core::rql::executor::execute(purpose, database.clone()).await;
         assert_ne!(response.first(), Some(&3), "the fixture table must exist");
     }
 
@@ -584,7 +1175,11 @@ mod tests {
         let outcome = apply_record(
             &database,
             &replication,
-            record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+            record(
+                2,
+                1,
+                vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"],
+            ),
             NO_SENDER,
         )
         .await;
@@ -592,6 +1187,121 @@ mod tests {
         assert_eq!(outcome.status, ApplyStatus::Applied, "{}", outcome.message);
         assert_eq!(row_count(&database).await, 1);
         assert_eq!(replication.applied().high_water(2), 1);
+    }
+
+    /// A peer's write fed by a CTE carries its statement temporaries: their
+    /// `CREATE TABLE __cte_…` was captured with the transaction. The prefix is
+    /// refused to every user create (`cte::reserved_name_refusal`), so the
+    /// apply loop opens it: refused here, the record failed and the write
+    /// never landed on this node.
+    ///
+    /// Mutation: the apply loop without `cte::allowing_temporaries`.
+    #[tokio::test]
+    async fn a_peers_statement_temporaries_apply() {
+        let database = database().await;
+        create_table(&database).await;
+        let replication = database.replication.clone();
+        let temp = format!("{}k_0_ab12", crate::core::rql::cte::TEMP_TABLE_PREFIX);
+        let create = format!("CREATE TABLE {temp} (id INTEGER)");
+        let fill = format!("INSERT INTO {temp} (id) VALUES (1)");
+        let drop = format!("DROP TABLE {temp}");
+        let outcome = apply_record(
+            &database,
+            &replication,
+            record(
+                2,
+                1,
+                vec![&create, &fill, "INSERT INTO repl_t (id, name) VALUES (1, 'ada')", &drop],
+            ),
+            NO_SENDER,
+        )
+        .await;
+        assert_eq!(outcome.status, ApplyStatus::Applied, "{}", outcome.message);
+        assert_eq!(row_count(&database).await, 1);
+        assert!(!database.has_table(&temp), "the temporary outlived the applied transaction");
+    }
+
+    /// Replication apply runs under a named owner, its transaction's root,
+    /// never unowned (§7 Owner; finding L2). A failed apply ends through
+    /// `Database::abort_transaction`, so its row and referenced-key locks
+    /// go, and its owner is released.
+    #[tokio::test]
+    async fn an_apply_runs_under_its_named_owner_and_releases_it_on_every_end() {
+        use crate::core::mvcc::owner::{probe, LockOwner, OwnerKind};
+        let database = database().await;
+        create_table(&database).await;
+        for sql in [
+            "CREATE TABLE repl_parent (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE repl_child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES repl_parent(id))",
+            "INSERT INTO repl_parent (id) VALUES (1)",
+        ] {
+            let response = crate::core::rql::executor::execute(recognize_query_purpose(sql).unwrap(), database.clone()).await;
+            assert_ne!(response.first(), Some(&3), "{sql}: {}", String::from_utf8_lossy(&response));
+        }
+        let replication = database.replication.clone();
+
+        let check = |what: &str, records: &[probe::Record]| -> crate::core::mvcc::TxId {
+            assert!(!records.is_empty(), "{what}: the apply recorded nothing");
+            let tx = records[0].tx;
+            for r in records {
+                let o = r.owner.unwrap_or_else(|| panic!("{what}: {:?} ran under no owner", r.site));
+                assert_eq!(o.kind, OwnerKind::Replication, "{what}: {:?}", r.site);
+                assert_eq!(o.owner, LockOwner::block(tx).unwrap(), "{what}: not the apply's own transaction");
+                assert!(r.owner_live);
+            }
+            tx
+        };
+
+        let (outcome, records) = probe::capture(apply_record(
+            &database,
+            &replication,
+            record(2, 1, vec!["INSERT INTO repl_child (id, pid) VALUES (10, 1)"]),
+            NO_SENDER,
+        ))
+        .await;
+        assert_eq!(outcome.status, ApplyStatus::Applied, "{}", outcome.message);
+        let tx = check("applied", &records);
+        assert!(!database.row_locks.txn_holds_rows(tx), "an applied transaction kept its key locks");
+        assert!(!database.row_locks.owner_holds_tables(tx));
+
+        // Control: the first statement below takes a row lock its transaction
+        // holds to its end, or the check after the failed apply proves nothing.
+        let control = database.transactions.begin();
+        let response = crate::core::rql::executor::execute_in_txn(
+            recognize_query_purpose("SELECT id FROM repl_parent WHERE id = 1 FOR UPDATE").unwrap(),
+            database.clone(),
+            control,
+        )
+        .await;
+        assert_ne!(response.first(), Some(&3), "{}", String::from_utf8_lossy(&response));
+        assert!(database.row_locks.txn_holds_rows(control), "the control statement took no lock");
+        database.abort_transaction(control);
+
+        // Under `abort` (the default), a statement that fails ends the apply.
+        // The statement before it took a row lock.
+        assert_eq!(replication.conflict_policy(), ConflictPolicy::Abort);
+        let (outcome, records) = probe::capture(apply_record(
+            &database,
+            &replication,
+            record(
+                2,
+                2,
+                vec![
+                    "SELECT id FROM repl_parent WHERE id = 1 FOR UPDATE",
+                    "INSERT INTO no_such_table (id) VALUES (1)",
+                ],
+            ),
+            NO_SENDER,
+        ))
+        .await;
+        assert_ne!(outcome.status, ApplyStatus::Applied);
+        let tx = check("failed", &records);
+        assert_eq!(database.transactions.outcome(tx), crate::core::mvcc::TxOutcome::Aborted);
+        assert!(
+            !database.row_locks.txn_holds_rows(tx),
+            "a failed apply left its row locks in the lock table"
+        );
+        assert!(!database.row_locks.owner_holds_tables(tx));
     }
 
     #[tokio::test]
@@ -620,6 +1330,69 @@ mod tests {
         assert_eq!(row_count(&database).await, 3);
     }
 
+    /// Replication apply passes the write gate (docs/persistent-indexes.md
+    /// §2, slice B11): from a forced clean point, the census sees a durable
+    /// `DIRTY` and a ticket on the table's gate before every mutation and
+    /// write the apply makes, and the apply's owner gives its ticket back once
+    /// the record's outcome is final.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replication_apply_passes_the_write_gate() {
+        use crate::core::index_store::census::{Census, Scope, check};
+        crate::replication::test_support::init_globals();
+        let dir = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::new_named(&dir.path().to_string_lossy(), false, "repl_gate").await);
+        database
+            .replication
+            .set_config(ReplicationConfig {
+                node_id: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        database.replication.open_storage(None).unwrap();
+        database.replication.set_active(true);
+        create_table(&database).await;
+        let replication = database.replication.clone();
+        let table = database.table_for_tests("repl_t").unwrap();
+        table.wait_filters_ready().await.unwrap();
+        table.gate().force_clean_for_tests();
+
+        let census = Census::start();
+        let outcome = apply_record(
+            &database,
+            &replication,
+            record(
+                2,
+                1,
+                vec![
+                    "INSERT INTO repl_t (id, name) VALUES (1, 'ada')",
+                    "INSERT INTO repl_t (id, name) VALUES (2, 'bob')",
+                    "UPDATE repl_t SET name = 'carol' WHERE id = 2",
+                ],
+            ),
+            NO_SENDER,
+        )
+        .await;
+        let events = census.finish();
+        assert_eq!(outcome.status, ApplyStatus::Applied, "{}", outcome.message);
+        let summary = check(
+            &events,
+            &Scope {
+                gate: table.gate().census_id(),
+                began_clean: true,
+                structures: &table.census_structures(),
+                files: &table.census_files(),
+            },
+        )
+        .unwrap_or_else(|e| panic!("census: {e}"));
+        assert_eq!(summary.dirty_durable, 1);
+        assert!(summary.writes > 0 && summary.ticket_mutations > 0, "{summary:?}");
+        assert_eq!(table.gate().word().load().count(), 0, "the apply's owner kept its ticket");
+        assert_eq!(row_count(&database).await, 2);
+        drop(table);
+        drop(database);
+        crate::core::wal::remove_for(&dir.path().to_string_lossy());
+    }
+
     /// The property the whole design rests on: applying a record must not make
     /// this node re-originate it.
     #[tokio::test]
@@ -635,7 +1408,11 @@ mod tests {
         apply_record(
             &database,
             &replication,
-            record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+            record(
+                2,
+                1,
+                vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"],
+            ),
             NO_SENDER,
         )
         .await;
@@ -645,7 +1422,11 @@ mod tests {
             before,
             "an applied record must not become a local one, or a mesh would loop"
         );
-        assert_eq!(replication.open_captures(), 0, "no buffer should be left behind");
+        assert_eq!(
+            replication.open_captures(),
+            0,
+            "no buffer should be left behind"
+        );
     }
 
     #[tokio::test]
@@ -657,21 +1438,33 @@ mod tests {
         let first = apply_record(
             &database,
             &replication,
-            record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+            record(
+                2,
+                1,
+                vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"],
+            ),
             NO_SENDER,
         )
         .await;
         let second = apply_record(
             &database,
             &replication,
-            record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+            record(
+                2,
+                1,
+                vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"],
+            ),
             NO_SENDER,
         )
         .await;
 
         assert_eq!(first.status, ApplyStatus::Applied);
         assert_eq!(second.status, ApplyStatus::Duplicate);
-        assert_eq!(row_count(&database).await, 1, "a resend must not double-insert");
+        assert_eq!(
+            row_count(&database).await,
+            1,
+            "a resend must not double-insert"
+        );
     }
 
     #[tokio::test]
@@ -683,7 +1476,11 @@ mod tests {
         apply_record(
             &database,
             &replication,
-            record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+            record(
+                2,
+                1,
+                vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"],
+            ),
             NO_SENDER,
         )
         .await;
@@ -691,33 +1488,210 @@ mod tests {
         let outcome = apply_record(
             &database,
             &replication,
-            record(2, 5, vec!["INSERT INTO repl_t (id, name) VALUES (5, 'five')"]),
+            record(
+                2,
+                5,
+                vec!["INSERT INTO repl_t (id, name) VALUES (5, 'five')"],
+            ),
             NO_SENDER,
         )
         .await;
 
         assert_eq!(outcome.status, ApplyStatus::Gap);
-        assert_eq!(row_count(&database).await, 1, "nothing may be applied over a hole");
+        assert_eq!(
+            row_count(&database).await,
+            1,
+            "nothing may be applied over a hole"
+        );
     }
 
-    /// A node joining a cluster whose early history is gone adopts the stream
-    /// where it finds it, rather than stalling forever on a gap it cannot close.
+    /// A node that holds nothing of an origin takes its stream from the
+    /// first transaction or not at all. Taking it up wherever a record
+    /// happened to arrive skipped whatever came before, and what came before
+    /// was, in practice, a transaction this node had just refused.
     #[tokio::test]
-    async fn a_fresh_origin_is_adopted_wherever_its_stream_starts() {
+    async fn a_stream_is_not_taken_up_part_way() {
         let database = database().await;
         create_table(&database).await;
         let replication = database.replication.clone();
 
+        // The first is refused: the table it writes is not there.
+        let refused = apply_record(
+            &database,
+            &replication,
+            record(2, 1, vec!["INSERT INTO no_such_table (id) VALUES (1)"]),
+            NO_SENDER,
+        )
+        .await;
+        assert_eq!(refused.status, ApplyStatus::Conflict);
+
+        // The second arrives with nothing applied yet.
         let outcome = apply_record(
             &database,
             &replication,
-            record(2, 900, vec!["INSERT INTO repl_t (id, name) VALUES (9, 'nine')"]),
+            record(2, 2, vec!["INSERT INTO repl_t (id, name) VALUES (9, 'nine')"]),
             NO_SENDER,
         )
         .await;
 
-        assert_eq!(outcome.status, ApplyStatus::Applied);
-        assert_eq!(replication.applied().high_water(2), 900);
+        assert_eq!(outcome.status, ApplyStatus::Gap, "the refused transaction was passed over");
+        assert_eq!(replication.applied().high_water(2), 0);
+        assert_eq!(row_count(&database).await, 0);
+    }
+
+    /// A sync that fails under an applied batch: the batch is not
+    /// acknowledged, the position this node reports does not move, nothing
+    /// is taken back from under a reader, and the origin's stream is not
+    /// applied again until the node is restarted.
+    #[tokio::test]
+    async fn a_failed_sync_halts_the_origin_and_acknowledges_nothing() {
+        crate::replication::test_support::init_globals();
+        let dir = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::new_named(&dir.path().to_string_lossy(), false, "repl_halt").await);
+        database
+            .replication
+            .set_config(ReplicationConfig {
+                node_id: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        database.open_replication_storage().unwrap();
+        database.replication.set_active(true);
+        create_table(&database).await;
+        let replication = database.replication.clone();
+
+        let first = apply_record(
+            &database,
+            &replication,
+            record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+            NO_SENDER,
+        )
+        .await;
+        assert_eq!(first.status, ApplyStatus::Applied, "{}", first.message);
+
+        crate::core::wal::test_hooks::FAIL_LOG_SYNC.with(|f| f.set(Some(5)));
+        let outcomes = apply_batch(
+            &database,
+            &replication,
+            vec![
+                record(2, 2, vec!["INSERT INTO repl_t (id, name) VALUES (2, 'grace')"]),
+                record(2, 3, vec!["INSERT INTO repl_t (id, name) VALUES (3, 'edsger')"]),
+            ],
+            NO_SENDER,
+        )
+        .await;
+        crate::core::wal::test_hooks::FAIL_LOG_SYNC.with(|f| f.set(None));
+
+        assert!(outcomes.iter().all(|o| o.status == ApplyStatus::Failed), "{outcomes:?}");
+        assert!(outcomes[0].message.contains("must be restarted"), "{}", outcomes[0].message);
+        assert_eq!(replication.applied().high_water(2), 1, "nothing of the batch is claimed");
+        assert!(replication.apply_halted(2).is_some());
+        // Still there for whoever read them: not undone on a guess.
+        assert_eq!(row_count(&database).await, 3);
+
+        // Offered again, as a sender would: refused, and not applied twice.
+        let again = apply_record(
+            &database,
+            &replication,
+            record(2, 2, vec!["INSERT INTO repl_t (id, name) VALUES (2, 'grace')"]),
+            NO_SENDER,
+        )
+        .await;
+        assert_eq!(again.status, ApplyStatus::Failed);
+        assert!(again.message.contains("restarted"), "{}", again.message);
+        assert_eq!(row_count(&database).await, 3);
+
+        // The restart decides. Here the log's page cache kept everything, so
+        // all three survive, and the position comes back agreeing with them.
+        drop(replication);
+        drop(database);
+        crate::core::wal::remove_for(&dir.path().to_string_lossy());
+        let database = Arc::new(Database::new_named(&dir.path().to_string_lossy(), false, "repl_halt").await);
+        database
+            .replication
+            .set_config(ReplicationConfig {
+                node_id: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        database.open_replication_storage().unwrap();
+        let position = database.replication.applied().high_water(2);
+        assert_eq!(row_count(&database).await as u64, position, "rows and position agree after the restart");
+        assert!(database.replication.apply_halted(2).is_none());
+        drop(database);
+        crate::core::wal::remove_for(&dir.path().to_string_lossy());
+    }
+
+    /// The log synced and only the copy of the outcomes into the status
+    /// file failed: the batch is durable, so it is acknowledged, the
+    /// position moves and the stream goes on. Nothing here is a reason to
+    /// halt, because the log already covers what the copy would have put
+    /// in the file.
+    #[tokio::test]
+    async fn a_failed_status_copy_after_a_durable_log_does_not_halt() {
+        crate::replication::test_support::init_globals();
+        let dir = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::new_named(&dir.path().to_string_lossy(), false, "repl_copy").await);
+        database
+            .replication
+            .set_config(ReplicationConfig {
+                node_id: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        database.open_replication_storage().unwrap();
+        database.replication.set_active(true);
+        create_table(&database).await;
+        let replication = database.replication.clone();
+
+        crate::core::database::test_hooks::FAIL_STAGED_COPY.with(|f| f.set(true));
+        let outcomes = apply_batch(
+            &database,
+            &replication,
+            vec![
+                record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+                record(2, 2, vec!["INSERT INTO repl_t (id, name) VALUES (2, 'grace')"]),
+            ],
+            NO_SENDER,
+        )
+        .await;
+        assert!(
+            !crate::core::database::test_hooks::FAIL_STAGED_COPY.with(|f| f.get()),
+            "the injected failure was never reached"
+        );
+
+        assert!(outcomes.iter().all(|o| o.status == ApplyStatus::Applied), "{outcomes:?}");
+        assert_eq!(replication.applied().high_water(2), 2);
+        assert!(replication.apply_halted(2).is_none());
+
+        // The stream goes on.
+        let next = apply_record(
+            &database,
+            &replication,
+            record(2, 3, vec!["INSERT INTO repl_t (id, name) VALUES (3, 'edsger')"]),
+            NO_SENDER,
+        )
+        .await;
+        assert_eq!(next.status, ApplyStatus::Applied, "{}", next.message);
+
+        // And a restart, which reads the outcomes back from the log, finds
+        // every row and a position that agrees with them.
+        drop(replication);
+        drop(database);
+        crate::core::wal::remove_for(&dir.path().to_string_lossy());
+        let database = Arc::new(Database::new_named(&dir.path().to_string_lossy(), false, "repl_copy").await);
+        database
+            .replication
+            .set_config(ReplicationConfig {
+                node_id: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        database.open_replication_storage().unwrap();
+        assert_eq!(database.replication.applied().high_water(2), 3);
+        assert_eq!(row_count(&database).await, 3);
+        drop(database);
+        crate::core::wal::remove_for(&dir.path().to_string_lossy());
     }
 
     #[tokio::test]
@@ -729,7 +1703,11 @@ mod tests {
         let outcome = apply_record(
             &database,
             &replication,
-            record(1, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+            record(
+                1,
+                1,
+                vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"],
+            ),
             NO_SENDER,
         )
         .await;
@@ -766,12 +1744,143 @@ mod tests {
         .await;
 
         assert_eq!(outcome.status, ApplyStatus::Conflict);
-        assert_eq!(row_count(&database).await, 0, "an aborted apply must be all-or-nothing");
+        assert_eq!(
+            row_count(&database).await,
+            0,
+            "an aborted apply must be all-or-nothing"
+        );
         assert_eq!(
             replication.applied().high_water(2),
             0,
             "the stream must stall rather than skip the transaction"
         );
+    }
+
+    /// A local block holding `LOCK TABLE repl_t IN ACCESS EXCLUSIVE MODE`,
+    /// and the id that ends it.
+    async fn lock_holder(database: &Arc<Database>) -> crate::core::mvcc::TxId {
+        let holder = database.transactions.begin();
+        let response = execute_in_txn(
+            recognize_query_purpose("LOCK TABLE repl_t IN ACCESS EXCLUSIVE MODE").unwrap(),
+            database.clone(),
+            holder,
+        )
+        .await;
+        assert_ne!(response.first(), Some(&3), "{}", String::from_utf8_lossy(&response));
+        holder
+    }
+
+    fn end_holder(database: &Arc<Database>, holder: crate::core::mvcc::TxId) {
+        database.commit_transaction(holder);
+        database.release_owner(crate::core::mvcc::owner::LockOwner::block(holder).unwrap());
+    }
+
+    fn skip_policy(replication: &StdArc<Replication>) {
+        replication
+            .update_config(|config| {
+                config.conflict = ConflictPolicy::Skip;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// Finding L2, part 2: an apply whose statement loses a lock to local
+    /// work (here 55P03: `lock_timeout` behind a local `LOCK TABLE`) is
+    /// aborted, released and retried whole, never skipped, even under
+    /// `Skip`; once the local block ends, the retry applies it. The row is
+    /// there, the position advanced, and the retries were counted.
+    ///
+    /// Mutation: `lost_a_lock` answers false: under `Skip` the statement is
+    /// skipped, the record reported applied, and the row is missing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_apply_that_loses_a_lock_is_retried_and_lands() {
+        let database = database().await;
+        create_table(&database).await;
+        let replication = database.replication.clone();
+        skip_policy(&replication);
+        let holder = lock_holder(&database).await;
+        let retries_before = replication.stats().apply_retries.load(Ordering::Relaxed);
+        // Ends the holder once the apply has retried, never by the clock.
+        let ender = {
+            let (database, replication) = (database.clone(), replication.clone());
+            tokio::spawn(async move {
+                tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                    while replication.stats().apply_retries.load(Ordering::Relaxed) <= retries_before {
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    }
+                })
+                .await
+                .expect("the apply never retried");
+                end_holder(&database, holder);
+            })
+        };
+        let outcome = crate::core::cancel::with_lock_timeout(
+            100,
+            apply_record(
+                &database,
+                &replication,
+                record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+                NO_SENDER,
+            ),
+        )
+        .await;
+        ender.await.unwrap();
+        assert_eq!(outcome.status, ApplyStatus::Applied, "{}", outcome.message);
+        assert_eq!(row_count(&database).await, 1, "the statement was skipped, not retried");
+        assert_eq!(replication.applied().high_water(2), 1);
+        assert!(replication.stats().apply_retries.load(Ordering::Relaxed) > retries_before);
+    }
+
+    /// When the local work outlasts every retry, the record is handed back
+    /// undelivered (`Failed`, so the sender sends it again): not applied,
+    /// not skipped, the position not advanced, nothing held.
+    ///
+    /// Mutation: `lost_a_lock` answers false: the record is reported applied
+    /// under `Skip` and the position moves past a statement this node lacks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_apply_that_keeps_losing_its_lock_is_not_advanced_past() {
+        let database = database().await;
+        create_table(&database).await;
+        let replication = database.replication.clone();
+        skip_policy(&replication);
+        let holder = lock_holder(&database).await;
+        let outcome = crate::core::cancel::with_lock_timeout(
+            20,
+            apply_record(
+                &database,
+                &replication,
+                record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+                NO_SENDER,
+            ),
+        )
+        .await;
+        assert_eq!(outcome.status, ApplyStatus::Failed, "{}", outcome.message);
+        assert!(!outcome.status.is_settled());
+        assert_eq!(replication.applied().high_water(2), 0, "advanced past a statement it lacks");
+        end_holder(&database, holder);
+        assert_eq!(row_count(&database).await, 0);
+    }
+
+    /// The four lock failures are retried; a conflict or a constraint is the
+    /// policy's to decide.
+    #[test]
+    fn lock_failures_are_told_apart_from_conflicts() {
+        for message in [
+            "deadlock detected while waiting for AccessExclusiveLock on relation \"t\"",
+            "canceling statement due to lock timeout (waiting for transaction 7)",
+            "could not obtain lock on relation \"t\"",
+            "canceling statement due to statement timeout",
+            "canceling statement due to user request",
+        ] {
+            assert!(lost_a_lock(message), "{message}");
+        }
+        for message in [
+            "could not serialize access due to concurrent update of row 1",
+            "duplicate value for UNIQUE column \"id\" (row 1 already holds it)",
+            "relation does not exist",
+        ] {
+            assert!(!lost_a_lock(message), "{message}");
+        }
     }
 
     #[tokio::test]
@@ -802,8 +1911,16 @@ mod tests {
         .await;
 
         assert_eq!(outcome.status, ApplyStatus::Applied);
-        assert_eq!(row_count(&database).await, 1, "the good statement should survive");
-        assert_eq!(replication.applied().high_water(2), 1, "the stream moves on");
+        assert_eq!(
+            row_count(&database).await,
+            1,
+            "the good statement should survive"
+        );
+        assert_eq!(
+            replication.applied().high_water(2),
+            1,
+            "the stream moves on"
+        );
     }
 
     #[tokio::test]
@@ -825,7 +1942,11 @@ mod tests {
         let outcome = apply_record(
             &database,
             &replication,
-            record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+            record(
+                2,
+                1,
+                vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"],
+            ),
             NO_SENDER,
         )
         .await;
@@ -878,7 +1999,10 @@ mod tests {
         hello.encode(&mut payload);
 
         let response = handle_hello(&replication, &payload);
-        assert_eq!(protocol::parse_header(&response).unwrap().kind, FrameKind::Error);
+        assert_eq!(
+            protocol::parse_header(&response).unwrap().kind,
+            FrameKind::Error
+        );
     }
 
     #[tokio::test]
@@ -905,7 +2029,9 @@ mod tests {
         .encode(&mut payload);
 
         assert_eq!(
-            protocol::parse_header(&handle_hello(&replication, &payload)).unwrap().kind,
+            protocol::parse_header(&handle_hello(&replication, &payload))
+                .unwrap()
+                .kind,
             FrameKind::Error
         );
 
@@ -922,7 +2048,9 @@ mod tests {
         .encode(&mut payload);
 
         assert_eq!(
-            protocol::parse_header(&handle_hello(&replication, &payload)).unwrap().kind,
+            protocol::parse_header(&handle_hello(&replication, &payload))
+                .unwrap()
+                .kind,
             FrameKind::HelloAck
         );
     }
@@ -956,8 +2084,44 @@ mod tests {
     #[tokio::test]
     async fn a_garbled_frame_is_answered_with_an_error_not_a_panic() {
         let database = database().await;
-        let response = handle_frame(database, vec![0xde, 0xad, 0xbe, 0xef]).await;
-        assert_eq!(protocol::parse_header(&response).unwrap().kind, FrameKind::Error);
+        let greeted = StdArc::new(rastcp::session::Principal::new(session_name(2), false));
+        let response = handle_frame(database, greeted, vec![0xde, 0xad, 0xbe, 0xef]).await;
+        assert_eq!(
+            protocol::parse_header(&response).unwrap().kind,
+            FrameKind::Error
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_on_a_connection_that_was_not_greeted_is_refused() {
+        // The listener greets every connection, so this is not reachable
+        // through it. It is refused all the same: a handler that served
+        // whoever it was handed would be one configuration change away from
+        // serving everyone.
+        let database = database().await;
+        let nobody = StdArc::new(rastcp::session::Principal::anonymous());
+
+        let ping = protocol::plain_frame(FrameKind::Ping, 0, &[]);
+        let response = handle_frame(database, nobody, ping).await;
+
+        assert_eq!(
+            protocol::parse_header(&response).unwrap().kind,
+            FrameKind::Error
+        );
+    }
+
+    #[test]
+    fn a_session_name_gives_back_the_node_it_was_made_from() {
+        for node in [1u64, 2, 61171, u64::MAX] {
+            let principal = rastcp::session::Principal::new(session_name(node), false);
+            assert_eq!(greeted_node(&principal), Some(node));
+        }
+        // Anything else is nobody, including the transport's own anonymous
+        // caller and a name that only looks like one of these.
+        assert_eq!(greeted_node(&rastcp::session::Principal::anonymous()), None);
+        assert_eq!(greeted_node(&rastcp::session::Principal::new("node:", false)), None);
+        assert_eq!(greeted_node(&rastcp::session::Principal::new("node:two", false)), None);
+        assert_eq!(greeted_node(&rastcp::session::Principal::new("alice", true)), None);
     }
 
     #[test]

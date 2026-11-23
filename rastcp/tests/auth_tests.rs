@@ -13,12 +13,16 @@ use rastcp::server::TcpServerBuilder;
 use rastcp::tls::{ClientAuth, ClientIdentity, Fingerprint, Trust, fingerprint};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-/// A port nothing is listening on.
-fn free_port() -> u16 {
+/// A loopback listener on a port of the kernel's choosing, and that port.
+///
+/// The server is handed the listener itself, never the number to bind again:
+/// a port that is let go can be given to a test running in parallel before the
+/// server binds it, which fails one of them or connects a client to the wrong
+/// server.
+fn loopback() -> (std::net::TcpListener, u16) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     let port = listener.local_addr().expect("a bound address").port();
-    drop(listener);
-    port
+    (listener, port)
 }
 
 struct Identity {
@@ -44,9 +48,10 @@ impl Identity {
     }
 }
 
-/// Starts an echo server on `port` with the given identity and client policy.
-async fn serve(port: u16, identity: &Identity, client_auth: ClientAuth) {
-    let server = TcpServerBuilder::new("127.0.0.1", port)
+/// Starts an echo server on `listener` with the given identity and client policy.
+async fn serve(listener: std::net::TcpListener, identity: &Identity, client_auth: ClientAuth) {
+    let server = TcpServerBuilder::from_listener(listener)
+        .expect("a bound listener")
         .with_certificates(identity.certs.clone(), identity.key.clone_key())
         .client_auth(client_auth)
         .build()
@@ -78,9 +83,9 @@ async fn exchange(port: u16, trust: Trust, identity: Option<ClientIdentity>) -> 
 
 #[tokio::test]
 async fn a_pinned_client_reaches_the_server_it_pinned() {
-    let port = free_port();
+    let (listener, port) = loopback();
     let server = Identity::generate();
-    serve(port, &server, ClientAuth::None).await;
+    serve(listener, &server, ClientAuth::None).await;
 
     assert!(
         exchange(port, Trust::Pinned(vec![server.fingerprint()]), None).await,
@@ -91,9 +96,9 @@ async fn a_pinned_client_reaches_the_server_it_pinned() {
 /// The test that matters: a pin has to *reject* something.
 #[tokio::test]
 async fn a_pinned_client_refuses_a_server_it_did_not_pin() {
-    let port = free_port();
+    let (listener, port) = loopback();
     let server = Identity::generate();
-    serve(port, &server, ClientAuth::None).await;
+    serve(listener, &server, ClientAuth::None).await;
 
     // A certificate generated the same way, but not this server's — which is
     // exactly what an impersonating middlebox would present.
@@ -107,9 +112,9 @@ async fn a_pinned_client_refuses_a_server_it_did_not_pin() {
 
 #[tokio::test]
 async fn a_pinned_client_accepts_any_of_several_pins() {
-    let port = free_port();
+    let (listener, port) = loopback();
     let server = Identity::generate();
-    serve(port, &server, ClientAuth::None).await;
+    serve(listener, &server, ClientAuth::None).await;
 
     let other = Identity::generate();
     let pins = vec![other.fingerprint(), server.fingerprint()];
@@ -122,10 +127,10 @@ async fn a_pinned_client_accepts_any_of_several_pins() {
 
 #[tokio::test]
 async fn a_server_requiring_a_certificate_refuses_an_anonymous_caller() {
-    let port = free_port();
+    let (listener, port) = loopback();
     let server = Identity::generate();
     let client = Identity::generate();
-    serve(port, &server, ClientAuth::RequirePinned(vec![client.fingerprint()])).await;
+    serve(listener, &server, ClientAuth::RequirePinned(vec![client.fingerprint()])).await;
 
     assert!(
         !exchange(port, Trust::Pinned(vec![server.fingerprint()]), None).await,
@@ -135,10 +140,10 @@ async fn a_server_requiring_a_certificate_refuses_an_anonymous_caller() {
 
 #[tokio::test]
 async fn a_server_requiring_a_certificate_accepts_the_one_it_pinned() {
-    let port = free_port();
+    let (listener, port) = loopback();
     let server = Identity::generate();
     let client = Identity::generate();
-    serve(port, &server, ClientAuth::RequirePinned(vec![client.fingerprint()])).await;
+    serve(listener, &server, ClientAuth::RequirePinned(vec![client.fingerprint()])).await;
 
     assert!(
         exchange(
@@ -153,10 +158,10 @@ async fn a_server_requiring_a_certificate_accepts_the_one_it_pinned() {
 
 #[tokio::test]
 async fn a_server_requiring_a_certificate_refuses_an_unpinned_one() {
-    let port = free_port();
+    let (listener, port) = loopback();
     let server = Identity::generate();
     let client = Identity::generate();
-    serve(port, &server, ClientAuth::RequirePinned(vec![client.fingerprint()])).await;
+    serve(listener, &server, ClientAuth::RequirePinned(vec![client.fingerprint()])).await;
 
     // A caller with a perfectly valid certificate that this cluster has never
     // heard of.
@@ -176,10 +181,10 @@ async fn a_server_requiring_a_certificate_refuses_an_unpinned_one() {
 /// Both directions at once, which is how a cluster is meant to be configured.
 #[tokio::test]
 async fn mutual_pinning_authenticates_both_ends() {
-    let port = free_port();
+    let (listener, port) = loopback();
     let server = Identity::generate();
     let client = Identity::generate();
-    serve(port, &server, ClientAuth::RequirePinned(vec![client.fingerprint()])).await;
+    serve(listener, &server, ClientAuth::RequirePinned(vec![client.fingerprint()])).await;
 
     assert!(
         exchange(
@@ -216,9 +221,9 @@ async fn mutual_pinning_authenticates_both_ends() {
 /// nothing.
 #[tokio::test]
 async fn accept_any_connects_to_anything() {
-    let port = free_port();
+    let (listener, port) = loopback();
     let server = Identity::generate();
-    serve(port, &server, ClientAuth::None).await;
+    serve(listener, &server, ClientAuth::None).await;
 
     assert!(exchange(port, Trust::AcceptAny, None).await);
     assert!(!Trust::AcceptAny.authenticates());

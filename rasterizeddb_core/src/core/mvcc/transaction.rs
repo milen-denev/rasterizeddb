@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use cacheguard::CacheGuard;
 
 use parking_lot::RwLock;
+use smallvec::SmallVec;
 
-use super::status::StatusLog;
+use super::status::{IdReservation, StatusLog};
 
 /// A transaction identifier.
 ///
@@ -53,6 +54,15 @@ pub struct Snapshot {
     /// One past the highest id assigned when this snapshot was taken. Anything
     /// at or above it began later and is invisible regardless of outcome.
     pub xmax: TxId,
+    /// The lowest id in `running`, or `xmax` when nothing was. Every id below
+    /// it had finished — or never started — when the snapshot was taken, so
+    /// "was it running?" is answered by one compare instead of a tree lookup
+    /// per row. PostgreSQL's `snapshot->xmin`, for the same reason.
+    pub xmin: TxId,
+    /// The reading transaction's only id, when its family is exactly one id —
+    /// the common case of no savepoints — so "is this write mine?" is an
+    /// equality test. `NO_TX` otherwise, and `family` is consulted.
+    solo: TxId,
     /// Transactions below `xmax` that were still running. Invisible even if they
     /// commit afterwards — otherwise a statement would see a transaction appear
     /// midway through its own execution.
@@ -61,13 +71,71 @@ pub struct Snapshot {
     /// are not committed. `NO_TX` for a snapshot taken outside any transaction.
     pub own: TxId,
     /// Every id belonging to the reading transaction, itself and each savepoint
-    /// it has opened.
+    /// it has opened. `None` when that is `own` alone (or nothing, for a
+    /// snapshot taken outside any transaction): the usual case, answered by
+    /// `solo`, and not worth a set and an `Arc` per statement.
     ///
     /// A savepoint is a sub-transaction with an id of its own, so "is this write
     /// mine?" stops being an equality test the moment savepoints exist. A write
     /// made before a savepoint carries the outer id and must stay visible after
     /// it; a write made inside one that was rolled back must not.
-    family: Arc<BTreeSet<TxId>>,
+    family: Option<Arc<BTreeSet<TxId>>>,
+    /// Keeps `xmin` in the manager's registry of live snapshots for as long as
+    /// any clone of this snapshot exists. `None` for a snapshot built by hand.
+    registration: Option<Arc<SnapshotRegistration>>,
+}
+
+/// The `xmin` of every live snapshot, as a multiset.
+///
+/// What a version horizon has to respect is the oldest *snapshot*, not the
+/// oldest running transaction. A snapshot keeps every transaction that was
+/// running when it was taken invisible even after it commits; once such a
+/// transaction retires, `oldest_active` moves past it while the snapshot still
+/// treats it as in flight — so a version it deleted read as reclaimable to
+/// vacuum and to a scan's skip gate while that snapshot could still see it.
+/// See `VersionHorizon::sample`.
+#[derive(Debug, Default)]
+pub struct SnapshotRegistry {
+    live: parking_lot::Mutex<std::collections::BTreeMap<TxId, usize>>,
+}
+
+impl SnapshotRegistry {
+    fn register(self: &Arc<Self>, xmin: TxId) -> Arc<SnapshotRegistration> {
+        *self.live.lock().entry(xmin).or_insert(0) += 1;
+        Arc::new(SnapshotRegistration {
+            registry: Arc::clone(self),
+            xmin,
+        })
+    }
+
+    /// The lowest `xmin` of any live snapshot.
+    pub fn oldest(&self) -> Option<TxId> {
+        self.live.lock().keys().next().copied()
+    }
+
+    /// Live snapshots. Diagnostic.
+    pub fn len(&self) -> usize {
+        self.live.lock().values().sum()
+    }
+}
+
+/// One snapshot's place in the [`SnapshotRegistry`], released on drop.
+#[derive(Debug)]
+pub struct SnapshotRegistration {
+    registry: Arc<SnapshotRegistry>,
+    xmin: TxId,
+}
+
+impl Drop for SnapshotRegistration {
+    fn drop(&mut self) {
+        let mut live = self.registry.live.lock();
+        if let Some(count) = live.get_mut(&self.xmin) {
+            *count -= 1;
+            if *count == 0 {
+                live.remove(&self.xmin);
+            }
+        }
+    }
 }
 
 impl Snapshot {
@@ -77,7 +145,7 @@ impl Snapshot {
         if own != NO_TX {
             family.insert(own);
         }
-        Snapshot { xmax, running: Arc::new(running), own, family: Arc::new(family) }
+        Self::at_with_family(xmax, running, own, family)
     }
 
     /// Same, with every id the reading transaction owns.
@@ -87,13 +155,56 @@ impl Snapshot {
         own: TxId,
         family: BTreeSet<TxId>,
     ) -> Self {
-        Snapshot { xmax, running: Arc::new(running), own, family: Arc::new(family) }
+        // Ids at or above `xmax` are excluded by the first test, so a running
+        // id there could never matter; `xmax` is the right floor.
+        let xmin = running.first().copied().unwrap_or(xmax).min(xmax);
+        let solo = if family.len() == 1 {
+            family.first().copied().unwrap_or(NO_TX)
+        } else {
+            NO_TX
+        };
+        // `own` alone, or nothing outside a transaction: what `None` means.
+        let just_own = if own == NO_TX {
+            family.is_empty()
+        } else {
+            solo == own
+        };
+        Snapshot {
+            xmax,
+            xmin,
+            solo,
+            running: Arc::new(running),
+            own,
+            family: if just_own { None } else { Some(Arc::new(family)) },
+            registration: None,
+        }
+    }
+
+    /// [`Self::at_with_family`] for a reader whose family is `own` alone,
+    /// without building the one-element set.
+    fn at_own(xmax: TxId, running: BTreeSet<TxId>, own: TxId) -> Self {
+        let xmin = running.first().copied().unwrap_or(xmax).min(xmax);
+        Snapshot {
+            xmax,
+            xmin,
+            solo: own,
+            running: Arc::new(running),
+            own,
+            family: None,
+            registration: None,
+        }
     }
 
     /// Whether `tx` is this transaction or one of its savepoints.
     #[inline]
-    fn is_mine(&self, tx: TxId) -> bool {
-        self.own != NO_TX && self.family.contains(&tx)
+    pub(crate) fn is_mine(&self, tx: TxId) -> bool {
+        if self.own == NO_TX {
+            return false;
+        }
+        if self.solo != NO_TX {
+            return tx == self.solo;
+        }
+        self.family.as_ref().is_some_and(|family| family.contains(&tx))
     }
 
     /// True when nothing was in flight, so every version below `xmax` is either
@@ -109,8 +220,51 @@ impl Snapshot {
 
     /// Whether the transaction that wrote a version had already happened, as far
     /// as this snapshot is concerned.
+    #[inline]
     fn started_before(&self, tx: TxId) -> bool {
-        tx < self.xmax && !self.running.contains(&tx)
+        tx < self.xmin || (tx < self.xmax && !self.running.contains(&tx))
+    }
+
+    /// The rule as it stood before `xmin` and `solo` existed, kept as the
+    /// reference the differential tests hold the fast paths to.
+    #[cfg(test)]
+    pub(crate) fn sees_reference(
+        &self,
+        xmin: TxId,
+        xmax: TxId,
+        outcome: &impl Fn(TxId) -> TxOutcome,
+    ) -> bool {
+        let is_mine = |tx: TxId| {
+            self.own != NO_TX
+                && match &self.family {
+                    Some(family) => family.contains(&tx),
+                    None => tx == self.own,
+                }
+        };
+        let started_before = |tx: TxId| tx < self.xmax && !self.running.contains(&tx);
+        let created = if xmin == FROZEN_TX {
+            true
+        } else if is_mine(xmin) {
+            outcome(xmin) != TxOutcome::Aborted
+        } else if !started_before(xmin) {
+            false
+        } else {
+            outcome(xmin) == TxOutcome::Committed
+        };
+        if !created {
+            return false;
+        }
+        if xmax == NO_TX {
+            return true;
+        }
+        let deleted = if is_mine(xmax) {
+            outcome(xmax) != TxOutcome::Aborted
+        } else if !started_before(xmax) {
+            false
+        } else {
+            outcome(xmax) == TxOutcome::Committed
+        };
+        !deleted
     }
 
     /// Whether a row version with these stamps is visible.
@@ -118,6 +272,7 @@ impl Snapshot {
     /// `xmin` is the transaction that created the version and `xmax` the one
     /// that removed it, or [`NO_TX`] if none has. `outcome` resolves an id to
     /// its fate.
+    #[inline]
     pub fn sees(&self, xmin: TxId, xmax: TxId, outcome: &impl Fn(TxId) -> TxOutcome) -> bool {
         // Did this version's creation happen, from here?
         let created = if xmin == FROZEN_TX {
@@ -210,6 +365,207 @@ pub struct TransactionManager {
     /// so an unrelated in-place overwrite starting or finishing knocked the
     /// ten-thousand-row fast path back out to L3 mid-statement.
     last_writer: CacheGuard<AtomicU64>,
+    /// Every live snapshot's `xmin`. See [`SnapshotRegistry`].
+    snapshots: Arc<SnapshotRegistry>,
+    /// Settling the status log as the process runs: the next id at which a
+    /// commit or abort tries, how far apart tries are, and a latch so only one
+    /// committer settles at a time. See [`TransactionManager::maybe_settle`].
+    next_settle_at: AtomicU64,
+    settle_window: AtomicU64,
+    settling: std::sync::atomic::AtomicBool,
+    /// Which aborted ids every table has been proven free of. See
+    /// [`ForgetRegistry`].
+    forget: Arc<ForgetRegistry>,
+    /// The durable mark every id handed out stays below. Taken by `begin`
+    /// between the in-place latch and `inner`, and by nothing else. See
+    /// [`IdReservation`].
+    reservation: parking_lot::Mutex<IdReservation>,
+    /// The mark ids stopped being reserved at, while raising it fails:
+    /// `TxId::MAX` when it does not. A transaction at or above it may not
+    /// commit a write (see [`TransactionManager::check_ids_reserved`]). Set and
+    /// cleared under `reservation`, by the `begin` whose raise failed or
+    /// succeeded; read by every writing commit, so an atomic.
+    unreserved_from: AtomicU64,
+    /// Why the last raise failed, for the error a refused commit reports.
+    reservation_failure: parking_lot::Mutex<Option<ReservationFailure>>,
+    /// Woken when a transaction ends, for a conflict retry waiting on the
+    /// transaction it met (slice B6, finding L1; `rql::conflict_wait`).
+    /// Signalled only while `end_watchers` is non-zero, so a commit with
+    /// nobody waiting pays one atomic load.
+    ended: tokio::sync::Notify,
+    /// How many waits are watching [`TransactionManager::ended`].
+    end_watchers: AtomicUsize,
+    /// Statement owners O whose transaction has ended while their scope
+    /// still acts for them (slice B8b; see
+    /// [`TransactionManager::owner_outlives`]). Few, and only on a rare
+    /// path: a conflict retry, a failed statement, or a scope that goes on
+    /// after its first attempt committed.
+    outliving: parking_lot::Mutex<SmallVec<[TxId; 4]>>,
+    /// `outliving.len()`, so the common answer ("no owner outlives its
+    /// transaction") is one atomic load.
+    outliving_count: AtomicUsize,
+    /// Registrations ever made: diagnostic, and what the test that a
+    /// committing statement registers nothing reads.
+    outliving_total: AtomicU64,
+    /// The write tickets each lock owner keeps, one per file set it wrote
+    /// (docs/persistent-indexes.md §2 Ticket ownership, slice B11). Given
+    /// back by `RowLocks::release_owner`, with the owner's table locks.
+    family_tickets: crate::core::index_store::gate::FamilyTickets,
+    /// The database's row locks, for the write paths: a row an `UPDATE` or
+    /// `DELETE` is about to stamp is marked there first, so a `FOR UPDATE`
+    /// that locks it afterwards waits for the writer (`RowLocks::mark_row_writes`).
+    /// Weak: the row locks hold this manager.
+    row_locks: std::sync::OnceLock<std::sync::Weak<crate::core::mvcc::row_locks::RowLocks>>,
+}
+
+/// Counts one wait among [`TransactionManager`]'s end watchers until dropped.
+pub struct EndWatch<'a> {
+    manager: &'a TransactionManager,
+}
+
+impl EndWatch<'_> {
+    /// Resolves at the next transaction end after it is enabled (see
+    /// [`tokio::sync::Notified::enable`]); the caller re-checks what it is
+    /// waiting for, since any end wakes every watcher.
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.manager.ended.notified()
+    }
+}
+
+impl Drop for EndWatch<'_> {
+    fn drop(&mut self) {
+        self.manager.end_watchers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A failed raise of the id reservation (see [`IdReservation::cover`]).
+#[derive(Clone, Debug)]
+struct ReservationFailure {
+    /// The reservation file.
+    path: String,
+    /// The disk is full, which clients are told as `53100 disk_full`.
+    disk_full: bool,
+    /// The error, as written.
+    detail: String,
+}
+
+impl ReservationFailure {
+    fn of(reservation: &IdReservation, e: &std::io::Error) -> Self {
+        ReservationFailure {
+            path: reservation
+                .path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            disk_full: e.kind() == std::io::ErrorKind::StorageFull,
+            detail: e.to_string(),
+        }
+    }
+}
+
+/// Every versioned table's *forget horizon*: the id below which vacuum has
+/// proven the table's pointer records carry no stamp of a transaction that did
+/// not commit — aborted-insert versions tombstoned, aborted deletes' `xmax`
+/// cleared, durably, and every query that read a pointer from before the
+/// rewrite drained.
+///
+/// Below the minimum over all tables, no row anywhere carries an aborted id,
+/// so the status log may forget which ids aborted: an id nobody will ever ask
+/// about can be answered "committed". That is what bounds the settled history
+/// on a workload that aborts often.
+///
+/// **What makes the minimum sound:**
+/// * A table registers when its versioning is enabled — at open, at create,
+///   and on every reopen of existing files (rename, reload, `MOVE TABLE`) — at
+///   the horizon already forgotten, which the files it opens satisfy: they
+///   were part of a registered table when that horizon was reached.
+/// * A reopen drops one handle before registering the next, so it holds a
+///   [`ForgetPause`] across the gap; no advance happens while one is held.
+/// * A dropped table deregisters with its handle. Never-swept tables sit at
+///   the floor and pin the minimum — the safe default.
+#[derive(Debug, Default)]
+pub struct ForgetRegistry {
+    state: parking_lot::Mutex<ForgetState>,
+}
+
+#[derive(Debug, Default)]
+struct ForgetState {
+    next_handle: u64,
+    tables: std::collections::HashMap<u64, TxId>,
+    paused: usize,
+}
+
+/// One table's place in the [`ForgetRegistry`]; deregisters on drop.
+#[derive(Debug)]
+pub struct ForgetHandle {
+    registry: Arc<ForgetRegistry>,
+    id: u64,
+}
+
+impl ForgetHandle {
+    /// This table's horizon.
+    pub fn horizon(&self) -> TxId {
+        self.registry
+            .state
+            .lock()
+            .tables
+            .get(&self.id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Raises this table's horizon to `to` — only after a sweep below `to` is
+    /// durable and every reader that predates it has drained.
+    pub fn advance(&self, to: TxId) {
+        let mut state = self.registry.state.lock();
+        if let Some(h) = state.tables.get_mut(&self.id) {
+            *h = (*h).max(to);
+        }
+    }
+
+    /// Lowers this table's horizon to `to`, if it is above it
+    /// (docs/partitioning.md §7.2): what a partitioned table does when one of
+    /// its partitions takes a first stamp after being clean, or materializes,
+    /// whose pin the table's one handle must then cover. The status log never
+    /// un-forgets (`StatusLog::forget_below` only moves forward), so this is
+    /// sound only for a `to` at or below every id the new stamps can carry;
+    /// the caller lowers to `forgotten_below()` before its writer's first
+    /// stamp, and that writer's id is at least `oldest_active`, which the
+    /// forgotten horizon never passes. Under the registry lock, so no
+    /// `try_forget` reads a minimum between the old value and this one.
+    pub fn lower_to(&self, to: TxId) {
+        let mut state = self.registry.state.lock();
+        if let Some(h) = state.tables.get_mut(&self.id) {
+            *h = (*h).min(to);
+        }
+    }
+
+    /// Sets this table's horizon to exactly `to`, lowering or raising: a
+    /// partitioned table's handle follows the minimum of its partitions'
+    /// pins (§7.2), which a `SWEPT` raises and a `DIRTY` lowers.
+    /// `TxId::MAX` pins nothing. Raising carries [`Self::advance`]'s contract.
+    pub fn set(&self, to: TxId) {
+        let mut state = self.registry.state.lock();
+        if let Some(h) = state.tables.get_mut(&self.id) {
+            *h = to;
+        }
+    }
+}
+
+impl Drop for ForgetHandle {
+    fn drop(&mut self) {
+        self.registry.state.lock().tables.remove(&self.id);
+    }
+}
+
+/// Holds forgetting off while a table is being reopened. See [`ForgetRegistry`].
+pub struct ForgetPause {
+    registry: Arc<ForgetRegistry>,
+}
+
+impl Drop for ForgetPause {
+    fn drop(&mut self) {
+        self.registry.state.lock().paused -= 1;
+    }
 }
 
 /// Held for the duration of an in-place overwrite. While one exists,
@@ -242,7 +598,9 @@ impl std::fmt::Debug for InPlaceGuard {
 /// carrying on.
 #[inline]
 fn lock(mutex: &std::sync::Mutex<usize>) -> std::sync::MutexGuard<'_, usize> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Debug, Default)]
@@ -295,6 +653,11 @@ struct Inner {
     /// Ids are removed as their family retires, so this holds one entry per
     /// writing transaction currently in flight rather than a history.
     wrote: BTreeSet<TxId>,
+    /// Statement lock owners O ([`TransactionManager::begin_owner`]): running,
+    /// so they read `InProgress` and hold `oldest_active` and the status log's
+    /// settling below them, but they never take a snapshot, read or write.
+    /// The in-place gate looks past them; see `try_begin_in_place_for`.
+    owner_only: BTreeSet<TxId>,
 }
 
 impl TransactionManager {
@@ -302,7 +665,55 @@ impl TransactionManager {
     pub fn new(status: StatusLog) -> Self {
         // Ids resume above anything the previous run assigned, so an id is never
         // reused with a different meaning.
-        let next_id = status.highest_recorded().max(FIRST_TX - 1) + 1;
+        //
+        // The highest recorded outcome is not that bound on its own: `begin`
+        // records nothing durable and an abort's outcome is not synced, so a
+        // writer whose rows reached the disk can sit above it. Handed out
+        // again, its id made a new transaction read those rows as its own
+        // writes and commit them. The reservation is: every id any run handed
+        // out is below it.
+        let mut reservation = IdReservation::open_for(&status);
+        let recorded = status.highest_recorded().max(FIRST_TX - 1) + 1;
+        let next_id = if reservation.is_durable() {
+            recorded.max(reservation.reserved())
+        } else {
+            recorded
+        };
+
+        // Every id between the last recorded outcome and `next_id` may have
+        // been handed out and none of them committed: record them as the
+        // aborts they are. Not needed to keep them invisible — no `Committed`
+        // record means not committed, and settling and forgetting treat an
+        // unrecorded id below the bound as final — but without it they read as
+        // *in progress* once this run's records grow the bitmap over them,
+        // and a row one stamped looks like a live writer's for good. See
+        // `StatusLog::record_unfinished_as_aborted`. At most about a block of
+        // ids (plus read-only ids whose outcome was never flushed), recorded a
+        // byte at a time, and made durable here once rather than left to ride
+        // on the first commit.
+        if reservation.is_durable() && next_id > recorded {
+            status.record_unfinished_as_aborted(recorded, next_id);
+            if let Err(e) = status.flush() {
+                // Liveness only, as above: the next flush writes them.
+                log::warn!(
+                    "Could not record ids {}..{} of the previous run as aborted: {}",
+                    recorded,
+                    next_id,
+                    e
+                );
+            }
+        }
+        // Reserved now rather than by the first `begin`, so opening pays for
+        // it and the first statement does not. A failure here fails writes
+        // closed until a `begin` raises the mark, as one in `begin` does.
+        let covered = reservation.cover(next_id, status.wal().as_ref());
+        let failure = covered.err().map(|e| ReservationFailure::of(&reservation, &e));
+        let unreserved_from = if failure.is_some() {
+            reservation.reserved()
+        } else {
+            TxId::MAX
+        };
+
         TransactionManager {
             inner: RwLock::new(Inner {
                 next_id,
@@ -313,6 +724,7 @@ impl TransactionManager {
                 children: std::collections::BTreeMap::new(),
                 rolled_back: BTreeSet::new(),
                 wrote: BTreeSet::new(),
+                owner_only: BTreeSet::new(),
             }),
             next_id: AtomicU64::new(next_id).into(),
             status,
@@ -320,7 +732,142 @@ impl TransactionManager {
             in_place_done: std::sync::Condvar::new(),
             savepoints: AtomicUsize::new(0),
             last_writer: AtomicU64::new(NO_TX).into(),
+            snapshots: Arc::new(SnapshotRegistry::default()),
+            next_settle_at: AtomicU64::new(0),
+            settle_window: AtomicU64::new(super::status::DEFAULT_SETTLE_WINDOW),
+            settling: std::sync::atomic::AtomicBool::new(false),
+            forget: Arc::new(ForgetRegistry::default()),
+            reservation: parking_lot::Mutex::new(reservation),
+            unreserved_from: AtomicU64::new(unreserved_from),
+            reservation_failure: parking_lot::Mutex::new(failure),
+            ended: tokio::sync::Notify::new(),
+            end_watchers: AtomicUsize::new(0),
+            outliving: parking_lot::Mutex::new(SmallVec::new()),
+            outliving_count: AtomicUsize::new(0),
+            outliving_total: AtomicU64::new(0),
+            family_tickets: crate::core::index_store::gate::FamilyTickets::new(),
+            row_locks: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Ties the database's row locks to this manager, once.
+    pub fn set_row_locks(&self, row_locks: &std::sync::Arc<crate::core::mvcc::row_locks::RowLocks>) {
+        let _ = self.row_locks.set(std::sync::Arc::downgrade(row_locks));
+    }
+
+    /// The database's row locks, if tied ([`TransactionManager::set_row_locks`]).
+    pub fn row_locks(&self) -> Option<std::sync::Arc<crate::core::mvcc::row_locks::RowLocks>> {
+        self.row_locks.get().and_then(std::sync::Weak::upgrade)
+    }
+
+    /// The write tickets lock owners keep (see the field).
+    #[inline]
+    pub fn family_tickets(&self) -> &crate::core::index_store::gate::FamilyTickets {
+        &self.family_tickets
+    }
+
+    /// Watches transaction ends (see [`EndWatch`]) until the guard drops.
+    pub fn watch_ends(&self) -> EndWatch<'_> {
+        self.end_watchers.fetch_add(1, Ordering::SeqCst);
+        EndWatch { manager: self }
+    }
+
+    /// Wakes the end watchers, if there are any. After the outcome is
+    /// recorded and the family retired, so a woken waiter reads it ended.
+    #[inline]
+    fn signal_ended(&self) {
+        if self.end_watchers.load(Ordering::SeqCst) > 0 {
+            self.ended.notify_waiters();
+        }
+    }
+
+    /// Refuses to let `tx` commit a write when it, or a savepoint under it,
+    /// holds an id the reservation does not cover.
+    ///
+    /// A raise of the reservation that failed leaves the mark where it was,
+    /// and `begin` hands out ids above it anyway, so reads go on. A write
+    /// under such an id must not commit: a restart resumes at the mark and
+    /// hands the id out again, and its new owner reads the committed rows as
+    /// its own uncommitted writes. A disk that cannot take the reservation
+    /// usually cannot take the outcome either, so the rows reach the log, the
+    /// outcome does not, and nothing but a log line would say so. Refused, the
+    /// caller rolls the transaction back.
+    ///
+    /// Every writing commit passes here, through
+    /// `Database::commit_written_transaction`; a read-only one never does,
+    /// and needs no reservation, since nothing durable carries its id. One
+    /// atomic load while the reservation is healthy.
+    ///
+    /// An id below the mark is never refused, even one handed out while a
+    /// raise was failing: once a later raise succeeds, the mark on disk is
+    /// above it and a restart cannot reissue it.
+    pub fn check_ids_reserved(&self, tx: TxId) -> std::io::Result<()> {
+        let from = self.unreserved_from.load(Ordering::Acquire);
+        if from == TxId::MAX {
+            return Ok(());
+        }
+        let highest = self.family_of(tx).into_iter().max().unwrap_or(tx).max(tx);
+        if highest < from {
+            return Ok(());
+        }
+        // Read again with the failure: a raise since the load may have put
+        // the mark above this id (and a later failure may have set a new
+        // one). Both are written failure first, mark second, under
+        // `reservation`, so the pair read here is one that was set together
+        // or a newer mark.
+        let failure = self.reservation_failure.lock().clone();
+        let from = self.unreserved_from.load(Ordering::Acquire);
+        let Some(failure) = failure.filter(|_| from != TxId::MAX && highest >= from) else {
+            return Ok(());
+        };
+        let kind = if failure.disk_full {
+            std::io::ErrorKind::StorageFull
+        } else {
+            std::io::ErrorKind::Other
+        };
+        Err(std::io::Error::new(
+            kind,
+            format!(
+                "could not reserve transaction ids from {} in {}{}: {}. Transaction {} was \
+                 rolled back: committed under an id that is not reserved, its rows would be \
+                 taken as another transaction's after a restart",
+                from,
+                failure.path,
+                if failure.disk_full { " (the disk is full)" } else { "" },
+                failure.detail,
+                tx
+            ),
+        ))
+    }
+
+    /// Records how a raise of the reservation went. Called under
+    /// `reservation`, so a failure and the success after it are seen in order.
+    fn note_reservation(&self, reservation: &IdReservation, covered: std::io::Result<()>) {
+        match covered {
+            Ok(()) => {
+                if self.unreserved_from.load(Ordering::Acquire) != TxId::MAX {
+                    self.unreserved_from.store(TxId::MAX, Ordering::Release);
+                    *self.reservation_failure.lock() = None;
+                }
+            }
+            Err(e) => {
+                *self.reservation_failure.lock() = Some(ReservationFailure::of(reservation, &e));
+                self.unreserved_from
+                    .store(reservation.reserved(), Ordering::Release);
+            }
+        }
+    }
+
+    /// The durable reservation mark. Diagnostic; `TxId::MAX` when nothing is
+    /// persisted.
+    pub fn reserved_ids_below(&self) -> TxId {
+        self.reservation.lock().reserved()
+    }
+
+    /// Shrinks the reservation block, so tests can cross many marks.
+    #[cfg(test)]
+    pub(crate) fn set_reservation_block(&self, ids: u64) {
+        self.reservation.lock().set_block(ids);
     }
 
     /// A manager with no durable record, for tests and in-memory databases.
@@ -377,7 +924,14 @@ impl TransactionManager {
         // Read `running` while holding the latch, so no `begin` can land
         // between observing it empty and raising the count.
         let inner = self.inner.read();
-        if inner.running.iter().any(|id| *id != own) {
+        // A statement's lock owner O is running but holds no snapshot, so it
+        // cannot tell before from after: counting it would make every
+        // autocommit statement decline (its own O is always running).
+        if inner
+            .running
+            .iter()
+            .any(|id| *id != own && !inner.owner_only.contains(id))
+        {
             return None;
         }
         // Two separate conditions, and the second is easy to miss. "Nobody else
@@ -405,15 +959,116 @@ impl TransactionManager {
         })
     }
 
+    /// Takes `tx` out of the statement-scoped set, so no write of it is ever
+    /// an in-place overwrite again ([`Self::try_begin_in_place_for`]).
+    ///
+    /// For a statement that writes through statements of its own (`UPDATE …
+    /// FROM` writes each joined row back with a per-row `UPDATE`): each of
+    /// those commits its storage transaction as it returns, and a later one
+    /// can still fail the statement. An overwrite keeps no previous version,
+    /// so the abort that follows could not take it back: `p` kept two rows'
+    /// new values after an `UPDATE … FROM` reported 23514. A new version is
+    /// what the abort makes invisible.
+    pub fn forbid_in_place(&self, tx: TxId) {
+        self.inner.write().statement_scoped.remove(&tx);
+    }
+
     /// Starts a transaction that ends with the statement that opened it.
     ///
     /// This is autocommit. Marking it matters because such a transaction can
     /// never be rolled back after its statement returns, which is what makes the
     /// in-place fast path safe for it and unsafe for a `BEGIN` block.
     pub fn begin_autocommit(&self) -> TxId {
-        let id = self.begin();
-        self.inner.write().statement_scoped.insert(id);
-        id
+        self.begin_inner(true, false)
+    }
+
+    /// Begins an autocommit statement's lock owner O (docs/persistent-indexes.md
+    /// §7 Owner, slice B2): a real top-level id, so it reads `InProgress`
+    /// from here until [`TransactionManager::end_owner`], however many
+    /// attempts the statement makes under ids of their own, and the status
+    /// log can neither settle nor forget it meanwhile (it holds
+    /// `oldest_active` down, which bounds both).
+    ///
+    /// It never takes a snapshot, reads or writes: each attempt does that
+    /// under its own id, aliased to O for locks (`RowLocks::owner_alias`).
+    /// So the in-place gate does not count it as a reader.
+    pub fn begin_owner(&self) -> TxId {
+        self.begin_inner(true, true)
+    }
+
+    /// Ends an owner begun by [`TransactionManager::begin_owner`]. It wrote
+    /// nothing, so it commits with no durable record: a restart that finds
+    /// none reads it as aborted, which changes nothing.
+    pub fn end_owner(&self, o: TxId) {
+        debug_assert!(
+            !self.inner.read().wrote.contains(&o),
+            "the owner {o} stamped a version; only its attempts write"
+        );
+        self.commit(o);
+    }
+
+    /// Whether `tx` is an owner begun by [`TransactionManager::begin_owner`]
+    /// and still running.
+    pub fn is_owner_only(&self, tx: TxId) -> bool {
+        self.inner.read().owner_only.contains(&tx)
+    }
+
+    /// Registers `o`, an autocommit statement's owner O that is also its
+    /// first attempt's transaction (slice B8b, `owner::claim_attempt`), as
+    /// live for as long as its scope lasts, whatever that transaction's
+    /// outcome: called before the transaction ends while the scope goes on
+    /// (an attempt aborted for a conflict retry or a failure, or a scope that
+    /// acts for O again after its attempt committed), and undone by
+    /// [`TransactionManager::owner_released`] after the scope has released
+    /// O's locks. Idempotent.
+    ///
+    /// The lock manager asks [`TransactionManager::owner_live`] rather than
+    /// O's outcome: an aborted O still holds its statement's table locks and
+    /// is still a node of the wait-for graph while the statement retries.
+    pub fn owner_outlives(&self, o: TxId) {
+        let mut set = self.outliving.lock();
+        if !set.contains(&o) {
+            set.push(o);
+            self.outliving_count.store(set.len(), Ordering::Release);
+            self.outliving_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Ends [`TransactionManager::owner_outlives`] for `o`: its scope has
+    /// released everything it held.
+    pub fn owner_released(&self, o: TxId) {
+        let mut set = self.outliving.lock();
+        if let Some(at) = set.iter().position(|id| *id == o) {
+            set.swap_remove(at);
+            self.outliving_count.store(set.len(), Ordering::Release);
+        }
+    }
+
+    /// Whether `o` is registered by [`TransactionManager::owner_outlives`].
+    #[inline]
+    pub fn outlives(&self, o: TxId) -> bool {
+        self.outliving_count.load(Ordering::Acquire) > 0 && self.outliving.lock().contains(&o)
+    }
+
+    /// How many owners outlive their transaction. Diagnostic and for tests.
+    pub fn outliving_len(&self) -> usize {
+        self.outliving_count.load(Ordering::Acquire)
+    }
+
+    /// How many registrations [`TransactionManager::owner_outlives`] has
+    /// made. Diagnostic and for tests.
+    pub fn outliving_total(&self) -> u64 {
+        self.outliving_total.load(Ordering::Relaxed)
+    }
+
+    /// Whether an owner can still act (slice B8b): its transaction is in
+    /// progress, or its scope is open past that transaction's end
+    /// ([`TransactionManager::owner_outlives`]). What the wait-for graph
+    /// asks of a node; never what a row lock's holder (a transaction) is
+    /// asked.
+    #[inline]
+    pub fn owner_live(&self, o: TxId) -> bool {
+        self.outcome(o) == TxOutcome::InProgress || self.outlives(o)
     }
 
     /// Republishes the count [`TransactionManager::outcome`]'s lock-free path
@@ -421,8 +1076,10 @@ impl TransactionManager {
     /// `rolled_back` — those two are the whole of what `outcome` consults.
     #[inline]
     fn publish_savepoints(&self, inner: &Inner) {
-        self.savepoints
-            .store(inner.parent.len() + inner.rolled_back.len(), Ordering::Release);
+        self.savepoints.store(
+            inner.parent.len() + inner.rolled_back.len(),
+            Ordering::Release,
+        );
     }
 
     /// Takes `tx` and every savepoint under it out of the running set.
@@ -436,6 +1093,15 @@ impl TransactionManager {
     /// parent, whose outcome was just written.
     fn retire_family(&self, tx: TxId) {
         let mut inner = self.inner.write();
+        // The usual transaction opened no savepoint: its family is itself,
+        // with no sub-transaction outcome to write down. Retired here without
+        // building the family set, which allocated twice under this write
+        // lock on every statement's commit.
+        if inner.children.get(&tx).is_none_or(|kids| kids.is_empty()) && !inner.parent.contains_key(&tx) {
+            Self::forget_retired(&mut inner, tx);
+            self.publish_savepoints(&inner);
+            return;
+        }
         let family = Self::collect_family(&inner, tx);
 
         // Each sub-transaction's outcome is written down before its parent link
@@ -461,19 +1127,25 @@ impl TransactionManager {
         // `rolled_back` grow for the life of the process, one entry per
         // savepoint ever opened.
         for id in family {
-            inner.running.remove(&id);
-            inner.pinned.remove(&id);
-            inner.statement_scoped.remove(&id);
-            inner.rolled_back.remove(&id);
-            inner.wrote.remove(&id);
-            if let Some(parent) = inner.parent.remove(&id) {
-                if let Some(kids) = inner.children.get_mut(&parent) {
-                    kids.retain(|k| *k != id);
-                }
-            }
-            inner.children.remove(&id);
+            Self::forget_retired(&mut inner, id);
         }
         self.publish_savepoints(&inner);
+    }
+
+    /// Drops every record of `id`, which has retired.
+    fn forget_retired(inner: &mut Inner, id: TxId) {
+        inner.running.remove(&id);
+        inner.pinned.remove(&id);
+        inner.statement_scoped.remove(&id);
+        inner.rolled_back.remove(&id);
+        inner.wrote.remove(&id);
+        inner.owner_only.remove(&id);
+        if let Some(parent) = inner.parent.remove(&id) {
+            if let Some(kids) = inner.children.get_mut(&parent) {
+                kids.retain(|k| *k != id);
+            }
+        }
+        inner.children.remove(&id);
     }
 
     /// Opens a savepoint inside `parent` and returns the sub-transaction id that
@@ -523,6 +1195,9 @@ impl TransactionManager {
         inner.running.remove(&tx);
         inner.pinned.remove(&tx);
         self.publish_savepoints(&inner);
+        drop(inner);
+        // A conflict wait on one of its versions can go on now.
+        self.signal_ended();
     }
 
     /// Merges `tx` into its parent: its writes now stand or fall with it.
@@ -532,6 +1207,24 @@ impl TransactionManager {
     /// own, which the caller enforces by dropping it from the savepoint stack.
     pub fn release_savepoint(&self, tx: TxId) {
         self.inner.write().running.remove(&tx);
+    }
+
+    /// The top-level transaction `tx` belongs to: `tx` itself unless it is a
+    /// savepoint, in which case the transaction that opened its chain.
+    ///
+    /// Lock-free when no savepoint exists, which is nearly always. A caller can
+    /// only hold a savepoint id it was handed after the savepoint was
+    /// published, so the zero count cannot hide one from it.
+    pub fn top_level(&self, tx: TxId) -> TxId {
+        if self.savepoints.load(Ordering::Acquire) == 0 {
+            return tx;
+        }
+        let inner = self.inner.read();
+        let mut current = tx;
+        while let Some(parent) = inner.parent.get(&current).copied() {
+            current = parent;
+        }
+        current
     }
 
     /// Every id belonging to `tx`: itself, and every savepoint opened under it.
@@ -568,6 +1261,14 @@ impl TransactionManager {
     /// middle of one would read the new bytes for a row it is entitled to see
     /// unchanged. See [`TransactionManager::try_begin_in_place`].
     pub fn begin(&self) -> TxId {
+        self.begin_inner(false, false)
+    }
+
+    /// `begin`, optionally marking the transaction statement-scoped in the
+    /// same critical section — so no observer of `inner` can see an
+    /// autocommit transaction running but not yet statement-scoped, and the
+    /// begin takes the write lock once rather than twice.
+    fn begin_inner(&self, statement_scoped: bool, owner_only: bool) -> TxId {
         let mut in_place = lock(&self.in_place);
         while *in_place > 0 {
             in_place = self
@@ -579,12 +1280,53 @@ impl TransactionManager {
         // observe an empty `running` set that this call is about to fill.
         let _latched = in_place;
 
+        // The id is made durable as reserved *before* it is handed out, and
+        // with no lock a reader needs: the write is a sync, once a block.
+        // Holding `reservation` through the hand-out below is what makes the
+        // check exact: every write of `next_id` happens under it, so the value
+        // read here is the id `inner` gives out.
+        let mut reservation = self.reservation.lock();
+        let next = self.next_id.load(Ordering::Acquire);
+        if next >= reservation.reserved() {
+            // Retried by every `begin` while it fails: the mark stays below
+            // `next` until one succeeds.
+            let covered = reservation.cover(next, self.status.wal().as_ref());
+            self.note_reservation(&reservation, covered);
+        }
+
         let mut inner = self.inner.write();
         let id = inner.next_id;
+        debug_assert_eq!(id, next, "an id was handed out outside the reservation lock");
         inner.next_id += 1;
         inner.running.insert(id);
+        if statement_scoped {
+            inner.statement_scoped.insert(id);
+        }
+        if owner_only {
+            inner.owner_only.insert(id);
+        }
         self.next_id.store(inner.next_id, Ordering::Release);
         self.status.record(id, TxOutcome::InProgress);
+        id
+    }
+
+    /// Running transactions that are not statement-scoped. Test-only: the
+    /// invariant test below asserts it never counts an autocommit one.
+    #[cfg(test)]
+    fn running_not_scoped(&self) -> usize {
+        let inner = self.inner.read();
+        inner
+            .running
+            .iter()
+            .filter(|id| !inner.statement_scoped.contains(id))
+            .count()
+    }
+
+    /// The two-lock `begin_autocommit` this replaced, kept for the A/B bench.
+    #[cfg(test)]
+    fn begin_autocommit_two_locks(&self) -> TxId {
+        let id = self.begin();
+        self.inner.write().statement_scoped.insert(id);
         id
     }
 
@@ -620,6 +1362,10 @@ impl TransactionManager {
         if inner.wrote.contains(&tx) {
             return true;
         }
+        // No savepoint under it: nothing else can have written for it.
+        if inner.children.get(&tx).is_none_or(|kids| kids.is_empty()) {
+            return false;
+        }
         // A savepoint's writes are the transaction's writes. Checking only the
         // top-level id would call a block read-only because everything in it
         // was written inside a `SAVEPOINT`.
@@ -637,7 +1383,11 @@ impl TransactionManager {
     /// aborted.
     pub fn commit(&self, tx: TxId) {
         self.status.record(tx, TxOutcome::Committed);
+        #[cfg(test)]
+        commit_test_hooks::recorded(self, tx);
         self.retire_family(tx);
+        self.signal_ended();
+        self.maybe_settle();
     }
 
     /// Ends `tx` without effect. Its versions stay on disk until vacuumed, but
@@ -645,6 +1395,119 @@ impl TransactionManager {
     pub fn abort(&self, tx: TxId) {
         self.status.record(tx, TxOutcome::Aborted);
         self.retire_family(tx);
+        self.signal_ended();
+        self.maybe_settle();
+    }
+
+    /// The highest id the status log may settle below: the oldest running
+    /// transaction, and no higher than the oldest live snapshot's `xmin`.
+    ///
+    /// The first is what makes settling sound — every id below it has a
+    /// final, recorded outcome (`commit` and `abort` record before retiring)
+    /// and no new id can be assigned below it. The second is not needed for
+    /// outcomes, which no snapshot can change, but keeps the settled horizon
+    /// no further ahead than the version horizon (`VersionHorizon::sample`).
+    pub fn settle_bound(&self) -> TxId {
+        let running = self.oldest_active();
+        let snapshots = self.snapshots.oldest().unwrap_or(TxId::MAX);
+        running.min(snapshots)
+    }
+
+    /// Registers a table with the [`ForgetRegistry`], at the horizon already
+    /// forgotten.
+    pub fn register_table(&self) -> ForgetHandle {
+        let floor = self.status.forgotten_below();
+        let mut state = self.forget.state.lock();
+        state.next_handle += 1;
+        let id = state.next_handle;
+        state.tables.insert(id, floor);
+        ForgetHandle {
+            registry: Arc::clone(&self.forget),
+            id,
+        }
+    }
+
+    /// Holds forgetting off until the returned guard drops. For a reopen of a
+    /// table's existing files.
+    pub fn forget_pause(&self) -> ForgetPause {
+        self.forget.state.lock().paused += 1;
+        ForgetPause {
+            registry: Arc::clone(&self.forget),
+        }
+    }
+
+    /// Forgets which ids below every table's horizon aborted, if that has
+    /// moved. Returns the forgotten horizon.
+    ///
+    /// The minimum is taken and applied under the registry's lock, so no table
+    /// registers or pauses in between. Also capped by what the status log has
+    /// settled: only settled outcomes are forgotten.
+    pub fn try_forget(&self) -> TxId {
+        let state = self.forget.state.lock();
+        if state.paused > 0 {
+            return self.status.forgotten_below();
+        }
+        let min = state.tables.values().copied().min().unwrap_or(TxId::MAX);
+        let forgotten = self.status.forget_below(min);
+        self.assert_no_running_id_settled();
+        forgotten
+    }
+
+    /// Settles the status log up to [`Self::settle_bound`] now. Returns the
+    /// horizon reached.
+    pub fn settle_now(&self) -> TxId {
+        let reached = self.status.settle_below(self.settle_bound());
+        self.assert_no_running_id_settled();
+        reached
+    }
+
+    /// The status log never settles, and so never forgets, an id still in
+    /// progress: a statement's owner O must read `InProgress` for its whole
+    /// life (§7 Owner), and a block's root for its own. Settling is bounded by
+    /// `oldest_active`, which only rises, so the settled horizon stays at or
+    /// below the oldest running id.
+    #[inline]
+    fn assert_no_running_id_settled(&self) {
+        debug_assert!(
+            self.status.settled_below() <= self.oldest_active(),
+            "the status log settled past running id {} (settled below {})",
+            self.oldest_active(),
+            self.status.settled_below()
+        );
+    }
+
+    /// How often, in transaction ids, a commit tries to settle. Tests shrink it.
+    pub fn set_settle_window(&self, ids: u64) {
+        self.settle_window.store(ids.max(4096), Ordering::Relaxed);
+        self.next_settle_at.store(0, Ordering::Relaxed);
+    }
+
+    /// Keeps the status log's bitmap to roughly the transactions still in
+    /// play, so memory stops growing two bits per transaction ever run.
+    ///
+    /// Cheap when not due — one load and a compare — and tried at most once
+    /// per quarter window of ids; a horizon held back by a long transaction or
+    /// snapshot does not turn every commit into a settle attempt.
+    fn maybe_settle(&self) {
+        if !self.status.settles() {
+            return;
+        }
+        let next = self.next_id.load(Ordering::Acquire);
+        if next < self.next_settle_at.load(Ordering::Relaxed) {
+            return;
+        }
+        if self
+            .settling
+            .swap(true, Ordering::Acquire)
+        {
+            return;
+        }
+        let window = self.settle_window.load(Ordering::Relaxed);
+        self.next_settle_at.store(next + window / 4, Ordering::Relaxed);
+        if next.saturating_sub(self.status.settled_below()) >= window {
+            self.settle_now();
+        }
+        self.settling.store(false, Ordering::Release);
     }
 
     /// How `tx` ended.
@@ -696,9 +1559,23 @@ impl TransactionManager {
         // A transaction that pinned one reuses it, however many statements it
         // runs. This is what makes a repeated read repeatable.
         if let Some(pinned) = inner.pinned.get(&own) {
-            return pinned.clone();
+            if self.savepoints.load(Ordering::Acquire) == 0 {
+                return pinned.clone();
+            }
+            // What the snapshot *sees* is fixed; which ids are *mine* is not.
+            // A savepoint inherits its parent's pinned snapshot, whose family
+            // was the parent's at pin time, so a row written inside the
+            // savepoint — or inside one since released — carried an id the
+            // snapshot counted as somebody else's that started after it, and
+            // the transaction could not see its own insert. The family is
+            // therefore taken as it stands now.
+            let family = Self::family_locked(&inner, own);
+            let mut snapshot =
+                Snapshot::at_with_family(pinned.xmax, (*pinned.running).clone(), own, family);
+            snapshot.registration = pinned.registration.clone();
+            return snapshot;
         }
-        Self::snapshot_now_locked(&inner, own)
+        self.snapshot_now_locked(&inner, own)
     }
 
     /// A snapshot taken now for `own`, ignoring any it has pinned.
@@ -711,13 +1588,46 @@ impl TransactionManager {
     /// are in [`Self::snapshot`].
     pub fn snapshot_now(&self, own: TxId) -> Snapshot {
         let inner = self.inner.read();
-        Self::snapshot_now_locked(&inner, own)
+        self.snapshot_now_locked(&inner, own)
     }
 
-    fn snapshot_now_locked(inner: &Inner, own: TxId) -> Snapshot {
+    /// Registered while `inner` is still held, so no transaction can retire —
+    /// and move `oldest_active` past this snapshot's `xmin` — before the
+    /// registry covers it. With the order `VersionHorizon::sample` reads the
+    /// two in, that leaves no instant at which a live snapshot is covered by
+    /// neither.
+    fn snapshot_now_locked(&self, inner: &Inner, own: TxId) -> Snapshot {
+        let mut snapshot = Self::unregistered_snapshot_locked(inner, own);
+        snapshot.registration = Some(self.snapshots.register(snapshot.xmin));
+        snapshot
+    }
+
+    fn unregistered_snapshot_locked(inner: &Inner, own: TxId) -> Snapshot {
         // A transaction does not count itself as running: it sees its own
         // writes, which `Snapshot::sees` handles through `own`, and listing it
         // here would only make the fast path fire less often.
+        //
+        // With no savepoint open anywhere, `own`'s family is `own` alone
+        // (`family_locked` would walk an empty `parent` and return just it),
+        // so the set is not built. This runs under `inner`'s read lock on
+        // every statement, which writers (`begin`, `retire_family`) wait on.
+        if own != NO_TX && inner.parent.is_empty() {
+            let running: BTreeSet<TxId> = inner.running.iter().copied().filter(|id| *id != own).collect();
+            return Snapshot::at_own(inner.next_id, running, own);
+        }
+        let family = Self::family_locked(inner, own);
+        let running: BTreeSet<TxId> = inner
+            .running
+            .iter()
+            .copied()
+            .filter(|id| !family.contains(id))
+            .collect();
+        Snapshot::at_with_family(inner.next_id, running, own, family)
+    }
+
+    /// Every id `own` counts as its own: itself, the savepoints under it, and
+    /// the transactions it is a savepoint of.
+    fn family_locked(inner: &Inner, own: TxId) -> BTreeSet<TxId> {
         let mut family = BTreeSet::new();
         if own != NO_TX {
             family.insert(own);
@@ -741,9 +1651,7 @@ impl TransactionManager {
                 }
             }
         }
-        let running: BTreeSet<TxId> =
-            inner.running.iter().copied().filter(|id| !family.contains(id)).collect();
-        Snapshot::at_with_family(inner.next_id, running, own, family)
+        family
     }
 
     /// Fixes `tx`'s snapshot for its whole life, rather than one per statement.
@@ -762,6 +1670,17 @@ impl TransactionManager {
         self.inner.read().pinned.contains_key(&tx)
     }
 
+    /// The lowest `xmin` of any live snapshot. A version deleted by a
+    /// transaction at or above it may still be visible to that snapshot.
+    pub fn oldest_snapshot_xmin(&self) -> Option<TxId> {
+        self.snapshots.oldest()
+    }
+
+    /// Live snapshots. Diagnostic.
+    pub fn live_snapshots(&self) -> usize {
+        self.snapshots.len()
+    }
+
     /// The oldest transaction still running, or the next id to be assigned if
     /// none is.
     ///
@@ -770,7 +1689,43 @@ impl TransactionManager {
     /// taken — which is what makes it safe to reclaim.
     pub fn oldest_active(&self) -> TxId {
         let inner = self.inner.read();
-        inner.running.iter().next().copied().unwrap_or(inner.next_id)
+        inner
+            .running
+            .iter()
+            .next()
+            .copied()
+            .unwrap_or(inner.next_id)
+    }
+
+    /// Whether `tx` is still in the running set: begun and not yet retired.
+    ///
+    /// Not the same as an outcome of `InProgress`. [`Self::commit`] records
+    /// the outcome first and retires the transaction after it, and a snapshot
+    /// taken in between still lists `tx` as running, so it does not see the
+    /// commit. A locker that let a writer's row mark go in that window kept
+    /// a row whose latest version no snapshot it could take yet would show
+    /// (`acquire_row_lock` in the executor).
+    pub fn is_running(&self, tx: TxId) -> bool {
+        self.inner.read().running.contains(&tx)
+    }
+
+    /// Whether `tx` has yet to end for a reader: in progress, or committed
+    /// but not yet retired, so a snapshot taken now still cannot see its
+    /// writes ([`Self::is_running`]). An abort is final at once: an aborted
+    /// write is invisible to every snapshot, retired or not.
+    ///
+    /// What a wait or a lock handover must ask before acting on a read it
+    /// takes next. Asking whether the outcome is `InProgress` handed on a
+    /// row lock, a referenced key and a conflict wait in the window between
+    /// a commit's record and its retirement, and the reader that followed
+    /// read the rows as they were before the commit
+    /// (`rql::row_lock_handover_tests`).
+    pub fn unfinished(&self, tx: TxId) -> bool {
+        match self.outcome(tx) {
+            TxOutcome::InProgress => true,
+            TxOutcome::Committed => tx != FROZEN_TX && self.is_running(tx),
+            TxOutcome::Aborted => false,
+        }
     }
 
     /// One past the highest id assigned so far.
@@ -801,9 +1756,20 @@ impl TransactionManager {
         self.inner.read().running.is_empty()
     }
 
+    /// The log the status log stages outcomes in: the database root's.
+    pub fn status_wal(&self) -> Option<std::sync::Arc<crate::core::wal::Wal>> {
+        self.status.wal()
+    }
+
     /// Flushes the durable record of outcomes.
     pub fn flush(&self) -> std::io::Result<()> {
         self.status.flush()
+    }
+
+    /// Makes every outcome recorded so far durable, whoever staged it. See
+    /// [`StatusLog::flush_all`].
+    pub fn flush_all(&self) -> std::io::Result<()> {
+        self.status.flush_all()
     }
 
     /// Writes the outcome records without syncing them.
@@ -814,6 +1780,12 @@ impl TransactionManager {
     /// See [`StatusLog::flush_deferred`].
     pub fn flush_deferred(&self) -> std::io::Result<()> {
         self.status.flush_deferred()
+    }
+
+    /// The log every transaction outcome is recorded in: the database's own
+    /// (root) log, or `None` when outcomes go straight to a synced file.
+    pub fn outcome_log(&self) -> Option<std::sync::Arc<crate::core::wal::Wal>> {
+        self.status.outcome_wal()
     }
 
     /// Copies staged outcome bytes into the file, once the log holds them.
@@ -834,6 +1806,55 @@ impl TransactionManager {
 
     pub fn status(&self) -> &StatusLog {
         &self.status
+    }
+}
+
+/// A test's hold on a commit between its two halves: the outcome recorded,
+/// the transaction not yet retired from the running set
+/// ([`TransactionManager::commit`]).
+#[cfg(test)]
+pub(crate) mod commit_test_hooks {
+    use super::{TransactionManager, TxId};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    /// Keyed by the manager's address as well as the id: tests run in
+    /// parallel, each database counting its ids from the same start.
+    static HOOKS: Mutex<Vec<(usize, TxId, Hook)>> = Mutex::new(Vec::new());
+    /// `HOOKS.len()`, so a commit with no hook armed anywhere (every commit
+    /// of every other test) skips the process-wide mutex.
+    static ARMED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Runs `hook` once, on the thread committing `tx` under `manager`, after
+    /// its outcome is recorded and before it is retired.
+    pub(crate) fn after_record(manager: &TransactionManager, tx: TxId, hook: impl Fn() + Send + Sync + 'static) {
+        let key = manager as *const TransactionManager as usize;
+        let mut hooks = HOOKS.lock().unwrap();
+        hooks.push((key, tx, Arc::new(hook)));
+        ARMED.store(hooks.len(), Ordering::Release);
+    }
+
+    pub(super) fn recorded(manager: &TransactionManager, tx: TxId) {
+        // Armed before the commit it is for begins, by the thread that then
+        // starts that commit, so this load sees it.
+        if ARMED.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let key = manager as *const TransactionManager as usize;
+        let hook = {
+            let mut hooks = HOOKS.lock().unwrap();
+            let hook = hooks
+                .iter()
+                .position(|(m, t, _)| *m == key && *t == tx)
+                .map(|at| hooks.swap_remove(at).2);
+            ARMED.store(hooks.len(), Ordering::Release);
+            hook
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
 
@@ -862,7 +1883,10 @@ mod tests {
     fn a_transaction_that_wrote_nothing_is_not_a_writer() {
         let m = TransactionManager::in_memory();
         let reader = m.begin_autocommit();
-        assert!(!m.wrote_family(reader), "a transaction that wrote nothing counted as a writer");
+        assert!(
+            !m.wrote_family(reader),
+            "a transaction that wrote nothing counted as a writer"
+        );
     }
 
     #[test]
@@ -891,7 +1915,10 @@ mod tests {
 
         assert!(m.wrote_family(a));
         assert!(m.wrote_family(b));
-        assert!(!m.wrote_family(c), "a transaction that never wrote counted as a writer");
+        assert!(
+            !m.wrote_family(c),
+            "a transaction that never wrote counted as a writer"
+        );
     }
 
     /// Writes made inside a `SAVEPOINT` carry the sub-transaction's id, so a
@@ -906,7 +1933,10 @@ mod tests {
 
         m.mark_wrote(sub);
 
-        assert!(m.wrote_family(parent), "the parent of a writing savepoint read as read-only");
+        assert!(
+            m.wrote_family(parent),
+            "the parent of a writing savepoint read as read-only"
+        );
     }
 
     /// The neither-real ids are never retired, so an entry for one would never
@@ -930,7 +1960,10 @@ mod tests {
         assert!(m.wrote_family(writer));
 
         m.commit(writer);
-        assert!(!m.wrote_family(writer), "the entry outlived the transaction");
+        assert!(
+            !m.wrote_family(writer),
+            "the entry outlived the transaction"
+        );
     }
 
     #[test]
@@ -963,8 +1996,14 @@ mod tests {
         let me = m.begin();
         let s = m.snapshot(me);
 
-        assert!(s.sees(me, NO_TX, &resolver(&m)), "an INSERT must be visible to the SELECT after it");
-        assert!(!s.sees(me, me, &resolver(&m)), "and a row it then deleted must not be");
+        assert!(
+            s.sees(me, NO_TX, &resolver(&m)),
+            "an INSERT must be visible to the SELECT after it"
+        );
+        assert!(
+            !s.sees(me, me, &resolver(&m)),
+            "and a row it then deleted must not be"
+        );
     }
 
     #[test]
@@ -1029,7 +2068,10 @@ mod tests {
         assert!(m.snapshot(NO_TX).sees_everything());
 
         let running = m.begin();
-        assert!(!m.snapshot(NO_TX).sees_everything(), "someone else is mid-write");
+        assert!(
+            !m.snapshot(NO_TX).sees_everything(),
+            "someone else is mid-write"
+        );
         // A transaction does not block its own fast path.
         assert!(m.snapshot(running).sees_everything());
 
@@ -1061,7 +2103,11 @@ mod tests {
         assert_eq!(m.oldest_active(), first);
 
         m.commit(first);
-        assert_eq!(m.oldest_active(), second, "the bound advances as the oldest ends");
+        assert_eq!(
+            m.oldest_active(),
+            second,
+            "the bound advances as the oldest ends"
+        );
 
         m.commit(second);
         assert_eq!(m.oldest_active(), m.next_id());
@@ -1120,7 +2166,10 @@ mod savepoint_tests {
 
         let s = m.snapshot(sp);
         assert!(s.sees(sp, NO_TX, &resolver(&m)), "its own write");
-        assert!(s.sees(outer, NO_TX, &resolver(&m)), "and one made before the savepoint");
+        assert!(
+            s.sees(outer, NO_TX, &resolver(&m)),
+            "and one made before the savepoint"
+        );
     }
 
     /// The point of the whole thing: rolling back to a savepoint discards what
@@ -1133,8 +2182,14 @@ mod savepoint_tests {
         m.rollback_savepoint(sp);
 
         let s = m.snapshot(outer);
-        assert!(!s.sees(sp, NO_TX, &resolver(&m)), "the savepoint's write is gone");
-        assert!(s.sees(outer, NO_TX, &resolver(&m)), "the earlier write is not");
+        assert!(
+            !s.sees(sp, NO_TX, &resolver(&m)),
+            "the savepoint's write is gone"
+        );
+        assert!(
+            s.sees(outer, NO_TX, &resolver(&m)),
+            "the earlier write is not"
+        );
     }
 
     /// A delete made inside a rolled-back savepoint did not happen, so the row
@@ -1163,7 +2218,10 @@ mod savepoint_tests {
 
         let s = m.snapshot(outer);
         assert!(!s.sees(first, NO_TX, &resolver(&m)));
-        assert!(!s.sees(second, NO_TX, &resolver(&m)), "the nested one went with it");
+        assert!(
+            !s.sees(second, NO_TX, &resolver(&m)),
+            "the nested one went with it"
+        );
         assert!(s.sees(outer, NO_TX, &resolver(&m)));
     }
 
@@ -1180,7 +2238,10 @@ mod savepoint_tests {
         assert!(!m.snapshot(NO_TX).sees(sp, NO_TX, &resolver(&m)));
 
         m.commit(outer);
-        assert!(m.snapshot(NO_TX).sees(sp, NO_TX, &resolver(&m)), "released work commits with it");
+        assert!(
+            m.snapshot(NO_TX).sees(sp, NO_TX, &resolver(&m)),
+            "released work commits with it"
+        );
     }
 
     /// And it aborts with its parent, released or not.
@@ -1222,7 +2283,11 @@ mod savepoint_tests {
         m.commit(other);
 
         let sp = m.begin_savepoint(outer);
-        assert_eq!(m.snapshot(sp).xmax, before, "the savepoint widened the view");
+        assert_eq!(
+            m.snapshot(sp).xmax,
+            before,
+            "the savepoint widened the view"
+        );
         assert!(!m.snapshot(sp).sees(other, NO_TX, &resolver(&m)));
     }
 
@@ -1267,7 +2332,11 @@ mod savepoint_leaks {
             }
 
             assert!(m.quiescent(), "savepoints outlived their transaction");
-            assert_eq!(m.oldest_active(), m.next_id(), "the reclamation bound is stuck");
+            assert_eq!(
+                m.oldest_active(),
+                m.next_id(),
+                "the reclamation bound is stuck"
+            );
         }
     }
 
@@ -1347,6 +2416,186 @@ mod savepoint_durability {
 }
 
 #[cfg(test)]
+mod id_reservation {
+    use super::*;
+    use crate::core::mvcc::status::read_reservation;
+
+    fn status_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("db_transactions.status")
+    }
+
+    /// The property the whole mechanism rests on: when `begin` returns an id,
+    /// the mark *on disk* is already above it. Checked after every `begin`
+    /// across many small blocks, so an implementation that hands the id out
+    /// first and raises the mark afterwards fails at the first crossing.
+    #[test]
+    fn every_id_is_reserved_on_disk_before_it_is_handed_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = status_path(dir.path());
+        let m = TransactionManager::new(StatusLog::open(&path).expect("open"));
+        m.set_reservation_block(8);
+        // Use up the block the open reserved at full size.
+        assert!(read_reservation(&path).expect("reserved at open") > m.next_id());
+        while m.next_id() < m.reserved_ids_below() {
+            let id = m.begin();
+            m.abort(id);
+        }
+        let mut crossings = 0;
+        let mut last_mark = read_reservation(&path).expect("reserved at open");
+        for _ in 0..100 {
+            let id = m.begin();
+            let mark = read_reservation(&path).expect("a valid mark");
+            assert!(id < mark, "id {id} was handed out with only {mark} reserved on disk");
+            if mark != last_mark {
+                crossings += 1;
+                last_mark = mark;
+            }
+            m.abort(id);
+        }
+        assert!(crossings >= 10, "only {crossings} reservations were written");
+    }
+
+    /// An open resumes at or above the mark, even when no outcome above the
+    /// last one was ever recorded: the ids in between were handed out.
+    #[test]
+    fn a_reopen_never_reissues_an_id_with_no_recorded_outcome() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = status_path(dir.path());
+        let committed;
+        let mut issued = Vec::new();
+        {
+            let m = TransactionManager::new(StatusLog::open(&path).expect("open"));
+            committed = m.begin();
+            m.commit(committed);
+            m.flush().expect("flush");
+            // Writers that never record an outcome: rolled back in memory
+            // only, or still running when the process stops.
+            for _ in 0..5 {
+                issued.push(m.begin());
+            }
+            let rolled_back = m.begin();
+            m.abort(rolled_back);
+            issued.push(rolled_back);
+        }
+        let m = TransactionManager::new(StatusLog::open(&path).expect("reopen"));
+        let next = m.begin();
+        let highest = *issued.iter().max().unwrap();
+        assert!(
+            next > highest,
+            "id {next} handed out again after a restart (ids up to {highest} were issued)"
+        );
+        // And every id the last run left unfinished reads as aborted, not as
+        // a writer still in flight.
+        for id in issued {
+            assert_eq!(m.outcome(id), TxOutcome::Aborted, "id {id}");
+        }
+        assert_eq!(m.outcome(committed), TxOutcome::Committed);
+    }
+
+    /// The same across many restarts that each leave unfinished ids behind,
+    /// including restarts that cross several blocks.
+    #[test]
+    fn ids_only_move_forward_across_many_restarts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = status_path(dir.path());
+        let mut highest = 0;
+        for round in 0..20u64 {
+            let m = TransactionManager::new(StatusLog::open(&path).expect("open"));
+            m.set_reservation_block(4);
+            for k in 0..(round % 7) * 3 + 1 {
+                let id = m.begin();
+                assert!(id > highest, "round {round}: id {id} reissued (had {highest})");
+                highest = id;
+                // Some commits, but never the last id of a round: that
+                // one is left with no outcome, as a rolled-back block is.
+                if k % 3 == 1 {
+                    m.commit(id);
+                    m.flush().expect("flush");
+                }
+            }
+        }
+    }
+
+    /// Concurrent `begin`s never share an id and never get ahead of the mark.
+    #[test]
+    fn concurrent_begins_stay_unique_and_reserved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = status_path(dir.path());
+        let m = Arc::new(TransactionManager::new(StatusLog::open(&path).expect("open")));
+        m.set_reservation_block(16);
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let m = Arc::clone(&m);
+                std::thread::spawn(move || {
+                    let mut ids = Vec::new();
+                    for _ in 0..300 {
+                        let id = m.begin();
+                        assert!(id < m.reserved_ids_below());
+                        ids.push(id);
+                        m.abort(id);
+                    }
+                    ids
+                })
+            })
+            .collect();
+        let mut all: Vec<TxId> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n, "two begins got the same id");
+        let mark = read_reservation(&path).expect("a valid mark");
+        assert!(*all.last().unwrap() < mark);
+    }
+
+    /// Through a write-ahead log, the mark is a logged write: if the file's
+    /// own bytes never reach the disk, replay puts them back. This is also
+    /// what carries the mark through a point-in-time restore.
+    #[test]
+    fn a_logged_mark_is_restored_by_replay() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = status_path(dir.path());
+        let dir_str = dir.path().to_str().unwrap().to_string();
+        let mark = {
+            let wal = Arc::new(
+                crate::core::wal::Wal::open(dir.path().join(crate::core::wal::DEFAULT_WAL_NAME))
+                    .expect("wal"),
+            );
+            let status = StatusLog::open(&path).expect("open");
+            status.attach_wal(wal).unwrap();
+            let m = TransactionManager::new(status);
+            m.set_reservation_block(8);
+            for _ in 0..30 {
+                let id = m.begin();
+                m.abort(id);
+            }
+            m.reserved_ids_below()
+        };
+        assert_eq!(read_reservation(&path), Some(mark));
+        // The file's write lost, as an unsynced page can be.
+        let file = crate::core::mvcc::status::reservation_path(&path);
+        std::fs::write(&file, [0u8; 20]).unwrap();
+        assert_eq!(read_reservation(&path), None);
+
+        let (_wal, stats) = crate::core::wal::open_and_recover(&dir_str).expect("recover");
+        assert!(stats.applied > 0, "nothing was replayed");
+        assert_eq!(read_reservation(&path), Some(mark), "replay did not restore the mark");
+        let m = TransactionManager::new(StatusLog::open(&path).expect("reopen"));
+        assert!(m.begin() >= mark);
+    }
+
+    /// An in-memory manager writes no file and never blocks on one.
+    #[test]
+    fn an_in_memory_manager_reserves_nothing() {
+        let m = TransactionManager::in_memory();
+        assert_eq!(m.reserved_ids_below(), TxId::MAX);
+        for _ in 0..1000 {
+            let id = m.begin();
+            m.commit(id);
+        }
+    }
+}
+
+#[cfg(test)]
 mod savepoint_bookkeeping {
     use super::*;
 
@@ -1393,5 +2642,92 @@ mod savepoint_bookkeeping {
             m.commit(outer);
         }
         assert_eq!(m.bookkeeping_entries(), 0);
+    }
+
+    /// A savepoint opened inside a `REPEATABLE READ` transaction shares its
+    /// parent's pinned snapshot — and must still see its own writes.
+    #[test]
+    fn a_savepoint_under_a_pinned_snapshot_sees_its_own_writes() {
+        let m = TransactionManager::in_memory();
+        let t = m.begin();
+        m.pin_snapshot(t);
+        let sub = m.begin_savepoint(t);
+        let snap = m.snapshot(sub);
+        let outcome = |id: TxId| m.outcome(id);
+        assert!(snap.sees(sub, NO_TX, &outcome), "a row the savepoint wrote");
+        assert!(snap.sees(t, NO_TX, &outcome), "a row written before the savepoint");
+        assert!(!snap.sees(t, sub, &outcome), "a row the savepoint deleted");
+    }
+
+    /// An autocommit transaction is statement-scoped from the instant it is
+    /// running. With the two-lock begin an observer between the locks saw it
+    /// running and not scoped.
+    #[test]
+    fn an_autocommit_transaction_is_never_running_unscoped() {
+        use std::sync::atomic::AtomicBool;
+        let m = std::sync::Arc::new(TransactionManager::in_memory());
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let m = m.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let tx = m.begin_autocommit();
+                        m.commit(tx);
+                    }
+                })
+            })
+            .collect();
+        let mut seen = 0usize;
+        for _ in 0..200_000 {
+            seen += m.running_not_scoped();
+        }
+        stop.store(true, Ordering::Relaxed);
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert_eq!(seen, 0, "an autocommit transaction was observed running but not scoped");
+    }
+
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored autocommit_begin_throughput --nocapture`
+    #[test]
+    #[ignore]
+    fn autocommit_begin_throughput() {
+        for clients in [16usize, 32] {
+            for round in 0..3 {
+                for two_locks in [true, false] {
+                    let m = std::sync::Arc::new(TransactionManager::in_memory());
+                    let per = 50_000usize;
+                    let t = std::time::Instant::now();
+                    let workers: Vec<_> = (0..clients)
+                        .map(|_| {
+                            let m = m.clone();
+                            std::thread::spawn(move || {
+                                for _ in 0..per {
+                                    let tx = if two_locks {
+                                        m.begin_autocommit_two_locks()
+                                    } else {
+                                        m.begin_autocommit()
+                                    };
+                                    m.commit(tx);
+                                }
+                            })
+                        })
+                        .collect();
+                    for w in workers {
+                        w.join().unwrap();
+                    }
+                    let rate = (clients * per) as f64 / t.elapsed().as_secs_f64();
+                    println!(
+                        "clients {:>2} round {} {:>9}: {:>10.0} begin+commit/s",
+                        clients,
+                        round,
+                        if two_locks { "two locks" } else { "one lock" },
+                        rate
+                    );
+                }
+            }
+        }
     }
 }

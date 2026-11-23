@@ -7,21 +7,33 @@
 //! CTE is an optimisation fence, evaluated once however many times it is
 //! referenced. That is a position worth documenting rather than an accident.
 //!
-//! `WITH RECURSIVE` is **refused by keyword**, before anything else looks at
-//! the statement. A recursive CTE run as a non-recursive one does not fail: it
-//! computes the base case, stops, and returns a shorter answer to a well-formed
-//! query. Silently wrong results are worse than an unsupported feature.
+//! `WITH RECURSIVE` is run as PostgreSQL runs it: the non-recursive term
+//! once, then the recursive term again and again over the rows the last
+//! iteration added (a working table), until an iteration adds none
+//! ([`materialize_recursive`]). A definition is recursive only when the
+//! clause says `RECURSIVE` and its body names itself; run as a plain CTE it
+//! would compute the base case and return a shorter answer with no error.
 
 use rclite::Arc;
 
 use crate::core::database::Database;
 use crate::core::db_type::DbType;
+use crate::core::row::schema::SchemaField;
+
+/// The columns of a relation that exists only while one statement is
+/// described: a CTE or a derived table, resolved from its own query.
+pub(crate) type ScratchFields = smallvec::SmallVec<[SchemaField; 20]>;
 
 /// One `name AS ( body )` definition.
 #[derive(Debug)]
 pub struct CteDef {
     pub name: String,
     pub body: String,
+    /// `name (a, b) AS (…)`: the names its columns take, in order.
+    pub columns: Option<Vec<String>>,
+    /// Written under `WITH RECURSIVE`: the body may name the definition
+    /// itself.
+    pub recursive: bool,
 }
 
 /// A statement whose CTEs have been materialised.
@@ -37,8 +49,11 @@ pub struct Materialized {
 fn starts_with_with(sql: &str) -> bool {
     let t = sql.trim_start();
     t.len() >= 4
-        && t[..4].eq_ignore_ascii_case("WITH")
-        && t[4..].chars().next().is_some_and(|c| c.is_whitespace() || c == '(')
+        && t.as_bytes()[..4].eq_ignore_ascii_case(b"WITH")
+        && t[4..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '(')
 }
 
 /// Index just past the parenthesis matching the one at `open`, ignoring
@@ -85,18 +100,12 @@ pub fn split_with(sql: &str) -> Result<Option<(Vec<CteDef>, String)>, String> {
     let trimmed = sql.trim_start();
     let after_with = trimmed[4..].trim_start();
 
-    // Refused by keyword, deliberately before any other check: run as a
-    // non-recursive CTE this would return the base case and no error.
-    if after_with.len() >= 9
-        && after_with[..9].eq_ignore_ascii_case("RECURSIVE")
-        && after_with[9..].chars().next().is_some_and(|c| c.is_whitespace())
-    {
-        return Err(
-            "WITH RECURSIVE is not supported yet; refusing rather than returning only the \
-             base case"
-                .to_string(),
-        );
-    }
+    // `WITH RECURSIVE` applies to every definition of the clause; which of
+    // them actually recurse is decided by whether a body names itself.
+    let recursive = after_with.len() >= 9
+        && after_with.as_bytes()[..9].eq_ignore_ascii_case(b"RECURSIVE")
+        && after_with[9..].chars().next().is_some_and(|c| c.is_whitespace());
+    let after_with = if recursive { after_with[9..].trim_start() } else { after_with };
 
     let mut rest = after_with;
     let mut defs: Vec<CteDef> = Vec::new();
@@ -110,13 +119,22 @@ pub fn split_with(sql: &str) -> Result<Option<(Vec<CteDef>, String)>, String> {
         if name.is_empty() {
             return Err("a WITH clause names no query".to_string());
         }
-        let after_name = rest[name_end..].trim_start();
+        let mut after_name = rest[name_end..].trim_start();
+        let mut columns = None;
         if after_name.starts_with('(') {
-            return Err(
-                "a WITH clause that renames its columns is not supported yet".to_string()
-            );
+            let open = after_name.as_ptr() as usize - rest.as_ptr() as usize;
+            let close = matching_paren(rest, open).ok_or_else(|| format!("unterminated column list for '{}'", name))?;
+            let list: Vec<String> = rest[open + 1..close]
+                .split(',')
+                .map(|c| c.trim().trim_matches('"').to_string())
+                .collect();
+            if list.iter().any(|c| c.is_empty() || !c.chars().all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '$')) {
+                return Err(format!("syntax error in the column list of the WITH clause '{}'", name));
+            }
+            columns = Some(list);
+            after_name = rest[close + 1..].trim_start();
         }
-        if after_name.len() < 2 || !after_name[..2].eq_ignore_ascii_case("AS") {
+        if after_name.len() < 2 || !after_name.as_bytes()[..2].eq_ignore_ascii_case(b"AS") {
             return Err(format!("expected AS after the WITH name '{}'", name));
         }
         let after_as = after_name[2..].trim_start();
@@ -130,9 +148,15 @@ pub fn split_with(sql: &str) -> Result<Option<(Vec<CteDef>, String)>, String> {
         if body.is_empty() {
             return Err(format!("the WITH clause '{}' has an empty body", name));
         }
-        defs.push(CteDef { name, body });
+        defs.push(CteDef { name, body, columns, recursive });
 
         let after_body = rest[close + 1..].trim_start();
+        // PostgreSQL 14's `SEARCH` and `CYCLE` clauses: refused, as running
+        // the CTE without them would loop or order differently.
+        let next_word = after_body.split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
+        if next_word.eq_ignore_ascii_case("SEARCH") || next_word.eq_ignore_ascii_case("CYCLE") {
+            return Err(format!("the {} clause of a recursive WITH query is not supported yet", next_word.to_ascii_uppercase()));
+        }
         if let Some(next) = after_body.strip_prefix(',') {
             rest = next.trim_start();
             continue;
@@ -151,31 +175,81 @@ fn item_label(item: &str) -> Option<String> {
     if item.is_empty() {
         return None;
     }
-    // ` AS name` at the top level.
-    let upper = item.to_ascii_uppercase();
+    match split_alias(item) {
+        (_, Some(alias)) => Some(alias.to_string()),
+        // Otherwise the name PostgreSQL gives the item: a cast's type
+        // (`'x'::text` is `text`), a call's function (`upper`). Only an
+        // item it names `?column?` is left unnamed: refused, and the client
+        // told to alias it. These were all refused, so `WITH c AS (SELECT
+        // 'x'::text) SELECT * FROM c` failed where PostgreSQL answers.
+        (expression, None) => bare_column(expression).or_else(|| {
+            // A star names no single column; `select_labels` expands it.
+            let star = expression.trim() == "*" || expression.trim().ends_with(".*");
+            let name = crate::core::rql::join::pg_column_name(expression);
+            (!star && name != "?column?").then_some(name)
+        }),
+    }
+}
+
+/// A select list past a leading `DISTINCT`, `DISTINCT ON (…)` or `ALL`,
+/// which belong to the statement and not to its first item: `SELECT DISTINCT
+/// a` names its column `a`, as PostgreSQL does. Read as part of the item, the
+/// first column was `DISTINCT a`, which names nothing, and a derived table or
+/// a `WITH` over it was refused as having "a column this cannot name".
+pub(crate) fn without_set_quantifier(list: &str) -> &str {
+    let trimmed = list.trim_start();
+    let word = |w: &str| {
+        trimmed.len() > w.len()
+            && trimmed.as_bytes()[..w.len()].eq_ignore_ascii_case(w.as_bytes())
+            && !trimmed.as_bytes()[w.len()].is_ascii_alphanumeric()
+            && trimmed.as_bytes()[w.len()] != b'_'
+    };
+    if word("ALL") {
+        return &trimmed[3..];
+    }
+    if !word("DISTINCT") {
+        return list;
+    }
+    let rest = trimmed["DISTINCT".len()..].trim_start();
+    let on = rest.len() > 2
+        && rest.as_bytes()[..2].eq_ignore_ascii_case(b"ON")
+        && rest[2..].trim_start().starts_with('(');
+    if on {
+        let open = rest.len() - rest[2..].trim_start().len();
+        if let Some(close) = crate::core::rql::expr::matching_paren(rest, open) {
+            return &rest[close + 1..];
+        }
+    }
+    rest
+}
+
+/// One select-list item as its expression and its ` AS name` alias, if it has
+/// one at the top level.
+fn split_alias(item: &str) -> (&str, Option<&str>) {
+    let upper = item.as_bytes().to_ascii_uppercase();
     let mut depth = 0usize;
-    let bytes = item.as_bytes();
     let mut i = 0usize;
-    while i + 4 <= bytes.len() {
-        match bytes[i] {
+    while i + 4 <= upper.len() {
+        match upper[i] {
             b'(' => depth += 1,
             b')' => depth = depth.saturating_sub(1),
             _ => {}
         }
-        if depth == 0
-            && upper[i..].starts_with(" AS ")
-            && i + 4 <= item.len()
-        {
+        if depth == 0 && upper[i..].starts_with(b" AS ") {
             let name = item[i + 4..].trim().trim_matches('"');
             if !name.is_empty() {
-                return Some(name.to_string());
+                return (&item[..i], Some(name));
             }
         }
         i += 1;
     }
+    (item, None)
+}
 
-    // A bare or qualified column keeps its own name: `d.id` is `id`.
-    let bare = item.trim().trim_matches('"');
+/// The column an expression names when it is nothing but a bare or qualified
+/// column reference: `d.id` is `id`.
+fn bare_column(expression: &str) -> Option<String> {
+    let bare = expression.trim().trim_matches('"');
     if bare.contains('(') || bare.contains(' ') || bare == "*" {
         return None;
     }
@@ -200,8 +274,23 @@ fn select_list_of(body: &str) -> Option<&str> {
     // and every Rust raw-string query formats across lines. `find_keyword`
     // already respects quoting and nesting, which is what this used to
     // hand-roll.
-    let at = crate::core::rql::join::find_keyword(body, "FROM", start)?;
-    Some(&body[start..at])
+    if let Some(at) = crate::core::rql::join::find_keyword(body, "FROM", start) {
+        return Some(&body[start..at]);
+    }
+    // A `SELECT` with no `FROM` is one row of its items. It was reported as
+    // "must be a SELECT", so any FROM-less body that `constant_body` cannot
+    // read as bare literals was refused: `SELECT 'x'::text AS d`,
+    // `SELECT 1::int AS n`, `SELECT now()::date AS d`. Its list ends at the
+    // first clause that can follow it, or at the end of the body.
+    let end = [
+        "WHERE", "GROUP", "HAVING", "WINDOW", "ORDER", "LIMIT", "OFFSET", "FETCH", "UNION",
+        "INTERSECT", "EXCEPT", "FOR", "INTO",
+    ]
+    .iter()
+    .filter_map(|keyword| crate::core::rql::join::find_keyword(body, keyword, start))
+    .min()
+    .unwrap_or_else(|| body.trim_end().trim_end_matches(';').trim_end().len());
+    (end > start).then(|| &body[start..end])
 }
 
 /// The constant literals a `RETURNING` clause lists, when every item is one.
@@ -220,7 +309,10 @@ fn returning_constants(body: &str) -> Option<Vec<String>> {
     for item in &items {
         let item = item.trim();
         let is_literal = item.starts_with('\'')
-            || item.chars().next().is_some_and(|c| c.is_ascii_digit() || c == '-')
+            || item
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit() || c == '-')
             || item.eq_ignore_ascii_case("NULL");
         if !is_literal {
             return None;
@@ -230,32 +322,236 @@ fn returning_constants(body: &str) -> Option<Vec<String>> {
     Some(literals)
 }
 
+/// One column of a body made of named constants; see [`constant_body`].
+pub(crate) struct ConstantColumn {
+    pub label: String,
+    pub db_type: DbType,
+    /// What the materialised relation declares the column as.
+    pub sql_type: String,
+    /// The literal as written.
+    pub value: String,
+}
+
+/// A body with no `FROM` whose items are all named literals —
+/// `SELECT 50 AS a, 'x' AS b` — as its columns and their one row of values.
+/// `None` for anything else, which then runs as a query.
+///
+/// Such a body names no relation, so the query path cannot run it and
+/// refused it as "cannot parse subquery". It is one row of constants, which
+/// is exactly what a `VALUES` tuple is. Each type is the one PostgreSQL gives
+/// the literal: an integer that fits is `int4`, then `int8`, then `numeric`,
+/// a decimal is `numeric`, and a string is `text`. Shared with the describe
+/// path, so the client is told the types the relation is built with.
+pub(crate) fn constant_body(body: &str) -> Option<Vec<ConstantColumn>> {
+    let trimmed = body.trim().trim_end_matches(';').trim_end();
+    if trimmed.len() < "SELECT".len() || !trimmed[.."SELECT".len()].eq_ignore_ascii_case("SELECT") {
+        return None;
+    }
+    let list = &trimmed["SELECT".len()..];
+    if !list.starts_with(char::is_whitespace) {
+        return None;
+    }
+    for keyword in ["FROM", "WHERE", "UNION", "GROUP", "ORDER", "LIMIT", "OFFSET"] {
+        if crate::core::rql::join::find_keyword(list, keyword, 0).is_some() {
+            return None;
+        }
+    }
+    let mut columns = Vec::new();
+    for item in crate::core::rql::lexer_ct::split_definitions(list) {
+        let (expression, alias) = split_alias(item.trim());
+        let label = alias?.to_string();
+        let value = expression.trim();
+        let (db_type, sql_type) = if value.eq_ignore_ascii_case("NULL") {
+            (DbType::STRING, "TEXT".to_string())
+        } else if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") {
+            (DbType::BOOL, "BOOLEAN".to_string())
+        } else if value.len() >= 2
+            && value.starts_with('\'')
+            && value.ends_with('\'')
+            && !value[1..value.len() - 1].replace("''", "").contains('\'')
+        {
+            (DbType::STRING, "TEXT".to_string())
+        } else if let Ok(n) = value.parse::<i64>() {
+            if i32::try_from(n).is_ok() {
+                (DbType::I32, "INTEGER".to_string())
+            } else {
+                (DbType::I64, "BIGINT".to_string())
+            }
+        } else if value.parse::<f64>().is_ok()
+            && value.chars().all(|c| c.is_ascii_digit() || matches!(c, '-' | '+' | '.'))
+        {
+            // A numeric literal keeps the places it was written with, as
+            // PostgreSQL's does: `1.5` prints as 1.5, not at the engine's nine.
+            let places = value.split_once('.').map_or(0, |(_, places)| places.len());
+            if places > crate::core::rql::type_modifier::MAX_DECIMAL_SCALE as usize {
+                return None;
+            }
+            (DbType::DECIMAL, format!("NUMERIC(38,{})", places))
+        } else {
+            return None;
+        };
+        columns.push(ConstantColumn {
+            label,
+            db_type,
+            sql_type,
+            value: value.to_string(),
+        });
+    }
+    if columns.is_empty() {
+        return None;
+    }
+    Some(columns)
+}
+
+/// The output names of a `SELECT` that is about to be materialised.
+///
+/// Each item's own name, as PostgreSQL gives it. A list holding a `*` has
+/// no name per item, so its names are taken from the query's description,
+/// which expands the star the way the outer statement's describe will:
+/// `WITH x AS (SELECT * FROM t)` was refused as "a column this cannot name".
+async fn select_labels(query: &str, database: &Arc<Database>) -> Option<Vec<String>> {
+    let list = without_set_quantifier(select_list_of(query)?);
+    let items = crate::core::rql::lexer_ct::split_definitions(list);
+    if let Some(labels) = items
+        .iter()
+        .map(|item| item_label(item))
+        .collect::<Option<Vec<String>>>()
+    {
+        return Some(labels);
+    }
+    let starred = items.iter().any(|item| {
+        let item = item.trim();
+        item == "*" || item.ends_with(".*")
+    });
+    if !starred {
+        return None;
+    }
+    match Box::pin(crate::pgwire::describe_query(database, query)).await {
+        Ok(Some((fields, true))) if !fields.is_empty() => {
+            Some(fields.into_iter().map(|(name, _)| name).collect())
+        }
+        _ => None,
+    }
+}
+
 /// The column names a data-modifying CTE exposes, taken from its `RETURNING`
 /// clause.
 ///
 /// `WITH x AS (INSERT … RETURNING id)` publishes `id` to the statement that
 /// follows, exactly as a SELECT publishes its select list.
-fn returning_labels(body: &str) -> Option<Vec<String>> {
+fn returning_labels(body: &str, database: &Database) -> Option<Vec<String>> {
     let (_, tail) = crate::core::rql::lexer_ir::returning_split(body)?;
-    crate::core::rql::lexer_ct::split_definitions(tail)
-        .iter()
-        .map(|item| item_label(item))
-        .collect::<Option<Vec<String>>>()
-        .filter(|labels| !labels.is_empty())
+    let mut labels = Vec::new();
+    for item in crate::core::rql::lexer_ct::split_definitions(tail) {
+        let item = item.trim();
+        // `RETURNING *` (or `t.*`): the target's columns, in their order,
+        // as the rows come back. It had no label to read, so a CTE
+        // returning `*` was refused as having no RETURNING clause.
+        if item == "*" || item.ends_with(".*") {
+            let table = dml_target(body)?;
+            let view = database.schema_view(&table)?;
+            labels.extend(
+                view.schema()
+                    .fields
+                    .iter()
+                    .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+                    .map(|f| f.name.clone()),
+            );
+            continue;
+        }
+        labels.push(item_label(item)?);
+    }
+    (!labels.is_empty()).then_some(labels)
+}
+
+/// The table an `INSERT INTO t`, `UPDATE [ONLY] t` or `DELETE FROM [ONLY] t`
+/// writes, as stored: a quoted name as written, a bare one lowercased, its
+/// schema qualifier dropped.
+fn dml_target(body: &str) -> Option<String> {
+    let mut words = body.split_whitespace();
+    let verb = words.next()?.to_ascii_uppercase();
+    let mut next = words.next()?;
+    if verb == "INSERT" || verb == "DELETE" {
+        if !next.eq_ignore_ascii_case(if verb == "INSERT" { "INTO" } else { "FROM" }) {
+            return None;
+        }
+        next = words.next()?;
+    } else if verb != "UPDATE" {
+        return None;
+    }
+    if next.eq_ignore_ascii_case("ONLY") {
+        next = words.next()?;
+    }
+    let name = next.split('(').next()?;
+    let last = crate::core::sql_scan::last_name_segment(name);
+    Some(match last.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
+        Some(quoted) => quoted.to_string(),
+        None => last.to_ascii_lowercase(),
+    })
 }
 
 /// The SQL type name that reads back as `db_type`, for the temporary table.
+///
+/// Every type is named as itself. A narrower integer or a `REAL` used to be
+/// widened, so the relation advertised `int4` or `float8` where the inner
+/// query's description said `int2` or `float4`, and a `REAL` of 0.1 read back
+/// as 0.10000000149011612.
 fn sql_type_of(db_type: &DbType) -> Option<&'static str> {
     Some(match db_type {
-        DbType::I8 | DbType::I16 | DbType::I32 => "INTEGER",
-        DbType::I64 | DbType::I128 => "BIGINT",
-        DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64 | DbType::U128 => "BIGINT",
-        DbType::F32 | DbType::F64 => "DOUBLE",
+        DbType::I8 => "TINYINT",
+        DbType::I16 => "SMALLINT",
+        DbType::I32 => "INTEGER",
+        DbType::I64 => "BIGINT",
+        DbType::U8 => "UTINYINT",
+        DbType::U16 => "USMALLINT",
+        DbType::U32 => "UINT",
+        // Their own widths: as `BIGINT` a `UBIGINT` above `i64::MAX` read
+        // back negative, a 16-byte integer was cut to eight, and the column
+        // advertised `int8` where the base table's said `numeric`.
+        DbType::U64 => "UBIGINT",
+        DbType::I128 => "HUGEINT",
+        DbType::U128 => "UHUGEINT",
+        DbType::F32 => "REAL",
+        DbType::F64 => "DOUBLE",
         DbType::DECIMAL => "NUMERIC",
         DbType::BOOL => "BOOLEAN",
         DbType::UUID => "UUID",
-        DbType::DATETIME => "TIMESTAMP",
-        DbType::STRING | DbType::CHAR => "TEXT",
+        // `TIMESTAMP` alone declares a `timestamp` (without time zone),
+        // whose literals drop their zone; a `DATETIME` cell is a
+        // `timestamptz`.
+        DbType::DATETIME => "TIMESTAMPTZ",
+        DbType::TIMESTAMP => "TIMESTAMP",
+        DbType::STRING => "TEXT",
+        // A `json` value goes in as `json`, its text kept as written.
+        DbType::JSONTEXT => "JSON",
+        // A legacy `CHAR` goes into the temporary relation as the text it
+        // holds. `CHAR` is `character(1)` now, which an older value of two
+        // characters does not fit.
+        DbType::CHAR => "TEXT",
+        // The types stored in PostgreSQL's own layout. Without them a CTE
+        // over a date, a time, an interval, a MAC address or any geometry was
+        // refused as "a type that cannot be materialised".
+        DbType::DATE => "DATE",
+        DbType::TIME => "TIME",
+        DbType::TIMETZ => "TIMETZ",
+        DbType::INTERVAL => "INTERVAL",
+        DbType::MACADDR => "MACADDR",
+        DbType::MACADDR8 => "MACADDR8",
+        DbType::BIT => "BIT",
+        DbType::VARBIT => "VARBIT",
+        DbType::POINT => "POINT",
+        DbType::LINE => "LINE",
+        DbType::LSEG => "LSEG",
+        DbType::BOX => "BOX",
+        DbType::PATH => "PATH",
+        DbType::POLYGON => "POLYGON",
+        DbType::CIRCLE => "CIRCLE",
+        DbType::INT4RANGE => "INT4RANGE",
+        DbType::INT8RANGE => "INT8RANGE",
+        DbType::NUMRANGE => "NUMRANGE",
+        DbType::TSRANGE => "TSRANGE",
+        DbType::TSTZRANGE => "TSTZRANGE",
+        DbType::DATERANGE => "DATERANGE",
         // Every remaining stored type, named as `parse_column_type` accepts it.
         // A materialised subquery has to be able to hold whatever a select list
         // can produce: a `SELECT COUNT(*) FROM (SELECT …) AS sub_query` — which
@@ -265,12 +561,444 @@ fn sql_type_of(db_type: &DbType) -> Option<&'static str> {
         DbType::JSONB | DbType::JSON => "JSONB",
         DbType::INET => "INET",
         DbType::BYTEA => "BYTEA",
-        DbType::ARRAY => "ARRAY",
+        DbType::ARRAY | DbType::ARRAYOF(_) => "ARRAY",
+        // `character(n)` keeps its type through the relation: compared
+        // without trailing spaces, and shown padded (`relation_columns`
+        // declares it with its length).
+        DbType::BPCHAR(_) => "BPCHAR",
         // NULL is not a type, it is the absence of a value in the row that was
         // sampled. The caller resolves it by looking at further rows.
         DbType::NULL => return None,
         _ => return None,
     })
+}
+
+/// One column of a materialised relation: what it is declared as, and the
+/// type its cells are written back as when a scan reports them physically.
+struct RelationColumn {
+    sql_type: String,
+    declared: Option<DbType>,
+    /// The scale this column's `DECIMAL` cells arrive at, when known.
+    scale: Option<u32>,
+}
+
+/// The column types of the relation `query` is materialised into.
+///
+/// Taken from the query's description, which is what the client is told the
+/// columns are and what pgwire renders their cells by — the same source the
+/// outer statement's describe resolves a CTE through, so the relation and its
+/// description cannot disagree. A scanned row cannot answer this: it reports
+/// the *physical* type, which is TEXT for a document, an array, a range, a bit
+/// string and a path, so a relation typed from the rows held a document's
+/// encoded bytes in a TEXT column. They came back non-NULL and unreadable, and
+/// `@>` refused the column as a string.
+///
+/// A sampled cell still wins where it disagrees physically with the
+/// description, because its bytes are what has to be written. The rows decide
+/// alone only when the query cannot be described, as before.
+async fn relation_columns(
+    query: &str,
+    labels: &[String],
+    rows: &[crate::core::row::row::Row],
+    scales: Option<&[u32]>,
+    database: &Arc<Database>,
+) -> Result<Vec<RelationColumn>, usize> {
+    let described: Vec<DbType> = match Box::pin(crate::pgwire::describe_query(database, query)).await {
+        Ok(Some((fields, _))) if fields.len() == labels.len() => {
+            fields.into_iter().map(|(_, ty)| ty).collect()
+        }
+        _ => Vec::new(),
+    };
+    // A typed array is described as `DbType::ARRAYOF`, the wire's word for
+    // it: here it is the `ARRAY` it is stored as, of that element type. Left
+    // as it was, no relation type matched it and the column became `TEXT`,
+    // whose rows went out as the array's stored bytes under the array type
+    // the statement was described as.
+    let described_elements: Vec<Option<DbType>> = described
+        .iter()
+        .map(|t| match t {
+            DbType::ARRAYOF(code) => Some(DbType::from_byte(*code)),
+            _ => None,
+        })
+        .collect();
+    let described: Vec<DbType> =
+        described.into_iter().map(|t| if matches!(t, DbType::ARRAYOF(_)) { DbType::ARRAY } else { t }).collect();
+    let sampled_wide = declared_wide_types(query, labels, database);
+    let engine = crate::core::value_codec::DECIMAL_SCALE;
+    // A bare `character varying` column keeps that type in the relation, so
+    // it compares blank-padded with a `character(n)` one there as it does in
+    // its table; declared TEXT, `WHERE a = b` over a CTE compared exactly.
+    let declared_fields = declared_fields_among(query, labels, database, &[]);
+    let varying: Vec<Option<u32>> = {
+        use crate::core::rql::type_modifier::TextTypmod;
+        declared_fields
+            .iter()
+            .map(|f| match f.as_ref().and_then(|f| (f.db_type == DbType::STRING).then(|| f.text_typmod()).flatten()) {
+                Some(TextTypmod::Varchar(n)) => Some(n),
+                _ => None,
+            })
+            .collect()
+    };
+    // A bare typed-array column's element type, which holds with no rows to
+    // sample (`CREATE TABLE … AS SELECT xs FROM t` of an empty `t`).
+    let elements: Vec<Option<DbType>> = {
+        use crate::core::rql::type_modifier::TextTypmod;
+        declared_fields
+            .iter()
+            .map(|f| match f.as_ref().filter(|f| f.db_type == DbType::ARRAY).and_then(|f| f.text_typmod()) {
+                Some(TextTypmod::Element(code)) => crate::core::rql::type_modifier::element_db_type(code),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let element_of = |index: usize| -> Option<DbType> {
+        elements
+            .get(index)
+            .cloned()
+            .flatten()
+            .or_else(|| described_elements.get(index).cloned().flatten())
+            .or_else(|| array_cells_element(rows, index))
+    };
+    let mut columns = Vec::with_capacity(labels.len());
+    for index in 0..labels.len() {
+        // The first row that has a value here: a NULL is the absence of a
+        // value, not a type.
+        let sampled = rows
+            .iter()
+            .filter_map(|row| row.columns.get(index))
+            .map(|c| c.column_type.clone())
+            .find(|t| *t != DbType::NULL);
+        let described = described
+            .get(index)
+            .filter(|t| sql_type_of(t).is_some())
+            .cloned();
+        let declared = match (described, sampled) {
+            (Some(d), Some(s)) if s != d && s != d.physical() => Some(s),
+            (Some(d), _) => Some(d),
+            // Undescribable: the sampled type, with TEXT second-guessed from
+            // the schema for the bare-column case `declared_wide_types` reads.
+            (None, Some(DbType::STRING)) | (None, None) => sampled_wide
+                .get(index)
+                .cloned()
+                .flatten()
+                .or(Some(DbType::STRING)),
+            (None, Some(s)) => Some(s),
+        };
+        let scale = scales.and_then(|s| s.get(index)).copied();
+        let sql_type = match &declared {
+            // A decimal is declared at the scale its cells were stored at, so
+            // it prints the places it was written with rather than nine.
+            // Cells carrying their own scale (a column that keeps each
+            // value's, an AVG, a quotient): an unconstrained NUMERIC, which
+            // keeps each value at its own scale as PostgreSQL's relation
+            // does. Declared at the widest of them, the narrower ones printed
+            // trailing zeros (1.500000000000 for 1.5).
+            Some(DbType::DECIMAL) if self_scaled_width(rows, index, scale).is_some() => "NUMERIC".to_string(),
+            Some(DbType::DECIMAL) => match scale {
+                Some(scale) if scale != engine => format!("NUMERIC(38,{})", scale),
+                _ => "NUMERIC".to_string(),
+            },
+            Some(DbType::BPCHAR(n)) if *n > 0 => format!("CHAR({n})"),
+            // An array whose cells all carry one element type (a typed
+            // column's, an `array_agg` of one) is declared of it, so the
+            // relation's arrays order as that type, as the source's did.
+            // Through an untyped `ARRAY` they were re-read as text and
+            // `ORDER BY` over a derived table sorted `{10}` before `{9}`.
+            Some(DbType::ARRAY)
+                if element_of(index).as_ref().and_then(sql_type_of).is_some() =>
+            {
+                let element = element_of(index).expect("checked");
+                format!("{}[]", sql_type_of(&element).expect("checked"))
+            }
+            Some(DbType::STRING) if varying.get(index).copied().flatten().is_some() => {
+                match varying[index] {
+                    Some(0) | None => "VARCHAR".to_string(),
+                    Some(n) => format!("VARCHAR({n})"),
+                }
+            }
+            Some(t) => sql_type_of(t).ok_or(index)?.to_string(),
+            None => "TEXT".to_string(),
+        };
+        columns.push(RelationColumn {
+            sql_type,
+            declared,
+            scale,
+        });
+    }
+    Ok(columns)
+}
+
+/// The element type every non-empty array cell of column `index` carries,
+/// when they all carry the same one and it is not text.
+fn array_cells_element(rows: &[crate::core::row::row::Row], index: usize) -> Option<DbType> {
+    let mut found: Option<DbType> = None;
+    for row in rows {
+        let Some(cell) = row.columns.get(index) else { continue };
+        if cell.column_type == DbType::NULL {
+            continue;
+        }
+        let raw = cell.data.into_slice();
+        let Some((_, elements)) = crate::core::value_codec::decode_array(raw) else { return None };
+        if elements.is_empty() {
+            continue;
+        }
+        let element = crate::core::value_codec::array_element_type(raw)?;
+        match &found {
+            Some(f) if *f != element => return None,
+            Some(_) => {}
+            None => found = Some(element),
+        }
+    }
+    found
+}
+
+/// The scale a `DECIMAL` column has to be declared at to hold every cell of
+/// it exactly, when any of those cells carries a scale of its own.
+///
+/// An `AVG` picks its scale per value, as PostgreSQL's numeric division does:
+/// twenty places for an average below 1, twelve from 10^4. The item's column
+/// scale is a fixed sixteen, so declaring the relation at it rounded
+/// `0.33333333333333333333` to sixteen places and padded `30000.5` to sixteen.
+/// The widest scale any cell carries loses nothing. A column holds one scale,
+/// so where the values differ the narrower ones print trailing zeros.
+///
+/// Narrowed to the most places a column may declare, which an average below
+/// 10^-12 exceeds, and so the widest integer part still fits the 38 digits a
+/// column holds, which only an average far below 1 sharing a column with a
+/// large one reaches. `None` when no cell carries its own scale, and the
+/// column's is then the item's.
+fn self_scaled_width(
+    rows: &[crate::core::row::row::Row],
+    index: usize,
+    column_scale: Option<u32>,
+) -> Option<u32> {
+    let arrival = column_scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE);
+    let mut self_scaled = false;
+    let mut widest = 0u32;
+    let mut integer_digits = 0u32;
+    for row in rows {
+        let Some(cell) = row.columns.get(index) else { continue };
+        if cell.column_type != DbType::DECIMAL {
+            continue;
+        }
+        let Some((v, own)) =
+            crate::core::value_codec::split_decimal_cell(cell.data.into_slice())
+        else {
+            continue;
+        };
+        self_scaled |= own.is_some();
+        let at = own.unwrap_or(arrival);
+        widest = widest.max(at);
+        let whole = 10u128.checked_pow(at).map_or(0, |f| v.unsigned_abs() / f);
+        let digits = if whole == 0 { 0 } else { whole.ilog10() + 1 };
+        integer_digits = integer_digits.max(digits);
+    }
+    let most = u32::from(crate::core::rql::type_modifier::MAX_DECIMAL_SCALE);
+    self_scaled.then(|| widest.min(most).min(38u32.saturating_sub(integer_digits)))
+}
+
+/// The literal one cell is written into a materialised relation as.
+///
+/// A cell a scan reports as `STRING` is read as the column's declared type
+/// when that type is stored as a string: the bytes are a document, an array
+/// or a range, and quoting them as text wrote their encoding back.
+fn cell_literal(column: &RelationColumn, cell: &crate::core::row::row::Column) -> Option<String> {
+    let as_type = match &column.declared {
+        Some(declared)
+            if cell.column_type == DbType::STRING && declared.physical() == DbType::STRING =>
+        {
+            declared.clone()
+        }
+        _ => cell.column_type.clone(),
+    };
+    // A decimal is written at the scale it arrived at. Its cells are not
+    // brought to the engine scale first (see `run_query_rows_scaled`), so a
+    // cell with no scale of its own is at its column's.
+    if as_type == DbType::DECIMAL {
+        if let (Some((v, None)), Some(scale)) = (
+            crate::core::value_codec::split_decimal_cell(cell.data.into_slice()),
+            column.scale,
+        ) {
+            return Some(crate::core::value_codec::format_decimal_scaled(v, scale));
+        }
+    }
+    crate::core::rql::subquery::value_to_literal(&as_type, cell.data.into_slice())
+}
+
+/// Refuses a relation that would name one column twice.
+///
+/// A join's `*`, or `a.id, b.id`, names a shared column twice. The relation
+/// is a table and its fill names its columns, and the INSERT maps each name
+/// to the first field called that: the second value was never written, or a
+/// nullable pair's companion was declared twice and the CREATE failed.
+/// Refused rather than renamed, since a renamed column would reach the client
+/// under the new name and resolve a reference PostgreSQL calls ambiguous.
+///
+/// Compared exactly, as the INSERT matches: `id` and `ID` are two columns of
+/// the relation and each is written, so refusing them would only turn a right
+/// answer into an error.
+fn refuse_repeated_labels<S: AsRef<str>>(labels: &[S], subject: &str) -> Result<(), String> {
+    for (index, label) in labels.iter().enumerate() {
+        let label = label.as_ref();
+        if labels[..index].iter().any(|earlier| earlier.as_ref() == label) {
+            return Err(format!(
+                "{} names the column '{}' twice; alias one of them with AS",
+                subject, label
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Creates `temp` with one column per label, typed by [`relation_columns`],
+/// and writes `rows` into it. `subject` names what is being materialised in
+/// an error: "the WITH clause 'x'" or "the subquery for 's'".
+///
+/// `created` is set as soon as the table exists, so a caller can drop it
+/// when the fill then fails: DDL is not transactional here.
+#[allow(clippy::too_many_arguments)]
+async fn build_relation(
+    query: &str,
+    temp: &str,
+    labels: &[String],
+    rows: &[crate::core::row::row::Row],
+    scales: Option<&[u32]>,
+    subject: &str,
+    database: &Arc<Database>,
+    tx: crate::core::mvcc::transaction::TxId,
+    created: &mut bool,
+) -> Result<(), String> {
+    refuse_repeated_labels(labels, subject)?;
+    // A scan fetches the columns its `WHERE` reads as well as the selected
+    // ones, so a row may carry more than the select list names. The visible
+    // columns come first, which is what `visible_columns` trims to elsewhere.
+    if let Some(row) = rows.first() {
+        if row.columns.len() < labels.len() {
+            return Err(format!(
+                "{} returned {} columns but names {}",
+                subject,
+                row.columns.len(),
+                labels.len()
+            ));
+        }
+    }
+    let columns = relation_columns(query, labels, rows, scales, database)
+        .await
+        .map_err(|index| {
+            format!(
+                "{} returned a type that cannot be materialised in column '{}'",
+                subject,
+                labels.get(index).map(String::as_str).unwrap_or("?")
+            )
+        })?;
+
+    let definitions: Vec<String> = labels
+        .iter()
+        .zip(columns.iter())
+        .map(|(name, column)| format!("{} {}", name, column.sql_type))
+        .collect();
+    create_temporary(
+        &format!("CREATE TABLE {} ({})", temp, definitions.join(", ")),
+        database,
+        tx,
+    )
+    .await
+    .map_err(|e| format!("could not materialise {}: {}", subject, e))?;
+    *created = true;
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut tuples: Vec<String> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut parts: Vec<String> = Vec::with_capacity(labels.len());
+        for (index, (cell, column)) in row.columns.iter().zip(columns.iter()).enumerate() {
+            parts.push(cell_literal(column, cell).ok_or_else(|| {
+                // Naming the type and the column is the difference between a
+                // five-minute fix and a hunt.
+                format!(
+                    "{} returned a {:?} value in column '{}' that cannot be stored",
+                    subject,
+                    column.declared.as_ref().unwrap_or(&cell.column_type),
+                    labels.get(index).map(String::as_str).unwrap_or("?"),
+                )
+            })?);
+        }
+        tuples.push(format!("({})", parts.join(", ")));
+    }
+    crate::core::rql::executor::run_statement(
+        &format!(
+            "INSERT INTO {} ({}) VALUES {}",
+            temp,
+            labels.join(", "),
+            tuples.join(", ")
+        ),
+        database,
+        tx,
+    )
+    .await
+    .map_err(|e| format!("could not fill {}: {}", subject, e))?;
+    Ok(())
+}
+
+/// The prefix every materialised CTE and derived table's name carries.
+///
+/// Public because it is the one thing that identifies a relation as
+/// statement-scoped from the outside. `Database::seed_in` reads it to give such
+/// a table memory-backed storage instead of files, and `pool_place` reads it to
+/// record no placement for one: a relation that is created and dropped inside a
+/// single statement can never be read after that statement ends, so nothing it
+/// writes has to reach a disk.
+pub const TEMP_TABLE_PREFIX: &str = "__cte_";
+
+tokio::task_local! {
+    /// Set while this module creates one of its own temporaries, and while a
+    /// replica applies a peer's statements (the peer's temporaries arrive as
+    /// its `CREATE TABLE __cte_…`): the only creates [`reserved_name_refusal`]
+    /// lets take the prefix.
+    static CREATING_TEMPORARY: ();
+}
+
+/// Runs `create`, a `CREATE TABLE` of a temporary this module named.
+async fn create_temporary(create: &str, database: &Arc<Database>, tx: crate::core::mvcc::transaction::TxId) -> Result<(), String> {
+    CREATING_TEMPORARY
+        .scope((), crate::core::rql::executor::run_statement(create, database, tx))
+        .await
+}
+
+/// Runs `work` with the prefix open, for the replication apply loop: a
+/// statement a peer accepted, its temporaries included, must apply here.
+pub(crate) async fn allowing_temporaries<F: std::future::Future>(work: F) -> F::Output {
+    CREATING_TEMPORARY.scope((), work).await
+}
+
+/// Why a table may not be created under, or renamed to, `name`: the
+/// [`TEMP_TABLE_PREFIX`] is the statement temporaries', and a user table
+/// taking it was treated as one. Memory-backed storage (its rows lost at
+/// every restart), no table locks, and reaped at startup: a plain `CREATE
+/// TABLE __cte_orders` lost everything it held. Matched ignoring ASCII case,
+/// so a later case folding of identifiers cannot let one through. `None`
+/// for every other name, and inside [`create_temporary`] or
+/// [`allowing_temporaries`].
+///
+/// The message is the one `pgwire::sqlstate_for` maps to 42939
+/// (`reserved_name`), PostgreSQL's code for a name a reserved prefix keeps
+/// out (`pg_` for schemas and roles), rather than 42602 (`invalid_name`),
+/// which says the name itself is malformed.
+pub fn reserved_name_refusal(name: &str) -> Option<String> {
+    let reserved = name
+        .get(..TEMP_TABLE_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(TEMP_TABLE_PREFIX));
+    if !reserved || CREATING_TEMPORARY.try_with(|_| ()).is_ok() {
+        return None;
+    }
+    Some(format!(
+        "table name {} is reserved: the prefix {} is reserved for the temporary tables a statement \
+         materialises",
+        crate::core::value_codec::double_quoted(name),
+        crate::core::value_codec::double_quoted(TEMP_TABLE_PREFIX)
+    ))
 }
 
 /// A temporary table name that cannot collide with a user's table or with
@@ -287,6 +1015,181 @@ fn sql_type_of(db_type: &DbType) -> Option<&'static str> {
 /// drop the temporary table … does not exist". A paginated count run twice at
 /// once is enough to hit it. The name is derived once per execution and carried
 /// through the rewrite and the drop, so it does not need to be reproducible.
+/// [`temp_name`], for the `LATERAL` items `lateral` materialises.
+pub(crate) fn temp_name_for(alias: &str, statement: &str, index: usize) -> String {
+    temp_name(alias, statement, index)
+}
+
+/// [`sql_type_of`], for the `LATERAL` constants `lateral` casts.
+pub(crate) fn sql_type_name(db_type: &DbType) -> Option<&'static str> {
+    sql_type_of(db_type)
+}
+
+/// The columns of a relation this module created, by name, in order.
+pub(crate) fn relation_labels(relation: &str, database: &Arc<Database>) -> Option<Vec<String>> {
+    let view = database.schema_view(relation)?;
+    let mut fields: Vec<_> = view
+        .schema()
+        .fields
+        .iter()
+        .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+        .cloned()
+        .collect();
+    fields.sort_by_key(|f| f.write_order);
+    Some(fields.into_iter().map(|f| f.name).collect())
+}
+
+/// A `LATERAL` item's relation (`lateral::materialize`): each of `runs` is the
+/// item with one tuple of outer values substituted and those values' keys;
+/// its rows are written with the keys after its own columns, as
+/// `__lat_k1`, …. Typed as `described` (the item with each outer value a
+/// NULL of its type) describes it, so the relation has its columns' types
+/// even when no run returns a row. `labels` renames the item's columns.
+/// The temporary is named in `temps` as soon as it exists.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_keyed_relation(
+    described: &str,
+    temp: &str,
+    labels: Option<&[String]>,
+    runs: &[(String, Vec<String>)],
+    alias: &str,
+    database: &Arc<Database>,
+    tx: crate::core::mvcc::transaction::TxId,
+    temps: &mut Vec<String>,
+) -> Result<(), String> {
+    let subject = format!("the LATERAL item '{alias}'");
+    let own = match select_labels(described, database).await {
+        Some(own) => own,
+        None => match Box::pin(crate::pgwire::describe_query(database, described)).await {
+            Ok(Some((fields, true))) if !fields.is_empty() => fields.into_iter().map(|(name, _)| name).collect(),
+            _ => return Err(format!("{subject} has a column this cannot name; alias it with AS")),
+        },
+    };
+    let mut names = own.clone();
+    if let Some(labels) = labels {
+        if labels.len() > names.len() {
+            return Err(format!(
+                "table \"{alias}\" has {} columns available but {} columns specified",
+                names.len(),
+                labels.len()
+            ));
+        }
+        for (name, label) in names.iter_mut().zip(labels) {
+            *name = label.clone();
+        }
+    }
+    let width = own.len();
+    // A run's own computed items and derived tables (`generate_series(…)`
+    // with its outer value in place, `(VALUES …)`), materialised as a
+    // derived table's are, and dropped once the relation is filled: its rows
+    // are copied out.
+    let mut nested_temps: Vec<String> = Vec::new();
+    let filled = fill_keyed_relation(
+        runs, width, &own, &mut names, described, temp, &subject, &mut nested_temps, database, tx, temps,
+    )
+    .await;
+    drop_temps(database, &nested_temps, tx).await;
+    filled
+}
+
+/// [`build_keyed_relation`]'s runs and fill, the nested temporaries each run
+/// creates named in `nested_temps` for the caller to drop.
+#[allow(clippy::too_many_arguments)]
+async fn fill_keyed_relation(
+    runs: &[(String, Vec<String>)],
+    width: usize,
+    own: &[String],
+    names: &mut Vec<String>,
+    described: &str,
+    temp: &str,
+    subject: &str,
+    nested_temps: &mut Vec<String>,
+    database: &Arc<Database>,
+    tx: crate::core::mvcc::transaction::TxId,
+    temps: &mut Vec<String>,
+) -> Result<(), String> {
+    let key_count = runs.first().map_or(0, |(_, keys)| keys.len());
+    let mut rows: Vec<crate::core::row::row::Row> = Vec::new();
+    let mut scales: Option<Vec<u32>> = None;
+    for (body, keys) in runs {
+        let nested = Box::pin(materialize_derived(body, database, tx)).await?;
+        let text = match nested {
+            Some(m) => {
+                nested_temps.extend(m.temps);
+                m.rewritten
+            }
+            None => body.clone(),
+        };
+        let (mut got, got_scales) = crate::core::rql::executor::run_query_rows_scaled(&text, database, tx)
+            .await
+            .map_err(|e| format!("{subject} failed: {e}"))?;
+        if scales.is_none() {
+            scales = got_scales;
+        }
+        for row in &mut got {
+            if row.columns.len() < width {
+                return Err(format!("{subject} returned {} columns but names {}", row.columns.len(), width));
+            }
+            row.columns.truncate(width);
+            for key in keys {
+                let mut block = crate::memory_pool::MEMORY_POOL.acquire(key.len());
+                block.into_slice_mut().copy_from_slice(key.as_bytes());
+                row.columns.push(crate::core::row::row::Column {
+                    schema_id: 0,
+                    data: block,
+                    column_type: DbType::STRING,
+                });
+            }
+        }
+        rows.extend(got);
+    }
+    refuse_repeated_labels(names, subject)?;
+    let mut columns = relation_columns(described, own, &rows, scales.as_deref(), database)
+        .await
+        .map_err(|index| {
+            format!(
+                "{subject} returned a type that cannot be materialised in column '{}'",
+                names.get(index).map(String::as_str).unwrap_or("?")
+            )
+        })?;
+    for n in 1..=key_count {
+        names.push(format!("__lat_k{n}"));
+        columns.push(RelationColumn { sql_type: "TEXT".to_string(), declared: Some(DbType::STRING), scale: None });
+    }
+    let quoted: Vec<String> = names.iter().map(|n| crate::core::rql::ctas::quote_ident(n)).collect();
+    let definitions: Vec<String> =
+        quoted.iter().zip(columns.iter()).map(|(name, column)| format!("{} {}", name, column.sql_type)).collect();
+    create_temporary(&format!("CREATE TABLE {} ({})", temp, definitions.join(", ")), database, tx)
+        .await
+        .map_err(|e| format!("could not materialise {subject}: {e}"))?;
+    temps.push(temp.to_string());
+    for chunk in rows.chunks(TABLE_AS_FILL_ROWS) {
+        let mut tuples: Vec<String> = Vec::with_capacity(chunk.len());
+        for row in chunk {
+            let mut parts: Vec<String> = Vec::with_capacity(names.len());
+            for (index, (cell, column)) in row.columns.iter().zip(columns.iter()).enumerate() {
+                parts.push(cell_literal(column, cell).ok_or_else(|| {
+                    format!(
+                        "{} returned a {:?} value in column '{}' that cannot be stored",
+                        subject,
+                        column.declared.as_ref().unwrap_or(&cell.column_type),
+                        names.get(index).map(String::as_str).unwrap_or("?"),
+                    )
+                })?);
+            }
+            tuples.push(format!("({})", parts.join(", ")));
+        }
+        crate::core::rql::executor::run_statement(
+            &format!("INSERT INTO {} ({}) VALUES {}", temp, quoted.join(", "), tuples.join(", ")),
+            database,
+            tx,
+        )
+        .await
+        .map_err(|e| format!("could not fill {subject}: {e}"))?;
+    }
+    Ok(())
+}
+
 fn temp_name(cte: &str, statement: &str, index: usize) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for b in statement.bytes().chain(cte.bytes()) {
@@ -299,9 +1202,8 @@ fn temp_name(cte: &str, statement: &str, index: usize) -> String {
         .filter(|c| c.is_alphanumeric() || *c == '_')
         .take(24)
         .collect();
-    format!("__cte_{}_{}_{:x}", safe, index, hash)
+    format!("{}{}_{}_{:x}", TEMP_TABLE_PREFIX, safe, index, hash)
 }
-
 
 /// Replaces references to a CTE *as a relation*, leaving same-named columns
 /// alone.
@@ -316,7 +1218,10 @@ fn temp_name(cte: &str, statement: &str, index: usize) -> String {
 /// qualifies something (`domain_id.id`). A name *preceded* by a dot is a column
 /// of something else and is left as it is.
 fn replace_relation_references(sql: &str, from: &str, to: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
+    // Bytes, not `char`s: pushing a byte of a multi-byte character as a
+    // `char` re-encoded it on its own, so `t = 'é'` in a statement over a CTE
+    // compared against `'Ã©'` and matched nothing.
+    let mut out: Vec<u8> = Vec::with_capacity(sql.len());
     let bytes = sql.as_bytes();
     let upper = sql.to_ascii_uppercase();
     let mut i = 0usize;
@@ -335,7 +1240,7 @@ fn replace_relation_references(sql: &str, from: &str, to: &str) -> String {
     while i < bytes.len() {
         let c = bytes[i];
         if let Some(q) = quote {
-            out.push(c as char);
+            out.push(c);
             if c == q {
                 quote = None;
             }
@@ -344,7 +1249,7 @@ fn replace_relation_references(sql: &str, from: &str, to: &str) -> String {
         }
         if c == b'\'' || c == b'"' {
             quote = Some(c);
-            out.push(c as char);
+            out.push(c);
             i += 1;
             continue;
         }
@@ -368,9 +1273,9 @@ fn replace_relation_references(sql: &str, from: &str, to: &str) -> String {
                 && !preceded_by_dot
                 && (qualifies || after_relation_keyword || relation_position)
             {
-                out.push_str(to);
+                out.extend_from_slice(to.as_bytes());
             } else {
-                out.push_str(word);
+                out.extend_from_slice(word.as_bytes());
             }
             previous_word = upper[start..i].to_string();
 
@@ -388,10 +1293,12 @@ fn replace_relation_references(sql: &str, from: &str, to: &str) -> String {
         if c == b',' && in_from {
             relation_position = true;
         }
-        out.push(c as char);
+        out.push(c);
         i += 1;
     }
-    out
+    // Every byte is copied in order and only whole ASCII words are replaced,
+    // by text, so the result is the input's characters.
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// Runs each CTE, stores it in a temporary table, and rewrites the statement to
@@ -408,8 +1315,52 @@ fn replace_relation_references(sql: &str, from: &str, to: &str) -> String {
 pub fn has_with_clause(sql: &str) -> bool {
     let trimmed = sql.trim_start();
     trimmed.len() >= 4
-        && trimmed[..4].eq_ignore_ascii_case("WITH")
+        && trimmed.as_bytes()[..4].eq_ignore_ascii_case(b"WITH")
         && trimmed[4..].starts_with(|c: char| c.is_whitespace() || c == '(')
+}
+
+/// `INSERT INTO t [(cols)] WITH a AS (…) SELECT …` rewritten as
+/// `WITH a AS (…) INSERT INTO t [(cols)] SELECT …`, and `None` for any other
+/// statement.
+///
+/// The two mean the same thing in PostgreSQL: a non-recursive CTE is visible
+/// to the query it is attached to, and here that query is the whole row
+/// source. Only the leading form was recognised, so the trailing one reached
+/// the insert path with its `WITH` intact and ran the CTE body as if it were
+/// the row source — "cannot parse subquery", or "a subquery used as a value
+/// returned 2 rows". Moving the clause to the front hands it to the
+/// materialisation every other CTE goes through, `ON CONFLICT` and
+/// `RETURNING` included, since they stay where they were.
+///
+/// `CREATE TABLE t AS WITH a AS (…) SELECT … [WITH NO DATA]` is moved the
+/// same way, for the same reason: left in place its CTE body reached the
+/// statement's scalar-subquery pass and was refused as a subquery returning
+/// more than one row.
+pub fn hoist_insert_with(sql: &str) -> Option<String> {
+    let (head, source, tail) = match crate::core::rql::lexer_ir::insert_select_source(sql) {
+        Some((head, source)) => (head, source, ""),
+        None => {
+            let ctas = crate::core::rql::ctas::parse(sql)?;
+            let span = ctas.query_span;
+            (&sql[..span.start], &sql[span.clone()], &sql[span.end..])
+        }
+    };
+    if !starts_with_with(source) {
+        return None;
+    }
+    let (defs, rest) = split_with(source).ok()??;
+    // Rebuilt with what the clause said beyond names and bodies: dropping
+    // `RECURSIVE` ran a recursive body as a plain UNION over whatever table
+    // shares the CTE's name, and dropping a column list renamed the columns.
+    let clauses: Vec<String> = defs
+        .iter()
+        .map(|def| match &def.columns {
+            Some(columns) => format!("{} ({}) AS ({})", def.name, columns.join(", "), def.body),
+            None => format!("{} AS ({})", def.name, def.body),
+        })
+        .collect();
+    let recursive = if defs.iter().any(|d| d.recursive) { "RECURSIVE " } else { "" };
+    Some(format!("WITH {recursive}{} {} {}{}", clauses.join(", "), head.trim_end(), rest, tail))
 }
 
 pub async fn materialize(
@@ -447,6 +1398,7 @@ async fn materialize_inner(
     if rest.trim().is_empty() {
         return Err("a WITH clause with no statement after it".to_string());
     }
+    crate::owner_probe!(crate::core::mvcc::owner::probe::Site::Cte, tx, database);
 
     let mut rewritten = rest;
 
@@ -467,12 +1419,22 @@ async fn materialize_inner(
             body = replace_relation_references(&body, name, temp);
         }
 
+        if def.recursive && names_itself(&body, &def.name) {
+            let temp = materialize_recursive(def, &body, sql, index, database, temps, tx).await?;
+            rewritten = replace_relation_references(&rewritten, &def.name, &temp);
+            published.push((def.name.clone(), temp));
+            continue;
+        }
+
         // A CTE body may modify data — `WITH x AS (INSERT … RETURNING id)` —
         // in which case it runs for its effect and publishes the RETURNING
         // rows. PostgreSQL runs such a CTE exactly once, which is what
         // materialising in order already gives.
         let modifies = !matches!(
-            body.trim_start().get(..6).map(|w| w.to_ascii_uppercase()).as_deref(),
+            body.trim_start()
+                .get(..6)
+                .map(|w| w.to_ascii_uppercase())
+                .as_deref(),
             Some("SELECT")
         );
 
@@ -485,41 +1447,89 @@ async fn materialize_inner(
                 let affected =
                     crate::core::rql::executor::run_statement_affected(head, database, tx)
                         .await
-                        .map_err(|e| {
-                            format!("the WITH clause '{}' failed: {}", def.name, e)
-                        })?;
+                        .map_err(|e| format!("the WITH clause '{}' failed: {}", def.name, e))?;
 
-                let labels: Vec<String> =
-                    (0..literals.len()).map(|i| format!("col{}", i + 1)).collect();
+                let labels: Vec<String> = renamed((0..literals.len()).map(|i| format!("col{}", i + 1)).collect(), def)?;
                 let temp = temp_name(&def.name, sql, index);
                 let columns: Vec<String> =
                     labels.iter().map(|name| format!("{} TEXT", name)).collect();
-                crate::core::rql::executor::run_statement(&format!("CREATE TABLE {} ({})", temp, columns.join(", ")), database, tx)
+                create_temporary(
+                    &format!("CREATE TABLE {} ({})", temp, columns.join(", ")),
+                    database,
+                    tx,
+                )
                 .await
                 .map_err(|e| {
-                    format!("could not materialise the WITH clause '{}': {}", def.name, e)
+                    format!(
+                        "could not materialise the WITH clause '{}': {}",
+                        def.name, e
+                    )
                 })?;
                 temps.push(temp.clone());
 
                 if affected > 0 {
                     let tuple = format!("({})", literals.join(", "));
-                    let tuples: Vec<String> =
-                        (0..affected).map(|_| tuple.clone()).collect();
-                    crate::core::rql::executor::run_statement(&format!(
+                    let tuples: Vec<String> = (0..affected).map(|_| tuple.clone()).collect();
+                    crate::core::rql::executor::run_statement(
+                        &format!(
                             "INSERT INTO {} ({}) VALUES {}",
                             temp,
                             labels.join(", "),
                             tuples.join(", ")
-                        ), database, tx)
+                        ),
+                        database,
+                        tx,
+                    )
                     .await
-                    .map_err(|e| {
-                        format!("could not fill the WITH clause '{}': {}", def.name, e)
-                    })?;
+                    .map_err(|e| format!("could not fill the WITH clause '{}': {}", def.name, e))?;
                 }
 
                 rewritten = replace_relation_references(&rewritten, &def.name, &temp);
                 // Registered by name so a later CTE referencing this one finds
                 // it, exactly as the ordinary path does.
+                published.push((def.name.clone(), temp));
+                continue;
+            }
+        }
+
+        // A body of named constants is one `VALUES` row, with no query to run.
+        if !modifies {
+            if let Some(mut constants) = constant_body(&body) {
+                let named = renamed(constants.iter().map(|c| c.label.clone()).collect(), def)?;
+                for (c, label) in constants.iter_mut().zip(named) {
+                    c.label = label;
+                }
+                let temp = temp_name(&def.name, sql, index);
+                let columns: Vec<String> = constants
+                    .iter()
+                    .map(|c| format!("{} {}", c.label, c.sql_type))
+                    .collect();
+                let labels: Vec<&str> = constants.iter().map(|c| c.label.as_str()).collect();
+                refuse_repeated_labels(&labels, &format!("the WITH clause '{}'", def.name))?;
+                let values: Vec<&str> = constants.iter().map(|c| c.value.as_str()).collect();
+                create_temporary(
+                    &format!("CREATE TABLE {} ({})", temp, columns.join(", ")),
+                    database,
+                    tx,
+                )
+                .await
+                .map_err(|e| {
+                    format!("could not materialise the WITH clause '{}': {}", def.name, e)
+                })?;
+                temps.push(temp.clone());
+                crate::core::rql::executor::run_statement(
+                    &format!(
+                        "INSERT INTO {} ({}) VALUES ({})",
+                        temp,
+                        labels.join(", "),
+                        values.join(", ")
+                    ),
+                    database,
+                    tx,
+                )
+                .await
+                .map_err(|e| format!("could not fill the WITH clause '{}': {}", def.name, e))?;
+                rewritten = replace_relation_references(&rewritten, &def.name, &temp);
                 published.push((def.name.clone(), temp));
                 continue;
             }
@@ -541,131 +1551,358 @@ async fn materialize_inner(
             None => body.as_str(),
         };
 
-        let rows = if modifies {
-            crate::core::rql::executor::run_returning_rows(body, database, tx).await
-        } else {
-            crate::core::rql::executor::run_query_rows(body, database, tx).await
+        // A later CTE or the statement itself can still fail after this body
+        // wrote, and an in-place overwrite would outlive the abort
+        // (`TransactionManager::forbid_in_place`).
+        if modifies {
+            database.transactions.forbid_in_place(tx);
         }
-        .map_err(|e| format!("the WITH clause '{}' failed: {}", def.name, e))?;
-
         // A data-modifying CTE with no `RETURNING` is legal and runs purely for
         // its effect. It publishes no columns, so it cannot be referenced and
-        // needs no temporary table — running it is the whole job.
+        // needs no temporary table — running it is the whole job. Decided
+        // before the body runs: it was checked after the run below, which had
+        // already executed it, so the body ran twice (`n = n + 1` added 2).
         if modifies && crate::core::rql::lexer_ir::returning_split(body).is_none() {
             crate::core::rql::executor::run_statement(body, database, tx)
                 .await
                 .map_err(|e| format!("the WITH clause '{}' failed: {}", def.name, e))?;
             continue;
         }
+        let (rows, scales) = if modifies {
+            // Returned cells are read straight from storage, at the scales
+            // the client's copy of them is rendered by.
+            let scales = crate::core::rql::lexer_s1::recognize_query_purpose(body)
+                .and_then(|purpose| crate::pgwire::purpose_returning_scales(database, &purpose));
+            crate::core::rql::executor::run_returning_rows(body, database, tx)
+                .await
+                .map(|rows| (rows, scales))
+        } else {
+            crate::core::rql::executor::run_query_rows_scaled(body, database, tx).await
+        }
+        .map_err(|e| format!("the WITH clause '{}' failed: {}", def.name, e))?;
 
         let labels: Vec<String> = if modifies {
-            returning_labels(&body).ok_or_else(|| {
-                format!(
-                    "the WITH clause '{}' modifies data but has no RETURNING clause to name \
-                     its columns",
-                    def.name
-                )
-            })?
-        } else {
-            let list = select_list_of(&body).ok_or_else(|| {
-                format!("the WITH clause '{}' must be a SELECT", def.name)
-            })?;
-            crate::core::rql::lexer_ct::split_definitions(list)
-                .iter()
-                .map(|item| item_label(item))
-                .collect::<Option<Vec<String>>>()
-                .ok_or_else(|| {
+            renamed(
+                returning_labels(&body, database).ok_or_else(|| {
                     format!(
-                        "the WITH clause '{}' has a column this cannot name; alias it with AS",
+                        "the WITH clause '{}' modifies data but has no RETURNING clause to name \
+                         its columns",
                         def.name
                     )
-                })?
-        };
-
-        // Types come from the rows when there are any. An empty result still
-        // needs a table for the outer statement to parse against, and nothing
-        // is read from it, so TEXT is a safe placeholder.
-        let types: Vec<&'static str> = match rows.first() {
-            Some(row) => {
-                // A scan fetches the columns its `WHERE` reads as well as the
-                // selected ones, so a row may carry more than the select list
-                // names. The visible columns come first, which is what
-                // `visible_columns` trims to elsewhere.
-                if row.columns.len() < labels.len() {
-                    return Err(format!(
-                        "the WITH clause '{}' returned {} columns but names {}",
-                        def.name,
-                        row.columns.len(),
-                        labels.len()
-                    ));
-                }
-                row.columns
-                    .iter()
-                    .take(labels.len())
-                    .map(|c| sql_type_of(&c.column_type))
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or_else(|| {
-                        format!(
-                            "the WITH clause '{}' returned a type that cannot be materialised",
-                            def.name
-                        )
-                    })?
-            }
-            None => labels.iter().map(|_| "TEXT").collect(),
+                })?,
+                def,
+            )?
+        } else {
+            query_labels(def, body, database).await?
         };
 
         let temp = temp_name(&def.name, sql, index);
-        let columns: Vec<String> = labels
-            .iter()
-            .zip(types.iter())
-            .map(|(name, ty)| format!("{} {}", name, ty))
-            .collect();
 
-        let create = format!("CREATE TABLE {} ({})", temp, columns.join(", "));
-        crate::core::rql::executor::run_statement(&create, database, tx)
-            .await
-            .map_err(|e| format!("could not materialise the WITH clause '{}': {}", def.name, e))?;
-        // Recorded before the insert, so a failure part-way still gets cleaned
-        // up by the caller.
-        temps.push(temp.clone());
+        // Timed from here rather than from the top of the loop: the body has
+        // already run, and a body containing its own derived table has already
+        // materialised that through `materialize_query`, which counts itself.
+        // Starting the clock earlier would count the nested relation twice.
+        #[cfg(feature = "query_stats")]
+        let materialising = std::time::Instant::now();
 
-        if !rows.is_empty() {
-            let mut tuples: Vec<String> = Vec::with_capacity(rows.len());
-            for row in &rows {
-                let mut parts: Vec<String> = Vec::with_capacity(labels.len());
-                for column in row.columns.iter().take(labels.len()) {
-                    let literal = crate::core::rql::subquery::value_to_literal(
-                        &column.column_type,
-                        column.data.into_slice(),
-                    )
-                    .ok_or_else(|| {
-                        format!(
-                            "the WITH clause '{}' returned a value that cannot be stored",
-                            def.name
-                        )
-                    })?;
-                    parts.push(literal);
-                }
-                tuples.push(format!("({})", parts.join(", ")));
-            }
-            let insert = format!(
-                "INSERT INTO {} ({}) VALUES {}",
-                temp,
-                labels.join(", "),
-                tuples.join(", ")
-            );
-            crate::core::rql::executor::run_statement(&insert, database, tx)
-                .await
-                .map_err(|e| {
-                    format!("could not fill the WITH clause '{}': {}", def.name, e)
-                })?;
+        // Typed by the body's description rather than by its rows, which also
+        // types an empty result: a TEXT placeholder there made `@>` on an
+        // empty CTE's document column an error instead of no rows.
+        let mut created = false;
+        let built = build_relation(
+            body,
+            &temp,
+            &labels,
+            &rows,
+            scales.as_deref(),
+            &format!("the WITH clause '{}'", def.name),
+            database,
+            tx,
+            &mut created,
+        )
+        .await;
+        // Recorded whether or not the fill succeeded, so a failure part-way
+        // still gets cleaned up.
+        if created {
+            temps.push(temp.clone());
         }
+        built?;
+
+        // One relation built. A CTE that failed part-way is not counted — the
+        // `?` above carries the error out — which is the right answer: nothing
+        // usable was produced, and the statement is recorded as the failure it
+        // was.
+        #[cfg(feature = "query_stats")]
+        crate::core::query_stats::note_materialised(
+            materialising.elapsed().as_micros().min(u64::MAX as u128) as u64,
+        );
 
         rewritten = replace_relation_references(&rewritten, &def.name, &temp);
         published.push((def.name.clone(), temp));
     }
 
-    Ok(Some(Materialized { rewritten, temps: std::mem::take(temps) }))
+    Ok(Some(Materialized {
+        rewritten,
+        temps: std::mem::take(temps),
+    }))
+}
+
+/// `labels` with the names a column list gives (`WITH t (a, b) AS …`): the
+/// first ones renamed, the rest kept, as PostgreSQL does; more names than
+/// columns is its 42P10.
+fn renamed(mut labels: Vec<String>, def: &CteDef) -> Result<Vec<String>, String> {
+    let Some(columns) = &def.columns else {
+        return Ok(labels);
+    };
+    if columns.len() > labels.len() {
+        return Err(format!(
+            "WITH query \"{}\" has {} columns available but {} columns specified",
+            def.name,
+            labels.len(),
+            columns.len()
+        ));
+    }
+    for (label, name) in labels.iter_mut().zip(columns) {
+        *label = name.clone();
+    }
+    Ok(labels)
+}
+
+/// The column names a `SELECT` body publishes under `def`: its own labels,
+/// renamed by a column list; with a column list covering every item, an item
+/// that names nothing (`SELECT 1`) takes the list's name.
+async fn query_labels(def: &CteDef, body: &str, database: &Arc<Database>) -> Result<Vec<String>, String> {
+    let Some(list) = select_list_of(body) else {
+        return Err(format!("the WITH clause '{}' must be a SELECT", def.name));
+    };
+    if let Some(labels) = select_labels(body, database).await {
+        return renamed(labels, def);
+    }
+    let items = crate::core::rql::lexer_ct::split_definitions(without_set_quantifier(list)).len();
+    match &def.columns {
+        Some(columns) if columns.len() == items => Ok(columns.clone()),
+        _ => Err(format!("the WITH clause '{}' has a column this cannot name; alias it with AS", def.name)),
+    }
+}
+
+/// Whether `body` reads the relation `name` (a recursive reference).
+fn names_itself(body: &str, name: &str) -> bool {
+    replace_relation_references(body, name, "__cte_self_probe") != body
+}
+
+/// A recursive definition's body as its non-recursive term, whether it
+/// combines by `UNION ALL` (no deduplication), and its recursive term: split
+/// at the last top-level `UNION`, as `a UNION b UNION ALL rec` is `(a UNION
+/// b) UNION ALL rec`. `None` for a definition that does not recurse.
+pub(crate) fn recursive_split<'a>(def: &CteDef, body: &'a str) -> Option<Result<(&'a str, bool, &'a str), String>> {
+    (def.recursive && names_itself(body, &def.name)).then(|| recursive_parts(&def.name, body))
+}
+
+fn recursive_parts<'a>(name: &str, body: &'a str) -> Result<(&'a str, bool, &'a str), String> {
+    let shape = || format!("recursive query \"{name}\" does not have the form non-recursive-term UNION [ALL] recursive-term");
+    let mut split = None;
+    let mut from = 0;
+    while let Some(at) = crate::core::rql::join::find_keyword(body, "UNION", from) {
+        split = Some(at);
+        from = at + 5;
+    }
+    let at = split.ok_or_else(shape)?;
+    let anchor = body[..at].trim();
+    let mut tail = body[at + 5..].trim_start();
+    let all = tail.len() >= 3 && tail.as_bytes()[..3].eq_ignore_ascii_case(b"ALL") && tail[3..].starts_with(char::is_whitespace);
+    if all {
+        tail = tail[3..].trim_start();
+    } else if tail.len() >= 8 && tail.as_bytes()[..8].eq_ignore_ascii_case(b"DISTINCT") {
+        tail = tail[8..].trim_start();
+    }
+    if names_itself(anchor, name) {
+        return Err(format!("recursive reference to query \"{name}\" must not appear within its non-recursive term"));
+    }
+    if !names_itself(tail, name) {
+        return Err(shape());
+    }
+    Ok((anchor, all, tail))
+}
+
+/// `VALUES (a, b), (c, d)` as the `SELECT a AS column1, b AS column2 UNION
+/// ALL SELECT c, d` it means, for a recursive CTE's non-recursive term, which
+/// runs as a subquery and a subquery reads no `VALUES`. `column1`… are
+/// PostgreSQL's names for its columns. `None` for anything else.
+pub(crate) fn values_as_select(term: &str) -> Option<String> {
+    let rest = term.trim();
+    if rest.len() < 6 || !rest.as_bytes()[..6].eq_ignore_ascii_case(b"VALUES") {
+        return None;
+    }
+    let mut rest = rest[6..].trim_start();
+    let mut selects: Vec<String> = Vec::new();
+    loop {
+        if !rest.starts_with('(') {
+            return None;
+        }
+        let close = matching_paren(rest, 0)?;
+        let items = crate::core::rql::lexer_ct::split_definitions(&rest[1..close]);
+        if items.is_empty() {
+            return None;
+        }
+        let list: Vec<String> = if selects.is_empty() {
+            items.iter().enumerate().map(|(i, e)| format!("{} AS column{}", e.trim(), i + 1)).collect()
+        } else {
+            items.iter().map(|e| e.trim().to_string()).collect()
+        };
+        selects.push(format!("SELECT {}", list.join(", ")));
+        rest = rest[close + 1..].trim_start();
+        match rest.strip_prefix(',') {
+            Some(next) => rest = next.trim_start(),
+            None if rest.is_empty() => break,
+            None => return None,
+        }
+    }
+    Some(selects.join(" UNION ALL "))
+}
+
+/// `columns` renamed by `def`'s column list, for a description: the first
+/// ones take the list's names, as [`renamed`] does for the relation built.
+pub(crate) fn described_names<T>(def: &CteDef, columns: Vec<(String, T)>) -> Result<Vec<(String, T)>, String> {
+    let labels = renamed(columns.iter().map(|(n, _)| n.clone()).collect(), def)?;
+    Ok(labels.into_iter().zip(columns).map(|(n, (_, t))| (n, t)).collect())
+}
+
+/// The most rows one recursive CTE may produce. PostgreSQL runs an endless
+/// recursion until something stops it; here every row is held in memory, so
+/// an unbounded one would take the server down with it. Far past any
+/// hierarchy a query walks.
+const RECURSIVE_ROW_LIMIT: usize = 10_000_000;
+
+/// The most iterations one recursive CTE may take. PostgreSQL evaluates the
+/// recursion lazily, so `… UNION ALL SELECT n + 1 FROM t) SELECT n FROM t
+/// LIMIT 5` stops after five rows there; here the CTE is built whole first,
+/// and that recursion never ends. Deeper than any hierarchy, and refused
+/// loudly rather than running until the statement timeout.
+const RECURSIVE_ITERATION_LIMIT: usize = 10_000;
+
+/// A recursive definition, `non_recursive UNION [ALL] recursive`, as
+/// PostgreSQL evaluates it: the non-recursive term once into the result,
+/// then the recursive term over a working table holding the rows the last
+/// iteration added, each iteration's rows appended, until one adds none.
+/// Under `UNION` a row already in the result (or twice in one iteration) is
+/// dropped, the anchor's duplicates too, which is what ends a walk over a
+/// cyclic graph. Columns are typed by the non-recursive term, as there.
+/// Returns the result's temporary table; every table made is in `temps`.
+async fn materialize_recursive(
+    def: &CteDef,
+    body: &str,
+    sql: &str,
+    index: usize,
+    database: &Arc<Database>,
+    temps: &mut Vec<String>,
+    tx: crate::core::mvcc::transaction::TxId,
+) -> Result<String, String> {
+    let subject = format!("the WITH clause '{}'", def.name);
+    let (anchor, all, recursive_term) = recursive_parts(&def.name, body)?;
+    let values_anchor = values_as_select(anchor);
+    let anchor = values_anchor.as_deref().unwrap_or(anchor);
+
+    let (anchor_rows, scales) = crate::core::rql::executor::run_query_rows_scaled(anchor, database, tx)
+        .await
+        .map_err(|e| format!("{subject} failed: {e}"))?;
+    let labels = query_labels(def, anchor, database).await?;
+    refuse_repeated_labels(&labels, &subject)?;
+    let columns = relation_columns(anchor, &labels, &anchor_rows, scales.as_deref(), database)
+        .await
+        .map_err(|i| format!("{subject} returned a type that cannot be materialised in column '{}'", labels.get(i).map(String::as_str).unwrap_or("?")))?;
+    // A row as the literals it is stored back with: the identity UNION
+    // compares by, NULL equal to NULL as there.
+    let literals = |row: &crate::core::row::row::Row| -> Result<Vec<String>, String> {
+        if row.columns.len() < labels.len() {
+            return Err(format!("{subject} returned {} columns but names {}", row.columns.len(), labels.len()));
+        }
+        row.columns
+            .iter()
+            .zip(columns.iter())
+            .enumerate()
+            .map(|(i, (cell, column))| {
+                cell_literal(column, cell).ok_or_else(|| {
+                    format!("{subject} returned a value in column '{}' that cannot be stored", labels.get(i).map(String::as_str).unwrap_or("?"))
+                })
+            })
+            .collect()
+    };
+    let mut seen: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+    let mut keep = |rows: Vec<crate::core::row::row::Row>| -> Result<Vec<(crate::core::row::row::Row, Vec<String>)>, String> {
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let key = literals(&row)?;
+            if all || seen.insert(key.clone()) {
+                out.push((row, key));
+            }
+        }
+        Ok(out)
+    };
+    let fill = |temp: &str, rows: &[(crate::core::row::row::Row, Vec<String>)]| {
+        let tuples: Vec<String> = rows.iter().map(|(_, key)| format!("({})", key.join(", "))).collect();
+        format!("INSERT INTO {} ({}) VALUES {}", temp, labels.join(", "), tuples.join(", "))
+    };
+    let create = |temp: &str| {
+        let definitions: Vec<String> = labels.iter().zip(columns.iter()).map(|(n, c)| format!("{} {}", n, c.sql_type)).collect();
+        format!("CREATE TABLE {} ({})", temp, definitions.join(", "))
+    };
+
+    let result = temp_name(&def.name, sql, index);
+    create_temporary(&create(&result), database, tx).await.map_err(|e| format!("could not materialise {subject}: {e}"))?;
+    temps.push(result.clone());
+    let mut working = keep(anchor_rows)?;
+    let mut total = working.len();
+    if !working.is_empty() {
+        crate::core::rql::executor::run_statement(&fill(&result, &working), database, tx)
+            .await
+            .map_err(|e| format!("could not fill {subject}: {e}"))?;
+    }
+    // A fresh working table each iteration: one table emptied and refilled
+    // kept every earlier iteration's rows as dead versions each scan steps
+    // over, and a 1000-deep recursion took twice as long.
+    let mut iteration = 0usize;
+    while !working.is_empty() {
+        if let Some(reason) = crate::core::cancel::tripped() {
+            return Err(reason.eval_error().as_str().to_string());
+        }
+        iteration += 1;
+        if iteration > RECURSIVE_ITERATION_LIMIT {
+            return Err(format!(
+                "{subject} recursed more than {RECURSIVE_ITERATION_LIMIT} times; a recursion with no end needs a \
+                 condition in its recursive term (an outer LIMIT does not stop it here), and a long series is \
+                 generate_series's"
+            ));
+        }
+        let work = temp_name(&format!("{}_w{}", def.name, iteration), sql, index);
+        create_temporary(&create(&work), database, tx).await.map_err(|e| format!("could not materialise {subject}: {e}"))?;
+        temps.push(work.clone());
+        let filled = crate::core::rql::executor::run_statement(&fill(&work, &working), database, tx).await;
+        let produced = match filled {
+            Ok(_) => {
+                let step = replace_relation_references(recursive_term, &def.name, &work);
+                crate::core::rql::executor::run_query_rows_scaled(&step, database, tx).await
+            }
+            Err(e) => Err(e),
+        };
+        // The working table is done with either way.
+        drop_temps(database, std::slice::from_ref(&work), tx).await;
+        temps.retain(|t| t != &work);
+        let (rows, _) = produced.map_err(|e| format!("{subject} failed: {e}"))?;
+        working = keep(rows)?;
+        if working.is_empty() {
+            break;
+        }
+        total += working.len();
+        if total > RECURSIVE_ROW_LIMIT {
+            return Err(format!(
+                "{subject} produced more than {RECURSIVE_ROW_LIMIT} rows; a recursion with no end needs a condition in its recursive term"
+            ));
+        }
+        crate::core::rql::executor::run_statement(&fill(&result, &working), database, tx)
+            .await
+            .map_err(|e| format!("could not fill {subject}: {e}"))?;
+    }
+    Ok(result)
 }
 
 /// Materialises one query into a temporary table and returns its name.
@@ -695,6 +1932,80 @@ fn declared_wide_types(
     labels: &[String],
     database: &Arc<Database>,
 ) -> Vec<Option<DbType>> {
+    declared_types(query, labels, database)
+        .into_iter()
+        .map(|t| t.filter(|t| matches!(t, DbType::JSONB | DbType::BYTEA | DbType::ARRAY)))
+        .collect()
+}
+
+/// The declared type of each of `labels`, read as a column of the one real
+/// relation `query` selects from, and `None` for a label that is not one.
+fn declared_types(
+    query: &str,
+    labels: &[String],
+    database: &Arc<Database>,
+) -> Vec<Option<DbType>> {
+    declared_types_among(query, labels, database, &[])
+}
+
+/// [`declared_types`], where the relation may also be one of `relations`:
+/// a CTE or a derived table a describe resolved from its own query. Those
+/// come first, as the statement reads them once it is materialised: a CTE
+/// is renamed to its temporary relation before the statement runs, so it
+/// stands in for a table of the same name.
+fn declared_types_among(
+    query: &str,
+    labels: &[String],
+    database: &Arc<Database>,
+    relations: &[(String, ScratchFields)],
+) -> Vec<Option<DbType>> {
+    declared_fields_among(query, labels, database, relations)
+        .into_iter()
+        // `literal_type`: a `timestamp` column is one.
+        .map(|f| f.map(|f| f.literal_type()))
+        .collect()
+}
+
+/// Whether each output column of `query`, by position, compares blank-padded
+/// with a `character(n)` value: a bare `character(n)` or `character
+/// varying` column, which PostgreSQL resolves to `bpchar` against one. Any
+/// other item — a text column, an expression, a column this cannot read —
+/// is text, which compares with `character(n)` exactly, trailing spaces
+/// kept (`a IN (SELECT t …)` does not take a `t` of `'ab  '` for `'ab'`).
+pub(crate) fn blank_padded_columns(query: &str, database: &Arc<Database>) -> Vec<bool> {
+    use crate::core::rql::type_modifier::TextTypmod;
+    let Some(list) = select_list_of(query) else {
+        return Vec::new();
+    };
+    let list = list.trim_start();
+    let list = match list.get(.."DISTINCT ".len()) {
+        Some(head) if head.eq_ignore_ascii_case("DISTINCT ") => &list["DISTINCT ".len()..],
+        _ => list,
+    };
+    let labels: Vec<String> = crate::core::rql::lexer_ct::split_definitions(list)
+        .iter()
+        .map(|item| item.trim())
+        .take_while(|item| !(*item == "*" || item.ends_with(".*")))
+        .map(|item| bare_column(split_alias(item).0).unwrap_or_default())
+        .collect();
+    declared_fields_among(query, &labels, database, &[])
+        .into_iter()
+        .map(|f| {
+            f.is_some_and(|f| {
+                f.db_type == DbType::STRING
+                    && matches!(f.text_typmod(), Some(TextTypmod::Bpchar(_) | TextTypmod::Varchar(_)))
+            })
+        })
+        .collect()
+}
+
+/// [`declared_types_among`]'s fields.
+fn declared_fields_among(
+    query: &str,
+    labels: &[String],
+    database: &Arc<Database>,
+    relations: &[(String, ScratchFields)],
+) -> Vec<Option<SchemaField>> {
     let none = vec![None; labels.len()];
     // A join has more than one relation behind its columns; this resolves only
     // the single-relation case rather than guessing which one a label meant.
@@ -714,23 +2025,191 @@ fn declared_wide_types(
     if name.is_empty() || name.contains('(') {
         return none;
     }
-    let Some(table) = database.tables.get(name) else {
+    let types_in = |fields: &[SchemaField]| -> Vec<Option<SchemaField>> {
+        labels
+            .iter()
+            .map(|label| {
+                fields
+                    .iter()
+                    .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(label))
+                    .cloned()
+            })
+            .collect()
+    };
+    if let Some((_, fields)) = relations.iter().find(|(alias, _)| alias.eq_ignore_ascii_case(name)) {
+        return types_in(fields);
+    }
+    let Some(table) = database.schema_view(name) else {
         return none;
     };
-    labels
+    types_in(&table.schema().fields)
+}
+
+/// For each output column of `query`, by position, whether a timestamp it
+/// yields is a `timestamptz` (`Some(true)`), a `timestamp` without time zone
+/// (`Some(false)`), or not known (`None`: not a timestamp, a `*`, a join, an
+/// item this cannot parse).
+///
+/// A scanned row carries a timestamp as the one storage type both are, so
+/// the row cannot say how its text is shown; the item's expression does
+/// (`expr::yields_timestamp`), read against the one relation the query
+/// selects from. What a scalar subquery's or an `INSERT … SELECT`'s value
+/// is rendered as for a text column: `(SELECT b …)` of a `timestamptz` into
+/// TEXT is '… +00', as PostgreSQL stores it, and was stored bare.
+pub(crate) fn zoned_timestamp_items(query: &str, database: &Arc<Database>) -> Vec<Option<bool>> {
+    let Some(list) = select_list_of(query) else {
+        return Vec::new();
+    };
+    let list = list.trim_start();
+    let list = match list.get(.."DISTINCT ".len()) {
+        Some(head) if head.eq_ignore_ascii_case("DISTINCT ") => &list["DISTINCT ".len()..],
+        _ => list,
+    };
+    let fields: Vec<SchemaField> = if crate::core::rql::join::statement_has_join(query) {
+        Vec::new()
+    } else {
+        crate::core::rql::join::find_keyword(query, "FROM", 0)
+            .and_then(|at| {
+                let name = query[at + "FROM".len()..]
+                    .split_whitespace()
+                    .next()?
+                    .trim_end_matches(|c: char| c == ';' || c == ',')
+                    .trim_matches('"')
+                    .to_string();
+                database.schema_view(&name).map(|t| t.schema().fields.iter().filter(|f| !f.is_deleted).cloned().collect())
+            })
+            .unwrap_or_default()
+    };
+    crate::core::rql::lexer_ct::split_definitions(list)
         .iter()
-        .map(|label| {
-            let field = table
-                .schema
-                .fields
-                .iter()
-                .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(label))?;
-            match field.db_type {
-                DbType::JSONB | DbType::BYTEA | DbType::ARRAY => Some(field.db_type.clone()),
-                _ => None,
-            }
+        .map(|item| item.trim())
+        .take_while(|item| !(*item == "*" || item.ends_with(".*")))
+        .map(|item| {
+            let text = split_alias(item).0.trim();
+            // `min(x)` and `max(x)` are `x`'s type; the expression parser
+            // does not read aggregates.
+            let text = min_max_argument(text).unwrap_or(text);
+            let expr = crate::core::rql::expr::parse(text, &fields).ok()?;
+            (crate::core::rql::expr::static_type(&expr) == DbType::DATETIME)
+                .then(|| !crate::core::rql::expr::yields_timestamp(&expr))
         })
         .collect()
+}
+
+/// The argument of `min(…)` or `max(…)` when `item` is exactly one such call.
+fn min_max_argument(item: &str) -> Option<&str> {
+    let head = item.get(..4)?;
+    if !(head.eq_ignore_ascii_case("min(") || head.eq_ignore_ascii_case("max(")) || !item.ends_with(')') {
+        return None;
+    }
+    let inner = &item[4..item.len() - 1];
+    // The closing parenthesis is the call's own: `max(a) + (b)` is not one.
+    let mut depth = 0i32;
+    let mut quote = false;
+    for c in inner.chars() {
+        match c {
+            '\'' => quote = !quote,
+            '(' if !quote => depth += 1,
+            ')' if !quote => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    (depth == 0 && !inner.trim().is_empty()).then_some(inner.trim())
+}
+
+/// Which output columns of `query`, by position, are stored documents, for
+/// the callers that compare its rows by value: `UNION`'s duplicate check and
+/// `IN (subquery)`. A scan reports a stored document as text, so without this
+/// `{"a":1}` and `{"a":1.0}` were two rows to `UNION`, and an `IN` list was
+/// built from the stored bytes as if they were text.
+///
+/// The same resolution as [`declared_wide_types`]: bare columns of one
+/// relation. Anything it cannot resolve is `false` and compares as before.
+///
+/// Each item is looked up by the column it reads, not by its output name. An
+/// alias is only a name: `doc->>'tag' AS doc` and `tag AS doc` are text, and
+/// looking `doc` up made them documents, so `IN` read text as encoded bytes
+/// and refused it, and `UNION` keyed a blob by its first byte and merged rows.
+/// `doc AS d`, the other way round, is the document column.
+pub(crate) fn document_columns(query: &str, database: &Arc<Database>) -> Vec<bool> {
+    declared_item_types(query, database)
+        .into_iter()
+        .map(|t| t == Some(DbType::JSONB))
+        .collect()
+}
+
+/// The declared type of each output column of `query`, by position, when the
+/// item is a bare column of the one relation it selects from; `None` for
+/// anything else. Looked up by the column read, not the output name, for the
+/// reason [`document_columns`] gives.
+///
+/// What a `UNION` widens its integer columns by: PostgreSQL gives a column
+/// that is `int` in one branch and `bigint` in another the type `bigint`, and
+/// the rows and the description sent to the client have to agree on it.
+pub(crate) fn declared_item_types(query: &str, database: &Arc<Database>) -> Vec<Option<DbType>> {
+    declared_item_types_among(query, database, &[])
+}
+
+/// [`declared_item_types`], where the relation read may also be one of
+/// `relations`: the CTEs and derived tables a describe resolved, which are
+/// not in `database.tables` until the statement is materialised to run.
+pub(crate) fn declared_item_types_among(
+    query: &str,
+    database: &Arc<Database>,
+    relations: &[(String, ScratchFields)],
+) -> Vec<Option<DbType>> {
+    let Some(list) = select_list_of(query) else {
+        return Vec::new();
+    };
+    let list = list.trim_start();
+    let list = match list.get(.."DISTINCT ".len()) {
+        Some(head) if head.eq_ignore_ascii_case("DISTINCT ") => &list["DISTINCT ".len()..],
+        _ => list,
+    };
+    // A `*` is several columns, so no item after it is at the position its
+    // place in the list says, as `output_names` notes. `SELECT *, n` was typed
+    // `[?, int]`, and a `UNION` widened the column after the `*` by `n`'s
+    // type: a text column described as `bigint`. The items before the first
+    // `*` are where they say, and are kept.
+    let labels: Vec<String> = crate::core::rql::lexer_ct::split_definitions(list)
+        .iter()
+        .map(|item| item.trim())
+        .take_while(|item| !(*item == "*" || item.ends_with(".*")))
+        .map(|item| bare_column(split_alias(item).0).unwrap_or_default())
+        .collect();
+    declared_types_among(query, &labels, database, relations)
+}
+
+/// The output name of each item in a `SELECT`'s list: its alias, or the
+/// column it reads, and `None` for an item this cannot name (an expression,
+/// or a `*` that stands for several columns).
+///
+/// What a `UNION`'s trailing `ORDER BY` resolves a name against: PostgreSQL
+/// names the combined columns after the first branch.
+pub(crate) fn output_names(query: &str) -> Vec<Option<String>> {
+    let Some(list) = select_list_of(query) else {
+        return Vec::new();
+    };
+    let list = list.trim_start();
+    let list = match list.get(.."DISTINCT ".len()) {
+        Some(head) if head.eq_ignore_ascii_case("DISTINCT ") => &list["DISTINCT ".len()..],
+        _ => list,
+    };
+    let items = crate::core::rql::lexer_ct::split_definitions(list);
+    // A `*` is several columns, so no item after it is at the position its
+    // place in the list says. Naming none is better than naming the wrong one.
+    if items.iter().any(|item| {
+        let item = item.trim();
+        item == "*" || item.ends_with(".*")
+    }) {
+        return Vec::new();
+    }
+    items.iter().map(|item| item_label(item)).collect()
 }
 
 pub async fn materialize_query(
@@ -740,113 +2219,271 @@ pub async fn materialize_query(
     database: &Arc<Database>,
     tx: crate::core::mvcc::transaction::TxId,
 ) -> Result<String, String> {
-    let rows = crate::core::rql::executor::run_query_rows(query, database, tx)
-        .await
-        .map_err(|e| format!("the subquery for '{}' failed: {}", alias, e))?;
+    // An explicit `return`, matching the same shape in `pgwire`: two cfg'd
+    // blocks in tail position depend on cfg-stripping to decide which one is
+    // the tail expression, and saying so outright costs nothing.
+    #[cfg(not(feature = "query_stats"))]
+    {
+        return materialize_query_inner(query, alias, statement, database, tx).await;
+    }
 
-    let list = select_list_of(query)
-        .ok_or_else(|| format!("the subquery for '{}' must be a SELECT", alias))?;
-    let labels: Vec<String> = crate::core::rql::lexer_ct::split_definitions(list)
-        .iter()
-        .map(|item| item_label(item))
-        .collect::<Option<Vec<String>>>()
-        .ok_or_else(|| {
-            format!(
-                "the subquery for '{}' has a column this cannot name; alias it with AS",
-                alias
-            )
+    // A wrapper rather than a timer threaded through the body, because the body
+    // returns early through `?` in a dozen places and a count that a failure
+    // path could skip is a count nobody can subtract from a duration.
+    #[cfg(feature = "query_stats")]
+    {
+        let started = std::time::Instant::now();
+        let result = materialize_query_inner(query, alias, statement, database, tx).await;
+        // Only a relation that was actually built, which is the same rule the
+        // `WITH` path follows: a materialisation that failed produced nothing
+        // to have been slow *for*, and the statement carrying it is recorded as
+        // the failure it was.
+        if result.is_ok() {
+            crate::core::query_stats::note_materialised(
+                started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            );
+        }
+        result
+    }
+}
+
+async fn materialize_query_inner(
+    query: &str,
+    alias: &str,
+    statement: &str,
+    database: &Arc<Database>,
+    tx: crate::core::mvcc::transaction::TxId,
+) -> Result<String, String> {
+    // A derived table may hold derived tables of its own, to any depth. Those
+    // are materialised first, so the query that runs here reads relations
+    // only. Without this the inner query reached the scan with `FROM (SELECT`
+    // still in it and failed as "Table not found". Each level drops what it
+    // built once its own relation is filled: the rows have been copied out.
+    let nested = Box::pin(materialize_derived(query, database, tx)).await?;
+    let result = match &nested {
+        Some(inner) => {
+            build_derived(&inner.rewritten, alias, statement, database, tx).await
+        }
+        None => build_derived(query, alias, statement, database, tx).await,
+    };
+    if let Some(inner) = &nested {
+        drop_temps(database, &inner.temps, tx).await;
+    }
+    result
+}
+
+/// [`materialize_query`] for a query that reads relations only.
+async fn build_derived(
+    query: &str,
+    alias: &str,
+    statement: &str,
+    database: &Arc<Database>,
+    tx: crate::core::mvcc::transaction::TxId,
+) -> Result<String, String> {
+    let (rows, scales) = crate::core::rql::executor::run_query_rows_scaled(query, database, tx)
+        .await
+        .map_err(|e| {
+            // A value's input error is PostgreSQL's own words, unwrapped:
+            // a join operand computed by a derived table (`join_on`) is
+            // reported as the join reports it there.
+            let inner = e.strip_prefix("subquery failed: ").unwrap_or(&e);
+            if crate::core::rql::expr::is_input_error(inner) {
+                inner.to_string()
+            } else {
+                format!("the subquery for '{}' failed: {}", alias, e)
+            }
         })?;
 
-    // The type of each column, taken from the first row that actually has a
-    // value there.
-    //
-    // Sampling only `rows.first()` was not enough: a column that happens to be
-    // NULL in the first row arrives as `DbType::NULL`, which is the absence of
-    // a value rather than a type, and the whole statement failed on it. Every
-    // row is consulted, and a column that is NULL in all of them becomes TEXT —
-    // it holds nothing, so the choice cannot lose anything.
-    let declared = declared_wide_types(query, &labels, database);
-    let types: Vec<&'static str> = (0..labels.len())
-        .map(|index| {
-            let sampled = rows
-                .iter()
-                .filter_map(|row| row.columns.get(index))
-                .find_map(|c| sql_type_of(&c.column_type));
-            let widened = declared.get(index).and_then(|w| w.as_ref()).and_then(sql_type_of);
-            match sampled {
-                // `TEXT` is what a scan reports for every variable-width type,
-                // so it is the one answer worth second-guessing.
-                Some("TEXT") | None => widened.unwrap_or("TEXT"),
-                Some(other) => other,
-            }
-        })
-        .collect();
+    if select_list_of(query).is_none() {
+        return Err(format!("the subquery for '{}' must be a SELECT", alias));
+    }
+    let labels = select_labels(query, database).await.ok_or_else(|| {
+        format!(
+            "the subquery for '{}' has a column this cannot name; alias it with AS",
+            alias
+        )
+    })?;
 
     let temp = temp_name(alias, statement, 0);
-    let columns: Vec<String> = labels
+    let mut created = false;
+    let built = build_relation(
+        query,
+        &temp,
+        &labels,
+        &rows,
+        scales.as_deref(),
+        &format!("the subquery for '{}'", alias),
+        database,
+        tx,
+        &mut created,
+    )
+    .await;
+    if let Err(e) = built {
+        // The caller is handed a name only on success, so a table created
+        // before the fill failed is dropped here.
+        if created {
+            drop_temps(database, std::slice::from_ref(&temp), tx).await;
+        }
+        return Err(e);
+    }
+    Ok(temp)
+}
+
+/// Rows per `INSERT` a `CREATE TABLE … AS` fills its table with: a statement
+/// per this many rows rather than one holding every row's text.
+const TABLE_AS_FILL_ROWS: usize = 512;
+
+/// `CREATE TABLE … AS` (`ctas`): runs the query once in `tx`, creates the
+/// table typed as a CTE's relation over the same query would be (the query's
+/// description, so a client reading the new table sees the types it was
+/// told), and fills it by `INSERT`s of its own. `Ok(Some(rows))` written, or
+/// `Ok(None)` for `WITH NO DATA`. The caller has checked the name is free.
+///
+/// DDL is not transactional here: a fill that fails drops the table it
+/// created, so a failed statement leaves nothing behind, as in PostgreSQL.
+pub(crate) async fn create_table_as(
+    statement: &crate::core::rql::ctas::CreateTableAs,
+    database: &Arc<Database>,
+    tx: crate::core::mvcc::transaction::TxId,
+) -> Result<Option<u64>, String> {
+    // The rewrite a top-level SELECT gets in `pgwire` (which saw this
+    // statement as a CREATE), so the query runs as it would on its own.
+    // `TABLE t` is `SELECT * FROM t`.
+    let table_form = crate::core::rql::ctas::table_as_select(&statement.query);
+    let query = table_form.as_deref().unwrap_or(&statement.query);
+    let distinct_on = crate::core::rql::distinct_on::rewrite_statement(query);
+    let query = distinct_on.as_deref().unwrap_or(query);
+    let materialized = materialize(query, database, tx).await?;
+    let after_cte = materialized.as_ref().map(|m| m.rewritten.as_str()).unwrap_or(query);
+    let derived = match Box::pin(materialize_derived(after_cte, database, tx)).await {
+        Ok(d) => d,
+        Err(e) => {
+            if let Some(m) = &materialized {
+                drop_temps(database, &m.temps, tx).await;
+            }
+            return Err(e);
+        }
+    };
+    let query = derived.as_ref().map(|d| d.rewritten.as_str()).unwrap_or(after_cte);
+    let result = Box::pin(build_table_as(statement, query, database, tx)).await;
+    if let Some(d) = &derived {
+        drop_temps(database, &d.temps, tx).await;
+    }
+    if let Some(m) = &materialized {
+        drop_temps(database, &m.temps, tx).await;
+    }
+    result
+}
+
+/// The column names a query's result carries, as PostgreSQL names them
+/// (`count`, `upper`, `?column?`): its description's, else the select
+/// list's own labels.
+async fn result_labels(query: &str, database: &Arc<Database>) -> Option<Vec<String>> {
+    match Box::pin(crate::pgwire::describe_query(database, query)).await {
+        Ok(Some((fields, _))) if !fields.is_empty() => Some(fields.into_iter().map(|(name, _)| name).collect()),
+        _ => select_labels(query, database).await,
+    }
+}
+
+/// [`create_table_as`] for a query that reads relations only.
+async fn build_table_as(
+    statement: &crate::core::rql::ctas::CreateTableAs,
+    query: &str,
+    database: &Arc<Database>,
+    tx: crate::core::mvcc::transaction::TxId,
+) -> Result<Option<u64>, String> {
+    use crate::core::rql::ctas::quote_ident;
+    if !query.trim_start().get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT")) {
+        return Err("CREATE TABLE … AS over anything but a SELECT or TABLE is not supported; write it as a SELECT".to_string());
+    }
+    // The query's own error, as it would be on its own: not the subquery
+    // runner's prefix.
+    let (rows, scales) = crate::core::rql::executor::run_query_rows_scaled(query, database, tx)
+        .await
+        .map_err(|e| e.strip_prefix("subquery failed: ").map(str::to_string).unwrap_or(e))?;
+    let labels = result_labels(query, database)
+        .await
+        .ok_or_else(|| "CREATE TABLE … AS has a column this cannot name; alias it with AS".to_string())?;
+    if statement.columns.len() > labels.len() {
+        return Err("too many column names were specified".to_string());
+    }
+    // The statement's list names the leading columns; the rest keep theirs.
+    let names: Vec<&str> = labels
         .iter()
-        .zip(types.iter())
-        .map(|(name, ty)| format!("{} {}", name, ty))
+        .enumerate()
+        .map(|(index, label)| statement.columns.get(index).map_or(label.as_str(), String::as_str))
+        .collect();
+    for (index, name) in names.iter().enumerate() {
+        if names[..index].contains(name) {
+            return Err(format!("column \"{name}\" specified more than once"));
+        }
+    }
+    if let Some(row) = rows.first() {
+        if row.columns.len() < labels.len() {
+            return Err(format!(
+                "CREATE TABLE … AS: the query returned {} columns but names {}",
+                row.columns.len(),
+                labels.len()
+            ));
+        }
+    }
+    // Typed under the query's own labels, which is what the declared-type
+    // lookups match against; the table then takes the statement's names.
+    let columns = relation_columns(query, &labels, &rows, scales.as_deref(), database)
+        .await
+        .map_err(|index| {
+            format!(
+                "CREATE TABLE … AS: the query returned a type that cannot be stored in column '{}'",
+                names.get(index).copied().unwrap_or("?")
+            )
+        })?;
+    let definitions: Vec<String> = names
+        .iter()
+        .zip(columns.iter())
+        .map(|(name, column)| format!("{} {}", quote_ident(name), column.sql_type))
         .collect();
     crate::core::rql::executor::run_statement(
-        &format!("CREATE TABLE {} ({})", temp, columns.join(", ")),
+        &format!("CREATE TABLE {} ({})", statement.name, definitions.join(", ")),
         database,
         tx,
     )
-    .await
-    .map_err(|e| format!("could not materialise '{}': {}", alias, e))?;
-
-    if !rows.is_empty() {
-        let mut tuples: Vec<String> = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let mut parts: Vec<String> = Vec::with_capacity(labels.len());
-            for (index, column) in row.columns.iter().take(labels.len()).enumerate() {
-                // The literal has to be written in the same type the column was
-                // created as. A scan reports a stored document as `STRING`, so
-                // rendering it that way quoted the raw encoded bytes and the
-                // insert into the (correctly) `JSONB` column was refused as a
-                // schema mismatch — the type had to be recovered on both sides
-                // or on neither.
-                let as_type = match declared.get(index).and_then(|w| w.clone()) {
-                    Some(wide) if column.column_type == DbType::STRING => wide,
-                    _ => column.column_type.clone(),
-                };
-                parts.push(
-                    crate::core::rql::subquery::value_to_literal(
-                        &as_type,
-                        column.data.into_slice(),
-                    )
-                    .ok_or_else(|| {
-                        // Naming the type and the column is the difference
-                        // between a five-minute fix and a hunt: the message
-                        // without them says only that something, somewhere in
-                        // the select list, has no literal form.
-                        format!(
-                            "the subquery for '{}' returned a {:?} value in column '{}' that cannot be stored",
-                            alias,
-                            as_type,
-                            labels.get(index).map(String::as_str).unwrap_or("?"),
-                        )
-                    })?,
-                );
-            }
-            tuples.push(format!("({})", parts.join(", ")));
-        }
-        crate::core::rql::executor::run_statement(
-            &format!(
-                "INSERT INTO {} ({}) VALUES {}",
-                temp,
-                labels.join(", "),
-                tuples.join(", ")
-            ),
-            database,
-            tx,
-        )
-        .await
-        .map_err(|e| format!("could not fill '{}': {}", alias, e))?;
+    .await?;
+    if !statement.with_data {
+        return Ok(None);
     }
-
-    Ok(temp)
+    let column_list: Vec<String> = names.iter().map(|name| quote_ident(name)).collect();
+    let column_list = column_list.join(", ");
+    let filled: Result<(), String> = async {
+        for chunk in rows.chunks(TABLE_AS_FILL_ROWS) {
+            let mut tuples: Vec<String> = Vec::with_capacity(chunk.len());
+            for row in chunk {
+                let mut parts: Vec<String> = Vec::with_capacity(names.len());
+                for (index, (cell, column)) in row.columns.iter().zip(columns.iter()).enumerate() {
+                    parts.push(cell_literal(column, cell).ok_or_else(|| {
+                        format!(
+                            "CREATE TABLE … AS: the query returned a {:?} value in column '{}' that cannot be stored",
+                            column.declared.as_ref().unwrap_or(&cell.column_type),
+                            names.get(index).copied().unwrap_or("?"),
+                        )
+                    })?);
+                }
+                tuples.push(format!("({})", parts.join(", ")));
+            }
+            crate::core::rql::executor::run_statement(
+                &format!("INSERT INTO {} ({}) VALUES {}", statement.name, column_list, tuples.join(", ")),
+                database,
+                tx,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = filled {
+        let _ = crate::core::rql::executor::run_statement(&format!("DROP TABLE {}", statement.name), database, tx).await;
+        return Err(e);
+    }
+    Ok(Some(rows.len() as u64))
 }
 
 /// Drops the temporary tables a statement materialised. Best effort: a failure
@@ -857,6 +2494,7 @@ pub async fn drop_temps(
     tx: crate::core::mvcc::transaction::TxId,
 ) {
     for temp in temps {
+        crate::owner_probe!(crate::core::mvcc::owner::probe::Site::DropTemps, tx, database);
         let sql = format!("DROP TABLE {}", temp);
         if let Err(e) = crate::core::rql::executor::run_statement(&sql, database, tx).await {
             log::warn!("could not drop the temporary table {}: {}", temp, e);
@@ -869,14 +2507,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recursive_is_refused_by_keyword() {
-        // The one that must never be approximated: run as non-recursive it
-        // returns the base case and no error.
-        let err = split_with("WITH RECURSIVE t AS (SELECT 1) SELECT * FROM t").unwrap_err();
-        assert!(err.contains("RECURSIVE"), "{}", err);
-        // A CTE merely *named* something starting with "recursive" is fine.
-        let ok = split_with("WITH recursive_totals AS (SELECT a FROM b) SELECT a FROM recursive_totals");
-        assert!(ok.is_ok(), "{:?}", ok.err());
+    fn recursive_marks_every_definition_and_only_the_keyword_does() {
+        // Run as non-recursive it would return the base case and no error, so
+        // the keyword has to reach the materialisation.
+        let (defs, rest) = split_with("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3), u AS (SELECT 2) SELECT * FROM t")
+            .expect("split")
+            .expect("a WITH");
+        assert!(defs.iter().all(|d| d.recursive));
+        assert_eq!(defs[0].columns.as_deref(), Some(&["n".to_string()][..]));
+        assert_eq!(rest, "SELECT * FROM t");
+        let (anchor, all, term) = recursive_split(&defs[0], &defs[0].body).expect("recursive").expect("its form");
+        assert_eq!((anchor, all, term), ("SELECT 1", true, "SELECT n + 1 FROM t WHERE n < 3"));
+        assert!(recursive_split(&defs[1], &defs[1].body).is_none(), "u does not name itself");
+        // A CTE merely *named* something starting with "recursive" is not.
+        let (defs, _) = split_with("WITH recursive_totals AS (SELECT a FROM b) SELECT a FROM recursive_totals")
+            .expect("split")
+            .expect("a WITH");
+        assert!(!defs[0].recursive);
+        // PostgreSQL 14's SEARCH and CYCLE are refused rather than dropped.
+        let err = split_with("WITH RECURSIVE t AS (SELECT 1 UNION ALL SELECT 1 FROM t) CYCLE x SET y USING z SELECT * FROM t").unwrap_err();
+        assert!(err.contains("CYCLE"), "{err}");
     }
 
     #[test]
@@ -888,8 +2538,9 @@ mod tests {
 
     #[test]
     fn splits_one_and_several_definitions() {
-        let (defs, rest) =
-            split_with("WITH a AS (SELECT id FROM t) SELECT id FROM a").unwrap().unwrap();
+        let (defs, rest) = split_with("WITH a AS (SELECT id FROM t) SELECT id FROM a")
+            .unwrap()
+            .unwrap();
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "a");
         assert_eq!(defs[0].body, "SELECT id FROM t");
@@ -922,23 +2573,43 @@ mod tests {
         assert_eq!(item_label("id").as_deref(), Some("id"));
         assert_eq!(item_label("\"id\"").as_deref(), Some("id"));
         assert_eq!(item_label("count(*) AS n").as_deref(), Some("n"));
-        // Unnameable rather than invented: the outer query refers to these by
-        // name, so guessing would bind the wrong column.
-        assert_eq!(item_label("count(*)"), None);
+        // PostgreSQL's own names, not guesses: `WITH c AS (SELECT count(*)
+        // FROM t) SELECT count FROM c` and `SELECT 'x'::text` named `text`
+        // are what it answers. Refused, every such CTE failed there.
+        assert_eq!(item_label("count(*)").as_deref(), Some("count"));
+        assert_eq!(item_label("'x'::text").as_deref(), Some("text"));
+        assert_eq!(item_label("upper(s)").as_deref(), Some("upper"));
+        // Unnameable rather than invented. A star is expanded from the
+        // query's description instead (`select_labels`), and an item
+        // PostgreSQL itself calls `?column?` has no name to refer to.
         assert_eq!(item_label("*"), None);
+        assert_eq!(item_label("t.*"), None);
+        assert_eq!(item_label("1 + 2"), None);
     }
 
     #[test]
     fn only_relation_references_are_replaced() {
         let f = replace_relation_references;
         assert_eq!(f("SELECT a FROM cte", "cte", "__t"), "SELECT a FROM __t");
-        assert_eq!(f("SELECT a FROM x JOIN cte ON 1", "cte", "__t"), "SELECT a FROM x JOIN __t ON 1");
+        assert_eq!(
+            f("SELECT a FROM x JOIN cte ON 1", "cte", "__t"),
+            "SELECT a FROM x JOIN __t ON 1"
+        );
         // Qualifying something is a relation reference too.
-        assert_eq!(f("SELECT cte.id FROM cte", "cte", "__t"), "SELECT __t.id FROM __t");
+        assert_eq!(
+            f("SELECT cte.id FROM cte", "cte", "__t"),
+            "SELECT __t.id FROM __t"
+        );
         // A longer identifier merely starting with the name is untouched.
-        assert_eq!(f("SELECT a FROM cte_extra", "cte", "__t"), "SELECT a FROM cte_extra");
+        assert_eq!(
+            f("SELECT a FROM cte_extra", "cte", "__t"),
+            "SELECT a FROM cte_extra"
+        );
         // Inside a literal it is data.
-        assert_eq!(f("SELECT 'cte' FROM cte", "cte", "__t"), "SELECT 'cte' FROM __t");
+        assert_eq!(
+            f("SELECT 'cte' FROM cte", "cte", "__t"),
+            "SELECT 'cte' FROM __t"
+        );
     }
 
     #[test]
@@ -949,9 +2620,21 @@ mod tests {
         let sql = "INSERT INTO users (id, domain_id, name) \
                    SELECT domain_id.id, 'x' FROM domain_id";
         let out = replace_relation_references(sql, "domain_id", "__cte_d");
-        assert!(out.contains("(id, domain_id, name)"), "column list changed: {}", out);
-        assert!(out.contains("__cte_d.id"), "qualified ref not rewritten: {}", out);
-        assert!(out.contains("FROM __cte_d"), "relation not rewritten: {}", out);
+        assert!(
+            out.contains("(id, domain_id, name)"),
+            "column list changed: {}",
+            out
+        );
+        assert!(
+            out.contains("__cte_d.id"),
+            "qualified ref not rewritten: {}",
+            out
+        );
+        assert!(
+            out.contains("FROM __cte_d"),
+            "relation not rewritten: {}",
+            out
+        );
     }
 
     #[test]
@@ -964,6 +2647,28 @@ mod tests {
         );
         assert!(out.contains("users.domain_id"), "{}", out);
         assert!(out.contains("FROM __cte_d"), "{}", out);
+    }
+
+    /// The statement temporaries' prefix is refused for any other table,
+    /// whatever its case, and open only inside this module's own creates
+    /// and a replica's apply.
+    ///
+    /// Mutation: `reserved_name_refusal` ignoring `CREATING_TEMPORARY` (the
+    /// scoped calls are refused too).
+    #[tokio::test]
+    async fn the_temporary_prefix_is_reserved_outside_this_module() {
+        for name in ["__cte_orders", "__CTE_x", "__Cte_", &temp_name("c", "WITH c AS (SELECT 1) SELECT 1", 0)] {
+            let refused = reserved_name_refusal(name).unwrap_or_else(|| panic!("{name} was accepted"));
+            assert_eq!(crate::pgwire::sqlstate_for(&refused), "42939", "{refused}");
+            assert_eq!(
+                crate::pgwire::sqlstate_for(&format!("could not rename t to {name}: {refused}")),
+                "42939"
+            );
+            assert_eq!(allowing_temporaries(async { reserved_name_refusal(name) }).await, None, "{name}");
+        }
+        for name in ["orders", "_cte_x", "__ct", "my__cte_x", "__cat_tables_1f"] {
+            assert_eq!(reserved_name_refusal(name), None, "{name}");
+        }
     }
 
     #[test]
@@ -982,12 +2687,79 @@ mod tests {
     }
 
     #[test]
-    fn a_with_clause_that_renames_its_columns_is_refused() {
-        let err = split_with("WITH a (x, y) AS (SELECT 1, 2) SELECT x FROM a").unwrap_err();
-        assert!(err.contains("renames its columns"), "{}", err);
+    fn a_with_clause_after_the_insert_target_is_moved_to_the_front() {
+        assert_eq!(
+            hoist_insert_with(
+                "INSERT INTO t (a, b) WITH w AS (SELECT n FROM d) SELECT n, 'x' FROM w \
+                 ON CONFLICT (a) DO NOTHING RETURNING a"
+            )
+            .as_deref(),
+            Some(
+                "WITH w AS (SELECT n FROM d) INSERT INTO t (a, b) SELECT n, 'x' FROM w \
+                 ON CONFLICT (a) DO NOTHING RETURNING a"
+            )
+        );
+        // No column list, and several definitions.
+        assert_eq!(
+            hoist_insert_with("INSERT INTO t WITH v AS (SELECT 1 AS a), w AS (SELECT a FROM v) SELECT a FROM w")
+                .as_deref(),
+            Some("WITH v AS (SELECT 1 AS a), w AS (SELECT a FROM v) INSERT INTO t SELECT a FROM w")
+        );
+        // Everything else is left as written.
+        assert!(hoist_insert_with("INSERT INTO t (a) SELECT a FROM w").is_none());
+        assert!(hoist_insert_with("INSERT INTO t (a) VALUES (1)").is_none());
+        assert!(hoist_insert_with("WITH w AS (SELECT 1 AS a) INSERT INTO t SELECT a FROM w").is_none());
+        assert!(hoist_insert_with("INSERT INTO withdrawals SELECT a FROM w").is_none());
+        // CREATE TABLE … AS, its trailing WITH NO DATA kept after the query.
+        assert_eq!(
+            hoist_insert_with("CREATE TABLE c (x) AS WITH w AS (SELECT n FROM d) SELECT n FROM w WITH NO DATA")
+                .as_deref(),
+            Some("WITH w AS (SELECT n FROM d) CREATE TABLE c (x) AS SELECT n FROM w WITH NO DATA")
+        );
+        assert!(hoist_insert_with("CREATE TABLE c AS SELECT n FROM d").is_none());
+        assert!(hoist_insert_with("CREATE TABLE c (n INT)").is_none());
+    }
+
+    #[test]
+    fn a_body_of_named_constants_is_one_typed_row() {
+        let columns =
+            constant_body("SELECT 50 AS a, 'it''s' AS b, NULL AS c, true AS d, 1.50 AS e, 3000000000 AS f")
+                .expect("constant");
+        let labels: Vec<&str> = columns.iter().map(|c| c.label.as_str()).collect();
+        let types: Vec<&str> = columns.iter().map(|c| c.sql_type.as_str()).collect();
+        assert_eq!(labels, ["a", "b", "c", "d", "e", "f"]);
+        assert_eq!(types, ["INTEGER", "TEXT", "TEXT", "BOOLEAN", "NUMERIC(38,2)", "BIGINT"]);
+        assert_eq!(columns[1].value, "'it''s'");
+        assert_eq!(columns[4].db_type, DbType::DECIMAL);
+        // A column, a relation or an unnamed item is a query, not a constant row.
+        assert!(constant_body("SELECT n AS a").is_none());
+        assert!(constant_body("SELECT 1 AS a FROM t").is_none());
+        assert!(constant_body("SELECT 1").is_none());
+        assert!(constant_body("SELECT 'a' || 'b' AS c").is_none());
+    }
+
+    #[test]
+    fn a_with_clause_keeps_its_column_list() {
+        let (defs, _) = split_with("WITH a (x, \"y\") AS (SELECT 1, 2) SELECT x FROM a").expect("split").expect("a WITH");
+        assert_eq!(defs[0].columns.as_deref(), Some(&["x".to_string(), "y".to_string()][..]));
+        assert!(split_with("WITH a (x, ) AS (SELECT 1, 2) SELECT x FROM a").is_err());
+        // Fewer names than columns rename the first ones; more is 42P10.
+        assert_eq!(renamed(vec!["?column?".into(), "b".into()], &defs[0]).unwrap(), ["x", "y"]);
+        let one = CteDef { name: "t".into(), body: String::new(), columns: Some(vec!["k".into()]), recursive: false };
+        assert_eq!(renamed(vec!["a".into(), "b".into()], &one).unwrap(), ["k", "b"]);
+        assert!(renamed(vec![], &one).unwrap_err().contains("has 0 columns available but 1 columns specified"));
+    }
+
+    #[test]
+    fn values_anchor_reads_as_a_select() {
+        assert_eq!(
+            values_as_select("VALUES (1, 'a,b'), (2, (3))").as_deref(),
+            Some("SELECT 1 AS column1, 'a,b' AS column2 UNION ALL SELECT 2, (3)")
+        );
+        assert!(values_as_select("SELECT 1").is_none());
+        assert!(values_as_select("VALUES (1) x").is_none());
     }
 }
-
 
 /// Materialises every derived table — `FROM (SELECT …) alias` — into a
 /// temporary table and points the statement at it.
@@ -1024,6 +2796,66 @@ async fn materialize_derived_inner(
     let mut current = sql.to_string();
     let mut found_any = false;
 
+    // A correlated scalar subquery, as the `LATERAL` join it means
+    // (`rql::correlated`), materialised with the other `LATERAL` items below.
+    // The top level rewrites its own before it gets here, but a derived
+    // table's or a CTE's body never passed there: its subquery's text reached
+    // the select-list parser, which read it as an expression over the outer
+    // row and answered `'t'` — or `max(ms.id)` under an aggregate — for
+    // every row, without an error.
+    if let Some(rewritten) = crate::core::rql::correlated::rewrite_select(&current) {
+        current = rewritten?;
+        found_any = true;
+    }
+
+    // `SELECT generate_series(1, 3)`: the `FROM` form it means.
+    if let Some(form) = crate::core::rql::table_functions::select_list_form(&current) {
+        current = form;
+        found_any = true;
+    }
+    // A computed `FROM` item — `(VALUES …) v(x)`, `generate_series(…) g`,
+    // `unnest(…)` — becomes a temporary filled with its rows, as a constant
+    // CTE body does: its arguments are constants, so nothing is run.
+    for index in 0..16usize {
+        let Some(item) = crate::core::rql::table_functions::next_item(&current) else {
+            break;
+        };
+        found_any = true;
+        let computed = match crate::core::rql::table_functions::compute(&item) {
+            Ok(computed) => computed,
+            // A function over an earlier item's column is a `LATERAL` item,
+            // with or without the word.
+            Err(e) if crate::core::rql::lateral::is_outer_reference_refusal(&e) => {
+                current = crate::core::rql::lateral::mark_implicit(&current, item.start);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let temp = temp_name(&item.alias, &current, 100 + index);
+        let definitions: Vec<String> = computed
+            .columns
+            .iter()
+            .map(|(name, _, sql_type)| format!("{} {}", crate::core::rql::ctas::quote_ident(name), sql_type))
+            .collect();
+        create_temporary(&format!("CREATE TABLE {} ({})", temp, definitions.join(", ")), database, tx)
+            .await
+            .map_err(|e| format!("could not materialise '{}': {}", item.alias, e))?;
+        temps.push(temp.clone());
+        let names: Vec<String> =
+            computed.columns.iter().map(|(name, _, _)| crate::core::rql::ctas::quote_ident(name)).collect();
+        for chunk in computed.rows.chunks(TABLE_AS_FILL_ROWS) {
+            let tuples: Vec<String> = chunk.iter().map(|row| format!("({})", row.join(", "))).collect();
+            crate::core::rql::executor::run_statement(
+                &format!("INSERT INTO {} ({}) VALUES {}", temp, names.join(", "), tuples.join(", ")),
+                database,
+                tx,
+            )
+            .await
+            .map_err(|e| format!("could not fill '{}': {}", item.alias, e))?;
+        }
+        current = format!("{}{} {}{}", &current[..item.start], temp, item.alias, &current[item.end..]);
+    }
+
     // Bounded: each pass replaces one derived table with a name, so the count
     // strictly decreases. The cap is a backstop against a rewrite that fails to
     // shrink rather than a real limit on how many a statement may have.
@@ -1032,23 +2864,29 @@ async fn materialize_derived_inner(
             break;
         };
         found_any = true;
+        crate::owner_probe!(crate::core::mvcc::owner::probe::Site::Derived, tx, database);
 
         let temp = materialize_query(&inner, &alias, &current, database, tx).await?;
         temps.push(temp.clone());
-        current = format!(
-            "{}{} {}{}",
-            &current[..start],
-            temp,
-            alias,
-            &current[end..]
-        );
+        current = format!("{}{} {}{}", &current[..start], temp, alias, &current[end..]);
         let _ = index;
+    }
+
+    // `LATERAL` items last: each reads the items before it, which are
+    // relations by now, and its keys join to them (`lateral`). Its body sits
+    // in parentheses after `LATERAL`, where neither pass above looks.
+    if let Some(rewritten) = crate::core::rql::lateral::materialize(&current, database, temps, tx).await? {
+        current = rewritten;
+        found_any = true;
     }
 
     if !found_any {
         return Ok(None);
     }
-    Ok(Some(Materialized { rewritten: current, temps: std::mem::take(temps) }))
+    Ok(Some(Materialized {
+        rewritten: current,
+        temps: std::mem::take(temps),
+    }))
 }
 
 /// Finds the first `FROM (SELECT …) alias` or `JOIN (SELECT …) alias`.
@@ -1100,7 +2938,11 @@ pub fn next_derived_table(sql: &str) -> Option<(usize, usize, String, String)> {
                 (first, first.len())
             };
             let alias = alias.trim_matches('"');
-            if alias.is_empty() || !alias.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            if alias.is_empty()
+                || !alias
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
             {
                 // PostgreSQL requires one, and guessing a name would make the
                 // rewritten statement refer to something the caller never wrote.
@@ -1135,8 +2977,7 @@ mod derived_tests {
 
     #[test]
     fn the_as_spelling_is_accepted() {
-        let (_, _, _, alias) =
-            next_derived_table("SELECT * FROM (SELECT 1) AS r").expect("found");
+        let (_, _, _, alias) = next_derived_table("SELECT * FROM (SELECT 1) AS r").expect("found");
         assert_eq!(alias, "r");
     }
 

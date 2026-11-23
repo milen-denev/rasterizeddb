@@ -231,6 +231,7 @@ process list.
 | `--s3-rollover-hours` | 0 | Fresh snapshot, then delete every earlier generation. 0 = never |
 | `--s3-staging-max-mb` | 4096 | Safety valve; see §10.7. 0 = no ceiling |
 | `--s3-backup-now` | off | Snapshot at *every* start, on top of the schedule |
+| `--s3-start-offline` | off | Start even when the bucket does not answer; hold the log locally until it does. See §10.6a |
 
 Restore:
 
@@ -314,6 +315,18 @@ a rolled-back one — and the rows would still be physically present, so it woul
 look fine. The file is an ordinary member of the database directory and is
 captured like any other; `transaction_outcomes_survive_a_restore` pins it.
 
+Its neighbour `db_transactions.next` holds the transaction-id reservation: no
+id at or above it has been handed out, and an open resumes there. Without it a
+restored database could hand out again the id of a writer whose rows the
+replay brought back but whose outcome it did not, and its new owner would
+adopt those rows. Each raise of the mark is a logged write, so the replay that
+restores the rows restores the mark past them;
+`a_restore_resumes_transaction_ids_past_every_one_the_window_issued` pins it.
+While the mark cannot be raised (a full disk), ids are still handed out so
+reads go on, but a transaction that wrote under an id at or above the mark is
+refused at commit and rolled back, as `53100 disk_full` when the disk is full
+and `58030 io_error` otherwise, until a later `begin` raises it.
+
 
 ### 10.1 Compaction
 
@@ -387,6 +400,54 @@ retroactively.
 
 Losing point-in-time coverage is bad. Taking the database down to preserve it
 is worse.
+
+The ceiling is checked after every flush, failed or not, and by a 10-second
+tick whenever a ceiling is set, with or without a bundle trigger. Until
+2026-11-16 it was checked only after a flush that *succeeded*. The tick also
+checked it only while staging was below the bundle size, because above it the
+tick just retried the flush. So the one case it exists for, a bucket that keeps
+refusing, never suspended anything, and staging grew until the disk filled.
+`SHOW BACKUP STATUS` reports `staged_bytes` against the ceiling, along with
+`archiving_suspended` and `last_error`.
+
+A flush that fails part-way publishes the catalogue before it reports the
+failure. Each bundle's staged files are deleted as soon as it is in S3, and a
+restore finds bundles only through the catalogue. An unpublished catalogue
+would leave the bundles uploaded before the failure out of every restore if
+the server crashed before the next flush succeeded.
+
+### 10.6a Starting without the bucket
+
+By default a server whose bucket does not answer at boot refuses to start
+("could not start backups"). An operator who asked for backups and silently
+got none is worse off than one who is told at boot. The cost is that an S3
+outage during a reboot keeps the database down.
+
+`--s3-start-offline` trades that for availability. When the catalogue cannot
+be read, the server starts on an empty placeholder catalogue and:
+
+- keeps staging the log locally, under the staging ceiling (§10.6), so writes
+  made during the outage are archived later rather than lost to point-in-time
+  recovery;
+- refuses every write to the bucket: snapshot, log flush, prune, rollover and
+  publishing the catalogue. The placeholder is empty, and publishing it would
+  replace every snapshot and bundle the real catalogue lists. `SHOW BACKUPS`
+  refuses too, rather than list the placeholder as "no backups";
+- reads the catalogue in the background, starting after 10 s and backing off
+  to every 5 minutes. Once it loads, the schedules start as on a normal boot:
+  the held log goes up on top of the real catalogue, and a missing base
+  snapshot is taken.
+
+`SHOW BACKUP STATUS` reports `catalogue = unreachable` with the time, the
+attempt count and the last error. It also shows `last_catalogue_load_attempt_at`
+/ `_outcome`, `next_catalogue_load_at`, and `last_error`. While the catalogue is
+unreachable it leaves out the rows that would come from the placeholder.
+
+A bucket that *answers* with another database's catalogue, or one this build
+cannot read, still refuses the start: that is a misconfiguration, not an
+outage, and waiting would not end it. If the bucket comes back like that after
+an offline start, backups stop (`catalogue = refused`), nothing is written to
+that prefix, and the log stays staged until the ceiling suspends archiving.
 
 ### 10.7 A snapshot is only recorded once its log is archived
 
@@ -555,8 +616,8 @@ streams stay separate the whole way:
 `stream_key` decides what "inside its location" means, and refuses two cases on
 purpose: a sibling directory whose path merely starts with the same characters
 (`/var/lib/rasterizeddb2` next to `/var/lib/rasterizeddb`), and a storage
-location on another disk — no snapshot copies those files, so archiving their
-records would claim a coverage the catalogue does not have.
+location on another disk. The second is still a stream, but under a key of its
+own rather than a relative path — see §10.13.
 
 #### What `AT LSN` means with more than one log
 
@@ -589,12 +650,19 @@ directory is ever opened as a database:
 * the source root becomes the directory this restore is being published into —
   the final one, not the sibling it is staged in, because the paths have to be
   true after the rename;
-* any other storage location is dropped, along with the tables placed on it.
-  Those files are on another disk, and a snapshot only ever walks the database
-  directory, so they were never in the backup under any reading. A restored
-  database that resolves them to its own root and reports them missing is loud;
-  one that reads the source's disk is not. The restore logs which tables those
-  were;
+* every database created with `CREATE DATABASE` has a pool file of its own,
+  naming its own subdirectory by an absolute path, and is rewritten the same
+  way — anything under the source root maps to the same place under the
+  restore. Until 2026-10 only the root's file was, so a restored sub-database
+  read the source's files;
+* a storage location the snapshot carried (§10.13) is rewritten to wherever its
+  files were restored;
+* any other storage location is dropped, along with the tables placed on it: a
+  backup location, whose files mirror a primary the snapshot already has, or
+  any location of a snapshot taken before locations were copied. A restored
+  database that resolves those tables to its own root and reports them missing
+  is loud; one that reads the source's disk is not. The restore logs which
+  tables those were;
 * an **in-place** restore — the CLI's `--restore-from-s3`, landing on the
   directory the backup came from — is left alone. Every path in the file is
   still true there, and rewriting would drop placements that host can still
@@ -605,6 +673,103 @@ refreshed on every publish, so a database directory that moves does not leave a
 restore repointing at a path this installation no longer uses. A catalogue
 written before that field falls back to the first `location` line, which
 `Pool::render` always writes as the root.
+
+### 10.13 Storage locations on other disks
+
+A table can be placed on a storage location outside the database directory
+([storage-pools.md](storage-pools.md)). Until 2026-10 the snapshot walked only
+the database directory and the archive took only the logs under it, so such a
+table was in neither — and the backup reported success. Now:
+
+* **Which locations.** Every primary location named by a pool file under the
+  backed-up directory — the root's and each created database's — plus any
+  directory a placement names. Read from the files, so the service still has no
+  dependency on a live `Database`. A location shared by two databases is copied
+  once. Backup locations are not copied: they mirror a primary that is. A
+  location inside the backed-up directory is not listed either; the walk
+  already takes it.
+* **Keys.** Each is identified by `~loc-` and a hash of its path. That is its
+  stream key (staging subdirectory, `SegmentEntry.database`,
+  `LogWindow.database`) and the directory its files are named under in the
+  archive. Never a relative path, so it cannot collide with a database created
+  inside the directory. `SnapshotEntry.locations` maps each key back to the
+  path.
+* **The copy** is flat: tables sit directly in a location, and a recursive walk
+  would take in whatever else is kept beneath it. The whole directory is taken,
+  not a list of a table's files — the suffix list has been short twice.
+* **The log.** Each location has its own log (§10.11's reasons apply: file ids
+  are names), checkpointed around the copy with every other. A location that
+  starts holding tables later is attached at the next cut, since the install
+  hook only saw its log while it held nothing. A location that appears *while*
+  a copy runs fails that snapshot rather than being recorded without it.
+* **Restore in place** (`--restore-from-s3` onto the source directory) copies
+  each location's files back to its own path — another disk, so a copy, done
+  before the root is renamed into place and undone if any fails. The location
+  must be empty or absent; a restore never merges into what is there, and says
+  so before downloading anything. Move it aside first.
+* **Restore elsewhere** puts each location's files in
+  `<target>/pool-location-<hash>` and repoints the pool file there. The source's
+  location is still the source's, and a clone writing into it would overwrite
+  live tables. The clone therefore holds everything on one disk; move tables
+  back out with `STORAGE MOVE TABLE` once it is verified.
+* **Format.** A catalogue with any such snapshot is written as version 3, which
+  an older build refuses: it would unpack the locations into stray directories
+  and restore a database whose tables on them read as missing. A catalogue
+  without one stays at the version it was, and snapshots taken before this
+  restore exactly as they did.
+
+### 10.14 Tables on a key/value store
+
+A table placed on a key/value store ([kv-storage.md](kv-storage.md)) has no
+files in any directory and no write-ahead log. Until 2026-10-28 every snapshot
+left it out with a warning in the log, `SHOW BACKUPS` looked healthy, and a
+restore came back without it. Now each snapshot copies it
+(`backup/cold.rs`, `kv/export.rs`):
+
+* **One cut per store.** A second, read-only family is opened over the store,
+  which is exactly what a restart would recover: every transaction some batch
+  declared committed, nothing else. The live family is paused around it:
+  compaction, a truncation's deletes, adopting a scratch generation and a
+  dropped file's sweep wait for the whole copy (each would change or delete an
+  object the reader listed), and commits wait only while the reader lists and
+  fetches the deltas (a listing must see each commit whole). Writes go on
+  meanwhile; nothing on a table in a directory waits at all.
+* **Inside the window.** The copy is taken after the first log cut and before
+  the second, so every transaction it holds is committed in the log a restore
+  replays.
+* **In the archive** under the names the files would have in their database's
+  directory, so a restore needs nothing new to unpack them. A file the walk
+  found under the same name — what a move onto the store left behind — is
+  replaced by the copy.
+* **Restore** removes the table's `kv:` placement from the restored pool file,
+  in place and elsewhere, so it opens from the directory. Opened through the
+  placement, a clone would read the live server's store and leave the copy
+  unread, and its writes would give one prefix two writers. `STORAGE MOVE
+  TABLE` puts it back on a store once the copy is verified.
+* **As of the copy.** A point-in-time target does not reach these tables: there
+  is no log to replay. The restore says so and names the time. Snapshot more
+  often to narrow the gap. A table that is in a directory is replayed to the
+  target, so a cold table and one that is not can disagree in the restore —
+  rows its foreign keys point at, or, with JSON shredding on, the
+  `__json_*` shadow tables of a cold table's JSON columns, which are in the
+  directory.
+* **What waits.** Compaction, truncation, scratch adoption and a dropped
+  file's sweep on the store wait for the whole copy; commits only for the
+  listing. Writes go on, held in memory until compaction runs again, so a long
+  copy under a heavy write load costs memory for its length. The copy is
+  staged on the database's own disk first and refused, as uncovered, when that
+  disk has not the room.
+* **What still cannot be copied** — an in-memory table, a store this server
+  cannot reach — is recorded on the snapshot (`SnapshotEntry.uncovered`). Such a
+  snapshot is still published, since it protects every other table, but
+  `SHOW BACKUPS` leads its detail with `INCOMPLETE:` and the tables, and
+  `SHOW BACKUP STATUS` reports `newest_snapshot_complete = false`.
+* **Cost.** Every cold byte is read from the store at every snapshot. With
+  `incremental_min_bytes` set, a file whose copy hashes the same as the last
+  snapshot's is not uploaded again, but it is still read.
+* **Format.** A catalogue with any such snapshot is written as version 4: a
+  version-3 reader would unpack the files but leave the placement naming the
+  store, so an in-place restore would answer from the live store.
 
 ## 11. Tests
 

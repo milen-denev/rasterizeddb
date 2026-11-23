@@ -6,3 +6,10 @@ s3_reset.py
 s3_reset.sh
 deploy.sh
 /__pycache__
+/.claude
+/target-p5b2b-rev-b-rel
+/target-p5b2b-rev-b-base
+/target-p5b2b-rev-b
+deploy_database.sh.bak-before-replica
+deploy_replica.py
+deploy.sh.bak-before-replica

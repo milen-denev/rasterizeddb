@@ -60,19 +60,35 @@ pub struct PgImportArgs {
     pub sslmode: Option<String>,
 
     /// Schema to read (default: public).
-    #[arg(long = "pg-import-schema", value_name = "NAME", default_value = "public")]
+    #[arg(
+        long = "pg-import-schema",
+        value_name = "NAME",
+        default_value = "public"
+    )]
     pub schema: String,
 
     /// Import only these tables. Repeatable, and accepts a comma-separated list.
-    #[arg(long = "pg-import-only-tables", value_name = "TABLE,…", value_delimiter = ',')]
+    #[arg(
+        long = "pg-import-only-tables",
+        value_name = "TABLE,…",
+        value_delimiter = ','
+    )]
     pub only_tables: Vec<String>,
 
     /// Leave these tables out. Repeatable, and accepts a comma-separated list.
-    #[arg(long = "pg-import-exclude-tables", value_name = "TABLE,…", value_delimiter = ',')]
+    #[arg(
+        long = "pg-import-exclude-tables",
+        value_name = "TABLE,…",
+        value_delimiter = ','
+    )]
     pub exclude_tables: Vec<String>,
 
     /// Rows per transaction on the way in (default: 5000).
-    #[arg(long = "pg-import-batch-rows", value_name = "N", default_value_t = 5_000)]
+    #[arg(
+        long = "pg-import-batch-rows",
+        value_name = "N",
+        default_value_t = 5_000
+    )]
     pub batch_rows: usize,
 
     /// What `json` and `jsonb` columns become: `auto` (default), which uses
@@ -84,13 +100,21 @@ pub struct PgImportArgs {
     /// `auto` is the default because a `jsonb` column carried over as TEXT is
     /// refused by every typed driver — the column an application wrote as JSON
     /// becomes one it cannot read.
-    #[arg(long = "pg-import-json", value_name = "auto|text|native", default_value = "auto")]
+    #[arg(
+        long = "pg-import-json",
+        value_name = "auto|text|native",
+        default_value = "auto"
+    )]
     pub json: String,
 
     /// What to do with a `numeric(p, s)` finer than the nine decimal places
     /// this engine keeps: `fail` (default) or `text`, which keeps every digit
     /// but stops the column being a number.
-    #[arg(long = "pg-import-wide-numeric", value_name = "fail|text", default_value = "fail")]
+    #[arg(
+        long = "pg-import-wide-numeric",
+        value_name = "fail|text",
+        default_value = "fail"
+    )]
     pub wide_numeric: String,
 
     /// Import the rows without the primary keys, unique constraints and

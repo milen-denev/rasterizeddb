@@ -9,6 +9,7 @@ use rasterizeddb_core::core::filter::persist::{self, LoadReject};
 use rasterizeddb_core::core::filter::sarg;
 use rasterizeddb_core::core::filter::zonemap::SargOp;
 use rasterizeddb_core::core::filter::{FilterConfig, TableFilters};
+use rasterizeddb_core::core::index_store::gate::{Proof, test_mint};
 use rasterizeddb_core::core::row::schema::SchemaField;
 use rasterizeddb_core::core::tokenizer::query_tokenizer::{Token, tokenize};
 use rasterizeddb_filter_tests::*;
@@ -24,6 +25,8 @@ fn spec() -> Vec<(&'static str, DbType)> {
 }
 
 fn filled(n: u64) -> (SmallVec<[SchemaField; 20]>, TableFilters, Vec<u64>, Vec<Vec<u8>>) {
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
     let (fields, f) = filters_for(&spec());
     let ids: Vec<u64> = (0..n).map(|_| fastrand::u64(..)).collect();
     let uids: Vec<Vec<u8>> = (0..n).map(|_| uuid_v4()).collect();
@@ -37,7 +40,7 @@ fn filled(n: u64) -> (SmallVec<[SchemaField; 20]>, TableFilters, Vec<u64>, Vec<V
             ]
         })
         .collect();
-    backfill_all(&f, &rows);
+    backfill_all(proof, &f, &rows);
     (fields, f, ids, uids)
 }
 
@@ -83,12 +86,14 @@ fn round_trip_preserves_pruning_power() {
 
 #[test]
 fn round_trip_preserves_zone_bounds() {
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
     // Bounds live alongside the fingerprints and must survive too.
     let n = 6000u64;
     let (fields, f) = filters_for(&[("id", DbType::U64)]);
     let rows: Vec<Vec<(u32, Vec<u8>)>> =
         (0..n as usize).map(|i| vec![(0u32, (i as u64).to_le_bytes().to_vec())]).collect();
-    backfill_all(&f, &rows);
+    backfill_all(proof, &f, &rows);
 
     let bytes = f.checkpoint_bytes(n);
     let restored =
@@ -104,6 +109,8 @@ fn round_trip_preserves_zone_bounds() {
 
 #[test]
 fn round_trip_survives_generation_boundaries() {
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
     let cfg = FilterConfig { min_f: 4, default_f: 4, max_f: 16, ..Default::default() };
     let fields = fields_of(&[("id", DbType::U64)]);
     let f = TableFilters::new(&fields, cfg);
@@ -111,7 +118,7 @@ fn round_trip_survives_generation_boundaries() {
     let ids: Vec<u64> = (0..n).map(|_| fastrand::u64(..)).collect();
     let rows: Vec<Vec<(u32, Vec<u8>)>> =
         (0..n as usize).map(|i| vec![(0u32, ids[i].to_le_bytes().to_vec())]).collect();
-    backfill_all(&f, &rows);
+    backfill_all(proof, &f, &rows);
     assert!(f.stats()[0].1 > 4, "f should have grown");
 
     let bytes = f.checkpoint_bytes(n);
@@ -124,12 +131,14 @@ fn round_trip_survives_generation_boundaries() {
 
 #[test]
 fn a_modification_after_a_checkpoint_pulls_the_frontier_back() {
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
     // The checkpoint's bytes for that region could be stale, so it must not
     // claim to cover it.
     let n = 4000u64;
     let (fields, f, _, _) = filled(n);
     let _ = f.checkpoint_bytes(n);
-    f.on_delete(1500);
+    f.on_delete(proof, 1500);
 
     let bytes = f.checkpoint_bytes(n);
     let restored =
@@ -411,7 +420,7 @@ async fn a_recreated_table_does_not_inherit_the_old_checkpoint() {
     {
         let t = open_table(dir.path(), "recreated", &std_columns()).await;
         fill_std(&t).await;
-        t.checkpoint_filters().await;
+        t.checkpoint_filters().await.unwrap();
     }
 
     // Truncate the pointer file to a third of its rows, leaving the sidecar
@@ -423,7 +432,7 @@ async fn a_recreated_table_does_not_inherit_the_old_checkpoint() {
     std::fs::write(&ptr, &bytes[..keep]).unwrap();
 
     let t = open_table(dir.path(), "recreated", &std_columns()).await;
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
 
     let rows = run(&t, "").await;
     assert_eq!(rows.len(), keep / rec, "row count should match the truncated file");
@@ -466,7 +475,7 @@ async fn append_rows(t: &Table<LocalStorageProvider>, from: u64, to: u64) {
 }
 
 fn sidecar_bytes(dir: &std::path::Path, name: &str) -> Vec<u8> {
-    std::fs::read(dir.join(format!("{}_flt.db", name))).expect("sidecar on disk")
+    std::fs::read(sidecar_path(dir, name)).expect("sidecar on disk")
 }
 
 /// A table whose columns match [`spec`], so the reload can be checked against
@@ -492,16 +501,16 @@ fn every_id_survives(bytes: &[u8], fields: &SmallVec<[SchemaField; 20]>, n: u64)
 async fn a_second_checkpoint_appends_instead_of_rewriting() {
     let dir = tempfile::tempdir().unwrap();
     let t = incremental_table(dir.path(), "inc_append").await;
-    let f = t.filters.clone().expect("filters active");
+    let f = t.filters().unwrap().clone().expect("filters active");
 
     append_rows(&t, 0, 8000).await;
-    t.checkpoint_filters().await;
+    checkpoint_sidecar(&t, dir.path()).await;
     let base_len = f.sidecar_len();
     assert_eq!(f.deltas_since_base(), 0, "the first write is a base image");
     assert!(base_len > 0);
 
     append_rows(&t, 8000, 8600).await;
-    t.checkpoint_filters().await;
+    checkpoint_sidecar(&t, dir.path()).await;
     assert_eq!(f.deltas_since_base(), 1, "the second write should be a delta");
 
     let grew = f.sidecar_len() - base_len;
@@ -519,13 +528,13 @@ async fn a_second_checkpoint_appends_instead_of_rewriting() {
 async fn a_chain_of_deltas_replays_in_order() {
     let dir = tempfile::tempdir().unwrap();
     let t = incremental_table(dir.path(), "inc_chain").await;
-    let f = t.filters.clone().expect("filters active");
+    let f = t.filters().unwrap().clone().expect("filters active");
 
     append_rows(&t, 0, 6000).await;
-    t.checkpoint_filters().await;
+    checkpoint_sidecar(&t, dir.path()).await;
     for round in 0..6u64 {
         append_rows(&t, 6000 + round * 600, 6600 + round * 600).await;
-        t.checkpoint_filters().await;
+        checkpoint_sidecar(&t, dir.path()).await;
     }
     assert_eq!(f.deltas_since_base(), 6, "each round should have appended");
 
@@ -540,14 +549,14 @@ async fn a_torn_delta_falls_back_to_the_state_before_it() {
     // were appended after it — so it must load, not be rejected.
     let dir = tempfile::tempdir().unwrap();
     let t = incremental_table(dir.path(), "inc_torn").await;
-    let f = t.filters.clone().expect("filters active");
+    let f = t.filters().unwrap().clone().expect("filters active");
 
     append_rows(&t, 0, 6000).await;
-    t.checkpoint_filters().await;
+    checkpoint_sidecar(&t, dir.path()).await;
     let after_base = f.sidecar_len();
 
     append_rows(&t, 6000, 6600).await;
-    t.checkpoint_filters().await;
+    checkpoint_sidecar(&t, dir.path()).await;
     let full = sidecar_bytes(dir.path(), "inc_torn");
     let after_delta = f.sidecar_len() as usize;
 
@@ -580,10 +589,10 @@ async fn garbage_after_the_base_stops_the_replay() {
     let dir = tempfile::tempdir().unwrap();
     let t = incremental_table(dir.path(), "inc_garbage").await;
     append_rows(&t, 0, 4000).await;
-    t.checkpoint_filters().await;
+    checkpoint_sidecar(&t, dir.path()).await;
 
     let mut bytes = sidecar_bytes(dir.path(), "inc_garbage");
-    let base_len = t.filters.as_ref().unwrap().sidecar_len() as usize;
+    let base_len = t.filters().unwrap().as_ref().unwrap().sidecar_len() as usize;
     bytes.truncate(base_len);
     for _ in 0..4096 {
         bytes.push(fastrand::u8(..));
@@ -601,24 +610,26 @@ async fn garbage_after_the_base_stops_the_replay() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delete_rewrites_the_base_rather_than_appending() {
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
     // A delete invalidates slots near the start, so the "tail" that would have
     // to be re-sent is the whole file. Folding it into a fresh base costs the
     // same and leaves nothing to replay.
     let dir = tempfile::tempdir().unwrap();
     let t = incremental_table(dir.path(), "inc_delete").await;
-    let f = t.filters.clone().expect("filters active");
+    let f = t.filters().unwrap().clone().expect("filters active");
 
     append_rows(&t, 0, 6000).await;
-    t.checkpoint_filters().await;
+    checkpoint_sidecar(&t, dir.path()).await;
     assert_eq!(f.deltas_since_base(), 0);
 
     append_rows(&t, 6000, 6100).await;
-    t.checkpoint_filters().await;
+    checkpoint_sidecar(&t, dir.path()).await;
     assert_eq!(f.deltas_since_base(), 1, "an append is a delta");
 
     // Touching slot 3 drags the re-send point back to the first zone.
-    f.on_delete(3);
-    t.checkpoint_filters().await;
+    f.on_delete(proof, 3);
+    checkpoint_sidecar(&t, dir.path()).await;
     assert_eq!(f.deltas_since_base(), 0, "a low-slot write forces a base rewrite");
 
     let bytes = sidecar_bytes(dir.path(), "inc_delete");
@@ -634,6 +645,8 @@ async fn a_delete_rewrites_the_base_rather_than_appending() {
 
 #[test]
 fn a_checkpoint_remembers_its_unindexed_prefix() {
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
     // Rows that predate the filter are candidates until a backfill indexes
     // them, and a checkpoint taken before that has to say so. Reloading one that
     // claimed the prefix was indexed would prune rows nothing had ever looked
@@ -644,7 +657,7 @@ fn a_checkpoint_remembers_its_unindexed_prefix() {
     let n = 3000u64;
     let prefix = 1000u64;
 
-    f.set_unindexed_prefix(prefix);
+    f.set_unindexed_prefix(proof, prefix);
     for slot in prefix..n {
         let cols: SmallVec<[(u32, Vec<u8>); 32]> = smallvec::smallvec![
             (0u32, slot.to_le_bytes().to_vec()),
@@ -652,7 +665,7 @@ fn a_checkpoint_remembers_its_unindexed_prefix() {
             (2u32, ((slot % 97) as i32).to_le_bytes().to_vec()),
             (3u32, uuid_ordered(slot)),
         ];
-        f.backfill_row(slot, &cols);
+        f.backfill_row(proof, slot, &cols);
     }
 
     let bytes = f.checkpoint_bytes(n);

@@ -24,21 +24,21 @@ pub fn result_fields(statement: &BackupStatement) -> Option<Vec<(String, DbType)
             ("kind".to_string(), DbType::STRING),
             ("id".to_string(), DbType::STRING),
             ("created_at".to_string(), DbType::STRING),
-            ("start_lsn".to_string(), DbType::U64),
-            ("end_lsn".to_string(), DbType::U64),
-            ("uncompressed_bytes".to_string(), DbType::U64),
-            ("compressed_bytes".to_string(), DbType::U64),
+            ("start_lsn".to_string(), DbType::I64),
+            ("end_lsn".to_string(), DbType::I64),
+            ("uncompressed_bytes".to_string(), DbType::I64),
+            ("compressed_bytes".to_string(), DbType::I64),
             ("detail".to_string(), DbType::STRING),
         ]),
         BackupStatement::Restore { .. } => Some(vec![
             ("snapshot_id".to_string(), DbType::STRING),
             ("target_dir".to_string(), DbType::STRING),
             ("recovered_to_lsn".to_string(), DbType::STRING),
-            ("files_restored".to_string(), DbType::U64),
-            ("bytes_restored".to_string(), DbType::U64),
-            ("segments_replayed".to_string(), DbType::U64),
-            ("records_applied".to_string(), DbType::U64),
-            ("records_discarded".to_string(), DbType::U64),
+            ("files_restored".to_string(), DbType::I64),
+            ("bytes_restored".to_string(), DbType::I64),
+            ("segments_replayed".to_string(), DbType::I64),
+            ("records_applied".to_string(), DbType::I64),
+            ("records_discarded".to_string(), DbType::I64),
         ]),
         _ => None,
     }
@@ -65,7 +65,7 @@ pub async fn execute(statement: BackupStatement) -> Vec<u8> {
 
         BackupStatement::ArchiveWal => match require_service() {
             Err(response) => response,
-            Ok(service) => match service.archive_wal_now().await {
+            Ok(service) => match service.archive_wal_barrier().await {
                 Ok(report) => count(report.compressed_bytes),
                 Err(e) => {
                     error!("BACKUP WAL failed: {e}");
@@ -105,7 +105,20 @@ pub async fn execute(statement: BackupStatement) -> Vec<u8> {
 
         BackupStatement::Show => match require_service() {
             Err(response) => response,
-            Ok(service) => rows(show_rows(&service).await),
+            // The catalogue a start without the bucket runs on is an empty
+            // placeholder; listing it would read as "no backups exist".
+            Ok(service) => match service.catalogue_state() {
+                backup::CatalogueState::Loaded => rows(show_rows(&service).await),
+                _ => failure(&format!(
+                    "SHOW BACKUPS cannot list the catalogue: it has not been read from the bucket \
+                     ({}). SHOW BACKUP STATUS says why.",
+                    match service.catalogue_state() {
+                        backup::CatalogueState::Refused { reason, .. } => reason,
+                        backup::CatalogueState::Unreachable { last_error, .. } => last_error,
+                        backup::CatalogueState::Loaded => String::new(),
+                    }
+                )),
+            },
         },
 
         BackupStatement::Restore { target_dir, target } => match require_service() {
@@ -177,11 +190,13 @@ async fn show_rows(service: &Arc<BackupService>) -> Vec<Row> {
             Cell::Number(snapshot.uncompressed_bytes),
             Cell::Number(snapshot.compressed_bytes),
             Cell::Text(format!(
-                "{} files, zstd level {}, s3://{}/{}",
+                "{}{} files, zstd level {}, s3://{}/{}{}",
+                coverage_warning(snapshot),
                 snapshot.file_count,
                 snapshot.compression_level,
                 service.config().bucket,
-                snapshot.key
+                snapshot.key,
+                cold_note(snapshot)
             )),
         ]));
     }
@@ -205,6 +220,38 @@ async fn show_rows(service: &Arc<BackupService>) -> Vec<Row> {
     }
 
     out
+}
+
+/// Leads a snapshot's detail when it is not a complete backup: a restore of
+/// it brings these tables back as missing, and a row that reads like every
+/// other would let that go unseen until then.
+pub fn coverage_warning(snapshot: &backup::manifest::SnapshotEntry) -> String {
+    if snapshot.uncovered.is_empty() {
+        return String::new();
+    }
+    format!(
+        "INCOMPLETE: {} table(s) not in this snapshot: {}. ",
+        snapshot.uncovered.len(),
+        snapshot
+            .uncovered
+            .iter()
+            .map(|u| format!("{} ({})", u.qualified(), u.reason))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
+/// What a snapshot holds of tables on a key/value store, which come back as
+/// of their copy rather than the restore's target.
+fn cold_note(snapshot: &backup::manifest::SnapshotEntry) -> String {
+    match snapshot.cold_copied_at {
+        Some(at) if !snapshot.cold_tables.is_empty() => format!(
+            "; {} key/value table(s) copied at {}, restored as of then",
+            snapshot.cold_tables.len(),
+            backup::timeutil::format_rfc3339(at)
+        ),
+        _ => String::new(),
+    }
 }
 
 /// Two paths naming the same directory, as far as the filesystem is concerned.
@@ -235,16 +282,19 @@ enum Cell {
 }
 
 fn row(cells: &[Cell]) -> Row {
-    let mut columns: SmallVec<[Column; 32]> = SmallVec::new();
+    let mut columns: crate::core::row::row::RowColumns = SmallVec::new();
     for (index, cell) in cells.iter().enumerate() {
         let (bytes, column_type): (Vec<u8>, DbType) = match cell {
             Cell::Text(text) => (text.as_bytes().to_vec(), DbType::STRING),
-            Cell::Number(n) => (n.to_le_bytes().to_vec(), DbType::U64),
+            Cell::Number(n) => (
+                crate::core::value_codec::count_as_bigint(*n).to_le_bytes().to_vec(),
+                DbType::I64,
+            ),
         };
         let mut block = MEMORY_POOL.acquire(bytes.len());
         block.into_slice_mut().copy_from_slice(&bytes);
         columns.push(Column {
-            schema_id: index as u64,
+            schema_id: crate::core::row::row::schema_id_of(index as u64),
             data: block,
             column_type,
         });

@@ -1,0 +1,374 @@
+//! A load generator and an echo server for measuring the transport itself.
+//!
+//! Two processes, so a `perf` attached to one sees only that side:
+//!
+//! ```text
+//! echo_bench server <port> <worker-threads>
+//! echo_bench server-percore <port> <threads>
+//! echo_bench client <addr:port> <connections> <seconds> <payload-bytes> <worker-threads> [depth]
+//! echo_bench mux    <addr:port> <connections> <seconds> <payload-bytes> <worker-threads> <callers>
+//! ```
+//!
+//! The handler echoes, so everything measured is the transport: framing, TLS
+//! records, timers, wakeups and system calls. `depth` is how many requests a
+//! connection keeps in flight; 1 is one request per round trip. `mux` shares
+//! each connection between `callers` tasks, each sending one request at a
+//! time, which is how an application with many concurrent queries uses it.
+
+// Unix sockets and SO_REUSEPORT: a unix-only benchmark.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("echo_bench needs unix sockets and SO_REUSEPORT; it runs on unix only");
+}
+
+#[cfg(unix)]
+fn main() {
+    bench::main()
+}
+
+#[cfg(unix)]
+mod bench {
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use rastcp::client::TcpClientBuilder;
+use rastcp::server::TcpServerBuilder;
+
+fn runtime(threads: usize) -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(threads.max(1))
+        .enable_all()
+        .build()
+        .expect("runtime")
+}
+
+fn arg<T: std::str::FromStr>(args: &[String], index: usize, default: T) -> T {
+    args.get(index)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+pub fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    match args.get(1).map(String::as_str) {
+        Some("server") => match args.get(2).and_then(|a| a.strip_prefix("unix:")) {
+            Some(path) => server_unix(path.to_string(), arg(&args, 3, 4usize)),
+            None => server(arg(&args, 2, 7878u16), arg(&args, 3, 4usize)),
+        },
+        Some("server-percore") => server_per_core(arg(&args, 2, 7878u16), arg(&args, 3, 4usize)),
+        Some("client") => client(
+            args.get(2)
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:7878".to_string()),
+            arg(&args, 3, 64usize),
+            arg(&args, 4, 5u64),
+            arg(&args, 5, 64usize),
+            arg(&args, 6, 4usize),
+            arg(&args, 7, 1usize),
+        ),
+        Some("mux") => mux(
+            args.get(2)
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:7878".to_string()),
+            arg(&args, 3, 1usize),
+            arg(&args, 4, 5u64),
+            arg(&args, 5, 64usize),
+            arg(&args, 6, 4usize),
+            arg(&args, 7, 64usize),
+        ),
+        _ => {
+            eprintln!("usage: echo_bench server <port> <threads>");
+            eprintln!(
+                "       echo_bench client <addr:port> <connections> <seconds> <payload> <threads> [depth]"
+            );
+            eprintln!(
+                "       echo_bench mux <addr:port> <connections> <seconds> <payload> <threads> <callers>"
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+fn server(port: u16, threads: usize) {
+    runtime(threads).block_on(async move {
+        let server = TcpServerBuilder::new("127.0.0.1", port)
+            .max_connections(4096)
+            // An echo never waits, which is the case inline handlers are for.
+            // RASTCP_BENCH_INLINE=0 measures the default instead.
+            .inline_handlers(std::env::var("RASTCP_BENCH_INLINE").as_deref() != Ok("0"))
+            .build()
+            .await
+            .expect("server");
+
+        println!("listening on 127.0.0.1:{port} with {threads} worker thread(s)");
+
+        server.run(|data| async move { data }).await.expect("run");
+    });
+}
+
+/// The echo server on a unix socket: `server unix:<path> <threads>`, and a
+/// client address of `unix:<path>`.
+fn server_unix(path: String, threads: usize) {
+    runtime(threads).block_on(async move {
+        let server = TcpServerBuilder::unix(&path)
+            .max_connections(4096)
+            .inline_handlers(std::env::var("RASTCP_BENCH_INLINE").as_deref() != Ok("0"))
+            .build()
+            .await
+            .expect("server");
+
+        println!("listening on unix:{path} with {threads} worker thread(s)");
+
+        server.run(|data| async move { data }).await.expect("run");
+    });
+}
+
+/// The same echo server as a thread per core: each thread has a runtime and a
+/// listener of its own on the one port, and the kernel deals connections
+/// between them. A connection then never leaves the thread that accepted it.
+/// Here to measure what that is worth before the library offers it.
+fn server_per_core(port: u16, threads: usize) {
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
+    let mut workers = Vec::new();
+
+    for _ in 0..threads.max(1) {
+        workers.push(std::thread::spawn(move || {
+            let socket =
+                Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("socket");
+            socket.set_reuse_address(true).expect("reuse address");
+            socket.set_reuse_port(true).expect("reuse port");
+            let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+            socket.bind(&SockAddr::from(addr)).expect("bind");
+            socket.listen(1024).expect("listen");
+            let listener: std::net::TcpListener = socket.into();
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+
+            runtime.block_on(async move {
+                let server = TcpServerBuilder::from_listener(listener)
+                    .expect("listener")
+                    .max_connections(4096)
+                    // An echo never waits, which is the case inline handlers are for.
+                    // RASTCP_BENCH_INLINE=0 measures the default instead.
+                    .inline_handlers(std::env::var("RASTCP_BENCH_INLINE").as_deref() != Ok("0"))
+                    .build()
+                    .await
+                    .expect("server");
+
+                server.run(|data| async move { data }).await.expect("run");
+            });
+        }));
+    }
+
+    println!("listening on 127.0.0.1:{port} with {threads} thread(s), one runtime each");
+
+    for worker in workers {
+        worker.join().expect("worker");
+    }
+}
+
+/// Microsecond buckets up to 20 ms; anything slower lands in the last one.
+const BUCKETS: usize = 20_000;
+
+fn percentile(histogram: &[u64], total: u64, fraction: f64) -> usize {
+    let target = (total as f64 * fraction).ceil() as u64;
+    let mut seen = 0u64;
+
+    for (micros, count) in histogram.iter().enumerate() {
+        seen += count;
+        if seen >= target {
+            return micros;
+        }
+    }
+
+    histogram.len() - 1
+}
+
+fn client(
+    addr: String,
+    connections: usize,
+    seconds: u64,
+    payload: usize,
+    threads: usize,
+    depth: usize,
+) {
+    let runtime = runtime(threads);
+
+    runtime.block_on(async move {
+        let stop = Arc::new(AtomicBool::new(false));
+        let measuring = Arc::new(AtomicBool::new(false));
+        let total = Arc::new(AtomicU64::new(0));
+        let mut tasks = Vec::with_capacity(connections);
+
+        for _ in 0..connections {
+            let addr = addr.clone();
+            let stop = stop.clone();
+            let measuring = measuring.clone();
+            let total = total.clone();
+
+            tasks.push(tokio::spawn(async move {
+                let mut client = TcpClientBuilder::new(&addr)
+                    .verify_certificate(false)
+                    .build()
+                    .await
+                    .expect("client");
+                client.connect().await.expect("connect");
+
+                let request = vec![0x5au8; payload];
+                let mut histogram = vec![0u64; BUCKETS];
+                let mut done = 0u64;
+
+                while !stop.load(Ordering::Relaxed) {
+                    let started = Instant::now();
+                    let completed = round(&mut client, &request, depth).await;
+
+                    if measuring.load(Ordering::Relaxed) {
+                        let micros = started.elapsed().as_micros() as usize;
+                        histogram[micros.min(BUCKETS - 1)] += 1;
+                        done += completed;
+                    }
+                }
+
+                total.fetch_add(done, Ordering::Relaxed);
+                histogram
+            }));
+        }
+
+        // Let every connection finish its handshake before the clock starts.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        measuring.store(true, Ordering::Relaxed);
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+        measuring.store(false, Ordering::Relaxed);
+        let elapsed = started.elapsed().as_secs_f64();
+        stop.store(true, Ordering::Relaxed);
+
+        let mut histogram = vec![0u64; BUCKETS];
+        for task in tasks {
+            for (slot, count) in histogram.iter_mut().zip(task.await.expect("task")) {
+                *slot += count;
+            }
+        }
+
+        let done = total.load(Ordering::Relaxed);
+        let rounds: u64 = histogram.iter().sum();
+
+        println!(
+            "ops={done} secs={elapsed:.3} ops_per_sec={:.0} p50_us={} p99_us={} p999_us={} conns={connections} payload={payload} depth={depth}",
+            done as f64 / elapsed,
+            percentile(&histogram, rounds, 0.50),
+            percentile(&histogram, rounds, 0.99),
+            percentile(&histogram, rounds, 0.999),
+        );
+    });
+}
+
+/// One round of `depth` requests on a connection. Returns how many completed.
+async fn round(client: &mut rastcp::client::TcpClient, request: &[u8], depth: usize) -> u64 {
+    if depth <= 1 {
+        let response = client.send_borrowed(request).await.expect("send");
+        assert_eq!(response.len(), request.len());
+        return 1;
+    }
+
+    let batch = vec![request; depth];
+    let responses = client.send_batch(&batch).await.expect("send_batch");
+    assert_eq!(responses.len(), depth);
+    assert!(
+        responses
+            .iter()
+            .all(|response| response.len() == request.len())
+    );
+    depth as u64
+}
+
+fn mux(
+    addr: String,
+    connections: usize,
+    seconds: u64,
+    payload: usize,
+    threads: usize,
+    callers: usize,
+) {
+    let runtime = runtime(threads);
+
+    runtime.block_on(async move {
+        let stop = Arc::new(AtomicBool::new(false));
+        let measuring = Arc::new(AtomicBool::new(false));
+        let total = Arc::new(AtomicU64::new(0));
+        let mut tasks = Vec::with_capacity(connections * callers);
+
+        for _ in 0..connections {
+            let client = TcpClientBuilder::new(&addr)
+                .verify_certificate(false)
+                .max_in_flight(callers.max(1))
+                .build_multiplexed()
+                .await
+                .expect("client");
+            client.connect().await.expect("connect");
+
+            for _ in 0..callers {
+                let client = client.clone();
+                let stop = stop.clone();
+                let measuring = measuring.clone();
+                let total = total.clone();
+
+                tasks.push(tokio::spawn(async move {
+                    let request = vec![0x5au8; payload];
+                    let mut histogram = vec![0u64; BUCKETS];
+                    let mut done = 0u64;
+
+                    while !stop.load(Ordering::Relaxed) {
+                        let started = Instant::now();
+                        let response = client.send(&request).await.expect("send");
+                        assert_eq!(response.len(), request.len());
+
+                        if measuring.load(Ordering::Relaxed) {
+                            let micros = started.elapsed().as_micros() as usize;
+                            histogram[micros.min(BUCKETS - 1)] += 1;
+                            done += 1;
+                        }
+                    }
+
+                    total.fetch_add(done, Ordering::Relaxed);
+                    histogram
+                }));
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        measuring.store(true, Ordering::Relaxed);
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+        measuring.store(false, Ordering::Relaxed);
+        let elapsed = started.elapsed().as_secs_f64();
+        stop.store(true, Ordering::Relaxed);
+
+        let mut histogram = vec![0u64; BUCKETS];
+        for task in tasks {
+            for (slot, count) in histogram.iter_mut().zip(task.await.expect("task")) {
+                *slot += count;
+            }
+        }
+
+        let done = total.load(Ordering::Relaxed);
+        let rounds: u64 = histogram.iter().sum();
+
+        println!(
+            "ops={done} secs={elapsed:.3} ops_per_sec={:.0} p50_us={} p99_us={} p999_us={} conns={connections} payload={payload} callers={callers} mux",
+            done as f64 / elapsed,
+            percentile(&histogram, rounds, 0.50),
+            percentile(&histogram, rounds, 0.99),
+            percentile(&histogram, rounds, 0.999),
+        );
+    });
+}
+}

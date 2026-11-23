@@ -50,9 +50,14 @@ use dashmap::DashMap;
 use log::{info, warn};
 use rclite::Arc;
 
-use crate::core::database::Database;
 #[cfg(test)]
 use crate::core::database::DEFAULT_DATABASE_NAME;
+use crate::core::database::Database;
+
+/// Database branches (`CREATE BRANCH`, `MERGE BRANCH`, …): `docs/branching.md`.
+#[cfg(feature = "db_branching")]
+#[path = "branch.rs"]
+pub mod branch;
 
 /// The file every database has, used to tell a database directory apart from
 /// whatever else an operator has left in the root.
@@ -95,12 +100,17 @@ struct Entry {
 
 /// The databases this process serves.
 pub struct DatabaseCatalog {
-    databases: DashMap<String, Entry, ahash::RandomState>,
+    /// Behind a `std` `Arc` so the automatic compaction can hold it weakly
+    /// (`core::auto_compact`) and end with the catalogue.
+    databases: StdArc<DashMap<String, Entry, ahash::RandomState>>,
     /// Root directory, or `None` for an in-memory catalogue.
     root: Option<String>,
     /// The database a connection that names none is given, and the one that
     /// lives at the root rather than in a subdirectory.
     default_name: String,
+    /// Each branch's merge base, once opened: `(generation, database)`.
+    #[cfg(feature = "db_branching")]
+    bases: DashMap<String, (u64, Arc<Database>), ahash::RandomState>,
 }
 
 /// Keeps a database attached for as long as a session is using it.
@@ -153,23 +163,35 @@ impl DatabaseCatalog {
         let in_memory = root.is_none();
         let location = root.unwrap_or("");
 
-        let default = Database::new_named(location, in_memory, default_name).await;
+        // Refusals come back as errors, so the server can say which database
+        // would not open and exit, rather than unwinding out of here.
+        let default = Database::try_new_named(location, in_memory, default_name).await?;
         databases.insert(default_name.to_string(), Entry::new(Arc::new(default)));
 
         if let Some(root) = root {
             for name in discover_databases(root, default_name).await {
                 let path = std::path::Path::new(root).join(&name);
-                let database =
-                    Database::new_named(&path.to_string_lossy(), false, &name).await;
+                let database = Database::try_new_named(&path.to_string_lossy(), false, &name).await?;
                 databases.insert(name, Entry::new(Arc::new(database)));
             }
         }
 
+        let databases = StdArc::new(databases);
+        crate::core::auto_compact::spawn(StdArc::downgrade(&databases), |map| {
+            map.iter().map(|e| e.database.clone()).collect()
+        });
         let catalogue = Arc::new(Self {
             databases,
             root: root.map(str::to_string),
             default_name: default_name.to_string(),
+            #[cfg(feature = "db_branching")]
+            bases: DashMap::with_hasher(ahash::RandomState::new()),
         });
+        if let Some(root) = root {
+            sweep_dropped(std::path::Path::new(root));
+        }
+        #[cfg(feature = "db_branching")]
+        catalogue.sweep_branch_leftovers();
 
         info!(
             "Database catalogue open with {}: {}",
@@ -193,7 +215,61 @@ impl DatabaseCatalog {
         let name = database.name.clone();
         let databases = DashMap::with_hasher(ahash::RandomState::new());
         databases.insert(name.clone(), Entry::new(database));
-        Arc::new(Self { databases, root: None, default_name: name })
+        let databases = StdArc::new(databases);
+        crate::core::auto_compact::spawn(StdArc::downgrade(&databases), |map| {
+            map.iter().map(|e| e.database.clone()).collect()
+        });
+        Arc::new(Self {
+            databases,
+            root: None,
+            default_name: name,
+            #[cfg(feature = "db_branching")]
+            bases: DashMap::with_hasher(ahash::RandomState::new()),
+        })
+    }
+
+    /// [`DatabaseCatalog::single`] without the automatic compaction task: a
+    /// view of one database that is already served (and compacted) through
+    /// the catalogue that opened it. What a native-protocol transaction's
+    /// session (`pgwire::native_session`) runs its statements against, so a
+    /// block opened over native does not start a second compaction loop over
+    /// the same tables.
+    pub(crate) fn single_unmanaged(database: Arc<Database>) -> Arc<Self> {
+        let name = database.name.clone();
+        let databases = DashMap::with_hasher(ahash::RandomState::new());
+        databases.insert(name.clone(), Entry::new(database));
+        Arc::new(Self {
+            databases: StdArc::new(databases),
+            root: None,
+            default_name: name,
+            #[cfg(feature = "db_branching")]
+            bases: DashMap::with_hasher(ahash::RandomState::new()),
+        })
+    }
+
+    /// [`DatabaseCatalog::single_unmanaged`] for the named database of this
+    /// catalogue, sharing its session count: what a native connection's
+    /// session resolves against, so `SHOW DATABASES` over native counts the
+    /// connections attached here, every protocol's. `None` for a name this
+    /// catalogue does not hold.
+    pub(crate) fn view_of(&self, name: &str) -> Option<Arc<Self>> {
+        let entry = self.databases.get(name)?;
+        let databases = DashMap::with_hasher(ahash::RandomState::new());
+        databases.insert(
+            name.to_string(),
+            Entry {
+                database: entry.database.clone(),
+                loading: entry.loading.clone(),
+                sessions: entry.sessions.clone(),
+            },
+        );
+        Some(Arc::new(Self {
+            databases: StdArc::new(databases),
+            root: None,
+            default_name: name.to_string(),
+            #[cfg(feature = "db_branching")]
+            bases: DashMap::with_hasher(ahash::RandomState::new()),
+        }))
     }
 
     /// What `SHOW DATABASES` reports, ordered by name.
@@ -208,7 +284,7 @@ impl DatabaseCatalog {
                     .location
                     .clone()
                     .unwrap_or_else(|| "(in memory)".to_string()),
-                tables: entry.database.tables.len() as u64,
+                tables: entry.database.table_count() as u64,
                 sessions: entry.sessions.load(Ordering::Acquire) as u64,
                 is_default: entry.key() == &self.default_name,
             })
@@ -229,8 +305,7 @@ impl DatabaseCatalog {
 
     /// Every name, sorted, so output is stable between calls.
     pub fn names(&self) -> Vec<String> {
-        let mut names: Vec<String> =
-            self.databases.iter().map(|e| e.key().clone()).collect();
+        let mut names: Vec<String> = self.databases.iter().map(|e| e.key().clone()).collect();
         names.sort();
         names
     }
@@ -267,7 +342,9 @@ impl DatabaseCatalog {
     pub fn begin_loading(&self, name: &str) -> Option<LoadingGuard> {
         let entry = self.databases.get(name)?;
         entry.loading.store(true, Ordering::Release);
-        Some(LoadingGuard { loading: entry.loading.clone() })
+        Some(LoadingGuard {
+            loading: entry.loading.clone(),
+        })
     }
 
     /// Creates a database and opens it.
@@ -292,11 +369,12 @@ impl DatabaseCatalog {
                 tokio::fs::create_dir_all(&path)
                     .await
                     .map_err(|e| format!("could not create database \"{}\": {}", name, e))?;
-                Database::new_named(&path.to_string_lossy(), false, name).await
+                // Refused as an error, not a panic: a panic here ends the
+                // client's session where it should answer the statement.
+                Database::try_new_named(&path.to_string_lossy(), false, name).await?
             }
-            None => Database::new_named("", true, name).await,
+            None => Database::try_new_named("", true, name).await?,
         };
-
 
         let database = Arc::new(database);
 
@@ -316,12 +394,18 @@ impl DatabaseCatalog {
         // database exists and holds data either way, and reporting the create
         // as failed would be a worse description of what happened than saying
         // its accounts did not come across.
-        if let Some(default) = self.databases.get(&self.default_name).map(|e| e.database.clone()) {
+        if let Some(default) = self
+            .databases
+            .get(&self.default_name)
+            .map(|e| e.database.clone())
+        {
             if let Err(e) = crate::auth::copy_role_catalogue(&default, &database).await {
                 log::error!(
                     "Database \"{}\" was created but its roles could not be carried over from \
                      \"{}\" ({}); no account will be able to connect to it until one is created",
-                    name, self.default_name, e
+                    name,
+                    self.default_name,
+                    e
                 );
             }
         }
@@ -358,6 +442,7 @@ impl DatabaseCatalog {
             return Err(format!("database \"{}\" does not exist", name));
         };
 
+        let database_id = entry.database.id;
         let attached = entry.sessions.load(Ordering::Acquire);
         if attached > 0 {
             return Err(format!(
@@ -370,6 +455,42 @@ impl DatabaseCatalog {
         // Out of the map first: a session that resolves the name after this
         // point must not be handed files that are about to be unlinked.
         self.databases.remove(name);
+        // Its sequences' counters. A recreated database has a new id and would
+        // never read them, so this only releases them.
+        crate::core::rql::sequence::forget_database(database_id);
+
+        // Branches made from it move to its parent (docs/branching.md §8).
+        #[cfg(feature = "db_branching")]
+        {
+            let moved = self.reparent_children(name);
+            let (reparented, orphaned): (Vec<_>, Vec<_>) =
+                moved.into_iter().partition(|(_, to)| to.is_some());
+            if let Some((_, Some(to))) = reparented.first() {
+                crate::core::notice::push(
+                    "NOTICE",
+                    "00000",
+                    format!(
+                        "{} now branch{} from \"{to}\"; {} merge base{} still the copy taken from \"{name}\"",
+                        reparented.iter().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", "),
+                        if reparented.len() == 1 { "es" } else { "" },
+                        if reparented.len() == 1 { "its" } else { "their" },
+                        if reparented.len() == 1 { " is" } else { "s are" },
+                    ),
+                );
+            }
+            if !orphaned.is_empty() {
+                crate::core::notice::push(
+                    "WARNING",
+                    "01000",
+                    format!(
+                        "{} {} made from \"{name}\", which was not a branch, so {} no parent to merge into now",
+                        orphaned.iter().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", "),
+                        if orphaned.len() == 1 { "was" } else { "were" },
+                        if orphaned.len() == 1 { "it has" } else { "they have" },
+                    ),
+                );
+            }
+        }
 
         if let Some(root) = &self.root {
             let path = std::path::Path::new(root).join(name);
@@ -380,18 +501,28 @@ impl DatabaseCatalog {
             // keep it, and its open handle to the now-unlinked log file, for the
             // life of the process. Nothing else removes registry entries.
             let _ = crate::core::wal::remove_for(&path.to_string_lossy());
+            // And for the same reason, any data-file flush failure recorded
+            // against it: a database recreated under this name reuses the path,
+            // and would otherwise refuse every commit for a failure in files
+            // that no longer exist.
+            crate::core::storage_providers::file_sync::forget_directory_failure(
+                &path.to_string_lossy(),
+            );
 
-            if let Err(e) = tokio::fs::remove_dir_all(&path).await {
-                // The database is gone as far as clients are concerned, so this
-                // is a disk-space problem rather than a failed statement.
-                warn!(
-                    "Dropped database \"{}\" but could not remove {}: {}",
-                    name,
-                    path.display(),
-                    e
-                );
-            }
+            // Its files close from its own tasks, just after it is let go:
+            // removing them while open leaves `.fuse_hidden` files on
+            // ntfs-3g, and the directory behind.
+            #[cfg(feature = "db_branching")]
+            branch::released(&path).await;
+            // The database is gone as far as clients are concerned, so one
+            // that cannot be removed yet is a disk-space matter, not a failed
+            // statement: it is set aside and removed once it can be.
+            remove_eventually(&path);
         }
+
+        // A branch's merge bases go with it.
+        #[cfg(feature = "db_branching")]
+        self.remove_bases(name).await;
 
         info!("Dropped database \"{}\"", name);
         Ok(())
@@ -457,6 +588,80 @@ async fn discover_databases(root: &str, default_name: &str) -> Vec<String> {
 /// Stricter than PostgreSQL, which allows anything inside double quotes: a name
 /// is also a directory name, so it is restricted to characters that mean the
 /// same thing on every filesystem and cannot escape the root.
+/// A directory removed while some of its files were still open, set aside
+/// under a name nothing reuses and removed once it can be: `.dropped-<name>-<n>`.
+pub(crate) const DROPPED_PREFIX: &str = ".dropped-";
+
+fn try_remove(path: &std::path::Path) -> bool {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => !path.exists(),
+    }
+}
+
+/// Removes the directory `path`. One that cannot be removed yet — on a FUSE
+/// filesystem (ntfs-3g) a file removed while open stays as `.fuse_hidden…`
+/// until it closes, and the directory with it — is renamed aside first, so
+/// its name is free at once (a database dropped and made again, a base
+/// generation reused), and removed in the background once it can be; what
+/// is still there at the next start is removed then ([`sweep_dropped`]).
+pub(crate) fn remove_eventually(path: &std::path::Path) {
+    if try_remove(path) {
+        return;
+    }
+    let (Some(parent), Some(base)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let aside = parent.join(format!(
+        "{DROPPED_PREFIX}{}-{nanos:x}",
+        base.to_string_lossy().trim_start_matches('.')
+    ));
+    if let Err(e) = crate::core::sync_path::rename_when_released(path, &aside) {
+        warn!(
+            "could not remove {} ({e}), nor set it aside; it is left as it is",
+            path.display()
+        );
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    // What keeps it is usually a file still mapped by a worker thread's
+    // read cache (`file_sync`'s per-thread mmap), which lets go the next time
+    // that thread reads another file: soon on a busy server, maybe not until
+    // a restart on an idle one. So: often at first, then rarely, for a day.
+    runtime.spawn(async move {
+        for attempt in 0u32..(60 + 24 * 120) {
+            let wait = if attempt < 60 { 1 } else { 30 };
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            if try_remove(&aside) {
+                return;
+            }
+        }
+        warn!(
+            "{} could not be removed; the next start removes it",
+            aside.display()
+        );
+    });
+}
+
+/// Removes what [`remove_eventually`] set aside and did not get to.
+fn sweep_dropped(root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if e.file_name().to_string_lossy().starts_with(DROPPED_PREFIX) && !try_remove(&e.path()) {
+            warn!("could not remove {}", e.path().display());
+        }
+    }
+}
+
 pub fn validate_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("database name is empty".to_string());
@@ -485,12 +690,47 @@ pub fn validate_name(name: &str) -> Result<(), String> {
 /// A parsed `CREATE DATABASE`, `DROP DATABASE` or `SHOW DATABASES` statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DatabaseStatement {
-    Create { name: String, if_not_exists: bool },
-    Drop { name: String, if_exists: bool },
+    Create {
+        name: String,
+        if_not_exists: bool,
+    },
+    Drop {
+        name: String,
+        if_exists: bool,
+    },
     /// Lists what the catalogue holds. It belongs here rather than with the
     /// rest of the introspection surface because the executor is handed one
     /// database and the catalogue is above it.
     List,
+    /// `CREATE BRANCH name [FROM db] [AS OF …] [WITHOUT BASE]`, and
+    /// `CREATE DATABASE name TEMPLATE db` (`from` set, default options).
+    #[cfg(feature = "db_branching")]
+    CreateBranch {
+        name: String,
+        /// `None`: the session's own database.
+        from: Option<String>,
+        options: branch::BranchOptions,
+        /// Written as `CREATE DATABASE … TEMPLATE`, and so answered as one.
+        template: bool,
+    },
+    #[cfg(feature = "db_branching")]
+    DropBranch { name: String, if_exists: bool },
+    #[cfg(feature = "db_branching")]
+    ResetBranch { name: String },
+    #[cfg(feature = "db_branching")]
+    PromoteBranch { name: String },
+    #[cfg(feature = "db_branching")]
+    ListBranches,
+    /// `SHOW BRANCH DIFF name [INTO db]`.
+    #[cfg(feature = "db_branching")]
+    DiffBranch { name: String, into: Option<String> },
+    #[cfg(feature = "db_branching")]
+    MergeBranch {
+        name: String,
+        into: Option<String>,
+        policy: branch::ConflictPolicy,
+        allow_drop: bool,
+    },
 }
 
 /// One database, as `SHOW DATABASES` reports it.
@@ -509,6 +749,25 @@ pub struct DatabaseListing {
 /// written, which is how PostgreSQL treats every identifier.
 pub fn parse_database_statement(sql: &str) -> Option<Result<DatabaseStatement, String>> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
+    // Every form names `DATABASE[S]` as its second word. Asked of the text as
+    // it is (uppercasing moves no whitespace), so the statements that are not
+    // one, which is every other statement the server runs, skip the copy.
+    let noun = trimmed.split_whitespace().nth(1)?;
+    if noun.eq_ignore_ascii_case("BRANCH") || noun.eq_ignore_ascii_case("BRANCHES") {
+        let verb = trimmed.split_whitespace().next()?.to_ascii_uppercase();
+        if !matches!(verb.as_str(), "CREATE" | "DROP" | "RESET" | "PROMOTE" | "MERGE" | "SHOW") {
+            return None;
+        }
+        #[cfg(feature = "db_branching")]
+        return branch::parse(trimmed, &trimmed.to_ascii_uppercase());
+        #[cfg(not(feature = "db_branching"))]
+        return Some(Err(
+            "database branching is not built into this server (feature db_branching)".to_string(),
+        ));
+    }
+    if !noun.eq_ignore_ascii_case("DATABASE") && !noun.eq_ignore_ascii_case("DATABASES") {
+        return None;
+    }
     let upper = trimmed.to_ascii_uppercase();
 
     let mut words = upper.split_whitespace();
@@ -551,7 +810,34 @@ pub fn parse_database_statement(sql: &str) -> Option<Result<DatabaseStatement, S
             let Some(name) = tokens.get(index).map(|t| fold(t)) else {
                 return Some(Err("CREATE DATABASE names no database".to_string()));
             };
-            // `WITH OWNER`, `TEMPLATE`, `ENCODING` and the rest are silently
+            // `TEMPLATE db` is a copy: a branch of `db`. `template0` and
+            // `template1` are PostgreSQL's empty templates, a plain create.
+            #[cfg(feature = "db_branching")]
+            {
+                let words: Vec<&str> = upper.split_whitespace().collect();
+                if let Some(template) = branch::template_of(
+                    words.get(index + 1..).unwrap_or(&[]),
+                    tokens.get(index + 1..).unwrap_or(&[]),
+                ) {
+                    return Some(match template {
+                        Err(e) => Err(e),
+                        Ok(None) => Ok(DatabaseStatement::Create {
+                            name,
+                            if_not_exists,
+                        }),
+                        Ok(Some(from)) if !if_not_exists => Ok(DatabaseStatement::CreateBranch {
+                            name,
+                            from: Some(from),
+                            options: branch::BranchOptions::default(),
+                            template: true,
+                        }),
+                        Ok(Some(_)) => Err(
+                            "CREATE DATABASE IF NOT EXISTS … TEMPLATE is not supported; use CREATE BRANCH".to_string(),
+                        ),
+                    });
+                }
+            }
+            // `WITH OWNER`, `ENCODING` and the rest are silently
             // accepted by nothing here; saying so beats creating a database
             // that ignores half of what was asked for.
             if tokens.len() > index + 1 {
@@ -560,7 +846,10 @@ pub fn parse_database_statement(sql: &str) -> Option<Result<DatabaseStatement, S
                     tokens[index + 1]
                 )));
             }
-            Some(Ok(DatabaseStatement::Create { name, if_not_exists }))
+            Some(Ok(DatabaseStatement::Create {
+                name,
+                if_not_exists,
+            }))
         }
         "DROP" => {
             let if_exists = upper.contains("IF EXISTS");
@@ -608,24 +897,44 @@ mod tests {
     #[test]
     fn an_unquoted_name_folds_and_a_quoted_one_does_not() {
         assert_eq!(
-            parse_database_statement("CREATE DATABASE Analytics").unwrap().unwrap(),
-            DatabaseStatement::Create { name: "analytics".to_string(), if_not_exists: false }
+            parse_database_statement("CREATE DATABASE Analytics")
+                .unwrap()
+                .unwrap(),
+            DatabaseStatement::Create {
+                name: "analytics".to_string(),
+                if_not_exists: false
+            }
         );
         assert_eq!(
-            parse_database_statement("CREATE DATABASE \"Analytics\"").unwrap().unwrap(),
-            DatabaseStatement::Create { name: "Analytics".to_string(), if_not_exists: false }
+            parse_database_statement("CREATE DATABASE \"Analytics\"")
+                .unwrap()
+                .unwrap(),
+            DatabaseStatement::Create {
+                name: "Analytics".to_string(),
+                if_not_exists: false
+            }
         );
     }
 
     #[test]
     fn if_exists_shifts_the_name() {
         assert_eq!(
-            parse_database_statement("DROP DATABASE IF EXISTS staging").unwrap().unwrap(),
-            DatabaseStatement::Drop { name: "staging".to_string(), if_exists: true }
+            parse_database_statement("DROP DATABASE IF EXISTS staging")
+                .unwrap()
+                .unwrap(),
+            DatabaseStatement::Drop {
+                name: "staging".to_string(),
+                if_exists: true
+            }
         );
         assert_eq!(
-            parse_database_statement("CREATE DATABASE IF NOT EXISTS staging").unwrap().unwrap(),
-            DatabaseStatement::Create { name: "staging".to_string(), if_not_exists: true }
+            parse_database_statement("CREATE DATABASE IF NOT EXISTS staging")
+                .unwrap()
+                .unwrap(),
+            DatabaseStatement::Create {
+                name: "staging".to_string(),
+                if_not_exists: true
+            }
         );
     }
 
@@ -640,7 +949,12 @@ mod tests {
 
     #[test]
     fn other_statements_are_not_claimed() {
-        for sql in ["SELECT 1", "CREATE TABLE t (id INT)", "DROP TABLE t", "CREATE USER bob"] {
+        for sql in [
+            "SELECT 1",
+            "CREATE TABLE t (id INT)",
+            "DROP TABLE t",
+            "CREATE USER bob",
+        ] {
             assert!(parse_database_statement(sql).is_none(), "claimed {:?}", sql);
         }
     }
@@ -648,7 +962,9 @@ mod tests {
     #[tokio::test]
     async fn an_in_memory_catalogue_creates_and_drops() {
         init_globals();
-        let catalogue = DatabaseCatalog::open(None, DEFAULT_DATABASE_NAME).await.unwrap();
+        let catalogue = DatabaseCatalog::open(None, DEFAULT_DATABASE_NAME)
+            .await
+            .unwrap();
         assert_eq!(catalogue.names(), vec![DEFAULT_DATABASE_NAME.to_string()]);
 
         catalogue.create("analytics").await.unwrap();
@@ -665,7 +981,9 @@ mod tests {
     #[tokio::test]
     async fn the_default_database_cannot_be_dropped() {
         init_globals();
-        let catalogue = DatabaseCatalog::open(None, DEFAULT_DATABASE_NAME).await.unwrap();
+        let catalogue = DatabaseCatalog::open(None, DEFAULT_DATABASE_NAME)
+            .await
+            .unwrap();
         assert!(
             catalogue
                 .drop_database(DEFAULT_DATABASE_NAME, "other")
@@ -677,10 +995,14 @@ mod tests {
     #[tokio::test]
     async fn an_attached_session_holds_a_database_open() {
         init_globals();
-        let catalogue = DatabaseCatalog::open(None, DEFAULT_DATABASE_NAME).await.unwrap();
+        let catalogue = DatabaseCatalog::open(None, DEFAULT_DATABASE_NAME)
+            .await
+            .unwrap();
         catalogue.create("staging").await.unwrap();
 
-        let guard = catalogue.connect("staging").expect("staging should be connectable");
+        let guard = catalogue
+            .connect("staging")
+            .expect("staging should be connectable");
         let err = catalogue
             .drop_database("staging", DEFAULT_DATABASE_NAME)
             .await
@@ -692,6 +1014,106 @@ mod tests {
             .drop_database("staging", DEFAULT_DATABASE_NAME)
             .await
             .expect("dropping should succeed once the session has gone");
+    }
+
+    /// A database recreated under a dropped one's name starts healthy.
+    ///
+    /// A data-file flush failure is recorded against the directory, and the
+    /// recreated database reuses that directory's path. Remembered across the
+    /// drop, it refused every commit of the new database — for files that had
+    /// been unlinked — until the process restarted.
+    #[tokio::test]
+    async fn a_recreated_database_does_not_inherit_a_dropped_one_s_flush_failure() {
+        use crate::core::storage_providers::file_sync::{
+            LocalStorageProvider, directory_flush_failure, record_directory_failure,
+        };
+        use crate::core::storage_providers::traits::StorageIO;
+
+        init_globals();
+        let root = tempfile::tempdir().unwrap();
+        let catalogue =
+            DatabaseCatalog::open(Some(root.path().to_str().unwrap()), DEFAULT_DATABASE_NAME)
+                .await
+                .unwrap();
+        catalogue.create("reused").await.unwrap();
+        let dir = root.path().join("reused").to_string_lossy().to_string();
+
+        record_directory_failure(&dir, "injected fdatasync failure".to_string());
+        assert!(directory_flush_failure(&dir).is_some());
+
+        catalogue
+            .drop_database("reused", DEFAULT_DATABASE_NAME)
+            .await
+            .unwrap();
+        catalogue.create("reused").await.unwrap();
+
+        assert_eq!(directory_flush_failure(&dir), None);
+        let provider = LocalStorageProvider::new(&dir, Some("fresh.db")).await;
+        let txn = provider.begin_txn();
+        let (_, token) = provider.append_data_txn(txn, b"row").await;
+        provider
+            .commit_durable(token)
+            .await
+            .expect("a commit in the recreated database was refused for the dropped one's failure");
+    }
+
+    /// The same, for a failure the dropped database records *after* the drop.
+    ///
+    /// The drop does not stop the database's vacuum or filter-checkpoint
+    /// tasks, and once its log is out of the registry their writes take the
+    /// no-log path and flush by opening the file's path — which the drop has
+    /// deleted. That failed open was recorded against the directory after the
+    /// drop had forgotten it, so the recreated database refused every commit
+    /// for files nobody could read any more.
+    #[tokio::test]
+    async fn a_late_write_from_a_dropped_database_does_not_poison_its_successor() {
+        use crate::core::storage_providers::file_sync::{
+            LocalStorageProvider, directory_flush_failure,
+        };
+        use crate::core::storage_providers::traits::{StorageIO, is_poisoned};
+
+        init_globals();
+        let root = tempfile::tempdir().unwrap();
+        let catalogue =
+            DatabaseCatalog::open(Some(root.path().to_str().unwrap()), DEFAULT_DATABASE_NAME)
+                .await
+                .unwrap();
+        catalogue.create("late").await.unwrap();
+        let dir = root.path().join("late").to_string_lossy().to_string();
+
+        // A maintenance task's handle on one of the database's files, opened
+        // while it existed and never flushed directly.
+        let survivor = LocalStorageProvider::new(&dir, Some("late_vacuum.db")).await;
+
+        catalogue
+            .drop_database("late", DEFAULT_DATABASE_NAME)
+            .await
+            .unwrap();
+        assert!(!root.path().join("late").exists(), "the drop removes the directory");
+
+        // Two late writes: the first finds the file gone, the second finds
+        // the file already poisoned. Neither may reach the directory.
+        for _ in 0..2 {
+            let (_, token) = survivor
+                .append_data_txn(survivor.begin_txn(), b"late")
+                .await;
+            // The dead file's own commits stay refused: they are not durable.
+            let err = survivor
+                .commit_durable(token)
+                .await
+                .expect_err("a write to an unlinked file was acknowledged as durable");
+            assert!(is_poisoned(&err), "{err}");
+        }
+        assert_eq!(directory_flush_failure(&dir), None);
+
+        catalogue.create("late").await.unwrap();
+        assert_eq!(directory_flush_failure(&dir), None);
+        let provider = LocalStorageProvider::new(&dir, Some("fresh.db")).await;
+        let (_, token) = provider.append_data_txn(provider.begin_txn(), b"row").await;
+        provider
+            .commit_durable(token)
+            .await
+            .expect("a commit in the recreated database was refused for the dropped one's late write");
     }
 }
 
@@ -738,7 +1160,11 @@ mod role_seeding_tests {
 
         // A role the default does not have is still absent, so this is a copy
         // rather than a blanket accept.
-        assert!(crate::auth::lookup_role(&made, "someone_else").await.is_none());
+        assert!(
+            crate::auth::lookup_role(&made, "someone_else")
+                .await
+                .is_none()
+        );
     }
 
     /// Trust authentication keeps no catalogue, so there is nothing to carry
@@ -771,7 +1197,10 @@ mod loading_tests {
             .expect("in-memory catalogue");
         catalog.create("loading_db").await.expect("create");
 
-        assert!(!catalog.is_loading("loading_db"), "not loading before it starts");
+        assert!(
+            !catalog.is_loading("loading_db"),
+            "not loading before it starts"
+        );
 
         let guard = catalog.begin_loading("loading_db").expect("guard");
         assert!(catalog.is_loading("loading_db"));

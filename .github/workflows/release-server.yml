@@ -1,0 +1,110 @@
+name: Release - server crates
+
+# Channel 2 of 3. Tag `server-v<version>` (the version in
+# rasterizeddb_core/Cargo.toml and rasterizeddb_embedded/Cargo.toml)
+# publishes, in order:
+#   rastcp (when its version is not on crates.io yet)
+#   rasterizeddb_core      - the engine and server, as a library
+#   rasterizeddb_embedded  - the SDK for running the database inside an application
+# and creates the GitHub release for the tag.
+#
+# The embedded SDK depends on rasterizeddb_client, so the client version it
+# names must already be on crates.io: release `client-v*` first.
+#
+# Needs the repository secret CARGO_REGISTRY_TOKEN.
+
+on:
+  push:
+    tags: ["server-v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Package and verify only; publish nothing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_MIN_STACK: "33554432"
+
+jobs:
+  test:
+    name: test ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { name: linux-x86_64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { name: linux-arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc }
+          - { name: windows-arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          target: ${{ matrix.target }}
+      - name: Embedded SDK tests
+        run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_embedded
+      - name: Server smoke test
+        shell: bash
+        run: |
+          cargo build --locked --target ${{ matrix.target }} -p rasterizeddb_core --bin rasterizeddb_core -p rasterizeddb_client --example quickstart
+          ext="${{ runner.os == 'Windows' && '.exe' || '' }}"
+          bash .github/scripts/smoke.sh \
+            "target/${{ matrix.target }}/debug/rasterizeddb_core$ext" \
+            "target/${{ matrix.target }}/debug/examples/quickstart$ext"
+
+  publish:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          target: x86_64-unknown-linux-gnu
+
+      - name: The tag matches the crate versions
+        if: github.event_name == 'push'
+        run: bash .github/scripts/check-version.sh server-v rasterizeddb_core rasterizeddb_embedded
+
+      - name: The client version the embedded SDK needs is on crates.io
+        run: |
+          v="$(cargo pkgid -p rasterizeddb_client | sed 's/.*[#@]//')"
+          code="$(curl -s -o /dev/null -w '%{http_code}' -A "rasterizeddb-release-workflow (github.com/$GITHUB_REPOSITORY)" "https://crates.io/api/v1/crates/rasterizeddb_client/$v")"
+          if [ "$code" != 200 ]; then
+            echo "::error::rasterizeddb_client $v is not on crates.io: push the client-v$v tag first"
+            exit 1
+          fi
+
+      - name: Publish (dry run)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        run: >
+          cargo package --locked
+          -p rastcp -p rasterizeddb_client_derive -p rasterizeddb_client
+          -p rasterizeddb_core -p rasterizeddb_embedded
+
+      - name: Publish to crates.io
+        if: github.event_name == 'push' || !inputs.dry_run
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: bash .github/scripts/publish-crates.sh rastcp rasterizeddb_core rasterizeddb_embedded
+
+      - name: GitHub release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Server crates ${{ github.ref_name }}"
+          generate_release_notes: true
+          body: |
+            The database as Rust libraries, published to crates.io:
+
+            - [`rasterizeddb_embedded`](https://crates.io/crates/rasterizeddb_embedded) - run the database inside your application ([docs](https://docs.rs/rasterizeddb_embedded))
+            - [`rasterizeddb_core`](https://crates.io/crates/rasterizeddb_core) - the engine and server
+
+            On x86-64 the engine needs an AVX2 (x86-64-v3) CPU; build with `-C target-cpu=x86-64-v3`. aarch64 needs nothing extra.

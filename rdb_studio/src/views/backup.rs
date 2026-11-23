@@ -518,13 +518,28 @@ fn catalogue<'a>(studio: &'a Studio, entries: &'a [BackupEntry]) -> Element<'a, 
         super::GridColumn::new("stored", "STORED", 90.0).right(),
         super::GridColumn::new("original", "ORIGINAL", 90.0).right(),
         super::GridColumn::new("ratio", "RATIO", 70.0).right(),
-        super::GridColumn::new("action", "", 104.0),
+        super::GridColumn::new("action", "", 104.0).unsortable(),
         super::GridColumn::new("detail", "WHERE", 420.0),
     ];
     let widths = super::column_widths(&layout, &columns);
 
+    let count = entries.len();
+    let mut entries: Vec<&BackupEntry> = entries.iter().collect();
+    super::sort_rows(&layout, &mut entries, |entry, column| match column {
+        "id" => super::SortKey::text(&entry.id),
+        // By the end of the range, which is what orders two backups in time
+        // when they were taken in the same second.
+        "lsn" => super::SortKey::number(entry.end_lsn as f64),
+        "stored" => super::SortKey::number(entry.compressed_bytes as f64),
+        "original" => super::SortKey::number(entry.uncompressed_bytes as f64),
+        "ratio" => super::SortKey::number(entry.ratio()),
+        "detail" => super::SortKey::text(&entry.detail),
+        "kind" => super::SortKey::text(&entry.kind),
+        _ => super::SortKey::text(&entry.created_at),
+    });
+
     let mut body = column![].spacing(0);
-    for (index, entry) in entries.iter().enumerate() {
+    for (index, entry) in entries.into_iter().enumerate() {
         let selected = entry.is_snapshot() && studio.restore_snapshot == entry.id;
 
         let action: Element<'_, Message> = if entry.is_snapshot() {
@@ -570,7 +585,7 @@ fn catalogue<'a>(studio: &'a Studio, entries: &'a [BackupEntry]) -> Element<'a, 
     }
 
     framed(
-        format!("CATALOGUE · {}", entries.len()),
+        format!("CATALOGUE · {}", count),
         None,
         super::grid_frame(
             &layout,

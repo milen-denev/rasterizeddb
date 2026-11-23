@@ -35,7 +35,9 @@ pub struct ImportStatement {
 /// "unsupported statement" reply rather than a confusing import error.
 pub fn is_import_statement(sql: &str) -> bool {
     let mut words = sql.split_whitespace();
-    words.next().is_some_and(|w| w.eq_ignore_ascii_case("IMPORT"))
+    words
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("IMPORT"))
 }
 
 /// Parses an `IMPORT` statement, or explains what is wrong with it.
@@ -60,7 +62,10 @@ pub fn parse(sql: &str) -> Result<ImportStatement, String> {
         index += 1;
     }
 
-    if !words.get(index).is_some_and(|w| w.eq_ignore_ascii_case("FROM")) {
+    if !words
+        .get(index)
+        .is_some_and(|w| w.eq_ignore_ascii_case("FROM"))
+    {
         return Err(USAGE.to_string());
     }
     index += 1;
@@ -166,7 +171,10 @@ pub fn parse(sql: &str) -> Result<ImportStatement, String> {
             "WIDE" => {
                 // `WIDE NUMERIC AS TEXT` / `... AS FAIL`.
                 let mut at = index + 1;
-                if words.get(at).is_some_and(|w| w.eq_ignore_ascii_case("NUMERIC")) {
+                if words
+                    .get(at)
+                    .is_some_and(|w| w.eq_ignore_ascii_case("NUMERIC"))
+                {
                     at += 1;
                 }
                 if words.get(at).is_some_and(|w| w.eq_ignore_ascii_case("AS")) {
@@ -203,13 +211,19 @@ pub fn parse(sql: &str) -> Result<ImportStatement, String> {
                 index += 2;
             }
             other => {
-                return Err(format!("unexpected {:?} in IMPORT DATABASE\n\n{}", other, USAGE));
+                return Err(format!(
+                    "unexpected {:?} in IMPORT DATABASE\n\n{}",
+                    other, USAGE
+                ));
             }
         }
     }
 
     if !source_given {
-        return Err(format!("IMPORT does not say what to read from.\n\n{}", USAGE));
+        return Err(format!(
+            "IMPORT does not say what to read from.\n\n{}",
+            USAGE
+        ));
     }
     if source.database.is_empty() {
         return Err("IMPORT does not name a database to read; add DATABASE '<name>'".to_string());
@@ -246,11 +260,21 @@ IMPORT DATABASE FROM POSTGRES
     INTO <new database>";
 
 /// Reads `TABLES (a, b, c)`, returning the names and how many words were used.
-fn table_list(words: &[String], mut at: usize, keyword: &str) -> Result<(Vec<String>, usize), String> {
+fn table_list(
+    words: &[String],
+    mut at: usize,
+    keyword: &str,
+) -> Result<(Vec<String>, usize), String> {
     let start = at;
-    if words.get(at).is_some_and(|w| w.eq_ignore_ascii_case("TABLES")) {
+    if words
+        .get(at)
+        .is_some_and(|w| w.eq_ignore_ascii_case("TABLES"))
+    {
         at += 1;
-    } else if words.get(at).is_some_and(|w| w.eq_ignore_ascii_case("TABLE")) {
+    } else if words
+        .get(at)
+        .is_some_and(|w| w.eq_ignore_ascii_case("TABLE"))
+    {
         at += 1;
     }
 
@@ -472,15 +496,13 @@ mod tests {
 
     #[test]
     fn sslmode_is_read_and_checked() {
-        let statement = parse(
-            "IMPORT FROM POSTGRES 'postgres://u:p@h:5432/d' SSLMODE 'verify-full' INTO t",
-        )
-        .unwrap();
+        let statement =
+            parse("IMPORT FROM POSTGRES 'postgres://u:p@h:5432/d' SSLMODE 'verify-full' INTO t")
+                .unwrap();
         assert_eq!(statement.source.sslmode, SslMode::VerifyFull);
 
-        let error =
-            parse("IMPORT FROM POSTGRES 'postgres://u:p@h:5432/d' SSLMODE 'maybe' INTO t")
-                .unwrap_err();
+        let error = parse("IMPORT FROM POSTGRES 'postgres://u:p@h:5432/d' SSLMODE 'maybe' INTO t")
+            .unwrap_err();
         assert!(error.contains("verify-full"), "{}", error);
     }
 
@@ -493,7 +515,11 @@ mod tests {
 
     #[test]
     fn a_statement_that_says_nothing_useful_explains_itself() {
-        assert!(parse("IMPORT").unwrap_err().contains("IMPORT DATABASE FROM POSTGRES"));
+        assert!(
+            parse("IMPORT")
+                .unwrap_err()
+                .contains("IMPORT DATABASE FROM POSTGRES")
+        );
         assert!(
             parse("IMPORT FROM MYSQL 'x' INTO t")
                 .unwrap_err()
@@ -514,12 +540,18 @@ mod tests {
     #[test]
     fn an_import_with_no_source_is_refused_rather_than_dialling_localhost() {
         let error = parse("IMPORT DATABASE FROM POSTGRES USER 'bob' INTO t").unwrap_err();
-        assert!(error.contains("does not say what to read from"), "{}", error);
+        assert!(
+            error.contains("does not say what to read from"),
+            "{}",
+            error
+        );
     }
 
     #[test]
     fn only_import_statements_are_recognised() {
-        assert!(is_import_statement("IMPORT DATABASE FROM POSTGRES 'x' INTO y"));
+        assert!(is_import_statement(
+            "IMPORT DATABASE FROM POSTGRES 'x' INTO y"
+        ));
         assert!(is_import_statement("  import from pg 'x' into y"));
         assert!(!is_import_statement("SELECT * FROM imports"));
         assert!(!is_import_statement("CREATE DATABASE importer"));

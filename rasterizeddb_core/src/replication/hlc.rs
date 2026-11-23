@@ -199,7 +199,10 @@ mod tests {
         let remote = pack(physical_ms(clock.read()) + 60_000, 7);
 
         let merged = clock.observe(remote);
-        assert!(merged > remote, "a reply must be later than what it answers");
+        assert!(
+            merged > remote,
+            "a reply must be later than what it answers"
+        );
         assert!(clock.now() > remote, "and stay later afterwards");
     }
 
@@ -219,7 +222,12 @@ mod tests {
 
         let wall = wall_clock_ms();
         // Within a second of the real clock: the packing must not shift it.
-        assert!(physical_ms(now).abs_diff(wall) < 1_000, "{} vs {}", physical_ms(now), wall);
+        assert!(
+            physical_ms(now).abs_diff(wall) < 1_000,
+            "{} vs {}",
+            physical_ms(now),
+            wall
+        );
     }
 
     #[test]

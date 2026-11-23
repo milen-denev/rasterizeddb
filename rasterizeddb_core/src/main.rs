@@ -1,13 +1,21 @@
+// The library's limit (`lib.rs`): the native listener's server is
+// instantiated here with the database's handler, and proving its futures
+// `Send` runs as deep as the library's own.
+#![recursion_limit = "256"]
+
 use std::env;
 
 use clap::Parser;
 
 use log::LevelFilter;
-use rasterizeddb_core::{BATCH_SIZE, MAX_PERMITS_THREADS, cache::query_cache, core::database::Database};
+use rasterizeddb_core::{
+    BATCH_SIZE, MAX_PERMITS_THREADS, cache::query_cache, core::database::Database,
+};
 use tokio::runtime::Builder;
 
-use rasterizeddb_core::configuration::Configuration;
 use clap::ValueEnum;
+use rasterizeddb_core::simds::cpu::SimdRequest;
+use rasterizeddb_core::configuration::Configuration;
 
 /// S3 backup and restore flags. Off by default and absent from the binary
 /// entirely without the feature.
@@ -18,6 +26,10 @@ mod backup_args;
 /// without the feature.
 #[cfg(feature = "pg_import")]
 mod pg_import_args;
+
+/// Redis-compatible key/value store flags.
+#[cfg(feature = "kv_cache")]
+mod kv_args;
 
 #[derive(Clone, Debug, ValueEnum)]
 enum PgTlsMode {
@@ -34,10 +46,21 @@ enum Protocol {
     Rastcp,
     /// PostgreSQL wire protocol (pgwire) for network-level Postgres compatibility
     Pgwire,
+    /// Both at once, on one catalogue: the `--pg-*` flags configure the
+    /// PostgreSQL listener and the `--rdb-*` flags the native one. They share
+    /// the role catalogue, which the PostgreSQL side seeds first, so its
+    /// `--pg-user`/`--pg-password` log in on either protocol (under
+    /// `--pg-auth scram-sha-256`: the native protocol answers SCRAM only)
+    #[value(alias = "all")]
+    Both,
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "rasterizeddb_core", version, about = "RasterizedDB Core Server")]
+#[command(
+    name = "rasterizeddb_core",
+    version,
+    about = "RasterizedDB Core Server"
+)]
 struct Args {
     /// Database location directory path (default: none, required)
     #[arg(long, value_name = "PATH")]
@@ -48,7 +71,11 @@ struct Args {
     batch_size: Option<usize>,
 
     /// Number of concurrent worker threads (default: 16)
-    #[arg(long = "concurrent-threads", alias = "concurrent_threads", value_name = "N")]
+    #[arg(
+        long = "concurrent-threads",
+        alias = "concurrent_threads",
+        value_name = "N"
+    )]
     concurrent_threads: Option<usize>,
 
     /// Whether a commit waits for its fdatasync (default: on)
@@ -66,7 +93,11 @@ struct Args {
     /// A session can override it for itself with `SET synchronous_commit = off`,
     /// and it can be changed on a running server with
     /// `SET CONFIG wal.synchronous_commit = off`.
-    #[arg(long = "synchronous-commit", alias = "synchronous_commit", value_name = "on|off")]
+    #[arg(
+        long = "synchronous-commit",
+        alias = "synchronous_commit",
+        value_name = "on|off"
+    )]
     synchronous_commit: Option<String>,
 
     /// How long an asynchronous commit may go unsynced, in milliseconds
@@ -74,8 +105,92 @@ struct Args {
     ///
     /// The bound on what `--synchronous-commit off` can lose. Ignored while
     /// synchronous commit is on, because nothing is then left for the writer.
-    #[arg(long = "wal-writer-delay-ms", alias = "wal_writer_delay_ms", value_name = "MS")]
+    #[arg(
+        long = "wal-writer-delay-ms",
+        alias = "wal_writer_delay_ms",
+        value_name = "MS"
+    )]
     wal_writer_delay_ms: Option<u64>,
+
+    /// Whether statements are recorded for `SHOW QUERIES`, `SHOW QUERY STATS`
+    /// and `pg_stat_statements` (default: on)
+    ///
+    /// Off, a statement skips the record: no redaction, normalisation or hash
+    /// of its text, and no turn at the one lock every statement on the server
+    /// otherwise takes. Nothing else changes; what a statement answers is the
+    /// same either way. It can be changed on a running server with
+    /// `SET CONFIG query_stats.enabled = off`.
+    #[cfg(feature = "query_stats")]
+    #[arg(long = "query-stats", alias = "query_stats", value_name = "on|off")]
+    query_stats: Option<String>,
+
+    /// Whether tables and partitions whose pointer slots are mostly dead are
+    /// compacted (`VACUUM FULL`) without being asked (default: on)
+    ///
+    /// Pointer slots are given back only by a compaction; plain `VACUUM`
+    /// reuses row bytes, not slots. A table or partition is due when it has at
+    /// least `--auto-compact-min-slots` slots and either its slots are
+    /// `--auto-compact-ratio` times its live rows or `--auto-compact-dead-fraction`
+    /// of them are dead. A busy one is skipped, never waited for. Every
+    /// `--auto-compact-*` flag is the starting value of the hot
+    /// `SET CONFIG auto_compact.*` key of the same name.
+    #[arg(long = "auto-compact", alias = "auto_compact", value_name = "on|off")]
+    auto_compact: Option<String>,
+
+    /// Seconds between two looks at every table and open partition (default: 60)
+    #[arg(long = "auto-compact-interval-secs", value_name = "SECS")]
+    auto_compact_interval_secs: Option<u64>,
+
+    /// Pointer slots a table or partition has before it can be due at all
+    /// (default: 2048)
+    #[arg(long = "auto-compact-min-slots", value_name = "N")]
+    auto_compact_min_slots: Option<u64>,
+
+    /// Due when the slots are this many times the live rows, an update-heavy
+    /// table's shape (default: 8; 0 turns this rule off)
+    #[arg(long = "auto-compact-ratio", value_name = "N")]
+    auto_compact_ratio: Option<u64>,
+
+    /// Due when this fraction of the slots is dead, a retention table's
+    /// shape (default: 0.25; 0 turns this rule off)
+    #[arg(long = "auto-compact-dead-fraction", value_name = "0..1")]
+    auto_compact_dead_fraction: Option<f64>,
+
+    /// The dead-fraction rule applies only to a table or partition of at most
+    /// this many slots, bounding how long it stops one (default: 131072, about
+    /// 2 s; 0 is no limit)
+    #[arg(long = "auto-compact-dead-fraction-max-slots", value_name = "N")]
+    auto_compact_dead_fraction_max_slots: Option<u64>,
+
+    /// Least seconds between two automatic compactions of one table or
+    /// partition (default: 600)
+    #[arg(long = "auto-compact-cooldown-secs", value_name = "SECS")]
+    auto_compact_cooldown_secs: Option<u64>,
+
+    /// glibc malloc arenas, a low-memory mode (default: 0, glibc's own, 8 per
+    /// core)
+    ///
+    /// Fewer arenas keep less freed memory per thread and cost throughput
+    /// under concurrency, since allocating threads share their locks.
+    /// Measured at 16 clients against the default: 4 arenas -20% point reads
+    /// and -12% inserts for -16% RSS; 1 arena -61% and -53% for -11%.
+    #[arg(long = "malloc-arenas", alias = "malloc_arenas", value_name = "N")]
+    malloc_arenas: Option<usize>,
+
+    /// Log bytes between checkpoints (default: 67108864, 64 MiB)
+    ///
+    /// A checkpoint flushes every data file and discards the log. Larger
+    /// means fewer checkpoints and a longer replay after a crash.
+    #[arg(long = "wal-checkpoint-bytes", alias = "wal_checkpoint_bytes", value_name = "N")]
+    wal_checkpoint_bytes: Option<u64>,
+
+    /// KiB of zeros the log is extended by ahead of its appends (default: 1024, 0 = off)
+    ///
+    /// A commit then syncs blocks the log already owns instead of growing
+    /// the file, which about halves the sync on ext4. Costs up to this much
+    /// disk per log, and each chunk of log is written twice.
+    #[arg(long = "wal-prealloc-kb", alias = "wal_prealloc_kb", value_name = "KB")]
+    wal_prealloc_kb: Option<u64>,
 
     /// Logging level off, error, warn, info, debug, trace (default: error)
     #[arg(long = "log-level", alias = "log_level", value_name = "LEVEL")]
@@ -99,13 +214,31 @@ struct Args {
     #[arg(long = "tune-allocator", alias = "tune_allocator", value_name = "BOOL")]
     tune_allocator: Option<bool>,
 
+    /// Instruction set for the SIMD kernels: auto, avx512, avx2 or scalar
+    /// (default: auto, the best this CPU supports).
+    ///
+    /// An explicit level the CPU cannot run refuses to start rather than
+    /// quietly falling back. `avx2` on an AVX-512 machine is how to measure
+    /// what an AVX2-only server (such as the i5-10400 in production) will do.
+    #[arg(long = "simd", value_name = "LEVEL")]
+    simd: Option<SimdRequest>,
+
+    /// Drop rows a WHERE clause cannot match before fetching them, a batch at
+    /// a time, using SIMD compares on fixed-width columns (default: true).
+    #[arg(long = "scan-prefilter", alias = "scan_prefilter", value_name = "BOOL")]
+    scan_prefilter: Option<bool>,
+
     /// Run an in-memory database (no files are created).
     /// Master switch for the bit-level filter index.
     #[arg(long = "filter", alias = "filter_enabled", value_name = "BOOL")]
     filter_enabled: Option<bool>,
 
     /// Index rows that predate the filter when a table opens.
-    #[arg(long = "filter-backfill", alias = "filter_backfill", value_name = "BOOL")]
+    #[arg(
+        long = "filter-backfill",
+        alias = "filter_backfill",
+        value_name = "BOOL"
+    )]
     filter_backfill: Option<bool>,
 
     /// Skip the candidate mask when it would prune less than this fraction.
@@ -115,6 +248,37 @@ struct Args {
     /// Seconds between filter checkpoints by the maintenance task.
     #[arg(long = "filter-checkpoint-secs", value_name = "N")]
     filter_checkpoint_secs: Option<u64>,
+
+    /// What an open does with the B-tree, hash and path indexes:
+    /// `rebuild` them from rows (the default), or load the `snapshot` a
+    /// clean shutdown, `rdb_index_checkpoint` or the idle checkpoint wrote
+    /// (docs/persistent-indexes.md §4). The startup value of `SET CONFIG
+    /// index_snapshot.index_storage`; it must be set here for the opens at
+    /// startup to load.
+    #[arg(long = "index-storage", value_name = "rebuild|snapshot")]
+    index_storage: Option<String>,
+
+    /// Where B-tree, hash and path indexes keep their entries (default:
+    /// memory)
+    ///
+    /// `memory` holds every entry in RAM, as always. `hybrid` and `disk` keep
+    /// them in sorted files beside the table, searched through a block cache,
+    /// with only recent changes in memory: `hybrid` with a large cache and
+    /// memory part, `disk` with small ones. Takes effect for tables opened
+    /// after it is set; a paged index is rebuilt at every open
+    /// (docs/disk-indexes.md).
+    #[arg(long = "index-residency", value_name = "memory|hybrid|disk")]
+    index_residency: Option<String>,
+
+    /// The paged indexes' block cache, in MiB, shared by every table
+    /// (default: 1024 for hybrid, 64 for disk)
+    #[arg(long = "index-cache-mb", value_name = "MIB")]
+    index_cache_mb: Option<u64>,
+
+    /// The memory part each paged index holds before writing it out as a
+    /// run, in MiB (default: 256 for hybrid, 16 for disk)
+    #[arg(long = "index-delta-mb", value_name = "MIB")]
+    index_delta_mb: Option<u64>,
 
     /// Floor on fingerprint bits per row (4..16).
     #[arg(long = "filter-min-f", value_name = "N")]
@@ -158,13 +322,38 @@ struct Args {
     ///
     /// Only affects columns created from now on; what an existing column is, is
     /// recorded in its schema.
-    #[arg(long = "json-shadow-tables", alias = "json_shadow_tables", value_name = "BOOL")]
+    #[arg(
+        long = "json-shadow-tables",
+        alias = "json_shadow_tables",
+        value_name = "BOOL"
+    )]
     json_shadow_tables: Option<bool>,
+
+    /// Settle long-finished transaction outcomes, at open and while running.
+    /// Default: on. `false` (or `RASTERIZEDDB_SETTLE_STATUS=0`) is the kill
+    /// switch.
+    ///
+    /// The status log keeps two bits per transaction in memory. Settling
+    /// replaces everything below the oldest running transaction and the oldest
+    /// open snapshot with a compact record of the transactions that did *not*
+    /// commit, and keeps a bitmap only for the window still in play — so
+    /// memory stops growing with every transaction ever run (≈ 120 KiB instead
+    /// of 4 MiB at 12 million). Answers are identical either way. A summary is
+    /// kept in a sidecar file (`db_transactions.status.settled`) so the next
+    /// open need not reread the history. The status file itself is never
+    /// rewritten or truncated: builds without settling, and older builds,
+    /// ignore the sidecar and read the file as always.
+    #[arg(
+        long = "settle-status-at-open",
+        alias = "settle_status_at_open",
+        value_name = "BOOL"
+    )]
+    settle_status_at_open: Option<bool>,
 
     #[arg(long = "in-memory", alias = "in_memory", default_value_t = false)]
     in_memory: bool,
 
-    /// Server protocol to use: rastcp or pgwire (default: rastcp)
+    /// Server protocol to use: rastcp, pgwire or both (default: rastcp)
     #[arg(long, value_enum, default_value_t = Protocol::Rastcp)]
     protocol: Protocol,
 
@@ -175,6 +364,30 @@ struct Args {
     /// pgwire listen port (default: 5432)
     #[arg(long = "pg-port", default_value_t = 5432)]
     pg_port: u16,
+
+    /// Also serve the PostgreSQL protocol on a unix socket in this directory,
+    /// named `.s.PGSQL.<pg-port>` as every PostgreSQL client expects: libpq,
+    /// psql and tokio-postgres connect with `host=<DIR> port=<pg-port>`.
+    ///
+    /// No TLS on it: an `SSLRequest` is answered "no" whatever `--pg-tls`
+    /// says, as PostgreSQL does. Its permissions and group are
+    /// `--socket-mode` and `--socket-group`. The whole path, file name
+    /// included, has to fit a socket address: about 107 bytes on Linux.
+    #[arg(long = "pg-socket-dir", value_name = "DIR")]
+    pg_socket_dir: Option<std::path::PathBuf>,
+
+    /// `off` serves the PostgreSQL protocol on `--pg-socket-dir` alone, with no
+    /// TCP port open. Default `on`.
+    #[arg(long = "pg-tcp", value_name = "on|off", default_value = "on")]
+    pg_tcp: String,
+
+    /// How callers on `--pg-socket-dir` authenticate: trust, password, md5,
+    /// scram-sha-256, or peer — a role may log in without a password when its
+    /// name is the operating-system user connecting, as the kernel reports it.
+    /// Defaults to `--pg-auth`. trust is refused on a socket that admits users
+    /// outside its owner and group.
+    #[arg(long = "pg-socket-auth", value_name = "METHOD")]
+    pg_socket_auth: Option<String>,
 
     /// pgwire TLS mode (default: require)
     #[arg(long = "pg-tls", value_enum, default_value_t = PgTlsMode::Require)]
@@ -212,6 +425,56 @@ struct Args {
     #[arg(long = "pg-password", value_name = "PASSWORD")]
     pg_password: Option<String>,
 
+    /// Most pgwire sessions served at once (default: 500). A connection over
+    /// it is refused with SQLSTATE 53300, "sorry, too many clients already".
+    /// Must be at least 1: there is no unlimited setting. Needs 4n + 256 open
+    /// files: the soft limit is raised to that if the hard limit allows, and
+    /// otherwise the cap is lowered to fit, with a warning.
+    #[arg(
+        long = "max-connections",
+        alias = "max_connections",
+        default_value_t = 500,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    max_connections: u32,
+
+    /// How long a pgwire connection has to send its startup packet, finish
+    /// TLS and authenticate before it is closed (default: 60s). A bare number
+    /// is seconds; `500ms`, `30s` and `2min` are accepted too.
+    #[arg(
+        long = "authentication-timeout",
+        alias = "authentication_timeout",
+        value_name = "TIME",
+        default_value = "60s",
+        value_parser = parse_authentication_timeout
+    )]
+    authentication_timeout: std::time::Duration,
+
+    /// Default `idle_in_transaction_session_timeout` for pgwire sessions: a
+    /// session idle inside an open transaction for longer is ended with
+    /// SQLSTATE 25P03 and its transaction rolled back. A bare number is
+    /// milliseconds. 0 (the default) disables it; sessions may `SET` their own.
+    #[arg(
+        long = "idle-in-transaction-session-timeout",
+        alias = "idle_in_transaction_session_timeout",
+        value_name = "TIME",
+        default_value = "0",
+        value_parser = parse_idle_timeout
+    )]
+    idle_in_transaction_session_timeout: std::time::Duration,
+
+    /// Default `idle_session_timeout` for pgwire sessions: a session idle
+    /// outside a transaction for longer is ended with SQLSTATE 57P05. A bare
+    /// number is milliseconds. 0 (the default) disables it.
+    #[arg(
+        long = "idle-session-timeout",
+        alias = "idle_session_timeout",
+        value_name = "TIME",
+        default_value = "0",
+        value_parser = parse_idle_timeout
+    )]
+    idle_session_timeout: std::time::Duration,
+
     // --- native (rastcp) protocol authentication --------------------------
     /// How native connections authenticate: `scram-sha-256` (default) or
     /// `trust`.
@@ -237,6 +500,160 @@ struct Args {
     /// more than one node on a host.
     #[arg(long = "rdb-port", value_name = "PORT")]
     rdb_port: Option<u16>,
+
+    /// Also serve the native protocol on this unix socket, for clients on the
+    /// same machine (`rasterizeddb_client` address `unix:<path>`).
+    ///
+    /// No TLS and no TCP stack on it: only root can watch a local socket, and
+    /// who may connect is decided by the file's permissions. A socket file
+    /// left behind by a server that did not shut down is replaced; one another
+    /// server is listening on, or a path that is not a socket, is refused.
+    /// The path has to fit a socket address: about 107 bytes on Linux.
+    #[arg(long = "rdb-socket", value_name = "PATH")]
+    rdb_socket: Option<std::path::PathBuf>,
+
+    /// `off` serves the native protocol on `--rdb-socket` alone, with no TCP
+    /// listener: a deployment whose clients are all on this machine has no
+    /// port open at all. Default `on`.
+    #[arg(long = "rdb-tcp", value_name = "on|off", default_value = "on")]
+    rdb_tcp: String,
+
+    /// How long one native-protocol request may run, in seconds, before it is
+    /// abandoned and answered as timed out (default 30). A connection idle this
+    /// long is closed too. Raise it for long statements sent over the native
+    /// protocol (a backup, an import, a rebalance, a large report); pgwire has
+    /// no such limit.
+    #[arg(long = "rdb-request-timeout", value_name = "SECONDS")]
+    rdb_request_timeout: Option<u64>,
+
+    /// PEM certificate chain the native TCP listener presents (with
+    /// --rdb-key). Without one it makes a self-signed certificate at every
+    /// start, which a client can encrypt to but never verify.
+    #[arg(long = "rdb-cert", value_name = "PATH", requires = "rdb_key")]
+    rdb_cert: Option<String>,
+
+    /// PEM private key for --rdb-cert.
+    #[arg(long = "rdb-key", value_name = "PATH", requires = "rdb_cert")]
+    rdb_key: Option<String>,
+
+    /// Permissions of every unix socket this server serves, in octal (default
+    /// 600: this server's user only; 660 admits its group too). Connecting
+    /// needs write permission. A socket that admits users outside its owner
+    /// and group must authenticate its callers.
+    #[arg(long = "socket-mode", value_name = "MODE", default_value = "600")]
+    socket_mode: String,
+
+    /// Group to give every unix socket this server serves, by name or id.
+    /// With `--socket-mode 660` its members may connect: how a socket is
+    /// shared with a service running as another user. This server's user must
+    /// belong to the group.
+    #[arg(long = "socket-group", value_name = "GROUP")]
+    socket_group: Option<String>,
+
+    // --- MySQL / MariaDB protocol ------------------------------------------
+    /// Also serve the MySQL / MariaDB client protocol on this TCP port (3306
+    /// is MySQL's), beside whichever other listeners run, on the same
+    /// databases and roles. Off unless this or `--mysql-socket` is given.
+    #[cfg(feature = "mysql_wire")]
+    #[arg(long = "mysql-port", value_name = "PORT")]
+    mysql_port: Option<u16>,
+
+    /// Address the MySQL protocol listens on (default: 127.0.0.1).
+    #[cfg(feature = "mysql_wire")]
+    #[arg(long = "mysql-addr", default_value = "127.0.0.1")]
+    mysql_addr: String,
+
+    /// Also serve the MySQL protocol on this unix socket (what
+    /// `mysql --socket=PATH` connects to). Its permissions are
+    /// `--socket-mode` and `--socket-group`; no TLS on it.
+    #[cfg(feature = "mysql_wire")]
+    #[arg(long = "mysql-socket", value_name = "PATH")]
+    mysql_socket: Option<std::path::PathBuf>,
+
+    /// How MySQL clients authenticate: `password` (caching_sha2_password
+    /// against the role catalogue, the default) or `trust`.
+    #[cfg(feature = "mysql_wire")]
+    #[arg(long = "mysql-auth", default_value = "password")]
+    mysql_auth: String,
+
+    /// How callers on `--mysql-socket` authenticate; defaults to
+    /// `--mysql-auth`. trust is refused on a socket that admits users outside
+    /// its owner and group.
+    #[cfg(feature = "mysql_wire")]
+    #[arg(long = "mysql-socket-auth", value_name = "METHOD")]
+    mysql_socket_auth: Option<String>,
+
+    /// MySQL protocol TLS: disable, prefer (default) or require. A first
+    /// password login over TCP needs TLS (there is no RSA key exchange).
+    #[cfg(feature = "mysql_wire")]
+    #[arg(long = "mysql-tls", default_value = "prefer")]
+    mysql_tls: String,
+
+    /// PEM certificate chain for the MySQL listener (default: `--pg-cert`,
+    /// else a self-signed one made at start-up).
+    #[cfg(feature = "mysql_wire")]
+    #[arg(long = "mysql-cert", value_name = "PATH")]
+    mysql_cert: Option<String>,
+
+    /// PEM private key for the MySQL listener (default: `--pg-key`).
+    #[cfg(feature = "mysql_wire")]
+    #[arg(long = "mysql-key", value_name = "PATH")]
+    mysql_key: Option<String>,
+
+    // --- SQL Server protocol (TDS) -----------------------------------------
+    /// Also serve the SQL Server (TDS) client protocol on this TCP port (1433
+    /// is SQL Server's), beside the other listeners, on the same databases
+    /// and roles. Off unless this or `--mssql-socket` is given.
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-port", value_name = "PORT")]
+    mssql_port: Option<u16>,
+
+    /// Address the SQL Server protocol listens on (default: 127.0.0.1).
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-addr", default_value = "127.0.0.1")]
+    mssql_addr: String,
+
+    /// Also serve the SQL Server protocol on this unix socket. Its
+    /// permissions are `--socket-mode` and `--socket-group`; no TLS on it.
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-socket", value_name = "PATH")]
+    mssql_socket: Option<std::path::PathBuf>,
+
+    /// How SQL Server clients authenticate: `password` (SQL Server
+    /// authentication against the role catalogue, the default) or `trust`.
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-auth", default_value = "password")]
+    mssql_auth: String,
+
+    /// How callers on `--mssql-socket` authenticate; defaults to
+    /// `--mssql-auth`.
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-socket-auth", value_name = "METHOD")]
+    mssql_socket_auth: Option<String>,
+
+    /// SQL Server protocol TLS: disable, prefer (default) or require. A client
+    /// that asks for encryption gets the whole connection encrypted.
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-tls", default_value = "prefer")]
+    mssql_tls: String,
+
+    /// PEM certificate chain for the SQL Server listener (default:
+    /// `--pg-cert`, else a self-signed one made at start-up).
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-cert", value_name = "PATH")]
+    mssql_cert: Option<String>,
+
+    /// PEM private key for the SQL Server listener (default: `--pg-key`).
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-key", value_name = "PATH")]
+    mssql_key: Option<String>,
+
+    /// How callers on `--rdb-socket` authenticate: `scram-sha-256`, `trust`,
+    /// or `peer` — a role may log in without a password when its name is the
+    /// operating-system user connecting, which the kernel reports. Defaults to
+    /// `--rdb-auth`.
+    #[arg(long = "rdb-socket-auth", value_name = "METHOD")]
+    rdb_socket_auth: Option<String>,
 
     /// Role created for the native protocol when the role catalogue is empty.
     #[arg(long = "rdb-user", default_value = "rasterized")]
@@ -339,6 +756,12 @@ struct Args {
     #[arg(long = "replication-batch-bytes", value_name = "N")]
     replication_batch_bytes: Option<usize>,
 
+    /// Batches of this node's stream a link keeps in flight before it waits
+    /// for an answer (default: 8). `1` waits for each. More helps a long link,
+    /// where waiting for every answer caps it at one batch per round trip.
+    #[arg(long = "replication-pipeline-depth", value_name = "N")]
+    replication_pipeline_depth: Option<usize>,
+
     /// How long a sender waits for more records before sending a partial
     /// batch, in microseconds (default: 500).
     #[arg(long = "replication-linger-us", value_name = "US")]
@@ -396,6 +819,10 @@ struct Args {
     #[cfg(feature = "pg_import")]
     #[command(flatten)]
     pg_import: pg_import_args::PgImportArgs,
+
+    #[cfg(feature = "kv_cache")]
+    #[command(flatten)]
+    kv: kv_args::KvArgs,
 }
 
 /// Applies `--storage-location`, `--storage-policy` and `--storage-min-free`
@@ -420,22 +847,29 @@ fn apply_storage_flags(config: &Configuration, location: &str) -> Result<(), Str
     // A pool opened purely to rewrite its file, then dropped. The database that
     // opens a moment later reads the result — which is the only ordering that
     // gets the catalogue's own files mirrored from the first start.
-    let pool = StorageManager::open(location);
+    let pool = StorageManager::try_open(location)?;
 
     for spec in &config.storage_locations {
         let (path, role, weight) = parse_location_spec(spec)?;
-        match pool.add_location(&path, role, weight, true) {
-            Ok(added) => log::info!(
-                "storage location {} ({}, weight {})",
-                added,
-                role.as_str(),
-                weight
-            ),
-            // Already present, or overlapping one that is. Reported at info
-            // rather than refused: the flag describes intent, and the intent is
-            // already satisfied.
-            Err(e) => log::info!("storage location {}: {}", path, e),
+        // Already present (the root included): reported at info rather than
+        // refused, since the flag describes intent and the intent is satisfied.
+        if pool.role_of(&path).is_some() {
+            log::info!("storage location {} is already in the pool", path);
+            continue;
         }
+        // Anything else that keeps it out is refused, as `open` refuses a
+        // recorded location: a log there that recovery would not replay, an
+        // overlap, a path that cannot be written. Starting without a disk the
+        // operator named is only noticed when the one that is left fills.
+        let added = pool
+            .add_location(&path, role, weight, true)
+            .map_err(|e| format!("--storage-location {}: {}", path, e))?;
+        log::info!(
+            "storage location {} ({}, weight {})",
+            added,
+            role.as_str(),
+            weight
+        );
     }
 
     if let Some(policy) = &config.storage_policy {
@@ -525,7 +959,10 @@ fn replication_config(
     // used instead of silently running unauthenticated.
     config.auth = match args.replication_auth.as_deref() {
         Some(text) => AuthMode::parse(text).ok_or_else(|| {
-            format!("--replication-auth {:?}: expected insecure, pinned or ca", text)
+            format!(
+                "--replication-auth {:?}: expected insecure, pinned or ca",
+                text
+            )
         })?,
         None if args.replication_ca.is_some() => AuthMode::Ca,
         None if args.replication_cert.is_some() => AuthMode::Pinned,
@@ -554,7 +991,10 @@ fn replication_config(
     }
     if let Some(mode) = args.replication_mode.as_deref() {
         config.sync_mode = SyncMode::parse(mode).ok_or_else(|| {
-            format!("--replication-mode {:?}: expected async, sync, quorum:N or all", mode)
+            format!(
+                "--replication-mode {:?}: expected async, sync, quorum:N or all",
+                mode
+            )
         })?;
     }
     if let Some(ms) = args.replication_ack_timeout_ms {
@@ -573,6 +1013,9 @@ fn replication_config(
     }
     if let Some(n) = args.replication_batch_bytes {
         config.batch_max_bytes = n;
+    }
+    if let Some(n) = args.replication_pipeline_depth {
+        config.pipeline_depth = n;
     }
     if let Some(us) = args.replication_linger_us {
         config.batch_linger = Duration::from_micros(us);
@@ -593,12 +1036,288 @@ fn replication_config(
     Ok(config)
 }
 
+/// `--authentication-timeout`: PostgreSQL's unit for it is seconds, and zero
+/// would remove the bound rather than set one, so it is refused.
+fn parse_authentication_timeout(value: &str) -> Result<std::time::Duration, String> {
+    let timeout = rasterizeddb_core::pgwire::parse_time_setting(value, 1_000)?;
+    if timeout.is_zero() {
+        return Err("must be greater than zero".to_string());
+    }
+    Ok(timeout)
+}
+
+/// The idle timeouts: milliseconds when bare, as in PostgreSQL, and 0 to
+/// disable.
+fn parse_idle_timeout(value: &str) -> Result<std::time::Duration, String> {
+    rasterizeddb_core::pgwire::parse_time_setting(value, 1)
+}
+
+/// Fills each startup flag not given on the command line from the settings
+/// file, and records every startup key's running value and where it came from
+/// for SHOW CONFIG. A saved value that does not parse is reported and
+/// ignored: a bad file must never keep the server from starting.
+fn apply_saved_settings(args: &mut Args) {
+    use rasterizeddb_core::configuration::saved::{self, Source};
+    use std::collections::BTreeMap;
+    let location = if args.in_memory {
+        None
+    } else {
+        args.location
+            .clone()
+            .or_else(|| cfg!(debug_assertions).then(|| "/mnt/Volume4/test_db".to_string()))
+    };
+    let stored: BTreeMap<String, String> = match location.as_deref() {
+        Some(dir) => saved::load(std::path::Path::new(dir)).unwrap_or_else(|e| {
+            eprintln!("{e}; starting without the saved settings");
+            BTreeMap::new()
+        }),
+        None => BTreeMap::new(),
+    };
+    fn one<T: std::str::FromStr + ToString>(
+        key: &str,
+        flag: &mut Option<T>,
+        stored: &BTreeMap<String, String>,
+        default: &str,
+    ) {
+        let source = if flag.is_some() {
+            Source::CommandLine
+        } else if let Some(v) = stored.get(key) {
+            match v.parse::<T>() {
+                Ok(t) => {
+                    *flag = Some(t);
+                    Source::Saved
+                }
+                Err(_) => {
+                    eprintln!("{}: `{key} = {v}` is not a valid value; ignored", saved::FILE_NAME);
+                    Source::Default
+                }
+            }
+        } else {
+            Source::Default
+        };
+        let text = flag.as_ref().map(|v| v.to_string()).unwrap_or_else(|| default.to_string());
+        saved::record(key, text, source);
+    }
+    one("server.batch_size", &mut args.batch_size, &stored, "10000");
+    one("server.concurrent_threads", &mut args.concurrent_threads, &stored, "16");
+    one("server.malloc_arenas", &mut args.malloc_arenas, &stored, "0");
+    one("wal.checkpoint_bytes", &mut args.wal_checkpoint_bytes, &stored, "67108864");
+    one("wal.prealloc_kb", &mut args.wal_prealloc_kb, &stored, "1024");
+    one("cache.enabled", &mut args.enable_cache, &stored, "false");
+    one("index.residency", &mut args.index_residency, &stored, "memory");
+    one("index.cache_mb", &mut args.index_cache_mb, &stored, "0");
+    one("index.delta_mb", &mut args.index_delta_mb, &stored, "0");
+}
+
+/// `--socket-mode` and `--socket-group`, checked, for every unix socket the
+/// server serves. Exits with the reason if either is wrong, as the other flags
+/// do: a socket with permissions an operator did not ask for is worse than no
+/// start-up.
+/// The role an empty role catalogue is given: the one the main protocol
+/// would create, so whichever listener seeds first, the same role exists.
+fn bootstrap_role(args: &Args) -> (String, Option<String>) {
+    match args.protocol {
+        Protocol::Rastcp => (
+            args.rdb_user.clone(),
+            args.rdb_password
+                .clone()
+                .or_else(|| std::env::var("RASTERIZEDDB_PASSWORD").ok())
+                .filter(|p| !p.is_empty()),
+        ),
+        _ => (
+            args.pg_user.clone(),
+            args.pg_password
+                .clone()
+                .or_else(|| std::env::var("RASTERIZEDDB_PG_PASSWORD").ok())
+                .filter(|p| !p.is_empty()),
+        ),
+    }
+}
+
+fn compat_limits(args: &Args) -> rasterizeddb_core::pgwire::ConnectionLimits {
+    rasterizeddb_core::pgwire::ConnectionLimits {
+        max_connections: args.max_connections as usize,
+        handshake_timeout: args.authentication_timeout,
+        idle_in_transaction_session_timeout: args.idle_in_transaction_session_timeout,
+        idle_session_timeout: args.idle_session_timeout,
+    }
+}
+
+/// The MySQL listener's configuration, or `None` when it is not asked for.
+#[cfg(feature = "mysql_wire")]
+fn mysql_config(args: &Args) -> Result<Option<rasterizeddb_core::mysql::MyConfig>, String> {
+    use rasterizeddb_core::mysql::{MyAuth, MyConfig, MySocket, MyTls};
+    if args.mysql_port.is_none() && args.mysql_socket.is_none() {
+        if args.mysql_socket_auth.is_some() {
+            return Err("--mysql-socket-auth needs --mysql-socket".into());
+        }
+        return Ok(None);
+    }
+    let auth = MyAuth::parse(&args.mysql_auth)
+        .ok_or_else(|| format!("unknown --mysql-auth {:?}: expected password or trust", args.mysql_auth))?;
+    let tls = MyTls::parse(&args.mysql_tls)
+        .ok_or_else(|| format!("unknown --mysql-tls {:?}: expected disable, prefer or require", args.mysql_tls))?;
+    let socket = match &args.mysql_socket {
+        Some(path) => {
+            let auth = match args.mysql_socket_auth.as_deref() {
+                None => None,
+                Some(text) => Some(MyAuth::parse(text).ok_or_else(|| {
+                    format!("unknown --mysql-socket-auth {text:?}: expected password or trust")
+                })?),
+            };
+            let (mode, group) = socket_permissions(args);
+            Some(MySocket { path: path.clone(), mode, group, auth })
+        }
+        None => {
+            if args.mysql_socket_auth.is_some() {
+                return Err("--mysql-socket-auth needs --mysql-socket".into());
+            }
+            None
+        }
+    };
+    let (bootstrap_user, bootstrap_password) = bootstrap_role(args);
+    Ok(Some(MyConfig {
+        tcp: args.mysql_port.map(|port| (args.mysql_addr.clone(), port)),
+        socket,
+        auth,
+        tls,
+        cert_path: args.mysql_cert.clone().or_else(|| args.pg_cert.clone()),
+        key_path: args.mysql_key.clone().or_else(|| args.pg_key.clone()),
+        bootstrap_user,
+        bootstrap_password,
+        limits: compat_limits(args),
+    }))
+}
+
+/// The SQL Server listener's configuration, or `None` when it is not asked for.
+#[cfg(feature = "mssql_wire")]
+fn mssql_config(args: &Args) -> Result<Option<rasterizeddb_core::mssql::MsConfig>, String> {
+    use rasterizeddb_core::mssql::{MsAuth, MsConfig, MsSocket, MsTls};
+    if args.mssql_port.is_none() && args.mssql_socket.is_none() {
+        if args.mssql_socket_auth.is_some() {
+            return Err("--mssql-socket-auth needs --mssql-socket".into());
+        }
+        return Ok(None);
+    }
+    let auth = MsAuth::parse(&args.mssql_auth)
+        .ok_or_else(|| format!("unknown --mssql-auth {:?}: expected password or trust", args.mssql_auth))?;
+    let tls = MsTls::parse(&args.mssql_tls)
+        .ok_or_else(|| format!("unknown --mssql-tls {:?}: expected disable, prefer or require", args.mssql_tls))?;
+    let socket = match &args.mssql_socket {
+        Some(path) => {
+            let auth = match args.mssql_socket_auth.as_deref() {
+                None => None,
+                Some(text) => Some(MsAuth::parse(text).ok_or_else(|| {
+                    format!("unknown --mssql-socket-auth {text:?}: expected password or trust")
+                })?),
+            };
+            let (mode, group) = socket_permissions(args);
+            Some(MsSocket { path: path.clone(), mode, group, auth })
+        }
+        None => {
+            if args.mssql_socket_auth.is_some() {
+                return Err("--mssql-socket-auth needs --mssql-socket".into());
+            }
+            None
+        }
+    };
+    let (bootstrap_user, bootstrap_password) = bootstrap_role(args);
+    Ok(Some(MsConfig {
+        tcp: args.mssql_port.map(|port| (args.mssql_addr.clone(), port)),
+        socket,
+        auth,
+        tls,
+        cert_path: args.mssql_cert.clone().or_else(|| args.pg_cert.clone()),
+        key_path: args.mssql_key.clone().or_else(|| args.pg_key.clone()),
+        bootstrap_user,
+        bootstrap_password,
+        limits: compat_limits(args),
+    }))
+}
+
+fn socket_permissions(args: &Args) -> (u32, Option<u32>) {
+    let mode = match u32::from_str_radix(args.socket_mode.trim_start_matches("0o"), 8) {
+        Ok(mode) if mode <= 0o777 => mode,
+        _ => {
+            eprintln!(
+                "--socket-mode {:?} is not a file mode: expected octal such as 600 or 660",
+                args.socket_mode
+            );
+            std::process::exit(2);
+        }
+    };
+
+    let group = match args.socket_group.as_deref() {
+        None => None,
+        #[cfg(unix)]
+        Some(name) => match rastcp::net::group_id(name) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                eprintln!("--socket-group: {e}");
+                std::process::exit(2);
+            }
+        },
+        #[cfg(not(unix))]
+        Some(_) => {
+            eprintln!("--socket-group: unix sockets are not supported on this platform");
+            std::process::exit(2);
+        }
+    };
+
+    (mode, group)
+}
+
 fn main() -> std::io::Result<()> {
+    // First, before anything compiled for x86-64-v3 has a chance to run: on a
+    // CPU without AVX2 the alternative is a SIGILL with no explanation.
+    rasterizeddb_core::simds::cpu::ensure_baseline_or_exit();
+
     // 32 MiB
     const STACK_SIZE: usize = 32 * 1024 * 1024;
 
+    // `test_tokens` lets any caller mint a write ticket, which only tests and
+    // benches may (docs/persistent-indexes.md §2), and `index_store_failpoints`
+    // puts named failpoints and the crash-image recorder on the I/O paths
+    // (§11), which only the compat suites may arm. Feature unification can
+    // still build this binary with either (`cargo bench --features
+    // test_tokens`, `cargo test --workspace`, whose compat dev-dependency
+    // enables the failpoints), so it refuses here rather than at compile
+    // time, which would break those builds.
+    if let Some(feature) = rasterizeddb_core::TEST_ONLY_FEATURES.first() {
+        eprintln!(
+            "this server was built with the test-only `{feature}` feature and will not start; rebuild without it"
+        );
+        std::process::exit(2);
+    }
+
     // Parse command line arguments with clap
-    let args = Args::parse();
+    let mut args = Args::parse();
+    // The descriptors the partitions' open budget is derived from: a stock
+    // systemd unit's soft limit of 1,024 would leave a budget of 16 open
+    // partitions; raised toward the hard limit, as far as the largest
+    // budget needs (docs/partitioning.md, "Phase 3 P5b-2a as built").
+    let (nofile_before, nofile_now, open_budget) = rasterizeddb_core::core::partition::budget::raise_descriptor_limit();
+    // Startup settings `SET CONFIG` saved, under the flags: a flag given here
+    // wins (configuration::saved).
+    apply_saved_settings(&mut args);
+    // Before the runtime starts a thread: an arena made is not undone.
+    if let Some(n) = args.malloc_arenas {
+        if !rasterizeddb_core::set_malloc_arenas(n) {
+            eprintln!("--malloc-arenas {n}: this platform's allocator refused it; using its default");
+        }
+    }
+
+    // Before any kernel resolves its path: the filter index's probe caches the
+    // first one it sees.
+    let simd_level =
+        match rasterizeddb_core::simds::cpu::init(args.simd.unwrap_or(SimdRequest::Auto)) {
+            Ok(level) => level,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        };
+    rasterizeddb_core::core::processor::prefilter::set_enabled(args.scan_prefilter.unwrap_or(true));
 
     // Before the database opens, so every buffer a statement allocates is
     // governed by it. Off by default: see `tune_allocator` for the measurements
@@ -624,7 +1343,10 @@ fn main() -> std::io::Result<()> {
                 println!("wrote {}", cert_path.display());
                 println!("wrote {} (mode 0600)", key_path.display());
                 println!();
-                println!("fingerprint: {}", rastcp::tls::format_fingerprint(&fingerprint));
+                println!(
+                    "fingerprint: {}",
+                    rastcp::tls::format_fingerprint(&fingerprint)
+                );
                 println!();
                 println!("Start this node with:");
                 println!(
@@ -640,7 +1362,10 @@ fn main() -> std::io::Result<()> {
                 return Ok(());
             }
             Err(e) => {
-                eprintln!("could not generate a replication identity in {}: {}", dir, e);
+                eprintln!(
+                    "could not generate a replication identity in {}: {}",
+                    dir, e
+                );
                 std::process::exit(2);
             }
         }
@@ -662,9 +1387,14 @@ fn main() -> std::io::Result<()> {
         storage_min_free: args.storage_min_free.clone(),
         #[cfg(not(feature = "storage_pools"))]
         storage_min_free: None,
+        settle_status_at_open: args.settle_status_at_open,
     };
+    // Before any database opens: the status log reads it at open.
+    config.apply_runtime_switches();
 
-    MAX_PERMITS_THREADS.set(config.concurrent_threads.unwrap_or(16)).unwrap();
+    MAX_PERMITS_THREADS
+        .set(config.concurrent_threads.unwrap_or(16))
+        .unwrap();
     BATCH_SIZE.set(config.batch_size.unwrap_or(10_000)).unwrap();
 
     // Durability. These seed the same runtime state `SET synchronous_commit` and
@@ -683,6 +1413,83 @@ fn main() -> std::io::Result<()> {
     }
     if let Some(ms) = args.wal_writer_delay_ms {
         rasterizeddb_core::set_wal_writer_delay_ms(ms);
+    }
+    // Before any database opens: the log's checkpoint trigger reads it.
+    if let Some(bytes) = args.wal_checkpoint_bytes {
+        if bytes == 0 {
+            return Err(std::io::Error::other("--wal-checkpoint-bytes must be above 0"));
+        }
+        let _ = rasterizeddb_core::WAL_CHECKPOINT_BYTES.set(bytes);
+    }
+    // Before any database opens too: the first record of each log reads it.
+    if let Some(kb) = args.wal_prealloc_kb {
+        let _ = rasterizeddb_core::WAL_PREALLOC_BYTES.set(kb.saturating_mul(1024));
+    }
+    #[cfg(feature = "query_stats")]
+    if let Some(spec) = args.query_stats.as_deref() {
+        match rasterizeddb_core::core::introspect::parse_bool(spec) {
+            Ok(on) => rasterizeddb_core::core::query_stats::set_enabled(on),
+            Err(e) => return Err(std::io::Error::other(format!("--query-stats: {}", e))),
+        }
+    }
+    // The same runtime state `SET CONFIG auto_compact.*` writes; before any
+    // catalogue opens, so its task's first pass sees them.
+    if let Some(spec) = args.auto_compact.as_deref() {
+        match rasterizeddb_core::core::introspect::parse_bool(spec) {
+            Ok(on) => rasterizeddb_core::set_auto_compact_enabled(on),
+            Err(e) => return Err(std::io::Error::other(format!("--auto-compact: {}", e))),
+        }
+    }
+    if let Some(secs) = args.auto_compact_interval_secs {
+        rasterizeddb_core::set_auto_compact_interval_secs(secs);
+    }
+    if let Some(n) = args.auto_compact_min_slots {
+        rasterizeddb_core::set_auto_compact_min_slots(n);
+    }
+    if let Some(n) = args.auto_compact_ratio {
+        rasterizeddb_core::set_auto_compact_ratio(n);
+    }
+    if let Some(f) = args.auto_compact_dead_fraction {
+        rasterizeddb_core::set_auto_compact_dead_fraction(f)
+            .map_err(|e| std::io::Error::other(format!("--auto-compact-dead-fraction: {e}")))?;
+    }
+    if let Some(n) = args.auto_compact_dead_fraction_max_slots {
+        rasterizeddb_core::set_auto_compact_dead_fraction_max_slots(n);
+    }
+    if let Some(secs) = args.auto_compact_cooldown_secs {
+        rasterizeddb_core::set_auto_compact_cooldown_secs(secs);
+    }
+    {
+        use rasterizeddb_core::core::index::paged;
+        if let Some(spec) = args.index_residency.as_deref() {
+            match paged::Residency::parse(spec) {
+                Some(r) => paged::set_residency(r),
+                None => {
+                    return Err(std::io::Error::other(format!(
+                        "--index-residency {:?}: expected memory, hybrid or disk",
+                        spec
+                    )));
+                }
+            }
+        }
+        if let Some(mb) = args.index_cache_mb {
+            paged::set_cache_mb(mb);
+        }
+        if let Some(mb) = args.index_delta_mb {
+            paged::set_delta_mb(mb);
+        }
+    }
+    if let Some(spec) = args.index_storage.as_deref() {
+        use rasterizeddb_core::core::index_store::load::settings::{IndexStorage, set_index_storage};
+        match IndexStorage::parse(spec) {
+            Some(s) => set_index_storage(s),
+            None => {
+                return Err(std::io::Error::other(format!(
+                    "--index-storage {:?}: expected rebuild or snapshot",
+                    spec
+                )));
+            }
+        }
     }
 
     // Filter tuning. These seed the same runtime state `SET FILTER ...` writes,
@@ -749,7 +1556,11 @@ fn main() -> std::io::Result<()> {
     query_cache::ENABLE_CACHE.get_or_init(|| enable_cache);
 
     let rt = Builder::new_multi_thread()
-        .worker_threads(config.concurrent_threads.unwrap_or(rasterizeddb_core::max_permits_threads()))
+        .worker_threads(
+            config
+                .concurrent_threads
+                .unwrap_or(rasterizeddb_core::max_permits_threads()),
+        )
         .thread_stack_size(STACK_SIZE)
         .enable_all()
         .build()?;
@@ -763,6 +1574,31 @@ fn main() -> std::io::Result<()> {
             .filter_level(level)
             .init();
 
+        // Freed heap goes back to the kernel once the server has been quiet
+        // for a few seconds (`idle_trim`); `RDB_IDLE_TRIM=0` turns it off.
+        rasterizeddb_core::idle_trim::spawn();
+
+        {
+            let cpu = rasterizeddb_core::simds::cpu::features();
+            // Printed, not logged: the default level is `error`, and which
+            // path the kernels run is the first thing to know when a number
+            // measured on one machine does not reproduce on another.
+            println!(
+                "SIMD: {} on {} [{}]{}; scan prefilter {}",
+                simd_level,
+                rasterizeddb_core::simds::cpu::describe_cpu(cpu),
+                cpu.flag_list(),
+                if cpu.fast_pext() { ", fast PEXT" } else { "" },
+                if rasterizeddb_core::core::processor::prefilter::enabled() { "on" } else { "off" },
+            );
+            // Printed for the same reason: a unit without LimitNOFILE leaves
+            // a small partition budget, which shows as closes and reopens.
+            println!(
+                "descriptors: soft limit {nofile_now}{}; partition open budget {open_budget}",
+                if nofile_now != nofile_before { format!(" (raised from {nofile_before})") } else { String::new() },
+            );
+        }
+
         #[cfg(debug_assertions)]
         let db_location = if args.in_memory {
             ""
@@ -770,15 +1606,27 @@ fn main() -> std::io::Result<()> {
             config.location.as_deref().unwrap_or("/mnt/Volume4/test_db")
         };
 
+        // `--restore-to` writes somewhere else and exits: it opens nothing at
+        // the location, so it does not need one.
+        #[cfg(feature = "s3_backup")]
+        let standalone_restore = args.backup.restore_to.is_some();
+        #[cfg(not(feature = "s3_backup"))]
+        let standalone_restore = false;
         #[cfg(not(debug_assertions))]
         let db_location = if args.in_memory {
             ""
         } else {
-            config
-                .location
-                .as_deref()
-                .expect("Database location must be provided with --location <path> unless --in-memory is set")
+            match config.location.as_deref() {
+                Some(location) => location,
+                None if standalone_restore => "",
+                None => {
+                    eprintln!("error: --location <PATH> is required unless --in-memory or --restore-to is given");
+                    std::process::exit(2);
+                }
+            }
         };
+        #[cfg(debug_assertions)]
+        let _ = standalone_restore;
 
         // Before anything opens a table: a restore rewrites the files the
         // engine is about to memory-map, and the WAL recovery that
@@ -852,6 +1700,16 @@ fn main() -> std::io::Result<()> {
             .get(&args.pg_default_db)
             .expect("the catalogue always holds its default database");
 
+        // Replication's files are settled at every start that finds them,
+        // switched on or not: see `Database::open_replication_storage`. Before
+        // the configuration below, which does not change what they hold.
+        if arc_database.has_replication_files() {
+            if let Err(e) = arc_database.open_replication_storage() {
+                eprintln!("replication storage could not be opened: {e}");
+                std::process::exit(2);
+            }
+        }
+
         // Started before the SQL listener, so a node is ready to take its
         // peers' transactions by the time it is ready to take a client's.
         // Configuration is applied either way: a node started without
@@ -885,13 +1743,25 @@ fn main() -> std::io::Result<()> {
         if args.backup.enabled() {
             match args.backup.to_config() {
                 Ok(config) => {
-                    match rasterizeddb_core::core::backup::install(config, db_location).await {
+                    let installed = if args.backup.start_offline {
+                        rasterizeddb_core::core::backup::install_waiting(config, db_location).await
+                    } else {
+                        rasterizeddb_core::core::backup::install(config, db_location).await
+                    };
+                    match installed {
                         Ok(service) => {
                             log::info!(
-                                "Backing up to s3://{}/{} as instance {}",
+                                "Backing up to s3://{}/{} as instance {}{}",
                                 service.config().bucket,
                                 service.config().normalized_prefix(),
-                                service.instance_id()
+                                service.instance_id(),
+                                if service.catalogue_state()
+                                    == rasterizeddb_core::core::backup::CatalogueState::Loaded
+                                {
+                                    ""
+                                } else {
+                                    " (bucket unreachable: holding the log locally until it answers)"
+                                }
                             );
                             // Flush what is still staged before the process
                             // leaves, so a clean stop costs no recovery window.
@@ -915,7 +1785,10 @@ fn main() -> std::io::Result<()> {
                         }
                         // Refusing to start: an operator who asked for backups
                         // and silently got none is worse off than one who is
-                        // told why at boot.
+                        // told why at boot. With --s3-start-offline only a
+                        // bucket that answers wrongly (another instance's
+                        // catalogue) gets here; one that does not answer is
+                        // waited for instead.
                         Err(e) => {
                             eprintln!("could not start backups: {e}");
                             std::process::exit(2);
@@ -929,8 +1802,55 @@ fn main() -> std::io::Result<()> {
             }
         }
 
-        match args.protocol {
-            Protocol::Rastcp => {
+        // The Redis protocol, beside whichever SQL protocol runs below. Bound
+        // here so a port that cannot be had stops the start-up with the
+        // reason, rather than failing quietly in a task.
+        #[cfg(feature = "kv_cache")]
+        {
+            if let Err(e) = args.kv.apply() {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+            let (socket_mode, socket_group) = socket_permissions(&args);
+            match args.kv.listener(&args.pg_user, socket_mode, socket_group) {
+                Ok(Some(config)) => {
+                    match rasterizeddb_core::core::kv_cache::resp::bind(&config).await {
+                        Ok(listener) => {
+                            let database = arc_database.clone();
+                            let handle = arc_database.kv_cache.clone();
+                            // Moved into the task: the socket file is removed
+                            // when the listener is dropped.
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    rasterizeddb_core::core::kv_cache::resp::serve(listener, database, handle, config)
+                                        .await
+                                {
+                                    log::error!("kv cache: the Redis listener stopped: {e}");
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("could not start the Redis protocol listener: {e}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+
+        let serves_native = matches!(args.protocol, Protocol::Rastcp | Protocol::Both);
+        let serves_pgwire = matches!(args.protocol, Protocol::Pgwire | Protocol::Both);
+
+        // Each side's flags are read and checked before either listener
+        // starts, so a bad flag for one protocol never leaves the other
+        // serving in a process that is about to exit.
+        let native = if serves_native {
+            Some({
                 let Some(method) = rasterizeddb_core::auth::AuthMethod::parse(&args.rdb_auth)
                 else {
                     eprintln!(
@@ -964,15 +1884,75 @@ fn main() -> std::io::Result<()> {
                 if let Some(port) = args.rdb_port {
                     listen.port = port;
                 }
-
-                if let Err(e) =
-                    Database::start_db_with_auth_on(arc_database, auth, listen).await
-                {
-                    eprintln!("{e}");
+                if let Some(seconds) = args.rdb_request_timeout {
+                    if seconds == 0 {
+                        eprintln!("--rdb-request-timeout 0: a request has to be given some time; use a number of seconds");
+                        std::process::exit(2);
+                    }
+                    listen.request_timeout = Some(std::time::Duration::from_secs(seconds));
+                }
+                if let (Some(cert), Some(key)) = (&args.rdb_cert, &args.rdb_key) {
+                    // Read now, so a wrong path stops the start-up with its
+                    // own message rather than as a failed bind.
+                    if let Err(e) = rastcp::tls::load_certificates(cert)
+                        .and_then(|_| rastcp::tls::load_private_key(key))
+                    {
+                        eprintln!("--rdb-cert/--rdb-key: {e}");
+                        std::process::exit(2);
+                    }
+                    listen.certificate = Some((cert.clone(), key.clone()));
+                }
+                listen.tcp = match args.rdb_tcp.trim().to_ascii_lowercase().as_str() {
+                    "on" | "true" | "yes" => true,
+                    "off" | "false" | "no" => false,
+                    other => {
+                        eprintln!("--rdb-tcp {other:?}: expected on or off");
+                        std::process::exit(2);
+                    }
+                };
+                if !listen.tcp && args.rdb_socket.is_none() {
+                    eprintln!("--rdb-tcp off needs --rdb-socket: there would be nothing to connect to");
                     std::process::exit(2);
                 }
-            }
-            Protocol::Pgwire => {
+                if let Some(path) = args.rdb_socket.clone() {
+                    let mut socket = rasterizeddb_core::core::database::NativeSocket::new(path);
+                    let (mode, group) = socket_permissions(&args);
+                    socket.mode = mode;
+                    socket.group = group;
+
+                    if let Some(text) = args.rdb_socket_auth.as_deref() {
+                        let Some(method) = rasterizeddb_core::auth::AuthMethod::parse(text) else {
+                            eprintln!(
+                                "unknown --rdb-socket-auth {:?}: expected peer, scram-sha-256 or trust",
+                                text
+                            );
+                            std::process::exit(2);
+                        };
+                        if let Err(e) =
+                            rasterizeddb_core::native_auth::NativeAuthConfig::validate_socket_method(
+                                method,
+                            )
+                        {
+                            eprintln!("{e}");
+                            std::process::exit(2);
+                        }
+                        socket.method = Some(method);
+                    }
+
+                    listen.socket = Some(socket);
+                } else if args.rdb_socket_auth.is_some() {
+                    eprintln!("--rdb-socket-auth needs --rdb-socket");
+                    std::process::exit(2);
+                }
+
+                (auth, listen)
+            })
+        } else {
+            None
+        };
+
+        let pgwire = if serves_pgwire {
+            Some({
                 // Run a PostgreSQL-wire-compatible server.
                 let tls_mode = match args.pg_tls {
                     PgTlsMode::Disable => rasterizeddb_core::pgwire::TlsMode::Disable,
@@ -996,6 +1976,58 @@ fn main() -> std::io::Result<()> {
                     );
                     std::process::exit(2);
                 };
+                if method == rasterizeddb_core::auth::AuthMethod::Peer {
+                    eprintln!(
+                        "--pg-auth peer is not offered: over TCP the user would be the caller's \
+                         word. Peer authentication is for the unix socket: --pg-socket-auth peer"
+                    );
+                    std::process::exit(2);
+                }
+
+                let pg_tcp = match args.pg_tcp.trim().to_ascii_lowercase().as_str() {
+                    "on" | "true" | "yes" => true,
+                    "off" | "false" | "no" => false,
+                    other => {
+                        eprintln!("--pg-tcp {other:?}: expected on or off");
+                        std::process::exit(2);
+                    }
+                };
+                if !pg_tcp && args.pg_socket_dir.is_none() {
+                    eprintln!("--pg-tcp off needs --pg-socket-dir: there would be nothing to connect to");
+                    std::process::exit(2);
+                }
+                if args.pg_socket_auth.is_some() && args.pg_socket_dir.is_none() {
+                    eprintln!("--pg-socket-auth needs --pg-socket-dir");
+                    std::process::exit(2);
+                }
+
+                let pg_socket = match args.pg_socket_dir.clone() {
+                    Some(dir) => {
+                        let socket_method = match args.pg_socket_auth.as_deref() {
+                            None => None,
+                            Some(text) => match rasterizeddb_core::auth::AuthMethod::parse(text) {
+                                Some(method) => Some(method),
+                                None => {
+                                    eprintln!(
+                                        "unknown --pg-socket-auth {:?}: expected peer, trust, \
+                                         password, md5 or scram-sha-256",
+                                        text
+                                    );
+                                    std::process::exit(2);
+                                }
+                            },
+                        };
+                        let (mode, group) = socket_permissions(&args);
+                        Some(rasterizeddb_core::pgwire::PgSocket {
+                            dir,
+                            port: args.pg_port,
+                            mode,
+                            group,
+                            method: socket_method,
+                        })
+                    }
+                    None => None,
+                };
 
                 let auth = rasterizeddb_core::pgwire::AuthConfig {
                     method,
@@ -1013,11 +2045,12 @@ fn main() -> std::io::Result<()> {
                 // — and every row after it — on the wire in the clear. Said
                 // loudly rather than refused: an operator may terminate TLS in
                 // front of the process.
-                let public = args
-                    .pg_addr
-                    .parse::<std::net::IpAddr>()
-                    .map(|ip| !ip.is_loopback())
-                    .unwrap_or(true);
+                let public = pg_tcp
+                    && args
+                        .pg_addr
+                        .parse::<std::net::IpAddr>()
+                        .map(|ip| !ip.is_loopback())
+                        .unwrap_or(true);
                 if public && tls_mode != rasterizeddb_core::pgwire::TlsMode::Require {
                     log::warn!(
                         "pgwire is bound to {} with --pg-tls {:?}: clients may connect \
@@ -1028,16 +2061,135 @@ fn main() -> std::io::Result<()> {
                     );
                 }
 
-                _ = rasterizeddb_core::pgwire::start_pgwire_with_catalog(
-                    catalog,
-                    &args.pg_addr,
-                    args.pg_port,
-                    tls,
-                    auth,
-                )
-                .await;
+                let limits = rasterizeddb_core::pgwire::ConnectionLimits {
+                    max_connections: args.max_connections as usize,
+                    handshake_timeout: args.authentication_timeout,
+                    idle_in_transaction_session_timeout: args.idle_in_transaction_session_timeout,
+                    idle_session_timeout: args.idle_session_timeout,
+                };
+
+                let listen = rasterizeddb_core::pgwire::PgListen {
+                    tcp: pg_tcp.then(|| (args.pg_addr.clone(), args.pg_port)),
+                    socket: pg_socket,
+                };
+                (listen, tls, auth, limits)
+            })
+        } else {
+            None
+        };
+
+        // Both listeners would otherwise seed an empty role catalogue at
+        // once, each checking for roles and each creating its own bootstrap
+        // role. The PostgreSQL side goes first, so `--pg-user` with its
+        // password is the role a fresh catalogue gets; the native side then
+        // finds roles and adds none.
+        if let (Some(_), Some((_, _, auth, _))) = (&native, &pgwire) {
+            if let Err(e) =
+                rasterizeddb_core::pgwire::seed_catalogue_roles(&catalog, auth).await
+            {
+                eprintln!("could not prepare the role catalogue: {e}");
+                rasterizeddb_core::shutdown::finalize();
+                std::process::exit(2);
             }
         }
+
+        // A listener returns an error only when it could not start — the port
+        // taken, the certificate unreadable — since a failed accept is retried
+        // rather than returned. That used to be discarded, and the process
+        // exited 0 having served nothing, which a supervisor reads as a clean
+        // stop. With both listeners, the first such error stops the process
+        // whatever the other is doing: half a server is not what was asked
+        // for. Otherwise each returns once a termination signal has drained
+        // it, and both are waited for.
+        // The MySQL protocol, beside the others: bound and started before
+        // them, so a port that cannot be had stops the start-up with the
+        // reason. Drained before the databases are sealed.
+        #[cfg(feature = "mysql_wire")]
+        let mysql_server = match mysql_config(&args) {
+            Ok(None) => None,
+            Ok(Some(config)) => {
+                let started = match rasterizeddb_core::mysql::bind(config).await {
+                    Ok(listener) => rasterizeddb_core::mysql::serve(listener, catalog.clone()).await,
+                    Err(e) => Err(e),
+                };
+                match started {
+                    Ok(server) => Some(server),
+                    Err(e) => {
+                        eprintln!("could not start the MySQL protocol listener: {e}");
+                        rasterizeddb_core::shutdown::finalize();
+                        std::process::exit(2);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        };
+
+        // The SQL Server protocol, the same way.
+        #[cfg(feature = "mssql_wire")]
+        let mssql_server = match mssql_config(&args) {
+            Ok(None) => None,
+            Ok(Some(config)) => {
+                let started = match rasterizeddb_core::mssql::bind(config).await {
+                    Ok(listener) => rasterizeddb_core::mssql::serve(listener, catalog.clone()).await,
+                    Err(e) => Err(e),
+                };
+                match started {
+                    Ok(server) => Some(server),
+                    Err(e) => {
+                        eprintln!("could not start the SQL Server protocol listener: {e}");
+                        rasterizeddb_core::shutdown::finalize();
+                        std::process::exit(2);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        };
+
+        let sealing = catalog.clone();
+        let native_catalog = catalog.clone();
+        let native_side = async move {
+            match native {
+                Some((auth, listen)) => {
+                    Database::start_db_with_auth_in(native_catalog, auth, listen)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                None => Ok(()),
+            }
+        };
+        let pgwire_side = async move {
+            match pgwire {
+                Some((listen, tls, auth, limits)) => {
+                    rasterizeddb_core::pgwire::start_pgwire_on(catalog, listen, tls, auth, limits)
+                        .await
+                        .map_err(|e| format!("pgwire server failed: {e}"))
+                }
+                None => Ok(()),
+            }
+        };
+        if let Err(e) = futures::future::try_join(native_side, pgwire_side).await {
+            log::error!("{}", e);
+            eprintln!("{e}");
+            rasterizeddb_core::shutdown::finalize();
+            std::process::exit(2);
+        }
+        #[cfg(feature = "mysql_wire")]
+        if let Some(server) = mysql_server {
+            server.drain(std::time::Duration::from_secs(10)).await;
+        }
+        #[cfg(feature = "mssql_wire")]
+        if let Some(server) = mssql_server {
+            server.drain(std::time::Duration::from_secs(10)).await;
+        }
+        // Every listener has drained and ended its sessions: the shutdown
+        // clean point (docs/persistent-indexes.md §3).
+        rasterizeddb_core::shutdown::seal_all(&sealing).await;
 
         // Both servers return once they have drained, so this is the last thing
         // the process does: flush what the WAL still holds so the next start-up
@@ -1046,4 +2198,65 @@ fn main() -> std::io::Result<()> {
     });
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "storage_pools"))]
+mod storage_flag_tests {
+    use super::*;
+
+    fn config(locations: &[&str]) -> Configuration {
+        Configuration {
+            location: None,
+            batch_size: None,
+            concurrent_threads: None,
+            storage_locations: locations.iter().map(|s| s.to_string()).collect(),
+            storage_policy: None,
+            storage_min_free: None,
+            settle_status_at_open: None,
+        }
+    }
+
+    /// A flag naming a location that is already there is the service unit's
+    /// every-start case and passes; one that cannot be added stops startup
+    /// instead of starting without it.
+    #[cfg(unix)]
+    #[test]
+    fn a_location_flag_refuses_unless_already_present() {
+        use rasterizeddb_core::core::storage::StorageManager;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::Builder::new().prefix("rastdb_flags_").tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let disk = tmp.path().join("disk");
+        let bad = tmp.path().join("bad");
+        std::fs::create_dir_all(&root).unwrap();
+        let (root_s, disk_s, bad_s) = (
+            root.to_string_lossy().into_owned(),
+            disk.to_string_lossy().into_owned(),
+            bad.to_string_lossy().into_owned(),
+        );
+
+        apply_storage_flags(&config(&[&disk_s]), &root_s).expect("a new location");
+        apply_storage_flags(&config(&[&disk_s, &root_s]), &root_s).expect("already present");
+        assert!(apply_storage_flags(&config(&["relative/dir"]), &root_s).is_err());
+
+        // A directory whose log recovery cannot read: refused, not recorded,
+        // and the log left as it was.
+        std::fs::create_dir_all(&bad).unwrap();
+        let log = bad.join(rasterizeddb_core::core::wal::DEFAULT_WAL_NAME);
+        std::fs::write(&log, b"unreadable").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let refused = apply_storage_flags(&config(&[&bad_s]), &root_s);
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let message = refused.expect_err("a location whose log recovery refused was accepted");
+        assert!(message.contains(&bad_s), "{message}");
+        assert_eq!(std::fs::read(&log).unwrap(), b"unreadable");
+        let paths = StorageManager::open(&root_s).all_paths();
+        assert!(!paths.contains(&bad_s), "the refused location was recorded: {paths:?}");
+        assert!(paths.contains(&disk_s), "{paths:?}");
+
+        for dir in [&root_s, &disk_s] {
+            let _ = rasterizeddb_core::core::wal::remove_for(dir);
+        }
+    }
 }

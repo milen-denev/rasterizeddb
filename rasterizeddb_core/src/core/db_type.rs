@@ -19,6 +19,19 @@ pub enum DbType {
     CHAR,
     STRING,
     DATETIME,
+    /// `timestamp` (without time zone), for *reporting* and literal reading
+    /// only, as [`DbType::JSON`] is: nothing stores it. A `timestamp` column
+    /// is a `DATETIME` whose field carries `without_time_zone`
+    /// (`SchemaField::without_time_zone`); its eight bytes are the same
+    /// microseconds, read as a wall-clock time rather than an instant.
+    ///
+    /// Two things differ, and both come from this one type so they cannot
+    /// disagree: a literal's zone (`'… 10:00+02'`) is discarded, as
+    /// PostgreSQL's `timestamp_in` discards it, rather than converted to UTC;
+    /// and the column is described as `timestamp` (OID 1114) and shown with
+    /// no `+00`. The session time zone is always UTC here, so the binary form
+    /// is the same microseconds as `timestamptz`'s.
+    TIMESTAMP,
     /// RFC 4122 UUID, stored as its 16 octets in network order. Equality is
     /// byte equality and `memcmp` reproduces canonical-text ordering, so it
     /// needs no comparator of its own.
@@ -62,6 +75,87 @@ pub enum DbType {
     /// storage: a column declared `JSONB` holds its document rather than a
     /// reference to a table the document was taken apart into.
     JSONB,
+    /// `json`: a document kept as the text it was written as — whitespace,
+    /// key order and duplicate keys included — for *reporting* only, as
+    /// [`DbType::TIMESTAMP`] is. A `json` column is a `STRING` whose field
+    /// carries `json_text` (`SchemaField::json_text`), in the record's spare
+    /// type byte; its bytes are the validated text. What differs from text is
+    /// what it is described as (OID 114), what its operators return, and that
+    /// a write is checked to be one JSON document.
+    JSONTEXT,
+    /// A span of time, stored as PostgreSQL's binary layout: `i64` microseconds,
+    /// `i32` days, `i32` months, big-endian. The three are kept apart because a
+    /// month is not a fixed number of days; see [`crate::core::pg_types`].
+    INTERVAL,
+    /// A six-octet MAC address.
+    MACADDR,
+    /// An eight-octet (EUI-64) MAC address. Distinct from [`DbType::MACADDR`]
+    /// rather than a width flag on it, because a column advertises one type OID
+    /// and the two have different ones.
+    MACADDR8,
+    /// A fixed-width bit string, `BIT(n)`.
+    BIT,
+    /// A varying bit string, `BIT VARYING(n)`.
+    VARBIT,
+    /// A calendar date, `i32` days from 2000-01-01, big-endian.
+    ///
+    /// Split out of [`DbType::DATETIME`] rather than folded into it: a `DATE`
+    /// column that advertised `timestamptz` was decoded by a client into a
+    /// timestamp type, and a driver asking for a `NaiveDate` refused the column
+    /// outright.
+    DATE,
+    /// A time of day, `i64` microseconds since midnight, big-endian.
+    TIME,
+    /// A time of day with a UTC offset: microseconds then an `i32` offset in
+    /// seconds west of Greenwich, both big-endian.
+    TIMETZ,
+    /// Geometric point, two `f64`.
+    POINT,
+    /// Geometric line, the coefficients of `Ax + By + C = 0`.
+    LINE,
+    /// Geometric line segment, two endpoints.
+    LSEG,
+    /// Geometric box, two corners normalised so the first is the upper right.
+    BOX,
+    /// Geometric path, open or closed, of any number of points.
+    PATH,
+    /// Geometric polygon.
+    POLYGON,
+    /// Geometric circle: centre and radius.
+    CIRCLE,
+    /// `int4range`.
+    INT4RANGE,
+    /// `int8range`.
+    INT8RANGE,
+    /// `numrange`.
+    NUMRANGE,
+    /// `tsrange`.
+    TSRANGE,
+    /// `tstzrange`.
+    TSTZRANGE,
+    /// `daterange`.
+    DATERANGE,
+    /// A `character(n)` value, for *reporting* only, as [`DbType::JSON`] is:
+    /// nothing stores it. A `character(n)` column is a `STRING` held to its
+    /// length and stored without its trailing spaces
+    /// (`type_modifier::TextTypmod`); the wire layer substitutes this when
+    /// describing one (`bpchar`, OID 1042, `atttypmod` n + 4), and formats
+    /// the cell blank-padded to `n`, so the description and the value come
+    /// from the one place. `0` is a `bpchar` with no length, shown as stored.
+    ///
+    /// Sixteen bits, so the type stays four bytes and a row's `Column` its
+    /// 32 (`row::Column`); a length past 65535, which PostgreSQL allows up to
+    /// 10485760, is reported as `bpchar` with none ([`DbType::bpchar`]) and
+    /// shown as stored, unpadded.
+    BPCHAR(u16),
+    /// Reporting only, as [`DbType::BPCHAR`] is: an array column of a declared
+    /// element type (`type_modifier::TextTypmod::Element`), the element's
+    /// [`DbType::to_byte`] code. The wire layer substitutes it when
+    /// describing one (`integer[]`, OID 1007), formats the cell's text as an
+    /// array's, and its binary form with each element in its type's binary
+    /// form, so the description and the value come from the one place.
+    /// Stored, it is an [`DbType::ARRAY`].
+    ARRAYOF(u8),
     /// Sentinel / UNKNOWN type. Used for forward-compat and internal meta records.
     UNKNOWN,
     NULL,
@@ -87,7 +181,30 @@ impl DbType {
     #[inline]
     pub fn physical(&self) -> DbType {
         match self {
-            DbType::BYTEA | DbType::ARRAY | DbType::JSONB => DbType::STRING,
+            // Variable-width and carried by the same pointer-and-length
+            // mechanism as a string. A bit string, a path, a polygon and every
+            // range vary in length for the same reason an array does, so they
+            // reach storage the same way and only the declared type tells them
+            // apart on the wire.
+            DbType::BYTEA
+            | DbType::ARRAY
+            | DbType::JSONB
+            | DbType::BIT
+            | DbType::VARBIT
+            | DbType::PATH
+            | DbType::POLYGON
+            | DbType::INT4RANGE
+            | DbType::INT8RANGE
+            | DbType::NUMRANGE
+            | DbType::TSRANGE
+            | DbType::TSTZRANGE
+            | DbType::DATERANGE
+            | DbType::ARRAYOF(_)
+            | DbType::BPCHAR(_) => DbType::STRING,
+            // The same eight bytes as a `timestamptz`.
+            DbType::TIMESTAMP => DbType::DATETIME,
+            // The text it was written as.
+            DbType::JSONTEXT => DbType::STRING,
             other => other.clone(),
         }
     }
@@ -95,7 +212,25 @@ impl DbType {
     /// Whether values of this type vary in length.
     #[inline]
     pub fn is_variable_width(&self) -> bool {
-        matches!(self, DbType::STRING | DbType::BYTEA | DbType::ARRAY | DbType::JSONB)
+        matches!(
+            self,
+            DbType::STRING
+                | DbType::JSONTEXT
+                | DbType::BPCHAR(_)
+                | DbType::BYTEA
+                | DbType::ARRAY
+                | DbType::JSONB
+                | DbType::BIT
+                | DbType::VARBIT
+                | DbType::PATH
+                | DbType::POLYGON
+                | DbType::INT4RANGE
+                | DbType::INT8RANGE
+                | DbType::NUMRANGE
+                | DbType::TSRANGE
+                | DbType::TSTZRANGE
+                | DbType::DATERANGE
+        )
     }
 
     #[inline(always)]
@@ -116,6 +251,13 @@ impl DbType {
             DbType::CHAR => 13,
             DbType::STRING => 14,
             DbType::DATETIME => 15,
+            // Never written to disk: a `timestamp` field is written as
+            // `DATETIME` with its flag in the record's spare type byte
+            // (`SchemaField::into_vec`).
+            DbType::TIMESTAMP => 46,
+            // Never written to disk either: a `json` field is written as
+            // `STRING` with its flag in the spare type byte.
+            DbType::JSONTEXT => 47,
             DbType::BOOL => 16,
             DbType::UUID => 17,
             DbType::INET => 18,
@@ -123,6 +265,27 @@ impl DbType {
             DbType::BYTEA => 20,
             DbType::ARRAY => 21,
             DbType::JSONB => 22,
+            DbType::INTERVAL => 24,
+            DbType::MACADDR => 25,
+            DbType::MACADDR8 => 26,
+            DbType::BIT => 27,
+            DbType::VARBIT => 28,
+            DbType::DATE => 29,
+            DbType::TIME => 30,
+            DbType::TIMETZ => 31,
+            DbType::POINT => 32,
+            DbType::LINE => 33,
+            DbType::LSEG => 34,
+            DbType::BOX => 35,
+            DbType::PATH => 36,
+            DbType::POLYGON => 37,
+            DbType::CIRCLE => 38,
+            DbType::INT4RANGE => 39,
+            DbType::INT8RANGE => 40,
+            DbType::NUMRANGE => 41,
+            DbType::TSRANGE => 42,
+            DbType::TSTZRANGE => 43,
+            DbType::DATERANGE => 44,
             DbType::UNKNOWN => 252,
             // Never written to disk: it exists only so the wire layer can say
             // `jsonb`, and so a rebuilt document keeps its JSON-ness while it
@@ -135,6 +298,11 @@ impl DbType {
             // no type, so the value had no literal form and the statement
             // failed. 23 is free and nothing on disk can hold it.
             DbType::JSON => 23,
+            // Never written to disk either; its length does not survive the
+            // byte (45 reads back as a `bpchar` with none, shown as stored).
+            DbType::BPCHAR(_) => 45,
+            // Never written either: it is an `ARRAY` stored.
+            DbType::ARRAYOF(_) => 21,
             DbType::NULL => 253,
             DbType::START => 254,
             DbType::END => 255,
@@ -160,6 +328,8 @@ impl DbType {
             13 => DbType::CHAR,
             14 => DbType::STRING,
             15 => DbType::DATETIME,
+            46 => DbType::TIMESTAMP,
+            47 => DbType::JSONTEXT,
             16 => DbType::BOOL,
             17 => DbType::UUID,
             18 => DbType::INET,
@@ -167,7 +337,29 @@ impl DbType {
             20 => DbType::BYTEA,
             21 => DbType::ARRAY,
             22 => DbType::JSONB,
+            24 => DbType::INTERVAL,
+            25 => DbType::MACADDR,
+            26 => DbType::MACADDR8,
+            27 => DbType::BIT,
+            28 => DbType::VARBIT,
+            29 => DbType::DATE,
+            30 => DbType::TIME,
+            31 => DbType::TIMETZ,
+            32 => DbType::POINT,
+            33 => DbType::LINE,
+            34 => DbType::LSEG,
+            35 => DbType::BOX,
+            36 => DbType::PATH,
+            37 => DbType::POLYGON,
+            38 => DbType::CIRCLE,
+            39 => DbType::INT4RANGE,
+            40 => DbType::INT8RANGE,
+            41 => DbType::NUMRANGE,
+            42 => DbType::TSRANGE,
+            43 => DbType::TSTZRANGE,
+            44 => DbType::DATERANGE,
             23 => DbType::JSON,
+            45 => DbType::BPCHAR(0),
             252 => DbType::UNKNOWN,
             253 => DbType::NULL,
             254 => DbType::START,
@@ -194,20 +386,42 @@ impl DbType {
             DbType::F64 => 8,
             DbType::BOOL => 1,
             DbType::CHAR => 4,
-            DbType::STRING => 4 + 8,
+            DbType::STRING | DbType::JSONTEXT | DbType::BPCHAR(_) => 4 + 8,
             DbType::UUID => crate::core::value_codec::UUID_LEN as u32,
             DbType::INET => crate::core::value_codec::INET_LEN as u32,
             DbType::DECIMAL => 16,
             // Variable-width, like STRING: an 8-byte pointer and a 4-byte
             // length live in the row, and the bytes themselves follow it.
-            DbType::BYTEA | DbType::ARRAY | DbType::JSONB => 4 + 8,
+            DbType::BYTEA
+            | DbType::ARRAY
+            | DbType::ARRAYOF(_)
+            | DbType::JSONB
+            | DbType::BIT
+            | DbType::VARBIT
+            | DbType::PATH
+            | DbType::POLYGON
+            | DbType::INT4RANGE
+            | DbType::INT8RANGE
+            | DbType::NUMRANGE
+            | DbType::TSRANGE
+            | DbType::TSTZRANGE
+            | DbType::DATERANGE => 4 + 8,
+            DbType::INTERVAL => crate::core::pg_types::INTERVAL_LEN as u32,
+            DbType::MACADDR => crate::core::pg_types::MACADDR_LEN as u32,
+            DbType::MACADDR8 => crate::core::pg_types::MACADDR8_LEN as u32,
+            DbType::DATE => crate::core::pg_types::DATE_LEN as u32,
+            DbType::TIME => crate::core::pg_types::TIME_LEN as u32,
+            DbType::TIMETZ => crate::core::pg_types::TIMETZ_LEN as u32,
+            DbType::POINT => crate::core::pg_types::POINT_LEN as u32,
+            DbType::LSEG | DbType::BOX => crate::core::pg_types::LSEG_LEN as u32,
+            DbType::LINE | DbType::CIRCLE => crate::core::pg_types::LINE_LEN as u32,
             DbType::UNKNOWN => 0,
             // Nothing stores it; a JSON column's slot is its UUID reference.
             DbType::JSON => crate::core::value_codec::UUID_LEN as u32,
             DbType::NULL => 1,
             DbType::START => 1,
             DbType::END => 1,
-            DbType::DATETIME => 8,
+            DbType::DATETIME | DbType::TIMESTAMP => 8,
         }
     }
 
@@ -222,12 +436,21 @@ impl DbType {
             // narrowest type it does have.
             DbType::I8 | DbType::I16 => 21, // int2
             DbType::I32 => 23,              // int4
-            DbType::I64 => 20, // int8
-            DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64 => 20, // best-effort
+            DbType::I64 => 20,              // int8
+            // Every unsigned value below 2^32 fits `int8`.
+            DbType::U8 | DbType::U16 | DbType::U32 => 20,
+            // Wider than `bigint`, so `numeric` at scale 0 — PostgreSQL's own
+            // choice for such integers. Advertised as `int8`, a `UBIGINT`
+            // above `i64::MAX` reached a binary client as a negative number.
+            DbType::U64 | DbType::I128 | DbType::U128 => 1700,
             DbType::F32 => 700,
             DbType::F64 => 701,
-            DbType::STRING => 25, // TEXT
+            DbType::STRING => 25,     // TEXT
+            DbType::BPCHAR(_) => 1042, // bpchar
+            DbType::ARRAYOF(code) => array_oid_of(DbType::from_byte(*code).pg_oid()),
             DbType::DATETIME => 1184, // timestamptz
+            DbType::TIMESTAMP => 1114,
+            DbType::JSONTEXT => 114,
             DbType::UUID => 2950,
             DbType::INET => 869,
             DbType::DECIMAL => 1700, // numeric
@@ -237,7 +460,43 @@ impl DbType {
             // `text[]`. The element type is in the value, but a column has to
             // advertise one OID, and text is what the schema declares.
             DbType::ARRAY => 1009,
+            DbType::INTERVAL => 1186,
+            DbType::MACADDR => 829,
+            DbType::MACADDR8 => 774,
+            DbType::BIT => 1560,
+            DbType::VARBIT => 1562,
+            DbType::DATE => 1082,
+            DbType::TIME => 1083,
+            DbType::TIMETZ => 1266,
+            DbType::POINT => 600,
+            DbType::LINE => 628,
+            DbType::LSEG => 601,
+            DbType::BOX => 603,
+            DbType::PATH => 602,
+            DbType::POLYGON => 604,
+            DbType::CIRCLE => 718,
+            DbType::INT4RANGE => 3904,
+            DbType::NUMRANGE => 3906,
+            DbType::TSRANGE => 3908,
+            DbType::TSTZRANGE => 3910,
+            DbType::DATERANGE => 3912,
+            DbType::INT8RANGE => 3926,
             _ => 25, // fallback TEXT
+        }
+    }
+
+    /// How a `character(n)` value of declared length `n` is reported (`0`, a
+    /// bare `bpchar`, has none): see [`DbType::BPCHAR`].
+    pub fn bpchar(n: u32) -> DbType {
+        DbType::BPCHAR(u16::try_from(n).unwrap_or(0))
+    }
+
+    /// `atttypmod` as a `RowDescription` carries it: a `character(n)`'s
+    /// length plus four, -1 for everything else (no modifier recorded).
+    pub fn pg_typmod(&self) -> i32 {
+        match self {
+            DbType::BPCHAR(n) if *n > 0 => i32::from(*n) + 4,
+            _ => -1,
         }
     }
 
@@ -249,21 +508,59 @@ impl DbType {
             DbType::I16 => 2,
             DbType::I32 => 4,
             DbType::I64 => 8,
-            DbType::U8 => 1,
-            DbType::U16 => 2,
-            DbType::U32 => 4,
-            DbType::U64 => 8,
+            // Advertised as `int8`, so they declare its width.
+            DbType::U8 | DbType::U16 | DbType::U32 => 8,
+            // `numeric` is a varlena.
+            DbType::U64 | DbType::I128 | DbType::U128 => -1,
             DbType::F32 => 4,
             DbType::F64 => 8,
-            DbType::STRING => -1,
-            DbType::DATETIME => 8,
+            DbType::STRING | DbType::JSONTEXT => -1,
+            DbType::DATETIME | DbType::TIMESTAMP => 8,
             DbType::UUID => 16,
             // Postgres models `inet` as a varlena, so its advertised length is
             // variable even though we store it fixed-width.
             DbType::INET => -1,
             DbType::DECIMAL => -1,
-            DbType::BYTEA | DbType::ARRAY => -1,
+            DbType::BYTEA | DbType::ARRAY | DbType::ARRAYOF(_) => -1,
+            DbType::INTERVAL => crate::core::pg_types::INTERVAL_LEN as i16,
+            DbType::MACADDR => crate::core::pg_types::MACADDR_LEN as i16,
+            DbType::MACADDR8 => crate::core::pg_types::MACADDR8_LEN as i16,
+            DbType::DATE => crate::core::pg_types::DATE_LEN as i16,
+            DbType::TIME => crate::core::pg_types::TIME_LEN as i16,
+            DbType::TIMETZ => crate::core::pg_types::TIMETZ_LEN as i16,
+            DbType::POINT => crate::core::pg_types::POINT_LEN as i16,
+            DbType::LSEG | DbType::BOX => crate::core::pg_types::LSEG_LEN as i16,
+            DbType::LINE | DbType::CIRCLE => crate::core::pg_types::LINE_LEN as i16,
             _ => -1,
         }
+    }
+}
+
+/// PostgreSQL's array type of the element type `oid` (`_int4` for `int4`);
+/// `text[]` for one with none listed here.
+pub fn array_oid_of(oid: u32) -> u32 {
+    match oid {
+        16 => 1000,
+        17 => 1001,
+        20 => 1016,
+        21 => 1005,
+        23 => 1007,
+        25 => 1009,
+        700 => 1021,
+        701 => 1022,
+        869 => 1041,
+        829 => 1040,
+        774 => 775,
+        1082 => 1182,
+        1083 => 1183,
+        1114 => 1115,
+        1184 => 1185,
+        1186 => 1187,
+        1266 => 1270,
+        1560 => 1561,
+        1562 => 1563,
+        1700 => 1231,
+        2950 => 2951,
+        _ => 1009,
     }
 }

@@ -58,11 +58,16 @@
 //! written before this feature existed is, so an existing installation opens
 //! unchanged.
 
+#[cfg(all(test, feature = "kv_storage"))]
+mod backend_tests;
+#[cfg(feature = "kv_storage")]
+pub mod kv_registry;
+pub mod kv_sql;
 pub mod mirror;
-pub mod relocate;
-pub mod sql;
 #[cfg(test)]
 mod placement_tests;
+pub mod relocate;
+pub mod sql;
 #[cfg(test)]
 mod tests;
 
@@ -169,7 +174,12 @@ pub struct StorageLocation {
 
 impl StorageLocation {
     fn root(path: String) -> Self {
-        Self { path, role: LocationRole::Primary, weight: 1, enabled: true }
+        Self {
+            path,
+            role: LocationRole::Primary,
+            weight: 1,
+            enabled: true,
+        }
     }
 }
 
@@ -180,11 +190,98 @@ pub struct LocationReport {
     /// True for the database's own directory, which cannot be dropped.
     pub is_root: bool,
     pub tables: u64,
+    /// Materialized partitions of partitioned tables here, counted as each
+    /// table opened (docs/partitioning.md §6.1).
+    pub partitions: u64,
     /// `None` when the filesystem could not be interrogated — a permission
     /// error, or a platform with no implementation here. Reported as unknown
     /// rather than as zero, which would read as "full".
     pub available_bytes: Option<u64>,
     pub total_bytes: Option<u64>,
+}
+
+/// What holds a table's files.
+///
+/// A placement used to be a directory and nothing else. It is now a *backend*,
+/// of which a directory is one kind — which is how one database can hold a
+/// file-backed table, a scratch table that lives only in memory, and a table
+/// kept in an object store, side by side.
+///
+/// The spec is what `db_storage.cfg` stores. Anything without a recognised
+/// scheme is a directory, so every file written before this existed still parses
+/// as what it meant, and a Windows path is not mistaken for a scheme.
+///
+/// **A table that is not file-backed does not get the file-backed features.**
+/// It is not in a backup, it cannot be moved between disks, it has no
+/// write-ahead log, and the free-space policy does not consider it. Those
+/// features are about files, and inventing an equivalent for each backend would
+/// mean three half-working versions of each instead of one that works.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TableBackend {
+    /// Files in a directory. The only backend before this existed.
+    Directory(String),
+    /// Buffers in this process. Gone when the server stops.
+    Memory,
+    /// Objects in a named key/value store — see `db_kv.cfg`.
+    KeyValue(String),
+}
+
+/// Spec prefix for an in-memory table.
+pub const MEMORY_SPEC: &str = "memory:";
+/// Spec prefix for a key/value table, followed by the store's name.
+pub const KV_SPEC_PREFIX: &str = "kv:";
+
+impl TableBackend {
+    /// Reads a placement spec. Anything unrecognised is a directory.
+    pub fn parse(spec: &str) -> Self {
+        let trimmed = spec.trim();
+        if trimmed.eq_ignore_ascii_case(MEMORY_SPEC) || trimmed.eq_ignore_ascii_case("memory") {
+            return TableBackend::Memory;
+        }
+        // Case-insensitive on the scheme but not on the store's name, which is
+        // an identifier the operator chose.
+        if trimmed.len() > KV_SPEC_PREFIX.len()
+            && trimmed[..KV_SPEC_PREFIX.len()].eq_ignore_ascii_case(KV_SPEC_PREFIX)
+        {
+            let name = trimmed[KV_SPEC_PREFIX.len()..].trim();
+            if !name.is_empty() {
+                return TableBackend::KeyValue(name.to_string());
+            }
+        }
+        TableBackend::Directory(normalize(trimmed))
+    }
+
+    /// How this is written to `db_storage.cfg`.
+    pub fn as_spec(&self) -> String {
+        match self {
+            TableBackend::Directory(path) => path.clone(),
+            TableBackend::Memory => MEMORY_SPEC.to_string(),
+            TableBackend::KeyValue(name) => format!("{KV_SPEC_PREFIX}{name}"),
+        }
+    }
+
+    /// The directory, for the backend that has one.
+    pub fn directory(&self) -> Option<&str> {
+        match self {
+            TableBackend::Directory(path) => Some(path),
+            _ => None,
+        }
+    }
+
+    /// Whether the file-backed features apply: backup, relocation, the log, and
+    /// the free-space policy.
+    pub fn is_file_based(&self) -> bool {
+        matches!(self, TableBackend::Directory(_))
+    }
+
+    /// A short name for error messages.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            TableBackend::Directory(_) => "directory",
+            TableBackend::Memory => "in-memory",
+            TableBackend::KeyValue(_) => "key/value",
+        }
+    }
 }
 
 /// The mutable half of a pool, behind one lock.
@@ -195,6 +292,14 @@ struct PoolState {
     locations: Vec<StorageLocation>,
     /// Table name to location path. Absent means the database directory.
     placements: HashMap<String, String>,
+    /// `(recorded, now)`: a location a restore into a new directory moved,
+    /// as partition maps recorded it and where its files are now
+    /// ([`repoint_restored_pool`] writes them). A map names its locations by
+    /// absolute path and is never rewritten, so a partition recorded at the
+    /// old path opens at the new one ([`StorageManager::partition_dir_now`]).
+    /// Written only by a restore: a directory copied by hand has none, and
+    /// its maps still refuse to read the original's files.
+    aliases: Vec<(String, String)>,
 }
 
 /// A database's storage pool.
@@ -215,6 +320,14 @@ pub struct StorageManager {
     /// *reads* the state, so serialising it through the write lock would block
     /// every reader for the duration of a write and an fsync.
     writing: Mutex<()>,
+    /// Materialized partitions per location, per partitioned table (by
+    /// uid): what the partition dealer balances on (docs/partitioning.md
+    /// §6.1). Kept beside `state`, not in it, so reloading the pool file
+    /// never forgets them; replaced whole per table as it opens, so a count
+    /// cannot drift past a restart. Balance only: the guards that protect a
+    /// location's files read its directory instead
+    /// ([`StorageManager::partition_files_in`]).
+    partitions: Mutex<HashMap<u64, HashMap<String, u64>>>,
 }
 
 impl StorageManager {
@@ -223,11 +336,13 @@ impl StorageManager {
         Self {
             root: None,
             writing: Mutex::new(()),
+            partitions: Mutex::new(HashMap::new()),
             state: RwLock::new(PoolState {
                 policy: PlacementPolicy::Primary,
                 min_free_bytes: DEFAULT_MIN_FREE_BYTES,
                 locations: Vec::new(),
                 placements: HashMap::new(),
+                aliases: Vec::new(),
             }),
         }
     }
@@ -239,16 +354,28 @@ impl StorageManager {
     /// which degrades to a single-directory database — every table then
     /// resolves to the root, and any table that is genuinely elsewhere reads as
     /// missing. That is loud in a way silently inventing placements is not.
+    ///
+    /// Panics where [`StorageManager::try_open`] errs, as a fatal startup path.
     pub fn open(root: &str) -> Self {
+        Self::try_open(root).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`StorageManager::open`], refusing with an error rather than a panic
+    /// when a location's log cannot be replayed. A log this call installed for
+    /// another location is uninstalled again on that error: nothing will use
+    /// it, and a registered log makes the next open skip that recovery.
+    pub fn try_open(root: &str) -> Result<Self, String> {
         let root = normalize(root);
         let manager = Self {
             root: Some(root.clone()),
             writing: Mutex::new(()),
+            partitions: Mutex::new(HashMap::new()),
             state: RwLock::new(PoolState {
                 policy: PlacementPolicy::Primary,
                 min_free_bytes: DEFAULT_MIN_FREE_BYTES,
                 locations: vec![StorageLocation::root(root.clone())],
                 placements: HashMap::new(),
+                aliases: Vec::new(),
             }),
         };
 
@@ -269,6 +396,7 @@ impl StorageManager {
                         min_free_bytes: DEFAULT_MIN_FREE_BYTES,
                         locations: vec![StorageLocation::root(root.clone())],
                         placements: HashMap::new(),
+                        aliases: Vec::new(),
                     };
                 }
             }
@@ -276,8 +404,19 @@ impl StorageManager {
             Err(e) => error!("could not read {}: {}", path.display(), e),
         }
 
-        manager.prepare_locations();
-        manager
+        let unlogged: Vec<String> = manager
+            .all_paths()
+            .into_iter()
+            .skip(1)
+            .filter(|path| crate::core::wal::wal_for(path).is_none())
+            .collect();
+        if let Err(e) = manager.prepare_locations() {
+            for path in &unlogged {
+                let _ = crate::core::wal::remove_for(path);
+            }
+            return Err(e);
+        }
+        Ok(manager)
     }
 
     /// Whether this pool can place anything anywhere but the root.
@@ -328,7 +467,10 @@ impl StorageManager {
     /// roughly an order of magnitude slower than the group commit the root
     /// enjoys. Recovery runs here too, for the same reason it runs for the
     /// root: a log on disk means writes that may not have reached their files.
-    fn prepare_locations(&self) {
+    ///
+    /// A location whose log recovery refuses fails the whole call; see
+    /// [`recover_location`] for why carrying on without it is not an option.
+    fn prepare_locations(&self) -> Result<(), String> {
         let extra: Vec<String> = {
             let state = self.state.read();
             state
@@ -344,28 +486,9 @@ impl StorageManager {
                 error!("storage location {} is unusable: {}", path, e);
                 continue;
             }
-            if crate::core::wal::wal_for(&path).is_some() {
-                continue;
-            }
-            match crate::core::wal::open_and_recover(&path) {
-                Ok((wal, stats)) => {
-                    if stats.applied > 0 || stats.rolled_back > 0 {
-                        info!(
-                            "WAL recovery in {}: applied {}, rolled back {}",
-                            path, stats.applied, stats.rolled_back
-                        );
-                    }
-                    if crate::wal_enabled() {
-                        crate::core::wal::install_for(&path, wal);
-                    }
-                }
-                Err(e) => error!(
-                    "WAL unavailable for storage location {} ({}); \
-                     writes there fall back to per-file flushes",
-                    path, e
-                ),
-            }
+            recover_location(&path)?;
         }
+        Ok(())
     }
 
     /// Every directory this pool writes into, root first.
@@ -374,7 +497,12 @@ impl StorageManager {
     /// second disk is not durable until *that* disk's log is flushed, and the
     /// root's log knows nothing about it.
     pub fn all_paths(&self) -> Vec<String> {
-        self.state.read().locations.iter().map(|l| l.path.clone()).collect()
+        self.state
+            .read()
+            .locations
+            .iter()
+            .map(|l| l.path.clone())
+            .collect()
     }
 
     /// The enabled backup locations, which every write is mirrored to.
@@ -389,8 +517,49 @@ impl StorageManager {
     }
 
     /// Where `table_name`'s files are, or `None` for the database directory.
+    ///
+    /// Directory placements only. A table on another backend has no directory,
+    /// and handing its spec back here would have every caller that treats this
+    /// as a path build one out of `kv:main`.
     pub fn location_of(&self, table_name: &str) -> Option<String> {
+        self.backend_of(table_name)?.directory().map(str::to_string)
+    }
+
+    /// What holds `table_name`, or `None` when nothing is recorded — which
+    /// means the database directory.
+    pub fn backend_of(&self, table_name: &str) -> Option<TableBackend> {
+        self.state
+            .read()
+            .placements
+            .get(table_name)
+            .map(|spec| TableBackend::parse(spec))
+    }
+
+    /// The recorded spec verbatim, for the paths that carry it around rather
+    /// than act on it.
+    pub fn spec_of(&self, table_name: &str) -> Option<String> {
         self.state.read().placements.get(table_name).cloned()
+    }
+
+    /// Records a backend for a table without consulting the policy.
+    ///
+    /// The counterpart of [`StorageManager::pin`] for the backends that are not
+    /// directories. A key/value store's name is not validated here — the pool
+    /// does not own `db_kv.cfg` — so the caller checks it exists first, or the
+    /// table opens against a store that is not configured.
+    pub fn pin_backend(&self, table_name: &str, backend: &TableBackend) -> Result<(), String> {
+        if let TableBackend::Directory(path) = backend {
+            return self.pin(table_name, path);
+        }
+        if self.root.is_none() {
+            return Err("this database is in memory".to_string());
+        }
+        self.state
+            .write()
+            .placements
+            .insert(table_name.to_string(), backend.as_spec());
+        self.persist();
+        Ok(())
     }
 
     /// Decides where a table about to be created goes, records it, and returns
@@ -406,14 +575,20 @@ impl StorageManager {
         let chosen = {
             let mut state = self.state.write();
             if let Some(existing) = state.placements.get(table_name) {
-                return Some(existing.clone());
+                // A table already pinned to another backend has no directory to
+                // report, and choosing one for it would overwrite the pin.
+                return TableBackend::parse(existing)
+                    .directory()
+                    .map(str::to_string);
             }
-            let chosen = choose(&state, root);
+            let chosen = choose(&state, root, &self.partition_totals());
             // Recorded even when it is the database's own directory. The
             // alternative — recording only the exceptions — makes the map an
             // undercount of the root, and `round-robin` reads those counts: the
             // root would look permanently empty and take every table.
-            state.placements.insert(table_name.to_string(), chosen.clone());
+            state
+                .placements
+                .insert(table_name.to_string(), chosen.clone());
             chosen
         };
 
@@ -435,7 +610,10 @@ impl StorageManager {
         {
             let mut state = self.state.write();
             if !state.locations.iter().any(|l| l.path == path) {
-                return Err(format!("{} is not a storage location of this database", path));
+                return Err(format!(
+                    "{} is not a storage location of this database",
+                    path
+                ));
             }
             // The root is recorded like any other location — see `place`.
             let _ = root;
@@ -452,6 +630,21 @@ impl StorageManager {
         if removed {
             self.persist();
         }
+    }
+
+    /// Drops every placement whose table `stale` names, persisting once.
+    /// Returns how many went.
+    pub fn forget_where(&self, stale: impl Fn(&str) -> bool) -> usize {
+        let removed = {
+            let mut state = self.state.write();
+            let before = state.placements.len();
+            state.placements.retain(|table, _| !stale(table));
+            before - state.placements.len()
+        };
+        if removed > 0 {
+            self.persist();
+        }
+        removed
     }
 
     /// Carries a placement across a rename. A renamed table does not move.
@@ -494,7 +687,9 @@ impl StorageManager {
             ));
         }
         if weight == 0 {
-            return Err("weight must be at least 1; use DISABLE to take a location out".to_string());
+            return Err(
+                "weight must be at least 1; use DISABLE to take a location out".to_string(),
+            );
         }
         if path == root {
             return Err(format!(
@@ -509,7 +704,11 @@ impl StorageManager {
         {
             let state = self.state.read();
             if let Some(clash) = state.locations.iter().find(|l| l.path == path) {
-                return Err(format!("{} is already a storage location ({})", clash.path, clash.role.as_str()));
+                return Err(format!(
+                    "{} is already a storage location ({})",
+                    clash.path,
+                    clash.role.as_str()
+                ));
             }
             if let Some(clash) = state
                 .locations
@@ -534,12 +733,20 @@ impl StorageManager {
             .map_err(|e| format!("{} is not writable by this server: {}", path, e))?;
         let _ = std::fs::remove_file(&probe);
 
-        self.state
-            .write()
-            .locations
-            .push(StorageLocation { path: path.clone(), role, weight, enabled });
+        // Before the location is recorded: a directory holding a log that
+        // cannot be replayed is refused here, not at the next restart.
+        recover_location(&path)?;
+
+        self.state.write().locations.push(StorageLocation {
+            path: path.clone(),
+            role,
+            weight,
+            enabled,
+        });
         self.persist();
-        self.prepare_locations();
+        self.prepare_locations().map_err(|e| {
+            format!("{path} was added to the pool, but another location is unusable: {e}")
+        })?;
         Ok(path)
     }
 
@@ -548,14 +755,15 @@ impl StorageManager {
         let path = normalize(path);
 
         if path == root {
-            return Err(
-                "the database's own directory cannot be removed from the pool".to_string()
-            );
+            return Err("the database's own directory cannot be removed from the pool".to_string());
         }
 
         let mut state = self.state.write();
         let Some(index) = state.locations.iter().position(|l| l.path == path) else {
-            return Err(format!("{} is not a storage location of this database", path));
+            return Err(format!(
+                "{} is not a storage location of this database",
+                path
+            ));
         };
 
         // A location still holding tables would take its files with it —
@@ -577,6 +785,10 @@ impl StorageManager {
                 names.len(),
                 names.join(", ")
             ));
+        }
+
+        if let Some(why) = self.partitions_holding(&path) {
+            return Err(why);
         }
 
         state.locations.remove(index);
@@ -607,13 +819,21 @@ impl StorageManager {
         {
             let state = self.state.read();
             if role == LocationRole::Backup
-                && state.placements.values().any(|at| *at == normalized)
+                && state
+                    .placements
+                    .values()
+                    .any(|spec| TableBackend::parse(spec).directory() == Some(normalized.as_str()))
             {
                 return Err(format!(
                     "{} still holds tables; a backup location is written by mirroring \
                      and would overwrite them",
                     normalized
                 ));
+            }
+            if role == LocationRole::Backup
+                && let Some(why) = self.partitions_holding(&normalized)
+            {
+                return Err(why);
             }
         }
         self.alter(path, |location| location.role = role)
@@ -635,7 +855,10 @@ impl StorageManager {
         {
             let mut state = self.state.write();
             let Some(location) = state.locations.iter_mut().find(|l| l.path == path) else {
-                return Err(format!("{} is not a storage location of this database", path));
+                return Err(format!(
+                    "{} is not a storage location of this database",
+                    path
+                ));
             };
             change(location);
         }
@@ -658,6 +881,7 @@ impl StorageManager {
     pub fn locations(&self) -> Vec<LocationReport> {
         let state = self.state.read();
         let root = self.root.as_deref().unwrap_or("");
+        let partitions = self.partition_totals();
         state
             .locations
             .iter()
@@ -667,12 +891,18 @@ impl StorageManager {
                 // and resolves to the root — so the root's count here is a
                 // floor, which `SHOW STORAGE` corrects against the live table
                 // list, the only thing that knows about those.
-                let tables =
-                    state.placements.values().filter(|at| **at == location.path).count() as u64;
+                let tables = state
+                    .placements
+                    .values()
+                    .filter(|spec| {
+                        TableBackend::parse(spec).directory() == Some(location.path.as_str())
+                    })
+                    .count() as u64;
                 LocationReport {
                     location: location.clone(),
                     is_root: location.path == root,
                     tables,
+                    partitions: partitions.get(&location.path).copied().unwrap_or(0),
                     available_bytes: available_bytes(&location.path),
                     total_bytes: total_bytes(&location.path),
                 }
@@ -698,7 +928,134 @@ impl StorageManager {
     pub fn would_place(&self) -> Option<String> {
         let root = self.root.as_deref()?;
         let state = self.state.read();
-        Some(choose(&state, root))
+        Some(choose(&state, root, &self.partition_totals()))
+    }
+
+    // -- partitions (docs/partitioning.md §6.1) --------------------------
+
+    /// Materialized partitions per location, summed over every partitioned
+    /// table this pool has been told about.
+    fn partition_totals(&self) -> HashMap<String, u64> {
+        sum_partitions(&self.partitions.lock())
+    }
+
+    /// Records where `uid`'s materialized partitions are, replacing what was
+    /// recorded for it: a partitioned table as it opens.
+    pub fn register_partitions(&self, uid: u64, counts: HashMap<String, u64>) {
+        let counts = counts.into_iter().map(|(path, n)| (normalize(&path), n)).collect();
+        self.partitions.lock().insert(uid, counts);
+    }
+
+    /// Forgets `uid`'s partitions: a partitioned table dropped, or the uid a
+    /// physical rewrite left (or abandoned).
+    pub fn forget_partitions(&self, uid: u64) {
+        self.partitions.lock().remove(&uid);
+    }
+
+    /// Test-only: the uids whose partitions are counted, sorted.
+    #[cfg(test)]
+    pub(crate) fn counted_uids(&self) -> Vec<u64> {
+        let mut uids: Vec<u64> = self.partitions.lock().keys().copied().collect();
+        uids.sort_unstable();
+        uids
+    }
+
+    /// Picks the directory a partition of `uid` about to be materialized
+    /// goes to, and counts it there at once, so a concurrent dealer sees it
+    /// and [`StorageManager::drop_location`] refuses the location before its
+    /// files exist. [`StorageManager::undeal_partition`] takes it back when
+    /// the materialization fails. `root_only` keeps it in the database's own
+    /// directory whatever the policy says. `None` for an in-memory database.
+    ///
+    /// The dealer is cross-table: a location's count is every partitioned
+    /// table's partitions there, so small tables cannot pile onto one disk.
+    /// Under `primary`, the first enabled primary; under `round-robin`, the
+    /// location holding the fewest tables and partitions; under
+    /// `free-space`, the one furthest below its share, the shares
+    /// proportional to available bytes times weight. Never the emptiest disk
+    /// outright, which would send every partition materialized in a burst to
+    /// the same one: free space only moves once rows arrive.
+    pub fn deal_partition(&self, uid: u64, root_only: bool) -> Option<String> {
+        let root = self.root.as_deref()?;
+        let state = self.state.read();
+        let mut partitions = self.partitions.lock();
+        let chosen = if root_only {
+            root.to_string()
+        } else {
+            deal(&state, root, &sum_partitions(&partitions))
+        };
+        *partitions.entry(uid).or_default().entry(chosen.clone()).or_insert(0) += 1;
+        Some(chosen)
+    }
+
+    /// Takes back a [`StorageManager::deal_partition`] whose
+    /// materialization failed.
+    pub fn undeal_partition(&self, uid: u64, path: &str) {
+        let mut partitions = self.partitions.lock();
+        if let Some(counts) = partitions.get_mut(&uid)
+            && let Some(n) = counts.get_mut(path)
+        {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                counts.remove(path);
+            }
+        }
+    }
+
+    /// Whether a partition recorded at `path` may open there: the database's
+    /// own directory, or a primary location of this pool, enabled or not
+    /// (a disabled location keeps what it holds). A path the pool does not
+    /// name is a map copied or restored from elsewhere, whose files there
+    /// are not this database's to read or write.
+    /// Where a partition a map recorded at `recorded` (not the root) is now:
+    /// `recorded` itself while it is a primary location of this pool, else
+    /// where a restore moved it, when that is one. `None` refuses the table.
+    pub fn partition_dir_now(&self, recorded: &str) -> Option<String> {
+        if self.holds_partitions_at(recorded) {
+            return Some(normalize(recorded));
+        }
+        let recorded = normalize(recorded);
+        let now = self.state.read().aliases.iter().find(|(from, _)| *from == recorded).map(|(_, to)| to.clone())?;
+        self.holds_partitions_at(&now).then_some(now)
+    }
+
+    pub fn holds_partitions_at(&self, path: &str) -> bool {
+        let path = normalize(path);
+        if self.root.as_deref() == Some(path.as_str()) {
+            return true;
+        }
+        self.state
+            .read()
+            .locations
+            .iter()
+            .any(|l| l.path == path && l.role == LocationRole::Primary)
+    }
+
+    /// Why `path` may not stop being a primary location of this pool because
+    /// of partitions, or `None`. A partition dealt there whose files are not
+    /// written yet counts (the dealer's reservation), and so does any
+    /// partition data file in the directory: that covers a table whose map
+    /// could not be read this start, which never registered its counts.
+    fn partitions_holding(&self, path: &str) -> Option<String> {
+        let dealt = self.partition_totals().get(path).copied().unwrap_or(0);
+        let files = match partition_data_files(Path::new(path)) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+            Err(e) => {
+                return Some(format!(
+                    "{path} could not be checked for partitions of partitioned tables ({e})"
+                ));
+            }
+        };
+        if dealt == 0 && files == 0 {
+            return None;
+        }
+        Some(format!(
+            "{path} holds partitions of partitioned tables ({} materialized, {files} partition file(s)); \
+             partitions cannot be moved off a location yet. DISABLE the location to stop new partitions \
+             landing there",
+            dealt
+        ))
     }
 
     // -- persistence ------------------------------------------------------
@@ -744,9 +1101,7 @@ impl StorageManager {
         // The bytes, then the directory entry. Renaming over a file whose
         // contents are still only in the page cache would survive a crash as an
         // empty configuration.
-        if let Ok(file) = std::fs::File::open(&temp_path) {
-            let _ = file.sync_all();
-        }
+        let _ = crate::core::sync_path::sync_file(&temp_path);
         if let Err(e) = std::fs::rename(&temp_path, &final_path) {
             error!(
                 "could not replace {}: {}. The placements this database is running with are \
@@ -765,7 +1120,9 @@ impl StorageManager {
         let state = self.state.read();
 
         let mut out = String::new();
-        out.push_str("# rasterizeddb storage pool. Rewritten by the server; edit while it is stopped.\n");
+        out.push_str(
+            "# rasterizeddb storage pool. Rewritten by the server; edit while it is stopped.\n",
+        );
         out.push_str(&format!("version\t{}\n", POOL_FORMAT_VERSION));
         out.push_str(&format!("policy\t{}\n", state.policy.as_str()));
         out.push_str(&format!("min_free_bytes\t{}\n", state.min_free_bytes));
@@ -779,9 +1136,17 @@ impl StorageManager {
                 "location\t{}\t{}\t{}\t{}\n",
                 location.role.as_str(),
                 location.weight,
-                if location.enabled { "enabled" } else { "disabled" },
+                if location.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
                 location.path,
             ));
+        }
+
+        for (from, to) in &state.aliases {
+            out.push_str(&format!("alias\t{}\t{}\n", from, to));
         }
 
         let mut placements: Vec<(&String, &String)> = state.placements.iter().collect();
@@ -807,11 +1172,12 @@ impl StorageManager {
 /// good by consulting the thing it was supposed to be a copy of.
 ///
 /// The source root becomes `target`. Any other location is dropped, along with
-/// the tables placed on it: those files are on another disk, and a snapshot
-/// only ever walks the database directory, so they are not in the backup under
-/// any reading. Dropping them makes the restored database resolve those tables
-/// to its own root and report them as missing — which is loud, where reading
-/// the source's copy is not.
+/// the tables placed on it: a snapshot taken before storage locations were
+/// captured walked only the database directory, so those files are not in it
+/// under any reading. Dropping them makes the restored database resolve those
+/// tables to its own root and report them as missing — which is loud, where
+/// reading the source's copy is not. A snapshot that did capture them restores
+/// through [`repoint_restored_pool`] instead.
 ///
 /// `written_in` is the directory holding the file — a restore stages its work
 /// in a sibling and renames it into place — and `final_root` is where that
@@ -826,6 +1192,62 @@ pub fn repoint_pool_config(
     written_in: &Path,
     final_root: &Path,
     source_root: Option<&str>,
+) -> io::Result<Vec<String>> {
+    repoint_restored_pool(written_in, final_root, source_root, &[])
+}
+
+/// Removes the key/value placements of `tables` from the pool file in
+/// `written_in`, so each opens from the directory instead: what a restore
+/// does with a table whose snapshot copy came off a store. Its placement
+/// still names the store, and for a clone that store is the live server's —
+/// opening it there would read the original and leave the copy unread, and a
+/// write would corrupt a prefix with two writers.
+pub fn drop_kv_placements(written_in: &Path, tables: &[String]) -> io::Result<()> {
+    let path = written_in.join(POOL_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let dropped = matches!(
+            line.split('\t').collect::<Vec<_>>().as_slice(),
+            ["table", spec, table]
+                if tables.iter().any(|t| t == table)
+                    && matches!(TableBackend::parse(spec), TableBackend::KeyValue(_))
+        );
+        if !dropped {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    // Through a temporary file and a rename, for the reason `persist` gives.
+    let temp = written_in.join(format!("{}.tmp", POOL_FILE));
+    std::fs::write(&temp, out.as_bytes())?;
+    let _ = crate::core::sync_path::sync_file(&temp);
+    std::fs::rename(&temp, &path)?;
+    let _ = crate::core::wal::sync_parent_dir(&path);
+    Ok(())
+}
+
+/// [`repoint_pool_config`] for a snapshot that also carried storage locations
+/// outside the database directory.
+///
+/// `locations` pairs each such location's source path with the directory its
+/// files were restored into. Those locations, and the tables on them, are
+/// rewritten rather than dropped. So is anything under the source root: a
+/// database created with `CREATE DATABASE` is a subdirectory with a pool file of
+/// its own, and that file names the subdirectory by an absolute path too.
+/// Missing that, a restored sub-database read the source's files.
+///
+/// `final_root` and `source_root` are always the roots of the whole backup,
+/// even when `written_in` is a sub-database's directory.
+pub fn repoint_restored_pool(
+    written_in: &Path,
+    final_root: &Path,
+    source_root: Option<&str>,
+    locations: &[(String, String)],
 ) -> io::Result<Vec<String>> {
     let path = written_in.join(POOL_FILE);
     let text = match std::fs::read_to_string(&path) {
@@ -853,8 +1275,43 @@ pub fn repoint_pool_config(
         return Ok(Vec::new());
     }
 
+    // Where a source path is in the restored copy, or `None` when no snapshot
+    // copied what is there.
+    let map = |at: &str| -> Option<String> {
+        let at = normalize(at);
+        if at == old_root {
+            return Some(target_path.clone());
+        }
+        if contains_path(&old_root, &at) {
+            let rest = Path::new(&at).strip_prefix(&old_root).ok()?;
+            return Some(normalize(
+                &Path::new(&target_path).join(rest).to_string_lossy(),
+            ));
+        }
+        locations
+            .iter()
+            .find(|(source, _)| normalize(source) == at)
+            .map(|(_, restored)| normalize(restored))
+    };
+
     let mut out = String::new();
     let mut dropped = Vec::new();
+    // `(recorded, now)` for every primary location this moves, and for every
+    // alias an earlier restore wrote, its target followed here too: partition
+    // maps keep the path they recorded, so a restore of a restore still finds
+    // the files (`StorageManager::partition_dir_now`). The root needs none: a
+    // map records it as location 0, wherever the database is.
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    // The directory this file was written for (its first `location` line):
+    // the root of a database created with `CREATE DATABASE` is a
+    // subdirectory of the backup's root, and location 0 to its own maps.
+    let own_root = first_location(&text);
+    let mut alias = |from: String, to: String| {
+        aliases.retain(|(f, _)| *f != from);
+        if from != to {
+            aliases.push((from, to));
+        }
+    };
     for line in text.lines() {
         if line.trim().is_empty() || line.starts_with('#') {
             out.push_str(line);
@@ -864,33 +1321,43 @@ pub fn repoint_pool_config(
         let fields: Vec<&str> = line.split('\t').collect();
         match fields.as_slice() {
             ["location", role, weight, enabled, path] => {
-                if normalize(path) == old_root {
+                // A backup location is never carried: the snapshot copied the
+                // primary its files mirror, and a clone mirroring into the
+                // source's backup disk would write over it.
+                let primary = LocationRole::parse(role) == Some(LocationRole::Primary);
+                let carried = primary || normalize(path) == old_root;
+                if let Some(restored) = map(path).filter(|_| carried) {
                     out.push_str(&format!(
-                        "location\t{role}\t{weight}\t{enabled}\t{target_path}\n"
+                        "location\t{role}\t{weight}\t{enabled}\t{restored}\n"
                     ));
+                    if primary && normalize(path) != old_root && Some(normalize(path)) != own_root {
+                        alias(normalize(path), restored);
+                    }
                 }
                 // Any other disk: dropped, and its tables with it below.
             }
-            ["table", at, table] => {
-                if normalize(at) == old_root {
-                    out.push_str(&format!("table\t{target_path}\t{table}\n"));
-                } else {
-                    dropped.push((*table).to_string());
-                }
+            ["alias", from, to] => {
+                let to = map(to).unwrap_or_else(|| normalize(to));
+                alias(normalize(from), to);
             }
+            ["table", at, table] => match map(at) {
+                Some(restored) => out.push_str(&format!("table\t{restored}\t{table}\n")),
+                None => dropped.push((*table).to_string()),
+            },
             _ => {
                 out.push_str(line);
                 out.push('\n');
             }
         }
     }
+    for (from, to) in &aliases {
+        out.push_str(&format!("alias\t{from}\t{to}\n"));
+    }
 
     // Through a temporary file and a rename, for the reason `persist` gives.
     let temp = written_in.join(format!("{}.tmp", POOL_FILE));
     std::fs::write(&temp, out.as_bytes())?;
-    if let Ok(file) = std::fs::File::open(&temp) {
-        let _ = file.sync_all();
-    }
+    let _ = crate::core::sync_path::sync_file(&temp);
     std::fs::rename(&temp, &path)?;
     let _ = crate::core::wal::sync_parent_dir(&path);
 
@@ -916,12 +1383,15 @@ pub fn repoint_pool_config(
 /// hand-editing one — but nothing that reads this file should have to guess
 /// afterwards why the numbers came from another directory.
 fn warn_if_written_elsewhere(text: &str, root: &str, path: &Path) {
-    let mut locations = text.lines().filter(|line| !line.starts_with('#')).filter_map(|line| {
-        match line.split('\t').collect::<Vec<_>>().as_slice() {
-            ["location", _, _, _, at] => Some(normalize(at)),
-            _ => None,
-        }
-    });
+    let mut locations = text
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(
+            |line| match line.split('\t').collect::<Vec<_>>().as_slice() {
+                ["location", _, _, _, at] => Some(normalize(at)),
+                _ => None,
+            },
+        );
 
     let mut any = false;
     let mut names_this_one = false;
@@ -946,15 +1416,77 @@ fn warn_if_written_elsewhere(text: &str, root: &str, path: &Path) {
     );
 }
 
+/// The directories other than `db_dir` that the pool file in `db_dir` keeps
+/// table files in, sorted. Empty when there is no pool file.
+///
+/// Every primary location, and every directory a placement names: a table
+/// whose location was dropped from the file still opens from where its line
+/// says (see [`parse_into`]), so its files are still live. Backup locations
+/// are left out — they hold mirrored copies of files a primary already has.
+///
+/// Read from the file rather than from a live pool, for the backup service,
+/// which has no `Database` and must not trigger [`StorageManager::open`]'s
+/// side effects. A file that cannot be parsed is an error rather than "no
+/// locations": the caller is deciding what a backup leaves out.
+pub fn data_locations(db_dir: &Path) -> io::Result<Vec<String>> {
+    let path = db_dir.join(POOL_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let root = normalize(&db_dir.to_string_lossy());
+    let mut state = PoolState {
+        policy: PlacementPolicy::Primary,
+        min_free_bytes: DEFAULT_MIN_FREE_BYTES,
+        locations: Vec::new(),
+        placements: HashMap::new(),
+        aliases: Vec::new(),
+    };
+    parse_into(&text, &root, &mut state).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} cannot be parsed ({e}), so which directories hold its tables is unknown",
+                path.display()
+            ),
+        )
+    })?;
+
+    let mut out: Vec<String> = state
+        .locations
+        .iter()
+        .filter(|l| l.role == LocationRole::Primary)
+        .map(|l| l.path.clone())
+        .chain(
+            state
+                .placements
+                .values()
+                .filter_map(|spec| TableBackend::parse(spec).directory().map(str::to_string)),
+        )
+        .filter(|at| *at != root)
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// The root a pool file was written for: its first `location` line.
+pub fn pool_file_root(db_dir: &Path) -> Option<String> {
+    first_location(&std::fs::read_to_string(db_dir.join(POOL_FILE)).ok()?)
+}
+
 /// The path on the first `location` line, which is the root the file was
 /// written for.
 fn first_location(text: &str) -> Option<String> {
     text.lines()
         .filter(|line| !line.starts_with('#'))
-        .find_map(|line| match line.split('\t').collect::<Vec<_>>().as_slice() {
-            ["location", _, _, _, path] => Some(normalize(path)),
-            _ => None,
-        })
+        .find_map(
+            |line| match line.split('\t').collect::<Vec<_>>().as_slice() {
+                ["location", _, _, _, path] => Some(normalize(path)),
+                _ => None,
+            },
+        )
 }
 
 /// Applies a rendered pool file to `state`.
@@ -966,6 +1498,7 @@ fn first_location(text: &str) -> Option<String> {
 fn parse_into(text: &str, root: &str, state: &mut PoolState) -> Result<(), String> {
     let mut locations: Vec<StorageLocation> = vec![StorageLocation::root(root.to_string())];
     let mut placements: HashMap<String, String> = HashMap::new();
+    let mut aliases: Vec<(String, String)> = Vec::new();
     let mut policy = PlacementPolicy::Primary;
     let mut min_free_bytes = DEFAULT_MIN_FREE_BYTES;
     let mut version = None;
@@ -1026,6 +1559,13 @@ fn parse_into(text: &str, root: &str, state: &mut PoolState) -> Result<(), Strin
                     enabled: enabled.trim() != "disabled",
                 });
             }
+            "alias" => {
+                let from = fields.next().ok_or_else(|| at("alias"))?;
+                let to = fields.next().ok_or_else(|| at("alias"))?;
+                let from = normalize(from);
+                aliases.retain(|(f, _)| *f != from);
+                aliases.push((from, normalize(to)));
+            }
             "table" => {
                 let at_path = fields.next().ok_or_else(|| at("table"))?;
                 // The name is the rest of the line, so a table name containing
@@ -1035,10 +1575,13 @@ fn parse_into(text: &str, root: &str, state: &mut PoolState) -> Result<(), Strin
                 if name.is_empty() {
                     return Err(at("table"));
                 }
-                placements.insert(name, normalize(at_path));
+                placements.insert(name, TableBackend::parse(at_path).as_spec());
             }
             other => {
-                warn!("{}: ignoring unknown storage pool directive {:?}", POOL_FILE, other);
+                warn!(
+                    "{}: ignoring unknown storage pool directive {:?}",
+                    POOL_FILE, other
+                );
             }
         }
     }
@@ -1051,8 +1594,12 @@ fn parse_into(text: &str, root: &str, state: &mut PoolState) -> Result<(), Strin
     // inconsistency that loses data quietly, so it is reported and the table is
     // left pointing where it says. Dropping the placement would make the table
     // resolve to the root, where it would open as empty.
-    for (table, path) in placements.iter() {
-        if !locations.iter().any(|l| l.path == *path) {
+    for (table, spec) in placements.iter() {
+        let Some(path) = TableBackend::parse(spec).directory().map(str::to_string) else {
+            // Not a directory, so no location is expected to list it.
+            continue;
+        };
+        if !locations.iter().any(|l| l.path == path) {
             warn!(
                 "{} places table {} in {}, which is not a storage location; \
                  add it back before using that table",
@@ -1065,11 +1612,12 @@ fn parse_into(text: &str, root: &str, state: &mut PoolState) -> Result<(), Strin
     state.min_free_bytes = min_free_bytes;
     state.locations = locations;
     state.placements = placements;
+    state.aliases = aliases;
     Ok(())
 }
 
 /// Picks a directory for a new table.
-fn choose(state: &PoolState, root: &str) -> String {
+fn choose(state: &PoolState, root: &str, partitions: &HashMap<String, u64>) -> String {
     let candidates: Vec<&StorageLocation> = state
         .locations
         .iter()
@@ -1116,8 +1664,13 @@ fn choose(state: &PoolState, root: &str) -> String {
             // older than the file have no line and are undercounted against the
             // root; the effect is a bias towards the other locations until they
             // catch up, which is the direction an operator adding a disk wants.
-            let counted =
-                |path: &str| state.placements.values().filter(|at| *at == path).count();
+            // Materialized partitions count beside tables (§6.1 of
+            // docs/partitioning.md): a location full of partitions is not
+            // empty to this policy.
+            let counted = |path: &str| {
+                state.placements.values().filter(|at| *at == path).count() as u64
+                    + partitions.get(path).copied().unwrap_or(0)
+            };
             pool.iter()
                 .min_by_key(|l| counted(&l.path))
                 .map(|l| l.path.clone())
@@ -1133,6 +1686,128 @@ fn choose(state: &PoolState, root: &str) -> String {
             .map(|l| l.path.clone())
             .unwrap_or_else(|| root.to_string()),
     }
+}
+
+fn sum_partitions(by_table: &HashMap<u64, HashMap<String, u64>>) -> HashMap<String, u64> {
+    let mut totals: HashMap<String, u64> = HashMap::new();
+    for counts in by_table.values() {
+        for (path, n) in counts {
+            *totals.entry(path.clone()).or_insert(0) += n;
+        }
+    }
+    totals
+}
+
+/// Partition data files (`__pt_<uid>_<pid>.db` and its pointers file) in
+/// `dir`.
+fn partition_data_files(dir: &Path) -> io::Result<usize> {
+    let mut n = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let Ok(name) = entry?.file_name().into_string() else {
+            continue;
+        };
+        if matches!(
+            crate::core::partition::files::parse_name(&name),
+            Some(crate::core::partition::files::PartFile::Data { .. })
+        ) {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Picks a directory for a partition (see [`StorageManager::deal_partition`]).
+///
+/// The candidates are [`choose`]'s: enabled primaries, those below
+/// `min_free_bytes` left out unless that leaves none. Ties go to declaration
+/// order, so the choice is a function of what is on disk.
+fn deal(state: &PoolState, root: &str, partitions: &HashMap<String, u64>) -> String {
+    let candidates: Vec<&StorageLocation> = state
+        .locations
+        .iter()
+        .filter(|l| l.enabled && l.role == LocationRole::Primary)
+        .collect();
+    if candidates.is_empty() {
+        return root.to_string();
+    }
+    if candidates.len() == 1 {
+        return candidates[0].path.clone();
+    }
+    let roomy: Vec<&StorageLocation> = candidates
+        .iter()
+        .copied()
+        .filter(|l| available_bytes(&l.path).is_none_or(|free| free >= state.min_free_bytes))
+        .collect();
+    let pool = if roomy.is_empty() { candidates } else { roomy };
+    let held = |path: &str| partitions.get(path).copied().unwrap_or(0);
+
+    match state.policy {
+        PlacementPolicy::Primary => pool[0].path.clone(),
+        PlacementPolicy::RoundRobin => {
+            let tables = |path: &str| state.placements.values().filter(|at| *at == path).count() as u64;
+            pool.iter()
+                .min_by_key(|l| tables(&l.path) + held(&l.path))
+                .map(|l| l.path.clone())
+                .unwrap_or_else(|| root.to_string())
+        }
+        PlacementPolicy::FreeSpace => {
+            // Each location's share is proportional to available bytes times
+            // weight; the next partition goes where `(held + 1) / share` is
+            // least, compared crosswise so nothing divides. A location whose
+            // free space cannot be read has no share and is taken only when
+            // no location has one.
+            let share = |l: &StorageLocation| {
+                available_bytes(&l.path).unwrap_or(0) as u128 * l.weight.max(1) as u128
+            };
+            let mut best: Option<&StorageLocation> = None;
+            for &l in &pool {
+                best = match best {
+                    None => Some(l),
+                    Some(b) => {
+                        let (sl, sb) = (share(l), share(b));
+                        let better = match (sl, sb) {
+                            (0, 0) => held(&l.path) < held(&b.path),
+                            (0, _) => false,
+                            (_, 0) => true,
+                            _ => (held(&l.path) as u128 + 1) * sb < (held(&b.path) as u128 + 1) * sl,
+                        };
+                        Some(if better { l } else { b })
+                    }
+                };
+            }
+            best.map(|l| l.path.clone()).unwrap_or_else(|| root.to_string())
+        }
+    }
+}
+
+/// Replays `path`'s log and installs it, or says why the location cannot be used.
+///
+/// A log recovery refuses (a contested file id, one that cannot be read) is
+/// left on disk untouched, and carrying on without it is what must not happen:
+/// writes would land on the bytes its records describe, and the replay that
+/// runs once the cause is cleared would put the older records back over them.
+/// The caller refuses instead.
+fn recover_location(path: &str) -> Result<(), String> {
+    if crate::core::wal::wal_for(path).is_some() {
+        return Ok(());
+    }
+    let (wal, stats) = crate::core::wal::open_and_recover(path).map_err(|e| {
+        format!(
+            "storage location {path} cannot be used: WAL recovery failed ({e}). Its log \
+             was left as it was; the writes it holds are not on disk until it replays. \
+             Resolve the cause and retry — deleting the log discards those writes."
+        )
+    })?;
+    if stats.applied > 0 || stats.rolled_back > 0 {
+        info!(
+            "WAL recovery in {}: applied {}, rolled back {}",
+            path, stats.applied, stats.rolled_back
+        );
+    }
+    if crate::wal_enabled() {
+        crate::core::wal::install_for(path, wal);
+    }
+    Ok(())
 }
 
 /// Trims trailing separators so that `/mnt/b` and `/mnt/b/` are one location.
@@ -1183,15 +1858,46 @@ fn statvfs(path: &str) -> Option<libc::statvfs> {
     (rc == 0).then_some(out)
 }
 
+/// Bytes the caller can still write to the volume holding `path` (its quota
+/// counted), from `GetDiskFreeSpaceExW`.
+#[cfg(windows)]
+pub fn available_bytes(path: &str) -> Option<u64> {
+    disk_free_space(path).map(|(available, _)| available)
+}
+
+#[cfg(windows)]
+pub fn total_bytes(path: &str) -> Option<u64> {
+    disk_free_space(path).map(|(_, total)| total)
+}
+
+/// `(available to the caller, total)` for the volume holding `path`, which
+/// must exist.
+#[cfg(windows)]
+fn disk_free_space(path: &str) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(dir: *const u16, available: *mut u64, total: *mut u64, free: *mut u64) -> i32;
+    }
+    if !Path::new(path).exists() {
+        return None;
+    }
+    let wide: Vec<u16> = std::ffi::OsStr::new(path).encode_wide().chain(std::iter::once(0)).collect();
+    let (mut available, mut total, mut free) = (0u64, 0u64, 0u64);
+    // SAFETY: a NUL-terminated wide path and three out-parameters the call
+    // fills on success.
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut free) };
+    (ok != 0).then_some((available, total))
+}
+
 /// No implementation on this platform, so the space-aware policy degrades to
 /// round-robin rather than to a wrong answer — `choose` treats `None` as "not
 /// known to be full".
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn available_bytes(_path: &str) -> Option<u64> {
     None
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn total_bytes(_path: &str) -> Option<u64> {
     None
 }
@@ -1209,7 +1915,13 @@ pub fn filesystem_id(path: &str) -> Option<u64> {
     std::fs::metadata(path).ok().map(|meta| meta.dev())
 }
 
-#[cfg(not(unix))]
+/// The volume serial number of the volume holding `path`.
+#[cfg(windows)]
+pub fn filesystem_id(path: &str) -> Option<u64> {
+    crate::core::sync_path::volume_and_index(Path::new(path)).ok().map(|(volume, _)| volume)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn filesystem_id(_path: &str) -> Option<u64> {
     None
 }

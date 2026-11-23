@@ -1,6 +1,7 @@
 use smallvec::SmallVec;
-use std::collections::HashMap;
-use std::{arch::x86_64::*, borrow::Cow};
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+use std::borrow::Cow;
 
 use crate::core::row::schema::SchemaField;
 use crate::memory_pool::MEMORY_POOL;
@@ -20,6 +21,9 @@ pub enum Token {
         write_order: u64,
         steps: Vec<crate::core::jsonb::Step>,
         as_text: bool,
+        /// The column is `json`, its bytes the text as written
+        /// (`core::json_text`), not a stored document.
+        json_text: bool,
     },
     Number(NumericValue),
     StringLit(String),
@@ -33,6 +37,13 @@ pub enum Token {
     /// applies to may be a parenthesised group whose extent the parser knows
     /// and the tokenizer does not.
     Cast(DbType),
+    /// An operand the expression evaluator computes per row — a `CASE`, a
+    /// `||` chain, a `%` — which the rewrite lifted out of the clause whole.
+    /// See `predicate_rewrite::lift_evaluated_operands`.
+    ///
+    /// Neither a column nor a literal, so every extractor that plans from
+    /// tokens treats the comparison holding it as opaque.
+    Evaluated(std::sync::Arc<crate::core::processor::transformer::EvaluatedOperand>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,6 +140,7 @@ fn is_id_part_fast(c: u8) -> bool {
 }
 
 // SIMD-optimized whitespace skipping
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn skip_whitespace_simd(bytes: &[u8], mut pos: usize) -> usize {
     if pos >= bytes.len() {
@@ -176,6 +188,7 @@ unsafe fn skip_whitespace_simd(bytes: &[u8], mut pos: usize) -> usize {
 }
 
 // SIMD-optimized digit scanning
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn scan_digits_simd(bytes: &[u8], mut pos: usize) -> usize {
     if pos >= bytes.len() {
@@ -216,6 +229,7 @@ unsafe fn scan_digits_simd(bytes: &[u8], mut pos: usize) -> usize {
 }
 
 // SIMD-optimized identifier scanning
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(non_snake_case)]
 unsafe fn scan_identifier_simd(bytes: &[u8], mut pos: usize) -> usize {
@@ -274,54 +288,77 @@ unsafe fn scan_identifier_simd(bytes: &[u8], mut pos: usize) -> usize {
     pos
 }
 
-// Pre-compute field lookup map for better cache locality
-struct FieldLookup<'a> {
-    map: HashMap<Cow<'a, String>, (Cow<'a, String>, DbType, u64)>,
-    logical_ops: HashMap<String, String>,
-    string_ops: HashMap<String, String>,
+// Off x86_64 the scanners are their scalar tails: each AVX2 loop above only
+// advances over bytes its scalar loop would also have taken, so the
+// positions they return are the same.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn skip_whitespace_simd(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && is_whitespace_fast(bytes[pos]) {
+        pos += 1;
+    }
+    pos
 }
 
-impl<'a> FieldLookup<'a> {
-    fn new(schema: &'a SmallVec<[SchemaField; 20]>) -> Self {
-        let mut map =
-            HashMap::<Cow<'a, String>, (Cow<'a, String>, DbType, u64)>::with_capacity(schema.len());
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn scan_digits_simd(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && is_digit_fast(bytes[pos]) {
+        pos += 1;
+    }
+    pos
+}
 
-        for field in schema.iter() {
-            map.insert(
-                Cow::Borrowed(&field.name),
-                (
-                    Cow::Borrowed(&field.name),
-                    field.db_type.clone(),
-                    field.write_order.clone(),
-                ),
-            );
-        }
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn scan_identifier_simd(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && is_id_part_fast(bytes[pos]) {
+        pos += 1;
+    }
+    pos
+}
 
-        let mut logical_ops = HashMap::new();
-        logical_ops.insert("and".to_string(), "AND".to_string());
-        logical_ops.insert("or".to_string(), "OR".to_string());
+/// The column a name in a predicate refers to: matched exactly, and the
+/// last of that name in schema order when several share it (a dropped column
+/// keeps its name). A linear scan: schemas are short, and building a map per
+/// tokenization cost more than every lookup it served.
+fn field_named<'a>(schema: &'a SmallVec<[SchemaField; 20]>, name: &str) -> Option<&'a SchemaField> {
+    schema.iter().rev().find(|f| f.name == name)
+}
 
-        let mut string_ops = HashMap::new();
-        string_ops.insert("contains".to_string(), "CONTAINS".to_string());
-        string_ops.insert("startswith".to_string(), "STARTSWITH".to_string());
-        string_ops.insert("endswith".to_string(), "ENDSWITH".to_string());
+/// The operators the tokenizer reads as words, by their lowercase spelling.
+fn string_op(lower: &str) -> Option<&'static str> {
+    Some(match lower {
+        "contains" => "CONTAINS",
+        "startswith" => "STARTSWITH",
+        "endswith" => "ENDSWITH",
         // The case-insensitive counterparts that `ILIKE` lowers to. Without
         // these the tokenizer would treat them as unknown identifiers, which it
         // panics on.
-        string_ops.insert("icontains".to_string(), "ICONTAINS".to_string());
-        string_ops.insert("istartswith".to_string(), "ISTARTSWITH".to_string());
-        string_ops.insert("iendswith".to_string(), "IENDSWITH".to_string());
-        string_ops.insert("iequals".to_string(), "IEQUALS".to_string());
+        "icontains" => "ICONTAINS",
+        "istartswith" => "ISTARTSWITH",
+        "iendswith" => "IENDSWITH",
+        "iequals" => "IEQUALS",
         // `LIKE`/`ILIKE` reach the tokenizer only for patterns the rewrite could
         // not reduce to one of the above — an interior `%`, or a `_`.
-        string_ops.insert("like".to_string(), "LIKE".to_string());
-        string_ops.insert("ilike".to_string(), "ILIKE".to_string());
+        "like" => "LIKE",
+        "ilike" => "ILIKE",
+        // `SIMILAR TO`, folded to one word by `predicate_rewrite` so it fits
+        // this table — the tokenizer reads one identifier at a time.
+        "similarto" => "SIMILARTO",
+        // `IS NULL` / `IS NOT NULL` over a JSON path, in PostgreSQL's own
+        // one-word spellings. Postfix: nothing follows them.
+        "isnull" => "ISNULL",
+        "notnull" => "NOTNULL",
+        _ => return None,
+    })
+}
 
-        Self {
-            map,
-            logical_ops,
-            string_ops,
-        }
+fn logical_op(lower: &str) -> Option<&'static str> {
+    match lower {
+        "and" => Some("AND"),
+        "or" => Some("OR"),
+        _ => None,
     }
 }
 
@@ -414,6 +451,18 @@ fn json_path_extent(bytes: &[u8], from: usize) -> Option<usize> {
     }
 }
 
+/// Where the digits of a number whose `-` sign is at `i` start: past the
+/// sign and any spaces after it.
+#[inline(always)]
+fn digits_after_sign(bytes: &[u8], i: usize) -> usize {
+    let mut j = i + 1;
+    // The whitespace `skip_whitespace_simd` skips between tokens.
+    while j < bytes.len() && is_whitespace_fast(bytes[j]) {
+        j += 1;
+    }
+    j
+}
+
 fn tokenize_inner<'a>(
     s: &str,
     schema: &'a SmallVec<[SchemaField; 20]>,
@@ -422,19 +471,26 @@ fn tokenize_inner<'a>(
     let bytes = s.as_bytes();
     let mut i = 0;
 
-    // Pre-compute lookup structures
-    let field_lookup = FieldLookup::new(schema);
-
     // Track context for field association to maintain type consistency
     let mut current_field_context: Option<(Cow<'a, String>, DbType, u64)> = None;
     let mut expression_type_context: Option<DbType> = None;
     let mut expression_stack: Vec<Option<DbType>> = Vec::new();
     let mut in_parentheses = 0;
+    // Fractions a float does not hold, by token index, for the literal
+    // written before the NUMERIC column it is compared with (see the end).
+    let mut lossy_fractions: Vec<(usize, String)> = Vec::new();
 
     // Helper to determine if a minus sign should be considered part of a number
     #[inline(always)]
     fn is_negative_number_start(tokens: &[Token], bytes: &[u8], i: usize) -> bool {
-        let next_is_digit = i + 1 < bytes.len() && is_digit_fast(bytes[i + 1]);
+        // Spaces between the sign and its digits too: `= - 6` is `= -6`, as
+        // PostgreSQL reads it, and as `predicate_rewrite` renders a negative
+        // literal. Read as an operator, it hid the comparison from every
+        // extractor (the partition router fanned out, and the same-value key
+        // proof refused `ON CONFLICT … DO UPDATE SET k = EXCLUDED.k` for a
+        // negative key).
+        let digit_at = digits_after_sign(bytes, i);
+        let next_is_digit = digit_at < bytes.len() && is_digit_fast(bytes[digit_at]);
         if !next_is_digit {
             return false;
         }
@@ -459,6 +515,20 @@ fn tokenize_inner<'a>(
         let c = bytes[i];
 
         match c {
+            // An operand the rewrite lifted for the expression evaluator.
+            crate::core::tokenizer::predicate_rewrite::LIFTED_OPEN => {
+                let (text, end) = crate::core::tokenizer::predicate_rewrite::read_lifted(s, i)
+                    .ok_or_else(|| {
+                        "a lifted expression in the WHERE clause is malformed".to_string()
+                    })?;
+                let operand =
+                    crate::core::processor::transformer::EvaluatedOperand::new(&text, schema)?;
+                expression_type_context = Some(operand.db_type.clone());
+                current_field_context = None;
+                out.push(Token::Evaluated(std::sync::Arc::new(operand)));
+                i = end;
+            }
+
             b'\'' => {
                 // A string literal. `''` inside one is an escaped quote, not
                 // the end: `'O''Brien'` is one literal, and reading it as two
@@ -471,7 +541,10 @@ fn tokenize_inner<'a>(
                         j += 1;
                     }
                     if j >= bytes.len() {
-                        return Err(format!("unclosed string literal starting at position {}", i));
+                        return Err(format!(
+                            "unclosed string literal starting at position {}",
+                            i
+                        ));
                     }
                     lit.push_str(&s[segment..j]);
                     if bytes.get(j + 1) == Some(&b'\'') {
@@ -498,6 +571,7 @@ fn tokenize_inner<'a>(
                     i += 1;
                     i = unsafe { scan_digits_simd(bytes, i) };
                 }
+                i = exponent_end(bytes, i);
 
                 let num_str = unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) };
 
@@ -505,35 +579,52 @@ fn tokenize_inner<'a>(
                     parse_numeric_value(num_str, &current_field_context, &expression_type_context)?;
 
                 let num_type = numeric_value_to_db_type(&numeric_value);
+                let numeric_context = [
+                    expression_type_context.as_ref(),
+                    current_field_context.as_ref().map(|(_, t, _)| t),
+                ]
+                .contains(&Some(&DbType::DECIMAL));
                 if expression_type_context.is_none() {
                     expression_type_context = Some(num_type);
                 }
 
-                out.push(Token::Number(numeric_value));
+                if numeric_value_is_lossy_fraction(num_str, &numeric_value) {
+                    lossy_fractions.push((out.len(), num_str.to_string()));
+                }
+                out.push(number_token(num_str, numeric_value, numeric_context));
             }
 
             b'-' if is_negative_number_start(&out, bytes, i) => {
-                // Handle negative numbers
-                let start = i;
-                i += 1;
-                i = unsafe { scan_digits_simd(bytes, i) };
+                // Handle negative numbers, the sign's spaces dropped.
+                let start = digits_after_sign(bytes, i);
+                i = unsafe { scan_digits_simd(bytes, start) };
 
                 if i < bytes.len() && bytes[i] == b'.' {
                     i += 1;
                     i = unsafe { scan_digits_simd(bytes, i) };
                 }
+                i = exponent_end(bytes, i);
 
-                let num_str = unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) };
+                let signed = format!("-{}", unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) });
+                let num_str = signed.as_str();
 
                 let numeric_value =
                     parse_numeric_value(num_str, &current_field_context, &expression_type_context)?;
 
                 let num_type = numeric_value_to_db_type(&numeric_value);
+                let numeric_context = [
+                    expression_type_context.as_ref(),
+                    current_field_context.as_ref().map(|(_, t, _)| t),
+                ]
+                .contains(&Some(&DbType::DECIMAL));
                 if expression_type_context.is_none() {
                     expression_type_context = Some(num_type);
                 }
 
-                out.push(Token::Number(numeric_value));
+                if numeric_value_is_lossy_fraction(num_str, &numeric_value) {
+                    lossy_fractions.push((out.len(), num_str.to_string()));
+                }
+                out.push(number_token(num_str, numeric_value, numeric_context));
             }
 
             _ if is_id_start_fast(c) => {
@@ -543,36 +634,54 @@ fn tokenize_inner<'a>(
 
                 let id = unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) };
 
-                let id_lower: String = id.to_lowercase();
+                // ASCII, the common case, needs no lowered copy. Anything else
+                // is lowered as Unicode lowers it, as it always was: a
+                // non-ASCII letter can lower to an ASCII one.
+                let lowered;
+                let id_lower: &str = if id.is_ascii() && !id.bytes().any(|b| b.is_ascii_uppercase()) {
+                    id
+                } else {
+                    lowered = id.to_lowercase();
+                    &lowered
+                };
 
-                // Check for special operators using pre-computed maps
-                if let Some(normalized) = field_lookup.string_ops.get(&id_lower) {
+                // Check for special operators
+                if let Some(normalized) = string_op(id_lower) {
                     // For string operations, we need to determine the type from context or schema
                     // Since these are operators, we might want to use the current expression type
                     // A string operator with nothing before it — `WHERE like 'x'`,
                     // or a column that happens to share an operator's name —
                     // has no operand type to take; refused rather than unwrapped.
                     let Some(op_type) = expression_type_context.clone() else {
-                        return Err(format!(
-                            "operator {} has no left-hand operand",
-                            normalized
-                        ));
+                        return Err(format!("operator {} has no left-hand operand", normalized));
                     };
-                    out.push(Token::Ident((normalized.clone(), op_type, 0)));
+                    out.push(Token::Ident((normalized.to_string(), op_type, 0)));
                     continue;
                 }
 
-                if let Some(normalized) = field_lookup.logical_ops.get(&id_lower) {
-                    out.push(Token::Next(normalized.clone()));
+                if let Some(normalized) = logical_op(id_lower) {
+                    out.push(Token::Next(normalized.to_string()));
+                    expression_type_context = None;
+                    current_field_context = None;
+                    continue;
+                }
+
+                // `NOT` before one comparison, which the rewrite emits only
+                // where an operator has no complement to become. An `Ident`
+                // rather than a `Next`, so the index extractors read it as part
+                // of the comparison it negates — an opaque one — rather than
+                // as a connective they do not know.
+                if id_lower == "not" && field_named(schema, id).is_none() {
+                    out.push(Token::Ident(("NOT".to_string(), DbType::BOOL, 0)));
                     expression_type_context = None;
                     current_field_context = None;
                     continue;
                 }
 
                 // Check if this is a field name in the schema
-                if let Some((canonical_name, field_type, write_order)) =
-                    field_lookup.map.get(&id.to_string())
-                {
+                if let Some(field) = field_named(schema, id) {
+                    let (canonical_name, field_type, write_order) =
+                        (Cow::Borrowed(&field.name), &field.db_type, &field.write_order);
                     current_field_context = Some((
                         canonical_name.clone(),
                         field_type.clone(),
@@ -596,6 +705,13 @@ fn tokenize_inner<'a>(
                     if let Some(end) = json_path_extent(bytes, i) {
                         let text = unsafe { std::str::from_utf8_unchecked(&bytes[start..end]) };
                         if let Some(path) = crate::core::jsonb::parse_path_expression(text) {
+                            // On a column holding no document: PostgreSQL's
+                            // `text ->> unknown`. Compiled, the text was read
+                            // as an encoded document, matched nothing, and
+                            // `s->>'a' IS NULL` kept every row.
+                            if let Some(refused) = crate::core::rql::expr::path_operator_refusal(field, text) {
+                                return Err(refused);
+                            }
                             i = end;
                             // `->>` is text; `->` yields a document.
                             let result_type = if path.as_text {
@@ -609,6 +725,7 @@ fn tokenize_inner<'a>(
                                 write_order: *write_order,
                                 steps: path.steps,
                                 as_text: path.as_text,
+                                json_text: field.json_text,
                             });
                             continue;
                         }
@@ -619,6 +736,43 @@ fn tokenize_inner<'a>(
                         field_type.clone(),
                         write_order.clone(),
                     )));
+                } else if let Some(db_type) = typed_literal_type(&id, bytes, i) {
+                    // `POINT '(1,2)'`, `inet '10.0.0.0/8'`, `INTERVAL '1 day'`
+                    // — PostgreSQL's typed-literal syntax, which is defined to
+                    // mean exactly what `'…'::type` means.
+                    //
+                    // So it is lexed as exactly that: the string, then a cast.
+                    // Compiling it to the form the parser already handles is
+                    // what keeps one implementation of what a cast does, rather
+                    // than a second that could disagree with it.
+                    let mut j = unsafe { skip_whitespace_simd(bytes, i) };
+                    let mut lit = String::new();
+                    let mut segment = j + 1;
+                    j += 1;
+                    loop {
+                        while j < bytes.len() && bytes[j] != b'\'' {
+                            j += 1;
+                        }
+                        if j >= bytes.len() {
+                            return Err(format!(
+                                "unclosed string literal after the type name '{}'",
+                                id
+                            ));
+                        }
+                        lit.push_str(&s[segment..j]);
+                        if bytes.get(j + 1) == Some(&b'\'') {
+                            lit.push('\'');
+                            j += 2;
+                            segment = j;
+                            continue;
+                        }
+                        break;
+                    }
+                    out.push(Token::StringLit(lit));
+                    out.push(Token::Cast(db_type.clone()));
+                    i = j + 1;
+                    expression_type_context = Some(db_type);
+                    current_field_context = None;
                 } else {
                     // Validate field reference
                     if i < bytes.len() {
@@ -635,7 +789,10 @@ fn tokenize_inner<'a>(
                                 || (next_i + 8 <= bytes.len()
                                     && &bytes[next_i..next_i + 8] == b"ENDSWITH")
                             {
-                                return Err(format!("unknown column '{}' is not defined in the schema", id));
+                                return Err(format!(
+                                    "unknown column '{}' is not defined in the schema",
+                                    id
+                                ));
                             }
                         }
                     }
@@ -643,7 +800,19 @@ fn tokenize_inner<'a>(
                     // For identifiers not found in schema, this should probably be an error
                     // since all valid fields should be in the schema
                     // But if you want to allow unknown identifiers, you could use a default type
-                    return Err(format!("unknown identifier '{}' is not defined in the schema", id));
+                    // Right after a value, a word is where an operator or a
+                    // keyword goes: `x = 1 LIMT 1`, `x = 1 ANDD v = 2`, `0x10`.
+                    // A syntax error (42601), not an unknown column.
+                    if matches!(
+                        out.last(),
+                        Some(Token::Number(_) | Token::StringLit(_) | Token::Ident(_) | Token::RPar | Token::JsonPath { .. })
+                    ) {
+                        return Err(format!("syntax error at or near \"{}\"", id));
+                    }
+                    return Err(format!(
+                        "unknown identifier '{}' is not defined in the schema",
+                        id
+                    ));
                 }
             }
 
@@ -673,6 +842,22 @@ fn tokenize_inner<'a>(
                     }
                     in_parentheses -= 1;
                 }
+            }
+
+            // PostgreSQL's structural operators, matched before the ordered
+            // comparisons below so `<@` is not cut into `<` and a stray `@`.
+            // The list is longest-first, which is what keeps `<<=` whole.
+            _ if crate::core::tokenizer::predicate_rewrite::PG_OPERATORS
+                .iter()
+                .any(|sym| bytes[i..].starts_with(sym.as_bytes())) =>
+            {
+                let symbol = crate::core::tokenizer::predicate_rewrite::PG_OPERATORS
+                    .iter()
+                    .find(|sym| bytes[i..].starts_with(sym.as_bytes()))
+                    .expect("the guard just found one");
+                out.push(Token::Op((*symbol).to_string()));
+                i += symbol.len();
+                current_field_context = None;
             }
 
             b'<' | b'>' | b'!' | b'=' => {
@@ -721,7 +906,45 @@ fn tokenize_inner<'a>(
                 while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
                     k += 1;
                 }
-                let name = unsafe { std::str::from_utf8_unchecked(&bytes[name_start..k]) };
+                // A type named in several words: `::double precision` read
+                // as `double` was "unknown type 'double' in a cast".
+                let mut phrase_name: Option<&str> = None;
+                for phrase in [
+                    "double precision",
+                    "character varying",
+                    "bit varying",
+                    "timestamp with time zone",
+                    "timestamp without time zone",
+                    "time with time zone",
+                    "time without time zone",
+                ] {
+                    let mut at = name_start;
+                    let mut matched = true;
+                    for (n, word) in phrase.split(' ').enumerate() {
+                        if n > 0 {
+                            let gap = bytes[at..].iter().take_while(|b| b.is_ascii_whitespace()).count();
+                            if gap == 0 {
+                                matched = false;
+                                break;
+                            }
+                            at += gap;
+                        }
+                        let end = at + word.len();
+                        if !bytes.get(at..end).is_some_and(|w| w.eq_ignore_ascii_case(word.as_bytes()))
+                            || bytes.get(end).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                        {
+                            matched = false;
+                            break;
+                        }
+                        at = end;
+                    }
+                    if matched {
+                        k = at;
+                        phrase_name = Some(phrase);
+                        break;
+                    }
+                }
+                let name = phrase_name.unwrap_or(unsafe { std::str::from_utf8_unchecked(&bytes[name_start..k]) });
                 let Some(db_type) = crate::core::rql::expr::db_type_of_cast(name) else {
                     return Err(format!("unknown type '{}' in a cast", name));
                 };
@@ -733,8 +956,145 @@ fn tokenize_inner<'a>(
             _ => return Err(format!("unexpected character '{}'", c as char)),
         }
     }
+    local_timestamp_literals(&mut out, schema);
 
+    // `0.12345678912300000001 > a`: read before the column, so with no
+    // NUMERIC beside it, the literal became a float that is another number.
+    // Kept as its text, as `number_token` keeps one written after the column.
+    for (at, text) in lossy_fractions {
+        let compared_with_numeric = matches!(out.get(at + 1), Some(Token::Op(_)))
+            && matches!(out.get(at + 2), Some(Token::Ident((_, DbType::DECIMAL, _))));
+        if compared_with_numeric && matches!(out.get(at), Some(Token::Number(NumericValue::F64(_)))) {
+            out[at] = Token::StringLit(text);
+        }
+    }
+    canonicalize_bpchar_literals(&mut out, schema);
     Ok(out)
+}
+
+/// A string compared with a `character(n)` column, read as the type reads
+/// it: without its trailing spaces.
+///
+/// Such a column is stored that way (`type_modifier::TextTypmod`), so
+/// `k = 'b  '` has to look for `'b'` — which is what PostgreSQL's `bpchareq`
+/// compares — or it answers from a value the column cannot hold. Done on the
+/// tokens, the one form every reader of a predicate shares: the scan's
+/// comparisons, the filter index (`sarg`), the secondary indexes, the
+/// prefilter, a partition's routing and a point update's key stripe all plan
+/// from them. `IN` and `BETWEEN` reach here as the comparisons they mean.
+/// The pattern operators read the padded value and are lifted before this
+/// (`predicate_rewrite::lift_evaluated_operands`).
+fn canonicalize_bpchar_literals(out: &mut SmallVec<[Token; 36]>, schema: &SmallVec<[SchemaField; 20]>) {
+    use crate::core::rql::type_modifier::TextTypmod;
+    // Only a string literal is rewritten; most statements have none beside
+    // a column, and this runs on every one.
+    if !out.iter().any(|t| matches!(t, Token::StringLit(_))) {
+        return;
+    }
+    // A cast to `character(n)` yields one too (`s::char(5) = 'ab '`), over
+    // a table that has no such column.
+    if !schema.iter().any(|f| matches!(f.text_typmod(), Some(TextTypmod::Bpchar(_))))
+        && !out.iter().any(|t| matches!(t, Token::Evaluated(operand) if operand.is_bpchar()))
+    {
+        return;
+    }
+    let bpchar = |t: &Token| match t {
+        Token::Ident((name, DbType::STRING, wo)) => schema.iter().any(|f| {
+            f.write_order == *wo && !f.is_deleted && f.name == *name && matches!(f.text_typmod(), Some(TextTypmod::Bpchar(_)))
+        }),
+        Token::Evaluated(operand) => operand.is_bpchar(),
+        _ => false,
+    };
+    let comparison = |t: &Token| {
+        matches!(t, Token::Op(op) if matches!(op.as_str(), "=" | "==" | "!=" | "<>" | "<" | "<=" | ">" | ">="))
+    };
+    for j in 0..out.len() {
+        if !matches!(out[j], Token::StringLit(_)) {
+            continue;
+        }
+        let after_column = j >= 2 && comparison(&out[j - 1]) && bpchar(&out[j - 2]);
+        let before_column = j + 2 < out.len() && comparison(&out[j + 1]) && bpchar(&out[j + 2]);
+        if after_column || before_column {
+            if let Token::StringLit(text) = &mut out[j] {
+                let kept = text.trim_end_matches(' ').len();
+                text.truncate(kept);
+            }
+        }
+    }
+}
+
+/// A string compared with a `timestamp` (without time zone) column, read as
+/// that type reads it: its zone, if it has one, discarded.
+///
+/// Such a column is a `DATETIME` that keeps a literal's wall-clock time
+/// (`SchemaField::without_time_zone`), so `ts = '2024-01-01 10:00:00+02'`
+/// has to look for 10:00, as PostgreSQL's `timestamp` comparison does, and
+/// not for the 08:00 UTC instant the text names: read that way, a value the
+/// column holds was not found. Done on the tokens, the form every reader of a
+/// predicate shares (the scan's comparisons, the filter index, the secondary
+/// indexes, the prefilter, partition routing); `IN` and `BETWEEN` reach here
+/// as the comparisons they mean. The literal is rewritten in the form every
+/// one of them reads as the same microseconds. A literal under a cast is left
+/// alone: `::timestamptz` names an instant.
+fn local_timestamp_literals(out: &mut SmallVec<[Token; 36]>, schema: &SmallVec<[SchemaField; 20]>) {
+    if !schema.iter().any(|f| f.without_time_zone && !f.is_deleted)
+        && !out.iter().any(|t| matches!(t, Token::Evaluated(operand) if operand.is_local_timestamp()))
+    {
+        return;
+    }
+    let local = |t: &Token| match t {
+        Token::Ident((name, DbType::DATETIME, wo)) => schema
+            .iter()
+            .any(|f| f.write_order == *wo && !f.is_deleted && f.name == *name && f.without_time_zone),
+        // An expression that is a `timestamp` too: `coalesce(a, …) > '…'`,
+        // `a + interval '1 hour' > '…'` (`expr::yields_timestamp`).
+        Token::Evaluated(operand) => operand.is_local_timestamp(),
+        _ => false,
+    };
+    let comparison = |t: &Token| {
+        matches!(t, Token::Op(op) if matches!(op.as_str(), "=" | "==" | "!=" | "<>" | "<" | "<=" | ">" | ">="))
+    };
+    for j in 0..out.len() {
+        if !matches!(out[j], Token::StringLit(_)) || matches!(out.get(j + 1), Some(Token::Cast(_))) {
+            continue;
+        }
+        let after_column = j >= 2 && comparison(&out[j - 1]) && local(&out[j - 2]);
+        let before_column = j + 2 < out.len() && comparison(&out[j + 1]) && local(&out[j + 2]);
+        if !(after_column || before_column) {
+            continue;
+        }
+        if let Token::StringLit(text) = &mut out[j] {
+            if let Some(us) = crate::core::value_codec::parse_timestamp_local_us(text) {
+                // Only a form that reads back as the same instant; anything
+                // else (a year past 9999) is left as written.
+                let local = crate::core::value_codec::format_timestamp_us(us);
+                if crate::core::value_codec::parse_timestamp_us(&local) == Some(us) {
+                    *text = local;
+                }
+            }
+        }
+    }
+}
+
+/// The type of a `TYPE 'literal'` at this position, or `None` when the
+/// identifier is not a type name or is not followed by a string.
+///
+/// Both conditions matter. A column may legitimately be called `path` or
+/// `line`, and treating the name as a type wherever it appeared would take a
+/// column reference away from a schema that has one — so the schema is
+/// consulted first (this runs in the `else` of that lookup) and a quote must
+/// follow.
+fn typed_literal_type(id: &str, bytes: &[u8], at: usize) -> Option<DbType> {
+    let db_type = crate::core::rql::expr::db_type_of_cast(id)?;
+    let mut j = at;
+    while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+        j += 1;
+    }
+    if bytes.get(j) == Some(&b'\'') {
+        Some(db_type)
+    } else {
+        None
+    }
 }
 
 // Rest of the helper functions remain the same but with optimized implementations
@@ -756,6 +1116,93 @@ fn parse_numeric_value<'a>(
     parse_default(value_str)
 }
 
+/// The token for a numeric literal: the number as it was read, except a
+/// fraction (or an integer past `bigint`) beside a NUMERIC that a float
+/// cannot hold, which keeps its text.
+///
+/// A fraction is read as an `f64`, and the planner re-reads that at the
+/// column's scale. Past a float's digits the re-read is another number:
+/// `nm = 1234567890123456.78` compared `1234567890123456.80` and returned that
+/// row instead, and so did `nm IN (SELECT nm …)`, whose values are written into
+/// the statement as text and read again here. The text is compared exactly,
+/// as a quoted number is.
+///
+/// Decided on the digits, not at the engine's nine places: past them both
+/// readings were "not a number" alike, so `a = 0.12345678912300000001`
+/// became 0.123456789123 and matched that row of a `NUMERIC(20,12)`.
+fn number_token(text: &str, value: NumericValue, numeric_context: bool) -> Token {
+    if let NumericValue::F64(f) = value {
+        if numeric_context && !float_holds_exactly(text) {
+            let written = crate::core::rql::expr::decimal_digits(text).map(normalise_digits);
+            let read = crate::core::rql::expr::decimal_digits(&format!("{}", f)).map(normalise_digits);
+            // More digits than an i128 holds is never what the float is.
+            if written != read && (written.is_some() || is_plain_decimal(text)) {
+                return Token::StringLit(text.to_string());
+            }
+        }
+    }
+    Token::Number(value)
+}
+
+/// A fraction read as a float that is not the number written.
+fn numeric_value_is_lossy_fraction(text: &str, value: &NumericValue) -> bool {
+    let NumericValue::F64(f) = value else {
+        return false;
+    };
+    if float_holds_exactly(text) {
+        return false;
+    }
+    let written = crate::core::rql::expr::decimal_digits(text).map(normalise_digits);
+    if written.is_none() {
+        return is_plain_decimal(text);
+    }
+    written != crate::core::rql::expr::decimal_digits(&format!("{}", f)).map(normalise_digits)
+}
+
+/// Whether `text` is a plain decimal (`[+-]digits[.digits]`, no exponent)
+/// of at most fifteen digits, which an `f64` reads and prints back as the
+/// same digits (`f64::DIGITS`): the float round-trip in [`number_token`]
+/// and [`numeric_value_is_lossy_fraction`] cannot find a difference, so it
+/// is not made — it formatted a float and read two decimals for every
+/// numeric literal of a statement on a NUMERIC column.
+fn float_holds_exactly(text: &str) -> bool {
+    let body = text.strip_prefix(['-', '+']).unwrap_or(text);
+    let mut digits = 0usize;
+    let mut points = 0usize;
+    for b in body.bytes() {
+        match b {
+            b'0'..=b'9' => digits += 1,
+            b'.' => points += 1,
+            _ => return false,
+        }
+    }
+    digits > 0 && points <= 1 && digits <= f64::DIGITS as usize
+}
+
+/// Digits with at most one point, an optional sign and exponent: a number
+/// as written, however long.
+fn is_plain_decimal(text: &str) -> bool {
+    let body = text.trim_start_matches(['-', '+']);
+    let mantissa = body.split(['e', 'E']).next().unwrap_or("");
+    !mantissa.is_empty()
+        && mantissa.bytes().any(|b| b.is_ascii_digit())
+        && mantissa.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && mantissa.bytes().filter(|b| *b == b'.').count() <= 1
+}
+
+/// `m × 10^e` with the trailing zeros of `m` moved into `e`, so equal
+/// numbers compare equal however they were written.
+fn normalise_digits((mut m, mut e): (i128, i32)) -> (i128, i32) {
+    if m == 0 {
+        return (0, 0);
+    }
+    while m % 10 == 0 {
+        m /= 10;
+        e += 1;
+    }
+    (m, e)
+}
+
 /// Parses the literal as the type of the column it is compared with.
 ///
 /// A literal the type cannot hold is an error, as it is in PostgreSQL. It
@@ -769,6 +1216,27 @@ fn parse_by_db_type(value_str: &str, db_type: &DbType) -> Result<NumericValue, S
         value_str
             .parse()
             .map_err(|_| format!("value {} is out of range for type {:?}", value_str, db_type))
+    }
+    // A fractional literal beside an integer is a fraction, not an integer that
+    // failed to parse: `i * 2.5` and `age > 2.5` are numeric in PostgreSQL. It
+    // stays a float, and the planner meets the two at a common type.
+    let integer = !matches!(db_type, DbType::F32 | DbType::F64);
+    if integer && value_str.contains(['.', 'e', 'E']) {
+        return parse_default(value_str);
+    }
+    // An integer the column's type cannot hold keeps its own type — `int4`
+    // or `int8`, as PostgreSQL types the constant — and the planner meets the
+    // two at a common type. Refusing it made `n * 3000000000 > 20000000000`
+    // an error over an `int4` column, where PostgreSQL answers it, and the
+    // comparison `age > 300` over a one-byte column is simply false there.
+    // What must never happen is the literal read as the column's zero, which
+    // this does not do.
+    if integer
+        && !matches!(db_type, DbType::I128 | DbType::U128)
+        && value_str.parse::<i64>().is_ok()
+        && !fits_integer_type(value_str, db_type)
+    {
+        return parse_default(value_str);
     }
     Ok(match db_type {
         DbType::I8 => NumericValue::I8(parse(value_str, db_type)?),
@@ -787,13 +1255,64 @@ fn parse_by_db_type(value_str: &str, db_type: &DbType) -> Result<NumericValue, S
     })
 }
 
+/// Whether an integer literal parses as `db_type` itself.
+fn fits_integer_type(value_str: &str, db_type: &DbType) -> bool {
+    match db_type {
+        DbType::I8 => value_str.parse::<i8>().is_ok(),
+        DbType::I16 => value_str.parse::<i16>().is_ok(),
+        DbType::I32 => value_str.parse::<i32>().is_ok(),
+        DbType::I64 => value_str.parse::<i64>().is_ok(),
+        DbType::U8 => value_str.parse::<u8>().is_ok(),
+        DbType::U16 => value_str.parse::<u16>().is_ok(),
+        DbType::U32 => value_str.parse::<u32>().is_ok(),
+        DbType::U64 => value_str.parse::<u64>().is_ok(),
+        _ => true,
+    }
+}
+
+/// Past an exponent, `e5`, `E-10` or `e+3`, that follows a number ending at
+/// `i`; `i` itself when none does. It was read as a word of its own, so
+/// `f > 1e-10` asked for a column `e`.
+fn exponent_end(bytes: &[u8], i: usize) -> usize {
+    if !matches!(bytes.get(i), Some(b'e' | b'E')) {
+        return i;
+    }
+    let mut j = i + 1;
+    if matches!(bytes.get(j), Some(b'+' | b'-')) {
+        j += 1;
+    }
+    let digits = j;
+    while bytes.get(j).is_some_and(u8::is_ascii_digit) {
+        j += 1;
+    }
+    // A letter after the digits makes it a word (`1e5x`), not an exponent.
+    if j == digits || bytes.get(j).is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_') {
+        return i;
+    }
+    j
+}
+
 #[inline(always)]
 fn parse_default(value_str: &str) -> Result<NumericValue, String> {
     let out_of_range = || format!("numeric literal {} is out of range", value_str);
-    if value_str.contains('.') {
-        Ok(NumericValue::F64(value_str.parse().map_err(|_| out_of_range())?))
+    if value_str.contains(['.', 'e', 'E']) {
+        Ok(NumericValue::F64(
+            value_str.parse().map_err(|_| out_of_range())?,
+        ))
     } else {
-        let parsed_num: i64 = value_str.parse().map_err(|_| out_of_range())?;
+        // Past `bigint` an integer constant is PostgreSQL's `numeric`. It
+        // is read as a float here, as a fraction is, and `number_token`
+        // keeps its digits beside a NUMERIC that the float does not hold:
+        // `w = 123456789012345678901234` over a NUMERIC(30,0) — and `w IN
+        // (SELECT w …)`, whose values are written back as such constants —
+        // was refused as out of range.
+        let Ok(parsed_num) = value_str.parse::<i64>() else {
+            let digits = value_str.strip_prefix(['-', '+']).unwrap_or(value_str);
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Ok(NumericValue::F64(value_str.parse().map_err(|_| out_of_range())?));
+            }
+            return Err(out_of_range());
+        };
         if parsed_num >= i32::MIN as i64 && parsed_num <= i32::MAX as i64 {
             Ok(NumericValue::I32(parsed_num as i32))
         } else {
@@ -875,6 +1394,76 @@ pub fn numeric_type_to_db_type(nv: &NumericValue) -> DbType {
 
 #[cfg(test)]
 mod tests {
+
+    /// A minus sign in a number's place reads as the number's sign whatever
+    /// spaces follow it: `k = - 6` tokenizes as `k = -6` does (the form
+    /// `predicate_rewrite` renders a negative literal in), and a binary
+    /// minus stays an operator.
+    ///
+    /// Mutation: `digits_after_sign` not skipping the spaces: `= - 6` is an
+    /// operator and a positive number again.
+    #[test]
+    fn a_spaced_sign_reads_as_the_numbers_own() {
+        let fields: SmallVec<[SchemaField; 20]> =
+            SmallVec::from_vec(vec![SchemaField::new("k".to_string(), DbType::I64, 8, 0, 0, false)]);
+        let toks = |s: &str| try_tokenize(s, &fields).unwrap_or_else(|e| panic!("{s}: {e}"));
+        for spaced in ["k = - 6", "k = -  6", "k = -\t6", "(k = - 6)", "k = 1 OR k = - 6"] {
+            let tight = spaced.replace("-\t", "-").replace("- ", "-").replace("- ", "-");
+            let (a, b) = (toks(spaced), toks(&tight));
+            assert_eq!(format!("{a:?}"), format!("{b:?}"), "`{spaced}` and `{tight}` tokenize differently");
+            assert!(
+                a.iter().any(|t| matches!(t, Token::Number(n) if format!("{n:?}").contains("-6"))),
+                "`{spaced}` has no -6: {a:?}"
+            );
+        }
+        // A binary minus is untouched.
+        let bin = toks("k - 6 = 0");
+        assert!(bin.iter().any(|t| matches!(t, Token::Op(o) if o == "-")), "{bin:?}");
+        assert!(!bin.iter().any(|t| matches!(t, Token::Number(n) if format!("{n:?}").contains("-6"))), "{bin:?}");
+    }
+
+    /// Every decimal `float_holds_exactly` lets past the round-trip is one
+    /// the round-trip finds equal: the shortcut never hides a lossy literal.
+    ///
+    /// Mutation: the fifteen-digit bound raised to seventeen.
+    #[test]
+    fn a_decimal_a_float_holds_skips_nothing_the_round_trip_would_catch() {
+        let mut texts: Vec<String> = Vec::new();
+        let mut seed: u64 = 0x5eed;
+        for _ in 0..20_000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let digits = 1 + (seed >> 59) as usize % 17;
+            let point = (seed >> 40) as usize % (digits + 1);
+            let mut text = String::new();
+            let mut s = seed;
+            for d in 0..digits {
+                if d == point && d > 0 {
+                    text.push('.');
+                }
+                text.push(char::from(b'0' + (s % 10) as u8));
+                s /= 10;
+                if s == 0 {
+                    s = seed ^ 0x9e3779b97f4a7c15;
+                }
+            }
+            texts.push(text);
+        }
+        texts.extend(["0.1", "1234567890.12345", "123456789012345", "0.000000000000001", "9999999999999.99"].map(String::from));
+        let mut held = 0;
+        for text in &texts {
+            if float_holds_exactly(text) {
+                held += 1;
+                let f: f64 = text.parse().expect("a number");
+                let written = crate::core::rql::expr::decimal_digits(text).map(normalise_digits);
+                let read = crate::core::rql::expr::decimal_digits(&format!("{}", f)).map(normalise_digits);
+                assert_eq!(written, read, "{text} read as {f}");
+            }
+        }
+        assert!(held > 10_000, "only {held} held");
+        assert!(!float_holds_exactly("1234567890123456.78"));
+        assert!(!float_holds_exactly("1e5"));
+    }
+
     use super::*;
 
     #[test]
@@ -915,26 +1504,37 @@ mod tests {
         let schema = create_schema_2();
         let toks = tokenize_inner("name = 'O''Brien'", &schema).expect("one literal");
         assert!(
-            toks.iter().any(|t| matches!(t, Token::StringLit(s) if s == "O'Brien")),
+            toks.iter()
+                .any(|t| matches!(t, Token::StringLit(s) if s == "O'Brien")),
             "got {:?}",
             toks
         );
         let toks = tokenize_inner("name = ''''", &schema).expect("a lone quote");
-        assert!(toks.iter().any(|t| matches!(t, Token::StringLit(s) if s == "'")));
+        assert!(
+            toks.iter()
+                .any(|t| matches!(t, Token::StringLit(s) if s == "'"))
+        );
         let toks = tokenize_inner("name = ''", &schema).expect("empty");
-        assert!(toks.iter().any(|t| matches!(t, Token::StringLit(s) if s.is_empty())));
+        assert!(
+            toks.iter()
+                .any(|t| matches!(t, Token::StringLit(s) if s.is_empty()))
+        );
     }
 
     /// A literal the column's type cannot hold used to parse as that type's
-    /// default, so `age > 300` on a `U8` column returned every row.
+    /// default, so `age > 300` on a `U8` column returned every row. It keeps
+    /// its own integer type now, as PostgreSQL's constant does, rather than
+    /// being refused — and never becomes the column's zero.
     #[test]
-    fn an_out_of_range_literal_is_refused_rather_than_read_as_zero() {
+    fn an_out_of_range_literal_keeps_its_own_type_rather_than_read_as_zero() {
         let schema = create_schema_2();
-        let err = tokenize_inner("age > 300", &schema).expect_err("300 does not fit a U8");
-        assert!(err.contains("out of range"), "{err}");
-        let err = tokenize_inner("age = -1", &schema).expect_err("-1 does not fit a U8");
-        assert!(err.contains("out of range"), "{err}");
-        assert!(tokenize_inner("age > 200", &schema).is_ok());
+        let toks = tokenize_inner("age > 300", &schema).expect("300 is an int4");
+        assert!(toks.contains(&Token::Number(NumericValue::I32(300))), "{toks:?}");
+        let toks = tokenize_inner("age = -1", &schema).expect("-1 is an int4");
+        assert!(toks.contains(&Token::Number(NumericValue::I32(-1))), "{toks:?}");
+        let toks = tokenize_inner("age > 200", &schema).expect("200 fits a U8");
+        assert!(toks.contains(&Token::Number(NumericValue::U8(200))), "{toks:?}");
+        assert!(tokenize_inner("age > 99999999999999999999", &schema).is_err());
     }
 
     fn create_schema_2() -> SmallVec<[SchemaField; 20]> {
@@ -1035,20 +1635,28 @@ mod tests {
         schema.push(SchemaField {
             name: "field1".to_string(),
             db_type: DbType::F64,
+            without_time_zone: false,
+            json_text: false,
             is_deleted: false,
             size: 0,
             offset: 0,
             write_order: 5,
             is_unique: false,
+            scale: None,
+            typmod_packed: None,
         });
         schema.push(SchemaField {
             name: "field2".to_string(),
             db_type: DbType::F64,
+            without_time_zone: false,
+            json_text: false,
             is_deleted: false,
             size: 0,
             offset: 0,
             write_order: 10,
             is_unique: false,
+            scale: None,
+            typmod_packed: None,
         });
         let tokens = tokenize("field1 + field2", &schema);
         assert_eq!(tokens.len(), 3);

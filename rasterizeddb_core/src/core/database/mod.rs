@@ -1,17 +1,132 @@
 pub mod catalog;
+pub mod incompat;
+pub mod index_checkpoint;
+#[cfg(test)]
+mod catalogue_present_tests;
+#[cfg(test)]
+mod incarnation_tests;
 #[cfg(test)]
 mod native_authz_tests;
 #[cfg(test)]
+mod native_catalog_tests;
+#[cfg(test)]
+mod native_statement_tests;
+#[cfg(test)]
+mod name_guard_tests;
+#[cfg(test)]
+mod sidecar_clash_tests;
+#[cfg(test)]
 mod rename_tests;
+#[cfg(test)]
+mod recovery_refusal_tests;
+#[cfg(test)]
+mod drop_recreate_replay_tests;
+#[cfg(all(test, feature = "storage_pools"))]
+mod cross_dir_commit_tests;
+#[cfg(all(test, feature = "storage_pools"))]
+mod partition_placement_tests;
+#[cfg(all(test, feature = "storage_pools", feature = "kv_storage"))]
+mod partition_store_tests;
+#[cfg(test)]
+mod txid_reuse_tests;
+mod create_intent;
+#[cfg(test)]
+mod create_failure_tests;
+mod foreign_keys;
+pub(crate) mod partitioned;
+mod partitioned_ddl;
+#[cfg(test)]
+mod partitioned_ddl_tests;
+#[cfg(test)]
+mod partitioned_tests;
+#[cfg(test)]
+mod partition_resident_tests;
+#[cfg(test)]
+mod lazy_resident_tests;
+#[cfg(test)]
+mod cap_scale_tests;
+#[cfg(test)]
+mod relation_dispatch_tests;
+#[cfg(test)]
+mod reaper_tests;
+#[cfg(test)]
+mod reshape_tests;
+#[cfg(test)]
+mod row_move_tests;
+#[cfg(test)]
+mod physical_alter_tests;
+#[cfg(test)]
+mod convert_tests;
+pub mod relation;
+pub mod slots;
+pub mod table_for;
+pub mod reload;
+pub(crate) mod rewrite;
+pub(crate) mod block_ddl;
+#[cfg(test)]
+mod block_ddl_tests;
+#[cfg(test)]
+mod rewrite_tests;
+#[cfg(test)]
+mod reload_tests;
+#[cfg(test)]
+mod slots_source_tests;
+#[cfg(test)]
+mod slots_tests;
 
-use std::{
-    fmt, io,
-    sync::atomic::AtomicU64,
-};
+pub use relation::Relation;
+pub use slots::{RelationTotals, SchemaStats, SchemaView};
 
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    thread_local! {
+        /// Fails the next catalogue tombstone on this thread before it is
+        /// written: the first step of a drop failing.
+        pub static FAIL_TOMBSTONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Fails the next catalogue row write on this thread before it is
+        /// written: a CREATE failing at its commit point.
+        pub static FAIL_CATALOGUE_ROW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Runs inside `Database::sync_durable` on this thread, after every
+        /// non-root location's log is synced and before the root's: the window
+        /// another session's commit can fall into.
+        pub static AFTER_POOL_SYNC: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            const { std::cell::RefCell::new(None) };
+
+        /// Fails the next sync of a non-root location's log on this thread, as
+        /// a device error would, without poisoning the shared log: the error
+        /// paths of every committer that syncs those logs before committing.
+        pub static FAIL_POOL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Fails the next copy of staged outcomes into the status file on
+        /// this thread, after the log holding them has synced: the one half
+        /// of a commit sync that can fail with the commit already durable.
+        pub static FAIL_STAGED_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Fails the next deletion of the rename intent on this thread.
+        pub static FAIL_INTENT_CLEAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    type Park = (String, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>);
+
+    /// `create_partitioned_table` calls of the named tables, parked after
+    /// their files and before their catalogue row: each signals its first
+    /// `Notify` and waits on its second. Process-wide, since a statement can
+    /// move threads; keyed by name so parallel tests do not meet.
+    pub static PARK_PARTITIONED_CREATE: std::sync::Mutex<Vec<Park>> = std::sync::Mutex::new(Vec::new());
+
+    pub(crate) fn take_partitioned_create_park(
+        name: &str,
+    ) -> Option<(std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>)> {
+        let mut parks = PARK_PARTITIONED_CREATE.lock().unwrap_or_else(|p| p.into_inner());
+        let at = parks.iter().position(|(n, _, _)| n == name)?;
+        let (_, parked, release) = parks.swap_remove(at);
+        Some((parked, release))
+    }
+}
+
+use std::{fmt, io, sync::atomic::AtomicU64};
+
+use cacheguard::CacheGuard;
 use rclite::Arc;
 use std::sync::Arc as StdArc;
-use cacheguard::CacheGuard;
 
 use crate::core::mvcc::TransactionManager;
 use crate::core::mvcc::status::StatusLog;
@@ -22,14 +137,20 @@ use rastcp::server::{TcpServer, TcpServerBuilder};
 use smallvec::{SmallVec, smallvec};
 
 use crate::{
+    SERVER_PORT,
     core::{
-        db_type::DbType, processor::concurrent_processor::ConcurrentProcessor, row::{
+        db_type::DbType,
+        processor::concurrent_processor::ConcurrentProcessor,
+        row::{
             row::{ColumnFetchingData, ColumnWritePayload, RowFetch, RowWrite},
             row_pointer::{RowPointer, RowPointerIterator},
             schema::{SchemaCalculator, SchemaField, TableSchema},
             table::Table,
-        }, rql::{executor::execute, lexer_ct::CreateTable, lexer_s1::recognize_query_purpose}, storage_providers::{backend::DbStorageProvider, traits::StorageIO}
-    }, memory_pool::MEMORY_POOL, SERVER_PORT
+        },
+        rql::{executor::execute_as, lexer_ct::CreateTable, lexer_s1::recognize_query_purpose},
+        storage_providers::{backend::DbStorageProvider, traits::StorageIO},
+    },
+    memory_pool::MEMORY_POOL,
 };
 
 /// Where the native listener binds.
@@ -49,6 +170,60 @@ pub const NATIVE_LISTEN_ADDR: &str = "127.0.0.1";
 pub struct NativeListen {
     pub addr: String,
     pub port: u16,
+    /// Whether the TCP address is served at all. Off serves the unix socket
+    /// alone, which then has to be configured.
+    pub tcp: bool,
+    /// A unix socket served alongside the TCP address, for clients on the
+    /// same machine. `None` serves TCP only.
+    pub socket: Option<NativeSocket>,
+    /// How long one request may run before it is abandoned and answered as
+    /// timed out, on both the TCP address and the socket; a connection idle
+    /// this long is also closed. `None` is rastcp's default, 30 s.
+    /// `--rdb-request-timeout`.
+    pub request_timeout: Option<std::time::Duration>,
+    /// The TCP listener's certificate chain and private key, as PEM file
+    /// paths (`--rdb-cert`, `--rdb-key`). `None` makes a self-signed
+    /// certificate at every start, which a client can encrypt to but never
+    /// verify.
+    pub certificate: Option<(String, String)>,
+}
+
+/// The native protocol on a unix socket: no TLS, no TCP stack, and the
+/// caller's operating-system user known from the kernel.
+#[derive(Debug, Clone)]
+pub struct NativeSocket {
+    pub path: std::path::PathBuf,
+    /// The socket file's permissions. Connecting needs write permission, so
+    /// `0o600` admits the server's own user only and `0o660` its group too.
+    /// With authentication off, a mode that admits anyone else is refused.
+    pub mode: u32,
+    /// The group that owns the socket file, so that its members may connect.
+    pub group: Option<u32>,
+    /// How callers on the socket authenticate. `None` uses the TCP listener's
+    /// method. [`crate::auth::AuthMethod::Peer`] is offered here and nowhere
+    /// else.
+    pub method: Option<crate::auth::AuthMethod>,
+}
+
+impl NativeSocket {
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            mode: rastcp::server::DEFAULT_UNIX_MODE,
+            group: None,
+            method: None,
+        }
+    }
+
+    /// Whether users outside the socket file's owner and group can connect.
+    ///
+    /// The owner and the group are people an operator chose: putting a
+    /// service's user in the server's group is how a socket is shared on
+    /// purpose. Anyone else is not, so a socket that admits them has to
+    /// authenticate.
+    pub fn admits_others(&self) -> bool {
+        self.mode & 0o007 != 0
+    }
 }
 
 impl Default for NativeListen {
@@ -56,6 +231,10 @@ impl Default for NativeListen {
         Self {
             addr: NATIVE_LISTEN_ADDR.to_string(),
             port: SERVER_PORT,
+            tcp: true,
+            socket: None,
+            request_timeout: None,
+            certificate: None,
         }
     }
 }
@@ -65,6 +244,10 @@ impl NativeListen {
         Self {
             addr: addr.into(),
             port,
+            tcp: true,
+            socket: None,
+            request_timeout: None,
+            certificate: None,
         }
     }
 
@@ -92,12 +275,14 @@ impl fmt::Display for NativeListen {
 ///
 /// A predecessor that was killed mid-connection can keep the port busy for a
 /// moment while its sockets drain. SO_REUSEADDR covers the usual case, so a
-/// bind that still fails after a few retries means someone else holds the port
-/// - say so instead of dumping a backtrace on an unwrap.
+/// bind that still fails after a few retries means someone else holds the port.
+/// That is an error naming the way out, not a panic: a second server started
+/// on the same host without its own port died with a backtrace after its unix
+/// socket was already up, and the cause took a while to find.
 async fn bind_native_listener(
     listen: &NativeListen,
     authenticator: Option<StdArc<dyn rastcp::session::ServerAuthenticator>>,
-) -> TcpServer {
+) -> std::io::Result<TcpServer> {
     const BIND_ATTEMPTS: u32 = 5;
     const BIND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -105,14 +290,26 @@ async fn bind_native_listener(
 
     for attempt in 1..=BIND_ATTEMPTS {
         let mut builder = TcpServerBuilder::new(&listen.addr, listen.port);
+        if let Some(timeout) = listen.request_timeout {
+            builder = builder.request_timeout(timeout);
+        }
+        if let Some((cert, key)) = &listen.certificate {
+            let invalid = |e: rastcp::error::RastcpError| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+            };
+            builder = builder.with_certificates(
+                rastcp::tls::load_certificates(cert).map_err(invalid)?,
+                rastcp::tls::load_private_key(key).map_err(invalid)?,
+            );
+        }
         if let Some(authenticator) = authenticator.clone() {
             builder = builder.authenticator(authenticator);
         }
 
         match builder.build().await {
-            Ok(server) => return server,
+            Ok(server) => return Ok(server),
             Err(e) => {
-                error!(
+                warn!(
                     "Could not bind {} (attempt {}/{}): {}",
                     listen, attempt, BIND_ATTEMPTS, e
                 );
@@ -125,12 +322,22 @@ async fn bind_native_listener(
         }
     }
 
-    panic!(
-        "Could not bind {listen} after {BIND_ATTEMPTS} attempts: {error}. \
-         Another instance is most likely still running - check with `ss -ltnp | grep {port}`.",
-        port = listen.port,
-        error = last_error.expect("a failed bind always records an error"),
-    );
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        format!(
+            "the native protocol's TCP listener could not bind {listen} after {BIND_ATTEMPTS} attempts \
+             ({error}). Another server most likely holds the port: check with `ss -ltnp | grep {port}`. \
+             To run a second server on this host, give it --rdb-port <another port>, or --rdb-tcp off \
+             to serve only its unix socket.{socket}",
+            port = listen.port,
+            error = last_error.expect("a failed bind always records an error"),
+            socket = match listen.socket.as_ref() {
+                Some(_) => " Its unix socket was already bound; the server stops rather than run \
+                            reachable on one listener and not the other.",
+                None => "",
+            },
+        ),
+    ))
 }
 
 /// The database a client reaches when its connection names none, and the one
@@ -157,13 +364,46 @@ fn next_database_id() -> u64 {
 /// [`Database::commit_transaction`] and consumed by
 /// [`Database::publish_transaction`]: the set is only reliably answerable at
 /// commit, and threading it through makes that impossible to get wrong.
-#[derive(Debug, Clone)]
-pub struct TransactionFamily(Vec<(crate::core::mvcc::TxId, bool)>);
+///
+/// It also carries the transaction's replication record, written just ahead
+/// of the commit (`Replication::prepare_family`). Publishing releases it to
+/// the peers; a family dropped without being published releases it too,
+/// because the transaction did commit and a record left unsettled would hold
+/// back every transaction after it. An abort voids the record first, and the
+/// drop then finds nothing to release.
+#[derive(Debug)]
+pub struct TransactionFamily {
+    members: Vec<(crate::core::mvcc::TxId, bool)>,
+    /// The id the commit was asked for, and what its record is settled
+    /// through.
+    record: Option<(
+        crate::core::mvcc::TxId,
+        StdArc<crate::replication::Replication>,
+        StdArc<TransactionManager>,
+    )>,
+}
 
 impl TransactionFamily {
     /// Every id, whether or not its writes survived.
     pub fn ids(&self) -> Vec<crate::core::mvcc::TxId> {
-        self.0.iter().map(|(id, _)| *id).collect()
+        self.members.iter().map(|(id, _)| *id).collect()
+    }
+}
+
+impl Drop for TransactionFamily {
+    fn drop(&mut self) {
+        let Some((root, replication, transactions)) = self.record.take() else {
+            return;
+        };
+        if !replication.is_prepared(root) {
+            return;
+        }
+        // Committed and never published. Its outcome goes into the log first,
+        // so the release below waits for a sync that covers it.
+        if let Err(e) = transactions.flush_deferred() {
+            warn!("Could not record a transaction outcome before releasing its replication record: {}", e);
+        }
+        replication.release(root);
     }
 }
 
@@ -174,10 +414,26 @@ impl TransactionFamily {
 /// this feature listed four entries and omitted `.db` — the row data itself —
 /// which would have moved the schema and the pointers while orphaning every
 /// row, leaving pointers resolving into a file that no longer existed. The list
-/// is asserted against `Table::new_with_constraints` by
-/// `the_rename_file_list_matches_what_a_table_creates`, so a sixth sidecar
-/// added later fails that test rather than being silently left behind.
-const RENAMED_SUFFIXES: &[&str] = &[
+/// is asserted against the files a real table produces by
+/// `the_rename_file_list_matches_what_a_table_creates`, so a sidecar added
+/// later fails that test rather than being silently left behind.
+///
+/// That guard was itself short for a while, and the three entries it missed say
+/// what to watch for: several sidecars are opened only when a schema is
+/// *loaded*, so a table that has been created and never reopened has fewer
+/// files on disk than the same table after a restart. Checking a
+/// freshly-created table is checking the smaller set. `CHK`, `GEN` and `PIX`
+/// sat outside this list that way — a rename dropped a table's CHECK
+/// constraints, its generated columns and its JSON path indexes, and left the
+/// files under the old name for the next table to inherit.
+///
+/// It is also the one list of every file a table can own, which is what the
+/// name guard reads: two tables share a file exactly when one's name plus one
+/// suffix is the other's plus another (`x_pointers` + `.db` is `x` +
+/// `_pointers.db`), so a suffix missing here is a pair of names the guard lets
+/// through. `sidecar_clash_tests` reads every `.db` name built anywhere in
+/// `src/` and fails on one whose suffix is not listed.
+pub(crate) const RENAMED_SUFFIXES: &[&str] = &[
     // Row data. First deliberately: it is the one whose absence is silent.
     ".db",
     "_pointers.db",
@@ -189,6 +445,12 @@ const RENAMED_SUFFIXES: &[&str] = &[
     "_schema_UK.db",
     "_schema_JSON.db",
     "_schema_TYP.db",
+    "_schema_CHK.db",
+    "_schema_GEN.db",
+    "_schema_PIX.db",
+    // `CREATE INDEX` declarations. The indexes themselves are rebuilt in
+    // memory at open; this is what says which ones to build.
+    "_schema_IDX.db",
     // Derived: the filter rebuilds from the pointers and the sequence from
     // `load_id_sequence`, so a failure to copy either is recoverable. They are
     // copied anyway because copying is cheaper than rebuilding.
@@ -196,8 +458,321 @@ const RENAMED_SUFFIXES: &[&str] = &[
     "_seq.db",
 ];
 
+/// Whether `file` is one of table `table`'s: a name [`table_file_names`]
+/// gives, or a schema sidecar — `_schema_` and an upper-case tag — which is
+/// created when first used and so is not always on that list. Lower case is
+/// left out: `a_schema_x` is a table name of its own, and `a` claiming its
+/// files would copy them as `a`'s.
+pub(crate) fn table_owns_file(table: &str, file: &str) -> bool {
+    file.strip_prefix(table).is_some_and(|rest| {
+        RENAMED_SUFFIXES.contains(&rest)
+            || rest
+                .strip_prefix("_schema_")
+                .and_then(|tag| tag.strip_suffix(".db"))
+                .is_some_and(|tag| !tag.is_empty() && tag.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()))
+    })
+}
+
+/// Every file a table of `name` may own: what its log records can name.
+fn table_file_names(name: &str) -> impl Iterator<Item = String> + '_ {
+    RENAMED_SUFFIXES
+        .iter()
+        .map(move |suffix| format!("{}{}", name, suffix))
+}
+
 /// Name of the marker recording a rename that has begun but not finished.
 const RENAME_INTENT_FILE: &str = "__rename.intent";
+
+/// The catalogue's own files, in the same directory as the root's tables.
+const CATALOGUE_POINTERS_FILE: &str = "db_data_pointers.db";
+const CATALOGUE_ROWS_FILE: &str = "db_data_rows.db";
+const CATALOGUE_SCHEMA_FILE: &str = "db_data_schema.db";
+
+/// The stem the catalogue's files hang off, as if it were a table of that
+/// name. Treating it as one reserves its schema sidecars (`db_data_schema_*`)
+/// as well as the three files above, which a list of names would miss the
+/// first time a sidecar is loaded for it.
+const CATALOGUE_STEM: &str = "db_data";
+
+/// The scratch file a file provider compacts into, beside the tables it
+/// compacts (`LocalStorageProvider::create_temp`). Truncated on every use, and
+/// left out of every S3 snapshot by name — so a table called `temp` would have
+/// its rows file emptied by a compaction and missing from every backup.
+pub(crate) const COMPACTION_SCRATCH_FILE: &str = "temp.db";
+
+/// Files the engine keeps in a table directory under fixed names, with what
+/// owns each. A table whose files include one of these would share it.
+const RESERVED_FILES: &[(&str, &str)] = &[
+    (CATALOGUE_POINTERS_FILE, "the database catalogue"),
+    (CATALOGUE_ROWS_FILE, "the database catalogue"),
+    (CATALOGUE_SCHEMA_FILE, "the database catalogue"),
+    (COMPACTION_SCRATCH_FILE, "the engine's compaction scratch"),
+    // What a file provider opened without a name creates, with `File::create`.
+    ("CONFIG_TABLE.db", "the engine's configuration file"),
+];
+
+/// The longest table name, in bytes: what the schema record holds
+/// (`schema.rs` truncates past it). Well inside a file name's 255-byte limit
+/// once the longest suffix and `.tmp` are added — the bound that matters,
+/// because a name past it panicked opening its files after the catalogue row
+/// was written, and every later open of the database panicked the same way.
+const MAX_TABLE_NAME_BYTES: usize = 128;
+
+/// Prefix of the files a hash-partitioned table keeps (`docs/partitioning.md`).
+///
+/// Partition files are never created through `add_table`, so nothing in the
+/// live map owns them: a user table of such a name would be created over a
+/// partition's bytes, or be swept along with the partitioned table it shadows.
+pub(crate) const PARTITION_FILE_PREFIX: &str = "__pt_";
+
+/// Why `name` cannot be a table's name, or `None` when it can.
+///
+/// A table's name is a file name with a suffix glued on, and each refusal
+/// here is a way that stops being true. A path separator puts the files in
+/// some other directory — another database's, or none. `.db` anywhere in the
+/// name breaks the sidecars: they are named from the schema file with every
+/// `.db` stripped (`schema.rs`), so `x.db`'s columns land in `x`'s
+/// `_schema_FIELDS.db` and both tables read the union.
+fn table_name_refusal(name: &str) -> Option<String> {
+    if name.len() > MAX_TABLE_NAME_BYTES {
+        return Some(format!(
+            "table names are limited to {} bytes, which is what the schema record holds",
+            MAX_TABLE_NAME_BYTES
+        ));
+    }
+    if name.starts_with(PARTITION_FILE_PREFIX) {
+        return Some(format!(
+            "table names beginning with \"{}\" are reserved for the files of partitioned tables",
+            PARTITION_FILE_PREFIX
+        ));
+    }
+    if name.starts_with(rewrite::BACKUP_PREFIX) {
+        return Some(format!(
+            "table names beginning with \"{}\" are reserved for the copy a table's files are held in \
+             while an ALTER changes them",
+            rewrite::BACKUP_PREFIX
+        ));
+    }
+    if name.starts_with(block_ddl::COPY_PREFIX) {
+        return Some(format!(
+            "table names beginning with \"{}\" are reserved for the copy a table's files are held in \
+             while a transaction's DDL may yet roll back",
+            block_ddl::COPY_PREFIX
+        ));
+    }
+    table_stem_refusal(name)
+}
+
+/// The part of [`table_name_refusal`] that is about finding the files again:
+/// what a rename checks on the name it moves *from*. A legacy table under a
+/// reserved prefix or an over-long name has ordinary files, and a rename is the
+/// only way off that name; one whose name is not a plain stem does not, and a
+/// suffix copy of it would arrive short.
+fn table_stem_refusal(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("a table name cannot be empty".to_string());
+    }
+    if name.contains(['/', '\\', '\0']) {
+        return Some(format!(
+            "table name \"{}\" names a file, so it cannot contain a path separator",
+            name
+        ));
+    }
+    if name.contains(".db") {
+        return Some(format!(
+            "table name \"{}\" cannot contain \".db\": its schema sidecars would be \
+             named after another table's",
+            name
+        ));
+    }
+    None
+}
+
+/// The table a file belongs to, for each suffix it could be read as ending in,
+/// with that suffix.
+///
+/// `foo_seq.db` is `foo`'s sequence and `foo_seq`'s rows. That is the whole
+/// collision: every suffix ends in `.db`, so a name that is another's plus a
+/// suffix stem shares a file with it.
+///
+/// The suffix is matched ignoring ASCII case, as [`same_file_name`] compares.
+/// Every suffix is ASCII and starts with `_` or `.`, so the cut it makes is a
+/// character boundary whatever the name holds.
+fn possible_owners(file: &str) -> impl Iterator<Item = (&str, &'static str)> + '_ {
+    RENAMED_SUFFIXES.iter().filter_map(move |suffix| {
+        let cut = file.len().checked_sub(suffix.len())?;
+        file.as_bytes()[cut..]
+            .eq_ignore_ascii_case(suffix.as_bytes())
+            .then(|| (&file[..cut], *suffix))
+    })
+}
+
+/// Whether two file names name one file on some filesystem a database
+/// directory can be kept on.
+///
+/// Table names keep their case (`CREATE TABLE X` makes `X.db`), and the default
+/// filesystems of Windows and macOS fold ASCII case, so `X.db` and `x.db` are
+/// one file there: the second create opens the first table's rows. A directory
+/// is not tied to the filesystem it was made on — a backup restores anywhere —
+/// so the guard folds case everywhere rather than asking this one.
+fn same_file_name(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+/// What owns `file` when the engine does, not a table: the catalogue (whose
+/// stem is reserved whole, sidecars included) or one of [`RESERVED_FILES`].
+///
+/// Every other file the engine keeps beside the tables (`db_transactions.*`,
+/// `rasterized.wal*`, `db_storage.cfg`, `__rename.intent`, `__rewrite_*.intent`,
+/// `incompat_features`) ends in no table suffix, so no table name reaches it;
+/// `sidecar_clash_tests` lists a fresh directory to hold that true.
+fn reserved_file_owner(file: &str) -> Option<&'static str> {
+    if possible_owners(file).any(|(stem, _)| same_file_name(stem, CATALOGUE_STEM)) {
+        return Some("the database catalogue");
+    }
+    RESERVED_FILES
+        .iter()
+        .find(|(reserved, _)| same_file_name(reserved, file))
+        .map(|(_, owner)| *owner)
+}
+
+/// A file two tables would share: what [`shared_table_file`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SharedFile {
+    /// The file as the table being named would call it.
+    file: String,
+    /// The table that already has it.
+    owner: String,
+    /// The same file as `owner` calls it, which differs from `file` only in
+    /// case when it differs at all.
+    owner_file: String,
+}
+
+impl SharedFile {
+    /// Why `name` is refused. Phrased with "relation … already exists" so the
+    /// wire reports `42P07`, as PostgreSQL does for a name that is taken.
+    fn refusal(&self, name: &str) -> String {
+        // The same name in another case. Names are matched exactly here, so
+        // `x` beside `X` would be a second table, not this one: an
+        // `IF NOT EXISTS` that skipped would tell the caller `x` exists while
+        // every later statement on `x` says it does not.
+        if name.eq_ignore_ascii_case(&self.owner) {
+            return format!(
+                "relation \"{}\" already exists as table \"{}\": names are matched exactly, so \
+                 they would be two tables sharing the file {} ({}) on a case-insensitive filesystem",
+                name, self.owner, self.file, self.owner_file
+            );
+        }
+        let case = if self.owner_file == self.file {
+            String::new()
+        } else {
+            format!(
+                " (its {}: file names are compared ignoring case, as the Windows and macOS \
+                 filesystems do)",
+                self.owner_file
+            )
+        };
+        format!(
+            "relation \"{}\" would share the file {} with table \"{}\"{}, which already exists",
+            name, self.file, self.owner, case
+        )
+    }
+}
+
+/// The first file a table named `name` would share with one of `others`.
+///
+/// Name arithmetic only. Two names share a file exactly when `a + s1` and
+/// `b + s2` are the same file name for some suffixes `s1`, `s2`; then `b` is
+/// that file with `s2` cut off. So reading each of `name`'s files back through
+/// every suffix finds every name it collides with, in both directions at once:
+/// `x_pointers` finds `x` (its `x_pointers.db` is `x`'s pointers) and `x` finds
+/// `x_pointers` (its pointers are `x_pointers`'s rows). `others` equal to
+/// `name` byte for byte are skipped, so a table can be checked against a list
+/// that holds it. The guard runs the same pass over the live map, with
+/// [`file_shared_with`] per table; this is that pass over a plain list.
+#[cfg(test)]
+fn shared_table_file<'a>(
+    name: &str,
+    others: impl IntoIterator<Item = &'a str>,
+) -> Option<SharedFile> {
+    let readings = file_readings(name);
+    others
+        .into_iter()
+        .find_map(|other| file_shared_with(name, &readings, other))
+}
+
+/// The file `name` (read as `readings`, from [`file_readings`]) shares with
+/// the table `other`, if any. Lengths are compared before case-folded bytes,
+/// so a pass over many tables mostly costs a length check each.
+fn file_shared_with(
+    name: &str,
+    readings: &[(String, String, &'static str)],
+    other: &str,
+) -> Option<SharedFile> {
+    if other == name {
+        return None;
+    }
+    readings
+        .iter()
+        .find(|(_, stem, _)| stem.len() == other.len() && same_file_name(stem, other))
+        .map(|(file, _, suffix)| SharedFile {
+            file: file.clone(),
+            owner: other.to_string(),
+            owner_file: format!("{}{}", other, suffix),
+        })
+}
+
+/// Each of `name`'s files, with every stem it can be read as belonging to and
+/// the suffix that reading cuts off: `(file, stem, suffix)`. Its own reading
+/// (`name`, the suffix it was built with) is among them. A few per file.
+fn file_readings(name: &str) -> Vec<(String, String, &'static str)> {
+    let mut readings = Vec::new();
+    for file in table_file_names(name) {
+        for (stem, suffix) in possible_owners(&file) {
+            readings.push((file.clone(), stem.to_string(), suffix));
+        }
+    }
+    readings
+}
+
+/// Every pair of `names` whose tables share a file, each pair once.
+///
+/// What an open reports about a catalogue an older build filled: those builds
+/// let `x` and `x_pointers` both be created, and the pair can only be warned
+/// about, not separated, since their bytes are already mixed. A map from the
+/// case-folded name keeps it linear in the number of tables.
+fn shared_file_pairs(names: &[String]) -> Vec<(String, SharedFile)> {
+    let mut by_folded: std::collections::HashMap<String, Vec<&str>> =
+        std::collections::HashMap::new();
+    for name in names {
+        by_folded
+            .entry(name.to_ascii_lowercase())
+            .or_default()
+            .push(name.as_str());
+    }
+    let mut pairs: Vec<(String, SharedFile)> = Vec::new();
+    for name in names {
+        for (file, stem, suffix) in file_readings(name) {
+            let Some(owners) = by_folded.get(&stem.to_ascii_lowercase()) else {
+                continue;
+            };
+            // `<` so each pair is reported once, from its smaller name.
+            for owner in owners.iter().filter(|owner| name.as_str() < **owner) {
+                pairs.push((
+                    name.clone(),
+                    SharedFile {
+                        file: file.clone(),
+                        owner: owner.to_string(),
+                        owner_file: format!("{}{}", owner, suffix),
+                    },
+                ));
+            }
+        }
+    }
+    pairs.sort_by(|a, b| (&a.0, &a.1.owner, &a.1.file).cmp(&(&b.0, &b.1.owner, &b.1.file)));
+    pairs.dedup_by(|a, b| a.0 == b.0 && a.1.owner == b.1.owner);
+    pairs
+}
 
 // ---------------------------------------------------------------------------
 // Storage placement
@@ -218,17 +793,61 @@ pub type StoragePool = StdArc<crate::core::storage::StorageManager>;
 #[cfg(not(feature = "storage_pools"))]
 pub type StoragePool = ();
 
-#[cfg(feature = "storage_pools")]
-fn open_pool(location: &str, in_memory: bool) -> StoragePool {
+/// The key/value stores a database's tables may be placed on, or `()` in a
+/// build without `kv_storage`.
+#[cfg(all(feature = "kv_storage", feature = "storage_pools"))]
+pub type KvStores = StdArc<crate::core::storage::kv_registry::KvRegistry>;
+/// The key/value stores a database's tables may be placed on, or `()` in a
+/// build without `kv_storage`.
+///
+/// Also `()` without `storage_pools`: the registry lives inside `core::storage`,
+/// and without a placement map there is nothing to place on it. The driver
+/// itself is unaffected — it is a provider, and needs neither feature.
+#[cfg(not(all(feature = "kv_storage", feature = "storage_pools")))]
+pub type KvStores = ();
+
+#[cfg(all(feature = "kv_storage", feature = "storage_pools"))]
+fn open_kv_stores(location: &str, in_memory: bool) -> KvStores {
     StdArc::new(if in_memory {
-        crate::core::storage::StorageManager::inert()
+        crate::core::storage::kv_registry::KvRegistry::inert()
     } else {
-        crate::core::storage::StorageManager::open(location)
+        crate::core::storage::kv_registry::KvRegistry::open(location)
     })
 }
 
+#[cfg(not(all(feature = "kv_storage", feature = "storage_pools")))]
+fn open_kv_stores(_location: &str, _in_memory: bool) -> KvStores {}
+
+/// The seed provider each non-directory table is opened from, keyed by the
+/// backend spec *and* the table name.
+///
+/// Cached because these backends have identity: an in-memory table's buffers
+/// live in the registry its seed created, and a key/value table's length and
+/// page cache live in its family. Building a fresh seed on the second call
+/// would not reopen the table — it would make a second, empty one.
+///
+/// The spec is part of the key rather than only the name, because a name can
+/// outlive the backend it was cached against: drop a table on `kv:archive`, pin
+/// the same name to `memory:`, recreate it, and a name-keyed entry would hand
+/// back the old key/value seed. The table would then be built on the store the
+/// placement no longer names — silently, and correctly as far as every later
+/// read is concerned. Keying on the spec makes that a miss instead of relying on
+/// every site that changes a placement to remember to invalidate this.
+type SeedCache = DashMap<(String, String), Arc<DbStorageProvider>, ahash::RandomState>;
+
+#[cfg(feature = "storage_pools")]
+fn open_pool(location: &str, in_memory: bool) -> Result<StoragePool, String> {
+    Ok(StdArc::new(if in_memory {
+        crate::core::storage::StorageManager::inert()
+    } else {
+        crate::core::storage::StorageManager::try_open(location)?
+    }))
+}
+
 #[cfg(not(feature = "storage_pools"))]
-fn open_pool(_location: &str, _in_memory: bool) -> StoragePool {}
+fn open_pool(_location: &str, _in_memory: bool) -> Result<StoragePool, String> {
+    Ok(())
+}
 
 /// The backup directories every write is mirrored into.
 #[cfg(feature = "storage_pools")]
@@ -257,17 +876,264 @@ async fn open_root_file(location: &str, _backups: &[String], name: &str) -> DbSt
 /// The database's own provider when the table has no recorded placement, which
 /// is every table in a single-directory database — so this call is free there
 /// and the code paths do not fork.
+/// Resolves a table onto a backend that is not a directory, if it is on one.
+///
+/// Separate from the directory path so that a build without `storage_pools` —
+/// which has no placement map at all — still compiles, and so the common case
+/// stays one map lookup.
+async fn seed_on_other_backend(
+    _io_pointers: &Arc<DbStorageProvider>,
+    _pool: &StoragePool,
+    _kv: &KvStores,
+    _seeds: &SeedCache,
+    _table_name: &str,
+) -> Option<Arc<DbStorageProvider>> {
+    #[cfg(feature = "storage_pools")]
+    {
+        use crate::core::storage::TableBackend;
+        let backend = _pool.backend_of(_table_name)?;
+        if backend.is_file_based() {
+            return None;
+        }
+        let key = (backend.as_spec(), _table_name.to_string());
+        if let Some(existing) = _seeds.get(&key) {
+            return Some(existing.clone());
+        }
+        let seed: Arc<DbStorageProvider> = match &backend {
+            TableBackend::Memory => Arc::new(DbStorageProvider::new_memory(&format!(
+                "{_table_name}_pointers.db"
+            ))),
+            #[cfg(feature = "kv_storage")]
+            TableBackend::KeyValue(store) => match _kv.family(store).await {
+                Ok(family) => match DbStorageProvider::new_key_value(
+                    family,
+                    &format!("{_table_name}_pointers.db"),
+                )
+                .await
+                {
+                    Ok(provider) => Arc::new(provider),
+                    Err(e) => {
+                        error!("table {_table_name}: key/value store '{store}' failed: {e}");
+                        return Some(fallback_seed(_table_name));
+                    }
+                },
+                Err(e) => {
+                    error!("table {_table_name}: key/value store '{store}' failed: {e}");
+                    return Some(fallback_seed(_table_name));
+                }
+            },
+            other => {
+                error!(
+                    "table {_table_name} is placed on a {} backend this build cannot open",
+                    other.kind()
+                );
+                return Some(fallback_seed(_table_name));
+            }
+        };
+        _seeds.insert(key, seed.clone());
+        return Some(seed);
+    }
+    #[cfg(not(feature = "storage_pools"))]
+    None
+}
+
+/// Whether `table_name`'s recorded backend is one this server can actually open.
+///
+/// Reports what is wrong and where, because the operator's fix — restore the
+/// store's entry in `db_kv.cfg`, or rebuild this server with the feature — is
+/// not guessable from "table does not exist".
+fn backend_is_openable(_pool: &StoragePool, _kv: &KvStores, _table_name: &str) -> bool {
+    #[cfg(feature = "storage_pools")]
+    {
+        use crate::core::storage::TableBackend;
+        match _pool.backend_of(_table_name) {
+            Some(TableBackend::KeyValue(store)) => {
+                #[cfg(all(feature = "kv_storage", feature = "storage_pools"))]
+                {
+                    if _kv.has(&store) {
+                        return true;
+                    }
+                    error!(
+                        "table {_table_name} is placed on key/value store '{store}', which \
+                         {} does not configure; the table is unavailable until it is restored",
+                        crate::core::storage::kv_registry::KV_FILE
+                    );
+                    return false;
+                }
+                #[cfg(not(all(feature = "kv_storage", feature = "storage_pools")))]
+                {
+                    error!(
+                        "table {_table_name} is placed on key/value store '{store}', and this \
+                         server was built without the kv_storage feature; the table is \
+                         unavailable"
+                    );
+                    return false;
+                }
+            }
+            _ => true,
+        }
+    }
+    #[cfg(not(feature = "storage_pools"))]
+    true
+}
+
+/// What a table gets when its backend cannot be opened.
+///
+/// In memory, deliberately: falling back to the database *directory* would
+/// scatter that table's files where a later, correct run would find them as
+/// orphans. Reached when a store is unreachable or refuses to open (its record
+/// of unfinished sweeps unreadable, say). An existing table opened on this
+/// fails to read its schema and is left out, so it reads as missing; a table
+/// being created is refused instead (`refuse_unopenable_store`,
+/// `seed_fell_back`), since created here it would take writes that vanish.
+fn fallback_seed(table_name: &str) -> Arc<DbStorageProvider> {
+    Arc::new(DbStorageProvider::new_memory(&format!(
+        "{table_name}_pointers.db{UNAVAILABLE}"
+    )))
+}
+
+/// Marks the name of a [`fallback_seed`], so it is told apart from a table
+/// legitimately placed in memory — whose seed is also a memory provider, and
+/// which a move off memory discards while its placement already names the
+/// destination. Also keeps its buffers apart from that table's.
+const UNAVAILABLE: &str = "#unavailable";
+
+#[cfg(feature = "storage_pools")]
+async fn refuse_unopenable_store(pool: &StoragePool, kv: &KvStores, table_name: &str) -> io::Result<()> {
+    use crate::core::storage::TableBackend;
+    match pool.backend_of(table_name) {
+        Some(backend @ TableBackend::KeyValue(_)) => {
+            seed_for_backend(pool, kv, &backend, table_name).await.map(|_| ())
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(feature = "storage_pools"))]
+async fn refuse_unopenable_store(_pool: &StoragePool, _kv: &KvStores, _table_name: &str) -> io::Result<()> {
+    Ok(())
+}
+
+/// A discard asked of the in-memory stand-in for `name` (its key/value store
+/// could not be opened): nothing is discarded, and it says so. Reported as a
+/// discard, the files in the store were left unnamed while the caller went on
+/// as if they were gone — a crash recovery cleared its intent over them, and
+/// a later table of the name read them as its own.
+fn unavailable_kept(name: &str) -> bool {
+    error!("{name}'s key/value store could not be opened, so its files there were not discarded; kept for a later try");
+    false
+}
+
+/// `name`'s seed, or an error when it is the in-memory stand-in a key/value
+/// placement falls back to: for work that must act on the real files or not
+/// at all.
+pub(super) async fn seed_or_unavailable(
+    io_pointers: &Arc<DbStorageProvider>,
+    pool: &StoragePool,
+    kv: &KvStores,
+    seeds: &SeedCache,
+    name: &str,
+) -> io::Result<Arc<DbStorageProvider>> {
+    let seed = seed_in(io_pointers, pool, kv, seeds, name).await;
+    if seed_fell_back(pool, &seed, name) {
+        return Err(io::Error::other(format!("{name}'s key/value store could not be opened")));
+    }
+    Ok(seed)
+}
+
+/// Whether `seed` is the in-memory stand-in a table placed on a key/value
+/// store got because the store could not be opened.
+#[cfg(feature = "storage_pools")]
+fn seed_fell_back(_pool: &StoragePool, seed: &DbStorageProvider, _table_name: &str) -> bool {
+    matches!(seed, DbStorageProvider::Memory(_)) && seed.get_name().ends_with(UNAVAILABLE)
+}
+
+#[cfg(not(feature = "storage_pools"))]
+fn seed_fell_back(_pool: &StoragePool, _seed: &DbStorageProvider, _table_name: &str) -> bool {
+    false
+}
+
+/// Memory-backed storage for a relation that cannot outlive its statement.
+///
+/// A CTE and a derived table are both turned into real relations before the
+/// scan can read them — see [`crate::core::rql::cte::materialize_query`] — and
+/// they are dropped again before the statement returns. Nothing can read one
+/// afterwards: the name carries per-execution entropy, so it is not even
+/// reproducible by the session that made it, and a crash mid-statement leaves
+/// files whose only possible reader has already gone away.
+///
+/// Given files, each one costs five `create_new` calls (`_pointers`, the rows
+/// file, `_schema`, `_flt`, `_seq`) and five deletions, every one of them
+/// durable. Measured against the deployment on 192.168.1.7, that is a flat
+/// ~130 ms per materialisation, independent of row count, column count and
+/// whether the outer query aggregates:
+///
+/// ```text
+/// SELECT COUNT(*) FROM t                              0.08 ms   (server-side)
+/// SELECT COUNT(*) FROM (SELECT id FROM t) AS s      126.0  ms
+/// WITH s AS (SELECT id FROM t) SELECT COUNT(*) FROM s 129.0  ms
+/// ```
+///
+/// It dominated that server: `SELECT COUNT(*) … FROM (…) AS sub_query` is what
+/// sea-orm's `paginate()` emits, so every paginated list view paid it once, and
+/// the single most expensive statement on the node — two CTEs feeding an
+/// `UPDATE … RETURNING`, scanning four rows per call — spent about half of its
+/// 594 ms mean here before doing any work of its own.
+///
+/// The durability that costs those milliseconds buys nothing, so it is not
+/// bought. Everything else about the relation is unchanged: it is a real table
+/// with a real schema, created and dropped through the ordinary paths.
+/// Whether `table_name` is a statement's own relation: a CTE's or a derived
+/// table's (`cte::TEMP_TABLE_PREFIX`), or a catalogue view's
+/// (`catalog_views::TEMP_PREFIX`), created in memory and dropped before the
+/// statement ends. The catalogue's were on disk: five files made, synced and
+/// removed, and a catalogue row written and tombstoned, for every relation of
+/// every statement naming `pg_type` or `pg_class` (a driver's connect read
+/// eight, 23 s on a debug build, past Npgsql's connect timeout).
+fn is_statement_scoped(table_name: &str) -> bool {
+    table_name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX)
+        || table_name.starts_with(crate::core::rql::catalog_views::TEMP_PREFIX)
+}
+
+fn temp_seed(table_name: &str) -> Option<Arc<DbStorageProvider>> {
+    is_statement_scoped(table_name).then(|| Arc::new(DbStorageProvider::new_memory(table_name)))
+}
+
 #[cfg(feature = "storage_pools")]
 async fn seed_in(
     io_pointers: &Arc<DbStorageProvider>,
     pool: &StoragePool,
+    kv: &KvStores,
+    seeds: &SeedCache,
     table_name: &str,
 ) -> Arc<DbStorageProvider> {
+    // A statement-scoped relation never reaches a disk. See `temp_seed`.
+    if let Some(seed) = temp_seed(table_name) {
+        return seed;
+    }
+
+    // Boxed, so opening a key/value store does not enlarge this frame for the
+    // tables that will never take that branch. `seed_in` is on `add_table`'s
+    // await chain, which already sits close to a test thread's 2 MiB stack, and
+    // an inlined future here would be paid for by every table.
+    if let Some(seed) = Box::pin(seed_on_other_backend(
+        io_pointers,
+        pool,
+        kv,
+        seeds,
+        table_name,
+    ))
+    .await
+    {
+        return seed;
+    }
     let Some(root) = pool.root() else {
         return io_pointers.clone(); // in memory: one place, and it is not a directory
     };
 
-    let at = pool.location_of(table_name).unwrap_or_else(|| root.to_string());
+    let at = pool
+        .location_of(table_name)
+        .unwrap_or_else(|| root.to_string());
     // Read here rather than inherited from `io_pointers`, so a backup location
     // added while the server is running applies to the next table created —
     // the catalogue's own providers were built before it existed and cannot be
@@ -287,11 +1153,7 @@ async fn seed_in(
 /// argument, which is what a move needs — it has to open the destination
 /// *before* the placement says the table is there.
 #[cfg(feature = "storage_pools")]
-async fn seed_at(
-    pool: &StoragePool,
-    location: &str,
-    table_name: &str,
-) -> Arc<DbStorageProvider> {
+async fn seed_at(pool: &StoragePool, location: &str, table_name: &str) -> Arc<DbStorageProvider> {
     Arc::new(
         DbStorageProvider::new_mirrored(
             location,
@@ -302,18 +1164,94 @@ async fn seed_at(
     )
 }
 
+/// The provider a table's files are created from, on a named *backend*.
+///
+/// The generalisation of [`seed_at`] that a move between backends needs: it has
+/// to open the destination before the placement says the table is there, and
+/// the destination may not be a directory at all.
+///
+/// Deliberately fallible where `seed_at` is not. A directory that cannot be
+/// written fails at the first write and the caller finds out; a key/value store
+/// that cannot be opened would otherwise fall back to memory — see
+/// [`fallback_seed`] — and a move into it would report success having copied
+/// the table into a buffer that dies with the process.
+#[cfg(feature = "storage_pools")]
+async fn seed_for_backend(
+    pool: &StoragePool,
+    _kv: &KvStores,
+    backend: &crate::core::storage::TableBackend,
+    table_name: &str,
+) -> io::Result<Arc<DbStorageProvider>> {
+    use crate::core::storage::TableBackend;
+
+    match backend {
+        TableBackend::Directory(path) => Ok(seed_at(pool, path, table_name).await),
+        TableBackend::Memory => Ok(Arc::new(DbStorageProvider::new_memory(&format!(
+            "{table_name}_pointers.db"
+        )))),
+        #[cfg(feature = "kv_storage")]
+        TableBackend::KeyValue(store) => {
+            let family = _kv.family(store).await?;
+            let provider =
+                DbStorageProvider::new_key_value(family, &format!("{table_name}_pointers.db"))
+                    .await?;
+            Ok(Arc::new(provider))
+        }
+        #[cfg(not(feature = "kv_storage"))]
+        other => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("this server cannot open a {} backend", other.kind()),
+        )),
+    }
+}
+
 #[cfg(not(feature = "storage_pools"))]
 async fn seed_in(
     io_pointers: &Arc<DbStorageProvider>,
     _pool: &StoragePool,
-    _table_name: &str,
+    _kv: &KvStores,
+    _seeds: &SeedCache,
+    table_name: &str,
 ) -> Arc<DbStorageProvider> {
+    // A statement-scoped relation never reaches a disk. See `temp_seed`.
+    if let Some(seed) = temp_seed(table_name) {
+        return seed;
+    }
     io_pointers.clone()
+}
+
+/// The provider a table's files are resolved from, for a test that wants to
+/// read one of them directly.
+///
+/// `seed_in` is private and takes four of a `Database`'s fields; a test that
+/// reached for them individually would go stale the moment one moves.
+#[cfg(test)]
+pub(crate) async fn seed_for_tests(
+    database: &Database,
+    table_name: &str,
+) -> Arc<DbStorageProvider> {
+    seed_in(
+        &database.db_io_pointers,
+        &database.storage,
+        &database.kv,
+        &database.seeds,
+        table_name,
+    )
+    .await
 }
 
 /// Chooses and records where a table about to be created goes.
 #[cfg(feature = "storage_pools")]
 fn pool_place(pool: &StoragePool, table_name: &str) {
+    // A statement-scoped relation is in memory and so is in no directory —
+    // recording a placement for it would name one its files are not in. It
+    // would also be the expensive half of this: `place` and `forget` each take
+    // the pool's write lock and `persist()` the whole placement map, so a
+    // materialised CTE rewrote that file twice, and every concurrent statement
+    // with a CTE in it queued behind the same lock. See `temp_seed`.
+    if temp_seed(table_name).is_some() {
+        return;
+    }
     pool.place(table_name);
 }
 
@@ -323,11 +1261,44 @@ fn pool_place(_pool: &StoragePool, _table_name: &str) {}
 /// Forgets a dropped table's placement.
 #[cfg(feature = "storage_pools")]
 fn pool_forget(pool: &StoragePool, table_name: &str) {
+    // Nothing to forget: `pool_place` records no placement for one of these.
+    if temp_seed(table_name).is_some() {
+        return;
+    }
     pool.forget(table_name);
 }
 
 #[cfg(not(feature = "storage_pools"))]
 fn pool_forget(_pool: &StoragePool, _table_name: &str) {}
+
+/// Forgets every statement-scoped relation's placement, once the open has
+/// reaped their files. Builds before `temp_seed` recorded one per CTE, and
+/// [`pool_forget`] skips these names, since nothing records them now, so
+/// the reap removed the files and the catalogue row and left the placement:
+/// `SHOW STORAGE PLACEMENTS` listed a dozen `__cte_*` tables on
+/// 192.168.1.7, forever.
+#[cfg(feature = "storage_pools")]
+fn pool_forget_statement_relations(pool: &StoragePool) {
+    let removed = pool.forget_where(|table| is_statement_scoped(table));
+    if removed > 0 {
+        info!("forgot {} placement(s) of statement-scoped relations left by an older build", removed);
+    }
+}
+
+#[cfg(not(feature = "storage_pools"))]
+fn pool_forget_statement_relations(_pool: &StoragePool) {}
+
+/// The placement recorded for `table_name`, verbatim; `None` in a build
+/// without `storage_pools`, which records none.
+#[cfg(feature = "storage_pools")]
+fn pool_spec_of(pool: &StoragePool, table_name: &str) -> Option<String> {
+    pool.spec_of(table_name)
+}
+
+#[cfg(not(feature = "storage_pools"))]
+fn pool_spec_of(_pool: &StoragePool, _table_name: &str) -> Option<String> {
+    None
+}
 
 /// Carries a placement across a rename, which does not move a table.
 #[cfg(feature = "storage_pools")]
@@ -335,8 +1306,11 @@ fn pool_rename(pool: &StoragePool, old_name: &str, new_name: &str) {
     // Recorded before the copy rather than after it, so that a crash midway
     // leaves the new name pointing at the directory its half-written files are
     // actually in. The other order strands them somewhere nothing looks.
-    if let Some(path) = pool.location_of(old_name) {
-        let _ = pool.pin(new_name, &path);
+    // The spec, not the directory: a table on another backend has no directory,
+    // and losing its placement here would have the renamed table resolve to the
+    // database directory and open empty.
+    if let Some(spec) = pool.spec_of(old_name) {
+        let _ = pool.pin_backend(new_name, &crate::core::storage::TableBackend::parse(&spec));
     }
 }
 
@@ -354,8 +1328,100 @@ fn pool_paths(_pool: &StoragePool) -> Vec<String> {
     Vec::new()
 }
 
+/// Every directory a table's own files can be in: the primaries, enabled or
+/// not. Backups never hold a table (`set_role` refuses one that does), and a
+/// copy in one is never inherited — opening a mirrored file resyncs it from the
+/// primary. They also outlive a drop when disabled, since the drop sweeps only
+/// the enabled ones, so counting them refused the create an ALTER rewrite
+/// makes right after its drop, and the table was gone.
+#[cfg(feature = "storage_pools")]
+fn pool_table_paths(pool: &StoragePool) -> Vec<String> {
+    pool.all_paths()
+        .into_iter()
+        .filter(|path| pool.role_of(path) != Some(crate::core::storage::LocationRole::Backup))
+        .collect()
+}
+
+#[cfg(not(feature = "storage_pools"))]
+fn pool_table_paths(_pool: &StoragePool) -> Vec<String> {
+    Vec::new()
+}
+
+/// The directory `table_name` is placed in, or `None` for the database's own.
+#[cfg(feature = "storage_pools")]
+fn pool_location_of(pool: &StoragePool, table_name: &str) -> Option<String> {
+    pool.location_of(table_name)
+}
+
+#[cfg(not(feature = "storage_pools"))]
+fn pool_location_of(_pool: &StoragePool, _table_name: &str) -> Option<String> {
+    None
+}
+
+/// Where a partition directory a map recorded at `recorded` is now, after a
+/// restore moved it; `None` refuses the table.
+#[cfg(feature = "storage_pools")]
+fn pool_partition_dir_now(pool: &StoragePool, recorded: &str) -> Option<String> {
+    pool.partition_dir_now(recorded)
+}
+
+/// Without storage pools there are no other locations to have moved to.
+#[cfg(not(feature = "storage_pools"))]
+fn pool_partition_dir_now(_pool: &StoragePool, recorded: &str) -> Option<String> {
+    Some(recorded.to_string())
+}
+
+
+/// Whether a placement is recorded for `table_name`: a `STORAGE PLACE TABLE`
+/// pin (applied before the table exists, and the only way onto a key/value
+/// store), or what an earlier `CREATE` of the name chose.
+#[cfg(feature = "storage_pools")]
+fn pool_has_placement(pool: &StoragePool, table_name: &str) -> bool {
+    pool.spec_of(table_name).is_some()
+}
+
+#[cfg(not(feature = "storage_pools"))]
+fn pool_has_placement(_pool: &StoragePool, _table_name: &str) -> bool {
+    false
+}
+
 pub struct Database {
-    pub tables: DashMap<String, Arc<Table<DbStorageProvider>>, ahash::RandomState>,
+    /// The names of the views this database may hold (`rql::views`).
+    pub(crate) views: crate::core::rql::views::ViewRegistry,
+    pub(crate) types: crate::core::rql::user_types::TypeRegistry,
+    /// The domains' names (`rql::domains`).
+    pub(crate) domains: crate::core::rql::user_types::TypeRegistry,
+    /// The names of the routines this database may hold (`rql::functions`).
+    pub(crate) functions: crate::core::rql::functions::FunctionRegistry,
+    /// The tables that may have triggers (`rql::triggers`).
+    pub(crate) triggers: crate::core::rql::triggers::TriggerRegistry,
+    /// Each table's slot by name (a partitioned table's shell included).
+    /// Private, and named only in `slots.rs`: metadata readers use
+    /// [`Database::schema_view`], execution the escape hatches listed there.
+    table_slots: DashMap<String, Arc<slots::Slot>, ahash::RandomState>,
+    /// Which engine catalogue tables are registered, one bit each
+    /// (`slots::ENGINE_CATALOGUE_TABLES`); see `Database::has_table`.
+    catalogue_present: std::sync::atomic::AtomicU32,
+    /// Serialises the recomputation of `catalogue_present`.
+    catalogue_noting: parking_lot::Mutex<()>,
+    /// Hash-partitioned tables by logical name. Each one's schema-only shell
+    /// has a slot too (unless its schema could not be read); resolve a name
+    /// through [`Database::relation`], which asks here first.
+    partitioned_tables: DashMap<String, Arc<crate::core::partition::table::PartitionedTable>, ahash::RandomState>,
+    /// Every foreign key by the table it references (`slots::FkReverse`),
+    /// changed only with the slot it mirrors, under this lock. Named only in
+    /// `slots.rs`.
+    fk_reverse: parking_lot::RwLock<slots::FkReverse>,
+    /// Names a CREATE or a partitioned DROP is working on (see
+    /// [`Database::claim_name`]).
+    name_claims: DashMap<String, (), ahash::RandomState>,
+    /// Serialises partitioned CREATE and DROP, so the per-database cap on
+    /// declared partitions counts what is really there.
+    partition_ddl: tokio::sync::Mutex<()>,
+    /// The one maintenance scheduler every partition of this database is
+    /// serviced by (docs/partitioning.md §7.3): inert until a partition
+    /// opens, then one task, whatever the partition count.
+    partition_maintenance: StdArc<crate::core::partition::maintenance::Scheduler>,
     pub db_io_pointers: Arc<DbStorageProvider>,
     pub db_io_rows: Arc<DbStorageProvider>,
     pub db_io_schema: Arc<DbStorageProvider>,
@@ -381,6 +1447,16 @@ pub struct Database {
     /// "cached plan must not change result type", which every driver handles by
     /// re-preparing. This counter is how the wire layer knows to look.
     pub schema_generation: StdArc<CacheGuard<std::sync::atomic::AtomicU64>>,
+    /// The database-wide shape epoch (`docs/persistent-indexes.md` §7
+    /// `shape_epoch`, Q7): one monotonic counter, moved only when what a name
+    /// returns changes (a table installed under a name, or an instance
+    /// swapped in with another column shape), never by index-only DDL. Each
+    /// slot keeps the value it drew (`Slot::shape_epoch`), so a DROP and
+    /// CREATE of a name can never repeat an epoch an old instance used, and
+    /// a statement over several tables, or a join, compares this one number
+    /// with the value it read when the client was told its shape. See
+    /// [`Database::shape_epoch`].
+    shape_epoch: CacheGuard<std::sync::atomic::AtomicU64>,
     /// Ships committed transactions to the other instances, and applies theirs.
     ///
     /// Always present and inert until configured, so the write path can hook
@@ -408,6 +1484,65 @@ pub struct Database {
     /// directory, so the placement call sites need no branch — the same shape
     /// `replication` uses. See [`crate::core::storage`].
     pub storage: StoragePool,
+
+    /// The key/value stores this database's tables may be placed on.
+    ///
+    /// Read from `db_kv.cfg` at open and empty for a database that has none, so
+    /// the call sites need no branch. See
+    /// [`crate::core::storage::kv_registry`].
+    pub kv: KvStores,
+
+    /// The seed provider each table on a non-directory backend was opened from.
+    ///
+    /// Not a cache in the usual sense — it is identity. Two lookups of the same
+    /// in-memory table have to reach the same buffers, and two lookups of the
+    /// same key/value table the same family. See [`SeedCache`].
+    seeds: SeedCache,
+
+    /// Names whose files were kept because a log's records for them could not
+    /// be voided (a rename's old name; see [`forget_logged_files`]), until the
+    /// rename intent that also names them is finished at the next open. A
+    /// table created under one would open those files as its own, and the
+    /// next open would sweep them from under it, so `CREATE TABLE` and
+    /// `RENAME … TO` refuse them, and no further rename starts meanwhile (it
+    /// would overwrite the intent that finishes the job).
+    held_names: parking_lot::Mutex<Vec<String>>,
+    /// Each open block's DDL undo steps, by its root transaction
+    /// (`block_ddl`): copies of the tables it changed and the tables it
+    /// created, undone if it aborts.
+    block_ddl: DashMap<crate::core::mvcc::TxId, Vec<block_ddl::Step>, ahash::RandomState>,
+
+    /// Held by a rename, plain or partitioned (`rename_partitioned`), from
+    /// its check of `held_names` to its last word on the intent: there is one `__rename.intent` (and one
+    /// `__rename.partial`) per database, so two renames at once synced and
+    /// installed each other's bytes, cleared each other's live intent, and
+    /// one failed with "No such file or directory".
+    rename_serial: tokio::sync::Mutex<()>,
+
+    /// Ends the catalogue files' background service when the database is
+    /// dropped. The task holds the three providers, so without this a
+    /// dropped database (`DROP DATABASE`, a branch's RESET or merge
+    /// retiring a copy) kept its catalogue files open, and their landing
+    /// loop running, for the life of the process.
+    catalogue_services: StdArc<tokio::sync::Notify>,
+
+    /// Tests only: create unconstrained NUMERIC columns in the sixteen-byte,
+    /// nine-place slot every build before `numeric_own_scale_v1` wrote, so a
+    /// test can hold such a column and convert it (`numeric_own_scale_tests`).
+    #[cfg(test)]
+    pub(crate) legacy_numeric_slot: std::sync::atomic::AtomicBool,
+
+    /// The Redis-compatible key/value store (`KV …` statements and the RESP
+    /// port). Built lazily: a database that never uses it allocates nothing.
+    #[cfg(feature = "kv_cache")]
+    pub kv_cache: crate::core::kv_cache::KvCacheHandle,
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        // A stored permit if the task has not reached its wait yet.
+        self.catalogue_services.notify_one();
+    }
 }
 
 impl Database {
@@ -424,7 +1559,24 @@ impl Database {
     /// The name is not derived from the location: the default database lives at
     /// the catalogue root, whose directory is named for the whole installation
     /// rather than for that one database.
+    ///
+    /// Panics where [`Database::try_new_named`] errs: startup and tests have
+    /// nobody to hand the refusal to, and that is the fatal-startup convention.
     pub async fn new_named(location: &str, in_memory: bool, name: &str) -> Self {
+        Self::try_new_named(location, in_memory, name)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`Database::new_named`], refusing with an error rather than a panic.
+    ///
+    /// For callers that have somewhere to report it: `CREATE DATABASE` adopting
+    /// a directory, where a panic would drop the client's connection instead of
+    /// answering it, and the catalogue at startup. Every refusal comes before
+    /// anything is opened, and a root log installed here is uninstalled again,
+    /// so a refused open leaves nothing behind but the log it would not replay.
+    pub async fn try_new_named(location: &str, in_memory: bool, name: &str) -> Result<Self, String> {
+        let mut installed_root_log = false;
         if !in_memory {
             let dir_exists = tokio::fs::metadata(location).await.is_ok();
 
@@ -432,11 +1584,25 @@ impl Database {
                 tokio::fs::create_dir_all(location).await.unwrap();
             }
 
+            // Before anything is replayed, opened or created: a directory using
+            // an on-disk format this build does not support is refused whole,
+            // since writing to it would leave files that format describes
+            // wrong for the build that wrote them (V14).
+            if let Err(e) = incompat::check(std::path::Path::new(location)) {
+                return Err(format!("refusing to open the database at {location}: {e}"));
+            }
+
             // Replay before anything opens a table. A log on disk means writes
             // that may not have reached their data files, and every reader below
             // would otherwise observe the pre-recovery state. This runs whether
             // or not logging is currently enabled, so switching the feature off
             // cannot strand un-checkpointed writes.
+            //
+            // A log recovery refuses is left on disk, and opening without it is
+            // the one thing that must not happen: writes would land on the bytes
+            // its records describe, and the replay that runs once the cause is
+            // cleared would put the older records back over them, silently. So
+            // the open is refused, as the other fatal startup paths are.
             match crate::core::wal::open_and_recover(location) {
                 Ok((w, stats)) => {
                     if stats.applied > 0 || stats.rolled_back > 0 {
@@ -447,63 +1613,121 @@ impl Database {
                     }
                     if crate::wal_enabled() {
                         crate::core::wal::install_for(location, w);
+                        installed_root_log = true;
                     }
                 }
-                Err(e) => error!(
-                    "WAL unavailable for {} ({}); falling back to per-file flushes",
-                    location, e
-                ),
+                Err(e) => {
+                    return Err(format!(
+                        "refusing to open the database at {location}: WAL recovery failed ({e}). \
+                         Its log was left as it was; the writes it holds are not on disk until \
+                         it replays. Resolve the cause and restart — deleting the log discards \
+                         those writes."
+                    ));
+                }
             }
         }
 
         // Before any file is opened: the pool decides which directories exist
         // for this database, recovers their logs, and says whether the
         // catalogue itself is mirrored.
-        let storage = open_pool(location, in_memory);
+        let storage = match open_pool(location, in_memory) {
+            Ok(storage) => storage,
+            Err(e) => {
+                // Nothing will use the root's log, and leaving it registered
+                // would make a later open of this directory skip its recovery.
+                if installed_root_log {
+                    let _ = crate::core::wal::remove_for(location);
+                }
+                return Err(format!("refusing to open the database at {location}: {e}"));
+            }
+        };
+        let kv_stores = open_kv_stores(location, in_memory);
+        let seeds: SeedCache = DashMap::default();
         let backups = pool_mirrors(&storage);
 
         // The catalogue, the row store and the schema are mirrored along with
         // everything else. A backup directory that held every table but not the
         // list of them would not open as a database, which is the one thing a
         // backup copy is for.
-        let open_root =
-            async |name: &str| open_root_file(location, &backups, name).await;
+        let open_root = async |name: &str| open_root_file(location, &backups, name).await;
 
         let io_pointers = if in_memory {
-            Arc::new(DbStorageProvider::new_memory("db_data_pointers.db"))
+            Arc::new(DbStorageProvider::new_memory(CATALOGUE_POINTERS_FILE))
         } else {
-            Arc::new(open_root("db_data_pointers.db").await)
+            Arc::new(open_root(CATALOGUE_POINTERS_FILE).await)
         };
 
         let io_rows = if in_memory {
-            Arc::new(DbStorageProvider::new_memory("db_data_rows.db"))
+            Arc::new(DbStorageProvider::new_memory(CATALOGUE_ROWS_FILE))
         } else {
-            Arc::new(open_root("db_data_rows.db").await)
+            Arc::new(open_root(CATALOGUE_ROWS_FILE).await)
         };
 
         let io_schema = if in_memory {
-            Arc::new(DbStorageProvider::new_memory("db_data_schema.db"))
+            Arc::new(DbStorageProvider::new_memory(CATALOGUE_SCHEMA_FILE))
         } else {
-            Arc::new(open_root("db_data_schema.db").await)
+            Arc::new(open_root(CATALOGUE_SCHEMA_FILE).await)
         };
 
         let io_pointers_clone = io_pointers.clone();
         let io_rows_clone = io_rows.clone();
         let io_schema_clone = io_schema.clone();
 
+        let catalogue_services = StdArc::new(tokio::sync::Notify::new());
+        let released = catalogue_services.clone();
         tokio::spawn(async move {
-            tokio::join!(io_rows_clone.start_service(), io_pointers_clone.start_service(), io_schema_clone.start_service());
+            tokio::select! {
+                _ = async {
+                    tokio::join!(
+                        io_rows_clone.start_service(),
+                        io_pointers_clone.start_service(),
+                        io_schema_clone.start_service()
+                    )
+                } => {}
+                _ = released.notified() => {}
+            }
         });
-        
-        let schema = load_db_data_schema(io_schema.clone()).await;
+
+        let schema = match load_db_data_schema(io_schema.clone()).await {
+            Ok(schema) => schema,
+            Err(e) => {
+                if installed_root_log {
+                    let _ = crate::core::wal::remove_for(location);
+                }
+                return Err(format!("refusing to open the database at {location}: its catalogue's schema could not be written: {e}"));
+            }
+        };
 
         let mut iterator = RowPointerIterator::new(io_pointers.clone()).await.unwrap();
 
         // Before the table list, because what it resolves is which names that
         // list should contain.
-        recover_interrupted_rename(&io_pointers, &io_rows, &io_schema, &storage).await;
+        let held = recover_interrupted_rename(
+            &io_pointers,
+            &io_rows,
+            &io_schema,
+            &storage,
+            &kv_stores,
+            &seeds,
+        )
+        .await;
 
-        let tables_names: Vec<(String, u64)> =
+        // A partitioned RENAME a crash interrupted: its own intent, which
+        // finishes or abandons it by the catalogue rows alone, touching no
+        // file (`partitioned_ddl.rs`).
+        partitioned_ddl::recover_interrupted_rename(&io_pointers, &io_rows, &io_schema).await;
+
+        // A conversion to a partitioned table a crash interrupted: the plain
+        // table's files released past its commit point, else the intent
+        // dropped (`partitioned_convert.rs`).
+        partitioned::recover_interrupted_conversion(&io_pointers, &io_rows, &io_schema, &storage, &kv_stores, &seeds)
+            .await;
+
+        // Before any table opens: a change a crash interrupted is undone from
+        // its backup (`rewrite.rs`), so the table opens as it was.
+        rewrite::recover_interrupted_rewrites(&io_pointers, &storage, &kv_stores, &seeds).await;
+
+        let mut tables_names: Vec<(String, u64)> =
             load_db_tables(&schema, &mut iterator, io_rows.clone()).await;
 
         debug!(
@@ -512,7 +1736,24 @@ impl Database {
             tables_names
         );
 
-        let tables = DashMap::with_hasher(ahash::RandomState::new());
+        // Before anything opens: which of two rows sharing a name would be
+        // served is the map's insert order, and the other's rows would vanish.
+        if let Err(e) = partitioned::catalogue_duplicates(&tables_names) {
+            if installed_root_log {
+                let _ = crate::core::wal::remove_for(location);
+            }
+            return Err(format!("refusing to open the database at {location}: {e}"));
+        }
+
+        // A plain CREATE TABLE a cut interrupted before its catalogue row:
+        // its files discarded by the intent naming them (`create_intent`),
+        // before any table opens and before a CREATE of the name could find
+        // them in its way.
+        if !in_memory {
+            create_intent::recover(&io_pointers, &storage, &kv_stores, &seeds, &tables_names, &held).await;
+        }
+
+        let table_slots = DashMap::with_hasher(ahash::RandomState::new());
 
         // Outcomes are durable for a file-backed database and need not be for
         // an in-memory one: nothing there outlives the process, so there is
@@ -526,18 +1767,67 @@ impl Database {
                     // Refusing to start would be worse than running unversioned,
                     // but running versioned on a log that cannot be written
                     // would report commits that do not survive a restart.
-                    error!("Could not open the transaction status log: {}. \
-                            Transactions will not be durable.", e);
+                    error!(
+                        "Could not open the transaction status log: {}. \
+                            Transactions will not be durable.",
+                        e
+                    );
                     StatusLog::in_memory()
                 }
             }
         };
         // Through the log, so a commit record survives whatever the data files
         // do. Nothing to attach for an in-memory database.
-        if let Some(wal) = crate::core::wal::wal_for(location) {
-            status.attach_wal(wal);
+        if let Some(wal) = crate::core::wal::wal_for(location)
+            && let Err(e) = status.attach_wal(wal)
+        {
+            error!("The transaction status log is not covered by the WAL: {}", e);
         }
         let transactions = StdArc::new(TransactionManager::new(status));
+        // A block's DDL a crash interrupted (`block_ddl`): before any table
+        // opens, the copies of a block that did not commit put back, and the
+        // tables it created named, to drop once the database is open.
+        let mut spared: Vec<(u64, u64)> = Vec::new();
+        let block_ddl_drops = if in_memory {
+            Vec::new()
+        } else {
+            block_ddl::recover_files(
+                &io_pointers,
+                &io_rows,
+                &io_schema,
+                &storage,
+                &kv_stores,
+                &seeds,
+                &mut tables_names,
+                &mut spared,
+                |tx| transactions.outcome(tx) == crate::core::mvcc::TxOutcome::Committed,
+            )
+            .await
+        };
+
+        // After WAL recovery, the catalogue read and the block DDL above
+        // (which may move a partitioned table's catalogue row back to the uid
+        // a block's rewrite left, 2026-11-12), before any table opens and so
+        // before forgetting resumes: partition files without MATERIALIZE may
+        // hold rows of a transaction whose outcome was lost, and must go
+        // before the forget horizon can pass it (§12). A uid a block's undo
+        // could not move back to is kept for the next try (`spared`), and
+        // the table left at the new one opens refused (`unfinished`).
+        let unfinished: Vec<u64> = spared.iter().map(|(_, new)| *new).collect();
+        if !in_memory {
+            let mut live = tables_names.clone();
+            live.extend(spared.iter().map(|(old, _)| (String::new(), *old)));
+            // Stores first: the directory reaper deletes a dead uid's map
+            // log, the only record of which stores its partitions were on.
+            partitioned::reap_stores_at_startup(location, &storage, &kv_stores, &live).await;
+            partitioned::reap_at_startup(location, &io_pointers, &storage, &live);
+        }
+        // No forgetting until every table holding rows is registered: plain
+        // tables register (and start their vacuum, which forgets) below,
+        // partitioned ones after the database exists, and a forget in the
+        // gap would pass aborted stamps a partition still holds
+        // (docs/partitioning.md §7.2). Dropped once they are all open.
+        let startup_forget_pause = transactions.forget_pause();
 
         // On the log writer's round, so a commit that did not wait for its own
         // sync still gets one shortly. Only for a database with files: an
@@ -550,33 +1840,200 @@ impl Database {
         // scope is fixed at construction.
         let id = next_database_id();
 
-        for (table_name, _) in tables_names {
+        // Opened after every plain table, so one that cannot open stops nothing
+        // else (§7.1).
+        let mut partitioned_rows: Vec<(String, u64)> = Vec::new();
+        for (table_name, clusters) in tables_names {
+            // First, ahead of the reap, the backend check, `seed_in` and
+            // `Table::new`: each of those would create `<name>*` files, and a
+            // partitioned table has none (its files are `__pt_<uid>_*`).
+            if clusters != 0 {
+                partitioned_rows.push((table_name, clusters));
+                continue;
+            }
+            // A statement-scoped relation that survived to an open is garbage,
+            // always, and is reaped here rather than reported.
+            //
+            // `materialize_query` creates one, uses it, and drops it inside a
+            // single statement, and its name carries per-execution entropy — so
+            // nothing can refer to one after the process that made it is gone,
+            // not even the session that made it. Reaching this loop means a
+            // crash or a kill landed between the create and the drop.
+            //
+            // Before this, each such leftover was logged as "its schema could
+            // not be read" on every subsequent start, forever: on the
+            // 192.168.1.7 node, 13 of them produced 32 error lines at each boot
+            // and had done since 2026-09-01. That is noise that trains an
+            // operator to skim exactly the part of the log where a real
+            // unreadable table would appear.
+            //
+            // Files first, then the catalogue row, matching `drop_table`: a row
+            // tombstoned first would leave the files with nothing naming them.
+            // `io_pointers` rather than `seed_in`, deliberately — `temp_seed`
+            // now answers with memory-backed storage for these names, which
+            // would discard nothing. These leftovers predate that and are real
+            // files in the database's own directory.
+            if is_statement_scoped(&table_name) {
+                // Kept files keep their row too, so the next start tries again.
+                if !discard_files(&io_pointers, &storage, Some(location), &table_name).await {
+                    continue;
+                }
+                pool_forget(&storage, &table_name);
+                if let Err(e) =
+                    tombstone_catalogue_row(&io_pointers, &io_rows, &io_schema, &table_name).await
+                {
+                    // Worth a line each: it means the reaper cannot make
+                    // progress and the entry will be back at the next start.
+                    error!(
+                        "could not reap the leftover temporary table '{}': {}",
+                        table_name, e
+                    );
+                }
+                continue;
+            }
+
+            // A table whose backend is not configured is left out of the live
+            // map entirely, so a query for it says the table does not exist.
+            // Opening it anyway would answer that query with no rows, which is
+            // the same shape as an empty table and reads as data loss.
+            if !backend_is_openable(&storage, &kv_stores, &table_name) {
+                continue;
+            }
             // A table placed on a second disk is opened from a seed rooted
             // there. `seed_in` returns the database's own provider when the
             // table has no placement, so a single-directory database opens
             // exactly as it did before.
-            let seed = seed_in(&io_pointers, &storage, &table_name).await;
+            let seed = seed_in(&io_pointers, &storage, &kv_stores, &seeds, &table_name).await;
 
             let mut table = Table::new(&table_name, seed, vec![]).await;
+            // Its schema did not load, so every column is missing. Left out of
+            // the live map for the same reason an unopenable backend is: a
+            // query then says the table does not exist, where opening it would
+            // answer `SELECT *` with rows carrying no fields.
+            if table.schema_unreadable {
+                error!(
+                    "table '{}' is left unopened: its schema could not be read",
+                    table_name
+                );
+                continue;
+            }
+            // A seventeen-byte NUMERIC field in a directory without its
+            // fence (a point-in-time restore brings the field records and not
+            // the flag): fenced before anything touches the table, so an
+            // older binary is refused this directory rather than misreading it.
+            if !in_memory {
+                if let Err(e) = incompat::fence_numeric_own_scale(std::path::Path::new(location), &table.schema.fields) {
+                    error!(
+                        "table '{}' is left unopened: it keeps NUMERIC values at their own scale and the \
+                         directory could not be marked for it ({}): {}",
+                        table_name,
+                        incompat::NUMERIC_OWN_SCALE_V1,
+                        e
+                    );
+                    continue;
+                }
+            }
             table.scope_cache_to_database(id);
             table.enable_versioning(transactions.clone());
-            tables.insert(table_name, Arc::new(table));
+            // A table with a legacy `CHAR` column: its keys are read once,
+            // before the instance is shared. A key holding two rows of one
+            // value is said (`executor::scan_legacy_char_keys`), and a table
+            // whose key cells are all in their stored form lets the
+            // uniqueness check use the index and the filter again.
+            if table.schema.fields.iter().any(|f| !f.is_deleted && f.db_type == DbType::CHAR) {
+                let scan = crate::core::rql::executor::scan_legacy_char_keys(&table).await;
+                table.legacy_keys_canonical = scan.canonical;
+                table.legacy_char_duplicates = scan.duplicates;
+            }
+            table_slots.insert(table_name, Arc::new(slots::Slot::new(Arc::new(table), 0)));
         }
 
-        Database {
+        // Builds before the name guard let two tables share a file (`x` and
+        // `x_pointers`). Both are opened as they always were: refusing would
+        // take away the rows that still read correctly, and nothing here can
+        // tell whose bytes are whose. Each such pair is named instead, so the
+        // operator learns why one of them reads wrong. A rewriting ALTER on
+        // either is refused (`check_recreatable`) before its drop; a plain DROP
+        // or RENAME of either still deletes the shared file, as it always did.
+        let names: Vec<String> = table_slots.iter().map(|entry| entry.key().clone()).collect();
+        for (name, shared) in shared_file_pairs(&names) {
+            warn!(
+                "tables \"{}\" and \"{}\" share the file {} (created by a build without the \
+                 name guard): writes to either can damage the other, and dropping or renaming \
+                 either deletes it; copy out what reads correctly from both before dropping them",
+                name, shared.owner, shared.file
+            );
+        }
+
+        // Every leftover's files are reaped by now; their placements go too.
+        pool_forget_statement_relations(&storage);
+
+        let database = Database {
+            #[cfg(test)]
+            legacy_numeric_slot: std::sync::atomic::AtomicBool::new(false),
+            views: crate::core::rql::views::ViewRegistry::default(),
+            types: crate::core::rql::user_types::TypeRegistry::default(),
+            domains: crate::core::rql::user_types::TypeRegistry::default(),
+            functions: crate::core::rql::functions::FunctionRegistry::default(),
+            triggers: crate::core::rql::triggers::TriggerRegistry::default(),
             id,
             name: name.to_string(),
-            tables,
+            catalogue_present: std::sync::atomic::AtomicU32::new(slots::catalogue_bits(&table_slots)),
+            catalogue_noting: parking_lot::Mutex::new(()),
+            table_slots,
+            partitioned_tables: DashMap::with_hasher(ahash::RandomState::new()),
+            fk_reverse: parking_lot::RwLock::new(slots::FkReverse::default()),
+            name_claims: DashMap::with_hasher(ahash::RandomState::new()),
+            partition_ddl: tokio::sync::Mutex::new(()),
+            partition_maintenance: crate::core::partition::maintenance::Scheduler::new(),
             db_io_pointers: io_pointers,
             db_io_rows: io_rows,
             db_io_schema: io_schema,
-            transactions,
-            row_locks: StdArc::new(crate::core::mvcc::row_locks::RowLocks::default()),
+            transactions: StdArc::clone(&transactions),
+            // Resolves a savepoint's locks to its transaction, which is what
+            // releases them.
+            row_locks: {
+                let row_locks = StdArc::new(crate::core::mvcc::row_locks::RowLocks::for_transactions(
+                    StdArc::clone(&transactions),
+                ));
+                transactions.set_row_locks(&row_locks);
+                row_locks
+            },
             schema_generation: StdArc::new(std::sync::atomic::AtomicU64::new(0).into()),
+            shape_epoch: std::sync::atomic::AtomicU64::new(0).into(),
             replication: StdArc::new(crate::replication::Replication::new()),
             location: (!in_memory).then(|| location.to_string()),
             storage,
-        }
+            kv: kv_stores,
+            seeds,
+            held_names: parking_lot::Mutex::new(held.into_iter().collect()),
+            block_ddl: DashMap::with_hasher(ahash::RandomState::new()),
+            rename_serial: tokio::sync::Mutex::new(()),
+            catalogue_services,
+            #[cfg(feature = "kv_cache")]
+            kv_cache: {
+                let handle = crate::core::kv_cache::KvCacheHandle::new((!in_memory).then_some(location));
+                handle.load_snapshot_if_present();
+                handle
+            },
+        };
+        database.open_partitioned_rows(partitioned_rows, &unfinished).await;
+        drop(startup_forget_pause);
+        // The plain tables went into the map before the database existed.
+        database.rebuild_fk_reverse();
+        database.finish_block_ddl_recovery(block_ddl_drops).await;
+        Ok(database)
+    }
+
+    /// Releases the cached seed for a table that is gone.
+    ///
+    /// Correctness does not depend on this — the spec is part of the cache key,
+    /// so a stale entry can never be served for a different backend. It is here
+    /// so that dropping an in-memory table also drops its buffers, and dropping
+    /// a key/value table releases its open file, rather than holding both for
+    /// the life of the process.
+    fn forget_seed(&self, table_name: &str) {
+        self.seeds.retain(|(_, name), _| name != table_name);
     }
 
     /// Ends `tx` successfully, on this node.
@@ -598,10 +2055,6 @@ impl Database {
     /// A failure here means the writes are *not* durable, so the caller has to
     /// report the statement as failed rather than swallow it.
     pub fn sync_durable(&self) -> std::io::Result<()> {
-        let Some(location) = self.location.as_deref() else {
-            return Ok(()); // in-memory: nothing to sync
-        };
-
         // Every directory this database writes into, not just its own. A
         // statement that touched a table on a second disk logged that write to
         // *that* directory's log, and the root's `sync_pending` knows nothing
@@ -609,25 +2062,59 @@ impl Database {
         // report durability for bytes still in the page cache.
         //
         // The other directories go first and the root goes last, because the
-        // root's log is also where the transaction *outcome* record lives. An
-        // outcome that reached the disk before the rows it validates would,
-        // after a crash in between, name a transaction as committed whose rows
-        // are missing — a write reported as successful that silently is not
-        // there. Within one log the records are already in that order, and
-        // replay stops at the first one it cannot read whole, so a torn tail
-        // can only ever lose the outcome and never keep it.
+        // root's log is also where the transaction *outcome* record lives.
+        // That order is only enough for this caller's own outcome: other
+        // sessions append to the other directories and stage outcomes between
+        // the two halves, which is why a writing transaction also syncs the
+        // other directories *before* it commits — see
+        // [`Database::commit_written_transaction`].
         //
-        // The first failure is returned and the rest are still attempted:
-        // stopping early would leave logs unflushed on directories that were
-        // fine, and the caller's answer is the same either way.
-        let mut outcome = Ok(());
+        // Both halves run even when the first fails: stopping early would leave
+        // the root unflushed when it was fine, and the caller's answer is the
+        // same either way.
+        let mut outcome = self.sync_other_locations();
 
+        #[cfg(test)]
+        test_hooks::AFTER_POOL_SYNC.with(|hook| {
+            if let Some(f) = hook.borrow_mut().as_mut() {
+                f();
+            }
+        });
+
+        let own = self.sync_own_log();
+        if outcome.is_ok() {
+            outcome = own;
+        }
+        if outcome.is_ok() {
+            self.copy_staged_outcomes();
+        }
+        outcome
+    }
+
+    /// Syncs the log of every storage location except the database's own.
+    ///
+    /// The first failure is returned and the rest are still attempted:
+    /// stopping early would leave logs unflushed on directories that were
+    /// fine, and the caller's answer is the same either way.
+    fn sync_other_locations(&self) -> std::io::Result<()> {
+        let Some(location) = self.location.as_deref() else {
+            return Ok(()); // in-memory: nothing to sync
+        };
+        let mut outcome = Ok(());
         for path in pool_paths(&self.storage) {
             if path == location {
                 continue;
             }
             if let Some(wal) = crate::core::wal::wal_for(&path) {
-                if let Err(e) = wal.sync_pending() {
+                #[cfg(test)]
+                let synced = if test_hooks::FAIL_POOL_SYNC.with(|f| f.replace(false)) {
+                    Err(io::Error::other("injected failure to sync another location's log"))
+                } else {
+                    wal.sync_pending()
+                };
+                #[cfg(not(test))]
+                let synced = wal.sync_pending();
+                if let Err(e) = synced {
                     error!("storage location {} could not be flushed: {}", path, e);
                     if outcome.is_ok() {
                         outcome = Err(e);
@@ -635,41 +2122,187 @@ impl Database {
                 }
             }
         }
+        outcome
+    }
 
-        if let Some(wal) = crate::core::wal::wal_for(location) {
-            if let Err(e) = wal.sync_pending() {
-                error!("storage location {} could not be flushed: {}", location, e);
-                if outcome.is_ok() {
-                    outcome = Err(e);
-                }
-            }
+    /// Syncs the database's own log — rows written to root-located tables and
+    /// the outcome records — then copies the staged outcomes into the status
+    /// file.
+    ///
+    /// The second half of [`Database::sync_durable`]. On its own it is the
+    /// whole post-commit sync for a transaction that went through
+    /// [`Database::commit_written_transaction`], which has already made its
+    /// rows on every other location durable.
+    ///
+    /// Only the log's sync can fail it. Once the log has synced, the commit
+    /// is durable and the copy is bookkeeping the log already covers (see
+    /// [`Database::copy_staged_outcomes`]).
+    pub fn sync_own_location(&self) -> std::io::Result<()> {
+        self.sync_own_log()?;
+        self.copy_staged_outcomes();
+        Ok(())
+    }
+
+    /// [`Database::apply_staged_outcomes`] for a caller whose log has just
+    /// synced, where a failed copy is not a failed commit.
+    ///
+    /// It used to be one. Every commit path aborted on the error, so a
+    /// transaction whose commit record was already durable in an unpoisoned
+    /// log was rolled back in memory: readers that had seen its rows lost
+    /// them, the client was told the commit failed, and replication never
+    /// published it — while a crash before the abort's own record reached the
+    /// disk had replay bring the commit back on this node alone. The ranges
+    /// stay staged, the next sync or the log writer's round retries them, and
+    /// a checkpoint writes them before discarding the log; the callee has
+    /// already logged the error for the operator.
+    fn copy_staged_outcomes(&self) {
+        let _ = self.apply_staged_outcomes();
+    }
+
+    /// Copies the outcomes the log has made durable into the status file.
+    ///
+    /// A failure here is not a failure of durability: the log already holds
+    /// these outcomes, a restart's replay would put them in the file, and the
+    /// ranges stay staged for the next call. It is reported so a caller can
+    /// say the disk is unwell, not so it can conclude the commit was lost.
+    pub(crate) fn apply_staged_outcomes(&self) -> std::io::Result<()> {
+        if self.location.is_none() {
+            return Ok(()); // in-memory: no status file
         }
-
+        #[cfg(test)]
+        if test_hooks::FAIL_STAGED_COPY.with(|f| f.replace(false)) {
+            return Err(io::Error::other("injected failure to copy staged outcomes"));
+        }
         // Outcome bytes that `flush_deferred` staged may be copied into the
         // status file now, and not before: the log record justifying them is
         // durable as of the sync above. The file is never fsynced here — the
         // log is what makes it recoverable — so a copy taken any earlier could
         // reach the disk on its own and outlive the rows it speaks for.
-        if outcome.is_ok() {
-            if let Err(e) = self.transactions.apply_staged() {
-                error!("transaction outcomes could not be written to the status file: {}", e);
-                outcome = Err(e);
-            }
+        if let Err(e) = self.transactions.apply_staged() {
+            error!(
+                "transaction outcomes could not be written to the status file: {}",
+                e
+            );
+            return Err(e);
         }
-
-        outcome
+        Ok(())
     }
+
+    /// Commits a transaction that wrote, once its rows on every storage
+    /// location other than the database's own are durable.
+    ///
+    /// The order is the point. `commit_transaction` records the outcome in
+    /// memory, and from then on *anyone's* flush can put it in the root log
+    /// and make it durable: `StatusLog::stage` writes the whole dirty range,
+    /// other transactions' bits included, and a ROLLBACK, a failed statement,
+    /// the outcome fold, another session's `sync_durable` or the log writer
+    /// then syncs the root log with no thought for a second disk. A crash
+    /// after that and before this transaction's own sync came back with its
+    /// root rows committed and its rows on the other disk gone — a torn
+    /// transaction reported as a success (`cross_dir_commit_tests`). Rows are
+    /// all appended before the commit, so syncing the other locations here
+    /// means no outcome of a transaction committed *through this method* can
+    /// become durable ahead of them, whoever stages it. Within the root's own
+    /// log rows already precede their outcome. Every committer of a writing
+    /// transaction has to come through here: the executor, pgwire and
+    /// replication apply do. The PostgreSQL import does not — it commits
+    /// batches in memory into a database nobody has been handed yet and
+    /// makes all of it durable once, at the end (`migrate::run::finish`).
+    ///
+    /// Not an extra sync in the common case: these logs used to be synced by
+    /// `sync_durable` right after the commit, and the caller now follows with
+    /// [`Database::sync_own_location`] instead. A database with no second
+    /// location, or none with unsynced writes, pays nothing. Otherwise every
+    /// location with unsynced writes is synced, *anyone's* writes, including
+    /// for a transaction that never wrote there: which logs a transaction
+    /// wrote is not tracked. So under `synchronous_commit = off` it is a sync
+    /// that was not there before, and in both modes `tx` holds its row locks
+    /// and stays running for it, which widens the window in which a
+    /// concurrent writer of the same rows gets `40001`. That mode gives up
+    /// the newest transactions on an OS crash, not their atomicity, and
+    /// keeping the atomicity without this sync would need the per-transaction
+    /// record of written logs and their positions.
+    ///
+    /// It is also where a write is refused under an id the transaction-id
+    /// reservation does not cover, because writing the reservation failed
+    /// (see [`crate::core::mvcc::TransactionManager::check_ids_reserved`]).
+    /// The error's kind is `StorageFull` when the disk is full.
+    ///
+    /// On failure nothing has been committed. The caller aborts `tx` and
+    /// reports the statement as failed.
+    pub fn commit_written_transaction(
+        &self,
+        tx: crate::core::mvcc::TxId,
+    ) -> std::io::Result<TransactionFamily> {
+        self.transactions.check_ids_reserved(tx)?;
+        self.sync_other_locations()?;
+        let mut family = self.family_of(tx);
+        // The replication record, ahead of the commit: on failure nothing
+        // has been committed, and the caller aborts.
+        self.prepare_replication(tx, &mut family)?;
+        Ok(self.commit_family(tx, family))
+    }
+
+    /// Commits a transaction with nothing to make durable first.
+    ///
+    /// Infallible, so a replication record that cannot be written is not a
+    /// commit that can be refused: the statement has run. It is reported, and
+    /// kept on show, as a statement the peers will never receive.
     pub fn commit_transaction(&self, tx: crate::core::mvcc::TxId) -> TransactionFamily {
         // Read *before* the commit. A rolled-back savepoint already resolves as
         // aborted while its parent runs, so the answer is correct here — and
         // asking afterwards would depend on the manager keeping its parent map
         // past the commit, which it happens to do and is not obliged to.
-        let family = self.family_of(tx);
+        let mut family = self.family_of(tx);
+        if let Err(e) = self.prepare_replication(tx, &mut family) {
+            self.replication.note_capture_failure(format!(
+                "A transaction committed but could not be written to the replication log ({}); \
+                 the peers will not receive it",
+                e
+            ));
+        }
+        self.commit_family(tx, family)
+    }
+
+    /// Writes `tx`'s replication record, if it captured anything, and ties it
+    /// to `family`. See `Replication::prepare_family` for why this comes
+    /// before the commit.
+    fn prepare_replication(
+        &self,
+        tx: crate::core::mvcc::TxId,
+        family: &mut TransactionFamily,
+    ) -> std::io::Result<()> {
+        if !self.replication.is_active() {
+            return Ok(());
+        }
+        let wrote = self.transactions.wrote_family(tx);
+        if self
+            .replication
+            .prepare_family(&family.members, tx, wrote)?
+            .is_some()
+        {
+            family.record = Some((tx, self.replication.clone(), self.transactions.clone()));
+        }
+        Ok(())
+    }
+
+    fn commit_family(&self, tx: crate::core::mvcc::TxId, family: TransactionFamily) -> TransactionFamily {
         self.transactions.commit(tx);
-        // A lock outlives nothing: whatever this transaction held is another
-        // transaction's the moment it ends.
-        self.row_locks.release_all(tx);
+        // A row lock outlives nothing: whatever this transaction held is
+        // another transaction's the moment it ends. Its owner's table locks
+        // are not released here (finding L4): the outcome is not durable yet,
+        // and an AE granted in between could rewrite rows a failed flush then
+        // aborts. The owner goes after the last durability step, with
+        // `release_owner` (an autocommit statement's scope end, a block's end).
+        self.row_locks.release_rows(tx);
         family
+    }
+
+    /// Releases everything `owner` holds: its table locks, its wait-for edge,
+    /// the aliases pointing at it. After the last durability step of the
+    /// statement or block it owns (docs/persistent-indexes.md §7 Lifetime).
+    pub fn release_owner(&self, owner: crate::core::mvcc::owner::LockOwner) {
+        self.row_locks.release_owner(owner);
     }
 
     /// Hands a committed, durable transaction to the peers.
@@ -682,9 +2315,9 @@ impl Database {
     /// In the default asynchronous mode this is a channel send per peer, so a
     /// peer that is slow or gone cannot hold a commit up. Under a synchronous
     /// mode it waits for acknowledgements, bounded by `ack_timeout`.
-    pub async fn publish_transaction(&self, family: TransactionFamily) {
-        if let Some(record) = self.replication.commit_record_family(&family.0) {
-            self.replication.publish(record).await;
+    pub async fn publish_transaction(&self, mut family: TransactionFamily) {
+        if let Some((root, replication, _)) = family.record.take() {
+            replication.publish_prepared(root).await;
         }
     }
 
@@ -709,16 +2342,21 @@ impl Database {
         // map, and a database that is not replicating should not pay for a
         // question whose answer it will throw away.
         if !self.replication.is_active() {
-            return TransactionFamily(vec![(tx, true)]);
+            return TransactionFamily {
+                members: vec![(tx, true)],
+                record: None,
+            };
         }
 
-        TransactionFamily(
-            self.transactions
+        TransactionFamily {
+            members: self
+                .transactions
                 .family_of(tx)
                 .into_iter()
                 .map(|id| (id, self.transactions.outcome(id) != TxOutcome::Aborted))
                 .collect(),
-        )
+            record: None,
+        }
     }
 
     /// Ends `tx` without effect and discards what replication buffered for it.
@@ -727,10 +2365,45 @@ impl Database {
         // relying on that would make this quietly wrong the day something does.
         let family = self.family_of(tx);
         self.transactions.abort(tx);
-        self.row_locks.release_all(tx);
+        // Rows only, as in `commit_transaction`. An autocommit attempt that
+        // conflicted ends here, and its statement's owner keeps its table
+        // locks and graph node for the next attempt (finding L4).
+        self.row_locks.release_rows(tx);
         // Every id, including savepoints: their buffers would otherwise sit in
         // the capture map for the life of the process.
         self.replication.on_abort_family(&family.ids());
+    }
+
+    /// Opens replication's two files and settles what a crash left in them.
+    ///
+    /// Called at every server start whether or not replication is switched
+    /// on, when the files are there: a record or a position written ahead of
+    /// a commit that never happened is decided by asking how its transaction
+    /// ended, and that has to be asked before anything can forget the answer.
+    pub fn open_replication_storage(&self) -> io::Result<()> {
+        let transactions = self.transactions.clone();
+        let committed = move |tx: crate::core::mvcc::TxId| {
+            transactions.outcome(tx) == crate::core::mvcc::TxOutcome::Committed
+        };
+        self.replication.open_storage_logged(
+            self.location.as_deref().map(std::path::Path::new),
+            self.transactions.outcome_log(),
+            &committed,
+        )
+    }
+
+    /// Whether this database's directory holds replication files from an
+    /// earlier run.
+    pub fn has_replication_files(&self) -> bool {
+        // By prefix: the log's first file is gone once retention has let
+        // it go, and any one of them left means there is something to settle.
+        self.location.as_deref().is_some_and(|dir| {
+            std::fs::read_dir(dir).is_ok_and(|entries| {
+                entries
+                    .flatten()
+                    .any(|entry| entry.file_name().to_string_lossy().starts_with("db_replication."))
+            })
+        })
     }
 
     /// Brings replication up: opens its log, starts each peer, and starts the
@@ -752,7 +2425,7 @@ impl Database {
             .validate()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-        replication.open_storage(database.location.as_deref().map(std::path::Path::new))?;
+        database.open_replication_storage()?;
         replication.set_active(true);
 
         for peer_config in &config.peers {
@@ -768,7 +2441,10 @@ impl Database {
             // Bound here rather than inside the task, so a port that is already
             // held is reported to whoever asked for the listener instead of
             // being logged into the void behind a success.
-            let server = match crate::replication::server::bind(&replication) {
+            // A socket handed over with `Replication::serve_on` if there is
+            // one, the configured port otherwise.
+            let listener = replication.take_bound_listener();
+            let server = match crate::replication::server::bind_on(&replication, listener) {
                 Ok(server) => server,
                 Err(e) => {
                     replication.release_listener();
@@ -801,6 +2477,7 @@ impl Database {
     /// really were released. Schema comes back, rows do not, and nothing
     /// reports an error at any point.
     pub async fn drop_table(&self, table_name: &str) -> io::Result<bool> {
+        let _changed = SchemaChanged::unless_internal(&self.schema_generation, table_name);
         self.drop_table_to_depth(table_name, 0).await
     }
 
@@ -812,47 +2489,176 @@ impl Database {
     /// a sidecar names a shadow that names it back. Stopping is right in that
     /// case — leaking a table is recoverable, recursing forever is not.
     async fn drop_table_to_depth(&self, table_name: &str, depth: usize) -> io::Result<bool> {
-        let Some((_, table)) = self.tables.remove(table_name) else {
+        // The map key DDL mutates (`resolve_key`): where identifier case
+        // folding drops in, so every mutator removes the slot a lookup finds.
+        let resolved = self.resolve_key(table_name);
+        let table_name = resolved.as_deref().unwrap_or(table_name);
+        // §7: DROP runs under the ACCESS EXCLUSIVE its statement took on the
+        // name (a shadow table, exempt, under its parent's). Statements that
+        // queued behind it find the slot dropped once it is released, and get
+        // 42P01 (see `table_for`).
+        debug_assert!(
+            self.exclusive_held(table_name),
+            "DROP of \"{table_name}\" without ACCESS EXCLUSIVE on it (§7)"
+        );
+        // A partitioned table drops through its own order. Resolved before
+        // `tables` is touched: its shell is there too, and the plain path
+        // below would sweep `<name>*` files it never had.
+        //
+        // A shell with no partitioned table behind it is refused before the
+        // map is touched: taking the entry out and putting it back would let
+        // a concurrent statement see no table, or a concurrent CREATE of the
+        // same name slip in between.
+        match self.relation(table_name) {
+            Some(Relation::Partitioned(_)) => return self.drop_partitioned(table_name).await,
+            Some(Relation::Plain(table)) => {
+                table.data()?;
+                // A held rename's intent names this table, and the next open
+                // settles the kept files by which of its two names the
+                // catalogue still holds. Dropped now, it would hold neither,
+                // the open would leave the kept files, and a table created
+                // under their name would take their rows.
+                if self.held_names.lock().iter().any(|h| h == table_name) {
+                    return Err(io::Error::other(format!(
+                        "\"{table_name}\" is part of a rename whose old files could not be released yet; \
+                         restart before dropping it"
+                    )));
+                }
+            }
+            None => {}
+        }
+        // Through the sweep below: see `deletion_permit`. Taken before the
+        // table leaves the map and the catalogue: a drop waiting for it with
+        // the table half gone hid the table, files still on disk, and a
+        // `CREATE TABLE` of the name was refused for those files.
+        let Some(logs) = self.table_held(table_name).map(|table| {
+            table
+                .io_rows()
+                .map(|io| logs_holding(io, &self.storage, self.location.as_deref()))
+        }) else {
             return Ok(false);
         };
+        let logs = logs?;
+        let snapshot_gate = deletion_permit(&logs).await;
+        drop(logs);
+        let Some(table) = self.take_table(table_name) else {
+            return Ok(false);
+        };
+        // Its maintenance stops, and a vacuum in flight on it finishes, before
+        // its files are released (§7 step 2). Not for a statement's own
+        // temporary, which no maintenance outlives (finding L12).
+        if !table_for::lock_exempt(table_name) {
+            table.retire().await;
+        }
 
         // Before the files go: a failure here must leave the table intact rather
         // than half-dropped, and the catalogue is the half that decides whether
         // it exists at all.
-        if let Err(e) = self.forget_in_catalogue(table_name).await {
-            self.tables.insert(table_name.to_string(), table);
+        //
+        // A statement's own relation has no row (`add_table_unguarded`). The
+        // search for one read the catalogue's schema, which opens its ten
+        // sidecars and, the first time in a database, creates each with a
+        // directory sync: ~90 ms on the first derived-table query after a
+        // database was made. A row an older build wrote for one is the
+        // startup reaper's (`load_db_tables`).
+        if !is_statement_scoped(table_name)
+            && let Err(e) = self.forget_in_catalogue(table_name).await
+        {
+            self.put_back_after_failed_drop(table_name, table).await;
             error!("Could not remove {} from the catalogue: {}", table_name, e);
             return Err(e);
         }
 
-        table.io_rows.drop_io();
-        table.io_pointers.drop_io();
+        // Before any file goes, and after the catalogue row: see
+        // `forget_logged_files`. Records name files by a hash of the file
+        // name, so the next table of this name would otherwise have this one's
+        // records replayed into it at the next open, crash or not.
+        let mut unconfirmed = None;
+        if let Err(failure) = self.forget_dropped_files(table.io_rows()?, table_name) {
+            if !failure.maybe_logged {
+                // No barrier reached any log: the row goes back, so a failed
+                // drop leaves the table as it was.
+                error!(
+                    "Could not void the log's records for {}, so it was not dropped: {}",
+                    table_name, failure.error
+                );
+                if let Err(restore) = self.remember_in_catalogue(table_name).await {
+                    error!(
+                        "... and could not put its catalogue row back ({}): it is open now \
+                         but will not be after a restart, though its files remain",
+                        restore
+                    );
+                }
+                self.put_back_after_failed_drop(table_name, table).await;
+                return Err(failure.error);
+            }
+            // A barrier may be durable (the log failed past its append and is
+            // poisoned now), so the table cannot come back: a restart would
+            // open it with its unflushed records void. It is dropped, as
+            // asked, files included. Unlike feat/partitioning, which keeps
+            // the files and relies on its leftover-file name guard, this
+            // branch has no such guard, and a later table of this name would
+            // open kept files as its own. With the files gone, records a lost
+            // barrier left live resolve to nothing at the next open (replay
+            // resolves ids from the directory listing).
+            //
+            // And it is reported as the drop it is, unless the database's own
+            // log is poisoned: then not even the catalogue tombstone is known
+            // to be durable, and nothing after it can commit. An error here
+            // otherwise told the `ALTER` rewrites, which drop and then create
+            // again, that nothing happened, so they stopped between the two
+            // and lost the rows they held in memory, though a backup's log
+            // refusing its barrier while the database's own log took it is no
+            // reason to stop the create that follows.
+            error!(
+                "Dropped {} but could not make the void of its log records durable: {}",
+                table_name, failure.error
+            );
+            if self.own_log_poisoned() {
+                unconfirmed = Some(failure.error);
+            }
+        }
+
+        let data = table.data()?;
+        data.io_rows.drop_io();
+        data.io_pointers.drop_io();
         table.io_schema.drop_io();
-        table.io_filters.drop_io();
         // Including the id sequence: a table recreated under the same name would
         // otherwise inherit the old one's floor and start numbering from it.
-        table.io_sequence.drop_io();
+        data.ids.io.drop_io();
 
-        // The five handles above are the five files a `Table` holds open. A
-        // table owns ten: the `_schema_*` sidecars are opened lazily, so they
+        // The four handles above are the four files a `Table` holds open. A
+        // table owns more: the `_schema_*` sidecars are opened lazily, so they
         // were never in a handle to release and survived every drop. Sweeping
         // the full list closes that, and uses the same list the rename moves —
         // one place to update when a sidecar is added, and one guard test
         // covering both directions.
         //
-        // Harmless for the files just released: `discard_files` tolerates a name
+        // Harmless for the files just released: `sweep_files` tolerates a name
         // that is not there, which is also what makes it usable for cleaning up
-        // a rename that never finished.
-        discard_files(
-            &seed_in(&self.db_io_pointers, &self.storage, table_name).await,
+        // a rename that never finished. The log was told above.
+        sweep_files_durably(
+            &seed_in(
+                &self.db_io_pointers,
+                &self.storage,
+                &self.kv,
+                &self.seeds,
+                table_name,
+            )
+            .await,
+            &self.storage,
+            self.location.as_deref(),
             table_name,
         )
         .await;
+        // Released before the shadow tables below, which take it again.
+        drop(snapshot_gate);
 
         // After the files, never before: a placement dropped first would send
         // the sweep above to the database directory, where it would find
         // nothing and report a clean drop over a table still on disk.
         pool_forget(&self.storage, table_name);
+        self.forget_seed(table_name);
 
         // A shadow table is storage the engine created to back a JSON column,
         // owned by the parent's column rather than by the user. Nothing will
@@ -865,10 +2671,8 @@ impl Database {
                     continue;
                 }
                 // A shadow can itself hold JSON columns, so this walks the chain.
-                if let Err(e) = Box::pin(
-                    self.drop_table_to_depth(&json.shadow_table, depth + 1),
-                )
-                .await
+                if let Err(e) =
+                    Box::pin(self.drop_table_to_depth(&json.shadow_table, depth + 1)).await
                 {
                     // The parent is already gone; failing here would report a
                     // drop that did happen as one that did not.
@@ -885,8 +2689,109 @@ impl Database {
             );
         }
 
+        if let Some(e) = unconfirmed {
+            return Err(e);
+        }
         info!("Dropped table {}", table_name);
         Ok(true)
+    }
+
+    /// A DROP that failed after taking the table out puts it back: a
+    /// retired instance never goes back (N14, N23), so a fresh one is opened
+    /// from the files the failure left; a statement's own temporary, which
+    /// was not retired, goes back as it was.
+    async fn put_back_after_failed_drop(&self, table_name: &str, table: Arc<Table<DbStorageProvider>>) {
+        if table.is_retired() && !table_for::lock_exempt(table_name) {
+            drop(table);
+            self.reopen_fresh(table_name).await;
+        } else {
+            self.install_table(table_name.to_string(), table);
+        }
+    }
+
+    /// Whether the database's own log, which holds the catalogue, is poisoned.
+    fn own_log_poisoned(&self) -> bool {
+        self.location
+            .as_deref()
+            .and_then(crate::core::wal::wal_for)
+            .is_some_and(|wal| wal.is_poisoned())
+    }
+
+    /// [`forget_logged_files`] for a table being dropped, once its catalogue
+    /// tombstone is durable: a barrier that outlived the tombstone in a crash
+    /// would void the records of a table that still exists.
+    ///
+    /// The tombstone is an in-place write, whose commit already syncs the
+    /// database's own log, so the sync here is normally a no-op; it is asked
+    /// for rather than inherited because the barriers depend on it. Skipped
+    /// when the first barrier goes to the database's own log, whose commit
+    /// sync covers everything before it there anyway. Nothing at all for a
+    /// table with no log, which covers every statement-scoped relation: those
+    /// are dropped once per CTE, and a sync each is the cost their memory
+    /// backing exists to avoid.
+    fn forget_dropped_files(
+        &self,
+        io: &DbStorageProvider,
+        table_name: &str,
+    ) -> Result<(), ForgetFailure> {
+        let ids: Vec<u64> = table_file_names(table_name)
+            .map(|file| crate::core::wal::file_id_for_name(&file))
+            .collect();
+        self.forget_dropped_ids(io, &ids)
+    }
+
+    /// [`Self::forget_dropped_files`] for files named by their log ids: a
+    /// partitioned table's `__pt_<uid>_*` files, which no table name derives.
+    /// One order for both drops: the catalogue tombstone durable first, then
+    /// a [`Barrier::Drop`] barrier, in every log `io` reaches.
+    fn forget_dropped_ids(&self, io: &DbStorageProvider, ids: &[u64]) -> Result<(), ForgetFailure> {
+        let logs = logs_holding(io, &self.storage, self.location.as_deref());
+        if logs.is_empty() {
+            return Ok(());
+        }
+        if !self.leads_with_own_log(&logs) {
+            self.sync_own_log().map_err(|error| ForgetFailure {
+                error,
+                maybe_logged: false,
+            })?;
+        }
+        forget_logged_ids(&logs, ids, Barrier::Drop)
+    }
+
+    /// Whether the first of `logs` is the database's own log, whose barrier
+    /// commit then syncs every catalogue change logged before it.
+    fn leads_with_own_log(&self, logs: &[StdArc<crate::core::wal::Wal>]) -> bool {
+        let own = self.location.as_deref().and_then(crate::core::wal::wal_for);
+        matches!((logs.first(), own), (Some(first), Some(own)) if StdArc::ptr_eq(first, &own))
+    }
+
+    /// Makes the database's own log durable: the catalogue's changes.
+    pub(crate) fn sync_own_log(&self) -> std::io::Result<()> {
+        let Some(location) = self.location.as_deref() else {
+            return Ok(()); // in-memory: nothing to sync
+        };
+        if let Some(wal) = crate::core::wal::wal_for(location) {
+            if let Err(e) = wal.sync_pending() {
+                error!("storage location {} could not be flushed: {}", location, e);
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses `name` while files kept under it still have live log records
+    /// (see `held_names`).
+    fn refuse_held_name(&self, name: &str) -> io::Result<()> {
+        if self.held_names.lock().iter().any(|held| held == name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "the files of a table formerly named \"{name}\" are still on disk with log \
+                     records that could not be voided; the name is free again after a restart"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Tombstones a table's row in the database catalogue.
@@ -901,6 +2806,10 @@ impl Database {
     /// a table created before the catalogue existed, or one already forgotten,
     /// should still drop cleanly.
     async fn forget_in_catalogue(&self, table_name: &str) -> io::Result<bool> {
+        #[cfg(test)]
+        if test_hooks::FAIL_TOMBSTONE.with(|f| f.replace(false)) {
+            return Err(io::Error::other("injected catalogue tombstone failure"));
+        }
         tombstone_catalogue_row(
             &self.db_io_pointers,
             &self.db_io_rows,
@@ -953,9 +2862,29 @@ impl Database {
     /// no more correct and briefly much less so. The names read as stale; the
     /// data resolves.
     pub async fn rename_table(&self, old_name: &str, new_name: &str) -> io::Result<()> {
+        // The map key DDL mutates (`resolve_key`): where identifier case
+        // folding drops in, so every mutator removes the slot a lookup finds.
+        let resolved = self.resolve_key(old_name);
+        let old_name = resolved.as_deref().unwrap_or(old_name);
+        // For the whole rename, before anything is checked or paused: a
+        // snapshot uploading now listed the old files and holds none of the
+        // new ones (see `relocation_permit`).
+        let _relocating = relocation_permit(self.location.is_some(), old_name).await;
+        // The table's handle is dropped before the reopened one registers;
+        // the database's forgotten horizon must not move in that gap, or the
+        // reopened files could carry ids it forgot. See `ForgetRegistry`.
+        let _forget_pause = self.transactions.forget_pause();
+        let _changed = SchemaChanged::unless_internal(&self.schema_generation, old_name)
+            .or_else(|| SchemaChanged::unless_internal(&self.schema_generation, new_name));
         if old_name == new_name {
             return Ok(());
         }
+        // §7: under ACCESS EXCLUSIVE on both names, taken in name order by
+        // the statement before anything here ran.
+        debug_assert!(
+            self.exclusive_held(old_name) && self.exclusive_held(new_name),
+            "RENAME of \"{old_name}\" to \"{new_name}\" without ACCESS EXCLUSIVE on both names (§7)"
+        );
         if new_name.is_empty() || new_name.len() > 128 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -968,19 +2897,82 @@ impl Database {
                 "that prefix is reserved for tables backing JSON columns",
             ));
         }
-        if !self.tables.contains_key(old_name) {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
+        // Only as a destination, as the other reserved prefixes: renaming a
+        // table off it is how one created before the refusal is kept.
+        if let Some(reason) = crate::core::rql::cte::reserved_name_refusal(new_name) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
         }
-        if self.tables.contains_key(new_name) {
+        // The old name only as far as the copy below needs: a name that is not
+        // a plain stem has files it cannot find by suffix. A reserved prefix is
+        // refused only as a destination — renaming a legacy table off it is
+        // the one way to move it.
+        if let Some(reason) = table_name_refusal(new_name).or_else(|| table_stem_refusal(old_name))
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+        }
+        // The new name taken by a partitioned table is a name taken, as by
+        // a plain one (42P07), whatever the renamed table is.
+        if self.is_partitioned(new_name) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "a table of that name already exists",
+                format!("relation \"{new_name}\" already exists"),
             ));
+        }
+        // A partitioned table moves no file: its catalogue row is re-keyed
+        // under the same uid (docs/partitioning.md §3.1, phase 3 P1).
+        if self.is_partitioned(old_name) {
+            // Type-erased: the statement future's `Send` proof is already
+            // near the compiler's recursion limit.
+            let renamed: std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + '_>> =
+                Box::pin(self.rename_partitioned(old_name, new_name));
+            return renamed.await;
+        }
+        // Both names, held to the return, ahead of every check: a rename is a
+        // CREATE of the new name, whose row a concurrent CREATE could also be
+        // writing (a partitioned one has no `<name>*` files for the check below
+        // to find), and the old name leaves `tables` while its row is live.
+        let _new_claim = self.claim_name(new_name)?;
+        let _old_claim = self.claim_name(old_name)?;
+        // Both names, before `tables`: a partitioned table renamed this way
+        // would be reopened as a plain one with `clusters = 0`, and its
+        // `__pt_<uid>_*` files reaped at the next start (§3.1). One with no
+        // shell in `tables` (its schema unreadable) is refused too, rather
+        // than reported missing. PARTITION-TODO(rename): §3.1's rename.
+        self.refuse_partitioned(old_name, "RENAME")?;
+        self.refuse_partitioned(new_name, "RENAME onto a partitioned name")?;
+        if !self.has_table(old_name) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
+        }
+        if self.has_table(new_name) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("relation \"{new_name}\" already exists"),
+            ));
+        }
+        self.refuse_held_name(new_name)?;
+        // One rename's intent at a time (`rename_serial`), taken before the
+        // check below, which a concurrent rename's failure could otherwise
+        // change between it and this rename's intent.
+        let _serial = self.rename_serial.lock().await;
+        // A rename whose old files are kept still has its intent on disk, and
+        // the next open finishes it from there; a new intent would replace it.
+        if let Some(held) = self.held_names.lock().first() {
+            return Err(io::Error::other(format!(
+                "an earlier rename has not finished (the files of \"{held}\" are kept until \
+                 the next open discards them); restart before renaming again"
+            )));
+        }
+        // The old table is counted among the owners, deliberately: renaming
+        // `foo` to `foo_seq` copies `foo.db` onto `foo_seq.db`, which is `foo`'s
+        // own sequence file and a source the copy has not reached yet.
+        if let Some(reason) = self.table_files_conflict(new_name) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, reason));
         }
 
         // Recorded before anything moves, so a crash anywhere below is
         // recognisable on the next open rather than merely non-destructive.
         self.record_rename_intent(old_name, new_name).await?;
+        self.rename_point("after_intent");
 
         // The new name inherits the old one's directory. Done here, before the
         // copy, so every path below — the copy's destination, the cleanup of a
@@ -988,48 +2980,78 @@ impl Database {
         // name to the directory its files are actually in.
         pool_rename(&self.storage, old_name, new_name);
 
-        // The handle goes first so its maintenance task stops before the files
-        // are read: a background flush landing mid-copy would put bytes in the
-        // source that the copy has already passed.
-        let table = self.tables.remove(old_name).map(|(_, t)| t);
+        // The instance is retired first so its maintenance stops before the
+        // files are read: a background flush landing mid-copy would put bytes
+        // in the source that the copy has already passed. It stays in the
+        // old name's slot until the commit point (§7 step 2): a statement
+        // queued on the name waits there rather than finding it missing, and
+        // a failure below swaps a fresh instance in, never this one.
+        let mut table = self.retire_current(old_name).await;
 
         let copied = self.copy_table_files(old_name, new_name).await;
         if let Err(e) = copied {
             // Nothing has been committed, so the cleanest state is the one we
             // started in. The partial copies are dropped rather than left for
             // recovery: no catalogue row names them.
-            self.discard_table_files(new_name).await;
-            pool_forget(&self.storage, new_name);
-            self.clear_rename_intent().await;
-            if let Some(table) = table {
-                self.tables.insert(old_name.to_string(), table);
+            self.abandon_copy(old_name, new_name).await;
+            if table.is_some() {
+                self.reopen_fresh(old_name).await;
             }
             error!("Rename of {} to {}: copy failed: {}", old_name, new_name, e);
             return Err(e);
         }
+        self.rename_point("after_copy");
+
+        // The file set's index-store pair and its write gate go with it
+        // (docs/persistent-indexes.md §2 P6, §6; B13): the pair copied
+        // under the new stem like the rest, and the word carried, with the
+        // family's ACCESS EXCLUSIVE ticket still counted on it, so the
+        // renamed table opens with it rather than a fresh one. Held to the
+        // end of the rename, so the open below finds it.
+        let to_dir = seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, new_name)
+            .await
+            .index_store_dir();
+        let _carried = match &table {
+            Some(t) => match carry_index_store(t, to_dir, new_name).await {
+                Ok(carried) => carried,
+                Err(e) => {
+                    self.abandon_copy(old_name, new_name).await;
+                    self.reopen_fresh(old_name).await;
+                    error!("Rename of {} to {}: the index-store files could not be carried: {}", old_name, new_name, e);
+                    return Err(e);
+                }
+            },
+            None => None,
+        };
 
         if let Err(e) = self.rewrite_schema_name(new_name).await {
-            self.discard_table_files(new_name).await;
-            pool_forget(&self.storage, new_name);
-            self.clear_rename_intent().await;
-            if let Some(table) = table {
-                self.tables.insert(old_name.to_string(), table);
+            self.abandon_copy(old_name, new_name).await;
+            if table.is_some() {
+                self.reopen_fresh(old_name).await;
             }
-            error!("Rename of {} to {}: schema rewrite failed: {}", old_name, new_name, e);
+            error!(
+                "Rename of {} to {}: schema rewrite failed: {}",
+                old_name, new_name, e
+            );
             return Err(e);
         }
+
+        self.rename_point("after_schema");
 
         // The commit point. After this the new name is the real one.
         if let Err(e) = self.remember_in_catalogue(new_name).await {
-            self.discard_table_files(new_name).await;
-            pool_forget(&self.storage, new_name);
-            self.clear_rename_intent().await;
-            if let Some(table) = table {
-                self.tables.insert(old_name.to_string(), table);
+            self.abandon_copy(old_name, new_name).await;
+            if table.is_some() {
+                self.reopen_fresh(old_name).await;
             }
-            error!("Rename of {} to {}: catalogue insert failed: {}", old_name, new_name, e);
+            error!(
+                "Rename of {} to {}: catalogue insert failed: {}",
+                old_name, new_name, e
+            );
             return Err(e);
         }
+
+        self.rename_point("after_commit");
 
         // Past the commit point, a failure here is not worth unwinding: both
         // rows exist and both tables read, which is the benign window the
@@ -1040,100 +3062,236 @@ impl Database {
                  Both names will be visible until the next open completes the rename.",
                 old_name, new_name, e
             );
+            drop(table.take());
+            self.take_table(old_name);
             self.open_renamed_table(new_name).await;
             return Ok(());
         }
 
-        self.discard_table_files(old_name).await;
-        // Only now: until the old files are gone, the old name still describes
-        // something real, and a placement dropped earlier would send the sweep
-        // above to the wrong directory.
-        pool_forget(&self.storage, old_name);
-        self.clear_rename_intent().await;
+        // The barriers below void the old name's records, which only a
+        // durable catalogue makes safe: one that outlived the catalogue rows in
+        // a crash would leave the old name the table, its unflushed writes
+        // void. The old row's tombstone is an in-place write whose commit
+        // syncs the database's log, so this normally finds nothing owed; it
+        // is asked for rather than inherited because the barriers depend on
+        // it. Every other location first, so the catalogue never names a copy
+        // whose records are not durable. When the old name's first log is the
+        // database's own, the barrier's commit sync covers it all anyway.
+        //
+        // Without the barriers the old name's records stay live in the log
+        // after its files are deleted, and the next open replays them into
+        // whatever table takes the name next: `RENAME src TO dst; CREATE
+        // TABLE src` came back from a restart with `src` holding the old rows.
+        self.rename_point("after_tombstone");
+        let old_seed = seed_in(
+            &self.db_io_pointers,
+            &self.storage,
+            &self.kv,
+            &self.seeds,
+            old_name,
+        )
+        .await;
+        let logs = logs_holding(&old_seed, &self.storage, self.location.as_deref());
+        if !logs.is_empty() && !self.leads_with_own_log(&logs) {
+            if let Err(e) = self.sync_durable() {
+                // The old files stay and so does the intent: once the
+                // catalogue is durable, the next open finishes the rename.
+                error!(
+                    "Renamed {} to {} but could not make it durable, so the old files \
+                     were kept: {}",
+                    old_name, new_name, e
+                );
+                self.hold_intent(old_name, new_name);
+                drop(table.take());
+                self.take_table(old_name);
+                self.open_renamed_table(new_name).await;
+                return Err(e);
+            }
+        }
+
+        if discard_files(
+            &old_seed,
+            &self.storage,
+            self.location.as_deref(),
+            old_name,
+        )
+        .await
+        {
+            // Only now: until the old files are gone, the old name still
+            // describes something real, and a placement dropped earlier would
+            // send the sweep above to the wrong directory.
+            self.rename_point("after_discard");
+            pool_forget(&self.storage, old_name);
+            if !self.clear_rename_intent().await {
+                // The intent outlives the rename: until the next open
+                // finishes it, neither name may be taken, or a table created
+                // under the old one would be what that open tombstones.
+                self.hold_intent(old_name, new_name);
+            }
+            self.rename_point("after_clear");
+        } else {
+            // The intent stays, and the placement with it, so the next open
+            // finds the old files and discards them, barriers first. Until
+            // then the old name is refused: a table created under it would
+            // open the kept files as its own.
+            self.hold_intent(old_name, new_name);
+        }
+        drop(table);
+        self.take_table(old_name);
         self.open_renamed_table(new_name).await;
 
         info!("Renamed table {} to {}", old_name, new_name);
         Ok(())
     }
+
+    /// A rename's test points: the power-loss failpoint `test.rename.<label>`,
+    /// armed for the database's directory. A no-op in a server build and for
+    /// an in-memory database.
+    fn rename_point(&self, label: &str) {
+        #[cfg(test)]
+        if let Some(root) = self.location.as_deref() {
+            let _ = crate::core::power_loss::failpoint::hit(
+                &format!("test.rename.{label}"),
+                std::path::Path::new(root),
+            );
+        }
+        let _ = label;
+    }
+
+    /// Drops a rename's copy that never reached the catalogue. If its files
+    /// cannot be released the intent stays, so the next open discards them.
+    async fn abandon_copy(&self, old_name: &str, new_name: &str) {
+        if self.discard_table_files(new_name).await {
+            pool_forget(&self.storage, new_name);
+            if !self.clear_rename_intent().await {
+                self.hold_intent(old_name, new_name);
+            }
+        } else {
+            self.hold_intent(old_name, new_name);
+        }
+    }
+
+    /// Holds both names of a rename intent the next open has to finish: the
+    /// kept files' name is refused to `CREATE TABLE` and `RENAME … TO`, and
+    /// the table under the other is refused to `DROP`, since the open decides
+    /// what the kept files are by which of the two the catalogue holds.
+    fn hold_intent(&self, old_name: &str, new_name: &str) {
+        let mut held = self.held_names.lock();
+        for name in [old_name, new_name] {
+            if !held.iter().any(|h| h == name) {
+                held.push(name.to_string());
+            }
+        }
+    }
+
     /// Copies every file derived from `old_name` to one derived from `new_name`.
     ///
     /// A file that does not exist copies as a no-op: the sidecars are created
     /// lazily, so a table with no foreign keys has no `_FK.db` and that is not
     /// an error.
     async fn copy_table_files(&self, old_name: &str, new_name: &str) -> io::Result<()> {
+        // A partitioned table has no `<name>*` files: copying would find none
+        // and report a rename that moved nothing.
+        self.refuse_partitioned(old_name, "copying a table's files")?;
+        self.refuse_partitioned(new_name, "copying a table's files")?;
         // A rename does not move a table, so both names resolve to the same
         // directory — but they are resolved separately rather than assumed
         // equal, because that assumption is only true while `pool_rename` runs
         // before this does.
-        let from = seed_in(&self.db_io_pointers, &self.storage, old_name).await;
-        let to = seed_in(&self.db_io_pointers, &self.storage, new_name).await;
+        let from = seed_in(
+            &self.db_io_pointers,
+            &self.storage,
+            &self.kv,
+            &self.seeds,
+            old_name,
+        )
+        .await;
+        let to = seed_in(
+            &self.db_io_pointers,
+            &self.storage,
+            &self.kv,
+            &self.seeds,
+            new_name,
+        )
+        .await;
 
-        for suffix in RENAMED_SUFFIXES {
-            let source = from
-                .create_new(format!("{}{}", old_name, suffix))
-                .await;
-            let len = source.get_len().await;
-            if len == 0 {
-                continue;
-            }
-
-            let destination = to
-                .create_new(format!("{}{}", new_name, suffix))
-                .await;
-
-            // Chunked rather than one allocation: a table is not bounded by
-            // memory and a rename of a large one should not be.
-            const CHUNK: usize = 1 << 20;
-            let mut position = 0u64;
-            let mut buffer = vec![0u8; CHUNK.min(len as usize)];
-            while position < len {
-                let remaining = (len - position) as usize;
-                let take = remaining.min(buffer.len());
-                let mut cursor = position;
-                source
-                    .read_data_into_buffer(&mut cursor, &mut buffer[..take])
-                    .await?;
-                destination.append_data(&buffer[..take], false).await;
-                position += take as u64;
-            }
-
-            // Durable before the catalogue names it: a file the catalogue
-            // points at but the page cache has not written is the one state
-            // this whole ordering exists to avoid.
-            let token = destination.begin_txn();
-            destination
-                .commit_durable(token)
-                .await
-                .map_err(|e| io::Error::other(format!("{e:?}")))?;
-
-            let written = destination.get_len().await;
-            if written != len {
-                return Err(io::Error::other(format!(
-                    "copying {}{} produced {} bytes from {}",
-                    new_name, suffix, written, len
-                )));
-            }
-        }
-        Ok(())
+        copy_files_between(&from, &to, old_name, new_name, RENAMED_SUFFIXES).await
     }
 
     /// Total bytes a table occupies, across every file it owns.
     ///
     /// What a rebalance sorts on: moving the largest table off a full disk
     /// frees the most space for the fewest copies.
+    ///
+    /// A partitioned table is its partitions' running totals (§14): it has no
+    /// `<name>*` files, so the file sum below would report 0, and on a
+    /// key/value seed its opens would create them. A broken one reports 0,
+    /// loudly; a shell with nothing behind it holds no bytes.
     #[cfg(feature = "storage_pools")]
     pub async fn table_bytes(&self, table_name: &str) -> u64 {
-        let seed = seed_in(&self.db_io_pointers, &self.storage, table_name).await;
+        match self.relation(table_name) {
+            Some(Relation::Partitioned(table)) => {
+                return match table.totals().await {
+                    Ok(totals) => totals.bytes,
+                    Err(e) => {
+                        error!("the size of partitioned table {} is unknown: {}", table_name, e);
+                        0
+                    }
+                };
+            }
+            Some(Relation::Plain(table)) if table.is_shell() => return 0,
+            _ => {}
+        }
+        let seed = seed_in(
+            &self.db_io_pointers,
+            &self.storage,
+            &self.kv,
+            &self.seeds,
+            table_name,
+        )
+        .await;
         let mut total = 0u64;
-        for suffix in RENAMED_SUFFIXES {
-            let io = seed.create_new(format!("{}{}", table_name, suffix)).await;
-            total = total.saturating_add(io.get_len().await);
+        // Read-only. Opening each file to ask its length — what this used to
+        // do — creates every sidecar the table never had, each with a `.tmp`
+        // and a directory fsync, so a `DRY RUN` wrote to the disk it was
+        // planning for; it also flushed the live table's staged bytes from a
+        // second handle. The stat sums what an open would have reported: the
+        // file plus its staged `.tmp`.
+        if let Some(directory) = seed.get_location() {
+            let directory = std::path::Path::new(&directory);
+            for file in table_file_names(table_name) {
+                for on_disk in [
+                    directory.join(&file),
+                    directory.join(format!("{}.tmp", file)),
+                ] {
+                    if let Ok(meta) = std::fs::metadata(&on_disk) {
+                        total = total.saturating_add(meta.len());
+                    }
+                }
+            }
+            return total;
+        }
+        match &*seed {
+            DbStorageProvider::Memory(memory) => {
+                for file in table_file_names(table_name) {
+                    total = total.saturating_add(memory.stored_len(&file).unwrap_or(0));
+                }
+            }
+            // A key/value store has no length query short of opening the file.
+            // Opening reads the store and writes nothing to it; it does register
+            // the name with the family, which is in-process only.
+            _ => {
+                for file in table_file_names(table_name) {
+                    let io = seed.create_new(file).await;
+                    total = total.saturating_add(io.get_len().await);
+                }
+            }
         }
         total
     }
 
-    /// Moves a table's files into `destination`, which must be a storage
-    /// location of this database.
+    /// Moves a table's bytes onto `destination`, which may be a storage
+    /// location, another key/value store, or memory.
     ///
     /// Returns the number of bytes copied.
     ///
@@ -1142,69 +3300,214 @@ impl Database {
     /// Copy, then flip the placement, then delete the originals. Every window
     /// between those steps leaves a *leak* rather than a loss:
     ///
-    /// * crash after the copy — the placement still names the old directory,
-    ///   the table opens from it unchanged, and the new copies are orphans that
+    /// * crash after the copy — the placement still names the old backend, the
+    ///   table opens from it unchanged, and the new copies are orphans that
     ///   nothing reads. `db_storage.cfg` is the only thing that decides where a
-    ///   table is, so files it does not name are invisible.
-    /// * crash after the flip — the table opens from the new directory and the
+    ///   table is, so bytes it does not name are invisible.
+    /// * crash after the flip — the table opens from the new backend and the
     ///   originals are the orphans.
     ///
     /// The placement flip is a rename over `db_storage.cfg`, so there is no
     /// state in which it is half-applied. That is the whole reason the pool
     /// file is rewritten atomically rather than appended to.
+    ///
+    /// # Why this works for every backend
+    ///
+    /// The copy is `StorageIO` to `StorageIO`, one named file at a time. It
+    /// never reads a directory entry, an object key or a buffer address, so a
+    /// directory, an in-memory registry and a key/value family are all just a
+    /// provider to it — which is what makes file to memory to key/value to S3
+    /// one operation instead of twelve.
+    ///
+    /// The two things that are *not* backend-agnostic are handled by the
+    /// caller: a directory destination has to be a location of this database,
+    /// and a store destination has to be configured. Both are checked here
+    /// before anything is copied.
     #[cfg(feature = "storage_pools")]
     pub async fn move_table_to(&self, table_name: &str, destination: &str) -> io::Result<u64> {
-        use crate::core::storage::LocationRole;
+        // Before the destination is parsed, so the refusal names the table.
+        self.refuse_partitioned(table_name, "STORAGE MOVE TABLE")?;
+        let backend = crate::core::storage::TableBackend::parse(destination);
+        self.move_table_to_backend(table_name, &backend).await
+    }
 
-        let destination = crate::core::storage::normalize(destination);
+    /// [`Self::move_table_to`], with the destination already resolved.
+    #[cfg(feature = "storage_pools")]
+    pub async fn move_table_to_backend(
+        &self,
+        table_name: &str,
+        destination: &crate::core::storage::TableBackend,
+    ) -> io::Result<u64> {
+        use crate::core::storage::{LocationRole, TableBackend};
+        // The map key DDL mutates (`resolve_key`): where identifier case
+        // folding drops in, so every mutator removes the slot a lookup finds.
+        let resolved = self.resolve_key(table_name);
+        let table_name = resolved.as_deref().unwrap_or(table_name);
+        // For the whole move, as a rename: see `relocation_permit`.
+        let _relocating = relocation_permit(self.location.is_some(), table_name).await;
+        // The table's handle is dropped before the reopened one registers;
+        // the database's forgotten horizon must not move in that gap, or the
+        // reopened files could carry ids it forgot. See `ForgetRegistry`.
+        let _forget_pause = self.transactions.forget_pause();
+        // Before anything: the move reopens the table with `Table::new`, and a
+        // partitioned table's partitions are not in the placement map at all
+        // (§3.1). Moving one partition is a later phase's MOVE PARTITION.
+        self.refuse_partitioned(
+            table_name,
+            "STORAGE MOVE TABLE (a partition moves with MOVE PARTITION, in a later version)",
+        )?;
+
         let root = self
             .storage
             .root()
             .ok_or_else(|| io::Error::other("this database is in memory"))?
             .to_string();
 
-        match self.storage.role_of(&destination) {
-            Some(LocationRole::Primary) => {}
-            Some(LocationRole::Backup) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "{} is a backup location: its contents are written by mirroring, \
-                         and a table moved into it would be overwritten",
-                        destination
-                    ),
-                ));
+        // A directory has to be one this database writes into; the other
+        // backends have their own answer to "does this exist", and both are
+        // asked before a byte is copied.
+        match destination {
+            TableBackend::Directory(path) => match self.storage.role_of(path) {
+                Some(LocationRole::Primary) => {}
+                Some(LocationRole::Backup) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "{} is a backup location: its contents are written by mirroring, \
+                             and a table moved into it would be overwritten",
+                            path
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("{} is not a storage location of this database", path),
+                    ));
+                }
+            },
+            TableBackend::Memory => {}
+            #[cfg(feature = "kv_storage")]
+            TableBackend::KeyValue(store) => {
+                if !self.kv.has(store) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "no key/value store named '{}' in {}",
+                            store,
+                            crate::core::storage::kv_registry::KV_FILE
+                        ),
+                    ));
+                }
             }
-            None => {
+            #[cfg(not(feature = "kv_storage"))]
+            other => {
                 return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("{} is not a storage location of this database", destination),
+                    io::ErrorKind::Unsupported,
+                    format!("this server cannot open a {} backend", other.kind()),
                 ));
             }
         }
 
-        let current = self.storage.location_of(table_name).unwrap_or_else(|| root.clone());
-        if current == destination {
+        let current = self
+            .storage
+            .backend_of(table_name)
+            .unwrap_or_else(|| TableBackend::Directory(root.clone()));
+        if current == *destination {
             return Ok(0);
         }
 
-        if !self.tables.contains_key(table_name) {
+        if !self.has_table(table_name) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
         }
+        // §7: under the ACCESS EXCLUSIVE its statement took on the name.
+        debug_assert!(
+            self.exclusive_held(table_name),
+            "STORAGE MOVE of \"{table_name}\" without ACCESS EXCLUSIVE on it (§7)"
+        );
 
-        // The handle goes first so its maintenance task stops before the files
-        // are read: a background flush landing mid-copy would put bytes in the
-        // source that the copy has already passed. Same reasoning as
-        // `rename_table`.
-        let table = self.tables.remove(table_name).map(|(_, t)| t);
+        // Every write this table has made has to be on the source before the
+        // source is read. The handle's own maintenance stops when it is removed
+        // below, but a write-ahead log record still only in the page cache is
+        // not something dropping a handle flushes — and the originals are
+        // deleted at the end of this, so anything left there is lost rather
+        // than merely late.
+        if let Err(e) = self.sync_durable() {
+            warn!("could not flush before moving {}: {}", table_name, e);
+        }
 
-        let from = seed_in(&self.db_io_pointers, &self.storage, table_name).await;
+        // The instance is retired first so its maintenance stops before the
+        // bytes are read: a background flush landing mid-copy would put bytes
+        // in the source that the copy has already passed. Same reasoning as
+        // `rename_table`. It stays in the slot until the swap below (§7 step
+        // 4), so a statement queued on the name finds the moved table, never
+        // a missing one; a failure before the flip swaps a fresh instance
+        // from the source in, never this one.
+        let table = self.retire_current(table_name).await;
+
+        let from = seed_in(
+            &self.db_io_pointers,
+            &self.storage,
+            &self.kv,
+            &self.seeds,
+            table_name,
+        )
+        .await;
         // Built for the destination directly rather than from this database's
         // own provider: whether a file is mirrored is settled when it is
         // opened, and the catalogue's provider may predate the backup location.
         // Deriving from it would move a mirrored table onto a disk and quietly
         // stop mirroring it.
-        let to = seed_at(&self.storage, &destination, table_name).await;
+        //
+        // Boxed for the reason `seed_in` boxes its own: this is on a statement's
+        // await chain and the key/value arm is much the largest of the three.
+        let to = match Box::pin(seed_for_backend(
+            &self.storage,
+            &self.kv,
+            destination,
+            table_name,
+        ))
+        .await
+        {
+            Ok(to) => to,
+            Err(e) => {
+                if table.is_some() {
+                    self.reopen_fresh(table_name).await;
+                }
+                return Err(e);
+            }
+        };
+
+        // The destination's log may still hold live records for this name: a
+        // move away from there whose source could not be released (below)
+        // kept them, and so does a crash between the flip and that release.
+        // The copy writes no records of its own, so the next open replayed
+        // the old incarnation's over it, and wherever the copy was shorter or
+        // had changed since, old rows came back. Voided first, in the
+        // destination primary's logs only: its backup copies are the files a
+        // table elsewhere still mirrors into, and their records are that
+        // table's. Nothing is copied yet, so a failure leaves the table where
+        // it is.
+        {
+            let destination_logs =
+                logs_holding(&to.without_backups(), &self.storage, self.location.as_deref());
+            let _snapshot_gate = deletion_permit(&destination_logs).await;
+            if let Err(failure) =
+                forget_logged_files(&destination_logs, table_name, Barrier::Relocation)
+            {
+                if table.is_some() {
+                    self.reopen_fresh(table_name).await;
+                }
+                error!(
+                    "Could not move {} to {}: the destination's log would not void its old \
+                     records for that name: {}",
+                    table_name,
+                    destination.as_spec(),
+                    failure.error
+                );
+                return Err(failure.error);
+            }
+        }
 
         let copied = copy_between(&from, &to, table_name).await;
 
@@ -1217,48 +3520,381 @@ impl Database {
                 // a table that is still there. Whatever partial bytes it holds
                 // are repaired at the next open, which rebuilds any backup
                 // whose length disagrees with its primary.
-                discard_files(&Arc::new(to.without_backups()), table_name).await;
-                if let Some(table) = table {
-                    self.tables.insert(table_name.to_string(), table);
+                discard_files(
+                &Arc::new(to.without_backups()),
+                &self.storage,
+                self.location.as_deref(),
+                table_name,
+            )
+            .await;
+                if table.is_some() {
+                    self.reopen_fresh(table_name).await;
                 }
-                error!("Could not move {} to {}: {}", table_name, destination, e);
+                error!(
+                    "Could not move {} to {}: {}",
+                    table_name,
+                    destination.as_spec(),
+                    e
+                );
                 return Err(e);
             }
         };
 
+        // The index-store pair and the write gate go with the files when the
+        // destination is a directory (B13): see `rename_table`. Into
+        // memory or a key/value store the table has no snapshot (P33), and
+        // opens with a detached word.
+        let _carried = match &table {
+            Some(t) => match carry_index_store(t, to.index_store_dir(), table_name).await {
+                Ok(carried) => carried,
+                Err(e) => {
+                    discard_files(
+                        &Arc::new(to.without_backups()),
+                        &self.storage,
+                        self.location.as_deref(),
+                        table_name,
+                    )
+                    .await;
+                    self.reopen_fresh(table_name).await;
+                    error!(
+                        "Could not move {} to {}: the index-store files could not be carried: {}",
+                        table_name,
+                        destination.as_spec(),
+                        e
+                    );
+                    return Err(e);
+                }
+            },
+            None => None,
+        };
+
         // The flip. Everything before it is reversible by deleting copies;
-        // everything after it reads from the new directory.
-        if let Err(e) = self.storage.pin(table_name, &destination) {
-            discard_files(&Arc::new(to.without_backups()), table_name).await;
-            if let Some(table) = table {
-                self.tables.insert(table_name.to_string(), table);
+        // everything after it reads from the new backend.
+        if let Err(e) = self.storage.pin_backend(table_name, destination) {
+            discard_files(
+                &Arc::new(to.without_backups()),
+                &self.storage,
+                self.location.as_deref(),
+                table_name,
+            )
+            .await;
+            if table.is_some() {
+                self.reopen_fresh(table_name).await;
             }
             return Err(io::Error::other(e));
         }
 
+        // The seed cache is keyed on `(spec, table)`, so the destination's
+        // entry is a different one — and it has to be *written*, not left to be
+        // built later. An in-memory backend's identity is the registry its seed
+        // created: rebuilding a seed for `memory:` would make a second, empty
+        // one and the rows just copied would be unreachable. The source's entry
+        // goes for the opposite reason: it holds the bytes this is about to
+        // delete, and a later move back to that backend must not find them.
+        self.seeds
+            .remove(&(current.as_spec(), table_name.to_string()));
+        if !destination.is_file_based() {
+            self.seeds
+                .insert((destination.as_spec(), table_name.to_string()), to.clone());
+        }
+
         // The old handle is dropped rather than reused: it holds file handles
-        // and a memory map of the *old* directory, and reading through it after
-        // the flip would serve rows from files this is about to delete.
+        // and a memory map of the *old* backend, and reading through it after
+        // the flip would serve rows from bytes this is about to delete.
         drop(table);
 
-        let mut reopened = Table::new(table_name, to, Vec::new()).await;
+        let mut reopened = Table::new(table_name, to.clone(), Vec::new()).await;
+        if reopened.schema_unreadable {
+            // Publishing it would be a table with no columns, which is what the
+            // guard exists to prevent. But *returning here* used to leave the
+            // table in neither place: removed from the live map, and with the
+            // placement already flipped, so the running server could not see it
+            // at all until a restart. An operator watching a move fail would
+            // find the table gone.
+            //
+            // The source bytes are still there — `discard_files` is below this
+            // point — so the whole move can be undone: put the placement back,
+            // reopen from the source, and delete the bad copy. That turns a
+            // failed move into a no-op, which is what it should always have
+            // been.
+            error!(
+                "table '{}' could not be read at {} after the copy; rolling the move back",
+                table_name,
+                destination.as_spec()
+            );
+            let rolled_back = self.storage.pin_backend(table_name, &current).is_ok();
+            self.seeds
+                .remove(&(destination.as_spec(), table_name.to_string()));
+            if !current.is_file_based() {
+                self.seeds
+                    .insert((current.as_spec(), table_name.to_string()), from.clone());
+            }
+            discard_files(
+                &Arc::new(to.without_backups()),
+                &self.storage,
+                self.location.as_deref(),
+                table_name,
+            )
+            .await;
+
+            let mut restored = Table::new(table_name, from, Vec::new()).await;
+            if rolled_back && !restored.schema_unreadable {
+                restored.scope_cache_to_database(self.id);
+                restored.enable_versioning(self.transactions.clone());
+                self.swap_instance(table_name, Arc::new(restored));
+            } else {
+                // Absent, not the retired instance.
+                self.take_table(table_name);
+                // Both copies unreadable, or the placement would not go back.
+                // Nothing to publish, and saying so is the only honest answer —
+                // but the bytes are still under the placement that is recorded.
+                error!(
+                    "table '{}' could not be restored to {} either; it is absent from this \
+                     server until it is restarted",
+                    table_name,
+                    current.as_spec()
+                );
+            }
+            return Err(io::Error::other(format!(
+                "table '{}' was copied to {} but its schema could not be read there; the \
+                 move was rolled back and the table is where it was",
+                table_name,
+                destination.as_spec()
+            )));
+        }
         reopened.scope_cache_to_database(self.id);
         reopened.enable_versioning(self.transactions.clone());
-        self.tables.insert(table_name.to_string(), Arc::new(reopened));
+        self.swap_instance(table_name, Arc::new(reopened));
 
         // The old primary's files, and only those — see `without_backups`.
-        discard_files(&Arc::new(from.without_backups()), table_name).await;
+        // Kept when their records cannot be voided, and said so: the move is
+        // done, but the source still holds a full copy of the table and its
+        // log holds the old records live. The next move back voids them
+        // first (above), and a restart replays them into the kept files and
+        // truncates the log, so neither reaches a later table; the space and
+        // the files stay until removed. Reported as an error rather than as a
+        // move: a success here hid a copy of the table left on the disk the
+        // move was meant to free.
+        let source_kept = !discard_files(
+            &Arc::new(from.without_backups()),
+            &self.storage,
+            self.location.as_deref(),
+            table_name,
+        )
+        .await;
 
-        info!("Moved {} from {} to {} ({} bytes)", table_name, current, destination, copied);
+        // Make the destination durable before reporting success.
+        //
+        // `copy_between` commits each file it writes, but reopening the table
+        // writes more — a schema header, an id sequence — and those are
+        // *non-transactional*, so a key/value backend leaves them to its
+        // background service and its flush interval. A server that stopped
+        // inside that window came back with the table on the new store and
+        // none of its rows: the move had reported success and the data was
+        // gone. It showed up as a restart in a test losing 12 rows of 12,
+        // intermittently, which is exactly how long that window is.
+        //
+        // The file backend has no equivalent gap here — its own commit path
+        // already ran — so this is asked of the provider rather than branched
+        // on the backend, and is a no-op where there is nothing to flush.
+        #[cfg(feature = "kv_storage")]
+        if let Some(family) = to.kv_family()
+            && let Err(e) = family.flush_all().await
+        {
+            // The bytes are copied and the placement is flipped, so this is a
+            // durability warning rather than a failed move: the background
+            // service will still write them out. Reported because "moved" must
+            // not imply "survives a crash from this instant" when it does not.
+            warn!(
+                "moved {} to {} but could not flush the store: {}. The move is applied; \
+                 its last writes are durable once the store's flush interval elapses",
+                table_name,
+                destination.as_spec(),
+                e
+            );
+        }
+
+        if source_kept {
+            return Err(io::Error::other(format!(
+                "moved {} to {}, but its files on {} could not be released (the log there \
+                 would not void their records), so a copy of the table is still there; it \
+                 reads from {} now",
+                table_name,
+                destination.as_spec(),
+                current.as_spec(),
+                destination.as_spec()
+            )));
+        }
+
+        info!(
+            "Moved {} from {} to {} ({} bytes)",
+            table_name,
+            current.as_spec(),
+            destination.as_spec(),
+            copied
+        );
         Ok(copied)
     }
 
-    /// Releases every file derived from `name`.
+    /// Why a table named `name` cannot be created (or renamed to), when its
+    /// files would not be its own.
+    ///
+    /// Nothing else stops it, and nothing downstream notices: `foo_schema`'s
+    /// rows file is `foo`'s schema, so creating one corrupts the other and
+    /// dropping either deletes the other's file. Three ways a file can be
+    /// taken, checked in this order:
+    ///
+    /// * a live table owns it — read through every suffix, so this is a fixed
+    ///   number of map lookups however many tables there are;
+    /// * the catalogue owns it (`db_data` takes the catalogue's schema);
+    /// * it is on disk and nothing owns it — a dropped table's leftovers, which
+    ///   the new table would open and append to as though they were its own.
+    ///   Every directory of the pool is checked, not only the one the table
+    ///   will be placed in: placement is decided after this, and a move later
+    ///   copies onto whatever is there.
+    ///
+    /// Key/value stores are not scanned for leftovers: there is no read-only way
+    /// to ask one whether an object exists short of opening the file.
+    fn table_files_conflict(&self, name: &str) -> Option<String> {
+        self.table_files_conflict_beside(name, None)
+    }
+
+    /// Whether the live table `name` could be dropped and created again under
+    /// the same name — what an `ALTER` rewrite does — or why not.
+    ///
+    /// Ask *before* the drop. `add_table` refuses names that older builds
+    /// accepted (`.db` in them, the `__pt_` prefix, a pair sharing a file), and
+    /// a refusal after the drop has already released every row. The table's
+    /// own directory is not scanned for leftovers: its files are there now and
+    /// the drop sweeps them, so the create after it does not find them.
+    pub fn check_recreatable(&self, name: &str) -> io::Result<()> {
+        // The rewrite drops it and creates a plain table in its place.
+        self.refuse_partitioned(name, "a rewriting ALTER TABLE")?;
+        if let Some(reason) = table_name_refusal(name) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+        }
+        let own = pool_location_of(&self.storage, name).or_else(|| self.db_io_pointers.get_location());
+        if let Some(reason) = self.table_files_conflict_beside(name, own.as_deref()) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, reason));
+        }
+        Ok(())
+    }
+
+    /// [`Self::table_files_conflict`], not scanning `skip` for leftovers.
+    fn table_files_conflict_beside(&self, name: &str, skip: Option<&str>) -> Option<String> {
+        // A statement-scoped relation lives in memory, apart from every table on
+        // disk, and it is created often enough that a pass over the map each
+        // time would show. Two of them cannot share a file either: each name
+        // ends in a lower-case hex tag, and no suffix stem does.
+        if is_statement_scoped(name) {
+            return None;
+        }
+        // Every live table, every partitioned table (whose shell may be
+        // missing from `tables` when its schema could not be read, while an
+        // older binary would still read `<name>_schema.db` as that schema),
+        // and every name a rename still holds files under until the next
+        // open. One pass, comparing ignoring case, so this is linear in the
+        // tables, not in the directory.
+        let readings = file_readings(name);
+        let shared = self
+            .relation_names()
+            .iter()
+            .find_map(|other| file_shared_with(name, &readings, other))
+            .or_else(|| {
+                let held = self.held_names.lock();
+                held.iter().find_map(|other| file_shared_with(name, &readings, other))
+            });
+        if let Some(shared) = shared {
+            return Some(shared.refusal(name));
+        }
+        for file in table_file_names(name) {
+            if let Some(owner) = reserved_file_owner(&file) {
+                return Some(format!(
+                    "relation \"{}\" would share the file {} with {}, which already exists",
+                    name, file, owner
+                ));
+            }
+        }
+
+        let mut directories = pool_table_paths(&self.storage);
+        if let Some(root) = self.db_io_pointers.get_location() {
+            directories.push(root);
+        }
+        for directory in &directories {
+            let directory = std::path::Path::new(directory);
+            // Component-wise, so a trailing separator is not a second directory.
+            if skip.is_some_and(|skip| std::path::Path::new(skip) == directory) {
+                continue;
+            }
+            for file in table_file_names(name) {
+                for candidate in [file.clone(), format!("{}.tmp", file)] {
+                    let path = directory.join(&candidate);
+                    // `symlink_metadata`: a dangling link is still a name taken.
+                    //
+                    // A drop's unlinks reach the disk only with a later
+                    // directory sync (see `sweep_files_durably`), so a power
+                    // cut just after a drop can bring the dropped table's files
+                    // back while its catalogue row and the log's barrier stay
+                    // gone; a rename that could not finish leaves files too.
+                    // Empty regular files are reused: a sweep creates each
+                    // missing file before deleting it, and an empty one holds
+                    // nothing.
+                    match std::fs::symlink_metadata(&path) {
+                        Ok(meta) if meta.len() == 0 && meta.is_file() => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Ok(_) => {
+                            return Some(format!(
+                                "table \"{}\" would take over {}, which already exists and \
+                                 belongs to no table (left by a dropped or failed one?); move \
+                                 it aside if it is not needed",
+                                name,
+                                path.display()
+                            ));
+                        }
+                        // Not "absent": a name the filesystem cannot even look up
+                        // is one the create would fail on after its catalogue row.
+                        Err(e) => {
+                            return Some(format!(
+                                "table \"{}\" cannot be checked for leftover files at {}: {}",
+                                name,
+                                path.display(),
+                                e
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Releases every file derived from `name`, and says whether they went
+    /// (see [`discard_files`]).
     ///
     /// Used both to clean up a failed copy and to drop the original once the
     /// rename has committed, so it must tolerate files that are not there.
-    async fn discard_table_files(&self, name: &str) {
-        discard_files(&seed_in(&self.db_io_pointers, &self.storage, name).await, name).await
+    async fn discard_table_files(&self, name: &str) -> bool {
+        // A partitioned name owns no `<name>*` files, and sweeping them
+        // creates each before deleting it. Reported as kept, so a caller
+        // leaves its intent for the next open rather than clearing it.
+        if let Err(e) = self.refuse_partitioned(name, "discarding a table's files") {
+            error!("{}", e);
+            return false;
+        }
+        discard_files(
+            &seed_in(
+                &self.db_io_pointers,
+                &self.storage,
+                &self.kv,
+                &self.seeds,
+                name,
+            )
+            .await,
+            &self.storage,
+            self.location.as_deref(),
+            name,
+        )
+        .await
     }
 
     /// Rewrites the table name embedded in a schema record's header.
@@ -1270,11 +3906,20 @@ impl Database {
     /// `schema.name` into its cache scope, so two tables would end up sharing
     /// a cache namespace.
     async fn rewrite_schema_name(&self, new_name: &str) -> io::Result<()> {
+        // A partitioned table's schema is `__pt_<uid>_schema.db`; the file
+        // below would be created empty under the logical name.
+        self.refuse_partitioned(new_name, "rewriting a table's schema name")?;
         let schema_io = Arc::new(
-            seed_in(&self.db_io_pointers, &self.storage, new_name)
-                .await
-                .create_new(format!("{}_schema.db", new_name))
-                .await,
+            seed_in(
+                &self.db_io_pointers,
+                &self.storage,
+                &self.kv,
+                &self.seeds,
+                new_name,
+            )
+            .await
+            .create_new(format!("{}_schema.db", new_name))
+            .await,
         );
 
         let mut schema = TableSchema::load(schema_io.clone())
@@ -1293,11 +3938,31 @@ impl Database {
 
     /// Opens the renamed table and puts it in the live map under its new name.
     async fn open_renamed_table(&self, new_name: &str) {
-        let seed = seed_in(&self.db_io_pointers, &self.storage, new_name).await;
+        // `Table::new` below would replace a partitioned table's shell with
+        // an empty plain table, and create `<name>*` files for it.
+        if let Err(e) = self.refuse_partitioned(new_name, "reopening a renamed table") {
+            error!("renamed table '{}' is left unopened: {}", new_name, e);
+            return;
+        }
+        let seed = seed_in(
+            &self.db_io_pointers,
+            &self.storage,
+            &self.kv,
+            &self.seeds,
+            new_name,
+        )
+        .await;
         let mut table = Table::new(new_name, seed, Vec::new()).await;
+        if table.schema_unreadable {
+            error!(
+                "renamed table '{}' is left unopened: its schema could not be read",
+                new_name
+            );
+            return;
+        }
         table.scope_cache_to_database(self.id);
         table.enable_versioning(self.transactions.clone());
-        self.tables.insert(new_name.to_string(), Arc::new(table));
+        self.install_table(new_name.to_string(), Arc::new(table));
     }
     /// Writes the catalogue row that makes a table enumerable on the next open.
     ///
@@ -1305,11 +3970,24 @@ impl Database {
     /// same record under a different name, and a second copy of it would be a
     /// second thing to keep in step with the catalogue's schema.
     async fn remember_in_catalogue(&self, table_name: &str) -> io::Result<()> {
+        self.write_catalogue_row(table_name, 0).await
+    }
+
+    /// The catalogue row itself: `table_name` and `clusters`, which is 0 for a
+    /// plain table and the uid of a partitioned one's files. Every row write
+    /// goes through here, so the record cannot drift between its writers.
+    pub(crate) async fn write_catalogue_row(&self, table_name: &str, clusters: u64) -> io::Result<()> {
+        #[cfg(test)]
+        if test_hooks::FAIL_CATALOGUE_ROW.with(|f| f.replace(false)) {
+            return Err(io::Error::other("injected catalogue row failure"));
+        }
         let mut name_mb = MEMORY_POOL.acquire(table_name.len());
-        name_mb.into_slice_mut().copy_from_slice(table_name.as_bytes());
+        name_mb
+            .into_slice_mut()
+            .copy_from_slice(table_name.as_bytes());
 
         let mut clusters_mb = MEMORY_POOL.acquire(8);
-        clusters_mb.into_slice_mut().copy_from_slice(&[0u8; 8]);
+        clusters_mb.into_slice_mut().copy_from_slice(&clusters.to_le_bytes());
 
         let row_write = RowWrite {
             columns_writing_data: smallvec![
@@ -1356,6 +4034,123 @@ impl Database {
         Ok(())
     }
 
+    /// The commit point of a partitioned table's physical rewrite
+    /// (docs/partitioning.md "Phase 6 P8 as built"): `table_name`'s
+    /// catalogue row naming `old_uid` replaced by one naming `new_uid`, the
+    /// tombstone and the new row in **one** storage transaction, made durable
+    /// with one commit. A crash leaves exactly one of them live, never both
+    /// (the next start refuses two live rows sharing a name) and never
+    /// neither; the uid the catalogue no longer names is the startup
+    /// reaper's.
+    pub(crate) async fn swap_catalogue_uid(&self, table_name: &str, old_uid: u64, new_uid: u64) -> io::Result<()> {
+        swap_catalogue_uid_in(&self.db_io_pointers, &self.db_io_rows, &self.db_io_schema, Some(table_name), old_uid, new_uid)
+            .await
+            .map(|_| ())
+    }
+}
+
+/// [`Database::swap_catalogue_uid`] on the catalogue's providers, for the
+/// open before the database exists: the live row naming `old_uid` (and
+/// `table_name`, when given; a uid is the catalogue's alone, so recovery
+/// goes by it) replaced by one naming `new_uid` under the same name, in one
+/// durable storage transaction. `Ok(None)` when no live row names `old_uid`
+/// and no name was given (an undo a crash already finished or never
+/// needed); `Ok(Some(name))`, the row's name, when swapped.
+pub(super) async fn swap_catalogue_uid_in(
+    io_pointers: &Arc<DbStorageProvider>,
+    io_rows: &Arc<DbStorageProvider>,
+    io_schema: &Arc<DbStorageProvider>,
+    table_name: Option<&str>,
+    old_uid: u64,
+    new_uid: u64,
+) -> io::Result<Option<String>> {
+    {
+        let schema = load_db_data_schema(io_schema.clone()).await?;
+        let fetch = create_db_data_row_fetch(&schema.fields);
+        let mut iterator = RowPointerIterator::new(io_pointers.clone())
+            .await
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
+        let mut found = None;
+        while let Ok(Some((record_pos, pointer))) = iterator.next_row_pointer_with_offset().await {
+            if pointer.deleted {
+                continue;
+            }
+            let Ok(row) = pointer.fetch_row(io_rows.clone(), &fetch).await else {
+                continue;
+            };
+            let name = row.columns.iter().find(|c| c.schema_id == 0).map(|c| c.data.into_slice().to_vec());
+            let clusters = row
+                .columns
+                .iter()
+                .find(|c| c.schema_id == 1)
+                .and_then(|c| <[u8; 8]>::try_from(c.data.into_slice()).ok())
+                .map(u64::from_le_bytes);
+            let named = table_name.is_none_or(|t| name.as_deref() == Some(t.as_bytes()));
+            if named && clusters == Some(old_uid) {
+                found = Some((record_pos, pointer, String::from_utf8_lossy(&name.unwrap_or_default()).into_owned()));
+                break;
+            }
+        }
+        let Some((record_pos, mut pointer, row_name)) = found else {
+            return match table_name {
+                None => Ok(None),
+                Some(table_name) => Err(io::Error::other(format!(
+                    "the catalogue has no row naming \"{table_name}\" with uid {old_uid:016x}"
+                ))),
+            };
+        };
+        let table_name = row_name.as_str();
+        let mut name_mb = MEMORY_POOL.acquire(table_name.len());
+        name_mb.into_slice_mut().copy_from_slice(table_name.as_bytes());
+        let mut clusters_mb = MEMORY_POOL.acquire(8);
+        clusters_mb.into_slice_mut().copy_from_slice(&new_uid.to_le_bytes());
+        let row_write = RowWrite {
+            columns_writing_data: smallvec![
+                ColumnWritePayload { column_type: DbType::STRING, size: 8 + 4, data: name_mb, write_order: 0 },
+                ColumnWritePayload { column_type: DbType::U64, size: 8, data: clusters_mb, write_order: 1 }
+            ],
+        };
+        let mut last = RowPointerIterator::new(io_pointers.clone())
+            .await
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
+        #[allow(clippy::unnecessary_cast)]
+        let (last_id, table_length) = match last.read_last().await {
+            Some(p) => (p.id as u64, p.position),
+            None => (0, 0),
+        };
+        let txn = io_pointers.begin_txn();
+        let written = RowPointer::write_row_with_pointer_record_pos(
+            io_pointers.clone(),
+            io_rows.clone(),
+            &AtomicU64::new(last_id),
+            &AtomicU64::new(table_length),
+            #[cfg(feature = "enable_long_row")]
+            0,
+            &row_write,
+            Some(txn),
+            None,
+            None,
+            crate::core::mvcc::transaction::FROZEN_TX,
+        )
+        .await;
+        if let Err(e) = written {
+            io_pointers.abort_txn(txn).await;
+            return Err(io::Error::other(format!("{e:?}")));
+        }
+        if let Err(e) = pointer
+            .delete(io_pointers.clone(), record_pos, Some(txn), crate::core::mvcc::transaction::FROZEN_TX)
+            .await
+        {
+            io_pointers.abort_txn(txn).await;
+            return Err(io::Error::other(format!("{e:?}")));
+        }
+        io_pointers.commit_durable(txn).await?;
+        Ok(Some(row_name))
+    }
+}
+
+impl Database {
+
     /// Whether the catalogue still names a table.
     ///
     /// Used by recovery to work out how far a rename got, which is why it reads
@@ -1373,251 +4168,308 @@ impl Database {
     }
 
     async fn record_rename_intent(&self, old_name: &str, new_name: &str) -> io::Result<()> {
-        let io = self.db_io_pointers.create_new(RENAME_INTENT_FILE.to_string()).await;
-        io.truncate(0)
-            .await
-            .map_err(|e| io::Error::other(format!("{e:?}")))?;
-        io.append_data(format!("{}\n{}", old_name, new_name).as_bytes(), true)
-            .await;
-        let token = io.begin_txn();
-        io.commit_durable(token)
-            .await
-            .map_err(|e| io::Error::other(format!("{e:?}")))
+        // Recovery acts on the intent by `<name>*` files and plain rows, so
+        // one naming a partitioned table would lead it to sweep or reopen it
+        // as plain. A partitioned RENAME keeps an intent of its own
+        // (`partitioned_ddl.rs`).
+        self.refuse_partitioned(old_name, "RENAME")?;
+        self.refuse_partitioned(new_name, "RENAME onto a partitioned name")?;
+        // Recovery refuses these (`parse_intent`), so one written would only
+        // be set aside at the next open.
+        if old_name.is_empty() || new_name.is_empty() || old_name == new_name {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("no rename intent for {old_name:?} to {new_name:?}: it names no rename"),
+            ));
+        }
+        // The intent is one name per line: a name holding a line break (or
+        // any control character) would be read back as another rename.
+        if old_name.chars().chain(new_name.chars()).any(char::is_control) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("table names may not hold control characters: {old_name:?} to {new_name:?}"),
+            ));
+        }
+        // Written whole: a temporary file, synced, renamed over the intent,
+        // and the directory synced (`rewrite::write_intent`). It was once a
+        // logged file truncated and appended in place, so a power cut could
+        // leave any prefix of it in the file: `pt\npt` from `pt\npt2\n…`,
+        // which the older unchecksummed form read as a rename of `pt` onto
+        // itself, and recovery dropped `pt`. In memory nothing survives a
+        // crash, so there is nothing to record.
+        let Some(path) = rename_intent_path(&self.db_io_pointers) else {
+            return Ok(());
+        };
+        rewrite::write_intent(&path, &encode_intent(old_name, new_name))
     }
 
-    async fn clear_rename_intent(&self) {
+    /// Whether the intent is gone (or there was none).
+    async fn clear_rename_intent(&self) -> bool {
         clear_intent(&self.db_io_pointers).await
     }
 
     pub async fn add_table(&self, create_table: CreateTable) -> io::Result<()> {
+        let _changed =
+            SchemaChanged::unless_internal(&self.schema_generation, &create_table.table_name);
         let table_name = &create_table.table_name;
-        let columns = create_table.columns;
-        let unique_columns = create_table.unique_columns;
+        // Held to the map insert, so a concurrent CREATE of the name cannot
+        // write a second catalogue row between the check and the insert.
+        let _claim = self.claim_name(table_name)?;
 
-        if self.tables.contains_key(table_name) {
+        if self.has_table(table_name) || self.is_partitioned(table_name) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "Table already exists",
             ));
         }
+        // Its foreign keys, and the ones naming it, as PostgreSQL checks
+        // them (a parent partitioned or not, phase 3 P4). InvalidInput,
+        // which the CREATE arm reports with its text.
+        if let Some(why) = self.create_foreign_key_refusal(&create_table, None) {
+            warn!("CREATE TABLE refused: {}", why);
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+        }
+        // Before the catalogue row: a refusal after it would leave a row naming
+        // a table that was never built.
+        if let Some(reason) = table_name_refusal(table_name) {
+            warn!("CREATE TABLE refused: {}", reason);
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+        }
+        self.refuse_held_name(table_name)?;
+        if let Some(reason) = self.table_files_conflict(table_name) {
+            warn!("CREATE TABLE refused: {}", reason);
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, reason));
+        }
+        self.add_table_unguarded(create_table).await
+    }
 
-        let mut name_mb = MEMORY_POOL.acquire(table_name.len());
-        let name_data = name_mb.into_slice_mut();
-        name_data.copy_from_slice(table_name.as_bytes());
+    /// `add_table` past its name checks. Separate so a test can make the
+    /// tables older builds allowed, which the guards exist to keep out.
+    async fn add_table_unguarded(&self, mut create_table: CreateTable) -> io::Result<()> {
+        let own_scale = create_table.own_scale_numerics();
+        #[cfg(test)]
+        let own_scale = if self.legacy_numeric_slot.load(std::sync::atomic::Ordering::Relaxed) {
+            Vec::new()
+        } else {
+            own_scale
+        };
+        // A temporary relation (a CTE's, a derived table's) lives in memory:
+        // nothing an older binary could open, so nothing to mark.
+        if !own_scale.is_empty() && temp_seed(&create_table.table_name).is_none() {
+            self.require_numeric_own_scale()?;
+        }
+        let table_name = &create_table.table_name;
+        let columns = std::mem::take(&mut create_table.columns);
 
-        let mut clusters_mb = MEMORY_POOL.acquire(8);
-        let clusters_data = clusters_mb.into_slice_mut();
-        clusters_data.copy_from_slice(&[0u8; 8]);
+        // A table placed on a key/value store that cannot be opened now is
+        // refused, before its catalogue row: `seed_in` falls back to memory
+        // there, and the table was created in a buffer — every write to it
+        // reported done and gone at the next start.
+        refuse_unopenable_store(&self.storage, &self.kv, table_name).await?;
 
-        let row_write = RowWrite {
-            columns_writing_data: smallvec![
-                ColumnWritePayload {
-                    column_type: DbType::STRING,
-                    size: 8 + 4,
-                    data: name_mb,
-                    write_order: 0
-                },
-                ColumnWritePayload {
-                    column_type: DbType::U64,
-                    size: 8,
-                    data: clusters_mb,
-                    write_order: 1
-                }
-            ],
+        // All or nothing across a power cut (`create_intent`): the intent,
+        // then every file, durable, then the catalogue row, the commit point.
+        // Only for a table a crash can leave files of.
+        let durable = self.creates_durably(table_name);
+        // A placement recorded before this CREATE is a pin (`STORAGE PLACE
+        // TABLE`), which outlives a CREATE that fails or is cut: only one this
+        // CREATE chose goes with its files.
+        let pinned = pool_has_placement(&self.storage, table_name);
+        let intent = match (durable, self.location.as_deref()) {
+            (true, Some(root)) => Some(create_intent::record(root, table_name, pinned)?),
+            _ => None,
         };
 
-        let mut pointer_iterator = RowPointerIterator::new(self.db_io_pointers.clone())
-            .await
-            .unwrap();
-
-        if let Some(row_pointer) = pointer_iterator.read_last().await {
-            // `id` widens to u128 under `enable_long_row`, but it is always
-            // allocated from this same AtomicU64, so it never exceeds u64.
-            let atomic_last_id = AtomicU64::new(row_pointer.id as u64);
-
-            let table_length = row_pointer.position;
-            let atomic_table_length = AtomicU64::new(table_length);
-
-            #[cfg(feature = "enable_long_row")]
-            let cluster = 0;
-
-            let result = RowPointer::write_row(
-                self.db_io_pointers.clone(),
-                self.db_io_rows.clone(),
-                &atomic_last_id,
-                &atomic_table_length,
-                #[cfg(feature = "enable_long_row")]
-                cluster,
-                &row_write,
-            )
-            .await;
-
-            if result.is_err() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Failed to write row pointer.",
-                ));
-            }
-        } else {
-            let atomic_last_id = AtomicU64::new(0);
-            let atomic_table_length = AtomicU64::new(0);
-
-            #[cfg(feature = "enable_long_row")]
-            let cluster = 0;
-
-            let result = RowPointer::write_row(
-                self.db_io_pointers.clone(),
-                self.db_io_rows.clone(),
-                &atomic_last_id,
-                &atomic_table_length,
-                #[cfg(feature = "enable_long_row")]
-                cluster,
-                &row_write,
-            )
-            .await;
-
-            if result.is_err() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Failed to write initial row pointer.",
-                ));
-            }
-        }
-
         // The directory is decided and recorded before a single file is
-        // created there. A crash between the two leaves a placement pointing at
-        // a half-written table, which the next `CREATE TABLE` of that name
-        // reuses; the other order leaves the files somewhere nothing looks.
+        // created there, so the files are where the intent's discard (or the
+        // next `CREATE TABLE` of the name) looks for them.
         pool_place(&self.storage, table_name);
-        let seed = seed_in(&self.db_io_pointers, &self.storage, table_name).await;
-
-        let mut table = Table::new_with_constraints(
-            &table_name,
-            seed,
-            columns,
-            &unique_columns,
+        let seed = seed_in(
+            &self.db_io_pointers,
+            &self.storage,
+            &self.kv,
+            &self.seeds,
+            table_name,
         )
         .await;
+
+        // The store failing between that check and here falls back the same
+        // way; refused all the same.
+        if seed_fell_back(&self.storage, &seed, table_name) {
+            self.abandon_create(table_name, None, intent, pinned).await;
+            return Err(io::Error::other(format!(
+                "table {table_name}: its key/value store could not be opened; not created"
+            )));
+        }
+
+        let mut table =
+            Table::new_with_constraints_sized(table_name, seed, columns, &create_table.unique_columns, &own_scale)
+                .await;
+        // Its schema or a field record could not be written: nothing is
+        // catalogued, and the files go.
+        if table.schema_unreadable {
+            self.abandon_create(table_name, Some(table), intent, pinned).await;
+            return Err(io::Error::other(format!(
+                "table {table_name}: its schema could not be written; not created"
+            )));
+        }
         table.scope_cache_to_database(self.id);
 
-        // The declared `PRIMARY KEY`, recorded in the schema header rather than
-        // left implicit in the column's `UNIQUE NOT NULL` flags.
-        //
-        // Enforcement does not need it — a primary key is a unique constraint
-        // and is already enforced as one — but every client that addresses a
-        // single row does: "the column this table calls its key" and "some
-        // column that happens to be unique" are different questions, and only
-        // the first has one answer.
-        if let Some(primary_key) = &create_table.primary_key {
-            table.schema.set_primary_key(primary_key.clone());
-            if let Err(e) = table.schema.rewrite_header(table.io_schema.clone()).await {
-                error!("Failed to record primary key for {}: {}", table_name, e);
-                return Err(e);
-            }
+        // Through `register_unique_key`, which also arms the table's unique
+        // checks; the sidecars only record them.
+        let keys_before = table.schema.unique_keys.len();
+        if let Err(e) = write_schema_sidecars(table.io_schema.clone(), &mut table.schema, &create_table).await {
+            self.abandon_create(table_name, Some(table), intent, pinned).await;
+            return Err(e);
         }
-
-        // Written after the table exists so its sidecar sits beside the schema
-        // it belongs to, and kept in the loaded schema so the first statement
-        // after `CREATE TABLE` is already constrained.
-        for fk in &create_table.foreign_keys {
-            if let Err(e) = crate::core::rql::foreign_key::append(table.io_schema.clone(), fk).await
-            {
-                error!("Failed to persist foreign key {}: {}", fk.name, e);
-                return Err(e);
-            }
-            table.schema.foreign_keys.push(fk.clone());
+        // Every file durable before the catalogue names the table: an image
+        // holding any byte of the row then holds them all.
+        if durable && let Err(e) = self.sync_durable() {
+            self.abandon_create(table_name, Some(table), intent, pinned).await;
+            return Err(e);
         }
-
-        for entry in &create_table.defaults {
-            if let Err(e) =
-                crate::core::rql::column_default::append(table.io_schema.clone(), entry).await
-            {
-                error!("Failed to persist default for {}: {}", entry.column, e);
-                return Err(e);
-            }
-            table.schema.defaults.push(entry.clone());
+        // Not for a statement's own relation (a CTE's, a derived table's).
+        // It lives in memory and is dropped before the statement ends, so a
+        // row naming it can only ever name nothing: the next open would find
+        // no files for it. Written, it was a logged, synced write on every
+        // such statement (the WAL's fdatasync, ~5 ms on ext4), and its
+        // tombstone stayed in the catalogue for good — every later drop's
+        // row search, and every open, read past one more dead row per query
+        // ever run (1,500 derived-table queries: 148 B to 55 KB of pointers,
+        // 8.3 to 8.8 ms each). See `forget_in_catalogue`'s twin guard.
+        if !is_statement_scoped(table_name)
+            && let Err(e) = self.write_catalogue_row(table_name, 0).await
+        {
+            self.abandon_create(table_name, Some(table), intent, pinned).await;
+            return Err(e);
         }
-
-        // Every column a constraint names has to exist, or the constraint would
-        // sit in the sidecar matching nothing and the table would look
-        // constrained while allowing duplicates.
-        for key in &create_table.unique_keys {
-            for column in &key.columns {
-                if !table
-                    .schema
-                    .fields
-                    .iter()
-                    .any(|f| f.name.eq_ignore_ascii_case(column) && !f.is_deleted)
-                {
-                    error!(
-                        "UNIQUE constraint {} names unknown column {}",
-                        key.name, column
-                    );
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "UNIQUE constraint {:?} names column {:?}, which the table does not have",
-                            key.name, column
-                        ),
-                    ));
-                }
-            }
-            if let Err(e) =
-                crate::core::rql::unique_key::append(table.io_schema.clone(), key).await
-            {
-                error!("Failed to persist unique constraint {}: {}", key.name, e);
-                return Err(e);
-            }
-            table.register_unique_key(key.clone());
+        // Past the commit point, whatever the sync says: the table goes in,
+        // and an error from here is reported after it. The intent goes only
+        // once the row is durable, so a cut can never leave the files with
+        // neither a row nor an intent naming them.
+        let synced = if durable { self.sync_durable() } else { Ok(()) };
+        if let Some(path) = &intent
+            && synced.is_ok()
+        {
+            create_intent::clear(path);
         }
-
-        for entry in &create_table.type_modifiers {
-            if let Err(e) =
-                crate::core::rql::type_modifier::append(table.io_schema.clone(), entry).await
-            {
-                error!("Failed to persist type modifier for {}: {}", entry.column, e);
-                return Err(e);
-            }
-            table.schema.type_modifiers.push(entry.clone());
-        }
-
-        for entry in &create_table.json_columns {
-            if let Err(e) =
-                crate::core::rql::json_map::append(table.io_schema.clone(), entry).await
-            {
-                error!("Failed to register JSON column {}: {}", entry.column, e);
-                return Err(e);
-            }
-            table.schema.json_columns.push(entry.clone());
+        let keys: Vec<_> = table.schema.unique_keys.drain(keys_before..).collect();
+        for key in keys {
+            table.register_unique_key(key);
         }
 
         table.enable_versioning(self.transactions.clone());
-        self.tables.insert(create_table.table_name, Arc::new(table));
+        // The table's indexes were built when it opened, from a schema that
+        // did not have its composite keys yet: they are registered above. A
+        // composite PRIMARY KEY or UNIQUE had no index until the next open, so
+        // pg_indexes listed none and its uniqueness checks scanned. Reopened
+        // from the sidecars just written, it has them; the table is empty, so
+        // the reopen builds nothing.
+        //
+        // So for a PRIMARY KEY: recorded in the header only after the table
+        // opened, its index was named for the column's UNIQUE flag
+        // (`<table>_<column>_key`) until a restart renamed it `<table>_pkey`.
+        // pg_indexes showed a name `DROP INDEX` and `DROP CONSTRAINT` did not
+        // know, and the name changed under the client at the next restart.
+        let reopen = (!create_table.unique_keys.is_empty() || create_table.primary_key.is_some())
+            .then(|| create_table.table_name.clone());
+        self.install_table(create_table.table_name, Arc::new(table));
+        if let Some(name) = reopen {
+            self.reload_table(&name).await?;
+        }
 
-        Ok(())
+        synced
+    }
+
+    /// Whether a `CREATE TABLE` of `table_name` must be all or nothing across
+    /// a power cut (`create_intent`): its files survive one (the database
+    /// has a directory and the table is not on `memory:`), and it is neither
+    /// a statement-scoped relation (in memory, created by every CTE, and kept
+    /// off the sync path) nor in a directory being bulk-loaded (an import that
+    /// dies is discarded whole).
+    /// Marks the database as holding unconstrained NUMERIC columns that keep
+    /// each value at its own scale (`incompat::NUMERIC_OWN_SCALE_V1`), before
+    /// the first such field record is written, so a binary that would misread
+    /// them refuses to open it instead. Nothing to mark for a database in
+    /// memory.
+    pub(crate) fn require_numeric_own_scale(&self) -> io::Result<()> {
+        match self.location.as_deref() {
+            Some(root) => incompat::require(std::path::Path::new(root), incompat::NUMERIC_OWN_SCALE_V1),
+            None => Ok(()),
+        }
+    }
+
+    fn creates_durably(&self, table_name: &str) -> bool {
+        temp_seed(table_name).is_none()
+            && self.survives_a_crash(table_name)
+            && !self.location.as_deref().is_some_and(crate::core::bulk_load::is_active)
+    }
+
+    /// A `CREATE TABLE` that failed before its catalogue row: the instance it
+    /// opened retired, its files discarded and the placement it chose
+    /// forgotten (a pin it found stays), then its intent removed. A discard that fails keeps the intent, so the next
+    /// open finishes it; nothing names the files meanwhile.
+    async fn abandon_create(
+        &self,
+        table_name: &str,
+        table: Option<Table<DbStorageProvider>>,
+        intent: Option<std::path::PathBuf>,
+        pinned: bool,
+    ) {
+        if let Some(table) = table {
+            table.retire().await;
+            drop(table);
+        }
+        let Some(root) = self.location.as_deref() else {
+            return;
+        };
+        if intent.is_none() && !self.creates_durably(table_name) {
+            return;
+        }
+        if !create_intent::discard(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, root, table_name, !pinned)
+            .await
+        {
+            error!("CREATE TABLE {table_name} failed and its files could not be discarded yet; the next open does");
+            return;
+        }
+        if let Some(path) = &intent {
+            create_intent::clear(path);
+        }
     }
 
     /// Reclaims dead space across every open table, now rather than at the
     /// background service's next tick.
     ///
-    /// Returns one report per table, named. A table whose report has `deferred`
-    /// set had a query older than the scan still running and published nothing;
-    /// the next run picks it up.
-    pub async fn vacuum_all(&self) -> Vec<(String, crate::core::vacuum::VacuumReport)> {
-        let tables: Vec<_> = self
-            .tables
-            .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
-            .collect();
+    /// Returns one report per table, named; a partitioned table is one report
+    /// under its logical name, summed over its materialized partitions. A
+    /// table whose report has `deferred` set had a query older than the scan
+    /// still running and published nothing; the next run picks it up.
+    ///
+    /// Any table's failure fails the call, naming it. Logging it and returning
+    /// the rest read as a complete vacuum to a caller that cannot see the log,
+    /// and a partitioned table's shell or a broken one always fails.
+    pub async fn vacuum_all(&self) -> io::Result<Vec<(String, crate::core::vacuum::VacuumReport)>> {
+        // A broken partitioned table may have no shell, and is listed too.
+        let mut names = self.relation_names();
+        names.sort_unstable();
 
-        let mut reports = Vec::with_capacity(tables.len());
-        for (name, table) in tables {
-            match table.vacuum_now().await {
+        let mut reports = Vec::with_capacity(names.len());
+        for name in names {
+            let report = match self.relation(&name) {
+                Some(Relation::Partitioned(table)) => partitioned::vacuum_partitions(&table).await,
+                Some(Relation::Plain(table)) => table.vacuum_now().await,
+                // Dropped since the names were read.
+                None => continue,
+            };
+            match report {
                 Ok(report) => reports.push((name, report)),
-                Err(e) => error!("Vacuum failed for {}: {}", name, e),
+                Err(e) => {
+                    error!("Vacuum failed for {}: {}", name, e);
+                    return Err(io::Error::new(e.kind(), format!("VACUUM failed for {}: {}", name, e)));
+                }
             }
         }
-        reports
+        Ok(reports)
     }
 
     /// Serves the native protocol, with authentication configured by default.
@@ -1662,11 +4514,181 @@ impl Database {
     /// The loopback exemption in [`Database::start_db_with_auth`] therefore
     /// stays exactly that: an exemption for the address only the machine
     /// itself can reach.
+    /// Binds the native protocol's unix socket, with the authentication its
+    /// configuration asks for. Returns the server and whether a caller on it
+    /// has to authenticate.
+    ///
+    /// The same rule as the TCP address: a listener that accepts anyone may
+    /// only be one nobody else can reach. For a socket that means one only its
+    /// owner and group can connect to; a socket every user can reach has to
+    /// authenticate its callers.
+    #[cfg(unix)]
+    async fn bind_native_socket(
+        database: &Arc<Database>,
+        catalog: Option<&Arc<catalog::DatabaseCatalog>>,
+        auth: &crate::native_auth::NativeAuthConfig,
+        socket: &NativeSocket,
+        credential_exists: bool,
+        request_timeout: Option<std::time::Duration>,
+    ) -> io::Result<(TcpServer, bool)> {
+        use crate::auth::AuthMethod;
+        use crate::native_auth::{NativeAuthConfig, RoleAuthenticator};
+
+        let method = socket.method.unwrap_or(auth.method);
+        if let Err(e) = NativeAuthConfig::validate_socket_method(method) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, e));
+        }
+
+        // Peer authentication needs no password to exist, only the role
+        // catalogue: the role's name is what is checked.
+        let authenticates = match method {
+            AuthMethod::Trust => false,
+            AuthMethod::Peer => true,
+            _ => credential_exists,
+        };
+
+        if !authenticates && socket.admits_others() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to serve the native protocol on unix:{} with mode {:o} and \
+                     authentication off: every user on the machine would have unauthenticated \
+                     access. Set a password, use --rdb-socket-auth peer, or a --socket-mode that \
+                     admits only the owner and group, such as 660.",
+                    socket.path.display(),
+                    socket.mode
+                ),
+            ));
+        }
+
+        if authenticates {
+            let seeding = NativeAuthConfig {
+                method,
+                ..auth.clone()
+            };
+            if let Err(e) = crate::native_auth::seed_roles(database, &seeding).await {
+                return Err(io::Error::other(format!(
+                    "could not prepare the role catalogue: {}",
+                    e
+                )));
+            }
+        }
+
+        let mut builder = TcpServerBuilder::unix(&socket.path).unix_mode(socket.mode);
+        if let Some(timeout) = request_timeout {
+            builder = builder.request_timeout(timeout);
+        }
+        if let Some(group) = socket.group {
+            builder = builder.unix_group(group);
+        }
+        if !authenticates {
+            info!(
+                "Native protocol on unix:{} accepts any caller its mode {:o} admits",
+                socket.path.display(),
+                socket.mode
+            );
+        }
+        if authenticates {
+            builder = builder.authenticator(
+                StdArc::new(
+                    RoleAuthenticator::new(database.clone(), method).with_catalog(catalog.cloned()),
+                ) as StdArc<dyn rastcp::session::ServerAuthenticator>,
+            );
+            info!(
+                "Native protocol on unix:{} requires {} authentication",
+                socket.path.display(),
+                method.name()
+            );
+        }
+
+        let server = builder.build().await.map_err(|e| {
+            io::Error::other(format!(
+                "could not serve the native protocol on unix:{}: {}",
+                socket.path.display(),
+                e
+            ))
+        })?;
+
+        Ok((server, authenticates))
+    }
+
+    #[cfg(not(unix))]
+    async fn bind_native_socket(
+        _database: &Arc<Database>,
+        _catalog: Option<&Arc<catalog::DatabaseCatalog>>,
+        _auth: &crate::native_auth::NativeAuthConfig,
+        _socket: &NativeSocket,
+        _credential_exists: bool,
+        _request_timeout: Option<std::time::Duration>,
+    ) -> io::Result<(TcpServer, bool)> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unix sockets are not supported on this platform",
+        ))
+    }
+
     pub async fn start_db_with_auth_on(
         database: Arc<Database>,
         auth: crate::native_auth::NativeAuthConfig,
         listen: NativeListen,
     ) -> io::Result<()> {
+        Self::start_native(database, None, auth, listen).await
+    }
+
+    /// As [`Database::start_db_with_auth_on`], for the catalogue's default
+    /// database, with each native connection counted among that database's
+    /// sessions in `catalog` as a PostgreSQL connection is: what
+    /// `SHOW DATABASES` reports as `sessions` on either protocol, and what
+    /// `DROP DATABASE` waits for.
+    pub async fn start_db_with_auth_in(
+        catalog: Arc<catalog::DatabaseCatalog>,
+        auth: crate::native_auth::NativeAuthConfig,
+        listen: NativeListen,
+    ) -> io::Result<()> {
+        let database = catalog
+            .get(catalog.default_name())
+            .expect("the catalogue always holds its default database");
+        Self::start_native(database, Some(catalog), auth, listen).await
+    }
+
+    async fn start_native(
+        database: Arc<Database>,
+        catalog: Option<Arc<catalog::DatabaseCatalog>>,
+        auth: crate::native_auth::NativeAuthConfig,
+        listen: NativeListen,
+    ) -> io::Result<()> {
+        Self::bind_native(database, catalog, auth, listen, true).await?.run().await
+    }
+
+    /// Binds the native listener(s) `listen` describes for the catalogue's
+    /// default database, as [`Database::start_db_with_auth_in`] does, and
+    /// hands them back unstarted: [`NativeServer::run`] serves them.
+    ///
+    /// For a process that embeds the engine. Unlike the `start_db_*`
+    /// functions it installs no termination-signal handler (the host owns
+    /// Ctrl+C and SIGTERM; stop through [`NativeServer::shutdown_handles`]),
+    /// and it reports the address actually bound, so `listen.port` may be 0.
+    pub async fn bind_native_in(
+        catalog: Arc<catalog::DatabaseCatalog>,
+        auth: crate::native_auth::NativeAuthConfig,
+        listen: NativeListen,
+    ) -> io::Result<NativeServer> {
+        let database = catalog
+            .get(catalog.default_name())
+            .expect("the catalogue always holds its default database");
+        Self::bind_native(database, Some(catalog), auth, listen, false).await
+    }
+
+    /// Everything `start_native` does before it serves. `on_signals` hooks
+    /// each listener's shutdown to Ctrl+C / SIGTERM, as the server binary
+    /// wants and an embedding process does not.
+    async fn bind_native(
+        database: Arc<Database>,
+        catalog: Option<Arc<catalog::DatabaseCatalog>>,
+        auth: crate::native_auth::NativeAuthConfig,
+        listen: NativeListen,
+        on_signals: bool,
+    ) -> io::Result<NativeServer> {
         use crate::native_auth::RoleAuthenticator;
 
         info!("Starting database");
@@ -1691,12 +4713,17 @@ impl Database {
                 "Native protocol requires {} authentication",
                 auth.method.name()
             );
-            Some(StdArc::new(RoleAuthenticator::new(
-                database.clone(),
-                auth.method,
-            )) as StdArc<dyn rastcp::session::ServerAuthenticator>)
+            Some(
+                StdArc::new(
+                    RoleAuthenticator::new(database.clone(), auth.method)
+                        .with_catalog(catalog.clone()),
+                ) as StdArc<dyn rastcp::session::ServerAuthenticator>,
+            )
         } else {
-            if auth.authenticates() {
+            // Only about the TCP listener: with it off there is no address to
+            // warn about, and a warning naming one reads as an open port. The
+            // socket's own authentication is decided in `bind_native_socket`.
+            if auth.authenticates() && listen.tcp {
                 warn!(
                     "No password is configured and no role has one, so {} accepts any caller. \
                      Pass --rdb-password, or run CREATE USER ... PASSWORD to require one.",
@@ -1708,9 +4735,17 @@ impl Database {
 
         let authentication_required = authenticator.is_some();
 
+        if !listen.tcp && listen.socket.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the native protocol's TCP listener is off and no unix socket is configured, so \
+                 there would be nothing to connect to: set --rdb-socket, or leave TCP on",
+            ));
+        }
+
         // The listener is about to accept anyone, so it may only do so where
         // only this machine can reach it.
-        if !authentication_required && !listen.is_loopback() {
+        if listen.tcp && !authentication_required && !listen.is_loopback() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -1722,92 +4757,314 @@ impl Database {
             ));
         }
 
-        let server = Arc::new(bind_native_listener(&listen, authenticator).await);
+        // The unix socket, decided and bound before the TCP listener so that
+        // a socket that cannot be served stops start-up before anything does.
+        let socket_server = match listen.socket.as_ref() {
+            Some(socket) => Some(
+                Self::bind_native_socket(
+                    &database,
+                    catalog.as_ref(),
+                    &auth,
+                    socket,
+                    credential_exists,
+                    listen.request_timeout,
+                )
+                .await?,
+            ),
+            None => None,
+        };
 
-        // Ctrl+C and SIGTERM stop the accept loop and let in-flight queries
-        // finish, rather than dropping every connection where it stands.
-        let shutdown = server.shutdown_handle();
-        crate::shutdown::on_termination(move || shutdown.shutdown());
+        let server = if listen.tcp {
+            let server = Arc::new(bind_native_listener(&listen, authenticator).await?);
+
+            // Ctrl+C and SIGTERM stop the accept loop and let in-flight queries
+            // finish, rather than dropping every connection where it stands.
+            if on_signals {
+                let shutdown = server.shutdown_handle();
+                crate::shutdown::on_termination(move || shutdown.shutdown());
+            }
+            Some(server)
+        } else {
+            info!("Native protocol TCP listener is off; serving the unix socket only");
+            None
+        };
 
         let context = NativeContext {
             database,
             authentication_required,
+            catalog,
         };
 
-        let fut = async move {
-            info!("Database started, listening on {}", listen);
-            if let Err(e) = server
-                .run_with_context_and_principal(context, process_incoming_queries)
-                .await
-            {
-                error!("Server stopped with an error: {}", e);
+        let socket = socket_server.map(|(socket_server, socket_requires_auth)| {
+            let socket_server = Arc::new(socket_server);
+            if on_signals {
+                let shutdown = socket_server.shutdown_handle();
+                crate::shutdown::on_termination(move || shutdown.shutdown());
             }
-        };
 
-        if let Err(e) = tokio::spawn(fut).await {
-            warn!("Server task did not stop cleanly: {}", e);
+            let socket_context = NativeContext {
+                database: context.database.clone(),
+                authentication_required: socket_requires_auth,
+                catalog: context.catalog.clone(),
+            };
+            (socket_server, socket_context)
+        });
+
+        Ok(NativeServer {
+            tcp: server,
+            socket,
+            context,
+            listen,
+        })
+    }
+}
+
+/// The native listener(s) [`Database::bind_native_in`] bound, not yet
+/// serving.
+pub struct NativeServer {
+    tcp: Option<Arc<TcpServer>>,
+    socket: Option<(Arc<TcpServer>, NativeContext)>,
+    context: NativeContext,
+    listen: NativeListen,
+}
+
+impl NativeServer {
+    /// The TCP address bound (`127.0.0.1:61170`), when TCP is served: the
+    /// real port when `listen.port` was 0.
+    pub fn tcp_endpoint(&self) -> Option<String> {
+        self.tcp.as_ref().map(|s| s.local_endpoint())
+    }
+
+    /// The unix socket served (`unix:/path`), when one is.
+    pub fn socket_endpoint(&self) -> Option<String> {
+        self.socket.as_ref().map(|(s, _)| s.local_endpoint())
+    }
+
+    /// Triggers that stop each listener: it stops accepting, drains the
+    /// requests in flight and ends, and [`NativeServer::run`] returns once
+    /// all have.
+    pub fn shutdown_handles(&self) -> Vec<rastcp::server::ShutdownHandle> {
+        self.tcp
+            .iter()
+            .map(|s| s.shutdown_handle())
+            .chain(self.socket.iter().map(|(s, _)| s.shutdown_handle()))
+            .collect()
+    }
+
+    /// Serves until every listener has been shut down.
+    pub async fn run(self) -> io::Result<()> {
+        let NativeServer {
+            tcp: server,
+            socket,
+            context,
+            listen,
+        } = self;
+        let socket_task = socket.map(|(socket_server, context)| {
+            tokio::spawn(async move {
+                info!("Also listening on {}", socket_server.local_endpoint());
+                if let Err(e) = socket_server
+                    .run_with_session(context, open_native_session, serve_native_request)
+                    .await
+                {
+                    error!("The unix socket listener stopped with an error: {}", e);
+                }
+            })
+        });
+
+        if let Some(server) = server {
+            let fut = async move {
+                info!("Database started, listening on {}", listen);
+                if let Err(e) = server
+                    .run_with_session(context, open_native_session, serve_native_request)
+                    .await
+                {
+                    error!("Server stopped with an error: {}", e);
+                }
+            };
+
+            if let Err(e) = tokio::spawn(fut).await {
+                warn!("Server task did not stop cleanly: {}", e);
+            }
+        }
+        if let Some(socket_task) = socket_task {
+            if let Err(e) = socket_task.await {
+                warn!("The unix socket listener did not stop cleanly: {}", e);
+            }
         }
 
         info!("Database stopped");
 
         Ok(())
     }
-
-    pub async fn reload_table(&self, table_name: &str) -> io::Result<()> {
-        if !self.tables.contains_key(table_name) {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "Table not found"));
-        }
-        // Every schema change comes through here, so this is where a client's
-        // cached column list becomes stale. See `schema_generation`.
-        self.schema_generation
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        // The previous handle is dropped first so its maintenance task stops
-        // before a second one starts on the same files.
-        self.tables.remove(table_name);
-        let seed = seed_in(&self.db_io_pointers, &self.storage, table_name).await;
-        let mut table = Table::new(table_name, seed, Vec::new()).await;
-        table.scope_cache_to_database(self.id);
-        table.enable_versioning(self.transactions.clone());
-        self.tables.insert(table_name.to_string(), Arc::new(table));
-        Ok(())
-    }
 }
 
-async fn load_db_data_schema<S: StorageIO>(schema_io: Arc<S>) -> TableSchema {
-    let schema = {
-        if let Ok(schema) = TableSchema::load(schema_io.clone()).await {
-            info!("Loaded schema: {:?}", schema);
-            schema
-        } else {
-            info!("Schema not found, creating new schema");
-            let mut table = TableSchema::new("db_data".to_string(), false);
+/// Every schema sidecar a `CREATE TABLE` declares, written beside `io_schema`
+/// and pushed into `schema`: the `PRIMARY KEY` header, then FK, DEF, UK (each
+/// column checked to exist), TYP with each field's scale, GEN, CHK, JSON.
+/// One function for plain and partitioned tables, so their schemas cannot
+/// drift apart. Unique keys are recorded here only; a plain `Table` arms its
+/// checks with `register_unique_key`.
+async fn write_schema_sidecars(
+    io_schema: Arc<DbStorageProvider>,
+    schema: &mut TableSchema,
+    ct: &CreateTable,
+) -> io::Result<()> {
+    // The declared `PRIMARY KEY`, recorded in the schema header rather than
+    // left implicit in the column's `UNIQUE NOT NULL` flags.
+    //
+    // Enforcement does not need it — a primary key is a unique constraint
+    // and is already enforced as one — but every client that addresses a
+    // single row does: "the column this table calls its key" and "some
+    // column that happens to be unique" are different questions, and only
+    // the first has one answer.
+    //
+    // Staged with every sidecar record below, all written and committed as
+    // one transaction at the end (`torn_tail::SidecarWrites`): one log sync,
+    // and after a cut all of them or none.
+    let mut writes = crate::core::torn_tail::SidecarWrites::default();
+    if let Some(primary_key) = &ct.primary_key {
+        schema.set_primary_key(primary_key.clone());
+        // `TableSchema::rewrite_header`'s write, in the transaction.
+        writes.write_at(io_schema.get_name(), 0, &schema.into_vec());
+    }
 
-            table
-                .add_field(
-                    schema_io.clone(),
-                    "table_name".to_string(),
-                    DbType::STRING,
-                    true,
-                )
-                .await;
-            table
-                .add_field(
-                    schema_io.clone(),
-                    "clusters".to_string(),
-                    DbType::U64,
-                    false,
-                )
-                .await;
-
-            table.save(schema_io).await.unwrap();
-
-            info!("Created new schema and saved it");
-
-            table
+    // Written after the table exists so its sidecar sits beside the schema
+    // it belongs to, and kept in the loaded schema so the first statement
+    // after `CREATE TABLE` is already constrained.
+    for fk in &ct.foreign_keys {
+        if let Err(e) = crate::core::rql::foreign_key::stage(&*io_schema, &mut writes, fk)
+        {
+            error!("Failed to persist foreign key {}: {}", fk.name, e);
+            return Err(e);
         }
-    };
+        schema.foreign_keys.push(fk.clone());
+    }
 
-    schema
+    for entry in &ct.defaults {
+        if let Err(e) =
+            crate::core::rql::column_default::stage(&*io_schema, &mut writes, entry)
+        {
+            error!("Failed to persist default for {}: {}", entry.column, e);
+            return Err(e);
+        }
+        schema.defaults.push(entry.clone());
+    }
+
+    // Every column a constraint names has to exist, or the constraint would
+    // sit in the sidecar matching nothing and the table would look
+    // constrained while allowing duplicates.
+    for key in &ct.unique_keys {
+        for column in &key.columns {
+            if !schema
+                .fields
+                .iter()
+                .any(|f| f.name.eq_ignore_ascii_case(column) && !f.is_deleted)
+            {
+                error!(
+                    "UNIQUE constraint {} names unknown column {}",
+                    key.name, column
+                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "UNIQUE constraint {:?} names column {:?}, which the table does not have",
+                        key.name, column
+                    ),
+                ));
+            }
+        }
+        if let Err(e) = crate::core::rql::unique_key::stage(&*io_schema, &mut writes, key)
+        {
+            error!("Failed to persist unique constraint {}: {}", key.name, e);
+            return Err(e);
+        }
+        schema.unique_keys.push(key.clone());
+    }
+
+    for entry in &ct.type_modifiers {
+        if let Err(e) =
+            crate::core::rql::type_modifier::stage(&*io_schema, &mut writes, entry)
+        {
+            error!(
+                "Failed to persist type modifier for {}: {}",
+                entry.column, e
+            );
+            return Err(e);
+        }
+        schema.type_modifiers.push(entry.clone());
+        // Onto the field as well as into the sidecar. A table created in
+        // this process is never re-read from disk, so `TableSchema::load`'s
+        // copy of this never runs for it — and a planner that did not know
+        // the column's scale compared every literal against it a power of
+        // ten away, silently.
+        if let Some(field) = schema
+            .fields
+            .iter_mut()
+            .find(|f| f.name.eq_ignore_ascii_case(&entry.column))
+        {
+            field.scale = Some(entry.scale as u32);
+        }
+    }
+    // A column's declared text length, onto its field for the same reason
+    // (`SchemaField::text_typmod`).
+    for field in schema.fields.iter_mut().filter(|f| !f.is_deleted) {
+        field.set_text_typmod(crate::core::rql::type_modifier::text_typmod_of(&field.name, &schema.type_modifiers));
+    }
+
+    for entry in &ct.generated {
+        if let Err(e) =
+            crate::core::rql::generated::stage(&*io_schema, &mut writes, entry)
+        {
+            error!("Failed to persist generated column {}: {}", entry.column, e);
+            return Err(e);
+        }
+        schema.generated.push(entry.clone());
+    }
+
+    for entry in &ct.checks {
+        if let Err(e) = crate::core::rql::check::stage(&*io_schema, &mut writes, entry) {
+            error!("Failed to persist check constraint {}: {}", entry.name, e);
+            return Err(e);
+        }
+        schema.checks.push(entry.clone());
+    }
+
+    for entry in &ct.json_columns {
+        if let Err(e) = crate::core::rql::json_map::stage(&*io_schema, &mut writes, entry)
+        {
+            error!("Failed to register JSON column {}: {}", entry.column, e);
+            return Err(e);
+        }
+        schema.json_columns.push(entry.clone());
+    }
+    // Every record above as one transaction, one log sync: after a cut all
+    // of them or none (`torn_tail::SidecarWrites`).
+    if let Err(e) = writes.commit(&*io_schema).await {
+        error!("Failed to persist the constraints of {}: {}", schema.name, e);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// The catalogue's schema, written first when there is none. An error when
+/// that write fails (a full disk at the first open): `add_field` used to drop
+/// a field whose write failed and `save` then panicked on the rest.
+async fn load_db_data_schema<S: StorageIO>(schema_io: Arc<S>) -> io::Result<TableSchema> {
+    if let Ok(schema) = TableSchema::load(schema_io.clone()).await {
+        info!("Loaded schema: {:?}", schema);
+        return Ok(schema);
+    }
+    info!("Schema not found, creating new schema");
+    let mut table = TableSchema::new("db_data".to_string(), false);
+    table
+        .try_add_field(schema_io.clone(), "table_name".to_string(), DbType::STRING, true)
+        .await?;
+    table
+        .try_add_field(schema_io.clone(), "clusters".to_string(), DbType::U64, false)
+        .await?;
+    table.save(schema_io).await?;
+    info!("Created new schema and saved it");
+    Ok(table)
 }
 
 /// Whether the catalogue still names a table.
@@ -1819,10 +5076,132 @@ async fn load_db_data_schema<S: StorageIO>(schema_io: Arc<S>) -> TableSchema {
 ///
 /// Free-standing for the same reason as `catalogue_has_row`: rename recovery
 /// needs it before there is a `Database` to call it on.
-/// Removes the marker recording a rename in progress.
-async fn clear_intent(io_pointers: &Arc<DbStorageProvider>) {
-    let io = io_pointers.create_new(RENAME_INTENT_FILE.to_string()).await;
-    io.drop_io();
+/// Removes the marker recording a rename in progress, voiding its log records
+/// first.
+///
+/// The marker is written whole now (`record_rename_intent`), but older builds
+/// logged it, rewriting it at offset 0 for every rename: their records from
+/// one rename, left live, replayed under the next one's at the next open, and
+/// a longer earlier intent showed through a shorter later one. They are
+/// voided here still, so a directory an older build wrote cannot replay one
+/// back. Callers clear it only once whatever the intent protected is durable,
+/// which the barrier's own sync also covers for everything this log holds
+/// before it.
+async fn clear_intent(io_pointers: &Arc<DbStorageProvider>) -> bool {
+    let Some(path) = rename_intent_path(io_pointers) else {
+        return true;
+    };
+    let dir = io_pointers.get_location();
+    let wal = dir.as_deref().and_then(crate::core::wal::wal_for);
+    let _snapshot_gate = deletion_permit(wal.as_slice()).await;
+    if let Some(wal) = &wal
+        && let Err(e) =
+            wal.forget_files(&[crate::core::wal::file_id_for_name(RENAME_INTENT_FILE)])
+    {
+        // Deleted anyway: the next intent is checked whole when it is read
+        // (see `parse_intent`), so a stale record under it is refused, not
+        // acted on.
+        error!("Could not void the log's records for the rename intent: {}", e);
+    }
+    // An unlink reaches the disk with the directory's next sync (see
+    // `sweep_files_durably`), and nothing on the rename's path syncs this
+    // directory after this one: a power cut could bring the intent back,
+    // whole and checksummed, and the next open would act on it over a table
+    // created under the old name since.
+    if let Err(e) = remove_rename_intent(&path) {
+        error!("Could not delete the rename intent {}: {}", path.display(), e);
+        return false;
+    }
+    true
+}
+
+/// Where the rename intent lives: the catalogue's directory. `None` in
+/// memory, where nothing survives a crash for an intent to describe.
+fn rename_intent_path(io_pointers: &Arc<DbStorageProvider>) -> Option<std::path::PathBuf> {
+    io_pointers
+        .get_location()
+        .map(|dir| std::path::Path::new(&dir).join(RENAME_INTENT_FILE))
+}
+
+/// Deletes `path`, durably: unlinked, then its directory synced.
+fn remove_rename_intent(path: &std::path::Path) -> io::Result<()> {
+    #[cfg(test)]
+    if test_hooks::FAIL_INTENT_CLEAR.with(|f| f.replace(false)) {
+        return Err(io::Error::other("injected intent deletion failure"));
+    }
+    #[cfg(test)]
+    crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Unlink(path));
+    match std::fs::remove_file(path) {
+        Ok(()) => drop(crate::core::sync_audit::note("unlink", path)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    crate::core::wal::sync_parent_dir(path)
+}
+
+/// Moves a rename intent recovery will not act on to the first free
+/// `__rename.intent.bad-<n>`, durably, and logs it at error level. Kept, not
+/// deleted: what it named is for an operator to judge. Left in place, it
+/// would be read again at every open.
+fn set_aside_rename_intent(path: &std::path::Path, text: &str, why: &str) {
+    let mut n = 1u32;
+    let aside = loop {
+        let candidate = path.with_file_name(format!("{RENAME_INTENT_FILE}.bad-{n}"));
+        if !candidate.exists() {
+            break candidate;
+        }
+        n += 1;
+    };
+    #[cfg(test)]
+    crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Rename { from: path, to: &aside });
+    match std::fs::rename(path, &aside).and_then(|()| crate::core::wal::sync_parent_dir(&aside)) {
+        Ok(()) => error!(
+            "Rename intent {} ({text:?}) {why}; nothing was done with it, and it was moved aside to {}. \
+             Check that the tables it names are as expected (a rename it described may have left a \
+             copy's files or both names behind), then remove the file.",
+            path.display(),
+            aside.display()
+        ),
+        Err(e) => error!(
+            "Rename intent {} ({text:?}) {why}; nothing was done with it, and it could not be moved \
+             aside ({e}), so the next open reads it again",
+            path.display()
+        ),
+    }
+}
+
+/// The rename intent's bytes: both names and a checksum over them, each line
+/// terminated, so a record that is not exactly one intent does not parse.
+fn encode_intent(old_name: &str, new_name: &str) -> String {
+    let body = format!("{old_name}\n{new_name}");
+    format!("{body}\n{:016x}\n", crate::core::wal::file_id_for_name(&body))
+}
+
+/// The names an intent written by [`encode_intent`] holds, or `None` for
+/// anything else: stale log records replayed under it, a torn write, and a
+/// record that names no rename (an empty name, or one name twice).
+///
+/// An older build's two-line form (`old\nnew`, no checksum) is refused too:
+/// it is byte for byte a checksummed intent torn just before its sum, whose
+/// second name may be a prefix of the real one. `pt\npt`, the first five
+/// bytes of `RENAME pt TO pt2`'s intent, read as a rename of `pt` onto
+/// itself: both catalogue lookups found the one row, recovery took the
+/// rename for committed, tombstoned it and discarded `pt`'s files. Ignoring
+/// any intent costs at most a copy's files or a duplicate name, never a
+/// table, so nothing that cannot be proved whole is acted on.
+fn parse_intent(text: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = text.split('\n').collect();
+    let [old_name, new_name, sum, ""] = parts.as_slice() else {
+        return None;
+    };
+    let body = format!("{old_name}\n{new_name}");
+    if *sum != format!("{:016x}", crate::core::wal::file_id_for_name(&body)) {
+        return None;
+    }
+    if old_name.is_empty() || new_name.is_empty() || old_name == new_name {
+        return None;
+    }
+    Some((old_name.to_string(), new_name.to_string()))
 }
 
 /// Finishes or abandons a rename that a crash interrupted.
@@ -1840,35 +5219,53 @@ async fn recover_interrupted_rename(
     io_rows: &Arc<DbStorageProvider>,
     io_schema: &Arc<DbStorageProvider>,
     pool: &StoragePool,
-) {
-    let io = io_pointers.create_new(RENAME_INTENT_FILE.to_string()).await;
-    let len = io.get_len().await;
-    if len == 0 {
-        return;
+    kv: &KvStores,
+    seeds: &SeedCache,
+) -> Vec<String> {
+    let Some(path) = rename_intent_path(io_pointers) else {
+        return Vec::new();
+    };
+    // A write cut before its rename into place: the rename itself never
+    // started (it waits for the intent), so nothing followed it.
+    let partial = path.with_extension("partial");
+    if partial.exists() && std::fs::remove_file(&partial).is_ok() {
+        let _ = crate::core::wal::sync_parent_dir(&partial);
     }
-
-    let mut buffer = vec![0u8; len as usize];
-    let mut position = 0u64;
-    if io.read_data_into_buffer(&mut position, &mut buffer).await.is_err() {
-        warn!("A rename intent record exists but could not be read; leaving it in place");
-        return;
+    let buffer = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            warn!("A rename intent {} exists but could not be read ({e}); leaving it in place", path.display());
+            return Vec::new();
+        }
+    };
+    if buffer.is_empty() {
+        // What an older build left after clearing one in place.
+        let _ = remove_rename_intent(&path);
+        return Vec::new();
     }
 
     let text = String::from_utf8_lossy(&buffer);
-    let mut parts = text.split('\n');
-    let (Some(old_name), Some(new_name)) = (parts.next(), parts.next()) else {
-        warn!("Malformed rename intent record; discarding it");
-        clear_intent(io_pointers).await;
-        return;
+    let Some((old_name, new_name)) = parse_intent(&text) else {
+        set_aside_rename_intent(&path, &text, "does not parse as one whole, checksummed rename");
+        return Vec::new();
     };
-    let (old_name, new_name) = (old_name.trim(), new_name.trim());
-    if old_name.is_empty() || new_name.is_empty() {
-        clear_intent(io_pointers).await;
-        return;
-    }
+    let (old_name, new_name) = (old_name.as_str(), new_name.as_str());
+    let held = || vec![old_name.to_string(), new_name.to_string()];
 
-    let has_new = catalogue_has_row(io_pointers, io_rows, io_schema, new_name).await;
-    let has_old = catalogue_has_row(io_pointers, io_rows, io_schema, old_name).await;
+    // A plain rename names plain tables only (`record_rename_intent` refuses
+    // partitioned ones): files under `<name>*` and a row with no uid. One
+    // naming a partitioned table was not written for it, and acting on it
+    // would sweep or reopen that table as plain.
+    let old_rows = catalogue_rows(io_pointers, io_rows, io_schema, old_name).await;
+    let new_rows = catalogue_rows(io_pointers, io_rows, io_schema, new_name).await;
+    if old_rows.iter().chain(&new_rows).any(|clusters| *clusters != 0) {
+        set_aside_rename_intent(&path, &text, "names a partitioned table");
+        return Vec::new();
+    }
+    let has_new = !new_rows.is_empty();
+    let has_old = !old_rows.is_empty();
+    let root = io_pointers.get_location();
 
     match (has_old, has_new) {
         // Committed: the new row is there. Finish the tidy-up.
@@ -1877,15 +5274,57 @@ async fn recover_interrupted_rename(
                 "Completing an interrupted rename of {} to {}: both catalogue rows exist",
                 old_name, new_name
             );
-            if tombstone_catalogue_row(io_pointers, io_rows, io_schema, old_name).await.is_ok() {
-                discard_files(&seed_in(io_pointers, pool, old_name).await, old_name).await;
-                clear_intent(io_pointers).await;
+            if tombstone_catalogue_row(io_pointers, io_rows, io_schema, old_name)
+                .await
+                .is_ok()
+                // Durable before the old name's records are voided below, on
+                // whichever log holds them: see `forget_logged_files`.
+                && root
+                    .as_deref()
+                    .and_then(crate::core::wal::wal_for)
+                    .is_none_or(|wal| wal.sync_pending().is_ok())
+            {
+                // Files kept keep the intent, so the next open tries again.
+                if !discard_files(
+                    &seed_in(io_pointers, pool, kv, seeds, old_name).await,
+                    pool,
+                    root.as_deref(),
+                    old_name,
+                )
+                .await
+                {
+                    return held();
+                }
+                // As a rename that finishes at once forgets it: left, the old
+                // name's placement outlives its files, and the next table
+                // created under the name inherits it (`place` keeps a
+                // recorded one).
+                pool_forget(pool, old_name);
+                if !clear_intent(io_pointers).await {
+                    return held();
+                }
+            } else {
+                // Kept, and the names with it, so the next open tries again
+                // and nothing is created under either meanwhile.
+                return held();
             }
         }
         (false, true) => {
             // Committed and tombstoned; only the old files remain.
-            discard_files(&seed_in(io_pointers, pool, old_name).await, old_name).await;
-            clear_intent(io_pointers).await;
+            if !discard_files(
+                &seed_in(io_pointers, pool, kv, seeds, old_name).await,
+                pool,
+                root.as_deref(),
+                old_name,
+            )
+            .await
+            {
+                return held();
+            }
+            pool_forget(pool, old_name);
+            if !clear_intent(io_pointers).await {
+                return held();
+            }
         }
         // Never committed: the catalogue still names only the original, so
         // the copy is incomplete and belongs to nobody.
@@ -1894,8 +5333,22 @@ async fn recover_interrupted_rename(
                 "Abandoning an interrupted rename of {} to {}: it never reached the catalogue",
                 old_name, new_name
             );
-            discard_files(&seed_in(io_pointers, pool, new_name).await, new_name).await;
-            clear_intent(io_pointers).await;
+            if !discard_files(
+                &seed_in(io_pointers, pool, kv, seeds, new_name).await,
+                pool,
+                root.as_deref(),
+                new_name,
+            )
+            .await
+            {
+                return held();
+            }
+            // The placement the rename pinned for the copy, as `abandon_copy`
+            // forgets it.
+            pool_forget(pool, new_name);
+            if !clear_intent(io_pointers).await {
+                return held();
+            }
         }
         // Neither: nothing to reconcile against, so the safest act is none.
         // Leaving both file sets costs space; deleting the wrong one costs
@@ -1906,27 +5359,28 @@ async fn recover_interrupted_rename(
                  leaving both file sets in place",
                 old_name, new_name
             );
-            clear_intent(io_pointers).await;
+            if !clear_intent(io_pointers).await {
+                return held();
+            }
         }
     }
+    Vec::new()
 }
 
 async fn tombstone_catalogue_row(
-io_pointers: &Arc<DbStorageProvider>,
-io_rows: &Arc<DbStorageProvider>,
-io_schema: &Arc<DbStorageProvider>,
-table_name: &str,
+    io_pointers: &Arc<DbStorageProvider>,
+    io_rows: &Arc<DbStorageProvider>,
+    io_schema: &Arc<DbStorageProvider>,
+    table_name: &str,
 ) -> io::Result<bool> {
-    let schema = load_db_data_schema(io_schema.clone()).await;
+    let schema = load_db_data_schema(io_schema.clone()).await?;
     let fetch = create_db_data_row_fetch(&schema.fields);
 
     let mut iterator = RowPointerIterator::new(io_pointers.clone())
         .await
         .map_err(|e| io::Error::other(format!("{e:?}")))?;
 
-    while let Ok(Some((record_pos, mut pointer))) =
-        iterator.next_row_pointer_with_offset().await
-    {
+    while let Ok(Some((record_pos, mut pointer))) = iterator.next_row_pointer_with_offset().await {
         let Ok(row) = pointer.fetch_row(io_rows.clone(), &fetch).await else {
             continue;
         };
@@ -1952,19 +5406,42 @@ table_name: &str,
     Ok(false)
 }
 
+#[cfg(test)]
 async fn catalogue_has_row(
     io_pointers: &Arc<DbStorageProvider>,
     io_rows: &Arc<DbStorageProvider>,
     io_schema: &Arc<DbStorageProvider>,
     table_name: &str,
 ) -> bool {
-    let schema = load_db_data_schema(io_schema.clone()).await;
+    !catalogue_rows(io_pointers, io_rows, io_schema, table_name)
+        .await
+        .is_empty()
+}
+
+/// The `clusters` of every live catalogue row named `table_name`: 0 for a
+/// plain table, the uid of a partitioned one's files.
+async fn catalogue_rows(
+    io_pointers: &Arc<DbStorageProvider>,
+    io_rows: &Arc<DbStorageProvider>,
+    io_schema: &Arc<DbStorageProvider>,
+    table_name: &str,
+) -> Vec<u64> {
+    // The open read (or wrote) this schema before anything asks here, so it
+    // only fails on one that stopped reading since; said loudly.
+    let schema = match load_db_data_schema(io_schema.clone()).await {
+        Ok(schema) => schema,
+        Err(e) => {
+            error!("The catalogue's schema could not be read: {e}; {table_name} reads as uncatalogued");
+            return Vec::new();
+        }
+    };
     let fetch = create_db_data_row_fetch(&schema.fields);
 
     let Ok(mut iterator) = RowPointerIterator::new(io_pointers.clone()).await else {
-        return false;
+        return Vec::new();
     };
 
+    let mut found = Vec::new();
     while let Ok(Some((_, pointer))) = iterator.next_row_pointer_with_offset().await {
         let Ok(row) = pointer.fetch_row(io_rows.clone(), &fetch).await else {
             continue;
@@ -1972,11 +5449,19 @@ async fn catalogue_has_row(
         let Some(name_column) = row.columns.iter().find(|c| c.schema_id == 0) else {
             continue;
         };
-        if String::from_utf8_lossy(name_column.data.into_slice()) == table_name {
-            return true;
+        if String::from_utf8_lossy(name_column.data.into_slice()) != table_name {
+            continue;
         }
+        let clusters = row
+            .columns
+            .iter()
+            .find(|c| c.schema_id == 1)
+            .and_then(|c| <[u8; 8]>::try_from(c.data.into_slice()).ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(0);
+        found.push(clusters);
     }
-    false
+    found
 }
 
 /// Copies every file `name` owns from one seed provider to another, under the
@@ -2011,7 +5496,10 @@ async fn copy_between(
         // table; emptying it first is the only safe reading.
         let existing = destination.get_len().await;
         if existing > 0 {
-            warn!("{} already exists at the destination ({} bytes); replacing it", file, existing);
+            warn!(
+                "{} already exists at the destination ({} bytes); replacing it",
+                file, existing
+            );
             destination
                 .truncate(0)
                 .await
@@ -2023,7 +5511,9 @@ async fn copy_between(
         while position < len {
             let take = ((len - position) as usize).min(buffer.len());
             let mut cursor = position;
-            source.read_data_into_buffer(&mut cursor, &mut buffer[..take]).await?;
+            source
+                .read_data_into_buffer(&mut cursor, &mut buffer[..take])
+                .await?;
             destination.append_data(&buffer[..take], false).await;
             position += take as u64;
         }
@@ -2049,12 +5539,447 @@ async fn copy_between(
     Ok(total)
 }
 
-/// Releases every file derived from `name`.
-async fn discard_files(io_pointers: &Arc<DbStorageProvider>, name: &str) {
-    for suffix in RENAMED_SUFFIXES {
-        let io = io_pointers.create_new(format!("{}{}", name, suffix)).await;
-        io.drop_io();
+/// Why [`forget_logged_files`] failed, and whether a barrier may be in a log
+/// anyway: one of several already written, or this one, if the failure came
+/// after its append. Only a caller told `maybe_logged: false` may put the
+/// table back, since a durable barrier voids its unflushed records.
+struct ForgetFailure {
+    error: io::Error,
+    maybe_logged: bool,
+}
+
+/// The logs that can hold records for the files `io` reaches: its own
+/// directory's, and for a mirrored provider each backup directory's, since a
+/// backup copy's writes are logged there under the same ids and a sweep
+/// through `io` deletes those copies too. The database's own log (`own`, a
+/// directory) comes first when it is one of them; see
+/// [`Database::forget_dropped_files`]. Empty without a log anywhere: in
+/// memory, a statement-scoped relation, another backend.
+fn logs_holding(
+    io: &DbStorageProvider,
+    pool: &StoragePool,
+    own: Option<&str>,
+) -> Vec<StdArc<crate::core::wal::Wal>> {
+    let dirs = dirs_reached(io, pool);
+    let mut logs: Vec<StdArc<crate::core::wal::Wal>> = Vec::new();
+    for dir in &dirs {
+        if let Some(wal) = crate::core::wal::wal_for(dir)
+            && !logs.iter().any(|l| StdArc::ptr_eq(l, &wal))
+        {
+            logs.push(wal);
+        }
     }
+    if let Some(own) = own.and_then(crate::core::wal::wal_for)
+        && let Some(at) = logs.iter().position(|l| StdArc::ptr_eq(l, &own))
+    {
+        logs.swap(0, at);
+    }
+    logs
+}
+
+/// The directories `io` reaches: its own, and for a mirrored provider each
+/// backup directory, whose copies a sweep through `io` deletes too.
+fn dirs_reached(io: &DbStorageProvider, pool: &StoragePool) -> Vec<String> {
+    let mut dirs: Vec<String> = io.get_location().into_iter().collect();
+    #[cfg(feature = "storage_pools")]
+    {
+        if matches!(io, DbStorageProvider::Mirror(_)) {
+            dirs.extend(pool.mirrors());
+        }
+    }
+    #[cfg(not(feature = "storage_pools"))]
+    let _ = pool;
+    dirs
+}
+
+/// Held from a barrier through the deletion it announces, when `logs` holds
+/// any log (a statement-scoped relation, in memory, never waits).
+///
+/// A point-in-time restore replays a barrier over the snapshot's copy of the
+/// file, and empties the file only when the barrier committed after the copy
+/// began (see [`crate::core::wal::Wal::recover_restoring`]). That reads the
+/// copy right only if the barrier and the file's deletion are on the same
+/// side of the point the copy began: a barrier committed just before it,
+/// with its file deleted only once the copy had read it, left the deleted
+/// file's bytes in a copy the restore then took for the new file's. A
+/// snapshot holds the gate exclusively while it fixes that point, and no
+/// longer (see [`crate::core::backup::deletion_permit`]): both after it, the
+/// file is emptied, rightly, however long the copy runs.
+#[cfg(feature = "s3_backup")]
+async fn deletion_permit(
+    logs: &[StdArc<crate::core::wal::Wal>],
+) -> Option<tokio::sync::RwLockReadGuard<'static, ()>> {
+    if logs.is_empty() {
+        return None;
+    }
+    #[cfg(test)]
+    let _parked = ParkedDeletion::new(logs[0].path());
+    Some(crate::core::backup::deletion_permit().await)
+}
+
+/// The first log of every [`deletion_permit`] waiting for its permit, so a
+/// test holding the gate knows its deletion reached it rather than guessing
+/// with a sleep.
+#[cfg(all(test, feature = "s3_backup"))]
+pub(crate) static PARKED_DELETIONS: parking_lot::Mutex<Vec<std::path::PathBuf>> =
+    parking_lot::Mutex::new(Vec::new());
+
+#[cfg(all(test, feature = "s3_backup"))]
+struct ParkedDeletion(std::path::PathBuf);
+
+#[cfg(all(test, feature = "s3_backup"))]
+impl ParkedDeletion {
+    fn new(log: &std::path::Path) -> Self {
+        PARKED_DELETIONS.lock().push(log.to_path_buf());
+        ParkedDeletion(log.to_path_buf())
+    }
+}
+
+#[cfg(all(test, feature = "s3_backup"))]
+impl Drop for ParkedDeletion {
+    fn drop(&mut self) {
+        let mut parked = PARKED_DELETIONS.lock();
+        if let Some(at) = parked.iter().position(|p| *p == self.0) {
+            parked.swap_remove(at);
+        }
+    }
+}
+
+#[cfg(not(feature = "s3_backup"))]
+async fn deletion_permit(_logs: &[StdArc<crate::core::wal::Wal>]) -> Option<()> {
+    None
+}
+
+/// Held by a rename or a move of `table` from start to finish, when the
+/// database is file-backed: it waits for a snapshot in progress to finish
+/// its upload (see [`crate::core::backup::relocation_permit`]).
+///
+/// A drop needs only [`deletion_permit`]: a file it deletes after a
+/// snapshot listed it is emptied by a restore at its barrier, so the copy
+/// may leave it out. A rename or a move deletes files whose bytes went on in
+/// a copy no log record describes, and creates files the snapshot does not
+/// hold. Either during the upload failed the snapshot on the missing file,
+/// and leaving such a file out would lose the table from the snapshot and
+/// from every point-in-time restore after it.
+#[cfg(feature = "s3_backup")]
+async fn relocation_permit(
+    file_backed: bool,
+    table: &str,
+) -> Option<tokio::sync::RwLockReadGuard<'static, ()>> {
+    if !file_backed {
+        return None;
+    }
+    #[cfg(test)]
+    let _parked = ParkedRelocation::new(table);
+    #[cfg(not(test))]
+    let _ = table;
+    Some(crate::core::backup::relocation_permit().await)
+}
+
+#[cfg(not(feature = "s3_backup"))]
+async fn relocation_permit(_file_backed: bool, _table: &str) -> Option<()> {
+    None
+}
+
+/// The table of every [`relocation_permit`] waiting for its permit, so a test
+/// holding a snapshot knows the rename or move reached it.
+#[cfg(all(test, feature = "s3_backup"))]
+pub(crate) static PARKED_RELOCATIONS: parking_lot::Mutex<Vec<String>> =
+    parking_lot::Mutex::new(Vec::new());
+
+#[cfg(all(test, feature = "s3_backup"))]
+struct ParkedRelocation(String);
+
+#[cfg(all(test, feature = "s3_backup"))]
+impl ParkedRelocation {
+    fn new(table: &str) -> Self {
+        PARKED_RELOCATIONS.lock().push(table.to_string());
+        ParkedRelocation(table.to_string())
+    }
+}
+
+#[cfg(all(test, feature = "s3_backup"))]
+impl Drop for ParkedRelocation {
+    fn drop(&mut self) {
+        let mut parked = PARKED_RELOCATIONS.lock();
+        if let Some(at) = parked.iter().position(|p| *p == self.0) {
+            parked.swap_remove(at);
+        }
+    }
+}
+
+/// Why a table's files are about to go, as their barrier tells a snapshot.
+#[derive(Clone, Copy)]
+enum Barrier {
+    /// `DROP TABLE`, and the drops an `ALTER` rewrite makes. A snapshot whose
+    /// copy finds one of these files gone may leave it out: a restore empties
+    /// it at the barrier anyway (see `crate::core::wal::Wal::dropped_after`).
+    Drop,
+    /// A rename's or a move's old files, and the destination's stale
+    /// records a move voids. Their bytes went on in a copy that wrote no log
+    /// record, so a snapshot must never leave them out; those paths wait for
+    /// a snapshot's whole upload instead (see [`relocation_permit`]).
+    Relocation,
+}
+
+/// Voids the records for every file a table of `name` owns in each of
+/// `logs` (see [`logs_holding`]), durably, in order. See
+/// [`crate::core::wal::Wal::forget_files`].
+///
+/// Records name files by a hash of the file name, so the next table of this
+/// name, or this one moved or renamed back, has the ids these records carry.
+/// Unvoided, the next open (a crash is not needed: every open replays the
+/// log) writes them into its files. Call it before the files are deleted and
+/// after the catalogue no longer names the table *durably*: voided while the
+/// table still exists, a crash would replay it without the writes its log was
+/// holding.
+fn forget_logged_files(
+    logs: &[StdArc<crate::core::wal::Wal>],
+    name: &str,
+    barrier: Barrier,
+) -> Result<(), ForgetFailure> {
+    let ids: Vec<u64> = table_file_names(name)
+        .map(|file| crate::core::wal::file_id_for_name(&file))
+        .collect();
+    forget_logged_ids(logs, &ids, barrier)
+}
+
+/// [`forget_logged_files`] for files named by their log ids: a partitioned
+/// table's, which no single table name derives.
+fn forget_logged_ids(
+    logs: &[StdArc<crate::core::wal::Wal>],
+    ids: &[u64],
+    barrier: Barrier,
+) -> Result<(), ForgetFailure> {
+    let mut logged = false;
+    for wal in logs {
+        let was_poisoned = wal.is_poisoned();
+        let forgotten = match barrier {
+            Barrier::Drop => wal.forget_dropped_files(ids),
+            Barrier::Relocation => wal.forget_files(ids),
+        };
+        if let Err(error) = forgotten {
+            // Poisoned by this call means it failed past the append, at the
+            // marker or the sync, and the barrier may be durable. Either
+            // other failure leaves nothing that can commit.
+            let maybe_logged = logged || (!was_poisoned && wal.is_poisoned());
+            return Err(ForgetFailure {
+                error,
+                maybe_logged,
+            });
+        }
+        logged = true;
+    }
+    Ok(())
+}
+
+/// Releases every file derived from `name`, voiding the logs' records for them
+/// first (see [`forget_logged_files`]). Returns whether the files went.
+///
+/// A failure to void keeps the files: deleted with their records live, the
+/// next open would replay those into a later table of that name. Kept, the
+/// caller holds the name (`Database::held_names`) and leaves whatever intent
+/// lets the next open try again: a space leak, not a corruption. The caller
+/// must already have made durable whatever stops the files being a live
+/// table's (see [`Database::rename_table`]).
+async fn discard_files(
+    io_pointers: &Arc<DbStorageProvider>,
+    pool: &StoragePool,
+    own: Option<&str>,
+    name: &str,
+) -> bool {
+    if seed_fell_back(pool, io_pointers, name) {
+        return unavailable_kept(name);
+    }
+    let logs = logs_holding(io_pointers, pool, own);
+    let _snapshot_gate = deletion_permit(&logs).await;
+    if let Err(failure) = forget_logged_files(&logs, name, Barrier::Relocation) {
+        error!(
+            "Could not void the log's records for {}'s files, so they were kept: {}",
+            name, failure.error
+        );
+        return false;
+    }
+    sweep_files_durably(io_pointers, pool, own, name).await;
+    true
+}
+
+/// [`sweep_files`], then a sync of each directory swept, so the deletions are
+/// on disk before the caller goes on.
+///
+/// An unlink reaches the disk with the directory's next sync, and the barrier
+/// and catalogue tombstone before it are already durable. A power cut in
+/// between kept the files, and the next table of the name opened them as its
+/// own. Only where a log reaches: a directory without one is in memory or
+/// another backend, and statement-scoped relations, dropped once per CTE,
+/// must not pay a sync each.
+async fn sweep_files_durably(
+    io_pointers: &Arc<DbStorageProvider>,
+    pool: &StoragePool,
+    own: Option<&str>,
+    name: &str,
+) {
+    sweep_files(io_pointers, name).await;
+    if logs_holding(io_pointers, pool, own).is_empty() {
+        return;
+    }
+    for dir in dirs_reached(io_pointers, pool) {
+        // Named by a swept file: `sync_parent_dir` syncs the directory a
+        // path is in.
+        let swept = std::path::Path::new(&dir).join(format!("{name}{}", RENAMED_SUFFIXES[0]));
+        if let Err(e) = crate::core::wal::sync_parent_dir(&swept) {
+            error!(
+                "Deleted {}'s files in {} but could not sync the directory: {}",
+                name, dir, e
+            );
+        }
+    }
+}
+
+/// Copies `table`'s index-store pair to the stem `stem` in `to_dir` and
+/// carries its write gate there (B13; `FileGate::carry_to`), under the
+/// file set's maintenance lock, so no seal writes either file meanwhile.
+/// `None` when either side has no directory: nothing is carried, and the
+/// target opens its own word.
+async fn carry_index_store(
+    table: &Table<DbStorageProvider>,
+    to_dir: Option<std::path::PathBuf>,
+    stem: &str,
+) -> io::Result<Option<StdArc<crate::core::index_store::file_gate::FileGate>>> {
+    let gate = table.gate().clone();
+    let Some(to_dir) = to_dir else {
+        return Ok(None);
+    };
+    if !gate.has_files() {
+        return Ok(None);
+    }
+    let _maintenance = gate.maintenance().lock().await;
+    crate::core::index_store::file_gate::copy_files(&gate, &to_dir, stem)?;
+    Ok(gate.carry_to(to_dir, stem))
+}
+
+/// Deletes every file derived from `name`, the log left as it is.
+///
+/// The index-store files of the stem go too (`.ixm`, `.ixs` and their
+/// `.tmp`s; docs/persistent-indexes.md §1): a DROP's, and a RENAME's or a
+/// MOVE's source, whose pair and word were carried to the target first
+/// (B13, `carry_index_store`). Left behind, a log ending `CLEAN` would
+/// vouch for a snapshot of rows that a rename back to this name brings home
+/// changed.
+async fn sweep_files(io_pointers: &Arc<DbStorageProvider>, name: &str) {
+    for suffix in RENAMED_SUFFIXES {
+        io_pointers.drop_file(format!("{}{}", name, suffix)).await;
+    }
+    if let Some(dir) = io_pointers.index_store_dir() {
+        crate::core::index_store::file_gate::remove_files(&dir, name);
+    }
+}
+
+/// Copies each file derived from `old_name` with one of `suffixes`, from the
+/// provider family `from` to one derived from `new_name` in `to`, each made
+/// durable before the next: a rename's copy, and an ALTER's file-set backup
+/// and its restore (`rewrite.rs`). A file that does not exist, or is empty,
+/// copies as nothing: sidecars are created lazily.
+pub(super) async fn copy_files_between(
+    from: &DbStorageProvider,
+    to: &DbStorageProvider,
+    old_name: &str,
+    new_name: &str,
+    suffixes: &[&str],
+) -> io::Result<()> {
+    for suffix in suffixes {
+        let source = from.create_new(format!("{}{}", old_name, suffix)).await;
+        let len = source.get_len().await;
+        if len == 0 {
+            continue;
+        }
+
+        let destination = to.create_new(format!("{}{}", new_name, suffix)).await;
+
+        // Chunked rather than one allocation: a table is not bounded by
+        // memory and a rename of a large one should not be.
+        const CHUNK: usize = 1 << 20;
+        let mut position = 0u64;
+        let mut buffer = vec![0u8; CHUNK.min(len as usize)];
+        while position < len {
+            let remaining = (len - position) as usize;
+            let take = remaining.min(buffer.len());
+            let mut cursor = position;
+            source
+                .read_data_into_buffer(&mut cursor, &mut buffer[..take])
+                .await?;
+            destination.append_data(&buffer[..take], false).await;
+            position += take as u64;
+        }
+
+        // Durable before the catalogue names it: a file the catalogue
+        // points at but the page cache has not written is the one state
+        // this whole ordering exists to avoid.
+        let token = destination.begin_txn();
+        destination
+            .commit_durable(token)
+            .await
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
+
+        let written = destination.get_len().await;
+        if written != len {
+            return Err(io::Error::other(format!(
+                "copying {}{} produced {} bytes from {}",
+                new_name, suffix, written, len
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// [`discard_files`] for only the files of `name` ending in one of
+/// `suffixes`: their log records voided first (a relocation barrier: what
+/// replaces them may be a copy no record describes), then the files deleted
+/// and the directories synced. False, deleting nothing, when the records
+/// could not be voided.
+pub(super) async fn discard_files_in(
+    io_pointers: &Arc<DbStorageProvider>,
+    pool: &StoragePool,
+    own: Option<&str>,
+    name: &str,
+    suffixes: &[&str],
+) -> bool {
+    if seed_fell_back(pool, io_pointers, name) {
+        return unavailable_kept(name);
+    }
+    let logs = logs_holding(io_pointers, pool, own);
+    let _snapshot_gate = deletion_permit(&logs).await;
+    let ids: Vec<u64> = suffixes
+        .iter()
+        .map(|suffix| crate::core::wal::file_id_for_name(&format!("{name}{suffix}")))
+        .collect();
+    if let Err(failure) = forget_logged_ids(&logs, &ids, Barrier::Relocation) {
+        error!(
+            "Could not void the log's records for {}'s files, so they were kept: {}",
+            name, failure.error
+        );
+        return false;
+    }
+    for suffix in suffixes {
+        io_pointers.drop_file(format!("{}{}", name, suffix)).await;
+    }
+    // No directory to sync for a database with none. One with its log
+    // disabled still has directories, whose unlinks a power cut could
+    // otherwise bring back: this used to return here whenever no log held
+    // the files.
+    if logs.is_empty() && own.is_none() {
+        return true;
+    }
+    for dir in dirs_reached(io_pointers, pool) {
+        let swept = std::path::Path::new(&dir).join(format!("{name}{}", RENAMED_SUFFIXES[0]));
+        if let Err(e) = crate::core::wal::sync_parent_dir(&swept) {
+            error!(
+                "Deleted {}'s files in {} but could not sync the directory: {}",
+                name, dir, e
+            );
+        }
+    }
+    true
 }
 
 async fn load_db_tables<S: StorageIO>(
@@ -2156,6 +6081,10 @@ pub(crate) struct NativeContext {
     /// `superuser` would refuse the very statement that creates the first
     /// account — so the gate is applied only where it means something.
     authentication_required: bool,
+    /// The server's catalogue, which each connection is counted in
+    /// ([`crate::pgwire::NativeSession::attach`]); `None` for a listener
+    /// serving a database of its own.
+    catalog: Option<Arc<catalog::DatabaseCatalog>>,
 }
 
 /// Encodes an error the way the executor does, so a caller needs no special
@@ -2167,12 +6096,331 @@ fn error_response(message: &str) -> Vec<u8> {
     result
 }
 
+/// Serves the native protocol on `server` for `database`, as the listeners
+/// [`Database::start_db_with_auth_on`] binds do: each connection with a
+/// session of its own, so a `rastcp/1` connection can hold a transaction
+/// block (`pgwire::NativeSession`). `authentication_required` says whether
+/// `server` was given an authenticator; see [`NativeContext`].
+///
+/// For embedding and tests that build their own [`TcpServer`] (a
+/// listener of their choosing, a shorter request timeout).
+pub async fn serve_native(
+    server: &TcpServer,
+    database: Arc<Database>,
+    authentication_required: bool,
+) -> Result<(), rastcp::error::RastcpError> {
+    let context = NativeContext {
+        database,
+        authentication_required,
+        catalog: None,
+    };
+    server
+        .run_with_session(context, open_native_session, serve_native_request)
+        .await
+}
+
+/// The database a native connection may use when it names `name`: the
+/// listener's own (`own`) when it has no catalogue, otherwise the catalogue's
+/// database of that name, unless it is being imported. The refusal is a
+/// SQLSTATE and the message pgwire gives for the same name at start-up.
+pub(crate) fn resolve_native_database(
+    catalog: Option<&catalog::DatabaseCatalog>,
+    own: &Arc<Database>,
+    name: &str,
+) -> Result<Arc<Database>, (&'static str, String)> {
+    let missing = || ("3D000", format!("database \"{}\" does not exist", name));
+    match catalog {
+        None if name == own.name => Ok(own.clone()),
+        None => Err(missing()),
+        Some(catalog) => {
+            if catalog.is_loading(name) {
+                return Err((
+                    "57P03",
+                    format!(
+                        "database \"{}\" is being imported and is not ready for connections \
+                         yet; it will accept them once the import finishes",
+                        name
+                    ),
+                ));
+            }
+            catalog.get(name).ok_or_else(missing)
+        }
+    }
+}
+
+/// A native connection (rastcp's `run_with_session`): who opened it, and the
+/// session its statements run in, made for the database it uses once that is
+/// known. Keyed on the connection, never on the principal: two connections of
+/// one user are two sessions.
+///
+/// The database is the one the login named ([`rastcp::session::Principal::database`]),
+/// or on a listener that asks for no login the one a
+/// [`crate::pgwire::NATIVE_DATABASE_PREFIX`] request selects first, or the
+/// listener's own. The session is made by the first request, so a
+/// connection that selects a database is never counted among the default
+/// database's sessions on the way.
+pub(crate) struct NativeConnection {
+    context: NativeContext,
+    principal: StdArc<rastcp::session::Principal>,
+    multiplexed: bool,
+    session: std::sync::OnceLock<crate::pgwire::NativeSession>,
+}
+
+impl NativeConnection {
+    /// The database the login named, or the listener's.
+    fn login_database(&self) -> &str {
+        self.principal
+            .database
+            .as_deref()
+            .unwrap_or(&self.context.database.name)
+    }
+
+    /// The connection's session, made in `name` if it has none yet.
+    ///
+    /// Two requests of a `rastcp/2` connection can both find none; each
+    /// makes one, the first to finish keeps its own and the other's is
+    /// dropped unused. What the caller gets is the one kept, which may be
+    /// in another database than `name`: [`Self::select`] checks.
+    fn session_in(
+        &self,
+        name: &str,
+    ) -> Result<&crate::pgwire::NativeSession, (&'static str, String)> {
+        if let Some(session) = self.session.get() {
+            return Ok(session);
+        }
+        let database =
+            resolve_native_database(self.context.catalog.as_deref(), &self.context.database, name)?;
+        let made = native_session_in(&self.context, database, &self.principal, self.multiplexed);
+        let _ = self.session.set(made);
+        Ok(self.session.get().expect("set just above"))
+    }
+
+    /// Answers a [`crate::pgwire::NATIVE_DATABASE_PREFIX`] request naming
+    /// `name`.
+    fn select(&self, name: &[u8]) -> Vec<u8> {
+        use crate::pgwire::{native_simple_complete as complete, native_simple_error as refuse};
+
+        let Ok(name) = std::str::from_utf8(name) else {
+            return refuse("22021", "the database name is not valid UTF-8", b'I');
+        };
+        if name.is_empty() {
+            return refuse("08P01", "the database selection names no database", b'I');
+        }
+
+        // A login checked against one database's roles stays in it: a
+        // selection could otherwise carry it into a database whose role of the
+        // same name is someone else.
+        let fixed_by_login =
+            self.principal.database.is_some() || self.context.authentication_required;
+        if fixed_by_login && name != self.login_database() {
+            return refuse(
+                "28000",
+                &format!(
+                    "this connection logged in to database \"{}\": a server that authenticates \
+                     checks a login against the roles of the database it names, so name \
+                     \"{}\" in the login instead of selecting it afterwards",
+                    self.login_database(),
+                    name
+                ),
+                b'I',
+            );
+        }
+
+        if let Some(session) = self.session.get()
+            && session.database().name != name
+        {
+            return refuse(
+                "08P01",
+                &format!(
+                    "this connection already runs in database \"{}\": a database is selected \
+                     before a connection's first statement, and stays",
+                    session.database().name
+                ),
+                b'I',
+            );
+        }
+
+        match self.session_in(name) {
+            Ok(session) if session.database().name == name => complete("SET"),
+            Ok(session) => refuse(
+                "08P01",
+                &format!(
+                    "this connection already runs in database \"{}\": a statement sent with \
+                     the selection reached it first",
+                    session.database().name
+                ),
+                b'I',
+            ),
+            Err((code, message)) => refuse(code, &message, b'I'),
+        }
+    }
+}
+
+/// A native connection, opened once its caller has authenticated: its
+/// session is made by its first request ([`NativeConnection`]).
+fn open_native_session(
+    context: &NativeContext,
+    principal: &StdArc<rastcp::session::Principal>,
+    connection: &rastcp::server::ConnectionInfo,
+) -> NativeConnection {
+    NativeConnection {
+        context: context.clone(),
+        principal: principal.clone(),
+        multiplexed: connection.multiplexed,
+        session: std::sync::OnceLock::new(),
+    }
+}
+
+/// A session in the listener's own database, for a connection that is
+/// `multiplexed` or not.
+#[cfg(test)]
+fn native_session_for(
+    context: &NativeContext,
+    principal: &StdArc<rastcp::session::Principal>,
+    multiplexed: bool,
+) -> crate::pgwire::NativeSession {
+    native_session_in(context, context.database.clone(), principal, multiplexed)
+}
+
+/// A session in `database`, counted among its sessions in the server's
+/// catalogue when the listener has one.
+fn native_session_in(
+    context: &NativeContext,
+    database: Arc<Database>,
+    principal: &StdArc<rastcp::session::Principal>,
+    multiplexed: bool,
+) -> crate::pgwire::NativeSession {
+    let session = crate::pgwire::NativeSession::new(
+        database,
+        &principal.user,
+        principal.superuser,
+        context.authentication_required,
+        multiplexed,
+    );
+    match &context.catalog {
+        Some(catalog) => session.attach(catalog),
+        None => session,
+    }
+}
+
+/// One request on a connection: a database selection, or a request run in
+/// the connection's session, in the connection's database.
+async fn serve_native_request(
+    context: NativeContext,
+    principal: StdArc<rastcp::session::Principal>,
+    connection: StdArc<NativeConnection>,
+    request_vec: Vec<u8>,
+) -> Vec<u8> {
+    if let Some(name) = request_vec.strip_prefix(crate::pgwire::NATIVE_DATABASE_PREFIX) {
+        return connection.select(name);
+    }
+    let session = match connection.session_in(connection.login_database()) {
+        Ok(session) => session,
+        Err((_, message)) => return error_response(&message),
+    };
+    // Everything below reads the database from the context.
+    let context = if Arc::ptr_eq(session.database(), &context.database) {
+        context
+    } else {
+        NativeContext {
+            database: session.database().clone(),
+            ..context
+        }
+    };
+    process_native_request(context, principal, Some(session), request_vec).await
+}
+
+/// One request with no connection session: transaction control is refused.
+/// What the statement tests drive the dispatch through.
+#[cfg(test)]
 pub(crate) async fn process_incoming_queries(
     context: NativeContext,
     principal: StdArc<rastcp::session::Principal>,
     request_vec: Vec<u8>,
 ) -> Vec<u8> {
-    let query = String::from_utf8_lossy(&request_vec);
+    process_native_request(context, principal, None, request_vec).await
+}
+
+async fn process_native_request(
+    context: NativeContext,
+    principal: StdArc<rastcp::session::Principal>,
+    session: Option<&crate::pgwire::NativeSession>,
+    request_vec: Vec<u8>,
+) -> Vec<u8> {
+    // Every branch but the plain statement's is boxed where it is awaited:
+    // an async fn's future is as large as its largest await, so the rare
+    // branches (the session's path, the role statements, the checkpoint),
+    // inline, made this future 13 KB, copied whole each time it moved, on
+    // every request.
+    // An EXEC request (`rastcp::exec`): a statement's text with `$n` in
+    // place of its values, and each value as the SQL literal the client
+    // would have written there. It is the rendered statement in every way:
+    // the text below is exactly what the client would otherwise have sent,
+    // and every rule below reads it as such. The one thing the client's
+    // split adds is the statement's template, ready made, which the learned
+    // path then keys on instead of working it out from the text
+    // (`NativeSession::text_step`). Ahead of the marked requests, whose mark
+    // is EXEC's first byte too. A malformed one is refused, never run as
+    // whatever its bytes read as.
+    let (request_vec, exec_template) = match rastcp::exec::decode(&request_vec) {
+        None => (request_vec, None),
+        Some(Err(e)) => return error_response(&format!("malformed EXEC request: {e}")),
+        Some(Ok(exec)) => {
+            let template = crate::pgwire::NativeTemplate {
+                sql: exec.sql.to_string(),
+                literals: exec.literals.iter().map(|l| l.to_string()).collect(),
+            };
+            (exec.render().into_bytes(), Some(template))
+        }
+    };
+
+    // A marked request (`pgwire::native_session::answer_marked`): the
+    // simple-query form, whose text is a PostgreSQL simple query run by the
+    // connection's session through pgwire's own path (its gates, statement
+    // log and statistics included) and answered with pgwire's messages, or a
+    // CANCEL of one. Ahead of the one-statement rule below, because a simple
+    // query may hold several.
+    if request_vec.first() == Some(&crate::pgwire::NATIVE_MARK) {
+        return Box::pin(crate::pgwire::native_answer_marked(session, &principal.user, &request_vec)).await;
+    }
+
+    // Valid UTF-8 (every request a client sends) is borrowed after the fast
+    // check; `from_utf8_lossy` walked it chunk by chunk even then.
+    let query = match std::str::from_utf8(&request_vec) {
+        Ok(text) => std::borrow::Cow::Borrowed(text),
+        Err(_) => String::from_utf8_lossy(&request_vec),
+    };
+    // What no data statement can be (`pgwire::native_begins_with_data_verb`):
+    // a role statement. Asked once, for the checks below.
+    let data_verb = crate::pgwire::native_begins_with_data_verb(&query);
+
+    // One statement per request: the native protocol answers each request
+    // with one response, and nothing here ran the second statement of
+    // `INSERT …; INSERT …`. It answered "1 row" for the first and the second
+    // row was never written; `UPDATE …; DELETE …` failed with a parser error
+    // about `;`. Refused before anything else reads the text, the role
+    // statements included, and without echoing it: it may hold a password.
+    // Only a `;` separates statements, so a request without one is a single
+    // statement and is not split to find that out.
+    if query.contains(';') && crate::pgwire::split_statements(&query).len() > 1 {
+        return error_response(
+            "the native protocol runs one statement per request: send each statement on its own \
+             (a request holding several, separated by ';', is refused rather than partly run)",
+        );
+    }
+
+    // Transaction control, and every statement while the connection's block
+    // is open, run through the connection's session: pgwire's block
+    // machinery, gates and all (`pgwire::native_session`). Ahead of the role
+    // statements below, whose catalogue write inside a block is the
+    // block's. Not logged here: the text may carry a password, and the
+    // session's path logs as pgwire's does (debug, redacted).
+    if let Some(session) = session
+        && session.takes(&query)
+    {
+        debug!("Native transaction statement from {}", principal);
+        return Box::pin(session.run(&query)).await;
+    }
 
     // Role management is answered by the auth module rather than the RQL
     // executor: the catalogue is an ordinary table, but a password has to be
@@ -2180,7 +6428,7 @@ pub(crate) async fn process_incoming_queries(
     //
     // Recognised before anything is logged, because the text of one of these
     // contains a password in the clear and the log does not need it.
-    if let Some(parsed) = crate::auth::parse_role_statement(&query) {
+    if let Some(parsed) = (!data_verb).then(|| crate::auth::parse_role_statement(&query)).flatten() {
         return match parsed {
             Err(e) => error_response(&e),
             Ok(statement) => {
@@ -2199,7 +6447,7 @@ pub(crate) async fn process_incoming_queries(
                 }
 
                 let method = crate::auth::AuthMethod::ScramSha256;
-                match crate::auth::execute_role_statement(&context.database, statement, method)
+                match Box::pin(crate::auth::execute_role_statement(&context.database, statement, method))
                     .await
                 {
                     Ok(()) => vec![0u8],
@@ -2209,13 +6457,552 @@ pub(crate) async fn process_incoming_queries(
         };
     }
 
-    info!("Received query from {}: {}", principal, query);
+    // Redacted before it is written: role statements are handled above, before
+    // reaching here, but the store grammar carries S3 keys and this line would
+    // otherwise put them in the server log in the clear — a file that is
+    // rotated, shipped and backed up, where the statement log at least stays in
+    // memory and bounded.
+    info!(
+        "Received query from {}: {}",
+        principal,
+        crate::core::redact::statement(&query)
+    );
 
-    if let Some(query_purpose) = recognize_query_purpose(&query) {
-        info!("Recognized query purpose: {:?}", query_purpose);
-        execute(query_purpose, context.database).await
+    // What administers the server rather than the data (`BACKUP`, `RESTORE`,
+    // `STORAGE`, `REPLICATION`, `SET CONFIG`, `KV FLUSHALL`, databases)
+    // needs a superuser, as on pgwire (`pgwire::privileged_statement`). Only
+    // the role statements above were gated here, so any authenticated user
+    // could restore over the database or reconfigure the process.
+    if context.authentication_required
+        && !principal.superuser
+        && let Some(verb) = crate::pgwire::privileged_statement(&query)
+    {
+        return error_response(&format!("permission denied: {verb} requires superuser ({principal} is not one)"));
+    }
+
+    // A transaction block needs a session that holds it between requests;
+    // a caller with none (an embedding that serves requests without
+    // connections) has each statement commit on its own. Said plainly rather
+    // than "Unrecognized query", so a caller that sent `BEGIN` does not go on
+    // believing the next statements are one unit.
+    if crate::pgwire::native_session_is_transaction_control(&query) {
+        return error_response(
+            "transaction control (BEGIN, COMMIT, ROLLBACK, SAVEPOINT) needs a connection session, which \
+             this caller does not have: each statement commits on its own",
+        );
+    }
+
+    // `SELECT rdb_index_checkpoint('t')` (docs/persistent-indexes.md §3):
+    // a clean point, answered above the engine as the pgwire listener
+    // answers it, under the role statements' gate. A native client that
+    // cannot open pgwire (a proxy on the unix socket alone) seals its tables
+    // through this between restarts, so a killed process loads its
+    // snapshots instead of rebuilding every index.
+    if let Some(name) = crate::pgwire::parse_index_checkpoint(&query) {
+        if context.authentication_required && !principal.superuser {
+            return error_response(&format!(
+                "permission denied: rdb_index_checkpoint requires superuser ({principal} is not one)"
+            ));
+        }
+        return Box::pin(native_index_checkpoint(&context.database, name)).await;
+    }
+
+    // A correlated scalar subquery (`SELECT id, (SELECT count(*) FROM p
+    // WHERE p.u = t.id) FROM t`) is the LATERAL join it means
+    // (`rql::correlated`), which runs inside the statement transaction pgwire
+    // opens around it; this path has none, and its planner met the join's
+    // `__cs0` item unmaterialised ("missing FROM-clause entry"). Run whole
+    // through pgwire's path, in a session made for this statement alone
+    // (`NativeSession::run_alone`).
+    if let Some(session) = session
+        && session.needs_session_path(&query).await
+    {
+        return Box::pin(session.run_alone(&query)).await;
+    }
+
+    #[cfg(not(feature = "query_stats"))]
+    {
+        run_native_query_in(&query, context.database, session, exec_template).await
+    }
+
+    // Recorded for `SHOW QUERIES` the same way a statement arriving over the
+    // wire protocol is. The role statements handled above are not: they return
+    // before this, and what they carry is a password.
+    #[cfg(feature = "query_stats")]
+    {
+        let Some(recording) = crate::core::query_stats::begin() else {
+            return run_native_query_in(&query, context.database, session, exec_template).await;
+        };
+        let database_name = context.database.name.clone();
+        let response = crate::core::query_stats::observe(recording.probe(), async {
+            let response = run_native_query_in(&query, context.database, session, exec_template).await;
+            // Counted inside the scope: outside it the statement's counters are
+            // no longer the ones this task can reach.
+            crate::core::query_stats::note_rows(rows_of(&response));
+            response
+        })
+        .await;
+        let failure = match response.first() {
+            Some(3) => Some(String::from_utf8_lossy(&response[1..]).to_string()),
+            _ => None,
+        };
+        crate::core::query_stats::finish(
+            recording,
+            &query,
+            &database_name,
+            &principal.user,
+            failure.as_deref(),
+        );
+        response
+    }
+}
+
+/// `rdb_index_checkpoint(name)` over the native protocol: one row, one
+/// text column, `"<clean> of <file sets> clean"` as pgwire's row reads, then
+/// for each file set not left clean `"; <file set>: <why>"` (the native
+/// protocol has no notices to carry them). Each statement is its own: no
+/// block holds a ticket, so `own_writes` stays empty.
+async fn native_index_checkpoint(database: &Arc<Database>, name: Result<String, String>) -> Vec<u8> {
+    use crate::core::row::row::{Column, Row};
+    let name = match name {
+        Ok(name) => name,
+        Err(e) => return error_response(&e),
+    };
+    let report = match database.index_checkpoint(&name, None).await {
+        Ok(report) => report,
+        Err(e) => return error_response(&e),
+    };
+    let (clean, of) = report.clean();
+    let mut line = format!("{clean} of {of} clean");
+    for own in &report.own_writes {
+        line.push_str(&format!("; {own}: not checkpointed, written by this transaction"));
+    }
+    for sealed in report.sealed.iter().filter(|s| !s.outcome.is_clean()) {
+        line.push_str(&format!("; {}: {}", sealed.name, sealed.outcome.describe()));
+    }
+    let mut block = crate::memory_pool::MEMORY_POOL.acquire(line.len());
+    block.into_slice_mut().copy_from_slice(line.as_bytes());
+    let row = Row {
+        position: 0,
+        columns: smallvec::smallvec![Column {
+            schema_id: 0,
+            data: block,
+            column_type: crate::core::db_type::DbType::STRING,
+        }],
+        length: 0,
+    };
+    let mut result = vec![2u8];
+    row.extend_serialized(&mut result);
+    result
+}
+
+/// Runs one recognised statement from the native protocol.
+/// [`run_native_query`], for the owner tests.
+#[cfg(test)]
+pub(crate) async fn run_native_query_for_tests(query: &str, database: Arc<Database>) -> Vec<u8> {
+    run_native_query(query, database).await
+}
+
+/// One statement over the native protocol, through the same preparation the
+/// pgwire listener gives an autocommit statement (`pgwire::execute_single_statement`
+/// and `execute_single_statement_inner`), in the same order, less what needs
+/// a session: a transaction block, a CTE's or derived table's statement
+/// transaction. Those are refused by name rather than reaching the parser as
+/// text it cannot read.
+/// [`run_native_query`], with the connection's sequence values in reach of
+/// the statement (a column's `DEFAULT nextval(…)` records its value for the
+/// connection's `currval` and `lastval`), and a sequence's reservation
+/// written ahead after it, as pgwire's `execute_single_statement` does.
+async fn run_native_query_in(
+    query: &str,
+    database: Arc<Database>,
+    session: Option<&crate::pgwire::NativeSession>,
+    template: Option<crate::pgwire::NativeTemplate>,
+) -> Vec<u8> {
+    let response = match session {
+        Some(session) => {
+            crate::core::rql::sequence::session::scoped(
+                session.sequence_scope(),
+                Box::pin(run_native_query_learning(query, database.clone(), session, template)),
+            )
+            .await
+        }
+        None => run_native_query(query, database.clone()).await,
+    };
+    crate::core::rql::sequence_catalog::flush(&database).await;
+    response
+}
+
+/// An autocommit statement on a connection: from a parse learned for its
+/// template when it has one (`NativeSession::text_step`), the plain native
+/// path otherwise, watched while a parse is learned. What a learned parse
+/// skips is the statement text's rewriting and parsing; the rows, their
+/// types and the statement's transaction are the plain path's.
+async fn run_native_query_learning(
+    query: &str,
+    database: Arc<Database>,
+    session: &crate::pgwire::NativeSession,
+    template: Option<crate::pgwire::NativeTemplate>,
+) -> Vec<u8> {
+    use crate::pgwire::NativeTextStep;
+    match session.text_step(query, template) {
+        NativeTextStep::Plain => run_native_query(query, database).await,
+        NativeTextStep::Run {
+            template,
+            rows,
+            fields,
+            scales,
+            #[cfg(feature = "query_stats")]
+            stats,
+        } => {
+            #[cfg(feature = "query_stats")]
+            crate::core::query_stats::note_shape(&stats);
+            match run_native_learned(rows, fields, scales, database.clone()).await {
+                Some(response) => {
+                    crate::pgwire::TEXT_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    response
+                }
+                // The table changed shape since the parse was learned:
+                // nothing was read, and the text runs instead.
+                None => {
+                    session.text_forget(&template);
+                    run_native_query(query, database).await
+                }
+            }
+        }
+        NativeTextStep::Watch(watch) => {
+            let (response, capture) =
+                crate::core::rql::prepared::capturing(run_native_query(query, database)).await;
+            if response.first() != Some(&3) {
+                if let Some((template, check)) = session.text_learn(watch, capture) {
+                    session.text_check_index(template, check).await;
+                }
+            }
+            response
+        }
+    }
+}
+
+/// A learned parse with this statement's values, run as the plain path runs
+/// its `SELECT`: in a statement clock, as a native owner, its rows retagged
+/// when a cell needs it from the description learned with the parse. Read
+/// under one snapshot unless
+/// it locks rows, as pgwire runs a learned parse. `None` when the table was
+/// reshaped since the parse was learned.
+async fn run_native_learned(
+    rows: Box<crate::core::rql::prepared::PreparedRows>,
+    fields: Option<crate::pgwire::LearnedFields>,
+    scales: Option<crate::pgwire::LearnedScales>,
+    database: Arc<Database>,
+) -> Option<Vec<u8>> {
+    let locking = rows.query_row.row_lock.is_some();
+    let table = rows.table_name.clone();
+    let purpose = crate::core::rql::lexer_s1::QueryPurpose::PreparedRows(rows);
+    // Boxed where it is made: the executor's future is tens of kilobytes,
+    // and the scopes below each move it, a copy of the whole of it per move
+    // (15% of a learned point query, unboxed).
+    let run = Box::pin(execute_as(crate::core::mvcc::owner::OwnerKind::Native, purpose, database.clone()));
+    let run = async move {
+        if locking { run.await } else { crate::core::rql::statement_snapshot::scope(run).await }
+    };
+    let response = if crate::core::statement_clock::current().is_some() {
+        run.await
     } else {
-        error!("Could not recognize query purpose");
-        error_response("Unrecognized query")
+        let clock = crate::core::statement_clock::StatementClock::starting(None);
+        crate::core::statement_clock::scope(clock, run).await
+    };
+    if response.first() == Some(&3) && response[1..] == *crate::core::rql::prepared::STALE_PLAN.as_bytes() {
+        return None;
+    }
+    // A learned parse reads one table, its own: that is the table the retag
+    // check asks about, rather than every relation the text names. The
+    // description it retags from was learned with the parse
+    // (`NativeSession::text_learn`), so the statement is not described again.
+    if crate::pgwire::native_answer_needs_retag_in(&response, &database, &table) {
+        return Some(crate::pgwire::native_retag(response, fields.as_deref(), scales.as_deref()));
+    }
+    Some(response)
+}
+
+async fn run_native_query(query: &str, database: Arc<Database>) -> Vec<u8> {
+    // An autocommit statement is its own transaction: `now()` is its start,
+    // one instant for every call and row of it, as pgwire's
+    // `execute_single_statement` sets (`statement_clock`). With no clock set
+    // each call read the wall clock, so `INSERT … VALUES (now(), now())`
+    // stored two different times over native. A caller that already set one
+    // (a native block runs through pgwire's path) keeps it.
+    if crate::core::statement_clock::current().is_some() {
+        return Box::pin(run_native_query_body(query, database)).await;
+    }
+    let clock = crate::core::statement_clock::StatementClock::starting(None);
+    crate::core::statement_clock::scope(clock, Box::pin(run_native_query_body(query, database))).await
+}
+
+async fn run_native_query_body(query: &str, database: Arc<Database>) -> Vec<u8> {
+    let rewritten = match crate::pgwire::rewrite_statement_text(&database, query) {
+        Ok(text) => text,
+        Err((_, message)) => return error_response(&message),
+    };
+    let stmt = rewritten.as_ref();
+    // Enum types in their stored form (`rql::user_types`); their own
+    // statements are the PostgreSQL protocol's.
+    if crate::core::rql::user_types::parse_type_statement(stmt).is_some()
+        || crate::core::rql::domains::parse_domain_statement(stmt).is_some()
+    {
+        return error_response(
+            "type statements are not supported over the native protocol yet; use the PostgreSQL protocol for this \
+             statement",
+        );
+    }
+    let with_types = match crate::core::rql::user_types::rewrite(&database, stmt, None).await {
+        Ok(text) => text,
+        Err((_, message)) => return error_response(&message),
+    };
+    let stmt = with_types.as_deref().unwrap_or(stmt);
+
+    // Views (`rql::views`) are read as derived tables and kept in a catalogue
+    // written in a session's transaction; neither is open to a native
+    // statement yet.
+    if crate::core::rql::views::parse_view_statement(stmt).is_some() {
+        return error_response(
+            "view statements are not supported over the native protocol yet; use the PostgreSQL protocol for this \
+             statement",
+        );
+    }
+    if crate::core::rql::views::names_a_known_view(&database, stmt) {
+        return error_response(
+            "reading a view is not supported over the native protocol yet; use the PostgreSQL protocol for this \
+             statement",
+        );
+    }
+
+    // A unique index is a constraint here, as on pgwire.
+    let unique;
+    let stmt = match crate::core::rql::lexer_alter::unique_index_as_constraint(stmt) {
+        Some(altered) => {
+            unique = altered;
+            unique.as_str()
+        }
+        None => stmt,
+    };
+
+    // Released the moment the statement ended, so the caller would be told
+    // it holds a lock it does not (pgwire refuses it outside a block, 25P01).
+    if stmt.trim_start().get(..4).is_some_and(|w| w.eq_ignore_ascii_case("LOCK"))
+        && crate::core::rql::row_lock::parse_lock_table(stmt).is_some()
+    {
+        return error_response(
+            "LOCK TABLE can only be used in transaction blocks: send BEGIN first (rasterizeddb_client: \
+             Client::begin) (SQLSTATE 25P01)",
+        );
+    }
+
+    // A replicating node's peers run the text again, so a write carries the
+    // values of its `now()`, `random()` and `gen_random_uuid()`.
+    let deterministic;
+    let stmt = if database.replication.is_active() {
+        match crate::core::rql::replicated_values::fold(stmt) {
+            crate::core::rql::replicated_values::Fold::Unchanged => stmt,
+            crate::core::rql::replicated_values::Fold::Rewritten(text) => {
+                crate::core::rql::prepared::note_rewritten();
+                deterministic = text;
+                deterministic.as_str()
+            }
+            crate::core::rql::replicated_values::Fold::Refused(message) => return error_response(&message),
+        }
+    } else {
+        stmt
+    };
+
+    // `WHERE created_at < NOW()`: the constant parts evaluated once, before
+    // the predicate tokenizer reads `NOW` as a column.
+    let folded = match crate::core::rql::executor::fold_where_constants_checked(stmt) {
+        Ok(folded) => folded,
+        Err(e) => return error_response(&e),
+    };
+    if folded != stmt {
+        crate::core::rql::prepared::note_rewritten();
+    }
+    let stmt = folded.as_str();
+
+    // An outer column a subquery names bare, qualified by its relation
+    // (`rql::outer_columns`), so the correlated passes below find it.
+    let qualified_outer;
+    let stmt = match crate::core::rql::outer_columns::qualify_in(&database, stmt) {
+        Some(text) => {
+            crate::core::rql::prepared::note_rewritten();
+            qualified_outer = text;
+            qualified_outer.as_str()
+        }
+        None => stmt,
+    };
+    // A correlated scalar subquery, as the LATERAL join it means.
+    let correlated;
+    let stmt = match crate::core::rql::correlated::rewrite_select(stmt) {
+        Some(Ok(rewritten)) => {
+            crate::core::rql::prepared::note_rewritten();
+            correlated = rewritten;
+            correlated.as_str()
+        }
+        Some(Err(e)) => return error_response(&e),
+        None => stmt,
+    };
+
+    // A CTE or a derived table runs its bodies and the outer statement in one
+    // statement transaction that pgwire opens, commits or replays around
+    // them; a native statement has no such transaction to hand them.
+    if crate::core::rql::cte::has_with_clause(stmt) || crate::core::rql::cte::next_derived_table(stmt).is_some() {
+        return error_response(
+            "WITH (a CTE) and FROM (SELECT …) (a derived table) are not supported over the native protocol yet; \
+             use the PostgreSQL protocol for this statement",
+        );
+    }
+
+    // The catalogue relations (`pg_tables`, `pg_class`,
+    // `information_schema.tables` and the rest) exist only per statement:
+    // built from the live catalogue into temporary relations the text is
+    // pointed at, as the pgwire listener builds them for an autocommit
+    // statement (under `FROZEN_TX`). Left out here, a native client asking
+    // `pg_tables` whether a table exists was told "Table not found" for the
+    // view itself. `pg_database` lists this database alone: a native session
+    // has no catalogue of databases to read.
+    let tx = crate::core::mvcc::transaction::FROZEN_TX;
+    let catalog = match crate::core::rql::catalog_views::materialize(stmt, &database, tx, None).await {
+        Ok(catalog) => catalog,
+        Err(e) => return error_response(&e),
+    };
+    let Some(catalog) = catalog else {
+        return run_native_statement(stmt, database).await;
+    };
+    crate::core::rql::prepared::note_rewritten();
+    let response = run_native_statement(&catalog.rewritten, database.clone()).await;
+    crate::core::rql::cte::drop_temps(&database, &catalog.temps, tx).await;
+    response
+}
+
+async fn run_native_statement(query: &str, database: Arc<Database>) -> Vec<u8> {
+    // `IN (SELECT …)`, `EXISTS (SELECT …)` and a scalar subquery are read
+    // into literals first, as pgwire does (`execute_single_statement_inner`).
+    // Not in an UPDATE or a DELETE, which flatten their own inside each
+    // attempt, under the snapshot their rows are scanned under; nor in a
+    // generation expression, which PostgreSQL refuses to hold a subquery.
+    let write = query
+        .trim_start()
+        .as_bytes()
+        .get(..6)
+        .is_some_and(|w| w.eq_ignore_ascii_case(b"UPDATE") || w.eq_ignore_ascii_case(b"DELETE"));
+    let flattened;
+    let query = if !write
+        && (crate::core::rql::subquery::find_in_subquery(query).is_some()
+            || crate::core::rql::subquery::find_exists(query).is_some()
+            || crate::core::rql::subquery::find_scalar_subquery(query).is_some())
+        && !crate::core::rql::generated::declares_generated(query)
+    {
+        match crate::core::rql::executor::substitute_in_subqueries(
+            query,
+            &database,
+            crate::core::mvcc::transaction::FROZEN_TX,
+        )
+        .await
+        {
+            Ok(text) => {
+                crate::core::rql::prepared::note_rewritten();
+                flattened = text;
+                flattened.as_str()
+            }
+            Err(e) => return error_response(&e),
+        }
+    } else {
+        query
+    };
+
+    let Some(query_purpose) = recognize_query_purpose(query) else {
+        // `SELECT 1`, `SELECT now()`: a SELECT with no FROM, one row
+        // evaluated with no columns (`rql::no_from`), as pgwire answers it.
+        // The usual liveness probe; it was "Unrecognized query" here.
+        return match crate::core::rql::no_from::parse(query) {
+            Some(Ok(select)) => match select.rows() {
+                Ok(rows) => {
+                    let mut response = vec![2u8];
+                    for row in &rows {
+                        row.extend_serialized(&mut response);
+                    }
+                    response
+                }
+                Err(e) => error_response(&e),
+            },
+            Some(Err(e)) => error_response(&e),
+            None => {
+                error!("Could not recognize query purpose");
+                error_response("Unrecognized query")
+            }
+        };
+    };
+    info!("Recognized query purpose: {:?}", query_purpose);
+    let read = matches!(query_purpose, crate::core::rql::lexer_s1::QueryPurpose::QueryRows(_));
+    // A named owner for the native protocol's statements (§7 Owner;
+    // finding L3): never `FROZEN_TX`, and one per statement.
+    let response = execute_as(crate::core::mvcc::owner::OwnerKind::Native, query_purpose, database.clone()).await;
+    // The rows typed by their columns (`pgwire::native_retag`), from the
+    // statement's description, read only when a cell may need it.
+    if read
+        && crate::pgwire::native_answer_needs_retag(&response, &database, query)
+        && let Some(purpose) = recognize_query_purpose(query)
+    {
+        let (fields, scales) = crate::pgwire::result_description(&database, &purpose).unwrap_or((None, None));
+        return crate::pgwire::native_retag(response, fields.as_deref(), scales.as_deref());
+    }
+    response
+}
+
+/// Rows a native-protocol response reports: the count a write carries, or the
+/// rows a read returned.
+///
+/// The tags are the executor's: 0 is an acknowledgement that may carry a count,
+/// 1 is a count, 2 is a result set, 3 is a failure.
+#[cfg(feature = "query_stats")]
+fn rows_of(response: &[u8]) -> u64 {
+    match response.first() {
+        Some(0) | Some(1) if response.len() >= 9 => {
+            u64::from_le_bytes(response[1..9].try_into().unwrap_or([0; 8]))
+        }
+        Some(2) => crate::core::row::row::count_serialized_rows(&response[1..]),
+        _ => 0,
+    }
+}
+
+/// Bumps the schema generation when dropped — that is, once the change it
+/// guards has finished, on every path out of it.
+///
+/// The bump at the *start* of `reload_table` is what tells a prepared
+/// statement's next `Execute` to look again. It is not enough for anything that
+/// caches a description keyed by the generation (`pgwire`'s describe cache):
+/// a describe that reads the generation after that first bump but the table
+/// before it is replaced would file the old shape under the new generation.
+/// A bump after the change closes that, since nothing computed during the
+/// change can match a lookup made after it.
+///
+/// Creating, dropping and renaming a table bump it too. None of them alters a
+/// table's shape, but each changes what a name resolves to — `DROP` then
+/// `CREATE` under the same name gives a statement a different column list
+/// without any `ALTER`. The engine's own temporary relations (a CTE's
+/// `__cte_…` tables, a JSON column's shadow tables) are created and dropped by
+/// ordinary statements constantly and are never named by a client, so they do
+/// not count.
+struct SchemaChanged<'a>(&'a CacheGuard<std::sync::atomic::AtomicU64>);
+
+impl<'a> SchemaChanged<'a> {
+    fn unless_internal(
+        generation: &'a CacheGuard<std::sync::atomic::AtomicU64>,
+        table_name: &str,
+    ) -> Option<Self> {
+        let internal = is_statement_scoped(table_name) || crate::core::rql::json_map::is_shadow_table(table_name);
+        (!internal).then(|| SchemaChanged(generation))
+    }
+}
+
+impl Drop for SchemaChanged<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 }

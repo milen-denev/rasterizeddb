@@ -113,9 +113,13 @@ pub fn probes() -> Vec<Probe> {
         // ---- aggregates ----------------------------------------------------
         p("aggregate", "count_star", "SELECT COUNT(*) FROM users", FirstColumn(&["4"])),
         p("aggregate", "count_column", "SELECT COUNT(country) FROM users", FirstColumn(&["3"])),
-        p("aggregate", "sum", "SELECT SUM(net_amount) FROM invoice", FirstColumn(&["1930.5"])),
+        // An unconstrained NUMERIC keeps each value's written scale (`100.00`), and
+        // PostgreSQL's SUM shows the inputs' widest.
+        p("aggregate", "sum", "SELECT SUM(net_amount) FROM invoice", FirstColumn(&["1930.50"])),
         p("aggregate", "min_max", "SELECT MIN(invoice_number), MAX(invoice_number) FROM invoice", Grid(&["1001|1005"])),
-        p("aggregate", "avg", "SELECT AVG(invoice_number) FROM invoice", FirstColumn(&["1003"])),
+        // PostgreSQL's `avg(int)` is a numeric at sixteen places here, and its
+        // binary form keeps that display scale.
+        p("aggregate", "avg", "SELECT AVG(invoice_number) FROM invoice", FirstColumn(&["1003.0000000000000000"])),
         p("aggregate", "group_by", "SELECT status, COUNT(*) FROM invoice GROUP BY status ORDER BY status ASC", Grid(&["open|1", "paid|3", "void|1"])),
         p("aggregate", "group_by_having", "SELECT status, COUNT(*) FROM invoice GROUP BY status HAVING COUNT(*) > 1", Grid(&["paid|3"])),
         // A LIMIT on an aggregate applies to the *output*. If it reached the
@@ -161,7 +165,8 @@ pub fn probes() -> Vec<Probe> {
         p("type", "inet_roundtrip", "SELECT ip_inet FROM user_session WHERE ip_inet = '10.0.0.1'", FirstColumn(&["10.0.0.1"])),
         p("type", "inet_ipv6_roundtrip", "SELECT ip_inet FROM user_session WHERE id = 'dddddddd-0000-4000-8000-000000000003'", FirstColumn(&["2001:db8::1"])),
         p("type", "uuid_roundtrip", "SELECT id FROM domain WHERE name = 'Acme'", FirstColumn(&[schema::ids::DOMAIN_ACME])),
-        p("type", "numeric_roundtrip", "SELECT vat_rate FROM users WHERE name = 'Carol'", FirstColumn(&["19"])),
+        // Written `19.00` into an unconstrained NUMERIC: PostgreSQL shows `19.00`.
+        p("type", "numeric_roundtrip", "SELECT vat_rate FROM users WHERE name = 'Carol'", FirstColumn(&["19.00"])),
         p("type", "timestamp_roundtrip", "SELECT created_at FROM users WHERE name = 'Alice'", FirstColumn(&["2026-01-01 08:00:00+00:00"])),
         p("type", "boolean_roundtrip", "SELECT billing_setup FROM users WHERE name = 'Alice'", FirstColumn(&["t"])),
         p("type", "null_roundtrip", "SELECT default_subscription FROM domain WHERE name = 'Globex'", FirstColumn(&[""])),
@@ -209,7 +214,7 @@ pub fn probes() -> Vec<Probe> {
         // that wrong makes the scan stop early and return a smaller number,
         // which is the worst kind of wrong answer: plausible, and silent.
         p("aggregate", "count_ignores_limit_on_input", "SELECT COUNT(*) FROM invoice LIMIT 2", FirstColumn(&["5"])),
-        p("aggregate", "sum_ignores_limit_on_input", "SELECT SUM(net_amount) FROM invoice LIMIT 2", FirstColumn(&["1930.5"])),
+        p("aggregate", "sum_ignores_limit_on_input", "SELECT SUM(net_amount) FROM invoice LIMIT 2", FirstColumn(&["1930.50"])),
     ]
 }
 
@@ -227,14 +232,40 @@ pub async fn run_all(pool: &sqlx::PgPool) -> anyhow::Result<Vec<ProbeResult>> {
 }
 
 async fn run_one(pool: &sqlx::PgPool, probe: &Probe) -> anyhow::Result<()> {
-    if matches!(probe.expect, Expect::Fails) {
-        return match sqlx::query(probe.sql).fetch_all(pool).await {
-            Err(_) => Ok(()),
-            Ok(_) => anyhow::bail!("the statement was accepted, but it must be refused"),
-        };
-    }
+    // One connection, held for this probe and cleaned before it goes back.
+    //
+    // Running straight against the pool made the probes share state: `BEGIN`,
+    // `START TRANSACTION` and `BEGIN ISOLATION LEVEL …` each leave their
+    // connection inside an open block, sqlx returns it to the pool as it is,
+    // and a later probe handed that connection inherits the block. So
+    // `SAVEPOINT probe_sp`, which must be refused *outside* a transaction, was
+    // sometimes correctly accepted — the engine right both times and the probe
+    // red on a coin toss. With one connection it reproduces every run.
+    //
+    // The `ROLLBACK` is what makes the claim above this list — that each probe
+    // runs on its own connection — actually true. Outside a block it is a
+    // no-op, and its own failure is not this probe's result.
+    let mut connection = pool.acquire().await?;
 
-    let rows = sqlx::query(probe.sql).fetch_all(pool).await?;
+    let outcome = if matches!(probe.expect, Expect::Fails) {
+        match sqlx::query(probe.sql).fetch_all(&mut *connection).await {
+            Err(_) => Ok(Vec::new()),
+            Ok(_) => Err(anyhow::anyhow!(
+                "the statement was accepted, but it must be refused"
+            )),
+        }
+    } else {
+        sqlx::query(probe.sql)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(anyhow::Error::from)
+    };
+    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+
+    let rows = outcome?;
+    if matches!(probe.expect, Expect::Fails) {
+        return Ok(());
+    }
 
     match &probe.expect {
         Expect::Succeeds => Ok(()),
@@ -360,7 +391,25 @@ fn render_cell(row: &sqlx::postgres::PgRow, idx: usize) -> String {
                 Err(e) => format!("<decode TIMESTAMP: {}>", first_line(&e.to_string())),
             };
         }
-        // TEXT, INET and anything else: the wire bytes are already text.
+        // Binary `inet`: family, prefix bits, is-cidr, length, address. It
+        // used to arrive as text under the `inet` OID, which this catch-all
+        // read; the server now sends PostgreSQL's binary form.
+        "INET" | "CIDR" => {
+            return match raw.as_bytes() {
+                Ok(b) if b.len() == 8 && b[3] == 4 => {
+                    let ip = std::net::Ipv4Addr::new(b[4], b[5], b[6], b[7]);
+                    if b[1] == 32 { ip.to_string() } else { format!("{}/{}", ip, b[1]) }
+                }
+                Ok(b) if b.len() == 20 && b[3] == 16 => {
+                    let octets: [u8; 16] = b[4..20].try_into().unwrap();
+                    let ip = std::net::Ipv6Addr::from(octets);
+                    if b[1] == 128 { ip.to_string() } else { format!("{}/{}", ip, b[1]) }
+                }
+                Ok(b) => format!("<decode {}: {} bytes>", type_name, b.len()),
+                Err(_) => "<unreadable>".to_string(),
+            };
+        }
+        // TEXT and anything else: the wire bytes are already text.
         _ => match raw.as_bytes() {
             Ok(b) => String::from_utf8_lossy(b).into_owned(),
             Err(_) => "<unreadable>".to_string(),

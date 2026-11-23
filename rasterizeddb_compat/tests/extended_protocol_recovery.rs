@@ -64,26 +64,15 @@ async fn a_connection_still_works_after_a_failed_statement() {
 /// The production shape: concurrent writers in explicit blocks, each reading
 /// back through the same pool afterwards.
 ///
-/// Ignored: this reproduces an open engine defect, not a protocol one. A plain
-/// `SELECT` for a row that exists transiently returns no rows while other
-/// transactions update that row — roughly one run in ten with eight writers on
-/// a single row.
-///
-/// Tracing the visibility test on the uncached scan shows why it is not simply
-/// a snapshot being too strict. For one row id the scan sees a well-formed
-/// chain — `xmin=4 xmax=8`, `8→9`, `9→10`, `10→11` — *and*, at the same time,
-/// two independently live versions: `xmin=5 xmax=0` and `xmin=7 xmax=0`.
-/// Neither retires the other. First-updater-wins is supposed to make that
-/// impossible, so the chain has forked: two writers each created a version
-/// without seeing the other. A reader whose snapshot rejects every branch tip
-/// then correctly concludes the row is invisible, and returns nothing.
-///
-/// So the defect is on the write side, in the window between the conflict check
-/// and the version being stamped, and it is a lost update as much as a missed
-/// read. `UPDATE … RETURNING` no longer reports it as an empty success — the
-/// executor re-reads once the write has landed — but a plain `SELECT` racing a
-/// writer still can.
-#[ignore = "open: concurrent writers fork the version chain; see the doc comment"]
+/// This used to fail about one run in five: a plain `SELECT` for an existing
+/// row returned nothing while other transactions updated it. An engine
+/// defect, not a protocol one, and not a forked version chain (an earlier
+/// reading of a trace that was retracted): the scan's reclaimable gate bounded its horizon by `oldest_active`
+/// alone, so once an updater the reader's snapshot still treats as running had
+/// committed and retired, the reader's visible (old) version was skipped as
+/// reclaimable while the new one was rightly invisible. Fixed by bounding the
+/// horizon by the oldest live snapshot (`VersionHorizon::sample`); pinned at
+/// scale by `rasterizeddb_core/tests/reader_miss_stress.rs`.
 #[tokio::test]
 async fn concurrent_block_writers_then_reads_stay_in_sync() {
     let (_s, pool) = server().await;

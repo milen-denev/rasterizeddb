@@ -1,0 +1,103 @@
+name: Release - client crates
+
+# Channel 1 of 3. Tag `client-v<version>` (the version in
+# rasterizeddb_client/Cargo.toml) publishes, in order:
+#   rastcp (when its version is not on crates.io yet)
+#   rasterizeddb_client_derive
+#   rasterizeddb_client
+# and creates the GitHub release for the tag.
+#
+# Needs the repository secret CARGO_REGISTRY_TOKEN (a crates.io token with
+# publish-new and publish-update scopes). Run it by hand with dry_run to see
+# what would be published without publishing.
+
+on:
+  push:
+    tags: ["client-v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Package and verify only; publish nothing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_MIN_STACK: "33554432"
+
+jobs:
+  test:
+    name: test ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { name: linux-x86_64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { name: linux-arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc }
+          - { name: windows-arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          target: ${{ matrix.target }}
+      - name: Test
+        run: >
+          cargo test --locked --target ${{ matrix.target }}
+          -p rastcp -p rasterizeddb_client_derive -p rasterizeddb_client --all-features
+      - name: Live tests against this tree's server (unix only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo build --locked --target ${{ matrix.target }} -p rasterizeddb_core --bin rasterizeddb_core
+          RDB_SERVER_BIN="$PWD/target/${{ matrix.target }}/debug/rasterizeddb_core" \
+            cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_client --all-features
+
+  publish:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          target: x86_64-unknown-linux-gnu
+
+      - name: The tag matches the crate versions
+        if: github.event_name == 'push'
+        run: bash .github/scripts/check-version.sh client-v rasterizeddb_client rasterizeddb_client_derive
+
+      - name: Publish (dry run)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        run: >
+          cargo package --locked
+          -p rastcp -p rasterizeddb_client_derive -p rasterizeddb_client
+
+      - name: Publish to crates.io
+        if: github.event_name == 'push' || !inputs.dry_run
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: bash .github/scripts/publish-crates.sh rastcp rasterizeddb_client_derive rasterizeddb_client
+
+      - name: GitHub release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Client SDK ${{ github.ref_name }}"
+          generate_release_notes: true
+          body: |
+            The native-protocol client SDK, published to crates.io:
+
+            - [`rasterizeddb_client`](https://crates.io/crates/rasterizeddb_client) - client, ORM, migrations, key/value API ([docs](https://docs.rs/rasterizeddb_client))
+            - [`rasterizeddb_client_derive`](https://crates.io/crates/rasterizeddb_client_derive) - `#[derive(Model, FromRow, SqlEnum)]`
+            - [`rastcp`](https://crates.io/crates/rastcp) - the transport both client and server use
+
+            ```toml
+            [dependencies]
+            rasterizeddb_client = "<version>"  # this tag without the client-v prefix
+            ```

@@ -6,8 +6,8 @@ use std::collections::BTreeSet;
 use crate::core::db_type::DbType;
 
 use super::bloom::{self, SuperBloom};
-use super::hash::{CODE_EMPTY, HashSeed, canonical_hash, fingerprint, is_fingerprintable};
-use super::kernels::{MAX_F, MIN_F, ZONE_ROWS, ZONE_WORDS, probe_fn, write_slot};
+use super::hash::{CODE_EMPTY, HashSeed, fingerprint, row_hash, is_fingerprintable};
+use super::kernels::{MAX_F, MIN_F, ZONE_ROWS, ZONE_WORDS, probe_fn, read_slot, write_slot};
 use super::zonemap::{SargOp, ZoneMap, zones_for};
 
 /// Tuning knobs. Defaults are the ones argued for in the design doc.
@@ -24,7 +24,18 @@ pub struct FilterConfig {
     /// distinct values is 0.1 % selectivity whether the table holds a million
     /// rows or a billion.
     pub min_selectivity: f64,
-    /// Tables smaller than this are cheaper to scan outright.
+    /// Tables smaller than this are cheaper to scan outright, so a query
+    /// against one does not consult the index at all.
+    ///
+    /// Enforced in `Table::build_candidates` rather than here: the decision is
+    /// about whether a mask is worth building for a scan, not about how wide a
+    /// column's fingerprints should be. Gating it in `choose_f` instead would
+    /// take each column out of service as it crossed a zone boundary, which
+    /// makes a checkpoint's contents depend on the table's size at the moment
+    /// it was taken.
+    ///
+    /// Counted in **slots, not live rows** — the scan walks slots, so that is
+    /// the work a mask would be saving.
     pub min_table_rows: u64,
 }
 
@@ -75,7 +86,9 @@ pub struct Hll {
 
 impl Default for Hll {
     fn default() -> Self {
-        Self { regs: Box::new([0u8; 256]) }
+        Self {
+            regs: Box::new([0u8; 256]),
+        }
     }
 }
 
@@ -87,7 +100,9 @@ impl Hll {
 
     #[inline]
     pub fn from_regs(regs: [u8; 256]) -> Self {
-        Self { regs: Box::new(regs) }
+        Self {
+            regs: Box::new(regs),
+        }
     }
 
     #[inline]
@@ -131,16 +146,52 @@ impl Hll {
 /// zones into generations lets old zones keep their narrower `f` forever while
 /// new zones are sized for the table as it is now. Offsets stay arithmetic
 /// *within* a generation, so lookup is still O(1) after an O(#generations) scan.
+///
+/// A generation with `f == 0` is **plane-less**: its zones carry no
+/// fingerprints at all, and a probe treats every slot in them as a candidate,
+/// leaving the zone bounds to do the pruning. Two kinds of column get them:
+///
+/// * a **clustered** one — a serial id, an insert-time timestamp — whose zone
+///   bounds do not overlap, so the bounds alone narrow an equality probe to the
+///   one zone that can hold the value. Planes would cost `f` bits a row to
+///   narrow 512 rows further, and a point probe would stream all of them
+///   (20 MB per 10M rows at f = 16) where the bounds are 312 KB;
+/// * a **gated-out** one, with too few distinct values to be worth probing,
+///   whose planes nothing reads.
+///
+/// With no words to divide, its zone count is carried explicitly in `zones`.
 #[derive(Clone)]
 pub struct Generation {
     pub start_zone: u64,
     pub f: u8,
     pub words: Vec<u64>,
+    /// Zone count of a plane-less (`f == 0`) generation; unused otherwise,
+    /// where the count follows from `words`.
+    pub zones: u64,
 }
 
 impl Generation {
+    /// A generation with planes of width `f`, or a plane-less one for `f == 0`.
+    pub fn new(start_zone: u64, f: u8, words: Vec<u64>, zones: u64) -> Self {
+        Self {
+            start_zone,
+            f,
+            words,
+            zones,
+        }
+    }
+
+    /// True when this generation carries no fingerprints.
+    #[inline]
+    pub fn is_planeless(&self) -> bool {
+        self.f == 0
+    }
+
     #[inline]
     pub fn zone_count(&self) -> u64 {
+        if self.f == 0 {
+            return self.zones;
+        }
         (self.words.len() / (ZONE_WORDS * self.f as usize)) as u64
     }
 
@@ -168,6 +219,10 @@ impl Generation {
     }
 
     fn grow_to_include(&mut self, zone: u64) {
+        if self.f == 0 {
+            self.zones = self.zones.max(zone - self.start_zone + 1);
+            return;
+        }
         let needed = (zone - self.start_zone + 1) as usize * ZONE_WORDS * self.f as usize;
         if self.words.len() < needed {
             // Zeros read as CODE_EMPTY, i.e. "matches nothing" — a grown region
@@ -226,6 +281,11 @@ pub struct ColumnFilter {
     /// something asks for it.
     gated_out: bool,
 
+    /// Whether generations started from here on are plane-less: the column is
+    /// gated out, or its zone bounds are clustered enough to stand in for
+    /// fingerprints. Re-decided at every zone boundary; see [`Generation`].
+    planeless: bool,
+
     /// Per-zone min/max, when the column's type supports ordered comparison.
     /// Covers `<`/`>`/`BETWEEN`, which fingerprints cannot express at all.
     zonemap: Option<ZoneMap>,
@@ -249,6 +309,17 @@ pub struct ColumnFilter {
     /// watermark, the dirty frontier, backfill — behaves identically, because
     /// zone bounds go stale in exactly the same ways fingerprints do.
     fingerprints: bool,
+
+    /// While a backfill runs (`backfills > 0`), the slots a writer set since
+    /// it began. A backfill reads a run of rows and writes their codes later,
+    /// and [`Self::set_reindex`] re-sets a slot outright: a writer that set
+    /// the slot in between (an in-place `UPDATE`, a reused slot's insert, a
+    /// vacuum clear) was overwritten with what the backfill read before it,
+    /// and the row's new value was pruned. A writer's code is never older
+    /// than what the backfill read (it set it under this column's lock,
+    /// after the backfill began), so the backfill leaves such a slot alone.
+    backfills: u32,
+    written_during_backfill: ahash::HashSet<u64>,
 }
 
 impl ColumnFilter {
@@ -281,7 +352,11 @@ impl ColumnFilter {
         zone_bounds: bool,
         span_summary: bool,
     ) -> Self {
-        let db_type_for_zonemap = if zone_bounds { Some(db_type.clone()) } else { None };
+        let db_type_for_zonemap = if zone_bounds {
+            Some(db_type.clone())
+        } else {
+            None
+        };
         let fingerprints = is_fingerprintable(&db_type);
         Self {
             write_order,
@@ -298,11 +373,14 @@ impl ColumnFilter {
             dirty_min: u64::MAX,
             touched_min: u64::MAX,
             gated_out: false,
+            planeless: false,
             zonemap: db_type_for_zonemap.and_then(ZoneMap::new),
             // A summary over rows with no fingerprints would summarise nothing:
             // a bounds-only column never hashes, so there is no key to record.
             bloom: (span_summary && fingerprints).then(SuperBloom::new),
             fingerprints,
+            backfills: 0,
+            written_during_backfill: Default::default(),
         }
     }
 
@@ -343,9 +421,12 @@ impl ColumnFilter {
             dirty_min: u64::MAX,
             touched_min: u64::MAX,
             gated_out: false,
+            planeless: false,
             zonemap,
             bloom: bloom.filter(|_| fingerprints),
             fingerprints,
+            backfills: 0,
+            written_during_backfill: Default::default(),
         }
     }
 
@@ -399,6 +480,13 @@ impl ColumnFilter {
     #[inline]
     pub fn persistable_valid_upto(&self) -> u64 {
         self.valid_upto.min(self.dirty_min)
+    }
+
+    /// The width bounds this column was built with (`SET FILTER … FOR
+    /// COLUMN` included): part of a snapshot's filter configuration hash.
+    #[inline]
+    pub fn config(&self) -> &FilterConfig {
+        &self.cfg
     }
 
     /// Called after a successful checkpoint: the on-disk copy now includes
@@ -474,6 +562,19 @@ impl ColumnFilter {
         self.unknown_below = 0;
     }
 
+    /// Stops vouching for slots `[0, slots)` on a column that was indexing
+    /// them: they are about to be renumbered. Unlike
+    /// [`Self::set_unindexed_prefix`] the frontier is left alone, since
+    /// everything at or past it is a candidate already, and the prefix never
+    /// shrinks. The next checkpoint rewrites from zone 0, so the file stops
+    /// vouching for those slots too.
+    pub fn demote_below(&mut self, slots: u64) {
+        self.unknown_below = self.unknown_below.max(slots);
+        if slots > 0 {
+            self.touched_min = 0;
+        }
+    }
+
     #[inline]
     pub fn current_f(&self) -> u8 {
         self.next_f
@@ -496,9 +597,11 @@ impl ColumnFilter {
         }
 
         // Beyond the last generation: extend it, or start a new one if the
-        // adaptive width has moved on.
+        // adaptive width has moved on — or the column has moved between having
+        // planes and not.
+        let want_f = if self.planeless { 0 } else { self.next_f };
         match self.gens.last_mut() {
-            Some(last) if last.f == self.next_f => {
+            Some(last) if last.f == want_f => {
                 last.grow_to_include(zone);
                 self.gens.len() - 1
             }
@@ -509,17 +612,35 @@ impl ColumnFilter {
                     last.grow_to_include(zone);
                     return self.gens.len() - 1;
                 }
-                let mut g = Generation { start_zone: next_start, f: self.next_f, words: Vec::new() };
+                let mut g = Generation::new(next_start, want_f, Vec::new(), 0);
                 g.grow_to_include(zone);
                 self.gens.push(g);
                 self.gens.len() - 1
             }
             None => {
-                let mut g = Generation { start_zone: 0, f: self.next_f, words: Vec::new() };
+                let mut g = Generation::new(0, want_f, Vec::new(), 0);
                 g.grow_to_include(zone);
                 self.gens.push(g);
                 0
             }
+        }
+    }
+
+    /// Whether `slot` holds a fingerprint other than `CODE_EMPTY`: whether
+    /// clearing it would change a plane. Read-only; vacuum asks before it
+    /// takes a write ticket for a clear (docs/persistent-indexes.md §2, RV2).
+    /// A bounds-only column, a plane-less zone and a zone never written have
+    /// nothing to clear. A wrong `false` would cost selectivity only: a
+    /// fingerprint left on a dead slot keeps it a candidate.
+    pub fn holds_code(&self, slot: u64) -> bool {
+        if !self.fingerprints {
+            return false;
+        }
+        let zone = slot / ZONE_ROWS as u64;
+        let local = (slot % ZONE_ROWS as u64) as usize;
+        match self.gens.iter().find(|g| g.contains(zone)) {
+            Some(g) if g.f > 0 => read_slot(g.zone(zone), g.f, local) != CODE_EMPTY,
+            _ => false,
         }
     }
 
@@ -531,7 +652,7 @@ impl ColumnFilter {
 
     fn set_value(&mut self, slot: u64, value: Option<&[u8]>, track_dirty: bool) {
         let hash = match (self.fingerprints, value) {
-            (true, Some(b)) => canonical_hash(&self.db_type, b, self.seed),
+            (true, Some(b)) => row_hash(&self.db_type, b, self.seed),
             _ => None,
         };
         self.set_prepared_inner(slot, value, hash, track_dirty);
@@ -557,7 +678,7 @@ impl ColumnFilter {
     /// fixed for the column's lifetime.
     #[inline]
     pub fn hash_of(db_type: &DbType, seed: HashSeed, value: &[u8]) -> Option<u64> {
-        canonical_hash(db_type, value, seed)
+        row_hash(db_type, value, seed)
     }
 
     fn set_prepared_inner(
@@ -567,6 +688,13 @@ impl ColumnFilter {
         hash: Option<u64>,
         track_dirty: bool,
     ) {
+        if track_dirty {
+            self.note_writer(slot);
+        } else if self.backfills > 0 && self.written_during_backfill.contains(&slot) {
+            // A backfill's code for a slot a writer set since it began: older
+            // than the writer's, so dropped (see `written_during_backfill`).
+            return;
+        }
         // Bounds only ever widen. A cleared slot leaves the zone's range
         // conservatively wide rather than shrinking it, because we cannot know
         // whether the removed value was the sole occupant of a bound.
@@ -597,7 +725,61 @@ impl ColumnFilter {
     }
 
     pub fn set_hash(&mut self, slot: u64, hash: Option<u64>) {
+        self.note_writer(slot);
         self.set_hash_inner(slot, hash, true)
+    }
+
+    /// The writer's path when no backfill runs: one compare. The insert is
+    /// kept out of line, off the common path's code.
+    #[inline]
+    fn note_writer(&mut self, slot: u64) {
+        if self.backfills > 0 {
+            self.record_backfill_write(slot);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record_backfill_write(&mut self, slot: u64) {
+        self.written_during_backfill.insert(slot);
+    }
+
+    /// How many slots the record holds, for tests.
+    #[cfg(test)]
+    pub(crate) fn backfill_record_len(&self) -> usize {
+        self.written_during_backfill.len()
+    }
+
+    /// A backfill begins: from now on, slots writers set are kept from it.
+    pub fn begin_backfill(&mut self) {
+        self.backfills += 1;
+    }
+
+    /// A backfill applied a batch: every slot it read is now written, so
+    /// none of the record is needed for it. A slot a writer sets ahead of
+    /// what it has read is read again, newer, when it gets there. Kept while
+    /// another backfill runs, whose batch in hand may hold any of them.
+    /// Bounds the record by the writes into one batch's window, not by the
+    /// backfill's lifetime.
+    pub fn backfill_batch_applied(&mut self) {
+        if self.backfills == 1 {
+            self.written_during_backfill.clear();
+        }
+    }
+
+    /// A backfill [`Self::begin_backfill`] began has ended.
+    pub fn end_backfill(&mut self) {
+        self.backfills = self.backfills.saturating_sub(1);
+        if self.backfills == 0 {
+            self.written_during_backfill = Default::default();
+        }
+    }
+
+    /// Slots were renumbered: what writers set is named by the old numbers,
+    /// and a backfill under the new one must not skip slots by them. Every
+    /// backfill that began before is refused from here on by its epoch.
+    pub fn forget_backfill_writes(&mut self) {
+        self.written_during_backfill.clear();
     }
 
     fn set_hash_inner(&mut self, slot: u64, hash: Option<u64>, track_dirty: bool) {
@@ -622,11 +804,15 @@ impl ColumnFilter {
 
         let gi = self.gen_index_for(zone);
         let f = self.gens[gi].f;
-        let g = match hash {
-            Some(h) => fingerprint(h, f),
-            None => CODE_EMPTY,
-        };
-        write_slot(self.gens[gi].zone_mut(zone), f, local, g);
+        // A plane-less zone has nothing to write: every slot in it is a
+        // candidate whatever it holds.
+        if f > 0 {
+            let g = match hash {
+                Some(h) => fingerprint(h, f),
+                None => CODE_EMPTY,
+            };
+            write_slot(self.gens[gi].zone_mut(zone), f, local, g);
+        }
 
         self.note_write(slot, track_dirty);
 
@@ -644,7 +830,28 @@ impl ColumnFilter {
                 self.gated_out = false;
                 self.next_f = chosen.max(self.cfg.min_f);
             }
+            // Planes are worth writing only while something will read them and
+            // the bounds cannot do their job alone.
+            self.planeless = self.gated_out || self.bounds_are_clustered(zone);
         }
+    }
+
+    /// Zones a clustering decision looks back over.
+    const CLUSTER_WINDOW: u64 = 8;
+
+    /// Whether the zone bounds up to `zone` are clustered: the last
+    /// [`Self::CLUSTER_WINDOW`] zones ascend without overlapping, as an id
+    /// sequence or an insert-time timestamp does, so an equality probe's
+    /// bounds narrow it to one zone. Only fixed-width bounds qualify (see
+    /// `ZoneMap::is_ascending_between`). A wrong answer costs selectivity,
+    /// never a row: a plane-less zone is always a candidate.
+    fn bounds_are_clustered(&self, zone: u64) -> bool {
+        if zone + 1 < Self::CLUSTER_WINDOW {
+            return false;
+        }
+        self.zonemap
+            .as_ref()
+            .is_some_and(|zm| zm.is_ascending_between(zone + 1 - Self::CLUSTER_WINDOW, zone + 1))
     }
 
     /// The bookkeeping every slot write owes regardless of what it stored.
@@ -686,7 +893,7 @@ impl ColumnFilter {
     /// `out` must be `ceil(n_slots / 64)` words. A set bit means "this slot may
     /// match" — the mask is always a **superset** of true matches.
     pub fn probe_into(&self, value: &[u8], n_slots: u64, out: &mut [u64]) -> bool {
-        match canonical_hash(&self.db_type, value, self.seed) {
+        match row_hash(&self.db_type, value, self.seed) {
             Some(h) => {
                 self.probe_hash_into(h, n_slots, out);
                 true
@@ -711,22 +918,18 @@ impl ColumnFilter {
         self.gated_out
     }
 
-    pub fn probe_pred_into(
-        &self,
-        op: SargOp,
-        value: &[u8],
-        n_slots: u64,
-        out: &mut [u64],
-    ) -> bool {
-        if self.gated_out {
-            out.fill(u64::MAX);
-            mask_tail(out, n_slots);
-            return false;
-        }
+    pub fn probe_pred_into(&self, op: SargOp, value: &[u8], n_slots: u64, out: &mut [u64]) -> bool {
+        // The selectivity gate takes the *fingerprints* out of service: with
+        // so few distinct values an equality probe would match too much to be
+        // worth streaming the planes. It says nothing about the zone bounds,
+        // which are maintained regardless and stay exact. Returning early here
+        // used to drop range pruning too, so `created_day > '…'` on a clustered
+        // low-cardinality column scanned the whole table.
+        //
         // Equality on a column that carries fingerprints consults both
         // structures, since they prune independently.
-        if op == SargOp::Eq && self.fingerprints {
-            let Some(h) = canonical_hash(&self.db_type, value, self.seed) else {
+        if op == SargOp::Eq && self.fingerprints && !self.gated_out {
+            let Some(h) = row_hash(&self.db_type, value, self.seed) else {
                 out.fill(u64::MAX);
                 mask_tail(out, n_slots);
                 return false;
@@ -738,10 +941,14 @@ impl ColumnFilter {
         }
 
         // Bounds alone from here: a range predicate, which fingerprints cannot
-        // express, or *any* predicate on a bounds-only column, where the bounds
+        // express; any predicate on a gated-out column, whose bounds are still
+        // good; or *any* predicate on a bounds-only column, where the bounds
         // are the entire index. `BOOL` is the second case — `__null_x = 1` gets
         // its pruning from zones that hold no `1` at all.
-        let usable = self.zonemap.as_ref().is_some_and(|zm| zm.probes_with(value));
+        let usable = self
+            .zonemap
+            .as_ref()
+            .is_some_and(|zm| zm.probes_with(value));
         if !usable {
             out.fill(u64::MAX);
             mask_tail(out, n_slots);
@@ -756,7 +963,9 @@ impl ColumnFilter {
 
     /// Clear every zone whose bounds rule the predicate out.
     fn intersect_zonemap(&self, op: SargOp, value: &[u8], n_slots: u64, out: &mut [u64]) {
-        let Some(zm) = self.zonemap.as_ref() else { return };
+        let Some(zm) = self.zonemap.as_ref() else {
+            return;
+        };
         let limit = zones_for(self.valid_upto.min(n_slots));
         for zone in 0..limit {
             let first = zone * ZONE_ROWS as u64;
@@ -798,7 +1007,9 @@ impl ColumnFilter {
         let mut scratch = [0u64; ZONE_WORDS];
 
         for gn in self.gens.iter() {
-            let g = fingerprint(hash, gn.f);
+            // No fingerprint exists at width 0; a plane-less generation never
+            // reaches the plane probe below.
+            let g = if gn.is_planeless() { 0 } else { fingerprint(hash, gn.f) };
             let count = gn.zone_count();
             for lz in 0..count {
                 let zone = gn.start_zone + lz;
@@ -808,6 +1019,19 @@ impl ColumnFilter {
                 }
                 let last = first + ZONE_ROWS as u64 - 1;
                 if last < self.unknown_below {
+                    continue;
+                }
+
+                // A plane-less zone cannot rule anything out: every slot stays
+                // a candidate, for the zone bounds to narrow.
+                if gn.is_planeless() {
+                    if self
+                        .bloom
+                        .as_ref()
+                        .is_some_and(|b| !b.may_contain(bloom::superzone_of(first), hash))
+                    {
+                        self.reject_zone(out, zone, first, last);
+                    }
                     continue;
                 }
 
@@ -841,6 +1065,59 @@ impl ColumnFilter {
 
         mask_tail(out, n_slots);
     }
+
+    /// Whether `col = value` keeps `slot` a candidate: bit `slot` of what
+    /// [`Self::probe_pred_into`] writes for `SargOp::Eq` over `n_slots`,
+    /// for one slot, without the bitmap. Read-only.
+    ///
+    /// For the index snapshot's audit (docs/persistent-indexes.md §4, B18):
+    /// a row's own value must keep its slot a candidate, or the filter
+    /// prunes a matching row. That is the filter's meaning, and what the
+    /// audit compares; codes are not comparable across builds, since each
+    /// zone's width is chosen from history (`gen_index_for`, the HLL in
+    /// completion order). Each step mirrors the probe's, in its order, and
+    /// `admits_eq_is_the_probes_bit` pins the two equal.
+    pub fn admits_eq(&self, slot: u64, value: &[u8], n_slots: u64) -> bool {
+        if slot >= n_slots {
+            // `mask_tail` clears every bit past the table.
+            return false;
+        }
+        // Slots the column does not vouch for stay candidates in every
+        // branch of the probe (`force_range`, the frontier's `break`).
+        if slot < self.unknown_below || slot >= self.valid_upto {
+            return true;
+        }
+        let zone = slot / ZONE_ROWS as u64;
+        let local = (slot % ZONE_ROWS as u64) as usize;
+        // The zone bounds, as `intersect_zonemap` applies them: zones below
+        // `zones_for(min(valid_upto, n_slots))`, and none wholly unknown
+        // (this slot is known, so its zone is not).
+        let bounds_admit = |zm: &ZoneMap| -> bool {
+            zone >= zones_for(self.valid_upto.min(n_slots)) || zm.zone_may_match(zone, SargOp::Eq, value)
+        };
+        if self.fingerprints && !self.gated_out {
+            let Some(h) = row_hash(&self.db_type, value, self.seed) else {
+                return true;
+            };
+            let first = zone * ZONE_ROWS as u64;
+            // `probe_hash_into`: a zone in no generation is never visited
+            // and stays a candidate.
+            if let Some(g) = self.gens.iter().find(|g| g.contains(zone)) {
+                if self.bloom.as_ref().is_some_and(|b| !b.may_contain(bloom::superzone_of(first), h)) {
+                    return false;
+                }
+                if !g.is_planeless() && read_slot(g.zone(zone), g.f, local) != fingerprint(h, g.f) {
+                    return false;
+                }
+            }
+            return self.zonemap.as_ref().is_none_or(bounds_admit);
+        }
+        // Bounds alone: a gated-out or bounds-only column.
+        match self.zonemap.as_ref() {
+            Some(zm) if zm.probes_with(value) => bounds_admit(zm),
+            _ => true,
+        }
+    }
 }
 
 /// The part of one column an incremental checkpoint carries.
@@ -854,8 +1131,10 @@ pub struct ColumnDelta {
     pub rows_seen: u64,
     pub next_f: u8,
     pub hll: Hll,
-    /// `(start_zone, f, first_zone_carried, words from that zone on)`.
-    pub gens: Vec<(u64, u8, u64, Vec<u64>)>,
+    /// `(start_zone, f, first_zone_carried, zones, words from that zone on)`.
+    /// `zones` is a plane-less generation's whole zone count; for one with
+    /// planes it is 0 and the words say it.
+    pub gens: Vec<(u64, u8, u64, u64, Vec<u64>)>,
     /// `(first_zone_carried, bound bytes from that zone on, validity bits)`.
     pub zonemap: Option<(u64, Vec<u8>, Vec<u64>)>,
     /// `(first_superzone_carried, summary words from that superzone on)`.
@@ -872,7 +1151,13 @@ impl ColumnFilter {
             .map(|g| {
                 let first = g.start_zone.max(from_zone);
                 let skip = (first - g.start_zone) as usize * ZONE_WORDS * g.f as usize;
-                (g.start_zone, g.f, first, g.words[skip.min(g.words.len())..].to_vec())
+                (
+                    g.start_zone,
+                    g.f,
+                    first,
+                    if g.f == 0 { g.zones } else { 0 },
+                    g.words[skip.min(g.words.len())..].to_vec(),
+                )
             })
             .collect();
 
@@ -883,10 +1168,13 @@ impl ColumnFilter {
             next_f: self.next_f,
             hll: self.hll.clone(),
             gens,
-            zonemap: self
-                .zonemap
-                .as_ref()
-                .map(|z| (from_zone, z.tail_from(from_zone).to_vec(), z.valid_bits().to_vec())),
+            zonemap: self.zonemap.as_ref().map(|z| {
+                (
+                    from_zone,
+                    z.tail_from(from_zone).to_vec(),
+                    z.valid_bits().to_vec(),
+                )
+            }),
             // A superzone spans 32 zones, so the re-send point rounds *down* to
             // the superzone containing `from_zone`: sending half a block would
             // drop the keys recorded in the half left behind.
@@ -907,9 +1195,21 @@ impl ColumnFilter {
     /// torn final append leaves us in, so there is one recovery path rather than
     /// two.
     pub fn apply_delta(&mut self, d: ColumnDelta) -> bool {
-        for (start_zone, f, first_zone, words) in d.gens {
-            if f == 0 || first_zone < start_zone {
+        for (start_zone, f, first_zone, zones, words) in d.gens {
+            if first_zone < start_zone {
                 return false;
+            }
+            if f == 0 {
+                // Plane-less: only its extent to carry.
+                if !words.is_empty() {
+                    return false;
+                }
+                match self.gens.iter_mut().find(|g| g.start_zone == start_zone) {
+                    Some(g) if g.f == 0 => g.zones = g.zones.max(zones),
+                    Some(_) => return false,
+                    None => self.gens.push(Generation::new(start_zone, 0, Vec::new(), zones)),
+                }
+                continue;
             }
             let stride = ZONE_WORDS * f as usize;
             if words.len() % stride != 0 {
@@ -933,7 +1233,7 @@ impl ColumnFilter {
                 // created after the checkpoint, so it starts at or above the
                 // first zone this delta covers.
                 None if keep == 0 => {
-                    self.gens.push(Generation { start_zone, f, words });
+                    self.gens.push(Generation::new(start_zone, f, words, 0));
                 }
                 None => return false,
             }
@@ -1019,4 +1319,422 @@ pub fn bitmap_words(n_slots: u64) -> usize {
 #[inline]
 pub fn mask_tail_pub(out: &mut [u64], n_slots: u64) {
     mask_tail(out, n_slots)
+}
+
+#[cfg(test)]
+mod gated_bounds_tests {
+    use super::*;
+    use crate::core::filter::hash::HashSeed;
+
+    /// A day-number-like column: few distinct values, inserted in order, so
+    /// each 512-row zone spans one or two of them.
+    fn clustered(n: u64, rows_per_value: u64) -> ColumnFilter {
+        let mut c = ColumnFilter::new(0, DbType::I64, HashSeed::default(), FilterConfig::default());
+        for slot in 0..n {
+            c.set(slot, Some(&((slot / rows_per_value) as i64).to_le_bytes()));
+        }
+        c
+    }
+
+    fn survivors(bm: &[u64]) -> u64 {
+        bm.iter().map(|w| w.count_ones() as u64).sum()
+    }
+
+    /// The selectivity gate takes the fingerprints out of service, not the zone
+    /// bounds: a range predicate on a gated column still prunes, and never a
+    /// matching slot.
+    #[test]
+    fn a_gated_column_still_prunes_ranges_by_its_bounds() {
+        let n = 20_000u64;
+        let per = 1_000u64; // 20 distinct values, below the gate's 50
+        let c = clustered(n, per);
+        assert!(c.is_gated_out(), "the test needs the gate closed");
+        let ops = [SargOp::Gt, SargOp::Ge, SargOp::Lt, SargOp::Le, SargOp::Eq];
+        for op in ops {
+            for pivot in [-1i64, 0, 3, 10, 17, 19, 20] {
+                let mut bm = vec![0u64; bitmap_words(n)];
+                let usable = c.probe_pred_into(op, &pivot.to_le_bytes(), n, &mut bm);
+                let mut matching = 0u64;
+                for slot in 0..n {
+                    let v = (slot / per) as i64;
+                    let hit = match op {
+                        SargOp::Gt => v > pivot,
+                        SargOp::Ge => v >= pivot,
+                        SargOp::Lt => v < pivot,
+                        SargOp::Le => v <= pivot,
+                        _ => v == pivot,
+                    };
+                    if hit {
+                        matching += 1;
+                        assert!(
+                            (bm[(slot / 64) as usize] >> (slot % 64)) & 1 == 1,
+                            "slot {} (v={}) pruned for {:?} {}",
+                            slot,
+                            v,
+                            op,
+                            pivot
+                        );
+                    }
+                }
+                assert!(usable, "{:?} {}: bounds are usable on a gated column", op, pivot);
+                // Bounds work at zone granularity: at most the matching rows
+                // plus the two partial zones at the edges.
+                assert!(
+                    survivors(&bm) <= matching + 2 * ZONE_ROWS as u64,
+                    "{:?} {}: {} survivors for {} matches",
+                    op,
+                    pivot,
+                    survivors(&bm),
+                    matching
+                );
+            }
+        }
+    }
+
+    /// The same gated column with no locality: every zone spans every value,
+    /// so nothing can be pruned — and nothing is.
+    #[test]
+    fn an_unclustered_gated_column_prunes_nothing_wrongly() {
+        let n = 10_000u64;
+        let mut c = ColumnFilter::new(0, DbType::I64, HashSeed::default(), FilterConfig::default());
+        for slot in 0..n {
+            c.set(slot, Some(&((slot % 7) as i64).to_le_bytes()));
+        }
+        assert!(c.is_gated_out());
+        let mut bm = vec![0u64; bitmap_words(n)];
+        c.probe_pred_into(SargOp::Gt, &3i64.to_le_bytes(), n, &mut bm);
+        assert_eq!(survivors(&bm), n);
+    }
+
+    /// A range probe on a clustered low-cardinality column, 10M rows over 100
+    /// days... capped at 49 distinct so the gate closes: rows surviving the
+    /// mask, and probe time. `cargo test --release -p rasterizeddb_core --lib
+    /// -- --ignored gated_range_probe_bench --nocapture`.
+    #[test]
+    #[ignore]
+    fn gated_range_probe_bench() {
+        let n = 10_000_000u64;
+        let c = clustered(n, n / 49 + 1);
+        assert!(c.is_gated_out());
+        let mut bm = vec![0u64; bitmap_words(n)];
+        for pivot in [45i64, 40, 25] {
+            let t = std::time::Instant::now();
+            c.probe_pred_into(SargOp::Gt, &pivot.to_le_bytes(), n, &mut bm);
+            let took = t.elapsed();
+            println!(
+                "day > {pivot}: {} of {n} slots survive ({:.1}%), probe {:?}",
+                survivors(&bm),
+                survivors(&bm) as f64 * 100.0 / n as f64,
+                took
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod planeless_tests {
+    use super::*;
+    use crate::core::filter::hash::HashSeed;
+    use crate::core::filter::persist;
+
+    fn col() -> ColumnFilter {
+        ColumnFilter::new(0, DbType::I64, HashSeed::default(), FilterConfig::default())
+    }
+
+    fn fill(c: &mut ColumnFilter, slots: std::ops::Range<u64>, value: impl Fn(u64) -> i64) {
+        for slot in slots {
+            c.set(slot, Some(&value(slot).to_le_bytes()));
+        }
+    }
+
+    fn bit(bm: &[u64], slot: u64) -> bool {
+        (bm[(slot / 64) as usize] >> (slot % 64)) & 1 == 1
+    }
+
+    fn count(bm: &[u64]) -> u64 {
+        bm.iter().map(|w| w.count_ones() as u64).sum()
+    }
+
+    fn planeless_zones(c: &ColumnFilter) -> u64 {
+        c.generations().iter().filter(|g| g.is_planeless()).map(|g| g.zone_count()).sum()
+    }
+
+    /// Every slot whose value is `v` must survive an equality probe for `v`.
+    fn assert_no_false_negatives(c: &ColumnFilter, n: u64, value: &dyn Fn(u64) -> i64, probes: &[u64]) {
+        let mut bm = vec![0u64; bitmap_words(n)];
+        for &slot in probes {
+            let v = value(slot);
+            c.probe_pred_into(SargOp::Eq, &v.to_le_bytes(), n, &mut bm);
+            for s in 0..n {
+                if value(s) == v {
+                    assert!(bit(&bm, s), "slot {} (v={}) pruned", s, v);
+                }
+            }
+        }
+    }
+
+    /// A serial id: distinct per row and ascending, so the bounds narrow an
+    /// equality probe to one zone and the planes are dropped after the window.
+    #[test]
+    fn a_clustered_column_stops_writing_planes() {
+        let n = 40_000u64;
+        let mut clustered = col();
+        fill(&mut clustered, 0..n, |s| s as i64 * 3);
+        assert!(!clustered.is_gated_out(), "distinct per row: the gate stays open");
+        assert!(planeless_zones(&clustered) > 0, "a clustered column went plane-less");
+
+        let mut random = col();
+        let scrambled = |s: u64| (s.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as i64;
+        fill(&mut random, 0..n, scrambled);
+        assert_eq!(planeless_zones(&random), 0, "an unclustered column keeps its planes");
+        assert!(
+            clustered.bytes() * 4 < random.bytes(),
+            "clustered {} B vs random {} B",
+            clustered.bytes(),
+            random.bytes()
+        );
+
+        // Point probes still land on one zone, and never miss.
+        let mut bm = vec![0u64; bitmap_words(n)];
+        for slot in [0u64, 511, 512, 4_097, 20_000, 39_999] {
+            clustered.probe_pred_into(SargOp::Eq, &(slot as i64 * 3).to_le_bytes(), n, &mut bm);
+            assert!(bit(&bm, slot), "slot {} pruned", slot);
+            assert!(count(&bm) <= ZONE_ROWS as u64, "{} survivors for a point probe", count(&bm));
+        }
+        assert_no_false_negatives(&clustered, n, &|s| s as i64 * 3, &[7, 30_001]);
+        // A value no row holds.
+        clustered.probe_pred_into(SargOp::Eq, &(-5i64).to_le_bytes(), n, &mut bm);
+        assert_eq!(count(&bm), 0);
+    }
+
+    /// Bounds that stop being clustered bring planes back for the zones after,
+    /// and every zone, plane-less or not, still answers correctly.
+    #[test]
+    fn planes_return_when_clustering_ends() {
+        let n1 = 20_000u64;
+        let n = 40_000u64;
+        let value = |s: u64| {
+            if s < n1 { s as i64 } else { (s.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 24) as i64 }
+        };
+        let mut c = col();
+        fill(&mut c, 0..n, value);
+        let gens = c.generations();
+        assert!(gens.iter().any(|g| g.is_planeless()));
+        assert!(gens.last().is_some_and(|g| !g.is_planeless()), "planes resumed");
+        assert_no_false_negatives(&c, n, &value, &[3, 15_000, 25_000, 39_999]);
+    }
+
+    /// A gated-out column writes no planes, and its probes stay supersets.
+    #[test]
+    fn a_gated_column_writes_no_planes() {
+        let n = 20_000u64;
+        let value = |s: u64| (s % 9) as i64;
+        let mut c = col();
+        fill(&mut c, 0..n, value);
+        assert!(c.is_gated_out());
+        assert!(planeless_zones(&c) > 0);
+        let with_planes: usize = c.generations().iter().map(|g| g.words.len() * 8).sum();
+        assert!(with_planes <= 4 * ZONE_ROWS, "only the first zone carries planes: {} B", with_planes);
+        assert_no_false_negatives(&c, n, &value, &[0, 4, 8]);
+    }
+
+    fn reload(c: &ColumnFilter, n: u64, buf: &[u8]) -> ColumnFilter {
+        let expected = [(c.write_order, c.db_type.clone())];
+        let mut loaded = persist::deserialize(buf, HashSeed::default(), &expected, FilterConfig::default(), n)
+            .unwrap_or_else(|e| panic!("load: {:?}", e));
+        assert_eq!(loaded.columns.len(), 1);
+        loaded.columns.remove(0)
+    }
+
+    /// Plane-less generations survive a checkpoint, and so does every answer.
+    #[test]
+    fn plane_less_generations_round_trip_a_checkpoint_and_a_delta() {
+        let n1 = 20_000u64;
+        let n = 30_000u64;
+        let value = |s: u64| s as i64;
+        let mut c = col();
+        fill(&mut c, 0..n1, value);
+        let base = persist::serialize(&[&c], HashSeed::default(), n1);
+        let reopened = reload(&c, n1, &base);
+        assert_eq!(planeless_zones(&reopened), planeless_zones(&c));
+        assert_eq!(reopened.zone_count(), c.zone_count());
+        assert_no_false_negatives(&reopened, n1, &value, &[0, 777, 19_999]);
+
+        // More rows, then an incremental record on top of the base.
+        let from = c.delta_from_zone();
+        c.mark_checkpointed();
+        let from = from.min(c.delta_from_zone());
+        fill(&mut c, n1..n, value);
+        let mut buf = base.clone();
+        buf.extend_from_slice(&persist::serialize_delta(&[&c], &[from.min(n1 / ZONE_ROWS as u64)], n));
+        let replayed = reload(&c, n, &buf);
+        assert_eq!(planeless_zones(&replayed), planeless_zones(&c));
+        assert_no_false_negatives(&replayed, n, &value, &[1, 20_000, 29_999]);
+    }
+
+    /// A version-4 file — written before plane-less generations existed —
+    /// reads unchanged; one claiming a plane-less generation is refused.
+    #[test]
+    fn a_version_4_checkpoint_still_loads() {
+        let n = 5_000u64;
+        let value = |s: u64| (s.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20) as i64;
+        let mut c = col();
+        fill(&mut c, 0..n, value);
+        assert_eq!(planeless_zones(&c), 0);
+        let mut buf = persist::serialize(&[&c], HashSeed::default(), n);
+        // The version field follows the 8-byte magic.
+        assert_eq!(u16::from_le_bytes([buf[8], buf[9]]), persist::FORMAT_VER);
+        buf[8..10].copy_from_slice(&4u16.to_le_bytes());
+        let old = reload(&c, n, &buf);
+        assert_eq!(old.zone_count(), c.zone_count());
+        assert_no_false_negatives(&old, n, &value, &[0, 2_500, 4_999]);
+
+        // v3 and earlier stay refused.
+        buf[8..10].copy_from_slice(&3u16.to_le_bytes());
+        assert!(matches!(
+            persist::deserialize(&buf, HashSeed::default(), &[(0, DbType::I64)], FilterConfig::default(), n),
+            Err(persist::LoadReject::Version(3))
+        ));
+
+        // A v4 file cannot hold a plane-less generation.
+        let mut clustered = col();
+        fill(&mut clustered, 0..n * 4, |s| s as i64);
+        assert!(planeless_zones(&clustered) > 0);
+        let mut buf = persist::serialize(&[&clustered], HashSeed::default(), n * 4);
+        buf[8..10].copy_from_slice(&4u16.to_le_bytes());
+        assert!(persist::deserialize(&buf, HashSeed::default(), &[(0, DbType::I64)], FilterConfig::default(), n * 4).is_err());
+    }
+
+    /// Bytes per row and point-probe cost on a 10M-row serial column, planes
+    /// against plane-less. `cargo test --release -p rasterizeddb_core --lib --
+    /// --ignored planeless_point_probe_bench --nocapture`.
+    #[test]
+    #[ignore]
+    fn planeless_point_probe_bench() {
+        let n = 10_000_000u64;
+        let mut clustered = col();
+        fill(&mut clustered, 0..n, |s| s as i64);
+        // The same data with the clustering decision defeated: one row out of
+        // order per zone keeps the bounds overlapping, so planes stay on.
+        let mut planes = col();
+        fill(&mut planes, 0..n, |s| if s % ZONE_ROWS as u64 == 0 { (n - s) as i64 } else { s as i64 });
+        let mut bm = vec![0u64; bitmap_words(n)];
+        for (label, c) in [("plane-less", &clustered), ("planes", &planes)] {
+            let t = std::time::Instant::now();
+            let mut survivors = 0;
+            for k in 0..100u64 {
+                let v = (k * 99_991 % n) as i64 + 1;
+                c.probe_pred_into(SargOp::Eq, &v.to_le_bytes(), n, &mut bm);
+                survivors += count(&bm);
+            }
+            println!(
+                "{label:<11} {:>6.1} MB ({:.2} B/row)  100 point probes {:>9.2?}  mean survivors {}",
+                c.bytes() as f64 / 1e6,
+                c.bytes() as f64 / n as f64,
+                t.elapsed(),
+                survivors / 100
+            );
+        }
+    }
+}
+
+/// `admits_eq` is the probe, one slot at a time (B18): the audit's verdict
+/// on the filter is the filter's own answer, never a second opinion.
+#[cfg(test)]
+mod admits_eq_tests {
+    use super::*;
+    use crate::core::filter::hash::HashSeed;
+
+    fn bit(bm: &[u64], slot: u64) -> bool {
+        (bm[(slot / 64) as usize] >> (slot % 64)) & 1 == 1
+    }
+
+    /// Columns of every shape the probe has a branch for: planes at widths
+    /// that grow with the table (so older zones keep a narrower width),
+    /// plane-less clustered zones, a gated-out column, a bounds-only `BOOL`,
+    /// the span summary on and off, zone bounds on and off; then deletes,
+    /// in-place overwrites, out-of-order writes past the frontier, and an
+    /// unindexed prefix. For every slot, its own value and values no slot
+    /// holds, `admits_eq` equals bit `slot` of `probe_pred_into(Eq)`, at
+    /// two table lengths.
+    #[test]
+    fn admits_eq_is_the_probes_bit() {
+        let mut rng = fastrand::Rng::with_seed(0xb18);
+        let mut checked = 0u64;
+        let mut rejected = 0u64;
+        for case in 0..14u32 {
+            let ty = if case == 13 { DbType::BOOL } else { DbType::I64 };
+            let bounds = case % 4 != 3;
+            let summary = case % 3 == 1;
+            let mut c = ColumnFilter::with_options(0, ty.clone(), HashSeed::default(), FilterConfig::default(), bounds, summary);
+            let n = 6_000 + rng.u64(0..4_000);
+            let value = |slot: u64, rng: &mut fastrand::Rng| -> Vec<u8> {
+                match case {
+                    13 => vec![(slot % 2) as u8],
+                    // Clustered: an id-like sequence (plane-less zones).
+                    0 | 4 => (slot as i64).to_le_bytes().to_vec(),
+                    // Gated out: twelve values.
+                    5 => ((slot % 12) as i64).to_le_bytes().to_vec(),
+                    // Cardinality that grows, so the width moves.
+                    _ => (rng.u64(0..(slot + 64)) as i64).to_le_bytes().to_vec(),
+                }
+            };
+            let mut held: Vec<Option<Vec<u8>>> = vec![None; n as usize];
+            let prefix = if case % 5 == 2 { 700 } else { 0 };
+            c.set_unindexed_prefix(prefix);
+            // A few slots are written late, out of order (pending past the
+            // frontier until it reaches them); the last of them never is,
+            // so the frontier stops there.
+            let late: Vec<u64> = (0..n).filter(|s| s % 997 == 11).collect();
+            for slot in 0..n {
+                if late.contains(&slot) {
+                    continue;
+                }
+                let v = value(slot, &mut rng);
+                c.set(slot, Some(&v));
+                held[slot as usize] = Some(v);
+            }
+            for &slot in &late[..late.len() - 1] {
+                let v = value(slot, &mut rng);
+                c.set(slot, Some(&v));
+                held[slot as usize] = Some(v);
+            }
+            for _ in 0..200 {
+                let slot = rng.u64(0..n);
+                if rng.u8(0..3) == 0 {
+                    c.set(slot, None);
+                    held[slot as usize] = None;
+                } else {
+                    let v = value(rng.u64(0..n), &mut rng);
+                    c.set(slot, Some(&v));
+                    held[slot as usize] = Some(v);
+                }
+            }
+            let mut probes: Vec<Vec<u8>> = held.iter().flatten().step_by(7).cloned().collect();
+            if case != 13 {
+                probes.extend([-1i64, 77_777_777, i64::MAX].map(|v| v.to_le_bytes().to_vec()));
+            }
+            probes.sort();
+            probes.dedup();
+            for len in [n, n - n / 3] {
+                let mut bm = vec![0u64; bitmap_words(len)];
+                for v in &probes {
+                    c.probe_pred_into(SargOp::Eq, v, len, &mut bm);
+                    for slot in 0..len {
+                        let want = bit(&bm, slot);
+                        assert_eq!(
+                            c.admits_eq(slot, v, len),
+                            want,
+                            "case {case}: slot {slot} of {len}, value {v:?}: admits_eq disagrees with the probe"
+                        );
+                        checked += 1;
+                        rejected += u64::from(!want);
+                    }
+                    assert!(!c.admits_eq(len, v, len), "a slot past the table is a candidate");
+                }
+            }
+        }
+        // The cases above must exercise rejection, not just "candidate".
+        assert!(rejected > checked / 4, "{rejected} of {checked} rejected");
+    }
 }

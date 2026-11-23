@@ -87,18 +87,41 @@ fn spawn_once() {
     });
 }
 
+/// The directory keys ([`wal::dir_key`]) of every live database on the round:
+/// the directories whose logs hold transaction outcome records. Anything that
+/// syncs logs from the process-wide list syncs every other log first, then
+/// these, or leaves them to their own database (see [`flush_once`]).
+pub(crate) fn outcome_dirs() -> std::collections::HashSet<String> {
+    registry()
+        .lock()
+        .iter()
+        .filter(|r| r.manager.strong_count() > 0)
+        .map(|r| wal::dir_key(&r.location))
+        .collect()
+}
+
 /// One round: flush every log that is owed a sync, then let the outcome bytes
 /// they now cover reach the status files.
 ///
 /// **The order matters and is the same order `Database::sync_durable` uses.**
-/// For each database, every *other* log is synced before its own, because its
-/// own is the one holding its transaction outcome records. An outcome that
+/// A database's own log holds its transaction outcome records, and must be
+/// synced after every other log it may have written rows to. An outcome that
 /// became durable ahead of the rows it validates would, after a crash in
 /// between, name a transaction committed whose rows are missing — which is
-/// corruption, not the bounded loss the knob promises. Syncing everything else
-/// first and the database's own log last satisfies that for every database on
-/// the round at once, whatever order they are visited in: rows-before-outcome
-/// is the safe direction, and only the reverse has to be prevented.
+/// corruption, not the bounded loss the knob promises.
+///
+/// So the round syncs in two passes: every log that is no database's own
+/// first, and only then each database's own. Visiting database by database,
+/// syncing "everything but this one's own" each time, is not enough: the first
+/// database visited would sync every *other* database's own log in that
+/// pass, before those databases' other directories had been reached.
+///
+/// The order covers only what was written before the round started. Sessions
+/// keep appending to the other logs and staging outcomes between its two
+/// halves, so it is not what keeps a transaction's outcome behind its rows on
+/// another disk: `Database::commit_written_transaction` is, by syncing those
+/// rows before the outcome exists to be staged — in `synchronous_commit = off`
+/// too, which is the mode that leans on this round.
 ///
 /// Errors are swallowed deliberately. Nothing is waiting on this round, a
 /// failed flush leaves the records exactly where they were, and a log that
@@ -115,14 +138,23 @@ fn flush_once() {
         return;
     }
 
-    let logs = wal::registered();
+    let own: std::collections::HashSet<String> =
+        entries.iter().map(|(location, _)| wal::dir_key(location)).collect();
+    for (dir, log) in wal::registered() {
+        if own.contains(&dir) {
+            continue;
+        }
+        #[cfg(test)]
+        if test_hooks::held(&dir) {
+            continue;
+        }
+        let _ = log.sync_pending();
+    }
     for (location, manager) in entries {
-        let own = wal::dir_key(&location);
-        for (dir, log) in &logs {
-            if *dir == own {
-                continue;
-            }
-            let _ = log.sync_pending();
+        // Neither its log nor its staged outcomes, which may only follow it.
+        #[cfg(test)]
+        if test_hooks::held(&location) {
+            continue;
         }
         if let Some(log) = wal::wal_for(&location) {
             let _ = log.sync_pending();
@@ -139,6 +171,39 @@ fn flush_once() {
 /// backlog it accumulated to be durable before it says so.
 pub fn flush_now() {
     flush_once();
+}
+
+/// Test-only: keeps the writer's round off the logs of one directory tree,
+/// so a crash test can cut an image with group commits still unsynced
+/// whatever the round's timing, without changing the process-wide delay
+/// every other test runs under.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::path::{Path, PathBuf};
+
+    static HELD: parking_lot::Mutex<Vec<PathBuf>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Holds the round off every log under `dir` until the guard drops.
+    pub(crate) fn hold(dir: &Path) -> Hold {
+        HELD.lock().push(dir.to_path_buf());
+        Hold(dir.to_path_buf())
+    }
+
+    pub(crate) struct Hold(PathBuf);
+
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            let mut held = HELD.lock();
+            if let Some(at) = held.iter().position(|d| *d == self.0) {
+                held.remove(at);
+            }
+        }
+    }
+
+    pub(super) fn held(dir: &str) -> bool {
+        let held = HELD.lock();
+        !held.is_empty() && held.iter().any(|d| Path::new(dir).starts_with(d))
+    }
 }
 
 #[cfg(test)]
@@ -165,7 +230,10 @@ mod tests {
             });
         }
         assert!(
-            registry().lock().iter().any(|r| r.manager.strong_count() > 0),
+            registry()
+                .lock()
+                .iter()
+                .any(|r| r.manager.strong_count() > 0),
             "the entry was not registered"
         );
 

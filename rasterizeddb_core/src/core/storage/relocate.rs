@@ -27,7 +27,9 @@ use rclite::Arc;
 
 use crate::core::database::Database;
 
-use super::{LocationRole, PlacementPolicy, StorageManager, available_bytes, human_bytes};
+use super::{
+    LocationRole, PlacementPolicy, StorageManager, TableBackend, available_bytes, human_bytes,
+};
 
 /// One move a rebalance intends.
 struct Move {
@@ -39,31 +41,112 @@ struct Move {
     reason: &'static str,
 }
 
-/// `STORAGE MOVE TABLE <name> TO '<path>'`, and the line it reports.
+/// `STORAGE MOVE TABLE <name> TO '<spec>'`, and the lines it reports.
 ///
 /// A move to where the table already is is success, not an error — a rebalance
 /// script that names every table should not fail on the ones the policy already
 /// put in the right place — but it says so rather than reporting a copy of zero
 /// bytes, which reads as a move that silently did nothing.
+///
+/// # It is a conversion, not only a relocation
+///
+/// `<spec>` is a backend, so this is also how a table changes what holds it:
+/// a directory, `memory:`, or `kv:<store>` — and a store is a local directory
+/// or an S3 bucket depending only on how it was defined. The copy itself is
+/// backend-agnostic (see [`crate::core::database::Database::move_table_to_backend`]);
+/// what is not agnostic, and what this reports, is which of the file-backed
+/// features the table gains or loses on arrival. Saying nothing there is how an
+/// operator ends up with a table that is no longer in any backup and no
+/// indication that it changed.
 pub async fn move_table(
     database: &Arc<Database>,
     table: &str,
-    destination: &str,
-) -> Result<String, String> {
+    destination: &TableBackend,
+) -> Result<Vec<String>, String> {
     let pool = &database.storage;
     let root = pool.root().ok_or("this database is in memory")?.to_string();
-    let current = pool.location_of(table).unwrap_or(root);
+    // Before "already there": a partitioned table is in no placement, so the
+    // root would read as where it is and the statement as done.
+    database
+        .refuse_partitioned(table, "STORAGE MOVE TABLE")
+        .map_err(|e| e.to_string())?;
 
-    if current == destination {
-        return Ok(format!("{} is already in {}", table, destination));
+    let current = pool
+        .backend_of(table)
+        .unwrap_or(TableBackend::Directory(root));
+
+    if current == *destination {
+        return Ok(vec![format!(
+            "{} is already on {}",
+            table,
+            where_it_is(destination)
+        )]);
     }
 
+    // ACCESS EXCLUSIVE on the name for the move (§7): every statement on the
+    // table has finished and none starts until this one ends, so the copy
+    // reads files nothing is writing, and the swap is seen only after it.
+    // After the partitioned refusal above, so that one never waits.
+    database
+        .lock_table(
+            table,
+            crate::core::mvcc::owner::ensure(),
+            crate::core::mvcc::table_locks::TableMode::AccessExclusive,
+        )
+        .await?;
     let bytes = database
-        .move_table_to(table, destination)
+        .move_table_to_backend(table, destination)
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(format!("moved {} to {} ({})", table, destination, human_bytes(bytes)))
+    let mut lines = vec![format!(
+        "moved {} from {} to {} ({})",
+        table,
+        where_it_is(&current),
+        where_it_is(destination),
+        human_bytes(bytes)
+    )];
+    lines.extend(consequences(&current, destination));
+    Ok(lines)
+}
+
+/// How a backend reads in a sentence an operator is looking at.
+fn where_it_is(backend: &TableBackend) -> String {
+    match backend {
+        TableBackend::Directory(path) => path.clone(),
+        TableBackend::Memory => "memory".to_string(),
+        TableBackend::KeyValue(store) => format!("key/value store '{store}'"),
+    }
+}
+
+/// What the table gained or lost by arriving where it did.
+///
+/// Backup, the write-ahead log, relocation and the free-space policy are
+/// features *about files*. Crossing that line in either direction is the part
+/// of a move that is invisible afterwards: the rows read back identically, and
+/// the next snapshot is the first hint that the table is no longer in one.
+fn consequences(from: &TableBackend, to: &TableBackend) -> Vec<String> {
+    let mut lines = Vec::new();
+    match to {
+        TableBackend::Memory => lines.push(
+            "it is now in this process only: it does not survive a restart, it is in no \
+             backup, and it has no write-ahead log"
+                .to_string(),
+        ),
+        TableBackend::KeyValue(_) => lines.push(
+            "it is durable in the store, but it is no longer covered by backups or by \
+             STORAGE REBALANCE, and it has no write-ahead log — its durability is \
+             the delta object written at each commit"
+                .to_string(),
+        ),
+        TableBackend::Directory(_) if !from.is_file_based() => lines.push(
+            "it is a file-backed table again: backups include it, the write-ahead log \
+             covers it, and the free-space policy counts it"
+                .to_string(),
+        ),
+        TableBackend::Directory(_) => {}
+    }
+    lines
 }
 
 /// `STORAGE REBALANCE [DRY RUN]`.
@@ -76,7 +159,9 @@ pub async fn rebalance(database: &Arc<Database>, dry_run: bool) -> Result<Vec<St
     let plan = plan(database, pool).await;
 
     if plan.is_empty() {
-        return Ok(vec!["nothing to move: every table is where the policy would put it".to_string()]);
+        return Ok(vec![
+            "nothing to move: every table is where the policy would put it".to_string(),
+        ]);
     }
 
     let total: u64 = plan.iter().map(|m| m.bytes).sum();
@@ -101,7 +186,33 @@ pub async fn rebalance(database: &Arc<Database>, dry_run: bool) -> Result<Vec<St
         // move is individually atomic — see `Database::move_table_to` — so
         // stopping leaves a consistent database with part of the plan applied,
         // and the next `STORAGE REBALANCE` re-plans from where it got to.
-        match database.move_table_to(&step.table, &step.to).await {
+        // ACCESS EXCLUSIVE per table, as `move_table` takes it, and given
+        // back as soon as that table's move is done (`MoveRelease`), so a
+        // table already moved is not held while the rest of the plan copies.
+        //
+        // No later step needs an earlier table still exclusive: each move is
+        // complete and durable on its own (the copy is synced, and the flip,
+        // `pin_backend`, persists the placement file before it returns), the
+        // plan was fixed above from sizes read once, and no step reads or
+        // writes another step's table. A writer growing a moved table only
+        // makes the fixed plan's free-space figures stale, as any concurrent
+        // write between two REBALANCE statements would.
+        let release = MoveRelease::before(database, &step.table);
+        let outcome = match database
+            .lock_table(
+                &step.table,
+                crate::core::mvcc::owner::ensure(),
+                crate::core::mvcc::table_locks::TableMode::AccessExclusive,
+            )
+            .await
+        {
+            Ok(()) => database
+                .move_table_to_backend(&step.table, &TableBackend::Directory(step.to.clone()))
+                .await,
+            Err(e) => Err(std::io::Error::other(e)),
+        };
+        drop(release);
+        match outcome {
             Ok(bytes) => {
                 moved += 1;
                 moved_bytes = moved_bytes.saturating_add(bytes);
@@ -120,8 +231,246 @@ pub async fn rebalance(database: &Arc<Database>, dry_run: bool) -> Result<Vec<St
         }
     }
 
-    lines.push(format!("{} table(s) moved, {}", moved, human_bytes(moved_bytes)));
+    lines.push(format!(
+        "{} table(s) moved, {}",
+        moved,
+        human_bytes(moved_bytes)
+    ));
     Ok(lines)
+}
+
+/// One partition's move in a [`rebalance_partitions`] plan.
+struct PartitionMove {
+    table: String,
+    pid: u32,
+    from: String,
+    to: String,
+    bytes: u64,
+    reason: &'static str,
+}
+
+fn describe_partition(step: &PartitionMove) -> String {
+    format!(
+        "{} partition {} ({}) {} -> {}: {}",
+        step.table,
+        step.pid,
+        human_bytes(step.bytes),
+        step.from,
+        step.to,
+        step.reason
+    )
+}
+
+/// `STORAGE REBALANCE PARTITIONS [DRY RUN]` (docs/partitioning.md §6.3): the
+/// whole-table rebalance's plan over every partitioned table's materialized
+/// partitions. Each partition on a location that no longer takes tables is
+/// evacuated to the roomiest one that does; under the round-robin policy,
+/// partitions then move one at a time from the location holding the most to
+/// the one holding the fewest, smallest first, until no two differ by more
+/// than one. Free space is taken off as the plan grows and no move takes a
+/// location below the floor. Sizes are the partitions' as `SHOW PARTITIONS`
+/// reads them, read once.
+///
+/// Each move is a `MOVE PARTITION` reshape (`ReshapeOp::MovePid`), under
+/// ACCESS EXCLUSIVE on its table given back after it, one at a time in the
+/// plan's order. The first failure stops the run, the moves before it kept;
+/// planning again resumes. A moved partition is a new pid, which a later plan
+/// names.
+pub async fn rebalance_partitions(database: &Arc<Database>, dry_run: bool) -> Result<Vec<String>, String> {
+    let pool = &database.storage;
+    if pool.root().is_none() {
+        return Err("this database is in memory and has no storage locations".to_string());
+    }
+    let plan = plan_partitions(database, pool).await?;
+    if plan.is_empty() {
+        return Ok(vec!["nothing to move: every partition is where the policy would put it".to_string()]);
+    }
+    let total: u64 = plan.iter().map(|m| m.bytes).sum();
+    if dry_run {
+        let mut lines = vec![format!("{} partition(s), {} would move:", plan.len(), human_bytes(total))];
+        lines.extend(plan.iter().map(describe_partition));
+        lines.push("run STORAGE REBALANCE PARTITIONS without DRY RUN to do it".to_string());
+        return Ok(lines);
+    }
+    let mut lines = Vec::with_capacity(plan.len() + 1);
+    let (mut moved, mut moved_bytes) = (0usize, 0u64);
+    for step in &plan {
+        let release = MoveRelease::before(database, &step.table);
+        let outcome = match database
+            .lock_table(
+                &step.table,
+                crate::core::mvcc::owner::ensure(),
+                crate::core::mvcc::table_locks::TableMode::AccessExclusive,
+            )
+            .await
+        {
+            Ok(()) => database
+                .reshape_partitioned(
+                    &step.table,
+                    &crate::core::partition::reshape::ReshapeOp::MovePid { pid: step.pid, to: step.to.clone() },
+                )
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        drop(release);
+        match outcome {
+            Ok(_) => {
+                moved += 1;
+                moved_bytes = moved_bytes.saturating_add(step.bytes);
+                lines.push(format!("moved {}", describe_partition(step)));
+            }
+            Err(e) => {
+                lines.push(format!("stopped at {} partition {}: {}", step.table, step.pid, e));
+                lines.push(format!(
+                    "{} of {} partition(s) moved ({}); run STORAGE REBALANCE PARTITIONS again once that is fixed",
+                    moved,
+                    plan.len(),
+                    human_bytes(moved_bytes)
+                ));
+                return Ok(lines);
+            }
+        }
+    }
+    lines.push(format!("{} partition(s) moved, {}", moved, human_bytes(moved_bytes)));
+    Ok(lines)
+}
+
+/// [`rebalance_partitions`]'s plan, moving nothing.
+async fn plan_partitions(database: &Arc<Database>, pool: &StorageManager) -> Result<Vec<PartitionMove>, String> {
+    let reports = pool.locations();
+    let key = |path: &str| crate::core::partition::files::dir_key(path);
+    // Every materialized partition, where it is and how big; sorted, so a
+    // DRY RUN and the run after it plan the same moves.
+    let mut parts: Vec<(String, u32, String, u64)> = Vec::new();
+    let mut tables: Vec<_> = database.partitioned_tables_all();
+    tables.sort_by(|a, b| a.name().cmp(b.name()));
+    for table in &tables {
+        let listed = table.partitions().await.map_err(|e| format!("{}: {e}", table.name()))?;
+        for p in listed {
+            if p.state != "materialized" {
+                continue;
+            }
+            let Some(at) = p.location else { continue };
+            // On a key/value store (docs/kv-partitions.md §1): not on any
+            // disk of the pool, so nothing to balance, and evacuating it to
+            // one would undo its placement.
+            if crate::core::partition::store::store_spec(&at).is_some() {
+                continue;
+            }
+            parts.push((table.name().to_string(), p.pid, at, p.bytes));
+        }
+    }
+    let usable: Vec<String> = reports
+        .iter()
+        .filter(|r| r.location.enabled && r.location.role == LocationRole::Primary)
+        .map(|r| r.location.path.clone())
+        .collect();
+    if usable.is_empty() {
+        return Ok(Vec::new());
+    }
+    // A partition's directory as the pool names the location it is in.
+    let named = |dir: &str| reports.iter().map(|r| r.location.path.clone()).find(|p| key(p) == key(dir));
+    let floor = pool.min_free_bytes();
+    let mut free: std::collections::HashMap<String, u64> = reports
+        .iter()
+        .map(|r| (r.location.path.clone(), r.available_bytes.unwrap_or(u64::MAX)))
+        .collect();
+    let mut at: Vec<String> = parts.iter().map(|(_, _, dir, _)| named(dir).unwrap_or_else(|| dir.clone())).collect();
+    let mut counts: std::collections::HashMap<String, usize> =
+        usable.iter().map(|p| (p.clone(), at.iter().filter(|a| *a == p).count())).collect();
+    let mut plan: Vec<PartitionMove> = Vec::new();
+    let mut planned = vec![false; parts.len()];
+    let take = |i: usize, to: String, reason: &'static str, at: &mut Vec<String>, free: &mut std::collections::HashMap<String, u64>, counts: &mut std::collections::HashMap<String, usize>, plan: &mut Vec<PartitionMove>| {
+        let (table, pid, _, bytes) = &parts[i];
+        let from = at[i].clone();
+        if let Some(space) = free.get_mut(&to) {
+            *space = space.saturating_sub(*bytes);
+        }
+        if let Some(space) = free.get_mut(&from) {
+            *space = space.saturating_add(*bytes);
+        }
+        *counts.entry(to.clone()).or_insert(0) += 1;
+        if let Some(c) = counts.get_mut(&from) {
+            *c = c.saturating_sub(1);
+        }
+        at[i] = to.clone();
+        plan.push(PartitionMove { table: table.clone(), pid: *pid, from, to, bytes: *bytes, reason });
+    };
+
+    // 1. Evacuate.
+    for i in 0..parts.len() {
+        if usable.iter().any(|p| *p == at[i]) {
+            continue;
+        }
+        let Some(target) = roomiest(&usable, &free, parts[i].3, floor) else { continue };
+        planned[i] = true;
+        take(i, target, "its location no longer takes tables", &mut at, &mut free, &mut counts, &mut plan);
+    }
+
+    // 2. The policy.
+    if matches!(pool.policy(), PlacementPolicy::RoundRobin) {
+        for _ in 0..parts.len() {
+            let Some(fullest) = usable.iter().max_by_key(|p| counts.get(*p).copied().unwrap_or(0)).cloned() else { break };
+            let Some(emptiest) = usable.iter().min_by_key(|p| counts.get(*p).copied().unwrap_or(0)).cloned() else { break };
+            if counts.get(&fullest).copied().unwrap_or(0) <= counts.get(&emptiest).copied().unwrap_or(0) + 1 {
+                break;
+            }
+            // The smallest partition there not moved yet: evening out a count
+            // costs as little copying as it can.
+            let candidate = (0..parts.len())
+                .filter(|&i| !planned[i] && at[i] == fullest && fits(&emptiest, &free, parts[i].3, floor))
+                .min_by_key(|&i| (parts[i].3, parts[i].0.clone(), parts[i].1));
+            let Some(i) = candidate else { break };
+            planned[i] = true;
+            take(i, emptiest, "the round-robin policy spreads partitions", &mut at, &mut free, &mut counts, &mut plan);
+        }
+    }
+    Ok(plan)
+}
+
+/// Gives one moved table's ACCESS EXCLUSIVE back when dropped, unless the
+/// statement's owner held it before the move (a block that locked the table
+/// itself keeps it, and keeps any other mode it held: the manager holds a
+/// mode set per owner). Taken before the request, so a failed or cancelled
+/// wait gives back nothing it did not get.
+struct MoveRelease<'a> {
+    database: &'a Database,
+    owner: Option<crate::core::mvcc::table_locks::LockOwner>,
+    table: String,
+}
+
+impl<'a> MoveRelease<'a> {
+    fn before(database: &'a Database, table: &str) -> Self {
+        use crate::core::mvcc::table_locks::TableMode;
+        let key = database.lock_key(table).into_owned();
+        let owner = crate::core::mvcc::owner::ensure()
+            .map(|o| o.owner)
+            .filter(|&o| {
+                !database
+                    .row_locks
+                    .table_locks()
+                    .holds(o, &key)
+                    .contains(TableMode::AccessExclusive)
+            });
+        MoveRelease {
+            database,
+            owner,
+            table: key,
+        }
+    }
+}
+
+impl Drop for MoveRelease<'_> {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner {
+            self.database.row_locks.table_locks().release_mode(
+                owner,
+                &self.table,
+                crate::core::mvcc::table_locks::TableMode::AccessExclusive,
+            );
+        }
+    }
 }
 
 /// Works out what should move, without moving anything.
@@ -135,9 +484,26 @@ async fn plan(database: &Arc<Database>, pool: &StorageManager) -> Vec<Move> {
     let placements: std::collections::HashMap<String, String> =
         pool.placements().into_iter().collect();
     let mut tables: Vec<(String, String, u64)> = Vec::new();
-    for entry in database.tables.iter() {
-        let name = entry.key().clone();
-        let at = placements.get(&name).cloned().unwrap_or_else(|| root.clone());
+    // A metadata walk: names and schemas, no table and no lock (a plan moves
+    // nothing; each move takes its own path).
+    for name in database.table_names() {
+        // A partitioned table's shell has no files of its own, so it would
+        // sort as the smallest table and be picked first, and its partitions
+        // are not in the placement map. They rebalance with REBALANCE
+        // PARTITIONS, a later version's.
+        if database.is_partitioned(&name) || database.schema_view(&name).is_none_or(|v| v.is_shell()) {
+            continue;
+        }
+        let at = match placements.get(&name) {
+            // Only a directory placement is a rebalance candidate: the others
+            // occupy no disk the policy is balancing and cannot be moved onto
+            // one.
+            Some(spec) => match super::TableBackend::parse(spec).directory() {
+                Some(path) => path.to_string(),
+                None => continue,
+            },
+            None => root.clone(),
+        };
         let bytes = database.table_bytes(&name).await;
         tables.push((name, at, bytes));
     }
@@ -163,20 +529,32 @@ async fn plan(database: &Arc<Database>, pool: &StorageManager) -> Vec<Move> {
     // not both aim at the same headroom.
     let mut free: std::collections::HashMap<String, u64> = reports
         .iter()
-        .map(|r| (r.location.path.clone(), r.available_bytes.unwrap_or(u64::MAX)))
+        .map(|r| {
+            (
+                r.location.path.clone(),
+                r.available_bytes.unwrap_or(u64::MAX),
+            )
+        })
         .collect();
     let mut counts: std::collections::HashMap<String, usize> = usable
         .iter()
         .map(|path| {
-            (path.clone(), tables.iter().filter(|(_, at, _)| at == path).count())
+            (
+                path.clone(),
+                tables.iter().filter(|(_, at, _)| at == path).count(),
+            )
         })
         .collect();
 
     let mut plan: Vec<Move> = Vec::new();
-    let mut current: std::collections::HashMap<String, String> =
-        tables.iter().map(|(name, at, _)| (name.clone(), at.clone())).collect();
-    let size: std::collections::HashMap<String, u64> =
-        tables.iter().map(|(name, _, bytes)| (name.clone(), *bytes)).collect();
+    let mut current: std::collections::HashMap<String, String> = tables
+        .iter()
+        .map(|(name, at, _)| (name.clone(), at.clone()))
+        .collect();
+    let size: std::collections::HashMap<String, u64> = tables
+        .iter()
+        .map(|(name, _, bytes)| (name.clone(), *bytes))
+        .collect();
 
     // -- 1. evacuate ------------------------------------------------------
     for (name, at, bytes) in tables.iter() {
@@ -186,13 +564,19 @@ async fn plan(database: &Arc<Database>, pool: &StorageManager) -> Vec<Move> {
         let Some(target) = roomiest(&usable, &free, *bytes, floor) else {
             continue;
         };
-        apply(&mut plan, &mut free, &mut counts, &mut current, Move {
-            table: name.clone(),
-            from: at.clone(),
-            to: target,
-            bytes: *bytes,
-            reason: "its location no longer takes tables",
-        });
+        apply(
+            &mut plan,
+            &mut free,
+            &mut counts,
+            &mut current,
+            Move {
+                table: name.clone(),
+                from: at.clone(),
+                to: target,
+                bytes: *bytes,
+                reason: "its location no longer takes tables",
+            },
+        );
     }
 
     // -- 2. policy --------------------------------------------------------
@@ -203,11 +587,15 @@ async fn plan(database: &Arc<Database>, pool: &StorageManager) -> Vec<Move> {
             // emptiest until they are within one of each other. Bounded by the
             // table count so a pathological case cannot loop.
             for _ in 0..tables.len() {
-                let Some(fullest) = usable.iter().max_by_key(|p| counts.get(*p).copied().unwrap_or(0))
+                let Some(fullest) = usable
+                    .iter()
+                    .max_by_key(|p| counts.get(*p).copied().unwrap_or(0))
                 else {
                     break;
                 };
-                let Some(emptiest) = usable.iter().min_by_key(|p| counts.get(*p).copied().unwrap_or(0))
+                let Some(emptiest) = usable
+                    .iter()
+                    .min_by_key(|p| counts.get(*p).copied().unwrap_or(0))
                 else {
                     break;
                 };
@@ -232,13 +620,19 @@ async fn plan(database: &Arc<Database>, pool: &StorageManager) -> Vec<Move> {
                 }
                 let from = fullest.clone();
                 let to = emptiest.clone();
-                apply(&mut plan, &mut free, &mut counts, &mut current, Move {
-                    table: candidate,
-                    from,
-                    to,
-                    bytes,
-                    reason: "evening out the table count",
-                });
+                apply(
+                    &mut plan,
+                    &mut free,
+                    &mut counts,
+                    &mut current,
+                    Move {
+                        table: candidate,
+                        from,
+                        to,
+                        bytes,
+                        reason: "evening out the table count",
+                    },
+                );
             }
         }
         PlacementPolicy::FreeSpace => {
@@ -263,18 +657,27 @@ async fn plan(database: &Arc<Database>, pool: &StorageManager) -> Vec<Move> {
                     break;
                 };
                 let bytes = size.get(&candidate).copied().unwrap_or(0);
-                let elsewhere: Vec<String> =
-                    usable.iter().filter(|path| **path != tight).cloned().collect();
+                let elsewhere: Vec<String> = usable
+                    .iter()
+                    .filter(|path| **path != tight)
+                    .cloned()
+                    .collect();
                 let Some(target) = roomiest(&elsewhere, &free, bytes, floor) else {
                     break;
                 };
-                apply(&mut plan, &mut free, &mut counts, &mut current, Move {
-                    table: candidate,
-                    from: tight,
-                    to: target,
-                    bytes,
-                    reason: "its location is below the free-space floor",
-                });
+                apply(
+                    &mut plan,
+                    &mut free,
+                    &mut counts,
+                    &mut current,
+                    Move {
+                        table: candidate,
+                        from: tight,
+                        to: target,
+                        bytes,
+                        reason: "its location is below the free-space floor",
+                    },
+                );
             }
         }
     }
@@ -324,12 +727,7 @@ fn roomiest(
 /// A location whose free space could not be determined is treated as roomy: the
 /// alternative is refusing every move on a platform with no `statvfs`, which
 /// would make the whole surface unusable there rather than merely unguided.
-fn fits(
-    path: &str,
-    free: &std::collections::HashMap<String, u64>,
-    bytes: u64,
-    floor: u64,
-) -> bool {
+fn fits(path: &str, free: &std::collections::HashMap<String, u64>, bytes: u64, floor: u64) -> bool {
     match free.get(path) {
         Some(&space) if space == u64::MAX => true,
         Some(&space) => space.saturating_sub(bytes) >= floor,

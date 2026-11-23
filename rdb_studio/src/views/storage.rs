@@ -422,13 +422,36 @@ fn locations<'a>(
         super::GridColumn::new("used", "USED", 68.0).right(),
     ];
     if manageable {
-        columns.push(super::GridColumn::new("actions", "", 330.0));
+        columns.push(super::GridColumn::new("actions", "", 330.0).unsortable());
     }
     let widths = super::column_widths(&layout, &columns);
     let total = super::grid_total(&widths);
 
+    let mut locations: Vec<&StorageLocation> = snapshot.locations.iter().collect();
+    super::sort_rows(&layout, &mut locations, |location, column| match column {
+        "state" => super::SortKey::text(location.health(floor).label()),
+        "role" => super::SortKey::text(&location.role),
+        "weight" => super::SortKey::number(location.weight as f64),
+        "tables" => super::SortKey::number(location.tables as f64),
+        // A directory whose free space the server could not read sorts as
+        // missing rather than as empty: "unknown" and "nothing left" are the
+        // opposite answers to the question this column is asked.
+        "free" if location.space_known() => {
+            super::SortKey::number(location.available_bytes as f64)
+        }
+        "total" if location.space_known() => {
+            super::SortKey::number(location.total_bytes as f64)
+        }
+        "free" | "total" => super::SortKey::Empty,
+        "used" => match location.used_fraction() {
+            Some(fraction) => super::SortKey::number(fraction),
+            None => super::SortKey::Empty,
+        },
+        _ => super::SortKey::text(&location.path),
+    });
+
     let mut body = column![].spacing(0);
-    for (index, location) in snapshot.locations.iter().enumerate() {
+    for (index, location) in locations.into_iter().enumerate() {
         let health = location.health(floor);
         let colour = match health {
             LocationHealth::Healthy => theme::OK,
@@ -746,8 +769,15 @@ fn placements<'a>(
     let widths = super::column_widths(&layout, &columns);
     let total = super::grid_total(&widths);
 
+    let mut placements: Vec<&TablePlacement> = snapshot.placements.iter().collect();
+    super::sort_rows(&layout, &mut placements, |placement, column| match column {
+        "location" => super::SortKey::text(&placement.location),
+        "mirrored" => super::SortKey::text(if placement.mirrored { "mirrored" } else { "not yet" }),
+        _ => super::SortKey::text(&placement.table),
+    });
+
     let mut body = column![].spacing(0);
-    for (index, placement) in snapshot.placements.iter().enumerate() {
+    for (index, placement) in placements.into_iter().enumerate() {
         let mut cells = vec![
             super::grid_cell(placement.table.clone(), false, theme::TEXT),
             super::grid_cell(placement.location.clone(), false, theme::TEXT_DIM),

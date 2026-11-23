@@ -149,10 +149,26 @@ already open are mirrored from the next restart — their providers were built
 before the location existed and cannot be swapped underneath a live table. The
 `STORAGE ADD LOCATION` output says so.
 
+## S3 backups
+
+Snapshots and the archived log cover every primary location, not only the
+database directory — each location's files are copied flat and its log is
+archived as a stream of its own. A restore onto the source directory puts each
+location's files back on its own disk (which must be empty); a restore anywhere
+else puts them in `pool-location-<hash>` inside the restored directory, because
+the source's disks are still the source's. Backup locations are not copied: they
+mirror a primary that is. See [s3-backup.md §10.13](s3-backup.md). Snapshots
+taken before this (2026-10) hold only the database directory, and their
+restores drop the tables on other disks, with a warning naming them.
+
 ## Moving tables
 
-`STORAGE MOVE TABLE <name> TO '<path>'` copies, flips the placement, then
-deletes the originals. Every window between those steps leaks rather than loses:
+`STORAGE MOVE TABLE <name> TO '<spec>'` copies, flips the placement, then
+deletes the originals. `<spec>` is a backend, not only a directory — `memory:`
+and `kv:<store>` are the others, and the same statement therefore converts a
+table between them. See [kv-storage.md](kv-storage.md). Everything below applies
+to all of them: the copy is provider to provider and never reads a directory
+entry. Every window between those steps leaks rather than loses:
 
 - crash after the copy — the placement still names the old directory, the table
   opens from it unchanged, and the new copies are orphans. `db_storage.cfg` is
@@ -164,6 +180,33 @@ deletes the originals. Every window between those steps leaks rather than loses:
 The flip is a rename over `db_storage.cfg`, so there is no state in which it is
 half-applied. That is the whole reason the pool file is rewritten atomically
 rather than appended to.
+
+### What a move used to lose
+
+Two defects, both fixed, both silent, and both leaving a table that reads back
+perfectly:
+
+- **Three sidecars were not in the copy list.** `_schema_CHK.db`,
+  `_schema_GEN.db` and `_schema_PIX.db` were left behind by every move and every
+  rename, so the table arrived without its CHECK constraints, its generated
+  columns or its JSON path indexes — and the files stayed under the old name for
+  the next table to inherit. The list is guarded by a test that compares it
+  against the files a real table produces; the guard missed these because
+  several sidecars are only opened when a schema is *loaded*, and it was looking
+  at a table that had been created and never reopened.
+- **The copy could read another file's bytes.** The per-thread mmap cache in
+  `file_sync` was keyed on the address of the provider's mapping handle. An
+  address is unique only among the objects alive at one moment, so opening a
+  table's files one after another — dropping each before opening the next, which
+  is exactly what a copy does — let the allocator hand a new provider the block
+  a dropped one had used, and its reads were answered from the dropped
+  provider's mapping. The symptom was a sidecar with the right length and
+  another sidecar's contents: a moved table whose CHECK constraint no longer
+  fired, and no error anywhere.
+
+**If a table was moved or renamed on an earlier build, check it.** The
+constraints are gone from that table's schema, not merely unenforced at runtime,
+so a restart does not bring them back — re-declare them with `ALTER TABLE`.
 
 The table handle is removed from the map before the files are read, so its
 maintenance task stops before the copy starts — a background flush landing

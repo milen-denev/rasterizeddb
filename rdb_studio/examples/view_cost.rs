@@ -25,6 +25,7 @@ fn rss_kib() -> u64 {
 
 fn grid(rows: usize, columns: usize) -> Grid {
     Grid {
+        total: None,
         columns: (0..columns).map(|c| format!("column_{c}")).collect(),
         rows: (0..rows)
             .map(|r| {
@@ -69,7 +70,12 @@ async fn main() {
         user: user.into(),
         password: password.into(),
         save_password: false,
+        password_store: None,
         tls: TlsMode::Disable,
+        transport: rdb_studio::model::Transport::Wire,
+        login: rdb_studio::model::NativeLogin::Password,
+        verify_server: false,
+        ca_file: String::new(),
     })
     .await
     .expect("could not connect");
@@ -84,6 +90,9 @@ async fn main() {
     studio.tables = (0..60)
         .map(|i| rdb_studio::model::TableInfo {
             name: format!("table_{i}"),
+            // Every third one in memory, so the badge is measured in both of
+            // its states rather than only the common one.
+            storage: if i % 3 == 0 { "memory".into() } else { "file".into() },
             row_slots: 1000 + i,
             columns: 12,
             data_bytes: 4096 * (i + 1),
@@ -112,6 +121,7 @@ async fn main() {
             hot: i % 3 != 0,
             set_with: "ALTER SYSTEM SET, then pg_reload_conf()".into(),
             help: "a sentence about what this setting does".into(),
+            ..Default::default()
         })
         .collect();
     for series in 0..14 {

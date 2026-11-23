@@ -1,11 +1,9 @@
 use cacheguard::CacheGuard;
-use log::{error, info};
 use itertools::Itertools;
+use log::{error, info};
 use smallvec::SmallVec;
 use std::io::Result;
-use std::{
-    sync::atomic::{AtomicBool, AtomicU64},
-};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use rclite::Arc;
 
@@ -23,14 +21,17 @@ use crate::core::{
 };
 
 use crate::core::row::row::{ColumnFetchingData, ColumnWritePayload};
+use crate::core::tokenizer::query_tokenizer::Token;
 
 use crate::core::db_type::DbType;
-use crate::core::row::schema::SchemaCalculator;
-use crate::core::filter::{CandidateBitmap, FilterConfig, TableFilters, is_indexable, sarg};
-use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+use crate::core::filter::{CandidateBitmap, TableFilters, is_indexable, sarg};
+use crate::core::index_store::file_gate::{FileGate, FltAtOpen};
+use crate::core::index_store::gate::{self, Proof, WriteTicket};
 use crate::core::mvcc::TransactionManager;
 use crate::core::mvcc::Visibility;
 use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX, TxId};
+use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+use crate::core::row::schema::SchemaCalculator;
 use crate::core::vacuum::{
     CompactReport, FreeSpace, ReadTicket, ReaderRegistry, VacuumConfig, VacuumReport,
     VacuumService, VacuumStats, VersionHorizon, collect_live, plan_row_moves,
@@ -49,11 +50,24 @@ const ID_RESERVATION_CHUNK: u64 = 1024;
 
 pub struct Table<S: StorageIO> {
     pub schema: TableSchema,
-    pub io_pointers: Arc<S>,
-    pub io_rows: Arc<S>,
+    /// Set when this table was *opened* and its stored schema could not be
+    /// read, so `schema` above is a fabricated empty one rather than the
+    /// table's own.
+    ///
+    /// A caller must not put such a table into the live map: every column is
+    /// missing, so `SELECT *` succeeds and returns rows with no fields, which
+    /// reads as "this table has no columns" rather than as a failure. The
+    /// database already refuses to open a table whose *backend* is missing, for
+    /// the same reason and with the same remedy — leave it out, and let the
+    /// query say the table does not exist.
+    pub schema_unreadable: bool,
     pub io_schema: Arc<S>,
-    /// Sidecar holding the persisted filter checkpoint.
-    pub io_filters: Arc<S>,
+    /// Everything that reads or writes rows. `None` on a partition shell
+    /// ([`Table::partition_shell`]), whose rows live in its partitions: every
+    /// data method goes through [`Table::data`], which refuses there, so a
+    /// path not yet taught about partitioning fails instead of answering from
+    /// an empty table.
+    data: Option<TableData<S>>,
     /// Updates that wrote only the assigned columns rather than re-encoding the
     /// whole row. Diagnostic: the ratio against rows updated says how much of a
     /// workload the cheap path is actually reaching.
@@ -65,6 +79,11 @@ pub struct Table<S: StorageIO> {
     /// reclamation service, which is spawned before versioning can be wired, so
     /// it has to be able to pick it up afterwards.
     versions: StdArc<ArcSwapOption<TransactionManager>>,
+    /// The highest transaction id that has written this table (`note_write`,
+    /// before any of its rows): what a statement that read the table asks
+    /// to know whether a commit since its snapshot could have changed what
+    /// it read (`statement_snapshot::target_visibility`).
+    max_writer: StdArc<AtomicU64>,
     /// Transaction bound at the last sweep that cleared filter fingerprints.
     /// Shared with the service so both agree on what is already cleared.
     cleared_below: StdArc<CacheGuard<AtomicU64>>,
@@ -81,19 +100,19 @@ pub struct Table<S: StorageIO> {
     /// are table-level would otherwise run the check outside the lock — two
     /// concurrent inserts would each look, each find nothing, and each write.
     has_unique: bool,
-    /// Sidecar holding the row-id sequence.
-    ///
-    /// The id counter used to be recovered from the last pointer record, which
-    /// worked only while ids ascended with file order. They no longer do: a
-    /// relocated row keeps its id, so the largest id can sit anywhere. Reading
-    /// the last record would then hand out ids that are already in use.
-    pub io_sequence: Arc<S>,
-    /// Highest id reserved on disk. Ids past this need a fresh reservation
-    /// before they are handed out.
-    id_reserved_upto: CacheGuard<AtomicU64>,
+    /// Every cell of a legacy `CHAR` column under a UNIQUE or PRIMARY KEY is
+    /// in its one stored form (`value_codec::legacy_char_canonical`), as the
+    /// open's scan found (`executor::scan_legacy_char_keys`). New writes store
+    /// only that form, so while this holds a key's stored bytes are its value
+    /// and the uniqueness check may find candidates through the index and the
+    /// filter; while it does not (an older build's `'a '` or `' '` cell, or a
+    /// table not scanned: any instance a reload makes), it walks the table.
+    /// Set once, before the instance is shared.
+    pub(crate) legacy_keys_canonical: bool,
+    /// The keys over a legacy `CHAR` column the open found holding two rows
+    /// of one value, each said as a sentence (`SHOW CHECKS` lists them).
+    pub(crate) legacy_char_duplicates: Vec<(String, String)>,
     pub hard_locked: CacheGuard<AtomicBool>,
-    pub len: CacheGuard<AtomicU64>,
-    pub last_row_id: CacheGuard<AtomicU64>,
     pub concurrent_processor: ConcurrentProcessor,
     /// Name this table answers to in the process-wide query cache.
     ///
@@ -107,20 +126,16 @@ pub struct Table<S: StorageIO> {
     /// Unqualified until [`Table::scope_cache_to_database`] says otherwise, so a
     /// table built outside a `Database` — tests, benchmarks — is unaffected.
     cache_scope: String,
-    /// Bit-level filter index. `None` when disabled or when no column of this
-    /// table has a filterable type.
-    ///
-    /// Shared with the maintenance task, which owns backfilling and
-    /// checkpointing so neither ever runs on a caller's thread.
-    pub filters: Option<StdArc<TableFilters>>,
-    /// Byte ranges of the rows file that deleted or relocated rows left behind
-    /// and the write path may reuse. Populated by the reclamation service.
-    pub free_space: StdArc<FreeSpace>,
-    /// Epoch tickets for in-flight reads, so reclamation can tell which queries
-    /// predate a batch of freed extents.
-    pub readers: StdArc<ReaderRegistry>,
-    /// Running totals for the reclamation service.
-    pub vacuum_stats: StdArc<VacuumStats>,
+    /// This instance's number among every `Table` the process has opened
+    /// (its first cache generation, never reused): appended to
+    /// `cache_scope`, so a second instance over the same files (a
+    /// partition closed and opened again, a reload, `DROP` then `CREATE`)
+    /// never answers from the first's cache entries. A generation alone
+    /// cannot keep them apart: each instance climbs from its own floor by
+    /// one per write, so a later instance reaches stamps an earlier one
+    /// left (phase 3 P5b review: 40 of 40 probes of a reopened partition
+    /// were served the old instance's pointers).
+    cache_instance: u64,
     /// Serializes the mutating half of `DELETE` and `UPDATE`.
     ///
     /// Both statements scan for matches and then rewrite the pointer records
@@ -130,7 +145,45 @@ pub struct Table<S: StorageIO> {
     /// concurrent; only the rewrite is serialized, and every rewrite re-reads
     /// the pointer record under the lock so a stale snapshot is caught rather
     /// than acted on.
-    write_lock: tokio::sync::Mutex<()>,
+    ///
+    /// Held exclusively by `DELETE`, by an `UPDATE` and by the aborted-write
+    /// sweep. A *point* update, one naming its row by a unique key, holds it
+    /// shared together with that key's stripe of `unique_lock`: every other
+    /// writer of a row with that key holds the same stripe or this lock
+    /// exclusively, so the guarantee above holds for the rows it can match,
+    /// and point updates of different keys run side by side.
+    write_lock: StdArc<tokio::sync::RwLock<()>>,
+    /// Makes a uniqueness check atomic with the write it guards.
+    ///
+    /// Taken by every `INSERT` into a table with a UNIQUE constraint, and by an
+    /// `UPDATE` of such a table for its rewrite — but not for its scan.
+    ///
+    /// Striped by key (`KeyLocks`): an insert takes the stripe of each key it
+    /// writes, so inserts of different keys no longer take turns. An `UPDATE`
+    /// that assigns a key column takes every stripe, since it learns its rows'
+    /// keys only as it rewrites them; one that assigns none takes none. A
+    /// point update takes its key's stripe *before* its scan and the stripes
+    /// of the row's other keys before its rewrite.
+    ///
+    /// It used to be `write_lock`, which an `UPDATE` holds across its whole
+    /// scan. A multi-row `INSERT` takes the lock once per tuple, so each tuple
+    /// queued behind a full update scan: under one session running 500-row
+    /// range updates, three inserters spent ~87% of their time waiting for it,
+    /// and a 50,000-row statement sat for minutes. An insert does not need to
+    /// exclude the scan — on a table without a constraint it never did.
+    ///
+    /// A rewrite that assigns no key column does not take it either, though it
+    /// has a window an insert's check must not fall into. A relocated row's
+    /// new version gets its filter entry only once the batch is durable
+    /// (`PendingFilterOp`), while the old version keeps the value. A check
+    /// that sampled the filter in that window, then read the old version after
+    /// the update committed, would find neither version and admit a duplicate
+    /// of a key nobody changed. Holding every stripe across the rewrite closed
+    /// it, and starved inserts under a stream of range updates (11% of their
+    /// pace). The check closes it instead: a version deleted after its
+    /// snapshot makes it sample again (`Supersessions`). Order: `write_lock`,
+    /// then this.
+    unique_lock: StdArc<crate::core::row::key_locks::KeyLocks>,
     /// Held shared by every read and write, exclusively by full compaction.
     ///
     /// Incremental reclamation needs no such gate — it only ever hands out
@@ -138,7 +191,10 @@ pub struct Table<S: StorageIO> {
     /// other operation stopped, not merely drained: a query that started after
     /// the drain would still be holding a pointer that compaction is about to
     /// invalidate.
-    compaction_gate: tokio::sync::RwLock<()>,
+    compaction_gate: StdArc<tokio::sync::RwLock<()>>,
+    /// This table's place in the forget registry, set when versioning is
+    /// enabled; shared with the vacuum service, which advances it.
+    forget: StdArc<std::sync::OnceLock<crate::core::mvcc::transaction::ForgetHandle>>,
     /// Bumped once per completed `DELETE` or `UPDATE`, under the write lock.
     ///
     /// Lets a statement tell whether anything could have changed under it
@@ -161,6 +217,14 @@ pub struct Table<S: StorageIO> {
     /// every query loads to validate a cache entry: readers and writers of two
     /// deliberately separated values contending as if they were one.
     write_generation: StdArc<CacheGuard<AtomicU64>>,
+    /// Row versions the write path has stamped dead: one per row a `DELETE`
+    /// removed and per row an `UPDATE` replaced. The vacuum service sweeps only
+    /// once enough have accrued since its last sweep
+    /// (`VacuumConfig::sweep_threshold`), rather than on every mutation.
+    ///
+    /// Plain, not padded: it is bumped once per statement beside
+    /// `write_generation`, and padding contended counters measured a loss here.
+    dead_stamps: StdArc<AtomicU64>,
     /// Bumped once per committed mutation, and stamped onto every query-cache
     /// entry the table produces. A reader compares the two, so a mutation
     /// strands every entry built before it — including one from a scan still in
@@ -175,6 +239,438 @@ pub struct Table<S: StorageIO> {
     filters_ready: StdArc<CacheGuard<AtomicBool>>,
     /// Drop signal for the maintenance task.
     maintenance_alive: StdArc<CacheGuard<AtomicBool>>,
+    /// Wakes the providers' service task when the instance is dropped, so
+    /// it lets go of the providers' descriptors at once rather than at its
+    /// next poll of `maintenance_alive` ([`spawn_provider_services`]).
+    services_released: StdArc<tokio::sync::Notify>,
+    /// Held by the reclamation service for each piece of work it does on
+    /// this instance, and by [`Table::vacuum_now`]: what [`Table::retire`]
+    /// waits on, so a retired instance has no vacuum still writing through
+    /// its providers (§7 step 2(b), RV14).
+    maintenance_tick: StdArc<tokio::sync::Mutex<()>>,
+    /// The file set's write gate (docs/persistent-indexes.md §2, slice B11):
+    /// one word per file set, shared by every instance of this table, its
+    /// map slot and every ticket on it ([`FileGate::open`]). Every write path
+    /// takes a ticket on it before its first
+    /// in-memory index or filter mutation and its first data-file write
+    /// (see [`Table::family`]).
+    gate: StdArc<FileGate>,
+    /// A partition opened `MaintenanceMode::External` (docs/partitioning.md
+    /// §7.2, §7.3): the slot's watch every write path enters before its
+    /// ticket ([`Table::enter_write`]), and the maintenance its database's
+    /// scheduler runs in place of this instance's own tasks. `None` for every
+    /// other table.
+    watch: Option<StdArc<crate::core::partition::maintenance::WriteWatch>>,
+    /// Owned here and held weakly by the scheduler, so a dropped instance
+    /// leaves its round; never read through this field.
+    #[allow(dead_code)]
+    external: Option<StdArc<table_maintenance::ExternalUnit<S>>>,
+    /// Phase 3 P5b-2b: set while a scan-only open's starts wait
+    /// ([`Table::ensure_full`]); shared with the unit, which takes no idle
+    /// checkpoint meanwhile.
+    scan_only: StdArc<AtomicBool>,
+    /// The starts a scan-only open deferred; run once, under this lock, by
+    /// the first [`Table::ensure_full`].
+    deferred_starts: parking_lot::Mutex<Vec<DeferredStart>>,
+}
+
+/// A table's row storage and what indexes it: the part a partition shell does
+/// not have. Reached only through [`Table::data`].
+pub(crate) struct TableData<S: StorageIO> {
+    pub(crate) io_pointers: Arc<S>,
+    pub(crate) io_rows: Arc<S>,
+    /// Where row ids come from. A plain table's own; every partition of one
+    /// logical table holds the same one, so ids are unique across the whole
+    /// table (§3.5, I12), which `locate_row_by_id` and the unique check's
+    /// `exclude_id` rely on.
+    pub(crate) ids: StdArc<IdSource<S>>,
+    pub(crate) len: CacheGuard<AtomicU64>,
+    /// A partition's range guard (§4.5); `None` on a plain table. Also what
+    /// marks a table as a partition.
+    pub(crate) guard: Option<crate::core::partition::guard::RangeGuard>,
+    /// Bit-level filter index. `None` when disabled or when no column of this
+    /// table has a filterable type.
+    ///
+    /// Shared with the maintenance task, which owns backfilling so it never
+    /// runs on a caller's thread. Persisted only as a snapshot's FILTER
+    /// section, at a clean point (docs/persistent-indexes.md §5, B14).
+    pub(crate) filters: Option<StdArc<TableFilters>>,
+    /// Secondary indexes: those `CREATE INDEX` declared, and the implicit ones
+    /// of `PRIMARY KEY` and `UNIQUE`. `None` when the table has none. See
+    /// [`crate::core::index`] for why they may only ever over-report.
+    pub(crate) indexes: Option<StdArc<crate::core::index::TableIndexes>>,
+    /// Byte ranges of the rows file that deleted or relocated rows left behind
+    /// and the write path may reuse. Populated by the reclamation service.
+    pub(crate) free_space: StdArc<FreeSpace>,
+    /// Epoch tickets for in-flight reads, so reclamation can tell which queries
+    /// predate a batch of freed extents.
+    pub(crate) readers: StdArc<ReaderRegistry>,
+    /// Running totals for the reclamation service.
+    pub(crate) vacuum_stats: StdArc<VacuumStats>,
+    /// What a seal of this instance reads (`table_seal`, B13).
+    pub(crate) seal: StdArc<table_seal::SealParts<S>>,
+}
+
+/// A row-id sequence: the counter ids are drawn from and its reservation on
+/// disk. A plain table owns one over its `_seq.db`; a partitioned table has
+/// one over `__pt_<uid>_ids.db`, shared by every partition (§3.5).
+///
+/// The counter used to be recovered from the last pointer record, which
+/// worked only while ids ascended with file order. They no longer do: a
+/// relocated row keeps its id, so the largest id can sit anywhere. Reading
+/// the last record would then hand out ids that are already in use.
+pub(crate) struct IdSource<S: StorageIO> {
+    /// The file holding the reservation: eight bytes, little-endian.
+    pub(crate) io: Arc<S>,
+    /// The next id to hand out.
+    pub(crate) last_row_id: CacheGuard<AtomicU64>,
+    /// Highest id reserved on disk. Ids past this need a fresh reservation
+    /// before they are handed out.
+    reserved_upto: CacheGuard<AtomicU64>,
+    /// Inserts between their reservation check and the id they take. Each
+    /// takes at most one, so the reservation must reach past the next id by
+    /// this many: two inserts checking at once both see the next id covered
+    /// and take it and the one after, and the second is not covered.
+    in_flight: AtomicU64,
+    /// Serialises raising the reservation, so it only ever goes up: two
+    /// writers could otherwise leave the smaller of their values on disk and
+    /// the larger in memory.
+    reserving: tokio::sync::Mutex<()>,
+}
+
+impl<S: StorageIO> IdSource<S> {
+    fn starting_at(io: Arc<S>, next: u64) -> Self {
+        IdSource {
+            io,
+            last_row_id: AtomicU64::new(next).into(),
+            // Everything up to the recovered value may already be in use, so
+            // the first insert reserves before it allocates.
+            reserved_upto: AtomicU64::new(next).into(),
+            in_flight: AtomicU64::new(0),
+            reserving: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// A plain table's sequence, by the rules it has always had: the
+    /// persisted reservation if there is one, else the last pointer's id
+    /// (exact only for a table written before the sequence existed, when ids
+    /// still ascended with file order, and such a table has no reservation to
+    /// honour), else 0.
+    async fn legacy(io: Arc<S>, last_pointer: Option<&RowPointer>) -> Self {
+        let next = match Self::load(&io).await {
+            Some(reserved) => reserved,
+            None => last_pointer.map_or(0, |p| p.row_id()),
+        };
+        Self::starting_at(io, next)
+    }
+
+    /// A partitioned table's sequence. A short or unreadable file is an
+    /// error, never a fallback (§3.5, I12): no partition's last record says
+    /// anything about the ids the others took. A missing file has to be
+    /// refused before the provider is built, since providers create.
+    // Called from `PartitionedTable` (S3b) on; until then only tests do.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn open_strict(io: Arc<S>) -> std::io::Result<Self> {
+        let len = io.get_len().await;
+        if len < 8 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the row-id sequence {} holds {} bytes, not 8; refusing to open the table",
+                    io.get_name(),
+                    len
+                ),
+            ));
+        }
+        let mut buffer = [0u8; 8];
+        let mut position = 0u64;
+        io.read_data_into_buffer(&mut position, &mut buffer)
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("the row-id sequence {} cannot be read: {}", io.get_name(), e),
+                )
+            })?;
+        Ok(Self::starting_at(io, u64::from_le_bytes(buffer)))
+    }
+
+    /// A new partitioned table's sequence, starting at 0. Refuses a file that
+    /// already holds anything: a new table's ids file is new, and reusing one
+    /// could hand out ids already taken.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn create(io: Arc<S>) -> std::io::Result<Self> {
+        let len = io.get_len().await;
+        if len != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("the row-id sequence {} already holds {} bytes", io.get_name(), len),
+            ));
+        }
+        // Committed here rather than through `write_data`, which only logs a
+        // failed commit: the table would be reported created and then refused
+        // by `open_strict` at every start after.
+        let txn = io.begin_txn();
+        let token = io.write_data_txn(txn, 0, &0u64.to_le_bytes()).await;
+        io.commit_durable(token).await?;
+        Ok(Self::starting_at(io, 0))
+    }
+
+    /// Ids handed out so far: the next one to hand out.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn handed_out(&self) -> u64 {
+        self.last_row_id.load(AtomicOrdering::Acquire)
+    }
+
+    /// The persisted reservation, or `None` if there is none yet.
+    ///
+    /// For a plain table, a sidecar that is present but unreadable is treated
+    /// as absent: the caller's fallback is conservative, and refusing to open
+    /// a table because eight bytes went bad would be a worse answer than
+    /// handing out ids from a slightly higher floor.
+    async fn load(io: &Arc<S>) -> Option<u64> {
+        if io.get_len().await < 8 {
+            return None;
+        }
+        let mut buffer = [0u8; 8];
+        let mut position = 0u64;
+        match io.read_data_into_buffer(&mut position, &mut buffer).await {
+            Ok(()) => Some(u64::from_le_bytes(buffer)),
+            Err(e) => {
+                error!(
+                    "Could not read the id sequence ({}); recovering from the pointer file",
+                    e
+                );
+                None
+            }
+        }
+    }
+
+    /// Reserves the next block of ids on disk.
+    ///
+    /// Written before any id in the block is used, so a crash can only ever skip
+    /// ids, never repeat one. Ids need to be unique, not gapless.
+    async fn reserve(&self, upto: u64) {
+        let _one = self.reserving.lock().await;
+        if upto <= self.reserved_upto.load(AtomicOrdering::Acquire) {
+            return;
+        }
+        self.io.write_data(0, &upto.to_le_bytes()).await;
+        self.reserved_upto.store(upto, AtomicOrdering::Release);
+    }
+
+    /// Makes sure the sequence on disk covers the ids about to be handed out.
+    ///
+    /// Called before an update relocates, whose new versions draw from the
+    /// counter but keep their row's own id, so a gap there is harmless. An
+    /// insert, which keeps the id it draws, uses [`Self::reserve_insert_id`].
+    async fn ensure_reserved(&self) {
+        let next = self.last_row_id.load(AtomicOrdering::Acquire);
+        if next < self.reserved_upto.load(AtomicOrdering::Acquire) {
+            return;
+        }
+        self.reserve(next + ID_RESERVATION_CHUNK).await;
+    }
+
+    /// Covers on disk the id an insert is about to take, counting every other
+    /// insert that has checked but not yet taken one. Hold the guard until the
+    /// id is taken.
+    ///
+    /// Inserts used to take turns here under the table's one uniqueness lock;
+    /// with that lock striped by key, two of them check and allocate side by
+    /// side, and checking `next < reserved` alone let the second take an id the
+    /// disk did not cover, which a crash then handed out twice. Partitions
+    /// sharing this source are such inserts too, with no lock in common.
+    pub(crate) async fn reserve_insert_id(&self) -> IdsInFlight<'_> {
+        let in_flight = self.in_flight.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+        let guard = IdsInFlight(&self.in_flight);
+        let next = self.last_row_id.load(AtomicOrdering::Acquire);
+        if next + in_flight > self.reserved_upto.load(AtomicOrdering::Acquire) {
+            self.reserve(next + in_flight + ID_RESERVATION_CHUNK).await;
+        }
+        guard
+    }
+}
+
+/// What [`Table::open_partition`] builds a partition from (§3.4).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct PartitionOpen<S: StorageIO> {
+    /// `__pt_<uid:016x>_<pid:08x>`: the stem its three files hang off.
+    pub physical: String,
+    /// Opens `<physical>.db` and `_pointers.db` and nothing else.
+    /// The caller has already checked they exist (I9): providers create.
+    pub seed: Arc<S>,
+    /// The directory the two files are in when it is not the seed's: a
+    /// partition materialized on another storage location (phase 4).
+    pub dir: Option<String>,
+    /// The shell's schema provider. Shared, never written through here: the
+    /// partition has no schema file of its own.
+    pub io_schema: Arc<S>,
+    /// A clone of the shell's schema, so write orders agree across
+    /// partitions; `name` stays the logical name.
+    pub schema: TableSchema,
+    /// The logical table's one sequence (§3.5).
+    pub ids: StdArc<IdSource<S>>,
+    pub guard: crate::core::partition::guard::RangeGuard,
+    /// `"<db_id>\0<physical>"` (I20). Derived from the shared `schema.name`,
+    /// one partition's cached rows would answer for another's.
+    pub cache_scope: String,
+    /// `External`: no task of its own, its maintenance a unit `watch` hands
+    /// its database's scheduler (§7.3), and no place in the forget registry,
+    /// its pin being its slot's (§7.2). `Own` (tests): as a plain table.
+    pub mode: crate::core::partition::maintenance::MaintenanceMode,
+    /// The slot's write watch; required for `External`.
+    pub watch: Option<StdArc<crate::core::partition::maintenance::WriteWatch>>,
+    /// Phase 3 P5b-2b: a fan-out's open, which only reads. The FILTER
+    /// section loads when the open's proof passes, but the index load or
+    /// build, the filter backfill and the load audit wait for
+    /// [`Table::ensure_full`] (the first routed access or write), so an
+    /// unrouted read wider than the open budget starts no rebuild it then
+    /// discards.
+    pub scan_only: bool,
+    /// With `scan_only`: open full after all when the open's proof finds
+    /// the snapshot's INDEX sections loadable (P5b-2b review): a load is
+    /// cheap, and deferring it makes the first routed read pay it alone
+    /// where a full fan-out loads every partition at once. The caller sets
+    /// it while the open budget has room, so the partition is likely to
+    /// stay open for the routed reads that follow.
+    pub load_if_proven: bool,
+}
+
+/// What [`Table::assemble`] finishes a table from.
+struct Assembly<'a, S: StorageIO> {
+    /// The name filter settings are looked up under: the logical name.
+    settings_name: &'a str,
+    /// The physical name the rows file uses (a partition's
+    /// `__pt_<uid>_<pid>`), which names the file set's index-store files.
+    stem: &'a str,
+    schema: TableSchema,
+    schema_unreadable: bool,
+    io_schema: Arc<S>,
+    io_pointers: Arc<S>,
+    io_rows: Arc<S>,
+    ids: StdArc<IdSource<S>>,
+    table_length: u64,
+    guard: Option<crate::core::partition::guard::RangeGuard>,
+    cache_scope: String,
+    maintenance_alive: StdArc<CacheGuard<AtomicBool>>,
+    services_released: StdArc<tokio::sync::Notify>,
+    /// `Some` for a partition opened `External` (see [`PartitionOpen::mode`]).
+    watch: Option<StdArc<crate::core::partition::maintenance::WriteWatch>>,
+    /// [`PartitionOpen::scan_only`]; false for every plain table.
+    deferred: bool,
+    /// [`PartitionOpen::load_if_proven`].
+    load_if_proven: bool,
+}
+
+/// One of an open's one-shot starts (its index load or build, its filter
+/// backfill, its load audit), deferred by a scan-only open to
+/// [`Table::ensure_full`]. Each raises what it raises (a load's barrier)
+/// before it returns and spawns the rest.
+type DeferredStart = Box<dyn FnOnce() + Send>;
+
+/// The `ErrorKind` and text a partition shell refuses data access with. The
+/// text says "not supported", which pgwire reports as 0A000.
+fn shell_refusal(name: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "relation \"{}\" is partitioned; this operation is not supported on partitioned tables yet",
+            name
+        ),
+    )
+}
+
+impl<S: StorageIO> Table<S> {
+    /// The table's row storage, or an error on a partition shell.
+    ///
+    /// Every data method starts here (`seam_tests` checks it), so a caller
+    /// that has not learned to dispatch to the partitions gets an error rather
+    /// than the empty answer a table with no rows would give.
+    #[inline]
+    pub(crate) fn data(&self) -> std::io::Result<&TableData<S>> {
+        self.data.as_ref().ok_or_else(|| shell_refusal(&self.schema.name))
+    }
+
+    /// Whether this is a partitioned table's shell: schema only, no rows.
+    #[inline]
+    pub(crate) fn is_shell(&self) -> bool {
+        self.data.is_none()
+    }
+
+    /// The rows file.
+    pub fn io_rows(&self) -> std::io::Result<&Arc<S>> {
+        Ok(&self.data()?.io_rows)
+    }
+
+    /// The pointer file.
+    pub fn io_pointers(&self) -> std::io::Result<&Arc<S>> {
+        Ok(&self.data()?.io_pointers)
+    }
+
+    /// Bytes of the file set's index-store files (`.ixs`, `.ixm`): what the
+    /// filter (and, from B17, the indexes) costs on disk, for size
+    /// reporting (docs/persistent-indexes.md §10, RV21). 0 for a table with
+    /// no directory.
+    pub fn index_store_bytes(&self) -> std::io::Result<u64> {
+        let _ = self.data()?;
+        let len = |p: Option<std::path::PathBuf>| p.and_then(|p| std::fs::metadata(p).ok()).map_or(0, |m| m.len());
+        Ok(len(self.gate.ixs_path()) + len(self.gate.ixm_path()))
+    }
+
+    /// The row-id sequence file: a plain table's own, a partition's shared one.
+    pub fn io_sequence(&self) -> std::io::Result<&Arc<S>> {
+        Ok(&self.data()?.ids.io)
+    }
+
+    /// The filter index, `Ok(None)` when the table has none.
+    pub fn filters(&self) -> std::io::Result<&Option<StdArc<TableFilters>>> {
+        Ok(&self.data()?.filters)
+    }
+
+    /// The secondary indexes, read-only, for readers such as the catalog
+    /// views. `Ok(None)` when the table has none; a shell errs, never reading
+    /// as "no indexes".
+    pub fn indexes(&self) -> std::io::Result<Option<crate::core::index::IndexView<'_>>> {
+        Ok(self.data()?.indexes.as_deref().map(crate::core::index::TableIndexes::view))
+    }
+
+    /// The row-id counter: the next id to hand out.
+    pub fn last_row_id(&self) -> std::io::Result<&CacheGuard<AtomicU64>> {
+        Ok(&self.data()?.ids.last_row_id)
+    }
+}
+
+/// Runs a table's provider services (`StorageIO::start_service`, which never
+/// return on their own) until the instance is retired or dropped. The task
+/// holds a clone of each provider, so it holds their descriptors (five per
+/// file), mmap and staging buffer for as long as it runs.
+///
+/// It used to stop only at a poll of `alive` every two seconds, so every
+/// instance a schema change replaced kept its descriptors up to two seconds
+/// after it was dropped (P5b-3: a migration's burst of ALTERs held twenty per
+/// statement per table until the polls caught up, and review B's probe read
+/// that as a leak). The drop now wakes it (`released`); the poll stays for
+/// retirement, which signals nothing.
+fn spawn_provider_services(
+    services: impl std::future::Future<Output = ()> + Send + 'static,
+    alive: StdArc<CacheGuard<AtomicBool>>,
+    released: StdArc<tokio::sync::Notify>,
+) {
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = services => {}
+            _ = released.notified() => {}
+            _ = async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    if !alive.load(AtomicOrdering::Relaxed) {
+                        break;
+                    }
+                }
+            } => {}
+        }
+    });
 }
 
 impl<S: StorageIO> Drop for Table<S> {
@@ -182,6 +678,8 @@ impl<S: StorageIO> Drop for Table<S> {
         // Without this the per-table maintenance task would outlive the table
         // and keep ticking against storage that is going away.
         self.maintenance_alive.store(false, AtomicOrdering::Relaxed);
+        // A stored permit if the task is not waiting yet: never lost.
+        self.services_released.notify_one();
     }
 }
 
@@ -214,13 +712,23 @@ unsafe impl<S: StorageIO> Sync for Table<S> {}
 /// establishes, not one that was ever true by construction — which is exactly
 /// what someone would otherwise assume when reading the ALTER path.
 ///
-/// Making the counter global rather than per-table means a new instance can
-/// never collide with a previous one's entries, and costs nothing: entries are
-/// matched on exact equality, so a higher floor simply never matches. Same
-/// reasoning as `next_database_id`, one level down.
+/// A global floor alone does **not** keep a new instance off an old one's
+/// entries: each instance then climbs by one per write from its own floor,
+/// so a later instance reaches the stamps an earlier one left, and entries
+/// match on exact equality (the phase 3 P5b review served a reopened
+/// partition 40 of 40 stale answers that way). What keeps them apart is the
+/// instance number this counter also hands out, appended to the cache scope
+/// ([`instance_scope`]): two instances never share a scope, whatever their
+/// generations.
 fn next_cache_generation() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, AtomicOrdering::Relaxed)
+}
+
+/// `scope` qualified with instance `instance`: the cache key no other
+/// instance over the same files can produce.
+fn instance_scope(scope: &str, instance: u64) -> String {
+    format!("{scope}\u{0}#{instance}")
 }
 
 /// Whether a candidate mask earns the per-record test it costs.
@@ -302,6 +810,145 @@ fn cache_generation_for(_visibility: &Visibility, generation: u64) -> Option<u64
     Some(generation)
 }
 
+/// Whether a stored value is the one a unique check is looking for. Bytes,
+/// except for a document, which is the same value as `=` says: `{"a":1}` and
+/// `{"a":1.0}` collide in PostgreSQL's unique index, and the hash index and
+/// key stripe a check goes through already key them alike.
+#[inline]
+fn same_unique_value(db_type: &DbType, stored: &[u8], value: &[u8]) -> bool {
+    // A legacy `CHAR` by its one stored form: an older build's `'a '` cell is
+    // the `'a'` a new write stores (`value_codec::legacy_char_canonical`), and
+    // compared byte for byte a UNIQUE column took the second.
+    if *db_type == DbType::CHAR {
+        return crate::core::value_codec::legacy_char_canonical(stored)
+            == crate::core::value_codec::legacy_char_canonical(value);
+    }
+    // A float by its value: -0 duplicates 0, and NaN duplicates NaN, as
+    // PostgreSQL's unique index has them.
+    if matches!(db_type, DbType::F32 | DbType::F64) {
+        let one = |b: &[u8]| crate::core::value_codec::canonical_float_cell(db_type, b).unwrap_or_else(|| b.to_vec());
+        return one(stored) == one(value);
+    }
+    if *db_type == DbType::JSONB {
+        crate::core::jsonb::values_equal(stored, value).unwrap_or_else(|| stored == value)
+    } else if *db_type == DbType::DECIMAL && (stored.len() == 17 || value.len() == 17) {
+        // A NUMERIC carrying its own scale by its value: 1.50 duplicates 1.5.
+        crate::core::value_codec::numeric_cell_cmp(stored, value) == Some(std::cmp::Ordering::Equal)
+    } else {
+        stored == value
+    }
+}
+
+/// A uniqueness violation, naming every unique key the row clashed on.
+///
+/// Carried inside the `AlreadyExists` error the check returns, so its text
+/// is still the first clash's, word for word (the SQLSTATE is read from it),
+/// while `INSERT … ON CONFLICT (k) DO NOTHING` can ask whether `k` was among
+/// the keys (`executor::conflict_is_on_arbiter`): a clash on another key is
+/// raised, as PostgreSQL raises it.
+#[derive(Debug)]
+pub struct UniqueViolation {
+    /// Each clashing key's columns, as declared: one column for a `UNIQUE`
+    /// column or a single-column primary key.
+    pub keys: Vec<Vec<String>>,
+    message: String,
+}
+
+impl UniqueViolation {
+    /// The violation `error` carries, when it is one this check raised.
+    pub fn of(error: &std::io::Error) -> Option<&UniqueViolation> {
+        error.get_ref()?.downcast_ref::<UniqueViolation>()
+    }
+}
+
+impl std::fmt::Display for UniqueViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UniqueViolation {}
+
+/// The clashes one row's check has found so far.
+#[derive(Default)]
+struct UniqueViolations {
+    keys: Vec<Vec<String>>,
+    first_message: Option<String>,
+}
+
+impl UniqueViolations {
+    fn push(&mut self, key: Vec<String>, message: String) {
+        self.first_message.get_or_insert(message);
+        self.keys.push(key);
+    }
+
+    fn into_result(self) -> Result<()> {
+        match self.first_message {
+            None => Ok(()),
+            Some(message) => Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                UniqueViolation { keys: self.keys, message },
+            )),
+        }
+    }
+}
+
+/// What one UPDATE has already written, for its uniqueness checks.
+///
+/// The check probes the table through its index or filter, whose
+/// maintenance is staged until the statement's storage transaction commits
+/// (`PendingFilterOp`), and an in-place overwrite reaches the data file only
+/// at that commit too. So a statement's own earlier rows were invisible to
+/// it: `UPDATE t SET n = 1000 WHERE id < 50` on a UNIQUE `n` wrote fifty
+/// rows holding 1000 and reported success. PostgreSQL checks each row as it
+/// is written, against every row including the statement's own.
+#[derive(Default)]
+pub(crate) struct OwnKeys {
+    /// Per constraint (`constraint_stripe`'s ids), the keys written so far.
+    written: std::collections::HashMap<usize, std::collections::HashSet<Vec<u8>>>,
+    /// Rows this statement has written. What the table shows of them until
+    /// the commit is stale: an in-place overwrite reaches the data file only
+    /// then, and an old version's deleting stamp is staged with the
+    /// transaction too, so it still looked live and a row taking the value
+    /// an earlier row gave up was refused (on disk; in memory it passed).
+    /// Their keys are the ones in `written`, so the table's view of them is
+    /// skipped.
+    updated: std::collections::HashSet<u64>,
+}
+
+impl OwnKeys {
+    /// A key as the check compares it: each value length-prefixed, a
+    /// document in its canonical form (`same_unique_value` compares documents
+    /// by value and everything else by bytes).
+    fn key<'a>(values: impl Iterator<Item = (&'a SchemaField, &'a [u8])>) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (field, value) in values {
+            let mut one = Vec::new();
+            if field.db_type == DbType::CHAR {
+                one.extend_from_slice(&crate::core::value_codec::legacy_char_canonical(value));
+            } else if let Some(canonical) = crate::core::value_codec::canonical_float_cell(&field.db_type, value) {
+                // -0 is 0 and every NaN one NaN (`same_unique_value`).
+                one.extend_from_slice(&canonical);
+            } else if field.db_type == DbType::JSONB
+                && crate::core::index::key::encode_canonical(&field.db_type, value, &mut one).is_some()
+            {
+            } else {
+                one.clear();
+                one.extend_from_slice(value);
+            }
+            out.extend_from_slice(&(one.len() as u32).to_le_bytes());
+            out.extend_from_slice(&one);
+        }
+        out
+    }
+
+    /// Records `key` for `constraint`; `false` when an earlier row of the
+    /// statement already wrote it.
+    fn claim(&mut self, constraint: usize, key: Vec<u8>) -> bool {
+        self.written.entry(constraint).or_default().insert(key)
+    }
+}
+
 /// A filter-index change staged until the write it describes is durable.
 ///
 /// The index used to be mutated inside the write loop, before
@@ -318,29 +965,65 @@ enum PendingFilterOp {
     /// Clear a slot's fingerprints once its row is gone for everyone.
     Delete(u64),
     /// (Re)fingerprint a slot from the row now durable at it.
-    Insert(u64, RowWrite),
+    ///
+    /// The third field is the slot's secondary-index keys *before* the write,
+    /// for an in-place overwrite: the slot keeps its number and changes its
+    /// value, so its old keys must go now that the new value is durable.
+    /// `None` for a version written at a fresh slot, which has no old keys.
+    Insert(u64, RowWrite, Option<Vec<Option<crate::core::index::KeyBuf>>>),
 }
 
-impl<S: StorageIO> Table<S> {
+impl<S: StorageIO> TableData<S> {
     /// Applies filter-index changes staged during a batch, now that the batch's
     /// `commit_durable` has made the writes they describe durable. A no-op with
     /// no filter index, and it always empties `pending`.
-    fn apply_pending_filters(&self, pending: &mut Vec<PendingFilterOp>) {
+    fn apply_pending_filters(&self, ticket: &WriteTicket, pending: &mut Vec<PendingFilterOp>) {
         if pending.is_empty() {
             return;
         }
-        match self.filters.as_ref() {
-            Some(filters) => {
-                for op in pending.drain(..) {
-                    match op {
-                        PendingFilterOp::Delete(slot) => filters.on_delete(slot),
-                        PendingFilterOp::Insert(slot, row_write) => {
-                            filters.on_insert(slot, &row_write)
+        for op in pending.drain(..) {
+            match op {
+                PendingFilterOp::Delete(slot) => {
+                    if let Some(filters) = self.filters.as_ref() {
+                        filters.on_delete(Proof::from(ticket), slot);
+                    }
+                    // A secondary index keeps the slot: vacuum forgets it once
+                    // nothing can reach the version, reading its key back then.
+                }
+                PendingFilterOp::Insert(slot, row_write, old_keys) => {
+                    if let Some(filters) = self.filters.as_ref() {
+                        filters.on_insert(Proof::from(ticket), slot, &row_write);
+                    }
+                    if let Some(indexes) = self.indexes.as_ref() {
+                        match old_keys {
+                            Some(old) => {
+                                indexes.on_replace(Proof::from(ticket), slot, &old, &row_write)
+                            }
+                            None => indexes.on_insert(Proof::from(ticket), slot, &row_write),
                         }
                     }
                 }
             }
-            None => pending.clear(),
+        }
+    }
+
+    /// Whether writes have filter or index maintenance to stage.
+    #[inline]
+    fn maintains_indexes(&self) -> bool {
+        self.filters.is_some() || self.indexes.is_some()
+    }
+
+    /// Registers this read with the epoch registry, so reclamation cannot hand
+    /// out an extent the read is about to fetch from.
+    ///
+    /// Inert when reclamation is off: nothing ever moves, so there is nothing
+    /// to shield against and no reason to pay for the bookkeeping.
+    #[inline]
+    fn read_guard(&self) -> ReadTicket {
+        if self.free_space.is_enabled() {
+            self.readers.enter()
+        } else {
+            ReadTicket::inert()
         }
     }
 }
@@ -365,22 +1048,107 @@ impl<S: StorageIO> Table<S> {
 
     /// The generation a scan starting now should stamp its cache entry with.
     #[inline]
-    fn cache_generation(&self) -> u64 {
+    pub fn cache_generation(&self) -> u64 {
         self.cache_generation.load(AtomicOrdering::Acquire)
+    }
+
+    /// See the `write_generation` field.
+    #[cfg(test)]
+    pub(crate) fn write_generation(&self) -> u64 {
+        self.write_generation.load(AtomicOrdering::Acquire)
+    }
+
+    /// Whether this table's scans consult and fill the query cache. Not a
+    /// statement's own CTE or derived table (`cte::TEMP_TABLE_PREFIX`): it is
+    /// created under a fresh name for one statement and dropped with it, so
+    /// no later scan can ask for what it would store. Each one was a lookup
+    /// that could only miss and an entry that could only evict a useful one:
+    /// a query over a derived table counted a hit and a miss together.
+    pub(crate) fn caches_queries(&self) -> bool {
+        !self.schema.name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX)
+    }
+
+    /// The query-cache scope and current generation: what an entry this
+    /// table stores is keyed and stamped with.
+    #[cfg(test)]
+    pub(crate) fn cache_key(&self) -> (&str, u64) {
+        (&self.cache_scope, self.cache_generation())
     }
 
     /// Qualifies this table's query-cache key with the database that owns it.
     ///
     /// Called once, by [`crate::core::database::Database`], before the table is
     /// shared. See [`Table::cache_scope`] for why the cache needs it.
+    ///
+    /// A partition keeps the scope [`Table::open_partition`] gave it: its
+    /// `schema.name` is the logical table's, shared by every partition, so a
+    /// scope derived from it would let one partition's cached rows answer for
+    /// another's (I20).
     pub fn scope_cache_to_database(&mut self, database_id: u64) {
+        if self.data.as_ref().is_some_and(|d| d.guard.is_some()) {
+            log::warn!(
+                "scope_cache_to_database called on partition scope {:?}; keeping it",
+                self.cache_scope
+            );
+            return;
+        }
         // A separator that cannot occur in an identifier, so `1` + `x_y` and
-        // `1_x` + `y` cannot produce the same key.
-        self.cache_scope = format!("{}\u{0}{}", database_id, self.schema.name);
+        // `1_x` + `y` cannot produce the same key; this instance's number
+        // after it (see `cache_instance`).
+        self.cache_scope = instance_scope(&format!("{}\u{0}{}", database_id, self.schema.name), self.cache_instance);
     }
 
     pub async fn new(table_name: &str, initial_io: Arc<S>, columns: Vec<CreateColumnData>) -> Self {
         Self::new_with_constraints(table_name, initial_io, columns, &[]).await
+    }
+
+    /// A partitioned table's shell: its schema and nothing else.
+    ///
+    /// It opens no row, pointer, filter or sequence file, spawns no task and
+    /// takes no place in the forget registry (see `enable_versioning`).
+    /// Schema-only callers (describe, parameter inference, index and
+    /// foreign-key lookups) work on it; every data method refuses with an
+    /// error saying the table is partitioned. `io_schema`'s service is the
+    /// caller's to run, as the shell owns no task to run it on.
+    pub fn partition_shell(io_schema: Arc<S>, schema: TableSchema) -> Self {
+        let has_unique = schema.fields.iter().any(|f| f.is_unique && !f.is_deleted)
+            || !schema.unique_keys.is_empty();
+        let cache_scope = schema.name.clone();
+        Self {
+            schema,
+            schema_unreadable: false,
+            io_schema,
+            data: None,
+            in_place_column_updates: AtomicU64::new(0).into(),
+            versions: StdArc::new(ArcSwapOption::empty()),
+            max_writer: StdArc::new(AtomicU64::new(0)),
+            cleared_below: StdArc::new(CacheGuard::new(AtomicU64::new(0))),
+            has_unique,
+            legacy_keys_canonical: false,
+            legacy_char_duplicates: Vec::new(),
+            hard_locked: AtomicBool::new(false).into(),
+            concurrent_processor: ConcurrentProcessor::new(),
+            cache_scope,
+            cache_instance: 0,
+            write_lock: StdArc::new(tokio::sync::RwLock::new(())),
+            unique_lock: StdArc::new(crate::core::row::key_locks::KeyLocks::new()),
+            compaction_gate: StdArc::new(tokio::sync::RwLock::new(())),
+            forget: StdArc::new(std::sync::OnceLock::new()),
+            write_generation: StdArc::new(CacheGuard::new(AtomicU64::new(0))),
+            dead_stamps: StdArc::new(AtomicU64::new(0)),
+            cache_generation: StdArc::new(CacheGuard::new(AtomicU64::new(next_cache_generation()))),
+            filters_ready: StdArc::new(CacheGuard::new(AtomicBool::new(true))),
+            // Nothing watches it: the shell spawns no task.
+            maintenance_alive: StdArc::new(CacheGuard::new(AtomicBool::new(false))),
+            services_released: StdArc::new(tokio::sync::Notify::new()),
+            maintenance_tick: StdArc::new(tokio::sync::Mutex::new(())),
+            // No rows, so nothing to gate: its partitions have their own.
+            gate: FileGate::detached(),
+            watch: None,
+            external: None,
+            scan_only: StdArc::new(AtomicBool::new(false)),
+            deferred_starts: parking_lot::Mutex::new(Vec::new()),
+        }
     }
 
     /// As [`Table::new`], but marks the named columns `UNIQUE`.
@@ -397,6 +1165,18 @@ impl<S: StorageIO> Table<S> {
         columns: Vec<CreateColumnData>,
         unique_columns: &[String],
     ) -> Self {
+        Self::new_with_constraints_sized(table_name, initial_io, columns, unique_columns, &[]).await
+    }
+
+    /// [`Self::new_with_constraints`], the NUMERIC columns named in `own_scale`
+    /// keeping each value at its own scale ([`Self::create_schema_files_with`]).
+    pub async fn new_with_constraints_sized(
+        table_name: &str,
+        initial_io: Arc<S>,
+        columns: Vec<CreateColumnData>,
+        unique_columns: &[String],
+        own_scale: &[String],
+    ) -> Self {
         let io_pointers = Arc::new(
             initial_io
                 .create_new(format!("{}_pointers.db", table_name))
@@ -411,12 +1191,6 @@ impl<S: StorageIO> Table<S> {
                 .await,
         );
 
-        let io_filters = Arc::new(
-            initial_io
-                .create_new(format!("{}_flt.db", table_name))
-                .await,
-        );
-
         let io_sequence = Arc::new(
             initial_io
                 .create_new(format!("{}_seq.db", table_name))
@@ -426,216 +1200,648 @@ impl<S: StorageIO> Table<S> {
         let io_pointers_clone = io_pointers.clone();
         let io_rows_clone = io_rows.clone();
         let io_schema_clone = io_schema.clone();
-        let io_filters_clone = io_filters.clone();
         let io_sequence_clone = io_sequence.clone();
 
         // Cleared by `Drop`. Every task spawned for this table watches it, and
         // this one has to as well: the providers' services never return on
         // their own, so a task that only joined them held an `Arc` to each
-        // provider — five files' worth of handles, an mmap and a staging
+        // provider — four files' worth of handles (five before B14 retired
+        // `_flt.db`), an mmap and a staging
         // buffer — for the life of the process, for every `Table` ever built.
         // A table rebuilt on each new JSON key leaked a generation per key, and
         // the process ran at the descriptor limit within the hour.
         let maintenance_alive = StdArc::new(CacheGuard::new(AtomicBool::new(true)));
-        let services_alive = maintenance_alive.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = async {
-                    tokio::join!(
-                        io_rows_clone.start_service(),
-                        io_pointers_clone.start_service(),
-                        io_schema_clone.start_service(),
-                        io_filters_clone.start_service(),
-                        io_sequence_clone.start_service()
-                    );
-                } => {}
-                _ = async {
-                    // Polled rather than signalled, so nothing new has to be
-                    // threaded through `Drop`. A few seconds of latency on
-                    // releasing a dropped table's handles is nothing next to
-                    // never.
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        if !services_alive.load(AtomicOrdering::Relaxed) {
-                            break;
-                        }
-                    }
-                } => {}
-            }
-        });
+        let services_released = StdArc::new(tokio::sync::Notify::new());
+        spawn_provider_services(
+            async move {
+                tokio::join!(
+                    io_rows_clone.start_service(),
+                    io_pointers_clone.start_service(),
+                    io_schema_clone.start_service(),
+                    io_sequence_clone.start_service()
+                );
+            },
+            maintenance_alive.clone(),
+            services_released.clone(),
+        );
 
+        // An open passes no columns; only `CREATE TABLE` passes them. So a
+        // failed load with no columns to build from is a table whose schema
+        // should have been there and was not — a recovery failure, not a new
+        // table — and fabricating one both answers every later query wrongly
+        // and *overwrites* whatever was still on disk.
+        let mut schema_unreadable = false;
         let schema = {
             if let Ok(schema) = TableSchema::load(io_schema.clone()).await {
                 schema
+            } else if columns.is_empty() {
+                error!(
+                    "table '{}' was opened but its schema could not be read; it is left \
+                     unusable rather than answering queries with no columns",
+                    table_name
+                );
+                schema_unreadable = true;
+                // Deliberately not saved: the bytes on disk are the only copy
+                // of the real schema, and a recovery that could not read them
+                // must not replace them with an empty one.
+                TableSchema::new(table_name.to_string(), false)
             } else {
-                let mut schema = TableSchema::new(table_name.to_string(), false);
-
-                schema
-                    .save(io_schema.clone())
-                    .await
-                    .expect("Failed to save initial schema");
-
-                for column in columns {
-                    let is_unique = unique_columns
-                        .iter()
-                        .any(|name| name.eq_ignore_ascii_case(&column.name));
-                    schema
-                        .add_field(io_schema.clone(), column.name, column.data_type, is_unique)
-                        .await;
+                match Self::create_schema_files_with(io_schema.clone(), table_name, columns, unique_columns, own_scale).await {
+                    Ok(schema) => schema,
+                    // A CREATE whose schema or a field record could not be
+                    // written (a full disk, a file-size limit, a refused
+                    // key/value put): unusable, which `add_table` sees and
+                    // discards the table for, before its catalogue row. It
+                    // used to panic here, and before that the write's failure
+                    // was only logged, and the CREATE succeeded with a column
+                    // its files did not hold.
+                    Err(e) => {
+                        error!("table '{}': its schema could not be written: {}", table_name, e);
+                        schema_unreadable = true;
+                        TableSchema::new(table_name.to_string(), false)
+                    }
                 }
-
-                schema
             }
         };
 
         info!("Loaded schema: {:?}", schema);
 
         let mut pointer_iterator = RowPointerIterator::new(io_pointers.clone()).await.unwrap();
+        let last_pointer = pointer_iterator.read_last().await;
+        let ids = StdArc::new(IdSource::legacy(io_sequence, last_pointer.as_ref()).await);
+        let table_length = Self::recovered_length(last_pointer.as_ref(), &io_rows).await;
+        let cache_scope = schema.name.clone();
 
-        let (atomic_last_id, atomic_table_length) =
-            if let Some(row_pointer) = pointer_iterator.read_last().await {
-                // The persisted sequence is the authority. Falling back to the
-                // last record is only correct for a table written before the
-                // sequence existed, when ids still ascended with file order —
-                // and such a table has no reservation to honour, so the fallback
-                // is exact rather than merely safe.
-                let atomic_last_id =
-                    AtomicU64::new(match Self::load_id_sequence(&io_sequence).await {
-                        Some(reserved) => reserved,
-                        None => row_pointer.row_id(),
-                    });
+        Self::assemble(Assembly {
+            settings_name: table_name,
+            stem: table_name,
+            schema,
+            schema_unreadable,
+            io_schema,
+            io_pointers,
+            io_rows,
+            ids,
+            table_length,
+            guard: None,
+            cache_scope,
+            maintenance_alive,
+            services_released,
+            watch: None,
+            deferred: false,
+            load_if_proven: false,
+        })
+        .await
+    }
 
-                // End of the last row, not its start — the start would place the
-                // high-water mark inside a row that already exists. The rows
-                // file's own length is the floor: a row written into a
-                // reclaimed extent sits below the frontier, so the last pointer
-                // on its own no longer bounds the file.
-                let table_length = (row_pointer.position + row_pointer.length as u64)
-                    .max(io_rows.get_len().await);
-                let atomic_table_length = AtomicU64::new(table_length);
+    /// A partition of a partitioned table (§3.4): a `Table` over the
+    /// partition's three files, with the logical table's schema and id
+    /// sequence, its range guard installed and its own cache scope.
+    ///
+    /// Loads no schema file and no `_seq.db`: the schema is the shell's clone
+    /// and the ids are the logical table's. Spawns the services of the three
+    /// providers it opens and, as a plain table does, its own filter, index
+    /// and reclamation tasks; shared maintenance is phase 3's. A pointer file
+    /// it cannot read is an error rather than a panic.
+    // Called from `PartitionedTable` (S3b) on; until then only tests do.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn open_partition(p: PartitionOpen<S>) -> std::io::Result<Self> {
+        let PartitionOpen {
+            physical,
+            seed,
+            dir,
+            io_schema,
+            schema,
+            ids,
+            guard,
+            cache_scope,
+            mode,
+            watch,
+            scan_only,
+            load_if_proven,
+        } = p;
+        use crate::core::partition::maintenance::MaintenanceMode;
+        let watch = match (mode, watch) {
+            (MaintenanceMode::External, Some(w)) => Some(w),
+            (MaintenanceMode::External, None) => {
+                return Err(std::io::Error::other("internal error: an External partition opened without its write watch"));
+            }
+            (MaintenanceMode::Own, _) => None,
+        };
+        // Fallible: a closed partition opens inside a statement (phase 3 P5b),
+        // and running out of file descriptors there must fail the statement,
+        // not panic it.
+        let open = |name: String| {
+            let (seed, dir) = (&seed, dir.as_deref());
+            async move {
+                match dir {
+                    Some(dir) => seed.try_create_new_at(dir, name).await,
+                    None => seed.try_create_new(name).await,
+                }
+            }
+        };
+        let io_pointers = Arc::new(open(format!("{}_pointers.db", physical)).await?);
+        let io_rows = Arc::new(open(format!("{}.db", physical)).await?);
 
-                (atomic_last_id, atomic_table_length)
+        let maintenance_alive = StdArc::new(CacheGuard::new(AtomicBool::new(true)));
+        let services_released = StdArc::new(tokio::sync::Notify::new());
+        let (rows_task, pointers_task) = (io_rows.clone(), io_pointers.clone());
+        // As in `new_with_constraints`: released when the instance drops, so
+        // the task does not hold the providers past it. Not for an
+        // `External` partition, whose scheduler lands its staged bytes
+        // (`StorageIO::land_background`).
+        if watch.is_none() {
+            spawn_provider_services(
+                async move {
+                    tokio::join!(rows_task.start_service(), pointers_task.start_service());
+                },
+                maintenance_alive.clone(),
+                services_released.clone(),
+            );
+        }
+
+        #[cfg(test)]
+        let opened = if partition_test_hooks::FAIL_POINTER_OPEN.with(|f| f.replace(false)) {
+            Err(std::io::Error::other("injected pointer-file read failure"))
+        } else {
+            RowPointerIterator::new(io_pointers.clone()).await.map_err(std::io::Error::from)
+        };
+        #[cfg(not(test))]
+        let opened = RowPointerIterator::new(io_pointers.clone()).await.map_err(std::io::Error::from);
+        // No `Table` is built on this path, so no `Drop` stops the service
+        // task: left `true`, it would hold the three providers for good.
+        let mut pointer_iterator = match opened {
+            Ok(iterator) => iterator,
+            Err(e) => {
+                maintenance_alive.store(false, AtomicOrdering::Relaxed);
+                services_released.notify_one();
+                return Err(e);
+            }
+        };
+        let last_pointer = pointer_iterator.read_last().await;
+        let table_length = Self::recovered_length(last_pointer.as_ref(), &io_rows).await;
+        // Filter settings are per logical table, like the schema.
+        let settings_name = schema.name.clone();
+
+        Ok(Self::assemble(Assembly {
+            settings_name: &settings_name,
+            stem: &physical,
+            schema,
+            schema_unreadable: false,
+            io_schema,
+            io_pointers,
+            io_rows,
+            ids,
+            table_length,
+            guard: Some(guard),
+            cache_scope,
+            maintenance_alive,
+            services_released,
+            watch,
+            deferred: scan_only,
+            load_if_proven,
+        })
+        .await)
+    }
+
+    /// Writes a new table's schema and its fields to `io_schema`.
+    #[cfg(test)]
+    #[cfg(test)]
+    pub(crate) async fn create_schema_files(
+        io_schema: Arc<S>,
+        name: &str,
+        columns: Vec<CreateColumnData>,
+        unique_columns: &[String],
+    ) -> std::io::Result<TableSchema> {
+        Self::create_schema_files_with(io_schema, name, columns, unique_columns, &[]).await
+    }
+
+    /// [`Self::create_schema_files`], the columns named in `own_scale` (NUMERIC
+    /// declared without a precision or scale, `CreateTable::own_scale_numerics`)
+    /// keeping each value at its own scale in a seventeen-byte slot.
+    pub(crate) async fn create_schema_files_with(
+        io_schema: Arc<S>,
+        name: &str,
+        columns: Vec<CreateColumnData>,
+        unique_columns: &[String],
+        own_scale: &[String],
+    ) -> std::io::Result<TableSchema> {
+        let mut schema = TableSchema::new(name.to_string(), false);
+        schema.save(io_schema.clone()).await?;
+        for column in columns {
+            let is_unique = unique_columns
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&column.name));
+            let size = if column.data_type == crate::core::db_type::DbType::DECIMAL
+                && own_scale.iter().any(|n| n.eq_ignore_ascii_case(&column.name))
+            {
+                crate::core::value_codec::NUMERIC_OWN_SCALE_SIZE
             } else {
-                let atomic_last_id = AtomicU64::new(
-                    Self::load_id_sequence(&io_sequence).await.unwrap_or(0),
-                );
-                let atomic_table_length = AtomicU64::new(0);
-                (atomic_last_id, atomic_table_length)
+                column.data_type.get_size()
             };
+            schema
+                .try_add_field_sized(io_schema.clone(), column.name, column.data_type, size, is_unique)
+                .await?;
+        }
+        Ok(schema)
+    }
 
-        // Everything up to the recovered value may already be in use, so the
-        // first insert reserves before it allocates.
-        let id_reserved_upto = AtomicU64::new(atomic_last_id.load(AtomicOrdering::Acquire));
+    /// The rows file's high-water mark as an open finds it.
+    async fn recovered_length(last_pointer: Option<&RowPointer>, io_rows: &Arc<S>) -> u64 {
+        match last_pointer {
+            // End of the last row, not its start — the start would place the
+            // high-water mark inside a row that already exists. The rows
+            // file's own length is the floor: a row written into a
+            // reclaimed extent sits below the frontier, so the last pointer
+            // on its own no longer bounds the file.
+            Some(row_pointer) => (row_pointer.position + row_pointer.length as u64).max(io_rows.get_len().await),
+            None => 0,
+        }
+    }
 
-        let existing_slots =
-            io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+    /// The part of opening a table that is the same for a plain table and a
+    /// partition: everything after the providers, the schema and the ids.
+    async fn assemble(a: Assembly<'_, S>) -> Self {
+        let Assembly {
+            settings_name: table_name,
+            stem,
+            schema,
+            schema_unreadable,
+            io_schema,
+            io_pointers,
+            io_rows,
+            ids,
+            table_length,
+            guard,
+            cache_scope,
+            maintenance_alive,
+            services_released,
+            watch,
+            deferred,
+            load_if_proven,
+        } = a;
+
+        let existing_slots = io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        // Before anything is built from rows: a revocation after this point
+        // may have removed a version the structures below never saw come
+        // back, so a seal of this instance refuses (N26).
+        let revocations_at_open = crate::core::mvcc::status::outcome_revocations();
+
+        // The file set's word: the live one when an instance of this file set
+        // is still open (a reload), else derived from `.ixm`. Writes nothing.
+        let gate = FileGate::open(io_pointers.index_store_dir(), stem, schema.incarnation);
+        // Every write of the file set registers on the word, at the provider
+        // (`index_store::gated_io`, B12): rows and pointers, and for a plain
+        // table its schema family (the sidecars inherit it) and `_seq.db`. A
+        // partition's schema and row ids are the logical table's, shared by
+        // every partition, so they attach to none of them.
+        {
+            use crate::core::index_store::gated_io::Policy;
+            for io in [&io_pointers, &io_rows] {
+                io.attach_write_gate(&gate, Policy::Backstop);
+            }
+            if guard.is_none() {
+                io_schema.attach_write_gate(&gate, Policy::Backstop);
+                ids.io.attach_write_gate(&gate, Policy::Backstop);
+            }
+        }
+
+        // `_flt.db`, retired (docs/persistent-indexes.md §5, B14): deleted at
+        // every open before anything is written, after `.ixs` is durably
+        // unlinked when an `.ixm` makes it evidence. A file set with no
+        // directory has no snapshot and no gate to start `Unknown`; its
+        // provider family deletes the file.
+        let flt = if gate.has_files() {
+            gate.retire_flt()
+        } else {
+            Self::retire_flt_through_provider(&io_pointers, stem).await;
+            FltAtOpen::Absent
+        };
 
         let filter_settings = crate::core::filter::settings::settings();
-        let filters = if filter_settings.table_enabled(table_name) {
-            match Self::load_filter_checkpoint(&io_filters, &schema.fields, existing_slots).await {
-                Some(f) => {
+        // The filter a rebuild starts from, and what a loaded one must match.
+        let template = filter_settings
+            .table_enabled(table_name)
+            .then(|| TableFilters::for_table(table_name, &schema.fields))
+            .filter(|f| !f.is_empty());
+        // Only a file set that can be sealed pays for it: a statement's
+        // temporary relation is memory-backed and opens per statement.
+        // A key/value table is sealed too, validated by its store
+        // (docs/kv-partitions.md §2): its two files' states as recovered,
+        // read before anything of this instance writes.
+        let on_store = !gate.has_files()
+            && match (io_pointers.kv_state_now(), io_rows.kv_state_now()) {
+                (Some(_), Some(_)) => true,
+                _ => false,
+            };
+        let shape_hash = if gate.has_files() || on_store { crate::core::index::shape_of(&schema) } else { 0 };
+        let mut kv_loaded = None;
+
+        // The open's proof (§4): every check, writing nothing. When it
+        // passes, the snapshot's FILTER section is loaded instead of
+        // rebuilt, with vacuum's clear horizon; otherwise the filter
+        // rebuilds below exactly as before. The word's state stays the
+        // marker log's either way (N21): a rejected `CLEAN` is still `Clean`,
+        // so the first write makes `DIRTY` durable, and only a load vouches.
+        // The INDEX sections a proven snapshot holds (B17), for the index
+        // load below.
+        let mut proven_indexes = None;
+        let loaded: Option<Option<(TableFilters, u64)>> = if gate.has_files() {
+            use crate::core::index_store::open_proof::{self, Reject};
+            let expected = crate::core::index_store::identity::Identity {
+                incarnation: schema.incarnation,
+                slot_epoch: gate.slot_epoch(),
+                n_slots: existing_slots,
+                pointers_len: io_pointers.get_len().await,
+                rows_len: io_rows.get_len().await,
+                versions: crate::core::index_store::identity::VersionTuple::current(
+                    crate::core::filter::persist::FORMAT_VER,
+                ),
+                shape_hash,
+                filter_config_hash: template.as_ref().map_or(0, |f| f.config_hash()),
+            };
+            let outcome = open_proof::prove(&gate, &flt, &expected, template.is_some()).and_then(|mut proven| {
+                let filter = proven.filter.take();
+                let l = match (filter, template.as_ref()) {
+                    (Some(bytes), Some(t)) => t
+                        .load_sealed(&bytes, existing_slots)
+                        .map(Some)
+                        .map_err(|e| Reject::FilterLoad(format!("{e:?}")))?,
+                    _ => None,
+                };
+                proven_indexes = Some(proven);
+                Ok(l)
+            });
+            match outcome {
+                Ok(l) => {
+                    open_proof::note_loaded();
                     info!(
-                        "Loaded filter checkpoint; resuming indexing at slot {} of {}",
-                        f.resume_slot(),
-                        existing_slots
+                        "{}: loaded the filter from its index snapshot ({} slots); no rebuild",
+                        stem, existing_slots
                     );
-                    Some(StdArc::new(f))
+                    Some(l)
                 }
-                None => {
-                    let f = TableFilters::for_table(table_name, &schema.fields);
-                    if f.is_empty() {
-                        None
-                    } else {
-                        // Rows already on disk predate the filter, so they stay
-                        // candidates until a backfill indexes them. Correct from
-                        // the first query; just not yet selective.
-                        f.set_unindexed_prefix(existing_slots);
-                        Some(StdArc::new(f))
-                    }
+                Err(why) => {
+                    open_proof::note_rejected(stem, &why);
+                    // This open's structures are not the snapshot's, whatever
+                    // a live word said of the instance before it (§3 rule 2).
+                    gate.set_vouched(false);
+                    None
+                }
+            }
+        } else if on_store {
+            use crate::core::index_store::{kv_snapshot, open_proof};
+            let now = io_pointers.kv_state_now().zip(io_rows.kv_state_now()).map(|(pointers, rows)| {
+                kv_snapshot::KvIdentity { pointers, rows }
+            });
+            let expected = crate::core::index_store::identity::Identity {
+                incarnation: schema.incarnation,
+                slot_epoch: 0,
+                n_slots: existing_slots,
+                pointers_len: io_pointers.get_len().await,
+                rows_len: io_rows.get_len().await,
+                versions: crate::core::index_store::identity::VersionTuple::current(
+                    crate::core::filter::persist::FORMAT_VER,
+                ),
+                shape_hash,
+                filter_config_hash: template.as_ref().map_or(0, |f| f.config_hash()),
+            };
+            let stored = match io_rows.kv_read_sidecar().await {
+                Ok(stored) => Ok(stored),
+                Err(e) => Err(open_proof::Reject::SnapshotUnreadable(e.to_string())),
+            };
+            let outcome = stored.and_then(|stored| {
+                let now = now.ok_or(open_proof::Reject::Excluded)?;
+                let mut proven = kv_snapshot::prove(stored, &now, &expected, template.is_some())?;
+                let filter = proven.filter.take();
+                let l = match (filter, template.as_ref()) {
+                    (Some(bytes), Some(t)) => t
+                        .load_sealed(&bytes, existing_slots)
+                        .map(Some)
+                        .map_err(|e| open_proof::Reject::FilterLoad(format!("{e:?}")))?,
+                    _ => None,
+                };
+                proven_indexes = Some(proven);
+                kv_loaded = Some(now);
+                Ok(l)
+            });
+            match outcome {
+                Ok(l) => {
+                    open_proof::note_loaded();
+                    info!(
+                        "{}: loaded the filter from its key/value snapshot ({} slots); no rebuild",
+                        stem, existing_slots
+                    );
+                    Some(l)
+                }
+                Err(why) => {
+                    open_proof::note_rejected(stem, &why);
+                    None
                 }
             }
         } else {
             None
+        };
+        let was_loaded = loaded.is_some();
+        let mut cleared_at_open = 0;
+        let filters = match (loaded, template) {
+            (Some(Some((f, cleared_below))), _) => {
+                cleared_at_open = cleared_below;
+                Some(StdArc::new(f))
+            }
+            (Some(None), _) => None,
+            (None, Some(f)) => {
+                // Rows already on disk predate the filter, so they stay
+                // candidates until a backfill indexes them. Correct from the
+                // first query; just not yet selective.
+                let build = gate::build_token();
+                f.set_unindexed_prefix(Proof::from(&build), existing_slots);
+                Some(StdArc::new(f))
+            }
+            (None, None) => None,
         };
 
         let filters_ready = StdArc::new(CacheGuard::new(AtomicBool::new(true)));
         let free_space = StdArc::new(FreeSpace::new(crate::vacuum_enabled()));
         let readers = StdArc::new(ReaderRegistry::new());
 
-        // Everything the filter needs doing after this point — the initial
-        // backfill and every checkpoint — happens on this task. No caller ever
-        // pays for it: `Table::new` returns immediately and an insert never
-        // stalls behind a blob rewrite.
-        // Whether the task has anything to backfill is knowable now, so a table
-        // with nothing to do reports ready immediately rather than after the
-        // task has been scheduled. Otherwise `filters_ready()` races on a fresh
-        // table, where the answer is trivially yes.
-        let needs_backfill = filters.as_ref().is_some_and(|f| {
-            filter_settings.backfill_on_open() && f.resume_slot() < existing_slots
-        });
-
-        if let Some(filters) = filters.clone() {
-            filters_ready.store(!needs_backfill, AtomicOrdering::Release);
-
-            let ready = filters_ready.clone();
-            let alive = maintenance_alive.clone();
-            let io_filters_task = io_filters.clone();
+        // Secondary indexes are built from the table on a task of their own,
+        // like the filter backfill: `Table::new` returns at once, writes
+        // maintain the indexes from this moment, and queries use them once the
+        // build has covered every row that was already there.
+        let indexes = {
+            // Paged under the table's own directory when the residency asks
+            // for it (docs/disk-indexes.md); a table without one (memory,
+            // key/value, a mirrored pool) keeps its indexes in memory.
+            let placement = io_pointers
+                .index_store_dir()
+                .filter(|dir| !crate::core::index::paged::memory_forced(dir))
+                .map(|dir| crate::core::index::paged::Placement::for_table(&dir, stem));
+            let indexes = crate::core::index::for_schema_in(&schema, placement.as_ref());
+            (!indexes.is_empty()).then(|| StdArc::new(indexes))
+        };
+        // Loaded from the snapshot's INDEX sections when the proof passed and
+        // `index_snapshot.index_storage` is `snapshot`, else built from rows
+        // as before (docs/persistent-indexes.md §4, B17;
+        // `index_store::load`). A load raises the file set's barrier here,
+        // before the open returns: a write's first ticket waits for it.
+        let filter_vouches = was_loaded
+            && !filters.as_ref().is_some_and(|f| f.resume_slot() < existing_slots)
+            && gate.state() == crate::core::index_store::gate_word::GateState::Clean;
+        let index_sections = StdArc::new(AtomicBool::new(false));
+        let index_origin = StdArc::new(std::sync::atomic::AtomicU8::new(0));
+        let mut indexes_vouch = true;
+        let mut index_load = false;
+        // The open's one-shot starts: run now, or by `ensure_full` for a
+        // scan-only open (`DeferredStart`).
+        let mut starts: Vec<DeferredStart> = Vec::new();
+        if let Some(indexes) = indexes.clone() {
+            use crate::core::index_store::load;
+            let storage = load::settings::index_storage_of(gate.dir(), stem);
+            let plan = load::plan(&indexes, storage, proven_indexes.as_ref());
+            let loading = matches!(plan, load::Plan::Load { .. });
+            // A snapshot whose INDEX sections this open does not load is not
+            // what a seal would write now (§3 rule 2).
+            indexes_vouch = !load::captures(&indexes, storage) || loading;
+            index_load = loading;
+            // Read now, before any compaction can start: a build may mark the
+            // indexes ready only if no renumbering began or ended while it
+            // ran, and a load only if none did since the open proved the
+            // snapshot.
+            let epoch_at_open = indexes.epoch();
+            let name = table_name.to_string();
+            let gate_task = gate.clone();
+            let index_sections_task = index_sections.clone();
+            let index_origin_task = index_origin.clone();
             let io_pointers_task = io_pointers.clone();
             let io_rows_task = io_rows.clone();
             let fields = schema.fields.clone();
+            let readers_task = readers.clone();
+            let alive = maintenance_alive.clone();
+            starts.push(Box::new(move || {
+                // A load's barrier is raised here, before the start returns,
+                // so a routed read waits for the load (`load_wait`) rather
+                // than scan, and a write whose ticket takes the slow path
+                // waits too. On a word already `Dirty` a write's ticket takes
+                // the fast path and writes during the load: sound, since a
+                // load is a union with what writes inserted (`index_store::
+                // load`'s module docs: `load_sorted` merges, a paged run is
+                // adopted as the oldest, a failed load clears and rebuilds).
+                let barrier = matches!(plan, load::Plan::Load { .. }).then(|| gate_task.loads().raise());
+                tokio::spawn(async move {
+                    if !alive.load(AtomicOrdering::Relaxed) {
+                        return;
+                    }
+                    // Deferred by a scan-only open, a load of the sections its
+                    // proof found stands unless the slots moved since: renumbered
+                    // (a compaction), or more of them (nothing with a write path
+                    // writes before the upgrade, so none should be). A vacuum
+                    // tick's reclamation or a forget sweep's neutralizing may
+                    // have written meanwhile with no write path; neither adds a
+                    // slot or changes what a row's indexed values are, so the
+                    // loaded index is still a superset of the rows. Run at the
+                    // open, this is the open's own plan.
+                    let plan = match plan {
+                        load::Plan::Load { .. }
+                            if indexes.epoch() != epoch_at_open
+                                || io_pointers_task.get_len().await / ROW_POINTER_RECORD_LEN as u64 != existing_slots =>
+                        {
+                            load::Plan::BuildInstead("the slots changed after its scan-only open")
+                        }
+                        plan => plan,
+                    };
+                    let loading = matches!(plan, load::Plan::Load { .. });
+                    let opened = load::OpenIndexes {
+                        name,
+                        indexes: indexes.clone(),
+                        epoch: if loading { epoch_at_open } else { indexes.epoch() },
+                        n_slots: existing_slots,
+                        gate: gate_task.clone(),
+                        // A build drops it at once (`open_indexes`).
+                        barrier,
+                        vouch: filter_vouches,
+                        sections_in_snapshot: index_sections_task,
+                        origin: index_origin_task,
+                    };
+                    let build = gate::build_token();
+                    load::open_indexes(&build, opened, plan, || {
+                        build_indexes(&indexes, &io_pointers_task, &io_rows_task, &fields, Some(&readers_task))
+                    })
+                    .await;
+                });
+            }));
+        }
+
+        // The filter's backfill, when it has one, runs on this task. No
+        // caller ever pays for it: `Table::new` returns immediately.
+        // Whether the task has anything to backfill is knowable now, so a table
+        // with nothing to do reports ready immediately rather than after the
+        // task has been scheduled. Otherwise `filters_ready()` races on a fresh
+        // table, where the answer is trivially yes. A loaded filter covers
+        // every slot, so it has nothing to do.
+        let needs_backfill = filters.as_ref().is_some_and(|f| {
+            filter_settings.backfill_on_open() && f.resume_slot() < existing_slots
+        });
+        // A load vouches for the word only when the loaded filter is all this
+        // instance has: one that still backfills differs from the snapshot,
+        // which the next clean point rewrites (§3 rule 3). With INDEX
+        // sections to load, their load vouches once it succeeds (B17).
+        if filter_vouches && indexes_vouch && !index_load {
+            gate.set_vouched(true);
+        }
+
+        if filters.is_some() {
+            filters_ready.store(!needs_backfill, AtomicOrdering::Release);
+        }
+        if let Some(filters) = filters.clone().filter(|_| needs_backfill) {
+            let ready = filters_ready.clone();
+            let alive = maintenance_alive.clone();
+            let io_pointers_task = io_pointers.clone();
+            let io_rows_task = io_rows.clone();
+            let fields = schema.fields.clone();
+            let stem_task = stem.to_string();
             // The backfill reads row bytes by pointer, exactly as a query does,
             // so it has to hold a reader epoch for the same reason: an extent it
             // is fetching from must not be reclaimed underneath it. Indexing
             // another row's bytes would not fail — it would silently build a
             // filter that prunes rows that do match.
             let readers_task = readers.clone();
+            // Read now, before any compaction can start. One that runs after
+            // this demotes the filter, and only its own rebuild, or the next
+            // open's backfill, may report it ready again.
+            let epoch_at_open = filters.renumber_epoch();
 
-            tokio::spawn(async move {
-                if needs_backfill {
-                    let resume = filters.resume_slot();
-                    if resume < existing_slots && alive.load(AtomicOrdering::Relaxed) {
-                        match backfill_into(
-                            &filters,
-                            &io_pointers_task,
-                            &io_rows_task,
-                            &fields,
-                            resume,
-                            Some(&readers_task),
-                        )
-                        .await
-                        {
-                            // Checkpoint straight away so the next open resumes
-                            // instead of rescanning.
-                            Ok(_) => {
-                                let n = io_pointers_task.get_len().await
-                                    / ROW_POINTER_RECORD_LEN as u64;
-                                filters.checkpoint(&*io_filters_task, n).await;
-                            }
-                            Err(e) => {
-                                error!("Filter backfill failed, continuing unfiltered: {}", e)
-                            }
+            starts.push(Box::new(move || { tokio::spawn(async move {
+                let resume = filters.resume_slot();
+                if resume < existing_slots && alive.load(AtomicOrdering::Relaxed) {
+                    let started = std::time::Instant::now();
+                    match backfill_into(
+                        &filters,
+                        &io_pointers_task,
+                        &io_rows_task,
+                        &fields,
+                        resume,
+                        Some(&readers_task),
+                    )
+                    .await
+                    {
+                        // Nothing is written: the filter persists only at a
+                        // clean point (docs/persistent-indexes.md §5).
+                        Ok(_) => info!(
+                            "{}: filter backfilled over {} slots in {:.3} s",
+                            stem_task,
+                            existing_slots - resume,
+                            started.elapsed().as_secs_f64()
+                        ),
+                        Err(e) => {
+                            error!("Filter backfill failed, continuing unfiltered: {}", e)
                         }
                     }
                 }
                 // Queries before this point are correct, just unfiltered.
-                ready.store(true, AtomicOrdering::Release);
-
-                loop {
-                    // Re-read each tick, so `SET FILTER checkpoint_interval_secs`
-                    // takes effect without restarting the table.
-                    let secs = crate::core::filter::settings::settings()
-                        .checkpoint_interval_secs();
-                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-                    if !alive.load(AtomicOrdering::Relaxed) {
-                        break;
-                    }
-                    if filters.should_checkpoint() || filters.checkpoint_requested() {
-                        let n =
-                            io_pointers_task.get_len().await / ROW_POINTER_RECORD_LEN as u64;
-                        filters.checkpoint(&*io_filters_task, n).await;
-                    }
+                if filters.renumber_epoch() == epoch_at_open {
+                    ready.store(true, AtomicOrdering::Release);
                 }
-            });
+            }); }));
         }
 
         // Reclamation runs on its own task for the same reason filter
@@ -643,19 +1849,28 @@ impl<S: StorageIO> Table<S> {
         // caller should ever find itself waiting behind.
         let vacuum_stats = StdArc::new(VacuumStats::default());
         let write_generation = StdArc::new(CacheGuard::new(AtomicU64::new(0)));
+        let dead_stamps = StdArc::new(AtomicU64::new(0));
         let versions: StdArc<ArcSwapOption<TransactionManager>> =
             StdArc::new(ArcSwapOption::empty());
-        let cleared_below = StdArc::new(CacheGuard::new(AtomicU64::new(0)));
+        // Restored from the snapshot when the filter was loaded (§2), before
+        // vacuum's first tick: its codes below the bound are already empty.
+        let cleared_below = StdArc::new(CacheGuard::new(AtomicU64::new(cleared_at_open)));
         // The sidecar counts as much as the flags: this is what decides whether
         // the write lock is taken, and a table whose only constraints are
         // table-level would otherwise be checked without it.
         let has_unique = schema.fields.iter().any(|f| f.is_unique && !f.is_deleted)
             || !schema.unique_keys.is_empty();
-        let cache_generation = StdArc::new(CacheGuard::new(AtomicU64::new(next_cache_generation())));
-        let schema_name_for_cache = schema.name.clone();
+        let cache_instance = next_cache_generation();
+        let cache_generation = StdArc::new(CacheGuard::new(AtomicU64::new(cache_instance)));
+        let cache_scope = instance_scope(&cache_scope, cache_instance);
+        let write_lock = StdArc::new(tokio::sync::RwLock::new(()));
+        let compaction_gate = StdArc::new(tokio::sync::RwLock::new(()));
+        let forget = StdArc::new(std::sync::OnceLock::new());
+        let maintenance_tick = StdArc::new(tokio::sync::Mutex::new(()));
 
+        let mut vacuum = None;
         if crate::vacuum_enabled() {
-            VacuumService {
+            let service = VacuumService {
                 table_name: schema.name.clone(),
                 io_pointers: io_pointers.clone(),
                 io_rows: io_rows.clone(),
@@ -663,102 +1878,370 @@ impl<S: StorageIO> Table<S> {
                 readers: readers.clone(),
                 stats: vacuum_stats.clone(),
                 alive: maintenance_alive.clone(),
+                tick: maintenance_tick.clone(),
                 mutations: write_generation.clone(),
+                dead_stamps: dead_stamps.clone(),
                 versions: versions.clone(),
                 filters: filters.clone(),
+                indexes: indexes
+                    .clone()
+                    .map(|ix| {
+                        let fetch = Self::build_fetch_for(&schema.fields, &ix.columns());
+                        (ix, fetch)
+                    }),
                 cleared_below: cleared_below.clone(),
                 config: VacuumConfig::default(),
+                write_lock: write_lock.clone(),
+                compaction_gate: compaction_gate.clone(),
+                cache_generation: cache_generation.clone(),
+                forget: forget.clone(),
+                gate: StdArc::downgrade(&gate),
+            };
+            // An `External` partition's service is ticked by its scheduler.
+            if watch.is_some() {
+                vacuum = Some(service);
+            } else {
+                service.spawn();
             }
-            .spawn();
+        }
+
+        // What a seal of this instance reads, and the idle checkpoint's
+        // watcher over it (docs/persistent-indexes.md §3, B13).
+        let seal = StdArc::new(table_seal::SealParts {
+            name: stem.to_string(),
+            gate: gate.clone(),
+            io_pointers: io_pointers.clone(),
+            io_rows: io_rows.clone(),
+            own: guard.is_none().then(|| (io_schema.clone(), ids.io.clone())),
+            filters: filters.clone(),
+            indexes: indexes.clone(),
+            filters_ready: filters_ready.clone(),
+            versions: versions.clone(),
+            incarnation: schema.incarnation,
+            shape_hash,
+            cleared_below: cleared_below.clone(),
+            legacy_flt: flt == FltAtOpen::LegacyPair,
+            revocations_at_open,
+            retired: AtomicBool::new(false),
+            index_sections,
+            index_origin,
+            on_store,
+            kv_sealed: parking_lot::Mutex::new(kv_loaded),
+        });
+        // A scan-only open whose snapshot proved loadable, with the budget's
+        // room, opens full after all (`PartitionOpen::load_if_proven`).
+        let deferred = deferred && !(load_if_proven && index_load);
+        // Set while a scan-only open's starts wait; the unit reads it.
+        let scan_only_unit = StdArc::new(AtomicBool::new(deferred));
+        let external = match &watch {
+            Some(watch) => {
+                let sealer = table_seal::IdleSealer::new(&seal, maintenance_alive.clone(), cache_generation.clone());
+                let unit = StdArc::new(table_maintenance::ExternalUnit::new(
+                    io_rows.clone(),
+                    io_pointers.clone(),
+                    maintenance_alive.clone(),
+                    watch.clone(),
+                    vacuum.take(),
+                    sealer,
+                    scan_only_unit.clone(),
+                ));
+                let weak: std::sync::Weak<dyn crate::core::partition::maintenance::Unit> =
+                    StdArc::downgrade(&(unit.clone() as StdArc<dyn crate::core::partition::maintenance::Unit>));
+                watch.attach(weak);
+                Some(unit)
+            }
+            None => {
+                table_seal::spawn_idle_watcher(&seal, maintenance_alive.clone(), cache_generation.clone());
+                None
+            }
+        };
+        // The audit of a load, 1 in `index_snapshot.audit_rate` (§4, B18),
+        // after the index start that raises the load's barrier.
+        {
+            let parts = table_audit::AuditParts {
+                seal: seal.clone(),
+                fields: schema.fields.clone(),
+                readers: readers.clone(),
+                alive: maintenance_alive.clone(),
+                cache_generation: cache_generation.clone(),
+            };
+            starts.push(Box::new(move || table_audit::spawn_after_load(parts)));
+        }
+        // A full open starts everything now; a scan-only one keeps it for
+        // its upgrade (`ensure_full`).
+        let scan_only_flag = scan_only_unit;
+        let deferred_starts = if deferred {
+            starts
+        } else {
+            for start in starts {
+                start();
+            }
+            Vec::new()
+        };
+        // A plain table's descriptors come off the partitions' open budget
+        // (`partition::budget`, which counts them); on a server the soft
+        // limit is raised as they grow. A memory-backed relation holds none.
+        if guard.is_none() && io_pointers.index_store_dir().is_some() {
+            crate::core::partition::budget::note_plain_open();
         }
 
         Self {
             schema,
-            io_pointers,
-            io_rows,
+            schema_unreadable,
             io_schema,
-            io_filters,
-            io_sequence,
+            data: Some(TableData {
+                seal,
+                io_pointers,
+                io_rows,
+                ids,
+                len: AtomicU64::new(table_length).into(),
+                guard,
+                filters,
+                indexes,
+                free_space,
+                readers,
+                vacuum_stats,
+            }),
             versions,
+            max_writer: StdArc::new(AtomicU64::new(0)),
             cleared_below,
             has_unique,
+            legacy_keys_canonical: false,
+            legacy_char_duplicates: Vec::new(),
             in_place_column_updates: AtomicU64::new(0).into(),
-            id_reserved_upto: id_reserved_upto.into(),
             hard_locked: AtomicBool::new(false).into(),
-            len: atomic_table_length.into(),
-            last_row_id: atomic_last_id.into(),
             concurrent_processor: ConcurrentProcessor::new(),
-            cache_scope: schema_name_for_cache,
-            filters,
-            free_space,
-            readers,
-            vacuum_stats,
-            write_lock: tokio::sync::Mutex::new(()),
-            compaction_gate: tokio::sync::RwLock::new(()),
+            cache_scope,
+            cache_instance,
+            write_lock,
+            unique_lock: StdArc::new(crate::core::row::key_locks::KeyLocks::new()),
+            compaction_gate,
+            forget,
             write_generation,
+            dead_stamps,
             cache_generation,
             filters_ready,
             maintenance_alive,
+            services_released,
+            maintenance_tick,
+            gate,
+            watch,
+            external,
+            scan_only: scan_only_flag,
+            deferred_starts: parking_lot::Mutex::new(deferred_starts),
         }
     }
 
-    /// Reads the persisted id reservation, or `None` if there is none yet.
-    ///
-    /// A sidecar that is present but unreadable is treated as absent: the
-    /// caller's fallback is conservative, and refusing to open a table because
-    /// eight bytes went bad would be a worse answer than handing out ids from a
-    /// slightly higher floor.
-    async fn load_id_sequence(io_sequence: &Arc<S>) -> Option<u64> {
-        if io_sequence.get_len().await < 8 {
-            return None;
+    /// Whether this instance was opened scan-only and has not been upgraded
+    /// yet ([`Self::ensure_full`]): its indexes neither load nor build, and
+    /// answer nothing (they are not ready), and its filter prunes only if
+    /// the open loaded it from the snapshot.
+    pub fn is_scan_only(&self) -> bool {
+        self.scan_only.load(AtomicOrdering::Acquire)
+    }
+
+    /// Upgrades a scan-only instance (phase 3 P5b-2b): runs the starts its
+    /// open deferred (the index load or build, the filter backfill, the
+    /// load audit), once. Called before any write takes its ticket
+    /// (`enter_write`) and when a routed access reaches the instance, so a
+    /// write never touches the indexes before a load's barrier is raised:
+    /// the starts run under the lock, and the flag clears only after them,
+    /// so a caller that finds it clear, or waited on the lock, sees every
+    /// start made. Scans racing it are unaffected: an index answers only
+    /// once ready, before and after.
+    pub fn ensure_full(&self) {
+        if !self.scan_only.load(AtomicOrdering::Acquire) {
+            return;
         }
-        let mut buffer = [0u8; 8];
-        let mut position = 0u64;
-        match io_sequence
-            .read_data_into_buffer(&mut position, &mut buffer)
-            .await
-        {
-            Ok(()) => Some(u64::from_le_bytes(buffer)),
-            Err(e) => {
-                error!("Could not read the id sequence ({}); recovering from the pointer file", e);
-                None
+        let mut starts = self.deferred_starts.lock();
+        for start in starts.drain(..) {
+            start();
+        }
+        self.scan_only.store(false, AtomicOrdering::Release);
+    }
+
+    /// The file set's write gate.
+    pub fn gate(&self) -> &StdArc<FileGate> {
+        &self.gate
+    }
+
+    /// Vacuum's clear horizon now (§2), for tests of its persistence (B14).
+    #[cfg(test)]
+    pub(crate) fn cleared_below_for_tests(&self) -> u64 {
+        self.cleared_below.load(AtomicOrdering::Acquire)
+    }
+
+    /// The family a write path's ticket on this file set is kept for (§2
+    /// layer 1, Ticket ownership): inside an owner scope of this database,
+    /// the scope's lock owner, whose record keeps a ticket on the file set
+    /// until the owner is released, after the outcome is final; the ticket a
+    /// write path holds is then a second count beside it, for its mutations'
+    /// proofs. `None` outside every scope (a table written with no statement
+    /// around it: tests, tools): the ticket is transient, given back when the
+    /// caller drops it.
+    ///
+    /// Every write path takes `gate::ticket(&self.gate, self.family())` after
+    /// the table lock and before `compaction_gate`, `write_lock`, the key
+    /// stripes and row locks, and before its first in-memory index or filter
+    /// mutation and its first data-file write. In `Clean` or `Unknown` the
+    /// ticket makes `DIRTY` durable first (T1).
+    #[inline]
+    pub(crate) fn family(&self) -> Option<gate::Family> {
+        let manager = self.versions.load_full()?;
+        let owner = crate::core::mvcc::owner::family_for(&manager)?;
+        Some(gate::Family { manager, owner })
+    }
+
+    /// The addresses of this table's in-memory structures, for the census
+    /// (`index_store::census`): the filter, the indexes and every index in
+    /// them.
+    #[cfg(test)]
+    pub(crate) fn census_structures(&self) -> Vec<usize> {
+        let Ok(d) = self.data() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if let Some(f) = d.filters.as_ref() {
+            out.push(StdArc::as_ptr(f) as usize);
+        }
+        if let Some(ix) = d.indexes.as_ref() {
+            out.push(StdArc::as_ptr(ix) as usize);
+            out.extend(ix.list.iter().map(|l| StdArc::as_ptr(l) as usize));
+            out.extend(ix.gin.iter().map(|g| StdArc::as_ptr(g) as usize));
+        }
+        out
+    }
+
+    /// The paths of this table's own files, for the census: rows, pointers,
+    /// filter sidecar and, for a plain table, schema and sequence.
+    #[cfg(test)]
+    pub(crate) fn census_files(&self) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut push = |io: &S| {
+            if let Some(dir) = io.get_location() {
+                out.push(std::path::Path::new(&dir).join(io.get_name()));
+            }
+        };
+        push(&self.io_schema);
+        if let Ok(d) = self.data() {
+            push(&d.io_pointers);
+            push(&d.io_rows);
+            push(&d.ids.io);
+        }
+        out
+    }
+
+    /// Retires this instance (§7 step 2): its maintenance stops, and any
+    /// vacuum work in flight on it (the reclamation service's current
+    /// sweep, a manual `VACUUM`) has finished when this returns. Reads
+    /// through an instance a statement still holds keep working: retiring
+    /// stops only the background writers, so the reload that replaces this
+    /// instance never has two maintenance tasks on one set of files.
+    ///
+    /// Called with ACCESS EXCLUSIVE held on the table's name (or with no
+    /// lock owner at all), so no statement is using the instance. The flag
+    /// goes first: a sweep in flight checks it between batches and while it
+    /// waits for a permit, which bounds the wait below.
+    pub async fn retire(&self) {
+        self.maintenance_alive.store(false, AtomicOrdering::Release);
+        let _joined = self.maintenance_tick.lock().await;
+        // §7 step 2(a): a retired instance never snapshots. A running seal
+        // of it is cancelled (a no-op once it is publishing) and waited for,
+        // so none is still writing the file set's `.ixs` or `.ixm` when the
+        // caller goes on to copy, rewrite or drop the files (B13).
+        if let Ok(d) = self.data() {
+            d.seal.retired.store(true, AtomicOrdering::Release);
+            let _ = self.gate.word().cancel_seal();
+            let _sealed = self.gate.maintenance().lock().await;
+        }
+    }
+
+    /// The exclusive close of a partition opened `External`
+    /// (docs/partitioning.md §7.2, phase 3 P5b), by its partitioned table
+    /// once it owns this instance alone: retired as a schema change retires
+    /// one, its unit's round in flight waited out, then its staged appends
+    /// landed, so the closed file set keeps every byte in its main files and
+    /// nothing of this instance writes once its successor opens. An instance
+    /// a schema change retired first is left as it was: the successor that
+    /// change opened over the same files lands what it staged.
+    ///
+    /// With `seal`, the file set is sealed first (P5b-2, §7.2 point 3), as
+    /// shutdown seals: background writers stopped and joined, the unit's
+    /// round waited out, then an optional seal, which writes a snapshot only
+    /// when this instance holds something the published one lacks (a
+    /// write since, or indexes it rebuilt rather than loaded) and every
+    /// index and the filter are ready, and lands the staged appends itself.
+    /// Nothing else writes the file set meanwhile: the caller owns the
+    /// instance alone. A seal that skips or fails leaves the next open to
+    /// rebuild, as before; one cut by a crash leaves a snapshot its marker
+    /// log does not vouch for, which no open trusts (`index_store::seal`).
+    pub(crate) async fn close_exclusive(&self, seal: bool) {
+        let already = self.is_retired();
+        // A seal only when it can publish (P5b-2b): an instance whose
+        // indexes or filter are not ready (a scan-only one, or one closed
+        // before its build or backfill finished) is not eligible, and the
+        // seal would first take its transient ticket, marking the file set's
+        // snapshot `DIRTY` for nothing: the next open would rebuild instead
+        // of loading it.
+        let seal = seal && !self.is_scan_only() && self.ready_to_seal();
+        if seal && !already {
+            self.quiesce_for_shutdown().await;
+            if let Some(unit) = &self.external {
+                unit.quiesce().await;
+            }
+            #[cfg(test)]
+            let sealed = if close_seal_hooks::skipped() {
+                crate::core::index_store::seal::SealOutcome::Excluded
+            } else {
+                self.seal_snapshot(crate::core::index_store::gate_word::SealKind::Optional).await
+            };
+            #[cfg(not(test))]
+            let sealed = self.seal_snapshot(crate::core::index_store::gate_word::SealKind::Optional).await;
+            ::log::debug!("partition {} sealed at close: {sealed:?}", self.schema.name);
+        }
+        self.retire().await;
+        if let Some(unit) = &self.external {
+            unit.quiesce().await;
+        }
+        if already {
+            return;
+        }
+        if let Ok(d) = self.data() {
+            // A landing the gate refuses, or one that fails, leaves the bytes
+            // in `.tmp`, which the next open of the file set lands.
+            for io in [&d.io_rows, &d.io_pointers] {
+                for _ in 0..3 {
+                    if !io.land_background().await {
+                        break;
+                    }
+                }
             }
         }
     }
 
-    /// Reserves the next block of ids on disk.
-    ///
-    /// Written before any id in the block is used, so a crash can only ever skip
-    /// ids, never repeat one. Ids need to be unique, not gapless.
-    async fn reserve_ids(&self, upto: u64) {
-        self.io_sequence.write_data(0, &upto.to_le_bytes()).await;
-        self.id_reserved_upto.store(upto, AtomicOrdering::Release);
+    /// Whether this instance's indexes (if any) and filter are ready: what a
+    /// seal's eligibility asks of them.
+    fn ready_to_seal(&self) -> bool {
+        self.filters_ready().unwrap_or(false)
+            && self.indexes().ok().and_then(|ix| ix.as_ref().map(|ix| ix.is_ready())).unwrap_or(true)
     }
 
-    /// Makes sure the sequence on disk covers the ids about to be handed out.
-    ///
-    /// Called before an insert allocates, so the reservation is always ahead of
-    /// use. The common case is a relaxed load and a comparison.
-    async fn ensure_ids_reserved(&self) {
-        let next = self.last_row_id.load(AtomicOrdering::Acquire);
-        if next < self.id_reserved_upto.load(AtomicOrdering::Acquire) {
-            return;
-        }
-        self.reserve_ids(next + ID_RESERVATION_CHUNK).await;
+    /// Whether [`Table::retire`] has run (or the table was dropped, or is a
+    /// shell, which runs no maintenance).
+    pub fn is_retired(&self) -> bool {
+        !self.maintenance_alive.load(AtomicOrdering::Acquire)
     }
 
-    /// Registers this read with the epoch registry, so reclamation cannot hand
-    /// out an extent the read is about to fetch from.
-    ///
-    /// Inert when reclamation is off: nothing ever moves, so there is nothing
-    /// to shield against and no reason to pay for the bookkeeping.
-    #[inline]
-    fn read_guard(&self) -> ReadTicket {
-        if self.free_space.is_enabled() {
-            self.readers.enter()
-        } else {
-            ReadTicket::inert()
-        }
+    /// The highest id the sequence reservation covers, for tests.
+    #[cfg(test)]
+    pub(crate) fn ids_reserved_upto(&self) -> Result<u64> {
+        Ok(self.data()?.ids.reserved_upto.load(AtomicOrdering::Acquire))
+    }
+
+    /// See [`TableData::reserve_insert_id`].
+    #[cfg(test)]
+    pub(crate) async fn reserve_insert_id(&self) -> Result<IdsInFlight<'_>> {
+        Ok(self.data()?.ids.reserve_insert_id().await)
     }
 
     /// Puts this table under MVCC.
@@ -774,7 +2257,73 @@ impl<S: StorageIO> Table<S> {
     /// transaction is about to read. The two changes belong in one step; this is
     /// not a switch to flip ahead of the write path.
     pub fn enable_versioning(&self, manager: StdArc<TransactionManager>) {
+        // Registered with the manager's forget registry at the horizon already
+        // forgotten — which the files this table opens satisfy, having been
+        // part of a registered table when that horizon was reached. Once per
+        // table object: a second call would register a second handle.
+        //
+        // Not for a shell. It has no rows, so no sweep ever advances its
+        // handle, and a handle that never advances holds the database's
+        // forget horizon down for good: the status bitmap would then grow
+        // without limit. Its partitions register for themselves.
+        //
+        // Nor for a partition opened `External`: its forget horizon is its
+        // slot's pin, which its partitioned table's one handle covers
+        // (docs/partitioning.md §7.2), so a reopen or close of the partition
+        // never moves the registry.
+        if !self.is_shell() && self.watch.is_none() {
+            let _ = self.forget.set(manager.register_table());
+        }
+        if let Ok(d) = self.data() {
+            d.vacuum_stats.attach(manager.clone());
+        }
         self.versions.store(Some(manager));
+    }
+
+    /// This table's forget horizon, once versioning is enabled.
+    pub fn forget_horizon(&self) -> Option<TxId> {
+        self.forget.get().map(|h| h.horizon())
+    }
+
+    /// Runs a forget sweep now. See [`crate::core::vacuum::neutralize_aborted`].
+    /// A partition opened `External` sweeps through its slot
+    /// (`PinBoard::sweep`), which records `SWEPT` and moves the slot's pin.
+    pub async fn neutralize_aborted_now(&self) -> std::io::Result<crate::core::vacuum::NeutralizeReport> {
+        let d = self.data()?;
+        if let Some(watch) = &self.watch {
+            return Box::pin(watch.sweep_now()).await;
+        }
+        let (Some(manager), Some(handle)) = (self.versions.load_full(), self.forget.get()) else {
+            return Ok(Default::default());
+        };
+        let parts = crate::core::vacuum::NeutralizeParts {
+            io_pointers: &*d.io_pointers,
+            write_lock: &self.write_lock,
+            compaction_gate: &self.compaction_gate,
+            readers: &d.readers,
+            free_space: &d.free_space,
+            cache_generation: &self.cache_generation,
+            dead_stamps: &self.dead_stamps,
+            drain_timeout: std::time::Duration::from_secs(crate::vacuum_drain_timeout_secs()),
+            alive: None,
+            gate: Some(&self.gate),
+        };
+        crate::core::vacuum::neutralize_aborted(&parts, &manager, handle).await
+    }
+
+    /// Enters a partition's write watch (docs/partitioning.md §7.2, §7.3):
+    /// every write path calls this first, before its ticket, and holds the
+    /// guard to its end. A clean partition's first writer makes its pin
+    /// durable here, before any stamp. `None` on every table but a partition
+    /// opened `External`.
+    async fn enter_write(&self) -> Result<Option<crate::core::partition::maintenance::WriteGuard<'_>>> {
+        // A scan-only instance is upgraded before its first write's ticket,
+        // so a load's barrier is up before anything is written (P5b-2b).
+        self.ensure_full();
+        match &self.watch {
+            None => Ok(None),
+            Some(watch) => watch.enter().await.map(Some),
+        }
     }
 
     /// Notes that `written_by` has stamped a version here.
@@ -785,6 +2334,9 @@ impl<S: StorageIO> Table<S> {
     /// rather than decided from the shape of the statement, because a `SELECT`
     /// with a data-modifying CTE writes rows through exactly these paths.
     fn note_write(&self, written_by: TxId) {
+        // Before any row is written, so before the writer can commit: a
+        // snapshot that sees the commit is taken after this is visible.
+        self.max_writer.fetch_max(written_by, std::sync::atomic::Ordering::SeqCst);
         if let Some(manager) = self.versions.load().as_ref() {
             manager.mark_wrote(written_by);
         }
@@ -803,6 +2355,103 @@ impl<S: StorageIO> Table<S> {
     /// reaches a client.
     pub(crate) const CONFLICT_RETRYABLE: &'static str = " [retryable]";
 
+    /// How a version stands for a uniqueness check by `writer`, judged by
+    /// outcome rather than by a snapshot (see `find_row_with_value`), or
+    /// `None` when it holds no key: decided before the version's row is
+    /// fetched. Only a creator or deleter at or above `floor` (the running
+    /// set's minimum, [`RunningFloor`]) can be a commit not yet retired;
+    /// that question waits for [`Self::settle_occupancy`], once the
+    /// version's value has matched. Below the floor a recorded commit is
+    /// retired for good, so a version deleted that long ago is skipped here,
+    /// unfetched, as it was before the running set was asked at all.
+    fn occupancy(
+        manager: &crate::core::mvcc::transaction::TransactionManager,
+        pointer: &RowPointer,
+        writer: TxId,
+        visibility: &crate::core::mvcc::Visibility,
+        floor: &mut RunningFloor,
+    ) -> Option<Occupancy> {
+        use crate::core::mvcc::transaction::TxOutcome;
+        let creator = manager.outcome(pointer.xmin);
+        if pointer.deleted || creator == TxOutcome::Aborted {
+            return None;
+        }
+        if pointer.xmax != NO_TX && !visibility.deleted_by_reader(pointer.xmax) {
+            if manager.outcome(pointer.xmax) == TxOutcome::Committed {
+                // Deleted, unless the delete's commit is recorded and not yet
+                // retired: until then a snapshot still shows the version.
+                // Retired, it is free, and decided here, unfetched — unless
+                // the check's snapshot does not see the delete: then the
+                // version that replaced it may have entered the index after
+                // the check sampled it (`Superseded`, `Supersessions`).
+                if floor.retired(manager, pointer.xmax) {
+                    if visibility.sees_delete(pointer.xmax) {
+                        return None;
+                    }
+                    return Some(Occupancy::Superseded(pointer.xmax));
+                }
+                return Some(Occupancy::DeletedBy(pointer.xmax));
+            }
+        } else if pointer.xmax != NO_TX {
+            return None;
+        }
+        // Our own uncommitted row is a real duplicate, not a race: retrying
+        // would find it again. Only another transaction's unfinished write is
+        // worth waiting out. "Our own" is the whole transaction, savepoints
+        // included: a key the block wrote before `SAVEPOINT` (or in one since
+        // released) and written again inside one was "being written by
+        // another transaction", 40001 where PostgreSQL says 23505, and
+        // `transaction()` retries replayed it for nothing. A rolled-back
+        // savepoint's rows are `Aborted`, refused above.
+        let mine = pointer.xmin == writer || manager.top_level(pointer.xmin) == manager.top_level(writer);
+        Some(match creator {
+            TxOutcome::InProgress if !mine => Occupancy::InFlight(pointer.xmin),
+            TxOutcome::Committed if !mine && !floor.retired(manager, pointer.xmin) => {
+                Occupancy::Committed(pointer.xmin)
+            }
+            _ => Occupancy::Held,
+        })
+    }
+
+    /// Whether a matched version's key is in flight (`Some(true)`: the
+    /// statement replays, waiting on the transaction named to
+    /// `conflict_wait`), held (`Some(false)`), or free after all (`None`).
+    ///
+    /// A commit recorded but not yet retired (`TransactionManager::
+    /// unfinished`) is still in flight here, in both directions. An insert of
+    /// a key whose own insert was in that window read the key as taken, and
+    /// its `ON CONFLICT DO UPDATE` then read at a snapshot that could not see
+    /// the row, updated nothing and reported `INSERT 0 0`; an insert of a key
+    /// whose delete was in that window wrote it and committed while a
+    /// snapshot still showed the deleted row: the key twice
+    /// (`rql::row_lock_handover_tests`).
+    ///
+    /// An insert of a key whose DELETE is still in progress is refused with
+    /// 23505 at once, as before (`occupancy` counts the version as held):
+    /// PostgreSQL waits for that DELETE instead. Only a delete whose commit
+    /// is recorded waits here.
+    fn settle_occupancy(
+        manager: Option<&crate::core::mvcc::transaction::TransactionManager>,
+        occupancy: Option<Occupancy>,
+    ) -> Option<bool> {
+        let (manager, occupancy) = match (manager, occupancy) {
+            (Some(manager), Some(occupancy)) => (manager, occupancy),
+            _ => return Some(false),
+        };
+        let blocker = match occupancy {
+            Occupancy::Held => return Some(false),
+            Occupancy::InFlight(creator) => creator,
+            Occupancy::Committed(creator) if manager.is_running(creator) => creator,
+            Occupancy::Committed(_) => return Some(false),
+            Occupancy::DeletedBy(deleter) if manager.is_running(deleter) => deleter,
+            Occupancy::DeletedBy(_) | Occupancy::Superseded(_) => return None,
+        };
+        // The writer of a key in flight is the transaction the replay waits
+        // for (slice B6, finding L1).
+        crate::core::rql::conflict_wait::note_blocker(blocker);
+        Some(true)
+    }
+
     /// Refuses a write to a version another transaction has already retired.
     ///
     /// Without this, two transactions can update the same row and both succeed:
@@ -811,10 +2460,11 @@ impl<S: StorageIO> Table<S> {
     /// two versions of one row are visible and the row is duplicated — and the
     /// update that was overwritten is silently lost.
     ///
-    /// First updater wins. The second is told to retry rather than being made to
-    /// wait, which is what PostgreSQL does under `REPEATABLE READ`; blocking
-    /// until the first transaction ends would need a lock manager this engine
-    /// does not have.
+    /// First updater wins. The second is told to retry, naming the transaction
+    /// it met (`conflict_wait::note_blocker`); the executor's retry waits for
+    /// that transaction to end, with a wait-for edge (slice B6, finding L1),
+    /// and replays, which under `READ COMMITTED` is PostgreSQL's block and
+    /// re-evaluate, and under `REPEATABLE READ` conflicts again and reports.
     fn check_write_conflict(&self, pointer: &RowPointer, writer: TxId) -> Result<()> {
         if pointer.xmax == NO_TX || pointer.xmax == writer {
             return Ok(());
@@ -827,6 +2477,9 @@ impl<S: StorageIO> Table<S> {
         if manager.outcome(pointer.xmax) == crate::core::mvcc::TxOutcome::Aborted {
             return Ok(());
         }
+        // The transaction to wait for, for the retry that replays this
+        // (slice B6, finding L1): carried beside the error, not in its text.
+        crate::core::rql::conflict_wait::note_blocker(pointer.xmax);
         Err(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             format!(
@@ -840,6 +2493,19 @@ impl<S: StorageIO> Table<S> {
         .into())
     }
 
+    /// A row another transaction holds `FOR UPDATE`, met as the write loop
+    /// marked it (`RowMarker::mark`). Before anything is applied the
+    /// statement is retryable, as a write conflict is: the retry waits for
+    /// the holder to end and replays, which under `READ COMMITTED` is
+    /// PostgreSQL's wait for the lock. Past that it fails (55P03).
+    fn locked_row((message, holder): (String, TxId), nothing_applied: bool) -> std::io::Error {
+        if nothing_applied && holder != NO_TX {
+            crate::core::rql::conflict_wait::note_blocker(holder);
+            return std::io::Error::new(std::io::ErrorKind::WouldBlock, format!("{}{}", message, Self::CONFLICT_RETRYABLE));
+        }
+        std::io::Error::other(message)
+    }
+
     /// The visibility rule for a statement running under `tx`.
     ///
     /// An unversioned table admits every untombstoned row, which is what it did
@@ -851,6 +2517,55 @@ impl<S: StorageIO> Table<S> {
             Some(manager) => Visibility::for_snapshot(manager.snapshot(tx), manager),
             None => Visibility::All,
         }
+    }
+
+    /// [`Table::visibility_for`] for a query: inside a read-only statement,
+    /// the snapshot every read of that statement shares
+    /// ([`crate::core::rql::statement_snapshot`]). An unversioned table reads
+    /// everything, whatever the statement holds.
+    pub fn read_visibility_for(&self, tx: TxId) -> Visibility {
+        let versions = self.versions.load();
+        let Some(manager) = versions.as_ref() else {
+            return Visibility::All;
+        };
+        let noting = if self.schema.name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX) {
+            crate::core::rql::statement_snapshot::Noting::Derived
+        } else {
+            crate::core::rql::statement_snapshot::Noting::Table(&self.max_writer)
+        };
+        crate::core::rql::statement_snapshot::get_or_take_noting(manager, noting, || self.visibility_for(tx))
+    }
+
+    /// The snapshot a write's statement already read under, when it read
+    /// before writing (its subqueries, CTE bodies, join sources): the rows
+    /// it writes are scanned under it, so they are the rows those reads
+    /// described ([`crate::core::rql::statement_snapshot::kept`]). `None`
+    /// for an unversioned table and for a statement that read nothing yet,
+    /// whose write takes its own under the write lock.
+    /// [`Self::statement_visibility`] for a write that takes its snapshot
+    /// under the write lock and needs none before it (no foreign-key work):
+    /// the choice is deferred to the lock ([`Self::target_visibility_under_lock`]),
+    /// and `None` comes back, unless the reads' tables are unknown.
+    pub fn statement_visibility_deferred(&self, tx: TxId) -> Option<Visibility> {
+        let versions = self.versions.load();
+        let manager = versions.as_ref()?;
+        if crate::core::rql::statement_snapshot::defer_target(manager, tx, &self.max_writer) {
+            return None;
+        }
+        crate::core::rql::statement_snapshot::target_visibility(manager, tx, || self.visibility_for(tx))
+    }
+
+    /// The snapshot a write scans under when its caller passed none: taken
+    /// now, under the write lock, and settled against a deferred target
+    /// (`statement_snapshot::settle_target`).
+    fn target_visibility_under_lock(&self, tx: TxId) -> Visibility {
+        crate::core::rql::statement_snapshot::settle_target(&self.max_writer, tx, self.visibility_for(tx))
+    }
+
+    pub fn statement_visibility(&self, tx: TxId) -> Option<Visibility> {
+        let versions = self.versions.load();
+        let manager = versions.as_ref()?;
+        crate::core::rql::statement_snapshot::target_visibility(manager, tx, || self.visibility_for(tx))
     }
 
     /// The rule for `tx` as of now, ignoring a snapshot it has pinned.
@@ -882,29 +2597,35 @@ impl<S: StorageIO> Table<S> {
     /// they do not within the configured drain timeout the report comes back
     /// with `deferred` set and nothing is published.
     pub async fn vacuum_now(&self) -> Result<VacuumReport> {
+        let d = self.data()?;
+        // Joined by `retire`, like the service's own sweeps.
+        let _tick = self.maintenance_tick.lock().await;
         let config = VacuumConfig::default();
         let horizon = self.version_horizon();
+        let index_fetch = d
+            .indexes
+            .as_ref()
+            .map(|ix| Self::build_fetch_for(&self.schema.fields, &ix.columns()));
         let ctx = crate::core::vacuum::ReclaimContext {
             horizon: &horizon,
-            filters: self.filters.as_deref(),
+            filters: d.filters.as_deref(),
             cleared_below: &self.cleared_below,
+            indexes: d.indexes.as_deref().zip(index_fetch.as_ref()),
+            compaction_gate: Some(&self.compaction_gate),
+            alive: Some(&self.maintenance_alive),
+            gate: Some(&self.gate),
+            stats: Some(&*d.vacuum_stats),
         };
         let report = crate::core::vacuum::run_once(
-            &*self.io_pointers,
-            &*self.io_rows,
-            &self.free_space,
-            &self.readers,
+            &*d.io_pointers,
+            &*d.io_rows,
+            &d.free_space,
+            &d.readers,
             &ctx,
             &config,
             true,
         )
         .await?;
-
-        if report.fingerprints_cleared > 0 {
-            if let Some(filters) = self.filters.as_ref() {
-                filters.request_checkpoint();
-            }
-        }
         Ok(report)
     }
 
@@ -943,6 +2664,7 @@ impl<S: StorageIO> Table<S> {
     /// that cannot truncate reports `truncation_unsupported` and keeps the
     /// tail — the space is reusable either way, just not returned.
     pub async fn compact(&self) -> Result<CompactReport> {
+        let d = self.data()?;
         // Compaction is the one writer whose effects the log cannot describe:
         // it moves rows and then shortens the file, and a truncation has no
         // redo record. A backup's fuzzy copy is only made consistent by replay,
@@ -950,25 +2672,87 @@ impl<S: StorageIO> Table<S> {
         #[cfg(feature = "s3_backup")]
         let _backup = crate::core::backup::compaction_permit().await;
 
+        // A ticket first, before the exclusive gate (§6 step 1, §2 lock order:
+        // readers never queue behind a seal through compaction's exclusive
+        // hold), so `DIRTY` is durable before anything below is issued.
+        let _watch = self.enter_write().await?;
+        let ticket = gate::ticket(&self.gate, self.family()).await?;
+
         // Exclusive: rows are about to move, so nothing may be holding a pointer
         // to one. Every read and write path takes this shared.
+        #[cfg(test)]
+        compact_test_hooks::gate_point(1);
         let _gate = self.compaction_gate.write().await;
+        #[cfg(test)]
+        compact_test_hooks::gate_point(2);
 
-        // Nothing on the free list survives compaction — every extent it names
-        // is about to be somewhere else.
-        self.free_space.clear();
-
-        // The checkpoint on disk describes a slot layout that is about to stop
-        // existing. Marking it dirty first means a crash mid-compaction leaves a
-        // sidecar that is rejected and rebuilt, rather than one that confidently
-        // indexes rows by their former addresses.
-        if let Some(filters) = self.filters.as_ref() {
-            filters.mark_disk_dirty(&*self.io_filters).await;
+        // Sampled before the barrier below, so every deleter this compaction
+        // will count as reclaimable had left the running set, and so had its
+        // outcome recorded, by the time the barrier ran.
+        let horizon = self.version_horizon();
+        // What is dead is decided from deleters' outcomes held in memory, and
+        // the moves below overwrite those versions' bytes and slots in durable
+        // batches. An asynchronous commit's outcome (or a synchronous one's,
+        // before its sync) is not on disk yet, and a power cut would undo the
+        // delete while the row's bytes already belong to another row. So the
+        // outcomes are made durable first, and nothing moves if they cannot be.
+        if let Err(e) = crate::core::vacuum::outcome_barrier(&*d.io_pointers, &horizon) {
+            error!(
+                "Compaction of {}: the outcomes of the deleted rows could not be made durable \
+                 ({}); nothing was moved",
+                self.schema.name, e
+            );
+            return Err(e.into());
         }
 
-        let rows_len = self.io_rows.get_len().await;
-        let (live, dead_rows) =
-            collect_live(&*self.io_pointers, rows_len, &self.version_horizon()).await?;
+        // The slot epoch, durably, before the first effect (§6 step 2): its
+        // own WAL transaction in the directory's `rdb.ixe`, synced with the
+        // directory log, so any replay that contains a move contains the
+        // bump, and a snapshot taken under the old numbering never matches
+        // the data again. Nothing has moved if it fails.
+        if let Err(e) = self.gate.bump_epoch(&*d.io_pointers).await {
+            error!(
+                "Compaction of {}: the slot epoch could not be recorded ({}); nothing was moved",
+                self.schema.name, e
+            );
+            return Err(e);
+        }
+
+        // Nothing on the free list survives compaction — every extent it names
+        // is about to be somewhere else. Quarantined batches go too, and a
+        // vacuum sweep that computed extents from the old layout (it releases
+        // this gate before publishing) publishes nothing.
+        d.free_space.begin_relayout();
+
+        // Cached answers hold row pointers, and rows are about to move. Retired
+        // now rather than only on success: a compaction that fails part-way has
+        // already moved rows durably, and a cached pointer would then read
+        // whatever another row moved over its old bytes. No query can store a
+        // new entry while this gate is held exclusively. The success tail
+        // retires them again for the rebuild it did.
+        self.invalidate_query_caches();
+        self.write_generation.fetch_add(1, AtomicOrdering::AcqRel);
+
+        // From here rows move (phase 1) and slots are renumbered (phase 2), so
+        // everything keyed by slot stops being trusted now, not only once the
+        // rebuild at the end starts: a failure part-way through phase 2 leaves
+        // rows at new slots, and an index or filter still answering by the old
+        // numbering prunes them silently. Both stay demoted until a rebuild
+        // under the new numbering completes; a failed compaction leaves them
+        // demoted (no snapshot is sealed while demoted, so a reopened table
+        // rebuilds both).
+        // Phase 1 is included because the open-time build and backfill read
+        // rows by pointer without this gate: their epoch check is what stops
+        // anything they read while rows moved from being published.
+        //
+        // A snapshot on disk describes a slot layout that is about to stop
+        // existing: the ticket taken above made `DIRTY` durable and
+        // `rdb.ixe`'s epoch moved, so no reopen trusts it.
+        let n_slots_before = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        let renumbering = self.begin_renumbering(d, n_slots_before, &ticket).await;
+
+        let rows_len = d.io_rows.get_len().await;
+        let (live, dead_rows) = collect_live(&*d.io_pointers, rows_len, &horizon).await?;
 
         let mut report = CompactReport {
             live_rows: live.len() as u64,
@@ -979,9 +2763,25 @@ impl<S: StorageIO> Table<S> {
         let (moves, compacted_rows_len) = plan_row_moves(&live);
         let mut pointers = live;
 
+        // Every way out of the two move phases ends the open storage
+        // transaction. One left open after a failed write holds the log's
+        // pending count up, and the log can then never be checkpointed again —
+        // which is how a deployed node's log grew without bound.
+        macro_rules! or_abort {
+            ($result:expr, $txn:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(e) => {
+                        d.io_pointers.abort_txn($txn).await;
+                        return Err(e.into());
+                    }
+                }
+            };
+        }
+
         // --- Phase 1: pack the row bytes ---
         let mut buffer: Vec<u8> = Vec::new();
-        let mut txn = self.io_rows.begin_txn();
+        let mut txn = d.io_rows.begin_txn();
 
         for (index, target) in moves {
             let record = &mut pointers[index];
@@ -990,7 +2790,7 @@ impl<S: StorageIO> Table<S> {
             buffer.clear();
             buffer.resize(length, 0);
             let mut read_at = record.pointer.position;
-            if let Err(e) = self
+            if let Err(e) = d
                 .io_rows
                 .read_data_into_buffer(&mut read_at, &mut buffer)
                 .await
@@ -1004,19 +2804,31 @@ impl<S: StorageIO> Table<S> {
 
             // Bytes and pointer in one transaction: a pointer that survived
             // without its bytes would name someone else's row.
-            let _ = self.io_rows.write_data_txn(txn, target, &buffer).await;
+            let _ = d.io_rows.write_data_txn(txn, target, &buffer).await;
             record.pointer.position = target;
-            let token = record
-                .pointer
-                .save_at_in_txn(
-                    &*self.io_pointers,
-                    record.slot * ROW_POINTER_RECORD_LEN as u64,
-                    txn,
-                )
-                .await?;
+            let token = or_abort!(
+                record
+                    .pointer
+                    .save_at_in_txn(
+                        &*d.io_pointers,
+                        record.slot * ROW_POINTER_RECORD_LEN as u64,
+                        txn,
+                    )
+                    .await,
+                txn
+            );
             let _ = token;
 
             report.rows_moved += 1;
+
+            // Test-only: the row moves so far commit as a batch, and the next
+            // batch fails, as an ENOSPC part-way through phase 1 would.
+            #[cfg(test)]
+            if compact_test_hooks::FAIL_PHASE1_AFTER_ROW_MOVES.with(|h| h.get()) == Some(report.rows_moved) {
+                compact_test_hooks::FAIL_PHASE1_AFTER_ROW_MOVES.with(|h| h.set(None));
+                or_abort!(d.io_pointers.commit_durable(txn).await, txn);
+                return Err(std::io::Error::other("injected failure part-way through phase 1"));
+            }
 
             // A failed commit has to stop the compaction, not just be noted.
             // Targets are at or below their sources, so the *next* row's move
@@ -1024,12 +2836,12 @@ impl<S: StorageIO> Table<S> {
             // this batch is not durable and the next one is, a restart finds a
             // pointer naming bytes that were overwritten. Interrupting is safe;
             // continuing past a failure is not.
-            if crate::core::wal::should_break_transaction(&*self.io_rows) {
-                self.io_pointers.commit_durable(txn).await?;
-                txn = self.io_rows.begin_txn();
+            if crate::core::wal::should_break_transaction(&*d.io_rows) {
+                or_abort!(d.io_pointers.commit_durable(txn).await, txn);
+                txn = d.io_rows.begin_txn();
             }
         }
-        self.io_pointers.commit_durable(txn).await?;
+        or_abort!(d.io_pointers.commit_durable(txn).await, txn);
 
         // --- Phase 2: pack the pointer records ---
         //
@@ -1041,7 +2853,7 @@ impl<S: StorageIO> Table<S> {
         // The filter is not updated per move — every slot address changes, so it
         // is rebuilt wholesale at the end. That renumbering is exactly why this
         // cannot run incrementally in the background alongside a live filter.
-        let mut txn = self.io_pointers.begin_txn();
+        let mut txn = d.io_pointers.begin_txn();
         let mut target_slot = 0u64;
 
         for record in pointers.iter_mut() {
@@ -1059,10 +2871,13 @@ impl<S: StorageIO> Table<S> {
             // half-applied on disk; without a log the two land separately, but
             // nothing can observe the gap — compaction holds the gate
             // exclusively — and a crash without a log has no atomicity anywhere.
-            let _ = record
-                .pointer
-                .save_at_in_txn(&*self.io_pointers, destination, txn)
-                .await?;
+            let _ = or_abort!(
+                record
+                    .pointer
+                    .save_at_in_txn(&*d.io_pointers, destination, txn)
+                    .await,
+                txn
+            );
 
             let mut tombstone = record.pointer.clone();
             tombstone.deleted = true;
@@ -1070,36 +2885,73 @@ impl<S: StorageIO> Table<S> {
             {
                 tombstone.is_active = false;
             }
-            let _ = tombstone
-                .save_at_in_txn(&*self.io_pointers, source, txn)
-                .await?;
+            let _ = or_abort!(
+                tombstone
+                    .save_at_in_txn(&*d.io_pointers, source, txn)
+                    .await,
+                txn
+            );
 
             record.slot = target_slot;
             target_slot += 1;
             report.slots_moved += 1;
 
-            if crate::core::wal::should_break_transaction(&*self.io_pointers) {
-                self.io_pointers.commit_durable(txn).await?;
-                txn = self.io_pointers.begin_txn();
+            // Test-only: the moves so far commit as a batch, and the next batch
+            // fails, as an ENOSPC part-way through phase 2 would.
+            #[cfg(test)]
+            if compact_test_hooks::FAIL_PHASE2_AFTER_SLOT_MOVES.with(|h| h.get())
+                == Some(report.slots_moved)
+            {
+                compact_test_hooks::FAIL_PHASE2_AFTER_SLOT_MOVES.with(|h| h.set(None));
+                or_abort!(d.io_pointers.commit_durable(txn).await, txn);
+                return Err(std::io::Error::other("injected failure part-way through phase 2"));
+            }
+
+            if crate::core::wal::should_break_transaction(&*d.io_pointers) {
+                or_abort!(d.io_pointers.commit_durable(txn).await, txn);
+                txn = d.io_pointers.begin_txn();
             }
         }
         // Nothing is truncated past this point unless every move is durable.
-        self.io_pointers.commit_durable(txn).await?;
+        or_abort!(d.io_pointers.commit_durable(txn).await, txn);
+        // Slot numbers have stopped changing. Ending the renumbering here (and
+        // on every early return above, by drop) starts the epoch the rebuild
+        // below runs in.
+        drop(renumbering);
 
         // --- Phase 3: give the tails back ---
         //
         // After the log is checkpointed, so no unreplayed record can re-extend
         // a file past the point we are about to cut it at.
-        if let Some(wal) = self
+        if let Some(wal) = d
             .io_pointers
             .get_location()
             .and_then(|location| crate::core::wal::wal_for(&location))
         {
             {
-                match tokio::task::spawn_blocking(move || wal.checkpoint())
-                    .await
-                    .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
-                {
+                // A checkpoint declines while another is running or while any
+                // transaction holds an in-place write — both routine under
+                // write load, where one declined attempt used to make the whole
+                // VACUUM FULL a silent no-op. So it is retried for a while
+                // before the tails are kept.
+                const ATTEMPTS: u32 = 40;
+                let mut outcome = Ok(false);
+                for attempt in 0..ATTEMPTS {
+                    let w = wal.clone();
+                    outcome = tokio::task::spawn_blocking(move || w.checkpoint())
+                        .await
+                        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+                    if !matches!(outcome, Ok(false)) {
+                        break;
+                    }
+                    if attempt + 1 < ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            25 * (attempt as u64 + 1).min(8),
+                        ))
+                        .await;
+                    }
+                }
+                match outcome {
                     // Only a checkpoint that actually ran makes truncation safe.
                     // A declined one (`Ok(false)`) leaves live records that
                     // still name offsets past the cut, so a crash would replay
@@ -1110,28 +2962,46 @@ impl<S: StorageIO> Table<S> {
                             "Compaction: checkpoint declined (log still active); keeping both tails"
                         );
                         report.truncation_unsupported = true;
+                        report.truncation_skipped = Some(
+                            "the write-ahead log could not be checkpointed: other \
+                             transactions kept it busy for the whole attempt",
+                        );
                     }
                     Err(e) => {
-                        error!("Compaction could not checkpoint the log ({}); keeping both tails", e);
+                        error!(
+                            "Compaction could not checkpoint the log ({}); keeping both tails",
+                            e
+                        );
                         report.truncation_unsupported = true;
+                        report.truncation_skipped =
+                            Some("the write-ahead log could not be checkpointed (see the server log)");
                     }
                 }
             }
         }
 
         let compacted_pointer_len = target_slot * ROW_POINTER_RECORD_LEN as u64;
+        if report.truncation_skipped.is_some() {
+            // Counted where `SHOW TABLE STATS` reads it: the statement reports
+            // it too, but a scheduled run has no client to tell.
+            d.vacuum_stats
+                .full_untruncated
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
         if !report.truncation_unsupported {
-            report.rows_bytes_freed =
-                self.truncate_tail(&self.io_rows, compacted_rows_len, &mut report).await;
+            report.rows_bytes_freed = self
+                .truncate_tail(&d.io_rows, compacted_rows_len, &mut report)
+                .await;
             report.pointer_bytes_freed = self
-                .truncate_tail(&self.io_pointers, compacted_pointer_len, &mut report)
+                .truncate_tail(&d.io_pointers, compacted_pointer_len, &mut report)
                 .await;
         }
 
         // The high-water mark and the id sequence both described the old layout.
-        self.len.store(compacted_rows_len, AtomicOrdering::Release);
+        d.len.store(compacted_rows_len, AtomicOrdering::Release);
         if let Some(last) = pointers.last() {
-            self.last_row_id
+            d.ids
+                .last_row_id
                 .fetch_max(last.pointer.row_id(), AtomicOrdering::AcqRel);
         }
 
@@ -1142,13 +3012,43 @@ impl<S: StorageIO> Table<S> {
         // past the new end keep stale bits, but a query bounds itself by the
         // pointer file's length and never reads them, and a later insert that
         // reaches one overwrites it.
-        if self.filters.is_some() {
-            self.filters_ready.store(false, AtomicOrdering::Release);
-            if let Err(e) = self.backfill_filters_from(0).await {
-                error!("Compaction could not rebuild the filter: {}", e);
+        //
+        // The filter has been demoted since the renumbering began. Only a
+        // backfill that completes restores it: one that fails leaves the
+        // prefix untrusted, so no seal can capture it, rather than reporting
+        // ready over planes that still hold the old numbering.
+        if d.filters.is_some() {
+            match self.backfill_filters_from(0).await {
+                Ok(_) => self.filters_ready.store(true, AtomicOrdering::Release),
+                Err(e) => error!("Compaction could not rebuild the filter; it stays unused: {}", e),
             }
-            self.filters_ready.store(true, AtomicOrdering::Release);
-            self.checkpoint_filters().await;
+        }
+
+        // The secondary indexes name slots too, every one of which moved.
+        // Rebuilt under the same exclusive gate, so no query can ask a
+        // half-built index; one that fails to rebuild stays unready, and
+        // queries scan rather than trust slot numbers that no longer exist.
+        if let Some(indexes) = d.indexes.as_ref() {
+            // Unready since the renumbering began; this epoch is the one it
+            // ended in, so only this build can mark them ready again.
+            let epoch = indexes.epoch();
+            let build = gate::build_token();
+            indexes.set_ready(Proof::from(&build), false);
+            indexes.clear(Proof::from(&build));
+            match build_indexes(
+                indexes,
+                &d.io_pointers,
+                &d.io_rows,
+                &self.schema.fields,
+                d.free_space.is_enabled().then_some(&d.readers),
+            )
+            .await
+            {
+                Ok(_) => {
+                    indexes.set_ready_at(Proof::from(&build), epoch);
+                }
+                Err(e) => error!("Compaction could not rebuild the indexes; queries scan: {}", e),
+            }
         }
 
         // Every slot address moved and the filter was rebuilt from storage, so
@@ -1174,13 +3074,50 @@ impl<S: StorageIO> Table<S> {
         Ok(report)
     }
 
+    /// Demotes everything keyed by slot number before `compact` moves rows
+    /// and renumbers slots: the filter stops vouching for `[0, n_slots)`
+    /// under a new epoch, in memory and in the sidecar, and the indexes go
+    /// unready. The guard ends the renumbering when dropped, starting another
+    /// epoch, so work that read slots at any point during it cannot publish
+    /// what it read.
+    ///
+    /// The filter's begin-time epoch is the one that matters: without it a
+    /// backfill that started before the compaction could clear the demotion.
+    /// For the indexes it is the guard's drop-time invalidate that keeps a
+    /// failed or overlapping compaction from leaving them ready (queries
+    /// cannot run while `compact` holds its gate, and an open-time build that
+    /// publishes ready meanwhile is made unready by the drop); the begin-time
+    /// one here is defence in depth.
+    async fn begin_renumbering<'a>(
+        &'a self,
+        d: &'a TableData<S>,
+        n_slots: u64,
+        ticket: &'a WriteTicket,
+    ) -> RenumberingGuard<'a> {
+        self.filters_ready.store(false, AtomicOrdering::Release);
+        // Built before the demotion, not after: `begin_renumbering` makes the
+        // epoch odd, and a compaction dropped after it (a cancelled statement drops its future)
+        // would otherwise leave it odd with nothing to end it, refusing every
+        // backfill, prefix clear and vacuum clear on this table until the
+        // next compaction or a restart. Ending a renumbering that never began
+        // only moves the epoch to the next even value, which costs whatever
+        // work was in flight a retry.
+        let guard = RenumberingGuard {
+            filters: d.filters.as_deref(),
+            indexes: d.indexes.as_deref(),
+            ticket,
+        };
+        if let Some(filters) = d.filters.as_ref() {
+            filters.begin_renumbering(Proof::from(ticket), n_slots);
+        }
+        if let Some(indexes) = d.indexes.as_ref() {
+            indexes.invalidate(Proof::from(ticket));
+        }
+        guard
+    }
+
     /// Shortens one file, tolerating a provider that cannot.
-    async fn truncate_tail(
-        &self,
-        io: &Arc<S>,
-        new_len: u64,
-        report: &mut CompactReport,
-    ) -> u64 {
+    async fn truncate_tail(&self, io: &Arc<S>, new_len: u64, report: &mut CompactReport) -> u64 {
         let before = io.get_len().await;
         if new_len >= before {
             return 0;
@@ -1200,8 +3137,14 @@ impl<S: StorageIO> Table<S> {
 
     /// Cumulative reclamation counters for this table.
     #[inline]
-    pub fn vacuum_stats(&self) -> &VacuumStats {
-        &self.vacuum_stats
+    pub fn vacuum_stats(&self) -> Result<&VacuumStats> {
+        Ok(&self.data()?.vacuum_stats)
+    }
+
+    /// Row versions the write path has stamped dead since the table opened.
+    /// See the field for what counts.
+    pub fn dead_stamps(&self) -> u64 {
+        self.dead_stamps.load(AtomicOrdering::Relaxed)
     }
 
     /// Bytes currently on the free list, waiting to be written into.
@@ -1210,8 +3153,17 @@ impl<S: StorageIO> Table<S> {
     /// no writer has claimed since. Dead space that a scan has not reached, or
     /// withheld because an older query was running, is not included.
     #[inline]
-    pub fn reclaimable_bytes(&self) -> u64 {
-        self.free_space.free_bytes()
+    pub fn reclaimable_bytes(&self) -> Result<u64> {
+        Ok(self.data()?.free_space.free_bytes())
+    }
+
+    /// Whether reclamation is running for this table.
+    ///
+    /// Per table rather than per database, which is why it is reported per
+    /// table: `SHOW CONFIG` can only answer "per table" for `vacuum.enabled`,
+    /// and without this there was nowhere to find out which tables that meant.
+    pub fn vacuum_enabled(&self) -> Result<bool> {
+        Ok(self.data()?.free_space.is_enabled())
     }
 
     /// Turns reclamation on or off for this table without restarting.
@@ -1219,8 +3171,9 @@ impl<S: StorageIO> Table<S> {
     /// Switching off drops the free list, so nothing further is handed out, and
     /// queries stop registering epochs from their next call. Switching back on
     /// starts from an empty list; the next scan repopulates it.
-    pub fn set_vacuum_enabled(&self, enabled: bool) {
-        self.free_space.set_enabled(enabled);
+    pub fn set_vacuum_enabled(&self, enabled: bool) -> Result<()> {
+        self.data()?.free_space.set_enabled(enabled);
+        Ok(())
     }
 
     /// Writes just the assigned columns' bytes, leaving the rest of the row
@@ -1234,6 +3187,7 @@ impl<S: StorageIO> Table<S> {
     /// general path — declining is always safe, taking it wrongly is not.
     async fn write_columns_in_place(
         &self,
+        d: &TableData<S>,
         pointer: &RowPointer,
         updates: &smallvec::SmallVec<[ColumnWritePayload; 32]>,
         txn: u64,
@@ -1243,6 +3197,19 @@ impl<S: StorageIO> Table<S> {
         // path does not have the bytes to recompute. Rewriting the row is what
         // keeps that field honest, so leave it to the general path.
         if cfg!(feature = "enable_long_row") {
+            return false;
+        }
+
+        // Only where the write waits for the commit. Applied at once (no
+        // write-ahead log, an in-memory table), the overwrite is out of the
+        // statement's reach: a later row failing the statement left this one
+        // changed, and the filter, whose maintenance waits for the commit,
+        // kept the old value (`WHERE n = <new>` pruned the row). Putting the
+        // old bytes back on failure (940178b) left a window where a reader saw
+        // the new ones, a cut mid-restore mixed the two, a failed restore was
+        // only logged, and a backfill could read the bytes before the restore.
+        // A new version is what an abort undoes.
+        if !d.io_rows.defers_in_place_writes() {
             return false;
         }
 
@@ -1256,6 +3223,28 @@ impl<S: StorageIO> Table<S> {
         // The guard holds `begin` off until the write lands. It owns an `Arc`
         // and a counter, never a lock, so carrying it across the awaits below
         // costs nothing and cannot deadlock.
+        // An overwrite keeps no prior version, so it commits through the log
+        // its bytes go to, not through a transaction outcome. Every other write
+        // commits through its outcome record in the database's own log, and
+        // with `synchronous_commit = off` two logs reach the disk in no order a
+        // power cut respects: a table on another location could keep this
+        // overwrite and lose an earlier statement's outcome, or lose this and
+        // keep a later one, which is no suffix of the commits (PostgreSQL's
+        // promise for an asynchronous commit is that a crash loses only the
+        // most recent ones). In the outcome log itself, the overwrite is one
+        // more record in commit order. Elsewhere it is written as a version,
+        // whose outcome is.
+        if let Some(manager) = self.versions.load_full()
+            && let Some(outcomes) = manager.outcome_log()
+            && !d
+                .io_rows
+                .get_location()
+                .and_then(|dir| crate::core::wal::wal_for(&dir))
+                .is_some_and(|own| std::sync::Arc::ptr_eq(&own, &outcomes))
+        {
+            return false;
+        }
+
         let _in_place = match self.versions.load_full() {
             // The writer's own transaction is not a reader to be protected from
             // its own write. Testing for an empty `running` set instead would
@@ -1301,7 +3290,7 @@ impl<S: StorageIO> Table<S> {
         }
 
         for (position, bytes) in writes {
-            let _ = self.io_rows.write_data_txn(txn, position, bytes).await;
+            let _ = d.io_rows.write_data_txn(txn, position, bytes).await;
         }
         self.in_place_column_updates
             .fetch_add(1, AtomicOrdering::Relaxed);
@@ -1335,26 +3324,45 @@ impl<S: StorageIO> Table<S> {
         self.has_unique = true;
     }
 
-    /// Whether the row being written marks `column` as NULL.
-    ///
-    /// Read from the row's own `__null_` companion payload rather than from the
-    /// value, because a fixed-width NULL is indistinguishable from a real zero
-    /// by its bytes alone.
-    fn null_flag_is_set(&self, row_write: &RowWrite, column: &str) -> bool {
-        let flag_name = crate::core::rql::nullable::flag_column_name(column);
-        let Some(flag) = self
-            .schema
+    /// The `__null_` companion of `field`, when the column is nullable.
+    fn null_companion(&self, field: &SchemaField) -> Option<&SchemaField> {
+        let flag_name = crate::core::rql::nullable::flag_column_name(&field.name);
+        self.schema
             .fields
             .iter()
             .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&flag_name))
-        else {
+    }
+
+    /// Whether the value a write carries for a UNIQUE column is SQL NULL.
+    ///
+    /// Decided by the companion, never by the bytes alone. Emptiness used to
+    /// decide it, and an empty *string* is a value: a UNIQUE text column took
+    /// `''` any number of times. A NOT NULL column has no companion and no
+    /// NULL. Only a nullable column whose write carries no companion falls back
+    /// on emptiness — there it is the only evidence there is.
+    fn written_value_is_null(&self, row_write: &RowWrite, field: &SchemaField, value: &[u8]) -> bool {
+        let Some(flag) = self.null_companion(field) else {
             return false;
         };
-        row_write
+        match row_write
             .columns_writing_data
             .iter()
             .find(|c| c.write_order == flag.write_order as u32)
-            .is_some_and(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()))
+        {
+            Some(c) => crate::core::rql::nullable::flag_is_set(c.data.into_slice()),
+            None => value.is_empty(),
+        }
+    }
+
+    /// The constraint a column's own UNIQUE is, as PostgreSQL names it: the
+    /// table's `_pkey` when it is the primary key, its `_<column>_key`
+    /// otherwise.
+    fn column_constraint_name(&self, column: &str) -> String {
+        if self.schema.primary_key.as_deref().is_some_and(|pk| pk.eq_ignore_ascii_case(column)) {
+            crate::core::rql::unique_key::pkey_name(&self.schema.name)
+        } else {
+            crate::core::rql::unique_key::implicit_key_name(&self.schema.name, column)
+        }
     }
 
     async fn check_unique(
@@ -1362,6 +3370,10 @@ impl<S: StorageIO> Table<S> {
         row_write: &RowWrite,
         exclude_id: Option<u64>,
         visibility: &Visibility,
+        // Whose write this is, so a value another transaction is still writing
+        // is told apart from one that is committed. See the in-flight branch in
+        // `find_row_with_value`.
+        written_by: TxId,
         // Which columns the statement actually assigns, by `write_order`, or
         // `None` for an insert — where every column is new.
         //
@@ -1374,10 +3386,20 @@ impl<S: StorageIO> Table<S> {
         // was unique. PostgreSQL revalidates a constraint only when a column it
         // covers is written, and for the same reason.
         assigned: Option<&std::collections::HashSet<u32>>,
+        // What this statement has already written (an UPDATE's earlier rows),
+        // or `None` for an insert, whose earlier rows are committed to the
+        // storage before the next is checked. See `OwnKeys`.
+        mut own: Option<&mut OwnKeys>,
     ) -> Result<()> {
         if !self.has_unique {
             return Ok(());
         }
+        // Every key the row clashes on, not the first: `ON CONFLICT (k) DO
+        // NOTHING` absorbs a clash on `k` alone, and has to see it even when
+        // another key, checked first, clashes too (PostgreSQL checks the
+        // arbiter first). A key another transaction is still writing returns
+        // at once, as before: the replay waits for it.
+        let mut violations = UniqueViolations::default();
         let touches = |write_order: u64| -> bool {
             assigned.is_none_or(|set| set.contains(&(write_order as u32)))
         };
@@ -1405,27 +3427,63 @@ impl<S: StorageIO> Table<S> {
             // to emptiness alone, a second row with a NULL uuid collided with
             // the first — they share sixteen zero bytes — and a nullable
             // UNIQUE column could hold exactly one NULL.
-            if value.is_empty() || self.null_flag_is_set(row_write, &field.name) {
+            if self.written_value_is_null(row_write, field, value) {
                 continue;
             }
 
-            if let Some(existing) =
-                self.find_row_with_value(field, value, exclude_id, visibility).await?
+            if let Some((existing, in_flight)) = self
+                .find_row_with_value(field, value, exclude_id, own.as_deref().map(|o| &o.updated), visibility, written_by)
+                .await?
             {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
+                if in_flight {
+                    // Another transaction is writing this value and has not
+                    // finished. Whether that is a duplicate depends on whether
+                    // it commits, and this engine has no lock manager to wait
+                    // on it — so the statement is replayed instead, which is
+                    // sound here for the reason the autocommit retry already
+                    // relies on: the check runs *before* the write, so a
+                    // statement rejected by it has applied nothing.
+                    //
+                    // Reporting `AlreadyExists` instead would be a guess, and
+                    // the wrong one whenever the other transaction aborts —
+                    // under `ON CONFLICT DO NOTHING` that guess is a silently
+                    // skipped row rather than an error anyone would see.
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!(
+                            "UNIQUE column {:?} is being written by another transaction{}",
+                            field.name,
+                            Self::CONFLICT_RETRYABLE
+                        ),
+                    ));
+                }
+                violations.push(
+                    vec![field.name.clone()],
                     format!(
-                        "duplicate value for UNIQUE column {:?} (row {} already holds it)",
-                        field.name, existing
+                        "duplicate key value violates unique constraint \"{}\" (row {} already holds it)",
+                        self.column_constraint_name(&field.name),
+                        existing
                     ),
-                ));
+                );
+                continue;
+            }
+            if let Some(own) = own.as_deref_mut()
+                && !own.claim(field.write_order as usize, OwnKeys::key(std::iter::once((field, value))))
+            {
+                violations.push(
+                    vec![field.name.clone()],
+                    format!(
+                        "duplicate key value violates unique constraint \"{}\" (an earlier row of this statement holds it)",
+                        self.column_constraint_name(&field.name)
+                    ),
+                );
             }
         }
 
         // Table-level constraints, which may span several columns. A composite
         // forbids repeating the whole tuple while leaving each column free to
         // repeat on its own, so it cannot be checked one column at a time.
-        for key in self.schema.unique_keys.iter() {
+        for (position, key) in self.schema.unique_keys.iter().enumerate() {
             let mut tuple: Vec<(&SchemaField, &[u8])> = Vec::with_capacity(key.columns.len());
             let mut skip = false;
 
@@ -1466,22 +3524,52 @@ impl<S: StorageIO> Table<S> {
                 // like a repeat of the first and a nullable `UNIQUE (col)` could
                 // hold exactly one NULL — which is what stopped an import of a
                 // table PostgreSQL was perfectly happy with.
-                if value.is_empty() || self.null_flag_is_set(row_write, &field.name) {
+                if self.written_value_is_null(row_write, field, value) {
                     skip = true;
                     break;
                 }
                 tuple.push((field, value));
             }
 
+            // A partial unique index constrains only the rows its predicate
+            // holds for; see `unique_key` for how that is judged.
+            let partial = match crate::core::rql::unique_key::partial_check(key, &self.schema.fields, row_write) {
+                Ok(partial) => partial,
+                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)),
+            };
+            let Some((condition, predicate_columns)) = partial else {
+                continue;
+            };
+
             // Same rule as the column flags above: a constraint the statement
-            // does not write to cannot be violated by it.
-            if skip || tuple.is_empty() || !tuple.iter().any(|(f, _)| touches(f.write_order)) {
+            // does not write to cannot be violated by it. For a partial key,
+            // writing the predicate's columns counts: that is how an undelete
+            // brings a row back under the key.
+            if skip
+                || tuple.is_empty()
+                || !(tuple.iter().any(|(f, _)| touches(f.write_order))
+                    || predicate_columns.iter().any(|wo| touches(*wo)))
+            {
                 continue;
             }
 
-            if let Some(existing) =
-                self.find_row_with_tuple(&tuple, exclude_id, visibility).await?
+            if let Some((existing, in_flight)) = self
+                .find_row_with_tuple(&tuple, exclude_id, own.as_deref().map(|o| &o.updated), visibility, written_by, condition)
+                .await?
             {
+                // Another transaction's unfinished write: replayed, not
+                // guessed at — the single-column rule above, for the reason
+                // given there.
+                if in_flight {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!(
+                            "UNIQUE constraint {} is being written by another transaction{}",
+                            key.describe(),
+                            Self::CONFLICT_RETRYABLE
+                        ),
+                    ));
+                }
                 // The value is named, not just the rows. A report of "row 634
                 // duplicates row 625" is unfalsifiable from outside: it cannot
                 // be told apart from data that really does hold a duplicate,
@@ -1491,29 +3579,40 @@ impl<S: StorageIO> Table<S> {
                 let shown: Vec<String> = tuple
                     .iter()
                     .map(|(field, value)| {
-                        let rendered = crate::core::rql::subquery::value_to_literal(
-                            &field.db_type,
-                            value,
-                        )
-                        .unwrap_or_else(|| format!("{:02x?}", value));
+                        let rendered = crate::core::rql::subquery::stored_value_literal(field, value)
+                            .unwrap_or_else(|| format!("{:02x?}", value));
                         format!("{} = {}", field.name, rendered)
                     })
                     .collect();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
+                // An update names the row it moves; an insert's row has no id
+                // yet, and printed as `None` it read like a lost value.
+                let updated = exclude_id.map(|id| format!("; the row being updated is {}", id)).unwrap_or_default();
+                violations.push(
+                    key.columns.clone(),
                     format!(
-                        "duplicate value for UNIQUE constraint {} (row {} already holds it): {}; \
-                         the row being written is {:?}",
-                        key.describe(),
+                        "duplicate key value violates unique constraint \"{}\" (row {} already holds it): {}{}",
+                        key.name,
                         existing,
                         shown.join(", "),
-                        exclude_id
+                        updated
                     ),
-                ));
+                );
+                continue;
+            }
+            if let Some(own) = own.as_deref_mut()
+                && !own.claim(Self::unique_key_constraint(position), OwnKeys::key(tuple.iter().copied()))
+            {
+                violations.push(
+                    key.columns.clone(),
+                    format!(
+                        "duplicate key value violates unique constraint \"{}\" (an earlier row of this statement holds it)",
+                        key.name
+                    ),
+                );
             }
         }
 
-        Ok(())
+        violations.into_result()
     }
 
     /// Id of a live row whose whole tuple equals `tuple`, other than
@@ -1528,20 +3627,70 @@ impl<S: StorageIO> Table<S> {
         &self,
         tuple: &[(&SchemaField, &[u8])],
         exclude_id: Option<u64>,
+        stale: Option<&std::collections::HashSet<u64>>,
+        visibility: &Visibility,
+        written_by: TxId,
+        predicate: Option<&crate::core::rql::expr::Cond>,
+    ) -> Result<Option<(u64, bool)>> {
+        // As for one column: sampled again while a round meets a version
+        // replaced after the snapshot (see `Supersessions`).
+        let mut supersessions = Supersessions::default();
+        for _ in 0..Supersessions::MAX_ROUNDS {
+            let found = self
+                .find_row_with_tuple_once(tuple, exclude_id, stale, visibility, written_by, predicate, &mut supersessions)
+                .await?;
+            if found.is_some() || !supersessions.take_fresh() {
+                return Ok(found);
+            }
+        }
+        Err(Supersessions::exhausted(Self::CONFLICT_RETRYABLE).into())
+    }
+
+    /// One sample of [`Self::find_row_with_tuple`].
+    #[allow(clippy::too_many_arguments)]
+    async fn find_row_with_tuple_once(
+        &self,
+        tuple: &[(&SchemaField, &[u8])],
+        exclude_id: Option<u64>,
+        stale: Option<&std::collections::HashSet<u64>>,
         // Only rows this statement can see may block it, exactly as for a
         // single-column check: under MVCC a deleted row keeps its `deleted`
         // flag clear until reclamation, and would otherwise go on reserving the
         // value it held.
         visibility: &Visibility,
-    ) -> Result<Option<u64>> {
+        // Whose write this is: see `find_row_with_value`, whose in-flight rule
+        // this applies to a whole tuple.
+        written_by: TxId,
+        // A partial key's predicate: a row holding the tuple conflicts only
+        // when the predicate holds for it too.
+        predicate: Option<&crate::core::rql::expr::Cond>,
+        supersessions: &mut Supersessions,
+    ) -> Result<Option<(u64, bool)>> {
+        let d = self.data()?;
         use crate::core::filter::sarg::{MaskExpr, SargPredicate, SargProgram};
         use crate::core::filter::zonemap::SargOp;
 
-        let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
+        let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
             .unwrap();
 
-        if let Some(filters) = self.filters.as_ref() {
+        // An index over exactly these columns names the candidate slots; the
+        // iterator then reads only the chunks holding them, and anything
+        // appended since the sample is a candidate by the list's own rule.
+        // A legacy `CHAR` column in the tuple: matched by its one stored
+        // form, which neither the index nor the filter keys (see
+        // `find_row_with_value`), so the table is walked.
+        let by_bytes = self.legacy_keys_canonical || tuple.iter().all(|(field, _)| field.db_type != DbType::CHAR);
+        let from_index = match if by_bytes { self.index_probe(d, tuple).await } else { None } {
+            Some((slots, n_slots)) => {
+                let slots: Vec<u64> = slots.into_iter().filter(|s| *s < n_slots).collect();
+                iterator.set_candidates(Some(Arc::new(CandidateBitmap::sparse(slots, n_slots))));
+                true
+            }
+            None => false,
+        };
+
+        if let (false, Some(filters), true) = (from_index, d.filters.as_ref(), by_bytes) {
             match tuple
                 .iter()
                 .find(|(field, _)| filters.indexes(field.write_order as u32))
@@ -1554,8 +3703,7 @@ impl<S: StorageIO> Table<S> {
                             value: value.to_vec(),
                         }),
                     };
-                    let n_slots =
-                        self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+                    let n_slots = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
                     if let Some(bitmap) = filters.evaluate(&program, n_slots) {
                         iterator.set_candidates(Some(Arc::new(bitmap)));
                     }
@@ -1568,13 +3716,14 @@ impl<S: StorageIO> Table<S> {
         }
 
         let calc = SchemaCalculator;
-        let mut columns_fetching_data: SmallVec<[ColumnFetchingData; 32]> = SmallVec::new();
+        let mut columns_fetching_data: crate::core::row::row::FetchColumns = SmallVec::new();
         for (field, _) in tuple.iter() {
             let (column_offset, schema_id) =
                 calc.calculate_schema_offset(&field.name, &self.schema.fields);
+            // By the stored type, as in `find_row_with_value`.
             columns_fetching_data.push(ColumnFetchingData {
                 column_offset,
-                column_type: field.db_type.clone(),
+                column_type: field.db_type.physical(),
                 size: field.size,
                 schema_id,
             });
@@ -1582,62 +3731,485 @@ impl<S: StorageIO> Table<S> {
         // Kept alongside the fetch so the comparison below can match columns by
         // schema id rather than by position.
         let schema_ids: Vec<u64> = columns_fetching_data.iter().map(|c| c.schema_id).collect();
-        let fetch = RowFetch { columns_fetching_data };
+        // A stored NULL holds the type's zeroes — empty bytes for text — so a
+        // row whose companion says NULL must not match a written `''`.
+        let mut flag_ids: Vec<u64> = Vec::new();
+        for (field, _) in tuple.iter() {
+            if let Some(flag) = self.null_companion(field) {
+                let (column_offset, schema_id) =
+                    calc.calculate_schema_offset(&flag.name, &self.schema.fields);
+                columns_fetching_data.push(ColumnFetchingData {
+                    column_offset,
+                    column_type: flag.db_type.clone(),
+                    size: flag.size,
+                    schema_id,
+                });
+                flag_ids.push(schema_id);
+            }
+        }
+        // The predicate's columns, each with its NULL flag: a value fetched
+        // without its flag reads as present, holding its type's zeroes.
+        if let Some(predicate) = predicate {
+            let read = crate::core::rql::expr::cond_columns(predicate);
+            let flags: Vec<SchemaField> = read.iter().filter_map(|f| self.null_companion(f).cloned()).collect();
+            for field in read.iter().chain(flags.iter()) {
+                let (column_offset, schema_id) =
+                    calc.calculate_schema_offset(&field.name, &self.schema.fields);
+                if !columns_fetching_data.iter().any(|c| c.schema_id == schema_id) {
+                    columns_fetching_data.push(ColumnFetchingData {
+                        column_offset,
+                        column_type: field.db_type.physical(),
+                        size: field.size,
+                        schema_id,
+                    });
+                }
+            }
+        }
+        let fetch = RowFetch {
+            columns_fetching_data,
+        };
 
         let mut row = Row::default();
-        while let Ok(Some(pointer)) = iterator.next_row_pointer().await {
-            if Some(pointer.row_id()) == exclude_id {
+        let mut floor = RunningFloor::default();
+        loop {
+            // A read that fails is an error, never the end of the table, as
+            // in `find_row_with_value`: `while let Ok(..)` ended the walk on
+            // one and answered "no duplicate" for a tuple that may be there.
+            let pointer = match iterator.next_row_pointer().await {
+                Ok(Some(pointer)) => pointer,
+                Ok(None) => break,
+                Err(e) => return Err(e.into()),
+            };
+            if Some(pointer.row_id()) == exclude_id || stale.is_some_and(|s| s.contains(&pointer.row_id())) {
                 continue;
             }
-            if !visibility.visible(pointer.deleted, pointer.xmin, pointer.xmax) {
-                continue;
-            }
+            // The same occupancy rule as a single column's (see
+            // `find_row_with_value`): a row another transaction has written but
+            // not committed is invisible to every snapshot, so judging a
+            // composite key by the snapshot let concurrent inserts of one tuple
+            // each find nothing and each write — 950 rows for 300 pairs from
+            // four connections, with no error.
+            let manager = self.versions.load_full();
+            let occupancy = match (&manager, written_by) {
+                (Some(manager), writer) if writer != crate::core::mvcc::transaction::NO_TX => {
+                    // A delete this transaction made has happened, for it.
+                    match Self::occupancy(manager, &pointer, writer, &visibility, &mut floor) {
+                        Some(occupancy) => Some(occupancy),
+                        None => continue,
+                    }
+                }
+                _ => {
+                    if !visibility.visible(pointer.deleted, pointer.xmin, pointer.xmax) {
+                        continue;
+                    }
+                    None
+                }
+            };
+            let superseded = Occupancy::superseded(occupancy, visibility);
             if pointer
-                .fetch_row_reuse_async(&*self.io_rows, &fetch, &mut row)
+                .fetch_row_reuse_async(&*d.io_rows, &fetch, &mut row)
                 .await
                 .is_err()
             {
+                if superseded {
+                    supersessions.note(&pointer);
+                }
                 continue;
             }
 
             // A tuple conflicts only when every column matches. Columns are
             // matched by `schema_id` rather than by position, so the comparison
             // does not depend on the fetch preserving the requested order.
-            let all_match = tuple.iter().zip(schema_ids.iter()).all(|((_, value), id)| {
+            let stored_null = flag_ids.iter().any(|id| {
                 row.columns
                     .iter()
-                    .find(|c| c.schema_id == *id)
-                    .is_some_and(|c| c.data.into_slice() == *value)
+                    .find(|c| u64::from(c.schema_id) == *id)
+                    .is_some_and(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()))
             });
-            if all_match {
-                return Ok(Some(pointer.row_id()));
+            let all_match = !stored_null
+                && tuple.iter().zip(schema_ids.iter()).all(|((field, value), id)| {
+                    row.columns
+                        .iter()
+                        .find(|c| u64::from(c.schema_id) == *id)
+                        .is_some_and(|c| {
+                            same_unique_value(&field.db_type, c.data.into_slice(), value)
+                        })
+                });
+            if !all_match {
+                continue;
             }
+            if let Some(predicate) = predicate {
+                let covered = crate::core::rql::expr::eval_cond(predicate, &row, &self.schema.fields)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                if !covered {
+                    continue;
+                }
+            }
+            let Some(in_flight) = Self::settle_occupancy(manager.as_deref(), occupancy) else {
+                if superseded {
+                    supersessions.note(&pointer);
+                }
+                continue;
+            };
+            return Ok(Some((pointer.row_id(), in_flight)));
         }
 
         Ok(None)
     }
 
+    /// The slots that may hold exactly this key, from an index over exactly
+    /// these columns, and the table length sampled *before* the index was
+    /// asked. A slot at or past that length was appended since and must be
+    /// treated as a candidate too; the caller does.
+    ///
+    /// Sound for a uniqueness check because the check runs under the key's
+    /// stripe of `unique_lock`, as does every write that could put that key
+    /// under these columns: an earlier writer has finished, its index entry
+    /// included, before this one looks.
+    async fn index_probe(&self, d: &TableData<S>, columns: &[(&SchemaField, &[u8])]) -> Option<(Vec<u64>, u64)> {
+        let indexes = d.indexes.as_ref()?;
+        let wos: SmallVec<[u32; 4]> = columns.iter().map(|(f, _)| f.write_order as u32).collect();
+        let index = indexes.exact(&wos)?;
+        let n_slots = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        let key = index.key_of(|wo| {
+            columns
+                .iter()
+                .find(|(f, _)| f.write_order as u32 == wo)
+                .map(|(_, v)| *v)
+        })?;
+        // `None` (answer without the index) when a paged index's runs could
+        // not be read: a short list would pass a duplicate.
+        Some((index.try_slots_for_key(&key)?, n_slots))
+    }
+
+    /// The `unique_lock` stripe for one constraint's key.
+    ///
+    /// Two values the uniqueness check calls equal must land on one stripe,
+    /// so the key is hashed in the canonical form a hash index is proven to
+    /// share with the evaluator's equality. A type without one puts its whole
+    /// constraint on a single stripe, which is what the one lock was.
+    fn constraint_stripe<'a>(constraint: usize, values: impl Iterator<Item = (&'a SchemaField, &'a [u8])>) -> usize {
+        let mut canonical = Vec::with_capacity(32);
+        let mut one = Vec::with_capacity(16);
+        for (field, value) in values {
+            one.clear();
+            // A legacy `CHAR`'s cells of one value take one stripe.
+            let legacy;
+            let value = if field.db_type == DbType::CHAR {
+                legacy = crate::core::value_codec::legacy_char_canonical(value);
+                &legacy[..]
+            } else {
+                value
+            };
+            if crate::core::index::key::encode_canonical(&field.db_type, value, &mut one).is_none() {
+                return crate::core::row::key_locks::KeyLocks::stripe_of(constraint, None);
+            }
+            canonical.extend_from_slice(&(one.len() as u32).to_le_bytes());
+            canonical.extend_from_slice(&one);
+        }
+        crate::core::row::key_locks::KeyLocks::stripe_of(constraint, Some(&canonical))
+    }
+
+    /// The constraint id `constraint_stripe` takes for a table-level key.
+    /// Column constraints use their column's `write_order`.
+    fn unique_key_constraint(position: usize) -> usize {
+        usize::MAX - position
+    }
+
+    /// Whether a statement assigning the columns `assigned` (by
+    /// `write_order`) can change a unique key: a UNIQUE column, a column of a
+    /// table-level key, or a column a partial key's predicate reads, which
+    /// may bring a row under it. The same rule `check_unique` uses to decide
+    /// which constraints a statement can violate.
+    fn assigns_unique(&self, assigned: &std::collections::HashSet<u32>) -> bool {
+        self.schema
+            .fields
+            .iter()
+            .any(|f| f.is_unique && !f.is_deleted && assigned.contains(&(f.write_order as u32)))
+            || self.schema.unique_keys.iter().any(|key| {
+                key.columns.iter().any(|name| {
+                    self.schema.fields.iter().any(|f| {
+                        !f.is_deleted && f.name.eq_ignore_ascii_case(name) && assigned.contains(&(f.write_order as u32))
+                    })
+                }) || (key.predicate.is_some()
+                    // A partial key also covers the columns its predicate
+                    // reads, NULL flags included: writing one can move a row
+                    // under the key (an undelete), as `check_unique` judges
+                    // it. Every update of a table with a partial key counted
+                    // as a key change before, so `SET last_seen = now()`
+                    // kept every insert out while it wrote. A predicate that
+                    // does not compile still counts, as before.
+                    && key
+                        .predicate_columns(&self.schema.fields)
+                        .map_or(true, |columns| columns.iter().any(|wo| assigned.contains(&(*wo as u32)))))
+            })
+    }
+
+    /// The columns of a table-level unique key, or `None` when one was
+    /// dropped (and the constraint is no longer enforced; see `check_unique`).
+    fn unique_key_fields(&self, key: &crate::core::rql::unique_key::UniqueKey) -> Option<SmallVec<[&SchemaField; 4]>> {
+        key.columns
+            .iter()
+            .map(|name| {
+                self.schema
+                    .fields
+                    .iter()
+                    .find(|f| f.name.eq_ignore_ascii_case(name) && !f.is_deleted)
+            })
+            .collect()
+    }
+
+    /// Holds each column of `row_write` that `columns` selects (by write
+    /// order) and that declares a text length to it, as an assignment does
+    /// (`type_modifier::assign_bytes`): a `character(n)` value in its stored
+    /// form, without trailing spaces; past the length the reason (22001).
+    /// Free for a table that declares none.
+    ///
+    /// `legacy_char` holds a legacy `CHAR` column's value too, to one
+    /// character in its four bytes, for a value being written. Not for a row
+    /// a rewrite carries across, whose value an older build stored: it may
+    /// hold two characters, and refusing it would refuse the whole rewrite.
+    fn hold_text_lengths(
+        &self,
+        row_write: &mut RowWrite,
+        columns: impl Fn(u32) -> bool,
+        legacy_char: bool,
+    ) -> std::result::Result<(), String> {
+        for field in self.schema.fields.iter() {
+            let held = field.text_typmod().is_some()
+                || field.db_type == DbType::ARRAY
+                || (legacy_char && field.db_type == DbType::CHAR);
+            if !held || field.is_deleted || !columns(field.write_order as u32) {
+                continue;
+            }
+            let Some(column) = row_write
+                .columns_writing_data
+                .iter_mut()
+                .find(|c| c.write_order as u64 == field.write_order)
+            else {
+                continue;
+            };
+            if let Some(held) = crate::core::rql::type_modifier::assign_bytes(field, column.data.into_slice())? {
+                let mut mb = crate::memory_pool::MEMORY_POOL.acquire(held.len());
+                mb.into_slice_mut().copy_from_slice(&held);
+                column.data = mb;
+            }
+        }
+        Ok(())
+    }
+
+    /// The `unique_lock` stripes a row's keys fall on: one per constraint it
+    /// holds a key for. A NULL key conflicts with nothing, so it needs none.
+    fn unique_stripes(&self, row_write: &RowWrite) -> SmallVec<[usize; 4]> {
+        let value_of = |wo: u32| {
+            row_write
+                .columns_writing_data
+                .iter()
+                .find(|c| c.write_order == wo)
+                .map(|c| c.data.into_slice())
+        };
+        let mut stripes = SmallVec::new();
+        for field in self.schema.fields.iter().filter(|f| f.is_unique && !f.is_deleted) {
+            let Some(value) = value_of(field.write_order as u32) else {
+                continue;
+            };
+            if self.written_value_is_null(row_write, field, value) {
+                continue;
+            }
+            stripes.push(Self::constraint_stripe(
+                field.write_order as usize,
+                std::iter::once((field, value)),
+            ));
+        }
+        for (position, key) in self.schema.unique_keys.iter().enumerate() {
+            let Some(fields) = self.unique_key_fields(key) else {
+                continue;
+            };
+            let values: Option<SmallVec<[(&SchemaField, &[u8]); 4]>> = fields
+                .iter()
+                .map(|f| value_of(f.write_order as u32).map(|v| (*f, v)))
+                .collect();
+            let Some(values) = values else {
+                continue;
+            };
+            if values.iter().any(|(f, v)| self.written_value_is_null(row_write, f, v)) {
+                continue;
+            }
+            stripes.push(Self::constraint_stripe(
+                Self::unique_key_constraint(position),
+                values.into_iter(),
+            ));
+        }
+        stripes
+    }
+
+    /// When an `UPDATE` names its rows by one unique key's value and assigns
+    /// no column of any unique key: the `unique_lock` stripe of that key.
+    ///
+    /// Every row such a statement can match holds that key, since the
+    /// extracted equality is implied by its `WHERE` (the same promise an index
+    /// lookup rests on). So holding the stripe from before the scan to after
+    /// the rewrite excludes every other writer of the rows it can touch:
+    /// inserts and point updates of the key take the stripe, and a statement
+    /// that could give some other row this key takes them all.
+    fn point_update_stripe(
+        &self,
+        where_clause: &str,
+        updates: &[ColumnWritePayload],
+        expressions: &[(u32, crate::core::rql::expr::Expr)],
+    ) -> Option<usize> {
+        use crate::core::filter::sarg::MaskExpr;
+        use crate::core::filter::zonemap::SargOp;
+
+        if !self.has_unique || where_clause.trim().is_empty() {
+            return None;
+        }
+        let mut keyed: SmallVec<[u32; 8]> = self
+            .schema
+            .fields
+            .iter()
+            .filter(|f| f.is_unique && !f.is_deleted)
+            .map(|f| f.write_order as u32)
+            .collect();
+        for key in self.schema.unique_keys.iter() {
+            keyed.extend(self.unique_key_fields(key)?.iter().map(|f| f.write_order as u32));
+        }
+        if updates.iter().any(|u| keyed.contains(&u.write_order))
+            || expressions.iter().any(|(wo, _)| keyed.contains(wo))
+        {
+            return None;
+        }
+
+        let tokens = crate::core::tokenizer::query_tokenizer::try_tokenize(where_clause, &self.schema.fields).ok()?;
+        let program = sarg::extract_gated(&tokens, &|wo| keyed.contains(&wo), &self.decimal_scales())?;
+        let conjuncts: &[MaskExpr] = match &program.root {
+            MaskExpr::And(children) => children,
+            single @ MaskExpr::Pred(_) => std::slice::from_ref(single),
+            _ => return None,
+        };
+        let eq = |wo: u32| {
+            conjuncts.iter().find_map(|c| match c {
+                MaskExpr::Pred(p) if p.op == SargOp::Eq && p.write_order == wo => Some(p.value.as_slice()),
+                _ => None,
+            })
+        };
+
+        for field in self.schema.fields.iter().filter(|f| f.is_unique && !f.is_deleted) {
+            if let Some(value) = eq(field.write_order as u32) {
+                return Some(Self::constraint_stripe(
+                    field.write_order as usize,
+                    std::iter::once((field, value)),
+                ));
+            }
+        }
+        for (position, key) in self.schema.unique_keys.iter().enumerate() {
+            // A partial key names no single row: every soft-deleted copy
+            // shares it. Its stripe is still taken through `lock_more`.
+            if key.predicate.is_some() {
+                continue;
+            }
+            let fields = self.unique_key_fields(key)?;
+            let values: Option<SmallVec<[(&SchemaField, &[u8]); 4]>> =
+                fields.iter().map(|f| eq(f.write_order as u32).map(|v| (*f, v))).collect();
+            if let Some(values) = values {
+                return Some(Self::constraint_stripe(
+                    Self::unique_key_constraint(position),
+                    values.into_iter(),
+                ));
+            }
+        }
+        None
+    }
+
     /// Id of a live row whose `field` equals `value`, other than `exclude_id`.
+    ///
+    /// Sampled again while a round meets a version replaced after the
+    /// snapshot (see [`Supersessions`]).
     async fn find_row_with_value(
         &self,
         field: &SchemaField,
         value: &[u8],
         exclude_id: Option<u64>,
+        stale: Option<&std::collections::HashSet<u64>>,
+        visibility: &Visibility,
+        written_by: TxId,
+    ) -> Result<Option<(u64, bool)>> {
+        let mut supersessions = Supersessions::default();
+        for _ in 0..Supersessions::MAX_ROUNDS {
+            let found = self
+                .find_row_with_value_once(field, value, exclude_id, stale, visibility, written_by, &mut supersessions)
+                .await?;
+            if found.is_some() || !supersessions.take_fresh() {
+                return Ok(found);
+            }
+        }
+        Err(Supersessions::exhausted(Self::CONFLICT_RETRYABLE).into())
+    }
+
+    /// One sample of [`Self::find_row_with_value`].
+    #[allow(clippy::too_many_arguments)]
+    async fn find_row_with_value_once(
+        &self,
+        field: &SchemaField,
+        value: &[u8],
+        exclude_id: Option<u64>,
+        // Rows whose stored state is stale (`OwnKeys::updated`): skipped.
+        stale: Option<&std::collections::HashSet<u64>>,
         // Only rows this statement can see may block it. A version whose
         // deleting transaction has committed is gone, even though reclamation
         // has not yet reached it and its `deleted` flag is still clear.
         visibility: &Visibility,
-    ) -> Result<Option<u64>> {
+        // The transaction doing the writing, so a row *it* wrote is told apart
+        // from one a concurrent transaction wrote. `NO_TX` disables the
+        // in-flight rule and leaves the plain snapshot test, which is what a
+        // database with no transaction manager wants.
+        written_by: TxId,
+        supersessions: &mut Supersessions,
+    ) -> Result<Option<(u64, bool)>> {
+        let d = self.data()?;
         use crate::core::filter::sarg::{MaskExpr, SargPredicate, SargProgram};
         use crate::core::filter::zonemap::SargOp;
 
-        let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
+        // Deferred: an index or a narrow filter answers by slot below and
+        // never walks the pointer file, and the eager constructor acquired a
+        // 320 KB chunk buffer (past the pool's reuse cap, so a fresh
+        // allocation) and loaded the first chunk before any of that was
+        // known — a tenth of a single-row INSERT, once per unique column.
+        let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
-            .unwrap();
+            .map_err(std::io::Error::from)?;
+
+        // The slots to probe directly, when the filter narrows the table to
+        // few enough of them. `None` walks the pointer file instead.
+        //
+        // Handing the mask to the iterator was correct but no faster than not
+        // having one: the iterator still steps through every record of the
+        // pointer file, copying each chunk, to test one bit per record. This
+        // check runs once per inserted row, so loading a table with a primary
+        // key was quadratic — a 5,000-row INSERT took 67 ms into an empty
+        // table and 9.3 s into one of 200k rows, and a 2M-row load ran for
+        // over half an hour. Reading the few candidate records by slot makes
+        // the check O(candidates), plus a pass over the bitmap's words.
+        let mut probe_slots: Option<std::vec::IntoIter<u64>> = None;
+        // A legacy `CHAR` is compared by its one stored form, which an older
+        // build's cells (`'a '`, `' '`) do not hold: neither the index nor the
+        // filter, keyed by the stored bytes, can name the rows that match.
+        let by_bytes = field.db_type != DbType::CHAR || self.legacy_keys_canonical;
+
+        // An index over exactly this column names the slots outright: a
+        // descent rather than a pass over a bitmap of the whole table, so an
+        // insert into a table with a primary key costs the same at a million
+        // rows as at a thousand.
+        if by_bytes && let Some((slots, n_slots)) = self.index_probe(d, &[(field, value)]).await {
+            let now = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+            let mut slots = slots;
+            slots.extend(n_slots..now);
+            probe_slots = Some(slots.into_iter());
+        }
 
         // The mask is a superset, so a slot it clears genuinely cannot hold the
         // value; every slot it keeps is still compared byte for byte below.
-        if let Some(filters) = self.filters.as_ref() {
+        if let (None, Some(filters), true) = (probe_slots.as_ref(), d.filters.as_ref(), by_bytes) {
             if filters.indexes(field.write_order as u32) {
                 let program = SargProgram {
                     root: MaskExpr::Pred(SargPredicate {
@@ -1646,9 +4218,32 @@ impl<S: StorageIO> Table<S> {
                         value: value.to_vec(),
                     }),
                 };
-                let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+                let n_slots = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
                 if let Some(bitmap) = filters.evaluate(&program, n_slots) {
-                    iterator.set_candidates(Some(Arc::new(bitmap)));
+                    // Past `n_slots` the bitmap says nothing, so every slot
+                    // appended since it was sampled is a candidate too.
+                    let now = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+                    let mut slots: Vec<u64> = Vec::new();
+                    if !bitmap.is_nothing() {
+                        for (w, &word) in bitmap.words().iter().enumerate() {
+                            let mut bits = word;
+                            while bits != 0 {
+                                let slot = w as u64 * 64 + bits.trailing_zeros() as u64;
+                                if slot < n_slots {
+                                    slots.push(slot);
+                                }
+                                bits &= bits - 1;
+                            }
+                        }
+                        slots.extend(n_slots..now);
+                    }
+                    // Many candidates: the sequential walk reads them in
+                    // order and is the cheaper of the two.
+                    if (slots.len() as u64) <= now / 64 + 64 {
+                        probe_slots = Some(slots.into_iter());
+                    } else {
+                        iterator.set_candidates(Some(Arc::new(bitmap)));
+                    }
                 }
             } else {
                 log::debug!(
@@ -1661,36 +4256,132 @@ impl<S: StorageIO> Table<S> {
         let calc = SchemaCalculator;
         let (column_offset, schema_id) =
             calc.calculate_schema_offset(&field.name, &self.schema.fields);
-        let fetch = RowFetch {
-            columns_fetching_data: smallvec::smallvec![ColumnFetchingData {
+        // Fetched by the type it is stored as, as every scan fetches it. The
+        // declared type read a document (or any value stored like text) as
+        // something else, so no stored row ever matched and a UNIQUE `jsonb`
+        // column accepted the same document twice.
+        let mut columns_fetching_data: crate::core::row::row::FetchColumns =
+            smallvec::smallvec![ColumnFetchingData {
                 column_offset,
-                column_type: field.db_type.clone(),
+                column_type: field.db_type.physical(),
                 size: field.size,
                 schema_id,
-            }],
+            }];
+        // A stored NULL holds the type's zeroes — empty bytes for text — and
+        // must not match a written `''`: the companion tells them apart.
+        let flag_id = self.null_companion(field).map(|flag| {
+            let (column_offset, flag_schema_id) =
+                calc.calculate_schema_offset(&flag.name, &self.schema.fields);
+            columns_fetching_data.push(ColumnFetchingData {
+                column_offset,
+                column_type: flag.db_type.clone(),
+                size: flag.size,
+                schema_id: flag_schema_id,
+            });
+            flag_schema_id
+        });
+        let fetch = RowFetch {
+            columns_fetching_data,
         };
 
         let mut row = Row::default();
-        while let Ok(Some(pointer)) = iterator.next_row_pointer().await {
-            if Some(pointer.row_id()) == exclude_id {
+        let mut record = [0u8; ROW_POINTER_RECORD_LEN];
+        let mut floor = RunningFloor::default();
+        loop {
+            // A read that fails is an error, never the end of the table: ending
+            // early answers "no duplicate" for a value that may be there.
+            let pointer = match probe_slots.as_mut() {
+                Some(slots) => {
+                    let Some(slot) = slots.next() else { break };
+                    let mut at = slot * ROW_POINTER_RECORD_LEN as u64;
+                    match d.io_pointers.read_data_into_buffer(&mut at, &mut record).await {
+                        Ok(()) => {}
+                        // A slot past the end: an append reserved it and has
+                        // not written it yet, exactly what the sequential walk
+                        // stops short of too.
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => continue,
+                        Err(e) => return Err(e),
+                    }
+                    let pointer = RowPointer::from_slice(&record);
+                    if pointer.deleted {
+                        continue;
+                    }
+                    pointer
+                }
+                None => match iterator.next_row_pointer().await {
+                    Ok(Some(pointer)) => pointer,
+                    Ok(None) => break,
+                    Err(e) => return Err(e.into()),
+                },
+            };
+            if Some(pointer.row_id()) == exclude_id || stale.is_some_and(|s| s.contains(&pointer.row_id())) {
                 continue;
             }
-            if !visibility.visible(pointer.deleted, pointer.xmin, pointer.xmax) {
-                continue;
-            }
+            // A uniqueness check is not a query, and a snapshot is the wrong
+            // rule for it. A row another transaction has written but not yet
+            // committed is invisible to every snapshot, so two concurrent
+            // inserts of one key each looked, each found nothing, and each
+            // wrote — the constraint did not hold, silently. The write lock
+            // around the check cannot help: it serialises the writers, not what
+            // they are permitted to see.
+            //
+            // So a row *occupies* the value when its creator has not aborted
+            // and no committed transaction has deleted it. Deliberately a local
+            // rule rather than a new `Visibility`: nothing outside this check
+            // may adopt it, because seeing uncommitted rows is exactly wrong for
+            // a scan, the query cache and reclamation.
+            let manager = self.versions.load_full();
+            let occupancy = match (&manager, written_by) {
+                (Some(manager), writer) if writer != crate::core::mvcc::transaction::NO_TX => {
+                    // A delete this transaction made has happened, for it:
+                    // deleting a row and writing its key again in one
+                    // transaction was refused, where PostgreSQL allows it.
+                    match Self::occupancy(manager, &pointer, writer, &visibility, &mut floor) {
+                        Some(occupancy) => Some(occupancy),
+                        None => continue,
+                    }
+                }
+                _ => {
+                    if !visibility.visible(pointer.deleted, pointer.xmin, pointer.xmax) {
+                        continue;
+                    }
+                    None
+                }
+            };
+            let superseded = Occupancy::superseded(occupancy, visibility);
             if pointer
-                .fetch_row_reuse_async(&*self.io_rows, &fetch, &mut row)
+                .fetch_row_reuse_async(&*d.io_rows, &fetch, &mut row)
                 .await
                 .is_err()
             {
+                // Its value unknown: it may have been the key's holder.
+                if superseded {
+                    supersessions.note(&pointer);
+                }
                 continue;
             }
-            if row
-                .columns
-                .first()
-                .is_some_and(|column| column.data.into_slice() == value)
+            let stored_null = flag_id.is_some_and(|id| {
+                row.columns
+                    .iter()
+                    .find(|c| u64::from(c.schema_id) == id)
+                    .is_some_and(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()))
+            });
+            if !stored_null
+                && row
+                    .columns
+                    .iter()
+                    .find(|c| u64::from(c.schema_id) == schema_id)
+                    .is_some_and(|column| {
+                        same_unique_value(&field.db_type, column.data.into_slice(), value)
+                    })
             {
-                return Ok(Some(pointer.row_id()));
+                let Some(in_flight) = Self::settle_occupancy(manager.as_deref(), occupancy) else {
+                    if superseded {
+                        supersessions.note(&pointer);
+                    }
+                    continue;
+                };
+                return Ok(Some((pointer.row_id(), in_flight)));
             }
         }
 
@@ -1707,20 +4398,21 @@ impl<S: StorageIO> Table<S> {
     ///
     /// Linear in the pointer file. Intended for resolving a handle, not for
     /// query execution, which goes through the filter index.
-    pub async fn locate_row_by_id(&self, id: u64) -> Option<(u64, RowPointer)> {
+    pub async fn locate_row_by_id(&self, id: u64) -> Result<Option<(u64, RowPointer)>> {
+        let d = self.data()?;
         const RECORD: usize = ROW_POINTER_RECORD_LEN;
 
         let _gate = self.compaction_gate.read().await;
-        let _read = self.read_guard();
+        let _read = d.read_guard();
 
-        let len = self.io_pointers.get_len().await;
+        let len = d.io_pointers.get_len().await;
         let end = len - (len % RECORD as u64);
         let mut position = 0u64;
 
         let mut buffer = [0u8; RECORD];
         while position + RECORD as u64 <= end {
             let mut read_at = position;
-            if self
+            if d
                 .io_pointers
                 .read_data_into_buffer(&mut read_at, &mut buffer)
                 .await
@@ -1732,55 +4424,53 @@ impl<S: StorageIO> Table<S> {
             // At most one live pointer carries a given id, so the first live
             // match is the answer however many times the row has moved.
             if !candidate.deleted && candidate.row_id() == id {
-                return Some((position, candidate));
+                return Ok(Some((position, candidate)));
             }
             position += RECORD as u64;
         }
-        None
+        Ok(None)
     }
 
     /// True once the maintenance task has finished its initial backfill.
     #[inline]
-    pub fn filters_ready(&self) -> bool {
-        self.filters_ready.load(AtomicOrdering::Acquire)
+    pub fn filters_ready(&self) -> Result<bool> {
+        self.data()?;
+        Ok(self.filters_ready.load(AtomicOrdering::Acquire))
     }
 
     /// Await the initial backfill. Queries before it completes are correct —
     /// just not yet narrowed by the filter.
-    pub async fn wait_filters_ready(&self) {
-        while !self.filters_ready() {
+    pub async fn wait_filters_ready(&self) -> Result<()> {
+        self.data()?;
+        while !self.filters_ready.load(AtomicOrdering::Acquire) {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
+        Ok(())
     }
 
-    /// Read and validate the sidecar. Any problem returns `None` and the caller
-    /// builds an empty catalog: a rejected checkpoint costs a scan, never a
-    /// wrong answer.
-    async fn load_filter_checkpoint(
-        io_filters: &Arc<S>,
-        fields: &SmallVec<[SchemaField; 20]>,
-        now_slots: u64,
-    ) -> Option<TableFilters> {
-        let len = io_filters.get_len().await;
-        if len == 0 {
-            return None;
+    /// `_flt.db` at the open of a table with no directory (memory, key/value,
+    /// a mirrored pool; P33), deleted through the provider family (RV20): a
+    /// key/value delete, every copy of a mirror. Such a table has no gate to
+    /// start `Unknown` and no snapshot for the file to be evidence against;
+    /// it matters only to a downgraded binary, which would trust a filter
+    /// image this one no longer maintains. An empty file is left (no binary
+    /// trusts one), and so is one that is not a filter image, which may be
+    /// the rows of a table named `<stem>_flt` (P19). The delete is the
+    /// provider's best effort: it reports no error to retry on.
+    async fn retire_flt_through_provider(seed: &Arc<S>, stem: &str) {
+        let io = seed.create_new(format!("{stem}_flt.db")).await;
+        let len = io.get_len().await;
+        if len < 8 {
+            return;
         }
-
-        let mut buf = vec![0u8; len as usize];
+        let mut head = [0u8; 8];
         let mut pos = 0u64;
-        if io_filters.read_data_into_buffer(&mut pos, &mut buf).await.is_err() {
-            return None;
+        if io.read_data_into_buffer(&mut pos, &mut head).await.is_err() || &head != b"RDBFLT01" {
+            return;
         }
-
-        match TableFilters::from_checkpoint(&buf, fields, FilterConfig::default(), now_slots) {
-            Ok(f) => Some(f),
-            Err(reason) => {
-                info!("Filter checkpoint not usable ({:?}); rebuilding", reason);
-                None
-            }
-        }
+        io.drop_io();
+        info!("{}: deleted the retired filter sidecar {}_flt.db", stem, stem);
     }
-
 
     /// Row fetch covering only columns the filter can index.
     fn build_indexed_row_fetch(schema_fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
@@ -1799,7 +4489,9 @@ impl<S: StorageIO> Table<S> {
                 schema_id: offset.1,
             });
         }
-        RowFetch { columns_fetching_data }
+        RowFetch {
+            columns_fetching_data,
+        }
     }
 
     /// Index every pre-existing row, then start trusting the filter for them.
@@ -1808,6 +4500,7 @@ impl<S: StorageIO> Table<S> {
     /// their slots stay all-zero — which reads as "matches nothing" and lets the
     /// filter prune tombstoned rows before their pointer is even decoded.
     pub async fn backfill_filters(&self) -> Result<u64> {
+        self.data()?;
         self.backfill_filters_from(0).await
     }
 
@@ -1815,27 +4508,43 @@ impl<S: StorageIO> Table<S> {
     /// frontier makes reopening cost work proportional to what was written
     /// since, not to the size of the table.
     pub async fn backfill_filters_from(&self, start_slot: u64) -> Result<u64> {
-        let Some(filters) = self.filters.as_ref() else {
+        let d = self.data()?;
+        let Some(filters) = d.filters.as_ref() else {
             return Ok(0);
         };
         backfill_into(
             filters,
-            &self.io_pointers,
-            &self.io_rows,
+            &d.io_pointers,
+            &d.io_rows,
             &self.schema.fields,
             start_slot,
-            self.free_space.is_enabled().then_some(&self.readers),
+            d.free_space.is_enabled().then_some(&d.readers),
         )
         .await
     }
 
-    /// Persist the current filter state. Normally the maintenance task does
-    /// this; call it directly when a checkpoint must be on disk before some
-    /// specific point, such as a controlled shutdown.
-    pub async fn checkpoint_filters(&self) {
-        let Some(filters) = self.filters.as_ref() else { return };
-        let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
-        filters.checkpoint(&*self.io_filters, n_slots).await;
+    /// Persists the filter now: a mandatory seal of the file set
+    /// (docs/persistent-indexes.md §3), the clean point
+    /// `rdb_index_checkpoint` is. Since B14 the filter persists only as a
+    /// snapshot's FILTER section, so this is [`Table::seal_snapshot`] for
+    /// callers that predate it. A table that cannot be sealed (no
+    /// directory, no write-ahead log, bulk load, a ticket still held, an
+    /// unready filter) persists nothing and rebuilds at its next open,
+    /// which is `Ok`: nothing is lost but the rebuild's time. An I/O error
+    /// of the seal is returned.
+    pub async fn checkpoint_filters(&self) -> Result<()> {
+        self.data()?;
+        match self
+            .seal_snapshot(crate::core::index_store::gate_word::SealKind::Mandatory)
+            .await
+        {
+            crate::core::index_store::seal::SealOutcome::Failed(e)
+            | crate::core::index_store::seal::SealOutcome::FailedAfterClean(e) => Err(e),
+            outcome => {
+                log::debug!("{}: filter checkpoint: {}", self.schema.name, outcome.describe());
+                Ok(())
+            }
+        }
     }
 
     /// The slot ceiling that answers `ORDER BY … LIMIT k` from the leading
@@ -1857,6 +4566,7 @@ impl<S: StorageIO> Table<S> {
     /// rows, which the caller detects and widens.
     async fn monotonic_scan_ceiling(
         &self,
+        d: &TableData<S>,
         order_by: &Option<String>,
         limit: Option<u64>,
         n_slots: u64,
@@ -1865,7 +4575,7 @@ impl<S: StorageIO> Table<S> {
         if wanted == 0 || n_slots == 0 {
             return None;
         }
-        let filters = self.filters.as_ref()?;
+        let filters = d.filters.as_ref()?;
         let spec = order_by.as_ref()?;
 
         let mut keys = crate::core::rql::order_by::parse_spec(spec).into_iter();
@@ -1885,6 +4595,16 @@ impl<S: StorageIO> Table<S> {
             return None;
         }
 
+        // Rounded up to whole zones. Ascending zone bounds order the zones
+        // against each other and say nothing about the rows inside one, so the
+        // `k` smallest values are only known to lie within the first
+        // `ceil(k / ZONE_ROWS)` zones — not in the first `k` slots. Bounded at
+        // `k` slots, a column ascending across zones but not within them
+        // (timestamps inserted out of order inside a batch) returned the wrong
+        // rows: `ORDER BY f LIMIT 3` over values descending within each zone
+        // answered slots 0, 1, 2 instead of 511, 510, 509.
+        let zone = crate::core::filter::kernels::ZONE_ROWS as u64;
+        let wanted = wanted.div_ceil(zone).saturating_mul(zone);
         // Already scanning everything: the bound would only add a mask.
         if wanted >= n_slots {
             return None;
@@ -1892,34 +4612,306 @@ impl<S: StorageIO> Table<S> {
         Some(wanted)
     }
 
-    /// Build a candidate mask for a WHERE clause, or `None` to scan normally.
-    async fn build_candidates(
-        &self,
-        where_clause: &str,
-        limit: Option<u64>,
-    ) -> Option<Arc<CandidateBitmap>> {
-        let filters = self.filters.as_ref()?;
-        if where_clause.trim().is_empty() {
+    /// Each `NUMERIC(p, s)` column's scale, where it is not the engine
+    /// default, so a literal is bounded where the column stores it.
+    fn decimal_scales(&self) -> smallvec::SmallVec<[(u32, u32); 4]> {
+        crate::core::value_codec::decimal_scales(&self.schema.fields)
+    }
+
+    /// The candidate slots a secondary index gives for a tokenized WHERE
+    /// clause, or `None` when no index can narrow it, or none is built yet.
+    async fn index_candidates(&self, d: &TableData<S>, tokens: &[Token]) -> Option<Arc<CandidateBitmap>> {
+        let indexes = d.indexes.as_ref().filter(|i| i.is_ready())?;
+        if tokens.is_empty() {
             return None;
         }
+        // Sampled before the index is asked. A version appended after this
+        // sits at or past `n_slots`, which the bitmap counts as a candidate;
+        // one appended before it was indexed by its writer before it could
+        // commit, so a snapshot that can see it finds it here — provided the
+        // caller took that snapshot BEFORE calling this. A snapshot taken
+        // after can see a commit whose entry this lookup missed; every caller
+        // of `build_candidates` takes its snapshot first for that reason.
+        let n_slots = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        let scales = self.decimal_scales();
+        let cap = crate::core::index::candidate_cap(n_slots);
+        // Key indexes, with `doc->>'k'` read as the virtual column of a path
+        // index that keys that path.
+        let resolve = |document: u32, steps: &[crate::core::jsonb::Step]| indexes.path_column(document, steps);
+        let from_keys = sarg::extract_gated_with_paths(tokens, &|wo| indexes.covers(wo), &scales, &resolve)
+            .and_then(|program| indexes.plan(&program.root, &self.schema.fields, cap));
+        // Inverted indexes, for `@>`, `?`, `?|`, `?&` on a document column.
+        let json = if indexes.gin.is_empty() {
+            None
+        } else {
+            crate::core::index::gin::parse_json_where(tokens)
+        };
+        let from_gin = json.as_ref().and_then(|e| indexes.plan_json(e, cap));
+        // Both are supersets of the matches, so where both narrow, so does
+        // their intersection.
+        let mut slots = match (from_keys, from_gin) {
+            (Some(a), Some(b)) => crate::core::index::intersect_sorted(&a, &b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => {
+                // Too broad for a slot list (`doc @> '{"status":"paid"}'`, a
+                // fifth of the table) but still most of it left out: a bitmap
+                // straight from the posting lists. It covers `n_slots`, so
+                // the rule for slots appended since holds as for a list.
+                let limit = crate::core::index::dense_cap(n_slots);
+                let words = json.as_ref().and_then(|e| indexes.plan_json_dense(e, n_slots, limit))?;
+                let bitmap = CandidateBitmap::dense(words, n_slots);
+                info!("Index narrowed {} slots to {} candidates, as a bitmap", n_slots, bitmap.count());
+                return Some(Arc::new(bitmap));
+            }
+        };
+        slots.retain(|s| *s < n_slots);
+        info!(
+            "Index narrowed {} slots to {} candidates",
+            n_slots,
+            slots.len()
+        );
+        Some(Arc::new(CandidateBitmap::sparse(slots, n_slots)))
+    }
 
-        // A predicate the tokenizer cannot read is not a reason to abandon the
-        // query: the filter index is an optimisation, so an unreadable clause
-        // just means no candidate set and a full scan, which the evaluator will
-        // then reject with a proper message.
-        let tokens = crate::core::tokenizer::query_tokenizer::try_tokenize(
-            where_clause,
-            &self.schema.fields,
-        )
-        .ok()?;
-        let program = sarg::extract(&tokens, filters)?;
-
-        let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+    /// The filter index's mask for a clause, and the table length it covers:
+    /// every slot that may match, before any judgement of whether a scan is
+    /// better off with it.
+    async fn filter_mask(&self, d: &TableData<S>, tokens: &[Token]) -> Option<(CandidateBitmap, u64)> {
+        let filters = d.filters.as_ref()?;
+        if tokens.is_empty() {
+            return None;
+        }
+        // Each `NUMERIC(p, s)` column's scale, so a literal is bounded where
+        // the column stores it — see `sarg::extract_with_scales`.
+        let scales = self.decimal_scales();
+        let program = sarg::extract_with_scales(tokens, filters, &scales)?;
+        let n_slots = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
         if n_slots == 0 {
             return None;
         }
-
         let bitmap = filters.evaluate(&program, n_slots)?;
+        Some((bitmap, n_slots))
+    }
+
+
+    /// Build a candidate mask for a WHERE clause, or `Ok(None)` to scan
+    /// normally.
+    ///
+    /// `pub(crate)` only so `write_path_tests` can assert on what it declines.
+    /// The decisions in [`Self::candidates_for`] — the size gate and the ratio
+    /// test — are invisible in query results by design, since both fail open
+    /// to a full scan, so nothing outside it can tell whether they ran.
+    pub(crate) async fn build_candidates(
+        &self,
+        where_clause: &str,
+        limit: Option<u64>,
+    ) -> Result<Option<Arc<CandidateBitmap>>> {
+        let d = self.data()?;
+        Ok(self.candidates_for(d, where_clause, limit).await)
+    }
+
+    /// The candidates a unique index gives for a full-key equality, from
+    /// the key's stored bytes rather than from a clause's text
+    /// ([`crate::core::row::point_key`]): per key column its write order, its
+    /// type, the bytes it equals, and (`names`) its name. `Ok(None)` when the
+    /// key cannot be answered so (a column not live under that name and type,
+    /// a type off [`point_key::key_type_allowed`], a column no index keys,
+    /// the indexes not built or loading): the text path is the answer then.
+    ///
+    /// The predicate is the one the text `col = literal AND …` extracts to,
+    /// asked of the same `TableIndexes::plan`. A learned statement checks
+    /// that this gives what [`Self::build_candidates`] gives for its rendered
+    /// clause before it uses one.
+    ///
+    /// [`point_key::key_type_allowed`]: crate::core::row::point_key::key_type_allowed
+    pub(crate) async fn candidates_for_key(
+        &self,
+        levels: &[(u32, DbType, &[u8])],
+        names: &[&str],
+    ) -> Result<Option<Arc<CandidateBitmap>>> {
+        let d = self.data()?;
+        Ok(self.key_candidates(d, levels, names).await)
+    }
+
+    /// The key columns, in key order, of each built unique index whose every
+    /// column a bound key can answer ([`Self::candidates_for_key`]): per
+    /// column its write order, type and name. What a learned statement
+    /// matches its compared columns against. A non-unique index is never
+    /// one: a full-key equality on it is not a point.
+    pub(crate) fn point_indexes(&self) -> Result<Vec<Vec<(u32, DbType, StdArc<str>)>>> {
+        let d = self.data()?;
+        let Some(indexes) = d.indexes.as_ref().filter(|i| i.is_ready()) else {
+            return Ok(Vec::new());
+        };
+        let fields = &self.schema.fields;
+        Ok(indexes
+            .list
+            .iter()
+            .filter(|index| index.decl.unique && !index.decl.is_deleted && !index.columns.is_empty())
+            .filter_map(|index| {
+                index
+                    .columns
+                    .iter()
+                    .map(|(wo, t)| {
+                        let field = fields.iter().find(|f| !f.is_deleted && f.write_order == u64::from(*wo))?;
+                        (field.db_type == *t && crate::core::row::point_key::key_type_allowed(field, fields))
+                            .then(|| (*wo, t.clone(), StdArc::<str>::from(field.name.as_str())))
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .collect())
+    }
+
+    /// [`Self::candidates_for_key`]'s body.
+    async fn key_candidates(
+        &self,
+        d: &TableData<S>,
+        levels: &[(u32, DbType, &[u8])],
+        names: &[&str],
+    ) -> Option<Arc<CandidateBitmap>> {
+        use crate::core::filter::sarg::{MaskExpr, SargPredicate};
+        use crate::core::filter::zonemap::SargOp;
+        if levels.is_empty() || levels.len() != names.len() || self.gate.loads().loading() {
+            return None;
+        }
+        let indexes = d.indexes.as_ref().filter(|i| i.is_ready())?;
+        let fields = &self.schema.fields;
+        let mut preds = Vec::with_capacity(levels.len());
+        for ((wo, db_type, bytes), name) in levels.iter().zip(names) {
+            let field = fields.iter().find(|f| !f.is_deleted && f.write_order == u64::from(*wo))?;
+            if field.name != *name
+                || field.db_type != *db_type
+                || !crate::core::row::point_key::key_type_allowed(field, fields)
+                || !indexes.covers(*wo)
+            {
+                return None;
+            }
+            preds.push(MaskExpr::Pred(SargPredicate { write_order: *wo, op: SargOp::Eq, value: bytes.to_vec() }));
+        }
+        // As `index_candidates`: the length sampled before the index is
+        // asked, so a version appended since stays a candidate.
+        let n_slots = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        let cap = crate::core::index::candidate_cap(n_slots);
+        let mut slots = indexes.plan(&MaskExpr::And(preds), fields, cap)?;
+        slots.retain(|s| *s < n_slots);
+        Some(Arc::new(CandidateBitmap::sparse(slots, n_slots)))
+    }
+
+    /// The body of [`Self::build_candidates`], for a caller that already
+    /// holds the table's data.
+    async fn candidates_for(
+        &self,
+        d: &TableData<S>,
+        where_clause: &str,
+        limit: Option<u64>,
+    ) -> Option<Arc<CandidateBitmap>> {
+        let candidates = self.build_candidates_inner(d, where_clause, limit).await;
+        // Test-only: parks the statement once the index and the filter have
+        // been asked, on every return path — the window between that lookup
+        // and anything the caller does next, a snapshot included.
+        #[cfg(test)]
+        snapshot_order_tests::candidates_built(&self.schema.name).await;
+        candidates
+    }
+
+    async fn build_candidates_inner(
+        &self,
+        d: &TableData<S>,
+        where_clause: &str,
+        limit: Option<u64>,
+    ) -> Option<Arc<CandidateBitmap>> {
+        // The constant judgement, the indexes and the filter all read the
+        // clause as tokens, so it is tokenized once here for all three, and
+        // only when one of them will look. A clause the tokenizer cannot read
+        // is not a reason to abandon the query: each of the three is an
+        // optimisation, so it just means a full scan, which the evaluator
+        // will then reject with a proper message.
+        if where_clause.trim().is_empty() {
+            return None;
+        }
+        // A learned point `SELECT`'s own scan: its key asks the index
+        // directly, the clause's text unread (`point_key`). Only for the
+        // table and the clause it was bound for; anything it cannot answer
+        // falls through to the text, below.
+        if let Some(key) = crate::core::row::point_key::current()
+            && *key.table == *self.schema.name
+            && *key.where_clause == *where_clause
+        {
+            let levels: SmallVec<[(u32, DbType, &[u8]); 3]> =
+                key.levels.iter().map(|(wo, t, bytes)| (*wo, t.clone(), bytes.as_slice())).collect();
+            let names: SmallVec<[&str; 3]> = key.names.iter().map(|n| &**n).collect();
+            if let Some(found) = self.key_candidates(d, &levels, &names).await {
+                crate::core::row::point_key::HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(found);
+            }
+        }
+        let judge_constant = sarg::worth_judging_constant(where_clause);
+        // A load of the snapshot's INDEX sections in flight (B17): waited for
+        // up to `index_snapshot.load_wait_ms` rather than scan unpruned. The
+        // loaded index lacks nothing the caller's snapshot, taken before
+        // this, can see: the snapshot covers every row it was sealed over,
+        // and a write that landed during the load (a deferred load on a
+        // `Dirty` word) inserted its own entries, which the load merges with
+        // and never removes (`index_store::load`'s module docs).
+        if self.gate.loads().loading() && d.indexes.as_ref().is_some_and(|i| !i.is_ready()) {
+            let wait = crate::core::index_store::load::settings::load_wait();
+            self.gate.loads().settled_within(wait).await;
+        }
+        let indexes_ready = d.indexes.as_ref().is_some_and(|i| i.is_ready());
+        if !judge_constant && !indexes_ready && d.filters.is_none() {
+            return None;
+        }
+        let tokens = crate::core::tokenizer::query_tokenizer::try_tokenize(where_clause, &self.schema.fields).ok()?;
+        // A clause no row can satisfy — `1 = 0`, `notnull IS NULL`, `x IN ()`,
+        // `id != id` — needs no index and no scan. Decided before the index is
+        // consulted, so it holds on a table with no filters too.
+        if sarg::clause_tokens_are_constant_false(where_clause, &tokens) {
+            return Some(Arc::new(CandidateBitmap::nothing()));
+        }
+        // A secondary index names the candidate slots outright, so it is
+        // asked first. When none can answer the clause, or the answer is too
+        // broad to be worth a slot list, the filter's mask is the next best.
+        //
+        // A short answer is taken as it is. A long one is narrowed by the
+        // filter as well: an index over `(cat, price)` asked `cat = 5 AND
+        // price > 990` without a range on `price` names every `cat = 5` row,
+        // while the filter's mask already excludes most of them on `price`.
+        // Both are supersets of the matches, so their intersection is too.
+        let from_index = self.index_candidates(d, &tokens).await;
+        if let Some(found) = &from_index {
+            if found.count() <= INDEX_ANSWER_TAKEN_AS_IS || d.filters.is_none() {
+                return from_index;
+            }
+            let Some((mask, _)) = self.filter_mask(d, &tokens).await else {
+                return from_index;
+            };
+            // Two bitmaps intersect word by word, and a slot past the
+            // shorter one's length would read as excluded. The mask is
+            // sampled after the index answer, and the table only grows under
+            // a query, so it is never the shorter; this keeps it that way.
+            if !found.is_sparse() && mask.n_slots() < found.n_slots() {
+                return from_index;
+            }
+            let mut narrowed = (**found).clone();
+            narrowed.intersect(&mask);
+            info!("Filter narrowed {} index candidates to {}", found.count(), narrowed.count());
+            return Some(Arc::new(narrowed));
+        }
+        let filters = d.filters.as_ref()?;
+        let (bitmap, n_slots) = self.filter_mask(d, &tokens).await?;
+
+        // A table small enough to scan outright gains nothing from a mask: the
+        // bitmap test per record costs more than the fetches it saves, and
+        // building the mask is itself work. Scanning is the cheaper answer, so
+        // give the caller no candidates and let it read everything.
+        //
+        // This is what `min_table_rows` is for. Until it was read here the knob
+        // was settable from the CLI and `SET CONFIG` and reported by `SHOW
+        // CONFIG` while gating nothing — it accepted a value and had no effect.
+        // Slots rather than live rows, because slots are what the scan walks.
+        if n_slots < filters.config().min_table_rows {
+            return None;
+        }
 
         // A mask that barely prunes costs more (a bitmap test per record) than
         // the fetches it avoids — *when the scan reads everything*. That is the
@@ -1966,31 +4958,63 @@ impl<S: StorageIO> Table<S> {
 
     /// Inserts outside any transaction, visible immediately.
     pub async fn insert_row(&self, row_write: RowWrite) -> Result<()> {
+        self.data()?;
         self.insert_row_in_txn(row_write, FROZEN_TX).await
     }
 
     /// Inserts a row belonging to `written_by`, visible to nobody else until it
     /// commits.
-    pub async fn insert_row_in_txn(&self, row_write: RowWrite, written_by: TxId) -> Result<()> {
+    pub async fn insert_row_in_txn(&self, mut row_write: RowWrite, written_by: TxId) -> Result<()> {
+        let d = self.data()?;
+        // Before a key is taken from the row: every value of a declared text
+        // length in its stored form, or the insert refused (22001). The
+        // encoders do this already; this is the one place every insert
+        // passes, so a path that reached here without them still stores
+        // `'b '` in a `character(3)` key as the `'b'` it is.
+        self.hold_text_lengths(&mut row_write, |_| true, true)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        // Before the gate below and before anything is written (§2 lock order,
+        // T1).
+        let _watch = self.enter_write().await?;
+        let ticket = gate::ticket(&self.gate, self.family()).await?;
         // Compaction relies on the live set not changing under it, so an insert
         // holds the gate too. It is shared, so concurrent inserts still run.
         let _gate = self.compaction_gate.read().await;
+
+        // A partition stores only rows of its own range (§4.5): a row routed
+        // here by mistake fails the statement instead of landing where no
+        // routed query looks. Before anything is locked or written.
+        if let Some(guard) = d.guard.as_ref() {
+            guard.check_insert(&row_write)?;
+        }
 
         self.note_write(written_by);
 
         // A uniqueness check that is not atomic with the write it guards is not
         // a check: two concurrent inserts would each look, each find nothing,
         // and each write. Tables without a constraint never take this.
+        //
+        // Not `write_lock`: see `unique_lock` for why an insert must not queue
+        // behind an update's scan. Only this row's keys' stripes: inserts of
+        // other keys cannot conflict with it.
         let _write = if self.has_unique {
-            Some(self.write_lock.lock().await)
+            Some(self.unique_lock.lock(&self.unique_stripes(&row_write)).await)
         } else {
             None
         };
-        self.check_unique(&row_write, None, &self.visibility_for(written_by), None).await?;
+        self.check_unique(
+            &row_write,
+            None,
+            &self.visibility_for(written_by),
+            written_by,
+            None,
+            None,
+        )
+        .await?;
 
         // The id this row is about to take must already be covered by the
         // reservation on disk, or a crash could hand it out again.
-        self.ensure_ids_reserved().await;
+        let _id = d.ids.reserve_insert_id().await;
 
         info!(
             "Inserting row with {} columns",
@@ -1998,16 +5022,16 @@ impl<S: StorageIO> Table<S> {
         );
 
         let result = RowPointer::write_row_with_pointer_record_pos(
-            self.io_pointers.clone(),
-            self.io_rows.clone(),
-            &self.last_row_id,
-            &self.len,
+            d.io_pointers.clone(),
+            d.io_rows.clone(),
+            &d.ids.last_row_id,
+            &d.len,
             // Clustering is not implemented; every row goes to cluster 0.
             #[cfg(feature = "enable_long_row")]
             0u32,
             &row_write,
             None,
-            Some(&self.free_space),
+            Some(&d.free_space),
             None,
             written_by,
         )
@@ -2021,15 +5045,97 @@ impl<S: StorageIO> Table<S> {
             error!("Failed to insert row: {}", e);
             std::io::Error::from(e)
         })?;
+        d.vacuum_stats.note_inserted(written_by, 1);
 
         // Index the new slot. The pointer record position IS the slot address
         // (dense fixed-stride file), so no mapping is needed.
-        if let Some(filters) = self.filters.as_ref() {
-            filters.on_insert(record_pos / ROW_POINTER_RECORD_LEN as u64, &row_write);
+        if let Some(filters) = d.filters.as_ref() {
+            filters.on_insert(
+                Proof::from(&ticket),
+                record_pos / ROW_POINTER_RECORD_LEN as u64,
+                &row_write,
+            );
+        }
+        // Before this returns, and so before the inserting transaction can
+        // commit: no snapshot can see the row without its index entry.
+        if let Some(indexes) = d.indexes.as_ref() {
+            indexes.on_insert(
+                Proof::from(&ticket),
+                record_pos / ROW_POINTER_RECORD_LEN as u64,
+                &row_write,
+            );
         }
 
         self.invalidate_query_caches();
 
+        Ok(())
+    }
+
+    /// Writes one row version as another instance of this table's file set
+    /// held it: created by `xmin` and, unless `xmax` is `NO_TX`, retired by
+    /// `xmax`. For an ALTER rewrite (docs/persistent-indexes.md §7, R5), which
+    /// copies every version a snapshot can still see with the stamps it had,
+    /// so the rewrite changes no one's view of the rows: a committed row stays
+    /// committed, a version the ALTER's own transaction wrote stays its own
+    /// (gone if it rolls back), and a row it deleted comes back if it does.
+    ///
+    /// No uniqueness check: the versions were checked when they were written,
+    /// a rewrite changes no key, and two versions of one key (the old one
+    /// retired) must both go in. The caller holds ACCESS EXCLUSIVE, so
+    /// nothing else writes the table meanwhile. Indexed and filtered like any
+    /// insert.
+    pub(crate) async fn insert_version(&self, mut row_write: RowWrite, xmin: TxId, xmax: TxId) -> Result<()> {
+        let d = self.data()?;
+        // A rewrite's added column (its DEFAULT) is held to its declared
+        // text length as any insert is; the copied columns already hold.
+        self.hold_text_lengths(&mut row_write, |_| true, false)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let _watch = self.enter_write().await?;
+        let ticket = gate::ticket(&self.gate, self.family()).await?;
+        let _gate = self.compaction_gate.read().await;
+        if let Some(manager) = self.versions.load().as_ref() {
+            // The transaction that will end these versions must know it wrote
+            // here (its commit syncs this table); a committed one is done.
+            for id in [xmin, xmax] {
+                if id != NO_TX && id != FROZEN_TX && manager.outcome(id) == crate::core::mvcc::TxOutcome::InProgress {
+                    manager.mark_wrote(id);
+                }
+            }
+        }
+        let _id = d.ids.reserve_insert_id().await;
+        let (record_pos, mut pointer) = RowPointer::write_row_with_pointer_record_pos(
+            d.io_pointers.clone(),
+            d.io_rows.clone(),
+            &d.ids.last_row_id,
+            &d.len,
+            #[cfg(feature = "enable_long_row")]
+            0u32,
+            &row_write,
+            None,
+            // Appended, in the order read: a fresh file set has no free space.
+            None,
+            None,
+            xmin,
+        )
+        .await
+        .map_err(std::io::Error::from)?;
+        if xmax != NO_TX {
+            pointer
+                .delete(d.io_pointers.clone(), record_pos, None, xmax)
+                .await
+                .map_err(std::io::Error::from)?;
+        } else {
+            d.vacuum_stats.note_inserted(xmin, 1);
+        }
+
+        let slot = record_pos / ROW_POINTER_RECORD_LEN as u64;
+        if let Some(filters) = d.filters.as_ref() {
+            filters.on_insert(Proof::from(&ticket), slot, &row_write);
+        }
+        if let Some(indexes) = d.indexes.as_ref() {
+            indexes.on_insert(Proof::from(&ticket), slot, &row_write);
+        }
+        self.invalidate_query_caches();
         Ok(())
     }
 
@@ -2045,6 +5151,7 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
         order_by: Option<String>,
     ) -> Result<Vec<Row>> {
+        self.data()?;
         self.query_row_in_txn(
             query,
             schema_fields,
@@ -2059,6 +5166,72 @@ impl<S: StorageIO> Table<S> {
 
     /// Queries through `reader`'s snapshot, so it sees its own uncommitted
     /// writes and nobody else's.
+    /// How many rows match, for a plan that wants nothing but the count.
+    ///
+    /// Additive alongside [`Self::query_row_in_txn`] rather than a mode on it:
+    /// the two return different things and share only their preamble. See
+    /// [`crate::core::rql::aggregate::is_row_count_only`] for which plans may
+    /// use it.
+    ///
+    /// No `limit` and no `order_by` are taken. Both belong to the aggregated
+    /// output rather than to its input, so there is nothing here for them to
+    /// mean — and the scan-ceiling machinery `query_row_with_visibility` runs
+    /// exists to bound an ordered scan, which this never is.
+    pub async fn count_rows_in_txn(
+        &self,
+        query: &str,
+        schema_fields: &Vec<SchemaField>,
+        query_row_fetch: RowFetch,
+        reader: TxId,
+    ) -> Result<u64> {
+        self.data()?;
+        let visibility = self.read_visibility_for(reader);
+        self.count_rows_with_visibility(query, schema_fields, query_row_fetch, visibility, true)
+            .await
+    }
+
+    /// [`Self::count_rows_in_txn`] under a rule the caller took, so a
+    /// statement reading several partitions sees them all through one
+    /// snapshot (§4.4, §8). `cache == false` neither reads nor fills the
+    /// query cache.
+    pub async fn count_rows_with_visibility(
+        &self,
+        query: &str,
+        schema_fields: &Vec<SchemaField>,
+        query_row_fetch: RowFetch,
+        visibility: Visibility,
+        cache: bool,
+    ) -> Result<u64> {
+        let d = self.data()?;
+
+        // The same two guards the row path takes, for the same reason:
+        // reclamation may not hand out an extent while a pointer into it is
+        // still in play, even though this path never dereferences one.
+        let _gate = self.compaction_gate.read().await;
+        let _read = d.read_guard();
+
+        let generation = self.cache_generation();
+        let base_candidates = self.candidates_for(d, query, None).await;
+
+        let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
+            .await
+            .unwrap();
+        iterator.set_candidates(base_candidates);
+
+        self.concurrent_processor
+            .process_count(
+                &self.cache_scope,
+                query,
+                query_row_fetch,
+                schema_fields,
+                d.io_rows.clone(),
+                &mut iterator,
+                (cache && self.caches_queries()).then(|| cache_generation_for(&visibility, generation)).flatten(),
+                visibility,
+            )
+            .await
+    }
+
     pub async fn query_row_in_txn(
         &self,
         query: &str,
@@ -2069,7 +5242,8 @@ impl<S: StorageIO> Table<S> {
         order_by: Option<String>,
         reader: TxId,
     ) -> Result<Vec<Row>> {
-        let visibility = self.visibility_for(reader);
+        self.data()?;
+        let visibility = self.read_visibility_for(reader);
         self.query_row_with_visibility(
             query,
             schema_fields,
@@ -2098,6 +5272,36 @@ impl<S: StorageIO> Table<S> {
         order_by: Option<String>,
         visibility: Visibility,
     ) -> Result<Vec<Row>> {
+        self.data()?;
+        self.query_row_with_visibility_cached(
+            query,
+            schema_fields,
+            query_row_fetch,
+            requested_row_fetch,
+            limit,
+            order_by,
+            visibility,
+            true,
+        )
+        .await
+    }
+
+    /// [`Self::query_row_with_visibility`], saying whether the scan may read
+    /// and fill the query cache. A fan-out over many partitions passes
+    /// `false`, so it cannot flush the cache (§8).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn query_row_with_visibility_cached(
+        &self,
+        query: &str,
+        schema_fields: &Vec<SchemaField>,
+        query_row_fetch: RowFetch,
+        requested_row_fetch: RowFetch,
+        limit: Option<u64>,
+        order_by: Option<String>,
+        visibility: Visibility,
+        cache: bool,
+    ) -> Result<Vec<Row>> {
+        let d = self.data()?;
         // Implementation for querying a row from the table
 
         info!("Querying row");
@@ -2105,14 +5309,14 @@ impl<S: StorageIO> Table<S> {
         // Held for the whole query, worker fetches included: reclamation may
         // not hand out an extent while a pointer into it is still in play.
         let _gate = self.compaction_gate.read().await;
-        let _read = self.read_guard();
+        let _read = d.read_guard();
 
         // Read before the scan, so a mutation that commits while it runs leaves
         // this query's cache entry stamped with a generation nobody will match.
         let generation = self.cache_generation();
 
-        let base_candidates = self.build_candidates(query, limit).await;
-        let n_slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        let base_candidates = self.candidates_for(d, query, limit).await;
+        let n_slots = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
 
         // `ORDER BY` on a column that already ascends with slot position does
         // not need the table ordered: the first `k` rows by slot *are* the
@@ -2124,12 +5328,10 @@ impl<S: StorageIO> Table<S> {
         // after `k` rows have been collected could return slots 0–50 and
         // 1500–1650 rather than the first 200 — the right number of rows and
         // the wrong ones.
-        let mut ceiling = self
-            .monotonic_scan_ceiling(&order_by, limit, n_slots)
-            .await;
+        let mut ceiling = self.monotonic_scan_ceiling(d, &order_by, limit, n_slots).await;
 
         let rows = loop {
-            let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
+            let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
                 .await
                 .unwrap();
             iterator.set_candidates(match ceiling {
@@ -2151,11 +5353,11 @@ impl<S: StorageIO> Table<S> {
                     query_row_fetch.clone(),
                     requested_row_fetch.clone(),
                     schema_fields,
-                    self.io_rows.clone(),
+                    d.io_rows.clone(),
                     &mut iterator,
                     limit,
                     order_by.clone(),
-                    cache_generation_for(&visibility, generation),
+                    (cache && self.caches_queries()).then(|| cache_generation_for(&visibility, generation)).flatten(),
                     visibility.clone(),
                 )
                 .await?;
@@ -2166,10 +5368,7 @@ impl<S: StorageIO> Table<S> {
             // retry rather than return a short page, which would look exactly
             // like the end of the table.
             match ceiling {
-                Some(upto)
-                    if upto < n_slots
-                        && limit.is_some_and(|k| (rows.len() as u64) < k) =>
-                {
+                Some(upto) if upto < n_slots && limit.is_some_and(|k| (rows.len() as u64) < k) => {
                     ceiling = Some(upto.saturating_mul(2).min(n_slots));
                     continue;
                 }
@@ -2203,6 +5402,7 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
         order_by: Option<String>,
     ) -> Result<Vec<u8>> {
+        self.data()?;
         self.query_row_bytes_in_txn(
             query,
             schema_fields,
@@ -2219,17 +5419,140 @@ impl<S: StorageIO> Table<S> {
     pub async fn query_row_bytes_in_txn(
         &self,
         query: &str,
-        schema_fields: &Vec<SchemaField>,
+        schema_fields: &[SchemaField],
         query_row_fetch: RowFetch,
         requested_row_fetch: RowFetch,
         limit: Option<u64>,
         order_by: Option<String>,
         reader: TxId,
     ) -> Result<Vec<u8>> {
+        self.data()?;
+        self.query_row_bytes_reporting_in_txn(
+            query,
+            schema_fields,
+            query_row_fetch,
+            requested_row_fetch,
+            limit,
+            order_by,
+            reader,
+        )
+        .await
+        .map(|(bytes, _)| bytes)
+    }
+
+    /// [`Table::query_row_bytes_in_txn`], also saying whether any row may hold
+    /// columns beyond `requested_row_fetch` (see
+    /// `ConcurrentProcessor::process_into_bytes`). A caller that skips trimming
+    /// on `false` must take the flag from here, never work it out from the
+    /// parse: only the scan knows which fetch it emitted.
+    pub async fn query_row_bytes_reporting_in_txn(
+        &self,
+        query: &str,
+        schema_fields: &[SchemaField],
+        query_row_fetch: RowFetch,
+        requested_row_fetch: RowFetch,
+        limit: Option<u64>,
+        order_by: Option<String>,
+        reader: TxId,
+    ) -> Result<(Vec<u8>, bool)> {
+        self.data()?;
+        self.query_row_bytes_reporting(
+            query,
+            schema_fields,
+            query_row_fetch,
+            requested_row_fetch,
+            limit,
+            order_by,
+            reader,
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// [`Table::query_row_bytes_in_txn`] under a snapshot the caller took.
+    ///
+    /// For a statement reading several relations, which must read them all
+    /// as of one moment: a join that took a snapshot per relation could show
+    /// one table from before a transaction committed and another from after.
+    /// `cache: false` skips the query cache, for a fan-out read whose pieces
+    /// are not worth an entry each.
+    pub async fn query_row_bytes_with_visibility(
+        &self,
+        query: &str,
+        schema_fields: &[SchemaField],
+        query_row_fetch: RowFetch,
+        requested_row_fetch: RowFetch,
+        limit: Option<u64>,
+        order_by: Option<String>,
+        visibility: Visibility,
+        cache: bool,
+    ) -> Result<Vec<u8>> {
+        self.data()?;
+        self.query_row_bytes_reporting(
+            query,
+            schema_fields,
+            query_row_fetch,
+            requested_row_fetch,
+            limit,
+            order_by,
+            FROZEN_TX,
+            Some(visibility),
+            cache,
+        )
+        .await
+        .map(|(bytes, _)| bytes)
+    }
+
+    /// [`Self::query_row_bytes_with_visibility`], also reporting over-fetch
+    /// as [`Self::query_row_bytes_reporting_in_txn`] does.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_row_bytes_reporting_with_visibility(
+        &self,
+        query: &str,
+        schema_fields: &[SchemaField],
+        query_row_fetch: RowFetch,
+        requested_row_fetch: RowFetch,
+        limit: Option<u64>,
+        order_by: Option<String>,
+        visibility: Visibility,
+        cache: bool,
+    ) -> Result<(Vec<u8>, bool)> {
+        self.data()?;
+        self.query_row_bytes_reporting(
+            query,
+            schema_fields,
+            query_row_fetch,
+            requested_row_fetch,
+            limit,
+            order_by,
+            FROZEN_TX,
+            Some(visibility),
+            cache,
+        )
+        .await
+    }
+
+    /// The one bytes-mode read: as `reader`, whose snapshot is taken once the
+    /// read holds its guards, or under `visibility` when the caller took one.
+    #[allow(clippy::too_many_arguments)]
+    async fn query_row_bytes_reporting(
+        &self,
+        query: &str,
+        schema_fields: &[SchemaField],
+        query_row_fetch: RowFetch,
+        requested_row_fetch: RowFetch,
+        limit: Option<u64>,
+        order_by: Option<String>,
+        reader: TxId,
+        visibility: Option<Visibility>,
+        cache: bool,
+    ) -> Result<(Vec<u8>, bool)> {
+        let d = self.data()?;
         info!("Querying row (bytes mode)");
 
         let _gate = self.compaction_gate.read().await;
-        let _read = self.read_guard();
+        let _read = d.read_guard();
 
         // The SNAPSHOT is taken first, then the generation — that order is
         // load-bearing, and the row-mode path already had it by construction.
@@ -2247,15 +5570,15 @@ impl<S: StorageIO> Table<S> {
         // in the set, or the entry has been retired and the scan runs for
         // real. Still read before the scan, so an entry this query stamps is
         // retired by a mutation that lands while it runs.
-        let visibility = self.visibility_for(reader);
+        let visibility = visibility.unwrap_or_else(|| self.read_visibility_for(reader));
         let generation = self.cache_generation();
 
-        let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
+        let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
             .unwrap();
-        iterator.set_candidates(self.build_candidates(query, limit).await);
+        iterator.set_candidates(self.candidates_for(d, query, limit).await);
 
-        let bytes = self
+        let (bytes, overfetched) = self
             .concurrent_processor
             .process_into_bytes(
                 &self.cache_scope,
@@ -2263,11 +5586,11 @@ impl<S: StorageIO> Table<S> {
                 query_row_fetch,
                 requested_row_fetch,
                 schema_fields,
-                self.io_rows.clone(),
+                d.io_rows.clone(),
                 &mut iterator,
                 limit,
                 order_by,
-                cache_generation_for(&visibility, generation),
+                cache_generation_for(&visibility, generation).filter(|_| cache && self.caches_queries()),
                 visibility,
             )
             .await?;
@@ -2277,10 +5600,109 @@ impl<S: StorageIO> Table<S> {
             bytes.len(),
             limit
         );
-        Ok(bytes)
+        Ok((bytes, overfetched))
     }
 
-    fn build_full_row_fetch(schema_fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
+    /// The cells of the rows matching `query` as `reader` sees them, laid out
+    /// as `layout` says: [`ConcurrentProcessor::process_columns`]. For an
+    /// aggregate that reads its rows only as fixed-width cells; like
+    /// [`Self::count_rows_in_txn`] it takes no limit and no ordering.
+    pub async fn query_columns_in_txn(
+        &self,
+        query: &str,
+        schema_fields: &[SchemaField],
+        query_row_fetch: RowFetch,
+        layout: std::sync::Arc<crate::core::processor::column_scan::CellLayout>,
+        reader: TxId,
+    ) -> Result<Vec<crate::core::processor::column_scan::ColumnChunk>> {
+        self.data()?;
+        self.query_columns(query, schema_fields, query_row_fetch, layout, reader, None, true).await
+    }
+
+    /// [`Self::query_columns_in_txn`] under a rule the caller took, so a
+    /// statement reading several partitions sees them all through one
+    /// snapshot. `cache == false` neither reads nor fills the query cache.
+    pub async fn query_columns_with_visibility(
+        &self,
+        query: &str,
+        schema_fields: &[SchemaField],
+        query_row_fetch: RowFetch,
+        layout: std::sync::Arc<crate::core::processor::column_scan::CellLayout>,
+        visibility: Visibility,
+        cache: bool,
+    ) -> Result<Vec<crate::core::processor::column_scan::ColumnChunk>> {
+        self.data()?;
+        self.query_columns(query, schema_fields, query_row_fetch, layout, FROZEN_TX, Some(visibility), cache)
+            .await
+    }
+
+    /// The one cell read: as `reader`, whose snapshot is taken once the read
+    /// holds its guards, or under `visibility` when the caller took one.
+    #[allow(clippy::too_many_arguments)]
+    async fn query_columns(
+        &self,
+        query: &str,
+        schema_fields: &[SchemaField],
+        query_row_fetch: RowFetch,
+        layout: std::sync::Arc<crate::core::processor::column_scan::CellLayout>,
+        reader: TxId,
+        visibility: Option<Visibility>,
+        cache: bool,
+    ) -> Result<Vec<crate::core::processor::column_scan::ColumnChunk>> {
+        let d = self.data()?;
+
+        let _gate = self.compaction_gate.read().await;
+        let _read = d.read_guard();
+
+        // The snapshot first, then the generation: see
+        // `query_row_bytes_reporting`, whose cache rule this shares.
+        let visibility = visibility.unwrap_or_else(|| self.read_visibility_for(reader));
+        let generation = self.cache_generation();
+
+        let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
+            .await
+            .unwrap();
+        iterator.set_candidates(self.candidates_for(d, query, None).await);
+
+        self.concurrent_processor
+            .process_columns(
+                &self.cache_scope,
+                query,
+                query_row_fetch,
+                layout,
+                schema_fields,
+                d.io_rows.clone(),
+                &mut iterator,
+                cache_generation_for(&visibility, generation).filter(|_| cache && self.caches_queries()),
+                visibility,
+            )
+            .await
+    }
+
+    /// A fetch of just the columns named by write order, for the index build
+    /// and for vacuum reading a reclaimed version's keys.
+    pub(crate) fn build_fetch_for(schema_fields: &SmallVec<[SchemaField; 20]>, columns: &[u32]) -> RowFetch {
+        let schema_calc = SchemaCalculator::default();
+        let mut columns_fetching_data = smallvec::SmallVec::new();
+        for field in schema_fields
+            .iter()
+            .filter(|f| !f.is_deleted && columns.contains(&(f.write_order as u32)))
+            .sorted_by(|a, b| a.write_order.cmp(&b.write_order))
+        {
+            let offset = schema_calc.calculate_schema_offset(&field.name, schema_fields);
+            columns_fetching_data.push(ColumnFetchingData {
+                column_offset: offset.0,
+                column_type: field.db_type.physical(),
+                size: field.size,
+                schema_id: offset.1,
+            });
+        }
+        RowFetch {
+            columns_fetching_data,
+        }
+    }
+
+    pub(crate) fn build_full_row_fetch(schema_fields: &SmallVec<[SchemaField; 20]>) -> RowFetch {
         let schema_calc = SchemaCalculator::default();
         let mut columns_fetching_data = smallvec::SmallVec::new();
         for field in schema_fields
@@ -2312,7 +5734,9 @@ impl<S: StorageIO> Table<S> {
         query_row_fetch: RowFetch,
         limit: Option<u64>,
     ) -> Result<u64> {
-        self.delete_rows_in_txn(where_clause, query_row_fetch, limit, FROZEN_TX).await
+        self.data()?;
+        self.delete_rows_in_txn(where_clause, query_row_fetch, limit, FROZEN_TX)
+            .await
     }
 
     /// Deletes the rows `deleted_by` can see, stamping rather than tombstoning.
@@ -2323,12 +5747,44 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
         deleted_by: TxId,
     ) -> Result<u64> {
+        self.data()?;
+        self.delete_rows_as_of(where_clause, query_row_fetch, limit, deleted_by, None, None)
+            .await
+    }
+
+    /// [`Self::delete_rows_in_txn`], matching rows through `visibility` rather
+    /// than a snapshot taken here.
+    ///
+    /// For a statement that has to know, before it deletes, exactly which rows
+    /// it will delete: a `DELETE` of a parent table collects the keys it is
+    /// removing to apply its foreign keys' actions, and that collection and
+    /// this scan must see the same rows. Taken separately, a parent row
+    /// committed between the two was deleted without its children ever being
+    /// considered. One snapshot for the statement is also what PostgreSQL does.
+    /// `collect`, when given, receives every deleted row as it was (all its
+    /// columns), read under the same lock and snapshot as the delete itself:
+    /// what `DELETE … RETURNING` reports. Read anywhere else, under another
+    /// snapshot, it could name rows this statement did not delete.
+    pub async fn delete_rows_as_of(
+        &self,
+        where_clause: &str,
+        query_row_fetch: RowFetch,
+        limit: Option<u64>,
+        deleted_by: TxId,
+        visibility: Option<Visibility>,
+        mut collect: Option<&mut Vec<Row>>,
+    ) -> Result<u64> {
+        let d = self.data()?;
         info!("Deleting rows");
 
         self.note_write(deleted_by);
 
+        // Taken at the statement's entry, before the gate and the write lock
+        // (§2 lock order), so a DELETE that matches nothing still takes one.
+        let _watch = self.enter_write().await?;
+        let ticket = gate::ticket(&self.gate, self.family()).await?;
         let _gate = self.compaction_gate.read().await;
-        let _read = self.read_guard();
+        let _read = d.read_guard();
 
         // Taken *before* the scan, not between the scan and the rewrite.
         //
@@ -2343,18 +5799,22 @@ impl<S: StorageIO> Table<S> {
         // already serialized for their rewrites; this extends it over the scan,
         // which is the expensive half. `SELECT` and `INSERT` are unaffected —
         // neither rewrites an existing record, and neither takes this lock.
-        let _write = self.write_lock.lock().await;
+        let _write = self.write_lock.write().await;
 
-        let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
+        // The snapshot is taken BEFORE the candidates are built, as every read
+        // path takes it. A writer appends its version, then indexes it, then
+        // commits; candidates built first could sample a length that includes
+        // the new slot, ask the index before its entry lands and leave the slot
+        // out, and a snapshot taken after that could then see the committed
+        // row: a visible matching row silently not deleted. Taken first, the
+        // snapshot either predates the commit, so the row is invisible and
+        // leaving it out is right, or follows it, so its entry landed first.
+        let visibility = visibility.unwrap_or_else(|| self.target_visibility_under_lock(deleted_by));
+
+        let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
             .unwrap();
-        iterator.set_candidates(self.build_candidates(where_clause, limit).await);
-
-        // The checkpoint on disk is about to describe rows that no longer exist.
-        // One byte, once per statement, and never on the insert path.
-        if let Some(filters) = self.filters.as_ref() {
-            filters.mark_disk_dirty(&*self.io_filters).await;
-        }
+        iterator.set_candidates(self.candidates_for(d, where_clause, limit).await);
 
         let matches = self
             .concurrent_processor
@@ -2363,18 +5823,28 @@ impl<S: StorageIO> Table<S> {
                 where_clause,
                 query_row_fetch,
                 &self.schema.fields,
-                self.io_rows.clone(),
+                d.io_rows.clone(),
                 &mut iterator,
                 limit,
                 // A statement may only remove rows it can see. Without this a
                 // DELETE would match another transaction's uncommitted rows.
-                self.visibility_for(deleted_by),
+                visibility,
             )
             .await?;
 
+        // Each row is marked as being written before it is stamped, so a
+        // `FOR UPDATE` that locks it afterwards waits for this statement's
+        // owner (`RowLocks::mark_row_writes`). Its key is read for that.
+        let marker = self
+            .versions
+            .load_full()
+            .and_then(|m| crate::core::rql::executor::RowMarker::for_table(&self.schema, &m));
+        let marker_fetch = marker.as_ref().map(|m| m.fetch(&self.schema.fields));
+        let mut key_row = Row::default();
+
         // One transaction for the whole statement: every tombstone lands or
         // none does, and the flush is paid once rather than once per row.
-        let mut txn = self.io_pointers.begin_txn();
+        let mut txn = d.io_pointers.begin_txn();
         let mut deleted_count: u64 = 0;
         // Applied only after each batch's commit — see `PendingFilterOp`.
         let mut pending_filters: Vec<PendingFilterOp> = Vec::new();
@@ -2393,23 +5863,65 @@ impl<S: StorageIO> Table<S> {
             // silently left a row behind would report a count the caller cannot
             // act on.
             if let Err(e) = self.check_write_conflict(&pointer, deleted_by) {
-                return Err(if deleted_count == 0 {
-                    std::io::Error::new(
-                        std::io::ErrorKind::WouldBlock,
-                        format!("{}{}", e, Self::CONFLICT_RETRYABLE),
-                    )
-                    .into()
-                } else {
-                    e
-                });
+                // The storage transaction is given up, not left open: one that
+                // logged an in-place stamp and never commits holds the log's
+                // pending count up, and the log cannot be checkpointed again
+                // for the life of the process.
+                d.io_pointers.abort_txn(txn).await;
+                // Replayable whatever was written before it: a failed
+                // statement's writes never become visible (the storage
+                // transaction is given up above; `a_conflicting_update_
+                // applies_nothing` pins it), so the replay starts clean, as
+                // PostgreSQL's DELETE waits at the row and goes on. Only the
+                // first row's conflict was replayed, and a later row's
+                // reported 40001 at once.
+                let _ = deleted_count;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!("{}{}", e, Self::CONFLICT_RETRYABLE),
+                )
+                .into());
             }
 
+            if let (Some(marker), Some(fetch)) = (marker.as_ref().filter(|m| m.needed()), &marker_fetch) {
+                let marked = match pointer.fetch_row_reuse_async(&*d.io_rows, fetch, &mut key_row).await {
+                    Ok(()) => marker.mark(&key_row, deleted_by),
+                    Err(e) => Err((format!("could not read a row's key to mark it: {}", e), NO_TX)),
+                };
+                if let Err(refusal) = marked {
+                    d.io_pointers.abort_txn(txn).await;
+                    return Err(Self::locked_row(refusal, deleted_count == 0));
+                }
+            }
+
+            // The row as it was, for `RETURNING`, read before the tombstone.
+            let before = match collect.as_ref() {
+                Some(_) => {
+                    let mut row = Row::default();
+                    let full_fetch = Self::build_full_row_fetch(&self.schema.fields);
+                    if let Err(e) = pointer.fetch_row_reuse_async(&*d.io_rows, &full_fetch, &mut row).await {
+                        // Given up, not left open, as on a conflict above.
+                        d.io_pointers.abort_txn(txn).await;
+                        return Err(std::io::Error::other(format!(
+                            "could not read a deleted row for RETURNING: {}",
+                            e
+                        ))
+                        .into());
+                    }
+                    Some(row)
+                }
+                None => None,
+            };
+
             if let Err(e) = pointer
-                .delete(self.io_pointers.clone(), record_pos, Some(txn), deleted_by)
+                .delete(d.io_pointers.clone(), record_pos, Some(txn), deleted_by)
                 .await
             {
                 error!("Failed to delete row pointer {:?}: {}", pointer, e);
                 continue;
+            }
+            if let (Some(collect), Some(row)) = (collect.as_deref_mut(), before) {
+                collect.push(row);
             }
 
             // Exact removal: clearing the slot's fingerprint bits *improves*
@@ -2420,7 +5932,7 @@ impl<S: StorageIO> Table<S> {
             // DELETE stamps `xmax` and leaves the version readable by older
             // snapshots; pruning its slot would hide it from them. Staged until
             // the tombstone is durable — see `PendingFilterOp`.
-            if deleted_by == FROZEN_TX && self.filters.is_some() {
+            if deleted_by == FROZEN_TX && d.filters.is_some() {
                 pending_filters.push(PendingFilterOp::Delete(
                     record_pos / ROW_POINTER_RECORD_LEN as u64,
                 ));
@@ -2432,10 +5944,10 @@ impl<S: StorageIO> Table<S> {
             // millions of rows would grow the log without bound — the same
             // reason UPDATE breaks its own. Batching costs the statement its
             // all-or-nothing property, which is the price of a reclaimable log.
-            if crate::core::wal::should_break_transaction(&*self.io_pointers) {
-                self.io_pointers.commit_durable(txn).await?;
-                self.apply_pending_filters(&mut pending_filters);
-                txn = self.io_pointers.begin_txn();
+            if crate::core::wal::should_break_transaction(&*d.io_pointers) {
+                d.io_pointers.commit_durable(txn).await?;
+                d.apply_pending_filters(&ticket, &mut pending_filters);
+                txn = d.io_pointers.begin_txn();
             }
         }
 
@@ -2445,20 +5957,18 @@ impl<S: StorageIO> Table<S> {
         // Failing the statement rather than reporting rows affected: a tombstone
         // that is not durable is a row that comes back, and telling the caller
         // otherwise is the difference between a failed delete and a silent one.
-        self.io_pointers.commit_durable(txn).await?;
-        self.apply_pending_filters(&mut pending_filters);
+        d.io_pointers.commit_durable(txn).await?;
+        d.apply_pending_filters(&ticket, &mut pending_filters);
 
         // Published before the lock is released, so anyone who takes it next
         // sees a generation that already accounts for everything above.
+        self.dead_stamps
+            .fetch_add(deleted_count, AtomicOrdering::Relaxed);
+        d.vacuum_stats.note_deleted(deleted_by, deleted_count);
         self.write_generation.fetch_add(1, AtomicOrdering::AcqRel);
 
         if deleted_count > 0 {
             self.invalidate_query_caches();
-            // Ask the maintenance task to clear the dirty flag. Rewriting the
-            // blob here would make a one-row DELETE pay for the whole index.
-            if let Some(filters) = self.filters.as_ref() {
-                filters.request_checkpoint();
-            }
         }
 
         Ok(deleted_count)
@@ -2473,6 +5983,7 @@ impl<S: StorageIO> Table<S> {
         updates: smallvec::SmallVec<[ColumnWritePayload; 32]>,
         limit: Option<u64>,
     ) -> Result<u64> {
+        self.data()?;
         self.update_rows_in_txn(where_clause, query_row_fetch, updates, limit, FROZEN_TX)
             .await
     }
@@ -2486,6 +5997,7 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
         written_by: TxId,
     ) -> Result<u64> {
+        self.data()?;
         self.update_rows_with_expressions(
             where_clause,
             query_row_fetch,
@@ -2513,27 +6025,308 @@ impl<S: StorageIO> Table<S> {
         limit: Option<u64>,
         written_by: TxId,
     ) -> Result<u64> {
+        self.data()?;
+        self.update_rows_as_of(
+            where_clause,
+            query_row_fetch,
+            updates,
+            expressions,
+            limit,
+            written_by,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::update_rows_with_expressions`], matching rows through
+    /// `visibility` rather than a snapshot taken here — see
+    /// [`Self::delete_rows_as_of`] for why a statement needs that.
+    /// `collect`, when given, receives every updated row as it was before the
+    /// update (all its columns), read under the same lock and snapshot as the
+    /// write: what `UPDATE … RETURNING` overlays its assignments on.
+    pub async fn update_rows_as_of(
+        &self,
+        where_clause: &str,
+        query_row_fetch: RowFetch,
+        updates: smallvec::SmallVec<[ColumnWritePayload; 32]>,
+        expressions: &[(u32, crate::core::rql::expr::Expr)],
+        limit: Option<u64>,
+        written_by: TxId,
+        visibility: Option<Visibility>,
+        collect: Option<&mut Vec<Row>>,
+    ) -> Result<u64> {
+        self.data()?;
+        self.update_rows_body(where_clause, query_row_fetch, updates, expressions, limit, written_by, visibility, collect, None)
+            .await
+    }
+
+    /// [`Self::update_rows_as_of`] on a partition whose assignments may move
+    /// a row's point (docs/partitioning.md §9, phase 6 row moves): a matched
+    /// version whose merged row has another point is stamped deleted here,
+    /// as a DELETE stamps it, counted as updated (and collected, as it was),
+    /// and its merged row pushed to `moves` instead of written. The caller
+    /// inserts each into the partition its point routes to, after every
+    /// partition of the statement was visited, so no later visit matches a
+    /// moved row again. A version keeping its point is updated as ever.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn update_rows_moving(
+        &self,
+        where_clause: &str,
+        query_row_fetch: RowFetch,
+        updates: smallvec::SmallVec<[ColumnWritePayload; 32]>,
+        expressions: &[(u32, crate::core::rql::expr::Expr)],
+        written_by: TxId,
+        visibility: Option<Visibility>,
+        collect: Option<&mut Vec<Row>>,
+        moves: &mut Vec<RowWrite>,
+    ) -> Result<u64> {
+        self.data()?;
+        self.update_rows_body(
+            where_clause,
+            query_row_fetch,
+            updates,
+            expressions,
+            None,
+            written_by,
+            visibility,
+            collect,
+            Some(moves),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// The row `RETURNING` reports for a version an `UPDATE` wrote: `row`
+    /// (the fetched pre-image) with each column an expression assigns
+    /// holding what `row_write` stores, NULL where the write set its
+    /// companion. A column the fetch did not carry is left out, as it is
+    /// from the pre-image.
+    fn returning_image(
+        &self,
+        row: &Row,
+        row_write: &RowWrite,
+        expressions: &[(u32, crate::core::rql::expr::Expr)],
+    ) -> Row {
+        let mut image = row.clone();
+        for (write_order, _) in expressions {
+            let Some(payload) = row_write.columns_writing_data.iter().find(|c| c.write_order == *write_order) else {
+                continue;
+            };
+            let flag = self
+                .schema
+                .fields
+                .iter()
+                .find(|f| !f.is_deleted && f.write_order as u32 == *write_order)
+                .and_then(|f| {
+                    let flag_name = crate::core::rql::nullable::flag_column_name(&f.name);
+                    self.schema.fields.iter().find(|g| !g.is_deleted && g.name.eq_ignore_ascii_case(&flag_name))
+                })
+                .and_then(|flag| row_write.columns_writing_data.iter().find(|c| c.write_order == flag.write_order as u32));
+            let is_null = flag.is_some_and(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()));
+            if let Some(cell) = image.columns.iter_mut().find(|c| u64::from(c.schema_id) == u64::from(*write_order)) {
+                cell.data = payload.data.clone();
+                cell.column_type = if is_null { crate::core::db_type::DbType::NULL } else { payload.column_type.clone() };
+            }
+            if let Some(flag) = flag
+                && let Some(cell) = image.columns.iter_mut().find(|c| u64::from(c.schema_id) == u64::from(flag.write_order))
+            {
+                cell.data = flag.data.clone();
+            }
+        }
+        image
+    }
+
+    async fn update_rows_body(
+        &self,
+        where_clause: &str,
+        query_row_fetch: RowFetch,
+        updates: smallvec::SmallVec<[ColumnWritePayload; 32]>,
+        expressions: &[(u32, crate::core::rql::expr::Expr)],
+        limit: Option<u64>,
+        written_by: TxId,
+        visibility: Option<Visibility>,
+        mut collect: Option<&mut Vec<Row>>,
+        mut moves: Option<&mut Vec<RowWrite>>,
+    ) -> Result<u64> {
         info!("Updating rows");
+
+        // A statement naming its row by a unique key tries the point path
+        // first, which lets updates of different keys run side by side. It
+        // falls back here, having written nothing, only when another key of
+        // the row it found is on a stripe it could not take in order.
+        if let Some(stripe) = self.point_update_stripe(where_clause, &updates, expressions) {
+            if let Some(n) = self
+                .update_rows_locked(
+                    where_clause,
+                    query_row_fetch.clone(),
+                    &updates,
+                    expressions,
+                    limit,
+                    written_by,
+                    visibility.clone(),
+                    Some(stripe),
+                    collect.as_deref_mut(),
+                    moves.as_deref_mut(),
+                )
+                .await?
+            {
+                return Ok(n);
+            }
+            // The point path wrote nothing; neither may it have reported any.
+            if let Some(collect) = collect.as_deref_mut() {
+                collect.clear();
+            }
+            if let Some(moves) = moves.as_deref_mut() {
+                moves.clear();
+            }
+        }
+        self.update_rows_locked(
+            where_clause,
+            query_row_fetch,
+            &updates,
+            expressions,
+            limit,
+            written_by,
+            visibility,
+            None,
+            collect,
+            moves,
+        )
+        .await
+        .map(|n| n.unwrap_or_default())
+    }
+
+    /// The partition point of a stored row, fetched in full (every column,
+    /// as [`Self::build_full_row_fetch`] reads one), by this partition's
+    /// guard: what a reshape routes each raw-copied version by
+    /// (docs/partitioning.md §6.2). Errs on a table that is no partition.
+    pub(crate) fn point_of_row(&self, row: &Row) -> Result<u64> {
+        let d = self.data()?;
+        let guard = d
+            .guard
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("internal error: a reshape read a table that is not a partition"))?;
+        guard.point_of_write(&self.row_write_of(row)).map_err(std::io::Error::other)
+    }
+
+    /// A row's columns as a write, every column keyed by `write_order`.
+    fn row_write_of(&self, row: &Row) -> RowWrite {
+        let mut row_write = RowWrite {
+            columns_writing_data: smallvec::SmallVec::new(),
+        };
+        for field in self
+            .schema
+            .fields
+            .iter()
+            .sorted_by(|a, b| a.write_order.cmp(&b.write_order))
+        {
+            let write_order = field.write_order as u32;
+            let col = row
+                .columns
+                .iter()
+                .find(|c| c.schema_id as u32 == write_order);
+
+            row_write.columns_writing_data.push(ColumnWritePayload {
+                // Missing columns shouldn't normally happen for a full fetch;
+                // treat as empty.
+                data: col.map(|c| c.data.clone()).unwrap_or_default(),
+                write_order,
+                column_type: field.db_type.physical(),
+                size: field.size,
+            });
+        }
+        row_write
+    }
+
+    /// The body of [`Self::update_rows_as_of`], under the locks `point`
+    /// chooses: with `Some(stripe)`, the write lock shared and that key's
+    /// stripe; with `None`, the write lock exclusively and, for the rewrite,
+    /// every stripe. `Ok(None)` when a point update gave up before writing.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_rows_locked(
+        &self,
+        where_clause: &str,
+        query_row_fetch: RowFetch,
+        updates: &smallvec::SmallVec<[ColumnWritePayload; 32]>,
+        expressions: &[(u32, crate::core::rql::expr::Expr)],
+        limit: Option<u64>,
+        written_by: TxId,
+        visibility: Option<Visibility>,
+        point: Option<usize>,
+        mut collect: Option<&mut Vec<Row>>,
+        mut moves: Option<&mut Vec<RowWrite>>,
+    ) -> Result<Option<u64>> {
+        let d = self.data()?;
+        // A caller that brings its own snapshot is a statement with work left
+        // to do after this write — foreign-key actions — and that work can
+        // fail it. An in-place overwrite keeps no previous version, so a
+        // failure there would leave the new bytes standing in a statement
+        // reported as failed. Such a statement always writes a new version.
+        let may_fail_after_write = visibility.is_some();
+        // The range guard can refuse a later row after earlier ones are
+        // written, and an aborted statement cannot undo an in-place overwrite
+        // (a batch committed by `should_break_transaction` is past any abort).
+        // So a statement whose key assignments might move a row writes new
+        // versions only. An expression leaves a placeholder in `updates`, and
+        // a key it computes is unproven, so this sees it too.
+        //
+        // A statement that provably keeps every row's point — each assigned
+        // key column gets the constant a top-level `key = v` of its WHERE
+        // already pins (an ORM's every-column UPDATE, ON CONFLICT's `SET
+        // tenant_id = EXCLUDED.tenant_id`) — cannot be refused by the guard,
+        // so it keeps the in-place overwrite exactly as the plain table does.
+        // Without this every such statement wrote a version the plain twin
+        // overwrote: one dead slot per row per statement.
+        let assigns_key = d.guard.as_ref().is_some_and(|g| {
+            let assigned: SmallVec<[(u32, &[u8]); 8]> =
+                updates.iter().map(|u| (u.write_order, u.data.into_slice())).collect();
+            let computed: SmallVec<[u32; 4]> = expressions.iter().map(|(wo, _)| *wo).collect();
+            !crate::core::partition::table::assignments_keep_point(
+                g.spec(),
+                &self.schema,
+                where_clause,
+                &assigned,
+                &computed,
+            )
+        });
 
         self.note_write(written_by);
 
+        // As in `delete_rows_as_of`: at entry, before the gate and every lock.
+        let _watch = self.enter_write().await?;
+        let ticket = gate::ticket(&self.gate, self.family()).await?;
         let _gate = self.compaction_gate.read().await;
-        let _read = self.read_guard();
+        let _read = d.read_guard();
 
         // Before the scan. See the note in `delete_rows`: a relocation by a
         // concurrent statement leaves nothing at the old record for a later
         // re-read to find, so a snapshot taken outside this lock can silently
-        // match nothing.
-        let _write = self.write_lock.lock().await;
+        // match nothing. A point update takes its key's stripe instead, which
+        // every writer of a row it could match takes too (see `write_lock`).
+        let (_write_exclusive, _write_shared) = match point {
+            Some(_) => (None, Some(self.write_lock.read().await)),
+            None => (Some(self.write_lock.write().await), None),
+        };
+        let point_keys = match point {
+            Some(stripe) => Some(self.unique_lock.lock(&[stripe]).await),
+            None => None,
+        };
 
-        let mut iterator = RowPointerIterator::new(self.io_pointers.clone())
+        // The snapshot is taken BEFORE the candidates are built, as every read
+        // path takes it. A writer appends its version, then indexes it, then
+        // commits; candidates built first could sample a length that includes
+        // the new slot, ask the index before its entry lands and leave the slot
+        // out, and a snapshot taken after that could then see the committed
+        // row: a visible matching row silently not updated. Taken first, the
+        // snapshot either predates the commit, so the row is invisible and
+        // leaving it out is right, or follows it, so its entry landed first.
+        let visibility = visibility.unwrap_or_else(|| self.target_visibility_under_lock(written_by));
+
+        let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
             .unwrap();
-        iterator.set_candidates(self.build_candidates(where_clause, limit).await);
-
-        if let Some(filters) = self.filters.as_ref() {
-            filters.mark_disk_dirty(&*self.io_filters).await;
-        }
+        iterator.set_candidates(self.candidates_for(d, where_clause, limit).await);
 
         let matches = self
             .concurrent_processor
@@ -2542,28 +6335,115 @@ impl<S: StorageIO> Table<S> {
                 where_clause,
                 query_row_fetch,
                 &self.schema.fields,
-                self.io_rows.clone(),
+                d.io_rows.clone(),
                 &mut iterator,
                 limit,
                 // As in `delete_rows_in_txn`: a statement may only change rows
                 // it can see.
-                self.visibility_for(written_by),
+                visibility,
             )
             .await?;
 
         let full_fetch = Self::build_full_row_fetch(&self.schema.fields);
 
+        // The rewrite runs under the lock inserts check uniqueness under; the
+        // scan above does not. See `unique_lock` for both halves of that.
+        //
+        // A point update already holds its key's stripe. It needs the
+        // stripes of the row's *other* keys too, for two reasons:
+        // - a point update through another key of the same row (`WHERE id`
+        //   here, `WHERE email` there) holds only that key's stripe. Without
+        //   this both scan the same version and both relocate it, and the row
+        //   forks into two live versions;
+        // - a relocated row's other keys reach the index only after the
+        //   rewrite, so an insert checking one of them in that window would
+        //   find neither version.
+        // The row cannot change those keys under the stripe held, since
+        // giving a row a key takes every stripe. Mutation-tested: without
+        // this, `point_update_concurrency.rs` forks rows until it stalls.
+        //
+        // Any other update takes every stripe only when it assigns a column
+        // some unique key covers (or a partial key's predicate may read): its
+        // rows' new keys are checked as it writes them, against inserts of
+        // the same keys. One that changes no key needs none. It used to take
+        // them all regardless, for the window in which a relocated row's new
+        // version is not yet in the index and the old one is about to be
+        // deleted; an insert's check now samples again when it meets a
+        // version deleted that way (`Supersessions`). The write lock above,
+        // held exclusively, still keeps every other writer of these rows out.
+        let changes_keys = self.has_unique && {
+            let assigned: std::collections::HashSet<u32> = updates.iter().map(|u| u.write_order).collect();
+            self.assigns_unique(&assigned)
+        };
+        // The check notices only a version that keeps its deleter in `xmax`
+        // until it is retired. A write outside a transaction (no manager,
+        // `NO_TX`) or a frozen one marks the old version deleted outright,
+        // which the check skips unseen: such an update still keeps inserts out.
+        let versioned = written_by != crate::core::mvcc::transaction::NO_TX
+            && written_by != FROZEN_TX
+            && self.versions.load().is_some();
+        let _unique = match point_keys {
+            None if changes_keys || (self.has_unique && !versioned) => Some(self.unique_lock.lock_all().await),
+            None => None,
+            Some(mut keys) => {
+                let constraints = self.schema.fields.iter().filter(|f| f.is_unique && !f.is_deleted).count()
+                    + self.schema.unique_keys.len();
+                if constraints > 1 {
+                    let mut more: SmallVec<[usize; 8]> = SmallVec::new();
+                    let mut row = Row::default();
+                    for pwo in matches.iter().filter(|m| !m.pointer.deleted) {
+                        if pwo
+                            .pointer
+                            .fetch_row_reuse_async(&*d.io_rows, &full_fetch, &mut row)
+                            .await
+                            .is_ok()
+                        {
+                            more.extend(self.unique_stripes(&self.row_write_of(&row)));
+                        }
+                    }
+                    if !self.unique_lock.lock_more(&mut keys, &more).await {
+                        return Ok(None);
+                    }
+                }
+                Some(keys)
+            }
+        };
+
         // A relocation allocates from the id counter even though it hands the
         // row back its own id, so the reservation on disk has to cover it.
-        self.ensure_ids_reserved().await;
+        d.ids.ensure_reserved().await;
 
         // One transaction for the statement, subject to the memory bound below.
-        let mut txn = self.io_pointers.begin_txn();
+        let mut txn = d.io_pointers.begin_txn();
 
         let mut updated_count: u64 = 0;
+        // Set by the first row overwritten in place, and from then on the
+        // statement takes no batch break. A batch's commit is past any abort,
+        // and an overwrite keeps no previous version: a row overwritten in a
+        // committed batch stayed changed when a later row failed. A new
+        // version written in one is undone by the abort, so breaks before the
+        // first overwrite are harmless. The cost is a log that cannot be cut
+        // while one huge in-place UPDATE runs.
+        let mut overwrote_in_place = false;
+        // What this statement has written, for its own uniqueness checks:
+        // kept only when it writes a column some unique key covers (or a
+        // partial key's predicate may), since no other statement's check
+        // reads it. Every row id of a large UPDATE was otherwise kept.
+        let mut own_keys = OwnKeys::default();
+        let checks_own_keys = changes_keys;
         let mut row = Row::default();
+        // Each row is marked as being written before it is stamped
+        // (`RowLocks::mark_row_writes`); see the DELETE.
+        let marker = self
+            .versions
+            .load_full()
+            .and_then(|m| crate::core::rql::executor::RowMarker::for_table(&self.schema, &m));
         // Applied only after each batch's commit — see `PendingFilterOp`.
         let mut pending_filters: Vec<PendingFilterOp> = Vec::new();
+        // The checks that read an expression's result, which the statement
+        // could not judge before the rows were read.
+        let row_checks =
+            crate::core::rql::executor::UpdateRowChecks::compile(&self.schema, updates, expressions);
 
         for pwo in matches.into_iter() {
             if pwo.pointer.deleted {
@@ -2576,60 +6456,50 @@ impl<S: StorageIO> Table<S> {
             let row_id = pointer.row_id();
 
             if let Err(e) = self.check_write_conflict(&pointer, written_by) {
-                return Err(if updated_count == 0 {
-                    std::io::Error::new(
-                        std::io::ErrorKind::WouldBlock,
-                        format!("{}{}", e, Self::CONFLICT_RETRYABLE),
-                    )
-                    .into()
-                } else {
-                    e
-                });
+                // As in the DELETE: an abandoned storage transaction would hold
+                // the log's checkpoint off for good.
+                d.io_pointers.abort_txn(txn).await;
+                // Replayable whatever was written before it: a failed
+                // statement's writes never become visible (the storage
+                // transaction is given up above; `a_conflicting_update_
+                // applies_nothing` pins it), so the replay starts clean, as
+                // PostgreSQL's UPDATE waits at the row and goes on. Only the
+                // first row's conflict was replayed, and a later row's
+                // reported 40001 at once.
+                let _ = updated_count;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!("{}{}", e, Self::CONFLICT_RETRYABLE),
+                )
+                .into());
             }
 
             // Load full row so we can merge updates.
             if pointer
-                .fetch_row_reuse_async(&*self.io_rows, &full_fetch, &mut row)
+                .fetch_row_reuse_async(&*d.io_rows, &full_fetch, &mut row)
                 .await
                 .is_err()
             {
                 continue;
             }
 
-            // Build RowWrite from the existing row (all columns), keyed by write_order.
-            let mut row_write = RowWrite {
-                columns_writing_data: smallvec::SmallVec::new(),
-            };
-
-            for field in self
-                .schema
-                .fields
-                .iter()
-                .sorted_by(|a, b| a.write_order.cmp(&b.write_order))
-            {
-                let write_order = field.write_order as u32;
-                let col = row
-                    .columns
-                    .iter()
-                    .find(|c| c.schema_id as u32 == write_order);
-
-                if let Some(col) = col {
-                    row_write.columns_writing_data.push(ColumnWritePayload {
-                        data: col.data.clone(),
-                        write_order,
-                        column_type: field.db_type.physical(),
-                        size: field.size,
-                    });
-                } else {
-                    // Missing columns shouldn't normally happen for a full fetch; treat as empty.
-                    row_write.columns_writing_data.push(ColumnWritePayload {
-                        data: crate::memory_pool::MemoryBlock::default(),
-                        write_order,
-                        column_type: field.db_type.physical(),
-                        size: field.size,
-                    });
+            if let Some(marker) = &marker {
+                if let Err(refusal) = marker.mark(&row, written_by) {
+                    d.io_pointers.abort_txn(txn).await;
+                    return Err(Self::locked_row(refusal, updated_count == 0));
                 }
             }
+
+            // Build RowWrite from the existing row (all columns), keyed by write_order.
+            let mut row_write = self.row_write_of(&row);
+
+            // The version's index keys as it stands, before the assignments:
+            // an in-place overwrite has to take the slot out from under them.
+            let old_keys = d.indexes.as_ref().map(|ix| ix.keys_of(&row_write));
+
+            // A partition's point for the version as it stands, checked
+            // against the merged row below.
+            let point_before = d.guard.as_ref().map(|g| g.point_of_write(&row_write));
 
             // Apply updates in-place in the RowWrite payloads.
             for upd in updates.iter() {
@@ -2648,14 +6518,31 @@ impl<S: StorageIO> Table<S> {
             // statement touched it, which is what `COALESCE(c, x)` means, and
             // then overwrite the placeholder their assignment left behind.
             for (write_order, expression) in expressions.iter() {
-                let value = crate::core::rql::expr::eval(
-                    expression,
-                    &row,
-                    self.schema.fields.as_slice(),
-                )
-                .map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-                })?;
+                // Computed for the target, at its own scale (`eval_into`: a
+                // `NUMERIC(p, s)` value exactly, anything else at the engine
+                // scale and put back). The declared precision is enforced on
+                // the stored value, as PostgreSQL's assignment does: `numeric
+                // field overflow`.
+                let fields = self.schema.fields.as_slice();
+                let value = match fields.iter().find(|f| f.write_order as u32 == *write_order as u32) {
+                    Some(target) => crate::core::rql::expr::eval_into(expression, &row, fields, target).and_then(|value| {
+                        crate::core::rql::expr::check_declared_precision(&value, target, &self.schema.type_modifiers)?;
+                        // A declared text length, as an assignment holds it
+                        // (`type_modifier::assign_bytes`): `SET c = c || 'zz'`
+                        // past it is 22001.
+                        crate::core::rql::expr::held_to_text_length(value, target)
+                    }),
+                    None => crate::core::rql::expr::eval(expression, &row, fields),
+                };
+                let value = match value {
+                        Ok(value) => value,
+                        Err(e) => {
+                            d.io_pointers.abort_txn(txn).await;
+                            return Err(
+                                std::io::Error::new(std::io::ErrorKind::InvalidInput, e).into()
+                            );
+                        }
+                    };
 
                 let Some(slot_index) = row_write
                     .columns_writing_data
@@ -2666,6 +6553,32 @@ impl<S: StorageIO> Table<S> {
                 };
 
                 let is_null = matches!(value, crate::core::rql::expr::Value::Null);
+                // NULL into a column with no companion (`NOT NULL`: a column
+                // is nullable exactly when it has one) is 23502, per row, as
+                // in PostgreSQL. The statement-level check
+                // (`executor::check_not_null`) only sees a NULL written as a
+                // constant; `SET n = m`, `n + m`, `NULLIF(…)` or a `CASE` that
+                // is NULL for this row reached here, and the empty value below
+                // was stored as the type's zero (or `''`) without a word.
+                if is_null
+                    && let Some(target) = self
+                        .schema
+                        .fields
+                        .iter()
+                        .find(|f| !f.is_deleted && f.write_order as u32 == *write_order)
+                    && !crate::core::rql::nullable::is_hidden(&target.name)
+                    && crate::core::rql::nullable::flag_field(&target.name, &self.schema.fields).is_none()
+                {
+                    d.io_pointers.abort_txn(txn).await;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
+                            target.name, self.schema.name
+                        ),
+                    )
+                    .into());
+                }
                 let bytes = match value {
                     crate::core::rql::expr::Value::Null => Vec::new(),
                     crate::core::rql::expr::Value::Data { bytes, .. } => bytes,
@@ -2702,8 +6615,7 @@ impl<S: StorageIO> Table<S> {
                             .find(|c| c.write_order == flag.write_order as u32)
                         {
                             let bits = crate::core::rql::nullable::flag_bytes(is_null);
-                            let mut mb =
-                                crate::memory_pool::MEMORY_POOL.acquire(bits.len());
+                            let mut mb = crate::memory_pool::MEMORY_POOL.acquire(bits.len());
                             mb.into_slice_mut().copy_from_slice(&bits);
                             flag_payload.data = mb;
                         }
@@ -2713,15 +6625,95 @@ impl<S: StorageIO> Table<S> {
                 // value is, exactly as the constant path pads it.
                 let (width, variable) = {
                     let existing = &row_write.columns_writing_data[slot_index];
-                    (existing.size as usize, existing.column_type.is_variable_width())
+                    (
+                        existing.size as usize,
+                        existing.column_type.is_variable_width(),
+                    )
                 };
-                let mut mb = crate::memory_pool::MEMORY_POOL
-                    .acquire(if variable { bytes.len() } else { width });
+                let mut mb = crate::memory_pool::MEMORY_POOL.acquire(if variable {
+                    bytes.len()
+                } else {
+                    width
+                });
                 let slot = mb.into_slice_mut();
                 slot.fill(0);
                 let n = bytes.len().min(slot.len());
                 slot[..n].copy_from_slice(&bytes[..n]);
                 row_write.columns_writing_data[slot_index].data = mb;
+            }
+
+            // A declared text length holds for the merged row too, whichever
+            // encoder produced the assigned value: the assigned columns only,
+            // since the rest already hold.
+            if let Err(e) = self.hold_text_lengths(&mut row_write, |wo| updates.iter().any(|u| u.write_order == wo), true) {
+                d.io_pointers.abort_txn(txn).await;
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e).into());
+            }
+
+            // Refused as an expression that fails to evaluate is refused: the
+            // statement's writes so far are abandoned with it.
+            // What `RETURNING` reports for this version, when it is asked:
+            // the pre-image with each computed assignment as written. Taken
+            // from the write, never computed again: a second evaluation of
+            // `SET id = nextval('s')` or `SET token = gen_random_uuid()`
+            // reported a value the row does not hold.
+            let returned_image = collect.is_some().then(|| self.returning_image(&row, &row_write, expressions));
+            if !row_checks.is_empty() {
+                if let Err(e) = row_checks.hold(
+                    &self.schema.name,
+                    &self.schema.fields,
+                    &row_write.columns_writing_data,
+                ) {
+                    d.io_pointers.abort_txn(txn).await;
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e).into());
+                }
+            }
+
+            // The range guard (§4.5), on the merged row and ahead of every
+            // write branch below. Two of them never relocate (the fixed-width
+            // fast path, taken whenever nothing else runs, and the in-place
+            // overwrite), so a guard on the relocating branch alone would let
+            // `SET tenant_id = 43` overwrite a row in tenant 42's partition,
+            // report success, and hide it from routed queries. Assigning the
+            // value a key already holds keeps the point and passes.
+            if let (Some(guard), Some(before)) = (d.guard.as_ref(), point_before) {
+                // A row move (§9): the merged row's point is another, and the
+                // caller takes moves. Any changed point moves, even one this
+                // partition would still own, so every node, whatever its
+                // map, does the same (§4.5). The version is retired here as a
+                // DELETE retires one (its key locks were taken above, as an
+                // update takes them); its merged row is the caller's to insert.
+                if let (Some(moves), Ok(before)) = (moves.as_deref_mut(), before.as_ref())
+                    && guard.point_of_write(&row_write).is_ok_and(|after| after != *before)
+                {
+                    if let Err(e) = pointer.delete(d.io_pointers.clone(), record_pos, Some(txn), written_by).await {
+                        d.io_pointers.abort_txn(txn).await;
+                        return Err(e.into());
+                    }
+                    if written_by == FROZEN_TX && d.filters.is_some() {
+                        pending_filters.push(PendingFilterOp::Delete(record_pos / ROW_POINTER_RECORD_LEN as u64));
+                    }
+                    updated_count = updated_count.saturating_add(1);
+                    if let Some(collect) = collect.as_deref_mut() {
+                        collect.push(returned_image.clone().unwrap_or_else(|| row.clone()));
+                    }
+                    moves.push(row_write);
+                    continue;
+                }
+                let checked = before
+                    .map_err(std::io::Error::other)
+                    .and_then(|before| guard.check_update_from(before, &row_write));
+                if let Err(e) = checked {
+                    // As a row check above is refused: the statement fails as
+                    // a whole, so its storage transaction is abandoned, and
+                    // the earlier rows' pending overwrites with it. Committed
+                    // here, a statement reported as failed left those rows
+                    // rewritten, durably, outside any transaction that could
+                    // take them back. Nothing is marked retryable, since a
+                    // retry fails the same way.
+                    d.io_pointers.abort_txn(txn).await;
+                    return Err(e);
+                }
             }
 
             // The row keeps the value it already holds, so it is excluded from
@@ -2733,21 +6725,71 @@ impl<S: StorageIO> Table<S> {
                     &row_write,
                     Some(row_id),
                     &self.visibility_for(written_by),
+                    written_by,
                     Some(&assigned),
+                    Some(&mut own_keys),
                 )
                 .await
             {
+                // An earlier row overwritten in place is applied by the commit,
+                // and no abort can take it back afterwards: committed here, the
+                // statement failed with 23505 and kept those rows. The storage
+                // transaction is abandoned instead, as a CHECK failure abandons
+                // it; the versions it holds were invisible either way.
+                // A conflict marked retryable keeps its marker, and the
+                // executor replays the statement: safe, because nothing of
+                // this attempt survives the abort. An overwrite in place is
+                // taken only where the storage holds it for the commit
+                // (`defers_in_place_writes`: a file with a write-ahead log, a
+                // key/value store; never a log-less file, memory or a
+                // mirror), so the abort drops it; and the versions are
+                // invisible once the transaction aborts.
+                if overwrote_in_place {
+                    d.io_pointers.abort_txn(txn).await;
+                    return Err(e);
+                }
                 // Durability outranks the constraint violation as the thing to
                 // report: the caller can retry a rejected UPDATE, but it cannot
                 // do anything about rows it was told had landed and had not.
-                self.io_pointers.commit_durable(txn).await?;
-                self.apply_pending_filters(&mut pending_filters);
+                d.io_pointers.commit_durable(txn).await?;
+                d.apply_pending_filters(&ticket, &mut pending_filters);
+                self.dead_stamps
+                    .fetch_add(updated_count, AtomicOrdering::Relaxed);
                 self.write_generation.fetch_add(1, AtomicOrdering::AcqRel);
                 if updated_count > 0 {
                     self.invalidate_query_caches();
                 }
+                // The marker survives only while nothing has been applied,
+                // the same rule `check_write_conflict` above follows. Unlike
+                // the insert check, this one is reached once per matched row,
+                // with earlier rows already written — so *if* partial work
+                // ever became visible to a replay, a non-idempotent assignment
+                // like `n = n + 1` would count twice.
+                //
+                // That case could not be produced. A conflicting multi-row
+                // UPDATE currently applies nothing at all — whichever matched
+                // row conflicts, and whether or not the caller has its own
+                // transaction — because the failed statement's writes never
+                // become visible. Pinned by `a_conflicting_update_applies_
+                // nothing`. So this is a guard on an invariant the function
+                // already keeps, not a fix for a reachable bug; it is here so
+                // that a change which starts committing partial work does not
+                // silently gain a double-apply.
+                //
+                // A conflict that *is* replayable is not an error anyone needs
+                // to see, for the same reason the executor logs one at `debug!`
+                // — it is about to be waited out and retried.
+                let retryable = e.to_string().ends_with(Self::CONFLICT_RETRYABLE);
+                if retryable {
+                    log::debug!("UPDATE replayed for row {}: {}", row_id, e);
+                    return Err(e);
+                }
                 error!("UPDATE rejected for row {}: {}", row_id, e);
-                return Err(e);
+                let text = e.to_string();
+                return Err(match text.strip_suffix(Self::CONFLICT_RETRYABLE) {
+                    Some(trimmed) => std::io::Error::new(e.kind(), trimmed.to_string()),
+                    None => e,
+                });
             }
 
             // Fast path: when every assigned column is fixed-width, the row's
@@ -2759,46 +6801,50 @@ impl<S: StorageIO> Table<S> {
             // The filter is fed the same full `row_write` either way, so this
             // needs nothing from it that the general path does not.
             if !updates.is_empty()
+                && !may_fail_after_write
+                && !assigns_key
                 && updates.iter().all(|u| u.column_type != DbType::STRING)
                 && self
-                    .write_columns_in_place(&pointer, &updates, txn, written_by)
+                    .write_columns_in_place(d, &pointer, updates, txn, written_by)
                     .await
             {
-                if self.filters.is_some() {
+                if d.maintains_indexes() {
                     pending_filters.push(PendingFilterOp::Insert(
                         record_pos / ROW_POINTER_RECORD_LEN as u64,
                         row_write,
+                        old_keys,
                     ));
                 }
                 updated_count = updated_count.saturating_add(1);
-
-                if crate::core::wal::should_break_transaction(&*self.io_pointers) {
-                    self.io_pointers.commit_durable(txn).await?;
-                    self.apply_pending_filters(&mut pending_filters);
-                    txn = self.io_pointers.begin_txn();
+                overwrote_in_place = true;
+                if checks_own_keys {
+                    own_keys.updated.insert(row_id);
+                }
+                if let Some(collect) = collect.as_deref_mut() {
+                    collect.push(returned_image.clone().unwrap_or_else(|| row.clone()));
                 }
                 continue;
             }
 
             let update_result = pointer
                 .update_with_pointer_record_pos(
-                    self.io_pointers.clone(),
-                    self.io_rows.clone(),
+                    d.io_pointers.clone(),
+                    d.io_rows.clone(),
                     record_pos,
-                    &self.last_row_id,
-                    &self.len,
+                    &d.ids.last_row_id,
+                    &d.len,
                     // Clustering is not implemented; every row goes to cluster 0.
                     #[cfg(feature = "enable_long_row")]
                     0u32,
                     &row_write,
                     Some(txn),
-                    Some(&self.free_space),
+                    Some(&d.free_space),
                     written_by,
                 )
                 .await;
 
             if let Ok((_, relocated)) = &update_result {
-                if self.filters.is_some() {
+                if d.maintains_indexes() {
                     let old_slot = record_pos / ROW_POINTER_RECORD_LEN as u64;
                     match relocated {
                         // A fresh pointer was appended for the new version.
@@ -2819,46 +6865,66 @@ impl<S: StorageIO> Table<S> {
                             pending_filters.push(PendingFilterOp::Insert(
                                 *new_pos / ROW_POINTER_RECORD_LEN as u64,
                                 row_write,
+                                None,
                             ));
                         }
-                        // Overwritten in place: same slot, new fingerprints.
-                        None => {
-                            pending_filters.push(PendingFilterOp::Insert(old_slot, row_write))
-                        }
+                        // Overwritten in place: same slot, new fingerprints,
+                        // and the old index keys go.
+                        None => pending_filters.push(PendingFilterOp::Insert(old_slot, row_write, old_keys)),
                     }
                 }
             }
 
             if update_result.is_ok() {
                 updated_count = updated_count.saturating_add(1);
+                if checks_own_keys {
+                    own_keys.updated.insert(row_id);
+                }
+                if let Some(collect) = collect.as_deref_mut() {
+                    collect.push(returned_image.clone().unwrap_or_else(|| row.clone()));
+                }
             }
 
             // An open transaction blocks checkpointing, so a statement running
             // over millions of rows would grow the log without bound. Break it
-            // into batches once the log is due for a checkpoint: the statement
-            // is then atomic per batch rather than as a whole, which is the
-            // price of a reclaimable log.
-            if crate::core::wal::should_break_transaction(&*self.io_pointers) {
-                self.io_pointers.commit_durable(txn).await?;
-                self.apply_pending_filters(&mut pending_filters);
-                txn = self.io_pointers.begin_txn();
+            // into batches once the log is due for a checkpoint. The statement
+            // stays atomic, since every row written so far is a new version its
+            // abort makes invisible, but not after an overwrite in place (see
+            // `overwrote_in_place`).
+            if !overwrote_in_place && crate::core::wal::should_break_transaction(&*d.io_pointers) {
+                d.io_pointers.commit_durable(txn).await?;
+                d.apply_pending_filters(&ticket, &mut pending_filters);
+                txn = d.io_pointers.begin_txn();
             }
         }
 
-        self.io_pointers.commit_durable(txn).await?;
-        self.apply_pending_filters(&mut pending_filters);
+        d.io_pointers.commit_durable(txn).await?;
+        d.apply_pending_filters(&ticket, &mut pending_filters);
+        self.dead_stamps
+            .fetch_add(updated_count, AtomicOrdering::Relaxed);
         self.write_generation.fetch_add(1, AtomicOrdering::AcqRel);
 
         if updated_count > 0 {
             self.invalidate_query_caches();
-            if let Some(filters) = self.filters.as_ref() {
-                filters.request_checkpoint();
-            }
         }
 
-        Ok(updated_count)
+        Ok(Some(updated_count))
     }
 }
+
+/// One insert counted in `IdSource::in_flight` until its id is taken.
+pub(crate) struct IdsInFlight<'a>(&'a AtomicU64);
+
+impl Drop for IdsInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, AtomicOrdering::AcqRel);
+    }
+}
+
+/// An index answer at most this long is scanned as it is; a longer one is
+/// intersected with the filter's mask first. Below it, evaluating the mask
+/// costs more than the fetches it could save.
+const INDEX_ANSWER_TAKEN_AS_IS: u64 = 256;
 
 /// Index rows `[start_slot, ..)` from authoritative storage.
 ///
@@ -2884,11 +6950,29 @@ async fn backfill_into<S: StorageIO>(
         Some(readers) => readers.enter(),
         None => ReadTicket::inert(),
     };
+    let build = gate::build_token();
+    // Before the first row is read: a slot a writer sets from here on keeps
+    // the writer's code, never the older one this read (`watch_writers`).
+    let _watch = filters.watch_writers(Proof::from(&build));
+
+    // Read before the first slot: a batch is written, and the prefix cleared,
+    // only if no renumbering (`Table::compact`, which this does not wait for)
+    // began or ended since, or rows read under one numbering would be indexed
+    // under another.
+    let epoch = filters.renumber_epoch();
+    let renumbered = || std::io::Error::other("slots were renumbered under the filter backfill");
+    // Read while a renumbering runs (this does not wait for one): every batch
+    // and the prefix clear would be refused anyway, and a scan now reads rows
+    // while they move. The renumbering's own rebuild, or the next open's
+    // backfill, indexes the table instead.
+    if crate::core::filter::renumbering(epoch) {
+        return Err(renumbered());
+    }
 
     let fetch = Table::<S>::build_indexed_row_fetch(fields);
     if fetch.columns_fetching_data.is_empty() {
-        if start_slot == 0 {
-            filters.clear_unindexed_prefix();
+        if start_slot == 0 && !filters.clear_unindexed_prefix_at(Proof::from(&build), epoch) {
+            return Err(renumbered());
         }
         return Ok(0);
     }
@@ -2906,6 +6990,11 @@ async fn backfill_into<S: StorageIO>(
 
     let mut row = Row::default();
     let mut indexed: u64 = 0;
+    // Slots whose row could not be read: never given codes, so the prefix
+    // that keeps them candidates must not be cleared (below).
+    let mut unread: u64 = 0;
+    #[cfg(test)]
+    let failing = backfill_test_hooks::failing_slots(io_rows.get_location());
 
     // Rows are handed to the filter in runs so each column's lock is taken once
     // per run rather than once per row. A whole-table backfill is the largest
@@ -2922,11 +7011,22 @@ async fn backfill_into<S: StorageIO>(
             .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
         let Some((offset, pointer)) = next else { break };
 
-        if pointer
-            .fetch_row_reuse_async(&**io_rows, &fetch, &mut row)
-            .await
-            .is_err()
+        #[cfg(test)]
+        let injected = failing.contains(&(offset / ROW_POINTER_RECORD_LEN as u64));
+        #[cfg(not(test))]
+        let injected = false;
+        if injected
+            || pointer
+                .fetch_row_reuse_async(&**io_rows, &fetch, &mut row)
+                .await
+                .is_err()
         {
+            // Unreadable here is not unreadable to a query, which may read
+            // it later (the index build keeps such a slot for the same
+            // reason). Skipped, it would read as having no value once the
+            // prefix clears, and the filter would prune it: a row the query
+            // matches, silently missing. So it stays a candidate.
+            unread += 1;
             continue;
         }
 
@@ -2938,19 +7038,229 @@ async fn backfill_into<S: StorageIO>(
 
         pending.push((offset / ROW_POINTER_RECORD_LEN as u64, cols));
         if pending.len() == BACKFILL_BATCH {
-            filters.backfill_batch(&pending);
+            if !filters.backfill_batch_at(Proof::from(&build), epoch, &pending) {
+                return Err(renumbered());
+            }
             pending.clear();
         }
         indexed += 1;
     }
-    filters.backfill_batch(&pending);
-
-    // Only a scan that started at the beginning can vouch for the prefix.
-    if start_slot == 0 {
-        filters.clear_unindexed_prefix();
+    #[cfg(test)]
+    backfill_test_hooks::before_last_batch(io_rows.get_location()).await;
+    if !filters.backfill_batch_at(Proof::from(&build), epoch, &pending) {
+        return Err(renumbered());
     }
-    info!("Filter backfill indexed {} rows from slot {}", indexed, start_slot);
+
+    // Only a scan that started at the beginning, and read every row, can
+    // vouch for the prefix. With a row unread the prefix stays: every slot
+    // below it is a candidate (correct, unpruned) until the next open's
+    // backfill. A scan from a later slot needs nothing: the frontier stops
+    // at the first slot it did not index (`valid_upto`).
+    if unread > 0 {
+        log::warn!(
+            "Filter backfill could not read {} rows from slot {}; the filter prunes none of them",
+            unread, start_slot
+        );
+    } else if start_slot == 0 && !filters.clear_unindexed_prefix_at(Proof::from(&build), epoch) {
+        return Err(renumbered());
+    }
+    info!(
+        "Filter backfill indexed {} rows from slot {}",
+        indexed, start_slot
+    );
     Ok(indexed)
+}
+
+/// Fills `indexes` from every version on disk.
+///
+/// Holds a reader epoch for the reason the filter backfill does: it reads row
+/// bytes by pointer, and an extent reclaimed underneath it would be keyed
+/// with another row's value. Deleted pointers are skipped by the iterator.
+/// A version still visible to an old snapshot is indexed like any other,
+/// and vacuum forgets it once nothing can reach it.
+///
+/// Writers maintain the indexes while this runs, so a version written after
+/// the scan passed its slot is indexed by its writer. One the scan reaches
+/// as well is simply added twice, which a set ignores.
+async fn build_indexes<S: StorageIO>(
+    indexes: &crate::core::index::TableIndexes,
+    io_pointers: &Arc<S>,
+    io_rows: &Arc<S>,
+    fields: &SmallVec<[SchemaField; 20]>,
+    readers: Option<&StdArc<ReaderRegistry>>,
+) -> Result<u64> {
+    let _read = match readers {
+        Some(readers) => readers.enter(),
+        None => ReadTicket::inert(),
+    };
+    let build = gate::build_token();
+    let fetch = Table::<S>::build_fetch_for(fields, &indexes.columns());
+    let mut iterator = RowPointerIterator::new(io_pointers.clone())
+        .await
+        .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+    let mut row = Row::default();
+    let mut built = 0u64;
+    loop {
+        let next = iterator
+            .next_row_pointer_with_offset()
+            .await
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        let Some((offset, pointer)) = next else { break };
+        let slot = offset / ROW_POINTER_RECORD_LEN as u64;
+        if pointer
+            .fetch_row_reuse_async(&**io_rows, &fetch, &mut row)
+            .await
+            .is_err()
+        {
+            // Unreadable here is not unreadable to the query, which may
+            // succeed later: kept as a candidate in every index.
+            indexes.index_unreadable(Proof::from(&build), slot);
+            continue;
+        }
+        indexes.index_row(Proof::from(&build), slot, &|wo| {
+            row.columns
+                .iter()
+                .find(|c| c.schema_id as u32 == wo)
+                .map(|c| c.data.into_slice())
+        });
+        built += 1;
+    }
+    Ok(built)
+}
+
+/// Ends a renumbering that [`Table::compact`] began, on every way out of it.
+struct RenumberingGuard<'a> {
+    filters: Option<&'a TableFilters>,
+    indexes: Option<&'a crate::core::index::TableIndexes>,
+    /// The compaction's ticket, held across the whole renumbering: the end
+    /// is a mutation like the beginning.
+    ticket: &'a WriteTicket,
+}
+
+impl Drop for RenumberingGuard<'_> {
+    fn drop(&mut self) {
+        let ticket = self.ticket;
+        if let Some(filters) = self.filters {
+            // A compaction that fails from here on leaves the filter demoted
+            // in memory, and no seal captures a demoted filter (§3 step 3).
+            filters.end_renumbering(Proof::from(ticket));
+        }
+        if let Some(indexes) = self.indexes {
+            indexes.invalidate(Proof::from(ticket));
+        }
+    }
+}
+
+/// Failpoints inside [`Table::compact`], for the tests that need it to fail
+/// at a chosen point. Thread-local: the caller runs `compact` on its own task.
+#[cfg(test)]
+pub(crate) mod compact_test_hooks {
+    thread_local! {
+        /// Fails `compact` once this many pointer records have moved in phase
+        /// 2, after committing those moves.
+        pub static FAIL_PHASE2_AFTER_SLOT_MOVES: std::cell::Cell<Option<u64>> =
+            const { std::cell::Cell::new(None) };
+        /// Fails `compact` once this many rows have moved in phase 1, after
+        /// committing those moves.
+        pub static FAIL_PHASE1_AFTER_ROW_MOVES: std::cell::Cell<Option<u64>> =
+            const { std::cell::Cell::new(None) };
+        /// Set by `compact` to 1 when it starts waiting for the compaction
+        /// gate and to 2 once it holds it, so a test can tell a compaction
+        /// that is blocked on the gate from one that is running.
+        pub static GATE_PROBE: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicU8>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn gate_point(state: u8) {
+        GATE_PROBE.with(|p| {
+            if let Some(p) = p.borrow().as_ref() {
+                p.store(state, std::sync::atomic::Ordering::Release);
+            }
+        });
+    }
+}
+
+/// Parks a filter backfill between the rows it read and the batch it
+/// writes, for the tests of writers in that window.
+/// Test-only: a close that skips its seal, process-wide while set (P5b-2's
+/// mutation of the seal at close, and its tests' baseline).
+#[cfg(test)]
+pub(crate) mod close_seal_hooks {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static SKIP: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) fn set_skipped(skip: bool) {
+        SKIP.store(skip, Ordering::SeqCst);
+    }
+
+    pub(crate) fn skipped() -> bool {
+        SKIP.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod backfill_test_hooks {
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    pub(crate) struct Park {
+        /// Notified once the backfill has read its rows and is parked.
+        pub read: tokio::sync::Notify,
+        /// Notify to let it write them.
+        pub release: tokio::sync::Notify,
+    }
+
+    static PARK: parking_lot::Mutex<Option<(String, Arc<Park>)>> = parking_lot::Mutex::new(None);
+
+    /// Parks the next backfill of a table whose rows are in `dir` before it
+    /// writes its last batch.
+    pub(crate) fn arm(dir: &str) -> Arc<Park> {
+        let park = Arc::new(Park::default());
+        *PARK.lock() = Some((dir.to_string(), park.clone()));
+        park
+    }
+
+    static FAILING: parking_lot::Mutex<Vec<(String, u64)>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Every backfill of a table whose rows are in `dir` fails to read slot
+    /// `slot` until [`clear_failing`].
+    pub(crate) fn fail_slot(dir: &str, slot: u64) {
+        FAILING.lock().push((dir.to_string(), slot));
+    }
+
+    pub(crate) fn clear_failing(dir: &str) {
+        FAILING.lock().retain(|(d, _)| d != dir);
+    }
+
+    pub(super) fn failing_slots(dir: Option<String>) -> Vec<u64> {
+        let Some(dir) = dir else { return Vec::new() };
+        FAILING.lock().iter().filter(|(d, _)| *d == dir).map(|(_, s)| *s).collect()
+    }
+
+    pub(super) async fn before_last_batch(dir: Option<String>) {
+        let park = {
+            let mut g = PARK.lock();
+            match (g.as_ref(), dir) {
+                (Some((at, _)), Some(dir)) if *at == dir => g.take().map(|(_, p)| p),
+                _ => None,
+            }
+        };
+        if let Some(park) = park {
+            park.read.notify_one();
+            park.release.notified().await;
+        }
+    }
+}
+
+/// Failures no file can be made to produce on demand. Thread-local, so set
+/// them from a current-thread runtime.
+#[cfg(test)]
+pub(crate) mod partition_test_hooks {
+    thread_local! {
+        /// The next `open_partition` fails reading its pointer file.
+        pub(crate) static FAIL_POINTER_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 }
 
 #[cfg(test)]
@@ -3042,3 +7352,216 @@ mod candidate_mask_tests {
         assert!(mask_is_worth_using(0.99, 0.5, 10_000, 10_000, true));
     }
 }
+
+#[cfg(test)]
+#[path = "snapshot_order_tests.rs"]
+mod snapshot_order_tests;
+
+#[path = "table_seal.rs"]
+pub(crate) mod table_seal;
+
+#[path = "table_audit.rs"]
+pub(crate) mod table_audit;
+
+/// A version's standing in a uniqueness check, before the running set is
+/// asked about it ([`Table::occupancy`], [`Table::settle_occupancy`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Occupancy {
+    /// Holds the key, written by the checking transaction itself.
+    Held,
+    /// Holds the key; its creator is still in progress.
+    InFlight(TxId),
+    /// Holds the key; its creator's commit is recorded.
+    Committed(TxId),
+    /// Its deleter's commit is recorded: free, once that is retired.
+    DeletedBy(TxId),
+    /// Free: its deleter committed after the check's snapshot and is retired.
+    Superseded(TxId),
+}
+
+impl Occupancy {
+    /// Deleted by a transaction that committed after the check's snapshot was
+    /// taken: free, but the version that replaced it may be one the check's
+    /// sample of the index or filter predates ([`Supersessions`]). A delete
+    /// the snapshot sees was applied, replacement and all, before the sample.
+    fn superseded(occupancy: Option<Occupancy>, visibility: &Visibility) -> bool {
+        match occupancy {
+            Some(Occupancy::Superseded(_)) => true,
+            Some(Occupancy::DeletedBy(deleter)) => !visibility.sees_delete(deleter),
+            _ => false,
+        }
+    }
+}
+
+/// The versions a uniqueness check skipped as [`Occupancy::superseded`], so
+/// the check can tell when its sample may have missed a replacement.
+///
+/// A check samples the candidates (an index descent, a filter bitmap, the
+/// pointer file's length), then reads each. An `UPDATE` relocating a row
+/// writes the new version, applies its index and filter entries once its
+/// batch is durable, and commits after that. So a delete the check's snapshot
+/// shows was applied before the sample and its replacement is among the
+/// candidates. One the snapshot does not show may have been applied after the
+/// sample: reading the old version then finds it free, and the new one was
+/// never a candidate, so the key's holder is missed and a duplicate admitted.
+/// Every such version is noted here, and the check samples again whenever a
+/// round meets one it had not seen. The new sample starts after the old
+/// version read as free, so after its deleter's entries were applied: it
+/// finds the replacement, or that replacement superseded in turn, which
+/// is new and starts another round. Finitely many, since each needs a commit.
+///
+/// It replaces holding every key stripe across an `UPDATE`'s rewrite, which
+/// closed the same window by keeping inserts out of it: under a stream of
+/// range updates, inserts of new keys ran at a tenth of their pace.
+#[derive(Default)]
+struct Supersessions {
+    seen: std::collections::HashSet<(u64, TxId, TxId)>,
+    fresh: bool,
+}
+
+impl Supersessions {
+    /// A bound no real workload reaches: each round needs another commit
+    /// replacing a version of this very key while the check runs.
+    const MAX_ROUNDS: usize = 1_000;
+
+    fn note(&mut self, pointer: &RowPointer) {
+        if self.seen.insert((pointer.row_id(), pointer.xmin, pointer.xmax)) {
+            self.fresh = true;
+        }
+    }
+
+    /// Whether the round just finished met a version it had not seen, and
+    /// starts the next one.
+    fn take_fresh(&mut self) -> bool {
+        std::mem::take(&mut self.fresh)
+    }
+
+    /// Retryable, as a key in flight is: the statement replays.
+    fn exhausted(retryable: &str) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "a uniqueness check met a key replaced {} times while it ran{}",
+                Self::MAX_ROUNDS,
+                retryable
+            ),
+        )
+    }
+}
+
+/// The running set's minimum, read once per uniqueness check, the first time
+/// a version needs it ([`Table::occupancy`]): every id below it has left the
+/// running set for good. `TransactionManager::oldest_active` is that minimum
+/// (or the next id when nothing runs), never an oldest snapshot or any other
+/// horizon; ids enter the running set only as they are handed out, at the
+/// next id, so the minimum never falls below a value once read.
+#[derive(Default)]
+struct RunningFloor(Option<TxId>);
+
+impl RunningFloor {
+    /// Whether `id`'s recorded commit is retired for good: below the floor.
+    /// At or above it the running set itself must be asked.
+    fn retired(&mut self, manager: &crate::core::mvcc::transaction::TransactionManager, id: TxId) -> bool {
+        id < *self.0.get_or_insert_with(|| manager.oldest_active())
+    }
+}
+
+#[cfg(test)]
+mod occupancy_floor_tests {
+    use super::*;
+    use crate::core::mvcc::transaction::TransactionManager;
+
+    type T = Table<crate::core::storage_providers::file_sync::LocalStorageProvider>;
+
+    fn version(xmin: TxId, xmax: TxId) -> RowPointer {
+        let mut pointer = RowPointer::from_slice(&[0u8; ROW_POINTER_RECORD_LEN]);
+        pointer.deleted = false;
+        pointer.xmin = xmin;
+        pointer.xmax = xmax;
+        pointer
+    }
+
+    /// A version whose creator or deleter is below the running set's minimum
+    /// is decided before its row is fetched: a delete retired long ago frees
+    /// the key at once, and an old committed insert holds it, with no
+    /// question to the running set left for after the fetch. A deleter at or
+    /// above the minimum is left to `settle_occupancy`, even one already
+    /// retired: the floor is the running set's minimum, not the next id or
+    /// any later horizon, which would wave a committing delete through.
+    ///
+    /// Mutations: `RunningFloor::retired` answers false (the old delete comes
+    /// back as `DeletedBy`, to be fetched and asked about, and the old insert
+    /// as `Committed`); the floor read is `next_id` (the delete above the
+    /// running minimum comes back free, unasked).
+    #[test]
+    fn versions_below_the_running_floor_are_decided_before_the_fetch() {
+        let m = std::sync::Arc::new(TransactionManager::in_memory());
+        let inserted = m.begin();
+        m.commit(inserted);
+        let deleted = m.begin();
+        m.commit(deleted);
+        // Holds the running set's minimum here, above both.
+        let running = m.begin();
+        let later = m.begin();
+        m.commit(later);
+        let writer = m.begin();
+        let visibility = crate::core::mvcc::Visibility::for_snapshot(m.snapshot(writer), m.clone());
+        assert_eq!(m.oldest_active(), running);
+
+        let mut floor = RunningFloor::default();
+        assert_eq!(T::occupancy(&m, &version(inserted, deleted), writer, &visibility, &mut floor), None);
+        assert_eq!(
+            T::occupancy(&m, &version(inserted, NO_TX), writer, &visibility, &mut floor),
+            Some(Occupancy::Held)
+        );
+        assert_eq!(
+            T::occupancy(&m, &version(inserted, later), writer, &visibility, &mut floor),
+            Some(Occupancy::DeletedBy(later)),
+            "a delete above the running minimum was decided without asking the running set"
+        );
+        assert_eq!(
+            T::occupancy(&m, &version(later, NO_TX), writer, &visibility, &mut floor),
+            Some(Occupancy::Committed(later))
+        );
+        // And settled: both retired, so free and held.
+        assert_eq!(T::settle_occupancy(Some(&m), Some(Occupancy::DeletedBy(later))), None);
+        assert_eq!(T::settle_occupancy(Some(&m), Some(Occupancy::Committed(later))), Some(false));
+        let _ = running;
+    }
+
+    /// A retired delete the check's snapshot does not see is `Superseded`,
+    /// the one case that makes the check sample again (`Supersessions`); one
+    /// it sees is still decided unfetched. Every old delete came back
+    /// `Superseded` when this keyed on retirement alone, so every insert of a
+    /// key with history fetched dead versions and sampled twice.
+    #[test]
+    fn only_a_delete_the_snapshot_missed_is_superseded() {
+        let m = std::sync::Arc::new(TransactionManager::in_memory());
+        let inserted = m.begin();
+        m.commit(inserted);
+        let seen = m.begin();
+        m.commit(seen);
+        // Running when the writer's snapshot is taken, committed after it.
+        let missed = m.begin();
+        let running = m.begin();
+        let writer = m.begin();
+        let visibility = crate::core::mvcc::Visibility::for_snapshot(m.snapshot(writer), m.clone());
+        m.commit(missed);
+        assert_eq!(m.oldest_active(), running, "both deletes are below the floor");
+
+        let mut floor = RunningFloor::default();
+        assert_eq!(T::occupancy(&m, &version(inserted, seen), writer, &visibility, &mut floor), None);
+        assert_eq!(
+            T::occupancy(&m, &version(inserted, missed), writer, &visibility, &mut floor),
+            Some(Occupancy::Superseded(missed))
+        );
+        assert!(Occupancy::superseded(Some(Occupancy::Superseded(missed)), &visibility));
+        // A recorded delete is told apart the same way once it settles free.
+        assert!(Occupancy::superseded(Some(Occupancy::DeletedBy(missed)), &visibility));
+        assert!(!Occupancy::superseded(Some(Occupancy::DeletedBy(seen)), &visibility));
+        let _ = running;
+    }
+}
+
+#[path = "table_maintenance.rs"]
+pub(crate) mod table_maintenance;

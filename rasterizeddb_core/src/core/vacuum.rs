@@ -43,19 +43,21 @@
 //!   by interval subtraction rather than exact match, so a partially consumed
 //!   extent contributes only its unused remainder.
 
-use std::collections::{BTreeSet, HashMap};
 use branches::likely;
 use cacheguard::CacheGuard;
-use std::sync::atomic::AtomicUsize;
+use std::collections::{BTreeSet, HashMap};
+use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use log::info;
 use parking_lot::Mutex;
 
+use crate::core::filter::TableFilters;
+use crate::core::index_store::gate::{self, Proof};
 use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX};
 use crate::core::mvcc::visibility::Visibility;
-use crate::core::filter::TableFilters;
 use crate::core::mvcc::{TransactionManager, TxId, TxOutcome};
 use crate::core::row::row_pointer::{ROW_POINTER_RECORD_LEN, RowPointer};
 use crate::core::storage_providers::traits::StorageIO;
@@ -182,11 +184,31 @@ struct FreeState {
     /// sixty-thousand-entry vector on each of those is the kind of cost that
     /// only shows up under exactly the workload this is meant to help.
     extents: BTreeSet<(u64, u64)>,
-    /// Handed to a writer, but not yet seen owned by a live pointer.
+    /// Handed to a writer, but not yet seen owned by a record: start →
+    /// [`Loan`].
     ///
     /// Keyed by start offset: an extent is lent out whole or from its front, so
     /// two live loans can never share a start.
-    in_flight: HashMap<u64, u64>,
+    in_flight: HashMap<u64, Loan>,
+}
+
+/// An extent lent to a writer.
+#[derive(Debug, Clone, Copy)]
+struct Loan {
+    len: u64,
+    /// The pointer slot of the record that owns the extent, once the writer
+    /// has written it ([`FreeSpace::owned_by`]); `u64::MAX` until then, when
+    /// nothing retires the loan. Only a record at this slot or beyond does.
+    ///
+    /// A record below it is an older version at the same start — usually
+    /// the very version whose extent was reclaimed and handed out, since an
+    /// extent is lent from its front. Its tombstone stays in the pointer file
+    /// for good, so it is in every later sweep. Retiring the loan on it
+    /// dropped the loan before the writer's own record existed, and the next
+    /// publication handed the extent out again over the row just written
+    /// there (2026-11-11: `reader_miss_stress` with spread writes lost rows
+    /// in most runs).
+    floor: u64,
 }
 
 /// Reclaimed byte ranges of one table's rows file, and the ranges currently
@@ -219,6 +241,103 @@ pub struct FreeSpace {
     /// is `#[inline]` and runs per row, while `set_enabled` fires approximately
     /// never. It should sit in each scanning core's L1 undisturbed.
     enabled: CacheGuard<AtomicBool>,
+    /// Bumped by every [`FreeSpace::set_enabled`]. Reader tickets are inert
+    /// while disabled, so a wait for readers to drain proves nothing across a
+    /// toggle; the forget sweep compares this before and after.
+    toggles: AtomicU64,
+    /// Bumped by [`FreeSpace::begin_relayout`] (`VACUUM FULL`, before any row
+    /// moves), under the `state` lock. A sweep reads it before its scan and
+    /// publishes or quarantines only if it is unchanged: extents computed from
+    /// the old row layout name bytes that live rows have since moved into.
+    layout: AtomicU64,
+    /// Rows appended at the frontier whose pointer a sweep may not have seen.
+    /// See [`Appends`]. Taken after `state` when both are held.
+    appends: Mutex<Appends>,
+}
+
+/// Rows appended at the end of the rows file, from the append until a sweep
+/// is sure to see the pointer that owns them.
+///
+/// An append writes the row's bytes, and the file's length moves past them,
+/// before the row's pointer record is written. A sweep that read the length
+/// after the bytes and finished its pointer pass before the record found
+/// those bytes owned by nothing — a gap, once another row appended after them
+/// had its pointer seen first — and published them; the next writer given
+/// that extent wrote over the row, whose pointer then named the other row's
+/// bytes (2026-11-11: `reader_miss_stress`, under load; a pause between the
+/// append and the pointer reproduces it in most runs). A loan cannot shield
+/// them: there is no list entry to take one with before the append, and one
+/// taken after leaves the same window open.
+///
+/// So an append takes a ticket before it writes ([`FreeSpace::begin_append`]),
+/// records the range it got as soon as it has it, and lets go once its pointer
+/// is written. A sweep waits, before it publishes or quarantines, for every
+/// ticket older than its own barrier to have recorded its range (an append is
+/// short), and leaves every recorded range out. A range whose pointer was
+/// written while no sweep ran is forgotten at once, since every later sweep
+/// reads that pointer; one written during a sweep is kept until the sweep
+/// ends. A table only ever appended to never sweeps, and keeps nothing.
+#[derive(Debug, Default)]
+struct Appends {
+    next: u64,
+    /// Tickets that have not yet recorded their range.
+    writing: BTreeSet<u64>,
+    /// Recorded ranges by ticket, with whether their pointer has been
+    /// written.
+    ranges: HashMap<u64, (Extent, bool)>,
+    /// Sweeps between [`FreeSpace::begin_sweep`] and their end (one at a
+    /// time per table, under its maintenance lock).
+    sweeping: u32,
+}
+
+/// An append's place in [`Appends`], from before it writes until its pointer
+/// is written (or it gives up). Dropping it marks the pointer written.
+pub struct AppendTicket<'a> {
+    free_space: Option<&'a FreeSpace>,
+    ticket: u64,
+}
+
+impl AppendTicket<'_> {
+    /// The append put its row at `start`, `len` bytes: shielded from here.
+    pub fn landed(&mut self, start: u64, len: u64) {
+        let Some(free_space) = self.free_space else { return };
+        let mut appends = free_space.appends.lock();
+        appends.writing.remove(&self.ticket);
+        if len > 0 {
+            appends.ranges.insert(self.ticket, (Extent { start, len }, false));
+        }
+    }
+}
+
+impl Drop for AppendTicket<'_> {
+    fn drop(&mut self) {
+        let Some(free_space) = self.free_space else { return };
+        let mut appends = free_space.appends.lock();
+        appends.writing.remove(&self.ticket);
+        if appends.sweeping > 0 {
+            if let Some(range) = appends.ranges.get_mut(&self.ticket) {
+                range.1 = true;
+            }
+        } else {
+            appends.ranges.remove(&self.ticket);
+        }
+    }
+}
+
+/// A sweep, from before it reads the rows file's length to its end. See
+/// [`Appends`].
+pub(crate) struct SweepGuard<'a> {
+    free_space: &'a FreeSpace,
+}
+
+impl Drop for SweepGuard<'_> {
+    fn drop(&mut self) {
+        let mut appends = self.free_space.appends.lock();
+        appends.sweeping -= 1;
+        if appends.sweeping == 0 {
+            appends.ranges.retain(|_, (_, written)| !*written);
+        }
+    }
 }
 
 impl FreeSpace {
@@ -232,7 +351,83 @@ impl FreeSpace {
             reused_rows: AtomicU64::new(0),
             leaked_loans: AtomicU64::new(0),
             enabled: AtomicBool::new(enabled).into(),
+            toggles: AtomicU64::new(0),
+            layout: AtomicU64::new(0),
+            appends: Mutex::new(Appends::default()),
         }
+    }
+
+    /// Before an append to the rows file: see [`Appends`]. Inert while
+    /// reclamation is off, as reader tickets are.
+    pub fn begin_append(&self) -> AppendTicket<'_> {
+        if !self.is_enabled() {
+            return AppendTicket { free_space: None, ticket: 0 };
+        }
+        let mut appends = self.appends.lock();
+        let ticket = appends.next;
+        appends.next += 1;
+        appends.writing.insert(ticket);
+        AppendTicket { free_space: Some(self), ticket }
+    }
+
+    /// A sweep starts: before it reads the rows file's length.
+    pub(crate) fn begin_sweep(&self) -> SweepGuard<'_> {
+        self.appends.lock().sweeping += 1;
+        SweepGuard { free_space: self }
+    }
+
+    /// The ticket an append starting now would take.
+    fn append_barrier(&self) -> u64 {
+        self.appends.lock().next
+    }
+
+    /// Whether every append that held a ticket below `barrier` has recorded
+    /// its range.
+    fn appends_landed_before(&self, barrier: u64) -> bool {
+        self.appends.lock().writing.first().is_none_or(|&oldest| oldest >= barrier)
+    }
+
+    /// The recorded ranges a sweep may not have seen the pointer of.
+    pub(crate) fn unseen_appends(&self) -> Vec<Extent> {
+        self.appends.lock().ranges.values().map(|(extent, _)| *extent).collect()
+    }
+
+    /// See the `layout` field.
+    pub fn layout(&self) -> u64 {
+        self.layout.load(Ordering::Acquire)
+    }
+
+    /// Called before rows move to new positions: drops the list, every
+    /// quarantined batch and every loan, and fences off any sweep that read
+    /// the old layout.
+    ///
+    /// Loans go too, unlike in [`FreeSpace::clear`]. The caller holds the
+    /// compaction gate exclusively, and every writer holds it shared from
+    /// [`FreeSpace::alloc`] until its pointer is saved (or its loan given
+    /// back), so no loan here protects a write still in progress: each one's
+    /// pointer is already saved. What a loan still guards against is a sweep
+    /// that read the layout before that pointer existed, and the layout check
+    /// refuses any such sweep from now on. Kept, a loan would retire only
+    /// when a scan saw a live pointer start exactly at its offset, which
+    /// after the rows move is almost never: its bytes would be withheld from
+    /// every later list, every scanned row would take the state lock in
+    /// `retire_loan`, and the service would sweep every tick for good.
+    pub fn begin_relayout(&self) {
+        {
+            let mut state = self.state.lock();
+            self.layout.fetch_add(1, Ordering::AcqRel);
+            state.in_flight.clear();
+            self.in_flight_count.store(0, Ordering::Release);
+        }
+        self.clear();
+        // After the bump: a quarantine that checked the layout before it has
+        // already pushed, and is dropped here; one after it sees the bump.
+        self.quarantined.lock().clear();
+    }
+
+    /// How many times reclamation has been switched on or off.
+    pub fn toggles(&self) -> u64 {
+        self.toggles.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -278,13 +473,22 @@ impl FreeSpace {
         self.leaked_loans.load(Ordering::Relaxed)
     }
 
-    /// Claims `need` bytes, returning the offset to write them at.
+    /// [`FreeSpace::alloc_after`] at slot 0: for tests, whose sweeps are
+    /// simulated by calling [`FreeSpace::retire_loan`] directly.
+    #[cfg(test)]
+    pub fn alloc(&self, need: u64) -> Option<u64> {
+        self.alloc_after(need, 0)
+    }
+
+    /// Claims `need` bytes, returning the offset to write them at, lent with
+    /// `floor` ([`Loan::floor`]): `u64::MAX` for a writer, which then names
+    /// its record with [`FreeSpace::owned_by`].
     ///
     /// Best fit: the smallest extent that still fits, so large holes stay
     /// available for large rows. A leftover worth keeping goes back on the list
     /// as its own extent; anything smaller is absorbed into the loan and lost
     /// until the next scan finds it again as an interior gap.
-    pub fn alloc(&self, need: u64) -> Option<u64> {
+    pub fn alloc_after(&self, need: u64, floor: u64) -> Option<u64> {
         if need == 0 || !self.is_enabled() {
             return None;
         }
@@ -307,7 +511,7 @@ impl FreeSpace {
                 chosen_len
             };
 
-            state.in_flight.insert(chosen_start, taken);
+            state.in_flight.insert(chosen_start, Loan { len: taken, floor });
             self.in_flight_count
                 .store(state.in_flight.len(), Ordering::Release);
 
@@ -324,10 +528,12 @@ impl FreeSpace {
         Some(start)
     }
 
-    /// A scan saw a live pointer at `start`: whatever loan covered it is now
-    /// accounted for by that pointer and no longer needs shielding.
+    /// A scan saw the record in pointer slot `slot` name `start`: a loan of
+    /// that start taken when the file was no longer than `slot` records is
+    /// now accounted for by that record and no longer needs shielding. A
+    /// record older than the loan is not its owner ([`Loan::floor`]).
     #[inline]
-    fn retire_loan(&self, start: u64) {
+    fn retire_loan(&self, start: u64, slot: u64) {
         // Called once per live row of a full scan, and almost always with
         // nothing outstanding, so the lock is worth avoiding. Hinted `likely`
         // to make the early return the fall-through, which is the same claim
@@ -338,10 +544,33 @@ impl FreeSpace {
             return;
         }
         let state = &mut *self.state.lock();
-        if state.in_flight.remove(&start).is_some() {
+        if state.in_flight.get(&start).is_some_and(|loan| slot >= loan.floor) {
+            state.in_flight.remove(&start);
             self.in_flight_count
                 .store(state.in_flight.len(), Ordering::Release);
         }
+    }
+
+    /// The writer of the extent lent at `start` wrote the record that owns it,
+    /// in pointer slot `slot`: from here, a sweep that reads that record
+    /// retires the loan. A sweep that read it before this leaves the loan for
+    /// the next one.
+    pub fn owned_by(&self, start: u64, slot: u64) {
+        if let Some(loan) = self.state.lock().in_flight.get_mut(&start) {
+            loan.floor = slot;
+        }
+    }
+
+    /// The extents on the list now.
+    #[cfg(test)]
+    pub(crate) fn listed(&self) -> Vec<Extent> {
+        self.state.lock().extents.iter().map(|&(len, start)| Extent { start, len }).collect()
+    }
+
+    /// The floor of the loan of the extent at `start`, if one is out.
+    #[cfg(test)]
+    pub(crate) fn loan_floor(&self, start: u64) -> Option<u64> {
+        self.state.lock().in_flight.get(&start).map(|loan| loan.floor)
     }
 
     /// Gives back an extent whose write failed.
@@ -366,15 +595,49 @@ impl FreeSpace {
     /// run does not have to rediscover it, and — more to the point — that a
     /// table with a query always in flight still reclaims, one run behind,
     /// rather than never.
+    #[cfg(test)]
     fn quarantine(&self, candidates: Vec<Extent>, barrier: u64) {
+        self.quarantine_at(candidates, barrier, self.layout());
+    }
+
+    /// [`FreeSpace::quarantine`], unless the rows were moved since the sweep
+    /// read `layout`: see the `layout` field.
+    ///
+    /// What is on the list or on loan now is left out. A sweep finds an extent
+    /// still waiting on the list as free, as it is, and one lent since the
+    /// sweep as free too; held here, either came back when the batch matured,
+    /// after a writer had taken it from the list and the loan had been
+    /// retired by the record that now owns it, and was handed out a second
+    /// time over that row. Left out, the batch holds only bytes nothing can
+    /// write until it is published: the list and the loans are the only ways
+    /// a writer reaches an extent below the frontier.
+    fn quarantine_at(&self, candidates: Vec<Extent>, barrier: u64, layout: u64) {
         if candidates.is_empty() {
             return;
         }
+        // The list and the loans read under the same lock the quarantine is
+        // stored under (state, then quarantined: nothing takes them the other
+        // way round), so no writer can take an extent between the two.
+        let state = self.state.lock();
         let mut quarantined = self.quarantined.lock();
+        if self.layout() != layout {
+            return;
+        }
+        let taken: Vec<Extent> = state
+            .extents
+            .iter()
+            .map(|&(len, start)| Extent { start, len })
+            .chain(state.in_flight.iter().map(|(&start, loan)| Extent { start, len: loan.len }))
+            .chain(self.unseen_appends())
+            .collect();
+        drop(state);
+        let candidates = subtract_ranges(merge_overlapping(candidates), &taken);
         // One batch per barrier is enough: a later run's findings supersede an
         // earlier one's, since both derive from the same authoritative sweep.
         quarantined.clear();
-        quarantined.push((barrier, candidates));
+        if !candidates.is_empty() {
+            quarantined.push((barrier, candidates));
+        }
     }
 
     /// Takes the quarantined batches whose barrier has since been passed.
@@ -405,15 +668,32 @@ impl FreeSpace {
     /// A full replacement rather than a merge: the scan derives the list from
     /// authoritative storage, so anything it did not find is either live or
     /// on loan, and either way must not stay on the list.
-    fn publish(&self, mut candidates: Vec<Extent>) {
+    #[cfg(test)]
+    fn publish(&self, candidates: Vec<Extent>) {
+        self.publish_at(candidates, self.layout());
+    }
+
+    /// [`FreeSpace::publish`], unless the rows were moved since the sweep read
+    /// `layout`: see the `layout` field.
+    fn publish_at(&self, mut candidates: Vec<Extent>, layout: u64) {
         // Both halves under one lock. See `FreeState`.
         let state = &mut *self.state.lock();
+        if self.layout() != layout {
+            return;
+        }
 
+        // Each byte once: two overlapping entries would be lent to two rows.
+        candidates = merge_overlapping(candidates);
+        // Appended rows whose pointer the sweep may have missed (`Appends`).
+        let unseen = self.unseen_appends();
+        if !unseen.is_empty() {
+            candidates = subtract_ranges(candidates, &unseen);
+        }
         if !state.in_flight.is_empty() {
             let loans: Vec<Extent> = state
                 .in_flight
                 .iter()
-                .map(|(&start, &len)| Extent { start, len })
+                .map(|(&start, loan)| Extent { start, len: loan.len })
                 .collect();
             candidates = subtract_ranges(candidates, &loans);
         }
@@ -445,6 +725,7 @@ impl FreeSpace {
     /// direction only — extents already published were cleared by the same
     /// call, and no new ones can appear while it stays off.
     pub fn set_enabled(&self, enabled: bool) {
+        self.toggles.fetch_add(1, Ordering::AcqRel);
         self.enabled.store(enabled, Ordering::Relaxed);
         if !enabled {
             self.clear();
@@ -454,8 +735,10 @@ impl FreeSpace {
 
 /// `ranges` minus `holes`, both half-open. Neither input need be sorted.
 fn subtract_ranges(ranges: Vec<Extent>, holes: &[Extent]) -> Vec<Extent> {
-    let mut sorted_holes: Vec<Extent> = holes.to_vec();
-    sorted_holes.sort_unstable_by_key(|h| h.start);
+    // Sorted and disjoint, so their ends rise with their starts: the search
+    // below relies on it, and holes gathered from the list, the loans and
+    // the appends are not promised to be disjoint.
+    let sorted_holes = merge_overlapping(holes.to_vec());
 
     let mut out = Vec::with_capacity(ranges.len());
     for range in ranges {
@@ -523,15 +806,54 @@ impl VersionHorizon {
 
     /// Takes the bound once, for the whole sweep.
     pub fn sample(manager: &Arc<TransactionManager>) -> Self {
+        // Bounded by the oldest live snapshot as well as the oldest running
+        // transaction. `oldest_active` alone let a version through that an
+        // open snapshot still saw: a snapshot keeps the transactions running
+        // when it was taken invisible after they commit, and once they retire
+        // `oldest_active` moves past them. Vacuum freed such versions, and a
+        // scan's skip gate dropped them from the very snapshot that could see
+        // them — `zz_audit_io` case A and `vacuum-frees-visible-versions`.
+        //
+        // Read in this order: a snapshot registered after `oldest_active` is
+        // read had, when taken, an `xmin` at or above it, so the first read
+        // already bounds it; one registered before is in the second.
+        let running = manager.oldest_active();
+        let snapshots = manager.oldest_snapshot_xmin().unwrap_or(TxId::MAX);
         Self {
             manager: Some(manager.clone()),
-            oldest_active: manager.oldest_active(),
+            oldest_active: running.min(snapshots),
         }
     }
 
     #[inline]
     pub fn is_versioned(&self) -> bool {
         self.manager.is_some()
+    }
+
+    /// Whether `tx` has committed. `FROZEN_TX` and `NO_TX` are no
+    /// transactions to ask about.
+    #[inline]
+    pub(crate) fn committed(&self, tx: TxId) -> bool {
+        tx != FROZEN_TX
+            && tx != NO_TX
+            && self.manager.as_ref().is_some_and(|m| m.outcome(tx) == TxOutcome::Committed)
+    }
+
+    /// Whether `tx` is still running.
+    #[inline]
+    pub(crate) fn in_progress(&self, tx: TxId) -> bool {
+        tx != FROZEN_TX
+            && tx != NO_TX
+            && self.manager.as_ref().is_some_and(|m| m.outcome(tx) == TxOutcome::InProgress)
+    }
+
+    /// Whether `tx` is known to have aborted. `FROZEN_TX` and `NO_TX` are no
+    /// transactions to ask about.
+    #[inline]
+    pub(crate) fn aborted(&self, tx: TxId) -> bool {
+        tx != FROZEN_TX
+            && tx != NO_TX
+            && self.manager.as_ref().is_some_and(|m| m.outcome(tx) == TxOutcome::Aborted)
     }
 
     /// The bound this horizon was taken at. Diagnostics only.
@@ -570,8 +892,7 @@ impl VersionHorizon {
         }
 
         if xmax != NO_TX {
-            return manager.outcome(xmax) == TxOutcome::Committed
-                && xmax < self.oldest_active;
+            return manager.outcome(xmax) == TxOutcome::Committed && xmax < self.oldest_active;
         }
 
         // No `xmax`, but marked deleted: the row predates versioning, so no
@@ -622,9 +943,45 @@ pub struct ReclaimContext<'a> {
     /// against the previous bound turns "has this slot been cleared already"
     /// into one integer test, instead of a set of every slot ever cleared.
     pub cleared_below: &'a AtomicU64,
+    /// The table's secondary indexes, which must forget every version this
+    /// sweep finds reclaimable, and the fetch that reads such a version's key
+    /// columns back from its row before the space is handed out.
+    pub indexes: Option<(&'a crate::core::index::TableIndexes, &'a crate::core::row::row::RowFetch)>,
+    /// The table's compaction gate, held shared from before the sweep reads
+    /// a slot until the indexes have forgotten what it found. `VACUUM FULL`
+    /// renumbers slots and moves rows under it, and a sweep that overlapped
+    /// one would forget index entries by slot numbers and row positions that
+    /// now belong to live rows. `None` only for a table that never compacts.
+    pub compaction_gate: Option<&'a tokio::sync::RwLock<()>>,
+    /// The instance's maintenance flag, which `Table::retire` clears before
+    /// it joins this sweep. Checked between pointer chunks and through the
+    /// drain wait, so a DDL holding ACCESS EXCLUSIVE waits for one chunk, not
+    /// the rest of the sweep (as PostgreSQL's autovacuum cancels itself when
+    /// it blocks a lock request); a sweep that sees it cleared returns
+    /// `deferred` and publishes nothing. `None` where nothing retires the
+    /// storage (tests driving `run_once` directly).
+    pub alive: Option<&'a AtomicBool>,
+    /// The file set's write gate. A sweep takes a transient ticket on it
+    /// only when it has a change to make (RV2): some clear candidate still
+    /// has fingerprints, or some reclaimed slot is still held by an index.
+    /// `None` where nothing gates the storage (tests driving `run_once`
+    /// directly): the sweep then takes its ticket on a detached word.
+    pub gate: Option<&'a crate::core::index_store::file_gate::FileGate>,
+    /// Where a complete sweep leaves its live count (see
+    /// [`VacuumStats::live_rows`]), sampled against the write counters the
+    /// moment the scan ends rather than after the drain wait, which can run
+    /// for seconds while inserts the scan never saw land. `None` for tests
+    /// driving `run_once` directly.
+    pub stats: Option<&'a VacuumStats>,
 }
 
 impl ReclaimContext<'_> {
+    /// Whether the instance this sweep runs on has been retired.
+    #[inline]
+    fn retired(&self) -> bool {
+        self.alive.is_some_and(|alive| !alive.load(Ordering::Acquire))
+    }
+
     /// Whether this sweep is the one that should clear `xmax`'s fingerprints.
     #[inline]
     fn should_clear(&self, xmax: TxId, previous_bound: TxId) -> bool {
@@ -663,6 +1020,10 @@ pub struct CompactReport {
     /// Set when the provider cannot truncate: everything was still compacted
     /// into the front of the files, but the tail stays allocated.
     pub truncation_unsupported: bool,
+    /// Why the tails were kept although the provider could have truncated
+    /// them — the log could not be checkpointed. `VACUUM FULL` still succeeds
+    /// and tells its client with a WARNING (SQLSTATE 01000).
+    pub truncation_skipped: Option<&'static str>,
 }
 
 /// One live row's pointer, and where its record sits.
@@ -774,6 +1135,15 @@ pub struct VacuumReport {
     /// Filter slots whose fingerprints this sweep cleared, having just
     /// established that no snapshot can reach their version.
     pub fingerprints_cleared: u64,
+    /// Versions a deleter has stamped that the horizon still protects: their
+    /// `xmax` is at or above `oldest_active`, so some transaction may yet see
+    /// them. They are dead stamps the next sweep can reclaim once the horizon
+    /// passes them, which is what lets the service re-sweep for them without
+    /// waiting for new writes.
+    pub held_rows: u64,
+    /// The lowest `xmax` among `held_rows`, or `NO_TX` if there are none. The
+    /// horizon passing it is the earliest point a re-sweep can find any of them.
+    pub held_min_xmax: TxId,
 }
 
 impl VacuumReport {
@@ -798,9 +1168,148 @@ pub struct VacuumStats {
     pub last_live_bytes: AtomicU64,
     pub last_reclaimed_bytes: AtomicU64,
     pub total_reclaimed_bytes: AtomicU64,
+    /// `VACUUM FULL` runs that compacted but could not give the space back,
+    /// because the log could not be checkpointed.
+    pub full_untruncated: AtomicU64,
+    /// Ticks of the background service that panicked and were caught. Each
+    /// one is a scan that did not happen; a count that keeps rising means the
+    /// table's dead space is not being reclaimed at all.
+    pub panics: AtomicU64,
+    /// Makes the next this-many service ticks panic. Tests only.
+    #[cfg(test)]
+    pub inject_panics: AtomicU64,
+    /// Rows this instance's inserts wrote, one per row, counted when the row
+    /// is written. Monotonic.
+    pub inserted_rows: AtomicU64,
+    /// Rows this instance's `DELETE`s removed, one per row, counted when the
+    /// statement's tombstones are durable. An `UPDATE` moves neither counter:
+    /// its row is still one row. Monotonic.
+    pub deleted_rows: AtomicU64,
+    /// The transaction system of a versioned table, which settles
+    /// [`Self::pending`] (`attach`).
+    resolver: Resolver,
+    /// Each running transaction's inserts and deletes, `(tx, inserted,
+    /// deleted)`: counted into the two counters once it commits, dropped if
+    /// it aborts. Counted when written, a rolled-back `DELETE` took its rows
+    /// off the live count until the next sweep, and a table not written
+    /// again is not swept again: four live rows read 0 live, 4 dead, for
+    /// good (`partition_shell_sites` S8).
+    pending: Mutex<Vec<(TxId, u64, u64)>>,
+    /// What the last complete sweep counted live, and the two counters as
+    /// they stood when it did. `None` until a sweep of this instance has seen
+    /// every pointer.
+    swept: Mutex<Option<SweptLive>>,
+}
+
+/// A complete sweep's live count and the write counters at its end.
+#[derive(Debug, Clone, Copy)]
+struct SweptLive {
+    live: u64,
+    inserted: u64,
+    deleted: u64,
+}
+
+/// The manager [`VacuumStats`] settles its pending counts against.
+#[derive(Default)]
+struct Resolver(std::sync::OnceLock<std::sync::Arc<TransactionManager>>);
+
+impl std::fmt::Debug for Resolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.get().is_some() { "Resolver(attached)" } else { "Resolver(none)" })
+    }
 }
 
 impl VacuumStats {
+    /// Counts the table's writes by their transactions' outcomes from here
+    /// on: a versioned table's.
+    pub(crate) fn attach(&self, manager: std::sync::Arc<TransactionManager>) {
+        let _ = self.resolver.0.set(manager);
+    }
+
+    /// `n` rows inserted by `tx`.
+    pub(crate) fn note_inserted(&self, tx: TxId, n: u64) {
+        self.note(tx, n, 0);
+    }
+
+    /// `n` rows deleted by `tx`.
+    pub(crate) fn note_deleted(&self, tx: TxId, n: u64) {
+        self.note(tx, 0, n);
+    }
+
+    fn note(&self, tx: TxId, inserted: u64, deleted: u64) {
+        if self.resolver.0.get().is_none() || tx == NO_TX || tx == FROZEN_TX {
+            self.inserted_rows.fetch_add(inserted, Ordering::AcqRel);
+            self.deleted_rows.fetch_add(deleted, Ordering::AcqRel);
+            return;
+        }
+        let mut pending = self.pending.lock();
+        match pending.iter_mut().find(|(t, _, _)| *t == tx) {
+            Some(entry) => {
+                entry.1 += inserted;
+                entry.2 += deleted;
+            }
+            None => pending.push((tx, inserted, deleted)),
+        }
+        drop(pending);
+        self.settle();
+    }
+
+    /// Counts the pending writes of every transaction that has committed,
+    /// and drops those of every one that aborted.
+    fn settle(&self) {
+        let Some(manager) = self.resolver.0.get() else { return };
+        let mut pending = self.pending.lock();
+        if pending.is_empty() {
+            return;
+        }
+        pending.retain(|&(tx, inserted, deleted)| match manager.outcome(tx) {
+            TxOutcome::Committed => {
+                self.inserted_rows.fetch_add(inserted, Ordering::AcqRel);
+                self.deleted_rows.fetch_add(deleted, Ordering::AcqRel);
+                false
+            }
+            TxOutcome::Aborted => false,
+            TxOutcome::InProgress => true,
+        });
+    }
+
+    /// The table's live rows as last measured: the count a complete sweep
+    /// took, plus the rows inserted since and minus the rows deleted since.
+    /// `None` until a sweep of this instance has run: what writes alone
+    /// maintain cannot tell a deleted row from a live one after a restart, so
+    /// it is not offered as a measurement.
+    ///
+    /// The sweep counts a version live when no deleter has stamped it, or its
+    /// deleter is one the horizon has not passed but which has not committed
+    /// either. A committed delete still protected by an older snapshot is
+    /// dead here, as PostgreSQL's `n_dead_tup` counts it: an update-heavy
+    /// table's old versions are the slots this exists to show.
+    ///
+    /// Still an estimate between sweeps, in both directions and by at most the
+    /// writes in flight when it was taken, plus any delete or insert that
+    /// rolled back since (counted when written, not when committed). The next
+    /// sweep replaces it. Callers clamp it to the slot count.
+    pub fn live_rows(&self) -> Option<u64> {
+        self.settle();
+        let swept = (*self.swept.lock())?;
+        let inserted = self.inserted_rows.load(Ordering::Acquire).wrapping_sub(swept.inserted);
+        let deleted = self.deleted_rows.load(Ordering::Acquire).wrapping_sub(swept.deleted);
+        Some(swept.live.saturating_add(inserted).saturating_sub(deleted))
+    }
+
+    /// The two write counters as they stand now, for [`Self::record_live`].
+    fn counters(&self) -> (u64, u64) {
+        self.settle();
+        (self.inserted_rows.load(Ordering::Acquire), self.deleted_rows.load(Ordering::Acquire))
+    }
+
+    /// Stores a complete sweep's live count against `counters`, which were
+    /// read before the last of the pointers it counts: see
+    /// [`count_tail_live`].
+    fn record_live(&self, live: u64, (inserted, deleted): (u64, u64)) {
+        *self.swept.lock() = Some(SweptLive { live, inserted, deleted });
+    }
+
     fn record(&self, report: &VacuumReport) {
         self.runs.fetch_add(1, Ordering::Relaxed);
         self.last_dead_bytes
@@ -846,12 +1355,18 @@ struct ScanResult {
     slots: u64,
     live_rows: u64,
     dead_rows: u64,
+    held_rows: u64,
+    /// Kept versions left out of the live count ([`uncounted`]).
+    uncounted_rows: u64,
+    held_min_xmax: TxId,
     live_bytes: u64,
     live: Vec<Extent>,
     /// Extents of tombstoned rows. Always collected: they are the starting
     /// point for the capped path.
     dead: Vec<Extent>,
-    fingerprints_cleared: u64,
+    /// Slots whose fingerprints this sweep may clear, as `(first, count)`
+    /// runs. Collected, not cleared: see [`apply_filter_clears`].
+    clear_runs: Vec<(u64, u64)>,
     /// Set when the live map was abandoned for `max_tracked_live_extents`, so
     /// dead space is derived from tombstones rather than from the gaps between
     /// live rows — which does not recover the slack an in-place shrinking
@@ -860,6 +1375,12 @@ struct ScanResult {
     /// Highest end offset seen across every pointer, live or dead. Anything
     /// past it belongs to the append frontier and is not ours to hand out.
     frontier: u64,
+    /// Reclaimable versions a secondary index still holds: their keys are
+    /// read back and forgotten before this run publishes anything.
+    index_dead: Vec<(u64, crate::core::row::row_pointer::RowPointer)>,
+    /// The instance was retired mid-scan, which stopped there: nothing it
+    /// found may be acted on.
+    retired: bool,
 }
 
 /// Walks every pointer record of `io`, tombstones included, calling `visit` on
@@ -872,11 +1393,28 @@ struct ScanResult {
 /// into a just-allocated extent could be missed.
 async fn sweep_pointers<S: StorageIO, F: FnMut(&RowPointer)>(
     io: &S,
-    mut visit: F,
+    visit: F,
 ) -> std::io::Result<()> {
-    const RECORD: usize = ROW_POINTER_RECORD_LEN;
+    sweep_pointers_until(io, SCAN_RECORDS_PER_CHUNK, &|| false, None, visit)
+        .await
+        .map(|_| ())
+}
 
-    let mut buffer = vec![0u8; RECORD * SCAN_RECORDS_PER_CHUNK];
+/// [`sweep_pointers`], `records_per_chunk` at a time, asking `stop` after
+/// each chunk: `Ok(true)` when it stopped there, with the rest unread.
+/// `park_key` names the sweep to the test park points; unused otherwise.
+async fn sweep_pointers_until<S: StorageIO, F: FnMut(&RowPointer)>(
+    io: &S,
+    records_per_chunk: usize,
+    stop: &(dyn Fn() -> bool + Sync),
+    park_key: Option<&FreeSpace>,
+    mut visit: F,
+) -> std::io::Result<bool> {
+    const RECORD: usize = ROW_POINTER_RECORD_LEN;
+    #[cfg(not(test))]
+    let _ = park_key;
+
+    let mut buffer = vec![0u8; RECORD * records_per_chunk.max(1)];
     let mut scanned_to: u64 = 0;
     let mut caught_up = false;
 
@@ -896,7 +1434,7 @@ async fn sweep_pointers<S: StorageIO, F: FnMut(&RowPointer)>(
                 Ok(()) => {}
                 // A concurrent append can leave the length ahead of the bytes
                 // for an instant. Whatever is missing is past our frontier.
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
                 Err(e) => return Err(e),
             }
 
@@ -905,6 +1443,14 @@ async fn sweep_pointers<S: StorageIO, F: FnMut(&RowPointer)>(
             }
 
             scanned_to += want as u64;
+
+            #[cfg(test)]
+            if let Some(free_space) = park_key {
+                run_once_test_hooks::reached(free_space, run_once_test_hooks::IN_SCAN).await;
+            }
+            if stop() {
+                return Ok(true);
+            }
         }
     }
 
@@ -916,10 +1462,97 @@ async fn sweep_pointers<S: StorageIO, F: FnMut(&RowPointer)>(
         );
     }
 
-    Ok(())
+    Ok(false)
+}
+
+/// Takes reclaimed versions out of the secondary indexes, keyed by what their
+/// rows hold. A row that cannot be read is forgotten without its key, which
+/// leaves at most a stale entry: a candidate the scan will find invisible.
+async fn forget_reclaimed<S: StorageIO>(
+    ticket: &gate::WriteTicket,
+    indexes: &crate::core::index::TableIndexes,
+    fetch: &crate::core::row::row::RowFetch,
+    io_rows: &S,
+    dead: &[(u64, crate::core::row::row_pointer::RowPointer)],
+) {
+    let mut row = crate::core::row::row::Row::default();
+    for (slot, pointer) in dead {
+        if pointer.fetch_row_reuse_async(io_rows, fetch, &mut row).await.is_ok() {
+            let get = |wo: u32| {
+                row.columns
+                    .iter()
+                    .find(|c| c.schema_id as u32 == wo)
+                    .map(|c| c.data.into_slice())
+            };
+            indexes.forget(Proof::from(ticket), *slot, Some(&get));
+        } else {
+            indexes.forget(Proof::from(ticket), *slot, None);
+        }
+    }
 }
 
 /// Reads every pointer record and reports the live and dead extents.
+/// Whether the sweep counts a version it keeps as held: stamped by a deleter
+/// the horizon has not passed, in flight or committed while an older
+/// transaction runs. A deleter that aborted deleted nothing, wherever it is:
+/// the row is live and is not counted. Counted held above the horizon, every
+/// row a rolled-back `UPDATE` or `DELETE` had stamped read as dead to a sweep
+/// right after it, and a table not written again was never swept again, so
+/// `pg_stat_user_tables` said 0 live and 4 dead for four live rows for good
+/// (`partition_shell_sites` S8, the twin side).
+fn is_held(horizon: &VersionHorizon, pointer: &RowPointer) -> bool {
+    horizon.is_versioned()
+        && pointer.xmax != NO_TX
+        && pointer.xmax >= horizon.oldest_active()
+        && !horizon.aborted(pointer.xmax)
+}
+
+/// Whether a version the sweep keeps is left out of its live count: deleted
+/// by a transaction that committed (held for an older snapshot), or written
+/// by one still running. The live count is committed rows: a running
+/// transaction's insert is counted when it commits, and a row it deletes
+/// stays live until then (`VacuumStats::pending`). An in-flight delete
+/// counted held, and a rollback never gave the row back.
+fn uncounted(horizon: &VersionHorizon, pointer: &RowPointer) -> bool {
+    if !horizon.is_versioned() {
+        return false;
+    }
+    let deleted = pointer.xmax != NO_TX && horizon.committed(pointer.xmax);
+    let unborn = horizon.in_progress(pointer.xmin);
+    deleted || unborn
+}
+
+/// The live rows, less the held ones, among the pointers past the first
+/// `from` slots: those appended after the sweep last read the file's length,
+/// classified as the sweep classifies. Up to the length as it is now; a
+/// record still being written is past it, and so is its insert's count.
+async fn count_tail_live<S: StorageIO>(io_pointers: &S, from: u64, horizon: &VersionHorizon) -> std::io::Result<u64> {
+    const RECORD: usize = ROW_POINTER_RECORD_LEN;
+    let len = io_pointers.get_len().await;
+    let end = (len - len % RECORD as u64) / RECORD as u64;
+    let mut live = 0u64;
+    let mut at = from;
+    let mut buffer = vec![0u8; RECORD * 256];
+    while at < end {
+        let n = ((end - at) as usize).min(256);
+        let chunk = &mut buffer[..n * RECORD];
+        let mut position = at * RECORD as u64;
+        match io_pointers.read_data_into_buffer(&mut position, chunk).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+        for record in chunk.chunks_exact(RECORD) {
+            let pointer = RowPointer::from_slice_unknown(record);
+            if !horizon.is_reclaimable(pointer.deleted, pointer.xmin, pointer.xmax) && !uncounted(horizon, &pointer) {
+                live += 1;
+            }
+        }
+        at += n as u64;
+    }
+    Ok(live)
+}
+
 async fn scan_pointers<S: StorageIO>(
     io_pointers: &S,
     free_space: &FreeSpace,
@@ -933,15 +1566,25 @@ async fn scan_pointers<S: StorageIO>(
         slots: 0,
         live_rows: 0,
         dead_rows: 0,
+        held_rows: 0,
+        uncounted_rows: 0,
+        held_min_xmax: NO_TX,
         live_bytes: 0,
         live: Vec::new(),
         dead: Vec::new(),
         live_map_dropped: false,
-        fingerprints_cleared: 0,
+        clear_runs: Vec::new(),
         frontier: 0,
+        index_dead: Vec::new(),
+        retired: false,
     };
 
-    sweep_pointers(io_pointers, |pointer| {
+    #[cfg(test)]
+    let records_per_chunk = run_once_test_hooks::chunk_records(free_space);
+    #[cfg(not(test))]
+    let records_per_chunk = SCAN_RECORDS_PER_CHUNK;
+    let retired = || ctx.retired();
+    result.retired = sweep_pointers_until(io_pointers, records_per_chunk, &retired, Some(free_space), |pointer| {
         let slot = result.slots;
         result.slots += 1;
 
@@ -958,13 +1601,22 @@ async fn scan_pointers<S: StorageIO>(
         // that was written into a reclaimed extent and then deleted before the
         // next sweep — the loan outlived the row and shielded those bytes from
         // every scan thereafter. Under delete-and-refill churn that is the whole
-        // working set, once per cycle.
-        free_space.retire_loan(pointer.position);
+        // working set, once per cycle. Only a record appended since the loan
+        // was taken, though: an older one at the same start is the version
+        // whose extent was reclaimed (`Loan::floor`).
+        free_space.retire_loan(pointer.position, slot as u64);
 
         if horizon.is_reclaimable(pointer.deleted, pointer.xmin, pointer.xmax) {
             result.dead_rows += 1;
+            // Whatever retired it (a delete, an update's old version, an
+            // aborted insert), an index that still holds it has to let go,
+            // or it keeps the entry for good. Checked by the index's own
+            // slot bit, so each one is forgotten once.
+            if ctx.indexes.is_some_and(|(ix, _)| ix.holds(slot)) {
+                result.index_dead.push((slot, pointer.clone()));
+            }
             if let Some(extent) = extent {
-                result.dead.push(extent);
+                push_dead(&mut result.dead, extent);
             }
 
             // The filter keeps a dead version's fingerprints until nothing can
@@ -974,16 +1626,26 @@ async fn scan_pointers<S: StorageIO>(
             // Establishing that nothing can reach it is exactly what this sweep
             // just did, so clearing them is now its job.
             //
+            // Collected here and cleared only after the scan, once the outcomes
+            // this decision read from memory are durable: see
+            // `apply_filter_clears`. Clearing here let a checkpoint persist the
+            // clear while the deleter's outcome could still be lost.
+            //
             // Safe even if this run is later deferred: deferral is about handing
             // out bytes, and this says only that no snapshot sees the version.
-            if let Some(filters) = ctx
-                .filters
-                .filter(|_| ctx.should_clear(pointer.xmax, previous_bound))
-            {
-                filters.on_delete(slot);
-                result.fingerprints_cleared += 1;
+            if ctx.should_clear(pointer.xmax, previous_bound) {
+                push_run(&mut result.clear_runs, slot);
             }
         } else {
+            if is_held(horizon, pointer) {
+                result.held_rows += 1;
+                if result.held_min_xmax == NO_TX || pointer.xmax < result.held_min_xmax {
+                    result.held_min_xmax = pointer.xmax;
+                }
+            }
+            if uncounted(horizon, pointer) {
+                result.uncounted_rows += 1;
+            }
             result.live_rows += 1;
             result.live_bytes += pointer.length as u64;
             if !result.live_map_dropped {
@@ -1000,6 +1662,213 @@ async fn scan_pointers<S: StorageIO>(
     .await?;
 
     Ok(result)
+}
+
+/// Appends `slot` to a list of `(first, count)` runs, extending the last run
+/// when it is adjacent. Slots arrive in increasing order, so a bulk delete is
+/// one entry.
+fn push_run(runs: &mut Vec<(u64, u64)>, slot: u64) {
+    if let Some(last) = runs.last_mut() {
+        if last.0 + last.1 == slot {
+            last.1 += 1;
+            return;
+        }
+    }
+    runs.push((slot, 1));
+}
+
+/// Makes durable everything a sweep's reclaimability decisions read from
+/// memory: the deleters' stamps, in the table directory's log, and their
+/// outcomes, in the status log's (the root's, for a table on another storage
+/// location).
+///
+/// Syncing the outcome log makes every outcome staged in it durable, not only
+/// the deleters', including an asynchronous commit that also wrote rows on a
+/// location this sweep never looked at. So every log that is not some
+/// database's outcome log is synced first, and then only this database's
+/// outcome log, by `flush_all`, the order `Database::sync_durable` and the
+/// log writer use. No other database's outcome log is synced here: from the
+/// process-wide list this cannot tell which directories belong to that
+/// database, so it could not order that one after them.
+///
+/// That ordering covers outcomes staged before the barrier began. A commit
+/// that appends rows to a directory after the loop has synced it, and stages
+/// its outcome before `flush_all` runs, still reaches the disk outcome first;
+/// the log writer and `Database::sync_durable` share that race, and closing
+/// it is a commit-side change (an outcome naming the log positions it
+/// depends on), not something a barrier can do.
+///
+/// A failure to sync the swept table's own log fails the barrier, and the
+/// caller acts on nothing: that log holds the stamps the decisions rest on.
+/// Another log's failure is logged and the barrier goes on. It cannot order
+/// anything that is not already lost: a failed `fdatasync` poisons that log,
+/// and the log writer syncs every outcome log on its next round whatever
+/// failed before it, as `Database::sync_durable` does after reporting the
+/// error. Stopping here would only stop reclamation on every table of every
+/// database while one directory anywhere is broken. A directory removed
+/// since its log was registered (`NotFound`) is skipped quietly.
+///
+/// One `fdatasync` per log that owes one, and nothing when none does.
+/// Taken once per sweep that found anything reclaimable, before any of it is
+/// acted on (see `run_once`), and by `Table::compact` before it decides what
+/// is dead.
+///
+/// Run under `block_in_place` on a multi-threaded runtime, so a slow disk
+/// (hundreds of ms per sync on ext4) hands this worker's other tasks to
+/// another thread instead of stalling them. Not `spawn_blocking`: the syncs
+/// stay on the calling thread, which is how the power-loss tests tell the
+/// sweep's syncs from the background log writer's.
+pub(crate) fn outcome_barrier<S: StorageIO>(io_pointers: &S, horizon: &VersionHorizon) -> std::io::Result<()> {
+    let wal = io_pointers
+        .get_location()
+        .and_then(|location| crate::core::wal::wal_for(&location));
+    let manager = horizon.manager.as_ref();
+    if wal.is_none() && manager.is_none() {
+        return Ok(());
+    }
+    let sync_one = |log: &crate::core::wal::Wal| -> std::io::Result<()> {
+        #[cfg(test)]
+        if barrier_test_hooks::fails(log) {
+            return Err(std::io::Error::other("injected failure to sync a log in the vacuum barrier"));
+        }
+        log.sync_pending()
+    };
+    let sync = || {
+        let Some(manager) = manager else {
+            // No outcomes to order against: the stamps are the whole story.
+            if let Some(wal) = wal.as_ref() {
+                sync_one(&**wal)?;
+            }
+            return Ok(());
+        };
+        // Ours by identity, every database's by the directory it registered
+        // with the log writer under; either way synced last or not at all.
+        let own_outcomes = manager.status().wal();
+        let outcome_dirs = crate::core::log_writer::outcome_dirs();
+        for (dir, log) in crate::core::wal::registered() {
+            if own_outcomes.as_ref().is_some_and(|w| Arc::ptr_eq(w, &log)) || outcome_dirs.contains(&dir) {
+                continue;
+            }
+            if let Err(e) = sync_one(&*log) {
+                if wal.as_ref().is_some_and(|w| Arc::ptr_eq(w, &log)) {
+                    return Err(e);
+                }
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    log::debug!(
+                        "Vacuum barrier: the log at {} is gone ({}); skipped",
+                        log.path().display(),
+                        e
+                    );
+                } else {
+                    log::error!(
+                        "Vacuum barrier: could not sync the log at {} ({}); \
+                         the outcomes are made durable without it",
+                        log.path().display(),
+                        e
+                    );
+                }
+            }
+        }
+        manager.flush_all()
+    };
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(sync),
+        _ => sync(),
+    }
+}
+
+/// Fails chosen syncs inside [`outcome_barrier`], on the calling thread.
+#[cfg(test)]
+pub(crate) mod barrier_test_hooks {
+    thread_local! {
+        /// The directory whose log the barrier fails to sync.
+        pub(crate) static FAIL_SYNC_IN: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn fails(log: &crate::core::wal::Wal) -> bool {
+        FAIL_SYNC_IN.with(|f| {
+            f.borrow()
+                .as_deref()
+                .is_some_and(|dir| log.path().parent() == Some(dir))
+        })
+    }
+}
+
+/// Clears the fingerprints a sweep found reclaimable, and returns how many,
+/// or `None` when none may be counted as cleared, so `cleared_below` must
+/// stay where it was and the next sweep finds them again.
+///
+/// Called only once [`outcome_barrier`] has succeeded. The decision that a
+/// version is reclaimable reads its deleter's outcome from memory, and a
+/// commit's outcome can still be in the page cache then (an asynchronous
+/// commit, or the window before its sync). A cleared slot reaches the
+/// filter's checkpoint, and for a table whose directory has its own log that
+/// checkpoint can be durable while the outcome is not. A power cut then
+/// undoes the delete, the row is visible again, and the trusted sidecar
+/// prunes it from every filtered query for good.
+///
+/// Nor when the slots were renumbered (`VACUUM FULL`) since the sweep began:
+/// its slot numbers then name other rows. `epoch` is the filter's
+/// renumbering epoch read before the sweep.
+fn apply_filter_clears(
+    ctx: &ReclaimContext<'_>,
+    ticket: Option<&gate::WriteTicket>,
+    epoch: Option<u64>,
+    runs: &[(u64, u64)],
+) -> Option<u64> {
+    let n: u64 = runs.iter().map(|r| r.1).sum();
+    match (ctx.filters, epoch, ticket) {
+        (Some(filters), Some(epoch), Some(ticket)) if n > 0 => filters
+            .on_delete_runs_at(Proof::from(ticket), epoch, runs)
+            .then_some(n),
+        // Nothing to clear: every candidate's fingerprints are already empty
+        // (the sweep took no ticket for them), so each counts as cleared and
+        // the bound may advance past them.
+        _ => Some(0),
+    }
+}
+
+/// Whether a sweep has anything to change in memory (RV2): a clear candidate
+/// whose fingerprints are not all empty yet, or a reclaimed slot an index
+/// still holds. A pass with neither takes no ticket and changes nothing.
+fn sweep_has_changes(ctx: &ReclaimContext<'_>, scan: &ScanResult) -> bool {
+    let clears = ctx
+        .filters
+        .is_some_and(|f| !scan.clear_runs.is_empty() && f.any_codes_in_runs(&scan.clear_runs));
+    let forgets = ctx
+        .indexes
+        .is_some_and(|(ix, _)| scan.index_dead.iter().any(|(slot, _)| ix.holds(*slot)));
+    clears || forgets
+}
+
+/// Appends a reclaimable extent to the sweep's dead list, coalescing as it
+/// goes.
+///
+/// The list used to take 16 bytes per reclaimable slot per run, unbounded — a
+/// table with ten million dead versions held a 160 MB vector for every sweep.
+/// Pointers are visited in slot order and rows are appended in roughly that
+/// order, so a bulk delete arrives as a run of adjacent extents and folds into
+/// one entry here. Extents that arrive out of order are coalesced by a full
+/// sort-and-merge whenever the list doubles past its last merged size, which
+/// bounds it by the number of *distinct* holes rather than dead rows.
+///
+/// The result is the same set of bytes `merge_overlapping` would produce from
+/// the unmerged list; `run_once` still merges it before use.
+fn push_dead(dead: &mut Vec<Extent>, extent: Extent) {
+    if let Some(last) = dead.last_mut() {
+        if extent.start >= last.start && extent.start <= last.end() {
+            let end = last.end().max(extent.end());
+            last.len = end - last.start;
+            return;
+        }
+    }
+    dead.push(extent);
+    const MERGE_FLOOR: usize = 1 << 16;
+    if dead.len() >= MERGE_FLOOR && dead.len().is_power_of_two() {
+        let merged = merge_overlapping(std::mem::take(dead));
+        *dead = merged;
+    }
 }
 
 /// Second pass for the capped path: the live extents that overlap `dead`.
@@ -1136,6 +2005,32 @@ pub struct VacuumConfig {
     /// dead space from tombstones instead. Exposed so the capped path can be
     /// exercised without building a table large enough to trip it naturally.
     pub max_tracked_live_extents: usize,
+    /// When the background service sweeps at all: once the dead stamps written
+    /// since its last sweep reach `min(base + ratio × slots, max)` — the shape
+    /// of PostgreSQL's `autovacuum_vacuum_threshold`, `…_scale_factor` and
+    /// (PG 18) `…_max_threshold`.
+    ///
+    /// The `min_dead_*` thresholds above gate only *publishing*, after a sweep
+    /// has already read every pointer record. Before this, any `DELETE` or
+    /// `UPDATE` at all made the next tick re-read the whole pointer file — a
+    /// ten-million-row table taking one update a minute re-read 370 MB every
+    /// 30 s to find one dead row.
+    ///
+    /// The ratio is lower than PostgreSQL's 0.2 because a sweep here reads 37
+    /// bytes per slot rather than a heap page per tuple, and because publishing
+    /// still waits for `min_dead_ratio`/`min_dead_bytes`: sweeping at 5 % costs
+    /// little and catches the 8 MiB case on large tables.
+    pub sweep_threshold_base: u64,
+    pub sweep_threshold_ratio: f64,
+    pub sweep_threshold_max: u64,
+}
+
+impl VacuumConfig {
+    /// Dead stamps that make a table of `slots` pointer records due.
+    pub fn sweep_threshold(&self, slots: u64) -> u64 {
+        let scaled = self.sweep_threshold_base as f64 + self.sweep_threshold_ratio * slots as f64;
+        (scaled as u64).min(self.sweep_threshold_max).max(1)
+    }
 }
 
 impl Default for VacuumConfig {
@@ -1146,6 +2041,9 @@ impl Default for VacuumConfig {
             min_dead_ratio: crate::vacuum_min_dead_ratio(),
             drain_timeout: std::time::Duration::from_secs(crate::vacuum_drain_timeout_secs()),
             max_tracked_live_extents: MAX_TRACKED_LIVE_EXTENTS,
+            sweep_threshold_base: 50,
+            sweep_threshold_ratio: 0.05,
+            sweep_threshold_max: 100_000,
         }
     }
 }
@@ -1167,10 +2065,29 @@ pub async fn run_once<S: StorageIO>(
     force: bool,
 ) -> std::io::Result<VacuumReport> {
     let horizon = ctx.horizon;
+    // Held until the indexes have forgotten what the sweep found: see
+    // `ReclaimContext::compaction_gate`. Released before the drain wait, so a
+    // compaction does not queue behind a slow query and stall every new one;
+    // what is published after that is fenced by `layout` instead.
+    let mut gate = match ctx.compaction_gate {
+        Some(gate) => Some(gate.read().await),
+        None => None,
+    };
+    // Under the gate: a compaction that ran before this has finished.
+    let layout = free_space.layout();
+    // Before the length is read: a row appended from here on whose pointer
+    // this sweep misses stays shielded until the sweep ends (`Appends`).
+    let _sweep = free_space.begin_sweep();
     // Read before the pointer sweep. A row appended during the scan lands past
     // this, so clamping to it can only ever exclude bytes, never include ones a
-    // pointer has since claimed.
+    // pointer has since claimed. One appended before it whose pointer the scan
+    // missed is not past it: `Appends` shields that one.
     let rows_len = io_rows.get_len().await;
+    // Before the sweep reads a slot: clears are applied only if no
+    // renumbering began or ended since.
+    let clear_epoch = ctx.filters.map(|f| f.renumber_epoch());
+    // And forgets only if the indexes were not renumbered either.
+    let forget_epoch = ctx.indexes.map(|(ix, _)| ix.epoch());
     let scan = scan_pointers(
         io_pointers,
         free_space,
@@ -1179,11 +2096,104 @@ pub async fn run_once<S: StorageIO>(
         ctx,
     )
     .await?;
+    #[cfg(test)]
+    run_once_test_hooks::reached(free_space, run_once_test_hooks::AFTER_SCAN).await;
+    // Retired mid-scan (or since): the scan is partial, or its instance is
+    // going, so nothing is cleared, forgotten or published, and the report
+    // says deferred (the sweep has not seen everything).
+    if scan.retired || ctx.retired() {
+        return Ok(retired_report(&scan));
+    }
+    // The scan saw every pointer, so its count stands, deferred or not:
+    // deferral is about handing out bytes.
+    //
+    // The counters are read first, and then whatever the pointer file holds
+    // past the scan is counted too. An insert counts itself only once its
+    // pointer is written, so every insert the counters hold is in the scan or
+    // in that tail. Counting the scan alone against counters read after it
+    // lost every row appended once the scan had read the file's length: a
+    // table's first sweep runs as soon as it opens, so it raced the rows its
+    // creator inserted next, and a table only ever inserted into is never
+    // swept again, so it reported those rows dead for good.
+    if let Some(stats) = ctx.stats {
+        let counters = stats.counters();
+        match count_tail_live(io_pointers, scan.slots, horizon).await {
+            Ok(tail) => stats.record_live(scan.live_rows.saturating_sub(scan.uncounted_rows) + tail, counters),
+            Err(e) => log::warn!("vacuum: counting the pointers appended during the sweep: {e}; live rows not measured"),
+        }
+    }
 
-    // Only after the sweep has finished, so a crash part-way leaves the bound
-    // where it was and the next run re-clears rather than skipping.
-    ctx.cleared_below
-        .fetch_max(horizon.oldest_active(), Ordering::AcqRel);
+    // Everything below acts on the sweep's decisions as final: fingerprints
+    // cleared (and then checkpointed), extents handed to writers. Those
+    // decisions read outcomes from memory, so the outcomes are made durable
+    // first. Otherwise a power cut can undo a delete whose slot the filter's
+    // sidecar already prunes, or whose bytes a writer given the extent has
+    // already overwritten. When that fails, nothing is cleared or published,
+    // and the next sweep finds it all again.
+    let durable = scan.dead_rows == 0
+        || match outcome_barrier(io_pointers, horizon) {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!(
+                    "Vacuum: the outcomes behind {} reclaimable versions could not be made \
+                     durable ({}); nothing is cleared or reclaimed this run",
+                    scan.dead_rows,
+                    e
+                );
+                false
+            }
+        };
+    // A transient ticket, only when there is a change to make (RV2): a
+    // reopen restarts the bound at 0 and its first tick sweeps every
+    // tombstone, whose fingerprints the open's backfill left empty, so a
+    // ticket taken regardless would make every churned table `DIRTY` with no
+    // write at all. Taken before the compaction gate (§2 lock order), so the
+    // gate is let go and taken again; a compaction that ran in between moved
+    // the epochs, and then nothing the scan found is applied.
+    let mut ticket = None;
+    let mut renumbered = false;
+    if durable && sweep_has_changes(ctx, &scan) {
+        let detached;
+        let file_gate = match ctx.gate {
+            Some(g) => g,
+            None => {
+                detached = crate::core::index_store::file_gate::FileGate::detached();
+                &*detached
+            }
+        };
+        let had_gate = gate.take().is_some();
+        ticket = Some(gate::ticket(file_gate, None).await?);
+        if had_gate {
+            gate = match ctx.compaction_gate {
+                Some(g) => Some(g.read().await),
+                None => None,
+            };
+        }
+        renumbered = ctx.filters.map(|f| f.renumber_epoch()) != clear_epoch
+            || ctx.indexes.map(|(ix, _)| ix.epoch()) != forget_epoch;
+    }
+    let fingerprints_cleared = if durable && !renumbered {
+        apply_filter_clears(ctx, ticket.as_ref(), clear_epoch, &scan.clear_runs)
+    } else {
+        None
+    };
+    // Only after the sweep has finished and its clears are applied, so a crash
+    // part-way, a failed barrier or a renumbering leaves the bound where it was
+    // and the next run re-clears rather than skipping.
+    if fingerprints_cleared.is_some() {
+        ctx.cleared_below
+            .fetch_max(horizon.oldest_active(), Ordering::AcqRel);
+    }
+
+    // Before anything below can publish an extent: these versions' bytes are
+    // still theirs, so their keys read back true. Once published, the space
+    // could hold another row's bytes.
+    if let (Some((indexes, fetch)), Some(ticket)) = (ctx.indexes, ticket.as_ref())
+        && !renumbered
+    {
+        forget_reclaimed(ticket, indexes, fetch, io_rows, &scan.index_dead).await;
+    }
+    drop(gate);
     let live_bytes = scan.live_bytes;
 
     let candidates = if scan.live_map_dropped {
@@ -1197,12 +2207,10 @@ pub async fn run_once<S: StorageIO>(
         info!(
             "Vacuum: {} live rows exceeds the tracking limit of {}; deriving dead space from \
              tombstones, so slack from in-place updates is left in place",
-            scan.live_rows,
-            config.max_tracked_live_extents
+            scan.live_rows, config.max_tracked_live_extents
         );
         let dead = merge_overlapping(scan.dead);
-        let conflicts =
-            live_extents_overlapping(io_pointers, &dead, rows_len, horizon).await?;
+        let conflicts = live_extents_overlapping(io_pointers, &dead, rows_len, horizon).await?;
         if !conflicts.is_empty() {
             log::debug!(
                 "Vacuum: {} tombstoned extents have since been reused; withholding them",
@@ -1224,13 +2232,46 @@ pub async fn run_once<S: StorageIO>(
         reclaimed_bytes: 0,
         extents: candidates.len() as u64,
         deferred: false,
-        fingerprints_cleared: scan.fingerprints_cleared,
+        fingerprints_cleared: fingerprints_cleared.unwrap_or(0),
+        held_rows: scan.held_rows,
+        held_min_xmax: scan.held_min_xmax,
     };
+
+    // See `outcome_barrier` above: nothing this run found is handed out.
+    // Reported as deferred, so the service sweeps again.
+    if !durable {
+        report.deferred = true;
+        return Ok(report);
+    }
 
     if !force {
         let ratio = report.dead_ratio();
         if dead_bytes < config.min_dead_bytes && ratio < config.min_dead_ratio {
             return Ok(report);
+        }
+    }
+
+    #[cfg(test)]
+    run_once_test_hooks::reached(free_space, run_once_test_hooks::BEFORE_PUBLISH).await;
+
+    // Every append that began before now has recorded its range, so what
+    // follows can leave out each one whose pointer the scan may have missed
+    // (`Appends`). An append is a write and a length update, so this is short;
+    // one that began after now lands past `rows_len`.
+    let appended = free_space.append_barrier();
+    let mut waits = 0u32;
+    while !free_space.appends_landed_before(appended) {
+        if ctx.retired() {
+            report.deferred = true;
+            return Ok(report);
+        }
+        // A yield is enough for an append between two instructions; one held
+        // up by a slow device is waited on without spinning.
+        waits += 1;
+        if waits < 64 {
+            tokio::task::yield_now().await;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
 
@@ -1241,6 +2282,12 @@ pub async fn run_once<S: StorageIO>(
     let deadline = std::time::Instant::now() + config.drain_timeout;
     let mut drained = true;
     while !readers.drained_past(barrier) {
+        // Checked as often as the deadline: a DDL retiring this instance
+        // waits for this sweep, so it stops publishing nothing.
+        if ctx.retired() {
+            report.deferred = true;
+            return Ok(report);
+        }
         if std::time::Instant::now() >= deadline {
             drained = false;
             break;
@@ -1266,7 +2313,7 @@ pub async fn run_once<S: StorageIO>(
                 barrier,
                 dead_bytes
             );
-            free_space.quarantine(candidates, barrier);
+            free_space.quarantine_at(candidates, barrier, layout);
             return Ok(report);
         }
 
@@ -1276,21 +2323,155 @@ pub async fn run_once<S: StorageIO>(
             ready.len(),
             barrier
         );
-        free_space.publish(ready);
-        free_space.quarantine(candidates, barrier);
+        free_space.publish_at(ready, layout);
+        free_space.quarantine_at(candidates, barrier, layout);
         report.reclaimed_bytes = free_space.free_bytes();
         report.extents = free_space.len() as u64;
         return Ok(report);
     }
 
-    // Anything a previous run had to hold back is safe now too: this run's
-    // barrier is at least as recent as theirs.
-    let mut candidates = candidates;
-    candidates.extend(free_space.take_matured(readers));
-    free_space.publish(candidates);
+    // A batch an earlier run had to hold back is superseded, not added:
+    // nothing could write into it (`FreeSpace::quarantine_at`), so whatever of
+    // it is still free this sweep found again, and its barrier is older than
+    // this run's. Added to this run's findings, it overlapped them, and two
+    // list entries over the same bytes are two rows written over each other.
+    let _superseded = free_space.take_matured(readers);
+    free_space.publish_at(candidates, layout);
     report.reclaimed_bytes = free_space.free_bytes();
     report.extents = free_space.len() as u64;
     Ok(report)
+}
+
+/// The report of a sweep stopped by its instance's retirement: what it
+/// counted, deferred, nothing reclaimed.
+fn retired_report(scan: &ScanResult) -> VacuumReport {
+    VacuumReport {
+        slots: scan.slots,
+        live_rows: scan.live_rows,
+        dead_rows: scan.dead_rows,
+        live_bytes: scan.live_bytes,
+        dead_bytes: 0,
+        reclaimed_bytes: 0,
+        extents: 0,
+        deferred: true,
+        fingerprints_cleared: 0,
+        held_rows: scan.held_rows,
+        held_min_xmax: scan.held_min_xmax,
+    }
+}
+
+/// Parks one `run_once` of a chosen table (named by its `FreeSpace`) at a
+/// chosen point, for tests that need something to happen there.
+#[cfg(test)]
+pub(crate) mod run_once_test_hooks {
+    use std::sync::Arc;
+
+    /// Once the pointer sweep has finished, before anything acts on it.
+    pub(crate) const AFTER_SCAN: u8 = 1;
+    /// Before the drain wait and the publish.
+    pub(crate) const BEFORE_PUBLISH: u8 = 2;
+    /// After each chunk of the pointer sweep (parks once, after the first).
+    pub(crate) const IN_SCAN: u8 = 3;
+
+    // One entry per table, keyed by its free-space map's address. Each was a
+    // single slot: tests running at once overwrote each other's, so a sweep
+    // waited at no park, or read whole-size chunks, and the test that armed
+    // it timed out ("the sweep never reached its first chunk", "never
+    // reached its park point"). A table's tests hold it for as long as its
+    // entries matter, so its address is not reused meanwhile.
+    static CHUNK: parking_lot::Mutex<Vec<(usize, usize)>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Sweeps of `free_space`'s table read `records` pointer records a chunk,
+    /// so a test can stop one between chunks without writing thousands of
+    /// rows.
+    pub(crate) fn set_chunk_records(free_space: &super::FreeSpace, records: usize) {
+        let at = free_space as *const _ as usize;
+        let mut chunks = CHUNK.lock();
+        chunks.retain(|(a, _)| *a != at);
+        chunks.push((at, records));
+    }
+
+    pub(super) fn chunk_records(free_space: &super::FreeSpace) -> usize {
+        let at = free_space as *const _ as usize;
+        CHUNK
+            .lock()
+            .iter()
+            .find(|(a, _)| *a == at)
+            .map_or(super::SCAN_RECORDS_PER_CHUNK, |(_, records)| *records)
+    }
+
+    #[derive(Default)]
+    pub(crate) struct Park {
+        /// Notified once a run is parked.
+        pub parked: tokio::sync::Notify,
+        /// Notify to let it continue.
+        pub release: tokio::sync::Notify,
+    }
+
+    static PARK: parking_lot::Mutex<Vec<(usize, u8, Arc<Park>)>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Parks the next run of `free_space`'s table at `point`, once. Arming a
+    /// table again replaces its own park, not another table's.
+    pub(crate) fn arm(free_space: &super::FreeSpace, point: u8) -> Arc<Park> {
+        let at = free_space as *const _ as usize;
+        let park = Arc::new(Park::default());
+        let mut parks = PARK.lock();
+        parks.retain(|(a, _, _)| *a != at);
+        parks.push((at, point, park.clone()));
+        park
+    }
+
+    pub(super) async fn reached(free_space: &super::FreeSpace, point: u8) {
+        let park = {
+            let at = free_space as *const _ as usize;
+            let mut parks = PARK.lock();
+            parks
+                .iter()
+                .position(|(a, p, _)| *a == at && *p == point)
+                .map(|i| parks.swap_remove(i).2)
+        };
+        if let Some(park) = park {
+            park.parked.notify_one();
+            park.release.notified().await;
+        }
+    }
+
+    /// Another table's arm leaves this table's park, and its chunk size,
+    /// where they were: tests running at once each park their own sweep.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_table_keeps_its_own_park_and_chunk_size() {
+        // In an `Arc` before anything is armed: the hooks key a table by its
+        // map's address, and moving it would change that.
+        let a = Arc::new(super::FreeSpace::new(true));
+        let b = super::FreeSpace::new(true);
+        set_chunk_records(&a, 8);
+        set_chunk_records(&b, 16);
+        let park_a = arm(&a, IN_SCAN);
+        let park_b = arm(&b, AFTER_SCAN);
+        assert_eq!(chunk_records(&a), 8);
+        assert_eq!(chunk_records(&b), 16);
+
+        let run = a.clone();
+        let parked = tokio::spawn(async move { reached(&run, IN_SCAN).await });
+        tokio::time::timeout(std::time::Duration::from_secs(10), park_a.parked.notified())
+            .await
+            .expect("table a's run parks at its own point");
+        park_a.release.notify_one();
+        parked.await.unwrap();
+        // Taken once: a's next run passes straight through, and b's park is
+        // still armed for b.
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached(&a, IN_SCAN))
+            .await
+            .expect("a second run of a does not park");
+        let b_at = &b as *const _ as usize;
+        assert!(PARK.lock().iter().any(|(at, p, _)| *at == b_at && *p == AFTER_SCAN));
+        // Nothing of these two left behind: a table later allocated at one of
+        // their addresses would park with no one to release it.
+        let a_at = &*a as *const _ as usize;
+        PARK.lock().retain(|(at, _, _)| *at != a_at && *at != b_at);
+        CHUNK.lock().retain(|(at, _)| *at != a_at && *at != b_at);
+        drop(park_b);
+    }
 }
 
 /// Everything the per-table reclamation service needs to run.
@@ -1306,9 +2487,18 @@ pub struct VacuumService<S: StorageIO> {
     pub stats: Arc<VacuumStats>,
     /// Cleared when the table is dropped; the loop stops on the next slice.
     pub alive: Arc<CacheGuard<AtomicBool>>,
+    /// Held for each piece of work a tick does (a forget sweep, a
+    /// reclamation sweep), after its permit: `Table::retire` clears `alive`
+    /// and then takes it, so it returns only once no sweep is writing
+    /// through this instance's providers (§7 step 2(b), RV14).
+    pub tick: Arc<tokio::sync::Mutex<()>>,
     /// Bumped by every committed `DELETE` and `UPDATE`. Nothing else can create
     /// dead space, so an unchanged value means there is nothing new to find.
     pub mutations: Arc<CacheGuard<AtomicU64>>,
+    /// Versions stamped dead by the write path — one per row a `DELETE`
+    /// removed or an `UPDATE` replaced. Monotonic; the service compares it with
+    /// its value at the last sweep against [`VacuumConfig::sweep_threshold`].
+    pub dead_stamps: Arc<AtomicU64>,
     /// Picked up whenever it is set: the service starts before versioning can
     /// be wired, so it cannot take a horizon once and keep it.
     pub versions: Arc<arc_swap::ArcSwapOption<TransactionManager>>,
@@ -1316,8 +2506,24 @@ pub struct VacuumService<S: StorageIO> {
     /// table so an explicit `VACUUM` and the service agree on what is already
     /// cleared.
     pub filters: Option<Arc<TableFilters>>,
+    /// The table's secondary indexes and their key-column fetch.
+    pub indexes: Option<(Arc<crate::core::index::TableIndexes>, crate::core::row::row::RowFetch)>,
     pub cleared_below: Arc<CacheGuard<AtomicU64>>,
     pub config: VacuumConfig,
+    /// The table's write lock, compaction gate and cache generation, for the
+    /// forget sweep. See [`neutralize_aborted`].
+    pub write_lock: Arc<tokio::sync::RwLock<()>>,
+    pub compaction_gate: Arc<tokio::sync::RwLock<()>>,
+    pub cache_generation: Arc<CacheGuard<AtomicU64>>,
+    /// Set when versioning is enabled.
+    pub forget: Arc<std::sync::OnceLock<crate::core::mvcc::transaction::ForgetHandle>>,
+    /// The file set's write gate (`ReclaimContext::gate`), weakly: the
+    /// service outlives its table by up to one interval, and a strong
+    /// reference would keep the word, and so the registry's entry, alive
+    /// past the table, so a later first open of the file set (a database
+    /// reopened in the process) would inherit a word it should derive from
+    /// `.ixm`. A tick whose gate is gone has no table to sweep.
+    pub gate: std::sync::Weak<crate::core::index_store::file_gate::FileGate>,
 }
 
 impl<S: StorageIO> VacuumService<S> {
@@ -1328,88 +2534,783 @@ impl<S: StorageIO> VacuumService<S> {
     /// scans.
     pub fn spawn(self) {
         tokio::spawn(async move {
-            // No value of the counter can equal this, so the first tick always
-            // scans — a table opened with tombstones already on disk has dead
-            // space that no mutation of ours will ever announce.
-            let mut scanned_at_mutation = u64::MAX;
+            let mut state = TickState::new();
+            let mut consecutive_panics = 0u32;
 
             loop {
-                if !sleep_until_due(self.config.interval, &self.alive).await {
-                    break;
-                }
-                if !self.free_space.is_enabled() {
-                    continue;
-                }
-
-                // A table that is only read, or only appended to, gains no dead
-                // space. Re-reading its whole pointer file every tick would be
-                // pure cost — and on a large table, not a small one. Outstanding
-                // loans still force a scan: they are what retires them.
-                let mutations_now = self.mutations.load(Ordering::Acquire);
-                if mutations_now == scanned_at_mutation
-                    && self.free_space.loans_outstanding() == 0
-                {
-                    continue;
-                }
-
-                let horizon = match self.versions.load_full() {
-                    Some(manager) => VersionHorizon::sample(&manager),
-                    None => VersionHorizon::unversioned(),
-                };
-                let ctx = ReclaimContext {
-                    horizon: &horizon,
-                    filters: self.filters.as_deref(),
-                    cleared_below: &self.cleared_below,
-                };
-
-                match run_once(
-                    &*self.io_pointers,
-                    &*self.io_rows,
-                    &self.free_space,
-                    &self.readers,
-                    &ctx,
-                    &self.config,
-                    false,
+                if !sleep_until_due(
+                    panic_backoff(self.config.interval, consecutive_panics),
+                    &self.alive,
                 )
                 .await
                 {
-                    Ok(report) => {
-                        self.stats.record(&report);
-                        // Losing this to a crash costs pruning quality, never
-                        // correctness: the mask stays a superset, so a
-                        // checkpoint predating the clearing is merely less
-                        // selective.
-                        if let Some(filters) = self
-                            .filters
-                            .as_ref()
-                            .filter(|_| report.fingerprints_cleared > 0)
-                        {
-                            filters.request_checkpoint();
-                        }
-                        // Only a run that got as far as publishing has actually
-                        // seen everything; a deferred one must try again.
-                        if !report.deferred {
-                            scanned_at_mutation = mutations_now;
-                        }
-                        if report.reclaimed_bytes > 0 {
-                            info!(
-                                "Vacuum on {}: {} dead rows, {} bytes reclaimable across {} extents ({:.1}% of heap)",
-                                self.table_name,
-                                report.dead_rows,
-                                report.reclaimed_bytes,
-                                report.extents,
-                                report.dead_ratio() * 100.0
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Vacuum scan failed for {}: {}", self.table_name, e);
+                    break;
+                }
+
+                // Supervised, because this task is the table's only reclaimer.
+                // A panic used to end it silently: the table went on working,
+                // and its dead space simply stopped being given back, with
+                // nothing anywhere saying so. Catching it per tick keeps the
+                // service alive. What a tick leaves behind is the free list,
+                // whose locks do not poison, and the permits and guards it
+                // held, which unwinding drops; and a tick that died before
+                // publishing has not advanced `state`, so the next one rescans
+                // what it missed.
+                let tick = std::panic::AssertUnwindSafe(self.tick(&mut state));
+                match futures::FutureExt::catch_unwind(tick).await {
+                    Ok(ControlFlow::Continue(())) => consecutive_panics = 0,
+                    Ok(ControlFlow::Break(())) => break,
+                    Err(payload) => {
+                        consecutive_panics = consecutive_panics.saturating_add(1);
+                        let total = self.stats.panics.fetch_add(1, Ordering::Relaxed) + 1;
+                        log::error!(
+                            "Vacuum service for {} panicked ({} so far): {}; retrying after {:?}",
+                            self.table_name,
+                            total,
+                            panic_message(&*payload),
+                            panic_backoff(self.config.interval, consecutive_panics)
+                        );
                     }
                 }
             }
 
             log::debug!("Vacuum service for {} stopped", self.table_name);
         });
+    }
+
+    /// Whether a tick now would find nothing to do and nothing is waiting on
+    /// time alone: the last completed sweep saw the current mutation count,
+    /// held no stamp the horizon still protected, and no loan is out. What
+    /// the shared scheduler (`partition::maintenance`, §7.3) asks before it
+    /// stops servicing a partition until its next write; a first tick is
+    /// never settled, since it always scans.
+    ///
+    /// Also settled when the last tick found the current mutation count
+    /// below the sweep threshold (the tick's due rule): only more dead
+    /// stamps make it due, and those come with a write, which pushes the
+    /// partition again. Otherwise a partition with a few updates below the
+    /// threshold would be serviced every round for good.
+    pub(crate) fn settled(&self, state: &TickState) -> bool {
+        if !self.free_space.is_enabled() {
+            // Reclamation off: every tick returns at once.
+            return true;
+        }
+        let mutations = self.mutations.load(Ordering::Acquire);
+        state.scanned_at_mutation != u64::MAX
+            && (state.scanned_at_mutation == mutations || state.quiet_at_mutation == mutations)
+            && state.held_rows == 0
+            && self.free_space.loans_outstanding() == 0
+    }
+
+    /// The service's liveness flag: false once its table is retired or gone.
+    pub(crate) fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
+    /// One pass of the service: a forget sweep if one is due, then a
+    /// reclamation sweep if one is due. `Break` when the table has gone.
+    /// Driven by [`Self::spawn`]'s loop for a table with its own
+    /// maintenance, or by the shared scheduler for a partition opened
+    /// `MaintenanceMode::External` (§7.3), whose `forget` is never set: its
+    /// forget sweeps are its slot's (§7.2), run by the scheduler too.
+    pub(crate) async fn tick(&self, state: &mut TickState) -> ControlFlow<()> {
+        #[cfg(test)]
+        if self
+            .stats
+            .inject_panics
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            panic!("injected vacuum panic");
+        }
+
+        if !self.free_space.is_enabled() {
+            return ControlFlow::Continue(());
+        }
+
+        // Forgetting: every FORGET_STEP ids, prove this table free of
+        // the non-committed ids below the settle bound. A table that
+        // never does pins the database's forgotten horizon.
+        if let (Some(manager), Some(handle)) = (self.versions.load_full(), self.forget.get()) {
+            if manager.status().settles()
+                && manager.settle_bound().saturating_sub(handle.horizon()) >= FORGET_STEP
+            {
+                if let Some(_permit) = sweep_scheduler().acquire(1.0, &self.alive).await {
+                    let _tick = self.tick.lock().await;
+                    if !self.alive.load(Ordering::Acquire) {
+                        return ControlFlow::Break(());
+                    }
+                    let Some(file_gate) = self.gate.upgrade() else {
+                        return ControlFlow::Break(());
+                    };
+                    let parts = NeutralizeParts {
+                        io_pointers: &*self.io_pointers,
+                        write_lock: &self.write_lock,
+                        compaction_gate: &self.compaction_gate,
+                        readers: &self.readers,
+                        free_space: &self.free_space,
+                        cache_generation: &self.cache_generation,
+                        dead_stamps: &self.dead_stamps,
+                        drain_timeout: self.config.drain_timeout,
+                        alive: Some(&self.alive),
+                        gate: Some(&file_gate),
+                    };
+                    match neutralize_aborted(&parts, &manager, handle).await {
+                        Ok(report) if report.tombstoned + report.cleared > 0 => info!(
+                            "Forget sweep on {}: {} tombstoned, {} cleared, horizon {:?}",
+                            self.table_name,
+                            report.tombstoned,
+                            report.cleared,
+                            report.advanced_to
+                        ),
+                        Ok(_) => {}
+                        Err(e) => log::error!(
+                            "Forget sweep failed for {}: {}",
+                            self.table_name,
+                            e
+                        ),
+                    }
+                }
+            }
+        }
+
+        // A table that is only read, or only appended to, gains no dead
+        // space. Re-reading its whole pointer file every tick would be
+        // pure cost — and on a large table, not a small one. Outstanding
+        // loans still force a scan: they are what retires them.
+        let mutations_now = self.mutations.load(Ordering::Acquire);
+        let stamps_now = self.dead_stamps.load(Ordering::Acquire);
+        let first = state.scanned_at_mutation == u64::MAX;
+        let loans = self.free_space.loans_outstanding() > 0;
+        // How far over its threshold this table is, for the shared
+        // ordering below. A first sweep or outstanding loans are due
+        // regardless and rank as exactly due.
+        let mut priority = 1.0f64;
+        if !first && !loans {
+            // Stamps the last sweep had to leave because the horizon
+            // still protected them become findable once it passes the
+            // oldest of them — with or without any new write.
+            let released = state.held_rows > 0
+                && self.versions.load_full().is_some_and(|m| {
+                    VersionHorizon::sample(&m).oldest_active() > state.held_min_xmax
+                });
+            if mutations_now == state.scanned_at_mutation && !released {
+                return ControlFlow::Continue(());
+            }
+            // Is there enough dead space to be worth a full read of the
+            // pointer file? Dead stamps since the last sweep, plus the
+            // released ones.
+            let slots = self.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+            let threshold = self.config.sweep_threshold(slots);
+            let fresh = stamps_now.saturating_sub(state.stamps_at_sweep);
+            let due = fresh >= threshold || (released && fresh + state.held_rows >= threshold);
+            if !due {
+                // Below the threshold: nothing to do until more stamps
+                // arrive, which only a write brings (`settled`).
+                state.quiet_at_mutation = mutations_now;
+                return ControlFlow::Continue(());
+            }
+            let counted = if released { fresh + state.held_rows } else { fresh };
+            priority = counted as f64 / threshold as f64;
+        }
+
+        // One sweep at a time per few tables, furthest over threshold
+        // first. The permit is held for the sweep and released on drop.
+        let Some(_permit) = sweep_scheduler().acquire(priority, &self.alive).await else {
+            return ControlFlow::Break(());
+        };
+        // Joined by `Table::retire` (see `tick`).
+        let _tick = self.tick.lock().await;
+        if !self.alive.load(Ordering::Acquire) {
+            return ControlFlow::Break(());
+        }
+
+        let Some(file_gate) = self.gate.upgrade() else {
+            return ControlFlow::Break(());
+        };
+        let horizon = match self.versions.load_full() {
+            Some(manager) => VersionHorizon::sample(&manager),
+            None => VersionHorizon::unversioned(),
+        };
+        let ctx = ReclaimContext {
+            horizon: &horizon,
+            filters: self.filters.as_deref(),
+            cleared_below: &self.cleared_below,
+            indexes: self.indexes.as_ref().map(|(ix, fetch)| (&**ix, fetch)),
+            compaction_gate: Some(&self.compaction_gate),
+            alive: Some(&self.alive),
+            gate: Some(&file_gate),
+            stats: Some(&self.stats),
+        };
+
+        match run_once(
+            &*self.io_pointers,
+            &*self.io_rows,
+            &self.free_space,
+            &self.readers,
+            &ctx,
+            &self.config,
+            false,
+        )
+        .await
+        {
+            Ok(report) => {
+                self.stats.record(&report);
+                // Losing this to a crash costs pruning quality, never
+                // correctness: the mask stays a superset, so a
+                // checkpoint predating the clearing is merely less
+                // selective.
+                if let Some(filters) = self
+                    .filters
+                    .as_ref()
+                    .filter(|_| report.fingerprints_cleared > 0)
+                {
+                    filters.request_checkpoint();
+                }
+                // Only a run that got as far as publishing has actually
+                // seen everything; a deferred one must try again.
+                if !report.deferred {
+                    state.scanned_at_mutation = mutations_now;
+                    state.stamps_at_sweep = stamps_now;
+                    state.held_rows = report.held_rows;
+                    state.held_min_xmax = report.held_min_xmax;
+                }
+                if report.reclaimed_bytes > 0 {
+                    info!(
+                        "Vacuum on {}: {} dead rows, {} bytes reclaimable across {} extents ({:.1}% of heap)",
+                        self.table_name,
+                        report.dead_rows,
+                        report.reclaimed_bytes,
+                        report.extents,
+                        report.dead_ratio() * 100.0
+                    );
+                }
+            }
+            Err(e) => {
+                log::error!("Vacuum scan failed for {}: {}", self.table_name, e);
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// What the service carries from one tick to the next.
+pub(crate) struct TickState {
+    /// The mutation count as of the last completed sweep.
+    scanned_at_mutation: u64,
+    /// The dead-stamp count as of the last completed sweep, and what that
+    /// sweep found stamped but still protected by the horizon.
+    stamps_at_sweep: u64,
+    held_rows: u64,
+    held_min_xmax: TxId,
+    /// The mutation count a tick last found below the sweep threshold.
+    quiet_at_mutation: u64,
+}
+
+impl TickState {
+    pub(crate) fn new() -> Self {
+        TickState {
+            quiet_at_mutation: u64::MAX,
+            // No value of the counter can equal this, so the first tick
+            // always scans — a table opened with tombstones already on disk
+            // has dead space that no mutation of ours will ever announce.
+            scanned_at_mutation: u64::MAX,
+            stamps_at_sweep: 0,
+            held_rows: 0,
+            held_min_xmax: NO_TX,
+        }
+    }
+}
+
+/// How long the service waits before its next tick.
+///
+/// The ordinary interval, doubled for each panic in a row and capped at ten
+/// minutes: a tick that panics deterministically would otherwise fill the log
+/// at the scan interval, and one that panicked once should not slow the
+/// service down afterwards.
+pub(crate) fn panic_backoff(interval: std::time::Duration, consecutive_panics: u32) -> std::time::Duration {
+    const CAP: std::time::Duration = std::time::Duration::from_secs(600);
+    if consecutive_panics == 0 {
+        return interval;
+    }
+    interval
+        .saturating_mul(1u32 << consecutive_panics.min(16))
+        .min(CAP.max(interval))
+}
+
+/// The text a panic was raised with, when it was raised with text.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "non-string panic payload"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Forgetting aborted ids
+// ---------------------------------------------------------------------------
+
+/// Ids a table's forget horizon has to fall behind before its service sweeps
+/// for it again. A sweep reads the whole pointer file, like a reclamation
+/// sweep, so it is paced by transactions rather than by the clock.
+pub const FORGET_STEP: u64 = 1 << 20;
+
+/// What one forget sweep did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct NeutralizeReport {
+    /// Pointer records read.
+    pub scanned: u64,
+    /// Versions whose creator did not commit, tombstoned.
+    pub tombstoned: u64,
+    /// Live versions whose deleter did not commit, the stamp cleared.
+    pub cleared: u64,
+    /// The horizon the table advanced to, if it did.
+    pub advanced_to: Option<TxId>,
+    /// Records of the last pass whose `xmin` or `xmax` is a transaction id at
+    /// or above the sweep's bound: written by a transaction that may still
+    /// abort. A partition's sweep is clean (§7.2) only when this is 0.
+    pub newer: u64,
+}
+
+/// The pieces of a table a forget sweep needs.
+pub struct NeutralizeParts<'a, S: StorageIO> {
+    pub io_pointers: &'a S,
+    /// The table's write lock: every rewrite of an existing pointer record —
+    /// `DELETE`, `UPDATE`, a uniqueness check's read — holds it, so a stamp
+    /// cleared here can never race one being written.
+    pub write_lock: &'a tokio::sync::RwLock<()>,
+    /// Held shared for the sweep: compaction moves records.
+    pub compaction_gate: &'a tokio::sync::RwLock<()>,
+    pub readers: &'a ReaderRegistry,
+    pub free_space: &'a FreeSpace,
+    /// Bumped after a rewrite, so no cached answer built from the old records
+    /// is served.
+    pub cache_generation: &'a AtomicU64,
+    /// Tombstoned versions are dead space; counted so a reclamation sweep
+    /// follows. Aborted inserts were never counted anywhere else.
+    pub dead_stamps: &'a AtomicU64,
+    pub drain_timeout: std::time::Duration,
+    /// The service's liveness flag, checked between batches and while
+    /// readers drain: a retired table's sweep stops at the next batch
+    /// boundary without advancing (RV14), so retirement waits for one batch,
+    /// not one sweep. `None` for an explicit sweep, which runs to its end.
+    pub alive: Option<&'a AtomicBool>,
+    /// The file set's write gate: one transient ticket per pass that has
+    /// something to rewrite, taken before the compaction gate (P24).
+    pub gate: Option<&'a crate::core::index_store::file_gate::FileGate>,
+}
+
+/// Whether `pointer` carries the id of a transaction below `bound` that did
+/// not commit, and so must be rewritten before that id can be forgotten.
+fn carries_unfinished(pointer: &RowPointer, bound: TxId, manager: &TransactionManager) -> (bool, bool) {
+    if pointer.deleted {
+        return (false, false);
+    }
+    let unfinished = |id: TxId| {
+        id != NO_TX && id != FROZEN_TX && id < bound && manager.outcome(id) != TxOutcome::Committed
+    };
+    (unfinished(pointer.xmin), unfinished(pointer.xmax))
+}
+
+/// Proves a table free of every non-committed id below the settle bound, so
+/// the status log may forget them — the vacuum half of [`TransactionManager`]'s
+/// forget registry.
+///
+/// 1. `bound` is read first: `TransactionManager::settle_bound`, at or below
+///    every running transaction. Every id under it is final, and every record
+///    written from now on carries an id at or above it — including records
+///    appended past the length this sweep reads.
+/// 2. A read pass finds the records carrying a non-committed id under it: a
+///    version whose creator aborted (or crashed) is tombstoned, and a live
+///    version whose deleter did not commit has `xmax` cleared. Both are what
+///    the visibility rule already concluded from the outcome; the rewrite
+///    makes it so without the outcome.
+/// 3. Each batch is rewritten under the table's write lock, re-reading the
+///    record there, in one storage transaction committed durably.
+/// 4. Readers that might hold a pointer read before the rewrite drain.
+/// 5. Only then does the table's horizon move, and the registry may forget.
+///
+/// Returns without advancing whenever that chain cannot be completed: the
+/// horizon pins, which is safe.
+pub async fn neutralize_aborted<S: StorageIO>(
+    parts: &NeutralizeParts<'_, S>,
+    manager: &Arc<TransactionManager>,
+    handle: &crate::core::mvcc::transaction::ForgetHandle,
+) -> std::io::Result<NeutralizeReport> {
+    let report = neutralize_aborted_from(parts, manager, handle.horizon()).await?;
+    // 5.
+    if let Some(bound) = report.advanced_to {
+        handle.advance(bound);
+        manager.try_forget();
+    }
+    Ok(report)
+}
+
+/// Whether `pointer` carries a transaction id at or above `bound` (neither
+/// `NO_TX` nor `FROZEN_TX`): a stamp the sweep to `bound` leaves to a later
+/// one.
+fn carries_newer(pointer: &RowPointer, bound: TxId) -> bool {
+    if pointer.deleted {
+        return false;
+    }
+    let newer = |id: TxId| id != NO_TX && id != FROZEN_TX && id >= bound;
+    newer(pointer.xmin) || newer(pointer.xmax)
+}
+
+/// Steps 1 to 4 of [`neutralize_aborted`] for a table whose horizon is
+/// `from`: proves its records free of every non-committed id below the
+/// settle bound, and reports the bound in `advanced_to` when the proof is
+/// complete, moving nothing. The caller advances whatever horizon it keeps:
+/// a plain table its [`ForgetHandle`](crate::core::mvcc::transaction::ForgetHandle),
+/// a partition its slot's pin, after the map log's `SWEPT` (§7.2).
+pub async fn neutralize_aborted_from<S: StorageIO>(
+    parts: &NeutralizeParts<'_, S>,
+    manager: &Arc<TransactionManager>,
+    from: TxId,
+) -> std::io::Result<NeutralizeReport> {
+    let mut report = NeutralizeReport::default();
+    if !manager.status().settles() || !parts.free_space.is_enabled() {
+        return Ok(report);
+    }
+    let toggles = parts.free_space.toggles();
+    let bound = manager.settle_bound();
+    if bound <= from {
+        return Ok(report);
+    }
+    let mut _gate = parts.compaction_gate.read().await;
+
+    // 2. Find them.
+    let scan = || async {
+        let mut candidates: Vec<u64> = Vec::new();
+        let mut slot = 0u64;
+        let mut newer = 0u64;
+        sweep_pointers(parts.io_pointers, |pointer| {
+            let (bad_xmin, bad_xmax) = carries_unfinished(pointer, bound, manager);
+            if bad_xmin || bad_xmax {
+                candidates.push(slot * ROW_POINTER_RECORD_LEN as u64);
+            }
+            newer += carries_newer(pointer, bound) as u64;
+            slot += 1;
+        })
+        .await
+        .map(|()| (candidates, slot, newer))
+    };
+    let (mut candidates, mut slots, mut newer) = scan().await?;
+    // One ticket for the pass, only when it has something to rewrite, and
+    // before the compaction gate (P24): a ticket per batch would be taken
+    // under it. So the gate is let go, the ticket taken, the gate taken
+    // again and the scan repeated under it (a compaction may have moved
+    // records in between).
+    let _ticket = match parts.gate {
+        Some(file_gate) if !candidates.is_empty() => {
+            drop(_gate);
+            let ticket = gate::ticket(file_gate, None).await?;
+            _gate = parts.compaction_gate.read().await;
+            (candidates, slots, newer) = scan().await?;
+            Some(ticket)
+        }
+        _ => None,
+    };
+    report.scanned = slots;
+    report.newer = newer;
+
+    // 3. Rewrite them.
+    let mut record = vec![0u8; ROW_POINTER_RECORD_LEN];
+    let retired = || parts.alive.is_some_and(|alive| !alive.load(Ordering::Acquire));
+    for batch in candidates.chunks(1024) {
+        // Stopping between batches leaves every batch whole and the horizon
+        // where it was, which is safe: it only pins.
+        if retired() {
+            return Ok(report);
+        }
+        let _write = parts.write_lock.write().await;
+        let txn = parts.io_pointers.begin_txn();
+        let mut token = txn;
+        let mut wrote = false;
+        for &position in batch {
+            let mut at = position;
+            parts.io_pointers.read_data_into_buffer(&mut at, &mut record).await?;
+            let mut pointer = RowPointer::from_slice_unknown(&record);
+            let (bad_xmin, bad_xmax) = carries_unfinished(&pointer, bound, manager);
+            if bad_xmin {
+                pointer.deleted = true;
+                pointer.xmax = NO_TX;
+                report.tombstoned += 1;
+            } else if bad_xmax {
+                pointer.xmax = NO_TX;
+                report.cleared += 1;
+            } else {
+                continue;
+            }
+            match pointer.save_at_in_txn(parts.io_pointers, position, txn).await {
+                Ok(t) => {
+                    token = t;
+                    wrote = true;
+                }
+                Err(e) => {
+                    parts.io_pointers.abort_txn(txn).await;
+                    return Err(std::io::Error::other(e.to_string()));
+                }
+            }
+        }
+        if wrote {
+            parts.io_pointers.commit_durable(token).await?;
+            parts.cache_generation.fetch_add(1, Ordering::AcqRel);
+        } else {
+            parts.io_pointers.abort_txn(txn).await;
+        }
+    }
+    parts
+        .dead_stamps
+        .fetch_add(report.tombstoned, Ordering::Relaxed);
+
+    // 4. Readers that could hold a pointer from before the rewrite.
+    let barrier = parts.readers.barrier();
+    let deadline = std::time::Instant::now() + parts.drain_timeout;
+    while !parts.readers.drained_past(barrier) {
+        if std::time::Instant::now() >= deadline || retired() {
+            return Ok(report);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // Reader tickets mean nothing across a toggle of reclamation.
+    if !parts.free_space.is_enabled() || parts.free_space.toggles() != toggles {
+        return Ok(report);
+    }
+    #[cfg(test)]
+    neutralize_test_hooks::park_before_report(parts.io_pointers.get_location()).await;
+    report.advanced_to = Some(bound);
+    Ok(report)
+}
+
+/// Test-only: holds a forget sweep after its scan and drain, before it
+/// reports its bound, so a test can write behind the scan.
+#[cfg(test)]
+pub(crate) mod neutralize_test_hooks {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use tokio::sync::Notify;
+
+    type Park = (PathBuf, Arc<Notify>, Arc<Notify>);
+    static PARKS: parking_lot::Mutex<Vec<Park>> = parking_lot::Mutex::new(Vec::new());
+
+    /// Arms one park for sweeps of files under `dir`: the first `Notify` is
+    /// signalled when a sweep reaches it, which goes on once the second is.
+    pub(crate) fn arm(dir: &Path) -> (Arc<Notify>, Arc<Notify>) {
+        let (reached, resume) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        PARKS.lock().push((dir.to_path_buf(), reached.clone(), resume.clone()));
+        (reached, resume)
+    }
+
+    pub(super) async fn park_before_report(location: Option<String>) {
+        let Some(location) = location else {
+            return;
+        };
+        let found = {
+            let mut parks = PARKS.lock();
+            let at = parks.iter().position(|(d, _, _)| Path::new(&location).starts_with(d));
+            at.map(|i| parks.remove(i))
+        };
+        if let Some((_, reached, resume)) = found {
+            reached.notify_one();
+            resume.notified().await;
+        }
+    }
+}
+
+/// How many tables may sweep at once, process-wide.
+///
+/// Every table runs its own service on the same interval, so a database with
+/// a few hundred tables opened together would otherwise read every pointer
+/// file at once each tick it had work for. Bounded, and ordered by how far
+/// over its threshold each table is (PostgreSQL d7965d65f), so the worst table
+/// goes first. Correctness does not depend on when a sweep runs — only on
+/// what it reads — so delaying one changes nothing but its timing.
+pub const DEFAULT_CONCURRENT_SWEEPS: usize = 2;
+
+static SWEEP_SCHEDULER: std::sync::OnceLock<SweepScheduler> = std::sync::OnceLock::new();
+
+/// The process-wide sweep scheduler.
+pub fn sweep_scheduler() -> &'static SweepScheduler {
+    SWEEP_SCHEDULER.get_or_init(|| SweepScheduler::new(DEFAULT_CONCURRENT_SWEEPS))
+}
+
+/// Grants sweep permits, at most `max` at once, highest priority first.
+pub struct SweepScheduler {
+    inner: Mutex<SchedulerState>,
+    max: usize,
+    /// Most permits ever out at once. Observability: what the bound bounds.
+    peak: AtomicUsize,
+    granted: AtomicU64,
+}
+
+struct SchedulerState {
+    running: usize,
+    seq: u64,
+    /// `(priority, arrival, wake)`. Few entries — one per table that is due —
+    /// so a linear scan for the best beats a heap's bookkeeping.
+    queue: Vec<(f64, u64, tokio::sync::oneshot::Sender<()>)>,
+}
+
+/// A granted sweep. Dropping it hands the slot to the best waiter.
+pub struct SweepPermit<'a> {
+    scheduler: &'a SweepScheduler,
+}
+
+impl SweepScheduler {
+    pub fn new(max: usize) -> Self {
+        SweepScheduler {
+            inner: Mutex::new(SchedulerState {
+                running: 0,
+                seq: 0,
+                queue: Vec::new(),
+            }),
+            max: max.max(1),
+            peak: AtomicUsize::new(0),
+            granted: AtomicU64::new(0),
+        }
+    }
+
+    fn note_grant(&self, running: usize) {
+        self.peak.fetch_max(running, Ordering::Relaxed);
+        self.granted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Waits for a permit. `None` if `alive` goes false while waiting — the
+    /// table was dropped and its service is stopping.
+    ///
+    /// Cancel-safe: dropped while waiting, it leaves the queue, and a slot
+    /// already handed to it is handed on. It was not: a grant `release` had
+    /// sent to a waiter whose future was then dropped (a partition's service
+    /// stopped as the open budget closed it) was never turned into a permit,
+    /// so never released, and the process had one sweep slot fewer for good.
+    /// With two, two such losses stopped every forget sweep in every
+    /// database, waiting on a slot nobody held (the `partition_twin` hang,
+    /// 2026-11-09).
+    pub async fn acquire(&self, priority: f64, alive: &AtomicBool) -> Option<SweepPermit<'_>> {
+        let (seq, wake) = {
+            let mut state = self.inner.lock();
+            if state.running < self.max && state.queue.is_empty() {
+                state.running += 1;
+                self.note_grant(state.running);
+                return Some(SweepPermit { scheduler: self });
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            state.seq += 1;
+            let seq = state.seq;
+            state.queue.push((priority, seq, tx));
+            (seq, rx)
+        };
+        let mut waiting = Waiting { scheduler: self, seq, wake: Some(wake) };
+        loop {
+            let wake = waiting.wake.as_mut().expect("waiting");
+            tokio::select! {
+                granted = wake => {
+                    // A sender is only dropped unsent by `release` when it
+                    // failed to send, which needs this receiver gone; so here
+                    // it was sent.
+                    let _ = granted;
+                    waiting.wake = None;
+                    return Some(SweepPermit { scheduler: self });
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                    if alive.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    // Leaves the queue, or hands a slot granted meanwhile on
+                    // (`Waiting`'s drop).
+                    drop(waiting);
+                    return None;
+                }
+            }
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.inner.lock();
+        loop {
+            // Highest priority; among equals, the one that has waited longest.
+            let best = state
+                .queue
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| {
+                    a.0.partial_cmp(&b.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(b.1.cmp(&a.1))
+                })
+                .map(|(i, _)| i);
+            let Some(index) = best else {
+                state.running -= 1;
+                return;
+            };
+            let (_, _, wake) = state.queue.swap_remove(index);
+            if wake.send(()).is_ok() {
+                // The slot passes on; `running` is unchanged.
+                self.note_grant(state.running);
+                return;
+            }
+            // That waiter is gone; try the next.
+        }
+    }
+
+    /// Waiters in the queue now.
+    pub fn queued(&self) -> usize {
+        self.inner.lock().queue.len()
+    }
+
+    /// Permits out now.
+    pub fn running(&self) -> usize {
+        self.inner.lock().running
+    }
+
+    /// Most permits ever out at once.
+    pub fn peak(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
+    }
+
+    /// Permits granted since start.
+    pub fn granted(&self) -> u64 {
+        self.granted.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for SweepPermit<'_> {
+    fn drop(&mut self) {
+        self.scheduler.release();
+    }
+}
+
+/// A waiter's place in the queue, until it holds a permit. Dropped first
+/// (cancelled, or given up as its table stops), it takes its entry out of
+/// the queue; if `release` had already granted it the slot, it releases it,
+/// so the slot reaches the next waiter rather than being lost.
+struct Waiting<'a> {
+    scheduler: &'a SweepScheduler,
+    seq: u64,
+    /// `None` once it has turned into a permit.
+    wake: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let Some(mut wake) = self.wake.take() else { return };
+        let mut state = self.scheduler.inner.lock();
+        if let Some(at) = state.queue.iter().position(|(_, s, _)| *s == self.seq) {
+            state.queue.remove(at);
+            return;
+        }
+        drop(state);
+        // Not queued: `release` sent this waiter the slot. Closing the
+        // receiver first makes the outcome final; a grant in it is passed on.
+        wake.close();
+        if wake.try_recv().is_ok() {
+            self.scheduler.release();
+        }
     }
 }
 
@@ -1442,6 +3343,69 @@ mod tests {
         Extent { start, len }
     }
 
+    /// A panicking tick must be caught, counted and survived: the service is
+    /// the table's only reclaimer, and a panic used to end it without a word.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_tick_is_counted_and_the_service_keeps_running() {
+        use crate::core::storage_providers::memory::MemoryStorageProvider;
+
+        let stats = Arc::new(VacuumStats::default());
+        stats.inject_panics.store(2, Ordering::Release);
+        let alive = Arc::new(CacheGuard::new(AtomicBool::new(true)));
+        // Held for the test: the service keeps only a weak reference.
+        let detached_gate = crate::core::index_store::file_gate::FileGate::detached();
+
+        VacuumService {
+            table_name: "supervised".to_string(),
+            io_pointers: rclite::Arc::new(MemoryStorageProvider::new("supervised_pointers")),
+            io_rows: rclite::Arc::new(MemoryStorageProvider::new("supervised_rows")),
+            free_space: Arc::new(FreeSpace::new(true)),
+            readers: Arc::new(ReaderRegistry::new()),
+            stats: stats.clone(),
+            alive: alive.clone(),
+            tick: Arc::new(tokio::sync::Mutex::new(())),
+            mutations: Arc::new(CacheGuard::new(AtomicU64::new(0))),
+            dead_stamps: Arc::new(AtomicU64::new(0)),
+            versions: Arc::new(arc_swap::ArcSwapOption::empty()),
+            filters: None,
+            indexes: None,
+            cleared_below: Arc::new(CacheGuard::new(AtomicU64::new(0))),
+            config: VacuumConfig {
+                interval: std::time::Duration::from_millis(5),
+                ..VacuumConfig::default()
+            },
+            write_lock: Arc::new(tokio::sync::RwLock::new(())),
+            compaction_gate: Arc::new(tokio::sync::RwLock::new(())),
+            cache_generation: Arc::new(CacheGuard::new(AtomicU64::new(0))),
+            forget: Arc::new(std::sync::OnceLock::new()),
+            gate: Arc::downgrade(&detached_gate),
+        }
+        .spawn();
+
+        // Bounded: two panics back off 10 ms and 20 ms, so a scan should
+        // follow well inside this.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while stats.runs.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        alive.store(false, Ordering::Release);
+
+        assert_eq!(stats.panics.load(Ordering::Acquire), 2, "each caught panic is counted");
+        assert!(
+            stats.runs.load(Ordering::Acquire) >= 1,
+            "the service must keep scanning after a panicking tick"
+        );
+    }
+
+    #[test]
+    fn panic_backoff_doubles_and_is_capped() {
+        let base = std::time::Duration::from_secs(1);
+        assert_eq!(panic_backoff(base, 0), base);
+        assert_eq!(panic_backoff(base, 1), base * 2);
+        assert_eq!(panic_backoff(base, 3), base * 8);
+        assert_eq!(panic_backoff(base, 40), std::time::Duration::from_secs(600));
+    }
+
     #[test]
     fn gaps_between_live_extents_are_dead() {
         let live = vec![e(0, 10), e(30, 10), e(60, 10)];
@@ -1471,6 +3435,16 @@ mod tests {
     #[test]
     fn subtraction_removes_a_fully_lent_extent() {
         assert!(subtract_ranges(vec![e(0, 50)], &[e(0, 50)]).is_empty());
+    }
+
+    /// Holes that overlap: one inside another. Sorted by start alone their
+    /// ends fall, and the search for the first hole that matters skipped the
+    /// one covering the range, leaving it to be published.
+    ///
+    /// Mutation: dropping the merge of the holes fails the assert.
+    #[test]
+    fn subtraction_handles_holes_that_overlap() {
+        assert_eq!(subtract_ranges(vec![e(50, 10)], &[e(0, 100), e(10, 10)]), Vec::<Extent>::new());
     }
 
     #[test]
@@ -1519,7 +3493,11 @@ mod tests {
         // Only the 400 bytes past the loan come back.
         assert_eq!(fs.free_bytes(), 400);
         assert_eq!(fs.alloc(400), Some(100));
-        assert_eq!(fs.alloc(1), None, "the lent 100 bytes must not be handed out twice");
+        assert_eq!(
+            fs.alloc(1),
+            None,
+            "the lent 100 bytes must not be handed out twice"
+        );
     }
 
     #[test]
@@ -1527,9 +3505,175 @@ mod tests {
         let fs = FreeSpace::new(true);
         fs.publish(vec![e(0, 500)]);
         assert_eq!(fs.alloc(100), Some(0));
-        fs.retire_loan(0);
+        fs.retire_loan(0, 0);
         fs.publish(vec![e(0, 500)]);
         assert_eq!(fs.alloc(500), Some(0));
+    }
+
+    /// The version whose extent was reclaimed keeps its record, at the same
+    /// start the extent is lent from, in every later sweep. That record is
+    /// not the loan's owner: retiring on it dropped the loan before the
+    /// writer's own record existed, and the extent was published again over
+    /// the row just written into it (`reader_miss_stress`, spread writes,
+    /// 2026-11-11).
+    ///
+    /// Mutation: `retire_loan` ignoring the floor fails the second assert.
+    #[test]
+    fn a_loan_is_retired_only_by_a_record_newer_than_it() {
+        let fs = FreeSpace::new(true);
+        fs.publish(vec![e(0, 500)]);
+        // Lent while the pointer file held 10 records.
+        assert_eq!(fs.alloc_after(500, 10), Some(0));
+        // A sweep meets the reclaimed version's record, slot 3, at offset 0,
+        // and no record of the writer's yet: the extent looks free.
+        fs.retire_loan(0, 3);
+        assert_eq!(fs.loans_outstanding(), 1, "an older record retired the loan");
+        fs.publish(vec![e(0, 500)]);
+        assert_eq!(fs.alloc_after(500, 11), None, "a lent extent was handed out twice");
+        // The writer's record, appended at slot 10 or later, retires it.
+        fs.retire_loan(0, 10);
+        assert_eq!(fs.loans_outstanding(), 0);
+    }
+
+    /// A writer's loan has no owner until its record is written: no record,
+    /// however new, retires it before then, and afterwards only that record
+    /// or a later one does.
+    ///
+    /// Mutation: `owned_by` not setting the floor fails the last assert;
+    /// `retire_loan` ignoring the floor, the first.
+    #[test]
+    fn a_loan_is_retired_only_once_its_owner_is_named() {
+        let fs = FreeSpace::new(true);
+        fs.publish(vec![e(0, 500)]);
+        assert_eq!(fs.alloc_after(500, u64::MAX), Some(0));
+        fs.retire_loan(0, 1_000_000);
+        assert_eq!(fs.loans_outstanding(), 1, "a loan with no owner yet was retired");
+        fs.owned_by(0, 7);
+        fs.retire_loan(0, 6);
+        assert_eq!(fs.loans_outstanding(), 1, "a record older than the owner retired the loan");
+        fs.retire_loan(0, 7);
+        assert_eq!(fs.loans_outstanding(), 0, "the owner's record did not retire the loan");
+    }
+
+    /// A run that could not wait out its readers quarantines what it found.
+    /// An extent still on the list was in it, found free as it is; a writer
+    /// then took it from the list, a sweep saw the writer's record and
+    /// retired the loan, and the matured batch put the extent back on the
+    /// list under that row. The quarantine leaves out what is on the list or
+    /// on loan, which nothing else can reach.
+    ///
+    /// Mutation: `quarantine_at` without the subtraction fails the asserts.
+    #[test]
+    fn a_quarantined_batch_holds_nothing_the_list_or_a_loan_already_holds() {
+        let reg = Arc::new(ReaderRegistry::new());
+        let fs = FreeSpace::new(true);
+        fs.publish(vec![e(0, 500), e(1000, 500)]);
+        assert_eq!(fs.alloc_after(500, 5), Some(0));
+
+        // The sweep found 0..500 (lent since), 1000..1500 (still listed) and
+        // 2000..2500 (newly dead) free, and a query held it back.
+        let held = reg.enter();
+        fs.quarantine(vec![e(0, 500), e(1000, 500), e(2000, 500)], reg.barrier());
+        assert_eq!(fs.quarantined_extents(), 1, "only the newly dead extent waits");
+
+        // The writer's record retires its loan; another takes the listed one.
+        fs.retire_loan(0, 5);
+        assert_eq!(fs.alloc_after(500, 6), Some(1000));
+        fs.retire_loan(1000, 6);
+
+        drop(held);
+        let matured = fs.take_matured(&reg);
+        assert_eq!(matured, vec![e(2000, 500)], "a matured batch named bytes rows now own");
+    }
+
+    /// A row appended at the frontier is in the file before its pointer. A
+    /// sweep that missed the pointer finds its bytes free, and published them
+    /// to the next writer over the row (`Appends`). They stay out until the
+    /// sweep ends, even once the pointer is written: the sweep that missed it
+    /// is still the one publishing.
+    ///
+    /// Mutation: `publish_at` without the subtraction fails the first assert;
+    /// the ticket's drop forgetting the range during a sweep, the second.
+    #[test]
+    fn an_appended_row_a_sweep_may_have_missed_is_not_published() {
+        let fs = FreeSpace::new(true);
+        let sweep = fs.begin_sweep();
+        let mut append = fs.begin_append();
+        append.landed(1000, 100);
+        // The sweep found 900..1200 owned by nothing.
+        fs.publish(vec![e(900, 300)]);
+        assert_eq!(fs.free_bytes(), 200, "an appended row's bytes were published");
+        assert_eq!(fs.alloc(101), None);
+
+        // Its pointer is written while the sweep still runs.
+        drop(append);
+        fs.publish(vec![e(900, 300)]);
+        assert_eq!(fs.free_bytes(), 200, "the sweep that missed the pointer published its row");
+
+        // A later sweep reads the pointer, so nothing is shielded.
+        drop(sweep);
+        fs.publish(vec![e(900, 300)]);
+        assert_eq!(fs.free_bytes(), 300);
+    }
+
+    /// An append whose pointer is written while no sweep runs is forgotten
+    /// at once: every later sweep reads that pointer. Kept, a table only ever
+    /// appended to (never swept) held one entry per row for good.
+    ///
+    /// Mutation: the ticket's drop never forgetting fails the assert.
+    #[test]
+    fn an_append_finished_outside_a_sweep_keeps_nothing() {
+        let fs = FreeSpace::new(true);
+        for at in 0..100u64 {
+            let mut append = fs.begin_append();
+            append.landed(at * 100, 100);
+        }
+        assert!(fs.unseen_appends().is_empty(), "finished appends were kept with no sweep running");
+    }
+
+    /// A sweep about to publish waits for each append that took its ticket
+    /// before then to record its range; one that takes its ticket afterwards
+    /// lands past the length the sweep read and does not hold it up.
+    ///
+    /// Mutation: `appends_landed_before` always true fails the first assert.
+    #[test]
+    fn a_sweep_waits_only_for_appends_begun_before_it_publishes() {
+        let fs = FreeSpace::new(true);
+        let mut early = fs.begin_append();
+        let barrier = fs.append_barrier();
+        let _late = fs.begin_append();
+        assert!(!fs.appends_landed_before(barrier), "an append still writing was taken as recorded");
+        early.landed(0, 50);
+        assert!(fs.appends_landed_before(barrier), "an append begun after the barrier held it up");
+    }
+
+    /// A quarantined batch leaves out appended rows whose pointer the sweep
+    /// may have missed, as it leaves out the list and the loans.
+    ///
+    /// Mutation: `quarantine_at` without `unseen_appends` fails the assert.
+    #[test]
+    fn a_quarantined_batch_holds_no_appended_row() {
+        let reg = Arc::new(ReaderRegistry::new());
+        let fs = FreeSpace::new(true);
+        let _sweep = fs.begin_sweep();
+        let mut append = fs.begin_append();
+        append.landed(1000, 100);
+        let _held = reg.enter();
+        fs.quarantine(vec![e(1000, 100), e(2000, 100)], reg.barrier());
+        assert_eq!(fs.quarantined_extents(), 1, "an appended row was quarantined for publication");
+    }
+
+    /// Candidates that overlap are listed once: as two entries, the same
+    /// bytes were lent to two rows.
+    ///
+    /// Mutation: `publish_at` without the merge fails the second alloc.
+    #[test]
+    fn overlapping_candidates_are_listed_once() {
+        let fs = FreeSpace::new(true);
+        fs.publish(vec![e(0, 200), e(100, 200)]);
+        assert_eq!(fs.free_bytes(), 300);
+        assert_eq!(fs.alloc(300), Some(0));
+        assert_eq!(fs.alloc(100), None, "overlapping entries lent the same bytes twice");
     }
 
     #[test]
@@ -1548,7 +3692,10 @@ mod tests {
 
     #[test]
     fn merging_absorbs_a_contained_extent() {
-        assert_eq!(merge_overlapping(vec![e(0, 100), e(20, 10)]), vec![e(0, 100)]);
+        assert_eq!(
+            merge_overlapping(vec![e(0, 100), e(20, 10)]),
+            vec![e(0, 100)]
+        );
     }
 
     #[test]
@@ -1573,7 +3720,14 @@ mod tests {
 
     #[test]
     fn a_saturating_end_cannot_wrap_into_live_data() {
-        assert_eq!(Extent { start: u64::MAX - 5, len: 100 }.end(), u64::MAX);
+        assert_eq!(
+            Extent {
+                start: u64::MAX - 5,
+                len: 100
+            }
+            .end(),
+            u64::MAX
+        );
     }
 
     #[test]
@@ -1660,7 +3814,12 @@ mod tests {
         // Every claim is a distinct ROW-sized slice of the one extent.
         assert_eq!(handed_out as u64, EXTENT / ROW);
         for pair in starts.windows(2) {
-            assert!(pair[1] - pair[0] >= ROW, "claims at {} and {} overlap", pair[0], pair[1]);
+            assert!(
+                pair[1] - pair[0] >= ROW,
+                "claims at {} and {} overlap",
+                pair[0],
+                pair[1]
+            );
         }
         assert_eq!(exhausted.load(Ordering::Relaxed), THREADS);
     }
@@ -1756,13 +3915,60 @@ mod tests {
         assert!(fs.take_matured(&reg).is_empty());
     }
 
+    /// A relayout (`VACUUM FULL`) moves rows into the bytes every extent
+    /// found before it names: what was quarantined goes, and a sweep that read
+    /// the old layout can neither quarantine nor publish afterwards.
+    #[test]
+    fn a_relayout_drops_quarantined_batches_and_fences_off_older_sweeps() {
+        let reg = Arc::new(ReaderRegistry::new());
+        let fs = FreeSpace::new(true);
+        let old = fs.layout();
+        fs.quarantine_at(vec![e(0, 500)], reg.barrier(), old);
+        assert_eq!(fs.quarantined_extents(), 1);
+
+        fs.begin_relayout();
+        assert_ne!(fs.layout(), old);
+        assert_eq!(fs.quarantined_extents(), 0, "a quarantined batch survived the relayout");
+        assert!(fs.take_matured(&reg).is_empty());
+
+        fs.quarantine_at(vec![e(1000, 500)], reg.barrier(), old);
+        assert_eq!(fs.quarantined_extents(), 0, "a sweep of the old layout quarantined");
+        fs.publish_at(vec![e(2000, 500)], old);
+        assert_eq!(fs.free_bytes(), 0, "a sweep of the old layout published");
+        assert_eq!(fs.alloc(100), None);
+
+        fs.publish_at(vec![e(3000, 500)], fs.layout());
+        assert_eq!(fs.alloc(100), Some(3000), "a sweep of the new layout could not publish");
+    }
+
+    /// Loans from before a relayout describe offsets the rows have moved away
+    /// from, so no scan would ever retire them: they go with the relayout,
+    /// and the bytes they named can be published again.
+    #[test]
+    fn a_relayout_retires_every_loan() {
+        let fs = FreeSpace::new(true);
+        fs.publish(vec![e(0, 500), e(1000, 500)]);
+        assert_eq!(fs.alloc(500), Some(0));
+        assert_eq!(fs.alloc(500), Some(1000));
+        assert_eq!(fs.loans_outstanding(), 2);
+
+        fs.begin_relayout();
+        assert_eq!(fs.loans_outstanding(), 0, "a loan from before the relayout survived it");
+        assert_eq!(fs.leaked_loans(), 0, "retired loans were counted as failed writes");
+
+        // A sweep of the new layout that finds those bytes free publishes
+        // them whole, rather than withholding them for a loan.
+        fs.publish_at(vec![e(0, 500), e(1000, 500)], fs.layout());
+        assert_eq!(fs.free_bytes(), 1000, "bytes of a pre-relayout loan were withheld");
+    }
+
     // -----------------------------------------------------------------------
     // Reclamation under versioning
     // -----------------------------------------------------------------------
 
     use crate::core::mvcc::TransactionManager;
     use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX};
-use crate::core::mvcc::visibility::Visibility;
+    use crate::core::mvcc::visibility::Visibility;
 
     /// Pins the defaults, because nothing else does.
     ///
@@ -2041,5 +4247,314 @@ use crate::core::mvcc::visibility::Visibility;
         let _t = ReadTicket::inert();
         assert!(reg.drained_past(barrier));
         assert_eq!(reg.oldest_active(), None);
+    }
+
+    #[test]
+    fn the_sweep_threshold_scales_with_the_table_and_is_capped() {
+        let config = VacuumConfig::default();
+        assert_eq!(config.sweep_threshold(0), 50);
+        assert_eq!(config.sweep_threshold(1_000), 100);
+        assert_eq!(config.sweep_threshold(1_000_000), 50_050);
+        // Ten million slots would be half a million at 5 %; the cap holds it
+        // to a sweep per hundred thousand dead versions.
+        assert_eq!(config.sweep_threshold(10_000_000), 100_000);
+        let never_zero = VacuumConfig {
+            sweep_threshold_base: 0,
+            sweep_threshold_ratio: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(never_zero.sweep_threshold(5), 1);
+    }
+
+    #[test]
+    fn coalescing_while_collecting_gives_the_same_bytes_as_merging_after() {
+        // Generated extent streams: runs of adjacent extents (a bulk delete),
+        // out-of-order ones (rows placed into reclaimed holes), duplicates and
+        // overlaps, with enough of them to cross the periodic full merge.
+        let mut rng = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = |bound: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % bound
+        };
+        for round in 0..40 {
+            let n = if round % 4 == 0 { 200_000 } else { 2_000 };
+            let mut stream = Vec::with_capacity(n);
+            let mut cursor = 0u64;
+            for _ in 0..n {
+                let len = 1 + next(64);
+                let start = match next(10) {
+                    0..=5 => cursor,                 // adjacent
+                    6 => cursor + next(32),          // small gap
+                    7 => next(cursor.max(1)),        // out of order, earlier
+                    8 => cursor.saturating_sub(next(16)), // overlap
+                    _ => cursor + 1000 + next(5000), // far ahead
+                };
+                cursor = cursor.max(start + len);
+                stream.push(e(start, len));
+            }
+            let mut collected = Vec::new();
+            for extent in &stream {
+                push_dead(&mut collected, *extent);
+            }
+            assert_eq!(
+                merge_overlapping(collected),
+                merge_overlapping(stream),
+                "round {}",
+                round
+            );
+        }
+    }
+
+    #[test]
+    fn a_bulk_delete_collects_into_one_extent() {
+        let mut dead = Vec::new();
+        for i in 0..1_000_000u64 {
+            push_dead(&mut dead, e(i * 40, 40));
+        }
+        assert_eq!(dead, vec![e(0, 40_000_000)]);
+    }
+
+    /// No more than `max` sweeps at once, and a queue drains worst-first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_scheduler_bounds_sweeps_and_takes_the_worst_table_first() {
+        // One slot, so each grant waits for the previous holder to finish and
+        // the order they record is the order they were granted in.
+        let scheduler = std::sync::Arc::new(SweepScheduler::new(1));
+        let alive = std::sync::Arc::new(AtomicBool::new(true));
+        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let concurrent = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_seen = std::sync::Arc::new(AtomicUsize::new(0));
+
+        // One holds the slot first, so everything after queues.
+        let first = scheduler.acquire(1.0, &alive).await.unwrap();
+        let mut handles = Vec::new();
+        for (i, priority) in [1.5f64, 9.0, 3.0, 1.0, 6.0, 9.0].into_iter().enumerate() {
+            let (s, a, o, c, m) = (
+                scheduler.clone(),
+                alive.clone(),
+                order.clone(),
+                concurrent.clone(),
+                max_seen.clone(),
+            );
+            handles.push(tokio::spawn(async move {
+                let _permit = s.acquire(priority, &a).await.unwrap();
+                let now = c.fetch_add(1, Ordering::SeqCst) + 1;
+                m.fetch_max(now, Ordering::SeqCst);
+                o.lock().push((priority, i));
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                c.fetch_sub(1, Ordering::SeqCst);
+            }));
+            // Arrival order is part of the tie-break, so make it definite: the
+            // next waiter is not started until this one is in the queue.
+            while scheduler.queued() < i + 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+        drop(first);
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(max_seen.load(Ordering::SeqCst), 1);
+        assert_eq!(scheduler.peak(), 1);
+        assert_eq!(scheduler.running(), 0);
+        let order: Vec<(f64, usize)> = order.lock().clone();
+        // Descending priority; the two 9.0s earlier arrival first.
+        let priorities: Vec<f64> = order.iter().map(|(p, _)| *p).collect();
+        assert_eq!(priorities, vec![9.0, 9.0, 6.0, 3.0, 1.5, 1.0], "{:?}", order);
+        assert_eq!(order[0].1, 1, "ties go to the earlier arrival");
+    }
+
+    /// With more waiters than slots, no more than the bound ever sweep at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_scheduler_never_exceeds_its_bound() {
+        let scheduler = std::sync::Arc::new(SweepScheduler::new(2));
+        let alive = std::sync::Arc::new(AtomicBool::new(true));
+        let concurrent = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let handles: Vec<_> = (0..12)
+            .map(|i| {
+                let (s, a, c, m) = (
+                    scheduler.clone(),
+                    alive.clone(),
+                    concurrent.clone(),
+                    max_seen.clone(),
+                );
+                tokio::spawn(async move {
+                    let _permit = s.acquire(i as f64, &a).await.unwrap();
+                    let now = c.fetch_add(1, Ordering::SeqCst) + 1;
+                    m.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    c.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert!(max_seen.load(Ordering::SeqCst) <= 2);
+        assert!(scheduler.peak() <= 2);
+        assert_eq!(scheduler.granted(), 12);
+        assert_eq!(scheduler.running(), 0);
+    }
+
+    /// A service whose table is dropped while it waits leaves the queue, and
+    /// its slot — if it was handed one meanwhile — goes to the next waiter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_tables_wait_leaves_the_queue() {
+        let scheduler = std::sync::Arc::new(SweepScheduler::new(1));
+        let alive = AtomicBool::new(true);
+        let held = scheduler.acquire(1.0, &alive).await.unwrap();
+        let dead = std::sync::Arc::new(AtomicBool::new(true));
+        let (s, d) = (scheduler.clone(), dead.clone());
+        let waiter = tokio::spawn(async move { s.acquire(5.0, &d).await.is_some() });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        dead.store(false, Ordering::Release);
+        assert!(!waiter.await.unwrap(), "a stopped service gets no permit");
+        drop(held);
+        assert_eq!(scheduler.running(), 0);
+        assert!(scheduler.acquire(1.0, &alive).await.is_some());
+    }
+
+    /// The ordering in `vacuum-frees-visible-versions`: the deleter begins,
+    /// the reader begins and snapshots while the deleter runs, the deleter
+    /// commits. The reader's snapshot still sees the version; the horizon must
+    /// not call it reclaimable until that snapshot is gone.
+    #[test]
+    fn a_version_an_open_snapshot_sees_is_not_reclaimable() {
+        let m = Arc::new(TransactionManager::in_memory());
+        let deleter = m.begin();
+        let reader = m.begin();
+        let snapshot = m.snapshot(reader);
+        m.commit(deleter);
+        assert!(deleter < m.oldest_active(), "the deleter has retired");
+        assert!(
+            snapshot.sees(FROZEN_TX, deleter, &|id| m.outcome(id)),
+            "the reader's snapshot still sees the version"
+        );
+
+        let horizon = VersionHorizon::sample(&m);
+        assert!(
+            !horizon.is_reclaimable(false, FROZEN_TX, deleter),
+            "reclaimable while an open snapshot sees it (horizon {:?})",
+            horizon
+        );
+        // A plain statement's snapshot outside any transaction pins it too —
+        // it is in no running set, so `oldest_active` never knew of it.
+        let plain = m.snapshot(NO_TX);
+        drop(snapshot);
+        m.commit(reader);
+        let later = m.begin();
+        let stamped_after = later;
+        m.commit(later);
+        let horizon = VersionHorizon::sample(&m);
+        assert!(
+            !horizon.is_reclaimable(false, FROZEN_TX, stamped_after),
+            "a delete after the plain snapshot was taken is visible to it"
+        );
+        drop(plain);
+        // Every snapshot gone: now it is reclaimable.
+        let horizon = VersionHorizon::sample(&m);
+        assert!(horizon.is_reclaimable(false, FROZEN_TX, deleter));
+        assert!(horizon.is_reclaimable(false, FROZEN_TX, stamped_after));
+        assert_eq!(m.live_snapshots(), 0);
+    }
+
+    /// The horizon a scan samples never moves backwards, which the sweep's
+    /// `cleared_below` bookkeeping relies on.
+    #[test]
+    fn the_horizon_never_moves_backwards() {
+        let m = Arc::new(TransactionManager::in_memory());
+        let mut last = 0;
+        let mut held: Vec<crate::core::mvcc::transaction::Snapshot> = Vec::new();
+        let mut running: Vec<TxId> = Vec::new();
+        let mut rng = 0x1234_5678_9ABC_DEF1u64;
+        for _ in 0..20_000 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            match rng % 6 {
+                0 | 1 => running.push(m.begin()),
+                2 if !running.is_empty() => {
+                    let tx = running.remove((rng as usize / 7) % running.len());
+                    m.commit(tx);
+                }
+                3 => held.push(m.snapshot(running.last().copied().unwrap_or(NO_TX))),
+                4 if !held.is_empty() => {
+                    held.remove((rng as usize / 11) % held.len());
+                }
+                _ => {}
+            }
+            let now = VersionHorizon::sample(&m).oldest_active();
+            assert!(now >= last, "horizon went from {} back to {}", last, now);
+            last = now;
+        }
+    }
+}
+
+#[cfg(test)]
+mod push_run_tests {
+    use super::push_run;
+
+    fn runs_of(slots: &[u64]) -> Vec<(u64, u64)> {
+        let mut runs = Vec::new();
+        for &s in slots {
+            push_run(&mut runs, s);
+        }
+        runs
+    }
+
+    #[test]
+    fn only_adjacent_slots_merge() {
+        assert_eq!(runs_of(&[]), vec![]);
+        assert_eq!(runs_of(&[7]), vec![(7, 1)]);
+        assert_eq!(runs_of(&[0, 1, 2]), vec![(0, 3)]);
+        assert_eq!(
+            runs_of(&[10, 12, 13, 14, 40]),
+            vec![(10, 1), (12, 3), (40, 1)],
+            "a run spanned a gap, which clears the live slots inside it"
+        );
+        assert_eq!(runs_of(&[5, 7, 9]), vec![(5, 1), (7, 1), (9, 1)]);
+    }
+}
+
+#[cfg(test)]
+mod sweep_scheduler_tests {
+    use super::*;
+    use futures::FutureExt;
+
+    /// A waiter handed the slot and then dropped before it ran gives the
+    /// slot on. It kept it: one slot fewer for good, and with them all lost
+    /// no sweep anywhere ever ran again.
+    #[tokio::test]
+    async fn a_waiter_dropped_after_its_grant_gives_the_slot_back() {
+        let scheduler = SweepScheduler::new(1);
+        let alive = AtomicBool::new(true);
+        let held = scheduler.acquire(1.0, &alive).await.expect("the free slot");
+        let mut waiter = Box::pin(scheduler.acquire(1.0, &alive));
+        assert!((&mut waiter).now_or_never().is_none(), "queued behind the holder");
+        assert_eq!(scheduler.queued(), 1);
+        drop(held); // granted to the waiter, which has not run since
+        assert_eq!(scheduler.running(), 1);
+        drop(waiter);
+        assert_eq!(scheduler.running(), 0, "the slot granted to a dropped waiter was lost");
+        // And the next one gets it.
+        let next = scheduler.acquire(1.0, &alive).now_or_never();
+        assert!(matches!(next, Some(Some(_))));
+    }
+
+    /// A waiter dropped while still queued leaves the queue.
+    #[tokio::test]
+    async fn a_waiter_dropped_while_queued_leaves_the_queue() {
+        let scheduler = SweepScheduler::new(1);
+        let alive = AtomicBool::new(true);
+        let held = scheduler.acquire(1.0, &alive).await.expect("the free slot");
+        let mut waiter = Box::pin(scheduler.acquire(1.0, &alive));
+        assert!((&mut waiter).now_or_never().is_none());
+        drop(waiter);
+        assert_eq!(scheduler.queued(), 0);
+        drop(held);
+        assert_eq!(scheduler.running(), 0);
     }
 }

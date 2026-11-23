@@ -1,0 +1,1220 @@
+//! Combining the branches of a `UNION` into one result.
+//!
+//! The executor runs each branch and hands its serialized rows here. This
+//! removes duplicates from the branches that need it, then applies the
+//! trailing `ORDER BY`, `OFFSET` and `LIMIT` to the combined rows.
+//!
+//! Two rows are duplicates when PostgreSQL's `=` calls every pair of their
+//! values equal, and NULL equals NULL. That is not the same as their bytes
+//! being equal. Each serialized cell carries the position of the column it was
+//! read from, so `open` from the third column of one table and `open` from the
+//! second of another were two rows. And a cell carries its own type, so an
+//! `int` 1 and a `bigint` 1 were two rows, where PostgreSQL makes the column a
+//! `bigint` and keeps one.
+//!
+//! That widening is also a matter of what the client is told. The column is
+//! described by the first branch's type, and the wire encoder renders each
+//! value by that description: a `bigint` value under an `int` description
+//! did not fit and went out as NULL. So a column whose branches declare
+//! integers of different widths is widened, in the rows and in the
+//! description alike, by [`widened_integers`].
+
+use std::cmp::Ordering;
+
+use rclite::Arc;
+
+use crate::core::database::Database;
+use crate::core::db_type::DbType;
+use crate::core::row::row::{serialized_cells, serialized_rows};
+use crate::core::rql::join::UnionParts;
+
+/// A branch with no `FROM` (`SELECT 1.5, 'z'`): each item's type as
+/// PostgreSQL types the constant, and the places it was written with. An
+/// integer is `integer` (`bigint` past it), a number with a point
+/// `numeric`, a string `text`, `true`/`false` `boolean`, `NULL` unknown
+/// (`DbType::NULL`); anything else (an expression) unknown (`None`). `None`
+/// for a branch that has a `FROM`, or that this cannot read.
+///
+/// Without it, such a branch's types were unknown: a NUMERIC column beside it
+/// was refused, and an integer column never learned of its `2.5`, which went
+/// out as NULL under the integer's description.
+pub fn constant_branch(branch: &str) -> Option<Vec<(Option<DbType>, u32)>> {
+    let text = branch.trim().trim_start_matches('(').trim_end_matches(')').trim();
+    if text.len() < 7 || !text.as_bytes()[..7].eq_ignore_ascii_case(b"SELECT ") {
+        return None;
+    }
+    let list = &text[7..];
+    for keyword in ["FROM", "WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET"] {
+        if crate::core::rql::join::find_keyword(list, keyword, 0).is_some() {
+            return None;
+        }
+    }
+    let list = crate::core::rql::cte::without_set_quantifier(list);
+    Some(
+        crate::core::rql::lexer_ct::split_definitions(list)
+            .iter()
+            .map(|item| {
+                let item = item.trim();
+                let value = match crate::core::rql::join::find_keyword(item, "AS", 0) {
+                    Some(at) => item[..at].trim(),
+                    None => item,
+                };
+                if value.eq_ignore_ascii_case("NULL") {
+                    (Some(DbType::NULL), 0)
+                } else if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") {
+                    (Some(DbType::BOOL), 0)
+                } else if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+                    (Some(DbType::STRING), 0)
+                } else if let Ok(n) = value.parse::<i64>() {
+                    (Some(if i32::try_from(n).is_ok() { DbType::I32 } else { DbType::I64 }), 0)
+                } else if value.trim_start_matches(['-', '+']).chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '-' | '+'))
+                    && value.chars().any(|c| c.is_ascii_digit())
+                {
+                    // `1.50`, `1e2`, `1.5e-3`: `numeric`, at the places
+                    // PostgreSQL shows it with (`1e2` is 100, `1e-2` 0.01).
+                    match crate::core::rql::pg_numeric::parse_text(value) {
+                        Some(n) => (Some(DbType::DECIMAL), n.s),
+                        None => (None, 0),
+                    }
+                } else {
+                    (None, 0)
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Each output column's type in `branch`: as declared, else as its select
+/// list types it, else as its constants are typed (`constant_branch`).
+pub fn branch_types(
+    branch: &str,
+    database: &Arc<Database>,
+    relations: &[(String, crate::core::rql::cte::ScratchFields)],
+    in_later_branch: bool,
+) -> Vec<Option<DbType>> {
+    if let Some(constants) = constant_branch(branch) {
+        return constants.into_iter().map(|(t, _)| t).collect();
+    }
+    let mut types = crate::core::rql::cte::declared_item_types_among(branch, database, relations);
+    if let Some(own) = crate::core::rql::lexer_s1::recognize_query_purpose(branch)
+        .and_then(|p| crate::core::rql::executor::query_output_types(&p, database, in_later_branch))
+    {
+        types.resize(types.len().max(own.len()), None);
+        for (at, t) in own.into_iter().enumerate() {
+            if types[at].is_none() {
+                types[at] = Some(t);
+            }
+        }
+    }
+    types
+}
+
+/// For each output column of a `UNION`, the integer type its values are
+/// widened to, when its branches declare integers of different widths, as
+/// PostgreSQL widens `int` and `bigint` to `bigint`. `None` where nothing
+/// changes, or where any branch's type is not known: an expression's type is
+/// not resolved here, and widening by a guess could disagree with the
+/// description.
+///
+/// The executor widens the rows by this and the wire layer the description,
+/// so both read it from here.
+pub fn widened_integers(parts: &UnionParts, database: &Arc<Database>) -> Vec<Option<DbType>> {
+    widened_branch_integers(&parts.branches, database, &[])
+}
+
+/// [`widened_integers`] over the branches alone, where a branch may also read
+/// one of `relations`: the CTEs and derived tables a describe resolved. The
+/// executor runs the statement with those materialised into real relations,
+/// so the describe has to type them the same way to reach the same answer.
+pub fn widened_branch_integers(
+    branches: &[String],
+    database: &Arc<Database>,
+    relations: &[(String, crate::core::rql::cte::ScratchFields)],
+) -> Vec<Option<DbType>> {
+    // A constant, an expression or an aggregate declares nothing; its type is
+    // the select list's own. Unread, `SELECT i FROM nn UNION SELECT 1 FROM mm`
+    // sent the constant's eight bytes under `i`'s int4 description, which
+    // rendered empty.
+    let declared: Vec<Vec<Option<DbType>>> =
+        branches.iter().map(|branch| branch_types(branch, database, relations, false)).collect();
+    let width = declared.iter().map(Vec::len).min().unwrap_or(0);
+    // `character(n)` in the first branch and text in another: PostgreSQL
+    // resolves the column to `bpchar` (the first branch's type wins where each
+    // casts to the other), so the text values are read without trailing
+    // spaces, and `'ab'` and `'ab  '` are one row. Marked `BPCHAR` here, which
+    // `push_widened` applies to the cells.
+    let padded: Vec<Vec<Option<u32>>> = if branches.len() > 1 {
+        branches.iter().map(|b| branch_bpchar_widths(b, database)).collect()
+    } else {
+        Vec::new()
+    };
+    (0..width)
+        .map(|at| {
+            if let Some(first) = padded.first().and_then(|w| w.get(at).copied().flatten()) {
+                let others: Vec<Option<u32>> = padded[1..].iter().map(|w| w.get(at).copied().flatten()).collect();
+                let text_beside = declared[1..].iter().zip(&others).any(|(b, w)| {
+                    w.is_none() && matches!(b.get(at), Some(Some(DbType::STRING)) | Some(None))
+                });
+                if text_beside {
+                    return Some(DbType::bpchar(0));
+                }
+                if others.iter().any(|w| *w != Some(first)) {
+                    return None;
+                }
+            }
+            let types: Vec<&DbType> =
+                declared.iter().map(|b| b[at].as_ref()).collect::<Option<Vec<_>>>()?;
+            // NUMERIC beside integers (or NULLs): PostgreSQL resolves the
+            // column to `numeric`, and each cell is carried as one at its own
+            // scale (`union_decimal_scales`). Described so whichever branch
+            // came first: an integer's description dropped `2.5` as NULL.
+            let integer = |t: &DbType| matches!(t, DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32);
+            // A float beside other numbers: PostgreSQL resolves the column to
+            // `double precision`, every cell converted to one (`push_widened`).
+            let float = |t: &DbType| matches!(t, DbType::F32 | DbType::F64);
+            if types.iter().any(|t| float(t))
+                && !types.iter().all(|t| **t == DbType::F64 || **t == DbType::NULL)
+                && types.iter().all(|t| float(t) || **t == DbType::DECIMAL || **t == DbType::NULL || integer(t))
+            {
+                return Some(DbType::F64);
+            }
+            if types.iter().any(|t| **t == DbType::DECIMAL)
+                && types.iter().all(|t| **t == DbType::DECIMAL || **t == DbType::NULL || integer(t))
+            {
+                return Some(DbType::DECIMAL);
+            }
+            if types.windows(2).all(|w| w[0] == w[1]) {
+                return None;
+            }
+            // The narrowest signed type each one fits in, and the widest of those.
+            let widest = types
+                .iter()
+                .map(|t| match t {
+                    DbType::I8 => Some(1u8),
+                    DbType::I16 | DbType::U8 => Some(2),
+                    DbType::I32 | DbType::U16 => Some(4),
+                    DbType::I64 | DbType::U32 => Some(8),
+                    DbType::I128 | DbType::U64 => Some(16),
+                    _ => None,
+                })
+                .collect::<Option<Vec<u8>>>()?
+                .into_iter()
+                .max()?;
+            Some(match widest {
+                1 => DbType::I8,
+                2 => DbType::I16,
+                4 => DbType::I32,
+                8 => DbType::I64,
+                _ => DbType::I128,
+            })
+        })
+        .collect()
+}
+
+/// The `character(n)` length of each output column of `branch`, a `SELECT`
+/// of one relation, where the column yields `character(n)` (`0` for a bare
+/// `bpchar`): a column declared so, a cast to it, `MIN`/`MAX` of one. Empty
+/// for a branch this cannot read (a join).
+pub fn branch_bpchar_widths(branch: &str, database: &Arc<Database>) -> Vec<Option<u32>> {
+    use crate::core::rql::aggregate::{AggFunc, SelectItem};
+    use crate::core::rql::type_modifier::TextTypmod;
+    let Some(purpose) = crate::core::rql::lexer_s1::recognize_query_purpose(branch) else { return Vec::new() };
+    let crate::core::rql::lexer_s1::QueryPurpose::QueryRows(qr) = &purpose else { return Vec::new() };
+    if crate::core::rql::join::statement_has_join(&qr.query) {
+        return Vec::new();
+    }
+    let Some(view) = database.schema_view(&qr.table_name) else { return Vec::new() };
+    let schema = view.schema();
+    let Ok(parsed) = crate::core::rql::lexer_query::row_fetch_from_select_query(&purpose, &schema.fields) else {
+        return Vec::new();
+    };
+    let of_field = |f: &crate::core::row::schema::SchemaField| match (f.db_type == DbType::STRING, f.text_typmod()) {
+        (true, Some(TextTypmod::Bpchar(n))) => Some(n),
+        _ => None,
+    };
+    let of_item = |item: &SelectItem| match item {
+        SelectItem::Column { field, .. } => of_field(field),
+        SelectItem::RowExpr { expr, .. } => crate::core::rql::expr::bpchar_width(expr),
+        SelectItem::Aggregate { func: AggFunc::Min | AggFunc::Max, arg: Some(field), arg_expr: None, .. } => of_field(field),
+        _ => None,
+    };
+    if let Some(plan) = &parsed.aggregate {
+        return plan.items.iter().map(of_item).collect();
+    }
+    if !parsed.select_items.is_empty() {
+        return parsed.select_items.iter().map(of_item).collect();
+    }
+    parsed
+        .requested_row_fetch
+        .columns_fetching_data
+        .iter()
+        .take(parsed.visible_columns)
+        .map(|c| {
+            schema
+                .fields
+                .iter()
+                .find(|f| f.write_order == c.schema_id)
+                .or_else(|| schema.fields.get(c.schema_id as usize))
+                .and_then(of_field)
+        })
+        .collect()
+}
+
+/// The bytes of `v` as the integer type `ty`, `None` when it does not fit.
+fn integer_bytes(v: i128, ty: &DbType) -> Option<Vec<u8>> {
+    Some(match ty {
+        DbType::I8 => i8::try_from(v).ok()?.to_le_bytes().to_vec(),
+        DbType::I16 => i16::try_from(v).ok()?.to_le_bytes().to_vec(),
+        DbType::I32 => i32::try_from(v).ok()?.to_le_bytes().to_vec(),
+        DbType::I64 => i64::try_from(v).ok()?.to_le_bytes().to_vec(),
+        DbType::I128 => v.to_le_bytes().to_vec(),
+        _ => return None,
+    })
+}
+
+#[cfg(feature = "enable_long_row")]
+fn push_row_length(out: &mut Vec<u8>, payload: usize) {
+    out.extend_from_slice(&(payload as u64).to_le_bytes());
+}
+#[cfg(not(feature = "enable_long_row"))]
+fn push_row_length(out: &mut Vec<u8>, payload: usize) {
+    out.extend_from_slice(&(payload as u32).to_le_bytes());
+}
+
+/// For each output column of a `UNION` whose branches are NUMERIC at
+/// different scales, or NUMERIC and integer, the scale each branch's cells are
+/// stored at there: `rescale[branch][column]`. Such a column is described by
+/// the first branch, at its scale, and its cells were all read at that scale:
+/// `numeric(10,2) UNION ALL numeric(12,4)` showed 3.1415 as 314.15, and an
+/// integer under a NUMERIC description went out empty. Each cell is then
+/// carried at its own scale (`value_codec::decimal_cell_with_scale`), as
+/// PostgreSQL shows each value of a `numeric` column at its own.
+///
+/// `Ok(None)` when no column needs it; refused when the first branch is an
+/// integer and a later one NUMERIC, a column PostgreSQL makes `numeric` and
+/// this would describe as the integer; `None` for a branch whose scales are
+/// not known leaves that column as it was.
+pub fn union_decimal_scales(
+    declared: &[Vec<Option<DbType>>],
+    scales: &[Option<Vec<u32>>],
+) -> Result<Option<Vec<Vec<Option<u32>>>>, String> {
+    let integer_type = |t: &DbType| {
+        matches!(
+            t,
+            DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::I128 | DbType::U8 | DbType::U16 | DbType::U32
+                | DbType::U64
+        )
+    };
+    let width = declared.iter().map(Vec::len).max().unwrap_or(0);
+    let mut out = vec![vec![None; width]; declared.len()];
+    let mut any = false;
+    for at in 0..width {
+        let types: Vec<Option<&DbType>> = declared.iter().map(|b| b.get(at).and_then(Option::as_ref)).collect();
+        if !types.iter().any(|t| *t == Some(&DbType::DECIMAL)) {
+            continue;
+        }
+        let refuse = |why: &str| {
+            Err(format!(
+                "UNION column {} is NUMERIC in one branch and {why}, which is not supported: cast each branch's \
+                 column to numeric",
+                at + 1
+            ))
+        };
+        // Never mixed: a branch whose type is not known, or one that is
+        // neither NUMERIC nor an integer (a float, text), is refused rather
+        // than read at another branch's layout (`numeric UNION float8`
+        // rendered blanks or "}").
+        if types.iter().any(Option::is_none) {
+            return refuse("of a type this cannot tell in another (a constant with no FROM, a join)");
+        }
+        // A float makes the column `double precision` (`widened_branch_integers`):
+        // its NUMERIC cells are carried at their own scale first, so the
+        // conversion reads each at the right one.
+        let float = |t: &DbType| matches!(t, DbType::F32 | DbType::F64);
+        if let Some(other) = types
+            .iter()
+            .flatten()
+            .find(|t| ***t != DbType::DECIMAL && ***t != DbType::NULL && !integer_type(t) && !float(t))
+        {
+            return refuse(&format!("{other} in another"));
+        }
+        // The scale each branch's cells are at: a column's declared one, an
+        // expression's display scale or the engine's (`query_output_scales`).
+        let at_scale: Option<Vec<u32>> = types
+            .iter()
+            .zip(scales)
+            .map(|(t, s)| {
+                // A NULL branch's cells are NULL, left as they are.
+                if *t == Some(&DbType::DECIMAL) { s.as_ref().and_then(|s| s.get(at).copied()) } else { Some(0) }
+            })
+            .collect();
+        let Some(at_scale) = at_scale else {
+            return refuse("at a scale this cannot tell in another");
+        };
+        any = true;
+        for (branch, scale) in at_scale.into_iter().enumerate() {
+            out[branch][at] = Some(scale);
+        }
+    }
+    Ok(any.then_some(out))
+}
+
+/// A float cell's value as the decimal it was written as, through its
+/// shortest digits: a select list's numeric constant (`SELECT 1.25`) is
+/// carried as a float, and in a NUMERIC column of a `UNION` it is that
+/// number.
+fn float_decimal(v: &[u8]) -> Option<(i128, u32)> {
+    let f = f64::from_le_bytes(le::<8>(v)?);
+    if !f.is_finite() {
+        return None;
+    }
+    let text = format!("{f}");
+    let (whole, frac) = text.split_once('.').unwrap_or((&text, ""));
+    let scale = u32::try_from(frac.len()).ok().filter(|s| *s <= 38)?;
+    Some((format!("{whole}{frac}").parse().ok()?, scale))
+}
+
+/// A NUMERIC cell's value and scale: one carrying its own (seventeen
+/// bytes), or an ordinary one at `default`.
+fn decimal_at(v: &[u8], default: u32) -> Option<(i128, u32)> {
+    let (m, own) = crate::core::value_codec::split_decimal_cell(v)?;
+    Some((m, own.unwrap_or(default)))
+}
+
+/// Appends `row` to `out` with each integer cell at a widened position
+/// rewritten as the wider type, and each cell at a rescaled position as a
+/// NUMERIC carrying its scale ([`union_decimal_scales`]), in the serialized
+/// layout: the length header, then per cell its size, schema id, data and
+/// type tag.
+fn push_widened(
+    row: &[u8],
+    widen: &[Option<DbType>],
+    rescale: Option<&[Option<u32>]>,
+    out: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    let start = out.len();
+    push_row_length(out, 0);
+    let header = out.len() - start;
+    for (position, cell) in serialized_cells(row)?.enumerate() {
+        let cell = cell?;
+        let scaled = rescale.and_then(|r| r.get(position).copied().flatten()).and_then(|scale| {
+            let (m, scale) = match cell.column_type {
+                DbType::DECIMAL => match decimal_at(cell.data, scale)? {
+                    // Already carrying its own scale: kept.
+                    (_, own) if cell.data.len() == 17 => return Some((DbType::DECIMAL, cell.data.to_vec())).filter(|_| own <= 38),
+                    (m, _) => (m, scale),
+                },
+                DbType::F64 => float_decimal(cell.data)?,
+                ref t => (integer(t, cell.data)?, scale),
+            };
+            Some((DbType::DECIMAL, crate::core::value_codec::decimal_cell_with_scale(m, scale)))
+        });
+        // A text cell of a column resolved to `bpchar` (`widened_branch_integers`)
+        // is read as one: without its trailing spaces.
+        if matches!(widen.get(position), Some(Some(DbType::BPCHAR(_)))) && cell.column_type == DbType::STRING {
+            let end = cell.data.iter().rposition(|b| *b != b' ').map_or(0, |at| at + 1);
+            let data = &cell.data[..end];
+            out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            out.extend_from_slice(&u64::from(cell.schema_id).to_le_bytes());
+            out.extend_from_slice(data);
+            out.push(cell.column_type.to_byte());
+            continue;
+        }
+        let wide = scaled.or_else(|| {
+            widen.get(position).and_then(|t| t.as_ref()).filter(|t| **t != DbType::F64).and_then(|ty| {
+                let bytes = integer_bytes(integer(&cell.column_type, cell.data)?, ty)?;
+                Some((ty.clone(), bytes))
+            })
+        });
+        // A column resolved to `double precision`: each number as one, a
+        // NUMERIC read at the scale it carries (rescaled above).
+        let wide = match widen.get(position) {
+            Some(Some(DbType::F64)) => {
+                let (ty, data) = match &wide {
+                    Some((ty, bytes)) => (ty.clone(), bytes.as_slice()),
+                    None => (cell.column_type.clone(), cell.data),
+                };
+                let value = match ty {
+                    DbType::F64 => le::<8>(data).map(f64::from_le_bytes),
+                    DbType::F32 => le::<4>(data).map(|b| f32::from_le_bytes(b) as f64),
+                    DbType::DECIMAL => decimal_at(data, crate::core::value_codec::DECIMAL_SCALE)
+                        .and_then(|(m, s)| format!("{m}e-{s}").parse::<f64>().ok()),
+                    ref t => integer(t, data).map(|v| v as f64),
+                };
+                match value {
+                    Some(v) => Some((DbType::F64, v.to_le_bytes().to_vec())),
+                    None => wide,
+                }
+            }
+            _ => wide,
+        };
+        let (ty, data) = match &wide {
+            Some((ty, bytes)) => (ty, bytes.as_slice()),
+            None => (&cell.column_type, cell.data),
+        };
+        out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        out.extend_from_slice(&u64::from(cell.schema_id).to_le_bytes());
+        out.extend_from_slice(data);
+        out.push(ty.to_byte());
+    }
+    let payload = out.len() - start - header;
+    let mut length = Vec::with_capacity(header);
+    push_row_length(&mut length, payload);
+    out[start..start + header].copy_from_slice(&length);
+    Ok(())
+}
+
+/// One resolved key of the trailing `ORDER BY`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SortKey {
+    /// Zero-based output column.
+    position: usize,
+    descending: bool,
+    nulls_first: bool,
+}
+
+/// The rows of a `UNION` as its branches arrive.
+pub struct Combined {
+    /// What the caller wants before the rows (the result marker), then each
+    /// kept row's serialized bytes.
+    out: Vec<u8>,
+    /// Where each kept row starts in `out`.
+    starts: Vec<usize>,
+    /// The duplicate keys of the rows kept from distinct branches, back to
+    /// back, and where each one starts. Only the distinct prefix has them,
+    /// and it comes first, so key `i` belongs to row `i`.
+    keys: Vec<u8>,
+    key_starts: Vec<usize>,
+    seen: hashbrown::HashTable<u32>,
+    state: ahash::RandomState,
+    /// Which output columns hold documents, compared by value.
+    documents: Vec<bool>,
+    /// The integer type each output column is widened to, if any.
+    widen: Vec<Option<DbType>>,
+    /// Per branch, the scale each rescaled column's cells are at
+    /// ([`union_decimal_scales`]).
+    rescale: Option<Vec<Vec<Option<u32>>>>,
+    sort: Vec<SortKey>,
+    limit: Option<u64>,
+    offset: u64,
+}
+
+impl Combined {
+    /// `documents` says which output positions hold documents in any branch,
+    /// and `names` are the first branch's output names, which a trailing
+    /// `ORDER BY` may sort by. `widen` is [`widened_integers`]. `out` is what
+    /// the result starts with.
+    pub fn new(
+        parts: &UnionParts,
+        documents: Vec<bool>,
+        widen: Vec<Option<DbType>>,
+        names: &[Option<String>],
+        out: Vec<u8>,
+    ) -> Result<Self, String> {
+        let sort = match parts.order_by.as_deref() {
+            Some(clause) => resolve_sort(clause, names)?,
+            None => Vec::new(),
+        };
+        Ok(Combined {
+            out,
+            starts: Vec::new(),
+            keys: Vec::new(),
+            key_starts: Vec::new(),
+            seen: hashbrown::HashTable::new(),
+            state: ahash::RandomState::new(),
+            documents,
+            widen,
+            rescale: None,
+            sort,
+            limit: parts.limit,
+            offset: parts.offset,
+        })
+    }
+
+    /// True when no later branch can change the answer: with no sort, the
+    /// rows kept so far are the first rows of the result, and a later branch
+    /// only adds rows after them.
+    pub fn is_full(&self) -> bool {
+        self.sort.is_empty()
+            && self
+                .limit
+                .is_some_and(|n| self.starts.len() as u64 >= n.saturating_add(self.offset))
+    }
+
+    /// Sets [`union_decimal_scales`]'s answer, which [`Combined::push`] reads
+    /// by branch.
+    pub fn rescale(&mut self, rescale: Option<Vec<Vec<Option<u32>>>>) {
+        self.rescale = rescale;
+    }
+
+    /// Adds one branch's serialized rows. `distinct` drops each row equal to
+    /// one already kept; the branches for which it is set must come first.
+    /// `branch` is its position among the UNION's branches.
+    pub fn push(&mut self, rows: &[u8], distinct: bool, branch: usize) -> Result<(), String> {
+        let rescale = self.rescale.as_ref().and_then(|r| r.get(branch)).map(Vec::as_slice);
+        let mut key = Vec::new();
+        for row in serialized_rows(rows) {
+            if self.is_full() {
+                break;
+            }
+            let row = row.map_err(|e| format!("a UNION branch's rows could not be read: {}", e))?;
+            if distinct {
+                key.clear();
+                duplicate_key(row, &self.documents, rescale, &self.widen, &mut key)
+                    .map_err(|e| format!("a UNION branch's rows could not be read: {}", e))?;
+                let hash = self.state.hash_one(&key[..]);
+                let (keys, key_starts) = (&self.keys, &self.key_starts);
+                let key_at = |i: u32| -> &[u8] {
+                    let i = i as usize;
+                    let end = key_starts.get(i + 1).copied().unwrap_or(keys.len());
+                    &keys[key_starts[i]..end]
+                };
+                if self.seen.find(hash, |i| key_at(*i) == &key[..]).is_some() {
+                    continue;
+                }
+                let state = &self.state;
+                self.seen.insert_unique(hash, self.key_starts.len() as u32, |i| {
+                    state.hash_one(key_at(*i))
+                });
+                self.key_starts.push(self.keys.len());
+                self.keys.extend_from_slice(&key);
+            }
+            self.starts.push(self.out.len());
+            if self.widen.iter().any(Option::is_some) || rescale.is_some() {
+                push_widened(row, &self.widen, rescale, &mut self.out)
+                    .map_err(|e| format!("a UNION branch's rows could not be read: {}", e))?;
+            } else {
+                self.out.extend_from_slice(row);
+            }
+        }
+        Ok(())
+    }
+
+    /// Every branch's serialized rows, combined by `parts.ops` where they
+    /// are not all `UNION`: `INTERSECT` binds tighter than `UNION` and
+    /// `EXCEPT`, which apply from the left, as in PostgreSQL. Rows are equal
+    /// as a bare `UNION` finds them ([`duplicate_key`]: NULL equals NULL, a
+    /// document by value, integers and decimals in the column's common
+    /// form). Without `ALL` each result is distinct; with it, a bag:
+    /// `INTERSECT ALL` keeps a row as often as both sides have it, `EXCEPT
+    /// ALL` as often as the left has it more.
+    pub fn push_set_ops(&mut self, parts: &UnionParts, leaves: &[Vec<u8>]) -> Result<(), String> {
+        use crate::core::rql::join::SetKind;
+        let read = |e: std::io::Error| format!("a set operation's rows could not be read: {}", e);
+        let mut sets: Vec<Vec<SetRow<'_>>> = Vec::with_capacity(leaves.len());
+        for (branch, bytes) in leaves.iter().enumerate() {
+            let rescale = self.rescale.as_ref().and_then(|r| r.get(branch)).map(Vec::as_slice);
+            let mut rows = Vec::new();
+            for row in serialized_rows(bytes) {
+                let row = row.map_err(read)?;
+                let mut key = Vec::new();
+                duplicate_key(row, &self.documents, rescale, &self.widen, &mut key).map_err(read)?;
+                rows.push(SetRow { branch, row, key });
+            }
+            sets.push(rows);
+        }
+        // The `INTERSECT` runs first, each into one term.
+        let mut sets = sets.into_iter();
+        let mut current = sets.next().unwrap_or_default();
+        let mut terms: Vec<Vec<SetRow<'_>>> = Vec::new();
+        let mut between = Vec::new();
+        for (op, next) in parts.ops.iter().zip(sets) {
+            if op.kind == SetKind::Intersect {
+                current = intersect_rows(current, next, op.all);
+            } else {
+                terms.push(std::mem::take(&mut current));
+                between.push(*op);
+                current = next;
+            }
+        }
+        terms.push(current);
+        let mut terms = terms.into_iter();
+        let mut result = terms.next().unwrap_or_default();
+        for (op, next) in between.into_iter().zip(terms) {
+            result = match op.kind {
+                SetKind::Except => except_rows(result, next, op.all),
+                _ => union_rows(result, next, op.all),
+            };
+        }
+        for row in result {
+            if self.is_full() {
+                break;
+            }
+            self.keep(row.row, row.branch)?;
+        }
+        Ok(())
+    }
+
+    /// Keeps one row of branch `branch` as it is, widened or rescaled as the
+    /// column says.
+    fn keep(&mut self, row: &[u8], branch: usize) -> Result<(), String> {
+        let rescale: Option<Vec<Option<u32>>> = self.rescale.as_ref().and_then(|r| r.get(branch)).cloned();
+        self.starts.push(self.out.len());
+        if self.widen.iter().any(Option::is_some) || rescale.is_some() {
+            push_widened(row, &self.widen, rescale.as_deref(), &mut self.out)
+                .map_err(|e| format!("a set operation's rows could not be read: {}", e))?;
+        } else {
+            self.out.extend_from_slice(row);
+        }
+        Ok(())
+    }
+
+    /// The combined rows, sorted, offset and limited, after what `out` began
+    /// with.
+    pub fn finish(self) -> Result<Vec<u8>, String> {
+        let base = self.starts.first().copied().unwrap_or(self.out.len());
+        let row_at = |i: usize| -> &[u8] {
+            let end = self.starts.get(i + 1).copied().unwrap_or(self.out.len());
+            &self.out[self.starts[i]..end]
+        };
+        let mut order: Vec<usize> = (0..self.starts.len()).collect();
+        if !self.sort.is_empty() {
+            // Each row's sort cells, read once rather than once per comparison.
+            let mut cells: Vec<Vec<Option<(DbType, &[u8])>>> = Vec::with_capacity(order.len());
+            for i in 0..self.starts.len() {
+                let mut row: Vec<Option<(DbType, &[u8])>> = Vec::new();
+                for cell in serialized_cells(row_at(i)).map_err(|e| e.to_string())? {
+                    let cell = cell.map_err(|e| e.to_string())?;
+                    row.push(Some((cell.column_type, cell.data)));
+                }
+                if let Some(key) = self.sort.iter().find(|k| k.position >= row.len()) {
+                    return Err(format!(
+                        "ORDER BY position {} is not in the UNION's result, which has {} column(s)",
+                        key.position + 1,
+                        row.len()
+                    ));
+                }
+                cells.push(row);
+            }
+            let documents = &self.documents;
+            // A stable sort, so rows the keys call equal keep the order the
+            // branches produced them in.
+            order.sort_by(|&a, &b| {
+                for key in &self.sort {
+                    let document = documents.get(key.position).copied().unwrap_or(false);
+                    let ord = compare_cells(
+                        cells[a][key.position].as_ref(),
+                        cells[b][key.position].as_ref(),
+                        document,
+                        key,
+                    );
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+                Ordering::Equal
+            });
+        }
+        let skip = usize::try_from(self.offset).unwrap_or(usize::MAX);
+        let take = self
+            .limit
+            .map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
+        let picked = order.iter().skip(skip).take(take);
+        // Rows already in place need no copy: no sort and no offset leaves
+        // the buffer as it is, cut after the last row kept.
+        if self.sort.is_empty() && skip == 0 {
+            let kept = order.len().min(take);
+            let end = self.starts.get(kept).copied().unwrap_or(self.out.len());
+            let mut out = self.out;
+            out.truncate(end);
+            return Ok(out);
+        }
+        let mut out = Vec::with_capacity(self.out.len());
+        out.extend_from_slice(&self.out[..base]);
+        for &i in picked {
+            out.extend_from_slice(row_at(i));
+        }
+        Ok(out)
+    }
+}
+
+/// Reads a `UNION`'s trailing `ORDER BY` into output positions.
+///
+/// PostgreSQL sorts a set operation by its output columns only: a position, or
+/// a name the first branch gives a column. An expression is refused there, as
+/// it is here, rather than sorted by something else.
+/// One row of a set operation's operand: its branch, its bytes, and the key
+/// it is compared by.
+struct SetRow<'a> {
+    branch: usize,
+    row: &'a [u8],
+    key: Vec<u8>,
+}
+
+/// How many times each key appears in `rows`.
+fn key_counts(rows: &[SetRow<'_>]) -> std::collections::HashMap<Vec<u8>, usize> {
+    let mut counts = std::collections::HashMap::with_capacity(rows.len());
+    for r in rows {
+        *counts.entry(r.key.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// `a UNION [ALL] b`: each distinct row once, or every row of both.
+fn union_rows<'a>(mut a: Vec<SetRow<'a>>, b: Vec<SetRow<'a>>, all: bool) -> Vec<SetRow<'a>> {
+    a.extend(b);
+    if all {
+        return a;
+    }
+    let mut seen = std::collections::HashSet::with_capacity(a.len());
+    a.into_iter().filter(|r| seen.insert(r.key.clone())).collect()
+}
+
+/// `a INTERSECT [ALL] b`: each row of `a` that `b` has, once; or as many
+/// times as both have it.
+fn intersect_rows<'a>(a: Vec<SetRow<'a>>, b: Vec<SetRow<'a>>, all: bool) -> Vec<SetRow<'a>> {
+    let mut counts = key_counts(&b);
+    let mut seen = std::collections::HashSet::new();
+    a.into_iter()
+        .filter(|r| match counts.get_mut(&r.key) {
+            Some(n) if *n > 0 => {
+                if all {
+                    *n -= 1;
+                    true
+                } else {
+                    seen.insert(r.key.clone())
+                }
+            }
+            _ => false,
+        })
+        .collect()
+}
+
+/// `a EXCEPT [ALL] b`: each row of `a` that `b` lacks, once; or as many
+/// times as `a` has it more than `b`.
+fn except_rows<'a>(a: Vec<SetRow<'a>>, b: Vec<SetRow<'a>>, all: bool) -> Vec<SetRow<'a>> {
+    let mut counts = key_counts(&b);
+    let mut seen = std::collections::HashSet::new();
+    a.into_iter()
+        .filter(|r| match counts.get_mut(&r.key) {
+            Some(n) if *n > 0 => {
+                if all {
+                    *n -= 1;
+                }
+                false
+            }
+            _ => all || seen.insert(r.key.clone()),
+        })
+        .collect()
+}
+
+fn resolve_sort(clause: &str, names: &[Option<String>]) -> Result<Vec<SortKey>, String> {
+    let terms = crate::core::rql::order_by::parse(clause)?;
+    let mut keys = Vec::with_capacity(terms.len());
+    for term in terms {
+        let token = term.token.trim();
+        let position = if !token.is_empty() && token.bytes().all(|b| b.is_ascii_digit()) {
+            match token.parse::<usize>() {
+                Ok(n) if n >= 1 => n - 1,
+                _ => {
+                    return Err(format!(
+                        "ORDER BY position {} is not in the UNION's result",
+                        token
+                    ));
+                }
+            }
+        } else {
+            let matching: Vec<usize> = names
+                .iter()
+                .enumerate()
+                .filter(|(_, name)| name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(token)))
+                .map(|(at, _)| at)
+                .collect();
+            match matching.as_slice() {
+                [at] => *at,
+                [] => {
+                    return Err(format!(
+                        "ORDER BY '{}' must name a column of the UNION's result, or give its position",
+                        token
+                    ));
+                }
+                _ => return Err(format!("ORDER BY '{}' is ambiguous", token)),
+            }
+        };
+        keys.push(SortKey {
+            position,
+            descending: term.descending,
+            // PostgreSQL's default: NULL is the largest value.
+            nulls_first: term.nulls_first.unwrap_or(term.descending),
+        });
+    }
+    Ok(keys)
+}
+
+/// One sort key's order for two cells, NULLs placed as the key says.
+fn compare_cells(
+    a: Option<&(DbType, &[u8])>,
+    b: Option<&(DbType, &[u8])>,
+    document: bool,
+    key: &SortKey,
+) -> Ordering {
+    let null = |c: Option<&(DbType, &[u8])>| c.is_none_or(|(t, _)| *t == DbType::NULL);
+    let null_side = if key.nulls_first { Ordering::Less } else { Ordering::Greater };
+    let ord = match (null(a), null(b)) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return null_side,
+        (false, true) => return null_side.reverse(),
+        (false, false) => {
+            let (a, b) = (a.unwrap(), b.unwrap());
+            compare_values(a, b, document)
+        }
+    };
+    if key.descending { ord.reverse() } else { ord }
+}
+
+/// Two non-NULL values of one output column, in PostgreSQL's order.
+fn compare_values(a: &(DbType, &[u8]), b: &(DbType, &[u8]), document: bool) -> Ordering {
+    let ((ta, va), (tb, vb)) = (a, b);
+    // A stored document arrives typed as text and a computed one as `jsonb`;
+    // both are documents and order as documents.
+    if document || (*ta == DbType::JSONB && *tb == DbType::JSONB) {
+        return crate::core::jsonb::order(va, vb);
+    }
+    // NUMERICs carrying their own scales (`union_decimal_scales`): compared
+    // at the larger of the two.
+    if *ta == DbType::DECIMAL && *tb == DbType::DECIMAL && (va.len() == 17 || vb.len() == 17) {
+        let nine = crate::core::value_codec::DECIMAL_SCALE;
+        if let (Some((x, sx)), Some((y, sy))) = (decimal_at(va, nine), decimal_at(vb, nine)) {
+            let up = |m: i128, by: u32| 10i128.checked_pow(by).and_then(|f| m.checked_mul(f));
+            let aligned = if sx >= sy { up(y, sx - sy).map(|y| (x, y)) } else { up(x, sy - sx).map(|x| (x, y)) };
+            return match aligned {
+                Some((x, y)) => x.cmp(&y),
+                // Past an i128 once aligned: apart by more than a float's
+                // error, which is all the order needs.
+                None => crate::core::processor::concurrent_processor::pg_float_cmp(
+                    x as f64 / 10f64.powi(sx as i32),
+                    y as f64 / 10f64.powi(sy as i32),
+                ),
+            };
+        }
+    }
+    if ta == tb {
+        if va.is_empty() || vb.is_empty() {
+            // Only text has an empty value, and it sorts first, as its bytes do.
+            return va.len().cmp(&vb.len());
+        }
+        return crate::core::processor::concurrent_processor::compare_bytes_as_type(
+            ta.clone(),
+            va,
+            vb,
+        );
+    }
+    // Branches of different widths or kinds of number: PostgreSQL widens the
+    // column to one type, and their values compare as numbers.
+    if let (Some(x), Some(y)) = (integer(ta, va), integer(tb, vb)) {
+        return x.cmp(&y);
+    }
+    if let (Some(x), Some(y)) = (number(ta, va), number(tb, vb)) {
+        return crate::core::processor::concurrent_processor::pg_float_cmp(x, y);
+    }
+    if text_like(ta) && text_like(tb) {
+        return va.cmp(vb);
+    }
+    // Types PostgreSQL would not have put in one column. A fixed order keeps
+    // the sort total.
+    ta.to_byte().cmp(&tb.to_byte()).then_with(|| va.cmp(vb))
+}
+
+fn text_like(ty: &DbType) -> bool {
+    matches!(ty, DbType::STRING | DbType::CHAR)
+}
+
+fn le<const N: usize>(b: &[u8]) -> Option<[u8; N]> {
+    b.try_into().ok()
+}
+
+/// An integer cell's value, whatever its width.
+fn integer(ty: &DbType, v: &[u8]) -> Option<i128> {
+    Some(match ty {
+        DbType::I8 => i8::from_le_bytes(le::<1>(v)?) as i128,
+        DbType::I16 => i16::from_le_bytes(le::<2>(v)?) as i128,
+        DbType::I32 => i32::from_le_bytes(le::<4>(v)?) as i128,
+        DbType::I64 => i64::from_le_bytes(le::<8>(v)?) as i128,
+        DbType::I128 => i128::from_le_bytes(le::<16>(v)?),
+        DbType::U8 => u8::from_le_bytes(le::<1>(v)?) as i128,
+        DbType::U16 => u16::from_le_bytes(le::<2>(v)?) as i128,
+        DbType::U32 => u32::from_le_bytes(le::<4>(v)?) as i128,
+        DbType::U64 => u64::from_le_bytes(le::<8>(v)?) as i128,
+        DbType::U128 => i128::try_from(u128::from_le_bytes(le::<16>(v)?)).ok()?,
+        _ => return None,
+    })
+}
+
+/// An integer or floating-point cell's value as a float.
+fn number(ty: &DbType, v: &[u8]) -> Option<f64> {
+    match ty {
+        DbType::F32 => Some(f32::from_le_bytes(le::<4>(v)?) as f64),
+        DbType::F64 => Some(f64::from_le_bytes(le::<8>(v)?)),
+        _ => integer(ty, v).map(|i| i as f64),
+    }
+}
+
+/// Appends what one serialized row is deduplicated by: equal for two rows
+/// exactly when every pair of their values is equal, NULL equal to NULL, and
+/// independent of which column position each value was read from.
+///
+/// Each value is a marker and then its bytes, with variable-width ones
+/// length-prefixed, so the values of a row cannot run into each other:
+///
+/// - NULL is its marker alone.
+/// - A document is keyed by its value (`jsonb::push_group_key`), so
+///   `{"a":1}` and `{"a":1.0}` are one, as `=` says.
+/// - An integer of any width is its value. A float is too when it holds a
+///   whole number, as `int` and `float8` unify to `float8` and 1 = 1.0; any
+///   other float is its value as an `f64`, zero and NaN each spelled once.
+/// - Text and a single character are their bytes, so `text` meets `varchar`.
+/// - Anything else keeps its type tag with its bytes, as before.
+fn duplicate_key(
+    row: &[u8],
+    documents: &[bool],
+    rescale: Option<&[Option<u32>]>,
+    widen: &[Option<DbType>],
+    out: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    for (position, cell) in serialized_cells(row)?.enumerate() {
+        let cell = cell?;
+        let (ty, data) = (&cell.column_type, cell.data);
+        if *ty == DbType::NULL {
+            out.push(0);
+            continue;
+        }
+        // A rescaled NUMERIC column (`union_decimal_scales`): by value, its
+        // trailing zeros dropped, so 1.25 at two places meets 1.2500 at four
+        // and an integer 7 meets 7.00, as `=` says.
+        if let Some(scale) = rescale.and_then(|r| r.get(position).copied().flatten()) {
+            let value = match ty {
+                DbType::DECIMAL => decimal_at(data, scale),
+                DbType::F64 => float_decimal(data),
+                t => integer(t, data).map(|m| (m, 0)),
+            };
+            if let Some((mut m, mut scale)) = value {
+                while scale > 0 && m % 10 == 0 {
+                    m /= 10;
+                    scale -= 1;
+                }
+                out.push(7);
+                out.extend_from_slice(&m.to_le_bytes());
+                out.extend_from_slice(&scale.to_le_bytes());
+                continue;
+            }
+        }
+        // A NUMERIC carrying its own scale, by value (1.5 is 1.50).
+        if *ty == DbType::DECIMAL {
+            if let Some((mut m, Some(mut scale))) = crate::core::value_codec::split_decimal_cell(data) {
+                while scale > 0 && m % 10 == 0 {
+                    m /= 10;
+                    scale -= 1;
+                }
+                out.push(7);
+                out.extend_from_slice(&m.to_le_bytes());
+                out.extend_from_slice(&scale.to_le_bytes());
+                continue;
+            }
+        }
+        if *ty == DbType::JSONB || documents.get(position).copied().unwrap_or(false) {
+            out.push(1);
+            crate::core::jsonb::push_group_key(data, out);
+            continue;
+        }
+        if let Some(v) = integer(ty, data) {
+            out.push(2);
+            out.extend_from_slice(&v.to_le_bytes());
+            continue;
+        }
+        if let (DbType::F32 | DbType::F64, Some(v)) = (ty, number(ty, data)) {
+            // Below 2^127 a whole float is exactly an `i128`.
+            if v.is_finite() && v.fract() == 0.0 && v.abs() < 1.7e38 {
+                out.push(2);
+                out.extend_from_slice(&(v as i128).to_le_bytes());
+            } else if v.is_nan() {
+                out.push(3);
+            } else {
+                out.push(4);
+                out.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
+            continue;
+        }
+        let text = match ty {
+            // A column resolved to `bpchar` (`widened_branch_integers`): its
+            // values compare without trailing spaces, so 'ab' and a text
+            // branch's 'ab  ' are one row.
+            DbType::STRING if matches!(widen.get(position), Some(Some(DbType::BPCHAR(_)))) => {
+                let end = data.iter().rposition(|b| *b != b' ').map_or(0, |at| at + 1);
+                Some(std::borrow::Cow::Borrowed(&data[..end]))
+            }
+            DbType::STRING => Some(std::borrow::Cow::Borrowed(data)),
+            DbType::CHAR => Some(std::borrow::Cow::Borrowed(
+                crate::core::value_codec::legacy_char_text(data).as_bytes(),
+            )),
+            _ => None,
+        };
+        match text {
+            Some(text) => {
+                out.push(5);
+                out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+                out.extend_from_slice(&text);
+            }
+            None => {
+                out.push(6);
+                out.push(ty.to_byte());
+                out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                out.extend_from_slice(data);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::row::row::{Column, Row};
+
+    fn cell(schema_id: u32, ty: DbType, data: &[u8]) -> Column {
+        let mut block = crate::memory_pool::MEMORY_POOL.acquire(data.len());
+        if !data.is_empty() {
+            block.into_slice_mut().copy_from_slice(data);
+        }
+        Column { schema_id, data: block, column_type: ty }
+    }
+
+    fn serialized(columns: Vec<Column>) -> Vec<u8> {
+        let row = Row { columns: columns.into_iter().collect(), ..Default::default() };
+        let mut out = Vec::new();
+        row.extend_serialized(&mut out);
+        out
+    }
+
+    fn key(columns: Vec<Column>, documents: &[bool]) -> Vec<u8> {
+        let mut out = Vec::new();
+        duplicate_key(&serialized(columns), documents, None, &[], &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn the_key_ignores_the_source_position() {
+        let a = key(vec![cell(2, DbType::STRING, b"open")], &[]);
+        let b = key(vec![cell(1, DbType::STRING, b"open")], &[]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn integers_of_different_widths_are_one_value() {
+        let a = key(vec![cell(3, DbType::I32, &1i32.to_le_bytes())], &[]);
+        let b = key(vec![cell(2, DbType::I64, &1i64.to_le_bytes())], &[]);
+        let c = key(vec![cell(2, DbType::F64, &1f64.to_le_bytes())], &[]);
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        let d = key(vec![cell(2, DbType::I64, &2i64.to_le_bytes())], &[]);
+        assert_ne!(a, d);
+    }
+
+    #[test]
+    fn null_meets_null_and_never_an_empty_string() {
+        let a = key(vec![cell(2, DbType::NULL, b"")], &[]);
+        let b = key(vec![cell(1, DbType::NULL, b"")], &[]);
+        let c = key(vec![cell(1, DbType::STRING, b"")], &[]);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    fn split(sql: &str) -> UnionParts {
+        crate::core::rql::join::split_union(sql).unwrap().unwrap()
+    }
+
+    #[test]
+    fn the_distinct_part_is_the_prefix_up_to_the_last_bare_union() {
+        assert_eq!(split("SELECT a FROM x UNION ALL SELECT a FROM y").distinct_prefix, 0);
+        assert_eq!(split("SELECT a FROM x UNION SELECT a FROM y").distinct_prefix, 2);
+        let p = split("SELECT a FROM x UNION SELECT a FROM y UNION ALL SELECT a FROM z");
+        assert_eq!(p.distinct_prefix, 2);
+        let p = split("SELECT a FROM x UNION ALL SELECT a FROM y UNION SELECT a FROM z");
+        assert_eq!(p.distinct_prefix, 3);
+    }
+
+    #[test]
+    fn trailing_clauses_belong_to_the_union() {
+        let p = split("SELECT a FROM x UNION SELECT a FROM y WHERE a > 1 ORDER BY 1 DESC, a LIMIT 3 OFFSET 2");
+        assert_eq!(p.branches, ["SELECT a FROM x", "SELECT a FROM y WHERE a > 1"]);
+        assert_eq!(p.order_by.as_deref(), Some("1 DESC, a"));
+        assert_eq!((p.limit, p.offset), (Some(3), 2));
+        let p = split("SELECT a FROM x UNION SELECT a FROM y OFFSET 4");
+        assert_eq!((p.order_by, p.limit, p.offset), (None, None, 4));
+        let p = split("SELECT a FROM x UNION SELECT a FROM y LIMIT ALL");
+        assert_eq!(p.limit, None);
+        // The standard's spelling of the same page.
+        let p = split("SELECT a FROM x UNION SELECT a FROM y ORDER BY 1 OFFSET 2 ROWS FETCH NEXT 3 ROWS ONLY");
+        assert_eq!(p.branches, ["SELECT a FROM x", "SELECT a FROM y"]);
+        assert_eq!(p.order_by.as_deref(), Some("1"));
+        assert_eq!((p.limit, p.offset), (Some(3), 2));
+        let p = split("SELECT a FROM x UNION ALL SELECT a FROM y FETCH FIRST ROW ONLY");
+        assert_eq!(p.branches, ["SELECT a FROM x", "SELECT a FROM y"]);
+        assert_eq!((p.order_by, p.limit, p.offset), (None, Some(1), 0));
+    }
+
+    #[test]
+    fn a_parenthesised_branch_keeps_its_own_clauses() {
+        let p = split("(SELECT a FROM x ORDER BY a LIMIT 2) UNION (SELECT a FROM y LIMIT 1) ORDER BY 1");
+        assert_eq!(p.branches, ["SELECT a FROM x ORDER BY a LIMIT 2", "SELECT a FROM y LIMIT 1"]);
+        assert_eq!(p.order_by.as_deref(), Some("1"));
+        assert_eq!(p.limit, None);
+    }
+
+    #[test]
+    fn an_unreadable_tail_is_refused_rather_than_left_on_the_last_branch() {
+        for sql in [
+            "SELECT a FROM x UNION SELECT a FROM y LIMIT $1",
+            "SELECT a FROM x UNION SELECT a FROM y LIMIT 2 ORDER BY a",
+            "SELECT a FROM x UNION SELECT a FROM y LIMIT 2 FOR UPDATE",
+            "SELECT a FROM x UNION SELECT a FROM y ORDER BY 1 FETCH FIRST 2 ROWS WITH TIES",
+            "SELECT a FROM x UNION SELECT a FROM y FETCH FIRST 2 ROWS",
+        ] {
+            assert!(crate::core::rql::join::split_union(sql).unwrap().is_err(), "{sql}");
+        }
+        assert!(crate::core::rql::join::split_union("SELECT a FROM x").is_none());
+    }
+
+    /// A row lock on a union's branch or tail is PostgreSQL's 0A000 refusal,
+    /// whichever clause it is: the last branch's used to lock that branch's
+    /// rows alone. (The statement path refuses it first, in
+    /// `split_locking_clause`; this pins the split's own guard.)
+    #[test]
+    fn a_row_lock_on_a_union_is_refused_by_the_split() {
+        for (sql, clause) in [
+            ("SELECT a FROM x UNION SELECT a FROM y FOR UPDATE", "FOR UPDATE"),
+            ("SELECT a FROM x UNION ALL SELECT a FROM y LIMIT 2 FOR NO KEY UPDATE", "FOR NO KEY UPDATE"),
+            ("(SELECT a FROM x FOR SHARE) UNION SELECT a FROM y", "FOR SHARE"),
+            ("SELECT a FROM x UNION SELECT a FROM y FOR KEY SHARE SKIP LOCKED", "FOR KEY SHARE"),
+        ] {
+            let e = crate::core::rql::join::split_union(sql).unwrap().expect_err(sql);
+            assert_eq!(e, format!("{clause} is not allowed with UNION/INTERSECT/EXCEPT"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_widened_row_reads_back_as_the_wider_type() {
+        let row = serialized(vec![
+            cell(3, DbType::I32, &(-7i32).to_le_bytes()),
+            cell(1, DbType::STRING, b"open"),
+            cell(2, DbType::NULL, b""),
+        ]);
+        let mut out = vec![2u8];
+        push_widened(&row, &[Some(DbType::I64), None, Some(DbType::I64)], None, &mut out).unwrap();
+        let back = Row::decode(&out[1..]).unwrap();
+        assert_eq!(back.columns.len(), 3);
+        assert_eq!(back.columns[0].column_type, DbType::I64);
+        assert_eq!(back.columns[0].data.into_slice(), (-7i64).to_le_bytes());
+        assert_eq!(back.columns[0].schema_id, 3);
+        assert_eq!(back.columns[1].data.into_slice(), b"open");
+        assert_eq!(back.columns[2].column_type, DbType::NULL);
+        // Nothing is left over after the row.
+        assert_eq!(serialized_rows(&out[1..]).count(), 1);
+    }
+
+    #[test]
+    fn values_cannot_run_into_each_other() {
+        let a = key(vec![cell(0, DbType::STRING, b"ab"), cell(1, DbType::STRING, b"c")], &[]);
+        let b = key(vec![cell(0, DbType::STRING, b"a"), cell(1, DbType::STRING, b"bc")], &[]);
+        assert_ne!(a, b);
+    }
+}

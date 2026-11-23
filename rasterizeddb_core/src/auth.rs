@@ -37,17 +37,26 @@ pub enum AuthMethod {
     Md5,
     /// SCRAM-SHA-256. The default, and what modern drivers negotiate.
     ScramSha256,
+    /// The caller is whoever the kernel says is at the other end of a unix
+    /// socket: a role may log in without a password if its name is the name
+    /// of the operating-system user connecting. Offered only on a unix
+    /// socket, where that answer comes from the kernel rather than from the
+    /// caller. A password, if a role has one, is stored as for SCRAM.
+    Peer,
 }
 
 impl AuthMethod {
     pub fn parse(text: &str) -> Option<Self> {
-        Some(match text.trim().to_ascii_lowercase().replace('-', "").as_str() {
-            "trust" => AuthMethod::Trust,
-            "password" | "cleartext" => AuthMethod::Password,
-            "md5" => AuthMethod::Md5,
-            "scram" | "scramsha256" => AuthMethod::ScramSha256,
-            _ => return None,
-        })
+        Some(
+            match text.trim().to_ascii_lowercase().replace('-', "").as_str() {
+                "trust" => AuthMethod::Trust,
+                "password" | "cleartext" => AuthMethod::Password,
+                "md5" => AuthMethod::Md5,
+                "scram" | "scramsha256" => AuthMethod::ScramSha256,
+                "peer" => AuthMethod::Peer,
+                _ => return None,
+            },
+        )
     }
 
     pub fn name(&self) -> &'static str {
@@ -56,6 +65,7 @@ impl AuthMethod {
             AuthMethod::Password => "password",
             AuthMethod::Md5 => "md5",
             AuthMethod::ScramSha256 => "scram-sha-256",
+            AuthMethod::Peer => "peer",
         }
     }
 }
@@ -87,7 +97,9 @@ impl Verifier {
         }
         if let Some(hex) = stored.strip_prefix("md5") {
             if hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Verifier::Md5 { hex: hex.to_ascii_lowercase() };
+                return Verifier::Md5 {
+                    hex: hex.to_ascii_lowercase(),
+                };
             }
         }
         Verifier::Plain(stored.to_string())
@@ -96,7 +108,12 @@ impl Verifier {
     /// Renders back to the stored form.
     pub fn to_stored(&self) -> String {
         match self {
-            Verifier::Scram { iterations, salt, stored_key, server_key } => format!(
+            Verifier::Scram {
+                iterations,
+                salt,
+                stored_key,
+                server_key,
+            } => format!(
                 "SCRAM-SHA-256${}:{}${}:{}",
                 iterations,
                 BASE64.encode(salt),
@@ -164,7 +181,9 @@ pub fn md5_verifier(user: &str, password: &str) -> Verifier {
     let mut hasher = Md5::new();
     hasher.update(password.as_bytes());
     hasher.update(user.as_bytes());
-    Verifier::Md5 { hex: hex_lower(&hasher.finalize()) }
+    Verifier::Md5 {
+        hex: hex_lower(&hasher.finalize()),
+    }
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -177,19 +196,21 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 /// Random bytes for salts and nonces.
-fn fill_random(out: &mut [u8]) {
-    for chunk in out.chunks_mut(8) {
-        let value = fastrand::u64(..).to_le_bytes();
-        let len = chunk.len();
-        chunk.copy_from_slice(&value[..len]);
-    }
+///
+/// From a cryptographic generator — `rand`'s thread RNG, ChaCha reseeded from
+/// the OS. `fastrand` is a wyrand PRNG whose state is recoverable from its
+/// output, so a client that saw a few nonces could predict the next salt.
+pub(crate) fn fill_random(out: &mut [u8]) {
+    rand::fill(out);
 }
 
 /// A nonce built from the printable ASCII SCRAM allows, excluding `,`.
 fn make_nonce() -> String {
+    use rand::RngExt;
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::rng();
     (0..SCRAM_NONCE_LEN)
-        .map(|_| ALPHABET[fastrand::usize(..ALPHABET.len())] as char)
+        .map(|_| ALPHABET[rng.random_range(..ALPHABET.len())] as char)
         .collect()
 }
 
@@ -227,7 +248,12 @@ pub fn verify_password(verifier: &Verifier, user: &str, password: &str) -> bool 
             let candidate = md5_verifier(user, password);
             candidate == *verifier
         }
-        Verifier::Scram { iterations, salt, stored_key, .. } => {
+        Verifier::Scram {
+            iterations,
+            salt,
+            stored_key,
+            ..
+        } => {
             let (candidate, _) = scram_keys(password, salt, *iterations);
             candidate.ct_eq(stored_key).into()
         }
@@ -347,14 +373,16 @@ impl ScramServer {
             }
         }
 
-        let client_nonce = field(bare, 'r')
-            .ok_or_else(|| "SCRAM client-first has no nonce".to_string())?;
+        let client_nonce =
+            field(bare, 'r').ok_or_else(|| "SCRAM client-first has no nonce".to_string())?;
         if client_nonce.is_empty() {
             return Err("SCRAM client-first has an empty nonce".to_string());
         }
 
         let (iterations, salt) = match &verifier {
-            Verifier::Scram { iterations, salt, .. } => (*iterations, salt.clone()),
+            Verifier::Scram {
+                iterations, salt, ..
+            } => (*iterations, salt.clone()),
             // Only a SCRAM verifier can answer a SCRAM exchange. A fabricated
             // salt would let an attacker distinguish a missing user from a
             // wrong password, so one is derived deterministically instead.
@@ -365,12 +393,7 @@ impl ScramServer {
         };
 
         let nonce = format!("{}{}", client_nonce, make_nonce());
-        let server_first = format!(
-            "r={},s={},i={}",
-            nonce,
-            BASE64.encode(&salt),
-            iterations
-        );
+        let server_first = format!("r={},s={},i={}", nonce, BASE64.encode(&salt), iterations);
 
         Ok((
             ScramServer {
@@ -412,7 +435,12 @@ impl ScramServer {
             .map(|at| &client_final[..at])
             .ok_or_else(|| "SCRAM client-final has no proof".to_string())?;
 
-        let Verifier::Scram { stored_key, server_key, .. } = &self.verifier else {
+        let Verifier::Scram {
+            stored_key,
+            server_key,
+            ..
+        } = &self.verifier
+        else {
             // The exchange ran with a decoy salt: the client's proof cannot
             // match, and it learns nothing beyond "authentication failed".
             return Err("authentication failed".to_string());
@@ -504,7 +532,10 @@ impl ScramClient {
         }
 
         let salt = BASE64
-            .decode(field(server_first, 's').ok_or_else(|| "SCRAM server-first has no salt".to_string())?)
+            .decode(
+                field(server_first, 's')
+                    .ok_or_else(|| "SCRAM server-first has no salt".to_string())?,
+            )
             .map_err(|_| "SCRAM salt is not valid base64".to_string())?;
         let iterations: u32 = field(server_first, 'i')
             .ok_or_else(|| "SCRAM server-first has no iteration count".to_string())?
@@ -672,17 +703,19 @@ pub async fn ensure_role_catalogue(
         database: &rclite::Arc<crate::core::database::Database>,
         sql: &str,
     ) -> Result<Vec<u8>, String> {
-        let purpose = recognize_query_purpose(sql)
-            .ok_or_else(|| format!("could not parse: {}", sql))?;
-        let response = executor::execute(purpose, database.clone()).await;
+        let purpose =
+            recognize_query_purpose(sql).ok_or_else(|| format!("could not parse: {}", sql))?;
+        let response = executor::execute_as(crate::core::mvcc::owner::OwnerKind::Auth, purpose, database.clone()).await;
         if response.first() == Some(&3) {
             return Err(String::from_utf8_lossy(&response[1..]).to_string());
         }
         Ok(response)
     }
 
-    if !database.tables.contains_key(ROLE_TABLE) {
-        run(database, ROLE_TABLE_DDL).await?;
+    // The catalogue and its first role are each node's own to make: not
+    // replicated, or every node's would arrive at every other.
+    if !database.has_table(ROLE_TABLE) {
+        crate::replication::Replication::local_only(run(database, ROLE_TABLE_DDL)).await?;
     }
 
     let existing = run(database, &format!("SELECT name FROM {}", ROLE_TABLE)).await?;
@@ -708,9 +741,12 @@ pub async fn ensure_role_catalogue(
         can_login: true,
         is_superuser: true,
     };
-    run(database, &role.insert_statement()).await?;
+    crate::replication::Replication::local_only(run(database, &role.insert_statement())).await?;
 
-    log::info!("Created role catalogue with bootstrap role \"{}\"", bootstrap_user);
+    log::info!(
+        "Created role catalogue with bootstrap role \"{}\"",
+        bootstrap_user
+    );
     Ok(())
 }
 
@@ -719,9 +755,19 @@ pub async fn lookup_role(
     database: &rclite::Arc<crate::core::database::Database>,
     name: &str,
 ) -> Option<Role> {
+    lookup_role_in(database, name, None).await
+}
+
+/// [`lookup_role`] as transaction `tx` sees the catalogue (a block's own
+/// role statements included), or as a statement of its own for `None`.
+pub async fn lookup_role_in(
+    database: &rclite::Arc<crate::core::database::Database>,
+    name: &str,
+    tx: Option<crate::core::mvcc::TxId>,
+) -> Option<Role> {
     use crate::core::rql::{executor, lexer_s1::recognize_query_purpose};
 
-    if !database.tables.contains_key(ROLE_TABLE) {
+    if !database.has_table(ROLE_TABLE) {
         return None;
     }
 
@@ -731,7 +777,10 @@ pub async fn lookup_role(
         quote(name)
     );
     let purpose = recognize_query_purpose(&sql)?;
-    let response = executor::execute(purpose, database.clone()).await;
+    let response = match tx {
+        Some(tx) => executor::execute_in_txn(purpose, database.clone(), tx).await,
+        None => executor::execute_as(crate::core::mvcc::owner::OwnerKind::Auth, purpose, database.clone()).await,
+    };
     if response.first() != Some(&2) {
         return None;
     }
@@ -744,7 +793,9 @@ pub async fn lookup_role(
         if column.column_type == crate::core::db_type::DbType::NULL {
             return None;
         }
-        std::str::from_utf8(column.data.into_slice()).ok().map(str::to_string)
+        std::str::from_utf8(column.data.into_slice())
+            .ok()
+            .map(str::to_string)
     };
     let flag = |index: usize| -> bool {
         row.columns
@@ -784,19 +835,19 @@ pub async fn copy_role_catalogue(
 ) -> Result<(), String> {
     use crate::core::rql::{executor, lexer_s1::recognize_query_purpose};
 
-    if !from.tables.contains_key(ROLE_TABLE) {
+    if !from.has_table(ROLE_TABLE) {
         // Trust authentication keeps no catalogue, so there is nothing to carry
         // and nothing to refuse.
         return Ok(());
     }
-    if to.tables.contains_key(ROLE_TABLE) {
+    if to.has_table(ROLE_TABLE) {
         return Ok(());
     }
 
     let run = |database: rclite::Arc<crate::core::database::Database>, sql: String| async move {
-        let purpose = recognize_query_purpose(&sql)
-            .ok_or_else(|| format!("could not parse: {}", sql))?;
-        let response = executor::execute(purpose, database).await;
+        let purpose =
+            recognize_query_purpose(&sql).ok_or_else(|| format!("could not parse: {}", sql))?;
+        let response = executor::execute_as(crate::core::mvcc::owner::OwnerKind::Auth, purpose, database).await;
         if response.first() == Some(&3) {
             return Err(String::from_utf8_lossy(&response[1..]).to_string());
         }
@@ -825,7 +876,9 @@ pub async fn copy_role_catalogue(
             if column.column_type == crate::core::db_type::DbType::NULL {
                 return None;
             }
-            std::str::from_utf8(column.data.into_slice()).ok().map(str::to_string)
+            std::str::from_utf8(column.data.into_slice())
+                .ok()
+                .map(str::to_string)
         };
         let flag = |index: usize| -> bool {
             row.columns
@@ -865,7 +918,7 @@ pub async fn copy_role_catalogue(
 pub async fn has_login_role(database: &rclite::Arc<crate::core::database::Database>) -> bool {
     use crate::core::rql::{executor, lexer_s1::recognize_query_purpose};
 
-    if !database.tables.contains_key(ROLE_TABLE) {
+    if !database.has_table(ROLE_TABLE) {
         return false;
     }
 
@@ -876,7 +929,7 @@ pub async fn has_login_role(database: &rclite::Arc<crate::core::database::Databa
     let Some(purpose) = recognize_query_purpose(&sql) else {
         return false;
     };
-    let response = executor::execute(purpose, database.clone()).await;
+    let response = executor::execute_as(crate::core::mvcc::owner::OwnerKind::Auth, purpose, database.clone()).await;
     if response.first() != Some(&2) {
         return false;
     }
@@ -903,16 +956,31 @@ pub async fn has_login_role(database: &rclite::Arc<crate::core::database::Databa
 /// A parsed `CREATE`/`ALTER`/`DROP` `ROLE`/`USER` statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RoleStatement {
-    Create { name: String, password: Option<String>, can_login: bool, is_superuser: bool },
-    AlterPassword { name: String, password: Option<String> },
-    Drop { name: String, if_exists: bool },
+    Create {
+        name: String,
+        password: Option<String>,
+        can_login: bool,
+        is_superuser: bool,
+    },
+    AlterPassword {
+        name: String,
+        password: Option<String>,
+    },
+    Drop {
+        name: String,
+        if_exists: bool,
+    },
 }
 
 /// Recognises role management SQL, or `None` when the statement is something
 /// else.
 pub fn parse_role_statement(sql: &str) -> Option<Result<RoleStatement, String>> {
     let trimmed = sql.trim().trim_end_matches(';');
-    let upper = trimmed.to_ascii_uppercase();
+    // Keywords and flags are read from the text with its string literals
+    // emptied. Read from the whole text, a password was searched too, so
+    // `CREATE ROLE app LOGIN PASSWORD 'x NOLOGIN SUPERUSER'` made a superuser
+    // that could not log in.
+    let upper = without_string_literals(trimmed).to_ascii_uppercase();
 
     let is_role_word = |word: &str| word == "ROLE" || word == "USER";
     let mut words = upper.split_whitespace();
@@ -969,12 +1037,46 @@ pub fn parse_role_statement(sql: &str) -> Option<Result<RoleStatement, String>> 
     }
 }
 
+/// `sql` with the inside of every single-quoted literal removed (`'x'` becomes
+/// `''`), so no keyword search can match inside one.
+fn without_string_literals(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c != '\'' {
+            continue;
+        }
+        // Inside a literal: skip to its closing quote, a doubled one being an
+        // escaped quote.
+        while let Some(c) = chars.next() {
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    continue;
+                }
+                out.push('\'');
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Reads the quoted value after `PASSWORD`, or `None` for `PASSWORD NULL`.
 fn extract_password(sql: &str) -> Result<Option<String>, String> {
-    let upper = sql.to_ascii_uppercase();
-    let Some(at) = upper.find("PASSWORD") else {
+    // The keyword is found outside literals, where it is one: a role name or
+    // an earlier literal holding the word must not move the search.
+    let outside = without_string_literals(sql);
+    let Some(at) = outside.to_ascii_uppercase().find("PASSWORD") else {
         return Ok(None);
     };
+    // The offset is `sql`'s too only when no literal comes before the
+    // keyword, which this grammar never has; anything else is refused rather
+    // than read from the wrong place.
+    if sql.get(..at) != Some(&outside[..at]) {
+        return Err("PASSWORD must follow the role name".to_string());
+    }
     let rest = sql[at + "PASSWORD".len()..].trim();
 
     if rest.to_ascii_uppercase().starts_with("NULL") {
@@ -984,21 +1086,21 @@ fn extract_password(sql: &str) -> Result<Option<String>, String> {
         return Err("PASSWORD must be given as a quoted string".to_string());
     };
 
-    // A doubled quote inside the literal is an escaped quote.
-    let bytes = stripped.as_bytes();
+    // A doubled quote inside the literal is an escaped quote. Read as
+    // characters: read as bytes, each byte of a non-ASCII character became a
+    // character of its own and the stored verifier was for another password.
     let mut out = String::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'\'' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+    let mut chars = stripped.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            if chars.peek() == Some(&'\'') {
                 out.push('\'');
-                i += 2;
+                chars.next();
                 continue;
             }
             return Ok(Some(out));
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        out.push(c);
     }
 
     Err("PASSWORD literal is not terminated".to_string())
@@ -1010,23 +1112,42 @@ pub async fn execute_role_statement(
     statement: RoleStatement,
     method: AuthMethod,
 ) -> Result<(), String> {
+    execute_role_statement_in(database, statement, method, None).await
+}
+
+/// [`execute_role_statement`] as part of transaction `tx`, an open block's:
+/// its write to the catalogue is the block's, so a `ROLLBACK` takes it back
+/// as PostgreSQL's does. Run as a statement of its own, a role a rolled-back
+/// block created could still log in. `None` runs it as its own statement.
+pub async fn execute_role_statement_in(
+    database: &rclite::Arc<crate::core::database::Database>,
+    statement: RoleStatement,
+    method: AuthMethod,
+    tx: Option<crate::core::mvcc::TxId>,
+) -> Result<(), String> {
     use crate::core::rql::{executor, lexer_s1::recognize_query_purpose};
 
     async fn run(
         database: &rclite::Arc<crate::core::database::Database>,
         sql: &str,
+        tx: Option<crate::core::mvcc::TxId>,
     ) -> Result<(), String> {
-        let purpose = recognize_query_purpose(sql)
-            .ok_or_else(|| format!("could not parse: {}", sql))?;
-        let response = executor::execute(purpose, database.clone()).await;
+        let purpose =
+            recognize_query_purpose(sql).ok_or_else(|| format!("could not parse: {}", sql))?;
+        let response = match tx {
+            Some(tx) => executor::execute_in_txn(purpose, database.clone(), tx).await,
+            None => executor::execute_as(crate::core::mvcc::owner::OwnerKind::Auth, purpose, database.clone()).await,
+        };
         if response.first() == Some(&3) {
             return Err(String::from_utf8_lossy(&response[1..]).to_string());
         }
         Ok(())
     }
 
-    if !database.tables.contains_key(ROLE_TABLE) {
-        run(database, ROLE_TABLE_DDL).await?;
+    // The catalogue table itself is made as a statement of its own: an
+    // empty catalogue outliving a rolled-back block grants nothing.
+    if !database.has_table(ROLE_TABLE) {
+        run(database, ROLE_TABLE_DDL, None).await?;
     }
 
     // The verifier format follows the configured method, as
@@ -1037,8 +1158,13 @@ pub async fn execute_role_statement(
     };
 
     match statement {
-        RoleStatement::Create { name, password, can_login, is_superuser } => {
-            if lookup_role(database, &name).await.is_some() {
+        RoleStatement::Create {
+            name,
+            password,
+            can_login,
+            is_superuser,
+        } => {
+            if lookup_role_in(database, &name, tx).await.is_some() {
                 return Err(format!("role \"{}\" already exists", name));
             }
             let role = Role {
@@ -1047,10 +1173,10 @@ pub async fn execute_role_statement(
                 can_login,
                 is_superuser,
             };
-            run(database, &role.insert_statement()).await
+            run(database, &role.insert_statement(), tx).await
         }
         RoleStatement::AlterPassword { name, password } => {
-            if lookup_role(database, &name).await.is_none() {
+            if lookup_role_in(database, &name, tx).await.is_none() {
                 return Err(format!("role \"{}\" does not exist", name));
             }
             let stored = match password.as_deref() {
@@ -1065,11 +1191,12 @@ pub async fn execute_role_statement(
                     stored,
                     quote(&name)
                 ),
+                tx,
             )
             .await
         }
         RoleStatement::Drop { name, if_exists } => {
-            if lookup_role(database, &name).await.is_none() {
+            if lookup_role_in(database, &name, tx).await.is_none() {
                 return if if_exists {
                     Ok(())
                 } else {
@@ -1079,6 +1206,7 @@ pub async fn execute_role_statement(
             run(
                 database,
                 &format!("DELETE FROM {} WHERE name = {}", ROLE_TABLE, quote(&name)),
+                tx,
             )
             .await
         }
@@ -1124,8 +1252,44 @@ mod tests {
             .unwrap();
         assert!(matches!(
             parsed,
-            RoleStatement::Create { can_login: true, is_superuser: true, .. }
+            RoleStatement::Create {
+                can_login: true,
+                is_superuser: true,
+                ..
+            }
         ));
+    }
+
+    #[test]
+    fn a_password_cannot_set_flags() {
+        // Each flag word inside the password was once read as the flag.
+        let parsed = parse_role_statement("CREATE ROLE esc LOGIN PASSWORD 'pw NOLOGIN SUPERUSER'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parsed,
+            RoleStatement::Create {
+                name: "esc".to_string(),
+                password: Some("pw NOLOGIN SUPERUSER".to_string()),
+                can_login: true,
+                is_superuser: false,
+            }
+        );
+        let parsed = parse_role_statement("CREATE ROLE esc2 PASSWORD 'a LOGIN'").unwrap().unwrap();
+        assert!(matches!(parsed, RoleStatement::Create { can_login: false, is_superuser: false, .. }));
+        let parsed = parse_role_statement("DROP ROLE x").unwrap().unwrap();
+        assert_eq!(parsed, RoleStatement::Drop { name: "x".to_string(), if_exists: false });
+    }
+
+    #[test]
+    fn a_non_ascii_password_is_read_as_written() {
+        let parsed = parse_role_statement("CREATE USER u PASSWORD 'пароль€😀''x'").unwrap().unwrap();
+        match parsed {
+            RoleStatement::Create { password, .. } => {
+                assert_eq!(password.as_deref(), Some("пароль€😀'x"))
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -1144,19 +1308,31 @@ mod tests {
     #[test]
     fn alter_and_drop_are_recognised() {
         assert_eq!(
-            parse_role_statement("ALTER USER alice PASSWORD 'new'").unwrap().unwrap(),
+            parse_role_statement("ALTER USER alice PASSWORD 'new'")
+                .unwrap()
+                .unwrap(),
             RoleStatement::AlterPassword {
                 name: "alice".to_string(),
                 password: Some("new".to_string())
             }
         );
         assert_eq!(
-            parse_role_statement("ALTER USER alice PASSWORD NULL").unwrap().unwrap(),
-            RoleStatement::AlterPassword { name: "alice".to_string(), password: None }
+            parse_role_statement("ALTER USER alice PASSWORD NULL")
+                .unwrap()
+                .unwrap(),
+            RoleStatement::AlterPassword {
+                name: "alice".to_string(),
+                password: None
+            }
         );
         assert_eq!(
-            parse_role_statement("DROP USER IF EXISTS alice").unwrap().unwrap(),
-            RoleStatement::Drop { name: "alice".to_string(), if_exists: true }
+            parse_role_statement("DROP USER IF EXISTS alice")
+                .unwrap()
+                .unwrap(),
+            RoleStatement::Drop {
+                name: "alice".to_string(),
+                if_exists: true
+            }
         );
     }
 
@@ -1169,7 +1345,11 @@ mod tests {
 
     #[test]
     fn an_unquoted_password_is_refused_rather_than_guessed_at() {
-        assert!(parse_role_statement("CREATE USER bob PASSWORD hunter2").unwrap().is_err());
+        assert!(
+            parse_role_statement("CREATE USER bob PASSWORD hunter2")
+                .unwrap()
+                .is_err()
+        );
     }
 
     #[test]
@@ -1181,7 +1361,11 @@ mod tests {
             is_superuser: false,
         };
         let sql = role.insert_statement();
-        assert!(sql.contains("'o''brien'"), "a quote in a name must not escape: {}", sql);
+        assert!(
+            sql.contains("'o''brien'"),
+            "a quote in a name must not escape: {}",
+            sql
+        );
         assert!(sql.contains("'pw'"));
     }
 
@@ -1260,14 +1444,20 @@ mod tests {
     fn a_full_exchange_accepts_the_right_password() {
         let verifier = build_scram_verifier("correct horse");
         let client_first = "n,,n=,r=clientnonce123456";
-        let (server, server_first) =
-            ScramServer::start(verifier.clone(), client_first).unwrap();
+        let (server, server_first) = ScramServer::start(verifier.clone(), client_first).unwrap();
 
         let nonce = field(&server_first, 'r').unwrap().to_string();
         let salt = BASE64.decode(field(&server_first, 's').unwrap()).unwrap();
         let iterations: u32 = field(&server_first, 'i').unwrap().parse().unwrap();
 
-        let client_final = client_final_for("correct horse", &salt, iterations, "n,,n=,r=clientnonce123456", &server_first, &nonce);
+        let client_final = client_final_for(
+            "correct horse",
+            &salt,
+            iterations,
+            "n,,n=,r=clientnonce123456",
+            &server_first,
+            &nonce,
+        );
         assert!(server.finish(&client_final).is_ok());
     }
 
@@ -1281,7 +1471,14 @@ mod tests {
         let salt = BASE64.decode(field(&server_first, 's').unwrap()).unwrap();
         let iterations: u32 = field(&server_first, 'i').unwrap().parse().unwrap();
 
-        let client_final = client_final_for("wrong horse", &salt, iterations, "n,,n=,r=clientnonce123456", &server_first, &nonce);
+        let client_final = client_final_for(
+            "wrong horse",
+            &salt,
+            iterations,
+            "n,,n=,r=clientnonce123456",
+            &server_first,
+            &nonce,
+        );
         assert!(server.finish(&client_final).is_err());
     }
 
@@ -1323,7 +1520,9 @@ mod tests {
 
         let response = {
             use md5::Md5;
-            let Verifier::Md5 { hex } = &verifier else { unreachable!() };
+            let Verifier::Md5 { hex } = &verifier else {
+                unreachable!()
+            };
             let mut hasher = Md5::new();
             hasher.update(hex.as_bytes());
             hasher.update(salt);
@@ -1331,7 +1530,12 @@ mod tests {
         };
 
         assert!(verify_md5(&verifier, "alice", &salt, &response));
-        assert!(!verify_md5(&verifier, "alice", &salt, "md500000000000000000000000000000000"));
+        assert!(!verify_md5(
+            &verifier,
+            "alice",
+            &salt,
+            "md500000000000000000000000000000000"
+        ));
     }
 
     /// A SCRAM verifier stores nothing an md5 challenge can be answered from.
@@ -1344,18 +1548,39 @@ mod tests {
     #[test]
     fn cleartext_verifies_against_every_verifier_shape() {
         assert!(verify_password(&build_scram_verifier("pw"), "alice", "pw"));
-        assert!(!verify_password(&build_scram_verifier("pw"), "alice", "nope"));
+        assert!(!verify_password(
+            &build_scram_verifier("pw"),
+            "alice",
+            "nope"
+        ));
         assert!(verify_password(&md5_verifier("alice", "pw"), "alice", "pw"));
-        assert!(!verify_password(&md5_verifier("alice", "pw"), "alice", "nope"));
-        assert!(verify_password(&Verifier::Plain("pw".into()), "alice", "pw"));
-        assert!(!verify_password(&Verifier::Plain("pw".into()), "alice", "nope"));
+        assert!(!verify_password(
+            &md5_verifier("alice", "pw"),
+            "alice",
+            "nope"
+        ));
+        assert!(verify_password(
+            &Verifier::Plain("pw".into()),
+            "alice",
+            "pw"
+        ));
+        assert!(!verify_password(
+            &Verifier::Plain("pw".into()),
+            "alice",
+            "nope"
+        ));
     }
 
     #[test]
     fn methods_parse_from_their_configuration_names() {
-        assert_eq!(AuthMethod::parse("scram-sha-256"), Some(AuthMethod::ScramSha256));
+        assert_eq!(
+            AuthMethod::parse("scram-sha-256"),
+            Some(AuthMethod::ScramSha256)
+        );
         assert_eq!(AuthMethod::parse("SCRAM"), Some(AuthMethod::ScramSha256));
         assert_eq!(AuthMethod::parse("md5"), Some(AuthMethod::Md5));
+        assert_eq!(AuthMethod::parse("peer"), Some(AuthMethod::Peer));
+        assert_eq!(AuthMethod::Peer.name(), "peer");
         assert_eq!(AuthMethod::parse("trust"), Some(AuthMethod::Trust));
         assert_eq!(AuthMethod::parse("nonsense"), None);
     }
@@ -1396,7 +1621,9 @@ mod tests {
         let _ = server;
 
         assert!(
-            client.verify("v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").is_err(),
+            client
+                .verify("v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .is_err(),
             "a fabricated server signature must not be accepted"
         );
     }
@@ -1406,8 +1633,7 @@ mod tests {
         let binding = ChannelBinding::TlsExporter(vec![7u8; 32]);
         let verifier = build_scram_verifier("hunter2");
 
-        let (mut client, client_first) =
-            ScramClient::start("alice", "hunter2", binding.clone());
+        let (mut client, client_first) = ScramClient::start("alice", "hunter2", binding.clone());
         let (server, server_first) =
             ScramServer::start_bound(verifier, &client_first, &binding).unwrap();
         let client_final = client.respond(&server_first).unwrap();
@@ -1423,8 +1649,7 @@ mod tests {
         let servers_view = ChannelBinding::TlsExporter(vec![2u8; 32]);
         let verifier = build_scram_verifier("hunter2");
 
-        let (mut client, client_first) =
-            ScramClient::start("alice", "hunter2", clients_view);
+        let (mut client, client_first) = ScramClient::start("alice", "hunter2", clients_view);
         let (server, server_first) =
             ScramServer::start_bound(verifier, &client_first, &servers_view).unwrap();
         let client_final = client.respond(&server_first).unwrap();
@@ -1441,12 +1666,8 @@ mod tests {
         let binding = ChannelBinding::TlsExporter(vec![3u8; 32]);
         let (_, unbound_first) = ScramClient::start("alice", "pw", ChannelBinding::None);
 
-        let err = ScramServer::start_bound(
-            build_scram_verifier("pw"),
-            &unbound_first,
-            &binding,
-        )
-        .unwrap_err();
+        let err = ScramServer::start_bound(build_scram_verifier("pw"), &unbound_first, &binding)
+            .unwrap_err();
         assert!(err.contains("requires channel binding"), "{}", err);
     }
 
@@ -1506,10 +1727,7 @@ mod tests {
         let stored_key = sha256(&client_key);
 
         let without_proof = format!("c=biws,r={}", nonce);
-        let auth_message = format!(
-            "{},{},{}",
-            &client_first[3..], server_first, without_proof
-        );
+        let auth_message = format!("{},{},{}", &client_first[3..], server_first, without_proof);
         let client_signature = hmac(&stored_key, auth_message.as_bytes());
         let proof: Vec<u8> = client_key
             .iter()

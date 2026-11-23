@@ -210,6 +210,36 @@ fn ordered_data_prunes_hard_and_random_data_does_not() {
 
 #[test]
 fn equality_combines_fingerprints_and_bounds() {
+    // Values clustered by zone but shuffled inside it: each 512-slot zone holds
+    // its own range, so bounds narrow to one zone, while the zones do not form
+    // one ascending run, so fingerprints stay in service and cut it further.
+    // (A perfectly sequential column is served by bounds alone; see below.)
+    let n = 20_000u64;
+    let mut c = col(DbType::I64);
+    let value_at = |slot: u64| -> i64 {
+        let zone = slot / 512;
+        let within = (slot % 512).wrapping_mul(389) % 512; // a permutation of 0..512
+        // Zones alternate high/low so neighbouring bounds do not ascend.
+        let base = if zone % 2 == 0 { zone * 512 } else { 1_000_000 + zone * 512 };
+        (base + within) as i64
+    };
+    for slot in 0..n {
+        c.set(slot, Some(&value_at(slot).to_le_bytes()));
+    }
+    let target_slot = 7777u64;
+    let target = value_at(target_slot);
+    let mut bm = vec![0u64; bitmap_words(n)];
+    c.probe_pred_into(SargOp::Eq, &target.to_le_bytes(), n, &mut bm);
+    assert!(is_candidate(&bm, target_slot), "true match pruned");
+    let live: u64 = bm.iter().map(|w| w.count_ones() as u64).sum();
+    // Bounds alone leave one zone (512); fingerprints cut that much further.
+    assert!(live < 64, "expected bounds and fingerprints to compound, got {}", live);
+}
+
+#[test]
+fn a_sequential_column_is_served_by_bounds_alone() {
+    // A perfectly ascending column needs no fingerprints: bounds narrow an
+    // equality probe to one zone, which is the plane-less design.
     let n = 20_000u64;
     let mut c = col(DbType::I64);
     for slot in 0..n {
@@ -219,8 +249,7 @@ fn equality_combines_fingerprints_and_bounds() {
     c.probe_pred_into(SargOp::Eq, &7777i64.to_le_bytes(), n, &mut bm);
     assert!(is_candidate(&bm, 7777), "true match pruned");
     let live: u64 = bm.iter().map(|w| w.count_ones() as u64).sum();
-    // Bounds alone leave one zone (512); fingerprints cut that much further.
-    assert!(live < 64, "expected bounds and fingerprints to compound, got {}", live);
+    assert!(live <= 512, "bounds should narrow to one zone, got {}", live);
 }
 
 #[test]

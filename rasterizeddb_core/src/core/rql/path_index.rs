@@ -81,9 +81,13 @@ impl PathIndex {
                 .map(|s| s.to_string())
                 .map_err(|e| format!("a path index record is not UTF-8: {}", e))
         };
+        let path = read(FIELD_LEN + 1)?;
+        // A record written before `#>` steps were keyed as `#>'{1}'` could not
+        // be read back, so its index was never built and no query matched it.
+        let path = crate::core::jsonb::upgrade_legacy_index_key(&path).unwrap_or(path);
         Ok(PathIndex {
             name: read(0)?,
-            path: read(FIELD_LEN + 1)?,
+            path,
             is_deleted: raw[(FIELD_LEN + 1) * 2] != 0,
         })
     }
@@ -98,11 +102,11 @@ fn sidecar_name<S: crate::core::storage_providers::traits::StorageIO>(
 /// Reads a table's declared path indexes.
 pub async fn load<S: crate::core::storage_providers::traits::StorageIO>(
     schema_io: rclite::Arc<S>,
-) -> smallvec::SmallVec<[PathIndex; 4]> {
+) -> Vec<PathIndex> {
     let io = schema_io.create_new(sidecar_name(&schema_io)).await;
     let len = io.get_len().await;
 
-    let mut out: smallvec::SmallVec<[PathIndex; 4]> = smallvec::SmallVec::new();
+    let mut out: Vec<PathIndex> = Vec::new();
     if len < PATH_INDEX_SIZE {
         return out;
     }
@@ -110,8 +114,17 @@ pub async fn load<S: crate::core::storage_providers::traits::StorageIO>(
     let mut buffer = vec![0u8; PATH_INDEX_SIZE as usize];
     for i in 0..(len / PATH_INDEX_SIZE) {
         let mut position = i * PATH_INDEX_SIZE;
-        if io.read_data_into_buffer(&mut position, &mut buffer).await.is_err() {
+        if io
+            .read_data_into_buffer(&mut position, &mut buffer)
+            .await
+            .is_err()
+        {
             break;
+        }
+        // A record of zeros is an append a power cut kept the length of and
+        // dropped (`torn_tail::is_unwritten`), never a declaration.
+        if crate::core::torn_tail::is_unwritten(&buffer) {
+            continue;
         }
         match PathIndex::from_vec(&buffer) {
             Ok(entry) => {
@@ -134,8 +147,20 @@ pub async fn append<S: crate::core::storage_providers::traits::StorageIO>(
     schema_io: rclite::Arc<S>,
     entry: &PathIndex,
 ) -> std::io::Result<()> {
-    let io = schema_io.create_new(sidecar_name(&schema_io)).await;
-    io.append_data(&entry.into_vec(), true).await;
+    let mut writes = crate::core::torn_tail::SidecarWrites::default();
+    stage(&*schema_io, &mut writes, entry)?;
+    writes.commit(&*schema_io).await
+}
+
+/// Adds `entry`'s record to `writes`, the statement's sidecar records, which
+/// commit as one transaction (`torn_tail::SidecarWrites`): one log sync for
+/// all of them, and after a cut all of them or none.
+pub fn stage<S: crate::core::storage_providers::traits::StorageIO>(
+    schema_io: &S,
+    writes: &mut crate::core::torn_tail::SidecarWrites,
+    entry: &PathIndex,
+) -> std::io::Result<()> {
+    writes.add(crate::core::torn_tail::sidecar_name(schema_io, "PIX.db"), &entry.into_vec());
     Ok(())
 }
 
@@ -306,7 +331,12 @@ pub fn parse_create(sql: &str) -> Option<Result<CreatePathIndex, String>> {
     let path = crate::core::jsonb::parse_path_expression(inner)?;
 
     Some(match indexable(&path) {
-        Ok(()) => Ok(CreatePathIndex { name, table, path, if_not_exists }),
+        Ok(()) => Ok(CreatePathIndex {
+            name,
+            table,
+            path,
+            if_not_exists,
+        }),
         Err(e) => Err(e),
     })
 }
@@ -415,7 +445,11 @@ mod statement_tests {
             "CREATE INDEX ix ON docs USING gin (doc)",
             "SELECT 1",
         ] {
-            assert!(parse_create(sql).is_none(), "{} should not be a path index", sql);
+            assert!(
+                parse_create(sql).is_none(),
+                "{} should not be a path index",
+                sql
+            );
         }
     }
 
@@ -430,9 +464,18 @@ mod statement_tests {
 
     #[test]
     fn drop_parses() {
-        assert_eq!(parse_drop("DROP INDEX ix_status"), Some(("ix_status".to_string(), false)));
-        assert_eq!(parse_drop("DROP INDEX IF EXISTS ix"), Some(("ix".to_string(), true)));
-        assert_eq!(parse_drop("drop index \"ix\";"), Some(("ix".to_string(), false)));
+        assert_eq!(
+            parse_drop("DROP INDEX ix_status"),
+            Some(("ix_status".to_string(), false))
+        );
+        assert_eq!(
+            parse_drop("DROP INDEX IF EXISTS ix"),
+            Some(("ix".to_string(), true))
+        );
+        assert_eq!(
+            parse_drop("drop index \"ix\";"),
+            Some(("ix".to_string(), false))
+        );
         assert!(parse_drop("DROP TABLE t").is_none());
     }
 }

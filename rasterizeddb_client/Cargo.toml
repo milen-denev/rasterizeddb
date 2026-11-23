@@ -1,0 +1,85 @@
+[package]
+name = "rasterizeddb_client"
+version = "1.0.0"
+edition = "2024"
+description = "A client SDK and ORM for RasterizedDB's native protocol that does not compile the engine"
+repository = "https://github.com/milen-denev/rasterizeddb"
+documentation = "https://docs.rs/rasterizeddb_client"
+readme = "README.md"
+license = "GPL-3.0-only"
+authors = ["Milen Denev"]
+keywords = ["database", "client", "orm", "rasterizeddb", "migrations"]
+categories = ["database", "asynchronous"]
+rust-version = "1.88"
+
+# docs.rs documents every feature, labels feature-gated items with the
+# feature they need (`--cfg docsrs` turns on `doc_cfg`), and shows the
+# examples' calls under the items they use.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
+
+# What a client needs and nothing else: the transport, a runtime, libc for
+# the operating-system user a peer login names (and the OS random source for
+# UUIDs and SCRAM nonces), and the hashes a password login computes. The row
+# format and the literal rules are this crate's own copies of the server's;
+# the tests in `tests/` run them against a real server so the
+# copies cannot drift unnoticed.
+[dependencies]
+rastcp = { path = "../rastcp", version = "1.0.0" }
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
+libc = "0.2"
+# The operating system's random generator on every platform (Linux's
+# getrandom(2), macOS's getentropy, Windows' ProcessPrng): SCRAM nonces,
+# UUIDs. Already in the tree through rustls.
+getrandom = "0.3"
+# Login::Password's SCRAM-SHA-256 exchange (the versions the server uses).
+sha2 = "0.11"
+hmac = "0.13"
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+base64 = "0.23"
+# RowStream is a futures_core::Stream (the trait only, no executor).
+futures-core = { version = "0.3", default-features = false }
+rasterizeddb_client_derive = { path = "../rasterizeddb_client_derive", version = "1.0.0", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }
+uuid = { version = "1", default-features = false, optional = true }
+serde = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+default = ["derive"]
+# `#[derive(Model)]`, `#[derive(FromRow)]` and `#[derive(SqlEnum)]`.
+derive = ["dep:rasterizeddb_client_derive"]
+# ToSql/FromSql for chrono's DateTime<Utc>, NaiveDateTime, NaiveDate, NaiveTime.
+chrono = ["dep:chrono"]
+# ToSql/FromSql for uuid::Uuid.
+uuid = ["dep:uuid"]
+# FromSql for serde_json::Value, Json::from_value / Json::parse, and
+# `#[rdb(json)]` model fields of any Serialize + Deserialize type.
+serde_json = ["dep:serde", "dep:serde_json"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time"] }
+serde = { version = "1", features = ["derive"] }
+
+# Scraped into the documentation by docs.rs (they use dev-dependencies, so
+# each opts in).
+[[example]]
+name = "quickstart"
+doc-scrape-examples = true
+
+[[example]]
+name = "orm"
+doc-scrape-examples = true
+required-features = ["derive"]
+
+[[example]]
+name = "migrations"
+doc-scrape-examples = true
+required-features = ["derive"]
+
+[[example]]
+name = "kv"
+doc-scrape-examples = true
+required-features = ["derive"]

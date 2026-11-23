@@ -186,7 +186,11 @@ async fn a_cte_body_may_break_its_lines_anywhere() {
         .await
         .expect("a line-broken CTE body must parse");
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].try_get::<i64, _>("total").expect("total"), 30);
+    // `sum(bigint)` is a numeric, as in PostgreSQL (it used to be an int8).
+    assert_eq!(
+        rows[0].try_get::<rust_decimal::Decimal, _>("total").expect("total"),
+        rust_decimal::Decimal::from(30)
+    );
 
     // And with tabs, which are just as much whitespace as a space.
     let rows = pool

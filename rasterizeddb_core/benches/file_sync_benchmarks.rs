@@ -37,10 +37,7 @@ fn write_random_file(path: &std::path::Path, bytes: usize, seed: u64) {
 fn append_random_bytes(path: &std::path::Path, bytes: usize, seed: u64) {
     let mut rng = StdRng::seed_from_u64(seed);
 
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .unwrap();
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
 
     const CHUNK: usize = 1 * 1024 * 1024;
     let mut remaining = bytes;
@@ -56,7 +53,11 @@ fn append_random_bytes(path: &std::path::Path, bytes: usize, seed: u64) {
     file.flush().unwrap();
 }
 
-fn make_provider(rt: &tokio::runtime::Runtime, dir: &TempDir, file_name: &str) -> LocalStorageProvider {
+fn make_provider(
+    rt: &tokio::runtime::Runtime,
+    dir: &TempDir,
+    file_name: &str,
+) -> LocalStorageProvider {
     rt.block_on(LocalStorageProvider::new(
         dir.path().to_string_lossy().as_ref(),
         Some(file_name),
@@ -84,28 +85,32 @@ fn bench_file_sync_read_data_into_buffer(c: &mut Criterion) {
         let read_size = 4 * 1024;
 
         group.throughput(Throughput::Bytes(read_size as u64));
-        group.bench_with_input(BenchmarkId::new("mmap_hot_sequential", read_size), &read_size, |b, &read_size| {
-            let mut buf = vec![0u8; read_size];
-            let mut pos = 0u64;
-            let max_start = (file_size - read_size) as u64;
+        group.bench_with_input(
+            BenchmarkId::new("mmap_hot_sequential", read_size),
+            &read_size,
+            |b, &read_size| {
+                let mut buf = vec![0u8; read_size];
+                let mut pos = 0u64;
+                let max_start = (file_size - read_size) as u64;
 
-            b.iter(|| {
-                // Wrap around to keep reads in-bounds.
-                if pos > max_start {
-                    pos = 0;
-                }
+                b.iter(|| {
+                    // Wrap around to keep reads in-bounds.
+                    if pos > max_start {
+                        pos = 0;
+                    }
 
-                let mut local_pos = pos;
-                rt.block_on(provider.read_data_into_buffer(&mut local_pos, &mut buf))
-                    .unwrap();
+                    let mut local_pos = pos;
+                    rt.block_on(provider.read_data_into_buffer(&mut local_pos, &mut buf))
+                        .unwrap();
 
-                // Advance for next iteration.
-                pos = local_pos;
+                    // Advance for next iteration.
+                    pos = local_pos;
 
-                black_box(&buf);
-                black_box(local_pos);
-            })
-        });
+                    black_box(&buf);
+                    black_box(local_pos);
+                })
+            },
+        );
     }
 
     // -------- Case 1b: Random reads within a 128MiB mmap --------

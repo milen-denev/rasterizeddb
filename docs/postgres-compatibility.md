@@ -49,6 +49,34 @@ faithfully restore old-layout bytes that the new schema then reads at new
 offsets. If a directory does have to cross this change, shut down cleanly first
 so the log is empty, then upgrade.
 
+## No downgrade past `character(n)`
+
+**A database this binary has written must not be opened by an older one.**
+The declared lengths of `character(n)` and `character varying(n)` columns,
+and the precision of `timestamp(p)`-style columns, are recorded as marker
+records whose length an older binary ignores. It does read the
+`character(n)` marker itself — by its name, which is why it treats a CHECK
+on such a column as unenforced when the table is created — but not the
+length in it, and not the `character varying(n)` and precision markers at
+all. So it opens the table and treats those columns as plain text and
+full-precision times:
+
+- it stores `'ab  '` beside a stored `'ab'` in a `character(4)` primary
+  key;
+- it takes `'toolong'` into a `character(3)`;
+- it keeps sub-second digits a `timestamp(0)` would round;
+- it lets a row past a CHECK through padding: under `CHECK (c3 <> 'zz')`
+  it refuses `'zz'` but accepts `'zz '`, which it compares as text.
+
+Back on this binary every such row is still there and nothing reports it:
+two rows with key `'ab  '`, one of them unreachable by key, a `'toolong'` in
+a `character(3)`, and a `'zz '` that violates the CHECK it was written
+under, which survives reopening because a CHECK is enforced on writes, not
+re-validated on open. No version stamp exists that an older binary refuses
+(the partitioned-table guard works only because those tables have no file
+under their own name), so this is not guarded: back up before upgrading, and
+restore that backup rather than downgrading.
+
 ## Type system
 
 Types are stored fixed-width and ordered by `memcmp` wherever an ordering is
@@ -63,14 +91,212 @@ the filter index entirely.
 | `INET` / `CIDR` | 18 bytes: `[family][addr(16, BE)][prefix]` | sorts by family, then address, then netmask |
 | `NUMERIC` / `DECIMAL` | `i128` at a fixed scale of 9 | one scale keeps it comparable as an integer |
 | `TIMESTAMPTZ` | `i64` microseconds from the Unix epoch | little-endian, so it compares as a signed integer |
+| `TIMESTAMP` | the same eight bytes, flagged in the field record | a literal's zone is discarded, not applied (below) |
 | `BYTEA` | variable width, same mechanism as `TEXT` | distinguished only so the wire reports `bytea` |
 | `TEXT[]` | Postgres' binary array form, variable width | the element OID lives in the value, so one type serves arrays of anything |
+
+### `timestamp` and `timestamptz`
+
+`TIMESTAMP` (and `TIMESTAMP WITHOUT TIME ZONE`, `TIMESTAMP(p)`) is
+PostgreSQL's `timestamp`: a wall-clock time. A zone written in a literal is read
+and **discarded**, as `timestamp_in` discards it, so
+`'2024-01-01 10:00:00+02'` stores 10:00. `TIMESTAMPTZ` (and `TIMESTAMP WITH TIME
+ZONE`, and this engine's own `DATETIME`) is an instant: the same literal stores
+08:00 UTC. The session time zone is always UTC, so both hold the same
+microseconds for a literal with no zone, and `ALTER COLUMN … TYPE timestamp` /
+`TYPE timestamptz` rewrites no row. Every path a literal reaches a column by
+reads it this way: `INSERT` (single- and multi-row, `DEFAULT`, `ON CONFLICT DO
+UPDATE`), `UPDATE`, a backfilled `ADD COLUMN … DEFAULT`, and every predicate
+compared with the column (the scan, `IN`, `BETWEEN`, the filter and secondary
+indexes, a prepared statement's bound text, a `CASE` condition).
+
+On the wire a `timestamp` column is described as `timestamp` (OID 1114) and
+shown with no offset, `2021-01-01 00:00:00`; a `timestamptz` keeps OID 1184 and
+its `+00`. The description and the value are formatted from one type
+(`DbType::TIMESTAMP`), on every path that describes a column: a plain select, a
+join, `MIN`/`MAX`, a CTE or derived table, `RETURNING`, a window,
+`information_schema.columns` (`timestamp without time zone`), and a parameter
+compared with or written into the column. A typed driver therefore decodes it as
+a naive date-time (sqlx `NaiveDateTime`, tokio-postgres `Type::TIMESTAMP`) and
+refuses to read it as an instant, as against PostgreSQL. Not yet: an expression
+yielding the column's value (`CASE … THEN ts`) is still described as
+`timestamptz`.
+
+A literal typed by a cast or a type name (`'… 10:00+02'::timestamptz`,
+`TIMESTAMP '…'`, `CAST('…' AS timestamp with time zone)`) is read at that type
+when the statement arrives and rewritten with no zone left to read two ways:
+the UTC time with `+00` for `timestamptz`, the wall-clock time for `timestamp`
+(`sql_scan::zone_free_timestamp_literals`). Written into a text column such a
+literal is shown as PostgreSQL shows its type as text (`… 08:00:00+00`,
+`… 10:00:00`). Every reader of the literal then
+agrees on it: the write path, a predicate, an index lookup, a stored `DEFAULT`
+or `CHECK`. A parameter sent as text with a declared type of `timestamptz`
+(OID 1184) or `timestamp` (1114), or bound to `$n::timestamptz`, is read the
+same way. A bare literal (`'… 10:00+02'`) takes its type from the column or the
+comparison it meets, as an unknown-typed literal does in PostgreSQL.
+
+`ALTER COLUMN … TYPE timestamp` / `TYPE timestamptz` is refused while the
+column's `DEFAULT`, or a `CHECK` naming it, holds a literal with a zone: the new
+type would read that text as another value, where PostgreSQL keeps the value it
+stored. Restate the default or check without the zone first.
+
+The column is a `DATETIME` whose field record carries a flag in its spare type
+byte (`SchemaField::without_time_zone`). A build from before the flag reads the
+record as `timestamptz`, which is what it always took the column for.
+
+**No downgrade after creating a `timestamp` column.** An older build opens such
+a table, but reads the column as `timestamptz` (zones applied, `+00` shown),
+and its next schema change on the table (an `ADD COLUMN`, a rewrite) writes the
+field records back without the flag: back on this build the column is then
+`timestamptz` for good, with nothing to say it changed. There is no cheap
+guard: an older build reads only the record's low type byte and checks nothing
+else, so nothing this build writes can make it refuse the table. Downgrade only
+a database that never ran `CREATE` or `ALTER` with `TIMESTAMP` here, or restate
+the flag afterwards with `ALTER COLUMN … TYPE timestamp`.
+
+**Data written before this change.** Until then both spellings were one type,
+so a literal with a zone written into a `TIMESTAMP` column was converted to UTC:
+`'… 10:00:00+02'` was stored as 08:00. Such values cannot be told apart from
+ones written without a zone, and nothing rewrites them. A table created before
+the change also has no flag, so its `TIMESTAMP` columns keep behaving as
+`timestamptz` until `ALTER TABLE … ALTER COLUMN c TYPE timestamp` sets it (which
+moves no value). If an application wrote zoned literals into such a column, the
+affected rows are off by the zone they were written with; correct them with an
+`UPDATE` once the column is flagged (for a `+02` source:
+`SET c = c + interval '2 hours'`), or reload them from their source. Literals
+without a zone, and values bound in the binary format, were stored right.
 
 `BYTEA` and `ARRAY` report `STRING` as their *physical* type, so the row writer,
 the fetch path and the in-place-update path need no knowledge of them; only the
 wire layer, which reports the declared type, tells them apart. Neither is
 indexed: they share `STRING`'s storage but have no comparator, so indexing them
 would store values no query could match.
+
+### `character(n)`, `character varying(n)` and cast modifiers
+
+`character(n)` (`char`, `char(n)`, `nchar`, `bpchar`) is text held to its
+declared length `n`, which is recorded with the table (a marker in the
+type-modifier sidecar, copied onto the column's `SchemaField::text_typmod`).
+PostgreSQL stores the value blank-padded and strips the padding in every
+comparison it makes on the type; this engine stores it **without its trailing
+spaces**, which is that comparison form, and puts the padding back where the
+value leaves as itself. So:
+
+- `'b'`, `'b '` and `'b  '` are one value, and one key: the primary key, a
+  UNIQUE column or composite, the ON CONFLICT arbiter, the multi-row 21000
+  check, a B-tree, hash or filter index and a row lock all see equal bytes.
+- A string compared with the column (`=`, `<>`, `<`, `IN`, `BETWEEN`, in a
+  `WHERE`, a `CASE` or a `CHECK`) is read without its trailing spaces too.
+- `LIKE`, `ILIKE` and `SIMILAR TO` match the padded value (`k LIKE 'b'` is
+  false for a `char(3)` 'b'), as in PostgreSQL.
+- Read as text (`||`, `length`, `upper`, `::text`, `::varchar`, a join with a
+  text column) it has no trailing spaces; `octet_length` counts the padding.
+- On the wire it is `bpchar` (OID 1042, `atttypmod` n + 4) and padded to `n`,
+  in text and in binary. A length past 65535 is reported as `bpchar` with
+  none and shown unpadded.
+- A value past `n` is an error (22001) unless every character past it is a
+  space; this holds for every write path (literals, expressions, DEFAULT,
+  parameters, `INSERT … SELECT`, `UPDATE`, `ON CONFLICT DO UPDATE`), with
+  the table's own write as the backstop.
+- Checks reading it are enforced, `pg_dump`'s `= ANY (ARRAY['AB'::bpchar,
+  …])` included.
+
+`character varying(n)` is held to `n` the same way (22001, excess spaces cut)
+and otherwise is text. Compared with `character(n)` it is read without its
+trailing spaces, as PostgreSQL resolves `bpchar` = `varchar` to `bpchar`: in a
+join, `UPDATE … FROM`, `DELETE … USING` and between two columns of a row. A
+`varchar` column created by an older binary recorded no type of its own and
+is text here.
+
+A value typed **text** — a text column read through `IN (SELECT …)`, `=
+(SELECT …)` or a correlated `EXISTS`, a parameter declared text (as sqlx and
+tokio-postgres bind strings), `'…'::text`, `t || ''` — compares with a
+`character(n)` column as text, exactly: `'ab  '` is not `'ab'`. Only an
+untyped literal, a `character varying` value and an `IN (…)` list's items
+(which take the column's type, as PostgreSQL's common type of the list does)
+read blank-padded. A `character(n)` value keeps its type through a CTE, a
+derived table, `CASE`, `COALESCE`, `NULLIF`, `GREATEST`/`LEAST`, and a
+`UNION` whose first branch is `character(n)` and another text (PostgreSQL
+resolves that column to `bpchar`, so `'ab'` and `'ab  '` are one row).
+
+A `timestamp(p)`, `timestamptz(p)`, `time(p)`, `timetz(p)` or `interval(p)`
+column rounds what is written to it to `p` fractional digits, on every write
+path, and `ALTER COLUMN … TYPE` to a narrower precision rounds the stored
+values. A timestamp written with more than six fractional digits is rounded
+to the microsecond, ties to even, as PostgreSQL rounds it (it was cut).
+
+A cast applies its modifier as PostgreSQL's explicit
+cast does: `'abcd'::varchar(2)` is `ab`, `::char(n)` pads (and cuts),
+`::timestamp(p)`, `::timestamptz(p)`, `::time(p)`, `::timetz(p)` and
+`::interval(p)` round half away from zero (a timestamp on PostgreSQL's epoch,
+so `1999-12-31 23:59:59.5::timestamp(0)` is `23:59:59`). `WHERE tm::time(0) =
+…` and `WHERE iv::interval(0) = …` are refused (42601): a time or interval
+value an expression computes cannot be compared in a `WHERE` yet.
+
+`ALTER COLUMN … TYPE` between text, `character(n)` and `character varying(n)`
+rewrites the stored values as PostgreSQL's rewrite does: past the length is
+22001, two keys that become one are 23505, and a `character(n)` value loses
+its trailing spaces (to text, nothing changes: they are already gone).
+
+**Columns from older binaries.** A `character(n)` column created before this
+was stored as plain text, values as written (trailing spaces kept, so `'b'`
+and `'b '` may both be keys), with a marker that recorded no length. It opens
+as it was: text semantics, described as `text`, its checks unenforced (they
+were stored reading the column `::bpchar`). Nothing is reinterpreted, because
+reading old values one way and new writes another would answer from neither.
+`ALTER TABLE … ALTER COLUMN c TYPE character(n)` converts it: the values lose
+their trailing spaces (23505 while two would become one key), the length is
+recorded, and its checks are enforced from then on — refused (23514) while a
+stored row is false for one. A bare `CHAR` / `CHAR(1)` an older binary created
+(up to f89ed7ad) is the engine's legacy four-byte type, and new ones are
+`character(1)`. Every build stored such a value's UTF-8, cut at four
+bytes and zero-padded (`'é'` is `c3 a9 00 00`), while every reader decoded
+the four bytes as a code point, so `'é'` read back as `'꧃'`, `'€'` as a
+number, and `c = 'é'` found nothing. The bytes are read as what they are
+now, so any value of one character (at most four bytes) reads back as
+written; a longer one was cut by the write that stored it (`'abcde'` is
+`'abcd'`) and reads as what survived. New writes are held to
+`character(1)`: one character, the rest spaces, anything longer 22001
+where it was cut and reported stored. Every cell is read as
+`character(1)` reads a value: its text, without trailing spaces, shown
+padded, so an older build's `''` (four zeros), `' '` and `'a '` cells
+show, match, sort and group as the values they are (`' '`, `' '`, `'a'`),
+and a cut cell as what survived. Comparisons, patterns, joins, ORDER BY,
+GROUP BY, DISTINCT and min/max all use that text, in byte order; the
+filter, the prefilter and the indexes, which hold the stored bytes, are
+not used for such a column. The column is still described as `text`.
+`sum`/`avg` over it and comparing it with a boolean or a number are
+refused (42883), as PostgreSQL has no such function or operator.
+A UNIQUE or PRIMARY KEY over such a column judges each cell by the value it
+shows, so a write never adds a row equal to one that is stored, an
+`ON CONFLICT` finds the row it conflicts with, and `CREATE UNIQUE INDEX` /
+`ADD CONSTRAINT UNIQUE` refuse (23505) over cells that read as one value.
+Rows an older build already stored apart under such a key (`'a'` and
+`'a '`) cannot be told apart now and are left as they are: the open logs an
+error naming the table, the key (`UNIQUE (c)`, `PRIMARY KEY (c)`) and the
+values, and `SHOW CHECKS` lists the key with the status `duplicates` (as
+found when the table was opened); an `ON CONFLICT … DO UPDATE` that would
+update two of them is refused (21000), and so is one statement proposing
+`'b'` and `'b '` (21000); resolve them by hand, and `ALTER … TYPE
+character(1)` (which refuses with 23505 while they remain) is the repair.
+The open also notes whether every key cell is already in its stored form;
+while one is not (or the table has been reloaded by DDL since it opened),
+the uniqueness check walks the table rather than use the index and the
+filter, so a load into such a key costs a pass per row. A partition of a
+partitioned table opens on first use, after the open's scan, so it is never
+called canonical (its keys are always checked by a walk) and its
+duplicates are not listed. `SELECT DISTINCT` and truth tests (`(c = 'a') IS
+TRUE`) read a cell as its value too.
+`ALTER TABLE … ALTER COLUMN c TYPE character(1)` (or `text`,
+`varchar(n)`) rewrites it into the new type, refused while a value does
+not fit (22001) or two keys of a unique constraint would become one
+(23505). Any `ALTER … TYPE` that would leave a check on the column
+unenforced is refused (0A000) rather than done: a check comparing
+`character(n)` values (`c::bpchar <> 'q'`, as an older binary stored every
+check on such a column and `pg_dump` writes them) is enforced over
+`character(n)` and not over text, so `TYPE text` stopped enforcing it with
+success reported. Nothing converts it on open: a conversion is a rewrite of every
+row, and DDL here is not transactional.
 
 Storing UUIDs natively rather than as `U128` matters for pruning. Canonical UUID
 octets are big-endian while `U128` is read little-endian, so copying the bytes
@@ -118,11 +344,139 @@ nothing at all, and point lookups improve ~18x.
   `INSERT ... RETURNING`.
 - **Protocol** — the extended query protocol with bound parameters in text and
   binary format, which is how every driver and ORM actually talks.
+- **`pg_stat_statements`** — one row per statement shape, with `calls`,
+  `total_exec_time`, `mean_exec_time`, `stddev_exec_time` and `rows`, built from
+  the engine's own statement log rather than from an extension. It carries one
+  column PostgreSQL has no counterpart for — `rows_scanned`, the candidate rows
+  the scan read — and `SELECT pg_stat_statements_reset()` empties it. The block
+  counters are reported as zero: there is no shared buffer pool here to count.
+  See [introspection.md](introspection.md#pg_stat_statements).
 
 Predicate forms are desugared into the engine's basic `column <op> value`
 grammar before evaluation (`core/tokenizer/predicate_rewrite.rs`), so `IN`
 becomes several indexable equality probes rather than one predicate the filter
 would have to skip.
+
+### Session values, settings and shorthands
+
+`current_user`, `session_user`, `current_role`, `current_catalog`,
+`current_database()`, `current_schemas(…)`, `pg_backend_pid()` and
+`current_setting(name [, missing_ok])` are read from the session as the
+statement starts. A bare `user` is left as a column name: a table here may
+have a column created as `user`, and reading the session's user in its place
+would be a wrong answer. Statements that store an expression for later
+(`DEFAULT current_user`, a view's or a function's body) keep it unevaluated.
+A native-protocol statement that names one runs through the same path, in a
+session made for it, so `SELECT current_database()` answers there too.
+
+`SET` of a parameter nothing here acts on (`application_name`,
+`search_path`, a custom `myapp.x`) is kept per session, so `SHOW`,
+`current_setting` and `set_config(name, value, is_local)` read back what was
+set; `SET LOCAL` lasts its block, and `RESET` and `DISCARD ALL` clear it.
+`search_path` is reported, not followed: an unqualified name still resolves
+as it always does. A parameter whose value decides how values are read and
+written (`TimeZone`, `DateStyle`, `IntervalStyle`, `client_encoding`,
+`extra_float_digits`, `bytea_output`) reports what this server does, whatever
+a `SET` asked for.
+
+Rewritten to the statements they stand for before anything else reads them:
+`TABLE t`; a CTE's `AS [NOT] MATERIALIZED`; `INSERT … DEFAULT VALUES`;
+`SELECT … INTO [TEMP] t`; `CREATE UNLOGGED TABLE` (a table here is always
+logged, which an unlogged one is allowed to be); `ROW(a, b)`;
+`a [NOT] SIMILAR TO p`; `UPDATE … SET (a, b) = (x, y)` and `= (SELECT p, q
+…)` (one scalar subquery per column, so a volatile function in it runs once
+per column; a list mixing an aggregate with a plain value, `(SELECT
+max(n), 'z' FROM t)`, is read through a derived table so it stays one
+row), in `ON CONFLICT … DO UPDATE` too; `x = ANY('{1,2}'::int[])` (the cast dropped: the elements are
+read as the left side's type either way); a derived table's column list,
+`FROM (SELECT a, b …) AS s(x, y)`, as the names of its first select list.
+
+### Enum types
+
+`CREATE TYPE name AS ENUM ('a', 'b')`, `DROP TYPE [IF EXISTS] … [RESTRICT]`,
+`ALTER TYPE … ADD VALUE [IF NOT EXISTS] 'c' [BEFORE | AFTER 'b']`,
+`ALTER TYPE … RENAME VALUE 'a' TO 'z'` and `ALTER TYPE … RENAME TO`, in a
+transaction block as well (a type and a table using it in one migration).
+A column of the type, or of an array of it, takes only its labels (22P02
+otherwise, as a cast of a non-label does); `pg_type` and `pg_enum` list the
+type and its labels. Enum values order by the labels' declared order, as
+PostgreSQL orders them: `ORDER BY` the column, its output name or position
+(in a `DISTINCT` or grouped query too), `<`, `<=`, `>` and `>=` against a
+label, a parameter or another column of the type, `[NOT] BETWEEN` two
+labels, and `min`/`max`. `enum_first`, `enum_last` and `enum_range` (one
+or two arguments) answer from the labels. A parameter that is no label matches nothing,
+where PostgreSQL refuses it (22P02). A column holds the label as `text`, kept to the labels by a hidden
+constraint the type's `ALTER`s replace.
+
+Where it differs from PostgreSQL:
+
+- The declared order applies where the column is certain from the text: a
+  comparison with a text expression (`m > note`, `m > $1::text`) compares
+  the labels' text, and so does an enum value inside an
+  expression (`ORDER BY coalesce(m, 'ok')`), a CTE's or a subquery's
+  output, or a column two of the statement's tables have.
+- The 22P02 a column reports does not name the value (`invalid input value
+  for enum "Status"`); a cast's does.
+- A row's column is typed `text` on the wire and in `information_schema`.
+- `ALTER TABLE … ALTER COLUMN … TYPE <enum>` and `DROP TYPE … CASCADE` with
+  columns of the type are refused (0A000); type statements are refused over
+  the native protocol.
+
+### Domains
+
+`CREATE DOMAIN name [AS] base [COLLATE c] [DEFAULT expr] [NOT NULL | NULL]
+[[CONSTRAINT n] CHECK (expr over VALUE)]…` and `DROP DOMAIN [IF EXISTS] …
+[RESTRICT]`, in a transaction block as well. A column of a domain is its base
+type with the domain's `NOT NULL`, its checks (named as PostgreSQL names them:
+`<domain>_check`, `<domain>_check1`, …, or the `CONSTRAINT` name) and its
+default where the column has none. A violated check is PostgreSQL's 23514,
+`value for domain posint violates check constraint "posint_check"`. A cast to
+a domain (`x::posint`, `CAST(x AS posint)`) is a cast to its base type
+checked against the domain's constraints, as PostgreSQL's: 23514 for a
+check, 23502 `domain d does not allow null values` for a NULL cast to a
+`NOT NULL` domain.
+
+`ALTER DOMAIN name` changes the domain and every column of it, in one
+statement that a failure (or a block's `ROLLBACK`) takes back whole: `ADD
+[CONSTRAINT n] CHECK (…)` and `SET NOT NULL` test every column's rows first
+(23514 `column "c" of table "t" contains values that violate the new
+constraint`, 23502 `… contains null values`); `DROP CONSTRAINT [IF EXISTS]`,
+`RENAME CONSTRAINT a TO b`, `VALIDATE CONSTRAINT`, `DROP NOT NULL` (a
+column's own `NOT NULL`, and a primary key's, stay), `SET DEFAULT` / `DROP
+DEFAULT` (a column's own default stays), `RENAME TO`; `OWNER TO` and `SET
+SCHEMA public`, which `pg_dump` writes, change nothing.
+
+Where it differs from PostgreSQL:
+
+- A cast to a domain is typed as its base (`pg_typeof(5::posint)` is
+  `integer`), and one of an expression calling a volatile function
+  (`random()::posint`) is refused (0A000).
+- `ALTER DOMAIN … ADD CONSTRAINT … NOT VALID` and `SET SCHEMA` another
+  schema are refused (0A000); `DROP DOMAIN … CASCADE` with columns of the
+  domain is refused (0A000), as is `ALTER COLUMN … TYPE <domain>`. A column
+  whose own default is written the same as the domain's follows `SET
+  DEFAULT` as if it had none.
+- A domain's `NOT NULL` reports the column's 23502 message, not `domain d
+  does not allow null values`.
+- `pg_type` lists no domain, so `psql`'s `\dD` shows none; domain statements
+  are refused over the native protocol.
+
+### Subqueries reading outer columns
+
+A subquery may name an outer column without its qualifier, `EXISTS (SELECT 1
+FROM ord WHERE customer_id = id)`, as PostgreSQL scopes it: the subquery's own
+relations first, then each enclosing query's, nearest first. The name is
+qualified with the relation it is found in before the correlated subquery is
+planned. Where that cannot be decided for certain (a level whose relations'
+columns are not all known, or two relations of one level with the column) the
+name is left as written and the statement fails as before, never with
+another relation's column.
+
+`(a, b) [NOT] IN (SELECT x, y …)` with an uncorrelated subquery runs the
+subquery once and compares the row with each of its rows three-valued: a NULL
+on either side makes that comparison unknown, so `NOT IN` keeps only the rows
+that differ for certain, as in PostgreSQL. A subquery with no rows makes `IN`
+false and `NOT IN` true, whatever the row holds.
 
 ### `LIKE` and `ILIKE`
 
@@ -166,19 +520,28 @@ than the rewrite and invisible to queries.
 
 `INSERT … ON CONFLICT DO NOTHING` works, with or without an arbiter, which is
 what makes a seed migration re-runnable against a database that already holds
-the rows. The arbiter is not consulted — any uniqueness violation is swallowed,
-where PostgreSQL would error if the named columns matched no constraint. That is
-more permissive, and the difference only shows for a statement PostgreSQL would
-have rejected. **`DO UPDATE` is refused** rather than treated as `DO NOTHING`:
-silently dropping the update half is a lost write the caller cannot detect,
-which is worse than an unsupported statement.
+the rows. The arbiter is consulted as in PostgreSQL: `ON CONFLICT (rid)` or
+`ON CONFLICT ON CONSTRAINT t_pkey` absorbs a clash on that key, and a clash on
+any other unique key alone is raised (23505). A row clashing on the arbiter and
+another key at once is the arbiter's. A targetless `ON CONFLICT DO NOTHING`
+absorbs a clash on any key. Until 2026-11-16 every clash was swallowed, so a
+second key's violation was reported as 0 rows. `DO UPDATE` follows the same
+rule, and finds the conflicting row by its arbiter key as the column stores it
+(`1.254` into a `NUMERIC(10,2)` key is `1.25`).
+
+Two rows of one `INSERT … ON CONFLICT DO UPDATE` with the same arbiter key
+refuse the statement with 21000, as in PostgreSQL, the keys compared as each
+column stores them: `5.0` and `5.00`, `'A0EE…'` and `'a0ee…'`, `'2020-01-01'`
+and `'2020-01-01 00:00:00'`, `true` and `'t'` are one key each. A NULL key
+equals nothing, and an omitted or `DEFAULT` key is its column's default when
+that is a constant (a sequence's is a new value per row).
 
 Statements accepted without acting, each for a stated reason rather than
 silently: index DDL (the engine maintains its own indexes), extensions, schemas,
 `COMMENT ON`, `ANALYZE`/`VACUUM`, and table storage tuning —
 `ALTER TABLE … SET COMPRESSION`, `SET`/`RESET (reloptions)`,
-`VALIDATE CONSTRAINT`, `CLUSTER`, `OWNER TO`. `CHECK` is accepted and logged as
-unenforced.
+`VALIDATE CONSTRAINT`, `CLUSTER`, `OWNER TO`. `CHECK` is enforced; see
+[CHECK constraints](#check-constraints).
 
 **`UNIQUE` and `PRIMARY KEY` are enforced, including composite keys.** Declared
 inline, as a table constraint, or through `ALTER TABLE … ADD CONSTRAINT`;
@@ -191,6 +554,14 @@ any number of `NULL`s.
 Single-column constraints declared inline live on `SchemaField.is_unique`;
 everything table-level lives in a per-table sidecar, because a schema flag
 carries no constraint name and `DROP CONSTRAINT` could never have found one.
+
+An inline `UNIQUE` therefore answers to the name the table derives for it now,
+`<table>_<column>_key` (cut where long), and to nothing else. **After
+`ALTER TABLE old RENAME TO new` it is dropped as `new_<column>_key`;**
+PostgreSQL keeps `old_<column>_key`, and asking for that name here is 42704
+(a no-op under `IF EXISTS`). Earlier builds matched any name ending in
+`_<column>_key`, which on a table with both `id` and `item_id` dropped the
+wrong column's constraint, and dropped one for a made-up name.
 
 Two limits remain. Uniqueness is checked against **committed** data, so two
 concurrent transactions can insert the same value and both commit — the probe was
@@ -219,6 +590,386 @@ cycle is caught by a depth limit rather than recursing forever.
 
 Composite keys are refused outright: enforcing one column of a two-column key
 would enforce something weaker than what was declared.
+
+Since the partitioning work's phase 3 P4 (`docs/partitioning.md`, "Phase 3 P4
+as built") foreign keys also run to and from hash-partitioned tables, and:
+
+- `ALTER TABLE … ADD … FOREIGN KEY` checks the rows already in the table, as
+  PostgreSQL does (23503 naming the first value with no parent; it used to add
+  the key unchecked). `… NOT VALID` skips that check and enforces new writes
+  only; `VALIDATE CONSTRAINT` checks the rows later. The PostgreSQL import adds
+  a key its source never validated `NOT VALID`, and a key whose source rows
+  break it (loaded with `--disable-triggers`) `NOT VALID` too, with a note in
+  the report, rather than stopping at its last step.
+- `DROP TABLE` of a table another table's key references is refused (2BP01)
+  unless `CASCADE`, which drops those keys and keeps their tables.
+- A key between columns PostgreSQL cannot compare is refused with 42804:
+  the integer widths, `REAL`/`DOUBLE`, `DATE`/`TIMESTAMP` and the text types
+  pair any way round; an integer child may reference a `NUMERIC`, `REAL` or
+  `DOUBLE` key and a `NUMERIC` child a `REAL` or `DOUBLE` one, not the
+  reverse; any other type only itself. Values are compared in the other
+  side's type, so an `INT` 7 finds a `NUMERIC` 7.00, a `DATE` only a
+  `TIMESTAMP` midnight; an `INT8` beyond a `DOUBLE`'s precision finds none
+  (PostgreSQL rounds it).
+- Names are kept as written (UTF-8, spaces, quotes), and an unnamed key is
+  PostgreSQL's `<table>_<column>_fkey`, numbered on a collision; a column's own
+  `CONSTRAINT n REFERENCES …` is named `n`.
+
+Still unlike PostgreSQL: a plain table may reference a column no unique key
+covers, and `CREATE TABLE` may reference a table that does not exist yet (each
+insert's check names it); identifiers are not case-folded.
+
+### Release note: foreign keys from older binaries
+
+What a database written by an older binary holds, read by this one:
+
+- **An unnamed key keeps the name it was stored under**, `fk_<column>_<parent>`
+  (the old default). New unnamed keys are `<table>_<column>_fkey`. Drop an old
+  one by its stored name: `ALTER TABLE c DROP CONSTRAINT fk_pid_p`; its
+  PostgreSQL name is 42704.
+- **Names were stored ASCII-filtered**, the referenced table and column too
+  (`"my parent"` as `myparent`). Such a key reads back as written. One whose
+  parent table or column lost characters names a relation or column that does
+  not exist: its checks fail naming it, and it is invisible to `DROP TABLE`'s
+  2BP01 check, which matches the stored parent name. Drop it by its stored name
+  and add it again.
+- **Keys an older `DROP TABLE` left behind** (it dropped a referenced table and
+  kept its children's keys) still name that table. Creating a table under the
+  name makes it their parent again, and a later `DROP TABLE` of it is refused
+  with 2BP01 naming them; drop them (`DROP CONSTRAINT`) or use `DROP TABLE …
+  CASCADE`.
+- **A key added `NOT VALID` looks like any other key after a restart**:
+  validity is not recorded and `pg_constraint` is not emulated, so nothing
+  shows which keys still have unchecked rows; run `VALIDATE CONSTRAINT` on
+  each to find their orphans.
+
+### CHECK constraints
+
+A check refuses a row only when it is FALSE, as in PostgreSQL: a NULL result
+passes, so `CHECK (x > 0)` and `CHECK (x IS NULL OR x > 0)` both take a NULL
+`x`. It is judged on `INSERT`, on `UPDATE` (against the row as it will be
+stored) and over the stored rows by `ALTER TABLE … ADD CONSTRAINT … CHECK`,
+all three the same way: a row violates the check when `NOT (check)` holds,
+evaluated as a `WHERE` clause would be.
+
+Accepted forms include what `pg_dump` writes — `((status = ANY
+(ARRAY['a'::text, 'b'::text])))`, a varchar column's `((status)::text = ANY
+((ARRAY[…])::text[]))`, `'…'::timestamp without time zone` — and what ORMs
+generate: comparisons, `BETWEEN`, `IN`/`NOT IN`, `IS [NOT] NULL`,
+`IS [NOT] DISTINCT FROM`, `IS [NOT] TRUE/FALSE`, `LIKE`/`ILIKE`/`NOT LIKE`,
+`SIMILAR TO` (and `pg_dump`'s `~~`, `~~*`, `!~~`), a `CASE` value compared,
+`COALESCE`, `length`/`char_length`/`upper`/`lower`/`btrim`, `jsonb_typeof`,
+`doc ? 'k'`, `doc @> …`, `doc ->> 'k' IS NOT NULL`, POSIX regular
+expressions (`~`, `~*`, `!~`, `!~*`, `regexp_like`, `pg_dump`'s `x ~
+similar_to_escape('…')`), and `AND`/`OR`/`NOT` of them. A check no evaluator
+here can read is refused where it is declared, always with 0A000, rather than
+stored unenforced. Not yet supported: a `CASE` whose branches are themselves
+conditions (`CASE WHEN a THEN b > 0 ELSE true END`).
+
+#### Regular expressions in a CHECK
+
+A pattern is translated from PostgreSQL's dialect (its ARE) into one this
+engine matches exactly as PostgreSQL does, checked against 16674 answers
+recorded from PostgreSQL 17 (`core/rql/pg_regex_pg17.tsv`): `.` takes a
+newline unless the `n` flag is given, `\d` and `[0-9]` are ASCII,
+`[[:<:]]`, `[[:>:]]`, `\m`, `\M`, `\y`, `\Y` are word boundaries, `\b` is a
+backspace and `\B` a backslash, and the flags `i c n m s t q` apply. The
+shapes regex checks are written in are read: `NOT (s ~ 'x')`, `(s ~ 'a') =
+false`, a literal on the left, `COLLATE "C"`, `s ~ ANY (ARRAY[…])`.
+
+A pattern outside that subset neither refuses the table nor its rows: the
+table is created (or the constraint added), the constraint is **not
+enforced**, and a WARNING (01000) naming it is sent to the client and logged.
+Outside the subset: back-references, look-around, `\x`, `\c` and octal
+escapes, collating elements other than one ASCII character, equivalence
+classes, non-ASCII range endpoints, non-ASCII characters under
+case-insensitivity, the flags `x p w b e`, braces that are not a repetition
+count, a quantifier on a quantifier or an anchor, and unknown classes. A few
+constructs depend on the locale's character classes: `\w`, `\W`, `\s`, `\S`,
+`\d`, every bracket class (`[:digit:]` included: under an ICU locale it takes
+'١'), word boundaries, and case-insensitive matching. They are answered for
+ASCII text, where every locale agrees; for other text the answer is UNKNOWN.
+A check whose regular expressions stand under AND, OR and NOT alone is then
+still judged, exactly: `s ~ '^\w+$' AND n > 0` refuses `n = -1` whatever `\w`
+says. A check that reads that answer as a value (`(s ~ '…') IS TRUE`,
+`COALESCE`, `CASE`) is not judged for the row; the statement says so once, as
+a WARNING (01000) naming the table and the constraint with how many rows, and
+the log says it once per statement.
+
+A pattern or flags read from the row (`CHECK (s ~ t)`) outside the subset
+refuse that row with 0A000, and an invalid one with 2201B, as PostgreSQL's.
+
+A check that reads a `character(n)` column (`char`, `char(n)`, `bpchar`) is
+enforced, compared blank-padded as PostgreSQL compares it (`'AB '` is
+`'AB'`; see *`character(n)`* under Type system). One on a `character(n)`
+column an older binary created stays unenforced, with a WARNING, until
+`ALTER COLUMN … TYPE character(n)` gives the column a length. The column's
+declared type follows it: `RENAME COLUMN` carries it, `DROP COLUMN` retires
+it, and `ALTER COLUMN … TYPE` sets or retires it.
+
+`SHOW CHECKS` lists every check, with `enforced`, `enforced (ASCII-exact)` (a
+locale-dependent pattern, answered exactly for ASCII text), `not enforced` or
+`cannot be compiled` (one stored by an older binary) and why; each that is
+not enforced is also logged once when its table is opened. `ALTER TABLE …
+ADD CONSTRAINT` says, as a WARNING, how many stored rows went unjudged.
+
+A pattern PostgreSQL itself rejects (`'('`, `'[a'`, `'*a'`) is accepted at
+CREATE TABLE, as there, and every row it meets is refused with 2201B; an
+unknown flag, or `g`, is 22023.
+
+#### Release note: checks stored by older binaries
+
+Older binaries stored some checks without enforcing them, logging "could not
+be compiled" at each write: checks using `COALESCE`, `IS NOT NULL`,
+`char_length`, `upper`, `IS DISTINCT FROM` or `->> … IS NOT NULL`, among
+others. This binary enforces them. Rows written while they were not enforced
+may violate them, and a later `UPDATE` of such a row fails with 23514 even if
+it does not touch the checked columns. Find them before upgrading traffic:
+
+```sql
+SELECT * FROM <table> WHERE NOT (<check expression>);
+```
+
+and fix or delete each row, or drop the check (`ALTER TABLE <table> DROP
+CONSTRAINT <name>`) and add it again once the data holds.
+
+### Subqueries in UPDATE and DELETE
+
+An `UPDATE` or a `DELETE` reads its subqueries (`[NOT] IN (SELECT …)`,
+correlated or not `[NOT] EXISTS`, a scalar subquery), its `FROM`/`USING`
+source, its CTEs and its derived tables under the snapshot its target rows are
+scanned under, as PostgreSQL reads a statement under `READ COMMITTED`: a
+transaction committing in between cannot make it write a row that no single
+moment had match. When nothing the statement read has been written since
+(every table read was last written by a transaction older than that
+snapshot's oldest running one), the target is scanned at a fresh snapshot
+instead, which holds the same answer for the reads: contention on the target
+alone then behaves as it does for a plain write. There is no EvalPlanQual: a
+target row changed since its snapshot is a write conflict, replayed whole
+(subqueries read again) in autocommit and in a `READ COMMITTED` block, and
+reported (40001) when it cannot be. A statement fed by a CTE or a derived
+table, which are read before the write starts, is replayed whole outside a
+block, its CTEs and derived tables read anew, up to four times. A locking
+read in a write's subquery (`… = (SELECT id FROM jobs … FOR UPDATE SKIP
+LOCKED)`) reads the latest rows at a snapshot of its own. `UPDATE … FROM` and
+`DELETE … USING` still write each joined row back by its key, rechecking the
+condition against the row as it is then.
+
+A correlation may name the target schema-qualified (`"public"."t"."id"`), cast
+either side (`u.tid = t.id::bigint`, `::numeric(10,1)`), or, in `UPDATE …
+FROM`, name the target beside its source; a cast keeps its type modifier
+there (`::varchar(1)`, `::char(2)`, `::timestamp(0)`, `::interval(3)`), as it
+does everywhere. One that compares an outer
+column under arithmetic (`u.x = t.x + 1`), or an `EXISTS` used as a value
+(`x - EXISTS (…)::int`), is refused with 0A000.
+
+### NUMERIC results and display scale
+
+A `NUMERIC` expression is computed as PostgreSQL computes it, with its
+display scale: the larger operand scale for `+`, `-` and `%`, their sum for
+`*`, `select_div_scale` for `/` (sixteen significant digits at least, never
+fewer places than either operand, rounded half away from zero), a written
+constant's own places (`2.50` is two), an integer's none, and for `CASE`,
+`COALESCE`, `LEAST`, `GREATEST` and `NULLIF` the scale of the value chosen.
+`1.0 / 3` is 0.33333333333333333333 and `2.50 * 2` is 5.00 in a select list,
+`ORDER BY` key, join item, `RETURNING`, an expression over aggregates
+(`min(n) + 1`), `::text`, `||`, a text column it is stored in, and a
+comparison (`CASE WHEN x * y > 0`). Stored into a `NUMERIC(p, s)` column the
+value is PostgreSQL's, rounded once more to `s`.
+
+An aggregate's NUMERIC argument is computed the same way (`sum(n * 2)` over a
+NUMERIC(10,4) is 24.0000), and so is arithmetic over an unconstrained column in
+a `WHERE` clause (the scan hands it to the expression evaluator). A value that
+needs more than the 38 digits an `i128` carries is refused (0A000 or 22003),
+never rounded — PostgreSQL's `numeric` has no such limit, so a product like a
+twenty-place value times `1e30` is refused here; one that ends within 38 places
+past a display scale of more than 38 is shown at 38. Not yet at PostgreSQL's
+digits: a `GROUP BY` key computed by an expression.
+
+#### Unconstrained NUMERIC storage (C6)
+
+An unconstrained `NUMERIC` column keeps each value at its own scale, as
+PostgreSQL does: `INSERT 1.50` reads back `1.50`, `'1e-10'` is stored, and
+`UPDATE … SET c = 2.0 / 3` stores 0.66666666666666666667. Up to 38 digits and
+38 places; past that a value is refused, never rounded. Equal values at
+different scales (1.5, 1.50) are one value to `=`, `GROUP BY`, `DISTINCT`, a
+join, `UNIQUE` and the indexes; each is shown as written, and `MIN`/`MAX` of
+tied values gives the later one, as PostgreSQL's `numeric_larger` does.
+
+Such a column's slot is seventeen bytes (the value and its scale); the
+field's recorded width says which format a column holds, and one column never
+mixes them. `CREATE TABLE`, `ALTER TABLE … ADD COLUMN`, a partitioned table,
+pg-import and a CTE or derived table make every new unconstrained `NUMERIC`
+column this way (`CREATE TABLE … AS` and `SELECT INTO` are not supported yet).
+Range predicates on such a column are not pruned by zone maps yet; equality
+is pruned by the filter index, and both B-tree and hash indexes key it.
+
+A column created before this release keeps the sixteen-byte slot at nine
+places, its values and its speed unchanged, and with them the earlier rule: a
+value with a nonzero digit past nine places is refused (0A000), and the error
+says how to keep them. Convert the column with
+
+    ALTER TABLE t ALTER COLUMN c TYPE NUMERIC;
+
+which rewrites every row into the new slot, all or nothing (a crash or a
+failure part-way leaves the old column, `database/rewrite.rs`). Each value
+keeps its value and is shown at the places it needs (1.500000000 becomes
+1.5; the scale it was written with was never stored). Any other rewrite of
+the table converts it the same way: an `ADD COLUMN` on a table with rows,
+`DROP NOT NULL`. A partitioned table is not rewritten yet, so its old columns
+stay as they are.
+
+`ALTER COLUMN c TYPE NUMERIC(p, s)` over an unconstrained column, a scale
+change of a `NUMERIC(p, s)` column, a narrower precision, and `TYPE NUMERIC`
+over a `NUMERIC(p, s)` column each rewrite every row the same way. Each value
+is converted as PostgreSQL's cast converts it: rounded half away from zero to
+`s`, refused with 22003 past `p`, and kept whole at its scale into an
+unconstrained column (1.50 stays 1.50). The rewrite is refused, leaving the
+table as it was, in these cases:
+- rounding makes two keys of a unique constraint one (23505);
+- a `CHECK` reading the column rejects a rounded row (23514; each check is
+  judged over the rows as the new type rounds them);
+- a foreign key the column is a side of (parent, child or both, for a
+  self-reference) would leave a child key naming no parent (23503);
+- a generated column reads the column (0A000, as PostgreSQL refuses).
+
+A check that cannot be judged through a cast to more than nine places is
+refused with 0A000 only when rounding changes a value it reads. A wider precision at the same scale only records the
+declaration.
+
+A float written into an unconstrained column is its `float8_numeric` value.
+One that needs more than the 38 digits or places carried here (`1e-300`,
+`1e40`) is refused with 0A000, never stored as 0. Into a `NUMERIC(p, s)` it is
+rounded to `s`, as PostgreSQL's assignment rounds it (`1e-200` is 0.00). An
+`avg` whose PostgreSQL scale passes 38 places with a nonzero digit there is
+refused with 0A000, as `n / 2` is. One whose digits past 38 places are all
+zero is shown at 38.
+
+Upgrade and downgrade: no rewrite is needed on upgrade. The first time a
+seventeen-byte column is written, the database records the on-disk feature
+`numeric_own_scale_v1` in its `incompat_features` file, and from then on a
+binary that does not know it refuses to open the database at start, naming
+the feature, rather than misreading those columns (an older binary would read
+the seventeen bytes at nine places and write sixteen into them). A binary from
+before `incompat_features` existed ignores the file and must not be used on
+such a database. The flag is written outside the log, so a
+snapshot taken before it was set does not carry it. A point-in-time restore
+therefore sets the flag itself, before the directory appears, in each
+database directory (the root, or a nested `CREATE DATABASE` one) whose tables
+hold a seventeen-byte column. Opening a table with such a column in a
+directory without the flag sets it too, before anything else reads the table. Replication ships
+statements, so a replica must run a binary that knows the feature before the
+primary writes a value with more than nine places.
+
+A constant with more than nine places, written either way (`0.000000000001`,
+`43e-17`), is `numeric` as in PostgreSQL, carried with its digits (up to 38
+places): `SELECT c + 43e-17` is 44812.65000000000000043. So is one too large
+for nine places (past about 1.7e29: `1e30`, a 30-digit integer), which was a
+`float8`: `n * 1e30` and `1e30 + 1` are exact. A `UNION` of NUMERIC
+columns at different scales gives each value at its own scale; one whose
+branch types cannot be resolved to NUMERIC is refused with 0A000 rather than
+mixed.
+
+Join keys of two numeric types or scales meet by value, in PostgreSQL's
+common type: `numeric = float8` as `float8`, `numeric = numeric` whatever the
+scales.
+
+A NUMERIC or an integer compared with a `double precision` or `real` is
+compared as PostgreSQL compares it, in `float8`: the exact value converted to
+its nearest double, a `real` widened. `n = 1234567890.123456789::float8` holds
+for a NUMERIC(30,9) 1234567890.123456789 and for 1234567890.1234567 (both
+round to that double), and `9007199254740993::bigint = 9007199254740992::float8`
+holds. Every operator (`=`, `<`, `CASE`, `NULLIF`, `GREATEST`, `LEAST`), a
+`WHERE` and a `CHECK` against a float constant, `IN` lists of floats
+(`n IN (SELECT f8 …)`, a NULL among them keeping IN unknown and NOT IN never
+true) and the hash join agree. Against a bare column the scan reads such a
+constant as the run of the column's values that round to it, so an index still
+serves it; in an IN list the floats only one value rounds to are an ordinary
+IN list, and those many values round to (a NUMERIC(38,20) near 0.1, a bigint
+past 2^52) are matched by the column's nearest double against one hashed set. `ORDER BY` over values of mixed numeric types orders
+them at their exact values. An IN list mixing floats and plain numbers
+(`w IN ('0.1'::float8, 2.5)`) takes the list's type, float8, so every item is
+compared with the column's nearest double. Two columns (`WHERE n = f8`,
+`n < f4`) are compared the same way, in a `WHERE`, a select list and
+`UPDATE … WHERE`. A `NaN` or infinity constant against an exact column is
+answered as PostgreSQL orders them: NaN above every number, `n < 'Infinity'`
+true for every value.
+
+A `real` column compared with a `double precision`, a decimal or an integer
+constant is widened, as PostgreSQL compares it: a `real` 0.1
+(0.10000000149011612) is not `'0.1'::float8` and is greater than it,
+`f4 = 0.1` holds for no row, `f4 = 16777217` for none, and `f4 BETWEEN 0 AND
+0.1` excludes the `real` 0.1. Against a `real` constant (`'0.1'::real`) it is
+compared as a `real`. An IN list follows PostgreSQL's common type: two or
+more plain numbers are a `real` list (`f4 IN (0.1, 0.5)` holds for the `real`
+0.1), while a `double precision` item or a single item widens; a column in
+the list (`f4 IN (f8, 0.1)`) and a subquery's numbers (`f4 IN (SELECT n …)`)
+are each compared as the scalar `=`, in double precision. A NULL item counts
+as an item but has no type (`f4 IN (0.1, NULL)` is a `real` list, `f4 IN
+('0.1'::float8, NULL)` a double one), and NOT IN with a NULL is never true.
+`'0.1'::numeric` is the numeric 0.1, and a negative constant is widened as a
+positive one is.
+
+Text compared with a float has no operator in PostgreSQL, and is refused
+here with its 42883, naming the float's type (`text = real` for a `::real`):
+a text, `character` or `character varying` column, a text function's result
+(`upper(t)`), a `CASE` of text and a `||` concatenation, under `=`, `IN` and
+`BETWEEN`, in a `WHERE` and a select list. So are a timestamp, date, time,
+boolean, bytea, inet or interval column against a float. A float parameter
+(`$1` bound as float8 or float4) is that float, as PostgreSQL types it, so a
+text column compared with it is refused too.
+
+`double` alone is not a type name (42704, as in PostgreSQL); `double precision`
+is, in a cast and in a `WHERE`. A DDL column type `DOUBLE` stays accepted, as
+the engine's other extension names (`STRING`, `UBIGINT`) are.
+
+A scalar subquery standing as a whole select item is named after its inner
+item, as PostgreSQL names it: `(SELECT max(x) FROM t)` is `max`, `(SELECT x AS
+y …)` is `y`, an expression is `?column?`.
+
+#### NUMERIC NaN and infinity (a known difference)
+
+PostgreSQL stores `NaN`, `Infinity` and `-Infinity` in a `numeric` (and
+refuses an infinity in a `numeric(p, s)`). This engine's NUMERIC is an exact
+fixed-point number with no NaN or infinity, so every path in refuses them
+with 0A000 "numeric NaN and infinity are not supported", and stores nothing:
+a literal (`'NaN'`, `'-inf'`), `'NaN'::numeric`, a float or real NaN or
+infinity (`'NaN'::float8`, a float column through `INSERT … SELECT` or
+`UPDATE … FROM`), `UPDATE … SET`, `ON CONFLICT … DO UPDATE`, a `DEFAULT`, a
+generated column, and pg-import's per-value conversion, into an unconstrained
+column of either slot and into a `NUMERIC(p, s)`. An infinity bound for a
+`NUMERIC(p, s)` keeps PostgreSQL's own 22003, since PostgreSQL refuses it too.
+Supporting them would mean a sentinel in every NUMERIC consumer (comparison,
+sort, indexes, filters, arithmetic, aggregates, casts, the wire), each of which
+could answer a silent wrong number if it missed one; a float NaN or infinity
+compared with a NUMERIC column is answered as PostgreSQL answers it.
+
+### Float text
+
+A `double precision` or `real` value's text is PostgreSQL's (`float8out`):
+the shortest digits that read back as the same float, with an exponent past
+fifteen digits (six for `real`) or below 10^-4 — `1e+20`, `1e-07`, `3.4e+38`
+— and `NaN`, `Infinity`, `-Infinity`, `-0`. The wire, `::text`, `||`, a text
+column a float is stored in and `INSERT … SELECT` all agree.
+
+A `real` stored into a `double precision` column is that real widened
+exactly, as PostgreSQL stores it: `'0.1'::real` is 0.10000000149011612 in a
+`float8` column, through every path in (a typed literal, `INSERT … SELECT`,
+`UPDATE`, `UPDATE … FROM`, `ON CONFLICT … DO UPDATE`, a `DEFAULT`, a
+generated column) and in `real::float8`. A `real` into a `NUMERIC` is its
+six-digit text, rounded to the column's scale, as PostgreSQL's cast reads it.
+
+Release note: older binaries stored such a value as the double nearest the
+real's digits (0.1). Those rows are not rewritten — there is no migration — so
+a `float8` column written through a `real` before and after the upgrade can
+hold both forms, and `f8 = (SELECT f4 …)` finds only the rows written since
+(or rewritten: `UPDATE t SET f8 = f8::real`).
+
+Release note: a `STORED` generated column computed from a float's text
+(`GENERATED ALWAYS AS (f::text) STORED`) keeps the text an older binary
+wrote for rows it wrote (`100000000000000000000`); rows written or updated
+since carry PostgreSQL's (`1e+20`), so such a column can hold both forms
+until its rows are rewritten (`UPDATE t SET f = f`).
 
 ## JSON
 
@@ -385,8 +1136,6 @@ has. A catalogue file could disagree with the directories it lists; this cannot.
   checkpointing run until the process exits, writing to files that have already
   been unlinked. Their work is discarded, but the space is not reclaimed until
   then.
-- **No `current_database()`, `pg_database` or `\l`.** Connecting works; tooling
-  that introspects the database list does not.
 - **No schemas.** `search_path` is not honoured, and a schema-qualified name has
   its qualifier stripped.
 
@@ -399,6 +1148,66 @@ invalidated each other's, so a scan in one could have been served the other's
 row pointers. Each table's cache key is now qualified by the id of the database
 that owns it — an id rather than the name, so a database recreated under a name
 does not inherit what its namesake left behind.
+
+## Connection limits and timeouts
+
+```
+--max-connections <n>                          (default: 500; must be >= 1)
+--authentication-timeout <time>                (default: 60s; bare number = seconds)
+--idle-in-transaction-session-timeout <time>   (default: 0 = off; bare number = ms)
+--idle-session-timeout <time>                  (default: 0 = off; bare number = ms)
+```
+
+These follow PostgreSQL's settings of the same names:
+
+- **Over `max_connections`** a connection is answered, after its startup
+  packet and any TLS negotiation, with `FATAL 53300` "sorry, too many clients
+  already". Connections still being refused are capped at the same number
+  again; past that a socket is closed unanswered. Each connection, admitted
+  or being refused, holds two descriptors, so a storm costs at most four per
+  unit of `max_connections`. There is no unlimited setting.
+- **`max_connections` must fit the open-file limit.** At start-up the server
+  needs `4 × max_connections + 256` descriptors (256 kept for table files, the
+  WAL and checkpoints). If the soft `RLIMIT_NOFILE` is short of that, it is
+  raised as far as needed, up to the hard limit. If the hard limit is short
+  too, `max_connections` is lowered to fit, a warning is logged, and
+  `SHOW max_connections` reports the lowered value. Without this, a cap the
+  limit could not hold ran the process out of descriptors before anyone was
+  refused: `accept()` failed with `EMFILE` and the engine's own file opens
+  failed inside sessions already admitted.
+- **`authentication_timeout`** bounds everything before the session exists —
+  the startup packet, TLS and the password exchange. A silent socket is
+  closed; one that stalls mid-authentication is told `FATAL 57014`
+  "canceling authentication due to timeout".
+- **A startup packet** longer than 10,000 bytes (PostgreSQL's
+  `MAX_STARTUP_PACKET_LENGTH`), or shorter than 8, is refused before anything
+  is allocated, with `FATAL 08P01` "invalid length of startup packet", and the
+  connection is closed.
+- **`idle_in_transaction_session_timeout`** ends a session that sits inside an
+  open block (failed or not) for longer, with `FATAL 25P03`; the block is
+  rolled back before the error is sent. **`idle_session_timeout`** does the
+  same outside a block, with `FATAL 57P05`. Both run only while the server
+  waits for a client that has been sent `ReadyForQuery` — never during a
+  statement, and not between `Parse` and `Sync`. Sessions `SET`, `SET LOCAL`,
+  `SHOW` and `RESET` them, with PostgreSQL's units (`us`, `ms`, `s`, `min`,
+  `h`, `d`); `RESET` returns to the server's flag. `SET LOCAL` is undone when
+  the block ends, but not by `ROLLBACK TO SAVEPOINT`. It undoes only the
+  setting it named, and a plain `SET` of that setting later in the block
+  supersedes it, so the plain `SET` outlives the block as in PostgreSQL.
+- A session that is ending gives the client 2 s to take its last bytes — the
+  `FATAL`, any output still buffered, a TLS `close_notify` — and closes
+  without them after that, so a client that has stopped reading cannot keep a
+  terminated session's slot.
+- `max_connections` and `authentication_timeout` are shown by `SHOW` and
+  refused by `SET` (`55P02`).
+
+A failed `accept()` — `EMFILE` when the process is out of descriptors, for
+one — is logged and retried with a backoff of 50 ms growing to 1 s; it never
+stops the listener, and a listener that cannot start at all (port taken,
+certificate unreadable) exits the process with status 2 rather than 0.
+Accepted sockets get TCP keepalive (on Linux: first probe after 60 s idle,
+then every 15 s, dead after 4 unanswered), so a peer that vanished without
+closing its socket stops holding a slot.
 
 ## Authentication and encrypted transport
 
@@ -479,8 +1288,66 @@ sea-orm's nested transactions both work. Rolling back to a savepoint also
 un-poisons a failed block, which is the reason the feature exists: recovering
 from one failed statement without losing the whole transaction.
 
-Not built: blocking-on-conflict (the second updater is told to retry rather than
-made to wait), and write-skew detection under `SERIALIZABLE`. See `docs/mvcc.md`.
+**DDL in a block rolls back with it** (`database::block_ddl`): `CREATE TABLE`
+(also `AS` a query and `PARTITION BY`), `ALTER TABLE` (`RENAME TO` included),
+`CREATE [UNIQUE] INDEX`, `DROP INDEX`, `DROP TABLE` and the role statements, on
+plain tables of any backend (a key/value store's too) and on partitioned ones.
+Before the statement runs, the files it can change are copied aside and an
+intent naming the block's transaction is written; `COMMIT` discards the
+copies, and `ROLLBACK`, a failed statement, a dropped connection or a crash
+puts them back and drops the tables the block created. `ROLLBACK TO
+SAVEPOINT` undoes the DDL since the savepoint. A `DROP TABLE` is deferred: it
+runs once the block's commit is durable, so a rolled-back drop never touched
+the table, and a `CREATE TABLE` of a name the block dropped sets the dropped
+table aside under a hidden name until then. An `ALTER` that rewrites a
+partitioned table's rows into new files keeps the old files until the block
+ends (2026-11-12). So a migration that fails part-way leaves the schema as it
+found it, and its retry does not fail on "already exists". As in PostgreSQL,
+the block keeps the statement's ACCESS EXCLUSIVE to its end: another
+session's reads and writes of the table wait for it. The copy costs a pass
+over the files, so an `ALTER` of a big table in a block takes that much longer
+than one outside.
+
+Refused in a block (`25001`, as PostgreSQL refuses its own commands that
+cannot roll back): `CREATE`/`DROP DATABASE`, and this engine's partition
+restructures, a conversion to a partitioned table (`ALTER TABLE … PARTITION
+BY`, `CREATE INDEX … USING partition`) and a reshape (`SPLIT PARTITION`,
+`MERGE PARTITIONS`, `ISOLATE KEY`, `SPLIT KEY`). Run those outside a block; a
+migration runner's per-migration transaction can be turned off for one (for
+sqlx, `-- no-transaction`). Unlike PostgreSQL, a table the block dropped can
+still be read by the block until it commits.
+
+At `READ COMMITTED` a writer that meets a row another transaction is changing
+waits for it, as PostgreSQL's does, then re-reads the row and applies its own
+change to the committed version if the row still qualifies (or skips it).
+`REPEATABLE READ` still raises `40001`. The wait ends at `lock_timeout`
+(`55P03`), `statement_timeout`, a cancel, or a deadlock (`40P01`).
+
+Not built: write-skew detection under `SERIALIZABLE`. See `docs/mvcc.md`.
+
+### Row locks (`FOR UPDATE`, `FOR SHARE`, `SKIP LOCKED`, `NOWAIT`)
+
+A locking read takes each row's lock and waits (bounded) for a holder. A
+writer honours them, but how it meets one depends on timing:
+
+- When some row is locked anywhere at the statement's start, an `UPDATE` or
+  `DELETE` asks for each row's lock first and is refused at once with
+  `55P03` on a row another transaction holds. PostgreSQL would wait.
+- When no row is locked at the start, the writer skips that pass and marks
+  each row just before writing it. A `FOR UPDATE` that locks the row after
+  the mark waits for the writer's transaction to end and then reads its
+  committed row. If the lock came first, the writer meets it at the mark:
+  having written nothing yet, the statement waits for the holder and is
+  replayed, which is PostgreSQL's wait; having already written other rows,
+  it fails with `55P03`.
+
+A writer's marks are per row until one transaction has written more than
+1,024 rows of one table. Past that they become one mark on the whole table,
+to bound memory: until that transaction ends, **every** `FOR UPDATE` on the
+table waits for it, `NOWAIT` fails with `55P03`, and `SKIP LOCKED` skips
+every row. A batch job that updates thousands of rows of a queue table in
+one block therefore holds up every worker's `SKIP LOCKED` claim on that
+table until it commits; run such a job in smaller transactions.
 
 ## Not yet supported
 
@@ -560,29 +1427,107 @@ in-place-update path all have to agree about it:
 
 ### 2. Smaller gaps
 
-- Correlated subqueries: `EXISTS (… WHERE inner.x = outer.y)`, and scalar
-  subqueries in the select list. Only the uncorrelated `IN` form works, because
-  it can be executed once; a correlated one would have to run per outer row.
-- `ON CONFLICT … DO UPDATE`, `DISTINCT ON`, `UPDATE … FROM other_table`,
-  window functions, `CREATE SEQUENCE`, table partitioning, and `DO $$ … $$`
-  plpgsql blocks. All confirmed present in a real application's migrations, so
-  these are gaps rather than hypotheticals.
-- `NOT` over a parenthesised group — needs the evaluator to negate a subtree
-- `CASE WHEN`, `::type` casts, and `WITH RECURSIVE`. The last is refused **by
-  keyword**: treating a recursive CTE as non-recursive computes the base case,
-  stops, and returns a shorter answer with no error.
-- `RIGHT`/`FULL`/`CROSS JOIN`, and `WHERE` terms spanning two relations. Refused
-  by name rather than mis-evaluated. An `ON` term spanning two relations is only
-  accepted when it is a further **equality**, which makes it part of a composite
-  join key; anything else there would have to be evaluated after the join.
-- On the null-supplying side of a `LEFT JOIN`, only `<column> IS NULL` is
-  supported in a `WHERE`, and only when that column is `NOT NULL`. Anything else
-  is refused, because a `WHERE` term pushed down there changes *which left rows
-  appear* — it would return rows PostgreSQL excludes. An `ON` term is different
-  and **is** pushed down: it changes which right rows are candidates, leaving
-  unmatched left rows to survive with `NULL`s exactly as they should.
+Checked against PostgreSQL 17 on 2026-11-19 with the differential harness
+(`.claude/reviews/pgdiff`). Correlated subqueries, `ON CONFLICT … DO UPDATE`,
+`DISTINCT ON`, `UPDATE … FROM`, window functions (with a `WINDOW` clause),
+sequences, views, triggers, `MERGE`, `DO` blocks, `PREPARE`/`EXECUTE`,
+`RIGHT`/`FULL`/`CROSS JOIN`, `JOIN … USING`, `NATURAL JOIN`,
+`ROLLUP`/`CUBE`/`GROUPING SETS`, `WITH RECURSIVE`, a column list on a table
+alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
+`::regtype` and `to_regclass` all run now and are no longer gaps. What is still missing:
 
-  The `NOT NULL` requirement is subtle and is a property of the *column*, not of
-  the query: on a nullable column `IS NULL` cannot distinguish "no matching row"
-  from "matched, with a NULL value there", so it is refused rather than answered
-  as an anti-join.
+- **Types**: `CREATE TYPE` for composites and ranges (enums work, see
+  "Enum types" above), multirange types (`int4multirange`), multidimensional
+  array literals (`ARRAY[[1,2],[3,4]]`),
+  NUMERIC `NaN`. A `money` value prints as a plain number (`12.5`), where
+  PostgreSQL prints `$12.50`. `'nosuch'::regclass` is not refused (42P01 in
+  PostgreSQL): a sequence's name is not known to the text pass that reads
+  the cast.
+- **DDL**: `CREATE TABLE … (LIKE t INCLUDING …)`, `UNIQUE NULLS NOT DISTINCT`,
+  `PARTITION BY RANGE`/`LIST` (tables partition by `HASH` only), and
+  `UPDATE … SET a[1] = …`.
+- **Queries**: a row compared with a correlated subquery (`(a, b) IN (SELECT …
+  WHERE u.k = t.k)`; an uncorrelated one works), an outer column
+  named bare where the subquery's relations are not all known (a CTE, a
+  function in `FROM`, `SELECT *` in a derived table) or two outer relations
+  have it, `TABLESAMPLE … REPEATABLE` (0A000: the sample is drawn anew on
+  every run; `TABLESAMPLE BERNOULLI|SYSTEM (p)` itself works, `SYSTEM`
+  sampling rows rather than pages),
+  the `SEARCH`/`CYCLE` clauses of a recursive CTE, `FOR UPDATE`
+  on a table with no unique column, and a `WINDOW` clause inside a subquery
+  (the outermost one works).
+- **Functions**: the ordered-set aggregates (`percentile_cont`,
+  `percentile_disc`, `mode`), `json_object_agg`/`jsonb_object_agg`,
+  `regexp_matches` and `regexp_split_to_table` in a select list, the
+  `jsonb_path_*` functions, `row_to_json`, `to_number`, `date_bin`, the XML
+  functions, and
+  the `json_*` (not `jsonb_*`) table functions.
+- **Operators**: the prefix `|/` and `@`. In a `WHERE`, a
+  `jsonb` operator over a function's result (`jsonb_set(doc, '{d}', '1') ? 'd'`)
+  is refused (0A000); over a column, and in a select list, it works.
+- **Table functions**: a `jsonb_array_elements` item's alias names the item,
+  not its column, so `SELECT x FROM t, jsonb_array_elements_text(t.tags) x`
+  fails (write `x.value`). A lateral `jsonb_each(t.j)` runs for every row of
+  `t` before the `WHERE`, so a row whose document is not an object fails the
+  statement even where the `WHERE` would have excluded it.
+- **Errors** carry PostgreSQL's position (`at character N`, the `P` field)
+  where the message names something in the statement: an undefined column,
+  relation, type, function or `TABLESAMPLE` method, a missing `FROM` entry,
+  an ambiguous column, the literal an input error quotes. Its first use in
+  the text is taken; where PostgreSQL points elsewhere (a syntax error, an
+  expression the reader cannot take) there is no position.
+- **Range types** (`int4range`, `int8range`, `numrange`, `daterange`,
+  `tsrange`, `tstzrange`) read and print as PostgreSQL's, discrete ones
+  canonical (`[1,5]` is `[1,6)`), and take the constructors
+  (`int4range(1, 5, '[]')`), `lower`/`upper`, `isempty`, `lower_inc`,
+  `upper_inc`, `lower_inf`, `upper_inf`, `range_merge`, the set operators
+  `*`, `+`, `-` (a union or difference that is not one range is 22000), and
+  `@>`, `<@`, `&&`, `<<`, `>>`, `&<`, `&>`, `-|-`. A lower bound above the
+  upper (`'[5,1)'`) is 22000, not `empty`. In a `WHERE`, a range column
+  against a literal is the scan's own comparison; any other range operand
+  (`int4range(lo, hi) @> 5`, `r * '[5,25)' = …`, `'[0,9)'::int4range @> r`)
+  is read by the select list's evaluator, NULLs unknown under `NOT`. An
+  untyped literal beside a range is that range type (`r * '[5,25)'`,
+  `range_merge(r, '[4,5)')`).
+- **Undefined names** are PostgreSQL's errors: a name that is no column is
+  42703 `column "x" does not exist` (or `column t.x …`) wherever it is
+  written — inside an expression, a `CASE`, `HAVING`, `ON`, a subquery — and
+  a function PostgreSQL has no such name for, or none taking those
+  arguments, is 42883 `function f(integer, unknown) does not exist` —
+  `lower(1)` and `upper(now())` among them, since only text has a case. The
+  first one in PostgreSQL's reading order is reported (`FROM` and `ON`, the
+  select list, `WHERE`, `HAVING`, `ORDER BY`, `GROUP BY`); text its parser
+  would refuse first stays a syntax error. A function PostgreSQL has that
+  the engine does not is 0A000. Behind a CTE, a derived table, a view or a
+  function in `FROM` the engine's own message is kept. A bare name where a
+  value belongs — `SET s = nosuch`, `VALUES (…, nosuch)` — is 42703 too; it
+  used to be stored as its own text. An `ON CONFLICT … DO UPDATE` is read
+  with the statement, conflict or not: a name in its `SET` or `WHERE` that
+  names nothing (a column, `excluded.x`, a qualifier) is refused before any
+  row is written, where the first run used to insert and succeed.
+
+## Statements over the native protocol
+
+A statement sent over the native protocol (`rasterizeddb_client`)
+gets the same preparation as an autocommit statement over pgwire: comments,
+typed literals (`DATE '…'`), `CREATE UNIQUE INDEX` as a unique constraint,
+constant folding, `IN`/`EXISTS`/scalar subqueries, `WITH` and derived tables
+(`FROM (SELECT …)`), views, sequences and the other schema objects, a
+`SELECT` with no `FROM` (`SELECT 1`, `SELECT now()`), and the catalogue views
+(`pg_tables`, `pg_indexes`, `information_schema.*`). A cell arrives typed by
+its column: `jsonb`, arrays, `bytea` and a NUMERIC's scale are kept. The
+statements that administer the server (`BACKUP`, `RESTORE`, `STORAGE`,
+`REPLICATION`, `SET CONFIG`, `KV FLUSHALL`, databases, roles) need a
+superuser when the listener requires authentication, as on pgwire.
+
+A transaction block (`BEGIN` … `COMMIT`, `SAVEPOINT`, `LOCK TABLE`) runs on a
+`rastcp/1` connection, which holds one session, as a pgwire connection does;
+the client gives each transaction a connection of its own. A multiplexed
+`rastcp/2` connection carries requests from unrelated callers at once, so it
+refuses transaction control (0A000).
+
+Refused by name rather than run in part:
+
+- **One statement per request.** `INSERT …; INSERT …` is refused whole. Before
+  2026-11-16 the first statement ran and the second was dropped with a success
+  reply.

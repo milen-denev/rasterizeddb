@@ -1,0 +1,706 @@
+//! A pgwire server over one on-disk database, and a small blocking client
+//! that speaks the simple and the extended protocol, for the partitioning
+//! tests that need what only the wire layer does: sessions (`BEGIN` …
+//! `ROLLBACK`), `$n` parameters, multi-row `INSERT` splitting, `ON CONFLICT`,
+//! `RETURNING`, `COPY`, `FOR UPDATE`, and the SQLSTATE a refusal maps to.
+//!
+//! Shared by `partition_twin.rs` and `partition_shell_sites.rs`; not a test
+//! target of its own (a directory module).
+
+#![allow(dead_code)]
+
+use std::io::{BufReader, Read, Write};
+use std::net::TcpStream;
+use std::time::Duration;
+
+use rasterizeddb_core::{
+    BATCH_SIZE, MAX_PERMITS_THREADS,
+    auth::AuthMethod,
+    core::database::{Database, catalog::DatabaseCatalog},
+    pgwire::{AuthConfig, ConnectionLimits, TlsConfig, TlsMode, start_pgwire_on_listener},
+};
+use rclite::Arc;
+
+pub fn init_globals() {
+    let _ = MAX_PERMITS_THREADS.set(4);
+    let _ = BATCH_SIZE.set(1_000);
+}
+
+/// A pgwire server on its own thread and runtime (32 MiB stacks, as the
+/// binary has), serving one database opened from `dir`. Dropping it, or
+/// [`Server::stop`], ends the server and releases the database, so the same
+/// directory can be opened again (a restart).
+pub struct Server {
+    pub port: u16,
+    pub db: Arc<Database>,
+    pub dir: String,
+    /// Storage locations other than `dir` a test added, whose logs a stop
+    /// releases too, so a restart recovers them afresh.
+    pub extra_dirs: Vec<String>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Server {
+    pub fn start(dir: &str) -> Server {
+        init_globals();
+        // The server keeps the socket it chose the port with: a probe bound,
+        // dropped and bound again leaves a window in which a parallel test
+        // takes the port and one client reaches the other test's server.
+        let (db_tx, db_rx) = std::sync::mpsc::channel::<(Arc<Database>, u16)>();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let owned_dir = dir.to_string();
+        let handle = std::thread::Builder::new()
+            .name("partition-test-server".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .thread_stack_size(32 * 1024 * 1024)
+                    .enable_all()
+                    .build()
+                    .expect("server runtime");
+                rt.block_on(async move {
+                    let db = Arc::new(Database::new_with_backend(&owned_dir, false).await);
+                    let listener =
+                        tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind a free port");
+                    let port = listener.local_addr().expect("the bound port").port();
+                    db_tx.send((db.clone(), port)).expect("hand the database back");
+                    // A clean stop records what a clean shutdown records
+                    // (the SERIAL high-water marks), as the server's own
+                    // shutdown does after its sessions end.
+                    let closing = db.clone();
+                    let catalog = DatabaseCatalog::single(db);
+                    let tls = TlsConfig { mode: TlsMode::Disable, cert_path: None, key_path: None };
+                    let auth = AuthConfig {
+                        method: AuthMethod::Trust,
+                        bootstrap_user: "rasterized".to_string(),
+                        bootstrap_password: None,
+                    };
+                    tokio::select! {
+                        _ = start_pgwire_on_listener(catalog, listener, tls, auth, ConnectionLimits::default()) => {}
+                        _ = shutdown_rx => {}
+                    }
+                    closing.record_clean_shutdown().await;
+                });
+                rt.shutdown_timeout(Duration::from_secs(5));
+            })
+            .expect("spawn the server thread");
+        let (db, port) = db_rx.recv_timeout(Duration::from_secs(120)).expect("the database opened");
+        let server = Server {
+            port,
+            db,
+            dir: dir.to_string(),
+            extra_dirs: Vec::new(),
+            shutdown: Some(shutdown_tx),
+            handle: Some(handle),
+        };
+        // Wait until it accepts.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the server never accepted");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        server
+    }
+
+    pub fn connect(&self) -> Client {
+        Client::connect(self.port, &self.db.name)
+    }
+
+    /// Ends the server and releases the database: every client must have
+    /// been dropped first, or its session keeps the database alive.
+    pub fn stop(mut self) {
+        self.stop_inner();
+    }
+
+    fn stop_inner(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        rasterizeddb_core::core::wal::remove_for(&self.dir);
+        for extra in &self.extra_dirs {
+            rasterizeddb_core::core::wal::remove_for(extra);
+        }
+    }
+
+    /// Stops this server and opens the same directory again.
+    pub fn restart(self) -> Server {
+        let dir = self.dir.clone();
+        let extra = self.extra_dirs.clone();
+        // Dropping the server stops its runtime (and with it every session's
+        // handle) and then drops ours.
+        drop(self);
+        let mut server = Server::start(&dir);
+        server.extra_dirs = extra;
+        server
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stop_inner();
+    }
+}
+
+/// A server's error: SQLSTATE and message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireError {
+    pub code: String,
+    pub message: String,
+}
+
+impl WireError {
+    /// A refusal of something not built yet: 0A000 and "not supported".
+    pub fn is_unsupported(&self) -> bool {
+        self.code == "0A000" && self.message.to_ascii_lowercase().contains("not supported")
+    }
+}
+
+impl std::fmt::Display for WireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+/// What one statement (or one simple-query string) answered.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reply {
+    /// Column names of the last row description.
+    pub columns: Vec<String>,
+    /// Each of those columns' type OID, from the same description: what a
+    /// client decodes the values by (one source with the payload).
+    pub types: Vec<u32>,
+    pub rows: Vec<Vec<Option<String>>>,
+    /// Every CommandComplete tag, in order.
+    pub tags: Vec<String>,
+    /// CopyOut data lines.
+    pub copy_out: Vec<String>,
+}
+
+pub type Outcome = Result<Reply, WireError>;
+
+pub struct Client {
+    writer: TcpStream,
+    reader: BufReader<TcpStream>,
+    /// The transaction status of the last ReadyForQuery: I, T or E.
+    pub status: u8,
+}
+
+fn frame(buf: &mut Vec<u8>, tag: u8, body: &[u8]) {
+    buf.push(tag);
+    buf.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+    buf.extend_from_slice(body);
+}
+
+fn cstr(buf: &mut Vec<u8>, s: &str) {
+    buf.extend_from_slice(s.as_bytes());
+    buf.push(0);
+}
+
+fn error_fields(body: &[u8]) -> WireError {
+    let mut code = String::new();
+    let mut message = String::new();
+    let mut at = 0;
+    while at < body.len() && body[at] != 0 {
+        let kind = body[at];
+        at += 1;
+        let end = at + body[at..].iter().position(|b| *b == 0).unwrap_or(body.len() - at);
+        let value = String::from_utf8_lossy(&body[at..end]).into_owned();
+        at = end + 1;
+        match kind {
+            b'C' => code = value,
+            b'M' => message = value,
+            _ => {}
+        }
+    }
+    WireError { code, message }
+}
+
+impl Client {
+    pub fn connect(port: u16, database: &str) -> Client {
+        let socket = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        socket.set_nodelay(true).unwrap();
+        // A statement that hangs fails the test instead of wedging it.
+        socket.set_read_timeout(Some(Duration::from_secs(300))).unwrap();
+        let mut client = Client {
+            writer: socket.try_clone().unwrap(),
+            reader: BufReader::with_capacity(64 * 1024, socket),
+            status: b'I',
+        };
+        let mut params = Vec::new();
+        for (k, v) in [("user", "rasterized"), ("database", database)] {
+            cstr(&mut params, k);
+            cstr(&mut params, v);
+        }
+        params.push(0);
+        let mut startup = Vec::new();
+        startup.extend_from_slice(&((params.len() + 8) as i32).to_be_bytes());
+        startup.extend_from_slice(&196_608i32.to_be_bytes());
+        startup.extend_from_slice(&params);
+        client.writer.write_all(&startup).unwrap();
+        client.until_ready().expect("startup");
+        client
+    }
+
+    fn message(&mut self) -> (u8, Vec<u8>) {
+        let mut head = [0u8; 5];
+        self.reader.read_exact(&mut head).expect("read a message header (server gone or hung?)");
+        let len = i32::from_be_bytes(head[1..5].try_into().unwrap()) as usize - 4;
+        let mut body = vec![0u8; len];
+        self.reader.read_exact(&mut body).expect("read a message body");
+        (head[0], body)
+    }
+
+    /// Reads to ReadyForQuery. The first error is the outcome.
+    fn until_ready(&mut self) -> Outcome {
+        let mut reply = Reply::default();
+        let mut error: Option<WireError> = None;
+        loop {
+            let (tag, body) = self.message();
+            match tag {
+                b'T' => {
+                    reply.columns.clear();
+                    reply.types.clear();
+                    let n = i16::from_be_bytes([body[0], body[1]]) as usize;
+                    let mut at = 2;
+                    for _ in 0..n {
+                        let end = at + body[at..].iter().position(|b| *b == 0).unwrap();
+                        reply.columns.push(String::from_utf8_lossy(&body[at..end]).into_owned());
+                        // Table OID (4), attribute number (2), then the type OID.
+                        let oid = end + 1 + 6;
+                        reply.types.push(u32::from_be_bytes(body[oid..oid + 4].try_into().unwrap()));
+                        at = end + 1 + 18;
+                    }
+                }
+                b'D' => {
+                    let n = i16::from_be_bytes([body[0], body[1]]) as usize;
+                    let mut at = 2;
+                    let mut row = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let len = i32::from_be_bytes(body[at..at + 4].try_into().unwrap());
+                        at += 4;
+                        if len < 0 {
+                            row.push(None);
+                        } else {
+                            let len = len as usize;
+                            row.push(Some(String::from_utf8_lossy(&body[at..at + len]).into_owned()));
+                            at += len;
+                        }
+                    }
+                    reply.rows.push(row);
+                }
+                b'C' => {
+                    let end = body.iter().position(|b| *b == 0).unwrap_or(body.len());
+                    reply.tags.push(String::from_utf8_lossy(&body[..end]).into_owned());
+                }
+                b'E' => {
+                    if error.is_none() {
+                        error = Some(error_fields(&body));
+                    }
+                }
+                b'd' => reply.copy_out.push(String::from_utf8_lossy(&body).into_owned()),
+                b'G' => {
+                    // CopyInResponse with nothing to send: fail the copy so the
+                    // exchange ends; the caller wanted copy_in for data.
+                    let mut buf = Vec::new();
+                    let mut msg = Vec::new();
+                    cstr(&mut msg, "no data from this client");
+                    frame(&mut buf, b'f', &msg);
+                    self.writer.write_all(&buf).unwrap();
+                }
+                b'Z' => {
+                    self.status = body.first().copied().unwrap_or(b'I');
+                    return match error {
+                        Some(e) => Err(e),
+                        None => Ok(reply),
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A simple query.
+    pub fn simple(&mut self, sql: &str) -> Outcome {
+        let mut body = Vec::new();
+        cstr(&mut body, sql);
+        let mut buf = Vec::new();
+        frame(&mut buf, b'Q', &body);
+        self.writer.write_all(&buf).unwrap();
+        self.until_ready()
+    }
+
+    /// A simple query that must succeed.
+    #[track_caller]
+    pub fn ok(&mut self, sql: &str) -> Reply {
+        match self.simple(sql) {
+            Ok(r) => r,
+            Err(e) => panic!("`{sql}` failed: {e}"),
+        }
+    }
+
+    /// `COPY … FROM STDIN` with `data` as the stream.
+    pub fn copy_in(&mut self, sql: &str, data: &str) -> Outcome {
+        let mut body = Vec::new();
+        cstr(&mut body, sql);
+        let mut buf = Vec::new();
+        frame(&mut buf, b'Q', &body);
+        self.writer.write_all(&buf).unwrap();
+        let mut reply = Reply::default();
+        loop {
+            let (tag, body) = self.message();
+            match tag {
+                b'G' => {
+                    let mut buf = Vec::new();
+                    frame(&mut buf, b'd', data.as_bytes());
+                    frame(&mut buf, b'c', &[]);
+                    self.writer.write_all(&buf).unwrap();
+                    let rest = self.until_ready();
+                    return rest.map(|mut r| {
+                        r.tags.splice(0..0, reply.tags.drain(..));
+                        r
+                    });
+                }
+                b'E' => {
+                    let e = error_fields(&body);
+                    // Drain to ReadyForQuery.
+                    let _ = self.until_ready();
+                    return Err(e);
+                }
+                b'C' => {
+                    let end = body.iter().position(|b| *b == 0).unwrap_or(body.len());
+                    reply.tags.push(String::from_utf8_lossy(&body[..end]).into_owned());
+                }
+                b'Z' => {
+                    self.status = body.first().copied().unwrap_or(b'I');
+                    return Ok(reply);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Parse a named statement (parameter types left to the server).
+    pub fn prepare(&mut self, name: &str, sql: &str) -> Outcome {
+        let mut buf = Vec::new();
+        let mut parse = Vec::new();
+        cstr(&mut parse, name);
+        cstr(&mut parse, sql);
+        parse.extend_from_slice(&0i16.to_be_bytes());
+        frame(&mut buf, b'P', &parse);
+        let mut describe = vec![b'S'];
+        cstr(&mut describe, name);
+        frame(&mut buf, b'D', &describe);
+        frame(&mut buf, b'S', &[]);
+        self.writer.write_all(&buf).unwrap();
+        self.until_ready()
+    }
+
+    /// Bind `params` (text, `None` is NULL) to a named statement, describe and
+    /// execute the unnamed portal, sync.
+    pub fn execute_prepared(&mut self, name: &str, params: &[Option<String>]) -> Outcome {
+        let mut buf = Vec::new();
+        let mut bind = Vec::new();
+        cstr(&mut bind, "");
+        cstr(&mut bind, name);
+        bind.extend_from_slice(&0i16.to_be_bytes()); // all text
+        bind.extend_from_slice(&(params.len() as i16).to_be_bytes());
+        for p in params {
+            match p {
+                None => bind.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(v) => {
+                    bind.extend_from_slice(&(v.len() as i32).to_be_bytes());
+                    bind.extend_from_slice(v.as_bytes());
+                }
+            }
+        }
+        bind.extend_from_slice(&0i16.to_be_bytes()); // results all text
+        frame(&mut buf, b'B', &bind);
+        let mut describe = vec![b'P'];
+        cstr(&mut describe, "");
+        frame(&mut buf, b'D', &describe);
+        let mut execute = Vec::new();
+        cstr(&mut execute, "");
+        execute.extend_from_slice(&0i32.to_be_bytes());
+        frame(&mut buf, b'E', &execute);
+        frame(&mut buf, b'S', &[]);
+        self.writer.write_all(&buf).unwrap();
+        self.until_ready()
+    }
+
+    /// Parse a named statement with its parameter types given as OIDs.
+    pub fn prepare_typed(&mut self, name: &str, sql: &str, oids: &[u32]) -> Outcome {
+        let mut buf = Vec::new();
+        let mut parse = Vec::new();
+        cstr(&mut parse, name);
+        cstr(&mut parse, sql);
+        parse.extend_from_slice(&(oids.len() as i16).to_be_bytes());
+        for oid in oids {
+            parse.extend_from_slice(&oid.to_be_bytes());
+        }
+        frame(&mut buf, b'P', &parse);
+        frame(&mut buf, b'S', &[]);
+        self.writer.write_all(&buf).unwrap();
+        self.until_ready()
+    }
+
+    /// Bind `params` in the binary format (`None` is NULL) to a named
+    /// statement, execute the unnamed portal, sync.
+    pub fn execute_binary(&mut self, name: &str, params: &[Option<Vec<u8>>]) -> Outcome {
+        let mut buf = Vec::new();
+        let mut bind = Vec::new();
+        cstr(&mut bind, "");
+        cstr(&mut bind, name);
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes()); // every parameter binary
+        bind.extend_from_slice(&(params.len() as i16).to_be_bytes());
+        for p in params {
+            match p {
+                None => bind.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(v) => {
+                    bind.extend_from_slice(&(v.len() as i32).to_be_bytes());
+                    bind.extend_from_slice(v);
+                }
+            }
+        }
+        bind.extend_from_slice(&0i16.to_be_bytes()); // results all text
+        frame(&mut buf, b'B', &bind);
+        let mut execute = Vec::new();
+        cstr(&mut execute, "");
+        execute.extend_from_slice(&0i32.to_be_bytes());
+        frame(&mut buf, b'E', &execute);
+        frame(&mut buf, b'S', &[]);
+        self.writer.write_all(&buf).unwrap();
+        self.until_ready()
+    }
+
+    /// Close a named statement.
+    pub fn close_prepared(&mut self, name: &str) {
+        let mut buf = Vec::new();
+        let mut close = vec![b'S'];
+        cstr(&mut close, name);
+        frame(&mut buf, b'C', &close);
+        frame(&mut buf, b'S', &[]);
+        self.writer.write_all(&buf).unwrap();
+        let _ = self.until_ready();
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        let mut buf = Vec::new();
+        frame(&mut buf, b'X', &[]);
+        let _ = self.writer.write_all(&buf);
+        let _ = self.writer.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// Files in `dir` whose names start with `prefix`, sorted.
+pub fn files_starting(dir: &std::path::Path, prefix: &str) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(dir)
+        .expect("read the database directory")
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.starts_with(prefix))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Files a plain table called `name` would have in `dir`: `<name>.db` and
+/// `<name>_<part>.db`, with their `.tmp` companions. Not every file starting
+/// with `name`: `site_p` is a prefix of `site_parent`. (A table named
+/// `<name>_x` would match too; the tests make none.)
+pub fn files_of_table(dir: &std::path::Path, name: &str) -> Vec<String> {
+    files_starting(dir, name)
+        .into_iter()
+        .filter(|n| matches!(n.as_bytes().get(name.len()), Some(b'.') | Some(b'_')))
+        .collect()
+}
+
+/// Runs `body` to completion on a multi-threaded runtime of its own, on a
+/// thread with the engine's 32 MiB stack.
+pub fn block_on_big<T: Send + 'static>(body: impl std::future::Future<Output = T> + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(32 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("a runtime")
+                .block_on(body)
+        })
+        .expect("a thread")
+        .join()
+        .expect("the thread panicked")
+}
+
+/// Writes rows straight into a partitioned table's partitions, under the
+/// frozen transaction (visible to every snapshot), the way the catalog tests
+/// do, bypassing the SQL `INSERT` path (which routes since S9). `inserts`
+/// are whole `INSERT INTO <table> (…) VALUES (…)` statements, one row each.
+pub fn seed_partitioned(db: &Arc<Database>, table: &str, inserts: Vec<String>) {
+    use rasterizeddb_core::core::mvcc::transaction::FROZEN_TX;
+    use rasterizeddb_core::core::rql::lexer_s1::{InsertRowData, QueryPurpose};
+    let pt = db.partitioned_table(table).expect("a partitioned table");
+    let name = table.to_string();
+    block_on_big(async move {
+        for query in inserts {
+            let qp = QueryPurpose::InsertRow(InsertRowData {
+                table_name: name.clone(),
+                query: query.clone(),
+                on_conflict_do_nothing: false,
+                on_conflict_target: Default::default(),
+                on_conflict_update: None,
+            });
+            let row = rasterizeddb_core::core::rql::lexer_ir::insert_row_with_defaults(
+                &qp,
+                &pt.shell().schema.fields,
+                &[],
+                &[],
+                0,
+            )
+            .unwrap_or_else(|| panic!("cannot build a row from {query}"));
+            pt.insert_row_in_txn(row, FROZEN_TX).await.unwrap_or_else(|e| panic!("{query}: {e}"));
+        }
+    });
+}
+
+/// One stored row: each column's name and stored bytes, by name. NULL
+/// companions (`__null_<col>`) are columns like any other, so a NULL and a
+/// stored zero differ.
+pub type StoredRow = Vec<(String, Vec<u8>)>;
+
+/// Every row `table` stores, read through the engine's API rather than SQL,
+/// visible to a fresh snapshot, sorted: for a partitioned table every
+/// materialized partition's, for a plain table its own. What the twin
+/// compares below SQL, so a write that answered like the twin's but stored
+/// something else, or stored it twice, fails whatever `SELECT` answers.
+pub fn stored_rows(db: &Arc<Database>, table: &str) -> Vec<StoredRow> {
+    let mut rows: Vec<StoredRow> =
+        stored_rows_by_partition(db, table).into_iter().flat_map(|(_, rows)| rows).collect();
+    rows.sort();
+    rows
+}
+
+/// [`stored_rows`] per partition, by pid (a plain table is one entry, pid 0).
+pub fn stored_rows_by_partition(db: &Arc<Database>, table: &str) -> Vec<(u32, Vec<StoredRow>)> {
+    use rasterizeddb_core::core::partition::Route;
+    use rasterizeddb_core::core::row::row::schema_id_of;
+    use rasterizeddb_core::core::row::schema::SchemaField;
+    use rasterizeddb_core::core::rql::join::fetch_for;
+    let db = db.clone();
+    let table = table.to_string();
+    block_on_big(async move {
+        // Partitions this read opens (phase 3 P5b: a closed one opens on
+        // demand) are closed again once read, so the reader leaves the open
+        // set as it found it, and no instance keeps a task of this short
+        // runtime's.
+        let mut reopened: Vec<(rclite::Arc<rasterizeddb_core::core::partition::table::PartitionedTable>, Vec<u32>)> =
+            Vec::new();
+        let (schema, parts) = match db.partitioned_table(&table) {
+            Some(pt) => {
+                let was_open: Vec<u32> = pt.open_partitions_now().into_iter().map(|(pid, _)| pid).collect();
+                let epoch = pt.epoch().expect("the partitioned table opens");
+                let parts = pt.materialized(&epoch, &Route::All).await.expect("its partitions");
+                let opened = parts.iter().map(|(pid, _)| *pid).filter(|pid| !was_open.contains(pid)).collect();
+                reopened.push((pt.clone(), opened));
+                (pt.shell().schema.clone(), parts)
+            }
+            None => {
+                let t = db.table_for_tests(&table).unwrap_or_else(|| panic!("no table {table}"));
+                (t.schema.clone(), vec![(0, t)])
+            }
+        };
+        let fields: Vec<SchemaField> = schema.fields.iter().filter(|f| !f.is_deleted).cloned().collect();
+        let fetch = fetch_for(&fields, &schema.fields);
+        let empty = fetch_for(&[], &schema.fields);
+        let mut out = Vec::new();
+        for (pid, t) in parts {
+            let rows = t
+                .query_row("", &schema.fields.to_vec(), empty.clone(), fetch.clone(), None, None)
+                .await
+                .unwrap_or_else(|e| panic!("reading {table} partition {pid}: {e}"));
+            let mut stored: Vec<StoredRow> = rows
+                .iter()
+                .map(|row| {
+                    let mut cols: StoredRow = row
+                        .columns
+                        .iter()
+                        .map(|c| {
+                            let name = fields
+                                .iter()
+                                .find(|f| schema_id_of(f.write_order) == c.schema_id)
+                                .map(|f| f.name.clone())
+                                .unwrap_or_else(|| format!("#{}", c.schema_id));
+                            (name, c.data.into_slice().to_vec())
+                        })
+                        .collect();
+                    cols.sort();
+                    cols
+                })
+                .collect();
+            stored.sort();
+            out.push((pid, stored));
+        }
+        for (pt, opened) in reopened {
+            for pid in opened {
+                pt.close_partition(pid).await.expect("closing a partition the read opened");
+            }
+        }
+        out
+    })
+}
+
+/// Rows of a partitioned table stored in a partition whose `[lo, hi)` does
+/// not hold their point (I4), each described; empty when every row is home.
+/// The point is the key columns' stored bytes hashed with the table's key.
+pub fn misplaced_rows(db: &Arc<Database>, table: &str) -> Vec<String> {
+    use rasterizeddb_core::core::row::schema::SchemaField;
+    let pt = db.partitioned_table(table).expect("a partitioned table");
+    let spec = pt.spec().expect("the table opens").clone();
+    let key_names: Vec<String> = spec
+        .levels()
+        .iter()
+        .map(|l| {
+            let f: &SchemaField = pt
+                .shell()
+                .schema
+                .fields
+                .iter()
+                .find(|f| !f.is_deleted && f.write_order as u32 == l.write_order)
+                .expect("a key column");
+            f.name.clone()
+        })
+        .collect();
+    let ranges: std::collections::HashMap<u32, (u64, u128)> = {
+        let pt = pt.clone();
+        block_on_big(async move { pt.partitions().await.expect("its partitions") })
+            .into_iter()
+            .map(|p| (p.pid, (p.lo, p.hi)))
+            .collect()
+    };
+    let mut wrong = Vec::new();
+    for (pid, rows) in stored_rows_by_partition(db, table) {
+        let (lo, hi) = ranges[&pid];
+        for row in rows {
+            let key: Vec<&[u8]> = key_names
+                .iter()
+                .map(|k| row.iter().find(|(n, _)| n == k).map(|(_, b)| b.as_slice()).expect("a key value"))
+                .collect();
+            match spec.point_of(&key) {
+                Ok(point) if point >= lo && (point as u128) < hi => {}
+                other => wrong.push(format!("partition {pid} [{lo:#x}, {hi:#x}) holds {row:?} at {other:?}")),
+            }
+        }
+    }
+    wrong
+}

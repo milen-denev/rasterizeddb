@@ -33,7 +33,12 @@ async fn run(db: &Arc<Database>, q: &str) -> Vec<u8> {
 /// The response is rows of bytes, not text, so an assertion on the rendered
 /// string would pass on almost anything.
 fn numbers(response: &[u8]) -> Vec<i64> {
-    assert_eq!(response.first(), Some(&2u8), "not a row response: {:?}", response);
+    assert_eq!(
+        response.first(),
+        Some(&2u8),
+        "not a row response: {:?}",
+        response
+    );
     let rows = vec_into_rows(&response[1..]).expect("rows");
     rows.first()
         .map(|row| {
@@ -64,9 +69,21 @@ async fn a_filtered_aggregate_counts_only_its_own_rows() {
         "CREATE TABLE a (id INT NOT NULL, status TEXT NOT NULL, tokens INT NOT NULL)",
     )
     .await;
-    run(&db, "INSERT INTO a (id, status, tokens) VALUES (1, 'ok', 10)").await;
-    run(&db, "INSERT INTO a (id, status, tokens) VALUES (2, 'failed', 20)").await;
-    run(&db, "INSERT INTO a (id, status, tokens) VALUES (3, 'failed', 30)").await;
+    run(
+        &db,
+        "INSERT INTO a (id, status, tokens) VALUES (1, 'ok', 10)",
+    )
+    .await;
+    run(
+        &db,
+        "INSERT INTO a (id, status, tokens) VALUES (2, 'failed', 20)",
+    )
+    .await;
+    run(
+        &db,
+        "INSERT INTO a (id, status, tokens) VALUES (3, 'failed', 30)",
+    )
+    .await;
 
     // `status` is read by the filter alone — no aggregate names it.
     let out = run(

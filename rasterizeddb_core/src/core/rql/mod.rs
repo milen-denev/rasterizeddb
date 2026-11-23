@@ -1,5 +1,6 @@
 /// Step 1
 pub mod lexer_s1;
+pub(crate) mod no_from;
 
 // Create Table
 pub mod lexer_ct;
@@ -32,27 +33,86 @@ pub mod lexer_query;
 pub mod order_by;
 
 pub mod aggregate;
+/// `HAVING` parsing and evaluation, shared by the single-table and join planners.
+pub mod having;
+pub mod column_default;
+/// Conflict retries waiting on the transaction they met (slice B6).
+pub(crate) mod conflict_wait;
+pub mod cte;
+pub(crate) mod ctas;
+pub(crate) mod distinct_on;
+pub(crate) mod join_on;
+pub(crate) mod join_using;
+pub(crate) mod grouping_sets;
+pub(crate) mod lateral;
+pub(crate) mod correlated;
+pub(crate) mod outer_columns;
+pub(crate) mod table_column_lists;
+pub(crate) mod reg_casts;
+pub(crate) mod domains;
+pub mod user_types;
+pub mod truncate;
+pub mod pg_functions;
+pub mod table_functions;
+pub(crate) mod window_join;
+pub mod expr;
+/// PostgreSQL's `numeric` arithmetic with display scales.
+pub(crate) mod pg_numeric;
+pub(crate) mod pg_numeric_math;
+pub mod foreign_key;
 pub mod join;
+pub mod lock_set;
 pub mod json_map;
 pub mod path_index;
-pub mod column_default;
-pub mod cte;
-pub mod expr;
-pub mod foreign_key;
+pub mod prepared;
+pub mod replicated_values;
 
-/// Table-level and composite `UNIQUE` constraints.
-pub mod unique_key;
+pub mod catalog_model;
+pub mod catalog_views;
+pub mod check;
+pub mod collation;
+pub mod pg_regex;
+pub mod executor;
+pub mod generated;
 pub mod lexer_alter;
 pub mod nullable;
-pub mod catalog_views;
 pub mod row_lock;
-pub mod type_modifier;
-pub mod window;
+/// What a single-table `SELECT` reads: one table, or a partitioned table's
+/// partitions under one snapshot.
+pub(crate) mod row_source;
+pub mod sequence;
+pub(crate) mod shadow_lock;
+/// Combining the branches of a `UNION`.
+pub mod set_ops;
+pub mod statement_snapshot;
 pub mod subquery;
-pub mod executor;
+pub mod type_modifier;
+/// Table-level and composite `UNIQUE` constraints.
+pub mod unique_key;
+pub mod window;
+pub mod views;
+pub mod sequence_catalog;
+pub mod functions;
+pub mod triggers;
+pub mod merge;
+pub mod privileges;
 
+#[cfg(test)]
+mod rename_column_tests;
+
+#[cfg(test)]
+mod alter_declaration_tests;
+
+#[cfg(test)]
+mod fk_partition_tests;
+
+#[cfg(test)]
+mod rename_column_crash_tests;
+
+pub(crate) mod column_declarations;
+
+#[cfg(feature = "s3_backup")]
+pub mod backup_exec;
 /// `BACKUP`, `RESTORE` and `SHOW BACKUPS`, behind the `s3_backup` feature.
 #[cfg(feature = "s3_backup")]
 pub mod lexer_backup;
-#[cfg(feature = "s3_backup")]
-pub mod backup_exec;

@@ -5,13 +5,19 @@
 //! `dialect` and `conn` directly, which a binary-only crate cannot expose.
 
 pub mod app;
+pub mod bench;
 pub mod conn;
 pub mod dialect;
 pub mod export;
 pub mod files;
+pub mod import;
 pub mod model;
 pub mod profiles;
+pub mod sqledit;
 pub mod sqlfmt;
+pub mod sqlhl;
+pub mod sqllex;
+pub mod sqllint;
 pub mod theme;
 pub mod types;
 pub mod views;

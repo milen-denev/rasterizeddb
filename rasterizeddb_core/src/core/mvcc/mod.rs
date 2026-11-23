@@ -53,8 +53,26 @@
 //! is exactly what a non-versioned scan computes. See
 //! [`transaction::Snapshot::sees_everything`].
 
+pub mod owner;
+
+/// The key a row or table lock on `name` is held under: the name with ASCII
+/// letters folded to lowercase. Two tables never differ only by case (the
+/// collision guard refuses the second), so the fold names one table, and
+/// `UPDATE X` and `UPDATE x` (which resolve to the same table,
+/// `Database::resolve`) lock one entry. Keyed by the spelling, they locked
+/// two, and a second writer would not wait for the first: a lost update.
+/// Borrowed, without a copy, when the name has no uppercase letter.
+#[inline]
+pub(crate) fn fold_lock_name(name: &str) -> std::borrow::Cow<'_, str> {
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    }
+}
 pub mod row_locks;
 pub mod status;
+pub mod table_locks;
 pub mod transaction;
 pub mod visibility;
 
@@ -76,7 +94,13 @@ mod invariants {
     fn the_reserved_ids_keep_their_values() {
         assert_eq!(NO_TX, 0, "a zeroed xmax must mean 'not deleted'");
         assert_eq!(FROZEN_TX, 1);
-        assert_eq!(FIRST_TX, 2, "real ids must start above both reserved values");
-        assert!(FROZEN_TX < FIRST_TX, "frozen rows must predate every transaction");
+        assert_eq!(
+            FIRST_TX, 2,
+            "real ids must start above both reserved values"
+        );
+        assert!(
+            FROZEN_TX < FIRST_TX,
+            "frozen rows must predate every transaction"
+        );
     }
 }

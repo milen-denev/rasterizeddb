@@ -3,19 +3,30 @@ use rustls::client::Resumption;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, Error, SignatureScheme};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, ready};
+use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
-use tokio_rustls::{TlsConnector, client::TlsStream};
+use tokio_rustls::TlsConnector;
 
-use crate::ALPN_PROTOCOL;
-use crate::common::{read_message, read_message_timeout, write_message, write_message_timeout};
+use crate::mux::MuxClient;
 use crate::config::ConfigBuilderExt;
 use crate::error::RastcpError;
-use crate::session::{AuthChannel, ClientAuthenticator};
+use crate::frame::{FrameReader, FrameWriter, KIND_DATA, KIND_TIMED_OUT, Tag};
+use crate::interrupt::Deadline;
+use crate::net::{ClientStream, Endpoint, Version};
+use crate::session::{AuthChannel, ClientAuthenticator, ConnectionSetup};
 use crate::tls::{ClientIdentity, Trust};
 
 /// How long the credential exchange may take, when there is one.
 const DEFAULT_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How many requests a multiplexed client keeps in flight unless told
+/// otherwise. Half the server's default, so two such clients sharing a server
+/// connection limit still fit.
+const DEFAULT_MAX_IN_FLIGHT: usize = 128;
 
 // A certificate verifier that accepts any certificate
 #[derive(Debug)]
@@ -75,18 +86,41 @@ pub struct TcpClientBuilder {
     trust: Option<Trust>,
     identity: Option<ClientIdentity>,
     authenticator: Option<Arc<dyn ClientAuthenticator>>,
+    setup: Option<Arc<dyn ConnectionSetup>>,
     auth_timeout: std::time::Duration,
     allow_tls12: bool,
+    max_message_size: usize,
+    max_in_flight: usize,
+    reconnect_when_idle_closed: bool,
 }
 
 pub struct TcpClient {
+    dialer: Dialer,
+    connection: Option<Connection>,
+}
+
+/// Everything needed to open an authenticated connection to one server, and
+/// the limits that apply to it once open. What a builder turns into, and what
+/// a client keeps so it can open the connection again.
+pub(crate) struct Dialer {
     addr: String,
-    connector: TlsConnector,
-    server_name: ServerName<'static>,
-    connection: Option<TlsStream<TcpStream>>,
-    timeout: Option<std::time::Duration>,
+    endpoint: Endpoint,
+    /// What a TCP connection's TLS is opened with. `None` for a unix socket,
+    /// which carries none.
+    tls: Option<(TlsConnector, ServerName<'static>)>,
+    /// The protocol this client speaks: offered in the TLS handshake, or as
+    /// the preamble on a unix socket.
+    version: Version,
+    pub(crate) timeout: Option<std::time::Duration>,
     authenticator: Option<Arc<dyn ClientAuthenticator>>,
+    /// See [`TcpClientBuilder::setup`].
+    setup: Option<Arc<dyn ConnectionSetup>>,
     auth_timeout: std::time::Duration,
+    pub(crate) max_message_size: usize,
+    /// Only a multiplexed client has more than one request in flight.
+    pub(crate) max_in_flight: usize,
+    /// See [`TcpClientBuilder::reconnect_when_idle_closed`].
+    reconnect_when_idle_closed: bool,
 }
 
 impl TcpClientBuilder {
@@ -98,10 +132,50 @@ impl TcpClientBuilder {
             trust: None,
             identity: None,
             authenticator: None,
+            setup: None,
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
             // See `crate::server::TcpServerBuilder::allow_tls12`.
             allow_tls12: false,
+            max_message_size: crate::common::DEFAULT_MAX_MESSAGE_SIZE,
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            reconnect_when_idle_closed: false,
         }
+    }
+
+    /// Whether a client that finds its idle connection closed opens another
+    /// and sends on that, instead of sending into the closed one and failing.
+    /// Off by default.
+    ///
+    /// A server closes a connection that has been quiet for its request
+    /// timeout. With this on, a connection unused for 100 ms is looked at
+    /// before a request is put on it, and replaced if the server has let go
+    /// of it; the request is sent once, on the new connection, and the caller
+    /// never sees the old one fail.
+    ///
+    /// Turn it on only for a protocol in which every request stands alone. The
+    /// new connection is authenticated like any other this client opens, but
+    /// nothing else is done to it: a caller that sets its connection up with
+    /// requests of its own — a handshake, a session — would find itself
+    /// sending on one that had none of that, without having been told. Such a
+    /// caller needs the failure, which is what it gets with this off. Has no
+    /// effect on a multiplexed client, which always knows when its connection
+    /// closes because it is always reading.
+    pub fn reconnect_when_idle_closed(mut self, reconnect: bool) -> Self {
+        self.reconnect_when_idle_closed = reconnect;
+        self
+    }
+
+    /// How many requests a multiplexed client keeps in flight at once.
+    /// Default 128; further callers wait their turn.
+    ///
+    /// Keep it at or below the server's own limit
+    /// ([`crate::server::TcpServerBuilder::max_in_flight`], default 256):
+    /// above that the server stops reading until it catches up, and the
+    /// surplus waits in socket buffers instead of here. Has no effect on a
+    /// client built with [`TcpClientBuilder::build`].
+    pub fn max_in_flight(mut self, requests: usize) -> Self {
+        self.max_in_flight = requests.max(1);
+        self
     }
 
     /// The credentials this client presents once the tunnel is up.
@@ -112,6 +186,15 @@ impl TcpClientBuilder {
     /// session.
     pub fn authenticator(mut self, authenticator: Arc<dyn ClientAuthenticator>) -> Self {
         self.authenticator = Some(authenticator);
+        self
+    }
+
+    /// A request sent first on every connection this client opens, after the
+    /// credential exchange and before anything else: see [`ConnectionSetup`].
+    /// Part of opening a connection for the same reason the exchange is, so
+    /// a reconnect cannot resume on a connection that was never set up.
+    pub fn setup(mut self, setup: Arc<dyn ConnectionSetup>) -> Self {
+        self.setup = Some(setup);
         self
     }
 
@@ -152,6 +235,13 @@ impl TcpClientBuilder {
         self
     }
 
+    /// The largest response this client reads, in bytes. The default is
+    /// [`crate::common::DEFAULT_MAX_MESSAGE_SIZE`].
+    pub fn max_message_size(mut self, bytes: usize) -> Self {
+        self.max_message_size = bytes;
+        self
+    }
+
     pub fn no_timeout(mut self) -> Self {
         self.timeout = None;
         self
@@ -163,6 +253,55 @@ impl TcpClientBuilder {
     }
 
     pub async fn build(self) -> Result<TcpClient, RastcpError> {
+        Ok(TcpClient {
+            dialer: self.dialer(Version::Plain)?,
+            connection: None,
+        })
+    }
+
+    /// Builds a client many tasks can share, speaking the multiplexed
+    /// protocol. See [`MuxClient`].
+    ///
+    /// Must be called, and the client used, inside a Tokio runtime: the
+    /// connection is driven by a task of its own.
+    pub async fn build_multiplexed(self) -> Result<MuxClient, RastcpError> {
+        Ok(MuxClient::new(self.dialer(Version::Multiplexed)?))
+    }
+
+    /// The TLS configuration and limits this builder describes, offering
+    /// `alpn` as the protocol to speak.
+    fn dialer(self, version: Version) -> Result<Dialer, RastcpError> {
+        let endpoint = Endpoint::parse(&self.addr)?;
+
+        #[cfg(unix)]
+        if let Endpoint::Unix(_) = endpoint {
+            // A unix socket carries no TLS, so nothing can be verified or
+            // presented through it. A client that asked for either is refused
+            // rather than connected without what it asked for.
+            if self.trust.is_some() || self.verify_certificate || self.identity.is_some() {
+                return Err(RastcpError::CertificateLoading(
+                    "a unix socket carries no TLS: a server certificate cannot be checked over \
+                     one, nor a client certificate presented"
+                        .to_string(),
+                ));
+            }
+
+            return Ok(Dialer {
+                addr: self.addr,
+                endpoint,
+                tls: None,
+                version,
+                timeout: self.timeout,
+                authenticator: self.authenticator,
+                setup: self.setup,
+                auth_timeout: self.auth_timeout,
+                max_message_size: self.max_message_size,
+                max_in_flight: self.max_in_flight,
+                reconnect_when_idle_closed: self.reconnect_when_idle_closed,
+            });
+        }
+
+        let alpn = version.identifier();
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         // `trust` when given; otherwise the older boolean, which chose between
@@ -222,7 +361,7 @@ impl TcpClientBuilder {
         client_config.enable_early_data = false;
         client_config.resumption = Resumption::in_memory_sessions(128);
         client_config.enable_sni = true;
-        client_config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+        client_config.alpn_protocols = vec![alpn.to_vec()];
         // Writing session keys to disk is a debugging aid that hands anyone who
         // can read that file the ability to decrypt every recorded session, so
         // it is behind a feature rather than an environment variable alone.
@@ -242,15 +381,430 @@ impl TcpClientBuilder {
         .map_err(|_| RastcpError::CertificateLoading("Invalid server name".into()))?
         .to_owned();
 
-        Ok(TcpClient {
+        Ok(Dialer {
             addr: self.addr,
-            connector: TlsConnector::from(Arc::new(config)),
-            server_name,
-            connection: None,
+            endpoint,
+            tls: Some((TlsConnector::from(Arc::new(config)), server_name)),
+            version,
             timeout: self.timeout,
             authenticator: self.authenticator,
+            setup: self.setup,
             auth_timeout: self.auth_timeout,
+            max_message_size: self.max_message_size,
+            max_in_flight: self.max_in_flight,
+            reconnect_when_idle_closed: self.reconnect_when_idle_closed,
         })
+    }
+}
+
+/// An open, authenticated connection and everything that belongs to it.
+///
+/// One struct so that all of it is dropped together. Bytes read ahead, a
+/// request half written and a timer armed for the old socket are all wrong for
+/// the connection that replaces it.
+struct Connection {
+    stream: ClientStream,
+    reader: FrameReader,
+    writer: FrameWriter,
+    /// The one timer behind every timeout on this connection. Made with it,
+    /// because both belong to the runtime that opened it; `None` when the
+    /// client has no timeout.
+    deadline: Option<Deadline>,
+    /// When a request last finished on this connection.
+    last_used: std::time::Instant,
+}
+
+/// How long a connection sits unused before it is checked, ahead of the next
+/// request, for having been closed. A busy connection is never checked: the
+/// check costs a trip through the TLS stream, and a server does not close a
+/// connection it heard from a moment ago.
+const CHECK_WHEN_IDLE_FOR: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Runs `wait` under `deadline`, if there is one.
+async fn within<T, F>(deadline: &mut Option<Deadline>, wait: F) -> Result<T, RastcpError>
+where
+    F: Future<Output = Result<T, RastcpError>>,
+{
+    match deadline {
+        Some(deadline) => deadline.run(wait).await.unwrap_or(Err(RastcpError::ConnectionTimeout)),
+        None => wait.await,
+    }
+}
+
+impl Connection {
+    /// Whether the server is known to have let go of this connection.
+    ///
+    /// A server closes a connection that has been quiet for its request
+    /// timeout. The close arrives while nobody is reading, so without this the
+    /// client would learn of it only by sending its next request into the
+    /// closed connection and failing — a failure that says nothing about
+    /// whether the request ran. Looking first costs nothing that matters and
+    /// turns that into a reconnect before anything is sent.
+    ///
+    /// Anything that can be read here is a reason to stop using the
+    /// connection: the end of the stream, an error, or a frame nobody asked
+    /// for, after which the two ends no longer agree on whose turn it is.
+    async fn has_gone(&mut self, max_message_size: usize) -> bool {
+        self.last_used.elapsed() >= CHECK_WHEN_IDLE_FOR
+            && self
+                .reader
+                .frame_now(&mut self.stream, max_message_size)
+                .await
+                .is_some()
+    }
+
+    /// Sends one request and reads its response. Each half gets the whole
+    /// timeout, as it did when each had a timer of its own.
+    async fn exchange(
+        &mut self,
+        request: &[u8],
+        max_message_size: usize,
+    ) -> Result<Vec<u8>, RastcpError> {
+        let Self {
+            stream,
+            reader,
+            writer,
+            deadline,
+            last_used,
+        } = self;
+
+        within(deadline, async {
+            if writer.queue(request)? {
+                writer.flush(stream).await
+            } else {
+                writer.send_large(stream, request).await
+            }
+        })
+        .await?;
+        debug!("Sent {} bytes", request.len());
+
+        let response = within(deadline, reader.frame(stream, max_message_size)).await?;
+        *last_used = std::time::Instant::now();
+        Ok(response)
+    }
+
+    /// Sends every request and reads every response, both at once.
+    ///
+    /// Writing the whole batch before reading anything would deadlock on a
+    /// large one: the server stops reading when its replies have nowhere to
+    /// go, this side stops writing when the server stops reading, and neither
+    /// moves again. So responses are taken off the connection while requests
+    /// are still going onto it.
+    async fn exchange_batch<B: AsRef<[u8]>>(
+        &mut self,
+        requests: &[B],
+        max_message_size: usize,
+    ) -> Result<Vec<Vec<u8>>, RastcpError> {
+        let Self {
+            stream,
+            reader,
+            writer,
+            deadline,
+            last_used,
+        } = self;
+
+        let mut pump = Pump {
+            requests,
+            next: 0,
+            writer,
+            written: 0,
+            large: None,
+            flushed: false,
+            reader,
+            responses: Vec::with_capacity(requests.len()),
+            max_message_size,
+        };
+
+        // One wait per response rather than one for the batch: the timeout
+        // bounds how long the server may go quiet, as it does for requests
+        // sent one at a time, not how long a large batch may take in all.
+        while pump.responses.len() < requests.len() {
+            let before = pump.responses.len();
+            within(
+                deadline,
+                std::future::poll_fn(|cx| pump.poll_progress(stream, cx, before)),
+            )
+            .await?;
+        }
+
+        *last_used = std::time::Instant::now();
+        Ok(pump.responses)
+    }
+}
+
+/// The state of one batch in flight: what is still to be written and what has
+/// come back.
+struct Pump<'a, B> {
+    requests: &'a [B],
+    /// The first request not yet handed to the writer.
+    next: usize,
+    writer: &'a mut FrameWriter,
+    /// How much of what the writer holds has reached the stream.
+    written: usize,
+    /// A request too large to copy, and how much of it has been written.
+    large: Option<(&'a [u8], usize)>,
+    flushed: bool,
+    reader: &'a mut FrameReader,
+    responses: Vec<Vec<u8>>,
+    max_message_size: usize,
+}
+
+impl<B: AsRef<[u8]>> Pump<'_, B> {
+    /// Writes as much as the stream takes without waiting. Pending only when
+    /// the stream is; ready once every request has been written and flushed.
+    fn poll_send(
+        &mut self,
+        stream: &mut ClientStream,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), RastcpError>> {
+        loop {
+            let queued = self.writer.queued();
+            if self.written < queued.len() {
+                let n = ready!(Pin::new(&mut *stream).poll_write(cx, &queued[self.written..]))?;
+                if n == 0 {
+                    return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()));
+                }
+                self.written += n;
+                continue;
+            }
+            self.writer.clear();
+            self.written = 0;
+
+            if let Some((payload, at)) = self.large.as_mut() {
+                if *at < payload.len() {
+                    let n = ready!(Pin::new(&mut *stream).poll_write(cx, &payload[*at..]))?;
+                    if n == 0 {
+                        return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()));
+                    }
+                    *at += n;
+                    continue;
+                }
+                self.large = None;
+            }
+
+            if self.next < self.requests.len() {
+                // As many small requests as make one good-sized write, or the
+                // prefix of one large one.
+                while self.next < self.requests.len() && !self.writer.is_full() {
+                    let request = self.requests[self.next].as_ref();
+                    self.next += 1;
+
+                    if !self.writer.queue(request)? {
+                        self.writer.queue_prefix(request.len())?;
+                        self.large = Some((request, 0));
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            if !self.flushed {
+                ready!(Pin::new(&mut *stream).poll_flush(cx))?;
+                self.flushed = true;
+            }
+
+            return Poll::Ready(Ok(()));
+        }
+    }
+
+    /// Moves the batch along. Ready once more responses are in than `before`.
+    fn poll_progress(
+        &mut self,
+        stream: &mut ClientStream,
+        cx: &mut Context<'_>,
+        before: usize,
+    ) -> Poll<Result<(), RastcpError>> {
+        // Pending here is not the end of this poll: the stream not taking more
+        // is exactly when the responses have to be read.
+        let sent = match self.poll_send(stream, cx) {
+            Poll::Ready(Ok(())) => true,
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => false,
+        };
+
+        while self.responses.len() < self.requests.len() {
+            match self.reader.poll_frame(stream, cx, self.max_message_size) {
+                Poll::Ready(Ok(response)) => self.responses.push(response),
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => break,
+            }
+        }
+
+        if self.responses.len() == self.requests.len() && !sent {
+            // An answer to a request that has not been sent. Whatever the
+            // peer is, it is not following this protocol.
+            return Poll::Ready(Err(RastcpError::ProtocolError(
+                "the server answered more requests than it was sent".to_string(),
+            )));
+        }
+
+        if self.responses.len() > before {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Dialer {
+    /// Opens a connection: TCP, the TLS handshake, then the credential
+    /// exchange if this client was given credentials.
+    pub(crate) async fn open(&self) -> Result<ClientStream, RastcpError> {
+        let mut stream = match &self.endpoint {
+            Endpoint::Tcp(addr) => self.open_tcp(addr).await?,
+            #[cfg(unix)]
+            Endpoint::Unix(path) => self.open_unix(path).await?,
+        };
+
+        self.authenticate(&mut stream).await?;
+        self.set_up(&mut stream).await?;
+
+        Ok(stream)
+    }
+
+    /// Sends the setup request, if this client has one, and hands its answer
+    /// to it. Under the client's timeout, as the rest of opening is.
+    ///
+    /// The answer is read with a reader of its own, which is then dropped:
+    /// nothing it read ahead is lost, because the server sends nothing on a
+    /// connection that has not asked for anything more.
+    async fn set_up(&self, stream: &mut ClientStream) -> Result<(), RastcpError> {
+        let Some(setup) = self.setup.as_ref() else {
+            return Ok(());
+        };
+        let request = setup.request();
+        let max = self.max_message_size;
+        let exchange = async {
+            let mut writer = FrameWriter::new();
+            let answer = match self.version {
+                Version::Plain => {
+                    if writer.queue(&request)? {
+                        writer.flush(stream).await?;
+                    } else {
+                        writer.send_large(stream, &request).await?;
+                    }
+                    FrameReader::new().frame(stream, max).await?
+                }
+                Version::Multiplexed => {
+                    writer.queue_tagged_copy(Tag::data(0), &request)?;
+                    writer.flush(stream).await?;
+                    let mut reader = FrameReader::tagged();
+                    let (tag, body) =
+                        std::future::poll_fn(|cx| reader.poll_tagged(stream, cx, max)).await?;
+                    match tag.kind {
+                        KIND_DATA => body,
+                        KIND_TIMED_OUT => return Err(RastcpError::HandlerTimeout),
+                        _ => {
+                            return Err(RastcpError::ProtocolError(format!(
+                                "the server could not answer the connection's setup request: {}",
+                                String::from_utf8_lossy(&body)
+                            )));
+                        }
+                    }
+                }
+            };
+            setup.accept(&answer)
+        };
+        self.bounded(exchange, RastcpError::ConnectionTimeout).await
+    }
+
+    /// Runs `step` under this client's timeout, if it has one.
+    async fn bounded<T, F>(&self, step: F, timed_out: RastcpError) -> Result<T, RastcpError>
+    where
+        F: Future<Output = Result<T, RastcpError>>,
+    {
+        match self.timeout {
+            Some(timeout) => tokio::time::timeout(timeout, step).await.map_err(|_| timed_out)?,
+            None => step.await,
+        }
+    }
+
+    /// TCP, then the TLS handshake, which names the protocol.
+    async fn open_tcp(&self, addr: &str) -> Result<ClientStream, RastcpError> {
+        let Some((connector, server_name)) = self.tls.as_ref() else {
+            return Err(RastcpError::CertificateLoading(
+                "this client has no TLS configuration for a TCP address".to_string(),
+            ));
+        };
+
+        let stream = self
+            .bounded(
+                async { Ok(TcpStream::connect(addr).await?) },
+                RastcpError::ConnectionTimeout,
+            )
+            .await?;
+
+        // Disable Nagle's algorithm: small request/response RPCs over a
+        // long-lived connection otherwise hit Linux's ~40 ms
+        // delayed-ACK timer between turns.
+        let _ = stream.set_nodelay(true);
+
+        info!("Connected to {}", self.addr);
+
+        let tls_stream = self
+            .bounded(
+                async { Ok(connector.connect(server_name.clone(), stream).await?) },
+                RastcpError::TlsHandshakeTimeout,
+            )
+            .await?;
+        debug!("TLS connection established");
+
+        Ok(ClientStream::Tls(tls_stream))
+    }
+
+    /// The socket, then the preamble that names the protocol in place of the
+    /// TLS handshake.
+    #[cfg(unix)]
+    async fn open_unix(&self, path: &std::path::Path) -> Result<ClientStream, RastcpError> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut stream = self
+            .bounded(
+                async { Ok(tokio::net::UnixStream::connect(path).await?) },
+                RastcpError::ConnectionTimeout,
+            )
+            .await?;
+
+        info!("Connected to {}", self.addr);
+
+        self.bounded(
+            async { Ok(stream.write_all(self.version.identifier()).await?) },
+            RastcpError::ConnectionTimeout,
+        )
+        .await?;
+
+        Ok(ClientStream::Unix(stream))
+    }
+
+    /// Presents credentials, if this client was given any.
+    ///
+    /// Deliberately part of opening a connection rather than something a
+    /// caller does afterwards: a client that reconnects after a transport
+    /// error would otherwise resume sending requests on a fresh,
+    /// unauthenticated session.
+    async fn authenticate(
+        &self,
+        tls_stream: &mut ClientStream,
+    ) -> Result<(), RastcpError> {
+        let Some(authenticator) = self.authenticator.as_ref() else {
+            return Ok(());
+        };
+
+        let binding = tls_stream.channel_binding()?;
+        let peer = tls_stream.peer().ok_or_else(|| {
+            RastcpError::AuthenticationError(
+                "the connection closed before it could be authenticated".to_string(),
+            )
+        })?;
+
+        let mut channel = AuthChannel::new(tls_stream, self.auth_timeout, binding, peer);
+
+        match tokio::time::timeout(self.auth_timeout, authenticator.authenticate(&mut channel))
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(RastcpError::ConnectionTimeout),
+        }
     }
 }
 
@@ -261,68 +815,17 @@ impl TcpClient {
 
     pub async fn connect(&mut self) -> Result<(), RastcpError> {
         if self.connection.is_none() {
-            let stream = match self.timeout {
-                Some(timeout) => tokio::time::timeout(timeout, TcpStream::connect(&self.addr))
-                    .await
-                    .map_err(|_| RastcpError::ConnectionTimeout)??,
-                None => TcpStream::connect(&self.addr).await?,
-            };
+            let stream = self.dialer.open().await?;
 
-            // Disable Nagle's algorithm: small request/response RPCs over a
-            // long-lived connection otherwise hit Linux's ~40 ms
-            // delayed-ACK timer between turns.
-            let _ = stream.set_nodelay(true);
-
-            info!("Connected to {}", self.addr);
-
-            let mut tls_stream = match self.timeout {
-                Some(timeout) => {
-                    tokio::time::timeout(timeout, self.connector.connect(self.server_name.clone(), stream))
-                        .await
-                        .map_err(|_| RastcpError::TlsHandshakeTimeout)??
-                }
-                None => self
-                    .connector
-                    .connect(self.server_name.clone(), stream)
-                    .await?,
-            };
-            debug!("TLS connection established");
-
-            self.authenticate(&mut tls_stream).await?;
-
-            self.connection = Some(tls_stream);
+            self.connection = Some(Connection {
+                stream,
+                reader: FrameReader::new(),
+                writer: FrameWriter::new(),
+                deadline: self.dialer.timeout.map(Deadline::new),
+                last_used: std::time::Instant::now(),
+            });
         }
         Ok(())
-    }
-
-    /// Presents credentials, if this client was given any.
-    ///
-    /// Deliberately part of `connect` rather than something a caller does
-    /// afterwards: a client that reconnects after a transport error would
-    /// otherwise resume sending requests on a fresh, unauthenticated session.
-    async fn authenticate(
-        &self,
-        tls_stream: &mut TlsStream<TcpStream>,
-    ) -> Result<(), RastcpError> {
-        let Some(authenticator) = self.authenticator.as_ref() else {
-            return Ok(());
-        };
-
-        let binding = crate::session::channel_binding_from(tls_stream.get_ref().1)?;
-        let peer = tls_stream
-            .get_ref()
-            .0
-            .peer_addr()
-            .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
-
-        let mut channel = AuthChannel::new(tls_stream, self.auth_timeout, binding, peer);
-
-        match tokio::time::timeout(self.auth_timeout, authenticator.authenticate(&mut channel))
-            .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(RastcpError::ConnectionTimeout),
-        }
     }
 
     // Modified send method to use the existing connection
@@ -338,26 +841,12 @@ impl TcpClient {
     /// one buffer it keeps, instead of allocating and growing a fresh one per
     /// request up to whatever its largest batch needs.
     pub async fn send_borrowed(&mut self, data: &[u8]) -> Result<Vec<u8>, RastcpError> {
-        // Connect if not connected
-        if !self.is_connected() {
-            self.connect().await?;
-        }
+        let max_message_size = self.dialer.max_message_size;
+        self.ready(max_message_size).await?;
 
-        let io_result = {
-            let stream = self.connection.as_mut().ok_or(RastcpError::NotConnected)?;
+        let connection = self.connection.as_mut().ok_or(RastcpError::NotConnected)?;
 
-            if let Some(timeout) = self.timeout {
-                write_message_timeout(stream, data, timeout).await?;
-                debug!("Sent {} bytes", data.len());
-                read_message_timeout(stream, timeout).await
-            } else {
-                write_message(stream, data).await?;
-                debug!("Sent {} bytes", data.len());
-                read_message(stream).await
-            }
-        };
-
-        match io_result {
+        match connection.exchange(data, max_message_size).await {
             Ok(response) => {
                 debug!("Received {} bytes response", response.len());
                 Ok(response)
@@ -367,6 +856,104 @@ impl TcpClient {
                 Err(err)
             }
         }
+    }
+
+    /// Sends several requests at once and returns their responses, in order.
+    ///
+    /// The requests leave together and the server answers them together, so a
+    /// batch of small requests costs a handful of system calls on each side
+    /// instead of two per request. The server handles them one after another
+    /// in the order given, exactly as if each had been sent with
+    /// [`TcpClient::send`] after the response to the one before.
+    ///
+    /// All or nothing from the caller's side: on an error the connection is
+    /// dropped and no responses are returned, though the server may already
+    /// have carried out any number of the requests. Batch only what is safe to
+    /// send again, or what the caller can otherwise reconcile.
+    ///
+    /// The timeout bounds the wait for each next response, not the batch.
+    pub async fn send_batch<B: AsRef<[u8]>>(
+        &mut self,
+        requests: &[B],
+    ) -> Result<Vec<Vec<u8>>, RastcpError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let max_message_size = self.dialer.max_message_size;
+        self.ready(max_message_size).await?;
+
+        let connection = self.connection.as_mut().ok_or(RastcpError::NotConnected)?;
+
+        match connection.exchange_batch(requests, max_message_size).await {
+            Ok(responses) => {
+                debug!("Received {} responses", responses.len());
+                Ok(responses)
+            }
+            Err(err) => {
+                self.connection = None;
+                Err(err)
+            }
+        }
+    }
+
+    /// Makes sure there is a connection to send on: opens one if there is
+    /// none, and — for a client that asked — replaces one the server closed
+    /// while it sat idle.
+    async fn ready(&mut self, max_message_size: usize) -> Result<(), RastcpError> {
+        if !self.dialer.reconnect_when_idle_closed {
+            // The connection is used as it is. If the server has closed it
+            // the request fails, and a caller that set the connection up
+            // itself learns that it has to do so again.
+        } else if let Some(connection) = self.connection.as_mut() {
+            if connection.has_gone(max_message_size).await {
+                debug!("The idle connection to the server was closed; opening another");
+                self.connection = None;
+            }
+        }
+
+        if !self.is_connected() {
+            self.connect().await?;
+        }
+
+        Ok(())
+    }
+
+    /// Opens this client's connection if it has none, and returns a handle
+    /// for sending requests on it without waiting for each answer.
+    ///
+    /// A `rastcp/1` server handles one connection's requests strictly in the
+    /// order they arrive and answers them in that order, so a caller may have
+    /// several on the wire at once and still know which answer is whose: the
+    /// first one back answers the first one sent. What that buys is the round
+    /// trip. Waiting for every answer before sending the next request caps a
+    /// connection at one request per round trip, which on a link with a few
+    /// tens of milliseconds of latency is the whole limit, however fast the
+    /// server is.
+    ///
+    /// The requests are still handled one after another; only the waiting
+    /// overlaps. That is the difference from [`TcpClient::build_multiplexed`]'s
+    /// connections, whose requests the server runs side by side, and from
+    /// [`TcpClient::send_batch`], which sends everything at once and returns
+    /// nothing until the last answer is in.
+    ///
+    /// The connection is dropped if the handle is dropped with requests still
+    /// unanswered — their answers would otherwise be read as the answers to
+    /// whatever is sent next — and after any error, as [`TcpClient::send`]
+    /// drops it.
+    pub async fn pipeline(&mut self) -> Result<Pipeline<'_>, RastcpError> {
+        let max_message_size = self.dialer.max_message_size;
+        self.ready(max_message_size).await?;
+
+        Ok(Pipeline {
+            client: self,
+            out: Vec::new(),
+            written: 0,
+            unflushed: false,
+            answers: std::collections::VecDeque::new(),
+            awaiting: 0,
+            max_message_size,
+        })
     }
 
     // Add a close method to explicitly close the connection
@@ -384,5 +971,229 @@ impl TcpClient {
     pub async fn reconnect(&mut self) -> Result<(), RastcpError> {
         self.close().await?;
         self.connect().await
+    }
+}
+
+/// Requests on the wire before their answers are in. See
+/// [`TcpClient::pipeline`].
+pub struct Pipeline<'a> {
+    client: &'a mut TcpClient,
+    /// Framed requests not yet written, and how much of them has been.
+    out: Vec<u8>,
+    written: usize,
+    unflushed: bool,
+    /// Answers that have arrived and not yet been handed out, oldest first.
+    answers: std::collections::VecDeque<Vec<u8>>,
+    /// Requests sent whose answers have not been handed out, counting those
+    /// in `answers`.
+    awaiting: usize,
+    max_message_size: usize,
+}
+
+/// What a wait on a [`Pipeline`] waits for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Until {
+    /// Everything queued has been written and flushed.
+    Written,
+    /// An answer has arrived.
+    Answer,
+}
+
+impl Pipeline<'_> {
+    /// How many requests have been sent and not yet answered through
+    /// [`Pipeline::recv`].
+    pub fn in_flight(&self) -> usize {
+        self.awaiting
+    }
+
+    /// Sends `request`, without waiting for its answer.
+    ///
+    /// Returns once it has been handed to the connection. Answers that arrive
+    /// meanwhile are read and kept, so a peer that answers while this side is
+    /// still writing is never left unable to send them — the deadlock a
+    /// write-everything-then-read client walks into once both directions'
+    /// buffers fill.
+    pub async fn send(&mut self, request: &[u8]) -> Result<(), RastcpError> {
+        let len = u32::try_from(request.len()).map_err(|_| RastcpError::MessageTooLarge {
+            len: request.len(),
+            max: u32::MAX as usize,
+        })?;
+        self.out.reserve(4 + request.len());
+        self.out.extend_from_slice(&len.to_le_bytes());
+        self.out.extend_from_slice(request);
+        self.awaiting += 1;
+
+        self.drive(Until::Written).await
+    }
+
+    /// The answer to the oldest request still unanswered.
+    pub async fn recv(&mut self) -> Result<Vec<u8>, RastcpError> {
+        if self.awaiting == 0 {
+            return Err(RastcpError::ProtocolError(
+                "no request is waiting for an answer".to_string(),
+            ));
+        }
+
+        if self.answers.is_empty() {
+            self.drive(Until::Answer).await?;
+        }
+
+        let answer = self.answers.pop_front().ok_or(RastcpError::NotConnected)?;
+        self.awaiting -= 1;
+        Ok(answer)
+    }
+
+    /// Writes and reads until `until` holds, under the connection's timeout.
+    /// Any error drops the connection.
+    async fn drive(&mut self, until: Until) -> Result<(), RastcpError> {
+        let max_message_size = self.max_message_size;
+        let Some(connection) = self.client.connection.as_mut() else {
+            return Err(RastcpError::NotConnected);
+        };
+        let Connection {
+            stream,
+            reader,
+            deadline,
+            last_used,
+            ..
+        } = connection;
+
+        let out = &mut self.out;
+        let written = &mut self.written;
+        let unflushed = &mut self.unflushed;
+        let answers = &mut self.answers;
+        let awaiting = self.awaiting;
+
+        let result = within(
+            deadline,
+            std::future::poll_fn(|cx| {
+                poll_pipeline(
+                    stream,
+                    reader,
+                    cx,
+                    PipelineState {
+                        out: &mut *out,
+                        written: &mut *written,
+                        unflushed: &mut *unflushed,
+                        answers: &mut *answers,
+                        awaiting,
+                        max_message_size,
+                    },
+                    until,
+                )
+            }),
+        )
+        .await;
+
+        match result {
+            Ok(()) => {
+                *last_used = std::time::Instant::now();
+                Ok(())
+            }
+            Err(err) => {
+                self.client.connection = None;
+                self.out.clear();
+                self.written = 0;
+                self.answers.clear();
+                self.awaiting = 0;
+                Err(err)
+            }
+        }
+    }
+}
+
+impl Drop for Pipeline<'_> {
+    fn drop(&mut self) {
+        // Answers still due would be read as the answers to whatever this
+        // client sends next. A connection in that state is not used again.
+        if self.awaiting > 0 || self.written < self.out.len() {
+            self.client.connection = None;
+        }
+    }
+}
+
+/// The parts of a [`Pipeline`] one poll moves.
+struct PipelineState<'s> {
+    out: &'s mut Vec<u8>,
+    written: &'s mut usize,
+    unflushed: &'s mut bool,
+    answers: &'s mut std::collections::VecDeque<Vec<u8>>,
+    awaiting: usize,
+    max_message_size: usize,
+}
+
+/// Writes what is queued and reads what has arrived, both as far as the
+/// connection allows without waiting, until `until` holds.
+fn poll_pipeline(
+    stream: &mut ClientStream,
+    reader: &mut FrameReader,
+    cx: &mut Context<'_>,
+    state: PipelineState<'_>,
+    until: Until,
+) -> Poll<Result<(), RastcpError>> {
+    let PipelineState {
+        out,
+        written,
+        unflushed,
+        answers,
+        awaiting,
+        max_message_size,
+    } = state;
+
+    loop {
+        let mut progressed = false;
+
+        while *written < out.len() {
+            match Pin::new(&mut *stream).poll_write(cx, &out[*written..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(
+                        std::io::Error::from(std::io::ErrorKind::WriteZero).into()
+                    ));
+                }
+                Poll::Ready(Ok(n)) => {
+                    *written += n;
+                    *unflushed = true;
+                    progressed = true;
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err.into())),
+                Poll::Pending => break,
+            }
+        }
+
+        if *written == out.len() {
+            out.clear();
+            *written = 0;
+            if *unflushed {
+                match Pin::new(&mut *stream).poll_flush(cx) {
+                    Poll::Ready(Ok(())) => *unflushed = false,
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err.into())),
+                    Poll::Pending => {}
+                }
+            }
+        }
+
+        // Answers are taken whenever they are there, whatever this wait is
+        // for: a server that cannot send them stops reading.
+        while answers.len() < awaiting {
+            match reader.poll_frame(stream, cx, max_message_size) {
+                Poll::Ready(Ok(answer)) => {
+                    answers.push_back(answer);
+                    progressed = true;
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => break,
+            }
+        }
+
+        let done = match until {
+            Until::Written => out.is_empty() && !*unflushed,
+            Until::Answer => !answers.is_empty(),
+        };
+        if done {
+            return Poll::Ready(Ok(()));
+        }
+        if !progressed {
+            return Poll::Pending;
+        }
     }
 }

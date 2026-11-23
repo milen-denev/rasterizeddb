@@ -200,6 +200,39 @@ transaction ends would need a lock manager this engine does not have. An `xmax`
 belonging to an *aborted* transaction is not a conflict — that retirement never
 happened — and is overwritten rather than treated as already-retired.
 
+### Which writers take turns
+
+Two locks per table decide which writes may run side by side.
+
+- **The write lock** keeps a `DELETE` or `UPDATE` from acting on a row
+  another one is relocating: a relocated row's new version is appended past
+  the end a concurrent scan has already passed, so that scan would find only
+  the tombstone and silently match nothing. `DELETE`, a general `UPDATE` and
+  the aborted-write sweep take it exclusively.
+- **The key locks** make a uniqueness check atomic with the write it guards.
+  They are 64 stripes, and a key hashes to one of them, in the canonical form
+  a hash index uses, so two values the check calls equal always share a
+  stripe. An `INSERT` takes the stripes of the keys it writes, so inserts of
+  different keys no longer take turns. A general `UPDATE` takes every stripe
+  for its rewrite, since it learns its rows' keys only as it goes.
+
+A **point update**, an `UPDATE` whose `WHERE` fixes every column of one
+`UNIQUE` or `PRIMARY KEY` constraint and which assigns no unique column,
+takes the write lock *shared* and that key's stripe *before* its scan. Every
+other writer of a row that key can match holds the same stripe or the write
+lock exclusively, so the scan's answer stays true until the rewrite. Before
+the rewrite it also takes the stripes of the row's other unique keys. Without
+them, `UPDATE … WHERE id = 1` and `UPDATE … WHERE email = 'a'` on the same row
+would hold different stripes, both relocate the same version, and fork the
+row. Stripes are always taken in ascending order. The one taken late is only
+*tried* when it sits below one already held, and on failure the statement
+starts again as a general update, having written nothing.
+
+So point updates of different rows, the conflict half of every
+`INSERT … ON CONFLICT DO UPDATE`, run in parallel. Pinned by
+`compat/tests/point_update_concurrency.rs`, mutation-tested against the
+other-key stripes.
+
 ## 5. Durability of outcomes
 
 Version stamps are only meaningful next to the outcome of the transaction that
@@ -383,7 +416,23 @@ depends on true serializability should not rely on this level.
 
 `SET TRANSACTION ISOLATION LEVEL` and `SET SESSION CHARACTERISTICS AS
 TRANSACTION ...` both take effect; they used to fall through to the blanket
-`SET` no-op, so asking for a stricter level silently got the default.
+`SET` no-op, so asking for a stricter level silently got the default. So do
+the run-time parameters: `default_transaction_isolation` and
+`default_transaction_read_only` (`SET`, `SET LOCAL` inside a block, `RESET`,
+`DEFAULT`; `SHOW` reads them back) set what a `BEGIN` naming no mode
+inherits, and `transaction_isolation` / `transaction_read_only` inside a block
+act as `SET TRANSACTION`. A value they do not take is refused with 22023.
+`SERIALIZABLE` runs as `REPEATABLE READ` and `READ UNCOMMITTED` as
+`READ COMMITTED`, and `SHOW` reports the level that runs. As in PostgreSQL,
+`SET TRANSACTION` outside a block warns (25P01) and changes nothing; it used
+to set the session default. Once a statement has run in a block its level is
+fixed: changing it is refused with 25001 and fails the block, as in
+PostgreSQL (it used to pin a snapshot mid-block). `RESET ALL` returns every
+setting to its session default, and `DISCARD ALL` (refused inside a block)
+also deallocates prepared statements and closes portals, which is how a pool
+clears a connection between borrowers. Not yet as in PostgreSQL: a `SET`
+inside a block that then rolls back is not undone, for these as for every
+other setting.
 
 ## 10. Savepoints
 

@@ -192,8 +192,10 @@ reported, not imported.
 | `float4` / `float8` | `REAL` / `DOUBLE PRECISION` | `NaN` and the infinities survive |
 | `numeric` | `NUMERIC` | see below |
 | `money` | `NUMERIC` | selected as `::numeric`, since the text form depends on `lc_monetary` |
-| `text`, `varchar`, `bpchar`, `name`, `citext`, `xml` | `TEXT` | |
-| `"char"` | `TEXT` | not this engine's `CHAR`, which is one Unicode scalar in four bytes |
+| `bpchar` / `character(n)` | `CHARACTER(n)` | its length held; `COPY`'s padded `'ab   '` stored as `'ab'`, compared blank-padded and shown padded. A bare `bpchar` (no length) becomes `BPCHAR`, which compares the same but does not keep trailing spaces |
+| `varchar` / `character varying(n)` | `VARCHAR(n)`, or `VARCHAR` | its length held |
+| `text`, `name`, `citext`, `xml` | `TEXT` | |
+| `"char"` | `TEXT` | PostgreSQL's one-byte type, not `character(1)` |
 | `uuid` | `UUID` | |
 | `inet`, `cidr` | `INET` | same address and netmask |
 | `bytea` | `BYTEA` | |
@@ -202,6 +204,16 @@ reported, not imported.
 | any array | `TEXT[]` | see below |
 | `json`, `jsonb` | `TEXT`, or `JSONB` under `JSON AS NATIVE` | |
 | enums, composites, ranges, `interval`, `time`, `macaddr`, `bit`, `tsvector`, geometry, anything unrecognised | `TEXT` | holding PostgreSQL's own rendering, which is exact and reversible |
+
+A column of a domain takes the domain's type modifier (`typtypmod`): a
+domain over `char(5)` or `numeric(12,2)` keeps its length or scale, which the
+column's own `atttypmod` (-1) does not carry.
+
+A `numeric(p, s)` with a negative scale (`numeric(5, -2)`, PostgreSQL 15
+and later) becomes an unconstrained `NUMERIC`: every imported value is a
+whole number and is held exactly, but a value written afterwards is not
+rounded to the scale (PostgreSQL stores 12345 as 12300, this column keeps
+12345), and values show at the engine's nine places. The report says so.
 
 Nothing is dropped and nothing is guessed. A type with no counterpart becomes
 `TEXT` carrying PostgreSQL's rendering rather than being skipped, and every such

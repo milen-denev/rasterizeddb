@@ -18,7 +18,11 @@ async fn open(dir: &std::path::Path) -> Arc<Database> {
 #[track_caller]
 fn expect_ok(response: &[u8], sql: &str) {
     if response.first() == Some(&3) {
-        panic!("`{}` failed: {}", sql, String::from_utf8_lossy(&response[1..]));
+        panic!(
+            "`{}` failed: {}",
+            sql,
+            String::from_utf8_lossy(&response[1..])
+        );
     }
 }
 
@@ -52,7 +56,9 @@ fn elements(row: &Row, column: usize) -> Vec<Option<String>> {
             continue;
         }
         let length = length as usize;
-        out.push(Some(String::from_utf8_lossy(&raw[at..at + length]).to_string()));
+        out.push(Some(
+            String::from_utf8_lossy(&raw[at..at + length]).to_string(),
+        ));
         at += length;
     }
     out

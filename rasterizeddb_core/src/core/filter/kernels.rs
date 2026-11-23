@@ -40,7 +40,11 @@ pub fn probe_zone_scalar(planes: &[u64], f: u8, g: u32, out: &mut [u64; ZONE_WOR
     // A real check, not a `debug_assert`: release builds turn assertions off
     // and the reads below are raw-pointer, so a short slice was an
     // out-of-bounds read there where the scalar oracle panics.
-    assert_eq!(planes.len(), f as usize * ZONE_WORDS, "probe planes must be f * ZONE_WORDS words");
+    assert_eq!(
+        planes.len(),
+        f as usize * ZONE_WORDS,
+        "probe planes must be f * ZONE_WORDS words"
+    );
     out.fill(u64::MAX);
     for j in 0..f as usize {
         // 0 when bit j of g is set (keep plane as-is), !0 when clear (invert it).
@@ -59,7 +63,11 @@ unsafe fn probe_zone_avx2(planes: &[u64], f: u8, g: u32, out: &mut [u64; ZONE_WO
     // A real check, not a `debug_assert`: release builds turn assertions off
     // and the reads below are raw-pointer, so a short slice was an
     // out-of-bounds read there where the scalar oracle panics.
-    assert_eq!(planes.len(), f as usize * ZONE_WORDS, "probe planes must be f * ZONE_WORDS words");
+    assert_eq!(
+        planes.len(),
+        f as usize * ZONE_WORDS,
+        "probe planes must be f * ZONE_WORDS words"
+    );
     unsafe {
         let p = planes.as_ptr();
         let mut lo = _mm256_set1_epi64x(-1);
@@ -86,7 +94,11 @@ unsafe fn probe_zone_avx512(planes: &[u64], f: u8, g: u32, out: &mut [u64; ZONE_
     // A real check, not a `debug_assert`: release builds turn assertions off
     // and the reads below are raw-pointer, so a short slice was an
     // out-of-bounds read there where the scalar oracle panics.
-    assert_eq!(planes.len(), f as usize * ZONE_WORDS, "probe planes must be f * ZONE_WORDS words");
+    assert_eq!(
+        planes.len(),
+        f as usize * ZONE_WORDS,
+        "probe planes must be f * ZONE_WORDS words"
+    );
     unsafe {
         let p = planes.as_ptr();
         let mut acc = _mm512_set1_epi64(-1);
@@ -121,37 +133,48 @@ fn probe_avx512_shim(planes: &[u64], f: u8, g: u32, out: &mut [u64; ZONE_WORDS])
 
 static PROBE: OnceLock<ProbeFn> = OnceLock::new();
 
-/// Resolve the best probe kernel for this CPU, once.
+/// Resolve the probe kernel for the process's SIMD level, once.
+///
+/// The level is [`crate::simds::cpu::level`], which `--simd` fixes at startup,
+/// so forcing `avx2` on an AVX-512 machine forces it here too. That level
+/// already accounts for what the CPU and the OS support.
 #[inline]
 pub fn probe_fn() -> ProbeFn {
-    *PROBE.get_or_init(|| {
+    *PROBE.get_or_init(|| match crate::simds::cpu::level() {
         #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("avx512f") {
-                return probe_avx512_shim as ProbeFn;
-            }
-            // AVX2 is guaranteed by the crate's `target-cpu=x86-64-v3` baseline,
-            // but detect anyway so the binary stays correct if that changes.
-            if is_x86_feature_detected!("avx2") {
-                return probe_avx2_shim as ProbeFn;
-            }
-        }
-        probe_zone_scalar as ProbeFn
+        crate::simds::cpu::SimdLevel::Avx512 => probe_avx512_shim as ProbeFn,
+        #[cfg(target_arch = "x86_64")]
+        crate::simds::cpu::SimdLevel::Avx2 => probe_avx2_shim as ProbeFn,
+        _ => probe_zone_scalar as ProbeFn,
     })
+}
+
+/// Every kernel this CPU can run, by name, so tests can hold each one to the
+/// same answers rather than only the one [`probe_fn`] picks.
+#[cfg(test)]
+pub(super) fn runnable_kernels() -> Vec<(&'static str, ProbeFn)> {
+    let mut kernels = vec![("scalar", probe_zone_scalar as ProbeFn)];
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            kernels.push(("avx2", probe_avx2_shim as ProbeFn));
+        }
+        if is_x86_feature_detected!("avx512f") {
+            kernels.push(("avx512f", probe_avx512_shim as ProbeFn));
+        }
+    }
+    kernels
 }
 
 /// Name of the active kernel. For benchmarks and diagnostics.
 pub fn active_kernel() -> &'static str {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f") {
-            return "avx512f";
-        }
-        if is_x86_feature_detected!("avx2") {
-            return "avx2";
-        }
+    match crate::simds::cpu::level() {
+        #[cfg(target_arch = "x86_64")]
+        crate::simds::cpu::SimdLevel::Avx512 => "avx512f",
+        #[cfg(target_arch = "x86_64")]
+        crate::simds::cpu::SimdLevel::Avx2 => "avx2",
+        _ => "scalar",
     }
-    "scalar"
 }
 
 /// Write the `f`-bit fingerprint `g` into slot `local` of a zone's planes.
@@ -165,7 +188,11 @@ pub fn write_slot(planes: &mut [u64], f: u8, local: usize, g: u32) {
     // A real check, not a `debug_assert`: release builds turn assertions off
     // and the reads below are raw-pointer, so a short slice was an
     // out-of-bounds read there where the scalar oracle panics.
-    assert_eq!(planes.len(), f as usize * ZONE_WORDS, "probe planes must be f * ZONE_WORDS words");
+    assert_eq!(
+        planes.len(),
+        f as usize * ZONE_WORDS,
+        "probe planes must be f * ZONE_WORDS words"
+    );
     let (w, b) = (local >> 6, local & 63);
     let m = 1u64 << b;
     for j in 0..f as usize {

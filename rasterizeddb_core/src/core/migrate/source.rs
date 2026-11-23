@@ -55,6 +55,9 @@ pub struct ForeignKey {
     /// `a` no action, `r` restrict, `c` cascade, `n` set null, `d` set default.
     pub on_delete: char,
     pub on_update: char,
+    /// `pg_constraint.convalidated`: false for a key added `NOT VALID` and
+    /// never validated, whose rows PostgreSQL itself never checked.
+    pub validated: bool,
 }
 
 /// What one schema of a PostgreSQL database holds.
@@ -165,10 +168,7 @@ pub async fn read_schema(
     }
 
     if tables.is_empty() {
-        return Err(format!(
-            "schema {:?} holds no tables to import",
-            schema
-        ));
+        return Err(format!("schema {:?} holds no tables to import", schema));
     }
 
     read_columns(connection, schema, &mut tables).await?;
@@ -234,6 +234,12 @@ async fn read_columns(
     schema: &str,
     tables: &mut [SourceTable],
 ) -> Result<(), String> {
+    // A column of a domain carries no `atttypmod` of its own (-1): the
+    // domain's `typtypmod` holds the length or scale, `varchar(10)` or
+    // `numeric(12,2)`, so the nearest domain in the chain that has one gives
+    // it. Read from `atttypmod` alone, a domain over `char(5)` lost its length
+    // and one over `numeric(12,2)` its scale.
+    //
     // The recursive term walks a domain down to whatever it is ultimately built
     // on, however many domains deep that is. Without it a column of a domain
     // over `numeric` would be reported as the domain's own name and fall
@@ -242,11 +248,11 @@ async fn read_columns(
     let sql = format!(
         "WITH RECURSIVE resolved AS ( \
              SELECT t.oid AS start_oid, t.oid, t.typname, t.typtype, t.typcategory, \
-                    t.typelem, t.typbasetype, 0 AS depth \
+                    t.typelem, t.typbasetype, t.typtypmod, 0 AS depth \
              FROM pg_type t \
              UNION ALL \
              SELECT r.start_oid, b.oid, b.typname, b.typtype, b.typcategory, \
-                    b.typelem, b.typbasetype, r.depth + 1 \
+                    b.typelem, b.typbasetype, b.typtypmod, r.depth + 1 \
              FROM resolved r \
              JOIN pg_type b ON b.oid = r.typbasetype \
              WHERE r.typtype = 'd' AND r.depth < 16 \
@@ -257,7 +263,11 @@ async fn read_columns(
                 a.attname AS name, \
                 a.attnum::text AS attnum, \
                 a.attnotnull::text AS notnull, \
-                a.atttypmod::text AS typmod, \
+                COALESCE(NULLIF(a.atttypmod, -1), \
+                         (SELECT r.typtypmod FROM resolved r \
+                          WHERE r.start_oid = a.atttypid AND r.typtypmod <> -1 \
+                          ORDER BY r.depth LIMIT 1), \
+                         -1)::text AS typmod, \
                 base.typname AS typname, \
                 base.typtype::text AS typtype, \
                 base.typcategory::text AS typcategory, \
@@ -320,12 +330,20 @@ async fn read_columns(
 
         table.columns.push(SourceColumn {
             name,
-            attnum: result.get(row, "attnum").unwrap_or("0").parse().unwrap_or(0),
+            attnum: result
+                .get(row, "attnum")
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0),
             type_name: result.get(row, "typname").unwrap_or("unknown").to_string(),
             type_kind: first_char(result.get(row, "typtype"), 'b'),
             type_category: first_char(result.get(row, "typcategory"), 'X'),
             element_type_name: result.get(row, "elemname").map(|e| e.to_string()),
-            type_modifier: result.get(row, "typmod").unwrap_or("-1").parse().unwrap_or(-1),
+            type_modifier: result
+                .get(row, "typmod")
+                .unwrap_or("-1")
+                .parse()
+                .unwrap_or(-1),
             not_null: is_true(result.get(row, "notnull")),
             default,
             formatted_type: formatted,
@@ -351,7 +369,8 @@ async fn read_constraints(
                 fr.relname AS reftable, \
                 fn.nspname AS refschema, \
                 con.confupdtype::text AS onupdate, \
-                con.confdeltype::text AS ondelete \
+                con.confdeltype::text AS ondelete, \
+                con.convalidated::text AS validated \
          FROM pg_constraint con \
          JOIN pg_class rel ON rel.oid = con.conrelid \
          JOIN pg_namespace n ON n.oid = rel.relnamespace \
@@ -426,6 +445,9 @@ async fn read_constraints(
                     referenced_columns,
                     on_delete: first_char(result.get(row, "ondelete"), 'a'),
                     on_update: first_char(result.get(row, "onupdate"), 'a'),
+                    // `true`/`t` as text; anything unreadable is taken as
+                    // validated, which only means the target checks the rows.
+                    validated: !matches!(result.get(row, "validated"), Some("false") | Some("f")),
                 });
             }
             _ => {}
@@ -447,11 +469,7 @@ fn columns_by_number(tables: &[SourceTable], relid: u32, key: &str) -> Vec<Strin
     let numbers = parse_int_array(key);
     let mut out = Vec::with_capacity(numbers.len());
     for number in numbers {
-        match table
-            .columns
-            .iter()
-            .find(|c| i64::from(c.attnum) == number)
-        {
+        match table.columns.iter().find(|c| i64::from(c.attnum) == number) {
             Some(column) => out.push(column.name.clone()),
             None => return Vec::new(),
         }
@@ -501,8 +519,7 @@ async fn read_unique_indexes(
             .map(|t| t.parse().unwrap_or(0))
             .collect();
         let partial = is_true(result.get(row, "partial"));
-        let expression =
-            is_true(result.get(row, "expression")) || numbers.iter().any(|n| *n <= 0);
+        let expression = is_true(result.get(row, "expression")) || numbers.iter().any(|n| *n <= 0);
 
         let Some(table) = tables.iter_mut().find(|t| t.oid == relid) else {
             continue;
@@ -522,7 +539,11 @@ async fn read_unique_indexes(
 
         let mut columns = Vec::with_capacity(numbers.len());
         for number in &numbers {
-            match table.columns.iter().find(|c| i64::from(c.attnum) == *number) {
+            match table
+                .columns
+                .iter()
+                .find(|c| i64::from(c.attnum) == *number)
+            {
                 Some(column) => columns.push(column.name.clone()),
                 None => {
                     columns.clear();
@@ -606,7 +627,10 @@ fn parse_int_array(text: &str) -> Vec<i64> {
 /// false, which quietly dropped `NOT NULL` from every column and let a partial
 /// unique index through as an ordinary one.
 fn is_true(text: Option<&str>) -> bool {
-    matches!(text, Some("t") | Some("true") | Some("TRUE") | Some("yes") | Some("1"))
+    matches!(
+        text,
+        Some("t") | Some("true") | Some("TRUE") | Some("yes") | Some("1")
+    )
 }
 
 fn first_char(text: Option<&str>, fallback: char) -> char {

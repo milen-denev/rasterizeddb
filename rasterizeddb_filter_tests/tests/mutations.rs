@@ -270,11 +270,11 @@ async fn mutations_survive_a_reopen() {
         )
         .await
         .unwrap();
-        t.checkpoint_filters().await;
+        t.checkpoint_filters().await.unwrap();
     }
 
     let t = open_table(dir.path(), "mut_reopen", &std_columns()).await;
-    t.wait_filters_ready().await;
+    t.wait_filters_ready().await.unwrap();
 
     assert!(run(&t, "id = 111").await.is_empty(), "deleted row came back");
     assert_eq!(u64s(&run(&t, "id = 222").await, 0), vec![222], "relocated row lost after reopen");

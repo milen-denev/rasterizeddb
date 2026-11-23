@@ -85,13 +85,20 @@ impl ImportReport {
         let mut out = Vec::new();
         out.push(format!(
             "{} {} from {} into {:?}",
-            if self.dry_run { "Would import" } else { "Imported" },
+            if self.dry_run {
+                "Would import"
+            } else {
+                "Imported"
+            },
             plural(self.tables.len() as u64, "table", "tables"),
             self.source,
             self.target
         ));
         if !self.server_version.is_empty() {
-            out.push(format!("  source server: PostgreSQL {}", self.server_version));
+            out.push(format!(
+                "  source server: PostgreSQL {}",
+                self.server_version
+            ));
         }
         for table in &self.tables {
             let count = match (table.rows, self.dry_run) {
@@ -230,7 +237,10 @@ pub async fn import(
     // The guard is held across the whole load, keys and foreign keys included,
     // and dropped before the final sync so that nothing appended after the
     // sync could be missed by it.
-    let bulk = database.location.as_deref().map(crate::core::bulk_load::begin);
+    let bulk = database
+        .location
+        .as_deref()
+        .map(crate::core::bulk_load::begin);
 
     // From here on the target exists, so every failure has to take it away
     // again: half a database that looks like a whole one is the one outcome
@@ -356,7 +366,7 @@ async fn load(
     for table in &plan.tables {
         for statement in &table.foreign_keys {
             log::info!("{}", statement);
-            run_ddl(database, statement).await?;
+            add_foreign_key(database, &table.name, statement, &mut report.notes).await?;
             if let Some(entry) = report.tables.iter_mut().find(|t| t.name == table.name) {
                 entry.foreign_keys += 1;
             }
@@ -378,86 +388,164 @@ async fn copy_table(
         None => log::info!("Copying {}", table.name),
     }
 
-    // `INSERT INTO t (a, b, c) VALUES (` — the same for every row, so it is
-    // built once and the values appended to a buffer that is reused.
-    let prefix = format!(
-        "INSERT INTO {} ({}) VALUES (",
-        table.name,
-        table
-            .columns
-            .iter()
-            .map(|c| c.source.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-
     connection.copy_out(&table.copy).await?;
 
-    let batch_rows = options.batch_rows.max(1);
-    let mut statement = String::with_capacity(prefix.len() + 256);
-    let mut copied: u64 = 0;
-    let mut in_batch = 0usize;
-    let mut batch_bytes = 0usize;
-    let mut transaction: Option<crate::core::mvcc::TxId> = None;
-    let mut last_logged = Instant::now();
-
+    let mut loader = TableLoader::new(database, table, options);
     loop {
         let line = match connection.copy_row().await {
             Ok(line) => line,
             Err(e) => {
-                if let Some(tx) = transaction.take() {
-                    abort(database, tx);
-                }
+                loader.abort();
                 return Err(format!("reading {}: {}", table.source_qualified, e));
             }
         };
-
         let Some(line) = line else { break };
         if copy::is_terminator(&line) {
             continue;
         }
+        loader.row(&line).await?;
+    }
+    loader.finish().await
+}
 
-        let result = build_statement(table, &prefix, &line, &mut statement);
+/// Loads one table's `COPY` rows, a batch to a transaction.
+///
+/// Separate from the connection that feeds it so the load itself — the part
+/// that decides what is stored — can be driven by a synthetic stream in tests
+/// and benchmarks.
+pub(crate) struct TableLoader<'a> {
+    database: &'a Arc<Database>,
+    table: &'a TablePlan,
+    /// `INSERT INTO t (a, b, c) VALUES (` — the same for every row, so it is
+    /// built once and the values appended to a buffer that is reused.
+    prefix: String,
+    statement: String,
+    batch_rows: usize,
+    copied: u64,
+    in_batch: usize,
+    batch_bytes: usize,
+    transaction: Option<crate::core::mvcc::TxId>,
+    last_logged: Instant,
+    /// Write each row through [`executor::insert_loaded_row`] rather than as
+    /// a statement. Off only in tests, as the reference the direct write is
+    /// compared against.
+    direct: bool,
+    /// Rows the direct write took, as opposed to handing them back.
+    direct_rows: u64,
+}
+
+impl<'a> TableLoader<'a> {
+    pub(crate) fn new(
+        database: &'a Arc<Database>,
+        table: &'a TablePlan,
+        options: &ImportOptions,
+    ) -> Self {
+        let prefix = format!(
+            "INSERT INTO {} ({}) VALUES (",
+            table.name,
+            table
+                .columns
+                .iter()
+                .map(|c| c.source.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        TableLoader {
+            database,
+            table,
+            statement: String::with_capacity(prefix.len() + 256),
+            prefix,
+            batch_rows: options.batch_rows.max(1),
+            copied: 0,
+            in_batch: 0,
+            batch_bytes: 0,
+            transaction: None,
+            last_logged: Instant::now(),
+            direct: true,
+            direct_rows: 0,
+        }
+    }
+
+    /// Rolls back the open batch, if there is one. The import fails behind it.
+    pub(crate) fn abort(&mut self) {
+        if let Some(tx) = self.transaction.take() {
+            abort(self.database, tx);
+        }
+    }
+
+    /// Stores one `COPY` row. On an error the open batch is rolled back.
+    pub(crate) async fn row(&mut self, line: &[u8]) -> Result<(), String> {
+        let (database, table) = (self.database, self.table);
+        let result = build_statement(table, &self.prefix, line, &mut self.statement);
         let Ok(()) = result else {
-            if let Some(tx) = transaction.take() {
-                abort(database, tx);
-            }
+            self.abort();
             return Err(format!(
                 "{} row {}: {}",
                 table.source_qualified,
-                copied + 1,
+                self.copied + 1,
                 result.unwrap_err()
             ));
         };
 
-        let tx = match transaction {
+        let tx = match self.transaction {
             Some(tx) => tx,
             None => {
                 let tx = database.transactions.begin();
-                transaction = Some(tx);
+                self.transaction = Some(tx);
                 tx
             }
         };
 
-        let Some(purpose) = recognize_query_purpose(&statement) else {
-            abort(database, tx);
+        // The row as the statement would write it, minus the statement: no
+        // classifying parse, no retry wrapper, no probes for shapes an import
+        // never builds. Anything that path cannot do exactly — a JSON column, a
+        // generated one, a refusal — comes back `None` and runs as the
+        // statement below, which then has the last word.
+        // Each batch transaction is a named owner, the importer's, never
+        // `FROZEN_TX` (docs/persistent-indexes.md §7 Owner); `commit` and
+        // `abort` release it.
+        let importer = crate::core::mvcc::owner::OwnerKind::Importer;
+        if self.direct
+            && crate::core::mvcc::owner::under(
+                &database.transactions,
+                tx,
+                importer,
+                executor::insert_loaded_row(database, &table.name, &self.statement, tx),
+            )
+            .await
+            .is_some()
+        {
+            self.direct_rows += 1;
+            self.note_row();
+            return self.end_batch_if_full(tx).await;
+        }
+
+        let Some(purpose) = recognize_query_purpose(&self.statement) else {
+            self.abort();
             return Err(format!(
                 "{} row {}: the statement built for this row could not be parsed back",
                 table.source_qualified,
-                copied + 1
+                self.copied + 1
             ));
         };
 
-        let response = executor::execute_in_txn(purpose, database.clone(), tx).await;
+        let response = crate::core::mvcc::owner::under(
+            &database.transactions,
+            tx,
+            importer,
+            executor::execute_in_txn(purpose, database.clone(), tx),
+        )
+        .await;
         if response.first() == Some(&3) {
             let message = String::from_utf8_lossy(&response[1..]).to_string();
-            abort(database, tx);
+            self.abort();
             // The statement is named, truncated. Some refusals — "Cannot insert
             // row due to schema mismatch" above all — say nothing about which
             // value the engine could not take, and without the text there is
             // nothing to reproduce from: the row is one of millions streaming
             // past and the copy has already been rolled back.
             const SHOWN: usize = 600;
+            let statement = &self.statement;
             let excerpt: String = if statement.chars().count() > SHOWN {
                 let head: String = statement.chars().take(SHOWN).collect();
                 format!("{head}… [{} chars]", statement.chars().count())
@@ -467,41 +555,52 @@ async fn copy_table(
             return Err(format!(
                 "{} row {}: {}\n  statement: {}",
                 table.source_qualified,
-                copied + 1,
+                self.copied + 1,
                 message,
                 excerpt
             ));
         }
 
-        copied += 1;
-        in_batch += 1;
-        batch_bytes += statement.len();
+        self.note_row();
+        self.end_batch_if_full(tx).await
+    }
 
+    fn note_row(&mut self) {
+        self.copied += 1;
+        self.in_batch += 1;
+        self.batch_bytes += self.statement.len();
+    }
+
+    async fn end_batch_if_full(&mut self, tx: crate::core::mvcc::TxId) -> Result<(), String> {
+        let (database, table) = (self.database, self.table);
         // A batch ends on whichever limit it reaches first, which is what makes
         // the size adaptive: narrow rows reach the row count and batch deeply,
         // wide ones reach the byte budget and batch shallowly. A row count
         // alone is not a bound on anything that matters — 5,000 rows of a few
         // bytes and 5,000 rows carrying a megabyte of JSON each are four
         // orders of magnitude apart in what one open transaction has to hold.
-        if in_batch >= batch_rows || batch_bytes >= MAX_BATCH_BYTES {
+        if self.in_batch >= self.batch_rows || self.batch_bytes >= MAX_BATCH_BYTES {
+            self.transaction = None;
+            self.in_batch = 0;
+            self.batch_bytes = 0;
             commit(database, tx).await?;
-            transaction = None;
-            in_batch = 0;
-            batch_bytes = 0;
 
-            if last_logged.elapsed() >= Duration::from_secs(10) {
-                log::info!("  {}: {} rows", table.name, copied);
-                last_logged = Instant::now();
+            if self.last_logged.elapsed() >= Duration::from_secs(10) {
+                log::info!("  {}: {} rows", table.name, self.copied);
+                self.last_logged = Instant::now();
             }
         }
+        Ok(())
     }
 
-    if let Some(tx) = transaction {
-        commit(database, tx).await?;
+    /// Commits the last batch and reports how many rows went in.
+    pub(crate) async fn finish(mut self) -> Result<u64, String> {
+        if let Some(tx) = self.transaction.take() {
+            commit(self.database, tx).await?;
+        }
+        log::info!("Copied {} rows into {}", self.copied, self.table.name);
+        Ok(self.copied)
     }
-
-    log::info!("Copied {} rows into {}", copied, table.name);
-    Ok(copied)
 }
 
 /// How much one import batch may accumulate before it is committed.
@@ -540,7 +639,10 @@ fn build_statement(
             statement.push_str(", ");
         }
         let literal = types::literal(&column.mapping, value.as_deref()).map_err(|e| {
-            format!("column {} ({}): {}", column.source.name, column.source.formatted_type, e)
+            format!(
+                "column {} ({}): {}",
+                column.source.name, column.source.formatted_type, e
+            )
         })?;
         statement.push_str(&literal);
     }
@@ -549,11 +651,49 @@ fn build_statement(
 }
 
 /// Runs one DDL statement, failing the import if it does not work.
+/// One of the plan's `ADD … FOREIGN KEY` statements. The target validates the
+/// rows already there (23503 for one with no parent), which a source can
+/// hold under a key it did validate: rows loaded with `pg_restore
+/// --disable-triggers` or `session_replication_role = replica` skip the
+/// check. Such a key is added `NOT VALID` instead, enforced on new writes as
+/// the source enforces it, and a note names the table and the key, rather
+/// than ending the import at its last step with the remaining keys unadded.
+async fn add_foreign_key(
+    database: &Arc<Database>,
+    table: &str,
+    statement: &str,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    match run_ddl(database, statement).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.contains("violates foreign key constraint") && !statement.trim_end().ends_with("NOT VALID") => {
+            let retry = format!("{} NOT VALID", statement.trim_end());
+            log::warn!("{e}\n  retried as: {retry}");
+            run_ddl(database, &retry).await?;
+            let detail = e.lines().next().unwrap_or_default();
+            notes.push(format!(
+                "table {table}: rows in the source break a foreign key it enforces ({detail}); the key was \
+                 added NOT VALID, so it holds for new writes and the rows already there were left as they are"
+            ));
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 async fn run_ddl(database: &Arc<Database>, sql: &str) -> Result<(), String> {
     let Some(purpose) = recognize_query_purpose(sql) else {
-        return Err(format!("this engine did not recognise the statement: {}", sql));
+        return Err(format!(
+            "this engine did not recognise the statement: {}",
+            sql
+        ));
     };
-    let response = executor::execute(purpose, database.clone()).await;
+    let response = executor::execute_as(
+        crate::core::mvcc::owner::OwnerKind::Importer,
+        purpose,
+        database.clone(),
+    )
+    .await;
     if response.first() == Some(&3) {
         return Err(format!(
             "{}\n  while running: {}",
@@ -575,6 +715,11 @@ async fn commit(database: &Arc<Database>, tx: crate::core::mvcc::TxId) -> Result
     // Publishing to peers is the one thing a batch still does, so a replica
     // keeps pace with the load rather than receiving it all at the end.
     let family = database.commit_transaction(tx);
+    // The batch's outcome is as durable as an import's gets until `finish`
+    // (above), so its owner goes with the commit.
+    if let Some(owner) = crate::core::mvcc::owner::LockOwner::block(tx) {
+        database.release_owner(owner);
+    }
     database.publish_transaction(family).await;
     Ok(())
 }
@@ -610,6 +755,9 @@ fn abort(database: &Arc<Database>, tx: crate::core::mvcc::TxId) {
     // The flush is skipped for the same reason `commit` skips it: an aborted
     // batch fails the import, and the database is dropped behind it.
     database.abort_transaction(tx);
+    if let Some(owner) = crate::core::mvcc::owner::LockOwner::block(tx) {
+        database.release_owner(owner);
+    }
 }
 
 /// The one column an `IMPORT` reports through.
@@ -619,4 +767,465 @@ fn abort(database: &Arc<Database>, tx: crate::core::mvcc::TxId) {
 /// it harder to read in a terminal and no easier to act on.
 pub fn result_fields() -> Vec<(String, crate::core::db_type::DbType)> {
     vec![("import".to_string(), crate::core::db_type::DbType::STRING)]
+}
+
+#[cfg(test)]
+mod load_tests {
+    //! The load step driven by a synthetic `COPY` stream: no PostgreSQL needed.
+
+    use super::*;
+    use crate::core::migrate::source::{SourceSchema, SourceTable};
+    use crate::core::migrate::types::SourceColumn;
+
+    fn column(name: &str, type_name: &str, category: char, modifier: i32) -> SourceColumn {
+        SourceColumn {
+            name: name.to_string(),
+            attnum: 1,
+            type_name: type_name.to_string(),
+            type_kind: 'b',
+            type_category: category,
+            element_type_name: (category == 'A').then(|| "text".to_string()),
+            type_modifier: modifier,
+            not_null: name == "id",
+            default: None,
+            formatted_type: type_name.to_string(),
+            json_shreddable: Some(true),
+        }
+    }
+
+    /// One table holding every conversion the import has: integers, NUMERIC
+    /// with a declared scale and without, floats, booleans, text with every
+    /// character `COPY` escapes, timestamps and dates, UUID, INET, BYTEA,
+    /// arrays, JSON/JSONB, and PostgreSQL types carried as text.
+    fn plan_for(name: &str) -> TablePlan {
+        // numeric(12,2): atttypmod = ((precision << 16) | scale) + 4.
+        let numeric_12_2 = ((12 << 16) | 2) + 4;
+        let columns = vec![
+            column("id", "int4", 'N', -1),
+            column("big", "int8", 'N', -1),
+            column("small", "int2", 'N', -1),
+            column("name", "text", 'S', -1),
+            column("amount", "numeric", 'N', numeric_12_2),
+            column("plain_num", "numeric", 'N', -1),
+            column("ratio", "float8", 'N', -1),
+            column("real4", "float4", 'N', -1),
+            column("ok", "bool", 'B', -1),
+            column("created", "timestamptz", 'D', -1),
+            column("day", "date", 'D', -1),
+            column("uid", "uuid", 'U', -1),
+            column("addr", "inet", 'I', -1),
+            column("blob", "bytea", 'U', -1),
+            column("tags", "_text", 'A', -1),
+            column("doc", "jsonb", 'U', -1),
+            column("span", "interval", 'T', -1),
+            column("mac", "macaddr", 'U', -1),
+        ];
+        let schema = SourceSchema {
+            tables: vec![SourceTable {
+                schema: "public".to_string(),
+                name: name.to_string(),
+                oid: 1,
+                columns,
+                primary_key: vec!["id".to_string()],
+                unique_keys: Vec::new(),
+                foreign_keys: Vec::new(),
+                estimated_rows: None,
+                notes: Vec::new(),
+            }],
+            notes: Vec::new(),
+        };
+        plan(&schema, &ImportOptions::default())
+            .expect("plan")
+            .tables
+            .remove(0)
+    }
+
+    /// Row `i` as PostgreSQL's text `COPY` renders it, with NULLs, escapes and
+    /// edge values spread across the rows.
+    fn copy_line(i: u64) -> Vec<u8> {
+        let null = |k: u64| (i + k) % 7 == 0;
+        let f = |k: u64, v: String| if null(k) { "\\N".to_string() } else { v };
+        let fields = [
+            i.to_string(),
+            f(1, format!("{}", (i as i64) * 1_000_003 - 7_000_000_000)),
+            f(2, format!("{}", (i % 60_000) as i64 - 30_000)),
+            f(3, match i % 5 {
+                0 => format!("plain {i}"),
+                1 => format!("tab\\there {i}"),
+                2 => format!("quote ' and back\\\\slash {i}"),
+                3 => format!("new\\nline é {i}"),
+                _ => String::new(),
+            }),
+            f(4, format!("{}.{:02}", i as i64 - 500, i % 100)),
+            f(5, format!("{}.{}", i % 1000, i % 7)),
+            f(6, match i % 4 {
+                0 => "NaN".to_string(),
+                1 => "-Infinity".to_string(),
+                2 => format!("{}", (i as f64) / 3.0),
+                _ => "-0".to_string(),
+            }),
+            f(7, format!("{}", (i as f32) * 0.25)),
+            f(8, if i % 2 == 0 { "t" } else { "f" }.to_string()),
+            f(9, format!("2026-{:02}-{:02} {:02}:{:02}:{:02}.{:06}+00", i % 12 + 1, i % 28 + 1, i % 24, i % 60, (i * 7) % 60, i % 1_000_000)),
+            f(10, format!("{}-{:02}-{:02}", 1990 + i % 40, i % 12 + 1, i % 28 + 1)),
+            f(11, format!("{:08x}-0000-4000-8000-{:012x}", i, i * 31)),
+            f(12, format!("10.{}.{}.{}", i % 256, (i / 256) % 256, i % 200)),
+            f(13, format!("\\\\x{:02x}{:02x}00ff", i % 256, (i * 3) % 256)),
+            f(14, format!("{{a,\"b c\",{i}}}")),
+            f(15, format!("{{\"k\": {i}, \"s\": \"v{i}\", \"arr\": [1, 2]}}")),
+            f(16, format!("{} days {:02}:00:00", i % 30, i % 24)),
+            f(17, format!("08:00:2b:01:02:{:02x}", i % 256)),
+        ];
+        fields.join("\t").into_bytes()
+    }
+
+    struct Target {
+        dir: String,
+        database: Arc<Database>,
+    }
+
+    impl Drop for Target {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A fresh on-disk database holding the planned table, keys dropped, as
+    /// `load` leaves it before the first row.
+    async fn target(table: &TablePlan, tag: &str) -> Target {
+        let dir = format!(
+            "/var/tmp/rdb_import_tests/{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the target directory");
+        let database = Arc::new(Database::new(&dir).await);
+        run_ddl(&database, &table.create).await.expect("create");
+        for statement in &table.drop_constraints {
+            run_ddl(&database, statement).await.expect("drop keys");
+        }
+        Target { dir, database }
+    }
+
+    /// Feeds `lines` through the loader under the bulk-load guard, then makes
+    /// the load durable, as `import` does.
+    /// Returns how many rows the direct write took.
+    async fn load_lines_via(
+        target: &Target,
+        table: &TablePlan,
+        lines: &[Vec<u8>],
+        batch: usize,
+        direct: bool,
+    ) -> u64 {
+        let options = ImportOptions {
+            batch_rows: batch,
+            ..ImportOptions::default()
+        };
+        let bulk = crate::core::bulk_load::begin(&target.dir);
+        let mut loader = TableLoader::new(&target.database, table, &options);
+        loader.direct = direct;
+        for line in lines {
+            loader.row(line).await.expect("row");
+        }
+        let direct_rows = loader.direct_rows;
+        let n = loader.finish().await.expect("finish");
+        assert_eq!(n, lines.len() as u64);
+        drop(bulk);
+        finish(&target.database).await.expect("durable");
+        direct_rows
+    }
+
+    async fn select(database: &Arc<Database>, sql: &str) -> Vec<u8> {
+        let purpose = recognize_query_purpose(sql).expect("parse");
+        executor::execute(purpose, database.clone()).await
+    }
+
+    /// A key the source enforced while its rows break it (rows let in by
+    /// `pg_restore --disable-triggers`): the import's last step adds it
+    /// `NOT VALID` with a note naming the table, never aborts, and the key
+    /// holds for new writes; a key the source never validated is added `NOT
+    /// VALID` as planned, its orphans kept; a clean key is validated as
+    /// usual, and another failure still ends the import (P4 round 2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_foreign_key_broken_by_the_source_rows_is_added_not_valid_with_a_note() {
+        let database = crate::replication::test_support::in_memory_database().await;
+        for sql in [
+            "CREATE TABLE fk_p (id BIGINT NOT NULL PRIMARY KEY)",
+            "INSERT INTO fk_p (id) VALUES (1), (2)",
+            "CREATE TABLE fk_c (id BIGINT NOT NULL PRIMARY KEY, p BIGINT)",
+            "INSERT INTO fk_c (id, p) VALUES (1, 1), (2, 99)",
+            "CREATE TABLE fk_d (id BIGINT NOT NULL PRIMARY KEY, p BIGINT)",
+            "INSERT INTO fk_d (id, p) VALUES (1, 98)",
+            "CREATE TABLE fk_e (id BIGINT NOT NULL PRIMARY KEY, p BIGINT)",
+            "INSERT INTO fk_e (id, p) VALUES (1, 2)",
+        ] {
+            run_ddl(&database, sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        let mut notes = Vec::new();
+        add_foreign_key(&database, "fk_c", "ALTER TABLE fk_c ADD CONSTRAINT fk_c_p FOREIGN KEY (p) REFERENCES fk_p (id)", &mut notes)
+            .await
+            .expect("an orphan in the source does not end the import");
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("fk_c") && notes[0].contains("NOT VALID") && notes[0].contains("99"), "{notes:?}");
+        let e = run_ddl(&database, "INSERT INTO fk_c (id, p) VALUES (3, 97)").await.expect_err("enforced on new writes");
+        assert!(e.contains("violates foreign key constraint"), "{e}");
+        run_ddl(&database, "INSERT INTO fk_c (id, p) VALUES (4, 2)").await.expect("a row with a parent");
+        let e = run_ddl(&database, "ALTER TABLE fk_c VALIDATE CONSTRAINT fk_c_p").await.expect_err("the orphan is there");
+        assert!(e.contains("violates foreign key constraint") && e.contains("99"), "{e}");
+        run_ddl(&database, "DELETE FROM fk_c WHERE p = 99").await.unwrap();
+        run_ddl(&database, "ALTER TABLE fk_c VALIDATE CONSTRAINT fk_c_p").await.expect("valid now");
+
+        // Planned NOT VALID (the source never validated it): no retry, no
+        // second note.
+        let mut notes = Vec::new();
+        add_foreign_key(
+            &database,
+            "fk_d",
+            "ALTER TABLE fk_d ADD CONSTRAINT fk_d_p FOREIGN KEY (p) REFERENCES fk_p (id) NOT VALID",
+            &mut notes,
+        )
+        .await
+        .expect("NOT VALID");
+        assert!(notes.is_empty(), "{notes:?}");
+        let e = run_ddl(&database, "INSERT INTO fk_d (id, p) VALUES (2, 96)").await.expect_err("enforced");
+        assert!(e.contains("violates foreign key constraint"), "{e}");
+
+        add_foreign_key(&database, "fk_e", "ALTER TABLE fk_e ADD CONSTRAINT fk_e_p FOREIGN KEY (p) REFERENCES fk_p (id)", &mut notes)
+            .await
+            .expect("clean");
+        assert!(notes.is_empty(), "{notes:?}");
+        let e = add_foreign_key(&database, "fk_e", "ALTER TABLE fk_e ADD CONSTRAINT fk_e_q FOREIGN KEY (p) REFERENCES nowhere (id)", &mut notes)
+            .await
+            .expect_err("another failure ends the import");
+        assert!(e.contains("does not exist"), "{e}");
+    }
+
+    /// The importer runs as a named owner, never unowned (§7 Owner): its DDL
+    /// one owner per statement, each batch transaction under its own root,
+    /// released when the batch commits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_importer_runs_under_named_owners() {
+        use crate::core::mvcc::owner::{probe, LockOwner, OwnerKind};
+        let database = crate::replication::test_support::in_memory_database().await;
+        let table = plan_for("owned");
+        let (created, records) = probe::capture(run_ddl(&database, &table.create)).await;
+        created.expect("create");
+        assert!(!records.is_empty(), "the DDL recorded nothing");
+        let ddl_owner = records[0].owner.expect("the DDL ran under no owner");
+        for r in &records {
+            assert_eq!(r.owner, Some(ddl_owner), "the DDL's {:?} ran under another owner", r.site);
+            assert_eq!(ddl_owner.kind, OwnerKind::Importer);
+        }
+        assert_ne!(
+            database.transactions.outcome(ddl_owner.owner.id()),
+            crate::core::mvcc::TxOutcome::InProgress,
+            "the DDL's owner was never ended"
+        );
+
+        let options = ImportOptions {
+            batch_rows: 2,
+            ..ImportOptions::default()
+        };
+        let mut loader = TableLoader::new(&database, &table, &options);
+        loader.direct = false;
+        let (row, records) = probe::capture(loader.row(&copy_line(1))).await;
+        row.expect("row");
+        let tx = loader.transaction.expect("the batch is open");
+        assert!(!records.is_empty());
+        for r in &records {
+            let o = r.owner.unwrap_or_else(|| panic!("the import row's {:?} ran under no owner", r.site));
+            assert_eq!(o.kind, OwnerKind::Importer);
+            assert_eq!(o.owner, LockOwner::block(tx).unwrap(), "the row ran outside its batch's owner");
+        }
+        // Something for the batch's owner to hold, so only its release frees it.
+        database
+            .row_locks
+            .acquire_table("owned", tx, crate::core::mvcc::table_locks::TableMode::Share);
+        assert!(database.row_locks.owner_holds_tables(tx));
+        let n = loader.finish().await.expect("finish");
+        assert_eq!(n, 1);
+        assert!(!database.row_locks.owner_holds_tables(tx), "the batch's commit did not release its owner");
+    }
+
+    /// Whether another owner of `database` takes ACCESS EXCLUSIVE on `table`
+    /// at once: nothing is left holding it.
+    fn lockable_now(database: &Arc<Database>, table: &str) -> bool {
+        use crate::core::mvcc::table_locks::{LockOwner, TableMode};
+        let probe = LockOwner::autocommit(database.transactions.begin_owner()).unwrap();
+        let took = database
+            .row_locks
+            .table_locks()
+            .try_acquire(probe, table, TableMode::AccessExclusive);
+        database.row_locks.release_owner(probe);
+        database.transactions.end_owner(probe.id());
+        took
+    }
+
+    /// A statement's owner never crosses into another database: a
+    /// sub-execution against database B inside a statement of database A
+    /// (CREATE DATABASE's role catalogue) runs under an owner of B's own,
+    /// released when it ends. Joined to A's scope, its ACCESS EXCLUSIVE in
+    /// B's lock manager was held by an id of A's transactions, released only
+    /// in A, and every later statement on the table in B queued forever.
+    ///
+    /// Mutation: `owner::statement` joins any scope (`in_scope()`); the table
+    /// in B stays locked after both statements ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_statement_owner_never_crosses_into_another_database() {
+        use crate::core::mvcc::owner::{self, OwnerKind};
+        let a = crate::replication::test_support::in_memory_database().await;
+        let b = crate::replication::test_support::in_memory_database().await;
+        let (ta, la) = (a.transactions.clone(), a.row_locks.clone());
+        let b2 = b.clone();
+        owner::statement(&ta, &la, OwnerKind::Statement, async move {
+            // A's owner exists before the sub-execution, as a session's does.
+            owner::ensure().expect("A's statement has an owner");
+            for sql in ["CREATE TABLE crossed (id INT PRIMARY KEY)", "INSERT INTO crossed (id) VALUES (1)"] {
+                let response = executor::execute_as(
+                    OwnerKind::Auth,
+                    recognize_query_purpose(sql).expect("parse"),
+                    b2.clone(),
+                )
+                .await;
+                assert_ne!(response.first(), Some(&3), "{sql}: {}", String::from_utf8_lossy(&response[1..]));
+            }
+        })
+        .await;
+        assert!(lockable_now(&b, "crossed"), "a lock taken in B under A's statement owner was never released");
+    }
+
+    /// An import batch into database B, driven from a statement of database
+    /// A, runs under its batch's own owner in B, released at the batch's
+    /// commit: B's table is free afterwards, by the direct write and by the
+    /// statement path alike.
+    ///
+    /// Mutation: `owner::under` joins any scope; the batch's RX stays held in
+    /// B under A's owner.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_import_from_another_databases_statement_leaves_no_lock() {
+        use crate::core::mvcc::owner::{self, OwnerKind};
+        for direct in [true, false] {
+            let a = crate::replication::test_support::in_memory_database().await;
+            let b = crate::replication::test_support::in_memory_database().await;
+            let table = plan_for("imported");
+            run_ddl(&b, &table.create).await.expect("create");
+            let (ta, la) = (a.transactions.clone(), a.row_locks.clone());
+            let b2 = b.clone();
+            owner::statement(&ta, &la, OwnerKind::Statement, async move {
+                owner::ensure().expect("A's statement has an owner");
+                let options = ImportOptions {
+                    batch_rows: 2,
+                    ..ImportOptions::default()
+                };
+                let mut loader = TableLoader::new(&b2, &table, &options);
+                loader.direct = direct;
+                for i in 1..=3 {
+                    loader.row(&copy_line(i)).await.expect("row");
+                }
+                assert_eq!(loader.finish().await.expect("finish"), 3);
+            })
+            .await;
+            assert!(
+                lockable_now(&b, "imported"),
+                "direct={direct}: the import left a lock in the target under the session's owner"
+            );
+        }
+    }
+
+    /// Every value the import converts, stored by the direct write and by the
+    /// statement it replaced, must read back identically — NULLs, NUMERIC
+    /// scales, floats' edge values, escapes, JSON, arrays, BYTEA and the
+    /// PostgreSQL types carried as text. Read back two ways: the whole row, and
+    /// each column on its own with its nullness, so a NULL that became a zero
+    /// cannot hide behind a renderer that prints both the same.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_direct_write_stores_what_the_statement_stored() {
+        let table = plan_for("differential");
+        let lines: Vec<Vec<u8>> = (0..3_000).map(copy_line).collect();
+        let reference = target(&table, "reference").await;
+        load_lines_via(&reference, &table, &lines, 700, false).await;
+        let direct = target(&table, "direct").await;
+        let taken = load_lines_via(&direct, &table, &lines, 700, true).await;
+        // Otherwise this compares the statement path with itself.
+        assert_eq!(taken, lines.len() as u64, "the direct write handed rows back");
+
+        let all = "SELECT * FROM differential ORDER BY id";
+        let a = select(&reference.database, all).await;
+        let b = select(&direct.database, all).await;
+        assert_eq!(a.first(), Some(&2), "the reference read failed: {:?}", String::from_utf8_lossy(&a));
+        assert!(a.len() > 3_000 * 20, "suspiciously little data: {} bytes", a.len());
+        assert!(a == b, "SELECT * differs between the two writes");
+        for column in &table.columns {
+            let name = &column.source.name;
+            let sql = format!(
+                "SELECT id, {name}, {name} IS NULL FROM differential ORDER BY id"
+            );
+            assert_eq!(
+                select(&reference.database, &sql).await,
+                select(&direct.database, &sql).await,
+                "column {name} differs"
+            );
+        }
+        // Some of every column is NULL, so the companions were exercised.
+        let nulls = select(
+            &direct.database,
+            "SELECT id FROM differential WHERE name IS NULL",
+        )
+        .await;
+        assert_eq!(nulls.first(), Some(&2));
+    }
+
+    /// A row the engine refuses is refused with the same words either way —
+    /// the direct write hands it to the statement, which then decides.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_row_fails_the_same_way_through_both_writes() {
+        let table = plan_for("refusals");
+        let mut bad = copy_line(1);
+        // `id` is NOT NULL.
+        let tab = bad.iter().position(|b| *b == b'\t').unwrap();
+        bad.splice(..tab, b"\\N".iter().copied());
+        let mut errors = Vec::new();
+        for direct in [false, true] {
+            let target = target(&table, "refusal").await;
+            let options = ImportOptions::default();
+            let mut loader = TableLoader::new(&target.database, &table, &options);
+            loader.direct = direct;
+            loader.row(&copy_line(0)).await.expect("a good row");
+            errors.push(loader.row(&bad).await.expect_err("the bad row is refused"));
+        }
+        assert_eq!(errors[0], errors[1]);
+        assert!(errors[0].contains("row 2"), "{}", errors[0]);
+    }
+
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored
+    /// import_load_bench --nocapture`. Rows/s through the load step on an
+    /// on-disk database under /var/tmp, from a synthetic `COPY` stream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn import_load_bench() {
+        let rows: u64 = std::env::var("RDB_IMPORT_BENCH_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        let table = plan_for("bench_rows");
+        let lines: Vec<Vec<u8>> = (0..rows).map(copy_line).collect();
+        for round in 0..3 {
+            for direct in [false, true] {
+                let target = target(&table, "bench").await;
+                let started = Instant::now();
+                load_lines_via(&target, &table, &lines, 5_000, direct).await;
+                let elapsed = started.elapsed();
+                println!(
+                    "round {round} {}: {rows} rows in {elapsed:.2?} = {:.0} rows/s",
+                    if direct { "direct   " } else { "statement" },
+                    rows as f64 / elapsed.as_secs_f64()
+                );
+            }
+        }
+    }
 }

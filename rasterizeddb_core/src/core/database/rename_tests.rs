@@ -25,6 +25,8 @@ async fn create(db: &Database, name: &str) {
         json_columns: Vec::new(),
         unique_keys: Vec::new(),
         type_modifiers: Vec::new(),
+        generated: Vec::new(),
+        checks: Vec::new(),
         primary_key: None,
         if_not_exists: false,
         is_immutable: false,
@@ -43,9 +45,26 @@ async fn the_rename_file_list_matches_what_a_table_creates() {
     let db = open_db(dir.path()).await;
     create(&db, "filelist").await;
 
-    // Touch every sidecar so the lazily-created ones exist.
-    let table = db.tables.get("filelist").expect("table").clone();
-    for suffix in ["_schema_FK.db", "_schema_DEF.db", "_schema_UK.db", "_schema_JSON.db"] {
+    // Reopening is what makes the lazily-created sidecars exist: several of
+    // them are only opened when a schema is *loaded*, so a table that has been
+    // created and never reopened has fewer files on disk than the same table
+    // after a restart. Asserting against the freshly-created set is how three
+    // sidecars — CHK, GEN and PIX — sat outside this list unnoticed: they were
+    // never on disk while this test was looking.
+    let table = db.table_for_tests("filelist").expect("table").clone();
+    let schema_io = db
+        .db_io_pointers
+        .create_new("filelist_schema.db".to_string())
+        .await;
+    let _ = TableSchema::load(Arc::new(schema_io))
+        .await
+        .expect("load the schema back");
+    for suffix in [
+        "_schema_FK.db",
+        "_schema_DEF.db",
+        "_schema_UK.db",
+        "_schema_JSON.db",
+    ] {
         let io = db
             .db_io_pointers
             .create_new(format!("filelist{}", suffix))
@@ -90,12 +109,18 @@ async fn a_rename_moves_the_table_and_its_rows() {
 
     db.rename_table("role", "roles").await.expect("rename");
 
-    assert!(db.tables.contains_key("roles"), "the new name is not live");
-    assert!(!db.tables.contains_key("role"), "the old name is still live");
+    assert!(db.has_table("roles"), "the new name is not live");
+    assert!(
+        !db.has_table("role"),
+        "the old name is still live"
+    );
 
     // The catalogue is what survives a restart, so it is what the assertion has
     // to be about.
-    assert!(db.catalogue_contains("roles").await, "the catalogue lost the new name");
+    assert!(
+        db.catalogue_contains("roles").await,
+        "the catalogue lost the new name"
+    );
     assert!(
         !db.catalogue_contains("role").await,
         "the old catalogue row was not tombstoned, so the table comes back twice"
@@ -114,9 +139,12 @@ async fn the_renamed_table_survives_a_reopen_under_its_new_name() {
     // The point of the whole ordering: what the catalogue says is what comes
     // back. An in-memory rename that does not survive here is not a rename.
     let db = open_db(dir.path()).await;
-    assert!(db.tables.contains_key("roles"), "the rename did not survive a reopen");
     assert!(
-        !db.tables.contains_key("role"),
+        db.has_table("roles"),
+        "the rename did not survive a reopen"
+    );
+    assert!(
+        !db.has_table("role"),
         "the old name came back, so the table exists twice after a restart"
     );
 }
@@ -128,7 +156,11 @@ async fn the_schema_record_carries_the_new_name() {
     create(&db, "role").await;
     db.rename_table("role", "roles").await.expect("rename");
 
-    let schema_io = Arc::new(db.db_io_pointers.create_new("roles_schema.db".to_string()).await);
+    let schema_io = Arc::new(
+        db.db_io_pointers
+            .create_new("roles_schema.db".to_string())
+            .await,
+    );
     let schema = TableSchema::load(schema_io).await.expect("load schema");
     assert_eq!(
         schema.name, "roles",
@@ -148,8 +180,8 @@ async fn a_rename_onto_an_existing_name_is_refused() {
 
     // Refusing has to leave both intact — a refusal that half-ran would be
     // worse than the unsupported error this replaced.
-    assert!(db.tables.contains_key("role"));
-    assert!(db.tables.contains_key("roles"));
+    assert!(db.has_table("role"));
+    assert!(db.has_table("roles"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -166,12 +198,12 @@ async fn a_rename_to_the_same_name_does_nothing() {
     let db = open_db(dir.path()).await;
     create(&db, "role").await;
     db.rename_table("role", "role").await.expect("no-op rename");
-    assert!(db.tables.contains_key("role"));
+    assert!(db.has_table("role"));
     assert!(db.catalogue_contains("role").await);
 }
 
 async fn insert_id(db: &Database, table: &str, value: i32) {
-    let table = db.tables.get(table).expect("table").clone();
+    let table = db.table_for_tests(table).expect("table").clone();
     let mut mb = MEMORY_POOL.acquire(4);
     mb.into_slice_mut().copy_from_slice(&value.to_le_bytes());
     let row = RowWrite {
@@ -200,7 +232,7 @@ fn fetch_all(fields: &SmallVec<[SchemaField; 20]>) -> crate::core::row::row::Row
 }
 
 async fn read_ids(db: &Database, table: &str) -> Vec<i32> {
-    let table = db.tables.get(table).expect("table").clone();
+    let table = db.table_for_tests(table).expect("table").clone();
     let rows = table
         .query_row(
             "",
@@ -269,7 +301,9 @@ async fn recovery_finishes_a_rename_that_reached_the_catalogue() {
         // A crash in the window the ordering deliberately produces: the new
         // catalogue row is written, the old one is not yet tombstoned. Both
         // names exist and both read.
-        db.record_rename_intent("role", "roles").await.expect("intent");
+        db.record_rename_intent("role", "roles")
+            .await
+            .expect("intent");
         db.copy_table_files("role", "roles").await.expect("copy");
         db.rewrite_schema_name("roles").await.expect("schema");
         db.remember_in_catalogue("roles").await.expect("catalogue");
@@ -280,14 +314,21 @@ async fn recovery_finishes_a_rename_that_reached_the_catalogue() {
     // Reopening completes it: the catalogue recorded the commit, so recovery
     // finishes rather than unwinds.
     let db = open_db(dir.path()).await;
-    assert!(db.tables.contains_key("roles"), "recovery lost the renamed table");
     assert!(
-        !db.tables.contains_key("role"),
+        db.has_table("roles"),
+        "recovery lost the renamed table"
+    );
+    assert!(
+        !db.has_table("role"),
         "recovery left the duplicate in place, so the table exists twice"
     );
     let mut ids = read_ids(&db, "roles").await;
     ids.sort();
-    assert_eq!(ids, vec![1, 2, 3, 4, 5], "recovery kept the name but lost the rows");
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4, 5],
+        "recovery kept the name but lost the rows"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -301,7 +342,9 @@ async fn recovery_abandons_a_rename_that_never_reached_the_catalogue() {
         }
 
         // A crash before the commit point: files copied, catalogue untouched.
-        db.record_rename_intent("role", "roles").await.expect("intent");
+        db.record_rename_intent("role", "roles")
+            .await
+            .expect("intent");
         db.copy_table_files("role", "roles").await.expect("copy");
     }
 
@@ -309,16 +352,20 @@ async fn recovery_abandons_a_rename_that_never_reached_the_catalogue() {
     // belongs to nobody.
     let db = open_db(dir.path()).await;
     assert!(
-        db.tables.contains_key("role"),
+        db.has_table("role"),
         "recovery discarded the original after a rename that never committed"
     );
     assert!(
-        !db.tables.contains_key("roles"),
+        !db.has_table("roles"),
         "an uncommitted rename produced a visible table"
     );
     let mut ids = read_ids(&db, "role").await;
     ids.sort();
-    assert_eq!(ids, vec![1, 2, 3, 4, 5], "the original lost rows to a failed rename");
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4, 5],
+        "the original lost rows to a failed rename"
+    );
 
     // The orphaned copy is gone rather than left to accumulate.
     let leftover = std::fs::read_dir(dir.path())
@@ -380,7 +427,10 @@ async fn dropping_a_table_removes_every_file_it_created() {
         insert_id(&db, "gone", i).await;
     }
 
-    assert!(db.drop_table("gone").await.expect("drop"), "the table was not dropped");
+    assert!(
+        db.drop_table("gone").await.expect("drop"),
+        "the table was not dropped"
+    );
 
     let leftovers: Vec<String> = std::fs::read_dir(dir.path())
         .unwrap()
@@ -409,13 +459,18 @@ async fn dropping_a_table_takes_its_json_shadow_tables_with_it() {
     let shadow = json_map::shadow_table_name("owner", "doc");
     let mut create_owner = CreateTable {
         table_name: "owner".to_string(),
-        columns: vec![CreateColumnData { name: "id".to_string(), data_type: DbType::I32 }],
+        columns: vec![CreateColumnData {
+            name: "id".to_string(),
+            data_type: DbType::I32,
+        }],
         unique_columns: Vec::new(),
         foreign_keys: Vec::new(),
         defaults: Vec::new(),
         json_columns: Vec::new(),
         unique_keys: Vec::new(),
         type_modifiers: Vec::new(),
+        generated: Vec::new(),
+        checks: Vec::new(),
         primary_key: None,
         if_not_exists: false,
         is_immutable: false,
@@ -430,12 +485,15 @@ async fn dropping_a_table_takes_its_json_shadow_tables_with_it() {
     // The executor creates the shadow lazily on first write; standing in for it
     // here so the drop has something to find.
     create(&db, &shadow).await;
-    assert!(db.tables.contains_key(&shadow), "setup did not create the shadow");
+    assert!(
+        db.has_table(&shadow),
+        "setup did not create the shadow"
+    );
 
     db.drop_table("owner").await.expect("drop");
 
     assert!(
-        !db.tables.contains_key(&shadow),
+        !db.has_table(&shadow),
         "the JSON shadow table outlived the table that owns it"
     );
     assert!(
@@ -446,7 +504,278 @@ async fn dropping_a_table_takes_its_json_shadow_tables_with_it() {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| n.starts_with(&format!("{}.", shadow)) || n.starts_with(&format!("{}_", shadow)))
+        .filter(|n| {
+            n.starts_with(&format!("{}.", shadow)) || n.starts_with(&format!("{}_", shadow))
+        })
         .collect();
-    assert!(leftovers.is_empty(), "the shadow's files survived: {:?}", leftovers);
+    assert!(
+        leftovers.is_empty(),
+        "the shadow's files survived: {:?}",
+        leftovers
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Intents recovery must not act on
+// ---------------------------------------------------------------------------
+
+/// Opens `dir` with `intent` hand-written as the rename intent, twice (the
+/// second open is where a reaper would have taken files the first one
+/// orphaned), and returns the database.
+async fn reopen_with_intent(dir: &std::path::Path, intent: &[u8]) -> Database {
+    crate::core::wal::remove_for(&dir.to_string_lossy());
+    std::fs::write(dir.join(super::RENAME_INTENT_FILE), intent).unwrap();
+    {
+        let _db = open_db(dir).await;
+    }
+    crate::core::wal::remove_for(&dir.to_string_lossy());
+    open_db(dir).await
+}
+
+fn intent_files(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("__rename."))
+        .collect();
+    names.sort();
+    names
+}
+
+async fn assert_intact(db: &Database, dir: &std::path::Path, table: &str, rows: &[i32], label: &str) {
+    assert!(db.has_table(table), "{label}: the table {table} is gone");
+    assert!(db.catalogue_contains(table).await, "{label}: {table}'s catalogue row was tombstoned");
+    assert!(
+        dir.join(format!("{table}.db")).exists(),
+        "{label}: {table}'s files were deleted"
+    );
+    let mut ids = read_ids(db, table).await;
+    ids.sort();
+    assert_eq!(ids, rows, "{label}: {table} lost rows");
+}
+
+/// A power cut tore the intent of `RENAME pt TO pt2` after five bytes:
+/// `pt\npt`, which the older two-line form read as "rename pt to pt". Both
+/// catalogue lookups found the one row, so recovery took the rename for
+/// committed, tombstoned the only row and discarded `pt`'s files.
+///
+/// Mutation: `parse_intent` accepting the two-line form again (and the
+/// degenerate check gone) loses `pt`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_torn_intent_naming_one_table_twice_does_not_drop_it() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open_db(dir.path()).await;
+        create(&db, "pt").await;
+        for i in 1..=4 {
+            insert_id(&db, "pt", i).await;
+        }
+        db.sync_durable().unwrap();
+    }
+    let db = reopen_with_intent(dir.path(), b"pt\npt").await;
+    assert_intact(&db, dir.path(), "pt", &[1, 2, 3, 4], "torn pt\\npt").await;
+    assert_eq!(
+        intent_files(dir.path()),
+        vec!["__rename.intent.bad-1".to_string()],
+        "a malformed intent is kept aside for an operator, not deleted or left in place"
+    );
+}
+
+/// The checksummed form naming one table twice is no rename either, and the
+/// same tombstone would follow from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_checksummed_intent_naming_one_table_twice_does_not_drop_it() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open_db(dir.path()).await;
+        create(&db, "pt").await;
+        for i in 1..=3 {
+            insert_id(&db, "pt", i).await;
+        }
+        db.sync_durable().unwrap();
+    }
+    let db = reopen_with_intent(dir.path(), super::encode_intent("pt", "pt").as_bytes()).await;
+    assert_intact(&db, dir.path(), "pt", &[1, 2, 3], "checksummed pt -> pt").await;
+}
+
+/// A two-line intent is indistinguishable from a checksummed one torn just
+/// before its sum: `orders_archive\norders` may be the start of a rename of
+/// `orders_archive` to `orders_x`. Read as written, both rows exist, so
+/// recovery would tombstone `orders_archive` and discard its files. It is
+/// refused, and both tables stay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_two_line_intent_is_not_acted_on() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open_db(dir.path()).await;
+        create(&db, "orders").await;
+        create(&db, "orders_archive").await;
+        insert_id(&db, "orders", 1).await;
+        insert_id(&db, "orders_archive", 2).await;
+        insert_id(&db, "orders_archive", 3).await;
+        db.sync_durable().unwrap();
+    }
+    let db = reopen_with_intent(dir.path(), b"orders_archive\norders").await;
+    assert_intact(&db, dir.path(), "orders", &[1], "two-line intent").await;
+    assert_intact(&db, dir.path(), "orders_archive", &[2, 3], "two-line intent").await;
+}
+
+/// Torn anywhere, a checksummed intent is refused: every prefix of one, and
+/// one with empty names.
+#[test]
+fn no_prefix_of_an_intent_parses() {
+    let intent = super::encode_intent("orders_archive", "orders");
+    for cut in 0..intent.len() {
+        assert_eq!(super::parse_intent(&intent[..cut]), None, "a prefix of {cut} bytes parsed");
+    }
+    assert!(super::parse_intent(&intent).is_some());
+    assert_eq!(super::parse_intent(&super::encode_intent("", "t")), None);
+    assert_eq!(super::parse_intent(&super::encode_intent("t", "")), None);
+    assert_eq!(super::parse_intent(&super::encode_intent("t", "t")), None);
+}
+
+// ---------------------------------------------------------------------------
+// One intent at a time
+// ---------------------------------------------------------------------------
+
+/// Eight sessions renaming their own tables back and forth at once. There is
+/// one `__rename.intent` and one `__rename.partial`: unserialised, one
+/// rename installed another's bytes or deleted its live intent, and one
+/// failed with "No such file or directory".
+///
+/// Mutation: `rename_serial` not taken fails a rename.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_renames_each_finish() {
+    const SESSIONS: usize = 8;
+    const ROUNDS: usize = 6;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(open_db(dir.path()).await);
+    for i in 0..SESSIONS {
+        create(&db, &format!("ra{i}")).await;
+        insert_id(&db, &format!("ra{i}"), i as i32).await;
+    }
+    let mut tasks = Vec::new();
+    for i in 0..SESSIONS {
+        let db = db.clone();
+        tasks.push(tokio::spawn(async move {
+            for round in 0..ROUNDS {
+                let (from, to) = if round % 2 == 0 { ("ra", "rb") } else { ("rb", "ra") };
+                db.rename_table(&format!("{from}{i}"), &format!("{to}{i}"))
+                    .await
+                    .map_err(|e| format!("could not rename {from}{i} to {to}{i} (round {round}): {e}"))?;
+            }
+            Ok::<(), String>(())
+        }));
+    }
+    let mut failures = Vec::new();
+    for t in tasks {
+        if let Err(e) = t.await.unwrap() {
+            failures.push(e);
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+    for i in 0..SESSIONS {
+        assert_eq!(read_ids(&db, &format!("ra{i}")).await, vec![i as i32]);
+    }
+    assert_eq!(intent_files(dir.path()), Vec::<String>::new(), "an intent outlived every rename");
+}
+
+/// The intent on disk while a rename is past its copy is that rename's, with
+/// a second rename started meanwhile: it waits for the first to finish
+/// rather than writing its own over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_rename_waits_for_the_first_intent() {
+    use crate::core::power_loss::failpoint;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(open_db(dir.path()).await);
+    create(&db, "first").await;
+    create(&db, "second").await;
+    let seen = std::sync::Arc::new(parking_lot::Mutex::new(None::<String>));
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+    let parked_tx = parking_lot::Mutex::new(parked_tx);
+    let intent = dir.path().join(super::RENAME_INTENT_FILE);
+    let action: failpoint::Action = {
+        let seen = seen.clone();
+        std::sync::Arc::new(move |_hit| {
+            let _ = parked_tx.lock().send(());
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            *seen.lock() = std::fs::read_to_string(&intent).ok();
+            failpoint::Outcome::Continue
+        })
+    };
+    let guard = failpoint::arm("test.rename.after_copy", dir.path(), 1, action);
+    let first = tokio::spawn({
+        let db = db.clone();
+        async move { db.rename_table("first", "first_moved").await }
+    });
+    tokio::task::spawn_blocking(move || parked_rx.recv_timeout(std::time::Duration::from_secs(30)))
+        .await
+        .unwrap()
+        .expect("the first rename never reached its copy");
+    let second = db.rename_table("second", "second_moved").await;
+    first.await.unwrap().expect("first rename");
+    second.expect("second rename");
+    assert_eq!(guard.fired(), 1);
+    drop(guard);
+    assert_eq!(
+        seen.lock().as_deref().and_then(super::parse_intent),
+        Some(("first".to_string(), "first_moved".to_string())),
+        "the first rename's intent was replaced while it ran"
+    );
+    assert!(db.has_table("first_moved") && db.has_table("second_moved"));
+}
+
+/// An intent whose deletion fails outlives the rename, so both names are
+/// held until the next open finishes it: a table created under the old name
+/// meanwhile would be what that open tombstones.
+///
+/// Mutation: the rename not holding the names lets the CREATE through.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rename_whose_intent_stays_holds_both_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path()).await;
+    create(&db, "kept").await;
+    super::test_hooks::FAIL_INTENT_CLEAR.with(|f| f.set(true));
+    db.rename_table("kept", "kept2").await.expect("the rename itself succeeds");
+    assert!(!super::test_hooks::FAIL_INTENT_CLEAR.with(|f| f.get()), "the intent was never cleared");
+    assert_eq!(intent_files(dir.path()), vec!["__rename.intent".to_string()]);
+    let create_old = CreateTable {
+        table_name: "kept".to_string(),
+        columns: vec![CreateColumnData { name: "id".to_string(), data_type: DbType::I32 }],
+        unique_columns: Vec::new(),
+        foreign_keys: Vec::new(),
+        defaults: Vec::new(),
+        json_columns: Vec::new(),
+        unique_keys: Vec::new(),
+        type_modifiers: Vec::new(),
+        generated: Vec::new(),
+        checks: Vec::new(),
+        primary_key: None,
+        if_not_exists: false,
+        is_immutable: false,
+    };
+    assert!(db.add_table(create_old).await.is_err(), "a table was created under a name the kept intent names");
+    // The next open finishes the rename and frees the name.
+    drop(db);
+    crate::core::wal::remove_for(&dir.path().to_string_lossy());
+    let db = open_db(dir.path()).await;
+    assert!(db.has_table("kept2") && !db.has_table("kept"));
+    assert_eq!(intent_files(dir.path()), Vec::<String>::new());
+}
+
+/// The intent holds one name per line: a name with a line break is refused
+/// before anything is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rename_intent_refuses_control_characters() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(dir.path()).await;
+    create(&db, "plain").await;
+    for bad in ["plain\nplain2", "tab\there", "cr\r"] {
+        let e = db.record_rename_intent("plain", bad).await.expect_err(bad);
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{bad:?}: {e}");
+        assert!(db.rename_table("plain", bad).await.is_err(), "{bad:?}");
+    }
+    assert_eq!(intent_files(dir.path()), Vec::<String>::new());
+    assert!(db.has_table("plain"));
 }

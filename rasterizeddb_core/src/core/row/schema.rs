@@ -10,7 +10,7 @@ use crate::{
     memory_pool::{MEMORY_POOL, MemoryBlock},
 };
 
-const SCHEMA_FIELD_SIZE: u64 = 129 + // up to 128 ascii chars for name + null terminator
+pub(crate) const SCHEMA_FIELD_SIZE: u64 = 129 + // up to 128 ascii chars for name + null terminator
     2 + // db_type u16,
     4 + // size u32,
     8 + // offset u64,
@@ -24,20 +24,143 @@ const SCHEMA_FIELD_CHUNK_SIZE: usize = SCHEMA_FIELD_SIZE as usize * 100;
 /// Number of schema fields to retrieve in a batch
 const BATCH_SIZE: usize = 100;
 
+/// Bit 0 of a field record's spare type byte (130): the column is a
+/// `timestamp` (without time zone). See [`SchemaField::without_time_zone`].
+const TIMESTAMP_WITHOUT_TIME_ZONE: u8 = 0x01;
+
+/// Bit 1 of the spare type byte: the column is `json`, text kept as written.
+/// See [`SchemaField::json_text`]. A build that predates it reads the column
+/// as the text it holds.
+const JSON_TEXT: u8 = 0x02;
+
 const TABLE_SIZE: usize = 129 * 2 + 1; // 128 chars for name  + null terminator and primary key + null terminator
 
-#[derive(Debug, Clone)]
+/// Opens the incarnation record that follows the header in `_schema.db`.
+///
+/// The first byte is one a header cannot start with — a header starts with the
+/// table name in UTF-8, which never holds `0xFF`, or with the `0` of an empty
+/// one — so a reader walking several headers ([`TableSchemaIterator`]) can tell the two
+/// apart. Version 1 in the last byte.
+const INCARNATION_MAGIC: [u8; 8] = [0xFF, b'R', b'Z', b'I', b'N', b'C', 0, 1];
+
+/// The incarnation record: [`INCARNATION_MAGIC`], the incarnation as a
+/// little-endian `u128`, and a CRC-32 of those 24 bytes, little-endian.
+///
+/// After the header, because the header is fixed-width and every binary,
+/// older ones included, reads exactly [`TABLE_SIZE`] bytes of it and nothing
+/// further: an older binary opens a file with the record exactly as it opened
+/// one without. Header rewrites write over the header only, so they keep it.
+const INCARNATION_LEN: usize = INCARNATION_MAGIC.len() + 16 + 4;
+
+/// The incarnation record for `incarnation`.
+fn incarnation_record(incarnation: u128) -> [u8; INCARNATION_LEN] {
+    let mut record = [0u8; INCARNATION_LEN];
+    record[..8].copy_from_slice(&INCARNATION_MAGIC);
+    record[8..24].copy_from_slice(&incarnation.to_le_bytes());
+    let crc = crc32fast::hash(&record[..24]);
+    record[24..].copy_from_slice(&crc.to_le_bytes());
+    record
+}
+
+/// The incarnation `bytes` records, or `None` if they are not a whole,
+/// verifying record of a non-zero incarnation.
+fn parse_incarnation(bytes: &[u8]) -> Option<u128> {
+    let record = bytes.get(..INCARNATION_LEN)?;
+    if record[..8] != INCARNATION_MAGIC {
+        return None;
+    }
+    let crc = u32::from_le_bytes(record[24..].try_into().expect("four bytes"));
+    if crc32fast::hash(&record[..24]) != crc {
+        return None;
+    }
+    let incarnation = u128::from_le_bytes(record[8..24].try_into().expect("sixteen bytes"));
+    (incarnation != 0).then_some(incarnation)
+}
+
+/// A new, random, non-zero incarnation.
+pub fn mint_incarnation() -> u128 {
+    loop {
+        let mut bytes = [0u8; 16];
+        rand::fill(&mut bytes);
+        let incarnation = u128::from_le_bytes(bytes);
+        if incarnation != 0 {
+            return incarnation;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SchemaField {
     pub name: String,
     pub db_type: DbType,
+    /// A `DATETIME` column declared `timestamp` (without time zone) rather
+    /// than `timestamptz`; always `false` for any other type.
+    ///
+    /// The two are stored alike, eight bytes of microseconds, so this is
+    /// metadata: a literal's zone offset is discarded for such a column rather
+    /// than applied (`'… 10:00+02'` stores 10:00, as PostgreSQL stores it), and
+    /// the column is described as `timestamp` and shown with no `+00`
+    /// ([`DbType::TIMESTAMP`], [`SchemaField::literal_type`]).
+    ///
+    /// Persisted in the field record's spare type byte (130), which every
+    /// earlier build wrote as zero and reads past: a table created before this
+    /// existed reads as `timestamptz`, which is what it always behaved as, and
+    /// an earlier build opening a newer table does the same.
+    pub without_time_zone: bool,
+    /// A `STRING` column declared `json`: its bytes are a document as it was
+    /// written, checked to be one when it is ([`DbType::JSONTEXT`],
+    /// [`SchemaField::literal_type`]). Always `false` for any other type.
+    /// Bit 1 of the spare type byte, which an earlier build reads past and so
+    /// reads the column as text.
+    pub json_text: bool,
     pub size: u32,
     pub offset: u64,
     pub write_order: u64,
     pub is_unique: bool,
     pub is_deleted: bool,
+    /// The `s` of a `NUMERIC(p, s)` declaration, when the column has one.
+    ///
+    /// A `DECIMAL` is stored as an `i128` of units scaled by this many decimal
+    /// places, so a comparison against a literal is only meaningful once both
+    /// sides are at the same scale. It lives on the field rather than only in
+    /// the type-modifier sidecar because the query planner has the schema and
+    /// not the sidecar — and without it every predicate over a
+    /// `NUMERIC(p, s)` column with `s` other than the engine default answered
+    /// from a value a power of ten away from the stored one. `WHERE price > 50`
+    /// over a `NUMERIC(10,2)` column returned no rows, and no error.
+    ///
+    /// `None` means the engine default,
+    /// [`crate::core::value_codec::DECIMAL_SCALE`].
+    pub scale: Option<u32>,
+    /// The declared length of a `character(n)` or `character varying(n)`
+    /// column, from its marker in the type-modifier sidecar
+    /// (`type_modifier::TextTypmod`).
+    ///
+    /// On the field for the reason `scale` is: the planner, the tokenizer and
+    /// the evaluator are handed fields, not the sidecar, and a `character(n)`
+    /// column is stored without its trailing spaces, so a literal compared
+    /// with one has to be read the same way (`'b  '` is `'b'`) or the
+    /// comparison answers from a value the column cannot hold.
+    ///
+    /// Packed into four bytes ([`crate::core::rql::type_modifier::PackedTypmod`]);
+    /// read through [`SchemaField::text_typmod`]. A `timestamp(p)`-style
+    /// precision is carried here too.
+    pub typmod_packed: Option<crate::core::rql::type_modifier::PackedTypmod>,
 }
 
 impl SchemaField {
+    /// The column's declared length or precision, when it has one.
+    #[inline]
+    pub fn text_typmod(&self) -> Option<crate::core::rql::type_modifier::TextTypmod> {
+        self.typmod_packed.map(crate::core::rql::type_modifier::PackedTypmod::unpack)
+    }
+
+    /// Sets [`SchemaField::text_typmod`].
+    #[inline]
+    pub fn set_text_typmod(&mut self, typmod: Option<crate::core::rql::type_modifier::TextTypmod>) {
+        self.typmod_packed = typmod.and_then(crate::core::rql::type_modifier::PackedTypmod::pack);
+    }
+
     pub fn new(
         name: String,
         db_type: DbType,
@@ -46,14 +169,43 @@ impl SchemaField {
         write_order: u64,
         is_unique: bool,
     ) -> Self {
+        // `DbType::TIMESTAMP` names a `timestamp` column; it is stored as a
+        // `DATETIME` that carries the flag.
+        let without_time_zone = db_type == DbType::TIMESTAMP;
+        // And `DbType::JSONTEXT` a `json` one, stored as the `STRING` it is.
+        let json_text = db_type == DbType::JSONTEXT;
+        let db_type = if without_time_zone {
+            DbType::DATETIME
+        } else if json_text {
+            DbType::STRING
+        } else {
+            db_type
+        };
         SchemaField {
             name,
             db_type,
+            without_time_zone,
+            json_text,
             size,
             offset,
             write_order,
             is_unique,
+            scale: None,
+            typmod_packed: None,
             is_deleted: false,
+        }
+    }
+
+    /// The type a literal written for this column is read as: its own, except
+    /// that a `timestamp` column reads one as [`DbType::TIMESTAMP`], so a
+    /// zone offset in it is discarded rather than applied.
+    pub fn literal_type(&self) -> DbType {
+        if self.without_time_zone && self.db_type == DbType::DATETIME {
+            DbType::TIMESTAMP
+        } else if self.json_text && self.db_type == DbType::STRING {
+            DbType::JSONTEXT
+        } else {
+            self.db_type.clone()
         }
     }
 
@@ -64,16 +216,17 @@ impl SchemaField {
     pub fn into_vec(&self) -> Vec<u8> {
         let mut vec = vec![0; SCHEMA_FIELD_SIZE as usize];
 
-        // Filter name to contain only ASCII letters and numbers
-        let filtered_name: String = self
-            .name
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-
-        // Copy filtered name bytes into vec (max 128 chars)
-        let name_bytes = filtered_name.as_bytes();
-        let copy_len = std::cmp::min(name_bytes.len(), 128);
+        // The column's name as it is, UTF-8, cut only at a character
+        // boundary within 128 bytes. Filtered to ASCII letters and digits,
+        // as it was, `naïve` came back from the next open as `nave` and
+        // `"日本"` as "", so every statement naming the column failed, and
+        // every insert into a NOT NULL one was refused as a NULL. A record
+        // written that way reads back as written.
+        let name_bytes = self.name.as_bytes();
+        let mut copy_len = name_bytes.len().min(128);
+        while !self.name.is_char_boundary(copy_len) {
+            copy_len -= 1;
+        }
         vec[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
 
         // Name is already null terminated by the initial zeroes
@@ -81,6 +234,15 @@ impl SchemaField {
         // Add type at position 129
         let type_bytes = (self.db_type.to_byte() as u16).to_le_bytes();
         vec[129..129 + 2].copy_from_slice(&type_bytes);
+        // The type's high byte is spare (every type fits the low one, and the
+        // reader has always taken only that): bit 0 marks a `timestamp`
+        // column ([`SchemaField::without_time_zone`]).
+        if self.without_time_zone && self.db_type == DbType::DATETIME {
+            vec[130] |= TIMESTAMP_WITHOUT_TIME_ZONE;
+        }
+        if self.json_text && self.db_type == DbType::STRING {
+            vec[130] |= JSON_TEXT;
+        }
 
         // Add size at position 131
         let size_bytes = self.size.to_le_bytes();
@@ -121,8 +283,10 @@ impl SchemaField {
         };
 
         // Extract type from position 129
-        let db_type_value = u16::from_le_bytes([vec[129], vec[130]]);
-        let db_type = DbType::from_byte(db_type_value as u8);
+        let db_type = DbType::from_byte(vec[129]);
+        let without_time_zone =
+            db_type == DbType::DATETIME && vec[130] & TIMESTAMP_WITHOUT_TIME_ZONE != 0;
+        let json_text = db_type == DbType::STRING && vec[130] & JSON_TEXT != 0;
 
         // Extract size from position 131
         let size = u32::from_le_bytes([vec[131], vec[132], vec[133], vec[134]]);
@@ -144,22 +308,42 @@ impl SchemaField {
         Ok(SchemaField {
             name,
             db_type,
+            without_time_zone,
+            json_text,
             size,
             offset,
             write_order,
             is_unique,
             is_deleted,
+            // Not part of the persisted record. `TableSchema::load` fills it in
+            // from the type-modifier sidecar once every field has been read.
+            scale: None,
+            typmod_packed: None,
         })
     }
 
     pub async fn save_field(&self, io: &mut impl StorageIO) -> io::Result<()> {
-        let data = self.into_vec();
-
-        // True only if appending multiple fields in a batch, no background service is running.
-        io.append_data(&data, true).await;
-
-        Ok(())
+        // A logged append committed here, so a write that fails (a full disk,
+        // a file-size limit, a key/value put) is this call's error: the
+        // immediate `append_data` only logged it, and a CREATE then reported
+        // a column its files did not hold.
+        append_committed(io, &self.into_vec()).await
     }
+}
+
+/// Appends `bytes` to the file `io` writes and commits it, returning the
+/// append's or the commit's error: what the immediate `append_data` does,
+/// except that its failure (a full disk, a file-size limit, a refused
+/// key/value put) was only logged there. The commit is the deferred kind, as
+/// before: durable with the statement's next log sync, or, on a key/value
+/// store, once its family has stored it. It also lands any staged bytes of
+/// the file (`commit_durable`), which the immediate append did not: harmless,
+/// since schema and field files are only ever appended immediately and never
+/// stage.
+pub(crate) async fn append_committed<S: StorageIO>(io: &S, bytes: &[u8]) -> io::Result<()> {
+    let txn = io.begin_txn();
+    let (_, token) = io.append_data_txn(txn, bytes).await;
+    io.commit_durable(token).await
 }
 
 #[derive(Debug, Clone, Default)]
@@ -179,7 +363,7 @@ impl SchemaCalculator {
             //println!("Field: {} - Offset: {}", field.name, offset);
             offset = offset.saturating_add(field.size as u32);
         }
-        
+
         (0, 0)
     }
 }
@@ -287,48 +471,59 @@ impl<'a, S: StorageIO> SchemaFieldIterator<'a, S> {
 
     /// Get the next SchemaField from the buffer, loading a new chunk if necessary
     pub async fn next_schema_field(&mut self) -> io::Result<Option<SchemaField>> {
-        // If we've reached the end of the data, return None
-        if self.end_of_data {
-            return Ok(None);
-        }
-
-        // If we've reached the end of the current buffer, load the next chunk
-        if self.buffer_index >= self.buffer_valid_length {
-            self.load_next_chunk().await?;
-
-            // If loading the next chunk reached the end of data, return None
+        loop {
+            // If we've reached the end of the data, return None
             if self.end_of_data {
                 return Ok(None);
             }
-        }
 
-        // If the remaining buffer is smaller than a single field, load the next chunk
-        if self.buffer_index + SCHEMA_FIELD_SIZE as usize > self.buffer_valid_length {
-            self.load_next_chunk().await?;
-            if self.end_of_data {
-                return Ok(None);
+            // If we've reached the end of the current buffer, load the next chunk
+            if self.buffer_index >= self.buffer_valid_length {
+                self.load_next_chunk().await?;
+
+                // If loading the next chunk reached the end of data, return None
+                if self.end_of_data {
+                    return Ok(None);
+                }
             }
-        }
 
-        // Extract the schema field data from the buffer
-        let field_data = &self.buffer.into_slice()
-            [self.buffer_index..self.buffer_index + SCHEMA_FIELD_SIZE as usize];
-
-        // Parse the SchemaField from the buffer
-        let schema_field = match SchemaField::from_vec(field_data) {
-            Ok(field) => field,
-            Err(_e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Failed to parse SchemaField.",
-                ));
+            // If the remaining buffer is smaller than a single field, load the next chunk
+            if self.buffer_index + SCHEMA_FIELD_SIZE as usize > self.buffer_valid_length {
+                self.load_next_chunk().await?;
+                if self.end_of_data {
+                    return Ok(None);
+                }
             }
-        };
 
-        // Advance the buffer index
-        self.buffer_index += SCHEMA_FIELD_SIZE as usize;
+            // Extract the schema field data from the buffer
+            let field_data = &self.buffer.into_slice()
+                [self.buffer_index..self.buffer_index + SCHEMA_FIELD_SIZE as usize];
 
-        Ok(Some(schema_field))
+            // A record of zeros is no column (every one has a name): the
+            // remains of an append a power cut kept the length of and dropped
+            // the page of (`torn_tail::is_unwritten`). Read, it was a column
+            // named "" at write order 0.
+            if crate::core::torn_tail::is_unwritten(field_data) {
+                self.buffer_index += SCHEMA_FIELD_SIZE as usize;
+                continue;
+            }
+
+            // Parse the SchemaField from the buffer
+            let schema_field = match SchemaField::from_vec(field_data) {
+                Ok(field) => field,
+                Err(_e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Failed to parse SchemaField.",
+                    ));
+                }
+            };
+
+            // Advance the buffer index
+            self.buffer_index += SCHEMA_FIELD_SIZE as usize;
+
+            return Ok(Some(schema_field));
+        }
     }
 
     /// Get multiple SchemaFields at once, up to BATCH_SIZE
@@ -351,41 +546,62 @@ impl<'a, S: StorageIO> SchemaFieldIterator<'a, S> {
     }
 }
 
+/// Every declaration list but `fields` is a `Vec`, not an inline `SmallVec`:
+/// almost every table has none of them, and inline they were 2.4 KB of empty
+/// slots in every schema — one per open table, and in every clone. See the
+/// `table_schema_stays_small` test.
 #[derive(Debug, Clone)]
 pub struct TableSchema {
     pub name: String,
     pub fields: SmallVec<[SchemaField; 20]>,
     pub primary_key: Option<String>,
-    pub indexes: SmallVec<[TableIndex; 4]>,
     pub is_immutable: bool,
     /// Foreign keys this table declares, loaded from its sidecar.
-    pub foreign_keys: SmallVec<[crate::core::rql::foreign_key::ForeignKey; 4]>,
+    pub foreign_keys: Vec<crate::core::rql::foreign_key::ForeignKey>,
     /// `DEFAULT` expressions, loaded from their sidecar.
-    pub defaults: SmallVec<[crate::core::rql::column_default::ColumnDefault; 8]>,
+    pub defaults: Vec<crate::core::rql::column_default::ColumnDefault>,
     /// Columns declared `JSON`/`JSONB`, each backed by its own table.
-    pub json_columns: SmallVec<[crate::core::rql::json_map::JsonColumn; 4]>,
+    pub json_columns: Vec<crate::core::rql::json_map::JsonColumn>,
     /// Indexes declared over a path into a document column.
     ///
     /// Read from a sidecar like the other declarations. Unlike them it changes
     /// no row layout — it says which paths the filter index should carry, and
     /// nothing else about the table depends on it.
-    pub path_indexes: SmallVec<[crate::core::rql::path_index::PathIndex; 4]>,
+    pub path_indexes: Vec<crate::core::rql::path_index::PathIndex>,
+    /// Indexes declared by `CREATE INDEX`, loaded from their sidecar. The
+    /// implicit ones a `PRIMARY KEY` or `UNIQUE` constraint brings are not
+    /// recorded here: they are derived from the constraints when the table
+    /// opens. See [`crate::core::index`].
+    pub secondary_indexes: Vec<crate::core::index::IndexDecl>,
     /// Table-level `UNIQUE` constraints, composite ones included, loaded from
     /// their sidecar. A single-column `UNIQUE` written inline on a column is
     /// recorded on the field instead, as `SchemaField::is_unique`.
-    pub unique_keys: SmallVec<[crate::core::rql::unique_key::UniqueKey; 4]>,
+    pub unique_keys: Vec<crate::core::rql::unique_key::UniqueKey>,
     /// Declared precision and scale per column — the `(p, s)` of
     /// `NUMERIC(p, s)`, loaded from their sidecar. A column with no entry keeps
     /// the engine's default scale, which is what its rows were written with.
-    pub type_modifiers: SmallVec<[crate::core::rql::type_modifier::TypeModifier; 8]>,
+    pub type_modifiers: Vec<crate::core::rql::type_modifier::TypeModifier>,
+    /// `CHECK` constraints, loaded from their sidecar.
+    pub checks: Vec<crate::core::rql::check::CheckConstraint>,
+    /// `GENERATED ALWAYS AS (…) STORED` expressions, loaded from their sidecar.
+    ///
+    /// Separate from `defaults` because the two differ in when they apply — see
+    /// [`crate::core::rql::generated`].
+    pub generated: Vec<crate::core::rql::generated::GeneratedColumn>,
+    /// Which incarnation of the table under this name this is (C7): random,
+    /// minted by [`TableSchema::new`], so a table created — or dropped and
+    /// created again, which an `ALTER` rewrite does — gets a new one, and kept
+    /// by every rewrite of the header (`RENAME`, `PRIMARY KEY`).
+    ///
+    /// Recorded after the header in `_schema.db` (see [`INCARNATION_LEN`]),
+    /// where a binary that predates it never reads. `0` means none is
+    /// recorded: a file written before it existed, or one whose record does not
+    /// verify. Anything derived from the table and kept on disk (an index
+    /// snapshot) records the incarnation it was taken from and is trusted only
+    /// while it matches, and `0` never does.
+    pub incarnation: u128,
 }
 
-#[derive(Debug, Clone)]
-pub struct TableIndex {
-    pub name: String,
-    pub fields: Vec<String>,
-    pub is_unique: bool,
-}
 
 impl TableSchema {
     pub fn new(name: String, is_immutable: bool) -> Self {
@@ -393,14 +609,17 @@ impl TableSchema {
             name,
             fields: SmallVec::new(),
             primary_key: None,
-            indexes: SmallVec::new(),
             is_immutable,
-            foreign_keys: SmallVec::new(),
-            defaults: SmallVec::new(),
-            json_columns: SmallVec::new(),
-            path_indexes: SmallVec::new(),
-            unique_keys: SmallVec::new(),
-            type_modifiers: SmallVec::new(),
+            foreign_keys: Vec::new(),
+            defaults: Vec::new(),
+            json_columns: Vec::new(),
+            path_indexes: Vec::new(),
+            secondary_indexes: Vec::new(),
+            unique_keys: Vec::new(),
+            type_modifiers: Vec::new(),
+            generated: Vec::new(),
+            checks: Vec::new(),
+            incarnation: mint_incarnation(),
         }
     }
 
@@ -424,6 +643,19 @@ impl TableSchema {
             Ok(s) => s,
             Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
         };
+        // The incarnation record after the header, if the file has one. A
+        // record that is missing, short, unreadable or does not verify leaves
+        // `0`, which nothing derived from the table is ever trusted against.
+        if schema_len >= (TABLE_SIZE + INCARNATION_LEN) as u64 {
+            let mut record = [0u8; INCARNATION_LEN];
+            if schema_io
+                .read_data_into_buffer(&mut (TABLE_SIZE as u64), &mut record)
+                .await
+                .is_ok()
+            {
+                table_schema.incarnation = parse_incarnation(&record).unwrap_or(0);
+            }
+        }
         let mut field_io = schema_io
             .create_new(format!(
                 "{}_{}",
@@ -485,18 +717,40 @@ impl TableSchema {
         deduped.sort_by_key(|f| f.write_order);
 
         table_schema.fields = deduped;
-        table_schema.foreign_keys =
-            crate::core::rql::foreign_key::load(schema_io.clone()).await;
-        table_schema.defaults =
-            crate::core::rql::column_default::load(schema_io.clone()).await;
-        table_schema.json_columns =
-            crate::core::rql::json_map::load(schema_io.clone()).await;
-        table_schema.path_indexes =
-            crate::core::rql::path_index::load(schema_io.clone()).await;
-        table_schema.unique_keys =
-            crate::core::rql::unique_key::load(schema_io.clone()).await;
+        table_schema.foreign_keys = crate::core::rql::foreign_key::load(schema_io.clone()).await;
+        table_schema.defaults = crate::core::rql::column_default::load(schema_io.clone()).await;
+        table_schema.json_columns = crate::core::rql::json_map::load(schema_io.clone()).await;
+        table_schema.path_indexes = crate::core::rql::path_index::load(schema_io.clone()).await;
+        table_schema.secondary_indexes = crate::core::index::decl::load(schema_io.clone()).await;
+        table_schema.unique_keys = crate::core::rql::unique_key::load(schema_io.clone()).await;
         table_schema.type_modifiers =
             crate::core::rql::type_modifier::load(schema_io.clone()).await;
+        // Copied onto the fields, because the planner is handed the schema and
+        // never sees the sidecar. See `SchemaField::scale`.
+        for field in table_schema.fields.iter_mut() {
+            field.scale = table_schema
+                .type_modifiers
+                .iter()
+                .find(|m| m.column.eq_ignore_ascii_case(&field.name) && !m.is_deleted)
+                .map(|m| m.scale as u32);
+            // And the declared text length, for the same reason.
+            let typmod = (!field.is_deleted)
+                .then(|| crate::core::rql::type_modifier::text_typmod_of(&field.name, &table_schema.type_modifiers))
+                .flatten();
+            field.set_text_typmod(typmod);
+        }
+        table_schema.generated = crate::core::rql::generated::load(schema_io.clone()).await;
+        table_schema.checks = crate::core::rql::check::load(schema_io.clone()).await;
+        // A check this binary keeps unenforced, or cannot compile (stored by
+        // an older one), is said in the log when the table opens: it was said
+        // only to the session that declared it.
+        for check in table_schema.checks.iter().filter(|c| !c.is_deleted) {
+            match crate::core::rql::executor::check_status(&check.expression, &table_schema.fields) {
+                Ok(None) => {}
+                Ok(Some(why)) => crate::core::rql::executor::report_unenforced_once(&table_schema.name, &check.name, &why, true),
+                Err(why) => crate::core::rql::executor::report_unenforced_once(&table_schema.name, &check.name, &why, false),
+            }
+        }
 
         Ok(table_schema)
     }
@@ -505,29 +759,29 @@ impl TableSchema {
         // Always create a buffer of TABLE_SIZE (129*2) bytes, initialized with zeros
         let mut vec = vec![0; TABLE_SIZE];
 
-        // Filter name to contain only ASCII letters and numbers
-        let filtered_name: String = self
-            .name
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-
-        // Copy filtered name bytes into vec (max 128 chars)
-        let name_bytes = filtered_name.as_bytes();
-        let copy_len = std::cmp::min(name_bytes.len(), 128);
+        // The table's name as it is, UTF-8, cut only at a character boundary
+        // within 128 bytes, as the column names are.
+        let name_bytes = self.name.as_bytes();
+        let mut copy_len = name_bytes.len().min(128);
+        while !self.name.is_char_boundary(copy_len) {
+            copy_len -= 1;
+        }
         vec[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
         // The null terminator is already there from initializing with zeros
 
-        // Primary key bytes (starting at position 129)
+        // Primary key bytes (starting at position 129): the column's name as
+        // it is, UTF-8, cut only at a character boundary within 128 bytes.
+        // It must name the column exactly. Filtered to ASCII letters and
+        // digits, as it was, `"日本"` was recorded as "" and `naïve` as
+        // `nave`, and from the next open every insert was refused as a NULL
+        // in a column of that name. A header written that way reads back as
+        // written.
         if let Some(primary_key) = &self.primary_key {
-            // Filter primary key to ASCII letters and numbers
-            let filtered_pk: String = primary_key
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-
-            let pk_bytes = filtered_pk.as_bytes();
-            let pk_copy_len = std::cmp::min(pk_bytes.len(), 128);
+            let pk_bytes = primary_key.as_bytes();
+            let mut pk_copy_len = pk_bytes.len().min(128);
+            while !primary_key.is_char_boundary(pk_copy_len) {
+                pk_copy_len -= 1;
+            }
             vec[129..(129 + pk_copy_len)].copy_from_slice(&pk_bytes[..pk_copy_len]);
             // The null terminator is already there from initializing with zeros
         }
@@ -573,25 +827,33 @@ impl TableSchema {
             name,
             fields: SmallVec::new(), // Fields are stored separately
             primary_key,
-            indexes: SmallVec::new(), // Indexes are stored separately,
             is_immutable: immutable,
             // Foreign keys and defaults live in their own sidecars; `load`
             // fills them in.
-            foreign_keys: SmallVec::new(),
-            defaults: SmallVec::new(),
-            json_columns: SmallVec::new(),
-            path_indexes: SmallVec::new(),
-            unique_keys: SmallVec::new(),
-            type_modifiers: SmallVec::new(),
+            foreign_keys: Vec::new(),
+            defaults: Vec::new(),
+            json_columns: Vec::new(),
+            path_indexes: Vec::new(),
+            secondary_indexes: Vec::new(),
+            unique_keys: Vec::new(),
+            type_modifiers: Vec::new(),
+            generated: Vec::new(),
+            checks: Vec::new(),
+            // Not part of the header; `load` reads it from the record after.
+            incarnation: 0,
         })
     }
 
     pub async fn save<S: StorageIO>(&self, schema_io: Arc<S>) -> io::Result<()> {
-        let data = self.into_vec();
-        // Schema is small and critical; persist immediately so CREATE TABLE is durable
-        // even if the process crashes before any background flush runs.
-        schema_io.append_data(&data, true).await;
-        Ok(())
+        let mut data = self.into_vec();
+        // In the same append as the header, so a schema file never holds a
+        // header whose record is still to come.
+        if self.incarnation != 0 {
+            data.extend_from_slice(&incarnation_record(self.incarnation));
+        }
+        // Committed here, so a failed write is the caller's error rather than
+        // a log line (`append_committed`).
+        append_committed(&*schema_io, &data).await
     }
 
     /// Overwrites the header record without appending a second one.
@@ -600,13 +862,15 @@ impl TableSchema {
     /// every time after: the file is a `TABLE_SIZE` header followed by field
     /// records, so a second append would be read back as a malformed field. The
     /// header is fixed-width and lives at offset zero, so writing over it is
-    /// exact.
+    /// exact, and leaves the incarnation record after it as it was.
     pub async fn rewrite_header<S: StorageIO>(&self, schema_io: Arc<S>) -> io::Result<()> {
         let data = self.into_vec();
         schema_io.write_data(0, &data).await;
         Ok(())
     }
 
+    /// [`Self::try_add_field`] for a caller with nowhere to send its error,
+    /// which is logged. The field is kept only once its record is written.
     pub async fn add_field<S: StorageIO>(
         &mut self,
         schema_io: Arc<S>,
@@ -614,6 +878,38 @@ impl TableSchema {
         db_type: DbType,
         is_unique: bool,
     ) {
+        if let Err(e) = self.try_add_field(schema_io, field_name.clone(), db_type, is_unique).await {
+            log::error!("column {field_name} of {} could not be recorded: {e}", self.name);
+        }
+    }
+
+    /// Adds a field and writes its record, returning the write's error. The
+    /// field joins `self.fields` only once its record is written: a schema
+    /// holding a column its file does not would lose it at the next open.
+    pub async fn try_add_field<S: StorageIO>(
+        &mut self,
+        schema_io: Arc<S>,
+        field_name: String,
+        db_type: DbType,
+        is_unique: bool,
+    ) -> io::Result<()> {
+        let size = db_type.get_size();
+        self.try_add_field_sized(schema_io, field_name, db_type, size, is_unique).await
+    }
+
+    /// [`Self::try_add_field`] with the slot width given: an unconstrained
+    /// NUMERIC that keeps each value's own scale is
+    /// `value_codec::NUMERIC_OWN_SCALE_SIZE` wide, not the type's sixteen. The
+    /// caller has marked the database (`Database::require_numeric_own_scale`)
+    /// before asking for that width.
+    pub async fn try_add_field_sized<S: StorageIO>(
+        &mut self,
+        schema_io: Arc<S>,
+        field_name: String,
+        db_type: DbType,
+        size: u32,
+        is_unique: bool,
+    ) -> io::Result<()> {
         let mut field_io = schema_io
             .create_new(format!(
                 "{}_{}",
@@ -632,7 +928,7 @@ impl TableSchema {
         // equal, so a SELECT could be served the WHERE clause's columns instead
         // of the ones it asked for.
         if self.fields.iter().any(|f| f.name == field_name) {
-            return;
+            return Ok(());
         }
 
         let offset: u64 = self.fields.iter().map(|f| f.size as u64).sum();
@@ -644,17 +940,11 @@ impl TableSchema {
             .map(|m| m + 1)
             .unwrap_or(0);
 
-        let field = SchemaField::new(
-            field_name,
-            db_type.clone(),
-            db_type.get_size(),
-            offset,
-            write_order,
-            is_unique,
-        );
+        let field = SchemaField::new(field_name, db_type.clone(), size, offset, write_order, is_unique);
 
-        _ = field.save_field(&mut field_io).await;
+        field.save_field(&mut field_io).await?;
         self.fields.push(field);
+        Ok(())
     }
 
     /// Renames a field in the schema and in its persisted record.
@@ -708,10 +998,14 @@ impl TableSchema {
         for field in all_fields.iter_mut() {
             if field.name.eq_ignore_ascii_case(from) {
                 field.name = to.to_string();
-                let mut vec = field.into_vec();
-                field_io
-                    .write_data_seek(io::SeekFrom::Start(position), &mut vec)
-                    .await;
+                let vec = field.into_vec();
+                // Through the log, not `write_data_seek`. The record being
+                // overwritten went in as a logged append, and every open
+                // replays the log: an unlogged overwrite was undone by that
+                // replay, so a rename came back under the old name after a
+                // restart — with the defaults, scale and companion already
+                // moved to the new one.
+                field_io.write_data(position, &vec).await;
                 found = true;
                 break;
             }
@@ -733,10 +1027,6 @@ impl TableSchema {
 
     pub fn set_primary_key(&mut self, primary_key: String) {
         self.primary_key = Some(primary_key);
-    }
-
-    pub fn add_index(&mut self, index: TableIndex) {
-        self.indexes.push(index);
     }
 
     /// Clears a column's `UNIQUE` flag, persisting it the way
@@ -770,10 +1060,11 @@ impl TableSchema {
         for field in all_fields.iter_mut() {
             if field.name.eq_ignore_ascii_case(field_name) {
                 field.is_unique = unique;
-                let mut vec = field.into_vec();
-                field_io
-                    .write_data_seek(io::SeekFrom::Start(position), &mut vec)
-                    .await;
+                let vec = field.into_vec();
+                // Logged, as `rename_field` explains: unlogged, the replay at
+                // the next open restored the flag and the dropped UNIQUE was
+                // enforced again.
+                field_io.write_data(position, &vec).await;
                 break;
             }
             position += SCHEMA_FIELD_SIZE;
@@ -806,10 +1097,11 @@ impl TableSchema {
         for field in all_fields.iter_mut() {
             if field.name == field_name {
                 field.is_deleted = true;
-                let mut vec = field.into_vec();
-                field_io
-                    .write_data_seek(io::SeekFrom::Start(position), &mut vec)
-                    .await;
+                let vec = field.into_vec();
+                // Logged, as `rename_field` explains: unlogged, the replay at
+                // the next open put the original record back and the dropped
+                // column returned.
+                field_io.write_data(position, &vec).await;
                 break;
             }
             position += SCHEMA_FIELD_SIZE;
@@ -928,22 +1220,34 @@ impl<S: StorageIO> TableSchemaIterator<S> {
             return Ok(None);
         }
 
-        // If we've reached the end of the current buffer, load the next chunk
-        if self.buffer_index >= self.buffer_valid_length {
+        // A header and the incarnation record after it are read from one
+        // buffer. Records put headers off the chunk grid, so when this buffer
+        // holds less than both and the file has more, the next chunk starts at
+        // the first unread byte rather than past the end of this buffer, which
+        // would cut whatever straddles the boundary.
+        if self.buffer_index + TABLE_SIZE + INCARNATION_LEN > self.buffer_valid_length
+            && self.position < self.total_length as u64
+        {
+            self.position -= (self.buffer_valid_length - self.buffer_index) as u64;
             self.load_next_chunk().await?;
-
-            // If loading the next chunk reached the end of data, return None
             if self.end_of_data {
                 return Ok(None);
             }
         }
 
-        // If the remaining buffer is smaller than a single table schema, load the next chunk
+        // A record this buffer holds without its header (one that did not
+        // verify after it) is stepped over; no header starts with that byte.
+        if self.buffer.into_slice()[..self.buffer_valid_length].get(self.buffer_index)
+            == Some(&INCARNATION_MAGIC[0])
+        {
+            self.buffer_index =
+                (self.buffer_index + INCARNATION_LEN).min(self.buffer_valid_length);
+        }
+
+        // Fewer bytes than a header left in the file: the end.
         if self.buffer_index + TABLE_SIZE > self.buffer_valid_length {
-            self.load_next_chunk().await?;
-            if self.end_of_data {
-                return Ok(None);
-            }
+            self.end_of_data = true;
+            return Ok(None);
         }
 
         // Extract the table schema data from the buffer
@@ -980,7 +1284,9 @@ impl<S: StorageIO> TableSchemaIterator<S> {
             let _ = field_io.read_data_into_buffer(&mut pos, &mut buf).await;
             let mut idx = 0usize;
             while idx + SCHEMA_FIELD_SIZE as usize <= total_len {
-                if let Ok(field) = SchemaField::from_vec(&buf[idx..idx + SCHEMA_FIELD_SIZE as usize]) {
+                if let Ok(field) =
+                    SchemaField::from_vec(&buf[idx..idx + SCHEMA_FIELD_SIZE as usize])
+                {
                     table_schema.fields.push(field);
                 }
                 idx += SCHEMA_FIELD_SIZE as usize;
@@ -999,8 +1305,15 @@ impl<S: StorageIO> TableSchemaIterator<S> {
             }
         }
 
-        // Advance the buffer index
+        // Advance the buffer index, past the incarnation record too if one
+        // follows.
         self.buffer_index += TABLE_SIZE;
+        if let Some(incarnation) = parse_incarnation(
+            &self.buffer.into_slice()[self.buffer_index..self.buffer_valid_length],
+        ) {
+            table_schema.incarnation = incarnation;
+            self.buffer_index += INCARNATION_LEN;
+        }
 
         Ok(Some(table_schema))
     }
@@ -1014,6 +1327,19 @@ impl<S: StorageIO> TableSchemaIterator<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One `TableSchema` per open table, and one more in every clone. With
+    /// nine inline `SmallVec`s of declarations it was 3720 bytes, about 2.4 KB
+    /// of that empty slots, since almost no table declares any of them. 1408
+    /// before the 16-byte incarnation; 1744 since each of the twenty inline
+    /// fields carries its declared text length (`SchemaField::text_typmod`, 8
+    /// bytes) and `DbType` grew to 4 bytes for `BPCHAR`'s length.
+    #[test]
+    fn table_schema_stays_small() {
+        let size = std::mem::size_of::<TableSchema>();
+        assert!(size <= 1744, "TableSchema grew to {size} bytes");
+        assert!(std::mem::size_of::<SchemaField>() <= 64, "SchemaField grew");
+    }
     use crate::core::{db_type::DbType, storage_providers::file_sync::LocalStorageProvider};
     use std::{fs, io, path::Path};
 
@@ -1062,10 +1388,8 @@ mod tests {
     async fn test_schema_field_iterator_empty() {
         let temp_loc = std::env::temp_dir().join("test_schema_field_iterator_empty");
 
-        let mut mock_io = make_clean_provider(
-            temp_loc.as_path(),
-            "test_schema_field_iterator_empty",
-        ).await;
+        let mut mock_io =
+            make_clean_provider(temp_loc.as_path(), "test_schema_field_iterator_empty").await;
 
         let mut iterator = SchemaFieldIterator::new(&mut mock_io).await.unwrap();
 
@@ -1083,7 +1407,8 @@ mod tests {
         let mut mock_io = make_clean_provider(
             temp_loc.as_path(),
             "test_schema_field_iterator_single_field",
-        ).await;
+        )
+        .await;
 
         save_schema_field(&schema_field, &mut mock_io)
             .await
@@ -1121,10 +1446,8 @@ mod tests {
 
         let temp_loc = std::env::temp_dir().join("test_schema_field_iterator_2_fields");
 
-        let mut mock_io = make_clean_provider(
-            temp_loc.as_path(),
-            "test_schema_field_iterator_2_fields",
-        ).await;
+        let mut mock_io =
+            make_clean_provider(temp_loc.as_path(), "test_schema_field_iterator_2_fields").await;
 
         save_schema_field(&schema_field1, &mut mock_io)
             .await
@@ -1175,10 +1498,8 @@ mod tests {
 
         let temp_loc = std::env::temp_dir().join("test_schema_field_iterator_3_fields");
 
-        let mut mock_io = make_clean_provider(
-            temp_loc.as_path(),
-            "test_schema_field_iterator_3_fields",
-        ).await;
+        let mut mock_io =
+            make_clean_provider(temp_loc.as_path(), "test_schema_field_iterator_3_fields").await;
 
         save_schema_field(&schema_field1, &mut mock_io)
             .await
@@ -1244,7 +1565,8 @@ mod tests {
         let mut mock_io = make_clean_provider(
             temp_loc.as_path(),
             "test_schema_field_iterator_batch_retrieval",
-        ).await;
+        )
+        .await;
 
         // Create and save multiple schema fields (more than BATCH_SIZE)
         for i in 0..BATCH_SIZE + 10 {
@@ -1289,10 +1611,8 @@ mod tests {
     async fn test_schema_field_iterator_reset() {
         let temp_loc = std::env::temp_dir().join("test_schema_field_iterator_reset");
 
-        let mut mock_io = make_clean_provider(
-            temp_loc.as_path(),
-            "test_schema_field_iterator_reset",
-        ).await;
+        let mut mock_io =
+            make_clean_provider(temp_loc.as_path(), "test_schema_field_iterator_reset").await;
 
         // Create and save schema fields
         let schema_field1 = create_test_schema_field("id", DbType::I32, 0, 1, true);
@@ -1439,7 +1759,9 @@ mod tests {
 
         let mock_io = LocalStorageProvider::new(
             temp_loc.to_str().unwrap(),
-            Some("test_table_schema_serialize_deserialize")).await;
+            Some("test_table_schema_serialize_deserialize"),
+        )
+        .await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1481,7 +1803,9 @@ mod tests {
 
         let mock_io = LocalStorageProvider::new(
             temp_loc.to_str().unwrap(),
-            Some("test_table_schema_mutability")).await;
+            Some("test_table_schema_mutability"),
+        )
+        .await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1504,7 +1828,9 @@ mod tests {
 
         let mock_io = LocalStorageProvider::new(
             temp_loc.to_str().unwrap(),
-            Some("test_table_schema_mutability_2")).await;
+            Some("test_table_schema_mutability_2"),
+        )
+        .await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1521,6 +1847,70 @@ mod tests {
         assert_eq!(schema.is_immutable, false);
     }
 
+    /// A column's name reads back exactly as written: a quoted identifier may
+    /// hold any character, and the record is what every open reads it from.
+    #[test]
+    fn a_column_name_reads_back_as_written() {
+        for name in ["naïve", "日本", "with space", "a-b", &"é".repeat(70)] {
+            let field = create_test_schema_field(name, DbType::I32, 0, 0, false);
+            let back = SchemaField::from_vec(&field.into_vec()).unwrap().name;
+            if name.len() <= 128 {
+                assert_eq!(back, name);
+            } else {
+                assert_eq!(back, "é".repeat(64));
+            }
+        }
+    }
+
+    /// A `json` column's flag rides beside it, bit 1: it reads back, and the
+    /// low byte says `STRING` (14), so an earlier build opens the column as
+    /// the text it holds. On another type the bit means nothing.
+    #[test]
+    fn a_json_column_keeps_its_flag_in_the_record() {
+        let js = SchemaField::new("d".into(), DbType::JSONTEXT, 12, 0, 0, false);
+        assert_eq!((js.db_type.clone(), js.json_text), (DbType::STRING, true));
+        let bytes = js.into_vec();
+        assert_eq!((bytes[129], bytes[130]), (14, 2));
+        let back = SchemaField::from_vec(&bytes).unwrap();
+        assert_eq!((back.db_type.clone(), back.json_text, back.without_time_zone), (DbType::STRING, true, false));
+        assert_eq!(back.literal_type(), DbType::JSONTEXT);
+
+        let text = SchemaField::new("t".into(), DbType::STRING, 12, 0, 0, false).into_vec();
+        assert_eq!(text[130], 0);
+        assert!(!SchemaField::from_vec(&text).unwrap().json_text);
+        let mut other = SchemaField::new("n".into(), DbType::I64, 8, 0, 0, false).into_vec();
+        other[130] = 2;
+        assert!(!SchemaField::from_vec(&other).unwrap().json_text);
+    }
+
+    /// A `timestamp` column's flag rides in the record's spare type byte: it
+    /// reads back, a `timestamptz` and every other type read back without it,
+    /// and the low byte an earlier build reads the type from is unchanged
+    /// (`DATETIME`, 15), so such a build opens the table as the `timestamptz`
+    /// it always took the column for.
+    #[test]
+    fn a_timestamp_column_keeps_its_flag_in_the_record() {
+        let ts = SchemaField::new("at".into(), DbType::TIMESTAMP, 8, 0, 0, false);
+        assert_eq!((ts.db_type.clone(), ts.without_time_zone), (DbType::DATETIME, true));
+        let bytes = ts.into_vec();
+        assert_eq!((bytes[129], bytes[130]), (15, 1));
+        let back = SchemaField::from_vec(&bytes).unwrap();
+        assert_eq!((back.db_type.clone(), back.without_time_zone), (DbType::DATETIME, true));
+        assert_eq!(back.literal_type(), DbType::TIMESTAMP);
+
+        let tz = SchemaField::new("at".into(), DbType::DATETIME, 8, 0, 0, false);
+        let bytes = tz.into_vec();
+        assert_eq!((bytes[129], bytes[130]), (15, 0));
+        let back = SchemaField::from_vec(&bytes).unwrap();
+        assert!(!back.without_time_zone);
+        assert_eq!(back.literal_type(), DbType::DATETIME);
+
+        // The bit means nothing on another type.
+        let mut other = SchemaField::new("n".into(), DbType::I64, 8, 0, 0, false).into_vec();
+        other[130] = 1;
+        assert!(!SchemaField::from_vec(&other).unwrap().without_time_zone);
+    }
+
     #[test]
     fn test_table_schema_special_chars() {
         // Create schema with special characters in name and primary key
@@ -1533,19 +1923,29 @@ mod tests {
         // Deserialize
         let deserialized = TableSchema::from_vec(&vec).unwrap();
 
-        // Verify filtered content (only alphanumeric characters)
-        assert_eq!(deserialized.name, "users123");
-        assert_eq!(deserialized.primary_key, Some("id123".to_string()));
+        // Both names read back exactly as written.
+        assert_eq!(deserialized.name, "users!@#123");
+        assert_eq!(deserialized.primary_key, Some("id!@#123".to_string()));
+
+        for pk in ["日本", "naïve", "with space", &"é".repeat(70)] {
+            let mut s = TableSchema::new("t".to_string(), false);
+            s.set_primary_key(pk.to_string());
+            let back = TableSchema::from_vec(&s.into_vec()).unwrap().primary_key.unwrap();
+            if pk.len() <= 128 {
+                assert_eq!(back, pk);
+            } else {
+                // Cut at a character boundary within 128 bytes, never inside one.
+                assert_eq!(back, "é".repeat(64));
+            }
+        }
     }
 
     #[tokio::test]
     async fn test_table_schema_iterator_empty() {
         let temp_loc = std::env::temp_dir().join("test_table_schema_iterator_empty");
 
-        let mock_io = make_clean_provider(
-            temp_loc.as_path(),
-            "test_table_schema_iterator_empty",
-        ).await;
+        let mock_io =
+            make_clean_provider(temp_loc.as_path(), "test_table_schema_iterator_empty").await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1565,7 +1965,8 @@ mod tests {
         let mock_io = make_clean_provider(
             temp_loc.as_path(),
             "test_table_schema_iterator_single_schema",
-        ).await;
+        )
+        .await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1597,7 +1998,8 @@ mod tests {
         let mock_io = make_clean_provider(
             temp_loc.as_path(),
             "test_table_schema_iterator_multiple_schemas",
-        ).await;
+        )
+        .await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1632,10 +2034,8 @@ mod tests {
     async fn test_table_schema_iterator_reset() {
         let temp_loc = std::env::temp_dir().join("test_table_schema_iterator_reset");
 
-        let mock_io = make_clean_provider(
-            temp_loc.as_path(),
-            "test_table_schema_iterator_reset",
-        ).await;
+        let mock_io =
+            make_clean_provider(temp_loc.as_path(), "test_table_schema_iterator_reset").await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1673,10 +2073,8 @@ mod tests {
         // Create multiple schemas
         let temp_loc = std::env::temp_dir().join("test_table_schema_save_and_iterator");
 
-        let mock_io = make_clean_provider(
-            temp_loc.as_path(),
-            "test_table_schema_save_and_iterator",
-        ).await;
+        let mock_io =
+            make_clean_provider(temp_loc.as_path(), "test_table_schema_save_and_iterator").await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1724,10 +2122,7 @@ mod tests {
 
         let temp_loc = std::env::temp_dir().join("test_table_schema_long_names");
 
-        let mock_io = make_clean_provider(
-            temp_loc.as_path(),
-            "test_table_schema_long_names",
-        ).await;
+        let mock_io = make_clean_provider(temp_loc.as_path(), "test_table_schema_long_names").await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1755,17 +2150,17 @@ mod tests {
         let _mock_io_fields = make_clean_provider(
             temp_loc.as_path(),
             "test_table_schema_complete_set_FIELDS.db",
-        ).await;
+        )
+        .await;
 
         let _mock_io_fields_tmp = make_clean_provider(
             temp_loc.as_path(),
             "test_table_schema_complete_set_FIELDS.db.tmp",
-        ).await;
+        )
+        .await;
 
-        let mock_io = make_clean_provider(
-            temp_loc.as_path(),
-            "test_table_schema_complete_set",
-        ).await;
+        let mock_io =
+            make_clean_provider(temp_loc.as_path(), "test_table_schema_complete_set").await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1855,15 +2250,21 @@ mod tests {
 
         let _mock_io_fields = LocalStorageProvider::new(
             temp_loc.to_str().unwrap(),
-            Some("test_table_schema_complete_set_FIELDS.db")).await;
+            Some("test_table_schema_complete_set_FIELDS.db"),
+        )
+        .await;
 
         let _mock_io_fields_tmp = LocalStorageProvider::new(
             temp_loc.to_str().unwrap(),
-            Some("test_table_schema_complete_set_FIELDS.db.tmp")).await;
+            Some("test_table_schema_complete_set_FIELDS.db.tmp"),
+        )
+        .await;
 
         let mock_io = LocalStorageProvider::new(
             temp_loc.to_str().unwrap(),
-            Some("test_table_mark_field_as_deleted")).await;
+            Some("test_table_mark_field_as_deleted"),
+        )
+        .await;
 
         let mock_io = Arc::new(mock_io);
 
@@ -1962,7 +2363,12 @@ mod tests {
         let mut schema = create_test_table_schema("retype", Some("id"));
         schema.save(mock_io.clone()).await.unwrap();
         schema
-            .add_field(mock_io.clone(), "payload_format".into(), DbType::STRING, false)
+            .add_field(
+                mock_io.clone(),
+                "payload_format".into(),
+                DbType::STRING,
+                false,
+            )
             .await;
         let dead_order = schema
             .fields
@@ -1972,9 +2378,16 @@ mod tests {
             .write_order;
 
         schema
-            .add_field(mock_io.clone(), "payload_format_tmp".into(), DbType::I16, false)
+            .add_field(
+                mock_io.clone(),
+                "payload_format_tmp".into(),
+                DbType::I16,
+                false,
+            )
             .await;
-        schema.mark_field_as_deleted("payload_format", mock_io.clone()).await;
+        schema
+            .mark_field_as_deleted("payload_format", mock_io.clone())
+            .await;
         schema
             .rename_field("payload_format_tmp", "payload_format", mock_io.clone())
             .await
@@ -2001,5 +2414,111 @@ mod tests {
             field.write_order > dead_order,
             "the load kept the older record; the live one is always the newer"
         );
+    }
+
+    async fn incarnation_provider(dir: &tempfile::TempDir) -> Arc<LocalStorageProvider> {
+        Arc::new(LocalStorageProvider::new(dir.path().to_str().unwrap(), Some("inc_schema.db")).await)
+    }
+
+    /// C7: every new schema gets its own non-zero incarnation; `save` records
+    /// it and `load` reads it back; a header rewrite (`PRIMARY KEY`, `RENAME`)
+    /// keeps it.
+    #[tokio::test]
+    async fn a_saved_schema_keeps_its_incarnation_across_loads_and_header_rewrites() {
+        let a = TableSchema::new("inc".into(), false);
+        let b = TableSchema::new("inc".into(), false);
+        assert_ne!(a.incarnation, 0);
+        assert_ne!(a.incarnation, b.incarnation, "two creations of one name share an incarnation");
+
+        let dir = tempfile::tempdir().unwrap();
+        let io = incarnation_provider(&dir).await;
+        let mut schema = a.clone();
+        schema.save(io.clone()).await.unwrap();
+        schema
+            .add_field(io.clone(), "id".into(), DbType::I64, true)
+            .await;
+        let loaded = TableSchema::load(io.clone()).await.expect("load");
+        assert_eq!(loaded.incarnation, a.incarnation, "the incarnation did not survive a load");
+        assert_eq!(loaded.fields.len(), 1);
+
+        schema.set_primary_key("id".into());
+        schema.name = "renamed".into();
+        schema.rewrite_header(io.clone()).await.unwrap();
+        let loaded = TableSchema::load(io.clone()).await.expect("load");
+        assert_eq!(loaded.primary_key.as_deref(), Some("id"));
+        assert_eq!(loaded.name, "renamed");
+        assert_eq!(loaded.incarnation, a.incarnation, "a header rewrite lost the incarnation");
+    }
+
+    /// A `_schema.db` written before incarnations existed is the header alone:
+    /// it loads exactly as before, with none recorded. A record that does not
+    /// verify reads as none too, never as some other incarnation.
+    #[tokio::test]
+    async fn a_schema_without_a_verifying_incarnation_loads_with_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = incarnation_provider(&dir).await;
+        let schema = TableSchema::new("legacy".into(), true);
+        io.append_data(&schema.into_vec(), true).await;
+        let loaded = TableSchema::load(io.clone()).await.expect("a legacy schema must load");
+        assert_eq!(loaded.name, "legacy");
+        assert!(loaded.is_immutable);
+        assert_eq!(loaded.incarnation, 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let io = incarnation_provider(&dir).await;
+        schema.save(io.clone()).await.unwrap();
+        assert_eq!(TableSchema::load(io.clone()).await.unwrap().incarnation, schema.incarnation);
+        // One bit of the incarnation flipped: the CRC no longer verifies.
+        let mut record = incarnation_record(schema.incarnation);
+        record[10] ^= 0x01;
+        io.write_data(TABLE_SIZE as u64, &record).await;
+        let loaded = TableSchema::load(io.clone()).await.expect("load");
+        assert_eq!(loaded.name, "legacy");
+        assert_eq!(loaded.incarnation, 0, "a corrupt record was trusted");
+
+        // And a record of incarnation zero is none, however well it verifies.
+        assert_eq!(parse_incarnation(&incarnation_record(0)), None);
+        assert_eq!(parse_incarnation(&incarnation_record(7)), Some(7));
+        assert_eq!(parse_incarnation(&incarnation_record(7)[..INCARNATION_LEN - 1]), None);
+    }
+
+    /// The record's first byte is one no header can start with, whatever the
+    /// table's name: names are UTF-8, which never holds `0xFF`, or empty.
+    #[test]
+    fn no_header_starts_like_an_incarnation_record() {
+        for name in ["", "a", "Z9", "_x", "weird-name.with dots", "\u{ff}x", "日本", "\u{10ffff}"] {
+            let header = TableSchema::new(name.into(), false).into_vec();
+            assert_ne!(header[0], INCARNATION_MAGIC[0], "{name:?}");
+        }
+    }
+
+    /// Several schemas saved into one file, each followed by its record, still
+    /// iterate one by one with their own incarnations, including across the
+    /// iterator's chunk boundary, which records no longer align with.
+    #[tokio::test]
+    async fn the_schema_iterator_steps_over_incarnation_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = incarnation_provider(&dir).await;
+        let schemas: Vec<TableSchema> = (0..150)
+            .map(|i| TableSchema::new(format!("t{i}"), i % 2 == 0))
+            .collect();
+        for schema in &schemas {
+            schema.save(io.clone()).await.unwrap();
+        }
+        let mut iterator = TableSchemaIterator::new(io.clone()).await.unwrap();
+        let mut seen = Vec::new();
+        while let Some(schema) = iterator.next_table_schema().await.unwrap() {
+            seen.push((schema.name, schema.is_immutable, schema.incarnation));
+        }
+        let expected: Vec<(String, bool, u128)> = schemas
+            .iter()
+            .map(|s| (s.name.clone(), s.is_immutable, s.incarnation))
+            .collect();
+        assert_eq!(seen.len(), expected.len(), "the iterator lost or invented schemas");
+        for (got, want) in seen.iter().zip(&expected) {
+            assert_eq!(got.0, want.0);
+            assert_eq!(got.1, want.1, "{}", want.0);
+            assert_eq!(got.2, want.2, "{}: the wrong incarnation", want.0);
+        }
     }
 }

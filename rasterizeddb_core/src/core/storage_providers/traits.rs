@@ -1,9 +1,4 @@
-use std::{
-    any::Any,
-    future::Future,
-    io::SeekFrom,
-    sync::Arc,
-};
+use std::{any::Any, future::Future, io::SeekFrom, sync::Arc};
 
 pub type IOError = std::io::Error;
 pub type IOResult<T> = std::result::Result<T, IOError>;
@@ -35,6 +30,10 @@ pub struct BorrowedBytes {
     _owner: Arc<dyn Any + Send + Sync>,
     ptr: *const u8,
     len: usize,
+    /// The file's in-place write count, when its bytes can be rewritten under
+    /// the borrow: a reader decodes a record between `read_begin` and
+    /// `read_valid` and decodes it again if they disagree (`inplace_seq`).
+    seq: Option<Arc<super::inplace_seq::InPlaceSeq>>,
 }
 
 // SAFETY: the bytes are read-only for the guard's lifetime and `_owner` keeps
@@ -48,7 +47,25 @@ impl BorrowedBytes {
     /// held, and must not be deallocated or unmapped while this guard lives.
     #[inline]
     pub unsafe fn new(owner: Arc<dyn Any + Send + Sync>, ptr: *const u8, len: usize) -> Self {
-        Self { _owner: owner, ptr, len }
+        Self {
+            _owner: owner,
+            ptr,
+            len,
+            seq: None,
+        }
+    }
+
+    /// The same bytes, read under `seq` (see the field).
+    #[inline]
+    pub fn with_seq(mut self, seq: Arc<super::inplace_seq::InPlaceSeq>) -> Self {
+        self.seq = Some(seq);
+        self
+    }
+
+    /// The count readers of these bytes check, if they can be rewritten.
+    #[inline(always)]
+    pub fn seq(&self) -> Option<&Arc<super::inplace_seq::InPlaceSeq>> {
+        self.seq.as_ref()
     }
 
     #[inline(always)]
@@ -102,6 +119,22 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
         false
     }
 
+    /// [`Self::try_read_vectored_sync`] for a batch of rows' fixed-width
+    /// cells. `rows` is each row's start (and its length, which this does
+    /// not read); `cells` is each cell's offset within a row and its width.
+    /// Cell `c` of every row, in `rows`' order, is appended to `out[c]`.
+    ///
+    /// `true` when every cell was copied without blocking. `false` when this
+    /// storage has no such path or could not serve some cell that way; the
+    /// buffers of `out` are then as long as they were, and the caller reads
+    /// the cells another way. A scan for cells reads four cells of each of a
+    /// few thousand rows at a time, and one position, one slice and one
+    /// `memmove` per cell was most of what the read cost.
+    #[inline(always)]
+    fn try_read_cells_sync(&self, _rows: &[(u64, u64)], _cells: &[(u32, u32)], _out: &mut [&mut Vec<u8>]) -> bool {
+        false
+    }
+
     fn append_data(&self, buffer: &[u8], immediate: bool)
     -> impl Future<Output = ()> + Send + Sync;
 
@@ -146,6 +179,15 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
         async move { (self.append_data_returning_offset(buffer, true).await, 0) }
     }
 
+    /// Whether [`StorageIO::write_data_txn`] holds its bytes back until its
+    /// transaction commits (`true`), so an abort or a failure before the
+    /// commit leaves the old bytes; or applies them at once (`false`), where
+    /// nothing can take an in-place overwrite back. An UPDATE overwrites in
+    /// place only where this is `true`.
+    fn defers_in_place_writes(&self) -> bool {
+        false
+    }
+
     /// In-place counterpart of [`StorageIO::append_data_txn`].
     fn write_data_txn(
         &self,
@@ -172,6 +214,19 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
     /// and retrying spins forever. Every other error may be transient.
     fn commit_durable(&self, _token: u64) -> impl Future<Output = IOResult<()>> + Send + Sync {
         async move { Ok(()) }
+    }
+
+    /// Rolls back `token`, a transaction that will not be committed: its
+    /// writes are taken back out and the provider stops holding anything for
+    /// it. The default does nothing, which is right for a provider whose
+    /// replay already discards a transaction that never reached its commit.
+    ///
+    /// For a transaction whose commit was never attempted. A failed
+    /// [`StorageIO::commit_durable`] has already settled the transaction one
+    /// way or the other; calling this afterwards could roll back one that in
+    /// fact committed.
+    fn abort_txn(&self, _token: u64) -> impl Future<Output = ()> + Send + Sync {
+        async move {}
     }
 
     /// Borrows `len` bytes at `position` directly from the backing store.
@@ -216,6 +271,28 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
 
     fn create_new(&self, name: String) -> impl Future<Output = Self> + Send + Sync;
 
+    /// [`StorageIO::create_new`] that returns an operating-system failure
+    /// (too many open files, permission denied) instead of panicking: what
+    /// opening a closed partition calls, since that runs inside a statement
+    /// (phase 3 P5b). The default cannot fail.
+    fn try_create_new(&self, name: String) -> impl Future<Output = IOResult<Self>> + Send + Sync {
+        async move { Ok(self.create_new(name).await) }
+    }
+
+    /// [`StorageIO::try_create_new`] rooted at `location`: a partition
+    /// materialized on another storage location (phase 4). Unlike
+    /// [`StorageIO::create_new_at`] the default refuses rather than ignore
+    /// `location`, which would put the partition's files in the seed's
+    /// directory while its map says they are elsewhere.
+    fn try_create_new_at(
+        &self,
+        location: &str,
+        name: String,
+    ) -> impl Future<Output = IOResult<Self>> + Send + Sync {
+        let why = format!("{name} cannot be created in {location}: this storage has no directories");
+        async move { Err(std::io::Error::new(std::io::ErrorKind::Unsupported, why)) }
+    }
+
     /// As [`StorageIO::create_new`], but rooted at `location` rather than at
     /// this provider's own directory.
     ///
@@ -241,4 +318,102 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
     fn start_service(&self) -> impl Future<Output = ()> + Send + Sync;
 
     fn get_name(&self) -> String;
+
+    /// The directory a table on this provider keeps its index-store files in
+    /// (`.ixm`, `.ixs`, the directory's `rdb.ixe`;
+    /// docs/persistent-indexes.md §1), or `None` for a provider excluded
+    /// from snapshots: memory, a key/value store, a mirrored pool (P33).
+    /// Such a table's write gate is detached and never `Clean`.
+    fn index_store_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    /// Hands the provider its file set's write gate. A file provider
+    /// registers every write it issues on the word (`index_store::gated_io`,
+    /// §2 layer 2, B12), judged by `policy`, passes the word on to the
+    /// providers it opens for files named after its own (the schema
+    /// sidecars), and takes a count for each background landing of staged
+    /// bytes (§2: `.tmp` landing passes the gate). The rest ignore it: their
+    /// word is detached and never `Clean` (P33).
+    fn attach_write_gate(
+        &self,
+        _gate: &std::sync::Arc<crate::core::index_store::file_gate::FileGate>,
+        _policy: crate::core::index_store::gated_io::Policy,
+    ) {
+    }
+
+    /// Lands every staged append in the main file and makes it durable,
+    /// waiting out a background landing already in flight: what a seal does
+    /// for each provider of its file set before it samples the file lengths
+    /// (docs/persistent-indexes.md §3 step 2), so the background landing has
+    /// nothing left to land after a `CLEAN`. A provider that stages nothing
+    /// has nothing to do; only a provider with a directory can be sealed.
+    fn land_staged(&self) -> impl Future<Output = IOResult<()>> + Send + Sync {
+        async move { Ok(()) }
+    }
+
+    /// One round of [`Self::start_service`]'s background landing, for a
+    /// provider whose service is not started: a partition opened
+    /// `MaintenanceMode::External`, whose database's one scheduler lands its
+    /// staged appends (docs/partitioning.md §7.3). Lands what is staged, as
+    /// the service's loop would, and returns whether staged bytes remain (the
+    /// landing was skipped or more arrived meanwhile). A provider that stages
+    /// nothing has nothing to do.
+    fn land_background(&self) -> impl Future<Output = bool> + Send + Sync {
+        async move { false }
+    }
+
+    /// A key/value file's state as it stands, without storing anything:
+    /// what an open compares a snapshot's record against before anything
+    /// wrote (docs/kv-partitions.md §2). `None` for every other provider.
+    fn kv_state_now(&self) -> Option<KvState> {
+        None
+    }
+
+    /// Stops a key/value file's background service from compacting it, so
+    /// its state stays what a shutdown seal records until the process ends
+    /// (docs/kv-partitions.md §2). Nothing for every other provider.
+    fn kv_pause_service(&self) {}
+
+    /// A key/value file's state once everything written to it is stored:
+    /// its pending records flushed, and then `Some` only when nothing of it
+    /// is in flight or undecided (no open or in-doubt transaction wrote it,
+    /// no compaction is folding it). `None` when it is not settled now, and
+    /// for every other provider.
+    fn kv_settled_state(&self) -> impl Future<Output = IOResult<Option<KvState>>> + Send + Sync {
+        async move { Ok(None) }
+    }
+
+    /// Stores `bytes` as this key/value file's snapshot sidecar
+    /// (`<name>.ixs` in its family), whole: read back only once its own
+    /// checks pass. `Unsupported` for every other provider.
+    fn kv_write_sidecar(&self, _bytes: Vec<u8>) -> impl Future<Output = IOResult<()>> + Send + Sync {
+        async move {
+            Err(IOError::new(
+                std::io::ErrorKind::Unsupported,
+                "only a key/value file keeps a snapshot sidecar",
+            ))
+        }
+    }
+
+    /// The sidecar's bytes, `None` when it does not stand (or this is not a
+    /// key/value file). Never makes it.
+    fn kv_read_sidecar(&self) -> impl Future<Output = IOResult<Option<Vec<u8>>>> + Send + Sync {
+        async move { Ok(None) }
+    }
+}
+
+/// What a key/value file's snapshot sidecar is named after it: `<name>.ixs`,
+/// in the same family (docs/kv-partitions.md §2).
+pub const KV_SIDECAR_SUFFIX: &str = ".ixs";
+
+/// A key/value file's durable state, as a snapshot of the indexes over it
+/// records it (docs/kv-partitions.md §2). Every record stored for the file
+/// takes the next sequence, and a compaction or a new generation moves one
+/// of these too, so a file whose state is unchanged holds what it held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvState {
+    pub generation: u64,
+    pub next_seq: u64,
+    pub len: u64,
 }

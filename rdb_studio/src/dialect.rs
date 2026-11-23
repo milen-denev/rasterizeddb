@@ -24,10 +24,19 @@
 //! - **`filters_ready`** describes RasterizedDB's own index catching up with
 //!   the rows. Nothing in PostgreSQL is ever behind in that sense, so it reads
 //!   `true`.
+//!
+//! The activity page adds a third case, and a sharper one: PostgreSQL keeps no
+//! statement *history*. `pg_stat_activity` reports what each backend is
+//! executing right now, which is a different question with the same shape, so
+//! the page renders it under a different heading — see
+//! [`recent_statements_label`] — and the columns it genuinely cannot answer
+//! come back empty rather than zero.
 
 use crate::model::{
-    BackupEntry, ColumnInfo, ConfigEntry, DatabaseInfo, Flavor, Grid, PeerStatus, Relationship,
-    RestoreReport, RestoreTarget, Stat, StorageLocation, TableInfo, TablePlacement,
+    BackupEntry, BranchDiffRow, BranchForm, BranchInfo, BranchPointKind, ColumnInfo,
+    ConfigEntry, DatabaseInfo, Flavor, Grid, IndexInfo, IndexOwner, MergePolicy, PartitionInfo,
+    PeerStatus, Relationship, RestoreReport, RestoreTarget, RoleInfo, Stat, StatementRecord,
+    StatementShape, StorageLocation, TableInfo, TablePlacement,
 };
 
 // ---------------------------------------------------------------------------
@@ -66,12 +75,212 @@ pub fn columns_sql(flavor: Flavor, table: &str) -> String {
     }
 }
 
+/// What to send for one table's indexes.
+///
+/// Both engines answer `pg_indexes`, and both print each index as the
+/// `CREATE INDEX` that would make it, so the list is one parser over one
+/// shape. PostgreSQL also says which constraint owns each index; RasterizedDB's
+/// `pg_indexes` has no such column, and [`parse_indexes`] works it out from the
+/// definition instead.
+pub fn indexes_sql(flavor: Flavor, table: &str) -> String {
+    match flavor {
+        Flavor::Rasterized => format!(
+            "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = {}",
+            quote_literal(table)
+        ),
+        Flavor::Postgres => PG_INDEXES.replace("$TABLE$", &quote_literal(table)),
+    }
+}
+
+/// What to send for a partitioned table's partitions. RasterizedDB only: a
+/// PostgreSQL partitioned table's children are tables of their own, and are
+/// listed as such.
+pub fn partitions_sql(table: &str) -> String {
+    format!("SHOW PARTITIONS {}", quote_ident(table))
+}
+
+/// RasterizedDB's audit of one table's indexes against its rows.
+pub fn index_check_sql(table: &str) -> String {
+    format!("SELECT rdb_index_check({})", quote_literal(table))
+}
+
+/// Removes an index. Only for [`IndexOwner::Declared`]: an index a constraint
+/// owns goes with the constraint, and both servers refuse `DROP INDEX` of one
+/// (RasterizedDB from fc3849c; before it, it answered success and kept it).
+pub fn drop_index_sql(index: &str) -> String {
+    format!("DROP INDEX {}", quote_ident(index))
+}
+
+/// Removes a `UNIQUE` or `PRIMARY KEY` constraint and the index it brought.
+pub fn drop_constraint_sql(table: &str, constraint: &str) -> String {
+    format!(
+        "ALTER TABLE {} DROP CONSTRAINT {}",
+        quote_ident(table),
+        quote_ident(constraint)
+    )
+}
+
 /// What to send for the relationship graph.
 pub fn schema_map_sql(flavor: Flavor) -> &'static str {
     match flavor {
         Flavor::Rasterized => "SHOW SCHEMA MAP",
         Flavor::Postgres => PG_SCHEMA_MAP,
     }
+}
+
+// ---------------------------------------------------------------------------
+// The key/value store (RasterizedDB's `KV` commands)
+// ---------------------------------------------------------------------------
+
+/// One page of the store's keys matching `pattern` (Redis glob), from
+/// `cursor`.
+pub fn kv_scan_sql(cursor: &str, pattern: &str, count: u32) -> String {
+    let cursor = if cursor.bytes().all(|b| b.is_ascii_digit()) && !cursor.is_empty() {
+        cursor
+    } else {
+        "0"
+    };
+    let pattern = if pattern.trim().is_empty() { "*" } else { pattern };
+    format!("KV SCAN {} MATCH {} COUNT {}", cursor, quote_literal(pattern), count)
+}
+
+/// A SCAN page: the cursor to continue from (`None` when the scan is done)
+/// and its keys. A page that matched nothing still says where to go on, as a
+/// row whose key is NULL.
+pub fn parse_kv_scan(grid: &Grid) -> (Option<String>, Vec<String>) {
+    let cursor = grid
+        .value(0, "cursor")
+        .map(str::to_string)
+        .filter(|c| c != "0");
+    let keys = (0..grid.rows.len())
+        .filter_map(|row| grid.value(row, "key").map(str::to_string))
+        .collect();
+    (cursor, keys)
+}
+
+/// The statement that reads a key's value, by its type; `None` for a type
+/// this console does not show. Long collections are read in part.
+pub fn kv_value_sql(kind: &str, key: &str) -> Option<String> {
+    let key = quote_literal(key);
+    Some(match kind {
+        "string" => format!("KV GET {key}"),
+        "hash" => format!("KV HGETALL {key}"),
+        "list" => format!("KV LRANGE {key} 0 {}", KV_SHOWN - 1),
+        "set" => format!("KV SMEMBERS {key}"),
+        "zset" => format!("KV ZRANGE {key} 0 {} WITHSCORES", KV_SHOWN - 1),
+        _ => return None,
+    })
+}
+
+/// How many items of a list or sorted set are shown.
+pub const KV_SHOWN: usize = 500;
+
+/// A key's type and time to live, in one request.
+pub fn kv_describe_sql(key: &str) -> String {
+    let key = quote_literal(key);
+    format!("KV TYPE {key}; KV TTL {key}")
+}
+
+// ---------------------------------------------------------------------------
+// Roles
+// ---------------------------------------------------------------------------
+
+/// The roles, without their password hashes: a console has no use for them,
+/// and a hash on screen is a hash in a screenshot.
+pub fn roles_sql(flavor: Flavor) -> &'static str {
+    match flavor {
+        Flavor::Rasterized => {
+            "SELECT name, can_login, is_superuser FROM rdb_roles ORDER BY name"
+        }
+        // The predefined `pg_*` roles are PostgreSQL's own and cannot be
+        // dropped or logged in as.
+        Flavor::Postgres => {
+            "SELECT rolname AS name, rolcanlogin AS can_login, rolsuper AS is_superuser \
+             FROM pg_roles WHERE rolname NOT LIKE 'pg\\_%' ORDER BY rolname"
+        }
+    }
+}
+
+pub fn parse_roles(grid: &Grid) -> Vec<RoleInfo> {
+    (0..grid.rows.len())
+        .filter_map(|row| {
+            Some(RoleInfo {
+                name: grid.value(row, "name")?.to_string(),
+                can_login: grid.flag(row, "can_login").unwrap_or(false),
+                superuser: grid.flag(row, "is_superuser").unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// `CREATE ROLE`, in the form both servers take. An empty password sets
+/// none, which on both means the role cannot log in with one.
+pub fn create_role_sql(
+    name: &str,
+    password: &str,
+    login: bool,
+    superuser: bool,
+) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("the role needs a name".to_string());
+    }
+    if login && password.is_empty() {
+        return Err(
+            "a role that logs in needs a password (or untick LOGIN and set one later)".to_string(),
+        );
+    }
+    let mut sql = format!("CREATE ROLE {}", quote_ident(name));
+    if superuser {
+        sql.push_str(" SUPERUSER");
+    }
+    sql.push_str(if login { " LOGIN" } else { " NOLOGIN" });
+    if !password.is_empty() {
+        sql.push_str(&format!(" PASSWORD {}", quote_literal(password)));
+    }
+    Ok(sql)
+}
+
+pub fn role_password_sql(name: &str, password: &str) -> Result<String, String> {
+    if password.is_empty() {
+        return Err("type the new password".to_string());
+    }
+    Ok(format!(
+        "ALTER ROLE {} PASSWORD {}",
+        quote_ident(name),
+        quote_literal(password)
+    ))
+}
+
+/// A statement as it may be kept and shown: every string literal after
+/// `PASSWORD` replaced, so the history, its export and the status bar never
+/// hold a password the console sent (or one typed in the editor).
+pub fn redact_passwords(sql: &str) -> String {
+    let lexed = crate::sqllex::lex(sql);
+    let mut cuts: Vec<(usize, usize, usize)> = Vec::new();
+    // From a `PASSWORD` to the first token that is not part of a string: a
+    // literal over several lines lexes as one string token per line.
+    let mut redacting = false;
+    for token in &lexed.tokens {
+        match token.token.kind {
+            crate::sqllex::Kind::Comment => continue,
+            crate::sqllex::Kind::String if redacting => {
+                cuts.push((token.line, token.token.start, token.token.end));
+                continue;
+            }
+            _ => {}
+        }
+        redacting = token.token.kind == crate::sqllex::Kind::Word
+            && lexed.text(token).eq_ignore_ascii_case("password");
+    }
+    if cuts.is_empty() {
+        return sql.to_string();
+    }
+    let mut lines: Vec<String> = crate::sqllex::lines(sql).iter().map(|l| l.to_string()).collect();
+    for (line, start, end) in cuts.into_iter().rev() {
+        lines[line].replace_range(start..end, "'********'");
+    }
+    lines.join("\n")
 }
 
 /// What to send for the runtime configuration.
@@ -90,6 +299,195 @@ pub fn databases_sql(flavor: Flavor) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Activity
+// ---------------------------------------------------------------------------
+
+/// What to send for the statements the server has answered most recently.
+///
+/// The two servers answer two different questions here and the page says which
+/// — see [`recent_statements_label`]. RasterizedDB keeps a ring of finished
+/// statements; PostgreSQL keeps none, and the closest thing it has is the list
+/// of what its backends are executing at this instant.
+pub fn recent_statements_sql(flavor: Flavor, limit: usize) -> String {
+    match flavor {
+        Flavor::Rasterized => format!("SHOW QUERIES {}", limit),
+        Flavor::Postgres => PG_RECENT_STATEMENTS.replace("$LIMIT$", &limit.to_string()),
+    }
+}
+
+/// What the recent pane is a list *of*, which is not the same on both servers.
+pub fn recent_statements_label(flavor: Flavor) -> &'static str {
+    match flavor {
+        Flavor::Rasterized => "RECENT · NEWEST FIRST",
+        Flavor::Postgres => "RUNNING NOW · THIS INSTANT, NOT A HISTORY",
+    }
+}
+
+/// The caveat under that heading, or nothing when there is none.
+pub fn recent_statements_caveat(flavor: Flavor) -> Option<&'static str> {
+    match flavor {
+        Flavor::Rasterized => None,
+        Flavor::Postgres => Some(
+            "PostgreSQL keeps no history of finished statements. This is pg_stat_activity: what \
+             each backend is executing right now. A statement that has already returned is not \
+             here, and neither figure beside it — rows returned, rows scanned — exists for a \
+             statement that has not finished.",
+        ),
+    }
+}
+
+/// What to send for the per-shape totals.
+pub fn statement_shapes_sql(flavor: Flavor) -> &'static str {
+    match flavor {
+        Flavor::Rasterized => "SHOW QUERY STATS",
+        Flavor::Postgres => PG_STATEMENT_SHAPES,
+    }
+}
+
+/// What to send to forget both.
+///
+/// RasterizedDB answers PostgreSQL's spelling too, but the console sends each
+/// server its own: the native one is what an operator would type, and it is
+/// what the confirmation dialog shows them before they agree to it.
+pub fn reset_statement_stats_sql(flavor: Flavor) -> &'static str {
+    match flavor {
+        Flavor::Rasterized => "RESET QUERY STATS",
+        Flavor::Postgres => "SELECT pg_stat_statements_reset()",
+    }
+}
+
+/// Why the recent list is missing, which is a different thing from why the
+/// aggregate is.
+///
+/// Worth its own message rather than reusing the aggregate's: on PostgreSQL the
+/// two panes come from different places, and `pg_stat_activity` is present on
+/// every server — so telling someone to install `pg_stat_statements` when the
+/// *recent* pane is empty would send them after the wrong thing entirely.
+pub fn recent_statements_missing(flavor: Flavor) -> &'static str {
+    match flavor {
+        Flavor::Rasterized => {
+            "This server does not record what it runs. It answered SHOW QUERIES as if it were a \
+             runtime parameter, which is what a build without the query_stats feature — or from \
+             before it existed — does. Rebuild with --features query_stats."
+        }
+        Flavor::Postgres => {
+            "This server did not answer the pg_stat_activity query. That view exists on every \
+             PostgreSQL server, so this is usually privileges rather than absence: a role without \
+             pg_read_all_stats (or membership of the monitoring role) sees other sessions with \
+             their query text hidden, and an older server may not have every column this uses."
+        }
+    }
+}
+
+/// Why the aggregate is missing, which is a different thing on each server.
+pub fn statement_shapes_missing(flavor: Flavor) -> &'static str {
+    match flavor {
+        Flavor::Rasterized => {
+            "This server does not record what it runs. It answered SHOW QUERY STATS as if it \
+             were a runtime parameter, which is what a build without the query_stats feature — \
+             or from before it existed — does. Rebuild with --features query_stats."
+        }
+        Flavor::Postgres => {
+            "pg_stat_statements is not loaded. It ships with PostgreSQL but is off until it is \
+             both listed in shared_preload_libraries (which needs a restart) and installed with \
+             CREATE EXTENSION pg_stat_statements."
+        }
+    }
+}
+
+pub fn parse_statement_records(grid: &Grid) -> Vec<StatementRecord> {
+    (0..grid.rows.len())
+        .map(|row| StatementRecord {
+            started_at: grid.value(row, "started_at").unwrap_or_default().trim().to_string(),
+            duration_ms: grid.real(row, "duration_ms").unwrap_or(0.0),
+            rows: grid.number(row, "rows"),
+            rows_scanned: grid.number(row, "rows_scanned"),
+            materialised: grid.number(row, "materialised"),
+            materialised_ms: grid.real(row, "materialised_ms"),
+            status: grid.value(row, "status").unwrap_or_default().trim().to_string(),
+            database: grid.value(row, "database").unwrap_or_default().to_string(),
+            username: grid.value(row, "username").unwrap_or_default().to_string(),
+            statement: grid.value(row, "statement").unwrap_or_default().to_string(),
+            error: grid.value(row, "error").unwrap_or_default().to_string(),
+        })
+        .collect()
+}
+
+pub fn parse_statement_shapes(grid: &Grid) -> Vec<StatementShape> {
+    (0..grid.rows.len())
+        .map(|row| StatementShape {
+            queryid: grid.value(row, "queryid").unwrap_or_default().trim().to_string(),
+            calls: grid.number(row, "calls").unwrap_or(0),
+            total_ms: grid.real(row, "total_ms").unwrap_or(0.0),
+            mean_ms: grid.real(row, "mean_ms").unwrap_or(0.0),
+            min_ms: grid.real(row, "min_ms").unwrap_or(0.0),
+            max_ms: grid.real(row, "max_ms").unwrap_or(0.0),
+            stddev_ms: grid.real(row, "stddev_ms").unwrap_or(0.0),
+            rows: grid.number(row, "rows"),
+            rows_scanned: grid.number(row, "rows_scanned"),
+            materialised: grid.number(row, "materialised"),
+            materialised_ms: grid.real(row, "materialised_ms"),
+            errors: grid.number(row, "errors"),
+            last_seen: grid.value(row, "last_seen").unwrap_or_default().trim().to_string(),
+            statement: grid.value(row, "statement").unwrap_or_default().to_string(),
+        })
+        .collect()
+}
+
+/// PostgreSQL's nearest thing to a recent-statement list.
+///
+/// Every column the RasterizedDB form has, so one parser reads both. The two it
+/// cannot fill come back as the empty string rather than as `0`: the page
+/// renders that as a dash, where a zero would say the statement scanned nothing.
+///
+/// The console's own connection is excluded, because its query would otherwise
+/// always be the most recent thing running and a page whose top row is always
+/// itself says nothing.
+const PG_RECENT_STATEMENTS: &str = "\
+SELECT
+  coalesce(to_char(query_start, 'YYYY-MM-DD HH24:MI:SS.US'), '')                 AS started_at,
+  coalesce(round(
+    extract(epoch FROM (clock_timestamp() - query_start))::numeric * 1000, 3)::text,
+    '0')                                                                         AS duration_ms,
+  ''                                                                             AS rows,
+  ''                                                                             AS rows_scanned,
+  coalesce(state, '')                                                            AS status,
+  coalesce(datname, '')                                                          AS database,
+  coalesce(usename, '')                                                          AS username,
+  coalesce(query, '')                                                            AS statement,
+  ''                                                                             AS error
+FROM pg_stat_activity
+WHERE pid <> pg_backend_pid() AND coalesce(query, '') <> ''
+ORDER BY query_start DESC NULLS LAST
+LIMIT $LIMIT$";
+
+/// PostgreSQL's own per-shape aggregate, named to match the RasterizedDB form.
+///
+/// The extension already normalises literals to `$1`, so `statement` means the
+/// same thing on both sides. `rows_scanned` has no counterpart at all: the
+/// nearest figure, `shared_blks_read`, counts eight-kilobyte blocks fetched
+/// through a buffer cache, which is neither rows nor comparable between two
+/// engines that store rows differently. Left empty rather than converted into a
+/// row count nobody could defend.
+const PG_STATEMENT_SHAPES: &str = "\
+SELECT
+  s.queryid::text                             AS queryid,
+  s.calls::text                               AS calls,
+  round(s.total_exec_time::numeric, 3)::text  AS total_ms,
+  round(s.mean_exec_time::numeric, 3)::text   AS mean_ms,
+  round(s.min_exec_time::numeric, 3)::text    AS min_ms,
+  round(s.max_exec_time::numeric, 3)::text    AS max_ms,
+  round(s.stddev_exec_time::numeric, 3)::text AS stddev_ms,
+  s.rows::text                                AS rows,
+  ''                                          AS rows_scanned,
+  ''                                          AS errors,
+  ''                                          AS last_seen,
+  s.query                                     AS statement
+FROM pg_stat_statements s
+ORDER BY s.total_exec_time DESC
+LIMIT 200";
+
 /// The statement that changes one knob, or an explanation of why there is none.
 ///
 /// PostgreSQL splits this in two and the split matters: `SET` lasts for the
@@ -99,7 +497,11 @@ pub fn databases_sql(flavor: Flavor) -> &'static str {
 /// the tab is closed, so the persistent form is used and the reload is chained
 /// onto it.
 pub fn set_config_sql(flavor: Flavor, entry: &ConfigEntry, value: &str) -> Result<String, String> {
-    if !entry.hot {
+    // A restart-only setting goes through the same statement: RasterizedDB's
+    // `SET CONFIG` saves one for the next start, and `ALTER SYSTEM` is how
+    // PostgreSQL always saves; the reload is then what sets its
+    // `pending_restart`, which is how the screen learns the change is waiting.
+    if !entry.editable() {
         return Err(format!(
             "{} is fixed at start-up on this server. Set it with: {}",
             entry.qualified(),
@@ -125,18 +527,192 @@ pub fn set_config_sql(flavor: Flavor, entry: &ConfigEntry, value: &str) -> Resul
 /// skip another — and an editor that then writes back by row position would
 /// write to the wrong row. The key is the primary key where there is one; where
 /// there is not, the console says so rather than paging on nothing.
-pub fn page_sql(table: &str, order_by: Option<&str>, limit: usize, offset: usize) -> String {
+///
+/// `sort` is the column a header was clicked on, and whether it was clicked
+/// twice. It goes *in front of* the key rather than replacing it: sorting by a
+/// column with a thousand equal values would otherwise leave those thousand
+/// rows in no defined order, which is the unstable paging this function exists
+/// to avoid — the key behind it breaks every tie the same way each time.
+pub fn page_sql(
+    table: &str,
+    filter: Option<&RowFilter>,
+    order_by: Option<&str>,
+    sort: Option<(&str, bool)>,
+    limit: usize,
+    offset: usize,
+) -> String {
     let mut sql = format!("SELECT * FROM {}", quote_ident(table));
-    if let Some(key) = order_by {
-        sql.push_str(&format!(" ORDER BY {}", quote_ident(key)));
+    if let Some(filter) = filter {
+        sql.push_str(&filter.where_clause());
     }
+
+    let mut terms: Vec<String> = Vec::new();
+    if let Some((column, descending)) = sort {
+        terms.push(format!(
+            "{}{}",
+            quote_ident(column),
+            if descending { " DESC" } else { "" }
+        ));
+    }
+    if let Some(key) = order_by {
+        // Not twice: `ORDER BY "id" DESC, "id"` is not what the second term
+        // means, and some servers reject it.
+        if sort.map(|(column, _)| column) != Some(key) {
+            terms.push(quote_ident(key));
+        }
+    }
+    if !terms.is_empty() {
+        sql.push_str(&format!(" ORDER BY {}", terms.join(", ")));
+    }
+
     sql.push_str(&format!(" LIMIT {} OFFSET {}", limit, offset));
     sql
 }
 
+/// A page that starts after a key rather than at an offset: the rows whose
+/// `key` is past `after` (the key of the previous page's last row, as a
+/// literal from [`key_literal`]), in key order, `limit` of them.
+///
+/// The same rows as `page_sql` ordered by the key alone gives at the
+/// matching offset, without the server producing and skipping every row
+/// before them: `OFFSET 90000` is ninety thousand rows read, sorted and
+/// thrown away for each page that deep.
+pub fn page_after_sql(
+    table: &str,
+    filter: Option<&RowFilter>,
+    key: &str,
+    descending: bool,
+    after: &str,
+    limit: usize,
+) -> String {
+    let past = format!(
+        "{} {} {}",
+        quote_ident(key),
+        if descending { "<" } else { ">" },
+        after
+    );
+    let condition = match filter {
+        Some(filter) => format!("{} AND {}", filter.where_clause(), past),
+        None => format!(" WHERE {}", past),
+    };
+    format!(
+        "SELECT * FROM {}{} ORDER BY {}{} LIMIT {}",
+        quote_ident(table),
+        condition,
+        quote_ident(key),
+        if descending { " DESC" } else { "" },
+        limit
+    )
+}
+
+/// How a key column's values are written back as a literal, when a page can
+/// start after one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeysetKind {
+    /// An integer, written as its digits.
+    Integer,
+    /// Text, written as a quoted string.
+    Text,
+}
+
+impl KeysetKind {
+    /// The kind of a column declared `data_type`, or `None` for a type whose
+    /// order and literal this does not vouch for (a float, a timestamp, a
+    /// UUID, NUMERIC): those pages stay at an offset.
+    pub fn of(data_type: &str) -> Option<KeysetKind> {
+        let upper = data_type.trim().to_ascii_uppercase();
+        let base = upper.split('(').next().unwrap_or("").trim();
+        match base {
+            "SMALLINT" | "INTEGER" | "INT" | "BIGINT" | "INT2" | "INT4" | "INT8" | "TINYINT"
+            | "UTINYINT" | "USMALLINT" | "UINTEGER" | "UINT" | "UBIGINT" | "HUGEINT"
+            | "UHUGEINT" | "SMALLSERIAL" | "SERIAL" | "BIGSERIAL" => Some(KeysetKind::Integer),
+            "TEXT" | "VARCHAR" | "CHARACTER VARYING" => Some(KeysetKind::Text),
+            _ => None,
+        }
+    }
+}
+
+/// A key's value, as the grid shows it, as a literal to page after; `None`
+/// when it cannot be written exactly (an integer cell that is not one).
+pub fn key_literal(value: &str, kind: KeysetKind) -> Option<String> {
+    match kind {
+        KeysetKind::Integer => {
+            let digits = value.strip_prefix('-').unwrap_or(value);
+            (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| value.to_string())
+        }
+        KeysetKind::Text => Some(quote_literal(value)),
+    }
+}
+
 /// The exact row count, which both engines answer by scanning.
-pub fn count_sql(table: &str) -> String {
-    format!("SELECT COUNT(*) AS n FROM {}", quote_ident(table))
+pub fn count_sql(table: &str, filter: Option<&RowFilter>) -> String {
+    format!(
+        "SELECT COUNT(*) AS n FROM {}{}",
+        quote_ident(table),
+        filter.map(RowFilter::where_clause).unwrap_or_default()
+    )
+}
+
+/// A condition typed into the data browser, checked to be one condition.
+///
+/// It is the user's own SQL, and they can run any SQL in the editor, so this
+/// is not a defence against them. It keeps the browser's own statement
+/// intact around it: a `;` would make the page two statements (and the
+/// second would run), an unbalanced `)` would close the `WHERE` early and let
+/// the rest change what the `ORDER BY` and `LIMIT` apply to, and a `--`
+/// comment would swallow them; it ends at the line break placed after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowFilter(String);
+
+impl RowFilter {
+    /// The condition, or why it cannot be one; `None` for an empty one.
+    pub fn parse(text: &str) -> Result<Option<RowFilter>, String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let lexed = crate::sqllex::lex(text);
+        if lexed.open.is_some() {
+            return Err(
+                "the filter ends inside a string, a quoted name or a comment".to_string(),
+            );
+        }
+        let mut depth = 0i32;
+        for token in &lexed.tokens {
+            if token.token.kind != crate::sqllex::Kind::Punct {
+                continue;
+            }
+            match lexed.text(token) {
+                ";" => {
+                    return Err(
+                        "the filter is one condition, as written after WHERE; it may not hold a ';'"
+                            .to_string(),
+                    );
+                }
+                "(" => depth += 1,
+                ")" => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return Err("the filter closes a parenthesis it did not open".to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return Err("the filter leaves a parenthesis open".to_string());
+        }
+        Ok(Some(RowFilter(text.to_string())))
+    }
+
+    pub fn text(&self) -> &str {
+        &self.0
+    }
+
+    fn where_clause(&self) -> String {
+        format!(" WHERE (\n{}\n)", self.0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -956,6 +1532,9 @@ pub fn parse_tables(grid: &Grid) -> Vec<TableInfo> {
     (0..grid.rows.len())
         .map(|row| TableInfo {
             name: grid.value(row, "table_name").unwrap_or_default().to_string(),
+            // Empty from a server that does not report it, which the badge
+            // reads as "nothing to say" rather than as a kind of storage.
+            storage: grid.value(row, "storage").unwrap_or_default().trim().to_string(),
             row_slots: grid.number(row, "row_slots").unwrap_or(0),
             columns: grid.number(row, "columns").unwrap_or(0),
             data_bytes: grid.number(row, "data_bytes").unwrap_or(0),
@@ -986,6 +1565,185 @@ pub fn parse_columns(grid: &Grid) -> Vec<ColumnInfo> {
         .collect()
 }
 
+/// One table's indexes, from [`indexes_sql`].
+///
+/// `primary_columns` is the table's primary key as `SHOW COLUMNS` flags it,
+/// used only against RasterizedDB, whose `pg_indexes` does not say which
+/// index is the key's. There a unique index is the primary key's when it is
+/// named `<table>_pkey`, as the engine names it, or covers exactly the flagged
+/// columns. Erring towards "primary" only hides a button; erring the other way
+/// offers one the server answers with success and ignores.
+pub fn parse_indexes(grid: &Grid, primary_columns: &[&str]) -> Vec<IndexInfo> {
+    let says_owner = grid.column_index("constraint_type").is_some();
+    (0..grid.rows.len())
+        .map(|row| {
+            let name = grid.value(row, "indexname").unwrap_or_default().to_string();
+            let definition = grid.value(row, "indexdef").unwrap_or_default().to_string();
+            let (unique, method, columns) = parse_index_def(&definition)
+                .unwrap_or_else(|| (false, String::new(), String::new()));
+            let owner = if says_owner {
+                match grid.value(row, "constraint_type").unwrap_or_default() {
+                    "primary" => IndexOwner::Primary,
+                    "unique" => IndexOwner::Unique,
+                    _ => IndexOwner::Declared,
+                }
+            } else if !unique {
+                IndexOwner::Declared
+            } else if name.ends_with("_pkey") || same_columns(&columns, primary_columns) {
+                IndexOwner::Primary
+            } else {
+                IndexOwner::Unique
+            };
+            IndexInfo { name, method, columns, unique, owner, definition }
+        })
+        .collect()
+}
+
+/// Whether an index's column list is exactly `wanted`, in any order.
+fn same_columns(columns: &str, wanted: &[&str]) -> bool {
+    if wanted.is_empty() {
+        return false;
+    }
+    let mut have: Vec<String> = columns
+        .split(',')
+        .map(|c| c.trim().trim_matches('"').to_ascii_lowercase())
+        .collect();
+    let mut want: Vec<String> = wanted.iter().map(|c| c.to_ascii_lowercase()).collect();
+    have.sort();
+    want.sort();
+    have == want
+}
+
+/// Reads `CREATE [UNIQUE] INDEX <name> ON <table> USING <method> (<columns>) …`
+/// into whether it is unique, the method, and what is inside the parentheses.
+///
+/// A scan rather than a split, because every part of this can hold the words
+/// and characters a split would cut on: a quoted name containing ` USING `, a
+/// path `((doc->>'a(b'))` with a bracket inside a literal, an operator class
+/// after the column. Quotes are skipped whole and brackets counted, so only a
+/// top-level `USING` and its own closing bracket end anything. `None` for a
+/// definition not in this shape.
+pub fn parse_index_def(definition: &str) -> Option<(bool, String, String)> {
+    let unique = definition
+        .trim_start()
+        .get(..19)
+        .is_some_and(|head| head.eq_ignore_ascii_case("CREATE UNIQUE INDEX"));
+
+    let bytes = definition.as_bytes();
+    let mut i = 0;
+    let mut using = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'"' | b'\'') => i = skip_quoted(bytes, i, quote),
+            b'(' => return None,
+            _ if is_word_at(bytes, i, b"USING") => {
+                using = Some(i + 5);
+                break;
+            }
+            _ => i += 1,
+        }
+    }
+    let mut i = using?;
+
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let method_start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    let method = definition[method_start..i].to_ascii_lowercase();
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'(') {
+        return None;
+    }
+
+    let open = i;
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'"' | b'\'') => {
+                i = skip_quoted(bytes, i, quote);
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let columns = definition[open + 1..i].trim().to_string();
+                    return Some((unique, method, columns));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The index just past the quote that closes the one opening at `start`. A
+/// doubled quote is an escaped one, in both quote styles.
+fn skip_quoted(bytes: &[u8], start: usize, quote: u8) -> usize {
+    let mut i = start + 1;
+    while i < bytes.len() {
+        if bytes[i] == quote {
+            if bytes.get(i + 1) == Some(&quote) {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// Whether `word` stands alone at `at`, case-insensitively: `USING`, but not
+/// the tail of `REUSING` or the head of `USINGS`.
+fn is_word_at(bytes: &[u8], at: usize, word: &[u8]) -> bool {
+    let boundary = |b: Option<&u8>| b.is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+    bytes.get(at..at + word.len()).is_some_and(|w| w.eq_ignore_ascii_case(word))
+        && boundary(at.checked_sub(1).and_then(|p| bytes.get(p)))
+        && boundary(bytes.get(at + word.len()))
+}
+
+/// A partitioned table's partitions, from [`partitions_sql`].
+pub fn parse_partitions(grid: &Grid) -> Vec<PartitionInfo> {
+    (0..grid.rows.len())
+        .map(|row| PartitionInfo {
+            pid: grid.number(row, "pid").unwrap_or(0),
+            lo: grid.value(row, "lo").unwrap_or_default().to_string(),
+            hi: grid.value(row, "hi").unwrap_or_default().to_string(),
+            location: grid.value(row, "location").unwrap_or_default().to_string(),
+            state: grid.value(row, "state").unwrap_or_default().to_string(),
+            row_slots: grid.number(row, "row_slots").unwrap_or(0),
+            total_bytes: grid.number(row, "total_bytes").unwrap_or(0),
+        })
+        .collect()
+}
+
+/// `rdb_index_check`'s one row, as a status line.
+///
+/// The `result` column is the verdict and already says what was not compared;
+/// the counts in front of it are what makes "clean" mean something.
+pub fn index_check_summary(grid: &Grid) -> String {
+    if grid.rows.is_empty() {
+        return "the index check returned nothing".to_string();
+    }
+    let field = |name: &str| grid.value(0, name).unwrap_or("?").to_string();
+    format!(
+        "{}: {} rows checked against {} index entries, {} missing, {} filter misses — {}",
+        field("relation"),
+        field("rows_checked"),
+        field("index_entries"),
+        field("missing_entries"),
+        field("filter_misses"),
+        field("result"),
+    )
+}
+
 pub fn parse_relationships(grid: &Grid) -> Vec<Relationship> {
     (0..grid.rows.len())
         .map(|row| Relationship {
@@ -1000,17 +1758,90 @@ pub fn parse_relationships(grid: &Grid) -> Vec<Relationship> {
         .collect()
 }
 
+/// The configuration, from either server.
+///
+/// `options`, `pending` and `source` are read when present and empty when
+/// not, so a server that predates them still lists everything. A RasterizedDB
+/// server that reports `pending` can save a restart-only setting for its next
+/// start; one that does not cannot, and its restart-only rows stay read-only.
 pub fn parse_config(grid: &Grid) -> Vec<ConfigEntry> {
+    let saves_for_restart = grid.column_index("pending").is_some();
     (0..grid.rows.len())
-        .map(|row| ConfigEntry {
-            section: grid.value(row, "section").unwrap_or_default().to_string(),
-            key: grid.value(row, "key").unwrap_or_default().to_string(),
-            value: grid.value(row, "value").unwrap_or_default().to_string(),
-            hot: grid.flag(row, "hot_reload").unwrap_or(false),
-            set_with: grid.value(row, "set_with").unwrap_or_default().to_string(),
-            help: grid.value(row, "help").unwrap_or_default().to_string(),
+        .map(|row| {
+            // One possible value is a fixed setting, whatever else the server
+            // can save: `wal.enabled` reads `fixed: always on` with options
+            // `true`, and a SAVE button there would offer a choice of one.
+            let fixed = grid
+                .value(row, "options")
+                .is_some_and(|o| !o.trim().is_empty() && !o.contains('|'));
+            let section = grid.value(row, "section").unwrap_or_default().to_string();
+            let key = grid.value(row, "key").unwrap_or_default().to_string();
+            let value = config_value(&section, &key, grid.value(row, "value").unwrap_or_default());
+            let hot = grid.flag(row, "hot_reload").unwrap_or(false);
+            let pending = grid.value(row, "pending").unwrap_or_default().to_string();
+            ConfigEntry {
+                hot,
+                restart_settable: !hot
+                    && !fixed
+                    && grid.flag(row, "restart_settable").unwrap_or(saves_for_restart),
+                set_with: grid.value(row, "set_with").unwrap_or_default().to_string(),
+                help: grid.value(row, "help").unwrap_or_default().to_string(),
+                options: grid.value(row, "options").unwrap_or_default().to_string(),
+                pending_restart: grid.flag(row, "pending_restart").unwrap_or(!pending.is_empty()),
+                pending,
+                source: grid.value(row, "source").unwrap_or_default().to_string(),
+                section,
+                key,
+                value,
+            }
         })
         .collect()
+}
+
+/// A setting's value in the syntax `SET CONFIG` takes it in.
+///
+/// Today's RasterizedDB prints `replication.compression`, `.mode` and
+/// `.conflict` with Rust's debug formatting — `Compression { mode: Auto,
+/// codec: Zstd, level: 1, … }`, `Quorum(2)`, `LastWriterWins` — which no
+/// statement accepts back. The server side is being fixed to print them
+/// properly; until then this reads the debug form back into the one a
+/// dropdown can match. Anything already in the right form passes through.
+pub fn config_value(section: &str, key: &str, value: &str) -> String {
+    let value = value.trim();
+    if section != "replication" || !value.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return value.to_string();
+    }
+    match key {
+        "compression" => {
+            let field = |name: &str| {
+                value
+                    .split(['{', ',', '}'])
+                    .filter_map(|part| part.split_once(':'))
+                    .find(|(k, _)| k.trim() == name)
+                    .map(|(_, v)| v.trim().to_ascii_lowercase())
+            };
+            match (field("mode"), field("codec"), field("level")) {
+                (Some(mode), Some(codec), level) => {
+                    let level = level.map(|l| format!(":{}", l)).unwrap_or_default();
+                    match (mode.as_str(), codec.as_str()) {
+                        ("off", _) | (_, "none") => "none".to_string(),
+                        ("auto", codec) => format!("auto:{}{}", codec, level),
+                        (_, codec) => format!("{}{}", codec, level),
+                    }
+                }
+                _ => value.to_string(),
+            }
+        }
+        "mode" => match value.strip_prefix("Quorum(").and_then(|r| r.strip_suffix(')')) {
+            Some(n) => format!("quorum:{}", n),
+            None => value.to_ascii_lowercase(),
+        },
+        "conflict" => match value {
+            "LastWriterWins" => "last-writer-wins".to_string(),
+            other => other.to_ascii_lowercase(),
+        },
+        _ => value.to_string(),
+    }
 }
 
 pub fn parse_databases(grid: &Grid) -> Vec<DatabaseInfo> {
@@ -1129,9 +1960,21 @@ SELECT metric, value, detail FROM (
 ) s ORDER BY ord";
 
 /// The table list. Column names match `SHOW TABLES` exactly.
+///
+/// `storage` is nearly constant here and that is the truth rather than a gap:
+/// every PostgreSQL relation is files in a tablespace. The two exceptions it
+/// does have are worth reporting, because both are emptied by a crash —
+/// `relpersistence` separates an `UNLOGGED` table and a temporary one from an
+/// ordinary one, which is the same distinction the RasterizedDB side draws
+/// between a file-backed table and an in-memory one.
 const PG_TABLES: &str = "\
 SELECT
   t.relname::text                                        AS table_name,
+  CASE t.relpersistence
+    WHEN 'u' THEN 'file-unlogged'
+    WHEN 't' THEN 'temporary'
+    ELSE 'file'
+  END                                                    AS storage,
   (s.n_live_tup + s.n_dead_tup)::text                    AS row_slots,
   (SELECT count(*) FROM pg_attribute a
     WHERE a.attrelid = t.oid AND a.attnum > 0 AND NOT a.attisdropped)::text AS columns,
@@ -1237,6 +2080,27 @@ LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
 WHERE a.attrelid = $TABLE$::regclass AND a.attnum > 0
 ORDER BY a.attnum";
 
+/// One table's indexes. Column names match the RasterizedDB `pg_indexes`
+/// query, plus `constraint_type`, which that side cannot answer.
+///
+/// The constraint is matched on both its index and its own table: a foreign
+/// key records the *referenced* table's index in `conindid`, so without the
+/// `contype` filter a self-referencing table would list its primary key twice.
+const PG_INDEXES: &str = "\
+SELECT
+  ic.relname::text                                AS indexname,
+  pg_get_indexdef(ix.indexrelid)                  AS indexdef,
+  CASE con.contype
+    WHEN 'p' THEN 'primary' WHEN 'u' THEN 'unique' WHEN 'x' THEN 'exclusion'
+    ELSE '' END                                   AS constraint_type
+FROM pg_index ix
+JOIN pg_class ic ON ic.oid = ix.indexrelid
+LEFT JOIN pg_constraint con
+  ON con.conindid = ix.indexrelid AND con.conrelid = ix.indrelid
+ AND con.contype IN ('p', 'u', 'x')
+WHERE ix.indrelid = $TABLE$::regclass
+ORDER BY ic.relname";
+
 /// The relationship graph. `json` edges have no PostgreSQL equivalent — a
 /// `jsonb` column is one value, not a reference — so only `fk` edges appear.
 const PG_SCHEMA_MAP: &str = "\
@@ -1276,11 +2140,18 @@ SELECT
   (context NOT IN ('internal','postmaster'))::text AS hot_reload,
   CASE context
     WHEN 'internal'   THEN 'compiled in; not settable'
-    WHEN 'postmaster' THEN 'postgresql.conf, then restart'
+    WHEN 'postmaster' THEN 'ALTER SYSTEM SET, then restart'
     WHEN 'sighup'     THEN 'ALTER SYSTEM SET, then pg_reload_conf()'
     ELSE 'ALTER SYSTEM SET, then pg_reload_conf()'
   END                                              AS set_with,
-  coalesce(short_desc, '')                         AS help
+  coalesce(short_desc, '')                         AS help,
+  CASE vartype
+    WHEN 'bool' THEN 'on|off'
+    WHEN 'enum' THEN array_to_string(enumvals, '|')
+    ELSE '' END                                    AS options,
+  (context = 'postmaster')::text                   AS restart_settable,
+  pending_restart::text                            AS pending_restart,
+  coalesce(source, '')                             AS source
 FROM pg_settings
 ORDER BY category, name";
 
@@ -1303,6 +2174,121 @@ ORDER BY d.datname";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- indexes ------------------------------------------------------------
+
+    fn index_grid(columns: &[&str], rows: &[&[&str]]) -> Grid {
+        Grid {
+            total: None,
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            rows: rows
+                .iter()
+                .map(|r| r.iter().map(|v| Some(v.to_string())).collect())
+                .collect(),
+            ..Grid::default()
+        }
+    }
+
+    /// Both servers' definitions, as each prints them, including the shapes a
+    /// split on spaces or brackets gets wrong.
+    #[test]
+    fn an_index_definition_is_read_past_quotes_and_brackets() {
+        let read = |d: &str| parse_index_def(d).unwrap();
+        assert_eq!(
+            read("CREATE INDEX orders_cs ON public.orders USING btree (customer_id, placed_at)"),
+            (false, "btree".into(), "customer_id, placed_at".into())
+        );
+        assert_eq!(
+            read("CREATE UNIQUE INDEX orders_pkey ON public.orders USING btree (id)"),
+            (true, "btree".into(), "id".into())
+        );
+        assert_eq!(
+            read("CREATE INDEX o ON public.orders USING btree (((doc->>'status')))"),
+            (false, "btree".into(), "((doc->>'status'))".into())
+        );
+        assert_eq!(
+            read("CREATE INDEX g ON public.orders USING gin (doc jsonb_path_ops)"),
+            (false, "gin".into(), "doc jsonb_path_ops".into())
+        );
+        // A bracket inside a literal does not close anything.
+        assert_eq!(
+            read("CREATE INDEX p ON t USING btree (((doc->>'a)(b')))"),
+            (false, "btree".into(), "((doc->>'a)(b'))".into())
+        );
+        // ` USING ` inside a quoted name is part of the name.
+        assert_eq!(
+            read(r#"CREATE INDEX "x USING hash (y)" ON public.t USING btree ("a b")"#),
+            (false, "btree".into(), r#""a b""#.into())
+        );
+        // A trailing WHERE stays out of the columns.
+        assert_eq!(
+            read("CREATE UNIQUE INDEX u ON public.t USING btree (email) WHERE (deleted_at IS NULL)").2,
+            "email"
+        );
+        assert!(parse_index_def("CREATE INDEX reusing_idx ON t (a)").is_none());
+        assert!(parse_index_def("").is_none());
+    }
+
+    /// RasterizedDB's `pg_indexes` does not say which index is the key's; the
+    /// parser must, because offering DROP CONSTRAINT on it reports success and
+    /// keeps the key.
+    #[test]
+    fn a_rasterized_primary_key_index_is_told_from_a_unique_one() {
+        let grid = index_grid(
+            &["indexname", "indexdef"],
+            &[
+                &["orders_pkey", "CREATE UNIQUE INDEX orders_pkey ON public.orders USING btree (id)"],
+                &["orders_email_key", "CREATE UNIQUE INDEX orders_email_key ON public.orders USING btree (email)"],
+                &["by_customer", "CREATE INDEX by_customer ON public.orders USING hash (customer_id)"],
+                &["k", "CREATE UNIQUE INDEX k ON public.assets USING btree (tenant_id, asset_id)"],
+            ],
+        );
+        let owners: Vec<IndexOwner> = parse_indexes(&grid, &["id"]).iter().map(|i| i.owner).collect();
+        assert_eq!(
+            owners,
+            [IndexOwner::Primary, IndexOwner::Unique, IndexOwner::Declared, IndexOwner::Unique]
+        );
+        // Covering exactly the flagged key columns, under any name.
+        let flagged = parse_indexes(&grid, &["asset_id", "tenant_id"]);
+        assert_eq!(flagged[3].owner, IndexOwner::Primary);
+        assert_eq!(flagged[2].kind(), "hash");
+    }
+
+    /// PostgreSQL says who owns each index, and that is believed over the
+    /// name: a `CREATE UNIQUE INDEX` there is an index, not a constraint.
+    #[test]
+    fn a_postgres_index_owner_comes_from_its_constraint() {
+        let grid = index_grid(
+            &["indexname", "indexdef", "constraint_type"],
+            &[
+                &["t_pkey", "CREATE UNIQUE INDEX t_pkey ON public.t USING btree (id)", "primary"],
+                &["t_u", "CREATE UNIQUE INDEX t_u ON public.t USING btree (a)", ""],
+                &["t_c", "CREATE UNIQUE INDEX t_c ON public.t USING btree (b)", "unique"],
+                &["t_p", "CREATE INDEX t_p ON public.t USING btree (((doc ->> 'k'::text)))", ""],
+            ],
+        );
+        let indexes = parse_indexes(&grid, &[]);
+        let owners: Vec<IndexOwner> = indexes.iter().map(|i| i.owner).collect();
+        assert_eq!(owners, [IndexOwner::Primary, IndexOwner::Declared, IndexOwner::Unique, IndexOwner::Declared]);
+        assert_eq!(indexes[3].kind(), "path");
+    }
+
+    #[test]
+    fn a_partition_share_reads_the_whole_hash_space() {
+        let p = |lo: &str, hi: &str| PartitionInfo {
+            pid: 0,
+            lo: lo.into(),
+            hi: hi.into(),
+            location: String::new(),
+            state: "unmaterialized".into(),
+            row_slots: 0,
+            total_bytes: 0,
+        };
+        // The last partition's `hi` is 2^64, which no u64 holds.
+        assert_eq!(p("0xe000000000000000", "0x10000000000000000").share(), Some(0.125));
+        assert_eq!(p("0x0000000000000000", "0x10000000000000000").share(), Some(1.0));
+        assert_eq!(p("junk", "0x1").share(), None);
+    }
 
     // -- storage placement -----------------------------------------------
 
@@ -1348,9 +2334,241 @@ mod tests {
         assert_eq!(storage_set_min_free_sql(" 2GiB ").unwrap(), "STORAGE SET MIN_FREE = '2GiB'");
     }
 
+    // -- activity ---------------------------------------------------------
+
+    /// The two servers' answers are read by one parser, so what they name the
+    /// columns is the whole contract between them. Both grids are written out
+    /// here as each server produces them.
+    #[test]
+    fn the_statement_grids_are_read_the_same_from_either_server() {
+        // RasterizedDB: `SHOW QUERIES`, which answers every column.
+        let rdb = Grid {
+            total: None,
+            columns: vec![
+                "started_at".into(),
+                "duration_ms".into(),
+                "rows".into(),
+                "rows_scanned".into(),
+                "status".into(),
+                "database".into(),
+                "username".into(),
+                "statement".into(),
+                "error".into(),
+            ],
+            rows: vec![vec![
+                Some("2026-09-01 09:14:02.7103".into()),
+                Some("0.718".into()),
+                Some("2".into()),
+                Some("3".into()),
+                Some("ok".into()),
+                Some("postgres".into()),
+                Some("rasterized".into()),
+                Some("SELECT id FROM t WHERE v > 15".into()),
+                Some("".into()),
+            ]],
+            ..Grid::default()
+        };
+
+        // PostgreSQL: `pg_stat_activity`, which cannot answer two of them and
+        // says so with an empty string rather than a zero.
+        let pg = Grid {
+            total: None,
+            columns: rdb.columns.clone(),
+            rows: vec![vec![
+                Some("2026-09-01 09:14:02.710300".into()),
+                Some("12.500".into()),
+                Some("".into()),
+                Some("".into()),
+                Some("active".into()),
+                Some("shop".into()),
+                Some("app".into()),
+                Some("SELECT id FROM t WHERE v > $1".into()),
+                Some("".into()),
+            ]],
+            ..Grid::default()
+        };
+
+        let mine = &parse_statement_records(&rdb)[0];
+        assert_eq!(mine.rows, Some(2));
+        assert_eq!(mine.rows_scanned, Some(3));
+        assert_eq!(mine.duration_ms, 0.718);
+        assert!(!mine.failed());
+
+        let theirs = &parse_statement_records(&pg)[0];
+        // The distinction the whole page rests on: a figure the server cannot
+        // produce is absent, not zero. Rendering it as `0` would say the
+        // statement scanned nothing.
+        assert_eq!(theirs.rows, None);
+        assert_eq!(theirs.rows_scanned, None);
+        assert_eq!(theirs.status, "active");
+        assert!(!theirs.failed());
+    }
+
+    /// A statement the server refused is a statement that ran, and the page
+    /// separates it by the reason rather than by the word in `status`.
+    #[test]
+    fn a_refused_statement_reads_as_failed() {
+        let grid = Grid {
+            total: None,
+            columns: vec!["status".into(), "error".into(), "statement".into()],
+            rows: vec![
+                vec![Some("error".into()), Some("relation does not exist".into()), Some("SELECT 1".into())],
+                vec![Some("ok".into()), Some("".into()), Some("SELECT 1".into())],
+                // A server that reported a reason but no status word is still
+                // reporting a failure.
+                vec![Some("".into()), Some("write conflict".into()), Some("UPDATE t SET a = 1".into())],
+            ],
+            ..Grid::default()
+        };
+        let parsed = parse_statement_records(&grid);
+        assert!(parsed[0].failed());
+        assert!(!parsed[1].failed());
+        assert!(parsed[2].failed());
+    }
+
+    #[test]
+    fn the_shape_grids_are_read_the_same_from_either_server() {
+        let columns: Vec<String> = vec![
+            "queryid".into(),
+            "calls".into(),
+            "total_ms".into(),
+            "mean_ms".into(),
+            "min_ms".into(),
+            "max_ms".into(),
+            "stddev_ms".into(),
+            "rows".into(),
+            "rows_scanned".into(),
+            "errors".into(),
+            "last_seen".into(),
+            "statement".into(),
+        ];
+
+        let rdb = Grid {
+            total: None,
+            columns: columns.clone(),
+            rows: vec![vec![
+                Some("2537360768813479364".into()),
+                Some("3".into()),
+                Some("1.705".into()),
+                Some("0.568".into()),
+                Some("0.373".into()),
+                Some("0.718".into()),
+                Some("0.144".into()),
+                Some("6".into()),
+                Some("9".into()),
+                Some("0".into()),
+                Some("2026-09-01 09:14:46.422114".into()),
+                Some("SELECT id FROM t WHERE v > $1".into()),
+            ]],
+            ..Grid::default()
+        };
+
+        let pg = Grid {
+            total: None,
+            columns,
+            rows: vec![vec![
+                // PostgreSQL's queryid is signed, and half of them are
+                // negative. Kept as text for exactly that reason.
+                Some("-4718895680489935218".into()),
+                Some("3".into()),
+                Some("1.705".into()),
+                Some("0.568".into()),
+                Some("0.373".into()),
+                Some("0.718".into()),
+                Some("0.144".into()),
+                Some("6".into()),
+                Some("".into()),
+                Some("".into()),
+                Some("".into()),
+                Some("SELECT id FROM t WHERE v > $1".into()),
+            ]],
+            ..Grid::default()
+        };
+
+        let mine = &parse_statement_shapes(&rdb)[0];
+        assert_eq!(mine.calls, 3);
+        assert_eq!(mine.rows_scanned, Some(9));
+        assert_eq!(mine.errors, Some(0));
+        assert_eq!(mine.mean_ms, 0.568);
+
+        let theirs = &parse_statement_shapes(&pg)[0];
+        assert_eq!(theirs.calls, 3);
+        assert_eq!(theirs.queryid, "-4718895680489935218");
+        // Neither has a counterpart in pg_stat_statements, and `errors` in
+        // particular must not read as "none failed".
+        assert_eq!(theirs.rows_scanned, None);
+        assert_eq!(theirs.errors, None);
+        assert!(theirs.last_seen.is_empty());
+    }
+
+    /// The console sends each server its own spelling, even though
+    /// RasterizedDB accepts PostgreSQL's too: the dialog shows the operator the
+    /// statement before they agree to it, and it should be one they recognise.
+    #[test]
+    fn each_server_is_asked_in_its_own_words() {
+        assert_eq!(recent_statements_sql(Flavor::Rasterized, 50), "SHOW QUERIES 50");
+        assert!(recent_statements_sql(Flavor::Postgres, 50).contains("FROM pg_stat_activity"));
+        assert!(recent_statements_sql(Flavor::Postgres, 50).ends_with("LIMIT 50"));
+        assert_eq!(statement_shapes_sql(Flavor::Rasterized), "SHOW QUERY STATS");
+        assert!(statement_shapes_sql(Flavor::Postgres).contains("FROM pg_stat_statements"));
+        assert_eq!(reset_statement_stats_sql(Flavor::Rasterized), "RESET QUERY STATS");
+        assert_eq!(
+            reset_statement_stats_sql(Flavor::Postgres),
+            "SELECT pg_stat_statements_reset()"
+        );
+        // The heading is not shared: one pane is a history and the other is an
+        // instant, and a page that called both "recent" would be lying about
+        // one of them.
+        assert_ne!(
+            recent_statements_label(Flavor::Rasterized),
+            recent_statements_label(Flavor::Postgres)
+        );
+        assert!(recent_statements_caveat(Flavor::Rasterized).is_none());
+        assert!(recent_statements_caveat(Flavor::Postgres).is_some());
+    }
+
+    /// A table list from a server too old to report `storage` must still read,
+    /// and must not invent a kind for it.
+    #[test]
+    fn a_table_list_without_a_storage_column_still_parses() {
+        let grid = Grid {
+            total: None,
+            columns: vec!["table_name".into(), "row_slots".into(), "primary_key".into()],
+            rows: vec![vec![Some("orders".into()), Some("12".into()), Some("id".into())]],
+            ..Grid::default()
+        };
+        let parsed = parse_tables(&grid);
+        assert_eq!(parsed[0].name, "orders");
+        assert!(parsed[0].storage.is_empty());
+        assert!(parsed[0].durable(), "an unanswered question is not a warning");
+    }
+
+    #[test]
+    fn the_storage_kind_is_read_from_either_server() {
+        let grid = Grid {
+            total: None,
+            columns: vec!["table_name".into(), "storage".into()],
+            rows: vec![
+                vec![Some("a".into()), Some("file".into())],
+                vec![Some("b".into()), Some("memory".into())],
+                vec![Some("c".into()), Some("s3".into())],
+                // PostgreSQL's two ephemeral kinds.
+                vec![Some("d".into()), Some("file-unlogged".into())],
+                vec![Some("e".into()), Some("temporary".into())],
+            ],
+            ..Grid::default()
+        };
+        let parsed = parse_tables(&grid);
+        assert_eq!(
+            parsed.iter().map(|t| t.durable()).collect::<Vec<_>>(),
+            vec![true, false, true, false, false]
+        );
+    }
+
     #[test]
     fn the_locations_grid_is_read_the_same_from_either_server() {
         let grid = Grid {
+            total: None,
             columns: vec![
                 "location".into(),
                 "role".into(),
@@ -1405,6 +2623,7 @@ mod tests {
     #[test]
     fn a_report_is_read_from_the_first_column_whatever_it_is_called() {
         let grid = Grid {
+            total: None,
             columns: vec!["storage".into()],
             rows: vec![
                 vec![Some("2 table(s), 4.4 KiB would move:".into())],
@@ -1497,9 +2716,108 @@ mod tests {
             hot: false,
             set_with: "--batch-size N (restart)".into(),
             help: String::new(),
+            ..ConfigEntry::default()
         };
         let error = set_config_sql(Flavor::Rasterized, &entry, "32000").unwrap_err();
         assert!(error.contains("--batch-size"), "the error must say what to do instead");
+
+        // A server that can save it for the next start is sent the change.
+        let saved = ConfigEntry { restart_settable: true, ..entry };
+        assert_eq!(
+            set_config_sql(Flavor::Rasterized, &saved, "32000").unwrap(),
+            "SET CONFIG server.batch_size = '32000'"
+        );
+    }
+
+    /// A server that saves startup settings makes its restart-only rows
+    /// editable, except one with a single possible value.
+    #[test]
+    fn a_saving_server_makes_restart_rows_editable_but_not_fixed_ones() {
+        let grid = Grid {
+            total: None,
+            columns: ["section", "key", "value", "hot_reload", "set_with", "help", "pending", "options", "source"]
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+            rows: [
+                ["server", "batch_size", "10000", "f", "--batch-size N (restart)", "", "20000", "", "default"],
+                ["wal", "enabled", "true", "f", "fixed: always on", "", "", "true", "default"],
+                ["cache", "enabled", "false", "f", "--enable-cache BOOL (restart)", "", "", "true|false", "command line"],
+                ["wal", "synchronous_commit", "on", "t", "", "", "", "on|off", ""],
+            ]
+            .iter()
+            .map(|r| r.iter().map(|v| Some(v.to_string())).collect())
+            .collect(),
+            ..Grid::default()
+        };
+        let config = parse_config(&grid);
+        assert!(config[0].restart_settable && config[0].pending_restart);
+        assert_eq!(config[0].pending, "20000");
+        assert!(!config[1].editable(), "a choice of one is fixed");
+        assert!(config[2].restart_settable && !config[2].pending_restart);
+        assert_eq!(config[2].source, "command line");
+        assert!(config[3].hot && !config[3].restart_settable);
+        // A server without `pending` cannot save, so nothing cold is editable.
+        let old = Grid { columns: grid.columns[..6].to_vec(), ..grid };
+        assert!(parse_config(&old).iter().filter(|e| !e.hot).all(|e| !e.editable()));
+    }
+
+    /// Today's RasterizedDB prints three replication settings as Rust debug
+    /// output. Read back as the values `SET CONFIG` takes, a dropdown can show
+    /// which one is current; left alone, none of its choices would match.
+    #[test]
+    fn a_debug_printed_setting_is_read_as_its_set_syntax() {
+        let read = |key: &str, value: &str| config_value("replication", key, value);
+        assert_eq!(
+            read("compression", "Compression { mode: Auto, codec: Zstd, level: 1, min_bytes: 512, min_ratio: 0.9 }"),
+            "auto:zstd:1"
+        );
+        assert_eq!(read("compression", "Compression { mode: Always, codec: Zstd, level: 3, min_bytes: 512, min_ratio: 0.9 }"), "zstd:3");
+        assert_eq!(read("compression", "Compression { mode: Off, codec: Zstd, level: 1, min_bytes: 512, min_ratio: 0.9 }"), "none");
+        assert_eq!(read("mode", "Async"), "async");
+        assert_eq!(read("mode", "Quorum(2)"), "quorum:2");
+        assert_eq!(read("mode", "All"), "all");
+        assert_eq!(read("conflict", "LastWriterWins"), "last-writer-wins");
+        // Already in the right spelling, or not one of these: untouched.
+        assert_eq!(read("mode", "quorum:2"), "quorum:2");
+        assert_eq!(config_value("filter", "enabled", "true"), "true");
+    }
+
+    #[test]
+    fn a_setting_with_fixed_values_offers_them() {
+        use crate::model::choice_of;
+        let entry = |key: &str, value: &str, options: &str| ConfigEntry {
+            section: "replication".into(),
+            key: key.into(),
+            value: value.into(),
+            options: options.into(),
+            ..ConfigEntry::default()
+        };
+        let mode = entry("mode", "quorum:2", "");
+        let choices = mode.choices();
+        assert_eq!(choices.iter().map(|c| c.to_string()).collect::<Vec<_>>(), ["async", "sync", "all", "quorum…"]);
+        assert_eq!(choice_of(&choices, "quorum:2"), Some((3, "2".to_string())));
+        assert_eq!(choices[3].value("5"), "quorum:5");
+        assert_eq!(choice_of(&choices, "sometimes"), None);
+
+        let compression = entry("compression", "zstd", "");
+        assert_eq!(choice_of(&compression.choices(), "zstd"), Some((1, String::new())));
+        assert_eq!(choice_of(&compression.choices(), "auto:zstd:9"), Some((2, "9".to_string())));
+
+        // Booleans, in the spelling the value already has.
+        let flag = ConfigEntry { section: "wal".into(), key: "synchronous_commit".into(), value: "on".into(), ..ConfigEntry::default() };
+        assert_eq!(flag.choices().iter().map(|c| c.to_string()).collect::<Vec<_>>(), ["on", "off"]);
+        let flag = ConfigEntry { value: "false".into(), ..flag };
+        assert_eq!(flag.choices().iter().map(|c| c.to_string()).collect::<Vec<_>>(), ["true", "false"]);
+        // The server's own list wins over every fallback.
+        let reported = entry("mode", "async", "async|all");
+        assert_eq!(reported.choices().len(), 2);
+        // A number is a text box.
+        assert!(entry("ack_timeout_ms", "5000", "").choices().is_empty());
+        // PostgreSQL lists an empty value among an enum's choices.
+        let tls = entry("ssl_max_protocol_version", "", "|TLSv1.2|TLSv1.3");
+        assert_eq!(choice_of(&tls.choices(), ""), Some((0, String::new())));
+        assert_eq!(tls.choices()[0].to_string(), "(none)");
     }
 
     #[test]
@@ -1672,17 +2990,465 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_kv_scan_continues_from_its_cursor_and_quotes_its_pattern() {
+        assert_eq!(kv_scan_sql("0", "user:*", 500), "KV SCAN 0 MATCH 'user:*' COUNT 500");
+        assert_eq!(kv_scan_sql("17", "", 10), "KV SCAN 17 MATCH '*' COUNT 10");
+        assert_eq!(kv_scan_sql("1; DROP", "it's", 10), "KV SCAN 0 MATCH 'it''s' COUNT 10");
+        let page = Grid {
+            columns: vec!["cursor".into(), "key".into()],
+            rows: vec![vec![Some("3".into()), Some("a".into())], vec![Some("3".into()), Some("b".into())]],
+            tag: String::new(),
+            total: None,
+        };
+        assert_eq!(parse_kv_scan(&page), (Some("3".to_string()), vec!["a".into(), "b".into()]));
+        let empty_done = Grid {
+            columns: vec!["cursor".into(), "key".into()],
+            rows: vec![vec![Some("0".into()), None]],
+            tag: String::new(),
+            total: None,
+        };
+        assert_eq!(parse_kv_scan(&empty_done), (None, vec![]));
+        assert_eq!(kv_value_sql("hash", "h'1").as_deref(), Some("KV HGETALL 'h''1'"));
+        assert_eq!(kv_value_sql("stream", "x"), None);
+    }
+
+    #[test]
+    fn a_password_never_reaches_the_history() {
+        assert_eq!(
+            redact_passwords("CREATE ROLE \"a\" LOGIN PASSWORD 'it''s secret'"),
+            "CREATE ROLE \"a\" LOGIN PASSWORD '********'"
+        );
+        assert_eq!(
+            redact_passwords("alter role a password /* new */ E'x\\'y'; SELECT 'password'"),
+            "alter role a password /* new */ '********'; SELECT 'password'"
+        );
+        assert_eq!(
+            redact_passwords("ALTER ROLE a PASSWORD 'line one\nline two' LOGIN"),
+            "ALTER ROLE a PASSWORD '********'\n'********' LOGIN"
+        );
+        assert_eq!(redact_passwords("SELECT password FROM t"), "SELECT password FROM t");
+    }
+
+    #[test]
+    fn a_role_is_created_in_the_form_both_servers_take() {
+        assert_eq!(
+            create_role_sql(" ops ", "pw'1", true, true).unwrap(),
+            "CREATE ROLE \"ops\" SUPERUSER LOGIN PASSWORD 'pw''1'"
+        );
+        assert_eq!(
+            create_role_sql("reader", "", false, false).unwrap(),
+            "CREATE ROLE \"reader\" NOLOGIN"
+        );
+        assert!(create_role_sql("", "x", true, false).is_err());
+        assert!(create_role_sql("a", "", true, false).is_err());
+        assert_eq!(
+            role_password_sql("ops", "n").unwrap(),
+            "ALTER ROLE \"ops\" PASSWORD 'n'"
+        );
+        assert!(role_password_sql("ops", "").is_err());
+    }
+
+    /// The filter goes in whole, between the table and the order, and a line
+    /// comment in it ends before the `ORDER BY` and `LIMIT`.
+    #[test]
+    fn a_filter_is_one_condition_inside_the_page() {
+        let filter = RowFilter::parse("  status = 'a;b' -- open ones\n AND (n > 1) ")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            page_sql("users", Some(&filter), Some("id"), None, 50, 0),
+            "SELECT * FROM \"users\" WHERE (\nstatus = 'a;b' -- open ones\n AND (n > 1)\n) \
+             ORDER BY \"id\" LIMIT 50 OFFSET 0"
+        );
+        assert_eq!(
+            count_sql("users", Some(&filter)),
+            "SELECT COUNT(*) AS n FROM \"users\" WHERE (\nstatus = 'a;b' -- open ones\n AND (n > 1)\n)"
+        );
+        assert_eq!(count_sql("users", None), "SELECT COUNT(*) AS n FROM \"users\"");
+        assert_eq!(RowFilter::parse("   ").unwrap(), None);
+        for bad in [
+            "1 = 1; DELETE FROM users",
+            "id = 1) OR (1 = 1",
+            "(id = 1",
+            "name = 'open",
+            "id = 1 /* unfinished",
+        ] {
+            assert!(RowFilter::parse(bad).is_err(), "{bad}");
+        }
+    }
+
     /// Paging without an order is paging on nothing: the same row can appear on
     /// two pages and another on none.
     #[test]
     fn a_page_orders_by_the_key_when_there_is_one() {
         assert_eq!(
-            page_sql("users", Some("id"), 50, 100),
+            page_sql("users", None, Some("id"), None, 50, 100),
             "SELECT * FROM \"users\" ORDER BY \"id\" LIMIT 50 OFFSET 100"
         );
         assert_eq!(
-            page_sql("users", None, 50, 0),
+            page_sql("users", None, None, None, 50, 0),
             "SELECT * FROM \"users\" LIMIT 50 OFFSET 0"
         );
+    }
+
+    /// A clicked header sorts the whole table, not the page in hand — and the
+    /// key stays behind it, or a column full of equal values would page
+    /// unstably again.
+    #[test]
+    fn a_clicked_header_orders_in_front_of_the_key() {
+        assert_eq!(
+            page_sql("users", None, Some("id"), Some(("email", false)), 50, 0),
+            "SELECT * FROM \"users\" ORDER BY \"email\", \"id\" LIMIT 50 OFFSET 0"
+        );
+        assert_eq!(
+            page_sql("users", None, Some("id"), Some(("email", true)), 50, 0),
+            "SELECT * FROM \"users\" ORDER BY \"email\" DESC, \"id\" LIMIT 50 OFFSET 0"
+        );
+    }
+
+    /// Sorting by the key itself must not name it twice: `ORDER BY "id" DESC,
+    /// "id"` does not mean what it looks like, and some servers refuse it.
+    #[test]
+    fn sorting_by_the_key_names_it_once() {
+        assert_eq!(
+            page_sql("users", None, Some("id"), Some(("id", true)), 50, 0),
+            "SELECT * FROM \"users\" ORDER BY \"id\" DESC LIMIT 50 OFFSET 0"
+        );
+    }
+
+    /// A table with nothing identifying a row can still be sorted; it just has
+    /// no tie-break, which the browser already warns about.
+    #[test]
+    fn a_keyless_table_still_sorts() {
+        assert_eq!(
+            page_sql("events", None, None, Some(("at", true)), 50, 0),
+            "SELECT * FROM \"events\" ORDER BY \"at\" DESC LIMIT 50 OFFSET 0"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Branches (RasterizedDB)
+// ---------------------------------------------------------------------------
+
+pub const BRANCHES_SQL: &str = "SHOW BRANCHES";
+
+/// `CREATE BRANCH …` from the form, or why it cannot be sent yet.
+pub fn create_branch_sql(form: &BranchForm) -> Result<String, String> {
+    let name = form.name.trim();
+    if name.is_empty() {
+        return Err("a branch needs a name".to_string());
+    }
+    let mut sql = format!("CREATE BRANCH {}", quote_ident(name));
+    if !form.source.trim().is_empty() {
+        sql.push_str(&format!(" FROM {}", quote_ident(form.source.trim())));
+    }
+    let value = form.value.trim();
+    match form.point {
+        BranchPointKind::Now => {}
+        BranchPointKind::Timestamp => {
+            if value.is_empty() {
+                return Err("a timestamp, as in 2026-11-19 10:00:00+00".to_string());
+            }
+            sql.push_str(&format!(" AS OF TIMESTAMP {}", quote_literal(value)));
+        }
+        BranchPointKind::Lsn => {
+            let lsn: u64 = value
+                .parse()
+                .map_err(|_| "an LSN is a whole number, as SHOW BACKUPS reports it".to_string())?;
+            sql.push_str(&format!(" AS OF LSN {lsn}"));
+        }
+        BranchPointKind::Snapshot => {
+            if value.is_empty() {
+                return Err("a snapshot id, as SHOW BACKUPS lists it".to_string());
+            }
+            sql.push_str(&format!(" AS OF SNAPSHOT {}", quote_literal(value)));
+        }
+    }
+    if !form.keep_base {
+        sql.push_str(" WITHOUT BASE");
+    }
+    Ok(sql)
+}
+
+pub fn branch_diff_sql(name: &str) -> String {
+    format!("SHOW BRANCH DIFF {}", quote_ident(name))
+}
+
+pub fn reset_branch_sql(name: &str) -> String {
+    format!("RESET BRANCH {}", quote_ident(name))
+}
+
+pub fn promote_branch_sql(name: &str) -> String {
+    format!("PROMOTE BRANCH {}", quote_ident(name))
+}
+
+pub fn drop_branch_sql(name: &str) -> String {
+    format!("DROP BRANCH {}", quote_ident(name))
+}
+
+pub fn merge_branch_sql(name: &str, policy: MergePolicy, allow_drop: bool) -> String {
+    let mut sql = format!("MERGE BRANCH {}", quote_ident(name));
+    match policy {
+        MergePolicy::Fail => {}
+        MergePolicy::BranchWins => sql.push_str(" ON CONFLICT BRANCH WINS"),
+        MergePolicy::ParentWins => sql.push_str(" ON CONFLICT PARENT WINS"),
+    }
+    if allow_drop {
+        sql.push_str(" ALLOW DROP");
+    }
+    sql
+}
+
+pub fn parse_branches(grid: &Grid) -> Vec<BranchInfo> {
+    (0..grid.rows.len())
+        .map(|i| {
+            let text = |c: &str| grid.value(i, c).unwrap_or("").to_string();
+            let number = |c: &str| grid.number(i, c).unwrap_or(0);
+            BranchInfo {
+                name: text("branch"),
+                parent: text("parent"),
+                parent_exists: matches!(grid.value(i, "parent_exists"), Some("t" | "true" | "1")),
+                point: text("point"),
+                parent_lsn: number("parent_lsn"),
+                method: text("method"),
+                created_at: text("created_at"),
+                merged_at: text("merged_at"),
+                size: number("size_bytes"),
+                base: number("base_bytes"),
+                sessions: number("sessions"),
+                depth: number("depth"),
+                path: text("path"),
+                children: number("children"),
+                via: text("via"),
+            }
+        })
+        .collect()
+}
+
+/// The branches as a tree, one line per database: each tree's root (the
+/// ordinary database it grows from, marked when it is gone) and every
+/// branch under its parent, siblings by name.
+///
+/// ```text
+/// prod
+/// ├─ dev
+/// │  └─ feature
+/// └─ hotfix
+/// ```
+pub fn branch_tree(branches: &[BranchInfo]) -> String {
+    use std::collections::{BTreeMap, BTreeSet};
+    let names: BTreeSet<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+    let mut children: BTreeMap<&str, Vec<&BranchInfo>> = BTreeMap::new();
+    for b in branches {
+        children.entry(b.parent.as_str()).or_default().push(b);
+    }
+    for list in children.values_mut() {
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    let roots: Vec<(&str, bool)> = branches
+        .iter()
+        .filter(|b| !names.contains(b.parent.as_str()))
+        .map(|b| (b.parent.as_str(), b.parent_exists))
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect();
+    fn walk<'a>(
+        at: &str,
+        prefix: &str,
+        children: &BTreeMap<&str, Vec<&'a BranchInfo>>,
+        seen: &mut BTreeSet<String>,
+        out: &mut String,
+    ) {
+        let Some(list) = children.get(at) else { return };
+        for (i, b) in list.iter().enumerate() {
+            let last = i + 1 == list.len();
+            if !seen.insert(b.name.clone()) {
+                continue;
+            }
+            out.push_str(prefix);
+            out.push_str(if last { "└─ " } else { "├─ " });
+            out.push_str(&b.name);
+            if !b.via.is_empty() {
+                out.push_str(&format!("  (via {})", b.via));
+            }
+            out.push('\n');
+            let deeper = format!("{prefix}{}", if last { "   " } else { "│  " });
+            walk(&b.name, &deeper, children, seen, out);
+        }
+    }
+    let mut out = String::new();
+    let mut seen = BTreeSet::new();
+    for (root, exists) in roots {
+        out.push_str(root);
+        if !exists {
+            out.push_str("  (dropped)");
+        }
+        out.push('\n');
+        walk(root, "", &children, &mut seen, &mut out);
+    }
+    out.trim_end().to_string()
+}
+
+pub fn parse_branch_diff(grid: &Grid) -> Vec<BranchDiffRow> {
+    (0..grid.rows.len())
+        .map(|i| {
+            let text = |c: &str| grid.value(i, c).unwrap_or("").to_string();
+            let number = |c: &str| grid.number(i, c).unwrap_or(0);
+            BranchDiffRow {
+                table: text("table_name"),
+                change: text("change"),
+                inserts: number("inserts"),
+                updates: number("updates"),
+                deletes: number("deletes"),
+                conflicts: number("conflicts"),
+                detail: text("detail"),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod branch_sql_tests {
+    use super::*;
+
+    fn branch(name: &str, parent: &str, exists: bool, via: &str) -> BranchInfo {
+        BranchInfo {
+            name: name.into(),
+            parent: parent.into(),
+            parent_exists: exists,
+            point: "now".into(),
+            parent_lsn: 0,
+            method: "copy".into(),
+            created_at: String::new(),
+            merged_at: String::new(),
+            size: 0,
+            base: 1,
+            sessions: 0,
+            depth: 0,
+            path: String::new(),
+            children: 0,
+            via: via.into(),
+        }
+    }
+
+    #[test]
+    fn branches_draw_as_a_tree_under_their_roots() {
+        let list = vec![
+            branch("hotfix", "prod", true, ""),
+            branch("feature", "dev", true, ""),
+            branch("dev", "prod", true, ""),
+            branch("old", "staging", true, "mid"),
+            branch("orphan", "gone", false, ""),
+        ];
+        assert_eq!(
+            branch_tree(&list),
+            "gone  (dropped)\n└─ orphan\nprod\n├─ dev\n│  └─ feature\n└─ hotfix\nstaging\n└─ old  (via mid)"
+        );
+    }
+
+    #[test]
+    fn the_tree_columns_are_read_by_name_and_default_when_absent() {
+        let grid = Grid {
+            columns: ["branch", "parent", "parent_exists", "depth", "path", "children", "via"]
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+            rows: vec![vec![
+                Some("feature".into()),
+                Some("dev".into()),
+                Some("t".into()),
+                Some("2".into()),
+                Some("prod/dev/feature".into()),
+                Some("0".into()),
+                Some("".into()),
+            ]],
+            ..Grid::default()
+        };
+        let parsed = parse_branches(&grid);
+        assert_eq!((parsed[0].depth, parsed[0].path.as_str()), (2, "prod/dev/feature"));
+        let old = Grid {
+            columns: vec!["branch".into(), "parent".into()],
+            rows: vec![vec![Some("dev".into()), Some("prod".into())]],
+            ..Grid::default()
+        };
+        assert_eq!(parse_branches(&old)[0].depth, 0);
+    }
+
+    #[test]
+    fn the_form_writes_the_statement_the_server_parses() {
+        let mut form = BranchForm { name: "dev".into(), ..BranchForm::default() };
+        assert_eq!(create_branch_sql(&form).unwrap(), "CREATE BRANCH \"dev\"");
+        form.source = "prod".into();
+        form.keep_base = false;
+        assert_eq!(create_branch_sql(&form).unwrap(), "CREATE BRANCH \"dev\" FROM \"prod\" WITHOUT BASE");
+        form.point = BranchPointKind::Timestamp;
+        assert!(create_branch_sql(&form).is_err());
+        form.value = "2026-11-19 10:00:00+00".into();
+        assert_eq!(
+            create_branch_sql(&form).unwrap(),
+            "CREATE BRANCH \"dev\" FROM \"prod\" AS OF TIMESTAMP '2026-11-19 10:00:00+00' WITHOUT BASE"
+        );
+        form.point = BranchPointKind::Lsn;
+        assert!(create_branch_sql(&form).is_err());
+        form.value = "42".into();
+        assert!(create_branch_sql(&form).unwrap().contains("AS OF LSN 42"));
+        assert!(create_branch_sql(&BranchForm::default()).is_err());
+    }
+
+    #[test]
+    fn merge_options_are_spelled_out() {
+        assert_eq!(merge_branch_sql("dev", MergePolicy::Fail, false), "MERGE BRANCH \"dev\"");
+        assert_eq!(
+            merge_branch_sql("dev", MergePolicy::BranchWins, true),
+            "MERGE BRANCH \"dev\" ON CONFLICT BRANCH WINS ALLOW DROP"
+        );
+    }
+
+    #[test]
+    fn a_keyset_page_starts_after_its_key_with_or_without_a_filter() {
+        assert_eq!(
+            page_after_sql("t", None, "id", false, "42", 100),
+            "SELECT * FROM \"t\" WHERE \"id\" > 42 ORDER BY \"id\" LIMIT 100"
+        );
+        let filter = RowFilter::parse("a = 1 OR b = 2").unwrap().unwrap();
+        assert_eq!(
+            page_after_sql("t", Some(&filter), "name", true, "'o''brien'", 10),
+            "SELECT * FROM \"t\" WHERE (\na = 1 OR b = 2\n) AND \"name\" < 'o''brien' ORDER BY \"name\" DESC LIMIT 10"
+        );
+        assert_eq!(KeysetKind::of("bigint"), Some(KeysetKind::Integer));
+        assert_eq!(KeysetKind::of("VARCHAR(40)"), Some(KeysetKind::Text));
+        assert_eq!(KeysetKind::of("character varying"), Some(KeysetKind::Text));
+        for other in ["UUID", "NUMERIC(10,2)", "DOUBLE PRECISION", "TIMESTAMPTZ", "CHAR(3)", "INTERVAL"] {
+            assert_eq!(KeysetKind::of(other), None, "{other}");
+        }
+        assert_eq!(key_literal("-17", KeysetKind::Integer).as_deref(), Some("-17"));
+        assert_eq!(key_literal("1e3", KeysetKind::Integer), None);
+        assert_eq!(key_literal("", KeysetKind::Integer), None);
+        assert_eq!(key_literal("1; DROP", KeysetKind::Integer), None);
+        assert_eq!(key_literal("it's", KeysetKind::Text).as_deref(), Some("'it''s'"));
+    }
+
+    #[test]
+    fn rows_parse_by_column_name() {
+        let grid = Grid {
+            columns: ["branch", "parent", "parent_exists", "point", "parent_lsn", "method", "created_at", "merged_at", "size_bytes", "base_bytes", "sessions"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            rows: vec![
+                ["dev", "prod", "t", "now", "7", "copy", "2026-11-19T10:00:00Z", "", "1024", "1024", "2"]
+                    .iter()
+                    .map(|s| Some(s.to_string()))
+                    .collect(),
+            ],
+            tag: "SELECT 1".into(),
+            total: None,
+        };
+        let parsed = parse_branches(&grid);
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].parent_exists && parsed[0].mergeable());
+        assert_eq!((parsed[0].parent_lsn, parsed[0].sessions), (7, 2));
     }
 }

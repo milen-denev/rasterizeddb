@@ -38,7 +38,21 @@ pub enum LockWait {
 pub struct RowLock {
     pub strength: LockStrength,
     pub behaviour: LockWait,
+    /// The clause as PostgreSQL names it (`FOR NO KEY UPDATE`), for the
+    /// refusals that quote it: the four spellings share two strengths here.
+    pub clause: &'static str,
 }
+
+impl RowLock {
+    /// PostgreSQL's refusal of this clause on a statement whose rows are not
+    /// table rows (0A000): "FOR UPDATE is not allowed with DISTINCT clause".
+    pub fn not_allowed_with(&self, what: &str) -> String {
+        format!("{} is not allowed with {}", self.clause, what)
+    }
+}
+
+/// What PostgreSQL's refusal names a set operation as.
+pub const SET_OPERATIONS: &str = "UNION/INTERSECT/EXCEPT";
 
 /// Splits a trailing locking clause off a `SELECT`.
 ///
@@ -55,18 +69,18 @@ pub fn split_locking_clause(sql: &str) -> Result<(String, Option<RowLock>), Stri
     let tail = trimmed[at + "FOR".len()..].trim_start();
     let upper = tail.to_ascii_uppercase();
 
-    let (strength, rest) = if upper.starts_with("UPDATE") {
-        (LockStrength::Update, &tail["UPDATE".len()..])
+    let (strength, clause, rest) = if upper.starts_with("UPDATE") {
+        (LockStrength::Update, "FOR UPDATE", &tail["UPDATE".len()..])
     } else if upper.starts_with("NO KEY UPDATE") {
         // Weaker than `FOR UPDATE` in PostgreSQL, but the difference only shows
         // against foreign-key locks, which this engine does not take. Treated as
         // the stronger one, which can refuse where PostgreSQL would allow but
         // never allows where PostgreSQL would refuse.
-        (LockStrength::Update, &tail["NO KEY UPDATE".len()..])
+        (LockStrength::Update, "FOR NO KEY UPDATE", &tail["NO KEY UPDATE".len()..])
     } else if upper.starts_with("SHARE") {
-        (LockStrength::Share, &tail["SHARE".len()..])
+        (LockStrength::Share, "FOR SHARE", &tail["SHARE".len()..])
     } else if upper.starts_with("KEY SHARE") {
-        (LockStrength::Share, &tail["KEY SHARE".len()..])
+        (LockStrength::Share, "FOR KEY SHARE", &tail["KEY SHARE".len()..])
     } else {
         // A `FOR` that begins no locking clause is left alone rather than
         // guessed at.
@@ -128,13 +142,21 @@ pub fn split_locking_clause(sql: &str) -> Result<(String, Option<RowLock>), Stri
     }
 
     let head = trimmed[..at].trim_end();
+    let lock = RowLock { strength, behaviour, clause };
+    // A set operation's rows are not table rows; PostgreSQL refuses the lock.
+    if ["UNION", "INTERSECT", "EXCEPT"]
+        .iter()
+        .any(|k| crate::core::rql::join::find_keyword(head, k, 0).is_some())
+    {
+        return Err(lock.not_allowed_with(SET_OPERATIONS));
+    }
     let statement = if rest.is_empty() {
         head.to_string()
     } else {
         format!("{} {}", head, rest)
     };
 
-    Ok((statement, Some(RowLock { strength, behaviour })))
+    Ok((statement, Some(lock)))
 }
 
 #[cfg(test)]
@@ -195,8 +217,16 @@ mod tests {
             "SELECT c.id FROM job AS c WHERE c.status = 'pending' \
              ORDER BY c.next_attempt_at ASC FOR UPDATE SKIP LOCKED LIMIT 1",
         );
-        assert!(rest.ends_with("LIMIT 1"), "the LIMIT must survive: {}", rest);
-        assert!(!rest.to_ascii_uppercase().contains("FOR UPDATE"), "{}", rest);
+        assert!(
+            rest.ends_with("LIMIT 1"),
+            "the LIMIT must survive: {}",
+            rest
+        );
+        assert!(
+            !rest.to_ascii_uppercase().contains("FOR UPDATE"),
+            "{}",
+            rest
+        );
         assert_eq!(l.unwrap().behaviour, LockWait::Skip);
 
         let (rest, _) = lock("SELECT id FROM t FOR UPDATE OFFSET 5");
@@ -215,7 +245,11 @@ mod tests {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockTable {
     pub tables: Vec<String>,
-    pub mode: crate::core::mvcc::row_locks::TableLockMode,
+    /// The mode as PostgreSQL names it; [`PgLockMode::table_mode`] is the one
+    /// of the four this engine takes (never weaker).
+    ///
+    /// [`PgLockMode::table_mode`]: crate::core::mvcc::table_locks::PgLockMode::table_mode
+    pub mode: crate::core::mvcc::table_locks::PgLockMode,
     /// `NOWAIT` — fail instead of waiting for the holder.
     pub nowait: bool,
 }
@@ -224,7 +258,7 @@ pub struct LockTable {
 ///
 /// Returns `None` when the statement is not a `LOCK`.
 pub fn parse_lock_table(sql: &str) -> Option<Result<LockTable, String>> {
-    use crate::core::mvcc::row_locks::TableLockMode;
+    use crate::core::mvcc::table_locks::PgLockMode;
 
     let trimmed = sql.trim().trim_end_matches(';').trim_end();
     let upper = trimmed.to_ascii_uppercase();
@@ -240,7 +274,11 @@ pub fn parse_lock_table(sql: &str) -> Option<Result<LockTable, String>> {
     let upper_rest = rest.to_ascii_uppercase();
     let list_end = crate::core::rql::join::find_keyword(&upper_rest, "IN", 0)
         .into_iter()
-        .chain(crate::core::rql::join::find_keyword(&upper_rest, "NOWAIT", 0))
+        .chain(crate::core::rql::join::find_keyword(
+            &upper_rest,
+            "NOWAIT",
+            0,
+        ))
         .min()
         .unwrap_or(rest.len());
 
@@ -262,7 +300,7 @@ pub fn parse_lock_table(sql: &str) -> Option<Result<LockTable, String>> {
     }
 
     let mut tail = rest[list_end..].trim_start();
-    let mut mode = TableLockMode::Exclusive; // PostgreSQL's default.
+    let mut mode = PgLockMode::AccessExclusive; // PostgreSQL's default.
 
     if tail.to_ascii_uppercase().starts_with("IN ") {
         let after = tail[3..].trim_start();
@@ -272,17 +310,19 @@ pub fn parse_lock_table(sql: &str) -> Option<Result<LockTable, String>> {
                 "LOCK TABLE ... IN <mode> needs the word MODE, as in `IN SHARE MODE`".to_string(),
             ));
         };
-        let named = upper_after[..mode_end].split_whitespace().collect::<Vec<_>>().join(" ");
+        let named = upper_after[..mode_end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         mode = match named.as_str() {
-            // Readers. `SHARE` blocks writers but not other readers.
-            "ACCESS SHARE" | "ROW SHARE" | "SHARE" => TableLockMode::Shared,
-            // Everything from `ROW EXCLUSIVE` up. Mapped to one exclusive mode,
-            // which refuses more than PostgreSQL would and permits no less.
-            "ROW EXCLUSIVE"
-            | "SHARE UPDATE EXCLUSIVE"
-            | "SHARE ROW EXCLUSIVE"
-            | "EXCLUSIVE"
-            | "ACCESS EXCLUSIVE" => TableLockMode::Exclusive,
+            "ACCESS SHARE" => PgLockMode::AccessShare,
+            "ROW SHARE" => PgLockMode::RowShare,
+            "ROW EXCLUSIVE" => PgLockMode::RowExclusive,
+            "SHARE UPDATE EXCLUSIVE" => PgLockMode::ShareUpdateExclusive,
+            "SHARE" => PgLockMode::Share,
+            "SHARE ROW EXCLUSIVE" => PgLockMode::ShareRowExclusive,
+            "EXCLUSIVE" => PgLockMode::Exclusive,
+            "ACCESS EXCLUSIVE" => PgLockMode::AccessExclusive,
             other => {
                 return Some(Err(format!("'{}' is not a lock mode", other)));
             }
@@ -301,13 +341,17 @@ pub fn parse_lock_table(sql: &str) -> Option<Result<LockTable, String>> {
         return Some(Err(format!("'{}' is not part of a LOCK statement", tail)));
     }
 
-    Some(Ok(LockTable { tables, mode, nowait }))
+    Some(Ok(LockTable {
+        tables,
+        mode,
+        nowait,
+    }))
 }
 
 #[cfg(test)]
 mod lock_table_tests {
     use super::*;
-    use crate::core::mvcc::row_locks::TableLockMode;
+    use crate::core::mvcc::table_locks::PgLockMode;
 
     fn parsed(sql: &str) -> LockTable {
         parse_lock_table(sql).expect("is a LOCK").expect("parses")
@@ -319,7 +363,7 @@ mod lock_table_tests {
         // never grants less than the caller expects.
         let l = parsed("LOCK TABLE t");
         assert_eq!(l.tables, vec!["t".to_string()]);
-        assert_eq!(l.mode, TableLockMode::Exclusive);
+        assert_eq!(l.mode, PgLockMode::AccessExclusive);
         assert!(!l.nowait);
     }
 
@@ -330,18 +374,24 @@ mod lock_table_tests {
             parsed("LOCK TABLE a, b").tables,
             vec!["a".to_string(), "b".to_string()]
         );
-        assert_eq!(parsed("LOCK TABLE t IN SHARE MODE").mode, TableLockMode::Shared);
+        assert_eq!(
+            parsed("LOCK TABLE t IN SHARE MODE").mode,
+            PgLockMode::Share
+        );
         assert_eq!(
             parsed("LOCK TABLE t IN ACCESS SHARE MODE").mode,
-            TableLockMode::Shared
+            PgLockMode::AccessShare
         );
         assert_eq!(
             parsed("LOCK TABLE t IN ACCESS EXCLUSIVE MODE").mode,
-            TableLockMode::Exclusive
+            PgLockMode::AccessExclusive
         );
         assert!(parsed("LOCK TABLE t IN EXCLUSIVE MODE NOWAIT").nowait);
         // Quoted and schema-qualified names are what an ORM emits.
-        assert_eq!(parsed("LOCK TABLE \"public\".\"t\"").tables, vec!["t".to_string()]);
+        assert_eq!(
+            parsed("LOCK TABLE \"public\".\"t\"").tables,
+            vec!["t".to_string()]
+        );
     }
 
     #[test]
@@ -353,7 +403,11 @@ mod lock_table_tests {
     fn an_unknown_mode_is_refused_rather_than_defaulted() {
         // Defaulting would hand back a weaker lock than asked for while
         // reporting success.
-        assert!(parse_lock_table("LOCK TABLE t IN WEIRD MODE").unwrap().is_err());
+        assert!(
+            parse_lock_table("LOCK TABLE t IN WEIRD MODE")
+                .unwrap()
+                .is_err()
+        );
         assert!(parse_lock_table("LOCK TABLE t IN SHARE").unwrap().is_err());
         assert!(parse_lock_table("LOCK TABLE").unwrap().is_err());
     }

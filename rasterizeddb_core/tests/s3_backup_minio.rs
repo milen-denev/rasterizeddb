@@ -53,7 +53,10 @@ macro_rules! s3_test {
         #[tokio::test]
         async fn $name() {
             let Some($client) = client() else {
-                eprintln!("skipping {}: RDB_S3_TEST_ENDPOINT is not set", stringify!($name));
+                eprintln!(
+                    "skipping {}: RDB_S3_TEST_ENDPOINT is not set",
+                    stringify!($name)
+                );
                 return;
             };
             $body
@@ -240,7 +243,10 @@ s3_test!(lists_and_abandons_orphaned_multipart_uploads, client, {
         client.abort_multipart_upload(k, id).await.expect("abort");
     }
 
-    let after = client.list_multipart_uploads(prefix).await.expect("list again");
+    let after = client
+        .list_multipart_uploads(prefix)
+        .await
+        .expect("list again");
     assert!(
         !after.iter().any(|(k, _)| k == &key),
         "the upload should be gone, got {after:?}"

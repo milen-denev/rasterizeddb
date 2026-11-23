@@ -3,10 +3,7 @@ use smallvec::SmallVec;
 
 use crate::core::row::row::{ColumnWritePayload, RowWrite};
 use crate::core::row::schema::SchemaField;
-use crate::core::{
-    db_type::DbType,
-    rql::lexer_s1::QueryPurpose,
-};
+use crate::core::{db_type::DbType, rql::lexer_s1::QueryPurpose};
 
 use crate::memory_pool::{MEMORY_POOL, MemoryBlock};
 
@@ -24,12 +21,58 @@ use crate::memory_pool::{MEMORY_POOL, MemoryBlock};
 ///
 /// A `NUMERIC(38,16)` column holds sixteen fractional digits; encoding at the
 /// engine's default nine would drop the last seven and report success.
+///
+/// The places past the scale round half away from zero, and a value past the
+/// declared precision is refused as `numeric field overflow` — the reason is
+/// left in [`REFUSAL`] for the caller to report. Both are what PostgreSQL's
+/// assignment does; this truncated, so `20.169` and `20.165` both stored 20.16,
+/// and took any number of integer digits.
+/// The type `value`, a literal written for `field`, is read at.
+///
+/// A `timestamp` column reads its literals with their zone discarded
+/// ([`SchemaField::literal_type`]), and a `timestamptz` one converts it. A
+/// cast written on the literal says which of the two it is, whatever the
+/// column: `'… 10:00+02'::timestamptz` is the 08:00 UTC instant, which a
+/// `timestamp` column holds as 08:00 (the session is UTC), and
+/// `'… 10:00+02'::timestamp` is 10:00 in either. The cast is otherwise
+/// dropped before the literal is read (`strip_redundant_cast`), which is why
+/// it is looked at here.
+pub(crate) fn literal_type_for(value: &str, field: &SchemaField) -> DbType {
+    let own = field.literal_type();
+    if !matches!(own, DbType::DATETIME | DbType::TIMESTAMP) {
+        return own;
+    }
+    let value = value.trim();
+    let stripped = crate::core::rql::column_default::strip_redundant_cast(value);
+    if stripped.len() == value.len() {
+        return own;
+    }
+    let cast = value[stripped.len()..].trim_start().trim_start_matches("::").trim();
+    if cast.eq_ignore_ascii_case("timestamptz") {
+        DbType::DATETIME
+    } else if cast.eq_ignore_ascii_case("timestamp") {
+        DbType::TIMESTAMP
+    } else {
+        own
+    }
+}
+
 fn value_to_mb_scaled(
     value_str: &str,
     db_type: &DbType,
     scale: Option<u32>,
+    precision: Option<u32>,
+    own_scale: bool,
 ) -> Option<MemoryBlock> {
     let value_str = crate::core::rql::column_default::strip_redundant_cast(value_str.trim());
+    // An unconstrained NUMERIC that keeps each value's own scale: the number
+    // as written, every digit and its display scale.
+    if *db_type == DbType::DECIMAL && own_scale && !value_str.trim().eq_ignore_ascii_case("NULL") {
+        let cell = crate::core::value_codec::own_scale_cell(value_str)?;
+        let mut mb = MEMORY_POOL.acquire(cell.len());
+        mb.into_slice_mut().copy_from_slice(&cell);
+        return Some(mb);
+    }
     if let (DbType::DECIMAL, Some(scale)) = (db_type, scale) {
         let text = value_str.trim().trim_matches('\'').trim_matches('"');
         // NULL is not a number to be parsed at a scale; it is the absence of
@@ -40,7 +83,13 @@ fn value_to_mb_scaled(
         // naming neither the column nor the value. A `numeric(18,8)` column
         // holding NULL is ordinary, so this refused ordinary rows.
         if !text.eq_ignore_ascii_case("NULL") {
-            let value = crate::core::value_codec::parse_decimal_scaled(text, scale)?;
+            let value = crate::core::value_codec::parse_decimal_rounded(text, scale)?;
+            if let Err(reason) =
+                crate::core::value_codec::check_numeric_precision(value, precision.unwrap_or(0), scale)
+            {
+                REFUSAL.with(|r| *r.borrow_mut() = Some(reason));
+                return None;
+            }
             let bytes = value.to_le_bytes();
             let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
@@ -48,6 +97,26 @@ fn value_to_mb_scaled(
         }
     }
     value_to_mb(value_str, db_type)
+}
+
+thread_local! {
+    /// Why the last `insert_row_with_defaults` on this thread refused a value,
+    /// in PostgreSQL's words. The function answers `None` for every failure,
+    /// and its callers reported each one as a "schema mismatch" (XX000); this
+    /// carries the real reason, and with it the real SQLSTATE, to the one
+    /// caller that reports it. Same thread by construction: the build is
+    /// synchronous and the caller reads it before its next `await`.
+    static REFUSAL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Takes the reason the last insert build on this thread refused a value.
+pub fn take_refusal() -> Option<String> {
+    REFUSAL.with(|r| r.borrow_mut().take())
+}
+
+fn note_refusal(field: &SchemaField, value: &str) {
+    let message = crate::core::value_codec::refusal_for_column(field, value);
+    REFUSAL.with(|r| *r.borrow_mut() = Some(message));
 }
 
 fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
@@ -65,6 +134,16 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
     // it does not; `strip_redundant_cast` removes only a cast applied to a
     // whole literal, and leaves anything it cannot vouch for to be parsed as
     // before.
+    // `2.5` into an integer column: the integer PostgreSQL assigns (3), not
+    // a refusal of the fraction. Read before the cast is stripped, which
+    // decides how a tie rounds.
+    // PostgreSQL's own integer types; an unsigned one is this engine's and
+    // keeps refusing a fraction.
+    if matches!(db_type, DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64) {
+        if let Some(rounded) = crate::core::value_codec::integer_from_number_literal(value_str) {
+            return value_to_mb(&rounded, db_type);
+        }
+    }
     let value_str = crate::core::rql::column_default::strip_redundant_cast(value_str.trim());
 
     #[inline(always)]
@@ -77,7 +156,6 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
         }
         s
     }
-
 
     /// Parses a scalar, reporting a bad literal instead of substituting a zero.
     #[inline]
@@ -188,14 +266,16 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
             mb
         }
         DbType::F32 => {
-            let val: f32 = parse_scalar::<f32>(value_str, db_type)?;
+            // A float's range is PostgreSQL's: `'1e400'` is out of range, not infinity.
+            let val: f32 = crate::core::value_codec::parse_float4(strip_surrounding_quotes(value_str))?;
             let bytes = val.to_le_bytes();
             let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             mb
         }
         DbType::F64 => {
-            let val: f64 = parse_scalar::<f64>(value_str, db_type)?;
+            // A float's range is PostgreSQL's: `'1e400'` is out of range, not infinity.
+            let val: f64 = crate::core::value_codec::parse_float8(strip_surrounding_quotes(value_str))?;
             let bytes = val.to_le_bytes();
             let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
@@ -203,13 +283,9 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
         }
         DbType::BOOL => {
             let stripped = strip_surrounding_quotes(value_str);
-            let val_u8 = parse_postgres_bool(stripped).unwrap_or_else(|| {
-                warn!(
-                    "Failed to parse BOOL value {:?}; defaulting to false",
-                    value_str
-                );
-                0
-            });
+            // Refused, not defaulted: storing `false` for `'maybe'` was a wrong
+            // value reported as success. PostgreSQL answers 22P02.
+            let val_u8 = parse_postgres_bool(stripped)?;
             let bytes = val_u8.to_le_bytes();
             let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
@@ -219,24 +295,62 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
         // one encoder with the `UPDATE` path, so the two cannot drift apart on
         // what they accept. An unparsable literal yields an empty block rather
         // than a plausible-looking zero value.
-        DbType::DATETIME | DbType::UUID | DbType::INET | DbType::DECIMAL => {
+        // `TIMESTAMP` is a `timestamp` column's literal: its zone is discarded.
+        DbType::DATETIME | DbType::TIMESTAMP | DbType::UUID | DbType::INET | DbType::DECIMAL => {
             match crate::core::value_codec::encode_literal(db_type, value_str) {
                 Some(bytes) => {
                     let mut mb = MEMORY_POOL.acquire(bytes.len());
                     mb.into_slice_mut().copy_from_slice(&bytes);
                     mb
                 }
-                None => {
-                    warn!("Failed to parse {:?} value {:?}", db_type, value_str);
-                    MemoryBlock::default()
+                // Refused rather than stored empty: an empty block reads back
+                // as a zero timestamp, a nil UUID or an empty value — a wrong
+                // value reported as success.
+                None => return None,
+            }
+        }
+        // A legacy `CHAR`: held to one character and stored in its four
+        // bytes (`value_codec::legacy_char_assign`). Copied in as text, the
+        // value was cut at four bytes by `fit_to_width` and reported stored.
+        DbType::CHAR => {
+            let stripped = crate::core::value_codec::unquote_sql(value_str);
+            match crate::core::value_codec::legacy_char_assign(&stripped) {
+                Ok(bytes) => {
+                    let mut mb = MEMORY_POOL.acquire(bytes.len());
+                    mb.into_slice_mut().copy_from_slice(&bytes);
+                    mb
+                }
+                Err(reason) => {
+                    REFUSAL.with(|r| *r.borrow_mut() = Some(reason));
+                    return None;
                 }
             }
         }
-        DbType::STRING | DbType::CHAR => {
+        DbType::STRING => {
             // `unquote_sql` rather than `strip_surrounding_quotes`: the outer
             // pair is not the whole story, since a quote inside the literal is
             // written doubled and has to be collapsed back to one.
+            //
+            // An unquoted number is its value's text, as PostgreSQL's
+            // assignment renders it: `1e1` is '10', `+9` is '9'.
+            let stripped = match crate::core::value_codec::written_constant_text(value_str) {
+                Some(text) => std::borrow::Cow::Owned(text),
+                None => crate::core::value_codec::unquote_sql(value_str),
+            };
+            let b = stripped.as_bytes();
+            let mut mb = MEMORY_POOL.acquire(b.len());
+            mb.into_slice_mut().copy_from_slice(b);
+            mb
+        }
+        // `json`: the text as written, checked to be one document
+        // (`json_in` validates and keeps the text, whitespace, key order and
+        // duplicates included).
+        DbType::JSONTEXT => {
             let stripped = crate::core::value_codec::unquote_sql(value_str);
+            if let Err(e) = crate::core::value_codec::check_json_text(&stripped) {
+                REFUSAL.with(|r| *r.borrow_mut() = Some(e));
+                return None;
+            }
             let b = stripped.as_bytes();
             let mut mb = MEMORY_POOL.acquire(b.len());
             mb.into_slice_mut().copy_from_slice(b);
@@ -248,15 +362,55 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
         // document would otherwise be stored and read back as one.
         DbType::JSONB => {
             let stripped = crate::core::value_codec::unquote_sql(value_str);
-            let document: serde_json::Value = serde_json::from_str(&stripped).ok()?;
-            let encoded = crate::core::jsonb::encode(&document);
+            let encoded = crate::core::jsonb::encode_text(&stripped).ok()?;
             let mut mb = MEMORY_POOL.acquire(encoded.len());
             mb.into_slice_mut().copy_from_slice(&encoded);
             mb
         }
+        // `byteain`, from the literal as written: its quotes are undone once
+        // (an `E'…'` string's escapes included), and input PostgreSQL refuses
+        // fails the statement. Through the shared arm below, the quotes were
+        // undone twice and a refused value was stored as zero bytes.
+        DbType::BYTEA => {
+            let bytes = match crate::core::value_codec::encode_bytea_sql(value_str) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    warn!("Refused BYTEA value {:?}: {}", value_str, e);
+                    return None;
+                }
+            };
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            mb
+        }
         // Variable-width values with a syntax of their own: `\xdeadbeef` and
         // `{a,b,NULL}`. Both share the STRING storage mechanism.
-        DbType::BYTEA | DbType::ARRAY => {
+        // Every type whose literal is text with a syntax of its own, sharing
+        // one encoder so the `INSERT` and `UPDATE` paths cannot disagree about
+        // what they accept.
+        DbType::ARRAY
+        | DbType::ARRAYOF(_)
+        | DbType::INTERVAL
+        | DbType::MACADDR
+        | DbType::MACADDR8
+        | DbType::BIT
+        | DbType::VARBIT
+        | DbType::DATE
+        | DbType::TIME
+        | DbType::TIMETZ
+        | DbType::POINT
+        | DbType::LINE
+        | DbType::LSEG
+        | DbType::BOX
+        | DbType::PATH
+        | DbType::POLYGON
+        | DbType::CIRCLE
+        | DbType::INT4RANGE
+        | DbType::INT8RANGE
+        | DbType::NUMRANGE
+        | DbType::TSRANGE
+        | DbType::TSTZRANGE
+        | DbType::DATERANGE => {
             // `unquote_sql`, exactly as `STRING` above uses it, and for the
             // same reason: a quote inside the literal is written doubled and
             // has to be collapsed back to one. Merely stripping the outer pair
@@ -270,20 +424,122 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
                     mb.into_slice_mut().copy_from_slice(&bytes);
                     mb
                 }
-                None => {
-                    warn!("Failed to parse {:?} value {:?}", db_type, value_str);
-                    MemoryBlock::default()
-                }
+                // Refused rather than stored empty: an empty block reads back
+                // as a zero timestamp, a nil UUID or an empty value — a wrong
+                // value reported as success.
+                None => return None,
             }
         }
         // Marker types carry no value. This used to panic, which made a column
         // of an unhandled type a way to kill the worker doing the insert.
         // Reporting-only: a JSON column is written as the UUID reference it
         // holds, never through this.
-        DbType::JSON | DbType::UNKNOWN | DbType::NULL | DbType::START | DbType::END => {
+        DbType::JSON | DbType::BPCHAR(_) | DbType::UNKNOWN | DbType::NULL | DbType::START | DbType::END => {
             MemoryBlock::default()
         }
     })
+}
+
+/// Whether `value` is a literal there is nothing to evaluate in: digits with
+/// at most one point between them, a `-` before them or not, or one
+/// single-quoted string holding no quote and no backslash.
+///
+/// Such a value is neither an expression nor NULL, which is what
+/// [`crate::core::rql::expr::needs_evaluation`] and
+/// [`crate::core::rql::lexer_query::looks_like_row_expression`] would each
+/// find by scanning it — the second twice over, for nesting. A loaded row is
+/// nothing but these, and every one of its values was scanned by both for
+/// the NOT NULL check and again to be encoded: a quarter of a bulk load.
+/// `plain_literals_are_what_the_scans_say` holds this to them.
+pub(crate) fn plain_literal(value: &str) -> bool {
+    match value.trim().as_bytes() {
+        [b'\'', inner @ .., b'\''] => !inner.iter().any(|c| *c == b'\'' || *c == b'\\'),
+        number => {
+            let digits = number.strip_prefix(b"-").unwrap_or(number);
+            let mut parts = digits.splitn(2, |c| *c == b'.');
+            let whole = parts.next().unwrap_or(&[]);
+            let all_digits = |part: &[u8]| !part.is_empty() && part.iter().all(u8::is_ascii_digit);
+            all_digits(whole) && parts.next().is_none_or(all_digits)
+        }
+    }
+}
+
+/// Why a value written as a bare name has no value to give, in PostgreSQL's
+/// words: `nosuch`, `"nosuch"` or `x.y` where a value belongs (`VALUES (…)`,
+/// `SET c = …`) names a column, and there is none — `VALUES` sees no column
+/// at all, so even one of the table's own is unknown there.
+///
+/// The name used to be taken for its own text: `UPDATE t SET s = nosuch`
+/// stored the string "nosuch" and reported success, as did `INSERT … VALUES
+/// (…, s)`. `None` for anything else, the keywords that are values (`NULL`,
+/// `TRUE`, `CURRENT_DATE`, `DEFAULT`, …) among it; the caller asks only of a
+/// value that names none of the columns it can see.
+pub(crate) fn bare_name_refusal(value: &str) -> Option<String> {
+    let value = value.trim();
+    let word = |w: &str| {
+        w.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+            && w.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    };
+    if let Some(inner) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        return (!inner.is_empty() && !inner.contains('"'))
+            .then(|| format!("column \"{}\" does not exist", inner));
+    }
+    if let Some((qualifier, column)) = value.split_once('.') {
+        return (word(qualifier) && word(column))
+            .then(|| format!("missing FROM-clause entry for table \"{}\"", qualifier.to_lowercase()));
+    }
+    if !word(value) {
+        return None;
+    }
+    const VALUE_KEYWORDS: &[&str] = &[
+        "NULL", "TRUE", "FALSE", "DEFAULT", "CURRENT_DATE", "CURRENT_TIME",
+        "CURRENT_TIMESTAMP", "LOCALTIME", "LOCALTIMESTAMP", "CURRENT_USER",
+        "SESSION_USER", "USER", "CURRENT_ROLE", "CURRENT_CATALOG", "CURRENT_SCHEMA",
+        // Not keywords in PostgreSQL, but the engine's own float renderings:
+        // a value it wrote back into a statement must read as it did.
+        "NAN", "INFINITY", "INF",
+    ];
+    if VALUE_KEYWORDS.iter().any(|k| value.eq_ignore_ascii_case(k)) {
+        return None;
+    }
+    Some(format!("column \"{}\" does not exist", value.to_lowercase()))
+}
+
+/// Whether a value written in `VALUES` is NULL: the keyword, or a constant
+/// expression that evaluates to NULL (`NULLIF(1, 1)`, `NULL::text`).
+///
+/// The companion flag was set only for the keyword, so an expression that
+/// came out NULL was stored as the type's filler (`''`, `0`) and read back
+/// as that, not as NULL.
+pub(crate) fn written_null(value: &str) -> bool {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("NULL") {
+        return true;
+    }
+    if plain_literal(value) {
+        return false;
+    }
+    if !(crate::core::rql::expr::needs_evaluation(value)
+        || crate::core::rql::lexer_query::looks_like_row_expression(value))
+    {
+        return false;
+    }
+    // A call that consumes a sequence value is not evaluated to ask whether
+    // it is NULL (it never is): evaluated here and again by the write, every
+    // `VALUES (nextval('s'), …)` took two values and stored the second.
+    if crate::core::sql_scan::contains_ignore_ascii_case(value, b"nextval")
+        || crate::core::sql_scan::contains_ignore_ascii_case(value, b"setval")
+    {
+        return false;
+    }
+    let empty = crate::core::row::row::Row {
+        position: 0,
+        length: 0,
+        columns: smallvec::SmallVec::new(),
+    };
+    crate::core::rql::expr::parse(value, &[])
+        .and_then(|expr| crate::core::rql::expr::eval(&expr, &empty, &[]))
+        .is_ok_and(|v| v.is_null())
 }
 
 /// Attempts to parse a QueryPurpose::InsertRow variant into a RowWrite object, using the provided schema.
@@ -299,8 +555,11 @@ pub fn assignments_of_insert(sql: &str) -> Option<Vec<(String, String)>> {
         Some((head, _)) => head,
         None => sql,
     };
-    let upper = sql.to_ascii_uppercase();
-    if !upper.trim_start().starts_with("INSERT INTO") {
+    // Searched in place: `find_word` compares case-insensitively, so the
+    // upper-cased copy of the statement each call made was only a cost
+    // (every row of an upsert pays it, twice).
+    let head = sql.trim_start().as_bytes();
+    if head.len() < "INSERT INTO".len() || !head[.."INSERT INTO".len()].eq_ignore_ascii_case(b"INSERT INTO") {
         return None;
     }
 
@@ -312,7 +571,7 @@ pub fn assignments_of_insert(sql: &str) -> Option<Vec<(String, String)>> {
         .filter(|c| !c.is_empty())
         .collect();
 
-    let values_at = find_word(&upper, "VALUES", columns_close)?;
+    let values_at = find_word(sql, "VALUES", columns_close)?;
     let values_open = sql[values_at..].find('(')? + values_at;
     let values_close = matching_paren(sql, values_open)?;
     let values = split_values(&sql[values_open + 1..values_close]);
@@ -323,31 +582,91 @@ pub fn assignments_of_insert(sql: &str) -> Option<Vec<(String, String)>> {
     Some(columns.into_iter().zip(values).collect())
 }
 
-/// Index of the parenthesis closing the one at `open`, ignoring quoted text.
-fn matching_paren(sql: &str, open: usize) -> Option<usize> {
-    let bytes = sql.as_bytes();
-    let mut depth = 0usize;
-    let mut i = open;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'\'' {
-                    i += 1;
-                }
-            }
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
+/// `OVERRIDING SYSTEM VALUE` or `OVERRIDING USER VALUE` in an `INSERT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overriding {
+    System,
+    User,
+}
+
+/// The `INSERT` without its `OVERRIDING { SYSTEM | USER } VALUE` clause, and
+/// which one it was; the text unchanged and `None` when it has none. The
+/// clause sits between the column list and `VALUES` or the query, at the
+/// top level.
+pub fn split_overriding(sql: &str) -> Result<(String, Option<Overriding>), String> {
+    let Some(at) = crate::core::rql::join::find_keyword(sql, "OVERRIDING", 0) else {
+        return Ok((sql.to_string(), None));
+    };
+    let malformed = || "syntax error at or near \"OVERRIDING\": expected OVERRIDING SYSTEM VALUE or OVERRIDING USER VALUE".to_string();
+    let rest = &sql[at + "OVERRIDING".len()..];
+    let mut words = rest.split_whitespace();
+    let kind = match words.next().map(str::to_ascii_uppercase).as_deref() {
+        Some("SYSTEM") => Overriding::System,
+        Some("USER") => Overriding::User,
+        _ => return Err(malformed()),
+    };
+    let value_word = words.next().ok_or_else(malformed)?;
+    if !value_word.eq_ignore_ascii_case("VALUE") {
+        return Err(malformed());
     }
-    None
+    // The end of `VALUE`, found in the text after the clause's second word.
+    let after_kind = rest.trim_start();
+    let after_kind = &after_kind[after_kind.find(char::is_whitespace).ok_or_else(malformed)?..];
+    let value_at = after_kind.len() - after_kind.trim_start().len();
+    let end = sql.len() - after_kind.len() + value_at + "VALUE".len();
+    let text = format!("{} {}", sql[..at].trim_end(), sql[end..].trim_start());
+    Ok((text, Some(kind)))
+}
+
+/// The `INSERT` with the assignments of the columns in `names` taken out of
+/// its column list and its `VALUES` tuple, the rest of the statement as
+/// written; `None` when it does not have the shape
+/// [`assignments_of_insert`] reads, or that would leave no column.
+///
+/// For a value about to be supplied by the engine in place of the one
+/// written (a `DEFAULT` the engine computed), which appended beside it would
+/// name the column twice: the row builder kept the first, so the computed
+/// value was dropped and the written `DEFAULT` stored an empty value.
+pub fn without_insert_assignments(sql: &str, names: &[String]) -> Option<String> {
+    let (head, returning) = match returning_split(sql) {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (sql, None),
+    };
+    let columns_open = head.find('(')?;
+    let columns_close = matching_paren(head, columns_open)?;
+    let values_at = find_word(head, "VALUES", columns_close)?;
+    let values_open = head[values_at..].find('(')? + values_at;
+    let values_close = matching_paren(head, values_open)?;
+    let columns: Vec<&str> = head[columns_open + 1..columns_close].split(',').map(str::trim).collect();
+    let values = split_values(&head[values_open + 1..values_close]);
+    if columns.len() != values.len() {
+        return None;
+    }
+    let kept: Vec<(&str, String)> = columns
+        .into_iter()
+        .zip(values)
+        .filter(|(c, _)| !names.iter().any(|n| n.eq_ignore_ascii_case(c.trim_matches('"'))))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(sql.len());
+    out.push_str(&head[..=columns_open]);
+    out.push_str(&kept.iter().map(|(c, _)| *c).collect::<Vec<_>>().join(", "));
+    out.push_str(&head[columns_close..=values_open]);
+    out.push_str(&kept.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>().join(", "));
+    out.push_str(&head[values_close..]);
+    if let Some(returning) = returning {
+        out.push_str(" RETURNING ");
+        out.push_str(returning);
+    }
+    Some(out)
+}
+
+/// Index of the parenthesis closing the one at `open`, ignoring quoted text
+/// of every kind — an escape string's `\'` or a dollar-quoted `)` included.
+fn matching_paren(sql: &str, open: usize) -> Option<usize> {
+    crate::core::sql_scan::matching_close(sql, open)
 }
 
 /// Rewrites `INSERT INTO t VALUES (…)` — no column list — into
@@ -400,8 +719,160 @@ pub fn supply_column_list(sql: &str, schema: &[SchemaField]) -> Option<String> {
     ))
 }
 
+/// The columns an `INSERT INTO t (a, b, …) …` names, unquoted as the row
+/// builder reads them; `None` when it names none (`INSERT INTO t VALUES …`,
+/// `INSERT INTO t SELECT …`) or is not an `INSERT`.
+pub fn named_columns(sql: &str) -> Option<Vec<String>> {
+    let trimmed = sql.trim_start();
+    if !trimmed.get(.."INSERT INTO".len())?.eq_ignore_ascii_case("INSERT INTO") {
+        return None;
+    }
+    let open = "INSERT INTO".len() + trimmed["INSERT INTO".len()..].find('(')?;
+    // Only a table name stands between `INSERT INTO` and the list: a `(`
+    // after VALUES, SELECT or DEFAULT is not one.
+    let head = trimmed["INSERT INTO".len()..open].trim();
+    if head.is_empty() || head.split_whitespace().count() != 1 {
+        return None;
+    }
+    let close = matching_paren(trimmed, open)?;
+    let list = &trimmed[open + 1..close];
+    let first = list.trim_start().split(|c: char| c.is_whitespace() || c == '(').next().unwrap_or("");
+    if ["SELECT", "WITH", "VALUES"].iter().any(|k| first.eq_ignore_ascii_case(k)) {
+        return None;
+    }
+    Some(
+        list.split(',')
+            .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+    )
+}
+
+/// The statement with each name in its column list spelled as the table
+/// declares it, when one is not: `None` when every name already matches a
+/// column exactly (the common case, no allocation past the scan) or the
+/// statement has no list.
+///
+/// PostgreSQL folds an unquoted identifier to lowercase, so `INSERT INTO t
+/// (ID, Name)` names `id` and `name`. Here every reader of the list matches
+/// it exactly, so `ID` was 42703. A name with no exact match takes the one
+/// live column equal to it ignoring ASCII case; with none, or with two
+/// (`"A"` and `a` both declared), it is left as written, and the 42703 gate
+/// reports it. More lenient than PostgreSQL (`"ID"` finds `id`), never
+/// retargeted: an exact match always wins.
+pub fn canonical_column_list(sql: &str, schema: &[SchemaField]) -> Option<String> {
+    let lead = sql.len() - sql.trim_start().len();
+    let trimmed = &sql[lead..];
+    named_columns(trimmed)?;
+    let open = "INSERT INTO".len() + trimmed["INSERT INTO".len()..].find('(')?;
+    let close = matching_paren(trimmed, open)?;
+    let live = || schema.iter().filter(|f| !f.is_deleted);
+    let mut out = String::new();
+    let mut from = 0usize;
+    let mut at = open + 1;
+    for item in trimmed[open + 1..close].split(',') {
+        let span_start = at + (item.len() - item.trim_start().len());
+        let name = item.trim();
+        at += item.len() + 1;
+        let bare = name.trim_matches('"').trim_matches('\'');
+        if bare.is_empty() || live().any(|f| f.name == bare) {
+            continue;
+        }
+        let mut folded = live().filter(|f| f.name.eq_ignore_ascii_case(bare));
+        // The readers below trim the quotes and never unescape a doubled
+        // one, so a name holding `"` is left for the gate.
+        let (Some(only), None) = (folded.next(), folded.next()) else {
+            continue;
+        };
+        if only.name.contains('"') {
+            continue;
+        }
+        out.push_str(&trimmed[from..span_start]);
+        out.push('"');
+        out.push_str(&only.name);
+        out.push('"');
+        from = span_start + name.len();
+    }
+    if from == 0 {
+        return None;
+    }
+    out.push_str(&trimmed[from..]);
+    Some(format!("{}{}", &sql[..lead], out))
+}
+
+/// PostgreSQL's `INSERT has more expressions than target columns` (42601).
+pub const MORE_EXPRESSIONS: &str = "INSERT has more expressions than target columns";
+/// PostgreSQL's `INSERT has more target columns than expressions` (42601).
+pub const MORE_TARGETS: &str = "INSERT has more target columns than expressions";
+/// PostgreSQL's `VALUES lists must all be the same length` (42601).
+pub const UNEQUAL_TUPLES: &str = "VALUES lists must all be the same length";
+
+/// PostgreSQL's arity refusal for an `INSERT … VALUES`, or `None` when every
+/// tuple fits its target columns.
+///
+/// Checked once per statement, before anything reads a default or splits
+/// the tuples. Without it the row parser saw the counts differ and gave up
+/// without a reason: a plain table answered `XX000 Cannot insert row due to
+/// schema mismatch`, and a partitioned one reached its NOT NULL check first
+/// and blamed the key column (`23502 null value in column "tenant_id"`), for
+/// a statement whose only fault was one value too many, as a locale's
+/// decimal comma (`204,60`) makes one value two.
+///
+/// PostgreSQL's order (`transformInsertStmt`): the tuples one by one, each
+/// after the first held to the first one's length, then each against the
+/// targets. With a column list the targets are its columns and a short
+/// tuple is refused too; without one they are the `writable` columns the
+/// tuple maps onto in order, and a short tuple leaves the rest to their
+/// defaults.
+///
+/// Only `INSERT INTO name [(columns)] VALUES (…)[, (…)]…` is read. Any other
+/// shape (`… SELECT`, `DEFAULT VALUES`, an alias) is `None`, left to the
+/// paths that handle it.
+pub fn values_arity_error(sql: &str, writable: usize) -> Option<&'static str> {
+    let trimmed = sql.trim_start();
+    if !trimmed.get(.."INSERT INTO".len())?.eq_ignore_ascii_case("INSERT INTO") {
+        return None;
+    }
+    let values_at = find_word(trimmed, "VALUES", "INSERT INTO".len())?;
+    let head = trimmed["INSERT INTO".len()..values_at].trim();
+    let (targets, explicit) = match head.find('(') {
+        None if head.split_whitespace().count() == 1 => (writable, false),
+        None => return None,
+        Some(open) => {
+            let close = matching_paren(head, open)?;
+            if head[..open].split_whitespace().count() != 1 || !head[close + 1..].trim().is_empty() {
+                return None;
+            }
+            (named_columns(trimmed)?.len(), true)
+        }
+    };
+    let mut rest = trimmed[values_at + "VALUES".len()..].trim_start();
+    let mut first: Option<usize> = None;
+    while rest.starts_with('(') {
+        let close = matching_paren(rest, 0)?;
+        let n = split_values(&rest[1..close]).len();
+        if first.is_some_and(|f| f != n) {
+            return Some(UNEQUAL_TUPLES);
+        }
+        first.get_or_insert(n);
+        if n > targets {
+            return Some(MORE_EXPRESSIONS);
+        }
+        if explicit && n < targets {
+            return Some(MORE_TARGETS);
+        }
+        rest = rest[close + 1..].trim_start();
+        match rest.strip_prefix(',') {
+            Some(next) => rest = next.trim_start(),
+            None => break,
+        }
+    }
+    None
+}
+
 /// Position of `word` in `upper` at or after `from`, outside quotes and on a
-/// word boundary, or `None`.
+/// word boundary, or `None`. The match ignores ASCII case, so `upper` may be
+/// the statement as written.
 fn find_word(upper: &str, word: &str, from: usize) -> Option<usize> {
     let bytes = upper.as_bytes();
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
@@ -412,9 +883,17 @@ fn find_word(upper: &str, word: &str, from: usize) -> Option<usize> {
         match bytes[i] {
             b'\'' if !in_identifier => in_string = !in_string,
             b'"' if !in_string => in_identifier = !in_identifier,
+            // Compared as bytes: `upper[i..]` panics when `i` falls inside a
+            // multi-byte character, which an unquoted identifier like `tëst`
+            // puts outside every quote — it took the worker down mid-INSERT.
+            //
+            // Case-insensitive, so the original statement can be searched
+            // without upper-casing a copy of it (`word` is upper case).
             _ if !in_string
                 && !in_identifier
-                && upper[i..].starts_with(word)
+                && bytes
+                    .get(i..i + word.len())
+                    .is_some_and(|w| w.eq_ignore_ascii_case(word.as_bytes()))
                 && (i == 0 || !is_word(bytes[i - 1]))
                 && bytes.get(i + word.len()).map_or(true, |b| !is_word(*b)) =>
             {
@@ -441,35 +920,11 @@ fn quote_identifier(name: &str) -> String {
     }
 }
 
-/// Splits a VALUES list on commas outside quotes and parentheses.
+/// Splits a VALUES list on commas at nesting depth zero; see
+/// [`parse_csv_values`]. It tracked parentheses but not brackets, escape
+/// strings or dollar quotes.
 fn split_values(list: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0usize;
-    let mut quoted = false;
-
-    for c in list.chars() {
-        match c {
-            '\'' => {
-                quoted = !quoted;
-                current.push(c);
-            }
-            '(' if !quoted => {
-                depth += 1;
-                current.push(c);
-            }
-            ')' if !quoted => {
-                depth = depth.saturating_sub(1);
-                current.push(c);
-            }
-            ',' if !quoted && depth == 0 => out.push(std::mem::take(&mut current).trim().to_string()),
-            _ => current.push(c),
-        }
-    }
-    if !current.trim().is_empty() {
-        out.push(current.trim().to_string());
-    }
-    out
+    parse_csv_values(list).into_iter().map(str::to_string).collect()
 }
 
 /// Extracts the column list of a `RETURNING` clause, resolved against the schema.
@@ -498,17 +953,73 @@ fn split_values(list: &str) -> Vec<String> {
 /// list, so the ordinary insert path does the writing and there is no second
 /// write path to keep in step.
 ///
-/// `None` for an ordinary `VALUES` insert, and for `INSERT INTO t SELECT …`
-/// written without a column list — the first parenthesis then belongs to the
-/// query rather than to a column list, and guessing between the two would be
-/// worse than declining.
+/// `INSERT INTO t SELECT …` with no column list is split too, with the prefix
+/// ending at the table name. That is told by the word right after the name,
+/// not by where the first parenthesis is, so a parenthesis inside the query is
+/// never mistaken for a column list. The caller's rewrite then names no
+/// columns either, and the ordinary path supplies them from the schema as it
+/// does for `INSERT INTO t VALUES (…)`.
+///
+/// `None` for an ordinary `VALUES` insert.
 pub fn insert_select_source(sql: &str) -> Option<(&str, &str)> {
     const INSERT_INTO: &str = "INSERT INTO";
     let trimmed = sql.trim_start();
+    // Byte comparisons throughout: slicing `&str` at a keyword's length panics
+    // when that length falls inside a multi-byte character.
     if trimmed.len() < INSERT_INTO.len()
-        || !trimmed[..INSERT_INTO.len()].eq_ignore_ascii_case(INSERT_INTO)
+        || !trimmed.as_bytes()[..INSERT_INTO.len()].eq_ignore_ascii_case(INSERT_INTO.as_bytes())
     {
         return None;
+    }
+
+    // Matched as a whole word: a column list followed by a relation named
+    // `selection` must not read as a query.
+    let starts_word = |rest: &str, keyword: &str| {
+        rest.len() >= keyword.len()
+            && rest.as_bytes()[..keyword.len()].eq_ignore_ascii_case(keyword.as_bytes())
+            && rest.as_bytes()
+                .get(keyword.len())
+                .map_or(true, |c| c.is_ascii_whitespace() || *c == b'(')
+    };
+
+    // The table name, which may be quoted or qualified, ends at whitespace or
+    // at the column list's parenthesis. A query straight after it means there
+    // is no column list.
+    let bytes = trimmed.as_bytes();
+    let mut at = INSERT_INTO.len();
+    while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+        at += 1;
+    }
+    while let Some(&b) = bytes.get(at) {
+        if b == b'"' {
+            at += 1;
+            while bytes.get(at).is_some_and(|b| *b != b'"') {
+                at += 1;
+            }
+            at += 1;
+        } else if b.is_ascii_whitespace() || b == b'(' {
+            break;
+        } else {
+            at += 1;
+        }
+    }
+    let name_end = at.min(bytes.len());
+    while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+        at += 1;
+    }
+    if let Some(rest) = trimmed.get(at..) {
+        if name_end > INSERT_INTO.len() && (starts_word(rest, "SELECT") || starts_word(rest, "WITH")) {
+            return Some((&trimmed[..name_end], rest));
+        }
+        // `INSERT INTO t OVERRIDING … VALUE SELECT …`: the clause stays with
+        // the prefix, where the tuple path reads it (`split_overriding`).
+        let skip = overriding_len(rest);
+        if name_end > INSERT_INTO.len() && skip > 0 {
+            let query = &rest[skip..];
+            if starts_word(query, "SELECT") || starts_word(query, "WITH") {
+                return Some((&trimmed[..at + skip], query));
+            }
+        }
     }
 
     let open = trimmed.find('(')?;
@@ -526,22 +1037,34 @@ pub fn insert_select_source(sql: &str) -> Option<(&str, &str)> {
     let after_columns = close + 1;
     let offset = trimmed[after_columns..].find(|c: char| !c.is_whitespace())? + after_columns;
     let rest = &trimmed[offset..];
+    let skip = overriding_len(rest);
+    let (head_end, rest) = (if skip > 0 { offset + skip } else { after_columns }, &rest[skip..]);
 
-    // Matched as a whole word: a column list followed by a relation named
-    // `selection` must not read as a query.
-    let starts_word = |keyword: &str| {
-        rest.len() >= keyword.len()
-            && rest[..keyword.len()].eq_ignore_ascii_case(keyword)
-            && rest[keyword.len()..]
-                .chars()
-                .next()
-                .map_or(true, |c| c.is_whitespace() || c == '(')
-    };
-    if !starts_word("SELECT") && !starts_word("WITH") {
+    if !starts_word(rest, "SELECT") && !starts_word(rest, "WITH") {
         return None;
     }
 
-    Some((&trimmed[..after_columns], rest))
+    Some((&trimmed[..head_end], rest))
+}
+
+/// The length of a leading `OVERRIDING { SYSTEM | USER } VALUE` in `text`,
+/// with the whitespace after it; 0 when it does not start with one.
+fn overriding_len(text: &str) -> usize {
+    let mut at = 0usize;
+    for (i, options) in [&["OVERRIDING"][..], &["SYSTEM", "USER"][..], &["VALUE"][..]].into_iter().enumerate() {
+        let rest = &text[at..];
+        let start = rest.len() - rest.trim_start().len();
+        if i == 0 && start != 0 {
+            return 0;
+        }
+        let word_end = rest[start..].find(|c: char| c.is_whitespace()).map_or(rest.len(), |e| start + e);
+        if !options.iter().any(|w| rest[start..word_end].eq_ignore_ascii_case(w)) {
+            return 0;
+        }
+        at += word_end;
+    }
+    let rest = &text[at..];
+    at + (rest.len() - rest.trim_start().len())
 }
 
 /// A byte that can sit inside an identifier, so `RETURNING` next to one is part
@@ -554,6 +1077,11 @@ fn is_ident_byte(b: u8) -> bool {
 
 pub fn returning_split(sql: &str) -> Option<(&str, &str)> {
     let bytes = sql.as_bytes();
+    // No `RETURNING` anywhere, in any case, literals included, is none to
+    // find: found by `memchr` for the statements, nearly all, that have none.
+    if !memchr::memchr2_iter(b'r', b'R', bytes).any(|p| bytes.len() - p >= 9 && bytes[p..p + 9].eq_ignore_ascii_case(b"RETURNING")) {
+        return None;
+    }
     let mut i = 0usize;
 
     while i < bytes.len() {
@@ -574,7 +1102,10 @@ pub fn returning_split(sql: &str) -> Option<(&str, &str)> {
         }
 
         const KW: usize = "RETURNING".len();
-        if i + KW <= bytes.len()
+        // The first byte first: it rules out nearly every position, where
+        // the nine-byte comparison ran at each one.
+        if bytes[i] | 0x20 == b'r'
+            && i + KW <= bytes.len()
             && bytes[i..i + KW].eq_ignore_ascii_case(b"RETURNING")
             && (i == 0 || !is_ident_byte(bytes[i - 1]))
             && (i + KW == bytes.len() || !is_ident_byte(bytes[i + KW]))
@@ -587,65 +1118,14 @@ pub fn returning_split(sql: &str) -> Option<(&str, &str)> {
     None
 }
 
-pub fn returning_columns(sql: &str, schema: &[SchemaField]) -> Option<Result<Vec<SchemaField>, String>> {
-    // Find the keyword outside of any string literal, so a value containing the
-    // word "returning" cannot be mistaken for the clause.
-    let bytes = sql.as_bytes();
-    let mut i = 0usize;
-    let mut kw_at = None;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\'' {
-                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            _ => {
-                const KW: &[u8] = b"RETURNING";
-                if i + KW.len() <= bytes.len()
-                    && bytes[i..i + KW.len()].eq_ignore_ascii_case(KW)
-                    && (i == 0 || !is_ident_byte(bytes[i - 1]))
-                    && (i + KW.len() == bytes.len()
-                        || !is_ident_byte(bytes[i + KW.len()]))
-                {
-                    kw_at = Some(i + KW.len());
-                    break;
-                }
-                i += 1;
-            }
-        }
-    }
-
-    let start = kw_at?;
-    let list = sql[start..].trim().trim_end_matches(';').trim();
-    if list.is_empty() {
-        return Some(Err("RETURNING is present but no columns were listed".to_string()));
-    }
-
-    if list == "*" {
-        // The same columns `SELECT *` shows, for the same reasons: a `__null_`
-        // companion is bookkeeping the client has no name for, and a dropped
-        // column keeps its slot rather than being removed, so both would
-        // otherwise come back here after `SELECT *` had stopped returning them.
-        let mut fields: Vec<SchemaField> = schema
-            .iter()
-            .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
-            .cloned()
-            .collect();
-        fields.sort_by_key(|f| f.write_order);
-        return Some(Ok(fields));
-    }
-
-    Some(parse_items(list, schema).map(|items| {
+pub fn returning_columns(
+    sql: &str,
+    schema: &[SchemaField],
+) -> Option<Result<Vec<SchemaField>, String>> {
+    // Read from the items, so the two views cannot disagree: this one had a
+    // keyword scan and a `*` of its own, and refused `RETURNING t.*` the items
+    // had accepted.
+    Some(returning_items(sql, schema)?.map(|items| {
         // The compatibility view: every item as a `SchemaField`. A computed
         // item gets a synthetic one — its alias, its static type, a
         // write_order above every real field's — which is exactly what the
@@ -693,12 +1173,26 @@ pub fn returning_items(
     sql: &str,
     schema: &[SchemaField],
 ) -> Option<Result<Vec<ReturningItem>, String>> {
-    let (_, list) = returning_split(sql)?;
+    let (head, list) = returning_split(sql)?;
     let list = list.trim().trim_end_matches(';').trim();
     if list.is_empty() {
-        return Some(Err("RETURNING is present but no columns were listed".to_string()));
+        return Some(Err(
+            "RETURNING is present but no columns were listed".to_string()
+        ));
     }
-    if list == "*" {
+    // Every qualifier names the statement's relation (its alias alone when
+    // it has one); `RETURNING nosuch.id` committed and answered. A join
+    // write (`UPDATE … FROM`, `DELETE … USING`) checks its own, across its
+    // relations.
+    let mut star = false;
+    if let Some(allowed) = write_target_qualifiers(head) {
+        let allowed: Vec<&str> = allowed.iter().map(String::as_str).collect();
+        if let Some(q) = crate::core::sql_scan::unknown_qualifier(list, &allowed) {
+            return Some(Err(crate::core::sql_scan::missing_from_entry(&q)));
+        }
+        star = crate::core::sql_scan::is_qualified_star(list, &allowed);
+    }
+    if list == "*" || star {
         let mut fields: Vec<SchemaField> = schema
             .iter()
             .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
@@ -708,6 +1202,36 @@ pub fn returning_items(
         return Some(Ok(fields.into_iter().map(ReturningItem::Column).collect()));
     }
     Some(parse_items(list, schema))
+}
+
+/// The qualifiers the target of a one-relation `INSERT`, `UPDATE` or
+/// `DELETE` is known by; `None` for one that joins other relations or that
+/// this cannot read.
+fn write_target_qualifiers(head: &str) -> Option<Vec<String>> {
+    use crate::core::rql::join::find_keyword;
+    let words: Vec<&str> = head.split_whitespace().collect();
+    let first = words.first()?.to_ascii_uppercase();
+    let (name, rest) = match first.as_str() {
+        "INSERT" if words.get(1)?.eq_ignore_ascii_case("INTO") => (*words.get(2)?, &words[3..]),
+        "UPDATE" if find_keyword(head, "FROM", 0).is_none() => (*words.get(1)?, &words[2..]),
+        "DELETE" if words.get(1)?.eq_ignore_ascii_case("FROM") && find_keyword(head, "USING", 0).is_none() => {
+            (*words.get(2)?, &words[3..])
+        }
+        _ => return None,
+    };
+    let name = name.split('(').next()?;
+    let alias = match rest {
+        [kw, a, ..] if kw.eq_ignore_ascii_case("AS") => Some(a.split('(').next()?),
+        [a, ..] if !["SET", "WHERE", "VALUES", "SELECT", "DEFAULT", "ON", "OVERRIDING"]
+            .iter()
+            .any(|k| a.eq_ignore_ascii_case(k))
+            && !a.starts_with('(') =>
+        {
+            Some(*a)
+        }
+        _ => None,
+    };
+    Some(crate::core::sql_scan::relation_qualifiers(name, alias))
 }
 
 fn parse_items(list: &str, schema: &[SchemaField]) -> Result<Vec<ReturningItem>, String> {
@@ -723,11 +1247,14 @@ fn parse_items(list: &str, schema: &[SchemaField]) -> Result<Vec<ReturningItem>,
         // operator — is a stored column. With an alias it becomes a computed
         // echo of itself, so the wire layer names it the way the client asked.
         let is_single_name = !expr_text.contains(|c: char| {
-            c.is_whitespace()
-                || matches!(c, '(' | ')' | '+' | '-' | '*' | '/' | '|' | ':' | ',')
+            c.is_whitespace() || matches!(c, '(' | ')' | '+' | '-' | '*' | '/' | '|' | ':' | ',')
         });
         if is_single_name {
-            let name = expr_text.rsplit('.').next().unwrap_or(expr_text).trim_matches('"');
+            let name = expr_text
+                .rsplit('.')
+                .next()
+                .unwrap_or(expr_text)
+                .trim_matches('"');
             if let Some(f) = schema.iter().find(|f| {
                 f.name.eq_ignore_ascii_case(name)
                     && !f.is_deleted
@@ -745,8 +1272,15 @@ fn parse_items(list: &str, schema: &[SchemaField]) -> Result<Vec<ReturningItem>,
             }
         }
 
-        // Anything else is an expression over the affected row.
-        match crate::core::rql::expr::parse(expr_text, schema) {
+        // Anything else is an expression over the affected row: a value, or
+        // a comparison read as the boolean it is (`k > 5`, `v IS NULL`),
+        // which the expression grammar alone refused ("RETURNING column 'k >
+        // 5' not found in schema").
+        let parsed = match crate::core::rql::expr::parse(expr_text, schema) {
+            Ok(expr) => Ok(expr),
+            Err(e) => crate::core::rql::join::comparison_value(expr_text, schema).ok().flatten().ok_or(e),
+        };
+        match parsed {
             Ok(expr) => {
                 // The expression path must not become a way to address what
                 // the column path refuses: a `__null_` companion is engine
@@ -755,10 +1289,7 @@ fn parse_items(list: &str, schema: &[SchemaField]) -> Result<Vec<ReturningItem>,
                     .iter()
                     .any(|f| crate::core::rql::nullable::is_hidden(&f.name))
                 {
-                    return Err(format!(
-                        "RETURNING column '{}' not found in schema",
-                        item
-                    ));
+                    return Err(format!("RETURNING column '{}' not found in schema", item));
                 }
                 let db_type = crate::core::rql::expr::static_type(&expr);
                 out.push(ReturningItem::Computed {
@@ -775,6 +1306,22 @@ fn parse_items(list: &str, schema: &[SchemaField]) -> Result<Vec<ReturningItem>,
     Ok(out)
 }
 
+/// Splits a `VALUES` tuple's contents into its values, each trimmed and
+/// borrowed from `s`.
+///
+/// Quotes are kept: they are what distinguishes the keyword `NULL` from the
+/// four-character string `'NULL'`, and each type's encoder strips them itself.
+/// A trailing empty value is dropped (`1, ` is one value) while an empty one
+/// between commas is kept, as it always was.
+///
+/// A comma separates values only at nesting depth zero — outside every string
+/// (standard, escape, dollar-quoted), quoted identifier, `(…)` and `[…]`. It
+/// used to track quotes alone, so `ARRAY[1,2]` was two values: three columns
+/// given `(ARRAY[1,2], 3)` stored `ARRAY[1` and `2]` and reported success.
+fn parse_csv_values(s: &str) -> Vec<&str> {
+    crate::core::sql_scan::split_top_level(s, b',')
+}
+
 /// Pads or truncates a column value to the width its slot expects.
 ///
 /// `STRING` is variable-width and is left alone; every other type occupies a
@@ -782,12 +1329,7 @@ fn parse_items(list: &str, schema: &[SchemaField]) -> Result<Vec<ReturningItem>,
 /// `copy_from_slice`, which panics on a length mismatch. Producing a
 /// zero-filled value of the right width turns what would be a crashed worker
 /// into a stored default.
-fn fit_to_width(
-    data: MemoryBlock,
-    db_type: &DbType,
-    width: usize,
-    col_name: &str,
-) -> MemoryBlock {
+fn fit_to_width(data: MemoryBlock, db_type: &DbType, width: usize, col_name: &str) -> MemoryBlock {
     if db_type.is_variable_width() || data.into_slice().len() == width {
         return data;
     }
@@ -820,7 +1362,9 @@ pub fn insert_row_from_query_purpose(
     qp: &QueryPurpose,
     schema: &[SchemaField],
 ) -> Option<RowWrite> {
-    insert_row_with_defaults(qp, schema, &[], &[])
+    // No defaults, so no `nextval` can be reached and no database's sequence
+    // is consulted: the id is never read.
+    insert_row_with_defaults(qp, schema, &[], &[], 0)
 }
 
 /// As `insert_row_from_query_purpose`, but filling omitted columns from their
@@ -839,20 +1383,203 @@ fn declared_scale(
         .map(|m| m.scale as u32)
 }
 
+/// `database` is the id of the database the row is written into
+/// ([`crate::core::database::Database::id`]): a `SERIAL` default draws from that
+/// database's sequence, and from no other's.
+/// The stored bytes of `value`, one `VALUES` item, for `schema_field`: what an
+/// `INSERT` writes into the field's slot, a constant expression evaluated
+/// (`CAST(-6 AS BIGINT)`, `2147483647 + 1`), a literal read at the column's
+/// type and declared scale (`'x'::text`, `-7::bigint`), and fitted to its
+/// width. `None` when the value is refused; the reason is left for
+/// [`take_refusal`]. The one encoder: an `INSERT` routes a partitioned row by
+/// these bytes, and a foreign key's probe of a partitioned parent routes a
+/// value by them too (phase 3 P4).
+pub(crate) fn encode_column_value(
+    value: &str,
+    schema_field: &SchemaField,
+    modifiers: &[crate::core::rql::type_modifier::TypeModifier],
+) -> Option<MemoryBlock> {
+    // A function call in VALUES is evaluated, or refused. It must not
+    // reach `value_to_mb`, which cannot parse it and yields an empty
+    // block: `INSERT … VALUES (gen_random_uuid())` stored a zero UUID
+    // and reported success.
+    let value_owned;
+    // An unquoted number for a text column is its value's text, as
+    // PostgreSQL's assignment renders it (`numeric_constant_text`), and is
+    // taken before the expression test: `100e-2` looks like arithmetic to it,
+    // and evaluated it lost the scale its digits give it ('1', not '1.00').
+    //
+    // Asked only of a text column, and never of a quoted string, which is no
+    // unquoted number: it was asked of every value of every column, and reads
+    // each one digit by digit to say so.
+    let rendered_constant;
+    let value: &str = match schema_field.db_type {
+        DbType::STRING | DbType::CHAR if !value.trim_start().starts_with('\'') => {
+            match crate::core::value_codec::written_constant_text(value) {
+                Some(text) => {
+                    rendered_constant = crate::core::value_codec::quote_sql(&text);
+                    &rendered_constant
+                }
+                None => value,
+            }
+        }
+        _ => value,
+    };
+    // Arithmetic counts as well as a call: `VALUES (2147483647 + 1)` has
+    // neither parentheses nor a cast, and was handed to the column's
+    // literal reader whole, which refused it as unreadable text.
+    let value = if !plain_literal(value)
+        && (crate::core::rql::expr::needs_evaluation(value)
+            || crate::core::rql::lexer_query::looks_like_row_expression(value))
+    {
+        // There is no row yet, so only a constant-foldable expression
+        // has meaning here — a nullary function or a literal. Its
+        // failure is the statement's answer, carried to the client as
+        // the refusal: `integer out of range` is 22003, not a schema
+        // mismatch.
+        let refuse = |e: String| {
+            error!("INSERT parse failed: {}", e);
+            REFUSAL.with(|r| *r.borrow_mut() = Some(e));
+        };
+        let expr = crate::core::rql::expr::parse(value, &[]).map_err(refuse).ok()?;
+        let empty = crate::core::row::row::Row {
+            position: 0,
+            length: 0,
+            columns: smallvec::SmallVec::new(),
+        };
+        // An integer column takes the value at its own width here, as
+        // an assignment does, so one it cannot hold is refused instead
+        // of keeping its low bytes. A decimal stays at the engine scale:
+        // it is rendered as text below and read at the column's scale
+        // by the literal reader.
+        //
+        // A NUMERIC column takes the value computed for it, exactly and at
+        // its own scale (`expr::eval_into`): at the engine's nine places,
+        // `VALUES (1 / 3.0)` into a NUMERIC(20,12) stored 0.333333333000. A
+        // `jsonb` one is checked as an assignment is (`'a' || 'b'` is text).
+        let scale = declared_scale(&schema_field.name, modifiers);
+        // A text column takes the value's text, as an assignment renders it
+        // (`expr::from_engine_scale`): a `timestamptz` with `+00`, a
+        // `timestamp` without (`expr::yields_timestamp`), a number as its
+        // digits.
+        let evaluated = match schema_field.db_type {
+            DbType::DECIMAL | DbType::JSONB | DbType::STRING | DbType::CHAR => {
+                let mut target = schema_field.clone();
+                target.scale = scale;
+                crate::core::rql::expr::eval_into(&expr, &empty, &[], &target)
+            }
+            _ => crate::core::rql::expr::eval(&expr, &empty, &[])
+                .and_then(|v| crate::core::rql::expr::to_integer_column(v, &schema_field.db_type)),
+        }
+        .map_err(refuse)
+        .ok()?;
+        value_owned = match evaluated {
+            crate::core::rql::expr::Value::Null => "NULL".to_string(),
+            crate::core::rql::expr::Value::Data { bytes, db_type: DbType::DECIMAL }
+                if schema_field.db_type == DbType::DECIMAL =>
+            {
+                // At the column's scale now, which the engine-scale renderer
+                // would read a power of ten wrong; a cell carrying its own
+                // scale (a column that keeps it) at that scale.
+                match crate::core::value_codec::split_decimal_cell(&bytes) {
+                    Some((m, own)) => crate::core::value_codec::format_decimal_scaled(
+                        m,
+                        own.or(scale).unwrap_or(crate::core::value_codec::DECIMAL_SCALE),
+                    ),
+                    None => "NULL".to_string(),
+                }
+            }
+            // A `real` (`CAST('0.1' AS real)`) bound for a `double
+            // precision` column: the real widened, written as the double it
+            // then is, which the column reads back exactly.
+            crate::core::rql::expr::Value::Data { bytes, db_type: DbType::F32 }
+                if schema_field.db_type == DbType::F64 =>
+            {
+                match <[u8; 4]>::try_from(bytes.as_slice()) {
+                    Ok(b) => crate::core::value_codec::widened_real_text(f32::from_le_bytes(b)),
+                    Err(_) => "NULL".to_string(),
+                }
+            }
+            crate::core::rql::expr::Value::Data { bytes, db_type } => {
+                crate::core::rql::subquery::value_to_literal(&db_type, &bytes)
+                    .unwrap_or_else(|| "NULL".to_string())
+            }
+        };
+        &value_owned
+    } else {
+        value
+    };
+
+    let encoded = value_to_mb_scaled(
+        value,
+        // A `timestamp` column's literal keeps its wall-clock time.
+        &literal_type_for(value, schema_field),
+        declared_scale(&schema_field.name, modifiers),
+        crate::core::rql::type_modifier::precision_of(&schema_field.name, modifiers),
+        crate::core::value_codec::keeps_own_scale(schema_field),
+    )
+    .or_else(|| {
+        // A reason already given — an overflow — is the real one.
+        if REFUSAL.with(|r| r.borrow().is_none()) {
+            note_refusal(schema_field, value);
+        }
+        None
+    })?;
+    Some(fit_to_width(
+        held_to_text_length(encoded, schema_field)?,
+        &schema_field.db_type,
+        schema_field.size as usize,
+        &schema_field.name,
+    ))
+}
+
+/// `data`, a text value for `field`, held to the field's declared length
+/// (`type_modifier::TextTypmod::assign`): a `character(n)` value without its
+/// trailing spaces, a `character varying(n)` one cut of excess spaces.
+/// `None`, the reason left for [`take_refusal`], when it is too long (22001).
+/// Before any key is computed from the row, so `'b '` and `'b'` in a
+/// `character(3)` key are one key to the uniqueness check, the conflict
+/// arbiter and the multi-row check alike.
+fn held_to_text_length(data: MemoryBlock, field: &SchemaField) -> Option<MemoryBlock> {
+    match crate::core::rql::type_modifier::assign_bytes(field, data.into_slice()) {
+        Ok(None) => Some(data),
+        Ok(Some(bytes)) => {
+            let mut mb = MEMORY_POOL.acquire(bytes.len());
+            mb.into_slice_mut().copy_from_slice(&bytes);
+            Some(mb)
+        }
+        Err(reason) => {
+            REFUSAL.with(|r| *r.borrow_mut() = Some(reason));
+            None
+        }
+    }
+}
+
 pub fn insert_row_with_defaults(
     qp: &QueryPurpose,
     schema: &[SchemaField],
     defaults: &[crate::core::rql::column_default::ColumnDefault],
     modifiers: &[crate::core::rql::type_modifier::TypeModifier],
+    database: u64,
 ) -> Option<RowWrite> {
+    REFUSAL.with(|r| *r.borrow_mut() = None);
     if let QueryPurpose::InsertRow(sql) = qp {
         let sql = sql.query.as_str();
         // Trim leading whitespace and newlines
         let sql_trimmed =
             sql.trim_start_matches(|c: char| c.is_whitespace() || c == '\n' || c == '\r');
-        let sql_upper = sql_trimmed.to_ascii_uppercase();
-        if !sql_upper.starts_with("INSERT INTO") {
-            error!("INSERT parse failed: query does not start with INSERT INTO. prefix={:?}", sql_trimmed.chars().take(80).collect::<String>());
+        // No upper-cased copy of the statement: it was made only to find two
+        // keywords, and a wide INSERT is mostly value text. Both are matched
+        // case-insensitively in place instead.
+        if !sql_trimmed
+            .as_bytes()
+            .get(.."INSERT INTO".len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(b"INSERT INTO"))
+        {
+            error!(
+                "INSERT parse failed: query does not start with INSERT INTO. prefix={:?}",
+                sql_trimmed.chars().take(80).collect::<String>()
+            );
             return None;
         }
         let sql = sql_trimmed;
@@ -865,100 +1592,69 @@ pub fn insert_row_with_defaults(
         /// `VALUES (1, 'a)b')` closed at the `)` *inside* the string, so the
         /// row was stored as `'a` — a silently truncated value from a
         /// well-formed statement, with no error anywhere.
+        ///
+        /// `start` is a byte offset and the walk is over bytes. It used to be
+        /// `char_indices().skip(start)`, which skips `start` *characters*: every
+        /// multi-byte character before the parenthesis — a table called
+        /// `"tëst"`, a column called `"日本"` — moved the walk past it, so the
+        /// tuple was taken for the column list or never found at all. The
+        /// delimiters are ASCII, and a byte of a multi-byte UTF-8 character is
+        /// never ASCII, so a byte walk cannot match inside one.
         fn extract_paren_block(
             s: &str,
-            open: char,
-            close: char,
+            open: u8,
+            close: u8,
             start: usize,
         ) -> Option<(usize, usize)> {
+            let bytes = s.as_bytes();
             let mut depth = 0;
             let mut begin = None;
-            let mut in_single = false;
-            let mut in_double = false;
-            for (i, c) in s.char_indices().skip(start) {
-                match c {
-                    '\'' if !in_double => in_single = !in_single,
-                    '"' if !in_single => in_double = !in_double,
-                    _ if in_single || in_double => {}
-                    _ if c == open => {
-                        if depth == 0 {
-                            begin = Some(i);
-                        }
-                        depth += 1;
-                    }
-                    _ if c == close => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return begin.map(|b| (b, i));
-                        }
-                    }
-                    _ => {}
+            let mut i = start;
+            while i < bytes.len() {
+                // Every kind of quoted run is stepped over whole, an escape
+                // string's `\'` and a dollar-quoted body included.
+                if let Some(end) = crate::core::sql_scan::skip_quoted(bytes, i) {
+                    i = end;
+                    continue;
                 }
+                let c = bytes[i];
+                if c == open {
+                    if depth == 0 {
+                        begin = Some(i);
+                    }
+                    depth += 1;
+                } else if c == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        return begin.map(|b| (b, i));
+                    }
+                }
+                i += 1;
             }
             None
         }
 
-        // --- Helper to parse comma-separated values respecting quotes ---
-        fn parse_csv_values(s: &str) -> Vec<String> {
-            let mut values = Vec::new();
-            let mut current_value = String::new();
-            let mut in_quotes = false;
-            let mut quote_char = '"';
-            let mut chars = s.chars();
-
-            while let Some(c) = chars.next() {
-                match c {
-                    '"' | '\'' if !in_quotes => {
-                        in_quotes = true;
-                        quote_char = c;
-                        current_value.push(c);
-                    }
-                    c if c == quote_char && in_quotes => {
-                        in_quotes = false;
-                        current_value.push(c);
-                    }
-                    ',' if !in_quotes => {
-                        // Quotes are kept: they are what distinguishes the
-                        // keyword `NULL` from the four-character string
-                        // `'NULL'`. Each type's encoder strips them itself.
-                        values.push(current_value.trim().to_string());
-                        current_value.clear();
-                    }
-                    _ => {
-                        current_value.push(c);
-                    }
-                }
-            }
-
-            // Don't forget the last value
-            let trimmed = current_value.trim();
-            if !trimmed.is_empty() {
-                values.push(trimmed.to_string());
-            }
-
-            values
-        }
-
-        // Find columns block after "INSERT INTO table_name"
-        let insert_kw = match sql_upper.find("INSERT INTO") {
-            Some(v) => v,
-            None => {
-                error!("INSERT parse failed: could not find INSERT INTO keyword. prefix={:?}", sql_trimmed.chars().take(120).collect::<String>());
-                return None;
-            }
-        };
+        // Find columns block after "INSERT INTO table_name"; the statement
+        // was just checked to start with it.
+        let insert_kw = 0usize;
         // Skip table name: find first '(' after "INSERT INTO"
         let table_paren_start = match sql[insert_kw..].find('(') {
             Some(v) => v + insert_kw,
             None => {
-                error!("INSERT parse failed: missing column list parentheses after INSERT INTO. prefix={:?}", sql_trimmed.chars().take(200).collect::<String>());
+                error!(
+                    "INSERT parse failed: missing column list parentheses after INSERT INTO. prefix={:?}",
+                    sql_trimmed.chars().take(200).collect::<String>()
+                );
                 return None;
             }
         };
-        let (col_start, col_end) = match extract_paren_block(sql, '(', ')', table_paren_start) {
+        let (col_start, col_end) = match extract_paren_block(sql, b'(', b')', table_paren_start) {
             Some(v) => v,
             None => {
-                error!("INSERT parse failed: could not extract column list parentheses block. prefix={:?}", sql_trimmed.chars().take(200).collect::<String>());
+                error!(
+                    "INSERT parse failed: could not extract column list parentheses block. prefix={:?}",
+                    sql_trimmed.chars().take(200).collect::<String>()
+                );
                 return None;
             }
         };
@@ -969,31 +1665,36 @@ pub fn insert_row_with_defaults(
         // a table name: the shadow table for a JSON key called `values_json`
         // is named `…_values_json_…`, so the column list was taken for the
         // tuple and every column name was parsed as a value.
-        let values_kw = match find_word(&sql_upper, "VALUES", col_end) {
+        // `find_word` matches case-insensitively, so the offset is already the
+        // keyword's offset in `sql` — it used to be found a second time by
+        // lower-casing the whole tail of the statement.
+        let values_kw_real = match find_word(sql, "VALUES", col_end) {
             Some(v) => v,
             None => {
-                error!("INSERT parse failed: missing VALUES keyword. prefix={:?}", sql_trimmed.chars().take(200).collect::<String>());
-                return None;
-            }
-        };
-        let values_kw_real = match sql[values_kw..].to_ascii_lowercase().find("values") {
-            Some(v) => values_kw + v,
-            None => {
-                error!("INSERT parse failed: could not locate VALUES keyword in original query. prefix={:?}", sql_trimmed.chars().take(200).collect::<String>());
+                error!(
+                    "INSERT parse failed: missing VALUES keyword. prefix={:?}",
+                    sql_trimmed.chars().take(200).collect::<String>()
+                );
                 return None;
             }
         };
         let values_paren_start = match sql[values_kw_real..].find('(') {
             Some(v) => v + values_kw_real,
             None => {
-                error!("INSERT parse failed: missing VALUES(...) parentheses. prefix={:?}", sql_trimmed.chars().take(220).collect::<String>());
+                error!(
+                    "INSERT parse failed: missing VALUES(...) parentheses. prefix={:?}",
+                    sql_trimmed.chars().take(220).collect::<String>()
+                );
                 return None;
             }
         };
-        let (val_start, val_end) = match extract_paren_block(sql, '(', ')', values_paren_start) {
+        let (val_start, val_end) = match extract_paren_block(sql, b'(', b')', values_paren_start) {
             Some(v) => v,
             None => {
-                error!("INSERT parse failed: could not extract VALUES parentheses block. prefix={:?}", sql_trimmed.chars().take(220).collect::<String>());
+                error!(
+                    "INSERT parse failed: could not extract VALUES parentheses block. prefix={:?}",
+                    sql_trimmed.chars().take(220).collect::<String>()
+                );
                 return None;
             }
         };
@@ -1030,8 +1731,7 @@ pub fn insert_row_with_defaults(
             // tombstone check an `INSERT` naming it was accepted and the value
             // written into the dead slot — reported as success, readable by
             // nothing. PostgreSQL rejects the statement, and so does this.
-            let Some(schema_field) =
-                schema.iter().find(|f| f.name == *col_name && !f.is_deleted)
+            let Some(schema_field) = schema.iter().find(|f| f.name == *col_name && !f.is_deleted)
             else {
                 error!(
                     "INSERT parse failed: column {:?} not found in schema (schema_fields={:?})",
@@ -1049,61 +1749,29 @@ pub fn insert_row_with_defaults(
             // produces until real nullability lands.
             // `VALUES (…, DEFAULT, …)` means the same as leaving the column
             // out, so it is resolved through the same expression.
-            let value = &if value.trim().eq_ignore_ascii_case("DEFAULT") {
-                crate::core::rql::column_default::expression_for(col_name, defaults)
-                    .and_then(|e| {
-                        crate::core::rql::column_default::evaluate(e, &schema_field.db_type).ok()
-                    })
-                    .unwrap_or_else(|| "NULL".to_string())
-            } else {
-                value.clone()
-            };
-
-            // A function call in VALUES is evaluated, or refused. It must not
-            // reach `value_to_mb`, which cannot parse it and yields an empty
-            // block: `INSERT … VALUES (gen_random_uuid())` stored a zero UUID
-            // and reported success.
-            let value_owned;
-            let value = if crate::core::rql::expr::needs_evaluation(&value) {
-                // There is no row yet, so only a constant-foldable expression
-                // has meaning here — a nullary function or a literal.
-                let expr = crate::core::rql::expr::parse(&value, &[])
-                    .map_err(|e| {
-                        error!("INSERT parse failed: {}", e);
-                    })
-                    .ok()?;
-                let empty = crate::core::row::row::Row {
-                    position: 0,
-                    length: 0,
-                    columns: smallvec::SmallVec::new(),
-                };
-                let evaluated = crate::core::rql::expr::eval(&expr, &empty, &[])
-                    .map_err(|e| {
-                        error!("INSERT parse failed: {}", e);
-                    })
-                    .ok()?;
-                value_owned = match evaluated {
-                    crate::core::rql::expr::Value::Null => "NULL".to_string(),
-                    crate::core::rql::expr::Value::Data { bytes, db_type } => {
-                        crate::core::rql::subquery::value_to_literal(&db_type, &bytes)
-                            .unwrap_or_else(|| "NULL".to_string())
-                    }
-                };
-                &value_owned
+            if let Some(refusal) = bare_name_refusal(value) {
+                REFUSAL.with(|r| *r.borrow_mut() = Some(refusal));
+                return None;
+            }
+            let default_owned;
+            let value: &str = if value.trim().eq_ignore_ascii_case("DEFAULT") {
+                default_owned =
+                    crate::core::rql::column_default::expression_for(col_name, defaults)
+                        .and_then(|e| {
+                            crate::core::rql::column_default::evaluate(
+                                e,
+                                &schema_field.db_type,
+                                database,
+                            )
+                            .ok()
+                        })
+                        .unwrap_or_else(|| "NULL".to_string());
+                &default_owned
             } else {
                 value
             };
 
-            let data = fit_to_width(
-                value_to_mb_scaled(
-                    value,
-                    &schema_field.db_type,
-                    declared_scale(&schema_field.name, modifiers),
-                )?,
-                &schema_field.db_type,
-                schema_field.size as usize,
-                col_name,
-            );
+            let data = encode_column_value(value, schema_field, modifiers)?;
 
             let payload = ColumnWritePayload {
                 data,
@@ -1147,38 +1815,62 @@ pub fn insert_row_with_defaults(
                     mb.into_slice_mut().fill(0);
                     mb
                 }
-            } else if nullable::is_hidden(&field.name) {
+            } else if nullable::is_flag(&field.name) {
                 // Set when the column it tracks was not supplied and has no
                 // default, or was supplied as NULL.
                 let tracked = &field.name[nullable::NULL_FLAG_PREFIX.len()..];
-                let is_null = match columns.iter().position(|c| c.eq_ignore_ascii_case(tracked)) {
-                    None => crate::core::rql::column_default::expression_for(tracked, defaults)
+                let defaulted_to_null = || {
+                    crate::core::rql::column_default::expression_for(tracked, defaults)
                         .map(|e| e.trim().eq_ignore_ascii_case("NULL"))
-                        .unwrap_or(true),
-                    Some(i) => values[i].trim().eq_ignore_ascii_case("NULL"),
+                        .unwrap_or(true)
+                };
+                let is_null = match columns.iter().position(|c| c.eq_ignore_ascii_case(tracked)) {
+                    None => defaulted_to_null(),
+                    // `DEFAULT` is what leaving the column out is: NULL when
+                    // the column has no default. Read as a value, the flag
+                    // said not-NULL and the slot held its empty or zero
+                    // filler: `''`, `0`, the epoch, reported as stored.
+                    Some(i) if values[i].trim().eq_ignore_ascii_case("DEFAULT") => defaulted_to_null(),
+                    Some(i) => written_null(&values[i]),
                 };
                 let bytes = nullable::flag_bytes(is_null);
                 let mut mb = MEMORY_POOL.acquire(bytes.len());
                 mb.into_slice_mut().copy_from_slice(&bytes);
                 mb
             } else if let Some(data) =
-                crate::core::rql::column_default::expression_for(&field.name, defaults)
+                match crate::core::rql::column_default::expression_for(&field.name, defaults)
                     .and_then(|e| {
-                        crate::core::rql::column_default::evaluate(e, &field.db_type).ok()
+                        crate::core::rql::column_default::evaluate(e, &field.db_type, database).ok()
                     })
                     .filter(|literal| literal != "NULL")
-                    .and_then(|literal| {
-                        value_to_mb_scaled(
-                            &literal,
-                            &field.db_type,
-                            declared_scale(&field.name, modifiers),
-                        )
-                    })
+                {
+                    None => None,
+                    // A default the column cannot hold refuses the row, as the
+                    // same value written in VALUES does. It fell through to the
+                    // filler below: `INT DEFAULT 1.5` stored 0, reported as an
+                    // insert.
+                    Some(literal) => match value_to_mb_scaled(
+                        &literal,
+                        &literal_type_for(&literal, field),
+                        declared_scale(&field.name, modifiers),
+                        crate::core::rql::type_modifier::precision_of(&field.name, modifiers),
+                        crate::core::value_codec::keeps_own_scale(field),
+                    ) {
+                        Some(data) => Some(data),
+                        None => {
+                            if REFUSAL.with(|r| r.borrow().is_none()) {
+                                note_refusal(field, &literal);
+                            }
+                            return None;
+                        }
+                    },
+                }
             {
                 // The column was omitted but has a default, evaluated now — so
                 // `DEFAULT CURRENT_TIMESTAMP` is the time of this insert rather
-                // than of the declaration.
-                fit_to_width(data, &field.db_type, field.size as usize, &field.name)
+                // than of the declaration. Held to the column's length as a
+                // written value is.
+                fit_to_width(held_to_text_length(data, field)?, &field.db_type, field.size as usize, &field.name)
             } else if field.db_type.is_variable_width() {
                 // Variable-width: an unsupplied string is simply empty.
                 MemoryBlock::default()
@@ -1221,7 +1913,8 @@ mod tests {
                        SELECT c.id, c.case_model_id\n\
                        FROM context c\n\
                        WHERE c.case_model_id IS NOT NULL";
-            let (prefix, select) = insert_select_source(sql).expect("should detect INSERT … SELECT");
+            let (prefix, select) =
+                insert_select_source(sql).expect("should detect INSERT … SELECT");
             assert!(prefix.trim_end().ends_with(')'), "got {:?}", prefix);
             assert!(select.starts_with("SELECT c.id"), "got {:?}", select);
             assert!(select.contains("IS NOT NULL"));
@@ -1230,9 +1923,7 @@ mod tests {
         #[test]
         fn an_ordinary_values_insert_is_not_a_query_source() {
             assert!(insert_select_source("INSERT INTO t (a, b) VALUES (1, 2)").is_none());
-            assert!(
-                insert_select_source("INSERT INTO t (a, b) VALUES (1, 2), (3, 4)").is_none()
-            );
+            assert!(insert_select_source("INSERT INTO t (a, b) VALUES (1, 2), (3, 4)").is_none());
         }
 
         #[test]
@@ -1243,10 +1934,51 @@ mod tests {
         }
 
         #[test]
-        fn a_missing_column_list_is_declined_rather_than_guessed() {
-            // The first parenthesis belongs to the query here, so there is no
-            // column list to split on and guessing would be worse.
-            assert!(insert_select_source("INSERT INTO t SELECT count(*) FROM u").is_none());
+        fn a_missing_column_list_ends_the_prefix_at_the_table_name() {
+            // The parenthesis belongs to the query here, and the word after the
+            // table name is what says so.
+            let (prefix, source) =
+                insert_select_source("INSERT INTO t SELECT count(*) FROM u").unwrap();
+            assert_eq!(prefix, "INSERT INTO t");
+            assert_eq!(source, "SELECT count(*) FROM u");
+            let (prefix, source) =
+                insert_select_source("INSERT INTO \"my t\"\n  WITH c AS (SELECT 1) SELECT * FROM c")
+                    .unwrap();
+            assert_eq!(prefix, "INSERT INTO \"my t\"");
+            assert!(source.starts_with("WITH c"));
+            // A relation whose name starts with the keyword is still not one.
+            assert!(insert_select_source("INSERT INTO t selection").is_none());
+            assert!(insert_select_source("INSERT INTO t VALUES ((SELECT 1))").is_none());
+        }
+
+        #[test]
+        fn an_overriding_clause_stays_with_the_prefix() {
+            use super::super::{insert_select_source, split_overriding, Overriding};
+            let (prefix, source) =
+                insert_select_source("INSERT INTO t (a, b) OVERRIDING SYSTEM VALUE SELECT x, y FROM u").unwrap();
+            assert_eq!(prefix.trim_end(), "INSERT INTO t (a, b) OVERRIDING SYSTEM VALUE");
+            assert_eq!(source, "SELECT x, y FROM u");
+            let (prefix, source) =
+                insert_select_source("INSERT INTO t overriding user value  WITH c AS (SELECT 1) SELECT * FROM c")
+                    .unwrap();
+            assert_eq!(prefix.trim_end(), "INSERT INTO t overriding user value");
+            assert!(source.starts_with("WITH c"));
+            assert!(insert_select_source("INSERT INTO t (a) OVERRIDING SYSTEM VALUES (1)").is_none());
+
+            assert_eq!(
+                split_overriding("INSERT INTO t (a) OVERRIDING SYSTEM VALUE VALUES (1)").unwrap(),
+                ("INSERT INTO t (a) VALUES (1)".to_string(), Some(Overriding::System))
+            );
+            assert_eq!(
+                split_overriding("INSERT INTO t overriding  user\nvalue VALUES (1)").unwrap(),
+                ("INSERT INTO t VALUES (1)".to_string(), Some(Overriding::User))
+            );
+            assert_eq!(
+                split_overriding("INSERT INTO t (a) VALUES ('OVERRIDING SYSTEM VALUE')").unwrap(),
+                ("INSERT INTO t (a) VALUES ('OVERRIDING SYSTEM VALUE')".to_string(), None)
+            );
+            assert!(split_overriding("INSERT INTO t (a) OVERRIDING FOO VALUE VALUES (1)").is_err());
+            assert!(split_overriding("INSERT INTO t (a) OVERRIDING SYSTEM VALUES (1)").is_err());
         }
 
         #[test]
@@ -1274,8 +2006,7 @@ mod tests {
         assert_eq!(assignments.len(), 2, "{:?}", assignments);
         assert_eq!(assignments[0], ("id".to_string(), "1".to_string()));
         assert_eq!(
-            assignments[1].1,
-            r#"'{"name":"acme","hits":42,"tags":["a","b"]}'"#,
+            assignments[1].1, r#"'{"name":"acme","hits":42,"tags":["a","b"]}'"#,
             "the document must survive as a single value"
         );
     }
@@ -1288,27 +2019,36 @@ mod tests {
             SchemaField {
                 name: "id".to_string(),
                 db_type: DbType::I32,
+                without_time_zone: false,
+                json_text: false,
                 size: 4,
                 offset: 0,
                 write_order: 0,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "name".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
+                json_text: false,
                 size: 4 + 8,
                 offset: 4,
                 write_order: 1,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
         ];
-        let sql = r#"INSERT INTO users (id, name) VALUES (1, "Alice")"#;
+        let sql = r#"INSERT INTO users (id, name) VALUES (1, 'Alice')"#;
         let qp = QueryPurpose::InsertRow(InsertRowData {
             query: sql.to_string(),
             table_name: "users".to_string(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Default::default(),
             on_conflict_update: None,
         });
         let row_write =
@@ -1328,17 +2068,22 @@ mod tests {
         let schema = vec![SchemaField {
             name: "id".to_string(),
             db_type: DbType::I32,
+            without_time_zone: false,
+            json_text: false,
             size: 4,
             offset: 0,
             write_order: 0,
             is_unique: false,
             is_deleted: false,
+            scale: None,
+            typmod_packed: None,
         }];
         let sql = r#"INSERT INTO users (id, name) VALUES (1, "Alice")"#;
         let qp = QueryPurpose::InsertRow(InsertRowData {
             query: sql.to_string(),
             table_name: "users".to_string(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Default::default(),
             on_conflict_update: None,
         });
         assert!(insert_row_from_query_purpose(&qp, &schema).is_none());
@@ -1350,82 +2095,115 @@ mod tests {
             SchemaField {
                 name: "id".to_string(),
                 db_type: DbType::I32,
+                without_time_zone: false,
+                json_text: false,
                 size: 4,
                 offset: 0,
                 write_order: 0,
                 is_unique: true,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "name".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
+                json_text: false,
                 size: 16,
                 offset: 4,
                 write_order: 1,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "age".to_string(),
                 db_type: DbType::I16,
+                without_time_zone: false,
+                json_text: false,
                 size: 2,
                 offset: 20,
                 write_order: 2,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "email".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
+                json_text: false,
                 size: 32,
                 offset: 22,
                 write_order: 3,
                 is_unique: true,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "active".to_string(),
                 db_type: DbType::U8,
+                without_time_zone: false,
+                json_text: false,
                 size: 1,
                 offset: 54,
                 write_order: 4,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "score".to_string(),
                 db_type: DbType::F64,
+                without_time_zone: false,
+                json_text: false,
                 size: 8,
                 offset: 55,
                 write_order: 5,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "created_at".to_string(),
                 db_type: DbType::I64,
+                without_time_zone: false,
+                json_text: false,
                 size: 8,
                 offset: 63,
                 write_order: 6,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "notes".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
+                json_text: false,
                 size: 64,
                 offset: 71,
                 write_order: 7,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
         ];
 
-        let sql = r#"INSERT INTO users (id, name, age, email, active, score, created_at, notes) VALUES (42, "Bob", 27, "bob@example.com", 1, 99.5, 1680000000, "Test user")"#;
+        let sql = r#"INSERT INTO users (id, name, age, email, active, score, created_at, notes) VALUES (42, 'Bob', 27, 'bob@example.com', 1, 99.5, 1680000000, 'Test user')"#;
         let qp = QueryPurpose::InsertRow(InsertRowData {
             query: sql.to_string(),
             table_name: "users".to_string(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Default::default(),
             on_conflict_update: None,
         });
         let row_write =
@@ -1487,36 +2265,49 @@ mod tests {
             SchemaField {
                 name: "id".to_string(),
                 db_type: DbType::I32,
+                without_time_zone: false,
+                json_text: false,
                 size: 4,
                 offset: 0,
                 write_order: 0,
                 is_unique: true,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "name".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
+                json_text: false,
                 size: 16,
                 offset: 4,
                 write_order: 1,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "age".to_string(),
                 db_type: DbType::I16,
+                without_time_zone: false,
+                json_text: false,
                 size: 2,
                 offset: 20,
                 write_order: 2,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
         ];
-        let sql = r#"INSERT INTO users (age, id, name) VALUES (30, 100, "Charlie")"#;
+        let sql = r#"INSERT INTO users (age, id, name) VALUES (30, 100, 'Charlie')"#;
         let qp = QueryPurpose::InsertRow(InsertRowData {
             query: sql.to_string(),
             table_name: "users".to_string(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Default::default(),
             on_conflict_update: None,
         });
         let row_write =
@@ -1555,36 +2346,49 @@ mod tests {
             SchemaField {
                 name: "id".to_string(),
                 db_type: DbType::I32,
+                without_time_zone: false,
+                json_text: false,
                 size: 4,
                 offset: 0,
                 write_order: 0,
                 is_unique: true,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "flag".to_string(),
                 db_type: DbType::U8,
+                without_time_zone: false,
+                json_text: false,
                 size: 1,
                 offset: 4,
                 write_order: 1,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "desc".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
+                json_text: false,
                 size: 32,
                 offset: 5,
                 write_order: 2,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
         ];
-        let sql = r#"INSERT INTO users (id, flag, desc) VALUES (0, 255, "Edge")"#;
+        let sql = r#"INSERT INTO users (id, flag, desc) VALUES (0, 255, 'Edge')"#;
         let qp = QueryPurpose::InsertRow(InsertRowData {
             query: sql.to_string(),
             table_name: "users".to_string(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Default::default(),
             on_conflict_update: None,
         });
         let row_write =
@@ -1603,27 +2407,36 @@ mod tests {
             SchemaField {
                 name: "score".to_string(),
                 db_type: DbType::F64,
+                without_time_zone: false,
+                json_text: false,
                 size: 8,
                 offset: 0,
                 write_order: 0,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "grade".to_string(),
                 db_type: DbType::CHAR,
+                without_time_zone: false,
+                json_text: false,
                 size: 1,
                 offset: 8,
                 write_order: 1,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
         ];
-        let sql = r#"INSERT INTO results (score, grade) VALUES (3.14, "A")"#;
+        let sql = r#"INSERT INTO results (score, grade) VALUES (3.14, 'A')"#;
         let qp = QueryPurpose::InsertRow(InsertRowData {
             query: sql.to_string(),
             table_name: "results".to_string(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Default::default(),
             on_conflict_update: None,
         });
         let row_write =
@@ -1641,27 +2454,35 @@ mod tests {
             SchemaField {
                 name: "id".to_string(),
                 db_type: DbType::I32,
+                without_time_zone: false,
+                json_text: false,
                 size: 4,
                 offset: 0,
                 write_order: 0,
                 is_unique: true,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "name".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
+                json_text: false,
                 size: 16,
                 offset: 4,
                 write_order: 1,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
         ];
         // Leading/trailing whitespace, tabs, newlines, and semicolon termination
         let sqls = [
-            "   \n\tINSERT INTO users (id, name) VALUES (123, \"Test\")\n\t  ",
-            "\r\nINSERT INTO users (id, name) VALUES (456, \"User\");\n",
-            "\t\n  INSERT INTO users (id, name) VALUES (789, \"Whitespace\")  ;  \n",
+            "   \n\tINSERT INTO users (id, name) VALUES (123, 'Test')\n\t  ",
+            "\r\nINSERT INTO users (id, name) VALUES (456, 'User');\n",
+            "\t\n  INSERT INTO users (id, name) VALUES (789, 'Whitespace')  ;  \n",
         ];
         let expected = [
             123i32.to_le_bytes(),
@@ -1675,8 +2496,9 @@ mod tests {
                 query: sql.to_string(),
                 table_name: "users".to_string(),
                 on_conflict_do_nothing: false,
-            on_conflict_update: None,
-        });
+                on_conflict_target: Default::default(),
+                on_conflict_update: None,
+            });
             let row_write =
                 insert_row_from_query_purpose(&qp, &schema).expect("Should parse successfully");
             assert_eq!(row_write.columns_writing_data[0].data.into_slice(), exp_id);
@@ -1693,20 +2515,28 @@ mod tests {
             SchemaField {
                 name: "ok".to_string(),
                 db_type: DbType::BOOL,
+                without_time_zone: false,
+                json_text: false,
                 size: 1,
                 offset: 0,
                 write_order: 0,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "flag".to_string(),
                 db_type: DbType::BOOL,
+                without_time_zone: false,
+                json_text: false,
                 size: 1,
                 offset: 1,
                 write_order: 1,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
         ];
 
@@ -1715,6 +2545,7 @@ mod tests {
             query: sql.to_string(),
             table_name: "t".to_string(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Default::default(),
             on_conflict_update: None,
         });
         let row_write =
@@ -1725,11 +2556,12 @@ mod tests {
         assert_eq!(row_write.columns_writing_data[1].column_type, DbType::BOOL);
         assert_eq!(row_write.columns_writing_data[1].data.into_slice(), [0u8]);
 
-        let sql2 = r#"INSERT INTO t (ok, flag) VALUES (On, 0)"#;
+        let sql2 = r#"INSERT INTO t (ok, flag) VALUES ('On', 0)"#;
         let qp2 = QueryPurpose::InsertRow(InsertRowData {
             query: sql2.to_string(),
             table_name: "t".to_string(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Default::default(),
             on_conflict_update: None,
         });
         let row_write2 =
@@ -1740,162 +2572,230 @@ mod tests {
 
     #[test]
     fn test_insert_row_employees_full_schema() {
-        use crate::core::rql::lexer_s1::{InsertRowData, QueryPurpose};
         use crate::core::db_type::DbType;
+        use crate::core::rql::lexer_s1::{InsertRowData, QueryPurpose};
 
         let schema = vec![
             SchemaField {
                 name: "id".to_string(),
                 db_type: DbType::U64,
+                without_time_zone: false,
+                json_text: false,
                 size: 8,
                 offset: 0,
                 write_order: 0,
                 is_unique: true,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "name".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
+                json_text: false,
                 size: 32,
                 offset: 8,
                 write_order: 1,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "job_title".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
+                json_text: false,
                 size: 32,
                 offset: 40,
                 write_order: 2,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "salary".to_string(),
                 db_type: DbType::F32,
+                without_time_zone: false,
+                json_text: false,
                 size: 4,
                 offset: 72,
                 write_order: 3,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "department".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
+                json_text: false,
                 size: 32,
                 offset: 76,
                 write_order: 4,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "age".to_string(),
                 db_type: DbType::I32,
+                without_time_zone: false,
+                json_text: false,
                 size: 4,
                 offset: 108,
                 write_order: 5,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "manager".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
+                json_text: false,
                 size: 32,
                 offset: 112,
                 write_order: 6,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "location".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
+                json_text: false,
                 size: 32,
                 offset: 144,
                 write_order: 7,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "hire_date".to_string(),
                 db_type: DbType::U64,
+                without_time_zone: false,
+                json_text: false,
                 size: 8,
                 offset: 176,
                 write_order: 8,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "degree".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
+                json_text: false,
                 size: 32,
                 offset: 184,
                 write_order: 9,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "skills".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
+                json_text: false,
                 size: 64,
                 offset: 216,
                 write_order: 10,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "current_project".to_string(),
                 db_type: DbType::STRING,
+                without_time_zone: false,
+                json_text: false,
                 size: 32,
                 offset: 280,
                 write_order: 11,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "performance_score".to_string(),
                 db_type: DbType::F32,
+                without_time_zone: false,
+                json_text: false,
                 size: 4,
                 offset: 312,
                 write_order: 12,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "is_active".to_string(),
                 db_type: DbType::U8,
+                without_time_zone: false,
+                json_text: false,
                 size: 1,
                 offset: 316,
                 write_order: 13,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "created_at".to_string(),
                 db_type: DbType::U64,
+                without_time_zone: false,
+                json_text: false,
                 size: 8,
                 offset: 317,
                 write_order: 14,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "updated_at".to_string(),
                 db_type: DbType::U64,
+                without_time_zone: false,
+                json_text: false,
                 size: 8,
                 offset: 325,
                 write_order: 15,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
             SchemaField {
                 name: "is_fired".to_string(),
                 db_type: DbType::U8,
+                without_time_zone: false,
+                json_text: false,
                 size: 1,
                 offset: 333,
                 write_order: 16,
                 is_unique: false,
                 is_deleted: false,
+                scale: None,
+                typmod_packed: None,
             },
         ];
 
@@ -1912,6 +2812,7 @@ mod tests {
             query: sql.to_string(),
             table_name: "employees".to_string(),
             on_conflict_do_nothing: false,
+            on_conflict_target: Default::default(),
             on_conflict_update: None,
         });
         let row_write =
@@ -2007,9 +2908,8 @@ mod tests {
 /// writes lost rows with no error anywhere. Refusing a statement that was only
 /// partly understood is strictly better than executing the part that was.
 pub fn split_values_tuples(sql: &str) -> Option<Result<Vec<String>, String>> {
-    let upper = sql.to_ascii_uppercase();
     // The `VALUES` that introduces the tuples, not one inside a string.
-    let values_at = find_values_keyword(sql, &upper)?;
+    let values_at = find_values_keyword(sql)?;
 
     let head = &sql[..values_at];
     let mut rest = sql[values_at + "VALUES".len()..].trim_start();
@@ -2023,7 +2923,9 @@ pub fn split_values_tuples(sql: &str) -> Option<Result<Vec<String>, String>> {
             break;
         }
         let Some(close) = matching_paren(rest, 0) else {
-            return Some(Err("unbalanced parentheses in the VALUES clause".to_string()));
+            return Some(Err(
+                "unbalanced parentheses in the VALUES clause".to_string()
+            ));
         };
         tuples.push(&rest[..=close]);
         expecting_tuple = false;
@@ -2050,7 +2952,9 @@ pub fn split_values_tuples(sql: &str) -> Option<Result<Vec<String>, String>> {
     // consume. Reporting it is the whole point: the old parser took the first
     // tuple and discarded the rest without a word.
     if rest.starts_with('(') {
-        return Some(Err("unbalanced parentheses in the VALUES clause".to_string()));
+        return Some(Err(
+            "unbalanced parentheses in the VALUES clause".to_string()
+        ));
     }
 
     if tuples.len() <= 1 {
@@ -2079,7 +2983,7 @@ pub fn split_values_tuples(sql: &str) -> Option<Result<Vec<String>, String>> {
 ///
 /// Skips any occurrence inside a quoted string, so a row containing the word
 /// does not derail the split.
-fn find_values_keyword(sql: &str, upper: &str) -> Option<usize> {
+fn find_values_keyword(sql: &str) -> Option<usize> {
     let bytes = sql.as_bytes();
     let mut in_single = false;
     let mut in_double = false;
@@ -2090,11 +2994,21 @@ fn find_values_keyword(sql: &str, upper: &str) -> Option<usize> {
             b'\'' if !in_double => in_single = !in_single,
             b'"' if !in_single => in_double = !in_double,
             _ if !in_single && !in_double => {
-                if upper[i..].starts_with("VALUES") {
-                    let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+                // Bytes, never a `str` slice, which panics inside a
+                // multi-byte character of an unquoted identifier; compared
+                // in place, ignoring ASCII case, rather than against an
+                // uppercased copy of the statement.
+                if c | 0x20 == b'v' && bytes[i..].len() >= 6 && bytes[i..i + 6].eq_ignore_ascii_case(b"VALUES") {
+                    // An identifier byte on either side means this is inside a
+                    // name — `raw_values`, `order_values`, `valuesx` — not the
+                    // keyword. `_`, `$` and non-ASCII bytes are identifier bytes
+                    // too: matching inside `raw_values` split the statement at
+                    // the column list, the tuple splitter gave up, and the
+                    // single-row fallback silently kept only the first tuple.
+                    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80;
+                    let before_ok = i == 0 || !ident(bytes[i - 1]);
                     let after = i + "VALUES".len();
-                    let after_ok =
-                        after >= bytes.len() || !bytes[after].is_ascii_alphanumeric();
+                    let after_ok = after >= bytes.len() || !ident(bytes[after]);
                     if before_ok && after_ok {
                         return Some(i);
                     }
@@ -2113,6 +3027,20 @@ mod multi_row_values {
 
     fn split(sql: &str) -> Option<Result<Vec<String>, String>> {
         split_values_tuples(sql)
+    }
+
+    #[test]
+    fn non_ascii_outside_quotes_does_not_panic_the_keyword_scanners() {
+        // Each of these sliced `&str` at every byte and panicked inside `ë`.
+        let sql = "INSERT INTO tëst (naïve, id) VALUES ('ü', 2), ('ø', 3)";
+        let split = split("INSERT INTO tëst (naïve, id) VALUES ('ü', 2), ('ø', 3)")
+            .expect("two tuples")
+            .expect("splits");
+        assert_eq!(split[1], "INSERT INTO tëst (naïve, id) VALUES ('ø', 3)");
+        let upper = sql.to_ascii_uppercase();
+        assert_eq!(find_word(&upper, "VALUES", 0), sql.find("VALUES"));
+        assert!(insert_select_source("INSERT INTO t (a) aëëë").is_none());
+        assert!(insert_select_source("INSERT INTë").is_none());
     }
 
     #[test]
@@ -2199,7 +3127,11 @@ mod multi_row_values {
             &schema,
         )
         .expect("clause found");
-        assert!(out.is_err(), "a companion column is not addressable: {:?}", out);
+        assert!(
+            out.is_err(),
+            "a companion column is not addressable: {:?}",
+            out
+        );
     }
 
     /// `_` is an identifier byte, so a column whose name merely ends in the
@@ -2235,9 +3167,15 @@ mod multi_row_values {
     /// Refused rather than half-executed: the whole reason this exists.
     #[test]
     fn a_clause_that_cannot_be_accounted_for_is_refused() {
-        assert!(split("INSERT INTO t (a) VALUES (1),").expect("saw a comma").is_err());
         assert!(
-            split("INSERT INTO t (a) VALUES (1), (2").expect("saw two groups").is_err(),
+            split("INSERT INTO t (a) VALUES (1),")
+                .expect("saw a comma")
+                .is_err()
+        );
+        assert!(
+            split("INSERT INTO t (a) VALUES (1), (2")
+                .expect("saw two groups")
+                .is_err(),
             "an unbalanced tuple must not be silently dropped"
         );
     }
@@ -2262,6 +3200,31 @@ mod column_list_supply {
             field("legacy", 3, true),
             field("select", 4, false),
         ]
+    }
+
+    #[test]
+    fn a_column_list_in_another_case_is_spelled_as_declared() {
+        let mut fields = schema();
+        fields.push(field("Mixed", 5, false));
+        fields.push(field("LEGACY", 6, false));
+        let out = canonical_column_list("  INSERT INTO t (ID, Name , mixed,\"SELECT\") VALUES (1, 'a', 2, 3)", &fields);
+        assert_eq!(
+            out.as_deref(),
+            Some("  INSERT INTO t (\"id\", \"name\" , \"Mixed\",\"select\") VALUES (1, 'a', 2, 3)")
+        );
+        // Exact names allocate nothing; an exact match wins over a folded one.
+        assert_eq!(canonical_column_list("INSERT INTO t (id, name) VALUES (1, 'a')", &fields), None);
+        // `legacy` is dropped, so `Legacy` folds only to the live `LEGACY`.
+        assert_eq!(
+            canonical_column_list("INSERT INTO t (Legacy) VALUES (1)", &fields).as_deref(),
+            Some("INSERT INTO t (\"LEGACY\") VALUES (1)")
+        );
+        // Two live columns equal ignoring case: left for the 42703 gate.
+        fields.push(field("mixed", 7, false));
+        assert_eq!(canonical_column_list("INSERT INTO t (MIXED) VALUES (1)", &fields), None);
+        assert_eq!(canonical_column_list("INSERT INTO t (nope) VALUES (1)", &fields), None);
+        assert_eq!(canonical_column_list("INSERT INTO t VALUES (1)", &fields), None);
+        assert_eq!(canonical_column_list("INSERT INTO t SELECT * FROM u", &fields), None);
     }
 
     #[test]
@@ -2290,12 +3253,12 @@ mod column_list_supply {
 
     #[test]
     fn the_keyword_is_found_outside_quotes_and_on_a_boundary() {
-        let out = supply_column_list(
-            "INSERT INTO \"values\" VALUES ('values', 'x')",
-            &schema(),
-        )
-        .unwrap();
-        assert_eq!(out, "INSERT INTO \"values\" (id, name) VALUES ('values', 'x')");
+        let out =
+            supply_column_list("INSERT INTO \"values\" VALUES ('values', 'x')", &schema()).unwrap();
+        assert_eq!(
+            out,
+            "INSERT INTO \"values\" (id, name) VALUES ('values', 'x')"
+        );
         assert!(supply_column_list("INSERT INTO t VALUESX (1)", &schema()).is_none());
     }
 
@@ -2306,7 +3269,10 @@ mod column_list_supply {
             &schema(),
         )
         .unwrap();
-        assert_eq!(out, "INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b') RETURNING id");
+        assert_eq!(
+            out,
+            "INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b') RETURNING id"
+        );
     }
 
     #[test]
@@ -2314,5 +3280,308 @@ mod column_list_supply {
         let s = vec![field("Order Id", 0, false)];
         let out = supply_column_list("INSERT INTO t VALUES (1)", &s).unwrap();
         assert_eq!(out, "INSERT INTO t (\"Order Id\") VALUES (1)");
+    }
+}
+
+#[cfg(test)]
+mod insert_parse_bench {
+    use super::*;
+    use crate::core::rql::lexer_s1::InsertRowData;
+
+    fn field(name: &str, db_type: DbType, size: u32, order: u64) -> SchemaField {
+        SchemaField {
+            name: name.to_string(),
+            db_type,
+            without_time_zone: false,
+            json_text: false,
+            size,
+            offset: 0,
+            write_order: order,
+            is_unique: false,
+            is_deleted: false,
+            scale: None,
+            typmod_packed: None,
+        }
+    }
+
+    /// A wide multi-row INSERT of text and JSON values, parsed the way the
+    /// executor parses it: split into one statement per tuple, each parsed.
+    /// `cargo test --release -p rasterizeddb_core --lib -- --ignored insert_parse_bench --nocapture`
+    #[test]
+    #[ignore]
+    fn insert_parse_bench() {
+        let schema = vec![
+            field("id", DbType::I64, 8, 0),
+            field("name", DbType::STRING, 12, 1),
+            field("doc", DbType::STRING, 12, 2),
+            field("note", DbType::STRING, 12, 3),
+            field("qty", DbType::I32, 4, 4),
+        ];
+        let doc = format!(
+            "{{\"payload\": \"{}\", \"tags\": [\"a\", \"b''c\"], \"n\": 1}}",
+            "x".repeat(2000)
+        );
+        let mut sql = String::from("INSERT INTO items (id, name, doc, note, qty) VALUES ");
+        for r in 0..100 {
+            if r > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!(
+                "({}, 'name {} with O''Quote and ünïcode', '{}', '{}', {})",
+                r,
+                r,
+                doc,
+                "note, with (parens) ".repeat(20),
+                r * 3
+            ));
+        }
+        let tuples = split_values_tuples(&sql).unwrap().unwrap();
+        let purposes: Vec<QueryPurpose> = tuples
+            .iter()
+            .map(|t| {
+                QueryPurpose::InsertRow(InsertRowData {
+                    query: t.clone(),
+                    table_name: "items".to_string(),
+                    on_conflict_do_nothing: false,
+                    on_conflict_target: Default::default(),
+                    on_conflict_update: None,
+                })
+            })
+            .collect();
+        for qp in &purposes {
+            assert!(insert_row_with_defaults(qp, &schema, &[], &[], 0).is_some());
+        }
+        let iters = 50u32;
+        for round in 0..4 {
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                for qp in &purposes {
+                    std::hint::black_box(insert_row_with_defaults(
+                        std::hint::black_box(qp),
+                        &schema,
+                        &[],
+                        &[],
+                        0,
+                    ));
+                }
+            }
+            println!(
+                "round {round}: {} tuples, {} B statement: {:?} per statement",
+                purposes.len(),
+                sql.len(),
+                t.elapsed() / iters
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod csv_values_reference {
+    /// `parse_csv_values` as it was: a character at a time into owned strings.
+    fn reference(s: &str) -> Vec<String> {
+        let mut values = Vec::new();
+        let mut current_value = String::new();
+        let mut in_quotes = false;
+        let mut quote_char = '"';
+        for c in s.chars() {
+            match c {
+                '"' | '\'' if !in_quotes => {
+                    in_quotes = true;
+                    quote_char = c;
+                    current_value.push(c);
+                }
+                c if c == quote_char && in_quotes => {
+                    in_quotes = false;
+                    current_value.push(c);
+                }
+                ',' if !in_quotes => {
+                    values.push(current_value.trim().to_string());
+                    current_value.clear();
+                }
+                _ => current_value.push(c),
+            }
+        }
+        let trimmed = current_value.trim();
+        if !trimmed.is_empty() {
+            values.push(trimmed.to_string());
+        }
+        values
+    }
+
+    #[test]
+    fn matches_the_reference() {
+        let pieces = [
+            // No brackets, `E` prefixes or `$`: the reference tracked quotes
+            // alone, and nesting is what the rewrite changed on purpose.
+            "'", "''", "\"", ",", ", ", " ", "a", "NULL", "'x,y'", "\"q,\"", "日本", "ü",
+            "\u{2003}", "\n", "1.5", "'it''s'", "\\", "🙂",
+        ];
+        let mut state = 0x853c_49e6_748f_ea9bu64;
+        for _ in 0..100_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let n = (state % 12) as usize;
+            let mut s = String::new();
+            let mut r = state;
+            for _ in 0..n {
+                r = r.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s.push_str(pieces[((r >> 33) % pieces.len() as u64) as usize]);
+            }
+            let got: Vec<String> = super::parse_csv_values(&s).into_iter().map(str::to_string).collect();
+            assert_eq!(got, reference(&s), "{:?}", s);
+        }
+    }
+}
+
+#[cfg(test)]
+mod values_arity {
+    use super::{MORE_EXPRESSIONS, MORE_TARGETS, UNEQUAL_TUPLES, values_arity_error as arity};
+
+    /// PostgreSQL 17's order and answers, against three writable columns.
+    #[test]
+    fn misfits_in_postgresqls_order() {
+        assert_eq!(arity("INSERT INTO t (a, b) VALUES (1, 2, 3)", 3), Some(MORE_EXPRESSIONS));
+        assert_eq!(arity("INSERT INTO t (a, b, c) VALUES (1, 2)", 3), Some(MORE_TARGETS));
+        assert_eq!(arity("insert into t values (1, 2, 'x', 4)", 3), Some(MORE_EXPRESSIONS));
+        assert_eq!(arity("INSERT INTO t (a, b) VALUES (7, 8), (9, 10, 11)", 3), Some(UNEQUAL_TUPLES));
+        assert_eq!(arity("INSERT INTO t (a, b) VALUES (12, 13, 14), (15, 16)", 3), Some(MORE_EXPRESSIONS));
+        assert_eq!(arity("INSERT INTO t VALUES (1, 2, 3), (4, 5)", 3), Some(UNEQUAL_TUPLES));
+        assert_eq!(arity("INSERT INTO t (a, b) VALUES (1, 2, 3) RETURNING a", 3), Some(MORE_EXPRESSIONS));
+        assert_eq!(arity("INSERT INTO t (a, b, c) VALUES (1, 204,60, 'x')", 3), Some(MORE_EXPRESSIONS));
+    }
+
+    /// Fits, and commas no separator: nested, quoted, in a string, a
+    /// function's arguments. A short tuple with no column list is a row
+    /// whose last columns take their defaults.
+    #[test]
+    fn fits_are_none() {
+        assert_eq!(arity("INSERT INTO t VALUES (5, 6)", 3), None);
+        assert_eq!(arity("INSERT INTO t (a, b, c) VALUES (abs(-7), (8), 'q,r')", 3), None);
+        assert_eq!(arity("INSERT INTO t (a, b, c) VALUES (1, 'it''s, two', 3), (4, 5, 6)", 3), None);
+        assert_eq!(arity("INSERT INTO t (a, b, c) VALUES (1, DEFAULT, coalesce(NULL, 2, 3))", 3), None);
+        assert_eq!(arity("INSERT INTO t (a) VALUES (1), (2), (3) ON CONFLICT DO NOTHING", 3), None);
+    }
+
+    /// Shapes it does not read are left to the paths that do.
+    #[test]
+    fn other_shapes_are_none() {
+        assert_eq!(arity("INSERT INTO t SELECT 1, 2, 3, 4", 3), None);
+        assert_eq!(arity("INSERT INTO t SELECT * FROM (VALUES (1, 2, 3, 4)) v", 3), None);
+        assert_eq!(arity("INSERT INTO t DEFAULT VALUES", 3), None);
+        assert_eq!(arity("INSERT INTO t AS x (a) VALUES (1, 2)", 3), None);
+        assert_eq!(arity("UPDATE t SET a = 1", 3), None);
+        assert_eq!(arity("INSERT INTO t (a) VALUES ('VALUES (1, 2, 3)')", 3), None);
+    }
+}
+
+#[cfg(test)]
+mod plain_literal_tests {
+    use super::{plain_literal, written_null};
+    use crate::core::rql::expr::needs_evaluation;
+    use crate::core::rql::lexer_query::looks_like_row_expression;
+    use crate::core::value_codec::numeric_constant_text;
+
+    /// What `encode_column_value` and `written_null` decided before they asked
+    /// `plain_literal`: whether the value is evaluated, and whether it is NULL.
+    fn scans(value: &str) -> (bool, bool) {
+        let evaluated = needs_evaluation(value) || looks_like_row_expression(value);
+        let null = value.trim().eq_ignore_ascii_case("NULL")
+            || (evaluated
+                && crate::core::rql::expr::parse(value.trim(), &[])
+                    .and_then(|e| {
+                        crate::core::rql::expr::eval(
+                            &e,
+                            &crate::core::row::row::Row { position: 0, length: 0, columns: smallvec::SmallVec::new() },
+                            &[],
+                        )
+                    })
+                    .is_ok_and(|v| v.is_null()));
+        (evaluated, null)
+    }
+
+    /// A small generator, so the corpus is the same on every run.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, below: usize) -> usize {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % below
+        }
+    }
+
+    /// Everything a string's inside may hold that some scanner gives a
+    /// meaning to outside one — operators, brackets, casts, comments,
+    /// keywords, placeholders, other quotes — and text that is none of those.
+    const PIECES: &[&str] = &[
+        "a", "Z", "0", "9", " ", "\t", "\n", "+", "-", "*", "/", "%", "^", "|", "||", "&", "&&", "~", "<", ">", "<<", ">>",
+        "=", "!", "@", "@>", "<@", "#", "#>", "#>>", "?", "?|", "?&", "->", "->>", ":", "::", ";", ",", ".", "(", ")", "[", "]",
+        "{", "}", "\"", "$", "$1", "$$", "_", "--", "/*", "*/", "NULL", "null", "ARRAY[", "CASE ", "SELECT ", "now()",
+        "CURRENT_TIMESTAMP", "DEFAULT", "true", "E", "x::int", "(1 + 2)", "{\"a\": 1}", "[1, 2]", "é", "日本", "😀", "1e5", "0x1F",
+    ];
+
+    #[test]
+    fn plain_literals_are_what_the_scans_say() {
+        let mut rng = Lcg(0x5EED);
+        let mut checked = 0usize;
+        let mut check = |value: &str| {
+            assert!(plain_literal(value), "not taken for plain: {value:?}");
+            assert_eq!(scans(value), (false, false), "{value:?}");
+            assert!(!written_null(value), "{value:?}");
+            checked += 1;
+        };
+        // Strings.
+        for value in ["''", "' '", "'NULL'", "'null'", "'a + b'", "'x::int'", "'-5'", "'(1)'", "'~'", "'$1'", "'--'"] {
+            check(value);
+        }
+        for _ in 0..60_000 {
+            let mut inside = String::new();
+            for _ in 0..rng.next(9) {
+                inside.push_str(PIECES[rng.next(PIECES.len())]);
+            }
+            let pad = ["", " ", "\n ", "\t"][rng.next(4)];
+            check(&format!("{pad}'{inside}'{pad}"));
+        }
+        // A quoted string is no unquoted number, which is what lets the
+        // encoder skip `written_constant_text` for it.
+        for _ in 0..20_000 {
+            let mut inside = String::new();
+            for _ in 0..rng.next(6) {
+                inside.push_str(["0", "7", "1.5", "-", "+", "e", "_", "x", " ", "."][rng.next(10)]);
+            }
+            let value = format!("'{inside}'");
+            assert_eq!(numeric_constant_text(&value), None, "{value:?}");
+        }
+        // Numbers.
+        for value in ["0", "7", "007", "1.50", "-1", "-0", "-0.0", "12345678901234567890123456789012345678901234567890", " 42 ", "-9223372036854775808"] {
+            check(value);
+        }
+        for _ in 0..40_000 {
+            let mut value = String::new();
+            if rng.next(3) == 0 {
+                value.push('-');
+            }
+            for _ in 0..1 + rng.next(24) {
+                value.push((b'0' + rng.next(10) as u8) as char);
+            }
+            if rng.next(2) == 0 {
+                value.push('.');
+                for _ in 0..1 + rng.next(12) {
+                    value.push((b'0' + rng.next(10) as u8) as char);
+                }
+            }
+            check(&value);
+        }
+        assert!(checked > 100_000);
+    }
+
+    #[test]
+    fn everything_else_takes_the_scans() {
+        for value in [
+            "", " ", "NULL", "null", "DEFAULT", "now()", "1 + 1", "- 5", "--5", "+5", "1e5", "0x1F", "1_000", ".5", "5.", "1.2.3", "-",
+            "'it''s'", "'a\\b'", "E'a'", "'a' || 'b'", "'a'::text", "'a' 'b'", "'unterminated", "x'", "DATE '2020-01-01'", "(1)",
+            "ARRAY[1]", "'{1}'::int[]", "$1", "true", "a", "\"a\"", "'a'b'", "1 -- c", "'a' -- c",
+        ] {
+            assert!(!plain_literal(value), "taken for plain: {value:?}");
+        }
     }
 }

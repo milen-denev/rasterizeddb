@@ -8,6 +8,9 @@ use log::{error, info, warn};
 
 /// Resolves on Ctrl+C, and on SIGTERM where the platform has it, so a `kill`
 /// from a service manager drains the same way an interactive Ctrl+C does.
+/// On Windows it also resolves on Ctrl+Break: unlike Ctrl+C, that event can
+/// be sent to one process group (`GenerateConsoleCtrlEvent`), so a supervisor
+/// that started the server in its own group can stop just the server.
 pub async fn termination_signal() {
     #[cfg(unix)]
     {
@@ -28,7 +31,23 @@ pub async fn termination_signal() {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        match tokio::signal::windows::ctrl_break() {
+            Ok(mut ctrl_break) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = ctrl_break.recv() => {}
+                }
+            }
+            Err(e) => {
+                error!("Could not install the Ctrl+Break handler ({e}); watching Ctrl+C only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = tokio::signal::ctrl_c().await;
     }
@@ -55,11 +74,41 @@ where
     });
 }
 
+/// Shutdown's clean point (docs/persistent-indexes.md §3 Shutdown, slice
+/// B13): every database's file sets sealed, after the listener has drained
+/// and ended its sessions and before [`finalize`]. Each database stops its
+/// own background writers first. One deadline,
+/// `index_snapshot.shutdown_deadline`, covers them all; what it leaves
+/// rebuilds after the restart.
+pub async fn seal_all(catalog: &crate::core::database::catalog::DatabaseCatalog) {
+    use crate::core::index_store::seal::settings;
+    let deadline = tokio::time::Instant::now() + settings::shutdown_deadline();
+    for database in catalog.all() {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let report = database.seal_for_shutdown(left).await;
+        let clean = report.sealed.iter().filter(|s| s.outcome.is_clean()).count();
+        info!(
+            "Index snapshots of database {}: {} of {} file sets clean, {} skipped by the deadline",
+            database.name,
+            clean,
+            report.sealed.len() + report.skipped.len(),
+            report.skipped.len()
+        );
+        for s in report.sealed.iter().filter(|s| !s.outcome.is_clean()) {
+            warn!("Index snapshot of {} at shutdown: {}", s.name, s.outcome.describe());
+        }
+    }
+}
+
 /// Last step before the process leaves: flush everything the WAL still owns.
 ///
 /// Skipping this is not corruption - recovery replays the log on the next
 /// start - but it makes that start-up slower for no reason.
 pub fn finalize() {
+    // Before the WAL: a store saving on exit writes its own file, and should
+    // not find the process already half gone.
+    #[cfg(feature = "kv_cache")]
+    crate::core::kv_cache::save_all_on_exit();
     match crate::core::wal::checkpoint_all() {
         Ok(()) => info!("WAL checkpointed on shutdown"),
         Err(e) => error!("WAL checkpoint failed during shutdown: {e}"),

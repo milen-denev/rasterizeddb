@@ -51,11 +51,19 @@ fn init_globals() {
 async fn run(db: &Arc<Database>, q: &str) {
     let purpose = recognize_query_purpose(q).expect("recognized");
     let out = execute(purpose, db.clone()).await;
-    assert_ne!(out.first(), Some(&3), "{} failed: {}", q, String::from_utf8_lossy(&out[1..]));
+    assert_ne!(
+        out.first(),
+        Some(&3),
+        "{} failed: {}",
+        q,
+        String::from_utf8_lossy(&out[1..])
+    );
 }
 
 fn open_descriptors() -> usize {
-    std::fs::read_dir("/proc/self/fd").map(|d| d.count()).unwrap_or(0)
+    std::fs::read_dir("/proc/self/fd")
+        .map(|d| d.count())
+        .unwrap_or(0)
 }
 
 #[test]
@@ -83,7 +91,11 @@ async fn a_rebuilt_table_releases_the_previous_generation_s_files_body() {
 
     const REBUILDS: usize = 20;
     for i in 0..REBUILDS {
-        run(&db, &format!("ALTER TABLE t ADD COLUMN c{} INT NULL", i + 1)).await;
+        run(
+            &db,
+            &format!("ALTER TABLE t ADD COLUMN c{} INT NULL", i + 1),
+        )
+        .await;
     }
     // The release is gated on the slowest watcher, the filter-maintenance
     // task, which looks at the flag once per checkpoint interval (10 s by
