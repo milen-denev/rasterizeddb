@@ -8,7 +8,7 @@ There are three release channels. Each is started by pushing a tag, and each mak
 | Server crates | `server-v<version>` | `release-server.yml` | crates.io: `rastcp`, `rasterizeddb_core`, `rasterizeddb_embedded` |
 | Server executables | `v<version>` | `release-binaries.yml` | GitHub release assets: the server for 6 targets (4 glibc/MSVC + 2 static musl), Studio for 4, the Arch/CachyOS package and its AUR sources, `SHA256SUMS`; container images on `ghcr.io` (Ubuntu 24.04, Ubuntu 26.04, Alpine) |
 
-`<version>` must equal the version in the crates' `Cargo.toml`. For the client channel that is `rasterizeddb_client` and `rasterizeddb_client_derive`; for the server crates and the executables it is `rasterizeddb_core` (and `rasterizeddb_embedded`). The workflow checks this before it builds anything.
+`<version>` must equal the version in the crates' `Cargo.toml`. For the client channel that is `rasterizeddb_client` and `rasterizeddb_client_derive`; for the server crates and the executables it is `rasterizeddb_core`. `rasterizeddb_embedded` has its own version, published by the same `server-v` release. The workflow checks this before it builds anything.
 
 The executables channel also takes a pre-release tag, such as `v1.0.0-rc.1`. The suffix is set aside for the version check, and the GitHub release is marked as a pre-release, so "latest" still points at the last full release. The crate channels take no suffix, because crates.io would receive the version in `Cargo.toml`, not the tag's.
 
@@ -19,6 +19,7 @@ The executables channel also takes a pre-release tag, such as `v1.0.0-rc.1`. The
 ```sh
 ./push_release.sh client minor        # client crates 1.0.0 -> 1.1.0, tag client-v1.1.0
 ./push_release.sh server patch        # server crates and executables, tags server-vX.Y.Z and vX.Y.Z
+./push_release.sh all patch --embedded minor   # everything a patch, the embedded SDK a minor
 ./push_release.sh all current         # first release: both channels at the version in Cargo.toml
 ./push_release.sh binaries --rc       # executables only, as a pre-release v<core>-rc.N
 ./push_release.sh client minor --dry-run   # show the version commit, change nothing
@@ -35,7 +36,7 @@ It releases what is on `origin/dev` (`--from` for another branch), working in a 
 5. It brings the version commit back to the source branch: a fast-forward when that branch has not moved, a merge commit otherwise.
 6. It tags the merge commit and pushes the tags. `all` waits for the client release first, because the server crates need it on crates.io. Then it waits for the release workflows and prints the release links.
 
-Each channel has its own version: the client channel owns `rasterizeddb_client` and `rasterizeddb_client_derive`, and the server channel owns `rasterizeddb_core` and `rasterizeddb_embedded`. The executables carry the core version.
+Each channel has its own version: the client channel owns `rasterizeddb_client` and `rasterizeddb_client_derive`, and the server channel owns `rasterizeddb_core` and `rasterizeddb_embedded`. The server tags and the executables carry the core version. The embedded SDK keeps its own version, so it can take a minor bump for new API while the engine and executables take a patch: `--embedded major|minor|patch|current|X.Y.Z`. Without it the SDK gets the same bump as the server, applied to its own version.
 
 `rastcp` is shared. When its code changed since the last crate release and its current version is already on crates.io, the script bumps it a patch; `--rastcp keep|minor|major|X.Y.Z` overrides that.
 

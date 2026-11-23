@@ -17,6 +17,10 @@
 #
 # Options:
 #   --from <branch>   branch to release from (default: $RELEASE_SOURCE or dev)
+#   --embedded <major|minor|patch|current|X.Y.Z>
+#                     server channel: the rasterizeddb_embedded version, when the
+#                     SDK moves differently from the engine (default: the same
+#                     bump as the server, applied to the SDK's own version)
 #   --rastcp <keep|major|minor|patch|X.Y.Z>
 #                     what to do with the shared rastcp crate (default: bump it a
 #                     patch when it changed since the last crate release and its
@@ -46,9 +50,10 @@
 #
 # Each channel has its own version. The client channel owns
 # rasterizeddb_client and rasterizeddb_client_derive; the server channel owns
-# rasterizeddb_core and rasterizeddb_embedded, and the executables (vX.Y.Z)
-# carry the core version. rastcp is shared: whichever channel publishes first
-# publishes it.
+# rasterizeddb_core and rasterizeddb_embedded. The server tags (server-vX.Y.Z,
+# vX.Y.Z) and the executables carry the core version; the embedded SDK has its
+# own (--embedded), which the server release publishes beside the core. rastcp
+# is shared: whichever channel publishes first publishes it.
 set -euo pipefail
 
 SOURCE="${RELEASE_SOURCE:-dev}"
@@ -83,10 +88,11 @@ if [ "$CHANNEL" != binaries ]; then
   BUMP="${1:-}"; [ $# -gt 0 ] && shift
   [ -n "$BUMP" ] || die "$CHANNEL needs a bump: major, minor, patch, current or an explicit X.Y.Z"
 fi
-RASTCP_BUMP="auto"; RC=0; DRY_RUN=0; WAIT=1; YES=0
+RASTCP_BUMP="auto"; EMBEDDED_BUMP=""; RC=0; DRY_RUN=0; WAIT=1; YES=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --from) SOURCE="${2:?--from needs a branch}"; shift 2 ;;
+    --embedded) EMBEDDED_BUMP="${2:?--embedded needs major, minor, patch, current or X.Y.Z}"; shift 2 ;;
     --rastcp) RASTCP_BUMP="${2:?--rastcp needs keep, major, minor, patch or X.Y.Z}"; shift 2 ;;
     --rc) RC=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -96,6 +102,7 @@ while [ $# -gt 0 ]; do
     *) die "unknown option '$1'" ;;
   esac
 done
+[ -z "$EMBEDDED_BUMP" ] || [ "$CHANNEL" = server ] || [ "$CHANNEL" = all ] || die "--embedded is for the server and all channels"
 [ "$RC" = 0 ] || [ "$CHANNEL" = binaries ] || die "--rc is for the binaries channel only: crates.io gets exactly the Cargo.toml version"
 
 # ---------------------------------------------------------------- helpers
@@ -205,7 +212,7 @@ fi
 
 declare -A OLD=() NEW=()   # crate -> version, for the crates whose version changes
 TAGS=()
-CLIENT_VER=""; SERVER_VER=""
+CLIENT_VER=""; SERVER_VER=""; EMBEDDED_VER=""
 CORE_NOW="$(version_at "$SRC" rasterizeddb_core)"
 
 if [ "$CHANNEL" = client ] || [ "$CHANNEL" = all ]; then
@@ -219,9 +226,18 @@ if [ "$CHANNEL" = client ] || [ "$CHANNEL" = all ]; then
 fi
 if [ "$CHANNEL" = server ] || [ "$CHANNEL" = all ]; then
   SERVER_VER="$(next_version "$CORE_NOW" "$BUMP")"
+  embedded_now="$(version_at "$SRC" rasterizeddb_embedded)"
+  if [ -n "$EMBEDDED_BUMP" ]; then
+    EMBEDDED_VER="$(next_version "$embedded_now" "$EMBEDDED_BUMP")"
+  elif [[ "$BUMP" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ "$embedded_now" != "$CORE_NOW" ]; then
+    die "rasterizeddb_embedded is $embedded_now and rasterizeddb_core $CORE_NOW: with an explicit server version, name the SDK's too (--embedded X.Y.Z or a bump)"
+  else
+    EMBEDDED_VER="$(next_version "$embedded_now" "$BUMP")"
+  fi
   for c in "${SERVER_CRATES[@]}"; do
     o="$(version_at "$SRC" "$c")"
-    if [ "$o" != "$SERVER_VER" ]; then OLD[$c]="$o"; NEW[$c]="$SERVER_VER"; fi
+    want="$SERVER_VER"; [ "$c" = rasterizeddb_embedded ] && want="$EMBEDDED_VER"
+    if [ "$o" != "$want" ]; then OLD[$c]="$o"; NEW[$c]="$want"; fi
   done
   TAGS+=("server-v$SERVER_VER" "v$SERVER_VER")
   if [ "$CHANNEL" = server ]; then
@@ -278,9 +294,8 @@ if [ -n "$CLIENT_VER" ]; then
   done
 fi
 if [ -n "$SERVER_VER" ]; then
-  for c in "${SERVER_CRATES[@]}"; do
-    if on_crates_io "$c" "$SERVER_VER"; then die "$c $SERVER_VER is already on crates.io; bump it"; fi
-  done
+  if on_crates_io rasterizeddb_core "$SERVER_VER"; then die "rasterizeddb_core $SERVER_VER is already on crates.io; bump it"; fi
+  if on_crates_io rasterizeddb_embedded "$EMBEDDED_VER"; then die "rasterizeddb_embedded $EMBEDDED_VER is already on crates.io; bump it (--embedded)"; fi
 fi
 # Not release/<tag>: a branch named `release` rules out any release/... ref.
 BRANCH="release-pr/${TAGS[0]}"
@@ -301,7 +316,7 @@ else
   note "no version change"
 fi
 [ -n "$CLIENT_VER" ] && note "client crates release $CLIENT_VER"
-[ -n "$SERVER_VER" ] && note "server crates and executables release $SERVER_VER"
+[ -n "$SERVER_VER" ] && note "server crates release rasterizeddb_core $SERVER_VER and rasterizeddb_embedded $EMBEDDED_VER; executables $SERVER_VER"
 [ "$CHANNEL" = binaries ] && note "executables of rasterizeddb_core $CORE_NOW"
 true
 note "tags:   ${TAGS[*]}"

@@ -1,8 +1,8 @@
 name: Release - server crates
 
 # Channel 2 of 3. Tag `server-v<version>` (the version in
-# rasterizeddb_core/Cargo.toml and rasterizeddb_embedded/Cargo.toml)
-# publishes, in order:
+# rasterizeddb_core/Cargo.toml; rasterizeddb_embedded has its own, which may
+# differ) publishes, in order:
 #   rastcp (when its version is not on crates.io yet)
 #   rasterizeddb_core      - the engine and server, as a library
 #   rasterizeddb_embedded  - the SDK for running the database inside an application
@@ -71,7 +71,14 @@ jobs:
 
       - name: The tag matches the crate versions
         if: github.event_name == 'push'
-        run: bash .github/scripts/check-version.sh server-v rasterizeddb_core rasterizeddb_embedded
+        run: bash .github/scripts/check-version.sh server-v rasterizeddb_core
+
+      - name: Crate versions
+        id: versions
+        run: |
+          for c in rasterizeddb_core rasterizeddb_embedded; do
+            echo "$c=$(cargo pkgid -p "$c" | sed 's/.*[#@]//')" >> "$GITHUB_OUTPUT"
+          done
 
       - name: The client version the embedded SDK needs is on crates.io
         run: |
@@ -104,7 +111,7 @@ jobs:
           body: |
             The database as Rust libraries, published to crates.io:
 
-            - [`rasterizeddb_embedded`](https://crates.io/crates/rasterizeddb_embedded) - run the database inside your application ([docs](https://docs.rs/rasterizeddb_embedded))
-            - [`rasterizeddb_core`](https://crates.io/crates/rasterizeddb_core) - the engine and server
+            - [`rasterizeddb_embedded` ${{ steps.versions.outputs.rasterizeddb_embedded }}](https://crates.io/crates/rasterizeddb_embedded/${{ steps.versions.outputs.rasterizeddb_embedded }}) - run the database inside your application ([docs](https://docs.rs/rasterizeddb_embedded))
+            - [`rasterizeddb_core` ${{ steps.versions.outputs.rasterizeddb_core }}](https://crates.io/crates/rasterizeddb_core/${{ steps.versions.outputs.rasterizeddb_core }}) - the engine and server
 
             On x86-64 the engine needs an AVX2 (x86-64-v3) CPU; build with `-C target-cpu=x86-64-v3`. aarch64 needs nothing extra.
