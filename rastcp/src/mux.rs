@@ -277,6 +277,23 @@ impl State {
         Ok(())
     }
 
+    /// Fails request `id` with `err`, if it is in flight: what [`State::lose`]
+    /// then does not reach.
+    fn refuse(&mut self, id: u32, err: RastcpError, wakers: &mut Vec<Waker>) {
+        let Some(slot) = self.slots.get_mut(id as usize) else {
+            return;
+        };
+        if !slot.owed {
+            return;
+        }
+        slot.owed = false;
+        if let Caller::Waiting(waker) = &mut slot.caller {
+            wakers.extend(waker.take());
+            slot.caller = Caller::Done(Err(err));
+        }
+        self.release(id);
+    }
+
     /// The earliest request still waiting to give up, dropping records of
     /// those that no longer are.
     fn next_expiry(&mut self) -> Option<Expiry> {
@@ -558,6 +575,7 @@ impl Link {
 
             // In: every response that has arrived.
             let mut broken = None;
+            let mut oversized = None;
             while self.inbox.len() < DELIVER_AT {
                 match self
                     .reader
@@ -565,6 +583,10 @@ impl Link {
                 {
                     Poll::Ready(Ok(frame)) => self.inbox.push(frame),
                     Poll::Ready(Err(err)) => {
+                        oversized = match &err {
+                            RastcpError::MessageTooLarge { .. } => self.reader.oversized(),
+                            _ => None,
+                        };
                         broken = Some(err);
                         break;
                     }
@@ -587,8 +609,19 @@ impl Link {
                     progressed = true;
                     if let Err(err) = state.deliver(tag, body, &mut self.wakers) {
                         broken.get_or_insert(err);
+                        oversized = None;
                         break;
                     }
+                }
+
+                // One answer too long for this client ends the connection
+                // (its body is still on the wire), but only its request was
+                // too large: that one is told so, every other request in
+                // flight only that the connection closed under it.
+                if let (Some(tag), Some(RastcpError::MessageTooLarge { len, max })) = (oversized, &broken) {
+                    let refused = RastcpError::MessageTooLarge { len: *len, max: *max };
+                    state.refuse(tag.id, refused, &mut self.wakers);
+                    broken = Some(RastcpError::ConnectionClosed);
                 }
 
                 if broken.is_none() && self.deadline.is_some() {

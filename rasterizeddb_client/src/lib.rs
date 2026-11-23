@@ -166,6 +166,26 @@ pub use rastcp::tls::Trust;
 pub fn load_ca(path: &str) -> Result<Trust> {
     Ok(Trust::RootCa(rastcp::tls::load_certificates(path)?))
 }
+
+/// The [`Trust`] that believes exactly the server certificates named by
+/// their SHA-256 fingerprints, as hex (`openssl x509 -noout -fingerprint
+/// -sha256 -in server.pem` prints one; its `:`s and case are fine).
+///
+/// Pin a certificate the server keeps (`--rdb-cert`/`--rdb-key`): one it makes
+/// for itself at start, without them, is a new one at every start.
+pub fn pin<S: AsRef<str>>(fingerprints: &[S]) -> Result<Trust> {
+    let pins = fingerprints
+        .iter()
+        .map(|f| {
+            rastcp::tls::parse_fingerprint(f.as_ref())
+                .map_err(|e| Error::Param(format!("{:?} is not a SHA-256 fingerprint: {e}", f.as_ref())))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if pins.is_empty() {
+        return Err(Error::Param("pin needs at least one fingerprint".into()));
+    }
+    Ok(Trust::Pinned(pins))
+}
 pub use to_sql::ToSql;
 pub use transaction::{
     DEFAULT_TRANSACTION_RETRIES, Isolation, SERVER_IDLE_CLOSE, Transaction, TransactionFuture,
@@ -232,5 +252,22 @@ pub mod __private {
             index: i,
             message: format!("the JSON did not deserialize: {e}"),
         })
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    #[test]
+    fn pin_reads_fingerprints_as_openssl_prints_them() {
+        let hex = "ab".repeat(32);
+        let colons = hex.as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap().to_uppercase()).collect::<Vec<_>>().join(":");
+        match pin(&[hex.as_str(), colons.as_str()]).unwrap() {
+            Trust::Pinned(pins) => assert_eq!(pins, vec![[0xab; 32], [0xab; 32]]),
+            _ => panic!("not a pin"),
+        }
+        assert!(matches!(pin(&["abcd"]), Err(Error::Param(_))));
+        assert!(matches!(pin::<&str>(&[]), Err(Error::Param(_))));
     }
 }

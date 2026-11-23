@@ -398,3 +398,43 @@ async fn a_stopping_server_finishes_the_request_in_hand_and_starts_no_other() {
     })
     .await
 }
+
+/// A caller that gives up on a request (its own timeout, a `select!`) drops
+/// the future after the request went out. The answer still arrives; the next
+/// request must not read it as its own.
+#[tokio::test]
+async fn a_dropped_request_does_not_leave_its_answer_for_the_next() {
+    bounded(async {
+        let (addr, server) = serve(Duration::from_secs(30), 1 << 20, |data: Vec<u8>| async move {
+            if data == b"slow" {
+                sleep(Duration::from_millis(400)).await;
+            }
+            data
+        })
+        .await;
+        let mut c = client(&addr, Duration::from_secs(10)).await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), c.send(b"slow".to_vec()))
+                .await
+                .is_err(),
+            "the slow request answered inside 50 ms"
+        );
+        sleep(Duration::from_millis(500)).await; // its answer is on the wire now
+        assert_eq!(c.send(b"fast".to_vec()).await.unwrap(), b"fast");
+
+        // The same for a batch dropped mid-flight.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                c.send_batch(&[b"slow".to_vec(), b"slow".to_vec()])
+            )
+            .await
+            .is_err()
+        );
+        sleep(Duration::from_millis(900)).await;
+        assert_eq!(c.send(b"after".to_vec()).await.unwrap(), b"after");
+        server.abort();
+    })
+    .await;
+}

@@ -1,7 +1,8 @@
 name: CI
 
-# Every push and pull request: the four release targets build, and the crates
-# that ship (rastcp, the client, the embedded SDK) pass their tests on each.
+# Every push and pull request: the four release targets build, the crates
+# that ship (rastcp, the client, the embedded SDK) pass their tests on each,
+# and their public API stays compatible with the last release (semver).
 # The engine's own suites are long (the core library alone is ~10 minutes on
 # 16 cores); they run on every target in the `full` job: weekly, on demand
 # (Actions -> CI -> Run workflow, full = true), and on pushes to the
@@ -169,6 +170,34 @@ jobs:
 
       - name: Compatibility suite (PostgreSQL / MySQL / SQL Server drivers)
         run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_compat --no-fail-fast
+
+  # The SDK crates promise semver: a patch or minor release must not break
+  # code written against the last release. Compared with the release tags'
+  # sources rather than crates.io, so a crate whose release never reached
+  # crates.io (rasterizeddb_embedded 1.0.0) is still checked.
+  semver:
+    name: semver against the last release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup
+        with:
+          target: x86_64-unknown-linux-gnu
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - name: cargo semver-checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          last() { git tag --list "$1" --sort=-v:refname | head -n1; }
+          client="$(last 'client-v*')"; server="$(last 'server-v*')"
+          echo "baselines: $client (client crates, rastcp), $server (embedded SDK)"
+          cargo semver-checks --baseline-rev "$client" -p rastcp -p rasterizeddb_client -p rasterizeddb_client_derive
+          cargo semver-checks --baseline-rev "$server" -p rasterizeddb_embedded
 
   package:
     name: crates package and verify

@@ -126,7 +126,16 @@ fn integer(t: u8, raw: &[u8]) -> Result<i128, String> {
         }
         tag::DECIMAL => {
             let (unscaled, scale) = numeric_parts(raw)?;
-            let factor = 10i128.pow(scale.min(38));
+            // Past 38 places no i128 is a whole number but 0: |unscaled| is
+            // below 10^39, so the value is a fraction. Capping the factor at
+            // 10^38 instead read such a value as a wrong integer.
+            if scale > 38 {
+                if unscaled == 0 {
+                    return Ok(0);
+                }
+                return Err(format!("{} is not a whole number", decimal_text(unscaled, scale)));
+            }
+            let factor = 10i128.pow(scale);
             if unscaled % factor != 0 {
                 return Err(format!(
                     "{} is not a whole number",

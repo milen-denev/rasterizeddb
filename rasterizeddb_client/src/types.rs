@@ -82,6 +82,11 @@ fn parse_date_parts(text: &str) -> Option<(i64, u32, u32)> {
     let month: u32 = parts.next()?.parse().ok()?;
     let day: u32 = parts.next()?.parse().ok()?;
     let year = if negative { -year } else { year };
+    // Far past PostgreSQL's own range (4713 BC to 294276 AD), and small
+    // enough that the day arithmetic below cannot overflow on any input.
+    if !(-1_000_000..=1_000_000).contains(&year) {
+        return None;
+    }
     ((1..=12).contains(&month) && day >= 1 && day <= days_in_month(year, month))
         .then_some((year, month, day))
 }
@@ -106,7 +111,7 @@ fn parse_clock(text: &str) -> Option<i64> {
             }
         },
     };
-    if !(0..=59).contains(&minute) || !(0..=59).contains(&second) {
+    if !(0..=24).contains(&hour) || !(0..=59).contains(&minute) || !(0..=59).contains(&second) {
         return None;
     }
     // 24:00:00 is a valid time of day in PostgreSQL; nothing past it is.
@@ -350,12 +355,20 @@ fn split_zone(s: &str) -> Option<(&str, i64)> {
             let (head, tail) = s.split_at(pos);
             let sign = if tail.starts_with('-') { -1 } else { 1 };
             let digits = &tail[1..];
+            // Byte offsets below: anything but ASCII digits and `:` is no
+            // zone, and slicing it could split a character.
+            if !digits.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+                return None;
+            }
             let (hh, mm): (i64, i64) = match digits.split_once(':') {
                 Some((h, m)) => (h.parse().ok()?, m.parse().ok()?),
                 None if digits.len() <= 2 => (digits.parse().ok()?, 0),
                 None if digits.len() == 4 => (digits[..2].parse().ok()?, digits[2..].parse().ok()?),
                 None => return None,
             };
+            if !(0..=23).contains(&hh) || !(0..=59).contains(&mm) {
+                return None;
+            }
             Some((head, sign * (hh * 60 + mm)))
         }
         _ => Some((s, 0)),
@@ -850,6 +863,27 @@ mod tests {
         assert_eq!(Timestamp::from_wire(&wire), Some(t));
         let st: std::time::SystemTime = before.into();
         assert_eq!(Timestamp::from(st), before);
+    }
+
+    /// Text from a TEXT cell or a caller is parsed, never trusted: whatever it
+    /// holds is an error, not a panic or an overflowed (wrapped) instant.
+    #[test]
+    fn hostile_text_is_refused_not_a_panic() {
+        for text in [
+            "2026-01-01 10:00+1é1",
+            "2026-01-01 10:00+é",
+            "2026-01-01 10:00+99:00",
+            "2026-01-01 10:00+99999999999999999",
+            "2026-01-01 99999999999999999:00",
+            "9223372036854775807-01-01",
+            "-9223372036854775807-01-01",
+            "1000001-01-01",
+        ] {
+            assert!(text.parse::<Timestamp>().is_err(), "{text}");
+        }
+        assert!("9223372036854775807-01-01".parse::<Date>().is_err());
+        assert!("99999999999999999:00".parse::<Time>().is_err());
+        assert!("2026-01-01 10:00+05:30".parse::<Timestamp>().is_ok());
     }
 
     #[test]

@@ -371,15 +371,10 @@ impl TcpClientBuilder {
         }
         let config = client_config;
 
-        // Get server name from address
-        let server_name = ServerName::try_from(
-            self.addr
-                .split(':')
-                .next()
-                .ok_or_else(|| RastcpError::CertificateLoading("Invalid address format".into()))?,
-        )
-        .map_err(|_| RastcpError::CertificateLoading("Invalid server name".into()))?
-        .to_owned();
+        let host = host_of(&self.addr);
+        let server_name = ServerName::try_from(host)
+            .map_err(|_| RastcpError::CertificateLoading(format!("{host:?} is not a server name")))?
+            .to_owned();
 
         Ok(Dialer {
             addr: self.addr,
@@ -428,6 +423,20 @@ where
     match deadline {
         Some(deadline) => deadline.run(wait).await.unwrap_or(Err(RastcpError::ConnectionTimeout)),
         None => wait.await,
+    }
+}
+
+/// The host part of a `host:port` address, as the TLS server name: a name
+/// or an IPv4 address before the last `:`, an IPv6 address inside `[…]`
+/// (`[::1]:61170`), and a bare IPv6 address (`::1`) whole.
+fn host_of(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[') {
+        return rest.split_once(']').map_or(rest, |(host, _)| host);
+    }
+    match addr.rsplit_once(':') {
+        Some((host, _)) if !host.contains(':') => host,
+        Some(_) => addr,
+        None => addr,
     }
 }
 
@@ -844,17 +853,19 @@ impl TcpClient {
         let max_message_size = self.dialer.max_message_size;
         self.ready(max_message_size).await?;
 
-        let connection = self.connection.as_mut().ok_or(RastcpError::NotConnected)?;
+        // Taken out for the exchange and put back only when it completes: a
+        // caller that drops this future after the request went out (a timeout
+        // of its own, a `select!`) must not leave the connection here, where
+        // the next request would read this one's answer.
+        let mut connection = self.connection.take().ok_or(RastcpError::NotConnected)?;
 
         match connection.exchange(data, max_message_size).await {
             Ok(response) => {
                 debug!("Received {} bytes response", response.len());
+                self.connection = Some(connection);
                 Ok(response)
             }
-            Err(err) => {
-                self.connection = None;
-                Err(err)
-            }
+            Err(err) => Err(err),
         }
     }
 
@@ -883,17 +894,17 @@ impl TcpClient {
         let max_message_size = self.dialer.max_message_size;
         self.ready(max_message_size).await?;
 
-        let connection = self.connection.as_mut().ok_or(RastcpError::NotConnected)?;
+        // Out of `self` for the exchange, as in `send_borrowed`: dropped
+        // mid-batch, the connection goes with the future.
+        let mut connection = self.connection.take().ok_or(RastcpError::NotConnected)?;
 
         match connection.exchange_batch(requests, max_message_size).await {
             Ok(responses) => {
                 debug!("Received {} responses", responses.len());
+                self.connection = Some(connection);
                 Ok(responses)
             }
-            Err(err) => {
-                self.connection = None;
-                Err(err)
-            }
+            Err(err) => Err(err),
         }
     }
 
@@ -1194,6 +1205,26 @@ fn poll_pipeline(
         }
         if !progressed {
             return Poll::Pending;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_server_name_is_the_host_of_any_address_form() {
+        assert_eq!(host_of("db.example.com:61170"), "db.example.com");
+        assert_eq!(host_of("127.0.0.1:61170"), "127.0.0.1");
+        assert_eq!(host_of("[::1]:61170"), "::1");
+        assert_eq!(host_of("[fe80::1%eth0]:5"), "fe80::1%eth0");
+        assert_eq!(host_of("::1"), "::1");
+        assert_eq!(host_of("localhost"), "localhost");
+        // Each is a name rustls takes: an IPv6 literal used to give "[",
+        // which no trust setting accepted.
+        for addr in ["db.example.com:1", "127.0.0.1:1", "[::1]:1", "::1"] {
+            assert!(ServerName::try_from(host_of(addr)).is_ok(), "{addr}");
         }
     }
 }

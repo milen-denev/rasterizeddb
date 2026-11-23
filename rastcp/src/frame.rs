@@ -113,6 +113,10 @@ pub(crate) struct FrameReader {
     /// Refuse a frame whose kind is not [`KIND_DATA`] as soon as its header
     /// is read: what a server reads requests with ([`FrameReader::requests`]).
     requests_only: bool,
+    /// The tag of a multiplexed frame refused for its length: whose answer
+    /// it was, so that one request can be told why while the others learn
+    /// only that the connection is gone.
+    oversized: Option<Tag>,
 }
 
 impl FrameReader {
@@ -153,7 +157,14 @@ impl FrameReader {
             partial: None,
             header,
             requests_only: false,
+            oversized: None,
         }
+    }
+
+    /// The tag of the frame [`FrameReader::poll_tagged`] last refused as
+    /// longer than the limit, on a multiplexed stream.
+    pub(crate) fn oversized(&self) -> Option<Tag> {
+        self.oversized
     }
 
     /// Whether bytes have been read that no frame handed out yet accounts
@@ -238,6 +249,9 @@ impl FrameReader {
                 // Checked on the prefix alone, before anything is reserved: a
                 // peer cannot make this side allocate by claiming a length.
                 if len > max_message_size {
+                    if header > PREFIX {
+                        self.oversized = Some(tag);
+                    }
                     return Poll::Ready(Err(RastcpError::MessageTooLarge {
                         len,
                         max: max_message_size,

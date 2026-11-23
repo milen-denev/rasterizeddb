@@ -954,3 +954,53 @@ async fn a_lone_request_is_finished_when_its_peer_goes() {
     })
     .await
 }
+
+/// An answer longer than this client takes ends the connection, since its
+/// body is still on the wire. Only the request it answers was too large: the
+/// others in flight learn that the connection closed, not that their answers
+/// were too long, and the next request reconnects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversized_answer_fails_its_own_request_and_closes_the_rest() {
+    bounded(async {
+        const BIG: u8 = 9;
+        let running = serve_with(
+            |builder| builder,
+            |data: Vec<u8>| async move {
+                match data.first().copied() {
+                    Some(BIG) => vec![BIG; 8 * 1024],
+                    _ => respond(data).await,
+                }
+            },
+        )
+        .await;
+        let client = TcpClientBuilder::new(&running.addr)
+            .timeout(Duration::from_secs(30))
+            .max_message_size(1024)
+            .build_multiplexed()
+            .await
+            .unwrap();
+
+        let slow = {
+            let client = client.clone();
+            tokio::spawn(async move { client.send(&request(SLOW, 1, 16)).await })
+        };
+        until("the slow request reaches the server", || {
+            running.server.active_connections() == 1
+        })
+        .await;
+        sleep(Duration::from_millis(50)).await;
+
+        let big = client.send(&[BIG]).await;
+        assert!(
+            matches!(big, Err(RastcpError::MessageTooLarge { max: 1024, .. })),
+            "got {big:?}"
+        );
+        let slow = slow.await.unwrap();
+        assert!(matches!(slow, Err(RastcpError::ConnectionClosed)), "got {slow:?}");
+
+        let again = request(ECHO, 7, 16);
+        assert!(client.send(&again).await.unwrap() == again);
+        running.task.abort();
+    })
+    .await
+}

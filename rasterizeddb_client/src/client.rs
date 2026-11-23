@@ -68,8 +68,16 @@ pub struct Options {
     /// [`Trust::AcceptAny`](crate::Trust::AcceptAny), encrypts without
     /// authenticating the server, which suits the self-signed certificate a
     /// server makes for itself; [`load_ca`](crate::load_ca) reads a private
-    /// CA's certificate for [`Trust::RootCa`](crate::Trust::RootCa), and
-    /// [`Trust::WebPki`](crate::Trust::WebPki) uses the public roots.
+    /// CA's certificate for [`Trust::RootCa`](crate::Trust::RootCa),
+    /// [`pin`](crate::pin) names the server's certificate by its
+    /// fingerprint, and [`Trust::WebPki`](crate::Trust::WebPki) uses the
+    /// public roots.
+    ///
+    /// **Over a network you do not control, do not keep the default.** A
+    /// password login stays safe from replay under it (the proof is bound to
+    /// this TLS session), but whoever answers in the server's place sees
+    /// the proof and can guess passwords against it offline, and reads
+    /// every statement and row.
     pub trust: crate::Trust,
 }
 

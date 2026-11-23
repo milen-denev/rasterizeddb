@@ -276,9 +276,16 @@ impl PasswordLogin {
             (S_CONTINUE, payload) => payload,
             (_, message) => return Err(RastcpError::AuthenticationError(message)),
         };
-        let client_final = scram
-            .respond(&server_first)
-            .map_err(RastcpError::AuthenticationError)?;
+        // PBKDF2 over up to a million rounds: off the runtime's workers, which
+        // other connections' requests are waiting on.
+        let (scram_back, answer) = tokio::task::spawn_blocking(move || {
+            let answer = scram.respond(&server_first);
+            (scram, answer)
+        })
+        .await
+        .map_err(|e| RastcpError::AuthenticationError(format!("the SCRAM proof could not be computed: {e}")))?;
+        scram = scram_back;
+        let client_final = answer.map_err(RastcpError::AuthenticationError)?;
         let mut message = vec![C_SASL_FINAL];
         message.extend_from_slice(client_final.as_bytes());
         channel.send(&message).await?;

@@ -91,7 +91,10 @@ impl Cursor {
             let mut chars = part.chars();
             let kind = chars.next().ok_or_else(bad)?;
             let hex = chars.as_str();
-            if hex.len() % 2 != 0 {
+            // Sliced by byte below: a token is ASCII hex, and anything else
+            // (it comes back from whoever holds the cursor) is refused rather
+            // than split inside a character.
+            if hex.len() % 2 != 0 || !hex.is_ascii() {
                 return Err(bad());
             }
             let bytes = (0..hex.len())
