@@ -1160,10 +1160,13 @@ pub(crate) fn correlated_in_as_exists(sql: &str) -> Option<String> {
         {
             continue;
         }
-        // The one item, without a DISTINCT, which an EXISTS does not need.
+        // The items, without a DISTINCT, which an EXISTS does not need: one,
+        // or one per column of a row on the left (`(a, b) IN (SELECT x, y …)`).
         let items = inner["SELECT".len()..from_at].trim();
         let items = crate::core::rql::lexer_query::leading_word(items, "DISTINCT").unwrap_or(items).trim();
-        if items.is_empty() || crate::core::sql_scan::split_top_level(items, b',').len() != 1 {
+        let item_list: Vec<String> =
+            crate::core::sql_scan::split_top_level(items, b',').into_iter().map(|i| i.trim().to_string()).collect();
+        if items.is_empty() || item_list.iter().any(|i| i.is_empty() || i == "*") {
             continue;
         }
         if !crate::core::rql::lexer_query::find_aggregate_calls(items).is_empty() {
@@ -1188,8 +1191,40 @@ pub(crate) fn correlated_in_as_exists(sql: &str) -> Option<String> {
         // Each bare column is the outer relation's, which must be the only
         // one: inside the subquery a bare name would be its own column.
         let Some(lhs) = qualify_bare_columns(lhs, || single_outer_alias(&current)) else { continue };
-        let lhs = format!("({lhs})");
-        let item = items;
+        // A row on the left, `(a, b)` or `ROW(a, b)`, is compared column by
+        // column; anything else is one value.
+        let lhs_trim = lhs.trim();
+        let row_body = lhs_trim
+            .strip_prefix("ROW")
+            .or_else(|| lhs_trim.strip_prefix("row"))
+            .map(str::trim_start)
+            .unwrap_or(lhs_trim);
+        let columns: Vec<String> = match (row_body.starts_with('('), row_body.ends_with(')')) {
+            (true, true)
+                if crate::core::rql::expr::matching_paren(row_body, 0) == Some(row_body.len() - 1) =>
+            {
+                let parts = crate::core::sql_scan::split_top_level(&row_body[1..row_body.len() - 1], b',');
+                if parts.len() > 1 {
+                    parts.into_iter().map(|p| format!("({})", p.trim())).collect()
+                } else {
+                    vec![format!("({lhs_trim})")]
+                }
+            }
+            _ => vec![format!("({lhs_trim})")],
+        };
+        if columns.len() != item_list.len() {
+            continue;
+        }
+        let pairs: Vec<(String, String)> =
+            item_list.iter().zip(&columns).map(|(item, column)| (format!("({item})"), column.clone())).collect();
+        // Every pair equal; and no pair definitely unequal (each equal, or
+        // either side NULL) — what makes a row comparison not false.
+        let all_equal = pairs.iter().map(|(i, c)| format!("{i} = {c}")).collect::<Vec<_>>().join(" AND ");
+        let maybe_equal = pairs
+            .iter()
+            .map(|(i, c)| format!("({i} = {c} OR {i} IS NULL OR {c} IS NULL)"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
         let rest = &inner[from_at..];
         let (rest, filter) = match find_keyword(rest, "WHERE", 0) {
             Some(at) => (rest[..at].trim_end(), Some(rest[at + "WHERE".len()..].trim())),
@@ -1202,20 +1237,17 @@ pub(crate) fn correlated_in_as_exists(sql: &str) -> Option<String> {
             };
             format!("EXISTS (SELECT 1 {rest} WHERE {condition})")
         };
-        let equal = probe(format!("({item}) = {lhs}"));
-        let null = probe(format!("(({item}) IS NULL OR {lhs} IS NULL)"));
+        let equal = probe(format!("({all_equal})"));
+        let maybe = probe(format!("({maybe_equal})"));
         let exists = if decides_the_where(&current, lhs_start) {
-            // Only its truth matters: the cheaper two-valued forms.
-            if negated {
-                format!("NOT {}", probe(format!("(({item}) = {lhs} OR ({item}) IS NULL OR {lhs} IS NULL)")))
-            } else {
-                equal
-            }
+            // Only its truth matters: the cheaper two-valued forms. NOT IN
+            // is true only when every row is definitely unequal.
+            if negated { format!("NOT {maybe}") } else { equal }
         } else {
             // A value (a select item, under a NOT, in a CASE): all three,
-            // NULL when no row is equal and a NULL met a row.
+            // NULL when no row is equal and one may be.
             let (hit, miss) = if negated { ("FALSE", "TRUE") } else { ("TRUE", "FALSE") };
-            format!("(CASE WHEN {equal} THEN {hit} WHEN {null} THEN NULL ELSE {miss} END)")
+            format!("(CASE WHEN {equal} THEN {hit} WHEN {maybe} THEN NULL ELSE {miss} END)")
         };
         current = format!("{}{}{}", &current[..lhs_start], exists, &current[sub.end..]);
         from = lhs_start + exists.len();

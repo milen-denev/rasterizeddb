@@ -101,3 +101,43 @@ async fn a_correlated_in_subquery_in_an_update_and_a_delete() {
     );
     assert_eq!(rows(&pool, "SELECT id FROM ca ORDER BY 1").await, v(&["4"]));
 }
+
+/// A row on the left: `(a, b) IN (SELECT x, y …)`, compared column by
+/// column. NOT IN is true only when every row is definitely unequal: a pair
+/// with a NULL on either side and no unequal pair leaves it NULL.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_correlated_row_in_subquery() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    pool.execute(sqlx::raw_sql(AssertSqlSafe(
+        "CREATE TABLE ra (id int PRIMARY KEY, k text, a int, b int); \
+         CREATE TABLE rb (id int PRIMARY KEY, k text, x int, y int); \
+         INSERT INTO ra VALUES (1,'p',1,1),(2,'p',1,2),(3,'q',3,NULL),(4,'q',4,4),(5,'r',5,5),(6,NULL,6,6); \
+         INSERT INTO rb VALUES (10,'p',1,1),(11,'q',3,3),(12,'q',NULL,4),(13,'r',5,NULL)"
+            .to_string(),
+    )))
+    .await
+    .expect("setup");
+    for (sql, expected) in [
+        ("SELECT id FROM ra t WHERE (t.a, t.b) IN (SELECT u.x, u.y FROM rb u WHERE u.k = t.k) ORDER BY 1", v(&["1"])),
+        ("SELECT id FROM ra t WHERE (a, b) NOT IN (SELECT u.x, u.y FROM rb u WHERE u.k = t.k) ORDER BY 1", v(&["2", "6"])),
+        (
+            "SELECT id, (a, b) IN (SELECT u.x, u.y FROM rb u WHERE u.k = t.k) AS m, \
+             (a, b) NOT IN (SELECT u.x, u.y FROM rb u WHERE u.k = t.k) AS nm FROM ra t ORDER BY 1",
+            v(&["1|t|f", "2|f|t", "3|NULL|NULL", "4|NULL|NULL", "5|NULL|NULL", "6|f|t"]),
+        ),
+        ("SELECT id FROM ra t WHERE NOT ((a, b) IN (SELECT u.x, u.y FROM rb u WHERE u.k = t.k)) ORDER BY 1", v(&["2", "6"])),
+        ("SELECT id FROM ra t WHERE ROW(t.a, t.b) IN (SELECT u.x, u.y FROM rb u WHERE u.k = t.k) ORDER BY 1", v(&["1"])),
+    ] {
+        assert_eq!(rows(&pool, sql).await, expected, "{sql}");
+    }
+    assert_eq!(
+        rows(&pool, "UPDATE ra t SET a = a + 100 WHERE (a, b) IN (SELECT u.x, u.y FROM rb u WHERE u.k = t.k) RETURNING id").await,
+        v(&["1"])
+    );
+    assert_eq!(
+        rows(&pool, "DELETE FROM ra t WHERE (a, b) NOT IN (SELECT u.x, u.y FROM rb u WHERE u.k = t.k) RETURNING id").await,
+        v(&["1", "2", "6"])
+    );
+    assert_eq!(rows(&pool, "SELECT id, a, b FROM ra ORDER BY 1").await, v(&["3|3|NULL", "4|4|4", "5|5|5"]));
+}

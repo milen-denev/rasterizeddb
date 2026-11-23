@@ -1454,9 +1454,7 @@ source) all run now and are no longer gaps. What is still missing:
 - **DDL**: `CREATE TABLE … (LIKE t INCLUDING …)`, `UNIQUE NULLS NOT DISTINCT`,
   `PARTITION BY RANGE`/`LIST` (tables partition by `HASH` only), and
   `UPDATE … SET a[1] = …`.
-- **Queries**: a correlated subquery after `IN` with a row on the left
-  (`(a, b) IN (SELECT … WHERE u.k = t.k)`; one value on the left works, in
-  `SELECT`, `UPDATE` and `DELETE`), a parenthesised set operation as a value
+- **Queries**: a parenthesised set operation as a value
   (`IN ((SELECT 1) UNION (SELECT 2))`, `EXISTS ((SELECT …) EXCEPT (SELECT
   …))`; without the inner parentheses it works), a `UNION` of a `NUMERIC`
   column with a branch that has no `FROM` (`… EXCEPT SELECT 3, NULL::numeric`,
