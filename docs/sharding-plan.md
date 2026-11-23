@@ -27,7 +27,9 @@ Two tracks, in this order:
   is a few weeks of work and covers apps whose every query is scoped by a
   tenant key (pms by `domain_id`, Kostas by `store_id`).
 - **Track B, engine sharding (§4).** The design's phases 0 to 6, revised
-  against the tree. A gateway forwards statements and shards enforce
+  against the tree. A dedicated gateway binary (§4.9) routes by hashing one
+  value and relays bytes. It is built to stay within a few percent of a raw
+  byte relay, with zero allocations per statement. Shards enforce
   ownership. Fan-out reads come next, then an authority with offline moves,
   then per-shard Raft. Each phase is safe to stop at.
 
@@ -93,7 +95,8 @@ The convention, from [[new-features-behind-cargo-features]] and
 | **`rasterizeddb_router`** (new workspace member) | none | `xxh64`, key framing, `level_hash`, point assembly, `PointRange`, `RangeMap`, the shard-map codec | none | always built: core's partitioning depends on it |
 | `rasterizeddb_client` | `sharding` | the `shard` module (map, router, fan-out, health, epoch check); the ORM's sharded surface (`ShardedModelExt` on `Router`, fan-out `Select`, sharded `Cached`/`KvRepo`, `Migrator::run_sharded`); the `rdb-shard` tool (behind `required-features`) | `rasterizeddb_router` only | yes, beside `derive` |
 | `rasterizeddb_client_derive` | none | emits `Model::SHARD` and `shard_key()` for every model; plain data with no routing code, so a client built without `sharding` still compiles derived models | none | — |
-| `rasterizeddb_core` | `sharding` | `core/shard/*` (map, ownership log, admission, classifier, rshard, gateway), the ownership guard, `--role`/`--cluster-map`/`--shard-id`, `SHOW SHARDS`, cluster DDL | none (rastcp, rustls and the tree's xxh64 cover it) | yes; dormant without `--role` |
+| `rasterizeddb_core` | `sharding` | `core/shard/*` (map, ownership log, admission, `Classify`, the shard side of rshard, the virtual-session backend endpoint), the ownership guard, `--role shard`/`--cluster-map`/`--shard-id`, `SHOW SHARDS`, cluster DDL | none (rastcp, rustls and `rasterizeddb_router` cover it) | yes; dormant without `--role` |
+| **`rasterizeddb_gateway`** (new binary crate) | `tls` (default), `native` (default), `fanout` (default from 1b) | the gateway (§4.9). **Does not depend on `rasterizeddb_core`**: no engine, no parser, no catalogue | `rastcp`, `rasterizeddb_router`, `tokio`, `rustls` (all already in the tree) | its own binary, built only when asked |
 | `rasterizeddb_core` | `sharding_raft` = `["sharding", "dep:openraft"]` | phase 3: log store, state machine, capture sink, apply loop, ReadIndex, learners | `openraft` (exact pin) | after phase 3's gate |
 | `rasterizeddb_core` | `sharding_2pc` = `["sharding_raft"]` | phase 5: Prepared outcome writers, `__dist_txn`, the recovery driver | none | after phase 5's gate |
 
@@ -410,16 +413,19 @@ in the default database.
 ### 4.1 Shape, revised
 
 ```
- client ─pgwire─► gateway (--role gateway)                 shard (--role shard, one Database)
-                   classify: route key / tenant predicate ──rshard──► admission: map/owner/schema epoch
-                   per-session backend sessions, lazily     │        full pgwire session: rewrites, views,
-                   fan-out merge (1b/1c)                    │        triggers, CTE temps run HERE
-                                                            │        ownership: route_where ∩ Owned,
-                   Track A routers connect to shards ───────┘        FOREIGN refuses, write guard
+ client ─pgwire/native─► rasterizeddb_gateway (own binary, no Database)      shard (--role shard, one Database)
+                          route template cache: stmt shape → "key = $2, int"  ┌► backend endpoint: virtual sessions
+                          hash 1 value → range map → shard   ──rastcp/2 mux──┤   (pgwire session per client session)
+                          relay pgwire bytes both ways, no row decode         │   admission: map/owner/schema epoch
+                          first sight of a shape: Classify{sql} ─────────────┘   rewrites, views, triggers, CTEs run HERE
+                          fan-out merge (1b/1c)                                   ownership: route_where ∩ Owned,
+                   Track A routers connect to shards directly ─────────────►      FOREIGN refuses, write guard
 ```
 
-- **The gateway forwards text and does not execute.** It holds catalogue
-  shells only to classify.
+- **The gateway forwards and does not execute.** It is a separate,
+  lean binary (§4.9) with no `Database`, no SQL parser and no catalogue
+  shells. A shard classifies each statement shape once, and the gateway
+  caches the answer.
 - **Correctness never depends on the classifier.** Each shard refuses any
   read reaching a range it does not own (`RDB02`) and any write that would
   stamp a row outside `Owned ∪ Incoming(own move)`.
@@ -454,9 +460,10 @@ independent of one another.
 
 ### 4.3 Phase B1a: single-shard routing, RF1 (feature `sharding`)
 
-**B1a.1 Roles and flags.** `--role shard|gateway`, `--cluster-map <file>`,
+**B1a.1 Roles and flags.** `--role shard`, `--cluster-map <file>`,
 `--shard-id`, `--cluster-id`; all under `#[cfg(feature = "sharding")]` in
-`main.rs`. A shard is one `Database` per process: the data-directory lock and
+`main.rs`. The gateway is its own binary, `rasterizeddb_gateway` (§4.9),
+not a role of the server. A shard is one `Database` per process: the data-directory lock and
 `EngineSlot` already enforce one engine per process (a5d81376). Several
 shards on one machine are several processes, as the design says.
 
@@ -468,9 +475,9 @@ shards on one machine are several processes, as the design says.
 | `ownership.rs` | `db_shard_ownership.log` on `core/framed_log.rs`: `ACQUIRE`, `RELEASE`, `INCOMING`, `FENCE`, `EVICTED`; `ArcSwap<OwnedRanges>` published only from accepted map + ownership records together |
 | `admission.rs` | one function every request passes: placement generation, `(range, owner_epoch)` Owned and named by the accepted map, schema epoch, per-range admission lease |
 | `guard.rs` | the ownership write guard (one comparison against the `ArcSwap`); `()` without the feature |
-| `classify.rs` | the gateway classifier (B1a.6) |
-| `rshard.rs` | the protocol over rastcp, pipelined (`TcpClient::pipeline()`, as replication uses since 9c090782) |
-| `gateway.rs` | per-client session, backend sessions per shard, forwarding, refusals, cancel map |
+| `classify.rs` | answers the gateway's `Classify{sql}` with a route template (B1a.6), using the engine's own parser, views and `route_where` |
+| `rshard.rs` | the shard side of the protocol over rastcp/2: virtual sessions, `Classify`, fan-out `Exec{Part}`, map and epoch exchange |
+| `backend.rs` | the virtual-session endpoint: one pgwire session per gateway client session, driven over a mux stream and writing replies straight into mux frames (§4.9, G5) |
 | `ddl.rs` | cluster DDL procedure (B1a.10) |
 
 **B1a.3 Static map.** The file is Track A's map codec (A1), with CRC and
@@ -511,39 +518,53 @@ FK cascades, `ON CONFLICT`, `UPDATE … FROM`, COPY, MERGE and import all
 re-enter the executor and end on these paths. **`FENCE` publishes the fenced
 guard before the drain samples the running set**, as in sharding.md §6.
 
-**B1a.6 The classifier, explicit first.** Routing in order:
-1. **An explicit route key.** `SET rdb.route_key = '<value>'` per session, or
-   `SET LOCAL` per transaction. pms already scopes every query by
-   `domain_id`, so this is one statement per connection checkout.
-2. **Automatic** only for statements whose every sharded reference is a
-   base table with the leading key fixed by `=` or a capped `IN`. This uses
-   the engine parser and `sarg::extract_gated` (`filter/sarg.rs:555`) against
-   shells, never a text scan ([[scanners-must-track-nesting]]).
-3. **Only unsharded tables:** the home shard.
-4. **Anything else:** `0A000 "statement needs a route key in cluster mode"`.
-   Fail-closed ([[a-guard-is-an-allowlist]]). A wrong guess costs the
-   client an `RDB02` from the shard, never wrong rows.
+**B1a.6 Classification: on a shard, once per statement shape.** The
+gateway routes in this order:
+1. **A route key carried with the request.** The native request header
+   field (set by the ORM and `Router`, A4b), or `SET rdb.route_key` /
+   `SET LOCAL rdb.route_key`. No inspection of the SQL at all.
+2. **A cached route template** for the statement's shape:
+   - A prepared statement's shape is its Parse text.
+   - A simple query's shape is its text with literals replaced by slots, by
+     the shared literal tokenizer (G3).
+   - The template says where the level-0 key is: `Param(i, family)`,
+     `Slot(k, family)`, `Home`, `FanOut(shape)` or `NeedsKey`.
+3. **On a cache miss**, the gateway sends `Classify{sql}` to any live shard
+   (its home shard by default) and caches the answer under the cluster
+   schema epoch.
 
-Views, functions and triggers are expanded only on the shard. A statement
-whose route the gateway cannot see through a view needs the route key.
+   **The shard classifies with the engine's real machinery:** its parser,
+   its views, functions and triggers, and the same `sarg::extract_gated`
+   (`filter/sarg.rs:555`) and `route()` that `route_where` enforces. So the
+   gateway carries no SQL parser and no catalogue, and statements through
+   views route automatically when their key is visible after expansion.
+4. **`NeedsKey`:** `0A000 "statement needs a route key in cluster mode"`.
+   This is fail-closed ([[a-guard-is-an-allowlist]]).
 
-**B1a.7 Gateway session model:**
-- **Forwarding point.** The gateway's pgwire listener branches at the top of
-  `execute_recorded_inner` (`pgwire.rs:8002`), before any rewrite: before the
-  DO block (`:8412`), temp-table (`:8476`), MERGE (`:8510`), sequence
-  (`:8542`), view (`:8590`), trigger (`:8616`) and CTE (`:8863`/`:8886`)
-  rewrites, and before `catalog_guards` (`:8255`).
-- **Backend sessions.** One per shard per client session, opened lazily over
-  rshard. Each is a real `SessionState` on the shard, bridged like
-  `pgwire/proxied.rs`'s `PgBridge`. Session `SET`s are recorded at the
-  gateway and replayed to a backend session when it opens.
-- **Prepared statements.** The gateway keeps Parse/Bind. At Execute it
-  inlines parameters with `pg_params::inline_params` (`pg_params.rs:97`, as
-  the shard would at `pgwire.rs:4512`), routes, and forwards text. **It never
-  routes at Parse** (S12).
-- **Describe.** Forwarded to the session's current shard, or the home shard.
-  Schemas are identical under the schema epoch. The describe cache key
-  (`pgwire.rs:3719`) gains the schema epoch.
+A wrong template costs an `RDB02` from the shard, never wrong rows. A
+template that produced an `RDB02` is dropped from the cache and counted
+(`route_template_refuted`), so it does not keep failing.
+
+**B1a.7 Gateway session semantics.** The mechanics (relay, threads,
+buffers) are in §4.9; this item fixes what a session means.
+- **Backend sessions.** One virtual session per shard per client session,
+  opened lazily on the shard's mux connection.
+  - Each is a real pgwire session on the shard. Every rewrite (DO blocks,
+    temp tables, MERGE, sequences, views, triggers, CTEs, `catalog_guards`)
+    therefore runs there, unchanged.
+  - Session `SET`s are recorded at the gateway as raw messages and replayed
+    to a backend session when it opens.
+- **Prepared statements.**
+  - Parse/Bind/Describe/Execute are forwarded **verbatim**. Parameters are
+    never inlined at the gateway; the shard inlines as it does today
+    (`pg_params::inline_params`, `pg_params.rs:97`).
+  - A statement Parsed on one backend is re-Parsed lazily on another the
+    first time it routes there, cached per backend session.
+  - Routing happens **at every Bind/Execute** by hashing the bound key
+    value, never at Parse (S12).
+- **Describe.** Goes to the session's current shard, or the home shard.
+  Schemas are identical under the schema epoch. The shard's describe cache
+  key (`pgwire.rs:3719`) gains the schema epoch.
 - **Transactions:**
   - `BEGIN` is recorded at the gateway, and the first routed statement opens
     the backend transaction.
@@ -570,7 +591,7 @@ whose route the gateway cannot see through a view needs the route key.
 | Front end | Phase 1a | Later |
 |---|---|---|
 | pgwire | through the gateway | — |
-| native (rastcp) | direct to shards with the Track A router; native autocommit (`execute_as`, `database/mod.rs:6722`) bypasses pgwire, so a native gateway is separate work | native gateway in 1b if asked |
+| native (rastcp) | through the gateway: the request header carries the route key (ORM/`Router` fill it), so routing parses nothing. On the shard the virtual session runs today's native path (`serve_native_request`, `database/mod.rs:6320`). Track A clients may still go direct | — |
 | MySQL, TDS | refused on gateways (they bridge to pgwire, so they can follow the pgwire gateway later); allowed direct to a shard | after 1c |
 | Redis / `kv_cache` | node-local; refused on gateways; direct to a shard is that shard's cache | route by key prefix, phase 4 |
 | `LISTEN`/`NOTIFY` | refused on gateways (the hub is per process, `pgwire/notify.rs`) | gateway hub, phase 4 |
@@ -867,6 +888,161 @@ The design's §9, with these concrete seams:
   - automatic rebalancing;
   - clone splits.
 
+### 4.9 The gateway (`rasterizeddb_gateway`)
+
+The gateway sits on every statement's path, so it gets the hardest budget
+in this plan: be invisible next to the shard's own cost, and never be the
+reason a statement fails or returns wrong rows. It is built in B1a and
+extended by B1b/B1c's fan-out.
+
+**Budgets.** These are merge gates, measured as in §6 and
+[[how-to-profile-this-repo]]: instructions and cycles per statement with
+`perf stat`, alternating A B B A, never wall-clock on a loaded box.
+
+| # | Budget | Why |
+|---|---|---|
+| B-1 | Routed statement, steady state: gateway cycles (user + kernel, TLS on both legs) ≤ **1.25×** a plain byte relay doing the same socket work (the floor, measured by G0) | Everything above the relay is routing, which should cost tens of nanoseconds |
+| B-2 | Gateway user-space instructions per routed prepared point read ≤ **10%** of the shard's (today ~95k server instructions, [[native-point-query-cost]]) | The hop must not change capacity planning |
+| B-3 | **Zero heap allocations** per routed statement in steady state | Checked by a counting global allocator in a dev-only bench. Allocation was this repo's largest flat cost ([[allocator-page-fault-churn]]) |
+| B-4 | ≤ **1 context switch** per statement per leg (`sysp.sh`) | The `yield_now` lesson ([[yield-now-wakes-a-second-worker]]) |
+| B-5 | Added latency over a direct connection, on loopback: p50 ≤ **30 µs**, p99 ≤ **100 µs** at 50% load. On the LAN: B1a's gate (< 150 µs) | — |
+| B-6 | ≤ **8 KiB** per idle client session, ≤ **64 KiB** per active one | 100k idle connections in under 1 GiB |
+| B-7 | Cycles per statement ≤ **PgBouncer's** (transaction pooling) on the same box and workload | The canonical lightweight proxy is the yardstick. Measured once in G0 and recorded |
+
+**G1. A lean binary.**
+- **Own crate.** Its only dependencies are `rastcp`, `rasterizeddb_router`,
+  `tokio` and `rustls`, all already in the tree.
+- **No `rasterizeddb_core`:**
+  - none of the engine's statics (`MEMORY_POOL`, `WALS`, the query cache);
+  - no parser;
+  - no catalogue.
+- `#![forbid(unsafe_code)]`.
+- It starts in milliseconds, reading its map from a file or from any shard.
+
+**G2. Thread-per-core.**
+- **N workers.** Each is a `current_thread` tokio runtime with its own
+  `SO_REUSEPORT` listener (rastcp `reuse_port`, f1c6a2be). Each has its own
+  mux connections to every shard, its own route-template cache and its own
+  buffer pool.
+- **A client connection stays on one core for life.** Nothing on the hot
+  path crosses threads.
+- **Shared read-mostly state:** the map (an `ArcSwap`, one load per
+  statement) and the template cache's shared second level, filled on a
+  per-core miss.
+- **Why here:** rastcp's measurements found thread-per-core worth 4–11% only
+  for echo-like handlers ([[rastcp-perf-phases]]). A relay is exactly that
+  case; the database handler on a shard was not.
+
+**G3. Routing without parsing.**
+- **The per-statement work:**
+  1. Find the route value: a request header field, a Bind parameter by
+     index, or literal slot k.
+  2. Normalise it to its family's bytes.
+  3. Hash it with `xxh64`.
+  4. Binary-search the range map (4,096 ranges is 12 comparisons).
+
+  Target: ≤ 100 ns.
+- **Bind formats.** Both binary and text, normalised exactly as the server
+  coerces (int2/4/8 by width, UUID octets, text bytes). Property-tested
+  against `rdb_route_point` (A2).
+- **The literal-slot tokenizer** for simple queries handles strings, `E''`,
+  dollar quotes, comments and nested parentheses. It lives in
+  `rasterizeddb_router`, shared with core's text template (663c509f) so the
+  two cannot drift, and is differential-fuzzed against core's
+  ([[scanners-must-track-nesting]], [[byte-walk-scanners-cut-utf8]]).
+
+**G4. Byte relay, no decode.**
+- **What the gateway reads:** pgwire framing (type and length), plus the few
+  messages it must understand:
+  - Parse, Bind, Execute, Sync, Query, Terminate, CancelRequest;
+  - ReadyForQuery's transaction-status byte;
+  - ErrorResponse's SQLSTATE, for the retry rules.
+- **Everything else is copied as bytes** from the shard's mux frames to the
+  client socket, coalesced into one `writev` per batch. That includes
+  DataRow, RowDescription and CommandComplete. Nothing is decoded and
+  nothing is re-encoded.
+
+**G5. The shard writes into the frame.**
+- **The endpoint.** `core/shard/backend.rs` drives a pgwire session whose
+  I/O is a message source and sink over a mux stream. It is neither a
+  socket nor the in-memory duplex `PgBridge` uses.
+- **Why not the duplex:** it re-encodes every row, which costs ~1–5.7k
+  instructions per row for MySQL/TDS ([[four-protocol-comparison]]).
+- **The change it needs:** pgwire's session I/O behind a small trait. This
+  is a `pgwire.rs` change, sent to its owner first.
+- **Native sessions** use today's native path, with replies written into
+  frames the same way.
+
+**G6. Pipelining and batching.**
+- Everything a client has pipelined is forwarded in one mux write, and
+  replies stream back as they arrive.
+- One mux connection per core per shard by default (rastcp/2 multiplexes up
+  to `max_in_flight`). More only if measurement shows head-of-line blocking.
+
+**G7. Per-connection machinery, never per-statement.**
+- One `Deadline` per connection (rastcp's interrupt pattern, a2e0beb0) and no
+  per-statement timers.
+- No task spawn per statement: the session is driven on its connection task,
+  as `drive_alone` does.
+- No `select!` over a `watch` per statement, and no `yield_now`.
+- Small futures: rare branches are boxed so large futures are not moved at
+  every await (the memmove lesson from the native rounds).
+
+**G8. Buffers.**
+- Per-core pooled read and write buffers, sized from each session's recent
+  high-water mark and returned when the session goes idle (B-6).
+- A large result streams through a bounded buffer and is never held whole.
+
+**G9. Authentication.**
+- The gateway verifies SCRAM-SHA-256 and SCRAM-SHA-256-PLUS itself, using
+  each role's StoredKey and ServerKey.
+- The keys are fetched from the home shard over mTLS and cached under a role
+  epoch. The gateway holds no plaintext secrets. Channel binding works
+  because the gateway terminates the client's TLS.
+- Backend virtual sessions open with the authenticated role, asserted by the
+  gateway's mTLS identity, and shards re-check grants (sharding.md §13).
+
+**G10. Observability at no hot-path cost.**
+- **Per-core counters:** plain integers, no atomics on the hot path.
+- **Summed on read:** by `SHOW GATEWAY` and a metrics endpoint.
+- **What is counted:**
+  - statements routed;
+  - template hits and misses, and `route_template_refuted`;
+  - refusals by SQLSTATE, retries and `08007`s;
+  - bytes relayed and sessions;
+  - a hop-latency histogram in per-core buckets.
+
+**Rock solid: what must never happen, and what prevents it.**
+
+| # | Never | Prevented by | Test (mutation) |
+|---|---|---|---|
+| R1 | Wrong rows from a misroute | Shard ownership (B1a.4–.5). The gateway is never trusted for correctness | A gateway with a deliberately wrong map gets only `RDB02`/`Moved`, never rows *(skip the shard check)* |
+| R2 | A write applied twice | Retry only on `before_effect` refusals. A connection lost after dispatch is `08007` | Kill the shard after a commit is sent: the counter rises exactly once *(retry on connection loss)* |
+| R3 | One slow client stalling others | Per-stream flow control on rastcp/2 (verify it exists; add credit windows if not) and bounded per-session buffers. A session whose client stops reading stops reading its own stream, not the shared connection | A client that never reads a 1 GB result; other sessions' p99 unchanged *(unbounded buffer)* |
+| R4 | One dead shard affecting other tenants | Per-shard circuit state: requests for that shard fail fast (`08006`/`57P03`), others are untouched. One dial attempt speaks for every waiter (rastcp 2c352d34) | Kill shard 2 under load: shards 1 and 3 keep their p99 |
+| R5 | Unbounded memory | B-6's budgets, the gather caps and semaphore (B1b), max sessions and max in-flight per core; past them, shed with `53300` | A connection and request flood stays under its RSS bound |
+| R6 | A crash losing state | No durable state except the highest map epoch seen (one small file). Any number of gateways run, with no coordination between them; a restarted gateway is simply a new one | kill -9 mid-transaction: the shard rolls back the orphaned virtual session, via a session lease on the mux connection |
+| R7 | A stale map serving writes | Every shard reply carries its map epoch. A newer epoch makes the gateway fetch the signed map from that shard before routing more writes, and epochs never go down | Shard at epoch e+1, gateway at e: the next write waits for the fetch *(route on the old map)* |
+| R8 | A panic killing the process | Each session's task runs under `catch_unwind`; a panic ends that session with `XX000` and is counted | An injected panic in one session; the others continue |
+| R9 | A malformed client harming anything | Length-checked framing, a maximum message size, and a fuzzed parser (bounded, seeded corpus) | Fuzz the frame reader and the Bind decoder |
+| R10 | Downtime on upgrade | `SO_REUSEPORT` hand-over: the new process binds, the old one stops accepting and drains up to a deadline. Open transactions finish; idle sessions close with `57P01` | A rolling restart under load: no failed statements beyond the idle closes |
+
+**Build order, inside B1a and before any feature work:**
+1. **G0, the floor.** A spike kept as a bench: a pure byte relay over the
+   same sockets, TLS and mux, with a fixed shard. It measures B-1's floor,
+   B-7's PgBouncer comparison and B-5 on .7/.4. If the relay itself misses
+   B-5, fix the transport (rastcp) first, not the gateway.
+2. **G1–G4 and G6–G8** on top. Each slice is re-measured against the floor
+   with the A/B harness (the `.claude/reviews/rastcp-perf/` and `protobench/`
+   methods).
+3. **G5** on the shard side, in parallel.
+4. **G9 and G10** last.
+
+A slice that breaks a budget does not merge until it is back within it.
+
+**Size:** the gateway crate is about 5–7k LOC plus ~3k of tests and benches.
+The shard endpoint (G5) is about 1.5k.
+
 ## 5. Sequencing
 
 ```
@@ -878,7 +1054,8 @@ Track A   A1 route    ███
 Track B   B0.1/.2/.3  ████████                    (independent slices)
           B0.4/.5/.6/.7   ██████████
           B0.9 measure        ██
-          B1a                       ████████████████████
+          G0 relay floor        ███                   (spike + bench, before B1a features)
+          B1a (+ gateway G1–G10)    ████████████████████
           B1b                                         ████████
           B1c                                               ████████
           B2 …                                                     ██████████████
@@ -949,9 +1126,14 @@ covers the growth path.
 
 ## 8. Risks and stop points
 
-1. **The forwarding gateway's session model is the largest unknown in B1a.**
-   This covers SET replay, temp pinning, prepared statements and Describe. If
-   it grows past ~10k LOC, stop at "native/Track A routers plus shard-side
+1. **The gateway is the largest unknown in B1a**, for two reasons:
+   - its session model: SET replay, temp pinning, prepared statements across
+     backends, Describe;
+   - its budgets (§4.9).
+
+   G0 measures the floor before any feature is built, so a transport problem
+   shows up first. If the gateway cannot meet B-1/B-5, or grows past ~10k
+   LOC, stop at "native/Track A routers plus shard-side
    enforcement" (B0 + B1a.1–.5 + B1a.9–.11), which is useful on its own: the
    engine then guarantees a misrouted client gets errors, never rows.
 2. **The classifier will refuse legitimate ORM SQL.** The explicit route key
