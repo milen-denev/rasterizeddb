@@ -3410,7 +3410,8 @@ async fn a_rolled_back_insert_gives_its_space_back() {
     let cfg = crate::core::vacuum::VacuumConfig::default();
     assert!(
         report.dead_bytes >= cfg.min_dead_bytes || report.dead_ratio() >= cfg.min_dead_ratio,
-        "rolled-back rows counted as dead but stayed under both trigger thresholds          ({} bytes, ratio {:.3}), so an unforced sweep would never reclaim them",
+        "rolled-back rows counted as dead but stayed under both trigger thresholds \
+         ({} bytes, ratio {:.3}), so an unforced sweep would never reclaim them",
         report.dead_bytes,
         report.dead_ratio()
     );

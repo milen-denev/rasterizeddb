@@ -1230,7 +1230,8 @@ pub fn check_tuning(prefix: &str, tuning: &[(String, u64)]) -> Result<(), String
             let below = (config.chunk_size / config.page_size) * config.page_size;
             let above = below + config.page_size;
             message.push_str(&format!(
-                ". The nearest usable CHUNK_SIZE values are {} and {} ({} is a common                  intended one — a binary 4 MiB rather than a decimal 4 MB)",
+                ". The nearest usable CHUNK_SIZE values are {} and {} ({} is a common \
+                 intended one — a binary 4 MiB rather than a decimal 4 MB)",
                 below, above, 4 * 1024 * 1024
             ));
         }

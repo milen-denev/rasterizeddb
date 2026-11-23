@@ -1008,7 +1008,8 @@ async fn download_object(
         let sha256 = super::to_hex(&digest.finalize());
         if total != expected.len || sha256 != expected.sha256 {
             return Err(io::Error::other(format!(
-                "object {} for {} does not match the catalogue: {} bytes with SHA-256 {},                  expected {} bytes with {}",
+                "object {} for {} does not match the catalogue: {} bytes with SHA-256 {}, \
+                 expected {} bytes with {}",
                 expected.key, expected.name, total, sha256, expected.len, expected.sha256
             )));
         }

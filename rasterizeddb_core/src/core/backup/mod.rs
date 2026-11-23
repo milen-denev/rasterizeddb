@@ -1451,7 +1451,8 @@ impl BackupService {
                 .find(|o| !o.key.starts_with(&own_prefix) && !live.contains(o.key.as_str()))
             {
                 return Err(io::Error::other(format!(
-                    "snapshot {id} reused {} for {}, but retention removed it while the                      snapshot ran; the snapshot is abandoned and the next one will upload it",
+                    "snapshot {id} reused {} for {}, but retention removed it while the \
+                     snapshot ran; the snapshot is abandoned and the next one will upload it",
                     gone.key, gone.name
                 )));
             }
@@ -3050,7 +3051,9 @@ fn folded_while_copying(before: &HashMap<String, u64>, after: &HashMap<String, u
         let now = after.get(name).copied().unwrap_or(0);
         if now < *was {
             return Err(io::Error::other(format!(
-                "{name} was folded into its main file while the snapshot was being copied,                      so up to {} bytes are in neither the copy nor the log. Discarding this                      snapshot; retry it.",
+                "{name} was folded into its main file while the snapshot was being copied, \
+                     so up to {} bytes are in neither the copy nor the log. Discarding this \
+                     snapshot; retry it.",
                 was - now
             )));
         }

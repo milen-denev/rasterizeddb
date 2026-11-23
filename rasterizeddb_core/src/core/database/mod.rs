@@ -2799,7 +2799,8 @@ impl Database {
             }
         } else {
             warn!(
-                "Stopped dropping JSON shadow tables under {} at depth {}: the sidecars                  describe a cycle",
+                "Stopped dropping JSON shadow tables under {} at depth {}: the sidecars \
+                 describe a cycle",
                 table_name, depth
             );
         }

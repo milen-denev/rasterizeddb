@@ -639,7 +639,8 @@ async fn resync(database: &Arc<Database>, tokens: &[String]) -> Result<Vec<Strin
         if !more || rounds >= MAX_ROUNDS {
             if rounds >= MAX_ROUNDS {
                 return Err(format!(
-                    "resynchronising origin {} did not finish after {} rounds;                      stopped at sequence {}",
+                    "resynchronising origin {} did not finish after {} rounds; \
+                     stopped at sequence {}",
                     origin, rounds, cursor
                 ));
             }
@@ -648,7 +649,8 @@ async fn resync(database: &Arc<Database>, tokens: &[String]) -> Result<Vec<Strin
     }
 
     Ok(vec![format!(
-        "resynchronised origin {} from sequence {} to {} (was at {}):          {} pulled, {} applied, {} refused",
+        "resynchronised origin {} from sequence {} to {} (was at {}): \
+         {} pulled, {} applied, {} refused",
         origin, from, cursor, before, pulled, applied_count, refused
     )])
 }

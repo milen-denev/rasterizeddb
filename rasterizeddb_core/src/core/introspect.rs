@@ -3384,7 +3384,8 @@ fn action_name(action: &crate::core::rql::foreign_key::ReferentialAction) -> &'s
 /// STATUS` says so: "nothing has run yet" and "this build does not record what
 /// runs" want two different things done about them.
 #[cfg(not(feature = "query_stats"))]
-const NO_QUERY_STATS: &str = "this server was built without the `query_stats` feature, so it records nothing about      what it runs; rebuild with `--features query_stats`";
+const NO_QUERY_STATS: &str = "this server was built without the `query_stats` feature, so it records nothing about \
+     what it runs; rebuild with `--features query_stats`";
 
 #[cfg(not(feature = "query_stats"))]
 fn recent_queries(_limit: Option<u64>) -> Result<Vec<Row>, String> {

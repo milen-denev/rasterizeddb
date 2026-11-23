@@ -3237,7 +3237,8 @@ fn deadlock_check(
     if database.row_locks.deadlock_victim(tx, is_live) {
         database.row_locks.clear_waiting(tx);
         return Some(format!(
-            "deadlock detected: transaction {} waits for transaction {}, which is waiting,              through a cycle, for transaction {}",
+            "deadlock detected: transaction {} waits for transaction {}, which is waiting, \
+             through a cycle, for transaction {}",
             tx,
             blockers.first().copied().unwrap_or(0),
             tx

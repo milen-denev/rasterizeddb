@@ -1426,7 +1426,10 @@ fn adopt_copied_pool(text: &str, root: &str, path: &Path) -> Result<Option<Strin
     let own = primaries[0].clone();
     let refuse = |why: String| -> Result<Option<String>, String> {
         Err(format!(
-            "{} was written for {own}, not for {root}: this directory is a copy of that database              (a mirror opened directly, or a directory copied or moved by hand), and {why}. Opening              it as it is would read and write the original's files, so it is not opened. Restore              it with RESTORE, which repoints such a copy, or edit or remove {}",
+            "{} was written for {own}, not for {root}: this directory is a copy of that database \
+             (a mirror opened directly, or a directory copied or moved by hand), and {why}. Opening \
+             it as it is would read and write the original's files, so it is not opened. Restore \
+             it with RESTORE, which repoints such a copy, or edit or remove {}",
             path.display(),
             path.display()
         ))
@@ -1485,7 +1488,8 @@ fn adopt_copied_pool(text: &str, root: &str, path: &Path) -> Result<Option<Strin
         return refuse(format!("rewriting it for this directory failed ({e})"));
     }
     warn!(
-        "{} was written for {own}; this directory is a copy of that database, so the file now          names {root} as its location{}",
+        "{} was written for {own}; this directory is a copy of that database, so the file now \
+         names {root} as its location{}",
         path.display(),
         if backups.is_empty() {
             String::new()

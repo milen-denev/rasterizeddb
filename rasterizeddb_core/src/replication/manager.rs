@@ -751,7 +751,8 @@ impl Replication {
             } else {
                 voided += 1;
                 warn!(
-                    "Transaction {}:{} was written to the replication log and did not commit                      before this node stopped; it is voided",
+                    "Transaction {}:{} was written to the replication log and did not commit \
+                     before this node stopped; it is voided",
                     origin, seq
                 );
                 // Fails only if the log cannot be written at all; the record
@@ -1266,7 +1267,8 @@ impl Replication {
             if let Some(wal) = self.wal.load_full() {
                 if let Err(e) = wal.commit_through(gate) {
                     self.note_capture_failure(format!(
-                        "Transaction {}:{} ran, but its replication record could not be made                          durable ({}); a crash now would leave the peers without it",
+                        "Transaction {}:{} ran, but its replication record could not be made \
+                         durable ({}); a crash now would leave the peers without it",
                         self.node_id(),
                         seq,
                         e
@@ -1292,7 +1294,8 @@ impl Replication {
         if let Some(log) = self.log.load_full() {
             if let Err(e) = log.void(self.node_id(), seq, self.clock.now()) {
                 warn!(
-                    "Could not write the void for transaction {}:{} ({}); it is void in memory                      and the next start writes it",
+                    "Could not write the void for transaction {}:{} ({}); it is void in memory \
+                     and the next start writes it",
                     self.node_id(),
                     seq,
                     e
@@ -1404,7 +1407,8 @@ impl Replication {
             if tokio::time::timeout_at(deadline, moved).await.is_err() {
                 self.stats.ack_timeouts.fetch_add(1, Ordering::Relaxed);
                 warn!(
-                    "Transaction {}:{} committed locally but only {} of {} peer(s)                      acknowledged within {:?}; they get it when they catch up",
+                    "Transaction {}:{} committed locally but only {} of {} peer(s) \
+                     acknowledged within {:?}; they get it when they catch up",
                     self.node_id(),
                     seq,
                     got,

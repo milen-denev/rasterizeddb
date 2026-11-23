@@ -1043,7 +1043,9 @@ impl SslMode {
                 "Encrypts if the source offers it, otherwise cleartext. Nothing is verified."
             }
             SslMode::Require => {
-                "Encrypted, but the source is not identified — anyone able to intercept the                  connection can present their own certificate and read the password and every                  row. Use verify-full across a network you do not trust."
+                "Encrypted, but the source is not identified — anyone able to intercept the \
+                 connection can present their own certificate and read the password and every \
+                 row. Use verify-full across a network you do not trust."
             }
             SslMode::VerifyFull => "Encrypted, and the source's certificate is checked.",
         }

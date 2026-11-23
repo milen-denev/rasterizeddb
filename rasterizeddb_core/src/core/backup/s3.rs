@@ -549,7 +549,8 @@ impl S3Client {
             return Err(StreamFailure {
                 consumed: 0,
                 error: io::Error::other(format!(
-                    "S3 ignored the range request for {key} (returned {}),                      so the download cannot be resumed safely",
+                    "S3 ignored the range request for {key} (returned {}), \
+                     so the download cannot be resumed safely",
                     head.status
                 )),
             });
