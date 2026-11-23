@@ -543,6 +543,13 @@ pub(crate) fn rewrite_write_where(sql: &str, key: &[String], delete: bool) -> Op
         (None, _) => table.clone(),
         _ => return None,
     };
+    // A write that already names a second relation (`UPDATE … FROM`,
+    // `DELETE … USING`) evaluates its correlated terms per joined row
+    // itself (`executor::split_correlated_terms`): left to it.
+    let second = if delete { find_keyword(sql, "USING", 0) } else { find_keyword(sql, "FROM", head_end) };
+    if second.is_some_and(|at| at < where_at) {
+        return None;
+    }
     let probe = format!("SELECT 1 FROM {table} {alias} WHERE {condition}");
     crate::core::rql::subquery::find_correlated_scalar_subquery(&probe)?;
     Some(rewrite_write_where_inner(sql, key, delete, head_end, where_at, condition, returning, &table, &alias))
@@ -560,14 +567,6 @@ fn rewrite_write_where_inner(
     table: &str,
     alias: &str,
 ) -> Result<String, String> {
-    let second = if delete { find_keyword(sql, "USING", 0) } else { find_keyword(sql, "FROM", head_end) };
-    if second.is_some_and(|at| at < where_at) {
-        return Err(format!(
-            "a correlated subquery in the WHERE of an {} with {} is not supported yet",
-            if delete { "DELETE" } else { "UPDATE" },
-            if delete { "USING" } else { "FROM" }
-        ));
-    }
     if key.is_empty() {
         return Err(format!(
             "a correlated subquery in the WHERE of an {} needs a primary key or a unique column on the table to \
