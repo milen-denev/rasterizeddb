@@ -187,6 +187,7 @@ jobs:
   #   <version>-ubuntu24.04  <version>  <minor>  <major>  latest   (the default)
   #   <version>-ubuntu26.04
   #   <version>-alpine      (the static musl server)
+  #   <version>-rustfs      (the musl server with RustFS: backups and S3 tables)
   #
   # plus <minor>-<variant> and <variant>. A pre-release gets only its exact
   # version tags. Each variant's amd64 image is smoke-tested before the push
@@ -203,9 +204,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { variant: ubuntu24.04, file: Dockerfile.ubuntu, base: "ubuntu:24.04", default: true }
-          - { variant: ubuntu26.04, file: Dockerfile.ubuntu, base: "ubuntu:26.04", default: false }
-          - { variant: alpine, file: Dockerfile.alpine, base: "alpine:3", default: false }
+          - { variant: ubuntu24.04, file: Dockerfile.ubuntu, args: "BASE=ubuntu:24.04", smoke: docker-smoke.sh, default: true }
+          - { variant: ubuntu26.04, file: Dockerfile.ubuntu, args: "BASE=ubuntu:26.04", smoke: docker-smoke.sh, default: false }
+          - { variant: alpine, file: Dockerfile.alpine, args: "BASE=alpine:3", smoke: docker-smoke.sh, default: false }
+          # The server with RustFS (S3 storage) in one container, on the
+          # official RustFS image: backups and S3-backed tables on board.
+          - { variant: rustfs, file: Dockerfile.rustfs, args: "RUSTFS_VERSION=1.0.6", smoke: docker-smoke-rustfs.sh, default: false }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -276,13 +280,13 @@ jobs:
         with:
           context: docker
           file: docker/${{ matrix.file }}
-          build-args: BASE=${{ matrix.base }}
+          build-args: ${{ matrix.args }}
           platforms: linux/amd64
           load: true
           tags: rasterizeddb-smoke:${{ matrix.variant }}
 
       - name: Smoke test the image
-        run: bash .github/scripts/docker-smoke.sh rasterizeddb-smoke:${{ matrix.variant }}
+        run: bash .github/scripts/${{ matrix.smoke }} rasterizeddb-smoke:${{ matrix.variant }}
 
       - name: Log in to the GitHub container registry
         if: github.event_name == 'push'
@@ -304,7 +308,7 @@ jobs:
         with:
           context: docker
           file: docker/${{ matrix.file }}
-          build-args: BASE=${{ matrix.base }}
+          build-args: ${{ matrix.args }}
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.tags.outputs.tags }}
@@ -398,7 +402,7 @@ jobs:
 
             Built with fat LTO and profile-guided optimisation; the glibc Linux binaries are also optimised with BOLT and need glibc 2.39+. The static musl binaries run on any Linux (Alpine included) and use mimalloc. Start with `rasterizeddb --location <dir>` (or `--in-memory`); `rasterizeddb --help` lists every option. Verify a download with `sha256sum -c SHA256SUMS`.
 
-            **Container images** (linux/amd64 and linux/arm64), on Docker Hub as `${{ vars.DOCKERHUB_USERNAME }}/rasterizeddb` and on `ghcr.io/${{ github.repository_owner }}/rasterizeddb`: `<version>` on Ubuntu 24.04 (also `<version>-ubuntu24.04`), `<version>-ubuntu26.04`, and `<version>-alpine`. Run with `docker run -e RASTERIZEDDB_PG_PASSWORD=<password> -p 5432:5432 -p 61170:61170 -v rasterizeddb:/var/lib/rasterizeddb ${{ vars.DOCKERHUB_USERNAME }}/rasterizeddb:<version>`; see docs/docker.md.
+            **Container images** (linux/amd64 and linux/arm64), on Docker Hub as `${{ vars.DOCKERHUB_USERNAME }}/rasterizeddb` and on `ghcr.io/${{ github.repository_owner }}/rasterizeddb`: `<version>` on Ubuntu 24.04 (also `<version>-ubuntu24.04`), `<version>-ubuntu26.04`, `<version>-alpine`, and `<version>-rustfs`, which runs RustFS beside the server for its backups and S3-backed tables. Run with `docker run -e RASTERIZEDDB_PG_PASSWORD=<password> -p 5432:5432 -p 61170:61170 -v rasterizeddb:/var/lib/rasterizeddb ${{ vars.DOCKERHUB_USERNAME }}/rasterizeddb:<version>`; see docs/docker.md.
 
             **Arch Linux / CachyOS** (x86-64-v3): `sudo pacman -U rasterizeddb-bin-*.pkg.tar.zst`, set the password in `/etc/rasterizeddb/rasterizeddb.env`, then `sudo systemctl enable --now rasterizeddb`. `rasterizeddb-bin-aur-*.tar.gz` holds the same PKGBUILD for the AUR.
 

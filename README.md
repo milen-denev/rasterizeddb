@@ -60,6 +60,8 @@ docker run -d --name rasterizeddb -e RASTERIZEDDB_PG_PASSWORD=change-me \
   milendenev/rasterizeddb:latest          # or ghcr.io/milen-denev/rasterizeddb:latest
 ```
 
+The `rustfs` tag runs [RustFS](https://github.com/rustfs/rustfs) in the same container, with the server's backups and S3-backed tables already pointed at it ([docs/docker.md](docs/docker.md#rustfs-backups-and-s3-tables-in-one-container)).
+
 **Arch Linux / CachyOS** (x86-64-v3): each release carries `rasterizeddb-bin-<version>-1-x86_64.pkg.tar.zst`, with a systemd service:
 
 ```sh
