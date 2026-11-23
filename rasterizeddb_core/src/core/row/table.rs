@@ -806,6 +806,11 @@ fn leading_excluded(words: &[u64]) -> u64 {
 /// is skipped rather than read. It is dead weight in the entry, not a hazard.
 /// `a_reclaimable_version_is_invisible_to_every_snapshot` pins the lemma; the
 /// ordering of the check and the fetch is what depends on it.
+/// Reads that skipped building their candidates because the query cache
+/// held their answer (`Table::candidates_unless_cached`).
+#[cfg(test)]
+pub(crate) static CANDIDATES_SKIPPED_FOR_CACHE: AtomicU64 = AtomicU64::new(0);
+
 fn cache_generation_for(_visibility: &Visibility, generation: u64) -> Option<u64> {
     Some(generation)
 }
@@ -4710,6 +4715,40 @@ impl<S: StorageIO> Table<S> {
         Ok(self.candidates_for(d, where_clause, limit).await)
     }
 
+    /// [`Self::candidates_for`], skipped when the query cache already holds
+    /// the answer to this clause at `cache_generation`.
+    ///
+    /// The candidates are built before the processor looks in the cache, and
+    /// for a clause an index answers only by a key prefix (`tenant_id = …
+    /// AND year = … AND month = …` and a column outside the key) building
+    /// them walks every row under the prefix: measured at 20k rows under it,
+    /// a cache hit cost 550 µs of CPU, three quarters of it that walk, against
+    /// 65 µs for a point read. A hit never reads them.
+    ///
+    /// Not for an ordered read (`ordered`): the processor may decline an
+    /// ordered hit on purpose and rescan, and that rescan needs them. Any
+    /// other hit that falls through (the entry evicted in between, a pointer
+    /// that no longer reads back) rescans without them: every slot, each row
+    /// tested against the clause, the same answer more slowly.
+    async fn candidates_unless_cached(
+        &self,
+        d: &TableData<S>,
+        where_clause: &str,
+        limit: Option<u64>,
+        cache_generation: Option<u64>,
+        ordered: bool,
+    ) -> Option<Arc<CandidateBitmap>> {
+        if !ordered
+            && let Some(generation) = cache_generation
+            && crate::cache::query_cache::holds(&self.cache_scope, where_clause, generation, limit)
+        {
+            #[cfg(test)]
+            CANDIDATES_SKIPPED_FOR_CACHE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        self.candidates_for(d, where_clause, limit).await
+    }
+
     /// The candidates a unique index gives for a full-key equality, from
     /// the key's stored bytes rather than from a clause's text
     /// ([`crate::core::row::point_key`]): per key column its write order, its
@@ -5211,7 +5250,8 @@ impl<S: StorageIO> Table<S> {
         let _read = d.read_guard();
 
         let generation = self.cache_generation();
-        let base_candidates = self.candidates_for(d, query, None).await;
+        let cache_generation = (cache && self.caches_queries()).then(|| cache_generation_for(&visibility, generation)).flatten();
+        let base_candidates = self.candidates_unless_cached(d, query, None, cache_generation, false).await;
 
         let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
@@ -5226,7 +5266,7 @@ impl<S: StorageIO> Table<S> {
                 schema_fields,
                 d.io_rows.clone(),
                 &mut iterator,
-                (cache && self.caches_queries()).then(|| cache_generation_for(&visibility, generation)).flatten(),
+                cache_generation,
                 visibility,
             )
             .await
@@ -5314,8 +5354,10 @@ impl<S: StorageIO> Table<S> {
         // Read before the scan, so a mutation that commits while it runs leaves
         // this query's cache entry stamped with a generation nobody will match.
         let generation = self.cache_generation();
+        let cache_generation = (cache && self.caches_queries()).then(|| cache_generation_for(&visibility, generation)).flatten();
 
-        let base_candidates = self.candidates_for(d, query, limit).await;
+        let base_candidates =
+            self.candidates_unless_cached(d, query, limit, cache_generation, order_by.is_some()).await;
         let n_slots = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
 
         // `ORDER BY` on a column that already ascends with slot position does
@@ -5357,7 +5399,7 @@ impl<S: StorageIO> Table<S> {
                     &mut iterator,
                     limit,
                     order_by.clone(),
-                    (cache && self.caches_queries()).then(|| cache_generation_for(&visibility, generation)).flatten(),
+                    cache_generation,
                     visibility.clone(),
                 )
                 .await?;
@@ -5572,11 +5614,14 @@ impl<S: StorageIO> Table<S> {
         // retired by a mutation that lands while it runs.
         let visibility = visibility.unwrap_or_else(|| self.read_visibility_for(reader));
         let generation = self.cache_generation();
+        let cache_generation = cache_generation_for(&visibility, generation).filter(|_| cache && self.caches_queries());
 
         let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
             .unwrap();
-        iterator.set_candidates(self.candidates_for(d, query, limit).await);
+        iterator.set_candidates(
+            self.candidates_unless_cached(d, query, limit, cache_generation, order_by.is_some()).await,
+        );
 
         let (bytes, overfetched) = self
             .concurrent_processor
@@ -5590,7 +5635,7 @@ impl<S: StorageIO> Table<S> {
                 &mut iterator,
                 limit,
                 order_by,
-                cache_generation_for(&visibility, generation).filter(|_| cache && self.caches_queries()),
+                cache_generation,
                 visibility,
             )
             .await?;
@@ -5658,11 +5703,12 @@ impl<S: StorageIO> Table<S> {
         // `query_row_bytes_reporting`, whose cache rule this shares.
         let visibility = visibility.unwrap_or_else(|| self.read_visibility_for(reader));
         let generation = self.cache_generation();
+        let cache_generation = cache_generation_for(&visibility, generation).filter(|_| cache && self.caches_queries());
 
         let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
             .unwrap();
-        iterator.set_candidates(self.candidates_for(d, query, None).await);
+        iterator.set_candidates(self.candidates_unless_cached(d, query, None, cache_generation, false).await);
 
         self.concurrent_processor
             .process_columns(
@@ -5673,7 +5719,7 @@ impl<S: StorageIO> Table<S> {
                 schema_fields,
                 d.io_rows.clone(),
                 &mut iterator,
-                cache_generation_for(&visibility, generation).filter(|_| cache && self.caches_queries()),
+                cache_generation,
                 visibility,
             )
             .await
