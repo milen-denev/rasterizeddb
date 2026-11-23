@@ -8382,8 +8382,17 @@ where
         };
         let mut table: Option<String> = None;
         database.each_schema(|name, schema| {
+            // A declared index, a key's, the primary key's, or the one a
+            // UNIQUE column carries under its table's and its own name.
             let holds = schema.secondary_indexes.iter().any(|i| !i.is_deleted && i.name.eq_ignore_ascii_case(&from))
-                || schema.unique_keys.iter().any(|k| !k.is_deleted && k.name.eq_ignore_ascii_case(&from));
+                || schema.unique_keys.iter().any(|k| !k.is_deleted && k.name.eq_ignore_ascii_case(&from))
+                || crate::core::rql::unique_key::primary_key_of_named(schema, name)
+                    .is_some_and(|key| key.name.eq_ignore_ascii_case(&from))
+                || schema.fields.iter().any(|f| {
+                    !f.is_deleted
+                        && f.is_unique
+                        && crate::core::rql::unique_key::implicit_key_name(name, &f.name).eq_ignore_ascii_case(&from)
+                });
             if table.is_none() && holds {
                 table = Some(name.to_string());
             }

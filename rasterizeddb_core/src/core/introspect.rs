@@ -1666,6 +1666,7 @@ fn columns(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
     let mut out = Vec::new();
     let mut position = 0u64;
 
+    let primary_key = crate::core::rql::unique_key::primary_key_of(&schema);
     for field in schema.fields.iter() {
         // Companion flag columns are engine-owned. They are reported through
         // the `nullable` flag of the column they belong to rather than as
@@ -1677,7 +1678,11 @@ fn columns(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
 
         let nullable =
             crate::core::rql::nullable::flag_field(&field.name, &schema.fields).is_some();
-        let is_primary = schema.primary_key.as_deref() == Some(field.name.as_str());
+        // A column of the primary key, whatever the key is called and
+        // however many columns it has (`unique_key::primary_key_of`). Only
+        // the header's column was flagged, so a composite key's columns
+        // read as no key at all here, where pg_index flags each.
+        let is_primary = primary_key.as_ref().is_some_and(|key| key.columns.iter().any(|c| c.eq_ignore_ascii_case(&field.name)));
         let in_unique_key = schema.unique_keys.iter().any(|k| {
             !k.is_deleted
                 && k.columns

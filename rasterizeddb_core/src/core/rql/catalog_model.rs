@@ -826,7 +826,7 @@ fn table_indexes(
             .find(|c| c.name.eq_ignore_ascii_case(column))
             .map(|c| c.attnum)
     };
-    let pkey = pkey_name(&schema.name);
+    let pkey = crate::core::rql::unique_key::primary_key_of(schema).map_or_else(|| pkey_name(&schema.name), |key| key.name);
     let mut indexes = Vec::new();
     let mut constraints = Vec::new();
     for (index_name, unique, keys, predicate) in shared {

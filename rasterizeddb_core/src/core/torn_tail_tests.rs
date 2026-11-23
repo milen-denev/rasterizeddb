@@ -1036,6 +1036,7 @@ impl Sidecar {
                     predicate: None,
                     compiled: Default::default(),
                     from_index: false,
+                    primary: false,
                 };
                 unique_key::append(io, &key).await
             }
@@ -1107,6 +1108,7 @@ impl Sidecar {
                     predicate: None,
                     compiled: Default::default(),
                     from_index: false,
+                    primary: false,
                 },
             ),
             Sidecar::Def => column_default::stage(

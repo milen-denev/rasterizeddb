@@ -189,5 +189,6 @@ impl Database {
 /// declared `PRIMARY KEY (a, b)` without a name of its own).
 fn composite_primary_key(table: &str, keys: &[crate::core::rql::unique_key::UniqueKey]) -> bool {
     let name = crate::core::rql::unique_key::pkey_name(table);
-    keys.iter().any(|k| !k.is_deleted && k.columns.len() > 1 && k.name.eq_ignore_ascii_case(&name))
+    // Marked primary under any name, or, from before the mark, by its name.
+    keys.iter().any(|k| !k.is_deleted && k.columns.len() > 1 && (k.primary || k.name.eq_ignore_ascii_case(&name)))
 }

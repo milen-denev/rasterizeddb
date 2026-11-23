@@ -456,6 +456,7 @@ pub fn apply_to_create(
                 predicate: None,
                 compiled: Default::default(),
                 from_index: false,
+                primary: false,
             });
         }
         for key in ct.unique_keys.iter_mut() {
@@ -475,6 +476,7 @@ pub fn apply_to_create(
                 predicate: None,
                 compiled: Default::default(),
                 from_index: false,
+                primary: false,
             });
         }
     }

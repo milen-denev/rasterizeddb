@@ -2035,7 +2035,8 @@ fn shared_declarations(schema: &crate::core::row::schema::TableSchema) -> Vec<(S
     }
     let pk = schema.primary_key.as_deref().and_then(by_name);
     if let Some(pk) = pk {
-        out.push((pkey_name(&schema.name), true, vec![pk], None));
+        let name = crate::core::rql::unique_key::primary_key_of(schema).map_or_else(|| pkey_name(&schema.name), |key| key.name);
+        out.push((name, true, vec![pk], None));
     }
     // An inline `PRIMARY KEY` flags its column unique too; that is the
     // primary key's index, not a `<table>_<column>_key` of its own.

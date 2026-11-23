@@ -3364,7 +3364,8 @@ impl<S: StorageIO> Table<S> {
     /// otherwise.
     fn column_constraint_name(&self, column: &str) -> String {
         if self.schema.primary_key.as_deref().is_some_and(|pk| pk.eq_ignore_ascii_case(column)) {
-            crate::core::rql::unique_key::pkey_name(&self.schema.name)
+            crate::core::rql::unique_key::primary_key_of(&self.schema)
+                .map_or_else(|| crate::core::rql::unique_key::pkey_name(&self.schema.name), |key| key.name)
         } else {
             crate::core::rql::unique_key::implicit_key_name(&self.schema.name, column)
         }

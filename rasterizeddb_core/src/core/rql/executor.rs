@@ -5930,8 +5930,9 @@ pub async fn scan_legacy_char_keys<S: crate::core::storage_providers::traits::St
         let fields: Option<Vec<_>> = key.columns.iter().map(|c| field_named(c).cloned()).collect();
         if let Some(fields) = fields.filter(|fs| fs.iter().any(|f| f.db_type == DbType::CHAR)) {
             let columns: Vec<&str> = key.columns.iter().map(String::as_str).collect();
-            // A composite PRIMARY KEY is the key named `<table>_pkey`.
-            let described = if key.name.eq_ignore_ascii_case(&crate::core::rql::unique_key::pkey_name(&schema.name)) {
+            // A composite PRIMARY KEY: the key marked so, or named
+            // `<table>_pkey` from before the mark.
+            let described = if key.primary || key.name.eq_ignore_ascii_case(&crate::core::rql::unique_key::pkey_name(&schema.name)) {
                 format!("PRIMARY KEY ({})", columns.join(", "))
             } else {
                 describe(&columns)
@@ -6554,7 +6555,7 @@ async fn drop_keys_depending_on_constraint(
 /// it answers to `DROP INDEX` itself (`execute_drop_unique_index`).
 fn constraint_index(schema: &crate::core::row::schema::TableSchema, table: &str, name: &str) -> bool {
     let named = |n: &str| n.eq_ignore_ascii_case(name);
-    (schema.primary_key.is_some() && named(&crate::core::rql::unique_key::pkey_name(table)))
+    crate::core::rql::unique_key::primary_key_of_named(schema, table).is_some_and(|key| named(&key.name))
         || schema.unique_keys.iter().any(|k| !k.is_deleted && !k.is_index() && named(&k.name))
         || implicit_unique_column(name, table, &schema.fields).is_some()
 }
@@ -9229,10 +9230,10 @@ fn constraint_columns(
     {
         return Some(key.columns.clone());
     }
-    if name.eq_ignore_ascii_case(&crate::core::rql::unique_key::pkey_name(table_name)) {
-        if let Some(pk) = schema.primary_key.as_deref() {
-            return Some(vec![pk.to_string()]);
-        }
+    if let Some(key) = crate::core::rql::unique_key::primary_key_of_named(schema, table_name)
+        && name.eq_ignore_ascii_case(&key.name)
+    {
+        return Some(key.columns);
     }
     schema
         .fields
@@ -17019,24 +17020,35 @@ async fn execute_alter_table_action(
                 .iter()
                 .find(|i| index_form && !i.is_deleted && named(&i.name, &from))
                 .cloned();
-            let implicit = |name: &str| {
-                primary_key_constraint(&schema, &table_name).is_some_and(|p| named(&p.name, name))
-                    || implicit_unique_column(name, &table_name, &schema.fields).is_some()
+            // The primary key, to keep it one under its new name, whether or
+            // not its record carries the mark yet.
+            let primary = primary_key_constraint(&schema, &table_name);
+            let renames_the_primary_key = primary.as_ref().is_some_and(|p| named(&p.name, &from));
+            // A key declared with its column (`id INT PRIMARY KEY`, `email
+            // TEXT UNIQUE`) is a flag on the column, named after its table
+            // and its column, with no record to rename. It is given one
+            // under the new name, and the flag goes: what `CONSTRAINT <to>
+            // PRIMARY KEY (id)` at table level would have stored.
+            let inline: Option<(String, bool)> = if key.is_some() {
+                None
+            } else if let Some(p) = primary.as_ref().filter(|p| p.inline && renames_the_primary_key) {
+                p.column.clone().map(|column| (column, true))
+            } else {
+                implicit_unique_column(&from, &table_name, &schema.fields)
+                    .filter(|column| {
+                        !primary.as_ref().is_some_and(|p| p.inline && p.column.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(column)))
+                    })
+                    .map(|column| (column, false))
             };
-            if key.is_none() && fk.is_none() && check.is_none() && index.is_none() {
-                if implicit(&from) {
-                    if named(&from, &to) {
-                        return ddl_ok(0);
-                    }
-                    return ddl_error(&format!(
-                        "renaming constraint \"{from}\" of \"{table_name}\" is not supported: it was declared with its \
-                         column, so its name is the table's and the column's; declare it as CONSTRAINT {to} to name it"
-                    ));
-                }
-                // Already called what it is asked to be called: a key named
-                // after its table followed the table's own rename, which is
-                // where a migration renaming both gets to.
-                if implicit(&to) {
+            if key.is_none() && fk.is_none() && check.is_none() && index.is_none() && inline.is_none() {
+                // Already called what it is asked to be called: a key
+                // declared with its column is named after its table, so it
+                // followed the table's own rename, which is where a
+                // migration renaming both gets to (`ALTER TABLE a RENAME TO
+                // b`, then `RENAME CONSTRAINT a_pkey TO b_pkey`).
+                let already = primary.as_ref().is_some_and(|p| p.inline && named(&p.name, &to))
+                    || implicit_unique_column(&to, &table_name, &schema.fields).is_some();
+                if already {
                     info!("ALTER TABLE {table_name}: constraint {from} is already {to}, which its table's name gives it");
                     return ddl_ok(0);
                 }
@@ -17049,21 +17061,6 @@ async fn execute_alter_table_action(
             if named(&from, &to) {
                 return ddl_ok(0);
             }
-            // The primary key is told from a UNIQUE by its name,
-            // `<table>_pkey`, alone (the sidecar has no field saying
-            // "primary"): renamed to anything else it would read as a UNIQUE
-            // beside a primary key nothing backs. To that name it may go,
-            // which is what a key left behind by its table's rename needs.
-            let pkey = crate::core::rql::unique_key::pkey_name(&table_name);
-            if key.is_some()
-                && primary_key_constraint(&schema, &table_name).is_some_and(|p| named(&p.name, &from))
-                && !named(&to, &pkey)
-            {
-                return ddl_error(&format!(
-                    "renaming the primary key of \"{table_name}\" to \"{to}\" is not supported: it is recognised as the \
-                     primary key only by the name \"{pkey}\""
-                ));
-            }
             let index_taken = schema.secondary_indexes.iter().any(|i| !i.is_deleted && named(&i.name, &to));
             let taken = constraint_name_taken(&schema, &table_name, &to) || index_taken;
             if taken {
@@ -17075,7 +17072,7 @@ async fn execute_alter_table_action(
             }
             // A key's or an index's name is its index's, and an index's name
             // is the database's: one any other table's index has is taken.
-            if key.is_some() || index.is_some() {
+            if key.is_some() || index.is_some() || inline.is_some() {
                 let mut elsewhere = false;
                 database.each_schema(|other, other_schema| {
                     // This table's own names were looked at above.
@@ -17091,14 +17088,27 @@ async fn execute_alter_table_action(
                     return ddl_error(&format!("relation \"{to}\" already exists"));
                 }
             }
+            let mut schema = schema.clone();
             let reloaded = database
                 .reload_with(&table_name, |old| async move {
                     let io = old.io_schema.clone();
                     let failed = |e: std::io::Error| e.to_string();
                     if let Some(key) = key {
                         crate::core::rql::unique_key::remove(io.clone(), &key.name).await.map_err(failed)?;
-                        let renamed = crate::core::rql::unique_key::UniqueKey { name: to.clone(), ..key };
+                        let renamed = crate::core::rql::unique_key::UniqueKey {
+                            name: to.clone(),
+                            primary: key.primary || (renames_the_primary_key && key.predicate.is_none()),
+                            ..key
+                        };
                         crate::core::rql::unique_key::append(io.clone(), &renamed).await.map_err(failed)?;
+                    }
+                    if let Some((column, primary)) = inline {
+                        let record = crate::core::rql::unique_key::UniqueKey {
+                            primary,
+                            ..crate::core::rql::unique_key::UniqueKey::new(to.clone(), vec![column.clone()])
+                        };
+                        crate::core::rql::unique_key::append(io.clone(), &record).await.map_err(failed)?;
+                        schema.set_field_unique(&column, false, io.clone()).await;
                     }
                     if let Some(fk) = fk {
                         crate::core::rql::foreign_key::remove(io.clone(), &fk.name).await.map_err(failed)?;
@@ -17951,24 +17961,10 @@ async fn execute_alter_table_action(
                             plan.table_name
                         ));
                     }
-                    // A composite primary key is recognised by its name,
-                    // `<table>_pkey`, alone: the sidecar has no field saying
-                    // "primary", so one named otherwise would read as a
-                    // UNIQUE, and a second PRIMARY KEY would be accepted
-                    // beside it. Refused rather than taken for what it is not.
-                    if primary
-                        && key.columns.len() > 1
-                        && !key.name.eq_ignore_ascii_case(&crate::core::rql::unique_key::pkey_name(&plan.table_name))
-                    {
-                        return ddl_error(&format!(
-                            "a composite PRIMARY KEY named \"{}\" is not supported: a key over several columns is \
-                             recognised as the primary key of \"{}\" only by the name \"{}\"; name it that or \
-                             leave it unnamed",
-                            key.name,
-                            plan.table_name,
-                            crate::core::rql::unique_key::pkey_name(&plan.table_name)
-                        ));
-                    }
+                    // A primary key may have any name: its record says it is
+                    // one (`UniqueKey::primary`, set by `parse_clause`). A
+                    // composite one named otherwise than `<table>_pkey` used
+                    // to be refused, the name being all that told it apart.
                     // An unnamed UNIQUE whose derived name is taken gets the
                     // next free one, as PostgreSQL's `t_a_key1`, rather than
                     // an error; a named one keeps its "already exists".
@@ -18571,24 +18567,10 @@ struct PrimaryKeyConstraint {
 }
 
 fn primary_key_constraint(schema: &crate::core::row::schema::TableSchema, table: &str) -> Option<PrimaryKeyConstraint> {
-    let pkey = crate::core::rql::unique_key::pkey_name(table);
-    let whole = || schema.unique_keys.iter().filter(|k| !k.is_deleted && k.predicate.is_none());
-    let Some(column) = schema.primary_key.clone() else {
-        return whole()
-            .find(|k| k.name.eq_ignore_ascii_case(&pkey))
-            .map(|k| PrimaryKeyConstraint { name: k.name.clone(), column: None, inline: false });
-    };
-    let inline = schema.fields.iter().any(|f| !f.is_deleted && f.is_unique && f.name.eq_ignore_ascii_case(&column));
-    if inline {
-        return Some(PrimaryKeyConstraint { name: pkey, column: Some(column), inline: true });
-    }
-    let on_column = |k: &&crate::core::rql::unique_key::UniqueKey| k.columns.len() == 1 && k.columns[0].eq_ignore_ascii_case(&column);
-    let name = whole()
-        .filter(on_column)
-        .find(|k| k.name.eq_ignore_ascii_case(&pkey))
-        .or_else(|| whole().find(on_column))
-        .map_or(pkey, |k| k.name.clone());
-    Some(PrimaryKeyConstraint { name, column: Some(column), inline: false })
+    // The one rule (`unique_key::primary_key_of`), with the header's column
+    // beside it, which this file's DDL arms rewrite.
+    let key = crate::core::rql::unique_key::primary_key_of_named(schema, table)?;
+    Some(PrimaryKeyConstraint { name: key.name, column: schema.primary_key.clone(), inline: key.inline })
 }
 
 /// Whether `schema` has a primary key ([`primary_key_constraint`]).
@@ -20263,8 +20245,9 @@ fn identifying_key(schema: &crate::core::row::schema::TableSchema) -> Option<Ide
     if let Some(field) = schema.primary_key.as_deref().and_then(live) {
         return Some(key(vec![field]));
     }
-    let pkey = crate::core::rql::unique_key::pkey_name(&schema.name);
-    if let Some(fields) = whole().find(|k| k.name.eq_ignore_ascii_case(&pkey)).and_then(|k| resolve(&k.columns)) {
+    // A composite primary key, by its mark or its name
+    // (`unique_key::primary_key_of`).
+    if let Some(fields) = crate::core::rql::unique_key::primary_key_of(schema).and_then(|pk| resolve(&pk.columns)) {
         return Some(key(fields));
     }
 
@@ -20314,12 +20297,6 @@ fn schema_after_for_identity(
             let primary = crate::core::rql::unique_key::is_primary_key_clause(&clause);
             if primary && has_primary_key(&after, &plan.table_name) {
                 return None; // refused: 42P16
-            }
-            if primary
-                && key.columns.len() > 1
-                && !key.name.eq_ignore_ascii_case(&crate::core::rql::unique_key::pkey_name(&plan.table_name))
-            {
-                return None; // refused: 0A000
             }
             if after.unique_keys.iter().any(|k| !k.is_deleted && k.name.eq_ignore_ascii_case(&key.name)) {
                 return None;
