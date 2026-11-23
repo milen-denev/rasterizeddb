@@ -8126,6 +8126,13 @@ pub(crate) fn rewrite_statement_text<'a>(
     if let Cow::Owned(text) = crate::core::sql_scan::catalog_syntax(&stmt) {
         stmt = Cow::Owned(text);
     }
+    // `pg_partition_tree('t'::regclass)` as the one leaf every table is
+    // here (`rql::reg_casts::partition_tree`), before its argument is an oid.
+    let relation_exists = |name: &str| {
+        database.schema_view(name).is_some() || database.is_partitioned(name) || database.views.contains(name)
+    };
+    let tree = crate::core::rql::reg_casts::partition_tree(&stmt, &relation_exists)?;
+    take(&mut stmt, tree);
     // `'t'::regclass`, `'int4'::regtype` and `to_regclass('t')` as the name
     // or oid they stand for (`rql::reg_casts`).
     let reg = crate::core::rql::reg_casts::rewrite(&stmt, &|name: &str| {
@@ -8364,6 +8371,40 @@ where
     // rewrite, which would act on a `PREPARE`'s statement as if it ran now.
     if let Some(parsed) = sql_prepare::parse(stmt) {
         return run_sql_prepare(database, state, stream, parsed, result_formats, omit_description).await;
+    }
+    // `ALTER INDEX [IF EXISTS] a RENAME TO b`: an index's name is the
+    // database's, so its table is found first, and the rename is that
+    // table's (`ALTER TABLE t RENAME INDEX a TO b`). It was "syntax error
+    // or unsupported query".
+    if let Some(parsed) = crate::core::rql::lexer_alter::parse_alter_index_rename(stmt) {
+        let (from, if_exists, to) = match parsed {
+            Ok(parts) => parts,
+            Err(message) => return fail_statement(state, stream, "42601", &message).await,
+        };
+        let mut table: Option<String> = None;
+        database.each_schema(|name, schema| {
+            let holds = schema.secondary_indexes.iter().any(|i| !i.is_deleted && i.name.eq_ignore_ascii_case(&from))
+                || schema.unique_keys.iter().any(|k| !k.is_deleted && k.name.eq_ignore_ascii_case(&from));
+            if table.is_none() && holds {
+                table = Some(name.to_string());
+            }
+        });
+        let Some(table) = table else {
+            if if_exists {
+                crate::core::notice::push("NOTICE", "00000", format!("relation \"{from}\" does not exist, skipping"));
+                return send_command_complete(stream, "ALTER INDEX").await;
+            }
+            return fail_statement(state, stream, "42P01", &format!("relation \"{from}\" does not exist")).await;
+        };
+        let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+        let rename = format!("ALTER TABLE {} RENAME INDEX {} TO {}", quote(&table), quote(&from), quote(&to));
+        return match Box::pin(view_statements::run_internal_ddl(database, state, &rename)).await? {
+            Ok(_) => send_command_complete(stream, "ALTER INDEX").await,
+            Err(message) => {
+                let code = sqlstate_for(&message);
+                fail_statement(state, stream, code, &message).await
+            }
+        };
     }
     // `DO $$ … $$`: a PL/pgSQL block run once (`trigger_exec::run_do`).
     if let Some(parsed) = trigger_exec::parse_do(stmt) {

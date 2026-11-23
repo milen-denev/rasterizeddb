@@ -254,6 +254,93 @@ pub(crate) fn rewrite(sql: &str, relation_exists: &dyn Fn(&str) -> bool) -> Opti
     Some(out)
 }
 
+/// `pg_partition_tree('t'::regclass)` in a FROM list, as the rows it
+/// answers here: a table's partitions are not relations of their own in this
+/// engine, so every table, partitioned or not, is its own one leaf, which is
+/// what PostgreSQL answers for a table with no partitions. `relid` is the
+/// relation's oid, as a comparison with `pg_class.oid` needs it.
+///
+/// Before [`rewrite`], which would make the argument an oid and lose the
+/// name: a relation that does not exist is 42P01, as the cast's failure is.
+/// An argument that is no literal is left as written.
+pub(crate) fn partition_tree(
+    sql: &str,
+    relation_exists: &dyn Fn(&str) -> bool,
+) -> Result<Option<String>, (&'static str, String)> {
+    const NAME: &[u8] = b"pg_partition_tree";
+    if !crate::core::sql_scan::contains_ignore_ascii_case(sql, NAME) {
+        return Ok(None);
+    }
+    // What may follow a FROM item that is no alias for it.
+    const NOT_AN_ALIAS: &[&str] = &[
+        "WHERE", "ON", "JOIN", "LEFT", "RIGHT", "INNER", "CROSS", "FULL", "NATURAL", "GROUP", "ORDER", "LIMIT", "OFFSET",
+        "UNION", "INTERSECT", "EXCEPT", "HAVING", "WINDOW", "FETCH", "FOR", "USING", "LOOP", "RETURNING",
+    ];
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 64);
+    let (mut copied, mut i) = (0usize, 0usize);
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)) {
+            i = end.max(i + 1);
+            continue;
+        }
+        let at_word = (i == 0 || !(is_identifier_byte(bytes[i - 1]) || bytes[i - 1] == b'.'))
+            && bytes.len() >= i + NAME.len()
+            && bytes[i..i + NAME.len()].eq_ignore_ascii_case(NAME);
+        if !at_word {
+            i += 1;
+            continue;
+        }
+        let open = i + NAME.len() + (sql[i + NAME.len()..].len() - sql[i + NAME.len()..].trim_start().len());
+        let Some(close) = (bytes.get(open) == Some(&b'(')).then(|| matching_close(sql, open)).flatten() else {
+            i += NAME.len();
+            continue;
+        };
+        // `'name'`, `'name'::regclass`, `CAST('name' AS regclass)`, or an oid.
+        let argument = sql[open + 1..close].trim();
+        let argument = argument
+            .strip_prefix("CAST(")
+            .or_else(|| argument.strip_prefix("cast("))
+            .and_then(|inner| inner.strip_suffix(')'))
+            .map(|inner| inner.rsplit_once(" AS ").or_else(|| inner.rsplit_once(" as ")).map_or(inner, |(v, _)| v).trim())
+            .unwrap_or(argument);
+        let oid = if let Ok(oid) = argument.parse::<i64>() {
+            oid
+        } else if argument.starts_with('\'') {
+            let end = quoted_end(argument.as_bytes(), 0, b'\'');
+            let rest = argument[end..].trim();
+            if !(rest.is_empty() || rest.eq_ignore_ascii_case("::regclass")) {
+                i = close + 1;
+                continue;
+            }
+            let text = argument[1..end - 1].replace("''", "'");
+            let name = relation_name(&text).filter(|name| relation_exists(name));
+            let Some(name) = name else {
+                return Err(("42P01", format!("relation \"{text}\" does not exist")));
+            };
+            crate::core::rql::catalog_model::oid_of(&name)
+        } else {
+            i = close + 1;
+            continue;
+        };
+        let after = sql[close + 1..].trim_start();
+        let word: String = after.bytes().take_while(|b| is_identifier_byte(*b)).map(|b| b as char).collect();
+        let aliased = !word.is_empty() && !NOT_AN_ALIAS.iter().any(|k| word.eq_ignore_ascii_case(k));
+        out.push_str(&sql[copied..i]);
+        out.push_str(&format!(
+            "(SELECT {oid} AS relid, CAST(NULL AS integer) AS parentrelid, TRUE AS isleaf, 0 AS level){}",
+            if aliased { "" } else { " AS pg_partition_tree" }
+        ));
+        copied = close + 1;
+        i = close + 1;
+    }
+    if copied == 0 {
+        return Ok(None);
+    }
+    out.push_str(&sql[copied..]);
+    Ok(Some(out))
+}
+
 /// Whether the value at `start..end` is compared with a `pg_typeof(…)`
 /// call: `pg_typeof(x) = <value>`, `<value> <> pg_typeof(x)`, or an item of
 /// `pg_typeof(x) [NOT] IN (…, <value>, …)`.

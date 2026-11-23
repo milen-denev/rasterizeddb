@@ -298,8 +298,38 @@ fn substitute(
                 }
                 if let Some((_, ty, value)) = vars.iter().find(|(name, _, _)| *name == word) {
                     if bytes.get(j) != Some(&b'.') {
-                        out.push_str(&literal(value, Some(ty.as_str())));
+                        if ty == RECORD {
+                            return Err(("0A000".into(), format!("record \"{word}\" as a whole value is not supported yet")));
+                        }
+                        out.push_str(&variable_literal(ty, value));
                         i = j;
+                        continue;
+                    }
+                    // `rec.field`, of the row the record holds.
+                    if ty == RECORD {
+                        let mut k = j + 1;
+                        let column = if bytes.get(k) == Some(&b'"') {
+                            let end = crate::core::sql_scan::quoted_end(bytes, k, b'"');
+                            let name = text[k + 1..end - 1].replace("\"\"", "\"");
+                            k = end;
+                            name
+                        } else {
+                            let start = k;
+                            while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                                k += 1;
+                            }
+                            text[start..k].to_ascii_lowercase()
+                        };
+                        let prefix = format!("{word}.");
+                        let field = format!("{prefix}{column}");
+                        match vars.iter().find(|(name, _, _)| *name == field) {
+                            Some((_, ty, value)) => out.push_str(&variable_literal(ty, value)),
+                            None if vars.iter().any(|(name, _, _)| name.starts_with(&prefix)) => {
+                                return Err(("42703".into(), format!("record \"{word}\" has no field \"{column}\"")));
+                            }
+                            None => return Err(("55000".into(), format!("record \"{word}\" is not assigned yet"))),
+                        }
+                        i = k;
                         continue;
                     }
                 }
@@ -321,6 +351,154 @@ enum Returned {
     Row(Option<Values>),
     /// The end of the body, or a bare `RETURN`.
     Nothing,
+    /// `EXIT` (or `CONTINUE`, `exit` false) on its way to the loop it leaves.
+    Leave { exit: bool },
+}
+
+/// The type a `record` variable is declared with. Its fields are variables
+/// of their own, named `record.field`, set when a row is assigned to it.
+const RECORD: &str = "record";
+
+/// A variable's value as a literal of its type. An object-identifier type
+/// (`regclass`, …) is read as the name it prints: `format('%s', part)` is
+/// the relation's name, as in PostgreSQL, where the oid it would otherwise
+/// become is not.
+fn variable_literal(ty: &str, value: &Option<String>) -> String {
+    match ty {
+        "" => literal(value, None),
+        // A text value is its quoted string, with no cast around it: `(v
+        // LIKE '%x%')::text` did not read with one ("trailing text after
+        // CAST(…)").
+        "text" | "varchar" | "character varying" if value.is_some() => literal(value, None),
+        "regclass" | "regtype" | "regproc" | "regprocedure" | "regnamespace" | "regrole" | "name" | "oid" => {
+            literal(value, Some("text"))
+        }
+        ty => literal(value, Some(ty)),
+    }
+}
+
+/// Puts one row into `targets`: a single `record` takes every column as its
+/// fields, anything else takes the columns by position (NULL past the last).
+fn assign_row(
+    database: &Database,
+    vars: &mut Vec<(String, String, Option<String>)>,
+    targets: &[String],
+    names: &[String],
+    types: &[u32],
+    row: Option<Vec<Option<String>>>,
+) -> Result<(), Failure> {
+    let declared = |vars: &[(String, String, Option<String>)], name: &str| vars.iter().position(|(n, _, _)| n == name);
+    if let [target] = targets
+        && declared(vars, target).is_some_and(|at| vars[at].1 == RECORD)
+    {
+        let prefix = format!("{target}.");
+        vars.retain(|(name, _, _)| !name.starts_with(&prefix));
+        let mut row = row.unwrap_or_else(|| vec![None; names.len()]);
+        row.resize(names.len(), None);
+        for ((name, oid), value) in names.iter().zip(types.iter().chain(std::iter::repeat(&0))).zip(row) {
+            let cast = cast_of_oid(*oid).unwrap_or("").to_string();
+            vars.push((format!("{prefix}{}", name.to_ascii_lowercase()), cast, value));
+        }
+        return Ok(());
+    }
+    let mut values = row.unwrap_or_default().into_iter();
+    for target in targets {
+        let Some(at) = declared(vars, target) else {
+            return Err(("42601".into(), format!("\"{target}\" is not a known variable")));
+        };
+        if vars[at].1 == RECORD {
+            return Err(("42601".into(), format!("record variable \"{target}\" cannot be part of a multiple-item INTO list")));
+        }
+        let value = values.next().flatten();
+        // A `regclass` variable given an oid holds the relation it names,
+        // which is what it prints as.
+        vars[at].2 = match value.as_deref().map(str::parse::<i64>) {
+            Some(Ok(oid)) if vars[at].1 == "regclass" => {
+                let mut named: Option<String> = None;
+                database.each_schema(|name, _| {
+                    if named.is_none() && crate::core::rql::catalog_model::oid_of(name) == oid {
+                        named = Some(name.to_string());
+                    }
+                });
+                named.or(value)
+            }
+            _ => value,
+        };
+    }
+    Ok(())
+}
+
+/// Whether an exception handler's `condition` takes an error of `code`:
+/// `others` (all but a cancel or a failed assertion, as in PostgreSQL), an
+/// SQLSTATE written out, or a condition's name.
+fn condition_takes(condition: &str, code: &str) -> bool {
+    if condition == "others" {
+        return !matches!(code, "57014" | "P0004");
+    }
+    if condition.len() == 5 && condition.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
+        return condition == code;
+    }
+    const NAMES: &[(&str, &str)] = &[
+        ("feature_not_supported", "0A000"),
+        ("invalid_parameter_value", "22023"),
+        ("lock_not_available", "55P03"),
+        ("deadlock_detected", "40P01"),
+        ("serialization_failure", "40001"),
+        ("unique_violation", "23505"),
+        ("foreign_key_violation", "23503"),
+        ("not_null_violation", "23502"),
+        ("check_violation", "23514"),
+        ("restrict_violation", "23001"),
+        ("exclusion_violation", "23P01"),
+        ("undefined_table", "42P01"),
+        ("undefined_column", "42703"),
+        ("undefined_object", "42704"),
+        ("undefined_function", "42883"),
+        ("duplicate_table", "42P07"),
+        ("duplicate_column", "42701"),
+        ("duplicate_object", "42710"),
+        ("duplicate_function", "42723"),
+        ("duplicate_schema", "42P06"),
+        ("invalid_table_definition", "42P16"),
+        ("invalid_column_reference", "42P10"),
+        ("datatype_mismatch", "42804"),
+        ("syntax_error", "42601"),
+        ("insufficient_privilege", "42501"),
+        ("wrong_object_type", "42809"),
+        ("dependent_objects_still_exist", "2BP01"),
+        ("object_in_use", "55006"),
+        ("object_not_in_prerequisite_state", "55000"),
+        ("division_by_zero", "22012"),
+        ("numeric_value_out_of_range", "22003"),
+        ("invalid_text_representation", "22P02"),
+        ("string_data_right_truncation", "22001"),
+        ("null_value_not_allowed", "22004"),
+        ("invalid_datetime_format", "22007"),
+        ("datetime_field_overflow", "22008"),
+        ("data_exception", "22000"),
+        ("raise_exception", "P0001"),
+        ("no_data_found", "P0002"),
+        ("too_many_rows", "P0003"),
+        ("assert_failure", "P0004"),
+        ("query_canceled", "57014"),
+        ("read_only_sql_transaction", "25006"),
+        ("in_failed_sql_transaction", "25P02"),
+        ("internal_error", "XX000"),
+        ("integrity_constraint_violation", "23000"),
+    ];
+    match NAMES.iter().find(|(name, _)| *name == condition) {
+        // A class's own condition (`…000`) takes the whole class.
+        Some((_, named)) if named.ends_with("000") => code.starts_with(&named[..2]),
+        Some((_, named)) => *named == code,
+        None => false,
+    }
+}
+
+/// Whether `expr` is true, for an `IF`, a `WHILE` or a `WHEN`.
+async fn is_true(database: &Arc<Database>, state: &mut SessionState, expr: &str) -> io::Result<Result<bool, Failure>> {
+    Ok(Box::pin(value_of(database, state, &format!("CASE WHEN {expr} THEN TRUE ELSE FALSE END")))
+        .await?
+        .map(|v| v.is_some_and(|v| v == "t" || v == "true")))
 }
 
 /// One expression's value.
@@ -450,19 +628,247 @@ async fn run_statements(
                 };
                 crate::core::notice::push(severity, "00000", message);
             }
+            PlStmt::Block { body, handlers } => {
+                // A block with handlers is PostgreSQL's subtransaction: in a
+                // transaction block, a savepoint its failure rolls back to.
+                // Outside one each statement commits on its own, so there
+                // is nothing to take back; in an implicit block (a batch)
+                // no savepoint can be had, and the error is the batch's.
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let in_block = state.transaction.is_some();
+                let mut savepoint: Option<String> = None;
+                if !handlers.is_empty() && state.transaction.as_ref().is_some_and(|t| !t.implicit) {
+                    let name = format!("rdb_plpgsql_{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+                    if Box::pin(super::view_statements::run_internal(database, state, &format!("SAVEPOINT {name}"))).await?.is_ok() {
+                        savepoint = Some(name);
+                    }
+                }
+                let batch_error = state.error_in_batch;
+                match Box::pin(run_statements(database, state, ctx, body, new, old, vars)).await? {
+                    Ok(result) => {
+                        if let Some(name) = &savepoint {
+                            let _ = Box::pin(super::view_statements::run_internal(database, state, &format!("RELEASE SAVEPOINT {name}"))).await?;
+                        }
+                        if result.is_some() {
+                            return Ok(Ok(result));
+                        }
+                    }
+                    Err((code, message)) => {
+                        let handler = handlers
+                            .iter()
+                            .find(|(conditions, _)| conditions.iter().any(|c| condition_takes(c, &code)))
+                            .filter(|_| savepoint.is_some() || !in_block);
+                        let Some((_, stmts)) = handler else {
+                            return Ok(Err((code, message)));
+                        };
+                        // The error was handled: it is not the statement's.
+                        // Cleared before the savepoint is rolled back to,
+                        // which would otherwise be reported as failing with
+                        // it.
+                        state.statement_failed = false;
+                        state.statement_error = None;
+                        if let Some(name) = &savepoint {
+                            for sql in [format!("ROLLBACK TO SAVEPOINT {name}"), format!("RELEASE SAVEPOINT {name}")] {
+                                if let Err(e) = Box::pin(super::view_statements::run_internal(database, state, &sql)).await? {
+                                    return Ok(Err(failure(e)));
+                                }
+                            }
+                        }
+                        state.statement_failed = false;
+                        state.statement_error = None;
+                        state.error_in_batch = batch_error;
+                        vars.push(("sqlstate".to_string(), "text".to_string(), Some(code)));
+                        vars.push(("sqlerrm".to_string(), "text".to_string(), Some(message)));
+                        let ran = Box::pin(run_statements(database, state, ctx, stmts, new, old, vars)).await?;
+                        for name in ["sqlerrm", "sqlstate"] {
+                            if let Some(at) = vars.iter().rposition(|(n, _, _)| n == name) {
+                                vars.remove(at);
+                            }
+                        }
+                        match ran {
+                            Ok(None) => {}
+                            other => return Ok(other),
+                        }
+                    }
+                }
+            }
+            PlStmt::ForQuery { targets, query: source, dynamic, body } => {
+                let text = match substitute(source, ctx, new.as_ref(), old.as_ref(), vars) {
+                    Ok(text) => text,
+                    Err(e) => return Ok(Err(e)),
+                };
+                let sql = if *dynamic {
+                    match Box::pin(value_of(database, state, &text)).await? {
+                        Ok(Some(sql)) => sql,
+                        Ok(None) => return Ok(Err(("22004".into(), "query string argument of EXECUTE is null".into()))),
+                        Err(e) => return Ok(Err(e)),
+                    }
+                } else {
+                    text
+                };
+                // Read whole before the first iteration, so the body may
+                // change what the query read.
+                let found = match Box::pin(query(database, state, &sql)).await? {
+                    Ok(found) => found,
+                    Err(e) => return Ok(Err(failure(e))),
+                };
+                for row in found.rows {
+                    if let Err(e) = assign_row(database, vars, targets, &found.names, &found.types, Some(row)) {
+                        return Ok(Err(e));
+                    }
+                    match Box::pin(run_statements(database, state, ctx, body, new, old, vars)).await? {
+                        Ok(None) | Ok(Some(Returned::Leave { exit: false })) => {}
+                        Ok(Some(Returned::Leave { exit: true })) => break,
+                        other => return Ok(other),
+                    }
+                }
+            }
+            PlStmt::ForRange { var, from, to, step, reverse, body } => {
+                let mut bounds = [0i64; 3];
+                for (slot, expr) in bounds.iter_mut().zip([Some(from), Some(to), step.as_ref()]) {
+                    let Some(expr) = expr else {
+                        *slot = 1;
+                        continue;
+                    };
+                    let text = match substitute(expr, ctx, new.as_ref(), old.as_ref(), vars) {
+                        Ok(text) => text,
+                        Err(e) => return Ok(Err(e)),
+                    };
+                    *slot = match Box::pin(value_of(database, state, &text)).await? {
+                        Ok(Some(v)) => match v.trim().parse::<i64>() {
+                            Ok(n) => n,
+                            Err(_) => return Ok(Err(("22P02".into(), format!("invalid input syntax for type integer: \"{v}\"")))),
+                        },
+                        Ok(None) => return Ok(Err(("22004".into(), "a bound of a FOR loop cannot be null".into()))),
+                        Err(e) => return Ok(Err(e)),
+                    };
+                }
+                let [from, to, step] = bounds;
+                if step <= 0 {
+                    return Ok(Err(("22023".into(), "BY value of FOR loop must be greater than zero".into())));
+                }
+                // The loop variable is the loop's own.
+                vars.push((var.clone(), "integer".to_string(), None));
+                let slot = vars.len() - 1;
+                let mut i = from;
+                let mut outcome = None;
+                while if *reverse { i >= to } else { i <= to } {
+                    vars[slot].2 = Some(i.to_string());
+                    match Box::pin(run_statements(database, state, ctx, body, new, old, vars)).await? {
+                        Ok(None) | Ok(Some(Returned::Leave { exit: false })) => {}
+                        Ok(Some(Returned::Leave { exit: true })) => break,
+                        other => {
+                            outcome = Some(other);
+                            break;
+                        }
+                    }
+                    i = match if *reverse { i.checked_sub(step) } else { i.checked_add(step) } {
+                        Some(next) => next,
+                        None => break,
+                    };
+                }
+                vars.remove(slot);
+                if let Some(other) = outcome {
+                    return Ok(other);
+                }
+            }
+            PlStmt::While { cond, body } => loop {
+                if let Some(cond) = cond {
+                    let text = match substitute(cond, ctx, new.as_ref(), old.as_ref(), vars) {
+                        Ok(text) => text,
+                        Err(e) => return Ok(Err(e)),
+                    };
+                    match Box::pin(is_true(database, state, &text)).await? {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(e) => return Ok(Err(e)),
+                    }
+                }
+                match Box::pin(run_statements(database, state, ctx, body, new, old, vars)).await? {
+                    Ok(None) | Ok(Some(Returned::Leave { exit: false })) => {}
+                    Ok(Some(Returned::Leave { exit: true })) => break,
+                    other => return Ok(other),
+                }
+            },
+            PlStmt::Leave { exit, when } => {
+                let leaves = match when {
+                    None => true,
+                    Some(cond) => {
+                        let text = match substitute(cond, ctx, new.as_ref(), old.as_ref(), vars) {
+                            Ok(text) => text,
+                            Err(e) => return Ok(Err(e)),
+                        };
+                        match Box::pin(is_true(database, state, &text)).await? {
+                            Ok(leaves) => leaves,
+                            Err(e) => return Ok(Err(e)),
+                        }
+                    }
+                };
+                if leaves {
+                    return Ok(Ok(Some(Returned::Leave { exit: *exit })));
+                }
+            }
+            PlStmt::SelectInto { targets, query: source } => {
+                let text = match substitute(source, ctx, new.as_ref(), old.as_ref(), vars) {
+                    Ok(text) => text,
+                    Err(e) => return Ok(Err(e)),
+                };
+                let found = match Box::pin(query(database, state, &text)).await? {
+                    Ok(found) => found,
+                    Err(e) => return Ok(Err(failure(e))),
+                };
+                let first = found.rows.into_iter().next();
+                if let Err(e) = assign_row(database, vars, targets, &found.names, &found.types, first) {
+                    return Ok(Err(e));
+                }
+            }
+            // `EXECUTE expr INTO target`: the dynamic query's first row.
+            // Its targets are split off before the variables are written
+            // in, or the target itself would be its own value.
+            PlStmt::Sql(sql)
+                if dynamic_execute(sql).is_some_and(|expr| crate::core::rql::join::find_keyword(expr, "INTO", 0).is_some()) =>
+            {
+                let expr = dynamic_execute(sql).expect("checked by the guard");
+                if crate::core::rql::join::find_keyword(expr, "USING", 0).is_some() {
+                    return Ok(Err(("0A000".into(), "EXECUTE … USING is not supported yet".into())));
+                }
+                let into = crate::core::rql::join::find_keyword(expr, "INTO", 0).expect("checked by the guard");
+                let after = expr[into + 4..].trim();
+                let after = if after.len() > 6 && after.as_bytes()[..6].eq_ignore_ascii_case(b"STRICT") && after.as_bytes()[6].is_ascii_whitespace() {
+                    after[6..].trim_start()
+                } else {
+                    after
+                };
+                let targets: Vec<String> = after.split(',').map(|t| t.trim().to_ascii_lowercase()).filter(|t| !t.is_empty()).collect();
+                let text = match substitute(expr[..into].trim(), ctx, new.as_ref(), old.as_ref(), vars) {
+                    Ok(text) => text,
+                    Err(e) => return Ok(Err(e)),
+                };
+                let dynamic = match Box::pin(value_of(database, state, &text)).await? {
+                    Ok(Some(sql)) => sql,
+                    Ok(None) => return Ok(Err(("22004".into(), "query string argument of EXECUTE is null".into()))),
+                    Err(e) => return Ok(Err(e)),
+                };
+                let found = match Box::pin(query(database, state, &dynamic)).await? {
+                    Ok(found) => found,
+                    Err(e) => return Ok(Err(failure(e))),
+                };
+                let first = found.rows.into_iter().next();
+                if let Err(e) = assign_row(database, vars, &targets, &found.names, &found.types, first) {
+                    return Ok(Err(e));
+                }
+            }
             PlStmt::Perform(sql) | PlStmt::Sql(sql) => {
                 let mut text = match substitute(sql, ctx, new.as_ref(), old.as_ref(), vars) {
                     Ok(text) => text,
                     Err(e) => return Ok(Err(e)),
                 };
                 // `EXECUTE expr`: PL/pgSQL's dynamic statement, the text the
-                // expression computes (`EXECUTE format('…', x)`). Its `INTO`
-                // and `USING` are refused rather than dropped.
+                // expression computes (`EXECUTE format('…', x)`). Its
+                // `USING` is refused rather than dropped.
                 if matches!(stmt, PlStmt::Sql(_)) && let Some(expr) = dynamic_execute(&text) {
-                    if crate::core::rql::join::find_keyword(expr, "INTO", 0).is_some()
-                        || crate::core::rql::join::find_keyword(expr, "USING", 0).is_some()
-                    {
-                        return Ok(Err(("0A000".into(), "EXECUTE … INTO and EXECUTE … USING are not supported yet".into())));
+                    if crate::core::rql::join::find_keyword(expr, "USING", 0).is_some() {
+                        return Ok(Err(("0A000".into(), "EXECUTE … USING is not supported yet".into())));
                     }
                     match Box::pin(value_of(database, state, expr)).await? {
                         Ok(Some(sql)) => text = sql,
@@ -575,6 +981,10 @@ pub(super) async fn run_do(database: &Arc<Database>, state: &mut SessionState, b
     let mut new_row = None;
     match Box::pin(run_statements(database, state, &ctx, &block.body, &mut new_row, &None, &mut vars)).await? {
         Ok(Some(Returned::Row(Some(_)))) => Ok(Err(("42804".into(), "RETURN cannot have a parameter in a DO block".into()))),
+        Ok(Some(Returned::Leave { exit })) => Ok(Err((
+            "42601".into(),
+            format!("{} cannot be used outside a loop", if exit { "EXIT" } else { "CONTINUE" }),
+        ))),
         Ok(_) => Ok(Ok(())),
         Err(e) => Ok(Err(e)),
     }

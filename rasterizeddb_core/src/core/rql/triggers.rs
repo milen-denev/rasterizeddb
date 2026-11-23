@@ -467,6 +467,23 @@ pub enum PlStmt {
     /// An SQL statement.
     Sql(String),
     Null,
+    /// A nested `BEGIN … [EXCEPTION WHEN … THEN …] END`: its statements,
+    /// and each handler's conditions (lowercase: a condition name,
+    /// `others`, or `sqlstate 'xxxxx'` as its five characters) with what it
+    /// runs.
+    Block { body: Vec<PlStmt>, handlers: Vec<(Vec<String>, Vec<PlStmt>)> },
+    /// `FOR target IN <query> LOOP … END LOOP`: `target` a record, a scalar
+    /// or several scalars. `dynamic`: the query is `EXECUTE <expression>`.
+    ForQuery { targets: Vec<String>, query: String, dynamic: bool, body: Vec<PlStmt> },
+    /// `FOR i IN [REVERSE] a .. b [BY step] LOOP … END LOOP`.
+    ForRange { var: String, from: String, to: String, step: Option<String>, reverse: bool, body: Vec<PlStmt> },
+    /// `WHILE cond LOOP … END LOOP`; a bare `LOOP` has no condition.
+    While { cond: Option<String>, body: Vec<PlStmt> },
+    /// `EXIT [WHEN cond]`, and `CONTINUE [WHEN cond]` (`exit` false).
+    Leave { exit: bool, when: Option<String> },
+    /// `SELECT … INTO targets FROM …`: the query without its `INTO`, and
+    /// where its first row goes.
+    SelectInto { targets: Vec<String>, query: String },
 }
 
 /// The statements of a block's text: split at `;` outside quotes,
@@ -489,6 +506,10 @@ fn keyword_at(text: &str, kw: &str) -> Option<usize> {
 /// Parses a PL/pgSQL function body.
 pub fn parse_plpgsql(body: &str) -> Result<PlBlock, Refusal> {
     let unsupported = |what: &str| ("0A000", format!("PL/pgSQL {what} is not supported yet"));
+    // Comments first: one before a statement was read as part of it
+    // ("syntax error in PL/pgSQL: -- …"). The statement's own were taken
+    // off before it got here, but not those inside its dollar-quoted body.
+    let body = without_comments(body);
     let mut text = body.trim().trim_end_matches(';').trim_end().to_string();
     // A `<<label>>` before the block.
     if text.starts_with("<<") {
@@ -510,8 +531,10 @@ pub fn parse_plpgsql(body: &str) -> Result<PlBlock, Refusal> {
                 Some((at, len)) => (rest[..at].trim(), Some(rest[at + len..].trim().to_string())),
                 None => (rest, None),
             };
-            if ty.to_ascii_uppercase().contains("RECORD") || ty.contains('%') {
-                return Err(unsupported("RECORD and %TYPE variables"));
+            // A `record` takes the shape of the row assigned to it
+            // (`trigger_exec`). `%TYPE` and `%ROWTYPE` need the catalogue.
+            if ty.contains('%') {
+                return Err(unsupported("%TYPE and %ROWTYPE variables"));
             }
             let ty = ty.trim_start_matches("CONSTANT ").trim_start_matches("constant ");
             declarations.push((ident(name), ty.trim().to_ascii_lowercase(), init));
@@ -521,20 +544,207 @@ pub fn parse_plpgsql(body: &str) -> Result<PlBlock, Refusal> {
     if head(&text) != "BEGIN" {
         return Err(("42601", "a PL/pgSQL body is BEGIN … END".to_string()));
     }
-    let upper = text.to_ascii_uppercase();
-    let end = upper.rfind("END").filter(|e| text[*e + 3..].trim().chars().all(|c| c.is_alphanumeric() || c == '_'))
-        .ok_or_else(|| ("42601", "a PL/pgSQL body ends with END".to_string()))?;
-    let inner = &text[5..end];
-    let mut flat: Vec<String> = statements(inner).into_iter().map(|s| s.trim().to_string()).collect();
+    let mut flat: Vec<String> = statements(&text).into_iter().map(|s| s.trim().to_string()).collect();
     flat.retain(|s| !s.is_empty());
-    // An `EXCEPTION WHEN …` section opens a statement; the word inside
-    // `RAISE EXCEPTION` does not.
-    if flat.iter().any(|s| head(s) == "EXCEPTION" || keyword_at(s, "EXCEPTION").is_some_and(|at| s[..at].trim_end().to_ascii_uppercase().ends_with("END IF") || s[..at].trim().is_empty())) {
-        return Err(unsupported("EXCEPTION blocks"));
+    let mut at = 1;
+    let PlStmt::Block { body, handlers } = nested_block(flat[0].clone(), &flat, &mut at)? else {
+        return Err(("42601", "a PL/pgSQL body is BEGIN … END".to_string()));
+    };
+    if at < flat.len() {
+        return Err(("42601", format!("syntax error at or near \"{}\" after the body's END", flat[at])));
     }
-    let mut at = 0;
-    let body = block(&flat, &mut at, &[])?;
+    // A body with no handlers is its statements, as it always was; one with
+    // an `EXCEPTION` section is the block that owns them.
+    let body = if handlers.is_empty() { body } else { vec![PlStmt::Block { body, handlers }] };
     Ok(PlBlock { declarations, body })
+}
+
+/// `text` with each comment outside its strings made a space.
+fn without_comments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let (mut copied, mut i) = (0, 0);
+    while i < bytes.len() {
+        if let Some(end) = crate::core::sql_scan::skip_quoted(bytes, i) {
+            i = end.max(i + 1);
+        } else if bytes[i] == b'"' {
+            i = crate::core::sql_scan::quoted_end(bytes, i, b'"').max(i + 1);
+        } else if let Some(end) = crate::core::sql_scan::skip_comment(bytes, i) {
+            out.push_str(&text[copied..i]);
+            out.push(' ');
+            copied = end;
+            i = end.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&text[copied.min(text.len())..]);
+    out
+}
+
+/// The statement that opens with `item`, which holds its header and, after
+/// a `THEN`, `LOOP` or `BEGIN`, the first statement inside it (the split at
+/// `;` keeps them together); the rest of it is read from `items[*at..]`.
+fn statement(item: String, items: &[String], at: &mut usize) -> Result<PlStmt, Refusal> {
+    let unsupported = |what: &str| ("0A000", format!("PL/pgSQL {what} is not supported yet"));
+    match head(&item).as_str() {
+        "IF" => if_statement(item, items, at),
+        "BEGIN" => nested_block(item, items, at),
+        "FOR" => for_loop(item, items, at),
+        "WHILE" => {
+            let do_at = keyword_at(&item, "LOOP").ok_or_else(|| ("42601", format!("WHILE without LOOP: {item}")))?;
+            let cond = item[5..do_at].trim().to_string();
+            let body = loop_body(item[do_at + 4..].trim(), items, at)?;
+            Ok(PlStmt::While { cond: Some(cond), body })
+        }
+        "LOOP" => Ok(PlStmt::While { cond: None, body: loop_body(item[4..].trim(), items, at)? }),
+        "DECLARE" => Err(unsupported("a nested DECLARE")),
+        _ if item.starts_with("<<") => Err(unsupported("a block or loop label")),
+        _ => simple(&item),
+    }
+}
+
+/// `BEGIN … [EXCEPTION WHEN … THEN …] END`, from the item that opens it.
+fn nested_block(item: String, items: &[String], at: &mut usize) -> Result<PlStmt, Refusal> {
+    let mut body = Vec::new();
+    let tail = item[5..].trim();
+    if !tail.is_empty() {
+        body.push(statement(tail.to_string(), items, at)?);
+    }
+    body.extend(block(items, at, &["EXCEPTION", "END"])?);
+    let mut handlers: Vec<(Vec<String>, Vec<PlStmt>)> = Vec::new();
+    let unclosed = || ("42601", "BEGIN without END".to_string());
+    let mut next = items.get(*at).cloned().ok_or_else(unclosed)?;
+    *at += 1;
+    if head(&next) == "EXCEPTION" {
+        // `EXCEPTION WHEN a OR b THEN stmt`, then `WHEN c THEN stmt` for
+        // each further handler.
+        let mut piece = next["EXCEPTION".len()..].trim().to_string();
+        loop {
+            if head(&piece) != "WHEN" {
+                return Err(("42601", format!("EXCEPTION needs WHEN: {piece}")));
+            }
+            let then = keyword_at(&piece, "THEN").ok_or_else(|| ("42601", format!("WHEN without THEN: {piece}")))?;
+            let conditions = exception_conditions(&piece[4..then])?;
+            let mut stmts = Vec::new();
+            let tail = piece[then + 4..].trim();
+            if !tail.is_empty() {
+                stmts.push(statement(tail.to_string(), items, at)?);
+            }
+            stmts.extend(block(items, at, &["WHEN", "END"])?);
+            handlers.push((conditions, stmts));
+            next = items.get(*at).cloned().ok_or_else(unclosed)?;
+            *at += 1;
+            if head(&next) != "WHEN" {
+                break;
+            }
+            piece = next;
+        }
+    }
+    if head(&next) != "END" || ["END IF", "END LOOP", "END CASE"].iter().any(|e| next.to_ascii_uppercase().starts_with(e)) {
+        return Err(("42601", format!("BEGIN without END: found {next}")));
+    }
+    Ok(PlStmt::Block { body, handlers })
+}
+
+/// A handler's conditions, `a OR b`: each a condition name or `others`,
+/// lowercase, or `SQLSTATE 'xxxxx'` as its five characters.
+fn exception_conditions(text: &str) -> Result<Vec<String>, Refusal> {
+    let mut out = Vec::new();
+    let mut rest = text.trim();
+    loop {
+        let (one, more) = match keyword_at(rest, "OR") {
+            Some(at) => (rest[..at].trim(), Some(rest[at + 2..].trim())),
+            None => (rest, None),
+        };
+        let condition = if head(one) == "SQLSTATE" {
+            one[8..].trim().trim_matches('\'').to_ascii_uppercase()
+        } else {
+            one.to_ascii_lowercase()
+        };
+        if condition.is_empty() || condition.contains(char::is_whitespace) {
+            return Err(("42601", format!("unrecognized exception condition \"{one}\"")));
+        }
+        out.push(condition);
+        match more {
+            Some(more) => rest = more,
+            None => return Ok(out),
+        }
+    }
+}
+
+/// A loop's statements: the one after its `LOOP`, then up to `END LOOP`.
+fn loop_body(tail: &str, items: &[String], at: &mut usize) -> Result<Vec<PlStmt>, Refusal> {
+    let mut body = Vec::new();
+    if !tail.is_empty() {
+        body.push(statement(tail.to_string(), items, at)?);
+    }
+    body.extend(block(items, at, &["END LOOP"])?);
+    match items.get(*at) {
+        Some(end) if end.to_ascii_uppercase().starts_with("END LOOP") => {
+            *at += 1;
+            Ok(body)
+        }
+        _ => Err(("42601", "LOOP without END LOOP".to_string())),
+    }
+}
+
+/// `FOR target IN … LOOP`: over a query's rows, or over an integer range.
+fn for_loop(item: String, items: &[String], at: &mut usize) -> Result<PlStmt, Refusal> {
+    let loop_at = keyword_at(&item, "LOOP").ok_or_else(|| ("42601", format!("FOR without LOOP: {item}")))?;
+    let header = &item[3..loop_at];
+    let in_at = keyword_at(header, "IN").ok_or_else(|| ("42601", format!("FOR without IN: {item}")))?;
+    let targets: Vec<String> =
+        header[..in_at].split(',').map(|t| t.trim().to_ascii_lowercase()).filter(|t| !t.is_empty()).collect();
+    if targets.is_empty() || targets.iter().any(|t| t.contains(char::is_whitespace)) {
+        return Err(("42601", format!("FOR names no loop variable: {item}")));
+    }
+    let source = header[in_at + 2..].trim();
+    let body_tail = item[loop_at + 4..].trim();
+    // `a .. b` outside quotes and parentheses is the integer form.
+    if let Some(dots) = range_dots(source) {
+        let (reverse, from) = match head(&source[..dots]).as_str() {
+            "REVERSE" => (true, source[7..dots].trim()),
+            _ => (false, source[..dots].trim()),
+        };
+        let upper = source[dots + 2..].trim();
+        let (to, step) = match keyword_at(upper, "BY") {
+            Some(by) => (upper[..by].trim(), Some(upper[by + 2..].trim().to_string())),
+            None => (upper, None),
+        };
+        let [var] = targets.as_slice() else {
+            return Err(("42601", "an integer FOR loop has one loop variable".to_string()));
+        };
+        let body = loop_body(body_tail, items, at)?;
+        return Ok(PlStmt::ForRange { var: var.clone(), from: from.to_string(), to: to.to_string(), step, reverse, body });
+    }
+    let (query, dynamic) = match head(source).as_str() {
+        "EXECUTE" => (source[7..].trim().to_string(), true),
+        _ => (source.to_string(), false),
+    };
+    let body = loop_body(body_tail, items, at)?;
+    Ok(PlStmt::ForQuery { targets, query, dynamic, body })
+}
+
+/// Where the `..` of an integer `FOR` range is, outside quotes and
+/// parentheses.
+fn range_dots(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let (mut depth, mut i) = (0usize, 0usize);
+    while i < bytes.len() {
+        match bytes[i] {
+            q @ (b'\'' | b'"') => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, q).max(i + 1);
+                continue;
+            }
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'.' if depth == 0 && bytes.get(i + 1) == Some(&b'.') => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Statements from `items[*at]` until one opening with a word of `stops`
@@ -549,12 +759,9 @@ fn block(items: &[String], at: &mut usize, stops: &[&str]) -> Result<Vec<PlStmt>
         }
         *at += 1;
         // An `IF … THEN <first statement>`: the split at `;` keeps the first
-        // statement of a branch with its condition.
-        if first == "IF" {
-            out.push(if_statement(item, items, at)?);
-            continue;
-        }
-        out.push(simple(&item)?);
+        // statement of a branch with its condition; a loop's and a nested
+        // block's likewise (`statement`).
+        out.push(statement(item, items, at)?);
     }
     Ok(out)
 }
@@ -590,13 +797,9 @@ fn if_statement(first: String, items: &[String], at: &mut usize) -> Result<PlStm
         // to the next ELSIF, ELSE or END IF.
         let mut stmts = Vec::new();
         if let Some(tail) = rest {
-            if head(&tail) == "IF" {
-                stmts.push(if_statement(tail, items, at)?);
-            } else {
-                // `IF c THEN x := 1 ELSE …` on one line is not a split point;
-                // only `;` ends a statement.
-                stmts.push(simple(&tail)?);
-            }
+            // `IF c THEN x := 1 ELSE …` on one line is not a split point;
+            // only `;` ends a statement.
+            stmts.push(statement(tail, items, at)?);
         }
         stmts.extend(block(items, at, &["ELSIF", "ELSEIF", "ELSE", "END IF"])?);
         if in_else {
@@ -630,8 +833,27 @@ fn simple(item: &str) -> Result<PlStmt, Refusal> {
         "PERFORM" => PlStmt::Perform(format!("SELECT {}", item[7..].trim())),
         "NULL" => PlStmt::Null,
         "INSERT" | "UPDATE" | "DELETE" | "SELECT" | "WITH" => {
-            if first == "SELECT" && keyword_at(item, "INTO").is_some() {
-                return Err(unsupported("SELECT … INTO"));
+            // `SELECT a, b INTO x, y FROM …`: the query without its `INTO`,
+            // whose targets end at the clause that follows them.
+            if first == "SELECT"
+                && let Some(into) = keyword_at(item, "INTO")
+            {
+                let after = item[into + 4..].trim_start();
+                let after = match head(after).as_str() {
+                    "STRICT" => after[6..].trim_start(),
+                    _ => after,
+                };
+                let end = ["FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "FETCH", "FOR", "UNION"]
+                    .iter()
+                    .filter_map(|k| keyword_at(after, k))
+                    .min()
+                    .unwrap_or(after.len());
+                let targets: Vec<String> =
+                    after[..end].split(',').map(|t| t.trim().to_ascii_lowercase()).filter(|t| !t.is_empty()).collect();
+                if targets.is_empty() || targets.iter().any(|t| t.contains(char::is_whitespace)) {
+                    return Err(("42601", format!("SELECT … INTO names no variable: {item}")));
+                }
+                return Ok(PlStmt::SelectInto { targets, query: format!("{} {}", item[..into].trim_end(), &after[end..]) });
             }
             PlStmt::Sql(item.to_string())
         }
@@ -641,8 +863,18 @@ fn simple(item: &str) -> Result<PlStmt, Refusal> {
         "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "GRANT" | "REVOKE" | "COMMENT" | "MERGE" | "NOTIFY" | "EXECUTE" => {
             PlStmt::Sql(item.to_string())
         }
-        "LOOP" | "WHILE" | "FOR" | "FOREACH" | "EXIT" | "CONTINUE" | "CASE" | "GET" | "OPEN" | "FETCH"
-        | "CLOSE" | "BEGIN" | "DECLARE" | "COMMIT" | "ROLLBACK" | "CALL" | "ASSERT" => return Err(unsupported(&first)),
+        "EXIT" | "CONTINUE" => {
+            let rest = item[first.len()..].trim();
+            let when = match head(rest).as_str() {
+                "" => None,
+                "WHEN" => Some(rest[4..].trim().to_string()),
+                _ => return Err(unsupported("a loop label")),
+            };
+            PlStmt::Leave { exit: first == "EXIT", when }
+        }
+        "FOREACH" | "CASE" | "GET" | "OPEN" | "FETCH" | "CLOSE" | "COMMIT" | "ROLLBACK" | "CALL" | "ASSERT" => {
+            return Err(unsupported(&first));
+        }
         _ => {
             let (at, len) = match item.find(":=") {
                 Some(at) => (at, 2),
@@ -746,6 +978,76 @@ mod tests {
         ]);
         assert_eq!(otherwise, &vec![PlStmt::Assign { target: "new.at".into(), expr: "NULL".into() }]);
         assert_eq!(block.body[2], PlStmt::Return(Some("NEW".into())));
-        assert!(parse_plpgsql("BEGIN LOOP NULL; END LOOP; END").is_err());
+        // What is still refused, by name.
+        for body in [
+            "BEGIN CASE WHEN true THEN NULL; END CASE; END",
+            "DECLARE x t.c%TYPE; BEGIN NULL; END",
+            "BEGIN <<outer>> LOOP EXIT outer; END LOOP; END",
+            "BEGIN FOREACH x IN ARRAY a LOOP NULL; END LOOP; END",
+        ] {
+            assert_eq!(parse_plpgsql(body).unwrap_err().0, "0A000", "{body}");
+        }
+        assert_eq!(parse_plpgsql("BEGIN LOOP NULL; END").unwrap_err().0, "42601");
+    }
+
+    /// Nested blocks with handlers, the loops, and `INTO`: a migration's
+    /// `DO` block. Each used to be "PL/pgSQL … is not supported yet".
+    #[test]
+    fn blocks_handlers_and_loops_are_read() {
+        let null = || vec![PlStmt::Null];
+        // A nested block, two handlers, the second on two conditions.
+        let block = parse_plpgsql(
+            "BEGIN                BEGIN EXECUTE 'ALTER TABLE t SET (x = 1)';                EXCEPTION WHEN feature_not_supported THEN ok := false;                          WHEN lock_not_available OR SQLSTATE '40P01' THEN NULL; RAISE NOTICE 'busy';                END;                n := 1;              END",
+        )
+        .unwrap();
+        let [PlStmt::Block { body, handlers }, PlStmt::Assign { .. }] = block.body.as_slice() else { panic!("{block:?}") };
+        assert_eq!(body, &vec![PlStmt::Sql("EXECUTE 'ALTER TABLE t SET (x = 1)'".into())]);
+        assert_eq!(handlers.len(), 2);
+        assert_eq!(handlers[0], (vec!["feature_not_supported".to_string()], vec![PlStmt::Assign { target: "ok".into(), expr: "false".into() }]));
+        assert_eq!(handlers[1].0, ["lock_not_available", "40P01"]);
+        assert_eq!(handlers[1].1.len(), 2);
+
+        // The body's own handler makes the body one block; without one it
+        // is its statements, as before.
+        let block = parse_plpgsql("BEGIN NULL; EXCEPTION WHEN OTHERS THEN NULL; END").unwrap();
+        assert_eq!(block.body, vec![PlStmt::Block { body: null(), handlers: vec![(vec!["others".into()], null())] }]);
+        assert_eq!(parse_plpgsql("BEGIN NULL; END").unwrap().body, null());
+
+        // A query loop, whose query holds parentheses, keywords in strings
+        // and a comment; an integer loop; WHILE, LOOP, EXIT and CONTINUE.
+        let block = parse_plpgsql(
+            "DECLARE r record; BEGIN                FOR r IN SELECT a, 'LOOP; x' AS b FROM t WHERE a IN (SELECT 1) -- not the END LOOP
+ LOOP                  CONTINUE WHEN r.a IS NULL; EXIT;                END LOOP;                FOR i IN REVERSE 10 .. 1 BY 2 LOOP NULL; END LOOP;                FOR k, v IN EXECUTE 'SELECT 1, 2' LOOP NULL; END LOOP;                WHILE n < 3 LOOP n := n + 1; END LOOP;                LOOP EXIT WHEN n > 9; END LOOP;              END",
+        )
+        .unwrap();
+        assert_eq!(block.declarations, vec![("r".into(), "record".into(), None)]);
+        assert_eq!(block.body, vec![
+            PlStmt::ForQuery {
+                targets: vec!["r".into()],
+                query: "SELECT a, 'LOOP; x' AS b FROM t WHERE a IN (SELECT 1)".into(),
+                dynamic: false,
+                body: vec![PlStmt::Leave { exit: false, when: Some("r.a IS NULL".into()) }, PlStmt::Leave { exit: true, when: None }],
+            },
+            PlStmt::ForRange { var: "i".into(), from: "10".into(), to: "1".into(), step: Some("2".into()), reverse: true, body: null() },
+            PlStmt::ForQuery { targets: vec!["k".into(), "v".into()], query: "'SELECT 1, 2'".into(), dynamic: true, body: null() },
+            PlStmt::While { cond: Some("n < 3".into()), body: vec![PlStmt::Assign { target: "n".into(), expr: "n + 1".into() }] },
+            PlStmt::While { cond: None, body: vec![PlStmt::Leave { exit: true, when: Some("n > 9".into()) }] },
+        ]);
+
+        // `SELECT … INTO` is the query without its targets.
+        let block = parse_plpgsql("BEGIN SELECT sum(v), max(g) INTO STRICT total, label FROM src WHERE v > 0; END").unwrap();
+        assert_eq!(block.body, vec![PlStmt::SelectInto {
+            targets: vec!["total".into(), "label".into()],
+            query: "SELECT sum(v), max(g) FROM src WHERE v > 0".into(),
+        }]);
+
+        // A loop inside an IF inside a handler, each closed by its own END.
+        let block = parse_plpgsql(
+            "BEGIN BEGIN NULL; EXCEPTION WHEN OTHERS THEN IF true THEN FOR i IN 1..2 LOOP NULL; END LOOP; END IF; END; END",
+        )
+        .unwrap();
+        let [PlStmt::Block { handlers, .. }] = block.body.as_slice() else { panic!("{block:?}") };
+        let [PlStmt::If { branches, .. }] = handlers[0].1.as_slice() else { panic!("{handlers:?}") };
+        assert!(matches!(branches[0].1.as_slice(), [PlStmt::ForRange { .. }]));
     }
 }

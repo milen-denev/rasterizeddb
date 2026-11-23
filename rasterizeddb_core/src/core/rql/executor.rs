@@ -16705,6 +16705,133 @@ async fn execute_alter_table_action(
                 Err(e) => ddl_error(&format!("foreign key \"{}\" could not be validated: {e}", fk.name)),
             };
         }
+        // `RENAME CONSTRAINT a TO b`, and `RENAME INDEX a TO b` (what `ALTER
+        // INDEX a RENAME TO b` runs as): the record under the old name
+        // retired and written again under the new one, in one reload. A
+        // primary key or UNIQUE column declared inline has no record: its
+        // name is its table's and its column's, and follows them.
+        action @ (AlterAction::RenameConstraint { .. } | AlterAction::RenameIndex { .. }) => {
+            let (index_form, from, to) = match action {
+                AlterAction::RenameIndex { from, to } => (true, from, to),
+                AlterAction::RenameConstraint { from, to } => (false, from, to),
+                _ => return ddl_error("RENAME names no constraint"),
+            };
+            let table_name = plan.table_name.clone();
+            let named = |n: &str, want: &str| n.eq_ignore_ascii_case(want);
+            let key = schema.unique_keys.iter().find(|k| !k.is_deleted && named(&k.name, &from)).cloned();
+            let fk = schema.foreign_keys.iter().find(|f| !index_form && !f.is_deleted && named(&f.name, &from)).cloned();
+            let check = schema.checks.iter().find(|c| !index_form && !c.is_deleted && named(&c.name, &from)).cloned();
+            let index = schema
+                .secondary_indexes
+                .iter()
+                .find(|i| index_form && !i.is_deleted && named(&i.name, &from))
+                .cloned();
+            let implicit = |name: &str| {
+                primary_key_constraint(&schema, &table_name).is_some_and(|p| named(&p.name, name))
+                    || implicit_unique_column(name, &table_name, &schema.fields).is_some()
+            };
+            if key.is_none() && fk.is_none() && check.is_none() && index.is_none() {
+                if implicit(&from) {
+                    if named(&from, &to) {
+                        return ddl_ok(0);
+                    }
+                    return ddl_error(&format!(
+                        "renaming constraint \"{from}\" of \"{table_name}\" is not supported: it was declared with its \
+                         column, so its name is the table's and the column's; declare it as CONSTRAINT {to} to name it"
+                    ));
+                }
+                // Already called what it is asked to be called: a key named
+                // after its table followed the table's own rename, which is
+                // where a migration renaming both gets to.
+                if implicit(&to) {
+                    info!("ALTER TABLE {table_name}: constraint {from} is already {to}, which its table's name gives it");
+                    return ddl_ok(0);
+                }
+                return ddl_error(&if index_form {
+                    format!("relation \"{from}\" does not exist")
+                } else {
+                    format!("constraint \"{from}\" for table \"{table_name}\" does not exist")
+                });
+            }
+            if named(&from, &to) {
+                return ddl_ok(0);
+            }
+            // The primary key is told from a UNIQUE by its name,
+            // `<table>_pkey`, alone (the sidecar has no field saying
+            // "primary"): renamed to anything else it would read as a UNIQUE
+            // beside a primary key nothing backs. To that name it may go,
+            // which is what a key left behind by its table's rename needs.
+            let pkey = crate::core::rql::unique_key::pkey_name(&table_name);
+            if key.is_some()
+                && primary_key_constraint(&schema, &table_name).is_some_and(|p| named(&p.name, &from))
+                && !named(&to, &pkey)
+            {
+                return ddl_error(&format!(
+                    "renaming the primary key of \"{table_name}\" to \"{to}\" is not supported: it is recognised as the \
+                     primary key only by the name \"{pkey}\""
+                ));
+            }
+            let index_taken = schema.secondary_indexes.iter().any(|i| !i.is_deleted && named(&i.name, &to));
+            let taken = constraint_name_taken(&schema, &table_name, &to) || index_taken;
+            if taken {
+                return ddl_error(&if index_form || index_taken {
+                    format!("relation \"{to}\" already exists")
+                } else {
+                    format!("constraint \"{to}\" for relation \"{table_name}\" already exists")
+                });
+            }
+            // A key's or an index's name is its index's, and an index's name
+            // is the database's: one any other table's index has is taken.
+            if key.is_some() || index.is_some() {
+                let mut elsewhere = false;
+                database.each_schema(|other, other_schema| {
+                    // This table's own names were looked at above.
+                    if other.eq_ignore_ascii_case(&table_name) {
+                        return;
+                    }
+                    elsewhere = elsewhere
+                        || constraint_index(other_schema, other, &to)
+                        || other_schema.unique_keys.iter().any(|k| !k.is_deleted && named(&k.name, &to))
+                        || other_schema.secondary_indexes.iter().any(|i| !i.is_deleted && named(&i.name, &to));
+                });
+                if elsewhere {
+                    return ddl_error(&format!("relation \"{to}\" already exists"));
+                }
+            }
+            let reloaded = database
+                .reload_with(&table_name, |old| async move {
+                    let io = old.io_schema.clone();
+                    let failed = |e: std::io::Error| e.to_string();
+                    if let Some(key) = key {
+                        crate::core::rql::unique_key::remove(io.clone(), &key.name).await.map_err(failed)?;
+                        let renamed = crate::core::rql::unique_key::UniqueKey { name: to.clone(), ..key };
+                        crate::core::rql::unique_key::append(io.clone(), &renamed).await.map_err(failed)?;
+                    }
+                    if let Some(fk) = fk {
+                        crate::core::rql::foreign_key::remove(io.clone(), &fk.name).await.map_err(failed)?;
+                        let renamed = crate::core::rql::foreign_key::ForeignKey { name: to.clone(), ..fk };
+                        crate::core::rql::foreign_key::append(io.clone(), &renamed).await.map_err(failed)?;
+                    }
+                    if let Some(check) = check {
+                        let retired = crate::core::rql::check::CheckConstraint { is_deleted: true, ..check.clone() };
+                        crate::core::rql::check::append(io.clone(), &retired).await.map_err(failed)?;
+                        let renamed = crate::core::rql::check::CheckConstraint { name: to.clone(), ..check };
+                        crate::core::rql::check::append(io.clone(), &renamed).await.map_err(failed)?;
+                    }
+                    if let Some(index) = index {
+                        let retired = crate::core::index::IndexDecl { is_deleted: true, ..index.clone() };
+                        crate::core::index::decl::append(io.clone(), &retired).await.map_err(failed)?;
+                        let renamed = crate::core::index::IndexDecl { name: to.clone(), ..index };
+                        crate::core::index::decl::append(io.clone(), &renamed).await.map_err(failed)?;
+                    }
+                    Ok(())
+                })
+                .await;
+            return match reloaded {
+                Ok(()) => ddl_ok(0),
+                Err(failure) => reload_failed(failure, ""),
+            };
+        }
         AlterAction::AddColumn {
             name,
             db_type,

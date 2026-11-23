@@ -91,6 +91,17 @@ pub enum AlterAction {
     ValidateConstraint {
         name: String,
     },
+    /// `RENAME CONSTRAINT from TO to`.
+    RenameConstraint {
+        from: String,
+        to: String,
+    },
+    /// `RENAME INDEX from TO to` (MySQL's spelling, and what `ALTER INDEX
+    /// from RENAME TO to` is run as once its table is known).
+    RenameIndex {
+        from: String,
+        to: String,
+    },
     /// Accepted and not acted on, with the reason.
     ///
     /// PostgreSQL storage tuning — `SET COMPRESSION`, `SET (autovacuum_…)` —
@@ -118,6 +129,25 @@ fn bare_name(raw: &str) -> String {
         .unwrap_or(raw)
         .trim_matches('"')
         .to_string()
+}
+
+/// `ALTER INDEX [IF EXISTS] name RENAME TO new`: the index, whether `IF
+/// EXISTS` was written, and its new name. `None` for any other statement;
+/// `Err` for an `ALTER INDEX … RENAME` that names nothing.
+pub fn parse_alter_index_rename(sql: &str) -> Option<Result<(String, bool, String), String>> {
+    let words: Vec<&str> = sql.trim().trim_end_matches(';').split_whitespace().collect();
+    let is = |at: usize, word: &str| words.get(at).is_some_and(|w| w.eq_ignore_ascii_case(word));
+    if !(is(0, "ALTER") && is(1, "INDEX")) {
+        return None;
+    }
+    let (if_exists, at) = if is(2, "IF") && is(3, "EXISTS") { (true, 4) } else { (false, 2) };
+    if !(is(at + 1, "RENAME") && is(at + 2, "TO")) {
+        return None;
+    }
+    let (Some(from), Some(to), None) = (words.get(at), words.get(at + 3), words.get(at + 4)) else {
+        return Some(Err("ALTER INDEX … RENAME TO needs the index and its new name".to_string()));
+    };
+    Some(Ok((bare_name(from), if_exists, bare_name(to))))
 }
 
 /// Parses `ALTER TABLE …`.
@@ -555,6 +585,28 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
                 return Ok(AlterTable {
                     table_name,
                     action: AlterAction::RenameTable { to },
+                });
+            }
+            // `RENAME CONSTRAINT a TO b`, `RENAME INDEX a TO b`: read as a
+            // column, it was a column called CONSTRAINT ("RENAME COLUMN must
+            // be followed by TO").
+            if let Some(kind @ ("CONSTRAINT" | "INDEX" | "KEY")) = rest_upper.get(i).map(String::as_str)
+                && rest_upper.get(i + 2).map(String::as_str) == Some("TO")
+            {
+                let from = crate::core::rql::unique_key::stored_name(&bare_name(&rest[i + 1]));
+                let to = crate::core::rql::unique_key::stored_name(&bare_name(
+                    rest.get(i + 3).ok_or_else(|| format!("RENAME {kind} has no new name"))?,
+                ));
+                if from.is_empty() || to.is_empty() {
+                    return Err(format!("RENAME {kind} needs two names"));
+                }
+                return Ok(AlterTable {
+                    table_name,
+                    action: if kind == "CONSTRAINT" {
+                        AlterAction::RenameConstraint { from, to }
+                    } else {
+                        AlterAction::RenameIndex { from, to }
+                    },
                 });
             }
             if rest_upper.get(i).map(String::as_str) == Some("COLUMN") {
