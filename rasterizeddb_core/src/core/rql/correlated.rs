@@ -86,7 +86,11 @@ pub(crate) fn rewrite_select(sql: &str) -> Option<Result<String, String>> {
     // A correlated `IN` subquery, as the `EXISTS` it means
     // (`executor::correlated_in_as_exists`): first, so its `NOT IN` form is
     // counted below like any other.
-    let as_exists = crate::core::rql::executor::correlated_in_as_exists(sql);
+    // An EXISTS over a UNION, as its branches' EXISTS
+    // (`executor::exists_over_set_operation`).
+    let split = crate::core::rql::executor::exists_over_set_operation(sql);
+    let sql = split.as_deref().unwrap_or(sql);
+    let as_exists = crate::core::rql::executor::correlated_in_as_exists(sql).or_else(|| split.clone());
     let sql = as_exists.as_deref().unwrap_or(sql);
     // An EXISTS the `IN` form cannot say, as the count it asks about: a
     // correlated scalar subquery, placed with the rest below.

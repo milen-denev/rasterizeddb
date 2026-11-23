@@ -470,7 +470,32 @@ fn rewrite_first_array_subquery(sql: &str) -> Option<String> {
 /// The aggregate an `ARRAY(…)` subquery is.
 fn array_aggregate(query: &str) -> Option<String> {
     use crate::core::rql::join::find_keyword;
-    let from = find_keyword(query, "FROM", 0)?;
+    // Where the first branch of a set operation ends, if there is one.
+    let set_at = ["UNION", "INTERSECT", "EXCEPT"].iter().filter_map(|k| find_keyword(query, k, 0)).min();
+    let from = match find_keyword(query, "FROM", 0).filter(|f| set_at.is_none_or(|s| *f < s)) {
+        Some(from) => from,
+        None => {
+            // A first select list with no FROM — `ARRAY(SELECT 2 UNION ALL
+            // SELECT 1 ORDER BY 1)`, `ARRAY(SELECT 1)` — read as the
+            // aggregate over the whole query, its one item named. It was
+            // taken for a scalar subquery ("returned 2 rows, but must
+            // return at most one").
+            let end = ["WHERE", "GROUP", "HAVING", "WINDOW", "ORDER", "LIMIT", "OFFSET", "FETCH"]
+                .iter()
+                .filter_map(|k| find_keyword(query, k, 0))
+                .chain(set_at)
+                .min()
+                .unwrap_or(query.len());
+            let list = query[6..end].trim();
+            let items = split_top_level(list, b',');
+            if items.len() != 1 || list.get(..8).is_some_and(|w| w.eq_ignore_ascii_case("DISTINCT")) {
+                return None;
+            }
+            let (expr, _) = crate::core::rql::lexer_query::split_alias(items[0].trim());
+            let aliased = format!("SELECT {} AS __arr_v {}", expr.trim(), &query[end..]);
+            return Some(format!("COALESCE((SELECT array_agg(__arr_v) FROM ({aliased}) __arr), '{{}}')"));
+        }
+    };
     let list = query[6..from].trim();
     let items = split_top_level(list, b',');
     if items.len() != 1 || list.get(..8).is_some_and(|w| w.eq_ignore_ascii_case("DISTINCT")) {
@@ -490,7 +515,23 @@ fn array_aggregate(query: &str) -> Option<String> {
         None => (body, None),
     };
     let aggregate = match order {
-        Some(o) => format!("array_agg({} ORDER BY {o})", expr.trim()),
+        Some(o) => {
+            // `ORDER BY 1` names the one select item. Inside the aggregate a
+            // bare 1 is a constant and sorts nothing, so the order was lost.
+            let keys: Vec<String> = split_top_level(o, b',')
+                .iter()
+                .map(|key| {
+                    let key = key.trim();
+                    let digits = key.bytes().take_while(u8::is_ascii_digit).count();
+                    if &key[..digits] == "1" && !key[digits..].starts_with(|c: char| c == '.' || is_identifier_byte(c as u8)) {
+                        format!("({}){}", expr.trim(), &key[digits..])
+                    } else {
+                        key.to_string()
+                    }
+                })
+                .collect();
+            format!("array_agg({} ORDER BY {})", expr.trim(), keys.join(", "))
+        }
         None => format!("array_agg({})", expr.trim()),
     };
     Some(format!("COALESCE((SELECT {aggregate} {}), '{{}}')", rest.trim()))
