@@ -132,8 +132,176 @@ pub(crate) fn rewrite(
     let numbered = quote_numeric_operands(sql);
     let rewritten = rewrite_literals(numbered.as_deref().unwrap_or(sql), relation_exists, user_type)?.or(numbered);
     // What is left is a cast of something other than a literal.
-    let named = column_regtype_casts(rewritten.as_deref().unwrap_or(sql));
+    let named = column_regtype_casts(rewritten.as_deref().unwrap_or(sql))?;
     Ok(named.or(rewritten))
+}
+
+/// Why a `regtype` value cannot be an `ORDER BY` key of a grouped query or
+/// a set operation: PostgreSQL sorts it by the type's oid, and a key of such
+/// a query has to be in its result, which carries the name. Sorted by the
+/// name it was a wrong order with no error.
+fn regtype_order_refusal() -> (&'static str, String) {
+    (
+        "0A000",
+        "ORDER BY a regtype value in a grouped query or a set operation is not supported: it sorts by the type's \
+         oid, which the result does not carry; select the name as text (x::regtype::text) and sort by that"
+            .to_string(),
+    )
+}
+
+/// One `ORDER BY` clause: where its keys are written, and whether the query
+/// it sorts is grouped or a set operation.
+struct OrderByClause {
+    keys: std::ops::Range<usize>,
+    grouped: bool,
+    /// The statement's own, not a subquery's, a window's or an aggregate's.
+    top: bool,
+}
+
+/// Every `ORDER BY` of `sql`, at any depth: a query's, a window's
+/// (`OVER (ORDER BY …)`) and an aggregate's (`array_agg(x ORDER BY y)`).
+fn order_by_clauses(sql: &str) -> Vec<OrderByClause> {
+    use crate::core::rql::join::find_keyword;
+    const ENDS: [&str; 10] = ["LIMIT", "OFFSET", "FETCH", "FOR", "UNION", "INTERSECT", "EXCEPT", "ROWS", "RANGE", "GROUPS"];
+    let bytes = sql.as_bytes();
+    // Open parentheses, and the clauses still open: (depth, keys start).
+    let mut parens: Vec<usize> = Vec::new();
+    let mut open: Vec<(usize, usize)> = Vec::new();
+    // (depth, the parenthesis the clause is in, keys).
+    let mut found: Vec<(usize, Option<usize>, std::ops::Range<usize>)> = Vec::new();
+    let close_at = |open: &mut Vec<(usize, usize)>, found: &mut Vec<(usize, Option<usize>, std::ops::Range<usize>)>, parens: &[usize], at: usize| {
+        while open.last().is_some_and(|(depth, _)| *depth == parens.len()) {
+            let (depth, start) = open.pop().expect("checked");
+            found.push((depth, parens.last().copied(), start..at));
+        }
+    };
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)) {
+            i = end.max(i + 1);
+            continue;
+        }
+        match bytes[i] {
+            b'(' => parens.push(i),
+            b')' => {
+                close_at(&mut open, &mut found, &parens, i);
+                parens.pop();
+            }
+            b';' => close_at(&mut open, &mut found, &parens, i),
+            b if is_identifier_byte(b) && (i == 0 || !is_identifier_byte(bytes[i - 1])) => {
+                let end = i + bytes[i..].iter().take_while(|b| is_identifier_byte(**b)).count();
+                let word = &sql[i..end];
+                if word.eq_ignore_ascii_case("ORDER") {
+                    let rest = sql[end..].trim_start();
+                    if crate::core::sql_scan::starts_with_keyword(rest, "BY") {
+                        open.push((parens.len(), sql.len() - rest.len() + 2));
+                    }
+                } else if ENDS.iter().any(|k| word.eq_ignore_ascii_case(k)) {
+                    close_at(&mut open, &mut found, &parens, i);
+                }
+                i = end;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    while let Some((depth, start)) = open.pop() {
+        found.push((depth, None, start..sql.len()));
+    }
+    found
+        .into_iter()
+        .map(|(depth, paren, keys)| {
+            // The query the clause sorts: what its parenthesis holds, or the
+            // whole statement.
+            let region = match paren {
+                Some(at) if depth > 0 => &sql[at + 1..matching_close(sql, at).unwrap_or(sql.len())],
+                _ => sql,
+            };
+            let grouped = ["GROUP", "UNION", "INTERSECT", "EXCEPT"].iter().any(|kw| find_keyword(region, kw, 0).is_some());
+            OrderByClause { keys, grouped, top: depth == 0 }
+        })
+        .collect()
+}
+
+/// `sql` with each key of its own `ORDER BY` that names a `regtype` item of
+/// its select list, by position (`ORDER BY 1`) or by alias (`ORDER BY n`),
+/// written as the column that item casts: the oid, which is what PostgreSQL
+/// sorts a `regtype` by. `Ok(None)` when it has none; refused in a grouped
+/// query or a set operation ([`regtype_order_refusal`]).
+fn regtype_order_keys(sql: &str) -> Result<Option<String>, (&'static str, String)> {
+    use crate::core::rql::join::find_keyword;
+    use crate::core::sql_scan::{split_top_level, starts_with_keyword};
+    let Some(select) = find_keyword(sql, "SELECT", 0) else {
+        return Ok(None);
+    };
+    let Some(order) = order_by_clauses(sql).into_iter().filter(|c| c.top && c.keys.start > select).last() else {
+        return Ok(None);
+    };
+    let list_start = select + "SELECT".len();
+    let list_end = find_keyword(sql, "FROM", list_start).filter(|at| *at < order.keys.start).unwrap_or(order.keys.start);
+    // The select list's regtype items: position, the column cast, its name.
+    let mut items: Vec<(usize, &str, &str)> = Vec::new();
+    for (at, item) in split_top_level(&sql[list_start..list_end], b',').into_iter().enumerate() {
+        let item = if at == 0 && starts_with_keyword(item, "DISTINCT") { item[8..].trim_start() } else { item };
+        let Some((operand, rest)) = item.split_once("::") else {
+            continue;
+        };
+        let operand = operand.trim_end();
+        let name = operand.bytes().all(|b| is_identifier_byte(b) || b == b'.' || b == b'"')
+            && operand.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == '"');
+        let rest = rest.trim_start();
+        if !name || !starts_with_keyword(rest, "regtype") {
+            continue;
+        }
+        let tail = rest["regtype".len()..].trim();
+        if tail.starts_with("::") {
+            continue;
+        }
+        let alias = if starts_with_keyword(tail, "AS") { tail[2..].trim() } else { tail };
+        let alias = if alias.is_empty() { operand.rsplit('.').next().unwrap_or(operand) } else { alias };
+        items.push((at + 1, operand, alias));
+    }
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let mut edits: Vec<(std::ops::Range<usize>, &str)> = Vec::new();
+    for key in split_top_level(&sql[order.keys.clone()], b',') {
+        // The key without its direction.
+        let mut core = key.trim_end();
+        while let Some(at) = core.rfind(|c: char| c.is_ascii_whitespace()) {
+            let word = &core[at + 1..];
+            if ["ASC", "DESC", "NULLS", "FIRST", "LAST"].iter().any(|w| word.eq_ignore_ascii_case(w)) {
+                core = core[..at].trim_end();
+            } else {
+                break;
+            }
+        }
+        let item = match core.parse::<usize>() {
+            Ok(position) => items.iter().find(|(at, _, _)| *at == position),
+            Err(_) => items.iter().find(|(_, _, alias)| alias.eq_ignore_ascii_case(core)),
+        };
+        let Some((_, operand, _)) = item else {
+            continue;
+        };
+        if order.grouped {
+            return Err(regtype_order_refusal());
+        }
+        let start = core.as_ptr() as usize - sql.as_ptr() as usize;
+        edits.push((start..start + core.len(), operand));
+    }
+    if edits.is_empty() {
+        return Ok(None);
+    }
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut copied = 0usize;
+    for (range, operand) in edits {
+        out.push_str(&sql[copied..range.start]);
+        out.push_str(operand);
+        copied = range.end;
+    }
+    out.push_str(&sql[copied..]);
+    Ok(Some(out))
 }
 
 /// `sql` with each `column::regtype` as the type's name, `None` when it has
@@ -141,8 +309,15 @@ pub(crate) fn rewrite(
 /// it the value is the column itself. It was "cast to 'regtype' is not
 /// supported yet" outside a catalogue statement. A whole select item keeps
 /// the column's name, as PostgreSQL names a cast column.
-fn column_regtype_casts(sql: &str) -> Option<String> {
+fn column_regtype_casts(sql: &str) -> Result<Option<String>, (&'static str, String)> {
     const CAST: &str = "regtype";
+    if !crate::core::sql_scan::contains_ignore_ascii_case(sql, CAST.as_bytes()) {
+        return Ok(None);
+    }
+    // A key that names a regtype item by position or alias, as the column.
+    let keyed = regtype_order_keys(sql)?;
+    let sql = keyed.as_deref().unwrap_or(sql);
+    let order_by = order_by_clauses(sql);
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len() + 32);
     let (mut copied, mut i) = (0usize, 0usize);
@@ -184,14 +359,22 @@ fn column_regtype_casts(sql: &str) -> Option<String> {
         // (`t::regtype = 'integer'::regtype`).
         let next = sql[cast_end..].trim_start();
         let keyword = |text: &str, words: &[&str]| words.iter().any(|w| crate::core::sql_scan::starts_with_keyword(text, w));
-        let compared = ["=", "<>", "!="].iter().any(|op| next.starts_with(op) || before[..start].trim_end().ends_with(op))
+        // The order of two regtypes is their oids' too (`<`, `>=`).
+        let compared = ["=", "<", ">", "!="].iter().any(|op| next.starts_with(op) || before[..start].trim_end().ends_with(op))
             || keyword(next, &["IN"])
             || (keyword(next, &["NOT"]) && keyword(next[3..].trim_start(), &["IN"]));
+        // An `ORDER BY` key, a query's, a window's or an aggregate's:
+        // PostgreSQL sorts a regtype by its oid. As the name it sorted
+        // `99999`, `boolean`, `integer`, where PostgreSQL has `boolean`
+        // (16), `integer` (23), … `99999`.
+        let sorted = order_by.iter().find(|clause| clause.keys.contains(&start));
         let (replacement, end) = match next.strip_prefix("::").map(str::trim_start) {
             Some(rest) if keyword(rest, &["oid"]) => (operand.to_string(), sql.len() - rest.len() + 3),
             Some(rest) if keyword(rest, &["bigint", "int8", "integer", "int4", "int"]) => (operand.to_string(), cast_end),
             Some(_) => (format!("__regtype_name({operand})"), cast_end),
             None if compared => (operand.to_string(), cast_end),
+            None if sorted.is_some_and(|clause| clause.grouped) => return Err(regtype_order_refusal()),
+            None if sorted.is_some() => (operand.to_string(), cast_end),
             None => (format!("__regtype_name({operand})"), cast_end),
         };
         let alias = if crate::core::sql_scan::whole_select_item(sql, start, end) {
@@ -207,10 +390,10 @@ fn column_regtype_casts(sql: &str) -> Option<String> {
         i = end;
     }
     if copied == 0 {
-        return None;
+        return Ok(keyed);
     }
     out.push_str(&sql[copied..]);
-    Some(out)
+    Ok(Some(out))
 }
 
 /// `sql` with each bare integer cast to `regtype` or `regclass` quoted
@@ -611,6 +794,48 @@ mod tests {
             Some("SELECT 1 FROM regs WHERE y = 23 AND 25 <> x1 AND y IN (23, 25)")
         );
         assert_eq!(r("SELECT y::regtype::bigint FROM regs").as_deref(), Some("SELECT y::bigint FROM regs"));
+        // Sorted, a regtype is its oid: as a key, by position, by alias, in
+        // a window and in an aggregate; the name where it is shown.
+        assert_eq!(
+            r("SELECT id, y::regtype FROM regs ORDER BY y::regtype DESC NULLS LAST, id LIMIT 2").as_deref(),
+            Some("SELECT id, __regtype_name(y) AS y FROM regs ORDER BY y DESC NULLS LAST, id LIMIT 2")
+        );
+        assert_eq!(
+            r("SELECT t.y::regtype AS n, id FROM regs t ORDER BY 1 DESC, 2").as_deref(),
+            Some("SELECT __regtype_name(t.y) AS n, id FROM regs t ORDER BY t.y DESC, 2")
+        );
+        assert_eq!(
+            r("SELECT y::regtype AS n FROM regs ORDER BY N").as_deref(),
+            Some("SELECT __regtype_name(y) AS n FROM regs ORDER BY y")
+        );
+        assert_eq!(
+            r("SELECT rank() OVER (PARTITION BY g ORDER BY y::regtype), array_agg(id ORDER BY y::regtype) FROM regs").as_deref(),
+            Some("SELECT rank() OVER (PARTITION BY g ORDER BY y), array_agg(id ORDER BY y) FROM regs")
+        );
+        assert_eq!(
+            r("SELECT 1 FROM regs WHERE y::regtype < 'text'::regtype AND 'bool'::regtype <= y::regtype").as_deref(),
+            Some("SELECT 1 FROM regs WHERE y < 25 AND 16 <= y")
+        );
+        // By its name where that is asked for, and other keys untouched.
+        assert_eq!(
+            r("SELECT y::regtype::text AS n, id FROM regs ORDER BY 1, id").as_deref(),
+            Some("SELECT __regtype_name(y)::text AS n, id FROM regs ORDER BY 1, id")
+        );
+        assert_eq!(
+            r("SELECT id, y::regtype FROM regs ORDER BY 1 LIMIT 3").as_deref(),
+            Some("SELECT id, __regtype_name(y) AS y FROM regs ORDER BY 1 LIMIT 3")
+        );
+        // Grouped, or a set operation: refused rather than sorted by name.
+        for sql in [
+            "SELECT y::regtype, count(*) FROM regs GROUP BY y::regtype ORDER BY 1",
+            "SELECT y::regtype AS n, count(*) FROM regs GROUP BY 1 ORDER BY n",
+            "SELECT y::regtype, count(*) FROM regs GROUP BY y::regtype ORDER BY y::regtype",
+            "SELECT y::regtype FROM regs UNION SELECT x1::regtype FROM regs ORDER BY 1",
+        ] {
+            assert_eq!(rewrite(sql, &|_| true, &|_| false).map_err(|(code, _)| code), Err("0A000"), "{sql}");
+        }
+        // A grouped query sorted by something else is not.
+        assert!(rewrite("SELECT y::regtype, count(*) FROM regs GROUP BY y::regtype ORDER BY 2", &|_| true, &|_| false).is_ok());
         // Characters wider than a byte around the cast.
         assert_eq!(
             r("SELECT 'é', y::regtype AS \"ü\" FROM regs WHERE n = 'ß€' AND 7::regtype = 7").as_deref(),

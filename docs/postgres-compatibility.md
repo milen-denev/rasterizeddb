@@ -1454,9 +1454,10 @@ source) all run now and are no longer gaps. What is still missing:
   PostgreSQL prints `$12.50`. `'nosuch'::regclass` is not refused (42P01 in
   PostgreSQL): a sequence's name is not known to the text pass that reads
   the cast. `::regtype` over a column (`atttypid::regtype`) is the type's
-  name, and sorts as that text where PostgreSQL sorts a `regtype` by its
-  oid; over any other expression (`(a + 1)::regtype`, `f(a)::regtype`) it is
-  not supported.
+  name, and sorts and compares by its oid as in PostgreSQL, except as an
+  `ORDER BY` key of a grouped query or a set operation, which is refused
+  (0A000) rather than sorted by the name; over any other expression
+  (`(a + 1)::regtype`, `f(a)::regtype`) it is not supported.
 - **DDL**: `CREATE TABLE … (LIKE t INCLUDING …)`, `UNIQUE NULLS NOT DISTINCT`,
   `PARTITION BY RANGE`/`LIST` (tables partition by `HASH` only), and
   `UPDATE … SET a[1] = …`.
