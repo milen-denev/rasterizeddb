@@ -90,8 +90,8 @@ The convention, from [[new-features-behind-cargo-features]] and
 
 | Crate | Feature | Gates | New crates | Default |
 |---|---|---|---|---|
-| **`rasterized_router`** (new workspace member) | none | `xxh64`, key framing, `level_hash`, point assembly, `PointRange`, `RangeMap`, the shard-map codec | none | always built: core's partitioning depends on it |
-| `rasterizeddb_client` | `sharding` | the `shard` module (map, router, fan-out, health, epoch check); the ORM's sharded surface (`ShardedModelExt` on `Router`, fan-out `Select`, sharded `Cached`/`KvRepo`, `Migrator::run_sharded`); the `rdb-shard` tool (behind `required-features`) | `rasterized_router` only | yes, beside `derive` |
+| **`rasterizeddb_router`** (new workspace member) | none | `xxh64`, key framing, `level_hash`, point assembly, `PointRange`, `RangeMap`, the shard-map codec | none | always built: core's partitioning depends on it |
+| `rasterizeddb_client` | `sharding` | the `shard` module (map, router, fan-out, health, epoch check); the ORM's sharded surface (`ShardedModelExt` on `Router`, fan-out `Select`, sharded `Cached`/`KvRepo`, `Migrator::run_sharded`); the `rdb-shard` tool (behind `required-features`) | `rasterizeddb_router` only | yes, beside `derive` |
 | `rasterizeddb_client_derive` | none | emits `Model::SHARD` and `shard_key()` for every model; plain data with no routing code, so a client built without `sharding` still compiles derived models | none | — |
 | `rasterizeddb_core` | `sharding` | `core/shard/*` (map, ownership log, admission, classifier, rshard, gateway), the ownership guard, `--role`/`--cluster-map`/`--shard-id`, `SHOW SHARDS`, cluster DDL | none (rastcp, rustls and the tree's xxh64 cover it) | yes; dormant without `--role` |
 | `rasterizeddb_core` | `sharding_raft` = `["sharding", "dep:openraft"]` | phase 3: log store, state machine, capture sink, apply loop, ReadIndex, learners | `openraft` (exact pin) | after phase 3's gate |
@@ -133,7 +133,7 @@ The convention, from [[new-features-behind-cargo-features]] and
              └─ ShardMap (epoch, digest, level-0 blocks → shard)
 ```
 
-### A1. The `rasterized_router` crate
+### A1. The `rasterizeddb_router` crate
 
 - **What moves out of core:**
   - `core/hash/xxh64.rs` (the in-tree reference XXH64);
@@ -264,7 +264,7 @@ fn shard_key(&self) -> Option<ShardKey<'_>>;  // the field's family + normalized
     (v7) or, once Track B lands, the engine's shard-prefixed `BIGSERIAL`
     (B1a.9).
 - **No hashing in the derive.** `ShardKey` is a small ungated type in the
-  client (`family` + bytes, mirroring `rasterized_router`'s families). The
+  client (`family` + bytes, mirroring `rasterizeddb_router`'s families). The
   hashing happens only in the `sharding` module, so a build without the
   feature carries no routing code.
 
@@ -379,11 +379,11 @@ in the default database.
 
 ### A8. sqlx / tokio-postgres consumers
 
-- An app holds `Vec<PgPool>` plus `rasterized_router`, and calls
+- An app holds `Vec<PgPool>` plus `rasterizeddb_router`, and calls
   `pool_for(map, key)`.
 - Bound parameters are coerced to the column type on the server, so hashing
   the Rust value under the column's family matches the engine.
-- The deliverable is an example in `rasterized_router/examples/`, not a
+- The deliverable is an example in `rasterizeddb_router/examples/`, not a
   crate.
 
 ### A9. Track A tests and exit
@@ -464,7 +464,7 @@ shards on one machine are several processes, as the design says.
 
 | File | What |
 |---|---|
-| `map.rs` | `ShardMap` over `rasterized_router::RangeMap`: epoch, `route_v`, ranges → `(ShardId, owner_epoch)`, `validate` (total, disjoint, `BLOCK`-aligned) |
+| `map.rs` | `ShardMap` over `rasterizeddb_router::RangeMap`: epoch, `route_v`, ranges → `(ShardId, owner_epoch)`, `validate` (total, disjoint, `BLOCK`-aligned) |
 | `ownership.rs` | `db_shard_ownership.log` on `core/framed_log.rs`: `ACQUIRE`, `RELEASE`, `INCOMING`, `FENCE`, `EVICTED`; `ArcSwap<OwnedRanges>` published only from accepted map + ownership records together |
 | `admission.rs` | one function every request passes: placement generation, `(range, owner_epoch)` Owned and named by the accepted map, schema epoch, per-range admission lease |
 | `guard.rs` | the ownership write guard (one comparison against the `ArcSwap`); `()` without the feature |
