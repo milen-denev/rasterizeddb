@@ -14969,7 +14969,7 @@ fn check_constraints_hold(
     }
     let row = &row;
 
-    for constraint in &schema.checks {
+    for (at, constraint) in schema.checks.iter().enumerate() {
         if constraint.is_deleted {
             continue;
         }
@@ -14992,9 +14992,23 @@ fn check_constraints_hold(
         match compiled.violated(row, &schema.fields, table_name, &constraint.name) {
             Ok(false) => {}
             Ok(true) => {
+                // The row is refused; under which name is PostgreSQL's
+                // choice (`check_reported_before`). Only now, on the way
+                // out, are the checks after this one judged.
+                let mut reported = constraint.name.as_str();
+                for later in schema.checks[at + 1..].iter().filter(|c| !c.is_deleted) {
+                    if check_reported_before(&later.name, reported)
+                        && compile_check_cached(&later.expression, &schema.fields).is_ok_and(|compiled| {
+                            !matches!(compiled.as_ref(), CompiledCheck::Unenforced(_))
+                                && matches!(compiled.violated(row, &schema.fields, table_name, &later.name), Ok(true))
+                        })
+                    {
+                        reported = later.name.as_str();
+                    }
+                }
                 return Err(format!(
                     "new row for relation \"{}\" violates check constraint \"{}\"",
-                    table_name, constraint.name
+                    table_name, reported
                 ));
             }
             // A check that cannot be evaluated for this row fails the
@@ -15003,6 +15017,18 @@ fn check_constraints_hold(
         }
     }
     Ok(())
+}
+
+/// Whether a row that breaks both checks is reported under `name` rather
+/// than under `other`. PostgreSQL judges a row's checks in the order of
+/// their names, byte by byte (`t_a_check` before `t_check`, an upper-case
+/// name before a lower-case one), and stops at the first it breaks; a
+/// domain's, judged when the value is made one, come before the table's.
+/// Checks here are judged in the order written, so a row breaking several
+/// was reported under the first written.
+fn check_reported_before(name: &str, other: &str) -> bool {
+    let table_level = |n: &str| !n.starts_with(crate::core::rql::domains::CONSTRAINT_PREFIX);
+    (table_level(name), name.as_bytes()) < (table_level(other), other.as_bytes())
 }
 
 /// The failure of a check that could not be evaluated for a row, with its
@@ -15587,104 +15613,44 @@ fn compile_check_lowered(
     })
 }
 
-/// Refuses an `UPDATE` whose assignments violate a `CHECK`.
-///
-/// Only the constraints whose every column the statement assigns can be judged:
-/// `UPDATE t SET status = 99` supplies everything `CHECK (status BETWEEN 1 AND
-/// 10)` reads, while `UPDATE t SET lo = 5` supplies half of
-/// `CHECK (lo < hi)` and the other half is in a row this has not read.
-///
-/// The rest, every check that also reads a column the statement leaves alone
-/// or assigns an expression, are judged row by row by the write, against the
-/// row as it will be stored ([`UpdateRowChecks`]). They used to go unjudged:
-/// `UPDATE t SET lo = 5` under `CHECK (lo < hi)` stored a row with `hi` 3 and
-/// reported success.
-#[inline(never)]
-fn check_constraints_hold_for_update(
-    table_name: &str,
-    schema: &crate::core::row::schema::TableSchema,
-    plan: &crate::core::rql::lexer_ur::UpdateRow,
-) -> Result<(), String> {
-    if schema.checks.is_empty() {
-        return Ok(());
-    }
-
-    let assigned: std::collections::HashSet<u64> =
-        plan.updates.iter().map(|p| p.write_order as u64).collect();
-    // A column assigned an expression of the row, `q = q + 1` or a recomputed
-    // generated column, holds an empty placeholder in the plan. Its value
-    // exists only once the row is read, so a check reading it is judged by the
-    // write instead; see `UpdateRowChecks`.
-    let computed: std::collections::HashSet<u64> =
-        plan.expressions.iter().map(|(wo, _)| *wo as u64).collect();
-
-    let mut candidate = crate::core::row::row::Row::default();
-    for payload in &plan.updates {
-        candidate.columns.push(crate::core::row::row::Column {
-            schema_id: crate::core::row::row::schema_id_of(payload.write_order as u64),
-            data: payload.data.clone(),
-            column_type: payload.column_type.clone(),
-        });
-    }
-
-    for constraint in schema.checks.iter().filter(|c| !c.is_deleted) {
-        let Ok(compiled) = compile_check(&constraint.expression, &schema.fields) else {
-            continue;
-        };
-        // Every column the check reads has to be one this statement assigns,
-        // or the row it would be judged against is incomplete.
-        let columns = compiled.columns(&schema.fields);
-        if columns.is_empty() || !columns.iter().all(|f| assigned.contains(&f.write_order)) {
-            continue;
-        }
-        if columns.iter().any(|f| computed.contains(&f.write_order)) {
-            continue;
-        }
-
-        if compiled
-            .violated(&candidate, &schema.fields, table_name, &constraint.name)
-            .map_err(|reason| check_evaluation_failed(&constraint.name, table_name, &reason))?
-        {
-            return Err(format!(
-                "new row for relation \"{}\" violates check constraint \"{}\"",
-                table_name, constraint.name
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// The `CHECK`s an `UPDATE` can only judge row by row, compiled once for the
+/// The `CHECK`s an `UPDATE` can change the answer of, compiled once for the
 /// statement and judged by the write against each row as it will be stored.
 ///
-/// These are the checks [`check_constraints_hold_for_update`] leaves out
-/// because a column they read is assigned an expression of the row. The rule
-/// for which checks are enforced on update is otherwise the same: every column
-/// a check reads has to be assigned, so `CHECK (lo < hi)` under `SET lo = lo
-/// + 1` is still not judged. A generated column the statement recomputes
-/// counts as assigned, which is what makes `CHECK (tot >= 0)` on `tot = q * p`
-/// enforceable under `SET q = 5`.
+/// Every check that reads an assigned column is here, whatever it is
+/// assigned: a constant, an expression of the row, or a generated column the
+/// statement recomputes (which is what makes `CHECK (tot >= 0)` on `tot = q
+/// * p` enforceable under `SET q = 5`). A check reading none held before and
+/// still does.
+///
+/// A check whose every column is assigned a constant used to be judged
+/// before the scan, on the assignments alone. That refused a statement that
+/// writes nothing: `UPDATE t SET status = 99 WHERE id = 0` failed its check
+/// with no row to break it, where PostgreSQL answers `UPDATE 0`. Its answer
+/// is the same for every row, so it is judged with the first row written and
+/// not again ([`Self::constants_hold`]).
 pub(crate) struct UpdateRowChecks {
-    /// Each check's name, compiled.
-    checks: Vec<(String, CompiledCheck)>,
+    /// Each check's name, compiled, and whether every column it reads is
+    /// assigned a constant.
+    checks: Vec<(String, CompiledCheck, bool)>,
+    /// Set once a row has passed every check: the constant ones need no
+    /// second look.
+    constants_hold: std::sync::atomic::AtomicBool,
 }
 
 impl UpdateRowChecks {
     /// Empty unless the table has a check this statement's assignments can
-    /// change and [`check_constraints_hold_for_update`] cannot judge alone.
+    /// change.
     pub(crate) fn compile(
         schema: &crate::core::row::schema::TableSchema,
         updates: &[crate::core::row::row::ColumnWritePayload],
         expressions: &[(u32, crate::core::rql::expr::Expr)],
     ) -> Self {
-        let mut out = UpdateRowChecks { checks: Vec::new() };
+        let mut out = UpdateRowChecks { checks: Vec::new(), constants_hold: std::sync::atomic::AtomicBool::new(false) };
         if schema.checks.is_empty() {
             return out;
         }
 
         for constraint in schema.checks.iter().filter(|c| !c.is_deleted) {
-            // Compiled as `check_constraints_hold_for_update` compiles it, so
-            // the two agree on which checks each one judges.
             let Ok(compiled) = compile_check(&constraint.expression, &schema.fields) else {
                 continue;
             };
@@ -15692,15 +15658,14 @@ impl UpdateRowChecks {
             let assigned = |wo: u64| updates.iter().any(|u| u.write_order as u64 == wo);
             let computed = |wo: u64| expressions.iter().any(|(e, _)| *e as u64 == wo);
             // A check reading no assigned column held before and still does.
-            // One whose every column is assigned a constant was judged before
-            // the scan. Every other one needs the stored row: a column it
-            // reads is left alone, or assigned an expression of the row.
-            let judged_up_front = columns.iter().all(|f| assigned(f.write_order))
-                && !columns.iter().any(|f| computed(f.write_order));
-            if columns.is_empty() || !columns.iter().any(|f| assigned(f.write_order)) || judged_up_front {
+            if columns.is_empty() || !columns.iter().any(|f| assigned(f.write_order)) {
                 continue;
             }
-            out.checks.push((constraint.name.clone(), compiled));
+            // A column assigned an expression of the row, `q = q + 1` or a
+            // recomputed generated column, holds an empty placeholder in the
+            // plan: its value exists only once the row is read.
+            let constant = columns.iter().all(|f| assigned(f.write_order)) && !columns.iter().any(|f| computed(f.write_order));
+            out.checks.push((constraint.name.clone(), compiled, constant));
         }
         out
     }
@@ -15721,6 +15686,8 @@ impl UpdateRowChecks {
         if self.checks.is_empty() {
             return Ok(());
         }
+        use std::sync::atomic::Ordering;
+        let constants_hold = self.constants_hold.load(Ordering::Relaxed);
         let mut row = crate::core::row::row::Row::default();
         for payload in payloads {
             row.columns.push(crate::core::row::row::Column {
@@ -15729,17 +15696,33 @@ impl UpdateRowChecks {
                 column_type: payload.column_type.clone(),
             });
         }
-        for (name, compiled) in &self.checks {
+        for (at, (name, compiled, constant)) in self.checks.iter().enumerate() {
+            if *constant && constants_hold {
+                continue;
+            }
             match compiled.violated(&row, fields, table_name, name) {
                 Ok(false) => {}
                 Ok(true) => {
+                    // Under the name PostgreSQL reports
+                    // (`check_reported_before`).
+                    let mut reported = name.as_str();
+                    for (later, compiled, _) in &self.checks[at + 1..] {
+                        if check_reported_before(later, reported)
+                            && matches!(compiled.violated(&row, fields, table_name, later), Ok(true))
+                        {
+                            reported = later.as_str();
+                        }
+                    }
                     return Err(format!(
                         "new row for relation \"{}\" violates check constraint \"{}\"",
-                        table_name, name
+                        table_name, reported
                     ));
                 }
                 Err(reason) => return Err(check_evaluation_failed(name, table_name, &reason)),
             }
+        }
+        if !constants_hold {
+            self.constants_hold.store(true, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -23457,15 +23440,9 @@ pub(crate) async fn execute_with_need(
                 return ddl_error(&e);
             }
 
-            // A `CHECK` the assignments can be judged against on their own.
-            // The values are the ones the plan already encoded, so this reads
-            // exactly what the write will store.
-            if let Err(e) =
-                check_constraints_hold_for_update(&table_name, &table.schema, &update_plan)
-            {
-                error!("{}", e);
-                return ddl_error(&e);
-            }
+            // Every `CHECK` is judged by the write, against each row as it
+            // will be stored (`UpdateRowChecks`): a statement that writes no
+            // row breaks none.
 
             // A partitioned table's rows are in its partitions (§9): `table`
             // above is its shell, whose schema every check so far read.

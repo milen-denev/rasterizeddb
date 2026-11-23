@@ -6507,8 +6507,8 @@ impl<S: StorageIO> Table<S> {
             .and_then(|m| crate::core::rql::executor::RowMarker::for_table(&self.schema, &m));
         // Applied only after each batch's commit — see `PendingFilterOp`.
         let mut pending_filters: Vec<PendingFilterOp> = Vec::new();
-        // The checks that read an expression's result, which the statement
-        // could not judge before the rows were read.
+        // Every check the assignments can change the answer of, judged
+        // against each row as it will be stored.
         let row_checks =
             crate::core::rql::executor::UpdateRowChecks::compile(&self.schema, updates, expressions);
 

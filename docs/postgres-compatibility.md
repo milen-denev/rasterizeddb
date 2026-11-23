@@ -650,7 +650,11 @@ passes, so `CHECK (x > 0)` and `CHECK (x IS NULL OR x > 0)` both take a NULL
 `x`. It is judged on `INSERT`, on `UPDATE` (against the row as it will be
 stored) and over the stored rows by `ALTER TABLE … ADD CONSTRAINT … CHECK`,
 all three the same way: a row violates the check when `NOT (check)` holds,
-evaluated as a `WHERE` clause would be.
+evaluated as a `WHERE` clause would be. An `UPDATE` is judged on the rows it
+writes, so one that matches no row breaks no check. A row that breaks several
+checks is reported under the first by name, as PostgreSQL reports it, and an
+unnamed check takes PostgreSQL's name (`t_check`, `t_check1`,
+`t_<column>_check`).
 
 Accepted forms include what `pg_dump` writes — `((status = ANY
 (ARRAY['a'::text, 'b'::text])))`, a varchar column's `((status)::text = ANY
@@ -1453,15 +1457,10 @@ source) all run now and are no longer gaps. What is still missing:
   name, and sorts as that text where PostgreSQL sorts a `regtype` by its
   oid; over any other expression (`(a + 1)::regtype`, `f(a)::regtype`) it is
   not supported.
-- **DDL**: a row that breaks several `CHECK` constraints at once is
-  reported under the first one written, where PostgreSQL names the first by
-  name (an unnamed check's name is PostgreSQL's: `t_check`, `t_check1`,
-  `t_<column>_check`). `CREATE TABLE … (LIKE t INCLUDING …)`, `UNIQUE NULLS NOT DISTINCT`,
+- **DDL**: `CREATE TABLE … (LIKE t INCLUDING …)`, `UNIQUE NULLS NOT DISTINCT`,
   `PARTITION BY RANGE`/`LIST` (tables partition by `HASH` only), and
   `UPDATE … SET a[1] = …`.
-- **Queries**: `EXISTS` or `ARRAY` over a set operation whose branches have
-  no `FROM` (`EXISTS (SELECT 1 EXCEPT SELECT 1)`), a correlated `EXISTS` over
-  a set operation, a `UNION` of a `NUMERIC` column with a branch that has no
+- **Queries**: a `UNION` of a `NUMERIC` column with a branch that has no
   `FROM` and computes its value (`… UNION ALL SELECT 9, round(2.567, 1)`,
   refused, 0A000; a constant or a typed NULL, `NULL::numeric`, works), an
   outer column
