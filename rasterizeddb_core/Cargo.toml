@@ -167,6 +167,12 @@ harness = false
 name = "vacuum_benchmarks"
 harness = false
 
+[[example]]
+name = "kv_table_bench"
+# It places tables on a key/value store (`STORAGE ADD STORE`, `STORAGE
+# PLACE TABLE`, `core::storage`), which only `kv_storage` builds.
+required-features = ["kv_storage"]
+
 [features]
 default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3", "query_stats", "kv_cache", "persistent_indexes", "mysql_wire", "mssql_wire", "db_branching"]
 enable_long_row = []
