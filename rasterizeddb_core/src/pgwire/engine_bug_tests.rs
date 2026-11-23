@@ -1154,3 +1154,63 @@ async fn a_foreign_key_is_checked_on_the_row_the_insert_writes() {
     .await
     .expect("bounded");
 }
+
+/// A volatile call in a condition is evaluated for each row it judges, as
+/// PostgreSQL evaluates it: `nextval` in a WHERE was folded into one value
+/// for the statement (`WHERE n < nextval('q') + 100000` over four rows drew
+/// one value, not four), and over a scan's workers it had no sequence to draw
+/// from. `clock_timestamp()` in a WHERE was refused (0A000), and `random()`
+/// or `nextval` in a join's WHERE too ("references no column"). Every answer
+/// is PostgreSQL 17's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_volatile_call_in_a_condition_is_evaluated_per_row() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        ok(&db, &mut s, "CREATE TABLE t (id int PRIMARY KEY, n int)").await;
+        ok(&db, &mut s, "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3), (4, NULL)").await;
+        ok(&db, &mut s, "CREATE SEQUENCE q START 1").await;
+        let at = |rows: &[&str], tag: &str| -> Result<(Vec<String>, String), String> {
+            Ok((rows.iter().map(|r| r.to_string()).collect(), tag.to_string()))
+        };
+        for (sql, expected) in [
+            ("SELECT count(*) FROM t WHERE n < nextval('q') + 100000", at(&["3"], "SELECT 1")),
+            ("SELECT nextval('q')", at(&["5"], "SELECT 1")),
+            ("SELECT currval('q')", at(&["5"], "SELECT 1")),
+            ("SELECT id FROM t WHERE nextval('q') < 10 ORDER BY id", at(&["1", "2", "3", "4"], "SELECT 4")),
+            ("SELECT currval('q')", at(&["9"], "SELECT 1")),
+            ("SELECT count(*) FROM t WHERE nextval('q') > 0", at(&["4"], "SELECT 1")),
+            ("SELECT nextval('q')", at(&["14"], "SELECT 1")),
+            ("UPDATE t SET n = n WHERE nextval('q') > 0", at(&[], "UPDATE 4")),
+            ("SELECT nextval('q')", at(&["19"], "SELECT 1")),
+            // Not a point lookup: the key is a new value for each row.
+            ("UPDATE t SET n = 5 WHERE id = nextval('q') - 100", at(&[], "UPDATE 0")),
+            ("DELETE FROM t WHERE id = nextval('q')", at(&[], "DELETE 0")),
+            ("SELECT nextval('q')", at(&["28"], "SELECT 1")),
+            ("SELECT count(*) FROM t a JOIN t b ON a.id = b.id WHERE nextval('q') > 0", at(&["4"], "SELECT 1")),
+            ("SELECT nextval('q')", at(&["33"], "SELECT 1")),
+            ("INSERT INTO t SELECT id + 10, n FROM t WHERE nextval('q') > 0", at(&[], "INSERT 0 4")),
+            ("SELECT nextval('q')", at(&["38"], "SELECT 1")),
+            // Eight values in a row: four of them even, whichever row takes which.
+            ("DELETE FROM t WHERE nextval('q') % 2 = 0", at(&[], "DELETE 4")),
+            ("SELECT count(*) FROM t", at(&["4"], "SELECT 1")),
+            ("SELECT nextval('q')", at(&["47"], "SELECT 1")),
+            ("SELECT count(*) FROM t WHERE setval('q', 100) > 0", at(&["4"], "SELECT 1")),
+            ("SELECT nextval('q')", at(&["101"], "SELECT 1")),
+            // The other volatile calls.
+            ("SELECT count(*) FROM t WHERE clock_timestamp() > now() - interval '1 hour'", at(&["4"], "SELECT 1")),
+            ("SELECT count(*) FROM t WHERE clock_timestamp() < now() - interval '1 hour'", at(&["0"], "SELECT 1")),
+            ("SELECT count(*) FROM t WHERE random() >= 0 AND random() < 1", at(&["4"], "SELECT 1")),
+            ("SELECT count(*) FROM t a JOIN t b ON a.id = b.id WHERE random() >= 0", at(&["4"], "SELECT 1")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        // The `SET` of one conflict's update still draws once.
+        ok(&db, &mut s, "INSERT INTO t VALUES (1, 0), (2, 0), (3, 0), (4, 0) ON CONFLICT DO NOTHING").await;
+        ok(&db, &mut s, "INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET n = nextval('q')").await;
+        assert_eq!(answer(&db, &mut s, "SELECT n FROM t WHERE id = 1").await, at(&["102"], "SELECT 1"));
+        assert_eq!(answer(&db, &mut s, "SELECT nextval('q')").await, at(&["103"], "SELECT 1"));
+    })
+    .await
+    .expect("bounded");
+}

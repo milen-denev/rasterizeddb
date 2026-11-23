@@ -84,8 +84,10 @@ pub fn on_thread<R>(clock: Option<StatementClock>, f: impl FnOnce() -> R) -> R {
 
 /// `f`, to be spawned, under the clock of the statement spawning it (if any):
 /// a worker evaluating `now()` for its rows reads the statement's instant.
+/// The statement's sequences go with it (`sequence::session::inherit`): a
+/// worker evaluating `nextval('s')` for its rows draws from them.
 pub fn inherit<F: Future>(f: F) -> impl Future<Output = F::Output> {
-    CLOCK.scope(current(), f)
+    CLOCK.scope(current(), crate::core::rql::sequence::session::inherit(f))
 }
 
 #[cfg(test)]

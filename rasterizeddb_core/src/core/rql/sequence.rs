@@ -685,6 +685,22 @@ pub mod session {
         SCOPE.scope(scope, fut).await
     }
 
+    /// `fut`, to be spawned, under the scope of the statement spawning it
+    /// (if any), as `statement_clock::inherit` carries the clock: a scan
+    /// worker judging `WHERE n < nextval('q')` for its rows draws from the
+    /// statement's sequences and records the values in its session. A
+    /// task-local does not cross `task::spawn`, so the call failed there
+    /// ("not available in this context").
+    pub fn inherit<F: std::future::Future>(fut: F) -> impl std::future::Future<Output = F::Output> {
+        let scope = SCOPE.try_with(Scope::clone).ok();
+        async move {
+            match scope {
+                Some(scope) => SCOPE.scope(scope, fut).await,
+                None => fut.await,
+            }
+        }
+    }
+
     /// The scope's database, when a statement set one.
     pub fn database() -> Option<u64> {
         SCOPE.try_with(|s| s.database).ok()

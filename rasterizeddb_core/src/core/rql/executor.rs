@@ -10335,7 +10335,7 @@ fn fold_where_constants_into(sql: &str, refused: &mut Option<String>) -> String 
     format!(
         "{}{}{}",
         &sql[..body_start],
-        fold_constants_in_predicate_into(&body[..end], refused),
+        fold_constants_in_predicate_into(&body[..end], refused, true),
         &body[end..]
     )
 }
@@ -10377,7 +10377,7 @@ fn fold_on_clauses(sql: &str, refused: &mut Option<String>) -> String {
         {
             out.push_str(&rest[..end]);
         } else {
-            out.push_str(&fold_constants_in_predicate_into(&rest[..end], refused));
+            out.push_str(&fold_constants_in_predicate_into(&rest[..end], refused, true));
         }
         cursor = start + end;
     }
@@ -10393,13 +10393,19 @@ fn fold_on_clauses(sql: &str, refused: &mut Option<String>) -> String {
 /// reference fails to resolve there — so that is what decides whether a term is
 /// folded or left alone.
 fn fold_constants_in_predicate(text: &str) -> String {
-    fold_constants_in_predicate_into(text, &mut None)
+    fold_constants_in_predicate_into(text, &mut None, false)
 }
 
 /// [`fold_constants_in_predicate`], noting in `refused` the first constant
 /// PostgreSQL would refuse to compute (see [`fold_where_constants_checked`]).
-fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) -> String {
-    fn fold_operand(operand: &str, refused: &mut Option<String>) -> String {
+///
+/// `per_row`: the text is a condition, evaluated once per row it judges (a
+/// `WHERE`, a join's `ON`), where a `nextval('s')` or `setval(…)` draws for
+/// every row as PostgreSQL's does, and so is left to the evaluator. Folded,
+/// `WHERE n < nextval('q') + 100000` over four rows drew one value, not four.
+/// Otherwise (the `SET` of one conflict's update) it is computed once here.
+fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>, per_row: bool) -> String {
+    fn fold_operand(operand: &str, refused: &mut Option<String>, per_row: bool) -> String {
         // The statement's own `;` is not part of its last operand: left on
         // it, `id <= 5 + 100;` (as pgbench and many drivers send it) and
         // `ts < NOW();` were never folded.
@@ -10414,7 +10420,11 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) ->
         let wrap = |value: String| format!("{}{}{}", lead, value, tail);
         // Asked by computing the operand, which a `nextval('s')` in it must
         // not be twice: the fold below computes it, once.
-        if !crate::core::rql::generated::moves_a_sequence(trimmed)
+        let moves_a_sequence = crate::core::rql::generated::moves_a_sequence(trimmed);
+        if per_row && moves_a_sequence {
+            return operand.to_string();
+        }
+        if !moves_a_sequence
             && let Some(e) = constant_refusal(trimmed)
         {
             refused.get_or_insert(e);
@@ -10586,7 +10596,7 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) ->
                 // same way.
                 if let Some((lead, inner, tail)) = parenthesised(term) {
                     out.push_str(lead);
-                    out.push_str(&fold_constants_in_predicate_into(inner, refused));
+                    out.push_str(&fold_constants_in_predicate_into(inner, refused, per_row));
                     out.push_str(tail);
                     continue;
                 }
@@ -10594,9 +10604,9 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) ->
                 // them is usually constant.
                 match find_comparison(term) {
                     Some((at, width)) => {
-                        let left = fold_operand(&term[..at], refused);
+                        let left = fold_operand(&term[..at], refused, per_row);
                         let op = &term[at..at + width];
-                        let right = fold_operand(&term[at + width..], refused);
+                        let right = fold_operand(&term[at + width..], refused, per_row);
                         // A number on the left of arithmetic over columns
                         // (`12 = v * 1`) is written the other way round: the
                         // predicate compiler reads arithmetic on the left

@@ -183,3 +183,23 @@ async fn sqlx_reads_sequence_values_as_bigint() {
     let row = sqlx::query("SELECT nextval('s') AS n, currval('s') AS c").fetch_one(&pool).await.expect("select");
     assert_eq!((row.get::<i64, _>("n"), row.get::<i64, _>("c")), (1, 1));
 }
+
+/// `nextval` in a condition draws once per row it judges, as PostgreSQL's
+/// does: it was folded into one value for the statement. Over both
+/// protocols; the extended one binds the rest of the condition.
+#[tokio::test(flavor = "multi_thread")]
+async fn nextval_in_a_where_draws_for_every_row() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    c.batch_execute("CREATE TABLE t (id INT PRIMARY KEY, n INT); INSERT INTO t VALUES (1, 1), (2, 2), (3, 3), (4, NULL); CREATE SEQUENCE q START 1")
+        .await
+        .expect("setup");
+    assert_eq!(rows(&c, "SELECT count(*) FROM t WHERE n < nextval('q') + 100000").await, ["3"]);
+    assert_eq!(rows(&c, "SELECT nextval('q')").await, ["5"]);
+    let bound = c.prepare("SELECT count(*) FROM t WHERE n < nextval('q') + $1::int4").await.expect("prepare");
+    let n: i64 = c.query_one(&bound, &[&100000i32]).await.expect("bound").get(0);
+    assert_eq!(n, 3);
+    assert_eq!(rows(&c, "SELECT nextval('q')").await, ["10"]);
+    assert_eq!(rows(&c, "DELETE FROM t WHERE id = nextval('q') - 100000 RETURNING id").await, Vec::<String>::new());
+    assert_eq!(rows(&c, "SELECT nextval('q')").await, ["15"]);
+}

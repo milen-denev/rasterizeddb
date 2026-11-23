@@ -3524,6 +3524,10 @@ fn needs_evaluator(text: &str) -> bool {
                     // evaluator knows, refused as an unknown column before.
                     || crate::core::rql::expr::is_function(word)
                         && text[end..].trim_start().starts_with('(')
+                    // `clock_timestamp()`, which no fold computes once (it
+                    // reads the wall clock at each call): the evaluator's,
+                    // as in a select list. Refused as an unknown keyword.
+                    || word.eq_ignore_ascii_case("CLOCK_TIMESTAMP") && text[end..].trim_start().starts_with('(')
                     || word.bytes().all(|b| b.is_ascii_digit() || b == b'.')
                         && literal_cast_in_arithmetic(text, i, end)
                 {
