@@ -1043,11 +1043,19 @@ async fn apply_one(
             // it again after a restart finds it done.
             if replication.routed_database().is_none() {
                 if let Some(op) = super::manager::CatalogOp::parse(statement) {
+                    // A node replicating its one database alone has no
+                    // catalogue to make it in: the change is passed over, as
+                    // a statement it cannot make, rather than holding up the
+                    // whole stream behind it.
                     let applied = match replication.catalog() {
                         Some(link) => link.apply(op).await,
-                        None => Err("this node cannot apply a catalogue change: its replication was started \
-                                     without its catalogue"
-                            .to_string()),
+                        None => {
+                            warn!(
+                                "Not applying {} from node {}: this node replicates its default database only",
+                                statement, record.origin
+                            );
+                            Ok(())
+                        }
                     };
                     match applied {
                         Ok(()) => continue,

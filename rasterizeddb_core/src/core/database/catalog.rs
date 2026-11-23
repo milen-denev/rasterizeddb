@@ -446,9 +446,15 @@ impl DatabaseCatalog {
         Ok(database)
     }
 
-    /// Whether the default database replicates, and so catalogue changes do.
-    fn replicating(&self) -> bool {
-        self.get(&self.default_name).is_some_and(|d| d.replication.is_active())
+    /// Whether catalogue changes replicate: the default database replicates,
+    /// and its replication was started with this catalogue
+    /// (`Database::start_replication_with`). A node replicating its one
+    /// database alone (started without the catalogue: embedded, tests)
+    /// announces nothing, as its peers could not make the change: a
+    /// database made there is its own, and pgwire says so.
+    pub(crate) fn replicating(&self) -> bool {
+        self.get(&self.default_name)
+            .is_some_and(|d| d.replication.is_active() && d.replication.catalog().is_some())
     }
 
     /// Where `name` lives: the root for the default database, a directory
@@ -521,10 +527,10 @@ impl DatabaseCatalog {
     /// on this node alone, as a failed `REPLICATION` capture does; the other
     /// order would have the peers make a change this node may then refuse.
     async fn replicate(&self, op: crate::replication::manager::CatalogOp, created: Option<&Arc<Database>>) {
-        let Some(default) = self.get(&self.default_name) else { return };
-        if !default.replication.is_active() {
+        if !self.replicating() {
             return;
         }
+        let Some(default) = self.get(&self.default_name) else { return };
         if let Some(database) = created {
             let config = default.replication.config();
             if let Err(e) = Database::start_routed_replication(database.clone(), op.name(), &config) {
