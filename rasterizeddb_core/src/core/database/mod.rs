@@ -6347,6 +6347,12 @@ async fn process_native_request(
     session: Option<&crate::pgwire::NativeSession>,
     request_vec: Vec<u8>,
 ) -> Vec<u8> {
+    // Counted as running until it is answered, as pgwire counts its own
+    // (`execute_recorded`): the idle trimmer trims after a quiet tick that
+    // follows a finished statement, and never under one. Uncounted, a
+    // process whose clients are all native (an embedded engine, a
+    // native-only server) was never trimmed and kept its high-water mark.
+    let _running = crate::idle_trim::statement();
     // Every branch but the plain statement's is boxed where it is awaited:
     // an async fn's future is as large as its largest await, so the rare
     // branches (the session's path, the role statements, the checkpoint),
