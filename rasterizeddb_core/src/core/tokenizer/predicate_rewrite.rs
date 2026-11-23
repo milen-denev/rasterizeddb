@@ -8516,8 +8516,12 @@ mod operand_guard_tests {
     /// In a list or a range, each comparison is guarded by its own operand.
     #[test]
     fn list_and_range_operands_guard_their_own_comparison() {
-        assert_eq!(rw("x IN (y, z)"), "(__null_x = 0 AND ((__null_y = 0 AND x = y) OR x = z))");
-        assert_eq!(rw("x NOT IN (y, 1)"), "(__null_x = 0 AND ((__null_y = 0 AND x != y) AND x != 1))");
+        // An IN list over integers is its comparisons before any guard goes
+        // in (`expand_expression_in_lists`), so `x`'s guard is written once
+        // per comparison: (A∧B)∨(A∧C), the same predicate as A∧(B∨C), NULLs
+        // included (a NULL `y` fails its own comparison only).
+        assert_eq!(rw("x IN (y, z)"), "( (__null_x = 0 AND (__null_y = 0 AND x = y)) OR (__null_x = 0 AND x = z) )");
+        assert_eq!(rw("x NOT IN (y, 1)"), "( (__null_x = 0 AND (__null_y = 0 AND x <> y)) AND (__null_x = 0 AND x <> 1) )");
         assert_eq!(rw("z BETWEEN x AND y"), "((__null_x = 0 AND z >= x) AND (__null_y = 0 AND z <= y))");
         assert_eq!(rw("NOT (z BETWEEN x AND y)"), "((__null_x = 0 AND z < x) OR (__null_y = 0 AND z > y))");
     }
