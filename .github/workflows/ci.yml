@@ -195,6 +195,18 @@ jobs:
           set -euo pipefail
           last() { git tag --list "$1" --sort=-v:refname | head -n1; }
           client="$(last 'client-v*')"; server="$(last 'server-v*')"
+          if [ -z "$client" ]; then
+            echo "::error::no client-v* tag in this checkout: there is no released client to compare with"
+            exit 1
+          fi
+          # A server-v* tag can lag its release commit: it is pushed only when
+          # the server crates publish (server-v1.0.0 waited for a crates.io
+          # name lock). Both channels released from one commit so far, so the
+          # client tag's sources are the server crates' last release too.
+          if [ -z "$server" ]; then
+            echo "::warning::no server-v* tag in this checkout; comparing the embedded SDK with $client instead"
+            server="$client"
+          fi
           echo "baselines: $client (client crates, rastcp), $server (embedded SDK)"
           cargo semver-checks --baseline-rev "$client" -p rastcp -p rasterizeddb_client -p rasterizeddb_client_derive
           cargo semver-checks --baseline-rev "$server" -p rasterizeddb_embedded
