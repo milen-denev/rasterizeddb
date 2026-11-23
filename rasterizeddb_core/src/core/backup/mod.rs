@@ -172,9 +172,30 @@ const EXCLUDED: &[&str] = &[
 /// rebuilds instead. `rdb.ixe` is kept: it is WAL'd.
 fn excluded_file(name: &str) -> bool {
     EXCLUDED.contains(&name)
+        || staging_copy(name)
         || crate::core::index_store::file_gate::INDEX_STORE_SUFFIXES
             .iter()
             .any(|s| name.ends_with(s))
+}
+
+/// A staging copy: every `.partial` file here is written, synced and renamed
+/// over the file it stands for within one operation, and one an open finds
+/// (a write cut before its rename) is deleted or ignored unread. DDL intents
+/// (`__create_….partial`), the log's floors (`rasterized.wal.floors.partial`)
+/// and marks (`….lsn.partial`, `….txn.partial`), the status log's rewrite.
+/// None has anything a restore could use, and each is routinely gone by the
+/// time a copy reaches it: a new database's first scheduled snapshot runs
+/// while start-up creates its catalogue tables and failed on two of them.
+fn staging_copy(name: &str) -> bool {
+    name.ends_with(".partial")
+}
+
+/// A DDL intent (`__create_….intent`, `__rewrite_….intent`, `__rename.intent`,
+/// ...). It is removed once its statement's commit point is durable, so one
+/// that disappears during a copy belongs to a statement that committed, which
+/// the log carries.
+fn intent_file(name: &str) -> bool {
+    name.starts_with("__") && name.ends_with(".intent")
 }
 
 /// S3 minimum for any part but the last.
@@ -3100,6 +3121,14 @@ impl DroppedDuringCopy {
         if error.kind() != io::ErrorKind::NotFound {
             return Err(error);
         }
+        if path.file_name().and_then(|n| n.to_str()).is_some_and(intent_file) {
+            info!(
+                "{} finished its statement while the snapshot copied it; left out, as the log \
+                 carries the statement",
+                path.display()
+            );
+            return Ok(());
+        }
         if self.explains(path) {
             info!(
                 "{} was dropped while the snapshot copied it; left out, as a restore empties \
@@ -3588,6 +3617,41 @@ mod tests {
         for name in ["rdb.ixe", "t.db", "t_pointers.db", "t_schema.db", "t.db.tmp", "t_ixs.db"] {
             assert!(!excluded_file(name), "{name} would be left out");
         }
+    }
+
+    /// A new database's first scheduled snapshot runs while start-up creates
+    /// its catalogue tables. It listed `__create_….partial`, the staging copy
+    /// of a create's intent, found it renamed away by the time it copied it,
+    /// and failed the whole snapshot. Staging copies are left out; an intent
+    /// that vanishes is a statement that committed and is left out too.
+    /// Mutations: `staging_copy` false; the `intent_file` arm in `leave_out`
+    /// removed.
+    #[test]
+    fn ddl_intents_coming_and_going_do_not_fail_a_snapshot() {
+        for name in [
+            "__create_21d12ae628b7226d.partial",
+            "__rename.partial",
+            "__txddl_9.partial",
+            "rasterized.wal.floors.partial",
+            "rasterized.wal.lsn.partial",
+            "rasterized.wal.txn.partial",
+        ] {
+            assert!(excluded_file(name), "{name} would be backed up");
+        }
+        for name in ["t.db", "__create_1.intent", "t.partial.db", "t.db.tmp", "rasterized.wal.lsn"] {
+            assert!(!excluded_file(name), "{name} would be left out");
+        }
+
+        let copy = DroppedDuringCopy { windows: Arc::new(HashMap::new()) };
+        let gone = || io::Error::new(io::ErrorKind::NotFound, "gone");
+        assert!(copy.leave_out(Path::new("/db/__create_21d12ae628b7226d.intent"), gone()).is_ok());
+        assert!(copy.leave_out(Path::new("/db/__rename.intent"), gone()).is_ok());
+        // Anything else that vanishes unexplained still fails the snapshot.
+        let e = copy.leave_out(Path::new("/db/orders.db"), gone()).unwrap_err();
+        assert!(e.to_string().contains("no DROP committed"), "{e}");
+        // And an intent that cannot be read for another reason is an error.
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        assert!(copy.leave_out(Path::new("/db/__create_1.intent"), denied).is_err());
     }
 
     #[test]

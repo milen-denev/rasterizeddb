@@ -570,8 +570,8 @@ fn place_table(tokens: &[String], database: &Arc<Database>) -> Result<Vec<String
              restart, a backup or a relocation"
         ),
         super::TableBackend::KeyValue(store) => format!(
-            "{table} will be created in key/value store '{store}' when it is created, and is \
-             not covered by backups or relocation"
+            "{table} will be created in key/value store '{store}' when it is created; a \
+             backup copies it as of each snapshot, with no point-in-time replay"
         ),
     }])
 }
