@@ -81,6 +81,8 @@ D1 and D6.
 | D7 | HA before phase 3 | Allow the **existing replication one-way per shard** as a warm standby with manual failover. It is statement-based, with known divergence risks (§4.3 B1a.13). The alternative is RF1 plus S3 restore. |
 | D8 | Default for a statement with no route key (`unrouted`, B1b) | **`refuse` by default.** Turn on `fan_out` per role (reporting, admin) or per gateway where the app expects it. A forgotten key then surfaces as an error instead of a silent whole-cluster scan. `unrouted_writes = each_shard` is never a gateway-wide default, because it is not atomic before 2PC |
 | D9 | User-based routing (G11): which modes, and the default | Build **both modes**. `user_routing = off` by default, `prefer` where tenants log in as their own roles. `user_key` is the one to choose when the data has a tenant column, because moves and fan-out keep working. `user_shard` is for apps whose tables have no tenant column |
+| D10 | Enterprise packaging | Whether `segregation_policies` (and possibly `tenant_isolation`) is an open feature or a licensed enterprise build is the owner's call. The code is separable either way, because each is its own Cargo feature |
+| D11 | HA for customer databases | Extend today's replication from the default database to every database (sooner, statement-based), or wait for B3's Raft. Recommendation: extend replication for the service's first customers, and move to Raft when B3 lands |
 
 ## 2. Cargo features
 
@@ -99,6 +101,9 @@ The convention, from [[new-features-behind-cargo-features]] and
 | `rasterizeddb_client_derive` | none | emits `Model::SHARD` and `shard_key()` for every model; plain data with no routing code, so a client built without `sharding` still compiles derived models | none | — |
 | `rasterizeddb_core` | `sharding` | `core/shard/*` (map, ownership log, admission, `Classify`, the shard side of rshard, the virtual-session backend endpoint), the ownership guard, `--role shard`/`--cluster-map`/`--shard-id`, `SHOW SHARDS`, cluster DDL | none (rastcp, rustls and `rasterizeddb_router` cover it) | yes; dormant without `--role` |
 | **`rasterizeddb_gateway`** (new binary crate) | `tls` (default), `native` (default), `fanout` (default from 1b) | the gateway (§4.9). **Does not depend on `rasterizeddb_core`**: no engine, no parser, no catalogue | `rastcp`, `rasterizeddb_router`, `tokio`, `rustls` (all already in the tree) | its own binary, built only when asked |
+| `rasterizeddb_core` | `tenant_isolation` | the tenant-safe mode T1–T10 (§4.10): process-admin split, scoped introspection, per-tenant limits, the tenant directory, `CREATE TENANT`; `--tenant-mode strict` | none | yes; dormant until `--tenant-mode strict` |
+| `rasterizeddb_core` | `segregation_policies` = `["sharding"]` | shard labels, placement policies, enforcement at the authority and the shard, the placement audit | none | yes; dormant until `placement_policies = enforce` |
+| `rasterizeddb_gateway` | `user_routing`, `tenant_isolation`, `segregation` | G11; database-as-a-service routing (`tenancy = database`); policy checks on gateway labels | none | yes; each dormant until configured |
 | `rasterizeddb_core` | `sharding_raft` = `["sharding", "dep:openraft"]` | phase 3: log store, state machine, capture sink, apply loop, ReadIndex, learners | `openraft` (exact pin) | after phase 3's gate |
 | `rasterizeddb_core` | `sharding_2pc` = `["sharding_raft"]` | phase 5: Prepared outcome writers, `__dist_txn`, the recovery driver | none | after phase 5's gate |
 
@@ -1131,7 +1136,9 @@ a gateway feature.
 - **Pinning is placement, not authorisation.** Users co-located on one shard
   are kept apart by that shard's grants (and row policies, where the engine
   has them), exactly as on a single node today. The plan does not claim
-  more.
+  more. Where separation must be a **guarantee**, as for a service with many
+  customers or company-policy segregation, use §4.10's models. Those come
+  with the engine hardening that makes the guarantee true.
 
 *Cost:* one lookup per connection, at login; zero per statement.
 
@@ -1178,6 +1185,153 @@ A slice that breaks a budget does not merge until it is back within it.
 
 **Size:** the gateway crate is about 5–7k LOC plus ~3k of tests and benches.
 The shard endpoint (G5) is about 1.5k.
+
+### 4.10 Two tenancy models: database as a service, and enterprise segregation
+
+The owner's goal is to run RasterizedDB **as a service** for many customers,
+each with their own credentials, where no customer can see, change or even
+learn about another's database. The same machinery serves an **enterprise
+feature**: segregating data by company policy (region, dedicated hardware,
+compliance tier). Each model is its own Cargo feature and its own runtime
+switch, dormant until configured.
+
+| Model | Cargo feature | Runtime switch | Needs |
+|---|---|---|---|
+| **Database as a service** (one database per customer, strict isolation) | `tenant_isolation`, in core and in the gateway | core `--tenant-mode strict` (`off` by default); gateway `tenancy = database` | Works on **one** shard too (a single server plus gateway); sharding spreads customers over shards |
+| **Enterprise segregation** (placement by policy) | `segregation_policies` = `["sharding"]` in core; `segregation` in the gateway | `placement_policies = enforce` (`off` by default) | The authority and moves (B2); `tenant_isolation` when policies apply to databases |
+| (base for both) user routing, `user_key`/`user_shard` | `user_routing` in the gateway | `user_routing = off \| prefer \| require` (G11) | — |
+
+**The security floor comes first, in every build.** An isolation audit on
+2026-11-23 found that today **any login role can make itself superuser**.
+This was reproduced live: a non-superuser ran
+`UPDATE rdb_roles SET is_superuser = true WHERE name = 'me'`, reconnected,
+and `CREATE DATABASE` succeeded. The same role could read every role's
+password verifier. These are bugs, not missing features, and their fixes
+(T0) are **not** feature-gated:
+
+| # | Fix (ungated) | Where |
+|---|---|---|
+| T0.1 | User SQL cannot read or write `rdb_roles` or any `__rdb_*` catalogue table; only the auth and catalogue paths may | `pgwire/privilege_statements.rs:209-215` (early return with no ACL/owner), `core/rql/privileges.rs:392-395` (`allows` is true without an owner), `:26` / `privilege_statements.rs:253` (skips `__*`) |
+| T0.2 | `IMPORT` is gated by `is_import_statement`, not by the words `IMPORT DATABASE`. `DATABASE` is optional, so `IMPORT FROM POSTGRES …` passes the gate today | `pgwire.rs:2436` vs `core/migrate/sql.rs:57-63`; native path `database/mod.rs:6498-6504` |
+| T0.3 | MySQL `USE`/`COM_INIT_DB` and TDS `USE` to another database re-authenticate against it, or are refused | `mysql/conn.rs:915-944`, `mssql/conn.rs:2185-2206`, `pgwire/proxied.rs:236-275` |
+
+**Database as a service (`tenant_isolation`).**
+
+*How a customer connects:*
+- It is standard PostgreSQL: `user=alice dbname=acme`.
+- The gateway's **tenant directory** maps `acme` to its shard.
+- The gateway verifies alice's SCRAM credentials against the roles **inside
+  acme's own database**, fetched from that shard and cached (G9).
+- It opens a virtual session locked to `(shard, acme)`. Any database switch
+  is refused, on every protocol.
+- User names may repeat across customers (two customers may both have
+  `admin`), because credentials live inside each customer's database.
+- Unknown database, unknown user and wrong password all give the same
+  `28P01`, so customer names cannot be enumerated.
+
+*Provisioning* is an operator action through the gateway's admin endpoint,
+or the authority from B2:
+
+```sql
+CREATE TENANT acme OWNER acme_admin PASSWORD '…' [ON SHARD 3 | POLICY eu_dedicated]
+       [LIMITS (connections = 50, storage = '20GB', statement_timeout = '60s')];
+ALTER TENANT acme SET LIMITS (…);   MOVE TENANT acme TO SHARD 5;   DROP TENANT acme;
+SHOW TENANTS;
+```
+
+`CREATE TENANT` creates the database on the chosen shard. It seeds **only**
+`acme_admin`: a database-scoped administrator who may manage roles and
+grants inside `acme` and nothing else. Today's `CREATE DATABASE` copies every
+role and password verifier from the default database (`catalog.rs:453-467`,
+`auth.rs:832-910`); tenant mode stops that.
+
+*The tenant-safe mode*, under `--tenant-mode strict`, has these items:
+
+| # | Item | Today |
+|---|---|---|
+| T1 | **Process admin** is a separate flag, granted only in the operator's database and never in a customer database. Every process-wide verb requires it: `CREATE/DROP DATABASE`, `BRANCH`, `SET CONFIG`, `STORAGE`, `BACKUP`/`RESTORE`, `REPLICATION`, `KV CONFIG/SAVE/FLUSHALL`, `IMPORT` | superuser of *any* database administers the process (`pgwire.rs:2396-2456`) |
+| T2 | Customer introspection is scoped to its own database: `SHOW QUERIES`, `SHOW QUERY STATS`, `pg_stat_statements`, MySQL `SHOW PROCESSLIST` (redacted), `pg_stat_activity` | process-wide, with literals (`introspect.rs:3370-3409`, `mysql/conn.rs:2355-2370`) |
+| T3 | Other databases are invisible: `SHOW DATABASES`, `pg_database`, MySQL/TDS listings and `SHOW BRANCHES` show only the current database, with no `location` path | every database listed, with absolute paths (`pgwire.rs:6503-6525`, `catalog_views.rs:1822`) |
+| T4 | `SHOW BACKUP STATUS`, `SHOW REPLICATION` and `SHOW STORAGE` require process admin | ungated (`introspect.rs:1864-1885`, `storage/sql.rs:711`) |
+| T5 | Session control is scoped to the database: MySQL `KILL` and native cancel tokens include the database id | `KILL` checks the user name only (`mysql/conn.rs:946-967`); cancel tokens keyed by (user, token) (`cancel.rs:443-470`) |
+| T6 | Refuse to start with `trust`, or with native authentication failing open | trust administers; native auth fails open with no password role (`database/mod.rs:4711`) |
+| T7 | Per-tenant limits (B-budgets for customers): connections (enforced at the gateway, cheap), a server-side `statement_timeout` ceiling, idle timeouts on by default, a disk quota per database, KV `maxmemory` bounded by default, the session counted only after authentication | one process-wide `max_connections` (500); `statement_timeout` client-set and 0-able; no quotas (`pgwire.rs:160-190`, `:12977`, `kv_cache/mod.rs:101`) |
+| T8 | Customer databases live under a separate tenants root, never adopting an existing directory; `STORAGE … LOCATION` and `PLACE TABLE AT` are confined to the customer's own root | inside the default root; any path accepted once escalated (`storage/sql.rs:319-358`) |
+| T9 | Outbound connections (PG import, S3 settings) are process-admin only, through an allowlist of hosts | — |
+| T10 | The Redis port stays off in tenant mode, or `AUTH` names the database | serves the default database only (`main.rs:1955`) |
+
+*Moves, backups and HA per customer:*
+- **Moves.** A customer moves between shards whole, with `MOVE TENANT`:
+  1. The gateway drains the customer's sessions (new ones wait up to 5 s,
+     retryably).
+  2. Copy the database through the backup snapshot routine. Each database
+     has its own WAL.
+  3. Verify, flip the tenant directory, release.
+- **Backups.** Each customer's database already archives to its own prefix.
+- **HA gap (stated).** Today's replication covers the default database
+  only (`main.rs:1829`). Customer databases therefore get HA only from B3's
+  Raft, or from extending replication to every database. That is a
+  decision, D11.
+- **Noisy neighbours.** A customer that outgrows a shared shard moves to its
+  own shard, or to a dedicated one under a policy (below).
+
+*Tests:*
+- Every T-item has a mutation-checked test, run over each protocol:
+  pgwire, native, MySQL, TDS.
+- A **cross-tenant attack suite** runs as customer A against customer B on
+  the same shard and must fail every time:
+  - escalation through `rdb_roles` and `__rdb_acl`;
+  - `IMPORT` SSRF;
+  - `USE` switches;
+  - reading `SHOW QUERIES`, `PROCESSLIST` and `pg_database`;
+  - `KILL` and cancel;
+  - enumeration before login;
+  - storage paths;
+  - exhausting connections, disk or KV memory.
+
+*Size:* T0 about 0.5k LOC; T1–T10 about 4–5k LOC; tenant directory and
+provisioning about 2k LOC.
+
+**Enterprise segregation (`segregation_policies`).**
+
+- **Shard labels.** Set with `ALTER SHARD 3 SET LABELS (region = 'eu-west',
+  tier = 'dedicated', compliance = 'hipaa')`. A gateway has labels too.
+- **Policies.**
+
+  ```sql
+  CREATE PLACEMENT POLICY eu_dedicated REQUIRE (region = 'eu-west') EXCLUSIVE;
+  ```
+
+  `EXCLUSIVE` means no other customer or policy may share those shards. A
+  policy attaches to a tenant (`ALTER TENANT acme SET POLICY …`), a role
+  (`user_key`/`user_shard`) or a route key.
+- **Enforcement, at every layer, so one bug is not a breach:**
+  1. The authority refuses any map edit, move, rebalance or `CREATE TENANT`
+     that would place data against its policy.
+  2. Each shard checks at admission that the data it serves matches its own
+     labels, and refuses otherwise. This covers a stale or forged map.
+  3. A gateway refuses to route a policy's traffic unless its own labels
+     satisfy the policy, so EU data never transits a gateway outside the EU.
+  4. Backups go to the policy's backup target, such as a bucket in the same
+     region.
+- **Audit.** Policy changes, and every refusal a policy causes, go to an
+  append-only audit table on the authority: who, when, what. `SHOW PLACEMENT
+  AUDIT` reads it.
+- **Out of scope here (stated):** per-customer encryption keys at rest. If
+  wanted, that is a design of its own.
+- **Tests:** a move or rebalance that would break a policy is refused at the
+  authority, and again at the shard, with the authority check removed
+  *(mutation)*. A gateway with the wrong region refuses. `EXCLUSIVE` keeps
+  other customers off.
+- **Size:** about 3k LOC.
+
+**Order.**
+1. **T0 now**, as bug fixes, independent of everything else, on the
+   owner's go.
+2. **`tenant_isolation` (T1–T10)** next. It is useful even before sharding:
+   one server plus the gateway as a single-shard service.
+3. **G11 user routing** after the gateway's G9.
+4. **`segregation_policies`** after B2's authority and moves.
 
 ## 5. Sequencing
 
