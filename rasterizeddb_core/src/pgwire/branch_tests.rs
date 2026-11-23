@@ -113,9 +113,16 @@ impl Fixture {
         }
     }
 
-    /// Closes the catalogue and opens it again, as a restart does.
+    /// Closes the catalogue and opens it again, as a restart does. The old
+    /// one goes first: it holds the directory's lock until it is dropped, as
+    /// a stopped server lets go of it, so a client still holding it makes the
+    /// reopen fail ("already open") rather than run two engines on one
+    /// directory.
     async fn reopen(&mut self) {
         self.forget();
+        self.catalog = DatabaseCatalog::open(None, "postgres")
+            .await
+            .expect("an in-memory catalogue in the old one's place");
         self.catalog = DatabaseCatalog::open(Some(&self.root.to_string_lossy()), "postgres")
             .await
             .expect("catalogue reopens");
@@ -565,6 +572,8 @@ async fn branches_survive_a_restart_and_leftovers_are_swept() {
     std::fs::create_dir_all(fx.root.join(".branching-half")).unwrap();
     std::fs::write(fx.root.join(".branching-half").join("x.db"), b"junk").unwrap();
 
+    // A restart: the sessions end with the server.
+    drop((admin, dev));
     fx.reopen().await;
     assert!(
         !fx.root.join(".branching-half").exists(),
