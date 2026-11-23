@@ -12,9 +12,14 @@ use std::time::Duration;
 use rastcp::server::TcpServerBuilder;
 use rasterizeddb_client::{Client, Options};
 
+/// The setup request the client sends on every connection it opens, asking
+/// for notices (`notice::NOTICES_REQUEST`): not a statement.
+const NOTICES_SETUP: &[u8] = b"\x01NOTICES;";
+
 /// A server that answers every request with an acknowledgement after
-/// `delay`, counts what it was asked, and closes connections idle for
-/// `idle_limit`.
+/// `delay`, counts the statements it was asked (not a connection's setup
+/// request, which every open and reopen sends once), and closes connections
+/// idle for `idle_limit`.
 async fn server(idle_limit: Duration, delay: Duration) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -28,10 +33,12 @@ async fn server(idle_limit: Duration, delay: Duration) -> (String, Arc<AtomicUsi
         .unwrap();
     tokio::spawn(async move {
         server
-            .run(move |_| {
+            .run(move |request| {
                 let counter = counter.clone();
                 async move {
-                    counter.fetch_add(1, Ordering::SeqCst);
+                    if request != NOTICES_SETUP {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
                     tokio::time::sleep(delay).await;
                     vec![0]
                 }
