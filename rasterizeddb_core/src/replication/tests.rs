@@ -1150,3 +1150,234 @@ async fn create_table_as_replicates_the_values_it_computed() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(read(two.clone()).await.as_deref(), Some(&here[..]), "node two changed after converging");
 }
+
+/// The key/value cache's writes, on the same link as the tables'.
+#[cfg(feature = "kv_cache")]
+mod kv {
+    use super::*;
+    use crate::core::kv_cache::commands;
+    use crate::core::kv_cache::reply::{Collect, Item};
+    use crate::core::kv_cache::store::Direct;
+
+    /// Runs a command against `database`'s store 0 directly, without
+    /// recording it: how the tests read a node's store.
+    fn kv(database: &Arc<Database>, args: &[&[u8]]) -> Item {
+        let store = database.kv_cache.db(0);
+        let spec = commands::lookup(args[0]).expect("a command");
+        let mut out = Collect::default();
+        commands::run(spec, &mut Direct::new(store), args, &mut out);
+        out.take()
+    }
+
+    fn get(database: &Arc<Database>, key: &[u8]) -> Item {
+        kv(database, &[b"GET", key])
+    }
+
+    fn bulk(value: &[u8]) -> Item {
+        Item::Bulk(value.to_vec())
+    }
+
+    /// Waits up to ten seconds for `check`, polling.
+    async fn within_10s(what: &str, mut check: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !check() {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timed out after 10 s waiting for {what}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A Redis protocol listener on node `database`, and a connection to it.
+    async fn resp_client(database: &Arc<Database>) -> tokio::net::TcpStream {
+        let config = crate::core::kv_cache::resp::RespConfig {
+            addr: "127.0.0.1".into(),
+            port: Some(0),
+            socket: None,
+            auth: crate::core::kv_cache::resp::RespAuth::Trust,
+            threads: Some(1),
+            tls: None,
+        };
+        let listener = crate::core::kv_cache::resp::bind(&config).await.expect("bind the RESP port");
+        let port = listener.tcp_port().expect("a TCP port");
+        tokio::spawn(crate::core::kv_cache::resp::serve(
+            listener,
+            database.clone(),
+            database.kv_cache.clone(),
+            config,
+        ));
+        tokio::net::TcpStream::connect(("127.0.0.1", port)).await.expect("connect to the RESP port")
+    }
+
+    fn encode(args: &[&[u8]]) -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            out.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+            out.extend_from_slice(arg);
+            out.extend_from_slice(b"\r\n");
+        }
+        out
+    }
+
+    /// Sends `commands` in one write and reads their replies.
+    async fn pipeline(socket: &mut tokio::net::TcpStream, commands: &[&[&[u8]]]) -> Vec<Item> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut batch = Vec::new();
+        for command in commands {
+            batch.extend(encode(command));
+        }
+        socket.write_all(&batch).await.expect("send");
+        let mut buf = Vec::new();
+        let mut replies = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while replies.len() < commands.len() {
+            while let Some((item, used)) = crate::core::kv_cache::repl::parse_reply(&buf) {
+                replies.push(item);
+                buf.drain(..used);
+            }
+            if replies.len() == commands.len() {
+                break;
+            }
+            let mut chunk = [0u8; 4096];
+            let n = tokio::time::timeout_at(deadline, socket.read(&mut chunk))
+                .await
+                .expect("replies within 10 s")
+                .expect("read");
+            assert!(n > 0, "the RESP connection closed");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        replies
+    }
+
+    /// A write through `KV` SQL on node one turns up in node two's store,
+    /// with the same absolute lifetime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_kv_write_reaches_the_peer_with_its_lifetime() {
+        let _settings = crate::core::kv_cache::tests::default_settings();
+        let (one, two) = pair().await;
+
+        run_ok(&one, "KV SET session:1 'hello' EX 100").await;
+        within_10s("the key to reach node two", || get(&two, b"session:1") == bulk(b"hello")).await;
+
+        let expires = |database: &Arc<Database>| kv(database, &[b"PEXPIRETIME", b"session:1"]);
+        assert_eq!(expires(&two), expires(&one), "the same absolute expiry on both nodes");
+        let Item::Int(left) = kv(&two, &[b"PTTL", b"session:1"]) else { panic!("a lifetime") };
+        assert!(left > 90_000 && left <= 100_000, "{left} ms left");
+    }
+
+    /// Binary values arrive byte for byte, a `DEL` arrives, and per-origin
+    /// order holds: once a later write is there, the earlier ones are too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kv_deletes_and_binary_values_replicate_in_order() {
+        let _settings = crate::core::kv_cache::tests::default_settings();
+        let (one, two) = pair().await;
+
+        run_ok(&one, "KV SET x'00ff10' x'deadbeef0000ff'").await;
+        run_ok(&one, "KV SET doomed 1").await;
+        run_ok(&one, "KV DEL doomed").await;
+        run_ok(&one, "KV RPUSH list a b c").await;
+        run_ok(&one, "KV LPOP list").await;
+        run_ok(&one, "KV SET marker done").await;
+
+        within_10s("the marker to reach node two", || get(&two, b"marker") == bulk(b"done")).await;
+        assert_eq!(get(&two, b"\x00\xff\x10"), bulk(b"\xde\xad\xbe\xef\x00\x00\xff"));
+        assert_eq!(get(&two, b"doomed"), Item::Null, "the DEL arrived before the marker");
+        assert_eq!(
+            kv(&two, &[b"LRANGE", b"list", b"0", b"-1"]),
+            Item::Array(vec![bulk(b"b"), bulk(b"c")])
+        );
+    }
+
+    /// The Redis port: a pipelined `MULTI`/`EXEC` among plain writes, and an
+    /// `SPOP` whose random pick must be the same member on the peer. Node two
+    /// ships none of it back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pipelined_transaction_over_resp_replicates_and_does_not_echo() {
+        let _settings = crate::core::kv_cache::tests::default_settings();
+        let (one, two) = pair().await;
+        let mut socket = resp_client(&one).await;
+
+        let replies = pipeline(
+            &mut socket,
+            &[
+                &[b"SET", b"a", b"1"],
+                &[b"SADD", b"s", b"p", b"q", b"r", b"t"],
+                &[b"MULTI"],
+                &[b"INCRBY", b"a", b"41"],
+                &[b"SET", b"b", b"2", b"PX", b"60000"],
+                &[b"SPOP", b"s"],
+                &[b"EXEC"],
+                &[b"SET", b"after", b"1"],
+            ],
+        )
+        .await;
+        let Item::Array(exec) = &replies[6] else { panic!("EXEC answered {:?}", replies[6]) };
+        assert_eq!(exec[0], Item::Int(42));
+
+        within_10s("the writes to reach node two", || get(&two, b"after") == bulk(b"1")).await;
+        assert_eq!(get(&two, b"a"), bulk(b"42"));
+        assert_eq!(get(&two, b"b"), bulk(b"2"));
+        let members = |database: &Arc<Database>| match kv(database, &[b"SMEMBERS", b"s"]) {
+            Item::Array(mut items) => {
+                items.sort_by_key(|i| format!("{i:?}"));
+                items
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(members(&two), members(&one), "the member SPOP took is gone on both");
+        assert_eq!(members(&two).len(), 3);
+        assert_eq!(
+            kv(&two, &[b"PEXPIRETIME", b"b"]),
+            kv(&one, &[b"PEXPIRETIME", b"b"]),
+            "PX inside EXEC arrived as the absolute time"
+        );
+
+        // Give an echo every chance to happen before looking.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(two.replication.local_seq(), 0, "node two originated nothing");
+        assert_eq!(two.replication.stats().kv_effects.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(two.replication.stats().kv_applied.load(std::sync::atomic::Ordering::Relaxed) >= 4);
+        assert_eq!(
+            one.replication.stats().kv_effects.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "SET, SADD, one EXEC, SET"
+        );
+        assert_eq!(get(&one, b"a"), bulk(b"42"), "nothing came back to node one twice");
+    }
+
+    /// A peer that was away is caught up from the replication log, as for
+    /// table data.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_paused_peer_catches_up_on_kv_writes() {
+        let _settings = crate::core::kv_cache::tests::default_settings();
+        let (one, two) = pair().await;
+        run_ok(&one, "KV SET warm 1").await;
+        within_10s("the link to carry a first write", || get(&two, b"warm") == bulk(b"1")).await;
+
+        let link = one.replication.peer("two").expect("node one knows node two");
+        link.set_paused(true);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        for i in 0..50 {
+            run_ok(&one, &format!("KV SET key:{i} value:{i}")).await;
+        }
+        run_ok(&one, "KV INCRBY counter 7").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(get(&two, b"key:0"), Item::Null, "a paused peer received nothing");
+        let log = one.replication.log().expect("node one keeps a log");
+        assert!(log.highest(1) >= 2, "the writes are in node one's log");
+
+        link.set_paused(false);
+        within_10s("the backlog to reach node two", || get(&two, b"counter") == bulk(b"7")).await;
+        for i in 0..50 {
+            assert_eq!(get(&two, format!("key:{i}").as_bytes()), bulk(format!("value:{i}").as_bytes()));
+        }
+
+        // A resend of what node two already holds changes nothing.
+        link.set_paused(true);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        link.set_paused(false);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(get(&two, b"counter"), bulk(b"7"), "a redelivered INCRBY is a duplicate");
+    }
+}

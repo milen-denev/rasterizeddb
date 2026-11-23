@@ -878,6 +878,13 @@ fn show_status(replication: &StdArc<Replication>) -> Vec<String> {
             stats.gaps.load(Ordering::Relaxed),
             stats.ack_timeouts.load(Ordering::Relaxed)
         ),
+        format!(
+            "key/value: {} write(s) shipped in {} record(s), {} applied from peers, {} skipped on apply",
+            stats.kv_effects.load(Ordering::Relaxed),
+            stats.kv_records.load(Ordering::Relaxed),
+            stats.kv_applied.load(Ordering::Relaxed),
+            stats.kv_apply_errors.load(Ordering::Relaxed)
+        ),
     ];
 
     if let Some(failure) = replication.capture_failure() {
@@ -1224,6 +1231,26 @@ fn stats_rows(database: &Arc<Database>) -> Vec<crate::core::row::row::Row> {
         "push_round_trip_us",
         load(&stats.push_round_trip_us),
         "total time this node's batches took to be acknowledged: the wire both ways plus the peer's apply",
+    );
+    push(
+        "kv_effects",
+        load(&stats.kv_effects),
+        "key/value cache writes recorded for the peers",
+    );
+    push(
+        "kv_records",
+        load(&stats.kv_records),
+        "records those were numbered into",
+    );
+    push(
+        "kv_applied",
+        load(&stats.kv_applied),
+        "key/value cache commands applied here for a peer",
+    );
+    push(
+        "kv_apply_errors",
+        load(&stats.kv_apply_errors),
+        "key/value cache commands that failed on apply and were skipped",
     );
     push(
         "batches_applied",

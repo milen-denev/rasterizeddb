@@ -531,7 +531,8 @@ fn refuse(record: &TxnRecord, status: ApplyStatus, message: impl Into<String>) -
 /// A record applied and committed in memory, waiting for the sync that
 /// makes it durable.
 struct Waiting {
-    owner: crate::core::mvcc::owner::OwnerRelease,
+    /// `None` for a key/value record, which has no transaction behind it.
+    owner: Option<crate::core::mvcc::owner::OwnerRelease>,
     record: TxnRecord,
     /// Where its outcome sits in the batch's answer.
     answer: usize,
@@ -615,7 +616,9 @@ impl Group {
                         e
                     ),
                 );
-                held.owner.release();
+                if let Some(owner) = held.owner {
+                    owner.release();
+                }
             }
             return;
         }
@@ -627,7 +630,9 @@ impl Group {
         let relay = replication.config().relay;
         for held in waiting {
             // Durable: the apply's table locks go now (finding L4).
-            held.owner.release();
+            if let Some(owner) = held.owner {
+                owner.release();
+            }
             replication.stamp_tables(&held.record.tables, held.record.commit_hlc, held.record.origin);
             debug!(
                 "Applied transaction {}:{} ({} statements)",
@@ -767,6 +772,61 @@ async fn apply_one(
     }
 
     replication.clock().observe(record.commit_hlc);
+
+    // Key/value cache effects. Applied in arrival order whatever the conflict
+    // policy: the store is a cache, and a command that fails here is counted
+    // and skipped rather than stopping the stream.
+    if record.is_kv() && !record.is_void() {
+        if group.waiting.is_empty() {
+            // Nothing waiting on a sync: the position is written as for a
+            // record passed over, and then the effects run. Written first, a
+            // failure to write it applies nothing and the record comes again.
+            if let Err(e) = applied.record(record.origin, record.seq) {
+                outcomes.push(refuse(
+                    &record,
+                    ApplyStatus::Failed,
+                    format!("the applied position could not be written: {}", e),
+                ));
+                return;
+            }
+            apply_kv(database, replication, &record);
+            outcomes.push(ApplyOutcome {
+                origin: record.origin,
+                seq: record.seq,
+                status: ApplyStatus::Applied,
+                message: String::new(),
+            });
+            if replication.config().relay {
+                relay_onwards(replication, record, from_node);
+            }
+            return;
+        }
+        // Behind row writes still waiting on their sync: it joins them, as a
+        // step that holds if theirs do, so the stream's position never runs
+        // ahead of rows that might not be there.
+        if let Err(e) = applied.begin(record.origin, record.seq, 0) {
+            outcomes.push(refuse(
+                &record,
+                ApplyStatus::Failed,
+                format!("the applied position could not be written: {}", e),
+            ));
+            return;
+        }
+        apply_kv(database, replication, &record);
+        applied.advance(record.origin, record.seq);
+        outcomes.push(ApplyOutcome {
+            origin: record.origin,
+            seq: record.seq,
+            status: ApplyStatus::Applied,
+            message: String::new(),
+        });
+        group.waiting.push(Waiting {
+            owner: None,
+            record,
+            answer: outcomes.len() - 1,
+        });
+        return;
+    }
 
     // A sequence the origin handed to a transaction that did not commit.
     // There is nothing to run: the stream moves past it.
@@ -1042,13 +1102,80 @@ async fn apply_one(
         message: String::new(),
     });
     group.waiting.push(Waiting {
-        owner,
+        owner: Some(owner),
         record,
         answer: outcomes.len() - 1,
     });
     if !plain {
         group.finish(database, replication, from_node, outcomes);
     }
+}
+
+/// Runs a key/value record's effects against this database's store.
+///
+/// Never fails the record: a command that does not apply is counted in
+/// `kv_apply_errors` and skipped. Two nodes writing one key at once can leave
+/// it different on each, as in any multi-primary cache.
+fn apply_kv(database: &Arc<Database>, replication: &StdArc<Replication>, record: &TxnRecord) {
+    use base64::Engine as _;
+    let stats = replication.stats();
+    let mut errors = 0u64;
+    let mut first_error: Option<String> = None;
+    for chunk in &record.statements {
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(chunk) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                errors += 1;
+                first_error.get_or_insert_with(|| format!("a chunk is not base64: {}", e));
+                continue;
+            }
+        };
+        #[cfg(feature = "kv_cache")]
+        {
+            let report = crate::core::kv_cache::repl::apply_chunk(&database.kv_cache, &bytes);
+            stats.kv_applied.fetch_add(report.applied, Ordering::Relaxed);
+            errors += report.errors;
+            if first_error.is_none() {
+                first_error = report.first_error;
+            }
+        }
+        #[cfg(not(feature = "kv_cache"))]
+        {
+            let _ = (database, bytes);
+            errors += 1;
+            first_error.get_or_insert_with(|| "this build has no key/value cache".to_string());
+        }
+    }
+    if errors > 0 {
+        stats.kv_apply_errors.fetch_add(errors, Ordering::Relaxed);
+        warn_kv_apply(record, errors, first_error.as_deref().unwrap_or(""));
+    }
+    debug!(
+        "Applied key/value record {}:{} ({} chunk(s), {} error(s))",
+        record.origin,
+        record.seq,
+        record.statements.len(),
+        errors
+    );
+}
+
+/// Says that key/value effects failed to apply, at most once every ten
+/// seconds: under concurrent writes to the same keys on two nodes this can be
+/// every record, and the counter in `SHOW REPLICATION STATS` has the total.
+fn warn_kv_apply(record: &TxnRecord, errors: u64, first: &str) {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 10 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    warn!(
+        "{} key/value command(s) of record {}:{} did not apply here and were skipped (first: {}); concurrent writes to one key on two nodes can leave it different on each",
+        errors, record.origin, record.seq, first
+    );
 }
 
 /// How many times a record that lost a lock is retried before it is handed
@@ -1465,6 +1592,108 @@ mod tests {
             1,
             "a resend must not double-insert"
         );
+    }
+
+    /// A key/value record carrying `commands`, as `kv_flush` would make one.
+    #[cfg(feature = "kv_cache")]
+    fn kv_record(origin: NodeId, seq: u64, commands: &[&[&[u8]]]) -> TxnRecord {
+        use base64::Engine as _;
+        let mut chunk = vec![protocol::KV_FORMAT_V1];
+        for command in commands {
+            let effect: Vec<Vec<u8>> = command.iter().map(|a| a.to_vec()).collect();
+            crate::core::kv_cache::repl::encode_entry(&mut chunk, 0, &[effect]);
+        }
+        TxnRecord {
+            origin,
+            seq,
+            commit_hlc: seq * 1000,
+            flags: protocol::FLAG_KV,
+            statements: vec![base64::engine::general_purpose::STANDARD.encode(&chunk)],
+            tables: Vec::new(),
+        }
+    }
+
+    #[cfg(feature = "kv_cache")]
+    fn kv_get(database: &Arc<Database>, key: &[u8]) -> crate::core::kv_cache::reply::Item {
+        use crate::core::kv_cache::{commands, reply::Collect, store::Direct};
+        let mut out = Collect::default();
+        let args: [&[u8]; 2] = [b"GET", key];
+        commands::run(commands::lookup(b"GET").unwrap(), &mut Direct::new(database.kv_cache.db(0)), &args, &mut out);
+        out.take()
+    }
+
+    /// At-least-once delivery: a key/value record delivered again is taken
+    /// as held, through the same positions table data uses, so an `INCR` in
+    /// it does not count twice.
+    #[cfg(feature = "kv_cache")]
+    #[tokio::test]
+    async fn a_kv_record_delivered_twice_is_applied_once() {
+        use crate::core::kv_cache::reply::Item;
+        let _settings = crate::core::kv_cache::tests::default_settings();
+        let database = database().await;
+        let replication = database.replication.clone();
+        let incr = kv_record(2, 1, &[&[b"INCRBY", b"n", b"5"]]);
+
+        let first = apply_record(&database, &replication, incr.clone(), NO_SENDER).await;
+        let second = apply_record(&database, &replication, incr, NO_SENDER).await;
+        assert_eq!(first.status, ApplyStatus::Applied);
+        assert_eq!(second.status, ApplyStatus::Duplicate);
+        assert_eq!(kv_get(&database, b"n"), Item::Bulk(b"5".to_vec()));
+
+        // And one that skips a sequence is a gap, as for table data.
+        let skipped = apply_record(&database, &replication, kv_record(2, 3, &[&[b"SET", b"x", b"1"]]), NO_SENDER).await;
+        assert_eq!(skipped.status, ApplyStatus::Gap);
+        assert_eq!(kv_get(&database, b"x"), Item::Null);
+        assert_eq!(replication.local_seq(), 0, "an applied record is not captured again");
+    }
+
+    /// A key/value command that fails on apply (here a `WRONGTYPE`, as
+    /// concurrent writes on two nodes can cause) is counted and skipped; the
+    /// record still applies, under the strictest conflict policy, and the
+    /// stream goes on.
+    #[cfg(feature = "kv_cache")]
+    #[tokio::test]
+    async fn a_kv_command_that_fails_on_apply_is_skipped_not_fatal() {
+        use crate::core::kv_cache::reply::Item;
+        let _settings = crate::core::kv_cache::tests::default_settings();
+        let database = database().await;
+        let replication = database.replication.clone();
+        assert_eq!(replication.conflict_policy(), ConflictPolicy::Abort);
+
+        let record = kv_record(2, 1, &[&[b"SET", b"s", b"text"], &[b"LPUSH", b"s", b"x"], &[b"SET", b"t", b"1"]]);
+        let outcome = apply_record(&database, &replication, record, NO_SENDER).await;
+        assert_eq!(outcome.status, ApplyStatus::Applied);
+        assert_eq!(kv_get(&database, b"t"), Item::Bulk(b"1".to_vec()));
+        assert_eq!(replication.stats().kv_apply_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(replication.stats().kv_applied.load(Ordering::Relaxed), 2);
+
+        let next = apply_record(&database, &replication, kv_record(2, 2, &[&[b"SET", b"u", b"2"]]), NO_SENDER).await;
+        assert_eq!(next.status, ApplyStatus::Applied);
+        assert_eq!(replication.applied().high_water(2), 2);
+    }
+
+    /// Key/value records interleaved with row writes in one batch: each
+    /// applies, in order, and the position ends past all of them.
+    #[cfg(feature = "kv_cache")]
+    #[tokio::test]
+    async fn kv_records_between_row_writes_apply_in_order() {
+        use crate::core::kv_cache::reply::Item;
+        let _settings = crate::core::kv_cache::tests::default_settings();
+        let database = database().await;
+        create_table(&database).await;
+        let replication = database.replication.clone();
+
+        let batch = vec![
+            record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+            kv_record(2, 2, &[&[b"SET", b"k", b"1"]]),
+            record(2, 3, vec!["INSERT INTO repl_t (id, name) VALUES (2, 'bob')"]),
+            kv_record(2, 4, &[&[b"APPEND", b"k", b"2"]]),
+        ];
+        let outcomes = apply_batch(&database, &replication, batch, NO_SENDER).await;
+        assert!(outcomes.iter().all(|o| o.status == ApplyStatus::Applied), "{outcomes:?}");
+        assert_eq!(row_count(&database).await, 2);
+        assert_eq!(kv_get(&database, b"k"), Item::Bulk(b"12".to_vec()));
+        assert_eq!(replication.applied().high_water(2), 4);
     }
 
     #[tokio::test]

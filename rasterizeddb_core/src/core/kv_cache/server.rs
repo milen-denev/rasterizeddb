@@ -36,12 +36,21 @@ pub fn run<O: Reply>(spec: &Spec, handle: &KvCacheHandle, db: usize, args: &[&[u
             out.ok()
         }
         SwapDb => out.error("ERR SWAPDB is not supported by this server"),
-        Move => move_key(handle, db, args, out),
+        Move => move_key(handle, db, args, out, &mut || {}),
         _ => out.error(&format!("ERR '{}' cannot run here", spec.name)),
     }
 }
 
-fn move_key<O: Reply>(handle: &KvCacheHandle, db: usize, args: &[&[u8]], out: &mut O) {
+/// `MOVE`. `moved` runs once the key has moved, while both shards are still
+/// held: replication records the move there, so a write to either key that
+/// follows it cannot be streamed ahead of it.
+pub(crate) fn move_key<O: Reply>(
+    handle: &KvCacheHandle,
+    db: usize,
+    args: &[&[u8]],
+    out: &mut O,
+    moved: &mut dyn FnMut(),
+) {
     let key = args[1];
     let target = match parse_int(args[2]) {
         Some(n) if (0..DATABASES as i64).contains(&n) => n as usize,
@@ -70,6 +79,7 @@ fn move_key<O: Reply>(handle: &KvCacheHandle, db: usize, args: &[&[u8]], out: &m
     }
     let slot = s.remove(hs, key).expect("live");
     d.insert(hd, slot);
+    moved();
     out.int(1);
 }
 

@@ -38,7 +38,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc};
 
-use super::commands::{self, BLOCKING, CONN, Cmd, NO_AUTH, NO_MULTI, SERVER, Spec, eq, parse_int};
+use super::commands::{self, BLOCKING, CONN, Cmd, NO_AUTH, NO_MULTI, SERVER, Spec, WRITE, eq, parse_int};
 use super::pubsub::{Message, QUEUE, Subscriber};
 use super::reply::{Reply, Resp};
 use super::store::{Direct, KvCache, Pinned, now_ms};
@@ -748,6 +748,9 @@ struct Conn {
     main: tokio::runtime::Handle,
     handle: KvCacheHandle,
     database: rclite::Arc<Database>,
+    /// The database's replication, held here so a write asks whether it is
+    /// on with one load (see `super::repl`).
+    repl: Arc<crate::replication::Replication>,
     auth: RespAuth,
     authed: bool,
     /// Whether the authenticated role is a superuser: the server-level
@@ -792,6 +795,7 @@ impl Conn {
                 RespAuth::Roles { default_user } => default_user.clone(),
             },
             handle,
+            repl: database.replication.clone(),
             database,
             id: NEXT_CLIENT.fetch_add(1, Ordering::Relaxed),
             peer,
@@ -1174,12 +1178,22 @@ impl Conn {
                         r.simple("Background saving started");
                     }
                 }
+                _ if spec.is(WRITE) && self.repl.is_active() => {
+                    super::repl::run_server_write(&self.repl, &self.handle, self.db, spec, args, &mut r)
+                }
                 _ => super::server::run(spec, &self.handle, self.db, args, &mut r),
             }
             return Ok(Flow::Continue);
         }
         if spec.is(BLOCKING) {
             return self.blocking(spec, args, out, sock).await;
+        }
+        // A write on a replicating node is recorded for the peers. The one
+        // thing a write pays when it is not is the relaxed load of the gate;
+        // a read pays nothing.
+        if spec.is(WRITE) && self.repl.is_active() {
+            super::repl::run_write(&self.repl, &self.store, self.db, spec, args, &mut r);
+            return Ok(Flow::Continue);
         }
         let mut access = Direct { store: &self.store, now: self.now };
         commands::run(spec, &mut access, args, &mut r);
@@ -1555,6 +1569,13 @@ impl Conn {
             .iter()
             .map(|args| commands::lookup(&args[0]).expect("queued commands were looked up"))
             .collect();
+        // On a replicating node the transaction's effects travel as one
+        // entry, recorded under the locks it ran under.
+        let capture = self.repl.is_active();
+        if capture && super::repl::queue_too_large(&queue) {
+            return r.error(super::repl::too_large_error());
+        }
+        let mut shipped: Vec<super::repl::Effect> = Vec::new();
         let all = specs.iter().any(|s| s.is(commands::ALL));
         let store = self.store.clone();
         let mut hashes: Vec<u64> = Vec::new();
@@ -1582,6 +1603,7 @@ impl Conn {
         r.array(queue.len());
         for (spec, args) in specs.iter().zip(&queue) {
             let refs: Vec<&[u8]> = args.iter().map(|a| a.as_slice()).collect();
+            let mark = r.out.len();
             if spec.cmd == Cmd::FlushAll {
                 // This database through the held locks; the others directly.
                 for d in (0..DATABASES).filter(|&d| d != self.db) {
@@ -1605,7 +1627,16 @@ impl Conn {
             } else {
                 commands::run(spec, &mut pinned, &refs, r);
             }
+            if capture && spec.is(WRITE) {
+                if let Some((reply, _)) = super::repl::parse_reply(&r.out[mark..]) {
+                    shipped.extend(super::repl::effects(spec, &refs, &reply, &mut |key| pinned.live_expiry(key)));
+                }
+            }
         }
+        if capture {
+            super::repl::append(&self.repl, self.db, &shipped);
+        }
+        drop(pinned);
     }
 
     async fn blocking(&mut self, spec: &Spec, args: &[&[u8]], out: &mut Vec<u8>, sock: &mut Sock) -> io::Result<Flow> {
@@ -1633,9 +1664,14 @@ impl Conn {
         let stats = &self.handle.inner().stats;
         loop {
             {
-                let mut access = Direct { store: &self.store, now: now_ms() };
                 let mut r = Resp { out, v3: self.v3 };
-                if commands::bpop_attempt(spec, &mut access, args, &mut r) {
+                let answered = if self.repl.is_active() {
+                    super::repl::bpop_attempt(&self.repl, &self.store, self.db, spec, args, &mut r)
+                } else {
+                    let mut access = Direct { store: &self.store, now: now_ms() };
+                    commands::bpop_attempt(spec, &mut access, args, &mut r)
+                };
+                if answered {
                     break;
                 }
             }

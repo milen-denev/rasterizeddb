@@ -118,6 +118,26 @@ pub const FLAG_RELAYED: u8 = 1 << 0;
 /// holes. A peer applies it by moving past it.
 pub const FLAG_VOID: u8 = 1 << 1;
 
+/// Record flag: this record carries key/value cache effects rather than SQL.
+///
+/// Record flags and frame flags are separate namespaces ([`FLAG_MORE`] is a
+/// frame header's, and shares its bit with [`FLAG_RELAYED`]); this one is
+/// the record's third bit, after [`FLAG_RELAYED`] and [`FLAG_VOID`], and is
+/// carried unchanged when a record is relayed.
+///
+/// Each of its `statements` is one chunk of effects, base64 of the binary
+/// form `core::kv_cache::repl` writes: a [`KV_FORMAT_V1`] byte, then entries.
+/// Base64 because a value is any bytes and a statement is a `String`; the
+/// batch compression takes most of the expansion back on the wire. Its
+/// `tables` is empty, so last-writer-wins never supersedes one: the store is
+/// a cache, applied in arrival order.
+pub const FLAG_KV: u8 = 1 << 2;
+
+/// The first byte of every chunk of key/value effects: the encoding's
+/// version. A node that meets a version it does not know counts the chunk
+/// as an apply error and moves on rather than misreading it.
+pub const KV_FORMAT_V1: u8 = 1;
+
 #[derive(Debug)]
 pub enum ProtocolError {
     /// The first bytes were not a replication frame at all.
@@ -277,7 +297,7 @@ pub struct TxnRecord {
     pub seq: u64,
     /// When it committed, on the cluster's hybrid clock.
     pub commit_hlc: Hlc,
-    /// [`FLAG_RELAYED`] and room for more.
+    /// [`FLAG_RELAYED`], [`FLAG_VOID`], [`FLAG_KV`].
     pub flags: u8,
     /// The statements, in the order they ran.
     pub statements: Vec<String>,
@@ -352,6 +372,12 @@ impl TxnRecord {
     #[inline]
     pub fn is_void(&self) -> bool {
         self.flags & FLAG_VOID != 0
+    }
+
+    /// Whether this record carries key/value cache effects ([`FLAG_KV`]).
+    #[inline]
+    pub fn is_kv(&self) -> bool {
+        self.flags & FLAG_KV != 0
     }
 }
 

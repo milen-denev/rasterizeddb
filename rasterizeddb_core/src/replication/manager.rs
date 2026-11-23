@@ -118,6 +118,15 @@ pub struct Stats {
     /// `pipeline_depth` lifts.
     pub batches_applied: AtomicU64,
     pub apply_us: AtomicU64,
+    /// Key/value cache effects captured here (a command that wrote, or one
+    /// `EXEC`), and the records they were numbered into.
+    pub kv_effects: AtomicU64,
+    pub kv_records: AtomicU64,
+    /// Key/value cache commands applied here for a peer, and those that
+    /// failed on apply (a `WRONGTYPE` after concurrent writes to one key on
+    /// two nodes, an `OOM`): counted and skipped, never a halt.
+    pub kv_applied: AtomicU64,
+    pub kv_apply_errors: AtomicU64,
 }
 
 impl Stats {
@@ -238,6 +247,32 @@ pub(super) fn plain_row_write(sql: &str) -> bool {
         || word.eq_ignore_ascii_case("DELETE")
 }
 
+/// Raw effect bytes a key/value record is cut at. A burst coalesces into
+/// records of about this size, a few hundred kilobytes of base64 each, rather
+/// than one per command; a single larger effect gets a record of its own.
+pub const KV_RECORD_TARGET: usize = 256 * 1024;
+
+/// The largest one key/value effect (a command, or one `EXEC`) may encode
+/// to: what fits in a record of at most half of
+/// [`super::protocol::MAX_PAYLOAD`] once base64 has grown it by a third, the
+/// same ceiling a SQL transaction has. A write whose effect would be larger
+/// is refused before it runs.
+pub const KV_ENTRY_MAX: usize = super::protocol::MAX_PAYLOAD / 2 / 4 * 3 - 4096;
+
+/// How long captured key/value effects wait for company before they are
+/// numbered into a record, unless a record's worth is already waiting.
+const KV_LINGER: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Key/value effects captured and not yet numbered: chunks of at most about
+/// [`KV_RECORD_TARGET`] bytes, each one record to be, each starting with
+/// [`super::protocol::KV_FORMAT_V1`].
+#[derive(Debug, Default)]
+struct KvBuffer {
+    chunks: Vec<Vec<u8>>,
+    bytes: usize,
+    effects: u64,
+}
+
 tokio::task_local! {
     /// Set around work that is this node's own business: see
     /// [`Replication::local_only`].
@@ -331,6 +366,17 @@ pub struct Replication {
     /// A socket to serve instead of binding `listen_port`, taken by the next
     /// start. See [`Replication::serve_on`].
     bound_listener: parking_lot::Mutex<Option<std::net::TcpListener>>,
+    /// Key/value cache effects waiting to be numbered: see
+    /// [`Replication::kv_append`]. Taken by writers while they still hold the
+    /// shards their command wrote, so the order in here is the order the
+    /// store saw.
+    kv_buffer: parking_lot::Mutex<KvBuffer>,
+    /// One numbering at a time, so two flushes cannot number their chunks in
+    /// the opposite order to the one they took them in.
+    kv_flushing: parking_lot::Mutex<()>,
+    /// Wakes the key/value flusher.
+    kv_wake: Arc<tokio::sync::Notify>,
+    kv_flusher: AtomicBool,
 }
 
 impl std::fmt::Debug for Replication {
@@ -380,6 +426,10 @@ impl Replication {
             capture_order: AtomicU64::new(0),
             listener: AtomicBool::new(false),
             bound_listener: parking_lot::Mutex::new(None),
+            kv_buffer: parking_lot::Mutex::new(KvBuffer::default()),
+            kv_flushing: parking_lot::Mutex::new(()),
+            kv_wake: Arc::new(tokio::sync::Notify::new()),
+            kv_flusher: AtomicBool::new(false),
         }
     }
 
@@ -654,6 +704,9 @@ impl Replication {
 
     /// Flushes both files. Called periodically and at shutdown.
     pub fn flush(&self) {
+        // Key/value effects still waiting are numbered and logged first, so
+        // a clean shutdown keeps them.
+        self.kv_flush();
         if let Some(log) = self.log.load_full() {
             if let Err(e) = log.flush() {
                 warn!("Could not flush the replication log: {}", e);
@@ -1267,6 +1320,168 @@ impl Replication {
     /// non-zero value at rest would mean buffers are leaking.
     pub fn open_captures(&self) -> usize {
         self.capture.len()
+    }
+
+    // -- the key/value cache's stream ----------------------------------------
+
+    /// Adds one key/value effect, already encoded by
+    /// `core::kv_cache::repl`, to the stream.
+    ///
+    /// The caller still holds the shards the effect's command wrote, so two
+    /// writers of one key append in the order the store applied them: one
+    /// stream, in execution order, which is what per-key order on a peer
+    /// rests on. What happens here is a copy under a short lock and, when
+    /// the buffer was empty, a wake-up. No sync, no log write, no number:
+    /// those are the flusher's, a moment later, for many effects at once.
+    pub fn kv_append(self: &Arc<Self>, entry: &[u8]) {
+        let wake = {
+            let mut buffer = self.kv_buffer.lock();
+            let was_empty = buffer.bytes == 0;
+            let before = buffer.bytes;
+            let fits = buffer
+                .chunks
+                .last()
+                .is_some_and(|chunk| chunk.len() + entry.len() <= KV_RECORD_TARGET);
+            if fits {
+                buffer.chunks.last_mut().expect("checked").extend_from_slice(entry);
+            } else {
+                let mut chunk = Vec::with_capacity((entry.len() + 1).max(KV_RECORD_TARGET.min(64 * 1024)));
+                chunk.push(super::protocol::KV_FORMAT_V1);
+                chunk.extend_from_slice(entry);
+                buffer.chunks.push(chunk);
+            }
+            buffer.bytes += entry.len();
+            buffer.effects += 1;
+            // Woken when the buffer starts filling, and again when it has a
+            // record's worth, so a burst does not wait out the linger.
+            was_empty || (before < KV_RECORD_TARGET && buffer.bytes >= KV_RECORD_TARGET)
+        };
+        if wake {
+            self.ensure_kv_flusher();
+            self.kv_wake.notify_one();
+        }
+    }
+
+    /// Key/value effect bytes captured and not yet numbered.
+    pub fn kv_pending(&self) -> usize {
+        self.kv_buffer.lock().bytes
+    }
+
+    /// Starts the task that numbers key/value effects, once, on the runtime
+    /// this is called from. Called at [`Database::start_replication`] (the
+    /// server's main runtime) and, for a node made active another way, by
+    /// the first effect. Without a runtime nothing starts, and the effects
+    /// wait for [`Replication::kv_flush`] or the periodic [`Replication::flush`].
+    ///
+    /// [`Database::start_replication`]: crate::core::database::Database::start_replication
+    pub fn ensure_kv_flusher(self: &Arc<Self>) {
+        if self.kv_flusher.load(Ordering::Acquire) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self.kv_flusher.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let wake = self.kv_wake.clone();
+        runtime.spawn(async move {
+            loop {
+                // Bounded, so a node that has gone lets its flusher go.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified()).await;
+                let pending = match weak.upgrade() {
+                    Some(replication) => replication.kv_pending(),
+                    None => break,
+                };
+                if pending == 0 {
+                    continue;
+                }
+                if pending < KV_RECORD_TARGET {
+                    tokio::time::sleep(KV_LINGER).await;
+                }
+                let Some(replication) = weak.upgrade() else {
+                    break;
+                };
+                // Off the async workers: a log without a write-ahead log
+                // behind it is synced here.
+                let _ = tokio::task::spawn_blocking(move || replication.kv_flush()).await;
+            }
+        });
+    }
+
+    /// Numbers what [`Replication::kv_append`] collected into records, logs
+    /// them, and settles them for release on the write-ahead log's next
+    /// durable round. Returns how many records it made.
+    ///
+    /// The `synchronous_commit = off` path, always: a cache write never
+    /// waits for a sync, and the record reaches the peers once the log
+    /// writer has made it durable here, so no peer holds a write this node
+    /// could lose to a power cut and then number again. A log with no
+    /// write-ahead log behind it is synced here instead, once for the lot.
+    pub fn kv_flush(&self) -> usize {
+        let _one_at_a_time = self.kv_flushing.lock();
+        let (chunks, effects) = {
+            let mut buffer = self.kv_buffer.lock();
+            buffer.bytes = 0;
+            (std::mem::take(&mut buffer.chunks), std::mem::take(&mut buffer.effects))
+        };
+        if chunks.is_empty() {
+            return 0;
+        }
+        let origin = self.node_id();
+        if origin == 0 {
+            return 0;
+        }
+        use base64::Engine as _;
+        let log = self.log.load_full();
+        let mut numbered: Vec<u64> = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            let text = base64::engine::general_purpose::STANDARD.encode(&chunk);
+            drop(chunk);
+            let mut outbox = self.outbox.lock();
+            let seq = self.seq.load(Ordering::Acquire) + 1;
+            let record = TxnRecord {
+                origin,
+                seq,
+                commit_hlc: self.clock.now(),
+                flags: super::protocol::FLAG_KV,
+                statements: vec![text],
+                tables: Vec::new(),
+            };
+            if let Some(log) = log.as_ref() {
+                if let Err(e) = log.append(&record) {
+                    drop(outbox);
+                    self.note_capture_failure(format!(
+                        "Key/value cache writes could not be written to the replication log ({}); the peers will not get them",
+                        e
+                    ));
+                    continue;
+                }
+            }
+            self.seq.store(seq, Ordering::Release);
+            outbox.pending.insert(seq, Pending::Unresolved);
+            drop(outbox);
+            numbered.push(seq);
+        }
+        if let Some(log) = log.as_ref() {
+            if !log.is_logged() {
+                if let Err(e) = log.sync() {
+                    warn!("Could not sync key/value records to the replication log: {}", e);
+                }
+            }
+        }
+        let gate = self.gate_now();
+        for seq in &numbered {
+            self.settle(*seq, gate);
+        }
+        let made = numbered.len();
+        self.stats.kv_effects.fetch_add(effects, Ordering::Relaxed);
+        self.stats.kv_records.fetch_add(made as u64, Ordering::Relaxed);
+        self.stats.captured.fetch_add(made as u64, Ordering::Relaxed);
+        self.stats.published.fetch_add(made as u64, Ordering::Relaxed);
+        debug!("Numbered {} key/value effect(s) into {} record(s)", effects, made);
+        made
     }
 }
 

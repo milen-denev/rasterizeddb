@@ -1972,6 +1972,7 @@ impl Database {
         // Every leftover's files are reaped by now; their placements go too.
         pool_forget_statement_relations(&storage);
 
+        let replication = StdArc::new(crate::replication::Replication::new());
         let database = Database {
             #[cfg(test)]
             legacy_numeric_slot: std::sync::atomic::AtomicBool::new(false),
@@ -2005,7 +2006,7 @@ impl Database {
             },
             schema_generation: StdArc::new(std::sync::atomic::AtomicU64::new(0).into()),
             shape_epoch: std::sync::atomic::AtomicU64::new(0).into(),
-            replication: StdArc::new(crate::replication::Replication::new()),
+            replication: replication.clone(),
             location: (!in_memory).then(|| location.to_string()),
             storage,
             kv: kv_stores,
@@ -2018,6 +2019,8 @@ impl Database {
             kv_cache: {
                 let handle = crate::core::kv_cache::KvCacheHandle::new((!in_memory).then_some(location));
                 handle.load_snapshot_if_present();
+                // Its writes travel on this database's replication stream.
+                handle.attach_replication(replication.clone());
                 handle
             },
         };
@@ -2431,6 +2434,8 @@ impl Database {
 
         database.open_replication_storage()?;
         replication.set_active(true);
+        // Numbers the key/value cache's writes, on this (the main) runtime.
+        replication.ensure_kv_flusher();
 
         for peer_config in &config.peers {
             if replication.peer(&peer_config.name).is_none() {

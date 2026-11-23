@@ -18725,7 +18725,9 @@ pub(crate) fn replication_of(query: &QueryPurpose) -> Replicated {
         }
         QueryPurpose::Replication(_) => Replicated::Local("replication settings are each node's own"),
         #[cfg(feature = "kv_cache")]
-        QueryPurpose::KvCache(_) => Replicated::Local("the key/value cache is each node's own and is not replicated"),
+        // Its writes travel on the same stream, as the store's own effects
+        // (`core::kv_cache::repl`) rather than as this statement's text.
+        QueryPurpose::KvCache(_) => Replicated::NotAWrite,
         #[cfg(feature = "storage_pools")]
         QueryPurpose::Storage(_) => {
             Replicated::Local("STORAGE statements place this node's files; run it on each node that should have it")
@@ -18762,8 +18764,9 @@ fn query_sql(query: &QueryPurpose) -> String {
         QueryPurpose::Storage(sql) => sql.clone(),
         QueryPurpose::Introspect(_) => String::new(),
         QueryPurpose::IntrospectError(message) => message.clone(),
-        // The key/value store is not replicated, and a value may be a secret
-        // (a session token), so there is nothing to record.
+        // The key/value store replicates its writes as effects of its own,
+        // not as statement text; and a value may be a secret (a session
+        // token), so the text is not kept.
         #[cfg(feature = "kv_cache")]
         QueryPurpose::KvCache(_) => String::new(),
         #[cfg(feature = "s3_backup")]

@@ -218,6 +218,24 @@ impl SeqIndex {
 /// request. Older ones are read back from the file.
 const HOT_RECORDS: usize = 4096;
 
+/// And no more than this many bytes of them, when a file is behind the
+/// window. Key/value cache records are a few hundred kilobytes each under a
+/// write burst, and four thousand of those would hold gigabytes in memory to
+/// save a read of the file. An in-memory database's window is its whole log,
+/// and is bounded by the retention budget instead (see
+/// [`ReplicationLog::hot_cap`]).
+const HOT_BYTES: usize = 128 * 1024 * 1024;
+
+/// Drops the oldest records of the window while it is over `cap` bytes,
+/// keeping at least one.
+fn trim_hot(hot: &mut std::collections::VecDeque<TxnRecord>, bytes: &mut usize, cap: usize) {
+    while *bytes > cap && hot.len() > 1 {
+        if let Some(old) = hot.pop_front() {
+            *bytes = bytes.saturating_sub(old.encoded_size_hint());
+        }
+    }
+}
+
 /// The file's durability: the database's own write-ahead log, when it has one.
 ///
 /// A record appended here is written to the file and then described to that
@@ -302,6 +320,11 @@ pub struct ReplicationLog {
     index: Mutex<BTreeMap<NodeId, SeqIndex>>,
     /// The newest records, ready to serve without a read.
     hot: Mutex<std::collections::VecDeque<TxnRecord>>,
+    /// What `hot` holds, by [`TxnRecord::encoded_size_hint`]. Changed only
+    /// under `hot`'s lock.
+    hot_bytes: std::sync::atomic::AtomicUsize,
+    /// Whether the window is all there is (an in-memory log).
+    windowed: bool,
     /// Records voided in memory whose replacement could not be written. They
     /// read back as void for the life of the process; the next open voids
     /// them for good.
@@ -540,6 +563,8 @@ impl ReplicationLog {
             file: Mutex::new(None),
             index: Mutex::new(BTreeMap::new()),
             hot: Mutex::new(std::collections::VecDeque::with_capacity(HOT_RECORDS)),
+            hot_bytes: std::sync::atomic::AtomicUsize::new(0),
+            windowed: true,
             voided: Mutex::new(std::collections::HashSet::new()),
             pending_at_open: Mutex::new(BTreeMap::new()),
             stamps_at_open: Mutex::new(BTreeMap::new()),
@@ -646,7 +671,13 @@ impl ReplicationLog {
                 conditional: found.conditional.iter().map(|((_, seq), tx)| (*seq, *tx)).collect(),
             })),
             index: Mutex::new(found.index),
+            hot_bytes: {
+                let mut bytes = found.hot.iter().map(TxnRecord::encoded_size_hint).sum();
+                trim_hot(&mut found.hot, &mut bytes, HOT_BYTES);
+                std::sync::atomic::AtomicUsize::new(bytes)
+            },
             hot: Mutex::new(found.hot),
+            windowed: false,
             voided: Mutex::new(std::collections::HashSet::new()),
             pending_at_open: Mutex::new(found.conditional),
             stamps_at_open: Mutex::new(found.stamps),
@@ -916,21 +947,40 @@ impl ReplicationLog {
         Ok(())
     }
 
+    /// How many bytes the hot window may hold. [`HOT_BYTES`] with a file
+    /// behind it. Without one the window is the log: the retention budget,
+    /// times the slack a connected peer is allowed on a file-backed log
+    /// ([`KEEP_FOR_PEERS_FACTOR`]), and never less than [`HOT_BYTES`].
+    fn hot_cap(&self) -> usize {
+        if !self.windowed {
+            return HOT_BYTES;
+        }
+        let budget = self.retention().saturating_mul(KEEP_FOR_PEERS_FACTOR);
+        usize::try_from(budget).unwrap_or(usize::MAX).max(HOT_BYTES)
+    }
+
     /// Puts `record` in the hot window, over any record it replaces.
     fn remember(&self, record: TxnRecord) {
         let mut hot = self.hot.lock();
+        let mut bytes = self.hot_bytes.load(std::sync::atomic::Ordering::Relaxed);
         if let Some(held) = hot
             .iter_mut()
             .rev()
             .find(|r| r.origin == record.origin && r.seq == record.seq)
         {
+            bytes = bytes.saturating_sub(held.encoded_size_hint()) + record.encoded_size_hint();
             *held = record;
-            return;
+        } else {
+            if hot.len() == HOT_RECORDS {
+                if let Some(old) = hot.pop_front() {
+                    bytes = bytes.saturating_sub(old.encoded_size_hint());
+                }
+            }
+            bytes += record.encoded_size_hint();
+            hot.push_back(record);
         }
-        if hot.len() == HOT_RECORDS {
-            hot.pop_front();
-        }
-        hot.push_back(record);
+        trim_hot(&mut hot, &mut bytes, self.hot_cap());
+        self.hot_bytes.store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The record's transaction committed: nothing about it is conditional
