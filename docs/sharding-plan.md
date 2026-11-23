@@ -17,7 +17,19 @@ so.**
 
 ## 0. Summary
 
-Two tracks, in this order:
+**Two sharding paths (owner, 2026-11-23).** A deployment uses either or both:
+
+1. **Key sharding.** Rows are spread over shards by a column's value
+   (`#[rdb(shard_by = "store_id")]`). Each statement goes to the shard that
+   owns its key. Either the client (Track A `Router`, ORM) or the gateway
+   (Track B) does the routing, with the same `rasterizeddb_router` function
+   and map.
+2. **Per-user shards.** Who logs in decides the shard. The gateway maps the
+   login role to one shard at authentication and **locks** the session
+   there: no other shard, no fan-out, no way to switch. The user's data
+   lives whole on that shard; tables need no tenant column (G11).
+
+Built in two tracks, in this order:
 
 - **Track A, client-side sharding (§3).** A shared routing crate, a
   shard-aware router in `rasterizeddb_client` with its ORM routing models by
@@ -80,7 +92,7 @@ D1 and D6.
 | D6 | Where Track B stops | Phase **1c** gives write scale-out without HA. Phase **3** is the first production topology for a large target. Decide this before B1a starts, because phases 1–2 alone have no replicas. |
 | D7 | HA before phase 3 | Allow the **existing replication one-way per shard** as a warm standby with manual failover. It is statement-based, with known divergence risks (§4.3 B1a.13). The alternative is RF1 plus S3 restore. |
 | D8 | Default for a statement with no route key (`unrouted`, B1b) | **`refuse` by default.** Turn on `fan_out` per role (reporting, admin) or per gateway where the app expects it. A forgotten key then surfaces as an error instead of a silent whole-cluster scan. `unrouted_writes = each_shard` is never a gateway-wide default, because it is not atomic before 2PC |
-| D9 | User-based routing (G11): which modes, and the default | Build **both modes**. `user_routing = off` by default, `prefer` where tenants log in as their own roles. `user_key` is the one to choose when the data has a tenant column, because moves and fan-out keep working. `user_shard` is for apps whose tables have no tenant column |
+| D9 | User-based routing (G11) | **Decided 2026-11-23:** two paths only. Key sharding (`shard_by`, routed by client or gateway) and per-user shards (login → one shard, locked). The earlier `user_key` mode, a login carrying a key into key sharding, is dropped. `user_routing = off` by default |
 | D10 | Licensing | **Decided 2026-11-23:** only the service and enterprise features are dual-licensed: `tenant_isolation`, `segregation_policies` and G11 user routing, in their engine and gateway parts. Everything else stays GPL-3.0-only: the engine, partitioning, sharding, `rasterizeddb_router`, the gateway's routing, the client/ORM, R-ALL replication, and the T0 security fixes. Under the dual licence, an organisation with more than 100 employees, more than 1 million in revenue or more than 5 million in assets must obtain a licence from **Denev Operations EOOD**. The layout this needs is in §10 |
 | D11 | HA for customer databases | **Decided 2026-11-23:** replication covers **every database in an instance, any number of them**, not only the default one. The work items are in §4.10 (R-ALL) |
 | D12 | Are the dual-licensed features in the default build? | **No (recommended).** They break the "default all features" rule on purpose: the default binary and images stay pure GPL, and a separate `enterprise` build (binary, Docker tag, package) carries them. Then nobody runs licensed code without choosing to |
@@ -530,8 +542,8 @@ guard before the drain samples the running set**, as in sharding.md §6.
 
 **B1a.6 Classification: on a shard, once per statement shape.** The
 gateway routes in this order:
-0. **The login role's route** (G11, `user_routing`), resolved once at
-   authentication. A pinned user skips steps 1–4 entirely.
+0. **The login role's shard** (G11, per-user shards), resolved once at
+   authentication. A pinned user skips steps 1–4 entirely and is locked.
 1. **A route key carried with the request.** The native request header
    field (set by the ORM and `Router`, A4b), or `SET rdb.route_key` /
    `SET LOCAL rdb.route_key`. No inspection of the SQL at all.
@@ -1082,30 +1094,35 @@ extended by B1b/B1c's fan-out.
   - bytes relayed and sessions;
   - a hop-latency histogram in per-core buckets.
 
-**G11. User-based routing (gateway only).** The gateway can route by **who
-logs in** instead of by what the statement says. The login role is resolved
-to a route once, when authentication completes (G9). From then on every
-statement on that connection is routed with no per-statement work at all:
-no template lookup, no hash. The Track A `Router` has no equivalent; this is
-a gateway feature.
+**G11. Per-user shards (gateway only), the second sharding path.** The
+gateway routes by **who logs in** instead of by what the statement says.
+When authentication completes (G9), the login role is resolved to its shard,
+and the session is **locked** to that shard for life. From then on every
+statement on that connection goes there with no per-statement work at all:
+no template lookup, no hash. Key sharding (path 1) is the other path; a
+deployment can run both, with tenant users pinned and service roles routed
+by key. The Track A `Router` has no equivalent; this is a gateway feature.
 
-*Two modes, chosen per role:*
+| | Per-user shard |
+|---|---|
+| What it means | The role is pinned to a shard (`shard_id`). Every session of that user goes to that shard, whole, and cannot leave it |
+| The data | Tables need no tenant column. A shard holds the data of the users placed on it, like a database per group of users but spread over instances |
+| Moves | Allowed only if the user's rows can be identified: the user's own database, or an owner column declared for the table in the cluster catalogue, else refused. A move is copy, verify, then re-pin, with the user's sessions drained first |
 
-| Mode | What it means | The data | Moves |
-|---|---|---|---|
-| **`user_key`** | The role carries a route key, a tenant value (`42`, `'store-17'`) or the role's own name as a text key. The gateway sets it as the session's route key and **locks** it | Rows are sharded by the tenant column as everywhere else in this plan. Several users may share one tenant key | Ordinary range and tenant moves (B2, A6). The user follows the key with no extra step |
-| **`user_shard`** | The role is pinned to a shard (`shard_id`). Every session of that user goes to that shard, whole | Tables need no tenant column. A shard holds the data of the users placed on it, like a database per group of users but spread over instances | Allowed only if the user's rows can be identified: an owner column declared for the table in the cluster catalogue, else refused. A move is copy, verify, then re-pin, with the user's sessions drained first |
+(An earlier draft also had a `user_key` mode, where the login carried a
+tenant key into key sharding. The owner dropped it on 2026-11-23: the two
+paths stay separate.)
 
 *The mapping:*
 - **Storage.** It lives in a cluster catalogue table,
-  `rdb_user_routes(role, mode, route_key, shard_id, locked, allow_fan_out, epoch)`.
+  `rdb_user_routes(role, shard_id, epoch)`.
   It is on the home shard in phases 1–2 and under the authority from B2,
   versioned with the map epoch.
 - **Gateway cache.** The gateway caches the mapping beside each role's SCRAM
   keys (G9) under a role epoch. A changed mapping takes effect at the user's
-  next connection, and immediately for a `user_shard` move (below).
-- **SQL.** `ALTER USER alice ROUTE KEY '42'`, `ALTER USER bob ROUTE SHARD 3`
-  and `ALTER USER carol ROUTE NONE`, by `cluster_admin` only. `SHOW USER
+  next connection, and immediately for a move (below).
+- **SQL.** `ALTER USER bob ROUTE SHARD 3` and `ALTER USER carol ROUTE
+  NONE`, by `cluster_admin` only. `SHOW USER
   ROUTES`.
 - **Gateway setting `user_routing`:**
   - `off` (default): statement routing only.
@@ -1114,24 +1131,24 @@ a gateway feature.
     for gateways that serve only tenant users.
 
 *Rules:*
-- **A locked route cannot be escaped.** For a locked role, `SET
-  rdb.route_key` and `SET LOCAL rdb.route_key` are refused (`42501`).
-- **No fan-out for pinned roles by default.** `unrouted` is forced to
-  `refuse` unless the role has `allow_fan_out`. A tenant user therefore never
-  scans other users' shards.
+- **The lock cannot be escaped.** For a pinned role, `SET rdb.route_key`,
+  `SET LOCAL rdb.route_key` and a route key in the native request header are
+  refused (`42501`).
+- **No fan-out, ever, for a pinned role.** `unrouted` is `refuse` for it
+  with no per-role override, so a pinned user never reaches another shard.
 - **Service and admin roles stay unmapped** and use statement routing and
   fan-out as configured.
-- **`user_shard` refuses a statement it cannot keep on the user's shard.**
+- **A pinned session refuses a statement it cannot keep on the user's shard.**
   - Sharded tables reaching other ranges get `RDB02` from the shard, as
     always.
   - Global tables are readable if they live on the user's shard or are
     reference tables (B5); otherwise they are refused.
-- **The shard checks too (R1 holds).** It admits a `user_shard` virtual
+- **The shard checks too (R1 holds).** It admits a pinned virtual
   session only if its own placement list names that role at the request's
   epoch, else `Moved` (`before_effect`, so the gateway refreshes and
   retries). A gateway with a stale mapping therefore costs a retry, never a
   session on the wrong shard.
-- **A move drains first.** Moving a `user_shard` user fences new sessions
+- **A move drains first.** Moving a pinned user fences new sessions
   for that role with a retryable `57P03` for up to 5 s, waits for open
   transactions to finish, copies, verifies, bumps the placement epoch and
   releases.
@@ -1145,11 +1162,12 @@ a gateway feature.
 *Cost:* one lookup per connection, at login; zero per statement.
 
 *Tests:*
-- A pinned user with a forged `SET rdb.route_key` is refused.
-- A `user_shard` session arriving at a shard that does not host the role
+- A pinned user with a forged `SET rdb.route_key`, a header route key, or an
+  unrouted statement is refused.
+- A pinned session arriving at a shard that does not host the role
   gets `Moved` *(skip the shard-side placement check)*.
 - A remapped user's next connection lands on the new shard.
-- Moving a `user_shard` user under load loses and duplicates nothing (the
+- Moving a pinned user under load loses and duplicates nothing (the
   digest equals the twin's).
 - `require` refuses an unmapped login.
 
@@ -1201,7 +1219,7 @@ switch, dormant until configured.
 |---|---|---|---|
 | **Database as a service** (one database per customer, strict isolation) | `tenant_isolation` in `rasterizeddb_enterprise` and `rasterizeddb_gateway_enterprise` (dual-licensed, §10) | core `--tenant-mode strict` (`off` by default); gateway `tenancy = database` | Works on **one** shard too (a single server plus gateway); sharding spreads customers over shards |
 | **Enterprise segregation** (placement by policy) | `segregation_policies` (needs `sharding`) in `rasterizeddb_enterprise`; `segregation` in `rasterizeddb_gateway_enterprise` (dual-licensed, §10) | `placement_policies = enforce` (`off` by default) | The authority and moves (B2); `tenant_isolation` when policies apply to databases |
-| (base for both) user routing, `user_key`/`user_shard` | `user_routing` in `rasterizeddb_gateway_enterprise` (dual-licensed, §10) | `user_routing = off \| prefer \| require` (G11) | — |
+| (base for both) per-user shards (G11) | `user_routing` in `rasterizeddb_gateway_enterprise` (dual-licensed, §10) | `user_routing = off \| prefer \| require` (G11) | — |
 
 **The security floor comes first, in every build.** It is now planned in full as **R0 of the role system plan** (`docs/roles-plan.md`, branch `wip/roles`, GPL and standard). T1's process-admin split uses that plan's R1 `PROCESS ADMIN` attribute. An isolation audit on
 2026-11-23 found that today **any login role can make itself superuser**.
@@ -1321,7 +1339,7 @@ provisioning about 2k LOC.
 
   `EXCLUSIVE` means no other customer or policy may share those shards. A
   policy attaches to a tenant (`ALTER TENANT acme SET POLICY …`), a role
-  (`user_key`/`user_shard`) or a route key.
+  (per-user shard) or a route key.
 - **Enforcement, at every layer, so one bug is not a breach:**
   1. The authority refuses any map edit, move, rebalance or `CREATE TENANT`
      that would place data against its policy.
