@@ -444,8 +444,14 @@ pub(super) fn parent_violation(parent_table: &str, fk: &ForeignKey, child_table:
 
 /// `ON DELETE` of composite key `fk` (on `child_table`) for the parent
 /// tuples `tuples` a `DELETE` from `parent_table` removes, already locked
-/// by the caller. A blocking key onto the table itself is put in `deferred`
-/// to be asked once the delete has run.
+/// by the caller: `NO ACTION` and `RESTRICT` refuse while a child references
+/// one (a key onto the table itself is put in `deferred`, to be asked once
+/// the delete has run); `CASCADE` deletes the referencing rows; `SET NULL`
+/// and `SET DEFAULT` set the key's columns (or the ones the action lists).
+/// The actions run as statements in the delete's transaction, so a cascade
+/// that triggers another works by recursion; afterwards, anything still
+/// referencing a deleted tuple as of now is refused, as the one-column path
+/// refuses it.
 #[allow(clippy::too_many_arguments)]
 async fn on_delete_fut(
     database: &Arc<Database>,
@@ -453,36 +459,93 @@ async fn on_delete_fut(
     child_table: &str,
     fk: &ForeignKey,
     tuples: &[Vec<String>],
-    _depth: usize,
+    depth: usize,
     tx: TxId,
     deferred: &mut Vec<SelfReference>,
 ) -> Result<(), String> {
+    use crate::core::rql::foreign_key::ReferentialAction;
     let child_tuples: Vec<Vec<String>> =
         parent_tuples_for_child(database, child_table, fk, tuples).into_iter().flatten().collect();
     if child_tuples.is_empty() {
         return Ok(());
     }
-    if !fk.on_delete.blocks() {
-        return Err(format!(
-            "foreign key \"{}\": ON DELETE {:?} of a composite key is not supported yet",
-            fk.name, fk.on_delete
-        ));
-    }
-    // The table onto itself: its referencing rows may be deleted by this
-    // same statement, so asked once it has run.
-    if child_table.eq_ignore_ascii_case(parent_table) {
-        deferred.push(SelfReference {
-            fk_name: fk.name.clone(),
-            column: String::new(),
-            literals: Vec::new(),
-            composite: Some((fk.clone(), child_tuples)),
-        });
+    if fk.on_delete.blocks() {
+        // The table onto itself: its referencing rows may be deleted by this
+        // same statement, so asked once it has run.
+        if child_table.eq_ignore_ascii_case(parent_table) {
+            deferred.push(SelfReference {
+                fk_name: fk.name.clone(),
+                column: String::new(),
+                literals: Vec::new(),
+                composite: Some((fk.clone(), child_tuples)),
+            });
+            return Ok(());
+        }
+        if referenced_by_child(database, child_table, fk, &child_tuples, tx).await? {
+            return Err(parent_violation(parent_table, fk, child_table));
+        }
         return Ok(());
     }
+    let set = |columns: &[String], value: &dyn Fn(&str) -> String| {
+        columns.iter().map(|c| format!("{c} = {}", value(c))).collect::<Vec<_>>().join(", ")
+    };
+    for chunk in child_tuples.chunks(chunk_for(fk.columns.len())) {
+        let predicate = tuple_predicate(&fk.columns, chunk);
+        let statement = match fk.on_delete {
+            ReferentialAction::Cascade => format!("DELETE FROM {child_table} WHERE {predicate}"),
+            ReferentialAction::SetNull => {
+                format!("UPDATE {child_table} SET {} WHERE {predicate}", set(fk.on_delete_set_columns(), &|_| "NULL".to_string()))
+            }
+            ReferentialAction::SetDefault => format!(
+                "UPDATE {child_table} SET {} WHERE {predicate}",
+                set(fk.on_delete_set_columns(), &|c| default_literal_for(database, child_table, c))
+            ),
+            // The blocking actions returned above.
+            _ => return Ok(()),
+        };
+        run_action(database, fk, child_table, &statement, depth, tx).await?;
+    }
+    // As of now, past this transaction's snapshot: a child committed while
+    // the tuple's lock was waited for is refused, never left an orphan.
     if referenced_by_child(database, child_table, fk, &child_tuples, tx).await? {
-        return Err(parent_violation(parent_table, fk, child_table));
+        return Err(match fk.on_delete {
+            // The declared default is itself one of the deleted tuples.
+            ReferentialAction::SetDefault => parent_violation(parent_table, fk, child_table),
+            _ => serialization_failure(parent_table, fk, child_table),
+        });
     }
     Ok(())
+}
+
+/// Runs a foreign key's action `statement` on `child_table` in `tx`, one
+/// level deeper (`MAX_CASCADE_DEPTH` bounds a cycle).
+async fn run_action(
+    database: &Arc<Database>,
+    fk: &ForeignKey,
+    child_table: &str,
+    statement: &str,
+    depth: usize,
+    tx: TxId,
+) -> Result<(), String> {
+    let Some(purpose) = recognize_query_purpose(statement) else {
+        return Err(format!("could not build the action for \"{}\"", fk.name));
+    };
+    let response = Box::pin(execute_with_context(purpose, database.clone(), depth + 1, tx)).await;
+    if response.first() == Some(&3) {
+        let message = String::from_utf8_lossy(&response[1..]).to_string();
+        return Err(format!("foreign key \"{}\" action on \"{}\" failed: {}", fk.name, child_table, message));
+    }
+    Ok(())
+}
+
+/// What the one-column path reports for a child row an action could not
+/// see: committed after the statement's snapshot (40001).
+fn serialization_failure(parent_table: &str, fk: &ForeignKey, child_table: &str) -> String {
+    format!(
+        "could not serialize access: a row of \"{}\" referencing \"{}\" was committed after this transaction's \
+         snapshot, so foreign key \"{}\" could not act on it",
+        child_table, parent_table, fk.name
+    )
 }
 
 /// The old tuples of `change` (a composite key's referenced columns moved by
@@ -504,16 +567,20 @@ async fn vanished_tuples_fut(
 }
 
 /// `ON UPDATE` of composite key `fk` (on `child_table`) once the `UPDATE`
-/// of `parent_table` has written: `NO ACTION` asks whether a child still
-/// references an old tuple no parent holds now; `RESTRICT` of a table onto
-/// itself (put off by `lock_keys_before_update`) every moved tuple.
+/// of `parent_table` has written, for the old tuples no parent row holds
+/// now: `NO ACTION` refuses while a child references one (`RESTRICT` of a
+/// table onto itself, put off by `lock_keys_before_update`, every moved
+/// tuple); `CASCADE` moves each child's tuple to its parent's new one, all
+/// pairs in one statement (`CASE`), so pairs that chain are applied to the
+/// children as they were; `SET NULL` and `SET DEFAULT` set every key column.
+/// Afterwards anything still referencing a vanished tuple is refused.
 async fn on_update_fut(
     database: &Arc<Database>,
     parent_table: &str,
     child_table: &str,
     fk: &ForeignKey,
     change: &KeyChange,
-    _depth: usize,
+    depth: usize,
     tx: TxId,
 ) -> Result<(), String> {
     use crate::core::rql::foreign_key::ReferentialAction;
@@ -529,19 +596,62 @@ async fn on_update_fut(
         return Ok(());
     }
     let old: Vec<Vec<String>> = vanished.iter().map(|i| change.old_tuples[*i].clone()).collect();
-    let child_old: Vec<Vec<String>> =
-        parent_tuples_for_child(database, child_table, fk, &old).into_iter().flatten().collect();
-    if child_old.is_empty() {
+    // (index into `change`, the old tuple at the child's types), for each
+    // old tuple some child value can equal.
+    let moved: Vec<(usize, Vec<String>)> = parent_tuples_for_child(database, child_table, fk, &old)
+        .into_iter()
+        .zip(&vanished)
+        .filter_map(|(child, i)| child.map(|t| (*i, t)))
+        .collect();
+    if moved.is_empty() {
         return Ok(());
     }
+    let child_old: Vec<Vec<String>> = moved.iter().map(|(_, t)| t.clone()).collect();
     if !fk.on_update.blocks() {
-        return Err(format!(
-            "foreign key \"{}\": ON UPDATE {:?} of a composite key is not supported yet",
-            fk.name, fk.on_update
-        ));
+        for chunk in moved.chunks(chunk_for(fk.columns.len())) {
+            let tuples: Vec<Vec<String>> = chunk.iter().map(|(_, t)| t.clone()).collect();
+            let predicate = tuple_predicate(&fk.columns, &tuples);
+            let assignments: Vec<String> = fk
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(at, column)| {
+                    let value = match fk.on_update {
+                        ReferentialAction::Cascade => {
+                            let new_of = |i: usize| change.new_tuples[i][at].clone().unwrap_or_else(|| "NULL".to_string());
+                            match chunk {
+                                [(i, _)] => new_of(*i),
+                                _ => {
+                                    let mut case = "CASE".to_string();
+                                    for (i, tuple) in chunk {
+                                        case.push_str(&format!(
+                                            " WHEN {} THEN {}",
+                                            tuple_predicate(&fk.columns, std::slice::from_ref(tuple)),
+                                            new_of(*i)
+                                        ));
+                                    }
+                                    case.push_str(&format!(" ELSE {column} END"));
+                                    case
+                                }
+                            }
+                        }
+                        ReferentialAction::SetNull => "NULL".to_string(),
+                        _ => default_literal_for(database, child_table, column),
+                    };
+                    format!("{column} = {value}")
+                })
+                .collect();
+            let statement = format!("UPDATE {child_table} SET {} WHERE {predicate}", assignments.join(", "));
+            run_action(database, fk, child_table, &statement, depth, tx).await?;
+        }
     }
     if referenced_by_child(database, child_table, fk, &child_old, tx).await? {
-        return Err(parent_violation(parent_table, fk, child_table));
+        return Err(match fk.on_update {
+            ReferentialAction::Cascade | ReferentialAction::SetNull => {
+                serialization_failure(parent_table, fk, child_table)
+            }
+            _ => parent_violation(parent_table, fk, child_table),
+        });
     }
     Ok(())
 }
@@ -717,11 +827,11 @@ pub(super) fn on_delete<'a>(
     child_table: &'a str,
     fk: &'a ForeignKey,
     tuples: &'a [Vec<String>],
-    _depth: usize,
+    depth: usize,
     tx: TxId,
     deferred: &'a mut Vec<SelfReference>,
 ) -> Boxed<'a, Result<(), String>> {
-    Box::pin(on_delete_fut(database, parent_table, child_table, fk, tuples, _depth, tx, deferred))
+    Box::pin(on_delete_fut(database, parent_table, child_table, fk, tuples, depth, tx, deferred))
 }
 
 /// [`vanished_tuples_fut`], boxed where it is made, so a caller's frame never holds
@@ -745,10 +855,10 @@ pub(super) fn on_update<'a>(
     child_table: &'a str,
     fk: &'a ForeignKey,
     change: &'a KeyChange,
-    _depth: usize,
+    depth: usize,
     tx: TxId,
 ) -> Boxed<'a, Result<(), String>> {
-    Box::pin(on_update_fut(database, parent_table, child_table, fk, change, _depth, tx))
+    Box::pin(on_update_fut(database, parent_table, child_table, fk, change, depth, tx))
 }
 
 /// [`restrict_update_fut`], boxed where it is made, so a caller's frame never holds

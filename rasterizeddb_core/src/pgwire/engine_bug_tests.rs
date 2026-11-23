@@ -1573,3 +1573,197 @@ async fn composite_self_referencing_foreign_key_is_checked_at_the_end_of_the_sta
     .await
     .expect("bounded");
 }
+
+/// A composite key's actions, as PostgreSQL 17 applies them on the same
+/// statements: CASCADE deletes and moves the referencing tuples whole,
+/// SET NULL and SET DEFAULT set every key column or the ones the action
+/// lists (`ON DELETE SET NULL (b)`), a default that names no parent is
+/// 23503, and RESTRICT refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn composite_foreign_key_actions_match_postgres() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        let at = |rows: &[&str], tag: &str| -> Result<(Vec<String>, String), String> {
+            Ok((rows.iter().map(|r| r.to_string()).collect(), tag.to_string()))
+        };
+        let err = |code: &str| -> Result<(Vec<String>, String), String> { Err(code.to_string()) };
+        for sql in [
+            "CREATE TABLE p (x int, y int, PRIMARY KEY (x, y))",
+            "INSERT INTO p VALUES (1, 1), (1, 2), (2, 1), (2, 2), (3, 3), (0, 0)",
+            "CREATE TABLE cc (id int PRIMARY KEY, a int, b int, FOREIGN KEY (a, b) REFERENCES p ON DELETE CASCADE ON UPDATE CASCADE)",
+            "INSERT INTO cc VALUES (1, 1, 1), (2, 1, 2), (3, 2, 1), (4, NULL, 1)",
+        ] {
+            ok(&db, &mut s, sql).await;
+        }
+        for (sql, expected) in [
+            ("DELETE FROM p WHERE x = 1 AND y = 1", at(&[], "DELETE 1")),
+            ("SELECT id, a, b FROM cc ORDER BY id", at(&["2|1|2", "3|2|1", "4|NULL|1"], "SELECT 3")),
+            ("UPDATE p SET y = 9 WHERE x = 1 AND y = 2", at(&[], "UPDATE 1")),
+            ("SELECT id, a, b FROM cc ORDER BY id", at(&["2|1|9", "3|2|1", "4|NULL|1"], "SELECT 3")),
+            // Two parent rows moved by one statement, each child following
+            // its own parent.
+            ("UPDATE p SET x = x + 10 WHERE x = 2", at(&[], "UPDATE 2")),
+            ("SELECT id, a, b FROM cc ORDER BY id", at(&["2|1|9", "3|12|1", "4|NULL|1"], "SELECT 3")),
+            (
+                "CREATE TABLE cn (id int PRIMARY KEY, a int, b int, FOREIGN KEY (a, b) REFERENCES p ON DELETE SET NULL ON UPDATE SET NULL)",
+                at(&[], "CREATE TABLE"),
+            ),
+            ("INSERT INTO cn VALUES (1, 3, 3), (2, 12, 2)", at(&[], "INSERT 0 2")),
+            ("DELETE FROM p WHERE x = 3", at(&[], "DELETE 1")),
+            ("UPDATE p SET y = 5 WHERE x = 12 AND y = 2", at(&[], "UPDATE 1")),
+            ("SELECT id, a, b FROM cn ORDER BY id", at(&["1|NULL|NULL", "2|NULL|NULL"], "SELECT 2")),
+            (
+                "CREATE TABLE cs (id int PRIMARY KEY, a int, b int, FOREIGN KEY (a, b) REFERENCES p ON DELETE SET NULL (b))",
+                at(&[], "CREATE TABLE"),
+            ),
+            ("INSERT INTO cs VALUES (1, 12, 5), (2, 0, 0)", at(&[], "INSERT 0 2")),
+            ("DELETE FROM p WHERE x = 12 AND y = 5", at(&[], "DELETE 1")),
+            ("SELECT id, a, b FROM cs ORDER BY id", at(&["1|12|NULL", "2|0|0"], "SELECT 2")),
+            (
+                "CREATE TABLE cd (id int PRIMARY KEY, a int DEFAULT 0, b int DEFAULT 0, FOREIGN KEY (a, b) REFERENCES p ON DELETE SET DEFAULT)",
+                at(&[], "CREATE TABLE"),
+            ),
+            ("INSERT INTO p VALUES (7, 7)", at(&[], "INSERT 0 1")),
+            ("INSERT INTO cd VALUES (1, 7, 7)", at(&[], "INSERT 0 1")),
+            ("DELETE FROM p WHERE x = 7", at(&[], "DELETE 1")),
+            ("SELECT id, a, b FROM cd ORDER BY id", at(&["1|0|0"], "SELECT 1")),
+            // The default is the tuple being deleted.
+            ("DELETE FROM p WHERE x = 0", err("23503")),
+            (
+                "CREATE TABLE cd2 (id int PRIMARY KEY, a int DEFAULT 5, b int DEFAULT 5, FOREIGN KEY (a, b) REFERENCES p ON DELETE SET DEFAULT (b))",
+                at(&[], "CREATE TABLE"),
+            ),
+            ("INSERT INTO p VALUES (8, 8)", at(&[], "INSERT 0 1")),
+            ("INSERT INTO cd2 VALUES (1, 8, 8)", at(&[], "INSERT 0 1")),
+            // (8, 5) is no parent's.
+            ("DELETE FROM p WHERE x = 8", err("23503")),
+            ("SELECT id, a, b FROM cd2 ORDER BY id", at(&["1|8|8"], "SELECT 1")),
+            (
+                "CREATE TABLE cr (id int PRIMARY KEY, a int, b int, FOREIGN KEY (a, b) REFERENCES p ON UPDATE RESTRICT ON DELETE RESTRICT)",
+                at(&[], "CREATE TABLE"),
+            ),
+            ("INSERT INTO p VALUES (4, 4)", at(&[], "INSERT 0 1")),
+            ("INSERT INTO cr VALUES (1, 4, 4)", at(&[], "INSERT 0 1")),
+            ("UPDATE p SET y = 5 WHERE x = 4", err("23503")),
+            ("DELETE FROM p WHERE x = 4", err("23503")),
+            // MATCH FULL with a partial SET NULL: the action's own row breaks
+            // the key, as in PostgreSQL.
+            (
+                "CREATE TABLE cf (a int, b int, FOREIGN KEY (a, b) REFERENCES p MATCH FULL ON DELETE SET NULL (b))",
+                at(&[], "CREATE TABLE"),
+            ),
+            ("INSERT INTO cf VALUES (1, 9)", at(&[], "INSERT 0 1")),
+            ("DELETE FROM p WHERE x = 1 AND y = 9", err("23503")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        assert_eq!(
+            answer(
+                &db,
+                &mut s,
+                "SELECT conname, confupdtype, confdeltype, pg_get_constraintdef(oid) FROM pg_constraint \
+                 WHERE conname IN ('cs_a_b_fkey', 'cc_a_b_fkey') ORDER BY conname"
+            )
+            .await
+            .unwrap()
+            .0,
+            [
+                r#"cc_a_b_fkey|c|c|FOREIGN KEY ("a", "b") REFERENCES "p"("x", "y") ON UPDATE CASCADE ON DELETE CASCADE"#,
+                r#"cs_a_b_fkey|a|n|FOREIGN KEY ("a", "b") REFERENCES "p"("x", "y") ON DELETE SET NULL ("b")"#,
+            ]
+        );
+        assert_eq!(
+            answer(
+                &db,
+                &mut s,
+                "SELECT constraint_name, column_name, ordinal_position, position_in_unique_constraint \
+                 FROM information_schema.key_column_usage WHERE table_name = 'cc' ORDER BY constraint_name, ordinal_position"
+            )
+            .await
+            .unwrap()
+            .0,
+            ["cc_a_b_fkey|a|1|1", "cc_a_b_fkey|b|2|2", "cc_pkey|id|1|NULL"]
+        );
+        assert_eq!(
+            answer(
+                &db,
+                &mut s,
+                "SELECT constraint_name, unique_constraint_name, match_option, update_rule, delete_rule \
+                 FROM information_schema.referential_constraints ORDER BY constraint_name"
+            )
+            .await
+            .unwrap()
+            .0,
+            [
+                "cc_a_b_fkey|p_pkey|NONE|CASCADE|CASCADE",
+                "cd2_a_b_fkey|p_pkey|NONE|NO ACTION|SET DEFAULT",
+                "cd_a_b_fkey|p_pkey|NONE|NO ACTION|SET DEFAULT",
+                "cf_a_b_fkey|p_pkey|FULL|NO ACTION|SET NULL",
+                "cn_a_b_fkey|p_pkey|NONE|SET NULL|SET NULL",
+                "cr_a_b_fkey|p_pkey|NONE|RESTRICT|RESTRICT",
+                "cs_a_b_fkey|p_pkey|NONE|NO ACTION|SET NULL",
+            ]
+        );
+    })
+    .await
+    .expect("bounded");
+}
+
+/// What depends on a composite key, as PostgreSQL 17 decides it: the unique
+/// or primary key it references is not dropped without CASCADE (2BP01),
+/// which drops the key; nor is a referenced column; a referencing column's
+/// drop takes the key with it; a renamed column or table keeps it working;
+/// `DROP TABLE … CASCADE` drops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn composite_foreign_key_dependencies() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        let at = |rows: &[&str], tag: &str| -> Result<(Vec<String>, String), String> {
+            Ok((rows.iter().map(|r| r.to_string()).collect(), tag.to_string()))
+        };
+        let err = |code: &str| -> Result<(Vec<String>, String), String> { Err(code.to_string()) };
+        for (sql, expected) in [
+            ("CREATE TABLE pu (x int, y int, z int, CONSTRAINT pu_xy UNIQUE (x, y))", at(&[], "CREATE TABLE")),
+            ("INSERT INTO pu VALUES (1, 1, 1)", at(&[], "INSERT 0 1")),
+            ("CREATE TABLE cu (a int, b int, CONSTRAINT cu_fk FOREIGN KEY (b, a) REFERENCES pu (y, x))", at(&[], "CREATE TABLE")),
+            ("INSERT INTO cu VALUES (1, 1)", at(&[], "INSERT 0 1")),
+            ("ALTER TABLE pu DROP CONSTRAINT pu_xy", err("2BP01")),
+            ("ALTER TABLE pu DROP CONSTRAINT pu_xy CASCADE", at(&[], "ALTER TABLE")),
+            ("SELECT conname FROM pg_constraint WHERE conrelid = 'cu'::regclass", at(&[], "SELECT 0")),
+            ("INSERT INTO cu VALUES (5, 5)", at(&[], "INSERT 0 1")),
+            ("CREATE TABLE pk2 (x int, y int, PRIMARY KEY (x, y))", at(&[], "CREATE TABLE")),
+            ("CREATE TABLE ck2 (a int, b int, FOREIGN KEY (a, b) REFERENCES pk2)", at(&[], "CREATE TABLE")),
+            ("ALTER TABLE pk2 DROP CONSTRAINT pk2_pkey", err("2BP01")),
+            ("ALTER TABLE pk2 DROP COLUMN y", err("2BP01")),
+            // Dropping a referencing column drops the key, whole.
+            ("ALTER TABLE ck2 DROP COLUMN b", at(&[], "ALTER TABLE")),
+            ("SELECT conname FROM pg_constraint WHERE conrelid = 'ck2'::regclass", at(&[], "SELECT 0")),
+            ("INSERT INTO ck2 VALUES (9)", at(&[], "INSERT 0 1")),
+            ("ALTER TABLE pk2 DROP CONSTRAINT pk2_pkey", at(&[], "ALTER TABLE")),
+            ("CREATE TABLE pr (x int, y int, PRIMARY KEY (x, y))", at(&[], "CREATE TABLE")),
+            ("INSERT INTO pr VALUES (1, 1)", at(&[], "INSERT 0 1")),
+            ("CREATE TABLE cr2 (a int, b int, FOREIGN KEY (a, b) REFERENCES pr)", at(&[], "CREATE TABLE")),
+            ("INSERT INTO cr2 VALUES (1, 1)", at(&[], "INSERT 0 1")),
+            ("ALTER TABLE pr RENAME COLUMN y TO yy", at(&[], "ALTER TABLE")),
+            ("ALTER TABLE cr2 RENAME COLUMN b TO bb", at(&[], "ALTER TABLE")),
+            ("ALTER TABLE pr RENAME TO pr2", at(&[], "ALTER TABLE")),
+            (
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'cr2'::regclass",
+                at(&[r#"FOREIGN KEY ("a", "bb") REFERENCES "pr2"("x", "yy")"#], "SELECT 1"),
+            ),
+            ("INSERT INTO cr2 VALUES (1, 2)", err("23503")),
+            ("INSERT INTO cr2 VALUES (1, 1)", at(&[], "INSERT 0 1")),
+            ("DELETE FROM pr2", err("23503")),
+            ("DROP TABLE pr2", err("2BP01")),
+            ("DROP TABLE pr2 CASCADE", at(&[], "DROP TABLE")),
+            ("SELECT count(*) FROM pg_constraint WHERE conrelid = 'cr2'::regclass AND contype = 'f'", at(&["0"], "SELECT 1")),
+            ("INSERT INTO cr2 VALUES (9, 9)", at(&[], "INSERT 0 1")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+    })
+    .await
+    .expect("bounded");
+}

@@ -611,13 +611,36 @@ parent row holding all of its key values at once.
   value), by `ADD` over the rows already there (23503) unless `NOT VALID`,
   and by `VALIDATE CONSTRAINT`. A key onto the table itself is asked at the
   end of the statement, as a one-column one is.
-- The parent's `DELETE`, and an `UPDATE` that moves a referenced tuple, are
-  refused (23503) while a child still references it (`NO ACTION`,
-  `RESTRICT`). The violation names the tuple: `key (a, b)=(2, 2) is not
-  present in table "p"`.
+- The parent's `DELETE`, and an `UPDATE` that moves a referenced tuple, act
+  on the referencing rows whole: `NO ACTION` and `RESTRICT` refuse (23503)
+  while a child still references the tuple; `CASCADE` deletes the children,
+  or moves each to its parent's new tuple (pairs that chain in one statement
+  are applied as the children were); `SET NULL` and `SET DEFAULT` set every
+  key column, or, for `ON DELETE`, only the ones listed (PostgreSQL 15's
+  `ON DELETE SET NULL (b)`; a list on `ON UPDATE` is 0A000, as there). A
+  default that names no parent is 23503, as is a `MATCH FULL` key whose
+  `SET NULL (b)` leaves a mix of NULLs. The violation names the tuple:
+  `key (a, b)=(2, 2) is not present in table "p"`.
+- Dependencies follow PostgreSQL: the `UNIQUE` or `PRIMARY KEY` a key
+  references (its columns in any order) is not dropped without `CASCADE`
+  (2BP01), which drops the key; neither is a referenced column; dropping a
+  referencing column drops the key; `RENAME COLUMN` and `RENAME TO` on
+  either side keep it working; `DROP TABLE parent CASCADE` drops it.
+- Catalogues: `pg_constraint.conkey`/`confkey` list the columns in key
+  order and `confmatchtype` is `s` or `f`; `pg_get_constraintdef` (and so
+  psql's `\d` and `pg_dump`) writes `FOREIGN KEY (a, b) REFERENCES p(x, y)
+  [MATCH FULL] … [ON DELETE SET NULL (b)]`, every name quoted (PostgreSQL
+  quotes only where it must); `information_schema.key_column_usage`,
+  `referential_constraints` and `table_constraints` list the keys
+  (`table_constraints` leaves out PostgreSQL's `NOT NULL` rows). A dump
+  restores the key, here and on PostgreSQL. The PostgreSQL import carries a
+  composite key over whole, with `MATCH FULL` and an `ON DELETE SET` list
+  (`confdelsetcols`), where it used to leave it out with a note.
 - An unnamed key is `<table>_<a>_<b>_fkey`, numbered on a collision.
-- Not supported (0A000): a composite key on or onto a hash-partitioned table;
-  a composite key's `CASCADE`, `SET NULL` and `SET DEFAULT` actions.
+- Not supported (0A000): a composite key on or onto a hash-partitioned
+  table, by `CREATE TABLE`, `ADD` or a conversion (`ALTER TABLE …
+  PARTITION BY`); the checks and actions would have to read every partition.
+  One-column keys to and from partitioned tables are unchanged.
 
 Since the partitioning work's phase 3 P4 (`docs/partitioning.md`, "Phase 3 P4
 as built") foreign keys also run to and from hash-partitioned tables, and:

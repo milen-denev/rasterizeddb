@@ -1416,6 +1416,14 @@ mod tests {
             qualified_references("FOREIGN KEY (a) REFERENCES Parent(id)", "Parent"),
             "FOREIGN KEY (a) REFERENCES public.\"Parent\"(id)"
         );
+        // A composite key, its MATCH and its action's column list kept.
+        assert_eq!(
+            qualified_references(
+                "FOREIGN KEY (\"a\", \"b\") REFERENCES \"p\"(\"x\", \"y\") MATCH FULL ON DELETE SET NULL (\"b\")",
+                "p"
+            ),
+            "FOREIGN KEY (\"a\", \"b\") REFERENCES public.p(\"x\", \"y\") MATCH FULL ON DELETE SET NULL (\"b\")"
+        );
     }
 
     /// Every catalogue query `pg_dump` 18 sent a PostgreSQL 17 server while

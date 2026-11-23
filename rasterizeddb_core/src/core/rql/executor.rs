@@ -7229,60 +7229,68 @@ pub(crate) fn sql_literal(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
-/// The column that would be left with no unique key by dropping the
-/// constraint `name` of `table`: what a foreign key referencing that column
-/// depends on. `None` when the name is no single-column primary key or
-/// UNIQUE (a composite key is no foreign key's target, a partial one
-/// neither), or when another key over the column stays.
+/// The columns that would be left with no unique key by dropping the
+/// constraint `name` of `table`: what a foreign key referencing exactly
+/// those columns depends on. One column for a one-column primary key or
+/// UNIQUE; a composite key's columns, in its order, for a composite one,
+/// which a composite foreign key may reference (in any order). `None` when
+/// the name is no such key (a partial one is no foreign key's target), or
+/// when another key over the same columns stays.
 ///
 /// PostgreSQL ties a foreign key to the one index it was created against.
 /// Nothing here records which, so a key depends on a constraint only while
-/// that constraint is the last thing keeping its column unique.
-fn column_losing_its_key(
+/// that constraint is the last thing keeping its columns unique.
+fn columns_losing_their_key(
     schema: &crate::core::row::schema::TableSchema,
     table: &str,
     name: &str,
-) -> Option<String> {
+) -> Option<Vec<String>> {
     let named = |n: &str| n.eq_ignore_ascii_case(name);
     let whole = || schema.unique_keys.iter().filter(|k| !k.is_deleted && k.predicate.is_none());
     let pk = primary_key_constraint(schema, table);
     // What the name drops, as `ALTER TABLE … DROP CONSTRAINT` reads it: a
     // stored key first, then an inline primary key's flag, then a UNIQUE
     // column's.
-    let (column, flag_goes) = if let Some(key) = whole().find(|k| named(&k.name)) {
-        match key.columns.as_slice() {
-            [column] => (column.clone(), false),
-            _ => return None,
-        }
+    let (columns, flag_goes) = if let Some(key) = whole().find(|k| named(&k.name)) {
+        (key.columns.clone(), false)
     } else if let Some(column) = pk.as_ref().filter(|p| p.inline && named(&p.name)).and_then(|p| p.column.clone()) {
-        (column, true)
+        (vec![column], true)
     } else {
         let inline_primary =
             |column: &str| pk.as_ref().is_some_and(|p| p.inline && p.column.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(column)));
-        (implicit_unique_column(name, table, &schema.fields).filter(|column| !inline_primary(column))?, true)
+        (vec![implicit_unique_column(name, table, &schema.fields).filter(|column| !inline_primary(column))?], true)
     };
-    let another_key = whole().any(|k| !named(&k.name) && k.columns.len() == 1 && k.columns[0].eq_ignore_ascii_case(&column));
+    let same_set = |k: &crate::core::rql::unique_key::UniqueKey| {
+        k.columns.len() == columns.len() && columns.iter().all(|c| k.columns.iter().any(|kc| kc.eq_ignore_ascii_case(c)))
+    };
+    let another_key = whole().any(|k| !named(&k.name) && same_set(k));
     let flag_stays = !flag_goes
-        && schema.fields.iter().any(|f| !f.is_deleted && f.is_unique && f.name.eq_ignore_ascii_case(&column));
-    (!another_key && !flag_stays).then_some(column)
+        && columns.len() == 1
+        && schema.fields.iter().any(|f| !f.is_deleted && f.is_unique && f.name.eq_ignore_ascii_case(&columns[0]));
+    (!another_key && !flag_stays).then_some(columns)
 }
 
 /// The foreign keys that depend on the constraint `name` of `table`
-/// ([`column_losing_its_key`]), as `(table holding the key, the key's name)`,
-/// the table's own self-references among them.
+/// ([`columns_losing_their_key`]): each referencing exactly those columns
+/// (a composite key's in any order), as `(table holding the key, the key's
+/// name)`, the table's own self-references among them.
 fn keys_depending_on_constraint(
     database: &Database,
     schema: &crate::core::row::schema::TableSchema,
     table: &str,
     name: &str,
 ) -> Vec<(String, String)> {
-    let Some(column) = column_losing_its_key(schema, table, name) else {
+    let Some(columns) = columns_losing_their_key(schema, table, name) else {
         return Vec::new();
     };
     let mut dependents: Vec<(String, String)> = database
         .referencing_keys(table)
         .into_iter()
-        .filter(|(_, fk)| !fk.is_deleted && fk.single().is_some_and(|(_, parent)| parent.eq_ignore_ascii_case(&column)))
+        .filter(|(_, fk)| {
+            !fk.is_deleted
+                && fk.parent_columns.len() == columns.len()
+                && columns.iter().all(|c| fk.has_parent_column(c))
+        })
         .map(|(child, fk)| (child, fk.name))
         .collect();
     dependents.sort();

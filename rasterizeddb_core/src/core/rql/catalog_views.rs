@@ -74,6 +74,9 @@ const VIEWS: &[&str] = &[
     "pg_depend",
     "pg_extension",
     "pg_partitioned_table",
+    "table_constraints",
+    "key_column_usage",
+    "referential_constraints",
 ];
 
 /// The relations built from [`crate::core::rql::catalog_model::Model`].
@@ -338,7 +341,15 @@ const SCHEMA: &str = "public";
 /// COLUMNS FROM "rdb_roles"` became `SHOW __cat_columns_… FROM "rdb_roles"`,
 /// which returned one empty column and left every client that asks a table for
 /// its columns believing it had none.
-const QUALIFIED_ONLY: [&str; 4] = ["columns", "tables", "views", "sequences"];
+const QUALIFIED_ONLY: [&str; 7] = [
+    "columns",
+    "tables",
+    "views",
+    "sequences",
+    "table_constraints",
+    "key_column_usage",
+    "referential_constraints",
+];
 
 /// Whether `view` may only be matched with its schema in front of it.
 fn needs_qualifier(view: &str) -> bool {

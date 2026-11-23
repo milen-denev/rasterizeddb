@@ -58,6 +58,11 @@ pub struct ForeignKey {
     /// `pg_constraint.convalidated`: false for a key added `NOT VALID` and
     /// never validated, whose rows PostgreSQL itself never checked.
     pub validated: bool,
+    /// `confmatchtype = 'f'`: MATCH FULL (one column is the same either way).
+    pub match_full: bool,
+    /// `confdelsetcols` (PostgreSQL 15+): the columns `ON DELETE SET NULL
+    /// (…)` / `SET DEFAULT (…)` sets; empty for every key column.
+    pub on_delete_columns: Vec<String>,
 }
 
 /// What one schema of a PostgreSQL database holds.
@@ -370,7 +375,9 @@ async fn read_constraints(
                 fn.nspname AS refschema, \
                 con.confupdtype::text AS onupdate, \
                 con.confdeltype::text AS ondelete, \
-                con.convalidated::text AS validated \
+                con.convalidated::text AS validated, \
+                con.confmatchtype::text AS matchtype, \
+                to_jsonb(con) ->> 'confdelsetcols' AS delsetcols \
          FROM pg_constraint con \
          JOIN pg_class rel ON rel.oid = con.conrelid \
          JOIN pg_namespace n ON n.oid = rel.relnamespace \
@@ -409,6 +416,18 @@ async fn read_constraints(
             referenced_relid,
             result.get(row, "refcols").unwrap_or("{}"),
         );
+        // `confdelsetcols`, a JSON array of attribute numbers (absent before
+        // PostgreSQL 15, where no such list exists). One that does not
+        // resolve whole is not guessed at: the key is reported instead.
+        let (on_delete_columns, set_list_unresolved) = match result.get(row, "delsetcols") {
+            Some(json) if json.trim_start().starts_with('[') => {
+                let list = format!("{{{}}}", json.trim().trim_start_matches('[').trim_end_matches(']'));
+                let resolved = columns_by_number(tables, relid, &list);
+                let unresolved = resolved.is_empty() && list.trim() != "{}";
+                (resolved, unresolved)
+            }
+            _ => (Vec::new(), false),
+        };
 
         let Some(table) = tables.iter_mut().find(|t| t.oid == relid) else {
             continue;
@@ -430,6 +449,13 @@ async fn read_constraints(
                     ));
                     continue;
                 }
+                if set_list_unresolved {
+                    table.notes.push(format!(
+                        "foreign key {name} sets columns on delete that could not be resolved, and was not carried \
+                         over"
+                    ));
+                    continue;
+                }
                 if referenced_columns.is_empty() {
                     table.notes.push(format!(
                         "foreign key {} references a table that is not being imported, and was \
@@ -448,6 +474,8 @@ async fn read_constraints(
                     // `true`/`t` as text; anything unreadable is taken as
                     // validated, which only means the target checks the rows.
                     validated: !matches!(result.get(row, "validated"), Some("false") | Some("f")),
+                    match_full: result.get(row, "matchtype") == Some("f"),
+                    on_delete_columns,
                 });
             }
             _ => {}

@@ -122,3 +122,36 @@ async fn a_composite_key_without_its_fence_is_fenced_again() {
     .await
     .expect("bounded");
 }
+
+/// A composite key on or onto a hash-partitioned table is refused (0A000),
+/// by `CREATE TABLE`, `ADD` and a conversion alike, and the refused
+/// conversion leaves the plain table and its key as they were.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_composite_key_and_a_partitioned_table_are_refused() {
+    init_globals();
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path()).await;
+        run_ok(&db, "CREATE TABLE p (x INT, y INT, PRIMARY KEY (x, y))").await;
+        run_ok(&db, "CREATE TABLE hp (x BIGINT NOT NULL, y BIGINT NOT NULL, PRIMARY KEY (x, y)) PARTITION BY HASH (x) PARTITIONS 4").await;
+        run_ok(&db, "CREATE TABLE hc3 (id BIGINT NOT NULL PRIMARY KEY, a INT, b INT) PARTITION BY HASH (id) PARTITIONS 4").await;
+        run_ok(&db, "CREATE TABLE qc (id BIGINT NOT NULL PRIMARY KEY, a INT, b INT, FOREIGN KEY (a, b) REFERENCES p)").await;
+        for sql in [
+            "CREATE TABLE hc (a BIGINT, b BIGINT, FOREIGN KEY (a, b) REFERENCES hp)",
+            "CREATE TABLE hc2 (id BIGINT NOT NULL PRIMARY KEY, a INT, b INT, FOREIGN KEY (a, b) REFERENCES p) \
+             PARTITION BY HASH (id) PARTITIONS 4",
+            "ALTER TABLE hc3 ADD FOREIGN KEY (a, b) REFERENCES p",
+            "ALTER TABLE qc PARTITION BY HASH (id) PARTITIONS 4",
+            "ALTER TABLE p PARTITION BY HASH (x) PARTITIONS 4",
+        ] {
+            let e = run(&db, sql).await.expect_err(sql);
+            assert!(e.contains("is not supported"), "{sql}: {e}");
+            assert_eq!(crate::pgwire::sqlstate_for(&e), "0A000", "{sql}: {e}");
+        }
+        assert!(db.partitioned_table("qc").is_none() && db.partitioned_table("p").is_none());
+        let e = run(&db, "INSERT INTO qc (id, a, b) VALUES (1, 5, 5)").await.unwrap_err();
+        assert!(e.contains("violates foreign key constraint"), "{e}");
+    })
+    .await
+    .expect("bounded");
+}

@@ -192,3 +192,32 @@ async fn a_key_nothing_references_is_dropped_as_before() {
     run(&pool, "ALTER TABLE k DROP CONSTRAINT k_pkey").await;
     run(&pool, "INSERT INTO k VALUES (1, 1), (1, 1)").await;
 }
+
+/// A composite key a composite foreign key references follows the same
+/// rule (PostgreSQL 17): refused without CASCADE, whichever order the key
+/// lists the columns in; CASCADE drops the foreign key and its table stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_composite_key_a_composite_foreign_key_references_follows_the_rule() {
+    let (_server, pool) = start().await;
+    run(
+        &pool,
+        "CREATE TABLE cp (x int, y int, z int, CONSTRAINT cp_xy UNIQUE (x, y), PRIMARY KEY (x, z));
+         CREATE TABLE cref (a int, b int, CONSTRAINT cref_fk FOREIGN KEY (b, a) REFERENCES cp (y, x));
+         CREATE TABLE cref2 (a int, c int, FOREIGN KEY (a, c) REFERENCES cp);
+         INSERT INTO cp VALUES (1, 1, 1);
+         INSERT INTO cref VALUES (1, 1);",
+    )
+    .await;
+    let (code, message) = refused(&pool, "ALTER TABLE cp DROP CONSTRAINT cp_xy").await;
+    assert_eq!(code, "2BP01", "{message}");
+    assert!(message.contains("cref_fk"), "{message}");
+    let (code, message) = refused(&pool, "ALTER TABLE cp DROP CONSTRAINT cp_pkey").await;
+    assert_eq!(code, "2BP01", "{message}");
+    assert!(message.contains("cref2_a_c_fkey"), "{message}");
+    run(&pool, "ALTER TABLE cp DROP CONSTRAINT cp_xy CASCADE").await;
+    assert_eq!(rows(&pool, "SELECT conname FROM pg_constraint WHERE conrelid = 'cref'::regclass").await, Vec::<String>::new());
+    run(&pool, "INSERT INTO cref VALUES (7, 7)").await;
+    // The other key is untouched.
+    let (code, _) = refused(&pool, "INSERT INTO cref2 VALUES (7, 7)").await;
+    assert_eq!(code, "23503");
+}

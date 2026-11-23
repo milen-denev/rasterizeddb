@@ -88,3 +88,44 @@ async fn a_composite_key_holds_on_the_tuple() {
     assert!(e.contains("MATCH FULL does not allow mixing of null and nonnull key values"), "{e}");
     ok(&pool, "INSERT INTO f VALUES (NULL, NULL)").await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_composite_keys_actions_and_catalogues() {
+    let (_s, pool) = server().await;
+    ok(&pool, "CREATE TABLE p (x int, y int, PRIMARY KEY (x, y))").await;
+    ok(&pool, "INSERT INTO p VALUES (1, 1), (1, 2), (2, 1)").await;
+    ok(&pool, "CREATE TABLE cc (id int PRIMARY KEY, a int, b int, FOREIGN KEY (a, b) REFERENCES p ON DELETE CASCADE ON UPDATE CASCADE)").await;
+    ok(&pool, "CREATE TABLE cs (id int PRIMARY KEY, a int, b int, FOREIGN KEY (a, b) REFERENCES p (x, y) ON DELETE SET NULL (b))").await;
+    ok(&pool, "INSERT INTO cc VALUES (1, 1, 1), (2, 1, 2), (3, 2, 1)").await;
+    ok(&pool, "INSERT INTO cs VALUES (1, 1, 2), (2, 2, 1)").await;
+    ok(&pool, "DELETE FROM p WHERE x = 1 AND y = 2").await;
+    assert_eq!(rows(&pool, "SELECT id, a, b FROM cc ORDER BY id").await, ["1|1|1", "3|2|1"]);
+    assert_eq!(rows(&pool, "SELECT id, a, b FROM cs ORDER BY id").await, ["1|1|NULL", "2|2|1"]);
+    // cs's (2, 1) blocks the parent's move (NO ACTION); cc would follow it.
+    refused(&pool, "UPDATE p SET y = 5 WHERE x = 2 AND y = 1", "23503").await;
+    ok(&pool, "DELETE FROM cs WHERE id = 2").await;
+    ok(&pool, "UPDATE p SET y = 5 WHERE x = 2 AND y = 1").await;
+    assert_eq!(rows(&pool, "SELECT id, a, b FROM cc ORDER BY id").await, ["1|1|1", "3|2|5"]);
+    assert_eq!(
+        rows(
+            &pool,
+            "SELECT constraint_name, column_name, ordinal_position::text, position_in_unique_constraint::text \
+             FROM information_schema.key_column_usage WHERE table_name = 'cc' ORDER BY constraint_name, ordinal_position"
+        )
+        .await,
+        ["cc_a_b_fkey|a|1|1", "cc_a_b_fkey|b|2|2", "cc_pkey|id|1|NULL"]
+    );
+    assert_eq!(
+        rows(
+            &pool,
+            "SELECT constraint_name, unique_constraint_name, match_option, update_rule, delete_rule \
+             FROM information_schema.referential_constraints ORDER BY constraint_name"
+        )
+        .await,
+        ["cc_a_b_fkey|p_pkey|NONE|CASCADE|CASCADE", "cs_a_b_fkey|p_pkey|NONE|NO ACTION|SET NULL"]
+    );
+    assert_eq!(
+        rows(&pool, "SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 'cs' AND constraint_type <> 'CHECK' ORDER BY 1").await,
+        ["cs_a_b_fkey|FOREIGN KEY", "cs_pkey|PRIMARY KEY"]
+    );
+}

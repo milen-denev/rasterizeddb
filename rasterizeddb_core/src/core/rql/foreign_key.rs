@@ -1015,25 +1015,16 @@ pub fn referenced_key_refusal(fk: &ForeignKey, parent: &ReferencedSide<'_>) -> O
 }
 
 /// What a composite key may not be yet, refused rather than half-enforced
-/// (0A000): a key whose `ON DELETE` or `ON UPDATE` acts (`CASCADE`, `SET
-/// NULL`, `SET DEFAULT`) rather than blocks, and a key on a partitioned
-/// table (`child_partitioned`; one onto a partitioned table is refused by
-/// [`referenced_key_refusal`]). `None` for a one-column key.
+/// (0A000): a key on a partitioned table (`child_partitioned`; one onto a
+/// partitioned table is refused by [`referenced_key_refusal`]), whose
+/// checks and actions would have to fan out over its partitions. `None`
+/// for a one-column key.
 pub fn composite_refusal(fk: &ForeignKey, table: &str, child_partitioned: bool) -> Option<String> {
     if !fk.is_composite() {
         return None;
     }
     if child_partitioned {
         return Some(format!("a composite foreign key on partitioned table \"{table}\" is not supported"));
-    }
-    for (what, action) in [("ON DELETE", fk.on_delete), ("ON UPDATE", fk.on_update)] {
-        if !action.blocks() {
-            return Some(format!(
-                "foreign key \"{}\": {what} {} of a composite foreign key is not supported yet",
-                fk.name,
-                action.sql()
-            ));
-        }
     }
     None
 }
