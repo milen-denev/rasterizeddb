@@ -2014,6 +2014,205 @@ fn next_text_operator(sql: &str) -> Option<(usize, usize, String)> {
     None
 }
 
+/// A query without the parentheses around a branch that group nothing:
+/// `(SELECT …) EXCEPT (SELECT …) ORDER BY 1` as `SELECT … EXCEPT SELECT …
+/// ORDER BY 1`, and `(SELECT …)` alone as the SELECT. Borrowed when there is
+/// nothing to remove.
+///
+/// The planners downstream read a branch as written from its `SELECT`, and a
+/// parenthesised one took a narrower path: a correlated subquery or an
+/// `EXISTS` in it was refused, where the same branch without parentheses ran.
+/// A branch keeps its parentheses when they do group: it has an `ORDER BY`,
+/// `LIMIT`, `OFFSET`, `FETCH` or `FOR` of its own. One that is itself a set
+/// operation, whose order of evaluation they decide, is written as the
+/// derived table it means (`(a UNION b) INTERSECT c` read its group as a
+/// relation with no name).
+pub fn plain_branch_parentheses(sql: &str) -> std::borrow::Cow<'_, str> {
+    use crate::core::rql::join::find_keyword;
+    use std::borrow::Cow;
+    const OPERATORS: [&str; 3] = ["UNION", "INTERSECT", "EXCEPT"];
+    const OWN_TAIL: [&str; 5] = ["ORDER", "LIMIT", "OFFSET", "FETCH", "FOR"];
+    let head = sql.trim_start();
+    let opens = head.starts_with('(');
+    // A point read has no parenthesis at all; anything else is a query
+    // with a parenthesis and, unless it opens with one, a set operation.
+    if !opens
+        && !(starts_with_keyword(head, "SELECT")
+            && memchr::memchr(b'(', sql.as_bytes()).is_some()
+            && OPERATORS.iter().any(|kw| contains_ignore_ascii_case(sql, kw.as_bytes())))
+    {
+        return Cow::Borrowed(sql);
+    }
+    let text = sql.trim().trim_end_matches(';').trim_end();
+    let operator = |text: &str, from: usize| {
+        OPERATORS.iter().filter_map(|kw| find_keyword(text, kw, from).map(|p| (p, kw.len()))).min_by_key(|(p, _)| *p)
+    };
+    // The branches: what lies between the top-level operators.
+    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0usize;
+    loop {
+        let Some((p, len)) = operator(text, at) else {
+            pieces.push((at, text.len()));
+            break;
+        };
+        pieces.push((at, p));
+        let mut end = p + len;
+        let rest = &text[end..];
+        for word in ["ALL", "DISTINCT"] {
+            if starts_with_keyword(rest.trim_start(), word) {
+                end += (rest.len() - rest.trim_start().len()) + word.len();
+                break;
+            }
+        }
+        at = end;
+    }
+    let alone = pieces.len() == 1;
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut copied = 0usize;
+    for (number, (start, end)) in pieces.into_iter().enumerate() {
+        let lead = text[start..end].len() - text[start..end].trim_start().len();
+        let open = start + lead;
+        if text.as_bytes().get(open) != Some(&b'(') {
+            continue;
+        }
+        let Some(close) = matching_close(text, open).filter(|close| *close < end) else {
+            continue;
+        };
+        // What follows a branch's parenthesis is the whole's `ORDER BY` or
+        // `LIMIT` (after the last branch) or nothing.
+        let after = text[close + 1..end].trim();
+        if !after.is_empty() && !OWN_TAIL.iter().any(|kw| starts_with_keyword(after, kw)) {
+            continue;
+        }
+        // Parentheses in parentheses group what the inner ones do, and the
+        // group may be branches in parentheses of their own.
+        let mut inner = text[open + 1..close].trim();
+        while inner.starts_with('(') && matching_close(inner, 0) == Some(inner.len() - 1) {
+            inner = inner[1..inner.len() - 1].trim();
+        }
+        let within = plain_branch_parentheses(inner);
+        let inner = within.as_ref();
+        if !starts_with_keyword(inner, "SELECT") {
+            continue;
+        }
+        let set_operation = operator(inner, 0).is_some();
+        let own_tail = OWN_TAIL.iter().any(|kw| find_keyword(inner, kw, 0).is_some());
+        let replacement = if alone && (after.is_empty() || !own_tail) {
+            // The whole query: the same without them.
+            inner.to_string()
+        } else if alone || own_tail {
+            continue;
+        } else if set_operation {
+            format!("SELECT * FROM ({inner}) __rdb_branch{number}")
+        } else {
+            inner.to_string()
+        };
+        out.push_str(&text[copied..open]);
+        out.push_str(&replacement);
+        copied = close + 1;
+    }
+    if copied == 0 {
+        return Cow::Borrowed(sql);
+    }
+    out.push_str(&text[copied..]);
+    Cow::Owned(out)
+}
+
+/// `INSERT INTO t [(columns)] (SELECT …)` and `CREATE TABLE t AS (SELECT …)`
+/// with the query that supplies their rows read as the top level reads one
+/// ([`plain_branch_parentheses`]). Borrowed when the query is not in
+/// parentheses.
+///
+/// A parenthesised query there was read as a value: "a subquery used as a
+/// value must select exactly one column", or with one column and one row, a
+/// table of that one value.
+pub fn source_query_parentheses(sql: &str) -> std::borrow::Cow<'_, str> {
+    use crate::core::rql::join::find_keyword;
+    use std::borrow::Cow;
+    let lead = sql.len() - sql.trim_start().len();
+    let head = &sql[lead..];
+    let bytes = sql.as_bytes();
+    let skip_ws = |mut at: usize| {
+        while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+            at += 1;
+        }
+        at
+    };
+    // Where the query starts and where it ends.
+    let (start, end) = if starts_with_keyword(head, "INSERT") {
+        let mut at = skip_ws(lead + 6);
+        if !starts_with_keyword(&sql[at..], "INTO") {
+            return Cow::Borrowed(sql);
+        }
+        at = skip_ws(at + 4);
+        // The table's name, quoted or not, to a space or a parenthesis.
+        while let Some(&b) = bytes.get(at) {
+            if b == b'"' {
+                match skip_quoted(bytes, at) {
+                    Some(end) => at = end,
+                    None => return Cow::Borrowed(sql),
+                }
+            } else if b.is_ascii_whitespace() || b == b'(' {
+                break;
+            } else {
+                at += 1;
+            }
+        }
+        at = skip_ws(at);
+        if starts_with_keyword(&sql[at..], "AS") {
+            return Cow::Borrowed(sql);
+        }
+        if bytes.get(at) != Some(&b'(') {
+            return Cow::Borrowed(sql);
+        }
+        let Some(close) = matching_close(sql, at) else {
+            return Cow::Borrowed(sql);
+        };
+        // A column list holds names; a query opens with its keyword or with
+        // a parenthesis of its own.
+        let first = sql[at + 1..close].trim_start();
+        let is_query = |text: &str| text.starts_with('(') || starts_with_keyword(text, "SELECT") || starts_with_keyword(text, "WITH");
+        if !is_query(first) {
+            at = skip_ws(close + 1);
+            if starts_with_keyword(&sql[at..], "OVERRIDING") {
+                let Some(value) = find_keyword(sql, "VALUE", at) else {
+                    return Cow::Borrowed(sql);
+                };
+                at = skip_ws(value + 5);
+            }
+            if bytes.get(at) != Some(&b'(') {
+                return Cow::Borrowed(sql);
+            }
+            let Some(close) = matching_close(sql, at) else {
+                return Cow::Borrowed(sql);
+            };
+            if !is_query(sql[at + 1..close].trim_start()) {
+                return Cow::Borrowed(sql);
+            }
+        }
+        // `ON CONFLICT` and `RETURNING` are the statement's, after its query.
+        let end = ["ON", "RETURNING"].iter().filter_map(|kw| find_keyword(sql, kw, at)).min().unwrap_or(sql.len());
+        (at, end)
+    } else if starts_with_keyword(head, "CREATE") {
+        let Some(parsed) = crate::core::rql::ctas::parse(sql) else {
+            return Cow::Borrowed(sql);
+        };
+        if !sql[parsed.query_span.clone()].trim_start().starts_with('(') {
+            return Cow::Borrowed(sql);
+        }
+        (parsed.query_span.start, parsed.query_span.end)
+    } else {
+        return Cow::Borrowed(sql);
+    };
+    let query = sql[start..end].trim_end().trim_end_matches(';');
+    match plain_branch_parentheses(query) {
+        Cow::Owned(plain) if !plain.trim_start().starts_with('(') => {
+            Cow::Owned(format!("{}{} {}", &sql[..start], plain, sql[start + query.len()..].trim_start()).trim_end().to_string())
+        }
+        _ => Cow::Borrowed(sql),
+    }
+}
+
 /// Whether `sql[start..end]` is a whole item of a select list: at depth
 /// zero after the nearest `SELECT`, between it or a comma and a comma,
 /// `FROM` or the end.
@@ -3646,5 +3845,98 @@ mod keyword_prefix_tests {
         assert!(!starts_with_keyword("withdrawn", "WITH"));
         assert!(starts_with_keyword("VALUES (1)", "VALUES"));
         assert!(!starts_with_keyword("values_n", "VALUES"));
+    }
+}
+
+#[cfg(test)]
+mod branch_parentheses_tests {
+    use super::*;
+
+    fn plain(sql: &str) -> String {
+        plain_branch_parentheses(sql).into_owned()
+    }
+
+    #[test]
+    fn parentheses_that_group_nothing_are_removed() {
+        assert_eq!(plain("(SELECT a FROM t)"), "SELECT a FROM t");
+        assert_eq!(plain("(SELECT a FROM t) EXCEPT (SELECT 1) ORDER BY 1"), "SELECT a FROM t EXCEPT SELECT 1 ORDER BY 1");
+        assert_eq!(plain("SELECT 9 UNION ALL (SELECT a FROM t WHERE EXISTS (SELECT 1))"), "SELECT 9 UNION ALL SELECT a FROM t WHERE EXISTS (SELECT 1)");
+        assert_eq!(plain("((SELECT 1)) UNION ALL ((SELECT 2));"), "SELECT 1 UNION ALL SELECT 2");
+        // The whole query alone: the same without them, whatever it ends in.
+        assert_eq!(plain("(SELECT a FROM t ORDER BY a LIMIT 1)"), "SELECT a FROM t ORDER BY a LIMIT 1");
+        assert_eq!(plain("(SELECT a FROM t) ORDER BY a LIMIT 1"), "SELECT a FROM t ORDER BY a LIMIT 1");
+        assert_eq!(plain("(SELECT 1 UNION SELECT 2) ORDER BY 1"), "SELECT 1 UNION SELECT 2 ORDER BY 1");
+    }
+
+    #[test]
+    fn parentheses_that_group_are_kept_or_made_a_derived_table() {
+        // A branch's own ORDER BY and LIMIT are its own.
+        for sql in [
+            "(SELECT a FROM t ORDER BY a LIMIT 1) UNION ALL (SELECT a FROM t ORDER BY a DESC LIMIT 1)",
+            "(SELECT a FROM t ORDER BY a LIMIT 2) ORDER BY a DESC",
+            "SELECT 1 UNION (SELECT a FROM t LIMIT 1)",
+        ] {
+            assert!(matches!(plain_branch_parentheses(sql), Cow::Borrowed(_)), "{sql}");
+        }
+        // A group decides the order of evaluation: a derived table.
+        assert_eq!(
+            plain("(SELECT 1 UNION SELECT 2) INTERSECT SELECT 2"),
+            "SELECT * FROM (SELECT 1 UNION SELECT 2) __rdb_branch0 INTERSECT SELECT 2"
+        );
+        assert_eq!(
+            plain("((SELECT 1) UNION (SELECT 2)) INTERSECT (SELECT 2)"),
+            "SELECT * FROM (SELECT 1 UNION SELECT 2) __rdb_branch0 INTERSECT SELECT 2"
+        );
+        assert_eq!(
+            plain("SELECT 1 EXCEPT ALL (SELECT 1 UNION SELECT 2)"),
+            "SELECT 1 EXCEPT ALL SELECT * FROM (SELECT 1 UNION SELECT 2) __rdb_branch1"
+        );
+    }
+
+    #[test]
+    fn anything_else_is_left_as_written() {
+        for sql in [
+            "SELECT a FROM t WHERE id = 1",
+            "SELECT a FROM t WHERE b IN ('x', 'union') UNION ALL SELECT 7",
+            "SELECT '(SELECT 1) UNION (SELECT 2)'",
+            "SELECT a FROM (SELECT 1 AS a) d UNION SELECT 2",
+            "INSERT INTO t VALUES (1)",
+            "(VALUES (1), (2))",
+            // Multibyte text beside the parentheses.
+            "SELECT 'é(ü' UNION ALL SELECT 'ß)'",
+        ] {
+            assert!(matches!(plain_branch_parentheses(sql), Cow::Borrowed(_)), "{sql}");
+        }
+        assert_eq!(plain("(SELECT 'é) UNION (ü' AS t) UNION ALL (SELECT 'ß')"), "SELECT 'é) UNION (ü' AS t UNION ALL SELECT 'ß'");
+    }
+
+    #[test]
+    fn a_source_query_in_parentheses_is_read_as_a_query() {
+        let source = |sql: &str| source_query_parentheses(sql).into_owned();
+        assert_eq!(source("INSERT INTO t (a, b) (SELECT 1, 2)"), "INSERT INTO t (a, b) SELECT 1, 2");
+        assert_eq!(source("INSERT INTO t (SELECT a, b FROM s)"), "INSERT INTO t SELECT a, b FROM s");
+        assert_eq!(source("insert into \"T x\" ((SELECT 1))"), "insert into \"T x\" SELECT 1");
+        assert_eq!(
+            source("INSERT INTO t (a) (SELECT 1) UNION ALL (SELECT 2) ON CONFLICT (a) DO NOTHING RETURNING a"),
+            "INSERT INTO t (a) SELECT 1 UNION ALL SELECT 2 ON CONFLICT (a) DO NOTHING RETURNING a"
+        );
+        assert_eq!(
+            source("INSERT INTO t (a) OVERRIDING SYSTEM VALUE (SELECT 1) RETURNING a"),
+            "INSERT INTO t (a) OVERRIDING SYSTEM VALUE SELECT 1 RETURNING a"
+        );
+        assert_eq!(source("CREATE TABLE c AS (SELECT a FROM s) WITH NO DATA"), "CREATE TABLE c AS SELECT a FROM s WITH NO DATA");
+        assert_eq!(source("CREATE TABLE c (x) AS (SELECT 1) UNION ALL (SELECT 2)"), "CREATE TABLE c (x) AS SELECT 1 UNION ALL SELECT 2");
+        for sql in [
+            "INSERT INTO t (a, b) VALUES (1, (SELECT 2))",
+            "INSERT INTO t (a, b) SELECT 1, 2",
+            "INSERT INTO t VALUES ((SELECT 1))",
+            "INSERT INTO t (a) VALUES ('(SELECT 1)')",
+            "INSERT INTO t DEFAULT VALUES",
+            "CREATE TABLE c (a int, b text)",
+            "CREATE TABLE c AS SELECT 1",
+            "UPDATE t SET a = (SELECT 1)",
+        ] {
+            assert!(matches!(source_query_parentheses(sql), Cow::Borrowed(_)), "{sql}");
+        }
     }
 }

@@ -537,6 +537,102 @@ pub async fn lookup(database: &Arc<Database>, name: &str, tx: Option<TxId>) -> R
     Ok(load(database, Some(&[name.to_string()]), tx).await?.into_iter().next())
 }
 
+/// `sql` with each `pg_get_viewdef(view[, pretty])` written as the text it
+/// answers; `Ok(None)` when it calls none. A view is its stored query, as
+/// `pg_views.definition` shows it: the query as it was written, where
+/// PostgreSQL prints its own layout of it. The view is an oid (`'v'::regclass`
+/// has become one by now), a name in quotes, or an expression, which is then
+/// compared with every view's oid (`pg_get_viewdef(c.oid) FROM pg_class c`).
+/// Anything that is no view is NULL, as in PostgreSQL; a name no relation has
+/// is its 42P01.
+pub async fn viewdef_calls(database: &Arc<Database>, sql: &str, tx: Option<TxId>) -> Result<Option<String>, Refusal> {
+    use crate::core::sql_scan::{is_identifier_byte, matching_close, skip_comment, skip_quoted, split_top_level};
+    const WORD: &[u8] = b"pg_get_viewdef";
+    if !crate::core::sql_scan::contains_ignore_ascii_case(sql, WORD) {
+        return Ok(None);
+    }
+    let bytes = sql.as_bytes();
+    // The calls first: the catalogue is read only for a statement with one.
+    let mut calls: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)) {
+            i = end.max(i + 1);
+            continue;
+        }
+        let word = bytes.len() >= i + WORD.len()
+            && bytes[i..i + WORD.len()].eq_ignore_ascii_case(WORD)
+            && (i == 0 || !is_identifier_byte(bytes[i - 1]));
+        if word {
+            let open = i + WORD.len() + (sql[i + WORD.len()..].len() - sql[i + WORD.len()..].trim_start().len());
+            if bytes.get(open) == Some(&b'(')
+                && let Some(close) = matching_close(sql, open)
+            {
+                calls.push((i, close));
+                i = close + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if calls.is_empty() {
+        return Ok(None);
+    }
+    let views = load(database, None, tx).await.map_err(|e| refusal("XX000", e))?;
+    let literal = |text: &str| format!("'{}'", text.replace('\'', "''"));
+    let mut out = String::with_capacity(sql.len() + 64);
+    let mut copied = 0usize;
+    for (start, close) in calls {
+        let open = start + sql[start..close].find('(').unwrap_or(0);
+        let args = split_top_level(&sql[open + 1..close], b',');
+        let Some(view) = args.first().map(|a| a.trim()).filter(|a| !a.is_empty() && args.len() <= 2) else {
+            continue;
+        };
+        // A schema in front of the call (`pg_catalog.pg_get_viewdef`).
+        let before = sql[copied..start].trim_end();
+        let call_start = match before.strip_suffix('.') {
+            Some(head) if head.to_ascii_lowercase().ends_with("pg_catalog") => copied + head.len() - "pg_catalog".len(),
+            _ => start,
+        };
+        let name_form = view.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')).filter(|v| !v.contains('\''));
+        let value = if let Ok(oid) = view.parse::<i64>() {
+            views
+                .iter()
+                .find(|v| crate::core::rql::catalog_model::oid_of(&v.name) == oid)
+                .map_or_else(|| "NULL".to_string(), |v| literal(&v.definition))
+        } else if let Some(name) = name_form {
+            let bare = name.rsplit('.').next().unwrap_or(name).trim();
+            let folded = match bare.strip_prefix('"').and_then(|b| b.strip_suffix('"')) {
+                Some(quoted) => quoted.replace("\"\"", "\""),
+                None => bare.to_ascii_lowercase(),
+            };
+            match views.iter().find(|v| v.name == folded) {
+                Some(v) => literal(&v.definition),
+                None if database.schema_view(&folded).is_some() || database.is_partitioned(&folded) => "NULL".to_string(),
+                None => return Err(refusal("42P01", format!("relation \"{name}\" does not exist"))),
+            }
+        } else if views.is_empty() {
+            "NULL".to_string()
+        } else {
+            let arms: String = views
+                .iter()
+                .map(|v| format!(" WHEN {} THEN {}", crate::core::rql::catalog_model::oid_of(&v.name), literal(&v.definition)))
+                .collect();
+            format!("CASE {view}{arms} END")
+        };
+        let alias = if crate::core::sql_scan::whole_select_item(sql, call_start, close + 1) { " AS pg_get_viewdef" } else { "" };
+        out.push_str(&sql[copied..call_start]);
+        out.push_str(&value);
+        out.push_str(alias);
+        copied = close + 1;
+    }
+    if copied == 0 {
+        return Ok(None);
+    }
+    out.push_str(&sql[copied..]);
+    Ok(Some(out))
+}
+
 /// Every view `tx` sees whose query names `relation`.
 pub async fn dependents(database: &Arc<Database>, relation: &str, tx: Option<TxId>) -> Result<Vec<ViewDef>, String> {
     let lower = relation.to_ascii_lowercase();

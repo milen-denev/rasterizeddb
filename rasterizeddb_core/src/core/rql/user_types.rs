@@ -97,6 +97,11 @@ impl TypeRegistry {
         self.names.insert(name.to_string(), ());
     }
 
+    /// Whether the database has had a type of this name.
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.names.contains_key(name)
+    }
+
     pub(crate) fn mentioned_in(&self, sql: &str) -> Vec<String> {
         self.names
             .iter()
