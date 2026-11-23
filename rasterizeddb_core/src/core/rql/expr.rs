@@ -1851,6 +1851,16 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                 ));
             }
 
+            // `CURRENT_TIME(2)`, `LOCALTIMESTAMP(0)`: the keyword at that
+            // many fractional digits, which is its cast to its own type at
+            // that precision. Read as a call, it was "function
+            // current_time(integer) does not exist".
+            if let Some(own_type) = clock_keyword_type(name)
+                && let Ok(precision) = args_text.trim().parse::<u32>()
+            {
+                return parse(&format!("{}::{}({})", name.trim(), own_type, precision.min(6)), schema);
+            }
+
             // `pg_column_size(t)` names a *relation*, which resolves to no
             // column — the answer is the whole row's width. Parsed specially so
             // the argument's failure to resolve is not the function's failure.
@@ -2341,6 +2351,18 @@ pub fn compare_key_values(
         }
     }
     Ordering::Equal
+}
+
+/// The type of a clock keyword that takes a precision in parentheses
+/// (`CURRENT_TIME(2)`): the type its bare form already is.
+fn clock_keyword_type(name: &str) -> Option<&'static str> {
+    match name.trim().to_ascii_uppercase().as_str() {
+        "CURRENT_TIMESTAMP" => Some("timestamptz"),
+        "LOCALTIMESTAMP" => Some("timestamp"),
+        "CURRENT_TIME" => Some("timetz"),
+        "LOCALTIME" => Some("time"),
+        _ => None,
+    }
 }
 
 /// The SQL value keywords spelled without parentheses.
@@ -3822,6 +3844,7 @@ pub fn static_type(expr: &Expr) -> DbType {
                     DbType::DATE => DbType::I32,
                     DbType::DATETIME if matches!(op, ArithOp::Sub) => DbType::INTERVAL,
                     DbType::DATETIME | DbType::INTERVAL => DbType::DATETIME,
+                    DbType::TIME if matches!(op, ArithOp::Add) || date(lhs) => DbType::DATETIME,
                     _ => DbType::DATE,
                 };
             }
@@ -7274,6 +7297,32 @@ fn date_arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
         // `interval + date`, which the timestamp arithmetic reads date first.
         (None, Some(_)) if matches!((a.db_type(), op), (Some(DbType::INTERVAL), ArithOp::Add)) => {
             arith(&as_timestamp(b), op, a)
+        }
+        // `date + time` and `time + date`: that time of day on that date, a
+        // `timestamp` (PostgreSQL's `datetime_pl`). It was "operator does
+        // not exist: date + time".
+        // `date - time` is the timestamp that much before the date's midnight.
+        (Some(_), None) | (None, Some(_))
+            if (matches!(op, ArithOp::Add) || (matches!(op, ArithOp::Sub) && date_days(a).is_some()))
+                && matches!(if date_days(a).is_some() { b.db_type() } else { a.db_type() }, Some(DbType::TIME)) =>
+        {
+            let (date, time) = if date_days(a).is_some() { (a, b) } else { (b, a) };
+            let of_day = match time {
+                Value::Data { bytes, .. } => bytes.get(..8).and_then(|b| b.try_into().ok()).map(i64::from_be_bytes),
+                Value::Null => None,
+            }
+            .ok_or_else(refuse)?;
+            match as_timestamp(date) {
+                Value::Data { bytes, db_type: DbType::DATETIME } => {
+                    let midnight = i64::from_le_bytes(bytes.as_slice().try_into().map_err(|_| refuse())?);
+                    let of_day = if matches!(op, ArithOp::Sub) { -of_day } else { of_day };
+                    Ok(Value::Data {
+                        bytes: midnight.checked_add(of_day).ok_or("timestamp out of range")?.to_le_bytes().to_vec(),
+                        db_type: DbType::DATETIME,
+                    })
+                }
+                _ => Err(refuse()),
+            }
         }
         _ => Err(refuse()),
     }

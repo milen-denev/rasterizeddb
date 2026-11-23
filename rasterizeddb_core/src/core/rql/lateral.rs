@@ -571,7 +571,11 @@ pub(crate) fn outer_references(sql: &str, item: &Item) -> Result<Option<(String,
     // nested subquery (`(SELECT … FROM u c WHERE c.n …)`), where `c.n` is
     // that subquery's own column: substituting the outer value there would
     // answer another query. Refused rather than guessed.
-    let rebinds = |alias: &str| bare_words(&item.body).iter().any(|w| w.eq_ignore_ascii_case(alias));
+    //
+    // The outer relation read again under another alias binds nothing:
+    // `FROM u7 x WHERE x.g = u7.g` hides no `u7`, and `u7.g` there is the
+    // outer row's, as PostgreSQL reads it. It was refused with the rest.
+    let rebinds = |alias: &str| binds_name(&item.body, alias);
     for (qualifier, column) in qualified_references(&item.body) {
         if inner.iter().any(|a| a.eq_ignore_ascii_case(&qualifier)) {
             continue;
@@ -602,31 +606,69 @@ pub(crate) fn outer_references(sql: &str, item: &Item) -> Result<Option<(String,
     Ok(found)
 }
 
-/// The words of `body` outside quotes that are not a qualifier (`x.`) or a
-/// qualified name's column (`.x`): where an alias is bound, or a column
-/// named without one.
-fn bare_words(body: &str) -> Vec<String> {
+/// Whether `body` may bind `name` as a relation's name or alias somewhere in
+/// itself: any bare use of the word but one, a relation in a `FROM` or a
+/// `JOIN` that is given another alias (`FROM name x`, `JOIN name AS x`),
+/// which leaves `name` unbound there. Anything it cannot place counts as a
+/// binding.
+fn binds_name(body: &str, name: &str) -> bool {
+    // What may follow a relation that is no alias for it.
+    const AFTER_A_RELATION: &[&str] = &[
+        "WHERE", "ON", "JOIN", "LEFT", "RIGHT", "INNER", "CROSS", "FULL", "NATURAL", "GROUP", "ORDER", "LIMIT",
+        "OFFSET", "UNION", "INTERSECT", "EXCEPT", "HAVING", "WINDOW", "FETCH", "FOR", "USING", "TABLESAMPLE",
+        "LATERAL", "RETURNING", "SET",
+    ];
     let bytes = body.as_bytes();
-    let mut out = Vec::new();
+    // The word starting at or after `at`, past whitespace: itself and its end.
+    let word_at = |mut at: usize| -> Option<(&str, usize)> {
+        while bytes.get(at).is_some_and(|b| b.is_ascii_whitespace()) {
+            at += 1;
+        }
+        let start = at;
+        if !bytes.get(at).is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_') {
+            return None;
+        }
+        while at < bytes.len() && is_word(bytes[at]) {
+            at += 1;
+        }
+        Some((&body[start..at], at))
+    };
+    let mut previous: Option<&str> = None;
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            q @ (b'\'' | b'"') => i = crate::core::sql_scan::quoted_end(bytes, i, q),
+            q @ (b'\'' | b'"') => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, q);
+                previous = None;
+            }
             b if b.is_ascii_alphabetic() || b == b'_' => {
                 let start = i;
                 while i < bytes.len() && is_word(bytes[i]) {
                     i += 1;
                 }
-                let after_dot = start > 0 && bytes[start - 1] == b'.';
-                let before_dot = bytes.get(i) == Some(&b'.');
-                if !after_dot && !before_dot {
-                    out.push(body[start..i].to_string());
+                let word = &body[start..i];
+                let qualified = (start > 0 && bytes[start - 1] == b'.') || bytes.get(i) == Some(&b'.');
+                if !qualified && word.eq_ignore_ascii_case(name) {
+                    let a_relation = previous.is_some_and(|p| p.eq_ignore_ascii_case("FROM") || p.eq_ignore_ascii_case("JOIN"));
+                    let own_alias = match word_at(i) {
+                        Some((w, end)) if w.eq_ignore_ascii_case("AS") => word_at(end).map(|(alias, _)| alias),
+                        Some((w, _)) if !AFTER_A_RELATION.iter().any(|k| w.eq_ignore_ascii_case(k)) => Some(w),
+                        _ => None,
+                    };
+                    if !(a_relation && own_alias.is_some_and(|alias| !alias.eq_ignore_ascii_case(name))) {
+                        return true;
+                    }
                 }
+                previous = Some(word);
             }
-            _ => i += 1,
+            b if b.is_ascii_whitespace() => i += 1,
+            _ => {
+                previous = None;
+                i += 1;
+            }
         }
     }
-    out
+    false
 }
 
 /// Where the body's top-level `FROM` list ends.
@@ -1147,5 +1189,41 @@ mod tests {
         );
         assert_eq!(key_of(None), "n");
         assert_eq!(key_of(Some("12")), "v12");
+    }
+}
+
+#[cfg(test)]
+mod binds_name_tests {
+    use super::binds_name;
+
+    /// A relation read under another alias leaves its name unbound; every
+    /// other bare use of the name may bind it.
+    #[test]
+    fn a_relation_given_another_alias_does_not_bind_its_name() {
+        for body in [
+            "SELECT max(x.v) FROM u7 x WHERE x.g = u7.g",
+            "SELECT count(*) FROM u7 AS x WHERE x.g = u7.g",
+            "SELECT count(*) FROM u7 x JOIN u7 y ON y.id = x.id WHERE x.g = u7.g",
+            "SELECT 1 FROM other o WHERE o.g = u7.g",
+            "SELECT 'u7' FROM other o WHERE o.g = u7.g",
+        ] {
+            assert!(!binds_name(body, "u7"), "{body}");
+        }
+        for body in [
+            // Unaliased, the name is the inner relation's.
+            "SELECT count(*) FROM u7 WHERE u7.g = 1",
+            "SELECT count(*) FROM u7",
+            "SELECT 1 FROM other o JOIN u7 ON u7.id = o.id",
+            // Bound as an alias, here or deeper.
+            "SELECT 1 FROM other u7 WHERE u7.g = 1",
+            "SELECT 1 FROM other AS u7",
+            "SELECT (SELECT c.n FROM v u7 WHERE u7.n = 1) FROM other o",
+            "SELECT 1 FROM u7 u7",
+            // Not placed: after a comma, or anywhere else.
+            "SELECT 1 FROM other o, u7 x WHERE x.g = u7.g",
+            "SELECT u7 FROM other o",
+        ] {
+            assert!(binds_name(body, "u7"), "{body}");
+        }
     }
 }

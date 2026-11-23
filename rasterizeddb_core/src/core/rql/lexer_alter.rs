@@ -395,21 +395,30 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
     let action = match rest_upper[0].as_str() {
         "ADD" => {
             let mut i = 1usize;
-            if rest_upper.get(i).map(String::as_str) == Some("COLUMN") {
+            let column_word = rest_upper.get(i).map(String::as_str) == Some("COLUMN");
+            if column_word {
                 i += 1;
             }
 
             // `ADD CONSTRAINT …`, `ADD FOREIGN KEY …`, `ADD PRIMARY KEY …`,
             // `ADD UNIQUE …` all declare constraints rather than columns.
-            if matches!(
-                rest_upper.get(i).map(String::as_str),
-                Some("CONSTRAINT")
-                    | Some("FOREIGN")
-                    | Some("PRIMARY")
-                    | Some("UNIQUE")
-                    | Some("CHECK")
-                    | Some("EXCLUDE")
-            ) {
+            // So does `ADD IF NOT EXISTS CONSTRAINT c …`, the word order some
+            // tools write (`unique_key::strip_if_not_exists` takes it out in
+            // either place): read as a column, it was a column called
+            // CONSTRAINT of the type its name spelled ("column type 'C' is
+            // not supported yet").
+            let constraint_word = |at: usize| {
+                matches!(
+                    rest_upper.get(at).map(String::as_str),
+                    Some("CONSTRAINT") | Some("FOREIGN") | Some("PRIMARY") | Some("UNIQUE") | Some("CHECK") | Some("EXCLUDE")
+                )
+            };
+            let if_not_exists_first = !column_word
+                && rest_upper.get(i).map(String::as_str) == Some("IF")
+                && rest_upper.get(i + 1).map(String::as_str) == Some("NOT")
+                && rest_upper.get(i + 2).map(String::as_str) == Some("EXISTS")
+                && constraint_word(i + 3);
+            if constraint_word(i) || if_not_exists_first {
                 return Ok(AlterTable {
                     table_name,
                     action: AlterAction::ConstraintClause {

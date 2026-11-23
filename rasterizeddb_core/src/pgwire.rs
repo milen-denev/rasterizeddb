@@ -10545,6 +10545,11 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("more than one row returned by a subquery used as an expression") {
         return "21000";
     }
+    // `untranslatable_character`: `convert_to` of a character the target
+    // encoding has no byte for (`pg_functions`, LATIN1).
+    if has("has no equivalent in encoding") {
+        return "22P05";
+    }
     // A range's bounds (`range_ops`): `data_exception`, as PostgreSQL's
     // `range_serialize` and set operations report them; a bad bounds flag
     // argument is its syntax error.

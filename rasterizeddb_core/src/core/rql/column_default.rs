@@ -406,6 +406,19 @@ pub fn validate(expression: &str, db_type: &DbType, own_scale: bool) -> Result<(
     Ok(())
 }
 
+/// `KEYWORD(p)` for the clock keywords that take a precision, upper-cased:
+/// the keyword and the precision (6 at most, as PostgreSQL reduces it).
+fn clock_precision(upper: &str) -> Option<(String, u32)> {
+    let open = upper.find('(')?;
+    let keyword = upper[..open].trim_end();
+    if !matches!(keyword, "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" | "CURRENT_TIME" | "LOCALTIME") {
+        return None;
+    }
+    let digits = upper[open + 1..].trim_end().strip_suffix(')')?.trim();
+    let precision = digits.parse::<u32>().ok()?;
+    Some((keyword.to_string(), precision.min(6)))
+}
+
 /// [`evaluate`], or with `database` absent [`validate`].
 fn evaluate_in(
     expression: &str,
@@ -434,6 +447,20 @@ fn evaluate_in(
     // statement and every statement of a block take one value; the
     // statement's start for `statement_timestamp()`; the wall clock, per row,
     // for `clock_timestamp()`.
+    // `CURRENT_TIMESTAMP(3)`: the keyword, its value at that many fractional
+    // digits. It was refused ("DEFAULT CURRENT_TIMESTAMP(3) is not
+    // supported"), and the table with it.
+    let (upper, precision) = match clock_precision(&upper) {
+        Some((keyword, precision)) => (keyword, Some(precision)),
+        None => (upper, None),
+    };
+    let rounded = |micros: i64| match precision {
+        Some(digits) if digits < 6 => {
+            let unit = 10i64.pow(6 - digits);
+            (micros + unit / 2).div_euclid(unit) * unit
+        }
+        _ => micros,
+    };
     let clock = match upper.as_str() {
         "CURRENT_TIMESTAMP" | "NOW()" | "CURRENT_TIMESTAMP()" | "LOCALTIMESTAMP" | "LOCALTIMESTAMP()"
         | "TRANSACTION_TIMESTAMP()" => Some(crate::core::statement_clock::transaction_us()),
@@ -441,7 +468,7 @@ fn evaluate_in(
         "CLOCK_TIMESTAMP()" => Some(crate::core::statement_clock::wall_us()),
         _ => None,
     };
-    if let Some(micros) = clock {
+    if let Some(micros) = clock.map(rounded) {
         // A wall clock defaulting a `DATE` or a `TIME` column is that instant's
         // date or time of day, not the whole timestamp: the column's encoder
         // would refuse the full text, and `DEFAULT now()` on a date column is
@@ -472,7 +499,7 @@ fn evaluate_in(
         upper.as_str(),
         "CURRENT_TIME" | "CURRENT_TIME()" | "LOCALTIME" | "LOCALTIME()"
     ) {
-        let micros = now_micros();
+        let micros = rounded(now_micros());
         return Ok(format!("'{}'", format_time_of(micros, db_type)));
     }
 

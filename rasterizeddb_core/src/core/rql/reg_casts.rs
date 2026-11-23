@@ -198,6 +198,10 @@ pub(crate) fn rewrite(sql: &str, relation_exists: &dyn Fn(&str) -> bool) -> Opti
             }
             None => (crate::core::sql_scan::whole_select_item(sql, span_start, cast_end), cast_end, kind.clone()),
         };
+        // `pg_typeof(x) = 'date'::regtype`: `pg_typeof` answers the type's
+        // name here, so the type it is compared with is its name too. As an
+        // oid it was "operator does not exist: text = integer".
+        let shown = shown || (kind == "regtype" && compared_with_pg_typeof(sql, span_start, end));
         let replacement = if kind == "regclass" {
             let Some(name) = relation_name(&text) else { continue };
             if let Ok(n) = text.trim().parse::<i64>() {
@@ -248,6 +252,79 @@ pub(crate) fn rewrite(sql: &str, relation_exists: &dyn Fn(&str) -> bool) -> Opti
     }
     out.push_str(&sql[copied..]);
     Some(out)
+}
+
+/// Whether the value at `start..end` is compared with a `pg_typeof(…)`
+/// call: `pg_typeof(x) = <value>`, `<value> <> pg_typeof(x)`, or an item of
+/// `pg_typeof(x) [NOT] IN (…, <value>, …)`.
+fn compared_with_pg_typeof(sql: &str, start: usize, end: usize) -> bool {
+    const OPERATORS: [&str; 3] = ["<>", "!=", "="];
+    // The text before `text`'s closing parenthesis, when `text` ends in a
+    // call of `pg_typeof`.
+    let ends_in_the_call = |text: &str| -> bool {
+        let text = text.trim_end();
+        if !text.ends_with(')') {
+            return false;
+        }
+        let mut depth = 0usize;
+        for (at, byte) in text.bytes().enumerate().rev() {
+            match byte {
+                b')' => depth += 1,
+                b'(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let name = text[..at].trim_end();
+                        let word = name.len() - name.bytes().rev().take_while(|b| is_identifier_byte(*b)).count();
+                        return name[word..].eq_ignore_ascii_case("pg_typeof");
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    };
+    let before = sql[..start].trim_end();
+    if OPERATORS.iter().any(|op| before.strip_suffix(op).is_some_and(ends_in_the_call)) {
+        return true;
+    }
+    let after = sql[end..].trim_start();
+    if OPERATORS.iter().any(|op| {
+        after.strip_prefix(op).is_some_and(|rest| {
+            let rest = rest.trim_start();
+            // By bytes: `rest` may open with a character wider than one.
+            rest.as_bytes().get(..9).is_some_and(|word| word.eq_ignore_ascii_case(b"pg_typeof"))
+                && rest[9..].trim_start().starts_with('(')
+        })
+    }) {
+        return true;
+    }
+    // An item of an `IN` list: the list's opening parenthesis, then `IN`.
+    let mut depth = 0usize;
+    for (at, byte) in before.bytes().enumerate().rev() {
+        match byte {
+            b')' => depth += 1,
+            b'(' if depth > 0 => depth -= 1,
+            b'(' => {
+                let head = before[..at].trim_end();
+                let Some(head) = strip_word(head, "IN") else {
+                    return false;
+                };
+                return ends_in_the_call(strip_word(head, "NOT").unwrap_or(head));
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `text` without the keyword `word` it ends in.
+fn strip_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    let text = text.trim_end();
+    let at = text.len().checked_sub(word.len())?;
+    (text.is_char_boundary(at)
+        && text[at..].eq_ignore_ascii_case(word)
+        && !text[..at].bytes().last().is_some_and(is_identifier_byte))
+    .then(|| text[..at].trim_end())
 }
 
 /// `CAST('x' AS regclass)` around the literal at `lit_start..lit_end`: the
@@ -307,5 +384,27 @@ mod tests {
         assert_eq!(r("CREATE TABLE t (id int DEFAULT nextval('t_id_seq'::regclass))"), None);
         assert_eq!(r("SELECT 'x::regclass'"), None);
         assert_eq!(r("SELECT 'other.items'::regclass"), None);
+    }
+}
+
+#[cfg(test)]
+mod pg_typeof_tests {
+    use super::rewrite;
+
+    /// Compared with `pg_typeof(…)`, a regtype is the name that call
+    /// answers; anywhere else compared, the oid it was.
+    #[test]
+    fn a_regtype_beside_pg_typeof_is_the_type_name() {
+        let r = |sql: &str| rewrite(sql, &|_| true).unwrap_or_else(|| sql.to_string());
+        assert_eq!(r("SELECT 1 WHERE pg_typeof(d) = 'date'::regtype"), "SELECT 1 WHERE pg_typeof(d) = 'date'");
+        assert_eq!(r("SELECT 1 WHERE 'int4'::regtype <> PG_TYPEOF (n + (1))"), "SELECT 1 WHERE 'integer' <> PG_TYPEOF (n + (1))");
+        assert_eq!(
+            r("SELECT 1 WHERE pg_typeof(n) NOT IN ('bigint'::regtype, 'int4'::regtype)"),
+            "SELECT 1 WHERE pg_typeof(n) NOT IN ('bigint', 'integer')"
+        );
+        assert_eq!(r("SELECT 1 WHERE typ = 'date'::regtype"), "SELECT 1 WHERE typ = 1082");
+        assert_eq!(r("SELECT 1 WHERE x IN ('date'::regtype)"), "SELECT 1 WHERE x IN (1082)");
+        // A character wider than a byte right after the operator.
+        assert_eq!(r("SELECT 1 WHERE 'date'::regtype = é"), "SELECT 1 WHERE 1082 = é");
     }
 }

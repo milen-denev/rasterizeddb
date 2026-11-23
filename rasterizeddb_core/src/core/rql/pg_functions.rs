@@ -1179,6 +1179,22 @@ fn bitwise(func: PgFunc, args: &[Value]) -> Result<Value, String> {
     })
 }
 
+/// A `bytea` argument's bytes. An untyped literal is read as `bytea`
+/// reads it, so `'\x616263'` is the three bytes it spells: taken as text,
+/// `sha256('\x616263')` hashed the eight characters and `convert_from` of
+/// one answered the literal back.
+fn bytea_argument(v: &Value) -> Vec<u8> {
+    match v {
+        Value::Data { bytes, db_type: DbType::BYTEA } => bytes.clone(),
+        Value::Data { bytes, db_type: DbType::STRING } if bytes.starts_with(b"\\x") => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|text| crate::core::value_codec::byteain(text).ok())
+            .unwrap_or_else(|| bytes.clone()),
+        Value::Data { bytes, db_type: DbType::STRING } => bytes.clone(),
+        other => text_of(other).into_bytes(),
+    }
+}
+
 fn text_value(text: String) -> Value {
     data(text.into_bytes(), DbType::STRING)
 }
@@ -2237,10 +2253,7 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         ColumnIsUpdatable => data(vec![1], DbType::BOOL),
         Sha224 | Sha256 | Sha384 | Sha512 => {
             use sha2::Digest;
-            let input = match &args[0] {
-                Value::Data { bytes, db_type: DbType::BYTEA } => bytes.clone(),
-                other => text_of(other).into_bytes(),
-            };
+            let input = bytea_argument(&args[0]);
             let digest = match func {
                 Sha224 => sha2::Sha224::digest(&input).to_vec(),
                 Sha256 => sha2::Sha256::digest(&input).to_vec(),
@@ -2252,6 +2265,29 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         ConvertTo | ConvertFrom => {
             let encoding = s(1).to_ascii_uppercase().replace(['-', '_'], "");
             let ascii = encoding == "SQLASCII";
+            // LATIN1 is Unicode's first 256 code points, one byte each.
+            if matches!(encoding.as_str(), "LATIN1" | "ISO88591") {
+                if func == ConvertTo {
+                    let mut out = Vec::new();
+                    for c in s(0).chars() {
+                        match u8::try_from(u32::from(c)) {
+                            Ok(byte) => out.push(byte),
+                            Err(_) => {
+                                let mut utf8 = [0u8; 4];
+                                let shown: Vec<String> =
+                                    c.encode_utf8(&mut utf8).bytes().map(|b| format!("0x{b:02x}")).collect();
+                                return Err(format!(
+                                    "character with byte sequence {} in encoding \"UTF8\" has no equivalent in \
+                                     encoding \"LATIN1\"",
+                                    shown.join(" ")
+                                ));
+                            }
+                        }
+                    }
+                    return Ok(data(out, DbType::BYTEA));
+                }
+                return Ok(text_value(bytea_argument(&args[0]).iter().map(|b| char::from(*b)).collect()));
+            }
             if encoding != "UTF8" && !ascii {
                 return Err(format!("conversion to or from encoding \"{}\" is not supported here", s(1)));
             }
@@ -2262,10 +2298,7 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
                 }
                 data(text.into_bytes(), DbType::BYTEA)
             } else {
-                let bytes = match &args[0] {
-                    Value::Data { bytes, .. } => bytes.clone(),
-                    other => text_of(other).into_bytes(),
-                };
+                let bytes = bytea_argument(&args[0]);
                 text_value(String::from_utf8(bytes).map_err(|_| "invalid byte sequence for encoding \"UTF8\"".to_string())?)
             }
         }
