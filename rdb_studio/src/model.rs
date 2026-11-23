@@ -169,8 +169,8 @@ pub const WIRE_PORT: u16 = 5432;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Transport {
     /// RasterizedDB's own protocol (rastcp), through `rasterizeddb_client`:
-    /// TLS over TCP, or a unix socket file (`--rdb-socket`). One database per
-    /// listener.
+    /// TLS over TCP, or a unix socket file (`--rdb-socket`). Each connection
+    /// opens the profile's database; switching database reconnects.
     Native,
     /// The PostgreSQL wire protocol, through `tokio-postgres`: what
     /// PostgreSQL itself, and RasterizedDB's pgwire listener, speak.

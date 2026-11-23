@@ -13160,18 +13160,71 @@ where
         return Ok(false);
     }
 
+    // `ANALYZE` names tables, and runs nothing: a statement after it is
+    // refused as PostgreSQL refuses it, and a table that is not there is
+    // reported, rather than both answering success.
+    if let Some(parsed) = crate::core::rql::lexer_alter::parse_analyze(s) {
+        match parsed {
+            Err(message) => {
+                fail_statement(state, stream, "42601", &message).await?;
+                return Ok(true);
+            }
+            Ok(tables) => {
+                // A temporary table arrives here under its real name
+                // (`temp_tables::rewrite`). A view is skipped with
+                // PostgreSQL's warning; only a name that is neither is
+                // refused.
+                if let Some(database) = state.catalog.get(&state.database_name) {
+                    let tx = state.current_tx();
+                    for table in &tables {
+                        if database.has_table(table) {
+                            continue;
+                        }
+                        match crate::core::rql::views::lookup(&database, table, tx).await {
+                            Ok(Some(_)) => {
+                                crate::core::notice::push(
+                                    "WARNING",
+                                    "01000",
+                                    format!("skipping \"{table}\" --- cannot analyze non-tables"),
+                                );
+                            }
+                            _ => {
+                                fail_statement(
+                                    state,
+                                    stream,
+                                    "42P01",
+                                    &format!("relation \"{table}\" does not exist"),
+                                )
+                                .await?;
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if let Some(reason) = crate::core::rql::lexer_alter::no_op_reason(s) {
         log::info!(
             "accepted without acting: {} ({})",
             s.lines().next().unwrap_or(s),
             reason
         );
-        let tag = s
-            .split_whitespace()
-            .take(2)
-            .map(|w| w.to_ascii_uppercase())
-            .collect::<Vec<_>>()
-            .join(" ");
+        // PostgreSQL's tags: one word for these two, the first two words
+        // (`CREATE EXTENSION`, `DROP SCHEMA`) for the rest. Two words made
+        // `ANALYZE ORDERS` and `COMMENT ON`.
+        let first = s.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+        let tag = match first.as_str() {
+            "ANALYZE" | "ANALYSE" => "ANALYZE".to_string(),
+            "COMMENT" => "COMMENT".to_string(),
+            _ => s
+                .split_whitespace()
+                .take(2)
+                .map(|w| w.to_ascii_uppercase())
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
         send_command_complete(stream, &tag).await?;
         return Ok(true);
     }

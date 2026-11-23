@@ -1894,3 +1894,119 @@ async fn a_wire_session_reopens_a_connection_the_server_closed() {
     exercise_reopen("RDB_STUDIO_TEST_PG", Flavor::Postgres).await;
     exercise_reopen("RDB_STUDIO_TEST_RDB", Flavor::Rasterized).await;
 }
+
+// ---------------------------------------------------------------------------
+// Several databases
+// ---------------------------------------------------------------------------
+
+/// The sidebar's database list, and switching to one of its entries, as the
+/// console does them: `CREATE DATABASE` from the modal, the list from
+/// `databases_sql`, and a switch as a new connection naming the database.
+/// Over native the list used to hold only the connection's own database, and
+/// a database created there lived in memory inside that one connection.
+async fn exercise_databases(variable: &str) {
+    let Ok(url) = std::env::var(variable) else { return };
+    let base = profile(&url, Flavor::Rasterized);
+    let session = conn::connect(base.clone()).await.expect("connects");
+    let home = session.database.clone();
+    let made = "studio_live_other";
+    let quoted = dialect::quote_ident(made);
+
+    let listed = |session: &Session| {
+        let session = session.clone();
+        async move {
+            let grid = session
+                .query(dialect::databases_sql(Flavor::Rasterized))
+                .await
+                .expect("SHOW DATABASES");
+            dialect::parse_databases(&grid)
+        }
+    };
+
+    let _ = session.query(&format!("DROP DATABASE IF EXISTS {quoted}")).await;
+    session
+        .query(&format!("CREATE DATABASE {quoted}"))
+        .await
+        .expect("CREATE DATABASE");
+
+    let databases = listed(&session).await;
+    let names: Vec<&str> = databases.iter().map(|d| d.name.as_str()).collect();
+    assert!(names.contains(&home.as_str()), "{variable}: {names:?}");
+    assert!(names.contains(&made), "{variable}: {names:?}");
+    let current: Vec<&str> =
+        databases.iter().filter(|d| d.is_current).map(|d| d.name.as_str()).collect();
+    assert_eq!(current, vec![home.as_str()], "{variable}");
+
+    // A switch: a new connection naming the database, as `SelectDatabase`.
+    let there = conn::connect(Connection { database: made.to_string(), ..base.clone() })
+        .await
+        .unwrap_or_else(|e| panic!("{variable}: switching to {made}: {e}"));
+    assert_eq!(there.database, made, "{variable}");
+    there
+        .query("CREATE TABLE studio_live_only_here (id INT)")
+        .await
+        .expect("a table in the other database");
+    let databases = listed(&there).await;
+    let current: Vec<&str> =
+        databases.iter().filter(|d| d.is_current).map(|d| d.name.as_str()).collect();
+    assert_eq!(current, vec![made], "{variable}");
+    assert!(databases.iter().any(|d| d.name == home), "{variable}: {databases:?}");
+    // The table is the other database's, not the first one's.
+    let tables = session.query("SHOW TABLES").await.expect("SHOW TABLES");
+    assert!(
+        !format!("{tables:?}").contains("studio_live_only_here"),
+        "{variable}: the table reached {home}"
+    );
+    drop(there);
+
+    // Dropped once no connection holds it; the switched one may take a
+    // moment to be let go by the server.
+    let mut dropped = Err(String::new());
+    for _ in 0..50 {
+        dropped = session.query(&format!("DROP DATABASE {quoted}")).await.map(|_| ());
+        if dropped.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    dropped.unwrap_or_else(|e| panic!("{variable}: DROP DATABASE {made}: {e}"));
+    assert!(!listed(&session).await.iter().any(|d| d.name == made), "{variable}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn databases_are_listed_created_and_switched_to() {
+    let _serial = serial().await;
+    exercise_databases("RDB_STUDIO_TEST_RDB").await;
+}
+
+/// `ANALYZE SELECT …` in the editor: refused, pointing at `EXPLAIN ANALYZE`,
+/// where it used to answer "0 rows affected" having run nothing. And
+/// `EXPLAIN ANALYZE` answers its plan as rows.
+async fn exercise_analyze(variable: &str) {
+    let Ok(url) = std::env::var(variable) else { return };
+    let session = conn::connect(profile(&url, Flavor::Rasterized)).await.expect("connects");
+    let tables = session.query(dialect::tables_sql(Flavor::Rasterized)).await.expect("tables");
+    let table = dialect::parse_tables(&tables).first().expect("a table").name.clone();
+    let table = dialect::quote_ident(&table);
+
+    let refused = session.query(&format!("ANALYZE SELECT * FROM {table}")).await;
+    let message = refused.expect_err("ANALYZE SELECT was answered");
+    assert!(message.contains("EXPLAIN ANALYZE"), "{variable}: {message}");
+
+    session.query(&format!("ANALYZE {table}")).await.expect("ANALYZE of a table");
+    let missing = session.query("ANALYZE studio_no_such_table").await;
+    assert!(missing.is_err(), "{variable}: ANALYZE of a missing table answered");
+
+    let plan = session
+        .query(&format!("EXPLAIN ANALYZE SELECT * FROM {table}"))
+        .await
+        .expect("EXPLAIN ANALYZE");
+    assert_eq!(plan.columns, vec!["QUERY PLAN".to_string()], "{variable}");
+    assert!(!plan.rows.is_empty(), "{variable}: no plan");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn analyze_of_a_statement_is_refused_and_explain_analyze_answers() {
+    let _serial = serial().await;
+    exercise_analyze("RDB_STUDIO_TEST_RDB").await;
+}

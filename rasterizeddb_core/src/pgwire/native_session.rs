@@ -296,8 +296,9 @@ pub(crate) struct NativeSession {
     /// The block's session, made at `BEGIN` and let go when the block
     /// closes. Only ever taken with `try_lock`.
     state: tokio::sync::Mutex<Option<SessionState>>,
-    /// The one-database catalogue a block's statements resolve against,
-    /// made the first time a block opens, or given by [`Self::attach`].
+    /// The catalogue a block's statements resolve against: the server's,
+    /// given by [`Self::attach`], or, on a listener serving a database of its
+    /// own, a one-database catalogue made the first time a block opens.
     catalog: std::sync::OnceLock<Arc<DatabaseCatalog>>,
     /// The connection counted among its database's sessions in the server's
     /// catalogue, as a pgwire connection is, until it closes.
@@ -500,15 +501,21 @@ impl NativeSession {
 
     /// This connection, counted in `catalog` (the server's) among its
     /// database's sessions for as long as it is open, and resolving its
-    /// statements against a view of that database which shares the count.
-    /// Without it a native connection was never counted: `SHOW DATABASES`
-    /// said `sessions` 0 for a database native clients were using, and
-    /// `DROP DATABASE` did not see them.
-    pub(crate) fn attach(mut self, catalog: &DatabaseCatalog) -> Self {
+    /// statements against that catalogue, as a pgwire connection does.
+    /// Without the count a native connection was never counted: `SHOW
+    /// DATABASES` said `sessions` 0 for a database native clients were
+    /// using, and `DROP DATABASE` did not see them.
+    ///
+    /// The server's catalogue itself, not a view of the one database: under
+    /// a one-database view `SHOW DATABASES` listed only this connection's
+    /// database, and `CREATE DATABASE` answered success having made an
+    /// in-memory database inside the view, which nothing else could see and
+    /// which was gone when the connection closed.
+    pub(crate) fn attach(mut self, catalog: &Arc<DatabaseCatalog>) -> Self {
         let name = self.database.name.clone();
-        if let (Some(guard), Some(view)) = (catalog.connect(&name), catalog.view_of(&name)) {
+        if let Some(guard) = catalog.connect(&name) {
             self.attached = Some(guard);
-            let _ = self.catalog.set(view);
+            let _ = self.catalog.set(catalog.clone());
         }
         self
     }
@@ -728,6 +735,10 @@ impl NativeSession {
         if self.multiplexed {
             let mut state = self.new_state();
             let mut answer = Box::pin(self.simple_in(&mut state, query, &run)).await;
+            // The connection's temporary tables outlive the request, as
+            // `run_alone` keeps them; without this one made by a simple
+            // query was gone by the next ("Table not found").
+            self.keep_temp_tables(&state);
             if let Some(t) = state.transaction.take() {
                 state.end_block_settings(&t);
                 self.database.block_ddl_abort(t.id).await;
@@ -753,6 +764,7 @@ impl NativeSession {
         };
         let state = slot.get_or_insert_with(|| self.new_state());
         let answer = Box::pin(self.simple_in(state, query, &run)).await;
+        self.keep_temp_tables(state);
         let open = state.transaction.is_some();
         if !open {
             *slot = None;

@@ -89,7 +89,7 @@ What differs over native:
 
 | | native | wire |
 |---|---|---|
-| Databases | one per listener: the session takes its name from the server, and switching is refused rather than reconnecting to the same one under another name | any; switching reconnects |
+| Databases | any; switching reconnects. A server older than database selection over native serves only its default database there, and lists only that one | any; switching reconnects |
 | Login | chosen: password (SCRAM-SHA-256), peer (unix socket), or trust | negotiated |
 | Link | TLS over TCP, always, the certificate verified when the profile asks (`--rdb-cert`); none on a socket | per the TLS setting |
 | Transaction blocks | the editor's own connection keeps one open across runs; the panels' shared one does not see into it | may span runs (and the panels share the editor's connection) |
