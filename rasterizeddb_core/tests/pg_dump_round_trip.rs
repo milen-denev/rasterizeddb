@@ -159,25 +159,47 @@ fn start(name: &str) -> (Server, u16, Cleanup) {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("data")).unwrap();
     let cleanup = Cleanup(dir.clone());
-    let port = free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_rasterizeddb_core"))
-        .arg("--location")
-        .arg(dir.join("data"))
-        .args(["--protocol", "pgwire", "--pg-tls", "disable", "--pg-auth", "trust"])
-        .args(["--pg-port", &port.to_string(), "--log-level", "error"])
-        .env_remove("RDB_PARTITION_MAX_OPEN")
-        .env_remove("RASTERIZEDDB_INDEX_RESIDENCY")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn the server");
-    let server = Server(child);
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "the server did not start");
-        std::thread::sleep(Duration::from_millis(50));
+    // `free_port` lets the port go before the server binds it, and the tests
+    // here start their servers in parallel: two can be handed one port. The
+    // one that loses the bind exits, and a readiness check that only connects
+    // would then hand this test the other test's server. So the port counts
+    // only while this test's own server is alive once it answers; otherwise
+    // the start is retried on a new port.
+    for _attempt in 0..5 {
+        let port = free_port();
+        let child = Command::new(env!("CARGO_BIN_EXE_rasterizeddb_core"))
+            .arg("--location")
+            .arg(dir.join("data"))
+            .args(["--protocol", "pgwire", "--pg-tls", "disable", "--pg-auth", "trust"])
+            .args(["--pg-port", &port.to_string(), "--log-level", "error"])
+            .env_remove("RDB_PARTITION_MAX_OPEN")
+            .env_remove("RASTERIZEDDB_INDEX_RESIDENCY")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the server");
+        let mut server = Server(child);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut exited = false;
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            if server.0.try_wait().expect("poll the server").is_some() {
+                exited = true;
+                break;
+            }
+            assert!(Instant::now() < deadline, "the server did not start");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Answered: still ours only if our server is still running (a
+        // server that lost the bind exits right after trying it).
+        if !exited {
+            std::thread::sleep(Duration::from_millis(200));
+            exited = server.0.try_wait().expect("poll the server").is_some();
+        }
+        if !exited {
+            return (server, port, cleanup);
+        }
     }
-    (server, port, cleanup)
+    panic!("the server did not start on any of five ports");
 }
 
 /// Every common type with NULLs, an enum type among them; a SERIAL, an
