@@ -80,6 +80,7 @@ D1 and D6.
 | D6 | Where Track B stops | Phase **1c** gives write scale-out without HA. Phase **3** is the first production topology for a large target. Decide this before B1a starts, because phases 1–2 alone have no replicas. |
 | D7 | HA before phase 3 | Allow the **existing replication one-way per shard** as a warm standby with manual failover. It is statement-based, with known divergence risks (§4.3 B1a.13). The alternative is RF1 plus S3 restore. |
 | D8 | Default for a statement with no route key (`unrouted`, B1b) | **`refuse` by default.** Turn on `fan_out` per role (reporting, admin) or per gateway where the app expects it. A forgotten key then surfaces as an error instead of a silent whole-cluster scan. `unrouted_writes = each_shard` is never a gateway-wide default, because it is not atomic before 2PC |
+| D9 | User-based routing (G11): which modes, and the default | Build **both modes**. `user_routing = off` by default, `prefer` where tenants log in as their own roles. `user_key` is the one to choose when the data has a tenant column, because moves and fan-out keep working. `user_shard` is for apps whose tables have no tenant column |
 
 ## 2. Cargo features
 
@@ -1072,6 +1073,78 @@ extended by B1b/B1c's fan-out.
   - bytes relayed and sessions;
   - a hop-latency histogram in per-core buckets.
 
+**G11. User-based routing (gateway only).** The gateway can route by **who
+logs in** instead of by what the statement says. The login role is resolved
+to a route once, when authentication completes (G9). From then on every
+statement on that connection is routed with no per-statement work at all:
+no template lookup, no hash. The Track A `Router` has no equivalent; this is
+a gateway feature.
+
+*Two modes, chosen per role:*
+
+| Mode | What it means | The data | Moves |
+|---|---|---|---|
+| **`user_key`** | The role carries a route key, a tenant value (`42`, `'store-17'`) or the role's own name as a text key. The gateway sets it as the session's route key and **locks** it | Rows are sharded by the tenant column as everywhere else in this plan. Several users may share one tenant key | Ordinary range and tenant moves (B2, A6). The user follows the key with no extra step |
+| **`user_shard`** | The role is pinned to a shard (`shard_id`). Every session of that user goes to that shard, whole | Tables need no tenant column. A shard holds the data of the users placed on it, like a database per group of users but spread over instances | Allowed only if the user's rows can be identified: an owner column declared for the table in the cluster catalogue, else refused. A move is copy, verify, then re-pin, with the user's sessions drained first |
+
+*The mapping:*
+- **Storage.** It lives in a cluster catalogue table,
+  `rdb_user_routes(role, mode, route_key, shard_id, locked, allow_fan_out, epoch)`.
+  It is on the home shard in phases 1–2 and under the authority from B2,
+  versioned with the map epoch.
+- **Gateway cache.** The gateway caches the mapping beside each role's SCRAM
+  keys (G9) under a role epoch. A changed mapping takes effect at the user's
+  next connection, and immediately for a `user_shard` move (below).
+- **SQL.** `ALTER USER alice ROUTE KEY '42'`, `ALTER USER bob ROUTE SHARD 3`
+  and `ALTER USER carol ROUTE NONE`, by `cluster_admin` only. `SHOW USER
+  ROUTES`.
+- **Gateway setting `user_routing`:**
+  - `off` (default): statement routing only.
+  - `prefer`: mapped users are pinned, unmapped users use statement routing.
+  - `require`: an unmapped user is refused at login with `28000`. This is
+    for gateways that serve only tenant users.
+
+*Rules:*
+- **A locked route cannot be escaped.** For a locked role, `SET
+  rdb.route_key` and `SET LOCAL rdb.route_key` are refused (`42501`).
+- **No fan-out for pinned roles by default.** `unrouted` is forced to
+  `refuse` unless the role has `allow_fan_out`. A tenant user therefore never
+  scans other users' shards.
+- **Service and admin roles stay unmapped** and use statement routing and
+  fan-out as configured.
+- **`user_shard` refuses a statement it cannot keep on the user's shard.**
+  - Sharded tables reaching other ranges get `RDB02` from the shard, as
+    always.
+  - Global tables are readable if they live on the user's shard or are
+    reference tables (B5); otherwise they are refused.
+- **The shard checks too (R1 holds).** It admits a `user_shard` virtual
+  session only if its own placement list names that role at the request's
+  epoch, else `Moved` (`before_effect`, so the gateway refreshes and
+  retries). A gateway with a stale mapping therefore costs a retry, never a
+  session on the wrong shard.
+- **A move drains first.** Moving a `user_shard` user fences new sessions
+  for that role with a retryable `57P03` for up to 5 s, waits for open
+  transactions to finish, copies, verifies, bumps the placement epoch and
+  releases.
+- **Pinning is placement, not authorisation.** Users co-located on one shard
+  are kept apart by that shard's grants (and row policies, where the engine
+  has them), exactly as on a single node today. The plan does not claim
+  more.
+
+*Cost:* one lookup per connection, at login; zero per statement.
+
+*Tests:*
+- A pinned user with a forged `SET rdb.route_key` is refused.
+- A `user_shard` session arriving at a shard that does not host the role
+  gets `Moved` *(skip the shard-side placement check)*.
+- A remapped user's next connection lands on the new shard.
+- Moving a `user_shard` user under load loses and duplicates nothing (the
+  digest equals the twin's).
+- `require` refuses an unmapped login.
+
+*Size:* about 1.5k LOC in the gateway and on the shard, plus the catalogue
+table.
+
 **Rock solid: what must never happen, and what prevents it.**
 
 | # | Never | Prevented by | Test (mutation) |
@@ -1096,7 +1169,8 @@ extended by B1b/B1c's fan-out.
    with the A/B harness (the `.claude/reviews/rastcp-perf/` and `protobench/`
    methods).
 3. **G5** on the shard side, in parallel.
-4. **G9 and G10** last.
+4. **G9 and G10** next, then **G11**: user-based routing needs G9's role
+   cache.
 
 A slice that breaks a budget does not merge until it is back within it.
 
