@@ -922,13 +922,15 @@ async fn a_lone_request_times_out_as_a_task_does() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lone_request_is_finished_when_its_peer_goes() {
     bounded(async {
+        let started = Arc::new(AtomicUsize::new(0));
         let finished = Arc::new(AtomicUsize::new(0));
-        let counted = finished.clone();
+        let (begun, counted) = (started.clone(), finished.clone());
         let running = serve_with(
             |builder| builder,
             move |data: Vec<u8>| {
-                let counted = counted.clone();
+                let (begun, counted) = (begun.clone(), counted.clone());
                 async move {
+                    begun.fetch_add(1, Ordering::SeqCst);
                     sleep(SLOW_FOR / 2).await;
                     counted.fetch_add(1, Ordering::SeqCst);
                     data
@@ -939,8 +941,10 @@ async fn a_lone_request_is_finished_when_its_peer_goes() {
         let client = mux(&running.addr, Duration::from_secs(30)).await;
         let sender = client.clone();
         let sent = tokio::spawn(async move { sender.send(&request(ECHO, 1, 16)).await });
-        until("the request reached the server", || running.server.active_connections() == 1).await;
-        sleep(SLOW_FOR / 8).await;
+        // The handler running, not only the connection accepted: on a slow
+        // runner (linux-arm64, CI 2026-11-23) the peer used to go before
+        // the request had been read, and no request ever started.
+        until("the request reached the handler", || started.load(Ordering::SeqCst) == 1).await;
         // The peer goes while the request waits: it is finished anyway.
         sent.abort();
         drop(client);
