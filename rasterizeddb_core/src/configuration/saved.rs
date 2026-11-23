@@ -109,6 +109,16 @@ pub fn load(location: &Path) -> Result<BTreeMap<String, String>, String> {
     Ok(saved)
 }
 
+/// Forgets the file [`load`] read: what a start with no data directory (an
+/// in-memory engine) calls in a process that had one before, so that its
+/// `SET CONFIG` on a startup key is refused rather than written into the
+/// earlier directory's file.
+pub fn unload() {
+    let mut s = state().lock();
+    s.path = None;
+    s.saved.clear();
+}
+
 /// Records a startup key's running value and its source.
 pub fn record(key: &str, value: impl Into<String>, source: Source) {
     state().lock().running.insert(key.to_ascii_lowercase(), (value.into(), source));

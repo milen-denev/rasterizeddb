@@ -28,6 +28,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Settings
+
+Everything the server binary takes as a flag, `Builder` takes as a method. A method's documentation names the flag it stands for and what it costs.
+
+```rust
+use rasterizeddb_embedded::{Builder, IndexResidency};
+
+let db = Builder::open("./data")
+    .worker_threads(4)                        // the engine's runtime threads
+    .query_threads(4)                         // workers one query may use
+    .malloc_arenas(4)                         // fewer allocator arenas: less memory, less throughput
+    .index_residency(IndexResidency::Disk)    // indexes on disk behind a 64 MiB cache
+    .join_memory_mb(256)                      // a join past this fails instead of exhausting memory
+    .synchronous_commit(false)                // commits return before their fdatasync
+    .config("auto_compact.interval_secs", "300")
+    .start()
+    .await?;
+```
+
+| Area | Methods |
+|---|---|
+| Memory | `low_memory` (a preset: 4 arenas, indexes on disk, 256 MiB a join), `malloc_arenas`, `idle_trim`, `tune_allocator`, `index_residency`, `index_cache_mb`, `index_delta_mb`, `join_memory_mb`, `batch_size`, `query_cache`, `query_cache_entries`, `kv_max_memory`, `kv_eviction` |
+| Durability | `synchronous_commit`, `wal_writer_delay`, `wal_checkpoint_bytes`, `wal_prealloc_kb`, `kv_persist`, `kv_save_interval` |
+| Threads and CPU | `worker_threads`, `query_threads`, `simd`, `scan_prefilter` |
+| Storage | `index_storage`, `auto_compact`, `json_shadow_tables`, `settle_status`, `partition_open_budget`, `raise_descriptor_limit` |
+| Everything else | `config(key, value)`: any key `SHOW CONFIG KEYS` lists (`filter.*`, `auto_compact.*`, `index_snapshot.*`, `partition.*`, `query_stats.*`, `vacuum.enabled`, …) |
+
+Three things to know:
+
+- **Hot keys change on the running engine.** `SET CONFIG wal.synchronous_commit = off` through any client works as it does on a server, and `SHOW CONFIG` lists every key with its value. The Builder only sets where a hot key starts.
+- **Startup keys are read once.** `SET CONFIG` on one (`server.*`, `index.*`, `wal.checkpoint_bytes`, `wal.prealloc_kb`, `cache.enabled`) saves it to `rasterizeddb.conf` in the database directory, and the next start on that directory applies it. A value given to the Builder wins over a saved one.
+- **Settings belong to the process, not to one database.** Two embedded engines in one process share them. `start` fails if it is given a startup value that can no longer change because an engine in this process already runs with another.
+
+Memory the engine frees goes back to the operating system once it has been idle for a few seconds (`idle_trim`, on by default; glibc only).
+
 ## Platforms
 
 | | Endpoint | Authentication |

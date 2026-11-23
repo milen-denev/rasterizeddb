@@ -2788,6 +2788,51 @@ pub fn startup_value(section: &str, name: &str, value: &str) -> Result<String, S
 /// reimplemented. That is what keeps `SET CONFIG filter.max_f = 20` and
 /// `SET FILTER max_f = 20` from drifting into meaning different things.
 async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<String, String> {
+    set_config_in(Some(database), key, value).await
+}
+
+/// `SET CONFIG` for a process that configures the engine in code rather than
+/// through a session: an embedding application seeding the hot keys the way
+/// the server binary's flags do. With `None` no database is open yet, which
+/// is when a starting value belongs, so that the opens see it; the keys that
+/// act on a database (`replication.*`, `vacuum.enabled`) then say so.
+///
+/// A key read once at start-up is refused here, where a session's `SET
+/// CONFIG` would save it for the next start: the caller is the start.
+pub async fn set_config_at_start(
+    database: Option<&Arc<Database>>,
+    key: &str,
+    value: &str,
+) -> Result<String, String> {
+    let known = key
+        .split_once('.')
+        .and_then(|(section, name)| CONFIG_KEYS.iter().find(|k| k.section == section && k.key == name));
+    if let Some(spec) = known
+        && !spec.hot
+    {
+        return Err(format!(
+            "{key} is read once, before the engine starts ({}); it has no live setter",
+            spec.set_with
+        ));
+    }
+    set_config_in(database, key, value).await
+}
+
+/// Whether `key` (`section.key`) is one `SET CONFIG` changes on a running
+/// engine, `None` when there is no such key. `SHOW CONFIG KEYS`' `hot`.
+pub fn config_key_is_hot(key: &str) -> Option<bool> {
+    let (section, name) = key.split_once('.')?;
+    CONFIG_KEYS.iter().find(|k| k.section == section && k.key == name).map(|k| k.hot)
+}
+
+/// What a key that acts on a database answers before one is open.
+fn needs_database<'a>(database: Option<&'a Arc<Database>>, key: &str) -> Result<&'a Arc<Database>, String> {
+    database.ok_or_else(|| format!("{key} acts on a database, and none is open yet"))
+}
+
+/// [`set_config`], with or without an open database
+/// ([`set_config_at_start`]).
+async fn set_config_in(database: Option<&Arc<Database>>, key: &str, value: &str) -> Result<String, String> {
     let (section, name) = key.split_once('.').ok_or_else(|| {
         format!(
             "`{}` is not a config key; they are `section.key`, and SHOW CONFIG KEYS lists them",
@@ -2864,6 +2909,7 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
             Ok(lines.join("; "))
         }
         "replication" => {
+            let database = needs_database(database, key)?;
             if name == "active" {
                 let statement = if parse_bool(value)? {
                     "REPLICATION ENABLE"
@@ -3019,6 +3065,7 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
             Ok(format!("{key} is now {n}"))
         }
         "vacuum" => {
+            let database = needs_database(database, key)?;
             let enabled = parse_bool(value)?;
             // Every target is found before any is changed: a table that cannot
             // serve data refuses the whole statement rather than leave it
@@ -3419,6 +3466,40 @@ mod tests {
             ok("SHOW COLUMNS FROM \"public\".\"users\""),
             Introspect::Columns("users".into())
         );
+    }
+
+    /// A start (an embedding application's Builder) sets hot keys with no
+    /// database open. The keys that act on a database say so, a key read
+    /// once is refused rather than saved for a start that is this one, and
+    /// a process-wide key gets as far as its own check of the value.
+    #[tokio::test]
+    async fn set_config_at_start_needs_no_database_for_process_wide_keys() {
+        for key in ["replication.mode", "replication.active", "vacuum.enabled"] {
+            let e = set_config_at_start(None, key, "on").await.unwrap_err();
+            assert!(e.contains("acts on a database"), "{key}: {e}");
+        }
+        for key in ["server.batch_size", "index.residency", "wal.enabled"] {
+            let e = set_config_at_start(None, key, "1").await.unwrap_err();
+            assert!(e.contains("read once"), "{key}: {e}");
+        }
+        let e = set_config_at_start(None, "wal.writer_delay_ms", "soon").await.unwrap_err();
+        assert!(e.contains("not a number of milliseconds"), "{e}");
+        let e = set_config_at_start(None, "auto_compact.ratio", "many").await.unwrap_err();
+        assert!(e.contains("not a whole number"), "{e}");
+        let e = set_config_at_start(None, "server.no_such", "1").await.unwrap_err();
+        assert!(e.contains("unknown config key"), "{e}");
+        let e = set_config_at_start(None, "nodot", "1").await.unwrap_err();
+        assert!(e.contains("not a config key"), "{e}");
+
+        assert_eq!(config_key_is_hot("wal.synchronous_commit"), Some(true));
+        assert_eq!(config_key_is_hot("server.batch_size"), Some(false));
+        assert_eq!(config_key_is_hot("server.no_such"), None);
+        assert_eq!(config_key_is_hot("nodot"), None);
+        // Every key answers what `SHOW CONFIG KEYS` shows for it.
+        for k in CONFIG_KEYS {
+            let key = format!("{}.{}", k.section, k.key);
+            assert_eq!(config_key_is_hot(&key), Some(k.hot), "{key}");
+        }
     }
 
     #[test]
