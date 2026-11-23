@@ -1166,6 +1166,23 @@ pub(crate) fn exists_as_counts(sql: &str) -> Option<String> {
     changed.then_some(current)
 }
 
+/// `sql`, an `UPDATE` or `DELETE`, rewritten by
+/// `correlated::rewrite_write_where` when its `WHERE` holds a correlated
+/// subquery, after an `EXISTS` that compares the row by anything but `=` is
+/// counted (`exists_as_counts`); `None` when it holds none.
+fn correlated_write_where(sql: &str, database: &Arc<Database>, delete: bool) -> Option<Result<String, String>> {
+    let counted = exists_as_counts(sql);
+    let sql = counted.as_deref().unwrap_or(sql);
+    let target = if delete { sql.split_whitespace().nth(2) } else { sql.split_whitespace().nth(1) }?
+        .trim_matches('"')
+        .to_string();
+    let key: Vec<String> = match database.schema_view(&target) {
+        Some(view) => identifying_key(view.schema()).map(|k| k.fields.iter().map(|f| f.name.clone()).collect()).unwrap_or_default(),
+        None => return None,
+    };
+    crate::core::rql::correlated::rewrite_write_where(sql, &key, delete)
+}
+
 /// The first `[NOT] EXISTS (…)` of `sql` that is not inside another
 /// parenthesised `SELECT`.
 fn top_level_exists(sql: &str) -> Option<crate::core::rql::subquery::ExistsClause> {
@@ -22589,6 +22606,17 @@ pub(crate) async fn execute_with_need(
             {
                 database.transactions.forbid_in_place(tx);
             }
+            // A correlated subquery in the WHERE — an EXISTS comparing the
+            // row by anything but `=`, counted — as `UPDATE … FROM` over its
+            // values (`correlated::rewrite_write_where`). It was refused ("a
+            // correlated EXISTS can compare an outer column only with `=`").
+            if let QueryPurpose::UpdateRow(sql) = &query {
+                match correlated_write_where(sql, &database, false) {
+                    Some(Ok(rewritten)) => return Box::pin(execute_update_from(&rewritten, &database, depth, tx)).await,
+                    Some(Err(e)) => return ddl_error(&e),
+                    None => {}
+                }
+            }
             // Subqueries are folded first, exactly as the SELECT arm does,
             // and then the flattened statement is dispatched. Without this an
             // `UPDATE … SET c = (SELECT …)` reached the UPDATE parser with the
@@ -23204,6 +23232,15 @@ pub(crate) async fn execute_with_need(
             result
         }
         QueryPurpose::DeleteRow(_) => {
+            // A correlated subquery in the WHERE, as `DELETE … USING` over
+            // its values: see the UPDATE arm.
+            if let QueryPurpose::DeleteRow(sql) = &query {
+                match correlated_write_where(sql, &database, true) {
+                    Some(Ok(rewritten)) => return Box::pin(execute_delete_using(&rewritten, &database, depth, tx)).await,
+                    Some(Err(e)) => return ddl_error(&e),
+                    None => {}
+                }
+            }
             // Subqueries are folded first and the flattened statement
             // dispatched, inside the attempt, as the UPDATE arm does.
             if let QueryPurpose::DeleteRow(sql) = &query
