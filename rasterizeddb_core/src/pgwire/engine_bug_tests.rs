@@ -1214,3 +1214,60 @@ async fn a_volatile_call_in_a_condition_is_evaluated_per_row() {
     .await
     .expect("bounded");
 }
+
+/// `EXISTS` over a `SELECT` with no `FROM` is the truth of its condition (one
+/// row when it holds, none otherwise). Every `EXISTS` path wanted a relation
+/// (42601, "the SELECT inside EXISTS has no FROM clause"), in a select list,
+/// in a `WHERE` with or without a table, and over a parameter. Every answer
+/// is PostgreSQL 17's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exists_over_a_select_without_from_answers_as_postgresql_does() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        ok(&db, &mut s, "CREATE TABLE t (id int PRIMARY KEY, n int)").await;
+        ok(&db, &mut s, "INSERT INTO t VALUES (1, 1), (2, 7), (3, NULL)").await;
+        let at = |rows: &[&str], tag: &str| -> Result<(Vec<String>, String), String> {
+            Ok((rows.iter().map(|r| r.to_string()).collect(), tag.to_string()))
+        };
+        for (sql, expected) in [
+            ("SELECT EXISTS (SELECT 1)", at(&["t"], "SELECT 1")),
+            ("SELECT EXISTS (SELECT 1 WHERE false)", at(&["f"], "SELECT 1")),
+            ("SELECT NOT EXISTS (SELECT 1)", at(&["f"], "SELECT 1")),
+            ("SELECT EXISTS (SELECT 1 WHERE NULL)", at(&["f"], "SELECT 1")),
+            ("SELECT NOT EXISTS (SELECT 1 WHERE NULL)", at(&["t"], "SELECT 1")),
+            ("SELECT 1 WHERE EXISTS (SELECT 1)", at(&["1"], "SELECT 1")),
+            ("SELECT 1 WHERE EXISTS (SELECT 1 WHERE false)", at(&[], "SELECT 0")),
+            ("SELECT 1 WHERE NOT EXISTS (SELECT 1 WHERE 1 = 2)", at(&["1"], "SELECT 1")),
+            ("SELECT 1 WHERE EXISTS (SELECT 1 WHERE EXISTS (SELECT 1 WHERE 1 = 1))", at(&["1"], "SELECT 1")),
+            ("SELECT id FROM t WHERE EXISTS (SELECT 1) AND n IS NULL", at(&["3"], "SELECT 1")),
+            ("SELECT id FROM t WHERE EXISTS (SELECT 1 WHERE false) ORDER BY id", at(&[], "SELECT 0")),
+            ("SELECT id FROM t WHERE NOT EXISTS (SELECT 1) ORDER BY id", at(&[], "SELECT 0")),
+            ("SELECT id FROM t WHERE NOT EXISTS (SELECT 1 WHERE false) ORDER BY id", at(&["1", "2", "3"], "SELECT 3")),
+            // The outer row's columns, qualified or bare.
+            ("SELECT id FROM t WHERE EXISTS (SELECT 1 WHERE t.n > 5) ORDER BY id", at(&["2"], "SELECT 1")),
+            ("SELECT id FROM t WHERE NOT EXISTS (SELECT 1 WHERE t.n > 5) ORDER BY id", at(&["1", "3"], "SELECT 2")),
+            ("SELECT id FROM t WHERE EXISTS (SELECT 1 WHERE n > 5) ORDER BY id", at(&["2"], "SELECT 1")),
+            ("SELECT id, EXISTS (SELECT 1 WHERE t.n > 5) FROM t ORDER BY id", at(&["1|f", "2|t", "3|f"], "SELECT 3")),
+            ("SELECT count(*) FROM t a JOIN t b ON a.id = b.id WHERE EXISTS (SELECT 1 WHERE a.n > 1)", at(&["1"], "SELECT 1")),
+            // Aggregates yield a row whatever the condition.
+            ("SELECT id FROM t WHERE EXISTS (SELECT count(*) WHERE false) ORDER BY id", at(&["1", "2", "3"], "SELECT 3")),
+            ("SELECT id FROM t WHERE EXISTS (SELECT 1 LIMIT 0) ORDER BY id", at(&[], "SELECT 0")),
+            (
+                "SELECT 1 WHERE NOT EXISTS (SELECT 1 WHERE 1 = 2) AND EXISTS (SELECT 1 FROM t)",
+                at(&["1"], "SELECT 1"),
+            ),
+            ("SELECT 'é' AS x WHERE EXISTS (SELECT 'ü')", at(&["é"], "SELECT 1")),
+            ("DELETE FROM t WHERE NOT EXISTS (SELECT 1 WHERE false) AND id = 3 RETURNING id", at(&["3"], "DELETE 1")),
+            ("UPDATE t SET n = 9 WHERE EXISTS (SELECT 1) AND id = 1 RETURNING id, n", at(&["1|9"], "UPDATE 1")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        // A parameter, prepared and executed.
+        ok(&db, &mut s, "PREPARE p(int) AS SELECT id FROM t WHERE NOT EXISTS (SELECT 1 WHERE $1 = 2) ORDER BY id").await;
+        assert_eq!(answer(&db, &mut s, "EXECUTE p(2)").await, at(&[], "SELECT 0"));
+        assert_eq!(answer(&db, &mut s, "EXECUTE p(3)").await, at(&["1", "2"], "SELECT 2"));
+    })
+    .await
+    .expect("bounded");
+}

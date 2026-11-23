@@ -5134,7 +5134,11 @@ pub(crate) async fn describe_query(
     ) {
         catalog = text;
     }
-    let arrays = crate::core::sql_scan::array_subqueries(&catalog).into_owned();
+    let mut arrays = crate::core::sql_scan::array_subqueries(&catalog).into_owned();
+    // A FROM-less `EXISTS`, as `rewrite_statement_text` reads it.
+    if let Some(text) = crate::core::sql_scan::from_less_exists(&arrays) {
+        arrays = text;
+    }
     let mut shorthands = crate::core::sql_scan::statement_shorthands(&arrays).into_owned();
     if let Ok(Some(text)) = crate::core::sql_scan::tablesample(&shorthands) {
         shorthands = text;
@@ -8181,6 +8185,10 @@ pub(crate) fn rewrite_statement_text<'a>(
     if let Cow::Owned(text) = crate::core::sql_scan::array_subqueries(&stmt) {
         stmt = Cow::Owned(text);
     }
+    // `EXISTS (SELECT 1 WHERE c)`, with no FROM, as the truth value of `c`
+    // (`sql_scan::from_less_exists`).
+    let from_less = crate::core::sql_scan::from_less_exists(&stmt);
+    take(&mut stmt, from_less);
     // `TABLE t` and `AS [NOT] MATERIALIZED` (`sql_scan::statement_shorthands`).
     if let Cow::Owned(text) = crate::core::sql_scan::statement_shorthands(&stmt) {
         stmt = Cow::Owned(text);
