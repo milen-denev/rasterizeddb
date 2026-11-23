@@ -97,6 +97,22 @@ pub fn find_in_subquery(sql: &str) -> Option<InSubquery> {
                 while k < bytes.len() && bytes[k].is_ascii_whitespace() {
                     k += 1;
                 }
+                // `IN ((SELECT …))` is PostgreSQL's `IN (SELECT …)`: a
+                // parenthesised query, as long as each group is all the one
+                // around it holds. (`IN ((SELECT …), 3)` is a list of values.)
+                // Unread, the text reached a value parser that answered true.
+                let mut query_open = j;
+                while bytes.get(k) == Some(&b'(')
+                    && group_close(bytes, query_open)
+                        .zip(group_close(bytes, k))
+                        .is_some_and(|(outer, inner)| sql[inner + 1..outer].trim().is_empty())
+                {
+                    query_open = k;
+                    k += 1;
+                    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                }
                 if crate::core::sql_scan::starts_with_keyword(&sql[k..], "SELECT") {
                     // Match the closing parenthesis.
                     let mut depth = 1usize;
@@ -126,10 +142,11 @@ pub fn find_in_subquery(sql: &str) -> Option<InSubquery> {
                             !b.is_ascii_alphanumeric() && b != b'_' && b != b'"'
                         }))
                     .then(|| head.len() - 3);
+                    let query_close = group_close(bytes, query_open).unwrap_or(m - 1);
                     return Some(InSubquery {
                         start: j,
                         end: m,
-                        inner_sql: sql[j + 1..m - 1].trim().to_string(),
+                        inner_sql: sql[query_open + 1..query_close].trim().to_string(),
                         negated_start,
                     });
                 }
@@ -139,6 +156,30 @@ pub fn find_in_subquery(sql: &str) -> Option<InSubquery> {
         i += 1;
     }
 
+    None
+}
+
+/// The `)` closing the group opened at `open`, past quoted text.
+fn group_close(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut m = open;
+    while m < bytes.len() {
+        match bytes[m] {
+            b'\'' => {
+                m = crate::core::sql_scan::quoted_end(bytes, m, b'\'');
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(m);
+                }
+            }
+            _ => {}
+        }
+        m += 1;
+    }
     None
 }
 
@@ -271,6 +312,19 @@ fn scalar_subquery(sql: &str, correlated: bool) -> Option<InSubquery> {
                     }
                     i = open + 1;
                     continue;
+                }
+                // An `IN` list's items are values: `x IN ((SELECT …), 3)`
+                // holds a scalar subquery, though the word in front of it is
+                // still `IN`. (A lone `IN ((SELECT …))` is IN's own query.)
+                // Skipped as IN's, a correlated one was left in place and the
+                // item answered true for every row.
+                if previous_word == "IN" {
+                    let lone = bytes.get(k) == Some(&b'(')
+                        && group_close(bytes, k).is_some_and(|inner| sql[inner + 1..m - 1].trim().is_empty());
+                    if !lone {
+                        word_before_previous = std::mem::take(&mut previous_word);
+                        previous_word = ",".to_string();
+                    }
                 }
                 // Descend into the group rather than stepping over it: a
                 // subquery can sit inside ordinary parentheses, as in
