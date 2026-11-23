@@ -2459,6 +2459,9 @@ impl Database {
                 }
                 Self::start_routed_replication(other, &name, &config)?;
             }
+            // Catalogue changes a crash left unrecorded, recorded now.
+            let catalog = catalog.clone();
+            tokio::spawn(async move { catalog.reconcile_replication().await });
         }
         Ok(())
     }
@@ -2483,12 +2486,7 @@ impl Database {
     /// Stops `database`'s replication: its links end, and it takes no more
     /// records. Its files stay, positions and all.
     pub fn stop_replication(&self) {
-        self.replication.set_active(false);
-        for peer in self.replication.peers() {
-            if let Some(peer) = self.replication.remove_peer(&peer.name) {
-                peer.stop();
-            }
-        }
+        self.replication.stop();
     }
 
     fn start_one_replication(

@@ -268,12 +268,19 @@ pub async fn execute(sql: &str, database: &Arc<Database>) -> Result<Vec<String>,
         return enable(database).await;
     }
     if rest == "DISABLE" || rest == "STOP" {
-        replication.set_active(false);
-        for peer in replication.peers() {
-            peer.stop();
-            replication.remove_peer(&peer.name);
+        // On the default database, every database, as ENABLE starts every
+        // one: a node half disabled ships some databases' writes and not
+        // others'.
+        let others = replication.other_databases();
+        replication.stop();
+        for (_, other) in &others {
+            other.stop();
         }
-        return Ok(vec!["replication disabled".to_string()]);
+        return Ok(vec![if others.is_empty() {
+            "replication disabled".to_string()
+        } else {
+            format!("replication disabled for this database and {} other(s)", others.len())
+        }]);
     }
     if rest == "FLUSH" {
         replication.flush();
@@ -384,11 +391,23 @@ async fn enable(database: &Arc<Database>) -> Result<Vec<String>, String> {
     }
 
     Database::start_replication(database.clone()).map_err(|e| e.to_string())?;
+    // Every other database a DISABLE stopped, through the catalogue the
+    // listener links: the counterpart of DISABLE stopping them all.
+    let mut resumed = 0usize;
+    for (_, other) in replication.other_databases() {
+        if !other.is_active() {
+            other.resume();
+            resumed += 1;
+        }
+    }
 
     let mut lines = vec![format!(
         "replication enabled as node {} of cluster '{}', listening on {}:{}",
         config.node_id, config.cluster, config.listen_addr, config.listen_port
     )];
+    if resumed > 0 {
+        lines.push(format!("and for {resumed} other database(s)"));
+    }
     for peer_config in &config.peers {
         lines.push(format!(
             "peer {} started at {}",
@@ -941,6 +960,49 @@ fn show_status(replication: &StdArc<Replication>) -> Vec<String> {
     }
 
     lines.extend(show_peers(replication));
+    lines.extend(database_summaries(replication));
+    lines
+}
+
+/// One line per other database of the node, after the default database's
+/// report: each replicates over links of its own, with its own positions.
+fn database_summaries(replication: &StdArc<Replication>) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (name, other) in replication.other_databases() {
+        let local_seq = other.local_seq();
+        let mut vector = other.applied().vector();
+        vector.sort_unstable_by_key(|entry| entry.origin);
+        let applied = if vector.is_empty() {
+            "nothing applied".to_string()
+        } else {
+            format!(
+                "applied through {}",
+                vector.iter().map(|e| format!("node {} → {}", e.origin, e.seq)).collect::<Vec<_>>().join(", ")
+            )
+        };
+        let peers: Vec<String> = other
+            .peers()
+            .iter()
+            .map(|peer| {
+                let snapshot = peer.snapshot(local_seq);
+                let state = if snapshot.paused {
+                    "paused"
+                } else if snapshot.state != super::peer::PeerState::Streaming {
+                    snapshot.state.as_str()
+                } else if snapshot.connected {
+                    "up"
+                } else {
+                    "down"
+                };
+                format!("{} {} acked {} lag {}", snapshot.name, state, snapshot.acked_seq, snapshot.lag)
+            })
+            .collect();
+        lines.push(format!(
+            "database {name}: {}, local sequence {local_seq}, {applied}; peers: {}",
+            if other.is_active() { "enabled" } else { "disabled" },
+            if peers.is_empty() { "none".to_string() } else { peers.join(", ") }
+        ));
+    }
     lines
 }
 
@@ -1306,6 +1368,27 @@ fn stats_rows(database: &Arc<Database>) -> Vec<crate::core::row::row::Row> {
         config.log_retention_bytes.to_string(),
         "history kept for a peer that falls behind; past this it must resynchronise",
     );
+
+    // Each other database's, as rows of their own after these: a client
+    // reads these rows by metric name, so rows are added, never columns.
+    for (name, other) in replication.other_databases() {
+        let local_seq = other.local_seq();
+        let peers = other.peers();
+        let snapshots: Vec<_> = peers.iter().map(|peer| peer.snapshot(local_seq)).collect();
+        let connected = snapshots.iter().filter(|s| s.connected).count();
+        let lag = snapshots.iter().map(|s| s.lag).max().unwrap_or(0);
+        let mut vector = other.applied().vector();
+        vector.sort_unstable_by_key(|entry| entry.origin);
+        push(&format!("database.{name}.active"), other.is_active().to_string(), "whether this database's writes are being shipped");
+        push(&format!("database.{name}.local_sequence"), local_seq.to_string(), "records this database has originated");
+        push(
+            &format!("database.{name}.applied"),
+            vector.iter().map(|e| e.seq).sum::<u64>().to_string(),
+            &vector.iter().map(|e| format!("node {} → {}", e.origin, e.seq)).collect::<Vec<_>>().join(", "),
+        );
+        push(&format!("database.{name}.peers_connected"), connected.to_string(), &format!("of {}", snapshots.len()));
+        push(&format!("database.{name}.max_lag"), lag.to_string(), "records the furthest-behind peer has yet to take");
+    }
 
     out
 }

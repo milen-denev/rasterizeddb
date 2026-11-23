@@ -191,3 +191,126 @@ async fn a_link_for_a_database_the_peer_does_not_have_waits_for_it() {
         crate::core::wal::remove_for(&dir.join("local").to_string_lossy());
     }
 }
+
+async fn pair(dir_one: &std::path::Path, dir_two: &std::path::Path) -> (Arc<DatabaseCatalog>, Arc<DatabaseCatalog>) {
+    let (bound_one, bound_two) = (listener(), listener());
+    let (port_one, port_two) = (bound_one.1, bound_two.1);
+    let one = node(1, dir_one, bound_one, vec![PeerConfig::new("two", format!("127.0.0.1:{port_two}"))]).await;
+    let two = node(2, dir_two, bound_two, vec![PeerConfig::new("one", format!("127.0.0.1:{port_one}"))]).await;
+    (one, two)
+}
+
+fn release(dirs: &[&std::path::Path], names: &[&str]) {
+    for dir in dirs {
+        crate::core::wal::remove_for(&dir.to_string_lossy());
+        for name in names {
+            crate::core::wal::remove_for(&dir.join(name).to_string_lossy());
+        }
+    }
+}
+
+/// A stop between a catalogue change and its record leaves the change on
+/// this node alone; the marker written before the change says so, and the
+/// next start records it. For a CREATE, a DROP, and a DROP the stop
+/// interrupted before the database was gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_catalogue_change_a_crash_left_unrecorded_is_recorded_at_the_next_start() {
+    use crate::core::database::catalog::test_hooks::crash_before_record;
+    let (dir_one, dir_two) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (one, two) = pair(dir_one.path(), dir_two.path()).await;
+
+    crash_before_record("crashed");
+    one.create("crashed").await.expect("CREATE DATABASE");
+    let marker = dir_one.path().join("crashed").join("db_replication.pending_create");
+    assert!(marker.exists(), "the CREATE's marker outlives the crash");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(two.get("crashed").is_none(), "nothing was recorded, so node two has not heard of it");
+
+    // What the next start runs.
+    one.reconcile_replication().await;
+    eventually("node two to create the database", || async { two.get("crashed").is_some() }).await;
+    assert!(!marker.exists(), "recorded: the marker is gone");
+    let mine = one.get("crashed").unwrap();
+    run_ok(&mine, "CREATE TABLE notes (id INTEGER, v VARCHAR)").await;
+    run_ok(&mine, "INSERT INTO notes (id, v) VALUES (1, 'after the crash')").await;
+    eventually("its rows on node two", || async {
+        notes(&two, "crashed").await == Some(strings(&["after the crash"]))
+    })
+    .await;
+    drop(mine);
+
+    // A DROP that stopped before its record.
+    crash_before_record("crashed");
+    one.drop_database("crashed", DEFAULT).await.expect("DROP DATABASE");
+    let tombstone = dir_one.path().join("db_replication.pending_drop.crashed");
+    assert!(tombstone.exists(), "the DROP's tombstone outlives the crash");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(two.get("crashed").is_some(), "nothing was recorded, so node two keeps it");
+    one.reconcile_replication().await;
+    eventually("node two to drop the database", || async { two.get("crashed").is_none() }).await;
+    assert!(!tombstone.exists());
+
+    // A DROP the stop interrupted before the database went: finished, then
+    // recorded.
+    one.create("half").await.expect("CREATE DATABASE");
+    eventually("node two to create half", || async { two.get("half").is_some() }).await;
+    std::fs::File::create(dir_one.path().join("db_replication.pending_drop.half")).unwrap();
+    one.reconcile_replication().await;
+    assert!(one.get("half").is_none(), "the interrupted DROP is finished");
+    eventually("node two to drop half", || async { two.get("half").is_none() }).await;
+
+    // A database with no marker is never announced: one made before
+    // replication knew of it waits for a base copy rather than being
+    // created empty on the peers.
+    one.create_unrecorded("quiet").await.expect("a database");
+    one.reconcile_replication().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(two.get("quiet").is_none());
+
+    drop((one, two));
+    release(&[dir_one.path(), dir_two.path()], &["crashed", "half", "quiet"]);
+}
+
+/// REPLICATION DISABLE on the default database stops every database, as
+/// ENABLE starts them; SHOW REPLICATION STATUS and STATS report each other
+/// database on rows of their own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disable_and_enable_cover_every_database_and_status_reports_each() {
+    let (dir_one, dir_two) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (one, two) = pair(dir_one.path(), dir_two.path()).await;
+    one.create("sales").await.expect("CREATE DATABASE");
+    eventually("node two to create sales", || async { two.get("sales").is_some() }).await;
+    let default = one.get(DEFAULT).unwrap();
+    let sales = one.get("sales").unwrap();
+    run_ok(&sales, "CREATE TABLE notes (id INTEGER, v VARCHAR)").await;
+    eventually("sales' table on node two", || async { notes(&two, "sales").await.is_some() }).await;
+
+    let status = super::sql::execute("SHOW REPLICATION STATUS", &default).await.unwrap();
+    let line = status.iter().find(|l| l.starts_with("database sales:")).unwrap_or_else(|| panic!("{status:#?}"));
+    assert!(line.contains("enabled") && line.contains("local sequence 1") && line.contains("two "), "{line}");
+    let stats = super::sql::execute_structured("SHOW REPLICATION STATS", &default).unwrap();
+    let rows = crate::core::row::row::vec_into_rows(&stats[1..]).unwrap();
+    let metrics: Vec<String> =
+        rows.iter().map(|r| String::from_utf8_lossy(r.columns[0].data.into_slice()).to_string()).collect();
+    for metric in ["database.sales.active", "database.sales.local_sequence", "database.sales.peers_connected"] {
+        assert!(metrics.iter().any(|m| m == metric), "{metric} in {metrics:?}");
+    }
+
+    let disabled = super::sql::execute("REPLICATION DISABLE", &default).await.unwrap();
+    assert!(disabled[0].contains("1 other"), "{disabled:?}");
+    assert!(!default.replication.is_active() && !sales.replication.is_active());
+    assert!(sales.replication.peers().is_empty());
+    // A write now is this node's alone.
+    run_ok(&sales, "INSERT INTO notes (id, v) VALUES (1, 'while disabled')").await;
+
+    super::sql::execute("REPLICATION ENABLE", &default).await.unwrap();
+    assert!(default.replication.is_active() && sales.replication.is_active());
+    run_ok(&sales, "INSERT INTO notes (id, v) VALUES (2, 'after enable')").await;
+    eventually("the write after ENABLE on node two", || async {
+        notes(&two, "sales").await.is_some_and(|rows| rows.contains(&"after enable".to_string()))
+    })
+    .await;
+
+    drop((default, sales, one, two));
+    release(&[dir_one.path(), dir_two.path()], &["sales"]);
+}

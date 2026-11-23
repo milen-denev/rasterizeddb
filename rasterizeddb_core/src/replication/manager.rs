@@ -437,6 +437,11 @@ pub trait CatalogLink: Send + Sync {
         &'a self,
         op: CatalogOp,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+
+    /// The node's other databases and their replication, by name, sorted:
+    /// what `REPLICATION DISABLE` stops and `SHOW REPLICATION STATUS` and
+    /// `STATS` report beside the default database's own.
+    fn replications(&self) -> Vec<(String, Arc<Replication>)>;
 }
 
 impl std::fmt::Debug for Replication {
@@ -493,6 +498,38 @@ impl Replication {
             routed: parking_lot::Mutex::new(None),
             catalog: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Stops this instance: it captures nothing more, and its links end. Its
+    /// files stay, positions and all.
+    pub fn stop(&self) {
+        self.set_active(false);
+        for peer in self.peers() {
+            peer.stop();
+            self.remove_peer(&peer.name);
+        }
+    }
+
+    /// Starts again what [`Replication::stop`] stopped: it captures again,
+    /// and a link to each configured peer starts. Its storage is still open
+    /// from the first start.
+    pub fn resume(self: &Arc<Self>) {
+        self.set_active(true);
+        let config = self.config();
+        for peer_config in &config.peers {
+            if self.peer(&peer_config.name).is_none() {
+                self.insert_peer(super::peer::spawn(self.clone(), peer_config));
+            }
+        }
+    }
+
+    /// The node's other databases' replication, when this is the default
+    /// database's and its catalogue is linked; empty otherwise.
+    pub fn other_databases(&self) -> Vec<(String, Arc<Replication>)> {
+        if self.routed_database().is_some() {
+            return Vec::new();
+        }
+        self.catalog().map(|link| link.replications()).unwrap_or_default()
     }
 
     /// Makes this the replication of the non-default database `name`.
