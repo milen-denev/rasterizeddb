@@ -1,0 +1,10 @@
+post_install() {
+  cat <<'MSG'
+==> RasterizedDB: set a password before starting the service:
+      sudoedit /etc/rasterizeddb/rasterizeddb.env    (RASTERIZEDDB_PG_PASSWORD=...)
+      sudo systemctl enable --now rasterizeddb
+    Data lives in /var/lib/rasterizeddb. It listens on localhost only
+    (PostgreSQL protocol 5432, native 61170); RASTERIZEDDB_ARGS in the same
+    file adds server flags, e.g. --pg-addr 0.0.0.0.
+MSG
+}

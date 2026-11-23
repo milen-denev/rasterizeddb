@@ -28,6 +28,9 @@ if [ "${2:-}" = "--no-bolt" ]; then BOLT=0; fi
 EXE=""
 case "$TARGET" in
   *windows*) EXE=".exe"; BOLT=0 ;;  # BOLT rewrites ELF binaries only
+  # The static musl binaries (Alpine image): PGO only, as BOLT's
+  # instrumentation is untested here on a static-pie executable.
+  *linux-musl*) BOLT=0 ;;
   *linux*) ;;
   *) BOLT=0 ;;
 esac

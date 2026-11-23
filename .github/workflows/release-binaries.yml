@@ -10,7 +10,13 @@ name: Release - server and Studio executables
 #   rasterizeddb-server-<version>-linux-arm64.tar.gz      (armv8-a)
 #   rasterizeddb-server-<version>-windows-x86_64.zip      (x86-64-v3: AVX2 CPUs)
 #   rasterizeddb-server-<version>-windows-arm64.zip       (armv8-a)
-#   rdb-studio-<version>-<same four platforms>.tar.gz / .zip
+#   rasterizeddb-server-<version>-linux-x86_64-musl.tar.gz  (static, for Alpine)
+#   rasterizeddb-server-<version>-linux-arm64-musl.tar.gz   (static, for Alpine)
+#   rdb-studio-<version>-<the four glibc/MSVC platforms>.tar.gz / .zip
+#   rasterizeddb-bin-<version>-1-x86_64.pkg.tar.zst         (Arch / CachyOS)
+#   rasterizeddb-bin-aur-<version>.tar.gz                   (its AUR sources)
+#
+# and pushes the container images to ghcr.io (the `docker` job below).
 #
 # Studio is a desktop application (iced): it is built in the release profile
 # without PGO, and only built here, since it cannot start without a display.
@@ -62,15 +68,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x86_64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, archive: tar.gz }
-          - { name: linux-arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, archive: tar.gz }
-          - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc, archive: zip }
-          - { name: windows-arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc, archive: zip }
+          - { name: linux-x86_64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, archive: tar.gz, studio: true }
+          - { name: linux-arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, archive: tar.gz, studio: true }
+          - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc, archive: zip, studio: true }
+          - { name: windows-arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc, archive: zip, studio: true }
+          # Static musl servers, for the Alpine image (and any Linux without
+          # glibc 2.39). No Studio: a desktop app is not built statically.
+          - { name: linux-x86_64-musl, runner: ubuntu-24.04, target: x86_64-unknown-linux-musl, archive: tar.gz, studio: false }
+          - { name: linux-arm64-musl, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, archive: tar.gz, studio: false }
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
         with:
           target: ${{ matrix.target }}
+
+      # aws-lc, ring, zstd and mimalloc compile C for the target: musl's gcc
+      # wrapper on the native runner of each architecture.
+      - name: musl C toolchain
+        if: contains(matrix.target, 'musl')
+        shell: bash
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q musl-tools
+          triple="$(echo '${{ matrix.target }}' | tr '-' '_')"
+          echo "CC_$triple=musl-gcc" >> "$GITHUB_ENV"
 
       # A pre-release tag (v1.0.0-rc.1) matches the version without its
       # suffix and makes a GitHub pre-release.
@@ -117,6 +138,7 @@ jobs:
       # network, not to code a training run would cover). Built, not run: it
       # opens a window at start.
       - name: Build RasterizedDB Studio (release profile)
+        if: matrix.studio
         run: cargo build --locked --release --target ${{ matrix.target }} -p rdb_studio
 
       - name: Package
@@ -139,16 +161,16 @@ jobs:
           mkdir -p "dist/$server"
           cp "target/${{ matrix.target }}/release/rasterizeddb_core$ext" "dist/$server/rasterizeddb$ext"
           cp README.md LICENSE-GPL "dist/$server/"
-          studio="rdb-studio-$version-${{ matrix.name }}"
-          mkdir -p "dist/$studio"
-          cp "target/${{ matrix.target }}/release/rdb_studio$ext" "dist/$studio/rdb-studio$ext"
-          cp rdb_studio/README.md "dist/$studio/README.md"
-          cp LICENSE-GPL "dist/$studio/"
           cd dist
-          {
-            echo "server=$(pack "$server")"
-            echo "studio=$(pack "$studio")"
-          } >> "$GITHUB_OUTPUT"
+          echo "server=$(pack "$server")" >> "$GITHUB_OUTPUT"
+          if [ "${{ matrix.studio }}" = true ]; then
+            studio="rdb-studio-$version-${{ matrix.name }}"
+            mkdir -p "$studio"
+            cp "../target/${{ matrix.target }}/release/rdb_studio$ext" "$studio/rdb-studio$ext"
+            cp ../rdb_studio/README.md "$studio/README.md"
+            cp ../LICENSE-GPL "$studio/"
+            echo "studio=$(pack "$studio")" >> "$GITHUB_OUTPUT"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -158,8 +180,169 @@ jobs:
             ${{ steps.package.outputs.studio }}
           if-no-files-found: error
 
-  release:
+  # Container images, ghcr.io/<owner>/rasterizeddb, for linux/amd64 and
+  # linux/arm64, from the binaries the build job made (no compiling here):
+  #
+  #   <version>-ubuntu24.04  <version>  <minor>  <major>  latest   (the default)
+  #   <version>-ubuntu26.04
+  #   <version>-alpine      (the static musl server)
+  #
+  # plus <minor>-<variant> and <variant>. A pre-release gets only its exact
+  # version tags. Each variant's amd64 image is smoke-tested before the push
+  # (.github/scripts/docker-smoke.sh); pushes happen only for a tag.
+  docker:
+    name: image ${{ matrix.variant }}
     needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { variant: ubuntu24.04, file: Dockerfile.ubuntu, base: "ubuntu:24.04", default: true }
+          - { variant: ubuntu26.04, file: Dockerfile.ubuntu, base: "ubuntu:26.04", default: false }
+          - { variant: alpine, file: Dockerfile.alpine, base: "alpine:3", default: false }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: linux-*
+          merge-multiple: true
+
+      - name: Binaries into the build context
+        shell: bash
+        run: |
+          set -euo pipefail
+          # take <archive suffix> <context dir>
+          take() {
+            mkdir -p "docker/$2"
+            tar xzf artifacts/rasterizeddb-server-*-"$1".tar.gz -C "docker/$2" \
+              --strip-components=1 --wildcards '*/rasterizeddb'
+          }
+          take linux-x86_64 bin/amd64
+          take linux-arm64 bin/arm64
+          take linux-x86_64-musl bin-musl/amd64
+          take linux-arm64-musl bin-musl/arm64
+          cp README.md LICENSE-GPL docker/
+          file docker/bin*/*/rasterizeddb
+
+      - name: Tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo pkgid -p rasterizeddb_core | sed 's/.*[#@]//')"
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/rasterizeddb"
+          variant="${{ matrix.variant }}"
+          tags="$image:$version-$variant"
+          case "$version" in
+            *-*)
+              if [ "${{ matrix.default }}" = true ]; then tags="$tags,$image:$version"; fi ;;
+            *)
+              minor="${version%.*}"; major="${version%%.*}"
+              tags="$tags,$image:$minor-$variant,$image:$variant"
+              if [ "${{ matrix.default }}" = true ]; then
+                tags="$tags,$image:$version,$image:$minor,$image:$major,$image:latest"
+              fi ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "$tags" | tr , '\n'
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the amd64 image for the smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: docker
+          file: docker/${{ matrix.file }}
+          build-args: BASE=${{ matrix.base }}
+          platforms: linux/amd64
+          load: true
+          tags: rasterizeddb-smoke:${{ matrix.variant }}
+
+      - name: Smoke test the image
+        run: bash .github/scripts/docker-smoke.sh rasterizeddb-smoke:${{ matrix.variant }}
+
+      - name: Log in to the GitHub container registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build both architectures (pushed for a tag)
+        uses: docker/build-push-action@v6
+        with:
+          context: docker
+          file: docker/${{ matrix.file }}
+          build-args: BASE=${{ matrix.base }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=RasterizedDB
+            org.opencontainers.image.description=RasterizedDB server (${{ matrix.variant }})
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.tags.outputs.version }}
+            org.opencontainers.image.licenses=GPL-3.0-only
+
+  # The Arch Linux / CachyOS package, rasterizeddb-bin, built with makepkg in
+  # an Arch container from packaging/arch and the linux-x86_64 archive, then
+  # installed there and run. The release gets the .pkg.tar.zst and an AUR
+  # source tarball (PKGBUILD with real checksums, .SRCINFO, its files).
+  pacman:
+    name: Arch / CachyOS package
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container: archlinux:latest
+    steps:
+      - name: Tools
+        run: pacman -Syu --noconfirm --needed base-devel git pacman-contrib namcap
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64
+          path: artifacts
+
+      - name: makepkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="$(ls artifacts/rasterizeddb-server-*-linux-x86_64.tar.gz)"
+          tag="$(basename "$tarball")"; tag="${tag#rasterizeddb-server-}"; tag="${tag%-linux-x86_64.tar.gz}"
+          work=/tmp/pkg && mkdir -p "$work"
+          cp packaging/arch/* "$tarball" "$work/"
+          sed -i "s/^_tag=.*/_tag=$tag/" "$work/PKGBUILD"
+          useradd -m builder && chown -R builder "$work"
+          # updpkgsums finds the archive beside the PKGBUILD and downloads nothing.
+          su builder -c "cd $work && updpkgsums && makepkg --nodeps --noconfirm && makepkg --printsrcinfo > .SRCINFO"
+          namcap "$work"/rasterizeddb-bin-*.pkg.tar.zst || true
+          pacman -U --noconfirm "$work"/rasterizeddb-bin-*.pkg.tar.zst
+          rasterizeddb --version
+          pacman -Ql rasterizeddb-bin
+          mkdir -p dist "dist/rasterizeddb-bin-aur-$tag"
+          cp "$work"/rasterizeddb-bin-*.pkg.tar.zst dist/
+          cp "$work"/{PKGBUILD,.SRCINFO,rasterizeddb.service,rasterizeddb.sysusers,rasterizeddb.env,rasterizeddb.install} "dist/rasterizeddb-bin-aur-$tag/"
+          tar czf "dist/rasterizeddb-bin-aur-$tag.tar.gz" -C dist "rasterizeddb-bin-aur-$tag"
+          rm -r "dist/rasterizeddb-bin-aur-$tag"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-package
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [build, pacman]
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     steps:
@@ -168,7 +351,7 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Checksums
-        run: cd dist && sha256sum rasterizeddb-server-* rdb-studio-* > SHA256SUMS && cat SHA256SUMS
+        run: cd dist && sha256sum rasterizeddb-server-* rdb-studio-* rasterizeddb-bin-* > SHA256SUMS && cat SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           name: "RasterizedDB ${{ github.ref_name }}"
@@ -177,6 +360,7 @@ jobs:
           files: |
             dist/rasterizeddb-server-*
             dist/rdb-studio-*
+            dist/rasterizeddb-bin-*
             dist/SHA256SUMS
           body: |
             The RasterizedDB server for Linux and Windows, x86-64 and ARM64.
@@ -187,7 +371,13 @@ jobs:
             | Linux ARM64 | `linux-arm64.tar.gz` | any ARMv8-A |
             | Windows x86-64 | `windows-x86_64.zip` | x86-64-v3 (AVX2) |
             | Windows ARM64 | `windows-arm64.zip` | any ARMv8-A |
+            | Linux x86-64, static (musl) | `linux-x86_64-musl.tar.gz` | x86-64-v3 (AVX2) |
+            | Linux ARM64, static (musl) | `linux-arm64-musl.tar.gz` | any ARMv8-A |
 
-            Built with fat LTO and profile-guided optimisation; the Linux binaries are also optimised with BOLT. Linux binaries need glibc 2.39+. Start with `rasterizeddb --location <dir>` (or `--in-memory`); `rasterizeddb --help` lists every option. Verify a download with `sha256sum -c SHA256SUMS`.
+            Built with fat LTO and profile-guided optimisation; the glibc Linux binaries are also optimised with BOLT and need glibc 2.39+. The static musl binaries run on any Linux (Alpine included) and use mimalloc. Start with `rasterizeddb --location <dir>` (or `--in-memory`); `rasterizeddb --help` lists every option. Verify a download with `sha256sum -c SHA256SUMS`.
+
+            **Container images** (linux/amd64 and linux/arm64): `ghcr.io/${{ github.repository_owner }}/rasterizeddb:<version>` on Ubuntu 24.04 (also `<version>-ubuntu24.04`), `<version>-ubuntu26.04`, and `<version>-alpine`. Run with `docker run -e RASTERIZEDDB_PG_PASSWORD=<password> -p 5432:5432 -p 61170:61170 -v rasterizeddb:/var/lib/rasterizeddb ghcr.io/${{ github.repository_owner }}/rasterizeddb:<version>`; see docs/docker.md.
+
+            **Arch Linux / CachyOS** (x86-64-v3): `sudo pacman -U rasterizeddb-bin-*.pkg.tar.zst`, set the password in `/etc/rasterizeddb/rasterizeddb.env`, then `sudo systemctl enable --now rasterizeddb`. `rasterizeddb-bin-aur-*.tar.gz` holds the same PKGBUILD for the AUR.
 
             **RasterizedDB Studio** (`rdb-studio-*`), the desktop console for RasterizedDB and PostgreSQL, is in the same four builds: dashboard, tables and schema, data editing, queries, activity, benchmarks, backups, branches, replication, migration, key/value browsing, roles and configuration. Run `rdb-studio` (`rdb-studio.exe` on Windows). It needs a desktop session: on Linux a Wayland or X11 session with a Vulkan or OpenGL driver, glibc 2.39+; the x86-64 builds need an AVX2 CPU like the server. Saved passwords go to the OS credential store (the Secret Service on Linux, Credential Manager on Windows).

@@ -47,8 +47,27 @@ Download the archive for your platform from the [releases](https://github.com/mi
 | Linux ARM64 | `rasterizeddb-server-<version>-linux-arm64.tar.gz` | any ARMv8-A (Graviton, Ampere, Raspberry Pi 4/5, ...) |
 | Windows x86-64 | `rasterizeddb-server-<version>-windows-x86_64.zip` | x86-64-v3 (AVX2) |
 | Windows ARM64 | `rasterizeddb-server-<version>-windows-arm64.zip` | any ARMv8-A (Snapdragon X, ...) |
+| Linux x86-64, static (musl) | `rasterizeddb-server-<version>-linux-x86_64-musl.tar.gz` | x86-64-v3 (AVX2) |
+| Linux ARM64, static (musl) | `rasterizeddb-server-<version>-linux-arm64-musl.tar.gz` | any ARMv8-A |
 
-Linux builds need glibc 2.39 or newer. Unix sockets (`--rdb-socket`, `--pg-socket`, peer authentication) exist on Linux only; on Windows use TCP.
+The glibc Linux builds need glibc 2.39 or newer; the static musl builds run on any Linux, Alpine included.
+
+**Docker** (linux/amd64 and linux/arm64; Ubuntu 24.04 by default, also `-ubuntu26.04` and `-alpine` tags; [docs/docker.md](docs/docker.md)):
+
+```sh
+docker run -d --name rasterizeddb -e RASTERIZEDDB_PG_PASSWORD=change-me \
+  -p 5432:5432 -p 61170:61170 -v rasterizeddb:/var/lib/rasterizeddb \
+  ghcr.io/milen-denev/rasterizeddb:latest
+```
+
+**Arch Linux / CachyOS** (x86-64-v3): each release carries `rasterizeddb-bin-<version>-1-x86_64.pkg.tar.zst`, with a systemd service:
+
+```sh
+sudo pacman -U rasterizeddb-bin-*.pkg.tar.zst
+sudoedit /etc/rasterizeddb/rasterizeddb.env     # RASTERIZEDDB_PG_PASSWORD=...
+sudo systemctl enable --now rasterizeddb
+```
+ Unix sockets (`--rdb-socket`, `--pg-socket`, peer authentication) exist on Linux only; on Windows use TCP.
 
 rasterizeddb --location /your-location/bla-bla --concurrent_threads 16 --batch_size 16000
 

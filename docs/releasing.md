@@ -6,7 +6,7 @@ There are three release channels. Each is started by pushing a tag, and each mak
 |---|---|---|---|
 | Client SDK | `client-v<version>` | `release-client.yml` | crates.io: `rastcp`, `rasterizeddb_client_derive`, `rasterizeddb_client` |
 | Server crates | `server-v<version>` | `release-server.yml` | crates.io: `rastcp`, `rasterizeddb_core`, `rasterizeddb_embedded` |
-| Server executables | `v<version>` | `release-binaries.yml` | GitHub release assets for 4 targets, plus `SHA256SUMS` |
+| Server executables | `v<version>` | `release-binaries.yml` | GitHub release assets: the server for 6 targets (4 glibc/MSVC + 2 static musl), Studio for 4, the Arch/CachyOS package and its AUR sources, `SHA256SUMS`; container images on `ghcr.io` (Ubuntu 24.04, Ubuntu 26.04, Alpine) |
 
 `<version>` must equal the version in the crates' `Cargo.toml`. For the client channel that is `rasterizeddb_client` and `rasterizeddb_client_derive`; for the server crates and the executables it is `rasterizeddb_core` (and `rasterizeddb_embedded`). The workflow checks this before it builds anything.
 
