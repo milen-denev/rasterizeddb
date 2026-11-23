@@ -1649,6 +1649,98 @@ fn key_display(literal: &str) -> String {
     }
 }
 
+/// Whether `text`, a value as a statement wrote it, is a literal a foreign
+/// key's probe may carry as it stands: a number, a quoted string, either
+/// under one cast (`'…'::uuid`, `7::bigint`).
+///
+/// Anything else is an expression (`gen_random_uuid()`, `nextval('s')`,
+/// `now()`, `1 + 1`, `DEFAULT`). Its text is not its value, and pasted into
+/// the probe it was read as a column ("unknown column 'gen_random_uuid'"),
+/// compared as text (`nextval('s')` matched no parent), or evaluated there,
+/// a second time: a sequence advanced once per probe, and a volatile call
+/// checked at one value and stored at another.
+fn is_key_literal(text: &str) -> bool {
+    let text = text.trim();
+    if crate::core::rql::lexer_ir::plain_literal(text) {
+        return true;
+    }
+    let body = match text.rfind("::") {
+        Some(at) => {
+            let type_name = text[at + 2..].trim();
+            let named = !type_name.is_empty()
+                && type_name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b' ' | b'(' | b')' | b','))
+                && type_name.as_bytes()[0].is_ascii_alphabetic();
+            if !named {
+                return false;
+            }
+            text[..at].trim_end()
+        }
+        None => text,
+    };
+    crate::core::rql::lexer_ir::plain_literal(body)
+        || (body.starts_with('\'')
+            && body.len() >= 2
+            && crate::core::sql_scan::quoted_end(body.as_bytes(), 0, b'\'') == body.len()
+            && !body.contains('\\'))
+}
+
+/// Whether an `INSERT`'s foreign keys can only be checked against the row
+/// it will write: a key column given something that is no literal
+/// ([`is_key_literal`]), or given nothing while it has a default, which then
+/// is its value. `INSERT INTO c (id) VALUES (1)` under `p INT DEFAULT 99
+/// REFERENCES parent` stored a 99 no parent has, unchecked.
+fn foreign_key_values_need_the_row(
+    schema: &crate::core::row::schema::TableSchema,
+    assignments: &[(String, String)],
+) -> bool {
+    schema.foreign_keys.iter().any(|fk| {
+        match assignments.iter().find(|(column, _)| column.eq_ignore_ascii_case(&fk.column)) {
+            Some((_, value)) => !value.trim().eq_ignore_ascii_case("NULL") && !is_key_literal(value),
+            None => schema.defaults.iter().any(|d| !d.is_deleted && d.column.eq_ignore_ascii_case(&fk.column)),
+        }
+    })
+}
+
+/// `assignments` for [`check_foreign_keys_of`], each foreign-key column that
+/// [`foreign_key_values_need_the_row`] names given the literal of what `row`
+/// holds for it (`NULL` when it holds none): the value the statement stores,
+/// computed once.
+fn foreign_key_values_of_row(
+    schema: &crate::core::row::schema::TableSchema,
+    assignments: &[(String, String)],
+    row: &crate::core::row::row::RowWrite,
+) -> Result<Vec<(String, String)>, String> {
+    let payload = |write_order: u64| row.columns_writing_data.iter().find(|p| u64::from(p.write_order) == write_order);
+    let mut out = Vec::with_capacity(schema.foreign_keys.len());
+    for fk in schema.foreign_keys.iter() {
+        if out.iter().any(|(column, _): &(String, String)| column.eq_ignore_ascii_case(&fk.column)) {
+            continue;
+        }
+        let written = assignments.iter().find(|(column, _)| column.eq_ignore_ascii_case(&fk.column));
+        if let Some((column, value)) = written
+            && (value.trim().eq_ignore_ascii_case("NULL") || is_key_literal(value))
+        {
+            out.push((column.clone(), value.clone()));
+            continue;
+        }
+        let Some(field) = schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&fk.column))
+        else {
+            continue;
+        };
+        let is_null = crate::core::rql::nullable::flag_field(&field.name, &schema.fields)
+            .and_then(|flag| payload(flag.write_order))
+            .is_some_and(|flag| crate::core::rql::nullable::flag_is_set(flag.data.into_slice()));
+        let literal = match payload(field.write_order) {
+            Some(value) if !is_null && value.column_type != crate::core::db_type::DbType::NULL => {
+                key_literal(field, value.data.into_slice())?
+            }
+            _ => "NULL".to_string(),
+        };
+        out.push((fk.column.clone(), literal));
+    }
+    Ok(out)
+}
+
 /// Checks that every foreign key on `table_name` is satisfied by `assignments`.
 ///
 /// `assignments` maps a column name to the literal being written. A `NULL` is
@@ -1882,6 +1974,12 @@ async fn prevalidate_foreign_keys(
             };
             let literal = literal.trim();
             if literal.eq_ignore_ascii_case("NULL") {
+                continue;
+            }
+            // An expression proves nothing here and must not reach the
+            // probe, which would evaluate it (`nextval('s')`, once per
+            // probe): its row's own check reads the value the row stores.
+            if !is_key_literal(literal) {
                 continue;
             }
             if seen.insert(literal.to_string()) {
@@ -2883,7 +2981,7 @@ async fn check_foreign_keys_for_update(
     assignments: &[(String, String)],
     visibility: Option<&crate::core::mvcc::Visibility>,
     tx: TxId,
-) -> Result<(), String> {
+) -> Result<Vec<crate::core::row::schema::SchemaField>, String> {
     let schema = &target.schema().fields;
     let expression_of = |name: &str| {
         schema
@@ -2904,19 +3002,38 @@ async fn check_foreign_keys_for_update(
         .collect();
     check_foreign_keys(database, table_name, &constants, tx).await?;
 
-    let by_expression: Vec<_> = target
+    let mut by_expression: Vec<_> = target
         .schema()
         .foreign_keys
         .iter()
         .filter_map(|fk| expression_of(&fk.column).map(|(f, e)| (fk.column.clone(), f, e)))
         .collect();
-    if by_expression.is_empty() {
-        return Ok(());
+    // An expression that answers anew at every evaluation (`nextval('s')`,
+    // `gen_random_uuid()`) has no value until the write computes it:
+    // computed here as well, the check read one value and the row stored
+    // the next, a key no parent holds, and a sequence advanced twice per
+    // row. Its column is the caller's to check once the rows are written
+    // (`check_written_foreign_keys`).
+    let mut after_write: Vec<crate::core::row::schema::SchemaField> = Vec::new();
+    by_expression.retain(|(column, field, _)| {
+        let volatile = assignments
+            .iter()
+            .any(|(name, text)| name.eq_ignore_ascii_case(column) && crate::core::rql::generated::is_volatile(text));
+        if volatile && !after_write.iter().any(|f| f.write_order == field.write_order) {
+            after_write.push(field.clone());
+        }
+        !volatile
+    });
+    if by_expression.is_empty() && after_write.is_empty() {
+        return Ok(after_write);
     }
     let Some(visibility) = visibility else {
         return Err("an expression assigned to a foreign-key column needs a statement snapshot"
             .to_string());
     };
+    if by_expression.is_empty() {
+        return Ok(after_write);
+    }
     let full = crate::core::row::table::Table::<crate::core::storage_providers::backend::DbStorageProvider>::build_full_row_fetch(schema);
     let rows = relation_rows_as_of(
         target,
@@ -2947,6 +3064,41 @@ async fn check_foreign_keys_for_update(
             };
             if seen.insert(literal.clone()) {
                 check_foreign_keys(database, table_name, &[(column.clone(), literal)], tx).await?;
+            }
+        }
+    }
+    Ok(after_write)
+}
+
+/// The foreign keys of `columns`, checked against the rows an `UPDATE`
+/// wrote: `written` is every row with its computed assignments as stored
+/// (`Table::returning_image`). For the columns
+/// [`check_foreign_keys_for_update`] could not check before the write. A
+/// violation fails the statement, whose abort takes the rows back: the
+/// write ran under the statement's snapshot, so none was overwritten in
+/// place.
+async fn check_written_foreign_keys(
+    database: &Arc<Database>,
+    table_name: &str,
+    columns: &[crate::core::row::schema::SchemaField],
+    written: &[crate::core::row::row::Row],
+    tx: TxId,
+) -> Result<(), String> {
+    for field in columns {
+        let mut seen = std::collections::HashSet::new();
+        for row in written {
+            let Some(cell) = row.columns.iter().find(|c| u64::from(c.schema_id) == field.write_order) else {
+                return Err(format!(
+                    "the foreign key on \"{}\" could not be checked: the written row does not carry the column",
+                    field.name
+                ));
+            };
+            if cell.column_type == crate::core::db_type::DbType::NULL {
+                continue;
+            }
+            let literal = key_literal(field, cell.data.into_slice())?;
+            if seen.insert(literal.clone()) {
+                check_foreign_keys(database, table_name, &[(field.name.clone(), literal)], tx).await?;
             }
         }
     }
@@ -9168,7 +9320,17 @@ fn fold_on_clauses(sql: &str, refused: &mut Option<String>) -> String {
         .unwrap_or(rest.len());
 
         out.push_str(&sql[cursor..start]);
-        out.push_str(&fold_constants_in_predicate_into(&rest[..end], refused));
+        // `ON CONFLICT … DO UPDATE SET n = nextval('s')` is no join
+        // condition, and its `SET` runs only when a row conflicts
+        // (`apply_conflict_update` folds it then): folded here, it drew from
+        // the sequence for a statement that met no conflict.
+        if crate::core::sql_scan::starts_with_keyword(rest.trim_start(), "CONFLICT")
+            && crate::core::rql::generated::moves_a_sequence(&rest[..end])
+        {
+            out.push_str(&rest[..end]);
+        } else {
+            out.push_str(&fold_constants_in_predicate_into(&rest[..end], refused));
+        }
         cursor = start + end;
     }
     out.push_str(&sql[cursor..]);
@@ -9202,7 +9364,11 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) ->
         let lead = &operand[..operand.len() - operand.trim_start().len()];
         let tail = &operand[lead.len() + trimmed.len()..];
         let wrap = |value: String| format!("{}{}{}", lead, value, tail);
-        if let Some(e) = constant_refusal(trimmed) {
+        // Asked by computing the operand, which a `nextval('s')` in it must
+        // not be twice: the fold below computes it, once.
+        if !crate::core::rql::generated::moves_a_sequence(trimmed)
+            && let Some(e) = constant_refusal(trimmed)
+        {
             refused.get_or_insert(e);
             return operand.to_string();
         }
@@ -20088,6 +20254,11 @@ pub(crate) async fn insert_loaded_row(
     )
     .ok()?;
     if let Some(assignments) = assignments.as_deref() {
+        // A key whose value is in the row alone (a default, an expression)
+        // is the statement path's to check: it reads it off the row it writes.
+        if !schema.foreign_keys.is_empty() && foreign_key_values_need_the_row(schema, assignments) {
+            return None;
+        }
         check_foreign_keys_of(database, Some(schema), table_name, assignments, tx)
             .await
             .ok()?;
@@ -20587,6 +20758,10 @@ async fn insert_row_resolved(
 
     // Foreign keys are checked before the row is written, so a
     // violation leaves nothing behind to undo.
+    //
+    // `early_row` is the row when the check had to encode it to read a key
+    // (`Some(None)`: it was refused). Boxed, as it is held across the check.
+    let mut early_row: Option<Option<Box<crate::core::row::row::RowWrite>>> = None;
     match &parsed_assignments {
         // Built only for a table that has foreign keys, and boxed: the
         // check's future is most of this one's, which a multi-row insert
@@ -20596,8 +20771,41 @@ async fn insert_row_resolved(
             crate::owner_probe!(crate::core::mvcc::owner::probe::Site::ForeignKeyCheck, tx, database);
         }
         Some(assignments) => {
+            // A key written as anything but a literal (`gen_random_uuid()`,
+            // `nextval('s')`, `DEFAULT`) or not written at all, its column
+            // having a default, has its value in the row and nowhere else:
+            // the row is encoded first, once, and the check reads the key
+            // off it. The row written below is that same row.
+            let stored;
+            let checked: &[(String, String)] = if foreign_key_values_need_the_row(&table.schema, assignments) {
+                let row = crate::core::rql::lexer_ir::insert_row_with_defaults(
+                    &query,
+                    &schema.fields,
+                    &schema.defaults,
+                    &schema.type_modifiers,
+                    database.id,
+                )
+                .map(Box::new);
+                let read = row.as_deref().map(|row| foreign_key_values_of_row(&table.schema, assignments, row));
+                early_row = Some(row);
+                match read {
+                    Some(Ok(values)) => {
+                        stored = values;
+                        &stored
+                    }
+                    Some(Err(e)) => {
+                        error!("{}", e);
+                        return ddl_error(&e);
+                    }
+                    // Refused: there is no value to check, and the arm below
+                    // reports why.
+                    None => &[],
+                }
+            } else {
+                assignments
+            };
             if let Err(e) =
-                Box::pin(check_foreign_keys_of(&database, Some(&table.schema), table_name, assignments, tx)).await
+                Box::pin(check_foreign_keys_of(&database, Some(&table.schema), table_name, checked, tx)).await
             {
                 error!("{}", e);
                 return ddl_error(&e);
@@ -20609,13 +20817,17 @@ async fn insert_row_resolved(
     }
 
     // Handle insert row
-    if let Some(insert_row) = crate::core::rql::lexer_ir::insert_row_with_defaults(
-        &query,
-        &schema.fields,
-        &schema.defaults,
-        &schema.type_modifiers,
-        database.id,
-    ) {
+    let insert_row = match early_row {
+        Some(row) => row.map(|row| *row),
+        None => crate::core::rql::lexer_ir::insert_row_with_defaults(
+            &query,
+            &schema.fields,
+            &schema.defaults,
+            &schema.type_modifiers,
+            database.id,
+        ),
+    };
+    if let Some(insert_row) = insert_row {
         // Every `CHECK` the table declares, evaluated against the row
         // as it will be stored. Before the write, so a violation
         // leaves nothing behind to undo.
@@ -21650,10 +21862,13 @@ pub(crate) async fn execute_with_need(
             let foreign_key_visibility = statement_visibility.as_ref().filter(|_| foreign_keys_read);
             let target = crate::core::database::Relation::Plain(table.clone());
 
+            // The key columns whose check waits for the write: see
+            // `check_foreign_keys_for_update`.
+            let mut keys_after_write: Vec<crate::core::row::schema::SchemaField> = Vec::new();
             if let Some(assignments) =
                 crate::core::rql::lexer_ur::assignments_of_update(&query_sql(&query))
             {
-                if let Err(e) = check_foreign_keys_for_update(
+                match check_foreign_keys_for_update(
                     &database,
                     &target,
                     &table_name,
@@ -21664,8 +21879,11 @@ pub(crate) async fn execute_with_need(
                 )
                 .await
                 {
-                    error!("{}", e);
-                    return ddl_error(&e);
+                    Ok(columns) => keys_after_write = columns,
+                    Err(e) => {
+                        error!("{}", e);
+                        return ddl_error(&e);
+                    }
                 }
             }
 
@@ -21737,12 +21955,25 @@ pub(crate) async fn execute_with_need(
                     None,
                     tx,
                     statement_visibility,
-                    returning_wanted.then_some(&mut before),
+                    (returning_wanted || !keys_after_write.is_empty()).then_some(&mut before),
                 )
                 .await
             {
                 Ok(n) => {
                     info!("Updated {} rows", n);
+                    if !keys_after_write.is_empty()
+                        && let Err(e) = Box::pin(check_written_foreign_keys(
+                            &database,
+                            &table_name,
+                            &keys_after_write,
+                            &before,
+                            tx,
+                        ))
+                        .await
+                    {
+                        error!("{}", e);
+                        return ddl_error(&e);
+                    }
                     if let Some(changes) = key_changes.as_ref() {
                         if let Err(e) =
                             apply_on_update(&database, &table_name, changes, depth, tx).await
@@ -22543,7 +22774,7 @@ async fn execute_partitioned_update(
     // rows it changes, the child side's checks, the parent side's keys
     // locked before the write and acted on after it. Every read routes on
     // the statement's `WHERE` over the partitions, under that snapshot.
-    let (statement_visibility, key_changes) =
+    let (statement_visibility, key_changes, keys_after_write) =
         match partitioned_update_foreign_keys(database, &pt, table_name, &update_plan, &sql, depth, tx).await {
             Ok(found) => found,
             Err(e) => {
@@ -22578,7 +22809,7 @@ async fn execute_partitioned_update(
         &where_clause,
         tx,
         statement_visibility,
-        returning_wanted.then_some(&mut before),
+        (returning_wanted || !keys_after_write.is_empty()).then_some(&mut before),
         |part, visibility, collecting| {
             // A payload is not `Clone`; each partition consumes its own copy.
             let updates: smallvec::SmallVec<[crate::core::row::row::ColumnWritePayload; 32]> = updates
@@ -22654,6 +22885,15 @@ async fn execute_partitioned_update(
     match outcome {
         Ok(n) => {
             info!("Updated {} rows", n);
+            // The keys whose value only the write computed, as the plain arm
+            // checks them.
+            if !keys_after_write.is_empty()
+                && let Err(e) =
+                    Box::pin(check_written_foreign_keys(database, table_name, &keys_after_write, &before, tx)).await
+            {
+                error!("{}", e);
+                return ddl_error(&e);
+            }
             if let Some(changes) = key_changes.as_ref() {
                 if let Err(e) = apply_on_update(database, table_name, changes, depth, tx).await {
                     error!("{}", e);
@@ -22695,15 +22935,19 @@ async fn partitioned_update_foreign_keys(
     sql: &str,
     depth: usize,
     tx: TxId,
-) -> Result<(Option<crate::core::mvcc::Visibility>, Option<KeyChanges>), String> {
+) -> Result<
+    (Option<crate::core::mvcc::Visibility>, Option<KeyChanges>, Vec<crate::core::row::schema::SchemaField>),
+    String,
+> {
     let schema = &pt.shell().schema;
     let foreign_keys_read = update_needs_statement_snapshot(database, schema, table_name, plan);
     let statement_visibility = statement_snapshot_for(depth, || pt.statement_visibility(tx))
         .or_else(|| foreign_keys_read.then(|| pt.visibility_for(tx)));
     let foreign_key_visibility = statement_visibility.as_ref().filter(|_| foreign_keys_read);
     let target = crate::core::database::Relation::Partitioned(pt.clone());
+    let mut keys_after_write = Vec::new();
     if let Some(assignments) = crate::core::rql::lexer_ur::assignments_of_update(sql) {
-        check_foreign_keys_for_update(
+        keys_after_write = check_foreign_keys_for_update(
             database,
             &target,
             table_name,
@@ -22721,7 +22965,7 @@ async fn partitioned_update_foreign_keys(
     if let Some(changes) = key_changes.as_ref() {
         lock_keys_before_update(database, table_name, changes, tx).await?;
     }
-    Ok((statement_visibility, key_changes))
+    Ok((statement_visibility, key_changes, keys_after_write))
 }
 
 /// A `DELETE` on a partitioned table (§9, S11): the `RETURNING` list resolved
@@ -24205,6 +24449,64 @@ mod predicate_extraction_tests {
             predicate_of("DELETE FROM t WHERE a = 1 RETURNING id", None),
             "a = 1"
         );
+    }
+}
+
+#[cfg(test)]
+mod key_literal_tests {
+    use super::{fold_where_constants_checked, is_key_literal};
+
+    /// What a foreign key's probe may carry as written; anything else is
+    /// read off the row that stores it.
+    #[test]
+    fn a_key_literal_is_a_number_or_a_string_under_at_most_one_cast() {
+        for text in [
+            "7",
+            "-7",
+            "1.50",
+            "'a'",
+            " 'aaaaaaaa-0000-4000-8000-000000000001' ",
+            "'it''s'",
+            "'aaaaaaaa-0000-4000-8000-000000000001'::uuid",
+            "7::bigint",
+            "'1.5'::numeric(10, 2)",
+            "'2026-01-01'::timestamp with time zone",
+        ] {
+            assert!(is_key_literal(text), "{text}");
+        }
+        for text in [
+            "gen_random_uuid()",
+            "nextval('s')",
+            "now()",
+            "CURRENT_TIMESTAMP",
+            "DEFAULT",
+            "1 + 1",
+            "abs(-2)",
+            "upper('a')::uuid",
+            "'a' || 'b'",
+            "TRUE",
+            "E'a\\n'",
+            "'a\\b'",
+            "'a'::",
+            "pn",
+            "",
+        ] {
+            assert!(!is_key_literal(text), "{text}");
+        }
+    }
+
+    /// `ON CONFLICT … DO UPDATE SET n = nextval('s')` is left for the
+    /// conflict to compute; a join's `ON` and every other `ON CONFLICT` are
+    /// folded as before.
+    #[test]
+    fn an_on_conflict_that_moves_a_sequence_is_not_folded() {
+        let sql = "INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET n = nextval('s') + 1";
+        assert_eq!(fold_where_constants_checked(sql).unwrap(), sql);
+        let folded = fold_where_constants_checked("INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET n = 5 + 1").unwrap();
+        assert!(folded.ends_with("SET n = 6"), "{folded}");
+        let join = fold_where_constants_checked("SELECT a.id FROM t a JOIN t b ON a.id = b.id AND b.id < 1 + 2").unwrap();
+        assert!(join.ends_with("b.id < 3"), "{join}");
+        assert!(fold_where_constants_checked("INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET n = 'abc'::int").is_err());
     }
 }
 

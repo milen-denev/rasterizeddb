@@ -367,6 +367,69 @@ pub fn declares_generated(statement: &str) -> bool {
             .any(|w| w[0] == "GENERATED" && w[1] == "ALWAYS" && w[2].starts_with("AS"))
 }
 
+// Not immutable: each gives a different answer on a later evaluation, so
+// a stored value could not be recomputed from the row it belongs to.
+const VOLATILE_CALLS: &[&str] = &[
+    "now",
+    "random",
+    "random_normal",
+    "setseed",
+    "clock_timestamp",
+    "statement_timestamp",
+    "transaction_timestamp",
+    "timeofday",
+    "gen_random_uuid",
+    "uuid_generate_v1",
+    "uuid_generate_v4",
+    "uuidv4",
+    "uuidv7",
+    "nextval",
+    "currval",
+    "lastval",
+    "setval",
+    "txid_current",
+    "pg_current_xact_id",
+    "current_setting",
+    "pg_backend_pid",
+];
+// The same, spelled without parentheses.
+const VOLATILE_WORDS: &[&str] = &[
+    "current_timestamp",
+    "current_date",
+    "current_time",
+    "localtime",
+    "localtimestamp",
+    "current_user",
+    "session_user",
+    "current_role",
+    "current_catalog",
+    "current_schema",
+];
+
+/// Whether `expression` calls something whose answer the row does not fix
+/// ([`VOLATILE_CALLS`], [`VOLATILE_WORDS`]): evaluated a second time it may
+/// answer otherwise (`gen_random_uuid()`, `random()`) or have acted twice
+/// (`nextval('s')`). What is computed from it has to be computed once.
+pub(crate) fn is_volatile(expression: &str) -> bool {
+    words_of(expression).iter().any(|(w, called)| {
+        if *called {
+            VOLATILE_CALLS.iter().any(|f| f.eq_ignore_ascii_case(w))
+        } else {
+            VOLATILE_WORDS.iter().any(|k| k.eq_ignore_ascii_case(w))
+        }
+    })
+}
+
+/// Whether `expression` calls a function that moves a sequence (`nextval`,
+/// `setval`): a call with an effect, which nothing may make on the
+/// statement's behalf before the statement makes it.
+pub(crate) fn moves_a_sequence(expression: &str) -> bool {
+    crate::core::sql_scan::contains_ignore_ascii_case(expression, b"val")
+        && words_of(expression)
+            .iter()
+            .any(|(w, called)| *called && (w.eq_ignore_ascii_case("nextval") || w.eq_ignore_ascii_case("setval")))
+}
+
 /// Checks the generation expressions of a `CREATE TABLE`, with PostgreSQL's
 /// refusals.
 ///
@@ -380,45 +443,6 @@ pub fn declares_generated(statement: &str) -> bool {
 /// `columns` is every column the table declares, so a column that happens to
 /// share a name with a clock keyword is read as the column.
 pub fn validate(generated: &[GeneratedColumn], columns: &[&str]) -> Result<(), String> {
-    // Not immutable: each gives a different answer on a later evaluation, so
-    // a stored value could not be recomputed from the row it belongs to.
-    const VOLATILE_CALLS: &[&str] = &[
-        "now",
-        "random",
-        "random_normal",
-        "setseed",
-        "clock_timestamp",
-        "statement_timestamp",
-        "transaction_timestamp",
-        "timeofday",
-        "gen_random_uuid",
-        "uuid_generate_v1",
-        "uuid_generate_v4",
-        "uuidv4",
-        "uuidv7",
-        "nextval",
-        "currval",
-        "lastval",
-        "setval",
-        "txid_current",
-        "pg_current_xact_id",
-        "current_setting",
-        "pg_backend_pid",
-    ];
-    // The same, spelled without parentheses.
-    const VOLATILE_WORDS: &[&str] = &[
-        "current_timestamp",
-        "current_date",
-        "current_time",
-        "localtime",
-        "localtimestamp",
-        "current_user",
-        "session_user",
-        "current_role",
-        "current_catalog",
-        "current_schema",
-    ];
-
     for g in generated.iter().filter(|g| !g.is_deleted) {
         let words = words_of(&g.expression);
         if words.iter().any(|(w, _)| w.eq_ignore_ascii_case("SELECT")) {
@@ -782,6 +806,24 @@ fn split_top_level<'a>(text: &'a str, keyword: &str) -> Option<Vec<&'a str>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a caller may compute only once: a call that answers anew, or
+    /// acts, each time. Named inside a string, or as a column, it is neither.
+    #[test]
+    fn volatile_calls_are_told_from_their_names() {
+        for text in ["nextval('s')", "gen_random_uuid()", "1 + random()", "CASE WHEN random() > 0 THEN 1 END", "NOW()", "current_timestamp"] {
+            assert!(is_volatile(text), "{text}");
+        }
+        for text in ["pn + 1", "abs(-3)", "'nextval(''s'')'", "upper('random()')", "nextval", "random_seed + 1"] {
+            assert!(!is_volatile(text), "{text}");
+        }
+        for text in ["nextval('s')", "NEXTVAL ('s') + 100", "setval('s', 5)", "oc.n < nextval('q')"] {
+            assert!(moves_a_sequence(text), "{text}");
+        }
+        for text in ["currval('s')", "'nextval(''s'')'", "nextval", "interval '1 day'", "gen_random_uuid()"] {
+            assert!(!moves_a_sequence(text), "{text}");
+        }
+    }
 
     #[test]
     fn a_record_round_trips_through_its_bytes() {
