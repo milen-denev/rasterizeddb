@@ -781,6 +781,62 @@ where
     if own_block && let Err(e) = run_internal(database, state, "BEGIN").await? {
         failure = Some((sqlstate_for(&e), e));
     }
+    // The rows, every batch one statement of the block, under one scope of
+    // foreign-key checks: a row referencing its own table may name a row of
+    // a later batch, and PostgreSQL checks the whole COPY at its end.
+    // Read to the client's end even after a failure, as the protocol asks.
+    // Only in a database with a key onto itself (`may_reference_itself`).
+    let rows = Box::pin(copy_rows(database, state, stream, copy, &columns, &insert_head, failure));
+    let (rows, deferred) = if database.may_reference_itself() {
+        match crate::core::rql::executor::statement_foreign_keys_scope(rows).await {
+            Ok((rows, deferred)) => (rows, Some(deferred)),
+            Err(rows) => (rows, None),
+        }
+    } else {
+        (rows.await, None)
+    };
+    let (written, mut failure) = rows?;
+    if failure.is_none()
+        && let Some(deferred) = deferred.filter(|d| !d.is_empty())
+        && let Some(tx) = state.current_tx()
+        && let Err(e) = crate::core::rql::executor::check_deferred_self_references_in_txn(database, deferred, tx).await
+    {
+        failure = Some((sqlstate_for(&e), e));
+    }
+    if own_block && state.transaction.is_some() {
+        let end = if failure.is_none() {
+            "COMMIT"
+        } else {
+            "ROLLBACK"
+        };
+        if let Err(e) = run_internal(database, state, end).await?
+            && failure.is_none()
+        {
+            failure = Some((sqlstate_for(&e), e));
+        }
+    }
+    Ok(match failure {
+        None => Ok(written),
+        Some(e) => Err(e),
+    })
+}
+
+/// The rows of a `COPY … FROM STDIN`, read off the client to its CopyDone
+/// or CopyFail and inserted in batches: how many were written, and why the
+/// copy failed when it did.
+async fn copy_rows<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    copy: &Copy,
+    columns: &[(String, i64)],
+    insert_head: &str,
+    mut failure: Option<Refusal>,
+) -> io::Result<(u64, Option<Refusal>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let binary = copy.format == Format::Binary;
     let mut buf: Vec<u8> = Vec::new();
     let mut pending: Vec<String> = Vec::new();
     let mut written = 0u64;
@@ -893,7 +949,7 @@ where
                         }
                         pending.push(format!("({})", values.join(", ")));
                         if pending.len() >= BATCH {
-                            match insert(database, state, &insert_head, &mut pending).await? {
+                            match insert(database, state, insert_head, &mut pending).await? {
                                 Ok(n) => written += n,
                                 Err(e) => {
                                     failure = Some(e);
@@ -911,7 +967,7 @@ where
         }
     }
     if failure.is_none() && !pending.is_empty() {
-        match insert(database, state, &insert_head, &mut pending).await? {
+        match insert(database, state, insert_head, &mut pending).await? {
             Ok(n) => written += n,
             Err(e) => failure = Some(e),
         }
@@ -922,22 +978,7 @@ where
             "COPY binary data ended without its trailer".to_string(),
         ));
     }
-    if own_block && state.transaction.is_some() {
-        let end = if failure.is_none() {
-            "COMMIT"
-        } else {
-            "ROLLBACK"
-        };
-        if let Err(e) = run_internal(database, state, end).await?
-            && failure.is_none()
-        {
-            failure = Some((sqlstate_for(&e), e));
-        }
-    }
-    Ok(match failure {
-        None => Ok(written),
-        Some(e) => Err(e),
-    })
+    Ok((written, failure))
 }
 
 async fn insert(

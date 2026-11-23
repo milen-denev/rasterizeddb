@@ -1921,6 +1921,20 @@ async fn check_foreign_keys_of(
         let Some(probe) = coerced else {
             return Err(violation());
         };
+        // A table's key onto itself may be satisfied by a row this same
+        // statement has yet to write: asked again at its end.
+        let deferred = |raw: &str| {
+            let deferred = defer_self_reference(schema, table_name, fk, raw);
+            // The statement may now fail after it has written: none of its
+            // writes may overwrite a row in place, which its abort could not
+            // take back (an autocommit `UPDATE` reported 23503 and kept its
+            // new value).
+            if deferred {
+                database.transactions.forbid_in_place(tx);
+            }
+            deferred
+        };
+        let raw = literal;
         let literal = &probe;
         let found = referenced_values_now(
             database,
@@ -1934,6 +1948,9 @@ async fn check_foreign_keys_of(
         .await
         .map_err(unchecked)?;
         let Some(key) = found.into_iter().next() else {
+            if deferred(raw) {
+                continue;
+            }
             return Err(violation());
         };
         acquire_referenced_waiting(
@@ -1957,6 +1974,9 @@ async fn check_foreign_keys_of(
         .await
         .map_err(unchecked)?;
         if still.is_empty() {
+            if deferred(raw) {
+                continue;
+            }
             return Err(violation());
         }
     }
@@ -1969,6 +1989,174 @@ tokio::task_local! {
     /// has already found and key-share locked for its transaction — see
     /// [`prevalidate_foreign_keys`]. Scoped to that statement's task.
     static FK_VERIFIED: std::cell::RefCell<std::collections::HashSet<(String, String, String)>>;
+}
+
+tokio::task_local! {
+    /// The child-side checks of a table's foreign keys onto itself that found
+    /// no parent row when their row was checked, asked again once the
+    /// statement has written all of its rows ([`statement_foreign_keys`]).
+    /// Scoped to the outermost writing statement on the task; a statement
+    /// it runs (a tuple of a multi-row `INSERT`, an `INSERT … SELECT`'s
+    /// insert, the `UPDATE` of `ON CONFLICT DO UPDATE`, a foreign-key
+    /// action) joins it.
+    static DEFERRED_SELF_REFERENCES: std::cell::RefCell<DeferredSelfReferences>;
+}
+
+/// See [`DEFERRED_SELF_REFERENCES`].
+///
+/// PostgreSQL checks a foreign key that is not deferrable at the end of the
+/// statement, once every row of it is in: `INSERT INTO s VALUES (1, 1)`
+/// under `p REFERENCES s (id)` stores a row that is its own parent, and
+/// `VALUES (2, 3), (3, 2)` two rows that are each other's. Each row's check
+/// ran before its row was written, so both were refused (23503). Only the
+/// references of a table onto itself wait, the rows a statement writes into
+/// the table it writes; a parent another table gets from the same statement
+/// (a writing CTE, a trigger) is still asked for at the row's own check.
+#[derive(Default)]
+pub(crate) struct DeferredSelfReferences {
+    /// Each table a check waits on, with the schema its check reads.
+    tables: Vec<(String, std::sync::Arc<crate::core::row::schema::TableSchema>)>,
+    /// `(index into tables, child column, value as the row wrote it)`.
+    checks: Vec<(usize, String, String)>,
+}
+
+impl DeferredSelfReferences {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.checks.is_empty()
+    }
+}
+
+/// Defers the self-reference check of `fk` for `literal` to the end of the
+/// statement, when a statement scope is open. `false` when none is: the
+/// caller then reports the violation at once, as it always did.
+fn defer_self_reference(
+    schema: Option<&crate::core::row::schema::TableSchema>,
+    table_name: &str,
+    fk: &crate::core::rql::foreign_key::ForeignKey,
+    literal: &str,
+) -> bool {
+    let Some(schema) = schema else {
+        return false;
+    };
+    if !fk.parent_table.eq_ignore_ascii_case(table_name) {
+        return false;
+    }
+    DEFERRED_SELF_REFERENCES
+        .try_with(|deferred| {
+            let mut deferred = deferred.borrow_mut();
+            let at = match deferred.tables.iter().position(|(name, _)| name.eq_ignore_ascii_case(table_name)) {
+                Some(at) => at,
+                None => {
+                    deferred.tables.push((table_name.to_string(), std::sync::Arc::new(schema.clone())));
+                    deferred.tables.len() - 1
+                }
+            };
+            deferred.checks.push((at, fk.column.clone(), literal.to_string()));
+        })
+        .is_ok()
+}
+
+/// How many checks the open statement scope has deferred, `None` outside
+/// one: an `INSERT`'s row takes back what its own check deferred with
+/// [`take_back_deferred`] when the row is not written after all (`ON
+/// CONFLICT DO NOTHING` skipped it, `DO UPDATE` updated another instead).
+fn deferred_mark() -> Option<usize> {
+    DEFERRED_SELF_REFERENCES.try_with(|deferred| deferred.borrow().checks.len()).ok()
+}
+
+fn take_back_deferred(mark: Option<usize>) {
+    if let Some(mark) = mark {
+        let _ = DEFERRED_SELF_REFERENCES.try_with(|deferred| deferred.borrow_mut().checks.truncate(mark));
+    }
+}
+
+/// Runs `statement` as the outermost writing statement of its task, the
+/// scope [`defer_self_reference`] defers into, and once it has succeeded
+/// asks every deferred check again, as of now with the statement's own
+/// writes: a violation still there fails the statement (23503), whose
+/// abort takes its rows back. Already inside a scope, `statement` joins it.
+pub(crate) async fn statement_foreign_keys<F>(database: &Arc<Database>, tx: TxId, statement: F) -> Vec<u8>
+where
+    F: std::future::Future<Output = Vec<u8>>,
+{
+    let (response, deferred) = match statement_foreign_keys_scope(statement).await {
+        Ok(run) => run,
+        Err(response) => return response,
+    };
+    if deferred.is_empty() || response.first() == Some(&3) {
+        return response;
+    }
+    match check_deferred_self_references(database, deferred, tx).await {
+        Ok(()) => response,
+        Err(e) => {
+            error!("{}", e);
+            ddl_error(&e)
+        }
+    }
+}
+
+/// The scope of [`statement_foreign_keys`] without its check: `statement`'s
+/// output with what it deferred, for a caller whose statement is several
+/// (`COPY`'s batches), which checks them once its last has run. `Err` with
+/// the output when a scope was already open, which `statement` joined.
+pub(crate) async fn statement_foreign_keys_scope<F>(statement: F) -> Result<(F::Output, DeferredSelfReferences), F::Output>
+where
+    F: std::future::Future,
+{
+    if DEFERRED_SELF_REFERENCES.try_with(|_| ()).is_ok() {
+        return Err(statement.await);
+    }
+    Ok(DEFERRED_SELF_REFERENCES
+        .scope(std::cell::RefCell::new(DeferredSelfReferences::default()), async move {
+            let output = statement.await;
+            let deferred = DEFERRED_SELF_REFERENCES.with(|deferred| std::mem::take(&mut *deferred.borrow_mut()));
+            (output, deferred)
+        })
+        .await)
+}
+
+/// [`check_deferred_self_references`] for a block's statement checked by its
+/// caller (`COPY`, whose batches ran through the block's path): under the
+/// block's owner, as each batch ran.
+pub(crate) async fn check_deferred_self_references_in_txn(
+    database: &Arc<Database>,
+    deferred: DeferredSelfReferences,
+    tx: TxId,
+) -> Result<(), String> {
+    let transactions = database.transactions.clone();
+    crate::core::mvcc::owner::under(
+        &transactions,
+        tx,
+        crate::core::mvcc::owner::OwnerKind::Block,
+        check_deferred_self_references(database, deferred, tx),
+    )
+    .await
+}
+
+/// Each check [`defer_self_reference`] put off, asked again (outside any
+/// scope, so a missing parent is now the violation), each distinct value
+/// once.
+async fn check_deferred_self_references(
+    database: &Arc<Database>,
+    deferred: DeferredSelfReferences,
+    tx: TxId,
+) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for (at, column, literal) in deferred.checks {
+        if !seen.insert((at, column.to_ascii_lowercase(), literal.trim().to_string())) {
+            continue;
+        }
+        let (table_name, schema) = &deferred.tables[at];
+        Box::pin(check_foreign_keys_of(
+            database,
+            Some(schema.as_ref()),
+            table_name,
+            &[(column, literal)],
+            tx,
+        ))
+        .await?;
+    }
+    Ok(())
 }
 
 fn verified_key(table: &str, column: &str, literal: &str) -> (String, String, String) {
@@ -3349,6 +3537,13 @@ async fn lock_keys_before_update(
         if fk.on_update != crate::core::rql::foreign_key::ReferentialAction::Restrict {
             continue;
         }
+        // The table onto itself: the rows referencing a moved key may be
+        // the ones this statement repoints (`SET id = 10, p = 10` of a row
+        // that is its own parent), so asked once it has written
+        // (`apply_on_update`), as PostgreSQL asks at the statement's end.
+        if child_table.eq_ignore_ascii_case(parent_table) {
+            continue;
+        }
         let Some(change) = changes
             .columns
             .iter()
@@ -3462,8 +3657,13 @@ async fn apply_on_update(
         // Each old key at the child column's type (P4 round 3); one no child
         // value can equal references nothing, and is left out.
         let old_for_child = parent_literals_for_child(database, &child_table, &fk, &change.old_literals);
+        // `ON UPDATE RESTRICT` of a table onto itself, put off by
+        // `lock_keys_before_update`: every moved key, whether or not another
+        // row holds it now, as RESTRICT does not ask that.
+        let restrict_self =
+            fk.on_update == ReferentialAction::Restrict && child_table.eq_ignore_ascii_case(parent_table);
         let vanished: Vec<usize> = (0..change.old_stored.len())
-            .filter(|i| !present.contains(&change.old_stored[*i]) && old_for_child[*i].is_some())
+            .filter(|i| (restrict_self || !present.contains(&change.old_stored[*i])) && old_for_child[*i].is_some())
             .collect();
         if vanished.is_empty() {
             continue;
@@ -3472,7 +3672,7 @@ async fn apply_on_update(
             vanished.iter().filter_map(|i| old_for_child[*i].clone()).collect();
 
         let statement = match fk.on_update {
-            // Restrict refused before the write.
+            // Restrict refused before the write, but onto the table itself.
             ReferentialAction::NoAction | ReferentialAction::Restrict => None,
             ReferentialAction::Cascade => {
                 let new_of = |i: usize| {
@@ -21474,6 +21674,9 @@ async fn insert_row_resolved(
     // `early_row` is the row when the check had to encode it to read a key
     // (`Some(None)`: it was refused). Boxed, as it is held across the check.
     let mut early_row: Option<Option<Box<crate::core::row::row::RowWrite>>> = None;
+    // What the statement's scope had deferred before this row's check: a
+    // row that is not written takes its own deferred checks back.
+    let deferred_at = deferred_mark();
     match &parsed_assignments {
         // Built only for a table that has foreign keys, and boxed: the
         // check's future is most of this one's, which a multi-row insert
@@ -21591,6 +21794,13 @@ async fn insert_row_resolved(
             Some(pt) => Box::pin(pt.insert_row_in_txn(insert_row, tx)).await,
             None => table.insert_row_in_txn(insert_row, tx).await,
         };
+        // Not written (`ON CONFLICT DO NOTHING` skips it, `DO UPDATE` updates
+        // the row it met, which is checked as an update): the key this row
+        // would have held references nothing, as in PostgreSQL, whose check
+        // runs for inserted rows only.
+        if outcome.is_err() {
+            take_back_deferred(deferred_at);
+        }
         if outcome.is_ok() {
             // Recorded here, with the statement as it actually ran: by
             // this point a JSON rewrite has already happened and its
@@ -21784,6 +21994,24 @@ fn broken_relation_refusal(query: &QueryPurpose, database: &Database) -> Option<
         .find_map(|(name, _)| database.partitioned_table(name).and_then(|t| t.broken().map(str::to_string)))
 }
 
+/// [`execute_with_need`] as the outermost writing statement of its task,
+/// under [`statement_foreign_keys`]. Boxed and type-erased: it is the
+/// dispatch run again, and erased, it neither deepens every caller's future
+/// type (the trait solver's recursion limit, see `execute_query_rows_once`)
+/// nor makes the dispatch's future contain itself.
+fn execute_in_statement_scope(
+    query: QueryPurpose,
+    database: Arc<Database>,
+    depth: usize,
+    tx: TxId,
+    need: SubqueryNeed,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>> {
+    Box::pin(async move {
+        let checker = database.clone();
+        statement_foreign_keys(&checker, tx, execute_with_need(query, database, depth, tx, need)).await
+    })
+}
+
 /// [`execute_with_context`] for a statement whose caller needs only part of
 /// its result. See [`SubqueryNeed`].
 pub(crate) async fn execute_with_need(
@@ -21793,6 +22021,24 @@ pub(crate) async fn execute_with_need(
     tx: TxId,
     need: SubqueryNeed,
 ) -> Vec<u8> {
+    // A writing statement's foreign keys onto its own table are checked at
+    // its end, once all its rows are in (`statement_foreign_keys`): the
+    // statement runs again under that scope, which the statements it runs
+    // in turn join. Only in a database that has such a key: elsewhere a
+    // write pays one atomic load. The flag is database-wide, so a write
+    // whose nested writes reach a table referencing itself (`ON CONFLICT DO
+    // UPDATE`, a key action, a cascade into such a child) opens the scope
+    // too. A key added while the statement runs is checked at each row, as
+    // it always was: refused, never let through.
+    if database.may_reference_itself()
+        && matches!(
+            query,
+            QueryPurpose::InsertRow(_) | QueryPurpose::UpdateRow(_) | QueryPurpose::DeleteRow(_)
+        )
+        && DEFERRED_SELF_REFERENCES.try_with(|_| ()).is_err()
+    {
+        return execute_in_statement_scope(query, database, depth, tx, need).await;
+    }
     crate::owner_probe!(crate::core::mvcc::owner::probe::Site::Dispatch { depth }, tx, database);
     // A cached parse goes straight to the scan: it is the parse the plain
     // branch below made for this statement, and was only cached because that
