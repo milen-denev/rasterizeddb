@@ -1106,6 +1106,86 @@ fn exists_used_as_value(sql: &str, start: usize, end: usize) -> bool {
         || matches!(before.as_bytes().last(), Some(b'+' | b'-' | b'*' | b'/' | b'%' | b'^' | b'|'))
 }
 
+/// `sql` with each `[NOT] EXISTS (A UNION [ALL] B …)` written as its
+/// branches: `(EXISTS (A) OR EXISTS (B))`, and `(NOT EXISTS (A) AND NOT
+/// EXISTS (B))`. `None` when it has none.
+///
+/// A union has a row exactly when one of its branches has, so the two are
+/// the same, and each branch's EXISTS is then answered by the paths that
+/// answer one: correlated or not, by count or by `IN`. A correlated EXISTS
+/// over a union was answered as a scalar over its first branch ("more than
+/// one row returned by a subquery used as an expression"). A branch with no
+/// FROM is the truth of its WHERE (`SELECT 1 WHERE c.id = 5` exists exactly
+/// when `c.id = 5` is true), or true. INTERSECT and EXCEPT, which no
+/// branch decides alone, are left as written, as is a union under a LIMIT
+/// or OFFSET of its own.
+pub(crate) fn exists_over_set_operation(sql: &str) -> Option<String> {
+    use crate::core::rql::join::find_keyword;
+    use crate::core::rql::subquery;
+    if !crate::core::sql_scan::contains_ignore_ascii_case(sql, b"union") {
+        return None;
+    }
+    let mut current = sql.to_string();
+    let mut changed = false;
+    let mut from = 0usize;
+    for _ in 0..32 {
+        let Some(mut clause) = current.get(from..).and_then(subquery::find_exists) else { break };
+        clause.start += from;
+        clause.end += from;
+        from = clause.end.max(from + 1);
+        let inner = clause.inner_sql.trim();
+        if find_keyword(inner, "UNION", 0).is_none()
+            || ["INTERSECT", "EXCEPT", "LIMIT", "OFFSET", "FETCH"].iter().any(|k| find_keyword(inner, k, 0).is_some())
+        {
+            continue;
+        }
+        // The whole union's ORDER BY decides nothing an EXISTS asks.
+        let inner = match crate::core::rql::join::find_phrase(inner, &["ORDER", "BY"], 0) {
+            Some(at) => inner[..at].trim_end(),
+            None => inner,
+        };
+        let mut branches: Vec<String> = Vec::new();
+        let mut rest = inner;
+        while let Some(at) = find_keyword(rest, "UNION", 0) {
+            branches.push(rest[..at].trim().to_string());
+            let after = rest[at + "UNION".len()..].trim_start();
+            rest = crate::core::rql::lexer_query::leading_word(after, "ALL")
+                .or_else(|| crate::core::rql::lexer_query::leading_word(after, "DISTINCT"))
+                .unwrap_or(after);
+        }
+        branches.push(rest.trim().to_string());
+        let mut parts: Vec<String> = Vec::with_capacity(branches.len());
+        let mut readable = true;
+        for branch in &branches {
+            let branch = branch.trim().trim_start_matches('(').trim_end_matches(')').trim();
+            if !crate::core::sql_scan::starts_with_keyword(branch, "SELECT") {
+                readable = false;
+                break;
+            }
+            let part = if find_keyword(branch, "FROM", 0).is_some() {
+                format!("EXISTS ({branch})")
+            } else if ["GROUP", "HAVING"].iter().any(|k| find_keyword(branch, k, 0).is_some()) {
+                readable = false;
+                break;
+            } else {
+                match find_keyword(branch, "WHERE", 0) {
+                    Some(at) => format!("(({}) IS TRUE)", branch[at + "WHERE".len()..].trim()),
+                    None => "(1 = 1)".to_string(),
+                }
+            };
+            parts.push(if clause.negated { format!("NOT {part}") } else { part });
+        }
+        if !readable {
+            continue;
+        }
+        let joined = format!("({})", parts.join(if clause.negated { " AND " } else { " OR " }));
+        current = format!("{}{}{}", &current[..clause.start], joined, &current[clause.end..]);
+        from = clause.start + joined.len();
+        changed = true;
+    }
+    changed.then_some(current)
+}
+
 /// `sql` with each `x [NOT] IN (SELECT c FROM … WHERE …)` whose subquery
 /// reads the outer row written as the `EXISTS` it means. `None` when it has
 /// none.
@@ -1516,7 +1596,9 @@ pub(crate) fn exists_as_counts(sql: &str) -> Option<String> {
 /// subquery, after an `EXISTS` that compares the row by anything but `=` is
 /// counted (`exists_as_counts`); `None` when it holds none.
 fn correlated_write_where(sql: &str, database: &Arc<Database>, delete: bool) -> Option<Result<WriteWhere, String>> {
-    let as_exists = correlated_in_as_exists(sql);
+    let split = exists_over_set_operation(sql);
+    let sql = split.as_deref().unwrap_or(sql);
+    let as_exists = correlated_in_as_exists(sql).or(split.clone());
     let sql = as_exists.as_deref().unwrap_or(sql);
     let counted = exists_as_counts(sql);
     let counted_sql = counted.as_deref().unwrap_or(sql);

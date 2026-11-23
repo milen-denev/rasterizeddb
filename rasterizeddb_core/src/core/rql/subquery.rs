@@ -867,10 +867,56 @@ pub(crate) const UNCORRELATED: &str = "EXISTS references no outer column";
 /// `WHERE NOT EXISTS (SELECT 1 FROM t)` — insert only if nothing matched — is a
 /// common seeding idiom.
 pub fn uncorrelated_exists(clause: &ExistsClause, outer_relations: &[String]) -> Option<String> {
+    // A set operation (`SELECT 1 EXCEPT SELECT 1`) or a select with no FROM
+    // that names no outer relation asks one question of the database: run as
+    // written, once. Read by `exists_to_in`, it was refused ("the SELECT
+    // inside EXISTS has no FROM clause").
+    let inner = clause.inner_sql.trim();
+    let set_operation = ["UNION", "INTERSECT", "EXCEPT"]
+        .iter()
+        .any(|k| crate::core::rql::join::find_keyword(inner, k, 0).is_some());
+    if set_operation || crate::core::rql::join::find_keyword(inner, "FROM", 0).is_none() {
+        let reads_outer = qualified_names(inner)
+            .iter()
+            .any(|q| outer_relations.iter().any(|o| o.eq_ignore_ascii_case(q)));
+        return (!reads_outer).then(|| inner.to_string());
+    }
     match exists_to_in(clause, outer_relations) {
         Err(e) if e == UNCORRELATED => Some(clause.inner_sql.trim().to_string()),
         _ => None,
     }
+}
+
+/// Every qualifier `q` written as `q.column` in `text`, outside quotes.
+fn qualified_names(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+                continue;
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' || c == b'"' => {
+                let start = i;
+                if c == b'"' {
+                    i = crate::core::sql_scan::quoted_end(bytes, i, b'"');
+                } else {
+                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                        i += 1;
+                    }
+                }
+                if bytes.get(i) == Some(&b'.') && (start == 0 || bytes[start - 1] != b'.') {
+                    out.push(text[start..i].trim_matches('"').to_string());
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
 }
 
 /// The predicate an uncorrelated `EXISTS` becomes once its query has run.
