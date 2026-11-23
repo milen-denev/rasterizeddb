@@ -523,6 +523,8 @@ guard before the drain samples the running set**, as in sharding.md §6.
 
 **B1a.6 Classification: on a shard, once per statement shape.** The
 gateway routes in this order:
+0. **The login role's route** (G11, `user_routing`), resolved once at
+   authentication. A pinned user skips steps 1–4 entirely.
 1. **A route key carried with the request.** The native request header
    field (set by the ORM and `Router`, A4b), or `SET rdb.route_key` /
    `SET LOCAL rdb.route_key`. No inspection of the SQL at all.
