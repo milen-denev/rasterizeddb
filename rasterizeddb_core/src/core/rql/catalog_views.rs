@@ -692,7 +692,7 @@ fn outside_subqueries(text: &str) -> String {
             i = end.max(i + 1);
             continue;
         }
-        if bytes[i] == b'(' && text[i + 1..].trim_start().get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT")) {
+        if bytes[i] == b'(' && crate::core::sql_scan::starts_with_keyword(text[i + 1..].trim_start(), "SELECT") {
             let mut depth = 0i32;
             let mut j = i;
             while j < bytes.len() {

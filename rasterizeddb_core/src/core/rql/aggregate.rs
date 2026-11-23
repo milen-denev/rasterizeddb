@@ -113,6 +113,15 @@ impl AggFunc {
                 AggFunc::BoolAnd | AggFunc::BoolOr | AggFunc::Every if f.db_type != DbType::BOOL => {
                     return Err(format!("function {}({}) does not exist", self.name(), shown()));
                 }
+                // A document is no number and has no order PostgreSQL will
+                // aggregate by: `sum` and `avg` answered NULL over one, and
+                // `min` and `max` a document picked by its bytes.
+                AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max
+                    if matches!(f.db_type, DbType::JSONB | DbType::JSON | DbType::JSONTEXT) =>
+                {
+                    let document = if f.db_type == DbType::JSONB { "jsonb" } else { "json" };
+                    return Err(format!("function {}({}) does not exist", self.name(), document));
+                }
                 _ => {}
             }
         }

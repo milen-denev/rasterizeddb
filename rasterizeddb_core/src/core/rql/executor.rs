@@ -462,7 +462,7 @@ fn scalar_subquery_label(sql: &str, start: usize, end: usize, inner: &str) -> Op
         return None;
     }
     let inner = inner.trim();
-    let body = inner.get(6..).filter(|_| inner.get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT")))?;
+    let body = inner.get(6..).filter(|_| crate::core::sql_scan::starts_with_keyword(inner, "SELECT"))?;
     let body = body.trim_start();
     let body = match body.get(..8) {
         Some(w) if w.eq_ignore_ascii_case("DISTINCT") => body[8..].trim_start(),
@@ -1134,8 +1134,7 @@ fn inside_a_subquery(sql: &str, pos: usize) -> bool {
             }
             b'(' => {
                 let rest = sql[i + 1..].trim_start();
-                let head = rest.get(..6).map(str::to_ascii_uppercase).unwrap_or_default();
-                stack.push(head.starts_with("SELECT") || head.starts_with("WITH"));
+                stack.push(crate::core::sql_scan::starts_with_keyword(rest, "SELECT") || crate::core::sql_scan::starts_with_keyword(rest, "WITH"));
             }
             b')' => {
                 stack.pop();
@@ -6252,7 +6251,7 @@ fn split_correlated_terms(
             continue;
         };
         let after = trimmed[open + 1..].trim_start();
-        if !after.to_ascii_uppercase().starts_with("SELECT") {
+        if !crate::core::sql_scan::starts_with_keyword(after, "SELECT") {
             plain.push(trimmed.to_string());
             continue;
         }

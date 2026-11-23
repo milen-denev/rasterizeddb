@@ -565,7 +565,7 @@ pub fn needs_evaluation(text: &str) -> bool {
         if let Some(close) = matching_paren(trimmed, 0) {
             if close == trimmed.len() - 1 {
                 let inner = trimmed[1..close].trim();
-                return !inner.to_ascii_uppercase().starts_with("SELECT");
+                return !crate::core::sql_scan::starts_with_keyword(inner, "SELECT");
             }
         }
     }
@@ -2581,7 +2581,7 @@ fn in_or_between(text: &str, schema: &[SchemaField]) -> Result<Option<Cond>, Str
                 return Ok(None);
             }
             let inside = rest[1..rest.len() - 1].trim();
-            if inside.len() >= 6 && inside.as_bytes()[..6].eq_ignore_ascii_case(b"SELECT") {
+            if crate::core::sql_scan::starts_with_keyword(inside, "SELECT") {
                 return Err(format!("condition '{}' with IN (SELECT …) is not supported here yet", text));
             }
             let items = crate::core::rql::lexer_ct::split_definitions(inside);

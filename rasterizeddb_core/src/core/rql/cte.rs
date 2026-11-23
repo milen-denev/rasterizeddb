@@ -2918,9 +2918,7 @@ pub fn next_derived_table(sql: &str) -> Option<(usize, usize, String, String)> {
                 continue;
             };
             let inner = sql[inner_start..close].trim();
-            if !inner.to_ascii_uppercase().starts_with("SELECT")
-                && !inner.to_ascii_uppercase().starts_with("WITH")
-            {
+            if !crate::core::sql_scan::starts_with_keyword(inner, "SELECT") && !crate::core::sql_scan::starts_with_keyword(inner, "WITH") {
                 from = after_keyword;
                 continue;
             }

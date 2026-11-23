@@ -36,6 +36,21 @@ pub fn is_identifier_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
 
+/// Whether `text` begins with the keyword `keyword`, whatever its case, as a
+/// whole word: `SELECT 1` and `select(1)` do, `selected_branches` does not.
+///
+/// What a scanner asks of the text after a `(` to tell a subquery from an
+/// expression. Asked as a bare prefix (`starts_with("SELECT")`), a column
+/// whose name begins with the keyword (`selected`, `selection`, `with_x`,
+/// `values_n`) made `count(selected)` a subquery named "selected".
+#[inline]
+pub fn starts_with_keyword(text: &str, keyword: &str) -> bool {
+    let (text, keyword) = (text.as_bytes(), keyword.as_bytes());
+    text.len() >= keyword.len()
+        && text[..keyword.len()].eq_ignore_ascii_case(keyword)
+        && !text.get(keyword.len()).is_some_and(|b| is_identifier_byte(*b))
+}
+
 /// True when the `'` at `quote` opens an escape string: `E'…'` / `e'…'`, with
 /// the `E` a word of its own rather than the end of an identifier.
 #[inline]
@@ -258,7 +273,7 @@ fn rewrite_first_array_subquery(sql: &str) -> Option<String> {
             let open = i + 5 + (after.len() - after.trim_start().len());
             if bytes.get(open) == Some(&b'(') && let Some(close) = matching_paren_at(bytes, open) {
                 let inner = sql[open + 1..close].trim();
-                if inner.get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT")) {
+                if starts_with_keyword(inner, "SELECT") {
                     let replacement = array_aggregate(inner)?;
                     return Some(format!("{}{}{}", &sql[..i], replacement, &sql[close + 1..]));
                 }
@@ -1267,8 +1282,7 @@ fn qualified_references(text: &str) -> Vec<(usize, usize, Vec<String>)> {
         if b == b'(' {
             // A subquery's names are its own.
             let inner = text[i + 1..].trim_start();
-            let upper = inner.get(..6).map(str::to_ascii_uppercase).unwrap_or_default();
-            if upper.starts_with("SELECT") || upper.starts_with("WITH") || upper.starts_with("VALUES") {
+            if ["SELECT", "WITH", "VALUES"].iter().any(|keyword| starts_with_keyword(inner, keyword)) {
                 i = matching_close(text, i).map_or(bytes.len(), |c| c + 1);
                 continue;
             }
@@ -3555,5 +3569,27 @@ mod multibyte_text_tests {
             }
         }
         assert!(failures.is_empty(), "{} panics, first: {:#?}", failures.len(), &failures[..failures.len().min(10)]);
+    }
+}
+
+#[cfg(test)]
+mod keyword_prefix_tests {
+    use super::starts_with_keyword;
+
+    /// A keyword is a whole word. `count(selected_branches)` was a subquery
+    /// named "selected_branches" while only the prefix was asked.
+    #[test]
+    fn a_keyword_is_a_whole_word() {
+        for text in ["SELECT 1", "select\n1", "Select(1)", "SELECT", "SELECT*", "select'x'", "SELECT\"a\""] {
+            assert!(starts_with_keyword(text, "SELECT"), "{text}");
+        }
+        for text in ["selected", "selected_branches", "selection = 1", "SELECT_1", "select9", "selecté", "sel", "", " SELECT 1"] {
+            assert!(!starts_with_keyword(text, "SELECT"), "{text}");
+        }
+        assert!(starts_with_keyword("with q AS (SELECT 1)", "WITH"));
+        assert!(!starts_with_keyword("with_x + 1", "WITH"));
+        assert!(!starts_with_keyword("withdrawn", "WITH"));
+        assert!(starts_with_keyword("VALUES (1)", "VALUES"));
+        assert!(!starts_with_keyword("values_n", "VALUES"));
     }
 }

@@ -4757,7 +4757,7 @@ fn spell_out_list_or_range(
         if matching_paren_at(after_not, open) == Some(after_not.len() - 1) {
             let items = split_row_items(&after_not[open + 1..after_not.len() - 1]);
             if !items.is_empty()
-                && !items.iter().any(|item| item.to_ascii_uppercase().starts_with("SELECT"))
+                && !items.iter().any(|item| crate::core::sql_scan::starts_with_keyword(item, "SELECT"))
             {
                 let (each, join) = if negated { ("<>", " AND ") } else { ("=", " OR ") };
                 // PostgreSQL types the list as one array only when two or

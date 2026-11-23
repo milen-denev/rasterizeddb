@@ -140,7 +140,7 @@ fn item_at(sql: &str, at: usize, limit: usize) -> Option<Item> {
         ("GENERATE_SERIES", at + "GENERATE_SERIES".len())
     } else if upper.starts_with("UNNEST") {
         ("UNNEST", at + "UNNEST".len())
-    } else if rest.starts_with('(') && rest[1..].trim_start().to_ascii_uppercase().starts_with("VALUES") {
+    } else if rest.starts_with('(') && crate::core::sql_scan::starts_with_keyword(rest[1..].trim_start(), "VALUES") {
         ("VALUES", at)
     } else {
         return None;

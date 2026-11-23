@@ -97,7 +97,7 @@ pub fn find_in_subquery(sql: &str) -> Option<InSubquery> {
                 while k < bytes.len() && bytes[k].is_ascii_whitespace() {
                     k += 1;
                 }
-                if upper[k..].starts_with("SELECT") {
+                if crate::core::sql_scan::starts_with_keyword(&sql[k..], "SELECT") {
                     // Match the closing parenthesis.
                     let mut depth = 1usize;
                     let mut m = j + 1;
@@ -223,7 +223,7 @@ fn scalar_subquery(sql: &str, correlated: bool) -> Option<InSubquery> {
                 let union_branch = (previous_word.is_empty() && sql[..open].trim().is_empty())
                     || set_word(&previous_word)
                     || (matches!(previous_word.as_str(), "ALL" | "DISTINCT") && set_word(&word_before_previous));
-                let is_select = upper[k..].starts_with("SELECT")
+                let is_select = crate::core::sql_scan::starts_with_keyword(&sql[k..], "SELECT")
                     && !matches!(previous_word.as_str(), "IN" | "EXISTS")
                     && !derived_table
                     && !union_branch;

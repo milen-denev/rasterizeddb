@@ -1156,7 +1156,7 @@ async fn insert_rows(
     let after_into = head[into..].trim_start();
     let name_end = after_into.find(|c: char| c.is_whitespace() || c == '(').unwrap_or(after_into.len());
     let rest = after_into[name_end..].trim_start();
-    let (columns, source) = if rest.starts_with('(') && !rest[1..].trim_start().to_ascii_uppercase().starts_with("SELECT") {
+    let (columns, source) = if rest.starts_with('(') && !crate::core::sql_scan::starts_with_keyword(rest[1..].trim_start(), "SELECT") {
         let close = crate::core::sql_scan::matching_close(rest, 0).unwrap_or(rest.len() - 1);
         let columns: Vec<String> = crate::core::sql_scan::split_top_level(&rest[1..close], b',')
             .into_iter()
