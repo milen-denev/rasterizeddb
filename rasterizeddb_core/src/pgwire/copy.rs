@@ -71,7 +71,7 @@ fn tokens(sql: &str) -> Vec<String> {
             i += 1;
             continue;
         }
-        if b == b'\'' || b == b'"' {
+        if b == b'\'' {
             let end = crate::core::sql_scan::skip_quoted(bytes, i).unwrap_or(bytes.len());
             out.push(sql[i..end].to_string());
             i = end.max(i + 1);
@@ -82,12 +82,25 @@ fn tokens(sql: &str) -> Vec<String> {
             i += 1;
             continue;
         }
+        // A word, or a name of dotted parts each bare or quoted, as one
+        // token: `public."case"` (what pg_dump writes for a reserved word),
+        // `"S"."T"`, `s.t`.
         let start = i;
-        while i < bytes.len()
-            && !bytes[i].is_ascii_whitespace()
-            && !matches!(bytes[i], b'(' | b')' | b',' | b';' | b'\'' | b'"')
-        {
-            i += 1;
+        loop {
+            if i < bytes.len() && bytes[i] == b'"' {
+                let end = crate::core::sql_scan::skip_quoted(bytes, i).unwrap_or(bytes.len());
+                i = end.max(i + 1);
+            }
+            while i < bytes.len()
+                && !bytes[i].is_ascii_whitespace()
+                && !matches!(bytes[i], b'(' | b')' | b',' | b';' | b'\'' | b'"')
+            {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'"' && i > start && bytes[i - 1] == b'.' {
+                continue;
+            }
+            break;
         }
         out.push(sql[start..i].to_string());
     }
@@ -122,7 +135,21 @@ fn single_byte(value: &str, what: &str) -> Result<u8, Refusal> {
 }
 
 fn name_of(token: &str) -> String {
-    let name = token.rsplit('.').next().unwrap_or(token);
+    // The last dotted part, a dot inside quotes being no separator.
+    let bytes = token.as_bytes();
+    let mut last = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => i = crate::core::sql_scan::skip_quoted(bytes, i).unwrap_or(bytes.len()).max(i + 1),
+            b'.' => {
+                last = i + 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let name = &token[last.min(token.len())..];
     if name.starts_with('"') {
         name.trim_matches('"').replace("\"\"", "\"")
     } else {
@@ -1241,6 +1268,21 @@ mod tests {
 
     fn p(sql: &str) -> Copy {
         parse_copy(sql).unwrap().unwrap()
+    }
+
+    /// A schema-qualified quoted name, as `pg_dump` writes a table named by
+    /// a reserved word (`public."case"`), is one name: it was read as the
+    /// table `public.`, with `"case"` where `TO` belongs (42601).
+    #[test]
+    fn a_qualified_quoted_name_is_one_name() {
+        let c = p("COPY public.\"case\" (domain_id, id) TO stdout;");
+        assert_eq!((c.table.as_deref(), c.columns.as_slice(), c.from), (Some("case"), &["domain_id".to_string(), "id".to_string()][..], false));
+        let c = p("COPY \"S\".\"a.b\" FROM STDIN");
+        assert_eq!((c.table.as_deref(), c.from), (Some("a.b"), true));
+        let c = p("COPY public.\"T\"(\"x\", y) FROM STDIN");
+        assert_eq!((c.table.as_deref(), c.columns.as_slice()), (Some("T"), &["x".to_string(), "y".to_string()][..]));
+        let c = p("COPY s.t FROM STDIN");
+        assert_eq!(c.table.as_deref(), Some("t"));
     }
 
     #[test]
