@@ -43,7 +43,7 @@ async fn native_statements_read_the_catalogue_views() {
 }
 
 fn context(database: &Arc<Database>, authentication_required: bool) -> NativeContext {
-    NativeContext { database: database.clone(), authentication_required, catalog: None }
+    NativeContext { database: database.clone(), authentication_required, catalog: None, statement_timeout: None }
 }
 
 async fn native(context: &NativeContext, superuser: bool, sql: &str) -> Vec<u8> {

@@ -12523,8 +12523,28 @@ fn create_table_already_satisfied(
             "Table '{}' already exists; IF NOT EXISTS makes that success",
             create_table.table_name
         );
+        already_exists_notice(&create_table.table_name);
     }
     exists
+}
+
+/// PostgreSQL's NOTICE for `CREATE TABLE IF NOT EXISTS` naming a relation
+/// that exists.
+fn already_exists_notice(name: &str) {
+    crate::core::notice::push(
+        "NOTICE",
+        "42P07",
+        format!("relation \"{name}\" already exists, skipping"),
+    );
+}
+
+/// PostgreSQL's NOTICE for `DROP TABLE IF EXISTS` naming no table.
+fn no_table_notice(name: &str) {
+    crate::core::notice::push(
+        "NOTICE",
+        "00000",
+        format!("table \"{name}\" does not exist, skipping"),
+    );
 }
 
 /// `CREATE TABLE … AS` (`rql::ctas`). The name is checked first, as
@@ -12553,6 +12573,7 @@ async fn execute_create_table_as(
     if database.has_table(&table_name) || database.is_partitioned(&table_name) {
         if statement.if_not_exists {
             info!("Table '{}' already exists; IF NOT EXISTS makes that success", table_name);
+            already_exists_notice(&table_name);
             return vec![0u8];
         }
         return ddl_error(&format!("relation \"{}\" already exists", table_name));
@@ -14066,6 +14087,8 @@ async fn drop_several_tables(sql: &str, each: &[String], database: &Arc<Database
             }
         } else if !if_exists {
             return ddl_error(&format!("table \"{name}\" does not exist"));
+        } else {
+            no_table_notice(name);
         }
     }
     if !cascade {
@@ -14132,7 +14155,10 @@ async fn execute_drop_table(sql: &str, database: &Arc<Database>) -> Vec<u8> {
     }
     match database.drop_table(&table_name).await {
         Ok(true) => ddl_ok(0),
-        Ok(false) if if_exists => ddl_ok(0),
+        Ok(false) if if_exists => {
+            no_table_notice(&table_name);
+            ddl_ok(0)
+        }
         Ok(false) => ddl_error(&format!("relation '{}' does not exist", table_name)),
         Err(e) => {
             error!("Failed to drop table {}: {}", table_name, e);

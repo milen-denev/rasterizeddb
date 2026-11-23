@@ -76,6 +76,126 @@ const CANCEL_PREFIX: &[u8] = b"\x01CANCEL;";
 /// way never the default database by accident.
 pub(crate) const DATABASE_PREFIX: &[u8] = b"\x01DATABASE;";
 
+/// Asks for notices: `\x01NOTICES;` makes every later answer on the
+/// connection that has notices carry them ([`with_notices`]). Sent by a
+/// client as a setup request of every connection it opens, after any
+/// database selection, and answered in the simple-query form (`SET`).
+///
+/// A connection that never sent it gets every answer exactly as before, so
+/// a client that does not know notices never sees one. A server without it
+/// refuses it without running anything, and a client then reads its
+/// answers as it always did: an unknown marked request on a server with
+/// marked requests (0A000), two statements on one before them.
+pub(crate) const NOTICES_PREFIX: &[u8] = b"\x01NOTICES;";
+
+/// The first byte of an answer that carries notices: a `u32` count (little
+/// endian), then each notice as three NUL-terminated strings (severity,
+/// SQLSTATE, message), then the answer itself, whose first byte is one of
+/// the native answers' (0 to 3). Only ever sent on a connection that asked
+/// with [`NOTICES_PREFIX`].
+pub(crate) const NOTICES_ANSWER: u8 = 5;
+
+/// One notice for a native client: severity (`NOTICE`, `WARNING`, …),
+/// SQLSTATE and message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WireNotice {
+    pub(crate) severity: String,
+    pub(crate) sqlstate: String,
+    pub(crate) message: String,
+}
+
+tokio::task_local! {
+    /// The notices of the request being answered on a connection that asked
+    /// for them, as the session's path read them from its messages
+    /// ([`translate`]).
+    static NATIVE_NOTICES: std::cell::RefCell<Vec<WireNotice>>;
+}
+
+/// Runs one request of a connection that asked for notices on the
+/// session's path (a block's statement, one run alone), and answers with
+/// them: what the session's path read from its messages, then what the
+/// engine raised outside it (`core::notice`, which without this scope only
+/// goes to the server log). An answer with none is unchanged; one with some
+/// is [`NOTICES_ANSWER`]'s form. A simple-query answer carries its notices
+/// as messages of its own, and is never wrapped. The autocommit path keeps
+/// its notices on the statement's signal instead (`engine_notices_answer`),
+/// with no scope of its own.
+pub(crate) fn with_notices<F: std::future::Future<Output = Vec<u8>>>(
+    request: F,
+) -> impl std::future::Future<Output = Vec<u8>> {
+    NATIVE_NOTICES.scope(
+        std::cell::RefCell::new(Vec::new()),
+        crate::core::notice::collect(async move {
+            let answer = request.await;
+            let mut notices = NATIVE_NOTICES.with(|n| std::mem::take(&mut *n.borrow_mut()));
+            notices.extend(crate::core::notice::drain().into_iter().map(|n| WireNotice {
+                severity: n.severity.to_string(),
+                sqlstate: n.sqlstate.to_string(),
+                message: n.message,
+            }));
+            notices_answer(answer, &notices)
+        }),
+    )
+}
+
+/// `answer` with `notices` in front of it ([`NOTICES_ANSWER`]).
+pub(crate) fn notices_answer(answer: Vec<u8>, notices: &[WireNotice]) -> Vec<u8> {
+    if notices.is_empty() {
+        return answer;
+    }
+    if answer.first() == Some(&SIMPLE_ANSWER) {
+        // Its notices are among its messages already; these came from
+        // outside them, and the form has nowhere else to put them.
+        for n in notices {
+            log::warn!("{} {}: {}", n.severity, n.sqlstate, n.message);
+        }
+        return answer;
+    }
+    let size: usize = notices
+        .iter()
+        .map(|n| n.severity.len() + n.sqlstate.len() + n.message.len() + 3)
+        .sum();
+    let mut out = Vec::with_capacity(5 + size + answer.len());
+    out.push(NOTICES_ANSWER);
+    out.extend_from_slice(&(notices.len() as u32).to_le_bytes());
+    for n in notices {
+        for field in [&n.severity, &n.sqlstate, &n.message] {
+            // A NUL inside would end the field early; no notice text holds
+            // one, and one that did would be cut, never misread.
+            out.extend(field.bytes().filter(|b| *b != 0));
+            out.push(0);
+        }
+    }
+    out.extend_from_slice(&answer);
+    out
+}
+
+/// `answer` with the engine's `notices` in front of it, as
+/// [`notices_answer`] puts them.
+pub(crate) fn engine_notices_answer(answer: Vec<u8>, notices: Vec<crate::core::notice::Notice>) -> Vec<u8> {
+    if notices.is_empty() {
+        return answer;
+    }
+    let wire: Vec<WireNotice> = notices
+        .into_iter()
+        .map(|n| WireNotice {
+            severity: n.severity.to_string(),
+            sqlstate: n.sqlstate.to_string(),
+            message: n.message,
+        })
+        .collect();
+    notices_answer(answer, &wire)
+}
+
+/// Hands notices read from a session statement's messages to the request's
+/// collector, when its connection asked for them.
+fn pass_on_notices(notices: Vec<WireNotice>) {
+    if notices.is_empty() {
+        return;
+    }
+    let _ = NATIVE_NOTICES.try_with(|n| n.borrow_mut().extend(notices));
+}
+
 /// What a simple query's header asked for: `\x01SIMPLE:key=value,…;text`.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct SimpleOptions {
@@ -316,6 +436,11 @@ pub(crate) struct NativeSession {
     /// queries. A lock held only to decide and to learn, never across a
     /// statement: a multiplexed connection's requests run at once.
     text_shapes: std::sync::Mutex<std::collections::HashMap<StdArc<str>, super::TextShape>>,
+    /// What each statement's session starts with as its `statement_timeout`,
+    /// in milliseconds: the listener's statement timeout
+    /// ([`Self::with_statement_timeout`]). A block's `SET statement_timeout`
+    /// replaces it until the block ends.
+    statement_timeout_ms: Option<u64>,
 }
 
 /// What [`NativeSession::text_step`] decided for an autocommit statement.
@@ -379,7 +504,17 @@ impl NativeSession {
             temp_tables: std::sync::Mutex::new(Vec::new()),
             temp_session: fastrand::u64(..),
             text_shapes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            statement_timeout_ms: None,
         }
+    }
+
+    /// Bounds every statement this session runs (a block's, a simple
+    /// query's, one run alone) by `timeout`, as `statement_timeout` does: a
+    /// statement past it fails with 57014, and in a block fails the block.
+    /// `None` is no bound.
+    pub(crate) fn with_statement_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.statement_timeout_ms = timeout.map(|t| (t.as_millis() as u64).max(1));
+        self
     }
 
     /// The database this session's statements run in.
@@ -570,6 +705,20 @@ impl NativeSession {
         {
             return true;
         }
+        // A `DO` block is PL/pgSQL, which pgwire's session runs
+        // (`trigger_exec`); the engine has no statement of that name.
+        if super::trigger_exec::parse_do(stmt).is_some() {
+            return true;
+        }
+        // `SHOW search_path`, `SHOW TimeZone`: a session parameter, which
+        // pgwire's session answers. The engine's own SHOW statements (`SHOW
+        // BACKUPS`, `SHOW QUERIES`, …) stay on the native path. An
+        // autocommit statement has no session of its own (see the module's
+        // notes), so the answer is what a fresh session holds: the server's
+        // defaults.
+        if upper_head.starts_with("SHOW") && self.is_session_show(stmt) {
+            return true;
+        }
         let has = |needle: &[u8]| crate::core::sql_scan::contains_ignore_ascii_case(stmt, needle);
         // The four sequence functions all hold `val`: one scan of a statement
         // that names none of them, where there were five.
@@ -613,6 +762,17 @@ impl NativeSession {
             }
         }
         false
+    }
+
+    /// Whether `stmt` is a `SHOW` the engine has no statement for: a session
+    /// parameter (`SHOW search_path`), which pgwire's session answers, or
+    /// one it refuses as PostgreSQL does (42704). The engine's own `SHOW`
+    /// statements (`SHOW TABLES`, `SHOW BACKUPS`, `SHOW QUERIES`, …) are
+    /// recognised by it and stay on the native path.
+    fn is_session_show(&self, stmt: &str) -> bool {
+        let mut words = stmt.trim_start().split_whitespace();
+        words.next().is_some_and(|w| w.eq_ignore_ascii_case("SHOW"))
+            && crate::core::rql::lexer_s1::recognize_query_purpose(stmt).is_none()
     }
 
     /// Whether `query` is this session's to run rather than the native
@@ -894,6 +1054,10 @@ impl NativeSession {
             },
             ConnectionLimits::default(),
         );
+        // The listener's bound on a statement; a block's own SET replaces it.
+        if self.statement_timeout_ms.is_some() {
+            state.statement_timeout_ms = self.statement_timeout_ms;
+        }
         // The connection's, not the statement's.
         state.sequence_values = self.sequence_values.clone();
         state.temp_tables = self
@@ -1091,9 +1255,12 @@ pub(super) struct Said {
     /// Each column's name, alongside `columns`.
     pub(super) names: Vec<String>,
     pub(super) rows: Vec<Vec<Option<Vec<u8>>>>,
-    /// Notices and warnings, by message. Not sent on the native protocol;
-    /// read by pgwire's own sessions and tests.
+    /// Notices and warnings, by message; read by pgwire's own sessions and
+    /// tests.
     pub(super) notices: Vec<String>,
+    /// The same notices whole, for a native client that asked for them
+    /// ([`NOTICES_PREFIX`]).
+    pub(super) notice_fields: Vec<WireNotice>,
 }
 
 fn cstring(bytes: &[u8], at: &mut usize) -> Option<String> {
@@ -1177,18 +1344,28 @@ pub(super) fn read_messages(out: &[u8]) -> Option<Said> {
                 said.rows.push(row);
             }
             // Notices (a warning, `there is no transaction in progress`):
-            // the native protocol has nowhere to put them, but its reader
-            // keeps them for the callers that do.
+            // sent on to a native client that asked for them.
             b'N' => {
                 let mut p = 0usize;
+                let mut notice = WireNotice {
+                    severity: String::new(),
+                    sqlstate: String::new(),
+                    message: String::new(),
+                };
                 while p < body.len() && body[p] != 0 {
                     let field = body[p];
                     p += 1;
                     let value = cstring(body, &mut p)?;
-                    if field == b'M' {
-                        said.notices.push(value);
+                    match field {
+                        b'V' => notice.severity = value,
+                        b'S' if notice.severity.is_empty() => notice.severity = value,
+                        b'C' => notice.sqlstate = value,
+                        b'M' => notice.message = value,
+                        _ => {}
                     }
                 }
+                said.notices.push(notice.message.clone());
+                said.notice_fields.push(notice);
             }
             _ => {}
         }
@@ -1208,7 +1385,7 @@ fn is_commit(stmt: &str) -> bool {
 
 /// The native answer to one statement run in the session.
 fn translate(stmt: &str, out: &[u8], engine: Option<Vec<u8>>) -> Vec<u8> {
-    let Some(said) = read_messages(out) else {
+    let Some(mut said) = read_messages(out) else {
         log::error!(
             "a native transaction's statement produced messages this module could not read"
         );
@@ -1217,6 +1394,7 @@ fn translate(stmt: &str, out: &[u8], engine: Option<Vec<u8>>) -> Vec<u8> {
             "internal error: the statement's answer could not be read",
         );
     };
+    pass_on_notices(std::mem::take(&mut said.notice_fields));
     if let Some((code, message)) = said.error {
         return native_error(&code, &message);
     }

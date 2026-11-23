@@ -12,7 +12,7 @@ use rclite::Arc;
 use super::*;
 
 fn context(database: &Arc<Database>, authentication_required: bool) -> NativeContext {
-    NativeContext { database: database.clone(), authentication_required, catalog: None }
+    NativeContext { database: database.clone(), authentication_required, catalog: None, statement_timeout: None }
 }
 
 async fn send(context: &NativeContext, superuser: bool, sql: &str) -> Vec<u8> {
@@ -973,6 +973,7 @@ async fn a_native_connection_counts_among_its_database_s_sessions() {
         database: database.clone(),
         authentication_required: false,
         catalog: Some(catalog.clone()),
+        statement_timeout: None,
     };
     let principal = std::sync::Arc::new(rastcp::session::Principal::new("svc", true));
     let sessions = || {
@@ -1030,6 +1031,7 @@ async fn a_native_connection_lists_and_creates_the_server_s_databases() {
         database: database.clone(),
         authentication_required: false,
         catalog: Some(catalog.clone()),
+        statement_timeout: None,
     };
     let principal = std::sync::Arc::new(rastcp::session::Principal::new("svc", true));
     let session = native_session_for(&context, &principal, false);
@@ -1113,6 +1115,7 @@ async fn a_native_role_without_superuser_cannot_create_or_drop_databases() {
         database: database.clone(),
         authentication_required: true,
         catalog: Some(catalog.clone()),
+        statement_timeout: None,
     };
     let reader = std::sync::Arc::new(rastcp::session::Principal::new("reader", false));
     let session = native_session_for(&context, &reader, false);
@@ -1171,6 +1174,7 @@ async fn analyze_takes_temporary_tables_and_skips_views() {
         database: database.clone(),
         authentication_required: false,
         catalog: Some(catalog.clone()),
+        statement_timeout: None,
     };
     let principal = std::sync::Arc::new(rastcp::session::Principal::new("svc", true));
     let session = native_session_for(&context, &principal, false);

@@ -20,6 +20,17 @@ pub struct Options {
     pub connections: usize,
     /// How long a statement may wait for its answer, and a connection for its
     /// handshake. `None` waits indefinitely.
+    ///
+    /// The server bounds a statement itself, at its request timeout (30 s
+    /// unless `--rdb-request-timeout` says otherwise): one that runs longer
+    /// is stopped and fails with SQLSTATE `57014`
+    /// ([`Error::is_statement_timeout`](crate::Error::is_statement_timeout)),
+    /// and its connection, and a transaction on it, go on (the transaction
+    /// is failed, as any failed statement fails it). So that this answer is
+    /// the one a caller gets, each statement's wait here is this timeout plus
+    /// [`ANSWER_GRACE`]. For statements longer than the server's limit,
+    /// raise both, or `SET statement_timeout` inside a transaction and raise
+    /// this.
     pub timeout: Option<Duration>,
     /// Who the connections log in as.
     pub login: Login,
@@ -113,6 +124,20 @@ pub(crate) fn with_trust(builder: TcpClientBuilder, trust: &crate::Trust) -> Tcp
 /// idle limit, leaving room for clock and scheduling slack.
 pub const DEFAULT_IDLE_RECONNECT: Duration = Duration::from_secs(20);
 
+/// What a connection waits past [`Options::timeout`] for a statement's
+/// answer. The server stops a statement at its own timeout, by default the
+/// same 30 s, and answers with an error (`57014`); without the grace the
+/// two would race, and a client that gave up first would lose the
+/// connection (and a transaction on it) over a statement the server was
+/// about to answer.
+pub const ANSWER_GRACE: Duration = Duration::from_secs(2);
+
+/// [`Options::timeout`] with [`ANSWER_GRACE`] added: what each connection
+/// is built with.
+pub(crate) fn with_grace(timeout: Option<Duration>) -> Option<Duration> {
+    timeout.map(|t| t.saturating_add(ANSWER_GRACE))
+}
+
 /// One multiplexed connection, and what deciding to reopen it needs.
 struct Connection {
     mux: MuxClient,
@@ -192,6 +217,10 @@ pub struct Client {
     /// (`rastcp::exec`): [`EXEC_UNKNOWN`] until the first statement with
     /// values asks it, then [`EXEC_YES`] or [`EXEC_NO`].
     exec: AtomicU8,
+    /// Where the notices of every answer go
+    /// ([`set_notice_handler`](Self::set_notice_handler)), shared with the
+    /// transactions' connections.
+    notices: std::sync::Arc<crate::notice::NoticeHook>,
 }
 
 const EXEC_UNKNOWN: u8 = 0;
@@ -222,7 +251,7 @@ impl Client {
             let mut builder =
                 with_trust(TcpClientBuilder::new(addr), &options.trust)
                     .max_message_size(options.max_message_size);
-            builder = match options.timeout {
+            builder = match with_grace(options.timeout) {
                 Some(timeout) => builder.timeout(timeout),
                 None => builder.no_timeout(),
             };
@@ -232,6 +261,9 @@ impl Client {
             if let Some(setup) = &setup {
                 builder = builder.setup(setup.clone());
             }
+            // After the database selection: the server answers it before
+            // anything else makes the connection's session.
+            builder = builder.add_setup(crate::notice::setup());
             let mux = builder.build_multiplexed().await?;
             mux.connect().await?;
             connections.push(Connection {
@@ -241,6 +273,7 @@ impl Client {
                 last_used: AtomicU64::new(0),
             });
         }
+        let notices = std::sync::Arc::new(crate::notice::NoticeHook::default());
         let client = Client {
             connections,
             next: AtomicUsize::new(0),
@@ -253,8 +286,10 @@ impl Client {
                 authenticator,
                 setup,
                 trust: options.trust.clone(),
+                notices: notices.clone(),
             }),
             exec: AtomicU8::new(EXEC_UNKNOWN),
+            notices,
         };
         if let Some(migrator) = &options.migrations {
             use crate::orm::AutoMigrate;
@@ -286,8 +321,10 @@ impl Client {
                 authenticator: None,
                 setup: None,
                 trust: crate::Trust::AcceptAny,
+                notices: Default::default(),
             }),
             exec: AtomicU8::new(EXEC_NO),
+            notices: Default::default(),
         }
     }
 
@@ -454,7 +491,7 @@ impl Client {
 
     /// Sends text already checked (by [`check_statement`], or by rendering).
     pub(crate) async fn send(&self, sql: &str) -> Result<Rows> {
-        decode_response(self.send_bytes(sql.as_bytes()).await?)
+        decode_response(self.send_bytes(sql.as_bytes()).await?, &self.notices)
     }
 
     async fn send_bytes(&self, request: &[u8]) -> Result<Vec<u8>> {
@@ -482,7 +519,7 @@ impl Client {
             })?;
             // `None`: too long to render from a request; sent as text.
             if let Some(request) = request {
-                return decode_response(self.send_bytes(&request).await?);
+                return decode_response(self.send_bytes(&request).await?, &self.notices);
             }
         }
         let statement = render(sql, params)?;
@@ -507,7 +544,8 @@ impl Client {
             // Not an answer about the form: decided by a later statement.
             Err(_) => return false,
         };
-        let supported = answer.first() == Some(&2);
+        let supported = crate::notice::split(answer)
+            .is_ok_and(|(_, answer)| answer.first() == Some(&2));
         self.exec.store(if supported { EXEC_YES } else { EXEC_NO }, Ordering::Relaxed);
         supported
     }
@@ -521,7 +559,7 @@ impl Client {
             })?;
             // `None`: too long to render from a request; sent as text.
             if let Some(request) = request {
-                return decode_response(self.send_bytes(&request).await?);
+                return decode_response(self.send_bytes(&request).await?, &self.notices);
             }
         }
         let statement = render_dyn(sql, params)?;
@@ -619,6 +657,33 @@ impl Client {
         Ok(rows.rows_affected().unwrap_or(rows.len() as u64))
     }
 
+    /// Calls `handler` with every notice the server raises for this
+    /// client's statements, in order, before the call that sent the
+    /// statement returns: those of the client's own statements and of its
+    /// transactions', and those of a statement that then failed (whose
+    /// error has no room for them). Replaces the handler set before.
+    ///
+    /// A successful statement's notices are also on its answer
+    /// ([`Rows::notices`]). A simple query's are on its answer
+    /// ([`SimpleAnswer`](crate::simple::SimpleAnswer)) alone. The handler
+    /// runs on the task that awaits the statement: keep it short.
+    ///
+    /// ```no_run
+    /// # async fn demo(client: &rasterizeddb_client::Client) -> rasterizeddb_client::Result<()> {
+    /// client.set_notice_handler(|notice| eprintln!("{notice}"));
+    /// client.run("DROP TABLE IF EXISTS gone").await?; // NOTICE: table "gone" does not exist, skipping
+    /// # Ok(()) }
+    /// ```
+    pub fn set_notice_handler(&self, handler: impl Fn(&crate::Notice) + Send + Sync + 'static) {
+        self.notices.set(Some(std::sync::Arc::new(handler)));
+    }
+
+    /// Stops calling the handler [`set_notice_handler`](Self::set_notice_handler)
+    /// set. Answers still carry their notices.
+    pub fn clear_notice_handler(&self) {
+        self.notices.set(None);
+    }
+
     /// Whether every connection is open right now.
     ///
     /// Not a health check: a connection the server closed after a quiet
@@ -644,8 +709,22 @@ impl Client {
 /// (`process_incoming_queries` / `run_native_query` in the server).
 ///
 /// 0 is an acknowledgement, optionally followed by a `u64` count; 1 a `u64`
-/// count; 2 serialized rows; 3 an error message.
-pub(crate) fn decode_response(response: Vec<u8>) -> Result<Rows> {
+/// count; 2 serialized rows; 3 an error message. Any of them may come with
+/// notices in front ([`crate::notice`]), which go to `hook` and onto the
+/// rows.
+pub(crate) fn decode_response(
+    response: Vec<u8>,
+    hook: &crate::notice::NoticeHook,
+) -> Result<Rows> {
+    let (notices, response) = crate::notice::split(response)?;
+    hook.deliver(&notices);
+    let mut rows = decode_plain(response)?;
+    rows.set_notices(notices);
+    Ok(rows)
+}
+
+/// [`decode_response`] for an answer without notices.
+fn decode_plain(response: Vec<u8>) -> Result<Rows> {
     let count = |bytes: &[u8]| -> Option<u64> {
         bytes
             .get(1..9)
@@ -677,6 +756,10 @@ pub(crate) fn decode_response(response: Vec<u8>) -> Result<Rows> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decode_response(response: Vec<u8>) -> Result<Rows> {
+        super::decode_response(response, &crate::notice::NoticeHook::default())
+    }
 
     #[test]
     fn answer_tags() {

@@ -561,11 +561,13 @@ struct Args {
     #[arg(long = "rdb-tcp", value_name = "on|off", default_value = "on")]
     rdb_tcp: String,
 
-    /// How long one native-protocol request may run, in seconds, before it is
-    /// abandoned and answered as timed out (default 30). A connection idle this
-    /// long is closed too. Raise it for long statements sent over the native
-    /// protocol (a backup, an import, a rebalance, a large report); pgwire has
-    /// no such limit.
+    /// How long one native-protocol statement may run, in seconds, before it
+    /// is stopped and answered with an error, SQLSTATE 57014 (default 30):
+    /// the connection survives, and a transaction block on it is failed as
+    /// any failed statement fails it. A connection idle this long is closed
+    /// too. Raise it for long statements sent over the native protocol (a
+    /// backup, an import, a rebalance, a large report), or `SET
+    /// statement_timeout` inside a block; pgwire has no such limit.
     #[arg(long = "rdb-request-timeout", value_name = "SECONDS")]
     rdb_request_timeout: Option<u64>,
 
