@@ -361,3 +361,32 @@ row, where a file borrows). Closing it means letting a store file lend
 resident pages (`try_borrow_range`), a design change, not done. A load is about 7x slower (284 s against 40 s for 2 x 100k rows,
 multi-row INSERTs). S3 (MinIO/RustFS) is not measured yet; no S3 image is
 on this box.
+
+### On S3 (RustFS 1.0.6, 2026-11-23)
+
+The same bench with `--s3`: a local RustFS 1.0.6, its data on tmpfs, 20,000
+rows. Wall time p50 in µs, files then store; the shared box was loaded,
+so read the pairs, not the absolute figures:
+
+| Query | Files | S3 store |
+|---|---|---|
+| primary-key point | 35 | 36 |
+| `n = v` through the index (100 rows) | 35 | 44 |
+| primary-key range (100 rows) | 47 | 51 |
+| routed + index on the partitioned twin | 57 | 68 |
+| fan-out on the index, 64 partitions | 366 | 384 |
+
+No query fetched from the store: reads are served from resident pages, as
+for a directory store. Loading the 2 x 20,000 rows took as long as on files
+(about 117 s on that box) and left 4,089 objects totalling 3.7 MiB.
+
+Two things found on the way:
+- **Throttling outlasted the retries.** The client retried 429/503 four
+  times with backoff up to 0.8 s, about 1.5 s in all, and a write the store
+  kept answering 503 failed the INSERT. Throttling answers now get 10
+  attempts, backoff capped at 3.2 s, about 25 s in all
+  (`backup::s3::THROTTLE_ATTEMPTS`); other 5xx keep `max_attempts`.
+- **RustFS on a FUSE mount is not a usable test store.** With its data on
+  ntfs-3g, RustFS's 5 s disk health check timed out under load. It marked
+  its disk faulty and answered 503 to everything ("disk marked faulty" in
+  its log). Give it a real filesystem.

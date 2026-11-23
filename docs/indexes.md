@@ -119,6 +119,15 @@ An index over `->` (a document rather than text) is refused. A path index
 serves both `->>` and `->` spellings of the same path, but answers only `->>`
 comparisons.
 
+**A JSON path comparison is fast only with a path index.** Without
+`CREATE INDEX … ON t ((doc->>'k'))`, `doc->>'k' = 'v'` reads every row: the
+filter index keys columns, not paths inside a document, and nothing indexes
+a path automatically (a document can hold unboundedly many). Declare one per
+path you filter on. It narrows the read on a plain table, a partitioned one
+(each partition keeps it) and a table on a key/value store alike, and
+answers exactly as the unindexed read does
+(`database::path_index_pruning_tests`).
+
 `pg_indexes` lists both kinds with the definition PostgreSQL would print.
 
 ## How a query uses one

@@ -590,6 +590,12 @@ mod s3 {
             elapsed,
             r.is_err()
         );
-        assert_eq!(requests.load(Ordering::Relaxed), 4);
+        // A throttling answer gets ten attempts whatever `max_attempts`
+        // says (`s3::THROTTLE_ATTEMPTS`): four were about a second and a
+        // half, which a store under load outlasted, failing the write. The
+        // backoff is capped, so the budget stays under 25 s.
+        assert_eq!(requests.load(Ordering::Relaxed), 10);
+        assert!(r.is_err(), "a store that only throttles still fails the request in the end");
+        assert!(elapsed < std::time::Duration::from_secs(25), "{elapsed:?}");
     }
 }
