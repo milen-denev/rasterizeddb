@@ -612,7 +612,7 @@ fn writers_through_a_stream_of_ddl_lose_and_mix_nothing() {
         "ALTER TABLE pa ALTER COLUMN s SET DEFAULT 'dflt'",
         "CREATE UNIQUE INDEX pa_u ON pa (tenant_id, id, n)",
         "ALTER TABLE pa RENAME COLUMN f TO g",
-        "ALTER TABLE pa DROP CONSTRAINT pa_u",
+        "DROP INDEX pa_u",
         "ALTER TABLE pa ALTER COLUMN s DROP DEFAULT",
         "ALTER TABLE pa RENAME COLUMN g TO f",
         "ALTER TABLE pa DROP CONSTRAINT pa_c",

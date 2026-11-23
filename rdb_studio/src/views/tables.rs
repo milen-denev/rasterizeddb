@@ -430,14 +430,24 @@ fn indexes<'a>(studio: &'a Studio, table: &str) -> Element<'a, Message> {
                     crate::dialect::drop_constraint_sql(table, &index.name),
                 ),
             ),
+            // A `CREATE UNIQUE INDEX` is an index too: `DROP INDEX` drops it,
+            // and its uniqueness with it.
             IndexOwner::Declared => drop_button(
                 "DROP",
                 drop(
                     "Drop index",
-                    format!(
-                        "This removes the index `{}`. Queries it answered scan instead; no rows change.",
-                        index.name
-                    ),
+                    if index.unique {
+                        format!(
+                            "This removes the unique index `{}`: `{}` will accept duplicates from now on. \
+                             No rows change.",
+                            index.name, index.columns
+                        )
+                    } else {
+                        format!(
+                            "This removes the index `{}`. Queries it answered scan instead; no rows change.",
+                            index.name
+                        )
+                    },
                     crate::dialect::drop_index_sql(&index.name),
                 ),
             ),

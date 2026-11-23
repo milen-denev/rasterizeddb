@@ -79,16 +79,31 @@ pub fn columns_sql(flavor: Flavor, table: &str) -> String {
 ///
 /// Both engines answer `pg_indexes`, and both print each index as the
 /// `CREATE INDEX` that would make it, so the list is one parser over one
-/// shape. PostgreSQL also says which constraint owns each index; RasterizedDB's
-/// `pg_indexes` has no such column, and [`parse_indexes`] works it out from the
-/// definition instead.
+/// shape. Each also says which constraint owns each index, through
+/// `pg_constraint` (`constraint_type`): a `CREATE UNIQUE INDEX` is an index,
+/// dropped by `DROP INDEX`, and a `UNIQUE` constraint's index goes with
+/// `DROP CONSTRAINT`; each refuses the other's statement (42704, 2BP01).
+/// RasterizedDB tells the two apart since its unique keys record how they
+/// were made; before that, `pg_constraint` lists every unique key, which is
+/// what that server's `DROP CONSTRAINT` drops.
 pub fn indexes_sql(flavor: Flavor, table: &str) -> String {
     match flavor {
-        Flavor::Rasterized => format!(
+        Flavor::Rasterized => RDB_INDEXES.replace("$TABLE$", &quote_literal(table)),
+        Flavor::Postgres => PG_INDEXES.replace("$TABLE$", &quote_literal(table)),
+    }
+}
+
+/// What to send for one table's indexes when [`indexes_sql`] fails: a
+/// RasterizedDB server that cannot answer the join reads `pg_indexes` alone,
+/// and [`parse_indexes`] works the owner out from the definition, as it
+/// always did there. `None` for PostgreSQL, whose query is its own catalogue.
+pub fn indexes_fallback_sql(flavor: Flavor, table: &str) -> Option<String> {
+    match flavor {
+        Flavor::Rasterized => Some(format!(
             "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = {}",
             quote_literal(table)
-        ),
-        Flavor::Postgres => PG_INDEXES.replace("$TABLE$", &quote_literal(table)),
+        )),
+        Flavor::Postgres => None,
     }
 }
 
@@ -1568,8 +1583,8 @@ pub fn parse_columns(grid: &Grid) -> Vec<ColumnInfo> {
 /// One table's indexes, from [`indexes_sql`].
 ///
 /// `primary_columns` is the table's primary key as `SHOW COLUMNS` flags it,
-/// used only against RasterizedDB, whose `pg_indexes` does not say which
-/// index is the key's. There a unique index is the primary key's when it is
+/// used only when the grid has no `constraint_type` (RasterizedDB's
+/// [`indexes_fallback_sql`]), which does not say which index is the key's. There a unique index is the primary key's when it is
 /// named `<table>_pkey`, as the engine names it, or covers exactly the flagged
 /// columns. Erring towards "primary" only hides a button; erring the other way
 /// offers one the server answers with success and ignores.
@@ -2086,6 +2101,20 @@ ORDER BY a.attnum";
 /// The constraint is matched on both its index and its own table: a foreign
 /// key records the *referenced* table's index in `conindid`, so without the
 /// `contype` filter a self-referencing table would list its primary key twice.
+/// RasterizedDB's indexes with their owners: `pg_indexes`, which prints its
+/// definitions as the engine stores them, beside the `pg_constraint` row of
+/// the same name, if any.
+const RDB_INDEXES: &str = "\
+SELECT
+  i.indexname,
+  i.indexdef,
+  CASE c.contype WHEN 'p' THEN 'primary' WHEN 'u' THEN 'unique' ELSE '' END AS constraint_type
+FROM pg_indexes i
+LEFT JOIN pg_constraint c
+  ON c.conname = i.indexname AND c.conrelid = $TABLE$::regclass AND c.contype IN ('p', 'u')
+WHERE i.tablename = $TABLE$
+ORDER BY i.indexname";
+
 const PG_INDEXES: &str = "\
 SELECT
   ic.relname::text                                AS indexname,
@@ -2252,6 +2281,39 @@ mod tests {
         let flagged = parse_indexes(&grid, &["asset_id", "tenant_id"]);
         assert_eq!(flagged[3].owner, IndexOwner::Primary);
         assert_eq!(flagged[2].kind(), "hash");
+    }
+
+    /// RasterizedDB's index query says who owns each index, as PostgreSQL's
+    /// does, so a `CREATE UNIQUE INDEX` is offered `DROP INDEX` and a UNIQUE
+    /// constraint `DROP CONSTRAINT`: each refuses the other (42704, 2BP01).
+    /// The plain `pg_indexes` read stays as the fallback for a server that
+    /// cannot answer the join.
+    #[test]
+    fn a_rasterized_unique_index_is_told_from_a_unique_constraint() {
+        let sql = indexes_sql(Flavor::Rasterized, "o'k");
+        assert!(sql.contains("FROM pg_indexes i") && sql.contains("LEFT JOIN pg_constraint c"), "{sql}");
+        assert!(sql.contains("AS constraint_type") && sql.contains("WHERE i.tablename = 'o''k'"), "{sql}");
+        assert!(sql.contains("c.conrelid = 'o''k'::regclass") && !sql.contains("$TABLE$"), "{sql}");
+        assert_eq!(
+            indexes_fallback_sql(Flavor::Rasterized, "t").as_deref(),
+            Some("SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 't'")
+        );
+        assert!(indexes_fallback_sql(Flavor::Postgres, "t").is_none());
+        // What a RasterizedDB server answers it with (as of the index mark).
+        let grid = index_grid(
+            &["indexname", "indexdef", "constraint_type"],
+            &[
+                &["s_a_ix", "CREATE UNIQUE INDEX s_a_ix ON public.s USING btree (a)", ""],
+                &["s_b_con", "CREATE UNIQUE INDEX s_b_con ON public.s USING btree (b)", "unique"],
+                &["s_pkey", "CREATE UNIQUE INDEX s_pkey ON public.s USING btree (id)", "primary"],
+            ],
+        );
+        let indexes = parse_indexes(&grid, &["id"]);
+        let owners: Vec<IndexOwner> = indexes.iter().map(|i| i.owner).collect();
+        assert_eq!(owners, [IndexOwner::Declared, IndexOwner::Unique, IndexOwner::Primary]);
+        assert!(indexes[0].unique);
+        assert_eq!(drop_index_sql(&indexes[0].name), "DROP INDEX \"s_a_ix\"");
+        assert_eq!(drop_constraint_sql("s", &indexes[1].name), "ALTER TABLE \"s\" DROP CONSTRAINT \"s_b_con\"");
     }
 
     /// PostgreSQL says who owns each index, and that is believed over the

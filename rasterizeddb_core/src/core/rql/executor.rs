@@ -6550,12 +6550,12 @@ async fn drop_keys_depending_on_constraint(
 
 /// Whether `name` is the index a constraint of `table` owns: its primary
 /// key's (`<table>_pkey`), a column declared `UNIQUE` (`<table>_<column>_key`),
-/// or a full unique constraint. A partial unique index is not one: it answers
-/// to `DROP INDEX` itself (`execute_drop_partial_unique`).
+/// or a full unique constraint. A unique index, partial or not, is not one:
+/// it answers to `DROP INDEX` itself (`execute_drop_unique_index`).
 fn constraint_index(schema: &crate::core::row::schema::TableSchema, table: &str, name: &str) -> bool {
     let named = |n: &str| n.eq_ignore_ascii_case(name);
     (schema.primary_key.is_some() && named(&crate::core::rql::unique_key::pkey_name(table)))
-        || schema.unique_keys.iter().any(|k| !k.is_deleted && k.predicate.is_none() && named(&k.name))
+        || schema.unique_keys.iter().any(|k| !k.is_deleted && !k.is_index() && named(&k.name))
         || implicit_unique_column(name, table, &schema.fields).is_some()
 }
 
@@ -17004,7 +17004,14 @@ async fn execute_alter_table_action(
             };
             let table_name = plan.table_name.clone();
             let named = |n: &str, want: &str| n.eq_ignore_ascii_case(want);
-            let key = schema.unique_keys.iter().find(|k| !k.is_deleted && named(&k.name, &from)).cloned();
+            // `RENAME CONSTRAINT` does not know a key `CREATE UNIQUE INDEX`
+            // made (42704, as in PostgreSQL); `ALTER INDEX … RENAME` renames
+            // either, and the key keeps its mark.
+            let key = schema
+                .unique_keys
+                .iter()
+                .find(|k| !k.is_deleted && (index_form || !k.from_index) && named(&k.name, &from))
+                .cloned();
             let fk = schema.foreign_keys.iter().find(|f| !index_form && !f.is_deleted && named(&f.name, &from)).cloned();
             let check = schema.checks.iter().find(|c| !index_form && !c.is_deleted && named(&c.name, &from)).cloned();
             let index = schema
@@ -17723,14 +17730,27 @@ async fn execute_alter_table_action(
                     Ok((name, if_exists)) => (Some(name), if_exists),
                     Err(e) => return ddl_error(&e),
                 };
-                if let Some(name) = dropped.clone() {
+                // A key `CREATE UNIQUE INDEX` made is an index, which
+                // PostgreSQL's DROP CONSTRAINT does not know (42704, or a
+                // no-op under IF EXISTS); `DROP INDEX` drops it. Before
+                // anything else reads the name: its dependent foreign keys
+                // would otherwise answer 2BP01 for a constraint that is not
+                // there.
+                let index_only = |name: &str| {
+                    let named = |n: &str| n.eq_ignore_ascii_case(name);
+                    schema.unique_keys.iter().any(|k| !k.is_deleted && k.from_index && named(&k.name))
+                        && !schema.unique_keys.iter().any(|k| !k.is_deleted && !k.from_index && named(&k.name))
+                        && !schema.foreign_keys.iter().any(|fk| !fk.is_deleted && named(&fk.name))
+                        && !schema.checks.iter().any(|c| !c.is_deleted && named(&c.name))
+                };
+                if let Some(name) = dropped.clone().filter(|name| !index_only(name)) {
                     // What the name matches, read from the open schema (the
                     // sidecars' loaded copy, which nothing changes while this
                     // statement holds ACCESS EXCLUSIVE): a name matching
                     // nothing reloads nothing.
                     let named = |n: &str| n.eq_ignore_ascii_case(&name);
                     let stored = schema.foreign_keys.iter().any(|fk| !fk.is_deleted && named(&fk.name))
-                        || schema.unique_keys.iter().any(|k| !k.is_deleted && named(&k.name))
+                        || schema.unique_keys.iter().any(|k| !k.is_deleted && !k.from_index && named(&k.name))
                         || schema.checks.iter().any(|c| !c.is_deleted && named(&c.name));
                     // A column declared `UNIQUE` inline is a flag on the field,
                     // not a named sidecar, so no name could ever match it —
@@ -17800,10 +17820,13 @@ async fn execute_alter_table_action(
                                 let removed = foreign_key::remove(io_schema.clone(), &name)
                                     .await
                                     .map_err(|e| e.to_string())?;
-                                let removed = crate::core::rql::unique_key::remove(io_schema.clone(), &name)
-                                    .await
-                                    .map_err(|e| e.to_string())?
-                                    || removed;
+                                // Not a key `CREATE UNIQUE INDEX` made, which
+                                // only `DROP INDEX` drops.
+                                let removed =
+                                    crate::core::rql::unique_key::remove_matching(io_schema.clone(), &name, |k| !k.from_index)
+                                        .await
+                                        .map_err(|e| e.to_string())?
+                                        || removed;
                                 // A CHECK is retired by a tombstone under its
                                 // name; the last record of a name wins when the
                                 // sidecar is read.
@@ -18849,20 +18872,24 @@ async fn execute_drop_index(sql: &str, database: &Arc<Database>) -> Option<Vec<u
     Some(ddl_ok(0))
 }
 
-/// `DROP INDEX` of a partial unique index, which is kept as a partial unique
-/// key. `None` when no table has one by that name, so the caller tries the
-/// other kinds.
+/// `DROP INDEX` of a unique index, partial or not, which is kept as a unique
+/// key marked as the index `CREATE UNIQUE INDEX` made
+/// ([`crate::core::rql::unique_key::UniqueKey::is_index`]). `None` when no
+/// table has one by that name, so the caller tries the other kinds.
 ///
-/// Only partial keys answer to `DROP INDEX` here. A full unique index is
-/// stored the same way as `ADD CONSTRAINT … UNIQUE`, and the two cannot be told
-/// apart afterwards; PostgreSQL refuses to drop the latter's index, so that
-/// case is left to the constraint.
-async fn execute_drop_partial_unique(sql: &str, database: &Arc<Database>) -> Option<Vec<u8>> {
+/// A key `ADD CONSTRAINT … UNIQUE` declared is not one: PostgreSQL refuses to
+/// drop its index (2BP01, `execute_drop_path_index`). A full key stored before
+/// the mark existed is taken for a constraint, as it always was.
+///
+/// The foreign keys that depend on the index go with it under `CASCADE`, and
+/// keep it otherwise (2BP01), as in PostgreSQL.
+async fn execute_drop_unique_index(sql: &str, database: &Arc<Database>, tx: TxId) -> Option<Vec<u8>> {
     let (name, _if_exists) = crate::core::rql::path_index::parse_drop(sql)?;
+    let cascade = crate::core::rql::path_index::drop_cascades(sql);
     // Found by a metadata walk, then locked and read again (see
     // `execute_drop_index`).
     let is_it = |k: &crate::core::rql::unique_key::UniqueKey| {
-        !k.is_deleted && k.predicate.is_some() && k.name.eq_ignore_ascii_case(&name)
+        !k.is_deleted && k.is_index() && k.name.eq_ignore_ascii_case(&name)
     };
     let mut found: Option<String> = None;
     database.each_schema(|table, schema| {
@@ -18878,13 +18905,59 @@ async fn execute_drop_partial_unique(sql: &str, database: &Arc<Database>) -> Opt
     if !table.schema.unique_keys.iter().any(is_it) {
         return None;
     }
+    let schema = table.schema.clone();
     drop(table);
+    // This transaction's row locks are keyed by the table's identifying key,
+    // which a unique index may be: dropping it would orphan them (55006), as
+    // `DROP CONSTRAINT` refuses.
+    if database.row_locks.txn_holds_rows_on(&table_name, tx) {
+        let mut after = schema.clone();
+        for key in after.unique_keys.iter_mut().filter(|k| is_it(k)) {
+            key.is_deleted = true;
+        }
+        if identifying_shape(&schema) != identifying_shape(&after) {
+            return Some(row_locks_in_use(&table_name, "change the key that identifies its rows"));
+        }
+    }
+    let dependents = keys_depending_on_constraint(database, &schema, &table_name, &name);
+    if let Some((child, key)) = dependents.first() {
+        if !cascade {
+            return Some(ddl_error(&format!(
+                "cannot drop index {name} because other objects depend on it: constraint {key} on table {child} \
+                 depends on index {name} (HINT: use DROP ... CASCADE to drop the dependent objects too)"
+            )));
+        }
+        for (child, key) in &dependents {
+            crate::core::notice::push(
+                "NOTICE",
+                "00000",
+                format!("drop cascades to constraint {key} on table {child}"),
+            );
+        }
+    }
+    if let Err(e) = Box::pin(drop_keys_depending_on_constraint(database, &table_name, &name, &dependents)).await {
+        error!("{}", e);
+        return Some(ddl_error(&e));
+    }
+    // The table's own keys onto the column: this reload's.
+    let own_keys: Vec<String> = dependents
+        .into_iter()
+        .filter(|(child, _)| child.eq_ignore_ascii_case(&table_name))
+        .map(|(_, key)| key)
+        .collect();
     // §7 step 3: the key's removal is the reload's work.
     let reloaded = database
         .reload_with(&table_name, |old| {
             let (name, table_name) = (name.clone(), table_name.clone());
             async move {
-                match crate::core::rql::unique_key::remove(old.io_schema.clone(), &name).await {
+                for key in &own_keys {
+                    crate::core::rql::foreign_key::remove(old.io_schema.clone(), key)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                // Only the index: a constraint of the same name, which
+                // nothing stops another table holding, is not this drop's.
+                match crate::core::rql::unique_key::remove_matching(old.io_schema.clone(), &name, |k| k.is_index()).await {
                     Ok(true) => Ok(()),
                     Ok(false) => Err(format!(
                         "index \"{}\" could not be found in the sidecar of '{}'",
@@ -20275,7 +20348,7 @@ fn schema_after_for_identity(
             let name = dropped_constraint_name(description)?;
             let pk = primary_key_constraint(schema, &plan.table_name);
             let pk_named = pk.as_ref().is_some_and(|p| p.name.eq_ignore_ascii_case(&name));
-            for key in after.unique_keys.iter_mut().filter(|k| k.name.eq_ignore_ascii_case(&name)) {
+            for key in after.unique_keys.iter_mut().filter(|k| !k.from_index && k.name.eq_ignore_ascii_case(&name)) {
                 key.is_deleted = true;
             }
             let inline_pk = pk.as_ref().filter(|p| p.inline).and_then(|p| p.column.clone());
@@ -22088,7 +22161,7 @@ pub(crate) async fn execute_with_need(
         QueryPurpose::DropIndex(sql) => {
             let response = match Box::pin(execute_drop_index(sql, &database)).await {
                 Some(response) => response,
-                None => match Box::pin(execute_drop_partial_unique(sql, &database)).await {
+                None => match Box::pin(execute_drop_unique_index(sql, &database, tx)).await {
                     Some(response) => response,
                     None => Box::pin(execute_drop_path_index(sql, &database)).await,
                 },

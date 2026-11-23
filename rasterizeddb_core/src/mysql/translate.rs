@@ -3120,12 +3120,17 @@ fn split_type_attrs(text: &str) -> (String, String) {
 }
 
 /// The statement that drops index `name` of `table`: its prefixed name if it
-/// was made here, a unique constraint if that is what it is.
+/// was made here, a unique constraint if that is what it is. A unique key
+/// PostgreSQL's `CREATE UNIQUE INDEX` made is an index, which `DROP
+/// CONSTRAINT` does not know (`UniqueKey::from_index`).
 fn drop_index_statement(database: &Database, table: &str, name: &str) -> String {
     let mangled = index_name(table, name);
     if let Some(view) = database.schema_view(table) {
         let schema = view.schema();
         for key in schema.unique_keys.iter().filter(|k| !k.is_deleted) {
+            if (key.name == mangled || key.name == name) && key.is_index() {
+                return format!("DROP INDEX {}", ident_sql(&key.name));
+            }
             if key.name == mangled || key.name == name {
                 return format!(
                     "ALTER TABLE {} DROP CONSTRAINT {}",

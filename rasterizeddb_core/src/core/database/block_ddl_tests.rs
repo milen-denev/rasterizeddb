@@ -309,6 +309,49 @@ async fn index_ddl_in_a_block_rolls_back_recovers_and_commits() {
     }
 }
 
+/// `DROP INDEX` of an index `CREATE UNIQUE INDEX` made, in a block: the
+/// block holds the table's declarations aside (`index_owner` finds the key
+/// as an index), so a ROLLBACK or a crash before COMMIT puts the key back,
+/// still marked an index and still enforced; a COMMIT keeps the drop.
+/// Before the mark, `DROP INDEX` of it was refused outright.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_unique_index_dropped_in_a_block_comes_back_as_an_index() {
+    for end in [End::Rollback, End::Crash, End::Commit] {
+        let dir = tempfile::tempdir().expect("dir");
+        let db = Arc::new(open(dir.path()).await);
+        exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, x INT)").await.expect("create");
+        let create = crate::core::rql::lexer_alter::unique_index_as_constraint("CREATE UNIQUE INDEX t_u ON t (x)").expect("rewritten");
+        exec(&db, &create).await.expect("unique index");
+        exec(&db, "INSERT INTO t (id, x) VALUES (1, 10)").await.expect("insert");
+        let marks = |db: &Database| -> Vec<(String, bool)> {
+            db.schema_view("t")
+                .map(|v| v.schema().unique_keys.iter().filter(|k| !k.is_deleted).map(|k| (k.name.clone(), k.from_index)).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(marks(&db), vec![("t_u".to_string(), true)]);
+        let root = db.transactions.begin();
+        block_ddl(&db, root, &["DROP INDEX t_u"]).await;
+        assert!(marks(&db).is_empty(), "{end:?}: the block's DROP INDEX did not run");
+        let db = end_block(db, root, end, dir.path()).await;
+        let duplicate = exec(&db, "INSERT INTO t (id, x) VALUES (2, 10)").await;
+        match end {
+            End::Commit => {
+                assert!(marks(&db).is_empty(), "{end:?}");
+                duplicate.expect("the index is gone");
+            }
+            _ => {
+                assert_eq!(marks(&db), vec![("t_u".to_string(), true)], "{end:?}");
+                assert!(duplicate.is_err(), "{end:?}: the index came back unenforced");
+                // Still an index: DROP INDEX drops it.
+                exec(&db, "DROP INDEX t_u").await.expect("drop");
+                assert!(marks(&db).is_empty(), "{end:?}");
+            }
+        }
+        assert!(block_leftovers(dir.path()).is_empty(), "{end:?}: left behind: {:?}", block_leftovers(dir.path()));
+        shut(db, dir.path());
+    }
+}
+
 /// A partitioned table's DDL in a block (2026-11-12): a metadata ALTER and
 /// a CREATE INDEX hold its shell's schema files aside (`__pt_<uid>_
 /// schema*`, all such DDL writes), and a table created PARTITION BY is
