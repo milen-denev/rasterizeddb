@@ -6189,6 +6189,105 @@ pub(crate) fn sql_literal(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
+/// The column that would be left with no unique key by dropping the
+/// constraint `name` of `table`: what a foreign key referencing that column
+/// depends on. `None` when the name is no single-column primary key or
+/// UNIQUE (a composite key is no foreign key's target, a partial one
+/// neither), or when another key over the column stays.
+///
+/// PostgreSQL ties a foreign key to the one index it was created against.
+/// Nothing here records which, so a key depends on a constraint only while
+/// that constraint is the last thing keeping its column unique.
+fn column_losing_its_key(
+    schema: &crate::core::row::schema::TableSchema,
+    table: &str,
+    name: &str,
+) -> Option<String> {
+    let named = |n: &str| n.eq_ignore_ascii_case(name);
+    let whole = || schema.unique_keys.iter().filter(|k| !k.is_deleted && k.predicate.is_none());
+    let pk = primary_key_constraint(schema, table);
+    // What the name drops, as `ALTER TABLE … DROP CONSTRAINT` reads it: a
+    // stored key first, then an inline primary key's flag, then a UNIQUE
+    // column's.
+    let (column, flag_goes) = if let Some(key) = whole().find(|k| named(&k.name)) {
+        match key.columns.as_slice() {
+            [column] => (column.clone(), false),
+            _ => return None,
+        }
+    } else if let Some(column) = pk.as_ref().filter(|p| p.inline && named(&p.name)).and_then(|p| p.column.clone()) {
+        (column, true)
+    } else {
+        let inline_primary =
+            |column: &str| pk.as_ref().is_some_and(|p| p.inline && p.column.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(column)));
+        (implicit_unique_column(name, table, &schema.fields).filter(|column| !inline_primary(column))?, true)
+    };
+    let another_key = whole().any(|k| !named(&k.name) && k.columns.len() == 1 && k.columns[0].eq_ignore_ascii_case(&column));
+    let flag_stays = !flag_goes
+        && schema.fields.iter().any(|f| !f.is_deleted && f.is_unique && f.name.eq_ignore_ascii_case(&column));
+    (!another_key && !flag_stays).then_some(column)
+}
+
+/// The foreign keys that depend on the constraint `name` of `table`
+/// ([`column_losing_its_key`]), as `(table holding the key, the key's name)`,
+/// the table's own self-references among them.
+fn keys_depending_on_constraint(
+    database: &Database,
+    schema: &crate::core::row::schema::TableSchema,
+    table: &str,
+    name: &str,
+) -> Vec<(String, String)> {
+    let Some(column) = column_losing_its_key(schema, table, name) else {
+        return Vec::new();
+    };
+    let mut dependents: Vec<(String, String)> = database
+        .referencing_keys(table)
+        .into_iter()
+        .filter(|(_, fk)| !fk.is_deleted && fk.parent_column.eq_ignore_ascii_case(&column))
+        .map(|(child, fk)| (child, fk.name))
+        .collect();
+    dependents.sort();
+    dependents.dedup();
+    dependents
+}
+
+/// `DROP CONSTRAINT … CASCADE`'s other half: every dependent foreign key
+/// another table holds is dropped (its record tombstoned, its table
+/// reloaded under ACCESS EXCLUSIVE), as `DROP TABLE … CASCADE` drops them
+/// (`drop_dependent_foreign_keys`). The table's own self-references are its
+/// own reload's work, with the constraint.
+async fn drop_keys_depending_on_constraint(
+    database: &Arc<Database>,
+    table: &str,
+    constraint: &str,
+    dependents: &[(String, String)],
+) -> Result<(), String> {
+    let mut children: Vec<&String> =
+        dependents.iter().map(|(child, _)| child).filter(|child| !child.eq_ignore_ascii_case(table)).collect();
+    children.dedup();
+    // Taken with the statement's set when the text said CASCADE
+    // (`alter_lock_set`); asked again here for a key added since.
+    for child in &children {
+        database.table_for(child, owner(), TableMode::AccessExclusive).await?;
+    }
+    for child in children {
+        let names: Vec<String> =
+            dependents.iter().filter(|(c, _)| c.eq_ignore_ascii_case(child)).map(|(_, name)| name.clone()).collect();
+        database
+            .reload_with(child, |old| async move {
+                for name in &names {
+                    crate::core::rql::foreign_key::remove(old.io_schema.clone(), name).await.map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|failure| {
+                format!("could not drop the foreign keys of \"{child}\" that depend on constraint {constraint}: {failure}")
+            })?;
+        info!("DROP CONSTRAINT {constraint} CASCADE on {table} dropped the foreign keys of {child} that depend on it");
+    }
+    Ok(())
+}
+
 /// Whether `name` is the index a constraint of `table` owns: its primary
 /// key's (`<table>_pkey`), a column declared `UNIQUE` (`<table>_<column>_key`),
 /// or a full unique constraint. A partial unique index is not one: it answers
@@ -17245,6 +17344,34 @@ async fn execute_alter_table_action(
                     // the catalogs and the row locks went on calling a column
                     // the key that nothing kept unique.
                     let header_goes = pk_named && pk.as_ref().is_some_and(|p| p.column.is_some());
+                    // The foreign keys that reference the column this key
+                    // keeps unique go with it, or keep it (2BP01), as in
+                    // PostgreSQL. The drop used to succeed and leave them:
+                    // keys enforced against a column nothing kept unique,
+                    // which no dump of the schema could be restored from.
+                    let dependents = keys_depending_on_constraint(&database, &schema, &plan.table_name, &name);
+                    if let Some((child, key)) = dependents.first()
+                        && !crate::core::rql::unique_key::dropped_constraint_cascades(&description)
+                    {
+                        return ddl_error(&format!(
+                            "cannot drop constraint {name} on table {table} because other objects depend on it: \
+                             constraint {key} on table {child} depends on index {name} (HINT: use DROP ... CASCADE to \
+                             drop the dependent objects too)",
+                            table = plan.table_name
+                        ));
+                    }
+                    if let Err(e) =
+                        Box::pin(drop_keys_depending_on_constraint(&database, &plan.table_name, &name, &dependents)).await
+                    {
+                        error!("{}", e);
+                        return ddl_error(&e);
+                    }
+                    // The table's own keys onto the column: this reload's.
+                    let own_keys: Vec<String> = dependents
+                        .into_iter()
+                        .filter(|(child, _)| child.eq_ignore_ascii_case(&plan.table_name))
+                        .map(|(_, key)| key)
+                        .collect();
                     if stored || implicit.is_some() || primary.is_some() || header_goes {
                         // §7 step 3: the removals are the reload's work. Both
                         // sidecars are tried, since the name alone does not say
@@ -17254,6 +17381,9 @@ async fn execute_alter_table_action(
                         let reloaded = database
                             .reload_with(&plan.table_name, |old| async move {
                                 let io_schema = old.io_schema.clone();
+                                for key in &own_keys {
+                                    foreign_key::remove(io_schema.clone(), key).await.map_err(|e| e.to_string())?;
+                                }
                                 let removed = foreign_key::remove(io_schema.clone(), &name)
                                     .await
                                     .map_err(|e| e.to_string())?;
@@ -20052,17 +20182,27 @@ pub(crate) fn alter_lock_set(
             let Some(name) = dropped_constraint_name(description) else {
                 return Vec::new();
             };
-            database
-                .schema_view(table)
-                .map(|view| {
-                    view.schema()
-                        .foreign_keys
-                        .iter()
-                        .filter(|fk| !fk.is_deleted && fk.name.eq_ignore_ascii_case(&name))
-                        .map(|fk| (fk.parent_table.clone(), TableMode::Share))
-                        .collect()
-                })
-                .unwrap_or_default()
+            let Some(view) = database.schema_view(table) else {
+                return Vec::new();
+            };
+            let mut set: Vec<(String, TableMode)> = view
+                .schema()
+                .foreign_keys
+                .iter()
+                .filter(|fk| !fk.is_deleted && fk.name.eq_ignore_ascii_case(&name))
+                .map(|fk| (fk.parent_table.clone(), TableMode::Share))
+                .collect();
+            // `CASCADE` on a key other tables' foreign keys depend on drops
+            // those keys: each such table is reloaded, ACCESS EXCLUSIVE.
+            if crate::core::rql::unique_key::dropped_constraint_cascades(description) {
+                set.extend(
+                    keys_depending_on_constraint(database, view.schema(), table, &name)
+                        .into_iter()
+                        .filter(|(child, _)| !child.eq_ignore_ascii_case(table))
+                        .map(|(child, _)| (child, TableMode::AccessExclusive)),
+                );
+            }
+            set
         }
         _ => Vec::new(),
     }

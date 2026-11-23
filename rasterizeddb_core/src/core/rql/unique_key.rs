@@ -900,6 +900,23 @@ pub fn dropped_constraint(description: &str) -> Result<(String, bool), String> {
     }
 }
 
+/// Whether `DROP CONSTRAINT [IF EXISTS] <name> [CASCADE | RESTRICT]` says
+/// `CASCADE`: the word after the name, so a constraint called "cascade" is
+/// a name and nothing more.
+pub fn dropped_constraint_cascades(description: &str) -> bool {
+    let Some(after) = starts_with_words(description, &["CONSTRAINT"]) else {
+        return false;
+    };
+    let rest = match starts_with_words(&description[after..], &["IF", "EXISTS"]) {
+        Some(end) => &description[after + end..],
+        None => &description[after..],
+    };
+    match split_constraint_name(&format!("CONSTRAINT {}", rest.trim_start())) {
+        Ok((Some(_), behaviour)) => behaviour.trim().trim_end_matches(';').trim_end().eq_ignore_ascii_case("CASCADE"),
+        _ => false,
+    }
+}
+
 /// Parses a table-level `UNIQUE (…)` or `PRIMARY KEY (…)` clause, with or
 /// without a leading `CONSTRAINT <name>`.
 ///
@@ -1099,6 +1116,34 @@ fn key_column(item: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `CASCADE` is the word after the name, whatever the name is.
+    #[test]
+    fn drop_constraint_reads_cascade_after_the_name() {
+        for given in [
+            "CONSTRAINT t1_pkey CASCADE",
+            "CONSTRAINT IF EXISTS t1_pkey cascade",
+            "CONSTRAINT \"My Key\" CASCADE;",
+            "CONSTRAINT \"cascade\" CASCADE",
+            "CONSTRAINT cascade CASCADE",
+        ] {
+            assert!(dropped_constraint_cascades(given), "{given}");
+        }
+        for given in [
+            "CONSTRAINT t1_pkey",
+            "CONSTRAINT t1_pkey RESTRICT",
+            "CONSTRAINT IF EXISTS t1_pkey",
+            "CONSTRAINT \"cascade\"",
+            "CONSTRAINT cascade",
+            "CONSTRAINT \"a CASCADE\"",
+            "CONSTRAINT",
+            "",
+        ] {
+            assert!(!dropped_constraint_cascades(given), "{given}");
+        }
+        // The name is read the same with or without the word.
+        assert_eq!(dropped_constraint("CONSTRAINT IF EXISTS t1_pkey CASCADE").unwrap(), ("t1_pkey".to_string(), true));
+    }
 
     #[test]
     fn a_record_round_trips() {
