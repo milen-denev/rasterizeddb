@@ -81,8 +81,9 @@ D1 and D6.
 | D7 | HA before phase 3 | Allow the **existing replication one-way per shard** as a warm standby with manual failover. It is statement-based, with known divergence risks (§4.3 B1a.13). The alternative is RF1 plus S3 restore. |
 | D8 | Default for a statement with no route key (`unrouted`, B1b) | **`refuse` by default.** Turn on `fan_out` per role (reporting, admin) or per gateway where the app expects it. A forgotten key then surfaces as an error instead of a silent whole-cluster scan. `unrouted_writes = each_shard` is never a gateway-wide default, because it is not atomic before 2PC |
 | D9 | User-based routing (G11): which modes, and the default | Build **both modes**. `user_routing = off` by default, `prefer` where tenants log in as their own roles. `user_key` is the one to choose when the data has a tenant column, because moves and fan-out keep working. `user_shard` is for apps whose tables have no tenant column |
-| D10 | Licensing | **Decided 2026-11-23:** a dual licence. An organisation with **more than 100 employees, or more than 1 million in revenue, or more than 5 million in assets** must obtain a licence from **Denev Operations EOOD**, the licensor. Engineering items and the caveat are in §10 |
+| D10 | Licensing | **Decided 2026-11-23:** only the service and enterprise features are dual-licensed: `tenant_isolation`, `segregation_policies` and G11 user routing, in their engine and gateway parts. Everything else stays GPL-3.0-only: the engine, partitioning, sharding, `rasterizeddb_router`, the gateway's routing, the client/ORM, R-ALL replication, and the T0 security fixes. Under the dual licence, an organisation with more than 100 employees, more than 1 million in revenue or more than 5 million in assets must obtain a licence from **Denev Operations EOOD**. The layout this needs is in §10 |
 | D11 | HA for customer databases | **Decided 2026-11-23:** replication covers **every database in an instance, any number of them**, not only the default one. The work items are in §4.10 (R-ALL) |
+| D12 | Are the dual-licensed features in the default build? | **No (recommended).** They break the "default all features" rule on purpose: the default binary and images stay pure GPL, and a separate `enterprise` build (binary, Docker tag, package) carries them. Then nobody runs licensed code without choosing to |
 
 ## 2. Cargo features
 
@@ -101,9 +102,10 @@ The convention, from [[new-features-behind-cargo-features]] and
 | `rasterizeddb_client_derive` | none | emits `Model::SHARD` and `shard_key()` for every model; plain data with no routing code, so a client built without `sharding` still compiles derived models | none | — |
 | `rasterizeddb_core` | `sharding` | `core/shard/*` (map, ownership log, admission, `Classify`, the shard side of rshard, the virtual-session backend endpoint), the ownership guard, `--role shard`/`--cluster-map`/`--shard-id`, `SHOW SHARDS`, cluster DDL | none (rastcp, rustls and `rasterizeddb_router` cover it) | yes; dormant without `--role` |
 | **`rasterizeddb_gateway`** (new binary crate) | `tls` (default), `native` (default), `fanout` (default from 1b) | the gateway (§4.9). **Does not depend on `rasterizeddb_core`**: no engine, no parser, no catalogue | `rastcp`, `rasterizeddb_router`, `tokio`, `rustls` (all already in the tree) | its own binary, built only when asked |
-| `rasterizeddb_core` | `tenant_isolation` | the tenant-safe mode T1–T10 (§4.10): process-admin split, scoped introspection, per-tenant limits, the tenant directory, `CREATE TENANT`; `--tenant-mode strict` | none | yes; dormant until `--tenant-mode strict` |
-| `rasterizeddb_core` | `segregation_policies` = `["sharding"]` | shard labels, placement policies, enforcement at the authority and the shard, the placement audit | none | yes; dormant until `placement_policies = enforce` |
-| `rasterizeddb_gateway` | `user_routing`, `tenant_isolation`, `segregation` | G11; database-as-a-service routing (`tenancy = database`); policy checks on gateway labels | none | yes; each dormant until configured |
+| `rasterizeddb_core` | none (GPL) | the **hook traits** the licensed crates implement: `TenancyPolicy` (admission, introspection scope, limits, process-admin split) and `PlacementPolicy`, plus the T0 security fixes. The default implementation is today's behaviour. Small, and always built | none | always |
+| **`rasterizeddb_enterprise`** (new crate, **dual-licensed**) | `tenant_isolation`, `segregation_policies` | T1–T10, `CREATE TENANT`, the tenant directory, shard labels, placement policies, the placement audit. Depends on `rasterizeddb_core` and implements its hooks | none | not in default (D12) |
+| **`rasterizeddb_gateway_enterprise`** (new crate, **dual-licensed**) | `user_routing`, `tenant_isolation`, `segregation` | G11, `tenancy = database`, gateway label checks. Depends on `rasterizeddb_gateway`'s hook traits, never on core | none | not in default (D12) |
+| **`rasterizeddb_server`** (new binary crate, GPL) | `enterprise` = `["dep:rasterizeddb_enterprise"]` | today's `rasterizeddb_core/src/main.rs`, moved, with its binary still named `rasterizeddb_core` so deploy scripts, Docker and the Arch package keep working. With `enterprise`, it installs the licensed hooks at startup | — | `enterprise` off by default |
 | `rasterizeddb_core` | `sharding_raft` = `["sharding", "dep:openraft"]` | phase 3: log store, state machine, capture sink, apply loop, ReadIndex, learners | `openraft` (exact pin) | after phase 3's gate |
 | `rasterizeddb_core` | `sharding_2pc` = `["sharding_raft"]` | phase 5: Prepared outcome writers, `__dist_txn`, the recovery driver | none | after phase 5's gate |
 
@@ -1197,9 +1199,9 @@ switch, dormant until configured.
 
 | Model | Cargo feature | Runtime switch | Needs |
 |---|---|---|---|
-| **Database as a service** (one database per customer, strict isolation) | `tenant_isolation`, in core and in the gateway | core `--tenant-mode strict` (`off` by default); gateway `tenancy = database` | Works on **one** shard too (a single server plus gateway); sharding spreads customers over shards |
-| **Enterprise segregation** (placement by policy) | `segregation_policies` = `["sharding"]` in core; `segregation` in the gateway | `placement_policies = enforce` (`off` by default) | The authority and moves (B2); `tenant_isolation` when policies apply to databases |
-| (base for both) user routing, `user_key`/`user_shard` | `user_routing` in the gateway | `user_routing = off \| prefer \| require` (G11) | — |
+| **Database as a service** (one database per customer, strict isolation) | `tenant_isolation` in `rasterizeddb_enterprise` and `rasterizeddb_gateway_enterprise` (dual-licensed, §10) | core `--tenant-mode strict` (`off` by default); gateway `tenancy = database` | Works on **one** shard too (a single server plus gateway); sharding spreads customers over shards |
+| **Enterprise segregation** (placement by policy) | `segregation_policies` (needs `sharding`) in `rasterizeddb_enterprise`; `segregation` in `rasterizeddb_gateway_enterprise` (dual-licensed, §10) | `placement_policies = enforce` (`off` by default) | The authority and moves (B2); `tenant_isolation` when policies apply to databases |
+| (base for both) user routing, `user_key`/`user_shard` | `user_routing` in `rasterizeddb_gateway_enterprise` (dual-licensed, §10) | `user_routing = off \| prefer \| require` (G11) | — |
 
 **The security floor comes first, in every build.** An isolation audit on
 2026-11-23 found that today **any login role can make itself superuser**.
@@ -1508,35 +1510,87 @@ covers the growth path.
   status decoders are `status.rs:590`/`:1584`; the table write paths are as
   in §4.3 here.
 
-## 10. Licensing (D10, decided 2026-11-23)
+## 10. Licensing (D10 and D12, decided 2026-11-23)
 
-**The owner's decision.** The software ships under a dual licence. An
-organisation with **more than 100 employees**, **more than 1 million in
-revenue**, or **more than 5 million in assets** must obtain a licence from
-**Denev Operations EOOD**, which is responsible for licensing.
+**The owner's decision.**
+- **Dual-licensed:** only the service and enterprise features:
+  - `tenant_isolation` (database as a service, T1–T10, `CREATE TENANT`);
+  - `segregation_policies` (labels, placement policies, audit);
+  - G11 user routing.
+
+  Each covers its engine part and its gateway part. An organisation with
+  **more than 100 employees, more than 1 million in revenue or more than 5
+  million in assets** must obtain a licence from **Denev Operations EOOD**,
+  which is responsible for licensing.
+- **Everything else stays GPL-3.0-only, as today:**
+  - the engine, partitioning and sharding;
+  - `rasterizeddb_router`, the gateway's routing and relay;
+  - the client and ORM;
+  - R-ALL replication;
+  - the T0 security fixes. T0 is a security floor for every user, never a
+    paid feature.
+
+**The code layout this needs.** A licence boundary has to be a crate
+boundary. One crate mixing GPL and licensed code is hard to reason about
+and hard to distribute.
+
+```
+rasterizeddb_core (GPL)                 hook traits: TenancyPolicy, PlacementPolicy; default impl = today
+   ▲                ▲
+   │                └── rasterizeddb_enterprise (dual)          T1–T10, CREATE TENANT, labels, policies, audit
+   │                          ▲
+rasterizeddb_server (GPL)  ───┘ only with feature `enterprise`  the binary, still named rasterizeddb_core
+rasterizeddb_gateway (GPL)              hook traits for routing by user/tenant/policy
+   ▲
+   └── rasterizeddb_gateway_enterprise (dual)                   G11, tenancy = database, gateway labels
+```
+
+- **Hooks live in core and are GPL.** The licensed crates only implement
+  them. Each hook is a trait object installed once at startup and read
+  through one load, so a build without them pays nothing measurable on the
+  statement path, and the plan's B-budgets are untouched.
+- **The binary moves out of core.** Today `rasterizeddb_core/src/main.rs` is
+  the server. A licensed crate that depends on core cannot also be linked
+  by core's own binary (a dependency cycle). So `main.rs` moves to
+  `rasterizeddb_server`, a thin binary crate whose binary keeps the name
+  `rasterizeddb_core`.
+- **Two artifacts (D12).**
+  - The default build is pure GPL.
+  - The `enterprise` build (`--features enterprise`) is the one that
+    contains licensed code, shipped as its own binary, Docker tag
+    (`…:<version>-enterprise`) and package (`rasterizeddb-enterprise-bin`).
 
 **Caveat for the owner's legal review (this is not legal advice):**
-- **GPL cannot carry a size limit.** Today every crate is `GPL-3.0-only`
-  (`LICENSE-GPL`, every `Cargo.toml`, the README). GPLv3 forbids adding
-  conditions such as a size threshold (its §7 and §10). While the code is
-  offered under GPL, a large organisation may use it under GPL without
-  buying a licence.
-- **The threshold needs a different free licence.** To make it binding, the
-  free licence would have to be a source-available licence that contains
-  the threshold, paired with the commercial licence. The PolyForm Small
-  Business licence is a published template close to this: under 100 people
-  and under USD 1M revenue, with no assets test.
-- **Released versions keep their licence.** Versions already released under
-  GPL, 1.0.0 included, stay available under GPL.
-- **Currency.** The thresholds need a currency (EUR or USD) and a
-  measurement rule (group or affiliate counting, which year).
+- **A GPL threshold is not enforceable.** The threshold must sit in the
+  dual-licensed crates' free licence, which therefore cannot be GPL. It
+  would be a source-available licence such as PolyForm Small Business, or a
+  custom one, paired with the commercial licence.
+- **The combined binary needs a GPL linking exception.** The `enterprise`
+  binary combines GPL core with code under that licence, and GPLv3 does not
+  allow that combination by default. As the copyright holder, Denev
+  Operations EOOD can add an **additional permission** to the core's GPL
+  (GPLv3 §7) allowing it to be combined with the dual-licensed crates. The
+  lawyer should draft that wording.
+- **Copyright ownership.** All 2,518 commits are by the owner, with AI
+  co-author trailers on many. The copyright should be assigned to Denev
+  Operations EOOD (the licensor), and the lawyer should say how they treat
+  the AI-assisted parts.
+- **Dependencies are no obstacle.** All 739 third-party crates are
+  permissive or offer a permissive option, and `option-ext` is MPL-2.0
+  (file-level, unmodified).
+- **Thresholds need a currency** (EUR or USD) and a counting rule: group or
+  affiliates, which year.
+- **Releases keep their licence.** Nothing released so far contains these
+  features, so no GPL release is affected.
 
 **Engineering items, on the owner's word:**
 
 | # | Item |
 |---|---|
-| L1 | Licence files: the chosen free licence and `LICENSE-COMMERCIAL` (contact: Denev Operations EOOD), at the root and in every published crate |
-| L2 | `license` / `license-file` in every `Cargo.toml` (an SPDX `LicenseRef-…` for a custom licence), docker images' labels, the Arch package |
-| L3 | README and docs: the threshold and how to obtain a licence |
-| L4 | Scope: whether the dual licence covers the whole project or only the service and enterprise features (`tenant_isolation`, `segregation_policies`, the gateway). Each is its own Cargo feature, so either is possible |
-| L5 | No licence-enforcement code (keys, phone-home) is planned. If wanted, it is a separate design, and it would conflict with a GPL grant |
+| L1 | The hook traits in core (GPL), with today's behaviour as the default; the T0 fixes stay in core |
+| L2 | Move `main.rs` into `rasterizeddb_server`, keeping the binary name; update `deploy.sh`, `docker/`, `packaging/` and the PGO/BOLT release workflows to build that crate |
+| L3 | Create `rasterizeddb_enterprise` and `rasterizeddb_gateway_enterprise`, each with its own `LICENSE` (the threshold licence) and `LICENSE-COMMERCIAL` (contact: Denev Operations EOOD), plus `license = "LicenseRef-…"` in their `Cargo.toml`; mark them `publish = false` until decided |
+| L4 | The GPL additional-permission text, once drafted by the lawyer, in `LICENSE-GPL`'s companion file and in the core crates' `Cargo.toml` (`GPL-3.0-only WITH LicenseRef-…-exception`) |
+| L5 | SPDX headers in every file of the licensed crates; a CI check that no file under a GPL crate imports from them and that the default build links neither (`cargo tree -e normal` on the default features) |
+| L6 | README and docs: which features are dual-licensed, the threshold, how to obtain a licence; `SHOW VERSION` reports `enterprise` when it is built in |
+| L7 | No licence-enforcement code (keys, phone-home) is planned. If wanted, it is a separate design |
