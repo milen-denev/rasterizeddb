@@ -288,7 +288,10 @@ const SITES: &[Site] = &[
     ),
     site("CREATE INDEX site_p_l ON site_p USING hash (label)", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
     site("DROP INDEX site_p_l", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
-    site("ALTER TABLE site_p DROP CONSTRAINT site_p_kn", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
+    // An index `CREATE UNIQUE INDEX` made is dropped as one, as in
+    // PostgreSQL, whose DROP CONSTRAINT does not know it.
+    site("ALTER TABLE site_p DROP CONSTRAINT site_p_kn", Expect::Error("42704"), "an index, not a constraint"),
+    site("DROP INDEX site_p_kn", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
     site("DROP INDEX site_p_n", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
     site("DROP INDEX IF EXISTS site_p_n", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
     site(

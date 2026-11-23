@@ -781,6 +781,7 @@ async fn database_stats(database: &Arc<Database>) -> Result<Vec<Row>, String> {
     let mut vacuum_panics = 0u64;
     let mut foreign_keys = 0usize;
     let mut unique_keys = 0usize;
+    let mut unique_indexes = 0usize;
     let mut json_columns = 0usize;
     let mut column_count = 0usize;
     let mut table_count = 0usize;
@@ -815,7 +816,12 @@ async fn database_stats(database: &Arc<Database>) -> Result<Vec<Row>, String> {
         unique_keys += schema
             .unique_keys
             .iter()
-            .filter(|k| !k.is_deleted)
+            .filter(|k| !k.is_deleted && !k.is_index())
+            .count();
+        unique_indexes += schema
+            .unique_keys
+            .iter()
+            .filter(|k| !k.is_deleted && k.is_index())
             .count();
         json_columns += schema
             .json_columns
@@ -931,6 +937,11 @@ async fn database_stats(database: &Arc<Database>) -> Result<Vec<Row>, String> {
         "unique_constraints",
         unique_keys.to_string(),
         "table-level UNIQUE constraints",
+    );
+    push(
+        "unique_indexes",
+        unique_indexes.to_string(),
+        "unique indexes CREATE UNIQUE INDEX made",
     );
     push(
         "json_columns",
@@ -1564,9 +1575,13 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
         "document paths carried by the filter index",
     );
 
+    // A key `CREATE UNIQUE INDEX` made (or a partial one) is an index, as
+    // `DROP INDEX` and `pg_constraint` have it (`UniqueKey::is_index`); one
+    // `ADD CONSTRAINT … UNIQUE` declared, or stored before the mark, keeps
+    // the label it always had.
     for key in schema.unique_keys.iter().filter(|k| !k.is_deleted) {
         push(
-            "unique_constraint",
+            if key.is_index() { "unique_index" } else { "unique_constraint" },
             format!("{} ({})", key.name, key.columns.join(", ")),
             "",
         );

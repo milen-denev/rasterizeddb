@@ -2207,6 +2207,10 @@ fn escape(text: &str) -> String {
 mod catalog_partition_tests;
 
 #[cfg(test)]
+#[path = "unique_index_origin_tests.rs"]
+mod unique_index_origin_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

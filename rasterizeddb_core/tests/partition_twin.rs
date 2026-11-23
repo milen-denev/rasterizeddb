@@ -1642,8 +1642,14 @@ impl Gen {
                     ];
                     return Op { kind, step: Step::Sequence(inner), ordered: false };
                 }
-                let name = if self.rng.bool() { "{t}_uq" } else { "{t}_uq2" };
-                self.simple(kind, format!("ALTER TABLE {{t}} DROP CONSTRAINT {name}"))
+                // `{t}_uq` is the index `CREATE UNIQUE INDEX` made, which
+                // `DROP INDEX` drops, as in PostgreSQL; `{t}_uq2` is a
+                // constraint.
+                if self.rng.bool() {
+                    self.simple(kind, "DROP INDEX {t}_uq".into())
+                } else {
+                    self.simple(kind, "ALTER TABLE {t} DROP CONSTRAINT {t}_uq2".into())
+                }
             }
             UniqueWithoutKey => {
                 if self.rng.bool() {

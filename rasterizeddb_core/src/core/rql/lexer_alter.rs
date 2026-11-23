@@ -967,7 +967,8 @@ pub fn parse_drop_table(sql: &str) -> Result<(String, bool), String> {
 }
 
 /// Rewrites `CREATE UNIQUE INDEX name ON t (cols)` as the equivalent
-/// `ALTER TABLE t ADD CONSTRAINT name UNIQUE (cols)`.
+/// `ALTER TABLE t ADD CONSTRAINT name UNIQUE (cols) AS INDEX`, the key the
+/// engine enforces marked as an index (`unique_key::AS_INDEX`).
 ///
 /// A unique index is a **constraint**, not merely an access path, so treating
 /// it like other index DDL silently dropped a guarantee the schema asked for —
@@ -1066,12 +1067,16 @@ pub fn unique_index_as_constraint(sql: &str) -> Option<String> {
         .windows(3)
         .any(|w| w == ["NULLS", "NOT", "DISTINCT"]);
 
+    // `AS INDEX` marks the key as the index it was created as
+    // (`unique_key::AS_INDEX`): `DROP INDEX` drops it and `DROP CONSTRAINT`
+    // does not know it, as in PostgreSQL.
     Some(format!(
-        "ALTER TABLE {} ADD CONSTRAINT {}{} UNIQUE ({}){}{}",
+        "ALTER TABLE {} ADD CONSTRAINT {}{} UNIQUE ({}) {}{}{}",
         table,
         if if_not_exists { "IF NOT EXISTS " } else { "" },
         name,
         columns,
+        crate::core::rql::unique_key::AS_INDEX,
         if nulls { " NULLS NOT DISTINCT" } else { "" },
         match predicate {
             Some(p) => format!(" WHERE {}", p),
@@ -1711,7 +1716,7 @@ mod tests {
         assert!(no_op_reason("CREATE UNIQUE INDEX idx ON t (a)").is_none());
         assert_eq!(
             unique_index_as_constraint("CREATE UNIQUE INDEX idx ON t (a, b)").as_deref(),
-            Some("ALTER TABLE t ADD CONSTRAINT idx UNIQUE (a, b)")
+            Some("ALTER TABLE t ADD CONSTRAINT idx UNIQUE (a, b) AS INDEX")
         );
         // `IF NOT EXISTS` is carried through rather than dropped. Dropping it
         // made the second run of a migration fail with "constraint already
@@ -1719,18 +1724,18 @@ mod tests {
         // migration that seeds rows relies on to be re-runnable.
         assert_eq!(
             unique_index_as_constraint("CREATE UNIQUE INDEX IF NOT EXISTS \"mix é 1\" ON t (a)").as_deref(),
-            Some("ALTER TABLE t ADD CONSTRAINT IF NOT EXISTS \"mix é 1\" UNIQUE (a)")
+            Some("ALTER TABLE t ADD CONSTRAINT IF NOT EXISTS \"mix é 1\" UNIQUE (a) AS INDEX")
         );
         assert_eq!(
             unique_index_as_constraint("CREATE UNIQUE INDEX 名 ON t (a)").as_deref(),
-            Some("ALTER TABLE t ADD CONSTRAINT 名 UNIQUE (a)")
+            Some("ALTER TABLE t ADD CONSTRAINT 名 UNIQUE (a) AS INDEX")
         );
         assert_eq!(
             unique_index_as_constraint(
                 "CREATE UNIQUE INDEX IF NOT EXISTS \"idx\" ON \"t\" (\"a\")"
             )
             .as_deref(),
-            Some("ALTER TABLE t ADD CONSTRAINT IF NOT EXISTS idx UNIQUE (\"a\")")
+            Some("ALTER TABLE t ADD CONSTRAINT IF NOT EXISTS idx UNIQUE (\"a\") AS INDEX")
         );
         // Without the clause it must stay intolerant: a name already in use is
         // an error, because the second constraint may cover different columns.
@@ -1748,7 +1753,7 @@ mod tests {
         // key over every row instead would reject rows PostgreSQL accepts.
         assert_eq!(
             unique_index_as_constraint("CREATE UNIQUE INDEX i ON t (a) WHERE b IS NULL").as_deref(),
-            Some("ALTER TABLE t ADD CONSTRAINT i UNIQUE (a) WHERE b IS NULL")
+            Some("ALTER TABLE t ADD CONSTRAINT i UNIQUE (a) AS INDEX WHERE b IS NULL")
         );
         assert!(no_op_reason("CREATE UNIQUE INDEX i ON t (a) WHERE b IS NULL").is_none());
         // A constraint written on ADD COLUMN is the action after it, tagged
@@ -1807,7 +1812,7 @@ mod tests {
         // dropped here, the index enforced NULLs as distinct.
         assert_eq!(
             unique_index_as_constraint("CREATE UNIQUE INDEX i ON t (a, b) nulls not distinct WHERE c").as_deref(),
-            Some("ALTER TABLE t ADD CONSTRAINT i UNIQUE (a, b) NULLS NOT DISTINCT WHERE c")
+            Some("ALTER TABLE t ADD CONSTRAINT i UNIQUE (a, b) AS INDEX NULLS NOT DISTINCT WHERE c")
         );
         // `pg_dump`'s spelling: a method, and a predicate in parentheses. The
         // column list ends at its own parenthesis, not the predicate's.
@@ -1816,14 +1821,14 @@ mod tests {
                 "CREATE UNIQUE INDEX users_email_live ON public.users USING btree (email) WHERE (deleted_at IS NULL);"
             )
             .as_deref(),
-            Some("ALTER TABLE public.users ADD CONSTRAINT users_email_live UNIQUE (email) WHERE (deleted_at IS NULL)")
+            Some("ALTER TABLE public.users ADD CONSTRAINT users_email_live UNIQUE (email) AS INDEX WHERE (deleted_at IS NULL)")
         );
         assert_eq!(
             unique_index_as_constraint(
                 "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS p ON ONLY pages (tenant_id, slug) WHERE active"
             )
             .as_deref(),
-            Some("ALTER TABLE pages ADD CONSTRAINT IF NOT EXISTS p UNIQUE (tenant_id, slug) WHERE active")
+            Some("ALTER TABLE pages ADD CONSTRAINT IF NOT EXISTS p UNIQUE (tenant_id, slug) AS INDEX WHERE active")
         );
         // A plain partial index still constrains nothing and is set aside,
         // saying so.

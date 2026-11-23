@@ -643,13 +643,15 @@ async fn constraint_names_are_stored_as_given_and_dropped_by_them() {
             schema.checks.iter().filter(|c| !c.is_deleted).map(|c| c.name.clone()).collect(),
         )
     };
-    let names = ["my key", "名", "検", "mix é 1"];
+    // The unique index's name is the table's own: an index name is the
+    // database's, as in PostgreSQL, and `DROP INDEX` names no table.
+    let names = |t: &str| ["my key".to_string(), "名".to_string(), "検".to_string(), format!("mix é {t}")];
     for t in ["pl", "pk"] {
         exec(&db, &format!("INSERT INTO {t} (a, c, d, e) VALUES (1, 10, 100, 1000), (2, 20, 200, 2000)")).await;
         exec(&db, &format!("ALTER TABLE {t} ADD CONSTRAINT \"my key\" UNIQUE (a, d)")).await;
         exec(&db, &format!("ALTER TABLE {t} ADD CONSTRAINT \"名\" UNIQUE (a, e)")).await;
         exec(&db, &format!("ALTER TABLE {t} ADD CONSTRAINT \"検\" UNIQUE (a, d, e)")).await;
-        exec(&db, &format!("CREATE UNIQUE INDEX IF NOT EXISTS \"mix é 1\" ON {t} (a, c, d)")).await;
+        exec(&db, &format!("CREATE UNIQUE INDEX IF NOT EXISTS \"mix é {t}\" ON {t} (a, c, d)")).await;
         exec(&db, &format!("ALTER TABLE {t} ADD CONSTRAINT IF NOT EXISTS \"名\" UNIQUE (a, e)")).await;
         exec(&db, &format!("ALTER TABLE {t} ADD CONSTRAINT \"my check\" CHECK (d >= 0)")).await;
         exec(&db, &format!("ALTER TABLE {t} ADD CONSTRAINT 検査 CHECK (e >= 0)")).await;
@@ -658,7 +660,8 @@ async fn constraint_names_are_stored_as_given_and_dropped_by_them() {
     let db = open(d).await;
     for t in ["pl", "pk"] {
         let (uniques, checks) = declared(&db, t);
-        for n in names {
+        let names = names(t);
+        for n in &names {
             assert_eq!(uniques.iter().filter(|u| *u == n).count(), 1, "{t}: {n:?} in {uniques:?}");
         }
         for n in ["my check", "検査"] {
@@ -668,13 +671,20 @@ async fn constraint_names_are_stored_as_given_and_dropped_by_them() {
         assert!(e.to_ascii_lowercase().contains("duplicate"), "{t}: {e}");
         let e = try_exec(&db, &format!("INSERT INTO {t} (a, c, d, e) VALUES (1, 12, 5, 1000)")).await.expect_err("名");
         assert!(e.to_ascii_lowercase().contains("duplicate"), "{t}: {e}");
-        for n in names {
-            exec(&db, &format!("ALTER TABLE {t} DROP CONSTRAINT \"{n}\"")).await;
+        // "mix é <t>" is the index `CREATE UNIQUE INDEX` made, which only
+        // `DROP INDEX` drops, as in PostgreSQL.
+        for n in &names {
+            let drop = if n.starts_with("mix é") {
+                format!("DROP INDEX \"{n}\"")
+            } else {
+                format!("ALTER TABLE {t} DROP CONSTRAINT \"{n}\"")
+            };
+            exec(&db, &drop).await;
         }
         exec(&db, &format!("ALTER TABLE {t} DROP CONSTRAINT \"my check\"")).await;
         exec(&db, &format!("ALTER TABLE {t} DROP CONSTRAINT 検査")).await;
         let (uniques, checks) = declared(&db, t);
-        assert!(!uniques.iter().any(|u| names.contains(&u.as_str())), "{t}: {uniques:?} after the drops");
+        assert!(!uniques.iter().any(|u| names.contains(u)), "{t}: {uniques:?} after the drops");
         assert!(!checks.iter().any(|c| c == "my check" || c == "検査"), "{t}: {checks:?} after the drops");
         // The keys are gone, so the rows they refused go in.
         exec(&db, &format!("INSERT INTO {t} (a, c, d, e) VALUES (1, 11, 100, -1)")).await;

@@ -876,8 +876,15 @@ fn table_indexes(
                     .unwrap_or_default()
             ),
         });
-        // A unique index under a predicate is an index, not a constraint.
-        if unique && predicate.is_none() {
+        // A unique index under a predicate is an index, not a constraint, and
+        // so is one `CREATE UNIQUE INDEX` made: PostgreSQL gives either no
+        // `pg_constraint` row, and psql's `\d` lists it as `UNIQUE`, not
+        // `UNIQUE CONSTRAINT`.
+        let made_as_index = schema
+            .unique_keys
+            .iter()
+            .any(|k| !k.is_deleted && k.from_index && k.name.eq_ignore_ascii_case(&index_name));
+        if unique && predicate.is_none() && !made_as_index {
             constraints.push(Constraint {
                 oid: oid_of(&format!("{name}.{index_name}.con")),
                 name: index_name.clone(),

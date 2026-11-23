@@ -3750,6 +3750,7 @@ impl Studio {
             return Task::none();
         };
         let sql = dialect::indexes_sql(session.flavor, &table);
+        let fallback = dialect::indexes_fallback_sql(session.flavor, &table);
         let primary: Vec<String> = self
             .columns
             .iter()
@@ -3759,7 +3760,13 @@ impl Studio {
         Task::perform(
             async move {
                 let primary: Vec<&str> = primary.iter().map(String::as_str).collect();
-                let result = session.query(&sql).await.map(|g| dialect::parse_indexes(&g, &primary));
+                // A server that cannot answer the owners' join is read as
+                // before: `pg_indexes` alone.
+                let grid = match (session.query(&sql).await, fallback) {
+                    (Err(_), Some(fallback)) => session.query(&fallback).await,
+                    (result, _) => result,
+                };
+                let result = grid.map(|g| dialect::parse_indexes(&g, &primary));
                 (table, result)
             },
             |(table, result)| Message::IndexesLoaded(table, result),

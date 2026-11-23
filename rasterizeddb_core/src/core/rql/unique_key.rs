@@ -46,6 +46,16 @@
 //! [`crate::core::index::for_schema`]) holds every row, so the planner may use
 //! it for any query, as it would any other index: it can never miss a row a
 //! query asks for.
+//!
+//! # A unique index is not a constraint
+//!
+//! `CREATE UNIQUE INDEX` is kept as a key too, and PostgreSQL tells the two
+//! apart: an index has no `pg_constraint` row, `DROP INDEX` drops it, and
+//! `ALTER TABLE … DROP CONSTRAINT` does not know it (42704). A key records
+//! which it was ([`UniqueKey::from_index`]) in the last byte of its name slot,
+//! which a name never reaches (at most 128 bytes, then a NUL that a reader
+//! never needs). A build that predates the mark ignores the byte and reads the
+//! key as a constraint, which is what every key written before the mark is.
 
 use std::io;
 
@@ -76,6 +86,20 @@ const FLAG_DELETED: u8 = 1;
 const FLAG_PARTIAL: u8 = 2;
 const FLAG_PREDICATE: u8 = 3;
 
+/// Where a key's record marks that `CREATE UNIQUE INDEX` made it: the last
+/// byte of the name slot, which [`write_name`] never fills.
+const ORIGIN_AT: usize = 128;
+/// The mark: made by `CREATE UNIQUE INDEX`. Zero, what every record before
+/// the mark holds there, is a constraint.
+const ORIGIN_INDEX: u8 = 1;
+
+/// The words [`crate::core::rql::lexer_alter::unique_index_as_constraint`]
+/// writes after a key's column list to say the key is an index: `ALTER TABLE
+/// t ADD CONSTRAINT i UNIQUE (a) AS INDEX`. Not PostgreSQL syntax, like the
+/// `WHERE` a partial key carries; it travels with the statement's text, so a
+/// replica keeps the mark too.
+pub const AS_INDEX: &str = "AS INDEX";
+
 /// One table-level `UNIQUE` constraint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UniqueKey {
@@ -89,6 +113,11 @@ pub struct UniqueKey {
     pub predicate: Option<String>,
     /// The predicate compiled against the table's columns, made on first use.
     pub compiled: CompiledPredicate,
+    /// Made by `CREATE UNIQUE INDEX` rather than declared as a constraint:
+    /// `DROP INDEX` drops it, `DROP CONSTRAINT` does not know it, and the
+    /// catalogues list an index with no constraint. A key stored before the
+    /// mark existed reads `false`, a constraint, as it always did.
+    pub from_index: bool,
 }
 
 /// A partial key's predicate, compiled once per loaded schema.
@@ -166,7 +195,15 @@ impl UniqueKey {
             is_deleted: false,
             predicate: None,
             compiled: CompiledPredicate::default(),
+            from_index: false,
         }
+    }
+
+    /// Whether `DROP INDEX` drops this key: one `CREATE UNIQUE INDEX` made. A
+    /// partial key always counts, as one written before the mark existed
+    /// still is: only `CREATE UNIQUE INDEX` ever made one.
+    pub fn is_index(&self) -> bool {
+        self.from_index || self.predicate.is_some()
     }
 
     /// The predicate, compiled against `fields`; `Ok(None)` for a key that
@@ -438,6 +475,9 @@ impl UniqueKey {
     pub fn into_vec(&self) -> Vec<u8> {
         let mut out = vec![0u8; UNIQUE_KEY_SIZE as usize];
         write_name(&mut out, 0, &self.name);
+        if self.from_index {
+            out[ORIGIN_AT] = ORIGIN_INDEX;
+        }
         for (i, column) in self.columns.iter().take(MAX_COLUMNS).enumerate() {
             write_name(&mut out, 129 + i * 129, column);
         }
@@ -529,6 +569,7 @@ fn decode(raw: &[u8]) -> Result<Record, String> {
         is_deleted: flag != FLAG_LIVE && flag != FLAG_PARTIAL,
         predicate: (flag == FLAG_PARTIAL).then(String::new),
         compiled: CompiledPredicate::default(),
+        from_index: raw[ORIGIN_AT] == ORIGIN_INDEX,
     }))
 }
 
@@ -675,6 +716,17 @@ pub fn stage<S: StorageIO>(
 /// fixed-stride array. A partial key's predicate record stays too; with the key
 /// tombstoned, `load` no longer pairs it with anything.
 pub async fn remove<S: StorageIO>(schema_io: Arc<S>, name: &str) -> io::Result<bool> {
+    remove_matching(schema_io, name, |_| true).await
+}
+
+/// [`remove`], of a key `which` accepts only: `DROP CONSTRAINT` leaves a key
+/// `CREATE UNIQUE INDEX` made, and `DROP INDEX` a constraint, though the two
+/// share a sidecar.
+pub async fn remove_matching<S: StorageIO>(
+    schema_io: Arc<S>,
+    name: &str,
+    which: impl Fn(&UniqueKey) -> bool,
+) -> io::Result<bool> {
     let io = schema_io.create_new(sidecar_name(&schema_io)).await;
     let len = io.get_len().await;
     if len < UNIQUE_KEY_SIZE {
@@ -696,7 +748,7 @@ pub async fn remove<S: StorageIO>(schema_io: Arc<S>, name: &str) -> io::Result<b
         let Ok(mut key) = UniqueKey::from_vec(&buffer) else {
             continue;
         };
-        if key.is_deleted || !key.name.eq_ignore_ascii_case(name) {
+        if key.is_deleted || !key.name.eq_ignore_ascii_case(name) || !which(&key) {
             continue;
         }
         key.is_deleted = true;
@@ -972,6 +1024,14 @@ pub fn parse_clause(clause: &str, table: &str) -> Result<Option<UniqueKey>, Stri
     // `UNIQUE (…) WHERE pred` is the form `CREATE UNIQUE INDEX … WHERE pred`
     // is rewritten into: a partial key.
     let tail = rest[close + 1..].trim();
+    // `… (cols) AS INDEX`, right after the columns: what `CREATE UNIQUE
+    // INDEX` is rewritten into. Taken off before the `WHERE` is looked for,
+    // which must start what is left: left on, the predicate was not read and
+    // a partial index held over every row.
+    let (tail, from_index) = match strip_as_index(tail) {
+        Some(after) => (after, true),
+        None => (tail, false),
+    };
     let where_at = crate::core::rql::join::find_keyword(tail, "WHERE", 0);
     nulls_clause(&tail[..where_at.unwrap_or(tail.len())])?;
     let predicate = match where_at {
@@ -1004,8 +1064,24 @@ pub fn parse_clause(clause: &str, table: &str) -> Result<Option<UniqueKey>, Stri
     });
     Ok(Some(UniqueKey {
         predicate,
+        from_index,
         ..UniqueKey::new(name, columns)
     }))
+}
+
+/// What follows [`AS_INDEX`] when `text` starts with it (as words, in any
+/// case), trimmed.
+fn strip_as_index(text: &str) -> Option<&str> {
+    let after_as = text.get(..2).filter(|w| w.eq_ignore_ascii_case("AS")).map(|_| &text[2..])?;
+    if !after_as.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let after_as = after_as.trim_start();
+    let rest = after_as.get(..5).filter(|w| w.eq_ignore_ascii_case("INDEX")).map(|_| &after_as[5..])?;
+    if !(rest.is_empty() || rest.starts_with(char::is_whitespace)) {
+        return None;
+    }
+    Some(rest.trim_start())
 }
 
 /// Refuses `NULLS NOT DISTINCT` in the words around a key's column list.
@@ -1162,6 +1238,46 @@ mod tests {
             ],
         );
         assert_eq!(UniqueKey::from_vec(&key.into_vec()).unwrap(), key);
+    }
+
+    /// The mark `CREATE UNIQUE INDEX` leaves, in the byte after a name's
+    /// longest form: it round-trips, a key without it reads as a constraint
+    /// (every key written before it), and a reader that predates it reads
+    /// the same name and columns, a 128-byte name included.
+    #[test]
+    fn the_index_mark_round_trips_and_older_readers_ignore_it() {
+        let long = "n".repeat(128);
+        for name in ["ix", long.as_str()] {
+            let index = UniqueKey { from_index: true, ..UniqueKey::new(name.to_string(), vec!["a".into(), "b".into()]) };
+            let bytes = index.into_vec();
+            assert_eq!(bytes[ORIGIN_AT], ORIGIN_INDEX);
+            let back = UniqueKey::from_vec(&bytes).unwrap();
+            assert!(back.from_index && back.is_index(), "{name}");
+            assert_eq!((back.name.as_str(), back.columns.as_slice()), (name, index.columns.as_slice()));
+            // Without the mark: the bytes a build before it wrote.
+            let constraint = UniqueKey { from_index: false, ..index.clone() };
+            let old = constraint.into_vec();
+            assert_eq!(old[ORIGIN_AT], 0);
+            assert!(!UniqueKey::from_vec(&old).unwrap().from_index && !UniqueKey::from_vec(&old).unwrap().is_index());
+            // Only that byte differs, and it is past every name's end, so an
+            // older reader (the name up to its NUL, or 128 bytes) is unmoved.
+            let differ: Vec<usize> = (0..bytes.len()).filter(|&i| bytes[i] != old[i]).collect();
+            assert_eq!(differ, vec![ORIGIN_AT]);
+            assert_eq!(read_name(&bytes, 0).unwrap(), name);
+            // A tombstone keeps it; a partial key is an index either way.
+            let dropped = UniqueKey::from_vec(&UniqueKey { is_deleted: true, ..index.clone() }.into_vec()).unwrap();
+            assert!(dropped.is_deleted && dropped.from_index);
+        }
+        assert!(UniqueKey { predicate: Some("a > 0".into()), ..UniqueKey::new("p".into(), vec!["a".into()]) }.is_index());
+        // The clause the rewrite writes, and only that.
+        assert!(parsed("CONSTRAINT ix UNIQUE (a, b) AS INDEX").from_index);
+        assert!(parsed("CONSTRAINT ix UNIQUE (a) as index WHERE b IS NULL").from_index);
+        assert_eq!(parsed("CONSTRAINT ix UNIQUE (a) AS INDEX WHERE b IS NULL").predicate.as_deref(), Some("b IS NULL"));
+        assert!(!parsed("CONSTRAINT c UNIQUE (a, b)").from_index);
+        assert!(!parsed("UNIQUE (a) WHERE note = 'AS INDEX'").from_index);
+        assert!(!parsed("UNIQUE (a) WHERE note IS NULL").from_index);
+        assert!(parse_clause("CONSTRAINT ix UNIQUE (a) AS INDEX NULLS NOT DISTINCT", "t").is_err());
+        assert!(!parsed("CONSTRAINT ix UNIQUE (a) AS INDEXES").from_index);
     }
 
     #[test]
@@ -1608,13 +1724,14 @@ mod stored_name_tests {
                 is_deleted: false,
                 predicate: None,
                 compiled: Default::default(),
+                from_index: false,
             };
             let back = UniqueKey::from_vec(&key.into_vec()).unwrap();
             assert_eq!((back.name.as_str(), back.columns.as_slice()), (name, key.columns.as_slice()), "{name}");
         }
         // Cut within 128 bytes at a character boundary, never inside one.
         let long = "名".repeat(50);
-        let key = UniqueKey { name: long.clone(), columns: vec!["c".into()], is_deleted: false, predicate: None, compiled: Default::default() };
+        let key = UniqueKey { name: long.clone(), columns: vec!["c".into()], is_deleted: false, predicate: None, compiled: Default::default(), from_index: false };
         let back = UniqueKey::from_vec(&key.into_vec()).unwrap();
         assert!(long.starts_with(&back.name) && back.name.len() <= 128 && back.name.len() % 3 == 0);
         for (given, name, if_exists) in [
