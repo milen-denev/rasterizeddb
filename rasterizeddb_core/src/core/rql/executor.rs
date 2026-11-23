@@ -6818,50 +6818,58 @@ async fn delete_using_join(
     // statement with nothing applied.
     let mut seen: ahash::HashSet<Vec<u8>> =
         ahash::HashSet::with_capacity_and_hasher(rows.len(), Default::default());
-    let mut named_rows: Vec<(&crate::core::row::row::Row, String)> = Vec::with_capacity(rows.len());
+    let mut named_rows: Vec<(&crate::core::row::row::Row, String, Vec<String>)> = Vec::with_capacity(rows.len());
     for row in &rows {
         if row.columns.len() < width {
             return Err("the join returned no key".to_string());
         }
         let cells: Vec<&crate::core::row::row::Column> = row.columns[..width].iter().collect();
         if seen.insert(key.row_key(&cells)?) {
-            named_rows.push((row, key.predicate(&cells)?));
+            named_rows.push((row, key.predicate(&cells)?, key.literals(&cells)?));
         }
     }
+    let mut prepared: Vec<JoinedWrite> = Vec::with_capacity(named_rows.len());
+    for (row, named, key_literals) in named_rows {
+        let recheck = match &recheck_text {
+            Some(text) => {
+                let mut bindings: Vec<(String, String)> = Vec::with_capacity(recheck_refs.len());
+                for (offset, reference) in recheck_refs.iter().enumerate() {
+                    let carried = row
+                        .columns
+                        .get(width + offset)
+                        .ok_or_else(|| "the join returned fewer values than the delete needs".to_string())?;
+                    let literal = joined_literal(carried, scales.as_deref(), width + offset)
+                        .ok_or_else(|| "a joined value cannot be written back".to_string())?;
+                    bindings.push((reference.clone(), literal));
+                }
+                Some(substitute_outer_refs(&strip_qualifier(text, target_alias), &bindings))
+            }
+            None => None,
+        };
+        prepared.push(JoinedWrite { named, key_literals, values: Vec::new(), recheck });
+    }
+    let returning_text = match &returning_unqualified {
+        Some(r) => format!(" {}", r),
+        None => String::new(),
+    };
     let mut deleted = 0u64;
     let mut returned: Vec<u8> = Vec::new();
-    for (row, named) in named_rows {
-        let returning_text = match &returning_unqualified {
-            Some(r) => format!(" {}", r),
-            None => String::new(),
-        };
-        let key_only = format!("DELETE FROM {} WHERE {}{}", table, named, returning_text);
-        let mut bindings: Vec<(String, String)> = Vec::with_capacity(recheck_refs.len());
-        for (offset, reference) in recheck_refs.iter().enumerate() {
-            let carried = row
-                .columns
-                .get(width + offset)
-                .ok_or_else(|| "the join returned fewer values than the delete needs".to_string())?;
-            let literal = joined_literal(carried, scales.as_deref(), width + offset)
-                .ok_or_else(|| "a joined value cannot be written back".to_string())?;
-            bindings.push((reference.clone(), literal));
+    // A batch of rows to a statement, as `UPDATE … FROM` writes them and for
+    // the same reason: a statement per row paid a log sync per row.
+    let batching = returning.is_none() && !join_write_per_row_only(table);
+    for chunk in prepared.chunks(JOIN_WRITE_BATCH) {
+        if !batching || chunk.len() < 2 {
+            deleted +=
+                delete_each(table, chunk, &returning_text, returning.is_some(), &mut returned, database, depth, tx).await?;
+            continue;
         }
-        let with_recheck = match &recheck_text {
-            Some(text) => format!(
-                "DELETE FROM {} WHERE {} AND ({}){}",
-                table,
-                named,
-                substitute_outer_refs(&strip_qualifier(text, target_alias), &bindings),
-                returning_text
-            ),
-            None => key_only.clone(),
-        };
-        let response = run_per_row_write(with_recheck, key_only, database, depth, tx).await?;
+        let sql = format!("DELETE FROM {} WHERE {}", table, batch_key_filter(&key, chunk));
+        let response = run_per_row_write(sql.clone(), sql, database, depth, tx).await?;
         if response.first() == Some(&3u8) {
-            return Err(String::from_utf8_lossy(&response[1..]).to_string());
-        }
-        if returning.is_some() && response.first() == Some(&2u8) {
-            returned.extend_from_slice(&response[1..]);
+            let failed = String::from_utf8_lossy(&response[1..]).to_string();
+            let mut ignored = Vec::new();
+            delete_each(table, chunk, "", false, &mut ignored, database, depth, tx).await?;
+            return Err(failed);
         }
         // What the delete removed, not one per key: a row another transaction
         // deleted first, or one that no longer matches, counts nothing.
@@ -6967,13 +6975,16 @@ async fn update_from_join(
     // functions, and nothing that computes. The columns such an expression
     // reads are projected instead, and the expression is evaluated per row
     // once they are in hand.
-    let target_schema: Vec<crate::core::row::schema::SchemaField> = {
+    let (target_schema, target_modifiers): (
+        Vec<crate::core::row::schema::SchemaField>,
+        Vec<crate::core::rql::type_modifier::TypeModifier>,
+    ) = {
         let entry = database.table_for(table, owner(), TableMode::RowExclusive).await?;
         let handle = entry
             .as_ref()
             .clone()
             .ok_or_else(|| format!("relation '{}' does not exist", table))?;
-        handle.schema.fields.to_vec()
+        (handle.schema.fields.to_vec(), handle.schema.type_modifiers.clone())
     };
 
     let mut projection: Vec<String> = key.names().map(|k| format!("{}.{}", target_alias, k)).collect();
@@ -7159,30 +7170,25 @@ async fn update_from_join(
     // nothing applied.
     let mut seen: ahash::HashSet<Vec<u8>> =
         ahash::HashSet::with_capacity_and_hasher(rows.len(), Default::default());
-    let mut named_rows: Vec<(&crate::core::row::row::Row, String)> = Vec::with_capacity(rows.len());
+    let mut named_rows: Vec<(&crate::core::row::row::Row, String, Vec<String>)> = Vec::with_capacity(rows.len());
     for (row, _) in rows.iter().zip(&keep_row).filter(|(_, keep)| **keep) {
         let cells: Vec<&crate::core::row::row::Column> = row.columns[..width].iter().collect();
         if seen.insert(key.row_key(&cells)?) {
-            named_rows.push((row, key.predicate(&cells)?));
+            named_rows.push((row, key.predicate(&cells)?, key.literals(&cells)?));
         }
     }
-    let mut written = 0u64;
-    let mut returned: Vec<u8> = Vec::new();
-    // Each row is written by a statement of its own, which commits its
-    // storage transaction as it returns, and a later row can still fail this
-    // one (a CHECK, a key, a foreign key). An autocommit statement's writes
-    // may otherwise overwrite in place, which its abort cannot undo: the rows
-    // before the failure kept their new values.
-    database.transactions.forbid_in_place(tx);
-    for (row, named) in named_rows {
+
+    // Each row's write, as text, before any is run.
+    let mut prepared: Vec<JoinedWrite> = Vec::with_capacity(named_rows.len());
+    for (row, named, key_literals) in named_rows {
         let literal_at = |index: usize| -> Result<String, String> {
             joined_literal(&row.columns[index], scales.as_deref(), index)
                 .ok_or_else(|| "a joined value cannot be written".to_string())
         };
 
-        let mut sets: Vec<String> = Vec::with_capacity(assignments.len());
-        for ((column, _), source) in assignments.iter().zip(sources.iter()) {
-            let literal = match source {
+        let mut values: Vec<String> = Vec::with_capacity(assignments.len());
+        for source in &sources {
+            let value = match source {
                 // A float is written as the float it is, so the assignment
                 // reads it as every other path does (`expr::from_engine_scale`,
                 // `pg_numeric::from_f64`): bare, its seventeen shortest digits
@@ -7212,44 +7218,72 @@ async fn update_from_join(
                             .ok_or_else(|| "a joined value cannot be written".to_string())?;
                         bindings.push((reference.clone(), literal));
                     }
-                    sets.push(format!("{} = {}", column, substitute_outer_refs(text, &bindings)));
-                    continue;
+                    substitute_outer_refs(text, &bindings)
                 }
             };
-            sets.push(format!("{} = {}", column, literal));
+            values.push(value);
         }
 
-        let returning_text = match &returning_unqualified {
-            Some(r) => format!(" {}", r),
-            None => String::new(),
+        let recheck = match &recheck_text {
+            Some(text) => {
+                let mut bindings: Vec<(String, String)> = Vec::with_capacity(recheck_refs.len());
+                for (offset, reference) in recheck_refs.iter().enumerate() {
+                    bindings.push((reference.clone(), literal_at(recheck_at + offset)?));
+                }
+                Some(substitute_outer_refs(&strip_qualifier(text, target_alias), &bindings))
+            }
+            None => None,
         };
-        let key_only = format!("UPDATE {} SET {} WHERE {}{}", table, sets.join(", "), named, returning_text);
-        let mut bindings: Vec<(String, String)> = Vec::with_capacity(recheck_refs.len());
-        for (offset, reference) in recheck_refs.iter().enumerate() {
-            bindings.push((reference.clone(), literal_at(recheck_at + offset)?));
-        }
-        let with_recheck = match &recheck_text {
-            Some(text) => format!(
-                "UPDATE {} SET {} WHERE {} AND ({}){}",
-                table,
-                sets.join(", "),
-                named,
-                substitute_outer_refs(&strip_qualifier(text, target_alias), &bindings),
-                returning_text
-            ),
-            None => key_only.clone(),
+        prepared.push(JoinedWrite { named, key_literals, values, recheck });
+    }
+
+    let columns: Vec<String> = assignments.iter().map(|(column, _)| column.clone()).collect();
+    let returning_text = match &returning_unqualified {
+        Some(r) => format!(" {}", r),
+        None => String::new(),
+    };
+    let mut written = 0u64;
+    let mut returned: Vec<u8> = Vec::new();
+    // Each write is a statement of its own, which commits its storage
+    // transaction as it returns, and a later row can still fail this one (a
+    // CHECK, a key, a foreign key). An autocommit statement's writes may
+    // otherwise overwrite in place, which its abort cannot undo: the rows
+    // before the failure kept their new values.
+    database.transactions.forbid_in_place(tx);
+
+    // Written back a batch of rows to a statement (`JOIN_WRITE_BATCH`). A
+    // statement's storage commit syncs the log once, before it stamps the
+    // versions it replaced in place, and a statement per row paid that sync
+    // per row: about 3 ms each, whatever the tables, so a 9 600-row backfill
+    // took half a minute where an `INSERT … SELECT` of the same join took
+    // two seconds. The rows of a batch are written by one `UPDATE` naming
+    // each by its key, each row's values chosen by a `CASE` on that key and
+    // its recheck kept beside it.
+    //
+    // `RETURNING` keeps a statement per row, so its rows come back in the
+    // join's order as they always have. So does any batch with a column
+    // `batch_update_sql` cannot type (`batch_cast_type`).
+    let batching = returning.is_none() && !join_write_per_row_only(table);
+    for chunk in prepared.chunks(JOIN_WRITE_BATCH) {
+        let batch = if batching && chunk.len() > 1 {
+            batch_update_sql(table, &columns, chunk, &key, &target_schema, &target_modifiers)
+        } else {
+            None
         };
-        let response = run_per_row_write(with_recheck, key_only, database, depth, tx).await?;
+        let Some(sql) = batch else {
+            written += update_each(table, &columns, chunk, &returning_text, returning.is_some(), &mut returned, database, depth, tx)
+                .await?;
+            continue;
+        };
+        let response = run_per_row_write(sql.clone(), sql, database, depth, tx).await?;
         if response.first() == Some(&3u8) {
-            return Err(String::from_utf8_lossy(&response[1..]).to_string());
+            // The rows one by one say which failed and why, as they always
+            // have; the statement fails either way.
+            let failed = String::from_utf8_lossy(&response[1..]).to_string();
+            let mut ignored = Vec::new();
+            update_each(table, &columns, chunk, "", false, &mut ignored, database, depth, tx).await?;
+            return Err(failed);
         }
-        // A `RETURNING` write answers with serialized rows; they are gathered so
-        // the statement returns one result set rather than one per row.
-        if returning.is_some() && response.first() == Some(&2u8) {
-            returned.extend_from_slice(&response[1..]);
-        }
-        // What the write changed, not one per key: a row deleted or changed
-        // out of the join's reach since counts nothing.
         written += affected_by(&response).unwrap_or(0);
     }
 
@@ -7262,6 +7296,241 @@ async fn update_from_join(
     let mut result = vec![0u8];
     result.extend_from_slice(&written.to_le_bytes());
     Ok(result)
+}
+
+/// One row an `UPDATE … FROM` or `DELETE … USING` writes back, as text.
+struct JoinedWrite {
+    /// The key predicate naming the row (`IdentifyingKey::predicate`).
+    named: String,
+    /// The key's values, as literals in the key's order.
+    key_literals: Vec<String>,
+    /// Each assignment's value, in the statement's order; empty for a delete.
+    values: Vec<String>,
+    /// The join condition's recheck with this row's source values in it.
+    recheck: Option<String>,
+}
+
+/// Rows a joined write writes back per statement. A statement's storage
+/// commit syncs the log once; past a hundred or so rows that sync is lost in
+/// the statement's own cost, and the `CASE` each value is chosen by grows
+/// with the batch.
+const JOIN_WRITE_BATCH: usize = 128;
+
+#[cfg(test)]
+pub(crate) mod join_write_hooks {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    /// Tables whose joined writes go row by row: the oracle a batched
+    /// write is compared against.
+    pub(crate) static PER_ROW_ONLY: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+    pub(crate) fn per_row_only(table: &str) {
+        PER_ROW_ONLY.lock().unwrap().get_or_insert_with(HashSet::new).insert(table.to_string());
+    }
+}
+
+fn join_write_per_row_only(_table: &str) -> bool {
+    #[cfg(test)]
+    {
+        if join_write_hooks::PER_ROW_ONLY.lock().unwrap().as_ref().is_some_and(|t| t.contains(_table)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Writes `chunk` back a statement per row, each with its recheck, as
+/// `UPDATE … FROM` always did; what they changed.
+#[allow(clippy::too_many_arguments)]
+async fn update_each(
+    table: &str,
+    columns: &[String],
+    chunk: &[JoinedWrite],
+    returning_text: &str,
+    collect: bool,
+    returned: &mut Vec<u8>,
+    database: &Arc<Database>,
+    depth: usize,
+    tx: TxId,
+) -> Result<u64, String> {
+    let mut written = 0u64;
+    for write in chunk {
+        let sets: Vec<String> =
+            columns.iter().zip(&write.values).map(|(column, value)| format!("{} = {}", column, value)).collect();
+        let key_only = format!("UPDATE {} SET {} WHERE {}{}", table, sets.join(", "), write.named, returning_text);
+        let with_recheck = match &write.recheck {
+            Some(recheck) => format!(
+                "UPDATE {} SET {} WHERE {} AND ({}){}",
+                table,
+                sets.join(", "),
+                write.named,
+                recheck,
+                returning_text
+            ),
+            None => key_only.clone(),
+        };
+        let response = run_per_row_write(with_recheck, key_only, database, depth, tx).await?;
+        if response.first() == Some(&3u8) {
+            return Err(String::from_utf8_lossy(&response[1..]).to_string());
+        }
+        // A `RETURNING` write answers with serialized rows; they are gathered so
+        // the statement returns one result set rather than one per row.
+        if collect && response.first() == Some(&2u8) {
+            returned.extend_from_slice(&response[1..]);
+        }
+        // What the write changed, not one per key: a row deleted or changed
+        // out of the join's reach since counts nothing.
+        written += affected_by(&response).unwrap_or(0);
+    }
+    Ok(written)
+}
+
+/// Deletes `chunk` a statement per row, each with its recheck, as
+/// `DELETE … USING` always did; how many it removed.
+#[allow(clippy::too_many_arguments)]
+async fn delete_each(
+    table: &str,
+    chunk: &[JoinedWrite],
+    returning_text: &str,
+    collect: bool,
+    returned: &mut Vec<u8>,
+    database: &Arc<Database>,
+    depth: usize,
+    tx: TxId,
+) -> Result<u64, String> {
+    let mut deleted = 0u64;
+    for write in chunk {
+        let key_only = format!("DELETE FROM {} WHERE {}{}", table, write.named, returning_text);
+        let with_recheck = match &write.recheck {
+            Some(recheck) => format!("DELETE FROM {} WHERE {} AND ({}){}", table, write.named, recheck, returning_text),
+            None => key_only.clone(),
+        };
+        let response = run_per_row_write(with_recheck, key_only, database, depth, tx).await?;
+        if response.first() == Some(&3u8) {
+            return Err(String::from_utf8_lossy(&response[1..]).to_string());
+        }
+        if collect && response.first() == Some(&2u8) {
+            returned.extend_from_slice(&response[1..]);
+        }
+        deleted += affected_by(&response).unwrap_or(0);
+    }
+    Ok(deleted)
+}
+
+/// The rows of `chunk`, each by its key and, where the join is rechecked,
+/// its recheck: `id IN (…) AND ((id = 1 AND (…)) OR …)` for a one-column key,
+/// whose `IN` list the scan answers from the key's index, or
+/// `(a = 1 AND b = 2 AND (…)) OR …` for a composite one, each conjunction
+/// pinning its row (and, on a partitioned table, its partition).
+fn batch_key_filter(key: &IdentifyingKey, chunk: &[JoinedWrite]) -> String {
+    let rechecked = chunk.iter().any(|w| w.recheck.is_some());
+    let each = |w: &JoinedWrite| match &w.recheck {
+        Some(recheck) => format!("({} AND ({}))", w.named, recheck),
+        None => format!("({})", w.named),
+    };
+    match key.fields.as_slice() {
+        [only] => {
+            let listed: Vec<&str> = chunk.iter().filter_map(|w| w.key_literals.first().map(String::as_str)).collect();
+            let mut filter = format!("{} IN ({})", only.name, listed.join(", "));
+            if rechecked {
+                let terms: Vec<String> = chunk.iter().map(each).collect();
+                filter.push_str(&format!(" AND ({})", terms.join(" OR ")));
+            }
+            filter
+        }
+        _ => {
+            let terms: Vec<String> = chunk.iter().map(each).collect();
+            format!("({})", terms.join(" OR "))
+        }
+    }
+}
+
+/// One `UPDATE` writing every row of `chunk`, or `None` when one of its
+/// columns cannot be written that way and the rows go one by one.
+///
+/// A column every row gives the same value keeps that value as written. One
+/// whose values differ takes a `CASE` on each row's key, every branch cast to
+/// the column's own type (`batch_cast_type`): a `CASE` takes one type from
+/// all its branches, as PostgreSQL's does, so `'1.5'` beside `3` made an
+/// integer of it and failed, where each written alone is assigned to the
+/// column as what it is.
+fn batch_update_sql(
+    table: &str,
+    columns: &[String],
+    chunk: &[JoinedWrite],
+    key: &IdentifyingKey,
+    schema: &[crate::core::row::schema::SchemaField],
+    modifiers: &[crate::core::rql::type_modifier::TypeModifier],
+) -> Option<String> {
+    let mut sets: Vec<String> = Vec::with_capacity(columns.len());
+    for (j, column) in columns.iter().enumerate() {
+        let first = chunk.first()?.values.get(j)?;
+        if chunk.iter().all(|w| w.values.get(j) == Some(first)) {
+            sets.push(format!("{} = {}", column, first));
+            continue;
+        }
+        let field = schema
+            .iter()
+            .find(|f| !f.is_deleted && f.name == *column)
+            .or_else(|| schema.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column)))?;
+        let cast = batch_cast_type(field, modifiers)?;
+        let mut choice = String::from("CASE");
+        for w in chunk {
+            choice.push_str(&format!(" WHEN ({}) THEN CAST(({}) AS {})", w.named, w.values.get(j)?, cast));
+        }
+        choice.push_str(" END");
+        sets.push(format!("{} = {}", column, choice));
+    }
+    Some(format!("UPDATE {} SET {} WHERE {}", table, sets.join(", "), batch_key_filter(key, chunk)))
+}
+
+/// The type a batched `CASE` branch is cast to for `field`, so the value the
+/// column is assigned is the one the row's own statement would assign it.
+/// The column's base type, its checks left to the assignment: `TEXT` for a
+/// `varchar(5)`, whose length the assignment still refuses (a cast to
+/// `varchar(5)` cuts the value, PostgreSQL's explicit-cast rule), and a
+/// declared `NUMERIC(p, s)` at its own scale, so the value is rounded once,
+/// as the assignment rounds it (through the engine's nine places first, a
+/// value is rounded twice). An unconstrained `NUMERIC` keeps each value's own
+/// scale. `None` for every type not listed: an array, whose element type the
+/// column does not record, a range, a network or geometric type, an
+/// interval, and anything stored past the engine's decimal places.
+fn batch_cast_type(
+    field: &crate::core::row::schema::SchemaField,
+    modifiers: &[crate::core::rql::type_modifier::TypeModifier],
+) -> Option<String> {
+    use crate::core::db_type::DbType;
+    Some(
+        match field.db_type {
+            DbType::I16 => "SMALLINT",
+            DbType::I32 => "INTEGER",
+            DbType::I64 => "BIGINT",
+            DbType::F32 => "REAL",
+            DbType::F64 => "DOUBLE PRECISION",
+            DbType::BOOL => "BOOLEAN",
+            DbType::UUID => "UUID",
+            DbType::DATETIME if field.without_time_zone => "TIMESTAMP",
+            DbType::DATETIME => "TIMESTAMPTZ",
+            DbType::TIMESTAMP => "TIMESTAMP",
+            DbType::DATE => "DATE",
+            DbType::STRING => "TEXT",
+            DbType::BYTEA => "BYTEA",
+            DbType::JSONB => "JSONB",
+            DbType::DECIMAL => {
+                let declared = modifiers.iter().find(|m| m.column.eq_ignore_ascii_case(&field.name) && !m.is_deleted);
+                return match declared {
+                    None => Some("NUMERIC".to_string()),
+                    Some(m) if u32::from(m.scale) <= crate::core::value_codec::DECIMAL_SCALE => {
+                        Some(format!("NUMERIC(38, {})", m.scale))
+                    }
+                    Some(_) => None,
+                };
+            }
+            _ => return None,
+        }
+        .to_string(),
+    )
 }
 
 /// The relation names a `USING` / `FROM` list makes visible: each comma-
@@ -18941,14 +19210,24 @@ impl IdentifyingKey {
     /// A decimal is written at its declared scale, every place kept, so the
     /// predicate names exactly the stored value.
     fn predicate(&self, cells: &[&crate::core::row::row::Column]) -> Result<String, String> {
-        self.row_key(cells)?;
-        let mut terms = Vec::with_capacity(self.fields.len());
-        for ((field, cell), scale) in self.fields.iter().zip(cells).zip(&self.scales) {
-            let literal = joined_literal(cell, Some(std::slice::from_ref(scale)), 0)
-                .ok_or_else(|| "a joined key cannot be written back".to_string())?;
-            terms.push(format!("{} = {}", field.name, literal));
-        }
+        let literals = self.literals(cells)?;
+        let terms: Vec<String> =
+            self.fields.iter().zip(&literals).map(|(field, literal)| format!("{} = {}", field.name, literal)).collect();
         Ok(terms.join(" AND "))
+    }
+
+    /// The key's values as literals, in [`Self::fields`] order: what
+    /// [`Self::predicate`] compares each column with.
+    fn literals(&self, cells: &[&crate::core::row::row::Column]) -> Result<Vec<String>, String> {
+        self.row_key(cells)?;
+        let mut literals = Vec::with_capacity(self.fields.len());
+        for (cell, scale) in cells.iter().zip(&self.scales) {
+            literals.push(
+                joined_literal(cell, Some(std::slice::from_ref(scale)), 0)
+                    .ok_or_else(|| "a joined key cannot be written back".to_string())?,
+            );
+        }
+        Ok(literals)
     }
 }
 
