@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+#
+# The RasterizedDB server image on Alpine: the static musl build of the server
+# (PGO, mimalloc as its allocator), from bin-musl/<amd64|arm64>/rasterizeddb
+# in this directory, put there by the release workflow. Otherwise the same as
+# docker/Dockerfile.ubuntu: user, volume, ports and entrypoint.
+ARG BASE=alpine:3
+FROM ${BASE}
+
+ARG TARGETARCH
+
+RUN apk add --no-cache ca-certificates \
+ && addgroup -S -g 10001 rasterizeddb \
+ && adduser -S -D -H -u 10001 -G rasterizeddb -h /var/lib/rasterizeddb \
+      -s /sbin/nologin rasterizeddb \
+ && mkdir -p /var/lib/rasterizeddb \
+ && chown rasterizeddb:rasterizeddb /var/lib/rasterizeddb \
+ && chmod 700 /var/lib/rasterizeddb
+
+COPY --chmod=0755 bin-musl/${TARGETARCH}/rasterizeddb /usr/local/bin/rasterizeddb
+COPY README.md LICENSE-GPL /usr/share/doc/rasterizeddb/
+
+USER rasterizeddb
+WORKDIR /var/lib/rasterizeddb
+VOLUME /var/lib/rasterizeddb
+EXPOSE 5432 61170
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["rasterizeddb", "--location", "/var/lib/rasterizeddb", "--protocol", "both", "--pg-addr", "0.0.0.0", "--rdb-addr", "0.0.0.0"]

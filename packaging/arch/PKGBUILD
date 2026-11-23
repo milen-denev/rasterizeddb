@@ -1,0 +1,43 @@
+# Maintainer: Milen Denev
+#
+# RasterizedDB server, from the release's prebuilt Linux x86-64 binary (PGO +
+# BOLT, x86-64-v3: CachyOS's v3/v4 repositories, or any Arch on an AVX2 CPU).
+#
+# The release workflow (.github/workflows/release-binaries.yml) builds this
+# package and attaches it, and this PKGBUILD with its checksums filled in, to
+# each GitHub release; the AUR package `rasterizeddb-bin` is that PKGBUILD
+# with the three files beside it. `_tag` is the release tag without its `v`;
+# pkgver cannot hold a `-`, so a pre-release 1.0.1-rc.1 becomes 1.0.1_rc.1.
+pkgname=rasterizeddb-bin
+_tag=1.0.0
+pkgver=${_tag//-/_}
+pkgrel=1
+pkgdesc="RasterizedDB server: a PostgreSQL-compatible database with its own native protocol (x86-64-v3)"
+arch=('x86_64')
+url="https://github.com/milen-denev/rasterizeddb"
+license=('GPL-3.0-only')
+depends=('glibc' 'gcc-libs')
+provides=('rasterizeddb')
+conflicts=('rasterizeddb')
+backup=('etc/rasterizeddb/rasterizeddb.env')
+install=rasterizeddb.install
+source=("https://github.com/milen-denev/rasterizeddb/releases/download/v${_tag}/rasterizeddb-server-${_tag}-linux-x86_64.tar.gz"
+        'rasterizeddb.service'
+        'rasterizeddb.sysusers'
+        'rasterizeddb.env')
+sha256sums=('SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP')
+
+package() {
+  local dir="rasterizeddb-server-${_tag}-linux-x86_64"
+  install -Dm755 "$dir/rasterizeddb" "$pkgdir/usr/bin/rasterizeddb"
+  install -Dm644 "$dir/README.md" "$pkgdir/usr/share/doc/rasterizeddb/README.md"
+  install -Dm644 "$dir/LICENSE-GPL" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 rasterizeddb.service "$pkgdir/usr/lib/systemd/system/rasterizeddb.service"
+  install -Dm644 rasterizeddb.sysusers "$pkgdir/usr/lib/sysusers.d/rasterizeddb.conf"
+  # The password lives here: readable by root only (systemd reads it before
+  # dropping to the service user).
+  install -Dm600 rasterizeddb.env "$pkgdir/etc/rasterizeddb/rasterizeddb.env"
+}

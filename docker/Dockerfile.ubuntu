@@ -1,0 +1,54 @@
+# syntax=docker/dockerfile:1
+#
+# The RasterizedDB server image on Ubuntu (24.04 by default, 26.04 with
+# --build-arg BASE=ubuntu:26.04). docker/Dockerfile.alpine is the musl one.
+#
+# Nothing is compiled here: the release workflow (release-binaries.yml) puts
+# the server it already built and smoke-tested at bin/<amd64|arm64>/rasterizeddb
+# in this directory, so the image runs exactly the binary in the GitHub
+# release (glibc 2.38+; the amd64 one needs an x86-64-v3, AVX2, CPU).
+# By hand:
+#
+#   mkdir -p docker/bin/amd64 && cp <server binary> docker/bin/amd64/rasterizeddb
+#   cp README.md LICENSE-GPL docker/
+#   docker build --platform linux/amd64 -f docker/Dockerfile.ubuntu -t rasterizeddb docker
+ARG BASE=ubuntu:24.04
+FROM ${BASE}
+
+ARG TARGETARCH
+
+# ca-certificates: S3 backup and PostgreSQL import carry their own roots, but
+# a dependency may read the system store. uid/gid 10001 in every variant, so
+# a data volume moves between them.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10001 rasterizeddb \
+ && useradd --system --uid 10001 --gid rasterizeddb --no-create-home \
+      --home-dir /var/lib/rasterizeddb --shell /usr/sbin/nologin rasterizeddb \
+ && mkdir -p /var/lib/rasterizeddb \
+ && chown rasterizeddb:rasterizeddb /var/lib/rasterizeddb \
+ && chmod 700 /var/lib/rasterizeddb
+
+COPY --chmod=0755 bin/${TARGETARCH}/rasterizeddb /usr/local/bin/rasterizeddb
+COPY README.md LICENSE-GPL /usr/share/doc/rasterizeddb/
+
+USER rasterizeddb
+WORKDIR /var/lib/rasterizeddb
+VOLUME /var/lib/rasterizeddb
+
+# 5432: PostgreSQL protocol. 61170: the native protocol (rasterizeddb_client,
+# Studio). The MySQL, SQL Server, Redis-compatible and replication listeners
+# stay off until their flags are given (docs/docker.md).
+EXPOSE 5432 61170
+
+# SIGTERM is a clean shutdown. Give it time: `docker stop -t 60`, or
+# stop_grace_period in compose.
+STOPSIGNAL SIGTERM
+
+# Both protocols on one catalogue, on every interface of the container. The
+# role `rasterized` gets RASTERIZEDDB_PG_PASSWORD; without one the server
+# refuses to listen beyond loopback and the container exits with that error.
+# Arguments after the image name are appended: any other server flag
+# (`--help` lists them).
+ENTRYPOINT ["rasterizeddb", "--location", "/var/lib/rasterizeddb", "--protocol", "both", "--pg-addr", "0.0.0.0", "--rdb-addr", "0.0.0.0"]

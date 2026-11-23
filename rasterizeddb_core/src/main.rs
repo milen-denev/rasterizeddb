@@ -5,6 +5,41 @@
 
 use std::env;
 
+/// On musl (the static Linux build the Alpine image runs) the system
+/// allocator is musl's own, which serialises a many-threaded server on one
+/// lock. mimalloc is already linked for the memory pool, so every allocation
+/// goes there instead. glibc builds keep glibc's malloc, which the allocator
+/// tuning in `lib.rs` (`mallopt`, `malloc_trim`) is written for.
+#[cfg(target_env = "musl")]
+mod musl_allocator {
+    use std::alloc::{GlobalAlloc, Layout};
+
+    use libmimalloc_sys::{mi_free, mi_malloc_aligned, mi_realloc_aligned, mi_zalloc_aligned};
+
+    struct Mimalloc;
+
+    // SAFETY: each method forwards to mimalloc's aligned API with the
+    // layout's size and alignment, which is what GlobalAlloc requires; a
+    // pointer is only ever freed or resized by the allocator that made it.
+    unsafe impl GlobalAlloc for Mimalloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            unsafe { mi_malloc_aligned(layout.size(), layout.align()) as *mut u8 }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            unsafe { mi_zalloc_aligned(layout.size(), layout.align()) as *mut u8 }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+            unsafe { mi_free(ptr as *mut _) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            unsafe { mi_realloc_aligned(ptr as *mut _, new_size, layout.align()) as *mut u8 }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: Mimalloc = Mimalloc;
+}
+
 use clap::Parser;
 
 use log::LevelFilter;
