@@ -11,12 +11,15 @@ runs:
     # On the Windows runners Defender scans each one: file-heavy tests ran
     # 8-23x slower than on Linux while CPU- and network-bound tests ran at
     # the same speed. The runners are throwaway VMs, so real-time scanning is
-    # turned off where the image allows it (windows-2025: the library suite
-    # went from 85 to 33 minutes). windows-11-arm has Tamper Protection, which
-    # ignores that silently; there the temp directory, where every test's
-    # tempdir lives, moves to a trusted Dev Drive (ReFS, scanned
-    # asynchronously), on every Windows runner alike. Best effort: a refused
-    # setting leaves the job as slow as before.
+    # turned off where the image allows it, and the temp directory, where
+    # every test's tempdir lives, moves to the fastest place each image has
+    # (library suite, measured 2026-11-23):
+    #   windows-2025 (x64): Defender off, temp on its D: disk: 85 -> 33 min.
+    #     A Dev Drive there was slower (55 min).
+    #   windows-11-arm: Tamper Protection silently keeps Defender on and there
+    #     is no D: disk; a trusted Dev Drive (ReFS, scanned asynchronously)
+    #     took it from 104 to 86 min.
+    # Best effort: a refused setting leaves the job as slow as before.
     - name: Windows - Defender real-time scanning off
       if: runner.os == 'Windows'
       shell: pwsh
@@ -28,8 +31,20 @@ runs:
         }
         Get-MpComputerStatus | Format-List AMRunningMode, RealTimeProtectionEnabled, IsTamperProtected
 
-    - name: Windows - Dev Drive for the temp directory
-      if: runner.os == 'Windows'
+    - name: "Windows x64 - temp directory on the D: disk"
+      if: runner.os == 'Windows' && runner.arch == 'X64'
+      shell: pwsh
+      continue-on-error: true
+      run: |
+        $t = 'D:\rdbtmp'
+        if (-not (Test-Path 'D:\')) { $t = Join-Path $env:RUNNER_TEMP 'rdbtmp' }
+        New-Item -ItemType Directory -Force $t | Out-Null
+        Add-MpPreference -ExclusionPath $t -ErrorAction Continue
+        "TEMP=$t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "TMP=$t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+    - name: Windows ARM64 - Dev Drive for the temp directory
+      if: runner.os == 'Windows' && runner.arch == 'ARM64'
       uses: samypr100/setup-dev-drive@v4.1.0
       with:
         drive-size: 40GB
@@ -40,8 +55,8 @@ runs:
           TEMP,{{ DEV_DRIVE }}/tmp
           TMP,{{ DEV_DRIVE }}/tmp
 
-    - name: Windows - temp directory on the Dev Drive
-      if: runner.os == 'Windows'
+    - name: Windows ARM64 - temp directory on the Dev Drive
+      if: runner.os == 'Windows' && runner.arch == 'ARM64'
       shell: pwsh
       continue-on-error: true
       run: |
