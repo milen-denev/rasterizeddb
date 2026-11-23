@@ -1077,7 +1077,32 @@ fn union_rows<'a>(mut a: Vec<SetRow<'a>>, b: Vec<SetRow<'a>>, all: bool) -> Vec<
 
 /// `a INTERSECT [ALL] b`: each row of `a` that `b` has, once; or as many
 /// times as both have it.
+///
+/// Rows equal under the set operation can still print differently — 2.25
+/// and 2.2500 are one NUMERIC — and PostgreSQL shows the row of whichever
+/// input its plan reads first. For INTERSECT that is the input with fewer
+/// distinct rows (by its estimate of the groups; the left on a tie), so a
+/// matched row here is that side's, in `a`'s order. Keeping `a`'s always
+/// printed 2.25 where PostgreSQL prints the one-row constant branch's
+/// 2.2500. Counted here, where PostgreSQL estimates: a VALUES list, which it
+/// has no statistics for, it takes to have as many groups as rows.
 fn intersect_rows<'a>(a: Vec<SetRow<'a>>, b: Vec<SetRow<'a>>, all: bool) -> Vec<SetRow<'a>> {
+    let groups = |rows: &[SetRow<'a>]| rows.iter().map(|r| &r.key).collect::<std::collections::HashSet<_>>().len();
+    if groups(&b) < groups(&a) {
+        let mut from_b: std::collections::HashMap<Vec<u8>, std::collections::VecDeque<SetRow<'a>>> =
+            std::collections::HashMap::with_capacity(b.len());
+        for r in b {
+            from_b.entry(r.key.clone()).or_default().push_back(r);
+        }
+        return a
+            .into_iter()
+            .filter_map(|r| {
+                let rows = from_b.get_mut(&r.key)?;
+                // Without ALL a key is taken once: its entry goes with it.
+                if all { rows.pop_front() } else { from_b.remove(&r.key).and_then(|mut rows| rows.pop_front()) }
+            })
+            .collect();
+    }
     let mut counts = key_counts(&b);
     let mut seen = std::collections::HashSet::new();
     a.into_iter()
