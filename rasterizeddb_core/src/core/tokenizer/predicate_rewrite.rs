@@ -3071,7 +3071,8 @@ pub fn rewrite_scan_where(
     // lifted on its own. Expanding again inside `rewrite_where` finds nothing.
     // `s ~ 'x'`, `s ~* 'x'`, `!~`, `!~*`: the `regexp_like` comparison
     // they mean, which the evaluator answers.
-    let lowered = crate::core::rql::check::lower_regex_operators(clause, "regexp_like");
+    let lowered = normalize_where_shapes(clause);
+    let lowered = crate::core::rql::check::lower_regex_operators(&lowered, "regexp_like");
     let lowered = crate::core::rql::check::lower_text_match(&lowered);
     // Before the lift, so an operand folded through the key function is
     // lifted with the rest (`collate_rewrite`).
@@ -6209,12 +6210,197 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
     rewrite_where_in(clause, schema, false)
 }
 
+/// Shapes PostgreSQL reads that the rest of this module does not, written as
+/// the ones it does. First, so every later step sees only those:
+///
+/// - a lone name in parentheses, `(n) > 5`, `(t) = 'a'`, `(n) IS NULL`, is
+///   the name: read as an expression it was an operand with nothing after
+///   it ("unexpected Op(">")"), a syntax error at `IS`, or an integer;
+/// - `x [NOT] IN (n / 10, 2)`, a list holding an expression, is the
+///   comparisons it means ([`expand_expression_in_lists`]).
+pub(crate) fn normalize_where_shapes(clause: &str) -> String {
+    expand_expression_in_lists(&unwrap_lone_names(clause))
+}
+
+/// Whether `text` is one name: `n`, `t.n`, `"N"`, `t."N"`.
+fn is_lone_name(text: &str) -> bool {
+    let part = |p: &str| {
+        let p = p.trim();
+        if p.len() >= 2 && p.starts_with('"') && p.ends_with('"') {
+            return !p[1..p.len() - 1].contains('"');
+        }
+        let mut chars = p.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    };
+    let text = text.trim();
+    if text.is_empty() || text.contains(char::is_whitespace) {
+        return false;
+    }
+    let parts: Vec<&str> = text.split('.').collect();
+    parts.len() <= 2 && parts.iter().all(|p| part(p))
+}
+
+/// `(n)` as `n`, where the parentheses are only grouping. Kept where they
+/// are syntax: after `IN`, `ANY`, `ALL`, `SOME`, `EXISTS`, `VALUES`, `ARRAY`,
+/// `OVER`, `FILTER`, `USING`, a call's name, or a `)`.
+fn unwrap_lone_names(clause: &str) -> String {
+    let bytes = clause.as_bytes();
+    let mut out = String::with_capacity(clause.len());
+    let mut i = 0;
+    let mut copied = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            q @ (b'\'' | b'"') => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, q);
+                continue;
+            }
+            b'(' => {
+                let Some(close) = matching_paren_at(clause, i) else {
+                    i += 1;
+                    continue;
+                };
+                let inner = &clause[i + 1..close];
+                let before = clause[..i].trim_end();
+                let word_start = before
+                    .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .map_or(0, |at| at + 1);
+                let word = &before[word_start..];
+                let syntax = ["IN", "ANY", "ALL", "SOME", "EXISTS", "VALUES", "ARRAY", "OVER", "FILTER", "USING"]
+                    .iter()
+                    .any(|k| word.eq_ignore_ascii_case(k));
+                // A call (`f(n)`) or a name right before; a `)` (`f(a)(n)`).
+                let keyword_before = [
+                    "AND", "OR", "NOT", "WHERE", "ON", "WHEN", "THEN", "ELSE", "IS", "LIKE", "ILIKE", "BETWEEN",
+                ]
+                .iter()
+                .any(|k| word.eq_ignore_ascii_case(k));
+                let attached = before.ends_with(')') || (!word.is_empty() && !keyword_before);
+                if is_lone_name(inner) && !syntax && !attached {
+                    out.push_str(&clause[copied..i]);
+                    out.push(' ');
+                    out.push_str(inner.trim());
+                    out.push(' ');
+                    copied = close + 1;
+                    i = close + 1;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push_str(&clause[copied..]);
+    out
+}
+
+/// Whether `item` is a literal: a number, a quoted string (with a cast), or
+/// `NULL`, `TRUE`, `FALSE`.
+fn is_literal_item(item: &str) -> bool {
+    let item = item.trim();
+    let base = match item.find("::") {
+        Some(at) if item.starts_with('\'') => &item[..at],
+        _ => item,
+    };
+    let base = base.trim();
+    if base.starts_with('\'') && base.ends_with('\'') && base.len() >= 2 {
+        return true;
+    }
+    let unsigned = base.strip_prefix(['-', '+']).unwrap_or(base);
+    if !unsigned.is_empty() && unsigned.chars().all(|c| c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E') {
+        return unsigned.starts_with(|c: char| c.is_ascii_digit() || c == '.');
+    }
+    ["NULL", "TRUE", "FALSE"].iter().any(|k| base.eq_ignore_ascii_case(k))
+}
+
+/// `x IN (n / 10, 2)` as `(x = n / 10 OR x = 2)`, and `x NOT IN (…)` as
+/// `(x <> … AND x <> …)`, when `x` is one name and the list holds anything
+/// but literals ("unexpected factor: Op("/")"). The same under SQL's three
+/// values: a NULL item folds `x = NULL` false, so `IN` is never true through
+/// it and `NOT IN` never true at all, as PostgreSQL answers in a `WHERE`. A
+/// list of literals, or a subquery, is left to the paths that read those.
+fn expand_expression_in_lists(clause: &str) -> String {
+    let bytes = clause.as_bytes();
+    let mut out = String::with_capacity(clause.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            q @ (b'\'' | b'"') => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, q);
+                continue;
+            }
+            b'(' => {
+                // `… IN (` right before?
+                let before = clause[..i].trim_end();
+                let is_in = before.get(before.len().saturating_sub(2)..).is_some_and(|w| w.eq_ignore_ascii_case("IN"))
+                    && before.len() >= 2
+                    && before[..before.len() - 2].ends_with(|c: char| c.is_whitespace());
+                if !is_in {
+                    i += 1;
+                    continue;
+                }
+                let Some(close) = matching_paren_at(clause, i) else {
+                    i += 1;
+                    continue;
+                };
+                let inner = &clause[i + 1..close];
+                if crate::core::sql_scan::starts_with_keyword(inner.trim(), "SELECT")
+                    || crate::core::sql_scan::starts_with_keyword(inner.trim(), "VALUES")
+                {
+                    i += 1;
+                    continue;
+                }
+                let items = split_row_items(inner);
+                if items.is_empty() || items.iter().all(|item| is_literal_item(item)) {
+                    i = close + 1;
+                    continue;
+                }
+                // The name and the optional NOT before `IN`.
+                let head = before[..before.len() - 2].trim_end();
+                let (head, negated) = match head.get(head.len().saturating_sub(3)..) {
+                    Some(w) if w.eq_ignore_ascii_case("NOT")
+                        && head[..head.len() - 3].ends_with(|c: char| c.is_whitespace()) =>
+                    {
+                        (head[..head.len() - 3].trim_end(), true)
+                    }
+                    _ => (head, false),
+                };
+                let name_start = head
+                    .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '"' || c == '$'))
+                    .map_or(0, |at| at + 1);
+                let name = &head[name_start..];
+                if !is_lone_name(name) || name_start < copied {
+                    i += 1;
+                    continue;
+                }
+                let terms: Vec<String> = items
+                    .iter()
+                    .map(|item| format!("{name} {} {}", if negated { "<>" } else { "=" }, item.trim()))
+                    .collect();
+                out.push_str(&clause[copied..name_start]);
+                out.push('(');
+                out.push_str(&terms.join(if negated { " AND " } else { " OR " }));
+                out.push(')');
+                copied = close + 1;
+                i = close + 1;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push_str(&clause[copied..]);
+    out
+}
+
 /// [`rewrite_where`]; `scan` when the scan reads the result
 /// ([`rewrite_scan_where`]), which can take a lifted operand.
 fn rewrite_where_in(clause: &str, schema: &SmallVec<[SchemaField; 20]>, scan: bool) -> Result<String, String> {
     if clause.trim().is_empty() {
         return Ok(String::new());
     }
+    let clause = &normalize_where_shapes(clause);
 
     // The regular-expression operators as `regexp_like` (a no-op once
     // `rewrite_scan_where` has done it).
