@@ -269,12 +269,18 @@ fn expand_truth_tests<'c>(
     let upper = clause.to_ascii_uppercase();
     let maybe = upper.contains("IS")
         && (upper.contains("TRUE") || upper.contains("FALSE") || upper.contains("UNKNOWN"));
-    if !maybe {
+    // `(a = b) IS NULL`, `(a > 0) = true`: a group's value tested
+    // (`predicate_group_values`, `arithmetic_null_test`).
+    let valued = upper.contains(')')
+        && ((upper.contains("IS") && upper.contains("NULL"))
+            || (upper.contains('=') && (upper.contains("TRUE") || upper.contains("FALSE"))));
+    if !maybe && !valued {
         return Ok(std::borrow::Cow::Borrowed(clause));
     }
     let (toks, grouped) = group_compared_truth_operands(lex(clause)?);
+    let (toks, values) = predicate_group_values(toks);
     let mut out: Vec<String> = Vec::with_capacity(toks.len());
-    let mut changed = grouped;
+    let mut changed = grouped || values;
     let mut i = 0usize;
     while i < toks.len() {
         // A constant's truth, `false IS NOT TRUE`, `NULL IS UNKNOWN`: the
@@ -301,6 +307,12 @@ fn expand_truth_tests<'c>(
         }
         if matches!(toks[i], Tok::LPar) {
             if let Some((text, after)) = parenthesised_truth_test(&toks, i, schema, scan)? {
+                out.push(text);
+                i = after;
+                changed = true;
+                continue;
+            }
+            if let Some((text, after)) = arithmetic_null_test(&toks, i, schema, scan)? {
                 out.push(text);
                 i = after;
                 changed = true;
@@ -363,6 +375,204 @@ fn group_compared_truth_operands(mut toks: Vec<Tok>) -> (Vec<Tok>, bool) {
         i += 1;
     }
     (toks, grouped)
+}
+
+/// Whether the group `open..=close` holds a condition at its own level: a
+/// comparison, or `LIKE`, `IN`, `BETWEEN`, `IS`, `AND`, `OR`, `NOT`.
+fn predicate_group(toks: &[Tok], open: usize, close: usize) -> bool {
+    const COMPARISONS: &[&str] = &["=", "<>", "!=", "<", ">", "<=", ">=", "~", "~*", "!~", "!~*"];
+    const WORDS: &[&str] = &["LIKE", "ILIKE", "IN", "BETWEEN", "IS", "AND", "OR", "NOT", "SIMILAR", "EXISTS"];
+    // Through a group that is all its parent holds: an integer IN list is
+    // already `((a = b OR a = 5))` here (`expand_expression_in_lists`).
+    if close > open + 2 && matches!(toks[open + 1], Tok::LPar) && toks_open_at(toks, close - 1) == Some(open + 1) {
+        return predicate_group(toks, open + 1, close - 1);
+    }
+    let mut depth = 0i32;
+    toks[open + 1..close].iter().any(|t| {
+        match t {
+            Tok::LPar => depth += 1,
+            Tok::RPar => depth -= 1,
+            Tok::Sym(sym) if depth == 0 && COMPARISONS.contains(&sym.as_str()) => return true,
+            _ if depth == 0 && WORDS.iter().any(|k| t.is_keyword(k)) => return true,
+            _ => {}
+        }
+        false
+    })
+}
+
+/// Whether a term ends right after `at`: nothing, a closing parenthesis, a
+/// comma, or `AND`/`OR`/`THEN`/`WHEN`/`ELSE`/`END`.
+fn term_ends_after(toks: &[Tok], at: usize) -> bool {
+    match toks.get(at + 1) {
+        None | Some(Tok::RPar) | Some(Tok::Comma) => true,
+        Some(t) => ["AND", "OR", "THEN", "WHEN", "ELSE", "END"].iter().any(|k| t.is_keyword(k)),
+    }
+}
+
+/// A condition used as a value, `(P) IS [NOT] NULL` and `(P) = TRUE` (`<>`,
+/// `!=`, `FALSE`, either side), as what it means. Both were refused ("syntax
+/// error at or near IS", "unexpected Op("=")"); ORMs write them.
+///
+/// `IS [NOT] NULL` of a condition is `IS [NOT] UNKNOWN`, which
+/// [`parenthesised_truth_test`] expands. `(P) = TRUE` is `P`, and `(P) =
+/// FALSE` is `NOT P` — not `IS TRUE`/`IS FALSE`: the comparison is NULL when
+/// `P` is, and under a `NOT` the two differ. The tokens and whether any
+/// changed.
+fn predicate_group_values(mut toks: Vec<Tok>) -> (Vec<Tok>, bool) {
+    let bool_word = |t: &Tok| {
+        if t.is_keyword("TRUE") {
+            Some(true)
+        } else if t.is_keyword("FALSE") {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    let equality = |t: &Tok| match t {
+        Tok::Sym(op) if op == "=" => Some(true),
+        Tok::Sym(op) if op == "<>" || op == "!=" => Some(false),
+        _ => None,
+    };
+    // `P` when the test holds as `P` does, else `(NOT P)`.
+    let as_condition = |group: &[Tok], holds_as_p: bool| -> Vec<Tok> {
+        if holds_as_p {
+            group.to_vec()
+        } else {
+            let mut v = Vec::with_capacity(group.len() + 3);
+            v.push(Tok::LPar);
+            v.push(Tok::Word("NOT".to_string()));
+            v.extend_from_slice(group);
+            v.push(Tok::RPar);
+            v
+        }
+    };
+    let mut changed = false;
+    let mut i = 0usize;
+    while i < toks.len() {
+        if matches!(toks[i], Tok::RPar)
+            && let Some(open) = toks_open_at(&toks, i)
+            && group_starts_term(&toks, open)
+            && predicate_group(&toks, open, i)
+        {
+            if toks.get(i + 1).is_some_and(|t| t.is_keyword("IS")) {
+                let at = i + 2 + usize::from(toks.get(i + 2).is_some_and(|t| t.is_keyword("NOT")));
+                if toks.get(at).is_some_and(|t| t.is_keyword("NULL")) {
+                    toks[at] = Tok::Word("UNKNOWN".to_string());
+                    changed = true;
+                }
+            } else if let (Some(eq), Some(value)) =
+                (toks.get(i + 1).and_then(equality), toks.get(i + 2).and_then(bool_word))
+                && term_ends_after(&toks, i + 2)
+            {
+                let replacement = as_condition(&toks[open..=i], eq == value);
+                let next = open + replacement.len();
+                toks.splice(open..=i + 2, replacement);
+                changed = true;
+                i = next;
+                continue;
+            }
+        }
+        // `TRUE = (P)`.
+        if let Some(value) = bool_word(&toks[i])
+            && (i == 0
+                || matches!(toks[i - 1], Tok::LPar)
+                || ["AND", "OR", "NOT", "WHERE", "WHEN", "ON", "HAVING"].iter().any(|k| toks[i - 1].is_keyword(k)))
+            && let Some(eq) = toks.get(i + 1).and_then(equality)
+            && matches!(toks.get(i + 2), Some(Tok::LPar))
+        {
+            let open = i + 2;
+            let mut depth = 0i32;
+            let close = (open..toks.len()).find(|&j| {
+                match toks[j] {
+                    Tok::LPar => depth += 1,
+                    Tok::RPar => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            });
+            if let Some(close) = close
+                && predicate_group(&toks, open, close)
+                && term_ends_after(&toks, close)
+            {
+                let replacement = as_condition(&toks[open..=close], eq == value);
+                let next = i + replacement.len();
+                toks.splice(i..=close, replacement);
+                changed = true;
+                i = next;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    (toks, changed)
+}
+
+/// `(b + 0) IS [NOT] NULL`: arithmetic in a group, tested for NULL, as the
+/// evaluator's `CASE` over it (it was "syntax error at or near IS"). Only
+/// for a scan, which reads a lifted operand, as `parenthesised_truth_test`'s
+/// own fallback.
+fn arithmetic_null_test(
+    toks: &[Tok],
+    at: usize,
+    schema: &SmallVec<[SchemaField; 20]>,
+    scan: bool,
+) -> Result<Option<(String, usize)>, String> {
+    if !scan || !group_starts_term(toks, at) {
+        return Ok(None);
+    }
+    let mut depth = 0i32;
+    let Some(close) = (at..toks.len()).find(|&j| {
+        match toks[j] {
+            Tok::LPar => depth += 1,
+            Tok::RPar => depth -= 1,
+            _ => {}
+        }
+        depth == 0
+    }) else {
+        return Ok(None);
+    };
+    if !toks.get(close + 1).is_some_and(|t| t.is_keyword("IS")) {
+        return Ok(None);
+    }
+    let negated = toks.get(close + 2).is_some_and(|t| t.is_keyword("NOT"));
+    let null_at = close + 2 + usize::from(negated);
+    if !toks.get(null_at).is_some_and(|t| t.is_keyword("NULL")) || predicate_group(toks, at, close) {
+        return Ok(None);
+    }
+    let mut depth = 0i32;
+    let arithmetic = toks[at + 1..close].iter().any(|t| {
+        match t {
+            Tok::LPar => depth += 1,
+            Tok::RPar => depth -= 1,
+            Tok::Sym(sym) if depth == 0 && matches!(sym.as_str(), "+" | "-" | "*" | "/" | "%") => return true,
+            _ => {}
+        }
+        false
+    });
+    if !arithmetic {
+        return Ok(None);
+    }
+    let mut parts = Vec::with_capacity(close - at);
+    for t in &toks[at + 1..close] {
+        match t {
+            Tok::Lifted(encoded) => match read_lifted(encoded, 0) {
+                Some((expression, _)) => parts.push(format!("({expression})")),
+                None => return Ok(None),
+            },
+            other => parts.push(other.render()),
+        }
+    }
+    let x = parts.join(" ");
+    let case = if negated {
+        format!("CASE WHEN ({x}) IS NULL THEN false ELSE true END")
+    } else {
+        format!("CASE WHEN ({x}) IS NULL THEN true ELSE false END")
+    };
+    match lift_operand(&case, schema, true) {
+        Ok(lifted) => Ok(Some((format!("{lifted} = true"), null_at + 1))),
+        Err(e) if e.starts_with("operator does not exist") || crate::core::rql::expr::is_input_error(&e) => Err(e),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Whether the `AND` at `and` closes a `BETWEEN`: one stands before it, at
