@@ -1,6 +1,24 @@
 # Persistent indexes
 
-Status: **designed, not built.** This revision cuts the design to a small v1
+Status: **phases 0, 1 and 2 built; phase 3 (GIN sections) not built.**
+`core/index_store` is the code (slices B9-B18, listed in its module
+comment):
+- Phase 1: the write gate, `.ixm` markers and FILTER snapshots, sealed at
+  every clean point (shutdown, `rdb_index_checkpoint`, the idle checkpoint,
+  a partition's idle close) and loaded at open instead of rebuilt;
+  `_flt.db` is retired.
+- Phase 2: B-tree, hash and path INDEX sections, written and loaded under
+  `--index-storage snapshot` (`SET CONFIG index_snapshot.index_storage`),
+  with the load audit and `rdb_index_check`. The default is still
+  `rebuild`. The open-time gate was met warm on 2026-11-08: 0.104 s against
+  a 1.31 s rebuild, 7.9%.
+- Not built: GIN sections (a table with a gin index rebuilds it at open) and
+  the rest of phase 4, including `snapshot` as the default.
+
+The design below is as written, with "Deviations, as built" notes per
+section.
+
+This revision cuts the design to a small v1
 and applies the 2026-10-17 verification round (43 corrections), the owner's
 v1 review (27 findings, RV1-RV27, §17) and the verification of those fixes
 (33 problems, P1-P33, §17), then the owner's re-check of those (R1-R12 and

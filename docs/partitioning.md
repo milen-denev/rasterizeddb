@@ -144,7 +144,7 @@ idle-box wall-clock A/B is still to run.
 | ~~`ALTER TABLE` in every form, `RENAME`, `CREATE INDEX`~~ (metadata forms built in phase 3 P1, below); ~~FKs onto or from a partitioned table~~ (built in phase 3 P4); ~~physical-rewrite `ALTER`~~ (built in phase 6 P8, [as built](#phase-6-p8-as-built)) | 6 |
 | ~~A key change: an `UPDATE` assigning a key column anything its `WHERE` does not pin to the same value~~ moves the row since phase 6 P9 ([as built](#phase-6-p9-as-built)); a `DO UPDATE` that would move it stays refused, as in PostgreSQL | 6 (row moves, §9) |
 | Conversion (`ALTER … PARTITION BY`, `CREATE INDEX … USING partition`); ~~reshapes (`SPLIT`, `ISOLATE KEY`, `SPLIT KEY`, `MERGE`, `MOVE PARTITION`)~~ built in phase 5 P7 ([as built](#phase-5-p7-as-built)) | 5 |
-| `CREATE … PARTITION BY` as a temporary or unlogged table, in an in-memory database, in a mirrored pool, on KV storage, or with shredded JSON columns | not scheduled (KV until measured; off-root placement 4) |
+| `CREATE … PARTITION BY` as a temporary or unlogged table, in an in-memory database, in a mirrored pool, or with shredded JSON columns; ~~on KV storage~~ built: `STORAGE PLACE TABLE t AT 'kv:<store>'` before the `CREATE` ([kv-partitions.md](kv-partitions.md), `tests/partition_kv.rs`) | not scheduled (off-root placement 4) |
 
 **Known limits** (correct answers, not refusals, unless stated):
 
@@ -3436,11 +3436,12 @@ built.
 |---|---|
 | `PARTITION BY RANGE` or `LIST`; `DEFAULT` partitions | not designed |
 | `PARTITION OF … FOR VALUES WITH (MODULUS m, REMAINDER r)`, `ATTACH`, `DETACH` | the child would hold different rows than in PostgreSQL. A later phase may accept `PARTITION OF` as a **write-only alias** (`INSERT` and `COPY` route through the parent, as a `pg_dump` restore needs; `SELECT`, `UPDATE`, `DELETE` stay refused). |
-| A key breaking §1.4 or §1.5, or over three columns; a unique key without every key column | §1.4, §1.5, §1b |
+| A key breaking §1.4 or §1.5, or over three columns; a unique key without every key column (0A000, PostgreSQL's code for its "unique constraint on partitioned table must include all partitioning columns") | §1.4, §1.5, §1b |
+| A key column dropped, retyped or made nullable (42P16, PostgreSQL's "cannot drop column … because it is part of the partition key"); a partition count out of range (22023) | §1.5 |
 | Naming a partition; `CREATE TABLE` or `RENAME` to a `__pt_` name | `add_table` checks only `contains_key` (`core/database/mod.rs:2100`); rename refuses only the JSON shadow prefix (`database/mod.rs:1408`) |
 | `STORAGE MOVE TABLE t` | points at `MOVE PARTITION` |
 | JSON columns in shredded mode | shadow tables would be unpartitioned; native JSONB is fine |
-| Temporary partitioned tables; KV-backed partitions | KV until measured |
+| Temporary partitioned tables | not scheduled |
 | `DROP INDEX` on a `USING partition` index | not an index (above) |
 | Until their phase: physical-rewrite `ALTER` on partitioned tables (phase 6, §11; the metadata forms, `RENAME` and `CREATE`/`DROP INDEX` are built in phase 3 P1); point-changing key assignment (phase 6, §9; any key assignment its `WHERE` does not pin to the same value, §4.5, which includes an `ON UPDATE CASCADE`, `SET NULL` or `SET DEFAULT` writing a child's partition key column); conversion and reshapes (phase 5). `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, `NOWAIT` and partitioned targets of `UPDATE … FROM`/`DELETE … USING` are built (phase 3 P3, §1b); FKs either way are built (phase 3 P4, §10) | §15 |
 | A `FOREIGN KEY` referencing a partitioned table by anything but its whole partition key (42830, PostgreSQL's "no unique constraint matching given keys": a unique key holds every key column, §1b, and a key is one column) | §10 |
@@ -3459,7 +3460,7 @@ answers like a plain table (below).
 | ~~`FOREIGN KEY` from a partitioned table (`CREATE … PARTITION BY`, `ADD CONSTRAINT`), and onto one (`REFERENCES`, `ADD CONSTRAINT`)~~ | ~~`CREATE` and the DDL arms~~ | lifted by phase 3 P4 ([as built](#phase-3-p4-as-built)); onto one by any column but its whole partition key: 42830, not a refusal |
 | An `UPDATE` assigning a key column anything its `WHERE` does not pin to the same value (`SET tenant_id = 5 WHERE tenant_id = 1`, `SET g = g + 1`), and a `DO UPDATE` that does so when its conflict happens | `assignments_keep_point` before routing (`DO UPDATE`: before the update writes); the range guard on every merged row behind it | phase 6 (row moves, §9) |
 | `ALTER … PARTITION BY`, `CREATE INDEX … USING partition` (on plain tables too); ~~`SPLIT PARTITION`, `ISOLATE KEY`, `SPLIT KEY`, `MERGE PARTITIONS`~~ (built in phase 5 P7); `STORAGE MOVE TABLE` on the logical name, which points at `MOVE PARTITION` (built in P7) | the ALTER, CREATE INDEX and STORAGE arms | phase 5 |
-| Temporary and unlogged partitioned tables; an in-memory database; a storage pool with backup mirrors; KV-backed partitions; shredded JSON columns | `CREATE … PARTITION BY` | not scheduled; KV until measured |
+| Temporary and unlogged partitioned tables; an in-memory database; a storage pool with backup mirrors; shredded JSON columns; ~~KV-backed partitions~~ (built, [kv-partitions.md](kv-partitions.md)) | `CREATE … PARTITION BY` | not scheduled |
 
 `ON CONFLICT` with a target that is not exactly one unique key (one that leaves
 out a key column, a subset or a superset) is not a refusal but PostgreSQL's
@@ -4550,10 +4551,23 @@ and is not designed here.
 
 ## 14. Observability
 
-- **`pg_class`** lists the logical table as relkind `'r'`; its size and tuple
-  counts are the running totals (§7.4). `'p'` would send psql and pg_dump to `pg_partitioned_table`,
-  which `catalog_views.rs` lacks, and to children they cannot query.
-- **`pg_inherits`** stays empty (`core/rql/catalog_views.rs:1122`).
+- **`pg_class`** lists the logical table as relkind `'p'`, PostgreSQL's
+  partitioned parent (relkind `'r'` until 2026-11-23); its size and tuple
+  counts are the running totals (§7.4). `pg_partitioned_table` has its row
+  (`partstrat` `'h'`, `partnatts`, `partattrs` by `attnum`, no default
+  partition, `partclass`/`partcollation` zeros: the key hashes by §1.3, not
+  an operator class), and `pg_get_partkeydef(oid)` answers `HASH (a, b)`.
+  psql's `\d` prints "Partitioned table" and "Partition key"; its
+  foreign-key query reads `pg_partition_ancestors(oid)`, answered as the
+  one row `relid = oid` since nothing here is a partition of anything
+  (`catalog_views::rewrite_reg_casts`). Test:
+  `driver_catalog_and_copy::a_partitioned_table_is_described_as_a_partitioned_parent`.
+- **`pg_inherits`** stays empty: the partitions are not relations a client
+  can name, so `\d` says "Number of partitions: 0". `pg_dump` does not run
+  against this server yet (it stops at `pg_is_in_recovery()`); whoever
+  makes it run must know that it dumps no data for a relkind `'p'` table,
+  expecting the rows in its leaf partitions, so a dump would lose every
+  partitioned table's rows.
 - **`pg_index`, `pg_indexes`** list declared indexes from the shell's
   `schema.secondary_indexes`, not live `indexes` (§3.3), and omit the partition
   key.
@@ -4653,8 +4667,8 @@ section specifying the mechanism.
 8. **Index memory** is rebuilt on every reopen; if that churns, use a longer
    idle window or [persistent indexes](persistent-indexes.md), whose v1 loads
    a snapshot instead after a clean close (§7.2, point 4).
-9. **`pg_dump`** emits a plain table, relkind being `'r'` (§14); a re-import
-   loses partitioning unless the importer is told.
+9. **`pg_dump`** does not run against this server yet; once it does, a
+   relkind `'p'` table's rows need dumping by hand (§14).
 10. **Out of scope:** a physical tenant drop (§13), and global uniqueness on a
     non-key column, which would need a hidden table partitioned by it and a
     two-partition write protocol.

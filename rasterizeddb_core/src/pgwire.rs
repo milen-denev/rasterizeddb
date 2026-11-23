@@ -10594,6 +10594,36 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("cannot reshape:") {
         return "22023";
     }
+    // The partition rules (docs/partitioning.md §1.4, §1.5, §1b), decided
+    // by their own words, whichever statement broke them: `CREATE …
+    // PARTITION BY`, a conversion (`ALTER TABLE … PARTITION BY`), which
+    // carries the refusal's text without its kind, or `ALTER` on a
+    // partitioned table. Without them a conversion's refusal answered XX000.
+    // Early: the messages quote column and table names.
+    //
+    // A key column dropped, retyped or made nullable: PostgreSQL's
+    // `invalid_table_definition` ("cannot drop column … because it is part
+    // of the partition key of relation …", "cannot alter column …").
+    if (has("is a partition key column of") && (has("drop column") || has("alter column")))
+        || has("drop not null on partition key column")
+    {
+        return "42P16";
+    }
+    // A unique key without every key column (PostgreSQL's "unique
+    // constraint on partitioned table must include all partitioning
+    // columns", 0A000), and the keys PostgreSQL takes and this engine does
+    // not: a nullable, generated or JSON column, a type off the §1.4 list.
+    if has("does not contain partition key column")
+        || has("is nullable; a partition key column must be not null")
+        || has("which cannot be a partition key")
+        || has("a partition key cannot be of type")
+    {
+        return "0A000";
+    }
+    // A partition count out of range: `invalid_parameter_value`.
+    if has("partitions must be between 1 and") || has("a partitioned table takes a whole number of partitions") {
+        return "22023";
+    }
     // The everyday functions' own errors (`rql::pg_functions`), with
     // PostgreSQL's codes. Early: they quote the argument text.
     if has("step size cannot equal zero")

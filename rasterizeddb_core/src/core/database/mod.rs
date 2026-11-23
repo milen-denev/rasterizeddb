@@ -59,6 +59,8 @@ mod row_move_tests;
 mod physical_alter_tests;
 #[cfg(test)]
 mod convert_tests;
+#[cfg(test)]
+mod partition_refusal_codes_tests;
 pub mod relation;
 pub mod slots;
 pub mod table_for;

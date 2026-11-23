@@ -153,6 +153,8 @@ pub enum PgFunc {
     FormatType,
     PgGetIndexDef,
     PgGetConstraintDef,
+    /// `pg_get_partkeydef(oid)`: a partitioned table's key.
+    PgGetPartKeyDef,
     PgGetFunctionResult,
     PgGetFunctionArguments,
     PgGetExpr,
@@ -275,7 +277,7 @@ pub const NAMES: &[&str] = &[
     "JSON_BUILD_ARRAY", "JSONB_BUILD_ARRAY", "TO_JSON", "TO_JSONB", "JSONB_ARRAY_LENGTH", "JSON_ARRAY_LENGTH",
     "NUM_NONNULLS", "NUM_NULLS", "STRING_TO_ARRAY", "ARRAY_TO_STRING", "CARDINALITY", "TRIM", "PG_TYPEOF",
     "ARRAY_APPEND", "ARRAY_PREPEND", "ARRAY_CAT", "JSONB_SET", "JSONB_STRIP_NULLS", "NEXTVAL", "CURRVAL", "SETVAL",
-    "LASTVAL", "PG_GET_USERBYID", "FORMAT_TYPE", "PG_GET_INDEXDEF", "PG_GET_CONSTRAINTDEF",
+    "LASTVAL", "PG_GET_USERBYID", "FORMAT_TYPE", "PG_GET_INDEXDEF", "PG_GET_CONSTRAINTDEF", "PG_GET_PARTKEYDEF",
     "PG_GET_FUNCTION_RESULT", "PG_GET_FUNCTION_ARGUMENTS", "PG_GET_FUNCTION_IDENTITY_ARGUMENTS", "PG_GET_EXPR",
     "PG_ENCODING_TO_CHAR", "OBJ_DESCRIPTION", "COL_DESCRIPTION", "SHOBJ_DESCRIPTION", "PG_RELATION_IS_PUBLISHABLE",
     "PG_COLUMN_IS_UPDATABLE", "__REGCLASS_NAME", "PG_GET_STATISTICSOBJDEF_COLUMNS", "PG_GET_TRIGGERDEF",
@@ -446,6 +448,7 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "FORMAT_TYPE" => (FormatType, &[2]),
         "PG_GET_INDEXDEF" => (PgGetIndexDef, &[1, 3]),
         "PG_GET_CONSTRAINTDEF" => (PgGetConstraintDef, &[1, 2]),
+        "PG_GET_PARTKEYDEF" => (PgGetPartKeyDef, &[1]),
         "PG_GET_FUNCTION_RESULT" => (PgGetFunctionResult, &[1]),
         "PG_GET_FUNCTION_ARGUMENTS" | "PG_GET_FUNCTION_IDENTITY_ARGUMENTS" => (PgGetFunctionArguments, &[1]),
         "PG_GET_EXPR" => (PgGetExpr, &[2, 3]),
@@ -530,7 +533,7 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
         Scale | MinScale => DbType::I32,
         TrimScale => DbType::DECIMAL,
         NextVal | CurrVal | SetVal | LastVal => DbType::I64,
-        PgGetUserById | FormatType | PgGetIndexDef | PgGetConstraintDef | PgGetFunctionResult
+        PgGetUserById | FormatType | PgGetIndexDef | PgGetConstraintDef | PgGetPartKeyDef | PgGetFunctionResult
         | PgGetFunctionArguments | PgGetExpr | PgEncodingToChar | Description | RegclassName => DbType::STRING,
         RelationIsPublishable | ColumnIsUpdatable => DbType::BOOL,
         Sha224 | Sha256 | Sha384 | Sha512 | ConvertTo => DbType::BYTEA,
@@ -2212,6 +2215,10 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             }
         }
         PgGetConstraintDef => match crate::core::rql::catalog_model::constraint_definition(int_of(&args[0], "the constraint's oid")?) {
+            Some(text) => text_value(text),
+            None => Value::Null,
+        },
+        PgGetPartKeyDef => match crate::core::rql::catalog_model::partition_key_definition(int_of(&args[0], "the relation's oid")?) {
             Some(text) => text_value(text),
             None => Value::Null,
         },

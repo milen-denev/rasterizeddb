@@ -348,8 +348,11 @@ const REFUSED: &[Refusal] = &[
     // ForeignKeyOntoPartitioned and ForeignKeyFromSink are compared with the
     // twin, AddForeignKey's refusal gone with them.
     refused(UniqueWithoutKey, "never (§1b)"),
-    refused(DropNotNullKey, "never (§1.5)"),
-    refused(DropKeyColumn, "never (§1.5)"),
+    // A key column made nullable or dropped: PostgreSQL's
+    // invalid_table_definition, as its "cannot drop column … because it is
+    // part of the partition key".
+    Refusal { kind: DropNotNullKey, code: "42P16", lifted_by: "never (§1.5)", or_like_twin: None },
+    Refusal { kind: DropKeyColumn, code: "42P16", lifted_by: "never (§1.5)", or_like_twin: None },
     // AddColumnPopulated and AlterType (INT to BIGINT, every value
     // converted) are built (phase 6 P8, every row rewritten into a new uid)
     // and compared with the twin.
@@ -1588,10 +1591,10 @@ impl Gen {
             // touch two partitions, which never overwrite in place (one
             // statement snapshot, `row_source::write_partitions`).
             CatalogClass if self.spread || self.reshaped => {
-                self.simple(kind, "SELECT relname, relkind FROM pg_class WHERE relname = '{t}'".into())
+                self.simple(kind, "SELECT relname FROM pg_class WHERE relname = '{t}'".into())
             }
             CatalogClass => {
-                self.simple(kind, "SELECT relname, relkind, reltuples >= 0 AS counted FROM pg_class WHERE relname = '{t}'".into())
+                self.simple(kind, "SELECT relname, reltuples >= 0 AS counted FROM pg_class WHERE relname = '{t}'".into())
             }
             CatalogStat if self.spread || self.reshaped => {
                 self.simple(kind, "SELECT schemaname, relname FROM pg_stat_user_tables WHERE relname = '{t}'".into())

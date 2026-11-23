@@ -73,6 +73,7 @@ const VIEWS: &[&str] = &[
     "pg_rewrite",
     "pg_depend",
     "pg_extension",
+    "pg_partitioned_table",
 ];
 
 /// The relations built from [`crate::core::rql::catalog_model::Model`].
@@ -451,10 +452,14 @@ pub async fn materialize(
 /// name, `__regclass_name(conrelid)`; `x::regtype` as `format_type(x, NULL)`.
 /// `psql`'s `(SELECT pg_partition_ancestors(r) UNION ALL VALUES (r))`, the
 /// relation and the ancestors it was partitioned from, is `(r)`: nothing
-/// here is a partition of another relation.
+/// here is a partition of another relation. For the same reason
+/// `pg_partition_ancestors(oid)` in a `FROM` list, which `psql`'s `\d` reads
+/// a partitioned table's foreign keys through, is the one row `relid = oid`.
+/// A cast qualified by `pg_catalog.`, as `psql` 18 writes them
+/// (`'16384'::pg_catalog.regclass`), is the cast unqualified.
 fn rewrite_reg_casts(sql: &str) -> String {
     let lower = sql.to_ascii_lowercase();
-    if !lower.contains("::reg") && !lower.contains("pg_partition_ancestors") {
+    if !lower.contains("::reg") && !lower.contains("pg_catalog.reg") && !lower.contains("pg_partition_ancestors") {
         return sql.to_string();
     }
     let sql = match regex::Regex::new(
@@ -462,6 +467,16 @@ fn rewrite_reg_casts(sql: &str) -> String {
     ) {
         Ok(re) => re.replace_all(sql, "($2)").into_owned(),
         Err(_) => sql.to_string(),
+    };
+    let sql = match regex::Regex::new(
+        r"(?i)(,|\bFROM|\bJOIN)(\s*)(?:pg_catalog\s*\.\s*)?pg_partition_ancestors\s*\(\s*'?(\d+)'?\s*\)",
+    ) {
+        Ok(re) => re.replace_all(&sql, "$1$2(VALUES ($3)) AS pg_partition_ancestors(relid)").into_owned(),
+        Err(_) => sql,
+    };
+    let sql = match regex::Regex::new(r"(?i)::\s*pg_catalog\s*\.\s*(reg(?:class|type|namespace|role))\b") {
+        Ok(re) => re.replace_all(&sql, "::$1").into_owned(),
+        Err(_) => sql,
     };
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
@@ -1838,8 +1853,8 @@ async fn build(
             )
         }
         // Nothing inherits from anything here. A partitioned table is one
-        // relation (relkind 'r' above) whose partitions no client can name, so
-        // they are not children either. Produced empty rather than refused: a
+        // relation (relkind 'p' above, with its `pg_partitioned_table` row)
+        // whose partitions no client can name, so they are not children. Produced empty rather than refused: a
         // query that anti-joins against it, which is how a caller excludes
         // partitions, then gets the right answer.
         "pg_inherits" => (

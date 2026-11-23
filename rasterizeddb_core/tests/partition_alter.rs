@@ -110,11 +110,20 @@ impl Pair {
     /// "not supported", `needle` in the reason), writing nothing; the twin
     /// does not run it.
     fn refused(&mut self, template: &str, needle: &str) {
+        self.refused_as(template, needle, "0A000");
+    }
+
+    /// [`Self::refused`] with `code`: a key column dropped, retyped or made
+    /// nullable is PostgreSQL's 42P16, not a missing feature.
+    fn refused_as(&mut self, template: &str, needle: &str, code: &str) {
         let before = self.state();
         let sql = render(template, PART);
         match self.p.as_mut().unwrap().simple(&sql) {
             Err(e) => {
-                assert!(e.is_unsupported(), "`{sql}` failed, but not as a refusal: {e}");
+                assert!(
+                    e.code == code && e.message.to_ascii_lowercase().contains("not supported"),
+                    "`{sql}` failed, but not as a {code} refusal: {e}"
+                );
                 assert!(e.message.contains(needle), "`{sql}`'s refusal does not say {needle:?}: {e}");
             }
             Ok(r) => panic!("`{sql}` was not refused: {r:?}"),
@@ -151,7 +160,7 @@ impl Pair {
              WHERE r.relname = '{t}' ORDER BY 1, 2, 3",
             "SHOW COLUMNS FROM {t}",
             "DESCRIBE {t}",
-            "SELECT relname, relkind FROM pg_class WHERE relname = '{t}'",
+            "SELECT relname FROM pg_class WHERE relname = '{t}'",
             "SELECT count(*) FROM {t}",
         ] {
             let out = self.both_ordered(q, true);
@@ -267,7 +276,7 @@ fn every_metadata_ddl_answers_like_a_plain_twin_and_survives_a_restart() {
     // Populated: every row rewritten into a new uid (phase 6 P8), like the twin.
     pair.ok("ALTER TABLE {t} ALTER COLUMN n DROP NOT NULL");
     pair.ok("SELECT tenant_id, id, n FROM {t} ORDER BY tenant_id, id");
-    pair.refused("ALTER TABLE {t} ALTER COLUMN tenant_id DROP NOT NULL", "must be NOT NULL");
+    pair.refused_as("ALTER TABLE {t} ALTER COLUMN tenant_id DROP NOT NULL", "must be NOT NULL", "42P16");
     pair.compare("not null");
 
     // Renames: a value column, the key column, back again.
@@ -287,7 +296,7 @@ fn every_metadata_ddl_answers_like_a_plain_twin_and_survives_a_restart() {
     // change rewrite.
     pair.ok("ALTER TABLE {t} DROP COLUMN f");
     pair.fails_alike("SELECT f FROM {t}");
-    pair.refused("ALTER TABLE {t} DROP COLUMN tenant_id", "partition key column");
+    pair.refused_as("ALTER TABLE {t} DROP COLUMN tenant_id", "partition key column", "42P16");
     // Rewritten into a new uid (phase 6 P8), like the twin; so is a type
     // change, every value converted (`retype_by_cast`).
     pair.ok("ALTER TABLE {t} ADD COLUMN extra INT");
@@ -295,7 +304,7 @@ fn every_metadata_ddl_answers_like_a_plain_twin_and_survives_a_restart() {
     pair.ok("SELECT tenant_id, id, extra, extra2 FROM {t} ORDER BY tenant_id, id");
     pair.ok("ALTER TABLE {t} ALTER COLUMN n TYPE BIGINT");
     pair.ok("SELECT tenant_id, id, n FROM {t} ORDER BY tenant_id, id");
-    pair.refused("ALTER TABLE {t} ALTER COLUMN tenant_id TYPE INT", "partition key column");
+    pair.refused_as("ALTER TABLE {t} ALTER COLUMN tenant_id TYPE INT", "partition key column", "42P16");
     pair.ok("ALTER TABLE {t} ADD COLUMN IF NOT EXISTS n INT");
     pair.fails("ALTER TABLE {t} ADD COLUMN n INT", "42701");
     pair.compare("columns dropped");
@@ -334,7 +343,7 @@ fn metadata_only_add_column_and_drop_not_null_on_an_empty_table() {
     pair.ok("ALTER TABLE {t} ADD COLUMN must INT NOT NULL");
     pair.ok("ALTER TABLE {t} ALTER COLUMN must DROP NOT NULL");
     pair.ok("ALTER TABLE {t} ALTER COLUMN filled DROP NOT NULL");
-    pair.refused("ALTER TABLE {t} ALTER COLUMN tenant_id DROP NOT NULL", "must be NOT NULL");
+    pair.refused_as("ALTER TABLE {t} ALTER COLUMN tenant_id DROP NOT NULL", "must be NOT NULL", "42P16");
     // `jsonb` is a stored document and `json` its text as written: both
     // ordinary columns, as `CREATE TABLE` makes them. (A shredded one, made
     // only under `json_shadow_tables`, is refused: `shredded_shadow_ddl.rs`.)

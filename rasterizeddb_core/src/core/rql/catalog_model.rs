@@ -434,6 +434,9 @@ pub(crate) struct Rel {
     pub constraints: Vec<Constraint>,
     pub bytes: i64,
     pub tuples: i64,
+    /// A partitioned table's key columns, outermost first, by `attnum`
+    /// (`pg_partitioned_table.partattrs`); empty for any other relation.
+    pub partition_key: Vec<i64>,
 }
 
 /// A role, as `pg_roles` lists it.
@@ -1034,14 +1037,30 @@ pub(crate) async fn build_model(
             ready_of(&relation),
         );
         let (bytes, tuples) = sizes.get(name).copied().unwrap_or((0, 0));
+        // A partitioned table is PostgreSQL's partitioned parent, relkind
+        // 'p' with its `pg_partitioned_table` row. Its partitions are not
+        // relations a client can name, so nothing lists them as children
+        // (`pg_inherits` stays empty).
+        let partition_key: Vec<i64> = match &relation {
+            Relation::Partitioned(pt) => pt
+                .key_columns()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|k| columns.iter().find(|c| c.name.eq_ignore_ascii_case(k)).map(|c| c.attnum))
+                .collect(),
+            Relation::Plain(_) => Vec::new(),
+        };
         rels.push(Rel {
             oid: oid_of(name),
             name: name.to_string(),
             kind: if materialized.contains(&name) {
                 "m"
+            } else if matches!(relation, Relation::Partitioned(_)) {
+                "p"
             } else {
                 "r"
             },
+            partition_key,
             owner: owner(name),
             columns,
             indexes,
@@ -1118,6 +1137,7 @@ pub(crate) async fn build_model(
             oid: oid_of(&view.name),
             name: view.name.clone(),
             kind: "v",
+            partition_key: Vec::new(),
             owner: owner(&view.name),
             columns,
             indexes: Vec::new(),
@@ -1131,6 +1151,7 @@ pub(crate) async fn build_model(
             oid: oid_of(name),
             name: name.clone(),
             kind: "S",
+            partition_key: Vec::new(),
             owner: owner(name),
             columns: Vec::new(),
             indexes: Vec::new(),
@@ -1360,6 +1381,28 @@ pub fn function_text(oid: i64, what: &str) -> Option<String> {
     })
 }
 
+/// `pg_get_partkeydef(oid)`: a partitioned table's key as PostgreSQL
+/// prints it, `HASH (tenant_id, id)`; `None` (NULL) for any other oid.
+pub fn partition_key_definition(oid: i64) -> Option<String> {
+    let model = lookup()?;
+    let rel = model.rels.iter().find(|r| r.oid == oid && r.kind == "p")?;
+    let names: Vec<String> = rel
+        .partition_key
+        .iter()
+        .filter_map(|n| rel.columns.iter().find(|c| c.attnum == *n).map(|c| key_ident(&c.name)))
+        .collect();
+    Some(format!("HASH ({})", names.join(", ")))
+}
+
+/// A key column's name as `pg_get_partkeydef` prints it: bare when it is a
+/// plain lower-case identifier, quoted otherwise. Reserved words are not
+/// told apart; a key column named `user` prints bare.
+fn key_ident(name: &str) -> String {
+    let plain = name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '$');
+    if plain { name.to_string() } else { quote_ident(name) }
+}
+
 /// A relation's name by its oid (`oid::regclass` as text), or the number
 /// for an oid that names none, as PostgreSQL prints it.
 pub fn regclass_name(oid: i64) -> String {
@@ -1371,6 +1414,7 @@ pub fn regclass_name(oid: i64) -> String {
 // ------------------------------------------------------------------ relations
 
 pub(crate) const NEW_VIEWS: &[&str] = &[
+    "pg_partitioned_table",
     "pg_type",
     "pg_proc",
     "pg_range",
@@ -1479,6 +1523,11 @@ pub(crate) fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]
             ("attinhcount", I16),
             ("attcollation", I64),
             ("attstattarget", I16),
+            // What `psql`'s `\d+` selects: `p` (plain) for a fixed-width
+            // type, `x` (extended) for a variable one, as PostgreSQL's
+            // defaults; no column has a compression method.
+            ("attstorage", STRING),
+            ("attcompression", STRING),
         ],
         "pg_attrdef" => &[
             ("oid", I64),
@@ -1688,6 +1737,19 @@ pub(crate) fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]
             ("indisreplident", BOOL),
             ("indkey", INT2_ARRAY),
         ],
+        // `partclass` and `partcollation` (oidvectors) as arrays, one zero
+        // each: the key hashes by the engine's own rule, not an operator
+        // class. No default partition, no key expressions.
+        "pg_partitioned_table" => &[
+            ("partrelid", I64),
+            ("partstrat", STRING),
+            ("partnatts", I16),
+            ("partdefid", I64),
+            ("partattrs", INT2_ARRAY),
+            ("partclass", INT2_ARRAY),
+            ("partcollation", INT2_ARRAY),
+            ("partexprs", STRING),
+        ],
         "pg_namespace" => &[
             ("oid", I64),
             ("nspname", STRING),
@@ -1838,6 +1900,8 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                         V::I(0),
                         V::I(c.collation),
                         V::I(-1),
+                        t(if c.len > 0 { "p" } else { "x" }),
+                        t(""),
                     ]);
                 }
             }
@@ -2024,7 +2088,7 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                     V::B(false),
                     V::B(false),
                     V::B(true),
-                    t(if rel.kind == "r" { "d" } else { "n" }),
+                    t(if matches!(rel.kind, "r" | "p") { "d" } else { "n" }),
                     V::B(false),
                     V::N,
                     V::N,
@@ -2093,6 +2157,23 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                         V::A(i.keys.clone()),
                     ]
                 })
+            })
+            .collect(),
+        "pg_partitioned_table" => model
+            .rels
+            .iter()
+            .filter(|rel| rel.kind == "p")
+            .map(|rel| {
+                vec![
+                    V::I(rel.oid),
+                    t("h"),
+                    V::I(rel.partition_key.len() as i64),
+                    V::I(0),
+                    V::A(rel.partition_key.clone()),
+                    V::A(vec![0; rel.partition_key.len()]),
+                    V::A(vec![0; rel.partition_key.len()]),
+                    V::N,
+                ]
             })
             .collect(),
         "pg_enum" => model
