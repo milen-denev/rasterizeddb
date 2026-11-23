@@ -760,8 +760,9 @@ either side (`u.tid = t.id::bigint`, `::numeric(10,1)`), or, in `UPDATE …
 FROM`, name the target beside its source; a cast keeps its type modifier
 there (`::varchar(1)`, `::char(2)`, `::timestamp(0)`, `::interval(3)`), as it
 does everywhere. One that compares an outer
-column under arithmetic (`u.x = t.x + 1`), or an `EXISTS` used as a value
-(`x - EXISTS (…)::int`), is refused with 0A000.
+column under arithmetic (`u.x = t.x + 1`) is answered too, and so is an
+`EXISTS` used as a value (`x - EXISTS (…)::int`), as the count it asks
+about.
 
 ### NUMERIC results and display scale
 

@@ -381,13 +381,13 @@ async fn a_correlated_exists_in_an_update_or_delete_runs_at_every_isolation_leve
     assert_eq!(rows(&pool).await, vec![(1, 0), (3, 0)]);
 }
 
-/// Correlations PostgreSQL places that the rewrite placed wrong, and one it
-/// cannot, each with its proper answer: a schema-qualified outer column
-/// (Prisma's `"public"."t"."id"`) and an EXISTS beside an `UPDATE … FROM`
-/// source correlating with the target run (both were 42P01, "missing
-/// FROM-clause entry"); an outer column under arithmetic (`u.x = t.x + 1`)
-/// runs; an EXISTS used as a value (`x - EXISTS (…)::int`, was XX000) is
-/// refused as 0A000.
+/// Correlations PostgreSQL places that the rewrite placed wrong, each with
+/// its proper answer: a schema-qualified outer column (Prisma's
+/// `"public"."t"."id"`) and an EXISTS beside an `UPDATE … FROM` source
+/// correlating with the target run (both were 42P01, "missing FROM-clause
+/// entry"); an outer column under arithmetic (`u.x = t.x + 1`) and an
+/// EXISTS used as a value (`x - EXISTS (…)::int`, was XX000, then 0A000)
+/// run.
 ///
 /// A cast on either side of the correlated column (`u.tid = t.id::bigint`,
 /// `u.tid::int = t.id`) is a correlation too.
@@ -421,14 +421,13 @@ async fn correlations_are_placed_or_refused_with_their_code() {
     assert_eq!(changed.rows_affected(), 1);
     conn.execute("ROLLBACK").await.expect("rollback");
     conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
-    for sql in [
-        "UPDATE t2 SET v = x - EXISTS (SELECT 1 FROM u2 WHERE u2.tid = t2.id)::int",
-    ] {
-        let e = conn.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.expect_err(sql);
-        assert_eq!(code(&e), "0A000", "{sql}: {e}");
-        conn.execute("ROLLBACK").await.expect("rollback");
-        conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
-    }
+    // An EXISTS used as a value, as its count (`exists_as_counts`): it was
+    // refused. PostgreSQL updates both rows (2|5, 1|0).
+    let as_value = "UPDATE t2 SET v = x - EXISTS (SELECT 1 FROM u2 WHERE u2.tid = t2.id)::int";
+    let changed = conn.execute(sqlx::raw_sql(AssertSqlSafe(as_value.to_string()))).await.expect(as_value);
+    assert_eq!(changed.rows_affected(), 2, "{as_value}");
+    conn.execute("ROLLBACK").await.expect("rollback");
+    conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
     for sql in [
         r#"UPDATE "public"."t2" SET v = 7 WHERE EXISTS (SELECT 1 FROM u2 WHERE u2.tid = "public"."t2"."id")"#,
         "UPDATE t2 SET v = 9 FROM u2 WHERE u2.tid = t2.id AND EXISTS (SELECT 1 FROM w2 WHERE w2.y = t2.y)",

@@ -1479,10 +1479,15 @@ pub(crate) fn exists_as_counts(sql: &str) -> Option<String> {
             continue;
         };
         let only_equalities_refusal = |e: &str| e.contains("can compare an outer column only with");
+        // Also an EXISTS that is a value — `x - EXISTS (…)::int` — which no
+        // `IN` can stand in for: as the count, a number the cast and the
+        // arithmetic read. It was refused ("a correlated EXISTS used as a
+        // value … is not supported").
         let goes = bounds.limit != Some(0)
             && bounds.offset == 0
             && subquery::uncorrelated_exists(&body, &outer).is_none()
-            && subquery::exists_to_in(&body, &outer).is_err_and(|e| only_equalities_refusal(&e));
+            && (exists_used_as_value(&current, clause.start, clause.end)
+                || subquery::exists_to_in(&body, &outer).is_err_and(|e| only_equalities_refusal(&e)));
         if !goes {
             continue;
         }
@@ -1525,10 +1530,12 @@ fn correlated_write_where(sql: &str, database: &Arc<Database>, delete: bool) -> 
     match crate::core::rql::correlated::rewrite_write_where(counted_sql, &key, delete) {
         Some(Ok(joined)) => Some(Ok(WriteWhere::Joined(joined))),
         Some(Err(e)) => Some(Err(e)),
-        // A correlated IN that became an EXISTS the write path answers
-        // itself (an equality, `exists_to_in`): the statement goes on as
-        // that. Left as the IN it was, it was refused.
-        None => as_exists.map(|plain| Ok(WriteWhere::Plain(plain))),
+        // Rewritten with nothing left for the joined path — a correlated IN
+        // that became an EXISTS the write path answers itself (an equality,
+        // `exists_to_in`), or an EXISTS used as a value in the SET, counted,
+        // which `correlated::rewrite_update` places: the statement goes on as
+        // it now reads. Left as it was, it was refused.
+        None => counted.or(as_exists).map(|plain| Ok(WriteWhere::Plain(plain))),
     }
 }
 
@@ -1632,6 +1639,11 @@ pub async fn substitute_in_subqueries(
         if bounds.limit == Some(0) {
             // `LIMIT 0` returns nothing, for every outer row.
             let predicate = subquery::uncorrelated_exists_predicate(clause.negated, false);
+            let predicate = if exists_used_as_value(&current, clause.start, clause.end) {
+                format!("({predicate})")
+            } else {
+                predicate.to_string()
+            };
             current = format!(
                 "{}{}{}",
                 &current[..clause.start],
@@ -1661,6 +1673,14 @@ pub async fn substitute_in_subqueries(
             };
             let predicate =
                 subquery::uncorrelated_exists_predicate(clause.negated, !rows.is_empty());
+            // Parenthesised where it is a value: `EXISTS (…)::int + 1` became
+            // `1 = 1::int + 1`, which reads as `1 = 2`, and answered false
+            // where PostgreSQL answers 2.
+            let predicate = if exists_used_as_value(&current, clause.start, clause.end) {
+                format!("({predicate})")
+            } else {
+                predicate.to_string()
+            };
             current = format!(
                 "{}{}{}",
                 &current[..clause.start],
