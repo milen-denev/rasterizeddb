@@ -675,11 +675,11 @@ fn data_locations_are_the_primaries_and_placed_directories_but_not_the_root() {
 }
 
 #[test]
-fn a_pool_file_copied_from_another_directory_is_still_read() {
-    // The warning path: a mirrored directory opened as a database carries the
-    // original's pool file. Opening must not fail — the copy is usable, and the
-    // operator is told — but the placements it carries are the original's, so
-    // this is the shape that needs the log line.
+fn a_pool_file_copied_from_another_directory_is_adopted_by_the_copy() {
+    // A directory copied with its pool file (a mirror opened as a database, a
+    // `cp -a`) carries placements that name the original. Read as they were,
+    // the copy's tables resolved to the original's files. One primary and every
+    // table on it: the copy is adopted, and its table resolves inside it.
     let elsewhere = temp_root("copied_pool");
     let text = format!(
         "version\t1\nlocation\tprimary\t1\tenabled\t/srv/somewhere-else\n\
@@ -689,12 +689,15 @@ fn a_pool_file_copied_from_another_directory_is_still_read() {
 
     let pool = StorageManager::open(&elsewhere);
 
-    // Read, not refused: the placement is the original's, which is exactly what
-    // the warning is about.
     assert_eq!(
         pool.location_of("orders").as_deref(),
-        Some("/srv/somewhere-else")
+        Some(elsewhere.as_str()),
+        "the copy's table resolves outside the copy"
     );
+    // And the file on disk says so, for the next start and for an operator.
+    let on_disk = std::fs::read_to_string(std::path::Path::new(&elsewhere).join(POOL_FILE)).unwrap();
+    assert!(!on_disk.contains("/srv/somewhere-else"), "{on_disk}");
+    assert!(on_disk.contains(&format!("table\t{elsewhere}\torders")), "{on_disk}");
 }
 
 #[test]

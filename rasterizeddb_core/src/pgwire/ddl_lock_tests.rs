@@ -337,11 +337,14 @@ async fn partitioned_ddl_waits_for_readers_and_its_refusals_take_no_lock() {
     )
     .await;
     let mut r = reader(&db, "pt").await;
-    for sql in ["ALTER TABLE pt ALTER COLUMN tenant_id DROP NOT NULL", "ALTER TABLE pt ADD CONSTRAINT pt_u UNIQUE (v)"] {
+    for (sql, code) in [
+        ("ALTER TABLE pt ALTER COLUMN tenant_id DROP NOT NULL", "42P16"),
+        ("ALTER TABLE pt ADD CONSTRAINT pt_u UNIQUE (v)", "0A000"),
+    ] {
         let refused = spawn(&db, session(&db), sql);
         let (_, out, took) = finish(sql, refused).await;
         let e = out.expect_err(sql);
-        assert_eq!(sqlstate_of(&e), "0A000", "{sql}: {e}");
+        assert_eq!(sqlstate_of(&e), code, "{sql}: {e}");
         assert!(took < SETTLE * 5, "{sql}: waited {took:?} before its refusal");
     }
     let index = spawn(&db, session(&db), "CREATE INDEX pt_v ON pt (v)");
