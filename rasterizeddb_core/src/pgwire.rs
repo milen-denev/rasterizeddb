@@ -10548,7 +10548,8 @@ fn materialize_class(code: &'static str) -> &'static str {
     // `21`: a scalar subquery inside it that gave more than one row (a
     // correlated one runs as a derived relation), the data's, not a feature.
     // 42803: a grouped query reading an ungrouped column, in a subquery too.
-    if ["21", "23", "22", "40", "57", "55", "53", "58", "42P01", "42703", "42702", "42803"]
+    // 42804: a set operation in it over two type families.
+    if ["21", "23", "22", "40", "57", "55", "53", "58", "42P01", "42703", "42702", "42803", "42804"]
         .iter()
         .any(|class| code.starts_with(class))
     {
@@ -10978,6 +10979,12 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         || has(" but expression is of type ")
         || has("cannot be cast automatically to type")
     {
+        return "42804";
+    }
+    // A set operation over two type families (`set_ops`): "UNION types text
+    // and bigint cannot be matched", also under the name of the CTE or the
+    // derived table it failed in.
+    if has(" types ") && has(" cannot be matched") {
         return "42804";
     }
     // `dependent_objects_still_exist`: DROP TABLE of a table other tables'
@@ -17075,9 +17082,8 @@ mod union_widening_tests {
     /// A `*` is several columns, so the items after it are not at the
     /// positions their places in the list say. `SELECT *, n FROM t32` was
     /// typed `[?, int]`, and paired with `t64`'s second column that widened
-    /// output column 1, `name`, a text column, to `bigint`. The engine refuses
-    /// `*` beside other items today, which is all that kept this from a
-    /// client; PostgreSQL 17 refuses the `UNION` itself, as text and bigint.
+    /// output column 1, `name`, a text column, to `bigint`. PostgreSQL 17
+    /// refuses the `UNION` itself, as text and bigint, and so does this.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_star_does_not_shift_the_widening_onto_another_column() {
         let (_dir, db) = open().await;
@@ -17090,8 +17096,14 @@ mod union_widening_tests {
         let branches: Vec<String> =
             crate::core::rql::join::union_branches("SELECT *, n FROM t32 UNION ALL SELECT a, b, c, d FROM t64")
                 .expect("a UNION");
+        // The items after the `*` are typed slot for slot now that the
+        // engine reads `*` beside other items: `name`, the text column, is
+        // at position 1 and is not widened; the integers around it are.
+        // The statement itself is refused when its rows meet, as text and
+        // bigint (`set_ops::Combined::same_families`; compat
+        // `set_operation_type_families`).
         let widened = crate::core::rql::set_ops::widened_branch_integers(&branches, &db, &[]);
-        assert!(widened.iter().all(Option::is_none), "{widened:?}");
+        assert_eq!(widened, vec![Some(DbType::I64), None, Some(DbType::I64), Some(DbType::I64)]);
     }
 }
 

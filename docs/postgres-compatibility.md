@@ -1463,7 +1463,16 @@ source) all run now and are no longer gaps. What is still missing:
 - **DDL**: `CREATE TABLE … (LIKE t INCLUDING …)`, `UNIQUE NULLS NOT DISTINCT`,
   `PARTITION BY RANGE`/`LIST` (tables partition by `HASH` only), and
   `UPDATE … SET a[1] = …`.
-- **Queries**: of two equal `NUMERIC` values written at different scales,
+- **Queries**: a set operation of a `date` column and a `timestamp` column
+  is refused (0A000; cast the date, `d::timestamp`), where PostgreSQL makes
+  the date a timestamp; a string constant in the *first* branch beside a
+  typed column of a later one (`SELECT '5' UNION ALL SELECT i FROM t`) is
+  refused (0A000; write `'5'::integer`), where PostgreSQL reads it as that
+  type (in a later branch it is read so here too); values of different type
+  families are refused as in PostgreSQL (42804), two columns before any row
+  is read, a `*`'s, a join's or an expression's when the rows meet (over
+  empty input such a statement answers); of two equal `NUMERIC` values
+  written at different scales,
   `INTERSECT` shows the first branch's digits (`2.25`) where PostgreSQL may
   show the other's (`2.2500`); an outer column
   named bare where the subquery's relations are not all known (a CTE, a

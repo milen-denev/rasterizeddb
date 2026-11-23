@@ -6788,11 +6788,20 @@ fn constant_condition_holds(condition: &str) -> Result<bool, String> {
 /// Kept out of `execute_with_context`'s own frame: that function is one large
 /// match and its future is the sum of every arm's locals.
 async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8> {
-    let parts = match crate::core::rql::join::split_union(sql) {
+    let mut parts = match crate::core::rql::join::split_union(sql) {
         Some(Ok(parts)) => parts,
         Some(Err(e)) => return ddl_error(&e),
         None => return ddl_error("not a UNION"),
     };
+    // A string constant beside a typed column, as that type
+    // (`set_ops::type_string_constants`).
+    crate::core::rql::set_ops::type_string_constants(&mut parts, database);
+    let parts = parts;
+    // Columns of two families at one position: PostgreSQL's 42804
+    // (`set_ops::refuse_mismatched_columns`).
+    if let Err(e) = crate::core::rql::set_ops::refuse_mismatched_columns(&parts, database) {
+        return ddl_error(&e);
+    }
     // Rows told apart by a column with a nondeterministic collation are
     // refused (`collation::refuse_in_set_op`).
     let compares = parts.ops.iter().any(|op| !(op.all && op.kind == crate::core::rql::join::SetKind::Union));

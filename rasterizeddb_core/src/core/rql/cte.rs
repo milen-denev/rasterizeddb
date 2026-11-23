@@ -263,7 +263,7 @@ fn bare_column(expression: &str) -> Option<String> {
 }
 
 /// The select-list text of a `SELECT … FROM …`, for naming the columns.
-fn select_list_of(body: &str) -> Option<&str> {
+pub(crate) fn select_list_of(body: &str) -> Option<&str> {
     let upper = body.to_ascii_uppercase();
     if !upper.trim_start().starts_with("SELECT") {
         return None;
