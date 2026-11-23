@@ -53,7 +53,7 @@ pub fn constant_branch(branch: &str) -> Option<Vec<(Option<DbType>, u32)>> {
         }
     }
     let list = crate::core::rql::cte::without_set_quantifier(list);
-    Some(
+    let mut items: Vec<(Option<DbType>, u32)> =
         crate::core::rql::lexer_ct::split_definitions(list)
             .iter()
             .map(|item| {
@@ -83,8 +83,25 @@ pub fn constant_branch(branch: &str) -> Option<Vec<(Option<DbType>, u32)>> {
                     (None, 0)
                 }
             })
-            .collect(),
-    )
+            .collect();
+    // An item that computes its value (`round(2.567, 1)`, `1 + 1`,
+    // `upper('x')`): typed as the statement run alone types it, at the scale
+    // its one row is written at (`no_from`, which is what runs the branch).
+    // Unknown, it was refused beside a NUMERIC column ("of a type this
+    // cannot tell").
+    if items.iter().any(|(t, _)| t.is_none())
+        && let Some(Ok(select)) = crate::core::rql::no_from::parse(text)
+    {
+        let (columns, scales) = (select.columns(), select.scales());
+        if columns.len() == items.len() {
+            for (at, item) in items.iter_mut().enumerate() {
+                if item.0.is_none() {
+                    *item = (Some(columns[at].1.clone()), scales[at]);
+                }
+            }
+        }
+    }
+    Some(items)
 }
 
 /// Whether `value` is a NULL with a type written on it: `NULL::numeric`,
@@ -1101,6 +1118,30 @@ fn duplicate_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_branch_with_no_from_is_typed_item_by_item() {
+        // Constants as PostgreSQL types them, a typed NULL as a NULL.
+        assert_eq!(
+            constant_branch("SELECT 3, 1.50, 'x', NULL, NULL::numeric, CAST(NULL AS text)"),
+            Some(vec![
+                (Some(DbType::I32), 0),
+                (Some(DbType::DECIMAL), 2),
+                (Some(DbType::STRING), 0),
+                (Some(DbType::NULL), 0),
+                (Some(DbType::NULL), 0),
+                (Some(DbType::NULL), 0)
+            ])
+        );
+        // An item that computes its value is typed as the statement types
+        // it: it was unknown, and refused beside a NUMERIC column.
+        let computed = constant_branch("(SELECT 9, round(2.567, 1), upper('x'))").expect("a branch with no FROM");
+        assert_eq!(computed[0], (Some(DbType::I32), 0));
+        assert_eq!(computed[1].0, Some(DbType::DECIMAL));
+        assert_eq!(computed[2].0, Some(DbType::STRING));
+        // A branch that reads a relation is not one.
+        assert_eq!(constant_branch("SELECT id, round(v, 1) FROM t"), None);
+    }
     use crate::core::row::row::{Column, Row};
 
     fn cell(schema_id: u32, ty: DbType, data: &[u8]) -> Column {
