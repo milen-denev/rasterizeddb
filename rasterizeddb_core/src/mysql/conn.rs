@@ -482,6 +482,7 @@ async fn handshake(
                 database: database.clone(),
                 verifier: None,
                 bootstrap_user: Some(shared.config.bootstrap_user.clone()),
+                upstream_password: None,
             },
             Err(_) => {
                 refuse(
@@ -535,6 +536,30 @@ async fn authenticate(
         io.flush().await?;
         response = io.read().await?;
     }
+    // A front-end node (B4.7) holds no roles: the client's password, taken
+    // by full authentication over TLS, is what the bridge logs in to the
+    // gateway with, and the cluster checks it there.
+    if crate::pgwire::proxied::upstream().is_some() {
+        io.packet(&[0x01, 0x04]);
+        io.flush().await?;
+        let answer = io.read().await?;
+        if answer.as_slice() == [0x02] || !io.stream.is_secure() {
+            let error = MyError::new(2061, "HY000", "Authentication through a front-end node requires TLS");
+            results::write_err(io, &error);
+            io.flush().await?;
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "a front-end login needs TLS"));
+        }
+        let password = String::from_utf8_lossy(answer.strip_suffix(&[0]).unwrap_or(&answer)).into_owned();
+        return Ok(Some(ProxiedLogin {
+            user: user.to_string(),
+            superuser: false,
+            authenticated: true,
+            database: database_name.to_string(),
+            verifier: None,
+            bootstrap_user: None,
+            upstream_password: Some(crate::pgwire::proxied::Secret(password)),
+        }));
+    }
     let role = crate::auth::lookup_role(database, user).await;
     let verifier = role.as_ref().and_then(|r| r.verifier.clone());
     let may_login = role.as_ref().map(|r| r.can_login).unwrap_or(false);
@@ -548,6 +573,7 @@ async fn authenticate(
         database: database_name.to_string(),
         verifier: verifier.as_ref().map(|v| v.to_stored()),
         bootstrap_user: None,
+        upstream_password: None,
     };
 
     // Fast path: a scramble against the cached hash.
@@ -1004,7 +1030,7 @@ impl Session {
             ));
         }
         if let Some((pid, key)) = *target.cancel.lock() {
-            crate::core::cancel::cancel_request(pid, key);
+            crate::pgwire::proxied::cancel(pid, key);
         }
         if !query_only {
             target.kill.notify_one();

@@ -596,6 +596,15 @@ struct Args {
     #[arg(long = "socket-group", value_name = "GROUP")]
     socket_group: Option<String>,
 
+    /// Run as a front-end node (B4.7): MySQL and SQL Server clients' sessions
+    /// go to this gateway (`host:port` of its PostgreSQL listener), logged in
+    /// as each client's own role; this server keeps only a copy of the
+    /// cluster's schema (`rdb-shard ddl --frontend`). MySQL logins then need
+    /// TLS.
+    #[cfg(any(feature = "mysql_wire", feature = "mssql_wire"))]
+    #[arg(long = "frontend-upstream", value_name = "HOST:PORT")]
+    frontend_upstream: Option<String>,
+
     // --- MySQL / MariaDB protocol ------------------------------------------
     /// Also serve the MySQL / MariaDB client protocol on this TCP port (3306
     /// is MySQL's), beside whichever other listeners run, on the same
@@ -1412,6 +1421,13 @@ fn main() -> std::io::Result<()> {
 
     // Parse command line arguments with clap
     let mut args = Args::parse();
+    #[cfg(any(feature = "mysql_wire", feature = "mssql_wire"))]
+    if let Some(gateway) = args.frontend_upstream.clone()
+        && let Err(e) = rasterizeddb_core::pgwire::set_frontend_upstream(gateway)
+    {
+        eprintln!("{e}");
+        std::process::exit(2);
+    }
     // The descriptors the partitions' open budget is derived from: a stock
     // systemd unit's soft limit of 1,024 would leave a budget of 16 open
     // partitions; raised toward the hard limit, as far as the largest

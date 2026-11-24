@@ -40,6 +40,87 @@ pub(crate) struct ProxiedLogin {
     /// The bootstrap role a `trust` login is checked with
     /// (`auth::trust_login`) in another database.
     pub(crate) bootstrap_user: Option<String>,
+    /// On a front-end node ([`upstream`]), the password the client proved,
+    /// which the bridge logs in to the gateway with. Never logged.
+    pub(crate) upstream_password: Option<Secret>,
+}
+
+/// A password held only to pass on: its `Debug` says nothing of it.
+#[derive(Clone)]
+pub(crate) struct Secret(pub(crate) String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// The gateway a front-end node sends its MySQL and SQL Server sessions to
+/// (sharding-plan.md B4.7, `--frontend-upstream`), or `None` for a server
+/// that runs them itself.
+static UPSTREAM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Makes this server a front-end node for the cluster behind `gateway`
+/// (`host:port` of its PostgreSQL listener). Once, at start.
+pub(crate) fn set_upstream(gateway: String) -> Result<(), String> {
+    UPSTREAM.set(gateway).map_err(|_| "the front-end upstream is already set".to_string())
+}
+
+/// [`set_upstream`]'s gateway, when this is a front-end node.
+pub(crate) fn upstream() -> Option<&'static str> {
+    UPSTREAM.get().map(String::as_str)
+}
+
+/// Cancels the statement of the session `(pid, key)` a bridge runs: here,
+/// or on a front-end node by a CancelRequest to its gateway.
+pub(crate) fn cancel(pid: i32, key: i32) {
+    match upstream() {
+        None => {
+            crate::core::cancel::cancel_request(pid, key);
+        }
+        Some(gateway) => {
+            let gateway = gateway.to_string();
+            tokio::spawn(async move {
+                if let Ok(mut s) = tokio::net::TcpStream::connect(&gateway).await {
+                    let mut m = 16i32.to_be_bytes().to_vec();
+                    m.extend_from_slice(&80877102i32.to_be_bytes());
+                    m.extend_from_slice(&pid.to_be_bytes());
+                    m.extend_from_slice(&key.to_be_bytes());
+                    let _ = s.write_all(&m).await;
+                }
+            });
+        }
+    }
+}
+
+/// A bridge's transport: the in-process session's pipe, or a front-end
+/// node's connection to its gateway.
+enum BridgeIo {
+    Pipe(tokio::io::DuplexStream),
+    Tcp(tokio::net::TcpStream),
+}
+
+impl BridgeIo {
+    async fn write_all(&mut self, b: &[u8]) -> io::Result<()> {
+        match self {
+            BridgeIo::Pipe(p) => p.write_all(b).await,
+            BridgeIo::Tcp(t) => t.write_all(b).await,
+        }
+    }
+
+    async fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+        match self {
+            BridgeIo::Pipe(p) => p.read(b).await,
+            BridgeIo::Tcp(t) => t.read(b).await,
+        }
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        match self {
+            BridgeIo::Pipe(p) => p.shutdown().await,
+            BridgeIo::Tcp(t) => t.shutdown().await,
+        }
+    }
 }
 
 /// `login`, as it stands in database `name` (`database`): the same login
@@ -51,6 +132,11 @@ pub(crate) struct ProxiedLogin {
 /// otherwise: MySQL's `USE` and SQL Server's `USE` used to carry a login
 /// into any database, as whatever role held its name there.
 pub(crate) async fn login_for(database: &Arc<Database>, name: &str, login: &ProxiedLogin) -> Result<ProxiedLogin, String> {
+    // A front-end node holds no roles: the gateway checks the login in the
+    // database it names when the session opens there.
+    if upstream().is_some() {
+        return Ok(ProxiedLogin { database: name.to_string(), ..login.clone() });
+    }
     if login.database == name {
         return Ok(login.clone());
     }
@@ -310,7 +396,7 @@ pub(crate) fn tag_count(tag: &str) -> Option<u64> {
 
 /// The client end of an in-process session.
 pub(crate) struct PgBridge {
-    io: tokio::io::DuplexStream,
+    io: BridgeIo,
     out: Vec<u8>,
     rbuf: Vec<u8>,
     rpos: usize,
@@ -353,6 +439,13 @@ impl PgBridge {
             parameters,
             lenient_booleans,
         } = options;
+        // A front-end node (B4.7): the session runs on the cluster, and this
+        // node's database is the copy of its schema the front end reads.
+        if let Some(gateway) = upstream() {
+            let _ = (limits, watch, parameters, lenient_booleans);
+            drop(guard);
+            return Self::open_remote(gateway, database, database_name, login).await;
+        }
         // A database other than the one the login was checked against
         // checks it again, before any session exists there.
         let login = login_for(&database, database_name, &login).await.map_err(OpenRefused::Denied)?;
@@ -372,7 +465,7 @@ impl PgBridge {
             tokio::spawn(PEER_WATCH.scope(watch, session));
         }
         let mut bridge = PgBridge {
-            io: client,
+            io: BridgeIo::Pipe(client),
             out: Vec::with_capacity(1024),
             rbuf: Vec::with_capacity(8 * 1024),
             rpos: 0,
@@ -583,6 +676,100 @@ impl PgBridge {
                     self.rbuf.truncate(old);
                     return Err(e);
                 }
+            }
+        }
+    }
+
+    /// A front-end node's session (B4.7): a PostgreSQL connection to the
+    /// gateway, logged in as the client's own role with the password it
+    /// proved, so the cluster authenticates and authorizes it as it would
+    /// a PostgreSQL client. `database` is this node's copy of the
+    /// database's schema, which the front ends translate against; its
+    /// rows are on the shards.
+    pub(crate) async fn open_remote(
+        gateway: &str,
+        database: Arc<Database>,
+        database_name: &str,
+        login: ProxiedLogin,
+    ) -> Result<Self, OpenRefused> {
+        let password = login.upstream_password.clone().map(|s| s.0).unwrap_or_default();
+        let tcp = tokio::time::timeout(std::time::Duration::from_secs(10), tokio::net::TcpStream::connect(gateway))
+            .await
+            .map_err(|_| OpenRefused::Denied(format!("the gateway {gateway} did not answer in 10 s")))?
+            .map_err(OpenRefused::Io)?;
+        let _ = tcp.set_nodelay(true);
+        let mut bridge = PgBridge {
+            io: BridgeIo::Tcp(tcp),
+            out: Vec::with_capacity(1024),
+            rbuf: Vec::with_capacity(8 * 1024),
+            rpos: 0,
+            pid: 0,
+            key: 0,
+            status: b'I',
+            database,
+            database_name: database_name.to_string(),
+            login: login.clone(),
+        };
+        // StartupMessage: protocol 3.0, user, database.
+        let mut startup = 196608i32.to_be_bytes().to_vec();
+        for (k, v) in [("user", login.user.as_str()), ("database", database_name), ("client_encoding", "UTF8")] {
+            startup.extend_from_slice(k.as_bytes());
+            startup.push(0);
+            startup.extend_from_slice(v.as_bytes());
+            startup.push(0);
+        }
+        startup.push(0);
+        bridge.out.extend_from_slice(&((startup.len() + 4) as i32).to_be_bytes());
+        bridge.out.extend_from_slice(&startup);
+        let mut scram: Option<crate::auth::ScramClient> = None;
+        loop {
+            let frame = bridge.next().await.map_err(OpenRefused::Io)?;
+            let (tag, body) = (frame.tag, frame.body.to_vec());
+            match tag {
+                b'R' => {
+                    let kind = body.get(0..4).map_or(-1, |b| i32::from_be_bytes(b.try_into().unwrap()));
+                    match kind {
+                        0 => {}
+                        3 => bridge.message(b'p', |b| {
+                            b.extend_from_slice(password.as_bytes());
+                            b.push(0);
+                        }),
+                        10 => {
+                            let (client, first) = crate::auth::ScramClient::start(&login.user, &password, crate::auth::ChannelBinding::None);
+                            scram = Some(client);
+                            bridge.message(b'p', |b| {
+                                b.extend_from_slice(b"SCRAM-SHA-256\0");
+                                b.extend_from_slice(&(first.len() as i32).to_be_bytes());
+                                b.extend_from_slice(first.as_bytes());
+                            });
+                        }
+                        11 => {
+                            let Some(s) = scram.as_mut() else { return Err(OpenRefused::Denied("SASL out of order".into())) };
+                            let server_first = String::from_utf8_lossy(&body[4..]).into_owned();
+                            let fin = s.respond(&server_first).map_err(OpenRefused::Denied)?;
+                            bridge.message(b'p', |b| b.extend_from_slice(fin.as_bytes()));
+                        }
+                        12 => {
+                            let Some(s) = scram.as_ref() else { return Err(OpenRefused::Denied("SASL out of order".into())) };
+                            s.verify(&String::from_utf8_lossy(&body[4..])).map_err(OpenRefused::Denied)?;
+                        }
+                        k => return Err(OpenRefused::Denied(format!("the gateway asked for authentication method {k}, which a front-end node does not speak"))),
+                    }
+                }
+                b'E' => {
+                    let msg = body
+                        .split(|&c| c == 0)
+                        .find(|f| f.first() == Some(&b'M'))
+                        .map(|f| String::from_utf8_lossy(&f[1..]).into_owned())
+                        .unwrap_or_else(|| "refused".into());
+                    return Err(OpenRefused::Denied(msg));
+                }
+                b'K' if body.len() >= 8 => {
+                    bridge.pid = i32::from_be_bytes(body[0..4].try_into().unwrap());
+                    bridge.key = i32::from_be_bytes(body[4..8].try_into().unwrap());
+                }
+                b'Z' => return Ok(bridge),
+                _ => {}
             }
         }
     }

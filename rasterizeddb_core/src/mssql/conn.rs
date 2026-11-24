@@ -463,12 +463,24 @@ async fn handshake(
                 database: database_name.clone(),
                 verifier: None,
                 bootstrap_user: Some(shared.config.bootstrap_user.clone()),
+                upstream_password: None,
             },
             Err(_) => {
                 refuse(wire, 18456, &format!("Login failed for user '{}'.", login.user));
                 wire.send(tds::PT_REPLY).await?;
                 return Ok(None);
             }
+        },
+        // A front-end node (B4.7) holds no roles: the login's password goes
+        // to the gateway, which checks it.
+        MsAuth::Password if crate::pgwire::proxied::upstream().is_some() => ProxiedLogin {
+            user: login.user.clone(),
+            superuser: false,
+            authenticated: true,
+            database: database_name.clone(),
+            verifier: None,
+            bootstrap_user: None,
+            upstream_password: Some(crate::pgwire::proxied::Secret(login.password.clone())),
         },
         MsAuth::Password => {
             let role = crate::auth::lookup_role(&database, &login.user).await;
@@ -495,6 +507,7 @@ async fn handshake(
                 database: database_name.clone(),
                 verifier: role.and_then(|r| r.verifier).map(|v| v.to_stored()),
                 bootstrap_user: None,
+                upstream_password: None,
             }
         }
     };

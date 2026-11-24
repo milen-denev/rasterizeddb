@@ -17,7 +17,8 @@
 //! rdb-shard keygen      --key FILE
 //! rdb-shard sign        --map MAP --key FILE
 //! rdb-shard ddl         --map MAP --file DDL.sql --table TABLE [--table …]
-//!                       [--home SHARD] [--state STATE]
+//!                       [--home SHARD] [--state STATE] [--frontend ADDR …]
+//! rdb-shard ddl         --file SCHEMA.sql --frontend ADDR [--frontend …] --frontend-only
 //! ```
 //!
 //! `ddl` is cluster DDL (sharding-plan.md B1a.10): the file runs on the home
@@ -918,6 +919,21 @@ async fn cluster_ddl(args: &Args, options: &Options) -> std::result::Result<(), 
     let map = read_map(args.one("map")?)?;
     let file = args.one("file")?;
     let sql = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?;
+    // Front-end nodes (B4.7) keep a copy of the schema, no rows: they take
+    // the DDL once every shard has it, or alone with --frontend-only (a new
+    // node seeded with the schema's DDL).
+    let frontends: Vec<String> = args.flags.get("frontend").cloned().unwrap_or_default();
+    if args.has("frontend-only") {
+        if frontends.is_empty() {
+            return Err("--frontend-only needs --frontend ADDR".to_string());
+        }
+        for addr in &frontends {
+            let c = Client::connect(addr, options.clone()).await.map_err(|e| format!("front-end node {addr}: {e}"))?;
+            c.run(&sql).await.map_err(|e| format!("front-end node {addr}: {e}"))?;
+            println!("front-end node {addr}: applied");
+        }
+        return Ok(());
+    }
     let tables: Vec<String> = args.flags.get("table").cloned().ok_or("--table TABLE is required (each table the DDL changes)")?;
     let home: ShardId = match args.opt("home") {
         Some(h) => h.parse().map_err(|_| "--home takes a shard id".to_string())?,
@@ -1027,6 +1043,19 @@ async fn cluster_ddl(args: &Args, options: &Options) -> std::result::Result<(), 
     }
     let _ = std::fs::remove_file(&state_path);
     println!("schema epoch {next} on every shard; the fence on {fence} is lifted");
+    for addr in &frontends {
+        let applied = match Client::connect(addr, options.clone()).await {
+            Ok(c) => c.run(&sql).await.map(drop).map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        match applied {
+            Ok(()) => println!("front-end node {addr}: applied"),
+            Err(e) => eprintln!(
+                "front-end node {addr}: {e}. The shards have the DDL; bring the node level with \
+                 rdb-shard ddl --file {file} --frontend {addr} --frontend-only"
+            ),
+        }
+    }
     Ok(())
 }
 

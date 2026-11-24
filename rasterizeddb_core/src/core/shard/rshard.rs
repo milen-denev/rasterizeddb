@@ -414,6 +414,7 @@ async fn open_session(conn: &Conn, session: u64, database: &str, role: &str, par
             database: database.to_string(),
             verifier: r.verifier.as_ref().map(|v| v.to_stored()),
             bootstrap_user: None,
+            upstream_password: None,
         },
         limits: crate::pgwire::ConnectionLimits::default(),
         watch: None,

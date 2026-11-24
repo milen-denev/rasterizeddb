@@ -93,6 +93,15 @@ pub const KEYMAP_TABLE_NAME: &str = branch_merge::KEYMAP_TABLE;
 mod branch_tests;
 #[cfg(any(feature = "mysql_wire", feature = "mssql_wire", feature = "sharding"))]
 pub(crate) mod proxied;
+
+/// Makes this server a front-end node (sharding-plan.md B4.7): its MySQL and
+/// SQL Server sessions run on the cluster behind `gateway` (`host:port` of
+/// its PostgreSQL listener), logged in as each client's role. Once, at
+/// start.
+#[cfg(any(feature = "mysql_wire", feature = "mssql_wire"))]
+pub fn set_frontend_upstream(gateway: String) -> Result<(), String> {
+    proxied::set_upstream(gateway)
+}
 mod wire_out;
 
 pub(crate) use native_session::{NativeSession, NativeTemplate, NativeTextStep, begins_with_data_verb as native_begins_with_data_verb};
