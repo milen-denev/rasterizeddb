@@ -5132,6 +5132,20 @@ impl<S: StorageIO> Table<S> {
             std::io::Error::from(e)
         })?;
         d.vacuum_stats.note_inserted(written_by, 1);
+        // A shard's Raft group carries the new row (B3).
+        #[cfg(feature = "sharding_raft")]
+        if crate::core::shard::capture::active()
+            && let Some(db) = crate::core::shard::capture::database_of_scope(&self.cache_scope)
+        {
+            crate::core::shard::capture::record(
+                db,
+                written_by,
+                crate::core::shard::capture::Op::Insert {
+                    table: self.schema.name.clone(),
+                    row: crate::core::shard::capture::image_of_write(&row_write),
+                },
+            );
+        }
 
         // Index the new slot. The pointer record position IS the slot address
         // (dense fixed-stride file), so no mapping is needed.
@@ -6039,9 +6053,14 @@ impl<S: StorageIO> Table<S> {
                 }
             }
 
-            // The row as it was, for `RETURNING`, read before the tombstone.
+            // The row as it was, for `RETURNING` (and a shard's Raft group,
+            // which carries the old image), read before the tombstone.
+            #[cfg(feature = "sharding_raft")]
+            let capturing = crate::core::shard::capture::active();
+            #[cfg(not(feature = "sharding_raft"))]
+            let capturing = false;
             let before = match collect.as_ref() {
-                Some(_) => {
+                _ if collect.is_some() || capturing => {
                     let mut row = Row::default();
                     let full_fetch = Self::build_full_row_fetch(&self.schema.fields);
                     if let Err(e) = pointer.fetch_row_reuse_async(&*d.io_rows, &full_fetch, &mut row).await {
@@ -6055,7 +6074,7 @@ impl<S: StorageIO> Table<S> {
                     }
                     Some(row)
                 }
-                None => None,
+                _ => None,
             };
 
             if let Err(e) = pointer
@@ -6064,6 +6083,19 @@ impl<S: StorageIO> Table<S> {
             {
                 error!("Failed to delete row pointer {:?}: {}", pointer, e);
                 continue;
+            }
+            #[cfg(feature = "sharding_raft")]
+            if capturing
+                && let (Some(db), Some(row)) = (crate::core::shard::capture::database_of_scope(&self.cache_scope), before.as_ref())
+            {
+                crate::core::shard::capture::record(
+                    db,
+                    deleted_by,
+                    crate::core::shard::capture::Op::Delete {
+                        table: self.schema.name.clone(),
+                        old: crate::core::shard::capture::image_of_row(row),
+                    },
+                );
             }
             if let (Some(collect), Some(row)) = (collect.as_deref_mut(), before) {
                 collect.push(row);
@@ -6846,6 +6878,21 @@ impl<S: StorageIO> Table<S> {
                     if let Some(collect) = collect.as_deref_mut() {
                         collect.push(returned_image.clone().unwrap_or_else(|| row.clone()));
                     }
+                    // The old version leaves this partition; the caller's
+                    // insert of the merged row is captured where it lands.
+                    #[cfg(feature = "sharding_raft")]
+                    if crate::core::shard::capture::active()
+                        && let Some(db) = crate::core::shard::capture::database_of_scope(&self.cache_scope)
+                    {
+                        crate::core::shard::capture::record(
+                            db,
+                            written_by,
+                            crate::core::shard::capture::Op::Delete {
+                                table: self.schema.name.clone(),
+                                old: crate::core::shard::capture::image_of_row(&row),
+                            },
+                        );
+                    }
                     moves.push(row_write);
                     continue;
                 }
@@ -6939,6 +6986,23 @@ impl<S: StorageIO> Table<S> {
                     Some(trimmed) => std::io::Error::new(e.kind(), trimmed.to_string()),
                     None => e,
                 });
+            }
+
+            // A shard's Raft group carries the update, the old image and the
+            // merged new one, whichever branch below writes it (B3).
+            #[cfg(feature = "sharding_raft")]
+            if crate::core::shard::capture::active()
+                && let Some(db) = crate::core::shard::capture::database_of_scope(&self.cache_scope)
+            {
+                crate::core::shard::capture::record(
+                    db,
+                    written_by,
+                    crate::core::shard::capture::Op::Update {
+                        table: self.schema.name.clone(),
+                        old: crate::core::shard::capture::image_of_row(&row),
+                        new: crate::core::shard::capture::image_of_write(&row_write),
+                    },
+                );
             }
 
             // Fast path: when every assigned column is fixed-width, the row's
