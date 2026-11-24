@@ -4,8 +4,8 @@
 //! Every one failed before: a transaction dropping a child then its parent, a
 //! correlated reference in an inner join's `ON` inside `EXISTS`, a window
 //! beside such a subquery, `make_interval` over a column, a parenthesised
-//! cast as a `DEFAULT`, an alias written without `AS`, and `SHOW TABLES`
-//! naming a composite key.
+//! cast as a `DEFAULT`, an alias written without `AS`, `SHOW TABLES`
+//! naming a composite key, and `GROUP BY 1` over a join.
 
 use rasterizeddb_compat::TestServer;
 use sqlx::{AssertSqlSafe, Row};
@@ -248,4 +248,42 @@ async fn show_tables_names_a_composite_primary_key() {
         .map(|r| r.get::<String, _>("primary_key"))
         .expect("zz_pk listed");
     assert_eq!(key, "id, d");
+}
+
+/// `GROUP BY 1` over a join was looked up as a column named `1` ("Column '1'
+/// not found in schema"); on one table it already named the first item.
+#[tokio::test]
+async fn group_by_a_position_or_an_output_name_over_a_join() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE zz_ut (id int PRIMARY KEY, system_key text)").await;
+    run(&pool, "CREATE TABLE zz_utr (id int PRIMARY KEY, table_id int)").await;
+    run(&pool, "INSERT INTO zz_ut VALUES (1, 'a'), (2, 'b')").await;
+    run(&pool, "INSERT INTO zz_utr VALUES (1, 1), (2, 1), (3, 2)").await;
+    let counts = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(AssertSqlSafe(sql))
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"))
+                .iter()
+                .map(|r| (r.get::<String, _>(0), r.get::<i64, _>(1)))
+                .collect::<Vec<_>>()
+        }
+    };
+    let want = vec![("a".to_string(), 2), ("b".to_string(), 1)];
+    for sql in [
+        "SELECT t.system_key, count(*) FROM zz_utr r JOIN zz_ut t ON t.id = r.table_id GROUP BY 1 ORDER BY 1",
+        "SELECT t.system_key AS k, count(*) FROM zz_utr r JOIN zz_ut t ON t.id = r.table_id GROUP BY 1 ORDER BY 1",
+        "SELECT t.system_key k, count(*) FROM zz_utr r JOIN zz_ut t ON t.id = r.table_id GROUP BY k ORDER BY k",
+        "SELECT t.system_key, count(*) FROM zz_utr r JOIN zz_ut t ON t.id = r.table_id GROUP BY t.system_key ORDER BY 1",
+    ] {
+        assert_eq!(counts(sql).await, want, "{sql}");
+    }
+    let e = sqlx::query("SELECT t.system_key, count(*) FROM zz_utr r JOIN zz_ut t ON t.id = r.table_id GROUP BY 3")
+        .fetch_all(&pool)
+        .await
+        .expect_err("a position past the select list");
+    let db = e.as_database_error().expect("a server error");
+    assert_eq!(db.code().as_deref(), Some("42P10"), "{e}");
 }
