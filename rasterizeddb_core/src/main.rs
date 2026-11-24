@@ -1506,6 +1506,12 @@ fn main() -> std::io::Result<()> {
             eprintln!("--enterprise-config: {e}");
             std::process::exit(2);
         }
+        // T6: strict tenant mode refuses to start where any login would be
+        // let in without a credential.
+        if rasterizeddb_core::core::policy_hooks::installed() && args.pg_auth.eq_ignore_ascii_case("trust") {
+            eprintln!("strict tenant mode needs password authentication: --pg-auth trust is refused");
+            std::process::exit(2);
+        }
     }
 
     // Before the database opens: a shard's directory is marked, its map

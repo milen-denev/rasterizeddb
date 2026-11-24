@@ -980,7 +980,23 @@ impl Session {
                 format!("Unknown thread id: {id}"),
             ));
         };
-        if target.user != self.user && !self.login.superuser {
+        // A role of one name in two databases is two accounts (T5): the
+        // owner is the same user in the same database. A superuser may kill
+        // others' threads, unless strict tenant mode reserves that to the
+        // operator.
+        let mine = self.database_name().to_string();
+        let same_account = target.user == self.user && *target.database.lock() == mine;
+        let ctx = crate::core::policy_hooks::SessionContext {
+            role: &self.user,
+            database: &mine,
+            protocol: "mysql",
+            superuser: self.login.superuser,
+        };
+        let admin = self.login.superuser
+            && crate::core::policy_hooks::tenancy()
+                .may_use(&ctx, crate::core::policy_hooks::ProcessSurface::Cancel)
+                .is_ok();
+        if !same_account && !admin {
             return Err(MyError::new(
                 1095,
                 "HY000",
