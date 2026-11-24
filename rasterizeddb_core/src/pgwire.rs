@@ -5273,6 +5273,9 @@ pub(crate) async fn describe_query(
         if let Some((fields, true)) = Box::pin(describe_resolved(database, &outer, &relations)).await? {
             return Ok(Some((widen_union_fields(database, &outer, &relations, fields).await?, true)));
         }
+        if let Some((fields, true)) = Box::pin(describe_over_derived(database, &outer, &relations)).await? {
+            return Ok(Some((fields, true)));
+        }
     }
 
     // A `LATERAL` item (`core::rql::lateral`): described from its body with
@@ -5419,6 +5422,45 @@ pub(crate) async fn describe_query(
     }
 }
 
+/// `text` with each derived table in it described and named as a relation, then
+/// described against those and `relations`. A CTE body reading a derived table
+/// (`WITH r AS (SELECT id FROM (SELECT …) x) SELECT … FROM r`) is described
+/// this way: the plain resolver knows no derived table, so the body went
+/// undescribed, the CTE list stopped there, and the client got a row
+/// description with no columns before the rows. A derived table is described
+/// against the earlier CTEs first, as it may read one; nothing is materialised.
+async fn describe_over_derived(
+    database: &Arc<Database>,
+    text: &str,
+    relations: &[(String, ScratchFields)],
+) -> io::Result<Option<(Vec<(String, DbType)>, bool)>> {
+    let mut rewritten = text.to_string();
+    let mut all = relations.to_vec();
+    let mut found = false;
+    for _ in 0..16usize {
+        let Some((start, end, inner, alias)) = crate::core::rql::cte::next_derived_table(&rewritten) else {
+            break;
+        };
+        let columns = match Box::pin(describe_resolved(database, &inner, &all)).await? {
+            Some((columns, _)) => Some(columns),
+            None => match Box::pin(describe_over_derived(database, &inner, &all)).await? {
+                Some((columns, _)) => Some(columns),
+                None => Box::pin(describe_query(database, &inner)).await?.map(|(columns, _)| columns),
+            },
+        };
+        let Some(columns) = columns else {
+            return Ok(None);
+        };
+        rewritten = format!("{}{} {}{}", &rewritten[..start], alias, alias, &rewritten[end..]);
+        all.push((alias, scratch_fields(&columns)));
+        found = true;
+    }
+    if !found {
+        return Ok(None);
+    }
+    Box::pin(describe_resolved(database, &rewritten, &all)).await
+}
+
 /// Each CTE of `defs` as a relation the statement after them can be described
 /// against: its body's columns, under its name and its column list. Nothing
 /// is materialised. They are accumulated in order so a later CTE may read an
@@ -5441,7 +5483,11 @@ async fn cte_relations(
             Some(Err(e)) => return Err(std::io::Error::other(e)),
             None => def.body.as_str(),
         };
-        match Box::pin(describe_resolved(database, body, &relations)).await? {
+        let described = match Box::pin(describe_resolved(database, body, &relations)).await? {
+            Some(described) => Some(described),
+            None => Box::pin(describe_over_derived(database, body, &relations)).await?,
+        };
+        match described {
             // A body that is itself a `UNION` is materialised with its rows
             // widened, so its relation has the wider column too. A column
             // list renames what it describes, as it renames the relation.
@@ -11773,7 +11819,15 @@ fn deferred_drops(
     if !cascade {
         for table in &present {
             for child in database.fk_children(table) {
-                if !child.eq_ignore_ascii_case(table) && !present.iter().any(|p| p.eq_ignore_ascii_case(&child)) {
+                // A child this block has already dropped (its drop is pending
+                // until COMMIT) no longer depends on the table: `BEGIN; DROP
+                // TABLE child; DROP TABLE parent; COMMIT` is how a migrator
+                // drops in key order, and was refused with 2BP01.
+                let child_dropped = pending.iter().any(|p| p.eq_ignore_ascii_case(&child));
+                if !child.eq_ignore_ascii_case(table)
+                    && !child_dropped
+                    && !present.iter().any(|p| p.eq_ignore_ascii_case(&child))
+                {
                     let message = if several {
                         format!(
                             "cannot drop desired object(s) because other objects depend on them: a foreign key on \

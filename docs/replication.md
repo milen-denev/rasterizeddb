@@ -259,6 +259,11 @@ conflicts 0, failures 0, gaps 0, ack timeouts 0
 61 batch(es), 60 compressed: 52439 bytes of payload went out as 12331 (76.5% smaller)
 ```
 
+`applied`, `duplicates` and `conflicts` count this node's own transactions
+by what its peers answered, so a node that writes nothing shows `applied 0`
+however much it receives. What a node has taken from each peer is the
+`applied through: <node> → <sequence>` line.
+
 Roughly six transactions per batch and **76.5%** off the wire. Repetitive SQL is
 what zstd is good at, and replication traffic is nothing but.
 

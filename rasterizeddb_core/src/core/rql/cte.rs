@@ -179,6 +179,10 @@ fn item_label(item: &str) -> Option<String> {
     }
     match split_alias(item) {
         (_, Some(alias)) => Some(alias.to_string()),
+        // An alias written without `AS`, as PostgreSQL takes it:
+        // `ROW_NUMBER() OVER (…) rn`, `count(*) n`. Refused before ("has a
+        // column this cannot name") though it is named.
+        (expression, None) if implicit_alias(expression).is_some() => implicit_alias(expression).map(str::to_string),
         // Otherwise the name PostgreSQL gives the item: a cast's type
         // (`'x'::text` is `text`), a call's function (`upper`). Only an
         // item it names `?column?` is left unnamed: refused, and the client
@@ -191,6 +195,54 @@ fn item_label(item: &str) -> Option<String> {
             (!star && name != "?column?").then_some(name)
         }),
     }
+}
+
+/// The alias of an item written `expression name`, without `AS`: a last word
+/// that is a plain or quoted identifier, after a `)`, a closing quote or a
+/// word, and not a keyword an expression can end with (`END`, `NULL`, `TRUE`,
+/// a unit, `ZONE`). `None` for anything else.
+fn implicit_alias(expression: &str) -> Option<&str> {
+    let t = expression.trim_end();
+    let (head, last) = match t.rfind(|c: char| c.is_whitespace() || c == ')') {
+        Some(at) => (&t[..=at], &t[at + 1..]),
+        None => return None,
+    };
+    if last.is_empty() || head.trim().is_empty() {
+        return None;
+    }
+    let quoted = last.len() >= 2 && last.starts_with('"') && last.ends_with('"') && !last[1..last.len() - 1].contains('"');
+    let plain = last.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && last.chars().all(|c| c.is_alphanumeric() || c == '_');
+    if !(quoted || plain) {
+        return None;
+    }
+    if plain {
+        const ENDINGS: &[&str] = &[
+            "END", "NULL", "TRUE", "FALSE", "UNKNOWN", "ASC", "DESC", "ZONE", "YEAR", "MONTH", "DAY", "HOUR",
+            "MINUTE", "SECOND", "AND", "OR", "NOT", "IS", "THEN", "ELSE", "WHEN", "DISTINCT", "ALL",
+        ];
+        if ENDINGS.iter().any(|k| last.eq_ignore_ascii_case(k)) {
+            return None;
+        }
+    }
+    // What comes before has to end an expression: a `)`, a closing quote or
+    // a word, never an operator (`a - b` is not `a -` aliased `b`).
+    let before = head.trim_end();
+    let ends_expression = before.ends_with(')')
+        || before.ends_with('\'')
+        || before.ends_with('"')
+        || before.chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_');
+    if !ends_expression {
+        return None;
+    }
+    // A word before it must not be an operator keyword (`x IS NULL` is not
+    // `x IS` aliased `NULL`, caught above; `a AND b` is not aliased).
+    let prev_word = before.rsplit(|c: char| c.is_whitespace() || c == '(').next().unwrap_or("");
+    const OPERATOR_WORDS: &[&str] = &["AND", "OR", "NOT", "IS", "IN", "LIKE", "ILIKE", "BETWEEN", "THEN", "ELSE", "WHEN", "CASE", "AT", "COLLATE", "SIMILAR", "TO", "ESCAPE", "DISTINCT", "SELECT"];
+    if OPERATOR_WORDS.iter().any(|k| prev_word.eq_ignore_ascii_case(k)) {
+        return None;
+    }
+    Some(last.trim_matches('"'))
 }
 
 /// A select list past a leading `DISTINCT`, `DISTINCT ON (…)` or `ALL`,
@@ -2522,6 +2574,22 @@ pub async fn drop_temps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An alias without `AS` names the item; an expression's last keyword
+    /// or operand does not.
+    #[test]
+    fn an_alias_without_as_names_the_item() {
+        assert_eq!(item_label("ROW_NUMBER() OVER (PARTITION BY d ORDER BY c) rn").as_deref(), Some("rn"));
+        assert_eq!(item_label("count(*) n").as_deref(), Some("n"));
+        assert_eq!(item_label("a.b c").as_deref(), Some("c"));
+        assert_eq!(item_label("x + 1 \"Y\"").as_deref(), Some("Y"));
+        assert_eq!(implicit_alias("CASE WHEN a THEN 1 ELSE 2 END"), None);
+        assert_eq!(implicit_alias("x IS NULL"), None);
+        assert_eq!(implicit_alias("a AND b"), None);
+        assert_eq!(implicit_alias("NOT b"), None);
+        assert_eq!(implicit_alias("a || b"), None);
+        assert_eq!(implicit_alias("x COLLATE \"C\""), None);
+    }
 
     #[test]
     fn recursive_marks_every_definition_and_only_the_keyword_does() {

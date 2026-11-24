@@ -1827,6 +1827,12 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                 const PARAMETERS: [&str; 7] = ["years", "months", "weeks", "days", "hours", "mins", "secs"];
                 let mut iv = crate::core::pg_types::Interval { months: 0, days: 0, micros: 0 };
                 let too_large = || "interval out of range".to_string();
+                // An argument that is not a constant (`hours => p.escalate_after_hours`)
+                // is the amount times one of its unit, summed with the
+                // constant part: `make_interval(hours => x)` is
+                // `x * INTERVAL '1 hour'`, NULL when x is. Its name was read
+                // as a column ("column \"hours\" does not exist").
+                let mut computed: Vec<(&'static str, String)> = Vec::new();
                 for (position, arg) in split_args(args_text).into_iter().enumerate() {
                     let arg = arg.trim();
                     if arg.is_empty() {
@@ -1839,6 +1845,27 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                             None => return Err("function make_interval takes at most 7 arguments".to_string()),
                         },
                     };
+                    let unit_word = match unit.as_str() {
+                        "years" => "year",
+                        "months" => "month",
+                        "weeks" => "week",
+                        "days" => "day",
+                        "hours" => "hour",
+                        "mins" => "minute",
+                        "secs" => "second",
+                        other => {
+                            return Err(format!(
+                                "make_interval has no argument named '{}' (it takes years, months, weeks, days, hours, mins and secs)",
+                                other
+                            ));
+                        }
+                    };
+                    let quoted = amount_text.len() >= 2 && amount_text.starts_with('\'') && amount_text.ends_with('\'');
+                    let numeric = amount_text.trim_matches('\'').parse::<f64>().is_ok();
+                    if !numeric && !quoted {
+                        computed.push((unit_word, amount_text.to_string()));
+                        continue;
+                    }
                     // A bound parameter can arrive quoted — PostgreSQL casts
                     // `'120'` to the argument's type, so the quotes are stripped
                     // rather than treated as a different value.
@@ -1874,6 +1901,22 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                             ));
                         }
                     }
+                }
+                if !computed.is_empty() {
+                    // The constant part as a literal, then each computed
+                    // argument as its amount times one of its unit.
+                    let mut terms: Vec<String> = Vec::new();
+                    if iv.months != 0 || iv.days != 0 || iv.micros != 0 {
+                        terms.push(format!(
+                            "INTERVAL '{} months {} days {} microseconds'",
+                            iv.months, iv.days, iv.micros
+                        ));
+                    }
+                    for (unit_word, amount) in &computed {
+                        terms.push(format!("({}) * INTERVAL '1 {}'", amount, unit_word));
+                    }
+                    let sum = terms.join(" + ");
+                    return parse(&sum, schema);
                 }
                 // An interval, not a bare count of microseconds: a count is an
                 // integer, and an integer next to a date is a number of days.
