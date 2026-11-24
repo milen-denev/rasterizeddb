@@ -971,26 +971,38 @@ async fn a_table_on_a_second_disk_comes_over_as_the_branchs_own() {
         .await;
     let rows: Vec<String> = (0..40).map(|i| format!("({i}, {i})")).collect();
     prod.exec(&format!("INSERT INTO spread (k, n) VALUES {}", rows.join(", "))).await;
-    let on_disk = |dir: &std::path::Path| -> Vec<(String, u64)> {
-        let mut v: Vec<(String, u64)> = std::fs::read_dir(dir)
+    // Each file's contents, read through the file. Not the directory entry's
+    // size: on Windows that is what FindNextFile cached, which NTFS updates
+    // lazily for a file the server holds open (CI read 0 for every row file).
+    let on_disk = |dir: &std::path::Path| -> Vec<(String, Vec<u8>)> {
+        let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
             .unwrap()
             .flatten()
             .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.metadata().unwrap().len()))
-            .filter(|(name, _)| name.ends_with(".db"))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".db"))
+            .map(|name| {
+                let bytes = std::fs::read(dir.join(&name)).unwrap();
+                (name, bytes)
+            })
             .collect();
         v.sort();
         v
     };
-    let parent_disk = on_disk(disk.path());
-    assert!(parent_disk.iter().any(|(n, _)| n.starts_with("far")), "far is not on the disk: {parent_disk:?}");
+    let names = |files: &[(String, Vec<u8>)]| -> Vec<String> { files.iter().map(|(n, _)| n.clone()).collect() };
+    let placed = on_disk(disk.path());
+    assert!(placed.iter().any(|(n, b)| n == "far.db" && !b.is_empty()), "far's rows are not on the disk: {:?}", names(&placed));
     assert!(
-        parent_disk.iter().any(|(n, _)| !n.starts_with("far")),
-        "no partition was dealt to the disk, so the test does not cover them: {parent_disk:?}"
+        placed.iter().any(|(n, b)| n.starts_with("__pt_") && !b.is_empty()),
+        "no partition's rows were dealt to the disk, so the test does not cover them: {:?}",
+        names(&placed)
     );
 
     let mut admin = fx.client("postgres");
     admin.exec("CREATE BRANCH dev FROM prod").await;
+    // The parent's disk as the branch leaves it: what follows writes only to
+    // the branch.
+    let parent_disk = on_disk(disk.path());
     // Every location and placement names the branch's own directory. The
     // parent's disk appears only as an alias's source, mapped into the
     // branch, which is how a partition map naming the old path resolves.
@@ -1018,7 +1030,13 @@ async fn a_table_on_a_second_disk_comes_over_as_the_branchs_own() {
     dev.exec("INSERT INTO far (id, what) VALUES (100, 'dev')").await;
     dev.exec("UPDATE spread SET n = n + 1000").await;
     dev.exec("INSERT INTO spread (k, n) VALUES (100, 100)").await;
-    assert_eq!(on_disk(disk.path()), parent_disk, "a write to the branch changed the parent's disk");
+    let after = on_disk(disk.path());
+    assert!(
+        after == parent_disk,
+        "a write to the branch changed the parent's disk: {:?} became {:?}",
+        parent_disk.iter().map(|(n, b)| (n.as_str(), b.len())).collect::<Vec<_>>(),
+        after.iter().map(|(n, b)| (n.as_str(), b.len())).collect::<Vec<_>>()
+    );
     assert_eq!(prod.scalar("SELECT COUNT(*) FROM far").await, "50");
     assert_eq!(prod.scalar("SELECT SUM(n) FROM spread").await, "780");
 
