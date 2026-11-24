@@ -3000,6 +3000,9 @@ struct SessionState {
     auth: AuthConfig,
     /// Who this session is, and whether it proved it.
     principal: Principal,
+    /// The session user while `SET ROLE` acts as another role (roles plan
+    /// R2); `RESET ROLE` returns to it.
+    session_user: Option<Principal>,
     // statement name -> info
     statements: HashMap<String, StatementInfo>,
     /// Learned parses of simple-query `SELECT`s, by their text with the
@@ -3522,6 +3525,7 @@ impl SessionState {
             database_name,
             auth,
             principal,
+            session_user: None,
             statements: HashMap::new(),
             text_shapes: HashMap::new(),
             portals: HashMap::new(),
@@ -12918,6 +12922,31 @@ fn session_rewrite(state: &SessionState, sql: &str) -> Result<Option<String>, (&
     )
 }
 
+/// `SET [SESSION] ROLE r` → `Some(Some(r))`; `SET ROLE NONE` and `RESET
+/// ROLE` → `Some(None)`; anything else `None`. `SET LOCAL ROLE` is not this
+/// (it is refused as an unknown setting).
+fn set_role_target(lower: &str, original: &str) -> Option<Option<String>> {
+    let l = lower.trim().trim_end_matches(';').trim();
+    if l == "reset role" {
+        return Some(None);
+    }
+    let rest = l.strip_prefix("set session role ").or_else(|| l.strip_prefix("set role "))?;
+    let rest = rest.trim();
+    if rest == "none" {
+        return Some(None);
+    }
+    // The original's case for a quoted name; a bare one folds.
+    let raw = original.trim().trim_end_matches(';').trim();
+    let raw = raw.get(raw.len().saturating_sub(rest.len())..).unwrap_or(rest).trim();
+    Some(Some(if raw.starts_with('"') && raw.ends_with('"') && raw.len() > 1 {
+        raw[1..raw.len() - 1].replace("\"\"", "\"")
+    } else if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() > 1 {
+        raw[1..raw.len() - 1].to_string()
+    } else {
+        rest.to_string()
+    }))
+}
+
 /// A `SET [SESSION | LOCAL] name {TO | =} value` or `RESET name` of a
 /// parameter `SessionState::settings` keeps: whether it is `LOCAL`, the name
 /// lowercased, and the value (`None` for `RESET` and `DEFAULT`). A quoted
@@ -13432,6 +13461,43 @@ where
 {
     let s = stmt.trim();
     let s_lower = s.to_ascii_lowercase();
+
+    // `SET ROLE r`, `SET ROLE NONE`, `RESET ROLE` (roles plan R2): act as a
+    // role the session user is a member of, with that role's rights.
+    if let Some(target) = set_role_target(&s_lower, s) {
+        let base = state.session_user.clone().unwrap_or_else(|| state.principal.clone());
+        match target {
+            None => {
+                if let Some(orig) = state.session_user.take() {
+                    state.principal = orig;
+                }
+                send_command_complete(stream, if s_lower.starts_with("reset") { "RESET" } else { "SET" }).await?;
+                return Ok(true);
+            }
+            Some(role) => {
+                let Some(database) = state.catalog.get(&state.database_name) else {
+                    return Ok(false);
+                };
+                let Some(r) = crate::auth::lookup_role(&database, &role).await else {
+                    send_error_response(stream, "22023", &format!("role \"{role}\" does not exist")).await?;
+                    return Ok(true);
+                };
+                let member = base.superuser
+                    || match crate::core::rql::privileges::load(&database, None).await {
+                        Ok(rows) => crate::core::rql::privileges::roles_of(&rows, &base.name).iter().any(|g| g == &r.name),
+                        Err(_) => false,
+                    };
+                if !member {
+                    send_error_response(stream, "42501", &format!("permission denied to set role \"{role}\"")).await?;
+                    return Ok(true);
+                }
+                state.session_user.get_or_insert(base.clone());
+                state.principal = Principal { name: r.name.clone(), superuser: r.is_superuser, authenticated: base.authenticated };
+                send_command_complete(stream, "SET").await?;
+                return Ok(true);
+            }
+        }
+    }
 
     // `SET rdb.shard_part = on|off`: a Track A router's fan-out marks its
     // statements as one shard's part, so a keyless read may read the ranges
