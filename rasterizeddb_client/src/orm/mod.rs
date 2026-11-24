@@ -97,6 +97,7 @@ mod migrate;
 mod projection;
 mod query;
 mod relations;
+pub(crate) mod shard_meta;
 mod upsert;
 
 pub use bulk::UPDATE_MANY_MAX_BYTES;
@@ -111,6 +112,7 @@ pub use query::{Column, Expr, Order, Select, Update};
 pub use relations::{
     ModelRelations, RELATION_CHUNK, Relation, RelationKind, RelationSlot, Synced, Through, With,
 };
+pub use shard_meta::{ShardFamily, ShardKey, ShardKeyType, Sharding};
 pub use upsert::{InsertMany, Upsert, UpsertNothing};
 
 use std::future::Future;
@@ -216,6 +218,17 @@ pub trait Model: FromRow + Sized {
     /// `zstd(n)`. A column not listed stores its values as they are, the
     /// server's default.
     const COLUMN_COMPRESSION: &'static [(&'static str, &'static str)] = &[];
+    /// Where the rows live in a sharded deployment (`#[rdb(shard_by =
+    /// "…")]`, `#[rdb(shard = "global")]`; by default the leading
+    /// `partition_by` column, else global). Plain data: hashing happens only
+    /// in a `shard::Router` (feature `sharding`).
+    const SHARD: Sharding = Sharding::Global;
+
+    /// This row's shard key value: `None` for a model that is not sharded.
+    /// Never hashed here.
+    fn shard_key(&self) -> Option<ShardKey<'_>> {
+        None
+    }
 
     /// Writes this value's column `i` as a literal into `out`.
     fn write_value(&self, column: usize, out: &mut String) -> Result<()>;
@@ -311,6 +324,19 @@ pub enum Write {
     Update,
     Upsert,
     Delete,
+}
+
+/// Inside a router's single-shard transaction (`Router::begin_for`,
+/// `transaction_for`), refuses a row that does not live on the
+/// transaction's shard, before anything is sent: a wrong key is
+/// [`Error::CrossShard`], never a misrouted row. A no-op everywhere else.
+pub(crate) fn shard_guard<E: Executor + ?Sized, M: Model>(db: &E, row: &M) -> Result<()> {
+    #[cfg(feature = "sharding")]
+    if let Some(scope) = db.__shard_scope() {
+        return scope.check(row);
+    }
+    let _ = (db, row);
+    Ok(())
 }
 
 /// What the derive's `__rdb_before` calls for a model with `#[rdb(hooks)]`.
@@ -1050,8 +1076,8 @@ pub trait ModelExt: Executor {
     /// Inserts one row and returns it as stored: serial columns and defaults
     /// filled in.
     fn insert<M: Model>(&self, row: &M) -> impl Future<Output = Result<M>> + Send {
-        let sql = row
-            .__rdb_before(Write::Insert)
+        let sql = shard_guard(self, row)
+            .and_then(|()| row.__rdb_before(Write::Insert))
             .and_then(|()| insert_sql(&[row]));
         async move {
             let rows = self.run(&sql?).await?;
@@ -1106,8 +1132,8 @@ pub trait ModelExt: Executor {
     /// [`Error::Conflict`] when the row is there at another version,
     /// [`Error::RowCount`] when it is gone.
     fn update<M: Model>(&self, row: &M) -> impl Future<Output = Result<M>> + Send {
-        let sql = row
-            .__rdb_before(Write::Update)
+        let sql = shard_guard(self, row)
+            .and_then(|()| row.__rdb_before(Write::Update))
             .and_then(|()| update_sql(row));
         let probe = VersionProbe::of(row);
         async move {
@@ -1147,6 +1173,7 @@ pub trait ModelExt: Executor {
     /// a transaction to make them one change.
     fn update_many<M: Model>(&self, rows: &[M]) -> impl Future<Output = Result<Vec<M>>> + Send {
         let plan = (!rows.is_empty()).then(|| {
+            rows.iter().try_for_each(|r| shard_guard(self, r))?;
             let refs: Vec<&M> = rows.iter().collect();
             bulk::update_many_sql(&refs)
         });
@@ -1170,8 +1197,8 @@ pub trait ModelExt: Executor {
     /// not deleted: [`Error::Conflict`]. A row already gone is `Ok(false)`,
     /// as without a version (one more statement tells the two apart).
     fn delete<M: Model>(&self, row: &M) -> impl Future<Output = Result<bool>> + Send {
-        let sql = row
-            .__rdb_before(Write::Delete)
+        let sql = shard_guard(self, row)
+            .and_then(|()| row.__rdb_before(Write::Delete))
             .and_then(|()| delete_sql(row));
         let probe = VersionProbe::of_live(row);
         async move { delete_checked(self, sql, probe).await }
@@ -1181,8 +1208,8 @@ pub trait ModelExt: Executor {
     /// with a `#[rdb(soft_delete)]` column (where [`delete`](Self::delete)
     /// only marks it). Checks the version as `delete` does.
     fn force_delete<M: Model>(&self, row: &M) -> impl Future<Output = Result<bool>> + Send {
-        let sql = row
-            .__rdb_before(Write::Delete)
+        let sql = shard_guard(self, row)
+            .and_then(|()| row.__rdb_before(Write::Delete))
             .and_then(|()| force_delete_sql(row));
         let probe = VersionProbe::of(row);
         async move { delete_checked(self, sql, probe).await }
@@ -1193,8 +1220,8 @@ pub trait ModelExt: Executor {
     /// when its version moved. [`Error::Unsupported`] for a model without a
     /// `#[rdb(soft_delete)]` column.
     fn restore<M: Model>(&self, row: &M) -> impl Future<Output = Result<M>> + Send {
-        let sql = row
-            .__rdb_before(Write::Update)
+        let sql = shard_guard(self, row)
+            .and_then(|()| row.__rdb_before(Write::Update))
             .and_then(|()| restore_sql(row));
         let probe = VersionProbe::of(row);
         async move {

@@ -130,6 +130,9 @@ pub mod admin;
 pub mod kv;
 pub mod notice;
 pub mod orm;
+#[cfg(feature = "sharding")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sharding")))]
+pub mod shard;
 pub mod simple;
 
 /// The guide: how to use this crate, chapter by chapter. Documentation only;
@@ -220,6 +223,8 @@ pub mod prelude {
     };
     #[cfg(feature = "derive")]
     pub use crate::{Model, SqlEnum};
+    #[cfg(feature = "sharding")]
+    pub use crate::shard::{Router, ShardedModelExt};
 }
 
 /// `Result` with this crate's [`Error`].

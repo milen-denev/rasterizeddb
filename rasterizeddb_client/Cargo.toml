@@ -46,11 +46,18 @@ chrono = { version = "0.4", default-features = false, features = ["std"], option
 uuid = { version = "1", default-features = false, optional = true }
 serde = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
+# route_v1 and the shard map (feature `sharding`): the same code the engine
+# routes with. No dependencies of its own.
+rasterizeddb_router = { path = "../rasterizeddb_router", version = "1.0.0", optional = true }
 
 [features]
-default = ["derive"]
+default = ["derive", "sharding"]
 # `#[derive(Model)]`, `#[derive(FromRow)]` and `#[derive(SqlEnum)]`.
 derive = ["dep:rasterizeddb_client_derive"]
+# Client-side sharding: `shard::Router` over N servers, the ORM routed by
+# `#[rdb(shard_by)]`, fan-out reads, and the `rdb-shard` tool
+# (docs/sharding-client.md). Dormant until a `Router` is built.
+sharding = ["dep:rasterizeddb_router"]
 # ToSql/FromSql for chrono's DateTime<Utc>, NaiveDateTime, NaiveDate, NaiveTime.
 chrono = ["dep:chrono"]
 # ToSql/FromSql for uuid::Uuid.
@@ -83,3 +90,9 @@ required-features = ["derive"]
 name = "kv"
 doc-scrape-examples = true
 required-features = ["derive"]
+
+# The offline shard tool: init, show, move-tenant, rollback, retire.
+[[bin]]
+name = "rdb-shard"
+path = "src/bin/rdb_shard.rs"
+required-features = ["sharding"]
