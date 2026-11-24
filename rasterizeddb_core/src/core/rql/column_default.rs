@@ -573,7 +573,16 @@ fn evaluate_in(
     // from it, so a row that is never written never takes a value.
     if let Some(name) = crate::core::rql::sequence::parse_nextval(text) {
         return Ok(match database {
-            Some(database) => crate::core::rql::sequence::next_checked(database, &name)?.to_string(),
+            Some(database) => {
+                let next = crate::core::rql::sequence::next_checked(database, &name)?;
+                // An explicit sequence's values are its own; an implicit
+                // counter's take the shard id on a shard (B1a.9).
+                if crate::core::rql::sequence::explicit(database, &name).is_some() {
+                    next.to_string()
+                } else {
+                    crate::core::rql::sequence::shard_serial(next, db_type)?.to_string()
+                }
+            }
             // Validation: the shape is all that is being checked, and nothing
             // reads this value.
             None => String::new(),
