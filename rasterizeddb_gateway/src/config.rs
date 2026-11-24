@@ -81,6 +81,10 @@ pub struct Config {
     pub auth_cache_secs: u64,
     pub admin: Option<SocketAddr>,
     pub native_listen: Option<SocketAddr>,
+    /// The Redis protocol, routed by key (`kv`): where it listens, and each
+    /// shard's Redis address.
+    pub kv_listen: Option<SocketAddr>,
+    pub kv_shards: BTreeMap<u32, String>,
     pub native_role: String,
     pub native_database: String,
     pub drain: Duration,
@@ -118,6 +122,8 @@ impl Default for Config {
             auth_cache_secs: 60,
             admin: None,
             native_listen: None,
+            kv_listen: None,
+            kv_shards: BTreeMap::new(),
             native_role: String::new(),
             native_database: String::new(),
             drain: Duration::from_secs(30),
@@ -264,6 +270,14 @@ impl Config {
             "auth_cache_secs" => self.auth_cache_secs = num(v)?,
             "admin" => self.admin = opt(v).map(|a| a.parse()).transpose().map_err(|_| "not host:port")?,
             "native_listen" => self.native_listen = opt(v).map(|a| a.parse()).transpose().map_err(|_| "not host:port")?,
+            "kv_listen" => self.kv_listen = opt(v).map(|a| a.parse()).transpose().map_err(|_| "not host:port")?,
+            "kv_shards" => {
+                for item in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let (id, addr) = item.split_once('=').ok_or("write ID=ADDR:PORT[,ID=ADDR:PORT…]")?;
+                    let id: u32 = id.trim().parse().map_err(|_| "not a shard id")?;
+                    self.kv_shards.insert(id, addr.trim().to_string());
+                }
+            }
             "native_role" => self.native_role = v.to_string(),
             "native_database" => self.native_database = v.to_string(),
             "drain_secs" => self.drain = Duration::from_secs(num(v)?),

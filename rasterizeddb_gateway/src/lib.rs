@@ -25,6 +25,7 @@ pub mod core;
 pub mod counters;
 pub mod fanout;
 pub mod hooks;
+mod kv;
 #[cfg(feature = "native")]
 pub mod native;
 pub mod pg;
@@ -122,6 +123,9 @@ pub fn run_with(cfg: Config, hooks: Hooks) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     if let Some(addr) = shared.cfg.admin {
         side.spawn(admin::serve(shared.clone(), addr));
+    }
+    if let Some(addr) = shared.cfg.kv_listen {
+        side.spawn(kv::serve(shared.clone(), addr, shared.cfg.kv_shards.clone()));
     }
     #[cfg(feature = "native")]
     if let Some(addr) = shared.cfg.native_listen {
