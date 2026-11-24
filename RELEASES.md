@@ -1,6 +1,24 @@
 # Releases
 
-## 1.0.1 (server, `rasterizeddb_core`, `rasterizeddb_client`) and `rasterizeddb_embedded` 1.1.0 (unreleased)
+## Unreleased
+
+### Statements that failed, now answered
+
+- `GROUP BY 1` over a join failed with "Column '1' not found in schema", and so did `GROUP BY k` naming an output column (`t.system_key AS k`). Both now group by that select-list item, a real column of the same name winning, as in PostgreSQL; a position past the select list fails with 42P10. On one table both already worked.
+
+### New features
+
+- Opt-in zstd compression (`storage_compression`, a default feature): a column takes `COMPRESSION zstd(n)` and a table `WITH (row_compression = …)`, levels 1–22. Nothing is compressed unless asked, and fixed-width values stay raw. `ALTER TABLE … RECOMPRESS` and `VACUUM (FULL, RECOMPRESS)` rewrite rows and train dictionaries. The client's ORM takes `#[rdb(compression)]` and `#[rdb(row_compression)]`. See `docs/compression.md`.
+
+### Behaviour changes
+
+- `STORAGE MOVE … TO 'kv:…'` said the table was no longer covered by backups. A backup copies it as of each snapshot, with no point-in-time replay, and the message now says so.
+
+### Upgrade notes
+
+- **No downgrade after a compressed value:** the first one adds `compressed_values_v1` to the directory's `incompat_features`, and an older build refuses to open that directory.
+
+## 1.0.1 (2026-11-24: server, `rasterizeddb_core`, `rasterizeddb_client`) and `rasterizeddb_embedded` 1.1.0
 
 ### Silent wrong answers fixed
 
@@ -44,6 +62,7 @@ Each was met migrating an application onto 1.0.0.
 
 ### Crashes fixed
 
+- A scheduled backup failed ("db_storage.cfg.tmp was listed for the snapshot and is gone") when it listed the directory while the server rewrote `db_storage.cfg`, `db_kv.cfg` or `db_kv_secrets.cfg`.
 - A multibyte character (`Δ`, `😀`) next to a parenthesis or a keyword in a `WHERE` (`ΔANY(…)`, `Δ(b) > 5`) or a `JOIN LATERAL` (`t😀 AS l`) panicked the statement's handler.
 
 ### New features
