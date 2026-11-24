@@ -2730,10 +2730,14 @@ where
             }
             // Extended query protocol (Parse/Bind/Describe/Execute/Sync/...)
             b'P' => {
-                handle_parse(database, state, stream, &payload).await?;
+                if let Err(e) = handle_parse(database, state, stream, &payload).await {
+                    return Err(malformed_message(stream, "Parse", e).await);
+                }
             }
             b'B' => {
-                handle_bind(database, state, stream, &payload).await?;
+                if let Err(e) = handle_bind(database, state, stream, &payload).await {
+                    return Err(malformed_message(stream, "Bind", e).await);
+                }
             }
             b'D' => {
                 handle_describe(database, state, stream, &payload).await?;
@@ -3900,9 +3904,9 @@ where
     // cstring stmt_name, cstring query, i16 param_count, [i32 param_oid]...
     let (stmt_name, i) = read_cstring_owned(payload, 0)?;
     let (query, i) = read_cstring_owned(payload, i)?;
-    let (param_count, mut i) = read_i16_be_from(payload, i)?;
+    let (param_count, mut i) = read_count_from(payload, i)?;
 
-    let mut param_oids = Vec::with_capacity(param_count.max(0) as usize);
+    let mut param_oids = Vec::with_capacity(param_count);
     for _ in 0..param_count {
         let (oid, next) = read_i32_be_from(payload, i)?;
         i = next;
@@ -3971,8 +3975,8 @@ where
     // i16 param_count, [i32 len + bytes]..., i16 result_fmt_count, [i16 fmt]...
     let (portal, i) = read_cstring_owned(payload, 0)?;
     let (stmt, i) = read_cstring_owned(payload, i)?;
-    let (fmt_count, mut i) = read_i16_be_from(payload, i)?;
-    let mut param_formats = Vec::with_capacity(fmt_count.max(0) as usize);
+    let (fmt_count, mut i) = read_count_from(payload, i)?;
+    let mut param_formats = Vec::with_capacity(fmt_count);
     for _ in 0..fmt_count {
         let (fmt, next) = read_i16_be_from(payload, i)?;
         param_formats.push(fmt);
@@ -4000,9 +4004,9 @@ where
         .await;
     };
 
-    let (param_count, mut i) = read_i16_be_from(payload, i)?;
-    let mut params = Vec::with_capacity(param_count.max(0) as usize);
-    for idx in 0..param_count as usize {
+    let (param_count, mut i) = read_count_from(payload, i)?;
+    let mut params = Vec::with_capacity(param_count);
+    for idx in 0..param_count {
         let (len, next) = read_i32_be_from(payload, i)?;
         i = next;
         let value = if len < 0 {
@@ -4106,8 +4110,8 @@ where
         }
     }
 
-    let (res_fmt_count, mut i) = read_i16_be_from(payload, i)?;
-    let mut result_formats = Vec::with_capacity(res_fmt_count as usize);
+    let (res_fmt_count, mut i) = read_count_from(payload, i)?;
+    let mut result_formats = Vec::with_capacity(res_fmt_count);
     for _ in 0..res_fmt_count {
         let (fmt, next) = read_i16_be_from(payload, i)?;
         result_formats.push(fmt);
@@ -11270,6 +11274,33 @@ fn read_cstring_owned(bytes: &[u8], start: usize) -> io::Result<(String, usize)>
     Ok((s, next))
 }
 
+/// A Parse or Bind the server could not read ends the connection, as in
+/// PostgreSQL, but says why: a FATAL 08P01 to the client and a warning in the
+/// log. It used to close with neither, logged only at debug level, so a
+/// driver read "expected to read 5 bytes, got 0 bytes at EOF" and the server's
+/// log showed nothing. Any other error (the socket itself) is passed on as is.
+async fn malformed_message<S>(stream: &mut S, kind: &str, error: io::Error) -> io::Error
+where
+    S: AsyncWrite + Unpin,
+{
+    if error.kind() == io::ErrorKind::InvalidData {
+        let message = format!("malformed {kind} message: {error}");
+        log::warn!("pgwire: {message}; closing the connection");
+        let _ = send_fatal_error_response(stream, "08P01", &message).await;
+    }
+    error
+}
+
+/// A count in a Parse or Bind message: an Int16 on the wire that PostgreSQL
+/// reads unsigned (`pq_getmsgint(msg, 2)`), so up to 65,535 parameters. Read
+/// signed, 39,000 parameters were -26,536: Bind then ran out of message and
+/// the connection dropped, and a result-format count that large asked for an
+/// impossible allocation.
+fn read_count_from(bytes: &[u8], start: usize) -> io::Result<(usize, usize)> {
+    let (count, end) = read_i16_be_from(bytes, start)?;
+    Ok((count as u16 as usize, end))
+}
+
 fn read_i16_be_from(bytes: &[u8], start: usize) -> io::Result<(i16, usize)> {
     let end = start + 2;
     if bytes.len() < end {
@@ -17663,5 +17694,39 @@ mod text_template_tests {
             }
             assert_eq!(back, sql.trim());
         }
+    }
+}
+
+#[cfg(test)]
+mod wire_count_tests {
+    use super::*;
+
+    /// Parse and Bind counts are unsigned: 39,000 is 39,000, not -26,536.
+    #[test]
+    fn a_count_above_32767_reads_as_itself() {
+        for n in [0u16, 1, 32_767, 32_768, 39_000, 65_535] {
+            let bytes = n.to_be_bytes();
+            assert_eq!(read_count_from(&bytes, 0).unwrap(), (n as usize, 2), "{n}");
+        }
+        assert!(read_count_from(&[1], 0).is_err());
+    }
+
+    /// A malformed message answers the client with a FATAL 08P01 naming it;
+    /// a socket error is passed on with nothing written.
+    #[tokio::test]
+    async fn a_malformed_message_is_answered_before_the_close() {
+        let mut out: Vec<u8> = Vec::new();
+        let e = io::Error::new(io::ErrorKind::InvalidData, "invalid Bind parameter length");
+        let back = malformed_message(&mut out, "Bind", e).await;
+        assert_eq!(back.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(out.first(), Some(&b'E'), "{out:?}");
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("FATAL") && text.contains("08P01"), "{text}");
+        assert!(text.contains("malformed Bind message: invalid Bind parameter length"), "{text}");
+
+        let mut out: Vec<u8> = Vec::new();
+        let e = io::Error::new(io::ErrorKind::BrokenPipe, "gone");
+        assert_eq!(malformed_message(&mut out, "Parse", e).await.kind(), io::ErrorKind::BrokenPipe);
+        assert!(out.is_empty());
     }
 }
