@@ -1,27 +1,187 @@
-RasterizedDB enterprise features
+RasterizedDB Enterprise License
+Version 1.0
+
 Licensor: Denev Operations EOOD
 
-The crates rasterizeddb_enterprise and rasterizeddb_gateway_enterprise, and
-any file that names this licence in its crate manifest, are licensed under
-the PolyForm Small Business License 1.0.0, as published at
+This license follows the structure of the PolyForm Small Business License
+1.0.0, with the size limits and the combination permission below.
 
-    https://polyformproject.org/licenses/small-business/1.0.0
+## What This License Covers
 
-with the following adaptation, which takes precedence over the published
-text where they differ:
+This license applies to the crates `rasterizeddb_enterprise` and
+`rasterizeddb_gateway_enterprise`, and to any other file or crate whose
+manifest or header names this license (together, "the software"). Every
+other part of the RasterizedDB repository is licensed under the GNU General
+Public License, version 3 only, and nothing in this license changes that.
 
-    The licence's small-business limits are replaced by these: the licence
-    applies only to an organisation that has no more than 100 employees, no
-    more than 1,000,000 in revenue in its last fiscal year, and no more than
-    5,000,000 in assets. Any other organisation must obtain a commercial
-    licence from Denev Operations EOOD.
+## Acceptance
 
-PENDING LEGAL REVIEW. The adaptation above records the licensor's decision of
-2026-11-23 (sharding plan, decisions D10 and D10b). Its wording, the currency
-of the amounts, how employees, revenue and assets are counted, and the
-additional permission that lets the GPL-3.0-only parts of RasterizedDB be
-combined with these crates in one binary (GPLv3 section 7) are to be written
-by the licensor's counsel. Until then, contact Denev Operations EOOD before
-any use above the limits.
+In order to get any license under these terms, you must agree to them as
+both strict obligations and conditions to all your licenses.
 
-Everything in this repository not named above remains GPL-3.0-only.
+## Copyright License
+
+The licensor grants you a copyright license for the software to do
+everything you might do with the software that would otherwise infringe the
+licensor's copyright in it for any permitted purpose. However, you may only
+distribute the software according to the Distribution License and make
+changes or new works based on the software according to the Changes and New
+Works License.
+
+## Distribution License
+
+The licensor grants you an additional copyright license to distribute copies
+of the software. Your license to distribute covers distributing the software
+with changes and new works permitted by the Changes and New Works License.
+
+## Notices
+
+You must ensure that anyone who gets a copy of any part of the software from
+you also gets a copy of these terms, or the address of a place where they can
+be read, and the following notice:
+
+> Required Notice: Copyright Denev Operations EOOD. Licensed under the
+> RasterizedDB Enterprise License 1.0.
+
+## Changes and New Works License
+
+The licensor grants you an additional copyright license to make changes and
+new works based on the software for any permitted purpose.
+
+## Patent License
+
+The licensor grants you a patent license for the software that covers patent
+claims the licensor can license, or becomes able to license, that you would
+infringe by using the software.
+
+## Combination With GPL Parts
+
+The software is designed to be linked with the parts of RasterizedDB that are
+licensed under the GNU General Public License, version 3 only (the "GPL
+parts"), into one program, such as the `rasterizeddb_core_enterprise` and
+`rasterizeddb_gateway_enterprise` binaries.
+
+As an additional permission under section 7 of the GNU General Public
+License, version 3, the copyright holder of the GPL parts permits you to
+combine and link the GPL parts with the software, and to convey the resulting
+combination, without the terms of the GNU General Public License applying to
+the software itself. The GPL parts of the combination remain under the GNU
+General Public License, version 3 only, and you must meet its terms for them,
+including making their corresponding source available. This permission
+applies only to the software as licensed here; it grants nothing for any
+other program, and it does not make the software available under the GNU
+General Public License.
+
+## Fair Use
+
+You may have "fair use" rights for the software under the law. These terms
+do not limit them.
+
+## Small Business
+
+Use of the software for the benefit of your company is use for a permitted
+purpose if your company has:
+
+1. fewer than 100 total individuals working as employees and independent
+   contractors;
+2. less than 1,000,000 USD (2026) in total revenue in the prior tax year;
+   and
+3. less than 5,000,000 USD (2026) in total assets at the end of the prior
+   tax year.
+
+All three conditions must hold. The amounts are adjusted annually for
+inflation according to the United States Bureau of Labor Statistics'
+consumer price index for all urban consumers, U.S. city average, for all
+items, not seasonally adjusted, with 1982–1984 = 100 reference base.
+
+Counting employees, independent contractors, revenue and assets, include
+those of every company that controls your company, that your company
+controls, and that is under common control with your company.
+
+## Noncommercial Use
+
+Personal use for research, experiment and testing for the benefit of public
+knowledge, personal study, private entertainment, hobby projects, amateur
+pursuits, or religious observance, without any anticipated commercial
+application, is use for a permitted purpose. Use by any charitable
+organization, educational institution, public research organization, public
+safety or health organization, environmental protection organization, or
+government institution is use for a permitted purpose regardless of the
+source of funding or obligations resulting from the funding.
+
+## Commercial License Above the Limits
+
+If your company does not meet every condition under Small Business, and its
+use is not a permitted purpose under Noncommercial Use, you must obtain a
+commercial license from Denev Operations EOOD before using the software. Use
+of the software for evaluation, for up to 30 days, is a permitted purpose
+for any company.
+
+## Growing or Joining a Larger Organization
+
+If your company stops meeting the conditions under Small Business, and its
+use is not otherwise a permitted purpose, your license will not stop
+immediately. You have 90 days from the date your company stopped meeting
+those conditions to obtain a commercial license from the licensor or stop
+using the software. Your license ends at the end of that period unless you
+have obtained a commercial license.
+
+## No Other Rights
+
+These terms do not allow you to sublicense or transfer any of your licenses
+to anyone else, or prevent the licensor from granting licenses to anyone
+else. These terms do not imply any other licenses.
+
+## Patent Defense
+
+If you make any written claim that the software infringes or contributes to
+infringement of any patent, your patent license for the software granted
+under these terms ends immediately. If your company makes such a claim, your
+patent license ends immediately for work on behalf of your company.
+
+## Violations
+
+The first time you are notified in writing that you have violated any of
+these terms, or done anything with the software not covered by your
+licenses, your licenses can nonetheless continue if you come into full
+compliance with these terms, and take practical steps to correct past
+violations, within 32 days of receiving notice. Otherwise, all your licenses
+end immediately.
+
+## No Liability
+
+***As far as the law allows, the software comes as is, without any warranty
+or condition, and the licensor will not be liable to you for any damages
+arising out of these terms or the use or nature of the software, under any
+kind of legal claim.***
+
+## Definitions
+
+The **licensor** is Denev Operations EOOD, the individual or entity offering
+these terms, and the **software** is the software the licensor makes
+available under these terms, as described under What This License Covers.
+
+**You** refers to the individual or entity agreeing to these terms.
+
+**Your company** is any legal entity, sole proprietorship, or other kind of
+organization that you work for, plus all organizations that have control
+over, are under the control of, or are under common control with that
+organization. **Control** means ownership of substantially all the assets of
+an entity, or the power to direct its management and policies by vote,
+contract, or otherwise. Control can be direct or indirect.
+
+**Your licenses** are all the licenses granted to you for the software under
+these terms.
+
+**Use** means anything you do with the software requiring one of your
+licenses.
+
+## Governing Law
+
+These terms are governed by the laws of the Republic of Bulgaria, without
+regard to its conflict-of-laws rules, except where the law of your place of
+residence requires otherwise for consumers.
+
+## Contact
+
+For commercial licenses: Denev Operations EOOD.

@@ -4,7 +4,8 @@ version = "1.0.0"
 edition = "2024"
 description = "RasterizedDB enterprise features: strict tenant isolation for database-as-a-service and policy-driven data segregation"
 repository = "https://github.com/milen-denev/rasterizeddb"
-# PolyForm Small Business 1.0.0, adapted (D10, D10b): see LICENSE.
+# The RasterizedDB Enterprise License 1.0 (PolyForm Small Business 1.0.0's
+# structure with the D10 limits and a GPLv3 §7 combination permission): see LICENSE.
 license-file = "LICENSE"
 authors = ["Milen Denev"]
 # Not published until the licence text is final.
