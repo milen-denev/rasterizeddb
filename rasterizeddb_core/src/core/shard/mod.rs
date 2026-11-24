@@ -11,6 +11,10 @@ pub mod map_state;
 pub mod merge;
 pub mod ownership;
 #[cfg(feature = "sharding_raft")]
+pub mod raft_group;
+#[cfg(feature = "sharding_raft")]
+pub mod raft_net;
+#[cfg(feature = "sharding_raft")]
 pub mod raft_store;
 pub mod rshard;
 pub mod signing;
