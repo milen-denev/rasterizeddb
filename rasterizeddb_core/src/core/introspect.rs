@@ -1850,6 +1850,9 @@ async fn shard_admin(database: &Arc<Database>, admin: &ShardAdmin) -> Result<Str
             Ok(format!("blocks [{lo:#x}, {hi:#x}) unfenced"))
         }
         ShardAdmin::Take { lo, hi } => {
+            // A placement policy may forbid this shard the range (§4.10).
+            let shard = map_state::current().map_or(0, |s| s.shard_id);
+            crate::core::policy_hooks::placement().may_place(lo, hi, shard, &[])?;
             // Incoming first, so the copy's stamps pass the guard as soon
             // as the spans open.
             ownership::add_incoming(lo, hi)?;
@@ -1879,6 +1882,11 @@ async fn shard_admin(database: &Arc<Database>, admin: &ShardAdmin) -> Result<Str
             }
             if map.shard(served.shard_id).is_none() {
                 return Err(format!("the map has no shard {}", served.shard_id));
+            }
+            // Every range the map gives this shard must be one a placement
+            // policy lets it hold: a forged or stale map is refused here.
+            for (lo, hi) in map.ranges_of(served.shard_id) {
+                crate::core::policy_hooks::placement().may_place(lo, hi, served.shard_id, &[])?;
             }
             if map.epoch() <= served.map.epoch() {
                 return Err(format!("the map is at epoch {}, this shard is already at {}", map.epoch(), served.map.epoch()));

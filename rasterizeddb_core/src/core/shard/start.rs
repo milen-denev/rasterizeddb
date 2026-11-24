@@ -129,6 +129,9 @@ pub fn start(config: &ShardConfig) -> Result<ShardStarted, String> {
     if map.shard(config.shard_id).is_none() {
         return Err(format!("the cluster map has no shard {}", config.shard_id));
     }
+    for (lo, hi) in map.ranges_of(config.shard_id) {
+        crate::core::policy_hooks::placement().may_place(lo, hi, config.shard_id, &[])?;
+    }
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|e| format!("cannot create {}: {e}", config.data_dir.display()))?;
     check_epoch(&config.data_dir, &map)?;
