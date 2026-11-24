@@ -740,6 +740,33 @@ impl Migrator {
         }
     }
 
+    /// [`apply`](Self::apply) over a router's every shard: the home shard
+    /// first, then the others in id order, each recording its own ledger in
+    /// its own migration table. A failure stops there and names the shard;
+    /// shards before it are migrated, and the next call resumes from each
+    /// shard's own ledger (DDL is not transactional, so nothing is undone).
+    /// Every model's table is made on every shard, so schemas stay
+    /// identical; a global model's table stays empty off the home shard.
+    #[cfg(feature = "sharding")]
+    pub async fn apply_sharded(
+        &self,
+        router: &crate::shard::Router,
+    ) -> Result<Vec<(crate::shard::ShardId, MigrationReport)>> {
+        let mut out = Vec::new();
+        for id in router.migration_order() {
+            let client = router.for_shard(id)?;
+            let report = self.apply(client).await.map_err(|e| match e {
+                Error::Server(m) => Error::Server(format!(
+                    "migration stopped at shard {id} (the shards before it are migrated; run again to resume): {m}"
+                )),
+                Error::Unsupported(m) => Error::Unsupported(format!("migration stopped at shard {id}: {m}")),
+                other => other,
+            })?;
+            out.push((id, report));
+        }
+        Ok(out)
+    }
+
     /// Applies what is pending: steps in order, repeatable steps whose text
     /// changed, then the model sync. Holds the migration lock throughout.
     pub async fn apply(&self, client: &Client) -> Result<MigrationReport> {

@@ -4698,6 +4698,7 @@ dependencies = [
  "pbkdf2",
  "rastcp",
  "rasterizeddb_client_derive",
+ "rasterizeddb_router",
  "serde",
  "serde_json",
  "sha2 0.11.1",

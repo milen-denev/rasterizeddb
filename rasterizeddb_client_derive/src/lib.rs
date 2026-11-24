@@ -78,6 +78,8 @@ use syn::{Data, DeriveInput, Fields, LitStr, Type, parse_macro_input};
 /// | `renamed_from = "old"` | an earlier table name, for the migrator to rename |
 /// | `hooks` | run the struct's `ModelHooks` impl (validation, before/after hooks), which you then write |
 /// | `partition_by = "tenant_id, group_id"`, `partitions = 16` | a hash-partitioned table: `CREATE TABLE … PARTITION BY HASH (…) PARTITIONS 16` |
+/// | `shard_by = "tenant_id"` | the shard key a router routes by (defaults to the leading `partition_by` column). The column must be an integer, `String` or `Uuid`, in the primary key and in every unique key, and the model has no `serial` column |
+/// | `shard = "global"`, `shard = "unsharded"` | rows on the home shard only; or refused by a router |
 /// | `row_compression = "zstd(9)"` | store each row's text, `jsonb`, `bytea` and array values as one compressed frame: `WITH (row_compression = …)`; for a table of many short strings, where per-column `compression` finds too little to work on |
 ///
 /// A field's type must implement `SqlType` (every type the client maps does)
@@ -663,6 +665,8 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             "partition_by",
             "partitions",
             "row_compression",
+            "shard_by",
+            "shard",
         ],
     )?;
     let setting = |key: &str| {
@@ -965,6 +969,7 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             }))
         }
     };
+    let (shard_const, shard_key_fn) = sharding(input, &fields, setting("shard_by"), setting("shard"), setting("partition_by"))?;
     let row_compression = match setting("row_compression") {
         Some(method) => {
             // A bare `row_compression` is zstd at its default level.
@@ -1002,6 +1007,8 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             const PARTITION: ::core::option::Option<::rasterizeddb_client::orm::Partitioning> = #partition;
             #row_compression
             #column_compression
+            #shard_const
+            #shard_key_fn
 
             fn write_value(&self, column: usize, out: &mut ::std::string::String) -> ::rasterizeddb_client::Result<()> {
                 match column {
@@ -1031,6 +1038,125 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
 
         #from_row
     })
+}
+
+/// `SHARD` and `shard_key()` for a model: `shard_by` checked strictly (a
+/// compile error per broken rule), the leading `partition_by` column taken
+/// by default when it can shard (else `Unroutable` with the reason), and
+/// `shard = "global" | "unsharded"`.
+fn sharding(
+    input: &DeriveInput,
+    fields: &[Field<'_>],
+    shard_by: Option<String>,
+    shard: Option<String>,
+    partition_by: Option<String>,
+) -> syn::Result<(Tokens, Tokens)> {
+    let span = input.span();
+    let global = quote!(const SHARD: ::rasterizeddb_client::orm::Sharding = ::rasterizeddb_client::orm::Sharding::Global;);
+    match (shard.as_deref(), &shard_by) {
+        (Some(_), Some(_)) => {
+            return Err(syn::Error::new(span, "shard_by and shard = \"…\" do not go together"));
+        }
+        (Some("global"), None) => return Ok((global, quote!())),
+        (Some("unsharded"), None) => {
+            return Ok((
+                quote!(const SHARD: ::rasterizeddb_client::orm::Sharding = ::rasterizeddb_client::orm::Sharding::Unsharded;),
+                quote!(),
+            ));
+        }
+        (Some(other), None) => {
+            return Err(syn::Error::new(
+                span,
+                format!("shard = \"{other}\": write shard = \"global\" or shard = \"unsharded\", or shard_by = \"<column>\""),
+            ));
+        }
+        (None, _) => {}
+    }
+    let explicit = shard_by.is_some();
+    let column = match (shard_by, partition_by) {
+        (Some(c), _) => c.trim().to_string(),
+        (None, Some(key)) => key.split(',').next().unwrap_or("").trim().to_string(),
+        (None, None) => return Ok((global, quote!())),
+    };
+    let column_of = |f: &Field<'_>| {
+        f.attrs
+            .column
+            .clone()
+            .unwrap_or_else(|| f.ident.expect("named").to_string().trim_start_matches("r#").to_string())
+    };
+    let columns: Vec<&Field<'_>> = fields.iter().filter(|f| !f.attrs.skip && f.attrs.relation.is_none() && f.attrs.count_of.is_none()).collect();
+    let Some(key) = columns.iter().find(|f| column_of(f) == column) else {
+        return Err(syn::Error::new(span, format!("shard_by names {column}, which is not a column of this model")));
+    };
+    // The rules a sharded model keeps (per-shard uniqueness is exact only
+    // when every unique key holds the shard column; a sequence is per shard).
+    let mut broken: Option<String> = None;
+    if is_option(key.ty) {
+        broken = Some(format!("the shard column {column} is an Option: a NULL key has no shard"));
+    } else if key.attrs.json || key.attrs.text || key.attrs.sql_type.is_some() {
+        broken = Some(format!("the shard column {column} has a custom type, which does not route"));
+    } else if let Some(f) = columns.iter().find(|f| f.attrs.serial) {
+        broken = Some(format!(
+            "{} is serial, and a sequence is per shard so its values collide across shards: use a Uuid (v7)",
+            column_of(f)
+        ));
+    } else if columns.iter().any(|f| f.attrs.primary_key) && !key.attrs.primary_key {
+        broken = Some(format!("the primary key does not contain the shard column {column}"));
+    } else if let Some(f) = columns.iter().find(|f| f.attrs.unique && column_of(f) != column) {
+        broken = Some(format!(
+            "unique on {} is not exact across shards: a unique key of a sharded model must contain the shard column {column}",
+            column_of(f)
+        ));
+    }
+    if let Some(why) = broken {
+        if explicit {
+            return Err(syn::Error::new(span, format!("shard_by = \"{column}\": {why}")));
+        }
+        let why = format!("partitioned by {column}, but not shardable: {why}");
+        return Ok((
+            quote!(const SHARD: ::rasterizeddb_client::orm::Sharding = ::rasterizeddb_client::orm::Sharding::Unroutable(#why);),
+            quote!(),
+        ));
+    }
+    if !explicit && !routable_type(key.ty) {
+        let why = format!("partitioned by {column}, but its Rust type does not route: declare shard_by to check it");
+        return Ok((
+            quote!(const SHARD: ::rasterizeddb_client::orm::Sharding = ::rasterizeddb_client::orm::Sharding::Unroutable(#why);),
+            quote!(),
+        ));
+    }
+    let ty = key.ty;
+    let access = &key.access;
+    Ok((
+        quote! {
+            const SHARD: ::rasterizeddb_client::orm::Sharding = ::rasterizeddb_client::orm::Sharding::By {
+                column: #column,
+                family: <#ty as ::rasterizeddb_client::orm::ShardKeyType>::FAMILY,
+            };
+        },
+        quote! {
+            fn shard_key(&self) -> ::core::option::Option<::rasterizeddb_client::orm::ShardKey<'_>> {
+                ::core::option::Option::Some(::rasterizeddb_client::orm::ShardKeyType::shard_key(&self.#access))
+            }
+        },
+    ))
+}
+
+/// Whether a field's type is one `ShardKeyType` covers, read from its last
+/// path segment: what lets a partitioned model shard by default without a
+/// compile error on an unusual key type.
+fn routable_type(ty: &Type) -> bool {
+    let Type::Path(p) = ty else {
+        return false;
+    };
+    p.qself.is_none()
+        && p.path.segments.last().is_some_and(|s| {
+            s.arguments.is_empty()
+                && matches!(
+                    s.ident.to_string().as_str(),
+                    "i8" | "i16" | "i32" | "i64" | "i128" | "u8" | "u16" | "u32" | "u64" | "String" | "Uuid"
+                )
+        })
 }
 
 // -------------------------------------------------------------------- SqlEnum

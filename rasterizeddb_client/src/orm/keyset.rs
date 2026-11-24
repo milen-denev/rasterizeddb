@@ -154,6 +154,18 @@ pub(crate) struct Key {
     numeric_text: bool,
 }
 
+#[cfg(feature = "sharding")]
+impl Key {
+    /// The key column's position in the model's select list.
+    pub(crate) fn position(&self) -> usize {
+        self.position
+    }
+
+    pub(crate) fn descending(&self) -> bool {
+        self.descending
+    }
+}
+
 /// The sort keys of a keyset over `order`: its columns, then the primary
 /// key's columns not already among them (in the last column's direction),
 /// so that every row has a distinct key.
