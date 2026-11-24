@@ -103,6 +103,10 @@ pub(super) enum Kind {
     Dependencies,
     /// `collectSequences`: every sequence's definition.
     Sequences,
+    /// One sequence's definition, as `dumpSequence` reads it before
+    /// `pg_dump` 18 (`… FROM pg_sequence WHERE seqrelid = '<oid>'::oid`): no
+    /// `seqrelid` column, and exactly one row.
+    Sequence(i64),
     /// `SELECT last_value, is_called FROM <sequence>`.
     SequenceData(String),
     /// `pg_get_viewdef(<oid>)`.
@@ -196,6 +200,9 @@ pub(super) fn recognize(sql: &str) -> Option<Kind> {
     }
     if has("from pg_depend where deptype != 'p'") {
         return Some(Kind::Dependencies);
+    }
+    if has("from pg_sequence ") && has("seqrelid =") {
+        return quoted_number_after(f, "seqrelid =").map(Kind::Sequence);
     }
     if has("from pg_sequence ") && has("seqrelid") {
         return Some(Kind::Sequences);
@@ -922,6 +929,11 @@ fn rows_of(kind: &Kind, sql: &str, dm: &DumpModel) -> Rows {
                 let owner = sequence.and_then(|q| q.owner);
                 let checks = rel.constraints.iter().filter(|c| c.contype == "c").count();
                 let has_index = !rel.indexes.is_empty() || partition_index(dm, rel).is_some();
+                // A foreign key's triggers sit on both its tables, and
+                // `pg_dump` before 18 reads foreign keys only off a table
+                // that has triggers (`getConstraints`).
+                let has_triggers = rel.constraints.iter().any(|c| c.contype == "f")
+                    || dm.model.rels.iter().any(|r| r.constraints.iter().any(|c| c.contype == "f" && c.foreign_table == rel.oid));
                 // A partitioned table is the table its rows are read from
                 // (the module's comment says why).
                 let kind = if rel.kind == "p" { "r" } else { rel.kind };
@@ -940,7 +952,7 @@ fn rows_of(kind: &Kind, sql: &str, dm: &DumpModel) -> Rows {
                     ("reltuples", s(if rel.kind == "S" { -1 } else { rel.tuples })),
                     ("relallvisible", s(0)),
                     ("relallfrozen", s(0)),
-                    ("relhastriggers", flag(false)),
+                    ("relhastriggers", flag(has_triggers)),
                     ("relpersistence", s("p")),
                     ("reloftype", s(0)),
                     ("relacl", None),
@@ -1023,6 +1035,9 @@ fn rows_of(kind: &Kind, sql: &str, dm: &DumpModel) -> Rows {
                         ("attversion", None),
                         ("attcollation", s(0)),
                         ("attfdwoptions", s("")),
+                        // `pg_dump` before 18 reads NOT NULL here; 18 off
+                        // `notnull_name`.
+                        ("attnotnull", flag(c.not_null)),
                         ("notnull_name", c.not_null.then(String::new)),
                         ("notnull_comment", None),
                         ("notnull_invalidoid", None),
@@ -1179,6 +1194,19 @@ fn rows_of(kind: &Kind, sql: &str, dm: &DumpModel) -> Rows {
                     })
                     .collect(),
             );
+        }
+        Kind::Sequence(oid) => {
+            if let Some(q) = dm.sequences.iter().find(|q| q.oid == *oid) {
+                rows.push(vec![
+                    ("format_type", s(&q.data_type)),
+                    ("seqstart", s(q.start)),
+                    ("seqincrement", s(q.increment)),
+                    ("seqmax", s(q.max)),
+                    ("seqmin", s(q.min)),
+                    ("seqcache", s(q.cache.max(1))),
+                    ("seqcycle", flag(q.cycle)),
+                ]);
+            }
         }
         Kind::SequenceData(name) => {
             if let Some(q) = dm.sequences.iter().find(|q| q.name == *name || q.name.eq_ignore_ascii_case(name)) {
@@ -1453,6 +1481,8 @@ mod tests {
             ("SELECT DISTINCT attrelid FROM pg_attribute WHERE attacl IS NOT NULL", Kind::Empty),
             ("SELECT description, classoid, objoid, objsubid FROM pg_catalog.pg_description ORDER BY classoid, objoid, objsubid", Kind::Descriptions),
             ("SELECT seqrelid, format_type(seqtypid, NULL), seqstart, seqincrement, seqmax, seqmin, seqcache, seqcycle, NULL, 'f' FROM pg_catalog.pg_sequence ORDER BY seqrelid", Kind::Sequences),
+            // `pg_dump` 16 and 17: one sequence at a time, one row back.
+            ("SELECT format_type(seqtypid, NULL), seqstart, seqincrement, seqmax, seqmin, seqcache, seqcycle FROM pg_catalog.pg_sequence WHERE seqrelid = '1607504362'::oid", Kind::Sequence(1607504362)),
             ("SELECT at.attname, at.attacl, '{}' AS acldefault, pip.privtype, pip.initprivs FROM pg_catalog.pg_attribute at LEFT JOIN pg_catalog.pg_init_privs pip ON (at.attrelid = pip.objoid) WHERE at.attrelid = '6100'", Kind::Empty),
             ("SELECT pg_catalog.pg_get_viewdef('16431'::pg_catalog.oid) AS viewdef", Kind::ViewDefinition(16431)),
             ("SELECT last_value, is_called FROM public.customers_id_seq", Kind::SequenceData("customers_id_seq".to_string())),

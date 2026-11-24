@@ -26,7 +26,7 @@
 - `DO $$ … $$` blocks.
 - `DROP INDEX` drops an index made by `CREATE UNIQUE INDEX`. It used to be refused.
 - A primary key can take any name, inline keys included.
-- `pg_dump` dumps a RasterizedDB database, including the rows of partitioned tables.
+- `pg_dump` 16, 17 and 18 dump a RasterizedDB database, including the rows of partitioned tables and composite foreign keys on them.
 - Redis-compatible KV cache: replication between nodes, and TLS on the Redis port.
 - Replication: `REPLICATION DISABLE` covers every database, and `SHOW REPLICATION STATUS` has a row per database.
 - Partitioned tables:
