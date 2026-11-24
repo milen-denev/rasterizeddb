@@ -92,6 +92,21 @@ pub trait TenancyPolicy: Send + Sync + 'static {
     fn is_process_admin(&self, ctx: &SessionContext<'_>) -> bool {
         ctx.superuser
     }
+
+    /// Whether `CREATE DATABASE` may take over a directory already on disk
+    /// under its name that holds something (T8). The open default does: it
+    /// can only be one the catalogue failed to notice. Strict tenant mode
+    /// refuses, so a customer's database never opens data it did not write.
+    fn may_adopt_directory(&self) -> bool {
+        true
+    }
+
+    /// Whether the server may open an outbound connection to `host:port`
+    /// (T9): a PostgreSQL import's source, an S3 endpoint. Open by default;
+    /// a licensed policy holds them to an allowlist.
+    fn may_connect(&self, _host: &str, _port: u16) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Placement's hook: which shards a range or a tenant may live on.

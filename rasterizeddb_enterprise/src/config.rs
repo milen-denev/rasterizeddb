@@ -31,6 +31,9 @@ pub struct EnterpriseConfig {
     pub pinned_roles: Vec<(String, String)>,
     /// Where `CREATE TENANT` keeps the tenant directory.
     pub tenants_file: Option<std::path::PathBuf>,
+    /// T9: the hosts the server may connect out to (`host`, `host:port`,
+    /// `*.suffix`), under strict tenant mode. Unset, nothing is held back.
+    pub outbound_hosts: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +100,9 @@ impl EnterpriseConfig {
                 }
                 ["pinned_role", db, role] => c.pinned_roles.push((db.to_string(), role.to_string())),
                 ["tenants_file", path] => c.tenants_file = Some(path.into()),
+                ["outbound_hosts", hosts @ ..] => {
+                    c.outbound_hosts.get_or_insert_with(Vec::new).extend(hosts.iter().map(|h| h.to_ascii_lowercase()));
+                }
                 _ => return Err(bad("unknown setting")),
             }
         }

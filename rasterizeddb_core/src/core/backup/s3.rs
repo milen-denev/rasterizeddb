@@ -871,6 +871,10 @@ impl S3Client {
 
     /// Takes a live connection from the pool, or opens one.
     async fn connect(&self) -> io::Result<Stream> {
+        // T9: where the server may connect to is the policy's to say.
+        crate::core::policy_hooks::tenancy()
+            .may_connect(&self.config.endpoint.host, self.config.endpoint.port)
+            .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
         loop {
             let candidate = self.pool.lock().pop();
             match candidate {

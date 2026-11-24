@@ -24,6 +24,7 @@ use rasterizeddb_core::core::policy_hooks::{ProcessSurface, SessionContext, Tena
 use crate::EnterpriseConfig;
 
 pub struct StrictTenancy {
+    outbound_hosts: Option<Vec<String>>,
     operator_database: String,
     limits: BTreeMap<String, TenantLimits>,
     directory: crate::tenants::Directory,
@@ -32,6 +33,7 @@ pub struct StrictTenancy {
 impl StrictTenancy {
     pub fn new(cfg: &EnterpriseConfig) -> Result<Self, String> {
         Ok(StrictTenancy {
+            outbound_hosts: cfg.outbound_hosts.clone(),
             operator_database: cfg.operator_database.clone(),
             limits: cfg.limits.clone(),
             directory: crate::tenants::Directory::open(cfg.tenants_file.clone())?,
@@ -40,6 +42,30 @@ impl StrictTenancy {
 }
 
 impl TenancyPolicy for StrictTenancy {
+    /// T8: a customer's database never opens a directory it did not write.
+    fn may_adopt_directory(&self) -> bool {
+        false
+    }
+
+    /// T9: outbound connections only to the configured hosts.
+    fn may_connect(&self, host: &str, port: u16) -> Result<(), String> {
+        let Some(allowed) = &self.outbound_hosts else {
+            return Ok(());
+        };
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        let with_port = format!("{host}:{port}");
+        let matches = allowed.iter().any(|a| {
+            *a == host
+                || *a == with_port
+                || a.strip_prefix("*.").is_some_and(|suffix| host.ends_with(&format!(".{suffix}")))
+        });
+        if matches {
+            Ok(())
+        } else {
+            Err(format!("connecting to {with_port} is not allowed: the server's outbound_hosts does not list it"))
+        }
+    }
+
     fn admit(&self, ctx: &SessionContext<'_>) -> Result<(), String> {
         if ctx.protocol == "redis" && ctx.database != self.operator_database {
             return Err("the Redis protocol is not offered to tenants in strict tenant mode".to_string());

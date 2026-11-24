@@ -593,7 +593,17 @@ impl DatabaseCatalog {
                 let path = std::path::Path::new(root).join(name);
                 // An existing directory is adopted rather than refused: it can
                 // only be one this catalogue failed to notice, since the name
-                // is not in the map.
+                // is not in the map. Unless the tenancy policy says otherwise
+                // (T8): then only an empty one, or one this create marked.
+                if !crate::core::policy_hooks::tenancy().may_adopt_directory()
+                    && !path.join(PENDING_CREATE).exists()
+                    && std::fs::read_dir(&path).is_ok_and(|mut entries| entries.next().is_some())
+                {
+                    return Err(format!(
+                        "could not create database \"{name}\": a directory of that name already holds data, \
+                         and a database is never made over one here"
+                    ));
+                }
                 tokio::fs::create_dir_all(&path)
                     .await
                     .map_err(|e| format!("could not create database \"{}\": {}", name, e))?;
