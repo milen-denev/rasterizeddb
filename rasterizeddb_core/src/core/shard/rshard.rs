@@ -294,6 +294,15 @@ async fn open_session(conn: &Conn, session: u64, database: &str, role: &str, par
     if !r.can_login {
         return refuse(*b"28000", true, format!("role \"{role}\" is not permitted to log in"));
     }
+    let ctx = crate::core::policy_hooks::SessionContext {
+        role: &r.name,
+        database,
+        protocol: "rshard",
+        superuser: r.is_superuser,
+    };
+    if let Err(e) = crate::core::policy_hooks::tenancy().admit(&ctx) {
+        return refuse(*b"28000", true, e);
+    }
     drop(guard);
     let options = BridgeOptions {
         login: ProxiedLogin { user: r.name.clone(), superuser: r.is_superuser, authenticated: true },

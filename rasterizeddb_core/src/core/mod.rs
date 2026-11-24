@@ -13,6 +13,9 @@ pub mod sync_audit;
 /// Ownership hooks on every path that stamps a row: no-ops without the
 /// `sharding` feature (sharding-plan.md B0.7).
 pub mod shard_hooks;
+/// The GPL hook traits licensed tenancy and placement plug into; their
+/// defaults are today's behaviour (sharding-plan.md §10).
+pub mod policy_hooks;
 /// A shard's side of sharding; dormant until `--role shard`.
 #[cfg(feature = "sharding")]
 pub mod shard;
