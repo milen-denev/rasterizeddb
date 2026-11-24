@@ -4830,6 +4830,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rasterizeddb_gateway"
+version = "1.0.0"
+dependencies = [
+ "env_logger",
+ "log",
+ "rastcp",
+ "rasterizeddb_router",
+ "rustls",
+ "sha2 0.11.1",
+ "socket2",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "rasterizeddb_router"
 version = "1.0.0"
 

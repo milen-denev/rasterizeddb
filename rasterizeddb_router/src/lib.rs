@@ -11,6 +11,8 @@
 //! - [`map`]: point ranges and a partition's range map.
 //! - [`shard_map`]: level-0 blocks to shards, with its text and binary codecs.
 //! - [`balance`]: the auto-balancing planner over a map and measured loads.
+//! - [`rshard`]: the gateway↔shard protocol's messages and codec.
+//! - [`literals`]: a simple query's shape and literal slots, for routing.
 //!
 //! The crate has no dependencies, so every byte of a route is computed here.
 
@@ -18,7 +20,9 @@
 
 pub mod balance;
 pub mod key;
+pub mod literals;
 pub mod map;
+pub mod rshard;
 pub mod shard_map;
 pub mod xxh64;
 

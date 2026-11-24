@@ -1,0 +1,1104 @@
+//! A client session through the gateway (B1a.7, §4.9 G4–G7).
+//!
+//! One virtual session per shard, opened lazily on that shard's mux
+//! connection. The client's bytes go to the shard unchanged; the replies
+//! come back unchanged, except for the replies to messages the gateway
+//! itself prepended (a deferred `BEGIN`, a lazy re-Parse), which it strips.
+
+use std::collections::{HashMap, VecDeque};
+use std::io;
+use std::rc::Rc;
+
+use rasterizeddb_router::rshard::{self, Merge, Refusal, Request, Response, RouteTemplate, Source};
+use rasterizeddb_router::shard_map::ShardMap;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+use crate::config::{Unrouted, UnroutedWrites};
+use crate::core::{CallError, Core};
+use crate::pg::{self, MsgReader};
+use crate::route::{self, OwnedKey};
+use crate::state::CancelTargets;
+
+/// Where a statement goes.
+pub(crate) enum Target {
+    Shard(u32),
+    FanOut { merge: Merge, writes: bool },
+    Refuse { sqlstate: &'static str, message: String },
+}
+
+/// What a run on a shard came to.
+pub(crate) enum Outcome {
+    /// Answered (rows or an error) and written to the client.
+    Done { error: bool },
+    /// Refused before effect: decide the target again and resend.
+    Retry,
+    /// The client connection must end (a transaction's shard was lost).
+    Close,
+}
+
+/// A transaction as the gateway tracks it.
+pub(crate) struct Txn {
+    /// ReadyForQuery's status: `I`, `T` or `E`.
+    pub status: u8,
+    /// The shard the transaction runs on, once its first statement routed.
+    pub shard: Option<u32>,
+    /// `BEGIN` and `SET LOCAL` messages recorded before the first routed
+    /// statement, prepended to it.
+    pub pending: Vec<u8>,
+    pub pending_queries: usize,
+}
+
+/// A virtual session on one shard.
+pub(crate) struct VSession {
+    pub id: u64,
+    /// Statement name → the generation parsed there.
+    pub parsed: HashMap<String, u64>,
+}
+
+/// A prepared statement as the client defined it.
+pub(crate) struct Stmt {
+    pub text: String,
+    pub parse: Vec<u8>,
+    pub generation: u64,
+}
+
+pub struct Login {
+    pub database: String,
+    pub role: String,
+    /// Startup parameters other than `user` and `database`, passed to every
+    /// virtual session.
+    pub params: Vec<(String, String)>,
+    /// G11: locked to this shard.
+    pub pinned: Option<u32>,
+    pub cancel: CancelTargets,
+}
+
+/// Messages the gateway strips from a reply, in order.
+struct ReplyFilter {
+    /// Prepended simple queries: everything through each one's
+    /// ReadyForQuery, errors excepted.
+    skip_rfq: usize,
+    /// Prepended extended messages' replies: ParseComplete (`1`) and
+    /// CloseComplete (`3`).
+    skip: VecDeque<u8>,
+}
+
+impl ReplyFilter {
+    fn none() -> ReplyFilter {
+        ReplyFilter { skip_rfq: 0, skip: VecDeque::new() }
+    }
+
+    fn apply(&mut self, bytes: &[u8], out: &mut Vec<u8>) {
+        if self.skip_rfq == 0 && self.skip.is_empty() {
+            out.extend_from_slice(bytes);
+            return;
+        }
+        for (t, m) in pg::messages(bytes) {
+            if self.skip_rfq > 0 {
+                match t {
+                    b'Z' => self.skip_rfq -= 1,
+                    b'E' => out.extend_from_slice(m),
+                    _ => {}
+                }
+                continue;
+            }
+            if let Some(&f) = self.skip.front() {
+                if t == f {
+                    self.skip.pop_front();
+                    continue;
+                }
+                if t == b'E' {
+                    self.skip.clear();
+                }
+            }
+            out.extend_from_slice(m);
+        }
+    }
+}
+
+pub struct Session {
+    pub(crate) core: Rc<Core>,
+    pub(crate) login: Login,
+    pub(crate) route_key: Option<OwnedKey>,
+    pub(crate) local_key: Option<OwnedKey>,
+    pub(crate) unrouted: Unrouted,
+    pub(crate) unrouted_writes: UnroutedWrites,
+    pub(crate) vs: HashMap<u32, VSession>,
+    pub(crate) txn: Txn,
+    /// Session-level `SET`s, as raw Query messages, replayed to every
+    /// virtual session that opens later.
+    pub(crate) session_sets: Vec<u8>,
+    pub(crate) statements: HashMap<String, Stmt>,
+    pub(crate) generation: u64,
+    /// The shard a session's last routed statement went to: Describe and
+    /// Parse-only batches go there (or home).
+    pub(crate) last_shard: Option<u32>,
+    pub(crate) copy_shard: Option<u32>,
+    /// After an error in a batch that ended in Flush: drop messages until
+    /// Sync, then ReadyForQuery.
+    pub(crate) discard_until_sync: bool,
+    pub(crate) out: Vec<u8>,
+}
+
+/// What the gateway does with a simple query itself.
+enum Local {
+    ShowGateway,
+    ShowRouteKey,
+    ShowSetting(&'static str),
+    SetRouteKey { local: bool, value: Option<String> },
+    SetUnrouted(String),
+    SetUnroutedWrites(String),
+    Begin,
+    End { commit: bool },
+    SetLocal,
+    SessionSet,
+    Discard,
+    Refused(&'static str),
+    Routed,
+}
+
+fn local_of(text: &str) -> Local {
+    let t = text.trim().trim_end_matches(';').trim();
+    // One statement only: anything with another `;` is forwarded whole.
+    if t.contains(';') {
+        return Local::Routed;
+    }
+    let lower = t.to_ascii_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    match words.as_slice() {
+        ["show", "gateway"] => return Local::ShowGateway,
+        ["show", "rdb.route_key"] => return Local::ShowRouteKey,
+        ["show", "rdb.unrouted"] => return Local::ShowSetting("unrouted"),
+        ["show", "rdb.unrouted_writes"] => return Local::ShowSetting("unrouted_writes"),
+        ["begin", ..] | ["start", "transaction", ..] => return Local::Begin,
+        ["commit", ..] | ["end", ..] => return Local::End { commit: true },
+        ["rollback"] | ["rollback", "work" | "transaction"] | ["abort", ..] => return Local::End { commit: false },
+        ["discard", "all"] | ["reset", "all"] => return Local::Discard,
+        ["listen", ..] | ["unlisten", ..] | ["notify", ..] => return Local::Refused("LISTEN/NOTIFY"),
+        _ => {}
+    }
+    if let ["reset", name] = words.as_slice() {
+        return match *name {
+            "rdb.route_key" => Local::SetRouteKey { local: false, value: None },
+            _ => Local::SessionSet,
+        };
+    }
+    if words.first() == Some(&"set") {
+        let mut rest = &t[3..];
+        let mut local = false;
+        let r = rest.trim_start();
+        if r.len() >= 6 && r[..6].eq_ignore_ascii_case("local ") {
+            local = true;
+            rest = &r[6..];
+        } else if r.len() >= 8 && r[..8].eq_ignore_ascii_case("session ") {
+            rest = &r[8..];
+        }
+        let rest = rest.trim_start();
+        let name_end = rest.find(|c: char| c.is_whitespace() || c == '=').unwrap_or(rest.len());
+        let name = rest[..name_end].to_ascii_lowercase();
+        let after = rest[name_end..].trim_start();
+        let value = after
+            .strip_prefix('=')
+            .or_else(|| (after.len() >= 3 && after[..3].eq_ignore_ascii_case("to ")).then(|| &after[3..]))
+            .map(|v| v.trim().to_string());
+        match name.as_str() {
+            "rdb.route_key" => {
+                let value = value.filter(|v| !v.eq_ignore_ascii_case("default"));
+                return Local::SetRouteKey { local, value };
+            }
+            "rdb.unrouted" => return Local::SetUnrouted(value.unwrap_or_default()),
+            "rdb.unrouted_writes" => return Local::SetUnroutedWrites(value.unwrap_or_default()),
+            // `SET TRANSACTION …` belongs to the transaction.
+            "transaction" | "constraints" => return if local { Local::SetLocal } else { Local::Routed },
+            _ => return if local { Local::SetLocal } else { Local::SessionSet },
+        }
+    }
+    Local::Routed
+}
+
+impl Session {
+    pub fn new(core: Rc<Core>, login: Login) -> Session {
+        let unrouted = core.shared.cfg.unrouted;
+        Session {
+            core,
+            login,
+            route_key: None,
+            local_key: None,
+            unrouted,
+            unrouted_writes: UnroutedWrites::Refuse,
+            vs: HashMap::new(),
+            txn: Txn { status: b'I', shard: None, pending: Vec::new(), pending_queries: 0 },
+            session_sets: Vec::new(),
+            statements: HashMap::new(),
+            generation: 0,
+            last_shard: None,
+            copy_shard: None,
+            discard_until_sync: false,
+            out: Vec::with_capacity(8 << 10),
+        }
+    }
+
+    pub(crate) async fn flush<S: AsyncWrite + Unpin>(&mut self, conn: &mut S) -> io::Result<()> {
+        if !self.out.is_empty() {
+            self.core.counters.borrow_mut().bytes_out += self.out.len() as u64;
+            pg::write_all(conn, &self.out).await?;
+            self.out.clear();
+            if self.out.capacity() > 256 << 10 {
+                self.out.shrink_to(8 << 10);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn error_ready(&mut self, sqlstate: &str, message: &str) {
+        pg::error(&mut self.out, "ERROR", sqlstate, message);
+        let status = if self.txn.status == b'I' { b'I' } else { b'E' };
+        if self.txn.status != b'I' {
+            self.txn.status = b'E';
+        }
+        pg::ready(&mut self.out, status);
+    }
+
+    /// Serves the session until the client terminates it or the gateway
+    /// drains (§4.9 R10: an idle session is closed with `57P01`).
+    pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
+        &mut self,
+        conn: &mut S,
+        reader: &mut MsgReader,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> io::Result<()> {
+        let mut batch: Vec<u8> = self.core.buffer();
+        let result = loop {
+            reader.trim();
+            let next = tokio::select! {
+                r = reader.next(conn) => r.map(|(t, m)| (t, m.to_vec())),
+                _ = shutdown.changed(), if self.txn.status == b'I' && batch.is_empty() => {
+                    pg::error(&mut self.out, "FATAL", "57P01", "terminating connection: the gateway is shutting down");
+                    let _ = self.flush(conn).await;
+                    break Ok(());
+                }
+            };
+            let (t, msg) = match next {
+                Ok(v) => v,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break Ok(()),
+                Err(e) => {
+                    pg::error(&mut self.out, "FATAL", "08P01", &e.to_string());
+                    let _ = self.flush(conn).await;
+                    break Err(e);
+                }
+            };
+            self.core.counters.borrow_mut().bytes_in += msg.len() as u64;
+            if self.discard_until_sync {
+                if t == b'S' {
+                    self.discard_until_sync = false;
+                    let status = self.txn.status;
+                    pg::ready(&mut self.out, status);
+                    self.flush(conn).await?;
+                }
+                continue;
+            }
+            let flow = match t {
+                b'Q' => {
+                    self.core.counters.borrow_mut().statements += 1;
+                    let r = self.query(conn, &msg).await;
+                    self.flush(conn).await?;
+                    r?
+                }
+                b'P' | b'B' | b'D' | b'E' | b'C' => {
+                    batch.extend_from_slice(&msg);
+                    if batch.len() > self.core.shared.cfg.max_batch_bytes {
+                        pg::error(&mut self.out, "FATAL", "54000", "pipelined batch without Sync exceeds max_batch_bytes");
+                        let _ = self.flush(conn).await;
+                        break Ok(());
+                    }
+                    Outcome::Done { error: false }
+                }
+                b'S' | b'H' => {
+                    batch.extend_from_slice(&msg);
+                    self.core.counters.borrow_mut().statements += 1;
+                    let b = std::mem::take(&mut batch);
+                    let r = self.extended(conn, &b, t == b'S').await;
+                    batch = b;
+                    batch.clear();
+                    self.flush(conn).await?;
+                    r?
+                }
+                b'd' | b'c' | b'f' => {
+                    let r = self.copy_data(conn, t, &msg).await;
+                    self.flush(conn).await?;
+                    r?
+                }
+                b'X' => break Ok(()),
+                b'F' => {
+                    self.error_ready("0A000", "the function-call protocol is not supported through the gateway");
+                    self.flush(conn).await?;
+                    Outcome::Done { error: true }
+                }
+                other => {
+                    pg::error(&mut self.out, "FATAL", "08P01", &format!("unexpected message type {:?}", other as char));
+                    let _ = self.flush(conn).await;
+                    break Ok(());
+                }
+            };
+            if let Outcome::Close = flow {
+                break Ok(());
+            }
+            if self.core.shared.draining.load(std::sync::atomic::Ordering::Relaxed) && self.txn.status == b'I' && batch.is_empty() {
+                pg::error(&mut self.out, "FATAL", "57P01", "terminating connection: the gateway is shutting down");
+                let _ = self.flush(conn).await;
+                break Ok(());
+            }
+        };
+        self.core.give_back(batch);
+        self.close_all().await;
+        result
+    }
+
+    /// Closes every virtual session (best effort: a shard also closes a
+    /// session whose connection is lost).
+    pub(crate) async fn close_all(&mut self) {
+        for (shard, vs) in self.vs.drain() {
+            if let Ok(link) = self.core.link(shard) {
+                let _ = link.call(&self.core, &Request::CloseSession { session: vs.id }.encode()).await;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ simple
+
+    async fn query<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, msg: &[u8]) -> io::Result<Outcome> {
+        let Some(text) = pg::parse_query(msg) else {
+            self.error_ready("08P01", "malformed Query message");
+            return Ok(Outcome::Done { error: true });
+        };
+        let text = text.to_string();
+        match local_of(&text) {
+            Local::ShowGateway => {
+                let rows = crate::admin::show_gateway(&self.core.shared);
+                pg::row_description(&mut self.out, &["name", "value"]);
+                for (k, v) in &rows {
+                    pg::data_row(&mut self.out, &[Some(k), Some(v)]);
+                }
+                pg::command_complete(&mut self.out, &format!("SHOW {}", rows.len()));
+                pg::ready(&mut self.out, self.txn.status);
+                return Ok(Outcome::Done { error: false });
+            }
+            Local::ShowRouteKey => {
+                let v = self.local_key.as_ref().or(self.route_key.as_ref()).map(|k| k.show()).unwrap_or_default();
+                self.show_one("rdb.route_key", &v);
+                return Ok(Outcome::Done { error: false });
+            }
+            Local::ShowSetting(which) => {
+                let v = match which {
+                    "unrouted" => match self.unrouted {
+                        Unrouted::Refuse => "refuse",
+                        Unrouted::FanOut => "fan_out",
+                    },
+                    _ => match self.unrouted_writes {
+                        UnroutedWrites::Refuse => "refuse",
+                        UnroutedWrites::EachShard => "each_shard",
+                    },
+                };
+                self.show_one(&format!("rdb.{which}"), v);
+                return Ok(Outcome::Done { error: false });
+            }
+            Local::SetRouteKey { local, value } => {
+                if self.login.pinned.is_some() {
+                    self.error_ready("42501", "this role is locked to its shard: rdb.route_key cannot be set");
+                    return Ok(Outcome::Done { error: true });
+                }
+                let key = match value.map(|v| OwnedKey::parse_setting(&v)).transpose() {
+                    Ok(k) => k,
+                    Err(e) => {
+                        self.error_ready("22023", &e);
+                        return Ok(Outcome::Done { error: true });
+                    }
+                };
+                if local {
+                    if self.txn.status == b'I' {
+                        pg::notice(&mut self.out, "SET LOCAL can only be used in transaction blocks");
+                    } else if let (Some(s), Some(k)) = (self.txn.shard, &key)
+                        && self.core.map().shard_of_block(k.block()) != s
+                    {
+                        self.core.counters.borrow_mut().refused_cross_shard += 1;
+                        self.error_ready("0A000", "this transaction runs on another shard: a transaction cannot span shards");
+                        return Ok(Outcome::Done { error: true });
+                    } else {
+                        self.local_key = key;
+                    }
+                } else {
+                    self.route_key = key;
+                }
+                pg::command_complete(&mut self.out, if value_is_reset(&text) { "RESET" } else { "SET" });
+                pg::ready(&mut self.out, self.txn.status);
+                return Ok(Outcome::Done { error: false });
+            }
+            Local::SetUnrouted(v) => {
+                let v = v.trim_matches('\'').to_ascii_lowercase();
+                self.unrouted = match v.as_str() {
+                    "refuse" | "default" => Unrouted::Refuse,
+                    "fan_out" if self.login.pinned.is_none() => Unrouted::FanOut,
+                    "fan_out" => {
+                        self.error_ready("42501", "this role is locked to its shard: it never fans out");
+                        return Ok(Outcome::Done { error: true });
+                    }
+                    _ => {
+                        self.error_ready("22023", "rdb.unrouted is refuse or fan_out");
+                        return Ok(Outcome::Done { error: true });
+                    }
+                };
+                pg::command_complete(&mut self.out, "SET");
+                pg::ready(&mut self.out, self.txn.status);
+                return Ok(Outcome::Done { error: false });
+            }
+            Local::SetUnroutedWrites(v) => {
+                let v = v.trim_matches('\'').to_ascii_lowercase();
+                self.unrouted_writes = match v.as_str() {
+                    "refuse" | "default" => UnroutedWrites::Refuse,
+                    "each_shard" if self.login.pinned.is_none() => UnroutedWrites::EachShard,
+                    _ => {
+                        self.error_ready("22023", "rdb.unrouted_writes is refuse or each_shard (not for a role locked to its shard)");
+                        return Ok(Outcome::Done { error: true });
+                    }
+                };
+                pg::command_complete(&mut self.out, "SET");
+                pg::ready(&mut self.out, self.txn.status);
+                return Ok(Outcome::Done { error: false });
+            }
+            Local::Begin if self.txn.status == b'I' && self.target_known().is_none() => {
+                // Recorded: the first routed statement opens the backend
+                // transaction (B1a.7).
+                self.txn.pending.clear();
+                self.txn.pending.extend_from_slice(msg);
+                self.txn.pending_queries = 1;
+                self.txn.status = b'T';
+                pg::command_complete(&mut self.out, "BEGIN");
+                pg::ready(&mut self.out, b'T');
+                return Ok(Outcome::Done { error: false });
+            }
+            Local::End { commit } if self.txn.status != b'I' && self.txn.shard.is_none() => {
+                let tag = if commit && self.txn.status == b'T' { "COMMIT" } else { "ROLLBACK" };
+                self.end_txn();
+                pg::command_complete(&mut self.out, tag);
+                pg::ready(&mut self.out, b'I');
+                return Ok(Outcome::Done { error: false });
+            }
+            Local::SetLocal if self.txn.status == b'T' && self.txn.shard.is_none() => {
+                self.txn.pending.extend_from_slice(msg);
+                self.txn.pending_queries += 1;
+                pg::command_complete(&mut self.out, "SET");
+                pg::ready(&mut self.out, b'T');
+                return Ok(Outcome::Done { error: false });
+            }
+            Local::SessionSet | Local::Discard if self.txn.status == b'I' => {
+                return self.everywhere(conn, msg, matches!(local_of(&text), Local::Discard)).await;
+            }
+            Local::Refused(what) => {
+                self.error_ready("0A000", &format!("{what} is not supported through the gateway; connect to a shard directly"));
+                return Ok(Outcome::Done { error: true });
+            }
+            _ => {}
+        }
+        self.route_simple(conn, msg, &text).await
+    }
+
+    fn show_one(&mut self, name: &str, v: &str) {
+        pg::row_description(&mut self.out, &[name]);
+        pg::data_row(&mut self.out, &[Some(v)]);
+        pg::command_complete(&mut self.out, "SHOW");
+        pg::ready(&mut self.out, self.txn.status);
+    }
+
+    pub(crate) fn end_txn(&mut self) {
+        self.txn.status = b'I';
+        self.txn.shard = None;
+        self.txn.pending.clear();
+        self.txn.pending_queries = 0;
+        self.local_key = None;
+    }
+
+    /// The shard a statement goes to without looking at it: pinned, the
+    /// transaction's, an explicit key's, or the configured fixed shard.
+    fn target_known(&self) -> Option<u32> {
+        if let Some(p) = self.login.pinned {
+            return Some(p);
+        }
+        if let Some(s) = self.txn.shard {
+            return Some(s);
+        }
+        let map = self.core.map();
+        if let Some(k) = self.local_key.as_ref().or(self.route_key.as_ref()) {
+            return Some(map.shard_of_block(k.block()));
+        }
+        self.core.shared.cfg.fixed_shard
+    }
+
+    /// A session-level SET (or DISCARD ALL): run on the home shard and on
+    /// every open virtual session, recorded for those that open later.
+    async fn everywhere<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, msg: &[u8], discard: bool) -> io::Result<Outcome> {
+        let map = self.core.map();
+        let first = self.login.pinned.or(self.core.shared.cfg.fixed_shard).unwrap_or_else(|| self.core.shared.home(&map));
+        let outcome = self.run_on(conn, first, msg, Vec::new(), None).await?;
+        let failed = matches!(outcome, Outcome::Done { error: true });
+        if !failed && matches!(outcome, Outcome::Done { .. }) {
+            if discard {
+                self.session_sets.clear();
+            } else {
+                self.session_sets.extend_from_slice(msg);
+            }
+            let others: Vec<u32> = self.vs.keys().copied().filter(|&s| s != first).collect();
+            for s in others {
+                if let Err(e) = self.send_discarding(s, msg).await {
+                    log::warn!("a session SET did not reach shard {s}: {e}");
+                    // Its virtual session no longer matches the client's:
+                    // close it, and the next one opens with the replay.
+                    if let Some(vs) = self.vs.remove(&s)
+                        && let Ok(link) = self.core.link(s)
+                    {
+                        let _ = link.call(&self.core, &Request::CloseSession { session: vs.id }.encode()).await;
+                    }
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    async fn route_simple<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, msg: &[u8], text: &str) -> io::Result<Outcome> {
+        let retries = self.core.shared.cfg.retries;
+        for attempt in 0..=retries {
+            self.core.refresh_if_stale().await;
+            let map = self.core.map();
+            let (target, tkey) = self.decide_simple(&map, text).await;
+            let outcome = match target {
+                Target::Refuse { sqlstate, message } => {
+                    if sqlstate == "0A000" {
+                        self.core.counters.borrow_mut().refused_no_key += 1;
+                    }
+                    self.error_ready(sqlstate, &message);
+                    return Ok(Outcome::Done { error: true });
+                }
+                Target::FanOut { merge, writes } => return self.fan_out(conn, msg, merge, writes).await,
+                Target::Shard(s) => {
+                    self.core.counters.borrow_mut().routed += 1;
+                    self.run_on(conn, s, msg, Vec::new(), tkey.as_ref().map(|t| (Source::Shape, t.as_str()))).await?
+                }
+            };
+            match outcome {
+                Outcome::Retry if attempt < retries => {
+                    self.core.counters.borrow_mut().retries += 1;
+                    continue;
+                }
+                Outcome::Retry => {
+                    self.error_ready("57P03", "the statement was refused for a moving range too many times; try again");
+                    return Ok(Outcome::Done { error: true });
+                }
+                o => return Ok(o),
+            }
+        }
+        unreachable!("the loop returns on its last attempt")
+    }
+
+    /// The target of a simple query, and the template text it was decided
+    /// by (for refutation).
+    async fn decide_simple(&mut self, map: &ShardMap, text: &str) -> (Target, Option<String>) {
+        if let Some(s) = self.target_known() {
+            return (Target::Shard(s), None);
+        }
+        let home = self.core.shared.home(map);
+        let (shape, slots) = match rasterizeddb_router::literals::shape(text) {
+            Some(sh) => (sh.text, sh.slots),
+            None => (text.to_string(), Vec::new()),
+        };
+        let template = match route::template(&self.core, &self.login.database, Source::Shape, &shape, home).await {
+            Ok(t) => t,
+            Err(e) => {
+                return (
+                    Target::Refuse { sqlstate: "08006", message: format!("the statement could not be classified: {e}") },
+                    None,
+                );
+            }
+        };
+        let target = match template {
+            RouteTemplate::Slot { index, family } => match slots.get(index as usize).and_then(|l| route::literal_block(l, family)) {
+                Some(b) => Target::Shard(map.shard_of_block(b)),
+                None => needs_key(),
+            },
+            RouteTemplate::Param { .. } => needs_key(),
+            RouteTemplate::Fixed { block } => Target::Shard(map.shard_of_block(block)),
+            RouteTemplate::Home => Target::Shard(home),
+            RouteTemplate::FanOut { merge, writes } => self.unrouted_target(merge, writes),
+            RouteTemplate::NeedsKey => needs_key(),
+        };
+        (target, Some(shape))
+    }
+
+    /// B1b: a statement whose shape can fan out, decided by `unrouted`.
+    fn unrouted_target(&self, merge: Merge, writes: bool) -> Target {
+        if !cfg!(feature = "fanout") {
+            return needs_key();
+        }
+        if self.login.pinned.is_some() {
+            return needs_key();
+        }
+        if self.txn.status != b'I' {
+            return Target::Refuse {
+                sqlstate: "0A000",
+                message: "a statement without a route key cannot fan out inside a transaction block".into(),
+            };
+        }
+        if writes {
+            return match self.unrouted_writes {
+                UnroutedWrites::EachShard => Target::FanOut { merge, writes: true },
+                UnroutedWrites::Refuse => needs_key(),
+            };
+        }
+        match self.unrouted {
+            Unrouted::FanOut => Target::FanOut { merge, writes: false },
+            Unrouted::Refuse => needs_key(),
+        }
+    }
+
+    // ------------------------------------------------------------ shards
+
+    /// The virtual session on `shard`, opened (and the session SETs
+    /// replayed) on first use.
+    pub(crate) async fn ensure_vs(&mut self, shard: u32) -> Result<u64, (String, String)> {
+        if let Some(v) = self.vs.get(&shard) {
+            return Ok(v.id);
+        }
+        let link = self.core.link(shard).map_err(|e| ("08006".to_string(), e))?;
+        let id = self.core.session_id();
+        let req = Request::OpenSession {
+            session: id,
+            database: self.login.database.clone(),
+            role: self.login.role.clone(),
+            params: self.login.params.clone(),
+            gateway: self.core.shared.cfg.gateway_name.clone(),
+            pinned: self.login.pinned.is_some(),
+        }
+        .encode();
+        match link.call(&self.core, &req).await {
+            Ok(Response::SessionOpened { backend_key, .. }) => {
+                self.vs.insert(shard, VSession { id, parsed: HashMap::new() });
+                if let Ok(mut t) = self.login.cancel.lock() {
+                    t.push((shard, backend_key));
+                }
+                self.core.counters.borrow_mut().virtual_sessions += 1;
+                if !self.session_sets.is_empty() {
+                    let sets = self.session_sets.clone();
+                    if let Err(e) = self.send_discarding(shard, &sets).await {
+                        log::warn!("session SETs could not be replayed on shard {shard}: {e}");
+                    }
+                }
+                Ok(id)
+            }
+            Ok(Response::Refused(r)) => Err((r.sqlstate_str().to_string(), r.message)),
+            Ok(other) => Err(("XX000".into(), format!("unexpected reply kind {:#04x} to OpenSession", other.kind()))),
+            Err(CallError::Down(e)) => {
+                self.core.counters.borrow_mut().down_08006 += 1;
+                Err(("08006".into(), e))
+            }
+            Err(CallError::Lost(e)) | Err(CallError::Bad(e)) => Err(("08006".into(), e)),
+        }
+    }
+
+    /// Sends messages on `shard`'s virtual session and drops the reply.
+    async fn send_discarding(&mut self, shard: u32, msgs: &[u8]) -> Result<(), String> {
+        let id = self.vs.get(&shard).map(|v| v.id).ok_or("no virtual session")?;
+        let link = self.core.link(shard)?;
+        let mut req = Vec::new();
+        Request::encode_pg(&mut req, id, self.core.map().epoch(), msgs);
+        let mut resp = link.call(&self.core, &req).await.map_err(|e| format!("{e:?}"))?;
+        loop {
+            match resp {
+                Response::PgReply { more: true, .. } => {
+                    resp = link
+                        .call(&self.core, &Request::Continue { session: id }.encode())
+                        .await
+                        .map_err(|e| format!("{e:?}"))?;
+                }
+                Response::PgReply { bytes, .. } => {
+                    return match pg::messages(&bytes).find(|(t, _)| *t == b'E') {
+                        Some((_, m)) => Err(format!("error {}", pg::error_sqlstate(m).unwrap_or("?"))),
+                        None => Ok(()),
+                    };
+                }
+                Response::Refused(r) => return Err(format!("{} {}", r.sqlstate_str(), r.message)),
+                other => return Err(format!("unexpected reply kind {:#04x}", other.kind())),
+            }
+        }
+    }
+
+    /// Runs `msgs` on `shard` and relays the reply to the client.
+    ///
+    /// `needs`: statement names the batch uses without parsing them first,
+    /// re-Parsed lazily here when this shard's virtual session does not
+    /// have the current generation (B1a.7). `tkey`: the template the
+    /// target came from, dropped if the shard refutes it.
+    pub(crate) async fn run_on<S: AsyncWrite + Unpin>(
+        &mut self,
+        conn: &mut S,
+        shard: u32,
+        msgs: &[u8],
+        needs: Vec<(String, bool)>,
+        tkey: Option<(Source, &str)>,
+    ) -> io::Result<Outcome> {
+        let vs_id = match self.ensure_vs(shard).await {
+            Ok(id) => id,
+            Err((code, msg)) => {
+                if code.as_bytes() == rshard::MOVED || code.as_bytes() == rshard::NOT_OWNED {
+                    let _ = self.core.fetch_map(shard).await;
+                }
+                self.error_ready(&code, &format!("shard {shard}: {msg}"));
+                return Ok(Outcome::Done { error: true });
+            }
+        };
+        let link = match self.core.link(shard) {
+            Ok(l) => l,
+            Err(e) => {
+                self.error_ready("08006", &e);
+                return Ok(Outcome::Done { error: true });
+            }
+        };
+
+        // The payload: a pending BEGIN, lazy re-Parses, then the client's.
+        let mut payload = self.core.buffer();
+        let mut filter = ReplyFilter::none();
+        let first_of_txn = self.txn.status != b'I' && self.txn.shard.is_none();
+        if first_of_txn && !self.txn.pending.is_empty() {
+            payload.extend_from_slice(&self.txn.pending);
+            filter.skip_rfq = self.txn.pending_queries;
+        }
+        let mut parsed_now: Vec<(String, u64)> = Vec::new();
+        if let Some(vs) = self.vs.get(&shard) {
+            for (name, client_parses_it) in &needs {
+                if *client_parses_it {
+                    // The client's own Parse of a name this backend still
+                    // holds from before a Close the gateway did not send
+                    // there: close it first.
+                    if !name.is_empty() && vs.parsed.contains_key(name) && !self.statements.contains_key(name) {
+                        push_close(&mut payload, name);
+                        filter.skip.push_back(b'3');
+                    }
+                    continue;
+                }
+                let Some(stmt) = self.statements.get(name) else { continue };
+                if vs.parsed.get(name) == Some(&stmt.generation) {
+                    continue;
+                }
+                if !name.is_empty() && vs.parsed.contains_key(name) {
+                    push_close(&mut payload, name);
+                    filter.skip.push_back(b'3');
+                }
+                payload.extend_from_slice(&stmt.parse);
+                filter.skip.push_back(b'1');
+                parsed_now.push((name.clone(), stmt.generation));
+            }
+        }
+        payload.extend_from_slice(msgs);
+        let mut req = self.core.buffer();
+        Request::encode_pg(&mut req, vs_id, self.core.map().epoch(), &payload);
+        self.core.give_back(payload);
+        let first = link.call(&self.core, &req).await;
+        self.core.give_back(req);
+
+        let mut resp = match first {
+            Ok(r) => r,
+            Err(CallError::Down(e)) => {
+                self.core.counters.borrow_mut().down_08006 += 1;
+                self.vs.remove(&shard);
+                self.error_ready("08006", &e);
+                return Ok(Outcome::Done { error: true });
+            }
+            Err(CallError::Lost(e)) | Err(CallError::Bad(e)) => {
+                self.core.counters.borrow_mut().lost_08007 += 1;
+                self.vs.remove(&shard);
+                if self.txn.shard == Some(shard) {
+                    pg::error(&mut self.out, "FATAL", "08007", &format!("the connection to shard {shard} was lost inside a transaction; its outcome is unknown: {e}"));
+                    return Ok(Outcome::Close);
+                }
+                self.error_ready("08007", &format!("the connection to shard {shard} was lost after the statement was sent; its outcome is unknown: {e}"));
+                return Ok(Outcome::Done { error: true });
+            }
+        };
+
+        let mut error = false;
+        let mut last_type = 0u8;
+        let mut refuted = false;
+        loop {
+            match resp {
+                Response::PgReply { more, status, bytes, .. } => {
+                    for (t, m) in pg::messages(&bytes) {
+                        last_type = t;
+                        if t == b'E' {
+                            error = true;
+                            if pg::error_sqlstate(m).is_some_and(|c| c.as_bytes() == rshard::NOT_OWNED) {
+                                refuted = true;
+                            }
+                        }
+                    }
+                    filter.apply(&bytes, &mut self.out);
+                    self.flush(conn).await?;
+                    if more {
+                        resp = match link.call(&self.core, &Request::Continue { session: vs_id }.encode()).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                self.core.counters.borrow_mut().lost_08007 += 1;
+                                self.vs.remove(&shard);
+                                pg::error(&mut self.out, "FATAL", "08007", &format!("shard {shard} was lost mid-reply: {e:?}"));
+                                return Ok(Outcome::Close);
+                            }
+                        };
+                        continue;
+                    }
+                    // Done: the bookkeeping that follows the reply.
+                    if let Some(vs) = self.vs.get_mut(&shard) {
+                        for (n, g) in parsed_now {
+                            vs.parsed.insert(n, g);
+                        }
+                    }
+                    self.copy_shard = (last_type == b'G').then_some(shard);
+                    match status {
+                        b'T' | b'E' => {
+                            self.txn.shard.get_or_insert(shard);
+                            self.txn.pending.clear();
+                            self.txn.pending_queries = 0;
+                            self.txn.status = status;
+                        }
+                        b'I' => self.end_txn(),
+                        _ => {}
+                    }
+                    self.last_shard = Some(shard);
+                    if refuted && let Some((src, text)) = tkey {
+                        route::refute(&self.core, &self.login.database, src, text);
+                    }
+                    return Ok(Outcome::Done { error });
+                }
+                Response::Refused(r) => return Ok(self.refused(shard, r, tkey).await),
+                other => {
+                    self.error_ready("XX000", &format!("shard {shard} answered with reply kind {:#04x}", other.kind()));
+                    return Ok(Outcome::Done { error: true });
+                }
+            }
+        }
+    }
+
+    /// A shard's refusal: retried when nothing took effect and the
+    /// statement may move (autocommit, or a transaction's first statement),
+    /// else reported (R2).
+    async fn refused(&mut self, shard: u32, r: Refusal, tkey: Option<(Source, &str)>) -> Outcome {
+        let movable = self.txn.shard.is_none() && self.login.pinned.is_none();
+        if r.sqlstate == rshard::SESSION_GONE {
+            self.vs.remove(&shard);
+            if movable && r.before_effect {
+                return Outcome::Retry;
+            }
+        }
+        if r.before_effect && (r.sqlstate == rshard::NOT_OWNED || r.sqlstate == rshard::MOVED) {
+            if r.sqlstate == rshard::NOT_OWNED
+                && let Some((src, text)) = tkey
+            {
+                route::refute(&self.core, &self.login.database, src, text);
+            }
+            let _ = self.core.fetch_map(shard).await;
+            if movable {
+                return Outcome::Retry;
+            }
+        }
+        if r.before_effect && r.sqlstate == rshard::FENCED && movable {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            return Outcome::Retry;
+        }
+        self.core.counters.borrow_mut().refusals_other += 1;
+        self.error_ready(r.sqlstate_str(), &format!("shard {shard}: {}", r.message));
+        Outcome::Done { error: true }
+    }
+
+    // ------------------------------------------------------------ extended
+
+    /// One extended-protocol batch, ending in Sync (or Flush).
+    async fn extended<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, batch: &[u8], sync: bool) -> io::Result<Outcome> {
+        let retries = self.core.shared.cfg.retries;
+        for attempt in 0..=retries {
+            self.core.refresh_if_stale().await;
+            let map = self.core.map();
+            let (target, needs, tkey) = match self.decide_extended(&map, batch).await {
+                Ok(v) => v,
+                Err((code, msg)) => {
+                    if code == "0A000" {
+                        self.core.counters.borrow_mut().refused_no_key += 1;
+                    }
+                    pg::error(&mut self.out, "ERROR", code, &msg);
+                    if self.txn.status != b'I' {
+                        self.txn.status = b'E';
+                    }
+                    if sync {
+                        let s = self.txn.status;
+                        pg::ready(&mut self.out, s);
+                    } else {
+                        self.discard_until_sync = true;
+                    }
+                    return Ok(Outcome::Done { error: true });
+                }
+            };
+            self.core.counters.borrow_mut().routed += 1;
+            let outcome = self.run_on(conn, target, batch, needs, tkey.as_ref().map(|t| (Source::Parse, t.as_str()))).await?;
+            if let Outcome::Retry = outcome {
+                if attempt < retries {
+                    self.core.counters.borrow_mut().retries += 1;
+                    continue;
+                }
+                self.error_ready("57P03", "the statement was refused for a moving range too many times; try again");
+                return Ok(Outcome::Done { error: true });
+            }
+            self.after_extended(batch, target);
+            return Ok(outcome);
+        }
+        unreachable!("the loop returns on its last attempt")
+    }
+
+    /// The batch's shard, the statement names it uses without parsing them
+    /// (with whether the batch itself parses them later), and the template
+    /// text of the Bind that decided it.
+    async fn decide_extended(
+        &mut self,
+        map: &ShardMap,
+        batch: &[u8],
+    ) -> Result<(u32, Vec<(String, bool)>, Option<String>), (&'static str, String)> {
+        // Statement texts as of each point in the batch.
+        let mut in_batch: HashMap<String, String> = HashMap::new();
+        let mut needs: Vec<(String, bool)> = Vec::new();
+        let mut routes: Vec<(u32, String)> = Vec::new();
+        let known = self.target_known();
+        let home = self.core.shared.home(map);
+        for (t, m) in pg::messages(batch) {
+            match t {
+                b'P' => {
+                    let (name, text) = pg::parse_parse(m).ok_or(("08P01", "malformed Parse message".to_string()))?;
+                    needs.push((name.to_string(), true));
+                    in_batch.insert(name.to_string(), text.to_string());
+                }
+                b'B' => {
+                    let bind = pg::parse_bind(m).ok_or(("08P01", "malformed Bind message".to_string()))?;
+                    let name = bind.statement.to_string();
+                    let text = match in_batch.get(&name) {
+                        Some(t) => t.clone(),
+                        None => {
+                            needs.push((name.clone(), false));
+                            match self.statements.get(&name) {
+                                Some(s) => s.text.clone(),
+                                None => return Err(("26000", format!("prepared statement \"{name}\" does not exist"))),
+                            }
+                        }
+                    };
+                    if known.is_some() {
+                        continue;
+                    }
+                    let template = route::template(&self.core, &self.login.database, Source::Parse, &text, home)
+                        .await
+                        .map_err(|e| ("08006", format!("the statement could not be classified: {e}")))?;
+                    let shard = match template {
+                        RouteTemplate::Param { index, family } => {
+                            let block = bind.param(index as usize).and_then(|(bin, v)| route::param_block(bin, v, family));
+                            match block {
+                                Some(b) => map.shard_of_block(b),
+                                None => return Err(no_key()),
+                            }
+                        }
+                        RouteTemplate::Fixed { block } => map.shard_of_block(block),
+                        RouteTemplate::Home => home,
+                        RouteTemplate::FanOut { .. } if !matches!(self.unrouted, Unrouted::Refuse) => {
+                            return Err(("0A000", "a statement without a route key fans out only as a simple query in this version".into()));
+                        }
+                        _ => return Err(no_key()),
+                    };
+                    routes.push((shard, text));
+                }
+                b'D' | b'C' => {
+                    let b = pg::body(m);
+                    if b.first() == Some(&b'S')
+                        && let Some((name, _)) = pg::cstr(&b[1..])
+                        && !in_batch.contains_key(name)
+                        && t == b'D'
+                    {
+                        needs.push((name.to_string(), false));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = known {
+            return Ok((s, needs, None));
+        }
+        let Some((first, text)) = routes.first().cloned() else {
+            return Ok((self.last_shard.unwrap_or(home), needs, None));
+        };
+        if routes.iter().any(|(s, _)| *s != first) {
+            self.core.counters.borrow_mut().refused_cross_shard += 1;
+            return Err(("0A000", "the statements of one batch reach different shards; send a Sync between them".into()));
+        }
+        Ok((first, needs, Some(text)))
+    }
+
+    /// The gateway's record of the client's statements after a batch ran.
+    fn after_extended(&mut self, batch: &[u8], shard: u32) {
+        for (t, m) in pg::messages(batch) {
+            match t {
+                b'P' => {
+                    if let Some((name, text)) = pg::parse_parse(m) {
+                        self.generation += 1;
+                        let g = self.generation;
+                        self.statements.insert(name.to_string(), Stmt { text: text.to_string(), parse: m.to_vec(), generation: g });
+                        if let Some(vs) = self.vs.get_mut(&shard) {
+                            vs.parsed.insert(name.to_string(), g);
+                        }
+                    }
+                }
+                b'C' => {
+                    if let Some((b'S', name)) = pg::parse_close(m) {
+                        self.statements.remove(name);
+                        if let Some(vs) = self.vs.get_mut(&shard) {
+                            vs.parsed.remove(name);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ copy
+
+    async fn copy_data<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, t: u8, msg: &[u8]) -> io::Result<Outcome> {
+        let Some(shard) = self.copy_shard else {
+            // PostgreSQL ignores CopyData outside COPY, and so does this.
+            return Ok(Outcome::Done { error: false });
+        };
+        // Every CopyData is sent as it comes: rastcp frames it, and the
+        // shard's reply to each is empty until CopyDone or CopyFail.
+        let outcome = self.run_on(conn, shard, msg, Vec::new(), None).await?;
+        if t == b'd' && matches!(outcome, Outcome::Done { error: false }) {
+            self.copy_shard = Some(shard);
+        }
+        Ok(outcome)
+    }
+}
+
+fn value_is_reset(text: &str) -> bool {
+    text.trim_start().get(..5).is_some_and(|w| w.eq_ignore_ascii_case("reset"))
+}
+
+fn needs_key() -> Target {
+    Target::Refuse { sqlstate: "0A000", message: "statement needs a route key in cluster mode".into() }
+}
+
+fn no_key() -> (&'static str, String) {
+    ("0A000", "statement needs a route key in cluster mode".into())
+}
+
+fn push_close(out: &mut Vec<u8>, name: &str) {
+    let mut b = vec![b'S'];
+    b.extend_from_slice(name.as_bytes());
+    b.push(0);
+    pg::put(out, b'C', &b);
+}
