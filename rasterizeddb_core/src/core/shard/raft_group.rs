@@ -304,13 +304,20 @@ impl Runner {
             self.machine.restore(meta, data)?;
         }
         let mut store = self.store.take().ok_or("internal: the raft store is gone")?;
-        let owned = ready.clone();
-        let (store, result) = tokio::task::spawn_blocking(move || {
-            let r = store.persist(&owned);
-            (store, r)
-        })
-        .await
-        .map_err(|e| format!("the raft store's thread failed: {e}"))?;
+        // Only what storage needs crosses to the blocking thread.
+        let (snapshot, truncate_from, entries, hard_state) =
+            (ready.snapshot.clone(), ready.truncate_from, ready.entries.clone(), ready.hard_state);
+        let nothing = snapshot.is_none() && truncate_from.is_none() && entries.is_empty() && hard_state.is_none();
+        let (store, result) = if nothing {
+            (store, Ok(()))
+        } else {
+            tokio::task::spawn_blocking(move || {
+                let r = store.persist_parts(snapshot.as_ref(), truncate_from, &entries, hard_state.as_ref());
+                (store, r)
+            })
+            .await
+            .map_err(|e| format!("the raft store's thread failed: {e}"))?
+        };
         self.store = Some(store);
         result?;
         // 2. Then the messages.

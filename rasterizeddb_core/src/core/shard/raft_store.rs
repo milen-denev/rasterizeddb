@@ -155,9 +155,22 @@ impl RaftStore {
 
     /// Makes `ready`'s durable work durable (the core's contract, step 1).
     pub fn persist(&mut self, ready: &Ready) -> Result<(), String> {
+        self.persist_parts(ready.snapshot.as_ref(), ready.truncate_from, &ready.entries, ready.hard_state.as_ref())
+    }
+
+    /// [`Self::persist`] over the parts a `Ready` carries for storage, so a
+    /// caller moves only those to a blocking thread.
+    pub fn persist_parts(
+        &mut self,
+        snapshot: Option<&(SnapshotMeta, Vec<u8>)>,
+        truncate_from: Option<Index>,
+        entries: &[Entry],
+        hard_state: Option<&HardState>,
+    ) -> Result<(), String> {
+        let ready = PersistView { snapshot, truncate_from, entries, hard_state };
         let path = self.dir.join(LOG);
         let mut buf = Vec::new();
-        if let Some((meta, data)) = &ready.snapshot {
+        if let Some((meta, data)) = ready.snapshot {
             let mut w = Writer::default();
             w.snapshot_meta(meta);
             let mut bytes = w.0;
@@ -171,7 +184,7 @@ impl RaftStore {
         if let Some(from) = ready.truncate_from {
             buf.extend(record(TRUNCATE, |b| b.extend_from_slice(&from.to_le_bytes()))?);
         }
-        for e in &ready.entries {
+        for e in ready.entries {
             buf.extend(record(ENTRY, |b| {
                 let mut w = Writer::default();
                 w.entry(e);
@@ -182,7 +195,7 @@ impl RaftStore {
             self.log.write_all(&buf).map_err(io(&path))?;
             self.log.sync_data().map_err(io(&path))?;
         }
-        if let Some(h) = &ready.hard_state {
+        if let Some(h) = ready.hard_state {
             replace(&self.dir, HARD, &encode_hard_state(h))?;
         }
         Ok(())
@@ -207,6 +220,14 @@ impl RaftStore {
         self.log = OpenOptions::new().append(true).open(&path).map_err(io(&path))?;
         Ok(())
     }
+}
+
+/// The storage half of a `Ready`, borrowed.
+struct PersistView<'a> {
+    snapshot: Option<&'a (SnapshotMeta, Vec<u8>)>,
+    truncate_from: Option<Index>,
+    entries: &'a [Entry],
+    hard_state: Option<&'a HardState>,
 }
 
 /// The encoded length of `meta`, to find where the snapshot's data starts.

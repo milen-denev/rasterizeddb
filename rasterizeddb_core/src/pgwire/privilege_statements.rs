@@ -454,6 +454,10 @@ fn written_as(stmt: &str, at: usize) -> Option<&'static str> {
 /// (`FOR UPDATE`, `FOR NO KEY UPDATE`).
 fn locking_read(stmt: &str) -> bool {
     use crate::core::sql_scan::{skip_comment, skip_quoted};
+    // Most statements have no `for` at all: no copy, no scan.
+    if !crate::core::sql_scan::contains_ignore_ascii_case(stmt, b"for") {
+        return false;
+    }
     let b = stmt.as_bytes();
     let mut plain = String::with_capacity(stmt.len());
     let mut i = 0;
