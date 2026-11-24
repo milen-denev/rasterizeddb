@@ -578,13 +578,13 @@ SHARD UNREFERENCE TABLE countries;
   statement; copy them to every shard first.
 - **Reads.** A reference table may be named with sharded tables. A keyed
   statement joins it on whichever shard the key picks.
-- **Writes.** A write to a reference table goes to every shard. It is a
-  fan-out write, so it needs `SET rdb.unrouted_writes = each_shard` and runs
-  outside a transaction block, as other fan-out writes do. The reply carries
-  one shard's row count.
-- **No atomicity across shards.** The write is not atomic across shards: a
-  shard that fails leaves its copy behind, and the error says so. Writes
-  committed atomically by 2PC are still to come.
+- **Writes.** A write to a reference table goes to every shard, and the
+  reply carries one shard's row count. Under the gateway's `two_phase`,
+  the write runs as one two-phase transaction across every shard: each
+  copy changes or none does, with no opt-in needed. Without `two_phase`, it
+  is a fan-out write: it needs `SET rdb.unrouted_writes = each_shard`, runs
+  outside a transaction block, and a shard that fails leaves its copy
+  behind, which the error says.
 
 ### 8.4 DDL: a cluster schema epoch
 

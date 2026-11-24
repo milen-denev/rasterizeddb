@@ -689,6 +689,13 @@ impl Session {
                     self.error_ready(sqlstate, &message);
                     return Ok(Outcome::Done { error: true });
                 }
+                // A reference table's write under two-phase commit: every
+                // copy or none (B5.1).
+                Target::FanOut { merge: Merge::Any, writes: true } if self.core.shared.cfg.two_phase => {
+                    let outcome = self.reference_write(text).await;
+                    self.flush(conn).await?;
+                    return Ok(outcome);
+                }
                 Target::FanOut { merge, writes } => return self.fan_out(conn, msg, merge, writes).await,
                 Target::Shard(s) => {
                     self.core.counters.borrow_mut().routed += 1;
@@ -757,6 +764,11 @@ impl Session {
                 sqlstate: "0A000",
                 message: "a statement without a route key cannot fan out inside a transaction block".into(),
             };
+        }
+        // A reference table's write is atomic under two-phase commit
+        // (B5.1), so it needs no each_shard opt-in.
+        if writes && merge == Merge::Any && self.core.shared.cfg.two_phase {
+            return Target::FanOut { merge, writes: true };
         }
         if writes {
             return match self.unrouted_writes {
@@ -1021,6 +1033,11 @@ impl Session {
     /// `shard`, for the gateway's own bookkeeping (nothing reaches the
     /// client): the final ReadyForQuery status, and the first error.
     async fn quiet_query(&mut self, shard: u32, sql: &str) -> Result<(u8, Option<(String, String)>), String> {
+        self.tagged_query(shard, sql).await.map(|(status, error, _)| (status, error))
+    }
+
+    /// [`Self::quiet_query`], with the statement's command tag.
+    async fn tagged_query(&mut self, shard: u32, sql: &str) -> Result<(u8, Option<(String, String)>, Option<String>), String> {
         let vs_id = self.ensure_vs(shard).await.map_err(|(c, m)| format!("{c}: {m}"))?;
         let link = self.core.link(shard)?;
         let mut q = vec![b'Q'];
@@ -1031,6 +1048,7 @@ impl Session {
         Request::encode_pg(&mut req, vs_id, self.core.map().epoch(), &q);
         let mut resp = link.call(&self.core, &req).await.map_err(|e| format!("{e:?}"))?;
         let mut error = None;
+        let mut tag = None;
         loop {
             match resp {
                 Response::PgReply { more, status, bytes, .. } => {
@@ -1039,12 +1057,15 @@ impl Session {
                             let code = pg::error_sqlstate(m).unwrap_or("XX000").to_string();
                             error = Some((code, pg::error_message(m).unwrap_or_default()));
                         }
+                        if t == b'C' {
+                            tag = pg::cstr(pg::body(m)).map(|(c, _)| c.to_string());
+                        }
                     }
                     if more {
                         resp = link.call(&self.core, &Request::Continue { session: vs_id }.encode()).await.map_err(|e| format!("{e:?}"))?;
                         continue;
                     }
-                    return Ok((status, error));
+                    return Ok((status, error, tag));
                 }
                 Response::Refused(r) => return Err(format!("{}: {}", String::from_utf8_lossy(&r.sqlstate), r.message)),
                 other => return Err(format!("reply kind {:#04x}", other.kind())),
@@ -1060,6 +1081,12 @@ impl Session {
     /// after the decision is left prepared for `rdb-shard resolve`, which
     /// reads the anchor's decision: the transaction is committed.
     async fn end_two_phase(&mut self, commit: bool) -> Outcome {
+        self.end_two_phase_tagged(commit, None).await
+    }
+
+    /// [`Self::end_two_phase`], answered with `tag` instead of COMMIT: a
+    /// statement the gateway ran as its own two-phase transaction.
+    async fn end_two_phase_tagged(&mut self, commit: bool, tag: Option<String>) -> Outcome {
         let shards = self.txn.shards.clone();
         if !commit {
             for s in &shards {
@@ -1130,9 +1157,47 @@ impl Session {
             }
         }
         self.end_txn();
-        pg::command_complete(&mut self.out, "COMMIT");
+        pg::command_complete(&mut self.out, tag.as_deref().unwrap_or("COMMIT"));
         pg::ready(&mut self.out, b'I');
         Outcome::Done { error: false }
+    }
+
+    /// A write to a reference table, outside a block (B5.1): run on every
+    /// shard as one two-phase transaction, so each copy changes or none
+    /// does. Answered with one shard's command tag, since every shard holds
+    /// the same rows.
+    async fn reference_write(&mut self, text: &str) -> Outcome {
+        let shards: Vec<u32> = self.core.map().shards().iter().map(|s| s.id).collect();
+        let mut tag = None;
+        let mut failure: Option<(String, String)> = None;
+        for &s in &shards {
+            match self.tagged_query(s, "BEGIN").await {
+                Ok((_, None, _)) => self.txn.shards.push(s),
+                Ok((_, Some(e), _)) => failure = Some(e),
+                Err(e) => failure = Some(("08006".into(), format!("shard {s}: {e}"))),
+            }
+            if failure.is_some() {
+                break;
+            }
+            match self.tagged_query(s, text).await {
+                Ok((_, None, t)) => tag = tag.or(t),
+                Ok((_, Some(e), _)) => failure = Some(e),
+                Err(e) => failure = Some(("08006".into(), format!("shard {s}: {e}"))),
+            }
+            if failure.is_some() {
+                break;
+            }
+        }
+        if let Some((code, msg)) = failure {
+            for s in self.txn.shards.clone() {
+                let _ = self.quiet_query(s, "ROLLBACK").await;
+            }
+            self.end_txn();
+            self.error_ready(&code, &msg);
+            return Outcome::Done { error: true };
+        }
+        self.txn.status = b'T';
+        self.end_two_phase_tagged(true, tag).await
     }
 
     /// A shard's refusal: retried when nothing took effect and the
