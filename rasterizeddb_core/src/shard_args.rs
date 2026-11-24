@@ -50,6 +50,20 @@ pub struct ShardArgs {
     #[arg(long = "peer-ca", value_name = "PEM")]
     pub peer_ca: Option<String>,
 
+    /// This replica's id in its shard's Raft group (sharding-plan.md B3;
+    /// a build with `sharding_raft`). Unique within the group, non-zero.
+    #[arg(long = "raft-id", value_name = "N")]
+    pub raft_id: Option<u64>,
+
+    /// Where the group's other replicas reach this one, `ADDR:PORT`.
+    #[arg(long = "raft-listen", value_name = "ADDR:PORT")]
+    pub raft_listen: Option<String>,
+
+    /// Another replica of the group, `ID=ADDR:PORT`; repeatable. The group's
+    /// first configuration is this replica and every peer named, all voters.
+    #[arg(long = "raft-peer", value_name = "ID=ADDR")]
+    pub raft_peer: Vec<String>,
+
     /// A gateway certificate's SHA-256 fingerprint; repeatable.
     #[arg(long = "gateway-pin", value_name = "SHA256")]
     pub gateway_pin: Vec<String>,
@@ -130,6 +144,47 @@ impl ShardArgs {
             gateway_pins: self.gateway_pin.clone(),
             peer_ca: self.peer_ca.clone(),
         }))
+    }
+
+    /// The Raft group's configuration when `--raft-id` was given.
+    #[cfg(feature = "sharding_raft")]
+    pub fn raft(&self) -> Result<Option<(u64, rasterizeddb_core::core::shard::raft_net::RaftNet)>, String> {
+        let Some(id) = self.raft_id else {
+            if self.raft_listen.is_some() || !self.raft_peer.is_empty() {
+                return Err("--raft-listen and --raft-peer need --raft-id".to_string());
+            }
+            return Ok(None);
+        };
+        if id == 0 {
+            return Err("--raft-id must not be 0".to_string());
+        }
+        if self.role.as_deref() != Some("shard") {
+            return Err("--raft-id needs --role shard".to_string());
+        }
+        let listen = self.raft_listen.as_deref().ok_or("--raft-id needs --raft-listen")?;
+        let (addr, port) = listen
+            .rsplit_once(':')
+            .and_then(|(a, p)| p.parse::<u16>().ok().map(|p| (a.trim_matches(['[', ']']).to_string(), p)))
+            .ok_or_else(|| format!("--raft-listen {listen}: write ADDR:PORT"))?;
+        let mut peers = std::collections::BTreeMap::new();
+        for p in &self.raft_peer {
+            let (pid, paddr) = p.split_once('=').ok_or_else(|| format!("--raft-peer {p}: write ID=ADDR:PORT"))?;
+            let pid: u64 = pid.parse().map_err(|_| format!("--raft-peer {p}: {pid:?} is not an id"))?;
+            if pid == id || pid == 0 || peers.insert(pid, paddr.to_string()).is_some() {
+                return Err(format!("--raft-peer {p}: ids are unique, non-zero and not this replica's"));
+            }
+        }
+        Ok(Some((
+            id,
+            rasterizeddb_core::core::shard::raft_net::RaftNet {
+                listen_addr: addr,
+                listen_port: port,
+                peers,
+                cert: self.shard_cert.clone().ok_or("--raft-id needs --shard-cert")?,
+                key: self.shard_key.clone().ok_or("--raft-id needs --shard-key")?,
+                ca: self.peer_ca.clone().or_else(|| self.gateway_ca.clone()).ok_or("--raft-id needs --peer-ca")?,
+            },
+        )))
     }
 
     /// Without the feature: any shard flag is refused.

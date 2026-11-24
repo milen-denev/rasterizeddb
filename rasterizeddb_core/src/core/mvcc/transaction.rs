@@ -920,6 +920,13 @@ impl TransactionManager {
     ///
     /// [`try_begin_in_place`]: TransactionManager::try_begin_in_place
     pub fn try_begin_in_place_for(self: &std::sync::Arc<Self>, own: TxId) -> Option<InPlaceGuard> {
+        // Off on a shard replicating through Raft (sharding-plan.md B3): an
+        // in-place write is visible before its entry could be applied by a
+        // quorum.
+        #[cfg(feature = "sharding_raft")]
+        if crate::core::shard::capture::active() {
+            return None;
+        }
         let mut in_place = lock(&self.in_place);
         // Read `running` while holding the latch, so no `begin` can land
         // between observing it empty and raising the count.

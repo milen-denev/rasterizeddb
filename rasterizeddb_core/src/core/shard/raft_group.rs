@@ -323,7 +323,15 @@ impl Runner {
         }
         // Snapshots peers asked for.
         for to in &ready.snapshot_wanted {
-            let data = self.machine.snapshot()?;
+            // A machine that cannot snapshot leaves the follower to be
+            // relocated from a backup; the leader goes on.
+            let data = match self.machine.snapshot() {
+                Ok(d) => d,
+                Err(e) => {
+                    log::warn!("raft group {}: peer {to} needs a snapshot: {e}", self.node.id());
+                    continue;
+                }
+            };
             let index = self.node.log().applied();
             let term = self.node.log().term(index).unwrap_or(self.node.log().snapshot_term());
             let meta = SnapshotMeta { index, term, config: self.node.config().clone() };

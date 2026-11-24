@@ -64,7 +64,7 @@ pub fn database_of_scope(scope: &str) -> Option<u64> {
 
 /// Records `op`, stamped by transaction `tx` of database `database`.
 pub fn record(database: u64, tx: TxId, op: Op) {
-    if is_temp(&op) {
+    if is_temp(&op) || super::raft_apply::is_applying(database, tx) {
         return;
     }
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -75,7 +75,11 @@ fn is_temp(op: &Op) -> bool {
     let t = match op {
         Op::Insert { table, .. } | Op::Delete { table, .. } | Op::Update { table, .. } => table,
     };
-    t.starts_with("__cte_tmp_") || t.starts_with("__rdb_tmp_") || t.starts_with("__cat_")
+    t.starts_with("__cte_tmp_")
+        || t.starts_with("__rdb_tmp_")
+        || t.starts_with("__cat_")
+        // The applied index is each replica's own.
+        || t == "__rdb_shard_applied"
 }
 
 /// The ops of a committing family, in stamp order: every member's, those of

@@ -1887,6 +1887,44 @@ fn main() -> std::io::Result<()> {
             }
         }
 
+        // The shard's Raft group (sharding-plan.md B3): its store, its
+        // runtime, the apply into the catalogue, and the peers' listener.
+        #[cfg(feature = "sharding_raft")]
+        match args.shard.raft() {
+            Ok(Some((id, net))) => {
+                use rasterizeddb_core::core::shard::{raft_apply, raft_group, raft_net, raft_store};
+                let dir = std::path::Path::new(args.location.as_deref().unwrap_or(".")).join("raft");
+                let (store, restored) = match raft_store::RaftStore::open(&dir) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("the raft store: {e}");
+                        std::process::exit(2);
+                    }
+                };
+                let voters = std::iter::once(id).chain(net.peers.keys().copied());
+                let group = raft_group::Group::start(
+                    id,
+                    store,
+                    restored,
+                    rasterizeddb_raft::Config::new(voters),
+                    rasterizeddb_raft::Timing::default(),
+                    Box::new(raft_apply::ShardMachine::new(catalog.clone(), id)),
+                    std::sync::Arc::new(raft_net::Sender(raft_net::RastcpTransport::new(net.clone()))),
+                );
+                raft_apply::install(group.clone(), id, catalog.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = raft_net::serve(net, group).await {
+                        log::error!("the raft listener stopped: {e}");
+                    }
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
+
         // The gateways' endpoint on a shard (rshard, mTLS), on the catalogue
         // so a virtual session can attach to any database.
         #[cfg(feature = "sharding")]

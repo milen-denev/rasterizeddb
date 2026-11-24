@@ -21140,7 +21140,7 @@ impl IdentifyingKey {
     ///
     /// A decimal is written at its declared scale, every place kept, so the
     /// predicate names exactly the stored value.
-    fn predicate(&self, cells: &[&crate::core::row::row::Column]) -> Result<String, String> {
+    pub(crate) fn predicate(&self, cells: &[&crate::core::row::row::Column]) -> Result<String, String> {
         let literals = self.literals(cells)?;
         let terms: Vec<String> =
             self.fields.iter().zip(&literals).map(|(field, literal)| format!("{} = {}", field.name, literal)).collect();

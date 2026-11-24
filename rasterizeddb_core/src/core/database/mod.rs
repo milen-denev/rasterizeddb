@@ -2285,6 +2285,19 @@ impl Database {
         self.transactions.check_ids_reserved(tx)?;
         self.sync_other_locations()?;
         let mut family = self.family_of(tx);
+        // A shard's Raft group: the write is proposed and applied by a
+        // quorum before it becomes visible here (sharding-plan.md B3).
+        #[cfg(feature = "sharding_raft")]
+        if crate::core::shard::capture::active() {
+            use crate::core::mvcc::TxOutcome;
+            let members: Vec<(crate::core::mvcc::TxId, bool)> = self
+                .transactions
+                .family_of(tx)
+                .into_iter()
+                .map(|id| (id, self.transactions.outcome(id) != TxOutcome::Aborted))
+                .collect();
+            crate::core::shard::raft_apply::propose_commit(self, &members, tx)?;
+        }
         // The replication record, ahead of the commit: on failure nothing
         // has been committed, and the caller aborts.
         self.prepare_replication(tx, &mut family)?;
@@ -2409,6 +2422,8 @@ impl Database {
 
     /// Ends `tx` without effect and discards what replication buffered for it.
     pub fn abort_transaction(&self, tx: crate::core::mvcc::TxId) {
+        #[cfg(feature = "sharding_raft")]
+        crate::core::shard::capture::discard(self.id, tx);
         // Read before the abort: nothing prunes the parent map today, but
         // relying on that would make this quietly wrong the day something does.
         let family = self.family_of(tx);
