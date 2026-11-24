@@ -12,6 +12,7 @@
 //!                       [--pin LO:HI …] [--exclude SHARD …]
 //!                       [--apply --fenced --out NEW_MAP --state-dir DIR
 //!                        --table TABLE:COLUMN:TYPE [--table …]]
+//! rdb-shard exec        --map MAP --sql SQL
 //! rdb-shard keygen      --key FILE
 //! rdb-shard sign        --map MAP --key FILE
 //! rdb-shard ddl         --map MAP --file DDL.sql --table TABLE [--table …]
@@ -147,6 +148,7 @@ async fn run(args: &Args) -> std::result::Result<(), String> {
         "rebalance" => rebalance(args, &options).await,
         "ddl" => cluster_ddl(args, &options).await,
         "keygen" => keygen(args),
+        "exec" => exec_each(args, &options).await,
         "sign" => {
             let path = args.one("map")?;
             let map = read_map(path)?;
@@ -1018,5 +1020,33 @@ async fn finish_move(
     }
     src.run(&format!("SHARD GIVE RANGE {lo:#x} {hi:#x}")).await.map_err(|e| format!("giving up the source's span: {e}"))?;
     src.run(&format!("SHARD UNFENCE RANGE {lo:#x} {hi:#x}")).await.map_err(|e| format!("unfencing the source: {e}"))?;
+    Ok(())
+}
+
+/// `exec` (EXECUTE ON EACH SHARD, sharding-plan.md B2): the statement on
+/// every shard as that shard's own transaction, in shard order. Each shard
+/// answers for its own rows only (its guard refuses the rest), so an
+/// `UPDATE`/`DELETE` without a key touches every row exactly once. Not
+/// atomic across shards: a failure names the shards that already applied.
+async fn exec_each(args: &Args, options: &Options) -> std::result::Result<(), String> {
+    let map = read_map(args.one("map")?)?;
+    let sql = args.one("sql")?;
+    let mut applied: Vec<ShardId> = Vec::new();
+    let mut total = 0u64;
+    for info in map.shards() {
+        let c = connect(&map, info.id, options).await?;
+        match c.run(sql).await {
+            Ok(r) => {
+                let n = r.rows_affected().unwrap_or(r.len() as u64);
+                total += n;
+                applied.push(info.id);
+                println!("shard {}: {n}", info.id);
+            }
+            Err(e) => {
+                return Err(format!("shard {}: {e}. Already applied on shards {applied:?}", info.id));
+            }
+        }
+    }
+    println!("{total} on {} shards", applied.len());
     Ok(())
 }
