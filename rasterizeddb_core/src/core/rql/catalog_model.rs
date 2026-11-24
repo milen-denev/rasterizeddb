@@ -48,6 +48,8 @@ pub(crate) enum V {
     B(bool),
     /// An array of integers (`int2vector`, `int2[]`).
     A(Vec<i64>),
+    /// An array of text (`text[]`): `pg_class.reloptions`.
+    TA(Vec<String>),
     N,
 }
 
@@ -69,6 +71,14 @@ impl V {
                     .collect::<Vec<_>>()
                     .join(",")
             ),
+            V::TA(items) => crate::auth::quote(&format!(
+                "{{{}}}",
+                items
+                    .iter()
+                    .map(|i| format!("\"{}\"", i.replace('\\', "\\\\").replace('"', "\\\"")))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
             V::N => "NULL".to_string(),
         }
     }
@@ -391,6 +401,10 @@ pub(crate) struct Column {
     /// `s` for a stored generated column, or empty.
     pub generated: &'static str,
     pub collation: i64,
+    /// `pg_attribute.attcompression`: the method a variable-width column
+    /// stores its values with (`zstd`, `zstd(9)`; `core::compression`), or
+    /// empty for none, as PostgreSQL leaves it for the default.
+    pub compression: String,
 }
 
 /// An index, as `pg_index` and `pg_class` list it.
@@ -437,6 +451,10 @@ pub(crate) struct Rel {
     /// A partitioned table's key columns, outermost first, by `attnum`
     /// (`pg_partitioned_table.partattrs`); empty for any other relation.
     pub partition_key: Vec<i64>,
+    /// `pg_class.reloptions`: `row_compression=zstd(9)` for a table that
+    /// compresses its row tails (`core::compression`); empty otherwise, which
+    /// is listed as NULL, as PostgreSQL lists a table with no options.
+    pub options: Vec<String>,
 }
 
 /// A role, as `pg_roles` lists it.
@@ -658,6 +676,11 @@ fn table_columns(schema: &TableSchema) -> Vec<Column> {
                 identity,
                 generated: if generated.is_some() { "s" } else { "" },
                 collation: collation_of(type_oid),
+                compression: crate::core::compression::method_name(crate::core::compression::level_of(
+                    &schema.compression,
+                    field.write_order,
+                ))
+                .unwrap_or_default(),
             }
         })
         .collect()
@@ -1061,6 +1084,9 @@ pub(crate) async fn build_model(
                 "r"
             },
             partition_key,
+            options: crate::core::compression::method_name(schema.compression.row.as_ref().map(|c| c.level))
+                .map(|m| vec![format!("row_compression={m}")])
+                .unwrap_or_default(),
             owner: owner(name),
             columns,
             indexes,
@@ -1131,6 +1157,8 @@ pub(crate) async fn build_model(
                 identity: "",
                 generated: "",
                 collation: collation_of(ty.pg_oid() as i64),
+                // A view stores nothing.
+                compression: String::new(),
             })
             .collect();
         rels.push(Rel {
@@ -1138,6 +1166,7 @@ pub(crate) async fn build_model(
             name: view.name.clone(),
             kind: "v",
             partition_key: Vec::new(),
+            options: Vec::new(),
             owner: owner(&view.name),
             columns,
             indexes: Vec::new(),
@@ -1152,6 +1181,7 @@ pub(crate) async fn build_model(
             name: name.clone(),
             kind: "S",
             partition_key: Vec::new(),
+            options: Vec::new(),
             owner: owner(name),
             columns: Vec::new(),
             indexes: Vec::new(),
@@ -1525,7 +1555,8 @@ pub(crate) fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]
             ("attstattarget", I16),
             // What `psql`'s `\d+` selects: `p` (plain) for a fixed-width
             // type, `x` (extended) for a variable one, as PostgreSQL's
-            // defaults; no column has a compression method.
+            // defaults. `attcompression` names the method a column
+            // compresses with (`zstd(9)`), empty for none.
             ("attstorage", STRING),
             ("attcompression", STRING),
         ],
@@ -1901,7 +1932,7 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                         V::I(c.collation),
                         V::I(-1),
                         t(if c.len > 0 { "p" } else { "x" }),
-                        t(""),
+                        t(&c.compression),
                     ]);
                 }
             }
@@ -2091,7 +2122,7 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                     t(if matches!(rel.kind, "r" | "p") { "d" } else { "n" }),
                     V::B(false),
                     V::N,
-                    V::N,
+                    if rel.options.is_empty() { V::N } else { V::TA(rel.options.clone()) },
                     V::N,
                 ]);
                 for index in &rel.indexes {

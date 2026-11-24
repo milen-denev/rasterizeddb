@@ -886,6 +886,9 @@ impl Database {
         if !own_scale.is_empty() {
             self.require_numeric_own_scale()?;
         }
+        if crate::core::rql::type_modifier::declares_compression(&ct.type_modifiers) {
+            self.require_compressed_values()?;
+        }
         let mut schema =
             Table::create_schema_files_with(io_schema.clone(), &ct.table_name, columns, &ct.unique_columns, &own_scale)
                 .await?;
@@ -1159,6 +1162,12 @@ impl Database {
         if let Some(location) = self.location.as_deref() {
             super::incompat::fence_numeric_own_scale(Path::new(location), &schema.fields).map_err(|e| {
                 format!("the directory could not be marked for its NUMERIC columns ({}): {e}", super::incompat::NUMERIC_OWN_SCALE_V1)
+            })?;
+            super::incompat::fence_compressed_values(Path::new(location), &schema).map_err(|e| {
+                format!(
+                    "the directory could not be marked for its compressed columns ({}): {e}",
+                    super::incompat::COMPRESSED_VALUES_V1
+                )
             })?;
         }
         if schema.name != name {

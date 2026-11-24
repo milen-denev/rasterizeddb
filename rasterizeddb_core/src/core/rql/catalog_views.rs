@@ -1225,7 +1225,7 @@ async fn model_for(
 /// [`build`], with the model made first when the relation needs one, as
 /// [`materialize`] makes it.
 #[cfg(test)]
-async fn build_alone(
+pub(crate) async fn build_alone(
     view: &str,
     database: &Arc<Database>,
     tx: crate::core::mvcc::transaction::TxId,

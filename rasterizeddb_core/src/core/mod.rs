@@ -2,6 +2,9 @@ pub mod auto_compact;
 #[cfg(feature = "s3_backup")]
 pub mod backup;
 pub mod bulk_load;
+pub mod compression;
+#[cfg(test)]
+mod compression_tests;
 pub mod cancel;
 pub mod notice;
 /// Hash partitioning's routing hash and range map; not wired in yet.

@@ -141,6 +141,11 @@ pub struct ColumnDef {
     pub index: Option<IndexMethod>,
     /// A `DEFAULT` expression for the DDL.
     pub default: Option<&'static str>,
+    /// The method the column stores its values with
+    /// (`#[rdb(compression = "zstd(19)")]`), as the server names it in
+    /// `pg_attribute.attcompression`: `zstd` or `zstd(n)`. `None` stores them
+    /// as they are, which is the server's default.
+    pub compression: Option<&'static str>,
     /// Read as `col::text`: a type the native protocol sends in a form this
     /// client cannot decode (`jsonb`, arrays, `NUMERIC(p, s)`).
     pub read_as_text: bool,
@@ -205,6 +210,11 @@ pub trait Model: FromRow + Sized {
     /// The table's hash partitioning (`#[rdb(partition_by = "…")]` on the
     /// struct), if it is partitioned.
     const PARTITION: Option<Partitioning> = None;
+    /// How the table compresses each row's variable-width values as one
+    /// frame (`#[rdb(row_compression = "zstd(9)")]` on the struct), as the
+    /// server names it in `pg_class.reloptions`: `zstd` or `zstd(n)`. `None`
+    /// for none, the server's default.
+    const ROW_COMPRESSION: Option<&'static str> = None;
 
     /// Writes this value's column `i` as a literal into `out`.
     fn write_value(&self, column: usize, out: &mut String) -> Result<()>;
@@ -805,6 +815,8 @@ pub struct TableSchema {
     pub columns: &'static [ColumnDef],
     /// The table's hash partitioning, if any.
     pub partition: Option<Partitioning>,
+    /// The table's row compression ([`Model::ROW_COMPRESSION`]).
+    pub row_compression: Option<&'static str>,
 }
 
 /// A table hash-partitioned on its partition key: `PARTITION BY HASH (a,
@@ -856,6 +868,7 @@ impl TableSchema {
             renamed_from: M::RENAMED_FROM,
             columns: M::COLUMNS,
             partition: M::PARTITION,
+            row_compression: M::ROW_COMPRESSION,
         }
     }
 
@@ -879,6 +892,12 @@ impl TableSchema {
         } else {
             column.sql_type
         });
+        // Where PostgreSQL's grammar puts it: after the type, before the
+        // constraints.
+        if let Some(method) = column.compression {
+            line.push_str(" COMPRESSION ");
+            line.push_str(method);
+        }
         if !column.nullable && !column.serial {
             line.push_str(" NOT NULL");
         }
@@ -933,6 +952,10 @@ impl TableSchema {
             }
             create.push(' ');
             create.push_str(&partition.clause()?);
+        }
+        // Where PostgreSQL puts storage options: after the partitioning.
+        if let Some(method) = self.row_compression {
+            create.push_str(&format!(" WITH (row_compression = '{method}')"));
         }
         let mut statements = vec![create];
         statements.extend(self.keys_sql()?);

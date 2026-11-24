@@ -137,6 +137,10 @@ pub struct SyncPolicy {
     /// writers wait) while every row is copied into partitions. Turn it on
     /// for the run that should do it.
     pub convert_partitioning: bool,
+    /// Change how a column stores its values to the model's
+    /// (`#[rdb(compression)]`, `ALTER COLUMN … SET COMPRESSION`). On by
+    /// default: it rewrites nothing, applying to values written from then on.
+    pub compression: bool,
 }
 
 impl Default for SyncPolicy {
@@ -151,6 +155,7 @@ impl Default for SyncPolicy {
             drop_columns: false,
             fail_on_drift: false,
             convert_partitioning: false,
+            compression: true,
         }
     }
 }
@@ -160,6 +165,7 @@ impl SyncPolicy {
     pub fn additive() -> Self {
         SyncPolicy {
             renames: false,
+            compression: false,
             ..SyncPolicy::default()
         }
     }
@@ -188,6 +194,7 @@ impl SyncPolicy {
             drop_columns: false,
             fail_on_drift: false,
             convert_partitioning: false,
+            compression: false,
         }
     }
 }
@@ -1053,6 +1060,10 @@ fn catalogue_type(sql_type: &str) -> Option<&'static str> {
 struct Existing {
     data_type: String,
     nullable: bool,
+    /// `pg_attribute.attcompression`: `zstd`, `zstd(9)`, or empty for none.
+    /// `None` when the server could not say (one that predates it reports
+    /// empty, which is right: it compresses nothing).
+    compression: Option<String>,
 }
 
 async fn existing_columns(client: &Client, table: &str) -> Result<HashMap<String, Existing>> {
@@ -1063,14 +1074,27 @@ async fn existing_columns(client: &Client, table: &str) -> Result<HashMap<String
             params![table],
         )
         .await?;
+    // How each column stores its values. A failure here leaves the
+    // compression unknown, and the comparison says so rather than guess.
+    let compression: Option<HashMap<String, String>> = client
+        .fetch_all::<(String, String)>(
+            "SELECT a.attname, a.attcompression FROM pg_attribute a \
+             JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = $1",
+            params![table],
+        )
+        .await
+        .ok()
+        .map(|rows| rows.into_iter().collect());
     Ok(rows
         .into_iter()
         .map(|(name, data_type, nullable)| {
+            let compressed = compression.as_ref().map(|c| c.get(&name).cloned().unwrap_or_default());
             (
                 name,
                 Existing {
                     data_type,
                     nullable: nullable == "YES",
+                    compression: compressed,
                 },
             )
         })
@@ -1191,6 +1215,7 @@ async fn plan_model(
         &mut drift,
     )
     .await?;
+    plan_row_compression(client, model, found, &table, policy, &mut changes, &mut drift).await;
     let mut extra: Vec<&String> = existing
         .keys()
         .filter(|n| !accounted.contains(n.as_str()))
@@ -1309,6 +1334,78 @@ async fn plan_partitioning(
     Ok(())
 }
 
+/// The table's row compression from `pg_class.reloptions`
+/// (`row_compression=zstd(9)`): `Some(None)` for none, `None` when the
+/// server could not say.
+async fn current_row_compression(client: &Client, table: &str) -> Option<Option<String>> {
+    let rows: Vec<(Option<String>,)> = client
+        .fetch_all("SELECT reloptions::text FROM pg_class WHERE relname = $1", params![table])
+        .await
+        .ok()?;
+    let options = rows.into_iter().next().and_then(|(o,)| o).unwrap_or_default();
+    let found = options.split_once("row_compression=").map(|(_, rest)| {
+        // Up to the element's end: a comma, the array's brace or a quote.
+        let mut depth = 0i32;
+        rest.chars()
+            .take_while(|c| match c {
+                '(' => {
+                    depth += 1;
+                    true
+                }
+                ')' => {
+                    depth -= 1;
+                    depth >= 0
+                }
+                ',' | '}' | '"' => depth > 0,
+                _ => true,
+            })
+            .collect::<String>()
+    });
+    Some(found)
+}
+
+/// Row compression drift: the model's `#[rdb(row_compression = …)]` against
+/// the table's, fixed with `SET (row_compression = …)` / `RESET
+/// (row_compression)` under [`SyncPolicy::compression`] (rows written from
+/// then on; `ALTER TABLE … RECOMPRESS` rewrites the rest).
+#[allow(clippy::too_many_arguments)]
+async fn plan_row_compression(
+    client: &Client,
+    model: &TableSchema,
+    found: &str,
+    table: &str,
+    policy: &SyncPolicy,
+    changes: &mut Vec<String>,
+    drift: &mut Vec<String>,
+) {
+    let wanted = model.row_compression;
+    match current_row_compression(client, found).await {
+        Some(now) if now.as_deref() != wanted => {
+            let statement = match wanted {
+                Some(method) => format!("ALTER TABLE {table} SET (row_compression = '{method}')"),
+                None => format!("ALTER TABLE {table} RESET (row_compression)"),
+            };
+            if policy.compression {
+                changes.push(statement);
+            } else {
+                drift.push(format!(
+                    "{}'s rows are compressed with {}, the model says {}",
+                    model.table,
+                    now.as_deref().unwrap_or("none"),
+                    wanted.unwrap_or("none")
+                ));
+            }
+        }
+        Some(_) => {}
+        None if wanted.is_some() => drift.push(format!(
+            "{}: the server did not say how its rows are compressed; the model says {}",
+            model.table,
+            wanted.unwrap_or("none")
+        )),
+        None => {}
+    }
+}
+
 fn compare_column(
     table_name: &str,
     table: &str,
@@ -1333,6 +1430,31 @@ fn compare_column(
                 column.name, current.data_type, column.sql_type
             ));
         }
+    }
+    // How it stores its values: the model's method, or none.
+    let wanted = column.compression.unwrap_or("");
+    match current.compression.as_deref() {
+        Some(now) if now != wanted => {
+            let method = if wanted.is_empty() { "default" } else { wanted };
+            if policy.compression {
+                changes.push(format!(
+                    "ALTER TABLE {table} ALTER COLUMN {name} SET COMPRESSION {method}"
+                ));
+            } else {
+                drift.push(format!(
+                    "{table_name}.{} is compressed with {}, the model says {}",
+                    column.name,
+                    if now.is_empty() { "none" } else { now },
+                    if wanted.is_empty() { "none" } else { wanted }
+                ));
+            }
+        }
+        Some(_) => {}
+        None if !wanted.is_empty() => drift.push(format!(
+            "{table_name}.{}: the server did not say how it is compressed; the model says {wanted}",
+            column.name
+        )),
+        None => {}
     }
     // A serial or key column is NOT NULL by construction; the model's Option
     // does not decide it.

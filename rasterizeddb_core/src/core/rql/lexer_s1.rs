@@ -74,6 +74,9 @@ pub enum QueryPurpose {
 pub struct VacuumRequest {
     pub table_name: Option<String>,
     pub full: bool,
+    /// `VACUUM (FULL, RECOMPRESS)`: the table rewritten under its compression
+    /// as it stands (`ALTER TABLE … RECOMPRESS`, which also compacts it).
+    pub recompress: bool,
 }
 
 #[derive(Debug)]
@@ -573,17 +576,28 @@ fn recognize_core_statement(query_trimmed: &str, query_bytes: &[u8]) -> Option<Q
         // vacuumed instead of a syntax error.
         let mut words = query_trimmed.split_whitespace().skip(1).peekable();
         let mut full = false;
+        let mut recompress = false;
         let mut table_name = None;
 
         while let Some(word) = words.next() {
             let upper = word.to_ascii_uppercase();
             if upper.starts_with('(') {
-                // Skip the option list, however it is spaced.
+                // The option list, however it is spaced: `FULL` and
+                // `RECOMPRESS` are acted on, the rest ignored.
+                let mut options = vec![upper.clone()];
                 if !word.ends_with(')') {
                     for rest in words.by_ref() {
+                        options.push(rest.to_ascii_uppercase());
                         if rest.ends_with(')') {
                             break;
                         }
+                    }
+                }
+                for option in options.iter().flat_map(|o| o.split(|c: char| c == '(' || c == ')' || c == ',')) {
+                    match option.trim() {
+                        "FULL" => full = true,
+                        "RECOMPRESS" => recompress = true,
+                        _ => {}
                     }
                 }
                 continue;
@@ -598,7 +612,7 @@ fn recognize_core_statement(query_trimmed: &str, query_bytes: &[u8]) -> Option<Q
             }
         }
 
-        Some(Vacuum(VacuumRequest { table_name, full }))
+        Some(Vacuum(VacuumRequest { table_name, full, recompress }))
     } else if simd_compare_strings(query_bytes, b"CREATE INDEX", &StartsWith)
         && (crate::core::rql::path_index::parse_create(query_trimmed).is_some()
             || crate::core::index::ddl::parse_create(query_trimmed).is_some())

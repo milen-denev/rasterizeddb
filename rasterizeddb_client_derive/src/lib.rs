@@ -43,6 +43,7 @@ use syn::{Data, DeriveInput, Fields, LitStr, Type, parse_macro_input};
 /// | `column = "name"` | the column's name, when it is not the field's |
 /// | `sql_type = "VARCHAR(64)"` | the DDL type, when the field type's default is not wanted |
 /// | `default = "…"` | a `DEFAULT` expression for the DDL |
+/// | `compression`, `compression = "zstd(19)"` | store a text, `jsonb`, `bytea` or array column's values compressed: zstd at level 3, or the level given (1 fastest to 22 smallest); `lz4` and `pglz` are taken as zstd. Applies to values written after it is set |
 /// | `renamed_from = "old"` | an earlier column name, for the migrator to rename (may repeat) |
 /// | `json` | any `Serialize + Deserialize` type, stored as `jsonb` (feature `serde_json`) |
 /// | `text` | read as `col::text` and parsed (for a type of your own) |
@@ -77,6 +78,7 @@ use syn::{Data, DeriveInput, Fields, LitStr, Type, parse_macro_input};
 /// | `renamed_from = "old"` | an earlier table name, for the migrator to rename |
 /// | `hooks` | run the struct's `ModelHooks` impl (validation, before/after hooks), which you then write |
 /// | `partition_by = "tenant_id, group_id"`, `partitions = 16` | a hash-partitioned table: `CREATE TABLE … PARTITION BY HASH (…) PARTITIONS 16` |
+/// | `row_compression = "zstd(9)"` | store each row's text, `jsonb`, `bytea` and array values as one compressed frame: `WITH (row_compression = …)`; for a table of many short strings, where per-column `compression` finds too little to work on |
 ///
 /// A field's type must implement `SqlType` (every type the client maps does)
 /// unless it has `sql_type` or `json`.
@@ -143,6 +145,8 @@ struct FieldAttrs {
     column: Option<String>,
     sql_type: Option<String>,
     default: Option<String>,
+    /// `compression`: the method as the server names it (`zstd`, `zstd(19)`).
+    compression: Option<String>,
     json: bool,
     text: bool,
     skip: bool,
@@ -284,6 +288,31 @@ fn fk_action(text: &str, span: Span) -> syn::Result<String> {
     }
 }
 
+/// The method of `#[rdb(compression = "…")]` as the server names it in
+/// `pg_attribute.attcompression` (`zstd` at the default level 3, else
+/// `zstd(n)`), so the migrator compares like with like. The grammar is the
+/// server's `COMPRESSION` clause: `zstd`, `zstd(1..=22)`, and `lz4` / `pglz`,
+/// which it stores as zstd.
+fn compression_method(text: &str) -> Result<String, String> {
+    const DEFAULT_LEVEL: u32 = 3;
+    let lower: String = text.trim().to_ascii_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+    let level = match lower.as_str() {
+        "zstd" | "lz4" | "pglz" => DEFAULT_LEVEL,
+        other => {
+            let inner = other
+                .strip_prefix("zstd(")
+                .and_then(|r| r.strip_suffix(')'))
+                .ok_or_else(|| format!("compression is zstd, zstd(level), lz4 or pglz, not \"{text}\""))?;
+            let level: u32 = inner.parse().map_err(|_| format!("compression level \"{inner}\" is not a number"))?;
+            if !(1..=22).contains(&level) {
+                return Err(format!("compression level {level} is out of range: zstd levels are 1 to 22"));
+            }
+            level
+        }
+    };
+    Ok(if level == DEFAULT_LEVEL { "zstd".to_string() } else { format!("zstd({level})") })
+}
+
 fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
     let mut out = FieldAttrs::default();
     for attr in attrs.iter().filter(|a| a.path().is_ident("rdb")) {
@@ -325,6 +354,16 @@ fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
                 "column" | "rename" => out.column = Some(string(&meta)?),
                 "sql_type" => out.sql_type = Some(string(&meta)?),
                 "default" => out.default = Some(string(&meta)?),
+                "compression" => {
+                    let method = if meta.input.peek(syn::Token![=]) {
+                        string(&meta)?
+                    } else {
+                        "zstd".to_string()
+                    };
+                    out.compression = Some(
+                        compression_method(&method).map_err(|e| meta.error(e))?,
+                    );
+                }
                 "renamed_from" => out.renamed_from.push(string(&meta)?),
                 "references" => {
                     let text = string(&meta)?;
@@ -353,7 +392,7 @@ fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
                 _ => {
                     return Err(meta.error(
                         "unknown rdb attribute; expected primary_key, serial, unique, index, \
-                         column, sql_type, default, renamed_from, references, on_delete, \
+                         column, sql_type, default, compression, renamed_from, references, on_delete, \
                          on_update, json, text, skip, version, created_at, updated_at, \
                          soft_delete, has_many, has_one, belongs_to, many_to_many or count_of",
                     ));
@@ -392,6 +431,7 @@ fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
             || out.column.is_some()
             || out.sql_type.is_some()
             || out.default.is_some()
+            || out.compression.is_some()
             || out.json
             || out.text
         {
@@ -407,6 +447,7 @@ fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
             || out.serial
             || out.unique
             || out.index.is_some()
+            || out.compression.is_some()
             || out.role.is_some())
     {
         return Err(syn::Error::new(
@@ -621,6 +662,7 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             "hooks",
             "partition_by",
             "partitions",
+            "row_compression",
         ],
     )?;
     let setting = |key: &str| {
@@ -683,6 +725,10 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             Some(d) => quote!(::core::option::Option::Some(#d)),
             None => quote!(::core::option::Option::None),
         };
+        let compression = match &f.attrs.compression {
+            Some(c) => quote!(::core::option::Option::Some(#c)),
+            None => quote!(::core::option::Option::None),
+        };
         let (primary_key, serial, unique) = (f.attrs.primary_key, f.attrs.serial, f.attrs.unique);
         let renamed_from = &f.attrs.renamed_from;
         let references = match &f.attrs.references {
@@ -732,6 +778,7 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
                 unique: #unique,
                 index: #index,
                 default: #default,
+                compression: #compression,
                 read_as_text: #read_as_text,
                 renamed_from: &[#(#renamed_from),*],
                 role: #role,
@@ -919,6 +966,15 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             }))
         }
     };
+    let row_compression = match setting("row_compression") {
+        Some(method) => {
+            // A bare `row_compression` is zstd at its default level.
+            let method = if method.is_empty() { "zstd".to_string() } else { method };
+            let method = compression_method(&method).map_err(|e| syn::Error::new(input.span(), e))?;
+            quote!(::core::option::Option::Some(#method))
+        }
+        None => quote!(::core::option::Option::None),
+    };
     let from_row = from_row_impl(input, &fields, named);
     let hook_methods = if hooks {
         quote! {
@@ -938,6 +994,7 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             const COLUMNS: &'static [::rasterizeddb_client::orm::ColumnDef] = &[#(#defs),*];
             const RENAMED_FROM: &'static [&'static str] = &[#(#table_renamed_from),*];
             const PARTITION: ::core::option::Option<::rasterizeddb_client::orm::Partitioning> = #partition;
+            const ROW_COMPRESSION: ::core::option::Option<&'static str> = #row_compression;
 
             fn write_value(&self, column: usize, out: &mut ::std::string::String) -> ::rasterizeddb_client::Result<()> {
                 match column {

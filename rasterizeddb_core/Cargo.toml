@@ -168,7 +168,7 @@ name = "vacuum_benchmarks"
 harness = false
 
 [features]
-default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3", "query_stats", "kv_cache", "persistent_indexes", "mysql_wire", "mssql_wire", "db_branching"]
+default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3", "query_stats", "kv_cache", "persistent_indexes", "mysql_wire", "mssql_wire", "db_branching", "storage_compression"]
 enable_long_row = []
 
 # Database branches: `CREATE BRANCH`, `RESET`/`PROMOTE`/`DROP BRANCH`,
@@ -208,6 +208,18 @@ index_store_failpoints = []
 # still interoperates with one that has it — the handshake only ever picks a
 # codec both ends advertise, so the link falls back to uncompressed.
 replication_compression = ["dep:zstd"]
+
+# Compression of stored values (docs/compression.md): a variable-width column
+# declared `COMPRESSION zstd` or `zstd(level)` stores each value of at least
+# `core::compression::MIN_VALUE_BYTES` as a zstd frame when that saves bytes.
+#
+# Nothing is compressed unless a column asks for it, so a build with this
+# feature and no such column writes the rows it always did. A directory that
+# has used it carries `compressed_values_v1` in its `incompat_features` file,
+# and a build without the feature refuses that directory rather than read a
+# frame as text. Without it the `COMPRESSION` clauses are accepted and ignored,
+# as `pg_dump` output carries them.
+storage_compression = ["dep:zstd"]
 
 # One-way import of a live PostgreSQL database: schema, then data.
 #

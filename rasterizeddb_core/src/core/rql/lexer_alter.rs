@@ -102,6 +102,17 @@ pub enum AlterAction {
         from: String,
         to: String,
     },
+    /// `SET (row_compression = 'zstd(9)')` / `RESET (row_compression)`: the
+    /// table stores each row's variable-width values as one frame
+    /// (`core::compression`), at this level, or stops (`None`). Values
+    /// written from then on.
+    SetRowCompression {
+        level: Option<i32>,
+    },
+    /// `RECOMPRESS`: every row rewritten under the table's compression as it
+    /// stands now, with dictionaries trained from the values the table holds
+    /// (`core::compression::train`).
+    Recompress,
     /// Accepted and not acted on, with the reason.
     ///
     /// PostgreSQL storage tuning — `SET COMPRESSION`, `SET (autovacuum_…)` —
@@ -415,7 +426,19 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
                     create the table with the identity column instead"
             .to_string());
     }
-    let (remainder, default) = crate::core::rql::column_default::split_clause(&remainder);
+    // `SET COMPRESSION default` names a method, not a DEFAULT clause: split
+    // off, `default` left a bare `SET COMPRESSION`.
+    let sets_compression = remainder
+        .to_ascii_uppercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|w| w == ["SET", "COMPRESSION"]);
+    let (remainder, default) = if sets_compression {
+        (remainder, None)
+    } else {
+        crate::core::rql::column_default::split_clause(&remainder)
+    };
     let rest: Vec<&str> = remainder.split_whitespace().collect();
     if rest.is_empty() {
         return Err("ALTER TABLE has no action".to_string());
@@ -664,12 +687,29 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
         // Storage tuning and constraint validation: accepted, not acted on.
         // `SET` here is the *table-level* form — `ALTER COLUMN … SET DEFAULT`
         // was matched earlier and still does what it says.
+        // `SET (…)` / `RESET (…)`: `row_compression` is acted on, the
+        // other storage options accepted and ignored.
+        "SET" | "RESET" if rest.get(1).is_some_and(|t| t.starts_with('(')) => {
+            let group = rest[1..].join(" ");
+            let inner = group.trim().trim_end_matches(';').trim();
+            let inner = inner.strip_prefix('(').and_then(|g| g.strip_suffix(')')).ok_or_else(|| {
+                format!("syntax error at or near \"{}\": a storage option list is parenthesised", rest[1])
+            })?;
+            match crate::core::compression::row_compression_option(inner)? {
+                Some(level) if rest_upper[0] == "SET" => AlterAction::SetRowCompression { level },
+                Some(_) => AlterAction::SetRowCompression { level: None },
+                None => AlterAction::NoOp {
+                    reason: "table storage options: RasterizedDB manages its own storage",
+                },
+            }
+        }
         "SET" => AlterAction::NoOp {
             reason: "table storage options: RasterizedDB manages its own storage",
         },
         "RESET" => AlterAction::NoOp {
             reason: "table storage options: RasterizedDB manages its own storage",
         },
+        "RECOMPRESS" if rest.len() == 1 => AlterAction::Recompress,
         "VALIDATE" if rest_upper.get(1).map(String::as_str) == Some("CONSTRAINT") => {
             // The name read as every constraint name is (bare or quoted, cut
             // to its stored form).

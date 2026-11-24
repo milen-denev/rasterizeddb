@@ -364,6 +364,9 @@ impl Database {
             // Between the fence and the first field record that needs it.
             point(self, "after_numeric_fence").map_err(io::Error::other)?;
         }
+        if crate::core::rql::type_modifier::declares_compression(&create.type_modifiers) {
+            self.require_compressed_values()?;
+        }
         let columns = std::mem::take(&mut create.columns);
         let seed = self.seed_of(&create.table_name).await;
         let mut table =

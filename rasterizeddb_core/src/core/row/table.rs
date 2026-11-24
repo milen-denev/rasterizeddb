@@ -5060,7 +5060,7 @@ impl<S: StorageIO> Table<S> {
             row_write.columns_writing_data.len()
         );
 
-        let result = RowPointer::write_row_with_pointer_record_pos(
+        let result = RowPointer::write_row_with_pointer_record_pos_compressed(
             d.io_pointers.clone(),
             d.io_rows.clone(),
             &d.ids.last_row_id,
@@ -5069,6 +5069,8 @@ impl<S: StorageIO> Table<S> {
             #[cfg(feature = "enable_long_row")]
             0u32,
             &row_write,
+            // The columns that store their values compressed (`core::compression`).
+            &self.schema.compression,
             None,
             Some(&d.free_space),
             None,
@@ -5142,7 +5144,7 @@ impl<S: StorageIO> Table<S> {
             }
         }
         let _id = d.ids.reserve_insert_id().await;
-        let (record_pos, mut pointer) = RowPointer::write_row_with_pointer_record_pos(
+        let (record_pos, mut pointer) = RowPointer::write_row_with_pointer_record_pos_compressed(
             d.io_pointers.clone(),
             d.io_rows.clone(),
             &d.ids.last_row_id,
@@ -5150,6 +5152,8 @@ impl<S: StorageIO> Table<S> {
             #[cfg(feature = "enable_long_row")]
             0u32,
             &row_write,
+            // The columns that store their values compressed (`core::compression`).
+            &self.schema.compression,
             None,
             // Appended, in the order read: a fresh file set has no free space.
             None,
@@ -6873,7 +6877,7 @@ impl<S: StorageIO> Table<S> {
             }
 
             let update_result = pointer
-                .update_with_pointer_record_pos(
+                .update_with_pointer_record_pos_compressed(
                     d.io_pointers.clone(),
                     d.io_rows.clone(),
                     record_pos,
@@ -6883,6 +6887,8 @@ impl<S: StorageIO> Table<S> {
                     #[cfg(feature = "enable_long_row")]
                     0u32,
                     &row_write,
+                    // The columns that store their values compressed (`core::compression`).
+                    &self.schema.compression,
                     Some(txn),
                     Some(&d.free_space),
                     written_by,

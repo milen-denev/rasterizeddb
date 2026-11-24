@@ -496,10 +496,16 @@ fn varchar_key(column: &str) -> String {
 /// here, so a renamed `timestamp(0)` column stopped rounding, a renamed
 /// `integer[]` column stopped checking its elements, and a dropped column's
 /// record held a column added later under its name.
-fn other_marker_keys(column: &str) -> [String; 2] {
+///
+/// Its compression too (`type_modifier::COMPRESSION_MARKER`): a renamed
+/// column keeps storing its values compressed, and a column added under a
+/// dropped one's name does not inherit it.
+fn other_marker_keys(column: &str) -> [String; 4] {
     [
         format!("{}{}", type_modifier::PRECISION_MARKER, column),
         format!("{}{}", type_modifier::ELEMENT_MARKER, column),
+        format!("{}{}", type_modifier::COMPRESSION_MARKER, column),
+        format!("{}{}", type_modifier::DICTIONARY_MARKER, column),
     ]
 }
 
