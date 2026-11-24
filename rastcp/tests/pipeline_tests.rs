@@ -161,11 +161,14 @@ async fn a_handle_dropped_with_answers_due_does_not_hand_them_to_the_next_reques
 async fn a_slow_answer_times_out_and_costs_the_connection() {
     bounded(async {
         let (addr, task) = serve(Duration::from_secs(30), |data| async move {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_secs(4)).await;
             data
         })
         .await;
-        let mut client = TcpClientBuilder::new(&addr).timeout(Duration::from_millis(100)).build().await.unwrap();
+        // The timeout bounds the TLS handshake too: 100 ms failed the
+        // handshake itself on a loaded Windows runner (TlsHandshakeTimeout),
+        // so the answer is made far slower than a handshake can be instead.
+        let mut client = TcpClientBuilder::new(&addr).timeout(Duration::from_secs(1)).build().await.unwrap();
 
         let mut pipeline = client.pipeline().await.unwrap();
         pipeline.send(b"slow").await.unwrap();

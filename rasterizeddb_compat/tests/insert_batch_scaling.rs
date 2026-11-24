@@ -42,9 +42,13 @@ async fn primary_key_inserts_do_not_slow_down_as_the_table_grows() {
         times.push(took);
         start += BATCH;
     }
-    let early: Duration = times[1..6].iter().sum::<Duration>() / 5;
-    let late: Duration = times[times.len() - 5..].iter().sum::<Duration>() / 5;
-    println!("5k-row batch: early {early:?}, late (at ~{ROWS} rows) {late:?}");
+    // The fastest of each window, not the mean: a batch other work on the
+    // machine slowed (another suite, a CI runner) only ever reads slower, so a
+    // mean of five failed under load (early 679 ms, late 3.0 s, at a load
+    // average of 9) while the fastest batch still shows the table's own cost.
+    let early: Duration = *times[1..6].iter().min().unwrap();
+    let late: Duration = *times[times.len() - 5..].iter().min().unwrap();
+    println!("5k-row batch, fastest of 5: early {early:?}, late (at ~{ROWS} rows) {late:?}; all {times:?}");
     // Linear growth per row would make the late batches ~60x the early ones
     // here; a per-row cost independent of the table size keeps them close.
     assert!(
