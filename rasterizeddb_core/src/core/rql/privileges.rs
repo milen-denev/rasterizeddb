@@ -299,9 +299,10 @@ pub fn is_protected_catalog(name: &str) -> bool {
 }
 
 /// The cheap first test of [`catalog_refusal`]: a statement without the
-/// bytes `rdb_` names no catalogue, and is not scanned.
+/// bytes `__rdb_` or `rdb_roles` names no catalogue, and is not scanned.
 pub fn may_name_catalog(sql: &str) -> bool {
-    crate::core::sql_scan::contains_ignore_ascii_case(sql, b"rdb_")
+    crate::core::sql_scan::contains_ignore_ascii_case(sql, b"__rdb_")
+        || crate::core::sql_scan::contains_ignore_ascii_case(sql, crate::auth::ROLE_TABLE.as_bytes())
 }
 
 fn catalog_denied(name: &str) -> Refusal {
