@@ -134,6 +134,32 @@ pub fn check_privileged(ctx: &SessionContext<'_>, verb: &str) -> Result<(), Stri
     }
 }
 
+/// The process-wide surface a `SHOW` reads, when it reads one (T2, T4):
+/// other sessions' statements and statistics, or the server's own state.
+pub fn surface_of_show(stmt: &str) -> Option<ProcessSurface> {
+    let up = stmt.trim().to_ascii_uppercase();
+    let words: Vec<&str> = up.split_whitespace().take(3).collect();
+    match words.as_slice() {
+        ["SHOW", "QUERIES", ..] | ["SHOW", "QUERY", "STATS", ..] | ["SHOW", "RECENT", ..] => Some(ProcessSurface::QueryStats),
+        ["SHOW", "BACKUP", ..]
+        | ["SHOW", "REPLICATION", ..]
+        | ["SHOW", "STORAGE", ..]
+        | ["SHOW", "CONFIG", ..]
+        | ["SHOW", "SHARDS", ..]
+        | ["SHOW", "SHARD", ..]
+        | ["SHOW", "BRANCHES", ..] => Some(ProcessSurface::Show),
+        _ => None,
+    }
+}
+
+/// The tenancy check for a process-wide `SHOW` (see [`surface_of_show`]).
+pub fn check_show(ctx: &SessionContext<'_>, stmt: &str) -> Result<(), String> {
+    match surface_of_show(stmt) {
+        Some(surface) => tenancy().may_use(ctx, surface),
+        None => Ok(()),
+    }
+}
+
 /// The databases of `names` that `ctx` may see exist (T3).
 pub fn visible_databases(ctx: &SessionContext<'_>, names: Vec<String>) -> Vec<String> {
     let policy = tenancy();

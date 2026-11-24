@@ -6773,6 +6773,17 @@ async fn process_native_request_for(
             return error_response(&e);
         }
     }
+    if crate::core::policy_hooks::installed() {
+        let ctx = crate::core::policy_hooks::SessionContext {
+            role: &principal.user,
+            database: &context.database.name,
+            protocol: "native",
+            superuser: principal.superuser,
+        };
+        if let Err(e) = crate::core::policy_hooks::check_show(&ctx, &query) {
+            return error_response(&e);
+        }
+    }
 
     // A transaction block needs a session that holds it between requests;
     // a caller with none (an embedding that serves requests without
