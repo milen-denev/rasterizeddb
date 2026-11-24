@@ -1179,7 +1179,7 @@ mod tests {
                 target: Target::Tables(vec!["t".into()]),
                 grantees: vec!["app".into()],
                 grant_option_only: false,
-                cascade: false,
+                cascade: true,
             }
         );
         assert_eq!(
@@ -1211,7 +1211,11 @@ mod tests {
             PrivilegeStatement::OwnerTo { relation: "t".into(), owner: "app".into() }
         );
         assert!(parse_privilege_statement("ALTER TABLE t ADD COLUMN x INT").is_none());
-        assert!(parse_privilege_statement("GRANT SELECT (a) ON t TO app").unwrap().is_err());
+        // Column privileges are read now (R2), not refused.
+        assert!(matches!(
+            parse_privilege_statement("GRANT SELECT (a) ON t TO app").unwrap().unwrap(),
+            PrivilegeStatement::Grant { ref privileges, .. } if privileges == &vec!["SELECT(a)".to_string()]
+        ));
     }
 
     #[test]

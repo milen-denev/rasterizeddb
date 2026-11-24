@@ -6777,7 +6777,7 @@ async fn process_native_request_for(
                     if let Err(e) =
                         crate::auth::role_statement_permitted(&context.database, &principal.user, &statement, None).await
                     {
-                        return error_response(&e);
+                        return error_response(&format!("permission denied: {} is not a superuser ({e})", principal));
                     }
                 }
 

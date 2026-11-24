@@ -120,3 +120,38 @@ impl TenancyPolicy for StrictTenancy {
         ctx.superuser && ctx.database == self.operator_database
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strict(config: &str) -> StrictTenancy {
+        let cfg = crate::EnterpriseConfig::parse(config).unwrap();
+        StrictTenancy {
+            outbound_hosts: cfg.outbound_hosts.clone(),
+            operator_database: cfg.operator_database.clone(),
+            limits: cfg.limits.clone(),
+            directory: crate::tenants::Directory::open(None).unwrap(),
+        }
+    }
+
+    #[test]
+    fn t9_outbound_hosts_hold_connections_to_the_list() {
+        let open = strict("tenant_mode strict");
+        assert!(open.may_connect("anywhere.example", 5432).is_ok(), "no list: nothing held back");
+        let held = strict("tenant_mode strict\noutbound_hosts pg.internal s3.example:9000 *.amazonaws.com");
+        assert!(held.may_connect("pg.internal", 5432).is_ok());
+        assert!(held.may_connect("PG.Internal.", 5432).is_ok(), "case and a trailing dot");
+        assert!(held.may_connect("s3.example", 9000).is_ok());
+        assert!(held.may_connect("s3.example", 443).is_err(), "the port is part of that entry");
+        assert!(held.may_connect("bucket.s3.amazonaws.com", 443).is_ok());
+        assert!(held.may_connect("amazonaws.com.evil.example", 443).is_err());
+        assert!(held.may_connect("evilamazonaws.com", 443).is_err(), "a suffix match is per label");
+        assert!(held.may_connect("10.0.0.1", 5432).is_err());
+    }
+
+    #[test]
+    fn t8_strict_mode_never_adopts_a_directory() {
+        assert!(!strict("tenant_mode strict").may_adopt_directory());
+    }
+}

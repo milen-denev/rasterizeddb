@@ -242,3 +242,47 @@ fn meta_len(meta: &SnapshotMeta) -> usize {
     w.snapshot_meta(meta);
     w.0.len()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rasterizeddb_raft::{Config, EntryData};
+
+    fn entry(term: Term, index: Index) -> Entry {
+        Entry { term, index, data: EntryData::Command(index.to_le_bytes().to_vec()) }
+    }
+
+    fn meta(index: Index, term: Term) -> SnapshotMeta {
+        SnapshotMeta { index, term, config: Config::new([1, 2, 3]) }
+    }
+
+    #[test]
+    fn r2r3_raft_store_reopens_what_it_persisted_through_both_snapshot_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, restored) = RaftStore::open(dir.path()).unwrap();
+        assert_eq!(restored.log.last_index(), 0);
+        let entries: Vec<Entry> = (1..=6).map(|i| entry(1, i)).collect();
+        let hard = HardState { term: 1, vote: Some(2), commit: 4 };
+        store.persist_parts(None, false, None, &entries, Some(&hard)).unwrap();
+        // A conflicting suffix cut and replaced.
+        store.persist_parts(None, false, Some(5), &[entry(2, 5)], None).unwrap();
+        drop(store);
+        let (mut store, r) = RaftStore::open(dir.path()).unwrap();
+        assert_eq!(r.hard, hard);
+        assert_eq!((r.log.last_index(), r.log.term(5)), (5, Some(2)));
+
+        // A snapshot the log agrees with keeps the entries after it.
+        store.persist_parts(Some(&(meta(3, 1), vec![7; 8])), true, None, &[], None).unwrap();
+        drop(store);
+        let (mut store, r) = RaftStore::open(dir.path()).unwrap();
+        assert_eq!((r.log.snapshot_index(), r.log.last_index(), r.log.term(5)), (3, 5, Some(2)));
+        assert_eq!(r.snapshot.as_ref().map(|(m, d)| (m.index, d.len())), Some((3, 8)));
+
+        // One that replaces the log leaves nothing after it.
+        store.persist_parts(Some(&(meta(9, 3), vec![1; 4])), false, None, &[], None).unwrap();
+        store.persist_parts(None, false, None, &[entry(3, 10)], None).unwrap();
+        drop(store);
+        let (_, r) = RaftStore::open(dir.path()).unwrap();
+        assert_eq!((r.log.snapshot_index(), r.log.snapshot_term(), r.log.last_index()), (9, 3, 10));
+    }
+}
