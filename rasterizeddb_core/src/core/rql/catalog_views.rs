@@ -1832,9 +1832,10 @@ async fn build(
         "pg_database" => {
             // `datallowconn` and `datistemplate` are constants: every database
             // here accepts connections and none is a template.
+            // Strict tenant mode shows a session only its own database (T3).
             let names: Vec<String> = match catalog {
-                Some(catalog) => catalog.names(),
-                None => vec![database.name.clone()],
+                Some(catalog) if !crate::core::policy_hooks::installed() => catalog.names(),
+                _ => vec![database.name.clone()],
             };
             let rows = names
                 .iter()

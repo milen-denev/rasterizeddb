@@ -134,6 +134,12 @@ pub fn check_privileged(ctx: &SessionContext<'_>, verb: &str) -> Result<(), Stri
     }
 }
 
+/// The databases of `names` that `ctx` may see exist (T3).
+pub fn visible_databases(ctx: &SessionContext<'_>, names: Vec<String>) -> Vec<String> {
+    let policy = tenancy();
+    names.into_iter().filter(|n| policy.may_see_database(ctx, n)).collect()
+}
+
 /// Today's behaviour.
 struct Open;
 impl TenancyPolicy for Open {}
@@ -150,6 +156,11 @@ pub fn install_tenancy(policy: Box<dyn TenancyPolicy>) -> Result<(), String> {
 /// Installs the placement policy; once per process.
 pub fn install_placement(policy: Box<dyn PlacementPolicy>) -> Result<(), String> {
     PLACEMENT.set(policy).map_err(|_| "a placement policy is already installed".to_string())
+}
+
+/// Whether a licensed tenancy policy is installed (strict tenant mode).
+pub fn installed() -> bool {
+    TENANCY.get().is_some()
 }
 
 /// The tenancy policy in force.

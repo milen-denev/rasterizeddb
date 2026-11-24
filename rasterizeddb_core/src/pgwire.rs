@@ -6679,7 +6679,28 @@ where
             }
         }
         DatabaseStatement::List => {
-            let listing = state.catalog.listing();
+            // Strict tenant mode: a tenant sees its own database, and no
+            // server path (T3).
+            let ctx = crate::core::policy_hooks::SessionContext {
+                role: &state.principal.name,
+                database: &state.database_name,
+                protocol: "pgwire",
+                superuser: state.principal.superuser,
+            };
+            let policy = crate::core::policy_hooks::tenancy();
+            let admin = policy.is_process_admin(&ctx);
+            let listing: Vec<_> = state
+                .catalog
+                .listing()
+                .into_iter()
+                .filter(|e| policy.may_see_database(&ctx, &e.name))
+                .map(|mut e| {
+                    if !admin && crate::core::policy_hooks::installed() {
+                        e.location = String::new();
+                    }
+                    e
+                })
+                .collect();
             let current = state.database_name.clone();
             let fields = vec![
                 ("database_name".to_string(), DbType::STRING),

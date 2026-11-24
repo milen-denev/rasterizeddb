@@ -544,7 +544,13 @@ impl Env for Scope<'_> {
         &self.s.login.user
     }
     fn databases(&self) -> Vec<String> {
-        self.s.shared.catalog.names()
+        let ctx = crate::core::policy_hooks::SessionContext {
+            role: &self.s.login.user,
+            database: self.database_name(),
+            protocol: "tds",
+            superuser: self.s.login.superuser,
+        };
+        crate::core::policy_hooks::visible_databases(&ctx, self.s.shared.catalog.names())
     }
     fn variable(&self, name: &str) -> Option<Value> {
         self.s.vars.get(name).map(|v| v.value.clone())
