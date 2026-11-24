@@ -154,6 +154,18 @@ jobs:
             runner: windows-11-arm
             target: aarch64-pc-windows-msvc
     steps:
+      # The three suites' test binaries outgrow an ubuntu runner's free disk:
+      # compat's link died with "No space left on device" (ld bus error) on
+      # linux-x86_64 in run 45357514504. Toolchains these jobs never use go
+      # first.
+      - name: Free disk space (ubuntu)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - uses: actions/checkout@v4
 
       - uses: ./.github/actions/setup
@@ -167,6 +179,28 @@ jobs:
       # unit tests, which the step above already ran (85 minutes on Windows).
       - name: Core integration tests
         run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_core --test '*' --no-fail-fast
+
+      # The core suites' test executables are done with; compat links its own
+      # hundred-odd against the same libraries, which stay. Only test
+      # executables (`<test>-<16 hex>`, `.exe`/`.pdb` on Windows) and
+      # incremental state go: rlibs, proc macros, build scripts and their
+      # outputs are kept, so nothing recompiles. Since cargo 1.100 a test
+      # executable lands in debug/build/<package>/<hash>/out/, not
+      # debug/deps/; both are swept.
+      - name: Free the core test binaries before compat
+        if: always()
+        shell: bash
+        run: |
+          df -h . || true
+          debug="target/${{ matrix.target }}/debug"
+          for dir in "$debug"/deps "$debug"/build/rasterizeddb_core/*/out; do
+            [ -d "$dir" ] || continue
+            find "$dir" -maxdepth 1 -regextype posix-extended -type f ! -name 'build_script_*' ! -name 'build-script-*' \
+              -regex '.*/[a-z0-9_]+-[0-9a-f]{16}(\.exe|\.pdb)?' \
+              \( -name '*.exe' -o -name '*.pdb' -o -perm -u+x \) -print -delete | wc -l
+          done
+          rm -rf "$debug/incremental"
+          df -h . || true
 
       - name: Compatibility suite (PostgreSQL / MySQL / SQL Server drivers)
         run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_compat --no-fail-fast
