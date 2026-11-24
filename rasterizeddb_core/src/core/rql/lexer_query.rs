@@ -2485,6 +2485,9 @@ fn parse_select_query(
     if having_raw.is_some() && !is_grouped {
         return Err("HAVING requires an aggregate in the SELECT list".to_string());
     }
+    if let Some(text) = having_raw.as_deref() {
+        crate::core::rql::collation::refuse_in_having(text, schema)?;
+    }
 
     // Every non-aggregate select item of a grouped query must be a grouping
     // key; otherwise its value is not determined by the group.

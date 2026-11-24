@@ -52,8 +52,9 @@ not the Unicode Collation Algorithm's: `'Zoe'` sorts before `'Ännchen'`.
 
 ## Refused for now (`0A000`), rather than compared by the bytes
 
-`UNION`/`INTERSECT`/`EXCEPT` (but `UNION ALL` works), `HAVING` comparing
-such a column, `min`/`max` as a window function, a `SELECT DISTINCT` of
+`UNION`/`INTERSECT`/`EXCEPT` (but `UNION ALL` works), a `HAVING` that
+compares `min`/`max` of such a column (it compares their bytes),
+`min`/`max` as a window function, a `SELECT DISTINCT` of
 such a column beside an expression, a `CHECK` reading one, a partitioned
 table with one, a foreign key whose action would write the child's key
 (`SET NULL`, `SET DEFAULT`, `ON UPDATE CASCADE`), `ALTER COLUMN TYPE` to a

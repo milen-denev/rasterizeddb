@@ -725,6 +725,30 @@ pub fn group_by_keys(
     converted
 }
 
+/// Refuses a `HAVING` comparing `min`/`max` of a column with a
+/// nondeterministic collation: the condition compares the aggregate's
+/// bytes. (A grouping column there is moved into the WHERE, where it
+/// compares by its key.)
+pub fn refuse_in_having(having: &str, fields: &[SchemaField]) -> Result<(), String> {
+    if !any(fields) {
+        return Ok(());
+    }
+    let words = words_of_list(having);
+    for (k, w) in words.iter().enumerate() {
+        let bare = w.rsplit('.').next().unwrap_or(w);
+        let ci = fields
+            .iter()
+            .any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(bare) && !of(&f.name, fields).is_binary());
+        let before = k.checked_sub(1).map(|i| words[i].to_ascii_uppercase());
+        if ci && matches!(before.as_deref(), Some("MIN" | "MAX")) {
+            return Err(format!(
+                "HAVING over min/max of column \"{bare}\", which has a case-insensitive collation, is not supported yet"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Tells each aggregate over a column with a nondeterministic collation
 /// which one: `min`/`max` pick by its order, `count(DISTINCT …)` and the
 /// other DISTINCT aggregates keep one value per key.

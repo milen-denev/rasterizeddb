@@ -2434,7 +2434,8 @@ fn for_json(
     }
     let path = |key: &str| -> Vec<String> {
         if mode == "PATH" {
-            key.split('.').map(str::to_string).collect()
+            // A bracketed alias's dots arrive as `lex::NAME_DOT`.
+            super::lex::decode_dots(&key).split('.').map(str::to_string).collect()
         } else {
             vec![key.to_string()]
         }
@@ -3867,7 +3868,10 @@ fn rewrite_create_index(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
     let close =
         matching_paren(&tokens, open).ok_or_else(|| TsqlError::syntax("unbalanced column list"))?;
     let cols = index_columns(&tokens[open + 1..close])?;
-    if let Some(w) = find_top(&tokens, close, &["WHERE"]) {
+    // From past the column list: started on its `)`, the search ran at
+    // depth -1 and never found the WHERE, so every filtered index was built
+    // whole, a unique one refusing rows its filter left out.
+    if let Some(w) = find_top(&tokens, close + 1, &["WHERE"]) {
         // A filter only narrows which rows the index holds. Not unique, the
         // index over every row answers the same queries. Unique, a filter of
         // `k IS NOT NULL [AND …]` over key columns leaves out only rows whose
@@ -4690,11 +4694,11 @@ mod tests {
         let e = env();
         assert_eq!(
             tr(&e, "SELECT [b].[Url], [p0].[Title] FROM [Blogs] AS [b] OUTER APPLY (SELECT TOP(1) [p].[Title] FROM [Posts] AS [p] WHERE [b].[Id] = [p].[BlogId] ORDER BY [p].[Title]) AS [p0] ORDER BY [b].[Url]"),
-            r#"SELECT b.url AS "Url", p0.title AS "Title" FROM blogs AS b LEFT JOIN LATERAL (SELECT p.title AS "Title" FROM posts AS p WHERE b.id = p.blogid ORDER BY "Title" LIMIT 1) AS p0 ON 1 = 1 ORDER BY "Url""#
+            r#"SELECT b.url AS "Url", p0.title AS "Title" FROM blogs AS b LEFT JOIN LATERAL (SELECT p.title FROM posts AS p WHERE b.id = p.blogid ORDER BY p.title LIMIT 1) AS p0 ON 1 = 1 ORDER BY "Url""#
         );
         assert_eq!(
             tr(&e, "SELECT b.id, x.n FROM b CROSS APPLY (SELECT TOP 2 p.n FROM p WHERE p.b = b.id) x"),
-            r#"SELECT b.id AS "id", x.n AS "n" FROM b CROSS JOIN LATERAL (SELECT p.n AS "n" FROM p WHERE p.b = b.id LIMIT 2) x"#
+            r#"SELECT b.id, x.n FROM b CROSS JOIN LATERAL (SELECT p.n FROM p WHERE p.b = b.id LIMIT 2) x"#
         );
         // An APPLY of a function is not a subquery.
         let tokens = lex("SELECT * FROM t CROSS APPLY OPENJSON(t.j) AS o").unwrap();
@@ -4706,7 +4710,7 @@ mod tests {
         let e = env();
         assert_eq!(
             tr(&e, "SELECT x.id FROM (SELECT TOP(1) b.id FROM blogs AS b ORDER BY b.url) AS x"),
-            r#"SELECT x.id AS "id" FROM (SELECT b.id AS "id" FROM blogs AS b ORDER BY b.url LIMIT 1) AS x"#
+            r#"SELECT x.id FROM (SELECT b.id FROM blogs AS b ORDER BY b.url LIMIT 1) AS x"#
         );
     }
 
