@@ -329,7 +329,9 @@ fn rows_file_len(dir: &std::path::Path, table: &str) -> u64 {
             if path.is_dir() {
                 pending.push(path);
             } else if path.file_name().is_some_and(|f| f.to_string_lossy() == name) {
-                total += entry.metadata().unwrap().len();
+                // `fs::metadata` opens the file: on Windows a directory
+                // entry's size is stale (0) for a file the engine holds open.
+                total += std::fs::metadata(&path).unwrap().len();
             }
         }
     }
