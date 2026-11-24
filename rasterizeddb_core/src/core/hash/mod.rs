@@ -12,7 +12,9 @@
 //! index store's file checksum.
 
 pub mod crc32c;
-pub mod xxh64;
+/// XXH64 lives in `rasterizeddb_router`, so the client and the gateway hash
+/// routes with the very code the engine does.
+pub use rasterizeddb_router::xxh64;
 mod rapidhash;
 #[cfg(test)]
 mod source_tests;

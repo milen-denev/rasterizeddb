@@ -10,6 +10,9 @@ authors = ["Milen Denev"]
 description = "The RasterizedDB server and engine: a SQL database speaking the PostgreSQL, MySQL, SQL Server and native protocols, with MVCC, a write-ahead log, replication and S3 backup."
 
 [dependencies]
+# route_v1 (XXH64, key frames, the range map) and the shard map: one copy
+# shared with the client and the gateway.
+rasterizeddb_router = { path = "../rasterizeddb_router", version = "1.0.0" }
 # `AT TIME ZONE`: zone rules from the system's tz database
 # (/usr/share/zoneinfo). Already in the tree through env_logger; no bundled
 # copy where the host has one, so the server answers with the zones its host
