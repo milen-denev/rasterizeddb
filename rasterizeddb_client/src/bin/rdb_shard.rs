@@ -5,12 +5,12 @@
 //! rdb-shard show        --map MAP
 //! rdb-shard move-tenant --map MAP --out NEW_MAP --state STATE
 //!                       --key-type int|text|uuid --key VALUE --to SHARD
-//!                       --table TABLE:COLUMN [--table …] --fenced
+//!                       --table TABLE:COLUMN [--table …] --fenced|--online
 //! rdb-shard rollback    --map NEW_MAP --out MAP --state STATE
 //! rdb-shard retire      --map NEW_MAP --state STATE [--retention-hours 24] [--force]
 //! rdb-shard rebalance   --map MAP [--tolerance 0.10] [--max-moves 4] [--max-bytes N]
 //!                       [--pin LO:HI …] [--exclude SHARD …]
-//!                       [--apply --fenced --out NEW_MAP --state-dir DIR
+//!                       [--apply --fenced|--online --out NEW_MAP --state-dir DIR
 //!                        --table TABLE:COLUMN:TYPE [--table …]] [--every SECS]
 //! rdb-shard exec        --map MAP --sql SQL
 //! rdb-shard resolve     --map MAP [--home SHARD] [--grace SECS]
@@ -55,6 +55,13 @@
 //! with the tenant on its new shard (one epoch up), and writes a state file.
 //! The source rows stay until `retire` (after the retention, 24 h by
 //! default); until then `rollback` puts the tenant back.
+//!
+//! `--online` (shards only, B4.4) moves without stopping writers. The
+//! destination takes the range; the rows are copied at a snapshot; unfenced
+//! rounds bring the destination up to the source's rows until few change
+//! between two; then the source is fenced for one last round and both
+//! sides are compared before the map moves. Writes to the moving rows are
+//! held only for that last round, which the tool reports in milliseconds.
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
@@ -348,6 +355,7 @@ impl Selection {
 }
 
 /// The tenant a move names.
+#[derive(Clone)]
 struct Tenant {
     family: ShardFamily,
     text: String,
@@ -637,6 +645,13 @@ async fn move_tenant(args: &Args, options: &Options) -> std::result::Result<(), 
     }
     let Selection::Tenant(tenant) = selection else { unreachable!() };
     snapshot.rollback().await.map_err(|e| e.to_string())?;
+    if args.has("online") {
+        let filters: Vec<(String, String)> = copied
+            .iter()
+            .map(|(t, c)| Ok((t.clone(), Selection::Tenant(tenant.clone()).filter(c, "")?)))
+            .collect::<std::result::Result<_, String>>()?;
+        online_tail(&src, &dst, &filters, block, block + 1).await?;
+    }
     // Hand off: the tenant's block on the destination, one epoch up.
     let next = map.reassign(block, block + 1, to)?;
     let state = MoveState {
@@ -858,6 +873,13 @@ async fn rebalance(args: &Args, options: &Options) -> std::result::Result<(), St
             copied.push((table.clone(), format!("{column}:{key_type}")));
         }
         snapshot.rollback().await.map_err(|e| e.to_string())?;
+        if args.has("online") {
+            let filters: Vec<(String, String)> = tables
+                .iter()
+                .map(|(t, c, k)| Ok((t.clone(), selection.filter(c, k)?)))
+                .collect::<std::result::Result<_, String>>()?;
+            online_tail(&src, &dst, &filters, mv.lo, mv.hi).await?;
+        }
         let next = current.reassign(mv.lo, mv.hi, mv.to)?;
         let state = MoveState {
             fields: BTreeMap::from([
@@ -992,6 +1014,16 @@ async fn is_shard(c: &Client) -> bool {
 /// Plain servers need the operator's `--fenced`.
 async fn begin_move(args: &Args, src: &Client, dst: &Client, lo: u64, hi: u64) -> std::result::Result<bool, String> {
     let engine = is_shard(src).await && is_shard(dst).await;
+    if args.has("online") {
+        // B4.4: the destination takes the range at once and the source keeps
+        // taking writes; it is fenced only for the last difference
+        // (`online_tail`).
+        if !engine {
+            return Err("--online needs both servers to be shards (--role shard)".to_string());
+        }
+        dst.run(&format!("SHARD TAKE RANGE {lo:#x} {hi:#x}")).await.map_err(|e| format!("taking the range on the destination: {e}"))?;
+        return Ok(true);
+    }
     if engine {
         src.run(&format!("SHARD FENCE RANGE {lo:#x} {hi:#x}")).await.map_err(|e| format!("fencing the source: {e}"))?;
         if let Err(e) = dst.run(&format!("SHARD TAKE RANGE {lo:#x} {hi:#x}")).await {
@@ -1004,6 +1036,117 @@ async fn begin_move(args: &Args, src: &Client, dst: &Client, lo: u64, hi: u64) -
             .to_string());
     }
     Ok(engine)
+}
+
+/// How many changed rows an unfenced round may still find before the
+/// source is fenced for the last one.
+const ONLINE_CONVERGED: u64 = 256;
+/// At most this many unfenced rounds; a source changing faster than a round
+/// copies is fenced anyway.
+const ONLINE_ROUNDS: usize = 8;
+
+/// An online move's tail (B4.4), after the snapshot copy: unfenced rounds
+/// that bring the destination up to the source's moving rows until few
+/// change between two, then the source fenced for the last round, and
+/// both sides' rows compared. The fence holds only for that last round.
+async fn online_tail(src: &Client, dst: &Client, tables: &[(String, String)], lo: u64, hi: u64) -> std::result::Result<(), String> {
+    for round in 1..=ONLINE_ROUNDS {
+        let mut changed = 0;
+        for (table, filter) in tables {
+            changed += sync_table(src, dst, table, filter).await?;
+        }
+        println!("online round {round}: {changed} rows brought up to date");
+        if changed <= ONLINE_CONVERGED {
+            break;
+        }
+    }
+    let started = std::time::Instant::now();
+    src.run(&format!("SHARD FENCE RANGE {lo:#x} {hi:#x}")).await.map_err(|e| format!("fencing the source: {e}"))?;
+    let finish = async {
+        let mut changed = 0;
+        for (table, filter) in tables {
+            changed += sync_table(src, dst, table, filter).await?;
+            let cols = columns(src, table).await.map_err(|e| e.to_string())?;
+            let sql = select_sql(table, &cols, filter)?;
+            let a = digest(&src.run(&sql).await.map_err(|e| e.to_string())?, cols.len()).map_err(|e| e.to_string())?;
+            let b = digest(&dst.run(&sql).await.map_err(|e| e.to_string())?, cols.len()).map_err(|e| e.to_string())?;
+            if a != b {
+                return Err(format!("{table}: the copy does not verify after the fenced round ({a:?} against {b:?})"));
+            }
+        }
+        Ok::<u64, String>(changed)
+    };
+    match finish.await {
+        Ok(changed) => {
+            println!("fenced round: {changed} rows, writes held {} ms", started.elapsed().as_millis());
+            Ok(())
+        }
+        Err(e) => {
+            let _ = src.run(&format!("SHARD UNFENCE RANGE {lo:#x} {hi:#x}")).await;
+            Err(e)
+        }
+    }
+}
+
+/// Makes the destination's rows of `table` under `filter` equal to the
+/// source's, as a multiset of whole rows (a table needs no primary key):
+/// surplus copies deleted by matching every column, missing ones inserted.
+/// Returns how many rows changed.
+async fn sync_table(src: &Client, dst: &Client, table: &str, filter: &str) -> std::result::Result<u64, String> {
+    let cols = columns(src, table).await.map_err(|e| format!("{table}: {e}"))?;
+    let sql = select_sql(table, &cols, filter)?;
+    let read = |rows: rasterizeddb_client::Rows| -> std::result::Result<BTreeMap<String, (Vec<Value>, i64)>, String> {
+        let mut out: BTreeMap<String, (Vec<Value>, i64)> = BTreeMap::new();
+        for r in rows.iter() {
+            let vals: Vec<Value> = (0..cols.len()).map(|i| r.get::<Value>(i)).collect::<Result<_>>().map_err(|e| e.to_string())?;
+            let key: String = vals.iter().map(|v| format!("{v:?}\u{1f}")).collect();
+            out.entry(key).or_insert_with(|| (vals, 0)).1 += 1;
+        }
+        Ok(out)
+    };
+    let want = read(src.run(&sql).await.map_err(|e| format!("{table} on the source: {e}"))?)?;
+    let have = read(dst.run(&sql).await.map_err(|e| format!("{table} on the destination: {e}"))?)?;
+    let quoted = rasterizeddb_client::quote_ident(table).map_err(|e| e.to_string())?;
+    let mut changed = 0u64;
+    let tx = dst.begin().await.map_err(|e| e.to_string())?;
+    let keys: std::collections::BTreeSet<&String> = want.keys().chain(have.keys()).collect();
+    for key in keys {
+        let w = want.get(key).map_or(0, |(_, n)| *n);
+        let h = have.get(key).map_or(0, |(_, n)| *n);
+        if w == h {
+            continue;
+        }
+        let vals = &want.get(key).or(have.get(key)).expect("in one of them").0;
+        // Every copy of the row out, then as many in as the source has.
+        if h > 0 {
+            let mut pred = Vec::new();
+            for (c, v) in cols.iter().zip(vals) {
+                let qc = rasterizeddb_client::quote_ident(c).map_err(|e| e.to_string())?;
+                if matches!(v, Value::Null) {
+                    pred.push(format!("{qc} IS NULL"));
+                } else {
+                    pred.push(rasterizeddb_client::render_dyn(&format!("{qc} = $1"), &[v as &dyn ToSql]).map_err(|e| e.to_string())?);
+                }
+            }
+            let mut del = format!("DELETE FROM {quoted} WHERE {}", pred.join(" AND "));
+            if !filter.is_empty() {
+                del.push_str(&format!(" AND ({filter})"));
+            }
+            tx.run(&del).await.map_err(|e| format!("{table} on the destination: {e}"))?;
+        }
+        if w > 0 {
+            let col_list = cols.iter().map(|c| rasterizeddb_client::quote_ident(c)).collect::<Result<Vec<_>>>().map_err(|e| e.to_string())?.join(", ");
+            let placeholders: Vec<String> = (1..=vals.len()).map(|i| format!("${i}")).collect();
+            let params: Vec<&dyn ToSql> = vals.iter().map(|v| v as &dyn ToSql).collect();
+            let tuple = rasterizeddb_client::render_dyn(&format!("({})", placeholders.join(", ")), &params).map_err(|e| e.to_string())?;
+            for _ in 0..w {
+                tx.run(&format!("INSERT INTO {quoted} ({col_list}) VALUES {tuple}")).await.map_err(|e| format!("{table} into the destination: {e}"))?;
+            }
+        }
+        changed += (w - h).unsigned_abs().max(1) as u64;
+    }
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(changed)
 }
 
 /// After a verified copy, on shards: the new map installed on both, the
