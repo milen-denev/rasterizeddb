@@ -86,7 +86,7 @@ D1 and D6.
 |---|---|---|
 | D1 | Which ceiling are we buying for? Sharding pays off only above one node's commit rate, RAM or disk. The current consumers (pms at ~10M rows and 40–50K tenants; Kostas) are far below that. | Build **Track A** now and gate Track B on a measured need (§7). |
 | D2 | Which clients Track A covers | The native client gets the router. sqlx apps (pms) use the shared routing crate and an app-level `pool_for(key)`, documented with an example, not productised. |
-| D3 | Phase 3 consensus | **openraft pinned to an exact version** behind `sharding_raft`, as the design argues. A home-grown Raft reproduces the classic bugs. This is a new third-party crate in a tree that hand-rolls its infrastructure, so it is the owner's call. |
+| D3 | Phase 3 consensus | **Decided 2026-11-24: our own Raft**, no third-party crate. It is held to the plan's correctness bar: the power-loss harness on every log and vote write, a deterministic simulation (seeded network partitions, reorderings, crashes) checking election safety, log matching and state-machine safety, and no merge until that runs clean |
 | D4 | Default feature list | Follow the convention: `sharding` and the client's `sharding` go in `default`, dormant until configured. `sharding_raft` and `sharding_2pc` join `default` only once each phase meets its gate. |
 | D5 | Persistent index default | Flip `index_snapshot.index_storage` to `snapshot` before phase 3. Follower apply and relocation depend on a cheap reopen. |
 | D6 | Where Track B stops | Phase **1c** gives write scale-out without HA. Phase **3** is the first production topology for a large target. Decide this before B1a starts, because phases 1–2 alone have no replicas. |
@@ -95,6 +95,7 @@ D1 and D6.
 | D9 | User-based routing (G11) | **Decided 2026-11-23:** two paths only. Key sharding (`shard_by`, routed by client or gateway) and per-user shards (login → one shard, locked). The earlier `user_key` mode, a login carrying a key into key sharding, is dropped. `user_routing = off` by default |
 | D10 | Licensing | **Decided 2026-11-23:** only the service and enterprise features are dual-licensed: `tenant_isolation`, `segregation_policies` and G11 user routing, in their engine and gateway parts. Everything else stays GPL-3.0-only: the engine, partitioning, sharding, `rasterizeddb_router`, the gateway's routing, the client/ORM, R-ALL replication, and the T0 security fixes. Under the dual licence, an organisation with more than 100 employees, more than 1 million in revenue or more than 5 million in assets must obtain a licence from **Denev Operations EOOD**. The layout this needs is in §10 |
 | D11 | HA for customer databases | **Decided 2026-11-23:** replication covers **every database in an instance, any number of them**, not only the default one. The work items are in §4.10 (R-ALL) |
+| D10b | Licence of the licensed crates | **Decided 2026-11-24: PolyForm Small Business 1.0.0**, adapted by the owner's lawyer to D10's thresholds (more than 100 employees, 1 million revenue or 5 million assets; the stock text has a people and revenue limit only, and no currency). The rest of the tree stays GPL-3.0-only |
 | D12 | Are the dual-licensed features in the default build? | **No (recommended).** They break the "default all features" rule on purpose: the default binary and images stay pure GPL, and a separate `enterprise` build (binary, Docker tag, package) carries them. Then nobody runs licensed code without choosing to |
 
 ## 2. Cargo features
@@ -118,7 +119,7 @@ The convention, from [[new-features-behind-cargo-features]] and
 | **`rasterizeddb_enterprise`** (new crate, **dual-licensed**) | `tenant_isolation`, `segregation_policies` | T1–T10, `CREATE TENANT`, the tenant directory, shard labels, placement policies, the placement audit. Depends on `rasterizeddb_core` and implements its hooks | none | not in default (D12) |
 | **`rasterizeddb_gateway_enterprise`** (new crate, **dual-licensed**) | `user_routing`, `tenant_isolation`, `segregation` | G11, `tenancy = database`, gateway label checks. Depends on `rasterizeddb_gateway`'s hook traits, never on core | none | not in default (D12) |
 | **`rasterizeddb_server`** (new binary crate, GPL) | `enterprise` = `["dep:rasterizeddb_enterprise"]` | today's `rasterizeddb_core/src/main.rs`, moved, with its binary still named `rasterizeddb_core` so deploy scripts, Docker and the Arch package keep working. With `enterprise`, it installs the licensed hooks at startup | — | `enterprise` off by default |
-| `rasterizeddb_core` | `sharding_raft` = `["sharding", "dep:openraft"]` | phase 3: log store, state machine, capture sink, apply loop, ReadIndex, learners | `openraft` (exact pin) | after phase 3's gate |
+| `rasterizeddb_core` | `sharding_raft` = `["sharding"]` | phase 3: our own Raft (D3), log store, state machine, capture sink, apply loop, ReadIndex, learners | none | after phase 3's gate |
 | `rasterizeddb_core` | `sharding_2pc` = `["sharding_raft"]` | phase 5: Prepared outcome writers, `__dist_txn`, the recovery driver | none | after phase 5's gate |
 
 **Rules that keep the features honest:**
