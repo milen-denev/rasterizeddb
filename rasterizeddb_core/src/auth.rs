@@ -1651,15 +1651,25 @@ async fn drop_role_privileges(
     let rows = privileges::load(database, tx).await?;
     let owned: Vec<&str> = rows
         .iter()
-        .filter(|r| r.privilege == "OWNER" && !r.relation.starts_with('@') && names.contains(&r.grantee))
+        // Every object's OWNER row: a function's, a type's or a domain's
+        // (`@kind:name`) too. Skipped, a role owning only a function was
+        // dropped and left it owned by no one.
+        .filter(|r| r.privilege == "OWNER" && names.contains(&r.grantee))
         .map(|r| r.relation.as_str())
         .collect();
     if !owned.is_empty() {
-        let mut listed: Vec<&str> = owned.iter().take(10).copied().collect();
+        let mut listed: Vec<String> = owned
+            .iter()
+            .take(10)
+            .map(|o| match o.strip_prefix('@').and_then(|k| k.split_once(':')) {
+                Some((kind, object)) => format!("{kind} {object}"),
+                None => o.to_string(),
+            })
+            .collect();
         listed.sort_unstable();
         return Err(format!(
             "role \"{name}\" cannot be dropped because some objects depend on it: it owns {}{}; \
-             ALTER … OWNER TO another role first",
+             REASSIGN OWNED BY or ALTER … OWNER TO another role first",
             listed.join(", "),
             if owned.len() > listed.len() { ", …" } else { "" }
         ));
