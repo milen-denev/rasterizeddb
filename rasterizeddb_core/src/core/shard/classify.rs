@@ -122,7 +122,37 @@ fn complex(database: &Database, t: &str) -> RouteTemplate {
 /// `names` (qualified or not), on either side.
 fn keyed_placeholder(t: &str, names: &[String]) -> Option<u16> {
     let b = t.as_bytes();
-    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'"';
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'"' || c == b'$';
+    let name_of = |x: &str| x.rsplit('.').next().unwrap_or(x).trim_matches('"').to_ascii_lowercase();
+    // `$k`, `$k::type`: the placeholder's number.
+    let ph = |x: &str| {
+        let x = x.split("::").next().unwrap_or(x);
+        x.strip_prefix('$').and_then(|d| d.parse::<u16>().ok()).filter(|&k| k >= 1)
+    };
+    // The operand that ends at `end` (going left) and the one that starts
+    // at `start` (going right), whitespace of any kind skipped.
+    let left_of = |end: usize| {
+        let mut l = end;
+        while l > 0 && b[l - 1].is_ascii_whitespace() {
+            l -= 1;
+        }
+        let le = l;
+        while l > 0 && (is_ident(b[l - 1]) || b[l - 1] == b':') {
+            l -= 1;
+        }
+        &t[l..le]
+    };
+    let right_of = |start: usize| {
+        let mut r = start;
+        while r < b.len() && b[r].is_ascii_whitespace() {
+            r += 1;
+        }
+        let rs = r;
+        while r < b.len() && (is_ident(b[r]) || b[r] == b':') {
+            r += 1;
+        }
+        &t[rs..r]
+    };
     let mut i = 0;
     while i < b.len() {
         if let Some(end) = skip_quoted(b, i)
@@ -131,29 +161,9 @@ fn keyed_placeholder(t: &str, names: &[String]) -> Option<u16> {
             i = end.max(i + 1);
             continue;
         }
+        // `col = $k` and `$k = col`.
         if b[i] == b'=' && b.get(i + 1) != Some(&b'=') && i > 0 && !matches!(b[i - 1], b'<' | b'>' | b'!') {
-            // left operand
-            let mut l = i;
-            while l > 0 && b[l - 1] == b' ' {
-                l -= 1;
-            }
-            let le = l;
-            while l > 0 && is_ident(b[l - 1]) {
-                l -= 1;
-            }
-            let left = &t[l..le];
-            // right operand
-            let mut r = i + 1;
-            while r < b.len() && b[r] == b' ' {
-                r += 1;
-            }
-            let rs = r;
-            while r < b.len() && (is_ident(b[r]) || b[r] == b'$') {
-                r += 1;
-            }
-            let right = &t[rs..r];
-            let name_of = |x: &str| x.rsplit('.').next().unwrap_or(x).trim_matches('"').to_ascii_lowercase();
-            let ph = |x: &str| x.strip_prefix('$').and_then(|d| d.parse::<u16>().ok()).filter(|&k| k >= 1);
+            let (left, right) = (left_of(i), right_of(i + 1));
             if let Some(k) = ph(right)
                 && names.contains(&name_of(left))
             {
@@ -165,12 +175,29 @@ fn keyed_placeholder(t: &str, names: &[String]) -> Option<u16> {
                 return Some(k);
             }
         }
+        // `col IN ($k)`: one value, one shard.
+        if (b[i] == b'I' || b[i] == b'i')
+            && b.get(i + 1).is_some_and(|c| c.eq_ignore_ascii_case(&b'N'))
+            && i > 0
+            && b[i - 1].is_ascii_whitespace()
+            && b.get(i + 2).is_some_and(|c| c.is_ascii_whitespace() || *c == b'(')
+        {
+            let col = left_of(i);
+            let rest = t[i + 2..].trim_start();
+            if let Some(inner) = rest.strip_prefix('(')
+                && let Some(close) = inner.find(')')
+                && !inner[..close].contains(',')
+                && let Some(k) = ph(inner[..close].trim())
+                && names.contains(&name_of(col))
+            {
+                return Some(k);
+            }
+        }
         i += 1;
     }
     None
 }
 
-/// Whether any identifier outside quotes names a partitioned relation.
 /// Whether `t` names a global table (a plain, unsharded one) that is not
 /// a reference table.
 fn mentions_global(database: &Database, t: &str) -> bool {
@@ -187,6 +214,7 @@ fn writes_reference(database: &Database, table: &str) -> bool {
     matches!(database.relation(table), Some(Relation::Plain(_))) && super::reference::is_reference(&database.name, table)
 }
 
+/// Whether any identifier outside quotes names a partitioned relation.
 fn mentions_partitioned(database: &Database, t: &str) -> bool {
     words(t).into_iter().any(|w| matches!(database.relation(&w), Some(Relation::Partitioned(_))))
 }
@@ -679,5 +707,24 @@ fn probe(pt: &crate::core::partition::table::PartitionedTable, source: Source, f
         }
         (Route::All, _) => Probed::NoKey,
         _ => Probed::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod b48_tests {
+    use super::keyed_placeholder;
+
+    #[test]
+    fn b48_a_key_compared_anywhere_routes_the_statement() {
+        let keys = vec!["tenant_id".to_string()];
+        let k = |t: &str| keyed_placeholder(t, &keys);
+        assert_eq!(k("SELECT * FROM a JOIN b ON a.tenant_id = b.tenant_id WHERE a.tenant_id = $2"), Some(2));
+        assert_eq!(k("SELECT * FROM a WHERE $1 = a.tenant_id"), Some(1), "placeholder first");
+        assert_eq!(k("SELECT * FROM a WHERE a.tenant_id\n\t=\n$3"), Some(3), "any whitespace");
+        assert_eq!(k("SELECT * FROM a WHERE a.tenant_id = $1::bigint"), Some(1), "a cast");
+        assert_eq!(k("SELECT * FROM a WHERE a.tenant_id IN ($4)"), Some(4), "one-value IN");
+        assert_eq!(k("SELECT * FROM a WHERE a.tenant_id IN ($1, $2)"), None, "two values may be two shards");
+        assert_eq!(k("SELECT * FROM a WHERE a.other = $1"), None);
+        assert_eq!(k("SELECT * FROM a WHERE a.tenant_id >= $1"), None, "a range is not one key");
     }
 }
