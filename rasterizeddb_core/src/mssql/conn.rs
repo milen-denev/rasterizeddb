@@ -209,6 +209,9 @@ struct Session {
     bulk_target: Option<String>,
     /// This connection, as the owner of its `sp_getapplock` locks.
     conn_id: u64,
+    /// The database the login named, as it named it: a pooled connection's
+    /// reset goes back to it, as SQL Server's does after a `USE`.
+    login_shown: String,
 }
 
 impl Drop for Session {
@@ -287,6 +290,7 @@ pub(crate) async fn serve_connection(
         fmtonly: false,
         bulk_target: None,
         conn_id,
+        login_shown: shown.clone(),
     };
     let packet_size = match login_packet.packet_size {
         0 => tds::DEFAULT_PACKET,
@@ -867,6 +871,15 @@ impl Session {
         self.error_number = 0;
         if !self.bridge().in_block() {
             let _ = self.silent("RESET ALL").await;
+            let login_db = resolve_database(&self.shared, &self.login_shown);
+            let old = self.bridge().database_name.clone();
+            if old != login_db && self.shared.catalog.get(&login_db).is_some() {
+                self.prepared.clear();
+                if self.open(&login_db).await.is_ok() {
+                    let shown = self.login_shown.clone();
+                    tds::env_change_text(self.wire.reply(), 1, &shown, &old);
+                }
+            }
         }
     }
 
