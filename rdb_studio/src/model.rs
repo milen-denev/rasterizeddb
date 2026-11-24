@@ -372,12 +372,20 @@ pub fn storage_is_durable(kind: &str) -> bool {
     !matches!(kind, "memory" | "kv-memory" | "temporary" | "file-unlogged")
 }
 
-/// A role the server knows: who can log in, and who can do everything.
+/// A role the server knows: who can log in, who can do everything, what
+/// else it may do, and the roles it is a member of.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoleInfo {
     pub name: String,
     pub can_login: bool,
     pub superuser: bool,
+    pub create_db: bool,
+    pub create_role: bool,
+    pub bypass_rls: bool,
+    /// `-1`: no limit.
+    pub conn_limit: i64,
+    pub valid_until: Option<String>,
+    pub member_of: Vec<String>,
 }
 
 /// A column of a table.

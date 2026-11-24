@@ -1,10 +1,9 @@
 //! Who may connect: the server's roles.
 //!
-//! What either server does here, and nothing it does not: create a role,
-//! set its password, drop it. RasterizedDB has no `GRANT` yet, so a role is
-//! either a superuser or not, and the page says so rather than offering
-//! privileges it cannot store. A role's password hash is never read: a
-//! console has no use for it.
+//! What either server does here: create a role, set its password, drop it,
+//! and see what each may do (its attributes) and whose member it is.
+//! Privileges are granted with GRANT in the query editor. A role's password
+//! hash is never read: a console has no use for it.
 
 use iced::widget::{Space, column, container, row, text};
 use iced::{Center, Element, Fill, Length};
@@ -19,7 +18,8 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
     let layout = super::GridLayout::new(studio, "roles");
     let specs = vec![
         super::GridColumn::new("name", "ROLE", 240.0),
-        super::GridColumn::new("flags", "", 200.0).unsortable(),
+        super::GridColumn::new("flags", "", 330.0).unsortable(),
+        super::GridColumn::new("member_of", "MEMBER OF", 200.0).unsortable(),
         super::GridColumn::new("actions", "", 190.0).unsortable(),
     ];
     let widths = super::column_widths(&layout, &specs);
@@ -39,6 +39,21 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
         } else {
             super::pill("NO LOGIN", theme::TEXT_FAINT)
         });
+        if role.create_role && !role.superuser {
+            flags = flags.push(super::pill("CREATEROLE", theme::TEXT_DIM));
+        }
+        if role.create_db && !role.superuser {
+            flags = flags.push(super::pill("CREATEDB", theme::TEXT_DIM));
+        }
+        if role.bypass_rls && !role.superuser {
+            flags = flags.push(super::pill("BYPASSRLS", theme::RUST));
+        }
+        if role.conn_limit >= 0 {
+            flags = flags.push(super::pill(&format!("≤{} CONN", role.conn_limit), theme::TEXT_FAINT));
+        }
+        if role.valid_until.is_some() {
+            flags = flags.push(super::pill("EXPIRES", theme::TEXT_FAINT));
+        }
         if role.name == current {
             flags = flags.push(super::pill("YOU", theme::OK));
         }
@@ -66,6 +81,7 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
             vec![
                 super::grid_cell(role.name.clone(), false, theme::TEXT),
                 container(flags).padding([3, 6]).into(),
+                super::grid_cell(role.member_of.join(", "), false, theme::TEXT_DIM),
                 container(
                     row![
                         small_button("PASSWORD", Some(Message::RolePassword(role.name.clone()))),
@@ -108,13 +124,11 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
     .align_y(Center);
 
     let note = match studio.flavor() {
-        Flavor::Rasterized => {
-            "RasterizedDB has no GRANT yet: a role logs in with full access to what it reads and \
-             writes, and only a superuser administers the server (configuration, storage, roles)."
-        }
-        Flavor::Postgres => {
-            "Privileges on tables are granted with GRANT in the query editor; this page creates, \
-             re-passwords and drops roles."
+        Flavor::Rasterized | Flavor::Postgres => {
+            "Privileges on tables, columns, sequences and functions, role membership, default \
+             privileges and row-level security policies are set with GRANT, ALTER DEFAULT \
+             PRIVILEGES and CREATE POLICY in the query editor; this page creates, re-passwords and \
+             drops roles, and shows what each may do."
         }
     };
 

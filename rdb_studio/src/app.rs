@@ -3890,7 +3890,15 @@ impl Studio {
         let Some(session) = self.session.clone() else { return Task::none() };
         let sql = dialect::roles_sql(session.flavor);
         Task::perform(
-            async move { session.query(sql).await.map(|g| dialect::parse_roles(&g)) },
+            async move {
+                let roles = dialect::parse_roles(&session.query(sql).await?);
+                // Memberships are an addition: a server without them still
+                // lists its roles.
+                Ok(match session.query(dialect::memberships_sql()).await {
+                    Ok(grid) => dialect::add_memberships(roles, &grid),
+                    Err(_) => roles,
+                })
+            },
             Message::RolesLoaded,
         )
     }

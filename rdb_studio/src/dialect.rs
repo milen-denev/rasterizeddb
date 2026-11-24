@@ -204,16 +204,43 @@ pub fn kv_describe_sql(key: &str) -> String {
 /// and a hash on screen is a hash in a screenshot.
 pub fn roles_sql(flavor: Flavor) -> &'static str {
     match flavor {
+        // `pg_roles`, as on PostgreSQL: the role catalogue itself is no
+        // client's to read (it holds the verifiers), and `pg_roles` has
+        // every attribute.
         Flavor::Rasterized => {
-            "SELECT name, can_login, is_superuser FROM rdb_roles ORDER BY name"
+            "SELECT rolname AS name, rolcanlogin AS can_login, rolsuper AS is_superuser, \
+             rolcreatedb AS create_db, rolcreaterole AS create_role, rolbypassrls AS bypass_rls, \
+             rolconnlimit AS conn_limit, rolvaliduntil AS valid_until FROM pg_roles ORDER BY rolname"
         }
         // The predefined `pg_*` roles are PostgreSQL's own and cannot be
         // dropped or logged in as.
         Flavor::Postgres => {
-            "SELECT rolname AS name, rolcanlogin AS can_login, rolsuper AS is_superuser \
+            "SELECT rolname AS name, rolcanlogin AS can_login, rolsuper AS is_superuser, \
+             rolcreatedb AS create_db, rolcreaterole AS create_role, rolbypassrls AS bypass_rls, \
+             rolconnlimit AS conn_limit, rolvaliduntil AS valid_until \
              FROM pg_roles WHERE rolname NOT LIKE 'pg\\_%' ORDER BY rolname"
         }
     }
+}
+
+/// Every membership, `(member, role)`, on both servers.
+pub fn memberships_sql() -> &'static str {
+    "SELECT m.rolname AS member, g.rolname AS role FROM pg_auth_members a \
+     JOIN pg_roles m ON m.oid = a.member JOIN pg_roles g ON g.oid = a.roleid"
+}
+
+/// `roles` with the memberships [`memberships_sql`] listed filled in.
+pub fn add_memberships(mut roles: Vec<RoleInfo>, grid: &Grid) -> Vec<RoleInfo> {
+    for row in 0..grid.rows.len() {
+        let (Some(member), Some(role)) = (grid.value(row, "member"), grid.value(row, "role")) else { continue };
+        if let Some(r) = roles.iter_mut().find(|r| r.name == member) {
+            r.member_of.push(role.to_string());
+        }
+    }
+    for r in &mut roles {
+        r.member_of.sort();
+    }
+    roles
 }
 
 pub fn parse_roles(grid: &Grid) -> Vec<RoleInfo> {
@@ -223,6 +250,12 @@ pub fn parse_roles(grid: &Grid) -> Vec<RoleInfo> {
                 name: grid.value(row, "name")?.to_string(),
                 can_login: grid.flag(row, "can_login").unwrap_or(false),
                 superuser: grid.flag(row, "is_superuser").unwrap_or(false),
+                create_db: grid.flag(row, "create_db").unwrap_or(false),
+                create_role: grid.flag(row, "create_role").unwrap_or(false),
+                bypass_rls: grid.flag(row, "bypass_rls").unwrap_or(false),
+                conn_limit: grid.value(row, "conn_limit").and_then(|v| v.trim().parse().ok()).unwrap_or(-1),
+                valid_until: grid.value(row, "valid_until").map(str::to_string),
+                member_of: Vec::new(),
             })
         })
         .collect()
