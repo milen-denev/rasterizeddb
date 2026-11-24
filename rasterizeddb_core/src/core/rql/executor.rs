@@ -22266,6 +22266,9 @@ pub(crate) async fn insert_loaded_row(
 
 #[inline]
 fn note_write(database: &Arc<Database>, tx: TxId, depth: usize, sql: &str, table: Option<&str>) {
+    if table.is_some_and(|t| t == crate::core::rql::privileges::ACL_TABLE) {
+        crate::core::rql::privileges::note_catalogue_write(database.id, tx);
+    }
     if depth == 0 {
         database.replication.note_statement(tx, sql, table);
         // A shard's Raft group carries schema changes as statements, in

@@ -494,6 +494,12 @@ mod cache {
     }
 }
 
+/// A write to the permission catalogue made outside this module (a
+/// replicated statement): the cache treats it as its own.
+pub fn note_catalogue_write(database: u64, tx: TxId) {
+    cache::wrote(database, Some(tx));
+}
+
 fn run(
     database: &Arc<Database>,
     sql: &str,
