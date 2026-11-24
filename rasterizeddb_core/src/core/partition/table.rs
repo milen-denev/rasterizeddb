@@ -1087,6 +1087,20 @@ fn initial_layout(n: u32) -> io::Result<(RangeMap, Vec<u32>)> {
     Ok((RangeMap::initial(n).map_err(bad)?, Vec::new()))
 }
 
+/// Whether the running statement is one shard's part of a fan-out
+/// (`cancel::SessionCancel::fan_out_part`).
+fn fan_out_part() -> bool {
+    #[cfg(feature = "sharding")]
+    {
+        crate::pgwire::current_session_cancel()
+            .is_some_and(|s| s.fan_out_part.load(std::sync::atomic::Ordering::Acquire))
+    }
+    #[cfg(not(feature = "sharding"))]
+    {
+        false
+    }
+}
+
 impl PartitionedTable {
     /// Writes a new table's map log (`HEADER`, `LOCATIONS` with the root,
     /// `PLACE` of [`initial_layout`], and on a shard a `RELEASE_SPAN` per
@@ -1875,7 +1889,7 @@ impl PartitionedTable {
             // shard owns (a gateway's fan-out sends it to every shard and
             // combines the answers); one whose key reaches another shard's
             // range is refused before anything is read (B1a.4).
-            if slot.foreign && matches!(route, Route::All) {
+            if slot.foreign && matches!(route, Route::All) && fan_out_part() {
                 continue;
             }
             slot.refuse_foreign(&self.name)?;

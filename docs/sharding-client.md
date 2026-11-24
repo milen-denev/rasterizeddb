@@ -213,3 +213,13 @@ Hash the Rust value under the column's family: an integer column takes
 `KeyValue::Int`, whatever its width, and a text column takes
 `KeyValue::Text`. The server coerces a bound parameter to the column's type,
 so this matches what the engine stores.
+
+## Against `--role shard` servers
+
+A server started as a shard refuses a read with no route key (`RDB02`),
+because inside a routed statement it would silently miss every other
+shard's rows. A fan-out is the one place such a read is meant: each shard
+then answers for its own ranges. A router fanning out directly to shards
+sends `SET rdb.shard_part = on` on the connection first and
+`SET rdb.shard_part = off` after. Plain servers, which own every range,
+need neither.

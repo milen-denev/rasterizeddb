@@ -13350,6 +13350,27 @@ where
     let s = stmt.trim();
     let s_lower = s.to_ascii_lowercase();
 
+    // `SET rdb.shard_part = on|off`: a Track A router's fan-out marks its
+    // statements as one shard's part, so a keyless read may read the ranges
+    // this shard owns (sharding-plan.md B1a.4).
+    #[cfg(feature = "sharding")]
+    if let Some(v) = s_lower
+        .trim_end_matches(';')
+        .strip_prefix("set rdb.shard_part")
+        .map(|r| r.trim_start().trim_start_matches('=').trim_start_matches("to").trim().trim_matches('\''))
+    {
+        let on = match v {
+            "on" | "true" | "1" => true,
+            "off" | "false" | "0" => false,
+            _ => return Ok(false),
+        };
+        if let Some(c) = current_session_cancel() {
+            c.fan_out_part.store(on, std::sync::atomic::Ordering::Release);
+        }
+        send_command_complete(stream, "SET").await?;
+        return Ok(true);
+    }
+
     // `RESET ALL` and `DISCARD`: how a pool clears a connection between
     // borrowers (Npgsql sends `DISCARD ALL`). Both used to fail as a syntax
     // error, which was harmless while every `SET` was dropped; with the

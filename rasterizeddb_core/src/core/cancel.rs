@@ -309,6 +309,12 @@ pub struct SessionCancel {
     /// rshard endpoint between statements, read by the fold.
     #[cfg(feature = "sharding")]
     pub fold: std::sync::Mutex<Fold>,
+    /// The session is running one shard's part of a fan-out: a keyless read
+    /// may read just the ranges this shard owns. Otherwise such a read fails
+    /// RDB02, since inside a routed statement it would silently miss every
+    /// other shard's rows (sharding-plan.md B1a.4).
+    #[cfg(feature = "sharding")]
+    pub fan_out_part: std::sync::atomic::AtomicBool,
 }
 
 /// See [`SessionCancel::fold`].
@@ -399,6 +405,8 @@ pub fn register_session(key: [u8; 4]) -> CancelRegistration {
         current: std::sync::Mutex::new(None),
         #[cfg(feature = "sharding")]
         fold: std::sync::Mutex::new(Fold::Normal),
+        #[cfg(feature = "sharding")]
+        fan_out_part: std::sync::atomic::AtomicBool::new(false),
     });
     let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
     let pid = loop {
@@ -515,6 +523,8 @@ pub fn register_token(user: &str, token: &str) -> Option<TokenRegistration> {
         current: std::sync::Mutex::new(None),
         #[cfg(feature = "sharding")]
         fold: std::sync::Mutex::new(Fold::Normal),
+        #[cfg(feature = "sharding")]
+        fan_out_part: std::sync::atomic::AtomicBool::new(false),
     });
     map.insert(key.clone(), session.clone());
     Some(TokenRegistration { key, session })

@@ -450,6 +450,28 @@ fn may_aggregate(sql: &str) -> bool {
         .any(|k| up.contains(k))
 }
 
+/// Marks session `s` as running a fan-out part for as long as the returned
+/// guard lives.
+struct PartGuard(Option<StdArc<crate::core::cancel::SessionCancel>>);
+
+impl PartGuard {
+    fn on(s: &VSession) -> PartGuard {
+        let c = crate::core::cancel::session_by_pid(s.bridge.pid);
+        if let Some(c) = &c {
+            c.fan_out_part.store(true, Ordering::Release);
+        }
+        PartGuard(c)
+    }
+}
+
+impl Drop for PartGuard {
+    fn drop(&mut self) {
+        if let Some(c) = &self.0 {
+            c.fan_out_part.store(false, Ordering::Release);
+        }
+    }
+}
+
 /// Whether a coordinated statement is a fold (aggregates, GROUP BY) rather
 /// than a top-N.
 fn may_aggregate_fold(sql: &str) -> bool {
@@ -483,6 +505,7 @@ struct TopPart {
 
 /// Runs `topn.part_sql` on this shard's session `s` and keys its rows.
 async fn top_part(s: &mut VSession, topn: &super::topn::TopN) -> Result<TopPart, String> {
+    let _part = PartGuard::on(s);
     s.bridge.raw(&query_message(&topn.part_sql));
     let mut part = TopPart { fields: None, rows: Vec::new(), error: None };
     let mut index: Option<(Vec<usize>, Vec<(String, u32)>)> = None;
@@ -780,6 +803,7 @@ async fn coordinate(session: u64, s: &mut VSession, bytes: &[u8]) -> Response {
         return refuse(*b"XX000", true, "the coordinating session is not registered");
     };
     *cancel.fold.lock().unwrap() = Fold::Coordinator { partials, consumed: false };
+    let _part = PartGuard::on(s);
     s.bridge.raw(bytes);
     let mut out = Vec::new();
     loop {
@@ -897,6 +921,7 @@ async fn exec_part(conn: &Conn, session: u64, merge: Merge, bytes: &[u8]) -> Res
     } else {
         None
     };
+    let _part = PartGuard::on(&s);
     s.bridge.raw(bytes);
     let (mut head, mut rows, mut tail) = (Vec::new(), Vec::new(), Vec::new());
     let mut status = 0;
