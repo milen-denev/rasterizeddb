@@ -113,11 +113,17 @@ fn free_port() -> u16 {
 }
 
 fn start(dir: &str, extra: &[&str]) -> (Server, u16) {
+    start_with_env(dir, extra, &[])
+}
+
+fn start_with_env(dir: &str, extra: &[&str], env: &[(&str, &str)]) -> (Server, u16) {
     let port = free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_rasterizeddb_core"))
         .args(["--location", dir, "--protocol", "pgwire", "--pg-tls", "disable", "--pg-auth", "trust"])
         .args(["--pg-port", &port.to_string(), "--log-level", "error"])
         .args(extra)
+        .env_remove("RDB_PARTITION_MAX_OPEN")
+        .envs(env.iter().copied())
         // The suite may be run with every index paged; this test is about
         // where a value comes from, so the default must be the default.
         .env_remove("RASTERIZEDDB_INDEX_RESIDENCY")
@@ -203,5 +209,171 @@ fn a_saved_setting_waits_for_the_next_start_and_a_flag_beats_it() {
         let (_server, port) = start(&dir, &[]);
         let mut pg = Pg::connect(port);
         assert_eq!(pg.config("server", "batch_size").0, "10000");
+    }
+}
+
+/// A hot key a session changes takes effect at once and is saved, so a
+/// restart keeps it (`partition.idle_close_secs` had no flag and reverted at
+/// every restart); `cache.size` is a startup key like the others; a flag
+/// still wins over either; and a file that does not parse is never replaced.
+#[test]
+fn a_hot_setting_survives_a_restart_and_cache_size_is_saved() {
+    let dir = format!("/var/tmp/startup_settings_hot_{}", std::process::id());
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(dir.clone());
+    let conf = format!("{dir}/rasterizeddb.conf");
+
+    {
+        let (_server, port) = start(&dir, &[]);
+        let mut pg = Pg::connect(port);
+        assert_eq!(pg.config("partition", "idle_close_secs").2, "default");
+        let reply = pg.query("SET CONFIG partition.idle_close_secs = 600").expect("applied");
+        assert!(format!("{reply:?}").contains("saved, so it holds after a restart"), "{reply:?}");
+        // Applied now, and a hot key has nothing pending.
+        assert_eq!(pg.config("partition", "idle_close_secs"), ("600".into(), "".into(), "saved".into()));
+        pg.query("SET CONFIG filter.bloom = off").expect("applied");
+        pg.query("SET CONFIG auto_compact.dead_fraction = 0.4").expect("applied");
+        // A refused value is neither applied nor saved.
+        assert!(pg.query("SET CONFIG partition.idle_close_secs = soon").is_err());
+        // The keys that act on a database say they are not saved.
+        let reply = pg.query("SET CONFIG replication.batch_max_records = 128").expect("applied");
+        assert!(format!("{reply:?}").contains("not saved"), "{reply:?}");
+        assert_eq!(pg.config("replication", "batch_max_records").2, "", "a database's key has no source");
+
+        assert_eq!(pg.config("cache", "size"), ("100000".into(), "".into(), "default".into()));
+        let reply = pg.query("SET CONFIG cache.size = 5000").expect("saved");
+        assert!(format!("{reply:?}").contains("next start"), "{reply:?}");
+        assert_eq!(pg.config("cache", "size"), ("100000".into(), "5000".into(), "default".into()));
+        assert!(pg.query("SET CONFIG cache.size = 0").is_err(), "0 would be an unbounded cache");
+    }
+    let saved = std::fs::read_to_string(&conf).unwrap();
+    assert!(!saved.contains("replication."), "{saved}");
+    {
+        // Applied by the next start, from the file.
+        let (_server, port) = start(&dir, &[]);
+        let mut pg = Pg::connect(port);
+        assert_eq!(pg.config("partition", "idle_close_secs"), ("600".into(), "".into(), "saved".into()));
+        assert_eq!(pg.config("filter", "bloom"), ("false".into(), "".into(), "saved".into()));
+        assert_eq!(pg.config("auto_compact", "dead_fraction"), ("0.4".into(), "".into(), "saved".into()));
+        assert_eq!(pg.config("cache", "size"), ("5000".into(), "".into(), "saved".into()));
+        assert_eq!(pg.config("replication", "batch_max_records").0, "256", "not saved, so the start-up value");
+        assert_eq!(pg.config("wal", "synchronous_commit").2, "default");
+    }
+    {
+        // A flag wins over both kinds, and says so.
+        let (_server, port) = start(
+            &dir,
+            &["--filter-bloom", "true", "--cache-size", "7000", "--enable-cache", "true"],
+        );
+        let mut pg = Pg::connect(port);
+        assert_eq!(pg.config("filter", "bloom"), ("true".into(), "".into(), "command line".into()));
+        assert_eq!(pg.config("cache", "size"), ("7000".into(), "5000".into(), "command line".into()));
+        // The keys without a flag still come from the file.
+        assert_eq!(pg.config("partition", "idle_close_secs"), ("600".into(), "".into(), "saved".into()));
+        let reply = pg.query("SET CONFIG filter.bloom = off").expect("applied");
+        assert!(format!("{reply:?}").contains("wins over a saved value"), "{reply:?}");
+        assert_eq!(pg.config("filter", "bloom"), ("false".into(), "".into(), "command line".into()));
+    }
+    {
+        // A saved value a key refuses is skipped, and the start goes on.
+        std::fs::write(&conf, "partition.idle_close_secs = soon\nfilter.max_f = 14\n").unwrap();
+        let (_server, port) = start(&dir, &[]);
+        let mut pg = Pg::connect(port);
+        assert_eq!(pg.config("partition", "idle_close_secs").2, "default");
+        assert_eq!(pg.config("filter", "max_f"), ("14".into(), "".into(), "saved".into()));
+    }
+    {
+        // A file that does not parse: the start goes on without it, and a
+        // SET CONFIG applies but refuses to save rather than replace it.
+        let text = "partition.idle_close_secs = 600\nthis line is not a setting\n";
+        std::fs::write(&conf, text).unwrap();
+        let (_server, port) = start(&dir, &[]);
+        let mut pg = Pg::connect(port);
+        assert_eq!(pg.config("partition", "idle_close_secs").2, "default");
+        let reply = pg.query("SET CONFIG partition.idle_close_secs = 700").expect("applied");
+        let reply = format!("{reply:?}");
+        assert!(reply.contains("not saved") && reply.contains("line 2"), "{reply}");
+        assert_eq!(pg.config("partition", "idle_close_secs").0, "700");
+        assert!(pg.query("SET CONFIG server.batch_size = 5000").is_err(), "a startup key cannot be saved either");
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), text, "the file is left as it was");
+    }
+}
+
+/// `partition.max_open` from each of its three places, the flag and the
+/// environment winning over the file; and the start raises the open-file
+/// limit for it (pms plans 5 tables of 1,024 partitions, past the old fixed
+/// ceiling of 4,096).
+#[test]
+fn partition_max_open_comes_from_a_flag_the_environment_or_the_file() {
+    let dir = format!("/var/tmp/startup_settings_max_open_{}", std::process::id());
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(dir.clone());
+
+    /// The child's soft and hard open-file limits, from /proc.
+    fn nofile(server: &Server) -> Option<(u64, u64)> {
+        let limits = std::fs::read_to_string(format!("/proc/{}/limits", server.0.id())).ok()?;
+        let line = limits.lines().find(|l| l.starts_with("Max open files"))?;
+        let mut n = line.split_whitespace().skip(3).map(|v| v.parse::<u64>().ok());
+        Some((n.next()??, n.next()??))
+    }
+
+    {
+        let (_server, port) = start(&dir, &[]);
+        let mut pg = Pg::connect(port);
+        assert_eq!(pg.config("partition", "max_open"), ("4096".into(), "".into(), "default".into()));
+        let reply = pg.query("SET CONFIG partition.max_open = 6000").expect("saved");
+        assert!(format!("{reply:?}").contains("next start"), "{reply:?}");
+        assert!(pg.query("SET CONFIG partition.max_open = 3").is_err(), "under the floor of 16");
+        assert!(pg.query("SET CONFIG partition.max_open = 99999999").is_err(), "over the ceiling");
+    }
+    {
+        let (server, port) = start(&dir, &[]);
+        let mut pg = Pg::connect(port);
+        assert_eq!(pg.config("partition", "max_open"), ("6000".into(), "".into(), "saved".into()));
+        // Raised for 6,000 partitions of ten descriptors over the reserve,
+        // as far as the hard limit allows.
+        if let Some((soft, hard)) = nofile(&server) {
+            let wanted = 2048 + 6000 * 10;
+            assert!(soft >= wanted.min(hard), "soft {soft}, hard {hard}, wanted {wanted}");
+        }
+    }
+    {
+        let (_server, port) = start_with_env(&dir, &[], &[("RDB_PARTITION_MAX_OPEN", "8000")]);
+        let mut pg = Pg::connect(port);
+        assert_eq!(pg.config("partition", "max_open"), ("8000".into(), "6000".into(), "command line".into()));
+    }
+    {
+        // The flag over the environment, and over the file.
+        let (_server, port) =
+            start_with_env(&dir, &["--partition-max-open", "5120"], &[("RDB_PARTITION_MAX_OPEN", "8000")]);
+        let mut pg = Pg::connect(port);
+        assert_eq!(pg.config("partition", "max_open"), ("5120".into(), "6000".into(), "command line".into()));
+        let reply = pg.query("SET CONFIG partition.max_open = 7000").expect("saved");
+        assert!(format!("{reply:?}").contains("wins over a saved value"), "{reply:?}");
+    }
+    {
+        // A value out of range refuses the start rather than run with
+        // another one.
+        let status = Command::new(env!("CARGO_BIN_EXE_rasterizeddb_core"))
+            .args(["--location", &dir, "--partition-max-open", "2"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run the server");
+        assert_eq!(status.code(), Some(2));
     }
 }

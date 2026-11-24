@@ -422,7 +422,7 @@ pub fn apply_to_create(
         if declared_column.data_type != DbType::STRING || ct.json_columns.iter().any(|j| j.column.eq_ignore_ascii_case(&name)) {
             return Err(format!("collations are not supported by the type of column \"{name}\""));
         }
-        if ct.foreign_keys.iter().any(|fk| fk.column.eq_ignore_ascii_case(&name)) {
+        if ct.foreign_keys.iter().any(|fk| fk.has_column(&name)) {
             return unsupported(&format!("a foreign key on column \"{name}\""));
         }
         if ct.checks.iter().any(|c| mentions(&c.expression, &name)) {
@@ -455,6 +455,8 @@ pub fn apply_to_create(
                 is_deleted: false,
                 predicate: None,
                 compiled: Default::default(),
+                from_index: false,
+                primary: false,
             });
         }
         for key in ct.unique_keys.iter_mut() {
@@ -473,6 +475,8 @@ pub fn apply_to_create(
                 is_deleted: false,
                 predicate: None,
                 compiled: Default::default(),
+                from_index: false,
+                primary: false,
             });
         }
     }

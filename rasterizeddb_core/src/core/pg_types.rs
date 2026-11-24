@@ -207,15 +207,17 @@ fn apply_unit(out: &mut Interval, value: f64, unit: &str) -> Option<()> {
         u => u,
     };
     let (months_per, days_per, micros_per) = match unit {
-        "millennium" | "millennia" | "millenium" => (12_000.0, 0.0, 0.0),
-        "century" | "centurie" => (1_200.0, 0.0, 0.0),
-        "decade" | "decade_" => (120.0, 0.0, 0.0),
+        // With PostgreSQL's abbreviations: `mil`, `c` and `cent`, `dec`, and
+        // `mm` for a minute below.
+        "millennium" | "millennia" | "millenium" | "mil" => (12_000.0, 0.0, 0.0),
+        "century" | "centurie" | "cent" | "c" => (1_200.0, 0.0, 0.0),
+        "decade" | "decade_" | "dec" => (120.0, 0.0, 0.0),
         "year" | "yr" | "y" => (12.0, 0.0, 0.0),
         "month" | "mon" | "mo" => (1.0, 0.0, 0.0),
         "week" | "w" => (0.0, 7.0, 0.0),
         "day" | "d" => (0.0, 1.0, 0.0),
         "hour" | "hr" | "h" => (0.0, 0.0, 3_600_000_000.0),
-        "minute" | "min" | "m" => (0.0, 0.0, 60_000_000.0),
+        "minute" | "min" | "m" | "mm" => (0.0, 0.0, 60_000_000.0),
         "second" | "sec" | "s" => (0.0, 0.0, 1_000_000.0),
         "millisecond" | "msec" | "ms" => (0.0, 0.0, 1_000.0),
         "microsecond" | "usec" | "us" => (0.0, 0.0, 1.0),

@@ -153,6 +153,8 @@ pub enum PgFunc {
     FormatType,
     PgGetIndexDef,
     PgGetConstraintDef,
+    /// `pg_get_partkeydef(oid)`: a partitioned table's key.
+    PgGetPartKeyDef,
     PgGetFunctionResult,
     PgGetFunctionArguments,
     PgGetExpr,
@@ -167,6 +169,8 @@ pub enum PgFunc {
     ColumnIsUpdatable,
     /// `oid::regclass` read as text: the relation's name.
     RegclassName,
+    /// `x::regtype` over a column: the type's name (`reg_casts`).
+    RegtypeName,
     /// `sha224`, `sha256`, `sha384`, `sha512` of a `bytea` (or text's bytes):
     /// the digest as `bytea`.
     Sha224,
@@ -275,10 +279,10 @@ pub const NAMES: &[&str] = &[
     "JSON_BUILD_ARRAY", "JSONB_BUILD_ARRAY", "TO_JSON", "TO_JSONB", "JSONB_ARRAY_LENGTH", "JSON_ARRAY_LENGTH",
     "NUM_NONNULLS", "NUM_NULLS", "STRING_TO_ARRAY", "ARRAY_TO_STRING", "CARDINALITY", "TRIM", "PG_TYPEOF",
     "ARRAY_APPEND", "ARRAY_PREPEND", "ARRAY_CAT", "JSONB_SET", "JSONB_STRIP_NULLS", "NEXTVAL", "CURRVAL", "SETVAL",
-    "LASTVAL", "PG_GET_USERBYID", "FORMAT_TYPE", "PG_GET_INDEXDEF", "PG_GET_CONSTRAINTDEF",
+    "LASTVAL", "PG_GET_USERBYID", "FORMAT_TYPE", "PG_GET_INDEXDEF", "PG_GET_CONSTRAINTDEF", "PG_GET_PARTKEYDEF",
     "PG_GET_FUNCTION_RESULT", "PG_GET_FUNCTION_ARGUMENTS", "PG_GET_FUNCTION_IDENTITY_ARGUMENTS", "PG_GET_EXPR",
     "PG_ENCODING_TO_CHAR", "OBJ_DESCRIPTION", "COL_DESCRIPTION", "SHOBJ_DESCRIPTION", "PG_RELATION_IS_PUBLISHABLE",
-    "PG_COLUMN_IS_UPDATABLE", "__REGCLASS_NAME", "PG_GET_STATISTICSOBJDEF_COLUMNS", "PG_GET_TRIGGERDEF",
+    "PG_COLUMN_IS_UPDATABLE", "__REGCLASS_NAME", "__REGTYPE_NAME", "PG_GET_STATISTICSOBJDEF_COLUMNS", "PG_GET_TRIGGERDEF",
     "PG_GET_RULEDEF", "SHA224", "SHA256", "SHA384", "SHA512", "CONVERT_TO", "CONVERT_FROM",
     "SIN", "COS", "TAN", "COT", "ASIN", "ACOS", "ATAN", "ATAN2", "SINH", "COSH", "TANH", "ASINH", "ACOSH", "ATANH",
     "ISFINITE", "GET_BYTE", "REGEXP_COUNT", "REGEXP_SUBSTR", "REGEXP_SPLIT_TO_ARRAY", "ARRAY_POSITION",
@@ -446,6 +450,7 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "FORMAT_TYPE" => (FormatType, &[2]),
         "PG_GET_INDEXDEF" => (PgGetIndexDef, &[1, 3]),
         "PG_GET_CONSTRAINTDEF" => (PgGetConstraintDef, &[1, 2]),
+        "PG_GET_PARTKEYDEF" => (PgGetPartKeyDef, &[1]),
         "PG_GET_FUNCTION_RESULT" => (PgGetFunctionResult, &[1]),
         "PG_GET_FUNCTION_ARGUMENTS" | "PG_GET_FUNCTION_IDENTITY_ARGUMENTS" => (PgGetFunctionArguments, &[1]),
         "PG_GET_EXPR" => (PgGetExpr, &[2, 3]),
@@ -465,6 +470,7 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "PG_RELATION_IS_PUBLISHABLE" => (RelationIsPublishable, &[1]),
         "PG_COLUMN_IS_UPDATABLE" => (ColumnIsUpdatable, &[3]),
         "__REGCLASS_NAME" => (RegclassName, &[1]),
+        "__REGTYPE_NAME" => (RegtypeName, &[1]),
         "ISEMPTY" => (RangeIsEmpty, &[1]),
         "LOWER_INC" => (RangeLowerInc, &[1]),
         "UPPER_INC" => (RangeUpperInc, &[1]),
@@ -530,8 +536,8 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
         Scale | MinScale => DbType::I32,
         TrimScale => DbType::DECIMAL,
         NextVal | CurrVal | SetVal | LastVal => DbType::I64,
-        PgGetUserById | FormatType | PgGetIndexDef | PgGetConstraintDef | PgGetFunctionResult
-        | PgGetFunctionArguments | PgGetExpr | PgEncodingToChar | Description | RegclassName => DbType::STRING,
+        PgGetUserById | FormatType | PgGetIndexDef | PgGetConstraintDef | PgGetPartKeyDef | PgGetFunctionResult
+        | PgGetFunctionArguments | PgGetExpr | PgEncodingToChar | Description | RegclassName | RegtypeName => DbType::STRING,
         RelationIsPublishable | ColumnIsUpdatable => DbType::BOOL,
         Sha224 | Sha256 | Sha384 | Sha512 | ConvertTo => DbType::BYTEA,
         ConvertFrom => DbType::STRING,
@@ -1176,6 +1182,22 @@ fn bitwise(func: PgFunc, args: &[Value]) -> Result<Value, String> {
     })
 }
 
+/// A `bytea` argument's bytes. An untyped literal is read as `bytea`
+/// reads it, so `'\x616263'` is the three bytes it spells: taken as text,
+/// `sha256('\x616263')` hashed the eight characters and `convert_from` of
+/// one answered the literal back.
+fn bytea_argument(v: &Value) -> Vec<u8> {
+    match v {
+        Value::Data { bytes, db_type: DbType::BYTEA } => bytes.clone(),
+        Value::Data { bytes, db_type: DbType::STRING } if bytes.starts_with(b"\\x") => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|text| crate::core::value_codec::byteain(text).ok())
+            .unwrap_or_else(|| bytes.clone()),
+        Value::Data { bytes, db_type: DbType::STRING } => bytes.clone(),
+        other => text_of(other).into_bytes(),
+    }
+}
+
 fn text_value(text: String) -> Value {
     data(text.into_bytes(), DbType::STRING)
 }
@@ -1321,7 +1343,7 @@ pub fn shown_at(value: Value, scale: u32) -> Value {
 /// Calls `func` over its evaluated arguments.
 pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
     use PgFunc::*;
-    let non_strict = matches!(func, DomainValue | Int4Range | Int8Range | NumRange | DateRange | TsRange | TstzRange | ArrayCtor | ArraySlice | QuantifiedCmp | Concat | ConcatWs | Format | JsonBuildObject | JsonBuildArray | JsonBuildObjectText | JsonBuildArrayText | NumNonnulls | NumNulls | ToJson | ToJsonText | StringToArray | ArrayToString | ArrayAppend | ArrayPrepend | ArrayCat | ArrayPosition | ArrayRemove | ArrayReplace | ArrayFill);
+    let non_strict = matches!(func, DomainValue | Int4Range | Int8Range | NumRange | DateRange | TsRange | TstzRange | ArrayCtor | ArraySlice | QuantifiedCmp | Concat | ConcatWs | Format | JsonBuildObject | JsonBuildArray | JsonBuildObjectText | JsonBuildArrayText | NumNonnulls | NumNulls | ToJson | ToJsonText | StringToArray | ArrayToString | ArrayAppend | ArrayPrepend | ArrayCat | ArrayPosition | ArrayRemove | ArrayReplace | ArrayFill | FormatType);
     // An element argument may be NULL (it finds, removes or replaces the
     // array's NULLs, as PostgreSQL's do); a NULL array is a NULL answer.
     if matches!(func, ArrayPosition | ArrayRemove | ArrayReplace) && (args[0].is_null() || args.get(2).is_some_and(|a| func == ArrayPosition && a.is_null())) {
@@ -2194,6 +2216,9 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         }
         JsonbStripNulls => data(crate::core::jsonb::strip_nulls(&jsonb_of(&args[0])?)?, DbType::JSONB),
         PgGetUserById => text_value(crate::core::rql::catalog_model::user_by_id(int_of(&args[0], "the role's oid")?)),
+        // Not strict: a NULL modifier is none (`format_type(23, NULL)` is
+        // `integer`), and only a NULL type is NULL.
+        FormatType if args[0].is_null() => Value::Null,
         FormatType => {
             let typmod = int_of(&args[1], "the type modifier").ok();
             match crate::core::rql::catalog_model::format_type(int_of(&args[0], "the type's oid")?, typmod) {
@@ -2215,6 +2240,10 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             Some(text) => text_value(text),
             None => Value::Null,
         },
+        PgGetPartKeyDef => match crate::core::rql::catalog_model::partition_key_definition(int_of(&args[0], "the relation's oid")?) {
+            Some(text) => text_value(text),
+            None => Value::Null,
+        },
         PgGetFunctionResult | PgGetFunctionArguments => {
             let what = if func == PgGetFunctionResult { "result" } else { "arguments" };
             match crate::core::rql::catalog_model::function_text(int_of(&args[0], "the function's oid")?, what) {
@@ -2230,10 +2259,7 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         ColumnIsUpdatable => data(vec![1], DbType::BOOL),
         Sha224 | Sha256 | Sha384 | Sha512 => {
             use sha2::Digest;
-            let input = match &args[0] {
-                Value::Data { bytes, db_type: DbType::BYTEA } => bytes.clone(),
-                other => text_of(other).into_bytes(),
-            };
+            let input = bytea_argument(&args[0]);
             let digest = match func {
                 Sha224 => sha2::Sha224::digest(&input).to_vec(),
                 Sha256 => sha2::Sha256::digest(&input).to_vec(),
@@ -2245,6 +2271,29 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         ConvertTo | ConvertFrom => {
             let encoding = s(1).to_ascii_uppercase().replace(['-', '_'], "");
             let ascii = encoding == "SQLASCII";
+            // LATIN1 is Unicode's first 256 code points, one byte each.
+            if matches!(encoding.as_str(), "LATIN1" | "ISO88591") {
+                if func == ConvertTo {
+                    let mut out = Vec::new();
+                    for c in s(0).chars() {
+                        match u8::try_from(u32::from(c)) {
+                            Ok(byte) => out.push(byte),
+                            Err(_) => {
+                                let mut utf8 = [0u8; 4];
+                                let shown: Vec<String> =
+                                    c.encode_utf8(&mut utf8).bytes().map(|b| format!("0x{b:02x}")).collect();
+                                return Err(format!(
+                                    "character with byte sequence {} in encoding \"UTF8\" has no equivalent in \
+                                     encoding \"LATIN1\"",
+                                    shown.join(" ")
+                                ));
+                            }
+                        }
+                    }
+                    return Ok(data(out, DbType::BYTEA));
+                }
+                return Ok(text_value(bytea_argument(&args[0]).iter().map(|b| char::from(*b)).collect()));
+            }
             if encoding != "UTF8" && !ascii {
                 return Err(format!("conversion to or from encoding \"{}\" is not supported here", s(1)));
             }
@@ -2255,14 +2304,16 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
                 }
                 data(text.into_bytes(), DbType::BYTEA)
             } else {
-                let bytes = match &args[0] {
-                    Value::Data { bytes, .. } => bytes.clone(),
-                    other => text_of(other).into_bytes(),
-                };
+                let bytes = bytea_argument(&args[0]);
                 text_value(String::from_utf8(bytes).map_err(|_| "invalid byte sequence for encoding \"UTF8\"".to_string())?)
             }
         }
         RegclassName => text_value(crate::core::rql::catalog_model::regclass_name(int_of(&args[0], "the relation's oid")?)),
+        // An oid no type has is shown as the number, as PostgreSQL shows it.
+        RegtypeName => {
+            let oid = int_of(&args[0], "the type's oid")?;
+            text_value(crate::core::rql::catalog_model::format_type(oid, None).unwrap_or_else(|| oid.to_string()))
+        }
         NextVal | CurrVal | SetVal | LastVal => {
             use crate::core::rql::sequence;
             let database = sequence::session::database()

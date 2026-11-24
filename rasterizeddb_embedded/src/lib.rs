@@ -32,7 +32,10 @@
 //!   functions, privileges), so an embedded database answers exactly as a
 //!   server would.
 //! - **Signals stay yours.** Nothing here installs a Ctrl+C or SIGTERM
-//!   handler. Stop the engine with [`Embedded::shutdown`]: it drains the
+//!   handler: a start turns the engine's own off for the whole process
+//!   (`engine::shutdown::set_signal_hooks(false)`), so neither the native
+//!   listener nor a replication listener brought up later by `REPLICATION
+//!   ENABLE` takes them. Stop the engine with [`Embedded::shutdown`]: it drains the
 //!   requests in flight, seals the index snapshots and checkpoints the
 //!   write-ahead log, so the next open has nothing to replay. Dropping an
 //!   [`Embedded`] does the same, blocking the dropping thread until it is
@@ -55,6 +58,72 @@
 //! than fail later with an illegal instruction. Build with
 //! `-C target-cpu=x86-64-v3` (as the server binary is) so the vector paths
 //! inline. aarch64 needs nothing extra.
+//!
+//! # Settings
+//!
+//! Everything the server binary takes as a flag, [`Builder`] takes as a
+//! method: memory ([`Builder::low_memory`], [`Builder::malloc_arenas`],
+//! [`Builder::index_residency`], [`Builder::join_memory_mb`],
+//! [`Builder::kv_max_memory`], …), durability
+//! ([`Builder::synchronous_commit`], [`Builder::wal_checkpoint_bytes`], …),
+//! threads, and through [`Builder::config`] every key `SHOW CONFIG KEYS`
+//! lists.
+//!
+//! ```no_run
+//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+//! use rasterizeddb_embedded::{Builder, IndexResidency};
+//!
+//! let db = Builder::open("./data")
+//!     .worker_threads(4)
+//!     .query_threads(4)
+//!     .malloc_arenas(4)
+//!     .index_residency(IndexResidency::Disk)
+//!     .join_memory_mb(256)
+//!     .synchronous_commit(false)
+//!     .config("auto_compact.interval_secs", "300")
+//!     .start()
+//!     .await?;
+//! # let _ = db;
+//! # Ok(()) }
+//! ```
+//!
+//! The keys come in two kinds, as on a server:
+//!
+//! - **Hot keys** (`wal.synchronous_commit`, `auto_compact.*`, `filter.*`,
+//!   `partition.*`, `index_snapshot.*`, `query_stats.*`, `vacuum.enabled`)
+//!   can also be changed on the running engine, with `SET CONFIG key = value`
+//!   through any client, which also saves the process-wide ones to
+//!   `rasterizeddb.conf` for the next start. A Builder value is only where
+//!   they start.
+//! - **Startup keys** (`server.*`, `index.*`, `wal.checkpoint_bytes`,
+//!   `wal.prealloc_kb`, `cache.enabled`, `cache.size`, `partition.max_open`)
+//!   are read once. `SET CONFIG` on one
+//!   saves it to `rasterizeddb.conf` in the database directory, and the next
+//!   [`Builder::start`] on that directory applies it. A value given to the
+//!   Builder wins over a saved one, as a server's flag does; `SHOW CONFIG`
+//!   shows each value's source (a Builder value reads `command line`).
+//!
+//! **One engine at a time in a process.** The engine keeps its settings in
+//! process-wide state, and `SET CONFIG` saves to the running engine's
+//! directory, so a second engine alongside the first would change the
+//! first's settings and save into the wrong file. [`Builder::start`] refuses
+//! while another [`Embedded`] runs (`ErrorKind::AlreadyExists`); serve
+//! several databases from one engine with `CREATE DATABASE` instead. A start
+//! after a stop is fine. Startup values the first engine fixed (the
+//! `OnceLock`s: batch size, worker permits, log checkpoint size, …) stay
+//! fixed for the process: a later start asking for another value fails
+//! rather than run with a value nobody asked for.
+//!
+//! **One process per directory.** The directory is locked
+//! (`rasterizeddb.lock`, an operating-system lock that ends with its holder)
+//! for as long as an engine has it open: a second process, or a server
+//! binary, opening it is refused instead of corrupting it.
+//!
+//! Freed memory goes back to the operating system once the engine has been
+//! idle for a few seconds ([`Builder::idle_trim`], on by default, glibc
+//! only).
+
+mod settings;
 
 use std::io;
 use std::path::PathBuf;
@@ -65,13 +134,26 @@ use rasterizeddb_core::auth::AuthMethod;
 use rasterizeddb_core::core::database::catalog::DatabaseCatalog;
 use rasterizeddb_core::core::database::{DEFAULT_DATABASE_NAME, Database, NativeListen};
 use rasterizeddb_core::native_auth::NativeAuthConfig;
+use settings::{Deferred, Settings};
 use tokio::sync::oneshot;
 
 pub use rasterizeddb_client as client;
 pub use rasterizeddb_client::{Client, Login, Options};
 /// The engine itself, for what the client cannot express (counters, internal
-/// state). Its API is the server's internals and changes between releases.
+/// state). Its API is the server's internals and changes in any release
+/// (`rasterizeddb_core` does not follow semver), so it is hidden from these
+/// docs and outside this crate's semver promise: code that reaches into it
+/// may need changes on any upgrade.
+#[doc(hidden)]
 pub use rasterizeddb_core as engine;
+/// Where indexes keep their entries; see [`Builder::index_residency`].
+pub use rasterizeddb_core::core::index::paged::Residency as IndexResidency;
+/// What an open does with the indexes; see [`Builder::index_storage`].
+pub use rasterizeddb_core::core::index_store::load::settings::IndexStorage;
+/// What the key/value store drops when full; see [`Builder::kv_eviction`].
+pub use rasterizeddb_core::core::kv_cache::EvictionPolicy as KvEviction;
+/// A vector instruction set; see [`Builder::simd`].
+pub use rasterizeddb_core::simds::cpu::SimdLevel;
 
 /// The stack every engine thread gets, as in the server binary.
 const ENGINE_STACK: usize = 32 * 1024 * 1024;
@@ -92,12 +174,36 @@ pub struct Builder {
     credentials: Option<(String, String)>,
     allow_unauthenticated_loopback: bool,
     request_timeout: Option<Duration>,
+    settings: Settings,
+}
+
+/// Shows where and how the engine would start, and the settings given as
+/// `section.key` values; never the password.
+impl std::fmt::Debug for Builder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Builder")
+            .field(
+                "location",
+                &match &self.location {
+                    Location::Memory => "memory".to_string(),
+                    Location::Directory(dir) => dir.display().to_string(),
+                },
+            )
+            .field("worker_threads", &self.worker_threads)
+            .field("user", &self.credentials.as_ref().map(|(user, _)| user))
+            .field("password", &self.credentials.as_ref().map(|_| "<hidden>"))
+            .field("allow_unauthenticated_loopback", &self.allow_unauthenticated_loopback)
+            .field("request_timeout", &self.request_timeout)
+            .field("config", &self.settings.config)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Builder {
     /// A database kept in `directory`, created if it does not exist. A
     /// directory written by the server binary opens here, and the reverse.
-    /// One process at a time may open a directory.
+    /// One process at a time may open a directory: another one's open (or
+    /// the server binary's) is refused while this engine runs.
     pub fn open(directory: impl Into<PathBuf>) -> Self {
         Self::new(Location::Directory(directory.into()))
     }
@@ -114,11 +220,13 @@ impl Builder {
             credentials: None,
             allow_unauthenticated_loopback: false,
             request_timeout: None,
+            settings: Settings::default(),
         }
     }
 
     /// Threads the engine's runtime runs on (default: one per CPU, as
-    /// tokio chooses).
+    /// tokio chooses). How many of them one query may use is
+    /// [`Builder::query_threads`].
     pub fn worker_threads(mut self, threads: usize) -> Self {
         self.worker_threads = Some(threads.max(1));
         self
@@ -148,6 +256,271 @@ impl Builder {
         self
     }
 
+
+    // ----------------------------------------------------------------
+    // Settings. See the crate documentation, "Settings": they are
+    // process-wide, and each method names the server flag it stands for.
+    // ----------------------------------------------------------------
+
+    /// Sets any key `SHOW CONFIG KEYS` lists, as `SET CONFIG key = value`
+    /// spells it: `config("auto_compact.enabled", "off")`,
+    /// `config("filter.max_f", "14")`, `config("index.residency", "disk")`.
+    /// The typed methods below are this with the key filled in, so the last
+    /// call for a key wins whichever of them made it.
+    ///
+    /// A hot key is set before the database opens (`replication.*` and
+    /// `vacuum.enabled`, which act on the open database, right after) and
+    /// stays changeable with `SET CONFIG`. An unknown key or a value the
+    /// key refuses makes [`Builder::start`] fail.
+    pub fn config(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.settings.config.push((key.into(), value.into()));
+        self
+    }
+
+    /// Trades throughput for memory, for a small machine or a process that
+    /// shares its memory with an application: four allocator arenas
+    /// ([`Builder::malloc_arenas`]), indexes on disk behind a 64 MiB cache
+    /// ([`Builder::index_residency`]) and 256 MiB a join
+    /// ([`Builder::join_memory_mb`]). A call after it overrides its choice
+    /// for that setting.
+    pub fn low_memory(self) -> Self {
+        self.malloc_arenas(4).index_residency(IndexResidency::Disk).join_memory_mb(256)
+    }
+
+    /// Workers one query may use (`--concurrent-threads`, default 16).
+    /// Read once.
+    pub fn query_threads(self, threads: usize) -> Self {
+        self.config("server.concurrent_threads", threads.max(1).to_string())
+    }
+
+    /// Row pointers a scan fetches per batch (`--batch-size`, default
+    /// 10 000). Read once.
+    pub fn batch_size(self, rows: usize) -> Self {
+        self.config("server.batch_size", rows.to_string())
+    }
+
+    /// Caps glibc's malloc arenas (`--malloc-arenas`; 0, the default, is
+    /// glibc's own 8 per core). Fewer arenas keep less freed memory per
+    /// thread and cost throughput under concurrency: measured at 16 clients,
+    /// 4 arenas cost 20% of point reads and 12% of inserts for 16% less
+    /// resident memory, and 1 arena 61% and 53% for 11%.
+    ///
+    /// It is the whole process's allocator, the application's threads
+    /// included, and it binds only arenas not yet made: start the engine
+    /// before the application's own thread pools for the full effect. A
+    /// limit once set is not lifted. Ignored (with a logged warning) where
+    /// the allocator is not glibc's.
+    pub fn malloc_arenas(self, arenas: usize) -> Self {
+        self.config("server.malloc_arenas", arenas.to_string())
+    }
+
+    /// Keeps large buffers out of the kernel's hands between statements
+    /// (`--tune-allocator`, default off; glibc only). Worth 1.4x on a single
+    /// large scan and nothing on point lookups; costs about 15% when several
+    /// clients run large scans at once, and holds more memory.
+    pub fn tune_allocator(mut self, on: bool) -> Self {
+        self.settings.tune_allocator = on;
+        self
+    }
+
+    /// Hands freed memory back to the operating system once no statement
+    /// has run for a few seconds (default on; glibc only, where a process
+    /// otherwise holds its high-water mark until it exits). `false` leaves
+    /// the allocator alone, for an application that manages it itself.
+    pub fn idle_trim(mut self, on: bool) -> Self {
+        self.settings.idle_trim = on;
+        self
+    }
+
+    /// Where B-tree, hash, path and gin indexes keep their entries
+    /// (`--index-residency`, default [`IndexResidency::Memory`], every entry
+    /// in RAM). `Hybrid` and `Disk` keep them in sorted files beside the
+    /// table, searched through a block cache, with only recent changes in
+    /// memory. Applies to tables opened afterwards.
+    pub fn index_residency(self, residency: IndexResidency) -> Self {
+        self.config("index.residency", residency.name())
+    }
+
+    /// The paged indexes' block cache in MiB, shared by every table
+    /// (`--index-cache-mb`; 0, the default, is the residency's own: 1024
+    /// for hybrid, 64 for disk).
+    pub fn index_cache_mb(self, mib: u64) -> Self {
+        self.config("index.cache_mb", mib.to_string())
+    }
+
+    /// The memory part each paged index holds before writing it out, in MiB
+    /// (`--index-delta-mb`; 0, the default, is the residency's own: 256 for
+    /// hybrid, 16 for disk).
+    pub fn index_delta_mb(self, mib: u64) -> Self {
+        self.config("index.delta_mb", mib.to_string())
+    }
+
+    /// What an open does with the B-tree, hash and path indexes
+    /// (`--index-storage`): rebuild them from rows (the default), or load
+    /// the snapshot a clean shutdown wrote. Hot:
+    /// `index_snapshot.index_storage`.
+    pub fn index_storage(self, storage: IndexStorage) -> Self {
+        self.config("index_snapshot.index_storage", storage.name())
+    }
+
+    /// The most memory one join may hold for its tuples, in MiB (the
+    /// server's `RDB_JOIN_MEMORY_MB`, default 1024). A join that would grow
+    /// past it fails with SQLSTATE 53200 instead of taking the process
+    /// down. Read once.
+    pub fn join_memory_mb(mut self, mib: usize) -> Self {
+        self.settings.join_memory_mb = Some(mib);
+        self
+    }
+
+    /// Serves repeated queries from a remembered position (`--enable-cache`,
+    /// default off). Read once.
+    pub fn query_cache(self, on: bool) -> Self {
+        self.config("cache.enabled", if on { "true" } else { "false" })
+    }
+
+    /// Entries the query cache holds when it is on (`--cache-size`, default
+    /// 100 000). The first engine in a process to turn the cache on sizes
+    /// it.
+    pub fn query_cache_entries(self, entries: usize) -> Self {
+        self.config("cache.size", entries.to_string())
+    }
+
+    /// Bytes the key/value store may hold, as Redis's `maxmemory`
+    /// (`--kv-max-memory`; 0, the default, is unbounded).
+    pub fn kv_max_memory(mut self, bytes: usize) -> Self {
+        self.settings.kv_max_memory = Some(bytes);
+        self
+    }
+
+    /// What goes when the key/value store is full, as Redis's
+    /// `maxmemory-policy` (`--kv-eviction`, default
+    /// [`KvEviction::NoEviction`]: writes fail instead).
+    pub fn kv_eviction(mut self, policy: KvEviction) -> Self {
+        self.settings.kv_eviction = Some(policy);
+        self
+    }
+
+    /// Saves the key/value store periodically and at a clean shutdown
+    /// (`--kv-persist`, default off: it is a cache).
+    pub fn kv_persist(mut self, on: bool) -> Self {
+        self.settings.kv_persist = Some(on);
+        self
+    }
+
+    /// Time between two periodic saves under [`Builder::kv_persist`]
+    /// (`--kv-save-interval-secs`); at least one second.
+    pub fn kv_save_interval(mut self, interval: Duration) -> Self {
+        self.settings.kv_save_interval = Some(interval);
+        self
+    }
+
+    /// Partitions open at once in this process, across tables
+    /// (`partition.open_budget`, hot). 0, the default, derives it from the
+    /// process's open-file limit: a soft limit of 1024 leaves 16, and
+    /// [`Builder::raise_descriptor_limit`] is the other way out.
+    pub fn partition_open_budget(self, partitions: u64) -> Self {
+        self.config("partition.open_budget", partitions.to_string())
+    }
+
+    /// The most partitions a derived open budget allows (`partition.max_open`,
+    /// `--partition-max-open`, default 4096). With
+    /// [`Builder::raise_descriptor_limit`], the open-file limit is raised for
+    /// this many, ten descriptors each. Read once.
+    pub fn partition_max_open(self, partitions: usize) -> Self {
+        self.config("partition.max_open", partitions.to_string())
+    }
+
+    /// Raises this process's soft open-file limit toward its hard limit, as
+    /// far as the largest partition budget needs, the way the server binary
+    /// does at start (default off: the limit is the application's). Unix
+    /// only. Leave it off in a process that still uses `select(2)`, which
+    /// cannot watch a descriptor above 1023.
+    pub fn raise_descriptor_limit(mut self, raise: bool) -> Self {
+        self.settings.raise_descriptor_limit = raise;
+        self
+    }
+
+    /// Whether a commit waits for its `fdatasync` (`--synchronous-commit`,
+    /// default on; hot: `wal.synchronous_commit`). Off, a commit returns
+    /// once its records are in the page cache: an operating-system crash or
+    /// power loss can then lose the last [`Builder::wal_writer_delay`] of
+    /// transactions, whole ones off the end of the log, never part of one.
+    /// A crash of the process alone loses nothing.
+    pub fn synchronous_commit(self, on: bool) -> Self {
+        self.config("wal.synchronous_commit", if on { "on" } else { "off" })
+    }
+
+    /// How long an asynchronous commit may go unsynced
+    /// (`--wal-writer-delay-ms`, default 200 ms; hot:
+    /// `wal.writer_delay_ms`). Unused while commits are synchronous.
+    pub fn wal_writer_delay(self, delay: Duration) -> Self {
+        self.config("wal.writer_delay_ms", delay.as_millis().to_string())
+    }
+
+    /// Log bytes between checkpoints (`--wal-checkpoint-bytes`, default
+    /// 64 MiB). Larger means fewer checkpoints and a longer replay after a
+    /// crash. Read once.
+    pub fn wal_checkpoint_bytes(self, bytes: u64) -> Self {
+        self.config("wal.checkpoint_bytes", bytes.to_string())
+    }
+
+    /// KiB of zeros the log is extended by ahead of its appends
+    /// (`--wal-prealloc-kb`, default 1024; 0 turns it off). It about halves
+    /// a commit's sync on ext4 and costs up to this much disk per log. Read
+    /// once.
+    pub fn wal_prealloc_kb(self, kib: u64) -> Self {
+        self.config("wal.prealloc_kb", kib.to_string())
+    }
+
+    /// Compacts tables and partitions whose pointer slots are mostly dead
+    /// without being asked (`--auto-compact`, default on; hot:
+    /// `auto_compact.enabled`, and the other `auto_compact.*` keys through
+    /// [`Builder::config`]).
+    pub fn auto_compact(self, on: bool) -> Self {
+        self.config("auto_compact.enabled", if on { "on" } else { "off" })
+    }
+
+    /// Records what each statement cost, for `SHOW QUERIES` and
+    /// `SHOW QUERY STATS` (`--query-stats`, default on; hot:
+    /// `query_stats.enabled`). Off, a statement skips the record and the one
+    /// lock every statement otherwise takes for it.
+    pub fn query_stats(self, on: bool) -> Self {
+        self.config("query_stats.enabled", if on { "on" } else { "off" })
+    }
+
+    /// The instruction set the vector kernels use (`--simd`; default: the
+    /// best this CPU supports). A level the CPU cannot run makes
+    /// [`Builder::start`] fail rather than fall back.
+    pub fn simd(mut self, level: SimdLevel) -> Self {
+        self.settings.simd = Some(level);
+        self
+    }
+
+    /// Drops rows a `WHERE` clause cannot match before fetching them
+    /// (`--scan-prefilter`, default on).
+    pub fn scan_prefilter(mut self, on: bool) -> Self {
+        self.settings.scan_prefilter = Some(on);
+        self
+    }
+
+    /// Stores a new JSON/JSONB column by taking its documents apart into a
+    /// table of their own instead of as bytes (`--json-shadow-tables`,
+    /// default off). Only for documents that share a small, stable set of
+    /// keys: with keys that are data, such a column loads quadratically.
+    /// Columns that already exist keep what they are. Read once.
+    pub fn json_shadow_tables(mut self, on: bool) -> Self {
+        self.settings.json_shadow_tables = Some(on);
+        self
+    }
+
+    /// Settles long-finished transaction outcomes so the status log's
+    /// memory stops growing with every transaction ever run
+    /// (`--settle-status-at-open`, default on; `false` is the kill switch).
+    pub fn settle_status(mut self, on: bool) -> Self {
+        self.settings.settle_status = Some(on);
+        self
+    }
+
     /// Opens the database and starts serving it. Callable from any async
     /// runtime: the engine runs on threads of its own.
     pub async fn start(self) -> io::Result<Embedded> {
@@ -171,6 +544,14 @@ impl Builder {
     }
 
     fn launch(self) -> io::Result<(oneshot::Receiver<io::Result<Ready>>, Embedded)> {
+        // First: a refused start must leave the running engine's settings
+        // alone. Held by the engine thread until it ends; dropped here if
+        // the start fails before that thread exists.
+        let slot = EngineSlot::take()?;
+        // Before anything the engine starts: none of it may take the
+        // host's Ctrl+C or SIGTERM.
+        rasterizeddb_core::shutdown::set_signal_hooks(false);
+
         let missing = rasterizeddb_core::simds::cpu::features().baseline_missing();
         if !missing.is_empty() {
             return Err(io::Error::new(
@@ -231,6 +612,13 @@ impl Builder {
             }
         };
 
+        // After the checks on this Builder's own arguments, so a start they
+        // refuse leaves the process's settings alone; before any engine
+        // thread exists.
+        let deferred = self
+            .settings
+            .apply(root.as_deref().map(std::path::Path::new))?;
+
         let private_dir = private_socket_dir()?;
         let listen = NativeListen {
             addr: "127.0.0.1".to_string(),
@@ -253,7 +641,10 @@ impl Builder {
             .name("rasterizeddb-engine".to_string())
             .stack_size(ENGINE_STACK)
             .spawn(move || {
-                let result = engine_thread(root, auth, listen, workers, ready_tx, stop_rx);
+                let result = engine_thread(root, auth, listen, workers, deferred, ready_tx, stop_rx);
+                // Free before the result is sent: a caller that awaits
+                // `shutdown` and starts again at once must find it free.
+                drop(slot);
                 let _ = done_tx.send(result);
             });
         let thread = match spawned {
@@ -268,6 +659,7 @@ impl Builder {
             Embedded {
                 endpoint: String::new(),
                 login,
+                fingerprint: None,
                 catalog: None,
                 stop: Some(stop_tx),
                 done: Some(done_rx),
@@ -278,9 +670,40 @@ impl Builder {
     }
 }
 
+/// The process's one running engine ([`Builder::start`]).
+static ENGINE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Holds [`ENGINE_RUNNING`] until dropped.
+struct EngineSlot;
+
+impl EngineSlot {
+    fn take() -> io::Result<Self> {
+        ENGINE_RUNNING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| EngineSlot)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "an embedded engine already runs in this process: its settings are process-wide \
+                     and SET CONFIG saves to its directory, so a second engine alongside it would \
+                     change both. Stop the first (Embedded::shutdown), or serve more databases \
+                     from it with CREATE DATABASE",
+                )
+            })
+    }
+}
+
+impl Drop for EngineSlot {
+    fn drop(&mut self) {
+        ENGINE_RUNNING.store(false, Ordering::Release);
+    }
+}
+
 struct Ready {
     endpoint: String,
     catalog: rclite::Arc<DatabaseCatalog>,
+    /// The loopback TCP listener's certificate, off unix.
+    fingerprint: Option<[u8; 32]>,
 }
 
 fn engine_thread(
@@ -288,6 +711,7 @@ fn engine_thread(
     auth: NativeAuthConfig,
     listen: NativeListen,
     workers: Option<usize>,
+    deferred: Deferred,
     ready_tx: oneshot::Sender<io::Result<Ready>>,
     stop_rx: oneshot::Receiver<()>,
 ) -> io::Result<()> {
@@ -308,17 +732,42 @@ fn engine_thread(
     };
     let result = runtime.block_on(async move {
         let started = async {
+            use rasterizeddb_core::core::introspect::set_config_at_start;
+            // Named by its key: the engine's own message often is not
+            // ("`x` is not an integer").
+            let refused = |key: &str, value: &str, e: String| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("{key} = {value}: {e}"))
+            };
+            // The hot keys, where the server's flags leave them: set before
+            // a database opens, so the opens see them.
+            for (key, value) in &deferred.before_open {
+                set_config_at_start(None, key, value).await.map_err(|e| refused(key, value, e))?;
+            }
             let catalog = DatabaseCatalog::open(root.as_deref(), DEFAULT_DATABASE_NAME)
                 .await
                 .map_err(|e| io::Error::other(format!("could not open the database: {e}")))?;
+            if !deferred.after_open.is_empty() {
+                let database = catalog
+                    .get(catalog.default_name())
+                    .ok_or_else(|| io::Error::other("the catalogue holds no default database"))?;
+                for (key, value) in &deferred.after_open {
+                    set_config_at_start(Some(&database), key, value)
+                        .await
+                        .map_err(|e| refused(key, value, e))?;
+                }
+            }
+            if deferred.idle_trim {
+                rasterizeddb_core::idle_trim::spawn();
+            }
             let server = Database::bind_native_in(catalog.clone(), auth, listen).await?;
             let endpoint = server
                 .socket_endpoint()
                 .or_else(|| server.tcp_endpoint())
                 .ok_or_else(|| io::Error::other("the engine bound no endpoint"))?;
-            io::Result::Ok((catalog, server, endpoint))
+            let fingerprint = server.tcp_certificate_fingerprint();
+            io::Result::Ok((catalog, server, endpoint, fingerprint))
         };
-        let (catalog, server, endpoint) = match started.await {
+        let (catalog, server, endpoint, fingerprint) = match started.await {
             Ok(started) => started,
             Err(e) => {
                 let _ = ready_tx.send(Err(io::Error::new(e.kind(), e.to_string())));
@@ -330,6 +779,7 @@ fn engine_thread(
         let _ = ready_tx.send(Ok(Ready {
             endpoint,
             catalog: catalog.clone(),
+            fingerprint,
         }));
 
         // A stop request, or the Embedded gone without one: either way, stop.
@@ -345,6 +795,13 @@ fn engine_thread(
         // seals and checkpoints at.
         rasterizeddb_core::shutdown::seal_all(&catalog).await;
         rasterizeddb_core::shutdown::finalize();
+        // The logs are checkpointed and this was the process's one engine:
+        // forget them, or every stop and start on another directory would
+        // keep one more open log (and its descriptor) for the life of the
+        // host, and checkpoint it again at every later stop.
+        for (dir, _) in rasterizeddb_core::core::wal::registered() {
+            rasterizeddb_core::core::wal::remove_for(&dir);
+        }
         served
     });
     // Connection tasks may still be parked; bounded so a client that never
@@ -358,6 +815,9 @@ fn engine_thread(
 pub struct Embedded {
     endpoint: String,
     login: Login,
+    /// The loopback TCP listener's certificate (off unix): what
+    /// [`Embedded::options`] pins.
+    fingerprint: Option<[u8; 32]>,
     catalog: Option<rclite::Arc<DatabaseCatalog>>,
     stop: Option<oneshot::Sender<()>>,
     done: Option<oneshot::Receiver<io::Result<()>>>,
@@ -365,10 +825,21 @@ pub struct Embedded {
     private_dir: Option<PathBuf>,
 }
 
+/// The endpoint, and whether the engine is still running; never the login.
+impl std::fmt::Debug for Embedded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Embedded")
+            .field("endpoint", &self.endpoint)
+            .field("running", &self.thread.as_ref().is_some_and(|t| !t.is_finished()))
+            .finish_non_exhaustive()
+    }
+}
+
 impl Embedded {
     fn ready(mut self, ready: Ready) -> Self {
         self.endpoint = ready.endpoint;
         self.catalog = Some(ready.catalog);
+        self.fingerprint = ready.fingerprint;
         self
     }
 
@@ -389,10 +860,17 @@ impl Embedded {
     }
 
     /// The [`Options`] [`Embedded::connect`] uses: the client's defaults with
-    /// this database's login. Adjust and pass to [`Embedded::connect_with`].
+    /// this database's login, and off unix, where the endpoint is a loopback
+    /// TCP port, trust in this engine's own certificate alone (pinned by its
+    /// fingerprint): a process that took the port first cannot pose as it.
+    /// Adjust and pass to [`Embedded::connect_with`].
     pub fn options(&self) -> Options {
         Options {
             login: self.login.clone(),
+            trust: match self.fingerprint {
+                Some(fingerprint) => rasterizeddb_client::Trust::Pinned(vec![fingerprint]),
+                None => Options::default().trust,
+            },
             ..Options::default()
         }
     }
@@ -467,15 +945,24 @@ impl Drop for Embedded {
 #[cfg(unix)]
 fn private_socket_dir() -> io::Result<Option<PathBuf>> {
     use std::os::unix::fs::DirBuilderExt;
+    use std::hash::{BuildHasher, Hasher};
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let base = std::env::temp_dir();
-    let base = if base.as_os_str().len() > 80 { PathBuf::from("/tmp") } else { base };
+    // The whole socket path must fit a sockaddr_un (107 bytes on Linux, 103
+    // on macOS); checking only the base left room for a TMPDIR whose
+    // directory and socket names together ran past it.
+    const SOCKET_PATH_MAX: usize = 100;
+    let fits = |dir: &std::path::Path| dir.join("native.sock").as_os_str().len() <= SOCKET_PATH_MAX;
+    let temp = std::env::temp_dir();
     for _ in 0..16 {
-        let dir = base.join(format!(
-            "rdb-embedded-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        // Unpredictable, so that another local user cannot claim the names
+        // ahead of this process and block its start.
+        let mut random = std::collections::hash_map::RandomState::new().build_hasher();
+        random.write_u64(NEXT.fetch_add(1, Ordering::Relaxed));
+        let name = format!("rdb-embedded-{}-{:016x}", std::process::id(), random.finish());
+        let dir = match temp.join(&name) {
+            dir if fits(&dir) => dir,
+            _ => PathBuf::from("/tmp").join(&name),
+        };
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => return Ok(Some(dir)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,

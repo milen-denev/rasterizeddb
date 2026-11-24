@@ -412,26 +412,36 @@ fn plan_table(table: &SourceTable, options: &ImportOptions) -> Result<TablePlan,
     if !options.skip_constraints {
         let mut used_names: Vec<String> = Vec::new();
         for key in &table.foreign_keys {
-            // This engine's foreign keys are single-column. A composite one
-            // would have to become several, and several single-column keys
-            // forbid different rows from what one composite key forbids — so it
-            // is reported rather than approximated.
-            if key.columns.len() != 1 || key.referenced_columns.len() != 1 {
+            // A composite key is carried over whole, its columns in order on
+            // both sides: as several one-column keys it would forbid
+            // different rows from what the one key forbids.
+            if key.columns.is_empty() || key.columns.len() != key.referenced_columns.len() {
                 notes.push(format!(
-                    "foreign key {} spans several columns, which this engine's foreign keys do \
-                     not; it was not carried over",
-                    key.name
+                    "foreign key {} pairs {} columns with {}, and was not carried over",
+                    key.name,
+                    key.columns.len(),
+                    key.referenced_columns.len()
                 ));
                 continue;
             }
             let name = constraint_name(&key.name, &table.name, &key.columns, &mut used_names);
             let mut statement = format!(
                 "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
-                table.name, name, key.columns[0], key.referenced_table, key.referenced_columns[0]
+                table.name,
+                name,
+                key.columns.join(", "),
+                key.referenced_table,
+                key.referenced_columns.join(", ")
             );
+            if key.match_full && key.columns.len() > 1 {
+                statement.push_str(" MATCH FULL");
+            }
             if let Some(action) = referential_action(key.on_delete) {
                 statement.push_str(" ON DELETE ");
                 statement.push_str(action);
+                if !key.on_delete_columns.is_empty() && matches!(key.on_delete, 'n' | 'd') {
+                    statement.push_str(&format!(" ({})", key.on_delete_columns.join(", ")));
+                }
             }
             if let Some(action) = referential_action(key.on_update) {
                 statement.push_str(" ON UPDATE ");
@@ -821,6 +831,8 @@ mod tests {
             on_delete: 'c',
             on_update: 'a',
             validated: true,
+            match_full: false,
+            on_delete_columns: Vec::new(),
         }];
         let plan = plan_one(source);
         assert_eq!(
@@ -849,6 +861,8 @@ mod tests {
             on_delete: 'a',
             on_update: 'a',
             validated: false,
+            match_full: false,
+            on_delete_columns: Vec::new(),
         }];
         let plan = plan_one(source);
         assert_eq!(
@@ -858,8 +872,10 @@ mod tests {
         assert!(plan.notes.iter().any(|n| n.contains("NOT VALID")), "{:?}", plan.notes);
     }
 
+    /// A composite key is carried over whole, with MATCH FULL and an
+    /// `ON DELETE SET NULL (…)` list, never split into one-column keys.
     #[test]
-    fn a_composite_foreign_key_is_reported_rather_than_split() {
+    fn a_composite_foreign_key_is_carried_over_whole() {
         let mut source = table(
             "child",
             vec![column("a", "int4", true), column("b", "int4", true)],
@@ -869,19 +885,21 @@ mod tests {
             columns: vec!["a".to_string(), "b".to_string()],
             referenced_table: "parent".to_string(),
             referenced_columns: vec!["x".to_string(), "y".to_string()],
-            on_delete: 'a',
-            on_update: 'a',
+            on_delete: 'n',
+            on_update: 'c',
             validated: true,
+            match_full: true,
+            on_delete_columns: vec!["b".to_string()],
         }];
         let plan = plan_one(source);
-        assert!(plan.foreign_keys.is_empty());
-        assert!(
-            plan.notes
-                .iter()
-                .any(|n| n.contains("spans several columns")),
-            "{:?}",
-            plan.notes
+        assert_eq!(
+            plan.foreign_keys,
+            vec![
+                "ALTER TABLE child ADD CONSTRAINT fk FOREIGN KEY (a, b) REFERENCES parent (x, y) MATCH FULL \
+                 ON DELETE SET NULL (b) ON UPDATE CASCADE"
+            ]
         );
+        assert!(!plan.notes.iter().any(|n| n.contains("fk")), "{:?}", plan.notes);
     }
 
     #[test]

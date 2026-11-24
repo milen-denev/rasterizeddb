@@ -164,8 +164,50 @@ fn tabs(studio: &Studio) -> Element<'_, Message> {
                 .on_press(Message::SelectTab(tab)),
         );
     }
-    container(bar).width(Fill).style(theme::panel_flat).into()
+
+    // Sixteen tabs do not fit a laptop's window beside the sidebar, so the
+    // strip scrolls, with a thin scrollbar under it and `<` `>` at its ends.
+    //
+    // A wheel turned over it moves it too. A horizontal scrollable moves
+    // only for a sideways or shift+wheel scroll, and it takes the first
+    // wheel event of all as its own whatever its direction, so the wheel is
+    // read inside it, by the tabs, which see each event before it does.
+    let along = |x: f32, y: f32| if y != 0.0 { y } else { x };
+    let tabs = iced::widget::mouse_area(bar).on_scroll(move |delta| {
+        Message::ScrollTabs(match delta {
+            iced::mouse::ScrollDelta::Lines { x, y } => -along(x, y) * 60.0,
+            iced::mouse::ScrollDelta::Pixels { x, y } => -along(x, y),
+        })
+    });
+    let strip = scrollable(tabs)
+        .id(tab_strip_id())
+        .direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::new().width(3).scroller_width(3),
+        ))
+        .style(theme::scroller)
+        .width(Fill);
+
+    let arrow = |label: &'static str, by: f32| {
+        button(text(label).size(12).font(theme::MONO))
+            .padding([9, 10])
+            .style(theme::tab(false))
+            .on_press(Message::ScrollTabs(by))
+    };
+    container(
+        row![arrow("<", -TAB_STEP), strip, arrow(">", TAB_STEP)].align_y(Center),
+    )
+    .width(Fill)
+    .style(theme::panel_flat)
+    .into()
 }
+
+/// The tab strip, for the `<` and `>` buttons and the wheel to scroll.
+pub fn tab_strip_id() -> iced::widget::Id {
+    iced::widget::Id::new("tab-strip")
+}
+
+/// How far one press of `<` or `>` moves the tab strip: about two tabs.
+pub const TAB_STEP: f32 = 240.0;
 
 fn pane(studio: &Studio) -> Element<'_, Message> {
     let inner = match studio.tab {
@@ -1396,6 +1438,12 @@ pub fn default_width(header: &str, widest_value: usize) -> f32 {
     (characters as f32 * 7.6 + 26.0).clamp(120.0, 560.0)
 }
 
+/// [`default_width`] for the only column of a result, which may be wider.
+pub fn default_width_alone(header: &str, widest_value: usize) -> f32 {
+    let characters = widest_value.max(header.len());
+    (characters as f32 * 7.6 + 26.0).clamp(120.0, 1400.0)
+}
+
 /// The widths to lay a grid out at: what the user dragged to, or the default.
 pub fn column_widths(layout: &GridLayout<'_>, columns: &[GridColumn]) -> Vec<f32> {
     columns
@@ -1632,7 +1680,9 @@ pub fn grid_row<'a>(
     let mut line = row![].spacing(0);
     for (index, cell) in cells.into_iter().enumerate() {
         let width = widths.get(index).copied().unwrap_or(120.0);
-        line = line.push(container(cell).width(Length::Fixed(width)));
+        // Clipped: a row is a fixed height (`ROW_HEIGHT`), and a value
+        // drawn past its cell lands on the rows below it.
+        line = line.push(container(cell).width(Length::Fixed(width)).clip(true));
         line = line.push(Space::new().width(GRIP));
     }
     line
@@ -1649,6 +1699,7 @@ pub fn grid_cell<'a>(
             .size(11)
             .font(theme::MONO)
             .color(colour)
+            .wrapping(iced::widget::text::Wrapping::None)
             .align_x(if right {
                 iced::alignment::Horizontal::Right
             } else {
@@ -1777,7 +1828,14 @@ pub fn result_grid<'a>(
                 .map(|value| value.as_deref().map_or(4, str::len))
                 .max()
                 .unwrap_or(0);
-            let mut column = GridColumn::new(name.clone(), name.clone(), default_width(name, widest));
+            // A result of one column — an EXPLAIN's `QUERY PLAN` — has the
+            // grid's whole width to itself.
+            let width = if grid.columns.len() == 1 {
+                default_width_alone(name, widest)
+            } else {
+                default_width(name, widest)
+            };
+            let mut column = GridColumn::new(name.clone(), name.clone(), width);
             column.right = numeric(index);
             column
         })
@@ -1955,10 +2013,13 @@ pub fn metric_grid(
 pub fn plain_cell(value: Option<&str>, numeric: bool) -> Element<'_, Message> {
     let content: Element<'_, Message> = match value {
         None => text("∅").size(12).font(theme::MONO).color(theme::TEXT_FAINT).into(),
+        // One line, cut at the cell's edge rather than wrapped onto the
+        // rows below; a narrow column is widened by dragging its edge.
         Some(text_value) => text(elide(text_value, 220))
             .size(12)
             .font(theme::MONO)
             .color(theme::TEXT)
+            .wrapping(iced::widget::text::Wrapping::None)
             .align_x(if numeric {
                 iced::alignment::Horizontal::Right
             } else {

@@ -113,9 +113,16 @@ impl Fixture {
         }
     }
 
-    /// Closes the catalogue and opens it again, as a restart does.
+    /// Closes the catalogue and opens it again, as a restart does. The old
+    /// one goes first: it holds the directory's lock until it is dropped, as
+    /// a stopped server lets go of it, so a client still holding it makes the
+    /// reopen fail ("already open") rather than run two engines on one
+    /// directory.
     async fn reopen(&mut self) {
         self.forget();
+        self.catalog = DatabaseCatalog::open(None, "postgres")
+            .await
+            .expect("an in-memory catalogue in the old one's place");
         self.catalog = DatabaseCatalog::open(Some(&self.root.to_string_lossy()), "postgres")
             .await
             .expect("catalogue reopens");
@@ -565,6 +572,8 @@ async fn branches_survive_a_restart_and_leftovers_are_swept() {
     std::fs::create_dir_all(fx.root.join(".branching-half")).unwrap();
     std::fs::write(fx.root.join(".branching-half").join("x.db"), b"junk").unwrap();
 
+    // A restart: the sessions end with the server.
+    drop((admin, dev));
     fx.reopen().await;
     assert!(
         !fx.root.join(".branching-half").exists(),
@@ -937,6 +946,113 @@ async fn a_promoted_middle_takes_its_branches_with_it() {
         prod.rows("SELECT name, qty FROM items WHERE id = 1").await,
         vec![row(&["dev", "77"])]
     );
+}
+
+/// A table placed on a second disk, and partitions dealt over it, come over
+/// as the branch's own: the branch's pool file names its own copy of the
+/// disk, never the parent's, so its reads hold every row and its writes
+/// leave the parent's disk as it was. A branch whose pool file kept the
+/// parent's path would read and write the parent's files; one that lost
+/// the placement would read the table as empty. Both silently.
+#[cfg(feature = "storage_pools")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_table_on_a_second_disk_comes_over_as_the_branchs_own() {
+    let fx = seeded("disk").await;
+    let disk = tempfile::tempdir().unwrap();
+    let disk_path = disk.path().to_string_lossy().into_owned();
+    let mut prod = fx.client("prod");
+    prod.exec(&format!("STORAGE ADD LOCATION '{disk_path}'")).await;
+    prod.exec(&format!("STORAGE PLACE TABLE far AT '{disk_path}'")).await;
+    prod.exec("CREATE TABLE far (id INT PRIMARY KEY, what TEXT)").await;
+    let rows: Vec<String> = (0..50).map(|i| format!("({i}, 'f{i}')")).collect();
+    prod.exec(&format!("INSERT INTO far (id, what) VALUES {}", rows.join(", "))).await;
+    prod.exec("STORAGE SET POLICY = 'round-robin'").await;
+    prod.exec("CREATE TABLE spread (k BIGINT NOT NULL PRIMARY KEY, n INT) PARTITION BY HASH (k) PARTITIONS 4")
+        .await;
+    let rows: Vec<String> = (0..40).map(|i| format!("({i}, {i})")).collect();
+    prod.exec(&format!("INSERT INTO spread (k, n) VALUES {}", rows.join(", "))).await;
+    // Each file's contents, read through the file. Not the directory entry's
+    // size: on Windows that is what FindNextFile cached, which NTFS updates
+    // lazily for a file the server holds open (CI read 0 for every row file).
+    let on_disk = |dir: &std::path::Path| -> Vec<(String, Vec<u8>)> {
+        let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".db"))
+            .map(|name| {
+                let bytes = std::fs::read(dir.join(&name)).unwrap();
+                (name, bytes)
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let names = |files: &[(String, Vec<u8>)]| -> Vec<String> { files.iter().map(|(n, _)| n.clone()).collect() };
+    let placed = on_disk(disk.path());
+    assert!(placed.iter().any(|(n, b)| n == "far.db" && !b.is_empty()), "far's rows are not on the disk: {:?}", names(&placed));
+    assert!(
+        placed.iter().any(|(n, b)| n.starts_with("__pt_") && !b.is_empty()),
+        "no partition's rows were dealt to the disk, so the test does not cover them: {:?}",
+        names(&placed)
+    );
+
+    let mut admin = fx.client("postgres");
+    admin.exec("CREATE BRANCH dev FROM prod").await;
+    // The parent's disk as the branch leaves it: what follows writes only to
+    // the branch.
+    let parent_disk = on_disk(disk.path());
+    // Every location and placement names the branch's own directory. The
+    // parent's disk appears only as an alias's source, mapped into the
+    // branch, which is how a partition map naming the old path resolves.
+    let dev_dir = fx.root.join("dev").to_string_lossy().into_owned();
+    let pool = std::fs::read_to_string(fx.root.join("dev").join(crate::core::storage::POOL_FILE)).unwrap();
+    for line in pool.lines().filter(|l| !l.starts_with('#')) {
+        let fields: Vec<&str> = line.split('\t').collect();
+        match fields.as_slice() {
+            ["location", .., at] | ["table", at, _] => assert!(
+                at.starts_with(&dev_dir) || *at == "memory",
+                "the branch's pool file places outside the branch:\n{pool}"
+            ),
+            ["alias", _, to] => assert!(to.starts_with(&dev_dir), "an alias leaves the branch:\n{pool}"),
+            _ => {}
+        }
+    }
+
+    let mut dev = fx.client("dev");
+    assert_eq!(dev.scalar("SELECT COUNT(*) FROM far").await, "50");
+    assert_eq!(dev.scalar("SELECT what FROM far WHERE id = 7").await, "f7");
+    assert_eq!(dev.scalar("SELECT COUNT(*) FROM spread").await, "40");
+
+    // The branch's writes are its own: the parent's disk is untouched.
+    dev.exec("DELETE FROM far WHERE id < 10").await;
+    dev.exec("INSERT INTO far (id, what) VALUES (100, 'dev')").await;
+    dev.exec("UPDATE spread SET n = n + 1000").await;
+    dev.exec("INSERT INTO spread (k, n) VALUES (100, 100)").await;
+    let after = on_disk(disk.path());
+    assert!(
+        after == parent_disk,
+        "a write to the branch changed the parent's disk: {:?} became {:?}",
+        parent_disk.iter().map(|(n, b)| (n.as_str(), b.len())).collect::<Vec<_>>(),
+        after.iter().map(|(n, b)| (n.as_str(), b.len())).collect::<Vec<_>>()
+    );
+    assert_eq!(prod.scalar("SELECT COUNT(*) FROM far").await, "50");
+    assert_eq!(prod.scalar("SELECT SUM(n) FROM spread").await, "780");
+
+    // And a restart reads both back the same.
+    drop((dev, prod, admin));
+    let mut fx = fx;
+    fx.reopen().await;
+    let mut dev = fx.client("dev");
+    let mut prod = fx.client("prod");
+    assert_eq!(dev.scalar("SELECT COUNT(*) FROM far").await, "41");
+    assert_eq!(dev.scalar("SELECT COUNT(*) FROM spread").await, "41");
+    assert_eq!(dev.scalar("SELECT SUM(n) FROM spread").await, "40880");
+    assert_eq!(prod.scalar("SELECT COUNT(*) FROM far").await, "50");
+    assert_eq!(prod.scalar("SELECT SUM(n) FROM spread").await, "780");
+    drop((dev, prod));
+    crate::core::wal::remove_for(&disk_path);
 }
 
 #[cfg(all(feature = "storage_pools", feature = "kv_storage"))]

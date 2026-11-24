@@ -229,7 +229,8 @@ fn twin_rows(rows: &[Vec<(String, String)>], key: &str, table: &str, skip: &[&st
 }
 
 /// I8's catalogue half, insert-only: the partitioned table is listed once
-/// in `pg_class` (relkind `'r'`), `pg_stat_user_tables`,
+/// in `pg_class` (relkind `'p'`, PostgreSQL's partitioned parent, with its
+/// `pg_partitioned_table` row), `pg_stat_user_tables`,
 /// `information_schema.tables` and `.columns`, and `SHOW TABLES`, never a
 /// partition; its live and dead counts equal its plain twin's; its sizes are
 /// the sum over its partitions plus its parent files; its implicit PK index
@@ -260,7 +261,7 @@ async fn a_partitioned_table_reports_what_its_plain_twin_does() {
     assert!(totals.schema > 0 && totals.map > 0 && totals.ids == 8, "parent files: {totals:?}");
     let expected_bytes = partition_bytes + totals.schema + totals.map + totals.ids;
 
-    // pg_class: once each, relkind 'r', the twin's tuple count, and the size
+    // pg_class: once each, relkind 'p' (the twin 'r'), the twin's tuple count, and the size
     // of every file the table has.
     let class = view(&db, "pg_class").await;
     for r in &class {
@@ -268,7 +269,16 @@ async fn a_partitioned_table_reports_what_its_plain_twin_does() {
     }
     let pt_class = only(&class, "relname", "pt");
     let twin_class = only(&class, "relname", "twin");
-    assert_eq!(get(pt_class, "relkind"), "r");
+    assert_eq!(get(pt_class, "relkind"), "p");
+    assert_eq!(get(twin_class, "relkind"), "r");
+    // One pg_partitioned_table row, the partitioned table's: hash, one key
+    // column, no default partition.
+    let parted = view(&db, "pg_partitioned_table").await;
+    assert_eq!(parted.len(), 1, "{parted:?}");
+    assert_eq!(get(&parted[0], "partrelid"), get(pt_class, "oid"));
+    assert_eq!(get(&parted[0], "partstrat"), "h");
+    assert_eq!(get(&parted[0], "partnatts"), "1");
+    assert_eq!(get(&parted[0], "partdefid"), "0");
     assert_eq!(get(pt_class, "reltuples"), ROWS.to_string());
     assert_eq!(get(pt_class, "reltuples"), get(twin_class, "reltuples"));
     assert_eq!(get(pt_class, "relsize"), expected_bytes.to_string());

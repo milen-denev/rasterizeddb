@@ -273,6 +273,71 @@ pub fn strip_redundant_cast(text: &str) -> &str {
     }
 }
 
+/// The expression inside parentheses that enclose the **whole** of it, peeled
+/// as many times as they are written: `('[]'::jsonb)` is `'[]'::jsonb`, as
+/// PostgreSQL reads it (and as `pg_dump` and ORMs write a default). `(a) + (b)`
+/// is left alone: its first `(` closes before the end. Quotes are honoured, so
+/// a `)` inside a string literal closes nothing.
+fn peel_enclosing_parens(mut text: &str) -> &str {
+    loop {
+        let t = text.trim();
+        if !(t.starts_with('(') && t.ends_with(')')) {
+            return t;
+        }
+        let bytes = t.as_bytes();
+        let mut depth = 0i32;
+        let mut in_quote = false;
+        let mut encloses = true;
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_quote {
+                if b == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
+                        i += 1;
+                    } else {
+                        in_quote = false;
+                    }
+                }
+            } else if b == b'\'' {
+                in_quote = true;
+            } else if b == b'(' {
+                depth += 1;
+            } else if b == b')' {
+                depth -= 1;
+                if depth == 0 && i != bytes.len() - 1 {
+                    encloses = false;
+                    break;
+                }
+            }
+            i += 1;
+        }
+        if !encloses || depth != 0 || in_quote {
+            return t;
+        }
+        text = &t[1..t.len() - 1];
+    }
+}
+
+/// A quoted literal under an array cast, `'{}'::text[]`, is that literal: the
+/// column is an array and says so ([`strip_redundant_cast`] takes only a bare
+/// type name, so the `[]` kept it). Anything but a whole quoted literal is
+/// left as written.
+fn strip_array_literal_cast(text: &str) -> &str {
+    let Some(at) = text.rfind("::") else {
+        return text;
+    };
+    let head = text[..at].trim_end();
+    let tail = text[at + 2..].trim();
+    let Some(base) = tail.strip_suffix("[]") else {
+        return text;
+    };
+    let is_type_name = !base.is_empty()
+        && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ' ');
+    let quoted = head.len() >= 2 && head.starts_with('\'') && head.ends_with('\'');
+    if is_type_name && quoted { head } else { text }
+}
+
 /// The `real` a literal under a `real` cast spells (`'0.1'::real`,
 /// `0.1::float4`), when it is one: bound for a `double precision` column it
 /// is that `real` widened (0.10000000149011612), as PostgreSQL stores it,
@@ -406,6 +471,19 @@ pub fn validate(expression: &str, db_type: &DbType, own_scale: bool) -> Result<(
     Ok(())
 }
 
+/// `KEYWORD(p)` for the clock keywords that take a precision, upper-cased:
+/// the keyword and the precision (6 at most, as PostgreSQL reduces it).
+fn clock_precision(upper: &str) -> Option<(String, u32)> {
+    let open = upper.find('(')?;
+    let keyword = upper[..open].trim_end();
+    if !matches!(keyword, "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" | "CURRENT_TIME" | "LOCALTIME") {
+        return None;
+    }
+    let digits = upper[open + 1..].trim_end().strip_suffix(')')?.trim();
+    let precision = digits.parse::<u32>().ok()?;
+    Some((keyword.to_string(), precision.min(6)))
+}
+
 /// [`evaluate`], or with `database` absent [`validate`].
 fn evaluate_in(
     expression: &str,
@@ -419,7 +497,7 @@ fn evaluate_in(
             return Ok(crate::core::value_codec::widened_real_text(v));
         }
     }
-    let text = strip_redundant_cast(expression.trim());
+    let text = strip_array_literal_cast(strip_redundant_cast(peel_enclosing_parens(expression.trim())));
     let upper = text.to_ascii_uppercase();
 
     if text.is_empty() || upper == "NULL" {
@@ -434,6 +512,20 @@ fn evaluate_in(
     // statement and every statement of a block take one value; the
     // statement's start for `statement_timestamp()`; the wall clock, per row,
     // for `clock_timestamp()`.
+    // `CURRENT_TIMESTAMP(3)`: the keyword, its value at that many fractional
+    // digits. It was refused ("DEFAULT CURRENT_TIMESTAMP(3) is not
+    // supported"), and the table with it.
+    let (upper, precision) = match clock_precision(&upper) {
+        Some((keyword, precision)) => (keyword, Some(precision)),
+        None => (upper, None),
+    };
+    let rounded = |micros: i64| match precision {
+        Some(digits) if digits < 6 => {
+            let unit = 10i64.pow(6 - digits);
+            (micros + unit / 2).div_euclid(unit) * unit
+        }
+        _ => micros,
+    };
     let clock = match upper.as_str() {
         "CURRENT_TIMESTAMP" | "NOW()" | "CURRENT_TIMESTAMP()" | "LOCALTIMESTAMP" | "LOCALTIMESTAMP()"
         | "TRANSACTION_TIMESTAMP()" => Some(crate::core::statement_clock::transaction_us()),
@@ -441,7 +533,7 @@ fn evaluate_in(
         "CLOCK_TIMESTAMP()" => Some(crate::core::statement_clock::wall_us()),
         _ => None,
     };
-    if let Some(micros) = clock {
+    if let Some(micros) = clock.map(rounded) {
         // A wall clock defaulting a `DATE` or a `TIME` column is that instant's
         // date or time of day, not the whole timestamp: the column's encoder
         // would refuse the full text, and `DEFAULT now()` on a date column is
@@ -472,7 +564,7 @@ fn evaluate_in(
         upper.as_str(),
         "CURRENT_TIME" | "CURRENT_TIME()" | "LOCALTIME" | "LOCALTIME()"
     ) {
-        let micros = now_micros();
+        let micros = rounded(now_micros());
         return Ok(format!("'{}'", format_time_of(micros, db_type)));
     }
 
@@ -763,6 +855,20 @@ mod tests {
         assert_eq!(evaluate("TRUE", &DbType::BOOL, NO_DB).unwrap(), "1");
         assert_eq!(evaluate("false", &DbType::BOOL, NO_DB).unwrap(), "0");
         assert_eq!(evaluate("NULL", &DbType::STRING, NO_DB).unwrap(), "NULL");
+    }
+
+    /// A default in parentheses, and a literal under an array cast, are the
+    /// literal (pms's `DEFAULT ('[]'::jsonb)`, refused before); a `)` inside
+    /// a string closes nothing, and `(a) + (b)` is not peeled.
+    #[test]
+    fn a_parenthesised_cast_literal_is_the_literal() {
+        assert_eq!(evaluate("('[]'::jsonb)", &DbType::JSONB, NO_DB).unwrap(), "'[]'");
+        assert_eq!(evaluate("(('{}'::jsonb))", &DbType::JSONB, NO_DB).unwrap(), "'{}'");
+        assert_eq!(evaluate("('{}'::text[])", &DbType::STRING, NO_DB).unwrap(), "'{}'");
+        assert_eq!(evaluate("'{}'::text[]", &DbType::STRING, NO_DB).unwrap(), "'{}'");
+        assert_eq!(evaluate("(0)", &DbType::I32, NO_DB).unwrap(), "0");
+        assert_eq!(evaluate("(')(')", &DbType::STRING, NO_DB).unwrap(), "')('");
+        assert_eq!(peel_enclosing_parens("(a) + (b)"), "(a) + (b)");
     }
 
     /// A number defaulting a text column is text, not a number.

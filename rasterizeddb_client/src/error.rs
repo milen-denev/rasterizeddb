@@ -98,10 +98,54 @@ impl Error {
     }
 
     /// Whether the server abandoned the statement at its request timeout
-    /// (`--rdb-request-timeout`, 30 s by default). Whether a write had taken
-    /// effect is unknown, as for any [`Error::Transport`].
+    /// (`--rdb-request-timeout`, 30 s by default) without stopping it.
+    /// Whether a write had taken effect is unknown, as for any
+    /// [`Error::Transport`]. A server that stops its statements itself
+    /// answers [`Error::is_statement_timeout`] instead.
     pub fn is_server_timeout(&self) -> bool {
         matches!(self, Error::Transport(RastcpError::HandlerTimeout))
+    }
+
+    /// Whether the server stopped the statement at its statement timeout
+    /// (SQLSTATE `57014`): its request timeout, `--rdb-request-timeout`
+    /// (30 s by default), or a transaction's `SET statement_timeout`.
+    /// Nothing of it took effect, and the connection goes on; inside a
+    /// transaction the transaction is failed, as by any failed statement
+    /// (later statements `25P02` until it rolls back).
+    pub fn is_statement_timeout(&self) -> bool {
+        self.sqlstate() == Some("57014")
+    }
+
+    /// Whether nothing came back in time on this side: the connection could
+    /// not be opened, logged in to, or answered within
+    /// [`Options::timeout`](crate::Options::timeout) (or the 10 s a login
+    /// has). The statement may or may not have run, and if it did it may
+    /// still be running on the server: a timeout here does not stop it. See
+    /// [`Error::is_server_timeout`] for the server's own timeout.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Error::Transport(RastcpError::ConnectionTimeout))
+    }
+
+    /// Whether an answer was longer than
+    /// [`Options::max_message_size`](crate::Options::max_message_size). The
+    /// statement ran; its answer was not read, and the connection it came on
+    /// was closed (the next statement opens another). Select fewer rows or
+    /// columns at once, page with `LIMIT`, or raise the limit.
+    pub fn is_message_too_large(&self) -> bool {
+        matches!(self, Error::Transport(RastcpError::MessageTooLarge { .. }))
+    }
+
+    /// Whether the connection closed or broke under the statement, rather
+    /// than timing out or being refused: the server restarted or dropped
+    /// it, or another request's failure ended the connection they shared.
+    /// The statement may or may not have run. A lost transaction
+    /// ([`Error::TransactionLost`]) is one too.
+    pub fn is_connection_lost(&self) -> bool {
+        matches!(
+            self,
+            Error::Transport(RastcpError::ConnectionClosed | RastcpError::Io(_))
+                | Error::TransactionLost { .. }
+        )
     }
 
     /// Whether [`connect`](crate::Client::connect) failed because it named a
@@ -124,8 +168,9 @@ impl Error {
     /// Statements run inside a transaction are answered by the server's
     /// transaction machinery, which ends each error message with
     /// `(SQLSTATE xxxxx)`; that code is returned. A statement outside a
-    /// transaction carries no code (the native protocol has no field for
-    /// it), and this is `None`.
+    /// transaction mostly carries no code (the native protocol has no field
+    /// for it), and this is `None`; one stopped at the statement timeout
+    /// carries `57014` either way.
     pub fn sqlstate(&self) -> Option<&str> {
         let message = self.server_message()?;
         let rest = message.strip_suffix(')')?;
@@ -234,5 +279,28 @@ impl std::error::Error for Error {
 impl From<RastcpError> for Error {
     fn from(e: RastcpError) -> Self {
         Error::Transport(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_transport_failure_answers_one_question() {
+        let timeout = Error::Transport(RastcpError::ConnectionTimeout);
+        let large = Error::Transport(RastcpError::MessageTooLarge { len: 9, max: 8 });
+        let closed = Error::Transport(RastcpError::ConnectionClosed);
+        let lost = Error::TransactionLost {
+            commit_outcome_unknown: false,
+            message: String::new(),
+        };
+        let server = Error::Server("no".into());
+
+        assert!(timeout.is_timeout() && !timeout.is_message_too_large() && !timeout.is_connection_lost());
+        assert!(large.is_message_too_large() && !large.is_timeout() && !large.is_connection_lost());
+        assert!(closed.is_connection_lost() && !closed.is_timeout());
+        assert!(lost.is_connection_lost());
+        assert!(!server.is_timeout() && !server.is_message_too_large() && !server.is_connection_lost());
     }
 }

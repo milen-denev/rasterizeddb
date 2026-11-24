@@ -698,6 +698,15 @@ impl ReplicationConfig {
                     .to_string(),
             );
         }
+        self.validate_settings()
+    }
+
+    /// [`ReplicationConfig::validate`] without the node id: what a node that
+    /// is not replicating, and has not been given an id yet, may hold. A
+    /// server started without `--node-id` keeps its settings in this state
+    /// until `REPLICATION SET node_id` and `REPLICATION ENABLE`, and each of
+    /// them is still checked for itself.
+    pub fn validate_settings(&self) -> Result<(), String> {
         if self.listen_port == 0 {
             return Err("replication needs a listen port".to_string());
         }
@@ -829,6 +838,15 @@ mod tests {
     fn a_node_without_an_id_cannot_replicate() {
         let config = ReplicationConfig::default();
         assert!(config.validate().is_err(), "node id 0 is not a node id");
+    }
+
+    #[test]
+    fn the_settings_of_a_node_without_an_id_are_still_checked() {
+        let mut config = ReplicationConfig::default();
+        assert!(config.validate_settings().is_ok(), "the defaults, with no id yet");
+        config.batch_max_records = 0;
+        assert!(config.validate_settings().is_err());
+        assert!(config.validate().is_err());
     }
 
     #[test]

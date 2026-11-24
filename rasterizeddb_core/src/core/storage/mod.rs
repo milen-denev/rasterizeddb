@@ -382,6 +382,12 @@ impl StorageManager {
         let path = Path::new(&root).join(POOL_FILE);
         match std::fs::read_to_string(&path) {
             Ok(text) => {
+                // A copy is adopted or refused before anything resolves a
+                // table through it (`adopt_copied_pool`).
+                let text = match adopt_copied_pool(&text, &root, &path)? {
+                    Some(rewritten) => rewritten,
+                    None => text,
+                };
                 warn_if_written_elsewhere(&text, &root, &path);
                 let mut state = manager.state.write();
                 if let Err(e) = parse_into(&text, &root, &mut state) {
@@ -1364,6 +1370,138 @@ pub fn repoint_restored_pool(
     dropped.sort();
     dropped.dedup();
     Ok(dropped)
+}
+
+/// Whether `a` and `b` name one directory: equal once normalised, or the
+/// same directory reached two ways (a symlink, a bind mount seen through its
+/// path), which is not a copy.
+fn same_directory(a: &str, b: &str) -> bool {
+    if normalize(a) == normalize(b) {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// A pool file that names none of `root` among its primary locations was
+/// written for another directory and copied here: a backup mirror opened as a
+/// database (the file names the mirror only as its *backup* location), an
+/// rsync or a `cp -a` of a data directory, a directory moved by hand. Read as
+/// it is, its placements resolve this database's tables to the original's
+/// files: reads answer from there and writes land there, silently.
+///
+/// So such a file is adopted or refused, never used as it is:
+///
+/// - **Adopted** when the copy is unambiguous: one primary location (the
+///   directory the file was written for), every table placed there or in
+///   memory, and no aliases. Every file such a database has is in the copy,
+///   so the primary becomes `root`. Backup locations are dropped: the copy
+///   mirroring into the original's backup disk would overwrite it (and a
+///   mirror opened directly names itself there). The file is rewritten before
+///   anything opens, and the start says what changed.
+/// - **Refused** otherwise: tables on other disks, on a key/value store, or
+///   behind a restore's aliases are the original's files under any reading,
+///   and which of them the copy carries cannot be told from here. `RESTORE`
+///   repoints them ([`repoint_restored_pool`]); a hand-made copy has to be
+///   edited or have the file removed.
+///
+/// `Ok(None)` when the file is this directory's own.
+fn adopt_copied_pool(text: &str, root: &str, path: &Path) -> Result<Option<String>, String> {
+    let mut primaries: Vec<String> = Vec::new();
+    let mut backups: Vec<String> = Vec::new();
+    for line in text.lines().filter(|line| !line.starts_with('#')) {
+        if let ["location", role, _, _, at] = line.split('\t').collect::<Vec<_>>().as_slice() {
+            match LocationRole::parse(role) {
+                Some(LocationRole::Primary) => primaries.push(normalize(at)),
+                _ => backups.push(normalize(at)),
+            }
+        }
+    }
+    // No locations: nothing is placed, and nothing can resolve elsewhere.
+    if primaries.is_empty() || primaries.iter().any(|at| same_directory(at, root)) {
+        return Ok(None);
+    }
+    let own = primaries[0].clone();
+    let refuse = |why: String| -> Result<Option<String>, String> {
+        Err(format!(
+            "{} was written for {own}, not for {root}: this directory is a copy of that database \
+             (a mirror opened directly, or a directory copied or moved by hand), and {why}. Opening \
+             it as it is would read and write the original's files, so it is not opened. Restore \
+             it with RESTORE, which repoints such a copy, or edit or remove {}",
+            path.display(),
+            path.display()
+        ))
+    };
+    if primaries.len() > 1 {
+        return refuse(format!("the database also keeps files on {}", primaries[1..].join(", ")));
+    }
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        match line.split('\t').collect::<Vec<_>>().as_slice() {
+            ["location", role, weight, enabled, at] => {
+                if LocationRole::parse(role) == Some(LocationRole::Primary) {
+                    debug_assert_eq!(normalize(at), own);
+                    out.push_str(&format!("location\t{role}\t{weight}\t{enabled}\t{root}\n"));
+                }
+                // A backup location: dropped (above).
+            }
+            ["alias", from, to] => {
+                return refuse(format!("a restore recorded {from} as {to}"));
+            }
+            ["table", at, table] => match TableBackend::parse(at) {
+                TableBackend::Memory => {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                TableBackend::KeyValue(store) => {
+                    return refuse(format!("its table {table} is kept in the key/value store {store}"));
+                }
+                TableBackend::Directory(dir) if normalize(&dir) == own => {
+                    out.push_str(&format!("table\t{root}\t{table}\n"));
+                }
+                TableBackend::Directory(dir) => {
+                    return refuse(format!("its table {table} is placed in {dir}"));
+                }
+            },
+            _ => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    // Written before anything opens through it, through a temporary file and
+    // a rename, for the reason `persist` gives. A copy that cannot be adopted
+    // on disk is not opened either: the next start would find it unadopted.
+    let temp = path.with_file_name(format!("{}.tmp", POOL_FILE));
+    let written = std::fs::write(&temp, out.as_bytes())
+        .and_then(|_| crate::core::sync_path::sync_file(&temp))
+        .and_then(|_| std::fs::rename(&temp, path))
+        .and_then(|_| crate::core::wal::sync_parent_dir(path));
+    if let Err(e) = written {
+        return refuse(format!("rewriting it for this directory failed ({e})"));
+    }
+    warn!(
+        "{} was written for {own}; this directory is a copy of that database, so the file now \
+         names {root} as its location{}",
+        path.display(),
+        if backups.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", and no longer mirrors into {} (the original's backup location{})",
+                backups.join(", "),
+                if backups.len() == 1 { "" } else { "s" }
+            )
+        }
+    );
+    Ok(Some(out))
 }
 
 /// Says so when a pool file was written for a different directory.

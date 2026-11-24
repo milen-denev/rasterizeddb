@@ -1,12 +1,13 @@
 [package]
 name = "rasterizeddb_core"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 repository = "https://github.com/milen-denev/rasterizeddb"
 license = "GPL-3.0-only"
-keywords = ["database", "embedded-database"]
+keywords = ["database", "sql", "postgresql", "server", "mvcc"]
+categories = ["database-implementations", "database"]
 authors = ["Milen Denev"]
-description = "A schemafull, high-performance database written in Rust, designed for speed and scalability."
+description = "The RasterizedDB server and engine: a SQL database speaking the PostgreSQL, MySQL, SQL Server and native protocols, with MVCC, a write-ahead log, replication and S3 backup."
 
 [dependencies]
 # `AT TIME ZONE`: zone rules from the system's tz database
@@ -48,7 +49,7 @@ dashmap = "6.2"
 # `--log-level trace` in a release build shows at most debug.
 log = { version = "0.4", features = ["release_max_level_debug"] }
 libmimalloc-sys = "0.1"
-rastcp = { path = "../rastcp", version = "1.0.0" }
+rastcp = { path = "../rastcp", version = "1.0.1" }
 env_logger = "0.11"
 crc = "3.4"
 # CRC-32/ISO-HDLC with PCLMULQDQ: the WAL, replication log, backup archives and
@@ -166,6 +167,12 @@ harness = false
 [[bench]]
 name = "vacuum_benchmarks"
 harness = false
+
+[[example]]
+name = "kv_table_bench"
+# It places tables on a key/value store (`STORAGE ADD STORE`, `STORAGE
+# PLACE TABLE`, `core::storage`), which only `kv_storage` builds.
+required-features = ["kv_storage"]
 
 [features]
 default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3", "query_stats", "kv_cache", "persistent_indexes", "mysql_wire", "mssql_wire", "db_branching"]

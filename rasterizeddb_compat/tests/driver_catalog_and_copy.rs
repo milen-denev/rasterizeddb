@@ -292,3 +292,89 @@ async fn join_conditions_read_bare_names_and_lines() {
         ["x", "z"]
     );
 }
+
+/// A partitioned table is PostgreSQL's partitioned parent: relkind `'p'`, a
+/// `pg_partitioned_table` row, `pg_get_partkeydef`, and the queries `psql`
+/// 18's `\d` and `\d+` send for one, each written as `psql` writes it
+/// (`'…'::pg_catalog.regclass`, `pg_partition_ancestors(oid)` in a `FROM`
+/// list, `attstorage`). `\d` of a partitioned table failed: relkind `'r'`
+/// hid what it was, and once `'p'` the foreign-key query named a function
+/// the engine did not have. Its partitions are not relations a client can
+/// name, so `pg_inherits` stays empty.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partitioned_table_is_described_as_a_partitioned_parent() {
+    // On files: an in-memory database refuses partitioned tables.
+    struct OnDisk(std::path::PathBuf);
+    impl Drop for OnDisk {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = OnDisk(std::env::temp_dir().join(format!("driver_catalog_partitioned_{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&root.0);
+    std::fs::create_dir_all(&root.0).expect("a database directory");
+    let server = TestServer::start_file_backed(&root.0.to_string_lossy()).await.expect("server");
+    let c = connect(&server).await;
+    c.batch_execute(
+        "CREATE TABLE ev (tenant_id BIGINT NOT NULL, grp INT NOT NULL, id BIGINT NOT NULL, v TEXT, \
+         PRIMARY KEY (tenant_id, grp, id)) PARTITION BY HASH (tenant_id, grp) PARTITIONS 8",
+    )
+    .await
+    .expect("create");
+
+    assert_eq!(
+        rows(&c, "SELECT relname, relkind, relam FROM pg_class WHERE relname IN ('ev', 'items') ORDER BY relname").await,
+        ["ev|p|0", "items|r|2"]
+    );
+    assert_eq!(
+        rows(&c, "SELECT c.relname, p.partstrat, p.partnatts, p.partdefid FROM pg_partitioned_table p \
+                  JOIN pg_class c ON c.oid = p.partrelid")
+        .await,
+        ["ev|h|2|0"]
+    );
+    assert_eq!(
+        rows(&c, "SELECT pg_get_partkeydef(c.oid), pg_get_partkeydef(i.oid) FROM pg_class c, pg_class i \
+                  WHERE c.relname = 'ev' AND i.relname = 'items'")
+        .await,
+        ["HASH (tenant_id, grp)|NULL"]
+    );
+    assert!(rows(&c, "SELECT * FROM pg_inherits").await.is_empty());
+
+    // psql 18's `\d ev`: its oid, then the foreign keys through
+    // `pg_partition_ancestors`, which only a partitioned table's `\d` sends.
+    let oid = rows(&c, "SELECT oid FROM pg_class WHERE relname = 'ev'").await.remove(0);
+    let fks = format!(
+        "SELECT conrelid = '{oid}'::pg_catalog.regclass AS sametable,\n       conname,\n       \
+         pg_catalog.pg_get_constraintdef(oid, true) AS condef,\n       conrelid::pg_catalog.regclass AS ontable\n  \
+         FROM pg_catalog.pg_constraint,\n       pg_catalog.pg_partition_ancestors('{oid}')\n \
+         WHERE conrelid = relid AND contype = 'f' AND conparentid = 0\nORDER BY sametable DESC, conname;"
+    );
+    assert!(rows(&c, &fks).await.is_empty(), "ev has no foreign key");
+    c.batch_execute("CREATE TABLE ev_ref (item_id BIGINT NOT NULL REFERENCES items (id)) PARTITION BY HASH (item_id) PARTITIONS 4")
+        .await
+        .expect("a partitioned table with a foreign key");
+    let ref_oid = rows(&c, "SELECT oid FROM pg_class WHERE relname = 'ev_ref'").await.remove(0);
+    let ref_fks = rows(&c, &fks.replace(&oid, &ref_oid)).await;
+    assert_eq!(ref_fks.len(), 1, "{ref_fks:?}");
+    assert!(ref_fks[0].starts_with("t|ev_ref_item_id_fkey|") && ref_fks[0].ends_with("|ev_ref"), "{ref_fks:?}");
+
+    // `\d+`: storage and compression, for a partitioned table and a plain one.
+    for (table, storage) in [("ev", ["plain", "plain", "plain", "extended"].as_slice()), ("items", &[])] {
+        let toid = rows(&c, &format!("SELECT oid FROM pg_class WHERE relname = '{table}'")).await.remove(0);
+        let got = rows(
+            &c,
+            &format!(
+                "SELECT a.attname, a.attstorage, a.attcompression AS attcompression,\n  \
+                 CASE WHEN a.attstattarget=-1 THEN NULL ELSE a.attstattarget END AS attstattarget\n\
+                 FROM pg_catalog.pg_attribute a\nWHERE a.attrelid = '{toid}' AND a.attnum > 0 AND NOT a.attisdropped\n\
+                 ORDER BY a.attnum;"
+            ),
+        )
+        .await;
+        assert!(!got.is_empty(), "{table}");
+        for (i, want) in storage.iter().enumerate() {
+            let code = if *want == "plain" { "p" } else { "x" };
+            assert!(got[i].split('|').nth(1) == Some(code), "{table} column {i}: {got:?}");
+        }
+    }
+}

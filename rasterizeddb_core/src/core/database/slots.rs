@@ -702,7 +702,8 @@ impl Database {
                 let old = {
                     let mut reverse = self.fk_reverse.write();
                     let old = slot.swap(table.clone());
-                    reverse.set_child(&key, &table.schema.foreign_keys);
+                    let onto_itself = reverse.set_child(&key, &table.schema.foreign_keys);
+                    self.note_key_onto_itself(onto_itself);
                     old
                 };
                 if !same_result_shape(&old.schema, &table.schema) && !super::table_for::lock_exempt(name) {
@@ -732,7 +733,8 @@ impl Database {
         let name_for_note = catalogue_bit(&name).map(|_| name.clone()).unwrap_or_default();
         let replaced = {
             let mut reverse = self.fk_reverse.write();
-            reverse.set_child(&name, &table.schema.foreign_keys);
+            let onto_itself = reverse.set_child(&name, &table.schema.foreign_keys);
+            self.note_key_onto_itself(onto_itself);
             self.table_slots.insert(name, Arc::new(Slot::new(table, epoch)))
         };
         self.note_catalogue_change(&name_for_note);
@@ -845,8 +847,29 @@ impl Database {
         *reverse = FkReverse::default();
         for entry in self.table_slots.iter() {
             let table = entry.value().table.load();
-            reverse.set_child(entry.key(), &table.0.schema.foreign_keys);
+            let onto_itself = reverse.set_child(entry.key(), &table.0.schema.foreign_keys);
+            self.note_key_onto_itself(onto_itself);
         }
+    }
+
+    /// Records that a table with a foreign key onto itself was filed: from
+    /// then on [`Database::may_reference_itself`] says so. Never cleared (a
+    /// dropped key leaves it set, which costs only the scope it gates).
+    fn note_key_onto_itself(&self, onto_itself: bool) {
+        if onto_itself && !self.fk_onto_itself.load(Ordering::Relaxed) {
+            self.fk_onto_itself.store(true, Ordering::Release);
+        }
+    }
+
+    /// Whether any table of this database has had a foreign key onto itself
+    /// since it opened: the gate of the executor's end-of-statement checks
+    /// of such keys (`executor::statement_foreign_keys`), which a database
+    /// without one never pays for. Set when the table is filed, by the DDL
+    /// that adds the key (under its ACCESS EXCLUSIVE, which every later
+    /// statement on the table waits behind) or at open.
+    #[inline]
+    pub(crate) fn may_reference_itself(&self) -> bool {
+        self.fk_onto_itself.load(Ordering::Acquire)
     }
 
     /// Every foreign key in the database whose referenced table is `parent`
@@ -873,7 +896,7 @@ impl Database {
             .referencing_keys(parent)
             .into_iter()
             .filter(|(_, fk)| {
-                !fk.is_deleted && columns.is_none_or(|cs| cs.iter().any(|c| fk.parent_column.eq_ignore_ascii_case(c)))
+                !fk.is_deleted && columns.is_none_or(|cs| cs.iter().any(|c| fk.has_parent_column(c)))
             })
             .map(|(child, _)| child)
             .collect();
@@ -970,11 +993,12 @@ impl FkReverse {
         }
     }
 
-    /// `child`'s keys are now `fks`, replacing whatever it had.
-    fn set_child(&mut self, child: &str, fks: &[ForeignKey]) {
+    /// `child`'s keys are now `fks`, replacing whatever it had. `true` when
+    /// one of them references `child` itself.
+    fn set_child(&mut self, child: &str, fks: &[ForeignKey]) -> bool {
         self.remove_child(child);
         if fks.is_empty() {
-            return;
+            return false;
         }
         let mut parents: Vec<String> = Vec::new();
         for fk in fks {
@@ -985,6 +1009,7 @@ impl FkReverse {
             }
         }
         self.by_child.insert(child.to_string(), parents);
+        fks.iter().any(|fk| !fk.is_deleted && fk.parent_table.eq_ignore_ascii_case(child))
     }
 
     fn referencing(&self, parent: &str) -> Vec<(String, ForeignKey)> {

@@ -862,6 +862,9 @@ pub struct LocalStorageProvider {
     pub(super) inplace_end: AtomicU64,
     // Memory map published with ArcSwap and owned by Arc to allow thread-local caches to own a handle safely.
     pub(crate) _memory_map: Arc<ArcSwap<Mmap>>,
+    /// What the per-thread cache holds of `_memory_map`, so this provider can
+    /// let go of every thread's copy when it goes ([`CachedMaps`]).
+    tls_maps: CachedMaps,
     // Monotonic generation counter; bumped whenever the mmap is refreshed.
     // Used to cheaply invalidate per-thread cached mmap handles.
     pub(crate) mmap_gen: AtomicU64,
@@ -920,6 +923,7 @@ impl Clone for LocalStorageProvider {
                 .into(),
             _memory_map: Arc::new(arc_swap::ArcSwap::new(map)),
             mmap_gen: AtomicU64::new(1).into(),
+            tls_maps: CachedMaps::default(),
             mmap_key: next_mmap_key(),
             hash: CRC.checksum(format!("{}+++{}", self.location, self.table_name).as_bytes()),
             _locked: AtomicBool::new(false).into(),
@@ -1009,10 +1013,91 @@ unsafe fn map_for_reads(file: &std::fs::File) -> io::Result<Mmap> {
 }
 
 thread_local! {
-    // (provider_key, generation, cached mmap)
+    // (provider_key, generation, the holder of the cached mmap, that mmap)
     // IMPORTANT: this must be keyed per provider; otherwise different providers would
     // incorrectly share a cached mmap within the same thread.
-    static TLS_MMAP_CACHE: RefCell<(u64, u64, Option<Arc<Mmap>>)> = RefCell::new((0, 0, None));
+    static TLS_MMAP_CACHE: RefCell<(u64, u64, Option<Arc<CachedMap>>, *const Mmap)> =
+        const { RefCell::new((0, 0, None, std::ptr::null())) };
+}
+
+/// One generation of a provider's read mapping, as the per-thread cache
+/// holds it: behind a holder the provider can empty, rather than as an
+/// `Arc<Mmap>` only the thread can drop.
+///
+/// The cache used to hold the `Arc<Mmap>` itself, so a thread whose last read
+/// was a dropped table kept that file mapped until it read another file: on
+/// an idle server, until restart. ext4 does not free a mapped file's space
+/// and ntfs-3g cannot remove its directory (`(deleted)` lines in
+/// /proc/<pid>/maps). Holding a `Weak` instead would put an upgrade, an
+/// atomic on a line every reader shares, on each read.
+///
+/// So the thread holds this, and the provider, when it is dropped, empties
+/// every holder it made ([`CachedMaps`]'s `Drop`): the mapping goes when its
+/// last reader that is not a cache does, whichever threads have cached it.
+pub(crate) struct CachedMap {
+    map: std::cell::UnsafeCell<Option<Arc<Mmap>>>,
+}
+
+// SAFETY: `map` is written twice: at construction, and by the provider's
+// `Drop` (`CachedMaps::drop`). It is read only by `with_cached_mmap`, through
+// `&self` of the provider that made it, found by that provider's key, which
+// no other provider ever has. So a read and the emptying never overlap: the
+// emptying runs once no `&provider` exists, and the release of the last
+// reference to the provider orders every read before it.
+unsafe impl Sync for CachedMap {}
+unsafe impl Send for CachedMap {}
+
+/// Every [`CachedMap`] a provider made: the current one, which a thread's
+/// cache refreshes from, and the earlier ones, while some thread still holds
+/// them. Dropped with the provider, which empties them all.
+#[derive(Default)]
+struct CachedMaps {
+    current: arc_swap::ArcSwapOption<CachedMap>,
+    made: Mutex<Vec<std::sync::Weak<CachedMap>>>,
+}
+
+impl CachedMaps {
+    /// A holder of `map`, made current and recorded.
+    fn publish(&self, map: Arc<Mmap>) -> Arc<CachedMap> {
+        let holder = Arc::new(CachedMap { map: std::cell::UnsafeCell::new(Some(map)) });
+        let mut made = self.made.lock();
+        made.retain(|weak| weak.strong_count() > 0);
+        made.push(Arc::downgrade(&holder));
+        holder
+    }
+
+    /// The current holder; the first is made from `memory_map` here, unless a
+    /// remap made one meanwhile (which then stands: it is the newer map).
+    fn current(&self, memory_map: &ArcSwap<Mmap>) -> Arc<CachedMap> {
+        if let Some(holder) = self.current.load_full() {
+            return holder;
+        }
+        let holder = self.publish(memory_map.load_full());
+        let previous = self.current.compare_and_swap(&None::<Arc<CachedMap>>, Some(holder.clone()));
+        match &*previous {
+            None => holder,
+            Some(newer) => newer.clone(),
+        }
+    }
+
+    /// A remap: `map` becomes the current holder's mapping.
+    fn replace(&self, map: Arc<Mmap>) {
+        let holder = self.publish(map);
+        self.current.store(Some(holder));
+    }
+}
+
+impl Drop for CachedMaps {
+    fn drop(&mut self) {
+        for weak in self.made.get_mut().drain(..) {
+            if let Some(holder) = weak.upgrade() {
+                // SAFETY: see `CachedMap`: the provider is being dropped, so
+                // no `&provider` exists and no thread is reading through a
+                // holder of its key, now or later.
+                unsafe { *holder.map.get() = None };
+            }
+        }
+    }
 }
 
 /// Hands each provider a key that is never reused.
@@ -1173,6 +1258,7 @@ impl LocalStorageProvider {
                 inplace_end: AtomicU64::new(0).into(),
                 _memory_map: map,
                 mmap_gen: AtomicU64::new(1).into(),
+                tls_maps: CachedMaps::default(),
                 mmap_key: next_mmap_key(),
                 hash: CRC.checksum(format!("{}+++{}", final_location, table_name).as_bytes()),
                 _locked: AtomicBool::new(false).into(),
@@ -1309,6 +1395,7 @@ impl LocalStorageProvider {
                 inplace_end: AtomicU64::new(0).into(),
                 _memory_map: map,
                 mmap_gen: AtomicU64::new(1).into(),
+                tls_maps: CachedMaps::default(),
                 mmap_key: next_mmap_key(),
                 hash: CRC.checksum(format!("{}+++{}", location_str, "CONFIG_TABLE.db").as_bytes()),
                 _locked: AtomicBool::new(false).into(),
@@ -1560,8 +1647,11 @@ impl LocalStorageProvider {
         }
 
         // Create new memory map with the current file size
-        self._memory_map
-            .store(Arc::new(unsafe { map_for_reads(file).unwrap() }));
+        let map = Arc::new(unsafe { map_for_reads(file).unwrap() });
+        self._memory_map.store(map.clone());
+        // Before the generation moves, so a cache that sees the new
+        // generation refreshes from the new holder.
+        self.tls_maps.replace(map);
 
         // Bump generation to invalidate thread-local caches.
         // Acquire/Release pairing ensures that if a thread observes a new generation,
@@ -1578,13 +1668,22 @@ impl LocalStorageProvider {
         TLS_MMAP_CACHE.with(|cell| {
             let mut state = cell.borrow_mut();
             if state.2.is_none() || state.0 != provider_key || state.1 != generation {
-                // Clone the Arc<Mmap> behind ArcSwap's guard and keep it in TLS.
+                // Hold this provider's current holder in TLS, and the map it
+                // holds by pointer: the hit path below is the same one load
+                // it was with the `Arc<Mmap>` held directly.
+                let holder = self.tls_maps.current(&self._memory_map);
+                // SAFETY: a holder of a live provider (this one) is never
+                // emptied; see `CachedMap`.
+                let map: *const Mmap = unsafe { (*holder.map.get()).as_deref() }
+                    .expect("a live provider's mapping is held") as *const Mmap;
                 state.0 = provider_key;
                 state.1 = generation;
-                state.2 = Some(Arc::clone(&*self._memory_map.load()));
+                state.2 = Some(holder);
+                state.3 = map;
             }
-            let mmap_arc = state.2.as_ref().unwrap();
-            f(&*mmap_arc)
+            // SAFETY: `state.2` keeps the holder alive, and the holder keeps
+            // the map while this provider (whose `&self` this is) lives.
+            f(unsafe { &*state.3 })
         })
     }
 
@@ -2650,6 +2749,7 @@ impl StorageIO for LocalStorageProvider {
                 map_for_reads(&file_read_mmap).unwrap()
             }))),
             mmap_gen: AtomicU64::new(1).into(),
+            tls_maps: CachedMaps::default(),
             mmap_key: next_mmap_key(),
             hash: CRC.checksum(format!("{}+++{}", final_location, "temp.db").as_bytes()),
             _locked: AtomicBool::new(false).into(),
@@ -2819,6 +2919,7 @@ impl StorageIO for LocalStorageProvider {
             inplace_end: AtomicU64::new(0).into(),
             _memory_map: Arc::new(ArcSwap::new(Arc::new(unsafe { map_for_reads(&file_read_mmap)? }))),
             mmap_gen: AtomicU64::new(1).into(),
+            tls_maps: CachedMaps::default(),
             mmap_key: next_mmap_key(),
             hash: CRC.checksum(format!("{}+++{}", final_location, name).as_bytes()),
             _locked: AtomicBool::new(false).into(),

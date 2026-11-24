@@ -37,19 +37,27 @@ pub const INDEX_STORE_V1: &str = "index_store_v1";
 /// bytes padded with a scale of zero — wrong values both ways, never an error.
 pub const NUMERIC_OWN_SCALE_V1: &str = "numeric_own_scale_v1";
 
+/// A foreign key over several columns is stored as one record per column
+/// pair (`foreign_key::ForeignKeyRecord`). Set before the first such record
+/// is written: a binary that predates composite keys reads each pair as a
+/// one-column key, which would enforce something weaker than the key, or
+/// something different, without an error.
+pub const COMPOSITE_FOREIGN_KEY_V1: &str = "composite_foreign_key_v1";
+
 /// Every flag any build has defined, with what it means, for the refusal
 /// message. Not the set this build supports: that is [`KNOWN`].
 const DESCRIBED: &[(&str, &str)] = &[
     (INDEX_STORE_V1, "persistent index snapshots (Cargo feature `persistent_indexes`)"),
     (NUMERIC_OWN_SCALE_V1, "unconstrained NUMERIC columns that keep each value's own scale"),
+    (COMPOSITE_FOREIGN_KEY_V1, "foreign keys over several columns"),
 ];
 
 /// The flags this build understands.
 #[cfg(feature = "persistent_indexes")]
-const KNOWN: &[&str] = &[INDEX_STORE_V1, NUMERIC_OWN_SCALE_V1];
+const KNOWN: &[&str] = &[INDEX_STORE_V1, NUMERIC_OWN_SCALE_V1, COMPOSITE_FOREIGN_KEY_V1];
 /// The flags this build understands.
 #[cfg(not(feature = "persistent_indexes"))]
-const KNOWN: &[&str] = &[NUMERIC_OWN_SCALE_V1];
+const KNOWN: &[&str] = &[NUMERIC_OWN_SCALE_V1, COMPOSITE_FOREIGN_KEY_V1];
 
 /// Serialises [`require`] within the process: two first writers in one
 /// directory would otherwise race on the temporary file.
@@ -228,12 +236,71 @@ pub fn directories_needing_numeric_own_scale(dir: &Path) -> io::Result<Vec<std::
 
 /// [`directories_needing_numeric_own_scale`], and the flag set in each: run
 /// by a restore before it hands the directory over, so a nested database
-/// is fenced too, not only when this binary first opens it.
+/// is fenced too, not only when this binary first opens it. The same for
+/// [`COMPOSITE_FOREIGN_KEY_V1`] ([`directories_needing_composite_foreign_keys`]).
 pub fn fence_restored_directory(dir: &Path) -> io::Result<()> {
     for database in directories_needing_numeric_own_scale(dir)? {
         require(&database, NUMERIC_OWN_SCALE_V1)?;
     }
+    for database in directories_needing_composite_foreign_keys(dir)? {
+        require(&database, COMPOSITE_FOREIGN_KEY_V1)?;
+    }
     Ok(())
+}
+
+/// Sets [`COMPOSITE_FOREIGN_KEY_V1`] in `dir` when `keys` (a table's, read
+/// at open) hold a composite key and the flag is not set yet: a
+/// point-in-time restore or a replica brings the key's records and not the
+/// flag, which is written outside the log. Asked whenever a table's schema
+/// is read, as [`fence_numeric_own_scale`] is.
+pub fn fence_composite_foreign_keys(dir: &Path, keys: &[crate::core::rql::foreign_key::ForeignKey]) -> io::Result<()> {
+    if !keys.iter().any(|k| k.is_composite()) {
+        return Ok(());
+    }
+    if flags(dir).map_err(io::Error::other)?.iter().any(|f| f == COMPOSITE_FOREIGN_KEY_V1) {
+        return Ok(());
+    }
+    require(dir, COMPOSITE_FOREIGN_KEY_V1)
+}
+
+/// The database directories under `dir` whose tables hold a live composite
+/// foreign key, read from every `<t>_schema_FK.db` in every subdirectory and owned
+/// as [`directories_needing_numeric_own_scale`] owns a field file.
+pub fn directories_needing_composite_foreign_keys(dir: &Path) -> io::Result<Vec<std::path::PathBuf>> {
+    const CATALOGUE: &str = "db_data_schema.db";
+    let mut needing: Vec<std::path::PathBuf> = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(at) = pending.pop() {
+        for entry in std::fs::read_dir(&at)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            let name = entry.file_name();
+            if !kind.is_file() || !name.to_string_lossy().ends_with("_schema_FK.db") {
+                continue;
+            }
+            if !crate::core::rql::foreign_key::sidecar_holds_composite(&std::fs::read(entry.path())?) {
+                continue;
+            }
+            let mut owner = at.clone();
+            while owner != dir && !owner.join(CATALOGUE).is_file() {
+                match owner.parent() {
+                    Some(up) if up.starts_with(dir) => owner = up.to_path_buf(),
+                    _ => {
+                        owner = dir.to_path_buf();
+                        break;
+                    }
+                }
+            }
+            if !needing.contains(&owner) {
+                needing.push(owner);
+            }
+        }
+    }
+    Ok(needing)
 }
 
 #[cfg(test)]

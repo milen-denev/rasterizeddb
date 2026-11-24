@@ -127,6 +127,9 @@ pub(crate) fn bind(name: &str, prepared: &Prepared, args: &[String]) -> Result<S
                 };
                 out.push_str(&body[copied..i]);
                 match prepared.types.get(n - 1) {
+                    // A row count reads a bare number: `LIMIT CAST(8 AS
+                    // bigint)` was cut at its first space and refused.
+                    Some(_) if after_row_count_keyword(&out) && is_integer_literal(arg) => out.push_str(arg.trim()),
                     Some(ty) => out.push_str(&format!("CAST({arg} AS {ty})")),
                     None => out.push_str(&format!("({arg})")),
                 }
@@ -141,9 +144,53 @@ pub(crate) fn bind(name: &str, prepared: &Prepared, args: &[String]) -> Result<S
     Ok(out)
 }
 
+/// Whether `text` ends with `LIMIT` or `OFFSET` (then whitespace), the
+/// keywords whose value the planner reads as a bare row count.
+fn after_row_count_keyword(text: &str) -> bool {
+    let trimmed = text.trim_end();
+    if trimmed.len() == text.len() {
+        return false;
+    }
+    ["LIMIT", "OFFSET"].iter().any(|kw| {
+        trimmed.len() >= kw.len()
+            && trimmed[trimmed.len() - kw.len()..].eq_ignore_ascii_case(kw)
+            && trimmed[..trimmed.len() - kw.len()]
+                .bytes()
+                .last()
+                .is_none_or(|b| !is_identifier_byte(b))
+    })
+}
+
+/// A plain non-negative integer, as `EXECUTE p (8)` passes one.
+fn is_integer_literal(arg: &str) -> bool {
+    let arg = arg.trim();
+    !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_digit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_count_parameter_goes_in_bare() {
+        let p = Prepared {
+            types: vec!["bigint".into(), "bigint".into(), "bigint".into()],
+            body: "SELECT id FROM t WHERE n < $1 ORDER BY id LIMIT $2 OFFSET $3".into(),
+        };
+        assert_eq!(
+            bind("p", &p, &["5".into(), "8".into(), "2".into()]).unwrap(),
+            "SELECT id FROM t WHERE n < CAST(5 AS bigint) ORDER BY id LIMIT 8 OFFSET 2"
+        );
+        // Not a bare integer: the cast stays, and the planner says why.
+        assert_eq!(
+            bind("p", &p, &["5".into(), "'8'".into(), "2".into()]).unwrap(),
+            "SELECT id FROM t WHERE n < CAST(5 AS bigint) ORDER BY id LIMIT CAST('8' AS bigint) OFFSET 2"
+        );
+        // A column whose name ends in "limit" is not the keyword.
+        let q = Prepared { types: vec!["int".into()], body: "SELECT * FROM t WHERE ratelimit = $1".into() };
+        assert_eq!(after_row_count_keyword("WHERE ratelimit "), false);
+        assert_eq!(bind("q", &q, &["3".into()]).unwrap(), "SELECT * FROM t WHERE ratelimit = CAST(3 AS int)");
+    }
 
     #[test]
     fn the_three_statements_parse() {

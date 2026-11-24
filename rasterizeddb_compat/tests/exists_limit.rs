@@ -321,3 +321,36 @@ async fn scalar_subquery_keeps_its_cardinality_error() {
         Ok(vec![3]),
     );
 }
+
+/// `EXISTS` over a `SELECT` with no `FROM`: one row when its condition holds,
+/// none otherwise, as PostgreSQL 17 answers. It was refused ("the SELECT
+/// inside EXISTS has no FROM clause"), over a parameter too.
+#[tokio::test]
+async fn exists_over_a_select_without_from() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE ef (id INT PRIMARY KEY, n INT); INSERT INTO ef VALUES (1, 1), (2, 7), (3, NULL)")
+        .await
+        .expect("setup");
+    for (sql, expected) in [
+        ("SELECT id FROM ef WHERE EXISTS (SELECT 1) AND n IS NULL", vec![3]),
+        ("SELECT id FROM ef WHERE EXISTS (SELECT 1 WHERE false)", vec![]),
+        ("SELECT id FROM ef WHERE NOT EXISTS (SELECT 1)", vec![]),
+        ("SELECT id FROM ef WHERE EXISTS (SELECT 1 WHERE ef.n > 5)", vec![2]),
+        ("SELECT id FROM ef WHERE NOT EXISTS (SELECT 1 WHERE ef.n > 5)", vec![1, 3]),
+        ("SELECT 1 WHERE EXISTS (SELECT 1)", vec![1]),
+        ("SELECT 1 WHERE NOT EXISTS (SELECT 1 WHERE 1 = 2)", vec![1]),
+    ] {
+        assert_eq!(ids(&pool, sql).await, Ok(expected), "{sql}");
+    }
+    let pool = &pool;
+    let bound = |v: i32| async move {
+        let rows = sqlx::query("SELECT id FROM ef WHERE NOT EXISTS (SELECT 1 WHERE $1 = 2) ORDER BY id")
+            .bind(v)
+            .fetch_all(pool)
+            .await
+            .expect("bound");
+        rows.iter().map(|r| r.get::<i32, _>(0)).collect::<Vec<_>>()
+    };
+    assert_eq!(bound(2).await, Vec::<i32>::new());
+    assert_eq!(bound(3).await, vec![1, 2, 3]);
+}

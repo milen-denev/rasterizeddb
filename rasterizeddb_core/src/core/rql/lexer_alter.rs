@@ -91,6 +91,17 @@ pub enum AlterAction {
     ValidateConstraint {
         name: String,
     },
+    /// `RENAME CONSTRAINT from TO to`.
+    RenameConstraint {
+        from: String,
+        to: String,
+    },
+    /// `RENAME INDEX from TO to` (MySQL's spelling, and what `ALTER INDEX
+    /// from RENAME TO to` is run as once its table is known).
+    RenameIndex {
+        from: String,
+        to: String,
+    },
     /// Accepted and not acted on, with the reason.
     ///
     /// PostgreSQL storage tuning — `SET COMPRESSION`, `SET (autovacuum_…)` —
@@ -118,6 +129,25 @@ fn bare_name(raw: &str) -> String {
         .unwrap_or(raw)
         .trim_matches('"')
         .to_string()
+}
+
+/// `ALTER INDEX [IF EXISTS] name RENAME TO new`: the index, whether `IF
+/// EXISTS` was written, and its new name. `None` for any other statement;
+/// `Err` for an `ALTER INDEX … RENAME` that names nothing.
+pub fn parse_alter_index_rename(sql: &str) -> Option<Result<(String, bool, String), String>> {
+    let words: Vec<&str> = sql.trim().trim_end_matches(';').split_whitespace().collect();
+    let is = |at: usize, word: &str| words.get(at).is_some_and(|w| w.eq_ignore_ascii_case(word));
+    if !(is(0, "ALTER") && is(1, "INDEX")) {
+        return None;
+    }
+    let (if_exists, at) = if is(2, "IF") && is(3, "EXISTS") { (true, 4) } else { (false, 2) };
+    if !(is(at + 1, "RENAME") && is(at + 2, "TO")) {
+        return None;
+    }
+    let (Some(from), Some(to), None) = (words.get(at), words.get(at + 3), words.get(at + 4)) else {
+        return Some(Err("ALTER INDEX … RENAME TO needs the index and its new name".to_string()));
+    };
+    Some(Ok((bare_name(from), if_exists, bare_name(to))))
 }
 
 /// Parses `ALTER TABLE …`.
@@ -395,21 +425,30 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
     let action = match rest_upper[0].as_str() {
         "ADD" => {
             let mut i = 1usize;
-            if rest_upper.get(i).map(String::as_str) == Some("COLUMN") {
+            let column_word = rest_upper.get(i).map(String::as_str) == Some("COLUMN");
+            if column_word {
                 i += 1;
             }
 
             // `ADD CONSTRAINT …`, `ADD FOREIGN KEY …`, `ADD PRIMARY KEY …`,
             // `ADD UNIQUE …` all declare constraints rather than columns.
-            if matches!(
-                rest_upper.get(i).map(String::as_str),
-                Some("CONSTRAINT")
-                    | Some("FOREIGN")
-                    | Some("PRIMARY")
-                    | Some("UNIQUE")
-                    | Some("CHECK")
-                    | Some("EXCLUDE")
-            ) {
+            // So does `ADD IF NOT EXISTS CONSTRAINT c …`, the word order some
+            // tools write (`unique_key::strip_if_not_exists` takes it out in
+            // either place): read as a column, it was a column called
+            // CONSTRAINT of the type its name spelled ("column type 'C' is
+            // not supported yet").
+            let constraint_word = |at: usize| {
+                matches!(
+                    rest_upper.get(at).map(String::as_str),
+                    Some("CONSTRAINT") | Some("FOREIGN") | Some("PRIMARY") | Some("UNIQUE") | Some("CHECK") | Some("EXCLUDE")
+                )
+            };
+            let if_not_exists_first = !column_word
+                && rest_upper.get(i).map(String::as_str) == Some("IF")
+                && rest_upper.get(i + 1).map(String::as_str) == Some("NOT")
+                && rest_upper.get(i + 2).map(String::as_str) == Some("EXISTS")
+                && constraint_word(i + 3);
+            if constraint_word(i) || if_not_exists_first {
                 return Ok(AlterTable {
                     table_name,
                     action: AlterAction::ConstraintClause {
@@ -546,6 +585,28 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
                 return Ok(AlterTable {
                     table_name,
                     action: AlterAction::RenameTable { to },
+                });
+            }
+            // `RENAME CONSTRAINT a TO b`, `RENAME INDEX a TO b`: read as a
+            // column, it was a column called CONSTRAINT ("RENAME COLUMN must
+            // be followed by TO").
+            if let Some(kind @ ("CONSTRAINT" | "INDEX" | "KEY")) = rest_upper.get(i).map(String::as_str)
+                && rest_upper.get(i + 2).map(String::as_str) == Some("TO")
+            {
+                let from = crate::core::rql::unique_key::stored_name(&bare_name(&rest[i + 1]));
+                let to = crate::core::rql::unique_key::stored_name(&bare_name(
+                    rest.get(i + 3).ok_or_else(|| format!("RENAME {kind} has no new name"))?,
+                ));
+                if from.is_empty() || to.is_empty() {
+                    return Err(format!("RENAME {kind} needs two names"));
+                }
+                return Ok(AlterTable {
+                    table_name,
+                    action: if kind == "CONSTRAINT" {
+                        AlterAction::RenameConstraint { from, to }
+                    } else {
+                        AlterAction::RenameIndex { from, to }
+                    },
                 });
             }
             if rest_upper.get(i).map(String::as_str) == Some("COLUMN") {
@@ -906,7 +967,8 @@ pub fn parse_drop_table(sql: &str) -> Result<(String, bool), String> {
 }
 
 /// Rewrites `CREATE UNIQUE INDEX name ON t (cols)` as the equivalent
-/// `ALTER TABLE t ADD CONSTRAINT name UNIQUE (cols)`.
+/// `ALTER TABLE t ADD CONSTRAINT name UNIQUE (cols) AS INDEX`, the key the
+/// engine enforces marked as an index (`unique_key::AS_INDEX`).
 ///
 /// A unique index is a **constraint**, not merely an access path, so treating
 /// it like other index DDL silently dropped a guarantee the schema asked for —
@@ -1005,12 +1067,16 @@ pub fn unique_index_as_constraint(sql: &str) -> Option<String> {
         .windows(3)
         .any(|w| w == ["NULLS", "NOT", "DISTINCT"]);
 
+    // `AS INDEX` marks the key as the index it was created as
+    // (`unique_key::AS_INDEX`): `DROP INDEX` drops it and `DROP CONSTRAINT`
+    // does not know it, as in PostgreSQL.
     Some(format!(
-        "ALTER TABLE {} ADD CONSTRAINT {}{} UNIQUE ({}){}{}",
+        "ALTER TABLE {} ADD CONSTRAINT {}{} UNIQUE ({}) {}{}{}",
         table,
         if if_not_exists { "IF NOT EXISTS " } else { "" },
         name,
         columns,
+        crate::core::rql::unique_key::AS_INDEX,
         if nulls { " NULLS NOT DISTINCT" } else { "" },
         match predicate {
             Some(p) => format!(" WHERE {}", p),
@@ -1042,6 +1108,124 @@ fn matching_close(text: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// PostgreSQL's `ANALYZE [VERBOSE | (options)] [table [(columns)], …]`
+/// (or `ANALYSE`), which the engine accepts without acting on: `None` for
+/// any other statement, `Some(Ok(tables))` for the tables it names, as
+/// written (unquoted names folded to lower case, quoted ones kept), and
+/// `Some(Err(message))` for a statement written after it.
+///
+/// `ANALYZE SELECT …` is not `EXPLAIN ANALYZE SELECT …`: PostgreSQL refuses
+/// it as a syntax error. Taken for the no-op, it answered success having
+/// run nothing, and a console showed "0 rows affected" for a query plan
+/// asked for.
+pub fn parse_analyze(sql: &str) -> Option<Result<Vec<String>, String>> {
+    let text = sql.trim().trim_end_matches(';').trim_end();
+    let word_end = text
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(text.len());
+    let first = &text[..word_end];
+    if !(first.eq_ignore_ascii_case("ANALYZE") || first.eq_ignore_ascii_case("ANALYSE")) {
+        return None;
+    }
+    let mut rest = text[word_end..].trim_start();
+
+    // `(VERBOSE, SKIP_LOCKED)` or the bare `VERBOSE`.
+    if let Some(inner) = rest.strip_prefix('(') {
+        let Some(close) = inner.find(')') else {
+            return Some(Err("syntax error at end of input: the option list is not closed".into()));
+        };
+        rest = inner[close + 1..].trim_start();
+    } else {
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if rest[..end].eq_ignore_ascii_case("VERBOSE") {
+            rest = rest[end..].trim_start();
+        }
+    }
+
+    const STATEMENTS: &[&str] = &[
+        "SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "VALUES", "TABLE", "EXPLAIN",
+        "CREATE", "DROP", "ALTER",
+    ];
+    let mut tables = Vec::new();
+    while !rest.is_empty() {
+        // One name, possibly qualified, each part quoted or not.
+        let mut name = String::new();
+        loop {
+            let part;
+            if let Some(quoted) = rest.strip_prefix('"') {
+                let mut out = String::new();
+                let mut chars = quoted.char_indices();
+                let mut end = None;
+                while let Some((i, c)) = chars.next() {
+                    if c == '"' {
+                        if quoted[i + 1..].starts_with('"') {
+                            out.push('"');
+                            chars.next();
+                        } else {
+                            end = Some(i + 1);
+                            break;
+                        }
+                    } else {
+                        out.push(c);
+                    }
+                }
+                let Some(end) = end else {
+                    return Some(Err("unterminated quoted identifier".into()));
+                };
+                part = out;
+                rest = &quoted[end..];
+            } else {
+                let end = rest
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+                    .unwrap_or(rest.len());
+                let word = &rest[..end];
+                if word.is_empty() {
+                    let near = rest.split_whitespace().next().unwrap_or(rest);
+                    return Some(Err(format!("syntax error at or near \"{near}\"")));
+                }
+                if name.is_empty()
+                    && tables.is_empty()
+                    && STATEMENTS.iter().any(|s| s.eq_ignore_ascii_case(word))
+                {
+                    return Some(Err(format!(
+                        "syntax error at or near \"{word}\": ANALYZE collects statistics for tables \
+                         and runs no statement; EXPLAIN ANALYZE {word} … runs it and shows its plan",
+                        word = word.to_ascii_uppercase()
+                    )));
+                }
+                part = word.to_lowercase();
+                rest = &rest[end..];
+            }
+            name = part;
+            match rest.strip_prefix('.') {
+                // The schema is dropped: there is one namespace.
+                Some(after) => rest = after,
+                None => break,
+            }
+        }
+        rest = rest.trim_start();
+        // A column list, which names columns of that table.
+        if let Some(inner) = rest.strip_prefix('(') {
+            let Some(close) = inner.find(')') else {
+                return Some(Err("syntax error at end of input: the column list is not closed".into()));
+            };
+            rest = inner[close + 1..].trim_start();
+        }
+        tables.push(name);
+        match rest.strip_prefix(',') {
+            Some(after) => rest = after.trim_start(),
+            None if rest.is_empty() => break,
+            None => {
+                let near = rest.split_whitespace().next().unwrap_or(rest);
+                return Some(Err(format!("syntax error at or near \"{near}\"")));
+            }
+        }
+    }
+    Some(Ok(tables))
 }
 
 /// Statements the engine accepts without acting on, with the reason.
@@ -1096,7 +1280,7 @@ pub fn no_op_reason(sql: &str) -> Option<&'static str> {
     if upper.starts_with("COMMENT ON") {
         return Some("comments are not stored");
     }
-    if upper.starts_with("ANALYZE") {
+    if parse_analyze(sql).is_some() {
         return Some("statistics are maintained automatically");
     }
     // `VACUUM` is deliberately absent. The engine implements it — reclamation
@@ -1170,6 +1354,37 @@ mod tests {
                 "{sql:?} is treated as a no-op while the engine implements it"
             );
         }
+    }
+
+    #[test]
+    fn analyze_names_tables_and_refuses_a_statement() {
+        assert_eq!(parse_analyze("ANALYZE"), Some(Ok(vec![])));
+        assert_eq!(parse_analyze("analyse;"), Some(Ok(vec![])));
+        assert_eq!(parse_analyze("ANALYZE VERBOSE t"), Some(Ok(vec!["t".to_string()])));
+        assert_eq!(
+            parse_analyze("ANALYZE (VERBOSE, SKIP_LOCKED) Orders (a, b), public.\"Line Items\""),
+            Some(Ok(vec!["orders".to_string(), "Line Items".to_string()]))
+        );
+        for sql in [
+            "ANALYZE SELECT a FROM t WHERE a = 1",
+            "analyze select 1",
+            "ANALYZE VERBOSE SELECT 1",
+            "ANALYZE WITH x AS (SELECT 1) SELECT * FROM x",
+            "ANALYZE UPDATE t SET a = 1",
+        ] {
+            let Some(Err(message)) = parse_analyze(sql) else {
+                panic!("{sql:?} was accepted as ANALYZE: {:?}", parse_analyze(sql));
+            };
+            assert!(message.contains("EXPLAIN ANALYZE"), "{sql:?}: {message}");
+        }
+        assert!(matches!(parse_analyze("ANALYZE t u"), Some(Err(_))));
+        assert_eq!(parse_analyze("ANALYZED"), None);
+        assert_eq!(parse_analyze("EXPLAIN ANALYZE SELECT 1"), None);
+        // Still the no-op, so the PostgreSQL listener answers it, and only it.
+        assert!(no_op_reason("ANALYZE t").is_some());
+        assert!(no_op_reason("ANALYSE").is_some());
+        assert!(no_op_reason("ANALYZE SELECT 1").is_some());
+        assert!(no_op_reason("ANALYZED_THINGS").is_none());
     }
 
     #[test]
@@ -1501,7 +1716,7 @@ mod tests {
         assert!(no_op_reason("CREATE UNIQUE INDEX idx ON t (a)").is_none());
         assert_eq!(
             unique_index_as_constraint("CREATE UNIQUE INDEX idx ON t (a, b)").as_deref(),
-            Some("ALTER TABLE t ADD CONSTRAINT idx UNIQUE (a, b)")
+            Some("ALTER TABLE t ADD CONSTRAINT idx UNIQUE (a, b) AS INDEX")
         );
         // `IF NOT EXISTS` is carried through rather than dropped. Dropping it
         // made the second run of a migration fail with "constraint already
@@ -1509,18 +1724,18 @@ mod tests {
         // migration that seeds rows relies on to be re-runnable.
         assert_eq!(
             unique_index_as_constraint("CREATE UNIQUE INDEX IF NOT EXISTS \"mix é 1\" ON t (a)").as_deref(),
-            Some("ALTER TABLE t ADD CONSTRAINT IF NOT EXISTS \"mix é 1\" UNIQUE (a)")
+            Some("ALTER TABLE t ADD CONSTRAINT IF NOT EXISTS \"mix é 1\" UNIQUE (a) AS INDEX")
         );
         assert_eq!(
             unique_index_as_constraint("CREATE UNIQUE INDEX 名 ON t (a)").as_deref(),
-            Some("ALTER TABLE t ADD CONSTRAINT 名 UNIQUE (a)")
+            Some("ALTER TABLE t ADD CONSTRAINT 名 UNIQUE (a) AS INDEX")
         );
         assert_eq!(
             unique_index_as_constraint(
                 "CREATE UNIQUE INDEX IF NOT EXISTS \"idx\" ON \"t\" (\"a\")"
             )
             .as_deref(),
-            Some("ALTER TABLE t ADD CONSTRAINT IF NOT EXISTS idx UNIQUE (\"a\")")
+            Some("ALTER TABLE t ADD CONSTRAINT IF NOT EXISTS idx UNIQUE (\"a\") AS INDEX")
         );
         // Without the clause it must stay intolerant: a name already in use is
         // an error, because the second constraint may cover different columns.
@@ -1538,7 +1753,7 @@ mod tests {
         // key over every row instead would reject rows PostgreSQL accepts.
         assert_eq!(
             unique_index_as_constraint("CREATE UNIQUE INDEX i ON t (a) WHERE b IS NULL").as_deref(),
-            Some("ALTER TABLE t ADD CONSTRAINT i UNIQUE (a) WHERE b IS NULL")
+            Some("ALTER TABLE t ADD CONSTRAINT i UNIQUE (a) AS INDEX WHERE b IS NULL")
         );
         assert!(no_op_reason("CREATE UNIQUE INDEX i ON t (a) WHERE b IS NULL").is_none());
         // A constraint written on ADD COLUMN is the action after it, tagged
@@ -1597,7 +1812,7 @@ mod tests {
         // dropped here, the index enforced NULLs as distinct.
         assert_eq!(
             unique_index_as_constraint("CREATE UNIQUE INDEX i ON t (a, b) nulls not distinct WHERE c").as_deref(),
-            Some("ALTER TABLE t ADD CONSTRAINT i UNIQUE (a, b) NULLS NOT DISTINCT WHERE c")
+            Some("ALTER TABLE t ADD CONSTRAINT i UNIQUE (a, b) AS INDEX NULLS NOT DISTINCT WHERE c")
         );
         // `pg_dump`'s spelling: a method, and a predicate in parentheses. The
         // column list ends at its own parenthesis, not the predicate's.
@@ -1606,14 +1821,14 @@ mod tests {
                 "CREATE UNIQUE INDEX users_email_live ON public.users USING btree (email) WHERE (deleted_at IS NULL);"
             )
             .as_deref(),
-            Some("ALTER TABLE public.users ADD CONSTRAINT users_email_live UNIQUE (email) WHERE (deleted_at IS NULL)")
+            Some("ALTER TABLE public.users ADD CONSTRAINT users_email_live UNIQUE (email) AS INDEX WHERE (deleted_at IS NULL)")
         );
         assert_eq!(
             unique_index_as_constraint(
                 "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS p ON ONLY pages (tenant_id, slug) WHERE active"
             )
             .as_deref(),
-            Some("ALTER TABLE pages ADD CONSTRAINT IF NOT EXISTS p UNIQUE (tenant_id, slug) WHERE active")
+            Some("ALTER TABLE pages ADD CONSTRAINT IF NOT EXISTS p UNIQUE (tenant_id, slug) AS INDEX WHERE active")
         );
         // A plain partial index still constrains nothing and is set aside,
         // saying so.

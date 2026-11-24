@@ -393,8 +393,18 @@ impl RowLocks {
         self.alias_count.load(Ordering::Acquire)
     }
 
+    /// The map, even after a panic while it was held. A poisoned lock used
+    /// to fail every later row-locking statement on the table until a
+    /// restart, which in an embedding process is the host's restart. The
+    /// guarded updates are small and finish before anything that could panic
+    /// runs, so the map a panic leaves behind is still consistent.
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().expect("row lock map poisoned")
+        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The wait graph, as [`Self::lock`] takes the map.
+    fn waits(&self) -> std::sync::MutexGuard<'_, HashMap<TxId, SmallVec<[TxId; 4]>>> {
+        self.waits.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn publish_counts(&self, inner: &Inner) {
@@ -655,7 +665,7 @@ impl RowLocks {
     /// edges of owners that wait outside it. The edges are copied first, so
     /// the graph mutex is never held while the manager's is taken.
     pub fn table_deadlock_check(&self, owner: LockOwner) -> Option<LockOwner> {
-        let outside = self.waits.lock().expect("wait graph poisoned").clone();
+        let outside = self.waits().clone();
         self.table_locks.deadlock_check_with(owner, &outside)
     }
 
@@ -990,7 +1000,7 @@ impl RowLocks {
             );
             return;
         }
-        let mut waits = self.waits.lock().expect("wait graph poisoned");
+        let mut waits = self.waits();
         if blockers.is_empty() {
             waits.remove(&waiter);
         } else {
@@ -1011,7 +1021,7 @@ impl RowLocks {
         if self.waits_len.load(Ordering::Acquire) == 0 {
             return;
         }
-        let mut waits = self.waits.lock().expect("wait graph poisoned");
+        let mut waits = self.waits();
         waits.remove(&waiter);
         self.waits_len.store(waits.len(), Ordering::Release);
         if waits.is_empty() && waits.capacity() > 64 {
@@ -1057,7 +1067,7 @@ impl RowLocks {
             return true;
         }
         if members.iter().any(|m| m.owner == victim && m.mode.is_some()) {
-            let outside = self.waits.lock().expect("wait graph poisoned").clone();
+            let outside = self.waits().clone();
             let _ = self.table_locks.deadlock_check_with(victim, &outside);
         }
         false
@@ -1070,7 +1080,7 @@ impl RowLocks {
     fn cycle_through(&self, waiter: TxId, is_live: &dyn Fn(TxId) -> bool) -> Option<SmallVec<[CycleMember; 8]>> {
         // Copied, so the graph mutex is not held while the table locks' is
         // taken below (the table side takes them in the other order).
-        let waits = self.waits.lock().expect("wait graph poisoned").clone();
+        let waits = self.waits().clone();
         if !waits.contains_key(&waiter) {
             return None;
         }

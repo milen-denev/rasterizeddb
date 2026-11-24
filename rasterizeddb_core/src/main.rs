@@ -5,6 +5,41 @@
 
 use std::env;
 
+/// On musl (the static Linux build the Alpine image runs) the system
+/// allocator is musl's own, which serialises a many-threaded server on one
+/// lock. mimalloc is already linked for the memory pool, so every allocation
+/// goes there instead. glibc builds keep glibc's malloc, which the allocator
+/// tuning in `lib.rs` (`mallopt`, `malloc_trim`) is written for.
+#[cfg(target_env = "musl")]
+mod musl_allocator {
+    use std::alloc::{GlobalAlloc, Layout};
+
+    use libmimalloc_sys::{mi_free, mi_malloc_aligned, mi_realloc_aligned, mi_zalloc_aligned};
+
+    struct Mimalloc;
+
+    // SAFETY: each method forwards to mimalloc's aligned API with the
+    // layout's size and alignment, which is what GlobalAlloc requires; a
+    // pointer is only ever freed or resized by the allocator that made it.
+    unsafe impl GlobalAlloc for Mimalloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            unsafe { mi_malloc_aligned(layout.size(), layout.align()) as *mut u8 }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            unsafe { mi_zalloc_aligned(layout.size(), layout.align()) as *mut u8 }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+            unsafe { mi_free(ptr as *mut _) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            unsafe { mi_realloc_aligned(ptr as *mut _, new_size, layout.align()) as *mut u8 }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: Mimalloc = Mimalloc;
+}
+
 use clap::Parser;
 
 use log::LevelFilter;
@@ -195,6 +230,14 @@ struct Args {
     /// Logging level off, error, warn, info, debug, trace (default: error)
     #[arg(long = "log-level", alias = "log_level", value_name = "LEVEL")]
     log_level: Option<LevelFilter>,
+
+    /// The most partitions a derived open budget allows, across tables
+    /// (default: 4096; `partition.max_open`). The start raises the soft
+    /// open-file limit for it, ten descriptors a partition over a 2,048
+    /// reserve, within the hard limit. `RDB_PARTITION_MAX_OPEN` sets it when
+    /// the flag is not given.
+    #[arg(long = "partition-max-open", value_name = "N")]
+    partition_max_open: Option<usize>,
 
     /// Cache size in number of entries (default: 100_000)
     #[arg(long = "cache-size", alias = "cache_size", value_name = "N")]
@@ -518,11 +561,13 @@ struct Args {
     #[arg(long = "rdb-tcp", value_name = "on|off", default_value = "on")]
     rdb_tcp: String,
 
-    /// How long one native-protocol request may run, in seconds, before it is
-    /// abandoned and answered as timed out (default 30). A connection idle this
-    /// long is closed too. Raise it for long statements sent over the native
-    /// protocol (a backup, an import, a rebalance, a large report); pgwire has
-    /// no such limit.
+    /// How long one native-protocol statement may run, in seconds, before it
+    /// is stopped and answered with an error, SQLSTATE 57014 (default 30):
+    /// the connection survives, and a transaction block on it is failed as
+    /// any failed statement fails it. A connection idle this long is closed
+    /// too. Raise it for long statements sent over the native protocol (a
+    /// backup, an import, a rebalance, a large report), or `SET
+    /// statement_timeout` inside a block; pgwire has no such limit.
     #[arg(long = "rdb-request-timeout", value_name = "SECONDS")]
     rdb_request_timeout: Option<u64>,
 
@@ -1056,7 +1101,10 @@ fn parse_idle_timeout(value: &str) -> Result<std::time::Duration, String> {
 /// file, and records every startup key's running value and where it came from
 /// for SHOW CONFIG. A saved value that does not parse is reported and
 /// ignored: a bad file must never keep the server from starting.
-fn apply_saved_settings(args: &mut Args) {
+///
+/// Returns what the file holds, for the hot keys it saved, which are applied
+/// once the flags have seeded theirs (`apply_saved_hot_keys`).
+fn apply_saved_settings(args: &mut Args) -> std::collections::BTreeMap<String, String> {
     use rasterizeddb_core::configuration::saved::{self, Source};
     use std::collections::BTreeMap;
     let location = if args.in_memory {
@@ -1082,13 +1130,18 @@ fn apply_saved_settings(args: &mut Args) {
         let source = if flag.is_some() {
             Source::CommandLine
         } else if let Some(v) = stored.get(key) {
-            match v.parse::<T>() {
+            // Checked as `SET CONFIG` checks it before saving: a hand-edited
+            // `cache.size = 0` would otherwise build an unbounded cache.
+            let (section, name) = key.split_once('.').expect("a startup key is section.key");
+            match rasterizeddb_core::core::introspect::startup_value(section, name, v)
+                .and_then(|canonical| canonical.parse::<T>().map_err(|_| format!("`{v}` does not parse")))
+            {
                 Ok(t) => {
                     *flag = Some(t);
                     Source::Saved
                 }
-                Err(_) => {
-                    eprintln!("{}: `{key} = {v}` is not a valid value; ignored", saved::FILE_NAME);
+                Err(e) => {
+                    eprintln!("{}: `{key} = {v}` is not a valid value ({e}); ignored", saved::FILE_NAME);
                     Source::Default
                 }
             }
@@ -1104,9 +1157,64 @@ fn apply_saved_settings(args: &mut Args) {
     one("wal.checkpoint_bytes", &mut args.wal_checkpoint_bytes, &stored, "67108864");
     one("wal.prealloc_kb", &mut args.wal_prealloc_kb, &stored, "1024");
     one("cache.enabled", &mut args.enable_cache, &stored, "false");
+    one("cache.size", &mut args.cache_size, &stored, "100000");
     one("index.residency", &mut args.index_residency, &stored, "memory");
     one("index.cache_mb", &mut args.index_cache_mb, &stored, "0");
     one("index.delta_mb", &mut args.index_delta_mb, &stored, "0");
+    // The environment stands in for the flag, and wins over the file as it
+    // does: it is part of how the server was started (a unit's
+    // Environment=).
+    if args.partition_max_open.is_none()
+        && let Ok(v) = std::env::var("RDB_PARTITION_MAX_OPEN")
+    {
+        match v.trim().parse() {
+            Ok(n) => args.partition_max_open = Some(n),
+            Err(_) => {
+                eprintln!("RDB_PARTITION_MAX_OPEN={v:?}: expected a whole number of partitions");
+                std::process::exit(2);
+            }
+        }
+    }
+    one("partition.max_open", &mut args.partition_max_open, &stored, "4096");
+    stored
+}
+
+/// Applies the hot keys a session's `SET CONFIG` saved, after the flags have
+/// seeded theirs: a key with a flag keeps the flag's value.
+fn apply_saved_hot_keys(args: &Args, stored: &std::collections::BTreeMap<String, String>) {
+    let given = |key: &str| -> bool {
+        match key {
+            "wal.synchronous_commit" => args.synchronous_commit.is_some(),
+            "wal.writer_delay_ms" => args.wal_writer_delay_ms.is_some(),
+            "filter.enabled" => args.filter_enabled.is_some(),
+            "filter.backfill_on_open" => args.filter_backfill.is_some(),
+            "filter.min_pruning_ratio" => args.filter_min_pruning_ratio.is_some(),
+            "filter.checkpoint_interval_secs" => args.filter_checkpoint_secs.is_some(),
+            "filter.min_f" => args.filter_min_f.is_some(),
+            "filter.default_f" => args.filter_default_f.is_some(),
+            "filter.max_f" => args.filter_max_f.is_some(),
+            "filter.min_selectivity" => args.filter_min_selectivity.is_some(),
+            "filter.min_table_rows" => args.filter_min_table_rows.is_some(),
+            "filter.zone_bounds" => args.filter_zone_bounds.is_some(),
+            "filter.bloom" => args.filter_bloom.is_some(),
+            #[cfg(feature = "query_stats")]
+            "query_stats.enabled" => args.query_stats.is_some(),
+            "auto_compact.enabled" => args.auto_compact.is_some(),
+            "auto_compact.interval_secs" => args.auto_compact_interval_secs.is_some(),
+            "auto_compact.min_slots" => args.auto_compact_min_slots.is_some(),
+            "auto_compact.ratio" => args.auto_compact_ratio.is_some(),
+            "auto_compact.dead_fraction" => args.auto_compact_dead_fraction.is_some(),
+            "auto_compact.dead_fraction_max_slots" => args.auto_compact_dead_fraction_max_slots.is_some(),
+            "auto_compact.cooldown_secs" => args.auto_compact_cooldown_secs.is_some(),
+            "index_snapshot.index_storage" => args.index_storage.is_some(),
+            // No flag: partition.*, the other index_snapshot.* keys,
+            // query_stats.recent.
+            _ => false,
+        }
+    };
+    for warning in rasterizeddb_core::core::introspect::apply_saved_hot_keys(stored, &given) {
+        eprintln!("{warning}");
+    }
 }
 
 /// `--socket-mode` and `--socket-group`, checked, for every unix socket the
@@ -1296,10 +1404,18 @@ fn main() -> std::io::Result<()> {
     // systemd unit's soft limit of 1,024 would leave a budget of 16 open
     // partitions; raised toward the hard limit, as far as the largest
     // budget needs (docs/partitioning.md, "Phase 3 P5b-2a as built").
-    let (nofile_before, nofile_now, open_budget) = rasterizeddb_core::core::partition::budget::raise_descriptor_limit();
+    //
     // Startup settings `SET CONFIG` saved, under the flags: a flag given here
-    // wins (configuration::saved).
-    apply_saved_settings(&mut args);
+    // wins (configuration::saved). First, as `partition.max_open` sizes the
+    // raise.
+    let stored_settings = apply_saved_settings(&mut args);
+    let max_open = args.partition_max_open.unwrap_or(rasterizeddb_core::core::partition::budget::DEFAULT_MAX_OPEN);
+    if let Err(e) = rasterizeddb_core::core::introspect::startup_value("partition", "max_open", &max_open.to_string()) {
+        eprintln!("--partition-max-open: {e}");
+        std::process::exit(2);
+    }
+    rasterizeddb_core::core::partition::budget::settings::set_max_open(max_open);
+    let (nofile_before, nofile_now, open_budget) = rasterizeddb_core::core::partition::budget::raise_descriptor_limit();
     // Before the runtime starts a thread: an arena made is not undone.
     if let Some(n) = args.malloc_arenas {
         if !rasterizeddb_core::set_malloc_arenas(n) {
@@ -1543,8 +1659,13 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    let cache_size = args.cache_size.unwrap_or(100_000);
+    // Under the flags, which seeded their keys above; before any database
+    // opens, so the opens see the values.
+    apply_saved_hot_keys(&args, &stored_settings);
+
+    let cache_size = args.cache_size.unwrap_or(query_cache::DEFAULT_ENTRIES);
     let enable_cache = args.enable_cache.unwrap_or(false);
+    query_cache::set_entries(cache_size);
 
     // `init` sizes the slot array itself; the cache is only reachable once the
     // flag is set, so building it first keeps a query from ever seeing a
@@ -1594,9 +1715,22 @@ fn main() -> std::io::Result<()> {
             // Printed for the same reason: a unit without LimitNOFILE leaves
             // a small partition budget, which shows as closes and reopens.
             println!(
-                "descriptors: soft limit {nofile_now}{}; partition open budget {open_budget}",
+                "descriptors: soft limit {nofile_now}{}; partition open budget {open_budget} of max_open {max_open}",
                 if nofile_now != nofile_before { format!(" (raised from {nofile_before})") } else { String::new() },
             );
+            // Said plainly when the hard limit is what stops the budget
+            // short of max_open: no setting here can fix it, the unit can.
+            let wanted = rasterizeddb_core::core::partition::budget::descriptors_for(max_open);
+            if let Some(hard) = rasterizeddb_core::core::partition::budget::hard_descriptor_limit()
+                && nofile_now < wanted
+                && hard <= nofile_now
+            {
+                println!(
+                    "descriptors: the hard limit {hard} caps the soft limit below the {wanted} that \
+                     {max_open} open partitions need, so at most {open_budget} stay open; raise the \
+                     hard limit (LimitNOFILE= in the unit, or ulimit -Hn) to at least {wanted}"
+                );
+            }
         }
 
         #[cfg(debug_assertions)]
@@ -1694,8 +1828,10 @@ fn main() -> std::io::Result<()> {
             }
         }
 
-        // Replication, backups and the rastcp protocol are single-database and
-        // act on the default one. Only the PostgreSQL listener routes by name.
+        // Backups and the rastcp protocol are single-database and act on the
+        // default one. Replication starts from it and carries every database
+        // (`Database::start_replication_with`); the PostgreSQL listener routes
+        // by name.
         let arc_database = catalog
             .get(&args.pg_default_db)
             .expect("the catalogue always holds its default database");
@@ -1703,10 +1839,14 @@ fn main() -> std::io::Result<()> {
         // Replication's files are settled at every start that finds them,
         // switched on or not: see `Database::open_replication_storage`. Before
         // the configuration below, which does not change what they hold.
-        if arc_database.has_replication_files() {
-            if let Err(e) = arc_database.open_replication_storage() {
-                eprintln!("replication storage could not be opened: {e}");
-                std::process::exit(2);
+        rasterizeddb_core::core::database::catalog::register_served(catalog.clone());
+        // Every database's, each in its own directory: they all replicate.
+        for database in catalog.all() {
+            if database.has_replication_files() {
+                if let Err(e) = database.open_replication_storage() {
+                    eprintln!("replication storage of database \"{}\" could not be opened: {e}", database.name);
+                    std::process::exit(2);
+                }
             }
         }
 
@@ -1723,7 +1863,9 @@ fn main() -> std::io::Result<()> {
                         std::process::exit(2);
                     }
                     if args.replication {
-                        if let Err(e) = Database::start_replication(arc_database.clone()) {
+                        // With the catalogue: every database replicates,
+                        // each over links of its own to the one listener.
+                        if let Err(e) = Database::start_replication_with(arc_database.clone(), Some(catalog.clone())) {
                             eprintln!("replication could not start: {e}");
                             std::process::exit(2);
                         }
@@ -1812,7 +1954,13 @@ fn main() -> std::io::Result<()> {
                 std::process::exit(2);
             }
             let (socket_mode, socket_group) = socket_permissions(&args);
-            match args.kv.listener(&args.pg_user, socket_mode, socket_group) {
+            match args.kv.listener(
+                &args.pg_user,
+                socket_mode,
+                socket_group,
+                args.pg_cert.as_deref(),
+                args.pg_key.as_deref(),
+            ) {
                 Ok(Some(config)) => {
                     match rasterizeddb_core::core::kv_cache::resp::bind(&config).await {
                         Ok(listener) => {

@@ -48,6 +48,10 @@ use crate::row::{Rows, tag};
 use crate::to_sql::ToSql;
 use crate::{Error, Result};
 
+/// Rounds [`Kv::keys`] runs before it gives up on a cursor that never ends:
+/// 500 million keys at the 500 a round it asks for.
+const MAX_SCAN_ROUNDS: u64 = 1_000_000;
+
 /// A value's text form, as stored in the cache: what [`FromSql`] reads back
 /// from a text cell. `None` for a NULL.
 ///
@@ -275,13 +279,24 @@ impl<'c, E: Executor> Kv<'c, E> {
         Ok((ms >= 0).then(|| Duration::from_millis(ms as u64)))
     }
 
-    /// Every key matching a glob `pattern` (`*`, `?`, `[…]`), by `SCAN`:
+    /// Every key matching a glob `pattern` (`*`, `?`, `[…]`), by `SCAN`
+    /// (500 keys a round; a cursor still going after a million rounds is an error):
     /// complete, but not a snapshot (keys written during the scan may or may
     /// not appear).
     pub async fn keys(&self, pattern: &[u8]) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
         let mut cursor = "0".to_string();
+        // A server's cursor walks a finite keyspace in rounds of up to 500;
+        // one that never returns to "0" would loop here forever.
+        let mut rounds = 0u64;
         loop {
+            rounds += 1;
+            if rounds > MAX_SCAN_ROUNDS {
+                return Err(Error::Unsupported(format!(
+                    "SCAN did not finish after {MAX_SCAN_ROUNDS} rounds ({} keys so far); the server's cursor does not end",
+                    out.len()
+                )));
+            }
             let rows = self
                 .command(
                     "SCAN",
@@ -870,13 +885,15 @@ impl<K: KvKey + KvValue, V: KvValue, E: Executor> KvQuery<'_, K, V, E> {
                     Err(_) if self.lenient => continue,
                     Err(e) => {
                         return Err(Error::Unsupported(format!(
-                            "the value at {:?} does not read as the query's value type ({e});                              lenient() skips such entries",
+                            "the value at {:?} does not read as the query's value type ({e}); \
+                             lenient() skips such entries",
                             String::from_utf8_lossy(full)
                         )));
                     }
                 };
                 if self.filter.as_ref().is_none_or(|keep| keep(key, &value)) {
-                    out.push((K::decode(&full[self.map.key_prefix().len()..])?, value));
+                    let cut = self.map.key_prefix().len().min(full.len());
+                    out.push((K::decode(&full[cut..])?, value));
                     if limit.is_some_and(|n| out.len() >= n) {
                         return Ok(out);
                     }

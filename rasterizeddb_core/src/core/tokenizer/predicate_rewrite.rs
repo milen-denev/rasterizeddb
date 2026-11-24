@@ -269,12 +269,18 @@ fn expand_truth_tests<'c>(
     let upper = clause.to_ascii_uppercase();
     let maybe = upper.contains("IS")
         && (upper.contains("TRUE") || upper.contains("FALSE") || upper.contains("UNKNOWN"));
-    if !maybe {
+    // `(a = b) IS NULL`, `(a > 0) = true`: a group's value tested
+    // (`predicate_group_values`, `arithmetic_null_test`).
+    let valued = upper.contains(')')
+        && ((upper.contains("IS") && upper.contains("NULL"))
+            || (upper.contains('=') && (upper.contains("TRUE") || upper.contains("FALSE"))));
+    if !maybe && !valued {
         return Ok(std::borrow::Cow::Borrowed(clause));
     }
     let (toks, grouped) = group_compared_truth_operands(lex(clause)?);
+    let (toks, values) = predicate_group_values(toks);
     let mut out: Vec<String> = Vec::with_capacity(toks.len());
-    let mut changed = grouped;
+    let mut changed = grouped || values;
     let mut i = 0usize;
     while i < toks.len() {
         // A constant's truth, `false IS NOT TRUE`, `NULL IS UNKNOWN`: the
@@ -301,6 +307,12 @@ fn expand_truth_tests<'c>(
         }
         if matches!(toks[i], Tok::LPar) {
             if let Some((text, after)) = parenthesised_truth_test(&toks, i, schema, scan)? {
+                out.push(text);
+                i = after;
+                changed = true;
+                continue;
+            }
+            if let Some((text, after)) = arithmetic_null_test(&toks, i, schema, scan)? {
                 out.push(text);
                 i = after;
                 changed = true;
@@ -363,6 +375,204 @@ fn group_compared_truth_operands(mut toks: Vec<Tok>) -> (Vec<Tok>, bool) {
         i += 1;
     }
     (toks, grouped)
+}
+
+/// Whether the group `open..=close` holds a condition at its own level: a
+/// comparison, or `LIKE`, `IN`, `BETWEEN`, `IS`, `AND`, `OR`, `NOT`.
+fn predicate_group(toks: &[Tok], open: usize, close: usize) -> bool {
+    const COMPARISONS: &[&str] = &["=", "<>", "!=", "<", ">", "<=", ">=", "~", "~*", "!~", "!~*"];
+    const WORDS: &[&str] = &["LIKE", "ILIKE", "IN", "BETWEEN", "IS", "AND", "OR", "NOT", "SIMILAR", "EXISTS"];
+    // Through a group that is all its parent holds: an integer IN list is
+    // already `((a = b OR a = 5))` here (`expand_expression_in_lists`).
+    if close > open + 2 && matches!(toks[open + 1], Tok::LPar) && toks_open_at(toks, close - 1) == Some(open + 1) {
+        return predicate_group(toks, open + 1, close - 1);
+    }
+    let mut depth = 0i32;
+    toks[open + 1..close].iter().any(|t| {
+        match t {
+            Tok::LPar => depth += 1,
+            Tok::RPar => depth -= 1,
+            Tok::Sym(sym) if depth == 0 && COMPARISONS.contains(&sym.as_str()) => return true,
+            _ if depth == 0 && WORDS.iter().any(|k| t.is_keyword(k)) => return true,
+            _ => {}
+        }
+        false
+    })
+}
+
+/// Whether a term ends right after `at`: nothing, a closing parenthesis, a
+/// comma, or `AND`/`OR`/`THEN`/`WHEN`/`ELSE`/`END`.
+fn term_ends_after(toks: &[Tok], at: usize) -> bool {
+    match toks.get(at + 1) {
+        None | Some(Tok::RPar) | Some(Tok::Comma) => true,
+        Some(t) => ["AND", "OR", "THEN", "WHEN", "ELSE", "END"].iter().any(|k| t.is_keyword(k)),
+    }
+}
+
+/// A condition used as a value, `(P) IS [NOT] NULL` and `(P) = TRUE` (`<>`,
+/// `!=`, `FALSE`, either side), as what it means. Both were refused ("syntax
+/// error at or near IS", "unexpected Op("=")"); ORMs write them.
+///
+/// `IS [NOT] NULL` of a condition is `IS [NOT] UNKNOWN`, which
+/// [`parenthesised_truth_test`] expands. `(P) = TRUE` is `P`, and `(P) =
+/// FALSE` is `NOT P` — not `IS TRUE`/`IS FALSE`: the comparison is NULL when
+/// `P` is, and under a `NOT` the two differ. The tokens and whether any
+/// changed.
+fn predicate_group_values(mut toks: Vec<Tok>) -> (Vec<Tok>, bool) {
+    let bool_word = |t: &Tok| {
+        if t.is_keyword("TRUE") {
+            Some(true)
+        } else if t.is_keyword("FALSE") {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    let equality = |t: &Tok| match t {
+        Tok::Sym(op) if op == "=" => Some(true),
+        Tok::Sym(op) if op == "<>" || op == "!=" => Some(false),
+        _ => None,
+    };
+    // `P` when the test holds as `P` does, else `(NOT P)`.
+    let as_condition = |group: &[Tok], holds_as_p: bool| -> Vec<Tok> {
+        if holds_as_p {
+            group.to_vec()
+        } else {
+            let mut v = Vec::with_capacity(group.len() + 3);
+            v.push(Tok::LPar);
+            v.push(Tok::Word("NOT".to_string()));
+            v.extend_from_slice(group);
+            v.push(Tok::RPar);
+            v
+        }
+    };
+    let mut changed = false;
+    let mut i = 0usize;
+    while i < toks.len() {
+        if matches!(toks[i], Tok::RPar)
+            && let Some(open) = toks_open_at(&toks, i)
+            && group_starts_term(&toks, open)
+            && predicate_group(&toks, open, i)
+        {
+            if toks.get(i + 1).is_some_and(|t| t.is_keyword("IS")) {
+                let at = i + 2 + usize::from(toks.get(i + 2).is_some_and(|t| t.is_keyword("NOT")));
+                if toks.get(at).is_some_and(|t| t.is_keyword("NULL")) {
+                    toks[at] = Tok::Word("UNKNOWN".to_string());
+                    changed = true;
+                }
+            } else if let (Some(eq), Some(value)) =
+                (toks.get(i + 1).and_then(equality), toks.get(i + 2).and_then(bool_word))
+                && term_ends_after(&toks, i + 2)
+            {
+                let replacement = as_condition(&toks[open..=i], eq == value);
+                let next = open + replacement.len();
+                toks.splice(open..=i + 2, replacement);
+                changed = true;
+                i = next;
+                continue;
+            }
+        }
+        // `TRUE = (P)`.
+        if let Some(value) = bool_word(&toks[i])
+            && (i == 0
+                || matches!(toks[i - 1], Tok::LPar)
+                || ["AND", "OR", "NOT", "WHERE", "WHEN", "ON", "HAVING"].iter().any(|k| toks[i - 1].is_keyword(k)))
+            && let Some(eq) = toks.get(i + 1).and_then(equality)
+            && matches!(toks.get(i + 2), Some(Tok::LPar))
+        {
+            let open = i + 2;
+            let mut depth = 0i32;
+            let close = (open..toks.len()).find(|&j| {
+                match toks[j] {
+                    Tok::LPar => depth += 1,
+                    Tok::RPar => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            });
+            if let Some(close) = close
+                && predicate_group(&toks, open, close)
+                && term_ends_after(&toks, close)
+            {
+                let replacement = as_condition(&toks[open..=close], eq == value);
+                let next = i + replacement.len();
+                toks.splice(i..=close, replacement);
+                changed = true;
+                i = next;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    (toks, changed)
+}
+
+/// `(b + 0) IS [NOT] NULL`: arithmetic in a group, tested for NULL, as the
+/// evaluator's `CASE` over it (it was "syntax error at or near IS"). Only
+/// for a scan, which reads a lifted operand, as `parenthesised_truth_test`'s
+/// own fallback.
+fn arithmetic_null_test(
+    toks: &[Tok],
+    at: usize,
+    schema: &SmallVec<[SchemaField; 20]>,
+    scan: bool,
+) -> Result<Option<(String, usize)>, String> {
+    if !scan || !group_starts_term(toks, at) {
+        return Ok(None);
+    }
+    let mut depth = 0i32;
+    let Some(close) = (at..toks.len()).find(|&j| {
+        match toks[j] {
+            Tok::LPar => depth += 1,
+            Tok::RPar => depth -= 1,
+            _ => {}
+        }
+        depth == 0
+    }) else {
+        return Ok(None);
+    };
+    if !toks.get(close + 1).is_some_and(|t| t.is_keyword("IS")) {
+        return Ok(None);
+    }
+    let negated = toks.get(close + 2).is_some_and(|t| t.is_keyword("NOT"));
+    let null_at = close + 2 + usize::from(negated);
+    if !toks.get(null_at).is_some_and(|t| t.is_keyword("NULL")) || predicate_group(toks, at, close) {
+        return Ok(None);
+    }
+    let mut depth = 0i32;
+    let arithmetic = toks[at + 1..close].iter().any(|t| {
+        match t {
+            Tok::LPar => depth += 1,
+            Tok::RPar => depth -= 1,
+            Tok::Sym(sym) if depth == 0 && matches!(sym.as_str(), "+" | "-" | "*" | "/" | "%") => return true,
+            _ => {}
+        }
+        false
+    });
+    if !arithmetic {
+        return Ok(None);
+    }
+    let mut parts = Vec::with_capacity(close - at);
+    for t in &toks[at + 1..close] {
+        match t {
+            Tok::Lifted(encoded) => match read_lifted(encoded, 0) {
+                Some((expression, _)) => parts.push(format!("({expression})")),
+                None => return Ok(None),
+            },
+            other => parts.push(other.render()),
+        }
+    }
+    let x = parts.join(" ");
+    let case = if negated {
+        format!("CASE WHEN ({x}) IS NULL THEN false ELSE true END")
+    } else {
+        format!("CASE WHEN ({x}) IS NULL THEN true ELSE false END")
+    };
+    match lift_operand(&case, schema, true) {
+        Ok(lifted) => Ok(Some((format!("{lifted} = true"), null_at + 1))),
+        Err(e) if e.starts_with("operator does not exist") || crate::core::rql::expr::is_input_error(&e) => Err(e),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Whether the `AND` at `and` closes a `BETWEEN`: one stands before it, at
@@ -3071,7 +3281,8 @@ pub fn rewrite_scan_where(
     // lifted on its own. Expanding again inside `rewrite_where` finds nothing.
     // `s ~ 'x'`, `s ~* 'x'`, `!~`, `!~*`: the `regexp_like` comparison
     // they mean, which the evaluator answers.
-    let lowered = crate::core::rql::check::lower_regex_operators(clause, "regexp_like");
+    let lowered = normalize_where_shapes(clause, schema);
+    let lowered = crate::core::rql::check::lower_regex_operators(&lowered, "regexp_like");
     let lowered = crate::core::rql::check::lower_text_match(&lowered);
     // Before the lift, so an operand folded through the key function is
     // lifted with the rest (`collate_rewrite`).
@@ -3523,6 +3734,10 @@ fn needs_evaluator(text: &str) -> bool {
                     // evaluator knows, refused as an unknown column before.
                     || crate::core::rql::expr::is_function(word)
                         && text[end..].trim_start().starts_with('(')
+                    // `clock_timestamp()`, which no fold computes once (it
+                    // reads the wall clock at each call): the evaluator's,
+                    // as in a select list. Refused as an unknown keyword.
+                    || word.eq_ignore_ascii_case("CLOCK_TIMESTAMP") && text[end..].trim_start().starts_with('(')
                     || word.bytes().all(|b| b.is_ascii_digit() || b == b'.')
                         && literal_cast_in_arithmetic(text, i, end)
                 {
@@ -3722,10 +3937,24 @@ pub fn lift_evaluated_operands(
         && !mentions_distinct_from(clause)
         && !mentions_range(clause)
         && !in_after_non_column(clause)
+        && !may_compare_an_array(clause, schema)
     {
         return Ok(clause.to_string());
     }
     lift_condition(clause, schema, 0)
+}
+
+/// Whether `text` may hold a comparison of arrays ([`compares_an_array`]):
+/// it names an array column of the table, or builds an array. The cheap
+/// test asked of every clause before any of it is parsed.
+fn may_compare_an_array(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    use crate::core::db_type::DbType;
+    crate::core::sql_scan::contains_ignore_ascii_case(text, b"array[")
+        || schema.iter().any(|f| {
+            !f.is_deleted
+                && matches!(f.db_type, DbType::ARRAY | DbType::ARRAYOF(_))
+                && crate::core::sql_scan::contains_ignore_ascii_case(text, f.name.as_bytes())
+        })
 }
 
 /// Whether `text` says `DISTINCT FROM` outside quotes: a clause whose terms
@@ -4129,7 +4358,20 @@ fn lift_term(
     depth: usize,
 ) -> Result<String, String> {
     let plain = !evaluated(term, schema) && !char_lift_needed(term, schema) && !reads_legacy_char(term, schema);
-    if plain && !mentions_distinct_from(term) && !mentions_range(term) && !in_after_non_column(term) {
+    // A comparison of arrays, or a group that may hold one (`(a = b)`,
+    // `NOT (a = b AND …)`), which is read below. Any other term naming an
+    // array column (`tags @> '{a}'`, `'x' = ANY(tags)`) is read as it was.
+    let array = may_compare_an_array(term, schema) && {
+        let mut inner = term.trim();
+        while inner.len() > 3
+            && inner.as_bytes()[..3].eq_ignore_ascii_case(b"NOT")
+            && !(inner.as_bytes()[3].is_ascii_alphanumeric() || inner.as_bytes()[3] == b'_')
+        {
+            inner = inner[3..].trim_start();
+        }
+        (inner.starts_with('(') && matching_paren_at(inner, 0) == Some(inner.len() - 1)) || compares_an_array(inner, schema)
+    };
+    if plain && !array && !mentions_distinct_from(term) && !mentions_range(term) && !in_after_non_column(term) {
         return Ok(term.to_string());
     }
     let lead = &term[..term.len() - term.trim_start().len()];
@@ -4149,12 +4391,30 @@ fn lift_term(
         || quantified_over_expression(body)
         || distinct_from_expression(body, schema)
         || compares_an_interval(body, schema)
+        || (array && compares_an_array(body, schema))
         || compares_a_computed_range(body, schema)
         || (plain && in_over_non_column(body, schema))
         || mixed_numeric_columns(body, schema)
         || constant_mixed_comparison(body)
         || quoted_against_arithmetic(body)
     {
+        // An array compared with a literal that is no array is PostgreSQL's
+        // 22P02. The evaluator reads such a literal as text, unequal to
+        // every array, and the clause would answer no rows.
+        if array && compares_an_array(body, schema)
+            && let Some((at, end, false)) = comparison_operator(body)
+        {
+            for side in [body[..at].trim(), body[end..].trim()] {
+                let quoted = side.starts_with('\'')
+                    && crate::core::sql_scan::quoted_end(side.as_bytes(), 0, b'\'') == side.len();
+                if quoted {
+                    let text = side[1..side.len() - 1].replace("''", "'");
+                    if crate::core::value_codec::parse_array_literal(&text).is_none() {
+                        return Err(format!("malformed array literal: \"{text}\""));
+                    }
+                }
+            }
+        }
         // The evaluator's three values, NULL for UNKNOWN, so a `NOT` pushed
         // onto the comparison below still leaves an unknown row out.
         let case = format!("CASE WHEN ({body}) THEN true WHEN NOT ({body}) THEN false END");
@@ -4305,6 +4565,39 @@ fn compares_an_interval(body: &str, schema: &SmallVec<[SchemaField; 20]>) -> boo
             })
     };
     interval(&body[..at]) || interval(&body[end..])
+}
+
+/// Whether `body` is a symbol comparison with a side that is an array
+/// (`tags = other`, `sig[1:n] = key`, `a <> ARRAY['x']`). The scan compares
+/// scalars only, and refused each ("operation is not supported for this
+/// column type", "yields a ARRAY value, which a WHERE clause cannot compare
+/// yet"); the evaluator compares arrays element by element, as PostgreSQL
+/// does, and already answered the same comparison in a select list.
+///
+/// Asked only of a term that names an array column or builds an array
+/// ([`may_compare_an_array`]): every other comparison is spared the two
+/// parses.
+fn compares_an_array(body: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    use crate::core::db_type::DbType;
+    let is_array = |ty: &DbType| matches!(ty, DbType::ARRAY | DbType::ARRAYOF(_));
+    if !may_compare_an_array(body, schema) {
+        return false;
+    }
+    let body = body.trim();
+    let Some((at, end, false)) = comparison_operator(body) else {
+        return false;
+    };
+    // The six comparisons only: `@>`, `<@` and `&&` over arrays are the
+    // containment reader's, as they were.
+    if !matches!(body[at..end].trim(), "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=") {
+        return false;
+    }
+    let array = |side: &str| {
+        let side = side.trim();
+        !side.is_empty()
+            && crate::core::rql::expr::parse(side, schema).is_ok_and(|e| is_array(&crate::core::rql::expr::static_type(&e)))
+    };
+    array(&body[..at]) || array(&body[end..])
 }
 
 /// Whether `body` compares with `ANY`/`SOME`/`ALL` over an array the
@@ -4757,7 +5050,7 @@ fn spell_out_list_or_range(
         if matching_paren_at(after_not, open) == Some(after_not.len() - 1) {
             let items = split_row_items(&after_not[open + 1..after_not.len() - 1]);
             if !items.is_empty()
-                && !items.iter().any(|item| item.to_ascii_uppercase().starts_with("SELECT"))
+                && !items.iter().any(|item| crate::core::sql_scan::starts_with_keyword(item, "SELECT"))
             {
                 let (each, join) = if negated { ("<>", " AND ") } else { ("=", " OR ") };
                 // PostgreSQL types the list as one array only when two or
@@ -6131,12 +6424,240 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
     rewrite_where_in(clause, schema, false)
 }
 
+/// Shapes PostgreSQL reads that the rest of this module does not, written as
+/// the ones it does. First, so every later step sees only those:
+///
+/// - a lone name in parentheses, `(n) > 5`, `(t) = 'a'`, `(n) IS NULL`, is
+///   the name: read as an expression it was an operand with nothing after
+///   it ("unexpected Op(">")"), a syntax error at `IS`, or an integer;
+/// - `x [NOT] IN (n / 10, 2)`, a list holding an expression, is the
+///   comparisons it means ([`expand_expression_in_lists`]).
+pub(crate) fn normalize_where_shapes(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> String {
+    expand_expression_in_lists(&unwrap_lone_names(clause), schema)
+}
+
+/// Whether `text` is one name: `n`, `t.n`, `"N"`, `t."N"`.
+fn is_lone_name(text: &str) -> bool {
+    let part = |p: &str| {
+        let p = p.trim();
+        if p.len() >= 2 && p.starts_with('"') && p.ends_with('"') {
+            return !p[1..p.len() - 1].contains('"');
+        }
+        let mut chars = p.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    };
+    let text = text.trim();
+    if text.is_empty() || text.contains(char::is_whitespace) {
+        return false;
+    }
+    let parts: Vec<&str> = text.split('.').collect();
+    parts.len() <= 2 && parts.iter().all(|p| part(p))
+}
+
+/// The byte just past the character starting at `at`: a `rfind` by a char
+/// predicate gives a character's first byte, and `at + 1` lands inside a
+/// multibyte one (`ΔANY(`).
+fn past_char_at(text: &str, at: usize) -> usize {
+    at + text[at..].chars().next().map_or(1, char::len_utf8)
+}
+
+/// `(n)` as `n`, where the parentheses are only grouping. Kept where they
+/// are syntax: after `IN`, `ANY`, `ALL`, `SOME`, `EXISTS`, `VALUES`, `ARRAY`,
+/// `OVER`, `FILTER`, `USING`, a call's name, or a `)`.
+fn unwrap_lone_names(clause: &str) -> String {
+    let bytes = clause.as_bytes();
+    let mut out = String::with_capacity(clause.len());
+    let mut i = 0;
+    let mut copied = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            q @ (b'\'' | b'"') => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, q);
+                continue;
+            }
+            b'(' => {
+                let Some(close) = matching_paren_at(clause, i) else {
+                    i += 1;
+                    continue;
+                };
+                let inner = &clause[i + 1..close];
+                let before = clause[..i].trim_end();
+                let word_start = before
+                    .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .map_or(0, |at| past_char_at(before, at));
+                let word = &before[word_start..];
+                let syntax = ["IN", "ANY", "ALL", "SOME", "EXISTS", "VALUES", "ARRAY", "OVER", "FILTER", "USING"]
+                    .iter()
+                    .any(|k| word.eq_ignore_ascii_case(k));
+                // A call (`f(n)`) or a name right before; a `)` (`f(a)(n)`).
+                let keyword_before = [
+                    "AND", "OR", "NOT", "WHERE", "ON", "WHEN", "THEN", "ELSE", "IS", "LIKE", "ILIKE", "BETWEEN",
+                ]
+                .iter()
+                .any(|k| word.eq_ignore_ascii_case(k));
+                let attached = before.ends_with(')') || (!word.is_empty() && !keyword_before);
+                if is_lone_name(inner) && !syntax && !attached {
+                    out.push_str(&clause[copied..i]);
+                    out.push(' ');
+                    out.push_str(inner.trim());
+                    out.push(' ');
+                    copied = close + 1;
+                    i = close + 1;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push_str(&clause[copied..]);
+    out
+}
+
+/// Whether `item` is a literal: a number, a quoted string (with a cast), or
+/// `NULL`, `TRUE`, `FALSE`.
+fn is_literal_item(item: &str) -> bool {
+    let item = item.trim();
+    let base = match item.find("::") {
+        Some(at) if item.starts_with('\'') => &item[..at],
+        _ => item,
+    };
+    let base = base.trim();
+    if base.starts_with('\'') && base.ends_with('\'') && base.len() >= 2 {
+        return true;
+    }
+    let unsigned = base.strip_prefix(['-', '+']).unwrap_or(base);
+    if !unsigned.is_empty() && unsigned.chars().all(|c| c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E') {
+        return unsigned.starts_with(|c: char| c.is_ascii_digit() || c == '.');
+    }
+    ["NULL", "TRUE", "FALSE"].iter().any(|k| base.eq_ignore_ascii_case(k))
+}
+
+/// `x IN (n / 10, 2)` as `(x = n / 10 OR x = 2)`, and `x NOT IN (…)` as
+/// `(x <> … AND x <> …)`, when `x` is one name and the list holds anything
+/// but literals ("unexpected factor: Op("/")"). The same under SQL's three
+/// values: a NULL item folds `x = NULL` false, so `IN` is never true through
+/// it and `NOT IN` never true at all, as PostgreSQL answers in a `WHERE`. A
+/// list of literals, or a subquery, is left to the paths that read those.
+///
+/// Only over an integer column, with items of integer arithmetic (names,
+/// whole numbers, operators, parentheses): PostgreSQL resolves an IN list to
+/// one common type with its left side, which separate comparisons do not —
+/// a `real` against `0.1`, a `character(n)` against a computed text — and
+/// for integers the two agree. Anything else is left as written, to the
+/// operand lifting that reads it.
+fn expand_expression_in_lists(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> String {
+    use crate::core::db_type::DbType;
+    let integer_column = |name: &str| {
+        let column = name.rsplit('.').next().unwrap_or(name).trim_matches('"');
+        schema.iter().any(|f| {
+            !f.is_deleted
+                && f.name.eq_ignore_ascii_case(column)
+                && matches!(
+                    f.db_type,
+                    DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32
+                )
+        })
+    };
+    let integer_arithmetic = |item: &str| {
+        let b = item.as_bytes();
+        !item.trim().is_empty()
+            && item.bytes().all(|c| c.is_ascii_alphanumeric() || b" _+-*/%()\".".contains(&c))
+            // A decimal point between digits is a numeric, not a qualifier.
+            && !b.windows(3).any(|w| w[0].is_ascii_digit() && w[1] == b'.' && w[2].is_ascii_digit())
+            && !b.windows(2).any(|w| w[0] == b'.' && w[1].is_ascii_digit())
+    };
+    let bytes = clause.as_bytes();
+    let mut out = String::with_capacity(clause.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            q @ (b'\'' | b'"') => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, q);
+                continue;
+            }
+            b'(' => {
+                // `… IN (` right before?
+                let before = clause[..i].trim_end();
+                let is_in = before.get(before.len().saturating_sub(2)..).is_some_and(|w| w.eq_ignore_ascii_case("IN"))
+                    && before.len() >= 2
+                    && before[..before.len() - 2].ends_with(|c: char| c.is_whitespace());
+                if !is_in {
+                    i += 1;
+                    continue;
+                }
+                let Some(close) = matching_paren_at(clause, i) else {
+                    i += 1;
+                    continue;
+                };
+                let inner = &clause[i + 1..close];
+                if crate::core::sql_scan::starts_with_keyword(inner.trim(), "SELECT")
+                    || crate::core::sql_scan::starts_with_keyword(inner.trim(), "VALUES")
+                {
+                    i += 1;
+                    continue;
+                }
+                // An empty list (`NOT IN ()`, an IN subquery that found no
+                // rows, substituted) or an empty item is the other paths'.
+                let items = split_row_items(inner);
+                if items.is_empty()
+                    || items.iter().any(|item| item.trim().is_empty())
+                    || items.iter().all(|item| is_literal_item(item))
+                {
+                    i = close + 1;
+                    continue;
+                }
+                // The name and the optional NOT before `IN`.
+                let head = before[..before.len() - 2].trim_end();
+                let (head, negated) = match head.get(head.len().saturating_sub(3)..) {
+                    Some(w) if w.eq_ignore_ascii_case("NOT")
+                        && head[..head.len() - 3].ends_with(|c: char| c.is_whitespace()) =>
+                    {
+                        (head[..head.len() - 3].trim_end(), true)
+                    }
+                    _ => (head, false),
+                };
+                let name_start = head
+                    .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '"' || c == '$'))
+                    .map_or(0, |at| past_char_at(head, at));
+                let name = &head[name_start..];
+                if !is_lone_name(name)
+                    || name_start < copied
+                    || !integer_column(name)
+                    || !items.iter().all(|item| integer_arithmetic(item))
+                {
+                    i += 1;
+                    continue;
+                }
+                let terms: Vec<String> = items
+                    .iter()
+                    .map(|item| format!("{name} {} {}", if negated { "<>" } else { "=" }, item.trim()))
+                    .collect();
+                out.push_str(&clause[copied..name_start]);
+                out.push('(');
+                out.push_str(&terms.join(if negated { " AND " } else { " OR " }));
+                out.push(')');
+                copied = close + 1;
+                i = close + 1;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push_str(&clause[copied..]);
+    out
+}
+
 /// [`rewrite_where`]; `scan` when the scan reads the result
 /// ([`rewrite_scan_where`]), which can take a lifted operand.
 fn rewrite_where_in(clause: &str, schema: &SmallVec<[SchemaField; 20]>, scan: bool) -> Result<String, String> {
     if clause.trim().is_empty() {
         return Ok(String::new());
     }
+    let clause = &normalize_where_shapes(clause, schema);
 
     // The regular-expression operators as `regexp_like` (a no-op once
     // `rewrite_scan_where` has done it).
@@ -8212,8 +8733,12 @@ mod operand_guard_tests {
     /// In a list or a range, each comparison is guarded by its own operand.
     #[test]
     fn list_and_range_operands_guard_their_own_comparison() {
-        assert_eq!(rw("x IN (y, z)"), "(__null_x = 0 AND ((__null_y = 0 AND x = y) OR x = z))");
-        assert_eq!(rw("x NOT IN (y, 1)"), "(__null_x = 0 AND ((__null_y = 0 AND x != y) AND x != 1))");
+        // An IN list over integers is its comparisons before any guard goes
+        // in (`expand_expression_in_lists`), so `x`'s guard is written once
+        // per comparison: (A∧B)∨(A∧C), the same predicate as A∧(B∨C), NULLs
+        // included (a NULL `y` fails its own comparison only).
+        assert_eq!(rw("x IN (y, z)"), "( (__null_x = 0 AND (__null_y = 0 AND x = y)) OR (__null_x = 0 AND x = z) )");
+        assert_eq!(rw("x NOT IN (y, 1)"), "( (__null_x = 0 AND (__null_y = 0 AND x <> y)) AND (__null_x = 0 AND x <> 1) )");
         assert_eq!(rw("z BETWEEN x AND y"), "((__null_x = 0 AND z >= x) AND (__null_y = 0 AND z <= y))");
         assert_eq!(rw("NOT (z BETWEEN x AND y)"), "((__null_x = 0 AND z < x) OR (__null_y = 0 AND z > y))");
     }
@@ -8447,5 +8972,42 @@ mod lifted_operand_tests {
         assert!(lift_evaluated_operands(&deep(10), &schema()).is_ok());
         let e = lift_evaluated_operands(&deep(100_000), &schema()).unwrap_err();
         assert!(e.contains("nested more than"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod where_shape_multibyte_tests {
+    use super::*;
+    use crate::core::db_type::DbType;
+
+    fn schema() -> SmallVec<[SchemaField; 20]> {
+        let mut s: SmallVec<[SchemaField; 20]> = SmallVec::new();
+        for (i, (name, ty)) in [("a", DbType::STRING), ("b", DbType::I32)].into_iter().enumerate() {
+            s.push(SchemaField::new(name.to_string(), ty, 12, 0, i as u64, false));
+        }
+        s
+    }
+
+    /// A multibyte character right before a parenthesis, or right before the
+    /// name of an `IN`, panicked: the word's start was the character's first
+    /// byte plus one, inside it.
+    #[test]
+    fn a_multibyte_character_before_a_group_is_not_cut() {
+        for clause in [
+            "b = ΔANY('{1,2}'::int[]) AND b <> ALL(ARRAY[1,2]::bigint[]) OR a = SOME('{x}'::text[])",
+            "b = AΔNY('{1,2}'::int[])",
+            "b = AN😀Y('{1,2}'::int[])",
+            "b <> ΔALL(ARRAY[1,2])",
+            "Δ(b) > 5",
+            "é (b) > 5",
+            "Δb IN (b / 10, 2)",
+            "ΔΔ b IN (b / 10, 2)",
+            "😀b NOT IN (b + 1, 2)",
+        ] {
+            let _ = normalize_where_shapes(clause, &schema());
+        }
+        // The rewrites still happen next to one.
+        assert_eq!(normalize_where_shapes("a = 'Δ' AND (b) > 5", &schema()).trim_end(), "a = 'Δ' AND  b  > 5");
+        assert_eq!(normalize_where_shapes("a = 'Δ' AND b IN (b / 10, 2)", &schema()), "a = 'Δ' AND (b = b / 10 OR b = 2)");
     }
 }

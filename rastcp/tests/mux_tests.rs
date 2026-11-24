@@ -922,13 +922,15 @@ async fn a_lone_request_times_out_as_a_task_does() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lone_request_is_finished_when_its_peer_goes() {
     bounded(async {
+        let started = Arc::new(AtomicUsize::new(0));
         let finished = Arc::new(AtomicUsize::new(0));
-        let counted = finished.clone();
+        let (begun, counted) = (started.clone(), finished.clone());
         let running = serve_with(
             |builder| builder,
             move |data: Vec<u8>| {
-                let counted = counted.clone();
+                let (begun, counted) = (begun.clone(), counted.clone());
                 async move {
+                    begun.fetch_add(1, Ordering::SeqCst);
                     sleep(SLOW_FOR / 2).await;
                     counted.fetch_add(1, Ordering::SeqCst);
                     data
@@ -939,13 +941,65 @@ async fn a_lone_request_is_finished_when_its_peer_goes() {
         let client = mux(&running.addr, Duration::from_secs(30)).await;
         let sender = client.clone();
         let sent = tokio::spawn(async move { sender.send(&request(ECHO, 1, 16)).await });
-        until("the request reached the server", || running.server.active_connections() == 1).await;
-        sleep(SLOW_FOR / 8).await;
+        // The handler running, not only the connection accepted: on a slow
+        // runner (linux-arm64, CI 2026-11-23) the peer used to go before
+        // the request had been read, and no request ever started.
+        until("the request reached the handler", || started.load(Ordering::SeqCst) == 1).await;
         // The peer goes while the request waits: it is finished anyway.
         sent.abort();
         drop(client);
         until("the connection closed", || running.server.active_connections() == 0).await;
         until("the request finished", || finished.load(Ordering::SeqCst) == 1).await;
+        running.task.abort();
+    })
+    .await
+}
+
+/// An answer longer than this client takes ends the connection, since its
+/// body is still on the wire. Only the request it answers was too large: the
+/// others in flight learn that the connection closed, not that their answers
+/// were too long, and the next request reconnects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversized_answer_fails_its_own_request_and_closes_the_rest() {
+    bounded(async {
+        const BIG: u8 = 9;
+        let running = serve_with(
+            |builder| builder,
+            |data: Vec<u8>| async move {
+                match data.first().copied() {
+                    Some(BIG) => vec![BIG; 8 * 1024],
+                    _ => respond(data).await,
+                }
+            },
+        )
+        .await;
+        let client = TcpClientBuilder::new(&running.addr)
+            .timeout(Duration::from_secs(30))
+            .max_message_size(1024)
+            .build_multiplexed()
+            .await
+            .unwrap();
+
+        let slow = {
+            let client = client.clone();
+            tokio::spawn(async move { client.send(&request(SLOW, 1, 16)).await })
+        };
+        until("the slow request reaches the server", || {
+            running.server.active_connections() == 1
+        })
+        .await;
+        sleep(Duration::from_millis(50)).await;
+
+        let big = client.send(&[BIG]).await;
+        assert!(
+            matches!(big, Err(RastcpError::MessageTooLarge { max: 1024, .. })),
+            "got {big:?}"
+        );
+        let slow = slow.await.unwrap();
+        assert!(matches!(slow, Err(RastcpError::ConnectionClosed)), "got {slow:?}");
+
+        let again = request(ECHO, 7, 16);
+        assert!(client.send(&again).await.unwrap() == again);
         running.task.abort();
     })
     .await

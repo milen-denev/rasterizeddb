@@ -565,7 +565,7 @@ pub fn needs_evaluation(text: &str) -> bool {
         if let Some(close) = matching_paren(trimmed, 0) {
             if close == trimmed.len() - 1 {
                 let inner = trimmed[1..close].trim();
-                return !inner.to_ascii_uppercase().starts_with("SELECT");
+                return !crate::core::sql_scan::starts_with_keyword(inner, "SELECT");
             }
         }
     }
@@ -1267,6 +1267,78 @@ pub(crate) fn array_constructor_body(text: &str) -> Option<&str> {
 }
 
 /// Parses one expression against `schema`.
+/// Whether `text` is a predicate — a value that is true, false or unknown —
+/// rather than an expression: it has, outside quotes and parentheses, a
+/// comparison operator or one of `LIKE`, `ILIKE`, `SIMILAR`, `BETWEEN`,
+/// `IN (`, `IS`, `AND`, `OR`, `NOT`. A `CASE` or a subquery is never one:
+/// its own conditions are inside it.
+pub(crate) fn is_predicate(text: &str) -> bool {
+    let text = text.trim();
+    if crate::core::sql_scan::starts_with_keyword(text, "SELECT")
+        || crate::core::sql_scan::starts_with_keyword(text, "CASE")
+        || crate::core::sql_scan::starts_with_keyword(text, "WITH")
+        || crate::core::sql_scan::starts_with_keyword(text, "VALUES")
+    {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let operator_byte = |b: u8| matches!(b, b'<' | b'>' | b'=' | b'!' | b'-' | b'@' | b'#' | b'|' | b'&' | b'~' | b'^' | b'*' | b'+' | b'/' | b'%');
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\'' | b'"' => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, b);
+                continue;
+            }
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            _ if depth > 0 => {}
+            b'=' | b'<' | b'>' | b'!' | b'~' => {
+                // One comparison operator, on its own: `=`, `<>`, `!=`, `<`,
+                // `>`, `<=`, `>=`, and the regular-expression matches `~`,
+                // `~*`, `!~`, `!~*` (what `SIMILAR TO` is lowered to before
+                // this reads it) — not `->`, `->>`, `=>`, `<@`, `@>`, `#>`,
+                // `<<`, `>>`, `||` or any longer operator.
+                let mut end = i;
+                while end < bytes.len() && operator_byte(bytes[end]) {
+                    end += 1;
+                }
+                let start_ok = i == 0 || !operator_byte(bytes[i - 1]);
+                let op = &text[i..end];
+                if start_ok && i > 0 && matches!(op, "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=" | "~" | "~*" | "!~" | "!~*") {
+                    return true;
+                }
+                i = end;
+                continue;
+            }
+            _ if b.is_ascii_alphabetic() && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_' || bytes[i - 1] == b'.')) => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let word = &text[start..i];
+                let rest = text[i..].trim_start();
+                // A name followed by `(` or `.` is a call or a qualifier.
+                let called = rest.starts_with('(') && !word.eq_ignore_ascii_case("IN");
+                if !called && !rest.starts_with('.') {
+                    if ["LIKE", "ILIKE", "SIMILAR", "BETWEEN", "IS", "AND", "OR", "NOT"].iter().any(|k| word.eq_ignore_ascii_case(k)) {
+                        return true;
+                    }
+                    if word.eq_ignore_ascii_case("IN") && rest.starts_with('(') {
+                        return true;
+                    }
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     let text = text.trim();
     if text.is_empty() {
@@ -1280,7 +1352,18 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     if text.starts_with('(') {
         if let Some(close) = matching_paren(text, 0) {
             if close == text.len() - 1 {
-                return parse(&text[1..close], schema);
+                let inner = &text[1..close];
+                // A predicate in parentheses is a boolean value:
+                // `('abc' LIKE '%b%')::text`, `'x' || (m LIKE '%o%')::text`.
+                // Read as an expression it was a column named after itself,
+                // or a call named `''`. It is the CASE it means, with
+                // SQL's third value kept: TRUE when it holds, FALSE when its
+                // NOT holds, and NULL when neither does (`NULL LIKE 'a'`),
+                // as PostgreSQL answers.
+                if is_predicate(inner) {
+                    return parse(&format!("CASE WHEN {inner} THEN TRUE WHEN NOT ({inner}) THEN FALSE END"), schema);
+                }
+                return parse(inner, schema);
             }
         }
     }
@@ -1744,6 +1827,12 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                 const PARAMETERS: [&str; 7] = ["years", "months", "weeks", "days", "hours", "mins", "secs"];
                 let mut iv = crate::core::pg_types::Interval { months: 0, days: 0, micros: 0 };
                 let too_large = || "interval out of range".to_string();
+                // An argument that is not a constant (`hours => p.escalate_after_hours`)
+                // is the amount times one of its unit, summed with the
+                // constant part: `make_interval(hours => x)` is
+                // `x * INTERVAL '1 hour'`, NULL when x is. Its name was read
+                // as a column ("column \"hours\" does not exist").
+                let mut computed: Vec<(&'static str, String)> = Vec::new();
                 for (position, arg) in split_args(args_text).into_iter().enumerate() {
                     let arg = arg.trim();
                     if arg.is_empty() {
@@ -1756,6 +1845,27 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                             None => return Err("function make_interval takes at most 7 arguments".to_string()),
                         },
                     };
+                    let unit_word = match unit.as_str() {
+                        "years" => "year",
+                        "months" => "month",
+                        "weeks" => "week",
+                        "days" => "day",
+                        "hours" => "hour",
+                        "mins" => "minute",
+                        "secs" => "second",
+                        other => {
+                            return Err(format!(
+                                "make_interval has no argument named '{}' (it takes years, months, weeks, days, hours, mins and secs)",
+                                other
+                            ));
+                        }
+                    };
+                    let quoted = amount_text.len() >= 2 && amount_text.starts_with('\'') && amount_text.ends_with('\'');
+                    let numeric = amount_text.trim_matches('\'').parse::<f64>().is_ok();
+                    if !numeric && !quoted {
+                        computed.push((unit_word, amount_text.to_string()));
+                        continue;
+                    }
                     // A bound parameter can arrive quoted — PostgreSQL casts
                     // `'120'` to the argument's type, so the quotes are stripped
                     // rather than treated as a different value.
@@ -1791,6 +1901,22 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                             ));
                         }
                     }
+                }
+                if !computed.is_empty() {
+                    // The constant part as a literal, then each computed
+                    // argument as its amount times one of its unit.
+                    let mut terms: Vec<String> = Vec::new();
+                    if iv.months != 0 || iv.days != 0 || iv.micros != 0 {
+                        terms.push(format!(
+                            "INTERVAL '{} months {} days {} microseconds'",
+                            iv.months, iv.days, iv.micros
+                        ));
+                    }
+                    for (unit_word, amount) in &computed {
+                        terms.push(format!("({}) * INTERVAL '1 {}'", amount, unit_word));
+                    }
+                    let sum = terms.join(" + ");
+                    return parse(&sum, schema);
                 }
                 // An interval, not a bare count of microseconds: a count is an
                 // integer, and an integer next to a date is a number of days.
@@ -1849,6 +1975,16 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                     TextFunc::ExtractField,
                     vec![Expr::Literal { bytes: canonical.as_bytes().to_vec(), db_type: DbType::STRING }, source],
                 ));
+            }
+
+            // `CURRENT_TIME(2)`, `LOCALTIMESTAMP(0)`: the keyword at that
+            // many fractional digits, which is its cast to its own type at
+            // that precision. Read as a call, it was "function
+            // current_time(integer) does not exist".
+            if let Some(own_type) = clock_keyword_type(name)
+                && let Ok(precision) = args_text.trim().parse::<u32>()
+            {
+                return parse(&format!("{}::{}({})", name.trim(), own_type, precision.min(6)), schema);
             }
 
             // `pg_column_size(t)` names a *relation*, which resolves to no
@@ -2343,6 +2479,18 @@ pub fn compare_key_values(
     Ordering::Equal
 }
 
+/// The type of a clock keyword that takes a precision in parentheses
+/// (`CURRENT_TIME(2)`): the type its bare form already is.
+fn clock_keyword_type(name: &str) -> Option<&'static str> {
+    match name.trim().to_ascii_uppercase().as_str() {
+        "CURRENT_TIMESTAMP" => Some("timestamptz"),
+        "LOCALTIMESTAMP" => Some("timestamp"),
+        "CURRENT_TIME" => Some("timetz"),
+        "LOCALTIME" => Some("time"),
+        _ => None,
+    }
+}
+
 /// The SQL value keywords spelled without parentheses.
 ///
 /// `CURRENT_TIMESTAMP` is a value, not a call, so every path that recognises a
@@ -2581,7 +2729,7 @@ fn in_or_between(text: &str, schema: &[SchemaField]) -> Result<Option<Cond>, Str
                 return Ok(None);
             }
             let inside = rest[1..rest.len() - 1].trim();
-            if inside.len() >= 6 && inside.as_bytes()[..6].eq_ignore_ascii_case(b"SELECT") {
+            if crate::core::sql_scan::starts_with_keyword(inside, "SELECT") {
                 return Err(format!("condition '{}' with IN (SELECT …) is not supported here yet", text));
             }
             let items = crate::core::rql::lexer_ct::split_definitions(inside);
@@ -3822,6 +3970,10 @@ pub fn static_type(expr: &Expr) -> DbType {
                     DbType::DATE => DbType::I32,
                     DbType::DATETIME if matches!(op, ArithOp::Sub) => DbType::INTERVAL,
                     DbType::DATETIME | DbType::INTERVAL => DbType::DATETIME,
+                    DbType::TIME if matches!(op, ArithOp::Add) || date(lhs) => DbType::DATETIME,
+                    // `date + timetz`: a `timestamptz` (not a `timestamp`:
+                    // `yields_timestamp` answers false for it).
+                    DbType::TIMETZ if matches!(op, ArithOp::Add) => DbType::DATETIME,
                     _ => DbType::DATE,
                 };
             }
@@ -7274,6 +7426,63 @@ fn date_arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
         // `interval + date`, which the timestamp arithmetic reads date first.
         (None, Some(_)) if matches!((a.db_type(), op), (Some(DbType::INTERVAL), ArithOp::Add)) => {
             arith(&as_timestamp(b), op, a)
+        }
+        // `date + timetz` and `timetz + date`: that time of day, in its own
+        // zone, on that date — an instant, a `timestamptz` (PostgreSQL's
+        // `datetimetz_pl`). The zone is stored as seconds west of UTC, so
+        // `10:00+02` is 08:00 UTC. It was "operator does not exist: date +
+        // time with time zone". PostgreSQL has no `date - timetz`, and
+        // neither has this: only `+` comes here.
+        (Some(_), None) | (None, Some(_))
+            if matches!(op, ArithOp::Add)
+                && matches!(if date_days(a).is_some() { b.db_type() } else { a.db_type() }, Some(DbType::TIMETZ)) =>
+        {
+            let (date, timetz) = if date_days(a).is_some() { (a, b) } else { (b, a) };
+            let (of_day, west) = match timetz {
+                Value::Data { bytes, .. } => (
+                    bytes.get(..8).and_then(|b| b.try_into().ok()).map(i64::from_be_bytes),
+                    bytes.get(8..12).and_then(|b| b.try_into().ok()).map(i32::from_be_bytes),
+                ),
+                Value::Null => (None, None),
+            };
+            let (of_day, west) = (of_day.ok_or_else(refuse)?, west.ok_or_else(refuse)?);
+            match as_timestamp(date) {
+                Value::Data { bytes, db_type: DbType::DATETIME } => {
+                    let midnight = i64::from_le_bytes(bytes.as_slice().try_into().map_err(|_| refuse())?);
+                    let instant = midnight
+                        .checked_add(of_day)
+                        .and_then(|t| t.checked_add(i64::from(west) * 1_000_000))
+                        .ok_or("timestamp out of range")?;
+                    Ok(Value::Data { bytes: instant.to_le_bytes().to_vec(), db_type: DbType::DATETIME })
+                }
+                _ => Err(refuse()),
+            }
+        }
+        // `date + time` and `time + date`: that time of day on that date, a
+        // `timestamp` (PostgreSQL's `datetime_pl`). It was "operator does
+        // not exist: date + time".
+        // `date - time` is the timestamp that much before the date's midnight.
+        (Some(_), None) | (None, Some(_))
+            if (matches!(op, ArithOp::Add) || (matches!(op, ArithOp::Sub) && date_days(a).is_some()))
+                && matches!(if date_days(a).is_some() { b.db_type() } else { a.db_type() }, Some(DbType::TIME)) =>
+        {
+            let (date, time) = if date_days(a).is_some() { (a, b) } else { (b, a) };
+            let of_day = match time {
+                Value::Data { bytes, .. } => bytes.get(..8).and_then(|b| b.try_into().ok()).map(i64::from_be_bytes),
+                Value::Null => None,
+            }
+            .ok_or_else(refuse)?;
+            match as_timestamp(date) {
+                Value::Data { bytes, db_type: DbType::DATETIME } => {
+                    let midnight = i64::from_le_bytes(bytes.as_slice().try_into().map_err(|_| refuse())?);
+                    let of_day = if matches!(op, ArithOp::Sub) { -of_day } else { of_day };
+                    Ok(Value::Data {
+                        bytes: midnight.checked_add(of_day).ok_or("timestamp out of range")?.to_le_bytes().to_vec(),
+                        db_type: DbType::DATETIME,
+                    })
+                }
+                _ => Err(refuse()),
+            }
         }
         _ => Err(refuse()),
     }

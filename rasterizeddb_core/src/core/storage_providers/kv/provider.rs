@@ -1580,6 +1580,20 @@ impl KvFile {
 
     /// Reads into `dst`, returning how many bytes the file actually had.
     async fn read_at(&self, position: u64, dst: &mut [u8]) -> io::Result<usize> {
+        // Resident and wholly inside the file: memory work under the two
+        // read locks the row fetch takes (`try_read_many_sync`), rather than
+        // the fetch path's map of pages built per read. A pointer read of an
+        // index's candidates is one small read per run of them, and that map
+        // was most of what each cost. Still noted, so a scan through here
+        // keeps its read-ahead for the pages that are not resident.
+        let n = dst.len();
+        if n > 0
+            && position.saturating_add(n as u64) <= self.len.load(Ordering::Acquire)
+            && self.try_read_many_sync(&mut [(position, &mut *dst)])
+        {
+            self.note_read(position, position + n as u64);
+            return Ok(n);
+        }
         self.read_at_inner(position, dst, true).await
     }
 
@@ -1642,6 +1656,13 @@ impl KvFile {
         if reads.is_empty() {
             return Ok(());
         }
+        // Resident, the whole batch: one pass under the two read locks
+        // (`try_read_many_sync`). Each read below runs the fetch path's
+        // overlay and page-map steps of its own: an index's hundred rows
+        // were a hundred of those per statement, a fan-out's scan thousands.
+        if self.try_read_many_sync(reads) {
+            return Ok(());
+        }
         let len = self.len.load(Ordering::Acquire);
         let base_len = self.base_len.load(Ordering::Acquire);
 
@@ -1674,7 +1695,12 @@ impl KvFile {
             self.pages(&wanted, base_len).await?;
         }
 
-        // Every page the batch needs is resident now, so each read is memory work.
+        // Every page the batch needs is resident now: the same one pass,
+        // unless a page went again or a read runs past the end, which the
+        // reads one at a time below answer.
+        if self.try_read_many_sync(reads) {
+            return Ok(());
+        }
         let mut first_error = None;
         for (position, buf) in reads.iter_mut() {
             match self.read_at_inner(*position, buf, false).await {

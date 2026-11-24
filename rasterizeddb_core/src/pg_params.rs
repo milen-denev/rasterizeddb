@@ -215,7 +215,13 @@ pub fn inline_params(sql: &str, params: &[BoundParam]) -> Result<String, String>
                         k += 1;
                     }
                     let name_start = k;
-                    while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_')
+                    let multi = multi_word_type(bytes, k);
+                    if let Some((end, _)) = multi {
+                        k = end;
+                    }
+                    while multi.is_none()
+                        && k < bytes.len()
+                        && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_')
                     {
                         k += 1;
                     }
@@ -225,7 +231,21 @@ pub fn inline_params(sql: &str, params: &[BoundParam]) -> Result<String, String>
                     // A built-in type only: a domain's or an enum type's name
                     // is a cast the statement's rewrite still has to see
                     // (`$1::posint` checks the domain's constraints).
-                    if k > name_start
+                    let after = {
+                        let mut a = k;
+                        while multi.is_some() && a < bytes.len() && bytes[a].is_ascii_whitespace() {
+                            a += 1;
+                        }
+                        a
+                    };
+                    if let Some((_, canonical)) = multi {
+                        // `character varying(20)`: a modifier follows, so the
+                        // cast is left whole, as for a one-word name.
+                        if !matches!(bytes.get(after), Some(b'(') | Some(b'[')) {
+                            consumed_cast = Some(canonical);
+                            i = k;
+                        }
+                    } else if k > name_start
                         && !matches!(bytes.get(k), Some(b'(') | Some(b'['))
                         && is_builtin_type_name(&sql[name_start..k])
                     {
@@ -290,11 +310,56 @@ fn placeholder_cast(bytes: &[u8], at: usize) -> Option<&str> {
     while k < bytes.len() && (bytes[k] as char).is_whitespace() {
         k += 1;
     }
+    if let Some((_, canonical)) = multi_word_type(bytes, k) {
+        return Some(canonical);
+    }
     let start = k;
     while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
         k += 1;
     }
     (k > start).then(|| std::str::from_utf8(&bytes[start..k]).ok()).flatten()
+}
+
+/// A built-in type PostgreSQL spells in several words, at `at`: where it ends
+/// and its one-word name. `$1::timestamp with time zone` was read as
+/// `$1::timestamp`, and the rest glued onto the value (`'…' with time zone`,
+/// `1.5 precision`), so every such bind failed as invalid input.
+fn multi_word_type(bytes: &[u8], at: usize) -> Option<(usize, &'static str)> {
+    const SPELLINGS: &[(&[&str], &str)] = &[
+        (&["timestamp", "with", "time", "zone"], "timestamptz"),
+        (&["timestamp", "without", "time", "zone"], "timestamp"),
+        (&["time", "with", "time", "zone"], "timetz"),
+        (&["time", "without", "time", "zone"], "time"),
+        (&["double", "precision"], "float8"),
+        (&["character", "varying"], "varchar"),
+        (&["char", "varying"], "varchar"),
+        (&["bit", "varying"], "varbit"),
+    ];
+    'spelling: for (words, canonical) in SPELLINGS {
+        let mut k = at;
+        for (n, word) in words.iter().enumerate() {
+            if n > 0 {
+                let gap = k;
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if k == gap {
+                    continue 'spelling;
+                }
+            }
+            let end = k + word.len();
+            if bytes.len() < end || !bytes[k..end].eq_ignore_ascii_case(word.as_bytes()) {
+                continue 'spelling;
+            }
+            k = end;
+        }
+        // The last word must end there: `timestamp with time zones` is not it.
+        if bytes.get(k).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_') {
+            continue;
+        }
+        return Some((k, canonical));
+    }
+    None
 }
 
 /// The bytes that can begin a construct `inline_params` must look inside or
@@ -1161,6 +1226,32 @@ mod tests {
                 .unwrap(),
             "SELECT '2024-01-01 08:00:00+00', '2024-01-01 10:00:00', '2024-01-01 10:00:00+02'"
         );
+    }
+
+    /// A cast to a type spelled in several words is read whole: before, only
+    /// its first word was, and the rest joined the value (`'…' with time
+    /// zone`, `1.5 precision`), so the bind failed as invalid input.
+    #[test]
+    fn a_multi_word_type_cast_on_a_parameter_is_read_whole() {
+        let zoned = "2024-01-01 10:00:00+02";
+        assert_eq!(
+            inline_params("INSERT INTO t (ts) VALUES ($1::timestamp with time zone)", &[text(0, zoned)]).unwrap(),
+            "INSERT INTO t (ts) VALUES ('2024-01-01 08:00:00+00')"
+        );
+        assert_eq!(
+            inline_params("SELECT $1::TIMESTAMP WITHOUT TIME ZONE", &[text(0, zoned)]).unwrap(),
+            "SELECT '2024-01-01 10:00:00'"
+        );
+        assert_eq!(inline_params("SELECT $1::double  precision", &[text(0, "1.5")]).unwrap(), "SELECT 1.5");
+        assert_eq!(inline_params("SELECT $1::character varying, $2", &[text(0, "a"), text(0, "b")]).unwrap(), "SELECT 'a', 'b'");
+        assert_eq!(inline_params("SELECT $1::time with time zone", &[text(0, "10:00:00+02")]).unwrap(), "SELECT '10:00:00+02'");
+        // A modifier after it: the cast stays, whole, as a one-word one does.
+        assert_eq!(
+            inline_params("SELECT $1::character varying(5)", &[text(0, "abc")]).unwrap(),
+            "SELECT 'abc'::character varying(5)"
+        );
+        // `time` alone, then a column named `with`: not the multi-word type.
+        assert_eq!(multi_word_type(b"timestamp with time zones", 0), None);
     }
 
     #[test]

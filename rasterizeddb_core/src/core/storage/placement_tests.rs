@@ -272,10 +272,28 @@ async fn a_backup_directory_opens_as_a_database_of_its_own() {
     }
 
     // The point of a mirrored copy: point the engine at the backup directory
-    // and it is a database, not an archive that needs restoring first. The pool
-    // file is removed so the copy does not try to mirror back into a location
-    // that is now its own.
-    let _ = std::fs::remove_file(backup.path().join(super::POOL_FILE));
+    // and it is a database, not an archive that needs restoring first.
+    //
+    // The mirror carries table files only, so as written it holds no pool
+    // file and its tables open from itself. The dangerous shape is a mirror
+    // that also carries the original's pool file (copied along with the
+    // directory by hand, or by a sync of the whole tree): that file names the
+    // primary, and opened as it was, the copy read and wrote the primary's
+    // files. It is adopted now, so the copy reads its own and leaves the
+    // original alone. The file is copied here so that is what this opens.
+    assert!(
+        !backup.path().join(super::POOL_FILE).exists(),
+        "the mirror now carries a pool file of its own; this test copies the original's over it"
+    );
+    std::fs::copy(root.path().join(super::POOL_FILE), backup.path().join(super::POOL_FILE)).unwrap();
+    let original_rows: Vec<(String, u64)> = files_for(root.path(), "survivor")
+        .into_iter()
+        .map(|name| {
+            let len = std::fs::metadata(root.path().join(&name)).unwrap().len();
+            (name, len)
+        })
+        .collect();
+    let original_pool = std::fs::read(root.path().join(super::POOL_FILE)).unwrap();
     let recovered = open(backup.path()).await;
     let table = recovered.table_for_tests("survivor")
         .expect("the backup copy should list the table");
@@ -283,6 +301,23 @@ async fn a_backup_directory_opens_as_a_database_of_its_own() {
         StorageIO::get_len(&*table.data().unwrap().io_rows).await > 0,
         "the backup copy lists the table but holds none of its rows"
     );
+    assert_eq!(
+        recovered.storage.location_of("survivor").as_deref(),
+        Some(backup.path().to_string_lossy().as_ref()),
+        "the copy resolves its table outside itself (pool file {:?})",
+        std::fs::read_to_string(backup.path().join(super::POOL_FILE)).ok()
+    );
+    // A write to the copy lands in the copy.
+    insert(&recovered, "survivor", 8, "only in the copy").await;
+    let after: Vec<(String, u64)> = files_for(root.path(), "survivor")
+        .into_iter()
+        .map(|name| {
+            let len = std::fs::metadata(root.path().join(&name)).unwrap().len();
+            (name, len)
+        })
+        .collect();
+    assert_eq!(after, original_rows, "a write to the copy changed the original's files");
+    assert_eq!(std::fs::read(root.path().join(super::POOL_FILE)).unwrap(), original_pool);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1150,4 +1185,70 @@ async fn a_failed_seek_write_to_a_backup_leaves_a_mark() {
     drop(MirrorStorageProvider::attach(&root_path, std::slice::from_ref(&backup_path), "ms.db").await);
     assert_same(root.path(), backup.path(), &["ms.db"], "after the next attach");
     assert!(marks_in(backup.path()).is_empty());
+}
+
+/// The mappings of `dir`'s files this process still has whose file is gone,
+/// from /proc/self/maps.
+#[cfg(target_os = "linux")]
+fn deleted_mappings_under(dir: &std::path::Path) -> Vec<String> {
+    let dir = dir.to_string_lossy().into_owned();
+    std::fs::read_to_string("/proc/self/maps")
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(&dir) && line.ends_with("(deleted)"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A dropped table's files are unmapped, whichever threads read them. Each
+/// thread's map cache held the last file it read, so a thread whose last read
+/// was the dropped table kept the file mapped until it read another one: on
+/// an idle server, until restart. ext4 did not free the space, and ntfs-3g
+/// could not remove the directory.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_table_is_unmapped_on_every_thread() {
+    let root = tempfile::tempdir().unwrap();
+    let db = open(root.path()).await;
+    db.add_table(create_statement("mapped")).await.unwrap();
+    for id in 0..200 {
+        insert(&db, "mapped", id, "row").await;
+    }
+
+    // Reads on every worker, so several threads cache the table's maps.
+    let mut reads = Vec::new();
+    for _ in 0..64 {
+        let db = db.clone();
+        reads.push(tokio::spawn(async move {
+            let sql = "SELECT id, label FROM mapped WHERE id >= 0";
+            let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(sql).expect("a query");
+            let result = crate::core::rql::executor::execute(purpose, db).await;
+            assert!(!result.is_empty());
+        }));
+    }
+    for read in reads {
+        read.await.unwrap();
+    }
+
+    let sql = "DROP TABLE mapped";
+    let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(sql).expect("a drop");
+    let result = crate::core::rql::executor::execute(purpose, db.clone()).await;
+    assert!(!result.is_empty());
+
+    // The workers stay idle from here: nothing else reads on them. The files
+    // go first (a drop may finish removing them a moment later), and then no
+    // thread may still map one.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let files = files_for(root.path(), "mapped");
+        let left = deleted_mappings_under(root.path());
+        if files.is_empty() && left.is_empty() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            assert!(files.is_empty(), "the dropped table's files are not removed: {files:?}");
+            panic!("a dropped table's files are still mapped:\n{}", left.join("\n"));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }

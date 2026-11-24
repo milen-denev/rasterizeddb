@@ -267,8 +267,9 @@ fn refused_shapes_write_nothing() {
             let reason = run(&db, sql).await.expect_err(&format!("{sql} was accepted"));
             assert!(reason.contains(names), "{sql} was refused for the wrong reason: {reason}");
             // The reserved-prefix refusal is the plain CREATE's own: an
-            // invalid name, not a missing feature.
-            if names != "reserved" {
+            // invalid name, not a missing feature. A partition count out of
+            // range is 22023, a bad value (`partition_refusal_codes_tests`).
+            if names != "reserved" && !names.starts_with("PARTITIONS") {
                 assert_0a000(sql, &reason);
             }
             assert_eq!(catalogue_len(&db).await, len_before, "{sql} wrote a catalogue row");
@@ -420,15 +421,20 @@ fn schema_ddl_on_a_partitioned_table_runs_or_is_refused_before_it_writes() {
         run(&db, "INSERT INTO pd_alt (k, n) VALUES (1, 1), (2, 2)").await.expect("rows");
         let before = on_disk_schema(&db, "pd_alt").await;
         let len = catalogue_len(&db).await;
-        for (sql, why) in [
-            ("ALTER TABLE pd_alt ALTER COLUMN k TYPE BIGINT", "partition key column"),
-            ("ALTER TABLE pd_alt ALTER COLUMN k DROP NOT NULL", "must be NOT NULL"),
-            ("ALTER TABLE pd_alt DROP COLUMN k", "partition key column"),
-            ("ALTER TABLE pd_alt ADD CONSTRAINT pd_alt_u UNIQUE (n)", "partition key column"),
-            ("CREATE UNIQUE INDEX pd_alt_n1 ON pd_alt (n)", "partition key column"),
+        // A key column dropped, retyped or made nullable is PostgreSQL's
+        // 42P16 (`partition_refusal_codes_tests` pins the codes); a unique
+        // key without the key column is 0A000.
+        for (sql, why, unsupported) in [
+            ("ALTER TABLE pd_alt ALTER COLUMN k TYPE BIGINT", "partition key column", false),
+            ("ALTER TABLE pd_alt ALTER COLUMN k DROP NOT NULL", "must be NOT NULL", false),
+            ("ALTER TABLE pd_alt DROP COLUMN k", "partition key column", false),
+            ("ALTER TABLE pd_alt ADD CONSTRAINT pd_alt_u UNIQUE (n)", "partition key column", true),
+            ("CREATE UNIQUE INDEX pd_alt_n1 ON pd_alt (n)", "partition key column", true),
         ] {
             let e = run(&db, sql).await.expect_err(&format!("{sql} was accepted"));
-            assert_0a000(sql, &e);
+            if unsupported {
+                assert_0a000(sql, &e);
+            }
             assert!(e.contains(why), "{sql}: {e}");
             assert_eq!(on_disk_schema(&db, "pd_alt").await, before, "{sql} wrote the shell's schema");
             assert!(db.is_partitioned("pd_alt"), "{sql}");

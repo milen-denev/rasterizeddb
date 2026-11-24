@@ -50,6 +50,7 @@ mod notify;
 mod explain;
 mod temp_tables;
 mod session_values;
+mod pg_dump;
 mod sql_prepare;
 mod privilege_statements;
 #[cfg(test)]
@@ -71,6 +72,10 @@ mod temp_relation_tests;
 mod block_error_tests;
 #[cfg(test)]
 mod engine_bug_tests;
+#[cfg(test)]
+mod correlated_subquery_tests;
+#[cfg(test)]
+mod vacuum_snapshot_tests;
 #[cfg(test)]
 mod shape_repair_tests;
 mod fixed_rows;
@@ -97,8 +102,9 @@ pub(crate) use native_session::{
 };
 pub(crate) use native_session::{
     DATABASE_PREFIX as NATIVE_DATABASE_PREFIX, MARK as NATIVE_MARK,
-    answer_marked as native_answer_marked, simple_complete as native_simple_complete,
-    simple_error as native_simple_error,
+    NOTICES_PREFIX as NATIVE_NOTICES_PREFIX, answer_marked as native_answer_marked,
+    simple_complete as native_simple_complete, simple_error as native_simple_error,
+    engine_notices_answer as native_engine_notices_answer, with_notices as native_with_notices,
 };
 
 /// Start a minimal PostgreSQL wire-protocol server (pgwire).
@@ -3020,6 +3026,9 @@ struct SessionState {
     settings: HashMap<String, String>,
     /// `PREPARE`d statements by name (`sql_prepare`).
     sql_prepared: HashMap<String, sql_prepare::Prepared>,
+    /// What a `pg_dump` session's catalogue queries are answered from
+    /// (`pg_dump`), built once for the transaction it reads in.
+    dump_model: Option<(TxId, StdArc<pg_dump::DumpModel>)>,
     /// The schema changes a `DO` block or an `EXECUTE` of a prepared
     /// statement ran on this statement's behalf, for a branch's DDL log
     /// (`branch::note_ddl`): the client statement itself (`DO …`, `EXECUTE
@@ -3424,6 +3433,7 @@ impl SessionState {
             copy_in_ran: false,
             settings: HashMap::new(),
             sql_prepared: HashMap::new(),
+            dump_model: None,
             branch_ddl: Vec::new(),
             error_text: String::new(),
             error_base: Some(0),
@@ -5113,13 +5123,22 @@ pub(crate) async fn describe_query(
     };
     let flat = crate::core::sql_scan::flatten_whitespace(&uncommented).into_owned();
     let mut catalog = crate::core::sql_scan::catalog_syntax(&flat).into_owned();
-    // `'t'::regclass` and the like, as `rewrite_statement_text` reads them.
-    if let Some(text) = crate::core::rql::reg_casts::rewrite(&catalog, &|name: &str| {
-        database.schema_view(name).is_some() || database.views.contains(name)
-    }) {
+    if let std::borrow::Cow::Owned(text) = crate::core::sql_scan::plain_branch_parentheses(&catalog) {
         catalog = text;
     }
-    let arrays = crate::core::sql_scan::array_subqueries(&catalog).into_owned();
+    // `'t'::regclass` and the like, as `rewrite_statement_text` reads them.
+    if let Ok(Some(text)) = crate::core::rql::reg_casts::rewrite(
+        &catalog,
+        &|name: &str| database.schema_view(name).is_some() || database.views.contains(name),
+        &|name: &str| database.types.contains(name) || database.domains.contains(name),
+    ) {
+        catalog = text;
+    }
+    let mut arrays = crate::core::sql_scan::array_subqueries(&catalog).into_owned();
+    // A FROM-less `EXISTS`, as `rewrite_statement_text` reads it.
+    if let Some(text) = crate::core::sql_scan::from_less_exists(&arrays) {
+        arrays = text;
+    }
     let mut shorthands = crate::core::sql_scan::statement_shorthands(&arrays).into_owned();
     if let Ok(Some(text)) = crate::core::sql_scan::tablesample(&shorthands) {
         shorthands = text;
@@ -5160,6 +5179,15 @@ pub(crate) async fn describe_query(
         Ok(Some(text)) => {
             expanded_views = text;
             expanded_views.as_str()
+        }
+        _ => stmt,
+    };
+    // A sequence read as a relation, as its row (`sequence_statements`).
+    let sequence_rows;
+    let stmt = match crate::core::rql::sequence_catalog::relations_as_rows(database, stmt) {
+        Ok(Some(text)) => {
+            sequence_rows = text;
+            sequence_rows.as_str()
         }
         _ => stmt,
     };
@@ -5244,6 +5272,9 @@ pub(crate) async fn describe_query(
         let relations = Box::pin(cte_relations(database, &defs)).await?;
         if let Some((fields, true)) = Box::pin(describe_resolved(database, &outer, &relations)).await? {
             return Ok(Some((widen_union_fields(database, &outer, &relations, fields).await?, true)));
+        }
+        if let Some((fields, true)) = Box::pin(describe_over_derived(database, &outer, &relations)).await? {
+            return Ok(Some((fields, true)));
         }
     }
 
@@ -5391,6 +5422,45 @@ pub(crate) async fn describe_query(
     }
 }
 
+/// `text` with each derived table in it described and named as a relation, then
+/// described against those and `relations`. A CTE body reading a derived table
+/// (`WITH r AS (SELECT id FROM (SELECT …) x) SELECT … FROM r`) is described
+/// this way: the plain resolver knows no derived table, so the body went
+/// undescribed, the CTE list stopped there, and the client got a row
+/// description with no columns before the rows. A derived table is described
+/// against the earlier CTEs first, as it may read one; nothing is materialised.
+async fn describe_over_derived(
+    database: &Arc<Database>,
+    text: &str,
+    relations: &[(String, ScratchFields)],
+) -> io::Result<Option<(Vec<(String, DbType)>, bool)>> {
+    let mut rewritten = text.to_string();
+    let mut all = relations.to_vec();
+    let mut found = false;
+    for _ in 0..16usize {
+        let Some((start, end, inner, alias)) = crate::core::rql::cte::next_derived_table(&rewritten) else {
+            break;
+        };
+        let columns = match Box::pin(describe_resolved(database, &inner, &all)).await? {
+            Some((columns, _)) => Some(columns),
+            None => match Box::pin(describe_over_derived(database, &inner, &all)).await? {
+                Some((columns, _)) => Some(columns),
+                None => Box::pin(describe_query(database, &inner)).await?.map(|(columns, _)| columns),
+            },
+        };
+        let Some(columns) = columns else {
+            return Ok(None);
+        };
+        rewritten = format!("{}{} {}{}", &rewritten[..start], alias, alias, &rewritten[end..]);
+        all.push((alias, scratch_fields(&columns)));
+        found = true;
+    }
+    if !found {
+        return Ok(None);
+    }
+    Box::pin(describe_resolved(database, &rewritten, &all)).await
+}
+
 /// Each CTE of `defs` as a relation the statement after them can be described
 /// against: its body's columns, under its name and its column list. Nothing
 /// is materialised. They are accumulated in order so a later CTE may read an
@@ -5413,7 +5483,11 @@ async fn cte_relations(
             Some(Err(e)) => return Err(std::io::Error::other(e)),
             None => def.body.as_str(),
         };
-        match Box::pin(describe_resolved(database, body, &relations)).await? {
+        let described = match Box::pin(describe_resolved(database, body, &relations)).await? {
+            Some(described) => Some(described),
+            None => Box::pin(describe_over_derived(database, body, &relations)).await?,
+        };
+        match described {
             // A body that is itself a `UNION` is materialised with its rows
             // widened, so its relation has the wider column too. A column
             // list renames what it describes, as it renames the relation.
@@ -6466,15 +6540,22 @@ where
             }
             match state.catalog.create(&name).await {
                 Ok(database) => {
-                    // Replication is single-database: it carries the default
-                    // one, and nothing written in this one reaches the peers.
-                    if state.catalog.all().iter().any(|d| d.replication.is_active()) {
+                    // Replicated when the default database is and its
+                    // replication carries the catalogue: the catalogue starts
+                    // its replication and records the CREATE for the peers
+                    // (`DatabaseCatalog::create`). A node replicating its one
+                    // database alone keeps this one to itself, and says so.
+                    let default_replicates = state
+                        .catalog
+                        .get(state.catalog.default_name())
+                        .is_some_and(|d| d.replication.is_active());
+                    if default_replicates && !state.catalog.replicating() {
                         crate::core::notice::push(
                             "WARNING",
                             "01000",
                             format!(
-                                "not replicated: database \"{name}\" is this node's alone; replication \
-                                 carries only the default database \"{}\"",
+                                "not replicated: database \"{name}\" is this node's alone; this node replicates only \
+                                 the default database \"{}\"",
                                 state.catalog.default_name()
                             ),
                         );
@@ -8126,16 +8207,48 @@ pub(crate) fn rewrite_statement_text<'a>(
     if let Cow::Owned(text) = crate::core::sql_scan::catalog_syntax(&stmt) {
         stmt = Cow::Owned(text);
     }
+    // `(SELECT …) EXCEPT (SELECT …)` without the parentheses that group
+    // nothing (`sql_scan::plain_branch_parentheses`).
+    if let Cow::Owned(text) = crate::core::sql_scan::plain_branch_parentheses(&stmt) {
+        stmt = Cow::Owned(text);
+    }
+    // The same for a query inside parentheses, `x IN ((SELECT 1) UNION
+    // (SELECT 2))` (`sql_scan::nested_branch_parentheses`).
+    if let Cow::Owned(text) = crate::core::sql_scan::nested_branch_parentheses(&stmt) {
+        stmt = Cow::Owned(text);
+    }
+    // `INSERT INTO t (SELECT …)` and `CREATE TABLE t AS (SELECT …)`: the
+    // query in parentheses, the same way (`sql_scan::source_query_parentheses`).
+    if let Cow::Owned(text) = crate::core::sql_scan::source_query_parentheses(&stmt) {
+        stmt = Cow::Owned(text);
+    }
+    // `indkey::text` and the other vector columns, spaced as PostgreSQL
+    // prints them (`sql_scan::vector_columns_as_text`).
+    let vectors = crate::core::sql_scan::vector_columns_as_text(&stmt);
+    take(&mut stmt, vectors);
+    // `pg_partition_tree('t'::regclass)` as the one leaf every table is
+    // here (`rql::reg_casts::partition_tree`), before its argument is an oid.
+    let relation_exists = |name: &str| {
+        database.schema_view(name).is_some() || database.is_partitioned(name) || database.views.contains(name)
+    };
+    let tree = crate::core::rql::reg_casts::partition_tree(&stmt, &relation_exists)?;
+    take(&mut stmt, tree);
     // `'t'::regclass`, `'int4'::regtype` and `to_regclass('t')` as the name
     // or oid they stand for (`rql::reg_casts`).
-    let reg = crate::core::rql::reg_casts::rewrite(&stmt, &|name: &str| {
-        database.schema_view(name).is_some() || database.views.contains(name)
-    });
+    let reg = crate::core::rql::reg_casts::rewrite(
+        &stmt,
+        &|name: &str| database.schema_view(name).is_some() || database.views.contains(name),
+        &|name: &str| database.types.contains(name) || database.domains.contains(name),
+    )?;
     take(&mut stmt, reg);
     // `ARRAY(SELECT …)` as the aggregate it is (`sql_scan::array_subqueries`).
     if let Cow::Owned(text) = crate::core::sql_scan::array_subqueries(&stmt) {
         stmt = Cow::Owned(text);
     }
+    // `EXISTS (SELECT 1 WHERE c)`, with no FROM, as the truth value of `c`
+    // (`sql_scan::from_less_exists`).
+    let from_less = crate::core::sql_scan::from_less_exists(&stmt);
+    take(&mut stmt, from_less);
     // `TABLE t` and `AS [NOT] MATERIALIZED` (`sql_scan::statement_shorthands`).
     if let Cow::Owned(text) = crate::core::sql_scan::statement_shorthands(&stmt) {
         stmt = Cow::Owned(text);
@@ -8360,10 +8473,61 @@ where
     if let Some(pairs) = column_origins::sqlx_origin_pairs(stmt) {
         return column_origins::answer(database, stream, &pairs, omit_description).await;
     }
+    // `pg_dump`'s catalogue queries, answered from the catalogue model
+    // (`pg_dump`): only in its session, which turned `synchronize_seqscans`
+    // off as it connected.
+    if pg_dump::is_dump_session(state)
+        && let Some(kind) = pg_dump::recognize(stmt)
+    {
+        return pg_dump::answer(database, state, stream, stmt, kind, omit_description).await;
+    }
     // `PREPARE`, `EXECUTE`, `DEALLOCATE` (`sql_prepare`): before any
     // rewrite, which would act on a `PREPARE`'s statement as if it ran now.
     if let Some(parsed) = sql_prepare::parse(stmt) {
         return run_sql_prepare(database, state, stream, parsed, result_formats, omit_description).await;
+    }
+    // `ALTER INDEX [IF EXISTS] a RENAME TO b`: an index's name is the
+    // database's, so its table is found first, and the rename is that
+    // table's (`ALTER TABLE t RENAME INDEX a TO b`). It was "syntax error
+    // or unsupported query".
+    if let Some(parsed) = crate::core::rql::lexer_alter::parse_alter_index_rename(stmt) {
+        let (from, if_exists, to) = match parsed {
+            Ok(parts) => parts,
+            Err(message) => return fail_statement(state, stream, "42601", &message).await,
+        };
+        let mut table: Option<String> = None;
+        database.each_schema(|name, schema| {
+            // A declared index, a key's, the primary key's, or the one a
+            // UNIQUE column carries under its table's and its own name.
+            let holds = schema.secondary_indexes.iter().any(|i| !i.is_deleted && i.name.eq_ignore_ascii_case(&from))
+                || schema.unique_keys.iter().any(|k| !k.is_deleted && k.name.eq_ignore_ascii_case(&from))
+                || crate::core::rql::unique_key::primary_key_of_named(schema, name)
+                    .is_some_and(|key| key.name.eq_ignore_ascii_case(&from))
+                || schema.fields.iter().any(|f| {
+                    !f.is_deleted
+                        && f.is_unique
+                        && crate::core::rql::unique_key::implicit_key_name(name, &f.name).eq_ignore_ascii_case(&from)
+                });
+            if table.is_none() && holds {
+                table = Some(name.to_string());
+            }
+        });
+        let Some(table) = table else {
+            if if_exists {
+                crate::core::notice::push("NOTICE", "00000", format!("relation \"{from}\" does not exist, skipping"));
+                return send_command_complete(stream, "ALTER INDEX").await;
+            }
+            return fail_statement(state, stream, "42P01", &format!("relation \"{from}\" does not exist")).await;
+        };
+        let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+        let rename = format!("ALTER TABLE {} RENAME INDEX {} TO {}", quote(&table), quote(&from), quote(&to));
+        return match Box::pin(view_statements::run_internal_ddl(database, state, &rename)).await? {
+            Ok(_) => send_command_complete(stream, "ALTER INDEX").await,
+            Err(message) => {
+                let code = sqlstate_for(&message);
+                fail_statement(state, stream, code, &message).await
+            }
+        };
     }
     // `DO $$ … $$`: a PL/pgSQL block run once (`trigger_exec::run_do`).
     if let Some(parsed) = trigger_exec::parse_do(stmt) {
@@ -8438,6 +8602,20 @@ where
         }
         None => stmt,
     };
+    // `ALTER VIEW v OWNER TO r` and `ALTER SEQUENCE s OWNER TO r`, which
+    // `pg_dump` writes after each: the privilege statement they are, before
+    // the view and sequence statements, which read only their own `ALTER`
+    // forms and refused these ("ALTER VIEW supports only RENAME TO here").
+    if crate::core::sql_scan::contains_ignore_ascii_case(stmt, b" OWNER TO ")
+        && {
+            let head: Vec<String> = stmt.split_whitespace().take(3).map(str::to_ascii_uppercase).collect();
+            head.first().is_some_and(|w| w == "ALTER")
+                && matches!(head.get(1).map(String::as_str), Some("VIEW" | "SEQUENCE" | "MATERIALIZED"))
+        }
+        && let Some(parsed) = crate::core::rql::privileges::parse_privilege_statement(stmt)
+    {
+        return privilege_statements::handle_privilege_statement(database, state, stream, parsed).await;
+    }
     // Views (`core::rql::views`): their own statements are answered here,
     // table DDL is checked against them, and a statement reading one is
     // given its query as a derived table, before anything else plans it.
@@ -8539,6 +8717,15 @@ where
         fail_statement(state, stream, code, &message).await?;
         return Ok(());
     }
+    // `pg_get_viewdef(view)` as the view's query (`views::viewdef_calls`).
+    let with_viewdefs = match crate::core::rql::views::viewdef_calls(database, stmt, state.current_tx()).await {
+        Ok(text) => text,
+        Err((code, message)) => {
+            fail_statement(state, stream, code, &message).await?;
+            return Ok(());
+        }
+    };
+    let stmt = with_viewdefs.as_deref().unwrap_or(stmt);
     let expanded_views;
     let stmt = if database.has_table(crate::core::rql::views::VIEW_TABLE) {
         let options = crate::core::rql::views::ExpandOptions {
@@ -8697,7 +8884,7 @@ where
     // the peers run the statement's text again (`rql::replicated_values`).
     let deterministic;
     let stmt = if database.replication.is_active() {
-        match crate::core::rql::replicated_values::fold(stmt) {
+        match crate::core::rql::replicated_values::fold_write(stmt, &database).await {
             crate::core::rql::replicated_values::Fold::Unchanged => stmt,
             crate::core::rql::replicated_values::Fold::Rewritten(text) => {
                 crate::core::rql::prepared::note_rewritten();
@@ -10407,7 +10594,8 @@ fn materialize_class(code: &'static str) -> &'static str {
     // `21`: a scalar subquery inside it that gave more than one row (a
     // correlated one runs as a derived relation), the data's, not a feature.
     // 42803: a grouped query reading an ungrouped column, in a subquery too.
-    if ["21", "23", "22", "40", "57", "55", "53", "58", "42P01", "42703", "42702", "42803"]
+    // 42804: a set operation in it over two type families.
+    if ["21", "23", "22", "40", "57", "55", "53", "58", "42P01", "42703", "42702", "42803", "42804"]
         .iter()
         .any(|class| code.starts_with(class))
     {
@@ -10545,6 +10733,11 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("more than one row returned by a subquery used as an expression") {
         return "21000";
     }
+    // `untranslatable_character`: `convert_to` of a character the target
+    // encoding has no byte for (`pg_functions`, LATIN1).
+    if has("has no equivalent in encoding") {
+        return "22P05";
+    }
     // A range's bounds (`range_ops`): `data_exception`, as PostgreSQL's
     // `range_serialize` and set operations report them; a bad bounds flag
     // argument is its syntax error.
@@ -10592,6 +10785,36 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // that is no storage location): `invalid_parameter_value`. Early: the
     // message quotes the statement's key values and paths.
     if has("cannot reshape:") {
+        return "22023";
+    }
+    // The partition rules (docs/partitioning.md §1.4, §1.5, §1b), decided
+    // by their own words, whichever statement broke them: `CREATE …
+    // PARTITION BY`, a conversion (`ALTER TABLE … PARTITION BY`), which
+    // carries the refusal's text without its kind, or `ALTER` on a
+    // partitioned table. Without them a conversion's refusal answered XX000.
+    // Early: the messages quote column and table names.
+    //
+    // A key column dropped, retyped or made nullable: PostgreSQL's
+    // `invalid_table_definition` ("cannot drop column … because it is part
+    // of the partition key of relation …", "cannot alter column …").
+    if (has("is a partition key column of") && (has("drop column") || has("alter column")))
+        || has("drop not null on partition key column")
+    {
+        return "42P16";
+    }
+    // A unique key without every key column (PostgreSQL's "unique
+    // constraint on partitioned table must include all partitioning
+    // columns", 0A000), and the keys PostgreSQL takes and this engine does
+    // not: a nullable, generated or JSON column, a type off the §1.4 list.
+    if has("does not contain partition key column")
+        || has("is nullable; a partition key column must be not null")
+        || has("which cannot be a partition key")
+        || has("a partition key cannot be of type")
+    {
+        return "0A000";
+    }
+    // A partition count out of range: `invalid_parameter_value`.
+    if has("partitions must be between 1 and") || has("a partitioned table takes a whole number of partitions") {
         return "22023";
     }
     // The everyday functions' own errors (`rql::pg_functions`), with
@@ -10783,8 +11006,22 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // exactly, `undefined_column` for a column it names that is not there.
     if has("there is no unique constraint matching given keys for referenced table")
         || has("number of referencing and referenced columns for foreign key disagree")
+        || has("foreign key referenced-columns list must not contain duplicates")
     {
         return "42830";
+    }
+    // A composite foreign key's clauses PostgreSQL refuses: `MATCH PARTIAL`
+    // and a column list on an `ON UPDATE` action (0A000), a key over more
+    // columns than an index may hold (54011), and an `ON DELETE SET` list
+    // naming a column outside the key (42P10).
+    if has("match partial not yet implemented") || (has("a column list with set ") && has("is only supported for on delete actions")) {
+        return "0A000";
+    }
+    if has("keys in a foreign key") && has("cannot have more than") {
+        return "54011";
+    }
+    if has("referenced in on delete set action must be part of foreign key") {
+        return "42P10";
     }
     // `undefined_object`: `REFERENCES parent` with no column list, on a
     // parent with no primary key.
@@ -10802,6 +11039,12 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         || has(" but expression is of type ")
         || has("cannot be cast automatically to type")
     {
+        return "42804";
+    }
+    // A set operation over two type families (`set_ops`): "UNION types text
+    // and bigint cannot be matched", also under the name of the CTE or the
+    // derived table it failed in.
+    if has(" types ") && has(" cannot be matched") {
         return "42804";
     }
     // `dependent_objects_still_exist`: DROP TABLE of a table other tables'
@@ -11124,6 +11367,16 @@ where
         }
     };
     let statements = split_statements(&normalized);
+    // A string holding no statement, only comments or blanks, is answered
+    // with EmptyQueryResponse, as PostgreSQL answers it: `pg_restore` sends a
+    // dump's header comment alone so. With ReadyForQuery alone, libpq had no
+    // result to give and reported a failure with an empty message, which
+    // `pg_restore --exit-on-error` stopped on.
+    if statements.is_empty() {
+        send_message(stream, b'I', &[]).await?;
+        let status = state.ready_status();
+        return send_ready_for_query(stream, status).await;
+    }
 
     // Several statements outside a block are one implicit transaction, as in
     // PostgreSQL: they commit together, or a failure rolls back the ones
@@ -11559,12 +11812,22 @@ fn deferred_drops(
             }
         } else if !if_exists {
             return Some(Err(("42P01", format!("table \"{name}\" does not exist"))));
+        } else {
+            crate::core::notice::push("NOTICE", "00000", format!("table \"{name}\" does not exist, skipping"));
         }
     }
     if !cascade {
         for table in &present {
             for child in database.fk_children(table) {
-                if !child.eq_ignore_ascii_case(table) && !present.iter().any(|p| p.eq_ignore_ascii_case(&child)) {
+                // A child this block has already dropped (its drop is pending
+                // until COMMIT) no longer depends on the table: `BEGIN; DROP
+                // TABLE child; DROP TABLE parent; COMMIT` is how a migrator
+                // drops in key order, and was refused with 2BP01.
+                let child_dropped = pending.iter().any(|p| p.eq_ignore_ascii_case(&child));
+                if !child.eq_ignore_ascii_case(table)
+                    && !child_dropped
+                    && !present.iter().any(|p| p.eq_ignore_ascii_case(&child))
+                {
                     let message = if several {
                         format!(
                             "cannot drop desired object(s) because other objects depend on them: a foreign key on \
@@ -13160,18 +13423,71 @@ where
         return Ok(false);
     }
 
+    // `ANALYZE` names tables, and runs nothing: a statement after it is
+    // refused as PostgreSQL refuses it, and a table that is not there is
+    // reported, rather than both answering success.
+    if let Some(parsed) = crate::core::rql::lexer_alter::parse_analyze(s) {
+        match parsed {
+            Err(message) => {
+                fail_statement(state, stream, "42601", &message).await?;
+                return Ok(true);
+            }
+            Ok(tables) => {
+                // A temporary table arrives here under its real name
+                // (`temp_tables::rewrite`). A view is skipped with
+                // PostgreSQL's warning; only a name that is neither is
+                // refused.
+                if let Some(database) = state.catalog.get(&state.database_name) {
+                    let tx = state.current_tx();
+                    for table in &tables {
+                        if database.has_table(table) {
+                            continue;
+                        }
+                        match crate::core::rql::views::lookup(&database, table, tx).await {
+                            Ok(Some(_)) => {
+                                crate::core::notice::push(
+                                    "WARNING",
+                                    "01000",
+                                    format!("skipping \"{table}\" --- cannot analyze non-tables"),
+                                );
+                            }
+                            _ => {
+                                fail_statement(
+                                    state,
+                                    stream,
+                                    "42P01",
+                                    &format!("relation \"{table}\" does not exist"),
+                                )
+                                .await?;
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if let Some(reason) = crate::core::rql::lexer_alter::no_op_reason(s) {
         log::info!(
             "accepted without acting: {} ({})",
             s.lines().next().unwrap_or(s),
             reason
         );
-        let tag = s
-            .split_whitespace()
-            .take(2)
-            .map(|w| w.to_ascii_uppercase())
-            .collect::<Vec<_>>()
-            .join(" ");
+        // PostgreSQL's tags: one word for these two, the first two words
+        // (`CREATE EXTENSION`, `DROP SCHEMA`) for the rest. Two words made
+        // `ANALYZE ORDERS` and `COMMENT ON`.
+        let first = s.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+        let tag = match first.as_str() {
+            "ANALYZE" | "ANALYSE" => "ANALYZE".to_string(),
+            "COMMENT" => "COMMENT".to_string(),
+            _ => s
+                .split_whitespace()
+                .take(2)
+                .map(|w| w.to_ascii_uppercase())
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
         send_command_complete(stream, &tag).await?;
         return Ok(true);
     }
@@ -13868,7 +14184,7 @@ fn from_less_first_branch(query: &str) -> Option<Vec<(String, DbType)>> {
     };
     let first = parts.branches.first()?;
     crate::core::rql::set_ops::constant_branch(first)?;
-    match crate::core::rql::no_from::parse(first.trim().trim_start_matches('(').trim_end_matches(')')) {
+    match crate::core::rql::no_from::parse(crate::core::sql_scan::without_outer_parentheses(first)) {
         Some(Ok(select)) => Some(select.columns()),
         _ => None,
     }
@@ -15346,6 +15662,12 @@ async fn send_error_response_at<S>(stream: &mut S, sqlstate: &str, message: &str
 where
     S: AsyncWrite + Unpin,
 {
+    // Whatever the statement raised before it failed goes first, as
+    // PostgreSQL sends it (`RAISE NOTICE` then `RAISE EXCEPTION`): it was
+    // dropped with the statement's notices when no completion followed.
+    for notice in crate::core::notice::drain() {
+        send_engine_notice(stream, &notice).await?;
+    }
     // ErrorResponse fields: (type_byte, cstring)..., terminated by 0.
     // Minimal set: Severity (S), SQLSTATE (C), Message (M)
     let mut payload = Vec::new();
@@ -15841,6 +16163,17 @@ fn ensure_crypto_provider() {
         // Already installed by another component is not a failure.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
+}
+
+/// The TLS acceptor for a certificate chain and key in PEM files, or for a
+/// self-signed pair made now when neither is given: what the PostgreSQL port
+/// serves, and the Redis port under `--kv-tls on`.
+pub fn tls_acceptor(cert_path: Option<&str>, key_path: Option<&str>) -> io::Result<TlsAcceptor> {
+    build_tls_acceptor(&TlsConfig {
+        mode: TlsMode::Require,
+        cert_path: cert_path.map(str::to_string),
+        key_path: key_path.map(str::to_string),
+    })
 }
 
 fn build_tls_acceptor(tls: &TlsConfig) -> io::Result<TlsAcceptor> {
@@ -16817,9 +17150,8 @@ mod union_widening_tests {
     /// A `*` is several columns, so the items after it are not at the
     /// positions their places in the list say. `SELECT *, n FROM t32` was
     /// typed `[?, int]`, and paired with `t64`'s second column that widened
-    /// output column 1, `name`, a text column, to `bigint`. The engine refuses
-    /// `*` beside other items today, which is all that kept this from a
-    /// client; PostgreSQL 17 refuses the `UNION` itself, as text and bigint.
+    /// output column 1, `name`, a text column, to `bigint`. PostgreSQL 17
+    /// refuses the `UNION` itself, as text and bigint, and so does this.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_star_does_not_shift_the_widening_onto_another_column() {
         let (_dir, db) = open().await;
@@ -16832,8 +17164,14 @@ mod union_widening_tests {
         let branches: Vec<String> =
             crate::core::rql::join::union_branches("SELECT *, n FROM t32 UNION ALL SELECT a, b, c, d FROM t64")
                 .expect("a UNION");
+        // The items after the `*` are typed slot for slot now that the
+        // engine reads `*` beside other items: `name`, the text column, is
+        // at position 1 and is not widened; the integers around it are.
+        // The statement itself is refused when its rows meet, as text and
+        // bigint (`set_ops::Combined::same_families`; compat
+        // `set_operation_type_families`).
         let widened = crate::core::rql::set_ops::widened_branch_integers(&branches, &db, &[]);
-        assert!(widened.iter().all(Option::is_none), "{widened:?}");
+        assert_eq!(widened, vec![Some(DbType::I64), None, Some(DbType::I64), Some(DbType::I64)]);
     }
 }
 

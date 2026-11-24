@@ -743,7 +743,13 @@ async fn tables(database: &Arc<Database>) -> Result<Vec<Row>, String> {
             Cell::Number(figures.reclaimable),
             Cell::Flag(figures.filters_ready),
             Cell::Flag(schema.is_immutable),
-            Cell::Text(schema.primary_key.clone().unwrap_or_default()),
+            // Every column of the key, comma-separated: a composite key read
+            // as the single-column field showed blank, as though it was lost.
+            Cell::Text(
+                crate::core::rql::unique_key::primary_key_of(&schema)
+                    .map(|k| k.columns.join(", "))
+                    .unwrap_or_default(),
+            ),
         ]));
     }
     Ok(out)
@@ -781,6 +787,7 @@ async fn database_stats(database: &Arc<Database>) -> Result<Vec<Row>, String> {
     let mut vacuum_panics = 0u64;
     let mut foreign_keys = 0usize;
     let mut unique_keys = 0usize;
+    let mut unique_indexes = 0usize;
     let mut json_columns = 0usize;
     let mut column_count = 0usize;
     let mut table_count = 0usize;
@@ -815,7 +822,12 @@ async fn database_stats(database: &Arc<Database>) -> Result<Vec<Row>, String> {
         unique_keys += schema
             .unique_keys
             .iter()
-            .filter(|k| !k.is_deleted)
+            .filter(|k| !k.is_deleted && !k.is_index())
+            .count();
+        unique_indexes += schema
+            .unique_keys
+            .iter()
+            .filter(|k| !k.is_deleted && k.is_index())
             .count();
         json_columns += schema
             .json_columns
@@ -931,6 +943,11 @@ async fn database_stats(database: &Arc<Database>) -> Result<Vec<Row>, String> {
         "unique_constraints",
         unique_keys.to_string(),
         "table-level UNIQUE constraints",
+    );
+    push(
+        "unique_indexes",
+        unique_indexes.to_string(),
+        "unique indexes CREATE UNIQUE INDEX made",
     );
     push(
         "json_columns",
@@ -1516,7 +1533,9 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
     push("immutable", schema.is_immutable.to_string(), "");
     push(
         "primary_key",
-        schema.primary_key.clone().unwrap_or_default(),
+        crate::core::rql::unique_key::primary_key_of(&schema)
+            .map(|k| k.columns.join(", "))
+            .unwrap_or_default(),
         "",
     );
 
@@ -1564,9 +1583,13 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
         "document paths carried by the filter index",
     );
 
+    // A key `CREATE UNIQUE INDEX` made (or a partial one) is an index, as
+    // `DROP INDEX` and `pg_constraint` have it (`UniqueKey::is_index`); one
+    // `ADD CONSTRAINT … UNIQUE` declared, or stored before the mark, keeps
+    // the label it always had.
     for key in schema.unique_keys.iter().filter(|k| !k.is_deleted) {
         push(
-            "unique_constraint",
+            if key.is_index() { "unique_index" } else { "unique_constraint" },
             format!("{} ({})", key.name, key.columns.join(", ")),
             "",
         );
@@ -1576,7 +1599,10 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
             "foreign_key",
             format!(
                 "{} : {} -> {}.{}",
-                fk.name, fk.column, fk.parent_table, fk.parent_column
+                fk.name,
+                key_list(&fk.columns),
+                fk.parent_table,
+                key_list(&fk.parent_columns)
             ),
             &format!("ON DELETE {}", action_name(&fk.on_delete)),
         );
@@ -1651,6 +1677,7 @@ fn columns(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
     let mut out = Vec::new();
     let mut position = 0u64;
 
+    let primary_key = crate::core::rql::unique_key::primary_key_of(&schema);
     for field in schema.fields.iter() {
         // Companion flag columns are engine-owned. They are reported through
         // the `nullable` flag of the column they belong to rather than as
@@ -1662,7 +1689,11 @@ fn columns(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
 
         let nullable =
             crate::core::rql::nullable::flag_field(&field.name, &schema.fields).is_some();
-        let is_primary = schema.primary_key.as_deref() == Some(field.name.as_str());
+        // A column of the primary key, whatever the key is called and
+        // however many columns it has (`unique_key::primary_key_of`). Only
+        // the header's column was flagged, so a composite key's columns
+        // read as no key at all here, where pg_index flags each.
+        let is_primary = primary_key.as_ref().is_some_and(|key| key.columns.iter().any(|c| c.eq_ignore_ascii_case(&field.name)));
         let in_unique_key = schema.unique_keys.iter().any(|k| {
             !k.is_deleted
                 && k.columns
@@ -1778,9 +1809,11 @@ fn schema_map(database: &Arc<Database>) -> Result<Vec<Row>, String> {
             out.push(row(&[
                 Cell::Text("fk".to_string()),
                 Cell::Text(schema.name.clone()),
-                Cell::Text(fk.column.clone()),
+                // A composite key's columns as one list, `a, b`, in key
+                // order: the row keeps its positions.
+                Cell::Text(fk.column_list()),
                 Cell::Text(fk.parent_table.clone()),
-                Cell::Text(fk.parent_column.clone()),
+                Cell::Text(fk.parent_column_list()),
                 Cell::Text(fk.name.clone()),
                 Cell::Text(action_name(&fk.on_delete).to_string()),
                 Cell::Text(action_name(&fk.on_update).to_string()),
@@ -2297,6 +2330,14 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         help: "serve repeated queries from a known offset",
     },
     ConfigKey {
+        section: "cache",
+        key: "size",
+        hot: false,
+        set_with: "--cache-size N (restart)",
+        options: "",
+        help: "entries the query cache holds when it is on",
+    },
+    ConfigKey {
         section: "filter",
         key: "enabled",
         hot: true,
@@ -2530,6 +2571,16 @@ const CONFIG_KEYS: &[ConfigKey] = &[
     },
     ConfigKey {
         section: "partition",
+        key: "max_open",
+        hot: false,
+        set_with: "--partition-max-open N (restart)",
+        options: "",
+        help: "the most partitions a derived open budget allows (partition.open_budget = 0), across tables; \
+               a start raises the open-file limit for it, ten descriptors each over a 2,048 reserve, as far \
+               as the hard limit allows; RDB_PARTITION_MAX_OPEN sets it as the flag does",
+    },
+    ConfigKey {
+        section: "partition",
         key: "idle_close_secs",
         hot: true,
         set_with: "SET CONFIG partition.idle_close_secs = 300",
@@ -2648,6 +2699,7 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             .to_string(),
             ("wal", "writer_delay_ms") => crate::wal_writer_delay_ms().to_string(),
             ("cache", "enabled") => crate::cache::query_cache::enabled().to_string(),
+            ("cache", "size") => crate::cache::query_cache::entries().to_string(),
             ("filter", "enabled") => filters.enabled().to_string(),
             ("filter", "backfill_on_open") => filters.backfill_on_open().to_string(),
             ("filter", "min_pruning_ratio") => filters.min_pruning_ratio().to_string(),
@@ -2693,6 +2745,7 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             ("auto_compact", "dead_fraction_max_slots") => crate::auto_compact_dead_fraction_max_slots().to_string(),
             ("auto_compact", "cooldown_secs") => crate::auto_compact_cooldown_secs().to_string(),
             ("partition", "open_budget") => crate::core::partition::budget::process_figures().0.to_string(),
+            ("partition", "max_open") => crate::core::partition::budget::settings::max_open().to_string(),
             ("partition", "idle_close_secs") => crate::core::partition::budget::settings::idle_close_secs().to_string(),
             ("index_snapshot", "idle_checkpoint_secs") => {
                 crate::core::index_store::seal::settings::idle_checkpoint_secs().to_string()
@@ -2744,9 +2797,13 @@ fn pending_of(k: &ConfigKey) -> String {
     crate::configuration::saved::pending(&format!("{}.{}", k.section, k.key)).unwrap_or_default()
 }
 
-/// Where a startup key's running value came from; empty for a hot key.
+/// Where a key's running value came from at start-up; empty for a key that
+/// acts on a database (`replication.*`, `vacuum.enabled`), which is never
+/// saved. A hot key a session changes and saves reads `saved` from then on,
+/// unless a flag set it at start-up: that flag wins at the next start, so it
+/// stays `command line`.
 fn source_of(k: &ConfigKey) -> String {
-    if k.hot {
+    if k.hot && !PROCESS_WIDE_SECTIONS.contains(&k.section) {
         return String::new();
     }
     crate::configuration::saved::source(&format!("{}.{}", k.section, k.key)).name().to_string()
@@ -2772,6 +2829,12 @@ pub fn startup_value(section: &str, name: &str, value: &str) -> Result<String, S
         ("wal", "checkpoint_bytes") => number(1, u64::MAX),
         ("wal", "prealloc_kb") => number(0, 1 << 20),
         ("cache", "enabled") => parse_bool(v).map(|b| b.to_string()),
+        // The slot array is built whole at start, two slots an entry.
+        ("cache", "size") => number(1, 100_000_000),
+        ("partition", "max_open") => number(
+            crate::core::partition::budget::MIN_OPEN as u64,
+            crate::core::partition::budget::MAX_OPEN_LIMIT as u64,
+        ),
         ("index", "residency") => crate::core::index::paged::Residency::parse(v)
             .map(|r| r.name().to_string())
             .ok_or_else(|| format!("`{v}` is not a residency (memory, hybrid or disk)")),
@@ -2787,7 +2850,127 @@ pub fn startup_value(section: &str, name: &str, value: &str) -> Result<String, S
 /// filter surface, the replication surface, the tables themselves — rather than
 /// reimplemented. That is what keeps `SET CONFIG filter.max_f = 20` and
 /// `SET FILTER max_f = 20` from drifting into meaning different things.
+///
+/// A hot key is applied and then saved, so that a restart does not silently
+/// undo it ([`save_hot`]).
 async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<String, String> {
+    let reply = set_config_in(Some(database), key, value).await?;
+    Ok(match spec_of(key) {
+        Some(spec) if spec.hot => reply + &save_hot(spec, value),
+        _ => reply,
+    })
+}
+
+fn spec_of(key: &str) -> Option<&'static ConfigKey> {
+    let (section, name) = key.split_once('.')?;
+    CONFIG_KEYS.iter().find(|k| k.section == section && k.key == name)
+}
+
+/// Saves a hot key a session just changed, and says what a restart will do
+/// with it, as a clause for the reply. The value is saved as given, not as
+/// `SHOW CONFIG` shows it: `partition.open_budget = 0` shows the budget it
+/// derives, and a start has to derive it again. It already took effect, so a
+/// save that fails does not fail the statement; the reply says so.
+fn save_hot(spec: &ConfigKey, value: &str) -> String {
+    let full = format!("{}.{}", spec.section, spec.key);
+    if !PROCESS_WIDE_SECTIONS.contains(&spec.section) {
+        return "; not saved: it acts on this database, so a restart returns it to the start-up value".to_string();
+    }
+    let value = value.trim().trim_matches(|c| c == '\'' || c == '"');
+    match crate::configuration::saved::save(&full, value) {
+        Err(why) => format!("; applied now but not saved, so a restart undoes it: {why}"),
+        Ok(()) if crate::configuration::saved::shadowed_by_flag(&full) => {
+            "; saved, but this server was started with a flag for it, which wins over a saved value \
+             at the next start, so remove the flag for this to hold"
+                .to_string()
+        }
+        Ok(()) => {
+            // What a restart would now report, and so what this one does.
+            crate::configuration::saved::record(&full, value, crate::configuration::saved::Source::Saved);
+            "; saved, so it holds after a restart".to_string()
+        }
+    }
+}
+
+/// Applies the hot keys a session saved ([`save_hot`]) at a start, under the
+/// flags: a key `given` says was set at start-up is left to that value and
+/// recorded as the command line's. Records every process-wide hot key's
+/// source for `SHOW CONFIG`.
+///
+/// Synchronous and database-free, so the server can call it before its
+/// runtime exists and an embedding application inside its Builder's checks;
+/// either way before any database opens, so the opens see the values.
+/// Returns a warning for each saved value that was refused: a bad line is
+/// reported and skipped, never a reason not to start, and the file is left
+/// as it is.
+pub fn apply_saved_hot_keys(
+    stored: &std::collections::BTreeMap<String, String>,
+    given: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    use crate::configuration::saved::{self, Source};
+    let mut warnings = Vec::new();
+    for k in CONFIG_KEYS.iter().filter(|k| k.hot && PROCESS_WIDE_SECTIONS.contains(&k.section)) {
+        let full = format!("{}.{}", k.section, k.key);
+        let (text, source) = if given(&full) {
+            (String::new(), Source::CommandLine)
+        } else if let Some(value) = stored.get(&full) {
+            match set_process_wide(&full, k.section, k.key, value) {
+                Ok(_) => (value.clone(), Source::Saved),
+                Err(e) => {
+                    warnings.push(format!("{}: `{full} = {value}` was not applied: {e}", saved::FILE_NAME));
+                    (String::new(), Source::Default)
+                }
+            }
+        } else {
+            (String::new(), Source::Default)
+        };
+        saved::record(&full, text, source);
+    }
+    warnings
+}
+
+/// `SET CONFIG` for a process that configures the engine in code rather than
+/// through a session: an embedding application seeding the hot keys the way
+/// the server binary's flags do. With `None` no database is open yet, which
+/// is when a starting value belongs, so that the opens see it; the keys that
+/// act on a database (`replication.*`, `vacuum.enabled`) then say so.
+///
+/// A key read once at start-up is refused here, where a session's `SET
+/// CONFIG` would save it for the next start: the caller is the start.
+pub async fn set_config_at_start(
+    database: Option<&Arc<Database>>,
+    key: &str,
+    value: &str,
+) -> Result<String, String> {
+    let known = key
+        .split_once('.')
+        .and_then(|(section, name)| CONFIG_KEYS.iter().find(|k| k.section == section && k.key == name));
+    if let Some(spec) = known
+        && !spec.hot
+    {
+        return Err(format!(
+            "{key} is read once, before the engine starts ({}); it has no live setter",
+            spec.set_with
+        ));
+    }
+    set_config_in(database, key, value).await
+}
+
+/// Whether `key` (`section.key`) is one `SET CONFIG` changes on a running
+/// engine, `None` when there is no such key. `SHOW CONFIG KEYS`' `hot`.
+pub fn config_key_is_hot(key: &str) -> Option<bool> {
+    let (section, name) = key.split_once('.')?;
+    CONFIG_KEYS.iter().find(|k| k.section == section && k.key == name).map(|k| k.hot)
+}
+
+/// What a key that acts on a database answers before one is open.
+fn needs_database<'a>(database: Option<&'a Arc<Database>>, key: &str) -> Result<&'a Arc<Database>, String> {
+    database.ok_or_else(|| format!("{key} acts on a database, and none is open yet"))
+}
+
+/// [`set_config`], with or without an open database
+/// ([`set_config_at_start`]).
+async fn set_config_in(database: Option<&Arc<Database>>, key: &str, value: &str) -> Result<String, String> {
     let (section, name) = key.split_once('.').ok_or_else(|| {
         format!(
             "`{}` is not a config key; they are `section.key`, and SHOW CONFIG KEYS lists them",
@@ -2818,6 +3001,87 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
         return Ok(reply);
     }
 
+    if PROCESS_WIDE_SECTIONS.contains(&section) {
+        return set_process_wide(key, section, name, value);
+    }
+    match section {
+        "replication" => {
+            let database = needs_database(database, key)?;
+            if name == "active" {
+                let statement = if parse_bool(value)? {
+                    "REPLICATION ENABLE"
+                } else {
+                    "REPLICATION DISABLE"
+                };
+                let lines = crate::replication::sql::execute(statement, database).await?;
+                return Ok(lines.join("; "));
+            }
+            let lines = crate::replication::sql::execute(
+                &format!("REPLICATION SET {} = '{}'", name, value),
+                database,
+            )
+            .await?;
+            Ok(lines.join("; "))
+        }
+        "vacuum" => {
+            let database = needs_database(database, key)?;
+            let enabled = parse_bool(value)?;
+            // Every target is found before any is changed: a table that cannot
+            // serve data refuses the whole statement rather than leave it
+            // reported applied to rows it never reached. A partitioned table's
+            // targets are its materialized partitions, open or closed (it
+            // keeps the value for every partition it opens later); one
+            // materialized later takes it too.
+            let names = table_names(database);
+            let mut targets: Vec<Arc<DbTable>> = Vec::new();
+            let mut partitioned: Vec<Arc<crate::core::partition::table::PartitionedTable>> = Vec::new();
+            let mut touched = 0usize;
+            let mut partitions = 0usize;
+            for name in names {
+                match database.relation(&name) {
+                    None => continue,
+                    Some(Relation::Plain(table)) => {
+                        table.data().map_err(|e| e.to_string())?;
+                        targets.push(table);
+                    }
+                    Some(Relation::Partitioned(table)) => {
+                        table.check().map_err(|e| e.to_string())?;
+                        partitioned.push(table);
+                    }
+                }
+                touched += 1;
+            }
+            for table in &targets {
+                table.set_vacuum_enabled(enabled).map_err(|e| e.to_string())?;
+            }
+            for table in &partitioned {
+                partitions += table.set_vacuum_enabled(enabled).map_err(|e| e.to_string())?;
+            }
+            Ok(format!(
+                "background reclamation {} for {} table{}{}",
+                if enabled { "enabled" } else { "disabled" },
+                touched,
+                if touched == 1 { "" } else { "s" },
+                if partitions > 0 {
+                    format!(" ({} partition{})", partitions, if partitions == 1 { "" } else { "s" })
+                } else {
+                    String::new()
+                }
+            ))
+        }
+        _ => Err(format!("`{}` has no live setter", key)),
+    }
+}
+
+/// The sections whose hot keys are process-wide state rather than a
+/// database's: what a session's `SET CONFIG` saves, and what a start applies
+/// from the settings file ([`apply_saved_hot_keys`]). `replication.*` and
+/// `vacuum.enabled` act on an open database and are neither.
+const PROCESS_WIDE_SECTIONS: &[&str] = &["wal", "filter", "query_stats", "auto_compact", "partition", "index_snapshot"];
+
+/// Sets one process-wide hot key. Synchronous, so that a start can apply the
+/// saved ones before its runtime exists.
+fn set_process_wide(key: &str, section: &str, name: &str, value: &str) -> Result<String, String> {
     match section {
         "wal" => match name {
             "synchronous_commit" => {
@@ -2861,23 +3125,6 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
         "filter" => {
             let lines =
                 crate::core::filter::sql::execute(&format!("SET FILTER {} = {}", name, value))?;
-            Ok(lines.join("; "))
-        }
-        "replication" => {
-            if name == "active" {
-                let statement = if parse_bool(value)? {
-                    "REPLICATION ENABLE"
-                } else {
-                    "REPLICATION DISABLE"
-                };
-                let lines = crate::replication::sql::execute(statement, database).await?;
-                return Ok(lines.join("; "));
-            }
-            let lines = crate::replication::sql::execute(
-                &format!("REPLICATION SET {} = '{}'", name, value),
-                database,
-            )
-            .await?;
             Ok(lines.join("; "))
         }
         "query_stats" => {
@@ -3018,51 +3265,6 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
             }
             Ok(format!("{key} is now {n}"))
         }
-        "vacuum" => {
-            let enabled = parse_bool(value)?;
-            // Every target is found before any is changed: a table that cannot
-            // serve data refuses the whole statement rather than leave it
-            // reported applied to rows it never reached. A partitioned table's
-            // targets are its materialized partitions, open or closed (it
-            // keeps the value for every partition it opens later); one
-            // materialized later takes it too.
-            let names = table_names(database);
-            let mut targets: Vec<Arc<DbTable>> = Vec::new();
-            let mut partitioned: Vec<Arc<crate::core::partition::table::PartitionedTable>> = Vec::new();
-            let mut touched = 0usize;
-            let mut partitions = 0usize;
-            for name in names {
-                match database.relation(&name) {
-                    None => continue,
-                    Some(Relation::Plain(table)) => {
-                        table.data().map_err(|e| e.to_string())?;
-                        targets.push(table);
-                    }
-                    Some(Relation::Partitioned(table)) => {
-                        table.check().map_err(|e| e.to_string())?;
-                        partitioned.push(table);
-                    }
-                }
-                touched += 1;
-            }
-            for table in &targets {
-                table.set_vacuum_enabled(enabled).map_err(|e| e.to_string())?;
-            }
-            for table in &partitioned {
-                partitions += table.set_vacuum_enabled(enabled).map_err(|e| e.to_string())?;
-            }
-            Ok(format!(
-                "background reclamation {} for {} table{}{}",
-                if enabled { "enabled" } else { "disabled" },
-                touched,
-                if touched == 1 { "" } else { "s" },
-                if partitions > 0 {
-                    format!(" ({} partition{})", partitions, if partitions == 1 { "" } else { "s" })
-                } else {
-                    String::new()
-                }
-            ))
-        }
         _ => Err(format!("`{}` has no live setter", key)),
     }
 }
@@ -3160,6 +3362,15 @@ pub fn sql_type_name(db_type: &DbType) -> &'static str {
     }
 }
 
+/// A foreign key's columns as a description lists them: `a`, or `(a, b)`
+/// for a composite key.
+fn key_list(columns: &[String]) -> String {
+    match columns {
+        [column] => column.clone(),
+        _ => format!("({})", columns.join(", ")),
+    }
+}
+
 fn action_name(action: &crate::core::rql::foreign_key::ReferentialAction) -> &'static str {
     use crate::core::rql::foreign_key::ReferentialAction::*;
     match action {
@@ -3181,7 +3392,8 @@ fn action_name(action: &crate::core::rql::foreign_key::ReferentialAction) -> &'s
 /// STATUS` says so: "nothing has run yet" and "this build does not record what
 /// runs" want two different things done about them.
 #[cfg(not(feature = "query_stats"))]
-const NO_QUERY_STATS: &str = "this server was built without the `query_stats` feature, so it records nothing about      what it runs; rebuild with `--features query_stats`";
+const NO_QUERY_STATS: &str = "this server was built without the `query_stats` feature, so it records nothing about \
+     what it runs; rebuild with `--features query_stats`";
 
 #[cfg(not(feature = "query_stats"))]
 fn recent_queries(_limit: Option<u64>) -> Result<Vec<Row>, String> {
@@ -3419,6 +3631,40 @@ mod tests {
             ok("SHOW COLUMNS FROM \"public\".\"users\""),
             Introspect::Columns("users".into())
         );
+    }
+
+    /// A start (an embedding application's Builder) sets hot keys with no
+    /// database open. The keys that act on a database say so, a key read
+    /// once is refused rather than saved for a start that is this one, and
+    /// a process-wide key gets as far as its own check of the value.
+    #[tokio::test]
+    async fn set_config_at_start_needs_no_database_for_process_wide_keys() {
+        for key in ["replication.mode", "replication.active", "vacuum.enabled"] {
+            let e = set_config_at_start(None, key, "on").await.unwrap_err();
+            assert!(e.contains("acts on a database"), "{key}: {e}");
+        }
+        for key in ["server.batch_size", "index.residency", "wal.enabled"] {
+            let e = set_config_at_start(None, key, "1").await.unwrap_err();
+            assert!(e.contains("read once"), "{key}: {e}");
+        }
+        let e = set_config_at_start(None, "wal.writer_delay_ms", "soon").await.unwrap_err();
+        assert!(e.contains("not a number of milliseconds"), "{e}");
+        let e = set_config_at_start(None, "auto_compact.ratio", "many").await.unwrap_err();
+        assert!(e.contains("not a whole number"), "{e}");
+        let e = set_config_at_start(None, "server.no_such", "1").await.unwrap_err();
+        assert!(e.contains("unknown config key"), "{e}");
+        let e = set_config_at_start(None, "nodot", "1").await.unwrap_err();
+        assert!(e.contains("not a config key"), "{e}");
+
+        assert_eq!(config_key_is_hot("wal.synchronous_commit"), Some(true));
+        assert_eq!(config_key_is_hot("server.batch_size"), Some(false));
+        assert_eq!(config_key_is_hot("server.no_such"), None);
+        assert_eq!(config_key_is_hot("nodot"), None);
+        // Every key answers what `SHOW CONFIG KEYS` shows for it.
+        for k in CONFIG_KEYS {
+            let key = format!("{}.{}", k.section, k.key);
+            assert_eq!(config_key_is_hot(&key), Some(k.hot), "{key}");
+        }
     }
 
     #[test]

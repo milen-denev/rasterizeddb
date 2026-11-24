@@ -168,6 +168,19 @@ pub(super) async fn prepare_statement(
     if database.has_table(sequence_catalog::SEQUENCE_TABLE) {
         sequence_catalog::ensure_loaded(database).await.map_err(|e| ("XX000", e))?;
     }
+    // A sequence read as a relation (`SELECT last_value FROM s`), as its row.
+    match sequence_catalog::relations_as_rows(database, stmt)? {
+        Some(rows) => Ok(Some(prepare_calls(database, tx, &rows).await?.unwrap_or(rows))),
+        None => prepare_calls(database, tx, stmt).await,
+    }
+}
+
+/// [`prepare_statement`] for the calls a statement makes.
+async fn prepare_calls(
+    database: &Arc<Database>,
+    tx: Option<TxId>,
+    stmt: &str,
+) -> Result<Option<String>, (&'static str, String)> {
     let lower_has = |needle: &[u8]| crate::core::sql_scan::contains_ignore_ascii_case(stmt, needle);
     if !(lower_has(b"val(") || lower_has(b"val (") || lower_has(b"pg_get_serial_sequence")) {
         return Ok(None);

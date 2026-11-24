@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1
+#
+# RasterizedDB with RustFS (https://github.com/rustfs/rustfs, Apache-2.0) in one
+# container, built on the official RustFS image: RustFS serves S3 on 9000 (its
+# console on 9001), and the database keeps its backups and its S3-backed tables
+# there. docker/rustfs-entrypoint.sh runs both; docs/docker.md, "RustFS".
+#
+# The server is the static musl build (the RustFS image is Alpine), taken from
+# bin-musl/<amd64|arm64>/rasterizeddb in this directory like Dockerfile.alpine.
+# Both processes run as RustFS's user, uid 10001, the uid of every other
+# RasterizedDB image.
+ARG RUSTFS_VERSION=1.0.6
+FROM rustfs/rustfs:${RUSTFS_VERSION}
+
+ARG TARGETARCH
+
+USER root
+# psql: the entrypoint defines the S3 table store with one statement.
+RUN apk add --no-cache postgresql18-client \
+ && mkdir -p /var/lib/rasterizeddb \
+ && chown rustfs:rustfs /var/lib/rasterizeddb \
+ && chmod 700 /var/lib/rasterizeddb
+
+COPY --chmod=0755 bin-musl/${TARGETARCH}/rasterizeddb /usr/local/bin/rasterizeddb
+COPY --chmod=0755 rustfs-entrypoint.sh /usr/local/bin/rasterizeddb-rustfs
+COPY README.md LICENSE-GPL /usr/share/doc/rasterizeddb/
+
+USER rustfs
+WORKDIR /var/lib/rasterizeddb
+# /data (RustFS's objects) is already a volume in the base image.
+VOLUME /var/lib/rasterizeddb
+
+# 5432 PostgreSQL protocol, 61170 native protocol, 9000 S3 API, 9001 RustFS console.
+EXPOSE 5432 61170 9000 9001
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/bin/rasterizeddb-rustfs"]
+# The base image's CMD is `rustfs`; arguments here go to the database.
+CMD []

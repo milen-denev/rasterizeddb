@@ -434,10 +434,10 @@ fn renames_and_drop_column_keep_the_key_or_take_it_away() {
     q.ok("INSERT INTO {c} (cid, pid, v) VALUES (5, 5, 5)");
     q.err("INSERT INTO {c} (cid, pid, v) VALUES (6, 606, 6)", "23503");
     // The referenced column: a key names it (2BP01); on a partitioned parent
-    // it is the partition key, which is never dropped (0A000).
+    // it is the partition key, which is never dropped (42P16, as PostgreSQL answers).
     for (i, (suffix, part_parent, _)) in CONFIGS.iter().enumerate() {
         let e = q.on(i, "ALTER TABLE {p} DROP COLUMN id").expect_err("referenced column");
-        let want = if *part_parent { "0A000" } else { "2BP01" };
+        let want = if *part_parent { "42P16" } else { "2BP01" };
         assert_eq!(e.code, want, "{suffix}: {e}");
     }
     // The child's key column: the key goes with it, and the parent is free.

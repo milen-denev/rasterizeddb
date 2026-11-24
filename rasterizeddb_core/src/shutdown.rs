@@ -53,16 +53,40 @@ pub async fn termination_signal() {
     }
 }
 
+static SIGNAL_HOOKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the engine may take the process's termination signals
+/// ([`on_termination`]): on by default, as the server binary wants. An
+/// embedding process turns it off before it starts an engine, so that nothing
+/// the engine starts later (a replication listener brought up by
+/// `REPLICATION ENABLE`, say) installs a Ctrl+C handler in the host or exits
+/// it on a second Ctrl+C. The engine then stops when its host stops it.
+pub fn set_signal_hooks(on: bool) {
+    SIGNAL_HOOKS.store(on, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether [`on_termination`] installs anything ([`set_signal_hooks`]).
+pub fn signal_hooks() -> bool {
+    SIGNAL_HOOKS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Runs `on_signal` when the first termination signal arrives, then exits the
 /// process on the second one.
 ///
 /// The escape hatch matters: installing a handler takes Ctrl+C away from the
 /// default kill behaviour, so without it an operator whose drain is wedged has
 /// no way out short of `kill -9`.
+///
+/// Does nothing in a process that turned the hooks off
+/// ([`set_signal_hooks`]): an application embedding the engine owns its own
+/// Ctrl+C and SIGTERM.
 pub fn on_termination<F>(on_signal: F)
 where
     F: FnOnce() + Send + 'static,
 {
+    if !SIGNAL_HOOKS.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     tokio::spawn(async move {
         termination_signal().await;
         info!("Termination signal received, draining before exit");

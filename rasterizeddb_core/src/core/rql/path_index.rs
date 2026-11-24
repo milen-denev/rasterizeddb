@@ -345,29 +345,86 @@ pub fn parse_create(sql: &str) -> Option<Result<CreatePathIndex, String>> {
 ///
 /// Nothing here says which table it belongs to, because PostgreSQL's index
 /// names are database-wide; the caller finds the table holding it.
+///
+/// `CONCURRENTLY` changes how PostgreSQL drops it, not what goes, and is
+/// passed over; so is a schema (`public.ix`). A quoted name is read whole,
+/// spaces and `""` included: read up to the first space, `"mix é 1"` was
+/// `mix`, and the drop matched nothing.
 pub fn parse_drop(sql: &str) -> Option<(String, bool)> {
+    parse_drop_parts(sql).map(|(name, if_exists, _)| (name, if_exists))
+}
+
+/// Whether `DROP INDEX … <name> CASCADE` says `CASCADE`: the word after the
+/// name, so an index called "cascade" is a name and nothing more.
+pub fn drop_cascades(sql: &str) -> bool {
+    parse_drop_parts(sql).is_some_and(|(_, _, cascade)| cascade)
+}
+
+fn parse_drop_parts(sql: &str) -> Option<(String, bool, bool)> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let upper = trimmed.to_ascii_uppercase();
     if !upper.starts_with("DROP INDEX") {
         return None;
     }
     let mut rest = trimmed["DROP INDEX".len()..].trim_start();
+    let word_is = |text: &str, word: &str| {
+        text.get(..word.len()).is_some_and(|w| w.eq_ignore_ascii_case(word))
+            && text[word.len()..].chars().next().is_none_or(|c| c.is_whitespace())
+    };
+    // Not an index called "concurrently".
+    if word_is(rest, "CONCURRENTLY") && !rest["CONCURRENTLY".len()..].trim().is_empty() {
+        rest = rest["CONCURRENTLY".len()..].trim_start();
+    }
     let mut if_exists = false;
     if rest.to_ascii_uppercase().starts_with("IF EXISTS") {
         if_exists = true;
         rest = rest["IF EXISTS".len()..].trim_start();
     }
-    // `CASCADE`/`RESTRICT` have nothing to act on here.
-    let name = rest
-        .split_whitespace()
-        .next()?
-        .trim_matches('"')
-        .trim_end_matches(',')
-        .to_string();
+    // The name, its last part when qualified: a schema before it is not
+    // part of it. `DROP INDEX public.idx` looked for an index called
+    // "public.idx", found none, and answered DROP INDEX with the index still
+    // there.
+    let mut name: String;
+    loop {
+        if let Some(quoted) = rest.strip_prefix('"') {
+            let mut part = String::new();
+            let mut end = None;
+            let mut chars = quoted.char_indices().peekable();
+            while let Some((i, c)) = chars.next() {
+                if c == '"' {
+                    if chars.peek().is_some_and(|(_, n)| *n == '"') {
+                        part.push('"');
+                        chars.next();
+                    } else {
+                        end = Some(i + 1);
+                        break;
+                    }
+                } else {
+                    part.push(c);
+                }
+            }
+            name = part;
+            rest = &quoted[end?..];
+        } else {
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == ',' || c == '.' || c == ';')
+                .unwrap_or(rest.len());
+            name = rest[..end].to_string();
+            rest = &rest[end..];
+        }
+        match rest.strip_prefix('.') {
+            Some(after) => rest = after,
+            None => break,
+        }
+    }
     if name.is_empty() {
         return None;
     }
-    Some((name, if_exists))
+    // `CASCADE`/`RESTRICT` after the name (only the first name of a list is
+    // read here).
+    let behaviour = rest.trim_start_matches(',').trim();
+    let cascade = word_is(behaviour, "CASCADE");
+    Some((name, if_exists, cascade))
 }
 
 fn matching_paren(text: &str, open: usize) -> Option<usize> {
@@ -477,5 +534,17 @@ mod statement_tests {
             Some(("ix".to_string(), false))
         );
         assert!(parse_drop("DROP TABLE t").is_none());
+        // A quoted name whole, a schema passed over, CONCURRENTLY too.
+        assert_eq!(parse_drop("DROP INDEX \"mix é 1\" CASCADE"), Some(("mix é 1".to_string(), false)));
+        assert_eq!(parse_drop("DROP INDEX public.\"a\"\"b\""), Some(("a\"b".to_string(), false)));
+        assert_eq!(parse_drop("DROP INDEX IF EXISTS public.idx"), Some(("idx".to_string(), true)));
+        assert_eq!(parse_drop("DROP INDEX \"public\".\"a.b\""), Some(("a.b".to_string(), false)));
+        assert_eq!(
+            parse_drop("DROP INDEX CONCURRENTLY IF EXISTS ix RESTRICT;"),
+            Some(("ix".to_string(), true))
+        );
+        assert_eq!(parse_drop("DROP INDEX concurrently"), Some(("concurrently".to_string(), false)));
+        assert!(drop_cascades("DROP INDEX ix CASCADE") && drop_cascades("drop index if exists \"i x\" cascade;"));
+        assert!(!drop_cascades("DROP INDEX ix RESTRICT") && !drop_cascades("DROP INDEX cascade"));
     }
 }

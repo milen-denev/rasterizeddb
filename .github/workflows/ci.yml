@@ -1,15 +1,18 @@
 name: CI
 
-# Every push and pull request: the four release targets build, and the crates
-# that ship (rastcp, the client, the embedded SDK) pass their tests on each.
+# Every push and pull request: the four release targets build, the crates
+# that ship (rastcp, the client, the embedded SDK) pass their tests on each,
+# and their public API stays compatible with the last release (semver).
 # The engine's own suites are long (the core library alone is ~10 minutes on
 # 16 cores); they run on every target in the `full` job: weekly, on demand
 # (Actions -> CI -> Run workflow, full = true), and on pushes to the
 # release branch.
 
 on:
+  # dev is where work lands; main and release only ever take commits whose
+  # checks already ran (a release pull request, then a fast-forward).
   push:
-    branches: [main, feat/secondary-indexes]
+    branches: [dev]
   pull_request:
   schedule:
     - cron: "17 3 * * 1"
@@ -124,7 +127,7 @@ jobs:
     if: >
       github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' && inputs.full) ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/feat/secondary-indexes')
+      (github.event_name == 'push' && github.ref == 'refs/heads/dev')
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 300
     env:
@@ -151,6 +154,18 @@ jobs:
             runner: windows-11-arm
             target: aarch64-pc-windows-msvc
     steps:
+      # The three suites' test binaries outgrow an ubuntu runner's free disk:
+      # compat's link died with "No space left on device" (ld bus error) on
+      # linux-x86_64 in run 45357514504. Toolchains these jobs never use go
+      # first.
+      - name: Free disk space (ubuntu)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - uses: actions/checkout@v4
 
       - uses: ./.github/actions/setup
@@ -160,11 +175,75 @@ jobs:
       - name: Core library tests
         run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_core --lib --no-fail-fast
 
+      # `--test '*'`, not `--tests`: `--tests` also reruns the library's own
+      # unit tests, which the step above already ran (85 minutes on Windows).
       - name: Core integration tests
-        run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_core --tests --no-fail-fast
+        run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_core --test '*' --no-fail-fast
+
+      # The core suites' test executables are done with; compat links its own
+      # hundred-odd against the same libraries, which stay. Only test
+      # executables (`<test>-<16 hex>`, `.exe`/`.pdb` on Windows) and
+      # incremental state go: rlibs, proc macros, build scripts and their
+      # outputs are kept, so nothing recompiles. Since cargo 1.100 a test
+      # executable lands in debug/build/<package>/<hash>/out/, not
+      # debug/deps/; both are swept.
+      - name: Free the core test binaries before compat
+        if: always()
+        shell: bash
+        run: |
+          df -h . || true
+          debug="target/${{ matrix.target }}/debug"
+          for dir in "$debug"/deps "$debug"/build/rasterizeddb_core/*/out; do
+            [ -d "$dir" ] || continue
+            find "$dir" -maxdepth 1 -regextype posix-extended -type f ! -name 'build_script_*' ! -name 'build-script-*' \
+              -regex '.*/[a-z0-9_]+-[0-9a-f]{16}(\.exe|\.pdb)?' \
+              \( -name '*.exe' -o -name '*.pdb' -o -perm -u+x \) -print -delete | wc -l
+          done
+          rm -rf "$debug/incremental"
+          df -h . || true
 
       - name: Compatibility suite (PostgreSQL / MySQL / SQL Server drivers)
         run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_compat --no-fail-fast
+
+  # The SDK crates promise semver: a patch or minor release must not break
+  # code written against the last release. Compared with the release tags'
+  # sources rather than crates.io, so a crate whose release never reached
+  # crates.io (rasterizeddb_embedded 1.0.0) is still checked.
+  semver:
+    name: semver against the last release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup
+        with:
+          target: x86_64-unknown-linux-gnu
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - name: cargo semver-checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          last() { git tag --list "$1" --sort=-v:refname | head -n1; }
+          client="$(last 'client-v*')"; server="$(last 'server-v*')"
+          if [ -z "$client" ]; then
+            echo "::error::no client-v* tag in this checkout: there is no released client to compare with"
+            exit 1
+          fi
+          # A server-v* tag can lag its release commit: it is pushed only when
+          # the server crates publish (server-v1.0.0 waited for a crates.io
+          # name lock). Both channels released from one commit so far, so the
+          # client tag's sources are the server crates' last release too.
+          if [ -z "$server" ]; then
+            echo "::warning::no server-v* tag in this checkout; comparing the embedded SDK with $client instead"
+            server="$client"
+          fi
+          echo "baselines: $client (client crates, rastcp), $server (embedded SDK)"
+          cargo semver-checks --baseline-rev "$client" -p rastcp -p rasterizeddb_client -p rasterizeddb_client_derive
+          cargo semver-checks --baseline-rev "$server" -p rasterizeddb_embedded
 
   package:
     name: crates package and verify

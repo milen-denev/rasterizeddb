@@ -251,7 +251,7 @@ impl UpdateMany {
         let now = db.run(&self.probe).await?;
         let key_width = now
             .get(0)
-            .map_or(0, |r| r.len() - usize::from(self.versions[0].is_some()));
+            .map_or(0, |r| r.len().saturating_sub(usize::from(self.versions[0].is_some())));
         let mut found: HashMap<String, Option<String>> = HashMap::new();
         for row in now.iter() {
             let mut parts = Vec::new();

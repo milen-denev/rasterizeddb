@@ -20,6 +20,11 @@ type HmacSha256 = Hmac<Sha256>;
 /// downgraded one could ask for `i=1` and make a captured exchange cheap to
 /// attack offline. PostgreSQL's own default is the floor.
 const MIN_ITERATIONS: u32 = 4096;
+/// The most a server may ask for. The server's own count is 4096; a
+/// hostile one (or anyone in the middle of a connection that does not pin
+/// the server's certificate) could otherwise ask for 4 billion and hold this
+/// client in PBKDF2 for hours. A million is about a second.
+const MAX_ITERATIONS: u32 = 1_000_000;
 
 const NONCE_LEN: usize = 18;
 
@@ -84,6 +89,11 @@ impl ScramClient {
         if iterations < MIN_ITERATIONS {
             return Err(format!(
                 "SCRAM iteration count {iterations} is below the {MIN_ITERATIONS} this client accepts"
+            ));
+        }
+        if iterations > MAX_ITERATIONS {
+            return Err(format!(
+                "SCRAM iteration count {iterations} is above the {MAX_ITERATIONS} this client accepts"
             ));
         }
 
@@ -215,6 +225,20 @@ mod tests {
             .respond(&format!("r={nonce},s=c2FsdA==,i=1"))
             .unwrap_err();
         assert!(err.contains("iteration"), "{err}");
+    }
+
+    /// A count a server could use to hold the client in PBKDF2 for hours is
+    /// refused before any hashing.
+    #[test]
+    fn a_huge_iteration_count_is_refused() {
+        let (mut client, _) = ScramClient::start("alice", "pw", b"bind").unwrap();
+        let nonce = format!("{}xyz", client.client_nonce);
+        let started = std::time::Instant::now();
+        let err = client
+            .respond(&format!("r={nonce},s=c2FsdA==,i=4294967295"))
+            .unwrap_err();
+        assert!(err.contains("above"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]

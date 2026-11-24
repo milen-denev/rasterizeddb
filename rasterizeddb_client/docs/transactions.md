@@ -135,6 +135,7 @@ A transaction's errors end with `(SQLSTATE xxxxx)`, read by
 | `40001` | serialization failure ([`is_serialization_failure`](crate::Error::is_serialization_failure)) |
 | `40P01` | deadlock victim ([`is_deadlock`](crate::Error::is_deadlock)) |
 | `55P03` | a lock wait passed `SET lock_timeout` |
+| `57014` | the statement ran past the statement timeout ([`is_statement_timeout`](crate::Error::is_statement_timeout)) |
 | `25P02` | the transaction had already failed |
 | `25006` | a write in a read-only transaction |
 | `23505` | a unique or primary key ([`is_unique_violation`](crate::Error::is_unique_violation)) |
@@ -142,8 +143,20 @@ A transaction's errors end with `(SQLSTATE xxxxx)`, read by
 DDL inside a transaction rolls back with it (`CREATE TABLE`, `ALTER TABLE`,
 `CREATE INDEX`, `DROP TABLE`, which is carried out at COMMIT, …), as on the
 PostgreSQL listener. `CREATE DATABASE` and `DROP DATABASE` are refused in a
-transaction (`25001`). Warnings the PostgreSQL listener sends as notices
-(for example about DDL it cannot roll back) do not reach a native client.
+transaction (`25001`). Warnings the server raises as notices (a `BEGIN`
+inside a transaction, a `RAISE NOTICE`, DDL it cannot roll back) come with
+the statement's answer ([`Rows::notices`](crate::Rows::notices)) and go to
+the client's notice handler
+([`Client::set_notice_handler`](crate::Client::set_notice_handler)).
+
+A statement that runs past the server's statement timeout (its request
+timeout, 30 s by default, or `SET statement_timeout` inside the
+transaction) is stopped and fails with `57014`
+([`is_statement_timeout`](crate::Error::is_statement_timeout)). The
+transaction is then failed like any other (`25P02` until it rolls back),
+and its connection stays: it is not lost. `SET statement_timeout = 0`
+inside a transaction lets its statements run as long as they need; give
+the client a `timeout` to match.
 
 ## Connections
 

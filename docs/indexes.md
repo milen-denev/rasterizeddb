@@ -46,8 +46,17 @@ Refused, with the reason:
   and an operator class accepted and set aside: the index orders by the
   engine's own comparison either way. `INCLUDE`, `WITH` and `TABLESPACE` are
   accepted too.
-- `CREATE UNIQUE INDEX` becomes a unique constraint, as it was already, and the
-  constraint brings its implicit B-tree.
+- `CREATE UNIQUE INDEX` is enforced as a unique key, as it was already, and the
+  key brings its implicit B-tree. The key remembers that it was made as an
+  index, as PostgreSQL does: `DROP INDEX` drops it (with `CASCADE` taking the
+  foreign keys that depend on it; without, 2BP01), `ALTER TABLE … DROP
+  CONSTRAINT` and `RENAME CONSTRAINT` do not know it (42704), and
+  `pg_constraint` has no row for it. A key made by `ADD CONSTRAINT … UNIQUE`
+  is the opposite: `DROP INDEX` of it is 2BP01. A key created before the mark
+  existed reads as a constraint. On a replicating node, upgrade every node to
+  this build before running `CREATE UNIQUE INDEX`: the statement replicates as
+  `ALTER TABLE … ADD CONSTRAINT … UNIQUE (…) AS INDEX`, which an older peer
+  cannot parse.
 - A **partial** index (`WHERE …`) or an **expression** index (`(lower(email))`)
   is accepted and *not* built, as all index DDL was before this feature. An
   index built without its predicate or expression would answer different
@@ -109,6 +118,15 @@ matches.
 An index over `->` (a document rather than text) is refused. A path index
 serves both `->>` and `->` spellings of the same path, but answers only `->>`
 comparisons.
+
+**A JSON path comparison is fast only with a path index.** Without
+`CREATE INDEX … ON t ((doc->>'k'))`, `doc->>'k' = 'v'` reads every row: the
+filter index keys columns, not paths inside a document, and nothing indexes
+a path automatically (a document can hold unboundedly many). Declare one per
+path you filter on. It narrows the read on a plain table, a partitioned one
+(each partition keeps it) and a table on a key/value store alike, and
+answers exactly as the unindexed read does
+(`database::path_index_pruning_tests`).
 
 `pg_indexes` lists both kinds with the definition PostgreSQL would print.
 

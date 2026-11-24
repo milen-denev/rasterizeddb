@@ -19,12 +19,14 @@ let peer = Client::connect(
     Options { login: Login::Peer, ..Options::default() },
 ).await?;
 
-// TCP as a role with a password (SCRAM-SHA-256), with more connections, a
-// longer timeout and a larger answer limit.
+// TCP as a role with a password (SCRAM-SHA-256), believing only the
+// server's own certificate (started with --rdb-cert/--rdb-key), with more
+// connections, a longer timeout and a larger answer limit.
 let remote = Client::connect(
     "db.internal:61170",
     Options {
         login: Login::password("app", "<password>"),
+        trust: rasterizeddb_client::pin(&["<the certificate's SHA-256 fingerprint>"])?,
         connections: 4,
         timeout: Some(Duration::from_secs(60)),
         max_message_size: 64 * 1024 * 1024,
@@ -46,15 +48,63 @@ wrong path or a refused login is `connect`'s error. When
 run (or are verified) before it returns too: see the
 [migrations chapter](crate::guide::migrations).
 
+**Over TCP, set `trust`.** The default, `AcceptAny`, encrypts but believes
+any server: a password is safe from replay, but whoever answers in the
+server's place can guess it offline from the login, and reads everything.
+Pin the server's certificate ([`pin`](crate::pin)) or use a CA
+([`load_ca`](crate::load_ca)).
+
+**Timeouts end the wait, not the statement.** A statement whose `timeout`
+passes on this side, or whose future is dropped, may still run to the end
+on the server. Over a plain (non-shared) connection, such as a
+transaction's, the write and the answer each get the whole timeout, so a
+statement can take up to twice it before failing.
+
+**The server bounds a statement itself.** At its request timeout (30 s by
+default, `--rdb-request-timeout`) it stops the statement and answers with
+SQLSTATE `57014`
+([`Error::is_statement_timeout`](crate::Error::is_statement_timeout)), as
+PostgreSQL's `statement_timeout` does: nothing of it took effect, the
+connection goes on, and a transaction is failed as by any failed statement
+(roll it back). The client waits [`ANSWER_GRACE`](crate::ANSWER_GRACE) (2 s)
+past `timeout` for an answer, so that this answer, not a timeout of its
+own, is what a caller gets when both are 30 s. To run a statement longer
+than the server's limit, raise `--rdb-request-timeout`, or `SET
+statement_timeout = '10min'` (or `0`, no limit) inside a transaction; and
+raise `timeout` to match.
+
 | option | default | meaning |
 |---|---|---|
 | `connections` | 1 | connections shared by every caller; each carries many statements at once |
-| `timeout` | 30 s | how long a statement waits for its answer (`None`: forever) |
+| `timeout` | 30 s | how long a statement waits for its answer, plus a 2 s grace (`None`: forever) |
 | `login` | `Trust` | `Trust`, `Peer`, `PeerAs(name)` or `Password { user, password }` (`Login::password`) |
 | `database` | `None` | the database every connection uses (`None`: the server's `--pg-default-db`); a password or peer login is checked against that database's roles |
-| `max_message_size` | 8 MiB | the largest answer accepted; a larger one fails whole |
+| `max_message_size` | 8 MiB | the largest answer accepted; a larger one fails whole ([`Error::is_message_too_large`](crate::Error::is_message_too_large)) and closes its connection |
+| `idle_reconnect` | 20 s | reopen a connection idle this long before using it, inside the server's 30 s idle close |
+| `trust` | `AcceptAny` | how a TCP connection checks the server: `AcceptAny` (encrypted, not authenticated), [`pin`](crate::pin), [`load_ca`](crate::load_ca) or `WebPki`; unix sockets have no TLS |
 | `migrations` | `None` | a [`Migrator`](crate::orm::Migrator) to run on connect |
 | `auto_migrate` | `Apply` | `Off`, `Apply` or `Verify` |
+
+## Notices
+
+What the server says about a statement without failing it (`RAISE NOTICE`
+in a `DO` block, `DROP TABLE IF EXISTS` naming no table, `CREATE TABLE IF
+NOT EXISTS` naming one that exists) comes with its answer,
+[`Rows::notices`](crate::Rows::notices), each a [`Notice`](crate::Notice)
+with its severity, SQLSTATE and message. A handler sees every one, those of
+a statement that then failed included:
+
+```no_run
+# async fn demo(client: &rasterizeddb_client::Client) -> rasterizeddb_client::Result<()> {
+client.set_notice_handler(|n| eprintln!("{}: {} ({})", n.severity, n.message, n.sqlstate));
+let rows = client.run("DROP TABLE IF EXISTS gone").await?;
+assert_eq!(rows.notices()[0].sqlstate, "00000");
+# Ok(()) }
+```
+
+Each connection asks for notices when it opens. A server that predates
+them refuses the request without running anything, and sends none; a
+client that predates them never asks, and is sent none.
 
 ## Sharing a client
 

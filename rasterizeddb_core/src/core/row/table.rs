@@ -806,6 +806,11 @@ fn leading_excluded(words: &[u64]) -> u64 {
 /// is skipped rather than read. It is dead weight in the entry, not a hazard.
 /// `a_reclaimable_version_is_invisible_to_every_snapshot` pins the lemma; the
 /// ordering of the check and the fetch is what depends on it.
+/// Reads that skipped building their candidates because the query cache
+/// held their answer (`Table::candidates_unless_cached`).
+#[cfg(test)]
+pub(crate) static CANDIDATES_SKIPPED_FOR_CACHE: AtomicU64 = AtomicU64::new(0);
+
 fn cache_generation_for(_visibility: &Visibility, generation: u64) -> Option<u64> {
     Some(generation)
 }
@@ -3359,7 +3364,8 @@ impl<S: StorageIO> Table<S> {
     /// otherwise.
     fn column_constraint_name(&self, column: &str) -> String {
         if self.schema.primary_key.as_deref().is_some_and(|pk| pk.eq_ignore_ascii_case(column)) {
-            crate::core::rql::unique_key::pkey_name(&self.schema.name)
+            crate::core::rql::unique_key::primary_key_of(&self.schema)
+                .map_or_else(|| crate::core::rql::unique_key::pkey_name(&self.schema.name), |key| key.name)
         } else {
             crate::core::rql::unique_key::implicit_key_name(&self.schema.name, column)
         }
@@ -4710,6 +4716,40 @@ impl<S: StorageIO> Table<S> {
         Ok(self.candidates_for(d, where_clause, limit).await)
     }
 
+    /// [`Self::candidates_for`], skipped when the query cache already holds
+    /// the answer to this clause at `cache_generation`.
+    ///
+    /// The candidates are built before the processor looks in the cache, and
+    /// for a clause an index answers only by a key prefix (`tenant_id = …
+    /// AND year = … AND month = …` and a column outside the key) building
+    /// them walks every row under the prefix: measured at 20k rows under it,
+    /// a cache hit cost 550 µs of CPU, three quarters of it that walk, against
+    /// 65 µs for a point read. A hit never reads them.
+    ///
+    /// Not for an ordered read (`ordered`): the processor may decline an
+    /// ordered hit on purpose and rescan, and that rescan needs them. Any
+    /// other hit that falls through (the entry evicted in between, a pointer
+    /// that no longer reads back) rescans without them: every slot, each row
+    /// tested against the clause, the same answer more slowly.
+    async fn candidates_unless_cached(
+        &self,
+        d: &TableData<S>,
+        where_clause: &str,
+        limit: Option<u64>,
+        cache_generation: Option<u64>,
+        ordered: bool,
+    ) -> Option<Arc<CandidateBitmap>> {
+        if !ordered
+            && let Some(generation) = cache_generation
+            && crate::cache::query_cache::holds(&self.cache_scope, where_clause, generation, limit)
+        {
+            #[cfg(test)]
+            CANDIDATES_SKIPPED_FOR_CACHE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        self.candidates_for(d, where_clause, limit).await
+    }
+
     /// The candidates a unique index gives for a full-key equality, from
     /// the key's stored bytes rather than from a clause's text
     /// ([`crate::core::row::point_key`]): per key column its write order, its
@@ -4962,6 +5002,26 @@ impl<S: StorageIO> Table<S> {
         self.insert_row_in_txn(row_write, FROZEN_TX).await
     }
 
+    /// The uniqueness check [`insert_row_in_txn`](Self::insert_row_in_txn)
+    /// makes, without the write: `Err` with the violation (or the in-flight
+    /// key to replay on) the insert of `row_write` would meet, `Ok` when it
+    /// would meet none. For an `INSERT` whose foreign key failed: PostgreSQL
+    /// checks a key on the row it inserted, so a row a uniqueness violation
+    /// stops (`ON CONFLICT` skipping or updating it, or 23505) never has its
+    /// key checked.
+    pub(crate) async fn insert_conflict_in_txn(&self, mut row_write: RowWrite, written_by: TxId) -> Result<()> {
+        self.data()?;
+        if !self.has_unique {
+            return Ok(());
+        }
+        // The key as the insert would compare it (`character(n)` padding).
+        self.hold_text_lengths(&mut row_write, |_| true, true)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let _write = self.unique_lock.lock(&self.unique_stripes(&row_write)).await;
+        self.check_unique(&row_write, None, &self.visibility_for(written_by), written_by, None, None)
+            .await
+    }
+
     /// Inserts a row belonging to `written_by`, visible to nobody else until it
     /// commits.
     pub async fn insert_row_in_txn(&self, mut row_write: RowWrite, written_by: TxId) -> Result<()> {
@@ -5211,7 +5271,8 @@ impl<S: StorageIO> Table<S> {
         let _read = d.read_guard();
 
         let generation = self.cache_generation();
-        let base_candidates = self.candidates_for(d, query, None).await;
+        let cache_generation = (cache && self.caches_queries()).then(|| cache_generation_for(&visibility, generation)).flatten();
+        let base_candidates = self.candidates_unless_cached(d, query, None, cache_generation, false).await;
 
         let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
@@ -5226,7 +5287,7 @@ impl<S: StorageIO> Table<S> {
                 schema_fields,
                 d.io_rows.clone(),
                 &mut iterator,
-                (cache && self.caches_queries()).then(|| cache_generation_for(&visibility, generation)).flatten(),
+                cache_generation,
                 visibility,
             )
             .await
@@ -5314,8 +5375,10 @@ impl<S: StorageIO> Table<S> {
         // Read before the scan, so a mutation that commits while it runs leaves
         // this query's cache entry stamped with a generation nobody will match.
         let generation = self.cache_generation();
+        let cache_generation = (cache && self.caches_queries()).then(|| cache_generation_for(&visibility, generation)).flatten();
 
-        let base_candidates = self.candidates_for(d, query, limit).await;
+        let base_candidates =
+            self.candidates_unless_cached(d, query, limit, cache_generation, order_by.is_some()).await;
         let n_slots = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
 
         // `ORDER BY` on a column that already ascends with slot position does
@@ -5357,7 +5420,7 @@ impl<S: StorageIO> Table<S> {
                     &mut iterator,
                     limit,
                     order_by.clone(),
-                    (cache && self.caches_queries()).then(|| cache_generation_for(&visibility, generation)).flatten(),
+                    cache_generation,
                     visibility.clone(),
                 )
                 .await?;
@@ -5572,11 +5635,14 @@ impl<S: StorageIO> Table<S> {
         // retired by a mutation that lands while it runs.
         let visibility = visibility.unwrap_or_else(|| self.read_visibility_for(reader));
         let generation = self.cache_generation();
+        let cache_generation = cache_generation_for(&visibility, generation).filter(|_| cache && self.caches_queries());
 
         let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
             .unwrap();
-        iterator.set_candidates(self.candidates_for(d, query, limit).await);
+        iterator.set_candidates(
+            self.candidates_unless_cached(d, query, limit, cache_generation, order_by.is_some()).await,
+        );
 
         let (bytes, overfetched) = self
             .concurrent_processor
@@ -5590,7 +5656,7 @@ impl<S: StorageIO> Table<S> {
                 &mut iterator,
                 limit,
                 order_by,
-                cache_generation_for(&visibility, generation).filter(|_| cache && self.caches_queries()),
+                cache_generation,
                 visibility,
             )
             .await?;
@@ -5658,11 +5724,12 @@ impl<S: StorageIO> Table<S> {
         // `query_row_bytes_reporting`, whose cache rule this shares.
         let visibility = visibility.unwrap_or_else(|| self.read_visibility_for(reader));
         let generation = self.cache_generation();
+        let cache_generation = cache_generation_for(&visibility, generation).filter(|_| cache && self.caches_queries());
 
         let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
             .unwrap();
-        iterator.set_candidates(self.candidates_for(d, query, None).await);
+        iterator.set_candidates(self.candidates_unless_cached(d, query, None, cache_generation, false).await);
 
         self.concurrent_processor
             .process_columns(
@@ -5673,7 +5740,7 @@ impl<S: StorageIO> Table<S> {
                 schema_fields,
                 d.io_rows.clone(),
                 &mut iterator,
-                cache_generation_for(&visibility, generation).filter(|_| cache && self.caches_queries()),
+                cache_generation,
                 visibility,
             )
             .await
@@ -6440,8 +6507,8 @@ impl<S: StorageIO> Table<S> {
             .and_then(|m| crate::core::rql::executor::RowMarker::for_table(&self.schema, &m));
         // Applied only after each batch's commit — see `PendingFilterOp`.
         let mut pending_filters: Vec<PendingFilterOp> = Vec::new();
-        // The checks that read an expression's result, which the statement
-        // could not judge before the rows were read.
+        // Every check the assignments can change the answer of, judged
+        // against each row as it will be stored.
         let row_checks =
             crate::core::rql::executor::UpdateRowChecks::compile(&self.schema, updates, expressions);
 

@@ -39,7 +39,10 @@ use crate::core::rql::join::UnionParts;
 /// was refused, and an integer column never learned of its `2.5`, which went
 /// out as NULL under the integer's description.
 pub fn constant_branch(branch: &str) -> Option<Vec<(Option<DbType>, u32)>> {
-    let text = branch.trim().trim_start_matches('(').trim_end_matches(')').trim();
+    // Without the parentheses around the whole branch, and only those: a
+    // list ending in a call (`SELECT 3, CAST(NULL AS numeric)`) lost the
+    // call's own, and was then no list this reads.
+    let text = crate::core::sql_scan::without_outer_parentheses(branch);
     if text.len() < 7 || !text.as_bytes()[..7].eq_ignore_ascii_case(b"SELECT ") {
         return None;
     }
@@ -50,7 +53,7 @@ pub fn constant_branch(branch: &str) -> Option<Vec<(Option<DbType>, u32)>> {
         }
     }
     let list = crate::core::rql::cte::without_set_quantifier(list);
-    Some(
+    let mut items: Vec<(Option<DbType>, u32)> =
         crate::core::rql::lexer_ct::split_definitions(list)
             .iter()
             .map(|item| {
@@ -59,7 +62,7 @@ pub fn constant_branch(branch: &str) -> Option<Vec<(Option<DbType>, u32)>> {
                     Some(at) => item[..at].trim(),
                     None => item,
                 };
-                if value.eq_ignore_ascii_case("NULL") {
+                if value.eq_ignore_ascii_case("NULL") || is_cast_null(value) {
                     (Some(DbType::NULL), 0)
                 } else if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") {
                     (Some(DbType::BOOL), 0)
@@ -80,8 +83,55 @@ pub fn constant_branch(branch: &str) -> Option<Vec<(Option<DbType>, u32)>> {
                     (None, 0)
                 }
             })
-            .collect(),
-    )
+            .collect();
+    // An item that computes its value (`round(2.567, 1)`, `1 + 1`,
+    // `upper('x')`): typed as the statement run alone types it, at the scale
+    // its one row is written at (`no_from`, which is what runs the branch).
+    // Unknown, it was refused beside a NUMERIC column ("of a type this
+    // cannot tell").
+    if items.iter().any(|(t, _)| t.is_none())
+        && let Some(Ok(select)) = crate::core::rql::no_from::parse(text)
+    {
+        let (columns, scales) = (select.columns(), select.scales());
+        if columns.len() == items.len() {
+            for (at, item) in items.iter_mut().enumerate() {
+                if item.0.is_none() {
+                    *item = (Some(columns[at].1.clone()), scales[at]);
+                }
+            }
+        }
+    }
+    Some(items)
+}
+
+/// Whether `value` is a NULL with a type written on it: `NULL::numeric`,
+/// `NULL::numeric(10,2)`, `CAST(NULL AS text)`. Its cells are NULL whatever
+/// the type, so beside a NUMERIC column it is the NULL branch a bare `NULL`
+/// is. It was an expression of unknown type, and `SELECT id, v FROM t EXCEPT
+/// SELECT 3, NULL::numeric` was refused for it.
+fn is_cast_null(value: &str) -> bool {
+    let value = value.trim();
+    let type_name = |text: &str| {
+        let text = text.trim();
+        !text.is_empty()
+            && text.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && text.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ' ' | '(' | ')' | ',' | '[' | ']' | '.'))
+    };
+    if let Some((null, ty)) = value.split_once("::") {
+        return null.trim().eq_ignore_ascii_case("NULL") && type_name(ty);
+    }
+    let Some(inner) = value
+        .get(..4)
+        .filter(|w| w.eq_ignore_ascii_case("CAST"))
+        .and_then(|_| value[4..].trim_start().strip_prefix('('))
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+    match crate::core::rql::join::find_keyword(inner, "AS", 0) {
+        Some(at) => inner[..at].trim().eq_ignore_ascii_case("NULL") && type_name(&inner[at + 2..]),
+        None => false,
+    }
 }
 
 /// Each output column's type in `branch`: as declared, else as its select
@@ -473,6 +523,188 @@ struct SortKey {
     nulls_first: bool,
 }
 
+/// The family a value's type belongs to, as far as a stored cell tells it:
+/// the types of one family combine in a set operation, as in PostgreSQL
+/// (`int` with `numeric`, `text` with `varchar`), and two families do not.
+/// `None` for a NULL and for a type this does not place.
+///
+/// `stored` is for a cell, whose type is the one it is carried as: a
+/// document, a bit string, `character(n)`, `bytea` and an array of a
+/// declared element type may each be carried as text, so there they are
+/// text. A column's declared type (`stored` false) tells them apart.
+fn type_family(t: &DbType, stored: bool) -> Option<u8> {
+    Some(match t {
+        DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::I128 => 1,
+        DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64 | DbType::U128 => 1,
+        DbType::F32 | DbType::F64 | DbType::DECIMAL => 1,
+        DbType::STRING | DbType::CHAR | DbType::BPCHAR(_) => 2,
+        DbType::BOOL => 3,
+        DbType::DATE => 4,
+        DbType::DATETIME | DbType::TIMESTAMP => 5,
+        DbType::TIME | DbType::TIMETZ => 6,
+        DbType::UUID => 7,
+        DbType::INTERVAL => 10,
+        DbType::INET => 11,
+        DbType::MACADDR | DbType::MACADDR8 => 12,
+        DbType::BYTEA => if stored { 2 } else { 8 },
+        DbType::ARRAY | DbType::ARRAYOF(_) => if stored { 2 } else { 9 },
+        DbType::JSON | DbType::JSONB | DbType::JSONTEXT => if stored { 2 } else { 13 },
+        DbType::BIT | DbType::VARBIT => if stored { 2 } else { 14 },
+        _ => return None,
+    })
+}
+
+/// The name of the operator before branch `branch`.
+fn operator_name(ops: &[crate::core::rql::join::SetKind], branch: usize) -> &'static str {
+    match branch.checked_sub(1).and_then(|at| ops.get(at)) {
+        Some(crate::core::rql::join::SetKind::Intersect) => "INTERSECT",
+        Some(crate::core::rql::join::SetKind::Except) => "EXCEPT",
+        _ => "UNION",
+    }
+}
+
+/// Refuses a set operation whose branches read columns of different
+/// families at one position, before a row is read: PostgreSQL's 42804,
+/// `UNION types text and bigint cannot be matched`. Only columns are judged
+/// here, by their declared types, which tell a `bytea`, a document and an
+/// array from text where their cells do not; everything else a branch can
+/// yield is judged on its cells ([`Combined::same_families`]).
+pub fn refuse_mismatched_columns(parts: &UnionParts, database: &Arc<Database>) -> Result<(), String> {
+    let declared: Vec<Vec<Option<DbType>>> =
+        parts.branches.iter().map(|b| crate::core::rql::cte::declared_item_types(b, database)).collect();
+    let ops: Vec<crate::core::rql::join::SetKind> = parts.ops.iter().map(|op| op.kind).collect();
+    let width = declared.iter().map(Vec::len).max().unwrap_or(0);
+    for position in 0..width {
+        let mut held: Option<(u8, &DbType)> = None;
+        for (branch, types) in declared.iter().enumerate() {
+            let Some(t) = types.get(position).and_then(Option::as_ref) else {
+                continue;
+            };
+            let Some(family) = type_family(t, false) else {
+                continue;
+            };
+            match held {
+                None => held = Some((family, t)),
+                Some((first_family, _)) if first_family == family => {}
+                // A date beside a timestamp is one family to PostgreSQL;
+                // said in its own words where the rows meet.
+                Some((4, _)) if family == 5 => {}
+                Some((5, _)) if family == 4 => {}
+                Some((_, first)) => {
+                    return Err(format!(
+                        "{} types {} and {} cannot be matched",
+                        operator_name(&ops, branch),
+                        type_display(first),
+                        type_display(t)
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A type's name as PostgreSQL writes it in "types … cannot be matched".
+fn type_display(t: &DbType) -> String {
+    crate::core::rql::catalog_model::format_type(i64::from(t.pg_oid()), None).unwrap_or_else(|| format!("{t}"))
+}
+
+/// The type name a string constant is cast to, to be read as `t`; `None`
+/// for text (it is one already) and for a type no constant is written for
+/// here.
+fn constant_cast(t: &DbType) -> Option<String> {
+    Some(
+        match t {
+            DbType::I8 | DbType::I16 => "smallint",
+            DbType::I32 => "integer",
+            DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 => "bigint",
+            DbType::F32 => "real",
+            DbType::F64 => "double precision",
+            DbType::DECIMAL | DbType::I128 | DbType::U64 | DbType::U128 => "numeric",
+            DbType::BOOL => "boolean",
+            DbType::DATE => "date",
+            DbType::DATETIME => "timestamptz",
+            DbType::TIMESTAMP => "timestamp",
+            DbType::TIME => "time",
+            DbType::TIMETZ => "timetz",
+            DbType::UUID => "uuid",
+            DbType::BYTEA => "bytea",
+            DbType::INTERVAL => "interval",
+            DbType::INET => "inet",
+            DbType::JSON | DbType::JSONB => "jsonb",
+            DbType::JSONTEXT => "json",
+            DbType::ARRAY => "text[]",
+            // An array of a declared element type, when the element has a
+            // name here.
+            DbType::ARRAYOF(code) => {
+                return match DbType::from_byte(*code) {
+                    DbType::STRING => Some("text[]".to_string()),
+                    element => constant_cast(&element).filter(|name| !name.ends_with(']')).map(|name| format!("{name}[]")),
+                };
+            }
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+/// A string constant in a branch's select list, beside a column the
+/// branches before it type as something other than text, written with that
+/// type: `SELECT d FROM t UNION ALL SELECT '2026-05-05'` reads the constant
+/// as a date, as PostgreSQL resolves an untyped constant to its column's
+/// type. Read as text it was a date of garbage, `'false'` was true, and a
+/// uuid or a timestamp was NULL, each with no error.
+///
+/// Only a branch after the first: the first one's types are what the
+/// statement is described by.
+pub fn type_string_constants(parts: &mut UnionParts, database: &Arc<Database>) {
+    use crate::core::rql::join::find_keyword;
+    let types: Vec<Vec<Option<DbType>>> =
+        parts.branches.iter().enumerate().map(|(at, b)| branch_types(b, database, &[], at > 0)).collect();
+    for at in 1..parts.branches.len() {
+        // The branch's select list, and where it is in the branch.
+        let branch = parts.branches[at].as_str();
+        let Some(list) = crate::core::rql::cte::select_list_of(branch) else {
+            continue;
+        };
+        if !list.contains('\'') {
+            continue;
+        }
+        let start = list.as_ptr() as usize - branch.as_ptr() as usize;
+        let mut changed = false;
+        let items: Vec<String> = crate::core::rql::lexer_ct::split_definitions(list)
+            .iter()
+            .enumerate()
+            .map(|(position, item)| {
+                let item = item.trim();
+                let (value, alias) = match find_keyword(item, "AS", 0) {
+                    Some(as_at) => (item[..as_at].trim(), &item[as_at..]),
+                    None => (item, ""),
+                };
+                let constant = value.len() >= 2
+                    && value.starts_with('\'')
+                    && value.ends_with('\'')
+                    && !value[1..value.len() - 1].replace("''", "").contains('\'');
+                // The column's type: the first branch before this one that
+                // knows it.
+                let target = types[..at].iter().find_map(|b| b.get(position).cloned().flatten().filter(|t| *t != DbType::NULL));
+                match target.as_ref().filter(|_| constant).and_then(constant_cast) {
+                    Some(name) => {
+                        changed = true;
+                        format!("{value}::{name} {alias}").trim_end().to_string()
+                    }
+                    None => item.to_string(),
+                }
+            })
+            .collect();
+        if changed {
+            parts.branches[at] = format!("{} {} {}", &branch[..start].trim_end(), items.join(", "), branch[start + list.len()..].trim_start())
+                .trim_end()
+                .to_string();
+        }
+    }
+}
+
 /// The rows of a `UNION` as its branches arrive.
 pub struct Combined {
     /// What the caller wants before the rows (the result marker), then each
@@ -497,6 +729,13 @@ pub struct Combined {
     sort: Vec<SortKey>,
     limit: Option<u64>,
     offset: u64,
+    /// The operator before each branch after the first, for its name.
+    ops: Vec<crate::core::rql::join::SetKind>,
+    /// Which branches have no `FROM`.
+    constant: Vec<bool>,
+    /// Each output column's family, the type that set it, and whether that
+    /// was a string constant ([`Combined::same_families`]).
+    families: Vec<Option<(u8, DbType, bool)>>,
 }
 
 impl Combined {
@@ -528,7 +767,79 @@ impl Combined {
             sort,
             limit: parts.limit,
             offset: parts.offset,
+            ops: parts.ops.iter().map(|op| op.kind).collect(),
+            constant: parts.branches.iter().map(|b| constant_branch(b).is_some()).collect(),
+            families: Vec::new(),
         })
+    }
+
+    /// Refuses a branch whose values are of another family than the column
+    /// already holds: PostgreSQL's 42804, `UNION types text and bigint
+    /// cannot be matched`. Such a column was answered: a bigint under a
+    /// text description went out blank, a text under an integer's as NULL,
+    /// an integer under a date's as a date of garbage, and `SELECT name …
+    /// UNION ALL SELECT big …` lost the row, each with no error.
+    ///
+    /// Judged on the cells, which is what a `*`, a join and an expression
+    /// have in common with a column, and read only until each column of the
+    /// branch has shown a value (its first row, unless that holds NULLs).
+    /// PostgreSQL refuses before reading a row; this one refuses when a row
+    /// of the second family arrives.
+    fn same_families(&mut self, rows: &[u8], branch: usize) -> Result<(), String> {
+        let read = |e: std::io::Error| format!("a set operation's rows could not be read: {}", e);
+        let constant = self.constant.get(branch).copied().unwrap_or(false);
+        let mut shown: Vec<bool> = Vec::new();
+        for row in serialized_rows(rows) {
+            let row = row.map_err(read)?;
+            for (position, cell) in serialized_cells(row).map_err(read)?.enumerate() {
+                let cell = cell.map_err(read)?;
+                if shown.len() <= position {
+                    shown.resize(position + 1, false);
+                }
+                if shown[position] || cell.column_type == DbType::NULL {
+                    continue;
+                }
+                shown[position] = true;
+                let Some(family) = type_family(&cell.column_type, true) else {
+                    continue;
+                };
+                if self.families.len() <= position {
+                    self.families.resize(position + 1, None);
+                }
+                let literal = constant && family == 2;
+                let Some((held, first, first_literal)) = self.families[position].clone() else {
+                    self.families[position] = Some((family, cell.column_type.clone(), literal));
+                    continue;
+                };
+                if held == family {
+                    continue;
+                }
+                let op = operator_name(&self.ops, branch);
+                // A string constant is read as its column's type by
+                // PostgreSQL; where that is not done here it is said so.
+                if literal || first_literal {
+                    let other = if literal { &first } else { &cell.column_type };
+                    return Err(format!(
+                        "a string constant in the first branch of a {op}, beside a column of type {}, is not supported: \
+                         write it with its type ('…'::{})",
+                        type_display(other),
+                        constant_cast(other).unwrap_or_else(|| "type".to_string())
+                    ));
+                }
+                // One family to PostgreSQL, which makes the date a
+                // timestamp; the two are not converted here.
+                if (held == 4 && family == 5) || (held == 5 && family == 4) {
+                    return Err(format!(
+                        "a {op} of a date and a timestamp is not supported yet: cast the date (d::timestamp) in its branch"
+                    ));
+                }
+                return Err(format!("{op} types {} and {} cannot be matched", type_display(&first), type_display(&cell.column_type)));
+            }
+            if !shown.is_empty() && shown.iter().all(|s| *s) {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// True when no later branch can change the answer: with no sort, the
@@ -551,6 +862,7 @@ impl Combined {
     /// one already kept; the branches for which it is set must come first.
     /// `branch` is its position among the UNION's branches.
     pub fn push(&mut self, rows: &[u8], distinct: bool, branch: usize) -> Result<(), String> {
+        self.same_families(rows, branch)?;
         let rescale = self.rescale.as_ref().and_then(|r| r.get(branch)).map(Vec::as_slice);
         let mut key = Vec::new();
         for row in serialized_rows(rows) {
@@ -601,6 +913,9 @@ impl Combined {
     pub fn push_set_ops(&mut self, parts: &UnionParts, leaves: &[Vec<u8>]) -> Result<(), String> {
         use crate::core::rql::join::SetKind;
         let read = |e: std::io::Error| format!("a set operation's rows could not be read: {}", e);
+        for (branch, bytes) in leaves.iter().enumerate() {
+            self.same_families(bytes, branch)?;
+        }
         let mut sets: Vec<Vec<SetRow<'_>>> = Vec::with_capacity(leaves.len());
         for (branch, bytes) in leaves.iter().enumerate() {
             let rescale = self.rescale.as_ref().and_then(|r| r.get(branch)).map(Vec::as_slice);
@@ -762,7 +1077,32 @@ fn union_rows<'a>(mut a: Vec<SetRow<'a>>, b: Vec<SetRow<'a>>, all: bool) -> Vec<
 
 /// `a INTERSECT [ALL] b`: each row of `a` that `b` has, once; or as many
 /// times as both have it.
+///
+/// Rows equal under the set operation can still print differently — 2.25
+/// and 2.2500 are one NUMERIC — and PostgreSQL shows the row of whichever
+/// input its plan reads first. For INTERSECT that is the input with fewer
+/// distinct rows (by its estimate of the groups; the left on a tie), so a
+/// matched row here is that side's, in `a`'s order. Keeping `a`'s always
+/// printed 2.25 where PostgreSQL prints the one-row constant branch's
+/// 2.2500. Counted here, where PostgreSQL estimates: a VALUES list, which it
+/// has no statistics for, it takes to have as many groups as rows.
 fn intersect_rows<'a>(a: Vec<SetRow<'a>>, b: Vec<SetRow<'a>>, all: bool) -> Vec<SetRow<'a>> {
+    let groups = |rows: &[SetRow<'a>]| rows.iter().map(|r| &r.key).collect::<std::collections::HashSet<_>>().len();
+    if groups(&b) < groups(&a) {
+        let mut from_b: std::collections::HashMap<Vec<u8>, std::collections::VecDeque<SetRow<'a>>> =
+            std::collections::HashMap::with_capacity(b.len());
+        for r in b {
+            from_b.entry(r.key.clone()).or_default().push_back(r);
+        }
+        return a
+            .into_iter()
+            .filter_map(|r| {
+                let rows = from_b.get_mut(&r.key)?;
+                // Without ALL a key is taken once: its entry goes with it.
+                if all { rows.pop_front() } else { from_b.remove(&r.key).and_then(|mut rows| rows.pop_front()) }
+            })
+            .collect();
+    }
     let mut counts = key_counts(&b);
     let mut seen = std::collections::HashSet::new();
     a.into_iter()
@@ -1068,6 +1408,30 @@ fn duplicate_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_branch_with_no_from_is_typed_item_by_item() {
+        // Constants as PostgreSQL types them, a typed NULL as a NULL.
+        assert_eq!(
+            constant_branch("SELECT 3, 1.50, 'x', NULL, NULL::numeric, CAST(NULL AS text)"),
+            Some(vec![
+                (Some(DbType::I32), 0),
+                (Some(DbType::DECIMAL), 2),
+                (Some(DbType::STRING), 0),
+                (Some(DbType::NULL), 0),
+                (Some(DbType::NULL), 0),
+                (Some(DbType::NULL), 0)
+            ])
+        );
+        // An item that computes its value is typed as the statement types
+        // it: it was unknown, and refused beside a NUMERIC column.
+        let computed = constant_branch("(SELECT 9, round(2.567, 1), upper('x'))").expect("a branch with no FROM");
+        assert_eq!(computed[0], (Some(DbType::I32), 0));
+        assert_eq!(computed[1].0, Some(DbType::DECIMAL));
+        assert_eq!(computed[2].0, Some(DbType::STRING));
+        // A branch that reads a relation is not one.
+        assert_eq!(constant_branch("SELECT id, round(v, 1) FROM t"), None);
+    }
     use crate::core::row::row::{Column, Row};
 
     fn cell(schema_id: u32, ty: DbType, data: &[u8]) -> Column {

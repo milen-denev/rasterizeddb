@@ -1997,7 +1997,7 @@ impl PartitionedTable {
             let declared = epoch.map.len();
             let (routed, why) = match route {
                 None => (1, format!("routed by the bound value of {}", self.key_names())),
-                Some(Route::Zero) => (0, "the WHERE clause is constant false".to_string()),
+                Some(Route::Zero) => (0, "no row can match the WHERE clause".to_string()),
                 Some(route @ Route::Points(_)) => (route.pids(&epoch.map).len(), format!("routed by {}", self.key_names())),
                 Some(Route::All) if where_clause.trim().is_empty() => (declared, "no WHERE clause".to_string()),
                 Some(Route::All) => (declared, format!("the WHERE clause does not pin {}", self.key_names())),

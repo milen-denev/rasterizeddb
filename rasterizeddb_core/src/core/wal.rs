@@ -954,6 +954,13 @@ impl Wal {
         self.durable.load(Ordering::Acquire)
     }
 
+    /// How many callers have come to take a sync (`commit_through`'s slow
+    /// path), for a test that counts the syncs a statement costs.
+    #[cfg(test)]
+    pub(crate) fn sync_arrivals_for_tests(&self) -> u64 {
+        self.gate_arrivals.load(Ordering::Acquire)
+    }
+
     /// Associates a data file's id with its path so replay can find it.
     ///
     /// Registering the path an id already has is a no-op. A *different* path

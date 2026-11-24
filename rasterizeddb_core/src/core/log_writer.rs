@@ -73,8 +73,20 @@ fn spawn_once() {
     if STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
+    // Cleared when the task ends, which is when its runtime shuts down: an
+    // embedding process that stops an engine and starts another has a new
+    // runtime, and the next registration must start a writer there. Left
+    // set, the flag kept a dead task "started", and an asynchronous commit
+    // was never synced by the writer again.
+    struct Running;
+    impl Drop for Running {
+        fn drop(&mut self) {
+            STARTED.store(false, Ordering::Release);
+        }
+    }
     // A runtime is guaranteed here: databases are opened from async code.
     tokio::spawn(async move {
+        let _running = Running;
         loop {
             let delay = Duration::from_millis(crate::wal_writer_delay_ms());
             tokio::time::sleep(delay).await;

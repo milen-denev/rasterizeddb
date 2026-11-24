@@ -337,11 +337,20 @@ async fn run(sql: &str, handle: &super::KvCacheHandle) -> Result<Vec<Vec<Cell>>,
                 return Err("KV PUBSUB supports CHANNELS and NUMPAT".into());
             }
         }
-        _ if spec.is(SERVER) => super::server::run(spec, handle, 0, &refs, &mut out),
+        // A write on a replicating node is recorded for the peers.
+        _ if spec.is(SERVER) => match spec.is(commands::WRITE).then(|| super::repl::capturing(handle)).flatten() {
+            Some(replication) => super::repl::run_server_write(replication, handle, 0, spec, &refs, &mut out),
+            None => super::server::run(spec, handle, 0, &refs, &mut out),
+        },
         _ => {
             let store = handle.db(0);
-            let mut access = Direct::new(store);
-            commands::run(spec, &mut access, &refs, &mut out);
+            match spec.is(commands::WRITE).then(|| super::repl::capturing(handle)).flatten() {
+                Some(replication) => super::repl::run_write(replication, store, 0, spec, &refs, &mut out),
+                None => {
+                    let mut access = Direct::new(store);
+                    commands::run(spec, &mut access, &refs, &mut out);
+                }
+            }
         }
     }
     rows_of(out.take(), shape, binary)

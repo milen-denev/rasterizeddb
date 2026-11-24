@@ -165,7 +165,9 @@ async fn a_partitioned_table_rewrites_every_partition() {
     run(&c, "ALTER TABLE pu ALTER COLUMN v TYPE INT USING v::int + k").await;
     assert_eq!(rows(&c, "SELECT count(*), sum(v) FROM pu").await, ["60|5610"]);
     assert_eq!(rows(&c, "SELECT v FROM pu WHERE k = 2 AND id = 7").await, ["23"]);
-    assert_eq!(code(&c, "ALTER TABLE pu ALTER COLUMN k TYPE BIGINT USING k + 1").await, "0A000");
+    // A partition key column's type: PostgreSQL's 42P16 ("cannot alter
+    // column … because it is part of the partition key").
+    assert_eq!(code(&c, "ALTER TABLE pu ALTER COLUMN k TYPE BIGINT USING k + 1").await, "42P16");
     run(&c, "ALTER TABLE pu ALTER COLUMN id TYPE BIGINT USING id * 2").await;
     assert_eq!(rows(&c, "SELECT k, id, v FROM pu WHERE k = 2 AND id = 14").await, ["2|14|23"]);
     assert_eq!(rows(&c, "SELECT count(*) FROM pu WHERE k = 2").await, ["12"]);

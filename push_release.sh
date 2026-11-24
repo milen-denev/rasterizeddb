@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# push_release.sh: cut a release through a pull request into main.
+# push_release.sh: cut a release: dev -> pull request into release -> main.
+#
+# Branches: work lands on `dev`; `release` holds exactly what was released,
+# and `main`, the GitHub default, follows `release` by fast-forward only.
+# Nothing else lives on the remote except this script's short-lived
+# `release-pr/<tag>` branch, deleted once its pull request is merged.
 #
 #   ./push_release.sh client   <bump>    client crates      -> client-vX.Y.Z
 #   ./push_release.sh server   <bump>    server crates      -> server-vX.Y.Z and vX.Y.Z
@@ -11,7 +16,11 @@
 # that is already tagged or on crates.io is always refused.
 #
 # Options:
-#   --from <branch>   branch to release from (default: $RELEASE_SOURCE or feat/secondary-indexes)
+#   --from <branch>   branch to release from (default: $RELEASE_SOURCE or dev)
+#   --embedded <major|minor|patch|current|X.Y.Z>
+#                     server channel: the rasterizeddb_embedded version, when the
+#                     SDK moves differently from the engine (default: the same
+#                     bump as the server, applied to the SDK's own version)
 #   --rastcp <keep|major|minor|patch|X.Y.Z>
 #                     what to do with the shared rastcp crate (default: bump it a
 #                     patch when it changed since the last crate release and its
@@ -26,26 +35,31 @@
 #      git worktree, so your checkout is never touched.
 #   2. Bumps the channel's crate versions, the version requirements that point
 #      at them, and README pins; refreshes Cargo.lock; commits on a new branch
-#      release/<first tag>.
-#   3. Opens a pull request from that branch into main and waits for every
+#      release-pr/<first tag>.
+#   3. Opens a pull request from that branch into release and waits for every
 #      check. If one fails it stops and leaves the pull request open.
 #   4. Merges the pull request (a merge commit, only if the head is still the
-#      commit it tested), then brings the version commit back to <from>:
-#      a fast-forward when <from> has not moved, a merge commit otherwise.
-#   5. Tags the merge commit on main and pushes the tags in channel order. The
+#      commit it tested) and fast-forwards main to it: the checks already ran
+#      on exactly that commit, so main gets no pull request and no second CI
+#      run. Then it brings the version commit back to <from>: a fast-forward
+#      when <from> has not moved, a merge commit otherwise.
+#   5. Tags the merge commit and pushes the tags in channel order. The
 #      server crates need the client version on crates.io, so `all` waits for
 #      the client release before pushing the server tags.
 #   6. Waits for the release workflows and prints the GitHub release links.
 #
 # Each channel has its own version. The client channel owns
 # rasterizeddb_client and rasterizeddb_client_derive; the server channel owns
-# rasterizeddb_core and rasterizeddb_embedded, and the executables (vX.Y.Z)
-# carry the core version. rastcp is shared: whichever channel publishes first
-# publishes it.
+# rasterizeddb_core and rasterizeddb_embedded. The server tags (server-vX.Y.Z,
+# vX.Y.Z) and the executables carry the core version; the embedded SDK has its
+# own (--embedded), which the server release publishes beside the core. rastcp
+# is shared: whichever channel publishes first publishes it.
 set -euo pipefail
 
-SOURCE="${RELEASE_SOURCE:-feat/secondary-indexes}"
-BASE="main"
+SOURCE="${RELEASE_SOURCE:-dev}"
+BASE="release"
+# Follows BASE by fast-forward after each release.
+PUBLISHED="main"
 REMOTE="origin"
 CLIENT_CRATES=(rasterizeddb_client rasterizeddb_client_derive)
 SERVER_CRATES=(rasterizeddb_core rasterizeddb_embedded)
@@ -74,10 +88,11 @@ if [ "$CHANNEL" != binaries ]; then
   BUMP="${1:-}"; [ $# -gt 0 ] && shift
   [ -n "$BUMP" ] || die "$CHANNEL needs a bump: major, minor, patch, current or an explicit X.Y.Z"
 fi
-RASTCP_BUMP="auto"; RC=0; DRY_RUN=0; WAIT=1; YES=0
+RASTCP_BUMP="auto"; EMBEDDED_BUMP=""; RC=0; DRY_RUN=0; WAIT=1; YES=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --from) SOURCE="${2:?--from needs a branch}"; shift 2 ;;
+    --embedded) EMBEDDED_BUMP="${2:?--embedded needs major, minor, patch, current or X.Y.Z}"; shift 2 ;;
     --rastcp) RASTCP_BUMP="${2:?--rastcp needs keep, major, minor, patch or X.Y.Z}"; shift 2 ;;
     --rc) RC=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -87,6 +102,7 @@ while [ $# -gt 0 ]; do
     *) die "unknown option '$1'" ;;
   esac
 done
+[ -z "$EMBEDDED_BUMP" ] || [ "$CHANNEL" = server ] || [ "$CHANNEL" = all ] || die "--embedded is for the server and all channels"
 [ "$RC" = 0 ] || [ "$CHANNEL" = binaries ] || die "--rc is for the binaries channel only: crates.io gets exactly the Cargo.toml version"
 
 # ---------------------------------------------------------------- helpers
@@ -196,7 +212,7 @@ fi
 
 declare -A OLD=() NEW=()   # crate -> version, for the crates whose version changes
 TAGS=()
-CLIENT_VER=""; SERVER_VER=""
+CLIENT_VER=""; SERVER_VER=""; EMBEDDED_VER=""
 CORE_NOW="$(version_at "$SRC" rasterizeddb_core)"
 
 if [ "$CHANNEL" = client ] || [ "$CHANNEL" = all ]; then
@@ -210,9 +226,18 @@ if [ "$CHANNEL" = client ] || [ "$CHANNEL" = all ]; then
 fi
 if [ "$CHANNEL" = server ] || [ "$CHANNEL" = all ]; then
   SERVER_VER="$(next_version "$CORE_NOW" "$BUMP")"
+  embedded_now="$(version_at "$SRC" rasterizeddb_embedded)"
+  if [ -n "$EMBEDDED_BUMP" ]; then
+    EMBEDDED_VER="$(next_version "$embedded_now" "$EMBEDDED_BUMP")"
+  elif [[ "$BUMP" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && [ "$embedded_now" != "$CORE_NOW" ]; then
+    die "rasterizeddb_embedded is $embedded_now and rasterizeddb_core $CORE_NOW: with an explicit server version, name the SDK's too (--embedded X.Y.Z or a bump)"
+  else
+    EMBEDDED_VER="$(next_version "$embedded_now" "$BUMP")"
+  fi
   for c in "${SERVER_CRATES[@]}"; do
     o="$(version_at "$SRC" "$c")"
-    if [ "$o" != "$SERVER_VER" ]; then OLD[$c]="$o"; NEW[$c]="$SERVER_VER"; fi
+    want="$SERVER_VER"; [ "$c" = rasterizeddb_embedded ] && want="$EMBEDDED_VER"
+    if [ "$o" != "$want" ]; then OLD[$c]="$o"; NEW[$c]="$want"; fi
   done
   TAGS+=("server-v$SERVER_VER" "v$SERVER_VER")
   if [ "$CHANNEL" = server ]; then
@@ -269,11 +294,11 @@ if [ -n "$CLIENT_VER" ]; then
   done
 fi
 if [ -n "$SERVER_VER" ]; then
-  for c in "${SERVER_CRATES[@]}"; do
-    if on_crates_io "$c" "$SERVER_VER"; then die "$c $SERVER_VER is already on crates.io; bump it"; fi
-  done
+  if on_crates_io rasterizeddb_core "$SERVER_VER"; then die "rasterizeddb_core $SERVER_VER is already on crates.io; bump it"; fi
+  if on_crates_io rasterizeddb_embedded "$EMBEDDED_VER"; then die "rasterizeddb_embedded $EMBEDDED_VER is already on crates.io; bump it (--embedded)"; fi
 fi
-BRANCH="release/${TAGS[0]}"
+# Not release/<tag>: a branch named `release` rules out any release/... ref.
+BRANCH="release-pr/${TAGS[0]}"
 # A run that stopped (a failed check, Ctrl+C) leaves its branch and pull
 # request behind. A rerun takes both over: the branch is this script's own,
 # so it is moved to the new head (with a lease on the commit seen here), and
@@ -291,11 +316,11 @@ else
   note "no version change"
 fi
 [ -n "$CLIENT_VER" ] && note "client crates release $CLIENT_VER"
-[ -n "$SERVER_VER" ] && note "server crates and executables release $SERVER_VER"
+[ -n "$SERVER_VER" ] && note "server crates release rasterizeddb_core $SERVER_VER and rasterizeddb_embedded $EMBEDDED_VER; executables $SERVER_VER"
 [ "$CHANNEL" = binaries ] && note "executables of rasterizeddb_core $CORE_NOW"
 true
 note "tags:   ${TAGS[*]}"
-note "flow:   $BRANCH -> pull request into $BASE -> checks -> merge -> tags on $BASE -> back into $SOURCE"
+note "flow:   $BRANCH -> pull request into $BASE -> checks -> merge -> $PUBLISHED fast-forwarded -> tags -> back into $SOURCE"
 if [ -n "$OLD_BRANCH_SHA" ]; then
   note "rerun:  $BRANCH exists on $REMOTE at ${OLD_BRANCH_SHA:0:8}; it is moved to the new head${OPEN_PR:+ and pull request #$OPEN_PR is reused}"
 fi
@@ -498,6 +523,20 @@ git push --quiet "$REMOTE" --delete "$BRANCH" 2>/dev/null || true
 git fetch --quiet "$REMOTE" "+refs/heads/$BASE:refs/remotes/$REMOTE/$BASE" "+refs/heads/$SOURCE:refs/remotes/$REMOTE/$SOURCE"
 git merge-base --is-ancestor "$MERGE_SHA" "$REMOTE/$BASE" || die "$MERGE_SHA is not on $REMOTE/$BASE"
 
+# ---------------------------------------------------------------- main follows release
+
+step "$PUBLISHED fast-forwarded to $BASE"
+git fetch --quiet "$REMOTE" "+refs/heads/$PUBLISHED:refs/remotes/$REMOTE/$PUBLISHED"
+if git merge-base --is-ancestor "$MERGE_SHA" "$REMOTE/$PUBLISHED"; then
+  note "$PUBLISHED already has $(git rev-parse --short "$MERGE_SHA")"
+elif git merge-base --is-ancestor "$REMOTE/$PUBLISHED" "$MERGE_SHA"; then
+  git push --quiet "$REMOTE" "$MERGE_SHA:refs/heads/$PUBLISHED" \
+    || die "could not fast-forward $PUBLISHED (branch protection?); nothing was tagged. Push $MERGE_SHA to $PUBLISHED, then rerun"
+  note "$PUBLISHED is at $(git rev-parse --short "$MERGE_SHA")"
+else
+  die "$PUBLISHED has commits that $BASE does not; only releases may reach $PUBLISHED. Nothing was tagged: merge $PUBLISHED into $SOURCE, then rerun"
+fi
+
 # ---------------------------------------------------------------- back into the source branch
 
 if [ ${#NEW[@]} -gt 0 ]; then
@@ -527,7 +566,7 @@ fi
 
 # ---------------------------------------------------------------- tags
 
-step "Tags on $BASE"
+step "Tags on $BASE (and $PUBLISHED)"
 for tag in "${TAGS[@]}"; do
   # The server crates need the client version on crates.io.
   if [ -n "$CLIENT_VER" ] && [ "$tag" = "server-v$SERVER_VER" ]; then

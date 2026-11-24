@@ -1,9 +1,9 @@
 # Key/Value Storage Backend — Design & Operation
 
-Status: **implemented and selectable per table, off by default.** Build with
-`--features kv_storage` (in-process and local-directory stores) or
-`--features kv_storage_s3` (adds the S3 backing store). Per-table placement is a
-`storage_pools` location, so `kv_storage` turns that feature on too.
+Status: **implemented and selectable per table**, in the default build:
+`kv_storage` (in-process and local-directory stores) and `kv_storage_s3` (adds
+the S3 backing store). A table uses it only once it is placed on it. Per-table
+placement is a `storage_pools` location, so `kv_storage` turns that feature on too.
 Target: `rasterizeddb_core::core::storage_providers::kv`, edition 2024.
 
 ## 0. What exists
@@ -25,9 +25,10 @@ Target: `rasterizeddb_core::core::storage_providers::kv`, edition 2024.
 | Compaction, delta retirement, recovery | **Done.** §4.4, §4.5 |
 | `create_temp` / `swap_temp` without a rename | **Done.** §4.6 |
 
-Not done: a multi-writer lease (§8) and a local disk cache tier (§5). Backup and
-the free-space policy deliberately do **not** cover a key/value table — see §9.
-Relocation does, but as a conversion rather than a directory move.
+Not done: a multi-writer lease (§8) and a local disk cache tier (§5). A backup
+copies a key/value table as of each snapshot, with no point-in-time replay; the
+free-space policy does not cover one; relocation does, as a conversion rather
+than a directory move — see §9.
 
 ## 1. Why an object store needs a different layout
 

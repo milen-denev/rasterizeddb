@@ -12,7 +12,7 @@ native protocol, without compiling the engine.
   that return what was stored, relations loaded without N+1, aggregates,
   keyset pages and streams, optimistic locking, server timestamps, soft
   delete, hooks, partitioned tables, a read-through cache and atomic bulk
-  updates, on a client or (coming) inside a transaction.
+  updates, on a client or inside a transaction.
 - **Migrations**: steps, baselines and rollbacks, with tables kept in sync
   with their structs. They can run when the client connects (`auto_migrate`).
 - **Key/value**: the server's Redis-compatible cache, typed, with closure

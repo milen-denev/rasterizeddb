@@ -4,6 +4,8 @@ pub mod index_checkpoint;
 #[cfg(test)]
 mod catalogue_present_tests;
 #[cfg(test)]
+mod cached_clause_candidates_tests;
+#[cfg(test)]
 mod incarnation_tests;
 #[cfg(test)]
 mod native_authz_tests;
@@ -33,6 +35,7 @@ mod create_intent;
 #[cfg(test)]
 mod create_failure_tests;
 mod foreign_keys;
+pub(crate) use foreign_keys::create_table_primary_key;
 pub(crate) mod partitioned;
 mod partitioned_ddl;
 #[cfg(test)]
@@ -57,6 +60,11 @@ mod row_move_tests;
 mod physical_alter_tests;
 #[cfg(test)]
 mod convert_tests;
+#[cfg(test)]
+mod partition_refusal_codes_tests;
+// Places one table on a key/value store (`core::storage`).
+#[cfg(all(test, feature = "kv_storage"))]
+mod path_index_pruning_tests;
 pub mod relation;
 pub mod slots;
 pub mod table_for;
@@ -176,10 +184,13 @@ pub struct NativeListen {
     /// A unix socket served alongside the TCP address, for clients on the
     /// same machine. `None` serves TCP only.
     pub socket: Option<NativeSocket>,
-    /// How long one request may run before it is abandoned and answered as
-    /// timed out, on both the TCP address and the socket; a connection idle
-    /// this long is also closed. `None` is rastcp's default, 30 s.
-    /// `--rdb-request-timeout`.
+    /// How long one statement may run before it is stopped and answered
+    /// with an error (SQLSTATE 57014, as PostgreSQL's `statement_timeout`),
+    /// on both the TCP address and the socket; the connection, and a
+    /// transaction block on it, survive (the block is failed, as a failed
+    /// statement fails it). A connection idle this long is closed. `None`
+    /// is rastcp's default, 30 s. Inside a block, `SET statement_timeout`
+    /// replaces it for the rest of the block. `--rdb-request-timeout`.
     pub request_timeout: Option<std::time::Duration>,
     /// The TCP listener's certificate chain and private key, as PEM file
     /// paths (`--rdb-cert`, `--rdb-key`). `None` makes a self-signed
@@ -289,7 +300,11 @@ async fn bind_native_listener(
     let mut last_error = None;
 
     for attempt in 1..=BIND_ATTEMPTS {
-        let mut builder = TcpServerBuilder::new(&listen.addr, listen.port);
+        // The listener waits for every answer: a statement bounds itself
+        // (`NativeContext::statement_timeout`) and answers 57014, where a
+        // rastcp timeout would drop it mid-way and, on a `rastcp/1`
+        // connection, close the connection and roll back its block.
+        let mut builder = TcpServerBuilder::new(&listen.addr, listen.port).handler_timeout(None);
         if let Some(timeout) = listen.request_timeout {
             builder = builder.request_timeout(timeout);
         }
@@ -1412,6 +1427,9 @@ pub struct Database {
     /// changed only with the slot it mirrors, under this lock. Named only in
     /// `slots.rs`.
     fk_reverse: parking_lot::RwLock<slots::FkReverse>,
+    /// Some table has been filed in [`Self::fk_reverse`] with a foreign key
+    /// onto itself (`Database::may_reference_itself`). Set only in `slots.rs`.
+    fk_onto_itself: std::sync::atomic::AtomicBool,
     /// Names a CREATE or a partitioned DROP is working on (see
     /// [`Database::claim_name`]).
     name_claims: DashMap<String, (), ahash::RandomState>,
@@ -1922,6 +1940,18 @@ impl Database {
             // the flag): fenced before anything touches the table, so an
             // older binary is refused this directory rather than misreading it.
             if !in_memory {
+                if let Err(e) =
+                    incompat::fence_composite_foreign_keys(std::path::Path::new(location), &table.schema.foreign_keys)
+                {
+                    error!(
+                        "table '{}' is left unopened: it holds a composite foreign key and the directory could not \
+                         be marked for it ({}): {}",
+                        table_name,
+                        incompat::COMPOSITE_FOREIGN_KEY_V1,
+                        e
+                    );
+                    continue;
+                }
                 if let Err(e) = incompat::fence_numeric_own_scale(std::path::Path::new(location), &table.schema.fields) {
                     error!(
                         "table '{}' is left unopened: it keeps NUMERIC values at their own scale and the \
@@ -1968,6 +1998,7 @@ impl Database {
         // Every leftover's files are reaped by now; their placements go too.
         pool_forget_statement_relations(&storage);
 
+        let replication = StdArc::new(crate::replication::Replication::new());
         let database = Database {
             #[cfg(test)]
             legacy_numeric_slot: std::sync::atomic::AtomicBool::new(false),
@@ -1983,6 +2014,7 @@ impl Database {
             table_slots,
             partitioned_tables: DashMap::with_hasher(ahash::RandomState::new()),
             fk_reverse: parking_lot::RwLock::new(slots::FkReverse::default()),
+            fk_onto_itself: std::sync::atomic::AtomicBool::new(false),
             name_claims: DashMap::with_hasher(ahash::RandomState::new()),
             partition_ddl: tokio::sync::Mutex::new(()),
             partition_maintenance: crate::core::partition::maintenance::Scheduler::new(),
@@ -2001,7 +2033,7 @@ impl Database {
             },
             schema_generation: StdArc::new(std::sync::atomic::AtomicU64::new(0).into()),
             shape_epoch: std::sync::atomic::AtomicU64::new(0).into(),
-            replication: StdArc::new(crate::replication::Replication::new()),
+            replication: replication.clone(),
             location: (!in_memory).then(|| location.to_string()),
             storage,
             kv: kv_stores,
@@ -2014,6 +2046,8 @@ impl Database {
             kv_cache: {
                 let handle = crate::core::kv_cache::KvCacheHandle::new((!in_memory).then_some(location));
                 handle.load_snapshot_if_present();
+                // Its writes travel on this database's replication stream.
+                handle.attach_replication(replication.clone());
                 handle
             },
         };
@@ -2418,6 +2452,74 @@ impl Database {
     /// through the executor, which would make the two futures mutually
     /// recursive if this one were awaited.
     pub fn start_replication(database: Arc<Database>) -> io::Result<()> {
+        // The served catalogue's default database (a `REPLICATION ENABLE` on
+        // it) starts every database, as `--replication` does.
+        let catalog = catalog::served_by_default(&database);
+        Self::start_replication_with(database, catalog)
+    }
+
+    /// [`Database::start_replication`] for the node's default database, with
+    /// the catalogue it belongs to: every other database of `catalog` starts
+    /// replicating too, over links of its own that name it, all served by
+    /// the one listener (`replication::server::Router`), and the default
+    /// stream's `CREATE DATABASE` / `DROP DATABASE` records are applied to it.
+    ///
+    /// Without a catalogue only the default database replicates, as it
+    /// always did.
+    pub fn start_replication_with(
+        database: Arc<Database>,
+        catalog: Option<Arc<catalog::DatabaseCatalog>>,
+    ) -> io::Result<()> {
+        Self::start_one_replication(database.clone(), catalog.clone())?;
+        if let Some(catalog) = &catalog {
+            let config = database.replication.config();
+            for name in catalog.names() {
+                let Some(other) = catalog.get(&name) else { continue };
+                if Arc::ptr_eq(&other, &database) {
+                    continue;
+                }
+                // A branch is this node's own copy: its peers have no such
+                // database, and making one would mean shipping it whole.
+                #[cfg(feature = "db_branching")]
+                if catalog.branch_meta(&name).is_some() {
+                    continue;
+                }
+                Self::start_routed_replication(other, &name, &config)?;
+            }
+            // Catalogue changes a crash left unrecorded, recorded now.
+            let catalog = catalog.clone();
+            tokio::spawn(async move { catalog.reconcile_replication().await });
+        }
+        Ok(())
+    }
+
+    /// Starts the replication of the non-default database `name` with the
+    /// default database's `config`: the same node, cluster, token and peers,
+    /// its own log and positions, and no listener (the default one routes its
+    /// links to it).
+    pub fn start_routed_replication(
+        database: Arc<Database>,
+        name: &str,
+        config: &crate::replication::ReplicationConfig,
+    ) -> io::Result<()> {
+        database.replication.route_as(name);
+        database
+            .replication
+            .set_config(config.clone())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        Self::start_one_replication(database, None)
+    }
+
+    /// Stops `database`'s replication: its links end, and it takes no more
+    /// records. Its files stay, positions and all.
+    pub fn stop_replication(&self) {
+        self.replication.stop();
+    }
+
+    fn start_one_replication(
+        database: Arc<Database>,
+        catalog: Option<Arc<catalog::DatabaseCatalog>>,
+    ) -> io::Result<()> {
         let replication = database.replication.clone();
         let config = replication.config();
 
@@ -2427,6 +2529,8 @@ impl Database {
 
         database.open_replication_storage()?;
         replication.set_active(true);
+        // Numbers the key/value cache's writes, on this (the main) runtime.
+        replication.ensure_kv_flusher();
 
         for peer_config in &config.peers {
             if replication.peer(&peer_config.name).is_none() {
@@ -2437,14 +2541,26 @@ impl Database {
             }
         }
 
-        if replication.claim_listener() {
+        // A routed database's links are served by the default database's
+        // listener; only the default one binds.
+        if replication.routed_database().is_none() && replication.claim_listener() {
+            // The catalogue's records are applied through a link the
+            // listener's router owns and every database's replication holds
+            // weakly.
+            let link = catalog.as_ref().map(|catalog| {
+                let link: std::sync::Arc<dyn crate::replication::manager::CatalogLink> =
+                    std::sync::Arc::new(catalog::ReplicatedCatalog::new(catalog.clone()));
+                replication.link_catalog(std::sync::Arc::downgrade(&link));
+                link
+            });
+            let router = std::sync::Arc::new(crate::replication::server::Router::new(database.clone(), catalog, link));
             // Bound here rather than inside the task, so a port that is already
             // held is reported to whoever asked for the listener instead of
             // being logged into the void behind a success.
             // A socket handed over with `Replication::serve_on` if there is
             // one, the configured port otherwise.
             let listener = replication.take_bound_listener();
-            let server = match crate::replication::server::bind_on(&replication, listener) {
+            let server = match crate::replication::server::bind_on(&router, listener) {
                 Ok(server) => server,
                 Err(e) => {
                     replication.release_listener();
@@ -2452,9 +2568,8 @@ impl Database {
                 }
             };
 
-            let listener_database = database.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::replication::server::serve(listener_database, server).await {
+                if let Err(e) = crate::replication::server::serve(router, server).await {
                     error!("Replication listener stopped with an error: {}", e);
                 }
             });
@@ -2684,7 +2799,8 @@ impl Database {
             }
         } else {
             warn!(
-                "Stopped dropping JSON shadow tables under {} at depth {}: the sidecars                  describe a cycle",
+                "Stopped dropping JSON shadow tables under {} at depth {}: the sidecars \
+                 describe a cycle",
                 table_name, depth
             );
         }
@@ -4258,6 +4374,10 @@ impl Database {
         if !own_scale.is_empty() && temp_seed(&create_table.table_name).is_none() {
             self.require_numeric_own_scale()?;
         }
+        if create_table.foreign_keys.iter().any(|fk| fk.is_composite()) && temp_seed(&create_table.table_name).is_none()
+        {
+            self.require_composite_foreign_keys()?;
+        }
         let table_name = &create_table.table_name;
         let columns = std::mem::take(&mut create_table.columns);
 
@@ -4395,6 +4515,17 @@ impl Database {
     pub(crate) fn require_numeric_own_scale(&self) -> io::Result<()> {
         match self.location.as_deref() {
             Some(root) => incompat::require(std::path::Path::new(root), incompat::NUMERIC_OWN_SCALE_V1),
+            None => Ok(()),
+        }
+    }
+
+    /// Marks the database as holding composite foreign keys
+    /// (`incompat::COMPOSITE_FOREIGN_KEY_V1`) before the first record of one
+    /// is written, so a binary that would read one as a one-column key
+    /// refuses to open it instead. Nothing to mark for a database in memory.
+    pub(crate) fn require_composite_foreign_keys(&self) -> io::Result<()> {
+        match self.location.as_deref() {
+            Some(root) => incompat::require(std::path::Path::new(root), incompat::COMPOSITE_FOREIGN_KEY_V1),
             None => Ok(()),
         }
     }
@@ -4574,7 +4705,10 @@ impl Database {
             }
         }
 
-        let mut builder = TcpServerBuilder::unix(&socket.path).unix_mode(socket.mode);
+        // As `bind_native_listener`'s: statements bound themselves.
+        let mut builder = TcpServerBuilder::unix(&socket.path)
+            .unix_mode(socket.mode)
+            .handler_timeout(None);
         if let Some(timeout) = request_timeout {
             builder = builder.request_timeout(timeout);
         }
@@ -4789,10 +4923,20 @@ impl Database {
             None
         };
 
+        // The listeners' request timeout, as each was built with it: what a
+        // statement may run for (`NativeContext::statement_timeout`).
+        let statement_timeout = Some(
+            server
+                .as_ref()
+                .map(|s| s.request_timeout())
+                .or_else(|| socket_server.as_ref().map(|(s, _)| s.request_timeout()))
+                .unwrap_or(std::time::Duration::from_secs(30)),
+        );
         let context = NativeContext {
             database,
             authentication_required,
             catalog,
+            statement_timeout,
         };
 
         let socket = socket_server.map(|(socket_server, socket_requires_auth)| {
@@ -4806,6 +4950,7 @@ impl Database {
                 database: context.database.clone(),
                 authentication_required: socket_requires_auth,
                 catalog: context.catalog.clone(),
+                statement_timeout: context.statement_timeout,
             };
             (socket_server, socket_context)
         });
@@ -4833,6 +4978,14 @@ impl NativeServer {
     /// real port when `listen.port` was 0.
     pub fn tcp_endpoint(&self) -> Option<String> {
         self.tcp.as_ref().map(|s| s.local_endpoint())
+    }
+
+    /// The SHA-256 fingerprint of the certificate the TCP listener
+    /// presents, when TCP is served: what a client pins
+    /// (`rastcp::tls::Trust::Pinned`) to believe this server alone,
+    /// including a certificate it made for itself at start.
+    pub fn tcp_certificate_fingerprint(&self) -> Option<rastcp::tls::Fingerprint> {
+        self.tcp.as_ref().and_then(|s| s.certificate_fingerprint())
     }
 
     /// The unix socket served (`unix:/path`), when one is.
@@ -6085,6 +6238,13 @@ pub(crate) struct NativeContext {
     /// ([`crate::pgwire::NativeSession::attach`]); `None` for a listener
     /// serving a database of its own.
     catalog: Option<Arc<catalog::DatabaseCatalog>>,
+    /// How long one statement may run before it is stopped and answered
+    /// with an error (57014, as PostgreSQL's `statement_timeout`): the
+    /// listener's request timeout. The listener itself waits for every
+    /// answer (`handler_timeout(None)`), so a slow statement costs its
+    /// caller an error, never the connection and the block it holds.
+    /// `None` is no limit.
+    statement_timeout: Option<std::time::Duration>,
 }
 
 /// Encodes an error the way the executor does, so a caller needs no special
@@ -6104,6 +6264,13 @@ fn error_response(message: &str) -> Vec<u8> {
 ///
 /// For embedding and tests that build their own [`TcpServer`] (a
 /// listener of their choosing, a shorter request timeout).
+///
+/// A statement is stopped at the server's request timeout and answered
+/// with an error (SQLSTATE 57014). Build `server` with
+/// `handler_timeout(None)`, as the server's own listeners are, so that its
+/// connections survive such a statement: with the default, rastcp gives up
+/// on a request at that same moment, and on a `rastcp/1` connection that
+/// closes the connection and rolls back the block on it.
 pub async fn serve_native(
     server: &TcpServer,
     database: Arc<Database>,
@@ -6113,6 +6280,7 @@ pub async fn serve_native(
         database,
         authentication_required,
         catalog: None,
+        statement_timeout: Some(server.request_timeout()),
     };
     server
         .run_with_session(context, open_native_session, serve_native_request)
@@ -6164,6 +6332,9 @@ pub(crate) struct NativeConnection {
     principal: StdArc<rastcp::session::Principal>,
     multiplexed: bool,
     session: std::sync::OnceLock<crate::pgwire::NativeSession>,
+    /// The connection asked for notices
+    /// ([`crate::pgwire::NATIVE_NOTICES_PREFIX`]): its answers carry them.
+    notices: std::sync::atomic::AtomicBool,
 }
 
 impl NativeConnection {
@@ -6268,6 +6439,7 @@ fn open_native_session(
         principal: principal.clone(),
         multiplexed: connection.multiplexed,
         session: std::sync::OnceLock::new(),
+        notices: std::sync::atomic::AtomicBool::new(false),
     }
 }
 
@@ -6296,7 +6468,8 @@ fn native_session_in(
         principal.superuser,
         context.authentication_required,
         multiplexed,
-    );
+    )
+    .with_statement_timeout(context.statement_timeout);
     match &context.catalog {
         Some(catalog) => session.attach(catalog),
         None => session,
@@ -6314,6 +6487,22 @@ async fn serve_native_request(
     if let Some(name) = request_vec.strip_prefix(crate::pgwire::NATIVE_DATABASE_PREFIX) {
         return connection.select(name);
     }
+    // Ahead of the session, as the database selection is: a setup request,
+    // which must not make the session in the default database before a
+    // selection does.
+    if let Some(rest) = request_vec.strip_prefix(crate::pgwire::NATIVE_NOTICES_PREFIX) {
+        if !rest.is_empty() {
+            return crate::pgwire::native_simple_error(
+                "08P01",
+                "a notices request carries nothing after its ';'",
+                b'I',
+            );
+        }
+        connection
+            .notices
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        return crate::pgwire::native_simple_complete("SET");
+    }
     let session = match connection.session_in(connection.login_database()) {
         Ok(session) => session,
         Err((_, message)) => return error_response(&message),
@@ -6327,7 +6516,10 @@ async fn serve_native_request(
             ..context
         }
     };
-    process_native_request(context, principal, Some(session), request_vec).await
+    // A connection that asked for notices has them carried with each
+    // answer; any other is answered exactly as before.
+    let notices = connection.notices.load(std::sync::atomic::Ordering::Relaxed);
+    process_native_request_for(context, principal, Some(session), request_vec, notices).await
 }
 
 /// One request with no connection session: transaction control is refused.
@@ -6341,12 +6533,33 @@ pub(crate) async fn process_incoming_queries(
     process_native_request(context, principal, None, request_vec).await
 }
 
+/// [`process_native_request_for`] for a connection that did not ask for
+/// notices, as the statement tests drive it.
+#[cfg(test)]
 async fn process_native_request(
     context: NativeContext,
     principal: StdArc<rastcp::session::Principal>,
     session: Option<&crate::pgwire::NativeSession>,
     request_vec: Vec<u8>,
 ) -> Vec<u8> {
+    process_native_request_for(context, principal, session, request_vec, false).await
+}
+
+/// One request of a connection, with its statement's notices carried in
+/// front of the answer when the connection asked for them (`notices`).
+async fn process_native_request_for(
+    context: NativeContext,
+    principal: StdArc<rastcp::session::Principal>,
+    session: Option<&crate::pgwire::NativeSession>,
+    request_vec: Vec<u8>,
+    notices: bool,
+) -> Vec<u8> {
+    // Counted as running until it is answered, as pgwire counts its own
+    // (`execute_recorded`): the idle trimmer trims after a quiet tick that
+    // follows a finished statement, and never under one. Uncounted, a
+    // process whose clients are all native (an embedded engine, a
+    // native-only server) was never trimmed and kept its high-water mark.
+    let _running = crate::idle_trim::statement();
     // Every branch but the plain statement's is boxed where it is awaited:
     // an async fn's future is as large as its largest await, so the rare
     // branches (the session's path, the role statements, the checkpoint),
@@ -6419,7 +6632,8 @@ async fn process_native_request(
         && session.takes(&query)
     {
         debug!("Native transaction statement from {}", principal);
-        return Box::pin(session.run(&query)).await;
+        let run = Box::pin(session.run(&query));
+        return if notices { crate::pgwire::native_with_notices(run).await } else { run.await };
     }
 
     // Role management is answered by the auth module rather than the RQL
@@ -6517,12 +6731,15 @@ async fn process_native_request(
     if let Some(session) = session
         && session.needs_session_path(&query).await
     {
-        return Box::pin(session.run_alone(&query)).await;
+        let run = Box::pin(session.run_alone(&query));
+        return if notices { crate::pgwire::native_with_notices(run).await } else { run.await };
     }
+
+    let statement_timeout = context.statement_timeout;
 
     #[cfg(not(feature = "query_stats"))]
     {
-        run_native_query_in(&query, context.database, session, exec_template).await
+        run_native_query_in(&query, context.database, session, exec_template, statement_timeout, notices).await
     }
 
     // Recorded for `SHOW QUERIES` the same way a statement arriving over the
@@ -6531,11 +6748,13 @@ async fn process_native_request(
     #[cfg(feature = "query_stats")]
     {
         let Some(recording) = crate::core::query_stats::begin() else {
-            return run_native_query_in(&query, context.database, session, exec_template).await;
+            return run_native_query_in(&query, context.database, session, exec_template, statement_timeout, notices)
+                .await;
         };
         let database_name = context.database.name.clone();
         let response = crate::core::query_stats::observe(recording.probe(), async {
-            let response = run_native_query_in(&query, context.database, session, exec_template).await;
+            let response =
+                run_native_query_in(&query, context.database, session, exec_template, statement_timeout, notices).await;
             // Counted inside the scope: outside it the statement's counters are
             // no longer the ones this task can reach.
             crate::core::query_stats::note_rows(rows_of(&response));
@@ -6555,6 +6774,44 @@ async fn process_native_request(
         );
         response
     }
+}
+
+/// The signal one autocommit statement runs under: the listener's statement
+/// timeout as its deadline, as pgwire's `execute_recorded` builds one from
+/// `statement_timeout`. The scan and the waits a statement makes check it,
+/// and a statement past its deadline stops and fails with 57014, its
+/// cleanup done on the way out as for any error ([`timed_out_answer`]).
+///
+/// With `notices`, it also keeps the notices the statement raises
+/// (`StatementCancel::collecting_notices`), for a connection that asked for
+/// them: no scope of their own is opened around the statement.
+fn statement_signal(
+    timeout: Option<std::time::Duration>,
+    notices: bool,
+) -> StdArc<crate::core::cancel::StatementCancel> {
+    let signal = crate::core::cancel::StatementCancel::new(
+        timeout.map(|t| std::time::Instant::now() + t),
+    );
+    StdArc::new(if notices { signal.collecting_notices() } else { signal })
+}
+
+/// `response` saying it was stopped at the statement timeout, with the
+/// SQLSTATE a native error otherwise lacks, when it was.
+fn timed_out_answer(
+    mut response: Vec<u8>,
+    signal: &crate::core::cancel::StatementCancel,
+) -> Vec<u8> {
+    if response.first() == Some(&3)
+        && signal.tripped() == Some(crate::core::cancel::CancelReason::Timeout)
+        && !response.ends_with(b")")
+        && crate::core::sql_scan::contains_ignore_ascii_case(
+            std::str::from_utf8(&response[1..]).unwrap_or(""),
+            b"statement timeout",
+        )
+    {
+        response.extend_from_slice(b" (SQLSTATE 57014)");
+    }
+    response
 }
 
 /// `rdb_index_checkpoint(name)` over the native protocol: one row, one
@@ -6618,14 +6875,29 @@ async fn run_native_query_in(
     database: Arc<Database>,
     session: Option<&crate::pgwire::NativeSession>,
     template: Option<crate::pgwire::NativeTemplate>,
+    statement_timeout: Option<std::time::Duration>,
+    notices: bool,
 ) -> Vec<u8> {
     let response = match session {
         Some(session) => {
-            crate::core::rql::sequence::session::scoped(
+            // The signal scopes the statement's boxed future, not a copy of
+            // it: moved into a scope by value, the statement's future (tens
+            // of kilobytes) was copied on every request.
+            let signal = statement_signal(statement_timeout, notices);
+            let response = crate::core::rql::sequence::session::scoped(
                 session.sequence_scope(),
-                Box::pin(run_native_query_learning(query, database.clone(), session, template)),
+                crate::core::cancel::STATEMENT_CANCEL.scope(
+                    signal.clone(),
+                    Box::pin(run_native_query_learning(query, database.clone(), session, template)),
+                ),
             )
-            .await
+            .await;
+            let response = timed_out_answer(response, &signal);
+            if notices {
+                crate::pgwire::native_engine_notices_answer(response, signal.take_notices())
+            } else {
+                response
+            }
         }
         None => run_native_query(query, database.clone()).await,
     };
@@ -6801,7 +7073,7 @@ async fn run_native_query_body(query: &str, database: Arc<Database>) -> Vec<u8> 
     // values of its `now()`, `random()` and `gen_random_uuid()`.
     let deterministic;
     let stmt = if database.replication.is_active() {
-        match crate::core::rql::replicated_values::fold(stmt) {
+        match crate::core::rql::replicated_values::fold_write(stmt, &database).await {
             crate::core::rql::replicated_values::Fold::Unchanged => stmt,
             crate::core::rql::replicated_values::Fold::Rewritten(text) => {
                 crate::core::rql::prepared::note_rewritten();
@@ -6858,6 +7130,33 @@ async fn run_native_query_body(query: &str, database: Arc<Database>) -> Vec<u8> 
         );
     }
 
+    // A `LATERAL` item — what a correlated scalar subquery was just
+    // rewritten into (`rql::correlated`), or one written as such — is
+    // materialised before the statement runs, as pgwire materialises it for
+    // an autocommit SELECT (`effective_tx` is `FROZEN_TX` there too), and its
+    // relations are dropped after. Left to the engine, the statement named a
+    // relation nothing had built: "missing FROM-clause entry for table
+    // \"__cs0\"".
+    let is_select = stmt.trim_start().as_bytes().get(..6).is_some_and(|w| w.eq_ignore_ascii_case(b"SELECT"));
+    if is_select && crate::core::rql::lateral::next_item(stmt).is_some() {
+        let tx = crate::core::mvcc::transaction::FROZEN_TX;
+        return match crate::core::rql::cte::materialize_derived(stmt, &database, tx).await {
+            Ok(Some(lateral)) => {
+                crate::core::rql::prepared::note_rewritten();
+                let response = Box::pin(run_native_with_catalog(&lateral.rewritten, database.clone())).await;
+                crate::core::rql::cte::drop_temps(&database, &lateral.temps, tx).await;
+                response
+            }
+            Ok(None) => Box::pin(run_native_with_catalog(stmt, database)).await,
+            Err(e) => error_response(&e),
+        };
+    }
+    run_native_with_catalog(stmt, database).await
+}
+
+/// [`run_native_query_body`]'s last step: the catalogue relations the
+/// statement reads, built for it, and the statement run.
+async fn run_native_with_catalog(stmt: &str, database: Arc<Database>) -> Vec<u8> {
     // The catalogue relations (`pg_tables`, `pg_class`,
     // `information_schema.tables` and the rest) exist only per statement:
     // built from the live catalogue into temporary relations the text is

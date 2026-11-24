@@ -639,6 +639,10 @@ fn keyset_pages_compare_row_values_or_chains() {
     assert_eq!(Cursor::decode(&text).unwrap(), cursor);
     assert!(Cursor::decode("zz").is_err());
     assert!(Cursor::decode("l3").is_err());
+    // A token comes back from whoever held it: non-ASCII is refused, not
+    // sliced inside a character.
+    assert!(Cursor::decode("té").is_err());
+    assert!(Cursor::decode("l3é4").is_err());
     let hostile = c(vec![Value::Text("'; --".into()), Value::I64(1)]);
     let back = Cursor::decode(&hostile.encode().unwrap()).unwrap();
     let sql = Event::query()

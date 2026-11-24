@@ -21,7 +21,7 @@
 //!    A collision costs a miss instead of serving another query's rows.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use cacheguard::CacheGuard;
 
@@ -183,6 +183,28 @@ pub fn record_abandoned_hit() {
     MISSES.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Entries the cache holds when nothing says otherwise (`--cache-size`).
+pub const DEFAULT_ENTRIES: usize = 100_000;
+
+/// The entry limit a start asked for (`cache.size`), for a cache not built
+/// yet; [`init`] builds with its own argument.
+static ENTRIES: AtomicUsize = AtomicUsize::new(DEFAULT_ENTRIES);
+
+/// Sets the entry limit [`entries`] reports for a cache not built yet: what
+/// a start that leaves the cache off still configured.
+pub fn set_entries(n: usize) {
+    ENTRIES.store(n, Ordering::Relaxed);
+}
+
+/// The cache's entry limit, `SHOW CONFIG`'s `cache.size`: the built cache's
+/// own, or the configured one while none is built.
+pub fn entries() -> usize {
+    match QUERY_CACHE.get() {
+        Some(cache) => cache.max_capacity(),
+        None => ENTRIES.load(Ordering::Relaxed),
+    }
+}
+
 /// Builds the query cache with room for `max_entries` live entries.
 ///
 /// The slot array is sized at twice that. The probe window is 16 slots wide, so
@@ -222,6 +244,38 @@ fn slot_hash(table: &str, where_clause: &str, limit: Option<u64>) -> u64 {
         }
     }
     digest.finalize()
+}
+
+/// Whether [`lookup`] would answer `(table, where_clause)` at `generation`
+/// right now, asked without counting a hit or a miss and without releasing a
+/// stranded entry.
+///
+/// For a caller deciding whether to do the work a miss needs before it
+/// knows: a scan narrows its slots by the indexes first, and for a clause an
+/// index answers only loosely (a key prefix) that narrowing is most of the
+/// statement, wasted when the entry then answers it. An entry evicted between
+/// this and the lookup is a miss like any other; the caller must still be
+/// correct, only slower, without the work it skipped.
+pub fn holds(table: &str, where_clause: &str, generation: u64, limit: Option<u64>) -> bool {
+    if !enabled() {
+        return false;
+    }
+    let probe = |key_limit: Option<u64>| -> bool {
+        let Some(cache) = QUERY_CACHE.get() else {
+            return false;
+        };
+        cache
+            .read(&slot_hash(table, where_clause, key_limit), |slot| {
+                slot.entry.load_full().is_some_and(|entry| {
+                    &*entry.table == table
+                        && &*entry.where_clause == where_clause
+                        && entry.limit == key_limit
+                        && entry.generation == generation
+                })
+            })
+            .unwrap_or(false)
+    };
+    probe(None) || (limit.is_some() && probe(limit))
 }
 
 /// Looks up the complete match set for `(table, where_clause)` as of

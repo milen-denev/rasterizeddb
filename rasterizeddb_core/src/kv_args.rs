@@ -1,7 +1,7 @@
 //! Flags for the Redis-compatible key/value store.
 
 use rasterizeddb_core::core::kv_cache::{self, EvictionPolicy};
-use rasterizeddb_core::core::kv_cache::resp::{RespAuth, RespConfig, RespSocket};
+use rasterizeddb_core::core::kv_cache::resp::{RespAuth, RespConfig, RespSocket, RespTls};
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct KvArgs {
@@ -27,6 +27,14 @@ pub struct KvArgs {
     /// anything but a loopback address.
     #[arg(long = "kv-auth", default_value = "password")]
     pub kv_auth: String,
+
+    /// TLS on `--kv-port`: `on` makes every TCP client complete a TLS
+    /// handshake first (`redis-cli --tls`), with the certificate and key the
+    /// PostgreSQL port serves (`--pg-cert`/`--pg-key`, or a self-signed pair
+    /// made at start when neither is given). `off`, the default, is plain
+    /// TCP. `--kv-socket` stays plain either way.
+    #[arg(long = "kv-tls", default_value = "off", value_name = "on|off")]
+    pub kv_tls: String,
 
     /// The role `AUTH <password>` (no user name) is checked as. Defaults to
     /// `--pg-user`.
@@ -82,10 +90,27 @@ impl KvArgs {
         pg_user: &str,
         socket_mode: u32,
         socket_group: Option<u32>,
+        cert: Option<&str>,
+        key: Option<&str>,
     ) -> Result<Option<RespConfig>, String> {
+        let tls_on = match self.kv_tls.trim().to_ascii_lowercase().as_str() {
+            "on" | "true" | "yes" | "require" => true,
+            "off" | "false" | "no" | "disable" => false,
+            other => return Err(format!("--kv-tls {other:?}: expected on or off")),
+        };
         if self.kv_port.is_none() && self.kv_socket.is_none() {
             return Ok(None);
         }
+        if tls_on && self.kv_port.is_none() {
+            return Err("--kv-tls on needs --kv-port: the unix socket is served without TLS".to_string());
+        }
+        let tls = if tls_on {
+            let acceptor = rasterizeddb_core::pgwire::tls_acceptor(cert, key)
+                .map_err(|e| format!("--kv-tls on: {e}"))?;
+            Some(RespTls(acceptor))
+        } else {
+            None
+        };
         let auth = match self.kv_auth.trim().to_ascii_lowercase().as_str() {
             "password" | "roles" | "scram-sha-256" => RespAuth::Roles {
                 default_user: self.kv_user.clone().unwrap_or_else(|| pg_user.to_string()),
@@ -103,6 +128,7 @@ impl KvArgs {
             }),
             auth,
             threads: self.kv_threads,
+            tls,
         }))
     }
 }

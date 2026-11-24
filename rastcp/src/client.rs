@@ -86,7 +86,7 @@ pub struct TcpClientBuilder {
     trust: Option<Trust>,
     identity: Option<ClientIdentity>,
     authenticator: Option<Arc<dyn ClientAuthenticator>>,
-    setup: Option<Arc<dyn ConnectionSetup>>,
+    setup: Vec<Arc<dyn ConnectionSetup>>,
     auth_timeout: std::time::Duration,
     allow_tls12: bool,
     max_message_size: usize,
@@ -113,8 +113,8 @@ pub(crate) struct Dialer {
     version: Version,
     pub(crate) timeout: Option<std::time::Duration>,
     authenticator: Option<Arc<dyn ClientAuthenticator>>,
-    /// See [`TcpClientBuilder::setup`].
-    setup: Option<Arc<dyn ConnectionSetup>>,
+    /// See [`TcpClientBuilder::setup`]: sent in this order.
+    setup: Vec<Arc<dyn ConnectionSetup>>,
     auth_timeout: std::time::Duration,
     pub(crate) max_message_size: usize,
     /// Only a multiplexed client has more than one request in flight.
@@ -132,7 +132,7 @@ impl TcpClientBuilder {
             trust: None,
             identity: None,
             authenticator: None,
-            setup: None,
+            setup: Vec::new(),
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
             // See `crate::server::TcpServerBuilder::allow_tls12`.
             allow_tls12: false,
@@ -193,8 +193,19 @@ impl TcpClientBuilder {
     /// credential exchange and before anything else: see [`ConnectionSetup`].
     /// Part of opening a connection for the same reason the exchange is, so
     /// a reconnect cannot resume on a connection that was never set up.
+    ///
+    /// Replaces any setup given before; [`TcpClientBuilder::add_setup`] adds
+    /// one after them instead.
     pub fn setup(mut self, setup: Arc<dyn ConnectionSetup>) -> Self {
-        self.setup = Some(setup);
+        self.setup = vec![setup];
+        self
+    }
+
+    /// One more setup request, sent after those given before it, each once
+    /// the answer to the one before has been accepted. Any of them failing
+    /// fails the open. See [`ConnectionSetup`].
+    pub fn add_setup(mut self, setup: Arc<dyn ConnectionSetup>) -> Self {
+        self.setup.push(setup);
         self
     }
 
@@ -371,15 +382,10 @@ impl TcpClientBuilder {
         }
         let config = client_config;
 
-        // Get server name from address
-        let server_name = ServerName::try_from(
-            self.addr
-                .split(':')
-                .next()
-                .ok_or_else(|| RastcpError::CertificateLoading("Invalid address format".into()))?,
-        )
-        .map_err(|_| RastcpError::CertificateLoading("Invalid server name".into()))?
-        .to_owned();
+        let host = host_of(&self.addr);
+        let server_name = ServerName::try_from(host)
+            .map_err(|_| RastcpError::CertificateLoading(format!("{host:?} is not a server name")))?
+            .to_owned();
 
         Ok(Dialer {
             addr: self.addr,
@@ -428,6 +434,20 @@ where
     match deadline {
         Some(deadline) => deadline.run(wait).await.unwrap_or(Err(RastcpError::ConnectionTimeout)),
         None => wait.await,
+    }
+}
+
+/// The host part of a `host:port` address, as the TLS server name: a name
+/// or an IPv4 address before the last `:`, an IPv6 address inside `[…]`
+/// (`[::1]:61170`), and a bare IPv6 address (`::1`) whole.
+fn host_of(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[') {
+        return rest.split_once(']').map_or(rest, |(host, _)| host);
+    }
+    match addr.rsplit_once(':') {
+        Some((host, _)) if !host.contains(':') => host,
+        Some(_) => addr,
+        None => addr,
     }
 }
 
@@ -662,16 +682,29 @@ impl Dialer {
         Ok(stream)
     }
 
-    /// Sends the setup request, if this client has one, and hands its answer
-    /// to it. Under the client's timeout, as the rest of opening is.
+    /// Sends each setup request this client has, in order, and hands each
+    /// answer to its setup before the next goes out. One after another and
+    /// never together: a multiplexed server may handle requests that arrive
+    /// together in any order, and a later setup may need an earlier one to
+    /// have taken effect.
+    async fn set_up(&self, stream: &mut ClientStream) -> Result<(), RastcpError> {
+        for setup in &self.setup {
+            self.set_up_one(setup.as_ref(), stream).await?;
+        }
+        Ok(())
+    }
+
+    /// Sends one setup request and hands its answer to it. Under the
+    /// client's timeout, as the rest of opening is.
     ///
     /// The answer is read with a reader of its own, which is then dropped:
     /// nothing it read ahead is lost, because the server sends nothing on a
     /// connection that has not asked for anything more.
-    async fn set_up(&self, stream: &mut ClientStream) -> Result<(), RastcpError> {
-        let Some(setup) = self.setup.as_ref() else {
-            return Ok(());
-        };
+    async fn set_up_one(
+        &self,
+        setup: &dyn ConnectionSetup,
+        stream: &mut ClientStream,
+    ) -> Result<(), RastcpError> {
         let request = setup.request();
         let max = self.max_message_size;
         let exchange = async {
@@ -844,17 +877,19 @@ impl TcpClient {
         let max_message_size = self.dialer.max_message_size;
         self.ready(max_message_size).await?;
 
-        let connection = self.connection.as_mut().ok_or(RastcpError::NotConnected)?;
+        // Taken out for the exchange and put back only when it completes: a
+        // caller that drops this future after the request went out (a timeout
+        // of its own, a `select!`) must not leave the connection here, where
+        // the next request would read this one's answer.
+        let mut connection = self.connection.take().ok_or(RastcpError::NotConnected)?;
 
         match connection.exchange(data, max_message_size).await {
             Ok(response) => {
                 debug!("Received {} bytes response", response.len());
+                self.connection = Some(connection);
                 Ok(response)
             }
-            Err(err) => {
-                self.connection = None;
-                Err(err)
-            }
+            Err(err) => Err(err),
         }
     }
 
@@ -883,17 +918,17 @@ impl TcpClient {
         let max_message_size = self.dialer.max_message_size;
         self.ready(max_message_size).await?;
 
-        let connection = self.connection.as_mut().ok_or(RastcpError::NotConnected)?;
+        // Out of `self` for the exchange, as in `send_borrowed`: dropped
+        // mid-batch, the connection goes with the future.
+        let mut connection = self.connection.take().ok_or(RastcpError::NotConnected)?;
 
         match connection.exchange_batch(requests, max_message_size).await {
             Ok(responses) => {
                 debug!("Received {} responses", responses.len());
+                self.connection = Some(connection);
                 Ok(responses)
             }
-            Err(err) => {
-                self.connection = None;
-                Err(err)
-            }
+            Err(err) => Err(err),
         }
     }
 
@@ -1194,6 +1229,26 @@ fn poll_pipeline(
         }
         if !progressed {
             return Poll::Pending;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_server_name_is_the_host_of_any_address_form() {
+        assert_eq!(host_of("db.example.com:61170"), "db.example.com");
+        assert_eq!(host_of("127.0.0.1:61170"), "127.0.0.1");
+        assert_eq!(host_of("[::1]:61170"), "::1");
+        assert_eq!(host_of("[fe80::1%eth0]:5"), "fe80::1%eth0");
+        assert_eq!(host_of("::1"), "::1");
+        assert_eq!(host_of("localhost"), "localhost");
+        // Each is a name rustls takes: an IPv6 literal used to give "[",
+        // which no trust setting accepted.
+        for addr in ["db.example.com:1", "127.0.0.1:1", "[::1]:1", "::1"] {
+            assert!(ServerName::try_from(host_of(addr)).is_ok(), "{addr}");
         }
     }
 }

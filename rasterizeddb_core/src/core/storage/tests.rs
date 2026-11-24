@@ -675,11 +675,11 @@ fn data_locations_are_the_primaries_and_placed_directories_but_not_the_root() {
 }
 
 #[test]
-fn a_pool_file_copied_from_another_directory_is_still_read() {
-    // The warning path: a mirrored directory opened as a database carries the
-    // original's pool file. Opening must not fail — the copy is usable, and the
-    // operator is told — but the placements it carries are the original's, so
-    // this is the shape that needs the log line.
+fn a_pool_file_copied_from_another_directory_is_adopted_by_the_copy() {
+    // A directory copied with its pool file (a mirror opened as a database, a
+    // `cp -a`) carries placements that name the original. Read as they were,
+    // the copy's tables resolved to the original's files. One primary and every
+    // table on it: the copy is adopted, and its table resolves inside it.
     let elsewhere = temp_root("copied_pool");
     let text = format!(
         "version\t1\nlocation\tprimary\t1\tenabled\t/srv/somewhere-else\n\
@@ -689,12 +689,15 @@ fn a_pool_file_copied_from_another_directory_is_still_read() {
 
     let pool = StorageManager::open(&elsewhere);
 
-    // Read, not refused: the placement is the original's, which is exactly what
-    // the warning is about.
     assert_eq!(
         pool.location_of("orders").as_deref(),
-        Some("/srv/somewhere-else")
+        Some(elsewhere.as_str()),
+        "the copy's table resolves outside the copy"
     );
+    // And the file on disk says so, for the next start and for an operator.
+    let on_disk = std::fs::read_to_string(std::path::Path::new(&elsewhere).join(POOL_FILE)).unwrap();
+    assert!(!on_disk.contains("/srv/somewhere-else"), "{on_disk}");
+    assert!(on_disk.contains(&format!("table\t{elsewhere}\torders")), "{on_disk}");
 }
 
 #[test]
@@ -749,4 +752,97 @@ fn concurrent_placements_leave_a_whole_configuration_on_disk() {
             );
         }
     }
+}
+
+/// A pool file copied with its directory (a `cp -a`, a directory moved by
+/// hand) names the original. Opened as it was, every table resolved to the
+/// original's files, reads and writes alike. A single-location copy is
+/// adopted: the file is rewritten for the directory it is in, and the
+/// original's backup location is let go rather than mirrored into.
+#[test]
+fn a_copied_pool_file_is_adopted_and_never_reaches_the_original() {
+    let orig = temp_root("copy_orig");
+    let backup = temp_root("copy_backup");
+    {
+        let pool = StorageManager::open(&orig);
+        pool.add_location(&backup, LocationRole::Backup, 1, true).unwrap();
+        pool.pin("users", &orig).unwrap();
+    }
+    let orig_text = std::fs::read_to_string(Path::new(&orig).join(POOL_FILE)).unwrap();
+
+    let copy = temp_root("copy_copy");
+    std::fs::copy(Path::new(&orig).join(POOL_FILE), Path::new(&copy).join(POOL_FILE)).unwrap();
+    let pool = StorageManager::try_open(&copy).expect("a single-location copy opens");
+    assert_eq!(pool.location_of("users").as_deref(), Some(copy.as_str()));
+    assert!(pool.mirrors().is_empty(), "the copy mirrors into the original's backup: {:?}", pool.mirrors());
+    let text = std::fs::read_to_string(Path::new(&copy).join(POOL_FILE)).unwrap();
+    assert!(!text.contains(&orig) && !text.contains(&backup), "{text}");
+    drop(pool);
+    // Adopted for good: the next open finds its own file.
+    let pool = StorageManager::try_open(&copy).unwrap();
+    assert_eq!(pool.location_of("users").as_deref(), Some(copy.as_str()));
+    assert_eq!(std::fs::read_to_string(Path::new(&orig).join(POOL_FILE)).unwrap(), orig_text);
+}
+
+/// The mirror's own story: a backup location is a copy of the database, so
+/// pointing the engine at it opens it. The file there names the mirror as its
+/// *backup* location, which hid the copy from the check that warned, and
+/// every table resolved to the primary's files.
+#[test]
+fn a_mirror_opened_directly_reads_its_own_files() {
+    let orig = temp_root("mirror_orig");
+    let mirror = temp_root("mirror_copy");
+    {
+        let pool = StorageManager::open(&orig);
+        pool.add_location(&mirror, LocationRole::Backup, 1, true).unwrap();
+        pool.pin("users", &orig).unwrap();
+    }
+    std::fs::copy(Path::new(&orig).join(POOL_FILE), Path::new(&mirror).join(POOL_FILE)).unwrap();
+    let pool = StorageManager::try_open(&mirror).expect("the mirror opens");
+    assert_eq!(pool.location_of("users").as_deref(), Some(mirror.as_str()));
+    assert!(pool.mirrors().is_empty(), "{:?}", pool.mirrors());
+    assert_eq!(pool.locations().len(), 1);
+}
+
+/// A copy of a database that keeps files on a second disk is refused: which
+/// of those files the copy carries cannot be told, and reading the original
+/// disk's would be the silent failure this guards against. The file is left
+/// as it was.
+#[test]
+fn a_copy_of_a_spread_pool_is_refused() {
+    let orig = temp_root("spread_orig");
+    let second = temp_root("spread_second");
+    {
+        let pool = StorageManager::open(&orig);
+        pool.add_location(&second, LocationRole::Primary, 1, true).unwrap();
+        pool.pin("users", &second).unwrap();
+    }
+    let copy = temp_root("spread_copy");
+    std::fs::copy(Path::new(&orig).join(POOL_FILE), Path::new(&copy).join(POOL_FILE)).unwrap();
+    let before = std::fs::read_to_string(Path::new(&copy).join(POOL_FILE)).unwrap();
+    let e = match StorageManager::try_open(&copy) {
+        Ok(_) => panic!("a copy of a two-disk pool opened"),
+        Err(e) => e,
+    };
+    assert!(e.contains("is not opened") && e.contains(&second), "{e}");
+    assert_eq!(std::fs::read_to_string(Path::new(&copy).join(POOL_FILE)).unwrap(), before);
+}
+
+/// The same directory reached through a symlink is not a copy: its file is
+/// left alone.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_path_to_the_same_directory_is_not_a_copy() {
+    let orig = temp_root("link_orig");
+    {
+        let pool = StorageManager::open(&orig);
+        pool.pin("users", &orig).unwrap();
+    }
+    let before = std::fs::read_to_string(Path::new(&orig).join(POOL_FILE)).unwrap();
+    let link = format!("{orig}_link");
+    std::os::unix::fs::symlink(&orig, &link).unwrap();
+    let pool = StorageManager::try_open(&link).expect("opens");
+    drop(pool);
+    assert_eq!(std::fs::read_to_string(Path::new(&orig).join(POOL_FILE)).unwrap(), before);
+    let _ = std::fs::remove_file(&link);
 }

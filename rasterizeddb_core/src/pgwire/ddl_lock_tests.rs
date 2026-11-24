@@ -227,7 +227,7 @@ async fn fk_ddl_locks_the_other_side() {
     ok(&db, &mut r, "COMMIT").await;
     let (_, out, _) = finish("RENAME COLUMN", rename).await;
     out.expect("RENAME COLUMN after the child's reader");
-    let parent_column = db.schema_view("c").unwrap().schema().foreign_keys[0].parent_column.clone();
+    let parent_column = db.schema_view("c").unwrap().schema().foreign_keys[0].parent_column_list();
     assert_eq!(parent_column, "pk", "the child's key does not follow the renamed column");
 
     // A parent reader does not hold back ADD FOREIGN KEY...
@@ -337,11 +337,14 @@ async fn partitioned_ddl_waits_for_readers_and_its_refusals_take_no_lock() {
     )
     .await;
     let mut r = reader(&db, "pt").await;
-    for sql in ["ALTER TABLE pt ALTER COLUMN tenant_id DROP NOT NULL", "ALTER TABLE pt ADD CONSTRAINT pt_u UNIQUE (v)"] {
+    for (sql, code) in [
+        ("ALTER TABLE pt ALTER COLUMN tenant_id DROP NOT NULL", "42P16"),
+        ("ALTER TABLE pt ADD CONSTRAINT pt_u UNIQUE (v)", "0A000"),
+    ] {
         let refused = spawn(&db, session(&db), sql);
         let (_, out, took) = finish(sql, refused).await;
         let e = out.expect_err(sql);
-        assert_eq!(sqlstate_of(&e), "0A000", "{sql}: {e}");
+        assert_eq!(sqlstate_of(&e), code, "{sql}: {e}");
         assert!(took < SETTLE * 5, "{sql}: waited {took:?} before its refusal");
     }
     let index = spawn(&db, session(&db), "CREATE INDEX pt_v ON pt (v)");
@@ -410,13 +413,17 @@ async fn rebalance_gives_each_moved_table_back() {
     ok(&db, &mut h, "BEGIN").await;
     ok(&db, &mut h, &format!("LOCK TABLE {then} IN ACCESS SHARE MODE")).await;
     let rebalance = spawn(&db, session(&db), "STORAGE REBALANCE");
+    // Until the move has happened, not one settle: on the Windows ARM64
+    // runner moving `first` outlasted a settle (CI, 2026-11-23). REBALANCE
+    // cannot finish meanwhile, as the block holds `then`.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while db.storage.spec_of(first).as_deref() != Some(second_path.as_str()) {
+        assert!(!rebalance.is_finished(), "REBALANCE finished while the block held {then}");
+        assert!(Instant::now() < deadline, "REBALANCE has not moved {first} before waiting on {then}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     tokio::time::sleep(SETTLE).await;
     assert!(!rebalance.is_finished(), "REBALANCE did not wait on the held table");
-    assert_eq!(
-        db.storage.spec_of(first).as_deref(),
-        Some(second_path.as_str()),
-        "REBALANCE has not moved {first} before waiting on {then}"
-    );
     // Given back while REBALANCE still waits on the held table. Asked until it
     // is, not once: the move switches the placement before it releases the
     // table, and on a Windows runner the release had not come yet one settle

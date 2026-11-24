@@ -399,7 +399,8 @@ pub fn tsvector_expression(part: &str) -> Option<Result<(bool, Vec<String>), Str
     }
     let unsupported = |why: &str| {
         Some(Err(format!(
-            "this full-text index expression is not supported: {why}; index              to_tsvector('<configuration>', column [|| ' ' || column …])"
+            "this full-text index expression is not supported: {why}; index \
+             to_tsvector('<configuration>', column [|| ' ' || column …])"
         )))
     };
     let args = split_top(&t[open + 1..t.len() - 1]);

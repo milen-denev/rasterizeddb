@@ -131,8 +131,17 @@ const ENDS: &[&str] = &[
     "EXCEPT",
 ];
 
-/// The plan's lines, outermost first.
+/// [`plan_lines_with`] from the text alone.
+#[cfg(test)]
 fn plan_lines(statement: &str) -> Vec<String> {
+    plan_lines_with(statement, None)
+}
+
+/// The plan's lines, outermost first; a join's read from `planned` when the statement
+/// planned (`join::plan_statement`), so they show the keys it hashes on,
+/// a comma join's lifted `WHERE` equalities included, and each relation's
+/// scan filter with the constants carried across the join.
+fn plan_lines_with(statement: &str, planned: Option<&crate::core::rql::join::JoinPlan>) -> Vec<String> {
     let flat = crate::core::sql_scan::flatten_whitespace(statement);
     let sql = flat.trim();
     let head = sql
@@ -280,17 +289,34 @@ fn plan_lines(statement: &str) -> Vec<String> {
     match crate::core::rql::join::parse_from_clause(from) {
         Ok(relations) if relations.len() > 1 => {
             push(depth, "Hash Join".to_string());
-            for r in relations.iter().skip(1) {
+            let planned = planned.filter(|p| p.relations.len() == relations.len());
+            for (n, r) in relations.iter().enumerate().skip(1) {
                 if let Some(join) = &r.join {
-                    let key = if join.left_qualified.is_empty() {
-                        "no equality: every pair is tested".to_string()
-                    } else {
-                        format!("{} = {}", join.left_qualified, join.right_qualified)
+                    let (kind, key) = match planned.and_then(|p| p.relations[n].join.as_ref().map(|j| (p, j))) {
+                        Some((p, j)) => (
+                            format!("{:?}", j.kind),
+                            if j.keys.is_empty() {
+                                "no equality: every pair is tested".to_string()
+                            } else {
+                                j.keys
+                                    .iter()
+                                    .map(|(left, right)| {
+                                        format!("{}.{left} = {}.{right}", p.relations[j.left_rel].label, r.label)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(" AND ")
+                            },
+                        ),
+                        None => (
+                            format!("{:?}", join.kind),
+                            if join.left_qualified.is_empty() {
+                                "no equality: every pair is tested".to_string()
+                            } else {
+                                format!("{} = {}", join.left_qualified, join.right_qualified)
+                            },
+                        ),
                     };
-                    push(
-                        depth + 1,
-                        format!("{:?} join {}: {}", join.kind, r.label, key),
-                    );
+                    push(depth + 1, format!("{kind} join {}: {key}", r.label));
                     for extra in &join.extra {
                         push(depth + 2, format!("Join Filter: ({extra})"));
                     }
@@ -299,7 +325,7 @@ fn plan_lines(statement: &str) -> Vec<String> {
             if let Some(f) = filter {
                 push(depth + 1, format!("Filter: ({f})"));
             }
-            for r in &relations {
+            for (n, r) in relations.iter().enumerate() {
                 push(
                     depth + 1,
                     format!(
@@ -312,6 +338,9 @@ fn plan_lines(statement: &str) -> Vec<String> {
                         }
                     ),
                 );
+                if let Some(predicate) = planned.map(|p| p.relations[n].predicate.as_str()).filter(|p| !p.is_empty()) {
+                    push(depth + 2, format!("Scan Filter: ({predicate})"));
+                }
             }
         }
         Ok(relations) if relations.len() == 1 => {
@@ -373,7 +402,15 @@ where
             Err(e) => return fail_statement(state, stream, "XX000", &e.to_string()).await,
         }
     }
-    let mut lines = plan_lines(&explain.statement);
+    // A join's keys and scan filters as the planner reads them; the text's
+    // own reading when it does not plan.
+    let planned = if is_select {
+        let schema_of = |name: &str| database.schema_view(name).map(|v| v.schema().fields.clone());
+        crate::core::rql::join::plan_statement(&explain.statement, &schema_of).ok()
+    } else {
+        None
+    };
+    let mut lines = plan_lines_with(&explain.statement, planned.as_ref());
     if explain.analyze {
         let started = std::time::Instant::now();
         let outcome = if is_select {

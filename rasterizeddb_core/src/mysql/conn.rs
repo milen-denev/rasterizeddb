@@ -694,6 +694,7 @@ impl Session {
             limits: self.shared.config.limits,
             watch: self.peer_watch.clone(),
             parameters,
+            lenient_booleans: true,
         };
         match PgBridge::open(self.shared.catalog.clone(), database, options).await {
             Ok(bridge) => {
@@ -2493,6 +2494,7 @@ impl Session {
             limits: self.shared.config.limits,
             watch: None,
             parameters: HashMap::new(),
+            lenient_booleans: true,
         };
         let mut bridge = match PgBridge::open(self.shared.catalog.clone(), database, options).await
         {
@@ -2796,9 +2798,13 @@ impl Session {
                 A::SetDefault => Some("SET DEFAULT"),
             };
             for fk in view.schema().foreign_keys.iter().filter(|f| !f.is_deleted) {
+                let list = |columns: &[String]| columns.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ");
                 let mut line = format!(
-                    "  CONSTRAINT `{}` FOREIGN KEY (`{}`) REFERENCES `{}` (`{}`)",
-                    fk.name, fk.column, fk.parent_table, fk.parent_column
+                    "  CONSTRAINT `{}` FOREIGN KEY ({}) REFERENCES `{}` ({})",
+                    fk.name,
+                    list(&fk.columns),
+                    fk.parent_table,
+                    list(&fk.parent_columns)
                 );
                 if let Some(a) = action(&fk.on_delete) {
                     line.push_str(&format!(" ON DELETE {a}"));

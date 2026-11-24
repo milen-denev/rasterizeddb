@@ -1,7 +1,7 @@
 # Hash partitioning
 
-Status: **phases 0, 1, 2a and 2b built** (2b through S20, 2026-10-24); **not
-advertised**, and **phases 3 to 7 designed, not built**, except phase 3's P3
+Status: **phases 0, 1, 2a and 2b built** (2b through S20, 2026-10-24); **advertised**
+(supported, and shipped tested in the 1.0.1 release), and **phases 3 to 7 designed, not built**, except phase 3's P3
 (composite identifying keys, [as built](#phase-3-p3-as-built)), P1
 (metadata DDL, [as built](#phase-3-p1-as-built)), P4 (foreign keys both
 ways, [as built](#phase-3-p4-as-built)), P5a (the lazy-open plumbing:
@@ -26,8 +26,9 @@ derivation for full-key point reads, `RETURNING`, `ON CONFLICT` and joins.
 What is still refused, and which phase lifts it, is §2's table; the summary
 is [Phase 2b as built](#phase-2b-as-built). Left from 2a: S12 (a cheap
 cross-partition `ORDER BY` merge and the statement worker budget, §8), which
-waits on the scan-concurrency owner, and §15's ext4 measurements. "Advertised"
-waits on one idle-box wall-clock A/B (§15). Line anchors were read on 2026-10-16 at
+waits on the scan-concurrency owner, and §15's ext4 measurements. The idle-box
+wall-clock A/B (§15) is a performance comparison, not a correctness gate; it no
+longer holds back "advertised" (2026-11-24) and is still to be recorded. Line anchors were read on 2026-10-16 at
 `61e9200` and are relative to `rasterizeddb_core/src/`. `core/row/table.rs`,
 `core/vacuum.rs` and `core/filter/sarg.rs` are being edited by another session,
 so anchors there will drift; the function names are the stable part. Siblings:
@@ -104,8 +105,9 @@ listed in `pg_indexes`, and refuses `DROP INDEX`.
 ## Phase 2b as built
 
 Built on `feat/partition-2b` (S15–S20, 2026-10-24), over phase 2a. Not
-advertised: §15's exit criterion is met on instructions per op, and the
-idle-box wall-clock A/B is still to run.
+advertised at the time: §15's exit criterion is met on instructions per op, and the
+idle-box wall-clock A/B is still to run. (Advertised since 2026-11-24, for the 1.0.1
+release; the A/B is a performance comparison and no longer gates it.)
 
 **What works on a partitioned table**, answering like a plain twin (I6):
 
@@ -144,18 +146,33 @@ idle-box wall-clock A/B is still to run.
 | ~~`ALTER TABLE` in every form, `RENAME`, `CREATE INDEX`~~ (metadata forms built in phase 3 P1, below); ~~FKs onto or from a partitioned table~~ (built in phase 3 P4); ~~physical-rewrite `ALTER`~~ (built in phase 6 P8, [as built](#phase-6-p8-as-built)) | 6 |
 | ~~A key change: an `UPDATE` assigning a key column anything its `WHERE` does not pin to the same value~~ moves the row since phase 6 P9 ([as built](#phase-6-p9-as-built)); a `DO UPDATE` that would move it stays refused, as in PostgreSQL | 6 (row moves, §9) |
 | Conversion (`ALTER … PARTITION BY`, `CREATE INDEX … USING partition`); ~~reshapes (`SPLIT`, `ISOLATE KEY`, `SPLIT KEY`, `MERGE`, `MOVE PARTITION`)~~ built in phase 5 P7 ([as built](#phase-5-p7-as-built)) | 5 |
-| `CREATE … PARTITION BY` as a temporary or unlogged table, in an in-memory database, in a mirrored pool, on KV storage, or with shredded JSON columns | not scheduled (KV until measured; off-root placement 4) |
+| `CREATE … PARTITION BY` as a temporary or unlogged table, in an in-memory database, in a mirrored pool, or with shredded JSON columns; ~~on KV storage~~ built: `STORAGE PLACE TABLE t AT 'kv:<store>'` before the `CREATE` ([kv-partitions.md](kv-partitions.md), `tests/partition_kv.rs`) | not scheduled (off-root placement 4) |
 
 **Known limits** (correct answers, not refusals, unless stated):
 
-- **Joins do not infer a key route transitively.** `t JOIN d ON t.k = d.k
-  WHERE d.k = 5` routes `d` but fans out over `t`: each relation routes on its
-  own pushed-down predicate only (§4.1).
-- **`k = 1 AND k = 2` is not proved empty.** Two equalities on one key level
-  are unioned, never intersected (§4.2, step 3), so the statement reads both
-  partitions and the scan returns no rows. Only a clause
-  `clause_is_constant_false` proves false (a comparison of constants, such
-  as `1 = 0`) routes to none.
+- ~~**Joins do not infer a key route transitively.**~~ Built 2026-11-23
+  (`join::infer_join_constants`): a top-level `col = literal` in one
+  relation's scan predicate is carried across the join's equalities and
+  added to the other relation's scan, so `t JOIN d ON t.k = d.k WHERE
+  d.k = 5` routes `t` to one partition too. Carried both ways across an
+  `INNER` key and a top-level `WHERE` equality between two relations (a
+  comma join's); across a `LEFT` key only from the preserved side to the
+  joined one; never across `RIGHT`, `FULL` or cross keys. Only an integer or
+  quoted-string literal, between columns of one type (integers of any width
+  when the value fits), never a case-insensitive column, and to a fixpoint,
+  so chains carry. Still not carried: an `IN` list, a range, a parameter
+  the text path has not rendered. Tests:
+  `row_source::join_tests::a_join_reads_only_the_partitions_its_own_predicate_proves`
+  (route counts), `…::carried_join_constants_answer_as_the_uninferred_plan`
+  (answers against the same queries written so nothing is carried, on a
+  partitioned table and its plain twin), `join::outer_join_reference::join_constants_are_carried_only_where_sound`.
+- ~~**`k = 1 AND k = 2` is not proved empty.**~~ Built 2026-11-23: two sets
+  for one key level inside an `AND` intersect (`route::KeyBox::meet`),
+  compared by the bytes the router hashes (`key::route_bytes`), so the
+  intersection is exactly as sound as routing; an empty one routes to
+  `Route::Zero` and reads no partition, as PostgreSQL prunes it. A value
+  that does not normalise still unions, which only widens. `t IN (1, 2) AND
+  t IN (2, 3)` routes to tenant 2.
 - **A partitioned target of `UPDATE … FROM` / `DELETE … USING` was refused**
   in 2b, as was any statement that addresses rows by one identifying
   column: a partitioned table has only composite unique keys (§1b). Phase 3
@@ -1367,6 +1384,15 @@ the budget it derives with the SIMD line. A unit whose hard limit is low
 proportionally smaller budget; set `LimitNOFILE` to at least 43,008 (or
 size `partition.open_budget` to it).
 
+**The ceiling is a setting.** The 4,096 above is `partition.max_open`'s
+default: `--partition-max-open N`, the `RDB_PARTITION_MAX_OPEN` environment
+variable, or `SET CONFIG partition.max_open = N` (saved, applied at the
+next start; the flag and the environment win over the file), 16 to
+1,000,000. The start raises the soft limit toward 2,048 + N × 10 within the
+hard limit, and when the hard limit is what stops it short, says so with
+the figure `LimitNOFILE=` needs. pms's five tables of 1,024 partitions want
+`--partition-max-open 5120` and a hard limit of at least 53,248.
+
 **Decision: the budget is soft.** With every open partition held (by a
 statement, a job, or a transaction's kept ticket, P5b-1's close rule), an
 open goes past the budget (counted, `Budget::overruns`) rather than wait
@@ -1909,9 +1935,9 @@ listed at the end):
   (`alter_lock_set`).
 - **Onto a partitioned table**: `REFERENCES p (k)` where `k` is a `UNIQUE`
   or `PRIMARY KEY` of `p`. By §1b such a key holds every partition key
-  column, and a foreign key is one column (composite keys are refused on
-  every table), so `k` **is** `p`'s whole partition key: `PARTITION BY HASH
-  (k)`. Anything else is PostgreSQL's 42830 ("there is no unique constraint
+  column, and a foreign key was one column (composite keys came later, see
+  [Composite keys on partitioned tables](#composite-keys-on-partitioned-tables-as-built)),
+  so `k` **is** `p`'s whole partition key: `PARTITION BY HASH (k)`. Anything else is PostgreSQL's 42830 ("there is no unique constraint
   matching given keys for referenced table …"), at CREATE and ADD
   (`foreign_key::referenced_key_refusal`), and so is a partitioned table
   created under a name an existing key already names by another column.
@@ -2484,10 +2510,13 @@ here).
 
 - An `ON UPDATE CASCADE`, `SET NULL` or `SET DEFAULT` that writes a
   partitioned child's partition key column is a key change: refused with
-  0A000 until phase 6 moves rows. PostgreSQL moves the row.
-- Keys are one column on every table, so a table partitioned by two or
+  0A000 until phase 6 moves rows. PostgreSQL moves the row. (Since phase 6
+  the action's `UPDATE` moves it, as any key-changing `UPDATE` does: pinned
+  for composite keys by `fk_composite_tests::composite_keys_hold_on_and_onto_partitioned_tables`,
+  whose `ON UPDATE CASCADE` moves `ev` rows to their new partition.)
+- ~~Keys are one column on every table, so a table partitioned by two or
   three columns can be referenced by no key at all; composite keys would
-  lift that.
+  lift that.~~ Lifted: [Composite keys on partitioned tables](#composite-keys-on-partitioned-tables-as-built).
 - ~~By reading: a column-level `CONSTRAINT n REFERENCES p (k)` gave its key
   no name of its own~~ (fixed in round 2, `lexer_ct::inline_constraint_name`).
 - Seen while pinning round 3, not investigated (CHECK code P4 does not
@@ -2496,6 +2525,116 @@ here).
 - The insert-time check finds its parent by exact name (`has_table`), as
   every lookup here does (identifiers are not case-folded, an open finding):
   a key on `P` never matches `p`.
+
+## Composite keys on partitioned tables (as built)
+
+Built on `wip/6f-cfkpart` (from local dev `2c90dc56`, 2026-11-24), after
+composite foreign keys (`86d19ac2`, `2e92e54f`), which refused them on and
+onto hash-partitioned tables (0A000). The layout it was built for, `pms`:
+
+```sql
+CREATE TABLE "case" (domain_id BIGINT NOT NULL, id BIGINT NOT NULL, PRIMARY KEY (domain_id, id));
+CREATE TABLE step (domain_id BIGINT NOT NULL, case_id BIGINT NOT NULL, id BIGINT NOT NULL,
+  PRIMARY KEY (domain_id, case_id, id)) PARTITION BY HASH (domain_id, case_id) PARTITIONS 4;
+CREATE TABLE field (domain_id BIGINT NOT NULL, case_id BIGINT NOT NULL, step_id BIGINT NOT NULL, id BIGINT NOT NULL,
+  PRIMARY KEY (domain_id, case_id, step_id, id)) PARTITION BY HASH (domain_id, case_id) PARTITIONS 4;
+ALTER TABLE field ADD CONSTRAINT field_step_fk FOREIGN KEY (domain_id, case_id, step_id)
+  REFERENCES step (domain_id, case_id, id);                      -- partitioned onto partitioned
+ALTER TABLE step ADD CONSTRAINT step_case_fk FOREIGN KEY (domain_id, case_id)
+  REFERENCES "case" (domain_id, id);                             -- partitioned onto plain
+```
+
+**What works**, each answer PostgreSQL 17's with declarative partitions
+(`MODULUS`/`REMAINDER` children), statement for statement: a partitioned
+table's composite key onto a plain or a partitioned parent and a plain
+table's onto a partitioned one, inline in `CREATE TABLE … PARTITION BY` or
+by `ADD` (validated in every partition); the child's checks on every write
+path (multi-row, `ON CONFLICT`, `INSERT … SELECT`, `COPY`, prepared, and
+`UPDATE`, including one that moves a row to another partition by changing
+its partition key); `MATCH SIMPLE`/`FULL`; a partitioned table onto itself
+(the postponed check behind `Database::fk_onto_itself`); every parent-side
+action, `ON DELETE SET NULL (cols)` included, either side partitioned (an
+`ON UPDATE CASCADE` that writes a partitioned child's partition key moves
+its rows, phase 6's move); `DROP CONSTRAINT`, `DROP COLUMN` (2BP01 for a
+referenced column, the key dropped with a referencing one), `DROP TABLE`
+(2BP01, `CASCADE`), `RENAME COLUMN` and `RENAME TO` on both sides; the
+catalogue rows of the plain-table keys (PostgreSQL's rows for the
+partitioned parent, `conparentid = 0`; its per-partition clones are not
+shown); conversion of a table holding composite keys, as child or as
+parent, by `ALTER TABLE … PARTITION BY` and `CREATE INDEX … USING
+partition`, so a `pg_dump` of `pms` restores (the dump converts the tables
+in its index section and adds the keys after it, as `pg_dump` orders
+post-data items; both orders are tested); the reshapes, the rewrite of a
+populated partitioned table, and a restart.
+
+**The declaration rule.** The referenced columns are exactly a unique key
+of the parent, and a unique key of a partitioned table holds every
+partition key column (§1b), so they cover the parent's partition key. That
+is checked again where a key is declared and where a partitioned table is
+created or converted under a name keys already reference
+(`foreign_key::referenced_key_refusal`: every partition key column among
+the referenced ones, else 42830); a one-column key's rule, the whole
+one-column partition key, is the same rule.
+
+**How a check routes** (`fk_composite::tuples_now`, the composite
+counterpart of `referenced_values_now`):
+
+- *Parent side* (`KeySide::Parent`: an insert's or update's probe and its
+  recheck under the key lock, `ADD`'s and `VALIDATE`'s chunks, `ON UPDATE`'s
+  "is the old tuple still held"): each tuple is routed by the bytes its
+  partition key columns encode to (`tuple_key_ranges`: the parent-typed
+  literal through `lexer_ir::encode_column_value`, the encoder an `INSERT`
+  stores and routes by, then `keyed_range` over all levels), and only those
+  partitions are read (`RowSource::partitioned_in`), the probe's predicate
+  applied in each. So `(-3, 7)`, which `route_where` reads no point in (a
+  signed number), routes too. A value that encodes as no key of its column
+  is routed on the predicate (correct, the rare case, warned); a key whose
+  referenced columns miss a partition key column (only a record written
+  behind the DDL) is refused with 0A000 "cannot be checked … not
+  supported", never read everywhere and never skipped.
+- *Child side* (`KeySide::Child`: a parent `DELETE`'s or key-moving
+  `UPDATE`'s "does any child reference these tuples", before and after its
+  action, and the self-reference's end-of-statement check): routed the same
+  way when the child's partition key columns are among the key's columns (a
+  co-located child, `field` on `step`), else every partition the predicate
+  does not rule out. The action itself is SQL through `execute_with_context`,
+  routed as any statement is (`route_where`: a signed key value reads every
+  partition, §4.1).
+- *Locks* are the plain path's: the tuple's key-share lock on (parent's
+  logical name, `lock_column` of the referenced columns, `lock_key` of the
+  stored bytes), so no partition enters it and a child insert racing a
+  parent delete meets it whichever partitions hold the two rows.
+
+Nothing else is new: the composite paths already read through `Relation`
+(`relation_rows_as_of`, `tuples_as_of`, `keys_about_to_change`), the
+partitioned `INSERT`, `UPDATE` and `DELETE` arms call the same helpers the
+plain ones do, and the key lives in the shell's FK sidecar, which a reshape
+does not touch and a conversion or rewrite writes from the definition. No
+storage change: the composite records and the `composite_foreign_key_v1`
+fence are the ones `86d19ac2` laid out (the fence is set by `ADD`, `CREATE …
+PARTITION BY`, a conversion and a rewrite alike); byte 128 of the unique
+key slot is not touched.
+
+**Tests.** `fk_composite_tests::composite_keys_hold_on_and_onto_partitioned_tables`
+(the `pms` layout, every path above, a restart),
+`…::composite_keys_on_partitioned_tables_follow_their_ddl`,
+`…::composite_keys_survive_conversion_reshapes_and_rewrites`;
+`fk_partition_tests::a_composite_check_of_a_partitioned_parent_reads_one_partition_per_tuple`
+(the probe and its recheck in the tuple's one partition, a negative key's
+too; a multi-row insert at most one per tuple; a co-located child's side of
+a parent delete on its route) and
+`…::a_composite_check_that_cannot_route_is_refused_never_skipped`;
+`rasterizeddb_compat/tests/composite_foreign_keys.rs`
+(`composite_keys_on_and_onto_partitioned_tables`, prepared, `COPY` and the
+catalogues over a real client; `composite_key_actions_across_partitioned_tables`);
+`tests/pg_dump_round_trip.rs::real_pg_dump_round_trips_composite_keys_on_partitioned_tables`
+(a real `pg_dump` of `pms`, plain and custom, restored and enforced).
+
+**Still unlike PostgreSQL:** a violation on the parent side names the key
+(`field_step_fk`) where PostgreSQL 17 names the clone it attached to the
+referenced partition (`field_domain_id_case_id_step_id_fkey2`); the
+catalogues show the partitioned table's key only, not one clone per
+partition.
 
 ## Phase 3 P3 as built
 
@@ -3427,14 +3566,15 @@ built.
 |---|---|
 | `PARTITION BY RANGE` or `LIST`; `DEFAULT` partitions | not designed |
 | `PARTITION OF … FOR VALUES WITH (MODULUS m, REMAINDER r)`, `ATTACH`, `DETACH` | the child would hold different rows than in PostgreSQL. A later phase may accept `PARTITION OF` as a **write-only alias** (`INSERT` and `COPY` route through the parent, as a `pg_dump` restore needs; `SELECT`, `UPDATE`, `DELETE` stay refused). |
-| A key breaking §1.4 or §1.5, or over three columns; a unique key without every key column | §1.4, §1.5, §1b |
+| A key breaking §1.4 or §1.5, or over three columns; a unique key without every key column (0A000, PostgreSQL's code for its "unique constraint on partitioned table must include all partitioning columns") | §1.4, §1.5, §1b |
+| A key column dropped, retyped or made nullable (42P16, PostgreSQL's "cannot drop column … because it is part of the partition key"); a partition count out of range (22023) | §1.5 |
 | Naming a partition; `CREATE TABLE` or `RENAME` to a `__pt_` name | `add_table` checks only `contains_key` (`core/database/mod.rs:2100`); rename refuses only the JSON shadow prefix (`database/mod.rs:1408`) |
 | `STORAGE MOVE TABLE t` | points at `MOVE PARTITION` |
 | JSON columns in shredded mode | shadow tables would be unpartitioned; native JSONB is fine |
-| Temporary partitioned tables; KV-backed partitions | KV until measured |
+| Temporary partitioned tables | not scheduled |
 | `DROP INDEX` on a `USING partition` index | not an index (above) |
 | Until their phase: physical-rewrite `ALTER` on partitioned tables (phase 6, §11; the metadata forms, `RENAME` and `CREATE`/`DROP INDEX` are built in phase 3 P1); point-changing key assignment (phase 6, §9; any key assignment its `WHERE` does not pin to the same value, §4.5, which includes an `ON UPDATE CASCADE`, `SET NULL` or `SET DEFAULT` writing a child's partition key column); conversion and reshapes (phase 5). `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, `NOWAIT` and partitioned targets of `UPDATE … FROM`/`DELETE … USING` are built (phase 3 P3, §1b); FKs either way are built (phase 3 P4, §10) | §15 |
-| A `FOREIGN KEY` referencing a partitioned table by anything but its whole partition key (42830, PostgreSQL's "no unique constraint matching given keys": a unique key holds every key column, §1b, and a key is one column) | §10 |
+| A `FOREIGN KEY` referencing a partitioned table by columns that miss one of its partition key columns (42830, PostgreSQL's "no unique constraint matching given keys": a unique key holds every key column, §1b); composite keys are built ([as built](#composite-keys-on-partitioned-tables-as-built)) | §10 |
 
 **What phase 2b refuses, as built (S20).** Each with 0A000 and "not
 supported" and a reason, before anything is read or written; the twin's
@@ -3450,7 +3590,7 @@ answers like a plain table (below).
 | ~~`FOREIGN KEY` from a partitioned table (`CREATE … PARTITION BY`, `ADD CONSTRAINT`), and onto one (`REFERENCES`, `ADD CONSTRAINT`)~~ | ~~`CREATE` and the DDL arms~~ | lifted by phase 3 P4 ([as built](#phase-3-p4-as-built)); onto one by any column but its whole partition key: 42830, not a refusal |
 | An `UPDATE` assigning a key column anything its `WHERE` does not pin to the same value (`SET tenant_id = 5 WHERE tenant_id = 1`, `SET g = g + 1`), and a `DO UPDATE` that does so when its conflict happens | `assignments_keep_point` before routing (`DO UPDATE`: before the update writes); the range guard on every merged row behind it | phase 6 (row moves, §9) |
 | `ALTER … PARTITION BY`, `CREATE INDEX … USING partition` (on plain tables too); ~~`SPLIT PARTITION`, `ISOLATE KEY`, `SPLIT KEY`, `MERGE PARTITIONS`~~ (built in phase 5 P7); `STORAGE MOVE TABLE` on the logical name, which points at `MOVE PARTITION` (built in P7) | the ALTER, CREATE INDEX and STORAGE arms | phase 5 |
-| Temporary and unlogged partitioned tables; an in-memory database; a storage pool with backup mirrors; KV-backed partitions; shredded JSON columns | `CREATE … PARTITION BY` | not scheduled; KV until measured |
+| Temporary and unlogged partitioned tables; an in-memory database; a storage pool with backup mirrors; shredded JSON columns; ~~KV-backed partitions~~ (built, [kv-partitions.md](kv-partitions.md)) | `CREATE … PARTITION BY` | not scheduled |
 
 `ON CONFLICT` with a target that is not exactly one unique key (one that leaves
 out a key column, a subset or a superset) is not a refusal but PostgreSQL's
@@ -3709,7 +3849,7 @@ resolve the table name and dispatch on `relation()`:
 | INSERT | after defaults, generated values and CHECKs (`executor.rs:9917`), from the final `RowWrite`; `RETURNING` is built from the payload the partition stores (§9) |
 | INSERT … ON CONFLICT | **As built (S18):** `check_conflict_target_infers_a_key` and `check_partitioned_conflict_target` at the statement's first dispatch (42P10 before anything runs); the insert routes as above; `DO UPDATE` re-dispatches its generated `UPDATE … WHERE <target> = <literal>` through the UPDATE hook, which routes it to the inserted row's partition (§9) |
 | UPDATE / DELETE | `executor.rs:10318` / `:10737`; **as built:** `execute_partitioned_update` / `execute_partitioned_delete`, which resolve the `RETURNING` list (`check_partitioned_write`) and, for an `UPDATE`, prove its key assignments keep the point (`assignments_keep_point`, §4.5) before routing, then `write_partitions` (§9) |
-| Joins | `execute_join`'s relation loop (`executor.rs:24`): each relation's pushed-down predicate routes it. **As built (S19):** the loop resolves each relation through `Database::relation`; a partitioned one is read by `RowSource::partitioned_with`, which plans its fan-out (`FanOut::plan_with`) under the `Visibility` the join already holds, so every relation and partition, a self-join's two sides included, reads under one snapshot, scoped or not. Each routes on its own pushed-down predicate, the exact text its scans evaluate, through `route_where` (`extract_gated`, never the path-aware variant). No transitive inference: `t JOIN d ON t.k = d.k WHERE d.k = 5` fans out on `t`, correct and slower (future work). |
+| Joins | `execute_join`'s relation loop (`executor.rs:24`): each relation's pushed-down predicate routes it. **As built (S19):** the loop resolves each relation through `Database::relation`; a partitioned one is read by `RowSource::partitioned_with`, which plans its fan-out (`FanOut::plan_with`) under the `Visibility` the join already holds, so every relation and partition, a self-join's two sides included, reads under one snapshot, scoped or not. Each routes on its own pushed-down predicate, the exact text its scans evaluate, through `route_where` (`extract_gated`, never the path-aware variant). Since 2026-11-23 a pin is carried across the join's equalities first (`join::infer_join_constants`, Known limits above), so `t JOIN d ON t.k = d.k WHERE d.k = 5` routes `t` to one partition. |
 | UNION, CTEs, `IN (SELECT …)` | re-dispatched as SQL text (`substitute_in_subqueries`, `executor.rs:645`) |
 | `$n` | already inlined as literal text (`pg_params.rs:97`) |
 
@@ -4180,7 +4320,7 @@ read must cost no more than an unpartitioned one plus one route. Phase 6's `proc
 | ORDER BY … LIMIT k OFFSET o | each partition returns its sorted top `k + o` (`QueryRows.limit` already includes OFFSET); concatenate and re-cut with `sort_rows_if_needed` (`concurrent_processor.rs:1800`, made `pub(crate)`) |
 | ORDER BY without LIMIT, DISTINCT, windows, expression sorts | gather, then the existing post-scan pipeline; valid because every partition's schema is a clone of one, so `write_order`s agree |
 | Prepared SELECT and COUNT | **As built (S15, S16b):** the learned parse, read through `read_partitioned` like the text path, routed per execution (§4.1, I11). `run_statement` runs it inside `statement_snapshot::scope`, so a fan-out takes one snapshot on the fast path too (I7); a full-key point read names its partition from the bound key (`RoutePlan`, `keyed_range`), snapshot first; a one-partition read is awaited in place |
-| Joins | concatenated bytes in one `RowSet::Serialized` (`core/rql/join.rs:331`); the 4 GiB cap (`join.rs:343`) applies to the sum, and still errors. **As built (S19):** every relation and partition, a self-join's two sides included, under the join's one `Visibility` (`FanOut::plan_with`), each relation routed on its own pushed-down predicate (§4.1), with no transitive inference across `ON` (a key pinned only on the other side fans out: correct, slower). A prepared join takes the scoped text path. `UPDATE … FROM`/`DELETE … USING` read a partitioned source through the same join, and only a plain target is written back; a partitioned target is refused (phase 3) |
+| Joins | concatenated bytes in one `RowSet::Serialized` (`core/rql/join.rs:331`); the 4 GiB cap (`join.rs:343`) applies to the sum, and still errors. **As built (S19):** every relation and partition, a self-join's two sides included, under the join's one `Visibility` (`FanOut::plan_with`), each relation routed on its own pushed-down predicate (§4.1), with a key pinned on the other side carried across the equality since 2026-11-23 (`join::infer_join_constants`). A prepared join takes the scoped text path. `UPDATE … FROM`/`DELETE … USING` read a partitioned source through the same join, and only a plain target is written back; a partitioned target is refused (phase 3) |
 | FOR UPDATE, SKIP LOCKED | refused until composite identifying keys (§1b); then gathered |
 
 **An empty route still runs the pipeline.** A constant-false clause, or only
@@ -4541,10 +4681,30 @@ and is not designed here.
 
 ## 14. Observability
 
-- **`pg_class`** lists the logical table as relkind `'r'`; its size and tuple
-  counts are the running totals (§7.4). `'p'` would send psql and pg_dump to `pg_partitioned_table`,
-  which `catalog_views.rs` lacks, and to children they cannot query.
-- **`pg_inherits`** stays empty (`core/rql/catalog_views.rs:1122`).
+- **`pg_class`** lists the logical table as relkind `'p'`, PostgreSQL's
+  partitioned parent (relkind `'r'` until 2026-11-23); its size and tuple
+  counts are the running totals (§7.4). `pg_partitioned_table` has its row
+  (`partstrat` `'h'`, `partnatts`, `partattrs` by `attnum`, no default
+  partition, `partclass`/`partcollation` zeros: the key hashes by §1.3, not
+  an operator class), and `pg_get_partkeydef(oid)` answers `HASH (a, b)`.
+  psql's `\d` prints "Partitioned table" and "Partition key"; its
+  foreign-key query reads `pg_partition_ancestors(oid)`, answered as the
+  one row `relid = oid` since nothing here is a partition of anything
+  (`catalog_views::rewrite_reg_casts`). Test:
+  `driver_catalog_and_copy::a_partitioned_table_is_described_as_a_partitioned_parent`.
+- **`pg_inherits`** stays empty: the partitions are not relations a client
+  can name, so `\d` says "Number of partitions: 0".
+- **`pg_dump`** dumps no data for a relkind `'p'` table, expecting the rows
+  in its leaf partitions. So its session alone (`pgwire::pg_dump`, which
+  answers the catalogue queries of a session that set
+  `synchronize_seqscans` off) is shown a partitioned table as a plain one,
+  relkind `'r'`, whose data step is `COPY t TO stdout` over every partition,
+  and its partitioning as a post-data `CREATE INDEX t_partition_key ON
+  public.t USING partition (k, …) WITH (partitions = n)`. A restore here
+  converts the table back; one into PostgreSQL fails that statement and
+  keeps a plain table with every row. [postgres-import.md
+  §11](postgres-import.md#11-the-other-way-pg_dump). Test:
+  `tests/pg_dump_round_trip.rs`.
 - **`pg_index`, `pg_indexes`** list declared indexes from the shell's
   `schema.secondary_indexes`, not live `indexes` (§3.3), and omit the partition
   key.
@@ -4568,7 +4728,7 @@ Each phase is safe alone and refuses what it does not support.
 | **0** | Nesting-aware `CREATE TABLE` trailer scan, making `PARTITION BY`, `PARTITION OF`, `INHERITS`, `ATTACH`, `DETACH` explicit refusals; refusal of `__pt_` names; hard error on a `Wal::register_file` id collision | all partitioning | the three mis-parse shapes, each asserting no catalogue row is written |
 | **1** | Pure, unwired modules: the hash (`partition::xxh64`, `partition::key`), `RangeMap`, the map-log codec, `route(MaskExpr)` | — | route ns/op; I1, I2-pure, I3, I5 |
 | **2a** | **Built** (S1–S11; S12, the worker budget and cheap merge, not built, §8). **The `table.rs` seam (§3.4), one reviewed change:** private data fields, the shell, `open_partition`, the range guard on the merged row, `_with_visibility` variants (their worker cap is S12; 2a bounds partitions in flight with `FANOUT_IN_FLIGHT = 8`, §8), the shared id source.<br>**The table:** `PartitionedTable`, the map, `CREATE … PARTITION BY HASH` with default N = 64 (§1.2), ≤ 2,048 declared partitions per database (§7.1), root only, lazy materialization with exclusive creation, eager `Result` opens, existence checks (I9).<br>**Statements:** routing, single-snapshot fan-out for SELECT and COUNT, routed INSERT, UPDATE, DELETE, VACUUM over the partitions. **Prepared SELECT, UPDATE and DELETE** skip the learned-parse cache (`note_rewritten`), using the text path (2b gives `SELECT` the cache).<br>**Also:** the uniqueness rule, catalogs with running totals, `SHOW PARTITIONS`, DROP, the reaper, the duplicate-name startup refusal, the name-keyed `Database` guards (§3.3). **Not advertised.** | everything else, incl. joins, ON CONFLICT and RETURNING on partitioned tables, and §2's phased refusals (the as-built list is in §2) | on .7, ext4 not tmpfs: 100 concurrent tenants' DELETE/UPDATE mix vs one plain table (expect a large gain); INSERT and point SELECT (expect parity); concurrent same-row increments in one tenant, 40001s vs plain; fan-out latency over 1024 one-row partitions; first-write latency per new tenant; writer stall p99 during a checkpoint with 1024 active partitions; point-read routing cost (< 5 µs); idle wakeups at 1k open partitions. **2b proceeds only if the first shows the gain.** **As measured:** on tmpfs only, partbench and jsonbench (the 2b row's figures); the ext4 items wait for a venue (.7); 2b went ahead without them. |
-| **2b** | **Built** (S15–S20, 2026-10-24; [as built](#phase-2b-as-built)). Joins (per-relation routing, one `Visibility`, no transitive inference; partitioned sources of `UPDATE … FROM`/`DELETE … USING`), the prepared-SELECT cache with late routing (I11) and a cached route derivation for full-key point reads (S16b), `ON CONFLICT` and `RETURNING` on partitioned tables; a same-value key assignment overwrites in place (§4.5). **Not advertised** until the wall-clock A/B below. | as 2a, less these: partitioned targets of `UPDATE … FROM`/`DELETE … USING`, `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, `ALTER`/`RENAME`/`CREATE INDEX`, FKs (phase 3); key changes, including by `DO UPDATE` (phase 6); conversion and reshapes (phase 5) | prepared point-read cost vs plain. **Exit criterion, the end of "not advertised":** in prepared mode, point SELECT by the full key and `COUNT(*)` for one key value run within ~10% of a plain table's ops/s at 1 and 16 clients (partbench, same binary, back to back). As measured on 2a (90e781b, 64 partitions, 1000 × 100 rows) they ran at 0.42–0.53× plain, because 2a's prepared statements skip the learned-parse cache; simple mode was level, so the gap is the parse, not the routing. Writes were already at parity (0.87–1.15×) and unindexed scans within 0–15% (jsonbench, 8 partitions). S15's learned parse brought them to 0.81–0.88× (point) and 0.86–0.93× (`COUNT`), wall-clock on a loaded box; S16b's profile put the rest in re-deriving the route, `join_all` and one async layer. **On a shared box the merge gate** for the prepared-read work is instructions per op plus cycles per op at c=16, part/plain, from `perf` on a profiling build of `examples/partition_prepared_bench.rs`. **As measured (S16b, user-mode instructions per op, part/plain): point 1.02 at c=1 and c=16 (1.19 and 1.18 before), `COUNT` 1.005 (1.04 before): the merge gate is met.** Wall-clock on that box (load 7–30) ranged 0.49–1.96 for one binary, so it is not evidence either way. **"Advertised" additionally needs**, and is still pending, an interleaved wall-clock A/B on a truly idle box: plain and part alternating, ~10 short rounds, the median ratio within ~10%, recorded with its load averages. The owner (rasterizeddb-47) decided this. |
+| **2b** | **Built** (S15–S20, 2026-10-24; [as built](#phase-2b-as-built)). Joins (per-relation routing, one `Visibility`, no transitive inference; partitioned sources of `UPDATE … FROM`/`DELETE … USING`), the prepared-SELECT cache with late routing (I11) and a cached route derivation for full-key point reads (S16b), `ON CONFLICT` and `RETURNING` on partitioned tables; a same-value key assignment overwrites in place (§4.5). **Not advertised** until the wall-clock A/B below. | as 2a, less these: partitioned targets of `UPDATE … FROM`/`DELETE … USING`, `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, `ALTER`/`RENAME`/`CREATE INDEX`, FKs (phase 3); key changes, including by `DO UPDATE` (phase 6); conversion and reshapes (phase 5) | prepared point-read cost vs plain. **Exit criterion, the end of "not advertised":** in prepared mode, point SELECT by the full key and `COUNT(*)` for one key value run within ~10% of a plain table's ops/s at 1 and 16 clients (partbench, same binary, back to back). As measured on 2a (90e781b, 64 partitions, 1000 × 100 rows) they ran at 0.42–0.53× plain, because 2a's prepared statements skip the learned-parse cache; simple mode was level, so the gap is the parse, not the routing. Writes were already at parity (0.87–1.15×) and unindexed scans within 0–15% (jsonbench, 8 partitions). S15's learned parse brought them to 0.81–0.88× (point) and 0.86–0.93× (`COUNT`), wall-clock on a loaded box; S16b's profile put the rest in re-deriving the route, `join_all` and one async layer. **On a shared box the merge gate** for the prepared-read work is instructions per op plus cycles per op at c=16, part/plain, from `perf` on a profiling build of `examples/partition_prepared_bench.rs`. **As measured (S16b, user-mode instructions per op, part/plain): point 1.02 at c=1 and c=16 (1.19 and 1.18 before), `COUNT` 1.005 (1.04 before): the merge gate is met.** Wall-clock on that box (load 7–30) ranged 0.49–1.96 for one binary, so it is not evidence either way. **"Advertised" additionally needed** an interleaved wall-clock A/B on a truly idle box: plain and part alternating, ~10 short rounds, the median ratio within ~10%, recorded with its load averages. The owner (rasterizeddb-47) decided this. On 2026-11-24, for the 1.0.1 release, partitioning was advertised without it, since it measures speed rather than correctness; the A/B is still to be recorded. |
 | **3** | Lazy open, scan-only fan-out opens, idle close, sharded CLOCK, pins, `SWEPT` and `DIRTY`, `MaintenanceMode::External`, lazy `.tmp`, persisted `SERIAL` high-water, metadata DDL and RENAME (§11) under ACCESS EXCLUSIVE on the logical name (the table-lock manager, §11), map-log generations, `fk_reverse`, FKs referencing partitioned tables, composite identifying keys (§1b) with FOR UPDATE, SKIP LOCKED, UPDATE FROM, DELETE USING; up to 65,536 partitions per database (P5b-3), default N measured and kept at 64 (§1.2). **Advertised from here.** | as 2b, less these | fds, heap, wakeups and open cost per partition; startup at 10⁴ partitions with 100 active; time to first forget and to first `SERIAL` insert after restart at 10⁴; first-touch latency |
 | **4** | **Built (P6, 2026-11-05; [as built](#phase-4-p6-as-built)).** Placement at materialize time across locations, weighted across tables; pool guards counting materialized partitions. The gate's fix was already in (`cf943c71`), its crash test extended to partitions. Partitions stay in the root while a backup service runs. Touched-only `sync_durable` not built. | off-root placement under `s3_backup`; backup refuses to run beside off-root partitions (§12) | per-disk group-commit size and throughput at 1, 2, 4 disks |
 | **4b** | S3 snapshots and log archive stream every pool location, with a multi-location restore test; phase-4 refusals lift | — | snapshot time vs location count |
@@ -4597,7 +4757,7 @@ section specifying the mechanism.
 |---|---|---|---|
 | I1 | The hash never changes within a `route_v` | §1.3 | reference and framed golden vectors per family and level |
 | I2 | Insert and query agree on a value's point | §1.3 | property test through the real tokenizer, `insert_row_with_defaults` and `extract_gated`, for every spelling the evaluator calls equal: `42`, `'42'`, `42::bigint`, `$1` text and binary, the prepared render; INT = BIGINT. *(Mutation: hash the literal text.)* **As built:** `partition::table_tests::insert_and_query_agree_on_points_for_every_spelling`, `tests/partition_insert.rs`'s `insert_and_query_agree_on_every_spelling`; **the cached route (S16b):** `pgwire::prepared_partition_tests::the_cached_route_hashes_like_route_where_and_insert`, over SMALLINT, INT, BIGINT, TEXT and a composite (BIGINT, TEXT) key, 900+ values: the bound key's partition equals `route_where`'s and the insert point's, and exactly the certain values bind. *(Mutations: hash a string's quoted text; hash an integer's text.)* |
-| I3 | Routing is a superset, in bounded memory | §4.2, §4.3 | random `WHERE` trees (AND, OR, IN, ranges, casts, functions, contradictions) over random rows: every brute-force-matching partition is routed; two and three 10k-value `IN` lists route in bounded allocation and time, and still as a superset. *(Mutations: intersect inside `And`; prune an `Or` with an unconstrained branch; accept casts; keep only the first box; truncate at the cap instead of degrading; cap after the product; clear the bitmap bit when vacuum finds no live rows.)* **Joins (S19):** `row_source::join_tests::a_join_reads_only_the_partitions_its_own_predicate_proves`: a key pinned in the `WHERE` or an `ON` term reads its partition, a constant-false clause none, a key pinned only on the other side every materialized one. *(Mutation: route on an empty clause instead of the relation's predicate.)* |
+| I3 | Routing is a superset, in bounded memory | §4.2, §4.3 | random `WHERE` trees (AND, OR, IN, ranges, casts, functions, contradictions) over random rows: every brute-force-matching partition is routed; two and three 10k-value `IN` lists route in bounded allocation and time, and still as a superset. *(Mutations: union two `And` sets that do not normalise as if they did, or intersect raw bytes (the intersection is by `route_bytes` since 2026-11-23, and the test admits `Zero` only where no sampled row matches); prune an `Or` with an unconstrained branch; accept casts; keep only the first box; truncate at the cap instead of degrading; cap after the product; clear the bitmap bit when vacuum finds no live rows.)* **Joins (S19):** `row_source::join_tests::a_join_reads_only_the_partitions_its_own_predicate_proves`: a key pinned in the `WHERE` or an `ON` term reads its partition, a constant-false clause none, a key held to two values none, a key pinned only on the other side (by `ON`, a comma join's `WHERE`, a chain, a `LEFT JOIN`'s preserved side) its one partition. *(Mutation: route on an empty clause instead of the relation's predicate.)* |
 | I4 | No row outside its range; no update changes a point | §4.5 | an injected wrong route errors; a key-changing `UPDATE` with no other transaction running (in-place fast path eligible) returns 0A000, the in-place counter stays, I6 finds no stray row. *(Mutations: remove the guard; move it back onto the relocating branch only, which I6 must catch.)* **As built:** `tests/partition_write.rs`'s `refused_writes_change_nothing` and `a_genuine_key_change_is_refused_before_any_partition_write` (a statement keeping one row's point and moving another's, in one partition: refused, no in-place overwrite, nothing changed); `tests/partition_upsert.rs`'s `a_do_update_that_moves_the_point_is_refused_before_any_write`; the twin's `UpdateKeyChange` and `InsertOnConflictKeyChange` (refused) and `UpdateKeySameValue` and `InsertOnConflictKeyAssign` (compared). **In-place eligibility (97e187f, §4.5):** `a_same_value_key_assignment_writes_no_more_versions_than_the_twin`, the twin's `reltuples`, `n_live_tup` and `n_dead_tup` after each same-value assignment. |
 | I5 | The map is total and disjoint | §1.1 | fuzz the map log, truncating or corrupting at every offset: the last valid epoch is recovered, or the table refused loudly |
 | I6 | A partitioned table answers like a plain twin | everything | **twin-table model test**, extending the index model test: N = 7 and 1024, open budget 1, random reshapes between; random inserts, updates (in place, relocating, same-value key assignment), deletes, rollbacks, conflicts, ON CONFLICT, RETURNING, VACUUM, VACUUM FULL, IN, OR, `$n`, prepared runs; every read compared (counts, aggregates, ORDER BY LIMIT OFFSET, DISTINCT, windows, joins). Empty routes: `COUNT(*)`, `MAX`, other aggregates without `GROUP BY`, `RETURNING`, `UPDATE … RETURNING`, on a never-written tenant and on `WHERE tenant_id = 1 AND tenant_id = 2`. **As built (2b):** `tests/partition_twin.rs`, four configurations (`twin_hash_tenant_7`, `twin_hash_tenant_64`, `twin_hash_tenant_grp_64`, `twin_hash_full_key_7`), seeds 0x5eed0001 and 0x5eed7a11 at 300 statements by default (`PART_TWIN_SEED`, `PART_TWIN_OPS`), a restart midway, what both tables store compared after writes, every kind required to run and every answering kind to agree on rows; each pgwire session's answers (rows as multisets where PostgreSQL gives no order, column names, type OIDs, tags, SQLSTATEs) compared, inside blocks too. The 2b kinds: the RETURNING kinds (S17), the ON CONFLICT kinds with 42P10 and 21000 (S18), `Join`, `LeftJoin`, `SelfJoin`, `JoinRouted`, `JoinFanOut`, `JoinPartitionedBoth`, `JoinAggregates`, `PreparedJoin`, `UpdateDimFromT`, `DeleteDimUsingT` (S19), and prepared reads that must run from the learned parse (S15). `REFUSED` holds only `UpdateKeyChange`, `InsertOnConflictKeyChange` (phase 6), `UpdateFrom`, `DeleteUsing`, `ForUpdate`, `SkipLocked` (phase 3); `KNOWN_DIVERGENCES` is empty. N = 1024, the open budget and reshapes wait for phases 3 and 5. `tests/partition_shell_sites.rs` runs each statement front door against a twin too (I8). **Phase 3 P1:** twenty-one DDL kinds (indexes, unique keys, CHECKs, defaults, NOT NULL, RENAME round trips of a column, the key and the table run as sequences with reads and writes under the change, a marking DROP COLUMN, a prepared SELECT across a RENAME COLUMN) compared, and the refused ones (`UniqueWithoutKey`, `DropNotNullKey`, `DropKeyColumn`, `AddColumnPopulated`, `AlterType`, `DropNotNull` of a NOT NULL column, `AddForeignKey`) in `REFUSED`; `SUCCEEDING_DDL` requires each changing kind to succeed on both at least once. **Phase 3 P4:** `AddForeignKey` leaves `REFUSED`; three foreign-key round trips (`ForeignKeyFromT`, `ForeignKeyOntoPartitioned`, `ForeignKeyFromSink`) are compared and in `SUCCEEDING_DDL`, with a per-side `{k}` parent partitioned by its key on the partitioned side. *(Mutations: a reload keeping one partition's old instance; the shell's sidecars written after the partitions reopen; the shape epoch left after a renamed column: `partitioned_ddl_tests::a_schema_change_reopens_every_open_partition_under_one_schema`.)* |
@@ -4644,8 +4804,9 @@ section specifying the mechanism.
 8. **Index memory** is rebuilt on every reopen; if that churns, use a longer
    idle window or [persistent indexes](persistent-indexes.md), whose v1 loads
    a snapshot instead after a clean close (§7.2, point 4).
-9. **`pg_dump`** emits a plain table, relkind being `'r'` (§14); a re-import
-   loses partitioning unless the importer is told.
+9. ~~**`pg_dump`** does not run against this server yet~~: it does since
+   2026-11-23, and a partitioned table's rows are dumped (§14). A dump
+   restores the partitioning here; into PostgreSQL it restores a plain table.
 10. **Out of scope:** a physical tenant drop (§13), and global uniqueness on a
     non-key column, which would need a hidden table partitioned by it and a
     two-partition write protocol.

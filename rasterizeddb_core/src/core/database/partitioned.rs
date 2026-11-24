@@ -714,6 +714,15 @@ impl Database {
                 key.len()
             )));
         }
+        // Named before any rule about it: a conversion's unknown key column
+        // read as a unique key missing it. `CREATE` checks this as it
+        // parses; a conversion's definition is the table's own.
+        if let Some(column) = key.iter().find(|k| !ct.columns.iter().any(|c| c.name.eq_ignore_ascii_case(k))) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("partition key column \"{column}\" does not exist"),
+            ));
+        }
         // Foreign keys both ways (phase 3 P4): each one it declares checked
         // as a plain CREATE checks it, and any naming it (or itself) must
         // reference its whole partition key, so every check routes.
@@ -876,6 +885,9 @@ impl Database {
         };
         if !own_scale.is_empty() {
             self.require_numeric_own_scale()?;
+        }
+        if ct.foreign_keys.iter().any(|fk| fk.is_composite()) {
+            self.require_composite_foreign_keys()?;
         }
         let mut schema =
             Table::create_schema_files_with(io_schema.clone(), &ct.table_name, columns, &ct.unique_columns, &own_scale)

@@ -377,6 +377,8 @@ async fn create_table_as_matches_postgresql() {
         ("CREATE TABLE c19 AS SELECT id FROM src UNION ALL SELECT id FROM src", 6, "SELECT count(*) FROM c19", &["6"]),
         ("CREATE TABLE c22 AS SELECT DISTINCT ON (t) t, id FROM src ORDER BY t, id DESC", 3,
          "SELECT * FROM c22 ORDER BY t NULLS FIRST", &["NULL|2", "x|1", "y|3"]),
+        // Over a VALUES list, its columns named as PostgreSQL names them.
+        ("CREATE TABLE c25 AS VALUES (1, 'a')", 1, "SELECT column1, column2 FROM c25", &["1|a"]),
         ("CREATE TABLE c26 AS TABLE src", 3, "SELECT count(*) FROM c26", &["3"]),
         ("CREATE TABLE \"Mixed\" AS SELECT id FROM src", 3, "SELECT count(*) FROM \"Mixed\"", &["3"]),
     ];
@@ -398,12 +400,11 @@ async fn create_table_as_matches_postgresql() {
         ("CREATE TABLE c14 AS SELECT 1 + 1, 'z'", "42701"),
         ("CREATE TABLE c16 AS SELECT * FROM nosuch", "42P01"),
         ("CREATE TABLE c17 AS SELECT id, 1 / (id - 2) FROM src", "22012"),
-        ("CREATE TABLE c25 AS VALUES (1, 'a')", "0A000"),
     ] {
         let e = c.simple_query(sql).await.expect_err(sql);
         assert_eq!(e.code().map(|s| s.code()), Some(code), "{sql}: {e}");
     }
-    for gone in ["c4", "c13", "c14", "c16", "c17", "c25"] {
+    for gone in ["c4", "c13", "c14", "c16", "c17"] {
         let e = c.simple_query(&format!("SELECT 1 FROM {gone}")).await.expect_err(gone);
         assert_eq!(e.code().map(|s| s.code()), Some("42P01"), "{gone} was left behind: {e}");
     }

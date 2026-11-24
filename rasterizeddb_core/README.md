@@ -1,168 +1,126 @@
 # Rasterized DB
 
-## A new schemaless, high-performance database written from scratch in Rust.
+> **API stability.** What is stable is the server: the `rasterizeddb` binary,
+> its command-line flags, its wire protocols (PostgreSQL, native, MySQL, SQL
+> Server, RESP) and the SQL it answers. The Rust API of this crate,
+> `rasterizeddb_core`, is the server's internals: it is published so the server
+> and the embedded SDK can be built from crates.io, and **any of it may change
+> in any release, a patch release included**. To run the database inside an
+> application, use [`rasterizeddb_embedded`](https://crates.io/crates/rasterizeddb_embedded);
+> to talk to a server, [`rasterizeddb_client`](https://crates.io/crates/rasterizeddb_client).
+> Both follow semver.
 
-### Vision
+RasterizedDB is a SQL database server written in Rust. It speaks the
+PostgreSQL wire protocol, so `psql`, any PostgreSQL driver and any ORM connect
+to it unmodified. It also speaks its own native protocol (rastcp), the MySQL /
+MariaDB client protocol and the SQL Server (TDS) protocol, all on the same
+databases and the same roles, and serves a Redis-compatible key/value store.
 
-#### Why schemaless?
+This crate is the engine and the server. The full documentation is in the
+[repository](https://github.com/milen-denev/rasterizeddb).
 
-In Rasterized DB, the schema is maintained on the client side instead of the database. This design allows for flexibility and adaptability. To support this approach, an ORM (Object-Relational Mapper) for Rust will be released soon, catering to a variety of development needs.
+## What is in it
 
-#### How Does It Achieve Better Performance Than Conventional Databases?
+| | |
+|---|---|
+| **Protocols** | PostgreSQL v3 (simple and extended query, SCRAM-SHA-256, TLS); native rastcp; MySQL / MariaDB; SQL Server (TDS 7.4 and 8.0); Redis RESP2/RESP3 |
+| **Types** | 40 PostgreSQL types, including intervals, MAC and bit strings, the geometric types and the ranges, each with its real wire OID |
+| **Transactions** | MVCC snapshots, `READ COMMITTED` / `REPEATABLE READ`, savepoints, first-updater-wins conflicts |
+| **Durability** | Write-ahead log with checkpoints, and a `synchronous_commit` setting |
+| **Indexes** | B-tree and hash indexes (`CREATE INDEX`, and one per primary key and unique constraint), GIN full-text indexes, JSON path indexes, plus a bit-sliced SIMD filter index that prunes every scan |
+| **Space reclamation** | Background vacuum, `VACUUM` and `VACUUM FULL` |
+| **JSON** | Documents stored as binary values, with path indexing |
+| **Partitioning** | Hash-partitioned tables, with split, merge and per-partition placement |
+| **Replication** | Multi-primary, HLC-ordered, over TLS 1.3 |
+| **Backup** | Snapshots and point-in-time recovery to any S3-compatible store |
+| **Branches** | A database copied live (or from a past point), then reset, promoted, diffed and merged back |
+| **Storage pools** | One database across several directories, with a placement policy and mirrored backups |
+| **Key/value storage** | A table kept in an object store instead of files, beside file and in-memory tables |
+| **Key/value cache** | A Redis-compatible store, reachable from Redis clients and from SQL (`KV …`) |
+| **PostgreSQL import** | One-shot migration of a live PostgreSQL database |
 
-Rasterized DB adopts a novel approach inspired by how the web works. For example, when you receive a file with specific headers, the file isn’t re-fetched if it hasn’t expired; instead, the existing copy is used. Similarly, every query in Rasterized DB is hashed. If the same query is repeated, the corresponding row is loaded directly from a specific file location without needing to scan.
+## Install and run
 
-Future updates will introduce an in-memory cache for rows, allowing the system to bypass the file system entirely. This will provide a combined functionality similar to Redis and a database, offering fast performance and seamless integration.
+Prebuilt servers for Linux and Windows (x86-64 and ARM64) and an Arch Linux
+package are on the
+[releases page](https://github.com/milen-denev/rasterizeddb/releases). There,
+and in the Docker images, the executable is named `rasterizeddb`.
 
-#### Why Rust?
+**Docker** (`milendenev/rasterizeddb` or `ghcr.io/milen-denev/rasterizeddb`;
+Ubuntu 24.04 by default, also `-ubuntu26.04` and `-alpine` tags):
 
-Rust provides high-level, zero-cost abstractions combined with low-level optimization capabilities. This makes development faster while achieving the best possible performance. Rust's safety guarantees also contribute to the reliability and robustness of the database.
-
-#### Does it have limits?
-
-Rasterized DB is designed with scalability and flexibility in mind, aiming to accommodate all potential use cases. Future updates will introduce support for new and exotic data types, enabling the database to natively handle complex data structures. Examples include one-dimensional and multi-dimensional arrays, vectors, and tensors.
-
-Theoretically, the database can support limitless amounts of data, row sizes, and the number of columns.
-
-#### What is RQL? 
-
-Rasterized Query Language (RQL) is a SQL-inspired dialect tailored to the unique requirements of Rasterized DB. Since the schema is managed by the client and not the database server, traditional SQL cannot be used directly.
-
-RQL is also planned to include advanced features inspired by Microsoft’s Kusto Query Language, enhancing its expressiveness and functionality.
-
-#### Will it have an ORM?
-
-Yes, a standalone ORM for Rust is planned, with a C# version to follow soon after.
-
-#### Which futures are missing?
-
-The following features are currently missing but are planned for future updates:
-
-- Inserting rows (through RQL)
-- Updating rows
-- Deleting rows (through RQL)
-- Vacuuming empty space
-- UUID (GUID) support
-- Fully functional RETURN, LIMIT, and SELECT commands among many other SQL features missing
-- Server features
-- Sharding
-- Compression
-- Table Immutability 
-
-Many additional enhancements are also planned to make the database more robust and feature-complete.
-
-#### Is it stable?
-Short answer, no. It will get through many refinements and even changes to the table files. Until version 1.0.0 use it on your own risk.
-
-### How to use the current API?
-
-#### Features:
-`enable_index_caching` to enable query caching
-`enable_parallelism` to enable in parallel table chunk scanning
-
-```rust
-// Imports
-use rasterizeddb_core::{
-    core::{
-        column::Column, 
-        row::InsertOrUpdateRow, 
-        storage_providers::{file_sync::LocalStorageProvider, memory::MemoryStorageProvider}, 
-        table::Table
-    }, rql::parser::parse_rql
-};
+```sh
+docker run -d --name rasterizeddb -e RASTERIZEDDB_PG_PASSWORD=change-me \
+  -p 5432:5432 -p 61170:61170 -v rasterizeddb:/var/lib/rasterizeddb \
+  milendenev/rasterizeddb:latest
 ```
 
-#### Create a table
-```rust
-//Local File Storage Database
-let io_sync = LocalStorageProvider::new(
-    "Some\\Folder",
-    "database.db"
-);
-//In-Memory Database
-let io_sync = MemoryStorageProvider::new();
+**From crates.io:**
 
-let mut table = Table::init(io_sync, false, false).unwrap();
+```sh
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo install rasterizeddb_core   # on x86-64
+cargo install rasterizeddb_core                                       # on ARM64
 ```
 
-#### Create columns, rows and insert them
+This installs the binary as `rasterizeddb_core`. On x86-64 the server needs an
+AVX2 CPU (x86-64-v3) and refuses to start on an older one.
 
-```rust
-let c1 = Column::new(10).unwrap();
-let c2 = Column::new(-10).unwrap();
-let str = 'A'.to_string().repeat(100);
-let c3 = Column::new(str).unwrap();
+**Running it:**
 
-let mut columns_buffer: Vec<u8> = Vec::with_capacity(
-    c1.len() +
-    c2.len() +
-    c3.len()
-);
+```sh
+rasterizeddb_core --location /var/lib/rasterized --protocol both \
+    --pg-addr 0.0.0.0 --pg-user superuser --pg-password <password>
 
-columns_buffer.append(&mut c1.content.to_vec());
-columns_buffer.append(&mut c2.content.to_vec());
-columns_buffer.append(&mut c3.content.to_vec());
-
-let insert_row = InsertOrUpdateRow {
-    columns_data: columns_buffer.clone()
-};
-
-table.insert_row(insert_row).await;
-//OR unsafe
-table.insert_row_unsync(insert_row).await;
+psql "postgresql://superuser:<password>@127.0.0.1:5432/postgres?sslmode=require"
 ```
 
-#### Build in-memory file indexes
-```rust
-table.rebuild_in_memory_indexes();
-```
+- `--location` is the data directory, and is required.
+- `--protocol` is `rastcp` (the default), `pgwire`, or `both`. `both` serves
+  PostgreSQL on `--pg-port` (5432) and the native protocol on `--rdb-port`
+  (61170) from one process.
+- `--mysql-port`, `--mssql-port` and `--kv-port` turn on the MySQL, SQL Server
+  and Redis listeners. Each is off until it is given a port.
+- Every listener binds `127.0.0.1` unless told otherwise (`--pg-addr`,
+  `--rdb-addr`, ...).
+- PostgreSQL connections need TLS by default (`--pg-tls require`). Without a
+  certificate the server generates a self-signed one at start-up.
+- `--pg-user`/`--pg-password` seed the first role of an empty database. After
+  that, use `CREATE USER`.
 
-#### Retrieve a row
-```rust
-//Rasterized Query Language (Alpha)
-let query_evaluation = parse_rql(&format!(
-r#"
-        BEGIN
-        SELECT FROM NAME_DOESNT_MATTER_FOR_NOW
-        WHERE COL(1) = -10
-        LIMIT 2
-        END
-"#
-))
-.unwrap();
+`rasterizeddb_core --help` lists every flag.
 
-let rows = table.execute_query(query_evaluation.parser_result).await?;
-```
+The heavier subsystems are Cargo features, and the default build turns most of
+them on. The
+[feature table](https://github.com/milen-denev/rasterizeddb#build-features)
+says what each one adds.
 
-#### Update a row
-```rust
-let update_row = InsertOrUpdateRow {
-    columns_data: columns_buffer_update
-};
+## Embedding
 
-table.update_row_by_id(3, update_row).await;
-```
+To run the database inside a Rust application, with no server process, use
+[`rasterizeddb_embedded`](https://crates.io/crates/rasterizeddb_embedded). It
+starts the engine in-process and hands back a `rasterizeddb_client::Client`
+for it. Over the network, use
+[`rasterizeddb_client`](https://crates.io/crates/rasterizeddb_client), the
+native-protocol SDK and ORM, or any PostgreSQL, MySQL or SQL Server driver.
 
-#### Delete a row
-```rust
-// Invalidates cache automatically
-table.delete_row_by_id(10).unwrap();
-```
+## Documentation
 
-#### Table Maintanance
-```rust
-// Vacuum the table
-// Note: The removed row's ids will be sorted back in use. 
-// So deleted row ID(3) and following rows ID(4), ID(5), ID(X) will become row ID(3), ID(4), ID(X - 1)
-table.vacuum_table().await;
+- [Repository README](https://github.com/milen-denev/rasterizeddb#readme):
+  the SQL surface, transactions, durability and every subsystem in more depth
+- [PostgreSQL compatibility](https://github.com/milen-denev/rasterizeddb/blob/main/docs/postgres-compatibility.md)
+- [MySQL and SQL Server](https://github.com/milen-denev/rasterizeddb/blob/main/docs/mysql-and-sql-server.md)
+- [Indexes](https://github.com/milen-denev/rasterizeddb/blob/main/docs/indexes.md),
+  [persistent indexes](https://github.com/milen-denev/rasterizeddb/blob/main/docs/persistent-indexes.md)
+- [Partitioning](https://github.com/milen-denev/rasterizeddb/blob/main/docs/partitioning.md)
+- [Replication](https://github.com/milen-denev/rasterizeddb/blob/main/docs/replication.md)
+- [S3 backup and point-in-time recovery](https://github.com/milen-denev/rasterizeddb/blob/main/docs/s3-backup.md)
+- [Database branches](https://github.com/milen-denev/rasterizeddb/blob/main/docs/branching.md)
+- [Storage pools](https://github.com/milen-denev/rasterizeddb/blob/main/docs/storage-pools.md),
+  [key/value storage](https://github.com/milen-denev/rasterizeddb/blob/main/docs/kv-storage.md),
+  [Redis-compatible cache](https://github.com/milen-denev/rasterizeddb/blob/main/docs/kv-cache.md)
+- [PostgreSQL import](https://github.com/milen-denev/rasterizeddb/blob/main/docs/postgres-import.md)
+- [Docker](https://github.com/milen-denev/rasterizeddb/blob/main/docs/docker.md)
 
-// Must rebuild in-memory file indexes after vacuum
-table.rebuild_in_memory_indexes();
-```
+## License
 
-##### Sponsor
-
-[![Buy me a coffe](https://raw.githubusercontent.com/vasundhasauras/badge-bmc/1bf9f937862f918818d3528cce12256be0116570/badges/coffee/buy%20me%20a%20coffee/bm_coffee.svg "Buy me a coffe")](https://buymeacoffee.com/milen.denev)
-
-### License
-Everything in this directory is distributed under GNU GENERAL PUBLIC LICENSE version 3.
+GNU General Public License version 3 (`GPL-3.0-only`).

@@ -1,0 +1,37 @@
+[Unit]
+Description=RasterizedDB server
+Documentation=https://github.com/milen-denev/rasterizeddb
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rasterizeddb
+Group=rasterizeddb
+EnvironmentFile=/etc/rasterizeddb/rasterizeddb.env
+ExecStartPre=/bin/sh -c 'test -n "$$RASTERIZEDDB_PG_PASSWORD" || { echo "set RASTERIZEDDB_PG_PASSWORD in /etc/rasterizeddb/rasterizeddb.env" >&2; exit 1; }'
+ExecStart=/usr/bin/rasterizeddb --location /var/lib/rasterizeddb --protocol both $RASTERIZEDDB_ARGS
+StateDirectory=rasterizeddb
+StateDirectoryMode=0700
+# A clean stop (SIGTERM) ends with a checkpoint: give it time.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# Storage outside /var/lib/rasterizeddb (--storage-location, backups to a
+# local directory) needs a drop-in with ReadWritePaths=<dir>.
+
+[Install]
+WantedBy=multi-user.target

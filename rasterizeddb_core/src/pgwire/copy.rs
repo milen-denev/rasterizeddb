@@ -71,7 +71,7 @@ fn tokens(sql: &str) -> Vec<String> {
             i += 1;
             continue;
         }
-        if b == b'\'' || b == b'"' {
+        if b == b'\'' {
             let end = crate::core::sql_scan::skip_quoted(bytes, i).unwrap_or(bytes.len());
             out.push(sql[i..end].to_string());
             i = end.max(i + 1);
@@ -82,12 +82,25 @@ fn tokens(sql: &str) -> Vec<String> {
             i += 1;
             continue;
         }
+        // A word, or a name of dotted parts each bare or quoted, as one
+        // token: `public."case"` (what pg_dump writes for a reserved word),
+        // `"S"."T"`, `s.t`.
         let start = i;
-        while i < bytes.len()
-            && !bytes[i].is_ascii_whitespace()
-            && !matches!(bytes[i], b'(' | b')' | b',' | b';' | b'\'' | b'"')
-        {
-            i += 1;
+        loop {
+            if i < bytes.len() && bytes[i] == b'"' {
+                let end = crate::core::sql_scan::skip_quoted(bytes, i).unwrap_or(bytes.len());
+                i = end.max(i + 1);
+            }
+            while i < bytes.len()
+                && !bytes[i].is_ascii_whitespace()
+                && !matches!(bytes[i], b'(' | b')' | b',' | b';' | b'\'' | b'"')
+            {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'"' && i > start && bytes[i - 1] == b'.' {
+                continue;
+            }
+            break;
         }
         out.push(sql[start..i].to_string());
     }
@@ -122,7 +135,21 @@ fn single_byte(value: &str, what: &str) -> Result<u8, Refusal> {
 }
 
 fn name_of(token: &str) -> String {
-    let name = token.rsplit('.').next().unwrap_or(token);
+    // The last dotted part, a dot inside quotes being no separator.
+    let bytes = token.as_bytes();
+    let mut last = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => i = crate::core::sql_scan::skip_quoted(bytes, i).unwrap_or(bytes.len()).max(i + 1),
+            b'.' => {
+                last = i + 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let name = &token[last.min(token.len())..];
     if name.starts_with('"') {
         name.trim_matches('"').replace("\"\"", "\"")
     } else {
@@ -767,20 +794,86 @@ where
     send_message(stream, b'G', &response).await?;
     state.copy_in_ran = true;
 
+    // COPY writes a `GENERATED ALWAYS` identity column's values as given,
+    // as PostgreSQL's does: a dump's data is restored with its keys. As a
+    // plain INSERT every row was refused (428C9) and the table restored
+    // empty. Only for such a table: the clause costs a pass per tuple.
+    let always_identity = database.schema_view(&real).is_some_and(|v| {
+        v.schema().defaults.iter().any(|d| {
+            !d.is_deleted && d.identity == Some(crate::core::rql::column_default::IdentityKind::Always)
+        })
+    });
     let insert_head = format!(
-        "INSERT INTO {} ({}) VALUES ",
+        "INSERT INTO {} ({}) {}VALUES ",
         crate::core::rql::views::quote_ident(&table),
         columns
             .iter()
             .map(|(n, _)| crate::core::rql::views::quote_ident(n))
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(", "),
+        if always_identity { "OVERRIDING SYSTEM VALUE " } else { "" }
     );
     let own_block = state.transaction.is_none();
     let mut failure: Option<Refusal> = None;
     if own_block && let Err(e) = run_internal(database, state, "BEGIN").await? {
         failure = Some((sqlstate_for(&e), e));
     }
+    // The rows, every batch one statement of the block, under one scope of
+    // foreign-key checks: a row referencing its own table may name a row of
+    // a later batch, and PostgreSQL checks the whole COPY at its end.
+    // Read to the client's end even after a failure, as the protocol asks.
+    // Only in a database with a key onto itself (`may_reference_itself`).
+    let rows = Box::pin(copy_rows(database, state, stream, copy, &columns, &insert_head, failure));
+    let (rows, deferred) = if database.may_reference_itself() {
+        match crate::core::rql::executor::statement_foreign_keys_scope(rows).await {
+            Ok((rows, deferred)) => (rows, Some(deferred)),
+            Err(rows) => (rows, None),
+        }
+    } else {
+        (rows.await, None)
+    };
+    let (written, mut failure) = rows?;
+    if failure.is_none()
+        && let Some(deferred) = deferred.filter(|d| !d.is_empty())
+        && let Some(tx) = state.current_tx()
+        && let Err(e) = crate::core::rql::executor::check_deferred_self_references_in_txn(database, deferred, tx).await
+    {
+        failure = Some((sqlstate_for(&e), e));
+    }
+    if own_block && state.transaction.is_some() {
+        let end = if failure.is_none() {
+            "COMMIT"
+        } else {
+            "ROLLBACK"
+        };
+        if let Err(e) = run_internal(database, state, end).await?
+            && failure.is_none()
+        {
+            failure = Some((sqlstate_for(&e), e));
+        }
+    }
+    Ok(match failure {
+        None => Ok(written),
+        Some(e) => Err(e),
+    })
+}
+
+/// The rows of a `COPY … FROM STDIN`, read off the client to its CopyDone
+/// or CopyFail and inserted in batches: how many were written, and why the
+/// copy failed when it did.
+async fn copy_rows<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    copy: &Copy,
+    columns: &[(String, i64)],
+    insert_head: &str,
+    mut failure: Option<Refusal>,
+) -> io::Result<(u64, Option<Refusal>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let binary = copy.format == Format::Binary;
     let mut buf: Vec<u8> = Vec::new();
     let mut pending: Vec<String> = Vec::new();
     let mut written = 0u64;
@@ -893,7 +986,7 @@ where
                         }
                         pending.push(format!("({})", values.join(", ")));
                         if pending.len() >= BATCH {
-                            match insert(database, state, &insert_head, &mut pending).await? {
+                            match insert(database, state, insert_head, &mut pending).await? {
                                 Ok(n) => written += n,
                                 Err(e) => {
                                     failure = Some(e);
@@ -911,7 +1004,7 @@ where
         }
     }
     if failure.is_none() && !pending.is_empty() {
-        match insert(database, state, &insert_head, &mut pending).await? {
+        match insert(database, state, insert_head, &mut pending).await? {
             Ok(n) => written += n,
             Err(e) => failure = Some(e),
         }
@@ -922,22 +1015,7 @@ where
             "COPY binary data ended without its trailer".to_string(),
         ));
     }
-    if own_block && state.transaction.is_some() {
-        let end = if failure.is_none() {
-            "COMMIT"
-        } else {
-            "ROLLBACK"
-        };
-        if let Err(e) = run_internal(database, state, end).await?
-            && failure.is_none()
-        {
-            failure = Some((sqlstate_for(&e), e));
-        }
-    }
-    Ok(match failure {
-        None => Ok(written),
-        Some(e) => Err(e),
-    })
+    Ok((written, failure))
 }
 
 async fn insert(
@@ -1190,6 +1268,21 @@ mod tests {
 
     fn p(sql: &str) -> Copy {
         parse_copy(sql).unwrap().unwrap()
+    }
+
+    /// A schema-qualified quoted name, as `pg_dump` writes a table named by
+    /// a reserved word (`public."case"`), is one name: it was read as the
+    /// table `public.`, with `"case"` where `TO` belongs (42601).
+    #[test]
+    fn a_qualified_quoted_name_is_one_name() {
+        let c = p("COPY public.\"case\" (domain_id, id) TO stdout;");
+        assert_eq!((c.table.as_deref(), c.columns.as_slice(), c.from), (Some("case"), &["domain_id".to_string(), "id".to_string()][..], false));
+        let c = p("COPY \"S\".\"a.b\" FROM STDIN");
+        assert_eq!((c.table.as_deref(), c.from), (Some("a.b"), true));
+        let c = p("COPY public.\"T\"(\"x\", y) FROM STDIN");
+        assert_eq!((c.table.as_deref(), c.columns.as_slice()), (Some("T"), &["x".to_string(), "y".to_string()][..]));
+        let c = p("COPY s.t FROM STDIN");
+        assert_eq!(c.table.as_deref(), Some("t"));
     }
 
     #[test]

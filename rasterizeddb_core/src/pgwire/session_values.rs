@@ -1,7 +1,7 @@
 //! What a statement reads of its session, as the literals they are for it:
 //! `current_user`, `session_user`, `current_role`, `current_catalog`,
-//! `current_database()`, `current_schemas(…)`, `pg_backend_pid()` and
-//! `current_setting(…)`.
+//! `current_database()`, `current_schemas(…)`, `pg_backend_pid()`,
+//! `pg_is_in_recovery()` and `current_setting(…)`.
 //!
 //! Each was "column \"current_user\" does not exist" or "function … is not
 //! supported yet": the row evaluator has no session to read. An ORM and a
@@ -53,7 +53,7 @@ pub(crate) fn rewrite(sql: &str, session: &Session) -> Result<Option<String>, (&
     if !runs_now {
         return Ok(None);
     }
-    if ![&b"current_"[..], b"session_user", b"pg_backend_pid"]
+    if ![&b"current_"[..], b"session_user", b"pg_backend_pid", b"pg_is_in_recovery"]
         .iter()
         .any(|w| contains_ignore_ascii_case(sql, w))
     {
@@ -106,7 +106,7 @@ pub(crate) fn rewrite(sql: &str, session: &Session) -> Result<Option<String>, (&
         let replaced: Option<(String, usize)> = match (word.as_str(), call) {
             ("current_user" | "current_role" | "session_user", false) => Some((literal(session.user), j)),
             ("current_catalog", false) => Some((literal(session.database), j)),
-            ("current_database" | "pg_backend_pid" | "current_schemas" | "current_setting", true) => {
+            ("current_database" | "pg_backend_pid" | "pg_is_in_recovery" | "current_schemas" | "current_setting", true) => {
                 let open = j + gap;
                 let Some(close) = matching_close(sql, open) else {
                     i = j;
@@ -116,6 +116,10 @@ pub(crate) fn rewrite(sql: &str, session: &Session) -> Result<Option<String>, (&
                 let value = match word.as_str() {
                     "current_database" if args.is_empty() => Some(literal(session.database)),
                     "pg_backend_pid" if args.is_empty() => Some(session.backend_pid.to_string()),
+                    // No server here replays another's log as a hot
+                    // standby: a replica applies its peer's commits as
+                    // ordinary transactions. `pg_dump` asks this first.
+                    "pg_is_in_recovery" if args.is_empty() => Some("FALSE".to_string()),
                     "current_schemas" => match args.to_ascii_lowercase().as_str() {
                         "true" | "'t'" | "'true'" => Some("'{pg_catalog,public}'::text[]".to_string()),
                         "false" | "'f'" | "'false'" => Some("'{public}'::text[]".to_string()),

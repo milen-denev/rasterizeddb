@@ -97,6 +97,16 @@
 //! has to outlast the call that sent it, uses a [`SimpleSession`]
 //! ([`Client::simple_session`]); a long statement is stopped with
 //! [`Client::cancel`] and the [`CancelToken`] it was sent with.
+//!
+//! # Notices and the statement timeout
+//!
+//! What the server says about a statement without failing it (`RAISE
+//! NOTICE`, `DROP TABLE IF EXISTS` naming no table) comes with its answer,
+//! [`Rows::notices`], and goes to [`Client::set_notice_handler`]'s handler;
+//! see [`notice`]. A statement that runs past the server's statement timeout
+//! (its request timeout, 30 s by default) is stopped and fails with `57014`
+//! ([`Error::is_statement_timeout`]); its connection, and a transaction on
+//! it, are kept.
 
 // The derive macros name this crate by its path; this lets its own tests use
 // them.
@@ -118,6 +128,7 @@ mod value;
 
 pub mod admin;
 pub mod kv;
+pub mod notice;
 pub mod orm;
 pub mod simple;
 
@@ -144,11 +155,12 @@ pub mod guide {
     pub mod admin {}
 }
 
-pub use client::{Client, Options};
+pub use client::{ANSWER_GRACE, Client, Options};
 pub use error::Error;
 pub use executor::Executor;
 pub use from_sql::{FromSql, FromSqlOwned};
 pub use login::Login;
+pub use notice::{Notice, NoticeHandler};
 pub use params::{
     ArrayRef, Param, check_statement, quote_bytes, quote_ident, quote_text, render, render_dyn,
 };
@@ -165,6 +177,26 @@ pub use rastcp::tls::Trust;
 /// as the [`Trust`] that believes what it signed.
 pub fn load_ca(path: &str) -> Result<Trust> {
     Ok(Trust::RootCa(rastcp::tls::load_certificates(path)?))
+}
+
+/// The [`Trust`] that believes exactly the server certificates named by
+/// their SHA-256 fingerprints, as hex (`openssl x509 -noout -fingerprint
+/// -sha256 -in server.pem` prints one; its `:`s and case are fine).
+///
+/// Pin a certificate the server keeps (`--rdb-cert`/`--rdb-key`): one it makes
+/// for itself at start, without them, is a new one at every start.
+pub fn pin<S: AsRef<str>>(fingerprints: &[S]) -> Result<Trust> {
+    let pins = fingerprints
+        .iter()
+        .map(|f| {
+            rastcp::tls::parse_fingerprint(f.as_ref())
+                .map_err(|e| Error::Param(format!("{:?} is not a SHA-256 fingerprint: {e}", f.as_ref())))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if pins.is_empty() {
+        return Err(Error::Param("pin needs at least one fingerprint".into()));
+    }
+    Ok(Trust::Pinned(pins))
 }
 pub use to_sql::ToSql;
 pub use transaction::{
@@ -232,5 +264,22 @@ pub mod __private {
             index: i,
             message: format!("the JSON did not deserialize: {e}"),
         })
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    #[test]
+    fn pin_reads_fingerprints_as_openssl_prints_them() {
+        let hex = "ab".repeat(32);
+        let colons = hex.as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap().to_uppercase()).collect::<Vec<_>>().join(":");
+        match pin(&[hex.as_str(), colons.as_str()]).unwrap() {
+            Trust::Pinned(pins) => assert_eq!(pins, vec![[0xab; 32], [0xab; 32]]),
+            _ => panic!("not a pin"),
+        }
+        assert!(matches!(pin(&["abcd"]), Err(Error::Param(_))));
+        assert!(matches!(pin::<&str>(&[]), Err(Error::Param(_))));
     }
 }

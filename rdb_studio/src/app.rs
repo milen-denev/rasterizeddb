@@ -760,6 +760,9 @@ pub enum Message {
     SelectTab(Tab),
     SelectTable(String),
     SelectDatabase(String),
+    /// Moves the tab strip sideways by this many pixels: its `<` and `>`
+    /// buttons, and a wheel turned over it.
+    ScrollTabs(f32),
     TableFilter(String),
     RefreshAll,
 
@@ -1732,6 +1735,10 @@ impl Studio {
                 self.form.database = name;
                 self.update(Message::Connect)
             }
+            Message::ScrollTabs(by) => iced::widget::operation::scroll_by(
+                crate::views::tab_strip_id(),
+                iced::widget::operation::AbsoluteOffset { x: by, y: 0.0 },
+            ),
             Message::TableFilter(v) => { self.table_filter = v; Task::none() }
             Message::RefreshAll => self.reload_everything(),
 
@@ -2193,7 +2200,11 @@ impl Studio {
                 // through diagnosing goes with it.
                 self.modal = Some(Modal::Confirm {
                     title: "Forget every statement".to_string(),
-                    body: "The server drops what it has recorded: the recent list and the                            per-shape totals, for every session and not just this console.                            Nothing that has run is affected — this is the record of it, not the                            thing itself — but anybody else looking at a slow statement right now                            loses it mid-sentence."
+                    body: "The server drops what it has recorded: the recent list and the \
+                           per-shape totals, for every session and not just this console. \
+                           Nothing that has run is affected — this is the record of it, not the \
+                           thing itself — but anybody else looking at a slow statement right now \
+                           loses it mid-sentence."
                         .to_string(),
                     statement: dialect::reset_statement_stats_sql(self.flavor()).to_string(),
                     refresh: Refresh::Activity,
@@ -3565,7 +3576,10 @@ impl Studio {
                     .unwrap_or(0)
                     .saturating_sub(retained as usize);
                 format!(
-                    "This keeps the newest {retained} snapshots and permanently deletes the rest                      from the bucket, along with the log bundles only they needed.\n\n                     {older} snapshot{} would go. Objects deleted from S3 are not recoverable, and                      any point-in-time target that depended on them stops being reachable.",
+                    "This keeps the newest {retained} snapshots and permanently deletes the rest \
+                     from the bucket, along with the log bundles only they needed.\n\n\
+                     {older} snapshot{} would go. Objects deleted from S3 are not recoverable, and \
+                     any point-in-time target that depended on them stops being reachable.",
                     if older == 1 { "" } else { "s" }
                 )
             };
@@ -3594,9 +3608,13 @@ impl Studio {
             self.modal = Some(Modal::Confirm {
                 title: "Force a rollover".to_string(),
                 body: format!(
-                    "This copies the whole database to a fresh snapshot and, once that has                      landed, permanently deletes every earlier generation — the older                      snapshots and the {segments} log bundle{} they needed.
-
-                     Nothing is deleted unless the new snapshot succeeds, so a rollover that                      fails leaves the current backup untouched. Afterwards the bucket holds                      one self-contained backup, and point-in-time targets before it stop                      being reachable.",
+                    "This copies the whole database to a fresh snapshot and, once that has \
+                     landed, permanently deletes every earlier generation — the older \
+                     snapshots and the {segments} log bundle{} they needed.\n\n\
+                     Nothing is deleted unless the new snapshot succeeds, so a rollover that \
+                     fails leaves the current backup untouched. Afterwards the bucket holds \
+                     one self-contained backup, and point-in-time targets before it stop \
+                     being reachable.",
                     if segments == 1 { "" } else { "s" }
                 ),
                 statement: action.sql().to_string(),
@@ -3743,6 +3761,7 @@ impl Studio {
             return Task::none();
         };
         let sql = dialect::indexes_sql(session.flavor, &table);
+        let fallback = dialect::indexes_fallback_sql(session.flavor, &table);
         let primary: Vec<String> = self
             .columns
             .iter()
@@ -3752,7 +3771,13 @@ impl Studio {
         Task::perform(
             async move {
                 let primary: Vec<&str> = primary.iter().map(String::as_str).collect();
-                let result = session.query(&sql).await.map(|g| dialect::parse_indexes(&g, &primary));
+                // A server that cannot answer the owners' join is read as
+                // before: `pg_indexes` alone.
+                let grid = match (session.query(&sql).await, fallback) {
+                    (Err(_), Some(fallback)) => session.query(&fallback).await,
+                    (result, _) => result,
+                };
+                let result = grid.map(|g| dialect::parse_indexes(&g, &primary));
                 (table, result)
             },
             |(table, result)| Message::IndexesLoaded(table, result),
@@ -4456,7 +4481,8 @@ pub const NO_KEY: &str = "no column identifies a single row of this table: it de
 /// should happen again.
 pub fn history_as_sql(history: &[HistoryEntry]) -> String {
     let mut out = String::from(
-        "-- rdb_studio session history\n         -- Statements that failed are commented out.\n\n",
+        "-- rdb_studio session history\n\
+         -- Statements that failed are commented out.\n\n",
     );
 
     for entry in history {

@@ -1016,9 +1016,11 @@ impl Sidecar {
             Sidecar::Fk => {
                 let fk = foreign_key::ForeignKey {
                     name,
-                    column: "v".into(),
+                    columns: vec!["v".into()],
                     parent_table: format!("parent_{i}"),
-                    parent_column: "id".into(),
+                    parent_columns: vec!["id".into()],
+                    match_full: false,
+                    on_delete_columns: Vec::new(),
                     on_delete: foreign_key::ReferentialAction::Cascade,
                     on_update: foreign_key::ReferentialAction::SetNull,
                     is_deleted: false,
@@ -1035,6 +1037,8 @@ impl Sidecar {
                     is_deleted: false,
                     predicate: None,
                     compiled: Default::default(),
+                    from_index: false,
+                    primary: false,
                 };
                 unique_key::append(io, &key).await
             }
@@ -1085,9 +1089,11 @@ impl Sidecar {
                 writes,
                 &foreign_key::ForeignKey {
                     name,
-                    column: "v".into(),
+                    columns: vec!["v".into()],
                     parent_table: format!("parent_{i}"),
-                    parent_column: "id".into(),
+                    parent_columns: vec!["id".into()],
+                    match_full: false,
+                    on_delete_columns: Vec::new(),
                     on_delete: foreign_key::ReferentialAction::Cascade,
                     on_update: foreign_key::ReferentialAction::SetNull,
                     is_deleted: false,
@@ -1105,6 +1111,8 @@ impl Sidecar {
                     is_deleted: false,
                     predicate: None,
                     compiled: Default::default(),
+                    from_index: false,
+                    primary: false,
                 },
             ),
             Sidecar::Def => column_default::stage(
@@ -1154,7 +1162,7 @@ impl Sidecar {
             Sidecar::Fk => foreign_key::load(io)
                 .await
                 .into_iter()
-                .map(|f| (f.name, format!("{} {} {} {:?} {:?}", f.column, f.parent_table, f.parent_column, f.on_delete, f.on_update)))
+                .map(|f| (f.name.clone(), format!("{} {} {} {:?} {:?}", f.column_list(), f.parent_table, f.parent_column_list(), f.on_delete, f.on_update)))
                 .collect(),
             Sidecar::Chk => check::load(io).await.into_iter().map(|c| (c.name, c.expression)).collect(),
             Sidecar::Uk => unique_key::load(io).await.into_iter().map(|k| (k.name, k.columns.join(","))).collect(),

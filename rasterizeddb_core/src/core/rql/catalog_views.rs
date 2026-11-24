@@ -73,6 +73,10 @@ const VIEWS: &[&str] = &[
     "pg_rewrite",
     "pg_depend",
     "pg_extension",
+    "pg_partitioned_table",
+    "table_constraints",
+    "key_column_usage",
+    "referential_constraints",
 ];
 
 /// The relations built from [`crate::core::rql::catalog_model::Model`].
@@ -337,7 +341,15 @@ const SCHEMA: &str = "public";
 /// COLUMNS FROM "rdb_roles"` became `SHOW __cat_columns_… FROM "rdb_roles"`,
 /// which returned one empty column and left every client that asks a table for
 /// its columns believing it had none.
-const QUALIFIED_ONLY: [&str; 4] = ["columns", "tables", "views", "sequences"];
+const QUALIFIED_ONLY: [&str; 7] = [
+    "columns",
+    "tables",
+    "views",
+    "sequences",
+    "table_constraints",
+    "key_column_usage",
+    "referential_constraints",
+];
 
 /// Whether `view` may only be matched with its schema in front of it.
 fn needs_qualifier(view: &str) -> bool {
@@ -451,10 +463,14 @@ pub async fn materialize(
 /// name, `__regclass_name(conrelid)`; `x::regtype` as `format_type(x, NULL)`.
 /// `psql`'s `(SELECT pg_partition_ancestors(r) UNION ALL VALUES (r))`, the
 /// relation and the ancestors it was partitioned from, is `(r)`: nothing
-/// here is a partition of another relation.
+/// here is a partition of another relation. For the same reason
+/// `pg_partition_ancestors(oid)` in a `FROM` list, which `psql`'s `\d` reads
+/// a partitioned table's foreign keys through, is the one row `relid = oid`.
+/// A cast qualified by `pg_catalog.`, as `psql` 18 writes them
+/// (`'16384'::pg_catalog.regclass`), is the cast unqualified.
 fn rewrite_reg_casts(sql: &str) -> String {
     let lower = sql.to_ascii_lowercase();
-    if !lower.contains("::reg") && !lower.contains("pg_partition_ancestors") {
+    if !lower.contains("::reg") && !lower.contains("pg_catalog.reg") && !lower.contains("pg_partition_ancestors") {
         return sql.to_string();
     }
     let sql = match regex::Regex::new(
@@ -462,6 +478,16 @@ fn rewrite_reg_casts(sql: &str) -> String {
     ) {
         Ok(re) => re.replace_all(sql, "($2)").into_owned(),
         Err(_) => sql.to_string(),
+    };
+    let sql = match regex::Regex::new(
+        r"(?i)(,|\bFROM|\bJOIN)(\s*)(?:pg_catalog\s*\.\s*)?pg_partition_ancestors\s*\(\s*'?(\d+)'?\s*\)",
+    ) {
+        Ok(re) => re.replace_all(&sql, "$1$2(VALUES ($3)) AS pg_partition_ancestors(relid)").into_owned(),
+        Err(_) => sql,
+    };
+    let sql = match regex::Regex::new(r"(?i)::\s*pg_catalog\s*\.\s*(reg(?:class|type|namespace|role))\b") {
+        Ok(re) => re.replace_all(&sql, "::$1").into_owned(),
+        Err(_) => sql,
     };
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
@@ -692,7 +718,7 @@ fn outside_subqueries(text: &str) -> String {
             i = end.max(i + 1);
             continue;
         }
-        if bytes[i] == b'(' && text[i + 1..].trim_start().get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT")) {
+        if bytes[i] == b'(' && crate::core::sql_scan::starts_with_keyword(text[i + 1..].trim_start(), "SELECT") {
             let mut depth = 0i32;
             let mut j = i;
             while j < bytes.len() {
@@ -1180,7 +1206,7 @@ fn temp_name(view: &str, database: &Arc<Database>) -> String {
 /// The model of `database` as `tx` sees it: its tables, views, materialized
 /// views and sequences, with every table's figures read here, where the
 /// storage layer is reachable.
-async fn model_for(
+pub(crate) async fn model_for(
     database: &Arc<Database>,
     tx: crate::core::mvcc::transaction::TxId,
 ) -> Result<crate::core::rql::catalog_model::Model, String> {
@@ -1838,8 +1864,8 @@ async fn build(
             )
         }
         // Nothing inherits from anything here. A partitioned table is one
-        // relation (relkind 'r' above) whose partitions no client can name, so
-        // they are not children either. Produced empty rather than refused: a
+        // relation (relkind 'p' above, with its `pg_partitioned_table` row)
+        // whose partitions no client can name, so they are not children. Produced empty rather than refused: a
         // query that anti-joins against it, which is how a caller excludes
         // partitions, then gets the right answer.
         "pg_inherits" => (
@@ -2020,7 +2046,8 @@ fn shared_declarations(schema: &crate::core::row::schema::TableSchema) -> Vec<(S
     }
     let pk = schema.primary_key.as_deref().and_then(by_name);
     if let Some(pk) = pk {
-        out.push((pkey_name(&schema.name), true, vec![pk], None));
+        let name = crate::core::rql::unique_key::primary_key_of(schema).map_or_else(|| pkey_name(&schema.name), |key| key.name);
+        out.push((name, true, vec![pk], None));
     }
     // An inline `PRIMARY KEY` flags its column unique too; that is the
     // primary key's index, not a `<table>_<column>_key` of its own.
@@ -2092,21 +2119,21 @@ fn oid_of(name: &str) -> i64 {
 }
 
 /// One sequence as the catalogue relations list it.
-struct SequenceRow {
-    name: String,
-    data_type: String,
-    start: i64,
-    min: i64,
-    max: i64,
-    increment: i64,
-    cycle: bool,
-    cache: i64,
-    last: Option<i64>,
+pub(crate) struct SequenceRow {
+    pub(crate) name: String,
+    pub(crate) data_type: String,
+    pub(crate) start: i64,
+    pub(crate) min: i64,
+    pub(crate) max: i64,
+    pub(crate) increment: i64,
+    pub(crate) cycle: bool,
+    pub(crate) cache: i64,
+    pub(crate) last: Option<i64>,
 }
 
 /// Every sequence of `database` as `tx` sees it: each explicit one with its
 /// counter as it stands, and each implicit one a column default reads.
-async fn sequence_rows(
+pub(crate) async fn sequence_rows(
     database: &Arc<Database>,
     tx: Option<crate::core::mvcc::transaction::TxId>,
 ) -> Result<Vec<SequenceRow>, String> {
@@ -2190,6 +2217,10 @@ fn escape(text: &str) -> String {
 #[cfg(test)]
 #[path = "catalog_partition_tests.rs"]
 mod catalog_partition_tests;
+
+#[cfg(test)]
+#[path = "unique_index_origin_tests.rs"]
+mod unique_index_origin_tests;
 
 #[cfg(test)]
 mod tests {

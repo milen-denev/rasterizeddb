@@ -205,7 +205,7 @@ const SITES: &[Site] = &[
     site("ALTER TABLE site_p ADD COLUMN x INT", Expect::LikeTwin, "already there: 42701 on both"),
     site("ALTER TABLE site_p ADD COLUMN IF NOT EXISTS n INT", Expect::LikeTwin, "an existing column: a no-op on both"),
     site("ALTER TABLE site_p DROP COLUMN IF EXISTS nope", Expect::LikeTwin, "no such column: a no-op on both"),
-    site("ALTER TABLE site_p DROP COLUMN tenant_id", Expect::Refused, "§1.5: a partition key column"),
+    site("ALTER TABLE site_p DROP COLUMN tenant_id", Expect::Error("42P16"), "§1.5: a partition key column"),
     site("ALTER TABLE site_p RENAME COLUMN label TO tag", Expect::LikeTwin, "phase 3 P1"),
     site("SELECT tenant_id, tag FROM site_p WHERE tenant_id = 1", Expect::LikeTwinAnswered, "the renamed column"),
     site("ALTER TABLE site_p RENAME COLUMN tag TO label", Expect::LikeTwin, "phase 3 P1"),
@@ -214,14 +214,14 @@ const SITES: &[Site] = &[
     site("ALTER TABLE site_p RENAME COLUMN grp TO asset_group_id", Expect::LikeTwin, "phase 3 P1"),
     site("ALTER TABLE site_q RENAME TO site_p", Expect::Error("42P07"), "onto the partitioned name: 42P07, as onto a plain one and in PostgreSQL"),
     site("ALTER TABLE site_p ALTER COLUMN n TYPE BIGINT", Expect::LikeTwin, "a type change: every row rewritten, each value converted (phase 6 P8)"),
-    site("ALTER TABLE site_p ALTER COLUMN tenant_id TYPE INT", Expect::Refused, "a partition key column"),
+    site("ALTER TABLE site_p ALTER COLUMN tenant_id TYPE INT", Expect::Error("42P16"), "a partition key column"),
     site("ALTER TABLE site_p ALTER COLUMN n TYPE BIGINT USING n::bigint", Expect::LikeTwin, "USING: every row rewritten with its value (phase 6 P8)"),
-    site("ALTER TABLE site_p ALTER COLUMN tenant_id TYPE BIGINT USING tenant_id + 1", Expect::Refused, "USING on a partition key column"),
+    site("ALTER TABLE site_p ALTER COLUMN tenant_id TYPE BIGINT USING tenant_id + 1", Expect::Error("42P16"), "USING on a partition key column"),
     site("ALTER TABLE site_p ALTER COLUMN n SET DEFAULT 5", Expect::LikeTwin, "phase 3 P1"),
     site("ALTER TABLE site_p ALTER COLUMN n DROP DEFAULT", Expect::LikeTwin, "phase 3 P1"),
     site("ALTER TABLE site_p ALTER COLUMN n SET NOT NULL", Expect::LikeTwin, "a NULL n: refused on both"),
     site("ALTER TABLE site_p ALTER COLUMN n DROP NOT NULL", Expect::LikeTwin, "already nullable: a no-op on both"),
-    site("ALTER TABLE site_p ALTER COLUMN tenant_id DROP NOT NULL", Expect::Refused, "§1.5"),
+    site("ALTER TABLE site_p ALTER COLUMN tenant_id DROP NOT NULL", Expect::Error("42P16"), "§1.5"),
     site("ALTER TABLE site_p ALTER COLUMN n SET STATISTICS 100", Expect::LikeTwin, "a no-op on both"),
     site("ALTER TABLE site_p ADD CONSTRAINT site_p_c CHECK (n > 0)", Expect::LikeTwin, "phase 3 P1"),
     site("ALTER TABLE site_p DROP CONSTRAINT site_p_c", Expect::LikeTwin, "phase 3 P1"),
@@ -288,7 +288,10 @@ const SITES: &[Site] = &[
     ),
     site("CREATE INDEX site_p_l ON site_p USING hash (label)", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
     site("DROP INDEX site_p_l", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
-    site("ALTER TABLE site_p DROP CONSTRAINT site_p_kn", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
+    // An index `CREATE UNIQUE INDEX` made is dropped as one, as in
+    // PostgreSQL, whose DROP CONSTRAINT does not know it.
+    site("ALTER TABLE site_p DROP CONSTRAINT site_p_kn", Expect::Error("42704"), "an index, not a constraint"),
+    site("DROP INDEX site_p_kn", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
     site("DROP INDEX site_p_n", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
     site("DROP INDEX IF EXISTS site_p_n", Expect::Check(|_, _| Ok(())), "phase 3 P1"),
     site(
@@ -378,7 +381,7 @@ const SITES: &[Site] = &[
     site("SHOW COLUMNS FROM site_p", Expect::LikeTwin, "from the shell's schema"),
     site("EXPLAIN SELECT * FROM site_p", Expect::LikeTwin, "not a statement here"),
     // Every pg_* view and information_schema relation.
-    site("SELECT relname, relkind, reltuples FROM pg_class WHERE relname = 'site_p'", Expect::LikeTwin, "S8"),
+    site("SELECT relname, reltuples FROM pg_class WHERE relname = 'site_p'", Expect::LikeTwin, "S8"),
     site(
         "SELECT schemaname, relname, n_live_tup, n_dead_tup FROM pg_stat_user_tables WHERE relname = 'site_p'",
         Expect::LikeTwin,

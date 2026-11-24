@@ -972,12 +972,16 @@ async fn a_correlated_exists_over_its_own_table() {
     let wrong = wrong_answers(&pool, cases).await;
     assert!(wrong.is_empty(), "{} wrong answers:\n{}", wrong.len(), wrong.join("\n"));
 
-    // PostgreSQL's answers are 1,4 and 1,2,4,5.
-    for sql in [
-        "SELECT id FROM ev WHERE EXISTS (SELECT 1 FROM ev e2 WHERE e2.k = ev.k AND e2.v > ev.v) ORDER BY id",
-        "SELECT o.id FROM ev o WHERE EXISTS (SELECT 1 FROM ev e2 WHERE e2.k = o.k AND e2.id <> o.id) ORDER BY o.id",
-    ] {
-        let err = joined(&pool, sql).await.expect_err(sql);
-        assert!(err.contains("not supported yet"), "{sql}: {err}");
-    }
+    // An EXISTS comparing the outer row by more than `=`, answered as the
+    // count it asks about (`executor::exists_as_counts`), with PostgreSQL's
+    // answers. They were refused ("not supported yet").
+    let cases: &[(&str, &str)] = &[
+        ("SELECT id FROM ev WHERE EXISTS (SELECT 1 FROM ev e2 WHERE e2.k = ev.k AND e2.v > ev.v) ORDER BY id", "1,4"),
+        (
+            "SELECT o.id FROM ev o WHERE EXISTS (SELECT 1 FROM ev e2 WHERE e2.k = o.k AND e2.id <> o.id) ORDER BY o.id",
+            "1,2,4,5",
+        ),
+    ];
+    let wrong = wrong_answers(&pool, cases).await;
+    assert!(wrong.is_empty(), "{} wrong answers:\n{}", wrong.len(), wrong.join("\n"));
 }

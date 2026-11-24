@@ -248,6 +248,12 @@ impl Database {
                 Err(e) => log::warn!("shutdown: {name} is not sealed: {e}"),
             }
         }
+        // A filter still backfilling, or an index still building, cannot be
+        // sealed, and quiescing stops the work that finishes it: skipped,
+        // the restart rebuilds it from nothing again. So the open tables'
+        // structures get half the deadline to complete, together, first.
+        let ready_by = tokio::time::Instant::now() + deadline / 2;
+        futures::future::join_all(targets.iter().map(|(_, table)| table.await_sealable(ready_by))).await;
         for (_, table) in &targets {
             table.quiesce_for_shutdown().await;
         }

@@ -50,7 +50,11 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
 
     let hot = matching.iter().filter(|e| e.hot).count();
     let saved = matching.iter().filter(|e| e.restart_settable).count();
-    let waiting = matching.iter().filter(|e| e.pending_restart).count();
+    // A save a flag overrides is not waiting for a restart — a restart keeps
+    // the flag's value — so it is counted apart, not as one more thing a
+    // restart would settle.
+    let waiting = matching.iter().filter(|e| e.pending_restart && !e.held_by_flag()).count();
+    let held = matching.iter().filter(|e| e.restart_settable && e.held_by_flag()).count();
 
     let layout = super::GridLayout::new(studio, "config");
     let specs = vec![
@@ -118,11 +122,12 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
             .style(theme::input)
             .width(Length::Fixed(260.0)),
         text(format!(
-            "{} settings · {} changeable while running · {} changeable at restart{}",
+            "{} settings · {} changeable while running · {} changeable at restart{}{}",
             matching.len(),
             hot,
             saved,
             if waiting > 0 { format!(" · {} waiting for a restart", waiting) } else { String::new() },
+            if held > 0 { format!(" · {} held by a command-line flag", held) } else { String::new() },
         ))
         .size(11)
         .font(theme::MONO)
@@ -298,35 +303,58 @@ fn value_editor<'a>(key: &str, entry: &ConfigEntry, value: &str) -> Element<'a, 
 }
 
 /// What a restart-only setting is waiting for, under its edit.
+///
+/// The edit above shows the value the server is *running*; this says what is
+/// saved beside it. A setting held by a command-line flag gets no "waiting
+/// for a restart" — a restart would keep the flag's value, and a line that
+/// promised otherwise is how a person ends up restarting a server five times
+/// for a change that cannot land.
 fn restart_line(entry: &ConfigEntry) -> Element<'static, Message> {
-    let mut line = row![super::pill("RESTART", theme::TEXT_FAINT)].spacing(6).align_y(Center);
+    let line = row![super::pill("RESTART", theme::TEXT_FAINT)].spacing(6).align_y(Center);
+    if entry.held_by_flag() {
+        let status = if entry.pending_restart && !entry.pending.is_empty() {
+            format!("saved: {} — not applied at a restart", entry.pending)
+        } else if entry.pending_restart {
+            "a saved change is not applied at a restart".to_string()
+        } else {
+            "a save is not applied at a restart".to_string()
+        };
+        let flag = entry.flag().unwrap_or("its flag");
+        return column![
+            line.push(text(status).size(10).font(theme::MONO).color(theme::WARN)),
+            text(format!(
+                "running {} from the server's {flag} flag, which wins at every start: remove the \
+                 flag from the server's start command (its systemd unit) for a save to apply",
+                display(&entry.value),
+            ))
+            .size(10)
+            .color(theme::WARN)
+            .width(Fill),
+        ]
+        .spacing(2)
+        .into();
+    }
     let (message, colour) = if entry.pending_restart {
         (
             if entry.pending.is_empty() {
                 "a saved change is waiting for a restart".to_string()
             } else {
-                format!("saved: {} — waiting for a restart", entry.pending)
+                format!(
+                    "saved: {} — waiting for a restart (running: {})",
+                    entry.pending,
+                    display(&entry.value)
+                )
             },
             theme::WARN,
         )
     } else {
         ("takes effect at the next start".to_string(), theme::TEXT_FAINT)
     };
-    line = line.push(text(message).size(10).font(theme::MONO).color(colour));
-    if entry.source != "command line" {
-        return line.into();
-    }
-    // Its own line: beside the status it is squeezed into a column a word
-    // wide, and it is the one note on the row that says the save is moot.
-    column![
-        line,
-        text("set on the server's command line, which wins over a saved value: remove the flag for a save to take effect")
-            .size(10)
-            .color(theme::WARN)
-            .width(Fill),
-    ]
-    .spacing(2)
-    .into()
+    line.push(text(message).size(10).font(theme::MONO).color(colour)).into()
+}
+
+fn display(value: &str) -> &str {
+    if value.is_empty() { "—" } else { value }
 }
 
 #[cfg(test)]
@@ -359,8 +387,46 @@ mod tests {
                 ..row("server", "batch_size", "10000", false)
             },
             row("cache", "enabled", "false", false),
+            ConfigEntry {
+                restart_settable: true,
+                pending: "disk".into(),
+                pending_restart: true,
+                source: "default".into(),
+                ..row("index", "residency", "memory", false)
+            },
         ];
         studio.config_edits.insert("replication.mode".into(), "all".into());
+        let _ = view(&studio);
+    }
+
+    /// The state a user restarted a server five times over: `cache.enabled`
+    /// saved false, running true from the unit's `--enable-cache true`. It
+    /// is held by the flag, not waiting for a restart, and the flag is named.
+    #[test]
+    fn a_save_a_flag_overrides_is_not_waiting_for_a_restart() {
+        let held = ConfigEntry {
+            section: "cache".into(),
+            key: "enabled".into(),
+            value: "true".into(),
+            restart_settable: true,
+            set_with: "--enable-cache BOOL (restart)".into(),
+            pending: "false".into(),
+            pending_restart: true,
+            source: "command line".into(),
+            ..ConfigEntry::default()
+        };
+        assert!(held.held_by_flag());
+        assert_eq!(held.flag(), Some("--enable-cache"));
+
+        let saved = ConfigEntry { source: "saved".into(), ..held.clone() };
+        assert!(!saved.held_by_flag());
+        // A hot setting has no source and nothing to hold.
+        let hot = ConfigEntry { hot: true, ..held.clone() };
+        assert!(!hot.held_by_flag());
+        assert_eq!(ConfigEntry { set_with: "fixed: always on".into(), ..held.clone() }.flag(), None);
+
+        let (mut studio, _) = Studio::new(None);
+        studio.config = vec![held, saved];
         let _ = view(&studio);
     }
 }

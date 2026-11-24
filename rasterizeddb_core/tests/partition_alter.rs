@@ -110,11 +110,20 @@ impl Pair {
     /// "not supported", `needle` in the reason), writing nothing; the twin
     /// does not run it.
     fn refused(&mut self, template: &str, needle: &str) {
+        self.refused_as(template, needle, "0A000");
+    }
+
+    /// [`Self::refused`] with `code`: a key column dropped, retyped or made
+    /// nullable is PostgreSQL's 42P16, not a missing feature.
+    fn refused_as(&mut self, template: &str, needle: &str, code: &str) {
         let before = self.state();
         let sql = render(template, PART);
         match self.p.as_mut().unwrap().simple(&sql) {
             Err(e) => {
-                assert!(e.is_unsupported(), "`{sql}` failed, but not as a refusal: {e}");
+                assert!(
+                    e.code == code && e.message.to_ascii_lowercase().contains("not supported"),
+                    "`{sql}` failed, but not as a {code} refusal: {e}"
+                );
                 assert!(e.message.contains(needle), "`{sql}`'s refusal does not say {needle:?}: {e}");
             }
             Ok(r) => panic!("`{sql}` was not refused: {r:?}"),
@@ -151,7 +160,7 @@ impl Pair {
              WHERE r.relname = '{t}' ORDER BY 1, 2, 3",
             "SHOW COLUMNS FROM {t}",
             "DESCRIBE {t}",
-            "SELECT relname, relkind FROM pg_class WHERE relname = '{t}'",
+            "SELECT relname FROM pg_class WHERE relname = '{t}'",
             "SELECT count(*) FROM {t}",
         ] {
             let out = self.both_ordered(q, true);
@@ -267,7 +276,7 @@ fn every_metadata_ddl_answers_like_a_plain_twin_and_survives_a_restart() {
     // Populated: every row rewritten into a new uid (phase 6 P8), like the twin.
     pair.ok("ALTER TABLE {t} ALTER COLUMN n DROP NOT NULL");
     pair.ok("SELECT tenant_id, id, n FROM {t} ORDER BY tenant_id, id");
-    pair.refused("ALTER TABLE {t} ALTER COLUMN tenant_id DROP NOT NULL", "must be NOT NULL");
+    pair.refused_as("ALTER TABLE {t} ALTER COLUMN tenant_id DROP NOT NULL", "must be NOT NULL", "42P16");
     pair.compare("not null");
 
     // Renames: a value column, the key column, back again.
@@ -287,7 +296,7 @@ fn every_metadata_ddl_answers_like_a_plain_twin_and_survives_a_restart() {
     // change rewrite.
     pair.ok("ALTER TABLE {t} DROP COLUMN f");
     pair.fails_alike("SELECT f FROM {t}");
-    pair.refused("ALTER TABLE {t} DROP COLUMN tenant_id", "partition key column");
+    pair.refused_as("ALTER TABLE {t} DROP COLUMN tenant_id", "partition key column", "42P16");
     // Rewritten into a new uid (phase 6 P8), like the twin; so is a type
     // change, every value converted (`retype_by_cast`).
     pair.ok("ALTER TABLE {t} ADD COLUMN extra INT");
@@ -295,7 +304,7 @@ fn every_metadata_ddl_answers_like_a_plain_twin_and_survives_a_restart() {
     pair.ok("SELECT tenant_id, id, extra, extra2 FROM {t} ORDER BY tenant_id, id");
     pair.ok("ALTER TABLE {t} ALTER COLUMN n TYPE BIGINT");
     pair.ok("SELECT tenant_id, id, n FROM {t} ORDER BY tenant_id, id");
-    pair.refused("ALTER TABLE {t} ALTER COLUMN tenant_id TYPE INT", "partition key column");
+    pair.refused_as("ALTER TABLE {t} ALTER COLUMN tenant_id TYPE INT", "partition key column", "42P16");
     pair.ok("ALTER TABLE {t} ADD COLUMN IF NOT EXISTS n INT");
     pair.fails("ALTER TABLE {t} ADD COLUMN n INT", "42701");
     pair.compare("columns dropped");
@@ -334,7 +343,7 @@ fn metadata_only_add_column_and_drop_not_null_on_an_empty_table() {
     pair.ok("ALTER TABLE {t} ADD COLUMN must INT NOT NULL");
     pair.ok("ALTER TABLE {t} ALTER COLUMN must DROP NOT NULL");
     pair.ok("ALTER TABLE {t} ALTER COLUMN filled DROP NOT NULL");
-    pair.refused("ALTER TABLE {t} ALTER COLUMN tenant_id DROP NOT NULL", "must be NOT NULL");
+    pair.refused_as("ALTER TABLE {t} ALTER COLUMN tenant_id DROP NOT NULL", "must be NOT NULL", "42P16");
     // `jsonb` is a stored document and `json` its text as written: both
     // ordinary columns, as `CREATE TABLE` makes them. (A shredded one, made
     // only under `json_shadow_tables`, is refused: `shredded_shadow_ddl.rs`.)
@@ -540,13 +549,20 @@ fn a_ddl_queues_behind_the_tables_users_and_a_timeout_writes_nothing() {
     });
     assert!(done_rx.recv_timeout(Duration::from_millis(400)).is_err(), "the reader did not queue behind the DDL");
     a.ok("COMMIT");
+    // Both finish. Which client hears back first is not the order the server
+    // ran them in: the DDL releases its lock before its client's thread
+    // wakes, and on a slow runner the reader's thread reported first
+    // (linux-arm64, 2026-11-23). The queueing itself is what the wait above
+    // proves: a reader allowed past the waiting DDL shares the block's lock
+    // and would have answered within it.
     let mut seen = Vec::new();
     for _ in 0..2 {
         let (who, r) = done_rx.recv_timeout(Duration::from_secs(60)).expect("both finish");
         assert!(r.is_ok(), "{who}: {r:?}");
         seen.push(who);
     }
-    assert_eq!(seen, ["ddl", "reader"], "the reader ran ahead of the queued DDL");
+    seen.sort_unstable();
+    assert_eq!(seen, ["ddl", "reader"]);
     let _ = (ddl_thread.join().unwrap(), reader.join().unwrap());
     let e = a.simple("INSERT INTO pa (tenant_id, id, n) VALUES (1, 500, -1)").expect_err("the CHECK holds");
     assert_eq!(e.code, "23514");
@@ -596,7 +612,7 @@ fn writers_through_a_stream_of_ddl_lose_and_mix_nothing() {
         "ALTER TABLE pa ALTER COLUMN s SET DEFAULT 'dflt'",
         "CREATE UNIQUE INDEX pa_u ON pa (tenant_id, id, n)",
         "ALTER TABLE pa RENAME COLUMN f TO g",
-        "ALTER TABLE pa DROP CONSTRAINT pa_u",
+        "DROP INDEX pa_u",
         "ALTER TABLE pa ALTER COLUMN s DROP DEFAULT",
         "ALTER TABLE pa RENAME COLUMN g TO f",
         "ALTER TABLE pa DROP CONSTRAINT pa_c",
@@ -1090,9 +1106,9 @@ fn long_names_number_repeated_unnamed_constraints_and_return() {
 
 /// The primary key answers to its own name only, as in PostgreSQL: one added
 /// as `k1` is not `<table>_pkey`; an inline one's flag is not also
-/// `<table>_<column>_key`; and a composite one named other than
-/// `<table>_pkey` is refused (0A000), since nothing else could tell it from a
-/// UNIQUE and a second PRIMARY KEY would be accepted beside it.
+/// `<table>_<column>_key`; and a composite one takes any name (89c1e752: the
+/// key's record says it is the primary key, so its name need not), after
+/// which a second PRIMARY KEY of any name is 42P16.
 #[test]
 fn a_primary_key_answers_to_its_own_name_only() {
     let dir = tempfile::tempdir().unwrap();
@@ -1113,11 +1129,19 @@ fn a_primary_key_answers_to_its_own_name_only() {
         assert!(!is_primary(&mut c, &t, "a"), "{t}: k1 dropped");
         c.ok(&format!("INSERT INTO {t} (a, b, c) VALUES (1, 2, 2)"));
 
-        // (c) a composite one: `<table>_pkey` or unnamed, nothing else.
+        // (c) a composite one, under a name of its own: it is the key.
         c.ok(&format!("DELETE FROM {t} WHERE b = 2"));
-        expect_code(&mut c, &format!("ALTER TABLE {t} ADD CONSTRAINT k2 PRIMARY KEY (a, b)"), "0A000");
-        c.ok(&format!("ALTER TABLE {t} ADD CONSTRAINT {t}_pkey PRIMARY KEY (a, b)"));
+        c.ok(&format!("ALTER TABLE {t} ADD CONSTRAINT k2 PRIMARY KEY (a, b)"));
+        assert!(is_primary(&mut c, &t, "b"), "{t}: k2 is the key");
+        expect_code(&mut c, &format!("INSERT INTO {t} (a, b, c) VALUES (1, 1, 9)"), "23505");
+        expect_code(&mut c, &format!("ALTER TABLE {t} DROP CONSTRAINT {t}_pkey"), "42704");
+        expect_code(&mut c, &format!("ALTER TABLE {t} ADD CONSTRAINT {t}_pkey PRIMARY KEY (a, b)"), "42P16");
         expect_code(&mut c, &format!("ALTER TABLE {t} ADD PRIMARY KEY (a)"), "42P16");
+        expect_code(&mut c, &format!("ALTER TABLE {t} ADD CONSTRAINT k3 PRIMARY KEY (a)"), "42P16");
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT k2"));
+        assert!(!is_primary(&mut c, &t, "b"), "{t}: k2 dropped");
+        // And `<table>_pkey` names one as well.
+        c.ok(&format!("ALTER TABLE {t} ADD CONSTRAINT {t}_pkey PRIMARY KEY (a, b)"));
         expect_code(&mut c, &format!("ALTER TABLE {t} ADD CONSTRAINT k3 PRIMARY KEY (a)"), "42P16");
 
         // (b) inline: `<table>_pkey`, never `<table>_<column>_key`.

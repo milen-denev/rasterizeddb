@@ -47,13 +47,38 @@ Download the archive for your platform from the [releases](https://github.com/mi
 | Linux ARM64 | `rasterizeddb-server-<version>-linux-arm64.tar.gz` | any ARMv8-A (Graviton, Ampere, Raspberry Pi 4/5, ...) |
 | Windows x86-64 | `rasterizeddb-server-<version>-windows-x86_64.zip` | x86-64-v3 (AVX2) |
 | Windows ARM64 | `rasterizeddb-server-<version>-windows-arm64.zip` | any ARMv8-A (Snapdragon X, ...) |
+| Linux x86-64, static (musl) | `rasterizeddb-server-<version>-linux-x86_64-musl.tar.gz` | x86-64-v3 (AVX2) |
+| Linux ARM64, static (musl) | `rasterizeddb-server-<version>-linux-arm64-musl.tar.gz` | any ARMv8-A |
 
-Linux builds need glibc 2.39 or newer. Unix sockets (`--rdb-socket`, `--pg-socket`, peer authentication) exist on Linux only; on Windows use TCP.
+The glibc Linux builds need glibc 2.39 or newer; the static musl builds run on any Linux, Alpine included.
 
-rasterizeddb --location /your-location/bla-bla --concurrent_threads 16 --batch_size 16000
+**Docker** (linux/amd64 and linux/arm64; Ubuntu 24.04 by default, also `-ubuntu26.04` and `-alpine` tags; [docs/docker.md](docs/docker.md)):
 
-*batch_size*: recommended value is 16K, but you can play around with more or less depending on your case. The lesser the number of rows, the lower the batch size must be.
-*concurrent_threads*: must equal to the number of CPU threads of lower.
+```sh
+docker run -d --name rasterizeddb -e RASTERIZEDDB_PG_PASSWORD=change-me \
+  -p 5432:5432 -p 61170:61170 -v rasterizeddb:/var/lib/rasterizeddb \
+  milendenev/rasterizeddb:latest          # or ghcr.io/milen-denev/rasterizeddb:latest
+```
+
+The `rustfs` tag runs [RustFS](https://github.com/rustfs/rustfs) in the same container, with the server's backups and S3-backed tables already pointed at it ([docs/docker.md](docs/docker.md#rustfs-backups-and-s3-tables-in-one-container)).
+
+**Arch Linux / CachyOS** (x86-64-v3): each release carries `rasterizeddb-bin-<version>-1-x86_64.pkg.tar.zst`, with a systemd service:
+
+```sh
+sudo pacman -U rasterizeddb-bin-*.pkg.tar.zst
+sudoedit /etc/rasterizeddb/rasterizeddb.env     # RASTERIZEDDB_PG_PASSWORD=...
+sudo systemctl enable --now rasterizeddb
+```
+
+Unix sockets (`--rdb-socket`, `--pg-socket-dir`, peer authentication) exist on Linux only; on Windows use TCP.
+
+To run an archive's executable yourself, give it a data directory:
+
+```sh
+rasterizeddb --location /var/lib/rasterized --protocol both --pg-password <password>
+```
+
+`--concurrent-threads` sets the number of worker threads (default 16) and `--batch-size` the rows read per batch (default 10 000). `rasterizeddb --help` lists every flag; the sections below cover them by subsystem. Built with `cargo install rasterizeddb_core`, the same executable is named `rasterizeddb_core`; on x86-64 build it with `RUSTFLAGS="-C target-cpu=x86-64-v3"`.
 
 ### Build features
 
@@ -777,10 +802,11 @@ guarantee.
 
 ### Key/value storage
 
-Off by default (`kv_storage`, and `kv_storage_s3` for the S3 backing store). A
-whole second storage backend — chunked objects, a delta log, a page cache and a
-compactor — so a build that only ever writes files does not carry it or the
-extra match arm on every storage call.
+On in the default feature set (`kv_storage`, and `kv_storage_s3` for the S3
+backing store), and unused until a table is placed on it. A whole second
+storage backend — chunked objects, a delta log, a page cache and a compactor —
+so a build without the features, which only ever writes files, does not carry
+it or the extra match arm on every storage call.
 
 Placement is **per table**, so one database can hold file, in-memory and
 object-store tables side by side. A table's spec in `db_storage.cfg` widens
@@ -955,51 +981,28 @@ The native-protocol client SDK is [`rasterizeddb_client`](rasterizeddb_client/RE
 
 ### Vision
 
-#### Complete Rewrite
-Rasterized DB has recently undergone a complete rewrite from the ground up and is still in an active state of redevelopment. This major overhaul has brought significant architectural changes to improve stability, performance, and developer experience. Many components are being redesigned for long-term maintainability, and the database will continue to evolve rapidly until its core design reaches maturity.
-
-#### From Schemaless to Schema-Full
-Originally conceived as a schemaless database, Rasterized DB is now schema-full. The database itself now manages and enforces the schema, reducing complexity for client applications and enabling stronger data consistency. This change also opens the door to richer query capabilities and deeper optimizations at the storage and execution layers.
-
 #### PostgreSQL Dialect Compatibility
-To make adoption easier, Rasterized DB aims for compatibility with the PostgreSQL SQL dialect, the most widely used and supported SQL standard in production environments. While not all PostgreSQL features are currently implemented, this compatibility goal ensures developers can leverage familiar syntax and tools without learning a proprietary query language from scratch.
+To make adoption easier, Rasterized DB aims for compatibility with the PostgreSQL SQL dialect, the most widely used and supported SQL standard in production environments. Not every PostgreSQL feature is implemented ([docs/postgres-compatibility.md](docs/postgres-compatibility.md) says which), but familiar syntax and tools work without learning a proprietary query language.
 
 #### Performance Philosophy
-Rasterized DB takes inspiration from how the web handles caching. Just like a browser reuses files when their cache headers indicate they’re still valid, Rasterized DB hashes each query so repeated requests can instantly fetch results from a known storage offset without rescanning the dataset.
-
-Future updates will introduce in-memory row caching, allowing certain queries to bypass disk entirely. This approach will merge the speed of in-memory stores like Redis with the persistence of a traditional database.
+Most work is avoided rather than done faster. The [filter index](#the-filter-index) rules out whole runs of rows before they are read, B-tree and hash [indexes](#indexes) answer point and range lookups, and an opt-in query cache (`--enable-cache`, `--cache-size`) remembers where a repeated query's rows are, so it does not scan again. For data that should not touch the disk at all, the [Redis-compatible key/value store](#redis-compatible-keyvalue-store) runs in the same process and answers both Redis clients and SQL.
 
 #### Why Rust?
 Rust combines zero-cost abstractions with low-level performance control, making it ideal for building a database that is both fast and safe. Its memory safety guarantees reduce the risk of crashes or data corruption, while still enabling optimizations close to the hardware.
 
-#### Scalability and Future Features
+#### Not built
+These are not part of any release:
 
-Rasterized DB is designed to handle virtually unlimited data sizes, row counts, and column counts. Planned features include:
+- Sharding across nodes. A design exists in [docs/sharding.md](docs/sharding.md); nothing of it is built.
+- Compression of table files. Replication links and backups are compressed (zstd); the data files are not.
+- Vector and tensor types. Arrays are supported.
+- Immutable (append-only) tables.
 
-- Advanced data types: arrays, vectors, tensors, and more [PARTIALLY DONE]
-- Row insertion, updates, and deletions via SQL [DONE]
-- Vacuuming unused space [DONE]
-- UUID (GUID) support [DONE]
-- Fully functional RETURN, LIMIT, and advanced SELECT capabilities [DONE]
-- Server mode with network access [DONE]
-- PostgreSQL wire protocol, drivers and ORMs [DONE]
-- Transactions with MVCC, savepoints and isolation levels [DONE]
-- Crash safety through a write-ahead log [DONE]
-- Joins, aggregates, CTEs, window functions and subqueries [DONE]
-- Foreign keys and composite unique constraints [DONE]
-- Binary JSON documents with path indexing [DONE]
-- Multi-primary replication [DONE]
-- Backup and point-in-time recovery to object storage [DONE]
-- A database spanning several disks, with a placement policy [DONE]
-- Compression for storage efficiency [PARTIALLY DONE — replication links and backups]
-- Sharding for horizontal scalability
-- Table immutability options
-
-#### ORM & Ecosystem
-An official Rust ORM is in development, with a C# ORM planned afterward. These tools will provide a seamless experience when integrating Rasterized DB into applications.
+#### Clients
+[`rasterizeddb_client`](rasterizeddb_client/README.md) is the Rust SDK for the native protocol, with an ORM and migrations built in. There is no dedicated client for other languages: they connect with any PostgreSQL, MySQL or SQL Server driver.
 
 #### Stability
-Currently, Rasterized DB is not stable. Table formats, storage engines, and query processing internals are likely to change until version 1.0.0. Use it at your own risk in production environments.
+Rasterized DB is at version 1.x. What is stable is the server: its command-line flags, its wire protocols and the SQL it answers, along with the [`rasterizeddb_client`](rasterizeddb_client/README.md) and [`rasterizeddb_embedded`](rasterizeddb_embedded/README.md) crates, which follow semver. The Rust API of `rasterizeddb_core` is the server's internals and may change in any release.
 
 ### Running the database inside a Rust application
 
@@ -1011,6 +1014,8 @@ let client = db.connect().await?;
 client.execute("CREATE TABLE IF NOT EXISTS notes (id BIGINT, body TEXT)", &[]).await?;
 db.shutdown().await?;
 ```
+
+The server's flags are `Builder` methods there (memory, durability, threads, and `config(key, value)` for every `SHOW CONFIG` key); see its README, "Settings".
 
 How releases are cut (crates and executables): [docs/releasing.md](docs/releasing.md).
 
