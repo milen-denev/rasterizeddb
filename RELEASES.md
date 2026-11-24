@@ -25,6 +25,22 @@
 - A copied, moved or mirrored data directory read and wrote the original directory's files, because `db_storage.cfg` names absolute paths. A copy with one storage location is now rewritten for its new path; any other copy is refused at open.
 - Two processes, or two embedded engines, could open one data directory at once: the second replayed and truncated the first's live log. The directory is now locked (`rasterizeddb.lock`), and the refusal names the holder's pid.
 - Client: a `NUMERIC` with more than 38 decimal places read as a wrong integer.
+- `SHOW TABLES` and the table statistics named only the first column of a composite primary key.
+- `SHOW REPLICATION STATUS` described `applied` as what a node received; it counts what peers applied of this node's own transactions, so a replica read `applied 0`. `duplicates` and `conflicts` were described the same way. The descriptions now say so; what a node received is the `applied through` line.
+
+### Statements that failed, now answered
+
+Each was met migrating an application onto 1.0.0.
+
+- Over the extended protocol (every driver's prepared statements), a CTE whose body reads a derived table (`WITH r AS (SELECT … FROM (SELECT …) x) SELECT … FROM r`) was described with no columns and its rows sent anyway, so drivers failed on every row.
+- `BEGIN; DROP TABLE child; DROP TABLE parent; COMMIT` was refused because of the child's foreign key, although the child's drop was pending in the same block.
+- A correlated reference in an inner `JOIN … ON` inside `EXISTS` (`… JOIN m ON m.space_id = t.space_id`) failed with "missing FROM-clause entry".
+- A window function in a query filtered by a correlated `EXISTS` that compares with `<` or `>` was refused.
+- `make_interval(hours => t.h)` over a column was refused; it now computes per row, `NULL` in giving `NULL` out.
+- A `DEFAULT` written as a parenthesised cast (`DEFAULT ('[]'::jsonb)`, `('{}'::text[])`), as ORMs and `pg_dump` write it, was refused.
+- A select-list alias written without `AS` (`ROW_NUMBER() OVER (…) rn`) did not name a CTE's or derived table's column.
+- A bound parameter cast to a multi-word type (`$1::timestamp with time zone`, `double precision`, `character varying`) took only the type's first word, and the rest joined the value.
+- SQL-level `PREPARE … LIMIT $1` then `EXECUTE` failed with "Invalid LIMIT value 'CAST(8'".
 
 ### Crashes fixed
 
