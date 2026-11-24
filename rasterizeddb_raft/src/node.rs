@@ -54,6 +54,10 @@ pub struct Ready {
     pub entries: Vec<Entry>,
     pub hard_state: Option<HardState>,
     pub snapshot: Option<(SnapshotMeta, Vec<u8>)>,
+    /// With `snapshot`: the log after it was kept (it agreed with the
+    /// snapshot), so the caller drops only its durable entries through the
+    /// snapshot's index. `false`: the durable log is replaced whole.
+    pub snapshot_keeps_log: bool,
     pub messages: Vec<(NodeId, Message)>,
     pub committed: Vec<Entry>,
     pub reads: Vec<ReadState>,
@@ -122,6 +126,7 @@ pub struct RaftNode {
     msgs: Vec<(NodeId, Message)>,
     truncated_from: Option<Index>,
     pending_snapshot: Option<(SnapshotMeta, Vec<u8>)>,
+    pending_snapshot_keeps_log: bool,
     snapshot_wanted: Vec<NodeId>,
     role_changed: Option<Role>,
     /// Read rounds (leader only).
@@ -157,6 +162,7 @@ impl RaftNode {
             msgs: Vec::new(),
             truncated_from: None,
             pending_snapshot: None,
+            pending_snapshot_keeps_log: false,
             snapshot_wanted: Vec::new(),
             role_changed: None,
             read_round: 0,
@@ -349,13 +355,23 @@ impl RaftNode {
     fn check_quorum(&mut self) {
         let mut active = 0;
         let voters = self.config.voters.clone();
+        // A snapshot that drew no answer in a whole round was lost (or its
+        // peer restarted): ask for another. Waiting on it, the leader sent
+        // that peer nothing at all, not even a heartbeat, for ever.
+        let mut resend = Vec::new();
         for (id, p) in self.progress.iter_mut() {
             if *id == self.id || p.active {
                 if voters.contains(id) {
                     active += 1;
                 }
+            } else if p.snapshotting {
+                p.snapshotting = false;
+                resend.push(*id);
             }
             p.active = false;
+        }
+        for id in resend {
+            self.send_append(id);
         }
         if active < self.config.quorum() {
             let term = self.hard.term;
@@ -566,8 +582,8 @@ impl RaftNode {
             self.send(from, Message::SnapshotResponse { term, from: self.id, index: c });
             return;
         }
-        self.log.restore_snapshot(meta.index, meta.term);
-        // The snapshot replaces the durable log whole (module docs).
+        self.pending_snapshot_keeps_log = self.log.restore_snapshot(meta.index, meta.term);
+        // The snapshot's own record says what of the durable log stays.
         self.truncated_from = None;
         self.config = meta.config.clone();
         self.config_index = meta.index;
@@ -834,6 +850,7 @@ impl RaftNode {
             entries: self.log.unpersisted(),
             hard_state: (self.hard_with_commit() != self.hard_persisted).then(|| self.hard_with_commit()),
             snapshot: self.pending_snapshot.clone(),
+            snapshot_keeps_log: self.pending_snapshot_keeps_log,
             messages: std::mem::take(&mut self.msgs),
             committed: self.log.to_apply(usize::MAX),
             reads: std::mem::take(&mut self.reads_ready),

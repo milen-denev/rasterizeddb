@@ -78,11 +78,15 @@ impl RaftLog {
 
     /// Entries `[lo, hi]`, at most `max` of them.
     pub fn slice(&self, lo: Index, hi: Index, max: usize) -> Vec<Entry> {
-        if lo > hi || lo <= self.snapshot_index {
+        // Past the end too: `hi` may reach beyond the log (a peer's next
+        // index ahead of it), which made the end fall before the start.
+        if lo > hi || lo <= self.snapshot_index || lo > self.last_index() {
             return Vec::new();
         }
         let start = (lo - self.snapshot_index - 1) as usize;
-        let end = ((hi.min(self.last_index()) - self.snapshot_index) as usize).min(start + max);
+        // Saturating: callers ask for `usize::MAX` entries, and `start +
+        // max` wrapped to `start - 1`, an end before the start.
+        let end = ((hi.min(self.last_index()) - self.snapshot_index) as usize).min(start.saturating_add(max));
         self.entries[start..end].to_vec()
     }
 
@@ -215,16 +219,29 @@ impl RaftLog {
         Ok(())
     }
 
-    /// Replaces the whole log with a received snapshot's position. Entries
-    /// after it are dropped too, even ones that agree with it: the leader
-    /// sends them again, and the durable log is replaced whole (`Ready`).
-    pub(crate) fn restore_snapshot(&mut self, index: Index, term: Term) {
-        self.entries.clear();
+    /// Moves the log to a received snapshot's position. When the log holds
+    /// the snapshot's last entry with its term, the entries after it are
+    /// kept, as Raft §7 says: the leader may already count them replicated
+    /// here, and dropping them left it sending after an end this log no
+    /// longer had, for ever. Otherwise the log is replaced whole. Returns
+    /// whether the suffix was kept, which says how the caller makes it
+    /// durable (`Ready::snapshot_keeps_log`).
+    pub(crate) fn restore_snapshot(&mut self, index: Index, term: Term) -> bool {
+        let kept = index > self.snapshot_index && self.term(index) == Some(term);
+        if kept {
+            let drop = (index - self.snapshot_index) as usize;
+            self.entries.drain(..drop);
+            self.persisted = self.persisted.max(index);
+        } else {
+            self.entries.clear();
+            // Nothing past the snapshot is in the log, durable or not.
+            self.persisted = index;
+        }
         self.snapshot_index = index;
         self.snapshot_term = term;
-        self.persisted = self.persisted.max(index);
         self.committed = self.committed.max(index);
         self.applied = self.applied.max(index);
+        kept
     }
 
     pub fn committed(&self) -> Index {

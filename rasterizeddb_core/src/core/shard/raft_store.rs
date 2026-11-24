@@ -155,7 +155,7 @@ impl RaftStore {
 
     /// Makes `ready`'s durable work durable (the core's contract, step 1).
     pub fn persist(&mut self, ready: &Ready) -> Result<(), String> {
-        self.persist_parts(ready.snapshot.as_ref(), ready.truncate_from, &ready.entries, ready.hard_state.as_ref())
+        self.persist_parts(ready.snapshot.as_ref(), ready.snapshot_keeps_log, ready.truncate_from, &ready.entries, ready.hard_state.as_ref())
     }
 
     /// [`Self::persist`] over the parts a `Ready` carries for storage, so a
@@ -163,6 +163,7 @@ impl RaftStore {
     pub fn persist_parts(
         &mut self,
         snapshot: Option<&(SnapshotMeta, Vec<u8>)>,
+        snapshot_keeps_log: bool,
         truncate_from: Option<Index>,
         entries: &[Entry],
         hard_state: Option<&HardState>,
@@ -176,6 +177,11 @@ impl RaftStore {
             let mut bytes = w.0;
             bytes.extend_from_slice(data);
             replace(&self.dir, SNAPSHOT, &bytes)?;
+            // A log that agreed with the snapshot keeps its entries after
+            // it: the restore drops those at or below the snapshot's index
+            // (`open`). Only a log replaced whole is reset.
+        }
+        if let Some((meta, _)) = ready.snapshot.filter(|_| !snapshot_keeps_log) {
             buf.extend(record(RESET, |b| {
                 b.extend_from_slice(&meta.index.to_le_bytes());
                 b.extend_from_slice(&meta.term.to_le_bytes());

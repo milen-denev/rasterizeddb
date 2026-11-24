@@ -305,14 +305,14 @@ impl Runner {
         }
         let mut store = self.store.take().ok_or("internal: the raft store is gone")?;
         // Only what storage needs crosses to the blocking thread.
-        let (snapshot, truncate_from, entries, hard_state) =
-            (ready.snapshot.clone(), ready.truncate_from, ready.entries.clone(), ready.hard_state);
+        let (snapshot, keeps_log, truncate_from, entries, hard_state) =
+            (ready.snapshot.clone(), ready.snapshot_keeps_log, ready.truncate_from, ready.entries.clone(), ready.hard_state);
         let nothing = snapshot.is_none() && truncate_from.is_none() && entries.is_empty() && hard_state.is_none();
         let (store, result) = if nothing {
             (store, Ok(()))
         } else {
             tokio::task::spawn_blocking(move || {
-                let r = store.persist_parts(snapshot.as_ref(), truncate_from, &entries, hard_state.as_ref());
+                let r = store.persist_parts(snapshot.as_ref(), keeps_log, truncate_from, &entries, hard_state.as_ref());
                 (store, r)
             })
             .await
