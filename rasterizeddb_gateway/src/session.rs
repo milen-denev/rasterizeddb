@@ -1133,6 +1133,9 @@ impl Session {
             }
         }
         let home = self.core.shared.home(&self.core.map());
+        // Marked before the decision exists, cleared once every part is
+        // told: reads across shards wait for it (B5.2).
+        crate::fanout::committing::begin(&gid);
         if failure.is_none() {
             let decided = match self.core.link(home) {
                 Ok(link) => link.call(&self.core, &Request::Decide { gid: gid.clone(), commit: true }.encode()).await,
@@ -1147,6 +1150,7 @@ impl Session {
             }
         }
         if let Some((code, msg)) = failure {
+            crate::fanout::committing::end(&gid);
             for s in &shards {
                 if prepared.contains(s) {
                     let _ = self.quiet_query(*s, &format!("ROLLBACK PREPARED '{gid}'")).await;
@@ -1166,6 +1170,7 @@ impl Session {
                 ),
             }
         }
+        crate::fanout::committing::end(&gid);
         self.end_txn();
         pg::command_complete(&mut self.out, tag.as_deref().unwrap_or("COMMIT"));
         pg::ready(&mut self.out, b'I');

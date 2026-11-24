@@ -38,6 +38,8 @@ impl Session {
         if writes {
             return self.each_shard(conn, msg, &shards).await;
         }
+        // A commit decided and mid-flight would show here half done (B5.2).
+        committing::settle(std::time::Duration::from_secs(5)).await;
         // Every part's virtual session first, then the parts at once.
         let mut sessions = Vec::with_capacity(shards.len());
         for &s in &shards {
@@ -95,6 +97,7 @@ impl Session {
     /// after.
     pub(crate) async fn gather_run<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, text: &str, tables: &[String]) -> io::Result<Outcome> {
         self.core.counters.borrow_mut().fan_outs += 1;
+        committing::settle(std::time::Duration::from_secs(5)).await;
         let map = self.core.map();
         let home = self.core.shared.home(&map);
         let shards: Vec<u32> = map.shards().iter().map(|s| s.id).collect();
@@ -648,5 +651,62 @@ mod gather_tests {
             "SELECT \"rdb_gather_1_orders\".id, \"rdb_gather_1_orders\".v FROM \"rdb_gather_1_orders\""
         );
         assert_eq!(rename_tables("SELECT x.orders FROM t x", &r), "SELECT x.orders FROM t x", "a column named like the table");
+    }
+}
+
+/// Two-phase commits this gateway has decided and not yet finished on
+/// every shard (B5.2): a read across shards waits for them, so it never
+/// sees one part of a committed transaction without the rest.
+pub(crate) mod committing {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    static SET: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+    pub(crate) fn begin(gid: &str) {
+        SET.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new).insert(gid.to_string());
+    }
+
+    pub(crate) fn end(gid: &str) {
+        if let Some(s) = SET.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            s.remove(gid);
+        }
+    }
+
+    fn busy() -> bool {
+        SET.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| !s.is_empty())
+    }
+
+    /// Waits until no decided commit is mid-flight, at most `bound`;
+    /// `false` when it gave up (a stuck part is `rdb-shard resolve`'s).
+    pub(crate) async fn settle(bound: Duration) -> bool {
+        let until = Instant::now() + bound;
+        while busy() {
+            if Instant::now() >= until {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn b52_a_read_waits_for_a_commit_mid_flight() {
+            begin("g1");
+            let start = Instant::now();
+            let waiter = tokio::spawn(settle(Duration::from_secs(5)));
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            end("g1");
+            assert!(waiter.await.unwrap(), "settled once the commit finished");
+            assert!(start.elapsed() >= Duration::from_millis(25));
+            begin("stuck");
+            assert!(!settle(Duration::from_millis(20)).await, "bounded");
+            end("stuck");
+        }
     }
 }
