@@ -441,8 +441,32 @@ pub fn apply_to_create(
         if declared_column.data_type != DbType::STRING || ct.json_columns.iter().any(|j| j.column.eq_ignore_ascii_case(&name)) {
             return Err(format!("collations are not supported by the type of column \"{name}\""));
         }
-        if ct.foreign_keys.iter().any(|fk| fk.has_column(&name)) {
-            return unsupported(&format!("a foreign key on column \"{name}\""));
+        // A foreign key over such a column matches its parent under the
+        // collation: it pairs the companions, the parent's being the key its
+        // own collation made unique (an `'ABC'` child finds an `'abc'`
+        // parent, as SQL Server's CI key does). The parent's column must
+        // have the same collation (its companion is named for it). An action
+        // that writes the child's key column — SET NULL, SET DEFAULT, ON
+        // UPDATE CASCADE — would write the companion, which only the column
+        // itself may set: refused for now.
+        for fk in ct.foreign_keys.iter_mut().filter(|fk| fk.has_column(&name)) {
+            use crate::core::rql::foreign_key::ReferentialAction as A;
+            let writes_child = |a: &A| matches!(a, A::SetNull | A::SetDefault);
+            if writes_child(&fk.on_delete) || writes_child(&fk.on_update) || matches!(fk.on_update, A::Cascade) {
+                return unsupported(&format!(
+                    "ON DELETE/UPDATE SET NULL, SET DEFAULT or ON UPDATE CASCADE on a foreign key over column \"{name}\""
+                ));
+            }
+            let Some(at) = fk.columns.iter().position(|c| c.eq_ignore_ascii_case(&name)) else { continue };
+            let companion = companion_name(&name, strength).expect("nondeterministic");
+            fk.columns[at] = companion;
+            if let Some(parent) = fk.parent_columns.get_mut(at) {
+                *parent = companion_name(parent, strength).expect("nondeterministic");
+            } else {
+                return unsupported(&format!(
+                    "a foreign key over column \"{name}\" without its referenced column list"
+                ));
+            }
         }
         if ct.checks.iter().any(|c| mentions(&c.expression, &name)) {
             return unsupported(&format!("a CHECK reading column \"{name}\""));
@@ -842,6 +866,148 @@ pub fn refuse_in_set_op(
         }
     }
     Ok(())
+}
+
+/// `ALTER TABLE t ADD [COLUMN] [IF NOT EXISTS] c <text type> COLLATE <ci>
+/// [NOT NULL] [DEFAULT …] [UNIQUE]` as the statements that make such a
+/// column, as `CREATE TABLE` makes one (`apply_to_create`): the column
+/// without its collation, its key companion as a stored generated column
+/// (filled for the rows already there), and a `UNIQUE` on the companion.
+/// `None` for any other statement, which a caller refuses if it declares
+/// one (`declares_nondeterministic`).
+pub fn add_column_statements(sql: &str) -> Option<Result<Vec<String>, String>> {
+    let sql = sql.trim().trim_end_matches(';').trim_end();
+    let bytes = sql.as_bytes();
+    // Words outside quotes, with their spans; a top-level comma means
+    // several actions, which this does not split.
+    let mut words: Vec<(usize, usize)> = Vec::new();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                let end = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+                words.push((i, end));
+                i = end;
+            }
+            b'"' => {
+                let start = i;
+                let mut end = crate::core::sql_scan::quoted_end(bytes, i, b'"');
+                // `"a"."b"`
+                while end < bytes.len() && bytes[end] == b'.' {
+                    end = if bytes.get(end + 1) == Some(&b'"') {
+                        crate::core::sql_scan::quoted_end(bytes, end + 1, b'"')
+                    } else {
+                        let mut e = end + 1;
+                        while e < bytes.len() && crate::core::sql_scan::is_identifier_byte(bytes[e]) {
+                            e += 1;
+                        }
+                        e
+                    };
+                }
+                words.push((start, end));
+                i = end;
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            b',' if depth == 0 => return None,
+            b if b.is_ascii_whitespace() => i += 1,
+            _ => {
+                let start = i;
+                while i < bytes.len()
+                    && !bytes[i].is_ascii_whitespace()
+                    && !matches!(bytes[i], b'(' | b')' | b',' | b'\'')
+                {
+                    i += 1;
+                }
+                words.push((start, i));
+            }
+        }
+    }
+    let word = |k: usize| words.get(k).map(|&(a, b)| &sql[a..b]);
+    let is = |k: usize, w: &str| word(k).is_some_and(|x| x.eq_ignore_ascii_case(w));
+    if !(is(0, "ALTER") && is(1, "TABLE")) {
+        return None;
+    }
+    let mut k = 2;
+    if is(k, "IF") && is(k + 1, "EXISTS") {
+        k += 2;
+    }
+    if is(k, "ONLY") {
+        k += 1;
+    }
+    let table = word(k)?.to_string();
+    k += 1;
+    if !is(k, "ADD") {
+        return None;
+    }
+    k += 1;
+    if is(k, "COLUMN") {
+        k += 1;
+    }
+    let mut if_not_exists = false;
+    if is(k, "IF") && is(k + 1, "NOT") && is(k + 2, "EXISTS") {
+        if_not_exists = true;
+        k += 3;
+    }
+    let column_word = word(k)?;
+    let column = unquote(column_word);
+    let collate_at = (k..words.len()).find(|&j| is(j, "COLLATE"))?;
+    let name = word(collate_at + 1)?;
+    let strength = match resolve(name.rsplit('.').next().unwrap_or(name)) {
+        Ok(s) => s,
+        Err(e) => return Some(Err(e)),
+    };
+    if strength.is_binary() {
+        return None;
+    }
+    let refuse = |what: &str| Some(Err(format!("{what} is not supported with a case-insensitive collation yet")));
+    if (k..words.len()).any(|j| is(j, "PRIMARY") || is(j, "REFERENCES") || is(j, "CHECK") || is(j, "GENERATED")) {
+        return refuse("ALTER TABLE ADD COLUMN with a PRIMARY KEY, REFERENCES, CHECK or GENERATED clause");
+    }
+    let unique_at = (k..words.len()).find(|&j| is(j, "UNIQUE"));
+    // The column, without the collation (and its UNIQUE, which goes on the
+    // key).
+    let mut cut: Vec<(usize, usize)> = vec![(words[collate_at].0, words[collate_at + 1].1)];
+    if let Some(u) = unique_at {
+        cut.push(words[u]);
+    }
+    cut.sort();
+    let mut plain = String::with_capacity(sql.len());
+    let mut at = 0;
+    for (a, b) in cut {
+        plain.push_str(&sql[at..a]);
+        at = b;
+    }
+    plain.push_str(&sql[at..]);
+    let companion = companion_name(&column, strength).expect("nondeterministic");
+    if companion.len() > 128 || crate::core::rql::nullable::flag_column_name(&companion).len() > 128 {
+        return Some(Err(format!("column name \"{column}\" is too long for a case-insensitive collation")));
+    }
+    let mut out = vec![
+        plain,
+        format!(
+            "ALTER TABLE {table} ADD COLUMN {}{} text GENERATED ALWAYS AS ({}) STORED",
+            if if_not_exists { "IF NOT EXISTS " } else { "" },
+            ident(&companion),
+            companion_expression(&column, strength).expect("nondeterministic")
+        ),
+    ];
+    if unique_at.is_some() {
+        let bare = crate::core::sql_scan::bare_name(&table);
+        out.push(format!(
+            "ALTER TABLE {table} ADD CONSTRAINT {} UNIQUE ({})",
+            ident(&crate::core::rql::unique_key::implicit_key_name(&bare, &column)),
+            ident(&companion)
+        ));
+    }
+    Some(Ok(out))
 }
 
 /// Whether `sql` declares a nondeterministic collation anywhere: a
