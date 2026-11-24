@@ -42,6 +42,7 @@
 //! | 0x08 | Classify | database str, schema_epoch u64, source u8 (0 simple shape, 1 Parse text), text str |
 //! | 0x09 | ExecPart | session u64, map_epoch u64, merge [`Merge`], bytes (pgwire frontend messages) |
 //! | 0x0A | Cancel | backend_key u64 |
+//! | 0x0B | Native | database str, role str, map_epoch u64, bytes (one native-protocol request) |
 //!
 //! | kind | response | body |
 //! |---|---|---|
@@ -54,15 +55,20 @@
 //! | 0x87 | Template | schema_epoch u64, [`RouteTemplate`] |
 //! | 0x88 | PartReply | session u64, map_epoch u64, more u8, status u8, head bytes, rows list(sort_key bytes, row bytes), tail bytes |
 //! | 0x89 | Done | none |
+//! | 0x8A | NativeReply | map_epoch u64, bytes (the native-protocol response) |
 //! | 0xFF | Refused | sqlstate [5], before_effect u8, map_epoch u64, message str |
 //!
 //! # Semantics
 //!
-//! - **Hello** is the first request on every mux connection. The shard answers
-//!   with its identity; a gateway whose `cluster_id` differs, or whose map
+//! - **Hello** is the first request on every mux connection; any other
+//!   request before it is refused with [`HELLO_FIRST`], before effect.
+//!   The shard answers Hello with its identity; a gateway whose `cluster_id` differs, or whose map
 //!   names another shard at that address, closes the connection. When the
 //!   shard's `map_epoch` is higher the gateway fetches the map (MapFetch)
 //!   before routing more writes (R7). Epochs never go down.
+//!   A Hello with `cluster_id = 0` is a gateway with no map yet
+//!   (`map_from`): the shard answers HelloOk and serves only MapFetch on
+//!   that connection.
 //! - **MapFetch** returns the map as the shard holds it. `signature` is empty
 //!   until phase 2 (B2) signs maps.
 //! - **AuthFetch** is sent to the home shard only, for `role` in
@@ -83,7 +89,13 @@
 //!   reply larger than the shard's chunk size comes back as several
 //!   PgReply with `more = 1`, each fetched by Continue; the last has
 //!   `more = 0` and the ReadyForQuery status (`I`, `T` or `E`), and its
-//!   bytes end with that ReadyForQuery. A refusal before anything ran is
+//!   bytes end with that ReadyForQuery. `more = 0` with `status = 0` means
+//!   the session is in COPY FROM STDIN: the reply ended with
+//!   CopyInResponse, and the next Pg requests carry the client's CopyData,
+//!   CopyDone or CopyFail until a reply ends in ReadyForQuery. A batch that
+//!   ends in Flush rather than Sync also ends with `more = 0, status = 0`;
+//!   the gateway knows which it sent. A chunk never splits a backend
+//!   message: every PgReply's bytes are whole messages. A refusal before anything ran is
 //!   `Refused` with `before_effect = 1`: safe to retry elsewhere.
 //! - **CloseSession** ends a virtual session; any open transaction rolls
 //!   back. A session whose mux connection is lost is closed by the shard
@@ -103,6 +115,13 @@
 //!   is the RowDescription (and anything before the first row), `tail` the
 //!   CommandComplete and ReadyForQuery.
 //! - **Cancel** cancels whatever the session with that key is running.
+//! - **Native** runs one native-protocol request (a `\x01SIMPLE:` request or
+//!   a bare statement) as `role` in `database`, in autocommit, and returns
+//!   the native response bytes. Native transactions through the gateway are
+//!   not part of version 1.
+//! - A request naming a session the shard does not have (its mux
+//!   connection was lost and the shard closed it) is refused with
+//!   [`SESSION_GONE`], before effect: the gateway opens a new one.
 //! - **Refused** is the one error reply: a SQLSTATE, whether nothing took
 //!   effect (`before_effect`), and the shard's map epoch. The gateway retries
 //!   only `before_effect` refusals (R2); `RDB02` (range not owned here),
@@ -123,6 +142,11 @@ pub const NOT_OWNED: [u8; 5] = *b"RDB02";
 pub const MOVED: [u8; 5] = *b"RDB03";
 /// SQLSTATE: fenced for a move or failover; retry after a pause.
 pub const FENCED: [u8; 5] = *b"57P03";
+/// SQLSTATE: the virtual session is gone (the shard closed it).
+pub const SESSION_GONE: [u8; 5] = *b"08003";
+/// SQLSTATE: a request on a connection that has not said Hello (rastcp
+/// reconnected under it), refused before effect: Hello, then resend.
+pub const HELLO_FIRST: [u8; 5] = *b"08P02";
 /// SQLSTATE: a protocol violation.
 pub const PROTOCOL: [u8; 5] = *b"08P01";
 
@@ -144,10 +168,15 @@ pub enum RouteTemplate {
     /// Touches no sharded table: global tables, sequences, catalogue reads,
     /// `SET`, DDL that the home shard runs.
     Home,
-    /// Reaches every shard; how to combine the parts.
+    /// No key, but a shape whose parts combine exactly: the gateway's
+    /// `unrouted` setting refuses it or sends it to every shard. `writes`:
+    /// an UPDATE/DELETE, which fans out only under a session's
+    /// `unrouted_writes = each_shard`.
     FanOut { merge: Merge, writes: bool },
-    /// A sharded table with no key the shard could see: refused or fanned
-    /// out by the gateway's `unrouted` setting.
+    /// A sharded table with no key the shard could see, in a shape a
+    /// fan-out cannot answer exactly (a write, a locking read): always
+    /// refused, `0A000 "statement needs a route key in cluster mode"`
+    /// (fail-closed, B1a.6 step 4).
     NeedsKey,
 }
 
@@ -187,6 +216,7 @@ pub enum Request {
     Classify { database: String, schema_epoch: u64, source: Source, text: String },
     ExecPart { session: u64, map_epoch: u64, merge: Merge, bytes: Vec<u8> },
     Cancel { backend_key: u64 },
+    Native { database: String, role: String, map_epoch: u64, bytes: Vec<u8> },
 }
 
 /// Where a classified text came from.
@@ -209,6 +239,7 @@ pub enum Response {
     Template { schema_epoch: u64, template: RouteTemplate },
     PartReply(PartReply),
     Done,
+    NativeReply { map_epoch: u64, bytes: Vec<u8> },
     Refused(Refusal),
 }
 
@@ -467,6 +498,7 @@ impl Request {
             Request::Classify { .. } => 0x08,
             Request::ExecPart { .. } => 0x09,
             Request::Cancel { .. } => 0x0A,
+            Request::Native { .. } => 0x0B,
         }
     }
 
@@ -504,6 +536,9 @@ impl Request {
             }
             Request::Cancel { backend_key } => {
                 w.u64(*backend_key);
+            }
+            Request::Native { database, role, map_epoch, bytes } => {
+                w.str(database).str(role).u64(*map_epoch).bytes(bytes);
             }
         }
         w.buf
@@ -567,6 +602,7 @@ impl Request {
                 bytes: r.bytes()?.to_vec(),
             },
             0x0A => Request::Cancel { backend_key: r.u64()? },
+            0x0B => Request::Native { database: r.str()?, role: r.str()?, map_epoch: r.u64()?, bytes: r.bytes()?.to_vec() },
             k => return Err(format!("rshard request kind {k:#04x} is unknown")),
         };
         r.end()?;
@@ -586,6 +622,7 @@ impl Response {
             Response::Template { .. } => 0x87,
             Response::PartReply(_) => 0x88,
             Response::Done => 0x89,
+            Response::NativeReply { .. } => 0x8A,
             Response::Refused(_) => 0xFF,
         }
     }
@@ -639,6 +676,9 @@ impl Response {
                 w.bytes(&p.tail);
             }
             Response::Done => {}
+            Response::NativeReply { map_epoch, bytes } => {
+                w.u64(*map_epoch).bytes(bytes);
+            }
             Response::Refused(r) => {
                 w.raw(&r.sqlstate).u8(r.before_effect as u8).u64(r.map_epoch).str(&r.message);
             }
@@ -702,6 +742,7 @@ impl Response {
                 Response::PartReply(PartReply { session, map_epoch, more, status, head, rows, tail: r.bytes()?.to_vec() })
             }
             0x89 => Response::Done,
+            0x8A => Response::NativeReply { map_epoch: r.u64()?, bytes: r.bytes()?.to_vec() },
             0xFF => Response::Refused(Refusal {
                 sqlstate: r.array()?,
                 before_effect: r.bool()?,
@@ -720,7 +761,8 @@ impl Response {
         match self {
             Response::HelloOk { map_epoch, .. }
             | Response::SessionOpened { map_epoch, .. }
-            | Response::PgReply { map_epoch, .. } => Some(*map_epoch),
+            | Response::PgReply { map_epoch, .. }
+            | Response::NativeReply { map_epoch, .. } => Some(*map_epoch),
             Response::PartReply(p) => Some(p.map_epoch),
             Response::Refused(r) => Some(r.map_epoch),
             _ => None,
