@@ -10,11 +10,13 @@
 //!   client-side [`key::KeyValue`] normaliser.
 //! - [`map`]: point ranges and a partition's range map.
 //! - [`shard_map`]: level-0 blocks to shards, with its text and binary codecs.
+//! - [`balance`]: the auto-balancing planner over a map and measured loads.
 //!
 //! The crate has no dependencies, so every byte of a route is computed here.
 
 #![forbid(unsafe_code)]
 
+pub mod balance;
 pub mod key;
 pub mod map;
 pub mod shard_map;

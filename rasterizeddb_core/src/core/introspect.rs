@@ -65,6 +65,10 @@ pub enum Introspect {
     /// One row per shard of the cluster map this node serves (sharding-plan.md
     /// B1a.12); no rows on a node that is not a shard.
     Shards,
+    /// One row per materialized partition of every partitioned table: its
+    /// level-0 block range and stored size, what the auto-balancer plans
+    /// from (sharding-plan.md §4.6b).
+    ShardLoad,
     Columns(String),
     SchemaMap,
     /// Every CHECK constraint and whether this binary enforces it.
@@ -185,6 +189,12 @@ pub fn parse(sql: &str) -> Option<Result<Introspect, String>> {
             Some(_) => Some(Err("SHOW TABLE STATS takes one table name".to_string())),
             None => Some(Err("SHOW TABLE STATS names no table".to_string())),
         },
+        Some("SHARD") if words.get(2).copied() == Some("LOAD") => {
+            if words.len() > 3 {
+                return Some(Err("SHOW SHARD LOAD takes no arguments".to_string()));
+            }
+            Some(Ok(Introspect::ShardLoad))
+        }
         Some("SHARDS") => {
             if words.len() > 2 {
                 return Some(Err("SHOW SHARDS takes no arguments".to_string()));
@@ -335,6 +345,15 @@ pub fn result_fields(statement: &Introspect) -> Option<Vec<(String, DbType)>> {
         // `lo` and `hi` are text: the hash space is `[0, 2^64)`, so the last
         // partition's `hi` does not fit a BIGINT, and a `lo` past 2^63 would
         // read as negative. Hex, as the map log and the design write them.
+        Introspect::ShardLoad => vec![
+            text("table_name"),
+            number("pid"),
+            text("lo_block"),
+            text("hi_block"),
+            number("row_slots"),
+            number("total_bytes"),
+            number("statements"),
+        ],
         // Block ranges as hex text, as SHOW PARTITIONS writes points.
         Introspect::Shards => vec![
             number("shard_id"),
@@ -463,6 +482,10 @@ pub async fn execute(statement: &Introspect, database: &Arc<Database>) -> Vec<u8
             Err(e) => failure(&e),
         },
         Introspect::Shards => rows(shards()),
+        Introspect::ShardLoad => match shard_load(database).await {
+            Ok(r) => rows(r),
+            Err(e) => failure(&e),
+        },
         Introspect::Columns(name) => match columns(database, name) {
             Ok(r) => rows(r),
             Err(e) => failure(&e),
@@ -1704,6 +1727,35 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
 /// `[lo, hi)` range of the hash space, where its files are, whether it has
 /// any, and its sizes (zero until it is materialized). Refused for a plain
 /// table, and for a partitioned table that cannot be opened.
+/// `SHOW SHARD LOAD`: every materialized partition's level-0 block range and
+/// size. `statements` is 0 until per-range statement counters exist; the
+/// balancer then weighs bytes alone.
+async fn shard_load(database: &Arc<Database>) -> Result<Vec<Row>, String> {
+    let mut names: Vec<String> = table_names(database).into_iter().filter(|n| !n.starts_with("__")).collect();
+    names.sort();
+    let mut out = Vec::new();
+    for name in names {
+        let Some(Relation::Partitioned(table)) = database.relation(&name) else {
+            continue;
+        };
+        let infos = table.partitions().await.map_err(|e| e.to_string())?;
+        for p in infos.into_iter().filter(|p| p.state == "materialized") {
+            let lo_block = p.lo >> 16;
+            let hi_block = ((p.hi + 0xFFFF) >> 16) as u64;
+            out.push(row(&[
+                Cell::Text(name.clone()),
+                Cell::Number(p.pid as u64),
+                Cell::Text(format!("{lo_block:#x}")),
+                Cell::Text(format!("{hi_block:#x}")),
+                Cell::Number(p.slots),
+                Cell::Number(p.bytes),
+                Cell::Number(0),
+            ]));
+        }
+    }
+    Ok(out)
+}
+
 /// `SHOW SHARDS`: the served cluster map, one row per shard.
 #[cfg(feature = "sharding")]
 fn shards() -> Vec<Row> {
