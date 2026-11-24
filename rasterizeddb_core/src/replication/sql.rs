@@ -1245,17 +1245,17 @@ fn stats_rows(database: &Arc<Database>) -> Vec<crate::core::row::row::Row> {
     push(
         "applied",
         load(&stats.applied),
-        "received from peers and applied here",
+        "of this node's, applied by the peers it sent them to (what this node received: \"applied through\" in SHOW REPLICATION)",
     );
     push(
         "duplicates",
         load(&stats.duplicates),
-        "already seen, so ignored",
+        "of this node's, a peer already had, so ignored there",
     );
     push(
         "conflicts",
         load(&stats.conflicts),
-        "would not apply; see the conflict policy",
+        "of this node's, a peer would not apply; see the conflict policy",
     );
     push("failures", load(&stats.failures), "");
     push(
