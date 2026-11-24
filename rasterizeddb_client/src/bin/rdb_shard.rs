@@ -11,7 +11,7 @@
 //! rdb-shard rebalance   --map MAP [--tolerance 0.10] [--max-moves 4] [--max-bytes N]
 //!                       [--pin LO:HI …] [--exclude SHARD …]
 //!                       [--apply --fenced --out NEW_MAP --state-dir DIR
-//!                        --table TABLE:COLUMN:TYPE [--table …]]
+//!                        --table TABLE:COLUMN:TYPE [--table …]] [--every SECS]
 //! rdb-shard exec        --map MAP --sql SQL
 //! rdb-shard keygen      --key FILE
 //! rdb-shard sign        --map MAP --key FILE
@@ -145,6 +145,7 @@ async fn run(args: &Args) -> std::result::Result<(), String> {
         "move-tenant" => move_tenant(args, &options).await,
         "rollback" => rollback(args, &options).await,
         "retire" => retire(args, &options).await,
+        "rebalance" if args.opt("every").is_some() => rebalance_forever(args, &options).await,
         "rebalance" => rebalance(args, &options).await,
         "ddl" => cluster_ddl(args, &options).await,
         "keygen" => keygen(args),
@@ -1049,4 +1050,28 @@ async fn exec_each(args: &Args, options: &Options) -> std::result::Result<(), St
     }
     println!("{total} on {} shards", applied.len());
     Ok(())
+}
+
+/// `rebalance --every SECS` (sharding-plan.md §4.6b, B6's automatic
+/// balancing): a round every SECS seconds against the map the last round
+/// wrote (`--out`), applied when `--apply` is given. Stops at the first
+/// round that fails, so a failed move is looked at, not retried over.
+async fn rebalance_forever(args: &Args, options: &Options) -> std::result::Result<(), String> {
+    let secs: u64 = args.one("every")?.parse().map_err(|_| "--every takes seconds".to_string())?;
+    let out = args.opt("out").map(str::to_string);
+    let mut round = 0u64;
+    loop {
+        round += 1;
+        println!("round {round}");
+        // From the second round on, plan from the map the previous wrote.
+        let mut a = Args { command: args.command.clone(), flags: args.flags.clone(), switches: args.switches.clone() };
+        if round > 1
+            && let Some(o) = &out
+            && std::path::Path::new(o).exists()
+        {
+            a.flags.insert("map".to_string(), vec![o.clone()]);
+        }
+        rebalance(&a, options).await.map_err(|e| format!("round {round}: {e}"))?;
+        tokio::time::sleep(std::time::Duration::from_secs(secs.max(1))).await;
+    }
 }
