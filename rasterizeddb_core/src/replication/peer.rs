@@ -436,6 +436,7 @@ async fn connect(replication: &Arc<Replication>, peer: &Arc<PeerHandle>) -> Resu
         codecs: Codec::local_mask(),
         clock: replication.clock().now(),
         token: config.token.clone(),
+        database: replication.routed_database(),
         advertised_addr: format!("{}:{}", config.listen_addr, config.listen_port),
     };
     let mut payload = Vec::new();

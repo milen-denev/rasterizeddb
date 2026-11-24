@@ -97,6 +97,16 @@
 //! has to outlast the call that sent it, uses a [`SimpleSession`]
 //! ([`Client::simple_session`]); a long statement is stopped with
 //! [`Client::cancel`] and the [`CancelToken`] it was sent with.
+//!
+//! # Notices and the statement timeout
+//!
+//! What the server says about a statement without failing it (`RAISE
+//! NOTICE`, `DROP TABLE IF EXISTS` naming no table) comes with its answer,
+//! [`Rows::notices`], and goes to [`Client::set_notice_handler`]'s handler;
+//! see [`notice`]. A statement that runs past the server's statement timeout
+//! (its request timeout, 30 s by default) is stopped and fails with `57014`
+//! ([`Error::is_statement_timeout`]); its connection, and a transaction on
+//! it, are kept.
 
 // The derive macros name this crate by its path; this lets its own tests use
 // them.
@@ -118,6 +128,7 @@ mod value;
 
 pub mod admin;
 pub mod kv;
+pub mod notice;
 pub mod orm;
 pub mod simple;
 
@@ -144,11 +155,12 @@ pub mod guide {
     pub mod admin {}
 }
 
-pub use client::{Client, Options};
+pub use client::{ANSWER_GRACE, Client, Options};
 pub use error::Error;
 pub use executor::Executor;
 pub use from_sql::{FromSql, FromSqlOwned};
 pub use login::Login;
+pub use notice::{Notice, NoticeHandler};
 pub use params::{
     ArrayRef, Param, check_statement, quote_bytes, quote_ident, quote_text, render, render_dyn,
 };

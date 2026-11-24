@@ -50,12 +50,20 @@
 //! `kv.save_interval_secs` when anything changed, and a clean shutdown saves.
 //! That is Redis's RDB without the AOF: a crash loses what changed since the
 //! last save.
+//!
+//! # Replication
+//!
+//! On a node that replicates, every write is shipped to the peers over the
+//! table data's link, in the order it ran, as the effect it had: absolute
+//! lifetimes, the members a pop took, the result of a float increment. See
+//! [`repl`].
 
 pub mod blocking;
 pub mod commands;
 pub mod glob;
 pub mod pubsub;
 pub mod reply;
+pub mod repl;
 pub mod resp;
 pub mod server;
 pub mod snapshot;
@@ -63,7 +71,7 @@ pub mod sql;
 pub mod store;
 pub mod values;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -315,6 +323,10 @@ pub struct Inner {
     /// same temporary file at once.
     save_lock: Mutex<()>,
     sweeper: OnceLock<()>,
+    /// The database's replication, which every write to these stores is
+    /// recorded for while it is active. Set once, by the database that owns
+    /// the handle; a handle made on its own (a test of the store) has none.
+    replication: OnceLock<Arc<crate::replication::Replication>>,
 }
 
 /// The database's key/value store, built on first use.
@@ -350,6 +362,7 @@ impl KvCacheHandle {
             port: AtomicU64::new(0),
             save_lock: Mutex::new(()),
             sweeper: OnceLock::new(),
+            replication: OnceLock::new(),
         });
         {
             // Every database opened registers here, so drop the ones that are
@@ -363,6 +376,18 @@ impl KvCacheHandle {
 
     pub fn inner(&self) -> &Arc<Inner> {
         &self.inner
+    }
+
+    /// Records this handle's writes for `replication` while it is active
+    /// (see [`repl`]). Once; a second call is ignored.
+    pub fn attach_replication(&self, replication: Arc<crate::replication::Replication>) {
+        let _ = self.inner.replication.set(replication);
+    }
+
+    /// The replication this handle's writes are recorded for, if any.
+    #[inline]
+    pub fn replication(&self) -> Option<&Arc<crate::replication::Replication>> {
+        self.inner.replication.get()
     }
 
     /// Database `db`, building it if this is its first use.

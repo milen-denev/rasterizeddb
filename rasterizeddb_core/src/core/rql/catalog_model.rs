@@ -432,6 +432,12 @@ pub(crate) struct Constraint {
     pub foreign_keys: Vec<i64>,
     pub on_update: &'static str,
     pub on_delete: &'static str,
+    /// A foreign key's `confmatchtype`: `s` (MATCH SIMPLE) or `f` (MATCH
+    /// FULL); a blank for any other constraint.
+    pub match_type: &'static str,
+    /// A foreign key's referenced columns, in key order, resolved to the
+    /// parent's attnums into `foreign_keys` once the model is complete.
+    pub foreign_columns: Vec<String>,
     pub definition: String,
 }
 
@@ -481,9 +487,24 @@ pub(crate) struct ProcRow {
     pub body: String,
 }
 
+/// The PRIMARY KEY or UNIQUE constraint of `fk`'s referenced table whose
+/// columns are exactly the ones `fk` references, in any order: what
+/// `information_schema` calls its unique constraint.
+fn referenced_key<'m>(model: &'m Model, fk: &Constraint) -> Option<&'m Constraint> {
+    let parent = model.rels.iter().find(|r| r.oid == fk.foreign_table)?;
+    parent.constraints.iter().find(|k| {
+        matches!(k.contype, "p" | "u")
+            && !fk.foreign_keys.is_empty()
+            && k.keys.len() == fk.foreign_keys.len()
+            && fk.foreign_keys.iter().all(|a| k.keys.contains(a))
+    })
+}
+
 /// What one statement's catalogue relations are built from.
 #[derive(Debug, Default)]
 pub(crate) struct Model {
+    /// The database's name: the `…_catalog` columns of `information_schema`.
+    pub database: String,
     pub rels: Vec<Rel>,
     pub roles: Vec<RoleRow>,
     pub procs: Vec<ProcRow>,
@@ -849,7 +870,7 @@ fn table_indexes(
             .find(|c| c.name.eq_ignore_ascii_case(column))
             .map(|c| c.attnum)
     };
-    let pkey = pkey_name(&schema.name);
+    let pkey = crate::core::rql::unique_key::primary_key_of(schema).map_or_else(|| pkey_name(&schema.name), |key| key.name);
     let mut indexes = Vec::new();
     let mut constraints = Vec::new();
     for (index_name, unique, keys, predicate) in shared {
@@ -899,8 +920,15 @@ fn table_indexes(
                     .unwrap_or_default()
             ),
         });
-        // A unique index under a predicate is an index, not a constraint.
-        if unique && predicate.is_none() {
+        // A unique index under a predicate is an index, not a constraint, and
+        // so is one `CREATE UNIQUE INDEX` made: PostgreSQL gives either no
+        // `pg_constraint` row, and psql's `\d` lists it as `UNIQUE`, not
+        // `UNIQUE CONSTRAINT`.
+        let made_as_index = schema
+            .unique_keys
+            .iter()
+            .any(|k| !k.is_deleted && k.from_index && k.name.eq_ignore_ascii_case(&index_name));
+        if unique && predicate.is_none() && !made_as_index {
             constraints.push(Constraint {
                 oid: oid_of(&format!("{name}.{index_name}.con")),
                 name: index_name.clone(),
@@ -911,6 +939,8 @@ fn table_indexes(
                 foreign_keys: Vec::new(),
                 on_update: "a",
                 on_delete: "a",
+                match_type: " ",
+                foreign_columns: Vec::new(),
                 definition: format!(
                     "{} ({})",
                     if primary { "PRIMARY KEY" } else { "UNIQUE" },
@@ -961,29 +991,42 @@ fn table_indexes(
     for fk in schema.foreign_keys.iter().filter(|f| !f.is_deleted) {
         let (on_update, update_text) = action_code(&fk.on_update);
         let (on_delete, delete_text) = action_code(&fk.on_delete);
+        let list = |columns: &[String]| columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+        // PostgreSQL's `pg_get_constraintdef`: `FOREIGN KEY (a, b)
+        // REFERENCES p(x, y) [MATCH FULL] [ON UPDATE …] [ON DELETE … [(cols)]]`.
         let mut definition = format!(
             "FOREIGN KEY ({}) REFERENCES {}({})",
-            quote_ident(&fk.column),
+            list(&fk.columns),
             quote_ident(&fk.parent_table),
-            quote_ident(&fk.parent_column)
+            list(&fk.parent_columns)
         );
+        if fk.match_full {
+            definition.push_str(" MATCH FULL");
+        }
         if !update_text.is_empty() {
             definition.push_str(&format!(" ON UPDATE {update_text}"));
         }
         if !delete_text.is_empty() {
             definition.push_str(&format!(" ON DELETE {delete_text}"));
+            if !fk.on_delete_columns.is_empty() {
+                definition.push_str(&format!(" ({})", list(&fk.on_delete_columns)));
+            }
         }
         constraints.push(Constraint {
             oid: oid_of(&format!("{name}.{}.con", fk.name)),
             name: fk.name.clone(),
             contype: "f",
             index: 0,
-            keys: attnum_of(&fk.column).into_iter().collect(),
+            // In key order, as `conkey` lists them; a column that is not
+            // there leaves the whole list out rather than a part of it.
+            keys: fk.columns.iter().map(|c| attnum_of(c)).collect::<Option<Vec<i64>>>().unwrap_or_default(),
             foreign_table: oid_of(&fk.parent_table),
-            // The parent's attnum is resolved when the model is complete.
+            // The parent's attnums are resolved when the model is complete.
             foreign_keys: Vec::new(),
             on_update,
             on_delete,
+            match_type: if fk.match_full { "f" } else { "s" },
+            foreign_columns: fk.parent_columns.clone(),
             definition,
         });
     }
@@ -998,6 +1041,8 @@ fn table_indexes(
             foreign_keys: Vec::new(),
             on_update: "a",
             on_delete: "a",
+            match_type: " ",
+            foreign_columns: Vec::new(),
             definition: format!("CHECK (({}))", check.expression.trim()),
         });
     }
@@ -1109,25 +1154,17 @@ pub(crate) async fn build_model(
         })
         .collect();
     for rel in rels.iter_mut() {
-        let Some(relation) = database.relation(&rel.name) else {
-            continue;
-        };
-        let schema = relation.schema();
         for con in rel.constraints.iter_mut().filter(|c| c.contype == "f") {
-            let parent_column = schema
-                .foreign_keys
+            let Some(columns) = parents.get(&con.foreign_table) else {
+                continue;
+            };
+            // In key order, `confkey` index for index with `conkey`.
+            con.foreign_keys = con
+                .foreign_columns
                 .iter()
-                .find(|f| !f.is_deleted && f.name == con.name)
-                .map(|f| f.parent_column.clone());
-            if let (Some(columns), Some(parent_column)) =
-                (parents.get(&con.foreign_table), parent_column)
-            {
-                con.foreign_keys = columns
-                    .iter()
-                    .filter(|(n, _)| n.eq_ignore_ascii_case(&parent_column))
-                    .map(|(_, a)| *a)
-                    .collect();
-            }
+                .map(|wanted| columns.iter().find(|(n, _)| n.eq_ignore_ascii_case(wanted)).map(|(_, a)| *a))
+                .collect::<Option<Vec<i64>>>()
+                .unwrap_or_default();
         }
     }
     for view in gathered
@@ -1192,7 +1229,7 @@ pub(crate) async fn build_model(
     }
     let procs = procs(database, tx).await;
     let enums = crate::core::rql::user_types::load(database, None, tx).await.unwrap_or_default();
-    Model { rels, roles, procs, enums }
+    Model { database: database.name.clone(), rels, roles, procs, enums }
 }
 
 /// The roles `rdb_roles` holds, with the bootstrap superuser's oid given to
@@ -1260,7 +1297,15 @@ pub(crate) fn type_oid_by_name(name: &str) -> i64 {
         Some(b) => (b.trim().to_string(), true),
         None => (lower, false),
     };
-    let canonical = match base.split('(').next().unwrap_or("").trim() {
+    // Without its modifier, wherever it is written: `numeric(10,2)`,
+    // `timestamp(3) with time zone`.
+    let base = match (base.find('('), base.find(')')) {
+        (Some(open), Some(close)) if open < close => {
+            format!("{} {}", base[..open].trim_end(), base[close + 1..].trim_start()).trim().to_string()
+        }
+        _ => base,
+    };
+    let canonical = match base.as_str() {
         "integer" | "int" | "int4" => "int4",
         "bigint" | "int8" => "int8",
         "smallint" | "int2" => "int2",
@@ -1467,6 +1512,11 @@ pub(crate) const NEW_VIEWS: &[&str] = &[
     "pg_rewrite",
     "pg_depend",
     "pg_extension",
+    // `information_schema`'s constraint views, built from `pg_constraint`'s
+    // rows: what an ORM's schema reader joins to find the keys.
+    "table_constraints",
+    "key_column_usage",
+    "referential_constraints",
 ];
 
 /// The columns of the relations this module builds, and of those
@@ -1565,6 +1615,41 @@ pub(crate) fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]
             ("adrelid", I64),
             ("adnum", I16),
             ("adbin", STRING),
+        ],
+        "table_constraints" => &[
+            ("constraint_catalog", STRING),
+            ("constraint_schema", STRING),
+            ("constraint_name", STRING),
+            ("table_catalog", STRING),
+            ("table_schema", STRING),
+            ("table_name", STRING),
+            ("constraint_type", STRING),
+            ("is_deferrable", STRING),
+            ("initially_deferred", STRING),
+            ("enforced", STRING),
+            ("nulls_distinct", STRING),
+        ],
+        "key_column_usage" => &[
+            ("constraint_catalog", STRING),
+            ("constraint_schema", STRING),
+            ("constraint_name", STRING),
+            ("table_catalog", STRING),
+            ("table_schema", STRING),
+            ("table_name", STRING),
+            ("column_name", STRING),
+            ("ordinal_position", I32),
+            ("position_in_unique_constraint", I32),
+        ],
+        "referential_constraints" => &[
+            ("constraint_catalog", STRING),
+            ("constraint_schema", STRING),
+            ("constraint_name", STRING),
+            ("unique_constraint_catalog", STRING),
+            ("unique_constraint_schema", STRING),
+            ("unique_constraint_name", STRING),
+            ("match_option", STRING),
+            ("update_rule", STRING),
+            ("delete_rule", STRING),
         ],
         "pg_constraint" => &[
             ("oid", I64),
@@ -1767,6 +1852,13 @@ pub(crate) fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]
             ("indcheckxmin", BOOL),
             ("indisreplident", BOOL),
             ("indkey", INT2_ARRAY),
+            // One operator class and one option word per key column, zero
+            // each: a key compares by the engine's own rule for its type,
+            // ascending, NULLs last. What a catalogue query needs of them is
+            // that two indexes over the same columns answer the same.
+            ("indclass", INT2_ARRAY),
+            ("indoption", INT2_ARRAY),
+            ("indcollation", INT2_ARRAY),
         ],
         // `partclass` and `partcollation` (oidvectors) as arrays, one zero
         // each: the key hashes by the engine's own rule, not an operator
@@ -1954,6 +2046,96 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                 })
             })
             .collect(),
+        "table_constraints" => {
+            let mut rows = Vec::new();
+            for rel in model.rels.iter().filter(|r| matches!(r.kind, "r" | "p")) {
+                for c in &rel.constraints {
+                    let kind = match c.contype {
+                        "p" => "PRIMARY KEY",
+                        "u" => "UNIQUE",
+                        "f" => "FOREIGN KEY",
+                        "c" => "CHECK",
+                        _ => continue,
+                    };
+                    rows.push(vec![
+                        t(&model.database),
+                        t("public"),
+                        t(&c.name),
+                        t(&model.database),
+                        t("public"),
+                        t(&rel.name),
+                        t(kind),
+                        t("NO"),
+                        t("NO"),
+                        t("YES"),
+                        if matches!(c.contype, "p" | "u") { t("YES") } else { V::N },
+                    ]);
+                }
+            }
+            rows
+        }
+        // Each column of a PRIMARY KEY, UNIQUE or FOREIGN KEY constraint,
+        // in key order; a foreign key's column with the position of the
+        // column it references within the referenced key.
+        "key_column_usage" => {
+            let mut rows = Vec::new();
+            for rel in model.rels.iter().filter(|r| matches!(r.kind, "r" | "p")) {
+                for c in rel.constraints.iter().filter(|c| matches!(c.contype, "p" | "u" | "f")) {
+                    let referenced = (c.contype == "f").then(|| referenced_key(model, c)).flatten();
+                    for (i, attnum) in c.keys.iter().enumerate() {
+                        let Some(column) = rel.columns.iter().find(|col| col.attnum == *attnum) else {
+                            continue;
+                        };
+                        let position = match (&referenced, c.foreign_keys.get(i)) {
+                            (Some(key), Some(parent)) => {
+                                key.keys.iter().position(|k| k == parent).map_or(V::N, |p| V::I(p as i64 + 1))
+                            }
+                            _ => V::N,
+                        };
+                        rows.push(vec![
+                            t(&model.database),
+                            t("public"),
+                            t(&c.name),
+                            t(&model.database),
+                            t("public"),
+                            t(&rel.name),
+                            t(&column.name),
+                            V::I(i as i64 + 1),
+                            position,
+                        ]);
+                    }
+                }
+            }
+            rows
+        }
+        "referential_constraints" => {
+            let rule = |code: &str| match code {
+                "r" => "RESTRICT",
+                "c" => "CASCADE",
+                "n" => "SET NULL",
+                "d" => "SET DEFAULT",
+                _ => "NO ACTION",
+            };
+            let mut rows = Vec::new();
+            for rel in model.rels.iter().filter(|r| matches!(r.kind, "r" | "p")) {
+                for c in rel.constraints.iter().filter(|c| c.contype == "f") {
+                    let key = referenced_key(model, c);
+                    let unique = |v: &str| if key.is_some() { t(v) } else { V::N };
+                    rows.push(vec![
+                        t(&model.database),
+                        t("public"),
+                        t(&c.name),
+                        unique(&model.database),
+                        unique("public"),
+                        key.map_or(V::N, |k| t(&k.name)),
+                        t(if c.match_type == "f" { "FULL" } else { "NONE" }),
+                        t(rule(c.on_update)),
+                        t(rule(c.on_delete)),
+                    ]);
+                }
+            }
+            rows
+        }
         "pg_constraint" => model
             .rels
             .iter()
@@ -1974,7 +2156,7 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                         V::I(c.foreign_table),
                         t(if c.contype == "f" { c.on_update } else { " " }),
                         t(if c.contype == "f" { c.on_delete } else { " " }),
-                        t(if c.contype == "f" { "s" } else { " " }),
+                        t(if c.contype == "f" { c.match_type } else { " " }),
                         V::B(true),
                         V::I(0),
                         V::B(false),
@@ -2176,8 +2358,12 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                         V::B(true),
                         V::B(i.ready),
                         V::B(true),
-                        t(""),
-                        t(""),
+                        // No index here is partial or over an expression
+                        // (a partial unique index is a constraint): NULL, as
+                        // PostgreSQL has it, where the empty string made
+                        // `indpred IS NOT NULL` true of every index.
+                        V::N,
+                        V::N,
                         V::I(i.keys.len() as i64),
                         V::B(false),
                         V::B(false),
@@ -2186,6 +2372,9 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                         V::B(false),
                         V::B(false),
                         V::A(i.keys.clone()),
+                        V::A(vec![0; i.keys.len()]),
+                        V::A(vec![0; i.keys.len()]),
+                        V::A(vec![0; i.keys.len()]),
                     ]
                 })
             })

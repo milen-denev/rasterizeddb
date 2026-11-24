@@ -1,6 +1,6 @@
 # Multiple storage directories
 
-Behind the off-by-default `storage_pools` Cargo feature. Without it the pool
+Behind the `storage_pools` Cargo feature, which is in the default build. Without it the pool
 type is `()`, every question asked of it is a one-line shim that the optimiser
 erases, and `DbStorageProvider` has one fewer variant.
 

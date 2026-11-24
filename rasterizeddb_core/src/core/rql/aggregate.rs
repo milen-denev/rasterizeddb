@@ -22,6 +22,14 @@ use crate::core::value_codec::DECIMAL_SCALE;
 use crate::core::value_codec;
 use crate::memory_pool::{MEMORY_POOL, MemoryBlock};
 
+tokio::task_local! {
+    /// Set around a session the MySQL front end opens
+    /// (`pgwire::proxied::BridgeOptions::lenient_booleans`): its statements
+    /// may `sum`, `avg`, `min` and `max` a boolean, as MySQL does, where
+    /// PostgreSQL has no such aggregate ([`AggFunc::check_argument`]).
+    pub(crate) static MYSQL_BOOLEAN_AGGREGATES: ();
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggFunc {
     Count,
@@ -97,8 +105,9 @@ impl AggFunc {
         matches!(self, AggFunc::StringAgg | AggFunc::ArrayAgg | AggFunc::JsonAgg | AggFunc::JsonbAgg)
     }
 
-    /// Refuses `sum` and `avg` over a legacy `CHAR`, as PostgreSQL has no
-    /// such function. They folded nothing (its four bytes are no number) and
+    /// Refuses an aggregate over a type PostgreSQL has no such aggregate
+    /// for (42883): `sum` and `avg` over a legacy `CHAR` or text, `sum`,
+    /// `avg`, `min`, `max` over a boolean or a document, and the rest below. They folded nothing (its four bytes are no number) and
     /// answered NULL.
     pub fn check_argument(&self, arg: Option<&SchemaField>) -> Result<(), String> {
         // `string_agg` joins text (PostgreSQL's other form joins bytea), and
@@ -112,6 +121,21 @@ impl AggFunc {
                 }
                 AggFunc::BoolAnd | AggFunc::BoolOr | AggFunc::Every if f.db_type != DbType::BOOL => {
                     return Err(format!("function {}({}) does not exist", self.name(), shown()));
+                }
+                // Text is no number: `sum` and `avg` answered NULL over it.
+                AggFunc::Sum | AggFunc::Avg if f.db_type == DbType::STRING => {
+                    return Err(format!("function {}({}) does not exist", self.name(), shown()));
+                }
+                // PostgreSQL has no `sum`, `avg`, `min` or `max` of a
+                // boolean (`bool_and`, `bool_or` and `count(*) FILTER` are
+                // its forms); these answered a number and a boolean. MySQL
+                // has them — its BOOLEAN is TINYINT(1), and `SUM(active)`
+                // is how it counts — so a statement its front end sends keeps
+                // them ([`MYSQL_BOOLEAN_AGGREGATES`]).
+                AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max
+                    if f.db_type == DbType::BOOL && MYSQL_BOOLEAN_AGGREGATES.try_with(|_| ()).is_err() =>
+                {
+                    return Err(format!("function {}(boolean) does not exist", self.name()));
                 }
                 // A document is no number and has no order PostgreSQL will
                 // aggregate by: `sum` and `avg` answered NULL over one, and

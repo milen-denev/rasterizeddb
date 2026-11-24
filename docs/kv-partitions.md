@@ -307,3 +307,86 @@ rebuilds and answers through its index; the same-lengths rewrite; a plain
 table on a store; DROP sweeps the sidecar), `tests/partition_kv_snapshot.rs`
 (over the wire at the store's default tuning: the shutdown seal, two
 restarts, written partitions rebuild, a reseal loads again).
+
+## Read cost against files (2026-11-23)
+
+`examples/kv_table_bench.rs`: the same 100,000 rows in a plain table
+(`id` primary key, an index on `n`) and a 64-way hash-partitioned twin,
+once on files and once placed on a directory store, the database reopened,
+the query cache off. A store table's reads are served from its resident
+pages: no query read a byte from the store. Instructions per query (user
+mode, `perf stat`, the difference of two run lengths; wall time on the
+shared box drifted 2x between runs):
+
+| Query | Files | Store, before | Store, after |
+|---|---|---|---|
+| primary-key point | 155k | | 150k |
+| `n = v` through the index (100 rows) | 259k | ~3x files (wall 153 µs against 43) | 666k |
+| primary-key range (100 rows) | 301k | | 524k |
+| routed point on the partitioned twin | level with files | | level |
+| routed + index on the partitioned twin | 341k | | 893k |
+
+Two fixes, so far:
+- **A thin slot list read its whole span.** An index's candidates spread
+  over the table made `RowPointerIterator::load_next_chunk` read from the
+  first candidate to the last that a chunk reaches. A file lends that span
+  from its mapping, but a store file copies every byte, which was about
+  the whole pointer file per statement. When the provider lends nothing
+  and the list has fewer than one candidate per 8 records of the span, it
+  now reads one run of adjacent candidates at a time (`SPARSE_RUN_FACTOR`).
+- **A small read built a page map.** `KvFile::read_at` took the fetch path,
+  which builds a `HashMap` of pages per read, even for resident bytes. It
+  now tries the row fetch's resident path (`try_read_many_sync`) first:
+  748k to 666k instructions for the indexed lookup.
+
+- **A batch of rows took the per-read path.** `KvFile::read_many`, which
+  the row fetch takes for an index's rows and a scan's batches, fetched
+  the batch's pages and then ran every read through the async path, with
+  its overlay steps and page map, once per row. That was 100 calls per
+  indexed lookup and about 16,000 per fan-out. It now serves the whole
+  batch in one `try_read_many_sync` pass, before fetching anything and
+  again after, and goes read by read only when that pass declines (a page
+  evicted again, a read past the end).
+
+After all three, in instructions per query (files, then store): the
+indexed lookup 349k / 587k (1.7x, was about 3x), the primary-key range
+302k / 384k (1.27x, was 1.75x), routed + index 349k / 624k (1.8x, was
+2.6x), the 64-partition fan-out on the index 50.4M / 81.0M (1.6x). Point
+reads are level. The file figures move about 30% between runs, because
+background threads count too, so compare the ratios.
+
+Still open: about 1.3-1.8x on reads of many rows. That is the sync pass's
+own work (the state and cache read locks, overlay checks and a copy per
+row, where a file borrows). Closing it means letting a store file lend
+resident pages (`try_borrow_range`), a design change, not done. A load is about 7x slower (284 s against 40 s for 2 x 100k rows,
+multi-row INSERTs). S3 (MinIO/RustFS) is not measured yet; no S3 image is
+on this box.
+
+### On S3 (RustFS 1.0.6, 2026-11-23)
+
+The same bench with `--s3`: a local RustFS 1.0.6, its data on tmpfs, 20,000
+rows. Wall time p50 in µs, files then store; the shared box was loaded,
+so read the pairs, not the absolute figures:
+
+| Query | Files | S3 store |
+|---|---|---|
+| primary-key point | 35 | 36 |
+| `n = v` through the index (100 rows) | 35 | 44 |
+| primary-key range (100 rows) | 47 | 51 |
+| routed + index on the partitioned twin | 57 | 68 |
+| fan-out on the index, 64 partitions | 366 | 384 |
+
+No query fetched from the store: reads are served from resident pages, as
+for a directory store. Loading the 2 x 20,000 rows took as long as on files
+(about 117 s on that box) and left 4,089 objects totalling 3.7 MiB.
+
+Two things found on the way:
+- **Throttling outlasted the retries.** The client retried 429/503 four
+  times with backoff up to 0.8 s, about 1.5 s in all, and a write the store
+  kept answering 503 failed the INSERT. Throttling answers now get 10
+  attempts, backoff capped at 3.2 s, about 25 s in all
+  (`backup::s3::THROTTLE_ATTEMPTS`); other 5xx keep `max_attempts`.
+- **RustFS on a FUSE mount is not a usable test store.** With its data on
+  ntfs-3g, RustFS's 5 s disk health check timed out under load. It marked
+  its disk faulty and answered 503 to everything ("disk marked faulty" in
+  its log). Give it a real filesystem.

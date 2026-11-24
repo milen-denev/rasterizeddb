@@ -70,6 +70,11 @@ const CHUNK_SIZE: usize = TOTAL_LENGTH * 2; // 92 * 2 bytes chunks for debugging
 #[cfg(not(feature = "enable_long_row"))]
 const CHUNK_SIZE: usize = TOTAL_LENGTH * 3047; // ~64KB chunks
 
+/// A slot list with fewer than one candidate per this many records of a span
+/// a provider cannot lend is read a run of candidates at a time
+/// ([`RowPointerIterator::load_next_chunk`]) rather than the span copied.
+const SPARSE_RUN_FACTOR: u64 = 8;
+
 
 /// Iterates over RowPointers from a StorageIO in 64KB chunks
 pub struct RowPointerIterator<S: StorageIO> {
@@ -408,7 +413,7 @@ impl<S: StorageIO> RowPointerIterator<S> {
                 bytes_to_read_raw = (last - first + 1) * TOTAL_LENGTH as u64;
             }
         }
-        let bytes_to_read = bytes_to_read_raw - (bytes_to_read_raw % (TOTAL_LENGTH as u64));
+        let mut bytes_to_read = bytes_to_read_raw - (bytes_to_read_raw % (TOTAL_LENGTH as u64));
         if bytes_to_read == 0 {
             self.end_of_data = true;
             return Ok(());
@@ -431,6 +436,29 @@ impl<S: StorageIO> RowPointerIterator<S> {
         }
 
         self.borrowed_chunk = None;
+
+        // The provider has nothing to lend (a key/value file), so every byte
+        // read here is copied. A slot list spread thin over the span (an
+        // index's matches across the whole table: `n = 7` on a hundred thousand
+        // rows) would copy every record between its candidates only to skip
+        // them, about the whole pointer file per statement. Read only the run
+        // of consecutive candidates the span starts at; the next load jumps
+        // to the next candidate. A dense list keeps the one copy, cheaper than
+        // a read per run.
+        if let Some(slots) = self.candidates.as_ref().and_then(|c| c.sparse_slots()) {
+            let first = self.position / TOTAL_LENGTH as u64;
+            let span = bytes_to_read / TOTAL_LENGTH as u64;
+            let lo = slots.partition_point(|s| *s < first);
+            let hi = slots.partition_point(|s| *s < first + span);
+            let listed = (hi - lo) as u64;
+            if listed > 0 && span > SPARSE_RUN_FACTOR * listed && slots[lo] == first {
+                let mut run = 1u64;
+                while lo + (run as usize) < hi && slots[lo + run as usize] == first + run {
+                    run += 1;
+                }
+                bytes_to_read = run * TOTAL_LENGTH as u64;
+            }
+        }
 
         // Clear the buffer and ensure capacity. Reuse existing allocation when sizes match
         // to avoid pool churn on every chunk.
@@ -2990,6 +3018,9 @@ mod tests {
         /// written — a concurrent append reserves its record before filling it —
         /// and the iterator has to cope rather than trusting it.
         pub(super) declared_len: Option<u64>,
+        /// Bytes copied out by `read_data_into_buffer`, for the tests that
+        /// check what a read costs on a provider that lends nothing.
+        pub(super) read_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl crate::core::storage_providers::traits::StorageIO for InMemoryIo {
@@ -3015,6 +3046,7 @@ mod tests {
                 ));
             }
             buffer.copy_from_slice(&self.data[start..end]);
+            self.read_bytes.fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::Relaxed);
             *position += buffer.len() as u64;
             Ok(())
         }
@@ -3082,6 +3114,7 @@ mod tests {
         let io = Arc::new(InMemoryIo {
             declared_len: None,
             data: std::sync::Arc::new(bytes),
+            read_bytes: Default::default(),
         });
         let mut iterator = RowPointerIterator::new(io).await.unwrap();
 
@@ -3303,7 +3336,7 @@ mod tests {
     /// Mutation: `check_column_range` always `Ok` panics on the add.
     #[tokio::test]
     async fn a_row_position_past_u64_is_an_error_not_an_overflow() {
-        let io = InMemoryIo { data: std::sync::Arc::new(vec![0u8; 64]), declared_len: None };
+        let io = InMemoryIo { data: std::sync::Arc::new(vec![0u8; 64]), declared_len: None, read_bytes: Default::default() };
         let pointer = create_test_row_pointer(1, u64::MAX - 4, 16, false);
         let fetch = RowFetch {
             columns_fetching_data: smallvec::smallvec![ColumnFetchingData {
@@ -3328,7 +3361,7 @@ mod tests {
         let mut data = vec![0u8; 128];
         data[64..72].copy_from_slice(&(u64::MAX - 8).to_le_bytes());
         data[72..76].copy_from_slice(&5u32.to_le_bytes());
-        let io = InMemoryIo { data: std::sync::Arc::new(data), declared_len: None };
+        let io = InMemoryIo { data: std::sync::Arc::new(data), declared_len: None, read_bytes: Default::default() };
         let pointer = create_test_row_pointer(1, position, 32, false);
         let fetch = RowFetch {
             columns_fetching_data: smallvec::smallvec![ColumnFetchingData {
@@ -3971,6 +4004,7 @@ mod over_reported_length {
         let io = Arc::new(InMemoryIo {
             declared_len: Some(((n + extra) * TOTAL_LENGTH) as u64),
             data: std::sync::Arc::new(bytes),
+            read_bytes: Default::default(),
         });
 
         let mut it = RowPointerIterator::new(io).await.expect("iterator");
@@ -4483,5 +4517,65 @@ mod sparse_candidate_walk {
         for seed in 1..=600u64 {
             run_case(seed).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod sparse_candidates_on_a_copying_provider {
+    use super::tests::InMemoryIo;
+    use super::*;
+    use crate::core::filter::CandidateBitmap;
+    use rclite::Arc;
+
+    /// An index's slot list spread thin over a pointer file the provider
+    /// cannot lend (a key/value file copies every byte it reads) reads its
+    /// candidates' records, a run at a time, not every record between them:
+    /// it used to copy about the whole file per statement, and an indexed
+    /// lookup on a key/value table cost 3.5 times one on files. Every
+    /// candidate still comes back, a run of adjacent ones in one read, and
+    /// every slot past the list's `n_slots` (rows appended since) too.
+    ///
+    /// Mutation: drop the run read (`SPARSE_RUN_FACTOR` huge): the bytes
+    /// read are the whole span again.
+    #[tokio::test]
+    async fn a_thin_slot_list_reads_its_runs_not_the_span() {
+        let _ = crate::BATCH_SIZE.get_or_init(|| 1024);
+        let n = 20_000usize;
+        let n_slots = 15_000u64;
+        let mut bytes = Vec::with_capacity(n * TOTAL_LENGTH);
+        for id in 0..n {
+            let mut p = RowPointer::from_slice(&[0u8; TOTAL_LENGTH]);
+            p.id = (id as u64 + 1).into();
+            p.position = (id * 16) as u64;
+            p.length = 16;
+            p.xmin = crate::core::mvcc::transaction::FROZEN_TX;
+            bytes.extend_from_slice(p.into_memory_block().into_slice());
+        }
+        let read_bytes: std::sync::Arc<std::sync::atomic::AtomicU64> = Default::default();
+        let io = Arc::new(InMemoryIo { declared_len: None, data: std::sync::Arc::new(bytes), read_bytes: read_bytes.clone() });
+
+        // Every 1000th slot, and a run of three adjacent ones.
+        let mut listed: Vec<u64> = (0..n_slots).step_by(1000).collect();
+        listed.extend([5001, 5002]);
+        listed.sort_unstable();
+        // As the query paths build it: nothing read until the mask is on.
+        let mut it = RowPointerIterator::new_deferred(io).await.expect("iterator");
+        it.set_candidates(Some(Arc::new(CandidateBitmap::sparse(listed.clone(), n_slots))));
+        it.reset();
+        let mut seen: Vec<u64> = Vec::new();
+        loop {
+            let batch = it.next_row_pointers().await.expect("batch");
+            if batch.is_empty() {
+                break;
+            }
+            seen.extend(batch.iter().map(|p| (p.id as u64) - 1));
+        }
+        for slot in listed.iter().copied().chain(n_slots..n as u64) {
+            assert!(seen.contains(&slot), "candidate slot {slot} was not read");
+        }
+        // The listed records, plus the unlisted tail read as one span.
+        let want = (listed.len() as u64 + (n as u64 - n_slots)) * TOTAL_LENGTH as u64;
+        let read = read_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(read <= want + TOTAL_LENGTH as u64, "read {read} bytes for {want} of candidates");
     }
 }

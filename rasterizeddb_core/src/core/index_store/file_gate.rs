@@ -563,7 +563,8 @@ impl FileGate {
             }
             if flt_may_be_a_table(files) {
                 log::info!(
-                    "{} may be the rows of a table named {}_flt, so it is kept and {} takes no index                      snapshot",
+                    "{} may be the rows of a table named {}_flt, so it is kept and {} takes no index \
+                     snapshot",
                     files.flt().display(),
                     files.stem,
                     files.stem
@@ -578,7 +579,8 @@ impl FileGate {
             if evidence {
                 FLT_EVIDENCE_TOTAL.fetch_add(1, Ordering::Relaxed);
                 log::info!(
-                    "{} is beside {}: a binary without marker logs opened the table since its last                      snapshot, so the snapshot is discarded and the filter rebuilt",
+                    "{} is beside {}: a binary without marker logs opened the table since its last \
+                     snapshot, so the snapshot is discarded and the filter rebuilt",
                     files.flt().display(),
                     files.ixm().display()
                 );

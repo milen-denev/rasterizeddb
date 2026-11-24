@@ -136,7 +136,9 @@ impl LocationLock {
                 let _ = file.read_to_string(&mut holder);
                 let holder = holder.trim();
                 return Err(format!(
-                    "{root} is already open in another RasterizedDB ({}): two engines on one data                      directory would corrupt it, so this one does not open it. Stop the other, or                      use another directory",
+                    "{root} is already open in another RasterizedDB ({}): two engines on one data \
+                     directory would corrupt it, so this one does not open it. Stop the other, \
+                     or use another directory",
                     if holder.is_empty() {
                         "another process, or an earlier engine in this one".to_string()
                     } else {
@@ -405,6 +407,151 @@ impl DatabaseCatalog {
     /// that account should be is the server's configuration rather than the
     /// catalogue's business.
     pub async fn create(&self, name: &str) -> Result<Arc<Database>, String> {
+        // While the default database replicates, the CREATE is owed to the
+        // peers from before the database exists until its record is durable:
+        // a marker in its directory says so, written first. A crash anywhere
+        // in between leaves the marker, and the next start records the CREATE
+        // (`reconcile_replication`); a crash before it leaves a directory
+        // that is not a database, which nothing serves or announces.
+        let announced = self.replicating() && self.root.is_some() && !self.fixed;
+        if announced {
+            validate_name(name)?;
+            // Never into a database that is there: its marker would announce
+            // it at the next start.
+            if self.databases.contains_key(name) {
+                return Err(format!("database \"{}\" already exists", name));
+            }
+            let dir = self.dir_of(name).expect("a root");
+            tokio::fs::create_dir_all(&dir)
+                .await
+                .map_err(|e| format!("could not create database \"{}\": {}", name, e))?;
+            write_marker(&dir.join(PENDING_CREATE)).map_err(|e| format!("could not create database \"{}\": {}", name, e))?;
+        }
+        let database = match self.create_unrecorded(name).await {
+            Ok(database) => database,
+            Err(e) => {
+                if announced {
+                    let _ = std::fs::remove_file(self.dir_of(name).expect("a root").join(PENDING_CREATE));
+                }
+                return Err(e);
+            }
+        };
+        #[cfg(test)]
+        if test_hooks::crashes_before_record(name) {
+            return Ok(database);
+        }
+        self.replicate(crate::replication::manager::CatalogOp::Create(name.to_string()), Some(&database))
+            .await;
+        if announced {
+            let _ = std::fs::remove_file(self.dir_of(name).expect("a root").join(PENDING_CREATE));
+        }
+        Ok(database)
+    }
+
+    /// Whether catalogue changes replicate: the default database replicates,
+    /// and its replication was started with this catalogue
+    /// (`Database::start_replication_with`). A node replicating its one
+    /// database alone (started without the catalogue: embedded, tests)
+    /// announces nothing, as its peers could not make the change: a
+    /// database made there is its own, and pgwire says so.
+    pub(crate) fn replicating(&self) -> bool {
+        self.get(&self.default_name)
+            .is_some_and(|d| d.replication.is_active() && d.replication.catalog().is_some())
+    }
+
+    /// Where `name` lives: the root for the default database, a directory
+    /// under it for any other. `None` in memory.
+    fn dir_of(&self, name: &str) -> Option<std::path::PathBuf> {
+        let root = std::path::Path::new(self.root.as_deref()?);
+        Some(if name == self.default_name { root.to_path_buf() } else { root.join(name) })
+    }
+
+    /// Records the catalogue changes a crash left unrecorded: a database whose
+    /// directory still holds its `CREATE` marker, and a drop whose tombstone
+    /// is still in the root (finished first if the database is still there).
+    /// Run at each start of replication with the catalogue; idempotent on the
+    /// peers, so a change recorded twice — the crash fell after the record and
+    /// before the marker went — is made once.
+    ///
+    /// A database with no marker is never announced: one that existed before
+    /// replication was on, announced, would be created empty on the peers and
+    /// take only the writes from now on, which is worse than its link waiting
+    /// visibly for a base copy.
+    pub(crate) async fn reconcile_replication(&self) {
+        if !self.replicating() {
+            return;
+        }
+        let Some(root) = self.root.clone() else { return };
+        for name in self.names() {
+            if name == self.default_name {
+                continue;
+            }
+            let marker = self.dir_of(&name).expect("a root").join(PENDING_CREATE);
+            if marker.exists() {
+                log::warn!("Recording the CREATE DATABASE \"{name}\" a stop left unrecorded");
+                // Started too, if the stop came before its replication was:
+                // a start with the catalogue starts every database, but this
+                // does not lean on having run inside one.
+                let unstarted = self.get(&name).filter(|d| !d.replication.is_active());
+                self.replicate(crate::replication::manager::CatalogOp::Create(name.clone()), unstarted.as_ref())
+                    .await;
+                let _ = std::fs::remove_file(&marker);
+            }
+        }
+        let tombstones: Vec<String> = std::fs::read_dir(&root)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str()?.strip_prefix(PENDING_DROP).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for name in tombstones {
+            let tombstone = std::path::Path::new(&root).join(format!("{PENDING_DROP}{name}"));
+            if self.get(&name).is_some() {
+                if let Err(e) = self.drop_unrecorded(&name, "").await {
+                    log::error!("The DROP DATABASE \"{name}\" a stop interrupted could not be finished: {e}");
+                    continue;
+                }
+            }
+            log::warn!("Recording the DROP DATABASE \"{name}\" a stop left unrecorded");
+            self.replicate(crate::replication::manager::CatalogOp::Drop(name.clone()), None).await;
+            let _ = std::fs::remove_file(&tombstone);
+        }
+    }
+
+    /// When the default database replicates, a catalogue change does too: a
+    /// new database starts replicating (its links name it, and the peers'
+    /// listeners route them to theirs once it is there), and the default
+    /// stream carries the change for the peers to make (`ReplicatedCatalog`).
+    ///
+    /// The record follows the change. A crash between them leaves the change
+    /// on this node alone, as a failed `REPLICATION` capture does; the other
+    /// order would have the peers make a change this node may then refuse.
+    async fn replicate(&self, op: crate::replication::manager::CatalogOp, created: Option<&Arc<Database>>) {
+        if !self.replicating() {
+            return;
+        }
+        let Some(default) = self.get(&self.default_name) else { return };
+        if let Some(database) = created {
+            let config = default.replication.config();
+            if let Err(e) = Database::start_routed_replication(database.clone(), op.name(), &config) {
+                log::error!("Database \"{}\" was created but does not replicate: {}", op.name(), e);
+            }
+        }
+        let tx = default.transactions.begin();
+        default.replication.note_statement(tx, &op.statement(), None);
+        let family = default.commit_transaction(tx);
+        default.publish_transaction(family).await;
+        // Durable before the caller lets its marker go.
+        if let Err(e) = default.sync_own_log() {
+            log::error!("The record of {} could not be made durable: {}", op.statement(), e);
+        }
+    }
+
+    /// [`DatabaseCatalog::create`] without recording it for the peers: what
+    /// applying a peer's `CREATE DATABASE` record does.
+    pub(crate) async fn create_unrecorded(&self, name: &str) -> Result<Arc<Database>, String> {
         validate_name(name)?;
 
         if self.fixed {
@@ -485,6 +632,35 @@ impl DatabaseCatalog {
     /// discarded rather than resurrected, but the space is not reclaimed until
     /// then.
     pub async fn drop_database(&self, name: &str, current: &str) -> Result<(), String> {
+        // As for a CREATE: a tombstone in the root says the DROP is owed to
+        // the peers, from before the database goes until its record is
+        // durable (`reconcile_replication`).
+        let tombstone = (self.replicating() && name != self.default_name && self.get(name).is_some())
+            .then(|| self.dir_of(&self.default_name).map(|root| root.join(format!("{PENDING_DROP}{name}"))))
+            .flatten();
+        if let Some(tombstone) = &tombstone {
+            write_marker(tombstone).map_err(|e| format!("could not drop database \"{}\": {}", name, e))?;
+        }
+        if let Err(e) = self.drop_unrecorded(name, current).await {
+            if let Some(tombstone) = &tombstone {
+                let _ = std::fs::remove_file(tombstone);
+            }
+            return Err(e);
+        }
+        #[cfg(test)]
+        if test_hooks::crashes_before_record(name) {
+            return Ok(());
+        }
+        self.replicate(crate::replication::manager::CatalogOp::Drop(name.to_string()), None).await;
+        if let Some(tombstone) = &tombstone {
+            let _ = std::fs::remove_file(tombstone);
+        }
+        Ok(())
+    }
+
+    /// [`DatabaseCatalog::drop_database`] without recording it for the
+    /// peers: what applying a peer's `DROP DATABASE` record does.
+    pub(crate) async fn drop_unrecorded(&self, name: &str, current: &str) -> Result<(), String> {
         if name == self.default_name {
             return Err(format!(
                 "cannot drop the default database \"{}\"; it is the catalogue root",
@@ -507,7 +683,13 @@ impl DatabaseCatalog {
                 name, attached
             ));
         }
+        let database = entry.database.clone();
         drop(entry);
+
+        // Its replication stops first: its links end, and the listener's
+        // router stops serving it with the name gone from the map below.
+        database.stop_replication();
+        drop(database);
 
         // Out of the map first: a session that resolves the name after this
         // point must not be handed files that are about to be unlinked.
@@ -583,6 +765,121 @@ impl DatabaseCatalog {
 
         info!("Dropped database \"{}\"", name);
         Ok(())
+    }
+}
+
+/// The catalogue this process serves, registered by the server's `main` so a
+/// `REPLICATION ENABLE` on its default database starts every database's
+/// replication, as `--replication` does at start. Unset in tests and
+/// embedded use, where replication starts with the catalogue it is given.
+static SERVED: std::sync::OnceLock<Arc<DatabaseCatalog>> = std::sync::OnceLock::new();
+
+/// Registers the catalogue this process serves. The first call wins.
+pub fn register_served(catalog: Arc<DatabaseCatalog>) {
+    let _ = SERVED.set(catalog);
+}
+
+/// The served catalogue, when `database` is its default database.
+pub(crate) fn served_by_default(database: &Arc<Database>) -> Option<Arc<DatabaseCatalog>> {
+    let catalog = SERVED.get()?;
+    let default = catalog.get(&catalog.default_name)?;
+    Arc::ptr_eq(&default, database).then(|| catalog.clone())
+}
+
+/// In a database's directory: its `CREATE` is not yet recorded for the
+/// peers. See [`DatabaseCatalog::create`].
+const PENDING_CREATE: &str = "db_replication.pending_create";
+/// In the root, followed by a name: that database's `DROP` is not yet
+/// recorded for the peers. See [`DatabaseCatalog::drop_database`].
+const PENDING_DROP: &str = "db_replication.pending_drop.";
+
+/// Writes an empty marker file durably: the file, then its directory entry.
+fn write_marker(path: &std::path::Path) -> std::io::Result<()> {
+    let file = std::fs::File::create(path)?;
+    file.sync_all()?;
+    if let Some(dir) = path.parent() {
+        crate::core::sync_path::sync_dir(dir)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    static CRASH: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+    /// The next CREATE or DROP of `name` stops after the catalogue change and
+    /// before its record, as a crash there would.
+    pub(crate) fn crash_before_record(name: &str) {
+        CRASH.lock().unwrap().get_or_insert_with(HashSet::new).insert(name.to_string());
+    }
+
+    pub(super) fn crashes_before_record(name: &str) -> bool {
+        CRASH.lock().unwrap().as_mut().is_some_and(|names| names.remove(name))
+    }
+}
+
+/// Applies the catalogue changes the default stream carries
+/// ([`crate::replication::manager::CatalogOp`]) to this node's catalogue.
+///
+/// Idempotent, as a record offered again after a restart must be: a database
+/// that is already there is only made to replicate, and one already gone is
+/// done. Neither is recorded again, so nothing travels back.
+pub struct ReplicatedCatalog {
+    catalog: Arc<DatabaseCatalog>,
+}
+
+impl ReplicatedCatalog {
+    pub fn new(catalog: Arc<DatabaseCatalog>) -> Self {
+        Self { catalog }
+    }
+}
+
+impl crate::replication::manager::CatalogLink for ReplicatedCatalog {
+    fn apply<'a>(
+        &'a self,
+        op: crate::replication::manager::CatalogOp,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            use crate::replication::manager::CatalogOp;
+            match op {
+                CatalogOp::Create(name) => {
+                    let database = match self.catalog.get(&name) {
+                        Some(database) => database,
+                        None => self.catalog.create_unrecorded(&name).await?,
+                    };
+                    let default = self
+                        .catalog
+                        .get(&self.catalog.default_name)
+                        .ok_or_else(|| "this node has no default database".to_string())?;
+                    if !database.replication.is_active() {
+                        Database::start_routed_replication(database, &name, &default.replication.config())
+                            .map_err(|e| format!("database \"{name}\" was created but does not replicate: {e}"))?;
+                    }
+                    Ok(())
+                }
+                CatalogOp::Drop(name) => {
+                    if self.catalog.get(&name).is_none() {
+                        return Ok(());
+                    }
+                    self.catalog.drop_unrecorded(&name, "").await
+                }
+            }
+        })
+    }
+
+    fn replications(&self) -> Vec<(String, std::sync::Arc<crate::replication::Replication>)> {
+        self.catalog
+            .names()
+            .into_iter()
+            .filter(|name| *name != self.catalog.default_name)
+            .filter_map(|name| {
+                let database = self.catalog.get(&name)?;
+                Some((name, database.replication.clone()))
+            })
+            .collect()
     }
 }
 

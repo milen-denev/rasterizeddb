@@ -4185,6 +4185,16 @@ pub fn plan(
                 // relation rather than needing a plan-level short circuit.
                 predicates[0].push(conjunct);
             }
+            0 if crate::core::rql::replicated_values::calls_volatile(&conjunct)
+                || crate::core::rql::generated::moves_a_sequence(&conjunct) =>
+            {
+                // A call that answers anew at each call (`random()`,
+                // `nextval('s')`) reads no relation and is no constant: judged
+                // on each joined row, as PostgreSQL judges it. Refused here
+                // before (`random()`), or folded once for the statement
+                // (`nextval`, which then drew one value for every row).
+                cross_relation.push(conjunct);
+            }
             0 => {
                 // Still an error for anything naming something: a misspelled
                 // column must not be quietly treated as a constant.
@@ -5737,6 +5747,10 @@ fn build_aggregate_stage(
                 }
                 None
             } else if let Ok((rel, field)) = resolve(arg_text) {
+                // Refused over a type with no such aggregate, as over one
+                // table: through a join `sum(text)` answered NULL and
+                // `min(jsonb)` a document picked by its bytes.
+                func.check_argument(Some(&field))?;
                 Some(positional(rel, field, items))
             } else {
                 // `AVG(EXTRACT(EPOCH FROM (a - b)))` — the argument is computed,

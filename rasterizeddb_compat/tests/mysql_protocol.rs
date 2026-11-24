@@ -985,3 +985,31 @@ async fn mysql_column_collations() {
     assert!(ddl.contains("UNIQUE KEY"), "{ddl}");
     assert!(!ddl.contains("__ci"), "{ddl}");
 }
+
+/// MySQL sums, averages and orders booleans — its BOOLEAN is TINYINT(1),
+/// and `SUM(active)` is how it counts — though PostgreSQL has none of these
+/// aggregates and refuses them on its own protocol (42883). A statement the
+/// MySQL front end sends keeps them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_aggregates_over_a_boolean_still_answer() {
+    let s = start(MyAuth::Trust);
+    let mut c = sqlx::MySqlConnection::connect(&format!(
+        "mysql://anyone@127.0.0.1:{}/postgres?ssl-mode=disabled",
+        s.mysql_port
+    ))
+    .await
+    .unwrap();
+    c.execute("CREATE TABLE flags (id INT PRIMARY KEY, active TINYINT(1), done BOOLEAN)").await.unwrap();
+    c.execute("INSERT INTO flags VALUES (1, 1, TRUE), (2, 0, TRUE), (3, 1, FALSE)").await.unwrap();
+    let row = sqlx::query(
+        "SELECT CAST(SUM(active) AS SIGNED) AS a, CAST(SUM(done) AS SIGNED) AS d, \
+         CAST(MAX(active) AS SIGNED) AS m, CAST(MIN(done) AS SIGNED) AS n FROM flags",
+    )
+    .fetch_one(&mut c)
+    .await
+    .unwrap();
+    assert_eq!(
+        (row.get::<i64, _>("a"), row.get::<i64, _>("d"), row.get::<i64, _>("m"), row.get::<i64, _>("n")),
+        (2, 2, 1, 0)
+    );
+}

@@ -809,3 +809,961 @@ async fn between_with_a_null_bound_or_symmetric_answers_as_postgresql_does() {
     ok(&db, &mut s, "DELETE FROM bt WHERE v BETWEEN NULL AND 100 OR id = 4").await;
     assert_eq!(one(&db, &mut s, "SELECT count(*) FROM bt").await, vec![r(&[Some("3")])]);
 }
+
+/// A statement refused with a foreign-key violation (23503).
+async fn refused_23503(db: &Arc<Database>, s: &mut Session, sql: &str) {
+    let e = rows(db, s, sql).await.expect_err(sql);
+    assert_eq!(sqlstate_of(&e), "23503", "{sql}: {e}");
+}
+
+/// `id, p` of every row of `table`, in id order, `p` as text or "-".
+async fn id_p(db: &Arc<Database>, s: &mut Session, table: &str) -> String {
+    let sql = format!("SELECT id, p FROM {table} ORDER BY id");
+    one(db, s, &sql)
+        .await
+        .iter()
+        .map(|row| format!("{}:{}", row[0].as_deref().unwrap_or("-"), row[1].as_deref().unwrap_or("-")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A table's foreign key onto itself is checked at the end of the statement,
+/// once every row of it is in, as PostgreSQL 17 checks a key that is not
+/// deferrable: a row may be its own parent, and rows of one `INSERT` may be
+/// each other's. Each row's check ran before its row was written, so `(1,
+/// 1)` and `(2, 3), (3, 2)` were refused (23503). What PostgreSQL refuses
+/// still is, and leaves nothing behind. Every answer is PostgreSQL 17's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_referencing_foreign_key_is_checked_at_the_end_of_an_insert() {
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let db = db().await;
+        let mut s = session(&db);
+        ok(&db, &mut s, "CREATE TABLE s (id int PRIMARY KEY, p int REFERENCES s (id))").await;
+        ok(&db, &mut s, "INSERT INTO s VALUES (1, 1)").await;
+        ok(&db, &mut s, "INSERT INTO s VALUES (2, 3), (3, 2)").await;
+        refused_23503(&db, &mut s, "INSERT INTO s VALUES (4, 99)").await;
+        // A row of the statement found, the other not: neither is kept.
+        refused_23503(&db, &mut s, "INSERT INTO s VALUES (5, 6), (6, 98)").await;
+        ok(&db, &mut s, "INSERT INTO s VALUES (7, NULL), (8, 7)").await;
+        ok(&db, &mut s, "INSERT INTO s SELECT id + 10, p + 10 FROM s WHERE id IN (2, 3)").await;
+        refused_23503(&db, &mut s, "INSERT INTO s SELECT id + 20, p + 50 FROM s WHERE id = 2").await;
+        assert_eq!(
+            one(&db, &mut s, "INSERT INTO s VALUES (40, 41), (41, 42), (42, 40) RETURNING id, p").await,
+            vec![r(&[Some("40"), Some("41")]), r(&[Some("41"), Some("42")]), r(&[Some("42"), Some("40")])]
+        );
+        assert_eq!(id_p(&db, &mut s, "s").await, "1:1 2:3 3:2 7:- 8:7 12:13 13:12 40:41 41:42 42:40");
+
+        // A key onto a UNIQUE column that is not the primary key.
+        ok(&db, &mut s, "CREATE TABLE nd (id int PRIMARY KEY, code text UNIQUE, p text REFERENCES nd (code))").await;
+        ok(&db, &mut s, "INSERT INTO nd VALUES (1, 'a', 'b'), (2, 'b', 'a')").await;
+        refused_23503(&db, &mut s, "INSERT INTO nd VALUES (3, 'c', 'zz')").await;
+        ok(&db, &mut s, "INSERT INTO nd VALUES (4, 'd', 'd')").await;
+        assert_eq!(one(&db, &mut s, "SELECT count(*) FROM nd").await, vec![r(&[Some("3")])]);
+    })
+    .await
+    .expect("bounded");
+}
+
+/// `ON CONFLICT`: a row the clause skips or turns into an update is not
+/// checked as inserted (PostgreSQL checks inserted rows only), and the
+/// update of `DO UPDATE` is checked at the end of the statement too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_referencing_foreign_key_under_on_conflict() {
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let db = db().await;
+        let mut s = session(&db);
+        ok(&db, &mut s, "CREATE TABLE oc (id int PRIMARY KEY, p int REFERENCES oc (id))").await;
+        ok(&db, &mut s, "INSERT INTO oc VALUES (1, 1) ON CONFLICT DO NOTHING").await;
+        ok(&db, &mut s, "INSERT INTO oc VALUES (1, 99) ON CONFLICT (id) DO NOTHING").await;
+        ok(&db, &mut s, "INSERT INTO oc VALUES (1, 99) ON CONFLICT DO NOTHING").await;
+        ok(&db, &mut s, "INSERT INTO oc VALUES (2, 3), (3, 2) ON CONFLICT (id) DO NOTHING").await;
+        ok(&db, &mut s, "INSERT INTO oc VALUES (1, 9), (9, 9) ON CONFLICT (id) DO UPDATE SET p = EXCLUDED.p").await;
+        refused_23503(&db, &mut s, "INSERT INTO oc VALUES (1, 97) ON CONFLICT (id) DO UPDATE SET p = EXCLUDED.p").await;
+        refused_23503(&db, &mut s, "INSERT INTO oc VALUES (5, 95) ON CONFLICT (id) DO UPDATE SET p = EXCLUDED.p").await;
+        assert_eq!(id_p(&db, &mut s, "oc").await, "1:9 2:3 3:2 9:9");
+    })
+    .await
+    .expect("bounded");
+}
+
+/// `UPDATE` and `DELETE` of a table that references itself: both sides of
+/// the key are judged on the statement's end state. A row that is its own
+/// parent may move its key with its reference; a key still referenced by a
+/// row the statement does not repoint is refused; under `RESTRICT` too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_referencing_foreign_key_is_checked_at_the_end_of_an_update_or_delete() {
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let db = db().await;
+        let mut s = session(&db);
+        ok(&db, &mut s, "CREATE TABLE u (id int PRIMARY KEY, p int REFERENCES u (id))").await;
+        ok(&db, &mut s, "INSERT INTO u VALUES (1, 1)").await;
+        ok(&db, &mut s, "UPDATE u SET id = 10, p = 10 WHERE id = 1").await;
+        refused_23503(&db, &mut s, "UPDATE u SET p = 96 WHERE id = 10").await;
+        ok(&db, &mut s, "INSERT INTO u VALUES (2, 10), (3, 2)").await;
+        // Row 2 still references 10.
+        refused_23503(&db, &mut s, "UPDATE u SET id = 20, p = 20 WHERE id = 10").await;
+        ok(&db, &mut s, "UPDATE u SET id = id + 100, p = p + 100").await;
+        ok(&db, &mut s, "UPDATE u SET p = id + 1 WHERE id = 102").await;
+        ok(&db, &mut s, "UPDATE u SET p = id WHERE id = 102").await;
+        assert_eq!(id_p(&db, &mut s, "u").await, "102:102 103:102 110:110");
+
+        ok(&db, &mut s, "CREATE TABLE d (id int PRIMARY KEY, p int REFERENCES d (id))").await;
+        ok(&db, &mut s, "INSERT INTO d VALUES (1, 1), (2, 3), (3, 2), (4, 1)").await;
+        ok(&db, &mut s, "DELETE FROM d WHERE id IN (2, 3)").await;
+        refused_23503(&db, &mut s, "DELETE FROM d WHERE id = 1").await;
+        ok(&db, &mut s, "DELETE FROM d WHERE id IN (1, 4)").await;
+        assert_eq!(id_p(&db, &mut s, "d").await, "");
+
+        ok(
+            &db,
+            &mut s,
+            "CREATE TABLE rs (id int PRIMARY KEY, p int REFERENCES rs (id) ON DELETE RESTRICT ON UPDATE RESTRICT)",
+        )
+        .await;
+        ok(&db, &mut s, "INSERT INTO rs VALUES (1, 1), (2, 3), (3, 2), (4, 4), (5, 4)").await;
+        ok(&db, &mut s, "UPDATE rs SET id = 10, p = 10 WHERE id = 1").await;
+        // Row 5 still references 4.
+        refused_23503(&db, &mut s, "UPDATE rs SET id = 40, p = 40 WHERE id = 4").await;
+        ok(&db, &mut s, "DELETE FROM rs WHERE id IN (2, 3)").await;
+        refused_23503(&db, &mut s, "DELETE FROM rs WHERE id = 4").await;
+        ok(&db, &mut s, "DELETE FROM rs").await;
+        assert_eq!(id_p(&db, &mut s, "rs").await, "");
+    })
+    .await
+    .expect("bounded");
+}
+
+/// Inside a block each statement is checked at its own end: a violation
+/// fails the statement, and `ROLLBACK TO SAVEPOINT` takes its rows back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_referencing_foreign_key_inside_a_block() {
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let db = db().await;
+        let mut s = session(&db);
+        ok(&db, &mut s, "CREATE TABLE blk (id int PRIMARY KEY, p int REFERENCES blk (id))").await;
+        ok(&db, &mut s, "BEGIN").await;
+        ok(&db, &mut s, "INSERT INTO blk VALUES (20, 21), (21, 20)").await;
+        ok(&db, &mut s, "INSERT INTO blk VALUES (22, 22)").await;
+        ok(&db, &mut s, "UPDATE blk SET id = 23, p = 23 WHERE id = 22").await;
+        ok(&db, &mut s, "COMMIT").await;
+        ok(&db, &mut s, "BEGIN").await;
+        refused_23503(&db, &mut s, "INSERT INTO blk VALUES (30, 95)").await;
+        ok(&db, &mut s, "ROLLBACK").await;
+        ok(&db, &mut s, "BEGIN").await;
+        ok(&db, &mut s, "SAVEPOINT a").await;
+        refused_23503(&db, &mut s, "INSERT INTO blk VALUES (31, 32), (32, 94)").await;
+        ok(&db, &mut s, "ROLLBACK TO SAVEPOINT a").await;
+        ok(&db, &mut s, "INSERT INTO blk VALUES (33, 33)").await;
+        ok(&db, &mut s, "COMMIT").await;
+        assert_eq!(id_p(&db, &mut s, "blk").await, "20:21 21:20 23:23 33:33");
+    })
+    .await
+    .expect("bounded");
+}
+
+/// Runs `COPY table FROM STDIN` with `data` (text format) as the client's
+/// rows, and returns its tag or its error.
+async fn copy_in(db: &Arc<Database>, s: &mut Session, table: &str, data: &str) -> Result<String, String> {
+    use tokio::io::AsyncWriteExt;
+    // The client's CopyData and CopyDone, ahead of the statement that reads
+    // them (the duplex holds them).
+    let mut frames = Vec::new();
+    for chunk in data.as_bytes().chunks(8192) {
+        frames.push(b'd');
+        frames.extend_from_slice(&((chunk.len() + 4) as i32).to_be_bytes());
+        frames.extend_from_slice(chunk);
+    }
+    frames.push(b'c');
+    frames.extend_from_slice(&4i32.to_be_bytes());
+    s.client.write_all(&frames).await.unwrap();
+    let sql = format!("COPY {table} FROM STDIN");
+    Box::pin(execute_recorded(db, &mut s.state, &mut s.server, &sql, &[], false, None))
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    loop {
+        let kind = s.client.read_u8().await.unwrap();
+        let len = s.client.read_i32().await.unwrap() as usize;
+        let mut body = vec![0u8; len - 4];
+        s.client.read_exact(&mut body).await.unwrap();
+        match kind {
+            b'C' => return Ok(String::from_utf8_lossy(&body).trim_end_matches('\0').to_string()),
+            b'E' => return Err(String::from_utf8_lossy(&body).to_string()),
+            _ => {}
+        }
+    }
+}
+
+/// `COPY` is one statement: a row may reference a row of a later batch
+/// (it inserts 500 rows a statement), and one missing parent anywhere
+/// refuses the whole copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_referencing_foreign_key_across_a_copy() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        ok(&db, &mut s, "CREATE TABLE cp (id int PRIMARY KEY, p int REFERENCES cp (id))").await;
+        assert_eq!(copy_in(&db, &mut s, "cp", "1\t2\n2\t1\n3\t3\n").await.as_deref(), Ok("COPY 3"));
+        let e = copy_in(&db, &mut s, "cp", "4\t93\n").await.expect_err("an orphan");
+        assert_eq!(sqlstate_of(&e), "23503", "{e}");
+        assert_eq!(id_p(&db, &mut s, "cp").await, "1:2 2:1 3:3");
+
+        ok(&db, &mut s, "CREATE TABLE big (id int PRIMARY KEY, p int REFERENCES big (id))").await;
+        // Row i references i + 1, the last the first: every reference but
+        // the last points forward, most into a later batch.
+        let rows: String = (1..=1200).map(|i| format!("{i}\t{}\n", i % 1200 + 1)).collect();
+        assert_eq!(copy_in(&db, &mut s, "big", &rows).await.as_deref(), Ok("COPY 1200"));
+        let rows: String =
+            (1201..=2400).map(|i| format!("{i}\t{}\n", if i < 2400 { i + 1 } else { 99999 })).collect();
+        let e = copy_in(&db, &mut s, "big", &rows).await.expect_err("an orphan in the last batch");
+        assert_eq!(sqlstate_of(&e), "23503", "{e}");
+        assert_eq!(
+            one(&db, &mut s, "SELECT count(*), min(id), max(id) FROM big").await,
+            vec![r(&[Some("1200"), Some("1"), Some("1200")])]
+        );
+    })
+    .await
+    .expect("bounded");
+}
+
+/// Runs `sql`: its rows as `a|b` text (`NULL` for a NULL) and its command
+/// tag, or the error's SQLSTATE.
+async fn answer(db: &Arc<Database>, s: &mut Session, sql: &str) -> Result<(Vec<String>, String), String> {
+    Box::pin(execute_recorded(db, &mut s.state, &mut s.server, sql, &[], false, None))
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let mut out = Vec::new();
+    loop {
+        let kind = s.client.read_u8().await.unwrap();
+        let len = s.client.read_i32().await.unwrap() as usize;
+        let mut body = vec![0u8; len - 4];
+        s.client.read_exact(&mut body).await.unwrap();
+        match kind {
+            b'D' => {
+                let n = i16::from_be_bytes([body[0], body[1]]) as usize;
+                let mut at = 2;
+                let mut row = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let l = i32::from_be_bytes(body[at..at + 4].try_into().unwrap());
+                    at += 4;
+                    if l < 0 {
+                        row.push("NULL".to_string());
+                    } else {
+                        row.push(String::from_utf8_lossy(&body[at..at + l as usize]).into_owned());
+                        at += l as usize;
+                    }
+                }
+                out.push(row.join("|"));
+            }
+            b'C' => return Ok((out, String::from_utf8_lossy(&body).trim_end_matches('\0').to_string())),
+            b'E' => return Err(sqlstate_of(&String::from_utf8_lossy(&body)).to_string()),
+            _ => {}
+        }
+    }
+}
+
+/// PostgreSQL checks a foreign key on the row it inserted, after the row is
+/// in: a row `ON CONFLICT` skips, or turns into an update of the row it met,
+/// never has its proposed key checked, and a CHECK or a uniqueness violation
+/// is the error before a missing parent is. Each row's key was checked first
+/// here, so all of these were 23503. Every answer is PostgreSQL 17's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_foreign_key_is_checked_on_the_row_the_insert_writes() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        for sql in [
+            "CREATE TABLE parn (id int PRIMARY KEY)",
+            "INSERT INTO parn VALUES (1), (2)",
+            "CREATE TABLE chn (id int PRIMARY KEY, pn int REFERENCES parn(id), c int CHECK (c > 0))",
+            "INSERT INTO chn VALUES (1, 1)",
+            "CREATE TABLE ch2 (id int PRIMARY KEY, u int UNIQUE, pn int REFERENCES parn(id))",
+            "INSERT INTO ch2 VALUES (1, 10, 1)",
+            "CREATE SEQUENCE s1",
+            "CREATE TABLE cs (id int PRIMARY KEY, k bigint DEFAULT nextval('s1'), pn int REFERENCES parn(id))",
+            "INSERT INTO cs VALUES (1, 100, 1)",
+            "CREATE TABLE src (id int, pn int)",
+            "INSERT INTO src VALUES (1, 81), (7, 2), (8, 1)",
+            "CREATE TABLE ck (a char(3), b int, pn int REFERENCES parn(id), PRIMARY KEY (a, b))",
+            "INSERT INTO ck VALUES ('x', 1, 1)",
+        ] {
+            ok(&db, &mut s, sql).await;
+        }
+        let ins = |rows: &[&str], tag: &str| -> Result<(Vec<String>, String), String> {
+            Ok((rows.iter().map(|r| r.to_string()).collect(), tag.to_string()))
+        };
+        let err = |code: &str| -> Result<(Vec<String>, String), String> { Err(code.to_string()) };
+        for (sql, expected) in [
+            ("INSERT INTO chn VALUES (1, 81) ON CONFLICT (id) DO UPDATE SET pn = 2 RETURNING pn", ins(&["2"], "INSERT 0 1")),
+            ("INSERT INTO chn VALUES (1, 81) ON CONFLICT (id) DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO chn VALUES (1, 81) ON CONFLICT DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO chn VALUES (1, 81) ON CONFLICT ON CONSTRAINT chn_pkey DO NOTHING", ins(&[], "INSERT 0 0")),
+            (
+                "INSERT INTO chn VALUES (1, 81) ON CONFLICT ON CONSTRAINT chn_pkey DO UPDATE SET pn = 1 RETURNING id, pn",
+                ins(&["1|1"], "INSERT 0 1"),
+            ),
+            // No conflict: the row is inserted, and its key is missing.
+            ("INSERT INTO chn VALUES (20, 81) ON CONFLICT (id) DO NOTHING", err("23503")),
+            ("INSERT INTO chn VALUES (20, 81) ON CONFLICT (id) DO UPDATE SET pn = 2", err("23503")),
+            // The update's own key is checked.
+            ("INSERT INTO chn VALUES (1, 81) ON CONFLICT (id) DO UPDATE SET pn = EXCLUDED.pn", err("23503")),
+            ("INSERT INTO chn VALUES (1, 81) ON CONFLICT (id) DO UPDATE SET pn = 99", err("23503")),
+            // A row of a multi-row insert.
+            ("INSERT INTO chn VALUES (1, 81), (2, 1), (3, 82) ON CONFLICT (id) DO NOTHING", err("23503")),
+            ("INSERT INTO chn VALUES (1, 81), (2, 1), (5, 2) ON CONFLICT (id) DO NOTHING", ins(&[], "INSERT 0 2")),
+            (
+                "INSERT INTO chn VALUES (1, 81), (2, 77), (6, 2) ON CONFLICT (id) DO UPDATE SET pn = 1 RETURNING id, pn",
+                ins(&["1|1", "2|1", "6|2"], "INSERT 0 3"),
+            ),
+            ("SELECT id, pn FROM chn ORDER BY id", ins(&["1|1", "2|1", "5|2", "6|2"], "SELECT 4")),
+            // Without the clause, or a clash on another key: 23505 first.
+            ("INSERT INTO chn VALUES (1, 81)", err("23505")),
+            ("INSERT INTO ch2 VALUES (2, 10, 81) ON CONFLICT (id) DO NOTHING", err("23505")),
+            ("INSERT INTO ch2 VALUES (2, 10, 81) ON CONFLICT (u) DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO ch2 VALUES (2, 10, 81) ON CONFLICT DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO ch2 VALUES (1, 11, 81) ON CONFLICT (u) DO NOTHING", err("23505")),
+            // A CHECK is judged before either.
+            ("INSERT INTO chn VALUES (1, 81, -1) ON CONFLICT DO NOTHING", err("23514")),
+            ("INSERT INTO chn VALUES (30, 81, -1)", err("23514")),
+            // A default computed once per row, the skipped row's too.
+            ("INSERT INTO cs (id, pn) VALUES (1, 81) ON CONFLICT DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO cs (id, pn) VALUES (1, 81) ON CONFLICT (id) DO UPDATE SET pn = 2 RETURNING id, k, pn", ins(&["1|100|2"], "INSERT 0 1")),
+            ("SELECT nextval('s1')", ins(&["3"], "SELECT 1")),
+            // INSERT … SELECT.
+            ("INSERT INTO chn (id, pn) SELECT id, pn FROM src ON CONFLICT DO NOTHING", ins(&[], "INSERT 0 2")),
+            (
+                "INSERT INTO chn (id, pn) SELECT id, pn FROM src ON CONFLICT (id) DO UPDATE SET c = 5 RETURNING id, pn, c",
+                ins(&["1|1|5", "7|2|5", "8|1|5"], "INSERT 0 3"),
+            ),
+            // A key compared as the column stores it.
+            ("INSERT INTO ck VALUES ('x  ', 1, 81) ON CONFLICT DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO ck VALUES ('x', 1, 81) ON CONFLICT (a, b) DO UPDATE SET pn = 2 RETURNING *", ins(&["x  |1|2"], "INSERT 0 1")),
+            ("INSERT INTO ck VALUES ('x', 2, 81) ON CONFLICT (a, b) DO NOTHING", err("23503")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        // In a block: the skipped row does not fail it.
+        ok(&db, &mut s, "BEGIN").await;
+        assert_eq!(answer(&db, &mut s, "INSERT INTO chn VALUES (1, 81) ON CONFLICT DO NOTHING").await, ins(&[], "INSERT 0 0"));
+        assert_eq!(
+            answer(&db, &mut s, "INSERT INTO chn VALUES (1, 81) ON CONFLICT (id) DO UPDATE SET pn = 2 RETURNING pn").await,
+            ins(&["2"], "INSERT 0 1")
+        );
+        ok(&db, &mut s, "ROLLBACK").await;
+        assert_eq!(answer(&db, &mut s, "SELECT pn FROM chn WHERE id = 1").await, ins(&["1"], "SELECT 1"));
+    })
+    .await
+    .expect("bounded");
+}
+
+/// A volatile call in a condition is evaluated for each row it judges, as
+/// PostgreSQL evaluates it: `nextval` in a WHERE was folded into one value
+/// for the statement (`WHERE n < nextval('q') + 100000` over four rows drew
+/// one value, not four), and over a scan's workers it had no sequence to draw
+/// from. `clock_timestamp()` in a WHERE was refused (0A000), and `random()`
+/// or `nextval` in a join's WHERE too ("references no column"). Every answer
+/// is PostgreSQL 17's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_volatile_call_in_a_condition_is_evaluated_per_row() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        ok(&db, &mut s, "CREATE TABLE t (id int PRIMARY KEY, n int)").await;
+        ok(&db, &mut s, "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3), (4, NULL)").await;
+        ok(&db, &mut s, "CREATE SEQUENCE q START 1").await;
+        let at = |rows: &[&str], tag: &str| -> Result<(Vec<String>, String), String> {
+            Ok((rows.iter().map(|r| r.to_string()).collect(), tag.to_string()))
+        };
+        for (sql, expected) in [
+            ("SELECT count(*) FROM t WHERE n < nextval('q') + 100000", at(&["3"], "SELECT 1")),
+            ("SELECT nextval('q')", at(&["5"], "SELECT 1")),
+            ("SELECT currval('q')", at(&["5"], "SELECT 1")),
+            ("SELECT id FROM t WHERE nextval('q') < 10 ORDER BY id", at(&["1", "2", "3", "4"], "SELECT 4")),
+            ("SELECT currval('q')", at(&["9"], "SELECT 1")),
+            ("SELECT count(*) FROM t WHERE nextval('q') > 0", at(&["4"], "SELECT 1")),
+            ("SELECT nextval('q')", at(&["14"], "SELECT 1")),
+            ("UPDATE t SET n = n WHERE nextval('q') > 0", at(&[], "UPDATE 4")),
+            ("SELECT nextval('q')", at(&["19"], "SELECT 1")),
+            // Not a point lookup: the key is a new value for each row.
+            ("UPDATE t SET n = 5 WHERE id = nextval('q') - 100", at(&[], "UPDATE 0")),
+            ("DELETE FROM t WHERE id = nextval('q')", at(&[], "DELETE 0")),
+            ("SELECT nextval('q')", at(&["28"], "SELECT 1")),
+            ("SELECT count(*) FROM t a JOIN t b ON a.id = b.id WHERE nextval('q') > 0", at(&["4"], "SELECT 1")),
+            ("SELECT nextval('q')", at(&["33"], "SELECT 1")),
+            ("INSERT INTO t SELECT id + 10, n FROM t WHERE nextval('q') > 0", at(&[], "INSERT 0 4")),
+            ("SELECT nextval('q')", at(&["38"], "SELECT 1")),
+            // Eight values in a row: four of them even, whichever row takes which.
+            ("DELETE FROM t WHERE nextval('q') % 2 = 0", at(&[], "DELETE 4")),
+            ("SELECT count(*) FROM t", at(&["4"], "SELECT 1")),
+            ("SELECT nextval('q')", at(&["47"], "SELECT 1")),
+            ("SELECT count(*) FROM t WHERE setval('q', 100) > 0", at(&["4"], "SELECT 1")),
+            ("SELECT nextval('q')", at(&["101"], "SELECT 1")),
+            // The other volatile calls.
+            ("SELECT count(*) FROM t WHERE clock_timestamp() > now() - interval '1 hour'", at(&["4"], "SELECT 1")),
+            ("SELECT count(*) FROM t WHERE clock_timestamp() < now() - interval '1 hour'", at(&["0"], "SELECT 1")),
+            ("SELECT count(*) FROM t WHERE random() >= 0 AND random() < 1", at(&["4"], "SELECT 1")),
+            ("SELECT count(*) FROM t a JOIN t b ON a.id = b.id WHERE random() >= 0", at(&["4"], "SELECT 1")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        // The `SET` of one conflict's update still draws once.
+        ok(&db, &mut s, "INSERT INTO t VALUES (1, 0), (2, 0), (3, 0), (4, 0) ON CONFLICT DO NOTHING").await;
+        ok(&db, &mut s, "INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET n = nextval('q')").await;
+        assert_eq!(answer(&db, &mut s, "SELECT n FROM t WHERE id = 1").await, at(&["102"], "SELECT 1"));
+        assert_eq!(answer(&db, &mut s, "SELECT nextval('q')").await, at(&["103"], "SELECT 1"));
+    })
+    .await
+    .expect("bounded");
+}
+
+/// `EXISTS` over a `SELECT` with no `FROM` is the truth of its condition (one
+/// row when it holds, none otherwise). Every `EXISTS` path wanted a relation
+/// (42601, "the SELECT inside EXISTS has no FROM clause"), in a select list,
+/// in a `WHERE` with or without a table, and over a parameter. Every answer
+/// is PostgreSQL 17's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exists_over_a_select_without_from_answers_as_postgresql_does() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        ok(&db, &mut s, "CREATE TABLE t (id int PRIMARY KEY, n int)").await;
+        ok(&db, &mut s, "INSERT INTO t VALUES (1, 1), (2, 7), (3, NULL)").await;
+        let at = |rows: &[&str], tag: &str| -> Result<(Vec<String>, String), String> {
+            Ok((rows.iter().map(|r| r.to_string()).collect(), tag.to_string()))
+        };
+        for (sql, expected) in [
+            ("SELECT EXISTS (SELECT 1)", at(&["t"], "SELECT 1")),
+            ("SELECT EXISTS (SELECT 1 WHERE false)", at(&["f"], "SELECT 1")),
+            ("SELECT NOT EXISTS (SELECT 1)", at(&["f"], "SELECT 1")),
+            ("SELECT EXISTS (SELECT 1 WHERE NULL)", at(&["f"], "SELECT 1")),
+            ("SELECT NOT EXISTS (SELECT 1 WHERE NULL)", at(&["t"], "SELECT 1")),
+            ("SELECT 1 WHERE EXISTS (SELECT 1)", at(&["1"], "SELECT 1")),
+            ("SELECT 1 WHERE EXISTS (SELECT 1 WHERE false)", at(&[], "SELECT 0")),
+            ("SELECT 1 WHERE NOT EXISTS (SELECT 1 WHERE 1 = 2)", at(&["1"], "SELECT 1")),
+            ("SELECT 1 WHERE EXISTS (SELECT 1 WHERE EXISTS (SELECT 1 WHERE 1 = 1))", at(&["1"], "SELECT 1")),
+            ("SELECT id FROM t WHERE EXISTS (SELECT 1) AND n IS NULL", at(&["3"], "SELECT 1")),
+            ("SELECT id FROM t WHERE EXISTS (SELECT 1 WHERE false) ORDER BY id", at(&[], "SELECT 0")),
+            ("SELECT id FROM t WHERE NOT EXISTS (SELECT 1) ORDER BY id", at(&[], "SELECT 0")),
+            ("SELECT id FROM t WHERE NOT EXISTS (SELECT 1 WHERE false) ORDER BY id", at(&["1", "2", "3"], "SELECT 3")),
+            // The outer row's columns, qualified or bare.
+            ("SELECT id FROM t WHERE EXISTS (SELECT 1 WHERE t.n > 5) ORDER BY id", at(&["2"], "SELECT 1")),
+            ("SELECT id FROM t WHERE NOT EXISTS (SELECT 1 WHERE t.n > 5) ORDER BY id", at(&["1", "3"], "SELECT 2")),
+            ("SELECT id FROM t WHERE EXISTS (SELECT 1 WHERE n > 5) ORDER BY id", at(&["2"], "SELECT 1")),
+            ("SELECT id, EXISTS (SELECT 1 WHERE t.n > 5) FROM t ORDER BY id", at(&["1|f", "2|t", "3|f"], "SELECT 3")),
+            ("SELECT count(*) FROM t a JOIN t b ON a.id = b.id WHERE EXISTS (SELECT 1 WHERE a.n > 1)", at(&["1"], "SELECT 1")),
+            // Aggregates yield a row whatever the condition.
+            ("SELECT id FROM t WHERE EXISTS (SELECT count(*) WHERE false) ORDER BY id", at(&["1", "2", "3"], "SELECT 3")),
+            ("SELECT id FROM t WHERE EXISTS (SELECT 1 LIMIT 0) ORDER BY id", at(&[], "SELECT 0")),
+            (
+                "SELECT 1 WHERE NOT EXISTS (SELECT 1 WHERE 1 = 2) AND EXISTS (SELECT 1 FROM t)",
+                at(&["1"], "SELECT 1"),
+            ),
+            ("SELECT 'é' AS x WHERE EXISTS (SELECT 'ü')", at(&["é"], "SELECT 1")),
+            ("DELETE FROM t WHERE NOT EXISTS (SELECT 1 WHERE false) AND id = 3 RETURNING id", at(&["3"], "DELETE 1")),
+            ("UPDATE t SET n = 9 WHERE EXISTS (SELECT 1) AND id = 1 RETURNING id, n", at(&["1|9"], "UPDATE 1")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        // A parameter, prepared and executed.
+        ok(&db, &mut s, "PREPARE p(int) AS SELECT id FROM t WHERE NOT EXISTS (SELECT 1 WHERE $1 = 2) ORDER BY id").await;
+        assert_eq!(answer(&db, &mut s, "EXECUTE p(2)").await, at(&[], "SELECT 0"));
+        assert_eq!(answer(&db, &mut s, "EXECUTE p(3)").await, at(&["1", "2"], "SELECT 2"));
+    })
+    .await
+    .expect("bounded");
+}
+
+/// A sequence read as a relation is PostgreSQL's one row of `last_value`,
+/// `log_cnt` and `is_called` (42P01 here before), for a `CREATE SEQUENCE`
+/// one and a serial column's; a write to one is 42809. Every answer is
+/// PostgreSQL 17's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sequence_reads_as_its_row() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        let at = |rows: &[&str], tag: &str| -> Result<(Vec<String>, String), String> {
+            Ok((rows.iter().map(|r| r.to_string()).collect(), tag.to_string()))
+        };
+        let err = |code: &str| -> Result<(Vec<String>, String), String> { Err(code.to_string()) };
+        for (sql, expected) in [
+            ("CREATE SEQUENCE sq START 1", at(&[], "CREATE SEQUENCE")),
+            ("SELECT last_value, log_cnt, is_called FROM sq", at(&["1|0|f"], "SELECT 1")),
+            ("SELECT * FROM sq", at(&["1|0|f"], "SELECT 1")),
+            ("SELECT nextval('sq')", at(&["1"], "SELECT 1")),
+            ("SELECT last_value FROM sq", at(&["1"], "SELECT 1")),
+            ("SELECT * FROM sq", at(&["1|32|t"], "SELECT 1")),
+            ("SELECT setval('sq', 10, false)", at(&["10"], "SELECT 1")),
+            ("SELECT last_value, is_called FROM sq", at(&["10|f"], "SELECT 1")),
+            ("SELECT nextval('sq')", at(&["10"], "SELECT 1")),
+            ("SELECT last_value, is_called FROM sq", at(&["10|t"], "SELECT 1")),
+            ("SELECT setval('sq', 20)", at(&["20"], "SELECT 1")),
+            ("SELECT * FROM sq", at(&["20|0|t"], "SELECT 1")),
+            ("SELECT nextval('sq'), nextval('sq')", at(&["21|22"], "SELECT 1")),
+            ("SELECT * FROM \"sq\"", at(&["22|31|t"], "SELECT 1")),
+            ("CREATE SEQUENCE s5 START 5 INCREMENT 3", at(&[], "CREATE SEQUENCE")),
+            ("SELECT * FROM s5", at(&["5|0|f"], "SELECT 1")),
+            ("SELECT nextval('s5'), nextval('s5')", at(&["5|8"], "SELECT 1")),
+            ("SELECT s.last_value FROM s5 s", at(&["8"], "SELECT 1")),
+            ("SELECT last_value FROM public.s5", at(&["8"], "SELECT 1")),
+            ("SELECT last_value + 1 AS nx FROM s5 WHERE is_called", at(&["9"], "SELECT 1")),
+            ("SELECT count(*) FROM s5", at(&["1"], "SELECT 1")),
+            ("SELECT (SELECT last_value FROM s5) + 1", at(&["9"], "SELECT 1")),
+            // A serial column's.
+            ("CREATE TABLE ser (id serial PRIMARY KEY, v text)", at(&[], "CREATE TABLE")),
+            ("SELECT last_value, is_called FROM ser_id_seq", at(&["1|f"], "SELECT 1")),
+            ("INSERT INTO ser (v) VALUES ('a'), ('b')", at(&[], "INSERT 0 2")),
+            ("SELECT last_value, is_called FROM ser_id_seq", at(&["2|t"], "SELECT 1")),
+            // Not a table.
+            ("INSERT INTO sq VALUES (1, 0, true)", err("42809")),
+            ("UPDATE sq SET last_value = 5", err("42809")),
+            ("DELETE FROM ser_id_seq", err("42809")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        // Not transactional: a value a rolled-back block took stays taken.
+        ok(&db, &mut s, "BEGIN").await;
+        assert_eq!(answer(&db, &mut s, "SELECT nextval('sq')").await, at(&["23"], "SELECT 1"));
+        assert_eq!(answer(&db, &mut s, "SELECT last_value FROM sq").await, at(&["23"], "SELECT 1"));
+        ok(&db, &mut s, "ROLLBACK").await;
+        assert_eq!(answer(&db, &mut s, "SELECT last_value FROM sq").await, at(&["23"], "SELECT 1"));
+    })
+    .await
+    .expect("bounded");
+}
+
+/// A composite foreign key holds on the tuple, never column by column: a
+/// row whose values are each some parent's but together none's is refused,
+/// on every path a row is written by, and a parent's tuple is not removed or
+/// moved from under a child. MATCH SIMPLE exempts a row with any key column
+/// NULL. Every answer is PostgreSQL 17's (`cfk6f_pg17`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn composite_foreign_key_is_checked_on_the_tuple() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        for sql in [
+            "CREATE TABLE p (x int, y int, z int, PRIMARY KEY (x, y))",
+            "INSERT INTO p VALUES (1, 1, 0), (1, 2, 0), (2, 1, 0)",
+            "CREATE TABLE c1 (id int PRIMARY KEY, a int, b int, FOREIGN KEY (a, b) REFERENCES p (x, y))",
+            "CREATE TABLE src (id int, a int, b int)",
+            "INSERT INTO src VALUES (20, 1, 2), (21, 2, 2)",
+        ] {
+            ok(&db, &mut s, sql).await;
+        }
+        let ins = |rows: &[&str], tag: &str| -> Result<(Vec<String>, String), String> {
+            Ok((rows.iter().map(|r| r.to_string()).collect(), tag.to_string()))
+        };
+        let err = |code: &str| -> Result<(Vec<String>, String), String> { Err(code.to_string()) };
+        for (sql, expected) in [
+            ("INSERT INTO c1 VALUES (1, 1, 1)", ins(&[], "INSERT 0 1")),
+            // Both values are some parent's; the tuple is none's.
+            ("INSERT INTO c1 VALUES (2, 2, 2)", err("23503")),
+            // MATCH SIMPLE: any NULL exempts the row.
+            ("INSERT INTO c1 VALUES (3, NULL, 7)", ins(&[], "INSERT 0 1")),
+            ("INSERT INTO c1 VALUES (4, 1, NULL)", ins(&[], "INSERT 0 1")),
+            // A column left out is NULL.
+            ("INSERT INTO c1 (id, a) VALUES (9, 5)", ins(&[], "INSERT 0 1")),
+            ("INSERT INTO c1 VALUES (5, 2, 1), (6, 1, 2)", ins(&[], "INSERT 0 2")),
+            ("INSERT INTO c1 VALUES (7, 2, 1), (8, 3, 3)", err("23503")),
+            ("INSERT INTO c1 (id, a, b) SELECT id, a, b FROM src WHERE id = 20", ins(&[], "INSERT 0 1")),
+            ("INSERT INTO c1 (id, a, b) SELECT id, a, b FROM src WHERE id > 20", err("23503")),
+            // An UPDATE of one column is checked with the other as it is.
+            ("UPDATE c1 SET b = 2 WHERE id = 1", ins(&[], "UPDATE 1")),
+            ("UPDATE c1 SET b = 9 WHERE id = 1", err("23503")),
+            ("UPDATE c1 SET a = a + 1 WHERE id = 6", err("23503")),
+            ("UPDATE c1 SET a = 2, b = 1 WHERE id = 6", ins(&[], "UPDATE 1")),
+            ("UPDATE c1 SET a = NULL WHERE id = 1", ins(&[], "UPDATE 1")),
+            ("UPDATE c1 SET a = 1 WHERE id = 1", ins(&[], "UPDATE 1")),
+            // ON CONFLICT: a row skipped or turned into an update is not
+            // checked for the key it proposed; the update's own is.
+            ("INSERT INTO c1 VALUES (1, 9, 9) ON CONFLICT (id) DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO c1 VALUES (1, 9, 9) ON CONFLICT (id) DO UPDATE SET a = excluded.a, b = excluded.b", err("23503")),
+            ("INSERT INTO c1 VALUES (1, 2, 1) ON CONFLICT (id) DO UPDATE SET a = excluded.a, b = excluded.b", ins(&[], "INSERT 0 1")),
+            ("INSERT INTO c1 VALUES (30, 9, 9) ON CONFLICT (id) DO NOTHING", err("23503")),
+            ("SELECT id, a, b FROM c1 ORDER BY id", ins(&["1|2|1", "3|NULL|7", "4|1|NULL", "5|2|1", "6|2|1", "9|5|NULL", "20|1|2"], "SELECT 7")),
+            // The parent side: a referenced tuple is not deleted or moved.
+            ("DELETE FROM p WHERE x = 2 AND y = 1", err("23503")),
+            ("UPDATE p SET y = 7 WHERE x = 2 AND y = 1", err("23503")),
+            // Unreferenced, or a column outside the key: as before.
+            ("UPDATE p SET z = 5 WHERE x = 1 AND y = 1", ins(&[], "UPDATE 1")),
+            ("DELETE FROM p WHERE x = 1 AND y = 1", ins(&[], "DELETE 1")),
+            ("DROP TABLE p", err("2BP01")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        // COPY: each row's tuple, a NULL exempting it.
+        assert_eq!(copy_in(&db, &mut s, "c1", "40\t1\t2\n41\t\\N\t5\n").await.as_deref(), Ok("COPY 2"));
+        let e = copy_in(&db, &mut s, "c1", "42\t1\t9\n").await.expect_err("no parent");
+        assert_eq!(sqlstate_of(&e), "23503", "{e}");
+        assert!(e.contains("Key (a, b)=(1, 9)") || e.contains("key (a, b)=(1, 9)"), "{e}");
+        // In a block, rolled back with it.
+        ok(&db, &mut s, "BEGIN").await;
+        assert_eq!(answer(&db, &mut s, "INSERT INTO c1 VALUES (50, 1, 2)").await, ins(&[], "INSERT 0 1"));
+        ok(&db, &mut s, "ROLLBACK").await;
+        assert_eq!(answer(&db, &mut s, "SELECT count(*) FROM c1 WHERE id = 50").await, ins(&["0"], "SELECT 1"));
+    })
+    .await
+    .expect("bounded");
+}
+
+/// A composite key's declaration answers as PostgreSQL 17 does: a list
+/// with no unique key over exactly its columns, lists of different
+/// lengths, a referenced column twice (42830), a missing column (42703),
+/// a pair of incompatible types (42804), MATCH PARTIAL (0A000); a list in
+/// any order of a key's columns, or none (the primary key), is accepted,
+/// and an unnamed key is `<table>_<a>_<b>_fkey`, numbered past a taken name.
+/// `ADD` checks the rows already there unless NOT VALID.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn composite_foreign_key_declarations_answer_as_postgres() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        for sql in [
+            "CREATE TABLE p (x int, y int, z int, PRIMARY KEY (x, y))",
+            "CREATE TABLE pu (x int, y int, UNIQUE (y, x))",
+            "INSERT INTO p VALUES (1, 1, 0), (1, 2, 0), (2, 1, 0)",
+        ] {
+            ok(&db, &mut s, sql).await;
+        }
+        let done = |tag: &str| -> Result<(Vec<String>, String), String> { Ok((Vec::new(), tag.to_string())) };
+        let err = |code: &str| -> Result<(Vec<String>, String), String> { Err(code.to_string()) };
+        for (sql, expected) in [
+            ("CREATE TABLE c3 (a int, b int, FOREIGN KEY (a, b) REFERENCES p (x))", err("42830")),
+            ("CREATE TABLE c3 (a int, FOREIGN KEY (a) REFERENCES p)", err("42830")),
+            ("CREATE TABLE c3 (a int, b int, c int, FOREIGN KEY (a, b, c) REFERENCES p)", err("42830")),
+            ("CREATE TABLE c3 (a int REFERENCES p)", err("42830")),
+            ("CREATE TABLE c3 (a int, b int, FOREIGN KEY (a) REFERENCES p (x, y))", err("42830")),
+            ("CREATE TABLE c4 (a int, b int, FOREIGN KEY (a, b) REFERENCES p (x, z))", err("42830")),
+            ("CREATE TABLE c4 (a int, b int, FOREIGN KEY (a, b) REFERENCES p (x, x))", err("42830")),
+            ("CREATE TABLE c4 (a int, b int, FOREIGN KEY (a, q) REFERENCES p)", err("42703")),
+            ("CREATE TABLE c4 (a int, b int, FOREIGN KEY (a, b) REFERENCES p (x, q))", err("42703")),
+            ("CREATE TABLE c5 (a int, b text, FOREIGN KEY (a, b) REFERENCES p (x, y))", err("42804")),
+            ("CREATE TABLE c7 (a int, b int, FOREIGN KEY (a, b) REFERENCES p MATCH PARTIAL)", err("0A000")),
+            ("CREATE TABLE c4 (a int, b int, FOREIGN KEY (a, b) REFERENCES p (y, x))", done("CREATE TABLE")),
+            ("CREATE TABLE c4b (a int, b int, FOREIGN KEY (a, b) REFERENCES pu (x, y))", done("CREATE TABLE")),
+            ("CREATE TABLE c2 (a int, b int, CONSTRAINT fk2 FOREIGN KEY (a, b) REFERENCES p)", done("CREATE TABLE")),
+            ("CREATE TABLE c9 (a int, b int, CONSTRAINT c9_a_b_fkey CHECK (a > 0), FOREIGN KEY (a, b) REFERENCES p)", done("CREATE TABLE")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        assert_eq!(
+            answer(&db, &mut s, "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f' ORDER BY conname")
+                .await
+                .unwrap()
+                .0,
+            [
+                // PostgreSQL quotes a name only when it must; the engine's
+                // definitions always quote (as its one-column keys' do).
+                r#"c4_a_b_fkey|FOREIGN KEY ("a", "b") REFERENCES "p"("y", "x")"#,
+                r#"c4b_a_b_fkey|FOREIGN KEY ("a", "b") REFERENCES "pu"("x", "y")"#,
+                r#"c9_a_b_fkey1|FOREIGN KEY ("a", "b") REFERENCES "p"("x", "y")"#,
+                r#"fk2|FOREIGN KEY ("a", "b") REFERENCES "p"("x", "y")"#,
+            ]
+        );
+        // The reversed list pairs a with y: (1, 2) needs p (x=2, y=1).
+        assert_eq!(answer(&db, &mut s, "INSERT INTO c4 VALUES (1, 2)").await, done("INSERT 0 1"));
+        assert_eq!(answer(&db, &mut s, "INSERT INTO c4 VALUES (2, 2)").await, err("23503"));
+        assert_eq!(
+            answer(&db, &mut s, "SELECT conkey, confkey, confmatchtype FROM pg_constraint WHERE conname = 'c4_a_b_fkey'")
+                .await
+                .unwrap()
+                .0,
+            ["{1,2}|{2,1}|s"]
+        );
+
+        // ADD over rows already there; NOT VALID; VALIDATE.
+        for sql in ["CREATE TABLE c8 (a int, b int)", "INSERT INTO c8 VALUES (1, 1), (5, 5), (NULL, 5)"] {
+            ok(&db, &mut s, sql).await;
+        }
+        for (sql, expected) in [
+            ("ALTER TABLE c8 ADD FOREIGN KEY (a, b) REFERENCES p", err("23503")),
+            ("ALTER TABLE c8 ADD CONSTRAINT fk8 FOREIGN KEY (a, b) REFERENCES p NOT VALID", done("ALTER TABLE")),
+            ("INSERT INTO c8 VALUES (6, 6)", err("23503")),
+            ("ALTER TABLE c8 VALIDATE CONSTRAINT fk8", err("23503")),
+            ("DELETE FROM c8 WHERE a = 5", done("DELETE 1")),
+            ("ALTER TABLE c8 VALIDATE CONSTRAINT fk8", done("ALTER TABLE")),
+            ("ALTER TABLE c8 ADD FOREIGN KEY (b, a) REFERENCES p (y, x)", done("ALTER TABLE")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        assert_eq!(
+            answer(&db, &mut s, "SELECT conname FROM pg_constraint WHERE conrelid = 'c8'::regclass ORDER BY conname")
+                .await
+                .unwrap()
+                .0,
+            ["c8_b_a_fkey", "fk8"]
+        );
+    })
+    .await
+    .expect("bounded");
+}
+
+/// MATCH FULL: a key's columns are all NULL or none is (23503 with
+/// PostgreSQL's words otherwise), on insert, update and `ADD`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn composite_foreign_key_match_full() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        for sql in [
+            "CREATE TABLE p (x int, y int, PRIMARY KEY (x, y))",
+            "INSERT INTO p VALUES (1, 1)",
+            "CREATE TABLE c6 (a int, b int, FOREIGN KEY (a, b) REFERENCES p MATCH FULL)",
+        ] {
+            ok(&db, &mut s, sql).await;
+        }
+        let done = |tag: &str| -> Result<(Vec<String>, String), String> { Ok((Vec::new(), tag.to_string())) };
+        let err = |code: &str| -> Result<(Vec<String>, String), String> { Err(code.to_string()) };
+        for (sql, expected) in [
+            ("INSERT INTO c6 VALUES (NULL, NULL)", done("INSERT 0 1")),
+            ("INSERT INTO c6 VALUES (1, NULL)", err("23503")),
+            ("INSERT INTO c6 VALUES (NULL, 1)", err("23503")),
+            ("INSERT INTO c6 VALUES (1, 1)", done("INSERT 0 1")),
+            ("INSERT INTO c6 VALUES (9, 9)", err("23503")),
+            ("UPDATE c6 SET a = NULL WHERE a = 1", err("23503")),
+            ("UPDATE c6 SET a = NULL, b = NULL WHERE a = 1", done("UPDATE 1")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        let e = rows(&db, &mut s, "INSERT INTO c6 VALUES (1, NULL)").await.unwrap_err();
+        assert!(e.contains("MATCH FULL does not allow mixing of null and nonnull key values"), "{e}");
+        assert_eq!(
+            answer(&db, &mut s, "SELECT confmatchtype, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'c6'::regclass")
+                .await
+                .unwrap()
+                .0,
+            [r#"f|FOREIGN KEY ("a", "b") REFERENCES "p"("x", "y") MATCH FULL"#]
+        );
+        ok(&db, &mut s, "CREATE TABLE c8f (a int, b int)").await;
+        ok(&db, &mut s, "INSERT INTO c8f VALUES (1, NULL)").await;
+        assert_eq!(answer(&db, &mut s, "ALTER TABLE c8f ADD FOREIGN KEY (a, b) REFERENCES p MATCH FULL").await, err("23503"));
+        assert_eq!(answer(&db, &mut s, "ALTER TABLE c8f ADD FOREIGN KEY (a, b) REFERENCES p").await, done("ALTER TABLE"));
+    })
+    .await
+    .expect("bounded");
+}
+
+/// A composite key onto its own table is asked at the end of the
+/// statement, as a one-column one is: rows that are each other's parents
+/// go in together, an orphan does not, and a parent tuple deleted with
+/// every row referencing it goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn composite_self_referencing_foreign_key_is_checked_at_the_end_of_the_statement() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        ok(&db, &mut s, "CREATE TABLE s (id int, k int, pid int, pk int, PRIMARY KEY (id, k), FOREIGN KEY (pid, pk) REFERENCES s)").await;
+        let done = |tag: &str| -> Result<(Vec<String>, String), String> { Ok((Vec::new(), tag.to_string())) };
+        let err = |code: &str| -> Result<(Vec<String>, String), String> { Err(code.to_string()) };
+        for (sql, expected) in [
+            ("INSERT INTO s VALUES (1, 1, 1, 1)", done("INSERT 0 1")),
+            ("INSERT INTO s VALUES (2, 2, 3, 3), (3, 3, 2, 2)", done("INSERT 0 2")),
+            ("INSERT INTO s VALUES (4, 4, 5, 5)", err("23503")),
+            ("UPDATE s SET pid = 9 WHERE id = 2", err("23503")),
+            ("DELETE FROM s WHERE id = 2", err("23503")),
+            ("DELETE FROM s WHERE id IN (2, 3)", done("DELETE 2")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        assert_eq!(answer(&db, &mut s, "SELECT id FROM s ORDER BY id").await.unwrap().0, ["1"]);
+        assert_eq!(copy_in(&db, &mut s, "s", "5\t5\t6\t6\n6\t6\t5\t5\n").await.as_deref(), Ok("COPY 2"));
+        let e = copy_in(&db, &mut s, "s", "7\t7\t8\t8\n").await.expect_err("an orphan");
+        assert_eq!(sqlstate_of(&e), "23503", "{e}");
+    })
+    .await
+    .expect("bounded");
+}
+
+/// A composite key's actions, as PostgreSQL 17 applies them on the same
+/// statements: CASCADE deletes and moves the referencing tuples whole,
+/// SET NULL and SET DEFAULT set every key column or the ones the action
+/// lists (`ON DELETE SET NULL (b)`), a default that names no parent is
+/// 23503, and RESTRICT refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn composite_foreign_key_actions_match_postgres() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        let at = |rows: &[&str], tag: &str| -> Result<(Vec<String>, String), String> {
+            Ok((rows.iter().map(|r| r.to_string()).collect(), tag.to_string()))
+        };
+        let err = |code: &str| -> Result<(Vec<String>, String), String> { Err(code.to_string()) };
+        for sql in [
+            "CREATE TABLE p (x int, y int, PRIMARY KEY (x, y))",
+            "INSERT INTO p VALUES (1, 1), (1, 2), (2, 1), (2, 2), (3, 3), (0, 0)",
+            "CREATE TABLE cc (id int PRIMARY KEY, a int, b int, FOREIGN KEY (a, b) REFERENCES p ON DELETE CASCADE ON UPDATE CASCADE)",
+            "INSERT INTO cc VALUES (1, 1, 1), (2, 1, 2), (3, 2, 1), (4, NULL, 1)",
+        ] {
+            ok(&db, &mut s, sql).await;
+        }
+        for (sql, expected) in [
+            ("DELETE FROM p WHERE x = 1 AND y = 1", at(&[], "DELETE 1")),
+            ("SELECT id, a, b FROM cc ORDER BY id", at(&["2|1|2", "3|2|1", "4|NULL|1"], "SELECT 3")),
+            ("UPDATE p SET y = 9 WHERE x = 1 AND y = 2", at(&[], "UPDATE 1")),
+            ("SELECT id, a, b FROM cc ORDER BY id", at(&["2|1|9", "3|2|1", "4|NULL|1"], "SELECT 3")),
+            // Two parent rows moved by one statement, each child following
+            // its own parent.
+            ("UPDATE p SET x = x + 10 WHERE x = 2", at(&[], "UPDATE 2")),
+            ("SELECT id, a, b FROM cc ORDER BY id", at(&["2|1|9", "3|12|1", "4|NULL|1"], "SELECT 3")),
+            (
+                "CREATE TABLE cn (id int PRIMARY KEY, a int, b int, FOREIGN KEY (a, b) REFERENCES p ON DELETE SET NULL ON UPDATE SET NULL)",
+                at(&[], "CREATE TABLE"),
+            ),
+            ("INSERT INTO cn VALUES (1, 3, 3), (2, 12, 2)", at(&[], "INSERT 0 2")),
+            ("DELETE FROM p WHERE x = 3", at(&[], "DELETE 1")),
+            ("UPDATE p SET y = 5 WHERE x = 12 AND y = 2", at(&[], "UPDATE 1")),
+            ("SELECT id, a, b FROM cn ORDER BY id", at(&["1|NULL|NULL", "2|NULL|NULL"], "SELECT 2")),
+            (
+                "CREATE TABLE cs (id int PRIMARY KEY, a int, b int, FOREIGN KEY (a, b) REFERENCES p ON DELETE SET NULL (b))",
+                at(&[], "CREATE TABLE"),
+            ),
+            ("INSERT INTO cs VALUES (1, 12, 5), (2, 0, 0)", at(&[], "INSERT 0 2")),
+            ("DELETE FROM p WHERE x = 12 AND y = 5", at(&[], "DELETE 1")),
+            ("SELECT id, a, b FROM cs ORDER BY id", at(&["1|12|NULL", "2|0|0"], "SELECT 2")),
+            (
+                "CREATE TABLE cd (id int PRIMARY KEY, a int DEFAULT 0, b int DEFAULT 0, FOREIGN KEY (a, b) REFERENCES p ON DELETE SET DEFAULT)",
+                at(&[], "CREATE TABLE"),
+            ),
+            ("INSERT INTO p VALUES (7, 7)", at(&[], "INSERT 0 1")),
+            ("INSERT INTO cd VALUES (1, 7, 7)", at(&[], "INSERT 0 1")),
+            ("DELETE FROM p WHERE x = 7", at(&[], "DELETE 1")),
+            ("SELECT id, a, b FROM cd ORDER BY id", at(&["1|0|0"], "SELECT 1")),
+            // The default is the tuple being deleted.
+            ("DELETE FROM p WHERE x = 0", err("23503")),
+            (
+                "CREATE TABLE cd2 (id int PRIMARY KEY, a int DEFAULT 5, b int DEFAULT 5, FOREIGN KEY (a, b) REFERENCES p ON DELETE SET DEFAULT (b))",
+                at(&[], "CREATE TABLE"),
+            ),
+            ("INSERT INTO p VALUES (8, 8)", at(&[], "INSERT 0 1")),
+            ("INSERT INTO cd2 VALUES (1, 8, 8)", at(&[], "INSERT 0 1")),
+            // (8, 5) is no parent's.
+            ("DELETE FROM p WHERE x = 8", err("23503")),
+            ("SELECT id, a, b FROM cd2 ORDER BY id", at(&["1|8|8"], "SELECT 1")),
+            (
+                "CREATE TABLE cr (id int PRIMARY KEY, a int, b int, FOREIGN KEY (a, b) REFERENCES p ON UPDATE RESTRICT ON DELETE RESTRICT)",
+                at(&[], "CREATE TABLE"),
+            ),
+            ("INSERT INTO p VALUES (4, 4)", at(&[], "INSERT 0 1")),
+            ("INSERT INTO cr VALUES (1, 4, 4)", at(&[], "INSERT 0 1")),
+            ("UPDATE p SET y = 5 WHERE x = 4", err("23503")),
+            ("DELETE FROM p WHERE x = 4", err("23503")),
+            // MATCH FULL with a partial SET NULL: the action's own row breaks
+            // the key, as in PostgreSQL.
+            (
+                "CREATE TABLE cf (a int, b int, FOREIGN KEY (a, b) REFERENCES p MATCH FULL ON DELETE SET NULL (b))",
+                at(&[], "CREATE TABLE"),
+            ),
+            ("INSERT INTO cf VALUES (1, 9)", at(&[], "INSERT 0 1")),
+            ("DELETE FROM p WHERE x = 1 AND y = 9", err("23503")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        assert_eq!(
+            answer(
+                &db,
+                &mut s,
+                "SELECT conname, confupdtype, confdeltype, pg_get_constraintdef(oid) FROM pg_constraint \
+                 WHERE conname IN ('cs_a_b_fkey', 'cc_a_b_fkey') ORDER BY conname"
+            )
+            .await
+            .unwrap()
+            .0,
+            [
+                r#"cc_a_b_fkey|c|c|FOREIGN KEY ("a", "b") REFERENCES "p"("x", "y") ON UPDATE CASCADE ON DELETE CASCADE"#,
+                r#"cs_a_b_fkey|a|n|FOREIGN KEY ("a", "b") REFERENCES "p"("x", "y") ON DELETE SET NULL ("b")"#,
+            ]
+        );
+        assert_eq!(
+            answer(
+                &db,
+                &mut s,
+                "SELECT constraint_name, column_name, ordinal_position, position_in_unique_constraint \
+                 FROM information_schema.key_column_usage WHERE table_name = 'cc' ORDER BY constraint_name, ordinal_position"
+            )
+            .await
+            .unwrap()
+            .0,
+            ["cc_a_b_fkey|a|1|1", "cc_a_b_fkey|b|2|2", "cc_pkey|id|1|NULL"]
+        );
+        assert_eq!(
+            answer(
+                &db,
+                &mut s,
+                "SELECT constraint_name, unique_constraint_name, match_option, update_rule, delete_rule \
+                 FROM information_schema.referential_constraints ORDER BY constraint_name"
+            )
+            .await
+            .unwrap()
+            .0,
+            [
+                "cc_a_b_fkey|p_pkey|NONE|CASCADE|CASCADE",
+                "cd2_a_b_fkey|p_pkey|NONE|NO ACTION|SET DEFAULT",
+                "cd_a_b_fkey|p_pkey|NONE|NO ACTION|SET DEFAULT",
+                "cf_a_b_fkey|p_pkey|FULL|NO ACTION|SET NULL",
+                "cn_a_b_fkey|p_pkey|NONE|SET NULL|SET NULL",
+                "cr_a_b_fkey|p_pkey|NONE|RESTRICT|RESTRICT",
+                "cs_a_b_fkey|p_pkey|NONE|NO ACTION|SET NULL",
+            ]
+        );
+    })
+    .await
+    .expect("bounded");
+}
+
+/// What depends on a composite key, as PostgreSQL 17 decides it: the unique
+/// or primary key it references is not dropped without CASCADE (2BP01),
+/// which drops the key; nor is a referenced column; a referencing column's
+/// drop takes the key with it; a renamed column or table keeps it working;
+/// `DROP TABLE … CASCADE` drops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn composite_foreign_key_dependencies() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        let at = |rows: &[&str], tag: &str| -> Result<(Vec<String>, String), String> {
+            Ok((rows.iter().map(|r| r.to_string()).collect(), tag.to_string()))
+        };
+        let err = |code: &str| -> Result<(Vec<String>, String), String> { Err(code.to_string()) };
+        for (sql, expected) in [
+            ("CREATE TABLE pu (x int, y int, z int, CONSTRAINT pu_xy UNIQUE (x, y))", at(&[], "CREATE TABLE")),
+            ("INSERT INTO pu VALUES (1, 1, 1)", at(&[], "INSERT 0 1")),
+            ("CREATE TABLE cu (a int, b int, CONSTRAINT cu_fk FOREIGN KEY (b, a) REFERENCES pu (y, x))", at(&[], "CREATE TABLE")),
+            ("INSERT INTO cu VALUES (1, 1)", at(&[], "INSERT 0 1")),
+            ("ALTER TABLE pu DROP CONSTRAINT pu_xy", err("2BP01")),
+            ("ALTER TABLE pu DROP CONSTRAINT pu_xy CASCADE", at(&[], "ALTER TABLE")),
+            ("SELECT conname FROM pg_constraint WHERE conrelid = 'cu'::regclass", at(&[], "SELECT 0")),
+            ("INSERT INTO cu VALUES (5, 5)", at(&[], "INSERT 0 1")),
+            ("CREATE TABLE pk2 (x int, y int, PRIMARY KEY (x, y))", at(&[], "CREATE TABLE")),
+            ("CREATE TABLE ck2 (a int, b int, FOREIGN KEY (a, b) REFERENCES pk2)", at(&[], "CREATE TABLE")),
+            ("ALTER TABLE pk2 DROP CONSTRAINT pk2_pkey", err("2BP01")),
+            ("ALTER TABLE pk2 DROP COLUMN y", err("2BP01")),
+            // Dropping a referencing column drops the key, whole.
+            ("ALTER TABLE ck2 DROP COLUMN b", at(&[], "ALTER TABLE")),
+            ("SELECT conname FROM pg_constraint WHERE conrelid = 'ck2'::regclass", at(&[], "SELECT 0")),
+            ("INSERT INTO ck2 VALUES (9)", at(&[], "INSERT 0 1")),
+            ("ALTER TABLE pk2 DROP CONSTRAINT pk2_pkey", at(&[], "ALTER TABLE")),
+            ("CREATE TABLE pr (x int, y int, PRIMARY KEY (x, y))", at(&[], "CREATE TABLE")),
+            ("INSERT INTO pr VALUES (1, 1)", at(&[], "INSERT 0 1")),
+            ("CREATE TABLE cr2 (a int, b int, FOREIGN KEY (a, b) REFERENCES pr)", at(&[], "CREATE TABLE")),
+            ("INSERT INTO cr2 VALUES (1, 1)", at(&[], "INSERT 0 1")),
+            ("ALTER TABLE pr RENAME COLUMN y TO yy", at(&[], "ALTER TABLE")),
+            ("ALTER TABLE cr2 RENAME COLUMN b TO bb", at(&[], "ALTER TABLE")),
+            ("ALTER TABLE pr RENAME TO pr2", at(&[], "ALTER TABLE")),
+            (
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'cr2'::regclass",
+                at(&[r#"FOREIGN KEY ("a", "bb") REFERENCES "pr2"("x", "yy")"#], "SELECT 1"),
+            ),
+            ("INSERT INTO cr2 VALUES (1, 2)", err("23503")),
+            ("INSERT INTO cr2 VALUES (1, 1)", at(&[], "INSERT 0 1")),
+            ("DELETE FROM pr2", err("23503")),
+            ("DROP TABLE pr2", err("2BP01")),
+            ("DROP TABLE pr2 CASCADE", at(&[], "DROP TABLE")),
+            ("SELECT count(*) FROM pg_constraint WHERE conrelid = 'cr2'::regclass AND contype = 'f'", at(&["0"], "SELECT 1")),
+            ("INSERT INTO cr2 VALUES (9, 9)", at(&[], "INSERT 0 1")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+    })
+    .await
+    .expect("bounded");
+}

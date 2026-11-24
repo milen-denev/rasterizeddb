@@ -272,10 +272,20 @@ async fn a_backup_directory_opens_as_a_database_of_its_own() {
     }
 
     // The point of a mirrored copy: point the engine at the backup directory
-    // and it is a database, not an archive that needs restoring first. Its
-    // pool file, copied from the primary, names the primary: opened as it
-    // was, the copy read and wrote the primary's files. It is adopted now,
-    // so the copy reads its own and leaves the original alone.
+    // and it is a database, not an archive that needs restoring first.
+    //
+    // The mirror carries table files only, so as written it holds no pool
+    // file and its tables open from itself. The dangerous shape is a mirror
+    // that also carries the original's pool file (copied along with the
+    // directory by hand, or by a sync of the whole tree): that file names the
+    // primary, and opened as it was, the copy read and wrote the primary's
+    // files. It is adopted now, so the copy reads its own and leaves the
+    // original alone. The file is copied here so that is what this opens.
+    assert!(
+        !backup.path().join(super::POOL_FILE).exists(),
+        "the mirror now carries a pool file of its own; this test copies the original's over it"
+    );
+    std::fs::copy(root.path().join(super::POOL_FILE), backup.path().join(super::POOL_FILE)).unwrap();
     let original_rows: Vec<(String, u64)> = files_for(root.path(), "survivor")
         .into_iter()
         .map(|name| {
@@ -294,7 +304,8 @@ async fn a_backup_directory_opens_as_a_database_of_its_own() {
     assert_eq!(
         recovered.storage.location_of("survivor").as_deref(),
         Some(backup.path().to_string_lossy().as_ref()),
-        "the copy resolves its table outside itself"
+        "the copy resolves its table outside itself (pool file {:?})",
+        std::fs::read_to_string(backup.path().join(super::POOL_FILE)).ok()
     );
     // A write to the copy lands in the copy.
     insert(&recovered, "survivor", 8, "only in the copy").await;

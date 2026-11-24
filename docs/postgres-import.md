@@ -1,6 +1,6 @@
 # Importing a PostgreSQL database — design and operation
 
-Status: **implemented, off by default.** Build with `--features pg_import`.
+Status: **implemented**, Cargo feature `pg_import` (in the default build).
 Target: `rasterizeddb_core::core::migrate`, edition 2024.
 
 One direction, one shot. This reads a live PostgreSQL server and builds a new
@@ -401,4 +401,104 @@ it.
 - A lock on the data directory, so that a CLI import into a directory a live
   server is serving is refused rather than merely documented (§1). Also an
   engine gap: nothing anywhere takes one.
-- Exporting the other way.
+- ~~Exporting the other way.~~ PostgreSQL's own `pg_dump` does it (§11).
+
+## 11. The other way: `pg_dump`
+
+PostgreSQL's `pg_dump` dumps a RasterizedDB database, in every format, for a
+restore into PostgreSQL or into another RasterizedDB database. Tested with
+`pg_dump` 18.6; the server reports version 16.3, so `pg_dump` sends its
+queries for 16.
+
+```sh
+pg_dump -h <host> -p <port> -U <role> --no-owner -Fc -f app.dump app
+pg_restore --no-owner -d <target> app.dump      # RasterizedDB or PostgreSQL
+pg_dump  ... --no-owner -Fp -f app.sql app && psql -d <target> -f app.sql
+```
+
+**How it is answered.** `pg_dump` learns what to dump from about fifty
+catalogue queries, read back by column name, most of them joining catalogues
+this engine has no rows for through shapes the statement path does not read.
+A session that has set `synchronize_seqscans` off, which `pg_dump` does
+before its first catalogue query whatever its options, has those queries
+answered by `pgwire::pg_dump` from the catalogue model `pg_class` is built
+from. Everything else it sends runs as any client's statements do: `BEGIN` …
+`REPEATABLE READ, READ ONLY`, `LOCK TABLE`, `COPY … TO stdout`, the sequence
+reads. Any other session reads the catalogue as before.
+
+**Partitioned tables.** `pg_dump` writes no data for a relkind `'p'` table:
+it expects the rows in leaf partitions it finds through `pg_inherits`, and
+the partitions here are not relations a client can name. Answered as
+`psql` is answered, every partitioned table's rows would be missing from the
+dump, with no error. So `pg_dump`, and only `pg_dump`, is shown a partitioned
+table as a plain table (relkind `'r'`), whose data step is one `COPY t TO
+stdout` over every partition, and its partitioning as a post-data index in
+this engine's spelling of the conversion
+([partitioning.md](partitioning.md#conversion-as-built)):
+
+```sql
+CREATE INDEX events_partition_key ON public.events USING partition (tenant_id) WITH (partitions = 64);
+```
+
+- **Into RasterizedDB** the table is created plain, its rows loaded and its
+  keys added, and then that statement converts it: the same key and the same
+  partition count. Not carried: `COLOCATE WITH`, isolated keys and split or
+  merged ranges (the rows are rehashed into `n` even ranges) and storage
+  placement.
+- **Into PostgreSQL** that one statement fails (`access method "partition"
+  does not exist`) and the table stays a plain table holding every row.
+  `pg_restore` then reports one ignored error; to restore without it, leave
+  the entry out: `pg_restore -l app.dump | grep -v partition_key > list;
+  pg_restore -L list …`. Partition the table in PostgreSQL by hand if wanted.
+
+Two other spellings were rejected. PostgreSQL's own, `CREATE TABLE …
+PARTITION BY HASH (k)` with no partitions: PostgreSQL 17 then refuses every
+row of the `COPY` (`no partition of relation "events" found for row`), and
+this server refuses the schema-qualified `CREATE TABLE public.t …
+PARTITION BY` a dump writes. A single synthetic leaf (`FOR VALUES WITH
+(MODULUS 1, REMAINDER 0)`) would restore into PostgreSQL, but here the leaf is
+a second, plain table (there is no `ATTACH PARTITION`), which would receive
+the rows.
+
+**What comes across:** tables, columns and their types (arrays and enum types
+too), `NOT NULL`, `DEFAULT`, `CHECK`, `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY`,
+secondary indexes, `SERIAL` and explicit sequences with their values, identity
+columns, views and materialized views. A `SERIAL`'s value is the one its next
+insert would seed, even right after a restart, when `pg_sequences` shows none
+yet. Expressions are schema-qualified as PostgreSQL's deparser writes them for
+the empty `search_path` a restore may run under (`nextval('public.s'::regclass)`,
+`REFERENCES public.t(id)`, a view's `FROM public.t`).
+
+**What does not**, said in a `WARNING` the session sends as `pg_dump` lists
+the relations (shown by `pg_dump --verbose` only): functions and procedures,
+triggers, domains (their columns keep the base type), and `GRANT`s; column
+collations (`rdb_ci`, …). Owners come across as the owning role's name; use
+`--no-owner` on a target without those roles (a server run with `--pg-auth
+trust` and no `--pg-user` has none, and every `OWNER TO` fails there).
+
+**Restoring here** needed six fixes, made with this: `ALTER COLUMN … ADD
+GENERATED … AS IDENTITY`, which reported success and did nothing (the restored
+column had no default, so every insert failed NOT NULL); `COPY` into a
+`GENERATED ALWAYS` identity column, which refused every row (428C9) where
+PostgreSQL's `COPY` writes them; a default `nextval('public.s'::regclass)`,
+which counted on a second, empty sequence named `public.s` (the first insert
+after a restore collided with a restored key); `ALTER VIEW` and `ALTER
+SEQUENCE … OWNER TO`, refused; `CREATE INDEX … ON public.t USING
+partition`, refused for the qualified name; and a query holding only a
+comment, which `pg_restore` sends, answered with no result at all, which
+`pg_restore --exit-on-error` stopped on (it is `EmptyQueryResponse` now).
+Restoring a dump PostgreSQL made is a different matter (typed default
+literals, `ATTACH PARTITION`, …): use `IMPORT DATABASE FROM POSTGRES` (§1).
+
+**Measured round trip** (2026-11-23, `pg_dump` 18.6, `-Fp` and `-Fc`, each
+restored into PostgreSQL 17.11 and into a fresh RasterizedDB database): five
+tables (every common type with NULLs, an enum column, a SERIAL, an identity
+column, a sequence-fed default, PK, UNIQUE, FK, CHECK, a secondary index), a
+hash-partitioned table of 3,001 rows, a view and a materialized view: every
+relation's rows in key order, as text, identical to the source in all four
+restores, and every counter carrying on past the restored keys.
+
+Tests: `tests/pg_dump_round_trip.rs`. `catalogue_answers_dump_every_partitioned_row`
+needs no PostgreSQL; `real_pg_dump_round_trips_plain_and_partitioned_tables`
+runs the real `pg_dump`, `pg_restore` and `psql` when they are on `PATH` (or
+in `RDB_PG_BIN`) and is skipped otherwise.

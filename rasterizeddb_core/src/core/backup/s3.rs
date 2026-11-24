@@ -44,6 +44,14 @@ type HmacSha256 = Hmac<Sha256>;
 /// compressed.
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 
+/// Attempts for a request the store throttles (429, 503): about 25 s of
+/// jittered backoff at most, where a 5xx of any other kind gets the
+/// configured `max_attempts`.
+const THROTTLE_ATTEMPTS: u32 = 10;
+
+/// The longest one backoff sleeps, in milliseconds.
+const THROTTLE_BACKOFF_CEILING_MS: u64 = 3_200;
+
 /// SHA-256 of the empty string, for requests that carry no body.
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -541,7 +549,8 @@ impl S3Client {
             return Err(StreamFailure {
                 consumed: 0,
                 error: io::Error::other(format!(
-                    "S3 ignored the range request for {key} (returned {}),                      so the download cannot be resumed safely",
+                    "S3 ignored the range request for {key} (returned {}), \
+                     so the download cannot be resumed safely",
                     head.status
                 )),
             });
@@ -783,10 +792,21 @@ impl S3Client {
             };
             match outcome {
                 Ok(response) => {
-                    let retryable = response.status == 429
-                        || response.status == 503
-                        || (500..=599).contains(&response.status);
-                    if retryable && attempt < self.config.max_attempts {
+                    // 429 and 503 are the store asking to slow down (S3's
+                    // SlowDown, RustFS's "service unavailable, please
+                    // retry"): a load that outruns it gets them for longer
+                    // than the four attempts' second and a half, and the
+                    // write failed with them. They get THROTTLE_ATTEMPTS,
+                    // their backoff capped at THROTTLE_BACKOFF_CEILING_MS;
+                    // any other 5xx keeps `max_attempts`.
+                    let throttled = response.status == 429 || response.status == 503;
+                    let retryable = throttled || (500..=599).contains(&response.status);
+                    let attempts = if throttled {
+                        self.config.max_attempts.max(THROTTLE_ATTEMPTS)
+                    } else {
+                        self.config.max_attempts
+                    };
+                    if retryable && attempt < attempts {
                         self.backoff(attempt).await;
                         continue;
                     }
@@ -811,7 +831,7 @@ impl S3Client {
     /// Exponential backoff with full jitter, so a fleet that all failed at once
     /// does not all retry at once.
     async fn backoff(&self, attempt: u32) {
-        let ceiling = 100u64 << attempt.min(6);
+        let ceiling = (100u64 << attempt.min(6)).min(THROTTLE_BACKOFF_CEILING_MS);
         tokio::time::sleep(Duration::from_millis(fastrand::u64(50..=ceiling.max(51)))).await;
     }
 

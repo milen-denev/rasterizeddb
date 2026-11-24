@@ -120,6 +120,8 @@ pub(crate) struct Dial {
     /// ([`crate::Options::database`]).
     pub(crate) setup: Option<Arc<dyn rastcp::session::ConnectionSetup>>,
     pub(crate) trust: crate::Trust,
+    /// The client's notice handler ([`crate::Client::set_notice_handler`]).
+    pub(crate) notices: Arc<crate::notice::NoticeHook>,
 }
 
 /// A finished transaction's connection, kept for the next.
@@ -150,7 +152,11 @@ impl Connections {
         let mut builder =
             crate::client::with_trust(TcpClientBuilder::new(&self.dial.addr), &self.dial.trust)
                 .max_message_size(self.dial.max_message_size);
-        builder = match self.dial.timeout {
+        // With the grace, so the server's own answer to a statement past its
+        // timeout (57014, the transaction failed but its connection kept)
+        // comes before this side gives up on the connection, and with it
+        // the transaction.
+        builder = match crate::client::with_grace(self.dial.timeout) {
             Some(timeout) => builder.timeout(timeout),
             None => builder.no_timeout(),
         };
@@ -160,6 +166,7 @@ impl Connections {
         if let Some(setup) = &self.dial.setup {
             builder = builder.setup(setup.clone());
         }
+        builder = builder.add_setup(crate::notice::setup());
         let mut tcp = builder.build().await?;
         tcp.connect().await?;
         Ok(tcp)
@@ -361,7 +368,7 @@ impl Transaction {
         match sent {
             Ok(response) => {
                 state.last_used = Instant::now();
-                decode_response(response)
+                decode_response(response, &self.connections.dial.notices)
             }
             Err(e) => {
                 let mut why = format!("its connection failed: {e}");

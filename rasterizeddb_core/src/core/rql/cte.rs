@@ -144,7 +144,9 @@ pub fn split_with(sql: &str) -> Result<Option<(Vec<CteDef>, String)>, String> {
         let open = after_as.as_ptr() as usize - rest.as_ptr() as usize;
         let close = matching_paren(rest, open)
             .ok_or_else(|| format!("unterminated WITH body for '{}'", name))?;
-        let body = rest[open + 1..close].trim().to_string();
+        // A body of parenthesised branches, as the top level reads one
+        // (`sql_scan::plain_branch_parentheses`): it was "cannot parse".
+        let body = crate::core::sql_scan::plain_branch_parentheses(rest[open + 1..close].trim()).into_owned();
         if body.is_empty() {
             return Err(format!("the WITH clause '{}' has an empty body", name));
         }
@@ -177,6 +179,10 @@ fn item_label(item: &str) -> Option<String> {
     }
     match split_alias(item) {
         (_, Some(alias)) => Some(alias.to_string()),
+        // An alias written without `AS`, as PostgreSQL takes it:
+        // `ROW_NUMBER() OVER (…) rn`, `count(*) n`. Refused before ("has a
+        // column this cannot name") though it is named.
+        (expression, None) if implicit_alias(expression).is_some() => implicit_alias(expression).map(str::to_string),
         // Otherwise the name PostgreSQL gives the item: a cast's type
         // (`'x'::text` is `text`), a call's function (`upper`). Only an
         // item it names `?column?` is left unnamed: refused, and the client
@@ -189,6 +195,54 @@ fn item_label(item: &str) -> Option<String> {
             (!star && name != "?column?").then_some(name)
         }),
     }
+}
+
+/// The alias of an item written `expression name`, without `AS`: a last word
+/// that is a plain or quoted identifier, after a `)`, a closing quote or a
+/// word, and not a keyword an expression can end with (`END`, `NULL`, `TRUE`,
+/// a unit, `ZONE`). `None` for anything else.
+fn implicit_alias(expression: &str) -> Option<&str> {
+    let t = expression.trim_end();
+    let (head, last) = match t.rfind(|c: char| c.is_whitespace() || c == ')') {
+        Some(at) => (&t[..=at], &t[at + 1..]),
+        None => return None,
+    };
+    if last.is_empty() || head.trim().is_empty() {
+        return None;
+    }
+    let quoted = last.len() >= 2 && last.starts_with('"') && last.ends_with('"') && !last[1..last.len() - 1].contains('"');
+    let plain = last.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && last.chars().all(|c| c.is_alphanumeric() || c == '_');
+    if !(quoted || plain) {
+        return None;
+    }
+    if plain {
+        const ENDINGS: &[&str] = &[
+            "END", "NULL", "TRUE", "FALSE", "UNKNOWN", "ASC", "DESC", "ZONE", "YEAR", "MONTH", "DAY", "HOUR",
+            "MINUTE", "SECOND", "AND", "OR", "NOT", "IS", "THEN", "ELSE", "WHEN", "DISTINCT", "ALL",
+        ];
+        if ENDINGS.iter().any(|k| last.eq_ignore_ascii_case(k)) {
+            return None;
+        }
+    }
+    // What comes before has to end an expression: a `)`, a closing quote or
+    // a word, never an operator (`a - b` is not `a -` aliased `b`).
+    let before = head.trim_end();
+    let ends_expression = before.ends_with(')')
+        || before.ends_with('\'')
+        || before.ends_with('"')
+        || before.chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_');
+    if !ends_expression {
+        return None;
+    }
+    // A word before it must not be an operator keyword (`x IS NULL` is not
+    // `x IS` aliased `NULL`, caught above; `a AND b` is not aliased).
+    let prev_word = before.rsplit(|c: char| c.is_whitespace() || c == '(').next().unwrap_or("");
+    const OPERATOR_WORDS: &[&str] = &["AND", "OR", "NOT", "IS", "IN", "LIKE", "ILIKE", "BETWEEN", "THEN", "ELSE", "WHEN", "CASE", "AT", "COLLATE", "SIMILAR", "TO", "ESCAPE", "DISTINCT", "SELECT"];
+    if OPERATOR_WORDS.iter().any(|k| prev_word.eq_ignore_ascii_case(k)) {
+        return None;
+    }
+    Some(last.trim_matches('"'))
 }
 
 /// A select list past a leading `DISTINCT`, `DISTINCT ON (…)` or `ALL`,
@@ -261,7 +315,7 @@ fn bare_column(expression: &str) -> Option<String> {
 }
 
 /// The select-list text of a `SELECT … FROM …`, for naming the columns.
-fn select_list_of(body: &str) -> Option<&str> {
+pub(crate) fn select_list_of(body: &str) -> Option<&str> {
     let upper = body.to_ascii_uppercase();
     if !upper.trim_start().starts_with("SELECT") {
         return None;
@@ -274,7 +328,15 @@ fn select_list_of(body: &str) -> Option<&str> {
     // and every Rust raw-string query formats across lines. `find_keyword`
     // already respects quoting and nesting, which is what this used to
     // hand-roll.
-    if let Some(at) = crate::core::rql::join::find_keyword(body, "FROM", start) {
+    // The list is the first branch's: a `FROM` after a set operator belongs
+    // to a later branch. `SELECT 7 AS id UNION ALL SELECT id FROM t` read its
+    // list as `7 AS id UNION ALL SELECT id`, and the relation built from it
+    // was "syntax error at or near \"ALL\"".
+    let set_operator = ["UNION", "INTERSECT", "EXCEPT"]
+        .iter()
+        .filter_map(|keyword| crate::core::rql::join::find_keyword(body, keyword, start))
+        .min();
+    if let Some(at) = crate::core::rql::join::find_keyword(body, "FROM", start).filter(|at| set_operator.is_none_or(|op| *at < op)) {
         return Some(&body[start..at]);
     }
     // A `SELECT` with no `FROM` is one row of its items. It was reported as
@@ -2351,6 +2413,13 @@ pub(crate) async fn create_table_as(
     // `TABLE t` is `SELECT * FROM t`.
     let table_form = crate::core::rql::ctas::table_as_select(&statement.query);
     let query = table_form.as_deref().unwrap_or(&statement.query);
+    // `AS VALUES (…), (…)`: the SELECT it means, its columns `column1`… as
+    // PostgreSQL names them. It was "over anything but a SELECT or TABLE".
+    let values_form = values_as_select(query);
+    let query = values_form.as_deref().unwrap_or(query);
+    // `AS (SELECT …) UNION ALL (SELECT …)`, as the top level reads it.
+    let unparenthesised = crate::core::sql_scan::plain_branch_parentheses(query);
+    let query = unparenthesised.as_ref();
     let distinct_on = crate::core::rql::distinct_on::rewrite_statement(query);
     let query = distinct_on.as_deref().unwrap_or(query);
     let materialized = materialize(query, database, tx).await?;
@@ -2505,6 +2574,22 @@ pub async fn drop_temps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An alias without `AS` names the item; an expression's last keyword
+    /// or operand does not.
+    #[test]
+    fn an_alias_without_as_names_the_item() {
+        assert_eq!(item_label("ROW_NUMBER() OVER (PARTITION BY d ORDER BY c) rn").as_deref(), Some("rn"));
+        assert_eq!(item_label("count(*) n").as_deref(), Some("n"));
+        assert_eq!(item_label("a.b c").as_deref(), Some("c"));
+        assert_eq!(item_label("x + 1 \"Y\"").as_deref(), Some("Y"));
+        assert_eq!(implicit_alias("CASE WHEN a THEN 1 ELSE 2 END"), None);
+        assert_eq!(implicit_alias("x IS NULL"), None);
+        assert_eq!(implicit_alias("a AND b"), None);
+        assert_eq!(implicit_alias("NOT b"), None);
+        assert_eq!(implicit_alias("a || b"), None);
+        assert_eq!(implicit_alias("x COLLATE \"C\""), None);
+    }
 
     #[test]
     fn recursive_marks_every_definition_and_only_the_keyword_does() {
@@ -2917,7 +3002,11 @@ pub fn next_derived_table(sql: &str) -> Option<(usize, usize, String, String)> {
                 from = after_keyword;
                 continue;
             };
-            let inner = sql[inner_start..close].trim();
+            // `FROM ((SELECT …) UNION ALL (SELECT …)) u`: its branches
+            // without the parentheses that group nothing, as the top level
+            // reads them. It was read as a relation with no name.
+            let inner = crate::core::sql_scan::plain_branch_parentheses(sql[inner_start..close].trim());
+            let inner = inner.as_ref();
             if !crate::core::sql_scan::starts_with_keyword(inner, "SELECT") && !crate::core::sql_scan::starts_with_keyword(inner, "WITH") {
                 from = after_keyword;
                 continue;

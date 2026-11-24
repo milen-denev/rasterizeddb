@@ -175,6 +175,11 @@ const TOUCH: [&str; 11] = [
 const ALLOWLIST: &[(&str, &str)] = &[
     ("new_named", "`name` is the database's"),
     ("try_new_named", "`name` is the database's"),
+    (
+        "start_routed_replication",
+        "`name` is the database's, its replication route; it opens that database's replication log, never a table, \
+         seed or table file",
+    ),
     ("forget_seed", "drops cached seeds by name; a partitioned table has none"),
     ("drop_table", "delegates to drop_table_to_depth, which dispatches"),
     ("forget_in_catalogue", "the row tombstone both drop paths share, after their dispatch"),

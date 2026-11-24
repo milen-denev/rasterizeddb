@@ -2157,7 +2157,11 @@ pub fn for_schema_in(schema: &crate::core::row::schema::TableSchema, placement: 
         is_deleted: false,
     };
     if let Some(pk) = schema.primary_key.as_deref().and_then(by_name) {
-        add(implicit(crate::core::rql::unique_key::pkey_name(&schema.name), vec![pk]), true, &mut out);
+        // Under the key's own name (`unique_key::primary_key_of`): a renamed
+        // primary key had this index as `<table>_pkey` beside its record's.
+        let name = crate::core::rql::unique_key::primary_key_of(schema)
+            .map_or_else(|| crate::core::rql::unique_key::pkey_name(&schema.name), |key| key.name);
+        add(implicit(name, vec![pk]), true, &mut out);
     }
     for f in schema.fields.iter().filter(|f| f.is_unique && !f.is_deleted) {
         add(

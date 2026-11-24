@@ -352,37 +352,42 @@ async fn a_correlated_exists_in_an_update_or_delete_runs_at_every_isolation_leve
         // 1: 10 -> 2; 2: deleted (w 200); 3: 30 + 1 (no u row); 4: 40 -> 2, then deleted (w 50).
         assert_eq!(rows(&pool).await, vec![(1, 2), (3, 31)], "{session:?} {begin:?}");
     }
-    // Refused under any snapshot: an IN subquery reading the target, and an
-    // inequality the rewrite cannot place.
-    let refused = [
-        "UPDATE t SET v = 0 WHERE id IN (SELECT m.id FROM u m WHERE EXISTS (SELECT 1 FROM u x WHERE x.tid = t.id))",
-        "UPDATE t SET v = 0 WHERE EXISTS (SELECT 1 FROM u WHERE u.tid > t.id)",
-    ];
+    // An IN subquery reading the target (through an EXISTS inside it),
+    // answered as PostgreSQL answers it (`executor::correlated_in_as_exists`):
+    // it was refused. Row 1's subquery holds its id; row 3's is empty.
     let before = rows(&pool).await;
-    for sql in refused {
-        let e = pool.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.expect_err(sql);
-        assert_eq!(code(&e), "0A000", "autocommit {sql}: {e}");
-    }
+    let reads_target =
+        "UPDATE t SET v = 0 WHERE id IN (SELECT m.id FROM u m WHERE EXISTS (SELECT 1 FROM u x WHERE x.tid = t.id))";
     let mut conn = pool.acquire().await.expect("conn");
     conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
-    for sql in refused {
-        let e = conn.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.expect_err(sql);
-        assert_eq!(code(&e), "0A000", "{sql}: {e}");
-        conn.execute("ROLLBACK").await.expect("rollback");
-        conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
-    }
+    let changed = conn.execute(sqlx::raw_sql(AssertSqlSafe(reads_target.to_string()))).await.expect(reads_target);
+    assert_eq!(changed.rows_affected(), 1, "{reads_target}");
     conn.execute("ROLLBACK").await.expect("rollback");
     drop(conn);
-    assert_eq!(rows(&pool).await, before, "a refused statement changed a row");
+    assert_eq!(rows(&pool).await, before, "a rolled-back statement changed a row");
+
+    // An inequality to the outer row, answered as PostgreSQL answers it
+    // (`correlated::rewrite_write_where`): it was refused. Under a snapshot
+    // and rolled back, then in autocommit.
+    let inequality = "UPDATE t SET v = 0 WHERE EXISTS (SELECT 1 FROM u WHERE u.tid > t.id)";
+    let mut conn = pool.acquire().await.expect("conn");
+    conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
+    let changed = conn.execute(sqlx::raw_sql(AssertSqlSafe(inequality.to_string()))).await.expect(inequality);
+    assert_eq!(changed.rows_affected(), 2, "{inequality}");
+    conn.execute("ROLLBACK").await.expect("rollback");
+    drop(conn);
+    assert_eq!(rows(&pool).await, before);
+    pool.execute(sqlx::raw_sql(AssertSqlSafe(inequality.to_string()))).await.expect(inequality);
+    assert_eq!(rows(&pool).await, vec![(1, 0), (3, 0)]);
 }
 
-/// Correlations PostgreSQL places that the rewrite placed wrong, and two it
-/// cannot, each with its proper answer: a schema-qualified outer column
-/// (Prisma's `"public"."t"."id"`) and an EXISTS beside an `UPDATE … FROM`
-/// source correlating with the target run (both were 42P01, "missing
-/// FROM-clause entry"); an outer column under arithmetic (`u.x = t.x + 1`,
-/// was 42601) and an EXISTS used as a value (`x - EXISTS (…)::int`, was
-/// XX000) are refused as 0A000.
+/// Correlations PostgreSQL places that the rewrite placed wrong, each with
+/// its proper answer: a schema-qualified outer column (Prisma's
+/// `"public"."t"."id"`) and an EXISTS beside an `UPDATE … FROM` source
+/// correlating with the target run (both were 42P01, "missing FROM-clause
+/// entry"); an outer column under arithmetic (`u.x = t.x + 1`) and an
+/// EXISTS used as a value (`x - EXISTS (…)::int`, was XX000, then 0A000)
+/// run.
 ///
 /// A cast on either side of the correlated column (`u.tid = t.id::bigint`,
 /// `u.tid::int = t.id`) is a correlation too.
@@ -404,15 +409,25 @@ async fn correlations_are_placed_or_refused_with_their_code() {
     .expect("setup");
     let mut conn = pool.acquire().await.expect("conn");
     conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
-    for sql in [
-        "UPDATE t2 SET v = 0 WHERE EXISTS (SELECT 1 FROM u2 WHERE u2.x = t2.x + 1)",
-        "UPDATE t2 SET v = x - EXISTS (SELECT 1 FROM u2 WHERE u2.tid = t2.id)::int",
-    ] {
-        let e = conn.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.expect_err(sql);
-        assert_eq!(code(&e), "0A000", "{sql}: {e}");
-        conn.execute("ROLLBACK").await.expect("rollback");
-        conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
-    }
+    // An outer column under arithmetic, placed as PostgreSQL places it
+    // (`correlated::rewrite_write_where`): it was refused. Row 1, x = 1,
+    // meets u2.x = 2.
+    let changed = conn
+        .execute(sqlx::raw_sql(AssertSqlSafe(
+            "UPDATE t2 SET v = 0 WHERE EXISTS (SELECT 1 FROM u2 WHERE u2.x = t2.x + 1)".to_string(),
+        )))
+        .await
+        .expect("an outer column under arithmetic");
+    assert_eq!(changed.rows_affected(), 1);
+    conn.execute("ROLLBACK").await.expect("rollback");
+    conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
+    // An EXISTS used as a value, as its count (`exists_as_counts`): it was
+    // refused. PostgreSQL updates both rows (2|5, 1|0).
+    let as_value = "UPDATE t2 SET v = x - EXISTS (SELECT 1 FROM u2 WHERE u2.tid = t2.id)::int";
+    let changed = conn.execute(sqlx::raw_sql(AssertSqlSafe(as_value.to_string()))).await.expect(as_value);
+    assert_eq!(changed.rows_affected(), 2, "{as_value}");
+    conn.execute("ROLLBACK").await.expect("rollback");
+    conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
     for sql in [
         r#"UPDATE "public"."t2" SET v = 7 WHERE EXISTS (SELECT 1 FROM u2 WHERE u2.tid = "public"."t2"."id")"#,
         "UPDATE t2 SET v = 9 FROM u2 WHERE u2.tid = t2.id AND EXISTS (SELECT 1 FROM w2 WHERE w2.y = t2.y)",

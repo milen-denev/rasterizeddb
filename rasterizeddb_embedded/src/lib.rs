@@ -140,7 +140,11 @@ use tokio::sync::oneshot;
 pub use rasterizeddb_client as client;
 pub use rasterizeddb_client::{Client, Login, Options};
 /// The engine itself, for what the client cannot express (counters, internal
-/// state). Its API is the server's internals and changes between releases.
+/// state). Its API is the server's internals and changes in any release
+/// (`rasterizeddb_core` does not follow semver), so it is hidden from these
+/// docs and outside this crate's semver promise: code that reaches into it
+/// may need changes on any upgrade.
+#[doc(hidden)]
 pub use rasterizeddb_core as engine;
 /// Where indexes keep their entries; see [`Builder::index_residency`].
 pub use rasterizeddb_core::core::index::paged::Residency as IndexResidency;
@@ -680,7 +684,10 @@ impl EngineSlot {
             .map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::AlreadyExists,
-                    "an embedded engine already runs in this process: its settings are process-wide                      and SET CONFIG saves to its directory, so a second engine alongside it would                      change both. Stop the first (Embedded::shutdown), or serve more databases                      from it with CREATE DATABASE",
+                    "an embedded engine already runs in this process: its settings are process-wide \
+                     and SET CONFIG saves to its directory, so a second engine alongside it would \
+                     change both. Stop the first (Embedded::shutdown), or serve more databases \
+                     from it with CREATE DATABASE",
                 )
             })
     }

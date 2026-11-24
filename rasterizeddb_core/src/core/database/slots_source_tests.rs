@@ -96,7 +96,7 @@ const FORMER_ESCAPES: &[(&str, &str, &str)] = &[
     (EXEC, "execute_create_index", "table_for"),
     (EXEC, "execute_create_path_index", "table_for"),
     (EXEC, "execute_drop_index", "table_for"),
-    (EXEC, "execute_drop_partial_unique", "table_for"),
+    (EXEC, "execute_drop_unique_index", "table_for"),
     (EXEC, "execute_drop_path_index", "table_for"),
     (EXEC, "execute_join", "relation_for"),
     (EXEC, "execute_prepared_rows", "relation_for"),

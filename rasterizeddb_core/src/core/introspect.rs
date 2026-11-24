@@ -743,7 +743,13 @@ async fn tables(database: &Arc<Database>) -> Result<Vec<Row>, String> {
             Cell::Number(figures.reclaimable),
             Cell::Flag(figures.filters_ready),
             Cell::Flag(schema.is_immutable),
-            Cell::Text(schema.primary_key.clone().unwrap_or_default()),
+            // Every column of the key, comma-separated: a composite key read
+            // as the single-column field showed blank, as though it was lost.
+            Cell::Text(
+                crate::core::rql::unique_key::primary_key_of(&schema)
+                    .map(|k| k.columns.join(", "))
+                    .unwrap_or_default(),
+            ),
         ]));
     }
     Ok(out)
@@ -781,6 +787,7 @@ async fn database_stats(database: &Arc<Database>) -> Result<Vec<Row>, String> {
     let mut vacuum_panics = 0u64;
     let mut foreign_keys = 0usize;
     let mut unique_keys = 0usize;
+    let mut unique_indexes = 0usize;
     let mut json_columns = 0usize;
     let mut column_count = 0usize;
     let mut table_count = 0usize;
@@ -815,7 +822,12 @@ async fn database_stats(database: &Arc<Database>) -> Result<Vec<Row>, String> {
         unique_keys += schema
             .unique_keys
             .iter()
-            .filter(|k| !k.is_deleted)
+            .filter(|k| !k.is_deleted && !k.is_index())
+            .count();
+        unique_indexes += schema
+            .unique_keys
+            .iter()
+            .filter(|k| !k.is_deleted && k.is_index())
             .count();
         json_columns += schema
             .json_columns
@@ -931,6 +943,11 @@ async fn database_stats(database: &Arc<Database>) -> Result<Vec<Row>, String> {
         "unique_constraints",
         unique_keys.to_string(),
         "table-level UNIQUE constraints",
+    );
+    push(
+        "unique_indexes",
+        unique_indexes.to_string(),
+        "unique indexes CREATE UNIQUE INDEX made",
     );
     push(
         "json_columns",
@@ -1559,7 +1576,9 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
     push("immutable", schema.is_immutable.to_string(), "");
     push(
         "primary_key",
-        schema.primary_key.clone().unwrap_or_default(),
+        crate::core::rql::unique_key::primary_key_of(&schema)
+            .map(|k| k.columns.join(", "))
+            .unwrap_or_default(),
         "",
     );
 
@@ -1607,9 +1626,13 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
         "document paths carried by the filter index",
     );
 
+    // A key `CREATE UNIQUE INDEX` made (or a partial one) is an index, as
+    // `DROP INDEX` and `pg_constraint` have it (`UniqueKey::is_index`); one
+    // `ADD CONSTRAINT … UNIQUE` declared, or stored before the mark, keeps
+    // the label it always had.
     for key in schema.unique_keys.iter().filter(|k| !k.is_deleted) {
         push(
-            "unique_constraint",
+            if key.is_index() { "unique_index" } else { "unique_constraint" },
             format!("{} ({})", key.name, key.columns.join(", ")),
             "",
         );
@@ -1619,7 +1642,10 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
             "foreign_key",
             format!(
                 "{} : {} -> {}.{}",
-                fk.name, fk.column, fk.parent_table, fk.parent_column
+                fk.name,
+                key_list(&fk.columns),
+                fk.parent_table,
+                key_list(&fk.parent_columns)
             ),
             &format!("ON DELETE {}", action_name(&fk.on_delete)),
         );
@@ -1694,6 +1720,7 @@ fn columns(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
     let mut out = Vec::new();
     let mut position = 0u64;
 
+    let primary_key = crate::core::rql::unique_key::primary_key_of(&schema);
     for field in schema.fields.iter() {
         // Companion flag columns are engine-owned. They are reported through
         // the `nullable` flag of the column they belong to rather than as
@@ -1705,7 +1732,11 @@ fn columns(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
 
         let nullable =
             crate::core::rql::nullable::flag_field(&field.name, &schema.fields).is_some();
-        let is_primary = schema.primary_key.as_deref() == Some(field.name.as_str());
+        // A column of the primary key, whatever the key is called and
+        // however many columns it has (`unique_key::primary_key_of`). Only
+        // the header's column was flagged, so a composite key's columns
+        // read as no key at all here, where pg_index flags each.
+        let is_primary = primary_key.as_ref().is_some_and(|key| key.columns.iter().any(|c| c.eq_ignore_ascii_case(&field.name)));
         let in_unique_key = schema.unique_keys.iter().any(|k| {
             !k.is_deleted
                 && k.columns
@@ -1821,9 +1852,11 @@ fn schema_map(database: &Arc<Database>) -> Result<Vec<Row>, String> {
             out.push(row(&[
                 Cell::Text("fk".to_string()),
                 Cell::Text(schema.name.clone()),
-                Cell::Text(fk.column.clone()),
+                // A composite key's columns as one list, `a, b`, in key
+                // order: the row keeps its positions.
+                Cell::Text(fk.column_list()),
                 Cell::Text(fk.parent_table.clone()),
-                Cell::Text(fk.parent_column.clone()),
+                Cell::Text(fk.parent_column_list()),
                 Cell::Text(fk.name.clone()),
                 Cell::Text(action_name(&fk.on_delete).to_string()),
                 Cell::Text(action_name(&fk.on_update).to_string()),
@@ -3372,6 +3405,15 @@ pub fn sql_type_name(db_type: &DbType) -> &'static str {
     }
 }
 
+/// A foreign key's columns as a description lists them: `a`, or `(a, b)`
+/// for a composite key.
+fn key_list(columns: &[String]) -> String {
+    match columns {
+        [column] => column.clone(),
+        _ => format!("({})", columns.join(", ")),
+    }
+}
+
 fn action_name(action: &crate::core::rql::foreign_key::ReferentialAction) -> &'static str {
     use crate::core::rql::foreign_key::ReferentialAction::*;
     match action {
@@ -3393,7 +3435,8 @@ fn action_name(action: &crate::core::rql::foreign_key::ReferentialAction) -> &'s
 /// STATUS` says so: "nothing has run yet" and "this build does not record what
 /// runs" want two different things done about them.
 #[cfg(not(feature = "query_stats"))]
-const NO_QUERY_STATS: &str = "this server was built without the `query_stats` feature, so it records nothing about      what it runs; rebuild with `--features query_stats`";
+const NO_QUERY_STATS: &str = "this server was built without the `query_stats` feature, so it records nothing about \
+     what it runs; rebuild with `--features query_stats`";
 
 #[cfg(not(feature = "query_stats"))]
 fn recent_queries(_limit: Option<u64>) -> Result<Vec<Row>, String> {

@@ -885,7 +885,8 @@ impl<K: KvKey + KvValue, V: KvValue, E: Executor> KvQuery<'_, K, V, E> {
                     Err(_) if self.lenient => continue,
                     Err(e) => {
                         return Err(Error::Unsupported(format!(
-                            "the value at {:?} does not read as the query's value type ({e});                              lenient() skips such entries",
+                            "the value at {:?} does not read as the query's value type ({e}); \
+                             lenient() skips such entries",
                             String::from_utf8_lossy(full)
                         )));
                     }

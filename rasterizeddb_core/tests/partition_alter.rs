@@ -612,7 +612,7 @@ fn writers_through_a_stream_of_ddl_lose_and_mix_nothing() {
         "ALTER TABLE pa ALTER COLUMN s SET DEFAULT 'dflt'",
         "CREATE UNIQUE INDEX pa_u ON pa (tenant_id, id, n)",
         "ALTER TABLE pa RENAME COLUMN f TO g",
-        "ALTER TABLE pa DROP CONSTRAINT pa_u",
+        "DROP INDEX pa_u",
         "ALTER TABLE pa ALTER COLUMN s DROP DEFAULT",
         "ALTER TABLE pa RENAME COLUMN g TO f",
         "ALTER TABLE pa DROP CONSTRAINT pa_c",
@@ -1106,9 +1106,9 @@ fn long_names_number_repeated_unnamed_constraints_and_return() {
 
 /// The primary key answers to its own name only, as in PostgreSQL: one added
 /// as `k1` is not `<table>_pkey`; an inline one's flag is not also
-/// `<table>_<column>_key`; and a composite one named other than
-/// `<table>_pkey` is refused (0A000), since nothing else could tell it from a
-/// UNIQUE and a second PRIMARY KEY would be accepted beside it.
+/// `<table>_<column>_key`; and a composite one takes any name (89c1e752: the
+/// key's record says it is the primary key, so its name need not), after
+/// which a second PRIMARY KEY of any name is 42P16.
 #[test]
 fn a_primary_key_answers_to_its_own_name_only() {
     let dir = tempfile::tempdir().unwrap();
@@ -1129,11 +1129,19 @@ fn a_primary_key_answers_to_its_own_name_only() {
         assert!(!is_primary(&mut c, &t, "a"), "{t}: k1 dropped");
         c.ok(&format!("INSERT INTO {t} (a, b, c) VALUES (1, 2, 2)"));
 
-        // (c) a composite one: `<table>_pkey` or unnamed, nothing else.
+        // (c) a composite one, under a name of its own: it is the key.
         c.ok(&format!("DELETE FROM {t} WHERE b = 2"));
-        expect_code(&mut c, &format!("ALTER TABLE {t} ADD CONSTRAINT k2 PRIMARY KEY (a, b)"), "0A000");
-        c.ok(&format!("ALTER TABLE {t} ADD CONSTRAINT {t}_pkey PRIMARY KEY (a, b)"));
+        c.ok(&format!("ALTER TABLE {t} ADD CONSTRAINT k2 PRIMARY KEY (a, b)"));
+        assert!(is_primary(&mut c, &t, "b"), "{t}: k2 is the key");
+        expect_code(&mut c, &format!("INSERT INTO {t} (a, b, c) VALUES (1, 1, 9)"), "23505");
+        expect_code(&mut c, &format!("ALTER TABLE {t} DROP CONSTRAINT {t}_pkey"), "42704");
+        expect_code(&mut c, &format!("ALTER TABLE {t} ADD CONSTRAINT {t}_pkey PRIMARY KEY (a, b)"), "42P16");
         expect_code(&mut c, &format!("ALTER TABLE {t} ADD PRIMARY KEY (a)"), "42P16");
+        expect_code(&mut c, &format!("ALTER TABLE {t} ADD CONSTRAINT k3 PRIMARY KEY (a)"), "42P16");
+        c.ok(&format!("ALTER TABLE {t} DROP CONSTRAINT k2"));
+        assert!(!is_primary(&mut c, &t, "b"), "{t}: k2 dropped");
+        // And `<table>_pkey` names one as well.
+        c.ok(&format!("ALTER TABLE {t} ADD CONSTRAINT {t}_pkey PRIMARY KEY (a, b)"));
         expect_code(&mut c, &format!("ALTER TABLE {t} ADD CONSTRAINT k3 PRIMARY KEY (a)"), "42P16");
 
         // (b) inline: `<table>_pkey`, never `<table>_<column>_key`.

@@ -412,8 +412,8 @@ impl Database {
     }
 
     /// The table that declares index `name` (names are database-wide): a
-    /// `CREATE INDEX` over columns or a path, or a partial unique key, which
-    /// is what a partial `CREATE UNIQUE INDEX` is kept as.
+    /// `CREATE INDEX` over columns or a path, or a unique key `CREATE UNIQUE
+    /// INDEX` made, partial or not (`UniqueKey::is_index`).
     pub(crate) fn index_owner(&self, name: &str) -> Option<String> {
         let mut owner: Option<String> = None;
         self.each_schema(|table, schema| {
@@ -423,7 +423,7 @@ impl Database {
                     || schema
                         .unique_keys
                         .iter()
-                        .any(|k| !k.is_deleted && k.predicate.is_some() && k.name.eq_ignore_ascii_case(name)))
+                        .any(|k| !k.is_deleted && k.is_index() && k.name.eq_ignore_ascii_case(name)))
             {
                 owner = Some(table.to_string());
             }

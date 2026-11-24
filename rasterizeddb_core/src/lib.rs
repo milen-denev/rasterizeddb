@@ -1,3 +1,18 @@
+//! The RasterizedDB engine and server, as a library.
+//!
+//! # API stability
+//!
+//! What is stable is the server: the `rasterizeddb` binary, its flags, its
+//! wire protocols and the SQL it answers. The Rust API of this crate is the
+//! server's internals. It is published so that the server and the embedded
+//! SDK build from crates.io, and **any of it may change in any release, a
+//! patch release included**: it does not follow semver.
+//!
+//! To run the database inside an application use
+//! [`rasterizeddb_embedded`](https://docs.rs/rasterizeddb_embedded); to talk
+//! to a server, [`rasterizeddb_client`](https://docs.rs/rasterizeddb_client).
+//! Both follow semver.
+
 // The pgwire connection future nests every statement path's future, and
 // proving it `Send` walks that whole type: the default limit of 128 was met
 // exactly, so a one-line change to any statement path stopped the crate

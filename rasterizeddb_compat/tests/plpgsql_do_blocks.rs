@@ -424,15 +424,15 @@ async fn constraints_and_indexes_are_renamed() {
     assert_eq!(refused(&pool, "ALTER TABLE a1 RENAME CONSTRAINT a1_v_uq TO a2_pkey").await.0, "42P07");
     assert_eq!(refused(&pool, "ALTER INDEX a1_w_index RENAME TO a1_v_uq").await.0, "42P07");
     assert_eq!(refused(&pool, "ALTER INDEX gone RENAME TO x").await.0, "42P01");
-    // This engine's own: a key declared with its column takes its name from
-    // the table and the column, and the primary key is known by its name.
-    assert_eq!(refused(&pool, "ALTER TABLE a2 RENAME CONSTRAINT a2_pkey TO a2_pk").await.0, "0A000");
-    assert_eq!(refused(&pool, "ALTER TABLE a1 RENAME CONSTRAINT a1_pkey TO a1_pk").await.0, "0A000");
-    // A key its table's rename left behind is given the table's name again.
-    run(&pool, "ALTER TABLE a1 RENAME TO b1; ALTER TABLE b1 RENAME CONSTRAINT a1_pkey TO b1_pkey").await;
+    // A primary key takes any name, declared with its column or not
+    // (`primary_key_rename.rs` has the rest).
+    run(&pool, "ALTER TABLE a2 RENAME CONSTRAINT a2_pkey TO a2_pk").await;
+    run(&pool, "ALTER TABLE a1 RENAME CONSTRAINT a1_pkey TO a1_pk").await;
+    // And keeps it when its table is renamed, as in PostgreSQL.
+    run(&pool, "ALTER TABLE a1 RENAME TO b1; ALTER TABLE b1 RENAME CONSTRAINT a1_pk TO b1_pkey").await;
     assert_eq!(
-        rows(&pool, "SELECT conname, contype FROM pg_constraint WHERE conrelid = 'b1'::regclass AND contype = 'p'").await,
-        ["b1_pkey|p"]
+        rows(&pool, "SELECT conname, contype FROM pg_constraint WHERE conrelid IN ('b1'::regclass, 'a2'::regclass) AND contype = 'p' ORDER BY 1").await,
+        ["a2_pk|p", "b1_pkey|p"]
     );
     assert_eq!(refused(&pool, "INSERT INTO b1 VALUES (1, 99, 1)").await.0, "23505");
 }

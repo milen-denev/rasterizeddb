@@ -97,6 +97,22 @@ pub fn find_in_subquery(sql: &str) -> Option<InSubquery> {
                 while k < bytes.len() && bytes[k].is_ascii_whitespace() {
                     k += 1;
                 }
+                // `IN ((SELECT …))` is PostgreSQL's `IN (SELECT …)`: a
+                // parenthesised query, as long as each group is all the one
+                // around it holds. (`IN ((SELECT …), 3)` is a list of values.)
+                // Unread, the text reached a value parser that answered true.
+                let mut query_open = j;
+                while bytes.get(k) == Some(&b'(')
+                    && group_close(bytes, query_open)
+                        .zip(group_close(bytes, k))
+                        .is_some_and(|(outer, inner)| sql[inner + 1..outer].trim().is_empty())
+                {
+                    query_open = k;
+                    k += 1;
+                    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                }
                 if crate::core::sql_scan::starts_with_keyword(&sql[k..], "SELECT") {
                     // Match the closing parenthesis.
                     let mut depth = 1usize;
@@ -126,10 +142,11 @@ pub fn find_in_subquery(sql: &str) -> Option<InSubquery> {
                             !b.is_ascii_alphanumeric() && b != b'_' && b != b'"'
                         }))
                     .then(|| head.len() - 3);
+                    let query_close = group_close(bytes, query_open).unwrap_or(m - 1);
                     return Some(InSubquery {
                         start: j,
                         end: m,
-                        inner_sql: sql[j + 1..m - 1].trim().to_string(),
+                        inner_sql: sql[query_open + 1..query_close].trim().to_string(),
                         negated_start,
                     });
                 }
@@ -139,6 +156,30 @@ pub fn find_in_subquery(sql: &str) -> Option<InSubquery> {
         i += 1;
     }
 
+    None
+}
+
+/// The `)` closing the group opened at `open`, past quoted text.
+fn group_close(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut m = open;
+    while m < bytes.len() {
+        match bytes[m] {
+            b'\'' => {
+                m = crate::core::sql_scan::quoted_end(bytes, m, b'\'');
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(m);
+                }
+            }
+            _ => {}
+        }
+        m += 1;
+    }
     None
 }
 
@@ -271,6 +312,19 @@ fn scalar_subquery(sql: &str, correlated: bool) -> Option<InSubquery> {
                     }
                     i = open + 1;
                     continue;
+                }
+                // An `IN` list's items are values: `x IN ((SELECT …), 3)`
+                // holds a scalar subquery, though the word in front of it is
+                // still `IN`. (A lone `IN ((SELECT …))` is IN's own query.)
+                // Skipped as IN's, a correlated one was left in place and the
+                // item answered true for every row.
+                if previous_word == "IN" {
+                    let lone = bytes.get(k) == Some(&b'(')
+                        && group_close(bytes, k).is_some_and(|inner| sql[inner + 1..m - 1].trim().is_empty());
+                    if !lone {
+                        word_before_previous = std::mem::take(&mut previous_word);
+                        previous_word = ",".to_string();
+                    }
                 }
                 // Descend into the group rather than stepping over it: a
                 // subquery can sit inside ordinary parentheses, as in
@@ -541,7 +595,7 @@ pub fn find_exists(sql: &str) -> Option<ExistsClause> {
             return Some(ExistsClause {
                 start,
                 end: m,
-                inner_sql: sql[j + 1..m - 1].trim().to_string(),
+                inner_sql: hoist_outer_on_terms(sql[j + 1..m - 1].trim()),
                 negated,
             });
         }
@@ -867,10 +921,56 @@ pub(crate) const UNCORRELATED: &str = "EXISTS references no outer column";
 /// `WHERE NOT EXISTS (SELECT 1 FROM t)` — insert only if nothing matched — is a
 /// common seeding idiom.
 pub fn uncorrelated_exists(clause: &ExistsClause, outer_relations: &[String]) -> Option<String> {
+    // A set operation (`SELECT 1 EXCEPT SELECT 1`) or a select with no FROM
+    // that names no outer relation asks one question of the database: run as
+    // written, once. Read by `exists_to_in`, it was refused ("the SELECT
+    // inside EXISTS has no FROM clause").
+    let inner = clause.inner_sql.trim();
+    let set_operation = ["UNION", "INTERSECT", "EXCEPT"]
+        .iter()
+        .any(|k| crate::core::rql::join::find_keyword(inner, k, 0).is_some());
+    if set_operation || crate::core::rql::join::find_keyword(inner, "FROM", 0).is_none() {
+        let reads_outer = qualified_names(inner)
+            .iter()
+            .any(|q| outer_relations.iter().any(|o| o.eq_ignore_ascii_case(q)));
+        return (!reads_outer).then(|| inner.to_string());
+    }
     match exists_to_in(clause, outer_relations) {
         Err(e) if e == UNCORRELATED => Some(clause.inner_sql.trim().to_string()),
         _ => None,
     }
+}
+
+/// Every qualifier `q` written as `q.column` in `text`, outside quotes.
+fn qualified_names(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+                continue;
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' || c == b'"' => {
+                let start = i;
+                if c == b'"' {
+                    i = crate::core::sql_scan::quoted_end(bytes, i, b'"');
+                } else {
+                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                        i += 1;
+                    }
+                }
+                if bytes.get(i) == Some(&b'.') && (start == 0 || bytes[start - 1] != b'.') {
+                    out.push(text[start..i].trim_matches('"').to_string());
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
 }
 
 /// The predicate an uncorrelated `EXISTS` becomes once its query has run.
@@ -1127,6 +1227,141 @@ fn inner_names(relation_text: &str) -> Vec<String> {
         }
     }
     names
+}
+
+/// An `EXISTS` body whose inner joins compare with an outer column in their
+/// `ON`, with those terms moved to its `WHERE`: `FROM s JOIN t prior ON
+/// prior.sid = s.id AND prior.ix < task.ix WHERE s.id = task.sid` is `FROM s
+/// JOIN t prior ON prior.sid = s.id WHERE prior.ix < task.ix AND (s.id =
+/// task.sid)`. For an inner join the two are the same filter. Every pass that
+/// runs a correlated subquery reads its correlation from the `WHERE` only, so
+/// one left in an `ON` was run without the outer row ("missing FROM-clause
+/// entry for table \"task\"").
+///
+/// A term is outer when it names a qualifier none of the body's own relations
+/// has. An outer join's `ON` is left alone: moved, it would drop the rows the
+/// join keeps. Anything this cannot read is returned as written.
+pub(crate) fn hoist_outer_on_terms(inner: &str) -> String {
+    use crate::core::rql::join::find_keyword;
+    let Some(from_at) = find_keyword(inner, "FROM", 0) else {
+        return inner.to_string();
+    };
+    let rel_start = from_at + "FROM".len();
+    let after_from = &inner[rel_start..];
+    if find_keyword(after_from, "JOIN", 0).is_none() {
+        return inner.to_string();
+    }
+    let clause_end = |text: &str| -> usize {
+        ["WHERE", "GROUP", "HAVING", "WINDOW", "ORDER", "LIMIT", "OFFSET", "FETCH", "FOR"]
+            .iter()
+            .filter_map(|k| find_keyword(text, k, 0))
+            .min()
+            .unwrap_or(text.len())
+    };
+    let rel_len = clause_end(after_from);
+    let relation_text = &after_from[..rel_len];
+    let names: Vec<String> = inner_names(relation_text).iter().map(|n| n.to_ascii_lowercase()).collect();
+    if names.is_empty() {
+        return inner.to_string();
+    }
+    let names_outer = |term: &str| -> bool {
+        let bytes = term.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\'' => i = crate::core::sql_scan::quoted_end(bytes, i, b'\''),
+                b'"' | b'_' | b'a'..=b'z' | b'A'..=b'Z' => {
+                    let start = i;
+                    if bytes[i] == b'"' {
+                        i = crate::core::sql_scan::quoted_end(bytes, i, b'"');
+                    } else {
+                        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                            i += 1;
+                        }
+                    }
+                    if bytes.get(i) == Some(&b'.') {
+                        let qualifier = term[start..i].trim_matches('"').to_ascii_lowercase();
+                        if !names.contains(&qualifier) {
+                            return true;
+                        }
+                    }
+                    // Skip the rest of a dotted name.
+                    while i < bytes.len() && (bytes[i] == b'.' || bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                        i += 1;
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+        false
+    };
+    const JOIN_WORDS: &[&str] = &["LEFT", "RIGHT", "FULL", "OUTER", "INNER", "CROSS", "NATURAL"];
+    let mut joins: Vec<usize> = Vec::new();
+    let mut at = 0;
+    while let Some(found) = find_keyword(&relation_text[at..], "JOIN", 0) {
+        joins.push(at + found);
+        at += found + "JOIN".len();
+    }
+    // (start, end, replacement) in relation_text, and the terms moved out.
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut hoisted: Vec<String> = Vec::new();
+    for (k, &join_at) in joins.iter().enumerate() {
+        let kind = relation_text[..join_at].split_whitespace().next_back().unwrap_or("").to_ascii_uppercase();
+        if matches!(kind.as_str(), "LEFT" | "RIGHT" | "FULL" | "OUTER" | "CROSS" | "NATURAL") {
+            continue;
+        }
+        let seg_start = join_at + "JOIN".len();
+        let seg_end = joins.get(k + 1).copied().unwrap_or(relation_text.len());
+        let segment = &relation_text[seg_start..seg_end];
+        let Some(on_at) = find_keyword(segment, "ON", 0) else {
+            continue;
+        };
+        let cond_start = seg_start + on_at + "ON".len();
+        // The words that open the next join belong to it, not to this `ON`.
+        let mut cond_end = seg_end;
+        loop {
+            let head = relation_text[cond_start..cond_end].trim_end();
+            let Some(last) = head.split_whitespace().next_back() else { break };
+            if JOIN_WORDS.iter().any(|w| last.eq_ignore_ascii_case(w)) {
+                cond_end = cond_start + head.len() - last.len();
+            } else {
+                cond_end = cond_start + head.len();
+                break;
+            }
+        }
+        let cond = &relation_text[cond_start..cond_end];
+        let mut kept: Vec<String> = Vec::new();
+        let mut moved: Vec<String> = Vec::new();
+        for term in crate::core::rql::join::split_conjuncts(unwrap_parens(cond)) {
+            let term = term.trim();
+            if names_outer(term) { moved.push(term.to_string()) } else { kept.push(term.to_string()) }
+        }
+        if moved.is_empty() {
+            continue;
+        }
+        let new_cond = if kept.is_empty() { "TRUE".to_string() } else { kept.join(" AND ") };
+        edits.push((cond_start, cond_end, format!(" {} ", new_cond)));
+        hoisted.extend(moved);
+    }
+    if hoisted.is_empty() {
+        return inner.to_string();
+    }
+    let mut relation = relation_text.to_string();
+    for (start, end, replacement) in edits.into_iter().rev() {
+        relation.replace_range(start..end, &replacement);
+    }
+    let rest = &after_from[rel_len..];
+    let moved = hoisted.join(" AND ");
+    let tail = match find_keyword(rest, "WHERE", 0) {
+        Some(0) => {
+            let body = &rest["WHERE".len()..];
+            let body_end = clause_end(body).min(body.len());
+            // `clause_end` counts WHERE too; the body holds none at top level.
+            format!("WHERE {} AND ({}) {}", moved, body[..body_end].trim(), &body[body_end..])
+        }
+        _ => format!("WHERE {} {}", moved, rest),
+    };
+    format!("{}{} {}", &inner[..rel_start], relation.trim_end(), tail).trim().to_string()
 }
 
 /// Whether `term` reads a column qualified by one of the outer relations, a
@@ -1932,6 +2167,26 @@ mod correlation_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A correlation in an inner join's `ON` moves to the `WHERE`, where the
+    /// passes that run a correlated EXISTS read it; an outer join's stays.
+    #[test]
+    fn an_outer_reference_in_an_inner_join_on_moves_to_where() {
+        let norm = |s: String| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let hoisted = norm(hoist_outer_on_terms(
+            "SELECT 1 FROM s JOIN t prior ON prior.sid = s.id AND prior.ix < task.ix WHERE s.id = task.sid AND s.seq",
+        ));
+        assert_eq!(
+            hoisted,
+            "SELECT 1 FROM s JOIN t prior ON prior.sid = s.id WHERE prior.ix < task.ix AND (s.id = task.sid AND s.seq)"
+        );
+        let only = norm(hoist_outer_on_terms("SELECT 1 FROM s INNER JOIN t ON t.ix < o.ix"));
+        assert_eq!(only, "SELECT 1 FROM s INNER JOIN t ON TRUE WHERE t.ix < o.ix");
+        let outer = "SELECT 1 FROM s LEFT JOIN t ON t.ix < o.ix WHERE s.id = o.sid";
+        assert_eq!(hoist_outer_on_terms(outer), outer);
+        let local = "SELECT 1 FROM s JOIN t ON t.sid = s.id WHERE s.id = o.sid";
+        assert_eq!(hoist_outer_on_terms(local), local);
+    }
 
     #[test]
     fn a_join_inside_exists_is_carried_through() {

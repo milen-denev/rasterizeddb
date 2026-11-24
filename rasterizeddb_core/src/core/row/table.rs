@@ -3364,7 +3364,8 @@ impl<S: StorageIO> Table<S> {
     /// otherwise.
     fn column_constraint_name(&self, column: &str) -> String {
         if self.schema.primary_key.as_deref().is_some_and(|pk| pk.eq_ignore_ascii_case(column)) {
-            crate::core::rql::unique_key::pkey_name(&self.schema.name)
+            crate::core::rql::unique_key::primary_key_of(&self.schema)
+                .map_or_else(|| crate::core::rql::unique_key::pkey_name(&self.schema.name), |key| key.name)
         } else {
             crate::core::rql::unique_key::implicit_key_name(&self.schema.name, column)
         }
@@ -5001,6 +5002,26 @@ impl<S: StorageIO> Table<S> {
         self.insert_row_in_txn(row_write, FROZEN_TX).await
     }
 
+    /// The uniqueness check [`insert_row_in_txn`](Self::insert_row_in_txn)
+    /// makes, without the write: `Err` with the violation (or the in-flight
+    /// key to replay on) the insert of `row_write` would meet, `Ok` when it
+    /// would meet none. For an `INSERT` whose foreign key failed: PostgreSQL
+    /// checks a key on the row it inserted, so a row a uniqueness violation
+    /// stops (`ON CONFLICT` skipping or updating it, or 23505) never has its
+    /// key checked.
+    pub(crate) async fn insert_conflict_in_txn(&self, mut row_write: RowWrite, written_by: TxId) -> Result<()> {
+        self.data()?;
+        if !self.has_unique {
+            return Ok(());
+        }
+        // The key as the insert would compare it (`character(n)` padding).
+        self.hold_text_lengths(&mut row_write, |_| true, true)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let _write = self.unique_lock.lock(&self.unique_stripes(&row_write)).await;
+        self.check_unique(&row_write, None, &self.visibility_for(written_by), written_by, None, None)
+            .await
+    }
+
     /// Inserts a row belonging to `written_by`, visible to nobody else until it
     /// commits.
     pub async fn insert_row_in_txn(&self, mut row_write: RowWrite, written_by: TxId) -> Result<()> {
@@ -6490,8 +6511,8 @@ impl<S: StorageIO> Table<S> {
             .and_then(|m| crate::core::rql::executor::RowMarker::for_table(&self.schema, &m));
         // Applied only after each batch's commit — see `PendingFilterOp`.
         let mut pending_filters: Vec<PendingFilterOp> = Vec::new();
-        // The checks that read an expression's result, which the statement
-        // could not judge before the rows were read.
+        // Every check the assignments can change the answer of, judged
+        // against each row as it will be stored.
         let row_checks =
             crate::core::rql::executor::UpdateRowChecks::compile(&self.schema, updates, expressions);
 

@@ -524,6 +524,9 @@ async fn run_statements(
     old: &Option<Values>,
     vars: &mut Vec<(String, String, Option<String>)>,
 ) -> io::Result<Result<Option<Returned>, Failure>> {
+    // What the body raises is its statement's to send, whatever it runs
+    // between raising it and ending (`notice::hold`).
+    let _notices = crate::core::notice::hold();
     for stmt in stmts {
         match stmt {
             PlStmt::Null => {}
@@ -619,14 +622,15 @@ async fn run_statements(
                     let code = errcode.clone().filter(|c| c.len() == 5).unwrap_or_else(|| "P0001".to_string());
                     return Ok(Err((code, message)));
                 }
-                let severity: &'static str = match level.as_str() {
-                    "WARNING" => "WARNING",
-                    "INFO" => "INFO",
-                    "LOG" => "LOG",
-                    "DEBUG" => "DEBUG",
-                    _ => "NOTICE",
+                // PostgreSQL's codes: a warning is 01000, the rest 00000.
+                let (severity, code): (&'static str, &'static str) = match level.as_str() {
+                    "WARNING" => ("WARNING", "01000"),
+                    "INFO" => ("INFO", "00000"),
+                    "LOG" => ("LOG", "00000"),
+                    "DEBUG" => ("DEBUG", "00000"),
+                    _ => ("NOTICE", "00000"),
                 };
-                crate::core::notice::push(severity, "00000", message);
+                crate::core::notice::push(severity, code, message);
             }
             PlStmt::Block { body, handlers } => {
                 // A block with handlers is PostgreSQL's subtransaction: in a

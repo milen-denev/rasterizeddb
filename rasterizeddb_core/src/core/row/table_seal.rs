@@ -81,6 +81,16 @@ impl<S: StorageIO> SealParts<S> {
         self.gate.dir().map(|d| d.to_path_buf())
     }
 
+    /// Whether a structure is unready only for now: an index building, the
+    /// filter backfilling, a renumbering running. Not a filter left with
+    /// an unindexed prefix, which nothing completes.
+    fn structures_settling(&self) -> bool {
+        self.indexes.as_ref().is_some_and(|ix| !ix.is_ready())
+            || self.filters.as_ref().is_some_and(|f| {
+                !self.filters_ready.load(Ordering::Acquire) || crate::core::filter::renumbering(f.renumber_epoch())
+            })
+    }
+
     /// §3 step 3's checks of the structures themselves: the indexes and the
     /// filter complete and current. Shared by a file set's seal and a
     /// key/value table's.
@@ -392,6 +402,15 @@ impl<S: StorageIO> Table<S> {
     /// idle checkpoint, `Mandatory` for shutdown and `rdb_index_checkpoint`.
     /// A partition shell has no file set and is excluded.
     pub async fn seal_snapshot(&self, kind: SealKind) -> SealOutcome {
+        // A mandatory seal (`rdb_index_checkpoint`) meeting a filter still
+        // backfilling, or an index still building, waits for them under
+        // `seal_timeout` rather than skipping the table: skipped, its next
+        // open rebuilds. Only while maintenance runs, which is what finishes
+        // them; shutdown waits before it stops it (`seal_for_shutdown`).
+        if kind == SealKind::Mandatory {
+            let until = tokio::time::Instant::now() + crate::core::index_store::seal::settings::seal_timeout();
+            self.await_sealable(until).await;
+        }
         match self.data() {
             // A key/value table (docs/kv-partitions.md §2), under the
             // instance's maintenance: no vacuum sweep between its two reads.
@@ -401,6 +420,24 @@ impl<S: StorageIO> Table<S> {
             }
             Ok(d) => seal::seal(&**d.seal_parts(), kind).await,
             Err(_) => SealOutcome::Excluded,
+        }
+    }
+
+    /// Waits, until `until`, for this instance's indexes and filter to
+    /// settle (`SealParts::structures_settling`), while its maintenance
+    /// runs: a filter backfill and an index build finish there. Returns at
+    /// once once maintenance stopped, since nothing would finish them, and
+    /// for a table with nothing to seal.
+    pub async fn await_sealable(&self, until: tokio::time::Instant) {
+        let parts = match self.data() {
+            Ok(d) => StdArc::clone(d.seal_parts()),
+            Err(_) => return,
+        };
+        while parts.structures_settling()
+            && self.maintenance_alive.load(Ordering::Acquire)
+            && tokio::time::Instant::now() < until
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 

@@ -144,7 +144,7 @@ Every command such a client may then send is in the list above.
 **Not implemented:** Lua scripting (`EVAL`, `FUNCTION`), streams (`XADD` …),
 HyperLogLog, geo, `BITFIELD`/`BITOP`/`BITPOS`, `OBJECT FREQ` and the LFU
 policies, keyspace notifications, `CLIENT TRACKING`, `WAIT`, cluster mode,
-replication of the store, and the append-only file.
+and the append-only file.
 A command outside the list is answered with Redis's `ERR unknown command`.
 
 ## How it is built
@@ -214,6 +214,67 @@ never half loaded. With `--kv-persist` the sweeper also saves every
 `--kv-save-interval-secs` when anything changed, and a clean shutdown saves.
 That is Redis's RDB without the AOF: a crash loses what changed since the last
 save.
+
+## Replication
+
+On a node with replication on (`--replication`, see the replication module's
+docs), every write to the store, from the Redis port or from `KV` SQL, on
+any of the 16 numbered databases, is shipped to the peers over the table
+data's own link. It gets what table data gets: the same authentication, one
+stream per origin with gap-free sequence numbers, a place in the replication
+log, and catch-up for a peer that was away or behind. A peer applies the
+writes to the same database's store, in the order they ran, through the
+ordinary command code, so memory accounting, `WATCH` and blocked pops see
+them as any write. Nothing it applies is shipped again (`relay` passes them
+on as it does table data).
+
+**What ships is the effect, not the command**, by Redis's own propagation
+rules, so a peer gets the same answer whenever it applies it:
+
+- a relative lifetime (`EX`, `PX`, `SETEX`, `EXPIRE`, `GETEX` …) ships as the
+  absolute one the write left: `SET … PXAT`, `PEXPIREAT`;
+- `SPOP` ships as `SREM` of what it took, `ZPOPMIN`/`ZPOPMAX` as `ZREM`;
+- `INCRBYFLOAT` ships as `SET` of its result, `HINCRBYFLOAT` as `HSET`;
+- a blocking pop ships as the `LPOP`, `RPOP` or `LMOVE` that happened;
+- a write that wrote nothing (a failed `NX`, `WRONGTYPE`, `DEL` of a missing
+  key) ships nothing;
+- `MULTI`/`EXEC` ships as one entry, applied atomically; `FLUSHDB` and
+  `FLUSHALL` ship.
+
+**What does not ship:** expiry and eviction. Every node removes a key at its
+absolute expiry time itself, and evicts under its own `maxmemory`. Clocks that
+disagree make lifetimes end at slightly different moments on each node.
+`PUBLISH` is not replicated (subscribers hear only their own node), nor
+are settings (`CONFIG SET`) or `SAVE`.
+
+**Cost.** With replication off, a write pays one relaxed load and a read
+nothing. With it on, a write runs under its keys' shard locks held together
+(as `EXEC` does) and appends its effect to the stream before letting them go,
+so per-key order on a peer is the order the origin applied. Effects are
+coalesced, numbered into records of about 256 KiB a millisecond later, and
+released to the peers on the write-ahead log's next durable round, as a
+`synchronous_commit = off` commit is: a cache write never waits for a sync or
+for a peer, whatever `REPLICATION SET mode` says. A write whose effect
+would exceed what one record may carry (about 24 MB) is refused on a
+replicating node. A peer applies a record's single-key writes on up to four
+threads, each key's in order, and anything touching several keys alone. As
+for table data, a peer that applies more slowly than its origin writes, for
+longer than the origin's log retention covers (`--replication-retention-mb`;
+an in-memory node keeps its log in memory, up to four times that budget),
+falls out of the stream and has to be reseeded. `SHOW REPLICATION STATS`
+counts `kv_effects`, `kv_records`, `kv_applied` and `kv_apply_errors`.
+
+**It is a multi-primary cache.** Each node takes writes; there is no conflict
+resolution beyond arrival order. A command that fails on a peer (a `WRONGTYPE`
+after two nodes wrote one key as different types) is counted in
+`kv_apply_errors` and skipped, never halting the stream. Two nodes writing the
+same key at the same time can be left holding different values; write a key
+from one node at a time if that matters. A node restarted without a snapshot
+comes back empty and receives only the writes after the position it had
+applied: replication carries what happens, not what is. All nodes
+must run a build that understands key/value records before key/value writes
+are made on a replicating node; an older peer reads them as unparsable
+statements.
 
 ## Performance
 

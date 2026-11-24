@@ -588,8 +588,71 @@ filtered and evaluated by the same paths as anything else, and a cascade that
 triggers another cascade works by recursion rather than a second mechanism. A
 cycle is caught by a depth limit rather than recursing forever.
 
-Composite keys are refused outright: enforcing one column of a two-column key
-would enforce something weaker than what was declared.
+**Composite keys** (`FOREIGN KEY (a, b) REFERENCES p (x, y)`, as a table
+constraint, named or not, in `CREATE TABLE` or `ALTER TABLE … ADD`) are
+enforced on the tuple, never column by column: a row references the one
+parent row holding all of its key values at once.
+
+- `REFERENCES p` with no column list is `p`'s primary key, composite or not.
+- The referenced columns must be exactly some `UNIQUE` or `PRIMARY KEY` of
+  `p`, in any order (`REFERENCES p (y, x)` against `PRIMARY KEY (x, y)` is
+  accepted, as PostgreSQL accepts it); otherwise 42830, "there is no unique
+  constraint matching given keys for referenced table". Lists of different
+  lengths are 42830 too ("number of referencing and referenced columns for
+  foreign key disagree"), a referenced column listed twice 42830, a missing
+  column 42703, and each pair's types are judged as a one-column key's are
+  (42804). This is stricter than the one-column rule below, on purpose.
+- `MATCH SIMPLE` (the default): a row with any key column NULL is exempt.
+  `MATCH FULL`: the key's columns are all NULL or none is, else 23503 with
+  PostgreSQL's "MATCH FULL does not allow mixing of null and nonnull key
+  values". `MATCH PARTIAL` is 0A000, as in PostgreSQL.
+- Checked on `INSERT` (multi-row, `ON CONFLICT`, `INSERT … SELECT`, `COPY`),
+  on `UPDATE` (each written row's new tuple, an unassigned column keeping its
+  value), by `ADD` over the rows already there (23503) unless `NOT VALID`,
+  and by `VALIDATE CONSTRAINT`. A key onto the table itself is asked at the
+  end of the statement, as a one-column one is.
+- The parent's `DELETE`, and an `UPDATE` that moves a referenced tuple, act
+  on the referencing rows whole: `NO ACTION` and `RESTRICT` refuse (23503)
+  while a child still references the tuple; `CASCADE` deletes the children,
+  or moves each to its parent's new tuple (pairs that chain in one statement
+  are applied as the children were); `SET NULL` and `SET DEFAULT` set every
+  key column, or, for `ON DELETE`, only the ones listed (PostgreSQL 15's
+  `ON DELETE SET NULL (b)`; a list on `ON UPDATE` is 0A000, as there). A
+  default that names no parent is 23503, as is a `MATCH FULL` key whose
+  `SET NULL (b)` leaves a mix of NULLs. The violation names the tuple:
+  `key (a, b)=(2, 2) is not present in table "p"`.
+- Dependencies follow PostgreSQL: the `UNIQUE` or `PRIMARY KEY` a key
+  references (its columns in any order) is not dropped without `CASCADE`
+  (2BP01), which drops the key; neither is a referenced column; dropping a
+  referencing column drops the key; `RENAME COLUMN` and `RENAME TO` on
+  either side keep it working; `DROP TABLE parent CASCADE` drops it.
+- Catalogues: `pg_constraint.conkey`/`confkey` list the columns in key
+  order and `confmatchtype` is `s` or `f`; `pg_get_constraintdef` (and so
+  psql's `\d` and `pg_dump`) writes `FOREIGN KEY (a, b) REFERENCES p(x, y)
+  [MATCH FULL] … [ON DELETE SET NULL (b)]`, every name quoted (PostgreSQL
+  quotes only where it must); `information_schema.key_column_usage`,
+  `referential_constraints` and `table_constraints` list the keys
+  (`table_constraints` leaves out PostgreSQL's `NOT NULL` rows). A dump
+  restores the key, here and on PostgreSQL. The PostgreSQL import carries a
+  composite key over whole, with `MATCH FULL` and an `ON DELETE SET` list
+  (`confdelsetcols`), where it used to leave it out with a note.
+- An unnamed key is `<table>_<a>_<b>_fkey`, numbered on a collision.
+- On and onto hash-partitioned tables, as PostgreSQL 17 runs them with
+  declarative partitions: a partitioned table's key onto a plain or a
+  partitioned parent, and a plain table's key onto a partitioned one,
+  declared inline, by `ADD` (validated in every partition), or carried by a
+  conversion (`ALTER TABLE … PARTITION BY`, `CREATE INDEX … USING
+  partition`), so a `pg_dump` of such a layout restores. The referenced
+  columns are a unique key of the parent, which holds every partition key
+  column, so each parent lookup hashes the tuple's partition key values and
+  reads the one partition they route to, never every partition (a key
+  naming a partitioned parent by columns missing one of its partition key
+  columns is 42830, and a check of one written behind the DDL is refused,
+  0A000, never skipped). Every check, action, dependency and catalogue row
+  above holds there too; an action that changes a partitioned child's
+  partition key moves its rows to their new partition. The pair of tables
+  in `docs/partitioning.md` ("Composite keys on partitioned tables") is the
+  `pms` layout this was built for.
 
 Since the partitioning work's phase 3 P4 (`docs/partitioning.md`, "Phase 3 P4
 as built") foreign keys also run to and from hash-partitioned tables, and:
@@ -621,6 +684,39 @@ insert's check names it); identifiers are not case-folded.
 
 ### Release note: foreign keys from older binaries
 
+**Composite keys and older binaries.** A composite key is stored in the same
+sidecar as every other key (`<table>_schema_FK.db`, fixed 519-byte records),
+as one record per column pair, back to back, its first pair first. A
+one-column key's record is unchanged, so every existing database reads back
+as it was. What a composite key adds lives in the spare 129th byte of each
+name slot, which no build ever read as part of a name: a flag byte (this
+record is a pair of a composite key; `MATCH FULL`), the pair's position, the
+key's pair count, and whether `ON DELETE SET … (cols)` names the pair's
+column.
+
+An older binary must never read such a key as something weaker (say, a
+one-column key on `a` alone), so two things stand in its way:
+
+1. **It refuses to open the directory.** The first composite key written
+   sets the `composite_foreign_key_v1` flag in the database's
+   `incompat_features` file, durably and before its records; every binary
+   since that file exists (2026-10-23; every release from 1.0.0-rc.1 on)
+   refuses, at open and before it touches anything, a directory carrying a
+   flag it does not know, naming it. A directory that holds a composite key
+   without the flag (a point-in-time restore, a replica, both of which bring
+   the records and not the flag) is fenced again by this binary when it
+   reads the table's schema, and by a restore before it hands the directory
+   over.
+2. **A binary older than the fence still fails loudly.** Each pair's
+   referenced column is stored after a `\x01` marker byte. A build that
+   knows foreign keys but not `incompat_features` (development builds of
+   2026-08-26 to 2026-10-23; no release) reads every pair as a one-column
+   key onto a column named `"\x01x"`, which no table has: an insert or
+   update giving the column a value, and a `DELETE` of the parent, fail
+   naming that column instead of enforcing `a` against `x` alone. An
+   `UPDATE` of the parent's key is the one statement such a build lets
+   through unchecked.
+
 What a database written by an older binary holds, read by this one:
 
 - **An unnamed key keeps the name it was stored under**, `fk_<column>_<parent>`
@@ -650,7 +746,11 @@ passes, so `CHECK (x > 0)` and `CHECK (x IS NULL OR x > 0)` both take a NULL
 `x`. It is judged on `INSERT`, on `UPDATE` (against the row as it will be
 stored) and over the stored rows by `ALTER TABLE … ADD CONSTRAINT … CHECK`,
 all three the same way: a row violates the check when `NOT (check)` holds,
-evaluated as a `WHERE` clause would be.
+evaluated as a `WHERE` clause would be. An `UPDATE` is judged on the rows it
+writes, so one that matches no row breaks no check. A row that breaks several
+checks is reported under the first by name, as PostgreSQL reports it, and an
+unnamed check takes PostgreSQL's name (`t_check`, `t_check1`,
+`t_<column>_check`).
 
 Accepted forms include what `pg_dump` writes — `((status = ANY
 (ARRAY['a'::text, 'b'::text])))`, a varchar column's `((status)::text = ANY
@@ -760,8 +860,9 @@ either side (`u.tid = t.id::bigint`, `::numeric(10,1)`), or, in `UPDATE …
 FROM`, name the target beside its source; a cast keeps its type modifier
 there (`::varchar(1)`, `::char(2)`, `::timestamp(0)`, `::interval(3)`), as it
 does everywhere. One that compares an outer
-column under arithmetic (`u.x = t.x + 1`), or an `EXISTS` used as a value
-(`x - EXISTS (…)::int`), is refused with 0A000.
+column under arithmetic (`u.x = t.x + 1`) is answered too, and so is an
+`EXISTS` used as a value (`x - EXISTS (…)::int`), as the count it asks
+about.
 
 ### NUMERIC results and display scale
 
@@ -798,9 +899,9 @@ tied values gives the later one, as PostgreSQL's `numeric_larger` does.
 
 Such a column's slot is seventeen bytes (the value and its scale); the
 field's recorded width says which format a column holds, and one column never
-mixes them. `CREATE TABLE`, `ALTER TABLE … ADD COLUMN`, a partitioned table,
-pg-import and a CTE or derived table make every new unconstrained `NUMERIC`
-column this way (`CREATE TABLE … AS` and `SELECT INTO` are not supported yet).
+mixes them. `CREATE TABLE`, `CREATE TABLE … AS`, `SELECT INTO`, `ALTER TABLE … ADD
+COLUMN`, a partitioned table, pg-import and a CTE or derived table make every
+new unconstrained `NUMERIC` column this way.
 Range predicates on such a column are not pruned by zone maps yet; equality
 is pruned by the filter index, and both B-tree and hash indexes key it.
 
@@ -816,8 +917,8 @@ failure part-way leaves the old column, `database/rewrite.rs`). Each value
 keeps its value and is shown at the places it needs (1.500000000 becomes
 1.5; the scale it was written with was never stored). Any other rewrite of
 the table converts it the same way: an `ADD COLUMN` on a table with rows,
-`DROP NOT NULL`. A partitioned table is not rewritten yet, so its old columns
-stay as they are.
+`DROP NOT NULL`. A partitioned table is rewritten the same way, every
+partition in one step (`Database::rewrite_partitioned`).
 
 `ALTER COLUMN c TYPE NUMERIC(p, s)` over an unconstrained column, a scale
 change of a `NUMERIC(p, s)` column, a narrower precision, and `TYPE NUMERIC`
@@ -1434,7 +1535,13 @@ sequences, views, triggers, `MERGE`, `DO` blocks, `PREPARE`/`EXECUTE`,
 `RIGHT`/`FULL`/`CROSS JOIN`, `JOIN … USING`, `NATURAL JOIN`,
 `ROLLUP`/`CUBE`/`GROUPING SETS`, `WITH RECURSIVE`, a column list on a table
 alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
-`::regtype` and `to_regclass` all run now and are no longer gaps. What is still missing:
+`::regtype` (a name, a name with a modifier, an oid written as a number, an
+enum's or a domain's name; 42704 for a name no type has), `to_regclass`,
+`CREATE TABLE … AS` over a `SELECT`, `TABLE`, `VALUES` or a parenthesised
+query, `pg_get_viewdef`, and a set operation whose branches are in
+parentheses (with correlated subqueries or `EXISTS` in them, as a group
+`(a UNION b) INTERSECT c`, as a CTE's body, a derived table or an `INSERT`'s
+source) all run now and are no longer gaps. What is still missing:
 
 - **Types**: `CREATE TYPE` for composites and ranges (enums work, see
   "Enum types" above), multirange types (`int4multirange`), multidimensional
@@ -1442,12 +1549,28 @@ alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
   NUMERIC `NaN`. A `money` value prints as a plain number (`12.5`), where
   PostgreSQL prints `$12.50`. `'nosuch'::regclass` is not refused (42P01 in
   PostgreSQL): a sequence's name is not known to the text pass that reads
-  the cast.
+  the cast. `::regtype` over a column (`atttypid::regtype`) is the type's
+  name, and sorts and compares by its oid as in PostgreSQL, except as an
+  `ORDER BY` key of a grouped or `DISTINCT` query or a set operation, which
+  is refused
+  (0A000) rather than sorted by the name. The same over an expression, a
+  call or an earlier cast (`(a + 1)::regtype`, `f(a)::regtype`,
+  `a::int::regtype`).
 - **DDL**: `CREATE TABLE … (LIKE t INCLUDING …)`, `UNIQUE NULLS NOT DISTINCT`,
   `PARTITION BY RANGE`/`LIST` (tables partition by `HASH` only), and
   `UPDATE … SET a[1] = …`.
-- **Queries**: a row compared with a correlated subquery (`(a, b) IN (SELECT …
-  WHERE u.k = t.k)`; an uncorrelated one works), an outer column
+- **Queries**: a set operation of a `date` column and a `timestamp` column
+  is refused (0A000; cast the date, `d::timestamp`), where PostgreSQL makes
+  the date a timestamp; a string constant in the *first* branch beside a
+  typed column of a later one (`SELECT '5' UNION ALL SELECT i FROM t`) is
+  refused (0A000; write `'5'::integer`), where PostgreSQL reads it as that
+  type (in a later branch it is read so here too); values of different type
+  families are refused as in PostgreSQL (42804), two columns before any row
+  is read, a `*`'s, a join's or an expression's when the rows meet (over
+  empty input such a statement answers); of two equal `NUMERIC` values
+  written at different scales,
+  `INTERSECT` shows the first branch's digits (`2.25`) where PostgreSQL may
+  show the other's (`2.2500`); an outer column
   named bare where the subquery's relations are not all known (a CTE, a
   function in `FROM`, `SELECT *` in a derived table) or two outer relations
   have it, `TABLESAMPLE … REPEATABLE` (0A000: the sample is drawn anew on
@@ -1456,7 +1579,10 @@ alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
   the `SEARCH`/`CYCLE` clauses of a recursive CTE, `FOR UPDATE`
   on a table with no unique column, and a `WINDOW` clause inside a subquery
   (the outermost one works).
-- **Functions**: the ordered-set aggregates (`percentile_cont`,
+- **Functions**: `pg_get_viewdef` answers the view's query as it was
+  written (what `pg_views.definition` shows), where PostgreSQL prints its own
+  layout of it, one select item to a line; the pretty flag and the wrap
+  column change nothing. The ordered-set aggregates (`percentile_cont`,
   `percentile_disc`, `mode`), `json_object_agg`/`jsonb_object_agg`,
   `regexp_matches` and `regexp_split_to_table` in a select list, the
   `jsonb_path_*` functions, `row_to_json`, `to_number`, `date_bin`, the XML

@@ -23,6 +23,13 @@
 //! node that took it, that node's sequence number, and a hybrid logical clock
 //! reading. See [`protocol::TxnRecord`] for why statements rather than pages.
 //!
+//! The key/value cache's writes travel on the same stream, in records flagged
+//! [`protocol::FLAG_KV`]: each carries many writes' effects, coalesced over a
+//! millisecond, numbered and logged like any record, and released once the
+//! write-ahead log is durable past them. They are applied in arrival order
+//! whatever the conflict policy, and a command that fails on apply is counted
+//! and skipped. See `core::kv_cache::repl`.
+//!
 //! # The pieces
 //!
 //! | Module | What it owns |
@@ -150,3 +157,5 @@ pub(crate) mod test_support {
 mod tests;
 #[cfg(test)]
 mod hardening_tests;
+#[cfg(test)]
+mod catalog_tests;

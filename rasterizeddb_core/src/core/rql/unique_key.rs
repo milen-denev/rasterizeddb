@@ -46,6 +46,16 @@
 //! [`crate::core::index::for_schema`]) holds every row, so the planner may use
 //! it for any query, as it would any other index: it can never miss a row a
 //! query asks for.
+//!
+//! # A unique index is not a constraint
+//!
+//! `CREATE UNIQUE INDEX` is kept as a key too, and PostgreSQL tells the two
+//! apart: an index has no `pg_constraint` row, `DROP INDEX` drops it, and
+//! `ALTER TABLE … DROP CONSTRAINT` does not know it (42704). A key records
+//! which it was ([`UniqueKey::from_index`]) in the last byte of its name slot,
+//! which a name never reaches (at most 128 bytes, then a NUL that a reader
+//! never needs). A build that predates the mark ignores the byte and reads the
+//! key as a constraint, which is what every key written before the mark is.
 
 use std::io;
 
@@ -76,6 +86,26 @@ const FLAG_DELETED: u8 = 1;
 const FLAG_PARTIAL: u8 = 2;
 const FLAG_PREDICATE: u8 = 3;
 
+/// Where a key's record says what it is: the last byte of the name slot,
+/// which [`write_name`] never fills. One byte, one of the three values
+/// below; a build that predates it reads the name up to its NUL and nothing
+/// here.
+const ORIGIN_AT: usize = 128;
+/// A constraint (`UNIQUE`, or a primary key from before [`ORIGIN_PRIMARY`]):
+/// what every record written before the byte was used holds there.
+const ORIGIN_CONSTRAINT: u8 = 0;
+/// Made by `CREATE UNIQUE INDEX` ([`UniqueKey::from_index`]).
+const ORIGIN_INDEX: u8 = 1;
+/// The table's primary key ([`UniqueKey::primary`]).
+const ORIGIN_PRIMARY: u8 = 2;
+
+/// The words [`crate::core::rql::lexer_alter::unique_index_as_constraint`]
+/// writes after a key's column list to say the key is an index: `ALTER TABLE
+/// t ADD CONSTRAINT i UNIQUE (a) AS INDEX`. Not PostgreSQL syntax, like the
+/// `WHERE` a partial key carries; it travels with the statement's text, so a
+/// replica keeps the mark too.
+pub const AS_INDEX: &str = "AS INDEX";
+
 /// One table-level `UNIQUE` constraint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UniqueKey {
@@ -89,6 +119,22 @@ pub struct UniqueKey {
     pub predicate: Option<String>,
     /// The predicate compiled against the table's columns, made on first use.
     pub compiled: CompiledPredicate,
+    /// Made by `CREATE UNIQUE INDEX` rather than declared as a constraint:
+    /// `DROP INDEX` drops it, `DROP CONSTRAINT` does not know it, and the
+    /// catalogues list an index with no constraint. A key stored before the
+    /// mark existed reads `false`, a constraint, as it always did.
+    pub from_index: bool,
+    /// The table's primary key, whatever it is called.
+    ///
+    /// A primary key used to be told from a UNIQUE by its name,
+    /// `<table>_pkey`, alone, so it could not be renamed and a composite one
+    /// could not be given a name of its own. Kept in the record's origin
+    /// byte ([`ORIGIN_PRIMARY`]), which a build that predates it does not
+    /// read: it sees the name, the columns and a live UNIQUE, and enforces
+    /// the key. A record written before the mark has none, and is still
+    /// known by its name ([`primary_key_of`]). Never set with
+    /// [`Self::from_index`]: a key is one or the other.
+    pub primary: bool,
 }
 
 /// A partial key's predicate, compiled once per loaded schema.
@@ -166,7 +212,16 @@ impl UniqueKey {
             is_deleted: false,
             predicate: None,
             compiled: CompiledPredicate::default(),
+            from_index: false,
+            primary: false,
         }
+    }
+
+    /// Whether `DROP INDEX` drops this key: one `CREATE UNIQUE INDEX` made. A
+    /// partial key always counts, as one written before the mark existed
+    /// still is: only `CREATE UNIQUE INDEX` ever made one.
+    pub fn is_index(&self) -> bool {
+        self.from_index || self.predicate.is_some()
     }
 
     /// The predicate, compiled against `fields`; `Ok(None)` for a key that
@@ -438,6 +493,14 @@ impl UniqueKey {
     pub fn into_vec(&self) -> Vec<u8> {
         let mut out = vec![0u8; UNIQUE_KEY_SIZE as usize];
         write_name(&mut out, 0, &self.name);
+        // A primary key is no index's key: the one byte says one thing.
+        out[ORIGIN_AT] = if self.primary {
+            ORIGIN_PRIMARY
+        } else if self.from_index {
+            ORIGIN_INDEX
+        } else {
+            ORIGIN_CONSTRAINT
+        };
         for (i, column) in self.columns.iter().take(MAX_COLUMNS).enumerate() {
             write_name(&mut out, 129 + i * 129, column);
         }
@@ -529,6 +592,8 @@ fn decode(raw: &[u8]) -> Result<Record, String> {
         is_deleted: flag != FLAG_LIVE && flag != FLAG_PARTIAL,
         predicate: (flag == FLAG_PARTIAL).then(String::new),
         compiled: CompiledPredicate::default(),
+        from_index: raw[ORIGIN_AT] == ORIGIN_INDEX,
+        primary: raw[ORIGIN_AT] == ORIGIN_PRIMARY,
     }))
 }
 
@@ -675,6 +740,17 @@ pub fn stage<S: StorageIO>(
 /// fixed-stride array. A partial key's predicate record stays too; with the key
 /// tombstoned, `load` no longer pairs it with anything.
 pub async fn remove<S: StorageIO>(schema_io: Arc<S>, name: &str) -> io::Result<bool> {
+    remove_matching(schema_io, name, |_| true).await
+}
+
+/// [`remove`], of a key `which` accepts only: `DROP CONSTRAINT` leaves a key
+/// `CREATE UNIQUE INDEX` made, and `DROP INDEX` a constraint, though the two
+/// share a sidecar.
+pub async fn remove_matching<S: StorageIO>(
+    schema_io: Arc<S>,
+    name: &str,
+    which: impl Fn(&UniqueKey) -> bool,
+) -> io::Result<bool> {
     let io = schema_io.create_new(sidecar_name(&schema_io)).await;
     let len = io.get_len().await;
     if len < UNIQUE_KEY_SIZE {
@@ -696,7 +772,7 @@ pub async fn remove<S: StorageIO>(schema_io: Arc<S>, name: &str) -> io::Result<b
         let Ok(mut key) = UniqueKey::from_vec(&buffer) else {
             continue;
         };
-        if key.is_deleted || !key.name.eq_ignore_ascii_case(name) {
+        if key.is_deleted || !key.name.eq_ignore_ascii_case(name) || !which(&key) {
             continue;
         }
         key.is_deleted = true;
@@ -833,6 +909,59 @@ fn stored_name_within(name: &str, limit: usize) -> String {
         len -= 1;
     }
     name[..len].to_string()
+}
+
+/// A table's primary key: what it is called, its columns in key order, and
+/// whether it is the column's own (`id INT PRIMARY KEY`: the header's
+/// column and its UNIQUE flag, with no record and so no name but the
+/// table's).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrimaryKey {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub inline: bool,
+}
+
+/// The primary key of `schema`, the one answer every reader asks for: the
+/// catalogues, the indexes, a duplicate's message, the foreign-key and
+/// partitioning rules, `DROP` and `RENAME CONSTRAINT`.
+///
+/// - the key record marked primary ([`UniqueKey::primary`]), under whatever
+///   name it has;
+/// - else the header's column: declared with the column, `<table>_pkey`;
+///   declared at table level before the mark existed, the record over that
+///   column (the one called `<table>_pkey` first);
+/// - else, with no header column, the record called `<table>_pkey`: a
+///   composite key from before the mark.
+pub fn primary_key_of(schema: &crate::core::row::schema::TableSchema) -> Option<PrimaryKey> {
+    primary_key_of_named(schema, &schema.name)
+}
+
+/// [`primary_key_of`] for a schema known as `table`.
+pub fn primary_key_of_named(schema: &crate::core::row::schema::TableSchema, table: &str) -> Option<PrimaryKey> {
+    // A key `CREATE UNIQUE INDEX` made is an index, never the primary key,
+    // whatever it is called and whichever column it is over.
+    let whole = || schema.unique_keys.iter().filter(|k| !k.is_deleted && !k.is_index());
+    if let Some(key) = whole().find(|k| k.primary) {
+        return Some(PrimaryKey { name: key.name.clone(), columns: key.columns.clone(), inline: false });
+    }
+    let pkey = pkey_name(table);
+    let Some(column) = schema.primary_key.clone() else {
+        return whole()
+            .find(|k| k.name.eq_ignore_ascii_case(&pkey))
+            .map(|k| PrimaryKey { name: k.name.clone(), columns: k.columns.clone(), inline: false });
+    };
+    let inline = schema.fields.iter().any(|f| !f.is_deleted && f.is_unique && f.name.eq_ignore_ascii_case(&column));
+    if inline {
+        return Some(PrimaryKey { name: pkey, columns: vec![column], inline: true });
+    }
+    let on_column = |k: &&UniqueKey| k.columns.len() == 1 && k.columns[0].eq_ignore_ascii_case(&column);
+    let name = whole()
+        .filter(on_column)
+        .find(|k| k.name.eq_ignore_ascii_case(&pkey))
+        .or_else(|| whole().find(on_column))
+        .map_or(pkey, |k| k.name.clone());
+    Some(PrimaryKey { name, columns: vec![column], inline: false })
 }
 
 /// The name of `table`'s primary key when it was not given one:
@@ -972,6 +1101,14 @@ pub fn parse_clause(clause: &str, table: &str) -> Result<Option<UniqueKey>, Stri
     // `UNIQUE (…) WHERE pred` is the form `CREATE UNIQUE INDEX … WHERE pred`
     // is rewritten into: a partial key.
     let tail = rest[close + 1..].trim();
+    // `… (cols) AS INDEX`, right after the columns: what `CREATE UNIQUE
+    // INDEX` is rewritten into. Taken off before the `WHERE` is looked for,
+    // which must start what is left: left on, the predicate was not read and
+    // a partial index held over every row.
+    let (tail, from_index) = match strip_as_index(tail) {
+        Some(after) => (after, true),
+        None => (tail, false),
+    };
     let where_at = crate::core::rql::join::find_keyword(tail, "WHERE", 0);
     nulls_clause(&tail[..where_at.unwrap_or(tail.len())])?;
     let predicate = match where_at {
@@ -1003,9 +1140,26 @@ pub fn parse_clause(clause: &str, table: &str) -> Result<Option<UniqueKey>, Stri
         }
     });
     Ok(Some(UniqueKey {
+        primary: predicate.is_none() && !from_index && rest_upper.starts_with("PRIMARY KEY"),
         predicate,
+        from_index,
         ..UniqueKey::new(name, columns)
     }))
+}
+
+/// What follows [`AS_INDEX`] when `text` starts with it (as words, in any
+/// case), trimmed.
+fn strip_as_index(text: &str) -> Option<&str> {
+    let after_as = text.get(..2).filter(|w| w.eq_ignore_ascii_case("AS")).map(|_| &text[2..])?;
+    if !after_as.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let after_as = after_as.trim_start();
+    let rest = after_as.get(..5).filter(|w| w.eq_ignore_ascii_case("INDEX")).map(|_| &after_as[5..])?;
+    if !(rest.is_empty() || rest.starts_with(char::is_whitespace)) {
+        return None;
+    }
+    Some(rest.trim_start())
 }
 
 /// Refuses `NULLS NOT DISTINCT` in the words around a key's column list.
@@ -1025,7 +1179,7 @@ fn nulls_clause(words: &str) -> Result<(), String> {
 /// The offset of the `)` closing the `(` that `text` starts with, outside
 /// quotes. The first `)` is not it: `pg_dump` writes an expression index as
 /// `(lower(email))`.
-fn list_close(text: &str) -> Option<usize> {
+pub(crate) fn list_close(text: &str) -> Option<usize> {
     let mut depth = 0usize;
     let mut quote: Option<char> = None;
     for (i, c) in text.char_indices() {
@@ -1049,7 +1203,7 @@ fn list_close(text: &str) -> Option<usize> {
 }
 
 /// `text` split at its top-level commas, outside quotes and parentheses.
-fn split_items(text: &str) -> Vec<&str> {
+pub(crate) fn split_items(text: &str) -> Vec<&str> {
     let mut items = Vec::new();
     let (mut depth, mut start) = (0usize, 0usize);
     let mut quote: Option<char> = None;
@@ -1162,6 +1316,46 @@ mod tests {
             ],
         );
         assert_eq!(UniqueKey::from_vec(&key.into_vec()).unwrap(), key);
+    }
+
+    /// The mark `CREATE UNIQUE INDEX` leaves, in the byte after a name's
+    /// longest form: it round-trips, a key without it reads as a constraint
+    /// (every key written before it), and a reader that predates it reads
+    /// the same name and columns, a 128-byte name included.
+    #[test]
+    fn the_index_mark_round_trips_and_older_readers_ignore_it() {
+        let long = "n".repeat(128);
+        for name in ["ix", long.as_str()] {
+            let index = UniqueKey { from_index: true, ..UniqueKey::new(name.to_string(), vec!["a".into(), "b".into()]) };
+            let bytes = index.into_vec();
+            assert_eq!(bytes[ORIGIN_AT], ORIGIN_INDEX);
+            let back = UniqueKey::from_vec(&bytes).unwrap();
+            assert!(back.from_index && back.is_index(), "{name}");
+            assert_eq!((back.name.as_str(), back.columns.as_slice()), (name, index.columns.as_slice()));
+            // Without the mark: the bytes a build before it wrote.
+            let constraint = UniqueKey { from_index: false, ..index.clone() };
+            let old = constraint.into_vec();
+            assert_eq!(old[ORIGIN_AT], 0);
+            assert!(!UniqueKey::from_vec(&old).unwrap().from_index && !UniqueKey::from_vec(&old).unwrap().is_index());
+            // Only that byte differs, and it is past every name's end, so an
+            // older reader (the name up to its NUL, or 128 bytes) is unmoved.
+            let differ: Vec<usize> = (0..bytes.len()).filter(|&i| bytes[i] != old[i]).collect();
+            assert_eq!(differ, vec![ORIGIN_AT]);
+            assert_eq!(read_name(&bytes, 0).unwrap(), name);
+            // A tombstone keeps it; a partial key is an index either way.
+            let dropped = UniqueKey::from_vec(&UniqueKey { is_deleted: true, ..index.clone() }.into_vec()).unwrap();
+            assert!(dropped.is_deleted && dropped.from_index);
+        }
+        assert!(UniqueKey { predicate: Some("a > 0".into()), ..UniqueKey::new("p".into(), vec!["a".into()]) }.is_index());
+        // The clause the rewrite writes, and only that.
+        assert!(parsed("CONSTRAINT ix UNIQUE (a, b) AS INDEX").from_index);
+        assert!(parsed("CONSTRAINT ix UNIQUE (a) as index WHERE b IS NULL").from_index);
+        assert_eq!(parsed("CONSTRAINT ix UNIQUE (a) AS INDEX WHERE b IS NULL").predicate.as_deref(), Some("b IS NULL"));
+        assert!(!parsed("CONSTRAINT c UNIQUE (a, b)").from_index);
+        assert!(!parsed("UNIQUE (a) WHERE note = 'AS INDEX'").from_index);
+        assert!(!parsed("UNIQUE (a) WHERE note IS NULL").from_index);
+        assert!(parse_clause("CONSTRAINT ix UNIQUE (a) AS INDEX NULLS NOT DISTINCT", "t").is_err());
+        assert!(!parsed("CONSTRAINT ix UNIQUE (a) AS INDEXES").from_index);
     }
 
     #[test]
@@ -1608,13 +1802,15 @@ mod stored_name_tests {
                 is_deleted: false,
                 predicate: None,
                 compiled: Default::default(),
+                from_index: false,
+                primary: false,
             };
             let back = UniqueKey::from_vec(&key.into_vec()).unwrap();
             assert_eq!((back.name.as_str(), back.columns.as_slice()), (name, key.columns.as_slice()), "{name}");
         }
         // Cut within 128 bytes at a character boundary, never inside one.
         let long = "名".repeat(50);
-        let key = UniqueKey { name: long.clone(), columns: vec!["c".into()], is_deleted: false, predicate: None, compiled: Default::default() };
+        let key = UniqueKey { name: long.clone(), columns: vec!["c".into()], is_deleted: false, predicate: None, compiled: Default::default(), from_index: false, primary: false };
         let back = UniqueKey::from_vec(&key.into_vec()).unwrap();
         assert!(long.starts_with(&back.name) && back.name.len() <= 128 && back.name.len() % 3 == 0);
         for (given, name, if_exists) in [
@@ -1626,5 +1822,117 @@ mod stored_name_tests {
         ] {
             assert_eq!(dropped_constraint(given).unwrap(), (name.to_string(), if_exists), "{given}");
         }
+    }
+}
+
+#[cfg(test)]
+mod primary_key_tests {
+    use super::*;
+    use crate::core::db_type::DbType;
+    use crate::core::row::schema::{SchemaField, TableSchema};
+
+    fn schema(header: Option<&str>, unique_columns: &[&str], keys: Vec<UniqueKey>) -> TableSchema {
+        let mut schema = TableSchema::new("t".to_string(), false);
+        for (at, name) in ["id", "a", "b"].into_iter().enumerate() {
+            let mut field = SchemaField::new(name.to_string(), DbType::I32, 4, 0, at as u64, unique_columns.contains(&name));
+            field.is_unique = unique_columns.contains(&name);
+            schema.fields.push(field);
+        }
+        schema.primary_key = header.map(str::to_string);
+        schema.unique_keys = keys;
+        schema
+    }
+
+    fn key(name: &str, columns: &[&str], primary: bool) -> UniqueKey {
+        UniqueKey { primary, ..UniqueKey::new(name.to_string(), columns.iter().map(|c| c.to_string()).collect()) }
+    }
+
+    /// The mark is the byte after the name. A record written before it is
+    /// read unmarked, and one written with it reads to an older build as the
+    /// same name, columns and live key.
+    #[test]
+    fn the_mark_is_kept_beside_the_name_and_costs_an_older_reader_nothing() {
+        let marked = key("orders_primary", &["id"], true);
+        let raw = marked.into_vec();
+        assert_eq!(raw[ORIGIN_AT], ORIGIN_PRIMARY);
+        assert_eq!(UniqueKey::from_vec(&raw).unwrap(), marked);
+        // The byte says one of three things, each read back as written: a
+        // constraint, a key `CREATE UNIQUE INDEX` made, the primary key.
+        let constraint = key("u", &["a"], false);
+        let index = UniqueKey { from_index: true, ..key("ix", &["a"], false) };
+        for (record, byte) in [(&constraint, ORIGIN_CONSTRAINT), (&index, ORIGIN_INDEX), (&marked, ORIGIN_PRIMARY)] {
+            let raw = record.into_vec();
+            assert_eq!(raw[ORIGIN_AT], byte, "{}", record.name);
+            let back = UniqueKey::from_vec(&raw).unwrap();
+            assert_eq!((back.primary, back.from_index), (record.primary, record.from_index), "{}", record.name);
+        }
+        // A primary key is no index's key, and an index's is no primary key:
+        // the two marks shared a byte and a value once, and an index read
+        // as the table's primary key.
+        let read = UniqueKey::from_vec(&marked.into_vec()).unwrap();
+        assert!(read.primary && !read.from_index && !read.is_index());
+        let read = UniqueKey::from_vec(&index.into_vec()).unwrap();
+        assert!(read.from_index && !read.primary);
+        // Both asked for, the primary key wins the byte.
+        let both = UniqueKey { from_index: true, ..marked.clone() };
+        assert_eq!(both.into_vec()[ORIGIN_AT], ORIGIN_PRIMARY);
+        // What an older build reads: the name up to its NUL, the flag byte.
+        assert_eq!(read_name(&raw, 0).unwrap(), "orders_primary");
+        assert_eq!(raw[129 + 129 * MAX_COLUMNS + 1], FLAG_LIVE);
+        // A name that fills its slot stops short of the mark.
+        let long = key(&"k".repeat(MAX_NAME_BYTES), &["id"], true);
+        let read = UniqueKey::from_vec(&long.into_vec()).unwrap();
+        assert!(read.primary && read.name.len() == MAX_NAME_BYTES);
+        // A record from before the mark, and a dropped or partial one.
+        let old = key("t_pkey", &["a", "b"], false);
+        assert!(!UniqueKey::from_vec(&old.into_vec()).unwrap().primary);
+        // A record rewritten from what was read keeps its mark: a tombstone
+        // (`remove`), a column's rename (`column_declarations`).
+        let dropped = UniqueKey::from_vec(&UniqueKey { is_deleted: true, ..key("x", &["id"], true) }.into_vec()).unwrap();
+        assert!(dropped.is_deleted && dropped.primary);
+        let renamed = UniqueKey { columns: vec!["ident".to_string()], ..UniqueKey::from_vec(&raw).unwrap() };
+        assert_eq!(renamed.into_vec()[ORIGIN_AT], ORIGIN_PRIMARY);
+        // Only PRIMARY KEY is one.
+        assert!(!parse_clause("CONSTRAINT ix UNIQUE (a) AS INDEX", "t").unwrap().unwrap().primary);
+        assert!(parse_clause("CONSTRAINT k1 PRIMARY KEY (a, b)", "t").unwrap().unwrap().primary);
+        assert!(parse_clause("PRIMARY KEY (id)", "t").unwrap().unwrap().primary);
+        assert!(!parse_clause("CONSTRAINT k1 UNIQUE (a, b)", "t").unwrap().unwrap().primary);
+    }
+
+    /// One rule for every reader: the marked record under any name, then
+    /// what told a primary key before the mark.
+    #[test]
+    fn the_primary_key_is_the_marked_record_or_what_named_it_before() {
+        let pk = |schema: &TableSchema| primary_key_of(schema).map(|k| (k.name, k.columns.join(","), k.inline));
+        let found = |name: &str, columns: &str, inline: bool| Some((name.to_string(), columns.to_string(), inline));
+        // Declared with its column: the header and the column's flag.
+        assert_eq!(pk(&schema(Some("id"), &["id"], vec![])), found("t_pkey", "id", true));
+        // Marked, whatever it is called, with a header column or without.
+        assert_eq!(pk(&schema(Some("id"), &[], vec![key("orders_primary", &["id"], true)])), found("orders_primary", "id", false));
+        assert_eq!(pk(&schema(None, &[], vec![key("u", &["a"], false), key("k", &["a", "b"], true)])), found("k", "a,b", false));
+        // From before the mark: the record over the header's column (the
+        // one called `<table>_pkey` first), and the composite one by name.
+        assert_eq!(
+            pk(&schema(Some("id"), &[], vec![key("other", &["id"], false), key("t_pkey", &["id"], false)])),
+            found("t_pkey", "id", false)
+        );
+        assert_eq!(pk(&schema(Some("id"), &[], vec![key("custom", &["id"], false)])), found("custom", "id", false));
+        assert_eq!(pk(&schema(None, &[], vec![key("T_PKEY", &["a", "b"], false)])), found("T_PKEY", "a,b", false));
+        // A UNIQUE is none, nor a dropped or partial key that is marked.
+        assert_eq!(pk(&schema(None, &["a"], vec![key("t_a_b_key", &["a", "b"], false)])), None);
+        let dropped = UniqueKey { is_deleted: true, ..key("k", &["a", "b"], true) };
+        assert_eq!(pk(&schema(None, &[], vec![dropped])), None);
+        // Nor a unique index over the header's column or called `<table>_pkey`.
+        let index = |name: &str, columns: &[&str]| UniqueKey { from_index: true, ..key(name, columns, false) };
+        assert_eq!(
+            pk(&schema(Some("id"), &[], vec![index("ix", &["id"]), key("custom", &["id"], false)])),
+            found("custom", "id", false)
+        );
+        assert_eq!(pk(&schema(None, &[], vec![index("t_pkey", &["a", "b"])])), None);
+        // Known as another table (a schema read under a new name).
+        assert_eq!(
+            primary_key_of_named(&schema(None, &[], vec![key("u_pkey", &["a", "b"], false)]), "u").map(|k| k.name),
+            Some("u_pkey".to_string())
+        );
     }
 }

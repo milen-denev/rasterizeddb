@@ -86,7 +86,7 @@ pub struct TcpClientBuilder {
     trust: Option<Trust>,
     identity: Option<ClientIdentity>,
     authenticator: Option<Arc<dyn ClientAuthenticator>>,
-    setup: Option<Arc<dyn ConnectionSetup>>,
+    setup: Vec<Arc<dyn ConnectionSetup>>,
     auth_timeout: std::time::Duration,
     allow_tls12: bool,
     max_message_size: usize,
@@ -113,8 +113,8 @@ pub(crate) struct Dialer {
     version: Version,
     pub(crate) timeout: Option<std::time::Duration>,
     authenticator: Option<Arc<dyn ClientAuthenticator>>,
-    /// See [`TcpClientBuilder::setup`].
-    setup: Option<Arc<dyn ConnectionSetup>>,
+    /// See [`TcpClientBuilder::setup`]: sent in this order.
+    setup: Vec<Arc<dyn ConnectionSetup>>,
     auth_timeout: std::time::Duration,
     pub(crate) max_message_size: usize,
     /// Only a multiplexed client has more than one request in flight.
@@ -132,7 +132,7 @@ impl TcpClientBuilder {
             trust: None,
             identity: None,
             authenticator: None,
-            setup: None,
+            setup: Vec::new(),
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
             // See `crate::server::TcpServerBuilder::allow_tls12`.
             allow_tls12: false,
@@ -193,8 +193,19 @@ impl TcpClientBuilder {
     /// credential exchange and before anything else: see [`ConnectionSetup`].
     /// Part of opening a connection for the same reason the exchange is, so
     /// a reconnect cannot resume on a connection that was never set up.
+    ///
+    /// Replaces any setup given before; [`TcpClientBuilder::add_setup`] adds
+    /// one after them instead.
     pub fn setup(mut self, setup: Arc<dyn ConnectionSetup>) -> Self {
-        self.setup = Some(setup);
+        self.setup = vec![setup];
+        self
+    }
+
+    /// One more setup request, sent after those given before it, each once
+    /// the answer to the one before has been accepted. Any of them failing
+    /// fails the open. See [`ConnectionSetup`].
+    pub fn add_setup(mut self, setup: Arc<dyn ConnectionSetup>) -> Self {
+        self.setup.push(setup);
         self
     }
 
@@ -671,16 +682,29 @@ impl Dialer {
         Ok(stream)
     }
 
-    /// Sends the setup request, if this client has one, and hands its answer
-    /// to it. Under the client's timeout, as the rest of opening is.
+    /// Sends each setup request this client has, in order, and hands each
+    /// answer to its setup before the next goes out. One after another and
+    /// never together: a multiplexed server may handle requests that arrive
+    /// together in any order, and a later setup may need an earlier one to
+    /// have taken effect.
+    async fn set_up(&self, stream: &mut ClientStream) -> Result<(), RastcpError> {
+        for setup in &self.setup {
+            self.set_up_one(setup.as_ref(), stream).await?;
+        }
+        Ok(())
+    }
+
+    /// Sends one setup request and hands its answer to it. Under the
+    /// client's timeout, as the rest of opening is.
     ///
     /// The answer is read with a reader of its own, which is then dropped:
     /// nothing it read ahead is lost, because the server sends nothing on a
     /// connection that has not asked for anything more.
-    async fn set_up(&self, stream: &mut ClientStream) -> Result<(), RastcpError> {
-        let Some(setup) = self.setup.as_ref() else {
-            return Ok(());
-        };
+    async fn set_up_one(
+        &self,
+        setup: &dyn ConnectionSetup,
+        stream: &mut ClientStream,
+    ) -> Result<(), RastcpError> {
         let request = setup.request();
         let max = self.max_message_size;
         let exchange = async {

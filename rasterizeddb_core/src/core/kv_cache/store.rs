@@ -1091,6 +1091,16 @@ impl<'s> Pinned<'s> {
         let h = self.store.hash(key);
         self.guard(h).find(h, key).map(|s| s.version)
     }
+
+    /// The lifetime `key` has now, under the held locks: `None` when it is
+    /// absent or expired, `Some(0)` when it has none, otherwise the absolute
+    /// millisecond it expires at. What replication reads back after a write
+    /// to ship the absolute time the write actually left.
+    pub fn live_expiry(&mut self, key: &[u8]) -> Option<u64> {
+        let h = self.store.hash(key);
+        let now = self.now;
+        self.guard(h).live(h, key, now).map(|s| s.expires_at)
+    }
 }
 
 impl Access for Pinned<'_> {

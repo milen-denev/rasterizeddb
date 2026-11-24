@@ -456,8 +456,9 @@ fn eviction_keeps_the_store_under_its_bound() {
 /// `OOM`, or a concurrent test's keys evicted, depending on the policy.
 static SETTINGS: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
 
-/// The process-wide settings at their defaults, for this test's duration.
-fn default_settings() -> parking_lot::RwLockReadGuard<'static, ()> {
+/// The process-wide settings at their defaults, for this test's duration;
+/// `pub(crate)` for the tests elsewhere (replication's) that write to a store.
+pub(crate) fn default_settings() -> parking_lot::RwLockReadGuard<'static, ()> {
     SETTINGS.read()
 }
 

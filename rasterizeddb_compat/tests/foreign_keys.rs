@@ -245,19 +245,52 @@ async fn a_constraint_added_later_is_enforced_and_can_be_dropped() {
         .expect("unconstrained again");
 }
 
-/// Composite keys are refused outright: enforcing one column of a two-column key
-/// would enforce something weaker than what was declared.
+/// A composite key is enforced on the whole tuple, not on one of its columns:
+/// a pair whose parts each exist in some parent row, but never together, is
+/// refused. As in PostgreSQL, the referenced columns must carry a unique key.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_composite_key_is_refused_rather_than_partly_enforced() {
+async fn a_composite_key_is_enforced_on_the_whole_tuple() {
     let (_s, pool) = server().await;
 
-    run(&pool, "CREATE TABLE p_comp (a INT NOT NULL, b INT NOT NULL)").await.expect("parent");
+    // No unique key on (a, b): refused, with PostgreSQL's message.
+    run(&pool, "CREATE TABLE p_nokey (a INT NOT NULL, b INT NOT NULL)").await.expect("parent");
     let err = run(
         &pool,
-        "CREATE TABLE c_comp (a INT NOT NULL, b INT NOT NULL, \
-         FOREIGN KEY (a, b) REFERENCES p_comp (a, b))",
+        "CREATE TABLE c_nokey (a INT NOT NULL, b INT NOT NULL, \
+         FOREIGN KEY (a, b) REFERENCES p_nokey (a, b))",
     )
     .await
-    .expect_err("composite");
-    assert!(err.contains("composite"), "{}", err);
+    .expect_err("no unique key on the referenced columns");
+    assert!(err.contains("no unique constraint matching given keys"), "{}", err);
+
+    run(
+        &pool,
+        "CREATE TABLE p_comp (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b))",
+    )
+    .await
+    .expect("parent");
+    run(
+        &pool,
+        "CREATE TABLE c_comp (id INT NOT NULL, a INT NOT NULL, b INT NOT NULL, \
+         CONSTRAINT fk_comp FOREIGN KEY (a, b) REFERENCES p_comp (a, b))",
+    )
+    .await
+    .expect("a composite key onto a primary key is declared");
+    run(&pool, "INSERT INTO p_comp (a, b) VALUES (1, 1), (2, 2)").await.expect("parents");
+
+    run(&pool, "INSERT INTO c_comp (id, a, b) VALUES (10, 1, 1)")
+        .await
+        .expect("an existing pair");
+    // 1 and 2 each exist as an `a` and a `b`, but (1, 2) is no parent row.
+    let err = run(&pool, "INSERT INTO c_comp (id, a, b) VALUES (11, 1, 2)")
+        .await
+        .expect_err("(1, 2) is not a parent");
+    assert!(err.contains("foreign key constraint"), "{}", err);
+    assert!(err.contains("fk_comp"), "the message should name the constraint: {}", err);
+    assert_eq!(count(&pool, "SELECT id FROM c_comp").await, 1, "nothing was written");
+
+    let err = run(&pool, "DELETE FROM p_comp WHERE a = 1 AND b = 1")
+        .await
+        .expect_err("a referenced parent row");
+    assert!(err.contains("foreign key constraint"), "{}", err);
 }

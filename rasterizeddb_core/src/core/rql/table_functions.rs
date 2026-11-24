@@ -138,6 +138,8 @@ fn item_at(sql: &str, at: usize, limit: usize) -> Option<Item> {
         (*name, at + name.len())
     } else if upper.starts_with("GENERATE_SERIES") {
         ("GENERATE_SERIES", at + "GENERATE_SERIES".len())
+    } else if upper.starts_with("GENERATE_SUBSCRIPTS") {
+        ("GENERATE_SUBSCRIPTS", at + "GENERATE_SUBSCRIPTS".len())
     } else if upper.starts_with("UNNEST") {
         ("UNNEST", at + "UNNEST".len())
     } else if rest.starts_with('(') && crate::core::sql_scan::starts_with_keyword(rest[1..].trim_start(), "VALUES") {
@@ -172,6 +174,24 @@ fn item_at(sql: &str, at: usize, limit: usize) -> Option<Item> {
             match jsonb {
                 Some((_, f)) => Kind::Jsonb(*f, args),
                 None if name == "UNNEST" => Kind::Unnest(args),
+                // `generate_subscripts(a, dim [, reverse])`: the subscripts
+                // of that dimension, which for the one-based arrays this
+                // engine holds are 1 to its length; none for a NULL or an
+                // empty array. It was "relation 'generate_subscripts(…' does
+                // not exist".
+                None if name == "GENERATE_SUBSCRIPTS" => {
+                    let (array, dimension) = match args.as_slice() {
+                        [array, dimension] | [array, dimension, _] => (array, dimension),
+                        _ => return None,
+                    };
+                    let length = format!("coalesce(array_length({array}, {dimension}), 0)");
+                    let reverse = args.get(2).is_some_and(|r| r.eq_ignore_ascii_case("true"));
+                    Kind::GenerateSeries(if reverse {
+                        vec![length, "1".to_string(), "-1".to_string()]
+                    } else {
+                        vec!["1".to_string(), length]
+                    })
+                }
                 None => Kind::GenerateSeries(args),
             }
         }

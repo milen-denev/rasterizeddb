@@ -74,6 +74,9 @@ const VIEWS: &[&str] = &[
     "pg_depend",
     "pg_extension",
     "pg_partitioned_table",
+    "table_constraints",
+    "key_column_usage",
+    "referential_constraints",
 ];
 
 /// The relations built from [`crate::core::rql::catalog_model::Model`].
@@ -338,7 +341,15 @@ const SCHEMA: &str = "public";
 /// COLUMNS FROM "rdb_roles"` became `SHOW __cat_columns_… FROM "rdb_roles"`,
 /// which returned one empty column and left every client that asks a table for
 /// its columns believing it had none.
-const QUALIFIED_ONLY: [&str; 4] = ["columns", "tables", "views", "sequences"];
+const QUALIFIED_ONLY: [&str; 7] = [
+    "columns",
+    "tables",
+    "views",
+    "sequences",
+    "table_constraints",
+    "key_column_usage",
+    "referential_constraints",
+];
 
 /// Whether `view` may only be matched with its schema in front of it.
 fn needs_qualifier(view: &str) -> bool {
@@ -1195,7 +1206,7 @@ fn temp_name(view: &str, database: &Arc<Database>) -> String {
 /// The model of `database` as `tx` sees it: its tables, views, materialized
 /// views and sequences, with every table's figures read here, where the
 /// storage layer is reachable.
-async fn model_for(
+pub(crate) async fn model_for(
     database: &Arc<Database>,
     tx: crate::core::mvcc::transaction::TxId,
 ) -> Result<crate::core::rql::catalog_model::Model, String> {
@@ -2035,7 +2046,8 @@ fn shared_declarations(schema: &crate::core::row::schema::TableSchema) -> Vec<(S
     }
     let pk = schema.primary_key.as_deref().and_then(by_name);
     if let Some(pk) = pk {
-        out.push((pkey_name(&schema.name), true, vec![pk], None));
+        let name = crate::core::rql::unique_key::primary_key_of(schema).map_or_else(|| pkey_name(&schema.name), |key| key.name);
+        out.push((name, true, vec![pk], None));
     }
     // An inline `PRIMARY KEY` flags its column unique too; that is the
     // primary key's index, not a `<table>_<column>_key` of its own.
@@ -2107,21 +2119,21 @@ fn oid_of(name: &str) -> i64 {
 }
 
 /// One sequence as the catalogue relations list it.
-struct SequenceRow {
-    name: String,
-    data_type: String,
-    start: i64,
-    min: i64,
-    max: i64,
-    increment: i64,
-    cycle: bool,
-    cache: i64,
-    last: Option<i64>,
+pub(crate) struct SequenceRow {
+    pub(crate) name: String,
+    pub(crate) data_type: String,
+    pub(crate) start: i64,
+    pub(crate) min: i64,
+    pub(crate) max: i64,
+    pub(crate) increment: i64,
+    pub(crate) cycle: bool,
+    pub(crate) cache: i64,
+    pub(crate) last: Option<i64>,
 }
 
 /// Every sequence of `database` as `tx` sees it: each explicit one with its
 /// counter as it stands, and each implicit one a column default reads.
-async fn sequence_rows(
+pub(crate) async fn sequence_rows(
     database: &Arc<Database>,
     tx: Option<crate::core::mvcc::transaction::TxId>,
 ) -> Result<Vec<SequenceRow>, String> {
@@ -2205,6 +2217,10 @@ fn escape(text: &str) -> String {
 #[cfg(test)]
 #[path = "catalog_partition_tests.rs"]
 mod catalog_partition_tests;
+
+#[cfg(test)]
+#[path = "unique_index_origin_tests.rs"]
+mod unique_index_origin_tests;
 
 #[cfg(test)]
 mod tests {

@@ -287,15 +287,36 @@ impl Listed<unique_key::UniqueKey> {
     }
 }
 
-impl Listed<foreign_key::ForeignKey> {
+impl Listed<foreign_key::ForeignKeyRecord> {
     async fn read(io_schema: &Arc<DbStorageProvider>) -> Self {
         let file = Sidecar::read(io_schema, "FK.db", foreign_key::FOREIGN_KEY_SIZE).await;
-        let records = file.raw.iter().map(|r| foreign_key::ForeignKey::from_vec(r).ok()).collect();
+        let records = file.raw.iter().map(|r| foreign_key::ForeignKeyRecord::from_vec(r).ok()).collect();
         Listed { file, records }
     }
-    fn put(&mut self, i: usize, record: foreign_key::ForeignKey) {
+    fn put(&mut self, i: usize, record: foreign_key::ForeignKeyRecord) {
         self.file.set(i, record.into_vec());
         self.records[i] = Some(record);
+    }
+    /// Retires record `i` and, when it is one column pair of a composite
+    /// key, every other pair of that key: a key is retired whole, never
+    /// left enforcing the columns it has left.
+    fn retire(&mut self, i: usize) {
+        let span = match self.records[i].as_ref().and_then(|r| r.member) {
+            Some((position, _)) => i
+                .checked_sub(position as usize)
+                .and_then(|head| foreign_key::composite_span(&self.records, head))
+                .filter(|span| span.contains(&i))
+                .unwrap_or(i..i + 1),
+            None => i..i + 1,
+        };
+        for at in span {
+            if let Some(mut fk) = self.records[at].clone()
+                && !fk.is_deleted
+            {
+                fk.is_deleted = true;
+                self.put(at, fk);
+            }
+        }
     }
 }
 
@@ -466,7 +487,7 @@ async fn other_foreign_keys(
     database: &Arc<Database>,
     table: &str,
     columns: &[&str],
-) -> Vec<(String, Arc<DbStorageProvider>, Listed<foreign_key::ForeignKey>)> {
+) -> Vec<(String, Arc<DbStorageProvider>, Listed<foreign_key::ForeignKeyRecord>)> {
     let ios: Vec<(String, Arc<DbStorageProvider>)> = database
         .fk_children_on(table, Some(columns))
         .into_iter()
@@ -475,7 +496,7 @@ async fn other_foreign_keys(
         .collect();
     let mut out = Vec::new();
     for (name, io) in ios {
-        let fks = Listed::<foreign_key::ForeignKey>::read(&io).await;
+        let fks = Listed::<foreign_key::ForeignKeyRecord>::read(&io).await;
         out.push((name, io, fks));
     }
     out
@@ -518,7 +539,7 @@ struct Declarations {
     checks: Keyed<check::CheckConstraint>,
     paths: Keyed<path_index::PathIndex>,
     unique: Listed<unique_key::UniqueKey>,
-    foreign: Listed<foreign_key::ForeignKey>,
+    foreign: Listed<foreign_key::ForeignKeyRecord>,
 }
 
 impl Declarations {
@@ -531,7 +552,7 @@ impl Declarations {
             checks: Keyed::read(io, "CHK.db", check::CHECK_SIZE).await,
             paths: Keyed::read(io, "PIX.db", path_index::PATH_INDEX_SIZE).await,
             unique: Listed::<unique_key::UniqueKey>::read(io).await,
-            foreign: Listed::<foreign_key::ForeignKey>::read(io).await,
+            foreign: Listed::<foreign_key::ForeignKeyRecord>::read(io).await,
         }
     }
 
@@ -583,13 +604,12 @@ impl Declarations {
             }
         }
         for i in 0..self.foreign.records.len() {
-            if let Some(mut fk) = self.foreign.records[i].clone()
+            if let Some(fk) = &self.foreign.records[i]
                 && !fk.is_deleted
                 && (named(&fk.column, name)
                     || (named(&fk.parent_table, table) && named(&fk.parent_column, name)))
             {
-                fk.is_deleted = true;
-                self.foreign.put(i, fk);
+                self.foreign.retire(i);
             }
         }
         for c in self.checks.live_all() {
@@ -607,26 +627,25 @@ impl Declarations {
 
 /// Retires another table's foreign keys that name `table`.`name` as parent.
 fn retire_parent_side(
-    others: &mut [(String, Arc<DbStorageProvider>, Listed<foreign_key::ForeignKey>)],
+    others: &mut [(String, Arc<DbStorageProvider>, Listed<foreign_key::ForeignKeyRecord>)],
     table: &str,
     name: &str,
 ) {
     for (_, _, fks) in others.iter_mut() {
         for i in 0..fks.records.len() {
-            if let Some(mut fk) = fks.records[i].clone()
+            if let Some(fk) = &fks.records[i]
                 && !fk.is_deleted
                 && named(&fk.parent_table, table)
                 && named(&fk.parent_column, name)
             {
-                fk.is_deleted = true;
-                fks.put(i, fk);
+                fks.retire(i);
             }
         }
     }
 }
 
 fn into_others(
-    others: Vec<(String, Arc<DbStorageProvider>, Listed<foreign_key::ForeignKey>)>,
+    others: Vec<(String, Arc<DbStorageProvider>, Listed<foreign_key::ForeignKeyRecord>)>,
 ) -> Vec<(String, Arc<DbStorageProvider>, Sidecar)> {
     others.into_iter().map(|(t, io, l)| (t, io, l.file)).collect()
 }
@@ -696,7 +715,7 @@ pub(crate) async fn drop_column(
     let mut decl = Declarations::read(io_schema).await;
     let mut others = other_foreign_keys(database, table, &[name]).await;
 
-    let depends = |fk: &foreign_key::ForeignKey| {
+    let depends = |fk: &foreign_key::ForeignKeyRecord| {
         !fk.is_deleted && named(&fk.parent_table, table) && named(&fk.parent_column, name)
     };
     for (owner, _, fks) in &others {
@@ -936,7 +955,7 @@ pub(crate) async fn rename_column(
         k.predicate = predicate;
         decl.unique.put(i, k);
     }
-    let follow = |fk: &mut foreign_key::ForeignKey, owner_is_table: bool| -> bool {
+    let follow = |fk: &mut foreign_key::ForeignKeyRecord, owner_is_table: bool| -> bool {
         let mut moved = false;
         if owner_is_table && named(&fk.column, from) {
             fk.column = to.to_string();
@@ -1124,7 +1143,7 @@ pub(crate) async fn retarget_parent(
     // Grouped by directory, one transaction each.
     let mut groups: BTreeMap<String, Vec<(String, Arc<DbStorageProvider>, Sidecar)>> = BTreeMap::new();
     for (name, io) in ios {
-        let mut fks = Listed::<foreign_key::ForeignKey>::read(&io).await;
+        let mut fks = Listed::<foreign_key::ForeignKeyRecord>::read(&io).await;
         for i in 0..fks.records.len() {
             if let Some(mut fk) = fks.records[i].clone()
                 && !fk.is_deleted

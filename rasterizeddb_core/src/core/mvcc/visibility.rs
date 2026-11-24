@@ -357,7 +357,8 @@ mod reclamation_lemma {
             let v = Visibility::for_snapshot(m.snapshot(own), m.clone());
             assert!(
                 !v.visible(false, inserter, NO_TX),
-                "a rolled-back INSERT was visible to a snapshot ({}), so the scan                  would skip a row it should return — or serve one it should not",
+                "a rolled-back INSERT was visible to a snapshot ({}), so the scan \
+                 would skip a row it should return — or serve one it should not",
                 own
             );
         }

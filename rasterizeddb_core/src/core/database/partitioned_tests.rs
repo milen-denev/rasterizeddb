@@ -623,9 +623,11 @@ async fn partitioned_names_are_guarded() {
 
     let fk = |parent: &str| crate::core::rql::foreign_key::ForeignKey {
         name: format!("fk_{parent}"),
-        column: "n".into(),
+        columns: vec!["n".into()],
         parent_table: parent.into(),
-        parent_column: "n".into(),
+        parent_columns: vec!["n".into()],
+        match_full: false,
+        on_delete_columns: Vec::new(),
         on_delete: crate::core::rql::foreign_key::ReferentialAction::NoAction,
         on_update: crate::core::rql::foreign_key::ReferentialAction::NoAction,
         is_deleted: false,

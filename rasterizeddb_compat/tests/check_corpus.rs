@@ -326,16 +326,30 @@ async fn corpus(partitioning: &str) {
     assert!(wrong.is_empty(), "{partitioning}: {} wrong:\n{}", wrong.len(), wrong.join("\n"));
 
     // What nothing here evaluates is refused where it is declared, with 0A000.
-    // A CASE whose branches are themselves conditions is not read yet.
-    for check in [
-        "(no_such_function(n) > 0)",
-        "(CASE WHEN (n > 10) THEN (price > (5)::numeric) ELSE true END)",
-    ] {
+    for check in ["(no_such_function(n) > 0)"] {
         let e = pool
             .execute(AssertSqlSafe(format!("CREATE TABLE r ({COLUMNS}, CHECK {check}){partitioning}")))
             .await
             .expect_err(check);
         assert_eq!(code(&e), "0A000", "{check}: {e}");
+    }
+
+    // A CASE whose branches are themselves conditions — a parenthesised
+    // predicate is a boolean value (`expr::is_predicate`) — enforced as
+    // PostgreSQL enforces it: only a FALSE refuses, a NULL passes.
+    pool.execute(AssertSqlSafe(format!(
+        "CREATE TABLE cw ({COLUMNS}, CHECK (CASE WHEN (n > 10) THEN (price > (5)::numeric) ELSE true END)){partitioning}"
+    )))
+    .await
+    .expect("a CASE over conditions is declared");
+    let rows = [("11", "6", true), ("11", "4", false), ("5", "1", true), ("11", "NULL", true), ("NULL", "1", true)];
+    for (id, (n, price, stored)) in rows.into_iter().enumerate() {
+        let sql = format!("INSERT INTO cw (id, n, price) VALUES ({id}, {n}, {price})");
+        match (pool.execute(AssertSqlSafe(sql.clone())).await, stored) {
+            (Ok(_), true) => {}
+            (Err(e), false) if code(&e) == "23514" => {}
+            (got, _) => panic!("{sql}: {:?}", got.map(|_| "stored").map_err(|e| e.to_string())),
+        }
     }
 }
 

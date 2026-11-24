@@ -268,12 +268,19 @@ pub async fn execute(sql: &str, database: &Arc<Database>) -> Result<Vec<String>,
         return enable(database).await;
     }
     if rest == "DISABLE" || rest == "STOP" {
-        replication.set_active(false);
-        for peer in replication.peers() {
-            peer.stop();
-            replication.remove_peer(&peer.name);
+        // On the default database, every database, as ENABLE starts every
+        // one: a node half disabled ships some databases' writes and not
+        // others'.
+        let others = replication.other_databases();
+        replication.stop();
+        for (_, other) in &others {
+            other.stop();
         }
-        return Ok(vec!["replication disabled".to_string()]);
+        return Ok(vec![if others.is_empty() {
+            "replication disabled".to_string()
+        } else {
+            format!("replication disabled for this database and {} other(s)", others.len())
+        }]);
     }
     if rest == "FLUSH" {
         replication.flush();
@@ -384,11 +391,23 @@ async fn enable(database: &Arc<Database>) -> Result<Vec<String>, String> {
     }
 
     Database::start_replication(database.clone()).map_err(|e| e.to_string())?;
+    // Every other database a DISABLE stopped, through the catalogue the
+    // listener links: the counterpart of DISABLE stopping them all.
+    let mut resumed = 0usize;
+    for (_, other) in replication.other_databases() {
+        if !other.is_active() {
+            other.resume();
+            resumed += 1;
+        }
+    }
 
     let mut lines = vec![format!(
         "replication enabled as node {} of cluster '{}', listening on {}:{}",
         config.node_id, config.cluster, config.listen_addr, config.listen_port
     )];
+    if resumed > 0 {
+        lines.push(format!("and for {resumed} other database(s)"));
+    }
     for peer_config in &config.peers {
         lines.push(format!(
             "peer {} started at {}",
@@ -620,7 +639,8 @@ async fn resync(database: &Arc<Database>, tokens: &[String]) -> Result<Vec<Strin
         if !more || rounds >= MAX_ROUNDS {
             if rounds >= MAX_ROUNDS {
                 return Err(format!(
-                    "resynchronising origin {} did not finish after {} rounds;                      stopped at sequence {}",
+                    "resynchronising origin {} did not finish after {} rounds; \
+                     stopped at sequence {}",
                     origin, rounds, cursor
                 ));
             }
@@ -629,7 +649,8 @@ async fn resync(database: &Arc<Database>, tokens: &[String]) -> Result<Vec<Strin
     }
 
     Ok(vec![format!(
-        "resynchronised origin {} from sequence {} to {} (was at {}):          {} pulled, {} applied, {} refused",
+        "resynchronised origin {} from sequence {} to {} (was at {}): \
+         {} pulled, {} applied, {} refused",
         origin, from, cursor, before, pulled, applied_count, refused
     )])
 }
@@ -671,7 +692,8 @@ async fn set(
     let edited = {
         let value = value.clone();
         let key = key.clone();
-        replication.update_config(move |config| apply_setting(config, &key, &value))?
+        // A setting, so it may be chosen before the node has an id.
+        replication.update_setting(move |config| apply_setting(config, &key, &value))?
     };
 
     // A few settings are held by the running peers as well as the config.
@@ -878,6 +900,13 @@ fn show_status(replication: &StdArc<Replication>) -> Vec<String> {
             stats.gaps.load(Ordering::Relaxed),
             stats.ack_timeouts.load(Ordering::Relaxed)
         ),
+        format!(
+            "key/value: {} write(s) shipped in {} record(s), {} applied from peers, {} skipped on apply",
+            stats.kv_effects.load(Ordering::Relaxed),
+            stats.kv_records.load(Ordering::Relaxed),
+            stats.kv_applied.load(Ordering::Relaxed),
+            stats.kv_apply_errors.load(Ordering::Relaxed)
+        ),
     ];
 
     if let Some(failure) = replication.capture_failure() {
@@ -934,6 +963,49 @@ fn show_status(replication: &StdArc<Replication>) -> Vec<String> {
     }
 
     lines.extend(show_peers(replication));
+    lines.extend(database_summaries(replication));
+    lines
+}
+
+/// One line per other database of the node, after the default database's
+/// report: each replicates over links of its own, with its own positions.
+fn database_summaries(replication: &StdArc<Replication>) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (name, other) in replication.other_databases() {
+        let local_seq = other.local_seq();
+        let mut vector = other.applied().vector();
+        vector.sort_unstable_by_key(|entry| entry.origin);
+        let applied = if vector.is_empty() {
+            "nothing applied".to_string()
+        } else {
+            format!(
+                "applied through {}",
+                vector.iter().map(|e| format!("node {} → {}", e.origin, e.seq)).collect::<Vec<_>>().join(", ")
+            )
+        };
+        let peers: Vec<String> = other
+            .peers()
+            .iter()
+            .map(|peer| {
+                let snapshot = peer.snapshot(local_seq);
+                let state = if snapshot.paused {
+                    "paused"
+                } else if snapshot.state != super::peer::PeerState::Streaming {
+                    snapshot.state.as_str()
+                } else if snapshot.connected {
+                    "up"
+                } else {
+                    "down"
+                };
+                format!("{} {} acked {} lag {}", snapshot.name, state, snapshot.acked_seq, snapshot.lag)
+            })
+            .collect();
+        lines.push(format!(
+            "database {name}: {}, local sequence {local_seq}, {applied}; peers: {}",
+            if other.is_active() { "enabled" } else { "disabled" },
+            if peers.is_empty() { "none".to_string() } else { peers.join(", ") }
+        ));
+    }
     lines
 }
 
@@ -1173,17 +1245,17 @@ fn stats_rows(database: &Arc<Database>) -> Vec<crate::core::row::row::Row> {
     push(
         "applied",
         load(&stats.applied),
-        "received from peers and applied here",
+        "of this node's, applied by the peers it sent them to (what this node received: \"applied through\" in SHOW REPLICATION)",
     );
     push(
         "duplicates",
         load(&stats.duplicates),
-        "already seen, so ignored",
+        "of this node's, a peer already had, so ignored there",
     );
     push(
         "conflicts",
         load(&stats.conflicts),
-        "would not apply; see the conflict policy",
+        "of this node's, a peer would not apply; see the conflict policy",
     );
     push("failures", load(&stats.failures), "");
     push(
@@ -1224,6 +1296,26 @@ fn stats_rows(database: &Arc<Database>) -> Vec<crate::core::row::row::Row> {
         "push_round_trip_us",
         load(&stats.push_round_trip_us),
         "total time this node's batches took to be acknowledged: the wire both ways plus the peer's apply",
+    );
+    push(
+        "kv_effects",
+        load(&stats.kv_effects),
+        "key/value cache writes recorded for the peers",
+    );
+    push(
+        "kv_records",
+        load(&stats.kv_records),
+        "records those were numbered into",
+    );
+    push(
+        "kv_applied",
+        load(&stats.kv_applied),
+        "key/value cache commands applied here for a peer",
+    );
+    push(
+        "kv_apply_errors",
+        load(&stats.kv_apply_errors),
+        "key/value cache commands that failed on apply and were skipped",
     );
     push(
         "batches_applied",
@@ -1279,6 +1371,27 @@ fn stats_rows(database: &Arc<Database>) -> Vec<crate::core::row::row::Row> {
         config.log_retention_bytes.to_string(),
         "history kept for a peer that falls behind; past this it must resynchronise",
     );
+
+    // Each other database's, as rows of their own after these: a client
+    // reads these rows by metric name, so rows are added, never columns.
+    for (name, other) in replication.other_databases() {
+        let local_seq = other.local_seq();
+        let peers = other.peers();
+        let snapshots: Vec<_> = peers.iter().map(|peer| peer.snapshot(local_seq)).collect();
+        let connected = snapshots.iter().filter(|s| s.connected).count();
+        let lag = snapshots.iter().map(|s| s.lag).max().unwrap_or(0);
+        let mut vector = other.applied().vector();
+        vector.sort_unstable_by_key(|entry| entry.origin);
+        push(&format!("database.{name}.active"), other.is_active().to_string(), "whether this database's writes are being shipped");
+        push(&format!("database.{name}.local_sequence"), local_seq.to_string(), "records this database has originated");
+        push(
+            &format!("database.{name}.applied"),
+            vector.iter().map(|e| e.seq).sum::<u64>().to_string(),
+            &vector.iter().map(|e| format!("node {} → {}", e.origin, e.seq)).collect::<Vec<_>>().join(", "),
+        );
+        push(&format!("database.{name}.peers_connected"), connected.to_string(), &format!("of {}", snapshots.len()));
+        push(&format!("database.{name}.max_lag"), lag.to_string(), "records the furthest-behind peer has yet to take");
+    }
 
     out
 }
@@ -1668,6 +1781,36 @@ mod tests {
     async fn enabling_without_a_node_id_is_refused() {
         let database = crate::replication::test_support::in_memory_database().await;
         assert!(execute("REPLICATION ENABLE", &database).await.is_err());
+    }
+
+    /// A server started without `--node-id`: a setting is not the node id's
+    /// business, and was refused for want of one.
+    #[tokio::test]
+    async fn a_setting_changes_on_a_node_without_an_id() {
+        let database = crate::replication::test_support::in_memory_database().await;
+        let said = execute("REPLICATION SET batch_max_records = 128", &database)
+            .await
+            .expect("a setting needs no node id");
+        assert_eq!(said, vec!["batch_max_records = 128".to_string()]);
+        assert_eq!(database.replication.config().batch_max_records, 128);
+
+        // Checked for itself all the same, and it starts nothing.
+        assert!(execute("REPLICATION SET batch_max_records = 0", &database).await.is_err());
+        assert_eq!(database.replication.config().batch_max_records, 128);
+        let refused = execute("REPLICATION ENABLE", &database).await.unwrap_err();
+        assert!(refused.contains("node id"), "{refused}");
+        assert!(!database.replication.is_active());
+
+        // A peer is still not added to a node nobody has named.
+        assert!(
+            execute("REPLICATION ADD PEER 'berlin' ADDRESS '10.0.0.2:61171'", &database)
+                .await
+                .is_err()
+        );
+
+        execute("REPLICATION SET node_id = 4", &database).await.expect("an id");
+        assert_eq!(database.replication.config().node_id, 4);
+        assert_eq!(database.replication.config().batch_max_records, 128);
     }
 
     #[tokio::test]

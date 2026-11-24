@@ -259,6 +259,11 @@ conflicts 0, failures 0, gaps 0, ack timeouts 0
 61 batch(es), 60 compressed: 52439 bytes of payload went out as 12331 (76.5% smaller)
 ```
 
+`applied`, `duplicates` and `conflicts` count this node's own transactions
+by what its peers answered, so a node that writes nothing shows `applied 0`
+however much it receives. What a node has taken from each peer is the
+`applied through: <node> → <sequence>` line.
+
 Roughly six transactions per batch and **76.5%** off the wire. Repetitive SQL is
 what zstd is good at, and replication traffic is nothing but.
 
@@ -531,7 +536,11 @@ after a restart unless the flag is added too. That is deliberate: what a node
 comes up as should always be what its command line says.
 
 `node_id` cannot change while replication is running — moving a node's identity
-under a live cluster makes its stream ambiguous. The token is never echoed by
+under a live cluster makes its stream ambiguous. A server started without
+`--node-id` has none: its settings can still be changed (`REPLICATION SET`, or
+`SET CONFIG replication.<key>`), and `REPLICATION SET node_id = <N>` gives it
+one, but a peer cannot be added and replication cannot be enabled until it has
+one. The token is never echoed by
 `SHOW`; it reports `(set)` or `(unset)`.
 
 **Where a lagging peer's time goes.** `SHOW REPLICATION STATS` carries three

@@ -38,6 +38,31 @@ struct Collected {
     /// `INSERT` routing under `partition_trace`, said once per table per
     /// statement: (table, why, partitions declared, partitions written, rows).
     inserts: Vec<(String, String, usize, std::collections::BTreeSet<u32>, u64)>,
+    /// How many [`hold`]s are open: while any is, [`drain`] answers nothing
+    /// and the notices wait for the statement that holds them.
+    held: u32,
+}
+
+/// Keeps the statement's notices until it is dropped ([`hold`]).
+pub struct Held(());
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let _ = NOTICES.try_with(|n| {
+            let mut n = n.borrow_mut();
+            n.held = n.held.saturating_sub(1);
+        });
+    }
+}
+
+/// Holds the current statement's notices while the statements it runs
+/// inside itself complete: a PL/pgSQL block's `RAISE NOTICE` is the block's,
+/// sent when the block is done. Each statement the block ran drained the
+/// collector into its own, discarded, output as it completed, so only what
+/// was raised after the last of them reached the client.
+pub fn hold() -> Held {
+    let _ = NOTICES.try_with(|n| n.borrow_mut().held += 1);
+    Held(())
 }
 
 tokio::task_local! {
@@ -92,6 +117,10 @@ pub fn trace_insert(table: &str, why: impl FnOnce() -> String, declared: usize, 
 
 /// Raises a notice for the current statement's client. Returns whether a
 /// client will receive it; when not, it is logged.
+///
+/// Outside a scope of [`collect`], a statement whose signal keeps notices
+/// (`cancel::StatementCancel::collecting_notices`: a native statement whose
+/// client asked for them) keeps it there.
 pub fn push(severity: &'static str, sqlstate: &'static str, message: impl Into<String>) -> bool {
     let message = message.into();
     let mut message = Some(message);
@@ -104,10 +133,30 @@ pub fn push(severity: &'static str, sqlstate: &'static str, message: impl Into<S
             })
         })
         .is_ok();
-    if !collected {
-        log::warn!("{} {}: {}", severity, sqlstate, message.unwrap_or_default());
+    if collected {
+        return true;
     }
-    collected
+    let mut notice = Some(Notice {
+        severity,
+        sqlstate,
+        message: message.take().unwrap_or_default(),
+    });
+    let kept = crate::core::cancel::STATEMENT_CANCEL
+        .try_with(|c| match c.keep_notice(notice.take().expect("taken once")) {
+            Ok(()) => true,
+            Err(back) => {
+                notice = Some(back);
+                false
+            }
+        })
+        .unwrap_or(false);
+    if kept {
+        return true;
+    }
+    if let Some(n) = notice {
+        log::warn!("{} {}: {}", n.severity, n.sqlstate, n.message);
+    }
+    false
 }
 
 /// Records one occurrence of something said once per statement: a WARNING
@@ -147,6 +196,9 @@ pub fn count(key: &str, message: impl FnOnce() -> String) {
 
 /// Takes every notice collected so far in this task, the counted ones last.
 pub fn drain() -> Vec<Notice> {
+    if NOTICES.try_with(|n| n.borrow().held > 0).unwrap_or(false) {
+        return Vec::new();
+    }
     let collected = NOTICES
         .try_with(|n| {
             let mut n = n.borrow_mut();

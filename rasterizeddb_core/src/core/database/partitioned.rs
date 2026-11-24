@@ -889,6 +889,9 @@ impl Database {
         if crate::core::rql::type_modifier::declares_compression(&ct.type_modifiers) {
             self.require_compressed_values()?;
         }
+        if ct.foreign_keys.iter().any(|fk| fk.is_composite()) {
+            self.require_composite_foreign_keys()?;
+        }
         let mut schema =
             Table::create_schema_files_with(io_schema.clone(), &ct.table_name, columns, &ct.unique_columns, &own_scale)
                 .await?;
