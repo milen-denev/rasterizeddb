@@ -23,3 +23,4 @@ pub mod raft_store;
 pub mod rshard;
 pub mod signing;
 pub mod start;
+pub mod topn;

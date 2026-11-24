@@ -238,6 +238,15 @@ fn fan_out_read(t: &str, c: &Clauses) -> RouteTemplate {
     if (aggregate || has("GROUP")) && !windowed && !list_upper.trim_start().starts_with("DISTINCT") {
         return RouteTemplate::FanOut { merge: Merge::Coordinator, writes: false };
     }
+    // ORDER BY … LIMIT over output columns: merged on the coordinator by
+    // sort keys (B1c top-N).
+    if !aggregate && !has("GROUP") && !has("HAVING") && !list_upper.trim_start().starts_with("DISTINCT")
+        && has("ORDER")
+        && has("LIMIT")
+        && matches!(super::topn::parse(t), Some(Ok(_)))
+    {
+        return RouteTemplate::FanOut { merge: Merge::Coordinator, writes: false };
+    }
     if aggregate || has("GROUP") || has("HAVING") || has("ORDER") || has("OFFSET") || list_upper.trim_start().starts_with("DISTINCT")
     {
         return RouteTemplate::NeedsKey;
