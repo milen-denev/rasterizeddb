@@ -263,6 +263,9 @@ impl ShardMachine {
                         delete(&db, table, old, tx).await?;
                         insert(&db, table, new, tx).await?;
                     }
+                    Op::Ddl { sql } => {
+                        exec(&db, sql, Some(tx)).await?;
+                    }
                 }
             }
             exec(&db, &format!("INSERT INTO {APPLIED_TABLE} (idx) VALUES ({index})"), Some(tx)).await?;

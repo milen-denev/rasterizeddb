@@ -22268,6 +22268,16 @@ pub(crate) async fn insert_loaded_row(
 fn note_write(database: &Arc<Database>, tx: TxId, depth: usize, sql: &str, table: Option<&str>) {
     if depth == 0 {
         database.replication.note_statement(tx, sql, table);
+        // A shard's Raft group carries schema changes as statements, in
+        // order with the row images (sharding-plan.md B3, Schema entries).
+        #[cfg(feature = "sharding_raft")]
+        if crate::core::shard::capture::active() && crate::core::shard::capture::is_ddl(sql) {
+            crate::core::shard::capture::record(
+                database.id,
+                tx,
+                crate::core::shard::capture::Op::Ddl { sql: sql.to_string() },
+            );
+        }
     }
 }
 

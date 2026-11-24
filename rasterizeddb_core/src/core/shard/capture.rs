@@ -28,6 +28,9 @@ pub enum Op {
     Insert { table: String, row: Image },
     Delete { table: String, old: Image },
     Update { table: String, old: Image, new: Image },
+    /// A schema change, as its statement: replicas run it in log order, so
+    /// their schemas and write orders stay the leader's.
+    Ddl { sql: String },
 }
 
 /// One committed transaction's effects, as proposed.
@@ -74,6 +77,7 @@ pub fn record(database: u64, tx: TxId, op: Op) {
 fn is_temp(op: &Op) -> bool {
     let t = match op {
         Op::Insert { table, .. } | Op::Delete { table, .. } | Op::Update { table, .. } => table,
+        Op::Ddl { .. } => return false,
     };
     t.starts_with("__cte_tmp_")
         || t.starts_with("__rdb_tmp_")
@@ -153,6 +157,10 @@ pub fn encode(c: &Command) -> Vec<u8> {
                 put_image(&mut b, old);
                 put_image(&mut b, new);
             }
+            Op::Ddl { sql } => {
+                b.push(4);
+                put_bytes(&mut b, sql.as_bytes());
+            }
         }
     }
     b
@@ -211,6 +219,7 @@ pub fn decode(bytes: &[u8]) -> Result<Command, String> {
             1 => Op::Insert { table: r.text()?, row: r.image()? },
             2 => Op::Delete { table: r.text()?, old: r.image()? },
             3 => Op::Update { table: r.text()?, old: r.image()?, new: r.image()? },
+            4 => Op::Ddl { sql: r.text()? },
             t => return Err(format!("a raft command op of tag {t}")),
         });
     }
@@ -218,6 +227,12 @@ pub fn decode(bytes: &[u8]) -> Result<Command, String> {
         return Err("a raft command has trailing bytes".to_string());
     }
     Ok(Command { origin_node, origin_tx, database, ops })
+}
+
+/// Whether `sql` changes the schema (it travels as an [`Op::Ddl`]).
+pub fn is_ddl(sql: &str) -> bool {
+    let first = sql.trim_start().split(|c: char| c.is_whitespace() || c == '(').next().unwrap_or("");
+    ["CREATE", "ALTER", "DROP", "TRUNCATE", "COMMENT", "RENAME"].iter().any(|k| first.eq_ignore_ascii_case(k))
 }
 
 /// A stored row as an image.
