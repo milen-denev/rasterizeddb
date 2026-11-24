@@ -250,10 +250,25 @@ async fn handle(conn: &Conn, data: &[u8]) -> Response {
             Response::Done
         }
         Request::Native { .. } => refuse(*b"0A000", true, "native requests through the gateway are not in rshard version 1"),
-        Request::Decide { gid, commit } => match decide(&gid, commit) {
-            Ok(()) => Response::Done,
-            Err(e) => refuse(*b"58030", false, e),
-        },
+        Request::Decide { gid, commit } => {
+            // A consistent fan-out is starting its snapshots (B6.1): a commit
+            // decision waits for it, never longer than its hold.
+            if commit {
+                commit_hold::wait().await;
+            }
+            match decide(&gid, commit) {
+                Ok(()) => Response::Done,
+                Err(e) => refuse(*b"58030", false, e),
+            }
+        }
+        Request::HoldCommits { ms } => {
+            commit_hold::hold(conn as *const Conn as usize, ms);
+            Response::Done
+        }
+        Request::ReleaseCommits => {
+            commit_hold::release(conn as *const Conn as usize);
+            Response::Done
+        }
         Request::Decision { gid } => match decision(&gid) {
             Ok(commit) => Response::Decided { commit },
             Err(e) => refuse(*b"58030", true, e),
@@ -1026,4 +1041,64 @@ async fn exec_part(conn: &Conn, session: u64, merge: Merge, bytes: &[u8]) -> Res
         return Response::PartReply(PartReply { session, map_epoch: epoch(), more: false, status, head, rows: vec![(Vec::new(), partial)], tail });
     }
     Response::PartReply(PartReply { session, map_epoch: epoch(), more: false, status, head, rows, tail })
+}
+
+/// The anchor shard's commit hold (B6.1): while a consistent fan-out starts
+/// every part's snapshot, multi-shard commit decisions wait, so each such
+/// transaction is wholly inside the snapshot or wholly outside it. A hold
+/// belongs to the rshard connection that took it and ends at its release or
+/// its expiry (at most 5 s), so a gateway that vanished stalls no one.
+mod commit_hold {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    static HOLDS: Mutex<Option<HashMap<usize, Instant>>> = Mutex::new(None);
+
+    pub(super) fn hold(owner: usize, ms: u32) {
+        let until = Instant::now() + Duration::from_millis(u64::from(ms.min(5_000)));
+        HOLDS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(owner, until);
+    }
+
+    pub(super) fn release(owner: usize) {
+        if let Some(h) = HOLDS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            h.remove(&owner);
+        }
+    }
+
+    /// The latest expiry of the holds still in force, dropping the expired.
+    fn until() -> Option<Instant> {
+        let mut g = HOLDS.lock().unwrap_or_else(|e| e.into_inner());
+        let h = g.as_mut()?;
+        let now = Instant::now();
+        h.retain(|_, until| *until > now);
+        h.values().max().copied()
+    }
+
+    pub(super) async fn wait() {
+        while let Some(until) = until() {
+            let left = until.saturating_duration_since(Instant::now());
+            tokio::time::sleep(left.min(Duration::from_millis(2))).await;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn b61_a_decision_waits_for_a_hold_and_no_longer() {
+            hold(1, 5_000);
+            let start = Instant::now();
+            let waiter = tokio::spawn(wait());
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            release(1);
+            waiter.await.unwrap();
+            assert!(start.elapsed() >= Duration::from_millis(25) && start.elapsed() < Duration::from_secs(2));
+            hold(2, 20);
+            let start = Instant::now();
+            wait().await;
+            assert!(start.elapsed() < Duration::from_secs(1), "an expired hold ends the wait");
+        }
+    }
 }

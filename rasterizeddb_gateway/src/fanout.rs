@@ -40,6 +40,16 @@ impl Session {
         }
         // A commit decided and mid-flight would show here half done (B5.2).
         committing::settle(std::time::Duration::from_secs(5)).await;
+        // One snapshot across the shards (B6.1): every multi-shard commit
+        // wholly in or wholly out.
+        let consistent = self.consistent_fanout && self.txn.status == b'I';
+        if consistent && let Err((code, m)) = self.consistent_snapshots(&shards).await {
+            for &s in &shards {
+                let _ = self.quiet_query(s, "ROLLBACK").await;
+            }
+            self.error_ready(&code, &m);
+            return Ok(Outcome::Done { error: true });
+        }
         // Every part's virtual session first, then the parts at once.
         let mut sessions = Vec::with_capacity(shards.len());
         for &s in &shards {
@@ -84,9 +94,68 @@ impl Session {
                 return Ok(Outcome::Done { error: true });
             }
         }
+        if consistent {
+            for &s in &shards {
+                let _ = self.quiet_query(s, "COMMIT").await;
+            }
+        }
         merge_parts(&mut self.out, &merge, &parts);
         pg::ready(&mut self.out, b'I');
         Ok(Outcome::Done { error: false })
+    }
+
+    /// Opens a REPEATABLE READ block on every shard at one instant of the
+    /// cluster (B6.1): commit decisions are held on the anchor, the
+    /// commits already decided are waited out (no shard still holds one
+    /// prepared), every part's snapshot is taken, and the hold is released.
+    async fn consistent_snapshots(&mut self, shards: &[u32]) -> Result<(), (String, String)> {
+        let home = self.core.shared.home(&self.core.map());
+        let link = self.core.link(home).map_err(|e| ("08006".to_string(), e))?;
+        let core = self.core.clone();
+        let call = |req: Request| {
+            let link = link.clone();
+            let core = core.clone();
+            async move { link.call(&core, &req.encode()).await }
+        };
+        if !matches!(call(Request::HoldCommits { ms: 3_000 }).await, Ok(Response::Done)) {
+            return Err(("08006".into(), format!("the anchor shard {home} did not hold commits for a consistent read")));
+        }
+        let result = async {
+            // Decided commits still prepared somewhere: wait them out.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            // Without two-phase commit no transaction spans shards.
+            while self.core.shared.cfg.two_phase {
+                let mut in_flight = false;
+                for &s in shards {
+                    let gids = self.first_column(s, "SHOW PREPARED TRANSACTIONS").await.map_err(|e| ("08006".to_string(), e))?;
+                    for gid in gids.into_iter().flatten() {
+                        if matches!(call(Request::Decision { gid }).await, Ok(Response::Decided { commit: Some(true) })) {
+                            in_flight = true;
+                        }
+                    }
+                }
+                if !in_flight {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(("40001".to_string(), "a commit stayed half finished across shards; retry the read".to_string()));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            for &s in shards {
+                for sql in ["BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", "SELECT 1"] {
+                    match self.quiet_query(s, sql).await {
+                        Ok((_, None)) => {}
+                        Ok((_, Some(e))) => return Err(e),
+                        Err(e) => return Err(("08006".to_string(), format!("shard {s}: {e}"))),
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+        let _ = call(Request::ReleaseCommits).await;
+        result
     }
 
     /// A read no one shard can answer (B4.5): each sharded table in

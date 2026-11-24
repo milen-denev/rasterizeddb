@@ -239,6 +239,13 @@ pub enum Request {
     /// none, just where the sequence stands. Answered by
     /// [`Response::Notifications`].
     Notifications { database: String, since: u64 },
+    /// On the anchor shard: commit decisions wait for `ms` (or until
+    /// `ReleaseCommits`), so a consistent fan-out can start every part's
+    /// snapshot with no multi-shard commit landing in between (B6.1).
+    /// Answered `Done`.
+    HoldCommits { ms: u32 },
+    /// Ends this connection's `HoldCommits`. Answered `Done`.
+    ReleaseCommits,
 }
 
 /// Where a classified text came from.
@@ -552,6 +559,8 @@ impl Request {
             Request::Waits => 0x0E,
             Request::AbortTxn { .. } => 0x0F,
             Request::Notifications { .. } => 0x10,
+            Request::HoldCommits { .. } => 0x11,
+            Request::ReleaseCommits => 0x12,
         }
     }
 
@@ -606,6 +615,10 @@ impl Request {
             Request::Notifications { database, since } => {
                 w.str(database).u64(*since);
             }
+            Request::HoldCommits { ms } => {
+                w.u32(*ms);
+            }
+            Request::ReleaseCommits => {}
         }
         w.buf
     }
@@ -674,6 +687,8 @@ impl Request {
             0x0E => Request::Waits,
             0x0F => Request::AbortTxn { gid: r.str()? },
             0x10 => Request::Notifications { database: r.str()?, since: r.u64()? },
+            0x11 => Request::HoldCommits { ms: r.u32()? },
+            0x12 => Request::ReleaseCommits,
             k => return Err(format!("rshard request kind {k:#04x} is unknown")),
         };
         r.end()?;

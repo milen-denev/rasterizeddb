@@ -130,6 +130,8 @@ pub struct Session {
     pub(crate) local_key: Option<OwnedKey>,
     pub(crate) unrouted: Unrouted,
     pub(crate) unrouted_writes: UnroutedWrites,
+    /// Fan-out reads take one snapshot across shards (B6.1).
+    pub(crate) consistent_fanout: bool,
     pub(crate) vs: HashMap<u32, VSession>,
     pub(crate) txn: Txn,
     /// Session-level `SET`s, as raw Query messages, replayed to every
@@ -157,6 +159,8 @@ enum Local {
     SetRouteKey { local: bool, value: Option<String> },
     SetUnrouted(String),
     SetUnroutedWrites(String),
+    /// `SET rdb.consistent_fanout = on|off` (B6.1).
+    SetConsistentFanout(String),
     Begin,
     End { commit: bool },
     SetLocal,
@@ -239,6 +243,7 @@ fn local_of(text: &str) -> Local {
             }
             "rdb.unrouted" => return Local::SetUnrouted(value.unwrap_or_default()),
             "rdb.unrouted_writes" => return Local::SetUnroutedWrites(value.unwrap_or_default()),
+            "rdb.consistent_fanout" => return Local::SetConsistentFanout(value.unwrap_or_default()),
             // `SET TRANSACTION …` belongs to the transaction.
             "transaction" | "constraints" => return if local { Local::SetLocal } else { Local::Routed },
             _ => return if local { Local::SetLocal } else { Local::SessionSet },
@@ -257,6 +262,7 @@ impl Session {
             local_key: None,
             unrouted,
             unrouted_writes: UnroutedWrites::Refuse,
+            consistent_fanout: false,
             vs: HashMap::new(),
             txn: Txn {
                 status: b'I',
@@ -499,6 +505,19 @@ impl Session {
                     }
                     _ => {
                         self.error_ready("22023", "rdb.unrouted is refuse or fan_out");
+                        return Ok(Outcome::Done { error: true });
+                    }
+                };
+                pg::command_complete(&mut self.out, "SET");
+                pg::ready(&mut self.out, self.txn.status);
+                return Ok(Outcome::Done { error: false });
+            }
+            Local::SetConsistentFanout(v) => {
+                self.consistent_fanout = match v.trim_matches('\'').to_ascii_lowercase().as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" | "default" | "" => false,
+                    _ => {
+                        self.error_ready("22023", "rdb.consistent_fanout is on or off");
                         return Ok(Outcome::Done { error: true });
                     }
                 };
@@ -1044,6 +1063,40 @@ impl Session {
     /// client): the final ReadyForQuery status, and the first error.
     pub(crate) async fn quiet_query(&mut self, shard: u32, sql: &str) -> Result<(u8, Option<(String, String)>), String> {
         self.tagged_query(shard, sql).await.map(|(status, error, _)| (status, error))
+    }
+
+    /// The first column of every row `sql` returns on `shard`.
+    pub(crate) async fn first_column(&mut self, shard: u32, sql: &str) -> Result<Vec<Option<String>>, String> {
+        let vs_id = self.ensure_vs(shard).await.map_err(|(c, m)| format!("{c}: {m}"))?;
+        let link = self.core.link(shard)?;
+        let mut q = vec![b'Q'];
+        q.extend_from_slice(&((sql.len() + 5) as i32).to_be_bytes());
+        q.extend_from_slice(sql.as_bytes());
+        q.push(0);
+        let mut req = Vec::new();
+        Request::encode_pg(&mut req, vs_id, self.core.map().epoch(), &q);
+        let mut resp = link.call(&self.core, &req).await.map_err(|e| format!("{e:?}"))?;
+        let mut out = Vec::new();
+        loop {
+            match resp {
+                Response::PgReply { more, bytes, .. } => {
+                    for (t, m) in pg::messages(&bytes) {
+                        match t {
+                            b'D' => out.push(pg::data_row_first(m).flatten().map(|v| String::from_utf8_lossy(v).into_owned())),
+                            b'E' => return Err(pg::error_message(m).unwrap_or_default()),
+                            _ => {}
+                        }
+                    }
+                    if more {
+                        resp = link.call(&self.core, &Request::Continue { session: vs_id }.encode()).await.map_err(|e| format!("{e:?}"))?;
+                        continue;
+                    }
+                    return Ok(out);
+                }
+                Response::Refused(r) => return Err(format!("{}: {}", String::from_utf8_lossy(&r.sqlstate), r.message)),
+                other => return Err(format!("reply kind {:#04x}", other.kind())),
+            }
+        }
     }
 
     /// [`Self::quiet_query`], with the statement's command tag.
