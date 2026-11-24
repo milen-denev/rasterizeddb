@@ -1719,6 +1719,7 @@ pub(crate) const NEW_VIEWS: &[&str] = &[
     "pg_constraint",
     "pg_am",
     "pg_roles",
+    "pg_authid",
     "pg_auth_members",
     "pg_user",
     "pg_collation",
@@ -1951,6 +1952,23 @@ pub(crate) fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]
             ("rolbypassrls", BOOL),
             ("rolconfig", ARRAY),
             ("oid", I64),
+        ],
+        // A superuser's alone (`privilege_statements::check`). `rolpassword`
+        // is NULL through SQL whoever asks: the verifiers stay in the role
+        // catalogue no statement reads.
+        "pg_authid" => &[
+            ("oid", I64),
+            ("rolname", STRING),
+            ("rolsuper", BOOL),
+            ("rolinherit", BOOL),
+            ("rolcreaterole", BOOL),
+            ("rolcreatedb", BOOL),
+            ("rolcanlogin", BOOL),
+            ("rolreplication", BOOL),
+            ("rolbypassrls", BOOL),
+            ("rolconnlimit", I32),
+            ("rolpassword", STRING),
+            ("rolvaliduntil", DATETIME),
         ],
         "pg_auth_members" => &[
             ("oid", I64),
@@ -2530,6 +2548,26 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                     V::B(r.superuser),
                     if r.config.is_empty() { V::N } else { V::TA(r.config.clone()) },
                     V::I(r.oid),
+                ]
+            })
+            .collect(),
+        "pg_authid" => model
+            .roles
+            .iter()
+            .map(|r| {
+                vec![
+                    V::I(r.oid),
+                    t(&r.name),
+                    V::B(r.superuser),
+                    V::B(true),
+                    V::B(r.superuser || r.create_role),
+                    V::B(r.superuser || r.create_db),
+                    V::B(r.login),
+                    V::B(r.superuser),
+                    V::B(r.superuser),
+                    V::I(r.conn_limit),
+                    V::N,
+                    r.valid_until_us.map_or(V::N, |us| t(crate::core::value_codec::format_timestamp_us(us))),
                 ]
             })
             .collect(),

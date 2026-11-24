@@ -453,6 +453,14 @@ pub(super) async fn check(database: &Arc<Database>, state: &SessionState, stmt: 
     }
     let me = state.principal.name.as_str();
     let tx = state.current_tx();
+    // `pg_authid`, as in PostgreSQL, is a superuser's to read.
+    if crate::core::sql_scan::contains_ignore_ascii_case(stmt, b"pg_authid")
+        && crate::core::rql::lock_set::named_words(stmt)
+            .iter()
+            .any(|w| !w.alias && w.name.rsplit('.').next().unwrap_or(&w.name).eq_ignore_ascii_case("pg_authid"))
+    {
+        return Some(("42501", "permission denied for table pg_authid".to_string()));
+    }
     let rows = match privileges::load_shared(database, tx).await {
         Ok(rows) => rows,
         Err(e) => return Some(("42501", format!("permission denied: the privilege catalogue could not be read ({e})"))),

@@ -60,6 +60,7 @@ const VIEWS: &[&str] = &[
     "pg_constraint",
     "pg_am",
     "pg_roles",
+    "pg_authid",
     "pg_auth_members",
     "pg_user",
     "pg_collation",
