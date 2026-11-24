@@ -114,7 +114,8 @@ pub fn privileges_for(privs: Vec<String>, valid: &[&str]) -> Result<Vec<String>,
     if privs.len() == TABLE_PRIVILEGES.len() && privs.iter().zip(TABLE_PRIVILEGES).all(|(a, b)| a == b) {
         return Ok(valid.iter().map(|p| p.to_string()).collect());
     }
-    match privs.iter().find(|p| !valid.contains(&p.as_str())) {
+    let base = |p: &String| p.split('(').next().unwrap_or(p).to_string();
+    match privs.iter().find(|p| !valid.contains(&base(p).as_str())) {
         Some(p) => Err(p.clone()),
         None => Ok(privs),
     }
@@ -158,6 +159,30 @@ pub const DEFINER: &str = "DEFINER";
 /// Whether the routine kept under `key` is `SECURITY DEFINER`.
 pub fn is_definer(rows: &[AclRow], key: &str) -> bool {
     rows.iter().any(|r| r.relation == key && r.privilege == DEFINER)
+}
+
+/// A privilege written with columns, `SELECT(a,b)`: the privilege and its
+/// columns. `None` for a table-wide one.
+pub fn column_privilege(privilege: &str) -> Option<(&str, Vec<&str>)> {
+    let (base, rest) = privilege.split_once('(')?;
+    Some((base, rest.trim_end_matches(')').split(',').collect()))
+}
+
+/// The ACL privilege of one column's grant: `SELECT:a`. Kept apart from
+/// the table's own, so no table-wide check reads it as one.
+pub fn column_key(privilege: &str, column: &str) -> String {
+    format!("{privilege}:{column}")
+}
+
+/// The columns of `relation` on which `role` holds `privilege` by a column
+/// grant (`GRANT SELECT (a) ON t`), through its roles and PUBLIC.
+pub fn granted_columns(rows: &[AclRow], role: &str, relation: &str, privilege: &str) -> Vec<String> {
+    let acting = roles_of(rows, role);
+    let prefix = format!("{privilege}:");
+    rows.iter()
+        .filter(|r| r.relation == relation && (r.grantee == "public" || acting.contains(&r.grantee)))
+        .filter_map(|r| r.privilege.strip_prefix(&prefix).map(str::to_string))
+        .collect()
 }
 
 /// One option of a role membership.
@@ -245,11 +270,25 @@ fn privilege_list(text: &str) -> Result<Vec<String>, Refusal> {
     }
     let mut out = Vec::new();
     for piece in crate::core::sql_scan::split_top_level(text, b',') {
-        let p = piece.trim().to_ascii_uppercase();
-        if p.contains('(') {
-            return Err(("0A000", "column privileges are not supported yet".to_string()));
+        let piece = piece.trim();
+        // `SELECT (a, b)`: a column privilege, kept as `SELECT(a,b)` with
+        // its names folded as identifiers are (R2).
+        if let Some(open) = piece.find('(') {
+            let base = piece[..open].trim().to_ascii_uppercase();
+            let Some(inner) = piece[open + 1..].trim_end().strip_suffix(')') else {
+                return Err(("42601", format!("syntax error in the column list of {base}")));
+            };
+            if !matches!(base.as_str(), "SELECT" | "INSERT" | "UPDATE" | "REFERENCES") {
+                return Err(("0LP01", format!("invalid privilege type {base} for column")));
+            }
+            let columns: Vec<String> = crate::core::sql_scan::split_top_level(inner, b',').into_iter().map(ident).collect();
+            if columns.iter().any(|c| c.is_empty()) {
+                return Err(("42601", format!("an empty name in the column list of {base}")));
+            }
+            out.push(format!("{base}({})", columns.join(",")));
+            continue;
         }
-        out.push(p);
+        out.push(piece.to_ascii_uppercase());
     }
     Ok(out)
 }

@@ -174,8 +174,26 @@ where
                 }
                 for (table, shown) in &tables {
                     for p in &privs {
-                        if !admin && !privileges::may_grant(&rows, &me, table, p) {
+                        if !admin && !privileges::may_grant(&rows, &me, table, privileges::column_privilege(p).map_or(p.as_str(), |(base, _)| base)) {
                             return Err(fail("42501", format!("permission denied for {label} {shown}")));
+                        }
+                        if let Some((base, columns)) = privileges::column_privilege(p) {
+                            if label != "table" {
+                                return Err(fail("0LP01", format!("column privileges are for tables, not a {label}")));
+                            }
+                            if !admin && !privileges::may_grant(&rows, &me, table, base) {
+                                return Err(fail("42501", format!("permission denied for {label} {shown}")));
+                            }
+                            for column in columns {
+                                if !column_exists(database, table, column) {
+                                    return Err(fail("42703", format!("column \"{column}\" of relation \"{shown}\" does not exist")));
+                                }
+                                for grantee in &grantees {
+                                    let row = AclRow { relation: table.clone(), grantee: grantee.clone(), privilege: privileges::column_key(base, column), grantor: me.clone(), grantable };
+                                    privileges::put(database, &row, tx).await.map_err(|e| fail("XX000", e))?;
+                                }
+                            }
+                            continue;
                         }
                         for grantee in &grantees {
                             // PUBLIC's EXECUTE is the default: granting it
@@ -199,8 +217,22 @@ where
                     .map_err(|p| fail("0LP01", format!("invalid privilege type {p} for {label}")))?;
                 for (table, shown) in &tables {
                     for p in &privs {
-                        if !admin && !privileges::may_grant(&rows, &me, table, p) {
+                        if !admin && !privileges::may_grant(&rows, &me, table, privileges::column_privilege(p).map_or(p.as_str(), |(base, _)| base)) {
                             return Err(fail("42501", format!("permission denied for {label} {shown}")));
+                        }
+                        if let Some((base, columns)) = privileges::column_privilege(p) {
+                            for column in columns {
+                                for grantee in &grantees {
+                                    let filter = format!(
+                                        "relation = {} AND grantee = {} AND privilege = {}",
+                                        crate::auth::quote(table),
+                                        crate::auth::quote(grantee),
+                                        crate::auth::quote(&privileges::column_key(base, column))
+                                    );
+                                    privileges::delete_where(database, &filter, tx).await.map_err(|e| fail("XX000", e))?;
+                                }
+                            }
+                            continue;
                         }
                         for grantee in &grantees {
                             if p == "EXECUTE" && grantee == "public" && !grant_option_only {
@@ -534,7 +566,9 @@ pub(super) async fn check(database: &Arc<Database>, state: &SessionState, stmt: 
             Ok(view) => view,
             Err(e) => return Some(("42501", format!("permission denied: the view catalogue could not be read ({e})"))),
         };
-        if !privileges::allows(&rows, me, &r.name, privilege) {
+        if !privileges::allows(&rows, me, &r.name, privilege)
+            && (view.is_some() || !columns_suffice(database, &rows, me, &r.name, privilege, stmt, r.span.end))
+        {
             let noun = if view.is_some() { "view" } else { "table" };
             return Some(("42501", format!("permission denied for {noun} {}", r.name)));
         }
@@ -548,6 +582,123 @@ pub(super) async fn check(database: &Arc<Database>, state: &SessionState, stmt: 
         }
     }
     None
+}
+
+/// Whether `table` has a live column `column`.
+fn column_exists(database: &Arc<Database>, table: &str, column: &str) -> bool {
+    database
+        .schema_view(table)
+        .is_some_and(|v| v.schema().fields.iter().any(|f| !f.is_deleted && f.name == column))
+}
+
+/// Whether `role`'s column grants on `table` cover what `stmt` does with it
+/// (R2), for a role without the table-wide `privilege`. Conservative: a
+/// word of the statement that names a column of the table counts as a use
+/// of it, wherever it stands, so an alias spelled as a column may refuse
+/// what PostgreSQL allows, never the other way. A `*` (other than
+/// `count(*)`) reads every column and needs the table-wide grant; an INSERT
+/// names its columns; an UPDATE's SET targets need UPDATE on each, what it
+/// reads SELECT or UPDATE; DELETE has no column form.
+fn columns_suffice(database: &Arc<Database>, rows: &[AclRow], role: &str, table: &str, privilege: &str, stmt: &str, after_ref: usize) -> bool {
+    let granted = privileges::granted_columns(rows, role, table, privilege);
+    if granted.is_empty() || privilege == "DELETE" {
+        return false;
+    }
+    let Some(view) = database.schema_view(table) else {
+        return false;
+    };
+    let columns: Vec<String> = view.schema().fields.iter().filter(|f| !f.is_deleted).map(|f| f.name.clone()).collect();
+    if star_outside_count(stmt) {
+        return false;
+    }
+    let used: Vec<String> = crate::core::rql::lock_set::named_words(stmt)
+        .into_iter()
+        .filter(|w| !w.alias)
+        .map(|w| w.name)
+        .filter(|n| columns.contains(n))
+        .collect();
+    let selectable = privileges::granted_columns(rows, role, table, "SELECT");
+    let readable = |c: &String| granted.contains(c) || selectable.contains(c) || privileges::allows(rows, role, table, "SELECT");
+    match privilege {
+        "SELECT" => used.iter().all(|c| granted.contains(c)),
+        "INSERT" => {
+            // `INSERT INTO t (a, b) …`: the list is what is written.
+            let rest = stmt.get(after_ref..).unwrap_or("").trim_start();
+            let Some(list) = rest.strip_prefix('(') else {
+                return false;
+            };
+            let Some(close) = list.find(')') else {
+                return false;
+            };
+            let targets: Vec<String> = list[..close].split(',').map(|c| object_name(c.trim())).collect();
+            targets.iter().all(|c| granted.contains(c)) && used.iter().all(readable)
+        }
+        "UPDATE" => {
+            let Some(targets) = set_targets(stmt) else {
+                return false;
+            };
+            targets.iter().all(|c| granted.contains(c)) && used.iter().all(readable)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `stmt` has a `*` outside quotes and comments that is not
+/// `count(*)`'s.
+fn star_outside_count(stmt: &str) -> bool {
+    use crate::core::sql_scan::{skip_comment, skip_quoted};
+    let b = stmt.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(end) = skip_comment(b, i).or_else(|| skip_quoted(b, i)) {
+            i = end.max(i + 1);
+            continue;
+        }
+        if b[i] == b'*' {
+            let before = stmt[..i].trim_end();
+            let after = stmt[i + 1..].trim_start();
+            let counted = before.ends_with('(') && after.starts_with(')') && {
+                let head = before[..before.len() - 1].trim_end();
+                head.len() >= 5 && head[head.len() - 5..].eq_ignore_ascii_case("count")
+            };
+            // Multiplication, `a * b`, is no column list: a value on both
+            // sides, neither a keyword (`DISTINCT *`, `ON (a) * FROM`).
+            let last_word = before.rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next().unwrap_or("").to_ascii_uppercase();
+            let next_word = after.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next().unwrap_or("").to_ascii_uppercase();
+            let value_before = before.ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == ')' || c == '"')
+                && !matches!(last_word.as_str(), "SELECT" | "DISTINCT" | "ALL" | "RETURNING" | "BY" | "ON");
+            let value_after = after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '(' || c == '"' || c == '\'')
+                && !matches!(next_word.as_str(), "FROM" | "WHERE" | "RETURNING" | "INTO" | "EXCEPT" | "UNION" | "INTERSECT");
+            let arithmetic = value_before && value_after && !before.ends_with(')') || (value_before && value_after && after.starts_with(|c: char| c.is_ascii_digit()));
+            if !counted && !arithmetic {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The columns an UPDATE's SET assigns, `None` when they cannot be read.
+fn set_targets(stmt: &str) -> Option<Vec<String>> {
+    let at = crate::core::rql::join::find_keyword(stmt, "SET", 0)?;
+    let rest = &stmt[at + 3..];
+    let end = ["WHERE", "FROM", "RETURNING"]
+        .iter()
+        .filter_map(|k| crate::core::rql::join::find_keyword(rest, k, 0))
+        .min()
+        .unwrap_or(rest.len());
+    let mut out = Vec::new();
+    for assignment in crate::core::sql_scan::split_top_level(&rest[..end], b',') {
+        let target = assignment.split('=').next()?.trim();
+        // `(a, b) = (…)`.
+        if let Some(list) = target.strip_prefix('(') {
+            out.extend(list.trim_end_matches(')').split(',').map(|c| object_name(c.trim())));
+        } else {
+            out.push(object_name(target));
+        }
+    }
+    Some(out)
 }
 
 /// The name a DDL word names: unquoted folded, quoted kept, schema and an
