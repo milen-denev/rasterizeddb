@@ -84,8 +84,8 @@ pub fn calls_volatile(text: &str) -> bool {
 
 /// [`fold_defaults`], then [`fold`] on what it made: a replicating node's
 /// write, with every value a peer would compute anew written into it.
-pub fn fold_write(sql: &str, database: &crate::core::database::Database) -> Fold {
-    match fold_defaults(sql, database) {
+pub async fn fold_write(sql: &str, database: &crate::core::database::Database) -> Fold {
+    match fold_defaults(sql, database).await {
         Fold::Refused(message) => Fold::Refused(message),
         Fold::Unchanged => fold(sql),
         Fold::Rewritten(text) => match fold(&text) {
@@ -343,18 +343,18 @@ fn top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
 /// * `INSERT … SELECT`: a clock default (`now()`) is added to the query's
 ///   output, one instant for every row as it is anyway; a per-row one
 ///   (`gen_random_uuid()`) is refused, since no literal can stand for it;
-/// * `UPDATE … SET c = DEFAULT` with such a default, and `ALTER TABLE … ADD
-///   COLUMN` with one (its backfill fills every existing row), are refused.
+/// * `UPDATE … SET c = DEFAULT` with such a default is refused;
+/// * `ALTER TABLE … ADD COLUMN` with one: see [`fold_add_column_default`].
 ///
 /// The message says what to write instead. Run before [`fold`], on a
 /// replicating node only.
-pub fn fold_defaults(sql: &str, database: &crate::core::database::Database) -> Fold {
+pub async fn fold_defaults(sql: &str, database: &crate::core::database::Database) -> Fold {
     let lower = sql.to_ascii_lowercase();
     let first = first_word(sql).map(|w| w.to_ascii_uppercase());
     match first.as_deref() {
         Some("INSERT") => fold_insert_defaults(sql, database),
         Some("UPDATE") if lower.contains("default") => refuse_update_default(sql, database),
-        Some("ALTER") if lower.contains("default") => refuse_add_column_default(sql),
+        Some("ALTER") if lower.contains("default") => fold_add_column_default(sql, database).await,
         _ => Fold::Unchanged,
     }
 }
@@ -665,38 +665,120 @@ fn refuse_update_default(sql: &str, database: &crate::core::database::Database) 
 
 /// `ALTER TABLE … ADD [COLUMN] c type … DEFAULT <varying>`: its backfill
 /// evaluates the default for every existing row, on each node.
-fn refuse_add_column_default(sql: &str) -> Fold {
-    let t = sql.trim();
+///
+/// * a clock default (`now()`, `CURRENT_TIMESTAMP`) is one instant for every
+///   row: the column is added with that instant as a literal default, and the
+///   same statement then sets the declared one (`ADD COLUMN c … DEFAULT
+///   '<instant>', ALTER COLUMN c SET DEFAULT now()`), so every node backfills
+///   the same value and later rows still take `now()`;
+/// * a per-row one (`gen_random_uuid()`) is refused while the table may hold
+///   rows; on an empty table it fills nothing and runs as written;
+/// * `ADD COLUMN IF NOT EXISTS` for a column the table has does nothing, and
+///   runs as written.
+async fn fold_add_column_default(sql: &str, database: &crate::core::database::Database) -> Fold {
+    let t = sql.trim().trim_end_matches(';').trim_end();
     let Some(rest) = strip_word(t, "ALTER").and_then(|r| strip_word(r, "TABLE")) else { return Fold::Unchanged };
-    let Some(add_at) = top_level_keyword(rest, "ADD") else { return Fold::Unchanged };
-    for action in split_top_commas(&rest[add_at..]) {
-        let Some(column_text) = strip_word(action.trim(), "ADD") else { continue };
-        let column_text = strip_word(column_text, "COLUMN").unwrap_or(column_text);
-        let column_text = strip_word(column_text, "IF")
+    let rest = strip_word(rest, "IF").and_then(|r| strip_word(r, "EXISTS")).unwrap_or(rest);
+    let rest = strip_word(rest, "ONLY").unwrap_or(rest);
+    let Some((table_text, actions_text)) = take_identifier(rest) else { return Fold::Unchanged };
+    let table = stored_name(table_text);
+    let actions_at = t.len() - actions_text.len();
+    let Some(view) = database.schema_view(&table) else { return Fold::Unchanged };
+    let existing: Vec<String> = view
+        .schema()
+        .fields
+        .iter()
+        .filter(|f| !f.is_deleted)
+        .map(|f| f.name.to_ascii_lowercase())
+        .collect();
+    drop(view);
+
+    let mut actions: Vec<String> = Vec::new();
+    let mut appended: Vec<String> = Vec::new();
+    let mut changed = false;
+    for action in split_top_commas(actions_text) {
+        let action = action.trim();
+        let Some(after_add) = strip_word(action, "ADD") else {
+            actions.push(action.to_string());
+            continue;
+        };
+        let after_column = strip_word(after_add, "COLUMN").unwrap_or(after_add);
+        let if_not_exists = strip_word(after_column, "IF")
             .and_then(|r| strip_word(r, "NOT"))
-            .and_then(|r| strip_word(r, "EXISTS"))
-            .unwrap_or(column_text);
-        if ["CONSTRAINT", "PRIMARY", "UNIQUE", "FOREIGN", "CHECK"]
+            .and_then(|r| strip_word(r, "EXISTS"));
+        let definition = if_not_exists.unwrap_or(after_column);
+        let is_constraint = ["CONSTRAINT", "PRIMARY", "UNIQUE", "FOREIGN", "CHECK", "EXCLUDE"]
             .iter()
-            .any(|k| strip_word(column_text, k).is_some())
-        {
+            .any(|k| strip_word(definition, k).is_some());
+        let (without_default, expression) = crate::core::rql::column_default::split_clause(definition);
+        let varying = expression.as_deref().filter(|e| varies(e));
+        let (Some(expression), false) = (varying, is_constraint) else {
+            actions.push(action.to_string());
+            continue;
+        };
+        let column = take_identifier(definition).map(|(c, _)| stored_name(c)).unwrap_or_default();
+        if if_not_exists.is_some() && existing.iter().any(|c| c.eq_ignore_ascii_case(&column)) {
+            // Does nothing on any node.
+            actions.push(action.to_string());
             continue;
         }
-        let Some(default_at) = top_level_keyword(column_text, "DEFAULT") else { continue };
-        let expression = column_text[default_at + "DEFAULT".len()..].trim();
-        if !varies(expression) {
+        if varies_per_row(expression) {
+            if table_may_have_rows(database, &table).await {
+                return refusal(
+                    &column,
+                    expression,
+                    "this ALTER TABLE (its backfill fills every existing row)",
+                    "Add the column without the DEFAULT (NULL allowed), fill the existing rows with values \
+                     computed in the client, then ALTER COLUMN … SET NOT NULL and SET DEFAULT, which fill no row. \
+                     On an empty table it runs as written",
+                );
+            }
+            actions.push(action.to_string());
             continue;
         }
-        let column = take_identifier(column_text).map(|(c, _)| stored_name(c)).unwrap_or_default();
-        return refusal(
-            &column,
-            expression.split_whitespace().next().unwrap_or(expression),
-            "this ALTER TABLE (its backfill fills every existing row)",
-            "Add the column without the DEFAULT, fill the existing rows with values computed in the client, \
-             then ALTER COLUMN … SET DEFAULT, which fills no row",
-        );
+        // A clock default: one instant, as the backfill would take anyway.
+        let Some(instant) = evaluate_as_text(expression) else {
+            return refusal(
+                &column,
+                expression,
+                "this ALTER TABLE (its backfill fills every existing row)",
+                "Add the column with a constant DEFAULT, then ALTER COLUMN … SET DEFAULT",
+            );
+        };
+        let head = &after_add[..after_add.len() - after_column.len()];
+        let keywords = if if_not_exists.is_some() { "IF NOT EXISTS " } else { "" };
+        actions.push(format!(
+            "ADD {}{}{} DEFAULT {}",
+            head,
+            keywords,
+            without_default.trim(),
+            crate::core::value_codec::quote_sql(&instant)
+        ));
+        appended.push(format!(
+            "ALTER COLUMN {} SET DEFAULT {}",
+            crate::core::rql::ctas::quote_ident(&column),
+            expression
+        ));
+        changed = true;
     }
-    Fold::Unchanged
+    if !changed {
+        return Fold::Unchanged;
+    }
+    actions.extend(appended);
+    Fold::Rewritten(format!("{} {}", t[..actions_at].trim_end(), actions.join(", ")))
+}
+
+/// Whether `table` may hold a row: a plain table with any pointer record
+/// (a deleted row's included); a partitioned one, always.
+async fn table_may_have_rows(database: &crate::core::database::Database, table: &str) -> bool {
+    use crate::core::storage_providers::traits::StorageIO;
+    match database.relation(table) {
+        Some(crate::core::database::relation::Relation::Plain(t)) => match t.data() {
+            Ok(data) => data.io_pointers.get_len().await > 0,
+            Err(_) => true,
+        },
+        _ => true,
+    }
 }
 
 /// `text` past a leading `word` (any case) and the whitespace after it.
@@ -821,14 +903,23 @@ mod tests {
             let response = execute(recognize_query_purpose(sql).unwrap(), db.clone()).await;
             assert_ne!(response.first(), Some(&3), "{sql}: {}", String::from_utf8_lossy(&response[1..]));
         }
-        let rewritten = |sql: &str| match fold_write(sql, &db) {
-            Fold::Rewritten(text) => text,
-            other => panic!("{sql}: {other:?}"),
+        let fold_now = |sql: &'static str| {
+            let db = db.clone();
+            async move { fold_write(sql, &db).await }
+        };
+        let rewritten = |sql: &'static str| {
+            let db = db.clone();
+            async move {
+                match fold_write(sql, &db).await {
+                    Fold::Rewritten(text) => text,
+                    other => panic!("{sql}: {other:?}"),
+                }
+            }
         };
 
         // Left out: a literal per tuple, each tuple its own UUID; the constant
         // default stays the table's to fill.
-        let out = rewritten("INSERT INTO dv (id) VALUES (1), (2)");
+        let out = rewritten("INSERT INTO dv (id) VALUES (1), (2)").await;
         assert!(out.contains("\"u\"") || out.contains(" u"), "{out}");
         assert!(!out.contains("gen_random_uuid()") && !out.contains("now()"), "{out}");
         assert_eq!(out.matches("::uuid").count(), 2, "{out}");
@@ -838,30 +929,46 @@ mod tests {
         assert_ne!(uuids[0].rsplit('\'').nth(1), uuids[1].rsplit('\'').nth(1), "{out}");
 
         // `DEFAULT` written in a slot, and DEFAULT VALUES.
-        assert!(!rewritten("INSERT INTO dv (id, u) VALUES (3, DEFAULT)").contains("DEFAULT"));
-        assert!(rewritten("INSERT INTO dv DEFAULT VALUES").contains("::uuid"));
+        assert!(!rewritten("INSERT INTO dv (id, u) VALUES (3, DEFAULT)").await.contains("DEFAULT"));
+        assert!(rewritten("INSERT INTO dv DEFAULT VALUES").await.contains("::uuid"));
         // No column list: the tuple's columns are the table's first ones.
-        assert!(rewritten("INSERT INTO dv VALUES (4)").contains("::uuid"));
+        assert!(rewritten("INSERT INTO dv VALUES (4)").await.contains("::uuid"));
         // RETURNING and ON CONFLICT stay where they were.
-        let out = rewritten("INSERT INTO dv (id) VALUES (5) ON CONFLICT (id) DO NOTHING RETURNING id");
+        let out = rewritten("INSERT INTO dv (id) VALUES (5) ON CONFLICT (id) DO NOTHING RETURNING id").await;
         assert!(out.ends_with("ON CONFLICT (id) DO NOTHING RETURNING id"), "{out}");
 
         // A query's rows: a clock default is one instant for all of them; a
         // per-row one is refused.
-        let out = rewritten("INSERT INTO clock_only (id) SELECT a.id FROM dv a JOIN dv b ON a.id = b.id");
+        let out = rewritten("INSERT INTO clock_only (id) SELECT a.id FROM dv a JOIN dv b ON a.id = b.id").await;
         assert!(out.contains("::timestamptz") && out.contains("ON a.id = b.id"), "{out}");
-        assert!(matches!(fold_write("INSERT INTO dv (id) SELECT 6", &db), Fold::Refused(m) if m.contains("\"u\"")));
+        assert!(matches!(fold_now("INSERT INTO dv (id) SELECT 6").await, Fold::Refused(m) if m.contains("\"u\"")));
         // SET c = DEFAULT and an ADD COLUMN backfill, refused.
-        assert!(matches!(fold_write("UPDATE dv SET u = DEFAULT WHERE id = 1", &db), Fold::Refused(_)));
+        assert!(matches!(fold_now("UPDATE dv SET u = DEFAULT WHERE id = 1").await, Fold::Refused(_)));
+        // dv has rows by now? It has none: the folds above wrote nothing.
+        // An empty table's backfill fills nothing, so a per-row default runs.
         assert!(matches!(
-            fold_write("ALTER TABLE dv ADD COLUMN w UUID DEFAULT gen_random_uuid()", &db),
+            fold_now("ALTER TABLE dv ADD COLUMN w UUID DEFAULT gen_random_uuid()").await,
+            Fold::Unchanged
+        ));
+        let response = execute(recognize_query_purpose("INSERT INTO plain (id) VALUES (1)").unwrap(), db.clone()).await;
+        assert_ne!(response.first(), Some(&3));
+        assert!(matches!(
+            fold_now("ALTER TABLE plain ADD COLUMN w UUID NOT NULL DEFAULT gen_random_uuid()").await,
             Fold::Refused(_)
         ));
-        assert!(matches!(fold_write("ALTER TABLE dv ADD COLUMN z INTEGER DEFAULT 7", &db), Fold::Unchanged));
-        // A table without one, and a write that names the column: as written.
-        assert!(matches!(fold_write("INSERT INTO plain (id) VALUES (1)", &db), Fold::Unchanged));
+        // A clock default backfills one instant, then keeps now().
+        let out = rewritten("ALTER TABLE plain ADD COLUMN IF NOT EXISTS at TIMESTAMPTZ NOT NULL DEFAULT now()").await;
+        assert!(out.contains("DEFAULT '") && out.ends_with("ALTER COLUMN \"at\" SET DEFAULT now()") || out.ends_with("ALTER COLUMN at SET DEFAULT now()"), "{out}");
+        // IF NOT EXISTS for a column the table has: nothing to fill.
         assert!(matches!(
-            fold_write("INSERT INTO dv (id, u, n) VALUES (7, '00000000-0000-0000-0000-000000000007', '2020-01-01')", &db),
+            fold_now("ALTER TABLE plain ADD COLUMN IF NOT EXISTS k UUID DEFAULT gen_random_uuid()").await,
+            Fold::Unchanged
+        ));
+        assert!(matches!(fold_now("ALTER TABLE dv ADD COLUMN z INTEGER DEFAULT 7").await, Fold::Unchanged));
+        // A table without one, and a write that names the column: as written.
+        assert!(matches!(fold_now("INSERT INTO plain (id) VALUES (1)").await, Fold::Unchanged));
+        assert!(matches!(
+            fold_now("INSERT INTO dv (id, u, n) VALUES (7, '00000000-0000-0000-0000-000000000007', '2020-01-01')").await,
             Fold::Unchanged
         ));
         drop(db);

@@ -10,8 +10,10 @@
   value is now written into the replicated `INSERT … VALUES` / `DEFAULT VALUES`, once per row. Where no
   single value can stand for it, the statement is refused (0A000) with what to write instead: an
   `INSERT … SELECT` that leaves such a column to a per-row default, `UPDATE … SET c = DEFAULT`, and
-  `ALTER TABLE … ADD COLUMN … DEFAULT` with one (its backfill). `uuidv7()` written in a statement is now
-  folded like `gen_random_uuid()`.
+  `ALTER TABLE … ADD COLUMN … DEFAULT gen_random_uuid()` on a table that has rows (its backfill). An
+  `ADD COLUMN … DEFAULT now()` backfills one instant on every node and keeps `now()` as the default; on an
+  empty table, or with `IF NOT EXISTS` for a column that exists, `ADD COLUMN` runs as written.
+  `uuidv7()` written in a statement is now folded like `gen_random_uuid()`. Only replicating nodes change.
 - `SELECT -id AS id … ORDER BY id` (an output alias shadowing a column), and `ORDER BY 1`, sorted by the stored column, including under `LIMIT`, `DISTINCT` and window functions.
 - Set operations mixing type families (`UNION` of `text` and `bigint`) answered with blank, lost, NULL or garbage values. They now fail with 42804, as in PostgreSQL.
 - `id IN ((correlated scalar subquery), 3)` in a select list was true for every row.
