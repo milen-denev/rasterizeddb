@@ -273,11 +273,23 @@ pub(super) async fn check(database: &Arc<Database>, state: &SessionState, stmt: 
         }
         return None;
     }
+    let locking = locking_read(stmt);
     for r in crate::core::rql::lock_set::relation_references(stmt) {
         if r.name.starts_with("__") || !relation_exists(database, &r.name, tx).await {
             continue;
         }
-        let privilege = if r.mode == crate::core::mvcc::table_locks::TableMode::AccessShare { "SELECT" } else { write };
+        // What this reference does, from the keyword written before it, so
+        // a data-modifying CTE (`WITH d AS (DELETE FROM t …) SELECT …`)
+        // needs DELETE on t, not SELECT (roles plan R1).
+        let privilege = if r.mode == crate::core::mvcc::table_locks::TableMode::AccessShare {
+            "SELECT"
+        } else {
+            written_as(stmt, r.span.start).unwrap_or(write)
+        };
+        // A locking read needs UPDATE besides SELECT, as in PostgreSQL.
+        if privilege == "SELECT" && locking && !privileges::allows(&rows, me, &r.name, "UPDATE") {
+            return Some(("42501", format!("permission denied for table {}", r.name)));
+        }
         let view = match crate::core::rql::views::lookup(database, &r.name, tx).await {
             Ok(view) => view,
             Err(e) => return Some(("42501", format!("permission denied: the view catalogue could not be read ({e})"))),
@@ -296,6 +308,42 @@ pub(super) async fn check(database: &Arc<Database>, state: &SessionState, stmt: 
         }
     }
     None
+}
+
+/// The privilege a write target needs, from the keyword written right
+/// before it at byte `at`: `INSERT INTO`, `UPDATE [ONLY]`, `DELETE FROM`,
+/// `MERGE INTO`.
+fn written_as(stmt: &str, at: usize) -> Option<&'static str> {
+    let before = stmt.get(..at)?.to_ascii_uppercase();
+    let words: Vec<&str> = before.split_whitespace().rev().take(3).collect();
+    match words.as_slice() {
+        ["INTO", "INSERT", ..] => Some("INSERT"),
+        ["INTO", "MERGE", ..] => Some("UPDATE"),
+        ["UPDATE", ..] | ["ONLY", "UPDATE", ..] => Some("UPDATE"),
+        ["FROM", "DELETE", ..] | ["ONLY", "FROM", "DELETE"] => Some("DELETE"),
+        _ => None,
+    }
+}
+
+/// Whether `stmt` takes row locks for update outside quotes and comments
+/// (`FOR UPDATE`, `FOR NO KEY UPDATE`).
+fn locking_read(stmt: &str) -> bool {
+    use crate::core::sql_scan::{skip_comment, skip_quoted};
+    let b = stmt.as_bytes();
+    let mut plain = String::with_capacity(stmt.len());
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(end) = skip_comment(b, i).or_else(|| skip_quoted(b, i)) {
+            plain.push(' ');
+            i = end.max(i + 1);
+            continue;
+        }
+        plain.push(b[i] as char);
+        i += 1;
+    }
+    let up = plain.to_ascii_uppercase();
+    let w: Vec<&str> = up.split_whitespace().collect();
+    w.windows(2).any(|p| p == ["FOR", "UPDATE"]) || w.windows(4).any(|p| p == ["FOR", "NO", "KEY", "UPDATE"])
 }
 
 /// How deep views over views are followed before the check gives up and
