@@ -1043,31 +1043,51 @@ the hottest path and cannot be trusted without them:
 5. `SeqReserve` and `Schema` entries; the in-place update path off;
    learner relocation through the backup snapshot routine.
 
-### 4.8 Phases B4 to B6 (outline only, replanned when B3 lands)
+### 4.8 Phases B4 to B6 (replanned 2026-11-24, after B3 landed)
 
-- **B4:**
-  - online range moves on the Raft log (`Watch`/`Drained`/`TxnData`);
-  - an openraft authority;
-  - a gather for `DISTINCT`, windows and joins (`RowSet::Serialized`,
-    `join.rs:374`, under `RDB_JOIN_MEMORY_MB`);
-  - correlated tenant-predicate propagation;
-  - routing `kv_cache` by key;
-  - a gateway hub for `LISTEN`/`NOTIFY`;
-  - MySQL/TDS on gateways;
-  - reshape and physical ALTER under the schema epoch.
-- **B5 (`sharding_2pc`):**
-  - opt-in 2PC with the anchor-log decision;
-  - every rule in sharding.md §7's table: a Prepared outcome and WAL kind,
-    restart rebuilding `running`, `settle_bound`/forget/settled-block
-    exclusions;
-  - reference tables;
-  - decision-pausing marks.
-- **B6:**
-  - closed timestamps and consistent cross-shard snapshots;
-  - follower and lease reads;
-  - distributed deadlock detection;
-  - online automatic rebalancing (the offline balancer is §4.6b);
-  - clone splits.
+What B3 left behind decides the order. Raft groups exist per shard, with
+leader-only serving and a working `read_index`. rshard is strictly
+request/response: a shard cannot push a frame. Moves are fenced and
+offline (§4.6b). Items already done are struck from the list:
+- routing `kv_cache` by key (built in B1);
+- 2PC with the anchor decision log (built in B5);
+- reference tables (built in B5);
+- the openraft authority (dropped by D3: our own Raft).
+
+Each item below names its design, its size and its test bar. The test
+bar is part of the item: an item is not done until its bar passes.
+
+**B4: what a running cluster needs to stay up and correct**
+
+| # | Item | Design | Size | Test bar |
+|---|---|---|---|---|
+| B4.1 | **Follower and lease reads** (moved up from B6) | A follower serves a read once `read_index` from the leader says its applied index covers it (ReadIndex, dissertation §6.4). The gateway chooses with `SET rdb.read_from = leader\|any`. Leases (§6.4.1) come later, behind a clock-drift bound | ~0.6k | Raft sim: a ReadIndex read never returns a value older than a committed write. Cluster test: a follower read after a write sees it |
+| B4.2 | **Distributed deadlock detection** (moved up from B6) | Each shard exports its wait-for edges that involve a two-phase global id (`SHOW SHARD WAITS`). The gateway's coordinator polls every `deadlock_timeout` (1 s), finds cycles across shards, and aborts the youngest gid with 40P01. Without 2PC, cross-shard waits are bounded by the `lock_timeout` the gateway already sets (5 s) | ~0.8k | Two sessions, two shards, opposite lock order: both resolve within 2 s, one 40P01. A unit test of cycle detection on random graphs |
+| B4.3 | **LISTEN/NOTIFY hub** | A new rshard pair, `Listen{channels}` / `Notifications{session}`, polled by the gateway's one hub connection per shard. NOTIFY and `pg_notify` run where their transaction runs, are queued at commit on that shard, and are drained by the hub and fanned out to the gateway's listening sessions (NotificationResponse, sent when the session is idle). Several gateways each run a hub | ~0.7k | LISTEN on gateway A, NOTIFY through gateway B on another shard: delivered once, after commit, never on rollback |
+| B4.4 | **Online range moves** | On top of today's fenced move: copy with writes still flowing, then a change-capture catch-up from the source's Raft log (`TxnData` filtered to the range), then a fence held only for the last delta (≤ 1 s), then the map flip. Reuses capture's row images | ~2k | Moves under a write load: no row lost or doubled (sum/count check), writes stalled ≤ 1 s, rollback at every step |
+| B4.5 | **Gather for windows and joins** | Joins whose sides are sharded on different keys, and window functions over a sharded table: each shard returns its rows (`RowSet::Serialized`), and the coordinator shard runs the rest under `RDB_JOIN_MEMORY_MB`, refusing past it. This lifts today's refusal of a sharded table mixed with a non-reference global one | ~2.5k | A differential against one node for 200 generated joins and windows |
+| B4.6 | **Reshape and physical ALTER under the schema epoch** | The DDL fan-out (`rdb-shard ddl`) learns the two-step changes: prepare on every shard, bump the epoch, then apply | ~0.8k | ALTER under load across 3 shards; old-epoch statements are refused with a retry, never misread |
+| B4.7 | **MySQL/TDS on gateways** | The gateway hosts the in-process front ends, translating to pgwire over its virtual sessions, as each server does now | ~1.5k | The MySQL and TDS compat suites through a gateway |
+| B4.8 | **Correlated tenant-predicate propagation** | A tenant key in a join's ON or WHERE routes the whole statement | ~0.5k | Classifier unit tests and a differential |
+
+**B5 remainder**
+
+| # | Item | Design | Size |
+|---|---|---|---|
+| B5.1 | **Atomic reference writes** | A reference-table write runs as a two-phase write over every shard when `sharding_2pc` is on, and is refused under each_shard otherwise | ~0.4k |
+| B5.2 | **Decision-pausing marks** | While a gid is prepared and undecided, rows it wrote stay locked for readers that would need its outcome; they wait for the decision rather than read around it | ~0.6k |
+
+**B6: consistency and elasticity**
+
+| # | Item | Design | Size |
+|---|---|---|---|
+| B6.1 | **Closed timestamps and consistent cross-shard snapshots** | Each leader publishes a closed timestamp: a hybrid-logical-clock time below which no new commit will land. A fan-out read at `AS OF SYSTEM TIME` (or `rdb.consistent_fanout = on`) waits until every part's closed timestamp passes the chosen time, then reads at it | ~2.5k |
+| B6.2 | **Clone splits** | A hot range is split by adding a learner that receives a snapshot, then promoting it and moving half the range by B4.4 | ~1.5k |
+| B6.3 | **Online automatic rebalancing** | The balancer's `--every` uses B4.4's online moves | ~0.3k |
+
+**Order:** B4.1, B4.2, B4.3, B5.1, B4.4, B6.3, B4.6, B4.8, B4.5, B4.7, B5.2,
+B6.1, B6.2. Correctness under failure comes before reach, and reach before
+consistency features.
 
 ### 4.9 The gateway (`rasterizeddb_gateway`)
 
