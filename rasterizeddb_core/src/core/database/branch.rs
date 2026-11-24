@@ -2093,6 +2093,15 @@ pub(super) fn parse(trimmed: &str, upper: &str) -> Option<Result<DatabaseStateme
             };
             Some(Ok(DatabaseStatement::DiffBranch { name, into }))
         }
+        ("CREATE", "BRANCH") | ("RESET", "BRANCH") | ("PROMOTE", "BRANCH") | ("MERGE", "BRANCH")
+            if on_a_shard() && !(words[0] == "MERGE" && words.contains(&"USING")) =>
+        {
+            Some(Err(
+                "0A000: database branches are not supported on a shard: a branch copies this shard's ranges \
+                 alone, under a cluster map that knows nothing of it"
+                    .to_string(),
+            ))
+        }
         ("CREATE", "BRANCH") => Some(parse_create(&words, &tokens, &name_at)),
         ("DROP", "BRANCH") => {
             let if_exists = words.get(2) == Some(&"IF") && words.get(3) == Some(&"EXISTS");
@@ -2137,6 +2146,18 @@ pub(super) fn parse(trimmed: &str, upper: &str) -> Option<Result<DatabaseStateme
         ("MERGE", "BRANCH") if words.contains(&"USING") => None,
         ("MERGE", "BRANCH") => Some(parse_merge(&words, &name_at)),
         _ => None,
+    }
+}
+
+/// True when this node runs as a shard (sharding-plan.md B1a.11).
+fn on_a_shard() -> bool {
+    #[cfg(feature = "sharding")]
+    {
+        crate::core::shard::map_state::current().is_some()
+    }
+    #[cfg(not(feature = "sharding"))]
+    {
+        false
     }
 }
 

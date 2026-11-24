@@ -1679,6 +1679,14 @@ fn main() -> std::io::Result<()> {
     }
 
     if let Some(v) = args.json_shadow_tables {
+        // Shadow tables are plain tables keyed by a per-row reference, not by
+        // the document's shard key, so a shard cannot keep them with their
+        // rows (sharding-plan.md B1a.11).
+        #[cfg(feature = "sharding")]
+        if v && rasterizeddb_core::core::shard::map_state::current().is_some() {
+            eprintln!("--json-shadow-tables is not supported on a shard (--role shard)");
+            std::process::exit(2);
+        }
         let _ = rasterizeddb_core::JSON_SHADOW_TABLES.set(v);
         if v {
             log::info!(
