@@ -1206,6 +1206,44 @@ impl Database {
     }
 }
 
+/// A shard taking in or giving up a span of every partitioned table's map
+/// (sharding-plan.md B2).
+#[cfg(feature = "sharding")]
+impl Database {
+    /// Makes level-0 blocks `[lo, hi)` of partitioned table `name` this
+    /// shard's (`take`) or another's: the span records written durably, then
+    /// the table reopened over the new map, as a reshape is (under the
+    /// partitioned DDL lock, with the schema generation moved so prepared
+    /// statements replan). Returns how many records were written; 0 when the
+    /// span already was.
+    pub(crate) async fn shard_span(&self, name: &str, lo: u64, hi: u64, take: bool) -> io::Result<usize> {
+        let _ddl = self.partition_ddl.lock().await;
+        let Some(old) = self.partitioned_table(name) else {
+            return Ok(0);
+        };
+        old.check()?;
+        let records = old.span_records(lo << 16, (hi as u128) << 16, take).await?;
+        if records.is_empty() {
+            return Ok(0);
+        }
+        let _forget_pause = self.transactions.forget_pause();
+        let changed = super::SchemaChanged(&self.schema_generation);
+        self.schema_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let mut result = Ok(records.len());
+        for rec in &records {
+            if let Err(e) = old.record_span(rec).await {
+                result = Err(e);
+                break;
+            }
+        }
+        // Reopened whatever happened: the log holds every record written.
+        let (new_shell, table) = self.reopen_partitioned(name, &old).await;
+        self.swap_partitioned(name, Arc::new(table), new_shell);
+        drop(changed);
+        result
+    }
+}
+
 /// Reshape (docs/partitioning.md §6.2, phase 5; `partition::reshape`).
 impl Database {
     /// Runs `op` on partitioned table `name`. The caller holds ACCESS

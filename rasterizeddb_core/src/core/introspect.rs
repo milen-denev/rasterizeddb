@@ -69,6 +69,10 @@ pub enum Introspect {
     /// level-0 block range and stored size, what the auto-balancer plans
     /// from (sharding-plan.md §4.6b).
     ShardLoad,
+    /// `SHARD TAKE|GIVE|FENCE|UNFENCE RANGE lo hi` and `SHARD MAP INSTALL
+    /// '<map>'`: a shard's side of a move (sharding-plan.md B2). Admin only
+    /// (`pgwire::privileged_statement`).
+    ShardAdmin(ShardAdmin),
     /// A table's 128-bit schema fingerprint, as cluster DDL compares them
     /// across shards (sharding-plan.md B1a.10).
     SchemaFingerprint(String),
@@ -92,9 +96,61 @@ pub enum Introspect {
     },
 }
 
+/// One `SHARD …` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShardAdmin {
+    /// Blocks `[lo, hi)` come in by this shard's move: marked incoming, and
+    /// every partitioned table's FOREIGN span there made this shard's.
+    Take { lo: u64, hi: u64 },
+    /// Blocks `[lo, hi)` were handed off: every table's span there made
+    /// FOREIGN (its rows kept, unread, until retired) and the ownership
+    /// dropped.
+    Give { lo: u64, hi: u64 },
+    Fence { lo: u64, hi: u64 },
+    Unfence { lo: u64, hi: u64 },
+    /// A newer cluster map, in its text form.
+    MapInstall(String),
+}
+
 // ---------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------
+
+fn parse_shard_admin(trimmed: &str, words: &[&str], original: &[&str]) -> Result<Introspect, String> {
+    let block = |s: &str| -> Result<u64, String> {
+        match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            Some(h) => u64::from_str_radix(h, 16),
+            None => s.parse(),
+        }
+        .map_err(|_| format!("{s:?} is not a block number"))
+    };
+    let range = || -> Result<(u64, u64), String> {
+        if words.get(2).copied() != Some("RANGE") || original.len() != 5 {
+            return Err(format!("the statement is `SHARD {} RANGE <lo> <hi>`", words.get(1).unwrap_or(&"")));
+        }
+        let (lo, hi) = (block(original[3])?, block(original[4])?);
+        if lo >= hi || hi > rasterizeddb_router::shard_map::BLOCKS {
+            return Err(format!("[{lo:#x}, {hi:#x}) is not a range of level-0 blocks"));
+        }
+        Ok((lo, hi))
+    };
+    let admin = match words.get(1).copied() {
+        Some("TAKE") => range().map(|(lo, hi)| ShardAdmin::Take { lo, hi })?,
+        Some("GIVE") => range().map(|(lo, hi)| ShardAdmin::Give { lo, hi })?,
+        Some("FENCE") => range().map(|(lo, hi)| ShardAdmin::Fence { lo, hi })?,
+        Some("UNFENCE") => range().map(|(lo, hi)| ShardAdmin::Unfence { lo, hi })?,
+        Some("MAP") if words.get(2).copied() == Some("INSTALL") => {
+            let at = trimmed.find('\'').ok_or("SHARD MAP INSTALL takes the map's text as a string literal")?;
+            let body = trimmed[at..].trim();
+            if body.len() < 2 || !body.ends_with('\'') {
+                return Err("SHARD MAP INSTALL takes the map's text as a string literal".to_string());
+            }
+            ShardAdmin::MapInstall(body[1..body.len() - 1].replace("''", "'"))
+        }
+        _ => return Err("SHARD takes TAKE, GIVE, FENCE or UNFENCE RANGE, or MAP INSTALL".to_string()),
+    };
+    Ok(Introspect::ShardAdmin(admin))
+}
 
 /// Whether this statement belongs to the introspection surface.
 ///
@@ -158,6 +214,10 @@ pub fn parse(sql: &str) -> Option<Result<Introspect, String>> {
             return Some(Err("SET CONFIG names no key".to_string()));
         }
         return Some(Ok(Introspect::SetConfig { key, value }));
+    }
+
+    if words.first().copied() == Some("SHARD") {
+        return Some(parse_shard_admin(trimmed, &words, &original));
     }
 
     if words.first().copied() != Some("SHOW") {
@@ -352,6 +412,7 @@ pub fn result_fields(statement: &Introspect) -> Option<Vec<(String, DbType)>> {
         // `lo` and `hi` are text: the hash space is `[0, 2^64)`, so the last
         // partition's `hi` does not fit a BIGINT, and a `lo` past 2^63 would
         // read as negative. Hex, as the map log and the design write them.
+        Introspect::ShardAdmin(_) => vec![text("result")],
         Introspect::SchemaFingerprint(_) => vec![text("table_name"), text("fingerprint"), number("schema_epoch")],
         Introspect::ShardLoad => vec![
             text("table_name"),
@@ -490,6 +551,10 @@ pub async fn execute(statement: &Introspect, database: &Arc<Database>) -> Vec<u8
             Err(e) => failure(&e),
         },
         Introspect::Shards => rows(shards()),
+        Introspect::ShardAdmin(admin) => match shard_admin(database, admin).await {
+            Ok(line) => rows(vec![row(&[Cell::Text(line)])]),
+            Err(e) => failure(&e),
+        },
         Introspect::SchemaFingerprint(name) => match schema_fingerprint(database, name) {
             Ok(r) => rows(r),
             Err(e) => failure(&e),
@@ -1739,6 +1804,77 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
 /// `[lo, hi)` range of the hash space, where its files are, whether it has
 /// any, and its sizes (zero until it is materialized). Refused for a plain
 /// table, and for a partitioned table that cannot be opened.
+/// Runs a `SHARD …` statement (sharding-plan.md B2).
+#[cfg(feature = "sharding")]
+async fn shard_admin(database: &Arc<Database>, admin: &ShardAdmin) -> Result<String, String> {
+    use crate::core::shard::{map_state, ownership, start};
+    let spans = |lo: u64, hi: u64, take: bool| async move {
+        let mut names: Vec<String> = table_names(database).into_iter().filter(|n| !n.starts_with("__")).collect();
+        names.sort();
+        let mut tables = 0;
+        for name in names {
+            if !matches!(database.relation(&name), Some(Relation::Partitioned(_))) {
+                continue;
+            }
+            database.shard_span(&name, lo, hi, take).await.map_err(|e| format!("{name}: {e}"))?;
+            tables += 1;
+        }
+        Ok::<usize, String>(tables)
+    };
+    match *admin {
+        ShardAdmin::Fence { lo, hi } => {
+            ownership::fence(lo, hi)?;
+            Ok(format!("blocks [{lo:#x}, {hi:#x}) fenced: their writes are refused until UNFENCE"))
+        }
+        ShardAdmin::Unfence { lo, hi } => {
+            ownership::unfence(lo, hi)?;
+            Ok(format!("blocks [{lo:#x}, {hi:#x}) unfenced"))
+        }
+        ShardAdmin::Take { lo, hi } => {
+            // Incoming first, so the copy's stamps pass the guard as soon
+            // as the spans open.
+            ownership::add_incoming(lo, hi)?;
+            let n = spans(lo, hi, true).await?;
+            Ok(format!("blocks [{lo:#x}, {hi:#x}) taken in {n} partitioned tables; incoming until the map gives them here"))
+        }
+        ShardAdmin::Give { lo, hi } => {
+            // Ownership first: nothing stamps there from now on, and only
+            // then do the spans close.
+            ownership::give_up(lo, hi)?;
+            let n = spans(lo, hi, false).await?;
+            Ok(format!("blocks [{lo:#x}, {hi:#x}) given up in {n} partitioned tables; their rows stay until retired"))
+        }
+        ShardAdmin::MapInstall(ref text) => {
+            let Some(served) = map_state::current() else {
+                return Err("this node is not a shard (--role shard)".to_string());
+            };
+            let map = rasterizeddb_router::ShardMap::from_text(text)?;
+            if map.cluster_id() != served.map.cluster_id() {
+                return Err(format!("the map is for cluster {:032x}, this shard is in {:032x}", map.cluster_id(), served.map.cluster_id()));
+            }
+            if map.shard(served.shard_id).is_none() {
+                return Err(format!("the map has no shard {}", served.shard_id));
+            }
+            if map.epoch() <= served.map.epoch() {
+                return Err(format!("the map is at epoch {}, this shard is already at {}", map.epoch(), served.map.epoch()));
+            }
+            let dir = database.location.clone().ok_or("the shard has no data directory")?;
+            let dir = std::path::Path::new(&dir);
+            start::check_epoch(dir, &map)?;
+            start::record_epoch(dir, map.epoch(), map.digest())?;
+            ownership::adopt_map(map.ranges_of(served.shard_id), map.epoch())?;
+            let epoch = map.epoch();
+            map_state::install(map, served.shard_id);
+            Ok(format!("cluster map epoch {epoch} installed"))
+        }
+    }
+}
+
+#[cfg(not(feature = "sharding"))]
+async fn shard_admin(_database: &Arc<Database>, _admin: &ShardAdmin) -> Result<String, String> {
+    Err("SHARD statements need a server built with the sharding feature".to_string())
+}
+
 /// `SHOW SCHEMA FINGERPRINT t`.
 #[cfg(feature = "sharding")]
 fn schema_fingerprint(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {

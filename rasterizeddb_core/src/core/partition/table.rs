@@ -1920,6 +1920,15 @@ impl PartitionedTable {
     /// (`PinBoard::record_span`). The open instance keeps serving the epoch
     /// it opened at; the caller reopens the table, under the ownership
     /// fence, to serve the new one.
+    /// The records [`super::log::MapState::span_records`] gives for points
+    /// `[lo, hi)` under the map as its log holds it now.
+    #[cfg(feature = "sharding")]
+    pub async fn span_records(&self, lo: u64, hi: u128, take: bool) -> io::Result<Vec<super::log::Record>> {
+        let live = self.live()?;
+        let state = live.parts.board.state.lock().await;
+        state.span_records(lo, hi, take).map_err(invalid)
+    }
+
     #[cfg(feature = "sharding")]
     pub async fn record_span(&self, rec: &super::log::Record) -> io::Result<()> {
         let live = self.live()?;

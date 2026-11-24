@@ -128,11 +128,14 @@ pub fn start(config: &ShardConfig) -> Result<ShardStarted, String> {
     crate::core::database::incompat::require(&config.data_dir, crate::core::database::incompat::SHARD_V1)
         .map_err(|e| format!("cannot mark {} as a shard: {e}", config.data_dir.display()))?;
     record_epoch(&config.data_dir, map.epoch(), map.digest())?;
+    let (incoming, fenced) = ownership::read_state(&config.data_dir)?;
+    ownership::set_data_dir(config.data_dir.clone());
     ownership::install(Ownership {
         shard_id: config.shard_id,
         map_epoch: map.epoch(),
         owned: map.ranges_of(config.shard_id),
-        incoming: Vec::new(),
+        incoming,
+        fenced,
     });
     super::map_state::install(map.clone(), config.shard_id);
     Ok(ShardStarted { map, shard_id: config.shard_id })

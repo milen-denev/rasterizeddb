@@ -2456,6 +2456,9 @@ pub(crate) fn privileged_statement(stmt: &str) -> Option<&'static str> {
             "GET" => None,
             _ => Some("KV CONFIG"),
         },
+        // A shard's side of a move (sharding-plan.md B2): it changes which
+        // rows this server answers for.
+        ("SHARD", _) => Some("SHARD"),
         _ => None,
     }
 }

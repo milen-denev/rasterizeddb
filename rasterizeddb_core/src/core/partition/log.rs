@@ -917,6 +917,75 @@ impl MapState {
     pub fn locations(&self) -> &[String] {
         &self.locations
     }
+    /// The records that make points `[lo, hi)` this shard's (`take`) or
+    /// another shard's (`!take`) in this map, and nothing else (sharding-plan.md
+    /// B2, a move's carve and hand-off). Taking splits a FOREIGN partition
+    /// straddling an edge (it holds no files); giving refuses a live one
+    /// straddling an edge, which only a reshape may split. Applying them in order leaves every point of `[lo, hi)`
+    /// live (taken) or FOREIGN (given), and every other point as it was.
+    /// Empty when the span already is.
+    pub fn span_records(&self, lo: u64, hi: u128, take: bool) -> Result<Vec<Record>, String> {
+        if lo as u128 >= hi {
+            return Err(format!("the span [{lo:#x}, {hi:#x}) is empty"));
+        }
+        let mut next_pid = self.next_pid;
+        let mut fresh = || -> Result<u32, String> {
+            let p = u32::try_from(next_pid).map_err(|_| "the table has used every partition id".to_string())?;
+            next_pid += 1;
+            Ok(p)
+        };
+        let mut out = Vec::new();
+        let entries = self.map.entries();
+        for (j, &(a, pid)) in entries.iter().enumerate() {
+            let b: u128 = entries.get(j + 1).map_or(SPACE_END, |&(l, _)| l as u128);
+            if b <= lo as u128 || a as u128 >= hi {
+                continue;
+            }
+            let foreign = self.parts.get(&pid).is_some_and(|p| p.foreign);
+            if foreign != take {
+                continue; // already as wanted
+            }
+            // The entry's pieces: before the span, inside it, after it.
+            let inner_lo = (a as u128).max(lo as u128) as u64;
+            let inner_hi = b.min(hi);
+            let mut pieces: Vec<(u64, u128, bool)> = Vec::new(); // (lo, hi, inside)
+            if (a as u128) < lo as u128 {
+                pieces.push((a, lo as u128, false));
+            }
+            pieces.push((inner_lo, inner_hi, true));
+            if inner_hi < b {
+                pieces.push((inner_hi as u64, b, false));
+            }
+            if take {
+                // Take the whole FOREIGN entry as live pieces, then give the
+                // outside pieces back.
+                let mut placed = Vec::with_capacity(pieces.len());
+                for &(plo, _, _) in &pieces {
+                    placed.push((plo, fresh()?));
+                }
+                out.push(Record::AcquireSpan { hi: b, entries: placed.clone() });
+                for &(plo, phi, inside) in &pieces {
+                    if !inside {
+                        out.push(Record::ReleaseSpan { hi: phi, entries: vec![(plo, fresh()?)] });
+                    }
+                }
+            } else {
+                // A live entry is given away whole. Splitting one would
+                // retire its files with the rows outside the span in them,
+                // which this shard still owns: a straddling partition is
+                // split by a reshape first, which copies its rows.
+                if pieces.len() > 1 {
+                    return Err(format!(
+                        "partition {pid} covers [{a:#x}, {b:#x}), across the span's edge: split it first \
+                         (ALTER TABLE … SPLIT PARTITION) so the span ends on partition boundaries"
+                    ));
+                }
+                out.push(Record::ReleaseSpan { hi: b, entries: vec![(a, fresh()?)] });
+            }
+        }
+        Ok(out)
+    }
+
     pub fn map(&self) -> &RangeMap {
         &self.map
     }
