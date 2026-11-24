@@ -17,6 +17,10 @@ native protocol, without compiling the engine.
   with their structs. They can run when the client connects (`auto_migrate`).
 - **Key/value**: the server's Redis-compatible cache, typed, with closure
   queries and models stored as hashes.
+- **Sharding**: a `shard::Router` over several servers, the ORM routed by
+  `#[rdb(shard_by = "…")]`, fan-out reads merged in order, and the
+  `rdb-shard` tool for identity rows and offline tenant moves
+  ([docs/sharding-client.md](../docs/sharding-client.md)).
 
 ```rust
 use rasterizeddb_client::prelude::*;
@@ -50,6 +54,7 @@ for each layer. [`examples/`](examples) holds runnable programs:
 | feature | default | adds |
 |---|---|---|
 | `derive` | yes | `#[derive(Model)]`, `#[derive(FromRow)]`, `#[derive(SqlEnum)]` |
+| `sharding` | yes | `shard::Router`, `ShardedModelExt`, the `rdb-shard` binary; dormant until a router is built |
 | `chrono` | | `chrono` date and time types |
 | `uuid` | | `uuid::Uuid` |
 | `serde_json` | | `serde_json::Value`, `#[rdb(json)]` fields, JSON cache values |
