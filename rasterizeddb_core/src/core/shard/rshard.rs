@@ -332,6 +332,10 @@ async fn open_session(conn: &Conn, session: u64, database: &str, role: &str, par
     if let Err(e) = crate::core::policy_hooks::tenancy().admit(&ctx) {
         return refuse(*b"28000", true, e);
     }
+    #[cfg(feature = "sharding_raft")]
+    if let Err(e) = super::raft_apply::serving() {
+        return refuse(FENCED, true, e);
+    }
     drop(guard);
     let options = BridgeOptions {
         login: ProxiedLogin {

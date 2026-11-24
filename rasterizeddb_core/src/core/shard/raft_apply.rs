@@ -48,6 +48,27 @@ pub fn install(group: super::raft_group::Group, node: u64, catalog: Arc<Database
     capture::activate();
 }
 
+/// `Err` when this replica must not serve sessions: it runs a Raft group
+/// and is not its leader, so what it holds may lag what a quorum committed.
+/// Sessions go to the leader, whose reads see every committed write (and
+/// whose check-quorum steps it down when it loses the majority).
+pub fn serving() -> Result<(), String> {
+    let Some((group, _, _)) = RAFT.get() else {
+        return Ok(());
+    };
+    let s = group.status();
+    if let Some(why) = s.halted {
+        return Err(format!("57P03: this shard replica halted: {why}"));
+    }
+    match s.role {
+        Some(rasterizeddb_raft::Role::Leader) => Ok(()),
+        _ => Err(format!(
+            "57P03: this shard replica is a follower of its Raft group (leader: {}); connect to the leader",
+            s.leader.map_or("unknown".to_string(), |l| l.to_string())
+        )),
+    }
+}
+
 /// Proposes `database`'s committing transaction `tx` (sharding-plan.md B3,
 /// "propose instead of commit"): its family's captured ops as one entry,
 /// waited for until it is applied here; then the applied index is written

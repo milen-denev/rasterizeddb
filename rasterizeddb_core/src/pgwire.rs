@@ -2252,6 +2252,11 @@ where
             send_fatal_error_response(stream, "28000", e.trim_start_matches("28000: ")).await?;
             return Ok(());
         }
+        #[cfg(feature = "sharding_raft")]
+        if let Err(e) = crate::core::shard::raft_apply::serving() {
+            send_fatal_error_response(stream, "57P03", e.trim_start_matches("57P03: ")).await?;
+            return Ok(());
+        }
         let limits = policy.limits(&database.name);
         if let Some(max) = limits.max_connections {
             let sessions = catalog.listing().iter().find(|e| e.name == database.name).map_or(0, |e| e.sessions);
