@@ -119,6 +119,8 @@ pub enum ShardAdmin {
     /// A newer cluster map, in its text form, with the authority's signature
     /// (hex) where shards require one.
     MapInstall { text: String, signature: Option<String> },
+    /// `SHARD REFERENCE TABLE t` / `SHARD UNREFERENCE TABLE t` (B5).
+    Reference { table: String, on: bool },
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +162,15 @@ fn parse_shard_admin(trimmed: &str, words: &[&str], original: &[&str]) -> Result
                 _ => return Err("the statement is `SHARD DECIDE 'gid' COMMIT|ABORT`".to_string()),
             };
             ShardAdmin::Decide { gid, commit }
+        }
+        Some(kind @ ("REFERENCE" | "UNREFERENCE")) if words.get(2).copied() == Some("TABLE") && original.len() == 4 => {
+            let raw = original[3].trim_end_matches(';');
+            let table = if raw.starts_with('"') && raw.ends_with('"') && raw.len() > 1 {
+                raw[1..raw.len() - 1].replace("\"\"", "\"")
+            } else {
+                raw.to_ascii_lowercase()
+            };
+            ShardAdmin::Reference { table, on: kind == "REFERENCE" }
         }
         Some("MAP") if words.get(2).copied() == Some("INSTALL") => {
             let usage = "the statement is `SHARD MAP INSTALL '<map>' [SIGNATURE '<hex>']`";
@@ -1908,6 +1919,18 @@ async fn shard_admin(database: &Arc<Database>, admin: &ShardAdmin) -> Result<Str
         Ok::<usize, String>(tables)
     };
     match *admin {
+        ShardAdmin::Reference { ref table, on } => {
+            match database.relation(table) {
+                Some(Relation::Plain(_)) => {}
+                Some(Relation::Partitioned(_)) => return Err(format!("{table} is sharded: a reference table is a global one")),
+                None => return Err(format!("relation \"{table}\" does not exist")),
+            }
+            crate::core::shard::reference::set(&database.name, table, on)?;
+            Ok(format!(
+                "{table} {} on this shard",
+                if on { "is a reference table (send this to every shard, and copy its rows)" } else { "is no longer a reference table" }
+            ))
+        }
         ShardAdmin::Decide { ref gid, commit } => {
             crate::core::shard::rshard::decide(gid, commit)?;
             Ok(format!("{gid} decided {}", if commit { "commit" } else { "abort" }))

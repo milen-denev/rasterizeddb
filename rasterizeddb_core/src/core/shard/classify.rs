@@ -40,6 +40,16 @@ pub fn classify(database: &Database, source: Source, text: &str) -> RouteTemplat
 fn classify_inner(database: &Database, source: Source, text: &str) -> RouteTemplate {
     let t = text.trim().trim_end_matches(';').trim();
     let first = first_word(t);
+    // A global table lives on the home shard alone (unless it is a
+    // reference table, which every shard holds): with a sharded table in
+    // the same statement, the shard the key picks has none of its rows,
+    // and a join there would answer short without a word.
+    if matches!(first.as_str(), "SELECT" | "UPDATE" | "DELETE" | "INSERT" | "WITH" | "MERGE" | "TABLE" | "VALUES")
+        && mentions_partitioned(database, t)
+        && mentions_global(database, t)
+    {
+        return RouteTemplate::NeedsKey;
+    }
     match first.as_str() {
         "SELECT" => select(database, source, t),
         "UPDATE" | "DELETE" => write(database, source, t, &first),
@@ -161,6 +171,22 @@ fn keyed_placeholder(t: &str, names: &[String]) -> Option<u16> {
 }
 
 /// Whether any identifier outside quotes names a partitioned relation.
+/// Whether `t` names a global table (a plain, unsharded one) that is not
+/// a reference table.
+fn mentions_global(database: &Database, t: &str) -> bool {
+    words(t).into_iter().any(|w| {
+        matches!(database.relation(&w), Some(Relation::Plain(_)))
+            && !w.starts_with("__")
+            && w != crate::auth::ROLE_TABLE
+            && !super::reference::is_reference(&database.name, &w)
+    })
+}
+
+/// Whether `table` is a reference table: a write to it goes to every shard.
+fn writes_reference(database: &Database, table: &str) -> bool {
+    matches!(database.relation(table), Some(Relation::Plain(_))) && super::reference::is_reference(&database.name, table)
+}
+
 fn mentions_partitioned(database: &Database, t: &str) -> bool {
     words(t).into_iter().any(|w| matches!(database.relation(&w), Some(Relation::Partitioned(_))))
 }
@@ -375,6 +401,11 @@ fn write(database: &Database, source: Source, t: &str, verb: &str) -> RouteTempl
     let Some(table) = target.and_then(single_table) else {
         return complex(database, t);
     };
+    if writes_reference(database, &table) {
+        // Every shard holds it whole: each changes its copy, and any one's
+        // count is the statement's.
+        return RouteTemplate::FanOut { merge: Merge::Any, writes: true };
+    }
     let Some(Relation::Partitioned(pt)) = database.relation(&table) else {
         return if mentions_partitioned(database, t) { RouteTemplate::NeedsKey } else { RouteTemplate::Home };
     };
@@ -406,6 +437,9 @@ fn insert(database: &Database, source: Source, t: &str) -> RouteTemplate {
     let Some(table) = single_table(name) else {
         return complex(database, t);
     };
+    if writes_reference(database, &table) {
+        return RouteTemplate::FanOut { merge: Merge::Any, writes: true };
+    }
     let relation = database.relation(&table);
     let Some(Relation::Partitioned(pt)) = relation.clone() else {
         return RouteTemplate::Home;

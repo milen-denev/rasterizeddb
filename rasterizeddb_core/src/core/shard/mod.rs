@@ -10,6 +10,7 @@ pub mod ddl;
 pub mod map_state;
 pub mod merge;
 pub mod ownership;
+pub mod reference;
 #[cfg(feature = "sharding_raft")]
 pub mod capture;
 #[cfg(feature = "sharding_raft")]
