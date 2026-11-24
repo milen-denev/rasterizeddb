@@ -35,9 +35,14 @@
 //! `RDB_PASSWORD`), `--ca PEM`, `--pin SHA256` or `--accept-any` (the
 //! default), and `--database NAME`.
 //!
-//! A move is offline and fenced by the application: the tool refuses to
-//! run without `--fenced`, the operator's word that no writer touches the
-//! tenant until the hand-off. It copies each table's rows at one snapshot,
+//! A move is offline. Between shards (`--role shard`) the engine fences it:
+//! the source refuses writes to the moved blocks (`SHARD FENCE`), the
+//! destination takes the span in (`SHARD TAKE`), and after the hand-off the
+//! new map is installed on both and the source gives the span up (`SHARD
+//! GIVE`), so no flag is needed and a stale router gets `RDB02`, never a
+//! write in the wrong place. Between plain servers the tool refuses to run
+//! without `--fenced`, the operator's word that no writer touches the moved
+//! rows until the hand-off. It copies each table's rows at one snapshot,
 //! verifies count and a digest of every row on both sides, publishes the map
 //! with the tenant on its new shard (one epoch up), and writes a state file.
 //! The source rows stay until `retire` (after the retention, 24 h by
@@ -496,11 +501,6 @@ fn digest(rows: &rasterizeddb_client::Rows, width: usize) -> Result<(u64, u64)> 
 }
 
 async fn move_tenant(args: &Args, options: &Options) -> std::result::Result<(), String> {
-    if !args.has("fenced") {
-        return Err(
-            "a move is offline: fence the tenant's writes in the application first, then say --fenced".to_string(),
-        );
-    }
     let map = read_map(args.one("map")?)?;
     let out = args.one("out")?;
     let state_path = args.one("state")?;
@@ -530,6 +530,7 @@ async fn move_tenant(args: &Args, options: &Options) -> std::result::Result<(), 
             other => return Err(format!("shard {id}'s identity does not match the map: {other:?}")),
         }
     }
+    let engine = begin_move(args, &src, &dst, block, block + 1).await?;
     // Copy each table at one snapshot of the source.
     let snapshot = src
         .begin_with(TransactionOptions {
@@ -569,11 +570,20 @@ async fn move_tenant(args: &Args, options: &Options) -> std::result::Result<(), 
         Identity::of(&next, id).write(c).await.map_err(|e| format!("shard {id}: {e}"))?;
     }
     write_map(out, &next)?;
-    println!(
-        "moved to shard {to}; map epoch {} written to {out}. Reload every router, then lift the fence. \
-         The source rows stay until `rdb-shard retire`.",
-        next.epoch()
-    );
+    if engine {
+        finish_move(&src, &dst, &next, block, block + 1).await?;
+        println!(
+            "moved to shard {to}; map epoch {} installed on both shards and written to {out}. Reload every router \
+             and gateway; the source's rows stay unread until it is restarted or retired.",
+            next.epoch()
+        );
+    } else {
+        println!(
+            "moved to shard {to}; map epoch {} written to {out}. Reload every router, then lift the fence. \
+             The source rows stay until `rdb-shard retire`.",
+            next.epoch()
+        );
+    }
     Ok(())
 }
 
@@ -593,6 +603,12 @@ async fn rollback(args: &Args, options: &Options) -> std::result::Result<(), Str
     let back = map.reassign(lo, hi, from)?;
     let src = connect(&map, from, options).await?;
     let dst = connect(&map, to, options).await?;
+    if is_shard(&src).await {
+        return Err(format!(
+            "on shards the source gave its span up when the move finished: move the rows back instead \
+             (rdb-shard move-tenant or rebalance onto shard {from})"
+        ));
+    }
     for (id, c) in [(from, &src), (to, &dst)] {
         Identity::of(&back, id).write(c).await.map_err(|e| format!("shard {id}: {e}"))?;
     }
@@ -714,9 +730,6 @@ async fn rebalance(args: &Args, options: &Options) -> std::result::Result<(), St
         println!("(plan only; --apply --fenced runs it)");
         return Ok(());
     }
-    if !args.has("fenced") {
-        return Err("--apply moves rows offline: fence writes to the moved ranges first, then say --fenced".to_string());
-    }
     let out = args.one("out")?;
     let dir = args.one("state-dir")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{dir}: {e}"))?;
@@ -740,6 +753,7 @@ async fn rebalance(args: &Args, options: &Options) -> std::result::Result<(), St
     for (n, mv) in plan.moves.iter().enumerate() {
         let src = connect(&current, mv.from, options).await?;
         let dst = connect(&current, mv.to, options).await?;
+        let engine = begin_move(args, &src, &dst, mv.lo, mv.hi).await?;
         let snapshot = src
             .begin_with(TransactionOptions {
                 isolation: Some(Isolation::RepeatableRead),
@@ -776,6 +790,9 @@ async fn rebalance(args: &Args, options: &Options) -> std::result::Result<(), St
             Identity::of(&next, id).write(c).await.map_err(|e| format!("shard {id}: {e}"))?;
         }
         write_map(out, &next)?;
+        if engine {
+            finish_move(&src, &dst, &next, mv.lo, mv.hi).await?;
+        }
         current = next;
     }
     println!(
@@ -875,5 +892,41 @@ async fn cluster_ddl(args: &Args, options: &Options) -> std::result::Result<(), 
     }
     let _ = std::fs::remove_file(&state_path);
     println!("schema epoch {next} on every shard");
+    Ok(())
+}
+
+/// Whether `c` runs as a shard (`--role shard`): its `SHOW SHARDS` has rows.
+async fn is_shard(c: &Client) -> bool {
+    matches!(c.run("SHOW SHARDS").await, Ok(rows) if !rows.is_empty())
+}
+
+/// Before a copy into `dst` of blocks `[lo, hi)` from `src`, on shards: the
+/// source's writes there fenced, the destination's span taken in (B2).
+/// Plain servers need the operator's `--fenced`.
+async fn begin_move(args: &Args, src: &Client, dst: &Client, lo: u64, hi: u64) -> std::result::Result<bool, String> {
+    let engine = is_shard(src).await && is_shard(dst).await;
+    if engine {
+        src.run(&format!("SHARD FENCE RANGE {lo:#x} {hi:#x}")).await.map_err(|e| format!("fencing the source: {e}"))?;
+        if let Err(e) = dst.run(&format!("SHARD TAKE RANGE {lo:#x} {hi:#x}")).await {
+            let _ = src.run(&format!("SHARD UNFENCE RANGE {lo:#x} {hi:#x}")).await;
+            return Err(format!("taking the range on the destination: {e}"));
+        }
+    } else if !args.has("fenced") {
+        return Err("these servers are not shards (--role shard): fence the moved rows' writes in the application \
+                    first, then say --fenced"
+            .to_string());
+    }
+    Ok(engine)
+}
+
+/// After a verified copy, on shards: the new map installed on both, the
+/// source's span given up (its rows kept, unread), its fence lifted.
+async fn finish_move(src: &Client, dst: &Client, next: &ShardMap, lo: u64, hi: u64) -> std::result::Result<(), String> {
+    let text = next.to_text().replace('\'', "''");
+    for (who, c) in [("destination", dst), ("source", src)] {
+        c.run(&format!("SHARD MAP INSTALL '{text}'")).await.map_err(|e| format!("installing the map on the {who}: {e}"))?;
+    }
+    src.run(&format!("SHARD GIVE RANGE {lo:#x} {hi:#x}")).await.map_err(|e| format!("giving up the source's span: {e}"))?;
+    src.run(&format!("SHARD UNFENCE RANGE {lo:#x} {hi:#x}")).await.map_err(|e| format!("unfencing the source: {e}"))?;
     Ok(())
 }
