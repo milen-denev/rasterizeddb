@@ -77,6 +77,7 @@ pub mod settings {
 
     static OPEN_BUDGET: AtomicU64 = AtomicU64::new(0);
     static IDLE_CLOSE_SECS: AtomicU64 = AtomicU64::new(300);
+    static RESIDENT_BUDGET: AtomicU64 = AtomicU64::new(0);
     static MAX_OPEN: AtomicUsize = AtomicUsize::new(super::DEFAULT_MAX_OPEN);
 
     /// The derived budget's ceiling, and what the descriptor limit a start
@@ -111,6 +112,17 @@ pub mod settings {
     pub fn set_idle_close_secs(secs: u64) {
         IDLE_CLOSE_SECS.store(secs, Ordering::Relaxed);
     }
+
+    /// `partition.resident_budget`: the estimated bytes open partitions may
+    /// hold in memory, across tables (`Table::resident_estimate`); 0, the
+    /// default, bounds them by count alone.
+    pub fn resident_budget() -> u64 {
+        RESIDENT_BUDGET.load(Ordering::Relaxed)
+    }
+
+    pub fn set_resident_budget(bytes: u64) {
+        RESIDENT_BUDGET.store(bytes, Ordering::Relaxed);
+    }
 }
 
 /// One open partition in a ring.
@@ -118,6 +130,8 @@ struct Entry {
     id: u64,
     parts: Weak<Parts>,
     pid: u32,
+    /// Its resident estimate when it entered, given back when it leaves.
+    bytes: u64,
 }
 
 #[derive(Default)]
@@ -135,6 +149,8 @@ pub struct Budget {
     /// reads the settings.
     idle_secs: Option<u64>,
     open: AtomicUsize,
+    /// The resident estimates of the open partitions, summed.
+    open_bytes: AtomicU64,
     rings: [parking_lot::Mutex<Ring>; SHARDS],
     next_id: AtomicU64,
     /// Where the next eviction starts looking, so evictions spread over the
@@ -157,10 +173,13 @@ pub struct Token {
 impl Drop for Token {
     fn drop(&mut self) {
         let mut ring = self.budget.rings[self.ring].lock();
+        let mut bytes = 0;
         if let Some(at) = ring.entries.iter().position(|e| e.id == self.id) {
+            bytes = ring.entries[at].bytes;
             ring.remove_at(at);
         }
         drop(ring);
+        self.budget.open_bytes.fetch_sub(bytes, Ordering::AcqRel);
         self.budget.open.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -186,6 +205,7 @@ impl Budget {
             fixed,
             idle_secs,
             open: AtomicUsize::new(0),
+            open_bytes: AtomicU64::new(0),
             rings: std::array::from_fn(|_| parking_lot::Mutex::new(Ring::default())),
             next_id: AtomicU64::new(1),
             next_ring: AtomicUsize::new(0),
@@ -215,6 +235,23 @@ impl Budget {
         self.open.load(Ordering::Acquire)
     }
 
+    /// The resident estimates of the partitions open now, summed.
+    pub fn open_bytes(&self) -> u64 {
+        self.open_bytes.load(Ordering::Acquire)
+    }
+
+    /// True while the open partitions are past either budget: their count
+    /// at or above `limit`, or, with a resident budget set, their estimated
+    /// bytes above it. Bytes are checked first: a few large partitions can
+    /// exhaust memory long before the count limit is near (B0.5).
+    fn over(&self, limit: usize, at_count: bool) -> bool {
+        let bytes = settings::resident_budget();
+        if bytes > 0 && self.open_bytes() > bytes {
+            return true;
+        }
+        if at_count { self.open() >= limit } else { self.open() > limit }
+    }
+
     /// Partitions closed to make room so far.
     pub fn evictions(&self) -> u64 {
         self.evictions.load(Ordering::Acquire)
@@ -226,10 +263,13 @@ impl Budget {
     }
 
     /// Counts partition `pid` of `parts` open, in the ring its key picks.
-    pub(crate) fn enter(self: &StdArc<Self>, parts: Weak<Parts>, uid: u64, pid: u32) -> Token {
+    pub(crate) fn enter(self: &StdArc<Self>, parts: Weak<Parts>, uid: u64, pid: u32, bytes: u64) -> Token {
         let ring = ring_of(uid, pid);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.rings[ring].lock().entries.push(Entry { id, parts, pid });
+        // Counted before the entry is visible, so a concurrent drop of it
+        // never subtracts what was not yet added.
+        self.open_bytes.fetch_add(bytes, Ordering::AcqRel);
+        self.rings[ring].lock().entries.push(Entry { id, parts, pid, bytes });
         self.open.fetch_add(1, Ordering::AcqRel);
         Token { budget: self.clone(), ring, id }
     }
@@ -246,12 +286,12 @@ impl Budget {
     /// own lifecycle lock the caller holds.
     pub(crate) async fn make_room(&self, skip: (usize, u32)) {
         let limit = self.limit();
-        if self.open() < limit {
+        if !self.over(limit, true) {
             return;
         }
         let mut offers = 2 * self.open() + SHARDS;
         let mut closed = 0;
-        while self.open() >= limit {
+        while self.over(limit, true) {
             if offers == 0 || closed == CLOSES_PER_OPEN {
                 self.overruns.fetch_add(1, Ordering::AcqRel);
                 return;
@@ -275,7 +315,7 @@ impl Budget {
         let limit = self.limit();
         let mut closed = 0;
         let mut offers = 2 * self.open() + SHARDS;
-        while self.open() > limit && closed < n && offers > 0 {
+        while self.over(limit, false) && closed < n && offers > 0 {
             offers -= 1;
             let Some((parts, pid)) = self.victim((0, u32::MAX)) else { break };
             if parts.close_for_budget(pid).await {
@@ -883,7 +923,7 @@ mod tests {
     fn removing_an_entry_keeps_the_hand_on_the_next_one() {
         let mut ring = Ring::default();
         for id in 0..6 {
-            ring.entries.push(Entry { id, parts: Weak::new(), pid: id as u32 });
+            ring.entries.push(Entry { id, parts: Weak::new(), pid: id as u32, bytes: 0 });
         }
         ring.hand = 3;
         ring.remove_at(1);

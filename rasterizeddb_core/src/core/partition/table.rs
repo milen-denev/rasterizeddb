@@ -1503,7 +1503,12 @@ impl PartitionedTable {
                             continue;
                         }
                         let table = next.parts.open_instance(new, false).await.map_err(|err| format!("partition {}: {err}", new.pid))?;
-                        let token = next.parts.budget.enter(StdArc::downgrade(&next.parts), self.uid, new.pid);
+                        let token = next.parts.budget.enter(
+                            StdArc::downgrade(&next.parts),
+                            self.uid,
+                            new.pid,
+                            table.resident_estimate(),
+                        );
                         #[cfg(test)]
                         instance_count::reopened(&self.root, self.uid, new.pid);
                         new.put(table, token, old_slot.referenced_now());
@@ -2991,7 +2996,8 @@ impl Parts {
         };
         #[cfg(test)]
         instance_count::opened(&self.root, self.uid, slot.pid);
-        slot.put(table.clone(), self.budget.enter(self.me.clone(), self.uid, slot.pid), routed);
+        let bytes = table.resident_estimate();
+        slot.put(table.clone(), self.budget.enter(self.me.clone(), self.uid, slot.pid, bytes), routed);
         // Again once it is in its slot: a `SET CONFIG vacuum` that stored
         // its value after `open_instance` read it walked the slots before
         // this one was there (both sides store, then read the other's).

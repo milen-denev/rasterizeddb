@@ -2631,6 +2631,15 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         help: "seconds a partition goes without a routed access before it closes; 0 turns idle close off",
     },
     ConfigKey {
+        section: "partition",
+        key: "resident_budget",
+        hot: true,
+        set_with: "SET CONFIG partition.resident_budget = 0",
+        options: "",
+        help: "estimated bytes open partitions may hold in memory, across tables; past it an open closes idle ones first, \
+               before the count budget is reached; 0 bounds them by count alone",
+    },
+    ConfigKey {
         section: "index_snapshot",
         key: "idle_checkpoint_secs",
         hot: true,
@@ -2790,6 +2799,7 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             ("partition", "open_budget") => crate::core::partition::budget::process_figures().0.to_string(),
             ("partition", "max_open") => crate::core::partition::budget::settings::max_open().to_string(),
             ("partition", "idle_close_secs") => crate::core::partition::budget::settings::idle_close_secs().to_string(),
+            ("partition", "resident_budget") => crate::core::partition::budget::settings::resident_budget().to_string(),
             ("index_snapshot", "idle_checkpoint_secs") => {
                 crate::core::index_store::seal::settings::idle_checkpoint_secs().to_string()
             }
@@ -3278,6 +3288,7 @@ fn set_process_wide(key: &str, section: &str, name: &str, value: &str) -> Result
                     });
                 }
                 "idle_close_secs" => settings::set_idle_close_secs(n),
+                "resident_budget" => settings::set_resident_budget(n),
                 _ => return Err(format!("`{}` has no live setter", key)),
             }
             Ok(format!("{key} is now {n}"))

@@ -31,6 +31,13 @@ use crate::core::mvcc::TransactionManager;
 use crate::core::mvcc::Visibility;
 use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX, TxId};
 use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+
+/// [`Table::resident_estimate`]'s fixed part: an open table's providers,
+/// caches and empty structures.
+const RESIDENT_BASE: u64 = 256 << 10;
+/// [`Table::resident_estimate`]'s per-byte part: one byte resident for every
+/// this many stored.
+const RESIDENT_SHARE: u64 = 8;
 use crate::core::row::schema::SchemaCalculator;
 use crate::core::vacuum::{
     CompactReport, FreeSpace, ReadTicket, ReaderRegistry, VacuumConfig, VacuumReport,
@@ -3148,6 +3155,19 @@ impl<S: StorageIO> Table<S> {
 
     /// Row versions the write path has stamped dead since the table opened.
     /// See the field for what counts.
+    /// What this table is estimated to hold in memory once open, for the
+    /// partition budget's resident-bytes term (sharding-plan.md B0.5): a
+    /// fixed cost per open table plus a share of its stored row bytes, which
+    /// is what its in-memory indexes and filters grow with. An estimate taken
+    /// at open, not a measurement; 0 for a table that cannot be read.
+    pub(crate) fn resident_estimate(&self) -> u64 {
+        let Ok(d) = self.data() else {
+            return 0;
+        };
+        let stored = d.len.load(AtomicOrdering::Relaxed);
+        RESIDENT_BASE + stored / RESIDENT_SHARE
+    }
+
     pub fn dead_stamps(&self) -> u64 {
         self.dead_stamps.load(AtomicOrdering::Relaxed)
     }
