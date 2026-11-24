@@ -4784,6 +4784,7 @@ dependencies = [
  "rand 0.10.3",
  "rastcp",
  "rasterizeddb_client",
+ "rasterizeddb_raft",
  "rasterizeddb_router",
  "rclite",
  "regex",

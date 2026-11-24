@@ -16,6 +16,8 @@ rasterizeddb_router = { path = "../rasterizeddb_router", version = "1.0.0" }
 # Ed25519 for signed cluster maps (sharding-plan.md B2); already in the tree
 # as rustls's crypto provider.
 aws-lc-rs = { version = "1.19", optional = true }
+# Per-shard Raft (sharding-plan.md B3): our own consensus core, no I/O.
+rasterizeddb_raft = { path = "../rasterizeddb_raft", version = "1.0.0", optional = true }
 # `AT TIME ZONE`: zone rules from the system's tz database
 # (/usr/share/zoneinfo). Already in the tree through env_logger; no bundled
 # copy where the host has one, so the server answers with the zones its host
@@ -194,6 +196,11 @@ enable_long_row = []
 # hooks compile to nothing. No crate of its own: routing is
 # `rasterizeddb_router`'s.
 sharding = ["dep:aws-lc-rs"]
+
+# Per-shard Raft over row images (sharding-plan.md B3): each shard a
+# replicated group with automatic failover. Off until phase 3 meets its
+# gate (the deterministic simulation and the power-loss harness).
+sharding_raft = ["sharding", "dep:rasterizeddb_raft"]
 
 # Database branches: `CREATE BRANCH`, `RESET`/`PROMOTE`/`DROP BRANCH`,
 # `MERGE BRANCH` and `SHOW BRANCH DIFF` (docs/branching.md). No crate of its
