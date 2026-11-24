@@ -11,10 +11,14 @@
 
 ### New features
 
+- SQL Server front end: EF Core 10 runs unchanged, its Identity schema, migrations and `__EFMigrationsLock` included. Added: `CROSS/OUTER APPLY`, `TOP` in a derived table, a unique index filtered by `key IS NOT NULL`, `sp_getapplock`/`sp_releaseapplock`/`APPLOCK_TEST`, `sp_rename … 'INDEX'`, `ALTER DATABASE … SET SINGLE_USER`, and bracketed table names holding dots (`[dbo].[DenevCloud.ERP.Colors]`). Database names are matched without case, and a pooled connection's reset goes back to the login's database.
+- Case-insensitive text columns (the engine's `rdb_ci` collation) group, deduplicate, join, sort in windows, and take `min`/`max`, foreign keys, `ALTER TABLE ADD COLUMN` and `ALTER COLUMN TYPE` by key.
 - Opt-in zstd compression (`storage_compression`, a default feature): a column takes `COMPRESSION zstd(n)` and a table `WITH (row_compression = …)`, levels 1–22. Nothing is compressed unless asked, and fixed-width values stay raw. `ALTER TABLE … RECOMPRESS` and `VACUUM (FULL, RECOMPRESS)` rewrite rows and train dictionaries. The client's ORM takes `#[rdb(compression)]` and `#[rdb(row_compression)]`. See `docs/compression.md`.
 
 ### Behaviour changes
 
+- **Over the SQL Server protocol, text columns are case-insensitive by default**, as under SQL Server's default `SQL_Latin1_General_CP1_CI_AS`: a `CREATE TABLE` or `ADD COLUMN` without a `COLLATE` gives a text column `rdb_ci`. `--mssql-collation bin` keeps the old byte comparison. Tables made over PostgreSQL, MySQL or the native protocol are unchanged.
+- A `CREATE UNIQUE INDEX … WHERE …` over the SQL Server protocol ignored its filter and refused rows the filter leaves out; the filter is honoured now.
 - `STORAGE MOVE … TO 'kv:…'` said the table was no longer covered by backups. A backup copies it as of each snapshot, with no point-in-time replay, and the message now says so.
 
 ### Upgrade notes
