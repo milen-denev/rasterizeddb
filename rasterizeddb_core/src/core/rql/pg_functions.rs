@@ -78,6 +78,9 @@ pub enum PgFunc {
     /// `rdb_route_point(type, value)`: the same value's level-0 point,
     /// `0x…` hex (a point may pass `int8`'s range).
     RdbRoutePoint,
+    /// `rdb_shard_of(type, value)`: the shard the served cluster map gives
+    /// `value`'s block; NULL on a node that is not a shard.
+    RdbShardOf,
     QuoteLiteral,
     Format,
     RegexpReplace,
@@ -278,7 +281,7 @@ fn range_bound_type(range: &DbType) -> DbType {
 /// evaluator from a select list or a `WHERE` (`expr::is_function`).
 pub const NAMES: &[&str] = &[
     "LEFT", "RIGHT", "SUBSTR", "SUBSTRING", "STRPOS", "POSITION", "REVERSE", "REPEAT", "CONCAT", "CONCAT_WS",
-    "SPLIT_PART", "TRANSLATE", "ASCII", "CHR", "STARTS_WITH", "INITCAP", "MD5", "TO_HEX", "RDB_ROUTE_BLOCK", "RDB_ROUTE_POINT", "QUOTE_LITERAL",
+    "SPLIT_PART", "TRANSLATE", "ASCII", "CHR", "STARTS_WITH", "INITCAP", "MD5", "TO_HEX", "RDB_ROUTE_BLOCK", "RDB_ROUTE_POINT", "RDB_SHARD_OF", "QUOTE_LITERAL",
     "FORMAT", "REGEXP_REPLACE", "CEIL", "CEILING", "FLOOR", "SIGN", "POWER", "POW", "SQRT", "CBRT", "EXP", "LN",
     "LOG", "LOG10", "PI", "DEGREES", "RADIANS", "RANDOM", "DIV", "GCD", "LCM", "WIDTH_BUCKET", "FACTORIAL", "JUSTIFY_HOURS", "JUSTIFY_DAYS", "JUSTIFY_INTERVAL", "MAKE_DATE", "MAKE_TIMESTAMP",
     "TO_TIMESTAMP", "TO_DATE", "TO_CHAR", "AGE", "ENCODE", "DECODE", "JSON_BUILD_OBJECT", "JSONB_BUILD_OBJECT",
@@ -367,6 +370,7 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "TO_HEX" => (ToHex, &[1]),
         "RDB_ROUTE_BLOCK" => (RdbRouteBlock, &[2]),
         "RDB_ROUTE_POINT" => (RdbRoutePoint, &[2]),
+        "RDB_SHARD_OF" => (RdbShardOf, &[2]),
         "QUOTE_LITERAL" => (QuoteLiteral, &[1]),
         "FORMAT" => (Format, &[]),
         "REGEXP_REPLACE" => (RegexpReplace, &[3, 4]),
@@ -524,7 +528,7 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
         Strpos | Ascii | JsonbArrayLength | NumNonnulls | NumNulls | Cardinality | WidthBucket => DbType::I32,
         Factorial => DbType::DECIMAL,
         StartsWith => DbType::BOOL,
-        RdbRouteBlock => DbType::I64,
+        RdbRouteBlock | RdbShardOf => DbType::I64,
         Ceil | Floor | Sign | Sqrt => {
             if first() == DbType::DECIMAL {
                 DbType::DECIMAL
@@ -1293,6 +1297,17 @@ fn route_block(type_name: &str, value: &Value) -> Result<u64, String> {
     shard_block(key, family)
 }
 
+/// The shard owning `block` under the map this node serves as a shard.
+#[cfg(feature = "sharding")]
+fn served_shard_of(block: u64) -> Option<u32> {
+    crate::core::shard::map_state::current().map(|s| s.map.shard_of_block(block))
+}
+
+#[cfg(not(feature = "sharding"))]
+fn served_shard_of(_block: u64) -> Option<u32> {
+    None
+}
+
 /// An integer argument; `Err` for one that is not an integer.
 fn int_of(v: &Value, what: &str) -> Result<i64, String> {
     let Value::Data { bytes, db_type } = v else {
@@ -1540,6 +1555,13 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             let v = int_of(&args[0], "the value")?;
             let wide = matches!(&args[0], Value::Data { db_type: DbType::I64, .. }) || i32::try_from(v).is_err();
             text_value(if wide { format!("{:x}", v as u64) } else { format!("{:x}", v as i32 as u32) })
+        }
+        RdbShardOf => {
+            let block = route_block(&s(0), &args[1])?;
+            match served_shard_of(block) {
+                Some(shard) => data((shard as i64).to_le_bytes().to_vec(), DbType::I64),
+                None => Value::Null,
+            }
         }
         RdbRouteBlock | RdbRoutePoint => {
             let block = route_block(&s(0), &args[1])?;
