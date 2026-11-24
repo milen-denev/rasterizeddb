@@ -1563,6 +1563,35 @@ impl Session {
         if let Some(r) = self.routine_statement(sql, &tokens, more, rows_mode).await {
             return r;
         }
+        // CREATE USER 'u'@'%' IDENTIFIED BY …, GRANT … ON db.* TO …, SET
+        // PASSWORD: the engine's role statements (`accounts`).
+        let database_name = self.database().name.clone();
+        if let Some(account) = super::accounts::translate(&tokens, &database_name) {
+            return match account {
+                Err(e) => {
+                    self.err(&e);
+                    Ok(false)
+                }
+                Ok(statements) if statements.is_empty() => {
+                    self.ok_more(more);
+                    Ok(true)
+                }
+                Ok(statements) => {
+                    let me = super::accounts::quote_ident(&self.user);
+                    let statements =
+                        statements.into_iter().map(|s| s.replace(super::accounts::SESSION_USER, &me)).collect();
+                    let forward = super::translate::Forward {
+                        statements,
+                        kind: Kind::Other,
+                        found_rows: None,
+                        params: 0,
+                        deferred: Vec::new(),
+                        system: Vec::new(),
+                    };
+                    self.forward(forward, more, rows_mode, None).await
+                }
+            };
+        }
         let (action, filter) = admin::classify(&tokens);
         let keeps_warnings = matches!(action, Action::Show(Show::Warnings | Show::CountWarnings))
             || tokens

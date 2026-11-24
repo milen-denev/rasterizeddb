@@ -1815,7 +1815,27 @@ impl Session {
                 return Ok(Ok(Flow::Next));
             }
         }
+        // Logins, users, roles and permissions, as the engine's role
+        // statements (`accounts`).
+        let account = match head.as_str() {
+            "CREATE" | "ALTER" | "DROP" | "GRANT" | "REVOKE" | "DENY" => super::accounts::translate(tokens),
+            _ => None,
+        };
         let r: Result<Flow, TsqlError> = match head.as_str() {
+            _ if account.is_some() => match account.expect("checked just above") {
+                Ok(statements) => {
+                    let mut out = Ok(Flow::Next);
+                    for sql in statements {
+                        if let Err(e) = self.silent(&sql).await {
+                            out = Err(error_from_engine(&e));
+                            break;
+                        }
+                    }
+                    self.statement_done(0, 0, 0);
+                    out
+                }
+                Err(e) => Err(e),
+            },
             "INSERT" if next == "BULK" => self.insert_bulk(tokens),
             "DECLARE" => self.declare(tokens, params).await,
             "DROP" if matches!(next.as_str(), "PROC" | "PROCEDURE") => {
