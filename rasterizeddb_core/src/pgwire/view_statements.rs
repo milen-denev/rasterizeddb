@@ -182,6 +182,20 @@ where
     if let Some(t) = state.transaction.as_mut() {
         t.queried = true;
     }
+    // A view is its owner's to drop, rename, refresh or replace: replaced by
+    // another role, its readers would run that role's query.
+    if !state.principal.may_administer() {
+        let owned: Vec<String> = match &statement {
+            ViewStatement::Drop { names, .. } => names.clone(),
+            ViewStatement::Refresh { name, .. } => vec![name.clone()],
+            ViewStatement::Rename { from, .. } => vec![from.clone()],
+            ViewStatement::Create { name, or_replace: true, .. } => vec![name.clone()],
+            ViewStatement::Create { .. } => Vec::new(),
+        };
+        if let Some((code, message)) = privilege_statements::require_view_owner(database, state, &owned).await {
+            return fail_statement(state, stream, code, &message).await;
+        }
+    }
     match statement {
         ViewStatement::Create { name, columns, query, or_replace, kind, if_not_exists, with_data } => {
             create_view(database, state, stream, name, columns, query, or_replace, kind, if_not_exists, with_data).await
@@ -249,6 +263,12 @@ where
         if !relation_exists(database, dep, tx).await {
             return fail_statement(state, stream, "42P01", &format!("relation \"{dep}\" does not exist")).await;
         }
+    }
+    // The creator must hold SELECT on what the view reads, as PostgreSQL
+    // asks: the view's readers read it with its owner's rights, so a view
+    // over a table its creator could not read was a way to read any table.
+    if let Some((code, message)) = privilege_statements::check(database, state, &query).await {
+        return fail_statement(state, stream, code, &message).await;
     }
 
     // The columns, as the query describes them.

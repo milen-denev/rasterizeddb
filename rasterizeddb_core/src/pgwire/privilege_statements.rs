@@ -278,13 +278,95 @@ pub(super) async fn check(database: &Arc<Database>, state: &SessionState, stmt: 
             continue;
         }
         let privilege = if r.mode == crate::core::mvcc::table_locks::TableMode::AccessShare { "SELECT" } else { write };
+        let view = match crate::core::rql::views::lookup(database, &r.name, tx).await {
+            Ok(view) => view,
+            Err(e) => return Some(("42501", format!("permission denied: the view catalogue could not be read ({e})"))),
+        };
         if !privileges::allows(&rows, me, &r.name, privilege) {
-            let noun = if matches!(crate::core::rql::views::lookup(database, &r.name, tx).await, Ok(Some(_))) {
-                "view"
-            } else {
-                "table"
-            };
+            let noun = if view.is_some() { "view" } else { "table" };
             return Some(("42501", format!("permission denied for {noun} {}", r.name)));
+        }
+        // What a view reads is read with its owner's rights (PostgreSQL's):
+        // the owner must hold them on every relation under it, so revoking
+        // them from the owner closes the view too.
+        if let Some(view) = view
+            && let Some(refusal) = Box::pin(view_owner_refusal(database, &rows, tx, &view, privilege, 0)).await
+        {
+            return Some(refusal);
+        }
+    }
+    None
+}
+
+/// How deep views over views are followed before the check gives up and
+/// refuses: further than any schema writes them, short of a stack.
+const VIEW_DEPTH: usize = 32;
+
+/// The refusal when `view`'s owner lacks `privilege` on a relation its query
+/// reads, following views under it with their own owners' rights; `None`
+/// when the owner holds every one. An unowned view, a view nested past
+/// [`VIEW_DEPTH`], or a catalogue that cannot be read refuses.
+fn view_owner_refusal<'a>(
+    database: &'a Arc<Database>,
+    rows: &'a [AclRow],
+    tx: Option<TxId>,
+    view: &'a crate::core::rql::views::ViewDef,
+    privilege: &'a str,
+    depth: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(&'static str, String)>> + Send + 'a>> {
+    Box::pin(async move {
+        if depth >= VIEW_DEPTH {
+            return Some(("42501", format!("permission denied for view {}: views nest too deeply to check", view.name)));
+        }
+        let Some(owner) = privileges::owner_of(rows, &view.name) else {
+            return Some(("42501", format!("permission denied for view {}: it has no owner", view.name)));
+        };
+        if crate::auth::lookup_role_in(database, owner, tx).await.is_some_and(|r| r.is_superuser) {
+            return None;
+        }
+        for r in crate::core::rql::lock_set::relation_references(&view.definition) {
+            if r.name.starts_with("__") || !relation_exists(database, &r.name, tx).await {
+                continue;
+            }
+            if !privileges::allows(rows, owner, &r.name, privilege) {
+                return Some((
+                    "42501",
+                    format!("permission denied for table {}: the owner of view {} does not hold {privilege} on it", r.name, view.name),
+                ));
+            }
+            match crate::core::rql::views::lookup(database, &r.name, tx).await {
+                Ok(Some(inner)) => {
+                    if let Some(refusal) = view_owner_refusal(database, rows, tx, &inner, privilege, depth + 1).await {
+                        return Some(refusal);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => return Some(("42501", format!("permission denied: the view catalogue could not be read ({e})"))),
+            }
+        }
+        None
+    })
+}
+
+/// The refusal for a non-superuser's statement on views it does not own:
+/// `names` that are views, each its owner's alone to drop, rename, refresh
+/// or replace. A name that is no view is the statement's to report.
+pub(super) async fn require_view_owner(database: &Arc<Database>, state: &SessionState, names: &[String]) -> Option<(&'static str, String)> {
+    if names.is_empty() || state.principal.may_administer() {
+        return None;
+    }
+    let tx = state.current_tx();
+    let rows = match privileges::load(database, tx).await {
+        Ok(rows) => rows,
+        Err(e) => return Some(("42501", format!("permission denied: the privilege catalogue could not be read ({e})"))),
+    };
+    for name in names {
+        match crate::core::rql::views::lookup(database, name, tx).await {
+            Ok(Some(_)) if !privileges::owns(&rows, &state.principal.name, name) => {
+                return Some(("42501", format!("must be owner of view {name}")));
+            }
+            Ok(_) => {}
+            Err(e) => return Some(("42501", format!("permission denied: the view catalogue could not be read ({e})"))),
         }
     }
     None
