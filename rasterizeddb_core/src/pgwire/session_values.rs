@@ -21,7 +21,16 @@ use crate::core::sql_scan::{contains_ignore_ascii_case, is_identifier_byte, matc
 
 /// The session a statement runs in.
 pub(crate) struct Session<'a> {
+    /// `current_user`: the role in effect, the one `SET ROLE` named.
     pub user: &'a str,
+    /// `session_user`: the role the session logged in as.
+    pub session_user: &'a str,
+    /// Whether `user` is a superuser, who holds every privilege.
+    pub superuser: bool,
+    /// The ACL, for `has_…_privilege` and `pg_has_role`; `None` leaves
+    /// them as written (the caller loads it only for a statement naming
+    /// one, [`names_privilege_function`]).
+    pub acl: Option<&'a [crate::core::rql::privileges::AclRow]>,
     pub database: &'a str,
     pub backend_pid: i32,
     /// A run-time parameter's value as `SHOW` reports it (`key` lowercase),
@@ -35,8 +44,88 @@ pub(crate) struct Session<'a> {
 /// needs_session_path`).
 pub(crate) fn names_any(sql: &str) -> bool {
     let nothing = |_: &str| None;
-    let session = Session { user: "", database: "", backend_pid: 0, setting: &nothing };
-    !matches!(rewrite(sql, &session), Ok(None))
+    let session = Session { user: "", session_user: "", superuser: false, acl: None, database: "", backend_pid: 0, setting: &nothing };
+    names_privilege_function(sql) || !matches!(rewrite(sql, &session), Ok(None))
+}
+
+/// The functions that read privileges, which [`rewrite`] answers when the
+/// session's ACL is given.
+const PRIVILEGE_FUNCTIONS: &[&str] = &[
+    "has_table_privilege",
+    "has_sequence_privilege",
+    "has_function_privilege",
+    "has_column_privilege",
+    "has_database_privilege",
+    "pg_has_role",
+];
+
+/// Whether `sql` may call one of [`PRIVILEGE_FUNCTIONS`]: the caller loads
+/// the ACL only then.
+pub(crate) fn names_privilege_function(sql: &str) -> bool {
+    (contains_ignore_ascii_case(sql, b"_privilege") || contains_ignore_ascii_case(sql, b"pg_has_role"))
+        && PRIVILEGE_FUNCTIONS.iter().any(|f| contains_ignore_ascii_case(sql, f.as_bytes()))
+}
+
+/// A privilege function's answer from its literal arguments: `TRUE` or
+/// `FALSE`, or `None` (left as written) for a non-literal argument, such
+/// as an oid column of a catalogue query.
+fn privilege_answer(function: &str, args: &str, session: &Session) -> Option<String> {
+    use crate::core::rql::privileges as p;
+    let acl = session.acl?;
+    let parts: Vec<String> = crate::core::sql_scan::split_top_level(args, b',')
+        .into_iter()
+        .map(|a| {
+            let a = a.trim();
+            let a = a.split("::").next().unwrap_or(a).trim();
+            a.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')).map(|x| x.replace("''", "'"))
+        })
+        .collect::<Option<Vec<String>>>()?;
+    // An optional role first: two arguments (three for a column) without.
+    let base = if function == "has_column_privilege" { 3 } else { 2 };
+    let (role, rest) = match parts.len() {
+        n if n == base => (session.user.to_string(), &parts[..]),
+        n if n == base + 1 => (parts[0].clone(), &parts[1..]),
+        _ => return None,
+    };
+    let object = crate::core::rql::sequence::sequence_name_of(rest[0].split('(').next().unwrap_or(&rest[0]).trim());
+    let wanted: Vec<String> = rest[rest.len() - 1]
+        .split(',')
+        .map(|w| w.trim().to_ascii_uppercase())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if wanted.is_empty() {
+        return None;
+    }
+    let superuser = session.superuser && role == session.user;
+    let holds = |privilege: &str| -> bool {
+        let (privilege, with_grant) = match privilege.strip_suffix(" WITH GRANT OPTION") {
+            Some(base) => (base.trim(), true),
+            None => (privilege, false),
+        };
+        if superuser {
+            return true;
+        }
+        match function {
+            "has_table_privilege" | "has_sequence_privilege" | "has_column_privilege" => {
+                if with_grant {
+                    p::may_grant(acl, &role, &object, privilege)
+                } else {
+                    p::allows(acl, &role, &object, privilege)
+                }
+            }
+            "has_function_privilege" => privilege == "EXECUTE" && p::may_execute(acl, &role, &format!("@function:{object}")),
+            // The database a session is in: anyone connected may connect
+            // and make temporary tables; CREATE (schemas) is not modelled.
+            "has_database_privilege" => object == session.database && matches!(privilege, "CONNECT" | "TEMPORARY" | "TEMP"),
+            "pg_has_role" => match privilege {
+                "MEMBER" | "SET" => p::settable_roles(acl, &role).contains(&object) || p::roles_of(acl, &role).contains(&object),
+                "USAGE" => p::roles_of(acl, &role).contains(&object),
+                _ => false,
+            },
+            _ => false,
+        }
+    };
+    Some(if wanted.iter().any(|w| holds(w)) { "TRUE" } else { "FALSE" }.to_string())
 }
 
 /// `sql` with each session value replaced; `None` when it names none, an
@@ -53,7 +142,7 @@ pub(crate) fn rewrite(sql: &str, session: &Session) -> Result<Option<String>, (&
     if !runs_now {
         return Ok(None);
     }
-    if ![&b"current_"[..], b"session_user", b"pg_backend_pid", b"pg_is_in_recovery"]
+    if ![&b"current_"[..], b"session_user", b"pg_backend_pid", b"pg_is_in_recovery", b"_privilege", b"pg_has_role"]
         .iter()
         .any(|w| contains_ignore_ascii_case(sql, w))
     {
@@ -104,7 +193,16 @@ pub(crate) fn rewrite(sql: &str, session: &Session) -> Result<Option<String>, (&
         }
         let call = next.starts_with('(');
         let replaced: Option<(String, usize)> = match (word.as_str(), call) {
-            ("current_user" | "current_role" | "session_user", false) => Some((literal(session.user), j)),
+            ("current_user" | "current_role", false) => Some((literal(session.user), j)),
+            ("session_user", false) => Some((literal(session.session_user), j)),
+            (f, true) if session.acl.is_some() && PRIVILEGE_FUNCTIONS.contains(&f) => {
+                let open = j + gap;
+                let Some(close) = matching_close(sql, open) else {
+                    i = j;
+                    continue;
+                };
+                privilege_answer(f, sql[open + 1..close].trim(), session).map(|v| (v, close + 1))
+            }
             ("current_catalog", false) => Some((literal(session.database), j)),
             ("current_database" | "pg_backend_pid" | "pg_is_in_recovery" | "current_schemas" | "current_setting", true) => {
                 let open = j + gap;
@@ -243,7 +341,7 @@ mod tests {
         };
         rewrite(
             sql,
-            &Session { user: "alice", database: "shop", backend_pid: 42, setting: &setting },
+            &Session { user: "alice", session_user: "alice", superuser: false, acl: None, database: "shop", backend_pid: 42, setting: &setting },
         )
     }
 

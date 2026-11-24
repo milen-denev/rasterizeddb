@@ -4491,7 +4491,11 @@ async fn description_now(
         None => {
             // The session's values as it runs them (`session_values`); one
             // that fails is left for `Execute` to report.
-            let with_session = session_rewrite(state, query).ok().flatten();
+            let acl = match session_values::names_privilege_function(query) {
+                true => crate::core::rql::privileges::load_shared(database, state.current_tx()).await.ok(),
+                false => None,
+            };
+            let with_session = session_rewrite(state, query, acl.as_deref().map(Vec::as_slice)).ok().flatten();
             let query = with_session.as_deref().unwrap_or(query);
             // `EXECUTE p(…)` is described as the statement it runs.
             let bound = match sql_prepare::parse(query) {
@@ -8787,13 +8791,23 @@ where
     let stmt = rewritten.as_ref();
     // `current_user`, `current_setting(…)` and the other values of this
     // session, as literals (`session_values`).
-    let with_session = match session_rewrite(state, stmt) {
+    // The ACL only for a statement that asks about privileges.
+    let acl = match session_values::names_privilege_function(stmt) {
+        true => crate::core::rql::privileges::load_shared(database, state.current_tx()).await.ok(),
+        false => None,
+    };
+    let with_session = match session_rewrite(state, stmt, acl.as_deref().map(Vec::as_slice)) {
         Ok(text) => text,
         Err((code, message)) => {
             fail_statement(state, stream, code, &message).await?;
             return Ok(());
         }
     };
+    // A privilege answer is baked in as TRUE or FALSE, and a GRANT changes
+    // it: no parse of this text is learned for the original's sake.
+    if acl.is_some() && with_session.is_some() {
+        crate::core::rql::prepared::note_rewritten();
+    }
     let stmt = with_session.as_deref().unwrap_or(stmt);
     // Enum types (`user_types`): a column, a cast and an `ORDER BY` of one
     // in their stored form, read in this statement's transaction so a type
@@ -12987,12 +13001,19 @@ pub(super) fn schema_verb(stmt: &str) -> bool {
 }
 
 /// `sql` with this session's values in it (`session_values::rewrite`).
-fn session_rewrite(state: &SessionState, sql: &str) -> Result<Option<String>, (&'static str, String)> {
+fn session_rewrite(
+    state: &SessionState,
+    sql: &str,
+    acl: Option<&[crate::core::rql::privileges::AclRow]>,
+) -> Result<Option<String>, (&'static str, String)> {
     let setting = |key: &str| show_parameter(state, key);
     session_values::rewrite(
         sql,
         &session_values::Session {
             user: &state.principal.name,
+            session_user: state.session_user.as_ref().map_or(&state.principal.name, |s| &s.name),
+            superuser: state.principal.may_administer(),
+            acl,
             database: &state.database_name,
             backend_pid: state.backend_pid,
             setting: &setting,
