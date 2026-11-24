@@ -2594,18 +2594,29 @@ async fn plain_tables_opening_keep_the_descriptor_count_fresh() {
         exec(&db, &format!("INSERT INTO plain{i} (id, v) VALUES (1, 1)")).await;
     }
     tokio::time::sleep(super::budget::RECOUNT_EVERY + Duration::from_millis(100)).await;
-    // Another test's board round may recount meanwhile in a full run; what
-    // this one needs is a count taken after the last open, holding them.
-    let last_open = std::time::Instant::now();
-    exec(&db, "CREATE TABLE plain_last (id BIGINT PRIMARY KEY, v BIGINT)").await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while super::budget::counted_at().is_none_or(|t| t < last_open) {
+    // What this test needs is a count taken after an open of its own,
+    // holding the twenty. In a full run another test's board round can
+    // claim the refresh just before that open, which then finds the count
+    // fresh and leaves it (as it should); so it opens one more table each
+    // period until an open's refresh lands (Windows CI 45430294580).
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut opened = 0;
+    'recounted: loop {
+        let last_open = std::time::Instant::now();
+        exec(&db, &format!("CREATE TABLE plain_last{opened} (id BIGINT PRIMARY KEY, v BIGINT)")).await;
+        opened += 1;
+        let period = std::time::Instant::now() + super::budget::RECOUNT_EVERY + Duration::from_millis(100);
+        while std::time::Instant::now() < period {
+            if super::budget::counted_at().is_some_and(|t| t >= last_open) {
+                break 'recounted;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(
             std::time::Instant::now() < deadline,
-            "no recount after twenty plain tables opened: the count stayed {} (was {before})",
+            "no recount after twenty plain tables and {opened} more opened: the count stayed {} (was {before})",
             super::budget::descriptors_in_use()
         );
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     // The claim is stamped before its listing lands.
     while super::budget::descriptors_in_use() == before {

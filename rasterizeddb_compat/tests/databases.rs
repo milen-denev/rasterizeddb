@@ -114,10 +114,23 @@ async fn a_dropped_database_stops_accepting_connections() {
 
     scratch.close().await;
 
-    sqlx::query("DROP DATABASE scratch")
-        .execute(&default)
-        .await
-        .expect("dropping should succeed once the session has gone");
+    // sqlx's close returns when its side is done, which can be before the
+    // server has deregistered the session; until then the drop is refused
+    // with 55006, as PostgreSQL's would be. Retried briefly while it is
+    // (Windows arm64 CI 45430294580); any other error, or a session that
+    // never goes, still fails the test.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match sqlx::query("DROP DATABASE scratch").execute(&default).await {
+            Ok(_) => break,
+            Err(sqlx::Error::Database(e))
+                if e.code().as_deref() == Some("55006") && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("dropping should succeed once the session has gone: {e:?}"),
+        }
+    }
 
     connect(&server.url_for("scratch", "rasterized", None))
         .await
