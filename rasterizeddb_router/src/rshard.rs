@@ -178,6 +178,11 @@ pub enum RouteTemplate {
     /// refused, `0A000 "statement needs a route key in cluster mode"`
     /// (fail-closed, B1a.6 step 4).
     NeedsKey,
+    /// A read no one shard can answer and no merge combines (sharded
+    /// tables on different keys, or with an unsharded one, or a window over
+    /// one): the gateway gathers `tables`' rows from every shard onto the
+    /// home shard and runs the statement there (B4.5).
+    Gather { tables: Vec<String> },
 }
 
 /// How a fan-out's parts are combined (B1b tier 1, B1c).
@@ -496,6 +501,12 @@ impl RouteTemplate {
             RouteTemplate::NeedsKey => {
                 w.u8(5);
             }
+            RouteTemplate::Gather { tables } => {
+                w.u8(6).u32(tables.len() as u32);
+                for t in tables {
+                    w.str(t);
+                }
+            }
         }
     }
     pub fn decode(r: &mut Reader) -> Result<RouteTemplate, String> {
@@ -506,6 +517,17 @@ impl RouteTemplate {
             3 => RouteTemplate::Home,
             4 => RouteTemplate::FanOut { merge: Merge::decode(r)?, writes: r.bool()? },
             5 => RouteTemplate::NeedsKey,
+            6 => {
+                let n = r.u32()? as usize;
+                if n > 256 {
+                    return Err("rshard: a gather of more than 256 tables".into());
+                }
+                let mut tables = Vec::with_capacity(n);
+                for _ in 0..n {
+                    tables.push(r.str()?);
+                }
+                RouteTemplate::Gather { tables }
+            }
             b => return Err(format!("rshard route template {b} is unknown")),
         })
     }

@@ -33,8 +33,34 @@ use crate::core::sql_scan::{skip_comment, skip_quoted};
 pub fn classify(database: &Database, source: Source, text: &str) -> RouteTemplate {
     match classify_inner(database, source, text) {
         RouteTemplate::Slot { index, family } if source == Source::Parse => RouteTemplate::Param { index, family },
+        // A read refused for want of one key is gathered instead (B4.5):
+        // every sharded table it names, fetched from every shard onto the
+        // home shard. A write or a locking read stays refused.
+        RouteTemplate::NeedsKey if gatherable(text) => {
+            let mut tables: Vec<String> = Vec::new();
+            for w in words(text) {
+                if matches!(database.relation(&w), Some(Relation::Partitioned(_))) && !tables.contains(&w) {
+                    tables.push(w);
+                }
+            }
+            if tables.is_empty() { RouteTemplate::NeedsKey } else { RouteTemplate::Gather { tables } }
+        }
         t => t,
     }
+}
+
+/// Whether `text` is a read that may be gathered: a SELECT, WITH, TABLE
+/// or VALUES that locks nothing and writes nothing.
+fn gatherable(text: &str) -> bool {
+    let t = text.trim_start();
+    let head = first_word(t);
+    if !matches!(head.as_str(), "SELECT" | "WITH" | "TABLE" | "VALUES") {
+        return false;
+    }
+    let up = t.to_ascii_uppercase();
+    let words: Vec<&str> = up.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).collect();
+    !words.windows(2).any(|p| p[0] == "FOR" && matches!(p[1], "UPDATE" | "SHARE" | "NO" | "KEY"))
+        && !words.iter().any(|w| matches!(*w, "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "NEXTVAL" | "SETVAL"))
 }
 
 fn classify_inner(database: &Database, source: Source, text: &str) -> RouteTemplate {
@@ -726,5 +752,21 @@ mod b48_tests {
         assert_eq!(k("SELECT * FROM a WHERE a.tenant_id IN ($1, $2)"), None, "two values may be two shards");
         assert_eq!(k("SELECT * FROM a WHERE a.other = $1"), None);
         assert_eq!(k("SELECT * FROM a WHERE a.tenant_id >= $1"), None, "a range is not one key");
+    }
+}
+
+#[cfg(test)]
+mod b45_tests {
+    use super::gatherable;
+
+    #[test]
+    fn b45_only_plain_reads_are_gathered() {
+        assert!(gatherable("SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer"));
+        assert!(gatherable("WITH r AS (SELECT * FROM t) SELECT row_number() OVER (ORDER BY id) FROM r"));
+        assert!(!gatherable("SELECT * FROM t FOR UPDATE"), "a locking read");
+        assert!(!gatherable("SELECT * FROM t FOR NO KEY UPDATE"));
+        assert!(!gatherable("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"), "a write in a CTE");
+        assert!(!gatherable("SELECT nextval('s'), * FROM t"), "a sequence call writes");
+        assert!(!gatherable("UPDATE t SET a = 1"));
     }
 }

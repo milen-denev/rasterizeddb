@@ -24,6 +24,8 @@ pub(crate) enum Target {
     Shard(u32),
     FanOut { merge: Merge, writes: bool },
     Refuse { sqlstate: &'static str, message: String },
+    /// Gather these sharded tables onto the home shard and run there (B4.5).
+    Gather { tables: Vec<String> },
 }
 
 /// What a run on a shard came to.
@@ -697,6 +699,7 @@ impl Session {
                     return Ok(outcome);
                 }
                 Target::FanOut { merge, writes } => return self.fan_out(conn, msg, merge, writes).await,
+                Target::Gather { tables } => return self.gather_run(conn, text, &tables).await,
                 Target::Shard(s) => {
                     self.core.counters.borrow_mut().routed += 1;
                     self.run_on(conn, s, msg, Vec::new(), tkey.as_ref().map(|t| (Source::Shape, t.as_str()))).await?
@@ -747,6 +750,13 @@ impl Session {
             RouteTemplate::Home => Target::Shard(home),
             RouteTemplate::FanOut { merge, writes } => self.unrouted_target(merge, writes),
             RouteTemplate::NeedsKey => needs_key(),
+            RouteTemplate::Gather { tables } => {
+                if self.core.shared.cfg.gather && self.txn.status == b'I' && self.login.pinned.is_none() {
+                    Target::Gather { tables }
+                } else {
+                    needs_key()
+                }
+            }
         };
         (target, Some(shape))
     }
@@ -1032,7 +1042,7 @@ impl Session {
     /// Runs `sql` as one simple query on this session's virtual session on
     /// `shard`, for the gateway's own bookkeeping (nothing reaches the
     /// client): the final ReadyForQuery status, and the first error.
-    async fn quiet_query(&mut self, shard: u32, sql: &str) -> Result<(u8, Option<(String, String)>), String> {
+    pub(crate) async fn quiet_query(&mut self, shard: u32, sql: &str) -> Result<(u8, Option<(String, String)>), String> {
         self.tagged_query(shard, sql).await.map(|(status, error, _)| (status, error))
     }
 

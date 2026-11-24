@@ -76,6 +76,9 @@ pub struct Config {
     pub max_message_bytes: usize,
     pub max_batch_bytes: usize,
     pub gather_max_bytes: usize,
+    /// Whether a read no one shard can answer is gathered onto the home
+    /// shard (B4.5) rather than refused.
+    pub gather: bool,
     pub template_cache_per_core: usize,
     pub template_cache_shared: usize,
     pub auth_cache_secs: u64,
@@ -137,6 +140,7 @@ impl Default for Config {
             two_phase: false,
             two_phase_lock_timeout_ms: 5000,
             deadlock_check_ms: 1000,
+            gather: true,
             native_role: String::new(),
             native_database: String::new(),
             drain: Duration::from_secs(30),
@@ -285,6 +289,7 @@ impl Config {
             "native_listen" => self.native_listen = opt(v).map(|a| a.parse()).transpose().map_err(|_| "not host:port")?,
             "two_phase_lock_timeout_ms" => self.two_phase_lock_timeout_ms = num(v)?,
             "deadlock_check_ms" => self.deadlock_check_ms = num(v)?,
+            "gather" => self.gather = matches!(v, "on" | "true" | "1"),
             "two_phase" => {
                 self.two_phase = match v.to_ascii_lowercase().as_str() {
                     "on" | "true" | "1" => true,

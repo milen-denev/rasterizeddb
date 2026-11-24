@@ -87,6 +87,132 @@ impl Session {
         Ok(Outcome::Done { error: false })
     }
 
+    /// A read no one shard can answer (B4.5): each sharded table in
+    /// `tables` read from every shard as fan-out parts, loaded into a
+    /// temporary table on the home shard (which holds the unsharded ones),
+    /// and the statement run there over those. Bounded by
+    /// `gather_max_bytes` across every table; the temporaries are dropped
+    /// after.
+    pub(crate) async fn gather_run<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, text: &str, tables: &[String]) -> io::Result<Outcome> {
+        self.core.counters.borrow_mut().fan_outs += 1;
+        let map = self.core.map();
+        let home = self.core.shared.home(&map);
+        let shards: Vec<u32> = map.shards().iter().map(|s| s.id).collect();
+        let cap = self.core.shared.cfg.gather_max_bytes;
+        let mut used = 0usize;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut renames: Vec<(String, String)> = Vec::new();
+        let fail = |me: &mut Self, code: &str, m: String| {
+            me.error_ready(code, &m);
+            Outcome::Done { error: true }
+        };
+        for table in tables {
+            let temp = format!("rdb_gather_{n}_{}", table.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').collect::<String>());
+            let sql = format!("SELECT * FROM {}", quote_ident(table));
+            let mut q = vec![b'Q'];
+            q.extend_from_slice(&((sql.len() + 5) as i32).to_be_bytes());
+            q.extend_from_slice(sql.as_bytes());
+            q.push(0);
+            let parts = match self.collect_parts(&shards, &q, cap.saturating_sub(used)).await {
+                Ok(p) => p,
+                Err((code, m)) => {
+                    self.drop_temps(home, &renames).await;
+                    return Ok(fail(self, code.as_str(), m));
+                }
+            };
+            used += parts.iter().map(|(_, p)| p.rows.iter().map(|(_, r)| r.len()).sum::<usize>()).sum::<usize>();
+            let Some(columns) = parts.first().and_then(|(_, p)| row_columns(&p.head)) else {
+                self.drop_temps(home, &renames).await;
+                return Ok(fail(self, "XX000", format!("gathering {table}: no row description")));
+            };
+            let defs: Vec<String> = columns.iter().map(|(name, oid)| format!("{} {}", quote_ident(name), type_name(*oid))).collect();
+            let create = format!("CREATE TEMP TABLE {} ({})", quote_ident(&temp), defs.join(", "));
+            match self.quiet_query(home, &create).await {
+                Ok((_, None)) => {}
+                Ok((_, Some((code, m)))) => {
+                    self.drop_temps(home, &renames).await;
+                    return Ok(fail(self, code.as_str(), format!("gathering {table} on shard {home}: {m}")));
+                }
+                Err(e) => {
+                    self.drop_temps(home, &renames).await;
+                    return Ok(fail(self, "08006", format!("gathering {table} on shard {home}: {e}")));
+                }
+            }
+            renames.push((table.clone(), temp.clone()));
+            // The rows, a few hundred to a statement.
+            let mut batch: Vec<String> = Vec::new();
+            let all_rows: Vec<&Vec<u8>> = parts.iter().flat_map(|(_, p)| p.rows.iter().map(|(_, r)| r)).collect();
+            for (i, row) in all_rows.iter().enumerate() {
+                let cells = row_cells(row);
+                let vals: Vec<String> = cells
+                    .iter()
+                    .zip(&columns)
+                    .map(|(c, (_, oid))| match c {
+                        None => "NULL".to_string(),
+                        Some(v) => format!("'{}'::{}", String::from_utf8_lossy(v).replace('\'', "''"), type_name(*oid)),
+                    })
+                    .collect();
+                batch.push(format!("({})", vals.join(", ")));
+                if batch.len() == 256 || i + 1 == all_rows.len() {
+                    let insert = format!("INSERT INTO {} VALUES {}", quote_ident(&temp), batch.join(", "));
+                    batch.clear();
+                    match self.quiet_query(home, &insert).await {
+                        Ok((_, None)) => {}
+                        Ok((_, Some((code, m)))) => {
+                            self.drop_temps(home, &renames).await;
+                            return Ok(fail(self, code.as_str(), format!("gathering {table}: {m}")));
+                        }
+                        Err(e) => {
+                            self.drop_temps(home, &renames).await;
+                            return Ok(fail(self, "08006", format!("gathering {table}: {e}")));
+                        }
+                    }
+                }
+            }
+        }
+        let rewritten = rename_tables(text, &renames);
+        let mut q = vec![b'Q'];
+        q.extend_from_slice(&((rewritten.len() + 5) as i32).to_be_bytes());
+        q.extend_from_slice(rewritten.as_bytes());
+        q.push(0);
+        let outcome = self.run_on(conn, home, &q, Vec::new(), None).await;
+        self.drop_temps(home, &renames).await;
+        outcome
+    }
+
+    async fn drop_temps(&mut self, home: u32, renames: &[(String, String)]) {
+        for (_, temp) in renames {
+            let _ = self.quiet_query(home, &format!("DROP TABLE IF EXISTS {}", quote_ident(temp))).await;
+        }
+    }
+
+    /// Every shard's part of `msg` (a plain read, concatenated), within
+    /// `cap` bytes in all.
+    async fn collect_parts(&mut self, shards: &[u32], msg: &[u8], cap: usize) -> Result<Vec<(u32, PartReply)>, (String, String)> {
+        let epoch = self.core.map().epoch();
+        let mut sessions = Vec::with_capacity(shards.len());
+        for &s in shards {
+            let id = self.ensure_vs(s).await.map_err(|(c, m)| (c, format!("shard {s}: {m}")))?;
+            sessions.push((s, id));
+        }
+        let mut handles = Vec::with_capacity(sessions.len());
+        for (s, id) in sessions {
+            let req = Request::ExecPart { session: id, map_epoch: epoch, merge: Merge::Concat, bytes: msg.to_vec() }.encode();
+            handles.push((s, tokio::task::spawn_local(gather(self.core.clone(), s, id, req, cap))));
+        }
+        let mut parts = Vec::with_capacity(handles.len());
+        for (s, h) in handles {
+            let p = h.await.map_err(|_| ("XX000".to_string(), format!("the part on shard {s} panicked")))??;
+            if let Some((_, m)) = pg::messages(&p.tail).find(|(t, _)| *t == b'E') {
+                let code = pg::error_sqlstate(m).unwrap_or("XX000").to_string();
+                return Err((code, format!("shard {s}: {}", pg::error_message(m).unwrap_or_default())));
+            }
+            parts.push((s, p));
+        }
+        Ok(parts)
+    }
+
     /// `unrouted_writes = each_shard`: the write on every shard in turn,
     /// each in its own transaction; counts summed.
     async fn each_shard<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, msg: &[u8], shards: &[u32]) -> io::Result<Outcome> {
@@ -371,5 +497,156 @@ mod tests {
         assert_eq!(merged(Merge::Any, &same).1, "UPDATE 5");
         let inserts = vec![(0, part(Vec::new(), vec![], "INSERT 0 2")), (1, part(Vec::new(), vec![], "INSERT 0 2"))];
         assert_eq!(merged(Merge::Any, &inserts).1, "INSERT 0 2");
+    }
+}
+
+/// An identifier, double-quoted.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// The columns a RowDescription names: (name, type oid).
+fn row_columns(head: &[u8]) -> Option<Vec<(String, u32)>> {
+    let (_, m) = pg::messages(head).find(|(t, _)| *t == b'T')?;
+    let b = pg::body(m);
+    let n = u16::from_be_bytes(b.get(0..2)?.try_into().ok()?) as usize;
+    let mut at = 2;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let end = at + b.get(at..)?.iter().position(|&c| c == 0)?;
+        let name = String::from_utf8_lossy(&b[at..end]).into_owned();
+        at = end + 1;
+        let oid = u32::from_be_bytes(b.get(at + 6..at + 10)?.try_into().ok()?);
+        at += 18;
+        out.push((name, oid));
+    }
+    Some(out)
+}
+
+/// A DataRow's cells, text format.
+fn row_cells(row: &[u8]) -> Vec<Option<Vec<u8>>> {
+    let b = pg::body(row);
+    let Some(n) = b.get(0..2).map(|x| u16::from_be_bytes([x[0], x[1]]) as usize) else { return Vec::new() };
+    let mut at = 2;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let Some(len) = b.get(at..at + 4).map(|x| i32::from_be_bytes([x[0], x[1], x[2], x[3]])) else { break };
+        at += 4;
+        if len < 0 {
+            out.push(None);
+        } else {
+            let end = at + len as usize;
+            out.push(b.get(at..end).map(<[u8]>::to_vec));
+            at = end;
+        }
+    }
+    out
+}
+
+/// The SQL type for a column of type `oid`, for the gathered temporary.
+fn type_name(oid: u32) -> &'static str {
+    match oid {
+        16 => "boolean",
+        20 => "bigint",
+        21 => "smallint",
+        23 => "integer",
+        700 => "real",
+        701 => "double precision",
+        1700 => "numeric",
+        17 => "bytea",
+        1082 => "date",
+        1114 => "timestamp",
+        1184 => "timestamptz",
+        2950 => "uuid",
+        3802 => "jsonb",
+        114 => "json",
+        _ => "text",
+    }
+}
+
+/// `text` with every table in `renames` written as its temporary, outside
+/// string literals. A dotted name is read part by part:
+/// - `t` is a relation;
+/// - `public.t` is a relation (the schema dropped: temporaries are not in it);
+/// - `t.c` is a column of `t` (the qualifier renamed);
+/// - `s.t.c` likewise.
+fn rename_tables(text: &str, renames: &[(String, String)]) -> String {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut i = 0;
+    let temp_of = |part: &str| {
+        let name = if part.starts_with('"') { part.trim_matches('"').to_string() } else { part.to_ascii_lowercase() };
+        renames.iter().find(|(t, _)| *t == name).map(|(_, temp)| quote_ident(temp))
+    };
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' {
+            let end = b[i + 1..].iter().position(|&x| x == b'\'').map_or(b.len(), |p| i + 2 + p);
+            out.push_str(&text[i..end.min(b.len())]);
+            i = end;
+            continue;
+        }
+        let ident_start = (c.is_ascii_alphabetic() || c == b'_' || c == b'"') && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'$'));
+        if !ident_start {
+            out.push(c as char);
+            i += 1;
+            continue;
+        }
+        // The dotted chain's parts.
+        let mut parts: Vec<&str> = Vec::new();
+        let mut j = i;
+        loop {
+            let s = j;
+            if j < b.len() && b[j] == b'"' {
+                j += 1 + b[j + 1..].iter().position(|&x| x == b'"').map_or(b.len() - j - 1, |p| p + 1);
+            } else {
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    j += 1;
+                }
+            }
+            parts.push(&text[s..j.min(text.len())]);
+            if j < b.len() && b[j] == b'.' && b.get(j + 1).is_some_and(|n| n.is_ascii_alphabetic() || *n == b'_' || *n == b'"') {
+                j += 1;
+                continue;
+            }
+            break;
+        }
+        let is_public = |p: &str| p.eq_ignore_ascii_case("public") || p == "\"public\"";
+        let rendered: Vec<String> = match parts.len() {
+            1 => vec![temp_of(parts[0]).unwrap_or_else(|| parts[0].to_string())],
+            2 if is_public(parts[0]) => match temp_of(parts[1]) {
+                Some(t) => vec![t],
+                None => parts.iter().map(|p| p.to_string()).collect(),
+            },
+            2 => vec![temp_of(parts[0]).unwrap_or_else(|| parts[0].to_string()), parts[1].to_string()],
+            _ if is_public(parts[0]) => match temp_of(parts[1]) {
+                Some(t) => std::iter::once(t).chain(parts[2..].iter().map(|p| p.to_string())).collect(),
+                None => parts.iter().map(|p| p.to_string()).collect(),
+            },
+            _ => parts.iter().map(|p| p.to_string()).collect(),
+        };
+        out.push_str(&rendered.join("."));
+        i = j;
+    }
+    out
+}
+
+#[cfg(test)]
+mod gather_tests {
+    use super::*;
+
+    #[test]
+    fn gather_renames_relations_not_their_columns_or_strings() {
+        let r = vec![("orders".to_string(), "rdb_gather_1_orders".to_string())];
+        assert_eq!(
+            rename_tables("SELECT o.id FROM orders o JOIN public.orders p ON true WHERE note = 'orders'", &r),
+            "SELECT o.id FROM \"rdb_gather_1_orders\" o JOIN \"rdb_gather_1_orders\" p ON true WHERE note = 'orders'"
+        );
+        // `orders.id`: the qualifier of a column is the table too.
+        assert_eq!(
+            rename_tables("SELECT orders.id, public.orders.v FROM orders", &r),
+            "SELECT \"rdb_gather_1_orders\".id, \"rdb_gather_1_orders\".v FROM \"rdb_gather_1_orders\""
+        );
+        assert_eq!(rename_tables("SELECT x.orders FROM t x", &r), "SELECT x.orders FROM t x", "a column named like the table");
     }
 }
