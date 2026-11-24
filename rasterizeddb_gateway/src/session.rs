@@ -142,6 +142,8 @@ pub struct Session {
     /// After an error in a batch that ended in Flush: drop messages until
     /// Sync, then ReadyForQuery.
     pub(crate) discard_until_sync: bool,
+    /// The channels this session listens on, once it has (B4.3).
+    pub(crate) listener: Option<crate::notify::Listener>,
     pub(crate) out: Vec<u8>,
 }
 
@@ -160,6 +162,20 @@ enum Local {
     Discard,
     Refused(&'static str),
     Routed,
+    /// `LISTEN ch`, answered by the gateway's hub (B4.3).
+    Listen(String),
+    /// `UNLISTEN ch`, or `UNLISTEN *` (`None`).
+    Unlisten(Option<String>),
+}
+
+/// A channel name as PostgreSQL reads it: quoted kept, bare lower-cased.
+fn channel_of(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        return Some(t[1..t.len() - 1].replace("\"\"", "\""));
+    }
+    (!t.is_empty() && t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80) && !t.as_bytes()[0].is_ascii_digit())
+        .then(|| t.to_ascii_lowercase())
 }
 
 fn local_of(text: &str) -> Local {
@@ -179,7 +195,15 @@ fn local_of(text: &str) -> Local {
         ["commit", ..] | ["end", ..] => return Local::End { commit: true },
         ["rollback"] | ["rollback", "work" | "transaction"] | ["abort", ..] => return Local::End { commit: false },
         ["discard", "all"] | ["reset", "all"] => return Local::Discard,
-        ["listen", ..] | ["unlisten", ..] | ["notify", ..] => return Local::Refused("LISTEN/NOTIFY"),
+        // NOTIFY runs where its transaction runs, and is sent at commit
+        // there; the hub carries it to every listener (B4.3).
+        ["listen", _] => {
+            return t[6..].trim().split_whitespace().next().and_then(channel_of).map_or(Local::Refused("LISTEN without a channel"), Local::Listen);
+        }
+        ["unlisten", "*"] => return Local::Unlisten(None),
+        ["unlisten", _] => {
+            return t[8..].trim().split_whitespace().next().and_then(channel_of).map_or(Local::Refused("UNLISTEN without a channel"), |c| Local::Unlisten(Some(c)));
+        }
         _ => {}
     }
     if let ["reset", name] = words.as_slice() {
@@ -247,6 +271,7 @@ impl Session {
             last_shard: None,
             copy_shard: None,
             discard_until_sync: false,
+            listener: None,
             out: Vec::with_capacity(8 << 10),
         }
     }
@@ -283,7 +308,22 @@ impl Session {
         let mut batch: Vec<u8> = self.core.buffer();
         let result = loop {
             reader.trim();
+            let idle = self.txn.status == b'I' && batch.is_empty();
+            let listening = self.listener.is_some();
             let next = tokio::select! {
+                // A notification while the session waits (B4.3).
+                note = async {
+                    match self.listener.as_mut() {
+                        Some(l) => l.rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if idle && listening => {
+                    if let Some(note) = note {
+                        crate::notify::message(&mut self.out, &note);
+                        self.flush(conn).await?;
+                    }
+                    continue;
+                }
                 r = reader.next(conn) => r.map(|(t, m)| (t, m.to_vec())),
                 _ = shutdown.changed(), if self.txn.status == b'I' && batch.is_empty() => {
                     pg::error(&mut self.out, "FATAL", "57P01", "terminating connection: the gateway is shutting down");
@@ -530,12 +570,37 @@ impl Session {
                 pg::ready(&mut self.out, b'T');
                 return Ok(Outcome::Done { error: false });
             }
+            Local::Discard if self.txn.status == b'I' && self.listener.is_some() => {
+                // DISCARD ALL is UNLISTEN * too.
+                self.listener = None;
+                return self.everywhere(conn, msg, true).await;
+            }
             Local::SessionSet | Local::Discard if self.txn.status == b'I' => {
                 return self.everywhere(conn, msg, matches!(local_of(&text), Local::Discard)).await;
             }
             Local::Refused(what) => {
                 self.error_ready("0A000", &format!("{what} is not supported through the gateway; connect to a shard directly"));
                 return Ok(Outcome::Done { error: true });
+            }
+            Local::Listen(channel) => {
+                let database = self.login.database.clone();
+                self.listener.get_or_insert_with(|| crate::notify::Listener::new(&database)).listen(&channel);
+                pg::command_complete(&mut self.out, "LISTEN");
+                let status = self.txn.status;
+                pg::ready(&mut self.out, status);
+                return Ok(Outcome::Done { error: false });
+            }
+            Local::Unlisten(channel) => {
+                if let Some(l) = self.listener.as_mut() {
+                    match channel {
+                        Some(c) => l.unlisten(&c),
+                        None => l.unlisten_all(),
+                    }
+                }
+                pg::command_complete(&mut self.out, "UNLISTEN");
+                let status = self.txn.status;
+                pg::ready(&mut self.out, status);
+                return Ok(Outcome::Done { error: false });
             }
             _ => {}
         }
@@ -1315,7 +1380,10 @@ mod tests {
         assert!(matches!(local_of("SET search_path = x"), Local::SessionSet));
         assert!(matches!(local_of("SET LOCAL statement_timeout = 5"), Local::SetLocal));
         assert!(matches!(local_of("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"), Local::Routed));
-        assert!(matches!(local_of("LISTEN ch"), Local::Refused(_)));
+        assert!(matches!(local_of("LISTEN Ch"), Local::Listen(ref c) if c == "ch"));
+        assert!(matches!(local_of("LISTEN \"Ch\""), Local::Listen(ref c) if c == "Ch"));
+        assert!(matches!(local_of("UNLISTEN *"), Local::Unlisten(None)));
+        assert!(matches!(local_of("NOTIFY ch, 'x'"), Local::Routed), "NOTIFY runs on a shard");
         // Two statements are forwarded whole, never half answered here.
         assert!(matches!(local_of("BEGIN; SELECT 1"), Local::Routed));
         assert!(matches!(local_of("SELECT 1"), Local::Routed));

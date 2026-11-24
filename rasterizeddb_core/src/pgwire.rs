@@ -46,7 +46,7 @@ mod routine_statements;
 mod trigger_exec;
 mod merge_exec;
 mod copy;
-mod notify;
+pub(crate) mod notify;
 mod explain;
 mod temp_tables;
 mod session_values;

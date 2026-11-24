@@ -264,6 +264,14 @@ async fn handle(conn: &Conn, data: &[u8]) -> Response {
             super::deadlock::abort(&gid);
             Response::Done
         }
+        // B4.3: the gateway's LISTEN hub.
+        Request::Notifications { database, since } => match conn.catalog.get(&database) {
+            Some(db) => {
+                let (next, lost, notes) = crate::pgwire::notify::outbox_since(db.id, since);
+                Response::Notifications { next, lost, notes: notes.into_iter().map(|n| (n.pid, n.channel, n.payload)).collect() }
+            }
+            None => refuse(*b"3D000", true, format!("database \"{database}\" does not exist")),
+        },
     }
 }
 

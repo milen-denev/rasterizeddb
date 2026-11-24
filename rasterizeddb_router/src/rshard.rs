@@ -229,6 +229,11 @@ pub enum Request {
     /// Ends global transaction `gid`'s waiting statement here, a deadlock's
     /// victim (B4.2). Answered `Done`.
     AbortTxn { gid: String },
+    /// The notifications `database` sent after sequence `since` on this
+    /// shard, for the gateway's LISTEN hub (B4.3). `since = u64::MAX`:
+    /// none, just where the sequence stands. Answered by
+    /// [`Response::Notifications`].
+    Notifications { database: String, since: u64 },
 }
 
 /// Where a classified text came from.
@@ -258,6 +263,10 @@ pub enum Response {
     Decided { commit: Option<bool> },
     /// Answers `Waits`: (waiter's global id, holder's global id).
     Waits { edges: Vec<(String, String)> },
+    /// Answers `Notifications`: the next `since` to ask with, and the notes
+    /// as (sender's backend pid, channel, payload). `lost`: notes after
+    /// `since` that the shard's bounded outbox no longer holds.
+    Notifications { next: u64, lost: bool, notes: Vec<(i32, String, String)> },
 }
 
 /// What SCRAM-SHA-256 needs to verify a role's proof (G9).
@@ -520,6 +529,7 @@ impl Request {
             Request::Decision { .. } => 0x0D,
             Request::Waits => 0x0E,
             Request::AbortTxn { .. } => 0x0F,
+            Request::Notifications { .. } => 0x10,
         }
     }
 
@@ -570,6 +580,9 @@ impl Request {
             Request::Waits => {}
             Request::AbortTxn { gid } => {
                 w.str(gid);
+            }
+            Request::Notifications { database, since } => {
+                w.str(database).u64(*since);
             }
         }
         w.buf
@@ -638,6 +651,7 @@ impl Request {
             0x0D => Request::Decision { gid: r.str()? },
             0x0E => Request::Waits,
             0x0F => Request::AbortTxn { gid: r.str()? },
+            0x10 => Request::Notifications { database: r.str()?, since: r.u64()? },
             k => return Err(format!("rshard request kind {k:#04x} is unknown")),
         };
         r.end()?;
@@ -661,6 +675,7 @@ impl Response {
             Response::Refused(_) => 0xFF,
             Response::Decided { .. } => 0x8B,
             Response::Waits { .. } => 0x8C,
+            Response::Notifications { .. } => 0x8D,
         }
     }
 
@@ -727,6 +742,12 @@ impl Response {
                 w.u32(edges.len() as u32);
                 for (a, b) in edges {
                     w.str(a).str(b);
+                }
+            }
+            Response::Notifications { next, lost, notes } => {
+                w.u64(*next).u8(*lost as u8).u32(notes.len() as u32);
+                for (pid, channel, payload) in notes {
+                    w.u32(*pid as u32).str(channel).str(payload);
                 }
             }
             Response::Refused(r) => {
@@ -811,6 +832,17 @@ impl Response {
                     edges.push((r.str()?, r.str()?));
                 }
                 Response::Waits { edges }
+            }
+            0x8D => {
+                let (next, lost, n) = (r.u64()?, r.u8()? != 0, r.u32()? as usize);
+                if n > 1 << 20 {
+                    return Err("rshard: too many notifications".into());
+                }
+                let mut notes = Vec::with_capacity(n.min(1024));
+                for _ in 0..n {
+                    notes.push((r.u32()? as i32, r.str()?, r.str()?));
+                }
+                Response::Notifications { next, lost, notes }
             }
             0xFF => Response::Refused(Refusal {
                 sqlstate: r.array()?,

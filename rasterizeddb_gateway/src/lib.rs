@@ -28,6 +28,7 @@ pub mod hooks;
 mod kv;
 #[cfg(feature = "native")]
 pub mod native;
+pub mod notify;
 pub mod pg;
 pub mod relay;
 pub mod route;
@@ -182,6 +183,18 @@ fn worker(id: usize, shared: Arc<Shared>, listeners: Vec<std::net::TcpListener>,
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
         let core = Rc::new(core::Core::new(id, shared));
+        // The LISTEN hub's poller, on the first core (B4.3).
+        if id == 0 {
+            let core = core.clone();
+            tokio::task::spawn_local(async move {
+                let mut cursors = std::collections::HashMap::new();
+                let mut tick = tokio::time::interval(Duration::from_millis(100));
+                loop {
+                    tick.tick().await;
+                    notify::poll(&core, &mut cursors).await;
+                }
+            });
+        }
         // One deadlock detector per gateway, on its first core (B4.2).
         if id == 0 && core.shared.cfg.two_phase && core.shared.cfg.deadlock_check_ms > 0 {
             let core = core.clone();

@@ -45,11 +45,55 @@ pub(crate) fn publish(database: u64, pid: i32, channel: &str, payload: &str) {
         channel: channel.to_string(),
         payload: payload.to_string(),
     };
+    #[cfg(feature = "sharding")]
+    if OUTBOX_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut outbox = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
+        let (next, notes) = outbox.entry(database).or_insert_with(|| (1, std::collections::VecDeque::new()));
+        notes.push_back((*next, note.clone()));
+        *next += 1;
+        while notes.len() > OUTBOX_LIMIT {
+            notes.pop_front();
+        }
+    }
     hub(|listeners| {
         if let Some(sessions) = listeners.get_mut(&(database, channel.to_string())) {
             sessions.retain(|(_, tx)| tx.send(note.clone()).is_ok());
         }
     });
+}
+
+/// The cluster's LISTEN hub (sharding-plan.md B4.3): a gateway polls each
+/// shard for the notifications sent there since it last asked, and hands
+/// them to its own listening sessions. Kept only once a gateway has asked,
+/// so a server outside a cluster keeps nothing.
+#[cfg(feature = "sharding")]
+static OUTBOX_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Per database: the next sequence number, and the newest notes.
+#[cfg(feature = "sharding")]
+static OUTBOX: Mutex<std::collections::BTreeMap<u64, (u64, std::collections::VecDeque<(u64, Note)>)>> =
+    Mutex::new(std::collections::BTreeMap::new());
+/// How many notes a database's outbox holds between two polls.
+#[cfg(feature = "sharding")]
+const OUTBOX_LIMIT: usize = 16_384;
+
+/// The notes `database` sent after `since`: the next `since`, whether some
+/// were dropped from the outbox before they were asked for, and the notes.
+/// `since = u64::MAX` asks only where the sequence stands.
+#[cfg(feature = "sharding")]
+pub(crate) fn outbox_since(database: u64, since: u64) -> (u64, bool, Vec<Note>) {
+    OUTBOX_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    let outbox = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((next, notes)) = outbox.get(&database) else {
+        return (1, false, Vec::new());
+    };
+    if since == u64::MAX {
+        return (*next, false, Vec::new());
+    }
+    // The gateway asks with the `next` it was given: anything older than the
+    // oldest note kept, and not before it, was dropped in between.
+    let lost = notes.front().is_some_and(|(seq, _)| *seq > since);
+    let out = notes.iter().filter(|(seq, _)| *seq >= since).map(|(_, n)| n.clone()).collect();
+    (*next, lost, out)
 }
 
 /// A session's channels and the queue its notifications arrive on.
@@ -382,5 +426,31 @@ mod tests {
         assert!(hub(|l| l
             .get(&(9_000_002, "ch".to_string()))
             .is_none_or(Vec::is_empty)));
+    }
+}
+
+#[cfg(all(test, feature = "sharding"))]
+mod outbox_tests {
+    use super::*;
+
+    #[test]
+    fn b43_outbox_hands_out_each_note_once_and_reports_a_gap() {
+        let db = 0xB43_0001;
+        // Asked first: where the sequence stands, no backlog.
+        let (start, lost, notes) = outbox_since(db, u64::MAX);
+        assert!(!lost && notes.is_empty());
+        publish(db, 1, "ch", "a");
+        publish(db, 1, "ch", "b");
+        let (next, lost, notes) = outbox_since(db, start);
+        assert!(!lost);
+        assert_eq!(notes.iter().map(|n| n.payload.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+        let (again, _, none) = outbox_since(db, next);
+        assert!(none.is_empty() && again == next, "nothing twice");
+        for i in 0..OUTBOX_LIMIT + 10 {
+            publish(db, 1, "ch", &i.to_string());
+        }
+        let (_, lost, notes) = outbox_since(db, next);
+        assert!(lost, "the oldest were dropped before they were read");
+        assert_eq!(notes.len(), OUTBOX_LIMIT);
     }
 }
