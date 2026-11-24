@@ -899,8 +899,20 @@ impl Session {
     // -----------------------------------------------------------------------
 
     async fn silent(&mut self, sql: &str) -> Result<String, PgNotice> {
+        self.silent_as(sql, false).await
+    }
+
+    /// [`Self::silent`], or with `system` this front end's own statement on
+    /// its catalogue (`__rdb_routines`), announced so the session's
+    /// catalogue guard lets it through (`PgBridge::system_query`). Never
+    /// `system` for a client's text.
+    async fn silent_as(&mut self, sql: &str, system: bool) -> Result<String, PgNotice> {
         let b = self.bridge();
-        b.query(sql);
+        if system {
+            b.system_query(sql);
+        } else {
+            b.query(sql);
+        }
         let mut error = None;
         let mut tag = String::new();
         loop {
@@ -951,8 +963,22 @@ impl Session {
         sql: &str,
         params: &[(i16, Option<Vec<u8>>, u32)],
     ) -> Result<(Vec<PgField>, Vec<Vec<Option<String>>>, String), PgNotice> {
+        self.query_bound_as(sql, params, false).await
+    }
+
+    /// [`Self::query_bound`]; with `system`, as [`Self::silent_as`] says,
+    /// and with no parameters (the announcement covers a simple query).
+    async fn query_bound_as(
+        &mut self,
+        sql: &str,
+        params: &[(i16, Option<Vec<u8>>, u32)],
+        system: bool,
+    ) -> Result<(Vec<PgField>, Vec<Vec<Option<String>>>, String), PgNotice> {
         let b = self.bridge();
-        if params.is_empty() {
+        if system {
+            debug_assert!(params.is_empty(), "a catalogue statement carries its values as literals");
+            b.system_query(sql);
+        } else if params.is_empty() {
             b.query(sql);
         } else {
             let oids: Vec<u32> = params.iter().map(|p| p.2).collect();
@@ -2862,10 +2888,6 @@ fn procedure_name(raw: &str) -> String {
         .unwrap_or_else(|| raw.to_lowercase())
 }
 
-fn text_param(v: &str) -> (i16, Option<Vec<u8>>, u32) {
-    (0, Some(v.as_bytes().to_vec()), 25)
-}
-
 const ROUTINE_SAVEPOINT: &str = "rdb_tds_routine";
 
 /// Procedures, table variables, cursors and the scopes they live in.
@@ -3003,17 +3025,43 @@ impl Session {
         r
     }
 
-    async fn fetch_guarded(
+    /// [`Self::silent_guarded`] for this front end's own statement on its
+    /// catalogue ([`Self::silent_as`]).
+    async fn system_guarded(&mut self, sql: &str) -> Result<String, PgNotice> {
+        let guard = self.bridge().in_block();
+        if guard {
+            self.silent(&format!("SAVEPOINT {ROUTINE_SAVEPOINT}"))
+                .await?;
+        }
+        let r = self.silent_as(sql, true).await;
+        if guard {
+            if r.is_err() {
+                let _ = self
+                    .silent(&format!("ROLLBACK TO SAVEPOINT {ROUTINE_SAVEPOINT}"))
+                    .await;
+            }
+            let _ = self
+                .silent(&format!("RELEASE SAVEPOINT {ROUTINE_SAVEPOINT}"))
+                .await;
+        }
+        r
+    }
+
+    /// A savepoint-guarded query (as [`Self::silent_guarded`]) for this front end's own read or write of its
+    /// catalogue ([`Self::silent_as`]): its values written into `sql`.
+    async fn system_fetch_guarded(
         &mut self,
         sql: &str,
-        params: &[(i16, Option<Vec<u8>>, u32)],
     ) -> Result<(Vec<u32>, Vec<Vec<Option<String>>>), PgNotice> {
         let guard = self.bridge().in_block();
         if guard {
             self.silent(&format!("SAVEPOINT {ROUTINE_SAVEPOINT}"))
                 .await?;
         }
-        let r = self.fetch(sql, params).await;
+        let r = self
+            .query_bound_as(sql, &[], true)
+            .await
+            .map(|(fields, rows, _)| (fields.iter().map(|f| f.type_oid).collect(), rows));
         if guard {
             if r.is_err() {
                 let _ = self
@@ -3314,9 +3362,8 @@ impl Session {
         let mut found = Vec::new();
         if self.has_routine_table() {
             if let Ok((_, rows)) = self
-                .fetch_guarded(
+                .system_fetch_guarded(
                     "SELECT name, definition FROM __rdb_routines WHERE dialect = 'tsql' ORDER BY name",
-                    &[],
                 )
                 .await
             {
@@ -3337,10 +3384,10 @@ impl Session {
             return Ok(None);
         }
         let (_, rows) = self
-            .fetch_guarded(
-                "SELECT definition FROM __rdb_routines WHERE name = $1 AND dialect = 'tsql'",
-                &[text_param(name)],
-            )
+            .system_fetch_guarded(&format!(
+                "SELECT definition FROM __rdb_routines WHERE name = {} AND dialect = 'tsql'",
+                crate::sqlcompat::string_sql(name.as_bytes())
+            ))
             .await
             .map_err(|e| error_from_engine(&e))?;
         Ok(rows
@@ -3390,15 +3437,15 @@ impl Session {
             return Err(taken());
         }
         if !self.has_routine_table() {
-            self.silent_guarded(routines::CREATE_ROUTINE_TABLE)
+            self.system_guarded(routines::CREATE_ROUTINE_TABLE)
                 .await
                 .map_err(|e| error_from_engine(&e))?;
         }
         let (_, rows) = self
-            .fetch_guarded(
-                "SELECT dialect FROM __rdb_routines WHERE name = $1",
-                &[text_param(&def.name)],
-            )
+            .system_fetch_guarded(&format!(
+                "SELECT dialect FROM __rdb_routines WHERE name = {}",
+                crate::sqlcompat::string_sql(def.name.as_bytes())
+            ))
             .await
             .map_err(|e| error_from_engine(&e))?;
         let existing = rows
@@ -3416,12 +3463,17 @@ impl Session {
             }
             _ => {}
         }
+        let lit = |v: &str| crate::sqlcompat::string_sql(v.as_bytes());
         let sql = if existing.is_some() {
-            "UPDATE __rdb_routines SET definition = $2 WHERE name = $1"
+            format!("UPDATE __rdb_routines SET definition = {} WHERE name = {}", lit(&definition), lit(&def.name))
         } else {
-            "INSERT INTO __rdb_routines (name, dialect, definition) VALUES ($1, 'tsql', $2)"
+            format!(
+                "INSERT INTO __rdb_routines (name, dialect, definition) VALUES ({}, 'tsql', {})",
+                lit(&def.name),
+                lit(&definition)
+            )
         };
-        self.fetch_guarded(sql, &[text_param(&def.name), text_param(&definition)])
+        self.system_fetch_guarded(&sql)
             .await
             .map_err(|e| error_from_engine(&e))?;
         self.routine_cache = None;
@@ -3446,7 +3498,7 @@ impl Session {
         for name in names {
             let removed = if self.has_routine_table() {
                 let tag = self
-                    .silent_guarded(&format!(
+                    .system_guarded(&format!(
                         "DELETE FROM __rdb_routines WHERE name = {} AND dialect = 'tsql'",
                         crate::sqlcompat::string_sql(name.as_bytes())
                     ))

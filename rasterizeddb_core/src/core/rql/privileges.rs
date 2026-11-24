@@ -261,6 +261,162 @@ pub fn parse_privilege_statement(sql: &str) -> Option<Result<PrivilegeStatement,
 }
 
 // ---------------------------------------------------------------------------
+// The catalogue guard
+// ---------------------------------------------------------------------------
+
+/// Names in the catalogue's namespace that are not relations: the alias an
+/// enum sort's rewrite gives its derived table (`user_types`), and the
+/// functions the collation and domain rewrites call.
+const NOT_CATALOGUES: &[&str] = &["__rdb_o", "__rdb_ci_key", "__rdb_ci_ai_key", "__rdb_domain_value"];
+
+/// The prefix of the tables the MySQL and SQL Server front ends make for a
+/// client's temporary tables (`sqlcompat::TEMP_PREFIX`): the client's own
+/// relations, written into its translated statements, not a catalogue.
+const FRONT_END_TEMP_PREFIX: &str = "__rdb_tmp_";
+
+/// The projection of `rdb_roles` a client may read, as PostgreSQL's
+/// `pg_roles` is readable: every column but the verifier.
+pub const ROLE_CATALOG_MASK: &str = "SELECT name, can_login, is_superuser FROM rdb_roles";
+
+/// Whether `name` is one of the engine's catalogues, which no client
+/// statement may read or write (memory: rdb-roles-writable-escalation): the
+/// role catalogue, and every `__rdb_*` table (ACL, views, sequences,
+/// functions, triggers, types, domains, the front ends' routines, the merge
+/// key map). A prefix, not a list, so a catalogue added later is covered
+/// before anyone remembers to list it. Compared without case: a quoted
+/// `"RDB_ROLES"` is refused too rather than argued about.
+pub fn is_protected_catalog(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    if name == crate::auth::ROLE_TABLE {
+        return true;
+    }
+    name.starts_with("__rdb_") && !name.starts_with(FRONT_END_TEMP_PREFIX) && !NOT_CATALOGUES.contains(&name.as_str())
+}
+
+/// The cheap first test of [`catalog_refusal`]: a statement without the
+/// bytes `rdb_` names no catalogue, and is not scanned.
+pub fn may_name_catalog(sql: &str) -> bool {
+    crate::core::sql_scan::contains_ignore_ascii_case(sql, b"rdb_")
+}
+
+fn catalog_denied(name: &str) -> Refusal {
+    ("42501", format!("permission denied: \"{name}\" is a system catalog"))
+}
+
+/// The refusal for a client's statement that names an engine catalogue
+/// ([`is_protected_catalog`]); `None` when it names none, or only reads
+/// `rdb_roles` where [`mask_role_catalog`] then hides its verifiers.
+///
+/// Read by tokens, every identifier wherever it stands, so `COPY`,
+/// `TRUNCATE`, `LOCK`, `GRANT … ON`, `ALTER … RENAME TO`, `CREATE INDEX …
+/// ON` and DDL meet it as a `SELECT` does: a guard taught each clause would
+/// miss the next one. A column qualifier (`t.c`) and an alias (`AS x`) are
+/// not relations. `rdb_roles` may be read, and only where every mention of
+/// it is a relation read from a `FROM` list, which is exactly where the mask
+/// reaches; a statement that writes it, locks it, or names it anywhere else
+/// is refused. Fails closed: a form this does not understand is a refusal.
+///
+/// The engine's own statements on its catalogues never come through here
+/// (they run on the executor directly, or in a session marked as the
+/// engine's: `SessionState::system_catalog`, `system_statement`).
+pub fn catalog_refusal(sql: &str) -> Option<Refusal> {
+    use crate::core::mvcc::table_locks::TableMode;
+    if !may_name_catalog(sql) {
+        return None;
+    }
+    let words = crate::core::rql::lock_set::named_words(sql);
+    let head = words.first().map(|w| w.name.to_ascii_uppercase()).unwrap_or_default();
+    let mut role_mentions = 0usize;
+    for word in &words {
+        if word.qualifier || word.alias || !is_protected_catalog(&word.name) {
+            continue;
+        }
+        if word.name.eq_ignore_ascii_case(crate::auth::ROLE_TABLE) {
+            role_mentions += 1;
+            continue;
+        }
+        return Some(catalog_denied(&word.name));
+    }
+    if role_mentions == 0 {
+        return None;
+    }
+    let role = crate::auth::ROLE_TABLE;
+    // Its columns, which `SHOW COLUMNS` lists (Studio's table view) and
+    // which say nothing a client could use.
+    if head == "SHOW" && words.get(1).is_some_and(|w| w.name.eq_ignore_ascii_case("COLUMNS")) {
+        return None;
+    }
+    // The statements that reach the mask: everything else that could read a
+    // relation (`COPY`, `EXPLAIN`, `MERGE`, `CREATE … AS`, `DO`) is answered
+    // before it, so it would read the verifiers.
+    if !matches!(head.as_str(), "SELECT" | "WITH" | "VALUES" | "INSERT" | "UPDATE" | "DELETE") {
+        return Some(catalog_denied(role));
+    }
+    let reads: Vec<_> = crate::core::rql::lock_set::relation_references(sql)
+        .into_iter()
+        .filter(|r| r.name.rsplit('.').next().unwrap_or(&r.name).eq_ignore_ascii_case(role))
+        .collect();
+    if reads.len() != role_mentions || reads.iter().any(|r| r.mode != TableMode::AccessShare) {
+        return Some(catalog_denied(role));
+    }
+    None
+}
+
+/// Whether the read of `rdb_roles` at `span` is the mask's own: the whole
+/// of `(SELECT name, can_login, is_superuser FROM rdb_roles)`, or a
+/// statement that is exactly that. Nothing can be added to either (no
+/// `WHERE`, no other column), so a client writing it reads what the mask
+/// would give.
+fn is_masked_read(sql: &str, span: &std::ops::Range<usize>) -> bool {
+    const HEAD: &str = "SELECT name, can_login, is_superuser FROM";
+    let (Some(before), Some(after)) = (sql.get(..span.start), sql.get(span.end..)) else {
+        return false;
+    };
+    let before = before.trim_end();
+    let Some(cut) = before.len().checked_sub(HEAD.len()) else {
+        return false;
+    };
+    let (Some(rest), Some(tail)) = (before.get(..cut), before.get(cut..)) else {
+        return false;
+    };
+    if !tail.eq_ignore_ascii_case(HEAD) {
+        return false;
+    }
+    let rest = rest.trim_end();
+    let after = after.trim_start();
+    (rest.ends_with('(') && after.starts_with(')')) || (rest.is_empty() && after.trim_end_matches(';').trim().is_empty())
+}
+
+/// `sql` with every read of `rdb_roles` replaced by [`ROLE_CATALOG_MASK`]
+/// as a derived table under the same name (or the alias it had), so no
+/// statement a client wrote, a view expanded or a function inlined reads a
+/// verifier; `None` when it reads none. Run after [`catalog_refusal`] has
+/// let the statement through, as the last rewrite before it is planned.
+pub fn mask_role_catalog(sql: &str) -> Option<String> {
+    use crate::core::mvcc::table_locks::TableMode;
+    let role = crate::auth::ROLE_TABLE;
+    if !crate::core::sql_scan::contains_ignore_ascii_case(sql, role.as_bytes()) {
+        return None;
+    }
+    let reads: Vec<_> = crate::core::rql::lock_set::relation_references(sql)
+        .into_iter()
+        .filter(|r| r.mode == TableMode::AccessShare)
+        .filter(|r| r.name.rsplit('.').next().unwrap_or(&r.name).eq_ignore_ascii_case(role))
+        .filter(|r| !is_masked_read(sql, &r.span))
+        .collect();
+    if reads.is_empty() {
+        return None;
+    }
+    let mut out = sql.to_string();
+    for r in reads.iter().rev() {
+        let replacement =
+            if r.aliased { format!("({ROLE_CATALOG_MASK})") } else { format!("({ROLE_CATALOG_MASK}) AS {role}") };
+        out.replace_range(r.span.clone(), &replacement);
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
 // Storage
 // ---------------------------------------------------------------------------
 

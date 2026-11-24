@@ -74,8 +74,12 @@ where
         superuser: login.superuser,
         authenticated: login.authenticated,
     };
-    let result = SESSION_CANCEL
+    // The one kind of session that takes a front end's catalogue statements
+    // (`SYSTEM_STATEMENT_TAG`).
+    let result = PROXIED_SESSION
         .scope(
+            (),
+            SESSION_CANCEL.scope(
             registration.session.clone(),
             run_message_loop(
                 catalog,
@@ -86,6 +90,7 @@ where
                 &mut conn,
                 startup,
                 registration.pid,
+            ),
             ),
         )
         .await;
@@ -336,6 +341,16 @@ impl PgBridge {
     /// Queues a simple Query.
     pub(crate) fn query(&mut self, sql: &str) {
         self.message(b'Q', |out| Self::cstr(out, sql));
+    }
+
+    /// Queues a simple Query that is the front end's own statement on its
+    /// catalogue (`__rdb_routines`, `__rdb_mysql_on_update`), announced by
+    /// [`SYSTEM_STATEMENT_TAG`] so the session's catalogue guard lets it
+    /// through. Never for text a client sent: the guard is what keeps a
+    /// client off every catalogue.
+    pub(crate) fn system_query(&mut self, sql: &str) {
+        self.message(SYSTEM_STATEMENT_TAG, |_| {});
+        self.query(sql);
     }
 
     /// Queues a Parse.

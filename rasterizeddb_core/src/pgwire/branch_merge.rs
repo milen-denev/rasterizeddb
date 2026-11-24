@@ -114,6 +114,10 @@ impl Internal {
             },
             ConnectionLimits::default(),
         );
+        let mut state = state;
+        // The engine's own session: it writes the merge key map, a
+        // catalogue no client statement may touch.
+        state.system_catalog = true;
         Self { database, state }
     }
 

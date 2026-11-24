@@ -6771,6 +6771,29 @@ async fn process_native_request_for(
         return Box::pin(native_index_checkpoint(&context.database, name)).await;
     }
 
+    // A statement naming one of the engine's catalogues (`rdb_roles`,
+    // `__rdb_*`): pgwire's path refuses it, or reads `rdb_roles` through its
+    // masked projection (`privileges::catalog_refusal`, `mask_role_catalog`).
+    // This path does neither, so it never runs one: any role read every
+    // verifier here and could write itself superuser.
+    if crate::core::rql::privileges::may_name_catalog(&query) {
+        if let Some((_, message)) = crate::core::rql::privileges::catalog_refusal(&query) {
+            return error_response(&message);
+        }
+        if crate::core::rql::privileges::mask_role_catalog(&query).is_some() {
+            return match session {
+                Some(session) => {
+                    let run = Box::pin(session.run_alone(&query));
+                    if notices { crate::pgwire::native_with_notices(run).await } else { run.await }
+                }
+                None => error_response(&format!(
+                    "permission denied: \"{}\" is read through a connection session, which this caller does not have",
+                    crate::auth::ROLE_TABLE
+                )),
+            };
+        }
+    }
+
     // A correlated scalar subquery (`SELECT id, (SELECT count(*) FROM p
     // WHERE p.u = t.id) FROM t`) is the LATERAL join it means
     // (`rql::correlated`), which runs inside the statement transaction pgwire

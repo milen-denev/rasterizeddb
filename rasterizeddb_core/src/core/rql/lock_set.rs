@@ -465,6 +465,37 @@ pub fn function_references(sql: &str) -> Vec<RelationRef> {
         .collect()
 }
 
+/// An identifier a statement writes, outside its literals and comments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedWord {
+    /// As written: a quoted identifier's text between its quotes (doubled
+    /// quotes undone), an unquoted one as it stands.
+    pub name: String,
+    /// A `.` follows it: the qualifier of a column (`t.c`) or of a name.
+    pub qualifier: bool,
+    /// `AS` comes before it: an alias the statement gives something.
+    pub alias: bool,
+}
+
+/// Every identifier `sql` writes, wherever it stands: a relation in any
+/// clause (`FROM`, `INTO`, `COPY`, `TRUNCATE`, `LOCK`, `GRANT … ON`, DDL),
+/// a column, a function or an alias. The same tokens as the lock set, so a
+/// name inside a string literal, a dollar-quoted body or a comment is none.
+/// What the catalogue guard reads (`privileges::catalog_refusal`): a scan
+/// by clause would miss every clause it was not taught.
+pub fn named_words(sql: &str) -> Vec<NamedWord> {
+    let toks = tokens(sql);
+    let mut out = Vec::new();
+    for (i, tok) in toks.iter().enumerate() {
+        let Tok::Word { text, quoted } = tok else { continue };
+        let qualifier = matches!(toks.get(i + 1), Some(Tok::Punct('.')));
+        let alias = i > 0
+            && matches!(toks.get(i - 1), Some(Tok::Word { text: w, quoted: false }) if w.eq_ignore_ascii_case("AS"));
+        out.push(NamedWord { name: word_text(text, *quoted), qualifier, alias });
+    }
+    out
+}
+
 /// The relations the tokens of a statement that is not DDL name; see
 /// [`statement_lock_set`].
 fn scan(toks: &[Tok<'_>]) -> Vec<Found> {

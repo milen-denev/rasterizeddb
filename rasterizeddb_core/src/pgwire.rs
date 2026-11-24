@@ -1612,6 +1612,21 @@ tokio::task_local! {
 }
 
 tokio::task_local! {
+    /// Set for the life of a session another protocol's front end opened
+    /// over the in-process pipe (`proxied::serve_proxied`): the one kind of
+    /// session that accepts [`SYSTEM_STATEMENT_TAG`]. A client of the
+    /// PostgreSQL listener can write any message type, so the announcement
+    /// means nothing on its connection.
+    pub(super) static PROXIED_SESSION: ();
+}
+
+/// A frontend message no PostgreSQL client sends: from a front end over its
+/// in-process pipe, it says the `Query` that follows is the front end's own
+/// statement on its catalogue (`__rdb_routines`, `__rdb_mysql_on_update`),
+/// which the catalogue guard then lets through. Its body is empty.
+pub(crate) const SYSTEM_STATEMENT_TAG: u8 = b'!';
+
+tokio::task_local! {
     /// The SELECT whose `RowDescription` is being sent, and its database:
     /// where [`send_row_description`] reads each column's table, number,
     /// type and modifier (`catalog_model::column_origins`). Every column was
@@ -1629,6 +1644,16 @@ async fn describing<F: std::future::Future>(database: &Arc<Database>, sql: &str,
     } else {
         fut.await
     }
+}
+
+/// The catalogue guard (`privileges::catalog_refusal`) for a statement of
+/// this session: `None` for the engine's own sessions and a front end's
+/// announced catalogue statements, which alone may reach the catalogues.
+fn catalogue_guard(state: &SessionState, stmt: &str) -> Option<(&'static str, String)> {
+    if state.system_catalog || state.system_statement {
+        return None;
+    }
+    crate::core::rql::privileges::catalog_refusal(stmt)
 }
 
 /// Runs `fut`, a statement run for another, outside the reply hold.
@@ -2694,9 +2719,14 @@ where
         // is dropped without a reply.
         ready = match tag[0] {
             b'Q' | b'S' => true,
-            b'P' | b'B' | b'D' | b'E' | b'C' | b'H' => false,
+            b'P' | b'B' | b'D' | b'E' | b'C' | b'H' | SYSTEM_STATEMENT_TAG => false,
             _ => !state.error_in_batch,
         };
+        // The announcement covers the very next message only, and only a
+        // `Query`: anything else between the two cancels it.
+        if tag[0] != b'Q' && tag[0] != SYSTEM_STATEMENT_TAG {
+            state.system_next = false;
+        }
 
         // An error opens a discard window that only `Sync` closes.
         //
@@ -2719,7 +2749,10 @@ where
                 state.error_in_batch = false;
                 state.message_us = crate::core::statement_clock::wall_us();
                 let query = read_cstring(&payload);
-                handle_simple_query(database, state, stream, query).await?;
+                state.system_statement = std::mem::take(&mut state.system_next);
+                let handled = handle_simple_query(database, state, stream, query).await;
+                state.system_statement = false;
+                handled?;
                 state.copy_in_ran = false;
                 // And it closes its own window: it has already answered with
                 // `ReadyForQuery`. A failure inside it (`fail_statement` sets
@@ -2799,6 +2832,11 @@ where
                 stream.flush().await?;
             }
             b'X' => return Ok(()),
+            // A front end's catalogue statement follows (see the tag). No
+            // reply: the `Query` answers for both.
+            SYSTEM_STATEMENT_TAG if PROXIED_SESSION.try_with(|_| ()).is_ok() && payload.is_empty() => {
+                state.system_next = true;
+            }
             _ => {
                 send_error_response(
                     stream,
@@ -2994,6 +3032,20 @@ struct SessionState {
     /// materialized view's table DDL, a rename's): the view guards on table
     /// DDL let it through (`rql::views`).
     view_internal: bool,
+    /// A session of the engine's own (a branch merge's [`branch_merge`]
+    /// side): the catalogue guard lets its statements reach the `__rdb_*`
+    /// catalogues and `rdb_roles` (`privileges::catalog_refusal`). Never set
+    /// for a session a client opened; `view_internal` is not this, since a
+    /// trigger's body and a view's query run under that one.
+    system_catalog: bool,
+    /// The statements of the simple query being run were sent by a front
+    /// end (MySQL, SQL Server) for its own catalogue, announced by a
+    /// [`SYSTEM_STATEMENT_TAG`] message just before it: the catalogue guard
+    /// lets them through. Only a proxied session ([`PROXIED_SESSION`])
+    /// accepts the announcement, so no client can send it.
+    system_statement: bool,
+    /// The announcement arrived and the next message is a `Query`.
+    system_next: bool,
     /// The materialized view a `REFRESH` is filling: the one write to a
     /// materialized view expansion lets through.
     refreshing_materialized: Option<String>,
@@ -3424,6 +3476,9 @@ impl SessionState {
             message_us: crate::core::statement_clock::wall_us(),
             statement_error: None,
             view_internal: false,
+            system_catalog: false,
+            system_statement: false,
+            system_next: false,
             refreshing_materialized: None,
             sequence_values: StdArc::default(),
             triggers_suppressed: Vec::new(),
@@ -6860,6 +6915,11 @@ where
     // What an error's position counts in (`error_position`).
     state.error_text.clear();
     state.error_text.push_str(stmt);
+    // No client statement reaches the engine's catalogues, on any path a
+    // statement takes from here (a block's deferred DROP included).
+    if let Some((code, message)) = catalogue_guard(state, stmt) {
+        return fail_statement(state, stream, code, &message).await;
+    }
     // Counted as running until it returns, so the idle trimmer
     // (`idle_trim`) never walks the heap under a statement.
     let _running = crate::idle_trim::statement();
@@ -7484,8 +7544,11 @@ where
     // learned before the temporary table was made names the real one. Such a
     // statement runs as text, and nothing is learned or forgotten for it.
     let names_a_temporary = !state.temp_tables.is_empty() && temp_tables::rewrite(&state.temp_tables, query).is_some();
+    // Nor a statement naming a catalogue: the text path guards and masks
+    // it, and a learned parse would do neither.
+    let names_a_catalogue = crate::core::rql::privileges::may_name_catalog(query);
     let step = match watched_slot(state, database, &key, true) {
-        _ if names_a_temporary => WatchStep::Text,
+        _ if names_a_temporary || names_a_catalogue => WatchStep::Text,
         None => WatchStep::Text,
         Some((prepared, sql)) => watch_step(prepared, &sql, generation, &literals, &classes),
     };
@@ -8467,6 +8530,11 @@ async fn execute_single_statement_unscoped<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // A statement run for another (a trigger's body, a view's query, a
+    // `PREPARE`d text) is a client's text too, and meets the guard here.
+    if let Some((code, message)) = catalogue_guard(state, stmt) {
+        return fail_statement(state, stream, code, &message).await;
+    }
     // sqlx's query for where a result's columns come from, answered from the
     // tables with the record array it reads (`column_origins`), as written:
     // the passes below make its `VALUES` list a derived table.
@@ -8754,6 +8822,26 @@ where
         }
     } else {
         stmt
+    };
+    // Again on what the function bodies and views became: one made before
+    // the guard existed may read a catalogue. Then every read of
+    // `rdb_roles` left is given its masked projection, last, so nothing
+    // after this reads a verifier.
+    if let Some((code, message)) = catalogue_guard(state, stmt) {
+        return fail_statement(state, stream, code, &message).await;
+    }
+    let masked_roles;
+    let stmt = if state.system_catalog || state.system_statement {
+        stmt
+    } else {
+        match crate::core::rql::privileges::mask_role_catalog(stmt) {
+            Some(text) => {
+                crate::core::rql::prepared::note_rewritten();
+                masked_roles = text;
+                masked_roles.as_str()
+            }
+            None => stmt,
+        }
     };
     // A write to a table with triggers runs a row at a time
     // (`trigger_exec`).

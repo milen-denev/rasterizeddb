@@ -984,8 +984,24 @@ impl Session {
 
     /// Runs a statement whose answer is not the client's; its error, if any.
     async fn silent(&mut self, sql: &str) -> Result<String, PgNotice> {
+        self.silent_as(sql, false).await
+    }
+
+    /// [`Self::silent`] for this front end's own statement on its catalogue
+    /// (`__rdb_routines`, `__rdb_mysql_on_update`), which the session's
+    /// catalogue guard lets through (`PgBridge::system_query`). Never for a
+    /// client's text.
+    async fn silent_system(&mut self, sql: &str) -> Result<String, PgNotice> {
+        self.silent_as(sql, true).await
+    }
+
+    async fn silent_as(&mut self, sql: &str, system: bool) -> Result<String, PgNotice> {
         let b = self.bridge();
-        b.query(sql);
+        if system {
+            b.system_query(sql);
+        } else {
+            b.query(sql);
+        }
         let mut error = None;
         let mut tag = String::new();
         loop {
@@ -1032,7 +1048,7 @@ impl Session {
             let _ = self.silent("SAVEPOINT rdb_mysql_meta").await;
         }
         let read = self
-            .fetch(&format!(
+            .fetch_system(&format!(
                 "SELECT tbl, col FROM {}",
                 translate::ON_UPDATE_TABLE
             ))
@@ -1058,8 +1074,29 @@ impl Session {
         &mut self,
         sql: &str,
     ) -> Result<(Vec<PgField>, Vec<Vec<Option<String>>>), PgNotice> {
+        self.fetch_as(sql, false).await
+    }
+
+    /// [`Self::fetch`] for this front end's own read of its catalogue; see
+    /// [`Self::silent_system`].
+    async fn fetch_system(
+        &mut self,
+        sql: &str,
+    ) -> Result<(Vec<PgField>, Vec<Vec<Option<String>>>), PgNotice> {
+        self.fetch_as(sql, true).await
+    }
+
+    async fn fetch_as(
+        &mut self,
+        sql: &str,
+        system: bool,
+    ) -> Result<(Vec<PgField>, Vec<Vec<Option<String>>>), PgNotice> {
         let b = self.bridge();
-        b.query(sql);
+        if system {
+            b.system_query(sql);
+        } else {
+            b.query(sql);
+        }
         let mut error = None;
         let mut fields = Vec::new();
         let mut rows = Vec::new();
@@ -1302,6 +1339,16 @@ impl Session {
                     if failed {
                         break;
                     }
+                }
+            }
+        }
+        // The DDL's record in this front end's catalogue, once the DDL has
+        // run: the front end's own statements, past the session's guard.
+        if !forward.system.is_empty() && !matches!(last, Some(Outcome::Failed(_))) {
+            for sql in &forward.system {
+                if let Err(notice) = self.silent_system(sql).await {
+                    last = Some(Outcome::Failed(notice));
+                    break;
                 }
             }
         }
@@ -3021,6 +3068,7 @@ impl Session {
                     found_rows: None,
                     params: prepared.params,
                     deferred: Vec::new(),
+                    system: Vec::new(),
                 };
                 self.forward(forward, false, Rows::Binary, Some((&name, params)))
                     .await?;
@@ -3595,7 +3643,7 @@ impl Session {
             crate::sqlcompat::string_sql(name.as_bytes())
         );
         let (_, rows) = self
-            .fetch(&sql)
+            .fetch_system(&sql)
             .await
             .map_err(|e| results::error_from_engine(&e))?;
         Ok(rows
@@ -3631,13 +3679,13 @@ impl Session {
                 .min(sql.len());
             let definition = String::from_utf8_lossy(&sql[start..end]).into_owned();
             if !self.has_routines() {
-                self.silent(super::routine::CREATE_ROUTINE_TABLE)
+                self.silent_system(super::routine::CREATE_ROUTINE_TABLE)
                     .await
                     .map_err(|e| results::error_from_engine(&e))?;
             }
             let lit = |s: &str| crate::sqlcompat::string_sql(s.as_bytes());
             let (_, rows) = self
-                .fetch(&format!(
+                .fetch_system(&format!(
                     "SELECT dialect FROM {} WHERE name = {}",
                     super::routine::ROUTINE_TABLE,
                     lit(&def.name)
@@ -3659,7 +3707,7 @@ impl Session {
                     format!("PROCEDURE {} already exists", def.name),
                 ));
             }
-            self.silent(&format!(
+            self.silent_system(&format!(
                 "INSERT INTO {} (name, dialect, definition) VALUES ({}, 'mysql', {})",
                 super::routine::ROUTINE_TABLE,
                 lit(&def.name),
@@ -3705,7 +3753,7 @@ impl Session {
                 return Ok(0);
             }
             let tag = self
-                .silent(&format!(
+                .silent_system(&format!(
                     "DELETE FROM {} WHERE name = {} AND dialect = 'mysql'",
                     super::routine::ROUTINE_TABLE,
                     crate::sqlcompat::string_sql(name.as_bytes())
@@ -3754,7 +3802,7 @@ impl Session {
         let mut names = Vec::new();
         if self.has_routines() {
             match self
-                .fetch(&format!(
+                .fetch_system(&format!(
                     "SELECT name FROM {} WHERE dialect = 'mysql' ORDER BY name",
                     super::routine::ROUTINE_TABLE
                 ))
