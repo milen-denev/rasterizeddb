@@ -69,11 +69,21 @@ fn record(kind: u8, body: impl FnOnce(&mut Vec<u8>)) -> Result<Vec<u8>, String> 
 fn replace(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
     let path = dir.join(name);
     let tmp = dir.join(format!("{name}.tmp"));
+    // Every step announced, so the power-loss harness can image a cut at
+    // any of them (`power_loss::raft_crash_tests`).
+    #[cfg(test)]
+    crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Create(&tmp));
     let mut f = File::create(&tmp).map_err(io(&tmp))?;
     f.write_all(bytes).map_err(io(&tmp))?;
-    f.sync_all().map_err(io(&tmp))?;
+    {
+        let _synced = crate::core::sync_audit::note("raft.replace", &tmp);
+        f.sync_all().map_err(io(&tmp))?;
+    }
     drop(f);
+    #[cfg(test)]
+    crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Rename { from: &tmp, to: &path });
     std::fs::rename(&tmp, &path).map_err(io(&path))?;
+    let _synced = crate::core::sync_audit::note("dir", &path);
     crate::core::sync_path::sync_dir(dir).map_err(io(dir))?;
     Ok(())
 }
@@ -100,7 +110,11 @@ impl RaftStore {
         let mut file = OpenOptions::new().read(true).append(true).create(true).open(&path).map_err(io(&path))?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(io(&path))?;
-        let (mut s_index, mut s_term) = snapshot.as_ref().map_or((0, 0), |(m, _)| (m.index, m.term));
+        // The log says where it starts by its own RESET records; the snapshot
+        // file is applied after (below). Started from the snapshot, a log
+        // that a snapshot kept (no RESET written) did not reopen: its first
+        // entry was not the one after the snapshot.
+        let (mut s_index, mut s_term) = (0, 0);
         let mut entries: Vec<Entry> = Vec::new();
         let end = framed_log::scan(&FORMAT, &bytes, |_, kind, payload| {
             let body = payload.get(1..).ok_or("a record with no layout byte")?;
@@ -199,6 +213,7 @@ impl RaftStore {
         }
         if !buf.is_empty() {
             self.log.write_all(&buf).map_err(io(&path))?;
+            let _synced = crate::core::sync_audit::note("raft.log", &path);
             self.log.sync_data().map_err(io(&path))?;
         }
         if let Some(h) = ready.hard_state {

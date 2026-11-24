@@ -113,6 +113,10 @@ pub(crate) const SYNC_TAGS: &[(&str, bool)] = &[
     ("unlink", false),
     ("file.data", true),
     ("wal.log", true),
+    // The shard's Raft store (`shard::raft_store`): its log, and a file it
+    // replaces whole (hard state, snapshot) before the rename.
+    ("raft.log", true),
+    ("raft.replace", true),
     ("wal.lsn_mark", true),
     ("wal.txn_mark", true),
     ("wal.truncate", true),
