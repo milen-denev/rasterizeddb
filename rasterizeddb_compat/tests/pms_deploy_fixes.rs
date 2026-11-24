@@ -141,6 +141,66 @@ async fn a_correlation_in_a_join_on_inside_exists_is_answered() {
     );
 }
 
+/// pms's claim statement as it really runs: CTEs over a windowed derived table
+/// ending in `UPDATE … RETURNING`, bound over the extended protocol, with rows
+/// to decode.
+const CLAIM: &str = "WITH blocked AS (SELECT task.id FROM vynchat_swarm_task task \
+       JOIN vynchat_swarm s ON s.id = task.swarm_id WHERE s.sequential AND EXISTS \
+       (SELECT 1 FROM vynchat_swarm_task prior WHERE prior.swarm_id = task.swarm_id \
+        AND prior.task_index < task.task_index AND prior.status = 'pending')), \
+     runnable AS (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY domain_id \
+        ORDER BY created_at, task_index) AS domain_rank FROM vynchat_swarm_task \
+        WHERE status = 'pending' AND id NOT IN (SELECT id FROM blocked)) ranked \
+        WHERE ranked.domain_rank <= $1), \
+     claimed AS (SELECT t.id FROM vynchat_swarm_task t WHERE t.id IN (SELECT id FROM runnable) \
+        ORDER BY t.created_at LIMIT $2 FOR UPDATE SKIP LOCKED) \
+     UPDATE vynchat_swarm_task AS t SET status = 'running' FROM claimed c WHERE t.id = c.id \
+     RETURNING t.id, t.swarm_id, t.status";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_claim_update_returning_is_described_and_decoded() {
+    let (_s, pool) = server().await;
+    swarm(&pool).await;
+    let rows = sqlx::query(CLAIM)
+        .bind(4i64)
+        .bind(8i64)
+        .fetch_all(&pool)
+        .await
+        .expect("the claim statement");
+    let mut got: Vec<(i32, i32, String)> = rows
+        .iter()
+        .map(|r| (r.try_get(0).unwrap(), r.try_get(1).unwrap(), r.try_get(2).unwrap()))
+        .collect();
+    got.sort();
+    let running = |id, swarm| (id, swarm, "running".to_string());
+    assert_eq!(got, vec![running(10, 1), running(20, 2), running(21, 2)]);
+}
+
+/// SQL-level `PREPARE` / `EXECUTE` with a parameter in a CTE's `LIMIT`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prepared_limit_inside_a_cte_takes_its_parameter() {
+    let (_s, pool) = server().await;
+    swarm(&pool).await;
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::raw_sql(
+        "PREPARE firsts (bigint) AS WITH c AS (SELECT id FROM vynchat_swarm_task ORDER BY id LIMIT $1) \
+         SELECT id FROM c ORDER BY id",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("PREPARE");
+    let rows = sqlx::raw_sql("EXECUTE firsts (2)").fetch_all(&mut *conn).await.expect("EXECUTE");
+    let got: Vec<i32> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(got, vec![10, 11]);
+    // The claim statement itself, as pms prepared it by hand.
+    sqlx::raw_sql(AssertSqlSafe(format!("PREPARE claim (bigint, bigint) AS {CLAIM}")))
+        .execute(&mut *conn)
+        .await
+        .expect("PREPARE claim");
+    let rows = sqlx::raw_sql("EXECUTE claim (4, 8)").fetch_all(&mut *conn).await.expect("EXECUTE claim");
+    assert_eq!(rows.len(), 3);
+}
+
 /// `make_interval` over a column, as pms's escalation query writes it.
 #[tokio::test(flavor = "multi_thread")]
 async fn make_interval_takes_a_column() {
