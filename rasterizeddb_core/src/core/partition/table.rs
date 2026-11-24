@@ -291,7 +291,7 @@ impl Slot {
     fn refuse_foreign(&self, table: &str) -> io::Result<()> {
         if self.foreign {
             return Err(io::Error::other(format!(
-                "partition {} of \"{table}\" covers [{:#018x}, {:#x}), which this shard does not own (FOREIGN): \
+                "RDB02: statement reaches ranges not on this shard: partition {} of \"{table}\" covers [{:#018x}, {:#x}), which this shard does not own (FOREIGN): \
                  the statement reached another shard's rows",
                 self.pid, self.range.lo, self.range.hi
             )));
@@ -1070,9 +1070,27 @@ pub(crate) fn any_broken() -> bool {
     ANY_BROKEN.load(Ordering::Acquire)
 }
 
+/// A new table's map, and the pids of the spans it must record `FOREIGN`:
+/// `RangeMap::initial(n)` on a plain node; on a shard, `n` partitions inside
+/// the ranges it owns (at least one per range) plus one per gap
+/// (`RangeMap::within`).
+fn initial_layout(n: u32) -> io::Result<(RangeMap, Vec<u32>)> {
+    let bad = |e: String| io::Error::new(io::ErrorKind::InvalidInput, e);
+    #[cfg(feature = "sharding")]
+    if let Some(own) = crate::core::shard::ownership::current() {
+        let owned: Vec<(u64, u64)> = own.owned.iter().chain(&own.incoming).copied().collect();
+        let mut sorted = owned;
+        sorted.sort_unstable();
+        let n = n.max(sorted.len() as u32);
+        return RangeMap::within(&sorted, n).map_err(bad);
+    }
+    Ok((RangeMap::initial(n).map_err(bad)?, Vec::new()))
+}
+
 impl PartitionedTable {
     /// Writes a new table's map log (`HEADER`, `LOCATIONS` with the root,
-    /// `PLACE` of `RangeMap::initial(n)`) and its ids file, synced through the
+    /// `PLACE` of [`initial_layout`], and on a shard a `RELEASE_SPAN` per
+    /// gap) and its ids file, synced through the
     /// log's last record.
     ///
     /// The caller has already made the parent files with
@@ -1094,7 +1112,7 @@ impl PartitionedTable {
             .to_str()
             .ok_or_else(|| invalid(format!("the root {} is not UTF-8", root.display())))?
             .to_string();
-        let map = RangeMap::initial(n).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let (map, foreign) = initial_layout(n)?;
         let header = MapHeader {
             uid,
             route_v: ROUTE_V1,
@@ -1106,13 +1124,24 @@ impl PartitionedTable {
 
         files::require_existing(&root, &[files::map_file(uid, 0), files::ids_file(uid)])?;
         let log = MapLogFile::create(StdArc::new(seed.create_new(files::map_file(uid, 0)).await)).await?;
-        // One transaction, one sync, for all three.
-        log.append_all_durable(&[
+        let mut records = vec![
             Record::Header(header),
             Record::Locations(vec![root_str]),
             Record::Place { hi: SPACE_END, entries: map.entries().to_vec() },
-        ])
-        .await?;
+        ];
+        // On a shard, the spans between its owned ranges are another shard's:
+        // each is released to a fresh FOREIGN pid at once, so no statement
+        // here ever writes or reads them (B1a.4).
+        let mut next_pid = map.len() as u32;
+        for pid in foreign {
+            let range = map
+                .range_of(pid)
+                .ok_or_else(|| invalid(format!("internal error: the shard layout has no partition {pid}")))?;
+            records.push(Record::ReleaseSpan { hi: range.hi, entries: vec![(range.lo, next_pid)] });
+            next_pid += 1;
+        }
+        // One transaction, one sync, for all of them.
+        log.append_all_durable(&records).await?;
         IdSource::create(Arc::new(seed.create_new(files::ids_file(uid)).await)).await?;
         Ok(())
     }
@@ -1837,6 +1866,13 @@ impl PartitionedTable {
         let mut out = Planned::new();
         for pid in route.pids(&epoch.map) {
             let slot = Self::slot(live, pid)?;
+            // On a shard, a statement with no route key reads the rows this
+            // shard owns (a gateway's fan-out sends it to every shard and
+            // combines the answers); one whose key reaches another shard's
+            // range is refused before anything is read (B1a.4).
+            if slot.foreign && matches!(route, Route::All) {
+                continue;
+            }
             slot.refuse_foreign(&self.name)?;
             if let Some(table) = slot.open_now() {
                 out.push((pid, Some(table)));
