@@ -755,10 +755,15 @@ fn call_text(routine: &Routine, args: &[String], in_from: bool, alias: &str) -> 
 
 /// `sql` with every call of a routine of `database` inlined, recursively;
 /// `Ok(None)` when it calls none. See the module comment.
-pub async fn inline_calls(database: &Arc<Database>, sql: &str, tx: Option<TxId>) -> Result<Option<String>, Refusal> {
+///
+/// `role`, when given, must hold EXECUTE on each function called (R2;
+/// `privileges::may_execute`); `None` checks nothing (a superuser, a
+/// describe that runs nothing).
+pub async fn inline_calls(database: &Arc<Database>, sql: &str, tx: Option<TxId>, role: Option<&str>) -> Result<Option<String>, Refusal> {
     if !may_call_a_routine(database, sql).await {
         return Ok(None);
     }
+    let mut acl: Option<Vec<crate::core::rql::privileges::AclRow>> = None;
     let mut cache: std::collections::HashMap<String, Vec<Routine>> = std::collections::HashMap::new();
     let mut text = sql.to_string();
     let mut changed = false;
@@ -794,6 +799,15 @@ pub async fn inline_calls(database: &Arc<Database>, sql: &str, tx: Option<TxId>)
             else {
                 continue;
             };
+            if let Some(role) = role {
+                if acl.is_none() {
+                    acl = Some(crate::core::rql::privileges::load(database, tx).await.map_err(|e| ("XX000", e))?);
+                }
+                let key = format!("@function:{}", routine.name);
+                if !crate::core::rql::privileges::may_execute(acl.as_deref().unwrap_or_default(), role, &key) {
+                    return Err(("42501", format!("permission denied for function {}", routine.name)));
+                }
+            }
             let from = from_items.iter().find(|(start, _)| *start == call.span.start);
             let text_for = match from {
                 Some((_, aliased)) => {

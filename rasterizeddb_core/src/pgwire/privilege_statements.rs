@@ -12,6 +12,76 @@ async fn relation_exists(database: &Arc<Database>, name: &str, tx: Option<TxId>)
         || matches!(crate::core::rql::sequence_catalog::load(database, Some(&[name.to_string()]), tx).await, Ok(v) if !v.is_empty())
 }
 
+/// What a GRANT or REVOKE acts on: each object's ACL key with the name to
+/// show for it, the privileges it takes, and the word for its kind.
+struct Resolved {
+    keys: Vec<(String, String)>,
+    valid: &'static [&'static str],
+    label: &'static str,
+}
+
+/// `target`'s objects, each checked to exist; `None` for one nothing is
+/// enforced on (a schema, a database, a type).
+async fn resolve_target(database: &Arc<Database>, target: Target, tx: Option<TxId>) -> Result<Option<Resolved>, (&'static str, String)> {
+    use crate::core::rql::functions::{self, RoutineKind};
+    let pair = |n: String| (n.clone(), n);
+    Ok(Some(match target {
+        Target::Other(_) => return Ok(None),
+        Target::AllTablesInSchema => {
+            let mut all: Vec<String> = database.relation_names().into_iter().filter(|n| !n.starts_with("__")).collect();
+            all.extend(crate::core::rql::views::load(database, None, tx).await.unwrap_or_default().into_iter().map(|v| v.name));
+            Resolved { keys: all.into_iter().map(pair).collect(), valid: privileges::TABLE_PRIVILEGES, label: "table" }
+        }
+        Target::Tables(names) => {
+            for table in &names {
+                if !relation_exists(database, table, tx).await {
+                    return Err(("42P01", format!("relation \"{table}\" does not exist")));
+                }
+            }
+            Resolved { keys: names.into_iter().map(pair).collect(), valid: privileges::TABLE_PRIVILEGES, label: "table" }
+        }
+        Target::Sequences(names) => {
+            for name in &names {
+                if !crate::core::rql::sequence_catalog::exists(database, name, tx).await {
+                    return Err(("42P01", format!("relation \"{name}\" does not exist")));
+                }
+            }
+            Resolved { keys: names.into_iter().map(pair).collect(), valid: privileges::SEQUENCE_PRIVILEGES, label: "sequence" }
+        }
+        Target::AllSequencesInSchema => {
+            let all = crate::core::rql::sequence_catalog::load(database, None, tx).await.map_err(|e| ("XX000", e))?;
+            Resolved { keys: all.into_iter().map(|s| pair(s.name)).collect(), valid: privileges::SEQUENCE_PRIVILEGES, label: "sequence" }
+        }
+        Target::Routines { kind, names } => {
+            let mut keys = Vec::new();
+            for name in names {
+                let found = functions::load(database, Some(&name), tx).await.map_err(|e| ("XX000", e))?;
+                let matching: Vec<&str> = found
+                    .iter()
+                    .map(|r| if r.kind == RoutineKind::Procedure { "procedure" } else { "function" })
+                    .filter(|k| kind == "routine" || *k == kind)
+                    .collect();
+                let Some(k) = matching.first() else {
+                    return Err(("42883", format!("{} {name} does not exist", if kind == "routine" { "function" } else { kind })));
+                };
+                keys.push((format!("@{k}:{name}"), name));
+            }
+            Resolved { keys, valid: privileges::ROUTINE_PRIVILEGES, label: "function" }
+        }
+        Target::AllRoutinesInSchema { kind } => {
+            let all = functions::load(database, None, tx).await.map_err(|e| ("XX000", e))?;
+            let keys = all
+                .into_iter()
+                .filter_map(|r| {
+                    let k = if r.kind == RoutineKind::Procedure { "procedure" } else { "function" };
+                    (kind == "routine" || k == kind).then(|| (format!("@{k}:{}", r.name), r.name))
+                })
+                .collect();
+            Resolved { keys, valid: privileges::ROUTINE_PRIVILEGES, label: "function" }
+        }
+    }))
+}
+
 /// Whether `me` may grant or revoke membership in `roles` (R2): a
 /// superuser; a CREATEROLE role, for roles that are not superusers; or a
 /// holder of ADMIN OPTION on each.
@@ -92,34 +162,28 @@ where
     let result: Result<&'static str, (&'static str, String)> = async {
         match statement {
             PrivilegeStatement::Grant { privileges: privs, target, grantees, grantable } => {
-                let tables = match target {
-                    Target::Other(_) => return Ok("GRANT"),
-                    Target::AllTablesInSchema => {
-                        let mut all: Vec<String> = database.relation_names().into_iter().filter(|n| !n.starts_with("__")).collect();
-                        all.extend(crate::core::rql::views::load(database, None, tx).await.unwrap_or_default().into_iter().map(|v| v.name));
-                        all
-                    }
-                    Target::Tables(names) => names,
+                let Some(Resolved { keys: tables, valid, label }) = resolve_target(database, target, tx).await? else {
+                    return Ok("GRANT");
                 };
-                for p in &privs {
-                    if !privileges::TABLE_PRIVILEGES.contains(&p.as_str()) {
-                        return Err(fail("0LP01", format!("invalid privilege type {p} for table")));
-                    }
-                }
+                let privs = privileges::privileges_for(privs, valid)
+                    .map_err(|p| fail("0LP01", format!("invalid privilege type {p} for {label}")))?;
                 for grantee in &grantees {
                     if !role_exists(database, grantee, tx).await {
                         return Err(fail("42704", format!("role \"{grantee}\" does not exist")));
                     }
                 }
-                for table in &tables {
-                    if !relation_exists(database, table, tx).await {
-                        return Err(fail("42P01", format!("relation \"{table}\" does not exist")));
-                    }
+                for (table, shown) in &tables {
                     for p in &privs {
                         if !admin && !privileges::may_grant(&rows, &me, table, p) {
-                            return Err(fail("42501", format!("permission denied for table {table}")));
+                            return Err(fail("42501", format!("permission denied for {label} {shown}")));
                         }
                         for grantee in &grantees {
+                            // PUBLIC's EXECUTE is the default: granting it
+                            // back takes the marker away.
+                            if p == "EXECUTE" && grantee == "public" {
+                                set_companion(database, table, "public", privileges::NOEXECUTE, false, &me, tx).await?;
+                                continue;
+                            }
                             let row = AclRow { relation: table.clone(), grantee: grantee.clone(), privilege: p.clone(), grantor: me.clone(), grantable };
                             privileges::put(database, &row, tx).await.map_err(|e| fail("XX000", e))?;
                         }
@@ -128,21 +192,21 @@ where
                 Ok("GRANT")
             }
             PrivilegeStatement::Revoke { privileges: privs, target, grantees, grant_option_only } => {
-                let tables = match target {
-                    Target::Other(_) => return Ok("REVOKE"),
-                    Target::AllTablesInSchema => {
-                        let mut all: Vec<String> = database.relation_names().into_iter().filter(|n| !n.starts_with("__")).collect();
-                        all.extend(crate::core::rql::views::load(database, None, tx).await.unwrap_or_default().into_iter().map(|v| v.name));
-                        all
-                    }
-                    Target::Tables(names) => names,
+                let Some(Resolved { keys: tables, valid, label }) = resolve_target(database, target, tx).await? else {
+                    return Ok("REVOKE");
                 };
-                for table in &tables {
+                let privs = privileges::privileges_for(privs, valid)
+                    .map_err(|p| fail("0LP01", format!("invalid privilege type {p} for {label}")))?;
+                for (table, shown) in &tables {
                     for p in &privs {
                         if !admin && !privileges::may_grant(&rows, &me, table, p) {
-                            return Err(fail("42501", format!("permission denied for table {table}")));
+                            return Err(fail("42501", format!("permission denied for {label} {shown}")));
                         }
                         for grantee in &grantees {
+                            if p == "EXECUTE" && grantee == "public" && !grant_option_only {
+                                set_companion(database, table, "public", privileges::NOEXECUTE, true, &me, tx).await?;
+                                continue;
+                            }
                             let existing = rows.iter().find(|r| r.relation == *table && r.grantee == *grantee && r.privilege == *p);
                             match (existing, grant_option_only) {
                                 (Some(row), true) => {
@@ -226,23 +290,30 @@ where
                 }
                 Ok("REVOKE ROLE")
             }
-            PrivilegeStatement::DefaultPrivileges { for_role, grant, privileges: privs, grantees, tables } => {
+            PrivilegeStatement::DefaultPrivileges { for_role, grant, privileges: privs, grantees, kind } => {
                 let role = for_role.unwrap_or_else(|| me.clone());
                 if !admin && role != me {
                     return Err(fail("42501", "permission denied to change default privileges".to_string()));
                 }
-                if !tables {
+                if kind == privileges::DefaultKind::Other {
                     return Ok("ALTER DEFAULT PRIVILEGES");
                 }
+                let relation = kind.relation(&role);
                 for grantee in &grantees {
                     for p in &privs {
+                        // PUBLIC's EXECUTE: the default is to have it, so
+                        // a REVOKE is a marker the creation copies.
+                        if p == "EXECUTE" && grantee == "public" {
+                            set_companion(database, &relation, "public", privileges::NOEXECUTE, !grant, &role, tx).await?;
+                            continue;
+                        }
                         if grant {
-                            let row = AclRow { relation: format!("@default:{role}"), grantee: grantee.clone(), privilege: p.clone(), grantor: role.clone(), grantable: false };
+                            let row = AclRow { relation: relation.clone(), grantee: grantee.clone(), privilege: p.clone(), grantor: role.clone(), grantable: false };
                             privileges::put(database, &row, tx).await.map_err(|e| fail("XX000", e))?;
                         } else {
                             let filter = format!(
                                 "relation = {} AND grantee = {} AND privilege = {}",
-                                crate::auth::quote(&format!("@default:{role}")),
+                                crate::auth::quote(&relation),
                                 crate::auth::quote(grantee),
                                 crate::auth::quote(p)
                             );
@@ -327,8 +398,10 @@ where
                         crate::auth::quote(crate::auth::ROLE_ATTR_RELATION)
                     );
                     privileges::delete_where(database, &filter, tx).await.map_err(|e| fail("XX000", e))?;
-                    let defaults = format!("relation = {}", crate::auth::quote(&format!("@default:{r}")));
-                    privileges::delete_where(database, &defaults, tx).await.map_err(|e| fail("XX000", e))?;
+                    for relation in privileges::default_relations(r) {
+                        let defaults = format!("relation = {}", crate::auth::quote(&relation));
+                        privileges::delete_where(database, &defaults, tx).await.map_err(|e| fail("XX000", e))?;
+                    }
                 }
                 Ok("DROP OWNED")
             }
@@ -539,13 +612,25 @@ async fn object_ddl_refusal(
         // before owners existed is a superuser's.
         None if first == "CREATE" && (!replace || !routine_exists(database, &kind, &name, tx).await) => {
             let row = privileges::AclRow {
-                relation: key,
+                relation: key.clone(),
                 grantee: me.to_string(),
                 privilege: "OWNER".to_string(),
                 grantor: me.to_string(),
                 grantable: false,
             };
-            privileges::put(database, &row, tx).await.err().map(|e| ("42501", format!("permission denied: recording the owner of {kind} {name} failed ({e})")))
+            if let Err(e) = privileges::put(database, &row, tx).await {
+                return Some(("42501", format!("permission denied: recording the owner of {kind} {name} failed ({e})")));
+            }
+            // A function or procedure takes its creator's default privileges
+            // for functions (R2), PUBLIC's EXECUTE marker among them.
+            if kind == "function" || kind == "procedure" {
+                let defaults = privileges::DefaultKind::Functions.relation(me);
+                for d in rows.iter().filter(|r| r.relation == defaults) {
+                    let row = privileges::AclRow { relation: key.clone(), grantor: me.to_string(), grantable: false, ..d.clone() };
+                    let _ = privileges::put(database, &row, tx).await;
+                }
+            }
+            None
         }
         None => Some(("42501", format!("must be owner of {kind} {name}"))),
     }
@@ -716,11 +801,18 @@ pub(super) async fn record_owner(database: &Arc<Database>, state: &SessionState,
         log::warn!("the owner of \"{name}\" could not be recorded: {e}");
         return;
     }
+    // A sequence takes its own kind's defaults; a table, a view or a
+    // materialized view the tables' (R2).
+    let is_sequence = crate::core::rql::sequence_catalog::load(database, Some(&[name.to_string()]), tx)
+        .await
+        .is_ok_and(|s| !s.is_empty());
+    let kind = if is_sequence { privileges::DefaultKind::Sequences } else { privileges::DefaultKind::Tables };
+    let relation = kind.relation(&me);
     let defaults: Vec<AclRow> = privileges::load(database, tx)
         .await
         .unwrap_or_default()
         .into_iter()
-        .filter(|r| r.relation == format!("@default:{me}"))
+        .filter(|r| r.relation == relation)
         .collect();
     for d in defaults {
         let row = AclRow { relation: name.to_string(), grantee: d.grantee, privilege: d.privilege, grantor: me.clone(), grantable: false };

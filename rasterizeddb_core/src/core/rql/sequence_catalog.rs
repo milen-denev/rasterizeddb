@@ -714,6 +714,18 @@ pub fn relations_as_rows(database: &Database, sql: &str) -> Result<Option<String
 /// The sequences a statement's `nextval`/`currval`/`setval` calls name, read
 /// off its text (`nextval('s')`, `nextval('public.s'::regclass)`).
 pub fn named_in(sql: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_, name) in calls_in(sql) {
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// Each `nextval`/`currval`/`setval` call a statement makes, as (the
+/// function, the sequence), once per pair.
+pub fn calls_in(sql: &str) -> Vec<(&'static str, String)> {
     let lower = sql.to_ascii_lowercase();
     let mut out = Vec::new();
     for func in ["nextval", "currval", "setval"] {
@@ -732,8 +744,9 @@ pub fn named_in(sql: &str) -> Vec<String> {
             let arg = arg.split("::").next().unwrap_or(arg).trim();
             if arg.starts_with('\'') && arg.ends_with('\'') && arg.len() >= 2 {
                 let name = sequence::sequence_name_of(&arg[1..arg.len() - 1].replace("''", "'"));
-                if !out.contains(&name) {
-                    out.push(name);
+                let call = (func, name);
+                if !out.contains(&call) {
+                    out.push(call);
                 }
             }
         }

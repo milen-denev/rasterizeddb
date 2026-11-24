@@ -1665,11 +1665,14 @@ async fn drop_role_privileges(
         ));
     }
     for n in &names {
+        let [tables, sequences, functions] = privileges::default_relations(n);
         let filter = format!(
-            "grantee = {q} OR relation = {member} OR relation = {defaults}",
+            "grantee = {q} OR relation = {member} OR relation = {tables} OR relation = {sequences} OR relation = {functions}",
             q = quote(n),
             member = quote(&format!("@role:{n}")),
-            defaults = quote(&format!("@default:{n}")),
+            tables = quote(&tables),
+            sequences = quote(&sequences),
+            functions = quote(&functions),
         );
         privileges::delete_where(database, &filter, tx).await?;
     }

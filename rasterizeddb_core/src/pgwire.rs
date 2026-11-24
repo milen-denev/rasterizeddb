@@ -5307,7 +5307,7 @@ pub(crate) async fn describe_query(
         };
     }
     let inlined_calls;
-    let stmt = match crate::core::rql::functions::inline_calls(database, stmt, None).await {
+    let stmt = match crate::core::rql::functions::inline_calls(database, stmt, None, None).await {
         Ok(Some(text)) => {
             inlined_calls = text;
             inlined_calls.as_str()
@@ -8868,7 +8868,10 @@ where
         return Ok(());
     }
     let prepared_sequences;
-    let stmt = match sequence_statements::prepare_statement(database, state.current_tx(), stmt).await {
+    // Checked as the session's role, unless it administers or this is the
+    // engine's own statement (a view's or a routine's expansion).
+    let sequence_role = (!state.principal.may_administer() && !state.view_internal).then_some(state.principal.name.as_str());
+    let stmt = match sequence_statements::prepare_statement(database, state.current_tx(), stmt, sequence_role).await {
         Ok(None) => stmt,
         Ok(Some(text)) => {
             crate::core::rql::prepared::note_rewritten();
@@ -8883,7 +8886,7 @@ where
     // A call of a `CREATE FUNCTION` function, as its body
     // (`rql::functions`), before views are expanded: a body may read one.
     let inlined_calls;
-    let stmt = match crate::core::rql::functions::inline_calls(database, stmt, state.current_tx()).await {
+    let stmt = match crate::core::rql::functions::inline_calls(database, stmt, state.current_tx(), sequence_role).await {
         Ok(None) => stmt,
         Ok(Some(text)) => {
             crate::core::rql::prepared::note_rewritten();

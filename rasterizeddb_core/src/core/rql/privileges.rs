@@ -53,9 +53,85 @@ pub struct AclRow {
 pub enum Target {
     Tables(Vec<String>),
     AllTablesInSchema,
-    /// A sequence, function, schema, database or type: accepted, nothing
-    /// enforced for it here.
+    /// `SEQUENCE a, b` (R2): USAGE, SELECT, UPDATE.
+    Sequences(Vec<String>),
+    AllSequencesInSchema,
+    /// `FUNCTION f(…), PROCEDURE p, ROUTINE r` (R2): EXECUTE. `kind` is
+    /// `function`, `procedure` or `routine` (either).
+    Routines { kind: &'static str, names: Vec<String> },
+    AllRoutinesInSchema { kind: &'static str },
+    /// A schema, database or type: accepted, nothing enforced for it here.
     Other(String),
+}
+
+/// What kind of object a default privilege is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultKind {
+    Tables,
+    Sequences,
+    Functions,
+    Other,
+}
+
+impl DefaultKind {
+    /// The ACL relation `role`'s defaults of this kind are kept under. Tables
+    /// keep the name they always had.
+    pub fn relation(self, role: &str) -> String {
+        match self {
+            DefaultKind::Tables | DefaultKind::Other => format!("@default:{role}"),
+            DefaultKind::Sequences => format!("@default:{role}:sequences"),
+            DefaultKind::Functions => format!("@default:{role}:functions"),
+        }
+    }
+
+    /// The privileges an object of this kind takes.
+    pub fn privileges(self) -> &'static [&'static str] {
+        match self {
+            DefaultKind::Tables | DefaultKind::Other => TABLE_PRIVILEGES,
+            DefaultKind::Sequences => SEQUENCE_PRIVILEGES,
+            DefaultKind::Functions => ROUTINE_PRIVILEGES,
+        }
+    }
+}
+
+/// Every ACL relation `role`'s default privileges are kept under.
+pub fn default_relations(role: &str) -> [String; 3] {
+    [DefaultKind::Tables.relation(role), DefaultKind::Sequences.relation(role), DefaultKind::Functions.relation(role)]
+}
+
+/// The privileges a sequence takes.
+pub const SEQUENCE_PRIVILEGES: &[&str] = &["USAGE", "SELECT", "UPDATE"];
+/// The privilege a function or procedure takes.
+pub const ROUTINE_PRIVILEGES: &[&str] = &["EXECUTE"];
+/// The marker row that PUBLIC may not execute a routine: PostgreSQL grants
+/// PUBLIC EXECUTE on every function it creates, so the default is no row,
+/// and routines made before privileges existed keep it.
+pub const NOEXECUTE: &str = "NOEXECUTE";
+
+/// `privs` for an object taking `valid`: `ALL` (read as every table
+/// privilege) becomes `valid`; `Err` with the first one it does not take.
+pub fn privileges_for(privs: Vec<String>, valid: &[&str]) -> Result<Vec<String>, String> {
+    if privs.len() == TABLE_PRIVILEGES.len() && privs.iter().zip(TABLE_PRIVILEGES).all(|(a, b)| a == b) {
+        return Ok(valid.iter().map(|p| p.to_string()).collect());
+    }
+    match privs.iter().find(|p| !valid.contains(&p.as_str())) {
+        Some(p) => Err(p.clone()),
+        None => Ok(privs),
+    }
+}
+
+/// Whether `role` may execute the routine kept under `key`
+/// (`@function:name`, `@procedure:name`): its owner may, PUBLIC may unless
+/// a [`NOEXECUTE`] marker says otherwise, and a grantee of EXECUTE may.
+pub fn may_execute(rows: &[AclRow], role: &str, key: &str) -> bool {
+    let acting = roles_of(rows, role);
+    if owner_of(rows, key).is_some_and(|o| acting.iter().any(|r| r == o)) {
+        return true;
+    }
+    if !rows.iter().any(|r| r.relation == key && r.grantee == "public" && r.privilege == NOEXECUTE) {
+        return true;
+    }
+    rows.iter().any(|r| r.relation == key && r.privilege == "EXECUTE" && acting.contains(&r.grantee))
 }
 
 /// One option of a role membership.
@@ -107,9 +183,10 @@ pub enum PrivilegeStatement {
     /// one option taken back, the membership kept; `None` revokes it.
     RevokeRole { roles: Vec<String>, members: Vec<String>, option: Option<MembershipOption> },
     /// `ALTER DEFAULT PRIVILEGES [FOR ROLE r] [IN SCHEMA s] GRANT|REVOKE … ON
-    /// TABLES …`; `for_role` `None` for the current role. `grant` false for
-    /// REVOKE. `tables` false for another object kind (accepted, unenforced).
-    DefaultPrivileges { for_role: Option<String>, grant: bool, privileges: Vec<String>, grantees: Vec<String>, tables: bool },
+    /// TABLES|SEQUENCES|FUNCTIONS|ROUTINES|TYPES|SCHEMAS …`; `for_role`
+    /// `None` for the current role. `grant` false for REVOKE. `kind`
+    /// [`DefaultKind::Other`] for types and schemas (accepted, unenforced).
+    DefaultPrivileges { for_role: Option<String>, grant: bool, privileges: Vec<String>, grantees: Vec<String>, kind: DefaultKind },
     /// `ALTER TABLE | VIEW | SEQUENCE … OWNER TO role`.
     OwnerTo { relation: String, owner: String },
     /// `REASSIGN OWNED BY a [, …] TO b` (roles plan R2).
@@ -172,6 +249,31 @@ fn target_of(text: &str) -> Target {
     let upper = t.to_ascii_uppercase();
     if upper.starts_with("ALL TABLES IN SCHEMA") {
         return Target::AllTablesInSchema;
+    }
+    if upper.starts_with("ALL SEQUENCES IN SCHEMA") {
+        return Target::AllSequencesInSchema;
+    }
+    for (prefix, kind) in [("ALL FUNCTIONS IN SCHEMA", "function"), ("ALL PROCEDURES IN SCHEMA", "procedure"), ("ALL ROUTINES IN SCHEMA", "routine")] {
+        if upper.starts_with(prefix) {
+            return Target::AllRoutinesInSchema { kind };
+        }
+    }
+    // A routine named with its argument types, `f(integer, text)`: the
+    // name alone, as routines are kept by name here.
+    let names_of = |list: &str| -> Vec<String> {
+        crate::core::sql_scan::split_top_level(list, b',')
+            .into_iter()
+            .map(|n| name_of(n.split('(').next().unwrap_or(n).trim()))
+            .filter(|n| !n.is_empty())
+            .collect()
+    };
+    if upper.starts_with("SEQUENCE ") {
+        return Target::Sequences(names_of(&t[9..]));
+    }
+    for (prefix, kind) in [("FUNCTION ", "function"), ("PROCEDURE ", "procedure"), ("ROUTINE ", "routine")] {
+        if upper.starts_with(prefix) {
+            return Target::Routines { kind, names: names_of(&t[prefix.len()..]) };
+        }
     }
     for kind in ["SEQUENCE", "ALL SEQUENCES", "FUNCTION", "ALL FUNCTIONS", "PROCEDURE", "ALL PROCEDURES", "ROUTINE", "SCHEMA", "DATABASE", "LANGUAGE", "TYPE", "DOMAIN", "FOREIGN", "LARGE OBJECT", "TABLESPACE", "PARAMETER"] {
         if upper.starts_with(kind) {
@@ -318,16 +420,22 @@ pub fn parse_privilege_statement(sql: &str) -> Option<Result<PrivilegeStatement,
             _ => return Some(Err(("42601", "syntax error in ALTER DEFAULT PRIVILEGES".to_string()))),
         };
         let objects = body[on + 2..sep].trim().to_ascii_uppercase();
-        let tables = objects == "TABLES";
+        let kind = match objects.as_str() {
+            "TABLES" => DefaultKind::Tables,
+            "SEQUENCES" => DefaultKind::Sequences,
+            "FUNCTIONS" | "ROUTINES" => DefaultKind::Functions,
+            _ => DefaultKind::Other,
+        };
         let mut grantees_text = body[sep + if grant { 2 } else { 4 }..].trim().to_string();
         for suffix in ["WITH GRANT OPTION", "CASCADE", "RESTRICT"] {
             if let Some(at) = grantees_text.to_ascii_uppercase().find(suffix) {
                 grantees_text.truncate(at);
             }
         }
-        let privileges = if tables {
-            match privilege_list(&body[..on]) {
-                Ok(p) => p,
+        let privileges = if kind != DefaultKind::Other {
+            match privilege_list(&body[..on]).map(|p| privileges_for(p, kind.privileges())) {
+                Ok(Ok(p)) => p,
+                Ok(Err(p)) => return Some(Err(("0LP01", format!("invalid privilege type {p} for {}", objects.to_ascii_lowercase())))),
                 Err(e) => return Some(Err(e)),
             }
         } else {
@@ -338,7 +446,7 @@ pub fn parse_privilege_statement(sql: &str) -> Option<Result<PrivilegeStatement,
             grant,
             privileges,
             grantees: grantee_list(&grantees_text),
-            tables,
+            kind,
         }));
     }
     if upper.starts_with("ALTER ") {
@@ -715,20 +823,23 @@ pub async fn set_role_attr(database: &Arc<Database>, role: &str, attr: &str, val
 pub async fn rename_role(database: &Arc<Database>, from: &str, to: &str, tx: Option<TxId>) -> Result<(), String> {
     use crate::auth::{ROLE_ATTR_RELATION, quote};
     let member = format!("@role:{from}");
-    let defaults = format!("@default:{from}");
+    let defaults = default_relations(from);
+    let renamed_defaults = default_relations(to);
     let rows: Vec<AclRow> = load(database, tx)
         .await?
         .into_iter()
-        .filter(|r| r.grantee == from || r.grantor == from || r.relation == member || r.relation == defaults)
+        .filter(|r| r.grantee == from || r.grantor == from || r.relation == member || defaults.contains(&r.relation))
         .collect();
     if rows.is_empty() {
         return Ok(());
     }
     let filter = format!(
-        "grantee = {f} OR relation = {m} OR relation = {d} OR (grantor = {f} AND relation <> {a})",
+        "grantee = {f} OR relation = {m} OR relation = {d0} OR relation = {d1} OR relation = {d2} OR (grantor = {f} AND relation <> {a})",
         f = quote(from),
         m = quote(&member),
-        d = quote(&defaults),
+        d0 = quote(&defaults[0]),
+        d1 = quote(&defaults[1]),
+        d2 = quote(&defaults[2]),
         a = quote(ROLE_ATTR_RELATION),
     );
     delete_where(database, &filter, tx).await?;
@@ -736,8 +847,8 @@ pub async fn rename_role(database: &Arc<Database>, from: &str, to: &str, tx: Opt
     for mut r in rows {
         if r.relation == member {
             r.relation = format!("@role:{to}");
-        } else if r.relation == defaults {
-            r.relation = format!("@default:{to}");
+        } else if let Some(i) = defaults.iter().position(|d| *d == r.relation) {
+            r.relation = renamed_defaults[i].clone();
         }
         r.grantee = swap(&r.grantee);
         // An attribute row's grantor is its value, not a role.
@@ -997,7 +1108,7 @@ mod tests {
                 grant: true,
                 privileges: vec!["SELECT".into()],
                 grantees: vec!["app".into()],
-                tables: true,
+                kind: DefaultKind::Tables,
             }
         );
         assert_eq!(
