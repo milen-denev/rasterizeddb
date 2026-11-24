@@ -231,6 +231,13 @@ fn fan_out_read(t: &str, c: &Clauses) -> RouteTemplate {
     let aggregate = ["COUNT(", "SUM(", "AVG(", "MIN(", "MAX(", "ARRAY_AGG(", "STRING_AGG(", "BOOL_", "EVERY(", "JSON_AGG("]
         .iter()
         .any(|a| compact.contains(a));
+    // Aggregates and groups merge on a coordinator shard with the engine's
+    // own fold (B1c); DISTINCT, windows and a bare ORDER BY … LIMIT are not
+    // a fold, and wait for B4.
+    let windowed = compact.contains(")OVER(") || compact.contains(")OVER ");
+    if (aggregate || has("GROUP")) && !windowed && !list_upper.trim_start().starts_with("DISTINCT") {
+        return RouteTemplate::FanOut { merge: Merge::Coordinator, writes: false };
+    }
     if aggregate || has("GROUP") || has("HAVING") || has("ORDER") || has("OFFSET") || list_upper.trim_start().starts_with("DISTINCT")
     {
         return RouteTemplate::NeedsKey;

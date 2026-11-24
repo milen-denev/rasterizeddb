@@ -45,6 +45,11 @@ pub struct ShardArgs {
     #[arg(long = "authority-key", value_name = "HEX")]
     pub authority_key: Option<String>,
 
+    /// The CA the other shards' certificates are signed by, for coordinating
+    /// keyless aggregates across shards; `--gateway-ca` when not given.
+    #[arg(long = "peer-ca", value_name = "PEM")]
+    pub peer_ca: Option<String>,
+
     /// A gateway certificate's SHA-256 fingerprint; repeatable.
     #[arg(long = "gateway-pin", value_name = "SHA256")]
     pub gateway_pin: Vec<String>,
@@ -123,6 +128,7 @@ impl ShardArgs {
             key: self.shard_key.clone().ok_or("--shard-listen needs --shard-key")?,
             gateway_ca: self.gateway_ca.clone(),
             gateway_pins: self.gateway_pin.clone(),
+            peer_ca: self.peer_ca.clone(),
         }))
     }
 

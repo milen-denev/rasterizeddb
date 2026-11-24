@@ -3621,6 +3621,10 @@ impl<'p> Folder<'p> {
     /// 100k-group result was 156 MB of `Row` for 10 MB of answer. With one, the
     /// rows have to exist together to be sorted, and `finish` builds them.
     pub fn finish_into(mut self, out: &mut Vec<u8>) -> Result<(), String> {
+        #[cfg(feature = "sharding")]
+        if self.cluster_fold()? {
+            return Ok(());
+        }
         let plan = self.plan;
         if !plan.order_by.is_empty() {
             for row in self.finish()? {
@@ -3658,8 +3662,48 @@ impl<'p> Folder<'p> {
         Ok(())
     }
 
+    /// A cluster fan-out's part in this fold (sharding-plan.md B1c), as the
+    /// session's [`crate::core::cancel::Fold`] says: on a peer, the partial is
+    /// handed over and `true` returned (nothing to emit); on the coordinator,
+    /// the peers' partials are merged in and the fold finishes as usual. Only
+    /// the session's first fold takes part: the mode is taken when read.
+    #[cfg(feature = "sharding")]
+    fn cluster_fold(&mut self) -> Result<bool, String> {
+        use crate::core::cancel::Fold;
+        let Some(session) = crate::pgwire::current_session_cancel() else {
+            return Ok(false);
+        };
+        let mut slot = session.fold.lock().unwrap_or_else(|e| e.into_inner());
+        match &mut *slot {
+            Fold::Normal => Ok(false),
+            Fold::Partial(out) => {
+                if out.is_none() {
+                    *out = Some(self.export_partial());
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            Fold::Coordinator { partials, consumed } => {
+                if *consumed {
+                    return Ok(false);
+                }
+                let parts = std::mem::take(partials);
+                *consumed = true;
+                drop(slot);
+                for p in &parts {
+                    self.merge_partial(p)?;
+                }
+                Ok(false)
+            }
+        }
+    }
+
     /// Emits the groups: HAVING, the select list, ORDER BY, OFFSET, LIMIT.
     pub fn finish(mut self) -> Result<Vec<Row>, String> {
+        #[cfg(feature = "sharding")]
+        if self.cluster_fold()? {
+            return Ok(Vec::new());
+        }
         let plan = self.plan;
         // A bare aggregate over an empty table still produces one row —
         // `COUNT(*)` of nothing is 0, not "no rows".

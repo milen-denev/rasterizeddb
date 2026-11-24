@@ -304,6 +304,26 @@ pub fn lock_timeout() -> crate::core::mvcc::table_locks::LockTimeout {
 pub struct SessionCancel {
     key: [u8; 4],
     current: std::sync::Mutex<Option<Arc<StatementCancel>>>,
+    /// How this session's next aggregate fold ends, for a shard taking part
+    /// in a cluster fan-out (sharding-plan.md B1c). Set by the shard's
+    /// rshard endpoint between statements, read by the fold.
+    #[cfg(feature = "sharding")]
+    pub fold: std::sync::Mutex<Fold>,
+}
+
+/// See [`SessionCancel::fold`].
+#[cfg(feature = "sharding")]
+#[derive(Debug, Default)]
+pub enum Fold {
+    /// Finish as usual.
+    #[default]
+    Normal,
+    /// Stop before finishing: the folder's partial goes here
+    /// (`Folder::export_partial`) and the statement returns no group.
+    Partial(Option<Vec<u8>>),
+    /// Merge these peers' partials before finishing; emptied (and marked
+    /// consumed) by the fold that merged them.
+    Coordinator { partials: Vec<Vec<u8>>, consumed: bool },
 }
 
 impl SessionCancel {
@@ -356,6 +376,12 @@ impl Drop for CancelRegistration {
     }
 }
 
+/// The live session registered under `pid`.
+#[cfg(feature = "sharding")]
+pub fn session_by_pid(pid: i32) -> Option<Arc<SessionCancel>> {
+    registry().lock().unwrap_or_else(|e| e.into_inner()).get(&pid).cloned()
+}
+
 fn registry() -> &'static std::sync::Mutex<std::collections::HashMap<i32, Arc<SessionCancel>>> {
     static REGISTRY: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<i32, Arc<SessionCancel>>>,
@@ -371,6 +397,8 @@ pub fn register_session(key: [u8; 4]) -> CancelRegistration {
     let session = Arc::new(SessionCancel {
         key,
         current: std::sync::Mutex::new(None),
+        #[cfg(feature = "sharding")]
+        fold: std::sync::Mutex::new(Fold::Normal),
     });
     let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
     let pid = loop {
@@ -485,6 +513,8 @@ pub fn register_token(user: &str, token: &str) -> Option<TokenRegistration> {
     let session = Arc::new(SessionCancel {
         key: [0; 4],
         current: std::sync::Mutex::new(None),
+        #[cfg(feature = "sharding")]
+        fold: std::sync::Mutex::new(Fold::Normal),
     });
     map.insert(key.clone(), session.clone());
     Some(TokenRegistration { key, session })

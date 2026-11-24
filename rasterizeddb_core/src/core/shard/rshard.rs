@@ -25,7 +25,11 @@
 //! placement hook says this shard hosts the role (`RDB03` otherwise, so the
 //! gateway refreshes the user's route).
 //!
-//! **Not in version 1, refused before effect:** native requests; `TopN` and `Coordinator` fan-out parts (B1c's coordinator); a
+//! **Coordinated aggregates (B1c).** A keyless aggregate the gateway sends
+//! to this shard as coordinator gathers every other shard's partial fold
+//! over shard-to-shard rshard, then runs here with them merged in.
+//!
+//! **Not in version 1, refused before effect:** native requests; `TopN` fan-out parts; a
 //! batch ending in Flush rather than Sync.
 
 use std::collections::HashMap;
@@ -60,7 +64,23 @@ pub struct RshardConfig {
     /// exact gateway certificates' SHA-256 fingerprints.
     pub gateway_ca: Option<String>,
     pub gateway_pins: Vec<String>,
+    /// The CA the other shards' certificates are signed by, for a
+    /// coordinator's connections to its peers (B1c); `gateway_ca` when
+    /// unset.
+    pub peer_ca: Option<String>,
 }
+
+/// What a coordinator needs to reach its peers: its own certificate as the
+/// client identity, and the CA it trusts them by.
+struct PeerConfig {
+    cert: String,
+    key: String,
+    ca: Option<String>,
+}
+
+static PEERS: std::sync::OnceLock<PeerConfig> = std::sync::OnceLock::new();
+static PEER_CLIENTS: std::sync::Mutex<Option<HashMap<u32, StdArc<rastcp::mux::MuxClient>>>> = std::sync::Mutex::new(None);
+static NEXT_PEER_SESSION: AtomicU64 = AtomicU64::new(1 << 62);
 
 /// One mux connection's state.
 pub struct Conn {
@@ -80,6 +100,8 @@ enum Hello {
 /// A virtual session.
 struct VSession {
     bridge: crate::pgwire::proxied::PgBridge,
+    database: String,
+    role: String,
     /// Backend bytes read past a chunk's end, sent with the next Continue.
     pending: Vec<u8>,
     /// The reply ended (`ReadyForQuery` or CopyInResponse); Continue has
@@ -103,6 +125,11 @@ pub async fn serve(catalog: Arc<DatabaseCatalog>, config: RshardConfig) -> std::
             ));
         }
     };
+    let _ = PEERS.set(PeerConfig {
+        cert: config.cert.clone(),
+        key: config.key.clone(),
+        ca: config.peer_ca.clone().or_else(|| config.gateway_ca.clone()),
+    });
     let server = rastcp::server::TcpServerBuilder::new(&config.addr, config.port)
         .client_auth(client_auth)
         .with_certificates(load_certificates(&config.cert).map_err(io)?, load_private_key(&config.key).map_err(io)?)
@@ -332,7 +359,13 @@ async fn open_session(conn: &Conn, session: u64, database: &str, role: &str, par
     let backend_key = ((bridge.pid as u32 as u64) << 32) | bridge.key as u32 as u64;
     let previous = conn.sessions.lock().unwrap().insert(
         session,
-        StdArc::new(Mutex::new(VSession { bridge, pending: Vec::new(), finished: true })),
+        StdArc::new(Mutex::new(VSession {
+            bridge,
+            database: database.to_string(),
+            role: r.name.clone(),
+            pending: Vec::new(),
+            finished: true,
+        })),
     );
     if previous.is_some() {
         return refuse(PROTOCOL, false, format!("session {session} was already open on this connection; it was replaced"));
@@ -372,10 +405,192 @@ async fn pg(conn: &Conn, session: u64, bytes: &[u8]) -> Response {
         Some(b'H') => return refuse(*b"0A000", true, "a batch ending in Flush is not in rshard version 1; end it with Sync"),
         Some(_) => {}
     }
+    // A keyless aggregate the gateway sent here to coordinate (B1c).
+    if let Some(sql) = simple_query_text(bytes)
+        && may_aggregate(&sql)
+        && let Some(guard) = conn.catalog.connect(&s.database)
+    {
+        let template = super::classify::classify(guard.database(), rshard::Source::Shape, &sql);
+        drop(guard);
+        if template == (rshard::RouteTemplate::FanOut { merge: Merge::Coordinator, writes: false }) {
+            return coordinate(session, &mut s, bytes).await;
+        }
+    }
     s.bridge.raw(bytes);
     s.finished = false;
     s.pending.clear();
     read_chunk(session, &mut s).await
+}
+
+/// A cheap first look: only text that could be an aggregate is classified,
+/// so ordinary statements pay nothing for the coordinator.
+fn may_aggregate(sql: &str) -> bool {
+    let up = sql.to_ascii_uppercase();
+    ["GROUP", "COUNT(", "SUM(", "AVG(", "MIN(", "MAX(", "_AGG(", "BOOL_", "EVERY(", "STDDEV", "VARIANCE"]
+        .iter()
+        .any(|k| up.contains(k))
+}
+
+/// The SQL of a batch that is exactly one simple `Query` message.
+fn simple_query_text(bytes: &[u8]) -> Option<String> {
+    if bytes.first() != Some(&b'Q') || bytes.len() < 6 {
+        return None;
+    }
+    let len = i32::from_be_bytes(bytes[1..5].try_into().ok()?) as usize;
+    if 1 + len != bytes.len() {
+        return None;
+    }
+    let body = &bytes[5..];
+    let text = body.strip_suffix(&[0]).unwrap_or(body);
+    String::from_utf8(text.to_vec()).ok()
+}
+
+/// A backend ErrorResponse then ReadyForQuery, as whole messages.
+fn error_reply(code: &str, message: &str, status: u8) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (k, v) in [(b'S', "ERROR"), (b'V', "ERROR"), (b'C', code), (b'M', message)] {
+        body.push(k);
+        body.extend_from_slice(v.as_bytes());
+        body.push(0);
+    }
+    body.push(0);
+    let mut out = vec![b'E'];
+    out.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+    out.extend(body);
+    out.extend_from_slice(&[b'Z', 0, 0, 0, 5, status]);
+    out
+}
+
+/// A mux client to peer shard `id` at its map address, with this shard's
+/// certificate, said Hello to once.
+async fn peer_client(id: u32) -> Result<StdArc<rastcp::mux::MuxClient>, String> {
+    if let Some(c) = PEER_CLIENTS.lock().unwrap().get_or_insert_with(HashMap::new).get(&id) {
+        return Ok(c.clone());
+    }
+    let served = served().ok_or("this node is not a shard")?;
+    let info = served.map.shard(id).ok_or_else(|| format!("shard {id} is not in the map"))?;
+    let peers = PEERS.get().ok_or("the rshard listener is not configured")?;
+    let ca = peers.ca.as_deref().ok_or("coordinating needs --peer-ca (or --gateway-ca) to trust the other shards")?;
+    let e = |x: rastcp::error::RastcpError| x.to_string();
+    let client = rastcp::client::TcpClientBuilder::new(&info.addr)
+        .no_timeout()
+        .trust(rastcp::tls::Trust::RootCa(rastcp::tls::load_certificates(ca).map_err(e)?))
+        .identity(rastcp::tls::ClientIdentity::load(&peers.cert, &peers.key).map_err(e)?)
+        .build_multiplexed()
+        .await
+        .map_err(e)?;
+    let client = StdArc::new(client);
+    let hello = Request::Hello {
+        cluster_id: served.map.cluster_id(),
+        gateway: format!("shard {}", served.shard_id),
+        map_epoch: served.map.epoch(),
+        map_digest: served.map.digest(),
+    };
+    match Response::decode(&client.send(&hello.encode()).await.map_err(e)?)? {
+        Response::HelloOk { .. } => {}
+        Response::Refused(r) => return Err(format!("shard {id} refused: {}", r.message)),
+        other => return Err(format!("shard {id} answered Hello with {other:?}")),
+    }
+    PEER_CLIENTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(id, client.clone());
+    Ok(client)
+}
+
+/// One peer's partial for `bytes` (a simple Query), run as `role` in
+/// `database` on its own virtual session there.
+async fn peer_partial(id: u32, database: &str, role: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let client = peer_client(id).await?;
+    let session = NEXT_PEER_SESSION.fetch_add(1, Ordering::Relaxed);
+    let e = |x: rastcp::error::RastcpError| x.to_string();
+    let open = Request::OpenSession {
+        session,
+        database: database.to_string(),
+        role: role.to_string(),
+        params: Vec::new(),
+        gateway: "coordinator".to_string(),
+        pinned: false,
+    };
+    match Response::decode(&client.send(&open.encode()).await.map_err(e)?)? {
+        Response::SessionOpened { .. } => {}
+        Response::Refused(r) => return Err(format!("shard {id}: {}", r.message)),
+        other => return Err(format!("shard {id} answered OpenSession with {other:?}")),
+    }
+    let req = Request::ExecPart { session, map_epoch: epoch(), merge: Merge::Coordinator, bytes: bytes.to_vec() };
+    let answer = Response::decode(&client.send(&req.encode()).await.map_err(e)?);
+    let _ = client.send(&Request::CloseSession { session }.encode()).await;
+    match answer? {
+        Response::PartReply(p) => match p.rows.into_iter().next() {
+            Some((_, partial)) => Ok(partial),
+            None => Err(format!("shard {id} returned no partial")),
+        },
+        Response::Refused(r) => Err(format!("shard {id}: {}", r.message)),
+        other => Err(format!("shard {id} answered ExecPart with {other:?}")),
+    }
+}
+
+/// Runs a keyless aggregate as the coordinator (B1c): every other shard's
+/// partial gathered, then the statement run here with them merged into this
+/// shard's own fold before it finishes. A fold that did not take them (the
+/// statement was answered some other way) fails the statement `XX000`
+/// rather than answer from this shard's rows alone.
+async fn coordinate(session: u64, s: &mut VSession, bytes: &[u8]) -> Response {
+    use crate::core::cancel::Fold;
+    let Some(served) = served() else {
+        return refuse(PROTOCOL, true, "this node is not a shard");
+    };
+    let mut partials = Vec::new();
+    for info in served.map.shards().iter().filter(|i| i.id != served.shard_id) {
+        match peer_partial(info.id, &s.database, &s.role, bytes).await {
+            Ok(p) => partials.push(p),
+            Err(e) => {
+                let msg = format!("the coordinator could not gather shard {}'s part: {e}", info.id);
+                return Response::PgReply { session, map_epoch: epoch(), more: false, status: s.bridge.status, bytes: error_reply("XX000", &msg, s.bridge.status) };
+            }
+        }
+    }
+    let Some(cancel) = crate::core::cancel::session_by_pid(s.bridge.pid) else {
+        return refuse(*b"XX000", true, "the coordinating session is not registered");
+    };
+    *cancel.fold.lock().unwrap() = Fold::Coordinator { partials, consumed: false };
+    s.bridge.raw(bytes);
+    let mut out = Vec::new();
+    loop {
+        let frame = match s.bridge.next().await {
+            Ok(f) => f,
+            Err(e) => return refuse(*b"08006", false, format!("the session ended: {e}")),
+        };
+        out.push(frame.tag);
+        out.extend_from_slice(&((frame.body.len() + 4) as i32).to_be_bytes());
+        out.extend_from_slice(frame.body);
+        if frame.tag == b'Z' {
+            break;
+        }
+        if out.len() > 256 << 20 {
+            *cancel.fold.lock().unwrap() = Fold::Normal;
+            return refuse(*b"54000", false, "a coordinated result passed 256 MiB");
+        }
+    }
+    let consumed = matches!(&*cancel.fold.lock().unwrap(), Fold::Coordinator { consumed: true, .. });
+    *cancel.fold.lock().unwrap() = Fold::Normal;
+    s.finished = true;
+    let status = s.bridge.status;
+    if !consumed && !reply_has_error(&out) {
+        let msg = "the statement was not answered by a fold the coordinator could merge the other shards into;                    it is refused rather than answered from one shard";
+        return Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes: error_reply("XX000", msg, status) };
+    }
+    Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes: out }
+}
+
+/// Whether a reply's messages include an ErrorResponse.
+fn reply_has_error(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 5 <= bytes.len() {
+        if bytes[i] == b'E' {
+            return true;
+        }
+        let len = i32::from_be_bytes(bytes[i + 1..i + 5].try_into().unwrap()) as usize;
+        i += 1 + len;
+    }
+    false
 }
 
 async fn continue_reply(conn: &Conn, session: u64) -> Response {
@@ -410,8 +625,8 @@ async fn read_chunk(session: u64, s: &mut VSession) -> Response {
 /// One shard's part of a fan-out: the statement run as a Pg batch, its
 /// DataRows split out for the gateway to concatenate or sum.
 async fn exec_part(conn: &Conn, session: u64, merge: Merge, bytes: &[u8]) -> Response {
-    if !matches!(merge, Merge::Concat | Merge::CountSum | Merge::Any) {
-        return refuse(*b"0A000", true, "this fan-out needs the coordinator shard (B1c), which is not built yet");
+    if matches!(merge, Merge::TopN { .. }) {
+        return refuse(*b"0A000", true, "a top-N fan-out is not in rshard version 1");
     }
     let Some(s) = session_of(conn, session) else {
         return refuse(SESSION_GONE, true, format!("session {session} is gone"));
@@ -420,6 +635,16 @@ async fn exec_part(conn: &Conn, session: u64, merge: Merge, bytes: &[u8]) -> Res
     if last_tag(bytes).is_none() {
         return refuse(PROTOCOL, true, "an ExecPart request must carry whole frontend messages");
     }
+    // A coordinator's request for this shard's partial fold.
+    let cancel = if merge == Merge::Coordinator {
+        let Some(c) = crate::core::cancel::session_by_pid(s.bridge.pid) else {
+            return refuse(*b"XX000", true, "the session is not registered");
+        };
+        *c.fold.lock().unwrap() = crate::core::cancel::Fold::Partial(None);
+        Some(c)
+    } else {
+        None
+    };
     s.bridge.raw(bytes);
     let (mut head, mut rows, mut tail) = (Vec::new(), Vec::new(), Vec::new());
     let mut status = 0;
@@ -444,6 +669,16 @@ async fn exec_part(conn: &Conn, session: u64, merge: Merge, bytes: &[u8]) -> Res
         if tag == b'Z' {
             break;
         }
+    }
+    if let Some(c) = cancel {
+        let taken = std::mem::take(&mut *c.fold.lock().unwrap());
+        if reply_has_error(&tail) {
+            return Response::PartReply(PartReply { session, map_epoch: epoch(), more: false, status, head, rows: Vec::new(), tail });
+        }
+        let crate::core::cancel::Fold::Partial(Some(partial)) = taken else {
+            return refuse(*b"XX000", false, "the statement was not answered by a fold, so it has no partial to merge");
+        };
+        return Response::PartReply(PartReply { session, map_epoch: epoch(), more: false, status, head, rows: vec![(Vec::new(), partial)], tail });
     }
     Response::PartReply(PartReply { session, map_epoch: epoch(), more: false, status, head, rows, tail })
 }

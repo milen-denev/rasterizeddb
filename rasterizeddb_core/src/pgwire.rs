@@ -1582,6 +1582,12 @@ tokio::task_local! {
     static SESSION_CANCEL: StdArc<crate::core::cancel::SessionCancel>;
 }
 
+/// The session the running task's statement belongs to, if it runs in one.
+#[cfg(feature = "sharding")]
+pub(crate) fn current_session_cancel() -> Option<StdArc<crate::core::cancel::SessionCancel>> {
+    SESSION_CANCEL.try_with(StdArc::clone).ok()
+}
+
 /// The end of an autocommit statement's reply, held until its table locks are
 /// released (docs/persistent-indexes.md §7, "As built (B3b)").
 ///
