@@ -217,6 +217,12 @@ pub enum Request {
     ExecPart { session: u64, map_epoch: u64, merge: Merge, bytes: Vec<u8> },
     Cancel { backend_key: u64 },
     Native { database: String, role: String, map_epoch: u64, bytes: Vec<u8> },
+    /// Two-phase commit's decision for global transaction `gid`, recorded
+    /// durably on the anchor (home) shard before any COMMIT PREPARED is sent
+    /// (sharding-plan.md B5). `commit = false` records an abort.
+    Decide { gid: String, commit: bool },
+    /// The decision recorded for `gid`, if any.
+    Decision { gid: String },
 }
 
 /// Where a classified text came from.
@@ -241,6 +247,9 @@ pub enum Response {
     Done,
     NativeReply { map_epoch: u64, bytes: Vec<u8> },
     Refused(Refusal),
+    /// Answers `Decision`: `None` when nothing is recorded (presumed abort
+    /// once the transaction is old enough), else whether it commits.
+    Decided { commit: Option<bool> },
 }
 
 /// What SCRAM-SHA-256 needs to verify a role's proof (G9).
@@ -499,6 +508,8 @@ impl Request {
             Request::ExecPart { .. } => 0x09,
             Request::Cancel { .. } => 0x0A,
             Request::Native { .. } => 0x0B,
+            Request::Decide { .. } => 0x0C,
+            Request::Decision { .. } => 0x0D,
         }
     }
 
@@ -539,6 +550,12 @@ impl Request {
             }
             Request::Native { database, role, map_epoch, bytes } => {
                 w.str(database).str(role).u64(*map_epoch).bytes(bytes);
+            }
+            Request::Decide { gid, commit } => {
+                w.str(gid).u8(*commit as u8);
+            }
+            Request::Decision { gid } => {
+                w.str(gid);
             }
         }
         w.buf
@@ -603,6 +620,8 @@ impl Request {
             },
             0x0A => Request::Cancel { backend_key: r.u64()? },
             0x0B => Request::Native { database: r.str()?, role: r.str()?, map_epoch: r.u64()?, bytes: r.bytes()?.to_vec() },
+            0x0C => Request::Decide { gid: r.str()?, commit: r.bool()? },
+            0x0D => Request::Decision { gid: r.str()? },
             k => return Err(format!("rshard request kind {k:#04x} is unknown")),
         };
         r.end()?;
@@ -624,6 +643,7 @@ impl Response {
             Response::Done => 0x89,
             Response::NativeReply { .. } => 0x8A,
             Response::Refused(_) => 0xFF,
+            Response::Decided { .. } => 0x8B,
         }
     }
 
@@ -676,6 +696,13 @@ impl Response {
                 w.bytes(&p.tail);
             }
             Response::Done => {}
+            Response::Decided { commit } => {
+                w.u8(match commit {
+                    None => 0,
+                    Some(true) => 1,
+                    Some(false) => 2,
+                });
+            }
             Response::NativeReply { map_epoch, bytes } => {
                 w.u64(*map_epoch).bytes(bytes);
             }
@@ -743,6 +770,14 @@ impl Response {
             }
             0x89 => Response::Done,
             0x8A => Response::NativeReply { map_epoch: r.u64()?, bytes: r.bytes()?.to_vec() },
+            0x8B => Response::Decided {
+                commit: match r.u8()? {
+                    0 => None,
+                    1 => Some(true),
+                    2 => Some(false),
+                    b => return Err(format!("rshard decision {b} is unknown")),
+                },
+            },
             0xFF => Response::Refused(Refusal {
                 sqlstate: r.array()?,
                 before_effect: r.bool()?,

@@ -250,6 +250,14 @@ async fn handle(conn: &Conn, data: &[u8]) -> Response {
             Response::Done
         }
         Request::Native { .. } => refuse(*b"0A000", true, "native requests through the gateway are not in rshard version 1"),
+        Request::Decide { gid, commit } => match decide(&gid, commit) {
+            Ok(()) => Response::Done,
+            Err(e) => refuse(*b"58030", false, e),
+        },
+        Request::Decision { gid } => match decision(&gid) {
+            Ok(commit) => Response::Decided { commit },
+            Err(e) => refuse(*b"58030", true, e),
+        },
     }
 }
 
@@ -261,6 +269,51 @@ fn epoch_refusal(theirs: u64, mine: u64) -> Option<Response> {
     } else {
         None
     }
+}
+
+/// The anchor's two-phase-commit decision log (sharding-plan.md B5):
+/// `commit gid` / `abort gid` lines, appended and synced. The first decision
+/// recorded for a gid is the decision; a later contrary one is refused.
+const DECISIONS: &str = "rdb_2pc_decisions";
+
+fn decision(gid: &str) -> Result<Option<bool>, String> {
+    let dir = super::ownership::data_dir().ok_or("this shard has no data directory")?;
+    let path = dir.join(DECISIONS);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    for line in text.lines() {
+        if let Some((verb, g)) = line.split_once(' ')
+            && g == gid
+        {
+            return Ok(Some(verb == "commit"));
+        }
+    }
+    Ok(None)
+}
+
+fn decide(gid: &str, commit: bool) -> Result<(), String> {
+    use std::io::Write;
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _held = LOCK.lock().unwrap();
+    if gid.is_empty() || gid.contains('\n') {
+        return Err("a malformed global transaction id".to_string());
+    }
+    match decision(gid)? {
+        Some(c) if c == commit => return Ok(()),
+        Some(c) => return Err(format!("{gid} is already decided {}", if c { "commit" } else { "abort" })),
+        None => {}
+    }
+    let dir = super::ownership::data_dir().ok_or("this shard has no data directory")?;
+    let path = dir.join(DECISIONS);
+    let io = |e: std::io::Error| format!("{}: {e}", path.display());
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(io)?;
+    f.write_all(format!("{} {gid}\n", if commit { "commit" } else { "abort" }).as_bytes()).map_err(io)?;
+    f.sync_all().map_err(io)?;
+    crate::core::sync_path::sync_dir(dir).map_err(io)?;
+    Ok(())
 }
 
 /// What SCRAM needs, from `role` in `database`; never a password. An

@@ -46,6 +46,11 @@ pub(crate) struct Txn {
     /// statement, prepended to it.
     pub pending: Vec<u8>,
     pub pending_queries: usize,
+    /// Under two-phase commit: every shard the transaction has run on, in
+    /// order, and the opening messages (BEGIN, SET LOCAL) each new one gets.
+    pub shards: Vec<u32>,
+    pub opening: Vec<u8>,
+    pub opening_queries: usize,
 }
 
 /// A virtual session on one shard.
@@ -227,7 +232,15 @@ impl Session {
             unrouted,
             unrouted_writes: UnroutedWrites::Refuse,
             vs: HashMap::new(),
-            txn: Txn { status: b'I', shard: None, pending: Vec::new(), pending_queries: 0 },
+            txn: Txn {
+                status: b'I',
+                shard: None,
+                pending: Vec::new(),
+                pending_queries: 0,
+                shards: Vec::new(),
+                opening: Vec::new(),
+                opening_queries: 0,
+            },
             session_sets: Vec::new(),
             statements: HashMap::new(),
             generation: 0,
@@ -471,6 +484,9 @@ impl Session {
                 self.txn.pending.clear();
                 self.txn.pending.extend_from_slice(msg);
                 self.txn.pending_queries = 1;
+                self.txn.opening.clear();
+                self.txn.opening.extend_from_slice(msg);
+                self.txn.opening_queries = 1;
                 self.txn.status = b'T';
                 pg::command_complete(&mut self.out, "BEGIN");
                 pg::ready(&mut self.out, b'T');
@@ -483,9 +499,18 @@ impl Session {
                 pg::ready(&mut self.out, b'I');
                 return Ok(Outcome::Done { error: false });
             }
+            Local::End { commit } if self.core.shared.cfg.two_phase && self.txn.shards.len() > 1 => {
+                return Ok(self.end_two_phase(commit && self.txn.status == b'T').await);
+            }
+            Local::End { .. } if self.core.shared.cfg.two_phase && self.txn.shards.len() == 1 => {
+                let shard = self.txn.shards[0];
+                return self.run_on(conn, shard, msg, Vec::new(), None).await;
+            }
             Local::SetLocal if self.txn.status == b'T' && self.txn.shard.is_none() => {
                 self.txn.pending.extend_from_slice(msg);
                 self.txn.pending_queries += 1;
+                self.txn.opening.extend_from_slice(msg);
+                self.txn.opening_queries += 1;
                 pg::command_complete(&mut self.out, "SET");
                 pg::ready(&mut self.out, b'T');
                 return Ok(Outcome::Done { error: false });
@@ -514,6 +539,9 @@ impl Session {
         self.txn.shard = None;
         self.txn.pending.clear();
         self.txn.pending_queries = 0;
+        self.txn.shards.clear();
+        self.txn.opening.clear();
+        self.txn.opening_queries = 0;
         self.local_key = None;
     }
 
@@ -523,7 +551,11 @@ impl Session {
         if let Some(p) = self.login.pinned {
             return Some(p);
         }
-        if let Some(s) = self.txn.shard {
+        // Under two-phase commit a transaction's statements route on their
+        // own; otherwise the transaction stays on its first shard.
+        if let Some(s) = self.txn.shard
+            && !self.core.shared.cfg.two_phase
+        {
             return Some(s);
         }
         let map = self.core.map();
@@ -768,6 +800,15 @@ impl Session {
         if first_of_txn && !self.txn.pending.is_empty() {
             payload.extend_from_slice(&self.txn.pending);
             filter.skip_rfq = self.txn.pending_queries;
+        } else if self.core.shared.cfg.two_phase
+            && self.txn.status != b'I'
+            && !self.txn.shards.contains(&shard)
+            && !self.txn.opening.is_empty()
+        {
+            // A shard the transaction reaches for the first time opens its
+            // own part of it.
+            payload.extend_from_slice(&self.txn.opening);
+            filter.skip_rfq = self.txn.opening_queries;
         }
         let mut parsed_now: Vec<(String, u64)> = Vec::new();
         if let Some(vs) = self.vs.get(&shard) {
@@ -861,6 +902,9 @@ impl Session {
                     match status {
                         b'T' | b'E' => {
                             self.txn.shard.get_or_insert(shard);
+                            if !self.txn.shards.contains(&shard) {
+                                self.txn.shards.push(shard);
+                            }
                             self.txn.pending.clear();
                             self.txn.pending_queries = 0;
                             self.txn.status = status;
@@ -881,6 +925,124 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// Runs `sql` as one simple query on this session's virtual session on
+    /// `shard`, for the gateway's own bookkeeping (nothing reaches the
+    /// client): the final ReadyForQuery status, and the first error.
+    async fn quiet_query(&mut self, shard: u32, sql: &str) -> Result<(u8, Option<(String, String)>), String> {
+        let vs_id = self.ensure_vs(shard).await.map_err(|(c, m)| format!("{c}: {m}"))?;
+        let link = self.core.link(shard)?;
+        let mut q = vec![b'Q'];
+        q.extend_from_slice(&((sql.len() + 5) as i32).to_be_bytes());
+        q.extend_from_slice(sql.as_bytes());
+        q.push(0);
+        let mut req = Vec::new();
+        Request::encode_pg(&mut req, vs_id, self.core.map().epoch(), &q);
+        let mut resp = link.call(&self.core, &req).await.map_err(|e| format!("{e:?}"))?;
+        let mut error = None;
+        loop {
+            match resp {
+                Response::PgReply { more, status, bytes, .. } => {
+                    for (t, m) in pg::messages(&bytes) {
+                        if t == b'E' && error.is_none() {
+                            let code = pg::error_sqlstate(m).unwrap_or("XX000").to_string();
+                            error = Some((code, pg::error_message(m).unwrap_or_default()));
+                        }
+                    }
+                    if more {
+                        resp = link.call(&self.core, &Request::Continue { session: vs_id }.encode()).await.map_err(|e| format!("{e:?}"))?;
+                        continue;
+                    }
+                    return Ok((status, error));
+                }
+                Response::Refused(r) => return Err(format!("{}: {}", String::from_utf8_lossy(&r.sqlstate), r.message)),
+                other => return Err(format!("reply kind {:#04x}", other.kind())),
+            }
+        }
+    }
+
+    /// Ends a transaction that ran on several shards (sharding-plan.md B5):
+    /// a rollback on each; or a two-phase commit. Every shard prepares
+    /// under one global id; any failure rolls every part back; once all are
+    /// prepared, the decision is recorded on the anchor (home) shard, and
+    /// only then is each part committed. A part whose COMMIT PREPARED fails
+    /// after the decision is left prepared for `rdb-shard resolve`, which
+    /// reads the anchor's decision: the transaction is committed.
+    async fn end_two_phase(&mut self, commit: bool) -> Outcome {
+        let shards = self.txn.shards.clone();
+        if !commit {
+            for s in &shards {
+                let _ = self.quiet_query(*s, "ROLLBACK").await;
+            }
+            self.end_txn();
+            pg::command_complete(&mut self.out, "ROLLBACK");
+            pg::ready(&mut self.out, b'I');
+            return Outcome::Done { error: false };
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let gid = format!(
+            "rdb2pc:{}:{nanos:x}:{}",
+            self.core.shared.cfg.gateway_name.replace(['\'', ':'], "_"),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let mut prepared = Vec::new();
+        let mut failure: Option<(String, String)> = None;
+        for s in &shards {
+            match self.quiet_query(*s, &format!("PREPARE TRANSACTION '{gid}'")).await {
+                Ok((_, None)) => prepared.push(*s),
+                Ok((_, Some(e))) => {
+                    failure = Some((e.0, format!("shard {s} could not prepare: {}", e.1)));
+                    break;
+                }
+                Err(e) => {
+                    failure = Some(("08006".into(), format!("shard {s} could not prepare: {e}")));
+                    break;
+                }
+            }
+        }
+        let home = self.core.shared.home(&self.core.map());
+        if failure.is_none() {
+            let decided = match self.core.link(home) {
+                Ok(link) => link.call(&self.core, &Request::Decide { gid: gid.clone(), commit: true }.encode()).await,
+                Err(e) => Err(CallError::Down(e)),
+            };
+            if !matches!(decided, Ok(Response::Done)) {
+                failure = Some(("40001".into(), format!("the commit decision could not be recorded on shard {home}: {decided:?}")));
+                // Recorded or not, an abort may still be recorded first.
+                if let Ok(link) = self.core.link(home) {
+                    let _ = link.call(&self.core, &Request::Decide { gid: gid.clone(), commit: false }.encode()).await;
+                }
+            }
+        }
+        if let Some((code, msg)) = failure {
+            for s in &shards {
+                if prepared.contains(s) {
+                    let _ = self.quiet_query(*s, &format!("ROLLBACK PREPARED '{gid}'")).await;
+                } else {
+                    let _ = self.quiet_query(*s, "ROLLBACK").await;
+                }
+            }
+            self.end_txn();
+            self.error_ready(&code, &msg);
+            return Outcome::Done { error: true };
+        }
+        for s in &shards {
+            match self.quiet_query(*s, &format!("COMMIT PREPARED '{gid}'")).await {
+                Ok((_, None)) => {}
+                other => log::warn!(
+                    "transaction {gid} is decided commit but shard {s} did not finish it ({other:?}); rdb-shard resolve completes it"
+                ),
+            }
+        }
+        self.end_txn();
+        pg::command_complete(&mut self.out, "COMMIT");
+        pg::ready(&mut self.out, b'I');
+        Outcome::Done { error: false }
     }
 
     /// A shard's refusal: retried when nothing took effect and the

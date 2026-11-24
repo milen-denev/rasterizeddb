@@ -322,6 +322,22 @@ pub fn error_sqlstate(msg: &[u8]) -> Option<&str> {
     None
 }
 
+/// An ErrorResponse's message text.
+pub fn error_message(msg: &[u8]) -> Option<String> {
+    let mut b = body(msg);
+    while let Some(&f) = b.first() {
+        if f == 0 {
+            break;
+        }
+        let (v, rest) = cstr(&b[1..])?;
+        if f == b'M' {
+            return Some(v.to_string());
+        }
+        b = rest;
+    }
+    None
+}
+
 /// A DataRow's single column value, for COUNT sums: `(binary?, bytes)` is
 /// decided by the caller from the RowDescription.
 pub fn data_row_first(msg: &[u8]) -> Option<Option<&[u8]>> {

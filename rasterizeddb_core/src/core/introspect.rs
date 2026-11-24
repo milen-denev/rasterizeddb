@@ -73,6 +73,9 @@ pub enum Introspect {
     /// '<map>'`: a shard's side of a move (sharding-plan.md B2). Admin only
     /// (`pgwire::privileged_statement`).
     ShardAdmin(ShardAdmin),
+    /// `SHOW PREPARED TRANSACTIONS`: this database's prepared transactions
+    /// (sharding-plan.md B5).
+    PreparedTransactions,
     /// A table's 128-bit schema fingerprint, as cluster DDL compares them
     /// across shards (sharding-plan.md B1a.10).
     SchemaFingerprint(String),
@@ -275,6 +278,9 @@ pub fn parse(sql: &str) -> Option<Result<Introspect, String>> {
             Some(name) if original.len() == 4 => Some(Ok(Introspect::SchemaFingerprint(normalize_name(name)))),
             _ => Some(Err("SHOW SCHEMA FINGERPRINT takes one table name".to_string())),
         },
+        Some("PREPARED") if words.get(2).copied() == Some("TRANSACTIONS") && words.len() == 3 => {
+            Some(Ok(Introspect::PreparedTransactions))
+        }
         Some("SHARD") if words.get(2).copied() == Some("LOAD") => {
             if words.len() > 3 {
                 return Some(Err("SHOW SHARD LOAD takes no arguments".to_string()));
@@ -432,6 +438,7 @@ pub fn result_fields(statement: &Introspect) -> Option<Vec<(String, DbType)>> {
         // partition's `hi` does not fit a BIGINT, and a `lo` past 2^63 would
         // read as negative. Hex, as the map log and the design write them.
         Introspect::ShardAdmin(_) => vec![text("result")],
+        Introspect::PreparedTransactions => vec![text("gid"), number("transaction")],
         Introspect::SchemaFingerprint(_) => vec![text("table_name"), text("fingerprint"), number("schema_epoch")],
         Introspect::ShardLoad => vec![
             text("table_name"),
@@ -570,6 +577,10 @@ pub async fn execute(statement: &Introspect, database: &Arc<Database>) -> Vec<u8
             Err(e) => failure(&e),
         },
         Introspect::Shards => rows(shards()),
+        Introspect::PreparedTransactions => match prepared_transactions(database) {
+            Ok(r) => rows(r),
+            Err(e) => failure(&e),
+        },
         Introspect::ShardAdmin(admin) => match shard_admin(database, admin).await {
             Ok(line) => rows(vec![row(&[Cell::Text(line)])]),
             Err(e) => failure(&e),
@@ -1823,6 +1834,20 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
 /// `[lo, hi)` range of the hash space, where its files are, whether it has
 /// any, and its sizes (zero until it is materialized). Refused for a plain
 /// table, and for a partitioned table that cannot be opened.
+#[cfg(feature = "sharding_2pc")]
+fn prepared_transactions(database: &Arc<Database>) -> Result<Vec<Row>, String> {
+    Ok(database
+        .prepared()?
+        .into_iter()
+        .map(|(gid, tx)| row(&[Cell::Text(gid), Cell::Number(tx)]))
+        .collect())
+}
+
+#[cfg(not(feature = "sharding_2pc"))]
+fn prepared_transactions(_database: &Arc<Database>) -> Result<Vec<Row>, String> {
+    Ok(Vec::new())
+}
+
 /// Runs a `SHARD …` statement (sharding-plan.md B2).
 #[cfg(feature = "sharding")]
 async fn shard_admin(database: &Arc<Database>, admin: &ShardAdmin) -> Result<String, String> {

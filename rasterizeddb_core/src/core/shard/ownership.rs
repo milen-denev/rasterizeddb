@@ -116,6 +116,11 @@ pub const STATE_FILE: &str = "rdb_shard_ownership";
 
 static DATA_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
+/// The shard's data directory, once started.
+pub fn data_dir() -> Option<&'static std::path::Path> {
+    DATA_DIR.get().map(|p| p.as_path())
+}
+
 /// Where [`STATE_FILE`] lives; set once by the shard start.
 pub fn set_data_dir(dir: std::path::PathBuf) {
     let _ = DATA_DIR.set(dir);
