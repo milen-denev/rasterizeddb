@@ -426,6 +426,74 @@ pub fn mask_role_catalog(sql: &str) -> Option<String> {
 // Storage
 // ---------------------------------------------------------------------------
 
+/// The permission rows cached per database (roles plan R1, §6): a check no
+/// longer runs a `SELECT` of the whole catalogue in a spawned task for every
+/// statement of a non-superuser.
+///
+/// Correct across transactions: a write inside a transaction marks its
+/// database *pending* with that transaction; while any pending writer is
+/// still running, loads bypass the cache (what a new snapshot sees may
+/// change at its commit), and once every pending writer has finished the
+/// cache is dropped and refilled. A write outside a transaction drops it at
+/// once.
+mod cache {
+    use std::sync::Arc as StdArc;
+
+    use dashmap::DashMap;
+
+    use super::AclRow;
+    use crate::core::mvcc::{TxId, TxOutcome};
+
+    static ROWS: std::sync::LazyLock<DashMap<u64, StdArc<Vec<AclRow>>>> = std::sync::LazyLock::new(DashMap::new);
+    static PENDING: std::sync::LazyLock<DashMap<u64, Vec<TxId>>> = std::sync::LazyLock::new(DashMap::new);
+    /// Bumped by every write, so a load that raced one does not fill the
+    /// cache with what it read before the write.
+    static GEN: std::sync::LazyLock<DashMap<u64, u64>> = std::sync::LazyLock::new(DashMap::new);
+
+    pub(super) fn generation(db: u64) -> u64 {
+        GEN.get(&db).map_or(0, |g| *g)
+    }
+
+    pub(super) fn wrote(db: u64, tx: Option<TxId>) {
+        *GEN.entry(db).or_insert(0) += 1;
+        match tx {
+            Some(t) => {
+                let mut p = PENDING.entry(db).or_default();
+                if !p.contains(&t) {
+                    p.push(t);
+                }
+                ROWS.remove(&db);
+            }
+            None => {
+                ROWS.remove(&db);
+            }
+        }
+    }
+
+    /// The cached rows, if they may be served: no pending writer is still
+    /// running. Finished writers are cleared (and the cache dropped).
+    pub(super) fn get(db: &crate::core::database::Database) -> Option<StdArc<Vec<AclRow>>> {
+        if let Some(mut p) = PENDING.get_mut(&db.id) {
+            let before = p.len();
+            p.retain(|t| db.transactions.outcome(*t) == TxOutcome::InProgress);
+            if p.len() != before {
+                ROWS.remove(&db.id);
+            }
+            if !p.is_empty() {
+                return None;
+            }
+        }
+        ROWS.get(&db.id).map(|r| r.clone())
+    }
+
+    pub(super) fn put(db: &crate::core::database::Database, rows: &[AclRow], seen: u64) {
+        if PENDING.get(&db.id).is_some_and(|p| !p.is_empty()) || generation(db.id) != seen {
+            return;
+        }
+        ROWS.insert(db.id, StdArc::new(rows.to_vec()));
+    }
+}
+
 fn run(
     database: &Arc<Database>,
     sql: &str,
@@ -434,6 +502,9 @@ fn run(
     use crate::core::rql::{executor, lexer_s1::recognize_query_purpose};
     let database = database.clone();
     let sql = sql.to_string();
+    if !sql.trim_start().get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT")) {
+        cache::wrote(database.id, tx);
+    }
     Box::pin(async move {
         let purpose = recognize_query_purpose(&sql).ok_or_else(|| format!("could not parse: {sql}"))?;
         let response = match tx {
@@ -458,6 +529,22 @@ pub async fn load(database: &Arc<Database>, tx: Option<TxId>) -> Result<Vec<AclR
     if !database.has_table(ACL_TABLE) {
         return Ok(Vec::new());
     }
+    // A statement's own transaction may hold uncommitted grants: it reads
+    // them itself. Only the committed view is cached.
+    if tx.is_none()
+        && let Some(rows) = cache::get(database)
+    {
+        return Ok((*rows).clone());
+    }
+    let seen = cache::generation(database.id);
+    let rows = load_uncached(database, tx).await?;
+    if tx.is_none() {
+        cache::put(database, &rows, seen);
+    }
+    Ok(rows)
+}
+
+async fn load_uncached(database: &Arc<Database>, tx: Option<TxId>) -> Result<Vec<AclRow>, String> {
     let response = run(database, &format!("SELECT relation, grantee, privilege, grantor, grantable FROM {ACL_TABLE}"), tx).await?;
     if response.first() != Some(&2) {
         return Ok(Vec::new());
