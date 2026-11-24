@@ -1,0 +1,14 @@
+[package]
+name = "rasterizeddb_raft"
+version = "1.0.0"
+edition = "2024"
+description = "RasterizedDB's Raft: a deterministic, I/O-free consensus core for per-shard replication (sharding-plan.md B3, D3)"
+repository = "https://github.com/milen-denev/rasterizeddb"
+license = "GPL-3.0-only"
+authors = ["Milen Denev"]
+keywords = ["rasterizeddb", "raft", "consensus"]
+categories = ["database", "algorithms"]
+
+# No dependencies: the core is pure, so a seeded simulation can drive it
+# through every interleaving the network and the disks can produce.
+[dependencies]

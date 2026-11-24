@@ -4864,6 +4864,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rasterizeddb_raft"
+version = "1.0.0"
+
+[[package]]
 name = "rasterizeddb_router"
 version = "1.0.0"
 
