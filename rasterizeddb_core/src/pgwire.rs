@@ -9372,6 +9372,18 @@ where
             .await?;
             return Ok(());
         }
+        // A superuser of a customer database is not a process administrator
+        // under strict tenant mode (licensed hook; open by default).
+        let ctx = crate::core::policy_hooks::SessionContext {
+            role: &state.principal.name,
+            database: &database.name,
+            protocol: "pgwire",
+            superuser: state.principal.superuser,
+        };
+        if let Err(e) = crate::core::policy_hooks::check_privileged(&ctx, verb) {
+            fail_statement(state, stream, "42501", e.trim_start_matches("42501: ")).await?;
+            return Ok(());
+        }
     }
 
     // `SELECT rdb_index_checkpoint('t')` (docs/persistent-indexes.md §3, a

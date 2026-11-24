@@ -109,6 +109,31 @@ pub trait PlacementPolicy: Send + Sync + 'static {
     }
 }
 
+/// The process-wide surface an admin-only statement's verb
+/// (`pgwire::privileged_statement`) reaches, or `None` for one that
+/// administers only the session's own database (role management).
+pub fn surface_of_verb(verb: &str) -> Option<ProcessSurface> {
+    Some(match verb {
+        "CREATE ROLE" | "ALTER ROLE" | "DROP ROLE" => return None,
+        "SET CONFIG" | "SET FILTER" | "KV CONFIG" | "KV SAVE" => ProcessSurface::SetConfig,
+        "STORAGE" | "BACKUP" | "RESTORE" | "KV FLUSHALL" => ProcessSurface::StoragePaths,
+        "IMPORT DATABASE" | "IMPORT" => ProcessSurface::Import,
+        "RESET QUERY STATS" | "SHOW BRANCH DIFF" => ProcessSurface::QueryStats,
+        "REPLICATION" | "SHARD" => ProcessSurface::Show,
+        _ => ProcessSurface::Databases,
+    })
+}
+
+/// The tenancy check for an admin-only statement that already passed the
+/// superuser check: `Err` with the refusal when the policy reserves its
+/// surface to process administrators.
+pub fn check_privileged(ctx: &SessionContext<'_>, verb: &str) -> Result<(), String> {
+    match surface_of_verb(verb) {
+        Some(surface) => tenancy().may_use(ctx, surface),
+        None => Ok(()),
+    }
+}
+
 /// Today's behaviour.
 struct Open;
 impl TenancyPolicy for Open {}
