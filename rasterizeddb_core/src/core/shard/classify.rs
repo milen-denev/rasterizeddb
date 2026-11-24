@@ -238,6 +238,19 @@ fn fan_out_read(t: &str, c: &Clauses) -> RouteTemplate {
     if (aggregate || has("GROUP")) && !windowed && !list_upper.trim_start().starts_with("DISTINCT") {
         return RouteTemplate::FanOut { merge: Merge::Coordinator, writes: false };
     }
+    // SELECT DISTINCT with no ordering or limit: every shard's distinct rows,
+    // deduplicated across shards on the coordinator (B4).
+    if list_upper.trim_start().starts_with("DISTINCT ")
+        && !list_upper.trim_start().starts_with("DISTINCT ON")
+        && !aggregate
+        && !has("GROUP")
+        && !has("HAVING")
+        && !has("ORDER")
+        && !has("LIMIT")
+        && !has("OFFSET")
+    {
+        return RouteTemplate::FanOut { merge: Merge::Coordinator, writes: false };
+    }
     // ORDER BY … LIMIT over output columns: merged on the coordinator by
     // sort keys (B1c top-N).
     if !aggregate && !has("GROUP") && !has("HAVING") && !list_upper.trim_start().starts_with("DISTINCT")

@@ -417,7 +417,10 @@ async fn pg(conn: &Conn, session: u64, bytes: &[u8]) -> Response {
         let template = super::classify::classify(guard.database(), rshard::Source::Shape, &sql);
         drop(guard);
         if template == (rshard::RouteTemplate::FanOut { merge: Merge::Coordinator, writes: false }) {
-            // A fold, or a top-N: the classifier sends both here.
+            // A fold, a top-N or a DISTINCT: the classifier sends all three.
+            if !may_aggregate_fold(&sql) && is_plain_distinct(&sql) {
+                return coordinate_distinct(session, &mut s, &sql).await;
+            }
             if !may_aggregate_fold(&sql)
                 && let Some(parsed) = super::topn::parse(&sql)
             {
@@ -561,6 +564,81 @@ async fn coordinate_topn(session: u64, s: &mut VSession, topn: super::topn::TopN
     let status = s.bridge.status;
     bytes.extend_from_slice(&[b'Z', 0, 0, 0, 5, status]);
     Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes }
+}
+
+/// `SELECT DISTINCT …` (not `DISTINCT ON`).
+fn is_plain_distinct(sql: &str) -> bool {
+    let up = sql.trim_start().to_ascii_uppercase();
+    let rest = up.strip_prefix("SELECT").map(str::trim_start).unwrap_or("");
+    rest.starts_with("DISTINCT ") && !rest.starts_with("DISTINCT ON")
+}
+
+/// Coordinates a keyless `SELECT DISTINCT`: each shard's distinct rows,
+/// deduplicated here by their bytes as returned (equal values print
+/// alike within one column's type; NULLs are equal, as DISTINCT says).
+async fn coordinate_distinct(session: u64, s: &mut VSession, sql: &str) -> Response {
+    let Some(served) = served() else {
+        return refuse(PROTOCOL, true, "this node is not a shard");
+    };
+    let status_of = |s: &VSession| s.bridge.status;
+    // Keys are not needed: a top-N with no keys and no limit is the plain run.
+    let plain = super::topn::TopN { keys: Vec::new(), limit: u64::MAX, offset: 0, part_sql: sql.to_string() };
+    let mine = match top_part(s, &plain).await {
+        Ok(p) => p,
+        Err(e) => {
+            let st = status_of(s);
+            return Response::PgReply { session, map_epoch: epoch(), more: false, status: st, bytes: error_reply("XX000", &e, st) };
+        }
+    };
+    if let Some(err) = mine.error {
+        let st = status_of(s);
+        let mut bytes = err;
+        bytes.extend_from_slice(&[b'Z', 0, 0, 0, 5, st]);
+        return Response::PgReply { session, map_epoch: epoch(), more: false, status: st, bytes };
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut rows: Vec<Vec<u8>> = Vec::new();
+    for (_, r) in mine.rows {
+        if seen.insert(r.clone()) {
+            rows.push(r);
+        }
+    }
+    let request = query_message(sql);
+    for info in served.map.shards().iter().filter(|i| i.id != served.shard_id) {
+        match peer_part(info.id, &s.database, &s.role, &request, Merge::Concat).await {
+            Ok(p) => {
+                if let Some((_, m)) = first_error(&p.tail) {
+                    let st = status_of(s);
+                    let mut bytes = message(b'E', &m);
+                    bytes.extend_from_slice(&[b'Z', 0, 0, 0, 5, st]);
+                    return Response::PgReply { session, map_epoch: epoch(), more: false, status: st, bytes };
+                }
+                for (_, r) in p.rows {
+                    if seen.insert(r.clone()) {
+                        rows.push(r);
+                    }
+                }
+            }
+            Err(e) => {
+                let st = status_of(s);
+                let msg = format!("the coordinator could not gather shard {}'s part: {e}", info.id);
+                return Response::PgReply { session, map_epoch: epoch(), more: false, status: st, bytes: error_reply("XX000", &msg, st) };
+            }
+        }
+    }
+    let mut bytes = Vec::new();
+    if let Some(f) = &mine.fields {
+        bytes.extend(message(b'T', f));
+    }
+    for r in &rows {
+        bytes.extend_from_slice(r);
+    }
+    let mut tag = format!("SELECT {}", rows.len()).into_bytes();
+    tag.push(0);
+    bytes.extend(message(b'C', &tag));
+    let st = status_of(s);
+    bytes.extend_from_slice(&[b'Z', 0, 0, 0, 5, st]);
+    Response::PgReply { session, map_epoch: epoch(), more: false, status: st, bytes }
 }
 
 /// The first ErrorResponse among `bytes`' messages: its tag and body.
