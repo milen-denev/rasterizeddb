@@ -554,9 +554,37 @@ columns run on the leader and replicate as values.
 
 ### 8.3 Unsharded tables
 
-They live on a **home shard** (shard 0 by default), with stubs elsewhere.
-Joining one with a sharded table waits for phase 4's gather. Reference tables,
-copied everywhere and written by 2PC, are phase 5.
+They live on a **home shard**: the gateway's `home_shard`, or the lowest
+shard id. Every other shard holds the table, created by the DDL fan-out, but
+none of its rows.
+
+A statement that names one beside a sharded table is **refused**
+(`0A000`, "needs a route key"). Routing it by the sharded table's key would
+reach a shard where the unsharded table is empty, so a join would come back
+short without an error. Phase 4's gather would answer such a statement; it is
+not built.
+
+**Reference tables** are the exception. A reference table is an unsharded
+table that every shard holds whole:
+
+```sql
+-- sent to every shard, as DDL is: rdb-shard ddl "SHARD REFERENCE TABLE countries"
+SHARD REFERENCE TABLE countries;
+SHARD UNREFERENCE TABLE countries;
+```
+
+- **Records.** Each shard keeps its own list, in `shard_reference_tables`
+  beside its state. Rows already in the table are not copied by the
+  statement; copy them to every shard first.
+- **Reads.** A reference table may be named with sharded tables. A keyed
+  statement joins it on whichever shard the key picks.
+- **Writes.** A write to a reference table goes to every shard. It is a
+  fan-out write, so it needs `SET rdb.unrouted_writes = each_shard` and runs
+  outside a transaction block, as other fan-out writes do. The reply carries
+  one shard's row count.
+- **No atomicity across shards.** The write is not atomic across shards: a
+  shard that fails leaves its copy behind, and the error says so. Writes
+  committed atomically by 2PC are still to come.
 
 ### 8.4 DDL: a cluster schema epoch
 

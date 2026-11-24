@@ -1,6 +1,20 @@
 # Sharding: implementation plan
 
-Status: **plan, nothing built.** Written 2026-11-23 against `dev` at
+Status (2026-11-24, branch `dev-sharding`): **B0 to B3 built, B5 in part,
+T1 to T9 in part. Not yet tested;** the tests are written after the whole
+plan.
+
+| Phase | State |
+|---|---|
+| B0–B1c | Built: `route_v1`, the shard map and its signing, ownership hooks on every stamping path, the gateway (rshard over rastcp/2 mTLS, virtual sessions, classification), fan-out with Concat, CountSum, Any, TopN and the aggregate, top-N and DISTINCT coordinator, and Redis routing by key |
+| B2 | Built: `rdb-shard` (init, show, move-tenant, rollback, retire, rebalance with `--apply`/`--every`, ddl, keygen, sign, exec, resolve), engine-fenced range moves, the offline balancer |
+| B3 | Built: our own Raft (`rasterizeddb_raft`), row-image capture, follower apply, `Op::Ddl`, leader-only serving |
+| B4 | **Not built:** online range moves, the gather for windows and joins, the LISTEN/NOTIFY hub, MySQL/TDS on gateways, reshape under the schema epoch. §4.8 is an outline to be replanned now that B3 has landed |
+| B5 | Built: 2PC (`sharding_2pc`), the anchor decision log, `resolve`, reference tables (sharding.md §8.3). **Not built:** decision-pausing marks; reference-table writes atomic by 2PC |
+| B6 | **Not built:** closed timestamps, follower and lease reads, distributed deadlock detection, clone splits. Outline only (§4.8) |
+| T1–T10 | Built: the policy hooks (GPL), strict tenancy in the licensed crates (T1–T7, T8 directory adoption, T9 outbound allowlist, T10). **Not built:** T8's separate tenants root; disk quotas |
+
+Written 2026-11-23 against `dev` at
 `219ea81f`; anchors are relative to `rasterizeddb_core/src/` unless a crate
 is named. The design is [sharding.md](sharding.md) (2026-10-17, at
 `952b3c4`). Its anchors and several of its premises are stale, and its refresh

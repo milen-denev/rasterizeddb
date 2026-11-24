@@ -1,9 +1,20 @@
 # Role system: plan
 
-Status: **plan, nothing built.** Written 2026-11-23 against local `dev` at
-`21a4cc83`. Anchors are relative to `rasterizeddb_core/src/` unless a crate
-is named. It lives on branch `wip/roles` in `.claude/worktrees/roles` until
-the owner decides to merge it. **No slice starts until the owner says so.**
+Status (2026-11-24, branch `dev-sharding`): **R0, R2 and R3 built; R1 and
+R4 in part. Not yet tested;** the tests are written after the whole plan.
+Written 2026-11-23 against local `dev` at `21a4cc83`. Anchors are relative to
+`rasterizeddb_core/src/` unless a crate is named.
+
+| Phase | State |
+|---|---|
+| R0 | Built (merged from `wip/roles`) |
+| R1 | Built: ownership of every object kind, the transaction-aware ACL cache, per-reference privileges, `SET ROLE`. **Not built:** the id-based role model and its migration (`roles_v2`); renames rewrite the ACL rows instead (`privileges::rename_role`) |
+| R2 | Built: every item in §9's list. Role attributes and `ALTER ROLE … SET` are ACL rows under `@attr`, so `rdb_roles` keeps its four columns and no catalogue is migrated. `ALTER ROLE … SET` takes only the three settings a session reads at its start |
+| R3 | Built: policies in `__rdb_policy`, with the RLS switches as ACL markers. The learned-statement path falls back to text while a policy applies |
+| R4 | Built: the client admin API (`Grant`, role attributes, `roles()`, `table_grants()`), `Migrator::grants`, Studio's Roles tab (attributes, memberships), the compatibility doc. **Not built:** Studio's grants matrix and default-privilege screens |
+
+Where the build differs from the plan below, the code and
+`postgres-compatibility.md` describe what was built.
 
 **Licence and build.** The whole role system is **GPL-3.0-only and
 standard**: always in the default build, with no licensed part. Its

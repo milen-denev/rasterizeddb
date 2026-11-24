@@ -1339,23 +1339,84 @@ Three properties are deliberate:
   does in PostgreSQL. A SCRAM verifier stores nothing an `md5` challenge can be
   answered from, so the two do not silently mix.
 
-Roles live in an ordinary table, `rdb_roles`, so they are queried, written and
-persisted by the same machinery as anything else. **The table is per database**:
-an account created in one database is not an account in another, and a database
-created by `CREATE DATABASE` is seeded with the bootstrap role so that it is
-reachable at all. There is no cluster-wide role catalogue and no `GRANT`; see
-*Databases* above. `CREATE USER`/`CREATE ROLE`,
-`ALTER ROLE … PASSWORD` and `DROP ROLE` are supported; `CREATE USER` implies
-`LOGIN` and `CREATE ROLE` does not, as in PostgreSQL. A bootstrap role is
-created only when the catalogue is empty, so a restart cannot resurrect a
-deleted account or reset a password — which also means `--pg-password` does
-nothing on an existing data directory.
+Roles live in an ordinary table, `rdb_roles`, which no client statement may
+read or write; it holds the password verifiers. Clients read roles through
+`pg_roles`, and a superuser can also use `pg_authid`, whose `rolpassword` is always
+NULL. **Roles are per database**: an account created in one database is not an
+account in another. `CREATE DATABASE` copies in only the creating role and the
+`OWNER` it names. A bootstrap role is created only when the catalogue is empty,
+so a restart cannot resurrect a deleted account or reset a password. This also
+means `--pg-password` does nothing on an existing data directory.
 
-**`is_superuser` is recorded but never checked.** It is parsed from `CREATE ROLE
-… SUPERUSER`, stored and read back, and no code path consults it: any role that
-can log in can create roles, drop tables and read `rdb_roles`. There is no
-`GRANT`/`REVOKE` and no per-table privilege. Nor is there a `pg_hba.conf`
-equivalent — one authentication method covers the whole listener.
+### Roles and privileges
+
+What follows is enforced for every role that is not a superuser, over pgwire,
+the native protocol, and the MySQL and SQL Server front ends.
+
+- **Roles:**
+  - `CREATE/ALTER/DROP ROLE|USER` with `LOGIN`, `SUPERUSER`, `CREATEDB`,
+    `CREATEROLE`, `BYPASSRLS`, `CONNECTION LIMIT` and `VALID UNTIL`;
+    `ALTER ROLE … RENAME TO`.
+  - `ALTER ROLE … SET|RESET` for `statement_timeout`, `lock_timeout` and
+    `rdb.shape_change`, the settings a session reads at its start. Other
+    parameters are refused.
+  - A role may change its own password. A `CREATEROLE` role manages roles that
+    are not superusers. Only a superuser gives `SUPERUSER` or `BYPASSRLS`.
+  - A password given in verifier form (`SCRAM-SHA-256$…`, `md5…`) is stored
+    as given, so `pg_dumpall --roles-only` output restores.
+  - Renaming a role clears an md5 password, as PostgreSQL does.
+- **Membership:**
+  - `GRANT role TO member [WITH ADMIN|INHERIT|SET {OPTION|TRUE|FALSE}]`,
+    `REVOKE [ADMIN|INHERIT|SET OPTION FOR] role FROM member`, and
+    `SET ROLE` / `RESET ROLE`.
+  - A role's privileges are those of the roles it inherits from.
+  - `SET ROLE` reaches the roles a chain of SET memberships leads to.
+  - `session_user` stays the login role.
+- **Ownership:**
+  - Every table, view, sequence, function, procedure, type, domain, index and
+    trigger has an owner, who alone alters or drops it.
+  - `ALTER … OWNER TO`, `REASSIGN OWNED BY`, and `DROP OWNED BY` are supported.
+    `DROP OWNED BY` revokes the role's grants, and refuses while the role
+    still owns objects, which is stricter than PostgreSQL.
+  - `DROP ROLE` is refused while the role owns anything.
+- **Privileges:**
+  - `GRANT/REVOKE … ON TABLE`, `ALL TABLES IN SCHEMA`, `SEQUENCE`, `FUNCTION`,
+    `PROCEDURE` and `ROUTINE`, with `WITH GRANT OPTION` and
+    `REVOKE … CASCADE`. A REVOKE that would leave dependent grants is
+    refused unless it says `CASCADE`.
+  - Column privileges (`GRANT SELECT (a, b) ON t`) are checked
+    conservatively. Any word naming a column of the table counts as a use
+    of it, and `*` needs the table-wide grant. An alias spelled like a
+    column can therefore refuse what PostgreSQL allows.
+  - `ALTER DEFAULT PRIVILEGES … ON TABLES|SEQUENCES|FUNCTIONS` applies to
+    each new object of its kind.
+  - A function runs with its caller's privileges, or its owner's when it
+    is `SECURITY DEFINER`. PUBLIC may execute a function until
+    `REVOKE EXECUTE … FROM PUBLIC`.
+  - Sequence calls are checked as in PostgreSQL. A SERIAL column's
+    sequence follows its table's privileges.
+  - A column default that calls `nextval` is not checked, which is laxer
+    than PostgreSQL.
+- **Row-level security:**
+  - `CREATE/ALTER/DROP POLICY` and `ALTER TABLE … ENABLE|DISABLE|FORCE|NO
+    FORCE ROW LEVEL SECURITY`, with PostgreSQL's combination rules.
+  - Predicates go in before the scan, so indexes still serve them.
+  - New rows are checked as stored, defaults filled.
+  - A write to an RLS table inside a CTE or `MERGE` is refused.
+- **Introspection:**
+  - `pg_roles`, `pg_authid`, `pg_auth_members`, `pg_class.relacl` and
+    `relrowsecurity`, `pg_policy` and `pg_default_acl`, so psql's `\du`,
+    `\dp`, `\z` and `\ddp` work.
+  - `information_schema.table_privileges`, `role_table_grants`,
+    `usage_privileges` and `routine_privileges` list every grant in the
+    database, not only the current role's.
+  - `has_table_privilege`, `has_sequence_privilege`,
+    `has_function_privilege`, `has_column_privilege` (answered at table
+    level), `has_database_privilege` and `pg_has_role`, with literal
+    arguments.
+
+There is no `pg_hba.conf` equivalent: one authentication method covers the
+whole listener.
 
 **TLS** uses rustls. With no certificate configured a self-signed one is
 generated at start-up, so an encrypted listener needs no preparation.
