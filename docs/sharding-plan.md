@@ -9,9 +9,9 @@ plan.
 | B0–B1c | Built: `route_v1`, the shard map and its signing, ownership hooks on every stamping path, the gateway (rshard over rastcp/2 mTLS, virtual sessions, classification), fan-out with Concat, CountSum, Any, TopN and the aggregate, top-N and DISTINCT coordinator, and Redis routing by key |
 | B2 | Built: `rdb-shard` (init, show, move-tenant, rollback, retire, rebalance with `--apply`/`--every`, ddl, keygen, sign, exec, resolve), engine-fenced range moves, the offline balancer |
 | B3 | Built: our own Raft (`rasterizeddb_raft`), row-image capture, follower apply, `Op::Ddl`, leader-only serving |
-| B4 | **Not built:** online range moves, the gather for windows and joins, the LISTEN/NOTIFY hub, MySQL/TDS on gateways, reshape under the schema epoch. §4.8 is an outline to be replanned now that B3 has landed |
-| B5 | Built: 2PC (`sharding_2pc`), the anchor decision log, `resolve`, reference tables (sharding.md §8.3). **Not built:** decision-pausing marks; reference-table writes atomic by 2PC |
-| B6 | **Not built:** closed timestamps, follower and lease reads, distributed deadlock detection, clone splits. Outline only (§4.8) |
+| B4 | Built (2026-11-25): B4.1 follower reads (forwarded ReadIndex), B4.2 deadlock detection across shards, B4.3 the LISTEN/NOTIFY hub, B4.4 online moves (`rdb-shard --online`, by converging rounds; not yet from the Raft log). **Not built:** B4.5 the gather for windows and joins, B4.6 reshape under the schema epoch, B4.7 MySQL/TDS on gateways, B4.8 tenant-predicate propagation. See §4.8 |
+| B5 | Built: 2PC (`sharding_2pc`), the anchor decision log, `resolve`, reference tables (sharding.md §8.3), B5.1 reference writes atomic under two-phase. **Not built:** B5.2 decision-pausing marks |
+| B6 | Built: B6.3 online automatic rebalancing (`rebalance --apply --online --every`). Follower reads and deadlock detection moved into B4. **Not built:** B6.1 closed timestamps and consistent cross-shard snapshots, B6.2 clone splits, lease reads |
 | T1–T10 | Built: the policy hooks (GPL), strict tenancy in the licensed crates (T1–T7, T8 directory adoption, T9 outbound allowlist, T10). **Not built:** T8's separate tenants root; disk quotas |
 
 Written 2026-11-23 against `dev` at
