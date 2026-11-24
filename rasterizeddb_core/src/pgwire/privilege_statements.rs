@@ -138,6 +138,98 @@ async fn role_exists(database: &Arc<Database>, name: &str, tx: Option<TxId>) -> 
     name == "public" || crate::auth::lookup_role_in(database, name, tx).await.is_some()
 }
 
+/// `CREATE/ALTER/DROP POLICY` and `ALTER TABLE … ROW LEVEL SECURITY`
+/// (R3): the table's owner's, or a superuser's.
+pub(super) async fn handle_policy_statement<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    parsed: Result<crate::core::rql::policies::PolicyStatement, crate::core::rql::policies::Refusal>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use crate::core::rql::policies::{self, PolicyStatement};
+    let statement = match parsed {
+        Ok(statement) => statement,
+        Err((code, message)) => return fail_statement(state, stream, code, &message).await,
+    };
+    let tx = state.current_tx();
+    let table = match &statement {
+        PolicyStatement::Create(p) => p.table.clone(),
+        PolicyStatement::Alter { table, .. } | PolicyStatement::Drop { table, .. } | PolicyStatement::Toggle { table, .. } => table.clone(),
+    };
+    if !relation_exists(database, &table, tx).await || crate::core::rql::views::lookup(database, &table, tx).await.ok().flatten().is_some() {
+        return fail_statement(state, stream, "42P01", &format!("relation \"{table}\" does not exist or is not a table")).await;
+    }
+    if !state.principal.may_administer() {
+        let owns = privileges::load_shared(database, tx).await.is_ok_and(|rows| privileges::owns(&rows, &state.principal.name, &table));
+        if !owns {
+            return fail_statement(state, stream, "42501", &format!("must be owner of table {table}")).await;
+        }
+    }
+    let existing = match policies::load(database, Some(&table), tx).await {
+        Ok(p) => p,
+        Err(e) => return fail_statement(state, stream, "XX000", &e).await,
+    };
+    let result: Result<&'static str, String> = async {
+        match statement {
+            PolicyStatement::Create(policy) => {
+                if existing.iter().any(|p| p.name == policy.name) {
+                    return Err(format!("policy \"{}\" for table \"{table}\" already exists", policy.name));
+                }
+                for role in policy.roles.iter().filter(|r| *r != "public") {
+                    if !role_exists(database, role, tx).await {
+                        return Err(format!("role \"{role}\" does not exist"));
+                    }
+                }
+                policies::store(database, &policy, tx).await?;
+                Ok("CREATE POLICY")
+            }
+            PolicyStatement::Alter { name, rename, roles, using, check, .. } => {
+                let Some(mut policy) = existing.iter().find(|p| p.name == name).cloned() else {
+                    return Err(format!("policy \"{name}\" for table \"{table}\" does not exist"));
+                };
+                if let Some(roles) = roles {
+                    policy.roles = roles;
+                }
+                if using.is_some() {
+                    policy.using = using;
+                }
+                if check.is_some() {
+                    policy.check = check;
+                }
+                if let Some(new) = rename {
+                    if existing.iter().any(|p| p.name == new) {
+                        return Err(format!("policy \"{new}\" for table \"{table}\" already exists"));
+                    }
+                    policies::remove(database, &table, Some(&name), tx).await?;
+                    policy.name = new;
+                }
+                policies::store(database, &policy, tx).await?;
+                Ok("ALTER POLICY")
+            }
+            PolicyStatement::Drop { name, if_exists, .. } => {
+                if !existing.iter().any(|p| p.name == name) {
+                    return if if_exists { Ok("DROP POLICY") } else { Err(format!("policy \"{name}\" for table \"{table}\" does not exist")) };
+                }
+                policies::remove(database, &table, Some(&name), tx).await?;
+                Ok("DROP POLICY")
+            }
+            PolicyStatement::Toggle { marker, on, .. } => {
+                let me = state.principal.name.clone();
+                set_companion(database, &table, "-", marker, on, &me, tx).await.map_err(|(_, e)| e)?;
+                Ok("ALTER TABLE")
+            }
+        }
+    }
+    .await;
+    match result {
+        Ok(tag) => send_command_complete(stream, tag).await,
+        Err(e) => fail_statement(state, stream, sqlstate_for(&e), &e).await,
+    }
+}
+
 pub(super) async fn handle_privilege_statement<S>(
     database: &Arc<Database>,
     state: &mut SessionState,

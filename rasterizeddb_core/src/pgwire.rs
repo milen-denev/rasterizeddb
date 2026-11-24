@@ -7729,6 +7729,23 @@ where
     // which answers it.
     let step = match step {
         WatchStep::Run(_) if privilege_statements::check(database, state, query).await.is_some() => WatchStep::Text,
+        // Row-level security (R3) puts its predicates in on the text path
+        // too: a parse learned without them would read every row.
+        WatchStep::Run(_)
+            if !state.principal.may_administer()
+                && !matches!(
+                    crate::core::rql::policies::context(
+                        database,
+                        query,
+                        &crate::core::rql::policies::Actor { role: &state.principal.name, superuser: false },
+                        state.current_tx(),
+                    )
+                    .await,
+                    Ok(None)
+                ) =>
+        {
+            WatchStep::Text
+        }
         other => other,
     };
 
@@ -8624,6 +8641,17 @@ where
             }
         }
     }
+    // Its row-level security policies too (R3).
+    if database.has_table(crate::core::rql::policies::POLICY_TABLE)
+        && let crate::core::rql::views::TableDdl::Drop { names, .. } = &ddl
+    {
+        for name in names {
+            if let Err(e) = crate::core::rql::policies::remove(database, name, None, state.current_tx()).await {
+                fail_statement(state, stream, sqlstate_for(&e), &e).await?;
+                return Ok(true);
+            }
+        }
+    }
     if database.has_table(crate::core::rql::triggers::TRIGGER_TABLE)
         && let crate::core::rql::views::TableDdl::Drop { names, .. } = &ddl
     {
@@ -8854,6 +8882,13 @@ where
     // `pg_dump` writes after each: the privilege statement they are, before
     // the view and sequence statements, which read only their own `ALTER`
     // forms and refused these ("ALTER VIEW supports only RENAME TO here").
+    // Row-level security (R3): policies, and switching it on a table.
+    if (crate::core::sql_scan::contains_ignore_ascii_case(stmt, b"POLICY")
+        || crate::core::sql_scan::contains_ignore_ascii_case(stmt, b"ROW LEVEL SECURITY"))
+        && let Some(parsed) = crate::core::rql::policies::parse_policy_statement(stmt)
+    {
+        return privilege_statements::handle_policy_statement(database, state, stream, parsed).await;
+    }
     if crate::core::sql_scan::contains_ignore_ascii_case(stmt, b" OWNER TO ")
         && {
             let head: Vec<String> = stmt.split_whitespace().take(3).map(str::to_ascii_uppercase).collect();
@@ -9054,6 +9089,55 @@ where
             None => stmt,
         }
     };
+    // Row-level security (R3): the policies of the tables it names, as
+    // predicates before the scan; new rows checked as they are stored, a
+    // row at a time.
+    let rls_text;
+    let mut rls_check: Option<(String, String)> = None;
+    let stmt = if sequence_role.is_some() {
+        let role = state.principal.name.clone();
+        let actor = crate::core::rql::policies::Actor { role: &role, superuser: false };
+        let substitute = |pred: &str| -> String {
+            let probe = format!("SELECT {pred}");
+            match session_rewrite(state, &probe, None) {
+                Ok(Some(text)) => text.strip_prefix("SELECT ").map(str::to_string).unwrap_or(text),
+                _ => pred.to_string(),
+            }
+        };
+        let context = match crate::core::rql::policies::context(database, stmt, &actor, state.current_tx()).await {
+            Ok(context) => context,
+            Err((code, message)) => return fail_statement(state, stream, code, &message).await,
+        };
+        let applied = match &context {
+            Some(context) => crate::core::rql::policies::rewrite(context, stmt, &actor, &substitute),
+            None => Ok(crate::core::rql::policies::Applied { text: None, check: None }),
+        };
+        match applied {
+            Ok(applied) => {
+                rls_check = applied.check;
+                match applied.text {
+                    Some(text) => {
+                        crate::core::rql::prepared::note_rewritten();
+                        rls_text = text;
+                        rls_text.as_str()
+                    }
+                    None => stmt,
+                }
+            }
+            Err((code, message)) => return fail_statement(state, stream, code, &message).await,
+        }
+    } else {
+        stmt
+    };
+    if let Some((table, check)) = rls_check {
+        let event = if stmt.trim_start().get(..6).is_some_and(|h| h.eq_ignore_ascii_case("INSERT")) {
+            crate::core::rql::triggers::Event::Insert
+        } else {
+            crate::core::rql::triggers::Event::Update
+        };
+        return trigger_exec::run_triggered_write_checked(database, state, stream, stmt, event, &table, result_formats, omit_description, Some(check))
+            .await;
+    }
     // A write to a table with triggers runs a row at a time
     // (`trigger_exec`).
     if let Some((event, table)) = trigger_exec::triggered_write(database, state, stmt).await {

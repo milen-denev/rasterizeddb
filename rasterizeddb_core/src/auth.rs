@@ -1156,6 +1156,8 @@ pub struct RoleAttrs {
     pub conn_limit: Option<i64>,
     /// `Some(None)` is `VALID UNTIL 'infinity'`.
     pub valid_until: Option<Option<String>>,
+    /// BYPASSRLS: row-level security policies do not hold it (R3).
+    pub bypass_rls: Option<bool>,
 }
 
 impl RoleStatement {
@@ -1353,7 +1355,9 @@ fn role_options(tokens: &[RoleTok]) -> Result<RoleOptions, String> {
             "NOCREATEUSER" => options.superuser = Some(false),
             "CREATEROLE" => options.attrs.create_role = Some(true),
             "NOCREATEROLE" => options.attrs.create_role = Some(false),
-            "INHERIT" | "NOINHERIT" | "REPLICATION" | "NOREPLICATION" | "BYPASSRLS" | "NOBYPASSRLS" => {}
+            "BYPASSRLS" => options.attrs.bypass_rls = Some(true),
+            "NOBYPASSRLS" => options.attrs.bypass_rls = Some(false),
+            "INHERIT" | "NOINHERIT" | "REPLICATION" | "NOREPLICATION" => {}
             "CONNECTION" => {
                 let Some(RoleTok::Number(n)) = tokens.get(at + 1).filter(|_| is_word(tokens.get(at), "LIMIT")) else {
                     return Err("CONNECTION LIMIT takes a number".to_string());
@@ -1501,6 +1505,7 @@ async fn write_role_attrs(
     for (attr, value) in [
         ("CREATEDB", flag(attrs.create_db)),
         ("CREATEROLE", flag(attrs.create_role)),
+        ("BYPASSRLS", flag(attrs.bypass_rls)),
         ("CONNECTION LIMIT", limit),
         ("VALID UNTIL", attrs.valid_until.clone()),
     ] {
@@ -1564,15 +1569,21 @@ pub async fn role_statement_permitted(
         return denied();
     }
     let target = match statement {
-        RoleStatement::Create { name, is_superuser, .. } => {
+        RoleStatement::Create { name, is_superuser, attrs, .. } => {
             if *is_superuser {
                 return Err("permission denied: only a superuser can create a superuser".to_string());
             }
+            if attrs.bypass_rls.is_some() {
+                return Err("permission denied: only a superuser can give BYPASSRLS".to_string());
+            }
             name
         }
-        RoleStatement::Alter { name, superuser, .. } => {
+        RoleStatement::Alter { name, superuser, attrs, .. } => {
             if superuser.is_some() {
                 return Err("permission denied: only a superuser can change SUPERUSER".to_string());
+            }
+            if attrs.bypass_rls.is_some() {
+                return Err("permission denied: only a superuser can change BYPASSRLS".to_string());
             }
             name
         }

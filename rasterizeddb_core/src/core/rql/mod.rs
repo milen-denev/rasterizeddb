@@ -95,6 +95,7 @@ pub mod sequence_catalog;
 pub mod functions;
 pub mod triggers;
 pub mod merge;
+pub mod policies;
 pub mod privileges;
 
 #[cfg(test)]

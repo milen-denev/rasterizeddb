@@ -464,6 +464,8 @@ pub(crate) struct Rel {
     /// `pg_class.relacl` as aclitem text (`alice=arw/owner`); empty, listed
     /// as NULL, while the relation has its owner's default rights only.
     pub acl: Vec<String>,
+    /// Row-level security on, and forced on its owner (R3).
+    pub rls: (bool, bool),
 }
 
 /// A role, as `pg_roles` lists it.
@@ -480,6 +482,7 @@ pub(crate) struct RoleRow {
     pub valid_until_us: Option<i64>,
     /// `ALTER ROLE … SET` values, `param=value`.
     pub config: Vec<String>,
+    pub bypass_rls: bool,
 }
 
 /// One privilege one role holds on one object.
@@ -579,6 +582,8 @@ fn default_acls(acl: &[crate::core::rql::privileges::AclRow], roles: &[RoleRow])
 /// Where `pg_auth_members` row oids start: above the fixed catalogue oids,
 /// below the hashed oids of user objects' usual range.
 const AUTH_MEMBERS_OID_BASE: i64 = 60_000;
+/// Where `pg_policy` row oids start.
+const POLICY_OID_BASE: i64 = 64_000;
 /// Where `pg_default_acl` row oids start.
 const DEFAULT_ACL_OID_BASE: i64 = 62_000;
 
@@ -633,6 +638,8 @@ pub(crate) struct Model {
     /// Every privilege held on a table, view, sequence or routine, the
     /// owners' own included: the `information_schema` privilege views.
     pub grants: Vec<GrantRow>,
+    /// Row-level security policies, as `pg_policy` lists them.
+    pub policies: Vec<crate::core::rql::policies::Policy>,
     /// Default privileges, as `pg_default_acl` lists them: (owner oid,
     /// object type letter, aclitems).
     pub default_acls: Vec<(i64, &'static str, Vec<String>)>,
@@ -1254,6 +1261,7 @@ pub(crate) async fn build_model(
         };
         rels.push(Rel {
             acl: Vec::new(),
+            rls: (false, false),
             oid: oid_of(name),
             name: name.to_string(),
             kind: if materialized.contains(&name) {
@@ -1335,6 +1343,7 @@ pub(crate) async fn build_model(
             .collect();
         rels.push(Rel {
             acl: Vec::new(),
+            rls: (false, false),
             oid: oid_of(&view.name),
             name: view.name.clone(),
             kind: "v",
@@ -1356,6 +1365,7 @@ pub(crate) async fn build_model(
             partition_key: Vec::new(),
             options: Vec::new(),
             acl: Vec::new(),
+            rls: (false, false),
             owner: owner(name),
             columns: Vec::new(),
             indexes: Vec::new(),
@@ -1365,6 +1375,9 @@ pub(crate) async fn build_model(
         });
     }
     let procs = procs(database, tx).await;
+    // Boxed: inline, the model future grew past what the Send check of a
+    // caller that spawns it can follow.
+    let policies = Box::pin(crate::core::rql::policies::load(database, None, tx)).await.unwrap_or_default();
     let enums = crate::core::rql::user_types::load(database, None, tx).await.unwrap_or_default();
     // Grouped once, so each relation reads its own rows and not the whole
     // ACL (`aclitems` needs only those: the owner's row has the same key).
@@ -1375,12 +1388,13 @@ pub(crate) async fn build_model(
     for rel in &mut rels {
         if let Some(rows) = by_relation.get(rel.name.as_str()) {
             rel.acl = aclitems(rows, &rel.name);
+            rel.rls = crate::core::rql::policies::rls_state(rows, &rel.name);
         }
     }
     let memberships = memberships(&acl, &roles);
     let grants = grants(&acl, &rels);
     let default_acls = default_acls(&acl, &roles);
-    Model { database: database.name.clone(), rels, roles, memberships, grants, default_acls, procs, enums }
+    Model { database: database.name.clone(), rels, roles, memberships, grants, default_acls, policies, procs, enums }
 }
 
 /// PostgreSQL's letter for a privilege in an aclitem.
@@ -1512,6 +1526,7 @@ async fn roles(database: &Arc<Database>, acl: &[crate::core::rql::privileges::Ac
                         conn_limit: -1,
                         valid_until_us: None,
                         config: Vec::new(),
+                        bypass_rls: false,
                     });
                 }
             }
@@ -1531,6 +1546,7 @@ async fn roles(database: &Arc<Database>, acl: &[crate::core::rql::privileges::Ac
                 conn_limit: -1,
                 valid_until_us: None,
                 config: Vec::new(),
+                bypass_rls: true,
             },
         ),
     }
@@ -1540,6 +1556,7 @@ async fn roles(database: &Arc<Database>, acl: &[crate::core::rql::privileges::Ac
         match a.privilege.as_str() {
             "CREATEDB" => r.create_db = true,
             "CREATEROLE" => r.create_role = true,
+            "BYPASSRLS" => r.bypass_rls = true,
             "CONNECTION LIMIT" => r.conn_limit = a.grantor.parse().unwrap_or(-1),
             "VALID UNTIL" => r.valid_until_us = a.grantor.parse().ok(),
             p => {
@@ -2595,7 +2612,7 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                     V::I(r.conn_limit),
                     t("********"),
                     r.valid_until_us.map_or(V::N, |us| t(crate::core::value_codec::format_timestamp_us(us))),
-                    V::B(r.superuser),
+                    V::B(r.superuser || r.bypass_rls),
                     if r.config.is_empty() { V::N } else { V::TA(r.config.clone()) },
                     V::I(r.oid),
                 ]
@@ -2614,7 +2631,7 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                     V::B(r.superuser || r.create_db),
                     V::B(r.login),
                     V::B(r.superuser),
-                    V::B(r.superuser),
+                    V::B(r.superuser || r.bypass_rls),
                     V::I(r.conn_limit),
                     V::N,
                     r.valid_until_us.map_or(V::N, |us| t(crate::core::value_codec::format_timestamp_us(us))),
@@ -2731,8 +2748,8 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                     V::B(false),
                     V::B(false),
                     V::B(false),
-                    V::B(false),
-                    V::B(false),
+                    V::B(rel.rls.0),
+                    V::B(rel.rls.1),
                     V::B(true),
                     t(if matches!(rel.kind, "r" | "p") { "d" } else { "n" }),
                     V::B(false),
@@ -2843,8 +2860,34 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
         // extended statistics, publications, rewrite rules, dependencies or
         // extensions. Present so a query that joins them gets its answer
         // rather than an error.
+        // `polroles` as PostgreSQL prints the array of role oids, here
+        // the names (`{public}` for PUBLIC); `polcmd` its letter.
+        "pg_policy" => model
+            .policies
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let relid = model.rels.iter().find(|r| r.name == p.table).map_or(0, |r| r.oid);
+                let cmd = match p.command.as_str() {
+                    "SELECT" => "r",
+                    "INSERT" => "a",
+                    "UPDATE" => "w",
+                    "DELETE" => "d",
+                    _ => "*",
+                };
+                vec![
+                    V::I(POLICY_OID_BASE + i as i64),
+                    t(&p.name),
+                    V::I(relid),
+                    t(cmd),
+                    V::B(p.permissive),
+                    t(format!("{{{}}}", p.roles.join(","))),
+                    p.using.as_ref().map_or(V::N, t),
+                    p.check.as_ref().map_or(V::N, t),
+                ]
+            })
+            .collect(),
         "pg_description"
-        | "pg_policy"
         | "pg_statistic_ext"
         | "pg_publication"
         | "pg_publication_rel"
