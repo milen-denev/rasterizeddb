@@ -78,6 +78,10 @@ const VIEWS: &[&str] = &[
     "table_constraints",
     "key_column_usage",
     "referential_constraints",
+    "table_privileges",
+    "role_table_grants",
+    "usage_privileges",
+    "routine_privileges",
 ];
 
 /// The relations built from [`crate::core::rql::catalog_model::Model`].
@@ -342,7 +346,7 @@ const SCHEMA: &str = "public";
 /// COLUMNS FROM "rdb_roles"` became `SHOW __cat_columns_… FROM "rdb_roles"`,
 /// which returned one empty column and left every client that asks a table for
 /// its columns believing it had none.
-const QUALIFIED_ONLY: [&str; 7] = [
+const QUALIFIED_ONLY: [&str; 11] = [
     "columns",
     "tables",
     "views",
@@ -350,6 +354,10 @@ const QUALIFIED_ONLY: [&str; 7] = [
     "table_constraints",
     "key_column_usage",
     "referential_constraints",
+    "table_privileges",
+    "role_table_grants",
+    "usage_privileges",
+    "routine_privileges",
 ];
 
 /// Whether `view` may only be matched with its schema in front of it.

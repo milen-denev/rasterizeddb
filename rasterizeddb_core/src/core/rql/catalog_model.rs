@@ -461,6 +461,9 @@ pub(crate) struct Rel {
     /// compresses its row tails (`core::compression`); empty otherwise, which
     /// is listed as NULL, as PostgreSQL lists a table with no options.
     pub options: Vec<String>,
+    /// `pg_class.relacl` as aclitem text (`alice=arw/owner`); empty, listed
+    /// as NULL, while the relation has its owner's default rights only.
+    pub acl: Vec<String>,
 }
 
 /// A role, as `pg_roles` lists it.
@@ -477,6 +480,64 @@ pub(crate) struct RoleRow {
     pub valid_until_us: Option<i64>,
     /// `ALTER ROLE … SET` values, `param=value`.
     pub config: Vec<String>,
+}
+
+/// One privilege one role holds on one object.
+#[derive(Debug, Clone)]
+pub(crate) struct GrantRow {
+    pub grantor: String,
+    pub grantee: String,
+    pub object: String,
+    /// `TABLE`, `SEQUENCE`, `FUNCTION` or `PROCEDURE`.
+    pub kind: &'static str,
+    pub privilege: String,
+    pub grantable: bool,
+}
+
+/// The grants on the relations `rels` lists and on routines, with each
+/// owner's own privileges first (held with their grant option, as an
+/// owner's are).
+fn grants(acl: &[crate::core::rql::privileges::AclRow], rels: &[Rel]) -> Vec<GrantRow> {
+    use crate::core::rql::privileges::{ROUTINE_PRIVILEGES, SEQUENCE_PRIVILEGES, TABLE_PRIVILEGES};
+    let kind_of = |object: &str| -> Option<(&'static str, &'static [&'static str], String)> {
+        if let Some(name) = object.strip_prefix("@function:") {
+            return Some(("FUNCTION", ROUTINE_PRIVILEGES, name.to_string()));
+        }
+        if let Some(name) = object.strip_prefix("@procedure:") {
+            return Some(("PROCEDURE", ROUTINE_PRIVILEGES, name.to_string()));
+        }
+        let rel = rels.iter().find(|r| r.name == object)?;
+        Some(if rel.kind == "S" { ("SEQUENCE", SEQUENCE_PRIVILEGES, rel.name.clone()) } else { ("TABLE", TABLE_PRIVILEGES, rel.name.clone()) })
+    };
+    let mut out = Vec::new();
+    for owner in acl.iter().filter(|a| a.privilege == "OWNER") {
+        let Some((kind, all, object)) = kind_of(&owner.relation) else { continue };
+        for p in all {
+            out.push(GrantRow {
+                grantor: owner.grantee.clone(),
+                grantee: owner.grantee.clone(),
+                object: object.clone(),
+                kind,
+                privilege: p.to_string(),
+                grantable: true,
+            });
+        }
+    }
+    for a in acl.iter().filter(|a| a.privilege != "OWNER" && acl_letter(&a.privilege).is_some()) {
+        let Some((kind, all, object)) = kind_of(&a.relation) else { continue };
+        if !all.contains(&a.privilege.as_str()) {
+            continue;
+        }
+        out.push(GrantRow {
+            grantor: a.grantor.clone(),
+            grantee: if a.grantee == "public" { "PUBLIC".to_string() } else { a.grantee.clone() },
+            object,
+            kind,
+            privilege: a.privilege.clone(),
+            grantable: a.grantable,
+        });
+    }
+    out
 }
 
 /// Where `pg_auth_members` row oids start: above the fixed catalogue oids,
@@ -531,6 +592,9 @@ pub(crate) struct Model {
     pub roles: Vec<RoleRow>,
     /// Role memberships, as `pg_auth_members` lists them.
     pub memberships: Vec<MemberRow>,
+    /// Every privilege held on a table, view, sequence or routine, the
+    /// owners' own included: the `information_schema` privilege views.
+    pub grants: Vec<GrantRow>,
     pub procs: Vec<ProcRow>,
     /// The enum types (`user_types`).
     pub enums: Vec<crate::core::rql::user_types::EnumType>,
@@ -1148,6 +1212,7 @@ pub(crate) async fn build_model(
             Relation::Plain(_) => Vec::new(),
         };
         rels.push(Rel {
+            acl: Vec::new(),
             oid: oid_of(name),
             name: name.to_string(),
             kind: if materialized.contains(&name) {
@@ -1228,6 +1293,7 @@ pub(crate) async fn build_model(
             })
             .collect();
         rels.push(Rel {
+            acl: Vec::new(),
             oid: oid_of(&view.name),
             name: view.name.clone(),
             kind: "v",
@@ -1248,6 +1314,7 @@ pub(crate) async fn build_model(
             kind: "S",
             partition_key: Vec::new(),
             options: Vec::new(),
+            acl: Vec::new(),
             owner: owner(name),
             columns: Vec::new(),
             indexes: Vec::new(),
@@ -1258,8 +1325,83 @@ pub(crate) async fn build_model(
     }
     let procs = procs(database, tx).await;
     let enums = crate::core::rql::user_types::load(database, None, tx).await.unwrap_or_default();
+    // Grouped once, so each relation reads its own rows and not the whole
+    // ACL (`aclitems` needs only those: the owner's row has the same key).
+    let mut by_relation: HashMap<&str, Vec<crate::core::rql::privileges::AclRow>> = HashMap::new();
+    for a in &acl {
+        by_relation.entry(a.relation.as_str()).or_default().push(a.clone());
+    }
+    for rel in &mut rels {
+        if let Some(rows) = by_relation.get(rel.name.as_str()) {
+            rel.acl = aclitems(rows, &rel.name);
+        }
+    }
     let memberships = memberships(&acl, &roles);
-    Model { database: database.name.clone(), rels, roles, memberships, procs, enums }
+    let grants = grants(&acl, &rels);
+    Model { database: database.name.clone(), rels, roles, memberships, grants, procs, enums }
+}
+
+/// PostgreSQL's letter for a privilege in an aclitem.
+fn acl_letter(privilege: &str) -> Option<char> {
+    Some(match privilege {
+        "SELECT" => 'r',
+        "INSERT" => 'a',
+        "UPDATE" => 'w',
+        "DELETE" => 'd',
+        "TRUNCATE" => 'D',
+        "REFERENCES" => 'x',
+        "TRIGGER" => 't',
+        "MAINTAIN" => 'm',
+        "EXECUTE" => 'X',
+        "USAGE" => 'U',
+        "CREATE" => 'C',
+        "CONNECT" => 'c',
+        "TEMPORARY" | "TEMP" => 'T',
+        _ => return None,
+    })
+}
+
+/// The aclitems of the object kept under `key`, as PostgreSQL prints them
+/// (`grantee=privs/grantor`, `*` after a privilege held with its grant
+/// option, an empty grantee for PUBLIC), the owner's own item first. Empty
+/// while no one but the owner holds anything, which is NULL there too.
+pub(crate) fn aclitems(acl: &[crate::core::rql::privileges::AclRow], key: &str) -> Vec<String> {
+    let grants: Vec<&crate::core::rql::privileges::AclRow> =
+        acl.iter().filter(|a| a.relation == key && acl_letter(&a.privilege).is_some()).collect();
+    if grants.is_empty() {
+        return Vec::new();
+    }
+    let owner = crate::core::rql::privileges::owner_of(acl, key).unwrap_or("postgres");
+    let mut out = vec![format!("{}=arwdDxtm/{}", acl_name(owner), acl_name(owner))];
+    let mut groups: Vec<((&str, &str), String)> = Vec::new();
+    for g in grants {
+        let who = (g.grantee.as_str(), g.grantor.as_str());
+        let letters = match groups.iter_mut().find(|(k, _)| *k == who) {
+            Some((_, letters)) => letters,
+            None => {
+                groups.push((who, String::new()));
+                &mut groups.last_mut().expect("pushed just above").1
+            }
+        };
+        letters.push(acl_letter(&g.privilege).expect("filtered above"));
+        if g.grantable {
+            letters.push('*');
+        }
+    }
+    for ((grantee, grantor), letters) in groups {
+        let grantee = if grantee == "public" { String::new() } else { acl_name(grantee) };
+        out.push(format!("{grantee}={letters}/{}", acl_name(grantor)));
+    }
+    out
+}
+
+/// A role name inside an aclitem: double-quoted unless plain.
+fn acl_name(name: &str) -> String {
+    if name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') && !name.is_empty() {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
 }
 
 /// The memberships the ACL holds, between roles that exist.
@@ -1594,6 +1736,10 @@ pub(crate) const NEW_VIEWS: &[&str] = &[
     // `information_schema`'s constraint views, built from `pg_constraint`'s
     // rows: what an ORM's schema reader joins to find the keys.
     "table_constraints",
+    "table_privileges",
+    "role_table_grants",
+    "usage_privileges",
+    "routine_privileges",
     "key_column_usage",
     "referential_constraints",
 ];
@@ -1694,6 +1840,38 @@ pub(crate) fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]
             ("adrelid", I64),
             ("adnum", I16),
             ("adbin", STRING),
+        ],
+        "table_privileges" | "role_table_grants" => &[
+            ("grantor", STRING),
+            ("grantee", STRING),
+            ("table_catalog", STRING),
+            ("table_schema", STRING),
+            ("table_name", STRING),
+            ("privilege_type", STRING),
+            ("is_grantable", STRING),
+            ("with_hierarchy", STRING),
+        ],
+        "usage_privileges" => &[
+            ("grantor", STRING),
+            ("grantee", STRING),
+            ("object_catalog", STRING),
+            ("object_schema", STRING),
+            ("object_name", STRING),
+            ("object_type", STRING),
+            ("privilege_type", STRING),
+            ("is_grantable", STRING),
+        ],
+        "routine_privileges" => &[
+            ("grantor", STRING),
+            ("grantee", STRING),
+            ("specific_catalog", STRING),
+            ("specific_schema", STRING),
+            ("specific_name", STRING),
+            ("routine_catalog", STRING),
+            ("routine_schema", STRING),
+            ("routine_name", STRING),
+            ("privilege_type", STRING),
+            ("is_grantable", STRING),
         ],
         "table_constraints" => &[
             ("constraint_catalog", STRING),
@@ -2134,6 +2312,61 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                 })
             })
             .collect(),
+        "table_privileges" | "role_table_grants" => model
+            .grants
+            .iter()
+            .filter(|g| g.kind == "TABLE")
+            .map(|g| {
+                vec![
+                    t(&g.grantor),
+                    t(&g.grantee),
+                    t(&model.database),
+                    t("public"),
+                    t(&g.object),
+                    t(&g.privilege),
+                    t(if g.grantable { "YES" } else { "NO" }),
+                    t(if g.privilege == "SELECT" { "YES" } else { "NO" }),
+                ]
+            })
+            .collect(),
+        // USAGE on sequences, as PostgreSQL lists it there; their SELECT
+        // and UPDATE are in no information_schema view.
+        "usage_privileges" => model
+            .grants
+            .iter()
+            .filter(|g| g.kind == "SEQUENCE" && g.privilege == "USAGE")
+            .map(|g| {
+                vec![
+                    t(&g.grantor),
+                    t(&g.grantee),
+                    t(&model.database),
+                    t("public"),
+                    t(&g.object),
+                    t("SEQUENCE"),
+                    t("USAGE"),
+                    t(if g.grantable { "YES" } else { "NO" }),
+                ]
+            })
+            .collect(),
+        "routine_privileges" => model
+            .grants
+            .iter()
+            .filter(|g| matches!(g.kind, "FUNCTION" | "PROCEDURE"))
+            .map(|g| {
+                vec![
+                    t(&g.grantor),
+                    t(&g.grantee),
+                    t(&model.database),
+                    t("public"),
+                    t(&g.object),
+                    t(&model.database),
+                    t("public"),
+                    t(&g.object),
+                    t("EXECUTE"),
+                    t(if g.grantable { "YES" } else { "NO" }),
+                ]
+            })
+            .collect(),
         "table_constraints" => {
             let mut rows = Vec::new();
             for rel in model.rels.iter().filter(|r| matches!(r.kind, "r" | "p")) {
@@ -2407,7 +2640,7 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                     V::B(true),
                     t(if matches!(rel.kind, "r" | "p") { "d" } else { "n" }),
                     V::B(false),
-                    V::N,
+                    if rel.acl.is_empty() { V::N } else { V::TA(rel.acl.clone()) },
                     if rel.options.is_empty() { V::N } else { V::TA(rel.options.clone()) },
                     V::N,
                 ]);
