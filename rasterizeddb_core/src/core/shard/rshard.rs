@@ -175,7 +175,7 @@ async fn handle(conn: &Conn, data: &[u8]) -> Response {
                 schema_epoch: SCHEMA_EPOCH.load(Ordering::Acquire),
             }
         }
-        Request::MapFetch => Response::MapBytes { signature: None, map: served.map.to_binary() },
+        Request::MapFetch => Response::MapBytes { signature: served.signature.clone(), map: served.map.to_binary() },
         Request::AuthFetch { database, role } => auth_fetch(conn, &database, &role).await,
         Request::Classify { database, source, text, .. } => {
             let Some(guard) = conn.catalog.connect(&database) else {

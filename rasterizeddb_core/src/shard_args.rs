@@ -40,6 +40,11 @@ pub struct ShardArgs {
     #[arg(long = "gateway-ca", value_name = "PEM")]
     pub gateway_ca: Option<String>,
 
+    /// The authority's Ed25519 public key (64 hex digits): maps must carry
+    /// its signature (`<map>.sig`, `SHARD MAP INSTALL … SIGNATURE`).
+    #[arg(long = "authority-key", value_name = "HEX")]
+    pub authority_key: Option<String>,
+
     /// A gateway certificate's SHA-256 fingerprint; repeatable.
     #[arg(long = "gateway-pin", value_name = "SHA256")]
     pub gateway_pin: Vec<String>,
@@ -82,11 +87,18 @@ impl ShardArgs {
                     .map_err(|_| format!("--cluster-id {h}: not a hex cluster id"))?,
             ),
         };
+        let authority_key = self
+            .authority_key
+            .as_deref()
+            .map(rasterizeddb_core::core::shard::signing::parse_key)
+            .transpose()
+            .map_err(|e| format!("--authority-key: {e}"))?;
         start(&ShardConfig {
             data_dir: data_dir.into(),
             map_file,
             shard_id,
             cluster_id,
+            authority_key,
         })
         .map(Some)
     }

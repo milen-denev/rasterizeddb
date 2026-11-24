@@ -12,6 +12,8 @@
 //!                       [--pin LO:HI …] [--exclude SHARD …]
 //!                       [--apply --fenced --out NEW_MAP --state-dir DIR
 //!                        --table TABLE:COLUMN:TYPE [--table …]]
+//! rdb-shard keygen      --key FILE
+//! rdb-shard sign        --map MAP --key FILE
 //! rdb-shard ddl         --map MAP --file DDL.sql --table TABLE [--table …]
 //!                       [--home SHARD] [--state STATE]
 //! ```
@@ -30,6 +32,10 @@
 //! falls in the moved blocks (`rdb_route_block(TYPE, COLUMN)`) are copied at
 //! one snapshot, verified, and handed off one map epoch up, with a state file
 //! per move in DIR that `rollback` and `retire` take like a tenant move's.
+//!
+//! Every command that writes a map signs it with `--key FILE` (the
+//! authority's key, `keygen`), writing `MAP.sig` beside it; shards started
+//! with `--authority-key` accept only signed maps.
 //!
 //! Every command also takes `--user U` (with the password in
 //! `RDB_PASSWORD`), `--ca PEM`, `--pin SHA256` or `--accept-any` (the
@@ -140,6 +146,17 @@ async fn run(args: &Args) -> std::result::Result<(), String> {
         "retire" => retire(args, &options).await,
         "rebalance" => rebalance(args, &options).await,
         "ddl" => cluster_ddl(args, &options).await,
+        "keygen" => keygen(args),
+        "sign" => {
+            let path = args.one("map")?;
+            let map = read_map(path)?;
+            if authority_key(args)?.is_none() {
+                return Err("sign needs --key FILE".to_string());
+            }
+            write_signed(args, path, &map)?;
+            println!("{path}.sig written for map epoch {}", map.epoch());
+            Ok(())
+        }
         other => Err(format!("unknown command {other:?}\n{}", usage())),
     }
 }
@@ -172,6 +189,71 @@ fn write_map(path: &str, map: &ShardMap) -> std::result::Result<(), String> {
     let tmp = format!("{path}.tmp");
     std::fs::write(&tmp, map.to_text()).map_err(|e| format!("{tmp}: {e}"))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("{path}: {e}"))
+}
+
+/// The authority's key pair from `--key FILE` (PKCS#8, hex), if given.
+fn authority_key(args: &Args) -> std::result::Result<Option<aws_lc_rs::signature::Ed25519KeyPair>, String> {
+    let Some(path) = args.opt("key") else {
+        return Ok(None);
+    };
+    let hex = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let der = unhex(hex.trim()).ok_or_else(|| format!("{path}: not a hex PKCS#8 key"))?;
+    aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8(&der).map(Some).map_err(|_| format!("{path}: not an Ed25519 PKCS#8 key"))
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+}
+
+/// Writes `map` to `path`, and with `--key` its signature to `path.sig`;
+/// returns the signature (hex) for `SHARD MAP INSTALL`.
+fn write_signed(args: &Args, path: &str, map: &ShardMap) -> std::result::Result<Option<String>, String> {
+    write_map(path, map)?;
+    let Some(key) = authority_key(args)? else {
+        return Ok(None);
+    };
+    let sig = hex(key.sign(&map.to_binary()).as_ref());
+    let sig_path = format!("{path}.sig");
+    let tmp = format!("{sig_path}.tmp");
+    std::fs::write(&tmp, format!("{sig}\n")).map_err(|e| format!("{tmp}: {e}"))?;
+    std::fs::rename(&tmp, &sig_path).map_err(|e| format!("{sig_path}: {e}"))?;
+    Ok(Some(sig))
+}
+
+/// `keygen --key FILE`: a new authority key pair; the public half printed,
+/// for every shard's `--authority-key`.
+fn keygen(args: &Args) -> std::result::Result<(), String> {
+    use aws_lc_rs::signature::KeyPair;
+    let path = args.one("key")?;
+    if std::path::Path::new(path).exists() {
+        return Err(format!("{path} exists: refusing to replace an authority key"));
+    }
+    let rng = aws_lc_rs::rand::SystemRandom::new();
+    let pkcs8 = aws_lc_rs::signature::Ed25519KeyPair::generate_pkcs8(&rng).map_err(|_| "key generation failed".to_string())?;
+    let pair = aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).map_err(|_| "key generation failed".to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("{path}: {e}"))?;
+        f.write_all(format!("{}\n", hex(pkcs8.as_ref())).as_bytes()).map_err(|e| format!("{path}: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, format!("{}\n", hex(pkcs8.as_ref()))).map_err(|e| format!("{path}: {e}"))?;
+    println!("authority key written to {path}; start every shard with --authority-key {}", hex(pair.public_key().as_ref()));
+    Ok(())
 }
 
 async fn connect(map: &ShardMap, id: ShardId, options: &Options) -> std::result::Result<Client, String> {
@@ -569,9 +651,9 @@ async fn move_tenant(args: &Args, options: &Options) -> std::result::Result<(), 
     for (id, c) in [(from, &src), (to, &dst)] {
         Identity::of(&next, id).write(c).await.map_err(|e| format!("shard {id}: {e}"))?;
     }
-    write_map(out, &next)?;
+    let sig = write_signed(args, out, &next)?;
     if engine {
-        finish_move(&src, &dst, &next, block, block + 1).await?;
+        finish_move(&src, &dst, &next, sig.as_deref(), block, block + 1).await?;
         println!(
             "moved to shard {to}; map epoch {} installed on both shards and written to {out}. Reload every router \
              and gateway; the source's rows stay unread until it is restarted or retired.",
@@ -612,7 +694,7 @@ async fn rollback(args: &Args, options: &Options) -> std::result::Result<(), Str
     for (id, c) in [(from, &src), (to, &dst)] {
         Identity::of(&back, id).write(c).await.map_err(|e| format!("shard {id}: {e}"))?;
     }
-    write_map(out, &back)?;
+    write_signed(args, out, &back)?;
     for (table, column) in &state.tables {
         let (column, key_type) = MoveState::split_column(column);
         let n = dst
@@ -789,9 +871,9 @@ async fn rebalance(args: &Args, options: &Options) -> std::result::Result<(), St
         for (id, c) in [(mv.from, &src), (mv.to, &dst)] {
             Identity::of(&next, id).write(c).await.map_err(|e| format!("shard {id}: {e}"))?;
         }
-        write_map(out, &next)?;
+        let sig = write_signed(args, out, &next)?;
         if engine {
-            finish_move(&src, &dst, &next, mv.lo, mv.hi).await?;
+            finish_move(&src, &dst, &next, sig.as_deref(), mv.lo, mv.hi).await?;
         }
         current = next;
     }
@@ -921,10 +1003,18 @@ async fn begin_move(args: &Args, src: &Client, dst: &Client, lo: u64, hi: u64) -
 
 /// After a verified copy, on shards: the new map installed on both, the
 /// source's span given up (its rows kept, unread), its fence lifted.
-async fn finish_move(src: &Client, dst: &Client, next: &ShardMap, lo: u64, hi: u64) -> std::result::Result<(), String> {
+async fn finish_move(
+    src: &Client,
+    dst: &Client,
+    next: &ShardMap,
+    signature: Option<&str>,
+    lo: u64,
+    hi: u64,
+) -> std::result::Result<(), String> {
     let text = next.to_text().replace('\'', "''");
+    let signed = signature.map(|s| format!(" SIGNATURE '{s}'")).unwrap_or_default();
     for (who, c) in [("destination", dst), ("source", src)] {
-        c.run(&format!("SHARD MAP INSTALL '{text}'")).await.map_err(|e| format!("installing the map on the {who}: {e}"))?;
+        c.run(&format!("SHARD MAP INSTALL '{text}'{signed}")).await.map_err(|e| format!("installing the map on the {who}: {e}"))?;
     }
     src.run(&format!("SHARD GIVE RANGE {lo:#x} {hi:#x}")).await.map_err(|e| format!("giving up the source's span: {e}"))?;
     src.run(&format!("SHARD UNFENCE RANGE {lo:#x} {hi:#x}")).await.map_err(|e| format!("unfencing the source: {e}"))?;

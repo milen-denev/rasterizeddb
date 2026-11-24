@@ -11,4 +11,5 @@ pub mod map_state;
 pub mod merge;
 pub mod ownership;
 pub mod rshard;
+pub mod signing;
 pub mod start;

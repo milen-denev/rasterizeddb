@@ -108,8 +108,9 @@ pub enum ShardAdmin {
     Give { lo: u64, hi: u64 },
     Fence { lo: u64, hi: u64 },
     Unfence { lo: u64, hi: u64 },
-    /// A newer cluster map, in its text form.
-    MapInstall(String),
+    /// A newer cluster map, in its text form, with the authority's signature
+    /// (hex) where shards require one.
+    MapInstall { text: String, signature: Option<String> },
 }
 
 // ---------------------------------------------------------------------------
@@ -140,12 +141,30 @@ fn parse_shard_admin(trimmed: &str, words: &[&str], original: &[&str]) -> Result
         Some("FENCE") => range().map(|(lo, hi)| ShardAdmin::Fence { lo, hi })?,
         Some("UNFENCE") => range().map(|(lo, hi)| ShardAdmin::Unfence { lo, hi })?,
         Some("MAP") if words.get(2).copied() == Some("INSTALL") => {
-            let at = trimmed.find('\'').ok_or("SHARD MAP INSTALL takes the map's text as a string literal")?;
-            let body = trimmed[at..].trim();
-            if body.len() < 2 || !body.ends_with('\'') {
-                return Err("SHARD MAP INSTALL takes the map's text as a string literal".to_string());
-            }
-            ShardAdmin::MapInstall(body[1..body.len() - 1].replace("''", "'"))
+            let usage = "the statement is `SHARD MAP INSTALL '<map>' [SIGNATURE '<hex>']`";
+            let literal = |from: usize| -> Result<(String, usize), String> {
+                let b = trimmed.as_bytes();
+                let at = from + trimmed[from..].find('\'').ok_or(usage)?;
+                let end = crate::core::sql_scan::string_literal_end(b, at, false);
+                if end > b.len() || end < at + 2 || b[end - 1] != b'\'' {
+                    return Err(usage.to_string());
+                }
+                Ok((trimmed[at + 1..end - 1].replace("''", "'"), end))
+            };
+            let (text, end) = literal(0)?;
+            let rest = trimmed[end..].trim();
+            let signature = if rest.is_empty() {
+                None
+            } else if rest.len() > 9 && rest[..9].eq_ignore_ascii_case("SIGNATURE") {
+                let (sig, after) = literal(end)?;
+                if !trimmed[after..].trim().is_empty() {
+                    return Err(usage.to_string());
+                }
+                Some(sig)
+            } else {
+                return Err(usage.to_string());
+            };
+            ShardAdmin::MapInstall { text, signature }
         }
         _ => return Err("SHARD takes TAKE, GIVE, FENCE or UNFENCE RANGE, or MAP INSTALL".to_string()),
     };
@@ -1844,11 +1863,17 @@ async fn shard_admin(database: &Arc<Database>, admin: &ShardAdmin) -> Result<Str
             let n = spans(lo, hi, false).await?;
             Ok(format!("blocks [{lo:#x}, {hi:#x}) given up in {n} partitioned tables; their rows stay until retired"))
         }
-        ShardAdmin::MapInstall(ref text) => {
+        ShardAdmin::MapInstall { ref text, ref signature } => {
             let Some(served) = map_state::current() else {
                 return Err("this node is not a shard (--role shard)".to_string());
             };
             let map = rasterizeddb_router::ShardMap::from_text(text)?;
+            let signature = signature
+                .as_deref()
+                .map(|h| crate::core::shard::signing::parse_hex(h.trim()))
+                .transpose()
+                .map_err(|e| format!("the signature: {e}"))?;
+            crate::core::shard::signing::check(&map, signature.as_deref())?;
             if map.cluster_id() != served.map.cluster_id() {
                 return Err(format!("the map is for cluster {:032x}, this shard is in {:032x}", map.cluster_id(), served.map.cluster_id()));
             }
@@ -1864,7 +1889,7 @@ async fn shard_admin(database: &Arc<Database>, admin: &ShardAdmin) -> Result<Str
             start::record_epoch(dir, map.epoch(), map.digest())?;
             ownership::adopt_map(map.ranges_of(served.shard_id), map.epoch())?;
             let epoch = map.epoch();
-            map_state::install(map, served.shard_id);
+            map_state::install(map, served.shard_id, signature);
             Ok(format!("cluster map epoch {epoch} installed"))
         }
     }

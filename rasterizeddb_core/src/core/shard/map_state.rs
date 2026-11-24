@@ -11,12 +11,14 @@ use rasterizeddb_router::ShardMap;
 pub struct Served {
     pub map: ShardMap,
     pub shard_id: u32,
+    /// The authority's signature over the map, when it came with one.
+    pub signature: Option<Vec<u8>>,
 }
 
 static SERVED: ArcSwapOption<Served> = ArcSwapOption::const_empty();
 
-pub fn install(map: ShardMap, shard_id: u32) {
-    SERVED.store(Some(Arc::new(Served { map, shard_id })));
+pub fn install(map: ShardMap, shard_id: u32, signature: Option<Vec<u8>>) {
+    SERVED.store(Some(Arc::new(Served { map, shard_id, signature })));
 }
 
 /// The map served, or `None` on a node that is not a shard.

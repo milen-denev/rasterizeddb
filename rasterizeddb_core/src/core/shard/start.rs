@@ -27,6 +27,8 @@ pub struct ShardConfig {
     pub shard_id: u32,
     /// When given, the map must name this cluster.
     pub cluster_id: Option<u128>,
+    /// When given, maps must carry this authority's Ed25519 signature.
+    pub authority_key: Option<[u8; 32]>,
 }
 
 /// A started shard.
@@ -111,6 +113,11 @@ pub fn start(config: &ShardConfig) -> Result<ShardStarted, String> {
         return Err("--role shard needs the write-ahead log, which is turned off".to_string());
     }
     let map = read_map(&config.map_file)?;
+    if let Some(key) = config.authority_key {
+        super::signing::set_authority(key);
+    }
+    let signature = super::signing::read_signature(&config.map_file)?;
+    super::signing::check(&map, signature.as_deref())?;
     if let Some(cluster) = config.cluster_id
         && cluster != map.cluster_id()
     {
@@ -137,6 +144,6 @@ pub fn start(config: &ShardConfig) -> Result<ShardStarted, String> {
         incoming,
         fenced,
     });
-    super::map_state::install(map.clone(), config.shard_id);
+    super::map_state::install(map.clone(), config.shard_id, signature);
     Ok(ShardStarted { map, shard_id: config.shard_id })
 }

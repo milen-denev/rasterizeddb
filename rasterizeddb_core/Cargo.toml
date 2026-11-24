@@ -13,6 +13,9 @@ description = "The RasterizedDB server and engine: a SQL database speaking the P
 # route_v1 (XXH64, key frames, the range map) and the shard map: one copy
 # shared with the client and the gateway.
 rasterizeddb_router = { path = "../rasterizeddb_router", version = "1.0.0" }
+# Ed25519 for signed cluster maps (sharding-plan.md B2); already in the tree
+# as rustls's crypto provider.
+aws-lc-rs = { version = "1.19", optional = true }
 # `AT TIME ZONE`: zone rules from the system's tz database
 # (/usr/share/zoneinfo). Already in the tree through env_logger; no bundled
 # copy where the host has one, so the server answers with the zones its host
@@ -190,7 +193,7 @@ enable_long_row = []
 # format; a build without the feature has none of the rest, and its stamping
 # hooks compile to nothing. No crate of its own: routing is
 # `rasterizeddb_router`'s.
-sharding = []
+sharding = ["dep:aws-lc-rs"]
 
 # Database branches: `CREATE BRANCH`, `RESET`/`PROMOTE`/`DROP BRANCH`,
 # `MERGE BRANCH` and `SHOW BRANCH DIFF` (docs/branching.md). No crate of its
