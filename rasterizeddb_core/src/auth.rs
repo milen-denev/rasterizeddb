@@ -1735,9 +1735,16 @@ pub async fn execute_role_statement_in(
 
     // The verifier format follows the configured method, as
     // `password_encryption` does in PostgreSQL.
-    let verifier_for = |name: &str, password: &str| match method {
-        AuthMethod::Md5 => md5_verifier(name, password),
-        _ => build_scram_verifier(password),
+    // A password already in a verifier's form (`SCRAM-SHA-256$…`, `md5` and
+    // 32 hex digits), as `pg_dumpall --roles-only` writes them, is stored as
+    // given, as PostgreSQL stores it (R2): hashed again, no password would
+    // match it and every restored role was locked out.
+    let verifier_for = |name: &str, password: &str| match Verifier::parse(password) {
+        given @ (Verifier::Scram { .. } | Verifier::Md5 { .. }) => given,
+        Verifier::Plain(_) => match method {
+            AuthMethod::Md5 => md5_verifier(name, password),
+            _ => build_scram_verifier(password),
+        },
     };
 
     match statement {

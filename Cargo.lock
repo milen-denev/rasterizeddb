@@ -4884,6 +4884,7 @@ dependencies = [
  "rastcp",
  "rasterizeddb_core",
  "rasterizeddb_enterprise",
+ "rasterizeddb_raft",
  "rclite",
  "tempfile",
  "tokio",
