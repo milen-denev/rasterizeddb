@@ -800,6 +800,36 @@ pub async fn all_roles(database: &rclite::Arc<crate::core::database::Database>) 
         .collect()
 }
 
+/// What a login that proves nothing (`trust`, a native listener asking for
+/// no credential) is in `database`: `Ok(true)` for an administrator,
+/// `Ok(false)` for an ordinary role, or why it is refused (28000).
+///
+/// The role it names decides, with that role's attributes, as PostgreSQL's
+/// `trust` authenticates as the named role. It is never an administrator by
+/// itself: only a database with no roles at all, where there is no account
+/// to be yet and the first has to be created, and the bootstrap role
+/// (`bootstrap_user`) when the catalogue has none of that name, as
+/// PostgreSQL's initdb user. Any other name with no role is refused.
+pub async fn trust_login(
+    database: &rclite::Arc<crate::core::database::Database>,
+    user: &str,
+    bootstrap_user: Option<&str>,
+) -> Result<bool, String> {
+    if let Some(role) = lookup_role(database, user).await {
+        if !role.can_login {
+            return Err(format!("role \"{user}\" is not permitted to log in"));
+        }
+        return Ok(role.is_superuser);
+    }
+    if all_roles(database).await.is_empty() {
+        return Ok(true);
+    }
+    if bootstrap_user.is_some_and(|b| b == user) {
+        return Ok(true);
+    }
+    Err(format!("role \"{user}\" does not exist"))
+}
+
 /// Gives `database`'s relations without an owner its owner
 /// (`privileges::assign_owners`). The rows are keyed by relation, grantee and
 /// privilege, so two nodes that each run this write the same rows. A failure

@@ -403,6 +403,12 @@ pub(crate) struct NativeSession {
     user: String,
     superuser: bool,
     authenticated: bool,
+    /// For a connection that proved nothing (`authenticated` false): whether
+    /// its user is an administrator, as a `trust` login is
+    /// (`auth::trust_login`), read once from the database's roles. Not by
+    /// itself: a listener that asks for no credential made every caller an
+    /// administrator.
+    trust_admin: tokio::sync::OnceCell<bool>,
     /// The connection is `rastcp/2`, which may not hold a block.
     multiplexed: bool,
     /// Whether a block is open: read without the lock, so a statement
@@ -494,6 +500,7 @@ impl NativeSession {
             user: user.to_string(),
             superuser,
             authenticated,
+            trust_admin: tokio::sync::OnceCell::new(),
             multiplexed,
             in_block: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
@@ -743,7 +750,7 @@ impl NativeSession {
         // (`privilege_statements::check` fails closed), which the native
         // path, checking nothing, would have run. Or the owner a new relation
         // is given. A superuser's other statements stay on the native path.
-        if (self.authenticated && !self.superuser)
+        if !self.resolve_admin().await
             || (upper_head.starts_with("CREATE") && database.has_table(crate::core::rql::privileges::ACL_TABLE))
         {
             return true;
@@ -786,8 +793,29 @@ impl NativeSession {
             || is_transaction_control(query)
     }
 
+    /// Whether this connection's user administers: a superuser who
+    /// authenticated, or for a connection that proved nothing, what its role
+    /// makes it (`auth::trust_login`: no roles at all, or a superuser role).
+    /// Resolved once, before the first session state is made.
+    pub(crate) async fn resolve_admin(&self) -> bool {
+        if self.authenticated {
+            return self.superuser;
+        }
+        *self
+            .trust_admin
+            .get_or_init(|| async { crate::auth::trust_login(&self.database, &self.user, None).await.unwrap_or(false) })
+            .await
+    }
+
+    /// What [`Self::resolve_admin`] found, for a session state; false before
+    /// it ran (fails closed).
+    fn effective_superuser(&self) -> bool {
+        if self.authenticated { self.superuser } else { self.trust_admin.get().copied().unwrap_or(false) }
+    }
+
     /// Runs one statement (already known to be one) of this connection.
     pub(crate) async fn run(&self, query: &str) -> Vec<u8> {
+        self.resolve_admin().await;
         if self.poisoned.load(Ordering::Acquire) {
             return native_error(
                 "08006",
@@ -832,6 +860,7 @@ impl NativeSession {
     /// block, so a multiplexed connection may use it too. Never called with
     /// a block open (`takes` routes every statement of one to `run`).
     pub(crate) async fn run_alone(&self, query: &str) -> Vec<u8> {
+        self.resolve_admin().await;
         let mut state = self.new_state();
         let answer = Box::pin(self.run_in(&mut state, query)).await;
         self.keep_temp_tables(&state);
@@ -866,6 +895,7 @@ impl NativeSession {
     /// session of its own, so a block must end within it; one left open is
     /// rolled back and the answer ends with an error saying so.
     pub(crate) async fn run_simple(&self, query: &str, options: &SimpleOptions) -> Vec<u8> {
+        self.resolve_admin().await;
         if self.poisoned.load(Ordering::Acquire) {
             return simple_error(
                 "08006",
@@ -1051,7 +1081,7 @@ impl NativeSession {
             AuthConfig::default(),
             Principal {
                 name: self.user.clone(),
-                superuser: self.superuser,
+                superuser: self.effective_superuser(),
                 authenticated: self.authenticated,
             },
             ConnectionLimits::default(),

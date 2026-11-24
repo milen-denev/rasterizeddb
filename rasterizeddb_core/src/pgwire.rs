@@ -2198,9 +2198,11 @@ where
     let principal = match authenticate(database, stream, parameters, auth, context.peer_uid).await {
         Ok(principal) => {
             log::debug!(
-                "authenticated {} via {}",
+                "authenticated {} via {}{}{}",
                 principal.name,
-                auth.method.name()
+                auth.method.name(),
+                if principal.authenticated { "" } else { " (no credential proven)" },
+                if principal.superuser { ", superuser" } else { "" }
             );
             principal
         }
@@ -2221,7 +2223,10 @@ where
         }
         Err(e) => {
             log::info!("authentication refused: {}", e);
-            send_fatal_error_response(stream, "28P01", &e.to_string()).await?;
+            // A `trust` login of a role that cannot log in (no such role,
+            // NOLOGIN) is no wrong password: PostgreSQL's 28000.
+            let code = if e.kind() == io::ErrorKind::NotFound { "28000" } else { "28P01" };
+            send_fatal_error_response(stream, code, &e.to_string()).await?;
             return Ok(());
         }
     };
@@ -2413,10 +2418,10 @@ fn startup_setting<T>(
 ///
 /// `superuser` is a snapshot of the role at login, as PostgreSQL's is for the
 /// life of a session. Under `trust` nobody proves anything, so the name is
-/// whatever the client sent and `authenticated` is false — the native listener
-/// draws the same line in [`crate::core::database::NativeContext`]: a gate
-/// applied to an anonymous principal would refuse the statement that creates
-/// the first account.
+/// whatever the client sent and `authenticated` is false; `superuser` is then
+/// what that role is (`auth::trust_login`), true only for a superuser role,
+/// the bootstrap role, or any name while the database has no roles at all
+/// (so the first account can be created).
 #[derive(Clone, Debug)]
 struct Principal {
     name: String,
@@ -2426,9 +2431,11 @@ struct Principal {
 }
 
 impl Principal {
-    /// Whether this session may run a server-administration statement.
+    /// Whether this session may run a server-administration statement: a
+    /// superuser's alone. Not having authenticated is no longer one: under
+    /// `trust` every session was an administrator.
     fn may_administer(&self) -> bool {
-        !self.authenticated || self.superuser
+        self.superuser
     }
 }
 
@@ -15453,10 +15460,16 @@ where
     let user = parameters.get("user").cloned().unwrap_or_default();
 
     if config.method == AuthMethod::Trust {
+        // As the named role, with its attributes; never an administrator by
+        // itself (`auth::trust_login`). Refused as PostgreSQL refuses a
+        // `trust` login of a role that does not exist (28000).
+        let superuser = crate::auth::trust_login(database, &user, Some(&config.bootstrap_user))
+            .await
+            .map_err(|message| io::Error::new(io::ErrorKind::NotFound, message))?;
         send_auth_ok(stream).await?;
         return Ok(Principal {
             name: user,
-            superuser: false,
+            superuser,
             authenticated: false,
         });
     }
@@ -16829,7 +16842,7 @@ mod authorization_tests {
     }
 
     #[test]
-    fn only_a_proven_non_superuser_is_refused() {
+    fn only_a_superuser_administers() {
         let trusted = Principal {
             name: "anyone".into(),
             superuser: false,
@@ -16845,7 +16858,9 @@ mod authorization_tests {
             superuser: false,
             authenticated: true,
         };
-        assert!(trusted.may_administer(), "trust has no one to refuse");
+        // Under `trust` a session is what its role is (`auth::trust_login`
+        // sets `superuser`), never an administrator by having proved nothing.
+        assert!(!trusted.may_administer(), "trust is not administration");
         assert!(admin.may_administer());
         assert!(!user.may_administer());
     }
@@ -17357,7 +17372,8 @@ mod cross_dir_commit_order_tests {
         };
         let principal = Principal {
             name: "rasterized".to_string(),
-            superuser: false,
+            // `trust` on a database with no roles: the bootstrap session.
+            superuser: true,
             authenticated: false,
         };
         let mut state = SessionState::new(
@@ -17567,7 +17583,8 @@ mod index_store_wire_tests {
         };
         let principal = Principal {
             name: "rasterized".to_string(),
-            superuser: false,
+            // `trust` on a database with no roles: the bootstrap session.
+            superuser: true,
             authenticated: false,
         };
         // A real loopback socket: the shutdown ends a session through it.
@@ -17628,7 +17645,8 @@ mod index_store_wire_tests {
         };
         let principal = Principal {
             name: "rasterized".to_string(),
-            superuser: false,
+            // `trust` on a database with no roles: the bootstrap session.
+            superuser: true,
             authenticated: false,
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

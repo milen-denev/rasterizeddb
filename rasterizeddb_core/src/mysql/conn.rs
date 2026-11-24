@@ -473,10 +473,21 @@ async fn handshake(
         shared.config.auth
     };
     let login = match method {
-        MyAuth::Trust => ProxiedLogin {
-            user: user.clone(),
-            superuser: false,
-            authenticated: false,
+        // As the named role, with its attributes (`auth::trust_login`).
+        MyAuth::Trust => match crate::auth::trust_login(&db, &user, Some(&shared.config.bootstrap_user)).await {
+            Ok(superuser) => ProxiedLogin {
+                user: user.clone(),
+                superuser,
+                authenticated: false,
+            },
+            Err(_) => {
+                refuse(
+                    io,
+                    MyError::new(1045, "28000", format!("Access denied for user '{user}' (using password: NO)")),
+                );
+                io.flush().await?;
+                return Ok(None);
+            }
         },
         MyAuth::Password => {
             match authenticate(io, &db, &user, &database, auth_response, &plugin, nonce).await? {
@@ -953,7 +964,7 @@ impl Session {
                 format!("Unknown thread id: {id}"),
             ));
         };
-        if target.user != self.user && self.login.authenticated && !self.login.superuser {
+        if target.user != self.user && !self.login.superuser {
             return Err(MyError::new(
                 1095,
                 "HY000",
@@ -2438,7 +2449,7 @@ impl Session {
                 .await
             }
             Show::Grants => {
-                let grant = if !self.login.authenticated || self.login.superuser {
+                let grant = if self.login.superuser {
                     format!(
                         "GRANT ALL PRIVILEGES ON *.* TO `{}`@`%` WITH GRANT OPTION",
                         self.user

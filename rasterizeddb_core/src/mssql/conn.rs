@@ -454,10 +454,18 @@ async fn handshake(
         shared.config.auth
     };
     let principal = match method {
-        MsAuth::Trust => ProxiedLogin {
-            user: login.user.clone(),
-            superuser: false,
-            authenticated: false,
+        // As the named role, with its attributes (`auth::trust_login`).
+        MsAuth::Trust => match crate::auth::trust_login(&database, &login.user, Some(&shared.config.bootstrap_user)).await {
+            Ok(superuser) => ProxiedLogin {
+                user: login.user.clone(),
+                superuser,
+                authenticated: false,
+            },
+            Err(_) => {
+                refuse(wire, 18456, &format!("Login failed for user '{}'.", login.user));
+                wire.send(tds::PT_REPLY).await?;
+                return Ok(None);
+            }
         },
         MsAuth::Password => {
             let role = crate::auth::lookup_role(&database, &login.user).await;
@@ -621,7 +629,7 @@ impl Env for Scope<'_> {
             "ERROR_PROCEDURE" => Value::Null,
             "XACT_STATE" => Value::Int((s.trancount > 0) as i64),
             "IS_SRVROLEMEMBER" | "IS_MEMBER" => {
-                Value::Int((!s.login.authenticated || s.login.superuser) as i64)
+                Value::Int(s.login.superuser as i64)
             }
             "HAS_DBACCESS" => Value::Int(1),
             "SESSIONPROPERTY" => Value::Int(1),
