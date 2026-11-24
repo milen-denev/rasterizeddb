@@ -157,6 +157,13 @@ struct Slot {
     /// committed row, and which reads the flag after taking that snapshot,
     /// finds it set.
     materialized: AtomicBool,
+    /// A `FOREIGN` partition (`log::PartState::foreign`): a range of the map
+    /// this shard does not own. Fixed for the slot's life (a span changing
+    /// hands starts a new map epoch, whose slots are built again). Every
+    /// open and every plan refuses it ([`Slot::refuse_foreign`]): it holds
+    /// no rows here, but answering as if its range were empty would answer
+    /// for another shard's rows.
+    foreign: bool,
     /// Everything else, built on the partition's first use: a declared
     /// partition nobody has written, routed to or opened holds only the
     /// three fields above. A table of 2^20 declared partitions held each
@@ -271,12 +278,25 @@ impl KeptSizes {
 }
 
 impl Slot {
-    fn new(pid: u32, range: PointRange, materialized: bool, place: Option<Place>) -> Self {
-        let slot = Slot { pid, range, materialized: AtomicBool::new(materialized), live: OnceLock::new() };
+    fn new(pid: u32, range: PointRange, materialized: bool, foreign: bool, place: Option<Place>) -> Self {
+        let slot = Slot { pid, range, materialized: AtomicBool::new(materialized), foreign, live: OnceLock::new() };
         if let Some(place) = place {
             slot.set_place(place);
         }
         slot
+    }
+
+    /// `Err` for a `FOREIGN` partition of table `table`: the one check every
+    /// path that would open, materialize or plan it makes first.
+    fn refuse_foreign(&self, table: &str) -> io::Result<()> {
+        if self.foreign {
+            return Err(io::Error::other(format!(
+                "partition {} of \"{table}\" covers [{:#018x}, {:#x}), which this shard does not own (FOREIGN): \
+                 the statement reached another shard's rows",
+                self.pid, self.range.lo, self.range.hi
+            )));
+        }
+        Ok(())
     }
 
     /// The slot's state, built now if this is its first use.
@@ -899,7 +919,7 @@ async fn slots_of(
         *index
             .get_mut(pid as usize)
             .ok_or_else(|| format!("live partition {pid} is past the map's next pid {n}"))? = j as u32;
-        slots.push(Slot::new(pid, range, materialized, place));
+        slots.push(Slot::new(pid, range, materialized, part.foreign, place));
     }
     Ok((slots.into_boxed_slice(), index.into_boxed_slice(), counts))
 }
@@ -1817,6 +1837,7 @@ impl PartitionedTable {
         let mut out = Planned::new();
         for pid in route.pids(&epoch.map) {
             let slot = Self::slot(live, pid)?;
+            slot.refuse_foreign(&self.name)?;
             if let Some(table) = slot.open_now() {
                 out.push((pid, Some(table)));
             } else if slot.materialized.load(Ordering::SeqCst) {
@@ -1851,6 +1872,17 @@ impl PartitionedTable {
     pub async fn open_part_scan(&self, pid: u32) -> io::Result<Arc<Table<DbStorageProvider>>> {
         let live = self.live()?;
         live.parts.open(pid, false).await
+    }
+
+    /// Records this shard taking (`ACQUIRE_SPAN`) or giving up
+    /// (`RELEASE_SPAN`) a span of the table's map, durably
+    /// (`PinBoard::record_span`). The open instance keeps serving the epoch
+    /// it opened at; the caller reopens the table, under the ownership
+    /// fence, to serve the new one.
+    #[cfg(feature = "sharding")]
+    pub async fn record_span(&self, rec: &super::log::Record) -> io::Result<()> {
+        let live = self.live()?;
+        live.parts.board.record_span(rec).await
     }
 
     /// Closes partition `pid` exclusively (§7.2 point 2): only while nothing
@@ -1916,6 +1948,7 @@ impl PartitionedTable {
         };
         let live = self.live()?;
         let slot = Self::slot(live, pid)?;
+        slot.refuse_foreign(&self.name)?;
         let mut out = Planned::new();
         if let Some(table) = slot.open_now() {
             table.ensure_full();
@@ -2825,6 +2858,7 @@ impl Parts {
     /// fan-out's open leaves it clear (`partition::budget`).
     pub(crate) async fn open(&self, pid: u32, routed: bool) -> io::Result<Arc<Table<DbStorageProvider>>> {
         let slot = self.slot_at(pid)?;
+        slot.refuse_foreign(&self.name)?;
         if routed {
             slot.touch();
         }
@@ -2873,6 +2907,7 @@ impl Parts {
     /// (§3.2) if it never was, then open it. A failure leaves the slot
     /// closed and fails the caller, never handing back a stand-in.
     async fn open_slow(&self, slot: &Slot, materialize: bool, routed: bool) -> io::Result<Arc<Table<DbStorageProvider>>> {
+        slot.refuse_foreign(&self.name)?;
         let lock = self.board.lifecycle(slot.pid)?;
         let _life = lock.lock().await;
         if let Some(table) = slot.open_now() {
@@ -2935,6 +2970,8 @@ impl Parts {
     /// at a time; the flag is set once the record is durable and before the
     /// first row reaches the partition.
     async fn materialize(&self, slot: &Slot) -> io::Result<()> {
+        // A FOREIGN range is never given files here.
+        slot.refuse_foreign(&self.name)?;
         // A mirror added after CREATE stops new partitions rather than let
         // them go unmirrored.
         refuse_mirrored((self.mirrored)())?;

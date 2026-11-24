@@ -178,8 +178,15 @@ name = "kv_table_bench"
 required-features = ["kv_storage"]
 
 [features]
-default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3", "query_stats", "kv_cache", "persistent_indexes", "mysql_wire", "mssql_wire", "db_branching", "storage_compression"]
+default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3", "query_stats", "kv_cache", "persistent_indexes", "mysql_wire", "mssql_wire", "db_branching", "storage_compression", "sharding"]
 enable_long_row = []
+
+# Sharding (docs/sharding-plan.md): a shard's ownership of its key ranges,
+# its partition maps' FOREIGN spans and their ACQUIRE_SPAN/RELEASE_SPAN
+# writers. On by default and dormant until a server is given a role; every
+# build decodes the records, so there is one format. No crate of its own:
+# routing is `rasterizeddb_router`'s.
+sharding = []
 
 # Database branches: `CREATE BRANCH`, `RESET`/`PROMOTE`/`DROP BRANCH`,
 # `MERGE BRANCH` and `SHOW BRANCH DIFF` (docs/branching.md). No crate of its
