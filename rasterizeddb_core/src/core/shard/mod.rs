@@ -7,5 +7,6 @@
 
 pub mod ddl;
 pub mod map_state;
+pub mod merge;
 pub mod ownership;
 pub mod start;
