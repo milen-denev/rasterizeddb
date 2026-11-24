@@ -279,5 +279,97 @@ fn merge_parts(out: &mut Vec<u8>, merge: &Merge, parts: &[(u32, PartReply)]) {
         }
         Merge::Coordinator => 0,
     };
+    // A statement that returns no rows (a write without RETURNING) counts
+    // by the shards' own tags: summed when each changed its own rows, one
+    // shard's when every shard holds the same rows (a reference table).
+    // Counted from rows, every fan-out write said `UPDATE 0`.
+    let returns_rows = pg::messages(&first.head).any(|(t, _)| t == b'T');
+    let n = if returns_rows {
+        n
+    } else {
+        let counts = parts.iter().filter_map(|(_, p)| {
+            pg::messages(&p.tail).find(|(t, _)| *t == b'C').and_then(|(_, m)| pg::tag_count(m)).map(|(_, c)| c)
+        });
+        match merge {
+            Merge::Any => counts.max().unwrap_or(0),
+            _ => counts.sum(),
+        }
+    };
     pg::command_complete(out, &format!("{tag} {n}"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn part(head: Vec<u8>, rows: Vec<(Vec<u8>, Vec<u8>)>, tag: &str) -> PartReply {
+        let mut tail = Vec::new();
+        pg::command_complete(&mut tail, tag);
+        PartReply { session: 1, map_epoch: 1, more: false, status: b'I', head, rows, tail }
+    }
+
+    fn row(v: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        pg::data_row(&mut out, &[Some(v)]);
+        out
+    }
+
+    fn head() -> Vec<u8> {
+        let mut out = Vec::new();
+        pg::row_description(&mut out, &["c"]);
+        out
+    }
+
+    /// The merged rows' first cells and the command tag.
+    fn merged(merge: Merge, parts: &[(u32, PartReply)]) -> (Vec<String>, String) {
+        let mut out = Vec::new();
+        merge_parts(&mut out, &merge, parts);
+        let mut cells = Vec::new();
+        let mut tag = String::new();
+        for (t, m) in pg::messages(&out) {
+            match t {
+                b'D' => cells.push(String::from_utf8(pg::data_row_first(m).unwrap().unwrap().to_vec()).unwrap()),
+                b'C' => tag = pg::cstr(pg::body(m)).unwrap().0.to_string(),
+                _ => {}
+            }
+        }
+        (cells, tag)
+    }
+
+    #[test]
+    fn fanout_concat_and_count_sum() {
+        let parts = vec![
+            (0, part(head(), vec![(vec![], row("a")), (vec![], row("b"))], "SELECT 2")),
+            (1, part(head(), vec![(vec![], row("c"))], "SELECT 1")),
+        ];
+        assert_eq!(merged(Merge::Concat, &parts), (vec!["a".into(), "b".into(), "c".into()], "SELECT 3".into()));
+        let counts = vec![
+            (0, part(head(), vec![(vec![], row("40"))], "SELECT 1")),
+            (1, part(head(), vec![(vec![], row("2"))], "SELECT 1")),
+        ];
+        assert_eq!(merged(Merge::CountSum, &counts), (vec!["42".into()], "SELECT 1".into()));
+    }
+
+    #[test]
+    fn fanout_top_n_merges_by_key_then_offset_and_limit() {
+        let p = |rows: &[(&str, &str)]| rows.iter().map(|(k, v)| (k.as_bytes().to_vec(), row(v))).collect::<Vec<_>>();
+        let parts = vec![
+            (0, part(head(), p(&[("a", "1"), ("d", "4"), ("e", "5")]), "SELECT 3")),
+            (1, part(head(), p(&[("b", "2"), ("c", "3"), ("f", "6")]), "SELECT 3")),
+        ];
+        let (cells, tag) = merged(Merge::TopN { limit: 3, offset: 1 }, &parts);
+        assert_eq!(cells, vec!["2", "3", "4"]);
+        assert_eq!(tag, "SELECT 3");
+    }
+
+    #[test]
+    fn fanout_writes_count_by_the_shards_tags() {
+        let parts = vec![(0, part(Vec::new(), vec![], "UPDATE 3")), (1, part(Vec::new(), vec![], "UPDATE 4"))];
+        assert_eq!(merged(Merge::Concat, &parts).1, "UPDATE 7", "each shard changed its own rows");
+        // A reference table: every shard changed the same rows.
+        let same = vec![(0, part(Vec::new(), vec![], "UPDATE 5")), (1, part(Vec::new(), vec![], "UPDATE 5"))];
+        assert_eq!(merged(Merge::Any, &same).1, "UPDATE 5");
+        let inserts = vec![(0, part(Vec::new(), vec![], "INSERT 0 2")), (1, part(Vec::new(), vec![], "INSERT 0 2"))];
+        assert_eq!(merged(Merge::Any, &inserts).1, "INSERT 0 2");
+    }
 }

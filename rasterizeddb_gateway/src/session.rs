@@ -1274,3 +1274,26 @@ fn push_close(out: &mut Vec<u8>, name: &str) {
     b.push(0);
     pg::put(out, b'C', &b);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_local_statements_are_told_apart() {
+        assert!(matches!(local_of("BEGIN"), Local::Begin));
+        assert!(matches!(local_of("commit;"), Local::End { commit: true }));
+        assert!(matches!(local_of("ROLLBACK"), Local::End { commit: false }));
+        // ROLLBACK TO is a savepoint's, not the block's end.
+        assert!(matches!(local_of("ROLLBACK TO SAVEPOINT s"), Local::Routed));
+        assert!(matches!(local_of("SET LOCAL rdb.route_key = 42"), Local::SetRouteKey { local: true, value: Some(ref v) } if v == "42"));
+        assert!(matches!(local_of("SET rdb.route_key TO DEFAULT"), Local::SetRouteKey { local: false, value: None }));
+        assert!(matches!(local_of("SET search_path = x"), Local::SessionSet));
+        assert!(matches!(local_of("SET LOCAL statement_timeout = 5"), Local::SetLocal));
+        assert!(matches!(local_of("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"), Local::Routed));
+        assert!(matches!(local_of("LISTEN ch"), Local::Refused(_)));
+        // Two statements are forwarded whole, never half answered here.
+        assert!(matches!(local_of("BEGIN; SELECT 1"), Local::Routed));
+        assert!(matches!(local_of("SELECT 1"), Local::Routed));
+    }
+}

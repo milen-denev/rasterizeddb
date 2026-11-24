@@ -313,3 +313,21 @@ async fn relay(
     read_value(&mut up.r, &mut reply).await?;
     Ok(reply)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kv_arguments_and_key_positions() {
+        let cmd = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nhe\r\nl\r\n";
+        let args = args_of(cmd).unwrap();
+        assert_eq!(args, vec![&b"SET"[..], b"k", b"he\r\nl"], "a value may hold CRLF");
+        assert!(args_of(b"*1\r\n$9\r\nSHORT\r\n").is_none(), "a length past the end");
+        assert!(args_of(b"PING\r\n").is_none());
+        assert_eq!(key_spec("MSET"), Some((1, 2, -1)), "every other argument a key");
+        assert_eq!(key_spec("DEL"), Some((1, 1, -1)));
+        assert_eq!(key_spec("FLUSHALL"), None);
+        assert!(local("PING") && session("AUTH") && !local("GET"));
+    }
+}
