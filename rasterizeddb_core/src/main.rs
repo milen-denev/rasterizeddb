@@ -65,6 +65,7 @@ mod pg_import_args;
 /// Redis-compatible key/value store flags.
 #[cfg(feature = "kv_cache")]
 mod kv_args;
+mod shard_args;
 
 #[derive(Clone, Debug, ValueEnum)]
 enum PgTlsMode {
@@ -868,6 +869,10 @@ struct Args {
     #[cfg(feature = "kv_cache")]
     #[command(flatten)]
     kv: kv_args::KvArgs,
+
+    // --- sharding (docs/sharding-plan.md) ---------------------------------
+    #[command(flatten)]
+    shard: shard_args::ShardArgs,
 }
 
 /// Applies `--storage-location`, `--storage-policy` and `--storage-min-free`
@@ -1484,6 +1489,30 @@ fn main() -> std::io::Result<()> {
                 );
                 std::process::exit(2);
             }
+        }
+    }
+
+    // Before the database opens: a shard's directory is marked, its map
+    // epoch checked and its ownership installed, so no statement ever runs
+    // unguarded.
+    let shard_location = if args.in_memory { None } else { args.location.clone() };
+    match args.shard.start(shard_location.as_deref()) {
+        Ok(Some(started)) => {
+            #[cfg(feature = "sharding")]
+            eprintln!(
+                "shard {} of cluster {:032x}, map epoch {} ({} ranges owned)",
+                started.shard_id,
+                started.map.cluster_id(),
+                started.map.epoch(),
+                started.map.ranges_of(started.shard_id).len()
+            );
+            #[cfg(not(feature = "sharding"))]
+            let () = started;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
         }
     }
 
