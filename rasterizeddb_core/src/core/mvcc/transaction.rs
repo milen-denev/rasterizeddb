@@ -714,16 +714,28 @@ impl TransactionManager {
             TxId::MAX
         };
 
+        // Prepared transactions (a two-phase commit's first phase) are still
+        // running: decided by their coordinator, never by this restart
+        // (sharding-plan.md B5).
+        #[cfg(feature = "sharding_2pc")]
+        let running: BTreeSet<TxId> = status.prepared_at_open().iter().copied().collect();
+        #[cfg(not(feature = "sharding_2pc"))]
+        let running: BTreeSet<TxId> = BTreeSet::new();
+        #[cfg(feature = "sharding_2pc")]
+        let wrote_prepared: BTreeSet<TxId> = running.clone();
+        #[cfg(not(feature = "sharding_2pc"))]
+        let wrote_prepared: BTreeSet<TxId> = BTreeSet::new();
+
         TransactionManager {
             inner: RwLock::new(Inner {
                 next_id,
-                running: BTreeSet::new(),
+                running,
                 pinned: std::collections::BTreeMap::new(),
                 statement_scoped: BTreeSet::new(),
                 parent: std::collections::BTreeMap::new(),
                 children: std::collections::BTreeMap::new(),
                 rolled_back: BTreeSet::new(),
-                wrote: BTreeSet::new(),
+                wrote: wrote_prepared,
                 owner_only: BTreeSet::new(),
             }),
             next_id: AtomicU64::new(next_id).into(),
@@ -1388,6 +1400,19 @@ impl TransactionManager {
     /// excludes `tx` from `running` — and so consults the status log — in the
     /// window before the log says it committed, and would read its rows as
     /// aborted.
+    /// Prepares `tx` (PostgreSQL's `PREPARE TRANSACTION`): its outcome
+    /// recorded `0b11` and made durable, the transaction left running and
+    /// invisible until [`Self::commit`] or [`Self::abort`] decides it, in this
+    /// run or after a restart (sharding-plan.md B5).
+    #[cfg(feature = "sharding_2pc")]
+    pub fn prepare(&self, tx: TxId) -> std::io::Result<()> {
+        if !self.inner.read().running.contains(&tx) {
+            return Err(std::io::Error::other(format!("transaction {tx} is not running")));
+        }
+        self.status.record_prepared(tx);
+        self.status.flush()
+    }
+
     pub fn commit(&self, tx: TxId) {
         self.status.record(tx, TxOutcome::Committed);
         #[cfg(test)]

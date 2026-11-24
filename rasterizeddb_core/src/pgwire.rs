@@ -12169,6 +12169,84 @@ where
     Ok(())
 }
 
+/// `PREPARE TRANSACTION 'gid'`, `COMMIT PREPARED 'gid'`, `ROLLBACK PREPARED
+/// 'gid'` (`core::database::prepared`); `None` for any other statement.
+#[cfg(feature = "sharding_2pc")]
+async fn two_phase<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    stmt: &str,
+) -> io::Result<Option<bool>>
+where
+    S: AsyncWrite + Unpin,
+{
+    let t = stmt.trim().trim_end_matches(';').trim();
+    let up = t.to_ascii_uppercase();
+    let words: Vec<&str> = up.split_whitespace().collect();
+    let kind = match words.as_slice() {
+        ["PREPARE", "TRANSACTION", ..] => 0,
+        ["COMMIT", "PREPARED", ..] => 1,
+        ["ROLLBACK", "PREPARED", ..] => 2,
+        _ => return Ok(None),
+    };
+    let gid = match (t.find('\''), t.rfind('\'')) {
+        (Some(a), Some(b)) if b > a => t[a + 1..b].replace("''", "'"),
+        _ => {
+            fail_statement(state, stream, "42601", "the transaction identifier is a string literal").await?;
+            return Ok(Some(true));
+        }
+    };
+    let fail = |e: String| {
+        let code = e.get(..5).filter(|c| c.bytes().all(|b| b.is_ascii_alphanumeric()) && e.as_bytes().get(5) == Some(&b':'));
+        (code.map(str::to_string).unwrap_or_else(|| "XX000".to_string()), e.splitn(2, ": ").last().unwrap_or(&e).to_string())
+    };
+    if kind == 0 {
+        let Some(tx) = state.transaction.as_ref() else {
+            fail_statement(state, stream, "25P01", "PREPARE TRANSACTION can only be used in transaction blocks").await?;
+            return Ok(Some(true));
+        };
+        if !database.block_drops_pending(tx.id).is_empty() {
+            fail_statement(state, stream, "0A000", "cannot PREPARE a transaction that has dropped tables").await?;
+            return Ok(Some(true));
+        }
+        let t = state.transaction.take().expect("checked above");
+        state.end_block_settings(&t);
+        if t.failed {
+            database.block_ddl_abort(t.id).await;
+            t.abort_unless_aborted(database);
+            t.owner.release();
+            send_command_complete(stream, "ROLLBACK").await?;
+            return Ok(Some(true));
+        }
+        if let Err(e) = database.prepare_transaction(t.id, &gid) {
+            database.block_ddl_abort(t.id).await;
+            database.abort_transaction(t.id);
+            t.owner.release();
+            let (code, msg) = fail(e);
+            send_error_response(stream, &code, &msg).await?;
+            return Ok(Some(true));
+        }
+        database.block_ddl_commit(t.id).await;
+        t.owner.release();
+        send_command_complete(stream, "PREPARE TRANSACTION").await?;
+        return Ok(Some(true));
+    }
+    if state.transaction.is_some() {
+        let verb = if kind == 1 { "COMMIT PREPARED" } else { "ROLLBACK PREPARED" };
+        fail_statement(state, stream, "25001", &format!("{verb} cannot run inside a transaction block")).await?;
+        return Ok(Some(true));
+    }
+    match database.finish_prepared(&gid, kind == 1) {
+        Ok(()) => send_command_complete(stream, if kind == 1 { "COMMIT PREPARED" } else { "ROLLBACK PREPARED" }).await?,
+        Err(e) => {
+            let (code, msg) = fail(e);
+            fail_statement(state, stream, &code, &msg).await?;
+        }
+    }
+    Ok(Some(true))
+}
+
 /// Returns `Ok(true)` when the statement was transaction control.
 async fn handle_transaction_control<S>(
     database: &Arc<Database>,
@@ -12179,6 +12257,11 @@ async fn handle_transaction_control<S>(
 where
     S: AsyncWrite + Unpin,
 {
+    // Two-phase commit, a shard's half (sharding-plan.md B5).
+    #[cfg(feature = "sharding_2pc")]
+    if let Some(answered) = two_phase(database, state, stream, stmt).await? {
+        return Ok(answered);
+    }
     // Every form below opens with one of these words, so any other statement
     // is not transaction control, decided before the lowercased, re-spaced
     // copy every statement used to pay for. It is also what keeps a statement

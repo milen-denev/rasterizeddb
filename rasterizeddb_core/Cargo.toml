@@ -202,6 +202,13 @@ sharding = ["dep:aws-lc-rs"]
 # gate (the deterministic simulation and the power-loss harness).
 sharding_raft = ["sharding", "dep:rasterizeddb_raft"]
 
+# Two-phase commit across shards (sharding-plan.md B5): PREPARE TRANSACTION /
+# COMMIT PREPARED / ROLLBACK PREPARED, status code 0b11 kept across restarts,
+# and the anchor decision log a gateway coordinates with. A directory that
+# holds a prepared transaction cannot be opened by a build without it (B0.1
+# refuses 0b11). Off by default.
+sharding_2pc = ["sharding"]
+
 # Database branches: `CREATE BRANCH`, `RESET`/`PROMOTE`/`DROP BRANCH`,
 # `MERGE BRANCH` and `SHOW BRANCH DIFF` (docs/branching.md). No crate of its
 # own, but it copies a database with `s3_backup`'s copy machinery (its copy

@@ -1,6 +1,8 @@
 pub mod catalog;
 pub mod incompat;
 pub mod index_checkpoint;
+#[cfg(feature = "sharding_2pc")]
+mod prepared;
 #[cfg(test)]
 mod catalogue_present_tests;
 #[cfg(test)]
