@@ -531,7 +531,7 @@ async fn build(database: &Arc<Database>, tx: crate::core::mvcc::transaction::TxI
     }
     if database.has_table(crate::core::rql::privileges::ACL_TABLE) {
         for a in crate::core::rql::privileges::load(database, view_tx).await.unwrap_or_default() {
-            if a.privilege != "OWNER" {
+            if a.privilege != "OWNER" && a.relation != crate::auth::ROLE_ATTR_RELATION {
                 not_dumped.push(format!("GRANT {} ON {} TO {}", a.privilege, a.relation, a.grantee));
             }
         }

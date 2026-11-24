@@ -1114,16 +1114,61 @@ pub enum RoleStatement {
         password: Option<String>,
         can_login: bool,
         is_superuser: bool,
+        attrs: RoleAttrs,
     },
     AlterPassword {
         name: String,
         password: Option<String>,
+    },
+    /// `ALTER ROLE` with anything besides a password alone.
+    Alter {
+        name: String,
+        password: Option<Option<String>>,
+        login: Option<bool>,
+        superuser: Option<bool>,
+        attrs: RoleAttrs,
+    },
+    /// `ALTER ROLE a RENAME TO b`.
+    Rename {
+        name: String,
+        to: String,
     },
     Drop {
         name: String,
         if_exists: bool,
     },
 }
+
+/// The role attributes kept beside `rdb_roles`, as ACL rows (relation
+/// [`ROLE_ATTR_RELATION`]): `None` leaves one as it is.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RoleAttrs {
+    pub create_db: Option<bool>,
+    pub create_role: Option<bool>,
+    /// `-1` is no limit.
+    pub conn_limit: Option<i64>,
+    /// `Some(None)` is `VALID UNTIL 'infinity'`.
+    pub valid_until: Option<Option<String>>,
+}
+
+impl RoleStatement {
+    /// The command tag it completes with.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            RoleStatement::Create { .. } => "CREATE ROLE",
+            RoleStatement::AlterPassword { .. } | RoleStatement::Alter { .. } | RoleStatement::Rename { .. } => {
+                "ALTER ROLE"
+            }
+            RoleStatement::Drop { .. } => "DROP ROLE",
+        }
+    }
+}
+
+/// The ACL relation role attributes are kept under: one row per attribute
+/// set, `grantee` the role, `privilege` the attribute, `grantor` its value.
+/// Kept out of `rdb_roles`, whose four columns every catalogue already has,
+/// so no catalogue is migrated; `DROP ROLE` clears them with its grants.
+pub const ROLE_ATTR_RELATION: &str = "@attr";
 
 /// One token of a role statement: a keyword or bare name (`Word`, as
 /// written), a quoted name, a string literal's value, a number, or
@@ -1239,6 +1284,7 @@ struct RoleOptions {
     password: Option<Option<String>>,
     login: Option<bool>,
     superuser: Option<bool>,
+    attrs: RoleAttrs,
     /// Whether any option besides `PASSWORD` was given.
     others: bool,
 }
@@ -1292,18 +1338,36 @@ fn role_options(tokens: &[RoleTok]) -> Result<RoleOptions, String> {
                 at += 1;
                 continue;
             }
-            "CREATEDB" | "NOCREATEDB" | "CREATEROLE" | "NOCREATEROLE" | "INHERIT" | "NOINHERIT" | "REPLICATION"
-            | "NOREPLICATION" | "BYPASSRLS" | "NOBYPASSRLS" | "CREATEUSER" | "NOCREATEUSER" => {}
+            "CREATEDB" => options.attrs.create_db = Some(true),
+            "NOCREATEDB" => options.attrs.create_db = Some(false),
+            // PostgreSQL's old `CREATEUSER` is `SUPERUSER`, not `CREATEROLE`.
+            "CREATEUSER" => options.superuser = Some(true),
+            "NOCREATEUSER" => options.superuser = Some(false),
+            "CREATEROLE" => options.attrs.create_role = Some(true),
+            "NOCREATEROLE" => options.attrs.create_role = Some(false),
+            "INHERIT" | "NOINHERIT" | "REPLICATION" | "NOREPLICATION" | "BYPASSRLS" | "NOBYPASSRLS" => {}
             "CONNECTION" => {
-                if !is_word(tokens.get(at), "LIMIT") || !matches!(tokens.get(at + 1), Some(RoleTok::Number(_))) {
+                let Some(RoleTok::Number(n)) = tokens.get(at + 1).filter(|_| is_word(tokens.get(at), "LIMIT")) else {
                     return Err("CONNECTION LIMIT takes a number".to_string());
+                };
+                let n: i64 = n.parse().map_err(|_| format!("CONNECTION LIMIT {n} is out of range"))?;
+                if n < -1 {
+                    return Err(format!("invalid connection limit: {n}"));
                 }
+                options.attrs.conn_limit = Some(n);
                 at += 2;
             }
             "VALID" => {
-                if !is_word(tokens.get(at), "UNTIL") || !matches!(tokens.get(at + 1), Some(RoleTok::Str(_))) {
+                let Some(RoleTok::Str(when)) = tokens.get(at + 1).filter(|_| is_word(tokens.get(at), "UNTIL")) else {
                     return Err("VALID UNTIL takes a quoted timestamp".to_string());
-                }
+                };
+                options.attrs.valid_until = Some(if when.trim().eq_ignore_ascii_case("infinity") {
+                    None
+                } else {
+                    let us = crate::core::value_codec::parse_timestamp_us(when)
+                        .ok_or_else(|| format!("invalid input syntax for type timestamp with time zone: \"{when}\""))?;
+                    Some(us.to_string())
+                });
                 at += 2;
             }
             "SYSID" => {
@@ -1365,19 +1429,35 @@ pub fn parse_role_statement(sql: &str) -> Option<Result<RoleStatement, String>> 
                 password: options.password.flatten(),
                 can_login: options.login.unwrap_or(noun == "USER"),
                 is_superuser: options.superuser.unwrap_or(false),
+                attrs: options.attrs,
             }))
         }
         "ALTER" => {
             let Some(name) = role_name(rest.first()) else {
                 return Some(Err("ALTER ROLE names no role".to_string()));
             };
+            if is_word(rest.get(1), "RENAME") && is_word(rest.get(2), "TO") {
+                let Some(to) = role_name(rest.get(3)).filter(|_| rest.len() == 4) else {
+                    return Some(Err("ALTER ROLE … RENAME TO names one role".to_string()));
+                };
+                return Some(Ok(RoleStatement::Rename { name, to }));
+            }
+            if is_word(rest.get(1), "SET") || is_word(rest.get(1), "RESET") || is_word(rest.get(1), "IN") {
+                return Some(Err("ALTER ROLE … SET and RESET are not supported yet: set the parameter per session".to_string()));
+            }
             let options = match role_options(&rest[1..]) {
                 Ok(options) => options,
-                Err(_) => return Some(Err("only ALTER ROLE ... PASSWORD is supported yet".to_string())),
+                Err(e) => return Some(Err(e)),
             };
             match options.password {
                 Some(password) if !options.others => Some(Ok(RoleStatement::AlterPassword { name, password })),
-                _ => Some(Err("only ALTER ROLE ... PASSWORD is supported yet".to_string())),
+                password => Some(Ok(RoleStatement::Alter {
+                    name,
+                    password,
+                    login: options.login,
+                    superuser: options.superuser,
+                    attrs: options.attrs,
+                })),
             }
         }
         _ => {
@@ -1392,6 +1472,157 @@ pub fn parse_role_statement(sql: &str) -> Option<Result<RoleStatement, String>> 
             Some(Ok(RoleStatement::Drop { name, if_exists }))
         }
     }
+}
+
+/// Writes the attributes `attrs` sets for `role`: each one's row replaced,
+/// or removed when it is back at its default.
+async fn write_role_attrs(
+    database: &rclite::Arc<crate::core::database::Database>,
+    role: &str,
+    attrs: &RoleAttrs,
+    tx: Option<crate::core::mvcc::TxId>,
+) -> Result<(), String> {
+    let flag = |b: Option<bool>| b.map(|b| b.then(|| "true".to_string()));
+    let limit = attrs.conn_limit.map(|n| (n >= 0).then(|| n.to_string()));
+    for (attr, value) in [
+        ("CREATEDB", flag(attrs.create_db)),
+        ("CREATEROLE", flag(attrs.create_role)),
+        ("CONNECTION LIMIT", limit),
+        ("VALID UNTIL", attrs.valid_until.clone()),
+    ] {
+        let Some(value) = value else { continue };
+        crate::core::rql::privileges::set_role_attr(database, role, attr, value, tx).await?;
+    }
+    Ok(())
+}
+
+/// A role's attributes as kept in the ACL: (CREATEDB, CREATEROLE,
+/// CONNECTION LIMIT, VALID UNTIL in microseconds).
+pub struct StoredAttrs {
+    pub create_db: bool,
+    pub create_role: bool,
+    pub conn_limit: Option<u64>,
+    pub valid_until_us: Option<i64>,
+}
+
+/// [`StoredAttrs`] of `role`, read through the ACL cache.
+pub async fn role_attrs(
+    database: &rclite::Arc<crate::core::database::Database>,
+    role: &str,
+    tx: Option<crate::core::mvcc::TxId>,
+) -> StoredAttrs {
+    let mut out = StoredAttrs { create_db: false, create_role: false, conn_limit: None, valid_until_us: None };
+    if !database.has_table(crate::core::rql::privileges::ACL_TABLE) {
+        return out;
+    }
+    let Ok(rows) = crate::core::rql::privileges::load(database, tx).await else {
+        return out;
+    };
+    for r in rows.iter().filter(|r| r.relation == ROLE_ATTR_RELATION && r.grantee == role) {
+        match r.privilege.as_str() {
+            "CREATEDB" => out.create_db = true,
+            "CREATEROLE" => out.create_role = true,
+            "CONNECTION LIMIT" => out.conn_limit = r.grantor.parse().ok(),
+            "VALID UNTIL" => out.valid_until_us = r.grantor.parse().ok(),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether `actor`, no superuser, may run `statement` (roles plan R2): a
+/// role changes its own password; a CREATEROLE role creates, alters and
+/// drops roles that are not superusers, and gives none SUPERUSER.
+/// `Err` with the refusal otherwise.
+pub async fn role_statement_permitted(
+    database: &rclite::Arc<crate::core::database::Database>,
+    actor: &str,
+    statement: &RoleStatement,
+    tx: Option<crate::core::mvcc::TxId>,
+) -> Result<(), String> {
+    if let RoleStatement::AlterPassword { name, .. } = statement
+        && name == actor
+    {
+        return Ok(());
+    }
+    let denied = || Err(format!("permission denied: {} requires superuser or CREATEROLE", statement.tag()));
+    if !role_attrs(database, actor, tx).await.create_role {
+        return denied();
+    }
+    let target = match statement {
+        RoleStatement::Create { name, is_superuser, .. } => {
+            if *is_superuser {
+                return Err("permission denied: only a superuser can create a superuser".to_string());
+            }
+            name
+        }
+        RoleStatement::Alter { name, superuser, .. } => {
+            if superuser.is_some() {
+                return Err("permission denied: only a superuser can change SUPERUSER".to_string());
+            }
+            name
+        }
+        RoleStatement::AlterPassword { name, .. } | RoleStatement::Rename { name, .. } | RoleStatement::Drop { name, .. } => name,
+    };
+    if lookup_role_in(database, target, tx).await.is_some_and(|r| r.is_superuser) {
+        return Err(format!("permission denied: only a superuser can alter or drop the superuser \"{target}\""));
+    }
+    Ok(())
+}
+
+/// One session's place under its role's `CONNECTION LIMIT`, given back when
+/// the session ends.
+pub struct RoleSlot(Option<(String, String)>);
+
+static ROLE_SESSIONS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(String, String), u64>>> =
+    std::sync::LazyLock::new(Default::default);
+
+impl Drop for RoleSlot {
+    fn drop(&mut self) {
+        if let Some(key) = self.0.take() {
+            let mut map = ROLE_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(n) = map.get_mut(&key) {
+                *n -= 1;
+                if *n == 0 {
+                    map.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+/// Admits a session that authenticated as `role` (roles plan R2): refused
+/// past its `VALID UNTIL` when a password was proven (28P01, as
+/// PostgreSQL's), or beyond its `CONNECTION LIMIT` (53300). A superuser is
+/// held to neither limit, as in PostgreSQL. A role with no limit counts
+/// nothing, so the common case takes no lock.
+pub async fn admit_role_login(
+    database: &rclite::Arc<crate::core::database::Database>,
+    role: &str,
+    superuser: bool,
+    by_password: bool,
+) -> Result<RoleSlot, (&'static str, String)> {
+    if superuser {
+        return Ok(RoleSlot(None));
+    }
+    let attrs = role_attrs(database, role, None).await;
+    if by_password
+        && let Some(until) = attrs.valid_until_us
+        && std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as i64) > until
+    {
+        return Err(("28P01", format!("password authentication failed for user \"{role}\"")));
+    }
+    let Some(limit) = attrs.conn_limit else {
+        return Ok(RoleSlot(None));
+    };
+    let key = (database.name.clone(), role.to_string());
+    let mut map = ROLE_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let n = map.entry(key.clone()).or_insert(0);
+    if *n >= limit {
+        return Err(("53300", format!("too many connections for role \"{role}\"")));
+    }
+    *n += 1;
+    Ok(RoleSlot(Some(key)))
 }
 
 /// Removes `name`'s rows from the ACL (`privileges::ACL_TABLE`): its grants,
@@ -1515,6 +1746,7 @@ pub async fn execute_role_statement_in(
             password,
             can_login,
             is_superuser,
+            attrs,
         } => {
             if lookup_role_in(database, &name, tx).await.is_some() {
                 return Err(format!("role \"{}\" already exists", name));
@@ -1525,7 +1757,62 @@ pub async fn execute_role_statement_in(
                 can_login,
                 is_superuser,
             };
-            run(database, &role.insert_statement(), tx).await
+            run(database, &role.insert_statement(), tx).await?;
+            write_role_attrs(database, &role.name, &attrs, tx).await
+        }
+        RoleStatement::Alter { name, password, login, superuser, attrs } => {
+            if lookup_role_in(database, &name, tx).await.is_none() {
+                return Err(format!("role \"{}\" does not exist", name));
+            }
+            let mut sets = Vec::new();
+            if let Some(password) = password {
+                sets.push(format!(
+                    "password = {}",
+                    match password.as_deref() {
+                        Some(p) => quote(&verifier_for(&name, p).to_stored()),
+                        None => "NULL".to_string(),
+                    }
+                ));
+            }
+            if let Some(login) = login {
+                sets.push(format!("can_login = {}", u8::from(login)));
+            }
+            if let Some(superuser) = superuser {
+                sets.push(format!("is_superuser = {}", u8::from(superuser)));
+            }
+            if !sets.is_empty() {
+                run(
+                    database,
+                    &format!("UPDATE {} SET {} WHERE name = {}", ROLE_TABLE, sets.join(", "), quote(&name)),
+                    tx,
+                )
+                .await?;
+            }
+            write_role_attrs(database, &name, &attrs, tx).await
+        }
+        RoleStatement::Rename { name, to } => {
+            let Some(role) = lookup_role_in(database, &name, tx).await else {
+                return Err(format!("role \"{}\" does not exist", name));
+            };
+            if lookup_role_in(database, &to, tx).await.is_some() {
+                return Err(format!("role \"{}\" already exists", to));
+            }
+            // An md5 verifier is salted with the name, so it cannot match
+            // under the new one: cleared, as PostgreSQL clears it.
+            let clear = matches!(role.verifier, Some(Verifier::Md5 { .. }));
+            run(
+                database,
+                &format!(
+                    "UPDATE {} SET name = {}{} WHERE name = {}",
+                    ROLE_TABLE,
+                    quote(&to),
+                    if clear { ", password = NULL" } else { "" },
+                    quote(&name)
+                ),
+                tx,
+            )
+            .await?;
+            crate::core::rql::privileges::rename_role(database, &name, &to, tx).await
         }
         RoleStatement::AlterPassword { name, password } => {
             if lookup_role_in(database, &name, tx).await.is_none() {
@@ -1586,6 +1873,7 @@ mod tests {
                 // `CREATE USER` implies LOGIN; `CREATE ROLE` does not.
                 can_login: true,
                 is_superuser: false,
+                attrs: RoleAttrs::default(),
             }
         );
     }
@@ -1600,6 +1888,7 @@ mod tests {
                 password: None,
                 can_login: false,
                 is_superuser: false,
+                attrs: RoleAttrs::default(),
             }
         );
 
@@ -1629,6 +1918,7 @@ mod tests {
                 password: Some("pw NOLOGIN SUPERUSER".to_string()),
                 can_login: true,
                 is_superuser: false,
+                attrs: RoleAttrs::default(),
             }
         );
         let parsed = parse_role_statement("CREATE ROLE esc2 PASSWORD 'a LOGIN'").unwrap().unwrap();

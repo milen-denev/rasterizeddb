@@ -2237,6 +2237,23 @@ where
         }
     };
 
+    // Its role's VALID UNTIL and CONNECTION LIMIT (R2), the slot held for
+    // the session's life.
+    let _role_slot = match crate::auth::admit_role_login(
+        database,
+        &principal.name,
+        principal.superuser,
+        principal.authenticated && !matches!(auth.method, crate::auth::AuthMethod::Peer),
+    )
+    .await
+    {
+        Ok(slot) => slot,
+        Err((code, message)) => {
+            log::info!("login refused for {}: {message}", principal.name);
+            send_fatal_error_response(stream, code, &message).await?;
+            return Ok(());
+        }
+    };
     // A licensed tenancy policy admits the session and bounds its database
     // (T7: connections counted only after authentication, a statement
     // timeout the client cannot start above). Open by default.
@@ -9428,7 +9445,29 @@ where
     // server is refused before any handler — builtin, role, catalogue or
     // engine — sees it.
     if let Some(verb) = privileged_statement(stmt) {
-        if !state.principal.may_administer() {
+        // A role changes its own password, and a CREATEROLE role manages
+        // the roles that are not superusers (R2): let through to the role
+        // handler, which runs them as anyone's.
+        let delegated = !state.principal.may_administer()
+            && matches!(verb, "CREATE ROLE" | "ALTER ROLE" | "DROP ROLE")
+            && match crate::auth::parse_role_statement(stmt) {
+                Some(Ok(statement)) => {
+                    match crate::auth::role_statement_permitted(database, &state.principal.name, &statement, state.current_tx()).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            fail_statement(state, stream, "42501", &e).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+                _ => false,
+            }
+            // CREATEDB (R2): the creator is copied into the new database as
+            // RD1 says, as the role it is here, no superuser there either.
+            || (!state.principal.may_administer()
+                && verb == "CREATE DATABASE"
+                && crate::auth::role_attrs(database, &state.principal.name, state.current_tx()).await.create_db);
+        if !delegated && !state.principal.may_administer() {
             log::info!(
                 "permission denied: {} attempted {} without superuser",
                 state.principal.name,
@@ -9563,11 +9602,7 @@ where
         match parsed {
             Err(e) => fail_statement(state, stream, "42601", &e).await?,
             Ok(statement) => {
-                let tag = match &statement {
-                    crate::auth::RoleStatement::Create { .. } => "CREATE ROLE",
-                    crate::auth::RoleStatement::AlterPassword { .. } => "ALTER ROLE",
-                    crate::auth::RoleStatement::Drop { .. } => "DROP ROLE",
-                };
+                let tag = statement.tag();
                 // In a block, the catalogue write is the block's: a
                 // ROLLBACK takes the role back, as PostgreSQL's does.
                 let tx = state.current_tx();

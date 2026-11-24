@@ -6733,18 +6733,16 @@ async fn process_native_request_for(
         return match parsed {
             Err(e) => error_response(&e),
             Ok(statement) => {
-                let verb = match statement {
-                    crate::auth::RoleStatement::Create { .. } => "CREATE ROLE",
-                    crate::auth::RoleStatement::AlterPassword { .. } => "ALTER ROLE",
-                    crate::auth::RoleStatement::Drop { .. } => "DROP ROLE",
-                };
+                let verb = statement.tag();
                 info!("Received {} from {}", verb, principal);
 
                 if !native_admin(&context, &principal, session).await {
-                    return error_response(&format!(
-                        "permission denied: {} is not a superuser",
-                        principal
-                    ));
+                    // Its own password, or a CREATEROLE role's (R2).
+                    if let Err(e) =
+                        crate::auth::role_statement_permitted(&context.database, &principal.user, &statement, None).await
+                    {
+                        return error_response(&e);
+                    }
                 }
 
                 let method = crate::auth::AuthMethod::ScramSha256;

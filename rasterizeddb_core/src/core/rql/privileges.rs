@@ -630,6 +630,68 @@ pub async fn delete_where(database: &Arc<Database>, filter: &str, tx: Option<TxI
     run(database, &format!("DELETE FROM {ACL_TABLE} WHERE {filter}"), tx).await.map(|_| ())
 }
 
+/// Sets role attribute `attr` of `role` to `value`, or clears it for
+/// `None` (`auth::ROLE_ATTR_RELATION`).
+pub async fn set_role_attr(database: &Arc<Database>, role: &str, attr: &str, value: Option<String>, tx: Option<TxId>) -> Result<(), String> {
+    use crate::auth::{ROLE_ATTR_RELATION, quote};
+    match value {
+        Some(value) => {
+            let row = AclRow {
+                relation: ROLE_ATTR_RELATION.to_string(),
+                grantee: role.to_string(),
+                privilege: attr.to_string(),
+                grantor: value,
+                grantable: false,
+            };
+            put(database, &row, tx).await
+        }
+        None => {
+            let filter =
+                format!("relation = {} AND grantee = {} AND privilege = {}", quote(ROLE_ATTR_RELATION), quote(role), quote(attr));
+            delete_where(database, &filter, tx).await
+        }
+    }
+}
+
+/// Every row naming role `from`, as grantee, grantor, member list or
+/// default-privilege owner, rewritten to name `to` (`ALTER ROLE … RENAME`).
+pub async fn rename_role(database: &Arc<Database>, from: &str, to: &str, tx: Option<TxId>) -> Result<(), String> {
+    use crate::auth::{ROLE_ATTR_RELATION, quote};
+    let member = format!("@role:{from}");
+    let defaults = format!("@default:{from}");
+    let rows: Vec<AclRow> = load(database, tx)
+        .await?
+        .into_iter()
+        .filter(|r| r.grantee == from || r.grantor == from || r.relation == member || r.relation == defaults)
+        .collect();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let filter = format!(
+        "grantee = {f} OR relation = {m} OR relation = {d} OR (grantor = {f} AND relation <> {a})",
+        f = quote(from),
+        m = quote(&member),
+        d = quote(&defaults),
+        a = quote(ROLE_ATTR_RELATION),
+    );
+    delete_where(database, &filter, tx).await?;
+    let swap = |name: &str| if name == from { to.to_string() } else { name.to_string() };
+    for mut r in rows {
+        if r.relation == member {
+            r.relation = format!("@role:{to}");
+        } else if r.relation == defaults {
+            r.relation = format!("@default:{to}");
+        }
+        r.grantee = swap(&r.grantee);
+        // An attribute row's grantor is its value, not a role.
+        if r.relation != ROLE_ATTR_RELATION {
+            r.grantor = swap(&r.grantor);
+        }
+        put(database, &r, tx).await?;
+    }
+    Ok(())
+}
+
 /// Every row of `relation`, renamed to `to` (a renamed table keeps its
 /// owner and grants).
 pub async fn rename(database: &Arc<Database>, relation: &str, to: &str, tx: Option<TxId>) -> Result<(), String> {

@@ -245,7 +245,11 @@ where
                     ));
                 }
                 for r in &roles {
-                    let filter = format!("grantee = {} AND privilege <> 'OWNER'", crate::auth::quote(r));
+                    let filter = format!(
+                        "grantee = {} AND privilege <> 'OWNER' AND relation <> {}",
+                        crate::auth::quote(r),
+                        crate::auth::quote(crate::auth::ROLE_ATTR_RELATION)
+                    );
                     privileges::delete_where(database, &filter, tx).await.map_err(|e| fail("XX000", e))?;
                     let defaults = format!("relation = {}", crate::auth::quote(&format!("@default:{r}")));
                     privileges::delete_where(database, &defaults, tx).await.map_err(|e| fail("XX000", e))?;

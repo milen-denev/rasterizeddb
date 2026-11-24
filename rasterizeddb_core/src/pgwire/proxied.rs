@@ -103,6 +103,28 @@ where
     let watch = PEER_WATCH.try_with(|w| w.clone()).ok().flatten();
     let mut conn = wire_out::WireStream::new(&mut stream, watch);
 
+    // As `authenticate_and_serve` admits a pgwire login: the role's VALID
+    // UNTIL and CONNECTION LIMIT (R2), then the tenancy policy (T7). Missing
+    // here, a MySQL or TDS login skipped both.
+    let _role_slot = match crate::auth::admit_role_login(&database, &login.user, login.superuser, login.authenticated).await {
+        Ok(slot) => slot,
+        Err((code, message)) => {
+            send_fatal_error_response(&mut conn, code, &message).await?;
+            return Ok(());
+        }
+    };
+    {
+        let ctx = crate::core::policy_hooks::SessionContext {
+            role: &login.user,
+            database: &database.name,
+            protocol: "proxied",
+            superuser: login.superuser,
+        };
+        if let Err(e) = crate::core::policy_hooks::tenancy().admit(&ctx) {
+            send_fatal_error_response(&mut conn, "28000", e.trim_start_matches("28000: ")).await?;
+            return Ok(());
+        }
+    }
     let mut key = [0u8; 4];
     crate::auth::fill_random(&mut key);
     let registration = crate::core::cancel::register_session(key);

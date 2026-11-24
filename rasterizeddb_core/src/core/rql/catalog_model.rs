@@ -470,6 +470,11 @@ pub(crate) struct RoleRow {
     pub name: String,
     pub superuser: bool,
     pub login: bool,
+    pub create_role: bool,
+    pub create_db: bool,
+    /// `-1`: no limit.
+    pub conn_limit: i64,
+    pub valid_until_us: Option<i64>,
 }
 
 /// A user's function or procedure, as `pg_proc` lists it.
@@ -1073,7 +1078,7 @@ pub(crate) async fn build_model(
     } else {
         Vec::new()
     };
-    let roles = roles(database).await;
+    let roles = roles(database, &acl).await;
     let owner = |relation: &str| {
         crate::core::rql::privileges::owner_of(&acl, relation)
             .and_then(|o| roles.iter().find(|r| r.name == o).map(|r| r.oid))
@@ -1240,7 +1245,7 @@ pub(crate) async fn build_model(
 /// The roles `rdb_roles` holds, with the bootstrap superuser's oid given to
 /// the first superuser; one `postgres` superuser when there is no catalogue
 /// (a server without authentication).
-async fn roles(database: &Arc<Database>) -> Vec<RoleRow> {
+async fn roles(database: &Arc<Database>, acl: &[crate::core::rql::privileges::AclRow]) -> Vec<RoleRow> {
     use crate::core::rql::{executor, lexer_s1::recognize_query_purpose};
     let mut out: Vec<RoleRow> = Vec::new();
     if database.has_table(crate::auth::ROLE_TABLE) {
@@ -1275,6 +1280,10 @@ async fn roles(database: &Arc<Database>) -> Vec<RoleRow> {
                         name,
                         login: flag(1),
                         superuser: flag(2),
+                        create_role: false,
+                        create_db: false,
+                        conn_limit: -1,
+                        valid_until_us: None,
                     });
                 }
             }
@@ -1289,8 +1298,23 @@ async fn roles(database: &Arc<Database>) -> Vec<RoleRow> {
                 name: "postgres".to_string(),
                 superuser: true,
                 login: true,
+                create_role: true,
+                create_db: true,
+                conn_limit: -1,
+                valid_until_us: None,
             },
         ),
+    }
+    // The attributes kept beside the role catalogue (`auth::RoleAttrs`).
+    for a in acl.iter().filter(|a| a.relation == crate::auth::ROLE_ATTR_RELATION) {
+        let Some(r) = out.iter_mut().find(|r| r.name == a.grantee) else { continue };
+        match a.privilege.as_str() {
+            "CREATEDB" => r.create_db = true,
+            "CREATEROLE" => r.create_role = true,
+            "CONNECTION LIMIT" => r.conn_limit = a.grantor.parse().unwrap_or(-1),
+            "VALID UNTIL" => r.valid_until_us = a.grantor.parse().ok(),
+            _ => {}
+        }
     }
     out
 }
@@ -2204,13 +2228,13 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                     t(&r.name),
                     V::B(r.superuser),
                     V::B(true),
-                    V::B(r.superuser),
-                    V::B(r.superuser),
+                    V::B(r.superuser || r.create_role),
+                    V::B(r.superuser || r.create_db),
                     V::B(r.login),
                     V::B(r.superuser),
-                    V::I(-1),
+                    V::I(r.conn_limit),
                     t("********"),
-                    V::N,
+                    r.valid_until_us.map_or(V::N, |us| t(crate::core::value_codec::format_timestamp_us(us))),
                     V::B(r.superuser),
                     V::N,
                     V::I(r.oid),
@@ -2225,12 +2249,12 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                 vec![
                     t(&r.name),
                     V::I(r.oid),
-                    V::B(r.superuser),
+                    V::B(r.superuser || r.create_db),
                     V::B(r.superuser),
                     V::B(r.superuser),
                     V::B(r.superuser),
                     t("********"),
-                    V::N,
+                    r.valid_until_us.map_or(V::N, |us| t(crate::core::value_codec::format_timestamp_us(us))),
                     V::N,
                 ]
             })
