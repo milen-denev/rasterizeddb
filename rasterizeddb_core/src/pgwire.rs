@@ -2237,6 +2237,37 @@ where
         }
     };
 
+    // A licensed tenancy policy admits the session and bounds its database
+    // (T7: connections counted only after authentication, a statement
+    // timeout the client cannot start above). Open by default.
+    let tenant_timeout = {
+        let ctx = crate::core::policy_hooks::SessionContext {
+            role: &principal.name,
+            database: &database.name,
+            protocol: "pgwire",
+            superuser: principal.superuser,
+        };
+        let policy = crate::core::policy_hooks::tenancy();
+        if let Err(e) = policy.admit(&ctx) {
+            send_fatal_error_response(stream, "28000", e.trim_start_matches("28000: ")).await?;
+            return Ok(());
+        }
+        let limits = policy.limits(&database.name);
+        if let Some(max) = limits.max_connections {
+            let sessions = catalog.listing().iter().find(|e| e.name == database.name).map_or(0, |e| e.sessions);
+            if sessions > max as u64 {
+                send_fatal_error_response(
+                    stream,
+                    "53300",
+                    &format!("too many connections for database \"{}\" (its limit is {max})", database.name),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+        limits.statement_timeout_ms
+    };
+
     // This session's cancel target: a process id unique among live sessions
     // and a secret key from the cryptographic generator, removed from the
     // registry when the session ends (the guard is dropped).
@@ -2248,7 +2279,11 @@ where
     // session, bounded (if at all) by the idle timeouts instead.
     context.handshake_finished.store(true, Ordering::Release);
     let startup_timeout = (
-        startup_statement_timeout(parameters),
+        match (startup_statement_timeout(parameters), tenant_timeout) {
+            (Some(asked), Some(cap)) if asked > 0 => Some(asked.min(cap)),
+            (_, Some(cap)) => Some(cap),
+            (asked, None) => asked,
+        },
         startup_lock_timeout(parameters),
         startup_shape_change(parameters),
     );

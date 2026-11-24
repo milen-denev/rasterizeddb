@@ -1424,6 +1424,16 @@ impl Conn {
                     _ => (false, false),
                 };
                 if ok {
+                    // Strict tenant mode keeps tenants off this port (T10).
+                    let ctx = crate::core::policy_hooks::SessionContext {
+                        role: user,
+                        database: &self.database.name,
+                        protocol: "redis",
+                        superuser,
+                    };
+                    if let Err(e) = crate::core::policy_hooks::tenancy().admit(&ctx) {
+                        return Err(format!("NOPERM {e}"));
+                    }
                     self.authed = true;
                     self.superuser = superuser;
                     self.user = user.to_string();
