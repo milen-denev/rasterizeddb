@@ -133,13 +133,7 @@ pub struct AlterTable {
 
 /// Strips quoting and any schema qualification from a relation or column name.
 fn bare_name(raw: &str) -> String {
-    raw.trim()
-        .trim_end_matches(&[',', ';'][..])
-        .split('.')
-        .next_back()
-        .unwrap_or(raw)
-        .trim_matches('"')
-        .to_string()
+    crate::core::sql_scan::bare_name(raw.trim().trim_end_matches(&[',', ';'][..]))
 }
 
 /// `ALTER INDEX [IF EXISTS] name RENAME TO new`: the index, whether `IF

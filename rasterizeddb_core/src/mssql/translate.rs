@@ -805,8 +805,7 @@ pub(crate) fn object_id(name: &str) -> i64 {
 
 /// `[dbo].[t]`, `dbo.t`, `t` written in a string (OBJECT_ID's argument).
 fn object_name_in(text: &str) -> String {
-    let last = text.rsplit('.').next().unwrap_or(text);
-    last.trim_matches(['[', ']', '"', ' ']).to_lowercase()
+    super::lex::last_name_part(text).to_lowercase()
 }
 
 /// `CROSS APPLY (…) [AS] t` is `CROSS JOIN LATERAL (…) t`; `OUTER APPLY`
@@ -1790,6 +1789,12 @@ fn sql_str(s: &str) -> String {
 /// A `sys.` or `INFORMATION_SCHEMA.` view as a derived table built now, or
 /// `None` when `schema.view` is not one.
 fn catalog_view(schema: &str, view: &str, cx: &Cx) -> Result<Option<String>, TsqlError> {
+    // Names are listed with their dots (`lex::NAME_DOT`): the view is a
+    // VALUES list, where every name is a string.
+    Ok(catalog_view_stored(schema, view, cx)?.map(|sql| super::lex::decode_dots(&sql).into_owned()))
+}
+
+fn catalog_view_stored(schema: &str, view: &str, cx: &Cx) -> Result<Option<String>, TsqlError> {
     let schema = schema.to_ascii_lowercase();
     let view = view.to_ascii_lowercase();
     if schema != "sys" && schema != "information_schema" {

@@ -41,17 +41,27 @@ const VERSION_TEXT: &str =
 
 /// SQL Server's system databases are the default database here: a client
 /// connects to `master` to create or drop its own.
-fn resolve_database<'a>(shared: &'a Shared, name: &'a str) -> &'a str {
+fn resolve_database(shared: &Shared, name: &str) -> String {
     if name.is_empty()
         || matches!(
             name.to_ascii_lowercase().as_str(),
             "master" | "model" | "msdb" | "tempdb"
         )
     {
-        shared.catalog.default_name()
-    } else {
-        name
+        return shared.catalog.default_name().to_string();
     }
+    // SQL Server compares database names without case, and `CREATE DATABASE
+    // [DenevColors]` made `denevcolors`: a login naming `DenevColors` must
+    // open it.
+    if shared.catalog.get(name).is_some() {
+        return name.to_string();
+    }
+    shared
+        .catalog
+        .names()
+        .into_iter()
+        .find(|n| n.eq_ignore_ascii_case(name))
+        .unwrap_or_else(|| name.to_string())
 }
 
 /// What a statement leaves the batch doing.
@@ -2440,11 +2450,12 @@ impl Session {
                     .and_then(|v| v.text())
                     .unwrap_or_default()
                     .to_ascii_uppercase();
-                let parts: Vec<String> = old
-                    .split('.')
-                    .map(|p| p.trim_matches(['[', ']']).to_lowercase())
+                let parts: Vec<String> = lex::name_parts(&old)
+                    .into_iter()
+                    .map(|p| p.to_lowercase())
                     .filter(|p| p != "dbo")
                     .collect();
+                let new = lex::encode_dots(new.trim_matches(['[', ']']).to_string());
                 let sql = if kind == "COLUMN" && parts.len() >= 2 {
                     format!(
                         "ALTER TABLE {} RENAME COLUMN {} TO {}",

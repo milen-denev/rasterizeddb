@@ -262,11 +262,7 @@ pub(crate) fn rename_target(sql: &str) -> Option<(String, String)> {
         return None;
     }
     let unquote = |raw: &str| -> Option<String> {
-        let part = raw.rsplit('.').next()?;
-        let name = match part.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
-            Some(inner) => inner.replace("\"\"", "\""),
-            None => part.to_string(),
-        };
+        let name = crate::core::sql_scan::bare_name(raw);
         (!name.is_empty()).then_some(name)
     };
     Some((unquote(words[i])?, unquote(words[i + 3])?))
@@ -284,13 +280,9 @@ pub(crate) fn targets(database: &Database, sql: &str) -> Option<(Vec<(String, Fi
     let name_at = |i: usize| -> Option<String> {
         let raw = words.get(i)?.trim_end_matches([';', '(']);
         let raw = raw.split('(').next()?;
-        let part = raw.rsplit('.').next()?;
         // Names arrive folded at the wire's entry; a quoted one keeps its
-        // case, its doubled quotes one.
-        let name = match part.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
-            Some(inner) => inner.replace("\"\"", "\""),
-            None => part.to_string(),
-        };
+        // case, its doubled quotes one, its dots its own.
+        let name = crate::core::sql_scan::bare_name(raw);
         (!name.is_empty()).then_some(name)
     };
     match (upper(0).as_str(), upper(1).as_str()) {
@@ -356,11 +348,7 @@ pub(crate) fn targets(database: &Database, sql: &str) -> Option<(Vec<(String, Fi
                         raw = raw[..raw.len() - tail.len()].trim_end();
                     }
                 }
-                let part = raw.rsplit('.').next().unwrap_or(raw);
-                let index = match part.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
-                    Some(inner) => inner.replace("\"\"", "\""),
-                    None => part.to_string(),
-                };
+                let index = crate::core::sql_scan::bare_name(raw);
                 if let Some(table) = database.index_owner(&index) {
                     if !existing.iter().any(|(t, _)| *t == table) {
                         existing.push((table, FileSet::Schema));
