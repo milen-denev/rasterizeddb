@@ -205,6 +205,17 @@ pub trait Model: FromRow + Sized {
     /// The table's hash partitioning (`#[rdb(partition_by = "…")]` on the
     /// struct), if it is partitioned.
     const PARTITION: Option<Partitioning> = None;
+    /// How the table compresses each row's variable-width values as one
+    /// frame (`#[rdb(row_compression = "zstd(9)")]` on the struct), as the
+    /// server names it in `pg_class.reloptions`: `zstd` or `zstd(n)`. `None`
+    /// for none, the server's default.
+    const ROW_COMPRESSION: Option<&'static str> = None;
+    /// The columns that store their values compressed
+    /// (`#[rdb(compression = "zstd(19)")]` on a field), each with its method
+    /// as the server names it in `pg_attribute.attcompression`: `zstd` or
+    /// `zstd(n)`. A column not listed stores its values as they are, the
+    /// server's default.
+    const COLUMN_COMPRESSION: &'static [(&'static str, &'static str)] = &[];
 
     /// Writes this value's column `i` as a literal into `out`.
     fn write_value(&self, column: usize, out: &mut String) -> Result<()>;
@@ -790,7 +801,7 @@ fn find_sql<M: Model>(key: &[&dyn ToSql]) -> Result<String> {
 /// The statements that create the model's table, its unique keys and its
 /// indexes, each safe to run again (`IF NOT EXISTS`).
 pub fn create_table_sql<M: Model>() -> Result<Vec<String>> {
-    TableSchema::of::<M>().create_sql()
+    TableSchema::of::<M>().create_sql_with(&Storage::of::<M>())
 }
 
 /// A model's table as data: what a [`Migrator`] keeps for each model it
@@ -805,6 +816,29 @@ pub struct TableSchema {
     pub columns: &'static [ColumnDef],
     /// The table's hash partitioning, if any.
     pub partition: Option<Partitioning>,
+}
+
+/// How a model's table stores its values: [`Model::ROW_COMPRESSION`] and
+/// [`Model::COLUMN_COMPRESSION`]. Kept beside a [`TableSchema`] rather than
+/// in it, whose fields are public and constructible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Storage {
+    pub(crate) row: Option<&'static str>,
+    pub(crate) columns: &'static [(&'static str, &'static str)],
+}
+
+impl Storage {
+    pub(crate) fn of<M: Model>() -> Self {
+        Storage {
+            row: M::ROW_COMPRESSION,
+            columns: M::COLUMN_COMPRESSION,
+        }
+    }
+
+    /// The method column `name` stores its values with, if any.
+    pub(crate) fn column(&self, name: &str) -> Option<&'static str> {
+        self.columns.iter().find(|(c, _)| *c == name).map(|(_, m)| *m)
+    }
 }
 
 /// A table hash-partitioned on its partition key: `PARTITION BY HASH (a,
@@ -861,7 +895,7 @@ impl TableSchema {
 
     /// `name TYPE [NOT NULL] [DEFAULT …]`, as `CREATE TABLE` and
     /// `ADD COLUMN` write a column.
-    pub(crate) fn column_ddl(column: &ColumnDef) -> Result<String> {
+    pub(crate) fn column_ddl(column: &ColumnDef, compression: Option<&str>) -> Result<String> {
         let mut line = ident(column.name)?;
         line.push(' ');
         line.push_str(if column.serial {
@@ -879,6 +913,12 @@ impl TableSchema {
         } else {
             column.sql_type
         });
+        // Where PostgreSQL's grammar puts it: after the type, before the
+        // constraints.
+        if let Some(method) = compression {
+            line.push_str(" COMPRESSION ");
+            line.push_str(method);
+        }
         if !column.nullable && !column.serial {
             line.push_str(" NOT NULL");
         }
@@ -903,10 +943,18 @@ impl TableSchema {
 
     /// `CREATE TABLE IF NOT EXISTS` (`… PARTITION BY HASH (…)` for a
     /// partitioned model), then the unique keys and indexes.
+    ///
+    /// A `TableSchema` does not carry the model's compression: for that,
+    /// [`create_table_sql`] or a [`Migrator`](migrate::Migrator).
     pub fn create_sql(&self) -> Result<Vec<String>> {
+        self.create_sql_with(&Storage::default())
+    }
+
+    /// [`create_sql`](Self::create_sql), with the model's compression.
+    pub(crate) fn create_sql_with(&self, storage: &Storage) -> Result<Vec<String>> {
         let mut lines = Vec::new();
         for column in self.columns {
-            lines.push(Self::column_ddl(column)?);
+            lines.push(Self::column_ddl(column, storage.column(column.name))?);
         }
         let key: Vec<String> = self
             .columns
@@ -933,6 +981,10 @@ impl TableSchema {
             }
             create.push(' ');
             create.push_str(&partition.clause()?);
+        }
+        // Where PostgreSQL puts storage options: after the partitioning.
+        if let Some(method) = storage.row {
+            create.push_str(&format!(" WITH (row_compression = '{method}')"));
         }
         let mut statements = vec![create];
         statements.extend(self.keys_sql()?);

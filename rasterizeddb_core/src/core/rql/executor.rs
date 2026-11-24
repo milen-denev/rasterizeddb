@@ -17795,6 +17795,86 @@ async fn add_check_constraint(
     }
 }
 
+/// `ALTER TABLE … RECOMPRESS` (and `VACUUM (FULL, RECOMPRESS)`): every row
+/// rewritten under the table's compression as it stands, so rows written
+/// before a `SET COMPRESSION` (or under an older level, or compressed and no
+/// longer wanted) are stored as the table now asks. A dictionary is trained
+/// for each compressed column, and for the row tail, from the values the
+/// table holds, and kept where it pays (`compression::train`); the old ones
+/// are retired with the old files.
+async fn recompress(database: &Arc<Database>, table_name: &str, schema: &crate::core::row::schema::TableSchema, tx: TxId) -> Result<(), String> {
+    use crate::core::compression::{train, MIN_VALUE_BYTES};
+    use crate::core::rql::type_modifier::{dictionary_marker, DICTIONARY_MARKER};
+    // At most this much of a column's values feeds its training: zstd's
+    // trainer is superlinear, and a sample this size already says what the
+    // dictionary will be.
+    const SAMPLE_VALUES: usize = 4096;
+    const SAMPLE_BYTES: usize = 8 * 1024 * 1024;
+    let columns: Vec<(String, i32)> = schema
+        .compression
+        .columns
+        .iter()
+        .filter_map(|c| {
+            let field = schema.fields.iter().find(|f| f.write_order == c.write_order && !f.is_deleted)?;
+            Some((field.name.clone(), c.codec.level))
+        })
+        .collect();
+    let row_level = schema.compression.row.as_ref().map(|c| c.level);
+    let mut string_columns: Vec<(u64, String)> = schema
+        .fields
+        .iter()
+        .filter(|f| !f.is_deleted && f.db_type.physical() == crate::core::db_type::DbType::STRING)
+        .map(|f| (f.write_order, f.name.clone()))
+        .collect();
+    string_columns.sort();
+    rewrite_rows(database, table_name, tx, move |definition, versions| {
+        definition.type_modifiers.retain(|m| !m.column.starts_with(DICTIONARY_MARKER));
+        if !crate::core::compression::ENABLED {
+            return Ok(versions);
+        }
+        for (name, level) in &columns {
+            let mut taken = 0usize;
+            let samples: Vec<&[u8]> = versions
+                .iter()
+                .filter_map(|v| v.values.iter().find(|(n, _, _)| n == name).map(|(_, b, _)| b.into_slice()))
+                .filter(|b| b.len() >= MIN_VALUE_BYTES)
+                .take_while(|b| {
+                    taken += b.len();
+                    taken <= SAMPLE_BYTES
+                })
+                .take(SAMPLE_VALUES)
+                .collect();
+            if let Some(dictionary) = train(&samples, *level) {
+                definition.type_modifiers.push(dictionary_marker(name, Some(dictionary.id)));
+            }
+        }
+        if let Some(level) = row_level {
+            // A row's tail: its strings' bytes in write_order, as
+            // `RowPointer::build_row_data` lays them out.
+            let tails: Vec<Vec<u8>> = versions
+                .iter()
+                .take(SAMPLE_VALUES)
+                .map(|v| {
+                    let mut tail = Vec::new();
+                    for (_, name) in &string_columns {
+                        if let Some((_, b, _)) = v.values.iter().find(|(n, _, _)| n == name) {
+                            tail.extend_from_slice(b.into_slice());
+                        }
+                    }
+                    tail
+                })
+                .filter(|t| t.len() >= MIN_VALUE_BYTES)
+                .collect();
+            let samples: Vec<&[u8]> = tails.iter().map(Vec::as_slice).collect();
+            if let Some(dictionary) = train(&samples, level) {
+                definition.type_modifiers.push(dictionary_marker("", Some(dictionary.id)));
+            }
+        }
+        Ok(versions)
+    })
+    .await
+}
+
 async fn execute_alter_table_action(
     plan: crate::core::rql::lexer_alter::AlterTable,
     database: &Arc<Database>,
@@ -17866,6 +17946,51 @@ async fn execute_alter_table_action(
                 plan.table_name, reason
             );
             return ddl_ok(0);
+        }
+        // `SET (row_compression = …)` / `RESET (row_compression)`: the
+        // table's tail marker, for rows written from now on. Accepted and
+        // ignored by a build that cannot compress.
+        AlterAction::SetRowCompression { level } => {
+            use crate::core::rql::type_modifier::{dictionary_marker, dictionary_of, row_compression_marker, row_compression_of};
+            if !crate::core::compression::ENABLED || row_compression_of(&schema.type_modifiers) == level {
+                return ddl_ok(0);
+            }
+            if level.is_some() {
+                if let Err(e) = database.require_compressed_values() {
+                    return ddl_error(&format!(
+                        "the database could not be marked for compressed values ({}): {e}",
+                        crate::core::database::incompat::COMPRESSED_VALUES_V1
+                    ));
+                }
+            }
+            let mut records = vec![row_compression_marker(level)];
+            // A tail dictionary trained for another level or method is
+            // retired with it; RECOMPRESS trains one for the new setting.
+            if dictionary_of("", &schema.type_modifiers).is_some() {
+                records.push(dictionary_marker("", None));
+            }
+            return match database
+                .reload_atomic(&plan.table_name, |old| async move {
+                    let io = old.io_schema.clone();
+                    let mut writes = crate::core::torn_tail::SidecarWrites::default();
+                    for record in &records {
+                        crate::core::rql::type_modifier::stage(&*io, &mut writes, record).map_err(|e| e.to_string())?;
+                    }
+                    writes.commit(&*io).await.map_err(|e| e.to_string())
+                })
+                .await
+            {
+                Ok(()) => ddl_ok(0),
+                Err(failure) => reload_failed(failure, ""),
+            };
+        }
+        AlterAction::Recompress => {
+            // Boxed: the rewrite's state would otherwise sit in this
+            // statement's future, which is near its stack limit.
+            return match Box::pin(recompress(database, &plan.table_name, &schema, tx)).await {
+                Ok(()) => ddl_ok(0),
+                Err(e) => ddl_error(&e),
+            };
         }
         // A foreign key's rows checked now, as `ADD` would have checked
         // them without `NOT VALID` (23503 for the first orphan, nothing
@@ -19022,6 +19147,54 @@ async fn execute_alter_table_action(
             else {
                 return ddl_error(&format!("column '{}' does not exist", name));
             };
+
+            // `SET COMPRESSION zstd(9)` / `lz4` / `pglz` / `default`: the
+            // column's marker (`type_modifier::COMPRESSION_MARKER`). As in
+            // PostgreSQL it applies to values written from now on; a row
+            // already stored keeps its bytes until it is next written.
+            if upper.starts_with("SET COMPRESSION") {
+                let method = detail["SET COMPRESSION".len()..].trim();
+                let level = match crate::core::compression::parse_method(method) {
+                    Ok(level) => level,
+                    Err(e) => return ddl_error(&e),
+                };
+                if level.is_some() && field.db_type.physical() != crate::core::db_type::DbType::STRING {
+                    return ddl_error(&format!(
+                        "column data type {} does not support compression",
+                        field.literal_type().to_string().to_ascii_lowercase()
+                    ));
+                }
+                // Accepted and ignored by a build that cannot compress, as
+                // `pg_dump` output carries the clause.
+                if !crate::core::compression::ENABLED {
+                    return ddl_ok(0);
+                }
+                if crate::core::rql::type_modifier::compression_of(&field.name, &schema.type_modifiers) == level {
+                    return ddl_ok(0);
+                }
+                // Fenced before the record that needs it is written.
+                if level.is_some() {
+                    if let Err(e) = database.require_compressed_values() {
+                        return ddl_error(&format!(
+                            "the database could not be marked for compressed values ({}): {e}",
+                            crate::core::database::incompat::COMPRESSED_VALUES_V1
+                        ));
+                    }
+                }
+                let record = crate::core::rql::type_modifier::compression_marker(&field.name, level);
+                return match database
+                    .reload_atomic(&plan.table_name, |old| async move {
+                        let io = old.io_schema.clone();
+                        let mut writes = crate::core::torn_tail::SidecarWrites::default();
+                        crate::core::rql::type_modifier::stage(&*io, &mut writes, &record).map_err(|e| e.to_string())?;
+                        writes.commit(&*io).await.map_err(|e| e.to_string())
+                    })
+                    .await
+                {
+                    Ok(()) => ddl_ok(0),
+                    Err(failure) => reload_failed(failure, ""),
+                };
+            }
 
             // `TYPE t`. sea-orm's `modify_column` restates the whole column
             // definition even when only nullability moves, so the type it names
@@ -24108,6 +24281,23 @@ pub(crate) async fn execute_with_need(
                     names
                 }
             };
+
+            // `VACUUM (FULL, RECOMPRESS)`: each table rewritten as `ALTER
+            // TABLE … RECOMPRESS` rewrites it, under the same locks. A rewrite
+            // lays every row out afresh, so it is a VACUUM FULL as well.
+            if request.recompress {
+                for name in names {
+                    let sql = format!("ALTER TABLE {} RECOMPRESS", crate::core::value_codec::double_quoted(&name));
+                    let Some(purpose) = recognize_query_purpose(&sql) else {
+                        return ddl_error(&format!("cannot parse {sql}"));
+                    };
+                    let response = Box::pin(execute(purpose, database.clone())).await;
+                    if response.first() == Some(&3u8) {
+                        return response;
+                    }
+                }
+                return ddl_ok(0);
+            }
 
             let mut reclaimed: u64 = 0;
             // Tables compacted whose space could not be given back.

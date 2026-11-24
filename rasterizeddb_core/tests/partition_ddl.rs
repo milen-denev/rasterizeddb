@@ -250,7 +250,10 @@ fn refused_shapes_write_nothing() {
             ("CREATE TABLE pr (k INT NOT NULL) PARTITION BY RANGE (k)", "RANGE"),
             ("CREATE TABLE pr (k INT NOT NULL) PARTITION BY LIST (k)", "LIST"),
             ("CREATE TABLE pr (k INT NOT NULL) PARTITION BY HASH (k) COLOCATE WITH pd_parent", "COLOCATE"),
-            ("CREATE TABLE pr (k INT NOT NULL) PARTITION BY HASH (k) WITH (fillfactor = 70)", "WITH"),
+            // `… PARTITION BY HASH (k) WITH (fillfactor = 70)` is no longer
+            // here: storage options after the partitioning are PostgreSQL's
+            // grammar, taken since storage compression (`lexer_ct`'s
+            // `storage_options_follow_the_partition_clause`).
             ("CREATE TABLE pr (k INT NOT NULL) PARTITION BY HASH (k) TABLESPACE fast", "TABLESPACE"),
             ("CREATE TABLE pr (k INT NOT NULL) PARTITION BY HASH (k) PARTITIONS 0", "PARTITIONS 0"),
             ("CREATE TABLE pr (k INT NOT NULL) PARTITION BY HASH (k) PARTITIONS 1048577", "PARTITIONS 1048577"),

@@ -170,6 +170,95 @@ pub const PRECISION_MARKER: &str = "\u{1}precision:";
 /// there.
 pub const ELEMENT_MARKER: &str = "\u{1}element:";
 
+/// The prefix of a record saying a variable-width column stores its values
+/// compressed (`core::compression`): `precision` is the codec
+/// (`compression::CODEC_ZSTD`), `scale` the level. A binary that predates it
+/// never reads it; the directory's `compressed_values_v1` flag refuses such a
+/// binary before it reads a frame.
+pub const COMPRESSION_MARKER: &str = "\u{1}compression:";
+
+/// The record giving `column` the compression `level`, or retiring its
+/// compression when `None`.
+pub fn compression_marker(column: &str, level: Option<i32>) -> TypeModifier {
+    TypeModifier {
+        column: format!("{COMPRESSION_MARKER}{column}"),
+        precision: if level.is_some() { u16::from(crate::core::compression::CODEC_ZSTD) } else { 0 },
+        scale: level.unwrap_or(0).clamp(0, i32::from(u16::MAX)) as u16,
+        is_deleted: level.is_none(),
+    }
+}
+
+/// The key of the record saying the table compresses each row's tail as one
+/// frame (`WITH (row_compression = …)`): `precision` is the codec, `scale`
+/// the level, as [`COMPRESSION_MARKER`]'s. No column has the name, so no
+/// per-column lookup meets it.
+pub const ROW_COMPRESSION_MARKER: &str = "\u{1}row_compression:";
+
+/// The prefix of a record naming the zstd dictionary a column's frames are
+/// made with (`core::compression::Dictionary`), its id's low and high
+/// sixteen bits in `precision` and `scale`; the key with no column after it
+/// is the row tail's. The dictionary's bytes are in the `_schema_ZD.db`
+/// sidecar.
+pub const DICTIONARY_MARKER: &str = "\u{1}dictionary:";
+
+/// Whether `modifiers` ask for any compression: a definition that does needs
+/// the directory fenced (`incompat::COMPRESSED_VALUES_V1`) before its
+/// records are written.
+pub fn declares_compression(modifiers: &[TypeModifier]) -> bool {
+    modifiers.iter().any(|m| {
+        !m.is_deleted && (m.column.starts_with(COMPRESSION_MARKER) || m.column == ROW_COMPRESSION_MARKER)
+    })
+}
+
+/// The record giving the table's row tail the compression `level`, or
+/// retiring it when `None`.
+pub fn row_compression_marker(level: Option<i32>) -> TypeModifier {
+    TypeModifier { column: ROW_COMPRESSION_MARKER.to_string(), ..compression_marker("", level) }
+}
+
+/// The zstd level `modifiers` give the table's row tail, when it compresses.
+pub fn row_compression_of(modifiers: &[TypeModifier]) -> Option<i32> {
+    modifiers
+        .iter()
+        .rev()
+        .find(|m| m.column == ROW_COMPRESSION_MARKER)
+        .filter(|m| !m.is_deleted && m.precision == u16::from(crate::core::compression::CODEC_ZSTD))
+        .map(|m| i32::from(m.scale))
+        .filter(|l| (crate::core::compression::MIN_LEVEL..=crate::core::compression::MAX_LEVEL).contains(l))
+}
+
+/// The record naming dictionary `id` for `column` (`""`: the row tail), or
+/// retiring the one it had when `None`.
+pub fn dictionary_marker(column: &str, id: Option<u32>) -> TypeModifier {
+    let id = id.unwrap_or(0);
+    TypeModifier {
+        column: format!("{DICTIONARY_MARKER}{column}"),
+        precision: (id & 0xFFFF) as u16,
+        scale: (id >> 16) as u16,
+        is_deleted: id == 0,
+    }
+}
+
+/// The dictionary id `modifiers` name for `column` (`""`: the row tail).
+pub fn dictionary_of(column: &str, modifiers: &[TypeModifier]) -> Option<u32> {
+    let key = format!("{DICTIONARY_MARKER}{column}");
+    modifiers
+        .iter()
+        .rev()
+        .find(|m| if column.is_empty() { m.column == key } else { m.column.eq_ignore_ascii_case(&key) })
+        .filter(|m| !m.is_deleted)
+        .map(|m| u32::from(m.precision) | (u32::from(m.scale) << 16))
+        .filter(|id| *id != 0)
+}
+
+/// The zstd level `modifiers` record for `column`, when it compresses.
+pub fn compression_of(column: &str, modifiers: &[TypeModifier]) -> Option<i32> {
+    live_marker(COMPRESSION_MARKER, column, modifiers)
+        .filter(|m| m.precision == u16::from(crate::core::compression::CODEC_ZSTD))
+        .map(|m| i32::from(m.scale))
+        .filter(|l| (crate::core::compression::MIN_LEVEL..=crate::core::compression::MAX_LEVEL).contains(l))
+}
+
 /// The element type `INTEGER[]`, `int4[]`, `boolean ARRAY` or
 /// `numeric(10,2)[]` declares, as a [`TextTypmod::Element`]; `None` for a type
 /// that is not an array, and for an array of text (`text[]`, `varchar(n)[]`),

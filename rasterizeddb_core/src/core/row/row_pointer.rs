@@ -2,7 +2,7 @@ use std::{io::Cursor, sync::atomic::AtomicU64};
 
 use rclite::Arc;
 
-use super::{error::Result, row::RowWrite};
+use super::{error::Result, row::{ColumnWritePayload, RowWrite}};
 use byteorder::{LittleEndian, WriteBytesExt};
 
 #[cfg(feature = "enable_long_row")]
@@ -828,6 +828,13 @@ fn string_position(row_position: u64, header: &[u8]) -> std::io::Result<u64> {
     })
 }
 
+/// The length word of a string header: the stored size, and above it the
+/// compression flag.
+#[inline(always)]
+fn stored_length_word(header: &[u8]) -> u32 {
+    u32::from_le_bytes(header[8..12].try_into().unwrap())
+}
+
 /// A string column's cell in a row: where its bytes start, as an offset from
 /// the row's start (eight bytes), and how many there are (four).
 pub(crate) const STRING_HEADER_BYTES: usize = 12;
@@ -839,11 +846,14 @@ pub(crate) const STRING_HEADER_BYTES: usize = 12;
 ///
 /// The checks [`RowPointer::fetch_row_reuse_async`] makes of a string, for a
 /// reader of cells (`processor::column_scan`) to make alike.
+///
+/// The size is of the bytes stored: a compressed value's frame, its flag
+/// ([`string_is_compressed`]) masked off (`core::compression`).
 #[inline]
 pub(crate) fn string_extent(row_position: u64, row_length: u64, header: &[u8]) -> std::io::Result<(u64, usize)> {
-    const MAX_REASONABLE_STRING_BYTES: usize = 64 * 1024 * 1024;
+    const MAX_REASONABLE_STRING_BYTES: usize = crate::core::compression::MAX_VALUE_BYTES;
     let string_row_position = string_position(row_position, header)?;
-    let string_size = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+    let string_size = (stored_length_word(header) & crate::core::compression::LENGTH_MASK) as usize;
     if string_size == 0 {
         return Ok((string_row_position, 0));
     }
@@ -867,6 +877,180 @@ pub(crate) fn string_extent(row_position: u64, row_length: u64, header: &[u8]) -
         ));
     }
     Ok((string_row_position, string_size))
+}
+
+/// What a string header says is stored for its value
+/// (`core::compression`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StringCell {
+    /// The value's bytes, or (`frame`) a frame of them, at `at`.
+    Bytes { at: u64, len: usize, frame: bool },
+    /// The value is `len` bytes at `pos` of the decompressed bytes of the
+    /// row's tail frame, which is the `frame_len` bytes at `frame_at`: the
+    /// rest of the row.
+    InTail { frame_at: u64, frame_len: usize, pos: usize, len: usize },
+}
+
+/// Reads a string header of a row of `row_length` bytes at `row_position`:
+/// [`string_extent`]'s checks for bytes stored in the row, and for a value in
+/// the row's tail frame that the frame starts inside the row. Where the value
+/// lies in the frame is checked once it is decompressed ([`tail_value`]).
+#[inline]
+pub(crate) fn string_cell(row_position: u64, row_length: u64, header: &[u8]) -> std::io::Result<StringCell> {
+    use crate::core::compression::{COMPRESSED, IN_TAIL, LENGTH_MASK, MAX_VALUE_BYTES};
+    let word = stored_length_word(header);
+    if word & IN_TAIL == 0 {
+        let (at, len) = string_extent(row_position, row_length, header)?;
+        return Ok(StringCell::Bytes { at, len, frame: word & COMPRESSED != 0 && len != 0 });
+    }
+    let len = (word & LENGTH_MASK) as usize;
+    if word & COMPRESSED != 0 || len > MAX_VALUE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid string size word {word:#x} (likely misread header)"),
+        ));
+    }
+    let offset = u64::from_le_bytes(header[0..8].try_into().unwrap());
+    let frame_start = offset >> 32;
+    if frame_start >= row_length {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid tail frame start {frame_start} in a row of {row_length} bytes (likely misread header)"),
+        ));
+    }
+    Ok(StringCell::InTail {
+        frame_at: row_position + frame_start,
+        frame_len: (row_length - frame_start) as usize,
+        pos: (offset & 0xFFFF_FFFF) as usize,
+        len,
+    })
+}
+
+/// The `len` bytes at `pos` of a decompressed tail, or the error a header
+/// pointing past it is.
+#[inline]
+pub(crate) fn tail_value(tail: &[u8], pos: usize, len: usize) -> std::io::Result<&[u8]> {
+    tail.get(pos..pos.saturating_add(len)).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("value at {pos}+{len} lies past a row tail of {} bytes (likely misread header)", tail.len()),
+        )
+    })
+}
+
+/// A fetched column whose value is in its row's tail frame
+/// ([`StringCell::InTail`]).
+pub(crate) struct TailValue {
+    pub col_idx: usize,
+    pub frame_at: u64,
+    pub frame_len: usize,
+    pub pos: usize,
+    pub len: usize,
+}
+
+/// Fills each of `tails`' columns with its value, decompressing the row's
+/// tail frame once (a row has one; a misread header naming another is read
+/// too, and its value checked against it).
+async fn fill_from_tails<S: StorageIO>(
+    io: &S,
+    columns: &mut crate::core::row::row::RowColumns,
+    tails: &[TailValue],
+) -> std::io::Result<()> {
+    let mut decoded: Option<(u64, MemoryBlock)> = None;
+    for t in tails {
+        if decoded.as_ref().map(|(at, _)| *at) != Some(t.frame_at) {
+            let mut frame = MEMORY_POOL.acquire(t.frame_len);
+            let mut at = t.frame_at;
+            io.read_data_into_buffer(&mut at, frame.into_slice_mut()).await?;
+            decoded = Some((t.frame_at, crate::core::compression::decompress(frame.into_slice())?));
+        }
+        let tail = &decoded.as_ref().expect("decoded above").1;
+        let value = tail_value(tail.into_slice(), t.pos, t.len)?;
+        let mut block = MEMORY_POOL.acquire(t.len);
+        block.into_slice_mut().copy_from_slice(value);
+        columns[t.col_idx].data = block;
+    }
+    Ok(())
+}
+
+/// `row_write` with each string value of a column `policy` compresses
+/// replaced by its frame (`core::compression::compress`), and the
+/// `write_order`s of the columns that got one. `None` when no value is
+/// compressed (no such column, every value short or incompressible), so the
+/// row is built as it is, with no copy.
+fn encode_values(
+    row_write: &RowWrite,
+    policy: &crate::core::compression::StoragePolicy,
+) -> Option<(RowWrite, SmallVec<[u32; 4]>)> {
+    if policy.columns.is_empty() {
+        return None;
+    }
+    let mut frames: SmallVec<[(usize, Vec<u8>); 4]> = SmallVec::new();
+    for (i, column) in row_write.columns_writing_data.iter().enumerate() {
+        if column.column_type != DbType::STRING {
+            continue;
+        }
+        let Some(codec) = policy.column(column.write_order as u64) else {
+            continue;
+        };
+        let raw = column.data.into_slice();
+        if let Some(frame) = crate::core::compression::compress(raw, codec) {
+            policy.counters.record(false, raw.len(), frame.len());
+            frames.push((i, frame));
+        }
+    }
+    if frames.is_empty() {
+        return None;
+    }
+    let mut compressed: SmallVec<[u32; 4]> = SmallVec::new();
+    let mut columns = SmallVec::with_capacity(row_write.columns_writing_data.len());
+    for (i, column) in row_write.columns_writing_data.iter().enumerate() {
+        let data = match frames.iter_mut().find(|(at, _)| *at == i) {
+            Some((_, frame)) => {
+                compressed.push(column.write_order);
+                MemoryBlock::from_vec(std::mem::take(frame))
+            }
+            None => column.data.clone(),
+        };
+        columns.push(ColumnWritePayload {
+            data,
+            write_order: column.write_order,
+            column_type: column.column_type.clone(),
+            size: column.size,
+        });
+    }
+    Some((RowWrite { columns_writing_data: columns }, compressed))
+}
+
+/// `raw`, a row as [`RowPointer::build_row_data`] lays it out, with its tail
+/// (every string's bytes, after the fixed-width region) replaced by one frame
+/// of them, and every non-empty string's header saying where in the frame's
+/// decompressed bytes it is (`core::compression::IN_TAIL`). `None` when the
+/// tail is short, does not compress, or the row is too large to address.
+fn compress_tail(raw: &[u8], row_write: &RowWrite, codec: &crate::core::compression::Codec) -> Option<Vec<u8>> {
+    let fixed_len: usize = row_write.columns_writing_data.iter().map(|c| c.size as usize).sum();
+    if fixed_len > u32::MAX as usize || raw.len() - fixed_len > u32::MAX as usize {
+        return None;
+    }
+    let frame = crate::core::compression::compress(&raw[fixed_len..], codec)?;
+    let mut out = Vec::with_capacity(fixed_len + frame.len());
+    out.extend_from_slice(&raw[..fixed_len]);
+    out.extend_from_slice(&frame);
+    let mut at = 0usize;
+    for column in row_write.columns_writing_data.iter().sorted_by(|a, b| a.write_order.cmp(&b.write_order)) {
+        if column.column_type == DbType::STRING {
+            let header = &mut out[at..at + STRING_HEADER_BYTES];
+            let offset = u64::from_le_bytes(header[0..8].try_into().unwrap());
+            let len = stored_length_word(header);
+            if len != 0 {
+                let pos = offset - fixed_len as u64;
+                header[0..8].copy_from_slice(&(((fixed_len as u64) << 32) | pos).to_le_bytes());
+                header[8..12].copy_from_slice(&(len | crate::core::compression::IN_TAIL).to_le_bytes());
+            }
+        }
+        at += column.size as usize;
+    }
+    Some(out)
 }
 
 #[derive(Debug, Clone)]
@@ -1343,6 +1527,17 @@ impl RowPointer {
             let actual = column.data.into_slice().len() as u64;
 
             if column.column_type == DbType::STRING {
+                // A string no reader returns (`string_extent` refuses one
+                // over this) was stored anyway, and every read of its row
+                // failed from then on.
+                if actual > crate::core::compression::MAX_VALUE_BYTES as u64 {
+                    return Err(super::error::RowError::InvalidLength(format!(
+                        "value of {} bytes in column {} exceeds the {}-byte limit of a stored value",
+                        actual,
+                        column.write_order,
+                        crate::core::compression::MAX_VALUE_BYTES
+                    )));
+                }
                 // A string contributes a fixed header plus its bytes, which live
                 // in the variable-length region after the fixed columns.
                 let header = column.column_type.get_size() as u64;
@@ -1386,6 +1581,42 @@ impl RowPointer {
         Ok(())
     }
 
+    /// The bytes `row_write` is stored as under `policy`
+    /// (`core::compression`), checked first ([`Self::validate`]):
+    ///
+    /// - no policy, or an empty one: the row as it always was;
+    /// - a row codec: the row with its tail as one frame, when that saves
+    ///   bytes ([`compress_tail`]);
+    /// - column codecs: each such column's value as its own frame, when that
+    ///   saves bytes ([`encode_values`]).
+    ///
+    /// Encoded once per write: an update that relocates stores these bytes,
+    /// one that overwrites in place writes them.
+    pub(crate) fn encode_row(
+        row_write: &RowWrite,
+        policy: Option<&crate::core::compression::StoragePolicy>,
+    ) -> Result<MemoryBlock> {
+        Self::validate(row_write)?;
+        if let Some(policy) = policy.filter(|p| !p.is_empty()) {
+            if let Some(codec) = &policy.row {
+                let (total, strings) = Self::calculate_total_bytes(row_write);
+                let raw = Self::build_row_data(row_write, total as usize, strings as usize, &[]);
+                if let Some(stored) = compress_tail(raw.into_slice(), row_write, codec) {
+                    let fixed = (total - strings as u64) as usize;
+                    policy.counters.record(true, strings as usize, stored.len() - fixed);
+                    return Ok(MemoryBlock::from_vec(stored));
+                }
+                return Ok(raw);
+            }
+            if let Some((stored, compressed)) = encode_values(row_write, policy) {
+                let (total, strings) = Self::calculate_total_bytes(&stored);
+                return Ok(Self::build_row_data(&stored, total as usize, strings as usize, &compressed));
+            }
+        }
+        let (total, strings) = Self::calculate_total_bytes(row_write);
+        Ok(Self::build_row_data(row_write, total as usize, strings as usize, &[]))
+    }
+
     fn calculate_total_bytes(row_write: &RowWrite) -> (u64, u32) {
         #[cfg(feature = "enable_long_row")]
         {
@@ -1426,10 +1657,19 @@ impl RowPointer {
         }
     }
 
+    /// The bytes of a row: every column in `write_order`, a fixed-width one
+    /// as it is and a string as its 12-byte header, then the strings
+    /// (layout in [`RowPointer::write_row_with_pointer_record_pos`]). A
+    /// string column whose `write_order` is in `compressed` carries a frame
+    /// ([`encode_for_storage`]) and gets the flag in its header's length.
+    ///
+    /// The one encoder: an insert and an in-place rewrite used to build the
+    /// bytes each with a copy of this loop.
     fn build_row_data(
         row_write: &RowWrite,
         total_bytes: usize,
         total_string_size: usize,
+        compressed: &[u32],
     ) -> MemoryBlock {
         let mut block = MEMORY_POOL.acquire(total_bytes);
         let slice = block.into_slice_mut();
@@ -1475,9 +1715,14 @@ impl RowPointer {
                 slice[row_position as usize..row_position as usize + 8]
                     .copy_from_slice(&end_of_row_bytes);
 
-                // Write STRING_SIZE
+                // Write STRING_SIZE, flagged when the bytes are a frame.
+                let length_word = if compressed.contains(&column.write_order) {
+                    string_size | crate::core::compression::COMPRESSED
+                } else {
+                    string_size
+                };
                 slice[row_position as usize + 8..row_position as usize + 4 + 8]
-                    .copy_from_slice(&string_size.to_le_bytes());
+                    .copy_from_slice(&length_word.to_le_bytes());
 
                 end_of_row += string_column_slice.len() as u64;
                 row_position = end_of_column;
@@ -1546,6 +1791,75 @@ impl RowPointer {
         pointers_io: Arc<S>,
         rows_io: Arc<S>,
         pointer_record_pos: u64,
+        #[cfg(feature = "enable_long_row")] last_id: &AtomicU64,
+        #[cfg(not(feature = "enable_long_row"))] last_id: &AtomicU64,
+        table_length: &AtomicU64,
+        #[cfg(feature = "enable_long_row")] cluster: u32,
+        row_write: &RowWrite,
+        txn: Option<u64>,
+        free_space: Option<&FreeSpace>,
+        written_by: TxId,
+    ) -> Result<(RowPointer, Option<u64>)> {
+        self.update_encoded(
+            pointers_io,
+            rows_io,
+            pointer_record_pos,
+            last_id,
+            table_length,
+            #[cfg(feature = "enable_long_row")]
+            cluster,
+            row_write,
+            Self::encode_row(row_write, None)?.into_slice(),
+            txn,
+            free_space,
+            written_by,
+        )
+        .await
+    }
+
+    /// [`Self::update_with_pointer_record_pos`] with a table's compression
+    /// applied, as [`Self::write_row_with_pointer_record_pos_compressed`]
+    /// applies it. The in-place rewrite and the relocation store the same
+    /// bytes, encoded once.
+    pub async fn update_with_pointer_record_pos_compressed<S: StorageIO>(
+        &mut self,
+        pointers_io: Arc<S>,
+        rows_io: Arc<S>,
+        pointer_record_pos: u64,
+        #[cfg(feature = "enable_long_row")] last_id: &AtomicU64,
+        #[cfg(not(feature = "enable_long_row"))] last_id: &AtomicU64,
+        table_length: &AtomicU64,
+        #[cfg(feature = "enable_long_row")] cluster: u32,
+        row_write: &RowWrite,
+        policy: &crate::core::compression::StoragePolicy,
+        txn: Option<u64>,
+        free_space: Option<&FreeSpace>,
+        written_by: TxId,
+    ) -> Result<(RowPointer, Option<u64>)> {
+        let block = Self::encode_row(row_write, Some(policy))?;
+        self.update_encoded(
+            pointers_io,
+            rows_io,
+            pointer_record_pos,
+            last_id,
+            table_length,
+            #[cfg(feature = "enable_long_row")]
+            cluster,
+            row_write,
+            block.into_slice(),
+            txn,
+            free_space,
+            written_by,
+        )
+        .await
+    }
+
+    /// The update itself, of a row already encoded for storage.
+    async fn update_encoded<S: StorageIO>(
+        &mut self,
+        pointers_io: Arc<S>,
+        rows_io: Arc<S>,
+        pointer_record_pos: u64,
 
         #[cfg(feature = "enable_long_row")] last_id: &AtomicU64,
         #[cfg(not(feature = "enable_long_row"))] last_id: &AtomicU64,
@@ -1555,6 +1869,9 @@ impl RowPointer {
         #[cfg(feature = "enable_long_row")] cluster: u32,
 
         row_write: &RowWrite,
+
+        // The row's bytes as stored (`encode_row`).
+        stored: &[u8],
 
         // A transaction to join, or `None` to open and commit one here.
         txn: Option<u64>,
@@ -1576,7 +1893,7 @@ impl RowPointer {
         // it, and this level commits or aborts.
         if txn.is_none() {
             let txn = rows_io.begin_txn();
-            let result = Box::pin(self.update_with_pointer_record_pos(
+            let result = Box::pin(self.update_encoded(
                 pointers_io.clone(),
                 rows_io.clone(),
                 pointer_record_pos,
@@ -1585,6 +1902,7 @@ impl RowPointer {
                 #[cfg(feature = "enable_long_row")]
                 cluster,
                 row_write,
+                stored,
                 Some(txn),
                 free_space,
                 written_by,
@@ -1613,7 +1931,7 @@ impl RowPointer {
             };
         }
 
-        let (new_total_bytes_u64, new_total_string_size) = Self::calculate_total_bytes(row_write);
+        let new_total_bytes_u64 = stored.len() as u64;
         let old_len_u64 = self.length as u64;
 
         // One transaction for whichever path we take. Both of them touch two
@@ -1646,7 +1964,7 @@ impl RowPointer {
             .await?;
 
             let (new_pointer_record_pos, new_pointer) =
-                RowPointer::write_row_with_pointer_record_pos(
+                RowPointer::write_encoded_row(
                     pointers_io,
                     rows_io,
                     last_id,
@@ -1654,6 +1972,7 @@ impl RowPointer {
                     #[cfg(feature = "enable_long_row")]
                     cluster,
                     row_write,
+                    stored,
                     // Same transaction: tombstoning the old pointer and appending
                     // the replacement must not be separable by a crash.
                     Some(txn),
@@ -1686,10 +2005,7 @@ impl RowPointer {
         }
 
         // Overwrite in-place.
-        let total_bytes_usize = new_total_bytes_u64 as usize;
-        let string_size_usize = new_total_string_size as usize;
-        let block = Self::build_row_data(row_write, total_bytes_usize, string_size_usize);
-        let slice = block.into_slice();
+        let slice = stored;
 
         // Row bytes and the pointer's new length are one transaction: a crash
         // between them would otherwise leave the row rewritten while the pointer
@@ -2054,43 +2370,43 @@ impl RowPointer {
 
         if !string_col_indices.is_empty() {
             let mut second_pass_reads: SmallVec<[(u64, &mut [u8]); 8]> = SmallVec::new();
-            let row_start = self.position;
-            let row_len = self.length as u64;
-            let row_end = row_start.saturating_add(row_len);
-            const MAX_REASONABLE_STRING_BYTES: usize = 64 * 1024 * 1024;
+            // The columns whose stored bytes are a frame, decoded once read,
+            // and those whose value is in the row's tail frame.
+            let mut compressed: SmallVec<[usize; 4]> = SmallVec::new();
+            let mut tails: SmallVec<[TailValue; 4]> = SmallVec::new();
 
             for (chunk, &col_idx) in string_headers_buffer
                 .chunks_exact(12)
                 .zip(string_col_indices.iter())
             {
-                let string_row_position = string_position(self.position, chunk)?;
-                let string_size = u32::from_le_bytes(chunk[8..12].try_into().unwrap()) as usize;
+                // The checks every string reader makes (`string_cell`): this
+                // copy of them predated it.
+                let cell = string_cell(self.position, self.length as u64, chunk)
+                    .map_err(|e| super::error::RowError::InvalidData(e.to_string()))?;
 
                 let col = &mut columns[col_idx];
                 col.schema_id = crate::core::row::row::schema_id_of(row_fetch.columns_fetching_data[col_idx].schema_id);
                 col.column_type = DbType::STRING;
 
+                let (string_row_position, string_size) = match cell {
+                    StringCell::Bytes { at, len, frame } => {
+                        if frame {
+                            compressed.push(col_idx);
+                        }
+                        (at, len)
+                    }
+                    StringCell::InTail { frame_at, frame_len, pos, len } => {
+                        col.data = MemoryBlock::default();
+                        if len != 0 {
+                            tails.push(TailValue { col_idx, frame_at, frame_len, pos, len });
+                        }
+                        continue;
+                    }
+                };
+
                 if string_size == 0 {
                     col.data = MemoryBlock::default();
                     continue;
-                }
-
-                if string_size > MAX_REASONABLE_STRING_BYTES {
-                    return Err(super::error::RowError::InvalidData(format!(
-                        "Invalid string size {} (too large)",
-                        string_size
-                    )));
-                }
-
-                // Ensure the string data pointer + size stays within the row bounds.
-                if string_row_position < row_start
-                    || string_row_position > row_end
-                    || string_row_position.saturating_add(string_size as u64) > row_end
-                {
-                    return Err(super::error::RowError::InvalidData(format!(
-                        "Invalid string range: pos={} size={} row_start={} row_end={} (likely misread header)",
-                        string_row_position, string_size, row_start, row_end
-                    )));
                 }
 
                 col.data = MEMORY_POOL.acquire(string_size);
@@ -2104,6 +2420,17 @@ impl RowPointer {
                 io.read_vectored(&mut second_pass_reads)
                     .await
                     .map_err(super::error::RowError::Io)?;
+            }
+            drop(second_pass_reads);
+            for col_idx in compressed {
+                let col = &mut columns[col_idx];
+                col.data = crate::core::compression::decompress(col.data.into_slice())
+                    .map_err(|e| super::error::RowError::InvalidData(e.to_string()))?;
+            }
+            if !tails.is_empty() {
+                fill_from_tails(&*io, &mut columns, &tails)
+                    .await
+                    .map_err(|e| super::error::RowError::InvalidData(e.to_string()))?;
             }
         }
 
@@ -2207,12 +2534,33 @@ impl RowPointer {
 
         if !string_col_indices.is_empty() {
             let mut second_pass_reads: SmallVec<[(u64, &mut [u8]); 8]> = SmallVec::new();
+            // The columns whose stored bytes are a frame, decoded once read,
+            // and those whose value is in the row's tail frame.
+            let mut compressed: SmallVec<[usize; 4]> = SmallVec::new();
+            let mut tails: SmallVec<[TailValue; 4]> = SmallVec::new();
 
             for (chunk, &col_idx) in string_headers_buffer
                 .chunks_exact(12)
                 .zip(string_col_indices.iter())
             {
-                let (string_row_position, string_size) = string_extent(self.position, self.length as u64, chunk)?;
+                let (string_row_position, string_size) = match string_cell(self.position, self.length as u64, chunk)? {
+                    StringCell::Bytes { at, len, frame } => {
+                        if unlikely(frame) {
+                            compressed.push(col_idx);
+                        }
+                        (at, len)
+                    }
+                    StringCell::InTail { frame_at, frame_len, pos, len } => {
+                        let col = &mut columns[col_idx];
+                        col.data = MemoryBlock::default();
+                        col.schema_id = crate::core::row::row::schema_id_of(row_fetch.columns_fetching_data[col_idx].schema_id);
+                        col.column_type = DbType::STRING;
+                        if len != 0 {
+                            tails.push(TailValue { col_idx, frame_at, frame_len, pos, len });
+                        }
+                        continue;
+                    }
+                };
 
                 let col = &mut columns[col_idx];
 
@@ -2240,6 +2588,14 @@ impl RowPointer {
                 if !io.try_read_vectored_sync(&mut second_pass_reads) {
                     io.read_vectored(&mut second_pass_reads).await?;
                 }
+            }
+            drop(second_pass_reads);
+            for col_idx in compressed {
+                let col = &mut columns[col_idx];
+                col.data = crate::core::compression::decompress(col.data.into_slice())?;
+            }
+            if unlikely(!tails.is_empty()) {
+                fill_from_tails(io, columns, &tails).await?;
             }
         }
 
@@ -2296,7 +2652,78 @@ impl RowPointer {
     }
 
     /// Writes a row and returns the pointer-record byte offset where the RowPointer was appended.
+    ///
+    /// Every value stored as it is: a table's column compression is applied
+    /// by [`Self::write_row_with_pointer_record_pos_compressed`].
     pub async fn write_row_with_pointer_record_pos<S: StorageIO>(
+        pointers_io: Arc<S>,
+        rows_io: Arc<S>,
+        #[cfg(feature = "enable_long_row")] last_id: &AtomicU64,
+        #[cfg(not(feature = "enable_long_row"))] last_id: &AtomicU64,
+        table_length: &AtomicU64,
+        #[cfg(feature = "enable_long_row")] cluster: u32,
+        row_write: &RowWrite,
+        txn: Option<u64>,
+        free_space: Option<&FreeSpace>,
+        previous: Option<&RowPointer>,
+        written_by: TxId,
+    ) -> Result<(u64, RowPointer)> {
+        Self::write_encoded_row(
+            pointers_io,
+            rows_io,
+            last_id,
+            table_length,
+            #[cfg(feature = "enable_long_row")]
+            cluster,
+            row_write,
+            Self::encode_row(row_write, None)?.into_slice(),
+            txn,
+            free_space,
+            previous,
+            written_by,
+        )
+        .await
+    }
+
+    /// [`Self::write_row_with_pointer_record_pos`], each string value of a
+    /// column `policy` names stored as a frame when that saves bytes
+    /// (`core::compression`). An empty `policy` is the plain write, with no
+    /// copy of the row.
+    pub async fn write_row_with_pointer_record_pos_compressed<S: StorageIO>(
+        pointers_io: Arc<S>,
+        rows_io: Arc<S>,
+        #[cfg(feature = "enable_long_row")] last_id: &AtomicU64,
+        #[cfg(not(feature = "enable_long_row"))] last_id: &AtomicU64,
+        table_length: &AtomicU64,
+        #[cfg(feature = "enable_long_row")] cluster: u32,
+        row_write: &RowWrite,
+        policy: &crate::core::compression::StoragePolicy,
+        txn: Option<u64>,
+        free_space: Option<&FreeSpace>,
+        previous: Option<&RowPointer>,
+        written_by: TxId,
+    ) -> Result<(u64, RowPointer)> {
+        let block = Self::encode_row(row_write, Some(policy))?;
+        Self::write_encoded_row(
+            pointers_io,
+            rows_io,
+            last_id,
+            table_length,
+            #[cfg(feature = "enable_long_row")]
+            cluster,
+            row_write,
+            block.into_slice(),
+            txn,
+            free_space,
+            previous,
+            written_by,
+        )
+        .await
+    }
+
+    /// The write itself, of a row already encoded for storage (`encode_row`):
+    /// `row_write` gives the pointer its id, `stored` is what is written.
+    async fn write_encoded_row<S: StorageIO>(
         pointers_io: Arc<S>,
         rows_io: Arc<S>,
 
@@ -2309,6 +2736,9 @@ impl RowPointer {
         #[cfg(feature = "enable_long_row")] cluster: u32,
 
         row_write: &RowWrite,
+
+        // The row's bytes as stored.
+        stored: &[u8],
 
         // A transaction to join, or `None` to open and commit one here. A
         // statement writing many rows passes the same id for all of them so
@@ -2349,84 +2779,41 @@ impl RowPointer {
             row_pointer.inherit_metadata(previous);
         }
 
-        let total_bytes = row_pointer.writing_data.total_columns_size;
-        let total_string_size = row_pointer.writing_data.total_strings_size;
-
-        // Allocate memory to store the row data
-        let mut block = MEMORY_POOL.acquire(total_bytes as usize);
-        let slice = block.into_slice_mut();
-
-        let mut row_position = 0;
-
-        let mut string_block = MEMORY_POOL.acquire(total_string_size as usize);
-        let string_slice = string_block.into_slice_mut();
-
-        let mut end_of_row: u64 = row_write
-            .columns_writing_data
-            .iter()
-            .map(|col| col.size as u64)
-            .sum();
-
-        // Write each column data into the buffer
-
-        let mut string_data_position: u64 = 0;
-
-        for column in row_write
-            .columns_writing_data
-            .iter()
-            .sorted_by(|a, b| a.write_order.cmp(&b.write_order))
+        // The row's length is the bytes stored, which compression makes
+        // shorter than `new` computed from the values.
+        let total_bytes = stored.len();
+        #[cfg(feature = "enable_long_row")]
         {
-            let end_of_column = row_position + column.size as u64;
-
-            // Data Layout Description:
-            //
-            // For fixed-size data types (integers, floats, booleans, etc.),
-            // the value is placed directly into the main data buffer.
-            //
-            // For variable-length data types, such as strings, a 64-bit pointer
-            // and a 32-bit size field are used. The pointer references the
-            // location where the string's binary data is stored, which is
-            // typically at the end of the buffer, after the fixed-size fields.
-            //
-            // Example:
-            //              U64 POINTER | U32 SIZE             U64 POINTER | U32 SIZE     BINARY DATA | BINARY DATA
-            //    4 bytes | 8 bytes | 4 bytes | 4 bytes | 16 bytes |  8 bytes  |  4 bytes  |   X bytes   |   X bytes
-            // ROW: [I32|STRING_POINTER_1|STRING_SIZE|I32|U128|STRING_POINTER_2|STRING_SIZE|STRING_DATA_1|STRING_DATA_2]
-            //
-            if column.column_type == DbType::STRING {
-                let string_column_slice = column.data.into_slice();
-
-                let string_size = string_column_slice.len() as u32;
-
-                string_slice[string_data_position as usize
-                    ..string_data_position as usize + string_size as usize]
-                    .copy_from_slice(string_column_slice);
-
-                string_data_position = string_data_position + string_size as u64;
-
-                let end_of_row_bytes = end_of_row.to_le_bytes();
-
-                // Write STRING_POINTER
-                slice[row_position as usize..row_position as usize + 8]
-                    .copy_from_slice(&end_of_row_bytes);
-
-                // Write STRING_SIZE
-                slice[row_position as usize + 8..row_position as usize + 4 + 8]
-                    .copy_from_slice(&string_size.to_le_bytes());
-
-                end_of_row = end_of_row + string_column_slice.len() as u64;
-
-                row_position = end_of_column;
-            } else {
-                let column_slice = column.data.into_slice();
-
-                slice[row_position as usize..end_of_column as usize].copy_from_slice(column_slice);
-
-                row_position = end_of_column;
-            }
+            row_pointer.length = total_bytes as u64;
+        }
+        #[cfg(not(feature = "enable_long_row"))]
+        {
+            row_pointer.length = u32::try_from(total_bytes).map_err(|_| {
+                super::error::RowError::InvalidLength(format!("row of {total_bytes} bytes overflows the u32 length field"))
+            })?;
         }
 
-        slice[row_position as usize..].copy_from_slice(&string_slice);
+        // Data Layout Description (built by `build_row_data`):
+        //
+        // For fixed-size data types (integers, floats, booleans, etc.),
+        // the value is placed directly into the main data buffer.
+        //
+        // For variable-length data types, such as strings, a 64-bit pointer
+        // and a 32-bit size field are used. The pointer references the
+        // location where the string's binary data is stored, which is
+        // typically at the end of the buffer, after the fixed-size fields.
+        //
+        // Example:
+        //              U64 POINTER | U32 SIZE             U64 POINTER | U32 SIZE     BINARY DATA | BINARY DATA
+        //    4 bytes | 8 bytes | 4 bytes | 4 bytes | 16 bytes |  8 bytes  |  4 bytes  |   X bytes   |   X bytes
+        // ROW: [I32|STRING_POINTER_1|STRING_SIZE|I32|U128|STRING_POINTER_2|STRING_SIZE|STRING_DATA_1|STRING_DATA_2]
+        //
+        // A string whose bytes are a compressed frame has bit 31 of its size
+        // set (`core::compression`).
+        // A value in a row whose tail is one frame has bit 30 of its size set
+        // instead, and its offset says where the frame starts and where in
+        // the frame's bytes the value is (`encode_row`).
+        let slice = stored;
 
         // Write the row data to the rows_io.
         //

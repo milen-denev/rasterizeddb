@@ -1424,6 +1424,49 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
         sizes.schema.to_string(),
         "schema and its sidecars",
     );
+    // Compression (`core::compression`), for a table that asked for it: what
+    // it asks, and what its writes since it opened got from it.
+    let policy = &schema.compression;
+    if !policy.is_empty() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let columns: Vec<String> = policy
+            .columns
+            .iter()
+            .filter_map(|c| {
+                let field = schema.fields.iter().find(|f| f.write_order == c.write_order && !f.is_deleted)?;
+                let method = crate::core::compression::method_name(Some(c.codec.level))?;
+                let dictionary = if c.codec.dictionary.is_some() { " +dictionary" } else { "" };
+                Some(format!("{}={method}{dictionary}", field.name))
+            })
+            .collect();
+        push("compressed_columns", columns.join(", "), "columns that store their values compressed");
+        push(
+            "row_compression",
+            policy
+                .row
+                .as_ref()
+                .and_then(|c| {
+                    crate::core::compression::method_name(Some(c.level))
+                        .map(|m| if c.dictionary.is_some() { format!("{m} +dictionary") } else { m })
+                })
+                .unwrap_or_else(|| "none".to_string()),
+            "each row's variable-width values stored as one frame",
+        );
+        let counters = &policy.counters;
+        push(
+            "compressed_values",
+            counters.values_compressed.load(Relaxed).to_string(),
+            "values stored as their own frame since the table opened",
+        );
+        push(
+            "compressed_row_tails",
+            counters.tails_compressed.load(Relaxed).to_string(),
+            "row tails stored as one frame since the table opened",
+        );
+        let (raw, stored) = (counters.raw_bytes.load(Relaxed), counters.stored_bytes.load(Relaxed));
+        push("compression_raw_bytes", raw.to_string(), "bytes those values and tails held");
+        push("compression_stored_bytes", stored.to_string(), "bytes their frames took");
+    }
     push(
         "index_bytes",
         sizes.filters.to_string(),

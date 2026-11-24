@@ -466,6 +466,9 @@ pub(crate) const RENAMED_SUFFIXES: &[&str] = &[
     // `CREATE INDEX` declarations. The indexes themselves are rebuilt in
     // memory at open; this is what says which ones to build.
     "_schema_IDX.db",
+    // Compression dictionaries (`core::compression::sidecar`): a value
+    // compressed with one cannot be read without it.
+    "_schema_ZD.db",
     // Derived: the filter rebuilds from the pointers and the sequence from
     // `load_id_sequence`, so a failure to copy either is recoverable. They are
     // copied anyway because copying is cheaper than rebuilding.
@@ -1958,6 +1961,17 @@ impl Database {
                          directory could not be marked for it ({}): {}",
                         table_name,
                         incompat::NUMERIC_OWN_SCALE_V1,
+                        e
+                    );
+                    continue;
+                }
+                // A column that compresses, the same way (`core::compression`).
+                if let Err(e) = incompat::fence_compressed_values(std::path::Path::new(location), &table.schema) {
+                    error!(
+                        "table '{}' is left unopened: it has a column that compresses its values and the \
+                         directory could not be marked for it ({}): {}",
+                        table_name,
+                        incompat::COMPRESSED_VALUES_V1,
                         e
                     );
                     continue;
@@ -4374,6 +4388,11 @@ impl Database {
         if !own_scale.is_empty() && temp_seed(&create_table.table_name).is_none() {
             self.require_numeric_own_scale()?;
         }
+        if crate::core::rql::type_modifier::declares_compression(&create_table.type_modifiers)
+            && temp_seed(&create_table.table_name).is_none()
+        {
+            self.require_compressed_values()?;
+        }
         if create_table.foreign_keys.iter().any(|fk| fk.is_composite()) && temp_seed(&create_table.table_name).is_none()
         {
             self.require_composite_foreign_keys()?;
@@ -4515,6 +4534,16 @@ impl Database {
     pub(crate) fn require_numeric_own_scale(&self) -> io::Result<()> {
         match self.location.as_deref() {
             Some(root) => incompat::require(std::path::Path::new(root), incompat::NUMERIC_OWN_SCALE_V1),
+            None => Ok(()),
+        }
+    }
+
+    /// Marks the database as holding compressed column values
+    /// (`incompat::COMPRESSED_VALUES_V1`), before the first record declaring
+    /// a column's compression is written. Nothing to mark in memory.
+    pub(crate) fn require_compressed_values(&self) -> io::Result<()> {
+        match self.location.as_deref() {
+            Some(root) => incompat::require(std::path::Path::new(root), incompat::COMPRESSED_VALUES_V1),
             None => Ok(()),
         }
     }
@@ -5163,6 +5192,27 @@ async fn write_schema_sidecars(
     for field in schema.fields.iter_mut().filter(|f| !f.is_deleted) {
         field.set_text_typmod(crate::core::rql::type_modifier::text_typmod_of(&field.name, &schema.type_modifiers));
     }
+    // The dictionaries the compression markers name, into this table's own
+    // sidecar (`compression::sidecar`): a rewrite's new files, a partitioned
+    // table's shell, a copy. They are registered already (trained by the
+    // statement, or read when their table opened); one that is not is left
+    // out, and the column writes without it (`refresh_compression`).
+    {
+        let mut staged: Vec<u32> = Vec::new();
+        for entry in ct.type_modifiers.iter().filter(|m| m.column.starts_with(crate::core::rql::type_modifier::DICTIONARY_MARKER)) {
+            let column = &entry.column[crate::core::rql::type_modifier::DICTIONARY_MARKER.len()..];
+            let Some(id) = crate::core::rql::type_modifier::dictionary_of(column, &ct.type_modifiers) else { continue };
+            if staged.contains(&id) {
+                continue;
+            }
+            if let Some(dictionary) = crate::core::compression::dictionary(id) {
+                crate::core::compression::sidecar::stage(&*io_schema, &mut writes, &dictionary);
+                staged.push(id);
+            }
+        }
+    }
+    // And which columns compress (`core::compression`), for the same reason.
+    schema.refresh_compression();
 
     for entry in &ct.generated {
         if let Err(e) =

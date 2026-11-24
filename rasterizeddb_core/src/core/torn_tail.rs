@@ -126,6 +126,10 @@
 //!   whole, and recovery truncates it.
 //! - `<t>_schema.db`: written once at offset 0 (header plus incarnation
 //!   record), never appended to.
+//! - `<t>_schema_ZD.db`, compression dictionaries: variable-length records,
+//!   each checksummed, read by looking for each record's magic, so a torn
+//!   one is stepped over and a record after it still reads
+//!   (`compression::sidecar`).
 //! - `<t>_seq.db`, `db_transactions.next`, `db_transactions.status`: written
 //!   at fixed offsets, not appended; a short status file reads as no outcome.
 //! - `<t>_flt.db`: retired (persistent indexes §5, B14), deleted at open and

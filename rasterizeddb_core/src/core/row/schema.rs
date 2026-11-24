@@ -581,6 +581,14 @@ pub struct TableSchema {
     /// `NUMERIC(p, s)`, loaded from their sidecar. A column with no entry keeps
     /// the engine's default scale, which is what its rows were written with.
     pub type_modifiers: Vec<crate::core::rql::type_modifier::TypeModifier>,
+    /// What the table compresses (`core::compression`): the variable-width
+    /// columns that store their values compressed, by `write_order`, and the
+    /// row tail's codec, from their markers in the type-modifier sidecar
+    /// (`type_modifier::COMPRESSION_MARKER`, `ROW_COMPRESSION_MARKER`,
+    /// `DICTIONARY_MARKER`). Empty for a table that asked for none, which is
+    /// every table unless one did: nothing is compressed by default. Rebuilt
+    /// by [`TableSchema::refresh_compression`].
+    pub compression: crate::core::compression::StoragePolicy,
     /// `CHECK` constraints, loaded from their sidecar.
     pub checks: Vec<crate::core::rql::check::CheckConstraint>,
     /// `GENERATED ALWAYS AS (…) STORED` expressions, loaded from their sidecar.
@@ -617,6 +625,7 @@ impl TableSchema {
             secondary_indexes: Vec::new(),
             unique_keys: Vec::new(),
             type_modifiers: Vec::new(),
+            compression: Default::default(),
             generated: Vec::new(),
             checks: Vec::new(),
             incarnation: mint_incarnation(),
@@ -739,6 +748,17 @@ impl TableSchema {
                 .flatten();
             field.set_text_typmod(typmod);
         }
+        // The dictionaries first, so the markers naming them find them. Only
+        // a table whose markers name one has the file: opening it for every
+        // table would create it for every table.
+        if table_schema
+            .type_modifiers
+            .iter()
+            .any(|m| !m.is_deleted && m.column.starts_with(crate::core::rql::type_modifier::DICTIONARY_MARKER))
+        {
+            crate::core::compression::sidecar::load(&schema_io).await;
+        }
+        table_schema.refresh_compression();
         table_schema.generated = crate::core::rql::generated::load(schema_io.clone()).await;
         table_schema.checks = crate::core::rql::check::load(schema_io.clone()).await;
         // A check this binary keeps unenforced, or cannot compile (stored by
@@ -753,6 +773,33 @@ impl TableSchema {
         }
 
         Ok(table_schema)
+    }
+
+    /// Rebuilds [`Self::compression`] from the type modifiers: every live
+    /// variable-width column with a compression marker, and the row tail's.
+    /// A marker on a fixed-width column is ignored, as PostgreSQL ignores
+    /// `SET COMPRESSION` on a plain-storage type: its cells are read in place
+    /// and never compressed. A dictionary no open table holds is left out,
+    /// so new values are written without it. The counters carry over.
+    pub fn refresh_compression(&mut self) {
+        use crate::core::compression::{Codec, ColumnCompression, dictionary};
+        use crate::core::rql::type_modifier::{compression_of, dictionary_of, row_compression_of};
+        let modifiers = &self.type_modifiers;
+        let columns = self
+            .fields
+            .iter()
+            .filter(|f| !f.is_deleted && f.db_type.physical() == DbType::STRING)
+            .filter_map(|f| {
+                compression_of(&f.name, modifiers).map(|level| ColumnCompression {
+                    write_order: f.write_order,
+                    codec: Codec { level, dictionary: dictionary_of(&f.name, modifiers).and_then(dictionary) },
+                })
+            })
+            .collect();
+        let row = row_compression_of(modifiers)
+            .map(|level| Codec { level, dictionary: dictionary_of("", modifiers).and_then(dictionary) });
+        self.compression.columns = columns;
+        self.compression.row = row;
     }
 
     pub fn into_vec(&self) -> Vec<u8> {
@@ -837,6 +884,7 @@ impl TableSchema {
             secondary_indexes: Vec::new(),
             unique_keys: Vec::new(),
             type_modifiers: Vec::new(),
+            compression: Default::default(),
             generated: Vec::new(),
             checks: Vec::new(),
             // Not part of the header; `load` reads it from the record after.
