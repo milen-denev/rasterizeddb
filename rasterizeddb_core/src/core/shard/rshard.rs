@@ -276,7 +276,7 @@ fn epoch_refusal(theirs: u64, mine: u64) -> Option<Response> {
 /// recorded for a gid is the decision; a later contrary one is refused.
 const DECISIONS: &str = "rdb_2pc_decisions";
 
-fn decision(gid: &str) -> Result<Option<bool>, String> {
+pub(crate) fn decision(gid: &str) -> Result<Option<bool>, String> {
     let dir = super::ownership::data_dir().ok_or("this shard has no data directory")?;
     let path = dir.join(DECISIONS);
     let text = match std::fs::read_to_string(&path) {
@@ -294,7 +294,7 @@ fn decision(gid: &str) -> Result<Option<bool>, String> {
     Ok(None)
 }
 
-fn decide(gid: &str, commit: bool) -> Result<(), String> {
+pub(crate) fn decide(gid: &str, commit: bool) -> Result<(), String> {
     use std::io::Write;
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _held = LOCK.lock().unwrap();

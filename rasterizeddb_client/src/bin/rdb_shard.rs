@@ -13,6 +13,7 @@
 //!                       [--apply --fenced --out NEW_MAP --state-dir DIR
 //!                        --table TABLE:COLUMN:TYPE [--table …]] [--every SECS]
 //! rdb-shard exec        --map MAP --sql SQL
+//! rdb-shard resolve     --map MAP [--home SHARD] [--grace SECS]
 //! rdb-shard keygen      --key FILE
 //! rdb-shard sign        --map MAP --key FILE
 //! rdb-shard ddl         --map MAP --file DDL.sql --table TABLE [--table …]
@@ -149,6 +150,7 @@ async fn run(args: &Args) -> std::result::Result<(), String> {
         "rebalance" => rebalance(args, &options).await,
         "ddl" => cluster_ddl(args, &options).await,
         "keygen" => keygen(args),
+        "resolve" => resolve(args, &options).await,
         "exec" => exec_each(args, &options).await,
         "sign" => {
             let path = args.one("map")?;
@@ -1074,4 +1076,62 @@ async fn rebalance_forever(args: &Args, options: &Options) -> std::result::Resul
         rebalance(&a, options).await.map_err(|e| format!("round {round}: {e}"))?;
         tokio::time::sleep(std::time::Duration::from_secs(secs.max(1))).await;
     }
+}
+
+/// `resolve` (sharding-plan.md B5): every transaction a gateway left
+/// prepared on a shard, finished by the anchor's decision: committed when it
+/// says commit, rolled back when it says abort, and, with no decision and
+/// older than `--grace` seconds (300), decided abort on the anchor first
+/// (presumed abort), so a late gateway cannot commit it, then rolled back.
+async fn resolve(args: &Args, options: &Options) -> std::result::Result<(), String> {
+    let map = read_map(args.one("map")?)?;
+    let home: ShardId = match args.opt("home") {
+        Some(h) => h.parse().map_err(|_| "--home takes a shard id".to_string())?,
+        None => map.shards().first().map(|s| s.id).ok_or("the map has no shards")?,
+    };
+    let grace: u64 = args.opt("grace").unwrap_or("300").parse().map_err(|_| "--grace takes seconds".to_string())?;
+    let anchor = connect(&map, home, options).await?;
+    let now_ns = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    for info in map.shards() {
+        let c = connect(&map, info.id, options).await?;
+        let prepared: Vec<(String, i64)> =
+            c.fetch_all("SHOW PREPARED TRANSACTIONS", &[]).await.map_err(|e| format!("shard {}: {e}", info.id))?;
+        for (gid, _) in prepared {
+            if !gid.starts_with("rdb2pc:") {
+                println!("shard {}: {gid} is not a gateway's; left alone", info.id);
+                continue;
+            }
+            let quoted = gid.replace('\'', "''");
+            let decided: Vec<(String,)> = anchor
+                .fetch_all(&format!("SHOW SHARD DECISION '{quoted}'"), &[])
+                .await
+                .map_err(|e| format!("anchor shard {home}: {e}"))?;
+            let commit = match decided.first().map(|(d,)| d.as_str()) {
+                Some("commit") => true,
+                Some(_) => false,
+                None => {
+                    // rdb2pc:<gateway>:<nanos hex>:<n>
+                    let born = gid.split(':').nth(2).and_then(|h| u128::from_str_radix(h, 16).ok()).unwrap_or(0);
+                    let age = now_ns.saturating_sub(born) / 1_000_000_000;
+                    if age < grace as u128 {
+                        println!("shard {}: {gid} is undecided and {age}s old; left for its gateway", info.id);
+                        continue;
+                    }
+                    // Refused when a commit was decided first: the re-read
+                    // below then says so.
+                    let _ = anchor.run(&format!("SHARD DECIDE '{quoted}' ABORT")).await;
+                    // Re-read: a gateway may have decided commit first.
+                    let again: Vec<(String,)> = anchor
+                        .fetch_all(&format!("SHOW SHARD DECISION '{quoted}'"), &[])
+                        .await
+                        .map_err(|e| format!("anchor shard {home}: {e}"))?;
+                    again.first().is_some_and(|(d,)| d == "commit")
+                }
+            };
+            let sql = if commit { format!("COMMIT PREPARED '{quoted}'") } else { format!("ROLLBACK PREPARED '{quoted}'") };
+            c.run(&sql).await.map_err(|e| format!("shard {}: {gid}: {e}", info.id))?;
+            println!("shard {}: {gid} {}", info.id, if commit { "committed" } else { "rolled back" });
+        }
+    }
+    Ok(())
 }

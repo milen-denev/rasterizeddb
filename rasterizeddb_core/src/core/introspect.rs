@@ -76,6 +76,8 @@ pub enum Introspect {
     /// `SHOW PREPARED TRANSACTIONS`: this database's prepared transactions
     /// (sharding-plan.md B5).
     PreparedTransactions,
+    /// `SHOW SHARD DECISION 'gid'`: `commit`, `abort` or no row.
+    Decision(String),
     /// A table's 128-bit schema fingerprint, as cluster DDL compares them
     /// across shards (sharding-plan.md B1a.10).
     SchemaFingerprint(String),
@@ -111,6 +113,9 @@ pub enum ShardAdmin {
     Give { lo: u64, hi: u64 },
     Fence { lo: u64, hi: u64 },
     Unfence { lo: u64, hi: u64 },
+    /// `SHARD DECIDE 'gid' COMMIT|ABORT`: records a two-phase commit's
+    /// decision on this (anchor) shard; `SHOW SHARD DECISION 'gid'` reads it.
+    Decide { gid: String, commit: bool },
     /// A newer cluster map, in its text form, with the authority's signature
     /// (hex) where shards require one.
     MapInstall { text: String, signature: Option<String> },
@@ -143,6 +148,19 @@ fn parse_shard_admin(trimmed: &str, words: &[&str], original: &[&str]) -> Result
         Some("GIVE") => range().map(|(lo, hi)| ShardAdmin::Give { lo, hi })?,
         Some("FENCE") => range().map(|(lo, hi)| ShardAdmin::Fence { lo, hi })?,
         Some("UNFENCE") => range().map(|(lo, hi)| ShardAdmin::Unfence { lo, hi })?,
+        Some("DECIDE") => {
+            let (a, b) = (trimmed.find('\''), trimmed.rfind('\''));
+            let (Some(a), Some(b)) = (a, b) else {
+                return Err("the statement is `SHARD DECIDE 'gid' COMMIT|ABORT`".to_string());
+            };
+            let gid = trimmed[a + 1..b].to_string();
+            let commit = match trimmed[b + 1..].trim().to_ascii_uppercase().as_str() {
+                "COMMIT" => true,
+                "ABORT" | "ROLLBACK" => false,
+                _ => return Err("the statement is `SHARD DECIDE 'gid' COMMIT|ABORT`".to_string()),
+            };
+            ShardAdmin::Decide { gid, commit }
+        }
         Some("MAP") if words.get(2).copied() == Some("INSTALL") => {
             let usage = "the statement is `SHARD MAP INSTALL '<map>' [SIGNATURE '<hex>']`";
             let literal = |from: usize| -> Result<(String, usize), String> {
@@ -278,6 +296,12 @@ pub fn parse(sql: &str) -> Option<Result<Introspect, String>> {
             Some(name) if original.len() == 4 => Some(Ok(Introspect::SchemaFingerprint(normalize_name(name)))),
             _ => Some(Err("SHOW SCHEMA FINGERPRINT takes one table name".to_string())),
         },
+        Some("SHARD") if words.get(2).copied() == Some("DECISION") => {
+            match (trimmed.find('\''), trimmed.rfind('\'')) {
+                (Some(a), Some(b)) if b > a => Some(Ok(Introspect::Decision(trimmed[a + 1..b].to_string()))),
+                _ => Some(Err("the statement is `SHOW SHARD DECISION 'gid'`".to_string())),
+            }
+        }
         Some("PREPARED") if words.get(2).copied() == Some("TRANSACTIONS") && words.len() == 3 => {
             Some(Ok(Introspect::PreparedTransactions))
         }
@@ -439,6 +463,7 @@ pub fn result_fields(statement: &Introspect) -> Option<Vec<(String, DbType)>> {
         // read as negative. Hex, as the map log and the design write them.
         Introspect::ShardAdmin(_) => vec![text("result")],
         Introspect::PreparedTransactions => vec![text("gid"), number("transaction")],
+        Introspect::Decision(_) => vec![text("decision")],
         Introspect::SchemaFingerprint(_) => vec![text("table_name"), text("fingerprint"), number("schema_epoch")],
         Introspect::ShardLoad => vec![
             text("table_name"),
@@ -577,6 +602,10 @@ pub async fn execute(statement: &Introspect, database: &Arc<Database>) -> Vec<u8
             Err(e) => failure(&e),
         },
         Introspect::Shards => rows(shards()),
+        Introspect::Decision(gid) => match decision_rows(gid) {
+            Ok(r) => rows(r),
+            Err(e) => failure(&e),
+        },
         Introspect::PreparedTransactions => match prepared_transactions(database) {
             Ok(r) => rows(r),
             Err(e) => failure(&e),
@@ -1834,6 +1863,19 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
 /// `[lo, hi)` range of the hash space, where its files are, whether it has
 /// any, and its sizes (zero until it is materialized). Refused for a plain
 /// table, and for a partitioned table that cannot be opened.
+#[cfg(feature = "sharding")]
+fn decision_rows(gid: &str) -> Result<Vec<Row>, String> {
+    Ok(match crate::core::shard::rshard::decision(gid)? {
+        Some(c) => vec![row(&[Cell::Text(if c { "commit" } else { "abort" }.to_string())])],
+        None => Vec::new(),
+    })
+}
+
+#[cfg(not(feature = "sharding"))]
+fn decision_rows(_gid: &str) -> Result<Vec<Row>, String> {
+    Ok(Vec::new())
+}
+
 #[cfg(feature = "sharding_2pc")]
 fn prepared_transactions(database: &Arc<Database>) -> Result<Vec<Row>, String> {
     Ok(database
@@ -1866,6 +1908,10 @@ async fn shard_admin(database: &Arc<Database>, admin: &ShardAdmin) -> Result<Str
         Ok::<usize, String>(tables)
     };
     match *admin {
+        ShardAdmin::Decide { ref gid, commit } => {
+            crate::core::shard::rshard::decide(gid, commit)?;
+            Ok(format!("{gid} decided {}", if commit { "commit" } else { "abort" }))
+        }
         ShardAdmin::Fence { lo, hi } => {
             ownership::fence(lo, hi)?;
             Ok(format!("blocks [{lo:#x}, {hi:#x}) fenced: their writes are refused until UNFENCE"))
