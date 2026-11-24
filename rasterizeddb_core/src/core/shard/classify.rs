@@ -31,6 +31,13 @@ use crate::core::sql_scan::{skip_comment, skip_quoted};
 
 /// The template for `text` (module docs).
 pub fn classify(database: &Database, source: Source, text: &str) -> RouteTemplate {
+    match classify_inner(database, source, text) {
+        RouteTemplate::Slot { index, family } if source == Source::Parse => RouteTemplate::Param { index, family },
+        t => t,
+    }
+}
+
+fn classify_inner(database: &Database, source: Source, text: &str) -> RouteTemplate {
     let t = text.trim().trim_end_matches(';').trim();
     let first = first_word(t);
     match first.as_str() {
@@ -55,10 +62,102 @@ fn first_word(t: &str) -> String {
         .to_ascii_uppercase()
 }
 
-/// A shape this does not analyse: `NeedsKey` if it mentions a partitioned
-/// table, `Home` otherwise.
+/// A shape this does not probe (a join, a subquery, a CTE…): routed by a
+/// placeholder compared with the shard key column of every partitioned
+/// table it mentions, when they share one key family (co-located tables, a
+/// tenant id); `NeedsKey` when it mentions partitioned tables otherwise;
+/// `Home` when it mentions none. A wrong guess is safe: the shard refuses a
+/// read that reaches another shard's rows (RDB02), never answers from its
+/// own alone.
 fn complex(database: &Database, t: &str) -> RouteTemplate {
-    if mentions_partitioned(database, t) { RouteTemplate::NeedsKey } else { RouteTemplate::Home }
+    let mut family = None;
+    let mut key_names: Vec<String> = Vec::new();
+    let mut any = false;
+    for w in words(t) {
+        let Some(Relation::Partitioned(pt)) = database.relation(&w) else {
+            continue;
+        };
+        any = true;
+        let Ok(spec) = pt.spec() else {
+            return RouteTemplate::NeedsKey;
+        };
+        let level0 = &spec.levels()[0];
+        match family {
+            None => family = Some(level0.family),
+            Some(f) if f != level0.family => return RouteTemplate::NeedsKey,
+            Some(_) => {}
+        }
+        let schema = Relation::Partitioned(pt.clone()).schema().clone();
+        if let Some(f) = schema.fields.iter().find(|f| !f.is_deleted && f.write_order == level0.write_order as u64) {
+            let n = f.name.to_ascii_lowercase();
+            if !key_names.contains(&n) {
+                key_names.push(n);
+            }
+        }
+    }
+    if !any {
+        return RouteTemplate::Home;
+    }
+    let Some(family) = family else {
+        return RouteTemplate::NeedsKey;
+    };
+    match keyed_placeholder(t, &key_names) {
+        // Shape or Parse is not known here; the caller's source decides.
+        Some(k) => RouteTemplate::Slot { index: k - 1, family },
+        None => RouteTemplate::NeedsKey,
+    }
+}
+
+/// The first placeholder `$k` compared with `=` to a column named in
+/// `names` (qualified or not), on either side.
+fn keyed_placeholder(t: &str, names: &[String]) -> Option<u16> {
+    let b = t.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'"';
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(end) = skip_quoted(b, i)
+            && b[i] != b'"'
+        {
+            i = end.max(i + 1);
+            continue;
+        }
+        if b[i] == b'=' && b.get(i + 1) != Some(&b'=') && i > 0 && !matches!(b[i - 1], b'<' | b'>' | b'!') {
+            // left operand
+            let mut l = i;
+            while l > 0 && b[l - 1] == b' ' {
+                l -= 1;
+            }
+            let le = l;
+            while l > 0 && is_ident(b[l - 1]) {
+                l -= 1;
+            }
+            let left = &t[l..le];
+            // right operand
+            let mut r = i + 1;
+            while r < b.len() && b[r] == b' ' {
+                r += 1;
+            }
+            let rs = r;
+            while r < b.len() && (is_ident(b[r]) || b[r] == b'$') {
+                r += 1;
+            }
+            let right = &t[rs..r];
+            let name_of = |x: &str| x.rsplit('.').next().unwrap_or(x).trim_matches('"').to_ascii_lowercase();
+            let ph = |x: &str| x.strip_prefix('$').and_then(|d| d.parse::<u16>().ok()).filter(|&k| k >= 1);
+            if let Some(k) = ph(right)
+                && names.contains(&name_of(left))
+            {
+                return Some(k);
+            }
+            if let Some(k) = ph(left)
+                && names.contains(&name_of(right))
+            {
+                return Some(k);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Whether any identifier outside quotes names a partitioned relation.
