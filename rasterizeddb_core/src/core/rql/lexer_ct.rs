@@ -2352,11 +2352,11 @@ mod partitioning_refusal_tests {
         assert_eq!(ct.checks.len(), 1);
         assert_eq!(ct.checks[0].expression, "a > 0");
 
-        // Refused before and after, for its expression, not its parentheses.
-        assert!(
-            refusal("CREATE TABLE t (a INT, ts TIMESTAMP DEFAULT (now()))")
-                .starts_with("DEFAULT (now()) is not supported")
-        );
+        // Enclosing parentheses are peeled, as PostgreSQL reads them, so this
+        // is `DEFAULT now()`: taken, where it was once refused.
+        let (ct, rejection) = parse("CREATE TABLE t (a INT, ts TIMESTAMP DEFAULT (now()))");
+        let ct = ct.unwrap_or_else(|| panic!("DEFAULT (now()) was refused: {rejection:?}"));
+        assert_eq!(ct.defaults.len(), 1);
 
         for (sql, expression) in [
             ("CREATE TABLE t (a INT, s TEXT DEFAULT 'a)b')", "'a)b'"),
