@@ -540,9 +540,47 @@ fn grants(acl: &[crate::core::rql::privileges::AclRow], rels: &[Rel]) -> Vec<Gra
     out
 }
 
+/// Each role's default privileges per kind (`@default:role[:kind]`), as
+/// aclitems, PUBLIC's EXECUTE taken away where a marker says so.
+fn default_acls(acl: &[crate::core::rql::privileges::AclRow], roles: &[RoleRow]) -> Vec<(i64, &'static str, Vec<String>)> {
+    use crate::core::rql::privileges::{DefaultKind, NOEXECUTE};
+    let mut out = Vec::new();
+    for role in roles {
+        for (kind, letter) in [(DefaultKind::Tables, "r"), (DefaultKind::Sequences, "S"), (DefaultKind::Functions, "f")] {
+            let key = kind.relation(&role.name);
+            let rows: Vec<&crate::core::rql::privileges::AclRow> = acl.iter().filter(|a| a.relation == key).collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let mut items: Vec<String> = Vec::new();
+            let mut by_grantee: Vec<(&str, String)> = Vec::new();
+            for r in rows.iter().filter(|r| r.privilege != NOEXECUTE) {
+                let Some(letter) = acl_letter(&r.privilege) else { continue };
+                match by_grantee.iter_mut().find(|(g, _)| *g == r.grantee) {
+                    Some((_, l)) => l.push(letter),
+                    None => by_grantee.push((r.grantee.as_str(), letter.to_string())),
+                }
+            }
+            // A function's defaults name PUBLIC's EXECUTE only by taking it
+            // away: listed, as PostgreSQL lists them, with the owner's own.
+            if kind == DefaultKind::Functions && rows.iter().any(|r| r.privilege == NOEXECUTE) {
+                items.push(format!("{}=X/{}", acl_name(&role.name), acl_name(&role.name)));
+            }
+            for (grantee, letters) in by_grantee {
+                let grantee = if grantee == "public" { String::new() } else { acl_name(grantee) };
+                items.push(format!("{grantee}={letters}/{}", acl_name(&role.name)));
+            }
+            out.push((role.oid, letter, items));
+        }
+    }
+    out
+}
+
 /// Where `pg_auth_members` row oids start: above the fixed catalogue oids,
 /// below the hashed oids of user objects' usual range.
 const AUTH_MEMBERS_OID_BASE: i64 = 60_000;
+/// Where `pg_default_acl` row oids start.
+const DEFAULT_ACL_OID_BASE: i64 = 62_000;
 
 /// One role membership (`GRANT role TO member`), with its options (R2).
 #[derive(Debug, Clone)]
@@ -595,6 +633,9 @@ pub(crate) struct Model {
     /// Every privilege held on a table, view, sequence or routine, the
     /// owners' own included: the `information_schema` privilege views.
     pub grants: Vec<GrantRow>,
+    /// Default privileges, as `pg_default_acl` lists them: (owner oid,
+    /// object type letter, aclitems).
+    pub default_acls: Vec<(i64, &'static str, Vec<String>)>,
     pub procs: Vec<ProcRow>,
     /// The enum types (`user_types`).
     pub enums: Vec<crate::core::rql::user_types::EnumType>,
@@ -1338,7 +1379,8 @@ pub(crate) async fn build_model(
     }
     let memberships = memberships(&acl, &roles);
     let grants = grants(&acl, &rels);
-    Model { database: database.name.clone(), rels, roles, memberships, grants, procs, enums }
+    let default_acls = default_acls(&acl, &roles);
+    Model { database: database.name.clone(), rels, roles, memberships, grants, default_acls, procs, enums }
 }
 
 /// PostgreSQL's letter for a privilege in an aclitem.
@@ -1721,6 +1763,7 @@ pub(crate) const NEW_VIEWS: &[&str] = &[
     "pg_roles",
     "pg_authid",
     "pg_auth_members",
+    "pg_default_acl",
     "pg_user",
     "pg_collation",
     "pg_description",
@@ -1969,6 +2012,13 @@ pub(crate) fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]
             ("rolconnlimit", I32),
             ("rolpassword", STRING),
             ("rolvaliduntil", DATETIME),
+        ],
+        "pg_default_acl" => &[
+            ("oid", I64),
+            ("defaclrole", I64),
+            ("defaclnamespace", I64),
+            ("defaclobjtype", STRING),
+            ("defaclacl", ARRAY),
         ],
         "pg_auth_members" => &[
             ("oid", I64),
@@ -2569,6 +2619,14 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                     V::N,
                     r.valid_until_us.map_or(V::N, |us| t(crate::core::value_codec::format_timestamp_us(us))),
                 ]
+            })
+            .collect(),
+        "pg_default_acl" => model
+            .default_acls
+            .iter()
+            .enumerate()
+            .map(|(i, (role, kind, items))| {
+                vec![V::I(DEFAULT_ACL_OID_BASE + i as i64), V::I(*role), V::I(0), t(*kind), V::TA(items.clone())]
             })
             .collect(),
         "pg_auth_members" => model

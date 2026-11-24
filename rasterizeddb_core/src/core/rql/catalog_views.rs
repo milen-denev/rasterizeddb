@@ -62,6 +62,7 @@ const VIEWS: &[&str] = &[
     "pg_roles",
     "pg_authid",
     "pg_auth_members",
+    "pg_default_acl",
     "pg_user",
     "pg_collation",
     "pg_description",
