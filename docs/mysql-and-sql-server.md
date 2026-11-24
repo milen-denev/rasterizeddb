@@ -33,7 +33,8 @@ already runs, so it cannot drift from PostgreSQL's behaviour.
   folding them to lower case. A result column is named as it was written in
   the select list (`SELECT UserId` returns `UserId`); `SELECT *` returns the
   names in lower case.
-- **Text compares as bytes unless a column says otherwise.** The servers
+- **Text compares as bytes unless a column says otherwise** (over the
+  MySQL protocol; for SQL Server see its section). The servers
   report `utf8mb4_bin` and `Latin1_General_BIN2` as their defaults, and a
   table's default collation (`DEFAULT COLLATE=…`, which `mysqldump` writes on
   every table) is not applied: existing schemas keep the answers they had. A
@@ -180,7 +181,8 @@ transaction with ENVCHANGE; `SET IMPLICIT_TRANSACTIONS ON` and
 
 | T-SQL | Sent as |
 |---|---|
-| `[name]`, `"name"`, `N'…'`, `dbo.`/`db.dbo.` | names (the engine's one schema), strings |
+| `[name]`, `"name"`, `N'…'`, `dbo.`/`db.dbo.` | names (the engine's one schema), strings; a dot inside a bracketed name (`[DenevCloud.ERP.Colors]`) is the name's own, stored as `․` (U+2024) and shown as `.` |
+| `CROSS APPLY (…) t`, `OUTER APPLY (…) t` | `CROSS JOIN LATERAL`, `LEFT JOIN LATERAL … ON true` |
 | `TOP (n)`, `OFFSET … FETCH` | `LIMIT … OFFSET …`; `UPDATE/DELETE TOP` by primary key |
 | `a + b` with a string side | `\|\|` |
 | `IDENTITY(1,1)`, `SCOPE_IDENTITY()`, `@@IDENTITY` | `serial`, the captured value |
@@ -193,6 +195,29 @@ transaction with ENVCHANGE; `SET IMPLICIT_TRANSACTIONS ON` and
 
 `master`, `model`, `msdb` and `tempdb` are the default database, so a
 client can create and drop its own (`EnsureCreated`, `EnsureDeleted`).
+Database names are found without case (`CREATE DATABASE [DenevColors]`
+makes `denevcolors`, which a login naming `DenevColors` opens), and a
+pooled connection's reset returns to the login's database after a `USE`.
+
+**Text is case-insensitive by default**, as under SQL Server's default
+collation: a text column a `CREATE TABLE` or `ADD COLUMN` makes without a
+`COLLATE` takes the engine's `rdb_ci` ([collations](collations.md)), so
+`=`, `LIKE`, `IN`, keys, foreign keys, `GROUP BY`, `DISTINCT`, joins,
+`ORDER BY` and windows ignore case. Each such column carries a hidden key
+column beside it. `--mssql-collation bin` makes such columns compare by
+their bytes instead. What the engine still refuses over one is listed
+there.
+
+**EF Core**: EF Core 10's SqlServer provider runs unchanged: `APPLY`
+shapes (`Take`/`First` in projections and filtered `Include`), batched
+inserts, `EnsureCreated`/`EnsureDeleted`, ASP.NET Identity's schema,
+`Migrate()` with its `sp_getapplock` lock, idempotent scripts,
+`RenameIndex`, `DropColumn`/`AlterColumn` (`sys.default_constraints` has
+the columns their scripts read), savepoints under `EnableRetryOnFailure`.
+A unique index filtered by `key IS NOT NULL [AND …]` over its own key
+columns (what EF puts on every unique index over a nullable column) is
+the plain unique key, since a unique key here never compares NULLs equal;
+a filtered index that is not unique is built over every row.
 
 **Kept by the front end** (the engine has none of these):
 
@@ -247,9 +272,14 @@ and `CONTAINS(*, …)` is refused (name the columns; the table-valued forms take
 `*`). `ALTER FULLTEXT INDEX … ADD/DROP` is refused: drop the index and create
 it again.
 
+**Application locks**: `sp_getapplock`, `sp_releaseapplock` and
+`APPLOCK_TEST`, per database and in this server only, owned by the
+connection or its transaction and released when either ends.
+
 **Refused**: `MERGE … OUTPUT` (other than EF Core's insert form) and a `MERGE`
 that updates a column its `ON` reads, `FOR XML RAW/AUTO/EXPLICIT`, stored
-functions and triggers, `rowversion`, computed columns, filtered indexes,
+functions and triggers, `rowversion`, computed columns, unique indexes
+with any other filter, `APPLY` of a table-valued function, `OPENJSON`,
 `SET ROWCOUNT`, `TOP … PERCENT/WITH TIES`, `OUTPUT … INTO`, `SELECT @v = @v
 + … FROM` over more than one row, and Windows authentication.
 `TRY_CAST`/`TRY_CONVERT` raise the conversion error where SQL Server would

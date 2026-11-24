@@ -28,15 +28,22 @@ A value is returned as it was written; only comparisons change.
 
 ## What follows the collation
 
-- `=`, `<>`, `<`, `<=`, `>`, `>=`, `IN (…)`, `BETWEEN`, `LIKE`/`ILIKE`,
-  `IS [NOT] DISTINCT FROM`, in `WHERE` of `SELECT`, `UPDATE` and `DELETE`,
-  against a literal, a parameter or an expression;
+- `=`, `<>`, `<`, `<=`, `>`, `>=`, `IN (…)`, `IN (SELECT …)`, `BETWEEN`,
+  `LIKE`/`ILIKE`, `IS [NOT] DISTINCT FROM`, `EXISTS` comparisons, in `WHERE`
+  of `SELECT`, `UPDATE` and `DELETE` and in a join's `ON`, against a literal,
+  a parameter, an expression or another such column;
 - `UNIQUE`, `PRIMARY KEY` (`'abc'` and `'ABC'` are one key), `ON CONFLICT
-  (column)`;
-- `CREATE INDEX` on the column (B-tree or hash), which then finds and orders
-  what the collation calls equal and ordered;
-- `ORDER BY` the column in a single-table query: by the collation, then by
-  the value, so values that compare equal still come back in one order.
+  (column)`, `CREATE [UNIQUE] INDEX`, and a key added by `ALTER TABLE`;
+- a `FOREIGN KEY` between two such columns: a child `'abc'` finds its
+  parent `'ABC'` (`ON DELETE CASCADE`, `NO ACTION`, `RESTRICT`);
+- `GROUP BY` (each group shows its least spelling under the collation),
+  `SELECT DISTINCT` of plain columns, `min`/`max`, `count(DISTINCT …)` and
+  the other DISTINCT aggregates, over one table or a join;
+- `ORDER BY`, and a window's `PARTITION BY` and `ORDER BY`: by the
+  collation, then by the value, so values that compare equal still come
+  back in one order;
+- `ALTER TABLE … ADD COLUMN c text COLLATE …` (the rows already there get
+  their keys) and `ALTER COLUMN c TYPE` to another text type.
 
 The order is by code point of the folded text (lowercased, canonically
 decomposed, accents removed for `rdb_ci_ai`), the engine's `C` order of it,
@@ -45,17 +52,20 @@ not the Unicode Collation Algorithm's: `'Zoe'` sorts before `'Ännchen'`.
 
 ## Refused for now (`0A000`), rather than compared by the bytes
 
-`GROUP BY`, `DISTINCT`, `min`/`max` and `… (DISTINCT …)` aggregates, window
-functions, `UNION`/`INTERSECT`/`EXCEPT` (but `UNION ALL` works), a join that
-compares such a column (selecting one in a join is fine), a correlated `IN
-(SELECT …)` (an uncorrelated one is compared under the collation),
-a foreign key or `CHECK` on one, a partitioned table with one, and giving a
-column one by `ALTER TABLE` (declare it in `CREATE TABLE`). A regular
-expression or `SIMILAR TO` over one is refused as PostgreSQL refuses it.
-Comparing columns of two different nondeterministic collations is `42P22`.
+`UNION`/`INTERSECT`/`EXCEPT` (but `UNION ALL` works), `HAVING` comparing
+such a column, `min`/`max` as a window function, a `SELECT DISTINCT` of
+such a column beside an expression, a `CHECK` reading one, a partitioned
+table with one, a foreign key whose action would write the child's key
+(`SET NULL`, `SET DEFAULT`, `ON UPDATE CASCADE`), `ALTER COLUMN TYPE` to a
+type that is not text, and giving an existing column one by `ALTER TABLE`.
+A regular expression or `SIMILAR TO` over one is refused as PostgreSQL
+refuses it. Comparing columns of two different nondeterministic
+collations, or one with a column compared by its bytes in a join key, is
+`42P22`.
 
-An expression over such a column (`upper(name) = 'BOB'`) compares by its
-bytes; PostgreSQL carries the column's collation through it.
+An expression over such a column (`upper(name) = 'BOB'`, `DISTINCT
+upper(name)`) compares by its bytes; PostgreSQL carries the column's
+collation through it.
 
 ## How it works
 
