@@ -273,6 +273,71 @@ pub fn strip_redundant_cast(text: &str) -> &str {
     }
 }
 
+/// The expression inside parentheses that enclose the **whole** of it, peeled
+/// as many times as they are written: `('[]'::jsonb)` is `'[]'::jsonb`, as
+/// PostgreSQL reads it (and as `pg_dump` and ORMs write a default). `(a) + (b)`
+/// is left alone: its first `(` closes before the end. Quotes are honoured, so
+/// a `)` inside a string literal closes nothing.
+fn peel_enclosing_parens(mut text: &str) -> &str {
+    loop {
+        let t = text.trim();
+        if !(t.starts_with('(') && t.ends_with(')')) {
+            return t;
+        }
+        let bytes = t.as_bytes();
+        let mut depth = 0i32;
+        let mut in_quote = false;
+        let mut encloses = true;
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_quote {
+                if b == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
+                        i += 1;
+                    } else {
+                        in_quote = false;
+                    }
+                }
+            } else if b == b'\'' {
+                in_quote = true;
+            } else if b == b'(' {
+                depth += 1;
+            } else if b == b')' {
+                depth -= 1;
+                if depth == 0 && i != bytes.len() - 1 {
+                    encloses = false;
+                    break;
+                }
+            }
+            i += 1;
+        }
+        if !encloses || depth != 0 || in_quote {
+            return t;
+        }
+        text = &t[1..t.len() - 1];
+    }
+}
+
+/// A quoted literal under an array cast, `'{}'::text[]`, is that literal: the
+/// column is an array and says so ([`strip_redundant_cast`] takes only a bare
+/// type name, so the `[]` kept it). Anything but a whole quoted literal is
+/// left as written.
+fn strip_array_literal_cast(text: &str) -> &str {
+    let Some(at) = text.rfind("::") else {
+        return text;
+    };
+    let head = text[..at].trim_end();
+    let tail = text[at + 2..].trim();
+    let Some(base) = tail.strip_suffix("[]") else {
+        return text;
+    };
+    let is_type_name = !base.is_empty()
+        && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ' ');
+    let quoted = head.len() >= 2 && head.starts_with('\'') && head.ends_with('\'');
+    if is_type_name && quoted { head } else { text }
+}
+
 /// The `real` a literal under a `real` cast spells (`'0.1'::real`,
 /// `0.1::float4`), when it is one: bound for a `double precision` column it
 /// is that `real` widened (0.10000000149011612), as PostgreSQL stores it,
@@ -432,7 +497,7 @@ fn evaluate_in(
             return Ok(crate::core::value_codec::widened_real_text(v));
         }
     }
-    let text = strip_redundant_cast(expression.trim());
+    let text = strip_array_literal_cast(strip_redundant_cast(peel_enclosing_parens(expression.trim())));
     let upper = text.to_ascii_uppercase();
 
     if text.is_empty() || upper == "NULL" {
@@ -790,6 +855,20 @@ mod tests {
         assert_eq!(evaluate("TRUE", &DbType::BOOL, NO_DB).unwrap(), "1");
         assert_eq!(evaluate("false", &DbType::BOOL, NO_DB).unwrap(), "0");
         assert_eq!(evaluate("NULL", &DbType::STRING, NO_DB).unwrap(), "NULL");
+    }
+
+    /// A default in parentheses, and a literal under an array cast, are the
+    /// literal (pms's `DEFAULT ('[]'::jsonb)`, refused before); a `)` inside
+    /// a string closes nothing, and `(a) + (b)` is not peeled.
+    #[test]
+    fn a_parenthesised_cast_literal_is_the_literal() {
+        assert_eq!(evaluate("('[]'::jsonb)", &DbType::JSONB, NO_DB).unwrap(), "'[]'");
+        assert_eq!(evaluate("(('{}'::jsonb))", &DbType::JSONB, NO_DB).unwrap(), "'{}'");
+        assert_eq!(evaluate("('{}'::text[])", &DbType::STRING, NO_DB).unwrap(), "'{}'");
+        assert_eq!(evaluate("'{}'::text[]", &DbType::STRING, NO_DB).unwrap(), "'{}'");
+        assert_eq!(evaluate("(0)", &DbType::I32, NO_DB).unwrap(), "0");
+        assert_eq!(evaluate("(')(')", &DbType::STRING, NO_DB).unwrap(), "')('");
+        assert_eq!(peel_enclosing_parens("(a) + (b)"), "(a) + (b)");
     }
 
     /// A number defaulting a text column is text, not a number.

@@ -131,6 +131,9 @@ fn rewrite_select_inner(sql: &str) -> Result<String, String> {
     if ["UNION", "INTERSECT", "EXCEPT"].iter().any(|kw| find_keyword(sql, kw, 0).is_some()) {
         return set_operation(sql);
     }
+    if let Some(wrapped) = window_over_filtered(sql) {
+        return Ok(wrapped);
+    }
     let mut current = sql.trim().trim_end_matches(';').trim_end().to_string();
     // Every subquery replaced first, its join kept to append after: an
     // appended join's body is itself a correlated subquery the finder would
@@ -181,6 +184,72 @@ fn rewrite_select_inner(sql: &str) -> Result<String, String> {
     let (head, tail) = current.split_at(end);
     let joined = format!("{} {} {}", head.trim_end(), joins.join(" "), tail.trim_start()).trim_end().to_string();
     group_by_values(joined, &per_group, in_select_expression)
+}
+
+/// A query whose select list has a window function and whose `WHERE` holds a
+/// correlated subquery, over one relation, as the window over the filtered
+/// rows: `SELECT id, row_number() OVER (…) FROM t task WHERE NOT EXISTS
+/// (… < task.ix …)` is `SELECT id, row_number() OVER (…) FROM (SELECT * FROM
+/// t task WHERE …) task` (`task.*`: a bare `*` over the
+/// join the subquery becomes is refused). A window is computed after the `WHERE`, so the two
+/// are the same query; the derived table answers the subquery on the path
+/// that runs it, where the join it became here could not read a window
+/// function ("could not be read as an expression over this join").
+///
+/// `None` unless the select list holds `OVER`, the `FROM` is one relation and
+/// the subquery is in the `WHERE`.
+fn window_over_filtered(sql: &str) -> Option<String> {
+    let sql = sql.trim().trim_end_matches(';').trim_end();
+    if !starts_with_word(sql, "SELECT") {
+        return None;
+    }
+    let from = find_keyword(sql, "FROM", 0)?;
+    find_keyword(&sql[..from], "OVER", 0)?;
+    let end = from_list_end(sql, from);
+    let relation = sql[from + "FROM".len()..end].trim();
+    if relation.is_empty()
+        || relation.starts_with('(')
+        || relation.contains(',')
+        || find_keyword(relation, "JOIN", 0).is_some()
+        || find_keyword(relation, "LATERAL", 0).is_some()
+    {
+        return None;
+    }
+    let words: Vec<&str> = relation.split_whitespace().filter(|w| !w.eq_ignore_ascii_case("AS")).collect();
+    let alias = match words.as_slice() {
+        [table] => table.rsplit('.').next()?.to_string(),
+        [_, alias] => alias.to_string(),
+        _ => return None,
+    };
+    let rest = sql[end..].trim_start();
+    if !starts_with_word(rest, "WHERE") {
+        return None;
+    }
+    let body = &rest["WHERE".len()..];
+    let body_end = ["GROUP", "HAVING", "WINDOW", "ORDER", "LIMIT", "OFFSET", "FETCH", "FOR"]
+        .iter()
+        .filter_map(|k| find_keyword(body, k, 0))
+        .min()
+        .unwrap_or(body.len());
+    let where_body = body[..body_end].trim();
+    // Only when the correlated subquery is the WHERE's: one in the select
+    // list or ORDER BY is the caller's.
+    let sub = outside_from(sql)?;
+    let where_at = sql.len() - rest.len();
+    if sub.start < where_at || sub.start > where_at + "WHERE".len() + body_end {
+        return None;
+    }
+    Some(format!(
+        "{} FROM (SELECT {}.* FROM {} WHERE {}) {} {}",
+        sql[..from].trim_end(),
+        alias,
+        relation,
+        where_body,
+        alias,
+        body[body_end..].trim_start()
+    )
+    .trim_end()
+    .to_string())
 }
 
 /// Whether the subquery at `at` is evaluated once per row of the outer

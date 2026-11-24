@@ -743,7 +743,13 @@ async fn tables(database: &Arc<Database>) -> Result<Vec<Row>, String> {
             Cell::Number(figures.reclaimable),
             Cell::Flag(figures.filters_ready),
             Cell::Flag(schema.is_immutable),
-            Cell::Text(schema.primary_key.clone().unwrap_or_default()),
+            // Every column of the key, comma-separated: a composite key read
+            // as the single-column field showed blank, as though it was lost.
+            Cell::Text(
+                crate::core::rql::unique_key::primary_key_of(&schema)
+                    .map(|k| k.columns.join(", "))
+                    .unwrap_or_default(),
+            ),
         ]));
     }
     Ok(out)
@@ -1527,7 +1533,9 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
     push("immutable", schema.is_immutable.to_string(), "");
     push(
         "primary_key",
-        schema.primary_key.clone().unwrap_or_default(),
+        crate::core::rql::unique_key::primary_key_of(&schema)
+            .map(|k| k.columns.join(", "))
+            .unwrap_or_default(),
         "",
     );
 

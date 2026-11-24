@@ -11773,7 +11773,15 @@ fn deferred_drops(
     if !cascade {
         for table in &present {
             for child in database.fk_children(table) {
-                if !child.eq_ignore_ascii_case(table) && !present.iter().any(|p| p.eq_ignore_ascii_case(&child)) {
+                // A child this block has already dropped (its drop is pending
+                // until COMMIT) no longer depends on the table: `BEGIN; DROP
+                // TABLE child; DROP TABLE parent; COMMIT` is how a migrator
+                // drops in key order, and was refused with 2BP01.
+                let child_dropped = pending.iter().any(|p| p.eq_ignore_ascii_case(&child));
+                if !child.eq_ignore_ascii_case(table)
+                    && !child_dropped
+                    && !present.iter().any(|p| p.eq_ignore_ascii_case(&child))
+                {
                     let message = if several {
                         format!(
                             "cannot drop desired object(s) because other objects depend on them: a foreign key on \
