@@ -31,6 +31,22 @@ use crate::core::wal::Wal;
 const BITS_IN_PROGRESS: u8 = 0b00;
 const BITS_COMMITTED: u8 = 0b01;
 const BITS_ABORTED: u8 = 0b10;
+/// Reserved: no build writes it yet. Sharding's two-phase commit will record
+/// "prepared" with it (sharding-plan.md B0.1, phase 5). A build that does not
+/// know what it means refuses the file at open rather than reading a
+/// prepared transaction as in progress, which is an abort to every reader.
+const BITS_RESERVED: u8 = 0b11;
+
+/// The open error for a reserved code at transaction `tx`.
+fn reserved_code(path: &Path, tx: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{}: transaction {tx} has status code 0b11, which this build does not know (a newer build's prepared state?); refusing to open",
+            path.display()
+        ),
+    )
+}
 
 const ENTRIES_PER_BYTE: u64 = 4;
 
@@ -431,7 +447,11 @@ impl StatusLog {
         for (index, byte) in bits.iter().enumerate() {
             if *byte != 0 {
                 for slot in 0..ENTRIES_PER_BYTE {
-                    if (byte >> (slot * 2)) & 0b11 != BITS_IN_PROGRESS {
+                    let code = (byte >> (slot * 2)) & 0b11;
+                    if code == BITS_RESERVED {
+                        return Err(reserved_code(&path, index as u64 * ENTRIES_PER_BYTE + slot));
+                    }
+                    if code != BITS_IN_PROGRESS {
                         highest = index as u64 * ENTRIES_PER_BYTE + slot;
                     }
                 }
@@ -1783,7 +1803,11 @@ impl StatusLog {
             for (i, byte) in chunk[..n].iter().enumerate() {
                 if *byte != 0 {
                     for slot in 0..ENTRIES_PER_BYTE {
-                        if (byte >> (slot * 2)) & 0b11 != BITS_IN_PROGRESS {
+                        let code = (byte >> (slot * 2)) & 0b11;
+                        if code == BITS_RESERVED {
+                            return Err(reserved_code(&path, (at + i as u64) * ENTRIES_PER_BYTE + slot));
+                        }
+                        if code != BITS_IN_PROGRESS {
                             highest = highest.max((at + i as u64) * ENTRIES_PER_BYTE + slot);
                         }
                     }
