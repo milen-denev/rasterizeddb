@@ -200,6 +200,58 @@ where
                 privileges::put(database, &row, tx).await.map_err(|e| fail("XX000", e))?;
                 Ok("ALTER TABLE")
             }
+            PrivilegeStatement::ReassignOwned { from, to } => {
+                if !role_exists(database, &to, tx).await {
+                    return Err(fail("42704", format!("role \"{to}\" does not exist")));
+                }
+                // As PostgreSQL asks: the giver acts as every role named.
+                let mine = privileges::roles_of(&rows, &me);
+                for r in from.iter().chain(std::iter::once(&to)) {
+                    if !admin && !mine.iter().any(|m| m == r) {
+                        return Err(fail("42501", format!("permission denied to reassign objects: must be able to SET ROLE \"{r}\"")));
+                    }
+                }
+                let owned: Vec<AclRow> =
+                    rows.iter().filter(|r| r.privilege == "OWNER" && from.contains(&r.grantee)).cloned().collect();
+                for r in owned {
+                    let filter = format!("relation = {} AND privilege = 'OWNER'", crate::auth::quote(&r.relation));
+                    privileges::delete_where(database, &filter, tx).await.map_err(|e| fail("XX000", e))?;
+                    let row = AclRow { relation: r.relation, grantee: to.clone(), privilege: "OWNER".into(), grantor: me.clone(), grantable: false };
+                    privileges::put(database, &row, tx).await.map_err(|e| fail("XX000", e))?;
+                }
+                Ok("REASSIGN OWNED")
+            }
+            PrivilegeStatement::DropOwned { roles } => {
+                let mine = privileges::roles_of(&rows, &me);
+                for r in &roles {
+                    if !admin && !mine.iter().any(|m| m == r) {
+                        return Err(fail("42501", format!("permission denied to drop objects: must be able to SET ROLE \"{r}\"")));
+                    }
+                }
+                let owned: Vec<&str> = rows
+                    .iter()
+                    .filter(|r| r.privilege == "OWNER" && roles.contains(&r.grantee))
+                    .map(|r| r.relation.as_str())
+                    .take(10)
+                    .collect();
+                if !owned.is_empty() {
+                    return Err(fail(
+                        "2BP01",
+                        format!(
+                            "DROP OWNED here revokes privileges only, and {} still own {}: REASSIGN OWNED or drop them first",
+                            roles.join(", "),
+                            owned.join(", ")
+                        ),
+                    ));
+                }
+                for r in &roles {
+                    let filter = format!("grantee = {} AND privilege <> 'OWNER'", crate::auth::quote(r));
+                    privileges::delete_where(database, &filter, tx).await.map_err(|e| fail("XX000", e))?;
+                    let defaults = format!("relation = {}", crate::auth::quote(&format!("@default:{r}")));
+                    privileges::delete_where(database, &defaults, tx).await.map_err(|e| fail("XX000", e))?;
+                }
+                Ok("DROP OWNED")
+            }
         }
     }
     .await;

@@ -71,6 +71,11 @@ pub enum PrivilegeStatement {
     DefaultPrivileges { for_role: Option<String>, grant: bool, privileges: Vec<String>, grantees: Vec<String>, tables: bool },
     /// `ALTER TABLE | VIEW | SEQUENCE … OWNER TO role`.
     OwnerTo { relation: String, owner: String },
+    /// `REASSIGN OWNED BY a [, …] TO b` (roles plan R2).
+    ReassignOwned { from: Vec<String>, to: String },
+    /// `DROP OWNED BY a [, …]`: the roles' grants and default privileges
+    /// revoked; refused while they still own objects (REASSIGN them first).
+    DropOwned { roles: Vec<String> },
 }
 
 fn ident(word: &str) -> String {
@@ -143,6 +148,31 @@ pub fn parse_privilege_statement(sql: &str) -> Option<Result<PrivilegeStatement,
     let upper = text.to_ascii_uppercase();
     let syntax = |what: &str| ("42601".to_string(), what.to_string());
     let _ = syntax;
+    if upper.starts_with("REASSIGN OWNED BY ") {
+        let body = &text["REASSIGN OWNED BY ".len()..];
+        let Some(to) = kw(body, "TO") else {
+            return Some(Err(("42601", "syntax error in REASSIGN OWNED: expected TO".to_string())));
+        };
+        let from = grantee_list(&body[..to]);
+        let to = name_of(body[to + 2..].trim());
+        if from.is_empty() || to.is_empty() {
+            return Some(Err(("42601", "REASSIGN OWNED BY names roles TO a role".to_string())));
+        }
+        return Some(Ok(PrivilegeStatement::ReassignOwned { from, to }));
+    }
+    if upper.starts_with("DROP OWNED BY ") {
+        let mut body = text["DROP OWNED BY ".len()..].trim();
+        for suffix in [" CASCADE", " RESTRICT"] {
+            if body.to_ascii_uppercase().ends_with(suffix) {
+                body = body[..body.len() - suffix.len()].trim_end();
+            }
+        }
+        let roles = grantee_list(body);
+        if roles.is_empty() {
+            return Some(Err(("42601", "DROP OWNED BY names roles".to_string())));
+        }
+        return Some(Ok(PrivilegeStatement::DropOwned { roles }));
+    }
     if upper.starts_with("GRANT ") {
         let body = &text[6..];
         let Some(to) = kw(body, "TO") else {
