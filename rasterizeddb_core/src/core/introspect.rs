@@ -62,6 +62,9 @@ pub enum Introspect {
     TableStats(String),
     /// One row per partition of a partitioned table.
     Partitions(String),
+    /// One row per shard of the cluster map this node serves (sharding-plan.md
+    /// B1a.12); no rows on a node that is not a shard.
+    Shards,
     Columns(String),
     SchemaMap,
     /// Every CHECK constraint and whether this binary enforces it.
@@ -182,6 +185,12 @@ pub fn parse(sql: &str) -> Option<Result<Introspect, String>> {
             Some(_) => Some(Err("SHOW TABLE STATS takes one table name".to_string())),
             None => Some(Err("SHOW TABLE STATS names no table".to_string())),
         },
+        Some("SHARDS") => {
+            if words.len() > 2 {
+                return Some(Err("SHOW SHARDS takes no arguments".to_string()));
+            }
+            Some(Ok(Introspect::Shards))
+        }
         Some("PARTITIONS") => match original.get(2) {
             Some(name) if original.len() == 3 => {
                 Some(Ok(Introspect::Partitions(normalize_name(name))))
@@ -326,6 +335,18 @@ pub fn result_fields(statement: &Introspect) -> Option<Vec<(String, DbType)>> {
         // `lo` and `hi` are text: the hash space is `[0, 2^64)`, so the last
         // partition's `hi` does not fit a BIGINT, and a `lo` past 2^63 would
         // read as negative. Hex, as the map log and the design write them.
+        // Block ranges as hex text, as SHOW PARTITIONS writes points.
+        Introspect::Shards => vec![
+            number("shard_id"),
+            flag("this_shard"),
+            text("address"),
+            text("standbys"),
+            number("ranges"),
+            number("blocks"),
+            number("map_epoch"),
+            text("cluster_id"),
+            text("map_digest"),
+        ],
         Introspect::Partitions(_) => vec![
             number("pid"),
             text("lo"),
@@ -441,6 +462,7 @@ pub async fn execute(statement: &Introspect, database: &Arc<Database>) -> Vec<u8
             Ok(r) => rows(r),
             Err(e) => failure(&e),
         },
+        Introspect::Shards => rows(shards()),
         Introspect::Columns(name) => match columns(database, name) {
             Ok(r) => rows(r),
             Err(e) => failure(&e),
@@ -1682,6 +1704,37 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
 /// `[lo, hi)` range of the hash space, where its files are, whether it has
 /// any, and its sizes (zero until it is materialized). Refused for a plain
 /// table, and for a partitioned table that cannot be opened.
+/// `SHOW SHARDS`: the served cluster map, one row per shard.
+#[cfg(feature = "sharding")]
+fn shards() -> Vec<Row> {
+    let Some(served) = crate::core::shard::map_state::current() else {
+        return Vec::new();
+    };
+    let map = &served.map;
+    map.shards()
+        .iter()
+        .map(|s| {
+            let ranges = map.ranges_of(s.id);
+            row(&[
+                Cell::Number(s.id as u64),
+                Cell::Flag(s.id == served.shard_id),
+                Cell::Text(s.addr.clone()),
+                Cell::Text(s.standbys.join(",")),
+                Cell::Number(ranges.len() as u64),
+                Cell::Number(ranges.iter().map(|(lo, hi)| hi - lo).sum()),
+                Cell::Number(map.epoch()),
+                Cell::Text(format!("{:032x}", map.cluster_id())),
+                Cell::Text(format!("{:016x}", map.digest())),
+            ])
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "sharding"))]
+fn shards() -> Vec<Row> {
+    Vec::new()
+}
+
 async fn partitions(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
     let table = match database.relation(name) {
         None => return Err(format!("relation `{}` does not exist", name)),

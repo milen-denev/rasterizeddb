@@ -5,6 +5,7 @@
 //! Built with the `sharding` feature, dormant until the server starts with
 //! `--role shard`.
 
+pub mod ddl;
 pub mod map_state;
 pub mod ownership;
 pub mod start;
