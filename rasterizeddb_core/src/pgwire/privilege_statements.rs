@@ -229,6 +229,10 @@ pub(super) async fn check(database: &Arc<Database>, state: &SessionState, stmt: 
         Ok(rows) => rows,
         Err(e) => return Some(("42501", format!("permission denied: the privilege catalogue could not be read ({e})"))),
     };
+    // Indexes, triggers and the non-relation objects (roles plan R1).
+    if let Some(refusal) = object_ddl_refusal(database, &rows, me, stmt, tx).await {
+        return Some(refusal);
+    }
     // Table DDL: the owner's alone. A `CREATE TABLE … AS` reads its query,
     // which is checked below as any read.
     if let Some(ddl) = crate::core::rql::views::table_ddl(stmt) {
@@ -308,6 +312,127 @@ pub(super) async fn check(database: &Arc<Database>, state: &SessionState, stmt: 
         }
     }
     None
+}
+
+/// The name a DDL word names: unquoted folded, quoted kept, schema and an
+/// argument list dropped.
+fn object_name(word: &str) -> String {
+    let w = word.split('(').next().unwrap_or(word);
+    let w = crate::core::sql_scan::last_name_segment(w.trim_end_matches([',', ';']));
+    if w.starts_with('"') { w.trim_matches('"').to_string() } else { w.to_ascii_lowercase() }
+}
+
+/// Ownership of the objects that are not relations, and of what is built on
+/// a table (roles plan R1):
+/// - `CREATE INDEX … ON t` and `DROP INDEX`: the table's owner;
+/// - `CREATE TRIGGER … ON t`: the table's owner or its TRIGGER privilege;
+///   `DROP TRIGGER … ON t`: the owner;
+/// - functions, procedures, domains and types: their creator is recorded as
+///   owner (`@function:name`, …); only the owner may replace, alter or drop
+///   one. One with no owner recorded (made before owners existed) is a
+///   superuser's to change, never the first comer's.
+async fn object_ddl_refusal(
+    database: &Arc<Database>,
+    rows: &[privileges::AclRow],
+    me: &str,
+    stmt: &str,
+    tx: Option<TxId>,
+) -> Option<(&'static str, String)> {
+    let words: Vec<&str> = stmt.split_whitespace().collect();
+    let up: Vec<String> = words.iter().map(|w| w.to_ascii_uppercase()).collect();
+    let on_table = || {
+        up.iter().position(|w| w == "ON").and_then(|i| {
+            let mut j = i + 1;
+            if up.get(j).is_some_and(|w| w == "ONLY") {
+                j += 1;
+            }
+            words.get(j).map(|w| object_name(w))
+        })
+    };
+    let first = up.first().map(String::as_str).unwrap_or("");
+    let second = up.get(1).map(String::as_str).unwrap_or("");
+    let third = up.get(2).map(String::as_str).unwrap_or("");
+    let is_index = second == "INDEX" || (second == "UNIQUE" && third == "INDEX");
+    if first == "CREATE" && is_index {
+        if let Some(t) = on_table()
+            && relation_exists(database, &t, tx).await
+            && !privileges::owns(rows, me, &t)
+        {
+            return Some(("42501", format!("must be owner of table {t}")));
+        }
+        return None;
+    }
+    let trigger = second == "TRIGGER" || (second == "OR" && third == "REPLACE" && up.get(3).is_some_and(|w| w == "TRIGGER"));
+    if first == "CREATE" && trigger {
+        if let Some(t) = on_table()
+            && relation_exists(database, &t, tx).await
+            && !privileges::owns(rows, me, &t)
+            && !privileges::allows(rows, me, &t, "TRIGGER")
+        {
+            return Some(("42501", format!("permission denied for table {t}")));
+        }
+        return None;
+    }
+    if first == "DROP" && second == "TRIGGER" {
+        if let Some(t) = on_table()
+            && relation_exists(database, &t, tx).await
+            && !privileges::owns(rows, me, &t)
+        {
+            return Some(("42501", format!("must be owner of table {t}")));
+        }
+        return None;
+    }
+    // Functions, procedures, domains, types.
+    let replace = second == "OR" && third == "REPLACE";
+    let kind_at = if replace { 3 } else { 1 };
+    let kind = up.get(kind_at).map(String::as_str).unwrap_or("");
+    let kind = match kind {
+        "FUNCTION" | "PROCEDURE" | "DOMAIN" | "TYPE" => kind.to_ascii_lowercase(),
+        _ => return None,
+    };
+    if !matches!(first, "CREATE" | "ALTER" | "DROP") {
+        return None;
+    }
+    let mut at = kind_at + 1;
+    if first == "DROP" && up.get(at).is_some_and(|w| w == "IF") && up.get(at + 1).is_some_and(|w| w == "EXISTS") {
+        at += 2;
+    }
+    let name = object_name(words.get(at)?);
+    let key = format!("@{kind}:{name}");
+    match privileges::owner_of(rows, &key) {
+        Some(owner) if owner == me => None,
+        Some(owner) => Some(("42501", format!("must be owner of {kind} {name} (owned by {owner})"))),
+        // Unowned: a CREATE of a new one makes this role its owner (OR
+        // REPLACE too, when nothing by that name exists); changing one made
+        // before owners existed is a superuser's.
+        None if first == "CREATE" && (!replace || !routine_exists(database, &kind, &name, tx).await) => {
+            let row = privileges::AclRow {
+                relation: key,
+                grantee: me.to_string(),
+                privilege: "OWNER".to_string(),
+                grantor: me.to_string(),
+                grantable: false,
+            };
+            privileges::put(database, &row, tx).await.err().map(|e| ("42501", format!("permission denied: recording the owner of {kind} {name} failed ({e})")))
+        }
+        None => Some(("42501", format!("must be owner of {kind} {name}"))),
+    }
+}
+
+/// Whether a function, procedure or domain named `name` exists.
+async fn routine_exists(database: &Arc<Database>, kind: &str, name: &str, tx: Option<TxId>) -> bool {
+    match kind {
+        "function" | "procedure" => crate::core::rql::functions::load(database, Some(name), tx)
+            .await
+            .map(|r| !r.is_empty())
+            // Unreadable: treat as existing, so it is not taken over.
+            .unwrap_or(true),
+        "domain" => crate::core::rql::domains::load(database, Some(&[name.to_string()]), tx)
+            .await
+            .map(|r| !r.is_empty())
+            .unwrap_or(true),
+        _ => true,
+    }
 }
 
 /// The privilege a write target needs, from the keyword written right
