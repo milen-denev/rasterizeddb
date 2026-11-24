@@ -460,6 +460,9 @@ async fn handshake(
                 user: login.user.clone(),
                 superuser,
                 authenticated: false,
+                database: database_name.clone(),
+                verifier: None,
+                bootstrap_user: Some(shared.config.bootstrap_user.clone()),
             },
             Err(_) => {
                 refuse(wire, 18456, &format!("Login failed for user '{}'.", login.user));
@@ -485,8 +488,11 @@ async fn handshake(
             }
             ProxiedLogin {
                 user: login.user.clone(),
-                superuser: role.map(|r| r.is_superuser).unwrap_or(false),
+                superuser: role.as_ref().map(|r| r.is_superuser).unwrap_or(false),
                 authenticated: true,
+                database: database_name.clone(),
+                verifier: role.and_then(|r| r.verifier).map(|v| v.to_stored()),
+                bootstrap_user: None,
             }
         }
     };
@@ -748,6 +754,9 @@ impl Session {
         };
         match PgBridge::open(self.shared.catalog.clone(), database, options).await {
             Ok(b) => {
+                // What this database made of the login (its own role's
+                // attributes), for this front end's own checks.
+                self.login = b.login.clone();
                 if let Some(old) = self.bridge.replace(b) {
                     old.terminate().await;
                 }
@@ -763,6 +772,14 @@ impl Session {
                 922,
                 format!(
                     "Database '{database}' is being recovered. Waiting until recovery is finished."
+                ),
+            )),
+            Err(OpenRefused::Denied(why)) => Err(TsqlError::new(
+                916,
+                format!(
+                    "The server principal \"{}\" is not able to access the database \"{database}\" under the current \
+                     security context: {why}",
+                    self.login.user
                 ),
             )),
             Err(OpenRefused::Io(e)) => Err(TsqlError::new(50000, e.to_string())),

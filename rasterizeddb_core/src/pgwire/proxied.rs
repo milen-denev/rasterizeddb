@@ -25,6 +25,48 @@ pub(crate) struct ProxiedLogin {
     /// Whether the name was proven with a credential. False under `trust`,
     /// as for a pgwire `trust` login: see [`Principal`].
     pub(crate) authenticated: bool,
+    /// The database the login was checked against: a session in any other
+    /// is checked again there ([`login_for`]), since a role of the same name
+    /// in another database is another account.
+    pub(crate) database: String,
+    /// The role's verifier as stored when it logged in (`Verifier::to_stored`),
+    /// for an authenticated login: the credential it proved. Another
+    /// database admits the login only where its role holds this same one.
+    pub(crate) verifier: Option<String>,
+    /// The bootstrap role a `trust` login is checked with
+    /// (`auth::trust_login`) in another database.
+    pub(crate) bootstrap_user: Option<String>,
+}
+
+/// `login`, as it stands in database `name` (`database`): the same login
+/// when it is the one it logged in to; otherwise checked again against that
+/// database's roles, with that role's attributes (its `superuser`, not the
+/// first database's). An authenticated login needs the role there to hold
+/// the very credential it proved, which a role copied by `CREATE DATABASE`
+/// does; a `trust` login is what `auth::trust_login` makes it there. Refused
+/// otherwise: MySQL's `USE` and SQL Server's `USE` used to carry a login
+/// into any database, as whatever role held its name there.
+pub(crate) async fn login_for(database: &Arc<Database>, name: &str, login: &ProxiedLogin) -> Result<ProxiedLogin, String> {
+    if login.database == name {
+        return Ok(login.clone());
+    }
+    let superuser = if login.authenticated {
+        let role = crate::auth::lookup_role(database, &login.user).await;
+        let same_credential = role.as_ref().is_some_and(|r| {
+            r.can_login && login.verifier.is_some() && r.verifier.as_ref().map(|v| v.to_stored()) == login.verifier
+        });
+        if !same_credential {
+            return Err(format!(
+                "role \"{}\" cannot use database \"{name}\" without logging in to it: its account there is not \
+                 the one this connection proved; connect to \"{name}\" instead",
+                login.user
+            ));
+        }
+        role.is_some_and(|r| r.is_superuser)
+    } else {
+        crate::auth::trust_login(database, &login.user, login.bootstrap_user.as_deref()).await?
+    };
+    Ok(ProxiedLogin { superuser, database: name.to_string(), ..login.clone() })
 }
 
 /// A watch on a front end's client socket, for a statement to notice the
@@ -118,6 +160,8 @@ pub(crate) enum OpenRefused {
     NoDatabase,
     /// The database is being imported.
     Loading,
+    /// The login is not admitted to the database ([`login_for`]).
+    Denied(String),
     Io(io::Error),
 }
 
@@ -253,6 +297,9 @@ pub(crate) struct PgBridge {
     /// The database the session is attached to.
     pub(crate) database: Arc<Database>,
     pub(crate) database_name: String,
+    /// The login as this database admits it ([`login_for`]): what the front
+    /// end's own checks (KILL, SHOW GRANTS) read after a `USE`.
+    pub(crate) login: ProxiedLogin,
 }
 
 const BRIDGE_PIPE: usize = 256 * 1024;
@@ -272,7 +319,6 @@ impl PgBridge {
             return Err(OpenRefused::NoDatabase);
         };
         let database = guard.database().clone();
-        let (client, server) = tokio::io::duplex(BRIDGE_PIPE);
         let BridgeOptions {
             login,
             limits,
@@ -280,6 +326,11 @@ impl PgBridge {
             parameters,
             lenient_booleans,
         } = options;
+        // A database other than the one the login was checked against
+        // checks it again, before any session exists there.
+        let login = login_for(&database, database_name, &login).await.map_err(OpenRefused::Denied)?;
+        let effective = login.clone();
+        let (client, server) = tokio::io::duplex(BRIDGE_PIPE);
         let session = async move {
             if let Err(e) = serve_proxied(catalog, guard, login, limits, server, parameters).await {
                 log::debug!("proxied session ended: {e}");
@@ -303,6 +354,7 @@ impl PgBridge {
             status: b'I',
             database,
             database_name: database_name.to_string(),
+            login: effective,
         };
         loop {
             let frame = bridge.next().await.map_err(OpenRefused::Io)?;

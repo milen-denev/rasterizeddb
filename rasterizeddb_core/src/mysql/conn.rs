@@ -479,6 +479,9 @@ async fn handshake(
                 user: user.clone(),
                 superuser,
                 authenticated: false,
+                database: database.clone(),
+                verifier: None,
+                bootstrap_user: Some(shared.config.bootstrap_user.clone()),
             },
             Err(_) => {
                 refuse(
@@ -542,6 +545,9 @@ async fn authenticate(
         user: user.to_string(),
         superuser,
         authenticated: true,
+        database: database_name.to_string(),
+        verifier: verifier.as_ref().map(|v| v.to_stored()),
+        bootstrap_user: None,
     };
 
     // Fast path: a scramble against the cached hash.
@@ -709,6 +715,9 @@ impl Session {
         };
         match PgBridge::open(self.shared.catalog.clone(), database, options).await {
             Ok(bridge) => {
+                // What this database made of the login (its own role's
+                // attributes), for this front end's own checks.
+                self.login = bridge.login.clone();
                 if let Some(old) = self.bridge.replace(bridge) {
                     old.terminate().await;
                 }
@@ -744,6 +753,11 @@ impl Session {
                 format!(
                     "database '{database}' is being imported and is not ready for connections yet"
                 ),
+            )),
+            Err(OpenRefused::Denied(why)) => Err(MyError::new(
+                1044,
+                "42000",
+                format!("Access denied for user '{}' to database '{database}': {why}", self.user),
             )),
             Err(OpenRefused::Io(e)) => Err(MyError::new(1105, "HY000", e.to_string())),
         }
@@ -2562,6 +2576,15 @@ impl Session {
                     1049,
                     "42000",
                     format!("Unknown database '{database}'"),
+                ));
+            }
+            // Not admitted there: another database's roles are another
+            // set of accounts (`proxied::login_for`).
+            Err(OpenRefused::Denied(why)) => {
+                return Err(MyError::new(
+                    1044,
+                    "42000",
+                    format!("Access denied for user '{}' to database '{database}': {why}", self.user),
                 ));
             }
             Err(_) => {
