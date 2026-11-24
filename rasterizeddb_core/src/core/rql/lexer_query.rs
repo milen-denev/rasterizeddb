@@ -2189,6 +2189,14 @@ fn parse_select_query(
         (columns_part, false)
     };
 
+    // A window over a column with a nondeterministic collation partitions
+    // and sorts by its key (`collate_rewrite::rewrite_windows`).
+    let windowed_ci = if crate::core::rql::collation::any(schema) {
+        crate::core::tokenizer::collate_rewrite::rewrite_windows(columns_part, schema)
+    } else {
+        None
+    };
+    let columns_part = windowed_ci.as_deref().unwrap_or(columns_part);
     let mut select_items = parse_select_items(columns_part, schema)?;
 
     // `DISTINCT ON (k, …)`: each key a select item it names or an expression
@@ -2431,6 +2439,20 @@ fn parse_select_query(
     let grouped_distinct =
         crate::core::rql::collation::group_by_keys(&mut group_by, &mut select_items, schema, as_distinct);
     let distinct = distinct && !grouped_distinct;
+    // A DISTINCT left over a plain column with a nondeterministic collation
+    // (beside an expression, which compares by its bytes) would tell its
+    // spellings apart.
+    if distinct
+        && let Some(f) = select_items.iter().find_map(|i| match i {
+            SelectItem::Column { field, .. } if !crate::core::rql::collation::of(&field.name, schema).is_binary() => Some(field),
+            _ => None,
+        })
+    {
+        return Err(format!(
+            "SELECT DISTINCT over column \"{}\" beside an expression, which has a case-insensitive collation, is not supported yet",
+            f.name
+        ));
+    }
     let is_grouped = has_aggregate || !group_by.is_empty();
     // A key naming an output column sorts by that column's value
     // (`output_item_named`). A plain column item sorts by its source column,

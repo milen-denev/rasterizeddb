@@ -125,6 +125,11 @@ pub(crate) trait Env {
     fn param_text(&self, _name: &str) -> Option<Option<String>> {
         None
     }
+    /// Whether a text column declared with no `COLLATE` compares without
+    /// case (`MsConfig::case_insensitive`).
+    fn case_insensitive(&self) -> bool {
+        false
+    }
 }
 
 /// What a statement answers with.
@@ -3405,6 +3410,7 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<String, TsqlError> {
     let mut ty = map_type(&def[1..type_end])?;
     let mut attrs: Vec<String> = Vec::new();
     let mut identity = false;
+    let mut explicit_collation = false;
     let mut k = type_end;
     while k < def.len() {
         let w = def[k].upper().unwrap_or_default();
@@ -3459,13 +3465,16 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<String, TsqlError> {
                 }
             }
             "COLLATE" => {
+                explicit_collation = true;
                 // A case-insensitive collation is the engine's own (the
                 // column gets its key companion); a case-sensitive or binary
                 // one is the bytes, which is what a column compares by.
                 if cx.collations
                     && let Some(engine) = def.get(k + 1).and_then(|t| t.ident()).and_then(engine_collation)
                 {
-                    attrs.push(format!("COLLATE {engine}"));
+                    // Right after the type: after a DEFAULT it would read
+                    // as part of the default's expression.
+                    attrs.insert(0, format!("COLLATE {engine}"));
                 }
                 k += 2;
             }
@@ -3481,6 +3490,16 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<String, TsqlError> {
                 )));
             }
         }
+    }
+    // SQL Server's default collation compares text without case: a text
+    // column that names no collation is given the engine's.
+    if cx.collations
+        && !explicit_collation
+        && cx.env.case_insensitive()
+        && is_string_type(&def[1..type_end])
+        && !kw(def, 1, "XML")
+    {
+        attrs.insert(0, format!("COLLATE {}", crate::core::rql::collation::CI_NAME));
     }
     if identity {
         ty = match ty.as_str() {
@@ -3710,6 +3729,8 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
     let verb = tokens.get(k).and_then(|x| x.upper()).unwrap_or_default();
     match verb.as_str() {
         "ADD" => {
+            // A column added takes collations as a created one does.
+            cx.collations = true;
             for part in split_commas(&tokens[k + 1..]) {
                 if part.is_empty() {
                     continue;

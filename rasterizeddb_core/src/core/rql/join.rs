@@ -3714,6 +3714,7 @@ pub fn plan(
     let ci_where: String;
     let ci_group: String;
     let ci_select: String;
+    let ci_windows: String;
     let mut where_clause = where_clause;
     let mut group_by_clause = group_by_clause;
     let mut select_list = select_list;
@@ -3787,6 +3788,10 @@ pub fn plan(
                 keyed.push(term);
             }
             order_by = keyed;
+        }
+        if let Some(windowed) = crate::core::tokenizer::collate_rewrite::rewrite_windows(select_list, &columns) {
+            ci_windows = windowed;
+            select_list = &ci_windows;
         }
         let labelled: Vec<(&str, &[SchemaField])> =
             relations.iter().zip(&schemas).map(|(r, s)| (r.label.as_str(), &s[..])).collect();

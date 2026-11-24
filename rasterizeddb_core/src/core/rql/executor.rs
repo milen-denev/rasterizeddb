@@ -13792,8 +13792,16 @@ async fn add_foreign_key(
         Err(e) => return ddl_error(&e),
     };
     let visible = crate::core::rql::nullable::visible_fields(&schema.fields);
-    if let Some(missing) =
-        fk.columns.iter().find(|c| !visible.iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(c)))
+    // A case-insensitive column's key is its companion
+    // (`collation::constraint_on_keys`), hidden as it is.
+    let companion = |c: &str| {
+        crate::core::rql::collation::is_companion(c)
+            && schema.fields.iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(c))
+    };
+    if let Some(missing) = fk
+        .columns
+        .iter()
+        .find(|c| !companion(c) && !visible.iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(c)))
     {
         return ddl_error(&format!("column \"{}\" referenced in foreign key constraint does not exist", missing));
     }
@@ -16559,13 +16567,28 @@ async fn execute_alter_table(sql: &str, database: &Arc<Database>, tx: TxId) -> V
         };
     }
 
-    let plans = match lexer_alter::parse_alter_table_actions_tagged(sql) {
+    let mut plans = match lexer_alter::parse_alter_table_actions_tagged(sql) {
         Ok(p) => p,
         Err(e) => {
             error!("Cannot parse ALTER TABLE: {}", e);
             return ddl_error(&e);
         }
     };
+    // A UNIQUE or FOREIGN KEY added over a column with a nondeterministic
+    // collation keys its companion, as one declared in CREATE TABLE does
+    // (`collation::constraint_on_keys`).
+    for (plan, _) in plans.iter_mut() {
+        if let lexer_alter::AlterAction::ConstraintClause { drop: false, description } = &mut plan.action
+            && let Some(view) = database.schema_view(&plan.table_name)
+        {
+            let fields_of = |table: &str| database.schema_view(table).map(|v| v.schema().fields.to_vec());
+            match crate::core::rql::collation::constraint_on_keys(description, &view.schema().fields, &fields_of) {
+                Ok(Some(rewritten)) => *description = rewritten,
+                Ok(None) => {}
+                Err(e) => return ddl_error(&e),
+            }
+        }
+    }
 
     // Retyping a column with a nondeterministic collation would rebuild it
     // without its key companion, comparing by its bytes after: refused.

@@ -539,6 +539,9 @@ struct Scope<'a> {
 }
 
 impl Env for Scope<'_> {
+    fn case_insensitive(&self) -> bool {
+        self.s.shared.config.case_insensitive
+    }
     fn database(&self) -> &Arc<Database> {
         &self.s.bridge.as_ref().unwrap().database
     }

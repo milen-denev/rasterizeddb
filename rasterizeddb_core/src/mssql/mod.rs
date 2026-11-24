@@ -88,6 +88,11 @@ pub struct MsConfig {
     pub bootstrap_user: String,
     pub bootstrap_password: Option<String>,
     pub limits: ConnectionLimits,
+    /// Text columns a `CREATE TABLE` / `ADD COLUMN` makes without a
+    /// `COLLATE` compare without case, as under SQL Server's default
+    /// collation (`SQL_Latin1_General_CP1_CI_AS`): each is given the
+    /// engine's `rdb_ci`. Off, they compare by their bytes.
+    pub case_insensitive: bool,
 }
 
 pub(crate) struct Shared {

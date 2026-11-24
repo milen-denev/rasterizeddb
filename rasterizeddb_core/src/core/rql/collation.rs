@@ -601,19 +601,14 @@ pub fn plan_single(
     let words = words_of_list(select_list);
     for (k, w) in words.iter().enumerate() {
         let Some(column) = ci(w) else { continue };
-        if distinct {
-            return refuse("SELECT DISTINCT", &column);
-        }
         let before = |n: usize| k.checked_sub(n).and_then(|i| words.get(i)).map(|s| s.to_ascii_uppercase());
         // `min`, `max` and DISTINCT aggregates compare by the key
-        // (`mark_aggregates`); a window does not yet.
-        if matches!(before(1).as_deref(), Some("PARTITION" | "BY")) {
-            return refuse("this aggregate or window", &column);
-        }
-    }
-    if words.iter().any(|w| w.eq_ignore_ascii_case("OVER")) && words.iter().any(|w| ci(w).is_some()) {
-        if let Some(c) = words.iter().find_map(|w| ci(w)) {
-            return refuse("a window function in a statement reading", &c);
+        // (`mark_aggregates`), and a window partitions and sorts by it
+        // (`collate_rewrite::rewrite_windows`); `min`/`max` as a window
+        // function does not yet.
+        let windowed = words.iter().any(|w| w.eq_ignore_ascii_case("OVER"));
+        if windowed && matches!(before(1).as_deref(), Some("MIN" | "MAX")) {
+            return refuse("min/max as a window function", &column);
         }
     }
     let mut out = Vec::with_capacity(order_terms.len());
@@ -811,9 +806,10 @@ pub fn refuse_in_join(
     for (k, w) in words.iter().enumerate() {
         let Some(c) = ci(w) else { continue };
         let before = k.checked_sub(1).map(|i| words[i].to_ascii_uppercase());
-        // `min`, `max` and DISTINCT aggregates compare by the key; a window
-        // or a DISTINCT over more than plain columns does not yet.
-        if distinct || window || matches!(before.as_deref(), Some("BY")) {
+        // `min`, `max` and DISTINCT aggregates compare by the key, and a
+        // window partitions and sorts by it; a DISTINCT over more than plain
+        // columns and `min`/`max` as a window function do not yet.
+        if distinct || window && matches!(before.as_deref(), Some("MIN" | "MAX")) {
             return refuse(c);
         }
     }
@@ -1008,6 +1004,91 @@ pub fn add_column_statements(sql: &str) -> Option<Result<Vec<String>, String>> {
         ));
     }
     Some(Ok(out))
+}
+
+/// An added constraint (`[CONSTRAINT n] UNIQUE (…)`, `FOREIGN KEY (…)
+/// REFERENCES p (…)`) over columns with a nondeterministic collation, on
+/// their companions: a UNIQUE keys them, a foreign key pairs the child's
+/// with the parent's (which must have the same collation). `None` when it
+/// names no such column.
+pub fn constraint_on_keys(
+    description: &str,
+    fields: &[SchemaField],
+    fields_of: &dyn Fn(&str) -> Option<Vec<SchemaField>>,
+) -> Result<Option<String>, String> {
+    let upper = description.to_ascii_uppercase();
+    let find = |kw: &str, from: usize| crate::core::rql::join::find_keyword(&upper, kw, from);
+    // The column list in the parentheses after `at`: its span inside them.
+    let list_after = |at: usize| -> Option<(usize, usize)> {
+        let open = at + description[at..].find('(')?;
+        let close = crate::core::rql::expr::matching_paren(description, open)?;
+        Some((open + 1, close))
+    };
+    let names = |(a, b): (usize, usize)| -> Vec<String> {
+        crate::core::sql_scan::split_top_level(&description[a..b], b',')
+            .iter()
+            .map(|c| crate::core::sql_scan::bare_name(c.split_whitespace().next().unwrap_or("")))
+            .collect()
+    };
+    let render = |cols: &[String]| cols.iter().map(|c| ident(c)).collect::<Vec<_>>().join(", ");
+    if let Some(fk) = find("FOREIGN", 0) {
+        let Some(child_span) = list_after(fk) else { return Ok(None) };
+        let Some(refs) = find("REFERENCES", child_span.1) else { return Ok(None) };
+        let mut child = names(child_span);
+        if !child.iter().any(|c| !of(c, fields).is_binary()) {
+            return Ok(None);
+        }
+        let after = description[refs + "REFERENCES".len()..].trim_start();
+        let parent_name_len = after.find(|c: char| c == '(' || c.is_whitespace()).unwrap_or(after.len());
+        let parent_table = crate::core::sql_scan::bare_name(&after[..parent_name_len]);
+        let parent_fields = fields_of(&parent_table).unwrap_or_default();
+        let Some(parent_span) = list_after(refs) else {
+            return Err("a foreign key over a case-insensitive column needs its referenced column list".to_string());
+        };
+        let mut parent = names(parent_span);
+        let tail = &upper[parent_span.1..];
+        if tail.contains("SET NULL") || tail.contains("SET DEFAULT") || find("UPDATE", parent_span.1).is_some_and(|u| upper[u..].trim_start_matches("UPDATE").trim_start().starts_with("CASCADE")) {
+            return Err("ON DELETE/UPDATE SET NULL, SET DEFAULT or ON UPDATE CASCADE on a foreign key over a column with a case-insensitive collation is not supported yet".to_string());
+        }
+        for (k, c) in child.iter_mut().enumerate() {
+            let strength = of(c, fields);
+            if strength.is_binary() {
+                continue;
+            }
+            let Some(p) = parent.get_mut(k) else { continue };
+            if of(p, &parent_fields) != strength {
+                return Err(format!(
+                    "foreign key column \"{c}\" and referenced column \"{p}\" have different collations"
+                ));
+            }
+            *c = companion_name(c, strength).expect("nondeterministic");
+            *p = companion_name(p, strength).expect("nondeterministic");
+        }
+        let mut out = String::with_capacity(description.len() + 16);
+        out.push_str(&description[..child_span.0]);
+        out.push_str(&render(&child));
+        out.push_str(&description[child_span.1..parent_span.0]);
+        out.push_str(&render(&parent));
+        out.push_str(&description[parent_span.1..]);
+        return Ok(Some(out));
+    }
+    if let Some(u) = find("UNIQUE", 0) {
+        let Some(span) = list_after(u) else { return Ok(None) };
+        let mut cols = names(span);
+        let mut changed = false;
+        for c in cols.iter_mut() {
+            let strength = of(c, fields);
+            if !strength.is_binary() {
+                *c = companion_name(c, strength).expect("nondeterministic");
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(None);
+        }
+        return Ok(Some(format!("{}{}{}", &description[..span.0], render(&cols), &description[span.1..])));
+    }
+    Ok(None)
 }
 
 /// Whether `sql` declares a nondeterministic collation anywhere: a
