@@ -8,7 +8,18 @@
 //!                       --table TABLE:COLUMN [--table …] --fenced
 //! rdb-shard rollback    --map NEW_MAP --out MAP --state STATE
 //! rdb-shard retire      --map NEW_MAP --state STATE [--retention-hours 24] [--force]
+//! rdb-shard rebalance   --map MAP [--tolerance 0.10] [--max-moves 4] [--max-bytes N]
+//!                       [--pin LO:HI …] [--exclude SHARD …]
+//!                       [--apply --fenced --out NEW_MAP --state-dir DIR
+//!                        --table TABLE:COLUMN:TYPE [--table …]]
 //! ```
+//!
+//! `rebalance` reads `SHOW SHARD LOAD` from every shard and prints the round
+//! the auto-balancer plans (sharding-plan.md §4.6b). With `--apply` it runs
+//! each move as an offline range move, one after another: the rows whose key
+//! falls in the moved blocks (`rdb_route_block(TYPE, COLUMN)`) are copied at
+//! one snapshot, verified, and handed off one map epoch up, with a state file
+//! per move in DIR that `rollback` and `retire` take like a tenant move's.
 //!
 //! Every command also takes `--user U` (with the password in
 //! `RDB_PASSWORD`), `--ca PEM`, `--pin SHA256` or `--accept-any` (the
@@ -53,7 +64,7 @@ impl Args {
             let Some(name) = a.strip_prefix("--") else {
                 return Err(format!("unexpected argument {a:?}\n{}", usage()));
             };
-            if matches!(name, "fenced" | "force" | "accept-any") {
+            if matches!(name, "fenced" | "force" | "accept-any" | "apply") {
                 switches.push(name.to_string());
             } else {
                 let v = it.next().ok_or_else(|| format!("--{name} needs a value"))?;
@@ -77,7 +88,7 @@ impl Args {
 }
 
 fn usage() -> String {
-    "usage: rdb-shard init|show|move-tenant|rollback|retire --map MAP … (see the source header)".to_string()
+    "usage: rdb-shard init|show|move-tenant|rollback|retire|rebalance --map MAP … (see the source header)".to_string()
 }
 
 fn main() -> ExitCode {
@@ -112,6 +123,7 @@ async fn run(args: &Args) -> std::result::Result<(), String> {
         "move-tenant" => move_tenant(args, &options).await,
         "rollback" => rollback(args, &options).await,
         "retire" => retire(args, &options).await,
+        "rebalance" => rebalance(args, &options).await,
         other => Err(format!("unknown command {other:?}\n{}", usage())),
     }
 }
@@ -203,6 +215,35 @@ async fn show(map: &ShardMap, options: &Options) -> std::result::Result<(), Stri
     Ok(())
 }
 
+/// The rows a move carries: one tenant's, or every row whose key falls in a
+/// range of level-0 blocks.
+enum Selection {
+    Tenant(Tenant),
+    /// Blocks `[lo, hi)`; each table names its key column's type.
+    Blocks { lo: u64, hi: u64 },
+}
+
+impl Selection {
+    /// The `WHERE` naming the moved rows of a table keyed by `column` (of
+    /// `key_type`, for a block range).
+    fn filter(&self, column: &str, key_type: &str) -> std::result::Result<String, String> {
+        let col = rasterizeddb_client::quote_ident(column).map_err(|e| e.to_string())?;
+        match self {
+            Selection::Tenant(t) => {
+                let head = format!("{col} = $1");
+                t.with_param(|p| rasterizeddb_client::render_dyn(&head, &[p]))?
+                    .map_err(|e| e.to_string())
+            }
+            Selection::Blocks { lo, hi } => {
+                family_of(key_type)?;
+                Ok(format!(
+                    "rdb_route_block('{key_type}', {col}) >= {lo} AND rdb_route_block('{key_type}', {col}) < {hi}"
+                ))
+            }
+        }
+    }
+}
+
 /// The tenant a move names.
 struct Tenant {
     family: ShardFamily,
@@ -283,6 +324,23 @@ impl MoveState {
         self.fields.get(k).map(String::as_str).ok_or_else(|| format!("the move state has no {k}"))
     }
 
+    /// What the move carried, and the blocks it handed off.
+    fn selection(&self) -> std::result::Result<(Selection, u64, u64), String> {
+        if self.fields.get("kind").map(String::as_str) == Some("range") {
+            let lo = parse_block(self.get("lo")?)?;
+            let hi = parse_block(self.get("hi")?)?;
+            return Ok((Selection::Blocks { lo, hi }, lo, hi));
+        }
+        let t = self.tenant()?;
+        let block = t.block()?;
+        Ok((Selection::Tenant(t), block, block + 1))
+    }
+
+    /// A table's key type, for a range move (`table T:C:TYPE`).
+    fn split_column(column: &str) -> (&str, &str) {
+        column.split_once(':').unwrap_or((column, ""))
+    }
+
     fn tenant(&self) -> std::result::Result<Tenant, String> {
         Ok(Tenant {
             family: family_of(self.get("key_type")?)?,
@@ -325,33 +383,91 @@ async fn columns(c: &Client, table: &str) -> Result<Vec<String>> {
     Ok(names.into_iter().map(|(n,)| n).collect())
 }
 
-/// `SELECT cols FROM table WHERE column = key`.
-fn select_sql(table: &str, cols: &[String], column: &str, tenant: &Tenant) -> std::result::Result<String, String> {
+/// `SELECT cols FROM table WHERE <the selection>`.
+fn select_sql(table: &str, cols: &[String], filter: &str) -> std::result::Result<String, String> {
     let list = cols
         .iter()
         .map(|c| rasterizeddb_client::quote_ident(c))
         .collect::<Result<Vec<_>>>()
         .map_err(|e| e.to_string())?
         .join(", ");
-    let head = format!(
-        "SELECT {list} FROM {} WHERE {} = $1",
-        rasterizeddb_client::quote_ident(table).map_err(|e| e.to_string())?,
-        rasterizeddb_client::quote_ident(column).map_err(|e| e.to_string())?
-    );
-    tenant
-        .with_param(|p| rasterizeddb_client::render_dyn(&head, &[p]))?
-        .map_err(|e| e.to_string())
+    Ok(format!(
+        "SELECT {list} FROM {} WHERE {filter}",
+        rasterizeddb_client::quote_ident(table).map_err(|e| e.to_string())?
+    ))
 }
 
-fn delete_sql(table: &str, column: &str, tenant: &Tenant) -> std::result::Result<String, String> {
+fn delete_sql(table: &str, filter: &str) -> std::result::Result<String, String> {
+    Ok(format!(
+        "DELETE FROM {} WHERE {filter}",
+        rasterizeddb_client::quote_ident(table).map_err(|e| e.to_string())?
+    ))
+}
+
+/// Copies one table's selected rows from `snapshot` (on shard `from`) into
+/// `dst` (shard `to`) and verifies them; the row count copied.
+async fn copy_table(
+    snapshot: &rasterizeddb_client::Transaction,
+    src: &Client,
+    dst: &Client,
+    (from, to): (ShardId, ShardId),
+    table: &str,
+    filter: &str,
+) -> std::result::Result<u64, String> {
+    let cols = columns(src, table).await.map_err(|e| format!("{table}: {e}"))?;
+    let sql = select_sql(table, &cols, filter)?;
+    let existing = dst.run(&sql).await.map_err(|e| format!("{table} on shard {to}: {e}"))?;
+    if !existing.is_empty() {
+        return Err(format!(
+            "shard {to} already holds {} {table} rows of what is being moved: clean it first",
+            existing.len()
+        ));
+    }
+    let rows = snapshot.run(&sql).await.map_err(|e| format!("{table} on shard {from}: {e}"))?;
+    let want = digest(&rows, cols.len()).map_err(|e| e.to_string())?;
     let head = format!(
-        "DELETE FROM {} WHERE {} = $1",
+        "INSERT INTO {} ({}) VALUES ",
         rasterizeddb_client::quote_ident(table).map_err(|e| e.to_string())?,
-        rasterizeddb_client::quote_ident(column).map_err(|e| e.to_string())?
+        cols.iter()
+            .map(|c| rasterizeddb_client::quote_ident(c))
+            .collect::<Result<Vec<_>>>()
+            .map_err(|e| e.to_string())?
+            .join(", ")
     );
-    tenant
-        .with_param(|p| rasterizeddb_client::render_dyn(&head, &[p]))?
-        .map_err(|e| e.to_string())
+    let all: Vec<Vec<Value>> = rows
+        .iter()
+        .map(|r| (0..cols.len()).map(|i| r.get::<Value>(i)).collect::<Result<Vec<_>>>())
+        .collect::<Result<_>>()
+        .map_err(|e| e.to_string())?;
+    for tx_rows in all.chunks(COPY_TX_ROWS) {
+        let tx = dst.begin().await.map_err(|e| e.to_string())?;
+        for stmt_rows in tx_rows.chunks(COPY_STATEMENT_ROWS) {
+            let mut sql = head.clone();
+            for (n, row) in stmt_rows.iter().enumerate() {
+                if n > 0 {
+                    sql.push_str(", ");
+                }
+                let placeholders: Vec<String> = (1..=row.len()).map(|i| format!("${i}")).collect();
+                let params: Vec<&dyn ToSql> = row.iter().map(|v| v as &dyn ToSql).collect();
+                let tuple = rasterizeddb_client::render_dyn(&format!("({})", placeholders.join(", ")), &params)
+                    .map_err(|e| e.to_string())?;
+                sql.push_str(&tuple);
+            }
+            tx.run(&sql).await.map_err(|e| format!("{table} into shard {to}: {e}"))?;
+        }
+        tx.commit().await.map_err(|e| e.to_string())?;
+    }
+    // Verify: the destination's rows, read back, against the snapshot's.
+    let back = dst.run(&sql).await.map_err(|e| e.to_string())?;
+    let got = digest(&back, cols.len()).map_err(|e| e.to_string())?;
+    if got != want {
+        return Err(format!(
+            "{table}: the copy does not verify (source {} rows, digest {:016x}; destination {} rows, \
+             digest {:016x}). Nothing was handed off; delete the destination's copied rows and retry",
+            want.0, want.1, got.0, got.1
+        ));
+    }
+    Ok(want.0)
 }
 
 /// `(rows, Σ xxh64(row) mod 2⁶⁴)` over rows decoded as values.
@@ -412,64 +528,15 @@ async fn move_tenant(args: &Args, options: &Options) -> std::result::Result<(), 
         })
         .await
         .map_err(|e| e.to_string())?;
+    let selection = Selection::Tenant(tenant);
     let mut copied = Vec::new();
     for (table, column) in &tables {
-        let cols = columns(&src, table).await.map_err(|e| format!("{table}: {e}"))?;
-        let sql = select_sql(table, &cols, column, &tenant)?;
-        let existing = dst.run(&sql).await.map_err(|e| format!("{table} on shard {to}: {e}"))?;
-        if !existing.is_empty() {
-            return Err(format!(
-                "shard {to} already holds {} {table} rows of this tenant: clean it first",
-                existing.len()
-            ));
-        }
-        let rows = snapshot.run(&sql).await.map_err(|e| format!("{table} on shard {from}: {e}"))?;
-        let want = digest(&rows, cols.len()).map_err(|e| e.to_string())?;
-        let head = format!(
-            "INSERT INTO {} ({}) VALUES ",
-            rasterizeddb_client::quote_ident(table).map_err(|e| e.to_string())?,
-            cols.iter()
-                .map(|c| rasterizeddb_client::quote_ident(c))
-                .collect::<Result<Vec<_>>>()
-                .map_err(|e| e.to_string())?
-                .join(", ")
-        );
-        let all: Vec<Vec<Value>> = rows
-            .iter()
-            .map(|r| (0..cols.len()).map(|i| r.get::<Value>(i)).collect::<Result<Vec<_>>>())
-            .collect::<Result<_>>()
-            .map_err(|e| e.to_string())?;
-        for tx_rows in all.chunks(COPY_TX_ROWS) {
-            let tx = dst.begin().await.map_err(|e| e.to_string())?;
-            for stmt_rows in tx_rows.chunks(COPY_STATEMENT_ROWS) {
-                let mut sql = head.clone();
-                for (n, row) in stmt_rows.iter().enumerate() {
-                    if n > 0 {
-                        sql.push_str(", ");
-                    }
-                    let placeholders: Vec<String> = (1..=row.len()).map(|i| format!("${i}")).collect();
-                    let params: Vec<&dyn ToSql> = row.iter().map(|v| v as &dyn ToSql).collect();
-                    let tuple = rasterizeddb_client::render_dyn(&format!("({})", placeholders.join(", ")), &params)
-                        .map_err(|e| e.to_string())?;
-                    sql.push_str(&tuple);
-                }
-                tx.run(&sql).await.map_err(|e| format!("{table} into shard {to}: {e}"))?;
-            }
-            tx.commit().await.map_err(|e| e.to_string())?;
-        }
-        // Verify: the destination's rows, read back, against the snapshot's.
-        let back = dst.run(&sql).await.map_err(|e| e.to_string())?;
-        let got = digest(&back, cols.len()).map_err(|e| e.to_string())?;
-        if got != want {
-            return Err(format!(
-                "{table}: the copy does not verify (source {} rows, digest {:016x}; destination {} rows, \
-                 digest {:016x}). Nothing was handed off; delete the destination's rows of this tenant and retry",
-                want.0, want.1, got.0, got.1
-            ));
-        }
-        println!("{table}: {} rows copied and verified", want.0);
+        let filter = selection.filter(column, "")?;
+        let n = copy_table(&snapshot, &src, &dst, (from, to), table, &filter).await?;
+        println!("{table}: {n} rows copied and verified");
         copied.push((table.clone(), column.clone()));
     }
+    let Selection::Tenant(tenant) = selection else { unreachable!() };
     snapshot.rollback().await.map_err(|e| e.to_string())?;
     // Hand off: the tenant's block on the destination, one epoch up.
     let next = map.reassign(block, block + 1, to)?;
@@ -507,13 +574,12 @@ async fn rollback(args: &Args, options: &Options) -> std::result::Result<(), Str
     if state.get("status")? != "moved" {
         return Err(format!("the move is {}: only a moved, unretired tenant rolls back", state.get("status")?));
     }
-    let tenant = state.tenant()?;
+    let (selection, lo, hi) = state.selection()?;
     let (from, to) = (state.shard("from")?, state.shard("to")?);
-    let block = tenant.block()?;
-    if map.shard_of_block(block) != to {
-        return Err(format!("the map does not have the tenant on shard {to}: roll back from the map the move wrote"));
+    if map.shard_of_block(lo) != to || map.shard_of_block(hi - 1) != to {
+        return Err(format!("the map does not have the moved rows on shard {to}: roll back from the map the move wrote"));
     }
-    let back = map.reassign(block, block + 1, from)?;
+    let back = map.reassign(lo, hi, from)?;
     let src = connect(&map, from, options).await?;
     let dst = connect(&map, to, options).await?;
     for (id, c) in [(from, &src), (to, &dst)] {
@@ -521,8 +587,9 @@ async fn rollback(args: &Args, options: &Options) -> std::result::Result<(), Str
     }
     write_map(out, &back)?;
     for (table, column) in &state.tables {
+        let (column, key_type) = MoveState::split_column(column);
         let n = dst
-            .run(&delete_sql(table, column, &tenant)?)
+            .run(&delete_sql(table, &selection.filter(column, key_type)?)?)
             .await
             .map_err(|e| format!("{table} on shard {to}: {e}"))?
             .rows_affected()
@@ -531,7 +598,7 @@ async fn rollback(args: &Args, options: &Options) -> std::result::Result<(), Str
     }
     state.fields.insert("status".to_string(), "rolled_back".to_string());
     state.write(state_path)?;
-    println!("the tenant is back on shard {from}; map epoch {} written to {out}. Reload every router.", back.epoch());
+    println!("the moved rows are back on shard {from}; map epoch {} written to {out}. Reload every router.", back.epoch());
     Ok(())
 }
 
@@ -551,15 +618,16 @@ async fn retire(args: &Args, options: &Options) -> std::result::Result<(), Strin
             age / 3600
         ));
     }
-    let tenant = state.tenant()?;
+    let (selection, lo, hi) = state.selection()?;
     let (from, to) = (state.shard("from")?, state.shard("to")?);
-    if map.shard_of_block(tenant.block()?) != to {
-        return Err(format!("the map does not have the tenant on shard {to}: refusing to delete its source rows"));
+    if map.shard_of_block(lo) != to || map.shard_of_block(hi - 1) != to {
+        return Err(format!("the map does not have the moved rows on shard {to}: refusing to delete their source"));
     }
     let src = connect(&map, from, options).await?;
     for (table, column) in &state.tables {
+        let (column, key_type) = MoveState::split_column(column);
         let n = src
-            .run(&delete_sql(table, column, &tenant)?)
+            .run(&delete_sql(table, &selection.filter(column, key_type)?)?)
             .await
             .map_err(|e| format!("{table} on shard {from}: {e}"))?
             .rows_affected()
@@ -568,5 +636,142 @@ async fn retire(args: &Args, options: &Options) -> std::result::Result<(), Strin
     }
     state.fields.insert("status".to_string(), "retired".to_string());
     state.write(state_path)?;
+    Ok(())
+}
+
+fn parse_block(s: &str) -> std::result::Result<u64, String> {
+    match s.strip_prefix("0x") {
+        Some(h) => u64::from_str_radix(h, 16),
+        None => s.parse(),
+    }
+    .map_err(|_| format!("{s:?} is not a block number"))
+}
+
+/// `rebalance` (module docs).
+async fn rebalance(args: &Args, options: &Options) -> std::result::Result<(), String> {
+    use rasterizeddb_router::balance::{self, BalanceConfig, PartitionReport};
+    let map = read_map(args.one("map")?)?;
+    let mut cfg = BalanceConfig::default();
+    if let Some(t) = args.opt("tolerance") {
+        cfg.tolerance = t.parse().map_err(|_| "--tolerance takes a fraction, such as 0.10")?;
+    }
+    if let Some(m) = args.opt("max-moves") {
+        cfg.max_moves = m.parse().map_err(|_| "--max-moves takes a number")?;
+    }
+    if let Some(b) = args.opt("max-bytes") {
+        cfg.max_bytes = b.parse().map_err(|_| "--max-bytes takes a byte count")?;
+    }
+    for p in args.flags.get("pin").into_iter().flatten() {
+        let (lo, hi) = p.split_once(':').ok_or_else(|| format!("--pin {p:?}: write LO:HI blocks"))?;
+        cfg.pinned.push((parse_block(lo)?, parse_block(hi)?));
+    }
+    for x in args.flags.get("exclude").into_iter().flatten() {
+        cfg.not_accepting.push(x.parse().map_err(|_| format!("--exclude {x:?}: a shard id"))?);
+    }
+    // Every shard's load.
+    let mut reports = Vec::new();
+    for info in map.shards() {
+        let c = connect(&map, info.id, options).await?;
+        let rows: Vec<(String, i64, String, String, i64, i64, i64)> =
+            c.fetch_all("SHOW SHARD LOAD", &[]).await.map_err(|e| format!("shard {}: {e}", info.id))?;
+        for (_, _, lo, hi, _, bytes, ops) in rows {
+            reports.push(PartitionReport {
+                shard: info.id,
+                lo: parse_block(&lo)?,
+                hi: parse_block(&hi)?,
+                bytes: bytes.max(0) as u64,
+                ops: ops.max(0) as u64,
+            });
+        }
+    }
+    let segments = balance::segments(&map, &reports);
+    let plan = balance::plan(&map, &segments, &cfg)?;
+    for ((id, before), (_, after)) in plan.before.iter().zip(&plan.after) {
+        println!("shard {id:>5}: load {:>6.2}% -> {:>6.2}%", before * 100.0, after * 100.0);
+    }
+    if plan.balanced {
+        println!("balanced: every shard is within {:.0}% of the mean", cfg.tolerance * 100.0);
+        return Ok(());
+    }
+    for mv in &plan.moves {
+        println!("move blocks [{:#x}, {:#x}) from shard {} to shard {} ({} bytes)", mv.lo, mv.hi, mv.from, mv.to, mv.bytes);
+    }
+    for (lo, hi, at) in &plan.splits {
+        println!("split [{lo:#x}, {hi:#x}) at {at:#x} before a later round can move part of it");
+    }
+    if !args.has("apply") {
+        println!("(plan only; --apply --fenced runs it)");
+        return Ok(());
+    }
+    if !args.has("fenced") {
+        return Err("--apply moves rows offline: fence writes to the moved ranges first, then say --fenced".to_string());
+    }
+    let out = args.one("out")?;
+    let dir = args.one("state-dir")?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{dir}: {e}"))?;
+    let tables: Vec<(String, String, String)> = args
+        .flags
+        .get("table")
+        .ok_or("--table TABLE:COLUMN:TYPE is required (once per sharded table)")?
+        .iter()
+        .map(|t| {
+            let mut it = t.splitn(3, ':');
+            match (it.next(), it.next(), it.next()) {
+                (Some(a), Some(b), Some(c)) => {
+                    family_of(c)?;
+                    Ok((a.to_string(), b.to_string(), c.to_string()))
+                }
+                _ => Err(format!("--table {t:?}: write TABLE:COLUMN:TYPE")),
+            }
+        })
+        .collect::<std::result::Result<_, String>>()?;
+    let mut current = map.clone();
+    for (n, mv) in plan.moves.iter().enumerate() {
+        let src = connect(&current, mv.from, options).await?;
+        let dst = connect(&current, mv.to, options).await?;
+        let snapshot = src
+            .begin_with(TransactionOptions {
+                isolation: Some(Isolation::RepeatableRead),
+                read_only: true,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        let selection = Selection::Blocks { lo: mv.lo, hi: mv.hi };
+        let mut copied = Vec::new();
+        for (table, column, key_type) in &tables {
+            let filter = selection.filter(column, key_type)?;
+            let rows = copy_table(&snapshot, &src, &dst, (mv.from, mv.to), table, &filter).await?;
+            println!("move {n}: {table}: {rows} rows copied and verified");
+            copied.push((table.clone(), format!("{column}:{key_type}")));
+        }
+        snapshot.rollback().await.map_err(|e| e.to_string())?;
+        let next = current.reassign(mv.lo, mv.hi, mv.to)?;
+        let state = MoveState {
+            fields: BTreeMap::from([
+                ("kind".to_string(), "range".to_string()),
+                ("lo".to_string(), format!("{:#x}", mv.lo)),
+                ("hi".to_string(), format!("{:#x}", mv.hi)),
+                ("from".to_string(), mv.from.to_string()),
+                ("to".to_string(), mv.to.to_string()),
+                ("epoch".to_string(), next.epoch().to_string()),
+                ("moved_at".to_string(), now_secs().to_string()),
+                ("status".to_string(), "moved".to_string()),
+            ]),
+            tables: copied,
+        };
+        state.write(&format!("{dir}/move-{}-{n}.state", next.epoch()))?;
+        for (id, c) in [(mv.from, &src), (mv.to, &dst)] {
+            Identity::of(&next, id).write(c).await.map_err(|e| format!("shard {id}: {e}"))?;
+        }
+        write_map(out, &next)?;
+        current = next;
+    }
+    println!(
+        "{} moves applied; map epoch {} written to {out}. Reload every router, then lift the fence. \
+         The source rows stay until `rdb-shard retire` of each state file in {dir}.",
+        plan.moves.len(),
+        current.epoch()
+    );
     Ok(())
 }
