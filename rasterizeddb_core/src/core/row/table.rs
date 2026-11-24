@@ -5047,6 +5047,10 @@ impl<S: StorageIO> Table<S> {
         if let Some(guard) = d.guard.as_ref() {
             guard.check_insert(&row_write)?;
         }
+        crate::core::shard_hooks::check_stamp(
+            d.guard.as_ref().map(|g| g.range()),
+            crate::core::shard_hooks::StampOp::Insert,
+        )?;
 
         self.note_write(written_by);
 
@@ -5148,6 +5152,10 @@ impl<S: StorageIO> Table<S> {
     /// insert.
     pub(crate) async fn insert_version(&self, mut row_write: RowWrite, xmin: TxId, xmax: TxId) -> Result<()> {
         let d = self.data()?;
+        crate::core::shard_hooks::check_stamp(
+            d.guard.as_ref().map(|g| g.range()),
+            crate::core::shard_hooks::StampOp::InsertVersion,
+        )?;
         // A rewrite's added column (its DEFAULT) is held to its declared
         // text length as any insert is; the copied columns already hold.
         self.hold_text_lengths(&mut row_write, |_| true, false)
@@ -5847,6 +5855,10 @@ impl<S: StorageIO> Table<S> {
     ) -> Result<u64> {
         let d = self.data()?;
         info!("Deleting rows");
+        crate::core::shard_hooks::check_stamp(
+            d.guard.as_ref().map(|g| g.range()),
+            crate::core::shard_hooks::StampOp::Delete,
+        )?;
 
         self.note_write(deleted_by);
 
@@ -6221,6 +6233,10 @@ impl<S: StorageIO> Table<S> {
         mut moves: Option<&mut Vec<RowWrite>>,
     ) -> Result<u64> {
         info!("Updating rows");
+        crate::core::shard_hooks::check_stamp(
+            self.data()?.guard.as_ref().map(|g| g.range()),
+            crate::core::shard_hooks::StampOp::Update,
+        )?;
 
         // A statement naming its row by a unique key tries the point path
         // first, which lets updates of different keys run side by side. It

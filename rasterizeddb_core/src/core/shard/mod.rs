@@ -1,0 +1,8 @@
+//! A shard's side of sharding (sharding-plan.md §4): its ownership of
+//! level-0 block ranges, and (from B1a) admission, classification and the
+//! virtual-session endpoint the gateway talks to.
+//!
+//! Built with the `sharding` feature, dormant until the server starts with
+//! `--role shard`.
+
+pub mod ownership;
