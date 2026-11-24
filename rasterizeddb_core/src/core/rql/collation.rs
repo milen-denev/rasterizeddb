@@ -1115,6 +1115,120 @@ pub fn constraint_on_keys(
     Ok(None)
 }
 
+/// Each output column's nondeterministic collation in a set operation
+/// (`UNION`, `INTERSECT`, `EXCEPT`), read from its branches: a column a
+/// branch selects (`t.c`, `c`, through the branch's relations and their
+/// aliases) with one. Rows are then told apart by its key, as SQL Server's
+/// `EXCEPT` compares under the column's collation. A `*` over such a column
+/// is refused (its positions are not read here); two collations at one
+/// position are 42P22's conflict.
+pub fn set_op_collations(
+    branches: &[String],
+    table_fields: &dyn Fn(&str) -> Option<Vec<SchemaField>>,
+) -> Result<Vec<Option<Strength>>, String> {
+    use crate::core::rql::join::find_keyword;
+    let mut out: Vec<Option<Strength>> = Vec::new();
+    for branch in branches {
+        let branch = crate::core::sql_scan::without_outer_parentheses(branch.trim());
+        let upper = branch.to_ascii_uppercase();
+        let Some(select) = find_keyword(&upper, "SELECT", 0) else { continue };
+        let Some(from) = find_keyword(&upper, "FROM", select) else { continue };
+        let end = ["WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "WINDOW"]
+            .iter()
+            .filter_map(|k| find_keyword(&upper, k, from))
+            .min()
+            .unwrap_or(branch.len());
+        // The relations: `table [AS] alias`, between commas and JOINs.
+        let mut relations: Vec<(String, String, Vec<SchemaField>)> = Vec::new();
+        let from_text = &branch[from + 4..end];
+        let from_upper = from_text.to_ascii_uppercase();
+        let mut cuts = vec![0usize];
+        let mut at = 0;
+        while let Some(j) = find_keyword(&from_upper, "JOIN", at) {
+            cuts.push(j + 4);
+            at = j + 4;
+        }
+        cuts.push(from_text.len());
+        for w in cuts.windows(2) {
+            let piece = &from_text[w[0]..w[1]];
+            let pu = piece.to_ascii_uppercase();
+            let piece_end = ["ON", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "USING"]
+                .iter()
+                .filter_map(|k| find_keyword(&pu, k, 0))
+                .min()
+                .unwrap_or(piece.len());
+            for rel in crate::core::sql_scan::split_top_level(&piece[..piece_end], b',') {
+                let words: Vec<&str> = rel.split_whitespace().filter(|w| !w.eq_ignore_ascii_case("AS")).collect();
+                let Some(first) = words.first() else { continue };
+                if first.starts_with('(') {
+                    continue;
+                }
+                let table = crate::core::sql_scan::bare_name(first);
+                let alias = words.get(1).map(|a| crate::core::sql_scan::bare_name(a)).unwrap_or_else(|| table.clone());
+                if let Some(fields) = table_fields(&table) {
+                    relations.push((table, alias, fields));
+                }
+            }
+        }
+        let mut list = branch[select + 6..from].trim();
+        for kw in ["DISTINCT", "ALL"] {
+            if let Some(rest) = crate::core::rql::lexer_query::leading_word(list, kw) {
+                list = rest;
+            }
+        }
+        for (position, item) in crate::core::sql_scan::split_top_level(list, b',').iter().enumerate() {
+            let item = item.trim();
+            let expr = match crate::core::rql::join::find_keyword(&item.to_ascii_uppercase(), "AS", 0) {
+                Some(a) => item[..a].trim(),
+                None => item,
+            };
+            let expr = expr.split_whitespace().next().unwrap_or(expr);
+            let strength = if expr == "*" || expr.ends_with(".*") {
+                let ci = relations.iter().any(|(_, alias, fields)| {
+                    (expr == "*" || crate::core::sql_scan::bare_name(&expr[..expr.len() - 2]).eq_ignore_ascii_case(alias))
+                        && fields.iter().any(|f| !f.is_deleted && !is_companion(&f.name) && !of(&f.name, fields).is_binary())
+                });
+                if ci {
+                    return Err(
+                        "UNION, INTERSECT or EXCEPT of * over a column with a case-insensitive collation is not supported yet; name the columns".to_string()
+                    );
+                }
+                None
+            } else {
+                let (qualifier, column) = match crate::core::sql_scan::last_name_segment(expr).len() < expr.len() {
+                    true => {
+                        let col = crate::core::sql_scan::bare_name(expr);
+                        let q = &expr[..expr.len() - crate::core::sql_scan::last_name_segment(expr).len() - 1];
+                        (Some(crate::core::sql_scan::bare_name(q)), col)
+                    }
+                    false => (None, crate::core::sql_scan::bare_name(expr)),
+                };
+                relations
+                    .iter()
+                    .filter(|(_, alias, _)| qualifier.as_deref().is_none_or(|q| q.eq_ignore_ascii_case(alias)))
+                    .find_map(|(_, _, fields)| {
+                        fields
+                            .iter()
+                            .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&column))
+                            .map(|f| of(&f.name, fields))
+                    })
+                    .filter(|s| !s.is_binary())
+            };
+            if out.len() <= position {
+                out.resize(position + 1, None);
+            }
+            match (out[position], strength) {
+                (Some(a), Some(b)) if a != b => {
+                    return Err("could not determine which collation to use for string comparison".to_string());
+                }
+                (None, Some(b)) => out[position] = Some(b),
+                _ => {}
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Whether `sql` declares a nondeterministic collation anywhere: a
 /// `COLLATE` naming one, or the type `citext`. `ALTER TABLE` cannot give a
 /// column one yet and refuses such a statement rather than add or retype a

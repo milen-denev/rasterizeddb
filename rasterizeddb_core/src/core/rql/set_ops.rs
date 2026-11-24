@@ -721,6 +721,9 @@ pub struct Combined {
     state: ahash::RandomState,
     /// Which output columns hold documents, compared by value.
     documents: Vec<bool>,
+    /// Each output column's nondeterministic collation: its rows are told
+    /// apart by the key (`collation::set_op_collations`).
+    collations: Vec<Option<crate::core::rql::collation::Strength>>,
     /// The integer type each output column is widened to, if any.
     widen: Vec<Option<DbType>>,
     /// Per branch, the scale each rescaled column's cells are at
@@ -743,6 +746,12 @@ impl Combined {
     /// and `names` are the first branch's output names, which a trailing
     /// `ORDER BY` may sort by. `widen` is [`widened_integers`]. `out` is what
     /// the result starts with.
+    /// Each output column's nondeterministic collation, which tells its
+    /// rows apart by key (`collation::set_op_collations`).
+    pub fn set_collations(&mut self, collations: Vec<Option<crate::core::rql::collation::Strength>>) {
+        self.collations = collations;
+    }
+
     pub fn new(
         parts: &UnionParts,
         documents: Vec<bool>,
@@ -762,6 +771,7 @@ impl Combined {
             seen: hashbrown::HashTable::new(),
             state: ahash::RandomState::new(),
             documents,
+            collations: Vec::new(),
             widen,
             rescale: None,
             sort,
@@ -872,7 +882,7 @@ impl Combined {
             let row = row.map_err(|e| format!("a UNION branch's rows could not be read: {}", e))?;
             if distinct {
                 key.clear();
-                duplicate_key(row, &self.documents, rescale, &self.widen, &mut key)
+                duplicate_key(row, &self.documents, rescale, &self.widen, &self.collations, &mut key)
                     .map_err(|e| format!("a UNION branch's rows could not be read: {}", e))?;
                 let hash = self.state.hash_one(&key[..]);
                 let (keys, key_starts) = (&self.keys, &self.key_starts);
@@ -923,7 +933,7 @@ impl Combined {
             for row in serialized_rows(bytes) {
                 let row = row.map_err(read)?;
                 let mut key = Vec::new();
-                duplicate_key(row, &self.documents, rescale, &self.widen, &mut key).map_err(read)?;
+                duplicate_key(row, &self.documents, rescale, &self.widen, &self.collations, &mut key).map_err(read)?;
                 rows.push(SetRow { branch, row, key });
             }
             sets.push(rows);
@@ -1002,6 +1012,7 @@ impl Combined {
                 cells.push(row);
             }
             let documents = &self.documents;
+            let collations = &self.collations;
             // A stable sort, so rows the keys call equal keep the order the
             // branches produced them in.
             order.sort_by(|&a, &b| {
@@ -1011,6 +1022,7 @@ impl Combined {
                         cells[a][key.position].as_ref(),
                         cells[b][key.position].as_ref(),
                         document,
+                        collations.get(key.position).copied().flatten(),
                         key,
                     );
                     if ord != Ordering::Equal {
@@ -1186,6 +1198,7 @@ fn compare_cells(
     a: Option<&(DbType, &[u8])>,
     b: Option<&(DbType, &[u8])>,
     document: bool,
+    collation: Option<crate::core::rql::collation::Strength>,
     key: &SortKey,
 ) -> Ordering {
     let null = |c: Option<&(DbType, &[u8])>| c.is_none_or(|(t, _)| *t == DbType::NULL);
@@ -1196,7 +1209,14 @@ fn compare_cells(
         (false, true) => return null_side.reverse(),
         (false, false) => {
             let (a, b) = (a.unwrap(), b.unwrap());
-            compare_values(a, b, document)
+            match collation {
+                // By the collation, then the value, as ORDER BY sorts such
+                // a column.
+                Some(strength) if text_like(&a.0) && text_like(&b.0) => {
+                    crate::core::rql::collation::compare(a.1, b.1, strength)
+                }
+                _ => compare_values(a, b, document),
+            }
         }
     };
     if key.descending { ord.reverse() } else { ord }
@@ -1309,6 +1329,7 @@ fn duplicate_key(
     documents: &[bool],
     rescale: Option<&[Option<u32>]>,
     widen: &[Option<DbType>],
+    collations: &[Option<crate::core::rql::collation::Strength>],
     out: &mut Vec<u8>,
 ) -> std::io::Result<()> {
     for (position, cell) in serialized_cells(row)?.enumerate() {
@@ -1316,6 +1337,18 @@ fn duplicate_key(
         let (ty, data) = (&cell.column_type, cell.data);
         if *ty == DbType::NULL {
             out.push(0);
+            continue;
+        }
+        // Text under a nondeterministic collation: by its key, so 'Abc'
+        // and 'abc' are one row. Length-prefixed, as text cannot end a key
+        // part by itself.
+        if let Some(strength) = collations.get(position).copied().flatten()
+            && text_like(ty)
+        {
+            let key = crate::core::rql::collation::key_bytes(data, strength);
+            out.push(8);
+            out.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            out.extend_from_slice(&key);
             continue;
         }
         // A rescaled NUMERIC column (`union_decimal_scales`): by value, its
@@ -1451,7 +1484,7 @@ mod tests {
 
     fn key(columns: Vec<Column>, documents: &[bool]) -> Vec<u8> {
         let mut out = Vec::new();
-        duplicate_key(&serialized(columns), documents, None, &[], &mut out).unwrap();
+        duplicate_key(&serialized(columns), documents, None, &[], &[], &mut out).unwrap();
         out
     }
 

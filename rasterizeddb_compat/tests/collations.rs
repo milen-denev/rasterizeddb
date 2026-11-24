@@ -209,7 +209,6 @@ async fn sorting_grouping_and_joins_follow_the_collation() {
         sqlx::query_scalar("SELECT place FROM people GROUP BY place HAVING place = 'CAFE'").fetch_all(&pool).await.unwrap();
     assert_eq!(having, ["Café"]);
     for sql in [
-        "SELECT name FROM people UNION SELECT note FROM people",
         "SELECT DISTINCT place, upper(note) FROM people",
         "SELECT id, min(name) OVER () FROM people",
         "SELECT place FROM people GROUP BY place HAVING max(name) = 'BOB'",
@@ -292,4 +291,33 @@ async fn a_restart_keeps_the_collation() {
     assert_eq!(code(&pool, "INSERT INTO r VALUES (3, 'LOWER')").await, "23505");
     exec(&pool, "INSERT INTO r VALUES (3, 'Third')").await;
     assert_eq!(ids(&pool, "SELECT id FROM r WHERE name = 'third'").await, vec![3]);
+}
+
+/// UNION, INTERSECT and EXCEPT tell rows apart under each column's
+/// collation, as SQL Server's EXCEPT does: EF Core's `Except` over two
+/// queries of one entity, one of them a join.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_operations_follow_the_collation() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    exec(&pool, "CREATE TABLE f (id int PRIMARY KEY, name text COLLATE rdb_ci)").await;
+    exec(&pool, "CREATE TABLE fv (id int PRIMARY KEY, fid int, name text COLLATE rdb_ci)").await;
+    exec(&pool, "INSERT INTO f VALUES (1, 'Abc'), (2, 'xyz'), (3, 'Q')").await;
+    exec(&pool, "INSERT INTO fv VALUES (1, 1, 'aBC'), (2, 3, 'q')").await;
+    assert_eq!(
+        ids(&pool, "SELECT f.id FROM f EXCEPT SELECT g.id FROM fv JOIN f AS g ON g.id = fv.fid ORDER BY 1").await,
+        vec![2]
+    );
+    let names = |sql: &'static str| {
+        let pool = pool.clone();
+        async move { sqlx::query_scalar::<_, String>(sql).fetch_all(&pool).await.unwrap() }
+    };
+    assert_eq!(names("SELECT name FROM f EXCEPT SELECT name FROM fv ORDER BY 1").await, ["xyz"]);
+    assert_eq!(names("SELECT name FROM f INTERSECT SELECT name FROM fv ORDER BY 1").await.len(), 2);
+    // Deduplicated without case, and sorted by the collation ('Q' after
+    // 'Abc' and before 'xyz'; by the bytes 'Q' sorts first).
+    let union = names("SELECT name FROM f UNION SELECT name FROM fv ORDER BY 1").await;
+    assert_eq!(union.len(), 3);
+    assert_eq!(union[1].to_lowercase(), "q");
+    assert_eq!(code(&pool, "SELECT * FROM f UNION SELECT * FROM f").await, "0A000");
 }

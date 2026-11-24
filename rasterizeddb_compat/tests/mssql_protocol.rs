@@ -35,6 +35,12 @@ impl Drop for Servers {
 }
 
 fn start() -> Servers {
+    start_with(false)
+}
+
+/// A server whose text columns are case-insensitive by default
+/// (`MsConfig::case_insensitive`, `--mssql-collation ci`).
+fn start_with(case_insensitive: bool) -> Servers {
     let _ = env_logger::builder().is_test(true).try_init();
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     // A socket path must fit sun_path: kept short, under /tmp.
@@ -69,9 +75,10 @@ fn start() -> Servers {
                     bootstrap_user: "rasterized".into(),
                     bootstrap_password: Some(PASSWORD.into()),
                     limits: ConnectionLimits::default(),
-                    // These tests pin the byte-compared answers they were
-                    // written against.
-                    case_insensitive: false,
+                    // Most tests pin the byte-compared answers they were
+                    // written against; `start_with(true)` is SQL Server's
+                    // case-insensitive default.
+                    case_insensitive,
                 };
                 let listener = rasterizeddb_core::mssql::bind(config).await.unwrap();
                 let port = listener.local_addr().unwrap().port();
@@ -116,7 +123,12 @@ fn config(s: &Servers, password: &str, encryption: EncryptionLevel) -> Config {
 }
 
 async fn connect(s: &Servers) -> Client<Compat<tokio::net::TcpStream>> {
-    let c = config(s, PASSWORD, EncryptionLevel::Required);
+    connect_to(s, "postgres").await
+}
+
+async fn connect_to(s: &Servers, database: &str) -> Client<Compat<tokio::net::TcpStream>> {
+    let mut c = config(s, PASSWORD, EncryptionLevel::Required);
+    c.database(database);
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", s.port))
         .await
         .unwrap();
@@ -1001,4 +1013,125 @@ async fn tiberius_column_collations() {
     assert_eq!(ids(&r), vec![2]);
     let e = batch(&mut c, "INSERT INTO Accounts VALUES (3, N'admin', NULL, NULL)").await.expect_err("duplicate");
     assert_eq!(number(&e), Some(2627), "{e}");
+}
+
+fn int(rows: &[tiberius::Row]) -> Vec<i32> {
+    rows.iter().map(|r| r.get::<i32, _>(0).unwrap()).collect()
+}
+
+fn texts(rows: &[tiberius::Row]) -> Vec<Option<String>> {
+    rows.iter().map(|r| r.get::<&str, _>(0).map(str::to_string)).collect()
+}
+
+/// What EF Core 10 contexts named like DenevCloud's send: a mixed-case
+/// database, `[dbo].[DenevCloud.ERP.Colors]` tables, filtered unique keys,
+/// sp_rename of an index, the DropColumn script's catalogue join, the
+/// migration lock, APPLY, and text that compares without case as under
+/// SQL Server's default collation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_ef_core_shapes() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(&mut c, "CREATE DATABASE [DenevColors]").await.unwrap();
+    drop(c);
+    // The database is found without case, however the login spells it.
+    let _ = connect_to(&s, "DENEVCOLORS").await;
+    let mut c = connect_to(&s, "DenevColors").await;
+    batch(
+        &mut c,
+        "CREATE TABLE [dbo].[DenevCloud.ERP.Colors] ([Id] int NOT NULL, [Name] nvarchar(50) NOT NULL, \
+         [Code] nvarchar(20) NULL, [Deleted] bit NOT NULL DEFAULT 0, CONSTRAINT [PK_DenevCloud.ERP.Colors] PRIMARY KEY ([Id]))",
+    )
+    .await
+    .unwrap();
+    batch(
+        &mut c,
+        "INSERT INTO [dbo].[DenevCloud.ERP.Colors] ([Id], [Name], [Code]) VALUES (1, N'Red', N'R1'), (2, N'blue', NULL), (3, N'RED', NULL)",
+    )
+    .await
+    .unwrap();
+    // Every statement reads the dotted name as one table: UPDATE and
+    // DELETE once answered 0 rows, a SELECT a relation named 'colors'.
+    let r = batch(&mut c, "UPDATE [d] SET [d].[Code] = N'B1' FROM [dbo].[DenevCloud.ERP.Colors] AS [d] WHERE [d].[Id] = 2; SELECT @@ROWCOUNT")
+        .await
+        .unwrap();
+    assert_eq!(int(r.last().unwrap()), vec![1]);
+    let r = batch(&mut c, "SELECT [d].[Id] FROM [dbo].[DenevCloud.ERP.Colors] AS [d] WHERE [d].[Code] = N'b1'").await.unwrap();
+    assert_eq!(int(&r[0]), vec![2], "text compares without case");
+    let r = batch(&mut c, "SELECT COUNT(*) FROM [dbo].[DenevCloud.ERP.Colors] WHERE [Name] = N'red'").await.unwrap();
+    assert_eq!(int(&r[0]), vec![2]);
+    let r = batch(&mut c, "SELECT [Name] FROM [dbo].[DenevCloud.ERP.Colors] GROUP BY [Name] ORDER BY [Name]").await.unwrap();
+    assert_eq!(texts(&r[0]), vec![Some("blue".into()), Some("RED".into())]);
+    let r = batch(
+        &mut c,
+        "SELECT [Name] FROM [dbo].[DenevCloud.ERP.Colors] EXCEPT SELECT N'RED' ORDER BY [Name]",
+    )
+    .await
+    .unwrap();
+    assert_eq!(texts(&r[0]), vec![Some("blue".into())]);
+    let r = batch(
+        &mut c,
+        "SELECT CASE WHEN OBJECT_ID(N'[dbo].[DenevCloud.ERP.Colors]') IS NULL THEN 0 ELSE 1 END; SELECT [name] FROM sys.tables",
+    )
+    .await
+    .unwrap();
+    assert_eq!(int(&r[0]), vec![1]);
+    assert!(texts(&r[1]).contains(&Some("denevcloud.erp.colors".into())), "{:?}", texts(&r[1]));
+    // OUTER APPLY, as EF writes FirstOrDefault in a projection.
+    let r = batch(
+        &mut c,
+        "SELECT [d].[Id], [x].[Name] FROM [dbo].[DenevCloud.ERP.Colors] AS [d] OUTER APPLY (SELECT TOP(1) [e].[Name] \
+         FROM [dbo].[DenevCloud.ERP.Colors] AS [e] WHERE [e].[Id] > [d].[Id] ORDER BY [e].[Id]) AS [x] ORDER BY [d].[Id]",
+    )
+    .await
+    .unwrap();
+    assert_eq!(r[0].len(), 3);
+    let names: Vec<Option<String>> = r[0].iter().map(|row| row.get::<&str, _>(1).map(str::to_string)).collect();
+    assert_eq!(names, vec![Some("blue".into()), Some("RED".into()), None]);
+    // A unique index filtered by `IS NOT NULL` is the key, under the
+    // collation; NULLs repeat. Any other filter on a unique index is
+    // refused (it was once built whole).
+    batch(&mut c, "CREATE UNIQUE INDEX [IX_DenevCloud.ERP.Colors_Code] ON [dbo].[DenevCloud.ERP.Colors] ([Code]) WHERE [Code] IS NOT NULL")
+        .await
+        .unwrap();
+    let e = batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Colors] ([Id], [Name], [Code]) VALUES (4, N'x', N'r1')").await.unwrap_err();
+    assert!(matches!(number(&e), Some(2601 | 2627)), "{e:?}");
+    batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Colors] ([Id], [Name], [Code]) VALUES (5, N'y', NULL)").await.unwrap();
+    assert!(batch(&mut c, "CREATE UNIQUE INDEX [IX_D] ON [dbo].[DenevCloud.ERP.Colors] ([Name]) WHERE [Deleted] = 0").await.is_err());
+    // sp_rename of an index, then DROP INDEX by the new name.
+    batch(&mut c, "EXEC sp_rename N'[DenevCloud.ERP.Colors].[IX_DenevCloud.ERP.Colors_Code]', N'IX_Code', 'INDEX'").await.unwrap();
+    batch(&mut c, "DROP INDEX [IX_Code] ON [dbo].[DenevCloud.ERP.Colors]").await.unwrap();
+    batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Colors] ([Id], [Name], [Code]) VALUES (6, N'z', N'r1')").await.unwrap();
+    // EF Core's DropColumn script: the join has the columns it reads.
+    batch(
+        &mut c,
+        "DECLARE @var sysname; SELECT @var = [d].[name] FROM [sys].[default_constraints] [d] \
+         INNER JOIN [sys].[columns] [c] ON [d].[parent_column_id] = [c].[column_id] AND [d].[parent_object_id] = [c].[object_id] \
+         WHERE ([d].[parent_object_id] = OBJECT_ID(N'[DenevCloud.ERP.Colors]') AND [c].[name] = N'Deleted'); \
+         IF @var IS NOT NULL EXEC(N'ALTER TABLE [DenevCloud.ERP.Colors] DROP CONSTRAINT [' + @var + '];'); \
+         ALTER TABLE [DenevCloud.ERP.Colors] DROP COLUMN [Deleted];",
+    )
+    .await
+    .unwrap();
+    // The migration lock: held by one connection, refused to another
+    // within its timeout, free again once released.
+    let lock = "DECLARE @r int; EXEC @r = sp_getapplock @Resource = '__EFMigrationsLock', @LockOwner = 'Session', @LockMode = 'Exclusive', @LockTimeout = 0; SELECT @r";
+    let r = batch(&mut c, lock).await.unwrap();
+    assert_eq!(int(r.last().unwrap()), vec![0]);
+    let mut other = connect_to(&s, "denevcolors").await;
+    let r = batch(&mut other, lock).await.unwrap();
+    assert_eq!(int(r.last().unwrap()), vec![-1]);
+    batch(&mut c, "DECLARE @r int; EXEC @r = sp_releaseapplock @Resource = '__EFMigrationsLock', @LockOwner = 'Session'; SELECT @r").await.unwrap();
+    let r = batch(&mut other, lock).await.unwrap();
+    assert_eq!(int(r.last().unwrap()), vec![0]);
+    // EnsureDeleted's statement before DROP DATABASE.
+    drop(other);
+    drop(c);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "IF SERVERPROPERTY('EngineEdition') <> 5 BEGIN ALTER DATABASE [DenevColors] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; END; DROP DATABASE [DenevColors];",
+    )
+    .await
+    .unwrap();
 }

@@ -4752,4 +4752,29 @@ mod tests {
         let sql = "ALTER DATABASE [d] SET ANSI_NULLS OFF";
         assert!(translate(sql, lex(sql).unwrap(), &e).is_err());
     }
+
+    #[test]
+    fn a_long_dotted_index_name_fits_and_is_found_again() {
+        let e = env();
+        let create = tr(
+            &e,
+            "CREATE INDEX [IX_DenevCloud.ERP.ClientSpecifics.UGCS.PublicationCategories_ContentCategoryId] \
+             ON [dbo].[DenevCloud.ERP.ClientSpecifics.UGCS.PublicationCategories] ([ContentCategoryId])",
+        );
+        let name = create.split_whitespace().nth(2).unwrap().trim_matches('"').to_string();
+        assert!(name.len() <= crate::sqlcompat::NAME_BYTES, "{name} is {} bytes", name.len());
+        let drop = tr(
+            &e,
+            "DROP INDEX [IX_DenevCloud.ERP.ClientSpecifics.UGCS.PublicationCategories_ContentCategoryId] \
+             ON [dbo].[DenevCloud.ERP.ClientSpecifics.UGCS.PublicationCategories]",
+        );
+        assert!(drop.contains(&name), "{drop} does not drop {name}");
+        // Short names are as they were.
+        assert_eq!(crate::sqlcompat::fit_name("ix_a".into()), "ix_a");
+        let long = "é".repeat(100);
+        let fitted = crate::sqlcompat::fit_name(long.clone());
+        assert!(fitted.len() <= crate::sqlcompat::NAME_BYTES);
+        assert_eq!(fitted, crate::sqlcompat::fit_name(long));
+        assert_ne!(fitted, crate::sqlcompat::fit_name("é".repeat(101)));
+    }
 }

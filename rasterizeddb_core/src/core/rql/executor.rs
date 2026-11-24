@@ -7100,10 +7100,18 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
     // Rows told apart by a column with a nondeterministic collation are
     // refused (`collation::refuse_in_set_op`).
     let compares = parts.ops.iter().any(|op| !(op.all && op.kind == crate::core::rql::join::SetKind::Union));
+    // Rows are told apart under each column's collation
+    // (`collation::set_op_collations`): 'Abc' and 'abc' are one row of a
+    // case-insensitive column.
     let fields = |table: &str| database.schema_view(table).map(|v| v.schema().fields.to_vec());
-    if let Err(e) = crate::core::rql::collation::refuse_in_set_op(&parts.branches, compares, &fields) {
-        return ddl_error(&e);
-    }
+    let collations = if compares {
+        match crate::core::rql::collation::set_op_collations(&parts.branches, &fields) {
+            Ok(c) => c,
+            Err(e) => return ddl_error(&e),
+        }
+    } else {
+        Vec::new()
+    };
 
     // A document column compares by value, so `{"a":1}` and `{"a":1.0}` are
     // one row. A position is a document column when any branch says so
@@ -7139,6 +7147,7 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
         Ok(combined) => combined,
         Err(e) => return ddl_error(&e),
     };
+    combined.set_collations(collations);
     // A NUMERIC column whose branches keep different scales: each cell at
     // its own (`set_ops::union_decimal_scales`).
     {

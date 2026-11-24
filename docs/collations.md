@@ -39,6 +39,8 @@ A value is returned as it was written; only comparisons change.
 - `GROUP BY` (each group shows its least spelling under the collation),
   `SELECT DISTINCT` of plain columns, `min`/`max`, `count(DISTINCT …)` and
   the other DISTINCT aggregates, over one table or a join;
+- `UNION`, `INTERSECT` and `EXCEPT`, whose rows are told apart and
+  sorted under each column's collation (a branch may be a join);
 - `ORDER BY`, and a window's `PARTITION BY` and `ORDER BY`: by the
   collation, then by the value, so values that compare equal still come
   back in one order;
@@ -52,7 +54,8 @@ not the Unicode Collation Algorithm's: `'Zoe'` sorts before `'Ännchen'`.
 
 ## Refused for now (`0A000`), rather than compared by the bytes
 
-`UNION`/`INTERSECT`/`EXCEPT` (but `UNION ALL` works), a `HAVING` that
+A `UNION`/`INTERSECT`/`EXCEPT` of `*` over such a column (name the
+columns), a `HAVING` that
 compares `min`/`max` of such a column (it compares their bytes),
 `min`/`max` as a window function, a `SELECT DISTINCT` of
 such a column beside an expression, a `CHECK` reading one, a partitioned
