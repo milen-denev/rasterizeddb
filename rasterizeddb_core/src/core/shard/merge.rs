@@ -381,3 +381,23 @@ impl<'a> Reader<'a> {
         if self.bool()? { Ok(Some(self.bytes()?)) } else { Ok(None) }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn r2r3_partial_count_round_trips_and_a_cut_frame_is_refused() {
+        for n in [0i64, 1, -1, i64::MAX, 123_456_789] {
+            let mut out = Vec::new();
+            encode_acc(&Acc::Count(n), &mut out);
+            let mut r = Reader::new(&out);
+            let back = decode_acc(&Acc::Count(0), &mut r).unwrap();
+            assert!(matches!(back, Acc::Count(v) if v == n));
+            assert!(r.done(), "every byte read");
+            for cut in 0..out.len() {
+                assert!(decode_acc(&Acc::Count(0), &mut Reader::new(&out[..cut])).is_err(), "cut at {cut}");
+            }
+        }
+    }
+}

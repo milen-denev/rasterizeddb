@@ -542,3 +542,57 @@ pub fn rewrite(ctx: &Context, stmt: &str, actor: &Actor<'_>, substitute: &dyn Fn
     }
     Ok(Applied { text: Some(text), check })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn r2r3_policy_statements_parse() {
+        let Some(Ok(PolicyStatement::Create(p))) = parse_policy_statement(
+            "CREATE POLICY own ON docs AS RESTRICTIVE FOR UPDATE TO alice, PUBLIC USING (owner = current_user) WITH CHECK (owner = 'x')",
+        ) else {
+            panic!()
+        };
+        assert_eq!((p.table.as_str(), p.name.as_str(), p.command.as_str(), p.permissive), ("docs", "own", "UPDATE", false));
+        assert_eq!(p.roles, vec!["alice".to_string(), "public".to_string()]);
+        assert_eq!(p.using.as_deref(), Some("owner = current_user"));
+        assert_eq!(p.check.as_deref(), Some("owner = 'x'"));
+        assert!(matches!(
+            parse_policy_statement("ALTER TABLE docs FORCE ROW LEVEL SECURITY"),
+            Some(Ok(PolicyStatement::Toggle { marker: RLS_FORCE, on: true, .. }))
+        ));
+        assert!(matches!(
+            parse_policy_statement("ALTER TABLE docs NO FORCE ROW LEVEL SECURITY"),
+            Some(Ok(PolicyStatement::Toggle { marker: RLS_FORCE, on: false, .. }))
+        ));
+        assert!(matches!(parse_policy_statement("DROP POLICY IF EXISTS own ON docs"), Some(Ok(PolicyStatement::Drop { if_exists: true, .. }))));
+        // INSERT takes no USING, SELECT no WITH CHECK, as in PostgreSQL.
+        assert!(matches!(parse_policy_statement("CREATE POLICY p ON t FOR INSERT USING (true)"), Some(Err(_))));
+        assert!(matches!(parse_policy_statement("CREATE POLICY p ON t FOR SELECT WITH CHECK (true)"), Some(Err(_))));
+        assert!(parse_policy_statement("ALTER TABLE t ADD COLUMN x INT").is_none());
+    }
+
+    fn policy(command: &str, permissive: bool, using: &str) -> Policy {
+        Policy {
+            table: "t".into(),
+            name: format!("{command}{permissive}"),
+            command: command.into(),
+            permissive,
+            roles: vec!["public".into()],
+            using: Some(using.into()),
+            check: None,
+        }
+    }
+
+    #[test]
+    fn r2r3_policies_combine_as_postgresql_does() {
+        let actor = Actor { role: "u", superuser: false };
+        let rows: Vec<AclRow> = Vec::new();
+        assert_eq!(predicate(&[], &rows, &actor, "SELECT", false), "FALSE", "no permissive policy: nothing");
+        let ps = vec![policy("ALL", true, "a"), policy("SELECT", true, "b"), policy("ALL", false, "c"), policy("DELETE", true, "d")];
+        assert_eq!(predicate(&ps, &rows, &actor, "SELECT", false), "((a) OR (b)) AND (c)");
+        // A restrictive policy alone admits nothing.
+        assert_eq!(predicate(&[policy("ALL", false, "c")], &rows, &actor, "SELECT", false), "FALSE");
+    }
+}

@@ -810,6 +810,29 @@ fn object_name(word: &str) -> String {
 ///   owner (`@function:name`, …); only the owner may replace, alter or drop
 ///   one. One with no owner recorded (made before owners existed) is a
 ///   superuser's to change, never the first comer's.
+/// The ownership gate of a function, procedure, type, domain or trigger
+/// statement, which is answered before [`check`] runs (R1): a role that is
+/// not a superuser is refused another's object, and a CREATE records its
+/// creator as owner, a superuser's as anyone's. Without it those statements
+/// skipped the check entirely: any role could replace or drop any function,
+/// and no function had an owner (so none could be SECURITY DEFINER).
+pub(super) async fn object_ddl_gate(database: &Arc<Database>, state: &SessionState, stmt: &str) -> Option<(&'static str, String)> {
+    let head: Vec<String> = stmt.split_whitespace().take(4).map(str::to_ascii_uppercase).collect();
+    let kind_at = if head.get(1).is_some_and(|w| w == "OR") { 3 } else { 1 };
+    let names_one = matches!(head.first().map(String::as_str), Some("CREATE" | "ALTER" | "DROP"))
+        && matches!(head.get(kind_at).map(String::as_str), Some("FUNCTION" | "PROCEDURE" | "TYPE" | "DOMAIN" | "TRIGGER"));
+    if !names_one || state.view_internal {
+        return None;
+    }
+    let tx = state.current_tx();
+    let rows = match privileges::load_shared(database, tx).await {
+        Ok(rows) => rows,
+        Err(e) => return Some(("42501", format!("permission denied: the privilege catalogue could not be read ({e})"))),
+    };
+    let refusal = object_ddl_refusal(database, &rows, &state.principal.name, stmt, tx).await;
+    if state.principal.may_administer() { None } else { refusal }
+}
+
 async fn object_ddl_refusal(
     database: &Arc<Database>,
     rows: &[privileges::AclRow],

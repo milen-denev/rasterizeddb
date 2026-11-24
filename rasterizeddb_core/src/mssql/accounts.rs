@@ -250,3 +250,33 @@ pub(crate) fn translate(tokens: &[Token]) -> Option<Result<Vec<String>, TsqlErro
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(sql: &str) -> Option<Result<Vec<String>, TsqlError>> {
+        translate(&super::super::lex::lex(sql).unwrap())
+    }
+
+    fn ok(sql: &str) -> Vec<String> {
+        match t(sql) {
+            Some(Ok(v)) => v,
+            other => panic!("{sql}: {:?}", other.map(|r| r.map_err(|e| e.message))),
+        }
+    }
+
+    #[test]
+    fn r2r3_tsql_logins_users_and_grants_map_to_roles() {
+        assert_eq!(ok("CREATE LOGIN app WITH PASSWORD = 'p', CHECK_POLICY = OFF"), vec!["CREATE ROLE \"app\" LOGIN PASSWORD 'p'".to_string()]);
+        assert!(ok("CREATE USER app FOR LOGIN app").is_empty(), "the login is the role already");
+        assert!(matches!(t("CREATE USER u2 FOR LOGIN app"), Some(Err(_))));
+        assert_eq!(ok("ALTER LOGIN app DISABLE"), vec!["ALTER ROLE \"app\" NOLOGIN".to_string()]);
+        assert_eq!(ok("ALTER ROLE readers ADD MEMBER app"), vec!["GRANT \"readers\" TO \"app\"".to_string()]);
+        assert_eq!(ok("GRANT SELECT ON OBJECT::dbo.orders TO app"), vec!["GRANT SELECT ON TABLE \"orders\" TO \"app\"".to_string()]);
+        assert_eq!(ok("REVOKE SELECT ON dbo.orders FROM app CASCADE"), vec!["REVOKE SELECT ON TABLE \"orders\" FROM \"app\" CASCADE".to_string()]);
+        assert!(matches!(t("DENY SELECT ON orders TO app"), Some(Err(_))));
+        assert!(matches!(t("ALTER ROLE db_datareader ADD MEMBER app"), Some(Err(_))));
+        assert!(t("CREATE TABLE x (a int)").is_none());
+    }
+}

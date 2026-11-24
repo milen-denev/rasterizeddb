@@ -2993,3 +2993,37 @@ mod tests {
         assert_eq!(oids.len(), rows.len());
     }
 }
+
+#[cfg(test)]
+mod r2r3_acl_tests {
+    use crate::core::rql::privileges::AclRow;
+
+    fn row(relation: &str, grantee: &str, privilege: &str, grantor: &str, grantable: bool) -> AclRow {
+        AclRow { relation: relation.into(), grantee: grantee.into(), privilege: privilege.into(), grantor: grantor.into(), grantable }
+    }
+
+    #[test]
+    fn r2r3_aclitems_print_as_postgresql_prints_them() {
+        let only_owner = vec![row("t", "own", "OWNER", "own", false)];
+        assert!(super::aclitems(&only_owner, "t").is_empty(), "the owner's defaults alone are NULL");
+        let acl = vec![
+            row("t", "own", "OWNER", "own", false),
+            row("t", "alice", "SELECT", "own", true),
+            row("t", "alice", "UPDATE", "own", false),
+            row("t", "public", "SELECT", "own", false),
+            row("t", "Mixed", "INSERT", "own", false),
+            // A column grant and a marker are no table privilege.
+            row("t", "bob", "SELECT:a", "own", false),
+            row("t", "-", "RLS", "own", false),
+        ];
+        assert_eq!(
+            super::aclitems(&acl, "t"),
+            vec![
+                "own=arwdDxtm/own".to_string(),
+                "alice=r*w/own".to_string(),
+                "=r/own".to_string(),
+                "\"Mixed\"=a/own".to_string(),
+            ]
+        );
+    }
+}

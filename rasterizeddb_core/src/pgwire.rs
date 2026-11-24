@@ -59,6 +59,8 @@ mod statement_intern;
 #[cfg(test)]
 mod owner_tests;
 #[cfg(test)]
+mod roles_tests;
+#[cfg(test)]
 mod schema_view_tests;
 #[cfg(test)]
 mod table_lock_tests;
@@ -8907,6 +8909,11 @@ where
     }
     if let Some(parsed) = crate::core::rql::sequence_catalog::parse_sequence_statement(stmt) {
         return sequence_statements::handle_sequence_statement(database, state, stream, parsed).await;
+    }
+    // Functions, procedures, types, domains and triggers: their owners'
+    // (R1), checked here because they are answered before `check`.
+    if let Some((code, message)) = privilege_statements::object_ddl_gate(database, state, stmt).await {
+        return fail_statement(state, stream, code, &message).await;
     }
     if let Some(parsed) = crate::core::rql::user_types::parse_type_statement(stmt) {
         return type_statements::handle_type_statement(database, state, stream, parsed).await;

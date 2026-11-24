@@ -1241,3 +1241,69 @@ mod tests {
         assert!(!may_grant(&rows, "alice", "t", "SELECT"));
     }
 }
+
+#[cfg(test)]
+mod r2r3_tests {
+    use super::*;
+
+    fn row(relation: &str, grantee: &str, privilege: &str, grantor: &str, grantable: bool) -> AclRow {
+        AclRow { relation: relation.into(), grantee: grantee.into(), privilege: privilege.into(), grantor: grantor.into(), grantable }
+    }
+
+    #[test]
+    fn r2r3_inherit_and_set_follow_their_own_edges() {
+        let rows = vec![
+            row("@role:g", "u", "MEMBER", "x", false),
+            row("@role:g", "u", NOINHERIT, "x", false),
+            row("@role:h", "u", "MEMBER", "x", false),
+            row("@role:h", "u", NOSET, "x", false),
+        ];
+        assert_eq!(roles_of(&rows, "u"), vec!["u".to_string(), "h".to_string()]);
+        assert_eq!(settable_roles(&rows, "u"), vec!["u".to_string(), "g".to_string()]);
+    }
+
+    #[test]
+    fn r2r3_dependent_grants_follow_the_chain() {
+        let rows = vec![
+            row("t", "a", "SELECT", "owner", true),
+            row("t", "b", "SELECT", "a", true),
+            row("t", "c", "SELECT", "b", false),
+            row("t", "d", "INSERT", "a", false),
+        ];
+        let mut d = dependent_grants(&rows, "t", "SELECT", "a");
+        d.sort();
+        assert_eq!(d, vec!["b".to_string(), "c".to_string()]);
+        assert!(dependent_grants(&rows, "t", "SELECT", "c").is_empty());
+    }
+
+    #[test]
+    fn r2r3_column_privileges_parse_and_execute_defaults_to_public() {
+        let Some(Ok(PrivilegeStatement::Grant { privileges, .. })) = parse_privilege_statement("GRANT SELECT (a, \"B\"), UPDATE (c) ON t TO u") else {
+            panic!()
+        };
+        assert_eq!(privileges, vec!["SELECT(a,B)".to_string(), "UPDATE(c)".to_string()]);
+        assert_eq!(column_privilege("SELECT(a,B)"), Some(("SELECT", vec!["a", "B"])));
+        let rows = vec![row("@function:f", "owner", "OWNER", "owner", false)];
+        assert!(may_execute(&rows, "anyone", "@function:f"), "PUBLIC holds EXECUTE by default");
+        let mut rows = rows;
+        rows.push(row("@function:f", "public", NOEXECUTE, "owner", false));
+        assert!(!may_execute(&rows, "anyone", "@function:f"));
+        assert!(may_execute(&rows, "owner", "@function:f"));
+    }
+
+    #[test]
+    fn r2r3_targets_parse_by_kind() {
+        assert_eq!(target_of("SEQUENCE s1, public.s2"), Target::Sequences(vec!["s1".into(), "s2".into()]));
+        assert_eq!(target_of("FUNCTION f(integer), g"), Target::Routines { kind: "function", names: vec!["f".into(), "g".into()] });
+        assert_eq!(target_of("ALL SEQUENCES IN SCHEMA public"), Target::AllSequencesInSchema);
+        assert!(matches!(parse_privilege_statement("REVOKE SELECT ON t FROM u CASCADE"), Some(Ok(PrivilegeStatement::Revoke { cascade: true, .. }))));
+        assert!(matches!(
+            parse_privilege_statement("REVOKE ADMIN OPTION FOR g FROM u"),
+            Some(Ok(PrivilegeStatement::RevokeRole { option: Some(MembershipOption::Admin), .. }))
+        ));
+        assert!(matches!(
+            parse_privilege_statement("GRANT g TO u WITH INHERIT FALSE, SET TRUE"),
+            Some(Ok(PrivilegeStatement::GrantRole { inherit: Some(false), set: Some(true), admin: false, .. }))
+        ));
+    }
+}

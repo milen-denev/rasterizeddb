@@ -242,8 +242,14 @@ pub(crate) fn translate(tokens: &[Token], database: &str) -> Option<Result<Vec<S
     // The role statements also come in PostgreSQL's own form through this
     // front end (`CREATE ROLE r LOGIN`, `ALTER USER u PASSWORD 'x'`), which
     // the engine reads as they are: translated only in MySQL's.
+    // The account's own token: a quoted string is MySQL's way of naming
+    // one ('u'@'%'); a password literal later in the statement is not.
+    let mut name_at = 2;
+    while matches!(upper(tokens, name_at).as_str(), "IF" | "NOT" | "EXISTS") {
+        name_at += 1;
+    }
     let mysql_form = tokens.iter().any(|t| matches!(t.tok, Tok::UserVar(_)) || t.is_word("IDENTIFIED") || t.is_word("ACCOUNT"))
-        || tokens.get(2..5).is_some_and(|w| w.iter().any(|t| matches!(t.tok, Tok::Str(_))));
+        || tokens.get(name_at).is_some_and(|t| matches!(t.tok, Tok::Str(_)));
     if matches!(head.as_str(), "CREATE" | "ALTER" | "DROP") && matches!(second.as_str(), "USER" | "ROLE") && !mysql_form {
         return None;
     }
@@ -372,4 +378,47 @@ pub(crate) fn translate(tokens: &[Token], database: &str) -> Option<Result<Vec<S
         ("REVOKE", _) => grant_or_revoke(tokens, false, database),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(sql: &str) -> Option<Result<Vec<String>, MyError>> {
+        translate(&super::super::lex::lex(sql.as_bytes(), Default::default()).unwrap(), "shop")
+    }
+
+    fn ok(sql: &str) -> Vec<String> {
+        match t(sql) {
+            Some(Ok(v)) => v,
+            other => panic!("{sql}: {:?}", other.map(|r| r.map_err(|e| e.message))),
+        }
+    }
+
+    #[test]
+    fn r2r3_mysql_accounts_become_roles() {
+        assert_eq!(ok("CREATE USER 'app'@'%' IDENTIFIED BY 'p''w'"), vec!["CREATE ROLE \"app\" LOGIN PASSWORD 'p''w'".to_string()]);
+        assert_eq!(ok("ALTER USER 'app'@'localhost' IDENTIFIED BY 'x'"), vec!["ALTER ROLE \"app\" PASSWORD 'x'".to_string()]);
+        assert_eq!(ok("DROP USER IF EXISTS 'a'@'%', 'b'"), vec!["DROP ROLE IF EXISTS \"a\"".to_string(), "DROP ROLE IF EXISTS \"b\"".to_string()]);
+        assert_eq!(ok("SET PASSWORD = 'n'"), vec![format!("ALTER ROLE {SESSION_USER} PASSWORD 'n'")]);
+        assert_eq!(ok("RENAME USER 'a'@'%' TO 'b'@'%'"), vec!["ALTER ROLE \"a\" RENAME TO \"b\"".to_string()]);
+        // PostgreSQL's own forms pass through untouched.
+        assert!(t("CREATE ROLE r LOGIN").is_none());
+        assert!(t("ALTER USER u PASSWORD 'x'").is_none());
+    }
+
+    #[test]
+    fn r2r3_mysql_grants_map_to_the_engines() {
+        assert_eq!(
+            ok("GRANT SELECT, INSERT ON shop.orders TO 'app'@'%' WITH GRANT OPTION"),
+            vec!["GRANT SELECT, INSERT ON TABLE \"orders\" TO \"app\" WITH GRANT OPTION".to_string()]
+        );
+        assert_eq!(ok("GRANT ALL PRIVILEGES ON shop.* TO app"), vec!["GRANT ALL ON ALL TABLES IN SCHEMA public TO \"app\"".to_string()]);
+        assert_eq!(ok("REVOKE UPDATE ON orders FROM 'app'"), vec!["REVOKE UPDATE ON TABLE \"orders\" FROM \"app\"".to_string()]);
+        assert!(ok("GRANT USAGE ON *.* TO app").is_empty(), "MySQL's nothing");
+        assert_eq!(ok("GRANT readers TO 'app'@'%'"), vec!["GRANT \"readers\" TO \"app\"".to_string()]);
+        // Another database's, and a privilege with no counterpart: refused.
+        assert!(matches!(t("GRANT SELECT ON other.t TO app"), Some(Err(_))));
+        assert!(matches!(t("GRANT CREATE ON shop.* TO app"), Some(Err(_))));
+    }
 }

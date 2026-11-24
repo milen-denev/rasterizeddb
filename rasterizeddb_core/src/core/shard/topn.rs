@@ -315,3 +315,72 @@ pub fn sort_key(keys: &[Key], index: &[usize], fields: &[(String, u32)], cells: 
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(oid: u32, value: Option<&str>, desc: bool, nulls_first: bool) -> Vec<u8> {
+        let keys = [Key { column: KeyRef::Ordinal(1), desc, nulls_first }];
+        let fields = [("c".to_string(), oid)];
+        sort_key(&keys, &[0], &fields, &[value.map(str::as_bytes)]).unwrap()
+    }
+
+    /// `values` sorted by their keys, as the gateway merges them.
+    fn sorted(oid: u32, values: &[Option<&str>], desc: bool, nulls_first: bool) -> Vec<Option<String>> {
+        let mut v: Vec<(Vec<u8>, Option<String>)> =
+            values.iter().map(|x| (key(oid, *x, desc, nulls_first), x.map(str::to_string))).collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v.into_iter().map(|(_, x)| x).collect()
+    }
+
+    fn some(v: &[&str]) -> Vec<Option<String>> {
+        v.iter().map(|s| Some(s.to_string())).collect()
+    }
+
+    #[test]
+    fn r2r3_topn_integers_and_floats_sort_numerically() {
+        assert_eq!(sorted(23, &[Some("10"), Some("-3"), Some("2"), Some("-20")], false, false), some(&["-20", "-3", "2", "10"]));
+        assert_eq!(sorted(20, &[Some("10"), Some("-3"), Some("2")], true, false), some(&["10", "2", "-3"]));
+        assert_eq!(
+            sorted(701, &[Some("NaN"), Some("-Infinity"), Some("1.5"), Some("-0"), Some("Infinity"), Some("-2.25")], false, false),
+            some(&["-Infinity", "-2.25", "-0", "1.5", "Infinity", "NaN"])
+        );
+        assert_eq!(key(701, Some("-0"), false, false), key(701, Some("0"), false, false), "-0 = 0, as PostgreSQL compares them");
+    }
+
+    #[test]
+    fn r2r3_topn_numeric_sorts_by_value_not_text() {
+        let values = ["10", "-10.5", "0.001", "1.5", "-2", "0", "100.25", "-0.5", "9.99"];
+        let expected = ["-10.5", "-2", "-0.5", "0", "0.001", "1.5", "9.99", "10", "100.25"];
+        let input: Vec<Option<&str>> = values.iter().map(|v| Some(*v)).collect();
+        assert_eq!(sorted(1700, &input, false, false), some(&expected));
+        let mut reversed = expected.to_vec();
+        reversed.reverse();
+        assert_eq!(sorted(1700, &input, true, false), some(&reversed));
+        assert_eq!(key(1700, Some("1.50"), false, false), key(1700, Some("1.5"), false, false), "equal values, equal keys");
+    }
+
+    #[test]
+    fn r2r3_topn_text_nulls_and_prefixes() {
+        assert_eq!(
+            sorted(25, &[Some("ab"), None, Some("a"), Some("abc"), Some("b")], false, false),
+            vec![Some("a".into()), Some("ab".into()), Some("abc".into()), Some("b".into()), None]
+        );
+        assert_eq!(
+            sorted(25, &[Some("ab"), None, Some("a"), Some("abc")], true, true),
+            vec![None, Some("abc".into()), Some("ab".into()), Some("a".into())]
+        );
+    }
+
+    #[test]
+    fn r2r3_topn_parse_asks_each_shard_for_limit_plus_offset() {
+        let t = parse("SELECT a, b FROM t ORDER BY a DESC, 2 LIMIT 5 OFFSET 2").unwrap().unwrap();
+        assert_eq!((t.limit, t.offset), (5, 2));
+        assert_eq!(t.keys.len(), 2);
+        assert!(t.keys[0].desc && t.keys[0].nulls_first, "DESC is NULLS FIRST by default");
+        assert_eq!(t.keys[1].column, KeyRef::Ordinal(2));
+        assert!(t.part_sql.contains("LIMIT 7"), "{}", t.part_sql);
+        assert!(parse("SELECT a FROM t LIMIT 5").is_none(), "no ORDER BY: not a top-N");
+    }
+}

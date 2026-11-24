@@ -2108,6 +2108,36 @@ mod tests {
     }
 
     #[test]
+    fn r2r3_alter_role_reads_attributes_settings_and_renames() {
+        let Some(Ok(RoleStatement::Alter { attrs, login, .. })) =
+            parse_role_statement("ALTER ROLE w NOLOGIN CREATEDB CONNECTION LIMIT 5 VALID UNTIL 'infinity' BYPASSRLS")
+        else {
+            panic!()
+        };
+        assert_eq!(login, Some(false));
+        assert_eq!(
+            attrs,
+            RoleAttrs { create_db: Some(true), create_role: None, conn_limit: Some(5), valid_until: Some(None), bypass_rls: Some(true) }
+        );
+        assert_eq!(
+            parse_role_statement("ALTER ROLE w SET statement_timeout = 5s").unwrap().unwrap(),
+            RoleStatement::SetConfig { name: "w".into(), param: "statement_timeout".into(), value: Some("5s".into()) }
+        );
+        assert_eq!(
+            parse_role_statement("ALTER ROLE w RESET rdb.shape_change").unwrap().unwrap(),
+            RoleStatement::SetConfig { name: "w".into(), param: "rdb.shape_change".into(), value: None }
+        );
+        assert!(parse_role_statement("ALTER ROLE w SET search_path = x").unwrap().is_err(), "only the applied settings");
+        assert!(parse_role_statement("ALTER ROLE w SET statement_timeout = 'soon'").unwrap().is_err());
+        assert_eq!(
+            parse_role_statement("ALTER USER a RENAME TO b").unwrap().unwrap(),
+            RoleStatement::Rename { name: "a".into(), to: "b".into() }
+        );
+        // The old CREATEUSER is SUPERUSER, not CREATEROLE.
+        assert!(matches!(parse_role_statement("CREATE ROLE x CREATEUSER").unwrap().unwrap(), RoleStatement::Create { is_superuser: true, .. }));
+    }
+
+    #[test]
     fn statements_that_are_not_about_roles_are_left_alone() {
         assert!(parse_role_statement("SELECT 1").is_none());
         assert!(parse_role_statement("CREATE TABLE users (id INT)").is_none());
