@@ -13,9 +13,14 @@
 //!   ON TABLES`): `('@default:<r>', grantee, privilege)`.
 //!
 //! A relation created from here on is owned by its creator, and other roles
-//! need a grant, as in PostgreSQL. A relation with no owner row (every one
-//! created before this existed) is open to every role, as it was. A
-//! superuser, and any session under `trust`, passes every check.
+//! need a grant, as in PostgreSQL. Every check fails closed: a relation with
+//! no owner row is its owner's alone, which nobody else is, so only a
+//! superuser reaches it, and an ACL that cannot be read refuses. A database
+//! from before owners existed is given them once, when its roles are
+//! prepared ([`assign_owners`]): its owner owns every relation, and PUBLIC is
+//! granted on each what every role had, so it keeps working. A superuser
+//! passes every check; under `trust` a session is only what its role is
+//! (`pgwire::authenticate`).
 
 use rclite::Arc;
 
@@ -517,6 +522,106 @@ pub async fn rename(database: &Arc<Database>, relation: &str, to: &str, tx: Opti
 }
 
 // ---------------------------------------------------------------------------
+// Owners for a database from before them
+// ---------------------------------------------------------------------------
+
+/// The row that says a database was given owners ([`assign_owners`]): from
+/// then on a relation with no owner is a new one some path did not record,
+/// and is given an owner but no grants.
+const UPGRADE_MARKER: &str = "@upgrade:r0";
+
+/// The relations a client names and owners are kept for: tables, views and
+/// sequences, not the engine's own (`__…`) nor the role catalogue.
+async fn owned_relation_names(database: &Arc<Database>) -> Vec<String> {
+    let mut names: Vec<String> = database
+        .relation_names()
+        .into_iter()
+        .filter(|n| !n.starts_with("__") && n != crate::auth::ROLE_TABLE)
+        .collect();
+    names.extend(crate::core::rql::views::load(database, None, None).await.unwrap_or_default().into_iter().map(|v| v.name));
+    names.extend(
+        crate::core::rql::sequence_catalog::load(database, None, None).await.unwrap_or_default().into_iter().map(|s| s.name),
+    );
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Records that `database` needs no legacy upgrade: one made from here on
+/// (`CREATE DATABASE`, an import's target), whose relations are owned as
+/// they are made.
+pub async fn mark_current(database: &Arc<Database>, owner: &str) -> Result<(), String> {
+    let marker = AclRow {
+        relation: UPGRADE_MARKER.to_string(),
+        grantee: owner.to_string(),
+        privilege: "UPGRADED".to_string(),
+        grantor: owner.to_string(),
+        grantable: false,
+    };
+    put(database, &marker, None).await
+}
+
+/// Gives every relation of `database` without an owner one: `owner`, the
+/// database's owner (its first superuser, or the bootstrap role). Once per
+/// database, the first time this runs (no marker yet), each such relation is
+/// also granted to PUBLIC with every table privilege: before owners existed
+/// an unowned relation was open to every role, and the grant keeps that, now
+/// as rows an owner can `REVOKE`, rather than as a rule that let any role
+/// take the relation over (`OWNER TO`) or read it when the ACL failed to
+/// load. After the marker a relation found without an owner gets the owner
+/// alone, closed to the other roles until granted.
+///
+/// Returns how many relations it gave an owner. Run where a database's roles
+/// are prepared (`auth::ensure_role_catalogue`, pgwire's `seed_roles`).
+pub async fn assign_owners(database: &Arc<Database>, owner: &str) -> Result<usize, String> {
+    let rows = load(database, None).await?;
+    let legacy = !rows.iter().any(|r| r.relation == UPGRADE_MARKER);
+    let mut assigned = 0usize;
+    for name in owned_relation_names(database).await {
+        if owner_of(&rows, &name).is_some() {
+            continue;
+        }
+        let row = AclRow {
+            relation: name.clone(),
+            grantee: owner.to_string(),
+            privilege: "OWNER".to_string(),
+            grantor: owner.to_string(),
+            grantable: false,
+        };
+        put(database, &row, None).await?;
+        if legacy {
+            for privilege in TABLE_PRIVILEGES {
+                let grant = AclRow {
+                    relation: name.clone(),
+                    grantee: "public".to_string(),
+                    privilege: privilege.to_string(),
+                    grantor: owner.to_string(),
+                    grantable: false,
+                };
+                put(database, &grant, None).await?;
+            }
+        }
+        assigned += 1;
+    }
+    if legacy {
+        mark_current(database, owner).await?;
+        if assigned > 0 {
+            log::warn!(
+                "Database \"{}\": {} relation{} from before owners existed now belong to \"{}\", and PUBLIC keeps \
+                 every privilege on them it had; REVOKE ALL ON <table> FROM PUBLIC to close one",
+                database.name,
+                assigned,
+                if assigned == 1 { "" } else { "s" },
+                owner
+            );
+        }
+    } else if assigned > 0 {
+        log::info!("Database \"{}\": {} relation{} without an owner now belong to \"{}\"", database.name, assigned, if assigned == 1 { "" } else { "s" }, owner);
+    }
+    Ok(assigned)
+}
+
+// ---------------------------------------------------------------------------
 // Checking
 // ---------------------------------------------------------------------------
 
@@ -545,9 +650,11 @@ pub fn owner_of<'a>(rows: &'a [AclRow], relation: &str) -> Option<&'a str> {
 }
 
 /// Whether `role` may use `privilege` on `relation` (its owner may do all).
+/// A relation with no owner is nobody's to use but a superuser's, who is not
+/// asked: fails closed.
 pub fn allows(rows: &[AclRow], role: &str, relation: &str, privilege: &str) -> bool {
     let Some(owner) = owner_of(rows, relation) else {
-        return true;
+        return false;
     };
     let acting = roles_of(rows, role);
     if acting.iter().any(|r| r == owner) {
@@ -560,12 +667,18 @@ pub fn allows(rows: &[AclRow], role: &str, relation: &str, privilege: &str) -> b
     })
 }
 
+/// Whether `role` acts as `relation`'s owner. No owner: nobody does.
+pub fn owns(rows: &[AclRow], role: &str, relation: &str) -> bool {
+    owner_of(rows, relation).is_some_and(|owner| roles_of(rows, role).iter().any(|r| r == owner))
+}
+
 /// Whether `role` may grant `privilege` on `relation`: its owner, or a
-/// holder of it `WITH GRANT OPTION`.
+/// holder of it `WITH GRANT OPTION`. An unowned relation's privileges are
+/// only a superuser's to give.
 pub fn may_grant(rows: &[AclRow], role: &str, relation: &str, privilege: &str) -> bool {
     let acting = roles_of(rows, role);
     match owner_of(rows, relation) {
-        None => true,
+        None => false,
         Some(owner) if acting.iter().any(|r| r == owner) => true,
         Some(_) => rows.iter().any(|r| {
             r.relation == relation && r.privilege == privilege && r.grantable && acting.iter().any(|a| *a == r.grantee)
@@ -644,7 +757,9 @@ mod tests {
         assert!(!allows(&rows, "alice", "t", "INSERT"));
         assert!(!allows(&rows, "bob", "t", "SELECT"));
         assert!(allows(&rows, "bob", "u", "INSERT"));
-        assert!(allows(&rows, "bob", "legacy", "DELETE"));
+        // Unowned: nobody's but a superuser's (fails closed).
+        assert!(!allows(&rows, "bob", "legacy", "DELETE"));
+        assert!(!may_grant(&rows, "bob", "legacy", "SELECT"));
         assert!(!may_grant(&rows, "alice", "t", "SELECT"));
     }
 }

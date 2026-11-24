@@ -738,11 +738,13 @@ impl NativeSession {
         {
             return true;
         }
-        // A privilege check (a non-superuser's statement), or the owner a
-        // new relation is given. A superuser's other statements stay on the
-        // native path.
-        if database.has_table(crate::core::rql::privileges::ACL_TABLE)
-            && ((self.authenticated && !self.superuser) || upper_head.starts_with("CREATE"))
+        // A privilege check (a non-superuser's statement), with or without
+        // an ACL: without one, every relation is unowned and refused to it
+        // (`privilege_statements::check` fails closed), which the native
+        // path, checking nothing, would have run. Or the owner a new relation
+        // is given. A superuser's other statements stay on the native path.
+        if (self.authenticated && !self.superuser)
+            || (upper_head.starts_with("CREATE") && database.has_table(crate::core::rql::privileges::ACL_TABLE))
         {
             return true;
         }

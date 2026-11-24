@@ -721,6 +721,7 @@ pub async fn ensure_role_catalogue(
     let existing = run(database, &format!("SELECT name FROM {}", ROLE_TABLE)).await?;
     let has_roles = existing.first() == Some(&2) && existing.len() > 1;
     if has_roles {
+        prepare_owners(database, bootstrap_user).await;
         return Ok(());
     }
 
@@ -747,7 +748,72 @@ pub async fn ensure_role_catalogue(
         "Created role catalogue with bootstrap role \"{}\"",
         bootstrap_user
     );
+    prepare_owners(database, bootstrap_user).await;
     Ok(())
+}
+
+/// The role that owns `database`: its first superuser by name, or
+/// `fallback` (the bootstrap role) when it has none.
+pub async fn database_owner(database: &rclite::Arc<crate::core::database::Database>, fallback: &str) -> String {
+    let mut superusers: Vec<String> = all_roles(database).await.into_iter().filter(|r| r.is_superuser).map(|r| r.name).collect();
+    superusers.sort();
+    if superusers.iter().any(|n| n == fallback) {
+        return fallback.to_string();
+    }
+    superusers.into_iter().next().unwrap_or_else(|| fallback.to_string())
+}
+
+/// Every role `database` holds; empty without a catalogue.
+pub async fn all_roles(database: &rclite::Arc<crate::core::database::Database>) -> Vec<Role> {
+    use crate::core::rql::{executor, lexer_s1::recognize_query_purpose};
+    if !database.has_table(ROLE_TABLE) {
+        return Vec::new();
+    }
+    let sql = format!("SELECT name, password, can_login, is_superuser FROM {}", ROLE_TABLE);
+    let Some(purpose) = recognize_query_purpose(&sql) else {
+        return Vec::new();
+    };
+    let response = executor::execute_as(crate::core::mvcc::owner::OwnerKind::Auth, purpose, database.clone()).await;
+    if response.first() != Some(&2) {
+        return Vec::new();
+    }
+    let Ok(rows) = crate::core::row::row::vec_into_rows(&response[1..]) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| {
+            let text = |index: usize| -> Option<String> {
+                let column = row.columns.get(index)?;
+                if column.column_type == crate::core::db_type::DbType::NULL {
+                    return None;
+                }
+                std::str::from_utf8(column.data.into_slice()).ok().map(str::to_string)
+            };
+            let flag = |index: usize| row.columns.get(index).is_some_and(|c| c.data.into_slice().first().copied().unwrap_or(0) != 0);
+            Some(Role {
+                name: text(0)?,
+                verifier: text(1).map(|stored| Verifier::parse(&stored)),
+                can_login: flag(2),
+                is_superuser: flag(3),
+            })
+        })
+        .collect()
+}
+
+/// Gives `database`'s relations without an owner its owner
+/// (`privileges::assign_owners`). The rows are keyed by relation, grantee and
+/// privilege, so two nodes that each run this write the same rows. A failure
+/// is logged, not a reason not to start: the relations stay unowned, which
+/// refuses every role but a superuser (fails closed).
+pub async fn prepare_owners(database: &rclite::Arc<crate::core::database::Database>, bootstrap_user: &str) {
+    let owner = database_owner(database, bootstrap_user).await;
+    if let Err(e) = crate::core::rql::privileges::assign_owners(database, &owner).await {
+        log::warn!(
+            "Database \"{}\": its relations could not be given an owner ({e}); until they are, only a superuser \
+             can use one that has none",
+            database.name
+        );
+    }
 }
 
 /// Looks a role up by name, or `None` when there is none.

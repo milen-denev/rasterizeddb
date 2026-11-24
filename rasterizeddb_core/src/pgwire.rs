@@ -1132,6 +1132,9 @@ fn field_of<'a>(
 
 async fn seed_roles(database: &Arc<Database>, auth: &AuthConfig) -> Result<(), String> {
     if auth.method == crate::auth::AuthMethod::Trust {
+        // No catalogue is made under trust, but the relations still get
+        // their owner: a role created later is checked against them.
+        crate::auth::prepare_owners(database, &auth.bootstrap_user).await;
         return Ok(());
     }
     crate::auth::ensure_role_catalogue(

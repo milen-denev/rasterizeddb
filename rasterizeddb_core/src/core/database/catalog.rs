@@ -613,6 +613,14 @@ impl DatabaseCatalog {
                 );
             }
         }
+        // Made now, so every relation it gets is owned as it is made: it
+        // needs none of the upgrade a database from before owners gets
+        // (`privileges::assign_owners`), which would grant its relations to
+        // PUBLIC.
+        let owner = crate::auth::database_owner(&database, "").await;
+        if let Err(e) = crate::core::rql::privileges::mark_current(&database, &owner).await {
+            log::warn!("Database \"{}\" was created but could not be marked as having owners: {}", name, e);
+        }
 
         self.databases
             .insert(name.to_string(), Entry::new(database.clone()));
