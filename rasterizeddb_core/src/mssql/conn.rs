@@ -41,17 +41,27 @@ const VERSION_TEXT: &str =
 
 /// SQL Server's system databases are the default database here: a client
 /// connects to `master` to create or drop its own.
-fn resolve_database<'a>(shared: &'a Shared, name: &'a str) -> &'a str {
+fn resolve_database(shared: &Shared, name: &str) -> String {
     if name.is_empty()
         || matches!(
             name.to_ascii_lowercase().as_str(),
             "master" | "model" | "msdb" | "tempdb"
         )
     {
-        shared.catalog.default_name()
-    } else {
-        name
+        return shared.catalog.default_name().to_string();
     }
+    // SQL Server compares database names without case, and `CREATE DATABASE
+    // [DenevColors]` made `denevcolors`: a login naming `DenevColors` must
+    // open it.
+    if shared.catalog.get(name).is_some() {
+        return name.to_string();
+    }
+    shared
+        .catalog
+        .names()
+        .into_iter()
+        .find(|n| n.eq_ignore_ascii_case(name))
+        .unwrap_or_else(|| name.to_string())
 }
 
 /// What a statement leaves the batch doing.
@@ -197,6 +207,17 @@ struct Session {
     fmtonly: bool,
     /// The table an `INSERT BULK` named, which the next bulk load fills.
     bulk_target: Option<String>,
+    /// This connection, as the owner of its `sp_getapplock` locks.
+    conn_id: u64,
+    /// The database the login named, as it named it: a pooled connection's
+    /// reset goes back to it, as SQL Server's does after a `USE`.
+    login_shown: String,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        super::applock::release_all(self.conn_id, None);
+    }
 }
 
 pub(crate) async fn serve_connection(
@@ -230,6 +251,7 @@ pub(crate) async fn serve_connection(
     } else {
         login_packet.database.clone()
     };
+    let conn_id = crate::sqlcompat::next_connection_id();
     let mut session = Session {
         wire,
         shared: shared.clone(),
@@ -264,12 +286,11 @@ pub(crate) async fn serve_connection(
         session_temps: Vec::new(),
         routine_cache: None,
         rpc_outputs: Vec::new(),
-        temp_prefix: crate::sqlcompat::temp_table_prefix(
-            "tds",
-            crate::sqlcompat::next_connection_id(),
-        ),
+        temp_prefix: crate::sqlcompat::temp_table_prefix("tds", conn_id),
         fmtonly: false,
         bulk_target: None,
+        conn_id,
+        login_shown: shown.clone(),
     };
     let packet_size = match login_packet.packet_size {
         0 => tds::DEFAULT_PACKET,
@@ -518,6 +539,9 @@ struct Scope<'a> {
 }
 
 impl Env for Scope<'_> {
+    fn case_insensitive(&self) -> bool {
+        self.s.shared.config.case_insensitive
+    }
     fn database(&self) -> &Arc<Database> {
         &self.s.bridge.as_ref().unwrap().database
     }
@@ -811,6 +835,10 @@ impl Session {
                     self.final_done();
                 }
             }
+            // A transaction's application locks go with it.
+            if self.trancount == 0 && !self.bridge().in_block() {
+                super::applock::release_all(self.conn_id, Some(super::applock::Owner::Transaction));
+            }
             self.wire.send(tds::PT_REPLY).await?;
             // An attention sent while the request ran is answered after it.
             if self.wire.attention_buffered() {
@@ -846,6 +874,15 @@ impl Session {
         self.error_number = 0;
         if !self.bridge().in_block() {
             let _ = self.silent("RESET ALL").await;
+            let login_db = resolve_database(&self.shared, &self.login_shown);
+            let old = self.bridge().database_name.clone();
+            if old != login_db && self.shared.catalog.get(&login_db).is_some() {
+                self.prepared.clear();
+                if self.open(&login_db).await.is_ok() {
+                    let shown = self.login_shown.clone();
+                    tds::env_change_text(self.wire.reply(), 1, &shown, &old);
+                }
+            }
         }
     }
 
@@ -2429,11 +2466,12 @@ impl Session {
                     .and_then(|v| v.text())
                     .unwrap_or_default()
                     .to_ascii_uppercase();
-                let parts: Vec<String> = old
-                    .split('.')
-                    .map(|p| p.trim_matches(['[', ']']).to_lowercase())
+                let parts: Vec<String> = lex::name_parts(&old)
+                    .into_iter()
+                    .map(|p| p.to_lowercase())
                     .filter(|p| p != "dbo")
                     .collect();
+                let new = lex::encode_dots(new.trim_matches(['[', ']']).to_string());
                 let sql = if kind == "COLUMN" && parts.len() >= 2 {
                     format!(
                         "ALTER TABLE {} RENAME COLUMN {} TO {}",
@@ -2441,8 +2479,16 @@ impl Session {
                         ident_sql(&parts[parts.len() - 1]),
                         ident_sql(&new.to_lowercase())
                     )
+                } else if kind == "INDEX" && parts.len() >= 2 {
+                    // Index names are stored per table (`<table>__<name>`).
+                    let table = &parts[parts.len() - 2];
+                    format!(
+                        "ALTER INDEX {} RENAME TO {}",
+                        ident_sql(&crate::sqlcompat::index_name(table, &parts[parts.len() - 1])),
+                        ident_sql(&crate::sqlcompat::index_name(table, &new))
+                    )
                 } else if kind == "INDEX" {
-                    return Err(TsqlError::unsupported("sp_rename of an index"));
+                    return Err(TsqlError::syntax("sp_rename of an index needs N'table.index'"));
                 } else {
                     format!(
                         "ALTER TABLE {} RENAME TO {}",
@@ -2465,6 +2511,76 @@ impl Session {
                     })
                     .unwrap_or_default();
                 self.table_collations(&table).await
+            }
+            "sp_getapplock" | "sp_releaseapplock" | "applock_test" => {
+                let arg = |n: &str, at: usize| -> Option<String> {
+                    named
+                        .iter()
+                        .find(|(k, _)| k.as_deref() == Some(n))
+                        .map(|(_, v)| v)
+                        .or_else(|| values.get(at))
+                        .and_then(|v| v.text())
+                };
+                let releasing = name == "sp_releaseapplock";
+                let resource = arg("resource", 0).ok_or_else(|| {
+                    TsqlError::new(201, &format!("Procedure or function '{name}' expects parameter '@Resource', which was not supplied."))
+                })?;
+                let (mode_at, owner_at) = if releasing { (usize::MAX, 1) } else { (1, 2) };
+                let mode = arg("lockmode", mode_at).unwrap_or_default().to_ascii_lowercase();
+                if !releasing && mode.is_empty() {
+                    return Err(TsqlError::new(201, &format!("Procedure or function '{name}' expects parameter '@LockMode', which was not supplied.")));
+                }
+                let owner = match arg("lockowner", owner_at)
+                    .unwrap_or_else(|| "Transaction".into())
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "session" => super::applock::Owner::Session,
+                    "transaction" => super::applock::Owner::Transaction,
+                    other => {
+                        return Err(TsqlError::new(
+                            1222,
+                            &format!("The parameter @LockOwner '{other}' is not valid."),
+                        ));
+                    }
+                };
+                if owner == super::applock::Owner::Transaction
+                    && self.trancount == 0
+                    && !self.bridge().in_block()
+                {
+                    return Err(TsqlError::new(
+                        1223,
+                        &format!(
+                            "Cannot {} the application lock (Database Principal: 'public', Resource: '{resource}') because there is not a current transaction.",
+                            if releasing { "release" } else { "acquire" }
+                        ),
+                    ));
+                }
+                let db = Arc::as_ptr(&self.bridge().database) as usize;
+                let status = if name == "applock_test" {
+                    i32::from(!super::applock::holds(db, &resource, self.conn_id))
+                } else if releasing {
+                    let r = super::applock::release(db, &resource, self.conn_id, owner);
+                    if r < 0 {
+                        return Err(TsqlError::new(
+                            1223,
+                            &format!("Cannot release the application lock (Database Principal: 'public', Resource: '{resource}') because it is not currently held."),
+                        ));
+                    }
+                    r
+                } else {
+                    let timeout = arg("locktimeout", 3)
+                        .and_then(|t| t.trim().parse::<i64>().ok())
+                        .filter(|t| *t >= 0)
+                        .map(|t| std::time::Duration::from_millis(t as u64));
+                    let shared = matches!(mode.as_str(), "shared" | "intentshared");
+                    super::applock::get(db, &resource, self.conn_id, owner, shared, timeout).await
+                };
+                if let Some(var) = status_var {
+                    self.assign(&var, Value::Int(status as i64))?;
+                }
+                self.statement_done(0, 0, 0);
+                Ok(Flow::Next)
             }
             "sp_reset_connection" | "sp_set_session_context" | "sp_setapprole" => {
                 self.statement_done(0, 0, 0);

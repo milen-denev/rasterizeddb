@@ -1693,6 +1693,18 @@ pub fn respell_qualifier(text: &str, from: &str, to: &str) -> String {
     out
 }
 
+/// A relation or column name as written (`t`, `"T"`, `public."a.b"`), as the
+/// name it stands for: the last segment outside double quotes, unquoted,
+/// its doubled quotes one. Dots inside quotes are the name's own: SQL
+/// Server's `[DenevCloud.ERP.Colors]` is one table.
+pub fn bare_name(raw: &str) -> String {
+    let last = last_name_segment(raw.trim()).trim();
+    match last.strip_prefix('"').and_then(|l| l.strip_suffix('"')) {
+        Some(inner) => inner.replace("\"\"", "\""),
+        None => last.to_string(),
+    }
+}
+
 /// The last segment of a possibly schema-qualified name as written
 /// (`public.t` → `t`, `"public"."T"` → `"T"`, `"a.b"` → `"a.b"`): dots inside
 /// double quotes do not split it. Quotes are kept for the caller to trim.

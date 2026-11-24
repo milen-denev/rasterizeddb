@@ -69,6 +69,9 @@ fn start() -> Servers {
                     bootstrap_user: "rasterized".into(),
                     bootstrap_password: Some(PASSWORD.into()),
                     limits: ConnectionLimits::default(),
+                    // These tests pin the byte-compared answers they were
+                    // written against.
+                    case_insensitive: false,
                 };
                 let listener = rasterizeddb_core::mssql::bind(config).await.unwrap();
                 let port = listener.local_addr().unwrap().port();

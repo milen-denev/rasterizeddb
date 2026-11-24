@@ -192,6 +192,7 @@ A MySQL "database" and a SQL Server database are the engine's databases;
 | `--mysql-auth`, `--mssql-auth` | `password` | `password` or `trust` |
 | `--mysql-socket-auth`, `--mssql-socket-auth` | the TCP method | Authentication on the socket |
 | `--mysql-tls`, `--mssql-tls` | `prefer` | `disable`, `prefer` or `require` |
+| `--mssql-collation` | `ci` | Text columns made over the SQL Server protocol: `ci` case-insensitive (SQL Server's default), `bin` by their bytes |
 | `--mysql-cert`/`--mysql-key`, `--mssql-cert`/`--mssql-key` | `--pg-cert`/`--pg-key`, else self-signed | TLS certificate |
 
 Logins are checked against the role catalogue the PostgreSQL listener uses

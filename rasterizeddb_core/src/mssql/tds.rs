@@ -1014,7 +1014,8 @@ pub(crate) fn col_metadata(out: &mut Vec<u8>, columns: &[Column]) {
         out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(&0x0009u16.to_le_bytes());
         type_info(out, &c.ty);
-        put_b_varchar(out, &c.name);
+        // A bracketed alias keeps its dots (`lex::NAME_DOT`).
+        put_b_varchar(out, &super::lex::decode_dots(&c.name));
     }
 }
 

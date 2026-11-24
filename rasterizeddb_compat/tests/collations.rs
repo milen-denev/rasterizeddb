@@ -174,9 +174,10 @@ async fn a_primary_key_follows_the_collation() {
     assert_eq!(v, vec![99]);
 }
 
-/// ORDER BY sorts by the collation; what would compare by the bytes is refused.
+/// ORDER BY, grouping, DISTINCT, min/max and joins follow the collation;
+/// what still would compare by the bytes is refused.
 #[tokio::test(flavor = "multi_thread")]
-async fn sorting_follows_the_collation_and_grouping_is_refused() {
+async fn sorting_grouping_and_joins_follow_the_collation() {
     let (_server, pool) = server().await;
     exec(&pool, "INSERT INTO people (id, name) VALUES (5, 'alice'), (6, 'Charlie'), (7, 'bobby')").await;
     let names: Vec<String> = sqlx::query_scalar("SELECT name FROM people ORDER BY name").fetch_all(&pool).await.unwrap();
@@ -184,14 +185,34 @@ async fn sorting_follows_the_collation_and_grouping_is_refused() {
     let names: Vec<String> =
         sqlx::query_scalar("SELECT name FROM people WHERE id > 1 ORDER BY name DESC LIMIT 2").fetch_all(&pool).await.unwrap();
     assert_eq!(names, ["Ännchen", "ZOE"]);
+    // 'Café' and 'cafe' are one group under rdb_ci_ai; it shows its least
+    // spelling.
+    let groups: Vec<(Option<String>, i64)> =
+        sqlx::query_as("SELECT place, count(*) FROM people GROUP BY place ORDER BY place").fetch_all(&pool).await.unwrap();
+    assert_eq!(groups, vec![(Some("Café".into()), 2), (Some("Zürich".into()), 1), (None, 4)]);
+    let places: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT DISTINCT place FROM people ORDER BY place").fetch_all(&pool).await.unwrap();
+    assert_eq!(places, vec![Some("Café".into()), Some("Zürich".into()), None]);
+    let (lo, hi, n): (String, String, i64) =
+        sqlx::query_as("SELECT min(name), max(name), count(DISTINCT place) FROM people").fetch_one(&pool).await.unwrap();
+    assert_eq!((lo.as_str(), hi.as_str(), n), ("alice", "Ännchen", 2));
+    assert_eq!(ids(&pool, "SELECT p.id FROM people p JOIN people q ON p.id = q.id WHERE p.name = 'bob'").await, vec![1]);
+    assert_eq!(ids(&pool, "SELECT p.id FROM people p JOIN people q ON p.place = q.place WHERE p.id <> q.id ORDER BY p.id").await, vec![1, 3]);
+    let ranks: Vec<(i32, i64)> = sqlx::query_as(
+        "SELECT id, row_number() OVER (PARTITION BY place ORDER BY name DESC) FROM people WHERE place IS NOT NULL ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ranks, vec![(1, 2), (2, 1), (3, 1)]);
+    let having: Vec<String> =
+        sqlx::query_scalar("SELECT place FROM people GROUP BY place HAVING place = 'CAFE'").fetch_all(&pool).await.unwrap();
+    assert_eq!(having, ["Café"]);
     for sql in [
-        "SELECT name, count(*) FROM people GROUP BY name",
-        "SELECT DISTINCT name FROM people",
-        "SELECT DISTINCT * FROM people",
-        "SELECT min(name) FROM people",
-        "SELECT count(DISTINCT name) FROM people",
         "SELECT name FROM people UNION SELECT note FROM people",
-        "SELECT p.id FROM people p JOIN people q ON p.id = q.id WHERE p.name = 'bob'",
+        "SELECT DISTINCT place, upper(note) FROM people",
+        "SELECT id, min(name) OVER () FROM people",
+        "SELECT place FROM people GROUP BY place HAVING max(name) = 'BOB'",
     ] {
         assert_eq!(code(&pool, sql).await, "0A000", "{sql}");
     }
@@ -203,9 +224,44 @@ async fn sorting_follows_the_collation_and_grouping_is_refused() {
         .await
         .unwrap();
     assert_eq!(n, 14);
-    let rows: Vec<(i32, String)> =
-        sqlx::query_as("SELECT p.id, q.name FROM people p JOIN people q ON p.id = q.id WHERE p.id = 2").fetch_all(&pool).await.unwrap();
-    assert_eq!(rows, vec![(2, "ann".to_string())]);
+}
+
+/// Keys between case-insensitive columns: a child finds its parent under
+/// the collation, as SQL Server's CI keys do; keys and columns added by
+/// ALTER follow it too.
+#[tokio::test(flavor = "multi_thread")]
+async fn keys_and_added_columns_follow_the_collation() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    exec(&pool, "CREATE TABLE users (id text COLLATE rdb_ci PRIMARY KEY, n int)").await;
+    exec(&pool, "CREATE TABLE roles (uid text COLLATE rdb_ci NOT NULL REFERENCES users (id) ON DELETE CASCADE, r text)").await;
+    exec(&pool, "INSERT INTO users VALUES ('ABC', 1), ('def', 2)").await;
+    exec(&pool, "INSERT INTO roles VALUES ('abc', 'admin'), ('DEF', 'user')").await;
+    assert_eq!(code(&pool, "INSERT INTO roles VALUES ('nope', 'x')").await, "23503");
+    exec(&pool, "DELETE FROM users WHERE id = 'aBc'").await;
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM roles").fetch_one(&pool).await.unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(
+        code(&pool, "CREATE TABLE bad (uid text COLLATE rdb_ci REFERENCES users (id) ON DELETE SET NULL)").await,
+        "0A000"
+    );
+    exec(&pool, "CREATE TABLE notes (id int PRIMARY KEY, uid text COLLATE rdb_ci)").await;
+    exec(&pool, "ALTER TABLE notes ADD CONSTRAINT notes_user FOREIGN KEY (uid) REFERENCES users (id)").await;
+    exec(&pool, "INSERT INTO notes VALUES (1, 'DEF')").await;
+    assert_eq!(code(&pool, "INSERT INTO notes VALUES (2, 'zzz')").await, "23503");
+    // An added column: the rows there get their keys; UNIQUE is on the key.
+    exec(&pool, "ALTER TABLE notes ADD COLUMN tag text COLLATE rdb_ci UNIQUE").await;
+    exec(&pool, "UPDATE notes SET tag = 'Red' WHERE id = 1").await;
+    exec(&pool, "INSERT INTO notes VALUES (3, 'def', 'blue')").await;
+    assert_eq!(code(&pool, "INSERT INTO notes VALUES (4, 'def', 'RED')").await, "23505");
+    assert_eq!(ids(&pool, "SELECT id FROM notes WHERE tag = 'red'").await, vec![1]);
+    exec(&pool, "ALTER TABLE notes ALTER COLUMN tag TYPE varchar(40)").await;
+    assert_eq!(ids(&pool, "SELECT id FROM notes WHERE tag IN (SELECT upper(r) FROM roles) OR tag = 'BLUE' ORDER BY id").await, vec![3]);
+    exec(&pool, "CREATE UNIQUE INDEX notes_uid ON notes (uid, id)").await;
+    exec(&pool, "CREATE TABLE codes (c text COLLATE rdb_ci)").await;
+    exec(&pool, "CREATE UNIQUE INDEX codes_c ON codes (c)").await;
+    exec(&pool, "INSERT INTO codes VALUES ('X1')").await;
+    assert_eq!(code(&pool, "INSERT INTO codes VALUES ('x1')").await, "23505");
 }
 
 /// The collation is the companion column and its generation record, both
