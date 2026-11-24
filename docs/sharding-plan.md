@@ -870,6 +870,55 @@ route key while its template is not single-shard (`FanOut`). The gateway's
   move time is promised.
 - **Size:** about 6–8k LOC.
 
+### 4.6b Auto-balancing (owner, 2026-11-24)
+
+The owner asked for automatic balancing between shards. It moves up from
+B6 to sit on B2's moves, and covers both sharding paths.
+
+**What is measured.** Each shard reports its load per partition range of
+every sharded table (`SHOW SHARD LOAD`): the range's level-0 blocks, its
+stored bytes and rows (the partition map's `STATS`), and its statement
+count since the last report. A range is the unit a move carries; a hot
+range wider than one block is split at a block boundary first (a carve,
+B2 step 1) so the next round can move half of it.
+
+**The planner** (`rasterizeddb_router::balance`, pure and dependency-free, so
+the authority, `rdb-shard` and tests share it):
+- A shard's load is `w_bytes × bytes + w_ops × ops`, normalised by the
+  cluster's totals.
+- Balanced when every shard is within `tolerance` (default 10%) of the
+  mean. Hysteresis: a round starts only past `tolerance`, and stops once
+  inside `tolerance / 2`, so ranges do not flap.
+- Greedy: move from the heaviest shard to the lightest the range that best
+  closes their gap without overshooting it; repeat while the caps allow.
+- Caps per round: `max_moves` (default 4) and `max_bytes` (default 64 GiB),
+  so a round is bounded in time and disk.
+- Never moves a range pinned by a placement policy (§4.10) or by an
+  operator (`PIN RANGE`), nor onto a shard marked `draining` or full.
+- A range bigger than the gap it could close is proposed for a split
+  instead.
+- Output: a list of moves `(blocks, from, to, bytes)` and splits; applying
+  them is `ShardMap::reassign` per move (one epoch each) plus the data copy.
+
+**Per-user shards (G11).** A pinned user is never split. New users are
+placed on the least-loaded shard (`balance::place`). Existing users move
+only when a shard is past `user_shard_max_load` (default 90% of the
+cluster mean × (1 + tolerance)), whole and drained first, as G11 moves are.
+
+**Who runs it.**
+- Track A, offline: `rdb-shard rebalance --plan` prints the round;
+  `--apply` runs each move with the offline range move (fence, copy,
+  verify, hand-off) one at a time.
+- Track B from B2: the authority runs a round every `balance_interval`
+  (default 10 min) when `auto_balance = on` (off by default), using the
+  B2 move procedure; from B4, online moves.
+- Either way a move that fails verification is rolled back and the
+  balancer pauses until an operator clears it.
+
+**Tests:** the planner converges and never violates a pin, on generated
+skewed clusters; moves lose and duplicate nothing (S7); a round under
+load keeps p99 within the move-rate gate.
+
 ### 4.7 Phase B3: per-shard Raft over row images (feature `sharding_raft`)
 
 The design's §9, with these concrete seams:
@@ -967,7 +1016,7 @@ The design's §9, with these concrete seams:
   - closed timestamps and consistent cross-shard snapshots;
   - follower and lease reads;
   - distributed deadlock detection;
-  - automatic rebalancing;
+  - online automatic rebalancing (the offline balancer is §4.6b);
   - clone splits.
 
 ### 4.9 The gateway (`rasterizeddb_gateway`)
