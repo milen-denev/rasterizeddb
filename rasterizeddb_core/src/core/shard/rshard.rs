@@ -305,7 +305,16 @@ async fn open_session(conn: &Conn, session: u64, database: &str, role: &str, par
     }
     drop(guard);
     let options = BridgeOptions {
-        login: ProxiedLogin { user: r.name.clone(), superuser: r.is_superuser, authenticated: true },
+        login: ProxiedLogin {
+            user: r.name.clone(),
+            superuser: r.is_superuser,
+            authenticated: true,
+            // Checked against this database's own role above: the session is
+            // in the database it was checked in.
+            database: database.to_string(),
+            verifier: r.verifier.as_ref().map(|v| v.to_stored()),
+            bootstrap_user: None,
+        },
         limits: crate::pgwire::ConnectionLimits::default(),
         watch: None,
         parameters: params.into_iter().collect(),
@@ -316,6 +325,7 @@ async fn open_session(conn: &Conn, session: u64, database: &str, role: &str, par
         Err(OpenRefused::NoDatabase) => return refuse(*b"3D000", true, format!("database \"{database}\" does not exist")),
         Err(OpenRefused::Loading) => return refuse(*b"57P03", true, format!("database \"{database}\" is being imported")),
         Err(OpenRefused::Io(e)) => return refuse(*b"08006", true, e.to_string()),
+        Err(OpenRefused::Denied(e)) => return refuse(*b"28000", true, e),
     };
     let backend_key = ((bridge.pid as u32 as u64) << 32) | bridge.key as u32 as u64;
     let previous = conn.sessions.lock().unwrap().insert(

@@ -473,10 +473,24 @@ async fn handshake(
         shared.config.auth
     };
     let login = match method {
-        MyAuth::Trust => ProxiedLogin {
-            user: user.clone(),
-            superuser: false,
-            authenticated: false,
+        // As the named role, with its attributes (`auth::trust_login`).
+        MyAuth::Trust => match crate::auth::trust_login(&db, &user, Some(&shared.config.bootstrap_user)).await {
+            Ok(superuser) => ProxiedLogin {
+                user: user.clone(),
+                superuser,
+                authenticated: false,
+                database: database.clone(),
+                verifier: None,
+                bootstrap_user: Some(shared.config.bootstrap_user.clone()),
+            },
+            Err(_) => {
+                refuse(
+                    io,
+                    MyError::new(1045, "28000", format!("Access denied for user '{user}' (using password: NO)")),
+                );
+                io.flush().await?;
+                return Ok(None);
+            }
         },
         MyAuth::Password => {
             match authenticate(io, &db, &user, &database, auth_response, &plugin, nonce).await? {
@@ -531,6 +545,9 @@ async fn authenticate(
         user: user.to_string(),
         superuser,
         authenticated: true,
+        database: database_name.to_string(),
+        verifier: verifier.as_ref().map(|v| v.to_stored()),
+        bootstrap_user: None,
     };
 
     // Fast path: a scramble against the cached hash.
@@ -585,6 +602,8 @@ async fn authenticate(
     if !may_login || !crate::auth::verify_password(&verifier, user, &password) {
         return Ok(None);
     }
+    // RD3: an md5 verifier's login is warned about.
+    crate::auth::warn_if_md5_login(Some(&verifier), user, database_name, "mysql");
     let h1 = sha256(&[password.as_bytes()]);
     let h2 = sha256(&[&h1]);
     fast_auth_cache().lock().insert(key, (fingerprint, h2));
@@ -698,6 +717,9 @@ impl Session {
         };
         match PgBridge::open(self.shared.catalog.clone(), database, options).await {
             Ok(bridge) => {
+                // What this database made of the login (its own role's
+                // attributes), for this front end's own checks.
+                self.login = bridge.login.clone();
                 if let Some(old) = self.bridge.replace(bridge) {
                     old.terminate().await;
                 }
@@ -733,6 +755,11 @@ impl Session {
                 format!(
                     "database '{database}' is being imported and is not ready for connections yet"
                 ),
+            )),
+            Err(OpenRefused::Denied(why)) => Err(MyError::new(
+                1044,
+                "42000",
+                format!("Access denied for user '{}' to database '{database}': {why}", self.user),
             )),
             Err(OpenRefused::Io(e)) => Err(MyError::new(1105, "HY000", e.to_string())),
         }
@@ -953,7 +980,7 @@ impl Session {
                 format!("Unknown thread id: {id}"),
             ));
         };
-        if target.user != self.user && self.login.authenticated && !self.login.superuser {
+        if target.user != self.user && !self.login.superuser {
             return Err(MyError::new(
                 1095,
                 "HY000",
@@ -984,8 +1011,24 @@ impl Session {
 
     /// Runs a statement whose answer is not the client's; its error, if any.
     async fn silent(&mut self, sql: &str) -> Result<String, PgNotice> {
+        self.silent_as(sql, false).await
+    }
+
+    /// [`Self::silent`] for this front end's own statement on its catalogue
+    /// (`__rdb_routines`, `__rdb_mysql_on_update`), which the session's
+    /// catalogue guard lets through (`PgBridge::system_query`). Never for a
+    /// client's text.
+    async fn silent_system(&mut self, sql: &str) -> Result<String, PgNotice> {
+        self.silent_as(sql, true).await
+    }
+
+    async fn silent_as(&mut self, sql: &str, system: bool) -> Result<String, PgNotice> {
         let b = self.bridge();
-        b.query(sql);
+        if system {
+            b.system_query(sql);
+        } else {
+            b.query(sql);
+        }
         let mut error = None;
         let mut tag = String::new();
         loop {
@@ -1032,7 +1075,7 @@ impl Session {
             let _ = self.silent("SAVEPOINT rdb_mysql_meta").await;
         }
         let read = self
-            .fetch(&format!(
+            .fetch_system(&format!(
                 "SELECT tbl, col FROM {}",
                 translate::ON_UPDATE_TABLE
             ))
@@ -1058,8 +1101,29 @@ impl Session {
         &mut self,
         sql: &str,
     ) -> Result<(Vec<PgField>, Vec<Vec<Option<String>>>), PgNotice> {
+        self.fetch_as(sql, false).await
+    }
+
+    /// [`Self::fetch`] for this front end's own read of its catalogue; see
+    /// [`Self::silent_system`].
+    async fn fetch_system(
+        &mut self,
+        sql: &str,
+    ) -> Result<(Vec<PgField>, Vec<Vec<Option<String>>>), PgNotice> {
+        self.fetch_as(sql, true).await
+    }
+
+    async fn fetch_as(
+        &mut self,
+        sql: &str,
+        system: bool,
+    ) -> Result<(Vec<PgField>, Vec<Vec<Option<String>>>), PgNotice> {
         let b = self.bridge();
-        b.query(sql);
+        if system {
+            b.system_query(sql);
+        } else {
+            b.query(sql);
+        }
         let mut error = None;
         let mut fields = Vec::new();
         let mut rows = Vec::new();
@@ -1302,6 +1366,16 @@ impl Session {
                     if failed {
                         break;
                     }
+                }
+            }
+        }
+        // The DDL's record in this front end's catalogue, once the DDL has
+        // run: the front end's own statements, past the session's guard.
+        if !forward.system.is_empty() && !matches!(last, Some(Outcome::Failed(_))) {
+            for sql in &forward.system {
+                if let Err(notice) = self.silent_system(sql).await {
+                    last = Some(Outcome::Failed(notice));
+                    break;
                 }
             }
         }
@@ -2391,7 +2465,7 @@ impl Session {
                 .await
             }
             Show::Grants => {
-                let grant = if !self.login.authenticated || self.login.superuser {
+                let grant = if self.login.superuser {
                     format!(
                         "GRANT ALL PRIVILEGES ON *.* TO `{}`@`%` WITH GRANT OPTION",
                         self.user
@@ -2504,6 +2578,15 @@ impl Session {
                     1049,
                     "42000",
                     format!("Unknown database '{database}'"),
+                ));
+            }
+            // Not admitted there: another database's roles are another
+            // set of accounts (`proxied::login_for`).
+            Err(OpenRefused::Denied(why)) => {
+                return Err(MyError::new(
+                    1044,
+                    "42000",
+                    format!("Access denied for user '{}' to database '{database}': {why}", self.user),
                 ));
             }
             Err(_) => {
@@ -3021,6 +3104,7 @@ impl Session {
                     found_rows: None,
                     params: prepared.params,
                     deferred: Vec::new(),
+                    system: Vec::new(),
                 };
                 self.forward(forward, false, Rows::Binary, Some((&name, params)))
                     .await?;
@@ -3595,7 +3679,7 @@ impl Session {
             crate::sqlcompat::string_sql(name.as_bytes())
         );
         let (_, rows) = self
-            .fetch(&sql)
+            .fetch_system(&sql)
             .await
             .map_err(|e| results::error_from_engine(&e))?;
         Ok(rows
@@ -3631,13 +3715,13 @@ impl Session {
                 .min(sql.len());
             let definition = String::from_utf8_lossy(&sql[start..end]).into_owned();
             if !self.has_routines() {
-                self.silent(super::routine::CREATE_ROUTINE_TABLE)
+                self.silent_system(super::routine::CREATE_ROUTINE_TABLE)
                     .await
                     .map_err(|e| results::error_from_engine(&e))?;
             }
             let lit = |s: &str| crate::sqlcompat::string_sql(s.as_bytes());
             let (_, rows) = self
-                .fetch(&format!(
+                .fetch_system(&format!(
                     "SELECT dialect FROM {} WHERE name = {}",
                     super::routine::ROUTINE_TABLE,
                     lit(&def.name)
@@ -3659,7 +3743,7 @@ impl Session {
                     format!("PROCEDURE {} already exists", def.name),
                 ));
             }
-            self.silent(&format!(
+            self.silent_system(&format!(
                 "INSERT INTO {} (name, dialect, definition) VALUES ({}, 'mysql', {})",
                 super::routine::ROUTINE_TABLE,
                 lit(&def.name),
@@ -3705,7 +3789,7 @@ impl Session {
                 return Ok(0);
             }
             let tag = self
-                .silent(&format!(
+                .silent_system(&format!(
                     "DELETE FROM {} WHERE name = {} AND dialect = 'mysql'",
                     super::routine::ROUTINE_TABLE,
                     crate::sqlcompat::string_sql(name.as_bytes())
@@ -3754,7 +3838,7 @@ impl Session {
         let mut names = Vec::new();
         if self.has_routines() {
             match self
-                .fetch(&format!(
+                .fetch_system(&format!(
                     "SELECT name FROM {} WHERE dialect = 'mysql' ORDER BY name",
                     super::routine::ROUTINE_TABLE
                 ))

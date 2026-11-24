@@ -1132,6 +1132,9 @@ fn field_of<'a>(
 
 async fn seed_roles(database: &Arc<Database>, auth: &AuthConfig) -> Result<(), String> {
     if auth.method == crate::auth::AuthMethod::Trust {
+        // No catalogue is made under trust, but the relations still get
+        // their owner: a role created later is checked against them.
+        crate::auth::prepare_owners(database, &auth.bootstrap_user).await;
         return Ok(());
     }
     crate::auth::ensure_role_catalogue(
@@ -1612,6 +1615,21 @@ tokio::task_local! {
 }
 
 tokio::task_local! {
+    /// Set for the life of a session another protocol's front end opened
+    /// over the in-process pipe (`proxied::serve_proxied`): the one kind of
+    /// session that accepts [`SYSTEM_STATEMENT_TAG`]. A client of the
+    /// PostgreSQL listener can write any message type, so the announcement
+    /// means nothing on its connection.
+    pub(super) static PROXIED_SESSION: ();
+}
+
+/// A frontend message no PostgreSQL client sends: from a front end over its
+/// in-process pipe, it says the `Query` that follows is the front end's own
+/// statement on its catalogue (`__rdb_routines`, `__rdb_mysql_on_update`),
+/// which the catalogue guard then lets through. Its body is empty.
+pub(crate) const SYSTEM_STATEMENT_TAG: u8 = b'!';
+
+tokio::task_local! {
     /// The SELECT whose `RowDescription` is being sent, and its database:
     /// where [`send_row_description`] reads each column's table, number,
     /// type and modifier (`catalog_model::column_origins`). Every column was
@@ -1629,6 +1647,16 @@ async fn describing<F: std::future::Future>(database: &Arc<Database>, sql: &str,
     } else {
         fut.await
     }
+}
+
+/// The catalogue guard (`privileges::catalog_refusal`) for a statement of
+/// this session: `None` for the engine's own sessions and a front end's
+/// announced catalogue statements, which alone may reach the catalogues.
+fn catalogue_guard(state: &SessionState, stmt: &str) -> Option<(&'static str, String)> {
+    if state.system_catalog || state.system_statement {
+        return None;
+    }
+    crate::core::rql::privileges::catalog_refusal(stmt)
 }
 
 /// Runs `fut`, a statement run for another, outside the reply hold.
@@ -2170,9 +2198,11 @@ where
     let principal = match authenticate(database, stream, parameters, auth, context.peer_uid).await {
         Ok(principal) => {
             log::debug!(
-                "authenticated {} via {}",
+                "authenticated {} via {}{}{}",
                 principal.name,
-                auth.method.name()
+                auth.method.name(),
+                if principal.authenticated { "" } else { " (no credential proven)" },
+                if principal.superuser { ", superuser" } else { "" }
             );
             principal
         }
@@ -2193,7 +2223,10 @@ where
         }
         Err(e) => {
             log::info!("authentication refused: {}", e);
-            send_fatal_error_response(stream, "28P01", &e.to_string()).await?;
+            // A `trust` login of a role that cannot log in (no such role,
+            // NOLOGIN) is no wrong password: PostgreSQL's 28000.
+            let code = if e.kind() == io::ErrorKind::NotFound { "28000" } else { "28P01" };
+            send_fatal_error_response(stream, code, &e.to_string()).await?;
             return Ok(());
         }
     };
@@ -2385,10 +2418,10 @@ fn startup_setting<T>(
 ///
 /// `superuser` is a snapshot of the role at login, as PostgreSQL's is for the
 /// life of a session. Under `trust` nobody proves anything, so the name is
-/// whatever the client sent and `authenticated` is false — the native listener
-/// draws the same line in [`crate::core::database::NativeContext`]: a gate
-/// applied to an anonymous principal would refuse the statement that creates
-/// the first account.
+/// whatever the client sent and `authenticated` is false; `superuser` is then
+/// what that role is (`auth::trust_login`), true only for a superuser role,
+/// the bootstrap role, or any name while the database has no roles at all
+/// (so the first account can be created).
 #[derive(Clone, Debug)]
 struct Principal {
     name: String,
@@ -2398,9 +2431,11 @@ struct Principal {
 }
 
 impl Principal {
-    /// Whether this session may run a server-administration statement.
+    /// Whether this session may run a server-administration statement: a
+    /// superuser's alone. Not having authenticated is no longer one: under
+    /// `trust` every session was an administrator.
     fn may_administer(&self) -> bool {
-        !self.authenticated || self.superuser
+        self.superuser
     }
 }
 
@@ -2437,7 +2472,12 @@ pub(crate) fn privileged_statement(stmt: &str) -> Option<&'static str> {
         // rows of the branch, its base and its parent — databases whose
         // accounts this session may not hold — and names their keys.
         ("SHOW", "BRANCH") => Some("SHOW BRANCH DIFF"),
-        ("IMPORT", "DATABASE") => Some("IMPORT DATABASE"),
+        // Every statement the importer takes, by its own predicate
+        // (`migrate::sql::is_import_statement`: the first word is IMPORT),
+        // `DATABASE` being optional to it. Gated on the two words, `IMPORT
+        // FROM POSTGRES …` ran for any role: a database made, and the server
+        // made to connect wherever the statement said.
+        ("IMPORT", _) => Some("IMPORT DATABASE"),
         ("SET", "CONFIG") => Some("SET CONFIG"),
         ("SET", "FILTER") | ("RESET", "FILTER") => Some("SET FILTER"),
         // Reading what ran is not administration, and `SHOW QUERIES` is
@@ -2697,9 +2737,14 @@ where
         // is dropped without a reply.
         ready = match tag[0] {
             b'Q' | b'S' => true,
-            b'P' | b'B' | b'D' | b'E' | b'C' | b'H' => false,
+            b'P' | b'B' | b'D' | b'E' | b'C' | b'H' | SYSTEM_STATEMENT_TAG => false,
             _ => !state.error_in_batch,
         };
+        // The announcement covers the very next message only, and only a
+        // `Query`: anything else between the two cancels it.
+        if tag[0] != b'Q' && tag[0] != SYSTEM_STATEMENT_TAG {
+            state.system_next = false;
+        }
 
         // An error opens a discard window that only `Sync` closes.
         //
@@ -2722,7 +2767,10 @@ where
                 state.error_in_batch = false;
                 state.message_us = crate::core::statement_clock::wall_us();
                 let query = read_cstring(&payload);
-                handle_simple_query(database, state, stream, query).await?;
+                state.system_statement = std::mem::take(&mut state.system_next);
+                let handled = handle_simple_query(database, state, stream, query).await;
+                state.system_statement = false;
+                handled?;
                 state.copy_in_ran = false;
                 // And it closes its own window: it has already answered with
                 // `ReadyForQuery`. A failure inside it (`fail_statement` sets
@@ -2802,6 +2850,11 @@ where
                 stream.flush().await?;
             }
             b'X' => return Ok(()),
+            // A front end's catalogue statement follows (see the tag). No
+            // reply: the `Query` answers for both.
+            SYSTEM_STATEMENT_TAG if PROXIED_SESSION.try_with(|_| ()).is_ok() && payload.is_empty() => {
+                state.system_next = true;
+            }
             _ => {
                 send_error_response(
                     stream,
@@ -2997,6 +3050,20 @@ struct SessionState {
     /// materialized view's table DDL, a rename's): the view guards on table
     /// DDL let it through (`rql::views`).
     view_internal: bool,
+    /// A session of the engine's own (a branch merge's [`branch_merge`]
+    /// side): the catalogue guard lets its statements reach the `__rdb_*`
+    /// catalogues and `rdb_roles` (`privileges::catalog_refusal`). Never set
+    /// for a session a client opened; `view_internal` is not this, since a
+    /// trigger's body and a view's query run under that one.
+    system_catalog: bool,
+    /// The statements of the simple query being run were sent by a front
+    /// end (MySQL, SQL Server) for its own catalogue, announced by a
+    /// [`SYSTEM_STATEMENT_TAG`] message just before it: the catalogue guard
+    /// lets them through. Only a proxied session ([`PROXIED_SESSION`])
+    /// accepts the announcement, so no client can send it.
+    system_statement: bool,
+    /// The announcement arrived and the next message is a `Query`.
+    system_next: bool,
     /// The materialized view a `REFRESH` is filling: the one write to a
     /// materialized view expansion lets through.
     refreshing_materialized: Option<String>,
@@ -3427,6 +3494,9 @@ impl SessionState {
             message_us: crate::core::statement_clock::wall_us(),
             statement_error: None,
             view_internal: false,
+            system_catalog: false,
+            system_statement: false,
+            system_next: false,
             refreshing_materialized: None,
             sequence_values: StdArc::default(),
             triggers_suppressed: Vec::new(),
@@ -6534,6 +6604,7 @@ where
         DatabaseStatement::Create {
             name,
             if_not_exists,
+            owner,
         } => {
             if if_not_exists && state.catalog.get(&name).is_some() {
                 // PostgreSQL has no `IF NOT EXISTS` here, but every migration
@@ -6541,7 +6612,26 @@ where
                 // does beats failing a script that is already idempotent.
                 return send_command_complete(stream, "CREATE DATABASE").await;
             }
-            match state.catalog.create(&name).await {
+            // RD1: the new database starts with the creating role and its
+            // `OWNER`, from this session's database, not with every account
+            // and verifier of the default database
+            // (`roles.create_database_roles = owner`; `all` keeps that).
+            let session_db = state.catalog.get(&state.database_name);
+            if let (Some(owner), Some(db)) = (&owner, &session_db)
+                && db.has_table(crate::auth::ROLE_TABLE)
+                && crate::auth::lookup_role(db, owner).await.is_none()
+            {
+                return fail_statement(state, stream, "42704", &format!("role \"{owner}\" does not exist")).await;
+            }
+            let roles = match session_db {
+                Some(db) if crate::auth::create_database_roles() == "owner" => {
+                    let mut keep = vec![state.principal.name.clone()];
+                    keep.extend(owner.clone().filter(|o| *o != state.principal.name));
+                    Some((db, keep))
+                }
+                _ => None,
+            };
+            match state.catalog.create_with_roles(&name, roles).await {
                 Ok(database) => {
                     // Replicated when the default database is and its
                     // replication carries the catalogue: the catalogue starts
@@ -6863,6 +6953,11 @@ where
     // What an error's position counts in (`error_position`).
     state.error_text.clear();
     state.error_text.push_str(stmt);
+    // No client statement reaches the engine's catalogues, on any path a
+    // statement takes from here (a block's deferred DROP included).
+    if let Some((code, message)) = catalogue_guard(state, stmt) {
+        return fail_statement(state, stream, code, &message).await;
+    }
     // Counted as running until it returns, so the idle trimmer
     // (`idle_trim`) never walks the heap under a statement.
     let _running = crate::idle_trim::statement();
@@ -7487,8 +7582,11 @@ where
     // learned before the temporary table was made names the real one. Such a
     // statement runs as text, and nothing is learned or forgotten for it.
     let names_a_temporary = !state.temp_tables.is_empty() && temp_tables::rewrite(&state.temp_tables, query).is_some();
+    // Nor a statement naming a catalogue: the text path guards and masks
+    // it, and a learned parse would do neither.
+    let names_a_catalogue = crate::core::rql::privileges::may_name_catalog(query);
     let step = match watched_slot(state, database, &key, true) {
-        _ if names_a_temporary => WatchStep::Text,
+        _ if names_a_temporary || names_a_catalogue => WatchStep::Text,
         None => WatchStep::Text,
         Some((prepared, sql)) => watch_step(prepared, &sql, generation, &literals, &classes),
     };
@@ -8470,6 +8568,11 @@ async fn execute_single_statement_unscoped<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // A statement run for another (a trigger's body, a view's query, a
+    // `PREPARE`d text) is a client's text too, and meets the guard here.
+    if let Some((code, message)) = catalogue_guard(state, stmt) {
+        return fail_statement(state, stream, code, &message).await;
+    }
     // sqlx's query for where a result's columns come from, answered from the
     // tables with the record array it reads (`column_origins`), as written:
     // the passes below make its `VALUES` list a derived table.
@@ -8757,6 +8860,26 @@ where
         }
     } else {
         stmt
+    };
+    // Again on what the function bodies and views became: one made before
+    // the guard existed may read a catalogue. Then every read of
+    // `rdb_roles` left is given its masked projection, last, so nothing
+    // after this reads a verifier.
+    if let Some((code, message)) = catalogue_guard(state, stmt) {
+        return fail_statement(state, stream, code, &message).await;
+    }
+    let masked_roles;
+    let stmt = if state.system_catalog || state.system_statement {
+        stmt
+    } else {
+        match crate::core::rql::privileges::mask_role_catalog(stmt) {
+            Some(text) => {
+                crate::core::rql::prepared::note_rewritten();
+                masked_roles = text;
+                masked_roles.as_str()
+            }
+            None => stmt,
+        }
     };
     // A write to a table with triggers runs a row at a time
     // (`trigger_exec`).
@@ -9322,7 +9445,7 @@ where
                     .await
                 {
                     Ok(()) => send_command_complete(stream, tag).await?,
-                    Err(e) => fail_statement(state, stream, "42710", &e).await?,
+                    Err(e) => fail_statement(state, stream, crate::auth::role_statement_sqlstate(&e), &e).await?,
                 }
             }
         }
@@ -15365,10 +15488,16 @@ where
     let user = parameters.get("user").cloned().unwrap_or_default();
 
     if config.method == AuthMethod::Trust {
+        // As the named role, with its attributes; never an administrator by
+        // itself (`auth::trust_login`). Refused as PostgreSQL refuses a
+        // `trust` login of a role that does not exist (28000).
+        let superuser = crate::auth::trust_login(database, &user, Some(&config.bootstrap_user))
+            .await
+            .map_err(|message| io::Error::new(io::ErrorKind::NotFound, message))?;
         send_auth_ok(stream).await?;
         return Ok(Principal {
             name: user,
-            superuser: false,
+            superuser,
             authenticated: false,
         });
     }
@@ -15389,6 +15518,7 @@ where
         .unwrap_or(Verifier::Plain(String::new()));
     let may_login = role.as_ref().map(|r| r.can_login).unwrap_or(false);
     let superuser = role.as_ref().map(|r| r.is_superuser).unwrap_or(false);
+    let md5_verifier = matches!(verifier, Verifier::Md5 { .. });
 
     let denied = || {
         io::Error::new(
@@ -15483,6 +15613,11 @@ where
     }
 
     send_auth_ok(stream).await?;
+    // RD3: md5 is accepted where configured, and every such login is
+    // warned about, in the log and to the client.
+    if md5_verifier && crate::auth::warn_if_md5_login(role.as_ref().and_then(|r| r.verifier.as_ref()), &user, &database.name, "pgwire") {
+        send_notice(stream, "01000", &crate::auth::md5_login_warning(&user)).await?;
+    }
     Ok(Principal {
         name: user,
         superuser,
@@ -16741,7 +16876,7 @@ mod authorization_tests {
     }
 
     #[test]
-    fn only_a_proven_non_superuser_is_refused() {
+    fn only_a_superuser_administers() {
         let trusted = Principal {
             name: "anyone".into(),
             superuser: false,
@@ -16757,7 +16892,9 @@ mod authorization_tests {
             superuser: false,
             authenticated: true,
         };
-        assert!(trusted.may_administer(), "trust has no one to refuse");
+        // Under `trust` a session is what its role is (`auth::trust_login`
+        // sets `superuser`), never an administrator by having proved nothing.
+        assert!(!trusted.may_administer(), "trust is not administration");
         assert!(admin.may_administer());
         assert!(!user.may_administer());
     }
@@ -17269,7 +17406,8 @@ mod cross_dir_commit_order_tests {
         };
         let principal = Principal {
             name: "rasterized".to_string(),
-            superuser: false,
+            // `trust` on a database with no roles: the bootstrap session.
+            superuser: true,
             authenticated: false,
         };
         let mut state = SessionState::new(
@@ -17479,7 +17617,8 @@ mod index_store_wire_tests {
         };
         let principal = Principal {
             name: "rasterized".to_string(),
-            superuser: false,
+            // `trust` on a database with no roles: the bootstrap session.
+            superuser: true,
             authenticated: false,
         };
         // A real loopback socket: the shutdown ends a session through it.
@@ -17540,7 +17679,8 @@ mod index_store_wire_tests {
         };
         let principal = Principal {
             name: "rasterized".to_string(),
-            superuser: false,
+            // `trust` on a database with no roles: the bootstrap session.
+            superuser: true,
             authenticated: false,
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

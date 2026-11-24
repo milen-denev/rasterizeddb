@@ -6572,6 +6572,26 @@ async fn serve_native_request(
     process_native_request_for(context, principal, Some(session), request_vec, notices).await
 }
 
+/// Whether a native request's caller administers: an authenticated
+/// superuser, or on a listener that asks for no credential, what the
+/// caller's role makes it (`NativeSession::resolve_admin`,
+/// `auth::trust_login`). Not having to authenticate is no longer being an
+/// administrator. A caller without a connection session (the statement
+/// tests' embedding) keeps the listener's word.
+async fn native_admin(
+    context: &NativeContext,
+    principal: &rastcp::session::Principal,
+    session: Option<&crate::pgwire::NativeSession>,
+) -> bool {
+    if context.authentication_required {
+        return principal.superuser;
+    }
+    match session {
+        Some(session) => session.resolve_admin().await,
+        None => true,
+    }
+}
+
 /// One request with no connection session: transaction control is refused.
 /// What the statement tests drive the dispatch through.
 #[cfg(test)]
@@ -6703,7 +6723,7 @@ async fn process_native_request_for(
                 };
                 info!("Received {} from {}", verb, principal);
 
-                if context.authentication_required && !principal.superuser {
+                if !native_admin(&context, &principal, session).await {
                     return error_response(&format!(
                         "permission denied: {} is not a superuser",
                         principal
@@ -6737,9 +6757,8 @@ async fn process_native_request_for(
     // needs a superuser, as on pgwire (`pgwire::privileged_statement`). Only
     // the role statements above were gated here, so any authenticated user
     // could restore over the database or reconfigure the process.
-    if context.authentication_required
-        && !principal.superuser
-        && let Some(verb) = crate::pgwire::privileged_statement(&query)
+    if let Some(verb) = crate::pgwire::privileged_statement(&query)
+        && !native_admin(&context, &principal, session).await
     {
         return error_response(&format!("permission denied: {verb} requires superuser ({principal} is not one)"));
     }
@@ -6763,12 +6782,35 @@ async fn process_native_request_for(
     // through this between restarts, so a killed process loads its
     // snapshots instead of rebuilding every index.
     if let Some(name) = crate::pgwire::parse_index_checkpoint(&query) {
-        if context.authentication_required && !principal.superuser {
+        if !native_admin(&context, &principal, session).await {
             return error_response(&format!(
                 "permission denied: rdb_index_checkpoint requires superuser ({principal} is not one)"
             ));
         }
         return Box::pin(native_index_checkpoint(&context.database, name)).await;
+    }
+
+    // A statement naming one of the engine's catalogues (`rdb_roles`,
+    // `__rdb_*`): pgwire's path refuses it, or reads `rdb_roles` through its
+    // masked projection (`privileges::catalog_refusal`, `mask_role_catalog`).
+    // This path does neither, so it never runs one: any role read every
+    // verifier here and could write itself superuser.
+    if crate::core::rql::privileges::may_name_catalog(&query) {
+        if let Some((_, message)) = crate::core::rql::privileges::catalog_refusal(&query) {
+            return error_response(&message);
+        }
+        if crate::core::rql::privileges::mask_role_catalog(&query).is_some() {
+            return match session {
+                Some(session) => {
+                    let run = Box::pin(session.run_alone(&query));
+                    if notices { crate::pgwire::native_with_notices(run).await } else { run.await }
+                }
+                None => error_response(&format!(
+                    "permission denied: \"{}\" is read through a connection session, which this caller does not have",
+                    crate::auth::ROLE_TABLE
+                )),
+            };
+        }
     }
 
     // A correlated scalar subquery (`SELECT id, (SELECT count(*) FROM p

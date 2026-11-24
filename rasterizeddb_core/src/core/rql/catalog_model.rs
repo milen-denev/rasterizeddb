@@ -1086,10 +1086,15 @@ pub(crate) async fn build_model(
         .filter(|v| v.kind == crate::core::rql::views::ViewKind::Materialized)
         .map(|v| v.name.as_str())
         .collect();
+    // Not the role catalogue: a system catalogue, as `pg_authid` is to
+    // PostgreSQL, which no client statement may read whole
+    // (`privileges::catalog_refusal`). Listed here, `pg_dump` dumped it with
+    // a `COPY` that the guard refuses, and every dump failed.
     for name in gathered
         .tables
         .iter()
         .map(String::as_str)
+        .filter(|name| *name != crate::auth::ROLE_TABLE)
         .chain(materialized.iter().copied())
     {
         let Some(relation) = database.relation(name) else {

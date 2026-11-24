@@ -119,7 +119,8 @@ fn parses_branch_statements() {
         p("CREATE DATABASE dev TEMPLATE template0"),
         DatabaseStatement::Create {
             name: "dev".into(),
-            if_not_exists: false
+            if_not_exists: false,
+            owner: None
         }
     );
     // Not ours.
