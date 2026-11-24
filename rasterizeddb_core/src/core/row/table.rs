@@ -5137,6 +5137,48 @@ impl<S: StorageIO> Table<S> {
         Ok(())
     }
 
+    /// Waits until this table's indexes are ready to answer exact lookups,
+    /// or `timeout` passes (sharding-plan.md B0.6).
+    ///
+    /// Covers both ways indexes become ready: a snapshot load (the gate's
+    /// load barrier) and a rebuild from the rows, which has no barrier and is
+    /// polled. A shard's apply loop and a move address rows by primary key,
+    /// so they call this first and fail on its `Err` rather than fall back to
+    /// a scan that would silently cost a full read per row. A table with no
+    /// indexes has nothing to wait for.
+    // Its callers (a shard's apply loop, a move) arrive with B1a and B2.
+    #[allow(dead_code)]
+    pub(crate) async fn wait_indexes_ready(&self, timeout: std::time::Duration) -> Result<()> {
+        let d = self.data()?;
+        let Some(indexes) = d.indexes.as_ref() else {
+            return Ok(());
+        };
+        let start = std::time::Instant::now();
+        let mut pause = std::time::Duration::from_millis(1);
+        loop {
+            if indexes.is_ready() {
+                return Ok(());
+            }
+            let left = timeout.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "the indexes of '{}' were not ready within {} ms",
+                        self.schema.name,
+                        timeout.as_millis()
+                    ),
+                ));
+            }
+            if self.gate.loads().loading() {
+                self.gate.loads().settled_within(left.min(pause.max(std::time::Duration::from_millis(50)))).await;
+            } else {
+                tokio::time::sleep(left.min(pause)).await;
+            }
+            pause = (pause * 2).min(std::time::Duration::from_millis(100));
+        }
+    }
+
     /// Writes one row version as another instance of this table's file set
     /// held it: created by `xmin` and, unless `xmax` is `NO_TX`, retired by
     /// `xmax`. For an ALTER rewrite (docs/persistent-indexes.md §7, R5), which
