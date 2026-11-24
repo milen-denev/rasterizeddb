@@ -264,7 +264,7 @@ pub fn fence_composite_foreign_keys(dir: &Path, keys: &[crate::core::rql::foreig
 }
 
 /// The database directories under `dir` whose tables hold a live composite
-/// foreign key, read from every `…_FK.db` in every subdirectory and owned
+/// foreign key, read from every `<t>_schema_FK.db` in every subdirectory and owned
 /// as [`directories_needing_numeric_own_scale`] owns a field file.
 pub fn directories_needing_composite_foreign_keys(dir: &Path) -> io::Result<Vec<std::path::PathBuf>> {
     const CATALOGUE: &str = "db_data_schema.db";
@@ -279,7 +279,7 @@ pub fn directories_needing_composite_foreign_keys(dir: &Path) -> io::Result<Vec<
                 continue;
             }
             let name = entry.file_name();
-            if !kind.is_file() || !name.to_string_lossy().ends_with("_FK.db") {
+            if !kind.is_file() || !name.to_string_lossy().ends_with("_schema_FK.db") {
                 continue;
             }
             if !crate::core::rql::foreign_key::sidecar_holds_composite(&std::fs::read(entry.path())?) {
