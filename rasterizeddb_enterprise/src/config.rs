@@ -9,6 +9,7 @@
 //! shard_labels 3 region=eu-west tier=dedicated
 //! policy eu_dedicated 0x0 0x800000000000 require region=eu-west exclusive
 //! pinned_role acme alice
+//! tenants_file /var/lib/rasterizeddb/rdb_tenants
 //! ```
 //!
 //! `#` starts a comment. A `policy` names a range of level-0 blocks, the
@@ -28,6 +29,8 @@ pub struct EnterpriseConfig {
     pub shard_labels: BTreeMap<u32, Vec<String>>,
     pub policies: Vec<Policy>,
     pub pinned_roles: Vec<(String, String)>,
+    /// Where `CREATE TENANT` keeps the tenant directory.
+    pub tenants_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +96,7 @@ impl EnterpriseConfig {
                     c.policies.push(Policy { name: name.to_string(), lo, hi, require, exclusive });
                 }
                 ["pinned_role", db, role] => c.pinned_roles.push((db.to_string(), role.to_string())),
+                ["tenants_file", path] => c.tenants_file = Some(path.into()),
                 _ => return Err(bad("unknown setting")),
             }
         }

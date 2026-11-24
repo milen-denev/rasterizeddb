@@ -89,7 +89,7 @@ mod branch_merge;
 pub const KEYMAP_TABLE_NAME: &str = branch_merge::KEYMAP_TABLE;
 #[cfg(all(test, feature = "db_branching"))]
 mod branch_tests;
-#[cfg(any(feature = "mysql_wire", feature = "mssql_wire"))]
+#[cfg(any(feature = "mysql_wire", feature = "mssql_wire", feature = "sharding"))]
 pub(crate) mod proxied;
 mod wire_out;
 
@@ -9445,6 +9445,40 @@ where
         if let Err(e) = crate::core::policy_hooks::check_privileged(&ctx, verb) {
             fail_statement(state, stream, "42501", e.trim_start_matches("42501: ")).await?;
             return Ok(());
+        }
+    }
+    // Statements a licensed tenancy policy answers itself (CREATE TENANT,
+    // SHOW TENANTS, …): rewritten into ordinary ones, run here in order.
+    if crate::core::policy_hooks::installed() {
+        let ctx = crate::core::policy_hooks::SessionContext {
+            role: &state.principal.name,
+            database: &database.name,
+            protocol: "pgwire",
+            superuser: state.principal.superuser,
+        };
+        match crate::core::policy_hooks::tenancy().rewrite_statement(&ctx, stmt) {
+            None => {}
+            Some(Err(e)) => {
+                fail_statement(state, stream, "42501", e.trim_start_matches("42501: ")).await?;
+                return Ok(());
+            }
+            Some(Ok(statements)) => {
+                for s in statements {
+                    Box::pin(execute_single_statement_unscoped(
+                        database,
+                        state,
+                        stream,
+                        &s,
+                        result_formats,
+                        omit_description,
+                    ))
+                    .await?;
+                    if state.transaction.as_ref().is_some_and(|t| t.failed) {
+                        break;
+                    }
+                }
+                return Ok(());
+            }
         }
     }
     // Process-wide SHOWs are the operator's under strict tenant mode (T2, T4).

@@ -26,11 +26,16 @@ use crate::EnterpriseConfig;
 pub struct StrictTenancy {
     operator_database: String,
     limits: BTreeMap<String, TenantLimits>,
+    directory: crate::tenants::Directory,
 }
 
 impl StrictTenancy {
-    pub fn new(cfg: &EnterpriseConfig) -> Self {
-        StrictTenancy { operator_database: cfg.operator_database.clone(), limits: cfg.limits.clone() }
+    pub fn new(cfg: &EnterpriseConfig) -> Result<Self, String> {
+        Ok(StrictTenancy {
+            operator_database: cfg.operator_database.clone(),
+            limits: cfg.limits.clone(),
+            directory: crate::tenants::Directory::open(cfg.tenants_file.clone())?,
+        })
     }
 }
 
@@ -67,7 +72,22 @@ impl TenancyPolicy for StrictTenancy {
     }
 
     fn limits(&self, database: &str) -> TenantLimits {
-        self.limits.get(database).cloned().unwrap_or_default()
+        // The directory's (set by CREATE/ALTER TENANT) over the file's.
+        self.directory
+            .limits(database)
+            .or_else(|| self.limits.get(database).cloned())
+            .unwrap_or_default()
+    }
+
+    fn rewrite_statement(&self, ctx: &SessionContext<'_>, sql: &str) -> Option<Result<Vec<String>, String>> {
+        let r = self.directory.rewrite(sql)?;
+        if !self.is_process_admin(ctx) {
+            return Some(Err(format!(
+                "42501: tenant statements are the operator's (a superuser of \"{}\")",
+                self.operator_database
+            )));
+        }
+        Some(r)
     }
 
     fn is_process_admin(&self, ctx: &SessionContext<'_>) -> bool {

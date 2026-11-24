@@ -78,6 +78,13 @@ pub trait TenancyPolicy: Send + Sync + 'static {
         TenantLimits::default()
     }
 
+    /// A statement the policy itself answers (`CREATE TENANT`, `SHOW
+    /// TENANTS`, …): `Some(Ok(statements))` to run instead, in order, as the
+    /// session; `Some(Err(..))` to refuse; `None` when it is not one.
+    fn rewrite_statement(&self, _ctx: &SessionContext<'_>, _sql: &str) -> Option<Result<Vec<String>, String>> {
+        None
+    }
+
     /// Whether the role is a process administrator: may administer the
     /// whole server, not only its own database. Today every superuser is;
     /// the roles plan's R1 `PROCESS ADMIN` attribute narrows it, and strict

@@ -15,6 +15,10 @@
 //! running the statement, and buys a session whose behaviour cannot drift
 //! from PostgreSQL's.
 
+// Built for the gateway's virtual sessions too (sharding), which use only
+// the bridge's core; the MySQL/TDS helpers are theirs.
+#![cfg_attr(not(any(feature = "mysql_wire", feature = "mssql_wire")), allow(dead_code))]
+
 use super::*;
 
 /// Who a front end authenticated: the session's principal.

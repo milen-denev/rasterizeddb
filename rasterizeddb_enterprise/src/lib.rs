@@ -13,6 +13,8 @@
 pub mod placement;
 #[cfg(feature = "tenant_isolation")]
 pub mod tenancy;
+#[cfg(feature = "tenant_isolation")]
+pub mod tenants;
 
 mod config;
 
@@ -25,7 +27,7 @@ pub fn install(path: &std::path::Path) -> Result<(), String> {
     let cfg = EnterpriseConfig::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     #[cfg(feature = "tenant_isolation")]
     if cfg.tenant_mode_strict {
-        rasterizeddb_core::core::policy_hooks::install_tenancy(Box::new(tenancy::StrictTenancy::new(&cfg)))?;
+        rasterizeddb_core::core::policy_hooks::install_tenancy(Box::new(tenancy::StrictTenancy::new(&cfg)?))?;
         log::info!("strict tenant mode: process administration only in \"{}\"", cfg.operator_database);
     }
     #[cfg(feature = "segregation_policies")]
