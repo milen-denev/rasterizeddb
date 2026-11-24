@@ -182,11 +182,14 @@ default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_impo
 enable_long_row = []
 
 # Sharding (docs/sharding-plan.md §4): a shard's ownership of level-0 block
-# ranges, the guard on every path that stamps a row, and (from B1a)
+# ranges, the guard on every path that stamps a row, its partition maps'
+# FOREIGN spans and their ACQUIRE_SPAN/RELEASE_SPAN writers, and (from B1a)
 # admission, classification and the gateway's virtual-session endpoint. In
 # the default list and dormant: nothing changes until a start passes
-# `--role shard`. A build without it has none of that code, and its stamping
-# hooks compile to nothing.
+# `--role shard`. Every build decodes the span records, so there is one
+# format; a build without the feature has none of the rest, and its stamping
+# hooks compile to nothing. No crate of its own: routing is
+# `rasterizeddb_router`'s.
 sharding = []
 
 # Database branches: `CREATE BRANCH`, `RESET`/`PROMOTE`/`DROP BRANCH`,

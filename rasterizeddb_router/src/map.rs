@@ -70,6 +70,97 @@ impl RangeMap {
         Self::new(entries)
     }
 
+    /// A map for a shard that owns only `owned`, half-open ranges of level-0
+    /// blocks (`[lo, hi)`, each below 2⁴⁸): `n` partitions laid out inside
+    /// the owned ranges, block-aligned and covering exactly them, plus one
+    /// partition per gap between them. Returns the map and the gap
+    /// partitions' pids, which the caller records `FOREIGN`
+    /// (sharding-plan.md B0.4).
+    ///
+    /// Each owned range gets at least one partition, so `n` must be at least
+    /// the number of ranges (after adjacent ones are merged) and at most the
+    /// number of owned blocks. The rest are shared out in proportion to each
+    /// range's size (largest remainder), and a range's boundaries are evenly
+    /// spaced blocks, as [`Self::initial`]'s are. Pids run `0..` in map order.
+    pub fn within(owned: &[(u64, u64)], n: u32) -> Result<(Self, Vec<u32>), String> {
+        const BLOCKS: u64 = 1 << 48;
+        let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(owned.len());
+        for &(lo, hi) in owned {
+            if lo >= hi || hi > BLOCKS {
+                return Err(format!("owned block range [{lo:#x}, {hi:#x}) is empty or past the last block"));
+            }
+            match ranges.last_mut() {
+                Some(last) if lo < last.1 => {
+                    return Err(format!("owned block ranges overlap or are unsorted at {lo:#x}"));
+                }
+                Some(last) if lo == last.1 => last.1 = hi,
+                _ => ranges.push((lo, hi)),
+            }
+        }
+        if ranges.is_empty() {
+            return Err("a shard that owns no blocks has no partitions to lay out".to_string());
+        }
+        let total: u128 = ranges.iter().map(|&(lo, hi)| (hi - lo) as u128).sum();
+        if (n as usize) < ranges.len() || n as u128 > total || n > MAX_INITIAL {
+            return Err(format!(
+                "{n} partitions cannot cover {} owned ranges of {total} blocks (1 per range at least, 1 block each at most, {MAX_INITIAL} in all)",
+                ranges.len()
+            ));
+        }
+        // One each, then the rest by largest remainder of the proportional share.
+        let spare = n as u128 - ranges.len() as u128;
+        let mut counts: Vec<u128> = Vec::with_capacity(ranges.len());
+        let mut rems: Vec<(u128, usize)> = Vec::with_capacity(ranges.len());
+        for (i, &(lo, hi)) in ranges.iter().enumerate() {
+            let size = (hi - lo) as u128;
+            let share = spare * size;
+            // Never more partitions than blocks in the range.
+            let k = (1 + share / total).min(size);
+            counts.push(k);
+            rems.push((share % total, i));
+        }
+        let mut left = n as u128 - counts.iter().sum::<u128>();
+        rems.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        while left > 0 {
+            let before = left;
+            for &(_, i) in &rems {
+                if left == 0 {
+                    break;
+                }
+                let size = (ranges[i].1 - ranges[i].0) as u128;
+                if counts[i] < size {
+                    counts[i] += 1;
+                    left -= 1;
+                }
+            }
+            if left == before {
+                return Err(format!("{n} partitions do not fit the owned blocks"));
+            }
+        }
+        let mut entries = Vec::with_capacity(n as usize + ranges.len() + 1);
+        let mut foreign = Vec::new();
+        let mut at = 0u64;
+        let push = |entries: &mut Vec<(u64, u32)>, block: u64| {
+            let pid = entries.len() as u32;
+            entries.push((block << 16, pid));
+            pid
+        };
+        for (&(lo, hi), &k) in ranges.iter().zip(&counts) {
+            if lo > at {
+                foreign.push(push(&mut entries, at));
+            }
+            let size = (hi - lo) as u128;
+            for i in 0..k {
+                push(&mut entries, lo + ((i * size) / k) as u64);
+            }
+            at = hi;
+        }
+        if at < BLOCKS {
+            foreign.push(push(&mut entries, at));
+        }
+        Ok((Self::new(entries)?, foreign))
+    }
+
     /// Checks the map is total and disjoint: it starts at 0, `lo` strictly
     /// increases, and no pid owns two ranges.
     pub fn validate(&self) -> Result<(), String> {
