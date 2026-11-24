@@ -6402,6 +6402,12 @@ pub(crate) struct NativeConnection {
     /// The connection asked for notices
     /// ([`crate::pgwire::NATIVE_NOTICES_PREFIX`]): its answers carry them.
     notices: std::sync::atomic::AtomicBool,
+    /// Its admission, decided at its first statement in its database and
+    /// held for the connection's life: the role's place under its
+    /// CONNECTION LIMIT and VALID UNTIL (R2), and the tenancy policy's
+    /// admit (T7), as a pgwire login is admitted. A refusal is kept and
+    /// answers every request.
+    admission: tokio::sync::OnceCell<Result<crate::auth::RoleSlot, String>>,
 }
 
 impl NativeConnection {
@@ -6507,6 +6513,7 @@ fn open_native_session(
         multiplexed: connection.multiplexed,
         session: std::sync::OnceLock::new(),
         notices: std::sync::atomic::AtomicBool::new(false),
+        admission: tokio::sync::OnceCell::new(),
     }
 }
 
@@ -6574,6 +6581,35 @@ async fn serve_native_request(
         Ok(session) => session,
         Err((_, message)) => return error_response(&message),
     };
+    let admitted = connection
+        .admission
+        .get_or_init(|| async {
+            let database = session.database();
+            // Only a password proves a credential here; a listener without
+            // authentication is held to the limit but not to VALID UNTIL.
+            let slot = crate::auth::admit_role_login(
+                database,
+                &principal.user,
+                principal.superuser,
+                context.authentication_required,
+            )
+            .await
+            .map_err(|(_, message)| message)?;
+            let ctx = crate::core::policy_hooks::SessionContext {
+                role: &principal.user,
+                database: &database.name,
+                protocol: "native",
+                superuser: principal.superuser,
+            };
+            crate::core::policy_hooks::tenancy()
+                .admit(&ctx)
+                .map_err(|e| e.trim_start_matches("28000: ").to_string())?;
+            Ok(slot)
+        })
+        .await;
+    if let Err(message) = admitted {
+        return error_response(message);
+    }
     // Everything below reads the database from the context.
     let context = if Arc::ptr_eq(session.database(), &context.database) {
         context
