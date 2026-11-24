@@ -292,3 +292,47 @@ async fn r2r3_createrole_manages_ordinary_roles_only() {
     ok(&db, &mut s, "ALTER ROLE worker PASSWORD 'new'").await;
     refused(&db, &mut s, "ALTER ROLE manager PASSWORD 'x'").await;
 }
+
+/// The rdb_roles escalation (reported on 1.0.1): a login role must not
+/// write the role catalogue nor read a verifier, by any spelling or path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2r3_rdb_roles_is_closed_to_every_path() {
+    let db = db().await;
+    let mut s = session(&db);
+    roles(&db, &mut s, &["mallory", "victim"]).await;
+    ok(&db, &mut s, "CREATE TABLE notes (id INT PRIMARY KEY)").await;
+    ok(&db, &mut s, "GRANT SELECT, INSERT, UPDATE ON notes TO mallory").await;
+    act_as(&mut s, Some("mallory"));
+    for sql in [
+        "UPDATE rdb_roles SET is_superuser = true WHERE name = 'mallory'",
+        "UPDATE \"rdb_roles\" SET is_superuser = 1",
+        "UPDATE public.rdb_roles SET is_superuser = 1",
+        "DELETE FROM rdb_roles WHERE name = 'victim'",
+        "INSERT INTO rdb_roles (name, password, can_login, is_superuser) VALUES ('evil', NULL, 1, 1)",
+        "SELECT password FROM rdb_roles",
+        "SELECT * FROM rdb_roles",
+        "SELECT * FROM \"rdb_roles\"",
+        "SELECT * FROM public.rdb_roles",
+        "SELECT * FROM (SELECT password FROM rdb_roles) AS r",
+        "WITH r AS (SELECT * FROM rdb_roles) SELECT * FROM r",
+        "SELECT id FROM notes WHERE id IN (SELECT 1 FROM rdb_roles WHERE is_superuser = 1)",
+        "INSERT INTO notes (id) SELECT 1 FROM rdb_roles",
+        "COPY rdb_roles TO STDOUT",
+        "CREATE VIEW leak AS SELECT * FROM rdb_roles",
+        "PREPARE p AS SELECT password FROM rdb_roles",
+        "SELECT * FROM __rdb_acl",
+        "UPDATE __rdb_acl SET grantee = 'mallory'",
+        "SELECT rolpassword FROM pg_authid",
+    ] {
+        let e = refused(&db, &mut s, sql).await;
+        assert!(e.contains("42501") || e.contains("permission denied"), "{sql}: {e}");
+    }
+    // A prepared statement learned on a granted table, then pointed at
+    // nothing new, keeps the guard: EXECUTE of a refused PREPARE has
+    // nothing to run.
+    refused(&db, &mut s, "EXECUTE p").await;
+    act_as(&mut s, None);
+    assert_eq!(first_cell(&db, &mut s, "SELECT rolsuper FROM pg_roles WHERE rolname = 'mallory'").await.as_deref(), Some("f"));
+    assert_eq!(ok(&db, &mut s, "SELECT rolname FROM pg_roles WHERE rolname = 'victim'").await, 1);
+    assert_eq!(ok(&db, &mut s, "SELECT rolname FROM pg_roles WHERE rolname = 'evil'").await, 0);
+}
