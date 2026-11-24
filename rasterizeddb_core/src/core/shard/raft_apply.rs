@@ -69,6 +69,63 @@ pub fn serving() -> Result<(), String> {
     }
 }
 
+/// Whether a client session may open here (B4.1): on the leader, and on a
+/// follower that knows its leader, for reads made linearizable statement by
+/// statement ([`statement_barrier`]). A halted replica, or one with no
+/// leader known, refuses.
+pub fn admits_session() -> Result<(), String> {
+    let Some((group, _, _)) = RAFT.get() else {
+        return Ok(());
+    };
+    let s = group.status();
+    if let Some(why) = s.halted {
+        return Err(format!("57P03: this shard replica halted: {why}"));
+    }
+    match (s.role, s.leader) {
+        (Some(rasterizeddb_raft::Role::Leader), _) => Ok(()),
+        (Some(rasterizeddb_raft::Role::Follower | rasterizeddb_raft::Role::Learner), Some(_)) => Ok(()),
+        _ => Err("57P03: this shard replica has no leader to follow yet; retry".to_string()),
+    }
+}
+
+/// How long a follower's read waits for its leader's read point.
+const READ_BARRIER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Before a statement on a session of this replica (B4.1). On the leader:
+/// nothing. On a follower: a write is refused (25006, with the leader to
+/// go to), and a read first waits for a read point from the leader
+/// (forwarded ReadIndex) and for this replica to apply through it, so it
+/// sees every write committed before it began. Statements that read no
+/// table (SET, SHOW, BEGIN, …) pass as they are.
+pub async fn statement_barrier(stmt: &str) -> Result<(), String> {
+    let Some((group, _, _)) = RAFT.get() else {
+        return Ok(());
+    };
+    let s = group.status();
+    if s.role == Some(rasterizeddb_raft::Role::Leader) {
+        return Ok(());
+    }
+    let head = stmt.trim_start().split(|c: char| c.is_whitespace() || c == '(').next().unwrap_or("").to_ascii_uppercase();
+    const WRITES: &[&str] = &[
+        "INSERT", "UPDATE", "DELETE", "MERGE", "COPY", "CREATE", "ALTER", "DROP", "TRUNCATE", "GRANT", "REVOKE",
+        "VACUUM", "REINDEX", "CLUSTER", "REFRESH", "IMPORT", "CALL", "DO", "COMMENT", "LOCK", "NOTIFY", "PREPARE",
+    ];
+    if WRITES.contains(&head.as_str()) || crate::core::sql_scan::contains_ignore_ascii_case(stmt, b" FOR UPDATE") {
+        return Err(format!(
+            "25006: cannot run {head} on a follower of this shard's Raft group (leader: {}); connect to the leader",
+            s.leader.map_or("unknown".to_string(), |l| l.to_string())
+        ));
+    }
+    if !matches!(head.as_str(), "SELECT" | "WITH" | "TABLE" | "VALUES" | "EXECUTE" | "EXPLAIN" | "FETCH") {
+        return Ok(());
+    }
+    match tokio::time::timeout(READ_BARRIER, group.read_index()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(format!("57P03: a follower read could not get a read point from the leader: {e:?}")),
+        Err(_) => Err("57P03: a follower read waited too long for the leader's read point; retry".to_string()),
+    }
+}
+
 /// Proposes `database`'s committing transaction `tx` (sharding-plan.md B3,
 /// "propose instead of commit"): its family's captured ops as one entry,
 /// waited for until it is applied here; then the applied index is written

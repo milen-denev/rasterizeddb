@@ -230,6 +230,19 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             w.u64(*term);
             w.u64(*from);
         }
+        Message::ReadIndex { term, from, ctx } => {
+            w.u8(8);
+            w.u64(*term);
+            w.u64(*from);
+            w.u64(*ctx);
+        }
+        Message::ReadIndexResp { term, from, ctx, index } => {
+            w.u8(9);
+            w.u64(*term);
+            w.u64(*from);
+            w.u64(*ctx);
+            w.u64(*index);
+        }
     }
     w.0
 }
@@ -266,6 +279,8 @@ pub fn decode_message(b: &[u8]) -> Result<Message, String> {
         5 => Message::Snapshot { term: r.u64()?, from: r.u64()?, meta: r.snapshot_meta()?, data: r.bytes()? },
         6 => Message::SnapshotResponse { term: r.u64()?, from: r.u64()?, index: r.u64()? },
         7 => Message::TimeoutNow { term: r.u64()?, from: r.u64()? },
+        8 => Message::ReadIndex { term: r.u64()?, from: r.u64()?, ctx: r.u64()? },
+        9 => Message::ReadIndexResp { term: r.u64()?, from: r.u64()?, ctx: r.u64()?, index: r.u64()? },
         t => return Err(format!("raft: message tag {t}")),
     };
     r.done()?;

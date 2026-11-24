@@ -93,6 +93,12 @@ pub enum Message {
     SnapshotResponse { term: Term, from: NodeId, index: Index },
     /// Leadership transfer: start an election now, ignoring the leader lease.
     TimeoutNow { term: Term, from: NodeId },
+    /// A follower asks its leader for a read point (ReadIndex forwarded,
+    /// dissertation §6.4): `ctx` is the follower's own.
+    ReadIndex { term: Term, from: NodeId, ctx: u64 },
+    /// The leader's answer, once a quorum confirmed it leads: the follower
+    /// may serve `ctx` when it has applied through `index`.
+    ReadIndexResp { term: Term, from: NodeId, ctx: u64, index: Index },
 }
 
 impl Message {
@@ -104,7 +110,9 @@ impl Message {
             | Message::AppendResponse { term, .. }
             | Message::Snapshot { term, .. }
             | Message::SnapshotResponse { term, .. }
-            | Message::TimeoutNow { term, .. } => *term,
+            | Message::TimeoutNow { term, .. }
+            | Message::ReadIndex { term, .. }
+            | Message::ReadIndexResp { term, .. } => *term,
         }
     }
 
@@ -116,7 +124,9 @@ impl Message {
             | Message::AppendResponse { from, .. }
             | Message::Snapshot { from, .. }
             | Message::SnapshotResponse { from, .. }
-            | Message::TimeoutNow { from, .. } => *from,
+            | Message::TimeoutNow { from, .. }
+            | Message::ReadIndex { from, .. }
+            | Message::ReadIndexResp { from, .. } => *from,
         }
     }
 }

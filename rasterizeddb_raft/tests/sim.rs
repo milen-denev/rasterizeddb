@@ -79,6 +79,12 @@ struct Sim {
     /// Commands some node applied: they must survive.
     committed: Vec<u64>,
     drop_percent: u64,
+    /// Reads issued: (node, ctx) → commands committed when it was issued.
+    reads: BTreeMap<(NodeId, u64), usize>,
+    /// Read points granted, waiting for the node to apply through them.
+    granted: Vec<(NodeId, u64, Index)>,
+    next_ctx: u64,
+    reads_served: u64,
 }
 
 impl Sim {
@@ -97,6 +103,10 @@ impl Sim {
             next_command: 1,
             committed: Vec::new(),
             drop_percent: 5,
+            reads: BTreeMap::new(),
+            granted: Vec::new(),
+            next_ctx: 1,
+            reads_served: 0,
         };
         for id in 1..=n {
             sim.nodes.insert(id, Node { raft: None, disk: Disk::default(), applied: Vec::new() });
@@ -118,6 +128,8 @@ impl Sim {
     }
 
     fn crash(&mut self, id: NodeId) {
+        self.reads.retain(|(n, _), _| *n != id);
+        self.granted.retain(|(n, _, _)| *n != id);
         let node = self.nodes.get_mut(&id).unwrap();
         node.raft = None;
         node.applied.clear();
@@ -170,6 +182,11 @@ impl Sim {
                     node.applied.push(v);
                 }
             }
+            // Read points granted here (a leader's own, or a follower's
+            // answered by its leader).
+            for r in &ready.reads {
+                self.granted.push((id, r.ctx, r.index));
+            }
             // 3. Messages out.
             for (to, m) in ready.messages.clone() {
                 let delay = 1 + self.rng.below(3);
@@ -207,6 +224,30 @@ impl Sim {
             node.disk.snap_data = node.applied.clone();
             node.disk.entries.retain(|e| e.index > index);
         }
+    }
+
+    /// Serves every granted read whose node has applied far enough, and
+    /// checks it saw every command committed before it was issued.
+    fn serve_reads(&mut self) {
+        let mut still = Vec::new();
+        for (id, ctx, index) in std::mem::take(&mut self.granted) {
+            let node = &self.nodes[&id];
+            let Some(raft) = &node.raft else { continue };
+            if raft.log().applied() < index {
+                still.push((id, ctx, index));
+                continue;
+            }
+            if let Some(needed) = self.reads.remove(&(id, ctx)) {
+                assert!(
+                    node.applied.len() >= needed,
+                    "a read on node {id} saw {} commands, {needed} were committed before it was issued (step {})",
+                    node.applied.len(),
+                    self.step
+                );
+                self.reads_served += 1;
+            }
+        }
+        self.granted = still;
     }
 
     fn check(&mut self) {
@@ -285,6 +326,18 @@ impl Sim {
                 self.next_command += 1;
             }
         }
+        // A read on a random live node, leader or not.
+        if self.rng.chance(20) {
+            let pick = ids[self.rng.below(ids.len() as u64) as usize];
+            let ctx = self.next_ctx;
+            let committed = self.committed.len();
+            if let Some(r) = self.nodes.get_mut(&pick).unwrap().raft.as_mut()
+                && r.read_index(ctx).is_ok()
+            {
+                self.next_ctx += 1;
+                self.reads.insert((pick, ctx), committed);
+            }
+        }
         if faults {
             let pick = ids[self.rng.below(ids.len() as u64) as usize];
             match self.rng.below(1000) {
@@ -307,6 +360,7 @@ impl Sim {
             self.drain(id);
         }
         self.check();
+        self.serve_reads();
     }
 
     fn heal(&mut self) {
@@ -367,6 +421,7 @@ fn run(seed: u64, nodes: u64, steps: u64) {
         sim.tick(false);
     }
     assert!(sim.committed.len() > before, "seed {seed}: no progress after healing");
+    assert!(sim.reads_served > 0, "seed {seed}: no read was ever served");
 }
 
 #[test]
@@ -407,6 +462,8 @@ fn raft_codec_round_trips_every_message() {
         Message::Snapshot { term: 5, from: 1, meta: SnapshotMeta { index: 9, term: 4, config: Config::new([1, 2]) }, data: vec![9; 40] },
         Message::SnapshotResponse { term: 5, from: 3, index: 9 },
         Message::TimeoutNow { term: 6, from: 1 },
+        Message::ReadIndex { term: 6, from: 2, ctx: 77 },
+        Message::ReadIndexResp { term: 6, from: 1, ctx: 77, index: 41 },
     ];
     for m in messages {
         let bytes = rasterizeddb_raft::codec::encode_message(&m);

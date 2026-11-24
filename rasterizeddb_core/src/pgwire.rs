@@ -2271,8 +2271,9 @@ where
             send_fatal_error_response(stream, "28000", e.trim_start_matches("28000: ")).await?;
             return Ok(());
         }
+        // The leader, or a follower serving linearizable reads (B4.1).
         #[cfg(feature = "sharding_raft")]
-        if let Err(e) = crate::core::shard::raft_apply::serving() {
+        if let Err(e) = crate::core::shard::raft_apply::admits_session() {
             send_fatal_error_response(stream, "57P03", e.trim_start_matches("57P03: ")).await?;
             return Ok(());
         }
@@ -9621,6 +9622,18 @@ where
         return Ok(());
     }
 
+    // On a follower of its shard's Raft group (B4.1): a write is refused,
+    // and a read waits for the leader's read point, so it sees every write
+    // committed before it began.
+    #[cfg(feature = "sharding_raft")]
+    if !state.view_internal
+        && let Err(e) = crate::core::shard::raft_apply::statement_barrier(stmt).await
+    {
+        let (code, message) = e.split_once(": ").unwrap_or(("57P03", e.as_str()));
+        let code: &'static str = if code == "25006" { "25006" } else { "57P03" };
+        fail_statement(state, stream, code, message).await?;
+        return Ok(());
+    }
     // Ahead of every dispatch below, so a statement that administers the
     // server is refused before any handler — builtin, role, catalogue or
     // engine — sees it.

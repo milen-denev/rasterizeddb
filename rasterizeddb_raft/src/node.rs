@@ -103,6 +103,8 @@ struct PendingRead {
     ctx: u64,
     index: Index,
     round: u64,
+    /// The follower that forwarded it, to answer; `None`: the leader's own.
+    origin: Option<NodeId>,
 }
 
 pub struct RaftNode {
@@ -364,7 +366,10 @@ impl RaftNode {
                 if voters.contains(id) {
                     active += 1;
                 }
-            } else if p.snapshotting {
+            }
+            // Answering heartbeats is no answer to the snapshot: a follower
+            // still waiting on a lost one is active and stayed behind.
+            if *id != self.id && p.snapshotting {
                 p.snapshotting = false;
                 resend.push(*id);
             }
@@ -440,6 +445,18 @@ impl RaftNode {
                     p.matched = p.matched.max(index);
                     p.next = p.matched + 1;
                     self.send_append(from);
+                }
+            }
+            Message::ReadIndex { from, ctx, .. } => {
+                // Only a leader answers; anything else is the asker's
+                // timeout (its leader changed under it).
+                if self.role == Role::Leader {
+                    let _ = self.start_read(ctx, Some(from));
+                }
+            }
+            Message::ReadIndexResp { from, ctx, index, .. } => {
+                if self.leader == Some(from) && self.role != Role::Leader {
+                    self.reads_ready.push(ReadState { ctx, index });
                 }
             }
             Message::TimeoutNow { from, term } => {
@@ -789,8 +806,23 @@ impl RaftNode {
     /// with the index the state machine must have applied first.
     pub fn read_index(&mut self, ctx: u64) -> Result<(), ProposeError> {
         if self.role != Role::Leader {
+            // A follower or learner forwards it to the leader it knows
+            // (B4.1, follower reads). The answer comes back as a ReadState
+            // like the leader's own; a lost one is the caller's timeout.
+            if matches!(self.role, Role::Follower | Role::Learner)
+                && let Some(leader) = self.leader
+            {
+                let t = self.hard.term;
+                self.send(leader, Message::ReadIndex { term: t, from: self.id, ctx });
+                return Ok(());
+            }
             return Err(ProposeError::NotLeader { leader: self.leader });
         }
+        self.start_read(ctx, None)
+    }
+
+    /// Registers a read the leader confirms with a quorum round.
+    fn start_read(&mut self, ctx: u64, origin: Option<NodeId>) -> Result<(), ProposeError> {
         // Not until this term has committed an entry: before that the commit
         // index may be behind entries earlier leaders committed.
         if self.log.term(self.log.committed()) != Some(self.hard.term) {
@@ -798,7 +830,7 @@ impl RaftNode {
         }
         self.read_round += 1;
         let index = self.log.committed();
-        self.reads_pending.push_back(PendingRead { ctx, index, round: self.read_round });
+        self.reads_pending.push_back(PendingRead { ctx, index, round: self.read_round, origin });
         if self.config.voters.len() == 1 {
             self.confirm_reads();
         } else {
@@ -822,7 +854,13 @@ impl RaftNode {
                 break;
             }
             self.reads_pending.pop_front();
-            self.reads_ready.push(ReadState { ctx: r.ctx, index: r.index });
+            match r.origin {
+                Some(to) => {
+                    let t = self.hard.term;
+                    self.send(to, Message::ReadIndexResp { term: t, from: self.id, ctx: r.ctx, index: r.index });
+                }
+                None => self.reads_ready.push(ReadState { ctx: r.ctx, index: r.index }),
+            }
         }
     }
 
