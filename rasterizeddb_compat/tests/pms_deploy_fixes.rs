@@ -5,7 +5,8 @@
 //! correlated reference in an inner join's `ON` inside `EXISTS`, a window
 //! beside such a subquery, `make_interval` over a column, a parenthesised
 //! cast as a `DEFAULT`, an alias written without `AS`, `SHOW TABLES`
-//! naming a composite key, and `GROUP BY 1` over a join.
+//! naming a composite key, `GROUP BY 1` over a join, and a statement with
+//! more than 32,767 bound parameters.
 
 use rasterizeddb_compat::TestServer;
 use sqlx::{AssertSqlSafe, Row};
@@ -286,4 +287,28 @@ async fn group_by_a_position_or_an_output_name_over_a_join() {
         .expect_err("a position past the select list");
     let db = e.as_database_error().expect("a server error");
     assert_eq!(db.code().as_deref(), Some("42P10"), "{e}");
+}
+
+/// A Bind's parameter count is an Int16 that PostgreSQL reads unsigned, up to
+/// 65,535. Read signed, pms's 39,000-parameter companion insert was -26,536
+/// parameters: the server ran out of message and dropped the connection with
+/// nothing in its log, and the client read "expected to read 5 bytes, got 0
+/// bytes at EOF".
+#[tokio::test]
+async fn a_statement_with_more_than_32767_parameters_is_bound() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE zz_wide (id int PRIMARY KEY, v int)").await;
+    let rows = 20_000; // 40,000 parameters
+    let values: Vec<String> = (0..rows).map(|r| format!("(${}, ${})", 2 * r + 1, 2 * r + 2)).collect();
+    let sql = format!("INSERT INTO zz_wide (id, v) VALUES {} ON CONFLICT (id) DO NOTHING", values.join(", "));
+    let mut query = sqlx::query(AssertSqlSafe(sql.as_str()));
+    for r in 0..rows {
+        query = query.bind(r).bind(r * 3);
+    }
+    let done = query.execute(&pool).await.unwrap_or_else(|e| panic!("40,000 parameters: {e}"));
+    assert_eq!(done.rows_affected(), rows as u64);
+    let (count, sum): (i64, i64) =
+        sqlx::query_as("SELECT count(*), sum(v)::bigint FROM zz_wide").fetch_one(&pool).await.unwrap();
+    assert_eq!(count, rows as i64);
+    assert_eq!(sum, (0..rows as i64).map(|r| r * 3).sum::<i64>());
 }
