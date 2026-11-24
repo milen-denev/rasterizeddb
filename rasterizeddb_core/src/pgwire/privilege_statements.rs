@@ -12,6 +12,58 @@ async fn relation_exists(database: &Arc<Database>, name: &str, tx: Option<TxId>)
         || matches!(crate::core::rql::sequence_catalog::load(database, Some(&[name.to_string()]), tx).await, Ok(v) if !v.is_empty())
 }
 
+/// Whether `me` may grant or revoke membership in `roles` (R2): a
+/// superuser; a CREATEROLE role, for roles that are not superusers; or a
+/// holder of ADMIN OPTION on each.
+async fn may_manage_membership(
+    database: &Arc<Database>,
+    rows: &[AclRow],
+    me: &str,
+    superuser: bool,
+    roles: &[String],
+    verb: &str,
+    tx: Option<TxId>,
+) -> Result<(), (&'static str, String)> {
+    if superuser {
+        return Ok(());
+    }
+    let create_role = crate::auth::role_attrs(database, me, tx).await.create_role;
+    for role in roles {
+        if crate::auth::lookup_role_in(database, role, tx).await.is_some_and(|r| r.is_superuser) {
+            return Err(("42501", format!("permission denied to {verb} role \"{role}\": only a superuser can {verb} a superuser role")));
+        }
+        if !create_role && !privileges::has_admin_option(rows, me, role) {
+            return Err(("42501", format!("permission denied to {verb} role \"{role}\": it needs ADMIN OPTION on it, or CREATEROLE")));
+        }
+    }
+    Ok(())
+}
+
+/// Writes (`on`) or removes a membership's companion row (`NOINHERIT`,
+/// `NOSET`).
+async fn set_companion(
+    database: &Arc<Database>,
+    relation: &str,
+    member: &str,
+    companion: &str,
+    on: bool,
+    me: &str,
+    tx: Option<TxId>,
+) -> Result<(), (&'static str, String)> {
+    if on {
+        let row = AclRow { relation: relation.into(), grantee: member.into(), privilege: companion.into(), grantor: me.into(), grantable: false };
+        privileges::put(database, &row, tx).await.map_err(|e| ("XX000", e))
+    } else {
+        let filter = format!(
+            "relation = {} AND grantee = {} AND privilege = {}",
+            crate::auth::quote(relation),
+            crate::auth::quote(member),
+            crate::auth::quote(companion)
+        );
+        privileges::delete_where(database, &filter, tx).await.map_err(|e| ("XX000", e))
+    }
+}
+
 async fn role_exists(database: &Arc<Database>, name: &str, tx: Option<TxId>) -> bool {
     name == "public" || crate::auth::lookup_role_in(database, name, tx).await.is_some()
 }
@@ -114,38 +166,62 @@ where
                 }
                 Ok("REVOKE")
             }
-            PrivilegeStatement::GrantRole { roles, members } => {
-                if !admin {
-                    return Err(fail("42501", "permission denied to grant role: only a superuser grants roles here".to_string()));
-                }
+            PrivilegeStatement::GrantRole { roles, members, admin: with_admin, inherit, set } => {
                 for name in roles.iter().chain(&members) {
                     if name == "public" || !role_exists(database, name, tx).await {
                         return Err(fail("42704", format!("role \"{name}\" does not exist")));
                     }
                 }
+                may_manage_membership(database, &rows, &me, admin, &roles, "grant", tx).await?;
                 for role in &roles {
+                    let relation = format!("@role:{role}");
                     for member in &members {
-                        if privileges::roles_of(&rows, role).contains(member) {
+                        if privileges::roles_of(&rows, role).contains(member) || privileges::settable_roles(&rows, role).contains(member) {
                             return Err(fail("0LP01", format!("role \"{member}\" is a member of role \"{role}\"")));
                         }
-                        let row = AclRow { relation: format!("@role:{role}"), grantee: member.clone(), privilege: "MEMBER".into(), grantor: me.clone(), grantable: false };
+                        // Granted again without ADMIN, a membership keeps the
+                        // ADMIN option it had, as in PostgreSQL.
+                        let had_admin = rows.iter().any(|r| r.privilege == "MEMBER" && r.relation == relation && r.grantee == *member && r.grantable);
+                        let row = AclRow { relation: relation.clone(), grantee: member.clone(), privilege: "MEMBER".into(), grantor: me.clone(), grantable: with_admin || had_admin };
                         privileges::put(database, &row, tx).await.map_err(|e| fail("XX000", e))?;
+                        for (option, companion) in [(inherit, privileges::NOINHERIT), (set, privileges::NOSET)] {
+                            if let Some(on) = option {
+                                set_companion(database, &relation, member, companion, !on, &me, tx).await?;
+                            }
+                        }
                     }
                 }
                 Ok("GRANT ROLE")
             }
-            PrivilegeStatement::RevokeRole { roles, members } => {
-                if !admin {
-                    return Err(fail("42501", "permission denied to revoke role".to_string()));
-                }
+            PrivilegeStatement::RevokeRole { roles, members, option } => {
+                may_manage_membership(database, &rows, &me, admin, &roles, "revoke", tx).await?;
                 for role in &roles {
+                    let relation = format!("@role:{role}");
                     for member in &members {
-                        let filter = format!(
-                            "relation = {} AND grantee = {} AND privilege = 'MEMBER'",
-                            crate::auth::quote(&format!("@role:{role}")),
-                            crate::auth::quote(member)
-                        );
-                        privileges::delete_where(database, &filter, tx).await.map_err(|e| fail("XX000", e))?;
+                        match option {
+                            None => {
+                                let filter = format!(
+                                    "relation = {} AND grantee = {} AND (privilege = 'MEMBER' OR privilege = {} OR privilege = {})",
+                                    crate::auth::quote(&relation),
+                                    crate::auth::quote(member),
+                                    crate::auth::quote(privileges::NOINHERIT),
+                                    crate::auth::quote(privileges::NOSET),
+                                );
+                                privileges::delete_where(database, &filter, tx).await.map_err(|e| fail("XX000", e))?;
+                            }
+                            Some(privileges::MembershipOption::Admin) => {
+                                if let Some(r) = rows.iter().find(|r| r.privilege == "MEMBER" && r.relation == relation && r.grantee == *member) {
+                                    let row = AclRow { grantable: false, ..r.clone() };
+                                    privileges::put(database, &row, tx).await.map_err(|e| fail("XX000", e))?;
+                                }
+                            }
+                            Some(privileges::MembershipOption::Inherit) => {
+                                set_companion(database, &relation, member, privileges::NOINHERIT, true, &me, tx).await?;
+                            }
+                            Some(privileges::MembershipOption::Set) => {
+                                set_companion(database, &relation, member, privileges::NOSET, true, &me, tx).await?;
+                            }
+                        }
                     }
                 }
                 Ok("REVOKE ROLE")
@@ -205,7 +281,7 @@ where
                     return Err(fail("42704", format!("role \"{to}\" does not exist")));
                 }
                 // As PostgreSQL asks: the giver acts as every role named.
-                let mine = privileges::roles_of(&rows, &me);
+                let mine = privileges::settable_roles(&rows, &me);
                 for r in from.iter().chain(std::iter::once(&to)) {
                     if !admin && !mine.iter().any(|m| m == r) {
                         return Err(fail("42501", format!("permission denied to reassign objects: must be able to SET ROLE \"{r}\"")));
@@ -222,7 +298,7 @@ where
                 Ok("REASSIGN OWNED")
             }
             PrivilegeStatement::DropOwned { roles } => {
-                let mine = privileges::roles_of(&rows, &me);
+                let mine = privileges::settable_roles(&rows, &me);
                 for r in &roles {
                     if !admin && !mine.iter().any(|m| m == r) {
                         return Err(fail("42501", format!("permission denied to drop objects: must be able to SET ROLE \"{r}\"")));

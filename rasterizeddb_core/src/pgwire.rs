@@ -13519,7 +13519,7 @@ where
                 };
                 let member = base.superuser
                     || match crate::core::rql::privileges::load(&database, None).await {
-                        Ok(rows) => crate::core::rql::privileges::roles_of(&rows, &base.name).iter().any(|g| g == &r.name),
+                        Ok(rows) => crate::core::rql::privileges::settable_roles(&rows, &base.name).iter().any(|g| g == &r.name),
                         Err(_) => false,
                     };
                 if !member {

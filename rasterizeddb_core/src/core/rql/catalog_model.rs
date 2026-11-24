@@ -477,6 +477,21 @@ pub(crate) struct RoleRow {
     pub valid_until_us: Option<i64>,
 }
 
+/// Where `pg_auth_members` row oids start: above the fixed catalogue oids,
+/// below the hashed oids of user objects' usual range.
+const AUTH_MEMBERS_OID_BASE: i64 = 60_000;
+
+/// One role membership (`GRANT role TO member`), with its options (R2).
+#[derive(Debug, Clone)]
+pub(crate) struct MemberRow {
+    pub roleid: i64,
+    pub member: i64,
+    pub grantor: i64,
+    pub admin: bool,
+    pub inherit: bool,
+    pub set: bool,
+}
+
 /// A user's function or procedure, as `pg_proc` lists it.
 #[derive(Debug, Clone)]
 pub(crate) struct ProcRow {
@@ -512,6 +527,8 @@ pub(crate) struct Model {
     pub database: String,
     pub rels: Vec<Rel>,
     pub roles: Vec<RoleRow>,
+    /// Role memberships, as `pg_auth_members` lists them.
+    pub memberships: Vec<MemberRow>,
     pub procs: Vec<ProcRow>,
     /// The enum types (`user_types`).
     pub enums: Vec<crate::core::rql::user_types::EnumType>,
@@ -1239,7 +1256,31 @@ pub(crate) async fn build_model(
     }
     let procs = procs(database, tx).await;
     let enums = crate::core::rql::user_types::load(database, None, tx).await.unwrap_or_default();
-    Model { database: database.name.clone(), rels, roles, procs, enums }
+    let memberships = memberships(&acl, &roles);
+    Model { database: database.name.clone(), rels, roles, memberships, procs, enums }
+}
+
+/// The memberships the ACL holds, between roles that exist.
+fn memberships(acl: &[crate::core::rql::privileges::AclRow], roles: &[RoleRow]) -> Vec<MemberRow> {
+    use crate::core::rql::privileges::{NOINHERIT, NOSET};
+    let oid = |name: &str| roles.iter().find(|r| r.name == name).map(|r| r.oid);
+    acl.iter()
+        .filter(|a| a.privilege == "MEMBER")
+        .filter_map(|a| {
+            let role = a.relation.strip_prefix("@role:")?;
+            let off = |companion: &str| {
+                acl.iter().any(|x| x.privilege == companion && x.relation == a.relation && x.grantee == a.grantee)
+            };
+            Some(MemberRow {
+                roleid: oid(role)?,
+                member: oid(&a.grantee)?,
+                grantor: oid(&a.grantor).unwrap_or(BOOTSTRAP_ROLE),
+                admin: a.grantable,
+                inherit: !off(NOINHERIT),
+                set: !off(NOSET),
+            })
+        })
+        .collect()
 }
 
 /// The roles `rdb_roles` holds, with the bootstrap superuser's oid given to
@@ -1528,6 +1569,7 @@ pub(crate) const NEW_VIEWS: &[&str] = &[
     "pg_constraint",
     "pg_am",
     "pg_roles",
+    "pg_auth_members",
     "pg_user",
     "pg_collation",
     "pg_description",
@@ -1723,6 +1765,15 @@ pub(crate) fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]
             ("rolbypassrls", BOOL),
             ("rolconfig", ARRAY),
             ("oid", I64),
+        ],
+        "pg_auth_members" => &[
+            ("oid", I64),
+            ("roleid", I64),
+            ("member", I64),
+            ("grantor", I64),
+            ("admin_option", BOOL),
+            ("inherit_option", BOOL),
+            ("set_option", BOOL),
         ],
         "pg_user" => &[
             ("usename", STRING),
@@ -2238,6 +2289,22 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                     V::B(r.superuser),
                     V::N,
                     V::I(r.oid),
+                ]
+            })
+            .collect(),
+        "pg_auth_members" => model
+            .memberships
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                vec![
+                    V::I(AUTH_MEMBERS_OID_BASE + i as i64),
+                    V::I(m.roleid),
+                    V::I(m.member),
+                    V::I(m.grantor),
+                    V::B(m.admin),
+                    V::B(m.inherit),
+                    V::B(m.set),
                 ]
             })
             .collect(),

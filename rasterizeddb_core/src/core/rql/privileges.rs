@@ -58,13 +58,54 @@ pub enum Target {
     Other(String),
 }
 
+/// One option of a role membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipOption {
+    Admin,
+    Inherit,
+    Set,
+}
+
+/// The companion row that switches a membership's INHERIT off: its
+/// privileges are not the member's, though SET ROLE may still reach it.
+pub const NOINHERIT: &str = "NOINHERIT";
+/// The companion row that switches a membership's SET off: SET ROLE may not
+/// reach it, though its privileges may be inherited.
+pub const NOSET: &str = "NOSET";
+
+/// The `WITH …` options after a GRANT's grantees: (GRANT OPTION, ADMIN,
+/// INHERIT, SET). PostgreSQL 16's forms and the older `WITH … OPTION`.
+fn grant_with(text: &str) -> Result<(bool, bool, Option<bool>, Option<bool>), (&'static str, String)> {
+    let (mut grant, mut admin, mut inherit, mut set) = (false, false, None, None);
+    for part in text.split(',') {
+        let words: Vec<String> = part.split_whitespace().map(str::to_ascii_uppercase).collect();
+        let value = match words.get(1).map(String::as_str) {
+            Some("OPTION" | "TRUE") if words.len() == 2 => true,
+            Some("FALSE") if words.len() == 2 => false,
+            _ => return Err(("42601", format!("syntax error in GRANT at WITH {}", part.trim()))),
+        };
+        match words[0].as_str() {
+            "GRANT" => grant = value,
+            "ADMIN" => admin = value,
+            "INHERIT" => inherit = Some(value),
+            "SET" => set = Some(value),
+            other => return Err(("42601", format!("unrecognized role option \"{other}\""))),
+        }
+    }
+    Ok((grant, admin, inherit, set))
+}
+
 /// A privilege statement, parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrivilegeStatement {
     Grant { privileges: Vec<String>, target: Target, grantees: Vec<String>, grantable: bool },
     Revoke { privileges: Vec<String>, target: Target, grantees: Vec<String>, grant_option_only: bool },
-    GrantRole { roles: Vec<String>, members: Vec<String> },
-    RevokeRole { roles: Vec<String>, members: Vec<String> },
+    /// `GRANT r TO m [WITH ADMIN|INHERIT|SET {OPTION|TRUE|FALSE}, …]`
+    /// (R2): `admin` the ADMIN option; `inherit`/`set` `None` where unsaid.
+    GrantRole { roles: Vec<String>, members: Vec<String>, admin: bool, inherit: Option<bool>, set: Option<bool> },
+    /// `REVOKE [ADMIN|INHERIT|SET OPTION FOR] r FROM m`: `option` names the
+    /// one option taken back, the membership kept; `None` revokes it.
+    RevokeRole { roles: Vec<String>, members: Vec<String>, option: Option<MembershipOption> },
     /// `ALTER DEFAULT PRIVILEGES [FOR ROLE r] [IN SCHEMA s] GRANT|REVOKE … ON
     /// TABLES …`; `for_role` `None` for the current role. `grant` false for
     /// REVOKE. `tables` false for another object kind (accepted, unenforced).
@@ -179,14 +220,15 @@ pub fn parse_privilege_statement(sql: &str) -> Option<Result<PrivilegeStatement,
             return Some(Err(("42601", "syntax error in GRANT: expected TO".to_string())));
         };
         let mut grantees_text = body[to + 2..].trim().to_string();
-        let mut grantable = false;
-        for suffix in ["WITH GRANT OPTION", "WITH ADMIN OPTION", "WITH INHERIT TRUE", "WITH SET TRUE"] {
-            if let Some(at) = kw(&grantees_text, &suffix[..4]).filter(|at| grantees_text[*at..].to_ascii_uppercase().starts_with(suffix)) {
-                grantable |= suffix == "WITH GRANT OPTION";
-                grantees_text = grantees_text[..at].trim().to_string();
-            }
-        }
         if let Some(at) = kw(&grantees_text, "GRANTED") {
+            grantees_text = grantees_text[..at].trim().to_string();
+        }
+        let (mut grantable, mut admin, mut inherit, mut set) = (false, false, None, None);
+        if let Some(at) = kw(&grantees_text, "WITH") {
+            match grant_with(&grantees_text[at + 4..]) {
+                Ok(options) => (grantable, admin, inherit, set) = options,
+                Err(e) => return Some(Err(e)),
+            }
             grantees_text = grantees_text[..at].trim().to_string();
         }
         let grantees = grantee_list(&grantees_text);
@@ -197,17 +239,31 @@ pub fn parse_privilege_statement(sql: &str) -> Option<Result<PrivilegeStatement,
                 grantees,
                 grantable,
             }),
-            None => Ok(PrivilegeStatement::GrantRole { roles: grantee_list(&body[..to]), members: grantees }),
+            None => Ok(PrivilegeStatement::GrantRole { roles: grantee_list(&body[..to]), members: grantees, admin, inherit, set }),
         });
     }
     if upper.starts_with("REVOKE ") {
         let mut body = &text[7..];
         let mut grant_option_only = false;
-        if body.to_ascii_uppercase().starts_with("GRANT OPTION FOR ") {
+        let mut option = None;
+        let head = body.to_ascii_uppercase();
+        if head.starts_with("GRANT OPTION FOR ") {
             grant_option_only = true;
             body = &body[17..];
-        } else if body.to_ascii_uppercase().starts_with("ADMIN OPTION FOR ") {
-            body = &body[17..];
+        } else {
+            // Once skipped and ignored: `REVOKE ADMIN OPTION FOR r FROM u`
+            // revoked the whole membership.
+            for (prefix, which) in [
+                ("ADMIN OPTION FOR ", MembershipOption::Admin),
+                ("INHERIT OPTION FOR ", MembershipOption::Inherit),
+                ("SET OPTION FOR ", MembershipOption::Set),
+            ] {
+                if head.starts_with(prefix) {
+                    option = Some(which);
+                    body = &body[prefix.len()..];
+                    break;
+                }
+            }
         }
         let Some(from) = kw(body, "FROM") else {
             return Some(Err(("42601", "syntax error in REVOKE: expected FROM".to_string())));
@@ -223,13 +279,14 @@ pub fn parse_privilege_statement(sql: &str) -> Option<Result<PrivilegeStatement,
         }
         let grantees = grantee_list(&grantees_text);
         return Some(match kw(&body[..from], "ON") {
+            Some(_) if option.is_some() => Err(("42601", "an OPTION FOR revoke names roles, not privileges ON an object".to_string())),
             Some(on) => privilege_list(&body[..on]).map(|privileges| PrivilegeStatement::Revoke {
                 privileges,
                 target: target_of(&body[on + 2..from]),
                 grantees,
                 grant_option_only,
             }),
-            None => Ok(PrivilegeStatement::RevokeRole { roles: grantee_list(&body[..from]), members: grantees }),
+            None => Ok(PrivilegeStatement::RevokeRole { roles: grantee_list(&body[..from]), members: grantees, option }),
         });
     }
     if upper.starts_with("ALTER DEFAULT PRIVILEGES") {
@@ -814,11 +871,30 @@ pub async fn assign_owners(database: &Arc<Database>, owner: &str) -> Result<usiz
 /// The roles `role` acts as: itself, and every role it is a member of,
 /// through memberships of memberships.
 pub fn roles_of(rows: &[AclRow], role: &str) -> Vec<String> {
+    reachable(rows, role, NOINHERIT)
+}
+
+/// The roles `role` may `SET ROLE` to, itself first: every membership on
+/// the way has SET (R2). Who acts as a role (REASSIGN OWNED, DROP OWNED)
+/// asks this too, as PostgreSQL does.
+pub fn settable_roles(rows: &[AclRow], role: &str) -> Vec<String> {
+    reachable(rows, role, NOSET)
+}
+
+/// The roles reached from `role` through memberships that carry no `skip`
+/// companion row.
+fn reachable(rows: &[AclRow], role: &str, skip: &str) -> Vec<String> {
+    // Rare: collected once, so a walk with none checks nothing per edge.
+    let off: Vec<(&str, &str)> =
+        rows.iter().filter(|r| r.privilege == skip).map(|r| (r.relation.as_str(), r.grantee.as_str())).collect();
     let mut out = vec![role.to_string()];
     let mut at = 0;
     while at < out.len() {
         let member = out[at].clone();
         for row in rows.iter().filter(|r| r.privilege == "MEMBER" && r.grantee == member) {
+            if off.iter().any(|(rel, g)| *rel == row.relation && *g == row.grantee) {
+                continue;
+            }
             if let Some(granted) = row.relation.strip_prefix("@role:") {
                 if !out.iter().any(|o| o == granted) {
                     out.push(granted.to_string());
@@ -828,6 +904,14 @@ pub fn roles_of(rows: &[AclRow], role: &str) -> Vec<String> {
         at += 1;
     }
     out
+}
+
+/// Whether `actor` holds ADMIN OPTION on `role`: a membership of its own,
+/// or of a role it inherits, granted WITH ADMIN.
+pub fn has_admin_option(rows: &[AclRow], actor: &str, role: &str) -> bool {
+    let relation = format!("@role:{role}");
+    let mine = roles_of(rows, actor);
+    rows.iter().any(|r| r.privilege == "MEMBER" && r.grantable && r.relation == relation && mine.contains(&r.grantee))
 }
 
 /// `relation`'s owner, `None` for one created before owners were recorded.
@@ -898,7 +982,13 @@ mod tests {
         );
         assert_eq!(
             parse_privilege_statement("GRANT readers TO alice, bob").unwrap().unwrap(),
-            PrivilegeStatement::GrantRole { roles: vec!["readers".into()], members: vec!["alice".into(), "bob".into()] }
+            PrivilegeStatement::GrantRole {
+                roles: vec!["readers".into()],
+                members: vec!["alice".into(), "bob".into()],
+                admin: false,
+                inherit: None,
+                set: None,
+            }
         );
         assert_eq!(
             parse_privilege_statement("ALTER DEFAULT PRIVILEGES FOR ROLE owner IN SCHEMA public GRANT SELECT ON TABLES TO app").unwrap().unwrap(),
