@@ -1,0 +1,27 @@
+RasterizedDB enterprise features
+Licensor: Denev Operations EOOD
+
+The crates rasterizeddb_enterprise and rasterizeddb_gateway_enterprise, and
+any file that names this licence in its crate manifest, are licensed under
+the PolyForm Small Business License 1.0.0, as published at
+
+    https://polyformproject.org/licenses/small-business/1.0.0
+
+with the following adaptation, which takes precedence over the published
+text where they differ:
+
+    The licence's small-business limits are replaced by these: the licence
+    applies only to an organisation that has no more than 100 employees, no
+    more than 1,000,000 in revenue in its last fiscal year, and no more than
+    5,000,000 in assets. Any other organisation must obtain a commercial
+    licence from Denev Operations EOOD.
+
+PENDING LEGAL REVIEW. The adaptation above records the licensor's decision of
+2026-11-23 (sharding plan, decisions D10 and D10b). Its wording, the currency
+of the amounts, how employees, revenue and assets are counted, and the
+additional permission that lets the GPL-3.0-only parts of RasterizedDB be
+combined with these crates in one binary (GPLv3 section 7) are to be written
+by the licensor's counsel. Until then, contact Denev Operations EOOD before
+any use above the limits.
+
+Everything in this repository not named above remains GPL-3.0-only.

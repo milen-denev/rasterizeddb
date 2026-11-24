@@ -4820,6 +4820,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rasterizeddb_enterprise"
+version = "1.0.0"
+dependencies = [
+ "log",
+ "rasterizeddb_core",
+]
+
+[[package]]
 name = "rasterizeddb_filter_tests"
 version = "0.1.0"
 dependencies = [
@@ -4844,6 +4852,15 @@ dependencies = [
  "socket2",
  "tokio",
  "tokio-rustls",
+]
+
+[[package]]
+name = "rasterizeddb_gateway_enterprise"
+version = "1.0.0"
+dependencies = [
+ "env_logger",
+ "log",
+ "rasterizeddb_gateway",
 ]
 
 [[package]]

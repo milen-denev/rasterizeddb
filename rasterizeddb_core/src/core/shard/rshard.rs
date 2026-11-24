@@ -21,9 +21,11 @@
 //! the map), one ahead of it `57P03` (this shard has not seen the new map
 //! yet), both before effect.
 //!
-//! **Not in version 1, refused before effect:** per-user-shard (`pinned`)
-//! sessions, whose placement list belongs to the licensed hook; native
-//! requests; `TopN` and `Coordinator` fan-out parts (B1c's coordinator); a
+//! **Per-user-shard (`pinned`) sessions** are admitted only when the
+//! placement hook says this shard hosts the role (`RDB03` otherwise, so the
+//! gateway refreshes the user's route).
+//!
+//! **Not in version 1, refused before effect:** native requests; `TopN` and `Coordinator` fan-out parts (B1c's coordinator); a
 //! batch ending in Flush rather than Sync.
 
 use std::collections::HashMap;
@@ -185,11 +187,11 @@ async fn handle(conn: &Conn, data: &[u8]) -> Response {
             Response::Template { schema_epoch: SCHEMA_EPOCH.load(Ordering::Acquire), template }
         }
         Request::OpenSession { session, database, role, params, pinned, .. } => {
-            if pinned {
+            if pinned && !crate::core::policy_hooks::placement().hosts_pinned_role(&database, &role) {
                 return refuse(
-                    PROTOCOL,
+                    MOVED,
                     true,
-                    "per-user-shard sessions need the placement hook, which this build does not have",
+                    format!("role \"{role}\" of \"{database}\" is not placed on this shard: refresh the user's route"),
                 );
             }
             open_session(conn, session, &database, &role, params).await

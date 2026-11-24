@@ -100,6 +100,13 @@ pub trait PlacementPolicy: Send + Sync + 'static {
     fn pinned(&self) -> Vec<(u64, u64)> {
         Vec::new()
     }
+
+    /// Whether this shard hosts per-user-shard role `role` of `database`
+    /// (G11): a gateway's pinned session is admitted only then, so a stale
+    /// or forged mapping lands nowhere. Nobody is hosted by default.
+    fn hosts_pinned_role(&self, _database: &str, _role: &str) -> bool {
+        false
+    }
 }
 
 /// Today's behaviour.

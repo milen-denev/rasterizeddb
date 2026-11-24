@@ -1,0 +1,24 @@
+[package]
+name = "rasterizeddb_gateway_enterprise"
+version = "1.0.0"
+edition = "2024"
+description = "RasterizedDB gateway enterprise features: per-user shards (G11) for database-as-a-service"
+repository = "https://github.com/milen-denev/rasterizeddb"
+# PolyForm Small Business 1.0.0, adapted (D10, D10b): see LICENSE.
+license-file = "LICENSE"
+authors = ["Milen Denev"]
+publish = false
+
+[[bin]]
+name = "rasterizeddb_gateway_enterprise"
+path = "src/main.rs"
+
+[dependencies]
+rasterizeddb_gateway = { path = "../rasterizeddb_gateway", version = "1.0.0" }
+env_logger = "0.11"
+log = "0.4"
+
+[features]
+default = ["user_routing"]
+# Per-user shards (G11): a login locked to its shard.
+user_routing = []
