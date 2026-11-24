@@ -448,6 +448,20 @@ impl Migrator {
         )
     }
 
+    /// A repeatable step of grants, run again whenever they change, so a
+    /// migration carries its permissions:
+    /// `.grants("app grants", &[Grant::privileges(&["SELECT"]).on_table("orders").to("app")])`.
+    /// Its undo revokes them.
+    pub fn grants(self, name: &str, grants: &[crate::admin::Grant]) -> Result<Self> {
+        let up = grants.iter().map(|g| g.to_sql(true)).collect::<Result<Vec<_>>>()?;
+        let down = grants.iter().map(|g| g.to_sql(false)).collect::<Result<Vec<_>>>()?;
+        let mut migrator = self.push(name, Body::Sql(up), true);
+        if let Some(step) = migrator.steps.last_mut() {
+            step.down = Some(Body::Sql(down));
+        }
+        Ok(migrator)
+    }
+
     /// The statements that undo the step added last, for
     /// [`rollback_to`](Self::rollback_to).
     pub fn down(mut self, statements: &[&str]) -> Self {
