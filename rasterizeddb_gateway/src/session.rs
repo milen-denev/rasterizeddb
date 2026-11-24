@@ -806,9 +806,19 @@ impl Session {
             && !self.txn.opening.is_empty()
         {
             // A shard the transaction reaches for the first time opens its
-            // own part of it.
+            // own part of it, under the multi-shard lock timeout: a cycle of
+            // waits across shards is seen whole by no shard's detector.
             payload.extend_from_slice(&self.txn.opening);
             filter.skip_rfq = self.txn.opening_queries;
+            let ms = self.core.shared.cfg.two_phase_lock_timeout_ms;
+            if ms > 0 {
+                let sql = format!("SET LOCAL lock_timeout = {ms}");
+                payload.push(b'Q');
+                payload.extend_from_slice(&((sql.len() + 5) as i32).to_be_bytes());
+                payload.extend_from_slice(sql.as_bytes());
+                payload.push(0);
+                filter.skip_rfq += 1;
+            }
         }
         let mut parsed_now: Vec<(String, u64)> = Vec::new();
         if let Some(vs) = self.vs.get(&shard) {
