@@ -69,6 +69,9 @@ pub enum Introspect {
     /// level-0 block range and stored size, what the auto-balancer plans
     /// from (sharding-plan.md §4.6b).
     ShardLoad,
+    /// A table's 128-bit schema fingerprint, as cluster DDL compares them
+    /// across shards (sharding-plan.md B1a.10).
+    SchemaFingerprint(String),
     Columns(String),
     SchemaMap,
     /// Every CHECK constraint and whether this binary enforces it.
@@ -188,6 +191,10 @@ pub fn parse(sql: &str) -> Option<Result<Introspect, String>> {
             }
             Some(_) => Some(Err("SHOW TABLE STATS takes one table name".to_string())),
             None => Some(Err("SHOW TABLE STATS names no table".to_string())),
+        },
+        Some("SCHEMA") if words.get(2).copied() == Some("FINGERPRINT") => match original.get(3) {
+            Some(name) if original.len() == 4 => Some(Ok(Introspect::SchemaFingerprint(normalize_name(name)))),
+            _ => Some(Err("SHOW SCHEMA FINGERPRINT takes one table name".to_string())),
         },
         Some("SHARD") if words.get(2).copied() == Some("LOAD") => {
             if words.len() > 3 {
@@ -345,6 +352,7 @@ pub fn result_fields(statement: &Introspect) -> Option<Vec<(String, DbType)>> {
         // `lo` and `hi` are text: the hash space is `[0, 2^64)`, so the last
         // partition's `hi` does not fit a BIGINT, and a `lo` past 2^63 would
         // read as negative. Hex, as the map log and the design write them.
+        Introspect::SchemaFingerprint(_) => vec![text("table_name"), text("fingerprint"), number("schema_epoch")],
         Introspect::ShardLoad => vec![
             text("table_name"),
             number("pid"),
@@ -482,6 +490,10 @@ pub async fn execute(statement: &Introspect, database: &Arc<Database>) -> Vec<u8
             Err(e) => failure(&e),
         },
         Introspect::Shards => rows(shards()),
+        Introspect::SchemaFingerprint(name) => match schema_fingerprint(database, name) {
+            Ok(r) => rows(r),
+            Err(e) => failure(&e),
+        },
         Introspect::ShardLoad => match shard_load(database).await {
             Ok(r) => rows(r),
             Err(e) => failure(&e),
@@ -1727,6 +1739,20 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
 /// `[lo, hi)` range of the hash space, where its files are, whether it has
 /// any, and its sizes (zero until it is materialized). Refused for a plain
 /// table, and for a partitioned table that cannot be opened.
+/// `SHOW SCHEMA FINGERPRINT t`.
+#[cfg(feature = "sharding")]
+fn schema_fingerprint(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
+    let relation = database.relation(name).ok_or_else(|| format!("relation `{}` does not exist", name))?;
+    let fp = crate::core::shard::ddl::fingerprint(relation.schema());
+    let epoch = crate::core::shard::rshard::SCHEMA_EPOCH.load(Ordering::Acquire);
+    Ok(vec![row(&[Cell::Text(name.to_string()), Cell::Text(format!("{fp:032x}")), Cell::Number(epoch)])])
+}
+
+#[cfg(not(feature = "sharding"))]
+fn schema_fingerprint(_database: &Arc<Database>, _name: &str) -> Result<Vec<Row>, String> {
+    Err("SHOW SCHEMA FINGERPRINT needs a server built with the sharding feature".to_string())
+}
+
 /// `SHOW SHARD LOAD`: every materialized partition's level-0 block range and
 /// size. `statements` is 0 until per-range statement counters exist; the
 /// balancer then weighs bytes alone.
@@ -2736,6 +2762,15 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         help: "seconds a partition goes without a routed access before it closes; 0 turns idle close off",
     },
     ConfigKey {
+        section: "shard",
+        key: "schema_epoch",
+        hot: true,
+        set_with: "SET CONFIG shard.schema_epoch = 2",
+        options: "",
+        help: "the schema epoch a shard classifies statements under; cluster DDL raises it on every shard once their \
+               fingerprints agree, and gateways drop templates of older epochs; never goes down",
+    },
+    ConfigKey {
         section: "partition",
         key: "resident_budget",
         hot: true,
@@ -2905,6 +2940,8 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             ("partition", "max_open") => crate::core::partition::budget::settings::max_open().to_string(),
             ("partition", "idle_close_secs") => crate::core::partition::budget::settings::idle_close_secs().to_string(),
             ("partition", "resident_budget") => crate::core::partition::budget::settings::resident_budget().to_string(),
+            #[cfg(feature = "sharding")]
+            ("shard", "schema_epoch") => crate::core::shard::rshard::SCHEMA_EPOCH.load(Ordering::Acquire).to_string(),
             ("index_snapshot", "idle_checkpoint_secs") => {
                 crate::core::index_store::seal::settings::idle_checkpoint_secs().to_string()
             }
@@ -3235,7 +3272,7 @@ async fn set_config_in(database: Option<&Arc<Database>>, key: &str, value: &str)
 /// database's: what a session's `SET CONFIG` saves, and what a start applies
 /// from the settings file ([`apply_saved_hot_keys`]). `replication.*` and
 /// `vacuum.enabled` act on an open database and are neither.
-const PROCESS_WIDE_SECTIONS: &[&str] = &["wal", "filter", "query_stats", "auto_compact", "partition", "index_snapshot"];
+const PROCESS_WIDE_SECTIONS: &[&str] = &["wal", "filter", "query_stats", "auto_compact", "partition", "index_snapshot", "shard"];
 
 /// Sets one process-wide hot key. Synchronous, so that a start can apply the
 /// saved ones before its runtime exists.
@@ -3372,6 +3409,15 @@ fn set_process_wide(key: &str, section: &str, name: &str, value: &str) -> Result
                 _ => return Err(format!("`{}` has no live setter", key)),
             };
             Ok(format!("{key} is now {now}"))
+        }
+        #[cfg(feature = "sharding")]
+        "shard" if name == "schema_epoch" => {
+            let n: u64 = value.trim().parse().map_err(|_| format!("`{}` is not a whole number for {}", value, key))?;
+            let was = crate::core::shard::rshard::SCHEMA_EPOCH.fetch_max(n, Ordering::AcqRel);
+            if n < was {
+                return Err(format!("{key} is {was}; an epoch never goes down"));
+            }
+            return Ok(format!("{key} is now {n}"));
         }
         "partition" => {
             use crate::core::partition::budget::settings;

@@ -12,7 +12,17 @@
 //!                       [--pin LO:HI …] [--exclude SHARD …]
 //!                       [--apply --fenced --out NEW_MAP --state-dir DIR
 //!                        --table TABLE:COLUMN:TYPE [--table …]]
+//! rdb-shard ddl         --map MAP --file DDL.sql --table TABLE [--table …]
+//!                       [--home SHARD] [--state STATE]
 //! ```
+//!
+//! `ddl` is cluster DDL (sharding-plan.md B1a.10): the file runs on the home
+//! shard, then on every other shard in id order; then every named table's
+//! `SHOW SCHEMA FINGERPRINT` must agree on every shard, and only then is
+//! each shard's `shard.schema_epoch` raised past the highest, so gateways
+//! drop their old templates. A failure or a disagreement stops, names the
+//! shard, and records the shards already applied in STATE; the next run
+//! with the same STATE resumes from there (DDL is not transactional).
 //!
 //! `rebalance` reads `SHOW SHARD LOAD` from every shard and prints the round
 //! the auto-balancer plans (sharding-plan.md §4.6b). With `--apply` it runs
@@ -88,7 +98,7 @@ impl Args {
 }
 
 fn usage() -> String {
-    "usage: rdb-shard init|show|move-tenant|rollback|retire|rebalance --map MAP … (see the source header)".to_string()
+    "usage: rdb-shard init|show|move-tenant|rollback|retire|rebalance|ddl --map MAP … (see the source header)".to_string()
 }
 
 fn main() -> ExitCode {
@@ -124,6 +134,7 @@ async fn run(args: &Args) -> std::result::Result<(), String> {
         "rollback" => rollback(args, &options).await,
         "retire" => retire(args, &options).await,
         "rebalance" => rebalance(args, &options).await,
+        "ddl" => cluster_ddl(args, &options).await,
         other => Err(format!("unknown command {other:?}\n{}", usage())),
     }
 }
@@ -773,5 +784,96 @@ async fn rebalance(args: &Args, options: &Options) -> std::result::Result<(), St
         plan.moves.len(),
         current.epoch()
     );
+    Ok(())
+}
+
+/// `ddl` (module docs).
+async fn cluster_ddl(args: &Args, options: &Options) -> std::result::Result<(), String> {
+    let map = read_map(args.one("map")?)?;
+    let file = args.one("file")?;
+    let sql = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?;
+    let tables: Vec<String> = args.flags.get("table").cloned().ok_or("--table TABLE is required (each table the DDL changes)")?;
+    let home: ShardId = match args.opt("home") {
+        Some(h) => h.parse().map_err(|_| "--home takes a shard id".to_string())?,
+        None => map.shards().first().map(|s| s.id).ok_or("the map has no shards")?,
+    };
+    if map.shard(home).is_none() {
+        return Err(format!("home shard {home} is not in the map"));
+    }
+    let state_path = args.opt("state").map(str::to_string).unwrap_or_else(|| format!("{file}.state"));
+    // Shards already applied by an earlier run of this DDL.
+    let digest = rasterizeddb_router::xxh64::xxh64(sql.as_bytes(), 0x5244_4244_444C_0001);
+    let mut applied: Vec<ShardId> = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(&state_path) {
+        let mut lines = text.lines();
+        if lines.next() != Some(&format!("ddl {digest:016x}")) {
+            return Err(format!("{state_path} records another DDL file: remove it or pass another --state"));
+        }
+        applied = lines.filter_map(|l| l.strip_prefix("applied ")).filter_map(|v| v.parse().ok()).collect();
+    }
+    let record = |applied: &[ShardId]| -> std::result::Result<(), String> {
+        let mut out = format!("ddl {digest:016x}\n");
+        for id in applied {
+            out.push_str(&format!("applied {id}\n"));
+        }
+        let tmp = format!("{state_path}.tmp");
+        std::fs::write(&tmp, out).map_err(|e| format!("{tmp}: {e}"))?;
+        std::fs::rename(&tmp, &state_path).map_err(|e| format!("{state_path}: {e}"))
+    };
+    let mut order: Vec<ShardId> = vec![home];
+    order.extend(map.shards().iter().map(|s| s.id).filter(|&id| id != home));
+    let mut clients = Vec::with_capacity(order.len());
+    for &id in &order {
+        clients.push((id, connect(&map, id, options).await?));
+    }
+    for (id, c) in &clients {
+        if applied.contains(id) {
+            println!("shard {id}: already applied");
+            continue;
+        }
+        if let Err(e) = c.run(&sql).await {
+            record(&applied)?;
+            return Err(format!(
+                "shard {id}: {e}. Shards {applied:?} have the DDL; fix the cause and run again with --state {state_path} to resume"
+            ));
+        }
+        applied.push(*id);
+        record(&applied)?;
+        println!("shard {id}: applied");
+    }
+    // Every table's fingerprint must agree everywhere.
+    let mut highest_epoch = 0i64;
+    for table in &tables {
+        let mut seen: Option<(ShardId, String)> = None;
+        for (id, c) in &clients {
+            let rows: Vec<(String, String, i64)> = c
+                .fetch_all(&format!("SHOW SCHEMA FINGERPRINT {table}"), &[])
+                .await
+                .map_err(|e| format!("shard {id}, {table}: {e}"))?;
+            let Some((_, fp, epoch)) = rows.into_iter().next() else {
+                return Err(format!("shard {id} gave no fingerprint for {table}"));
+            };
+            highest_epoch = highest_epoch.max(epoch);
+            match &seen {
+                None => seen = Some((*id, fp)),
+                Some((first, want)) if *want != fp => {
+                    return Err(format!(
+                        "PARTIAL: {table} has fingerprint {want} on shard {first} but {fp} on shard {id}. \
+                         Gateways keep the old schema epoch; make the shards agree, then run again with --state {state_path}"
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        println!("{table}: one fingerprint on every shard");
+    }
+    let next = highest_epoch + 1;
+    for (id, c) in &clients {
+        c.run(&format!("SET CONFIG shard.schema_epoch = {next}"))
+            .await
+            .map_err(|e| format!("shard {id}: raising the schema epoch: {e}"))?;
+    }
+    let _ = std::fs::remove_file(&state_path);
+    println!("schema epoch {next} on every shard");
     Ok(())
 }
