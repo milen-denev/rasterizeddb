@@ -763,7 +763,7 @@ pub async fn inline_calls(database: &Arc<Database>, sql: &str, tx: Option<TxId>,
     if !may_call_a_routine(database, sql).await {
         return Ok(None);
     }
-    let mut acl: Option<Vec<crate::core::rql::privileges::AclRow>> = None;
+    let mut acl: Option<std::sync::Arc<Vec<crate::core::rql::privileges::AclRow>>> = None;
     let mut cache: std::collections::HashMap<String, Vec<Routine>> = std::collections::HashMap::new();
     let mut text = sql.to_string();
     let mut changed = false;
@@ -801,10 +801,10 @@ pub async fn inline_calls(database: &Arc<Database>, sql: &str, tx: Option<TxId>,
             };
             if let Some(role) = role {
                 if acl.is_none() {
-                    acl = Some(crate::core::rql::privileges::load(database, tx).await.map_err(|e| ("XX000", e))?);
+                    acl = Some(crate::core::rql::privileges::load_shared(database, tx).await.map_err(|e| ("XX000", e))?);
                 }
                 let key = format!("@function:{}", routine.name);
-                if !crate::core::rql::privileges::may_execute(acl.as_deref().unwrap_or_default(), role, &key) {
+                if !crate::core::rql::privileges::may_execute(acl.as_deref().map(Vec::as_slice).unwrap_or_default(), role, &key) {
                     return Err(("42501", format!("permission denied for function {}", routine.name)));
                 }
             }

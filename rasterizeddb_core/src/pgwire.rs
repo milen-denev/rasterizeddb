@@ -13561,7 +13561,7 @@ where
                     return Ok(true);
                 };
                 let member = base.superuser
-                    || match crate::core::rql::privileges::load(&database, None).await {
+                    || match crate::core::rql::privileges::load_shared(&database, None).await {
                         Ok(rows) => crate::core::rql::privileges::settable_roles(&rows, &base.name).iter().any(|g| g == &r.name),
                         Err(_) => false,
                     };

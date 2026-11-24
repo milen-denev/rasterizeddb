@@ -747,6 +747,26 @@ fn id_of(row: &AclRow) -> String {
     format!("{}\u{1}{}\u{1}{}", row.relation, row.grantee, row.privilege)
 }
 
+/// [`load`] without the copy: the cached rows themselves on a hit. What a
+/// check that only reads them takes. Every statement of a role that is no
+/// superuser reads the ACL, and [`load`] copied all of it each time.
+pub async fn load_shared(database: &Arc<Database>, tx: Option<TxId>) -> Result<std::sync::Arc<Vec<AclRow>>, String> {
+    if !database.has_table(ACL_TABLE) {
+        return Ok(std::sync::Arc::new(Vec::new()));
+    }
+    if tx.is_none()
+        && let Some(rows) = cache::get(database)
+    {
+        return Ok(rows);
+    }
+    let seen = cache::generation(database.id);
+    let rows = load_uncached(database, tx).await?;
+    if tx.is_none() {
+        cache::put(database, &rows, seen);
+    }
+    Ok(std::sync::Arc::new(rows))
+}
+
 /// Every row `tx` sees.
 pub async fn load(database: &Arc<Database>, tx: Option<TxId>) -> Result<Vec<AclRow>, String> {
     if !database.has_table(ACL_TABLE) {

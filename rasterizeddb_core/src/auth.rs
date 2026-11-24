@@ -1529,7 +1529,7 @@ pub async fn role_attrs(
     if !database.has_table(crate::core::rql::privileges::ACL_TABLE) {
         return out;
     }
-    let Ok(rows) = crate::core::rql::privileges::load(database, tx).await else {
+    let Ok(rows) = crate::core::rql::privileges::load_shared(database, tx).await else {
         return out;
     };
     for r in rows.iter().filter(|r| r.relation == ROLE_ATTR_RELATION && r.grantee == role) {
@@ -1700,12 +1700,12 @@ pub async fn role_settings(database: &rclite::Arc<crate::core::database::Databas
     if !database.has_table(crate::core::rql::privileges::ACL_TABLE) {
         return Vec::new();
     }
-    let Ok(rows) = crate::core::rql::privileges::load(database, None).await else {
+    let Ok(rows) = crate::core::rql::privileges::load_shared(database, None).await else {
         return Vec::new();
     };
-    rows.into_iter()
+    rows.iter()
         .filter(|r| r.relation == ROLE_ATTR_RELATION && r.grantee == role)
-        .filter_map(|r| r.privilege.strip_prefix("SET:").map(|p| (p.to_string(), r.grantor)))
+        .filter_map(|r| r.privilege.strip_prefix("SET:").map(|p| (p.to_string(), r.grantor.clone())))
         .collect()
 }
 

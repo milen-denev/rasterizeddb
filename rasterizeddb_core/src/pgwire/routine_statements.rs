@@ -125,7 +125,7 @@ where
             };
             if !state.principal.may_administer() && !state.view_internal {
                 // Unreadable, refused: no checks are skipped (R0).
-                let allowed = crate::core::rql::privileges::load(database, tx).await.is_ok_and(|rows| {
+                let allowed = crate::core::rql::privileges::load_shared(database, tx).await.is_ok_and(|rows| {
                     crate::core::rql::privileges::may_execute(&rows, &state.principal.name, &format!("@procedure:{}", routine.name))
                 });
                 if !allowed {

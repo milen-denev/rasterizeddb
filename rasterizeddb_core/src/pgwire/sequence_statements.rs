@@ -187,7 +187,7 @@ async fn sequence_refusal(database: &Arc<Database>, tx: Option<TxId>, stmt: &str
     if calls.is_empty() {
         return None;
     }
-    let Ok(rows) = privileges::load(database, tx).await else {
+    let Ok(rows) = privileges::load_shared(database, tx).await else {
         return Some(("42501", "permission denied: the privileges could not be read".to_string()));
     };
     let mut implicit = None;

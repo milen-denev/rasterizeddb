@@ -154,7 +154,7 @@ where
     let tx = state.current_tx();
     let me = state.principal.name.clone();
     let admin = state.principal.may_administer();
-    let rows = match privileges::load(database, tx).await {
+    let rows = match privileges::load_shared(database, tx).await {
         Ok(rows) => rows,
         Err(e) => return fail_statement(state, stream, "XX000", &e).await,
     };
@@ -453,7 +453,7 @@ pub(super) async fn check(database: &Arc<Database>, state: &SessionState, stmt: 
     }
     let me = state.principal.name.as_str();
     let tx = state.current_tx();
-    let rows = match privileges::load(database, tx).await {
+    let rows = match privileges::load_shared(database, tx).await {
         Ok(rows) => rows,
         Err(e) => return Some(("42501", format!("permission denied: the privilege catalogue could not be read ({e})"))),
     };
@@ -773,7 +773,7 @@ pub(super) async fn require_view_owner(database: &Arc<Database>, state: &Session
         return None;
     }
     let tx = state.current_tx();
-    let rows = match privileges::load(database, tx).await {
+    let rows = match privileges::load_shared(database, tx).await {
         Ok(rows) => rows,
         Err(e) => return Some(("42501", format!("permission denied: the privilege catalogue could not be read ({e})"))),
     };
