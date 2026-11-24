@@ -9410,7 +9410,7 @@ where
                     .await
                 {
                     Ok(()) => send_command_complete(stream, tag).await?,
-                    Err(e) => fail_statement(state, stream, "42710", &e).await?,
+                    Err(e) => fail_statement(state, stream, crate::auth::role_statement_sqlstate(&e), &e).await?,
                 }
             }
         }
