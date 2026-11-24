@@ -2694,6 +2694,14 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         options: "",
         help: "1 in this many index loads is checked against a copy read from rows in the background; 0 checks none",
     },
+    ConfigKey {
+        section: "roles",
+        key: "create_database_roles",
+        hot: true,
+        set_with: "SET CONFIG roles.create_database_roles = owner",
+        options: "owner|all",
+        help: "which roles CREATE DATABASE gives the new database: its creator and its OWNER (owner), or every role of the default database with its verifier (all)",
+    },
 ];
 
 fn config_keys() -> Vec<Row> {
@@ -2787,6 +2795,7 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             ("auto_compact", "dead_fraction") => crate::auto_compact_dead_fraction().to_string(),
             ("auto_compact", "dead_fraction_max_slots") => crate::auto_compact_dead_fraction_max_slots().to_string(),
             ("auto_compact", "cooldown_secs") => crate::auto_compact_cooldown_secs().to_string(),
+            ("roles", "create_database_roles") => crate::auth::create_database_roles().to_string(),
             ("partition", "open_budget") => crate::core::partition::budget::process_figures().0.to_string(),
             ("partition", "max_open") => crate::core::partition::budget::settings::max_open().to_string(),
             ("partition", "idle_close_secs") => crate::core::partition::budget::settings::idle_close_secs().to_string(),
@@ -3120,12 +3129,26 @@ async fn set_config_in(database: Option<&Arc<Database>>, key: &str, value: &str)
 /// database's: what a session's `SET CONFIG` saves, and what a start applies
 /// from the settings file ([`apply_saved_hot_keys`]). `replication.*` and
 /// `vacuum.enabled` act on an open database and are neither.
-const PROCESS_WIDE_SECTIONS: &[&str] = &["wal", "filter", "query_stats", "auto_compact", "partition", "index_snapshot"];
+const PROCESS_WIDE_SECTIONS: &[&str] = &["wal", "filter", "query_stats", "auto_compact", "partition", "index_snapshot", "roles"];
 
 /// Sets one process-wide hot key. Synchronous, so that a start can apply the
 /// saved ones before its runtime exists.
 fn set_process_wide(key: &str, section: &str, name: &str, value: &str) -> Result<String, String> {
     match section {
+        "roles" => match name {
+            "create_database_roles" => {
+                crate::auth::set_create_database_roles(value)?;
+                Ok(format!(
+                    "CREATE DATABASE now gives the new database {}",
+                    if crate::auth::create_database_roles() == "all" {
+                        "every role of the default database"
+                    } else {
+                        "its creator and its OWNER"
+                    }
+                ))
+            }
+            _ => Err(format!("`{}` has no live setter", key)),
+        },
         "wal" => match name {
             "synchronous_commit" => {
                 let on = crate::parse_synchronous_commit(value).ok_or_else(|| {

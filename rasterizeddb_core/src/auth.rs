@@ -929,6 +929,39 @@ pub async fn copy_role_catalogue(
     from: &rclite::Arc<crate::core::database::Database>,
     to: &rclite::Arc<crate::core::database::Database>,
 ) -> Result<(), String> {
+    copy_roles(from, to, None).await
+}
+
+/// Whether `CREATE DATABASE` gives the new database every role of the
+/// default one (`roles.create_database_roles = all`, the behaviour before
+/// RD1), rather than only its creator and its `OWNER` (`owner`, the
+/// default).
+static CREATE_DATABASE_COPIES_ALL_ROLES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `roles.create_database_roles`, as `SHOW CONFIG` shows it.
+pub fn create_database_roles() -> &'static str {
+    if CREATE_DATABASE_COPIES_ALL_ROLES.load(std::sync::atomic::Ordering::Relaxed) { "all" } else { "owner" }
+}
+
+/// Sets `roles.create_database_roles`: `owner` or `all`.
+pub fn set_create_database_roles(value: &str) -> Result<(), String> {
+    let all = match value.trim().trim_matches(|c| c == '\'' || c == '"').to_ascii_lowercase().as_str() {
+        "owner" => false,
+        "all" => true,
+        other => return Err(format!("`{other}` is not a value for roles.create_database_roles (use owner or all)")),
+    };
+    CREATE_DATABASE_COPIES_ALL_ROLES.store(all, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// [`copy_role_catalogue`], copying only the roles `keep` names when it is
+/// given (RD1: a new database's creator and owner). A name with no role in
+/// `from` is skipped.
+pub async fn copy_roles(
+    from: &rclite::Arc<crate::core::database::Database>,
+    to: &rclite::Arc<crate::core::database::Database>,
+    keep: Option<&[String]>,
+) -> Result<(), String> {
     use crate::core::rql::{executor, lexer_s1::recognize_query_purpose};
 
     if !from.has_table(ROLE_TABLE) {
@@ -983,6 +1016,9 @@ pub async fn copy_role_catalogue(
                 .unwrap_or(false)
         };
         let Some(name) = text(0) else { continue };
+        if keep.is_some_and(|keep| !keep.iter().any(|k| *k == name)) {
+            continue;
+        }
         let password = match text(1) {
             Some(stored) => quote(&stored),
             None => "NULL".to_string(),

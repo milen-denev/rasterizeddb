@@ -6601,6 +6601,7 @@ where
         DatabaseStatement::Create {
             name,
             if_not_exists,
+            owner,
         } => {
             if if_not_exists && state.catalog.get(&name).is_some() {
                 // PostgreSQL has no `IF NOT EXISTS` here, but every migration
@@ -6608,7 +6609,26 @@ where
                 // does beats failing a script that is already idempotent.
                 return send_command_complete(stream, "CREATE DATABASE").await;
             }
-            match state.catalog.create(&name).await {
+            // RD1: the new database starts with the creating role and its
+            // `OWNER`, from this session's database, not with every account
+            // and verifier of the default database
+            // (`roles.create_database_roles = owner`; `all` keeps that).
+            let session_db = state.catalog.get(&state.database_name);
+            if let (Some(owner), Some(db)) = (&owner, &session_db)
+                && db.has_table(crate::auth::ROLE_TABLE)
+                && crate::auth::lookup_role(db, owner).await.is_none()
+            {
+                return fail_statement(state, stream, "42704", &format!("role \"{owner}\" does not exist")).await;
+            }
+            let roles = match session_db {
+                Some(db) if crate::auth::create_database_roles() == "owner" => {
+                    let mut keep = vec![state.principal.name.clone()];
+                    keep.extend(owner.clone().filter(|o| *o != state.principal.name));
+                    Some((db, keep))
+                }
+                _ => None,
+            };
+            match state.catalog.create_with_roles(&name, roles).await {
                 Ok(database) => {
                     // Replicated when the default database is and its
                     // replication carries the catalogue: the catalogue starts
