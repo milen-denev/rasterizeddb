@@ -873,6 +873,13 @@ struct Args {
     // --- sharding (docs/sharding-plan.md) ---------------------------------
     #[command(flatten)]
     shard: shard_args::ShardArgs,
+
+    /// The enterprise build's configuration (strict tenant mode, placement
+    /// policies, per-user-shard roles): `rasterizeddb_enterprise`'s file
+    /// format. Only in the `rasterizeddb_core_enterprise` binary.
+    #[cfg(feature = "enterprise")]
+    #[arg(long = "enterprise-config", value_name = "FILE")]
+    enterprise_config: Option<std::path::PathBuf>,
 }
 
 /// Applies `--storage-location`, `--storage-policy` and `--storage-min-free`
@@ -1489,6 +1496,15 @@ fn main() -> std::io::Result<()> {
                 );
                 std::process::exit(2);
             }
+        }
+    }
+
+    // The licensed hooks, before anything can open a session.
+    #[cfg(feature = "enterprise")]
+    if let Some(path) = &args.enterprise_config {
+        if let Err(e) = rasterizeddb_enterprise::install(path) {
+            eprintln!("--enterprise-config: {e}");
+            std::process::exit(2);
         }
     }
 

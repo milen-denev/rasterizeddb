@@ -325,3 +325,7 @@ mssql_wire = []
 # a root certificate bundle, or the code that signs requests. A backup covers
 # every storage location a database has, so it needs `storage_pools`.
 s3_backup = ["dep:zstd", "dep:webpki-roots", "storage_pools"]
+# `main.rs` is also compiled by `rasterizeddb_server`, whose `enterprise`
+# feature it checks; that name is no feature of this crate.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("enterprise"))'] }

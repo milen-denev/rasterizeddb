@@ -4868,6 +4868,23 @@ name = "rasterizeddb_router"
 version = "1.0.0"
 
 [[package]]
+name = "rasterizeddb_server"
+version = "1.0.0"
+dependencies = [
+ "clap",
+ "env_logger",
+ "futures",
+ "libmimalloc-sys",
+ "log",
+ "rastcp",
+ "rasterizeddb_core",
+ "rasterizeddb_enterprise",
+ "rclite",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "raw-window-handle"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
