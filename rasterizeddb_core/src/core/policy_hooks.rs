@@ -126,7 +126,8 @@ pub fn surface_of_verb(verb: &str) -> Option<ProcessSurface> {
         "STORAGE" | "BACKUP" | "RESTORE" | "KV FLUSHALL" => ProcessSurface::StoragePaths,
         "IMPORT DATABASE" | "IMPORT" => ProcessSurface::Import,
         "RESET QUERY STATS" | "SHOW BRANCH DIFF" => ProcessSurface::QueryStats,
-        "REPLICATION" | "SHARD" => ProcessSurface::Show,
+        // They change what the process replicates and which rows it owns.
+        "REPLICATION" | "SHARD" => ProcessSurface::SetConfig,
         _ => ProcessSurface::Databases,
     })
 }
@@ -173,9 +174,38 @@ pub fn visible_databases(ctx: &SessionContext<'_>, names: Vec<String>) -> Vec<St
     names.into_iter().filter(|n| policy.may_see_database(ctx, n)).collect()
 }
 
-/// Today's behaviour.
+/// The operator's (default) database, set once by the catalogue's open.
+static OPERATOR_DB: OnceLock<String> = OnceLock::new();
+
+pub fn set_operator_database(name: &str) {
+    let _ = OPERATOR_DB.set(name.to_string());
+}
+
+/// The GPL default: the roles plan's process-admin rule (R1). Only a
+/// superuser of the operator's (default) database administers the process;
+/// a superuser of any other database administers that database alone.
 struct Open;
-impl TenancyPolicy for Open {}
+impl TenancyPolicy for Open {
+    fn is_process_admin(&self, ctx: &SessionContext<'_>) -> bool {
+        ctx.superuser && OPERATOR_DB.get().is_none_or(|d| d == ctx.database)
+    }
+
+    fn may_use(&self, ctx: &SessionContext<'_>, surface: ProcessSurface) -> Result<(), String> {
+        // Statistics, SHOWs and cancelling stay as they are by default;
+        // what changes the process is the operator's.
+        let process_wide = matches!(
+            surface,
+            ProcessSurface::SetConfig | ProcessSurface::StoragePaths | ProcessSurface::Import | ProcessSurface::Databases
+        );
+        if !process_wide || self.is_process_admin(ctx) {
+            return Ok(());
+        }
+        Err(format!(
+            "42501: permission denied: administering the server needs a superuser of the \"{}\" database",
+            OPERATOR_DB.get().map_or("default", |s| s.as_str())
+        ))
+    }
+}
 impl PlacementPolicy for Open {}
 
 static TENANCY: OnceLock<Box<dyn TenancyPolicy>> = OnceLock::new();

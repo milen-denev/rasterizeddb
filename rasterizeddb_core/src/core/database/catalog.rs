@@ -225,6 +225,7 @@ impl DatabaseCatalog {
     /// that looks like a database is opened with it.
     pub async fn open(root: Option<&str>, default_name: &str) -> Result<Arc<Self>, String> {
         validate_name(default_name)?;
+        crate::core::policy_hooks::set_operator_database(default_name);
 
         let databases = DashMap::with_hasher(ahash::RandomState::new());
 
