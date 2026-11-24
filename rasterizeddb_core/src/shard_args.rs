@@ -22,12 +22,37 @@ pub struct ShardArgs {
     /// When given, the cluster map must name this cluster (32 hex digits).
     #[arg(long = "cluster-id", value_name = "HEX")]
     pub cluster_id: Option<String>,
+
+    /// Where the gateways reach this shard (rshard over rastcp/2, mTLS
+    /// only), `ADDR:PORT`. Closed unless given.
+    #[arg(long = "shard-listen", value_name = "ADDR:PORT")]
+    pub shard_listen: Option<String>,
+
+    /// The certificate chain the rshard listener presents (PEM).
+    #[arg(long = "shard-cert", value_name = "PEM")]
+    pub shard_cert: Option<String>,
+
+    /// Its private key (PEM).
+    #[arg(long = "shard-key", value_name = "PEM")]
+    pub shard_key: Option<String>,
+
+    /// A CA every gateway's certificate is signed by.
+    #[arg(long = "gateway-ca", value_name = "PEM")]
+    pub gateway_ca: Option<String>,
+
+    /// A gateway certificate's SHA-256 fingerprint; repeatable.
+    #[arg(long = "gateway-pin", value_name = "SHA256")]
+    pub gateway_pin: Vec<String>,
 }
 
 impl ShardArgs {
     /// True when any shard flag was given.
     fn given(&self) -> bool {
-        self.role.is_some() || self.cluster_map.is_some() || self.shard_id.is_some() || self.cluster_id.is_some()
+        self.role.is_some()
+            || self.cluster_map.is_some()
+            || self.shard_id.is_some()
+            || self.cluster_id.is_some()
+            || self.shard_listen.is_some()
     }
 
     /// Starts this node as a shard when `--role shard` was given; `Ok(None)`
@@ -64,6 +89,29 @@ impl ShardArgs {
             cluster_id,
         })
         .map(Some)
+    }
+
+    /// The rshard listener's configuration when `--shard-listen` was given.
+    #[cfg(feature = "sharding")]
+    pub fn listener(&self) -> Result<Option<rasterizeddb_core::core::shard::rshard::RshardConfig>, String> {
+        let Some(listen) = &self.shard_listen else {
+            return Ok(None);
+        };
+        if self.role.as_deref() != Some("shard") {
+            return Err("--shard-listen needs --role shard".to_string());
+        }
+        let (addr, port) = listen
+            .rsplit_once(':')
+            .and_then(|(a, p)| p.parse::<u16>().ok().map(|p| (a.trim_matches(['[', ']']).to_string(), p)))
+            .ok_or_else(|| format!("--shard-listen {listen}: write ADDR:PORT"))?;
+        Ok(Some(rasterizeddb_core::core::shard::rshard::RshardConfig {
+            addr,
+            port,
+            cert: self.shard_cert.clone().ok_or("--shard-listen needs --shard-cert")?,
+            key: self.shard_key.clone().ok_or("--shard-listen needs --shard-key")?,
+            gateway_ca: self.gateway_ca.clone(),
+            gateway_pins: self.gateway_pin.clone(),
+        }))
     }
 
     /// Without the feature: any shard flag is refused.

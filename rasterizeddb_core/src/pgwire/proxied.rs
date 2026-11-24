@@ -411,6 +411,14 @@ impl PgBridge {
         self.message(b'S', |_| {});
     }
 
+    /// Queues frontend messages exactly as a client sent them: a gateway's
+    /// virtual session relays its client's bytes (`core::shard::rshard`).
+    /// The caller has checked they are whole messages.
+    #[cfg(feature = "sharding")]
+    pub(crate) fn raw(&mut self, bytes: &[u8]) {
+        self.out.extend_from_slice(bytes);
+    }
+
     /// Sends what is queued.
     pub(crate) async fn flush(&mut self) -> io::Result<()> {
         if !self.out.is_empty() {

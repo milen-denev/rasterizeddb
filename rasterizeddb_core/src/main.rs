@@ -1865,6 +1865,25 @@ fn main() -> std::io::Result<()> {
             }
         }
 
+        // The gateways' endpoint on a shard (rshard, mTLS), on the catalogue
+        // so a virtual session can attach to any database.
+        #[cfg(feature = "sharding")]
+        match args.shard.listener() {
+            Ok(Some(config)) => {
+                let catalog = catalog.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = rasterizeddb_core::core::shard::rshard::serve(catalog, config).await {
+                        log::error!("the rshard listener stopped: {e}");
+                    }
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
+
         // Backups and the rastcp protocol are single-database and act on the
         // default one. Replication starts from it and carries every database
         // (`Database::start_replication_with`); the PostgreSQL listener routes
