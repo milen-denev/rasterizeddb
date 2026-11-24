@@ -6455,6 +6455,13 @@ fn is_lone_name(text: &str) -> bool {
     parts.len() <= 2 && parts.iter().all(|p| part(p))
 }
 
+/// The byte just past the character starting at `at`: a `rfind` by a char
+/// predicate gives a character's first byte, and `at + 1` lands inside a
+/// multibyte one (`ΔANY(`).
+fn past_char_at(text: &str, at: usize) -> usize {
+    at + text[at..].chars().next().map_or(1, char::len_utf8)
+}
+
 /// `(n)` as `n`, where the parentheses are only grouping. Kept where they
 /// are syntax: after `IN`, `ANY`, `ALL`, `SOME`, `EXISTS`, `VALUES`, `ARRAY`,
 /// `OVER`, `FILTER`, `USING`, a call's name, or a `)`.
@@ -6478,7 +6485,7 @@ fn unwrap_lone_names(clause: &str) -> String {
                 let before = clause[..i].trim_end();
                 let word_start = before
                     .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                    .map_or(0, |at| at + 1);
+                    .map_or(0, |at| past_char_at(before, at));
                 let word = &before[word_start..];
                 let syntax = ["IN", "ANY", "ALL", "SOME", "EXISTS", "VALUES", "ARRAY", "OVER", "FILTER", "USING"]
                     .iter()
@@ -6614,7 +6621,7 @@ fn expand_expression_in_lists(clause: &str, schema: &SmallVec<[SchemaField; 20]>
                 };
                 let name_start = head
                     .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '"' || c == '$'))
-                    .map_or(0, |at| at + 1);
+                    .map_or(0, |at| past_char_at(head, at));
                 let name = &head[name_start..];
                 if !is_lone_name(name)
                     || name_start < copied
@@ -8965,5 +8972,42 @@ mod lifted_operand_tests {
         assert!(lift_evaluated_operands(&deep(10), &schema()).is_ok());
         let e = lift_evaluated_operands(&deep(100_000), &schema()).unwrap_err();
         assert!(e.contains("nested more than"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod where_shape_multibyte_tests {
+    use super::*;
+    use crate::core::db_type::DbType;
+
+    fn schema() -> SmallVec<[SchemaField; 20]> {
+        let mut s: SmallVec<[SchemaField; 20]> = SmallVec::new();
+        for (i, (name, ty)) in [("a", DbType::STRING), ("b", DbType::I32)].into_iter().enumerate() {
+            s.push(SchemaField::new(name.to_string(), ty, 12, 0, i as u64, false));
+        }
+        s
+    }
+
+    /// A multibyte character right before a parenthesis, or right before the
+    /// name of an `IN`, panicked: the word's start was the character's first
+    /// byte plus one, inside it.
+    #[test]
+    fn a_multibyte_character_before_a_group_is_not_cut() {
+        for clause in [
+            "b = ΔANY('{1,2}'::int[]) AND b <> ALL(ARRAY[1,2]::bigint[]) OR a = SOME('{x}'::text[])",
+            "b = AΔNY('{1,2}'::int[])",
+            "b = AN😀Y('{1,2}'::int[])",
+            "b <> ΔALL(ARRAY[1,2])",
+            "Δ(b) > 5",
+            "é (b) > 5",
+            "Δb IN (b / 10, 2)",
+            "ΔΔ b IN (b / 10, 2)",
+            "😀b NOT IN (b + 1, 2)",
+        ] {
+            let _ = normalize_where_shapes(clause, &schema());
+        }
+        // The rewrites still happen next to one.
+        assert_eq!(normalize_where_shapes("a = 'Δ' AND (b) > 5", &schema()).trim_end(), "a = 'Δ' AND  b  > 5");
+        assert_eq!(normalize_where_shapes("a = 'Δ' AND b IN (b / 10, 2)", &schema()), "a = 'Δ' AND (b = b / 10 OR b = 2)");
     }
 }
