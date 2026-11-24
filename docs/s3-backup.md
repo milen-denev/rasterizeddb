@@ -1,6 +1,7 @@
 # S3 Backup & Point-in-Time Recovery — Design & Operation
 
-Status: **implemented, off by default.** Build with `--features s3_backup`.
+Status: **implemented**, Cargo feature `s3_backup` (in the default build). Nothing is
+backed up until a bucket is named (`--s3-bucket`).
 Target: `rasterizeddb_core::core::backup`, edition 2024.
 
 ## 0. What exists

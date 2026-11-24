@@ -1,9 +1,9 @@
 # Key/Value Storage Backend — Design & Operation
 
-Status: **implemented and selectable per table, off by default.** Build with
-`--features kv_storage` (in-process and local-directory stores) or
-`--features kv_storage_s3` (adds the S3 backing store). Per-table placement is a
-`storage_pools` location, so `kv_storage` turns that feature on too.
+Status: **implemented and selectable per table**, in the default build:
+`kv_storage` (in-process and local-directory stores) and `kv_storage_s3` (adds
+the S3 backing store). A table uses it only once it is placed on it. Per-table
+placement is a `storage_pools` location, so `kv_storage` turns that feature on too.
 Target: `rasterizeddb_core::core::storage_providers::kv`, edition 2024.
 
 ## 0. What exists

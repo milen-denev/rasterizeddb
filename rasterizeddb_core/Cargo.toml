@@ -4,9 +4,10 @@ version = "1.0.0"
 edition = "2024"
 repository = "https://github.com/milen-denev/rasterizeddb"
 license = "GPL-3.0-only"
-keywords = ["database", "embedded-database"]
+keywords = ["database", "sql", "postgresql", "server", "mvcc"]
+categories = ["database-implementations", "database"]
 authors = ["Milen Denev"]
-description = "A schemafull, high-performance database written in Rust, designed for speed and scalability."
+description = "The RasterizedDB server and engine: a SQL database speaking the PostgreSQL, MySQL, SQL Server and native protocols, with MVCC, a write-ahead log, replication and S3 backup."
 
 [dependencies]
 # `AT TIME ZONE`: zone rules from the system's tz database

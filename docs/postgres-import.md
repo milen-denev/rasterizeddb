@@ -1,6 +1,6 @@
 # Importing a PostgreSQL database — design and operation
 
-Status: **implemented, off by default.** Build with `--features pg_import`.
+Status: **implemented**, Cargo feature `pg_import` (in the default build).
 Target: `rasterizeddb_core::core::migrate`, edition 2024.
 
 One direction, one shot. This reads a live PostgreSQL server and builds a new
