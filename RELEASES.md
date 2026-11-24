@@ -16,6 +16,10 @@
 - Two processes, or two embedded engines, could open one data directory at once: the second replayed and truncated the first's live log. The directory is now locked (`rasterizeddb.lock`), and the refusal names the holder's pid.
 - Client: a `NUMERIC` with more than 38 decimal places read as a wrong integer.
 
+### Crashes fixed
+
+- A multibyte character (`Δ`, `😀`) next to a parenthesis or a keyword in a `WHERE` (`ΔANY(…)`, `Δ(b) > 5`) or a `JOIN LATERAL` (`t😀 AS l`) panicked the statement's handler.
+
 ### New features
 
 - Composite foreign keys, including on and onto hash-partitioned tables.

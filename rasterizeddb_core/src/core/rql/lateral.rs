@@ -112,6 +112,12 @@ fn identifier_at(sql: &str, at: usize) -> Option<(String, usize)> {
     }
 }
 
+/// Whether `word` (ASCII) is spelled at byte `at`, in any case. A
+/// multibyte character there is not it, rather than a cut through it.
+fn word_at(sql: &str, at: usize, word: &str) -> bool {
+    sql.get(at..at + word.len()).is_some_and(|t| t.eq_ignore_ascii_case(word))
+}
+
 fn skip_ws(sql: &str, at: usize) -> usize {
     at + sql[at..].len() - sql[at..].trim_start().len()
 }
@@ -287,7 +293,7 @@ fn parse_item(sql: &str, at: usize) -> Result<Item, String> {
 
     // `[AS] alias [(columns)]`.
     let mut j = skip_ws(sql, i);
-    if sql[j..].len() >= 2 && sql[j..j + 2].eq_ignore_ascii_case("AS") && sql.as_bytes().get(j + 2).is_some_and(|b| !is_word(*b)) {
+    if word_at(sql, j, "AS") && sql.as_bytes().get(j + 2).is_some_and(|b| !is_word(*b)) {
         j = skip_ws(sql, j + 2);
     }
     let (alias, mut end) = match identifier_at(sql, j) {
@@ -311,7 +317,7 @@ fn parse_item(sql: &str, at: usize) -> Result<Item, String> {
     let on = match form {
         Form::Inner | Form::Left => {
             let o = skip_ws(sql, end);
-            if !(sql[o..].len() >= 2 && sql[o..o + 2].eq_ignore_ascii_case("ON")) {
+            if !word_at(sql, o, "ON") {
                 return Err("JOIN LATERAL needs an ON condition".to_string());
             }
             let from = o + 2;
@@ -475,7 +481,7 @@ fn items_before(sql: &str, upto: usize) -> Vec<(String, String)> {
             break;
         };
         let mut j = skip_ws(sql, after);
-        if sql[j..].len() >= 2 && sql[j..j + 2].eq_ignore_ascii_case("AS") && bytes.get(j + 2).is_some_and(|b| !is_word(*b)) {
+        if word_at(sql, j, "AS") && bytes.get(j + 2).is_some_and(|b| !is_word(*b)) {
             j = skip_ws(sql, j + 2);
         }
         let alias = match identifier_at(sql, j) {
@@ -1404,5 +1410,28 @@ pub(crate) mod test_hooks {
         let Some(map) = runs.as_mut() else { return 0 };
         let names: Vec<String> = map.keys().filter(|k| *k == relation || k.starts_with(&derived)).cloned().collect();
         names.iter().filter_map(|k| map.remove(k)).sum()
+    }
+}
+
+#[cfg(test)]
+mod multibyte_tests {
+    use super::*;
+
+    /// A multibyte character where `AS` or `ON` would be read — after the
+    /// item, after a FROM relation — cut through it ("end byte index 17 is
+    /// not a char boundary"). Every position, as the live sweep puts it.
+    #[test]
+    fn a_multibyte_character_where_a_keyword_is_read_is_not_cut() {
+        let base = "SELECT * FROM t AS l LEFT JOIN LATERAL (SELECT b FROM u WHERE u.b = l.b) AS r ON true";
+        for at in (0..=base.len()).filter(|&i| base.is_char_boundary(i)) {
+            for ch in ["Δ", "😀"] {
+                let sql = format!("{}{}{}", &base[..at], ch, &base[at..]);
+                if let Some(Ok(item)) = next_item(&sql) {
+                    let _ = outer_references(&sql, &item);
+                }
+            }
+        }
+        let item = next_item(base).expect("an item").expect("parses");
+        assert!(outer_references(base, &item).expect("reads").is_some());
     }
 }
