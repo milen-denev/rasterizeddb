@@ -1133,6 +1133,13 @@ pub enum RoleStatement {
         name: String,
         to: String,
     },
+    /// `ALTER ROLE a SET p = v` (`value` Some), `RESET p` (None), `RESET
+    /// ALL` (`param` "all", None).
+    SetConfig {
+        name: String,
+        param: String,
+        value: Option<String>,
+    },
     Drop {
         name: String,
         if_exists: bool,
@@ -1156,9 +1163,10 @@ impl RoleStatement {
     pub fn tag(&self) -> &'static str {
         match self {
             RoleStatement::Create { .. } => "CREATE ROLE",
-            RoleStatement::AlterPassword { .. } | RoleStatement::Alter { .. } | RoleStatement::Rename { .. } => {
-                "ALTER ROLE"
-            }
+            RoleStatement::AlterPassword { .. }
+            | RoleStatement::Alter { .. }
+            | RoleStatement::Rename { .. }
+            | RoleStatement::SetConfig { .. } => "ALTER ROLE",
             RoleStatement::Drop { .. } => "DROP ROLE",
         }
     }
@@ -1442,8 +1450,14 @@ pub fn parse_role_statement(sql: &str) -> Option<Result<RoleStatement, String>> 
                 };
                 return Some(Ok(RoleStatement::Rename { name, to }));
             }
-            if is_word(rest.get(1), "SET") || is_word(rest.get(1), "RESET") || is_word(rest.get(1), "IN") {
-                return Some(Err("ALTER ROLE … SET and RESET are not supported yet: set the parameter per session".to_string()));
+            if is_word(rest.get(1), "IN") {
+                return Some(Err(
+                    "ALTER ROLE … IN DATABASE is not supported: roles belong to one database here, so set it without IN DATABASE"
+                        .to_string(),
+                ));
+            }
+            if is_word(rest.get(1), "SET") || is_word(rest.get(1), "RESET") {
+                return Some(role_set_config(name, &rest[1..]));
             }
             let options = match role_options(&rest[1..]) {
                 Ok(options) => options,
@@ -1540,7 +1554,7 @@ pub async fn role_statement_permitted(
     statement: &RoleStatement,
     tx: Option<crate::core::mvcc::TxId>,
 ) -> Result<(), String> {
-    if let RoleStatement::AlterPassword { name, .. } = statement
+    if let RoleStatement::AlterPassword { name, .. } | RoleStatement::SetConfig { name, .. } = statement
         && name == actor
     {
         return Ok(());
@@ -1562,7 +1576,10 @@ pub async fn role_statement_permitted(
             }
             name
         }
-        RoleStatement::AlterPassword { name, .. } | RoleStatement::Rename { name, .. } | RoleStatement::Drop { name, .. } => name,
+        RoleStatement::AlterPassword { name, .. }
+        | RoleStatement::Rename { name, .. }
+        | RoleStatement::SetConfig { name, .. }
+        | RoleStatement::Drop { name, .. } => name,
     };
     if lookup_role_in(database, target, tx).await.is_some_and(|r| r.is_superuser) {
         return Err(format!("permission denied: only a superuser can alter or drop the superuser \"{target}\""));
@@ -1623,6 +1640,73 @@ pub async fn admit_role_login(
     }
     *n += 1;
     Ok(RoleSlot(Some(key)))
+}
+
+/// `SET p {TO|=} v`, `RESET p` or `RESET ALL` after `ALTER ROLE name`.
+/// A dotted name (`rdb.shape_change`) and a value with a unit (`5s`) come
+/// in several tokens, put back together here.
+fn role_set_config(name: String, tokens: &[RoleTok]) -> Result<RoleStatement, String> {
+    let set = is_word(tokens.first(), "SET");
+    let mut at = 1;
+    let mut param = String::new();
+    while let Some(tok) = tokens.get(at) {
+        match tok {
+            RoleTok::Word(w) if set && (w.eq_ignore_ascii_case("TO")) => break,
+            RoleTok::Punct('=') => break,
+            RoleTok::Word(w) | RoleTok::Quoted(w) => param.push_str(&w.to_ascii_lowercase()),
+            RoleTok::Punct('.') => param.push('.'),
+            _ => return Err("ALTER ROLE … SET names a parameter".to_string()),
+        }
+        at += 1;
+    }
+    if param.is_empty() {
+        return Err("ALTER ROLE … SET names a parameter".to_string());
+    }
+    if !set {
+        if at != tokens.len() {
+            return Err("ALTER ROLE … RESET takes a parameter name only".to_string());
+        }
+        return Ok(RoleStatement::SetConfig { name, param, value: None });
+    }
+    let value_tokens = tokens.get(at + 1..).unwrap_or_default();
+    let value = match value_tokens {
+        [RoleTok::Str(s)] => s.clone(),
+        [RoleTok::Word(w)] if w.eq_ignore_ascii_case("DEFAULT") => {
+            return Ok(RoleStatement::SetConfig { name, param, value: None });
+        }
+        [] => return Err(format!("ALTER ROLE … SET {param} needs a value")),
+        many => many
+            .iter()
+            .map(|t| match t {
+                RoleTok::Word(w) | RoleTok::Quoted(w) | RoleTok::Str(w) | RoleTok::Number(w) => w.clone(),
+                RoleTok::Punct(c) => c.to_string(),
+            })
+            .collect(),
+    };
+    if !crate::pgwire::ROLE_SETTINGS.contains(&param.as_str()) {
+        return Err(format!(
+            "ALTER ROLE … SET {param} is not supported: a role keeps only {}, which a session applies at its start",
+            crate::pgwire::ROLE_SETTINGS.join(", ")
+        ));
+    }
+    if !crate::pgwire::role_setting_valid(&param, &value) {
+        return Err(format!("invalid value for parameter \"{param}\": \"{value}\""));
+    }
+    Ok(RoleStatement::SetConfig { name, param, value: Some(value) })
+}
+
+/// The `ALTER ROLE … SET` values `role` keeps, as (parameter, value).
+pub async fn role_settings(database: &rclite::Arc<crate::core::database::Database>, role: &str) -> Vec<(String, String)> {
+    if !database.has_table(crate::core::rql::privileges::ACL_TABLE) {
+        return Vec::new();
+    }
+    let Ok(rows) = crate::core::rql::privileges::load(database, None).await else {
+        return Vec::new();
+    };
+    rows.into_iter()
+        .filter(|r| r.relation == ROLE_ATTR_RELATION && r.grantee == role)
+        .filter_map(|r| r.privilege.strip_prefix("SET:").map(|p| (p.to_string(), r.grantor)))
+        .collect()
 }
 
 /// Removes `name`'s rows from the ACL (`privileges::ACL_TABLE`): its grants,
@@ -1809,6 +1893,16 @@ pub async fn execute_role_statement_in(
                 .await?;
             }
             write_role_attrs(database, &name, &attrs, tx).await
+        }
+        RoleStatement::SetConfig { name, param, value } => {
+            if lookup_role_in(database, &name, tx).await.is_none() {
+                return Err(format!("role \"{}\" does not exist", name));
+            }
+            let params: Vec<&str> = if param == "all" { crate::pgwire::ROLE_SETTINGS.to_vec() } else { vec![param.as_str()] };
+            for p in params {
+                crate::core::rql::privileges::set_role_attr(database, &name, &format!("SET:{p}"), value.clone(), tx).await?;
+            }
+            Ok(())
         }
         RoleStatement::Rename { name, to } => {
             let Some(role) = lookup_role_in(database, &name, tx).await else {

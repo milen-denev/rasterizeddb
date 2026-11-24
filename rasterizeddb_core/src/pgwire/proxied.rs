@@ -132,6 +132,7 @@ where
     // end reads the same sequence, so the bridge's startup has one shape.
     send_auth_ok(&mut conn).await?;
     send_startup_responses(&mut conn, registration.pid, registration.key).await?;
+    let parameters = with_role_settings(&database, &login.user, &parameters).await.into_owned();
     let startup = (
         startup_statement_timeout(&parameters),
         startup_lock_timeout(&parameters),

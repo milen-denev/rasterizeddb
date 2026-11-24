@@ -2290,6 +2290,9 @@ where
         limits.statement_timeout_ms
     };
 
+    // The role's ALTER ROLE … SET values, under the client's own (R2).
+    let parameters = with_role_settings(database, &principal.name, parameters).await;
+    let parameters = parameters.as_ref();
     // This session's cancel target: a process id unique among live sessions
     // and a secret key from the cryptographic generator, removed from the
     // registry when the session ends (the guard is dropped).
@@ -2400,6 +2403,43 @@ fn startup_statement_timeout(parameters: &HashMap<String, String>) -> Option<u64
 /// [`startup_statement_timeout`] accepts.
 fn startup_lock_timeout(parameters: &HashMap<String, String>) -> Option<u64> {
     startup_time_setting(parameters, "lock_timeout")
+}
+
+/// The settings `ALTER ROLE … SET` takes (R2): the ones a session reads at
+/// its start, where the role's value stands in for one the client did not
+/// send. Any other parameter is refused rather than kept and ignored.
+pub(crate) const ROLE_SETTINGS: &[&str] = &["statement_timeout", "lock_timeout", ShapeChangeMode::SETTING];
+
+/// Whether `value` is one `param` (of [`ROLE_SETTINGS`]) takes.
+pub(crate) fn role_setting_valid(param: &str, value: &str) -> bool {
+    match param {
+        "statement_timeout" | "lock_timeout" => parse_statement_timeout(value).is_some(),
+        p if p == ShapeChangeMode::SETTING => ShapeChangeMode::parse(value).is_some(),
+        _ => false,
+    }
+}
+
+/// The StartupMessage parameters with `role`'s `ALTER ROLE … SET` values
+/// filled in where the client sent none, as PostgreSQL lets a client's own
+/// startup options override the role's. Borrowed unchanged for a role with
+/// none, the usual case.
+async fn with_role_settings<'a>(
+    database: &Arc<Database>,
+    role: &str,
+    parameters: &'a HashMap<String, String>,
+) -> std::borrow::Cow<'a, HashMap<String, String>> {
+    let settings = crate::auth::role_settings(database, role).await;
+    if settings.is_empty() {
+        return std::borrow::Cow::Borrowed(parameters);
+    }
+    let mut merged = parameters.clone();
+    for (param, value) in settings {
+        let in_options = parameters.get("options").is_some_and(|o| o.contains(param.as_str()));
+        if !merged.contains_key(&param) && !in_options {
+            merged.insert(param, value);
+        }
+    }
+    std::borrow::Cow::Owned(merged)
 }
 
 /// A time setting (`name`, milliseconds) from the StartupMessage: the

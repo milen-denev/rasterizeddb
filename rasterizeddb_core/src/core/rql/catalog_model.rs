@@ -475,6 +475,8 @@ pub(crate) struct RoleRow {
     /// `-1`: no limit.
     pub conn_limit: i64,
     pub valid_until_us: Option<i64>,
+    /// `ALTER ROLE … SET` values, `param=value`.
+    pub config: Vec<String>,
 }
 
 /// Where `pg_auth_members` row oids start: above the fixed catalogue oids,
@@ -1325,6 +1327,7 @@ async fn roles(database: &Arc<Database>, acl: &[crate::core::rql::privileges::Ac
                         create_db: false,
                         conn_limit: -1,
                         valid_until_us: None,
+                        config: Vec::new(),
                     });
                 }
             }
@@ -1343,6 +1346,7 @@ async fn roles(database: &Arc<Database>, acl: &[crate::core::rql::privileges::Ac
                 create_db: true,
                 conn_limit: -1,
                 valid_until_us: None,
+                config: Vec::new(),
             },
         ),
     }
@@ -1354,7 +1358,11 @@ async fn roles(database: &Arc<Database>, acl: &[crate::core::rql::privileges::Ac
             "CREATEROLE" => r.create_role = true,
             "CONNECTION LIMIT" => r.conn_limit = a.grantor.parse().unwrap_or(-1),
             "VALID UNTIL" => r.valid_until_us = a.grantor.parse().ok(),
-            _ => {}
+            p => {
+                if let Some(param) = p.strip_prefix("SET:") {
+                    r.config.push(format!("{param}={}", a.grantor));
+                }
+            }
         }
     }
     out
@@ -2287,7 +2295,7 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                     t("********"),
                     r.valid_until_us.map_or(V::N, |us| t(crate::core::value_codec::format_timestamp_us(us))),
                     V::B(r.superuser),
-                    V::N,
+                    if r.config.is_empty() { V::N } else { V::TA(r.config.clone()) },
                     V::I(r.oid),
                 ]
             })
