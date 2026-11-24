@@ -773,6 +773,74 @@ fn view_owner_refusal<'a>(
     })
 }
 
+/// The refusal for the `SECURITY DEFINER` functions `stmt` calls, which
+/// run with their owners' privileges (R2): the caller needs EXECUTE; each
+/// body, its own calls put in as the owner may make them, is read with the
+/// owner's SELECT, and a view in it with its own owner's, as a view is
+/// (`view_owner_refusal`). Run after the caller's check, which did not see
+/// these bodies (`functions::inline_calls` with `invokers_only`).
+pub(super) async fn definer_refusal(database: &Arc<Database>, state: &SessionState, stmt: &str) -> Option<(&'static str, String)> {
+    use crate::core::rql::functions;
+    if state.principal.may_administer() || !functions::may_call_a_routine(database, stmt).await {
+        return None;
+    }
+    let tx = state.current_tx();
+    let rows = match privileges::load_shared(database, tx).await {
+        Ok(rows) => rows,
+        Err(e) => return Some(("42501", format!("permission denied: the privilege catalogue could not be read ({e})"))),
+    };
+    if !rows.iter().any(|r| r.privilege == privileges::DEFINER) {
+        return None;
+    }
+    let me = state.principal.name.as_str();
+    for name in functions::called_routines(database, stmt) {
+        let key = format!("@function:{name}");
+        if !privileges::is_definer(&rows, &key) {
+            continue;
+        }
+        if !privileges::may_execute(&rows, me, &key) {
+            return Some(("42501", format!("permission denied for function {name}")));
+        }
+        let Some(owner) = privileges::owner_of(&rows, &key) else {
+            return Some(("42501", format!("permission denied for function {name}: a SECURITY DEFINER function with no owner")));
+        };
+        if crate::auth::lookup_role_in(database, owner, tx).await.is_some_and(|r| r.is_superuser) {
+            continue;
+        }
+        let routines = match functions::load(database, Some(&name), tx).await {
+            Ok(r) => r,
+            Err(e) => return Some(("42501", format!("permission denied: the routine catalogue could not be read ({e})"))),
+        };
+        for routine in routines {
+            let body = match functions::inline_calls(database, &routine.body, tx, Some(owner), false).await {
+                Ok(text) => text.unwrap_or(routine.body.clone()),
+                Err((code, message)) => return Some((code, message)),
+            };
+            for r in crate::core::rql::lock_set::relation_references(&body) {
+                if r.name.starts_with("__") || !relation_exists(database, &r.name, tx).await {
+                    continue;
+                }
+                if !privileges::allows(&rows, owner, &r.name, "SELECT") {
+                    return Some((
+                        "42501",
+                        format!("permission denied for table {}: the owner of SECURITY DEFINER function {name} does not hold SELECT on it", r.name),
+                    ));
+                }
+                match crate::core::rql::views::lookup(database, &r.name, tx).await {
+                    Ok(Some(view)) => {
+                        if let Some(refusal) = view_owner_refusal(database, &rows, tx, &view, "SELECT", 0).await {
+                            return Some(refusal);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => return Some(("42501", format!("permission denied: the view catalogue could not be read ({e})"))),
+                }
+            }
+        }
+    }
+    None
+}
+
 /// The refusal for a non-superuser's statement on views it does not own:
 /// `names` that are views, each its owner's alone to drop, rename, refresh
 /// or replace. A name that is no view is the statement's to report.

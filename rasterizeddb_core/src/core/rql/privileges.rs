@@ -151,6 +151,15 @@ pub fn dependent_grants(rows: &[AclRow], relation: &str, privilege: &str, granto
     out
 }
 
+/// The marker row that a routine is `SECURITY DEFINER`: it runs with its
+/// owner's privileges.
+pub const DEFINER: &str = "DEFINER";
+
+/// Whether the routine kept under `key` is `SECURITY DEFINER`.
+pub fn is_definer(rows: &[AclRow], key: &str) -> bool {
+    rows.iter().any(|r| r.relation == key && r.privilege == DEFINER)
+}
+
 /// One option of a role membership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MembershipOption {

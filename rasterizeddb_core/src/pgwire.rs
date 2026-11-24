@@ -5351,7 +5351,7 @@ pub(crate) async fn describe_query(
         };
     }
     let inlined_calls;
-    let stmt = match crate::core::rql::functions::inline_calls(database, stmt, None, None).await {
+    let stmt = match crate::core::rql::functions::inline_calls(database, stmt, None, None, false).await {
         Ok(Some(text)) => {
             inlined_calls = text;
             inlined_calls.as_str()
@@ -8940,7 +8940,7 @@ where
     // A call of a `CREATE FUNCTION` function, as its body
     // (`rql::functions`), before views are expanded: a body may read one.
     let inlined_calls;
-    let stmt = match crate::core::rql::functions::inline_calls(database, stmt, state.current_tx(), sequence_role).await {
+    let stmt = match crate::core::rql::functions::inline_calls(database, stmt, state.current_tx(), sequence_role, sequence_role.is_some()).await {
         Ok(None) => stmt,
         Ok(Some(text)) => {
             crate::core::rql::prepared::note_rewritten();
@@ -8968,6 +8968,34 @@ where
         fail_statement(state, stream, code, &message).await?;
         return Ok(());
     }
+    // SECURITY DEFINER functions, left as calls above: checked as their
+    // owners, then put in (R2).
+    let inlined_definers;
+    let stmt = if sequence_role.is_some() {
+        if let Some((code, message)) = privilege_statements::definer_refusal(database, state, stmt).await {
+            fail_statement(state, stream, code, &message).await?;
+            return Ok(());
+        }
+        match crate::core::rql::functions::inline_calls(database, stmt, state.current_tx(), None, false).await {
+            Ok(None) => stmt,
+            Ok(Some(text)) => match rewrite_statement_text(database, &text) {
+                Ok(again) => {
+                    inlined_definers = again.into_owned();
+                    inlined_definers.as_str()
+                }
+                Err((code, message)) => {
+                    fail_statement(state, stream, code, &message).await?;
+                    return Ok(());
+                }
+            },
+            Err((code, message)) => {
+                fail_statement(state, stream, code, &message).await?;
+                return Ok(());
+            }
+        }
+    } else {
+        stmt
+    };
     // `pg_get_viewdef(view)` as the view's query (`views::viewdef_calls`).
     let with_viewdefs = match crate::core::rql::views::viewdef_calls(database, stmt, state.current_tx()).await {
         Ok(text) => text,
