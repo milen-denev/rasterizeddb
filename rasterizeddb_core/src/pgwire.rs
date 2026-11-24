@@ -5130,6 +5130,11 @@ pub(crate) async fn describe_query(
     if let std::borrow::Cow::Owned(text) = crate::core::sql_scan::plain_branch_parentheses(&catalog) {
         catalog = text;
     }
+    // `doc #>> ARRAY[…]`, as `rewrite_statement_text` reads it: with a
+    // placeholder's stand-in in it (`describe_for_wire`), a constant path.
+    if let std::borrow::Cow::Owned(text) = crate::core::sql_scan::json_path_arrays(&catalog) {
+        catalog = text;
+    }
     // `'t'::regclass` and the like, as `rewrite_statement_text` reads them.
     if let Ok(Some(text)) = crate::core::rql::reg_casts::rewrite(
         &catalog,
@@ -8224,6 +8229,11 @@ pub(crate) fn rewrite_statement_text<'a>(
     // `INSERT INTO t (SELECT …)` and `CREATE TABLE t AS (SELECT …)`: the
     // query in parentheses, the same way (`sql_scan::source_query_parentheses`).
     if let Cow::Owned(text) = crate::core::sql_scan::source_query_parentheses(&stmt) {
+        stmt = Cow::Owned(text);
+    }
+    // `doc #>> ARRAY['a', '0']` as the path literal `doc #>> '{a,0}'`
+    // (`sql_scan::json_path_arrays`), with bound values already in it.
+    if let Cow::Owned(text) = crate::core::sql_scan::json_path_arrays(&stmt) {
         stmt = Cow::Owned(text);
     }
     // `indkey::text` and the other vector columns, spaced as PostgreSQL

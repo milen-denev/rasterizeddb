@@ -4,6 +4,8 @@
 
 ### Statements that failed, now answered
 
+- A JSON path written as an array constructor, `data #>> ARRAY['0', 'k']` or `#> ARRAY[…]`, failed ("unexpected character '['" in a `WHERE`, "Column … not found" in a select list, and no columns described once a driver's parameter was in it). A path of constants is now read as the path literal `'{0,k}'`; an element that is a column or an expression is still unsupported.
+- SQL-level `PREPARE p(text) AS … WHERE data -> $1 ->> 'k' = …` then `EXECUTE p('0')` failed ("is neither a column nor a value"): a string for a text parameter now goes in as written, not as `CAST('0' AS text)`.
 - A statement with more than 32,767 bound parameters (a 1,000-row `INSERT … VALUES` of 39 columns) dropped its connection with nothing in the server's log; the client read "expected to read 5 bytes, got 0 bytes at EOF". Parse and Bind now read their counts unsigned, as PostgreSQL does, up to 65,535 parameters. A Parse or Bind the server cannot read is answered with FATAL 08P01 naming it, and logged, before the connection closes.
 - `GROUP BY 1` over a join failed with "Column '1' not found in schema", and so did `GROUP BY k` naming an output column (`t.system_key AS k`). Both now group by that select-list item, a real column of the same name winning, as in PostgreSQL; a position past the select list fails with 42P10. On one table both already worked.
 
