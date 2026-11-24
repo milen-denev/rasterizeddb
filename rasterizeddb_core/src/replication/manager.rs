@@ -623,11 +623,41 @@ impl Replication {
     where
         F: Fn(&mut ReplicationConfig) -> Result<(), String>,
     {
+        self.edit_config(edit, false)
+    }
+
+    /// [`Replication::update_config`] for one setting of a node that may not
+    /// have an id yet.
+    ///
+    /// A server started without `--node-id` has node id 0 and is not
+    /// replicating. Demanding the id before any other setting may change
+    /// refused `SET CONFIG replication.batch_max_records` on every
+    /// single-node server, with a message about a flag the setting has
+    /// nothing to do with. So while the node has no id and is stopped, an
+    /// edit that leaves it without one is checked for everything else;
+    /// `REPLICATION ENABLE` and the listener still refuse to start without
+    /// an id. A node that has an id never loses it this way, and a running
+    /// one is checked in full.
+    pub fn update_setting<F>(&self, edit: F) -> Result<Arc<ReplicationConfig>, String>
+    where
+        F: Fn(&mut ReplicationConfig) -> Result<(), String>,
+    {
+        self.edit_config(edit, true)
+    }
+
+    fn edit_config<F>(&self, edit: F, before_an_id: bool) -> Result<Arc<ReplicationConfig>, String>
+    where
+        F: Fn(&mut ReplicationConfig) -> Result<(), String>,
+    {
         loop {
             let current = self.config.load_full();
             let mut next = (*current).clone();
             edit(&mut next)?;
-            next.validate()?;
+            if before_an_id && current.node_id == 0 && next.node_id == 0 && !self.is_active() {
+                next.validate_settings()?;
+            } else {
+                next.validate()?;
+            }
 
             let next = Arc::new(next);
             let previous = self.config.compare_and_swap(&current, next.clone());
@@ -1775,6 +1805,46 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(replication.config().node_id, before);
+    }
+
+    #[test]
+    fn a_setting_changes_before_the_node_has_an_id() {
+        let replication = Replication::new();
+        let edited = replication
+            .update_setting(|config| {
+                config.batch_max_records = 128;
+                Ok(())
+            })
+            .expect("a setting needs no node id");
+        assert_eq!(edited.batch_max_records, 128);
+        assert_eq!(replication.config().batch_max_records, 128);
+
+        // Still checked for itself, and a refused one changes nothing.
+        let refused = replication.update_setting(|config| {
+            config.batch_max_records = 0;
+            Ok(())
+        });
+        assert!(refused.is_err());
+        assert_eq!(replication.config().batch_max_records, 128);
+
+        // Anything else still needs the id, and the id still enables nothing
+        // by being absent.
+        assert!(replication.update_config(|_| Ok(())).is_err());
+        assert!(replication.config().validate().is_err());
+
+        // The id is given the same way, and from then on cannot be taken away.
+        replication
+            .update_setting(|config| {
+                config.node_id = 3;
+                Ok(())
+            })
+            .expect("an id");
+        let taken = replication.update_setting(|config| {
+            config.node_id = 0;
+            Ok(())
+        });
+        assert!(taken.is_err());
+        assert_eq!(replication.config().node_id, 3);
     }
 
     #[test]

@@ -70,6 +70,7 @@
 - An `UPDATE` matching no row no longer fails a `CHECK` its constant `SET` would break; it answers `UPDATE 0`.
 - A row breaking several `CHECK`s reports the first by name, as PostgreSQL does.
 - An unnamed `CHECK` is named as PostgreSQL names it: `<table>_<column>_check`, or `<table>_check` for a table-level one, which used to be `<table>_check1`. Tables created before keep their names.
+- On a server started without `--node-id`, `SET CONFIG replication.<key>` and `REPLICATION SET` change the setting instead of failing with "replication needs a node id". Enabling replication and adding a peer still need an id.
 - A throttled S3 write (429/503) is retried ten times, and can take about 25 seconds before it fails.
 
 ### Upgrade notes

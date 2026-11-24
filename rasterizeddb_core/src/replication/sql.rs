@@ -692,7 +692,8 @@ async fn set(
     let edited = {
         let value = value.clone();
         let key = key.clone();
-        replication.update_config(move |config| apply_setting(config, &key, &value))?
+        // A setting, so it may be chosen before the node has an id.
+        replication.update_setting(move |config| apply_setting(config, &key, &value))?
     };
 
     // A few settings are held by the running peers as well as the config.
@@ -1780,6 +1781,36 @@ mod tests {
     async fn enabling_without_a_node_id_is_refused() {
         let database = crate::replication::test_support::in_memory_database().await;
         assert!(execute("REPLICATION ENABLE", &database).await.is_err());
+    }
+
+    /// A server started without `--node-id`: a setting is not the node id's
+    /// business, and was refused for want of one.
+    #[tokio::test]
+    async fn a_setting_changes_on_a_node_without_an_id() {
+        let database = crate::replication::test_support::in_memory_database().await;
+        let said = execute("REPLICATION SET batch_max_records = 128", &database)
+            .await
+            .expect("a setting needs no node id");
+        assert_eq!(said, vec!["batch_max_records = 128".to_string()]);
+        assert_eq!(database.replication.config().batch_max_records, 128);
+
+        // Checked for itself all the same, and it starts nothing.
+        assert!(execute("REPLICATION SET batch_max_records = 0", &database).await.is_err());
+        assert_eq!(database.replication.config().batch_max_records, 128);
+        let refused = execute("REPLICATION ENABLE", &database).await.unwrap_err();
+        assert!(refused.contains("node id"), "{refused}");
+        assert!(!database.replication.is_active());
+
+        // A peer is still not added to a node nobody has named.
+        assert!(
+            execute("REPLICATION ADD PEER 'berlin' ADDRESS '10.0.0.2:61171'", &database)
+                .await
+                .is_err()
+        );
+
+        execute("REPLICATION SET node_id = 4", &database).await.expect("an id");
+        assert_eq!(database.replication.config().node_id, 4);
+        assert_eq!(database.replication.config().batch_max_records, 128);
     }
 
     #[tokio::test]
