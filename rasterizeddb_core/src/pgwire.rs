@@ -2472,7 +2472,12 @@ pub(crate) fn privileged_statement(stmt: &str) -> Option<&'static str> {
         // rows of the branch, its base and its parent — databases whose
         // accounts this session may not hold — and names their keys.
         ("SHOW", "BRANCH") => Some("SHOW BRANCH DIFF"),
-        ("IMPORT", "DATABASE") => Some("IMPORT DATABASE"),
+        // Every statement the importer takes, by its own predicate
+        // (`migrate::sql::is_import_statement`: the first word is IMPORT),
+        // `DATABASE` being optional to it. Gated on the two words, `IMPORT
+        // FROM POSTGRES …` ran for any role: a database made, and the server
+        // made to connect wherever the statement said.
+        ("IMPORT", _) => Some("IMPORT DATABASE"),
         ("SET", "CONFIG") => Some("SET CONFIG"),
         ("SET", "FILTER") | ("RESET", "FILTER") => Some("SET FILTER"),
         // Reading what ran is not administration, and `SHOW QUERIES` is
