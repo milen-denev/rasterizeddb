@@ -191,7 +191,7 @@ where
                 }
                 Ok("GRANT")
             }
-            PrivilegeStatement::Revoke { privileges: privs, target, grantees, grant_option_only } => {
+            PrivilegeStatement::Revoke { privileges: privs, target, grantees, grant_option_only, cascade } => {
                 let Some(Resolved { keys: tables, valid, label }) = resolve_target(database, target, tx).await? else {
                     return Ok("REVOKE");
                 };
@@ -208,6 +208,29 @@ where
                                 continue;
                             }
                             let existing = rows.iter().find(|r| r.relation == *table && r.grantee == *grantee && r.privilege == *p);
+                            // What the grantee passed on with its grant
+                            // option goes with it, or stops the REVOKE.
+                            let dependents = privileges::dependent_grants(&rows, table, p, grantee);
+                            if existing.is_some() && !dependents.is_empty() {
+                                if !cascade {
+                                    return Err(fail(
+                                        "2BP01",
+                                        format!(
+                                            "dependent privileges exist: {grantee} granted {p} on {shown} to {}; use CASCADE to revoke them too",
+                                            dependents.join(", ")
+                                        ),
+                                    ));
+                                }
+                                for d in &dependents {
+                                    let filter = format!(
+                                        "relation = {} AND grantee = {} AND privilege = {}",
+                                        crate::auth::quote(table),
+                                        crate::auth::quote(d),
+                                        crate::auth::quote(p)
+                                    );
+                                    privileges::delete_where(database, &filter, tx).await.map_err(|e| fail("XX000", e))?;
+                                }
+                            }
                             match (existing, grant_option_only) {
                                 (Some(row), true) => {
                                     let mut row = row.clone();

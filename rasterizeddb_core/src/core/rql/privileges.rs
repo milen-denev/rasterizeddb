@@ -134,6 +134,23 @@ pub fn may_execute(rows: &[AclRow], role: &str, key: &str) -> bool {
     rows.iter().any(|r| r.relation == key && r.privilege == "EXECUTE" && acting.contains(&r.grantee))
 }
 
+/// The grants of `privilege` on `relation` that hang off `grantor`'s, as
+/// (grantee) names: made by it with its grant option, and those made from
+/// them in turn.
+pub fn dependent_grants(rows: &[AclRow], relation: &str, privilege: &str, grantor: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut from = vec![grantor.to_string()];
+    while let Some(g) = from.pop() {
+        for r in rows.iter().filter(|r| r.relation == relation && r.privilege == privilege && r.grantor == g && r.grantee != g) {
+            if r.grantee != grantor && !out.contains(&r.grantee) {
+                out.push(r.grantee.clone());
+                from.push(r.grantee.clone());
+            }
+        }
+    }
+    out
+}
+
 /// One option of a role membership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MembershipOption {
@@ -175,7 +192,9 @@ fn grant_with(text: &str) -> Result<(bool, bool, Option<bool>, Option<bool>), (&
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrivilegeStatement {
     Grant { privileges: Vec<String>, target: Target, grantees: Vec<String>, grantable: bool },
-    Revoke { privileges: Vec<String>, target: Target, grantees: Vec<String>, grant_option_only: bool },
+    /// `cascade`: also revoke what the grantees granted on with their grant
+    /// option; without it such dependents refuse the REVOKE (2BP01).
+    Revoke { privileges: Vec<String>, target: Target, grantees: Vec<String>, grant_option_only: bool, cascade: bool },
     /// `GRANT r TO m [WITH ADMIN|INHERIT|SET {OPTION|TRUE|FALSE}, …]`
     /// (R2): `admin` the ADMIN option; `inherit`/`set` `None` where unsaid.
     GrantRole { roles: Vec<String>, members: Vec<String>, admin: bool, inherit: Option<bool>, set: Option<bool> },
@@ -371,8 +390,10 @@ pub fn parse_privilege_statement(sql: &str) -> Option<Result<PrivilegeStatement,
             return Some(Err(("42601", "syntax error in REVOKE: expected FROM".to_string())));
         };
         let mut grantees_text = body[from + 4..].trim().to_string();
+        let mut cascade = false;
         for suffix in ["CASCADE", "RESTRICT"] {
             if grantees_text.to_ascii_uppercase().ends_with(suffix) {
+                cascade |= suffix == "CASCADE";
                 grantees_text.truncate(grantees_text.len() - suffix.len());
             }
         }
@@ -387,6 +408,7 @@ pub fn parse_privilege_statement(sql: &str) -> Option<Result<PrivilegeStatement,
                 target: target_of(&body[on + 2..from]),
                 grantees,
                 grant_option_only,
+                cascade,
             }),
             None => Ok(PrivilegeStatement::RevokeRole { roles: grantee_list(&body[..from]), members: grantees, option }),
         });
@@ -1089,6 +1111,7 @@ mod tests {
                 target: Target::Tables(vec!["t".into()]),
                 grantees: vec!["app".into()],
                 grant_option_only: false,
+                cascade: false,
             }
         );
         assert_eq!(
