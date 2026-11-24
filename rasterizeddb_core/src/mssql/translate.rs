@@ -271,6 +271,7 @@ fn statement_end(tokens: &[Token], start: usize) -> usize {
                         (!seen_set
                             && (head == "UPDATE" || main_verb_is(tokens, start, j, "UPDATE")))
                             || prev == "UPDATE"
+                            || (head == "ALTER" && kw(tokens, start + 1, "DATABASE"))
                     }
                     "INSERT" | "UPDATE" | "DELETE" => {
                         matches!(prev.as_str(), "ON" | "FOR" | "OF" | "THEN" | "INSTEAD")
@@ -301,6 +302,13 @@ fn statement_end(tokens: &[Token], start: usize) -> usize {
                             || tokens.get(j + 1).is_some_and(|n| {
                                 n.is_word("CHECK") || n.is_word("TIES") || n.is_word("GRANT")
                             })
+                            // `ALTER DATABASE d SET SINGLE_USER WITH ROLLBACK
+                            // IMMEDIATE` / `WITH NO_WAIT`.
+                            || (head == "ALTER"
+                                && kw(tokens, start + 1, "DATABASE")
+                                && tokens.get(j + 1).is_some_and(|n| {
+                                    n.is_word("ROLLBACK") || n.is_word("NO_WAIT")
+                                }))
                     }
                     "END" | "ELSE" => in_case,
                     // `OFFSET 5 ROWS FETCH NEXT …`: part of a query.
@@ -349,7 +357,7 @@ fn statement_end(tokens: &[Token], start: usize) -> usize {
                         !names_cursor || after_expr_start
                     }
                     "BEGIN" => false,
-                    "ROLLBACK" | "COMMIT" => prev == "ON",
+                    "ROLLBACK" | "COMMIT" => prev == "ON" || (prev == "WITH" && head == "ALTER"),
                     _ => false,
                 };
                 if w == "SET" && continues {
@@ -801,7 +809,64 @@ fn object_name_in(text: &str) -> String {
     last.trim_matches(['[', ']', '"', ' ']).to_lowercase()
 }
 
+/// `CROSS APPLY (…) [AS] t` is `CROSS JOIN LATERAL (…) t`; `OUTER APPLY`
+/// is `LEFT JOIN LATERAL (…) t ON 1 = 1`, which keeps an outer row the
+/// subquery has nothing for. EF Core writes these for `Take`/`First` inside
+/// a projection or an `Include`.
+fn apply_to_lateral(tokens: Vec<Token>) -> Result<Vec<Token>, TsqlError> {
+    if !tokens.iter().any(|t| t.is_word("APPLY")) {
+        return Ok(tokens);
+    }
+    let mut out = Vec::with_capacity(tokens.len() + 8);
+    let mut on_at: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = &tokens[i];
+        let outer = t.is_word("OUTER");
+        if (outer || t.is_word("CROSS")) && kw(&tokens, i + 1, "APPLY") {
+            if !tokens.get(i + 2).is_some_and(|p| p.is_op("(")) {
+                return Err(TsqlError::unsupported("APPLY of a table-valued function"));
+            }
+            let close = matching_paren(&tokens, i + 2)
+                .ok_or_else(|| TsqlError::syntax("unbalanced parentheses"))?;
+            let mut end = close + 1;
+            if kw(&tokens, end, "AS") {
+                end += 1;
+            }
+            if tokens
+                .get(end)
+                .is_some_and(|a| a.ident().is_some() && !is_clause_word(a))
+            {
+                end += 1;
+            } else {
+                return Err(TsqlError::syntax("APPLY needs an alias"));
+            }
+            let mut first = Token::word(if outer { "LEFT" } else { "CROSS" });
+            first.space = t.space;
+            out.push(first);
+            out.push(Token::word("JOIN"));
+            out.push(Token::word("LATERAL"));
+            if outer {
+                on_at.push(end);
+            }
+            i += 2;
+            continue;
+        }
+        out.push(t.clone());
+        i += 1;
+        if on_at.last() == Some(&i) {
+            on_at.pop();
+            out.push(Token::word("ON"));
+            out.push(Token::new(Tok::Num("1".into())));
+            out.push(Token::op("="));
+            out.push(Token::new(Tok::Num("1".into())));
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>, TsqlError> {
+    let tokens = apply_to_lateral(tokens)?;
     let mut out: Vec<Token> = Vec::with_capacity(tokens.len() + 4);
     let mut i = 0usize;
     let n = tokens.len();
@@ -1050,6 +1115,8 @@ fn is_clause_word(t: &Token) -> bool {
         matches!(
             w.as_str(),
             "WHERE"
+                | "FROM"
+                | "LATERAL"
                 | "JOIN"
                 | "INNER"
                 | "LEFT"
@@ -1872,8 +1939,32 @@ fn catalog_view(schema: &str, view: &str, cx: &Cx) -> Result<Option<String>, Tsq
             }
             values(rows, &cols, empty(&cols))
         }
-        ("sys", "foreign_keys") | ("sys", "key_constraints") | ("sys", "check_constraints") | ("sys", "default_constraints") | ("sys", "index_columns") | ("sys", "foreign_key_columns") | ("sys", "extended_properties") => {
-            empty(&["object_id", "name", "parent_object_id"])
+        // No rows (the engine's defaults, checks and keys are not named
+        // objects a script can drop one by one), but each with the columns
+        // scripts read: EF Core's DropColumn / AlterColumn joins
+        // `default_constraints` to `columns` on `parent_column_id`.
+        ("sys", view @ ("foreign_keys" | "key_constraints" | "check_constraints" | "default_constraints" | "index_columns" | "foreign_key_columns" | "extended_properties")) => {
+            let cols: &[&str] = match view {
+                "default_constraints" => &["object_id", "name", "parent_object_id", "parent_column_id", "definition", "type", "type_desc", "is_system_named", "schema_id"],
+                "check_constraints" => &["object_id", "name", "parent_object_id", "parent_column_id", "definition", "type", "type_desc", "is_disabled", "schema_id"],
+                "key_constraints" => &["object_id", "name", "parent_object_id", "type", "type_desc", "unique_index_id", "schema_id"],
+                "foreign_keys" => &["object_id", "name", "parent_object_id", "referenced_object_id", "key_index_id", "delete_referential_action", "update_referential_action", "type", "type_desc", "is_disabled", "schema_id"],
+                "index_columns" => &["object_id", "index_id", "index_column_id", "column_id", "key_ordinal", "partition_ordinal", "is_descending_key", "is_included_column"],
+                "foreign_key_columns" => &["constraint_object_id", "constraint_column_id", "parent_object_id", "parent_column_id", "referenced_object_id", "referenced_column_id"],
+                _ => &["class", "class_desc", "major_id", "minor_id", "name", "value"],
+            };
+            let numeric = |c: &str| {
+                c.ends_with("_id")
+                    || c.starts_with("is_")
+                    || matches!(c, "class" | "key_ordinal" | "partition_ordinal" | "delete_referential_action" | "update_referential_action")
+            };
+            format!(
+                "(SELECT {} WHERE 1 = 0)",
+                cols.iter()
+                    .map(|c| format!("CAST(NULL AS {}) AS {}", if numeric(c) { "integer" } else { "text" }, ident_sql(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         }
         ("information_schema", "tables") => {
             let cols = ["table_catalog", "table_schema", "table_name", "table_type"];
@@ -2616,7 +2707,15 @@ fn rewrite_select_inner(
         if k > 0 {
             out.push(Token::op(","));
         }
-        let rewritten = rewrite_expr(expr, cx)?;
+        // A whole-number literal is an `int` in T-SQL (EF Core selects
+        // `1 AS [c]` and reads it with GetInt32); the engine's is a bigint.
+        let int_literal = matches!(&expr[..], [t] if matches!(&t.tok, Tok::Num(n)
+            if n.parse::<i32>().is_ok()));
+        let mut rewritten = rewrite_expr(expr, cx)?;
+        if int_literal {
+            let n = render_text(&rewritten);
+            rewritten = vec![Token::raw(format!("CAST({n} AS integer)"))];
+        }
         if let Some(n) = &name {
             item_texts.push((render_text(&rewritten), n.clone()));
         }
@@ -3694,6 +3793,33 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
     })
 }
 
+/// The columns of a filter made only of `col IS NOT NULL` joined by `AND`
+/// (parentheses allowed), lower-cased; `None` for any other filter.
+fn not_null_filter(tokens: &[Token]) -> Option<Vec<String>> {
+    let body: Vec<&Token> = tokens
+        .iter()
+        .filter(|t| !t.is_op("(") && !t.is_op(")"))
+        .collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        let col = body.get(i)?.ident()?.to_lowercase();
+        if !(body.get(i + 1)?.is_word("IS")
+            && body.get(i + 2)?.is_word("NOT")
+            && body.get(i + 3)?.is_word("NULL"))
+        {
+            return None;
+        }
+        out.push(col);
+        i += 4;
+        match body.get(i) {
+            None => return Some(out),
+            Some(t) if t.is_word("AND") => i += 1,
+            Some(_) => return None,
+        }
+    }
+}
+
 fn rewrite_create_index(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
     let _ = cx;
     let unique = tokens.iter().take(4).any(|t| t.is_word("UNIQUE"));
@@ -3715,8 +3841,28 @@ fn rewrite_create_index(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
     let close =
         matching_paren(&tokens, open).ok_or_else(|| TsqlError::syntax("unbalanced column list"))?;
     let cols = index_columns(&tokens[open + 1..close])?;
-    if find_top(&tokens, close, &["WHERE"]).is_some() {
-        return Err(TsqlError::unsupported("filtered indexes"));
+    if let Some(w) = find_top(&tokens, close, &["WHERE"]) {
+        // A filter only narrows which rows the index holds. Not unique, the
+        // index over every row answers the same queries. Unique, a filter of
+        // `k IS NOT NULL [AND …]` over key columns leaves out only rows whose
+        // key holds a NULL, which a unique key here never compares equal
+        // anyway (EF Core puts one on every unique index over a nullable
+        // column). Any other filter would constrain different rows.
+        if unique {
+            let keys: Vec<String> = split_commas(&tokens[open + 1..close])
+                .iter()
+                .filter_map(|p| p.first().and_then(|t| t.ident()).map(str::to_lowercase))
+                .collect();
+            let end = find_top(&tokens, w + 1, &["WITH", "ON"]).unwrap_or(tokens.len());
+            match not_null_filter(&tokens[w + 1..end]) {
+                Some(filtered) if filtered.iter().all(|c| keys.contains(c)) => {}
+                _ => {
+                    return Err(TsqlError::unsupported(
+                        "a filtered unique index other than `key IS NOT NULL [AND …]`",
+                    ))
+                }
+            }
+        }
     }
     Ok(Forward {
         statements: vec![format!(
@@ -4148,6 +4294,29 @@ pub(crate) fn translate(
         "ALTER" => {
             if kw(&tokens, 1, "TABLE") {
                 rewrite_alter_table(tokens, &mut cx)
+            } else if kw(&tokens, 1, "DATABASE") && kw(&tokens, 3, "SET") {
+                // Options that tune SQL Server itself, which change no answer
+                // here: user access (EnsureDeleted's SINGLE_USER WITH
+                // ROLLBACK IMMEDIATE before DROP DATABASE), snapshot reads
+                // (MVCC already reads committed snapshots), statistics,
+                // recovery. Any other option is refused.
+                let option = tokens.get(4).and_then(|t| t.upper()).unwrap_or_default();
+                if matches!(
+                    option.as_str(),
+                    "SINGLE_USER" | "MULTI_USER" | "RESTRICTED_USER" | "READ_COMMITTED_SNAPSHOT"
+                        | "ALLOW_SNAPSHOT_ISOLATION" | "COMPATIBILITY_LEVEL" | "RECOVERY"
+                        | "AUTO_CLOSE" | "AUTO_SHRINK" | "AUTO_UPDATE_STATISTICS"
+                        | "AUTO_UPDATE_STATISTICS_ASYNC" | "AUTO_CREATE_STATISTICS" | "PAGE_VERIFY"
+                        | "QUERY_STORE" | "TARGET_RECOVERY_TIME"
+                ) {
+                    Ok(Forward {
+                        statements: vec![String::new()],
+                        kind: Kind::Ddl,
+                        extra_column: None,
+                    })
+                } else {
+                    Err(TsqlError::unsupported(format!("ALTER DATABASE … SET {option}")))
+                }
             } else {
                 Err(TsqlError::unsupported(format!(
                     "ALTER {}",
@@ -4488,5 +4657,69 @@ mod tests {
             tr(&e, "ALTER TABLE [t] ADD [c] int NULL"),
             "ALTER TABLE t ADD COLUMN c integer NULL"
         );
+    }
+
+    #[test]
+    fn apply_is_a_lateral_join() {
+        let e = env();
+        assert_eq!(
+            tr(&e, "SELECT [b].[Url], [p0].[Title] FROM [Blogs] AS [b] OUTER APPLY (SELECT TOP(1) [p].[Title] FROM [Posts] AS [p] WHERE [b].[Id] = [p].[BlogId] ORDER BY [p].[Title]) AS [p0] ORDER BY [b].[Url]"),
+            r#"SELECT b.url AS "Url", p0.title AS "Title" FROM blogs AS b LEFT JOIN LATERAL (SELECT p.title AS "Title" FROM posts AS p WHERE b.id = p.blogid ORDER BY "Title" LIMIT 1) AS p0 ON 1 = 1 ORDER BY "Url""#
+        );
+        assert_eq!(
+            tr(&e, "SELECT b.id, x.n FROM b CROSS APPLY (SELECT TOP 2 p.n FROM p WHERE p.b = b.id) x"),
+            r#"SELECT b.id AS "id", x.n AS "n" FROM b CROSS JOIN LATERAL (SELECT p.n AS "n" FROM p WHERE p.b = b.id LIMIT 2) x"#
+        );
+        // An APPLY of a function is not a subquery.
+        let tokens = lex("SELECT * FROM t CROSS APPLY OPENJSON(t.j) AS o").unwrap();
+        assert!(translate("", tokens, &e).is_err());
+    }
+
+    #[test]
+    fn a_derived_tables_top_is_its_limit() {
+        let e = env();
+        assert_eq!(
+            tr(&e, "SELECT x.id FROM (SELECT TOP(1) b.id FROM blogs AS b ORDER BY b.url) AS x"),
+            r#"SELECT x.id AS "id" FROM (SELECT b.id AS "id" FROM blogs AS b ORDER BY b.url LIMIT 1) AS x"#
+        );
+    }
+
+    #[test]
+    fn an_integer_literal_item_is_an_int() {
+        let e = env();
+        assert_eq!(tr(&e, "SELECT 1 AS [c], 5000000000 AS d"), r#"SELECT CAST(1 AS integer) AS "c", 5000000000 AS "d""#);
+    }
+
+    #[test]
+    fn a_not_null_filter_on_a_unique_key_is_the_key() {
+        let e = env();
+        assert_eq!(
+            tr(&e, "CREATE UNIQUE INDEX [IX_U] ON [AspNetUsers] ([NormalizedUserName]) WHERE [NormalizedUserName] IS NOT NULL"),
+            "CREATE UNIQUE INDEX aspnetusers__ix_u ON aspnetusers (normalizedusername)"
+        );
+        assert_eq!(
+            tr(&e, "CREATE UNIQUE INDEX [IX_P] ON [P] ([Sku], [Name]) WHERE ([Sku] IS NOT NULL AND [Name] IS NOT NULL)"),
+            "CREATE UNIQUE INDEX p__ix_p ON p (sku, name)"
+        );
+        // Not unique: the index over every row answers the same.
+        assert_eq!(tr(&e, "CREATE INDEX [IX_D] ON [P] ([Sku]) WHERE [Deleted] = 0"), "CREATE INDEX p__ix_d ON p (sku)");
+        for sql in [
+            "CREATE UNIQUE INDEX [IX_D] ON [P] ([Sku]) WHERE [Deleted] = 0",
+            "CREATE UNIQUE INDEX [IX_D] ON [P] ([Sku]) WHERE [Other] IS NOT NULL",
+            "CREATE UNIQUE INDEX [IX_D] ON [P] ([Sku]) WHERE [Sku] IS NOT NULL OR [Name] IS NOT NULL",
+        ] {
+            assert!(translate(sql, lex(sql).unwrap(), &e).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn alter_database_set_is_one_statement() {
+        let e = env();
+        let sql = "IF SERVERPROPERTY('EngineEdition') <> 5 BEGIN ALTER DATABASE [efmig] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; END; DROP DATABASE [efmig];";
+        let stmts = parse_batch(&lex(sql).unwrap()).unwrap();
+        assert_eq!(stmts.len(), 2, "{stmts:?}");
+        assert_eq!(tr(&e, "ALTER DATABASE [d] SET READ_COMMITTED_SNAPSHOT ON"), "");
+        let sql = "ALTER DATABASE [d] SET ANSI_NULLS OFF";
+        assert!(translate(sql, lex(sql).unwrap(), &e).is_err());
     }
 }

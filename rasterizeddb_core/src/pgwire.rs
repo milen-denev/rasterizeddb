@@ -13957,6 +13957,10 @@ fn join_output_columns(
         };
         match database.schema_view(&relation.table) {
             Some(table) => reported_type_of(&item.field, &table.schema().json_columns),
+            // A derived table's relation is gone by the time this runs; its
+            // column still says whether it is a `timestamp`, which the raw
+            // stored type (`timestamptz`) does not.
+            None if fallback == DbType::DATETIME && item.field.without_time_zone => DbType::TIMESTAMP,
             None => fallback,
         }
     };
