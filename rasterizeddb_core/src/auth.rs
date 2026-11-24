@@ -800,6 +800,27 @@ pub async fn all_roles(database: &rclite::Arc<crate::core::database::Database>) 
         .collect()
 }
 
+/// What every login with an md5 verifier is told and logged (RD3): md5 is
+/// still accepted where it is configured, but a stolen verifier logs in as
+/// the role (it is the password's equivalent), and SCRAM is the default for
+/// a new password.
+pub fn md5_login_warning(user: &str) -> String {
+    format!(
+        "role \"{user}\" logged in with an md5 password verifier, which is deprecated: whoever holds the \
+         verifier can log in as the role. Set its password again under scram-sha-256 (ALTER ROLE … PASSWORD)"
+    )
+}
+
+/// Logs [`md5_login_warning`] for a login of `user` to `database` over
+/// `protocol`, when `verifier` is md5.
+pub fn warn_if_md5_login(verifier: Option<&Verifier>, user: &str, database: &str, protocol: &str) -> bool {
+    if !matches!(verifier, Some(Verifier::Md5 { .. })) {
+        return false;
+    }
+    log::warn!("{} ({protocol}, database \"{database}\")", md5_login_warning(user));
+    true
+}
+
 /// What a login that proves nothing (`trust`, a native listener asking for
 /// no credential) is in `database`: `Ok(true)` for an administrator,
 /// `Ok(false)` for an ordinary role, or why it is refused (28000).

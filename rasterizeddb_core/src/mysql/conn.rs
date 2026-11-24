@@ -602,6 +602,8 @@ async fn authenticate(
     if !may_login || !crate::auth::verify_password(&verifier, user, &password) {
         return Ok(None);
     }
+    // RD3: an md5 verifier's login is warned about.
+    crate::auth::warn_if_md5_login(Some(&verifier), user, database_name, "mysql");
     let h1 = sha256(&[password.as_bytes()]);
     let h2 = sha256(&[&h1]);
     fast_auth_cache().lock().insert(key, (fingerprint, h2));

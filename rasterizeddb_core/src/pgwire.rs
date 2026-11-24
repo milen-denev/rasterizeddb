@@ -15515,6 +15515,7 @@ where
         .unwrap_or(Verifier::Plain(String::new()));
     let may_login = role.as_ref().map(|r| r.can_login).unwrap_or(false);
     let superuser = role.as_ref().map(|r| r.is_superuser).unwrap_or(false);
+    let md5_verifier = matches!(verifier, Verifier::Md5 { .. });
 
     let denied = || {
         io::Error::new(
@@ -15609,6 +15610,11 @@ where
     }
 
     send_auth_ok(stream).await?;
+    // RD3: md5 is accepted where configured, and every such login is
+    // warned about, in the log and to the client.
+    if md5_verifier && crate::auth::warn_if_md5_login(role.as_ref().and_then(|r| r.verifier.as_ref()), &user, &database.name, "pgwire") {
+        send_notice(stream, "01000", &crate::auth::md5_login_warning(&user)).await?;
+    }
     Ok(Principal {
         name: user,
         superuser,

@@ -486,6 +486,8 @@ async fn handshake(
                 wire.send(tds::PT_REPLY).await?;
                 return Ok(None);
             }
+            // RD3: an md5 verifier's login is warned about.
+            crate::auth::warn_if_md5_login(Some(&verifier), &login.user, &database_name, "tds");
             ProxiedLogin {
                 user: login.user.clone(),
                 superuser: role.as_ref().map(|r| r.is_superuser).unwrap_or(false),
