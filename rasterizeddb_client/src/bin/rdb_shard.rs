@@ -952,6 +952,28 @@ async fn cluster_ddl(args: &Args, options: &Options) -> std::result::Result<(), 
     for &id in &order {
         clients.push((id, connect(&map, id, options).await?));
     }
+    // B4.6, step 1: the DDL tried on every shard and rolled back, so one it
+    // would fail on is applied on none. A statement a block cannot hold
+    // (25001) is not tried there.
+    if applied.is_empty() {
+        for (id, c) in &clients {
+            let tx = c.begin().await.map_err(|e| format!("shard {id}: {e}"))?;
+            let tried = tx.run(&sql).await;
+            let _ = tx.rollback().await;
+            match tried {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains("25001") || e.to_string().contains("inside a transaction block") => {
+                    println!("shard {id}: the DDL cannot be tried in a block; applied without a dry run");
+                }
+                Err(e) => return Err(format!("shard {id} would refuse the DDL, so no shard was changed: {e}")),
+            }
+        }
+    }
+    // Step 2: the changed tables fenced everywhere until the epoch moves.
+    let fence = tables.join(",").replace('\'', "''");
+    for (id, c) in &clients {
+        c.run(&format!("SET CONFIG shard.ddl_fence = '{fence}'")).await.map_err(|e| format!("shard {id}: fencing {fence}: {e}"))?;
+    }
     for (id, c) in &clients {
         if applied.contains(id) {
             println!("shard {id}: already applied");
@@ -999,8 +1021,12 @@ async fn cluster_ddl(args: &Args, options: &Options) -> std::result::Result<(), 
             .await
             .map_err(|e| format!("shard {id}: raising the schema epoch: {e}"))?;
     }
+    // The epoch has moved: the tables are open again.
+    for (id, c) in &clients {
+        c.run("SET CONFIG shard.ddl_fence = ''").await.map_err(|e| format!("shard {id}: lifting the fence: {e}"))?;
+    }
     let _ = std::fs::remove_file(&state_path);
-    println!("schema epoch {next} on every shard");
+    println!("schema epoch {next} on every shard; the fence on {fence} is lifted");
     Ok(())
 }
 

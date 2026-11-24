@@ -84,3 +84,68 @@ fn put_str(b: &mut Vec<u8>, s: &str) {
     put_u64(b, s.len() as u64);
     b.extend_from_slice(s.as_bytes());
 }
+
+/// The tables a cluster DDL is changing right now (B4.6): set on every
+/// shard before the DDL applies anywhere, cleared once every shard's
+/// fingerprint agrees and the schema epoch is raised. While a table is
+/// fenced, a statement that reads or writes it is refused with a
+/// retryable 40001, so no statement runs against one shard's new schema
+/// and another's old one. Kept in memory: a restarted shard is unfenced,
+/// and the tool sets the fence again when it resumes.
+static FENCE: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+static FENCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Replaces the fence with `tables` (comma separated; empty lifts it).
+pub fn set_fence(tables: &str) {
+    let list: Vec<String> = tables
+        .split(',')
+        .map(|t| t.trim().trim_matches('\'').trim_matches('"').to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    FENCED.store(!list.is_empty(), std::sync::atomic::Ordering::Release);
+    *FENCE.write().unwrap_or_else(|e| e.into_inner()) = list;
+}
+
+/// The fence as `SHOW CONFIG` reports it.
+pub fn fence() -> String {
+    FENCE.read().unwrap_or_else(|e| e.into_inner()).join(",")
+}
+
+/// The refusal for `stmt` while it touches a fenced table; `None` for a
+/// statement that does not, and for the DDL and session statements the
+/// change itself is made with.
+pub fn fenced_refusal(stmt: &str) -> Option<String> {
+    if !FENCED.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let head = stmt.trim_start().split(|c: char| c.is_whitespace() || c == '(').next().unwrap_or("").to_ascii_uppercase();
+    if matches!(
+        head.as_str(),
+        "CREATE" | "ALTER" | "DROP" | "SET" | "SHOW" | "RESET" | "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "ABORT"
+    ) {
+        return None;
+    }
+    let fence = FENCE.read().unwrap_or_else(|e| e.into_inner());
+    crate::core::rql::lock_set::relation_references(stmt).into_iter().find_map(|r| {
+        let name = r.name.rsplit('.').next().unwrap_or(&r.name).trim_matches('"').to_ascii_lowercase();
+        fence.contains(&name).then(|| {
+            format!("40001: table {name} is having its schema changed across the cluster; retry the statement in a moment")
+        })
+    })
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+
+    #[test]
+    fn b46_a_fenced_table_refuses_reads_and_writes_but_not_its_ddl() {
+        set_fence("orders, \"Items\"");
+        assert!(fenced_refusal("SELECT * FROM orders WHERE id = 1").is_some_and(|e| e.starts_with("40001")));
+        assert!(fenced_refusal("UPDATE public.orders SET x = 1").is_some());
+        assert!(fenced_refusal("SELECT 1 FROM other").is_none());
+        assert!(fenced_refusal("ALTER TABLE orders ADD COLUMN y INT").is_none(), "the DDL itself runs");
+        set_fence("");
+        assert!(fenced_refusal("SELECT * FROM orders").is_none(), "lifted");
+    }
+}

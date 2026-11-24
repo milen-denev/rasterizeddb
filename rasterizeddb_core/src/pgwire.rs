@@ -9622,6 +9622,14 @@ where
         return Ok(());
     }
 
+    // A cluster DDL is changing a table this touches (B4.6): retryable.
+    #[cfg(feature = "sharding")]
+    if !state.view_internal
+        && let Some(e) = crate::core::shard::ddl::fenced_refusal(stmt)
+    {
+        fail_statement(state, stream, "40001", e.trim_start_matches("40001: ")).await?;
+        return Ok(());
+    }
     // On a follower of its shard's Raft group (B4.1): a write is refused,
     // and a read waits for the leader's read point, so it sees every write
     // committed before it began.

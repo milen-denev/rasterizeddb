@@ -3034,6 +3034,15 @@ const CONFIG_KEYS: &[ConfigKey] = &[
                fingerprints agree, and gateways drop templates of older epochs; never goes down",
     },
     ConfigKey {
+        section: "shard",
+        key: "ddl_fence",
+        hot: true,
+        set_with: "SET CONFIG shard.ddl_fence = 'orders,items'",
+        options: "",
+        help: "tables a cluster DDL is changing: statements touching them are refused with a retryable 40001 until \
+               rdb-shard ddl lifts it (''), so none reads one shard's new schema and another's old",
+    },
+    ConfigKey {
         section: "partition",
         key: "resident_budget",
         hot: true,
@@ -3214,6 +3223,7 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             ("partition", "resident_budget") => crate::core::partition::budget::settings::resident_budget().to_string(),
             #[cfg(feature = "sharding")]
             ("shard", "schema_epoch") => crate::core::shard::rshard::SCHEMA_EPOCH.load(Ordering::Acquire).to_string(),
+            ("shard", "ddl_fence") => crate::core::shard::ddl::fence(),
             ("index_snapshot", "idle_checkpoint_secs") => {
                 crate::core::index_store::seal::settings::idle_checkpoint_secs().to_string()
             }
@@ -3695,6 +3705,11 @@ fn set_process_wide(key: &str, section: &str, name: &str, value: &str) -> Result
                 _ => return Err(format!("`{}` has no live setter", key)),
             };
             Ok(format!("{key} is now {now}"))
+        }
+        #[cfg(feature = "sharding")]
+        "shard" if name == "ddl_fence" => {
+            crate::core::shard::ddl::set_fence(value.trim().trim_matches('\''));
+            return Ok(format!("{key} is now '{}'", crate::core::shard::ddl::fence()));
         }
         #[cfg(feature = "sharding")]
         "shard" if name == "schema_epoch" => {
