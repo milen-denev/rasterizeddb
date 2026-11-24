@@ -994,6 +994,41 @@ The design's §9, with these concrete seams:
 - **Size:** about 15–20k LOC. It is the riskiest phase: visibility moves into
   the apply loop on the hottest path (sharding.md §18.1).
 
+**B3 as built so far (2026-11-24), behind `sharding_raft`, off by default:**
+- `rasterizeddb_raft`: our own Raft core (D3), deterministic and I/O-free:
+  pre-vote, leader stickiness, check-quorum, ReadIndex, snapshots,
+  single-server membership changes with learners, leadership transfer,
+  flow control; its codec.
+- `core::shard::raft_store`: the durable log, hard state and snapshot.
+- `core::shard::raft_group`: the runtime (persist, send, apply, answer by
+  index and term) and the `StateMachine`/`Transport` seams.
+- `core::shard::raft_net`: the mTLS transport.
+
+**Still to build, together with its gate** (the deterministic simulation
+over `RaftNode`s with seeded partitions, reorderings and crashes; the
+power-loss harness on the store; S13–S18), because it moves visibility onto
+the hottest path and cannot be trusted without them:
+1. *Capture.* A per-transaction-family op buffer (insert image; update as
+   key + new image; delete by key), filled at the four stamping paths
+   beside `shard_hooks::check_stamp`, keyed by root TxId so a block's
+   statements accumulate, discarding a rolled-back savepoint's ops by the
+   family's outcomes.
+2. *Propose at commit.* In `commit_written_transaction` where
+   `prepare_replication` runs: the family's ops proposed and awaited
+   (the group's `propose`, on a multi-thread runtime), and the local commit
+   only after it applied; `Lost`/`NotLeader` aborts the transaction.
+3. *Apply.* On every replica, by log index: skip at or below the durable
+   applied index; the leader commits the waiting origin transaction; a
+   follower (or a leader whose origin transaction died with a restart)
+   writes the images under a fresh transaction at the storage layer, by PK
+   (B0.3's identifying key, B0.6's index wait), asserting the old image,
+   with capture off, no defaults, FK actions or sequences; the applied
+   index written in the same storage transaction.
+4. *Reads:* ReadIndex for linearizable reads; followers serve none until
+   then.
+5. `SeqReserve` and `Schema` entries; the in-place update path off;
+   learner relocation through the backup snapshot routine.
+
 ### 4.8 Phases B4 to B6 (outline only, replanned when B3 lands)
 
 - **B4:**
