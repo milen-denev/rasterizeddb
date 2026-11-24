@@ -686,6 +686,7 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
         .collect();
 
     let mut defs = Vec::new();
+    let mut column_compression = Vec::new();
     let mut writes = Vec::new();
     let mut texts = Vec::new();
     let mut consts = Vec::new();
@@ -725,10 +726,9 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             Some(d) => quote!(::core::option::Option::Some(#d)),
             None => quote!(::core::option::Option::None),
         };
-        let compression = match &f.attrs.compression {
-            Some(c) => quote!(::core::option::Option::Some(#c)),
-            None => quote!(::core::option::Option::None),
-        };
+        if let Some(method) = &f.attrs.compression {
+            column_compression.push(quote!((#column, #method)));
+        }
         let (primary_key, serial, unique) = (f.attrs.primary_key, f.attrs.serial, f.attrs.unique);
         let renamed_from = &f.attrs.renamed_from;
         let references = match &f.attrs.references {
@@ -778,7 +778,6 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
                 unique: #unique,
                 index: #index,
                 default: #default,
-                compression: #compression,
                 read_as_text: #read_as_text,
                 renamed_from: &[#(#renamed_from),*],
                 role: #role,
@@ -971,9 +970,16 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             // A bare `row_compression` is zstd at its default level.
             let method = if method.is_empty() { "zstd".to_string() } else { method };
             let method = compression_method(&method).map_err(|e| syn::Error::new(input.span(), e))?;
-            quote!(::core::option::Option::Some(#method))
+            quote!(const ROW_COMPRESSION: ::core::option::Option<&'static str> = ::core::option::Option::Some(#method);)
         }
-        None => quote!(::core::option::Option::None),
+        None => quote!(),
+    };
+    // Emitted only for a model that compresses, so that a model that does
+    // not compiles against a client that predates these constants.
+    let column_compression = if column_compression.is_empty() {
+        quote!()
+    } else {
+        quote!(const COLUMN_COMPRESSION: &'static [(&'static str, &'static str)] = &[#(#column_compression),*];)
     };
     let from_row = from_row_impl(input, &fields, named);
     let hook_methods = if hooks {
@@ -994,7 +1000,8 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             const COLUMNS: &'static [::rasterizeddb_client::orm::ColumnDef] = &[#(#defs),*];
             const RENAMED_FROM: &'static [&'static str] = &[#(#table_renamed_from),*];
             const PARTITION: ::core::option::Option<::rasterizeddb_client::orm::Partitioning> = #partition;
-            const ROW_COMPRESSION: ::core::option::Option<&'static str> = #row_compression;
+            #row_compression
+            #column_compression
 
             fn write_value(&self, column: usize, out: &mut ::std::string::String) -> ::rasterizeddb_client::Result<()> {
                 match column {

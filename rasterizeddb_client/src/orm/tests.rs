@@ -1129,7 +1129,8 @@ struct TailOnly {
 /// compares against `attcompression` and `reloptions`.
 #[test]
 fn compression_reaches_the_ddl_as_the_server_names_it() {
-    let column = |name: &str| CompressedDoc::COLUMNS.iter().find(|c| c.name == name).unwrap().compression;
+    let storage = super::Storage::of::<CompressedDoc>();
+    let column = |name: &str| storage.column(name);
     assert_eq!(column("body"), Some("zstd(19)"));
     assert_eq!(column("note"), Some("zstd"));
     assert_eq!(column("legacy"), Some("zstd"), "lz4 is stored as zstd(3)");
@@ -1138,6 +1139,7 @@ fn compression_reaches_the_ddl_as_the_server_names_it() {
     assert_eq!(CompressedDoc::ROW_COMPRESSION, Some("zstd(6)"));
     assert_eq!(TailOnly::ROW_COMPRESSION, Some("zstd"));
     assert_eq!(Account::ROW_COMPRESSION, None);
+    assert!(Account::COLUMN_COMPRESSION.is_empty());
     assert_eq!(
         create_table_sql::<CompressedDoc>().unwrap()[0],
         "CREATE TABLE IF NOT EXISTS compressed_docs (id BIGINT NOT NULL, body TEXT COMPRESSION zstd(19) NOT NULL, \
@@ -1146,16 +1148,27 @@ fn compression_reaches_the_ddl_as_the_server_names_it() {
     );
     // Added later, a column keeps its compression in `ADD COLUMN`.
     let body = CompressedDoc::COLUMNS.iter().find(|c| c.name == "body").unwrap();
-    assert_eq!(TableSchema::column_ddl(body).unwrap(), "body TEXT COMPRESSION zstd(19) NOT NULL");
+    assert_eq!(
+        TableSchema::column_ddl(body, storage.column("body")).unwrap(),
+        "body TEXT COMPRESSION zstd(19) NOT NULL"
+    );
+    // A bare `TableSchema` has no field for it (adding one would break
+    // literals written against 1.0.0): its own DDL leaves it out.
+    let bare = &TableSchema::of::<CompressedDoc>().create_sql().unwrap()[0];
+    assert!(!bare.contains("COMPRESSION") && !bare.contains("WITH ("), "{bare}");
 }
 
-/// The policy presets: compression is fixed by default and by `exact`, and
-/// left as drift by `additive` and `report_only`.
+/// Unset, compression sync follows the policy: fixed by default and by
+/// `exact`, left as drift by `additive` and `report_only`;
+/// `sync_compression` overrides it either way.
 #[test]
 fn compression_follows_the_sync_policy_presets() {
-    use super::migrate::SyncPolicy;
-    assert!(SyncPolicy::default().compression);
-    assert!(SyncPolicy::exact().compression);
-    assert!(!SyncPolicy::additive().compression);
-    assert!(!SyncPolicy::report_only().compression);
+    use super::migrate::{Migrator, SyncPolicy};
+    let under = |policy: SyncPolicy| Migrator::new().sync_policy(policy);
+    assert!(Migrator::new().compression_sync());
+    assert!(under(SyncPolicy::exact()).compression_sync());
+    assert!(!under(SyncPolicy::additive()).compression_sync());
+    assert!(!under(SyncPolicy::report_only()).compression_sync());
+    assert!(under(SyncPolicy::report_only()).sync_compression(true).compression_sync());
+    assert!(!Migrator::new().sync_compression(false).compression_sync());
 }

@@ -388,9 +388,19 @@ struct Doc {
 
 The migrator compares the model with `attcompression` (columns) and
 `reloptions` (tables). It issues `SET COMPRESSION` or `SET`/`RESET
-(row_compression)` under `SyncPolicy::compression`, which is on by default and
-in `exact()`, and off in `additive()` and `report_only()`. It never issues
+(row_compression)` when `Migrator::sync_compression` allows it. Unset, that
+follows the `SyncPolicy`: on by default and in `exact()`, off in `additive()`
+and `report_only()`, where a difference is reported as drift. It never issues
 RECOMPRESS: a rewrite is the operator's call.
+
+The settings travel as `Model::ROW_COMPRESSION` and
+`Model::COLUMN_COMPRESSION`, defaulted trait constants the derive emits only
+for a model that compresses. `ColumnDef`, `TableSchema` and `SyncPolicy` gain
+no fields: their fields are public and constructible with a literal, so a new
+one would break code written against client 1.0.0 (cargo semver-checks
+refuses it), and a derive and client of different 1.0.x releases would not
+compile together. So `TableSchema::create_sql()` alone leaves compression out;
+`create_table_sql::<M>()` and the migrator include it.
 
 ### Behaviour
 

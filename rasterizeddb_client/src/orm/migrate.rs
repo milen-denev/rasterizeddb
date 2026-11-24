@@ -81,7 +81,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{ColumnDef, Model, TableSchema, ident};
+use super::{ColumnDef, Model, Storage, TableSchema, ident};
 use crate::client::Client;
 use crate::types::{Timestamp, Uuid};
 use crate::{Error, Result, params};
@@ -137,10 +137,6 @@ pub struct SyncPolicy {
     /// writers wait) while every row is copied into partitions. Turn it on
     /// for the run that should do it.
     pub convert_partitioning: bool,
-    /// Change how a column stores its values to the model's
-    /// (`#[rdb(compression)]`, `ALTER COLUMN … SET COMPRESSION`). On by
-    /// default: it rewrites nothing, applying to values written from then on.
-    pub compression: bool,
 }
 
 impl Default for SyncPolicy {
@@ -155,7 +151,6 @@ impl Default for SyncPolicy {
             drop_columns: false,
             fail_on_drift: false,
             convert_partitioning: false,
-            compression: true,
         }
     }
 }
@@ -165,7 +160,6 @@ impl SyncPolicy {
     pub fn additive() -> Self {
         SyncPolicy {
             renames: false,
-            compression: false,
             ..SyncPolicy::default()
         }
     }
@@ -194,7 +188,6 @@ impl SyncPolicy {
             drop_columns: false,
             fail_on_drift: false,
             convert_partitioning: false,
-            compression: false,
         }
     }
 }
@@ -355,13 +348,14 @@ pub struct MigrationReport {
 #[derive(Clone)]
 pub struct Migrator {
     steps: Vec<Step>,
-    models: Vec<TableSchema>,
+    models: Vec<(TableSchema, Storage)>,
     table: String,
     baseline: Option<String>,
     accept_changed: bool,
     ignore_unknown: bool,
     allow_out_of_order: bool,
     policy: SyncPolicy,
+    compression: Option<bool>,
     lock_timeout: Duration,
     lock_stale_after: Duration,
 }
@@ -372,7 +366,7 @@ impl fmt::Debug for Migrator {
             .field("steps", &self.steps)
             .field(
                 "models",
-                &self.models.iter().map(|m| m.table).collect::<Vec<_>>(),
+                &self.models.iter().map(|m| m.0.table).collect::<Vec<_>>(),
             )
             .field("table", &self.table)
             .field("baseline", &self.baseline)
@@ -402,6 +396,7 @@ impl Migrator {
             ignore_unknown: false,
             allow_out_of_order: false,
             policy: SyncPolicy::default(),
+            compression: None,
             lock_timeout: Duration::from_secs(60),
             lock_stale_after: Duration::from_secs(15 * 60),
         }
@@ -482,15 +477,35 @@ impl Migrator {
     /// they are when the step is added. (For a table kept in sync on every
     /// start, use [`model`](Self::model).)
     pub fn create_table<M: Model>(self, name: &str) -> Result<Self> {
-        let statements = TableSchema::of::<M>().create_sql()?;
+        let statements = TableSchema::of::<M>().create_sql_with(&Storage::of::<M>())?;
         Ok(self.push(name, Body::Sql(statements), false))
     }
 
     /// Keeps model `M`'s table matching the struct on every run, after the
     /// steps, under the [`SyncPolicy`].
     pub fn model<M: Model>(mut self) -> Self {
-        self.models.push(TableSchema::of::<M>());
+        self.models.push((TableSchema::of::<M>(), Storage::of::<M>()));
         self
+    }
+
+    /// Whether the model sync changes how a table stores its values to the
+    /// model's: a column's `#[rdb(compression)]` (`ALTER COLUMN … SET
+    /// COMPRESSION`) and the struct's `row_compression` (`ALTER TABLE … SET
+    /// (row_compression = …)`). Either rewrites nothing: it applies to
+    /// values written from then on. Unset, it follows the [`SyncPolicy`]:
+    /// on when the policy alters existing tables at all (`renames`,
+    /// `nullability`, `retype` or `drop_columns`), so under the default and
+    /// [`SyncPolicy::exact`], and off under [`SyncPolicy::additive`] and
+    /// [`SyncPolicy::report_only`], where a difference is reported as drift.
+    pub fn sync_compression(mut self, on: bool) -> Self {
+        self.compression = Some(on);
+        self
+    }
+
+    pub(crate) fn compression_sync(&self) -> bool {
+        self.compression.unwrap_or(
+            self.policy.renames || self.policy.nullability || self.policy.retype || self.policy.drop_columns,
+        )
     }
 
     /// What the model sync may change (the default: create, add, rename, keys).
@@ -667,8 +682,8 @@ impl Migrator {
         let recorded = self.recorded(client).await?;
         let mut plan = MigrationPlan::default();
         self.plan_steps(&recorded, &mut plan);
-        for model in &self.models {
-            let sync = plan_model(client, model, &self.policy).await?;
+        for (model, storage) in &self.models {
+            let sync = plan_model(client, model, storage, &self.policy, self.compression_sync()).await?;
             plan.schema_changes.extend(sync.changes);
             plan.ensured.extend(sync.ensure);
             plan.drift.extend(sync.drift);
@@ -795,8 +810,8 @@ impl Migrator {
             self.record(client, step, "repeatable", again).await?;
             report.reapplied.push(name.clone());
         }
-        for model in &self.models {
-            let sync = plan_model(client, model, &self.policy).await?;
+        for (model, storage) in &self.models {
+            let sync = plan_model(client, model, storage, &self.policy, self.compression_sync()).await?;
             if !sync.drift.is_empty() && self.policy.fail_on_drift {
                 return Err(Error::Unsupported(format!(
                     "{} has drifted from its model: {}",
@@ -1113,7 +1128,9 @@ struct ModelSync {
 async fn plan_model(
     client: &Client,
     model: &TableSchema,
+    storage: &Storage,
     policy: &SyncPolicy,
+    compression: bool,
 ) -> Result<ModelSync> {
     let mut changes = Vec::new();
     let mut ensure = Vec::new();
@@ -1133,7 +1150,7 @@ async fn plan_model(
     }
     let Some(found) = source else {
         if policy.create_tables {
-            changes.extend(model.create_sql()?);
+            changes.extend(model.create_sql_with(storage)?);
         } else {
             drift.push(format!("table {} does not exist", model.table));
         }
@@ -1184,7 +1201,7 @@ async fn plan_model(
                     None if policy.add_columns => {
                         changes.push(format!(
                             "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {}",
-                            TableSchema::column_ddl(column)?
+                            TableSchema::column_ddl(column, storage.column(column.name))?
                         ));
                         continue;
                     }
@@ -1199,8 +1216,10 @@ async fn plan_model(
             model.table,
             &table,
             column,
+            storage.column(column.name),
             current,
             policy,
+            compression,
             &mut changes,
             &mut drift,
         )?;
@@ -1215,7 +1234,7 @@ async fn plan_model(
         &mut drift,
     )
     .await?;
-    plan_row_compression(client, model, found, &table, policy, &mut changes, &mut drift).await;
+    plan_row_compression(client, model, storage.row, found, &table, compression, &mut changes, &mut drift).await;
     let mut extra: Vec<&String> = existing
         .keys()
         .filter(|n| !accounted.contains(n.as_str()))
@@ -1366,26 +1385,26 @@ async fn current_row_compression(client: &Client, table: &str) -> Option<Option<
 
 /// Row compression drift: the model's `#[rdb(row_compression = …)]` against
 /// the table's, fixed with `SET (row_compression = …)` / `RESET
-/// (row_compression)` under [`SyncPolicy::compression`] (rows written from
+/// (row_compression)` under [`Migrator::sync_compression`] (rows written from
 /// then on; `ALTER TABLE … RECOMPRESS` rewrites the rest).
 #[allow(clippy::too_many_arguments)]
 async fn plan_row_compression(
     client: &Client,
     model: &TableSchema,
+    wanted: Option<&'static str>,
     found: &str,
     table: &str,
-    policy: &SyncPolicy,
+    sync: bool,
     changes: &mut Vec<String>,
     drift: &mut Vec<String>,
 ) {
-    let wanted = model.row_compression;
     match current_row_compression(client, found).await {
         Some(now) if now.as_deref() != wanted => {
             let statement = match wanted {
                 Some(method) => format!("ALTER TABLE {table} SET (row_compression = '{method}')"),
                 None => format!("ALTER TABLE {table} RESET (row_compression)"),
             };
-            if policy.compression {
+            if sync {
                 changes.push(statement);
             } else {
                 drift.push(format!(
@@ -1410,8 +1429,10 @@ fn compare_column(
     table_name: &str,
     table: &str,
     column: &ColumnDef,
+    compression: Option<&str>,
     current: &Existing,
     policy: &SyncPolicy,
+    sync_compression: bool,
     changes: &mut Vec<String>,
     drift: &mut Vec<String>,
 ) -> Result<()> {
@@ -1432,11 +1453,11 @@ fn compare_column(
         }
     }
     // How it stores its values: the model's method, or none.
-    let wanted = column.compression.unwrap_or("");
+    let wanted = compression.unwrap_or("");
     match current.compression.as_deref() {
         Some(now) if now != wanted => {
             let method = if wanted.is_empty() { "default" } else { wanted };
-            if policy.compression {
+            if sync_compression {
                 changes.push(format!(
                     "ALTER TABLE {table} ALTER COLUMN {name} SET COMPRESSION {method}"
                 ));
