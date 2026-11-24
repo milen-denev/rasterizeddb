@@ -10856,6 +10856,22 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // branches below. `disk_full` when the disk is, `io_error` otherwise.
     // `cardinality_violation`: a scalar subquery (a correlated one run as a
     // `LATERAL` join included) that gave more than one row.
+    // Sharding's refusals lead with their code (`core::shard`): a range this
+    // shard does not own, a stale map, a fenced move, a statement that
+    // names no route key in cluster mode. Matched on the message's own
+    // prefix, never inside quoted text.
+    for code in ["RDB02", "RDB03", "57P03", "0A000", "22003", "42501", "XX000"] {
+        if message.starts_with(code) && message[code.len()..].starts_with(':') {
+            return code;
+        }
+    }
+    // Wrapped by a caller that names the table or partition first.
+    if has("rdb02: ") {
+        return "RDB02";
+    }
+    if has("rdb03: ") {
+        return "RDB03";
+    }
     if has("more than one row returned by a subquery used as an expression") {
         return "21000";
     }
