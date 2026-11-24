@@ -335,6 +335,10 @@ pub struct AggCall {
     /// `string_agg(s, ',' ORDER BY k DESC)`: the order the values are kept
     /// in, keys evaluated per row.
     pub order: Vec<AggOrderKey>,
+    /// The argument column's nondeterministic collation: `min`/`max` pick by
+    /// its order and a DISTINCT keeps one value per key
+    /// (`core::rql::collation::compare`).
+    pub collation: Option<crate::core::rql::collation::Strength>,
 }
 
 /// One key of an `ORDER BY` inside an aggregate call.
@@ -448,7 +452,7 @@ pub(crate) fn build_call(
     if delimiter.is_none() && keys.is_empty() && !(func == AggFunc::StringAgg && second.is_some()) {
         return Ok(None);
     }
-    Ok(Some(Box::new(AggCall { delimiter, order: keys })))
+    Ok(Some(Box::new(AggCall { delimiter, order: keys, collation: None })))
 }
 
 /// The `FILTER (WHERE …)` attached to one aggregate.
@@ -1220,6 +1224,8 @@ pub(crate) enum Acc {
         best: Option<Vec<u8>>,
         ty: DbType,
         want_max: bool,
+        /// Text under a nondeterministic collation, compared by its key.
+        collation: Option<crate::core::rql::collation::Strength>,
     },
     /// An aggregate over DISTINCT values: the set of values seen, and the
     /// accumulator of the function it feeds them into once each.
@@ -1236,6 +1242,10 @@ pub(crate) enum Acc {
         template: Box<Acc>,
         ty: DbType,
         null: bool,
+        /// Text under a nondeterministic collation: one value per key, the
+        /// keys seen kept here.
+        collation: Option<crate::core::rql::collation::Strength>,
+        keys: std::collections::HashSet<Vec<u8>>,
     },
     /// `string_agg`, `array_agg`, `json_agg`: every value of the group (NULL
     /// as `None`) with the keys of the call's `ORDER BY`, kept until the
@@ -1277,12 +1287,18 @@ impl Acc {
                 *order = keys.iter().map(|k| (k.descending, k.nulls_first)).collect();
             }
         }
+        let collation = call.and_then(|c| c.collation).filter(|s| !s.is_binary());
+        if let Acc::Extreme { collation: c, .. } = &mut plain {
+            *c = collation;
+        }
         match (distinct, arg) {
             (true, Some(field)) => Acc::Distinct {
                 seen: std::collections::HashSet::new(),
                 template: Box::new(plain),
                 ty: field.db_type.clone(),
                 null: false,
+                collation,
+                keys: std::collections::HashSet::new(),
             },
             _ => plain,
         }
@@ -1291,7 +1307,7 @@ impl Acc {
     /// The function's own accumulator over the distinct values, for a
     /// [`Acc::Distinct`]; `None` for every other kind.
     fn resolve(&self) -> Option<Acc> {
-        let Acc::Distinct { seen, template, ty, null } = self else {
+        let Acc::Distinct { seen, template, ty, null, collation, .. } = self else {
             return None;
         };
         let mut acc = (**template).clone();
@@ -1299,7 +1315,10 @@ impl Acc {
         // (`string_agg(DISTINCT s, …)`) answers the same every time, as
         // PostgreSQL's sorted DISTINCT does.
         let mut values: Vec<&Vec<u8>> = seen.iter().collect();
-        values.sort_by(|a, b| compare_values(a, b, ty));
+        match collation {
+            Some(strength) => values.sort_by(|a, b| crate::core::rql::collation::compare(a, b, *strength)),
+            None => values.sort_by(|a, b| compare_values(a, b, ty)),
+        }
         for value in values {
             acc.accumulate(Some(value), Some(ty));
         }
@@ -1328,6 +1347,7 @@ impl Acc {
                 best: None,
                 ty: arg.map(|f| f.db_type.clone()).unwrap_or(DbType::I64),
                 want_max: func == AggFunc::Max,
+                collation: None,
             },
             AggFunc::Stddev
             | AggFunc::StddevSamp
@@ -1468,9 +1488,16 @@ impl Acc {
             }
             _ => {}
         }
-        if let Acc::Distinct { seen, ty: own, template, null } = self {
+        if let Acc::Distinct { seen, ty: own, template, null, collation, keys } = self {
             if bytes.is_none() && matches!(**template, Acc::Collect { .. }) {
                 *null = true;
+            }
+            if let (Some(value), Some(strength)) = (bytes, *collation) {
+                // One value per key: the first seen stands for the others.
+                if keys.insert(crate::core::rql::collation::key_bytes(value, strength)) {
+                    seen.insert(value.to_vec());
+                }
+                return;
             }
             if let Some(value) = bytes {
                 // -0.0 and 0.0 are one value to `=`, and so to DISTINCT.
@@ -1662,6 +1689,7 @@ impl Acc {
                 best,
                 ty: acc_ty,
                 want_max,
+                collation,
             } => {
                 let Some(b) = bytes else { return };
                 // A NULL arrives as `None` (its cell retyped from the
@@ -1676,7 +1704,10 @@ impl Acc {
                 match best {
                     None => *best = Some(b.to_vec()),
                     Some(current) => {
-                        let ord = compare_values(b, current, acc_ty);
+                        let ord = match collation {
+                            Some(strength) => crate::core::rql::collation::compare(b, current, *strength),
+                            None => compare_values(b, current, acc_ty),
+                        };
                         // A NUMERIC carrying its own scale ties to the later
                         // value, as `numeric_larger`/`numeric_smaller` return
                         // their second argument: max(1.5, 1.50) is 1.50.
@@ -1704,10 +1735,25 @@ impl Acc {
     /// Exact totals add checked, as `accumulate` does: an overflow in either
     /// part, or in the sum of the two, is reported by `finish`.
     pub(crate) fn merge(&mut self, other: &Acc) {
-        if let (Acc::Distinct { seen, null, .. }, Acc::Distinct { seen: theirs, null: their_null, .. }) =
-            (&mut *self, other)
+        if let (
+            Acc::Distinct { seen, null, collation, keys, .. },
+            Acc::Distinct { seen: theirs, null: their_null, .. },
+        ) = (&mut *self, other)
         {
-            seen.extend(theirs.iter().cloned());
+            match collation {
+                Some(strength) => {
+                    // In a fixed order, so which spelling stands for a key
+                    // does not depend on how the rows were split.
+                    let mut theirs: Vec<&Vec<u8>> = theirs.iter().collect();
+                    theirs.sort();
+                    for value in theirs {
+                        if keys.insert(crate::core::rql::collation::key_bytes(value, *strength)) {
+                            seen.insert(value.clone());
+                        }
+                    }
+                }
+                None => seen.extend(theirs.iter().cloned()),
+            }
             *null |= *their_null;
             return;
         }
@@ -1825,13 +1871,16 @@ impl Acc {
             }
             (
                 Acc::Extreme {
-                    best, ty, want_max, ..
+                    best, ty, want_max, collation,
                 },
                 Acc::Extreme { best: Some(b2), .. },
             ) => match best {
                 None => *best = Some(b2.clone()),
                 Some(current) => {
-                    let ord = compare_values(b2, current, ty);
+                    let ord = match collation {
+                        Some(strength) => crate::core::rql::collation::compare(b2, current, *strength),
+                        None => compare_values(b2, current, ty),
+                    };
                     let replace = if *want_max {
                         ord == std::cmp::Ordering::Greater
                     } else {
@@ -4260,16 +4309,23 @@ fn sort_output(plan: &AggregatePlan, out: &mut [Row]) {
     // Each key is the position of an output column plus its direction,
     // placement and type, resolved once so the label lookup stays out of the
     // comparator.
-    let sort_keys: Vec<(usize, bool, bool, DbType)> = plan
+    let sort_keys: Vec<(usize, bool, bool, DbType, Option<crate::core::rql::collation::Strength>)> = plan
         .order_by
         .iter()
         .filter_map(|(label, descending, nulls_first)| {
             let idx = plan.items.iter().position(|i| i.label() == label)?;
+            // The spelling of a group of a nondeterministic column (or its
+            // min/max) sorts by the collation.
+            let collation = match &plan.items[idx] {
+                SelectItem::Aggregate { func: AggFunc::Min | AggFunc::Max, call: Some(call), .. } => call.collation,
+                _ => None,
+            };
             Some((
                 idx,
                 *descending,
                 nulls_first.unwrap_or(*descending),
                 plan.items[idx].result_type(),
+                collation,
             ))
         })
         .collect();
@@ -4278,7 +4334,7 @@ fn sort_output(plan: &AggregatePlan, out: &mut [Row]) {
     }
     out.sort_by(|a, b| {
         use std::cmp::Ordering;
-        for (idx, descending, nulls_first, ty) in sort_keys.iter() {
+        for (idx, descending, nulls_first, ty, collation) in sort_keys.iter() {
             let (ac, bc) = (a.columns.get(*idx), b.columns.get(*idx));
             let is_null = |c: Option<&Column>| c.is_none_or(|c| c.column_type == DbType::NULL);
             let ord = match (is_null(ac), is_null(bc)) {
@@ -4298,11 +4354,14 @@ fn sort_output(plan: &AggregatePlan, out: &mut [Row]) {
                     }
                 }
                 (false, false) => {
-                    let ord = compare_values(
+                    let (x, y) = (
                         ac.map(|c| c.data.into_slice()).unwrap_or(&[]),
                         bc.map(|c| c.data.into_slice()).unwrap_or(&[]),
-                        ty,
                     );
+                    let ord = match collation {
+                        Some(strength) => crate::core::rql::collation::compare(x, y, *strength),
+                        None => compare_values(x, y, ty),
+                    };
                     if *descending { ord.reverse() } else { ord }
                 }
             };

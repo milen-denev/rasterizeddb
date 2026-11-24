@@ -113,6 +113,25 @@ pub fn key(text: &str, strength: Strength) -> String {
     }
 }
 
+/// A stored text value's key under `strength`, as bytes (what its
+/// companion holds). Text that is not UTF-8 keys as itself.
+pub fn key_bytes(value: &[u8], strength: Strength) -> Vec<u8> {
+    match std::str::from_utf8(value) {
+        Ok(text) if !strength.is_binary() => key(text, strength).into_bytes(),
+        _ => value.to_vec(),
+    }
+}
+
+/// Two stored text values in a collation's order: by their keys, then by
+/// their bytes, so values that compare equal still come in one order (as an
+/// `ORDER BY` over the column sorts them).
+pub fn compare(a: &[u8], b: &[u8], strength: Strength) -> std::cmp::Ordering {
+    if strength.is_binary() {
+        return a.cmp(b);
+    }
+    key_bytes(a, strength).cmp(&key_bytes(b, strength)).then_with(|| a.cmp(b))
+}
+
 /// The collation a name means, as `COLLATE <name>` and a column type
 /// (`citext`) write it. `Err` for a name that is no collation (PostgreSQL's
 /// 42704).
@@ -562,7 +581,9 @@ pub fn plan_single(
             return refuse("SELECT DISTINCT", &column);
         }
         let before = |n: usize| k.checked_sub(n).and_then(|i| words.get(i)).map(|s| s.to_ascii_uppercase());
-        if matches!(before(1).as_deref(), Some("MIN" | "MAX" | "DISTINCT" | "PARTITION" | "BY")) {
+        // `min`, `max` and DISTINCT aggregates compare by the key
+        // (`mark_aggregates`); a window does not yet.
+        if matches!(before(1).as_deref(), Some("PARTITION" | "BY")) {
             return refuse("this aggregate or window", &column);
         }
     }
@@ -577,8 +598,14 @@ pub fn plan_single(
             out.push(term);
             continue;
         };
-        if grouped || distinct {
-            return refuse("ORDER BY in a grouped or DISTINCT query", &column);
+        if distinct {
+            return refuse("ORDER BY in a DISTINCT query", &column);
+        }
+        // A grouped query sorts its output, where the column is the group's
+        // spelling and the sort follows the collation (`aggregate::sort_output`).
+        if grouped {
+            out.push(term);
+            continue;
         }
         let (key, _) = companion(&column, fields).expect("a nondeterministic column has its companion");
         out.push(crate::core::rql::order_by::SortTerm {
@@ -616,6 +643,101 @@ fn words_of_list(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// A grouping over columns with a nondeterministic collation, made to group
+/// by their keys: each such `GROUP BY` column is replaced by its companion,
+/// and a select item echoing it becomes the group's least spelling under the
+/// collation (`min`, marked by [`mark_aggregates`]): SQL Server and
+/// PostgreSQL both answer one of the group's values, and this one is the
+/// same every time. With `as_distinct`, a `SELECT DISTINCT` of plain columns
+/// reading such a column is grouped by every column it selects instead; true
+/// when that was done.
+pub fn group_by_keys(
+    group_by: &mut Vec<SchemaField>,
+    items: &mut [crate::core::rql::aggregate::SelectItem],
+    fields: &[SchemaField],
+    as_distinct: bool,
+) -> bool {
+    use crate::core::rql::aggregate::{AggFunc, SelectItem};
+    if !any(fields) {
+        return false;
+    }
+    let ci = |f: &SchemaField| !of(&f.name, fields).is_binary();
+    let mut converted = false;
+    if as_distinct {
+        let plain = items.iter().all(|i| matches!(i, SelectItem::Column { .. }));
+        let reads_ci = items.iter().any(|i| matches!(i, SelectItem::Column { field, .. } if ci(field)));
+        if plain && reads_ci && group_by.is_empty() {
+            for item in items.iter() {
+                if let SelectItem::Column { field, .. } = item {
+                    if !group_by.iter().any(|g| g.write_order == field.write_order) {
+                        group_by.push(field.clone());
+                    }
+                }
+            }
+            converted = true;
+        }
+    }
+    let keyed: Vec<SchemaField> = group_by.iter().filter(|g| ci(g)).cloned().collect();
+    if keyed.is_empty() {
+        return converted;
+    }
+    for g in group_by.iter_mut() {
+        if let Some((companion, _)) = companion(&g.name, fields).filter(|_| ci(g)) {
+            *g = companion.clone();
+        }
+    }
+    for item in items.iter_mut() {
+        let SelectItem::Column { field, label } = item else { continue };
+        if !keyed.iter().any(|k| k.write_order == field.write_order) {
+            continue;
+        }
+        *item = SelectItem::Aggregate {
+            func: AggFunc::Min,
+            arg: Some(field.clone()),
+            label: label.clone(),
+            filter: None,
+            arg_expr: None,
+            distinct: false,
+            call: None,
+        };
+    }
+    converted
+}
+
+/// Tells each aggregate over a column with a nondeterministic collation
+/// which one: `min`/`max` pick by its order, `count(DISTINCT …)` and the
+/// other DISTINCT aggregates keep one value per key.
+pub fn mark_aggregates(items: &mut [crate::core::rql::aggregate::SelectItem], fields: &[SchemaField]) {
+    use crate::core::rql::aggregate::{AggCall, SelectItem};
+    if !any(fields) {
+        return;
+    }
+    let strength_of = |arg: &Option<SchemaField>, expr: bool| -> Option<Strength> {
+        let f = arg.as_ref().filter(|_| !expr)?;
+        Some(of(&f.name, fields)).filter(|s| !s.is_binary())
+    };
+    let mark = |call: &mut Option<Box<AggCall>>, strength: Option<Strength>| {
+        if let Some(strength) = strength {
+            call.get_or_insert_with(Default::default).collation = Some(strength);
+        }
+    };
+    for item in items.iter_mut() {
+        match item {
+            SelectItem::Aggregate { arg, arg_expr, call, .. } => {
+                let strength = strength_of(arg, arg_expr.is_some());
+                mark(call, strength);
+            }
+            SelectItem::Computed { inputs, .. } => {
+                for input in inputs.iter_mut() {
+                    let strength = strength_of(&input.arg, input.arg_expr.is_some());
+                    mark(&mut input.call, strength);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Refuses a multi-table query that compares a column with a
@@ -665,7 +787,9 @@ pub fn refuse_in_join(
     for (k, w) in words.iter().enumerate() {
         let Some(c) = ci(w) else { continue };
         let before = k.checked_sub(1).map(|i| words[i].to_ascii_uppercase());
-        if distinct || window || matches!(before.as_deref(), Some("MIN" | "MAX" | "DISTINCT" | "BY")) {
+        // `min`, `max` and DISTINCT aggregates compare by the key; a window
+        // or a DISTINCT over more than plain columns does not yet.
+        if distinct || window || matches!(before.as_deref(), Some("BY")) {
             return refuse(c);
         }
     }

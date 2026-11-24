@@ -3692,28 +3692,106 @@ pub fn plan(
             schema_of(&r.table).ok_or_else(|| format!("relation '{}' does not exist", r.table))
         })
         .collect::<Result<_, _>>()?;
+    // A caller may hand the select list with its `DISTINCT` (`parse_join`):
+    // a DISTINCT over a column with a nondeterministic collation is a
+    // grouping (below); any other is reported in `JoinPlan::distinct`.
+    let (select_list, mut distinct) = match crate::core::rql::lexer_query::leading_word(select_list.trim(), "DISTINCT") {
+        Some(rest) => (rest, true),
+        None => (select_list, false),
+    };
     let relations = qualify_on_clauses(relations, &schemas);
     if let Some(name) = ambiguous_on(&relations, &schemas) {
         return Err(format!("column reference \"{}\" is ambiguous", name));
     }
 
-    // A column with a nondeterministic collation compared anywhere here is
-    // refused (`collation::refuse_in_join`).
+    // Columns with a nondeterministic collation compare by their keys: a
+    // join key on two such columns joins their companions, `WHERE` and `ON`
+    // comparisons read them (`collate_rewrite`), `GROUP BY` groups by them
+    // (`build_aggregate_stage`), `ORDER BY` sorts by them first, and a
+    // `SELECT DISTINCT` of plain columns is that grouping. What still cannot
+    // be carried over is refused (`collation::refuse_in_join`).
+    let mut relations = relations;
+    let ci_where: String;
+    let ci_group: String;
+    let ci_select: String;
+    let mut where_clause = where_clause;
+    let mut group_by_clause = group_by_clause;
+    let mut select_list = select_list;
+    let mut order_by = order_by;
     if schemas.iter().any(|s| crate::core::rql::collation::any(s)) {
-        let labelled: Vec<(&str, &[SchemaField])> =
-            relations.iter().zip(&schemas).map(|(r, s)| (r.label.as_str(), &s[..])).collect();
-        let order_text: Vec<String> = order_by.iter().map(|t| t.token.clone()).collect();
-        let mut compared: Vec<&str> = vec![where_clause];
-        compared.extend(group_by_clause);
-        compared.extend(having_clause);
-        compared.extend(order_text.iter().map(String::as_str));
-        for r in &relations {
-            if let Some(j) = &r.join {
-                compared.push(&j.left_qualified);
-                compared.push(&j.right_qualified);
-                compared.extend(j.extra.iter().map(String::as_str));
+        let labelled: Vec<(String, SmallVec<[SchemaField; 20]>)> =
+            relations.iter().zip(&schemas).map(|(r, s)| (r.label.clone(), s.clone())).collect();
+        let columns = crate::core::tokenizer::collate_rewrite::Relations(
+            labelled.iter().map(|(l, s)| (l.as_str(), &s[..])).collect(),
+        );
+        use crate::core::tokenizer::collate_rewrite::Columns;
+        for r in relations.iter_mut() {
+            let Some(j) = r.join.as_mut() else { continue };
+            if !j.left_qualified.is_empty() {
+                match (columns.ci(&j.left_qualified), columns.ci(&j.right_qualified)) {
+                    (Some((l, a)), Some((rr, b))) if a == b => {
+                        j.left_qualified = l;
+                        j.right_qualified = rr;
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(
+                            "could not determine which collation to use for string comparison".to_string()
+                        );
+                    }
+                }
+            }
+            for term in j.extra.iter_mut() {
+                *term = crate::core::tokenizer::collate_rewrite::rewrite_with(term, &columns)?;
             }
         }
+        ci_where = crate::core::tokenizer::collate_rewrite::rewrite_with(where_clause, &columns)?;
+        where_clause = &ci_where;
+        // `SELECT DISTINCT a.name, b.x`: grouped by what it selects.
+        let list = select_list;
+        if distinct
+            && group_by_clause.is_none()
+            && split_top_level(list).iter().all(|item| {
+                let (expr, _) = split_expr_alias(item.trim());
+                is_column_reference(expr)
+            })
+            && split_top_level(list).iter().any(|item| columns.ci(split_expr_alias(item.trim()).0).is_some())
+        {
+            ci_group = split_top_level(list)
+                .iter()
+                .map(|item| split_expr_alias(item.trim()).0.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            ci_select = list.to_string();
+            group_by_clause = Some(&ci_group);
+            select_list = &ci_select;
+            distinct = false;
+        }
+        // A row's sort key under the collation, then its spelling, as one
+        // table sorts (`collation::plan_single`). A grouped query sorts its
+        // output instead (`aggregate::sort_output`).
+        let grouped = group_by_clause.is_some()
+            || split_top_level(select_list).iter().any(|item| {
+                !crate::core::rql::lexer_query::find_aggregate_calls(split_expr_alias(item.trim()).0).is_empty()
+            });
+        if !grouped {
+            let mut keyed = Vec::with_capacity(order_by.len());
+            for term in order_by {
+                if let Some((companion, _)) = columns.ci(term.token.trim()) {
+                    keyed.push(crate::core::rql::order_by::SortTerm {
+                        token: companion,
+                        descending: term.descending,
+                        nulls_first: term.nulls_first,
+                    });
+                }
+                keyed.push(term);
+            }
+            order_by = keyed;
+        }
+        let labelled: Vec<(&str, &[SchemaField])> =
+            relations.iter().zip(&schemas).map(|(r, s)| (r.label.as_str(), &s[..])).collect();
+        let mut compared: Vec<&str> = Vec::new();
+        compared.extend(having_clause);
         crate::core::rql::collation::refuse_in_join(&labelled, select_list, &compared)?;
     }
 
@@ -4817,9 +4895,9 @@ pub fn plan(
         offset,
         aggregate,
         post_join,
-        // Set by the caller that parsed the select list; `plan` is also reached
-        // from paths that have no DISTINCT to report.
-        distinct: false,
+        // A `DISTINCT` the select list was handed with (most callers strip
+        // it and set this themselves).
+        distinct,
     })
 }
 
@@ -5441,6 +5519,8 @@ fn build_aggregate_stage(
     // every group holds at most one of its rows — so its other columns may be
     // selected without being grouped, as PostgreSQL allows for a primary key.
     let mut determined: Vec<bool> = vec![false; schemas.len()];
+    // Grouping columns with a nondeterministic collation, grouped by key.
+    let mut ci_keys: Vec<(usize, u64)> = Vec::new();
     if let Some(list) = group_by_clause {
         for raw in list.split(',') {
             let name = raw.trim().split_whitespace().next().unwrap_or("");
@@ -5463,7 +5543,19 @@ fn build_aggregate_stage(
             }) {
                 determined[rel] = true;
             }
-            group_by.push(positional(rel, field, items));
+            // A column with a nondeterministic collation groups by its key:
+            // its companion. The column itself is then the group's least
+            // spelling (below).
+            let keyed = schemas.get(rel).and_then(|schema| {
+                crate::core::rql::collation::companion(&field.name, schema).map(|(c, _)| c.clone())
+            });
+            match keyed {
+                Some(companion) => {
+                    ci_keys.push((rel, field.write_order));
+                    group_by.push(positional(rel, companion, items));
+                }
+                None => group_by.push(positional(rel, field, items)),
+            }
         }
     }
 
@@ -5783,6 +5875,23 @@ fn build_aggregate_stage(
         } else {
             let (rel, field) = resolve(expr)?;
             let label = alias.unwrap_or_else(|| field.name.clone());
+            if ci_keys.contains(&(rel, field.write_order)) {
+                let strength = crate::core::rql::collation::of(&field.name, &schemas[rel]);
+                let arg = positional(rel, field, items);
+                fold_items.push(SelectItem::Aggregate {
+                    distinct: false,
+                    func: AggFunc::Min,
+                    arg: Some(arg),
+                    label,
+                    filter: None,
+                    arg_expr: None,
+                    call: Some(Box::new(crate::core::rql::aggregate::AggCall {
+                        collation: Some(strength),
+                        ..Default::default()
+                    })),
+                });
+                continue;
+            }
             let synthetic = positional(rel, field, items);
             if !group_by
                 .iter()
@@ -5902,6 +6011,39 @@ fn build_aggregate_stage(
                 .ok_or_else(|| format!("ORDER BY term '{}' is not in the SELECT list", term.token))?,
         };
         fold_order.push((label, term.descending, term.nulls_first));
+    }
+
+    // An aggregate over a column with a nondeterministic collation compares
+    // by it (`collation::mark_aggregates` does this over one table): the
+    // argument is a projected position, whose relation column says.
+    {
+        let strength_at = |arg: &Option<SchemaField>| -> Option<crate::core::rql::collation::Strength> {
+            let item = items.get(arg.as_ref()?.write_order as usize)?;
+            if !item.reads_column() {
+                return None;
+            }
+            Some(crate::core::rql::collation::of(&item.field.name, schemas.get(item.rel)?)).filter(|s| !s.is_binary())
+        };
+        let mark = |call: &mut Option<Box<crate::core::rql::aggregate::AggCall>>, strength| {
+            if let Some(strength) = strength {
+                call.get_or_insert_with(Default::default).collation = Some(strength);
+            }
+        };
+        for item in fold_items.iter_mut() {
+            match item {
+                SelectItem::Aggregate { arg, call, .. } => {
+                    let strength = strength_at(arg);
+                    mark(call, strength);
+                }
+                SelectItem::Computed { inputs, .. } => {
+                    for input in inputs.iter_mut() {
+                        let strength = strength_at(&input.arg);
+                        mark(&mut input.call, strength);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     Ok(Some(crate::core::rql::aggregate::AggregatePlan {
@@ -6421,9 +6563,12 @@ pub fn plan_statement(
             return Err(crate::core::sql_scan::missing_from_entry(&q));
         }
     }
-    let mut planned = plan(
+    // Handed over with its DISTINCT: one over a nondeterministic column is
+    // planned as a grouping.
+    let written = if distinct { format!("DISTINCT {select_list}") } else { select_list.to_string() };
+    let planned = plan(
         relations,
-        select_list,
+        &written,
         where_clause,
         group_by_clause,
         having_clause,
@@ -6432,7 +6577,6 @@ pub fn plan_statement(
         offset,
         schema_of,
     )?;
-    planned.distinct = distinct;
     Ok(planned)
 }
 

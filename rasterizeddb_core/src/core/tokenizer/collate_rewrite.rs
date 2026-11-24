@@ -27,25 +27,72 @@ use crate::core::row::schema::SchemaField;
 /// The clause with each comparison over a nondeterministic column on its
 /// key; unchanged when the table has none.
 pub(crate) fn rewrite(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Result<String, String> {
-    if !collation::any(schema) || clause.trim().is_empty() {
+    if !collation::any(schema) {
+        return Ok(clause.to_string());
+    }
+    rewrite_with(clause, schema)
+}
+
+/// [`rewrite`] over the columns `columns` resolves: one table's, or the
+/// relations of a join ([`Relations`]).
+pub(crate) fn rewrite_with(clause: &str, columns: &dyn Columns) -> Result<String, String> {
+    if clause.trim().is_empty() {
         return Ok(clause.to_string());
     }
     let toks = lex(clause)?;
-    let out = condition(&toks, schema)?;
+    let out = condition(&toks, columns)?;
     Ok(out.join(" "))
 }
 
+/// Where a comparison's column operands come from.
+pub(crate) trait Columns {
+    /// A column operand as written (`name`, `t.name`): the companion it
+    /// reads instead, and the collation; `None` when it is no column with a
+    /// nondeterministic one.
+    fn ci(&self, raw: &str) -> Option<(String, Strength)>;
+}
+
+impl Columns for SmallVec<[SchemaField; 20]> {
+    fn ci(&self, raw: &str) -> Option<(String, Strength)> {
+        let name = resolve_column(raw, self)?;
+        let (companion, strength) = collation::companion(&name, self)?;
+        // Keep a qualifier as written: `t.name` reads `t.__ci_name`.
+        let qualifier = match raw.rfind('.') {
+            Some(at) if !raw.trim_matches('"').eq_ignore_ascii_case(&name) => &raw[..=at],
+            _ => "",
+        };
+        Some((format!("{qualifier}{}", collation::ident(&companion.name)), strength))
+    }
+}
+
+/// The relations of a join, each by the label its columns are qualified
+/// with. A bare column is the one relation's that has it.
+pub(crate) struct Relations<'a>(pub Vec<(&'a str, &'a [SchemaField])>);
+
+impl Columns for Relations<'_> {
+    fn ci(&self, raw: &str) -> Option<(String, Strength)> {
+        let (qualifier, column) = match raw.rsplit_once('.') {
+            Some((q, c)) => (Some(q.trim_matches('"')), c.trim_matches('"')),
+            None => (None, raw.trim_matches('"')),
+        };
+        let mut found = self.0.iter().filter(|(label, fields)| {
+            qualifier.is_none_or(|q| q.eq_ignore_ascii_case(label))
+                && fields.iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))
+        });
+        let (label, fields) = found.next()?;
+        if qualifier.is_none() && found.next().is_some() {
+            return None;
+        }
+        let field = fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))?;
+        let (companion, strength) = collation::companion(&field.name, fields)?;
+        Some((format!("{}.{}", collation::ident(label), collation::ident(&companion.name)), strength))
+    }
+}
+
 /// A column operand: the companion it reads instead, and the collation.
-fn ci_column(toks: &[Tok], schema: &SmallVec<[SchemaField; 20]>) -> Option<(String, Strength)> {
+fn ci_column(toks: &[Tok], schema: &dyn Columns) -> Option<(String, Strength)> {
     let [Tok::Word(raw)] = toks else { return None };
-    let name = resolve_column(raw, schema)?;
-    let (companion, strength) = collation::companion(&name, schema)?;
-    // Keep a qualifier as written: `t.name` reads `t.__ci_name`.
-    let qualifier = match raw.rfind('.') {
-        Some(at) if !raw.trim_matches('"').eq_ignore_ascii_case(&name) => &raw[..=at],
-        _ => "",
-    };
-    Some((format!("{qualifier}{}", collation::ident(&companion.name)), strength))
+    schema.ci(raw)
 }
 
 fn depth_split<'a>(toks: &'a [Tok], at_word: &dyn Fn(&Tok, &[Tok], usize) -> bool) -> Vec<(usize, usize)> {
@@ -68,7 +115,7 @@ fn depth_split<'a>(toks: &'a [Tok], at_word: &dyn Fn(&Tok, &[Tok], usize) -> boo
 }
 
 /// A boolean condition: its `AND`/`OR` terms, each rewritten.
-fn condition(toks: &[Tok], schema: &SmallVec<[SchemaField; 20]>) -> Result<Vec<String>, String> {
+fn condition(toks: &[Tok], schema: &dyn Columns) -> Result<Vec<String>, String> {
     // The `AND` of a `BETWEEN … AND …` is not a connective.
     let mut between_open = vec![false; toks.len()];
     {
@@ -100,7 +147,7 @@ fn condition(toks: &[Tok], schema: &SmallVec<[SchemaField; 20]>) -> Result<Vec<S
 }
 
 /// One term: `NOT`s, a parenthesised condition, or a comparison.
-fn term(toks: &[Tok], schema: &SmallVec<[SchemaField; 20]>) -> Result<Vec<String>, String> {
+fn term(toks: &[Tok], schema: &dyn Columns) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut i = 0;
     while toks.get(i).is_some_and(|t| t.is_keyword("not")) {
@@ -143,11 +190,11 @@ fn render(toks: &[Tok]) -> Vec<String> {
 }
 
 /// Whether `toks` read a nondeterministic column anywhere, as a word.
-fn reads_ci(toks: &[Tok], schema: &SmallVec<[SchemaField; 20]>) -> bool {
+fn reads_ci(toks: &[Tok], schema: &dyn Columns) -> bool {
     toks.iter().enumerate().any(|(i, t)| match t {
         Tok::Word(w) => {
             !matches!(toks.get(i + 1), Some(Tok::LPar))
-                && resolve_column(w, schema).is_some_and(|c| !collation::of(&c, schema).is_binary())
+                && schema.ci(w).is_some()
         }
         _ => false,
     })
@@ -219,7 +266,7 @@ fn folded(toks: &[Tok], strength: Strength) -> Vec<String> {
 }
 
 /// One comparison, on keys when an operand is a nondeterministic column.
-fn comparison(toks: &[Tok], schema: &SmallVec<[SchemaField; 20]>) -> Result<Vec<String>, String> {
+fn comparison(toks: &[Tok], schema: &dyn Columns) -> Result<Vec<String>, String> {
     // A regular expression over such a column, as `lower_regex_operators`
     // spelled it.
     for (i, t) in toks.iter().enumerate() {
