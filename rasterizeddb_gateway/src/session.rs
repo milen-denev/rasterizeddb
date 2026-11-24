@@ -487,6 +487,21 @@ impl Session {
                 self.txn.opening.clear();
                 self.txn.opening.extend_from_slice(msg);
                 self.txn.opening_queries = 1;
+                // Under two-phase commit every part carries the transaction's
+                // one id, so the deadlock detector can follow a cycle of waits
+                // across shards (B4.2).
+                if self.core.shared.cfg.two_phase {
+                    let sql = format!("SET LOCAL rdb.global_txn = '{}'", next_global_txn(&self.core.shared.cfg.gateway_name));
+                    let mut q = Vec::with_capacity(sql.len() + 6);
+                    q.push(b'Q');
+                    q.extend_from_slice(&((sql.len() + 5) as i32).to_be_bytes());
+                    q.extend_from_slice(sql.as_bytes());
+                    q.push(0);
+                    self.txn.pending.extend_from_slice(&q);
+                    self.txn.pending_queries += 1;
+                    self.txn.opening.extend_from_slice(&q);
+                    self.txn.opening_queries += 1;
+                }
                 self.txn.status = b'T';
                 pg::command_complete(&mut self.out, "BEGIN");
                 pg::ready(&mut self.out, b'T');
@@ -1254,6 +1269,15 @@ impl Session {
         }
         Ok(outcome)
     }
+}
+
+/// A new global transaction id, `gateway-pid-n`: unique across gateways,
+/// numbered in order so the deadlock detector can tell the youngest.
+fn next_global_txn(gateway: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name: String = gateway.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(40).collect();
+    format!("{name}-{}-{n}", std::process::id())
 }
 
 fn value_is_reset(text: &str) -> bool {

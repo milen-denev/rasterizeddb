@@ -92,6 +92,9 @@ pub struct Config {
     /// (ms), so a deadlock across shards, which no shard's own detector
     /// sees whole, ends in an error instead of a hang (B6).
     pub two_phase_lock_timeout_ms: u64,
+    /// How often the deadlock detector reads every shard's waits between
+    /// two-phase transactions (B4.2); 0 turns it off.
+    pub deadlock_check_ms: u64,
     pub native_role: String,
     pub native_database: String,
     pub drain: Duration,
@@ -133,6 +136,7 @@ impl Default for Config {
             kv_shards: BTreeMap::new(),
             two_phase: false,
             two_phase_lock_timeout_ms: 5000,
+            deadlock_check_ms: 1000,
             native_role: String::new(),
             native_database: String::new(),
             drain: Duration::from_secs(30),
@@ -280,6 +284,7 @@ impl Config {
             "admin" => self.admin = opt(v).map(|a| a.parse()).transpose().map_err(|_| "not host:port")?,
             "native_listen" => self.native_listen = opt(v).map(|a| a.parse()).transpose().map_err(|_| "not host:port")?,
             "two_phase_lock_timeout_ms" => self.two_phase_lock_timeout_ms = num(v)?,
+            "deadlock_check_ms" => self.deadlock_check_ms = num(v)?,
             "two_phase" => {
                 self.two_phase = match v.to_ascii_lowercase().as_str() {
                     "on" | "true" | "1" => true,

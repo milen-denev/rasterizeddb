@@ -131,6 +131,8 @@ pub enum EvalError {
     ClientWentAway,
     /// A `CancelRequest` with this session's key asked for it to stop.
     UserCanceled,
+    /// A cycle of lock waits across shards ended this transaction (40P01).
+    DistributedDeadlock,
     /// The `WHERE` clause has more comparisons than the compiled boolean
     /// program can index.
     ///
@@ -184,6 +186,9 @@ impl EvalError {
             EvalError::InvalidPattern => "invalid regular expression in SIMILAR TO",
             EvalError::PatternTooComplex => crate::core::similar_to::TOO_COMPLEX,
             EvalError::UserCanceled => "canceling statement due to user request",
+            EvalError::DistributedDeadlock => {
+                "deadlock detected: this transaction closed a cycle of lock waits across shards and was chosen to end"
+            }
             EvalError::ExpressionFailed => "an expression in the WHERE clause could not be evaluated",
             EvalError::InexactNumeric => {
                 "a NUMERIC value with more than 9 decimal places cannot be carried exactly by arithmetic \
@@ -210,6 +215,7 @@ impl EvalError {
             EvalError::UserCanceled => 12,
             EvalError::ExpressionFailed => 13,
             EvalError::InexactNumeric => 14,
+            EvalError::DistributedDeadlock => 15,
         }
     }
 
@@ -229,6 +235,7 @@ impl EvalError {
             12 => Some(EvalError::UserCanceled),
             13 => Some(EvalError::ExpressionFailed),
             14 => Some(EvalError::InexactNumeric),
+            15 => Some(EvalError::DistributedDeadlock),
             _ => None,
         }
     }

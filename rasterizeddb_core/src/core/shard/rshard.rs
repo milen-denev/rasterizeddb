@@ -258,6 +258,12 @@ async fn handle(conn: &Conn, data: &[u8]) -> Response {
             Ok(commit) => Response::Decided { commit },
             Err(e) => refuse(*b"58030", true, e),
         },
+        // B4.2: the gateway's deadlock detector.
+        Request::Waits => Response::Waits { edges: super::deadlock::waits(&conn.catalog) },
+        Request::AbortTxn { gid } => {
+            super::deadlock::abort(&gid);
+            Response::Done
+        }
     }
 }
 

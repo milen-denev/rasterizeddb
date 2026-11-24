@@ -7,6 +7,7 @@
 
 pub mod classify;
 pub mod ddl;
+pub mod deadlock;
 pub mod map_state;
 pub mod merge;
 pub mod ownership;

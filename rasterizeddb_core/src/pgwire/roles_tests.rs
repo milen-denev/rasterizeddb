@@ -336,3 +336,50 @@ async fn r2r3_rdb_roles_is_closed_to_every_path() {
     assert_eq!(ok(&db, &mut s, "SELECT rolname FROM pg_roles WHERE rolname = 'victim'").await, 1);
     assert_eq!(ok(&db, &mut s, "SELECT rolname FROM pg_roles WHERE rolname = 'evil'").await, 0);
 }
+
+/// B4.2 on one shard: two tagged transactions, one waiting on the other's
+/// row lock, are reported as a wait between their global ids; ending the
+/// waiter fails its statement with 40P01.
+#[cfg(feature = "sharding")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn b42_tagged_waits_are_reported_and_a_victim_ends_with_40p01() {
+    let db = db().await;
+    let mut a = session(&db);
+    ok(&db, &mut a, "CREATE TABLE dl (id INT PRIMARY KEY, v INT)").await;
+    ok(&db, &mut a, "INSERT INTO dl (id, v) VALUES (1, 0)").await;
+    ok(&db, &mut a, "BEGIN").await;
+    ok(&db, &mut a, "SET LOCAL rdb.global_txn = 'gw-1-1'").await;
+    ok(&db, &mut a, "UPDATE dl SET v = 1 WHERE id = 1").await;
+
+    let db2 = db.clone();
+    let waiter = tokio::spawn(async move {
+        // As a connection runs: inside its registered session, which is
+        // what an abort stops.
+        let registration = crate::core::cancel::register_session([7, 7, 7, 7]);
+        SESSION_CANCEL
+            .scope(registration.session.clone(), async move {
+                let mut b = session(&db2);
+                ok(&db2, &mut b, "BEGIN").await;
+                ok(&db2, &mut b, "SET LOCAL rdb.global_txn = 'gw-1-2'").await;
+                // Blocks on a's row lock until ended.
+                send(&db2, &mut b, "UPDATE dl SET v = 2 WHERE id = 1").await
+            })
+            .await
+    });
+
+    let catalog = crate::core::database::catalog::DatabaseCatalog::single(db.clone());
+    let mut edges = Vec::new();
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        edges = crate::core::shard::deadlock::waits(&catalog);
+        if !edges.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(edges, vec![("gw-1-2".to_string(), "gw-1-1".to_string())]);
+    assert!(crate::core::shard::deadlock::abort("gw-1-2"));
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(10), waiter).await.expect("the waiter ended").unwrap();
+    let e = ended.expect_err("the victim's statement fails");
+    assert!(e.contains("40P01") || e.contains("deadlock detected"), "{e}");
+    ok(&db, &mut a, "COMMIT").await;
+}

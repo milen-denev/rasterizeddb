@@ -223,6 +223,12 @@ pub enum Request {
     Decide { gid: String, commit: bool },
     /// The decision recorded for `gid`, if any.
     Decision { gid: String },
+    /// The waits between the gateway's tagged multi-shard transactions on
+    /// this shard (B4.2), answered by [`Response::Waits`].
+    Waits,
+    /// Ends global transaction `gid`'s waiting statement here, a deadlock's
+    /// victim (B4.2). Answered `Done`.
+    AbortTxn { gid: String },
 }
 
 /// Where a classified text came from.
@@ -250,6 +256,8 @@ pub enum Response {
     /// Answers `Decision`: `None` when nothing is recorded (presumed abort
     /// once the transaction is old enough), else whether it commits.
     Decided { commit: Option<bool> },
+    /// Answers `Waits`: (waiter's global id, holder's global id).
+    Waits { edges: Vec<(String, String)> },
 }
 
 /// What SCRAM-SHA-256 needs to verify a role's proof (G9).
@@ -510,6 +518,8 @@ impl Request {
             Request::Native { .. } => 0x0B,
             Request::Decide { .. } => 0x0C,
             Request::Decision { .. } => 0x0D,
+            Request::Waits => 0x0E,
+            Request::AbortTxn { .. } => 0x0F,
         }
     }
 
@@ -555,6 +565,10 @@ impl Request {
                 w.str(gid).u8(*commit as u8);
             }
             Request::Decision { gid } => {
+                w.str(gid);
+            }
+            Request::Waits => {}
+            Request::AbortTxn { gid } => {
                 w.str(gid);
             }
         }
@@ -622,6 +636,8 @@ impl Request {
             0x0B => Request::Native { database: r.str()?, role: r.str()?, map_epoch: r.u64()?, bytes: r.bytes()?.to_vec() },
             0x0C => Request::Decide { gid: r.str()?, commit: r.bool()? },
             0x0D => Request::Decision { gid: r.str()? },
+            0x0E => Request::Waits,
+            0x0F => Request::AbortTxn { gid: r.str()? },
             k => return Err(format!("rshard request kind {k:#04x} is unknown")),
         };
         r.end()?;
@@ -644,6 +660,7 @@ impl Response {
             Response::NativeReply { .. } => 0x8A,
             Response::Refused(_) => 0xFF,
             Response::Decided { .. } => 0x8B,
+            Response::Waits { .. } => 0x8C,
         }
     }
 
@@ -705,6 +722,12 @@ impl Response {
             }
             Response::NativeReply { map_epoch, bytes } => {
                 w.u64(*map_epoch).bytes(bytes);
+            }
+            Response::Waits { edges } => {
+                w.u32(edges.len() as u32);
+                for (a, b) in edges {
+                    w.str(a).str(b);
+                }
             }
             Response::Refused(r) => {
                 w.raw(&r.sqlstate).u8(r.before_effect as u8).u64(r.map_epoch).str(&r.message);
@@ -778,6 +801,17 @@ impl Response {
                     b => return Err(format!("rshard decision {b} is unknown")),
                 },
             },
+            0x8C => {
+                let n = r.u32()? as usize;
+                if n > 1 << 20 {
+                    return Err("rshard: too many wait edges".into());
+                }
+                let mut edges = Vec::with_capacity(n.min(1024));
+                for _ in 0..n {
+                    edges.push((r.str()?, r.str()?));
+                }
+                Response::Waits { edges }
+            }
             0xFF => Response::Refused(Refusal {
                 sqlstate: r.array()?,
                 before_effect: r.bool()?,

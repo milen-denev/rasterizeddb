@@ -13723,6 +13723,26 @@ where
 {
     let s = stmt.trim();
     let s_lower = s.to_ascii_lowercase();
+    // `SET LOCAL rdb.global_txn = 'g'`: the gateway's id for the
+    // multi-shard transaction this block is one part of, so the cluster's
+    // deadlock detector can follow a cycle of waits across shards
+    // (sharding-plan.md B4.2). Only inside a block: it names the block.
+    #[cfg(feature = "sharding")]
+    if let Some(v) = s_lower
+        .trim_end_matches(';')
+        .strip_prefix("set local rdb.global_txn")
+        .map(|r| r.trim_start().trim_start_matches('=').trim_start_matches("to").trim().trim_matches('\''))
+    {
+        if v.is_empty() || v.len() > 128 {
+            return Ok(false);
+        }
+        if let (Some(tx), Some(db)) = (state.current_tx(), state.catalog.get(&state.database_name)) {
+            crate::core::shard::deadlock::tag(&db, tx, v, current_session_cancel().as_ref());
+        }
+        send_command_complete(stream, "SET").await?;
+        return Ok(true);
+    }
+
 
     // `SET ROLE r`, `SET ROLE NONE`, `RESET ROLE` (roles plan R2): act as a
     // role the session user is a member of, with that role's rights.

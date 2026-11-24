@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod deadlock;
 pub mod balance;
 pub mod key;
 pub mod literals;

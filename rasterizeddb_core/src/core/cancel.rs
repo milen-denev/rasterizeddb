@@ -40,6 +40,9 @@ pub enum CancelReason {
     ClientWentAway,
     /// A `CancelRequest` carrying this session's key arrived.
     UserRequest,
+    /// The cluster found this transaction on a cycle of lock waits across
+    /// shards and chose it to end (sharding-plan.md B4.2).
+    Deadlock,
 }
 
 impl CancelReason {
@@ -49,6 +52,7 @@ impl CancelReason {
             CancelReason::Timeout => EvalError::StatementTimeout,
             CancelReason::ClientWentAway => EvalError::ClientWentAway,
             CancelReason::UserRequest => EvalError::UserCanceled,
+            CancelReason::Deadlock => EvalError::DistributedDeadlock,
         }
     }
 }
@@ -207,6 +211,7 @@ impl StatementCancel {
             CancelReason::Timeout => 1,
             CancelReason::ClientWentAway => 2,
             CancelReason::UserRequest => 3,
+            CancelReason::Deadlock => 4,
         };
         // First writer wins: the first reason is the true one, and a later
         // deadline should not relabel a client that had already gone.
@@ -224,6 +229,7 @@ impl StatementCancel {
             1 => return Some(CancelReason::Timeout),
             2 => return Some(CancelReason::ClientWentAway),
             3 => return Some(CancelReason::UserRequest),
+            4 => return Some(CancelReason::Deadlock),
             _ => {}
         }
         if let Some(at) = self.deadline {
@@ -333,6 +339,18 @@ pub enum Fold {
 }
 
 impl SessionCancel {
+    /// Stops the statement running now, if one is, for `reason`. `false`
+    /// when none is running.
+    pub fn flag_current(&self, reason: CancelReason) -> bool {
+        match self.current.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(statement) => {
+                statement.flag(reason);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Makes `statement` the one a `CancelRequest` for this session stops,
     /// until the returned guard is dropped.
     ///

@@ -1156,6 +1156,15 @@ impl RowLocks {
                 .any(|entry| *entry.value() == owner && transactions.wrote_family(*entry.key()))
     }
 
+    /// Every recorded wait, owner by owner: the cluster's deadlock detector
+    /// reads it whole (sharding-plan.md B4.2). A copy, taken under the lock.
+    pub fn wait_graph(&self) -> Vec<(TxId, SmallVec<[TxId; 4]>)> {
+        if self.waits_len.load(Ordering::Acquire) == 0 {
+            return Vec::new();
+        }
+        self.waits().iter().map(|(w, b)| (*w, b.clone())).collect()
+    }
+
     /// The owners `waiter`'s recorded row, referenced-key or conflict wait
     /// is waiting for. Diagnostic and for tests.
     pub fn waiting_on(&self, waiter: TxId) -> SmallVec<[TxId; 4]> {

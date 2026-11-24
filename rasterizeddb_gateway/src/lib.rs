@@ -182,6 +182,17 @@ fn worker(id: usize, shared: Arc<Shared>, listeners: Vec<std::net::TcpListener>,
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
         let core = Rc::new(core::Core::new(id, shared));
+        // One deadlock detector per gateway, on its first core (B4.2).
+        if id == 0 && core.shared.cfg.two_phase && core.shared.cfg.deadlock_check_ms > 0 {
+            let core = core.clone();
+            tokio::task::spawn_local(async move {
+                let mut tick = tokio::time::interval(Duration::from_millis(core.shared.cfg.deadlock_check_ms));
+                loop {
+                    tick.tick().await;
+                    detect_deadlocks(&core).await;
+                }
+            });
+        }
         // Counters reach the board about once a second (G10).
         {
             let core = core.clone();
@@ -322,4 +333,32 @@ fn client_tls(cfg: &Config) -> Result<Option<state::ClientTls>, String> {
         acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
         end_point,
     }))
+}
+
+/// One round of the cluster's deadlock detection (B4.2): every shard's
+/// waits between two-phase transactions put together, each cycle's
+/// youngest member ended on every shard (only the one where it waits has
+/// anything to end). A shard that cannot answer is left out this round.
+async fn detect_deadlocks(core: &Rc<core::Core>) {
+    use rasterizeddb_router::rshard::{Request, Response};
+    let shards: Vec<u32> = core.shared.map.get().shards().iter().map(|s| s.id).collect();
+    let mut edges = Vec::new();
+    for &s in &shards {
+        let Ok(link) = core.link(s) else { continue };
+        if let Ok(Response::Waits { edges: e }) = link.call(core, &Request::Waits.encode()).await {
+            edges.extend(e);
+        }
+    }
+    if edges.len() < 2 {
+        return;
+    }
+    for victim in rasterizeddb_router::deadlock::victims(&edges) {
+        log::info!("deadlock across shards: ending {victim}");
+        let req = Request::AbortTxn { gid: victim }.encode();
+        for &s in &shards {
+            if let Ok(link) = core.link(s) {
+                let _ = link.call(core, &req).await;
+            }
+        }
+    }
 }
