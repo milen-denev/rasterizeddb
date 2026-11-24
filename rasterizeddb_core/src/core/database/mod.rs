@@ -7073,7 +7073,7 @@ async fn run_native_query_body(query: &str, database: Arc<Database>) -> Vec<u8> 
     // values of its `now()`, `random()` and `gen_random_uuid()`.
     let deterministic;
     let stmt = if database.replication.is_active() {
-        match crate::core::rql::replicated_values::fold(stmt) {
+        match crate::core::rql::replicated_values::fold_write(stmt, &database) {
             crate::core::rql::replicated_values::Fold::Unchanged => stmt,
             crate::core::rql::replicated_values::Fold::Rewritten(text) => {
                 crate::core::rql::prepared::note_rewritten();

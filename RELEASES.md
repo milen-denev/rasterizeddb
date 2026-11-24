@@ -4,6 +4,14 @@
 
 ### Silent wrong answers fixed
 
+- **Replicated defaults diverged.** On a replicating node, a column whose `DEFAULT` is not deterministic
+  (`gen_random_uuid()`, `uuidv7()`, `clock_timestamp()`, `random()`, and also `now()`) was evaluated again
+  by every peer, so an `id uuid DEFAULT gen_random_uuid()` row had a different key on every node. The
+  value is now written into the replicated `INSERT … VALUES` / `DEFAULT VALUES`, once per row. Where no
+  single value can stand for it, the statement is refused (0A000) with what to write instead: an
+  `INSERT … SELECT` that leaves such a column to a per-row default, `UPDATE … SET c = DEFAULT`, and
+  `ALTER TABLE … ADD COLUMN … DEFAULT` with one (its backfill). `uuidv7()` written in a statement is now
+  folded like `gen_random_uuid()`.
 - `SELECT -id AS id … ORDER BY id` (an output alias shadowing a column), and `ORDER BY 1`, sorted by the stored column, including under `LIMIT`, `DISTINCT` and window functions.
 - Set operations mixing type families (`UNION` of `text` and `bigint`) answered with blank, lost, NULL or garbage values. They now fail with 42804, as in PostgreSQL.
 - `id IN ((correlated scalar subquery), 3)` in a select list was true for every row.
@@ -79,6 +87,9 @@
 
 ### Upgrade notes
 
+- Tables replicated by 1.0.0 that use non-deterministic defaults may already differ between nodes
+  (different UUIDs or timestamps for the same row). Compare them (`SELECT … ORDER BY` on each node) and
+  re-copy the affected tables from one node.
 - **Replicating clusters:** upgrade the receiving nodes first and the node taking writes last. Every node must run this release before any of these:
   - `CREATE UNIQUE INDEX`: its replicated text carries `AS INDEX`, which 1.0.0 cannot parse;
   - KV cache writes on a replicating node;

@@ -8838,7 +8838,7 @@ where
     // the peers run the statement's text again (`rql::replicated_values`).
     let deterministic;
     let stmt = if database.replication.is_active() {
-        match crate::core::rql::replicated_values::fold(stmt) {
+        match crate::core::rql::replicated_values::fold_write(stmt, &database) {
             crate::core::rql::replicated_values::Fold::Unchanged => stmt,
             crate::core::rql::replicated_values::Fold::Rewritten(text) => {
                 crate::core::rql::prepared::note_rewritten();

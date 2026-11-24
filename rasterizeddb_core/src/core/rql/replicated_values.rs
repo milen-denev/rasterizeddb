@@ -59,6 +59,9 @@ const FUNCTIONS: &[(&str, bool, Kind, &str)] = &[
     ("gen_random_uuid", true, Kind::Volatile, "uuid"),
     ("clock_timestamp", true, Kind::Volatile, "timestamptz"),
     ("timeofday", true, Kind::Volatile, "text"),
+    // Random bits after its timestamp: a new value at every call, like
+    // `gen_random_uuid()`. Left out, `uuidv7()` was run again on every peer.
+    ("uuidv7", true, Kind::Volatile, "uuid"),
 ];
 
 /// One call found in the text.
@@ -77,6 +80,19 @@ pub fn calls_volatile(text: &str) -> bool {
         return false;
     }
     calls_in(text).iter().any(|c| FUNCTIONS[c.function].2 == Kind::Volatile)
+}
+
+/// [`fold_defaults`], then [`fold`] on what it made: a replicating node's
+/// write, with every value a peer would compute anew written into it.
+pub fn fold_write(sql: &str, database: &crate::core::database::Database) -> Fold {
+    match fold_defaults(sql, database) {
+        Fold::Refused(message) => Fold::Refused(message),
+        Fold::Unchanged => fold(sql),
+        Fold::Rewritten(text) => match fold(&text) {
+            Fold::Unchanged => Fold::Rewritten(text),
+            other => other,
+        },
+    }
 }
 
 /// See the module documentation. `sql` is one statement.
@@ -311,6 +327,392 @@ fn top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
     None
 }
 
+/// A write whose rows a column's non-deterministic `DEFAULT` would fill
+/// (`id uuid DEFAULT gen_random_uuid()`, `created_at DEFAULT now()`), with
+/// that default written into the statement, for [`fold`] to turn into the
+/// values the peers will store.
+///
+/// The peers run the statement's text again (see the module documentation),
+/// and a column the text leaves out takes its default there too: each node
+/// drew its own UUID and read its own clock, so the same row had a different
+/// primary key on every node, with nothing reporting it. Here:
+///
+/// * `INSERT … VALUES` and `DEFAULT VALUES`: each such column the statement
+///   leaves out, or fills with `DEFAULT`, gets its default's text in every
+///   tuple; [`fold`] then makes it one literal per tuple;
+/// * `INSERT … SELECT`: a clock default (`now()`) is added to the query's
+///   output, one instant for every row as it is anyway; a per-row one
+///   (`gen_random_uuid()`) is refused, since no literal can stand for it;
+/// * `UPDATE … SET c = DEFAULT` with such a default, and `ALTER TABLE … ADD
+///   COLUMN` with one (its backfill fills every existing row), are refused.
+///
+/// The message says what to write instead. Run before [`fold`], on a
+/// replicating node only.
+pub fn fold_defaults(sql: &str, database: &crate::core::database::Database) -> Fold {
+    let lower = sql.to_ascii_lowercase();
+    let first = first_word(sql).map(|w| w.to_ascii_uppercase());
+    match first.as_deref() {
+        Some("INSERT") => fold_insert_defaults(sql, database),
+        Some("UPDATE") if lower.contains("default") => refuse_update_default(sql, database),
+        Some("ALTER") if lower.contains("default") => refuse_add_column_default(sql),
+        _ => Fold::Unchanged,
+    }
+}
+
+/// Whether a default expression has a value a peer would compute anew: it
+/// calls one of [`FUNCTIONS`].
+fn varies(expression: &str) -> bool {
+    !calls_in(expression).is_empty()
+}
+
+fn varies_per_row(expression: &str) -> bool {
+    calls_in(expression).iter().any(|c| FUNCTIONS[c.function].2 == Kind::Volatile)
+}
+
+/// An identifier as stored: a quoted one as written, a bare one lowercased,
+/// a schema qualifier dropped.
+fn stored_name(raw: &str) -> String {
+    let last = split_qualified(raw.trim()).pop().unwrap_or_default();
+    if last.len() >= 2 && last.starts_with('"') && last.ends_with('"') {
+        last[1..last.len() - 1].replace("\"\"", "\"")
+    } else {
+        last.to_ascii_lowercase()
+    }
+}
+
+/// `a.b."C"` as its parts, quotes kept.
+fn split_qualified(raw: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for c in raw.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                current.push(c);
+            }
+            '.' if !quoted => parts.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    parts.push(current);
+    parts
+}
+
+/// The identifier at the start of `text` (bare, quoted, or qualified), and
+/// what follows it.
+fn take_identifier(text: &str) -> Option<(&str, &str)> {
+    let t = text.trim_start();
+    let bytes = t.as_bytes();
+    let mut i = 0usize;
+    loop {
+        if bytes.get(i) == Some(&b'"') {
+            i = crate::core::sql_scan::skip_quoted(bytes, i)?;
+        } else {
+            let start = i;
+            while i < bytes.len() && crate::core::sql_scan::is_identifier_byte(bytes[i]) {
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
+        }
+        if bytes.get(i) == Some(&b'.') {
+            i += 1;
+            continue;
+        }
+        return Some((&t[..i], &t[i..]));
+    }
+}
+
+/// `text` split at its top-level commas.
+fn split_top_commas(text: &str) -> Vec<&str> {
+    crate::core::sql_scan::split_top_level(text, b',')
+}
+
+/// The columns of `table` a write can name, in order, and each one's default
+/// expression, when it varies.
+fn varying_defaults(
+    database: &crate::core::database::Database,
+    table: &str,
+) -> Option<(Vec<String>, Vec<(String, String)>)> {
+    let view = database.schema_view(table)?;
+    let schema = view.schema();
+    let columns: Vec<String> = schema
+        .fields
+        .iter()
+        .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+        .map(|f| f.name.clone())
+        .collect();
+    let defaults: Vec<(String, String)> = columns
+        .iter()
+        .filter_map(|c| {
+            let d = schema.defaults.iter().find(|d| !d.is_deleted && d.column.eq_ignore_ascii_case(c))?;
+            (d.identity.is_none() && varies(&d.expression)).then(|| (c.clone(), d.expression.clone()))
+        })
+        .collect();
+    Some((columns, defaults))
+}
+
+fn refusal(column: &str, expression: &str, place: &str, instead: &str) -> Fold {
+    Fold::Refused(format!(
+        "column \"{column}\"'s DEFAULT {expression} would be evaluated again, to a different value, on every \
+         node replicating {place}: replication sends the statement, not the rows. {instead}"
+    ))
+}
+
+fn fold_insert_defaults(sql: &str, database: &crate::core::database::Database) -> Fold {
+    let t = sql.trim().trim_end_matches(';').trim_end();
+    let Some(rest) = strip_word(t, "INSERT").and_then(|r| strip_word(r, "INTO")) else {
+        return Fold::Unchanged;
+    };
+    let Some((table_text, mut rest)) = take_identifier(rest) else {
+        return Fold::Unchanged;
+    };
+    let table = stored_name(table_text);
+    let Some((columns, varying)) = varying_defaults(database, &table) else {
+        return Fold::Unchanged;
+    };
+    if varying.is_empty() {
+        return Fold::Unchanged;
+    }
+    // `INSERT INTO t AS alias`.
+    if let Some(after) = strip_word(rest, "AS") {
+        let Some((_, after)) = take_identifier(after) else { return Fold::Unchanged };
+        rest = after;
+    }
+    let head_end = t.len() - rest.len();
+    let rest_trimmed = rest.trim_start();
+    let (listed, mut rest) = if rest_trimmed.starts_with('(') {
+        let Some(close) = matching_paren(rest_trimmed.as_bytes(), 0) else { return Fold::Unchanged };
+        let names: Vec<String> = split_top_commas(&rest_trimmed[1..close]).iter().map(|n| stored_name(n)).collect();
+        (Some(names), &rest_trimmed[close + 1..])
+    } else {
+        (None, rest_trimmed)
+    };
+    // `OVERRIDING SYSTEM VALUE` / `OVERRIDING USER VALUE` stays where it is.
+    let mut overriding = "";
+    if let Some(after) = strip_word(rest, "OVERRIDING") {
+        let after = after.trim_start();
+        let word_end = after.find(char::is_whitespace).unwrap_or(after.len());
+        let Some(after2) = strip_word(&after[word_end..], "VALUE") else { return Fold::Unchanged };
+        overriding = &rest[..rest.len() - after2.len()];
+        rest = after2;
+    }
+    let body = rest.trim_start();
+    // `ON CONFLICT`, not any `ON`: a query's join has one at its top level.
+    let on_conflict = {
+        let mut from = 0usize;
+        let mut found = None;
+        while let Some(at) = top_level_keyword(&body[from..], "ON") {
+            let at = from + at;
+            if strip_word(&body[at + 2..], "CONFLICT").is_some() {
+                found = Some(at);
+                break;
+            }
+            from = at + 2;
+        }
+        found
+    };
+    let tail_at = [on_conflict, top_level_keyword(body, "RETURNING")]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(body.len());
+    let (body, tail) = (body[..tail_at].trim_end(), &body[tail_at..]);
+    let quote = |c: &str| crate::core::rql::ctas::quote_ident(c);
+
+    // DEFAULT VALUES: the varying columns, with their defaults.
+    if let Some(after) = strip_word(body, "DEFAULT") {
+        if strip_word(after, "VALUES").is_none() {
+            return Fold::Unchanged;
+        }
+        let names: Vec<String> = varying.iter().map(|(c, _)| quote(c)).collect();
+        let values: Vec<&str> = varying.iter().map(|(_, e)| e.as_str()).collect();
+        return Fold::Rewritten(format!(
+            "{} ({}) {}VALUES ({}) {}",
+            &t[..head_end].trim_end(),
+            names.join(", "),
+            overriding,
+            values.join(", "),
+            tail
+        ));
+    }
+
+    if let Some(values_text) = strip_word(body, "VALUES") {
+        // Each tuple, its items split.
+        let mut tuples: Vec<Vec<String>> = Vec::new();
+        let bytes = values_text.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => {
+                    let Some(close) = matching_paren(bytes, i) else { return Fold::Unchanged };
+                    tuples.push(split_top_commas(&values_text[i + 1..close]).iter().map(|s| s.trim().to_string()).collect());
+                    i = close + 1;
+                }
+                b',' | b' ' | b'\t' | b'\n' | b'\r' => i += 1,
+                _ => return Fold::Unchanged,
+            }
+        }
+        let Some(arity) = tuples.first().map(Vec::len) else { return Fold::Unchanged };
+        let named: Vec<String> = match &listed {
+            Some(names) => names.clone(),
+            None if arity <= columns.len() => columns[..arity].to_vec(),
+            None => return Fold::Unchanged,
+        };
+        if tuples.iter().any(|tuple| tuple.len() != named.len()) {
+            return Fold::Unchanged;
+        }
+        let missing: Vec<&(String, String)> =
+            varying.iter().filter(|(c, _)| !named.iter().any(|n| n.eq_ignore_ascii_case(c))).collect();
+        let mut changed = !missing.is_empty();
+        for tuple in &mut tuples {
+            for (position, item) in tuple.iter_mut().enumerate() {
+                if item.eq_ignore_ascii_case("DEFAULT") {
+                    if let Some((_, e)) = varying.iter().find(|(c, _)| c.eq_ignore_ascii_case(&named[position])) {
+                        *item = e.clone();
+                        changed = true;
+                    }
+                }
+            }
+            tuple.extend(missing.iter().map(|(_, e)| e.clone()));
+        }
+        if !changed {
+            return Fold::Unchanged;
+        }
+        let mut names: Vec<String> = named.iter().map(|c| quote(c)).collect();
+        names.extend(missing.iter().map(|(c, _)| quote(c)));
+        let rows: Vec<String> = tuples.iter().map(|tuple| format!("({})", tuple.join(", "))).collect();
+        return Fold::Rewritten(format!(
+            "{} ({}) {}VALUES {} {}",
+            &t[..head_end].trim_end(),
+            names.join(", "),
+            overriding,
+            rows.join(", "),
+            tail
+        ));
+    }
+
+    // A query: `SELECT …`, `WITH … SELECT`, `(SELECT …)`, `TABLE t`.
+    let Some(named) = listed.clone().or_else(|| {
+        let select_at = top_level_keyword(body, "SELECT")?;
+        let from_at = top_level_keyword(body, "FROM").unwrap_or(body.len());
+        if from_at < select_at {
+            return None;
+        }
+        let items = split_top_commas(&body[select_at + "SELECT".len()..from_at]);
+        if items.iter().any(|i| i.trim() == "*" || i.trim().ends_with(".*")) || items.len() > columns.len() {
+            return None;
+        }
+        Some(columns[..items.len()].to_vec())
+    }) else {
+        // Which columns the query fills is unknown: left as it was.
+        return Fold::Unchanged;
+    };
+    let missing: Vec<&(String, String)> =
+        varying.iter().filter(|(c, _)| !named.iter().any(|n| n.eq_ignore_ascii_case(c))).collect();
+    if missing.is_empty() {
+        return Fold::Unchanged;
+    }
+    if let Some((column, expression)) = missing.iter().find(|(_, e)| varies_per_row(e)) {
+        return refusal(
+            column,
+            expression,
+            "this INSERT … SELECT",
+            "Name the column and compute its value in the query, the same on every node (for example \
+             from a key the rows already have), or insert the rows with VALUES, where it is taken once per row",
+        );
+    }
+    let mut names: Vec<String> = named.iter().map(|c| quote(c)).collect();
+    names.extend(missing.iter().map(|(c, _)| quote(c)));
+    let extra: Vec<&str> = missing.iter().map(|(_, e)| e.as_str()).collect();
+    Fold::Rewritten(format!(
+        "{} ({}) {}SELECT __rv.*, {} FROM ({}) __rv {}",
+        &t[..head_end].trim_end(),
+        names.join(", "),
+        overriding,
+        extra.join(", "),
+        body,
+        tail
+    ))
+}
+
+/// `UPDATE t SET c = DEFAULT` where `c`'s default varies per row.
+fn refuse_update_default(sql: &str, database: &crate::core::database::Database) -> Fold {
+    let t = sql.trim();
+    let Some(rest) = strip_word(t, "UPDATE") else { return Fold::Unchanged };
+    let rest = strip_word(rest, "ONLY").unwrap_or(rest);
+    let Some((table_text, rest)) = take_identifier(rest) else { return Fold::Unchanged };
+    let Some((_, varying)) = varying_defaults(database, &stored_name(table_text)) else { return Fold::Unchanged };
+    let Some(set_at) = top_level_keyword(rest, "SET") else { return Fold::Unchanged };
+    let after = &rest[set_at + "SET".len()..];
+    let end = ["FROM", "WHERE", "RETURNING"].iter().filter_map(|k| top_level_keyword(after, k)).min().unwrap_or(after.len());
+    for item in split_top_commas(&after[..end]) {
+        let Some((lhs, rhs)) = item.split_once('=') else { continue };
+        if !rhs.trim().eq_ignore_ascii_case("DEFAULT") {
+            continue;
+        }
+        let column = stored_name(lhs);
+        if let Some((c, e)) = varying.iter().find(|(c, _)| c.eq_ignore_ascii_case(&column)) {
+            if varies_per_row(e) {
+                return refusal(c, e, "this UPDATE", "Compute the value in the client and assign it");
+            }
+        }
+    }
+    Fold::Unchanged
+}
+
+/// `ALTER TABLE … ADD [COLUMN] c type … DEFAULT <varying>`: its backfill
+/// evaluates the default for every existing row, on each node.
+fn refuse_add_column_default(sql: &str) -> Fold {
+    let t = sql.trim();
+    let Some(rest) = strip_word(t, "ALTER").and_then(|r| strip_word(r, "TABLE")) else { return Fold::Unchanged };
+    let Some(add_at) = top_level_keyword(rest, "ADD") else { return Fold::Unchanged };
+    for action in split_top_commas(&rest[add_at..]) {
+        let Some(column_text) = strip_word(action.trim(), "ADD") else { continue };
+        let column_text = strip_word(column_text, "COLUMN").unwrap_or(column_text);
+        let column_text = strip_word(column_text, "IF")
+            .and_then(|r| strip_word(r, "NOT"))
+            .and_then(|r| strip_word(r, "EXISTS"))
+            .unwrap_or(column_text);
+        if ["CONSTRAINT", "PRIMARY", "UNIQUE", "FOREIGN", "CHECK"]
+            .iter()
+            .any(|k| strip_word(column_text, k).is_some())
+        {
+            continue;
+        }
+        let Some(default_at) = top_level_keyword(column_text, "DEFAULT") else { continue };
+        let expression = column_text[default_at + "DEFAULT".len()..].trim();
+        if !varies(expression) {
+            continue;
+        }
+        let column = take_identifier(column_text).map(|(c, _)| stored_name(c)).unwrap_or_default();
+        return refusal(
+            &column,
+            expression.split_whitespace().next().unwrap_or(expression),
+            "this ALTER TABLE (its backfill fills every existing row)",
+            "Add the column without the DEFAULT, fill the existing rows with values computed in the client, \
+             then ALTER COLUMN … SET DEFAULT, which fills no row",
+        );
+    }
+    Fold::Unchanged
+}
+
+/// `text` past a leading `word` (any case) and the whitespace after it.
+fn strip_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    let t = text.trim_start();
+    let head = t.get(..word.len())?;
+    if !head.eq_ignore_ascii_case(word) {
+        return None;
+    }
+    let after = &t[word.len()..];
+    if after.as_bytes().first().is_some_and(|b| crate::core::sql_scan::is_identifier_byte(*b)) {
+        return None;
+    }
+    Some(after.trim_start())
+}
+
 /// `call`'s value as PostgreSQL's text for it, evaluated now, under the
 /// running statement's clock.
 fn evaluate_as_text(call: &str) -> Option<String> {
@@ -396,5 +798,73 @@ mod tests {
         }
         // RETURNING changes no row.
         assert!(matches!(fold("UPDATE t SET a = 1 RETURNING random()"), Fold::Unchanged));
+    }
+
+    /// A column's non-deterministic DEFAULT is written into the write the
+    /// peers run, once per tuple; where it cannot be (a query's rows, a
+    /// backfill, `SET c = DEFAULT`), the write is refused. Before, each node
+    /// evaluated the default itself, and every row had a different UUID on
+    /// every node.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_varying_default_is_written_into_the_write_or_refused() {
+        use crate::core::rql::executor::execute;
+        use crate::core::rql::lexer_s1::recognize_query_purpose;
+        let dir = tempfile::tempdir().unwrap();
+        let db = rclite::Arc::new(
+            crate::core::database::Database::new_named(&dir.path().to_string_lossy(), false, "replvaluesdefaults").await,
+        );
+        for sql in [
+            "CREATE TABLE dv (id INTEGER PRIMARY KEY, u UUID DEFAULT gen_random_uuid(), n TIMESTAMPTZ DEFAULT now(), k TEXT DEFAULT 'x')",
+            "CREATE TABLE clock_only (id INTEGER PRIMARY KEY, n TIMESTAMPTZ DEFAULT now())",
+            "CREATE TABLE plain (id INTEGER PRIMARY KEY, k TEXT DEFAULT 'x')",
+        ] {
+            let response = execute(recognize_query_purpose(sql).unwrap(), db.clone()).await;
+            assert_ne!(response.first(), Some(&3), "{sql}: {}", String::from_utf8_lossy(&response[1..]));
+        }
+        let rewritten = |sql: &str| match fold_write(sql, &db) {
+            Fold::Rewritten(text) => text,
+            other => panic!("{sql}: {other:?}"),
+        };
+
+        // Left out: a literal per tuple, each tuple its own UUID; the constant
+        // default stays the table's to fill.
+        let out = rewritten("INSERT INTO dv (id) VALUES (1), (2)");
+        assert!(out.contains("\"u\"") || out.contains(" u"), "{out}");
+        assert!(!out.contains("gen_random_uuid()") && !out.contains("now()"), "{out}");
+        assert_eq!(out.matches("::uuid").count(), 2, "{out}");
+        assert_eq!(out.matches("::timestamptz").count(), 2, "{out}");
+        assert!(!out.contains("'x'"), "{out}");
+        let uuids: Vec<&str> = out.split("::uuid").collect();
+        assert_ne!(uuids[0].rsplit('\'').nth(1), uuids[1].rsplit('\'').nth(1), "{out}");
+
+        // `DEFAULT` written in a slot, and DEFAULT VALUES.
+        assert!(!rewritten("INSERT INTO dv (id, u) VALUES (3, DEFAULT)").contains("DEFAULT"));
+        assert!(rewritten("INSERT INTO dv DEFAULT VALUES").contains("::uuid"));
+        // No column list: the tuple's columns are the table's first ones.
+        assert!(rewritten("INSERT INTO dv VALUES (4)").contains("::uuid"));
+        // RETURNING and ON CONFLICT stay where they were.
+        let out = rewritten("INSERT INTO dv (id) VALUES (5) ON CONFLICT (id) DO NOTHING RETURNING id");
+        assert!(out.ends_with("ON CONFLICT (id) DO NOTHING RETURNING id"), "{out}");
+
+        // A query's rows: a clock default is one instant for all of them; a
+        // per-row one is refused.
+        let out = rewritten("INSERT INTO clock_only (id) SELECT a.id FROM dv a JOIN dv b ON a.id = b.id");
+        assert!(out.contains("::timestamptz") && out.contains("ON a.id = b.id"), "{out}");
+        assert!(matches!(fold_write("INSERT INTO dv (id) SELECT 6", &db), Fold::Refused(m) if m.contains("\"u\"")));
+        // SET c = DEFAULT and an ADD COLUMN backfill, refused.
+        assert!(matches!(fold_write("UPDATE dv SET u = DEFAULT WHERE id = 1", &db), Fold::Refused(_)));
+        assert!(matches!(
+            fold_write("ALTER TABLE dv ADD COLUMN w UUID DEFAULT gen_random_uuid()", &db),
+            Fold::Refused(_)
+        ));
+        assert!(matches!(fold_write("ALTER TABLE dv ADD COLUMN z INTEGER DEFAULT 7", &db), Fold::Unchanged));
+        // A table without one, and a write that names the column: as written.
+        assert!(matches!(fold_write("INSERT INTO plain (id) VALUES (1)", &db), Fold::Unchanged));
+        assert!(matches!(
+            fold_write("INSERT INTO dv (id, u, n) VALUES (7, '00000000-0000-0000-0000-000000000007', '2020-01-01')", &db),
+            Fold::Unchanged
+        ));
+        drop(db);
+        crate::core::wal::remove_for(&dir.path().to_string_lossy());
     }
 }
