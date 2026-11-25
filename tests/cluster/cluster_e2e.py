@@ -23,7 +23,7 @@ PG = {n: BASE + n for n in ALL}                # each shard's own pgwire
 RDB = {n: BASE + 10 + n for n in ALL}          # native (rdb-shard's way in)
 RSHARD = {n: BASE + 20 + n for n in ALL}       # rshard (the gateway's links)
 GW = BASE + 30                                 # the gateway's pgwire
-FE_PG, FE_MY, FE_RDB = BASE + 40, BASE + 41, BASE + 42  # the front-end node (B4.7)
+FE_PG, FE_MY, FE_RDB, FE_MS = BASE + 40, BASE + 41, BASE + 42, BASE + 43  # the front-end node (B4.7)
 CLUSTER = "0123456789abcdef0123456789abcdef"
 BLOCKS = 1 << 48
 ENV = dict(os.environ, PGPASSWORD="pw", PGSSLMODE="prefer")
@@ -238,6 +238,151 @@ class PgClient:
         if error:
             raise RuntimeError(error)
         return described, rows
+
+
+class TDS:
+    """Just enough of SQL Server's TDS 7.4 for the front-end node: an
+    unencrypted PRELOGIN, LOGIN7, SQL batches; rows as lists of ints, strs,
+    bytes or None, and the last DONE's row count."""
+
+    def __init__(self, port, user, password, database):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=30)
+        # PRELOGIN: VERSION, ENCRYPTION = not supported.
+        opts = bytes([0x00]) + struct.pack(">HH", 11, 6) + bytes([0x01]) + struct.pack(">HH", 17, 1) + b"\xff"
+        self.send(0x12, opts + bytes([16, 0, 0, 0, 0, 0]) + b"\x02")
+        self.recv()
+        u = lambda t: t.encode("utf-16-le")
+        obfuscated = bytes(((b << 4 | b >> 4) & 0xFF) ^ 0xA5 for b in u(password))
+        fields = [u("rdb-test"), u(user), obfuscated, u("cluster_e2e"), u("127.0.0.1"), b"", u("python"), b"", u(database)]
+        off, data, table = 94, b"", b""
+        for i, f in enumerate(fields):
+            table += struct.pack("<HH", off + len(data), len(f) // 2)
+            data += f
+        table += b"\0" * 6 + struct.pack("<HHHHHHI", off + len(data), 0, off + len(data), 0, off + len(data), 0, 0)
+        head = struct.pack("<IIIIII", 0, 0x74000004, 4096, 7, os.getpid(), 0) + bytes([0xE0, 0x03, 0, 0]) + struct.pack("<iI", 0, 0x0409)
+        login = head + table + data
+        login = struct.pack("<I", len(login)) + login[4:]
+        self.send(0x10, login)
+        _, _, error = self.tokens(self.recv())
+        if error:
+            raise RuntimeError(f"login refused: {error}")
+
+    def send(self, kind, payload):
+        self.sock.sendall(struct.pack(">BBHHBB", kind, 1, len(payload) + 8, 0, 1, 0) + payload)
+
+    def recv(self):
+        out = b""
+        while True:
+            h = self.exact(8)
+            out += self.exact(struct.unpack(">H", h[2:4])[0] - 8)
+            if h[1] & 1:
+                return out
+
+    def exact(self, n):
+        b = b""
+        while len(b) < n:
+            c = self.sock.recv(n - len(b))
+            if not c:
+                raise RuntimeError("the connection closed")
+            b += c
+        return b
+
+    def tokens(self, b):
+        at, cols, rows, count, error = 0, [], [], None, None
+        while at < len(b):
+            t = b[at]
+            at += 1
+            if t == 0x81:                       # COLMETADATA
+                n = struct.unpack("<H", b[at:at + 2])[0]
+                at += 2
+                cols = []
+                for _ in range(0 if n == 0xFFFF else n):
+                    at += 6
+                    ty = b[at]
+                    at += 1
+                    size = None
+                    if ty in (0x68, 0x26, 0x6d, 0x24, 0x2a, 0x2b, 0x29):
+                        size = b[at]
+                        at += 1
+                    elif ty in (0x6a, 0x6c):
+                        size = b[at]
+                        at += 3
+                    elif ty == 0xe7:
+                        size = struct.unpack("<H", b[at:at + 2])[0]
+                        at += 7
+                    elif ty == 0xa5:
+                        size = struct.unpack("<H", b[at:at + 2])[0]
+                        at += 2
+                    elif ty != 0x28:
+                        raise RuntimeError(f"TDS type {ty:#x} is not read by this client")
+                    nl = b[at]
+                    at += 1 + 2 * nl
+                    cols.append((ty, size))
+            elif t == 0xD1:                     # ROW
+                row = []
+                for ty, size in cols:
+                    if ty in (0xe7, 0xa5) and size == 0xFFFF:   # PLP
+                        total = struct.unpack("<Q", b[at:at + 8])[0]
+                        at += 8
+                        if total == 0xFFFFFFFFFFFFFFFF:
+                            row.append(None)
+                            continue
+                        v = b""
+                        while True:
+                            cl = struct.unpack("<I", b[at:at + 4])[0]
+                            at += 4
+                            if cl == 0:
+                                break
+                            v += b[at:at + cl]
+                            at += cl
+                    elif ty in (0xe7, 0xa5):
+                        ln = struct.unpack("<H", b[at:at + 2])[0]
+                        at += 2
+                        if ln == 0xFFFF:
+                            row.append(None)
+                            continue
+                        v = b[at:at + ln]
+                        at += ln
+                    else:
+                        ln = b[at]
+                        at += 1
+                        if ln == 0:
+                            row.append(None)
+                            continue
+                        v = b[at:at + ln]
+                        at += ln
+                    if ty == 0x26:
+                        row.append(int.from_bytes(v, "little", signed=True))
+                    elif ty == 0xe7:
+                        row.append(v.decode("utf-16-le"))
+                    else:
+                        row.append(v)
+                rows.append(row)
+            elif t in (0xFD, 0xFE, 0xFF):       # DONE, DONEPROC, DONEINPROC
+                status = struct.unpack("<H", b[at:at + 2])[0]
+                if status & 0x10:
+                    count = struct.unpack("<Q", b[at + 4:at + 12])[0]
+                at += 12
+            elif t == 0xAA:                     # ERROR
+                ln = struct.unpack("<H", b[at:at + 2])[0]
+                ml = struct.unpack("<H", b[at + 8:at + 10])[0]
+                error = b[at + 10:at + 10 + 2 * ml].decode("utf-16-le")
+                at += 2 + ln
+            elif t in (0xAB, 0xAD, 0xE3, 0xA9):  # INFO, LOGINACK, ENVCHANGE, ORDER
+                at += 2 + struct.unpack("<H", b[at:at + 2])[0]
+            elif t == 0x79:                     # RETURNSTATUS
+                at += 4
+            else:
+                raise RuntimeError(f"TDS token {t:#x} is not read by this client")
+        return rows, count, error
+
+    def query(self, sql):
+        headers = struct.pack("<IIHQI", 22, 18, 2, 0, 1)
+        self.send(0x01, headers + sql.encode("utf-16-le"))
+        rows, count, error = self.tokens(self.recv())
+        if error:
+            raise RuntimeError(error)
+        return rows if rows else ("ok", count)
 
 
 class MySQL:
@@ -631,6 +776,7 @@ def frontend(tls):
         [CORE, "--location", f"{WORK}/fe", "--protocol", "pgwire", "--pg-port", str(FE_PG), "--pg-password", "pw",
          "--pg-tls", "prefer", "--pg-cert", f"{tls}/gateway.pem", "--pg-key", f"{tls}/gateway.key",
          "--rdb-port", str(FE_RDB), "--mysql-port", str(FE_MY), "--mysql-tls", "prefer",
+         "--mssql-port", str(FE_MS), "--mssql-tls", "prefer",
          "--frontend-upstream", f"127.0.0.1:{GW}", "--log-level", "info"],
         stdout=log, stderr=log)
     up(FE_PG, "the front-end node")
@@ -662,6 +808,35 @@ def frontend(tls):
         check("  ...a wrong password is refused", False, "it logged in")
     except Exception as e:
         check("  ...a wrong password is refused", "refused" in str(e) or "password" in str(e).lower(), repr(e))
+    frontend_tds()
+
+
+def frontend_tds():
+    """The same front-end node, as SQL Server clients reach it."""
+    try:
+        ms = TDS(FE_MS, "rasterized", "pw", "postgres")
+    except Exception as e:
+        check("a SQL Server login on the front-end node", False, repr(e))
+        return
+    check("a SQL Server login on the front-end node", True)
+    try:
+        got = ms.query("SELECT v FROM orders WHERE id = 42")
+        check("  ...a keyed read reaches the cluster (TDS)", got == [[42]], got)
+        got = ms.query("SELECT TOP 3 id FROM orders ORDER BY id DESC")
+        want = [[int(x)] for x in psql(GW, "SELECT id FROM orders ORDER BY id DESC LIMIT 3")[1].split()]
+        check("  ...a TOP across shards (TDS)", got == want, f"{got} vs {want}")
+        got = ms.query("INSERT INTO orders (id, store, v) VALUES (7101, 1, 1), (7102, 2, 2), (7103, 3, 3)")
+        check("  ...a multi-row INSERT across shards (TDS)", got == ("ok", 3), got)
+        check("  ...seen through the gateway (TDS)", psql(GW, "SELECT count(*) FROM orders WHERE id > 7100") == (0, "3"),
+              psql(GW, "SELECT count(*) FROM orders WHERE id > 7100"))
+        ms.query("DELETE FROM orders WHERE id > 7100")
+    except Exception as e:
+        check("  ...statements through the front-end node (TDS)", False, repr(e))
+    try:
+        TDS(FE_MS, "rasterized", "wrong", "postgres")
+        check("  ...a wrong password is refused (TDS)", False, "it logged in")
+    except Exception as e:
+        check("  ...a wrong password is refused (TDS)", "refused" in str(e) or "failed" in str(e).lower(), repr(e))
 
 
 def on_every_shard_of(ids, sql):
