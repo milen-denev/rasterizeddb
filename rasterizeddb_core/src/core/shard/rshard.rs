@@ -570,6 +570,19 @@ fn session_of(conn: &Conn, session: u64) -> Option<StdArc<Mutex<VSession>>> {
 }
 
 /// The tag of the last whole frontend message in `bytes`, if they are whole.
+/// Whether `bytes` are CopyData messages and nothing else.
+fn only_copy_data(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 5 <= bytes.len() {
+        if bytes[i] != b'd' {
+            return false;
+        }
+        let len = i32::from_be_bytes(bytes[i + 1..i + 5].try_into().unwrap()).max(4) as usize;
+        i += 1 + len;
+    }
+    i == bytes.len() && !bytes.is_empty()
+}
+
 /// How many ReadyForQuery messages the whole frontend messages `bytes` are
 /// answered with: one per Query and one per Sync.
 fn ready_owed(bytes: &[u8]) -> usize {
@@ -668,6 +681,12 @@ async fn pg(conn: &Conn, session: u64, bytes: &[u8]) -> Response {
             }
             return coordinate(session, &mut s, bytes).await;
         }
+    }
+    // CopyData alone has no reply (an error in it is answered at CopyDone,
+    // as PostgreSQL's is): sent, and answered empty at once.
+    if only_copy_data(bytes) {
+        s.bridge.raw(bytes);
+        return Response::PgReply { session, map_epoch: epoch(), more: false, status: 0, bytes: Vec::new() };
     }
     s.bridge.raw(bytes);
     s.finished = false;

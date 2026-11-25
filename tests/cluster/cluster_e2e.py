@@ -665,6 +665,30 @@ def main():
     check("  ...and the rollback undid them", psql(GW, "SELECT count(*) FROM orders WHERE id > 5000") == (0, "0"),
           psql(GW, "SELECT count(*) FROM orders WHERE id > 5000"))
 
+    # 4j. COPY: into the unsharded table (one shard), and into the sharded
+    # one, split by row, all or nothing.
+    with open(f"{WORK}/stores.tsv", "w") as f:
+        f.write("10\tten\n11\televen\n")
+    code, out = psql_script(GW, f"\\copy stores (id, name) FROM '{WORK}/stores.tsv'\n")
+    check("a COPY into an unsharded table", (code, out) == (0, "COPY 2"), out)
+    with open(f"{WORK}/orders.tsv", "w") as f:
+        f.write("".join(f"{k}\t{k % 5}\t{k}\n" for k in range(8001, 9001)))
+    code, out = psql_script(GW, f"\\copy orders (id, store, v) FROM '{WORK}/orders.tsv'\n")
+    per = [int(psql(PG[n], "SET rdb.shard_part = on; SELECT count(*) FROM orders WHERE id > 8000")[1].splitlines()[-1]) for n in SHARDS]
+    check("a COPY into a sharded table, split by row", (code, out) == (0, "COPY 1000") and sum(per) == 1000 and all(per), f"{out} {per}")
+    with open(f"{WORK}/orders.csv", "w") as f:
+        f.write('id,store,v\n9001,1,"7"\n9002,2,"8"\n9003,"3",9\n')
+    code, out = psql_script(GW, f"\\copy orders (id, store, v) FROM '{WORK}/orders.csv' WITH (FORMAT csv, HEADER true)\n")
+    got = psql(GW, "SELECT sum(v) FROM orders WHERE id > 9000")
+    check("  ...CSV with a header and quoted fields", (code, out) == (0, "COPY 3") and got == (0, "24"), f"{out} / {got}")
+    with open(f"{WORK}/dup.tsv", "w") as f:
+        f.write("".join(f"{k}\t1\t1\n" for k in range(9100, 9150)) + "8001\t1\t1\n")
+    code, out = psql_script(GW, f"\\copy orders (id, store, v) FROM '{WORK}/dup.tsv'\n")
+    got = psql(GW, "SELECT count(*) FROM orders WHERE id BETWEEN 9100 AND 9149")
+    check("  ...a duplicate key in one row loads nothing", code != 0 and got == (0, "0"), f"{out} / {got}")
+    psql(GW, "DELETE FROM orders WHERE id > 8000")
+    psql(GW, "DELETE FROM stores WHERE id >= 10")
+
     # 4g. LISTEN on one session, NOTIFY from another: the gateway's hub
     # carries it whatever shard the NOTIFY ran on.
     listener = psql_script_bg(GW, "LISTEN jobs;\n\\! sleep 3\nSELECT 1;\n", "listen")

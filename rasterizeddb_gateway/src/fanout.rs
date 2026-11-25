@@ -1040,6 +1040,297 @@ impl Session {
         Ok(Some(self.write_done(implicit, out).await))
     }
 
+    /// `COPY t FROM STDIN` into a sharded table (module docs of
+    /// `copysplit`): answered here with CopyInResponse, its rows split as
+    /// they come. `None` when `text` is not such a COPY (a table with one
+    /// home, a COPY TO), for the caller to answer as before.
+    pub(crate) async fn copy_split_start<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, text: &str) -> io::Result<Option<Outcome>> {
+        let _ = conn;
+        let copy = match crate::copysplit::parse(text) {
+            None => return Ok(None),
+            Some(Ok(c)) => c,
+            Some(Err(e)) => {
+                let (code, msg) = e.split_once(": ").unwrap_or(("0A000", &e));
+                self.error_ready(code, msg);
+                return Ok(Some(Outcome::Done { error: true }));
+            }
+        };
+        let map = self.core.map();
+        let home = self.core.shared.home(&map);
+        // The columns the rows carry, in order: as written, or the table's.
+        let columns: Vec<String> = match &copy.columns {
+            Some(c) => c.clone(),
+            None => {
+                let sql = format!(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name = '{}' ORDER BY ordinal_position",
+                    copy.table.replace('\'', "''")
+                );
+                match self.first_column(home, &sql).await {
+                    Ok(names) => names.into_iter().flatten().collect(),
+                    Err(e) => {
+                        self.error_ready("08006", &format!("the table's columns could not be read: {e}"));
+                        return Ok(Some(Outcome::Done { error: true }));
+                    }
+                }
+            }
+        };
+        if columns.is_empty() {
+            return Ok(None);
+        }
+        // Where the key is: the one-row INSERT of these columns, classified.
+        let probe = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            quote_ident(&copy.table),
+            columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", "),
+            (1..=columns.len()).map(|i| format!("${i}")).collect::<Vec<_>>().join(", ")
+        );
+        let (key, family) = match crate::route::template(&self.core, &self.login.database, rasterizeddb_router::rshard::Source::Parse, &probe, home).await {
+            Ok(rasterizeddb_router::rshard::RouteTemplate::Param { index, family }) => (index as usize, family),
+            _ => return Ok(None),
+        };
+        if self.txn.status == b'E' {
+            self.error_ready("25P02", "current transaction is aborted, commands ignored until end of transaction block");
+            return Ok(Some(Outcome::Done { error: true }));
+        }
+        let atomic = self.core.shared.cfg.two_phase;
+        if !atomic && !(self.split_bulk_writes && self.txn.status == b'I') {
+            self.error_ready(
+                "0A000",
+                "a COPY into a sharded table is split by shard only under the gateway's two_phase = on (atomic), or in autocommit after SET rdb.split_bulk_writes = on (each shard's part committed alone)",
+            );
+            return Ok(Some(Outcome::Done { error: true }));
+        }
+        let implicit = atomic && self.begin_implicit();
+        self.core.counters.borrow_mut().fan_outs += 1;
+        let ncols = columns.len();
+        let header = copy.header;
+        self.copy_split = Some(crate::copysplit::Split {
+            copy,
+            statement: text.trim().trim_end_matches(';').to_string(),
+            key,
+            family,
+            rows: crate::copysplit::Rows::new(),
+            header_line: None,
+            header_pending: header,
+            buffers: std::collections::BTreeMap::new(),
+            opened: Vec::new(),
+            atomic,
+            implicit,
+            failure: None,
+            columns: ncols,
+        });
+        // CopyInResponse: text, every column text.
+        let mut g = vec![0u8];
+        g.extend_from_slice(&(ncols as i16).to_be_bytes());
+        for _ in 0..ncols {
+            g.extend_from_slice(&0i16.to_be_bytes());
+        }
+        pg::put(&mut self.out, b'G', &g);
+        Ok(Some(Outcome::Done { error: false }))
+    }
+
+    /// CopyData, CopyDone or CopyFail of a split COPY.
+    pub(crate) async fn copy_split_data(&mut self, t: u8, msg: &[u8]) -> io::Result<Outcome> {
+        let body = msg.get(5..).unwrap_or(&[]);
+        match t {
+            b'd' => {
+                self.copy_split_rows(body, false).await;
+                Ok(Outcome::Done { error: false })
+            }
+            b'c' => {
+                self.copy_split_rows(&[], true).await;
+                Ok(self.copy_split_done().await)
+            }
+            _ => {
+                let why = pg::cstr(body).map(|(m, _)| m.to_string()).unwrap_or_default();
+                Ok(self.copy_split_abort("57014", &format!("COPY from stdin failed: {why}")).await)
+            }
+        }
+    }
+
+    /// Routes the rows in `data` (and, at the end, the last one without a
+    /// line end) into their shards' buffers, sending the full ones.
+    async fn copy_split_rows(&mut self, data: &[u8], end: bool) {
+        let map = self.core.map();
+        let Some(split) = self.copy_split.as_mut() else { return };
+        if split.failure.is_some() {
+            return;
+        }
+        let mut routed: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut header: Option<Vec<u8>> = None;
+        let mut header_pending = split.header_pending;
+        let (copy, key, family) = (split.copy.clone(), split.key, split.family);
+        let mut on_row = |row: &[u8]| -> Result<(), String> {
+            if header_pending {
+                header_pending = false;
+                header = Some(row.to_vec());
+                return Ok(());
+            }
+            let block = match crate::copysplit::field(&copy, row, key)? {
+                None => return Err("23502: a row's shard key is NULL".to_string()),
+                Some(v) => crate::route::param_block(false, Some(&v), family)
+                    .ok_or_else(|| format!("22P02: a row's shard key {:?} is not a value of the key's type", String::from_utf8_lossy(&v)))?,
+            };
+            let shard = map.shard_of_block(block);
+            match routed.last_mut() {
+                Some((s, buf)) if *s == shard => buf.extend_from_slice(row),
+                _ => routed.push((shard, row.to_vec())),
+            }
+            Ok(())
+        };
+        let mut result = split.rows.feed(&copy, data, &mut on_row);
+        if result.is_ok() && end {
+            result = split.rows.finish(&copy, &mut on_row);
+        }
+        split.header_pending = header_pending;
+        if header.is_some() {
+            split.header_line = header;
+        }
+        if let Err(e) = result {
+            let (code, msg) = e.split_once(": ").map(|(c, m)| (c.to_string(), m.to_string())).unwrap_or(("22P04".into(), e));
+            split.failure = Some((code, msg));
+            return;
+        }
+        for (s, rows) in routed {
+            split.buffers.entry(s).or_default().extend_from_slice(&rows);
+        }
+        let full: Vec<u32> = split.buffers.iter().filter(|(_, b)| end || b.len() >= crate::copysplit::FLUSH_BYTES).map(|(s, _)| *s).collect();
+        for s in full {
+            if let Err(e) = self.copy_split_flush(s).await {
+                if let Some(split) = self.copy_split.as_mut() {
+                    split.failure.get_or_insert(e);
+                }
+                return;
+            }
+        }
+    }
+
+    /// Sends shard `s` its buffered rows, opening its COPY first if this is
+    /// its first.
+    async fn copy_split_flush(&mut self, s: u32) -> Result<(), (String, String)> {
+        let (opened, atomic, statement) = {
+            let split = self.copy_split.as_ref().expect("a split COPY");
+            (split.opened.contains(&s), split.atomic, split.statement.clone())
+        };
+        let id = self.ensure_vs(s).await.map_err(|(c, m)| (c, format!("shard {s}: {m}")))?;
+        let epoch = self.core.map().epoch();
+        if !opened {
+            if atomic {
+                self.join_txn(&[s]).await?;
+            }
+            let mut q = vec![b'Q'];
+            q.extend_from_slice(&((statement.len() + 5) as i32).to_be_bytes());
+            q.extend_from_slice(statement.as_bytes());
+            q.push(0);
+            let mut req = Vec::new();
+            Request::encode_pg(&mut req, id, epoch, &q);
+            let reply = collect_pg(self.core.clone(), s, id, req).await?;
+            if let Some((_, m)) = pg::messages(&reply).find(|(t, _)| *t == b'E') {
+                return Err((pg::error_sqlstate(m).unwrap_or("XX000").to_string(), format!("shard {s}: {}", pg::error_message(m).unwrap_or_default())));
+            }
+            if !pg::messages(&reply).any(|(t, _)| t == b'G') {
+                return Err(("08P01".into(), format!("shard {s} did not start its COPY")));
+            }
+            let split = self.copy_split.as_mut().expect("a split COPY");
+            split.opened.push(s);
+            if let Some(h) = split.header_line.clone() {
+                let buf = split.buffers.entry(s).or_default();
+                buf.splice(0..0, h);
+            }
+        }
+        let rows = self.copy_split.as_mut().expect("a split COPY").buffers.remove(&s).unwrap_or_default();
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut d = Vec::with_capacity(rows.len() + 5);
+        pg::put(&mut d, b'd', &rows);
+        let mut req = Vec::new();
+        Request::encode_pg(&mut req, id, epoch, &d);
+        collect_pg(self.core.clone(), s, id, req).await.map(drop)
+    }
+
+    /// CopyDone: every shard's COPY ended, the counts summed, and the load
+    /// committed (in two phases when it is the gateway's own transaction).
+    async fn copy_split_done(&mut self) -> Outcome {
+        let split = self.copy_split.as_ref().expect("a split COPY");
+        if let Some((code, msg)) = split.failure.clone() {
+            return self.copy_split_abort(&code, &msg).await;
+        }
+        let opened = split.opened.clone();
+        let mut done = Vec::new();
+        pg::put(&mut done, b'c', &[]);
+        let work: Vec<(u32, Vec<u8>)> = opened.iter().map(|s| (*s, done.clone())).collect();
+        // Each shard's CopyDone at once; its reply carries its count.
+        let mut handles = Vec::new();
+        let epoch = self.core.map().epoch();
+        for (s, msgs) in &work {
+            let Ok(id) = self.ensure_vs(*s).await else { continue };
+            let mut req = Vec::new();
+            Request::encode_pg(&mut req, id, epoch, msgs);
+            handles.push((*s, tokio::task::spawn_local(crate::meter::carry(collect_pg(self.core.clone(), *s, id, req)))));
+        }
+        let mut total = 0u64;
+        let mut failure = None;
+        let mut applied = Vec::new();
+        for (s, h) in handles {
+            match h.await {
+                Ok(Ok(bytes)) => {
+                    if let Some((_, m)) = pg::messages(&bytes).find(|(t, _)| *t == b'E') {
+                        failure.get_or_insert((pg::error_sqlstate(m).unwrap_or("XX000").to_string(), format!("shard {s}: {}", pg::error_message(m).unwrap_or_default())));
+                        continue;
+                    }
+                    if let Some((_, m)) = pg::messages(&bytes).find(|(t, _)| *t == b'C')
+                        && let Some((_, n)) = pg::tag_count(m)
+                    {
+                        total += n;
+                    }
+                    applied.push(s);
+                }
+                Ok(Err(e)) => {
+                    failure.get_or_insert(e);
+                }
+                Err(_) => {
+                    failure.get_or_insert(("XX000".into(), format!("shard {s}'s COPY panicked")));
+                }
+            }
+        }
+        let split = self.copy_split.take().expect("a split COPY");
+        if let Some((code, msg)) = failure {
+            if split.atomic {
+                return self.write_failed(split.implicit, &code, &msg).await;
+            }
+            let msg = if applied.is_empty() { msg } else { format!("{msg}; the rows of shards {applied:?} were loaded and stay") };
+            self.error_ready(&code, &msg);
+            return Outcome::Done { error: true };
+        }
+        let mut out = Vec::new();
+        pg::command_complete(&mut out, &format!("COPY {total}"));
+        if split.atomic {
+            return self.write_done(split.implicit, out).await;
+        }
+        self.out.extend_from_slice(&out);
+        pg::ready(&mut self.out, b'I');
+        Outcome::Done { error: false }
+    }
+
+    /// CopyFail, or a failure found while splitting: every open shard COPY
+    /// failed too, and the load undone where it can be.
+    async fn copy_split_abort(&mut self, code: &str, msg: &str) -> Outcome {
+        let Some(split) = self.copy_split.take() else {
+            self.error_ready(code, msg);
+            return Outcome::Done { error: true };
+        };
+        let mut fail = Vec::new();
+        pg::put(&mut fail, b'f', b"the gateway ended the COPY\0");
+        let work: Vec<(u32, Vec<u8>)> = split.opened.iter().map(|s| (*s, fail.clone())).collect();
+        let _ = self.send_each(&work).await;
+        if split.atomic {
+            return self.write_failed(split.implicit, code, msg).await;
+        }
+        self.error_ready(code, msg);
+        Outcome::Done { error: true }
+    }
+
     fn partial(&mut self, code: &str, message: &str, applied: &[u32]) -> Outcome {
         let msg = if applied.is_empty() {
             message.to_string()

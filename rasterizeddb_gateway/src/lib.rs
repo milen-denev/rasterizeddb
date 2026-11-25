@@ -21,6 +21,7 @@
 pub mod admin;
 pub mod config;
 pub mod conn;
+pub mod copysplit;
 pub mod core;
 pub mod counters;
 pub mod fanout;

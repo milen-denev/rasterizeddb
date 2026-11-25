@@ -132,6 +132,12 @@ pub struct Session {
     pub(crate) unrouted_writes: UnroutedWrites,
     /// Fan-out reads take one snapshot across shards (B6.1).
     pub(crate) consistent_fanout: bool,
+    /// `SET rdb.split_bulk_writes = on`: without two-phase commit, a COPY
+    /// into a sharded table is split by shard, each shard's part committed
+    /// alone (§8.5).
+    pub(crate) split_bulk_writes: bool,
+    /// A COPY being split by shard (`copysplit`).
+    pub(crate) copy_split: Option<crate::copysplit::Split>,
     pub(crate) vs: HashMap<u32, VSession>,
     pub(crate) txn: Txn,
     /// Session-level `SET`s, as raw Query messages, replayed to every
@@ -170,6 +176,7 @@ enum Local {
     SetUnroutedWrites(String),
     /// `SET rdb.consistent_fanout = on|off` (B6.1).
     SetConsistentFanout(String),
+    SetSplitBulkWrites(String),
     Begin,
     End { commit: bool },
     SetLocal,
@@ -253,6 +260,7 @@ fn local_of(text: &str) -> Local {
             "rdb.unrouted" => return Local::SetUnrouted(value.unwrap_or_default()),
             "rdb.unrouted_writes" => return Local::SetUnroutedWrites(value.unwrap_or_default()),
             "rdb.consistent_fanout" => return Local::SetConsistentFanout(value.unwrap_or_default()),
+            "rdb.split_bulk_writes" => return Local::SetSplitBulkWrites(value.unwrap_or_default()),
             // `SET TRANSACTION …` belongs to the transaction.
             "transaction" | "constraints" => return if local { Local::SetLocal } else { Local::Routed },
             _ => return if local { Local::SetLocal } else { Local::SessionSet },
@@ -272,6 +280,8 @@ impl Session {
             unrouted,
             unrouted_writes: UnroutedWrites::Refuse,
             consistent_fanout: false,
+            split_bulk_writes: false,
+            copy_split: None,
             vs: HashMap::new(),
             txn: Txn {
                 status: b'I',
@@ -628,6 +638,19 @@ impl Session {
                 pg::ready(&mut self.out, self.txn.status);
                 return Ok(Outcome::Done { error: false });
             }
+            Local::SetSplitBulkWrites(v) => {
+                self.split_bulk_writes = match v.trim_matches('\'').to_ascii_lowercase().as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" | "default" | "" => false,
+                    _ => {
+                        self.error_ready("22023", "rdb.split_bulk_writes is on or off");
+                        return Ok(Outcome::Done { error: true });
+                    }
+                };
+                pg::command_complete(&mut self.out, "SET");
+                pg::ready(&mut self.out, self.txn.status);
+                return Ok(Outcome::Done { error: false });
+            }
             Local::SetConsistentFanout(v) => {
                 self.consistent_fanout = match v.trim_matches('\'').to_ascii_lowercase().as_str() {
                     "on" | "true" | "1" => true,
@@ -821,9 +844,14 @@ impl Session {
             let outcome = match target {
                 Target::Refuse { sqlstate, message } => {
                     // A multi-row INSERT is split by the shard each row
-                    // goes to.
+                    // goes to; so is a COPY's every row.
                     if sqlstate == "0A000"
                         && let Some(outcome) = self.split_insert(conn, msg, text).await?
+                    {
+                        return Ok(outcome);
+                    }
+                    if sqlstate == "0A000"
+                        && let Some(outcome) = self.copy_split_start(conn, text).await?
                     {
                         return Ok(outcome);
                     }
@@ -1631,6 +1659,9 @@ impl Session {
     // ------------------------------------------------------------ copy
 
     async fn copy_data<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, t: u8, msg: &[u8]) -> io::Result<Outcome> {
+        if self.copy_split.is_some() {
+            return self.copy_split_data(t, msg).await;
+        }
         let Some(shard) = self.copy_shard else {
             // PostgreSQL ignores CopyData outside COPY, and so does this.
             return Ok(Outcome::Done { error: false });
