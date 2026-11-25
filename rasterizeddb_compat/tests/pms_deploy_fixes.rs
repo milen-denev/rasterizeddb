@@ -506,3 +506,29 @@ async fn percentiles_within_group() {
         .expect("mode");
     assert_eq!((row.get::<String, _>(0), row.get::<String, _>(1)), ("x".to_string(), "y".to_string()));
 }
+
+/// EF Core's and SeaORM's spelling: every alias quoted. A correlated EXISTS
+/// whose subquery joins two relations (`"d0"` JOIN `"d1"`) failed with
+/// `column "d0" does not exist` (DenevCloud ERP's product queries over pgwire:
+/// 13 of 31 statements).
+#[tokio::test]
+async fn a_correlated_exists_over_a_join_with_quoted_aliases() {
+    let (_s, pool) = server().await;
+    for sql in [
+        "CREATE TABLE zz_tags (id int PRIMARY KEY, content text)",
+        "CREATE TABLE zz_pt (tagsid int, productsid int)",
+        "CREATE TABLE zz_products (id int PRIMARY KEY, name text)",
+        "INSERT INTO zz_tags VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        "INSERT INTO zz_pt VALUES (1, 10), (2, 11), (3, 10)",
+        "INSERT INTO zz_products VALUES (10, 'p10'), (11, 'p11')",
+    ] {
+        run(&pool, sql).await;
+    }
+    let exists = r#"SELECT "d"."id" FROM zz_tags AS "d" WHERE EXISTS (SELECT 1 FROM zz_pt AS "d0" INNER JOIN zz_products AS "d1" ON "d0"."productsid" = "d1"."id" WHERE "d"."id" = "d0"."tagsid" AND "d1"."id" = 10) ORDER BY "d"."id""#;
+    assert_eq!(ids(&pool, exists).await, vec![1, 3]);
+    let not_exists = r#"SELECT "d"."id" FROM zz_tags AS "d" WHERE NOT EXISTS (SELECT 1 FROM zz_pt AS "d0" INNER JOIN zz_products AS "d1" ON "d0"."productsid" = "d1"."id" WHERE "d"."id" = "d0"."tagsid" AND "d1"."id" = 10) ORDER BY "d"."id""#;
+    assert_eq!(ids(&pool, not_exists).await, vec![2]);
+    // In a derived table, with a correlated scalar subquery beside it (ERP #13).
+    let derived = r#"SELECT "x"."id" FROM (SELECT "d"."id", (SELECT "d1"."name" FROM zz_pt AS "d0" INNER JOIN zz_products AS "d1" ON "d0"."productsid" = "d1"."id" WHERE "d"."id" = "d0"."tagsid" LIMIT 1) AS "c" FROM zz_tags AS "d" WHERE EXISTS (SELECT 1 FROM zz_pt AS "d0" INNER JOIN zz_products AS "d1" ON "d0"."productsid" = "d1"."id" WHERE "d"."id" = "d0"."tagsid" AND "d1"."name" = 'p11') LIMIT 10) AS "x" ORDER BY "x"."id""#;
+    assert_eq!(ids(&pool, derived).await, vec![2]);
+}

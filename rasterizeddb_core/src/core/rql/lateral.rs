@@ -855,6 +855,77 @@ fn clause_end_of_from(body: &str) -> usize {
     end
 }
 
+/// `sql` with every quoted part of a qualified reference (`"d"."id"`,
+/// `"d".id`, `d."id"`) unquoted where quoting changes nothing: a plain
+/// lower-case identifier, which PostgreSQL reads the same either way. A part
+/// that needs its quotes (upper case, a space, a dot, `""`) keeps them, and so
+/// does a lone quoted name (`AS "d"`, a quoted column); string literals are
+/// copied as they are.
+pub(crate) fn unquote_plain_qualified(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let plain = |name: &str| {
+        let mut chars = name.chars();
+        chars.next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    };
+    // One part at `i`: its end, its text as it may be written, and whether it
+    // was quoted.
+    let part = |i: usize| -> Option<(usize, String, bool)> {
+        if bytes.get(i) == Some(&b'"') {
+            let end = crate::core::sql_scan::quoted_end(bytes, i, b'"');
+            let inner = sql.get(i + 1..end.checked_sub(1)?)?;
+            if end > i + 1 && bytes.get(end - 1) == Some(&b'"') && plain(inner) {
+                return Some((end, inner.to_string(), true));
+            }
+            return Some((end, sql[i..end].to_string(), false));
+        }
+        let mut j = i;
+        while j < bytes.len() && is_word(bytes[j]) {
+            j += 1;
+        }
+        (j > i).then(|| (j, sql[i..j].to_string(), false))
+    };
+    let mut out = String::with_capacity(sql.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            i = crate::core::sql_scan::quoted_end(bytes, i, b'\'').max(i + 1);
+            continue;
+        }
+        let starts = (b == b'"' || b.is_ascii_alphabetic() || b == b'_')
+            && (i == 0 || !(is_word(bytes[i - 1]) || bytes[i - 1] == b'.' || bytes[i - 1] == b'"'));
+        if !starts {
+            i += 1;
+            continue;
+        }
+        let Some((q_end, q_text, q_unquoted)) = part(i) else {
+            i += 1;
+            continue;
+        };
+        if bytes.get(q_end) != Some(&b'.') {
+            i = q_end.max(i + 1);
+            continue;
+        }
+        let Some((c_end, c_text, c_unquoted)) = part(q_end + 1) else {
+            i = q_end + 1;
+            continue;
+        };
+        let third = matches!(bytes.get(c_end), Some(b'.'));
+        if (q_unquoted || c_unquoted) && !third {
+            out.push_str(&sql[copied..i]);
+            out.push_str(&q_text);
+            out.push('.');
+            out.push_str(&c_text);
+            copied = c_end;
+        }
+        i = c_end.max(i + 1);
+    }
+    out.push_str(&sql[copied..]);
+    out
+}
+
 /// `body` with every `alias.column` of `columns` replaced by its constant.
 pub(crate) fn substitute(body: &str, alias: &str, columns: &[String], constants: &[String]) -> String {
     let bytes = body.as_bytes();
@@ -1065,7 +1136,11 @@ pub(crate) async fn materialize(
     temps: &mut Vec<String>,
     tx: TxId,
 ) -> Result<Option<String>, String> {
-    let mut current = sql.to_string();
+    // `"d"."id"` (EF Core, SeaORM) read as `d.id`: the scans below find and
+    // substitute outer references only in that spelling, and a quoted one was
+    // left in the item, where `d` is unbound ("missing FROM-clause entry for
+    // table d", every correlated scalar subquery an ORM sends).
+    let mut current = unquote_plain_qualified(sql);
     let mut found = false;
     for index in 0..16usize {
         let Some(item) = next_item(&current) else { break };
@@ -1602,5 +1677,21 @@ mod multibyte_tests {
         }
         let item = next_item(base).expect("an item").expect("parses");
         assert!(outer_references(base, &item).expect("reads").is_some());
+    }
+}
+
+#[cfg(test)]
+mod unquote_plain_qualified_tests {
+    use super::unquote_plain_qualified as u;
+
+    #[test]
+    fn plain_quoted_parts_are_unquoted_and_the_rest_kept() {
+        assert_eq!(u(r#"SELECT "d"."id", (SELECT "p"."x" FROM pt AS "p" WHERE "d"."id" = "p"."tagsid") FROM tags AS "d""#),
+            r#"SELECT d.id, (SELECT p.x FROM pt AS "p" WHERE d.id = p.tagsid) FROM tags AS "d""#);
+        assert_eq!(u(r#""d".id + d."id" + d.id"#), "d.id + d.id + d.id");
+        assert_eq!(u(r#""D"."id" + "d"."Id" + "d"."a b""#), r#""D".id + d."Id" + d."a b""#);
+        assert_eq!(u(r#"'"d"."id"' || "d"."id""#), r#"'"d"."id"' || d.id"#);
+        assert_eq!(u(r#""s"."t"."c" + "denevcloud․erp․x"."c""#), r#""s"."t"."c" + "denevcloud․erp․x".c"#);
+        assert_eq!(u("no quotes at all"), "no quotes at all");
     }
 }

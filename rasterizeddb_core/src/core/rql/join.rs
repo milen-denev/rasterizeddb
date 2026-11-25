@@ -5382,6 +5382,47 @@ fn column_references(text: &str) -> Vec<String> {
     out
 }
 
+/// A two-part `qualifier.column` reference starting at `i`, either part
+/// quoted (`""` inside a quoted part is one `"`): its end and both names
+/// unquoted. `None` when what starts at `i` is not one, or is followed by a
+/// third part.
+fn qualified_at(bytes: &[u8], i: usize) -> Option<(usize, String, String)> {
+    fn part(bytes: &[u8], i: usize) -> Option<(usize, String)> {
+        if bytes.get(i) == Some(&b'"') {
+            let mut name = Vec::new();
+            let mut j = i + 1;
+            loop {
+                match bytes.get(j)? {
+                    b'"' if bytes.get(j + 1) == Some(&b'"') => {
+                        name.push(b'"');
+                        j += 2;
+                    }
+                    b'"' => return Some((j + 1, String::from_utf8(name).ok()?)),
+                    b => {
+                        name.push(*b);
+                        j += 1;
+                    }
+                }
+            }
+        }
+        let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || !b.is_ascii();
+        let mut j = i;
+        while j < bytes.len() && word(bytes[j]) {
+            j += 1;
+        }
+        (j > i && !bytes[i].is_ascii_digit()).then(|| (j, String::from_utf8_lossy(&bytes[i..j]).into_owned()))
+    }
+    let (after_qualifier, qualifier) = part(bytes, i)?;
+    if bytes.get(after_qualifier) != Some(&b'.') {
+        return None;
+    }
+    let (end, column) = part(bytes, after_qualifier + 1)?;
+    if matches!(bytes.get(end), Some(b'.') | Some(b'"')) || bytes.get(end).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_') {
+        return None;
+    }
+    Some((end, qualifier, column))
+}
+
 /// Replaces a qualified name with another, matching whole identifiers only and
 /// skipping string literals.
 ///
@@ -5403,6 +5444,28 @@ fn replace_qualified(sql: &str, from: &str, to: &str) -> String {
                 quote = None;
             }
             i += 1;
+            continue;
+        }
+        // A quoted spelling of `from`: `"d"."c"`, `d."c"` or `"d".c`, as EF
+        // Core and SeaORM write every reference. Copied verbatim as a quoted
+        // identifier, it was never renamed: a column two relations share is
+        // renamed in the join's layout, so `COALESCE("d"."c", 0)` read as
+        // "neither a column nor a value".
+        let starts_identifier = i == 0
+            || !(bytes[i - 1].is_ascii_alphanumeric()
+                || bytes[i - 1] == b'_'
+                || bytes[i - 1] == b'.'
+                || bytes[i - 1] == b'"'
+                || !bytes[i - 1].is_ascii());
+        if starts_identifier
+            && (c == b'"' || c.is_ascii_alphabetic() || c == b'_')
+            && let Some((end, qualifier, column)) = qualified_at(bytes, i)
+            && let Some((fq, fc)) = from.split_once('.')
+            && qualifier.eq_ignore_ascii_case(fq)
+            && column.eq_ignore_ascii_case(fc)
+        {
+            out.extend_from_slice(to.as_bytes());
+            i = end;
             continue;
         }
         if c == b'\'' || c == b'"' {
@@ -8336,5 +8399,24 @@ mod outer_join_reference {
             let p = planned("ta a, tb b", term);
             assert_eq!(join(&p, 1).kind, JoinKind::Cross, "{term}");
         }
+    }
+}
+
+#[cfg(test)]
+mod replace_qualified_tests {
+    use super::replace_qualified;
+
+    /// Every spelling of a qualified reference is renamed; a longer name, a
+    /// third part, a string literal and another qualifier are not.
+    #[test]
+    fn quoted_spellings_are_renamed() {
+        let r = |s: &str| replace_qualified(s, "d.c", "d__c");
+        assert_eq!(r("COALESCE(d.c, 0)"), "COALESCE(d__c, 0)");
+        assert_eq!(r(r#"COALESCE("d"."c", 0)"#), "COALESCE(d__c, 0)");
+        assert_eq!(r(r#"d."c" + "d".c"#), "d__c + d__c");
+        assert_eq!(r(r#""D"."C""#), "d__c");
+        assert_eq!(r(r#""d"."cc" + "dd"."c" + "x"."d"."c""#), r#""d"."cc" + "dd"."c" + "x"."d"."c""#);
+        assert_eq!(r(r#"'"d"."c"' || d.c"#), r#"'"d"."c"' || d__c"#);
+        assert_eq!(r(r#""é"."c" || "d"."c""#), r#""é"."c" || d__c"#);
     }
 }

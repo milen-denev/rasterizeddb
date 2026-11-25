@@ -844,7 +844,10 @@ pub fn exists_to_in(clause: &ExistsClause, outer_relations: &[String]) -> Result
     // ambiguous across the joined relations. Without one it is stripped, which
     // is what the single-relation path has always emitted.
     let inner_column = if joined {
-        inner_ref.trim_matches('"').to_string()
+        // As written: `"d0"."tagsid"` (EF Core, SeaORM) is valid as it is.
+        // Its quotes trimmed from the whole term it was `d0"."tagsid`, which
+        // the join plan read as a column `d0` that does not exist.
+        inner_ref.trim().to_string()
     } else {
         inner_ref
             .rsplit('.')
@@ -2356,6 +2359,19 @@ mod tests {
         );
         assert!(body.ends_with("AND t.n = 'LIMIT 9'"), "{body}");
         assert_eq!(b, ExistsBounds::default());
+    }
+
+    /// A joined inner relation keeps its key qualified as written: EF Core and
+    /// SeaORM quote every alias (`"d0"."tagsid"`), and trimming the quotes off
+    /// the whole term made `d0"."tagsid`, read as a column `d0`.
+    #[test]
+    fn a_quoted_qualified_inner_key_is_kept_whole() {
+        let sql = r#"SELECT "d"."content" FROM tags AS "d" WHERE EXISTS (SELECT 1 FROM pt AS "d0" INNER JOIN products AS "d1" ON "d0"."productsid" = "d1"."id" WHERE "d"."id" = "d0"."tagsid" AND "d1"."id" = 10)"#;
+        let (clause, _) = strip_exists_tail(&find_exists(sql).unwrap()).unwrap();
+        let rewritten = exists_to_in(&clause, &["d".to_string()]).unwrap();
+        assert!(rewritten.contains(r#"SELECT "d0"."tagsid" FROM"#), "{rewritten}");
+        assert!(rewritten.contains(r#"WHERE "d0"."tagsid" IS NOT NULL"#), "{rewritten}");
+        assert!(!rewritten.contains(r#"d0"."tagsid IS"#), "{rewritten}");
     }
 
     #[test]
