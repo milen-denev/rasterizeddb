@@ -677,6 +677,9 @@ pub(crate) struct Cx<'a> {
     project_ticks: bool,
     /// Output columns read whole with their 100 ns digit ([`Forward::ticks`]).
     tick_outputs: Vec<(String, &'static str)>,
+    /// The one table an INFORMATION_SCHEMA view is read for (`WHERE
+    /// TABLE_NAME = @t`, ANDed): only its rows are built.
+    catalog_table: Option<String>,
 }
 
 impl<'a> Cx<'a> {
@@ -691,6 +694,7 @@ impl<'a> Cx<'a> {
             top_aliases: Vec::new(),
             project_ticks: false,
             tick_outputs: Vec::new(),
+            catalog_table: None,
         }
     }
 }
@@ -1986,6 +1990,14 @@ fn catalog_view_stored(schema: &str, view: &str, cx: &Cx) -> Result<Option<Strin
     // Names as they were declared over this protocol (`NAMES_TABLE`).
     let shown_table = |t: &str| cx.env.shown(t, None).unwrap_or_else(|| t.to_string());
     let shown_column = |t: &str, c: &str| cx.env.shown(t, Some(c)).unwrap_or_else(|| c.to_string());
+    // A read for one table builds only its rows (`catalog_table_named`).
+    if schema == "information_schema" {
+        if let Some(only) = cx.catalog_table.as_deref() {
+            tables.retain(|t| {
+                shown_table(t).eq_ignore_ascii_case(only) || super::lex::decode_dots(t).eq_ignore_ascii_case(only)
+            });
+        }
+    }
     let empty = |cols: &[&str]| -> String {
         format!(
             "(SELECT {} WHERE 1 = 0)",
@@ -3091,11 +3103,14 @@ fn rewrite_select_inner(
             return Err(TsqlError::unsupported("FOR JSON / FOR XML"));
         }
     }
+    let catalog_hint = if reads_catalog(&rest) { catalog_table_named(&rest, cx) } else { None };
     let rest = if reads_catalog(&rest) { fold_catalog_names(rest) } else { rest };
     let env = cx.env;
     let rest = sql_server_null_order(rest, &|key: &[Token]| key_not_null(key, &relations, env));
     let outer = std::mem::replace(&mut cx.past_select_list, true);
+    let outer_hint = std::mem::replace(&mut cx.catalog_table, catalog_hint);
     let tail = rewrite_expr(rest, cx);
+    cx.catalog_table = outer_hint;
     cx.past_select_list = outer;
     out.extend(tail?);
     if let Some(l) = limit {
@@ -3153,6 +3168,47 @@ fn split_alias(item: &[Token]) -> (Vec<Token>, Option<String>) {
         }
     }
     (item.to_vec(), None)
+}
+
+/// The table a catalogue read is for, when its WHERE says one as `[q.]
+/// TABLE_NAME = <text, @variable or parameter>` with no top-level OR: the
+/// INFORMATION_SCHEMA views are built for it alone, where every table's
+/// rows were built and filtered (seconds per lookup with a hundred tables,
+/// each one EF Core's migrations and a copy tool make).
+fn catalog_table_named(rest: &[Token], cx: &Cx) -> Option<String> {
+    let w = find_top(rest, 0, &["WHERE"])?;
+    let end = find_top(rest, w + 1, &["GROUP", "HAVING", "ORDER", "UNION", "EXCEPT", "INTERSECT", "OPTION", "FOR"]).unwrap_or(rest.len());
+    let cond = &rest[w + 1..end];
+    if find_top(cond, 0, &["OR"]).is_some() {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (k, t) in cond.iter().enumerate() {
+        if t.is_op("(") {
+            depth += 1;
+        } else if t.is_op(")") {
+            depth -= 1;
+        }
+        if depth != 0 || !t.ident().is_some_and(|n| n.eq_ignore_ascii_case("table_name")) {
+            continue;
+        }
+        if k > 0 && cond[k - 1].is_op(".") && k > 1 && !cond[k - 2].ident().is_some() {
+            continue;
+        }
+        if !cond.get(k + 1).is_some_and(|o| o.is_op("=")) || cond.get(k + 3).is_some_and(|n| n.is_op(".") || n.is_op("+")) {
+            continue;
+        }
+        return match &cond.get(k + 2)?.tok {
+            Tok::Str(b) => Some(String::from_utf8_lossy(b).into_owned()),
+            Tok::UserVar(v) => cx
+                .env
+                .param_text(v)
+                .flatten()
+                .or_else(|| cx.env.variable(v).and_then(|x| x.text())),
+            _ => None,
+        };
+    }
+    None
 }
 
 /// Whether `tokens` read a catalogue view (`sys.x`, `INFORMATION_SCHEMA.x`).

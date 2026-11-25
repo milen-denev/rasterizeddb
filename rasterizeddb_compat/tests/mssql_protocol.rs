@@ -1910,3 +1910,46 @@ async fn tiberius_null_order_and_mixed_keys() {
     assert_eq!(r[0][0].get::<i64, _>(1), Some(1));
     assert_eq!(r[0][0].get::<i32, _>(0), None);
 }
+
+/// A catalogue lookup for one table (`WHERE TABLE_NAME = @t`, what EF Core
+/// and copy tools send per table) builds only that table's rows: every
+/// table's were built and filtered, seconds a lookup with a hundred
+/// tables. What reads more than one table still sees them all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_catalogue_lookup_for_one_table() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    let mut ddl = String::new();
+    for k in 0..60 {
+        ddl.push_str(&format!("CREATE TABLE [DenevCloud.ERP.T{k}] ([Id] int PRIMARY KEY, [Name] nvarchar(20) NULL, [At] datetime2 NULL); "));
+    }
+    batch(&mut c, &ddl).await.unwrap();
+    let started = std::time::Instant::now();
+    for k in 0..60 {
+        let r = c
+            .query(
+                "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = @P1 AND TABLE_NAME = @P2 ORDER BY ORDINAL_POSITION",
+                &[&"dbo", &format!("denevcloud.erp.t{k}")],
+            )
+            .await
+            .unwrap()
+            .into_first_result()
+            .await
+            .unwrap();
+        assert_eq!(texts(&r).into_iter().flatten().collect::<Vec<_>>(), ["Id", "Name", "At"]);
+    }
+    let per_lookup = started.elapsed() / 60;
+    assert!(per_lookup < std::time::Duration::from_millis(500), "{per_lookup:?} a lookup");
+    // An OR, a lookup by another column, and none: every table's rows.
+    let r = batch(
+        &mut c,
+        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = N'DenevCloud.ERP.T1' OR TABLE_NAME = N'DenevCloud.ERP.T2'; \
+         SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE COLUMN_NAME = N'Name'; \
+         SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES",
+    )
+    .await
+    .unwrap();
+    assert_eq!(int(&r[0]), [6]);
+    assert_eq!(int(&r[1]), [60]);
+    assert_eq!(int(&r[2]), [60]);
+}
