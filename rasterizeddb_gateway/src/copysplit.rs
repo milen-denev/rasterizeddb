@@ -402,6 +402,9 @@ pub struct Split {
     /// until then).
     pub failure: Option<(String, String)>,
     pub columns: usize,
+    /// A reference table: every row to every shard, whose copies must stay
+    /// the same (so only under `two_phase`).
+    pub broadcast: bool,
 }
 
 #[cfg(test)]

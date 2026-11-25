@@ -848,6 +848,13 @@ impl Session {
 
     async fn route_simple<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, msg: &[u8], text: &str) -> io::Result<Outcome> {
         let retries = self.core.shared.cfg.retries;
+        // A COPY into a reference table routes as the home shard's (its
+        // statement names no key) but its rows belong on every shard.
+        if text.trim_start().get(..5).is_some_and(|w| w.eq_ignore_ascii_case("COPY "))
+            && let Some(outcome) = self.copy_split_start(conn, text).await?
+        {
+            return Ok(outcome);
+        }
         for attempt in 0..=retries {
             self.core.refresh_if_stale().await;
             let map = self.core.map();

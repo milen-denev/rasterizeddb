@@ -763,6 +763,14 @@ def main():
     check("  ...a duplicate key in one row loads nothing", code != 0 and got == (0, "0"), f"{out} / {got}")
     psql(GW, "DELETE FROM orders WHERE id > 8000")
     psql(GW, "DELETE FROM stores WHERE id >= 10")
+    # A reference table: every shard's copy takes every row.
+    on_every_shard("CREATE TABLE ref_copy (id INT PRIMARY KEY, name TEXT NOT NULL)")
+    on_every_shard("SHARD REFERENCE TABLE ref_copy")
+    with open(f"{WORK}/ref.tsv", "w") as f:
+        f.write("".join(f"{k}\tr{k}\n" for k in range(1, 41)))
+    code, out = psql_script(GW, f"\\copy ref_copy (id, name) FROM '{WORK}/ref.tsv'\n")
+    per = [psql(PG[n], "SELECT count(*) FROM ref_copy")[1] for n in SHARDS]
+    check("a COPY into a reference table loads every shard's copy", (code, out) == (0, "COPY 40") and all(p == "40" for p in per), f"{out} {per}")
 
     # 4g. LISTEN on one session, NOTIFY from another: the gateway's hub
     # carries it whatever shard the NOTIFY ran on.

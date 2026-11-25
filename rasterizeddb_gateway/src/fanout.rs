@@ -1221,8 +1221,11 @@ impl Session {
             columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", "),
             (1..=columns.len()).map(|i| format!("${i}")).collect::<Vec<_>>().join(", ")
         );
-        let (key, family) = match crate::route::template(&self.core, &self.login.database, rasterizeddb_router::rshard::Source::Parse, &probe, home).await {
-            Ok(rasterizeddb_router::rshard::RouteTemplate::Param { index, family }) => (index as usize, family),
+        // A keyed INSERT: rows split by key. A write that fans out with no
+        // key: a reference table, every row to every shard.
+        let (key, family, broadcast) = match crate::route::template(&self.core, &self.login.database, rasterizeddb_router::rshard::Source::Parse, &probe, home).await {
+            Ok(rasterizeddb_router::rshard::RouteTemplate::Param { index, family }) => (index as usize, family, false),
+            Ok(rasterizeddb_router::rshard::RouteTemplate::FanOut { writes: true, .. }) => (0, rasterizeddb_router::KeyFamily::Integer, true),
             _ => return Ok(None),
         };
         if self.txn.status == b'E' {
@@ -1230,6 +1233,13 @@ impl Session {
             return Ok(Some(Outcome::Done { error: true }));
         }
         let atomic = self.core.shared.cfg.two_phase;
+        if broadcast && !atomic {
+            self.error_ready(
+                "0A000",
+                "a COPY into a reference table loads every shard's copy at once, which needs the gateway's two_phase = on; use INSERT, or load each shard",
+            );
+            return Ok(Some(Outcome::Done { error: true }));
+        }
         if !atomic && !(self.split_bulk_writes && self.txn.status == b'I') {
             self.error_ready(
                 "0A000",
@@ -1255,6 +1265,7 @@ impl Session {
             implicit,
             failure: None,
             columns: ncols,
+            broadcast,
         });
         // CopyInResponse: text, every column text.
         let mut g = vec![0u8];
@@ -1296,11 +1307,21 @@ impl Session {
         let mut routed: Vec<(u32, Vec<u8>)> = Vec::new();
         let mut header: Option<Vec<u8>> = None;
         let mut header_pending = split.header_pending;
-        let (copy, key, family) = (split.copy.clone(), split.key, split.family);
+        let (copy, key, family, broadcast) = (split.copy.clone(), split.key, split.family, split.broadcast);
+        let every: Vec<u32> = map.shards().iter().map(|s| s.id).collect();
         let mut on_row = |row: &[u8]| -> Result<(), String> {
             if header_pending {
                 header_pending = false;
                 header = Some(row.to_vec());
+                return Ok(());
+            }
+            if broadcast {
+                for &shard in &every {
+                    match routed.iter_mut().find(|(s, _)| *s == shard) {
+                        Some((_, buf)) => buf.extend_from_slice(row),
+                        None => routed.push((shard, row.to_vec())),
+                    }
+                }
                 return Ok(());
             }
             let block = match crate::copysplit::field(&copy, row, key)? {
@@ -1419,7 +1440,8 @@ impl Session {
                     if let Some((_, m)) = pg::messages(&bytes).find(|(t, _)| *t == b'C')
                         && let Some((_, n)) = pg::tag_count(m)
                     {
-                        total += n;
+                        // A reference table's copies each took every row.
+                        total = if self.copy_split.as_ref().is_some_and(|c| c.broadcast) { total.max(n) } else { total + n };
                     }
                     applied.push(s);
                 }
@@ -1489,6 +1511,8 @@ impl Session {
             "SHOW TABLES" => 0,
             "SHOW STORAGE LOCATIONS" | "SHOW STORAGE PLACEMENTS" | "SHOW SHARD LOAD" => 1,
             "SHOW STORAGE STATS" => 2,
+            "SHOW DATABASE STATS" => 3,
+            u if u.starts_with("SHOW TABLE STATS ") && u.split(' ').count() == 4 => 4,
             _ => return Ok(None),
         };
         let map = self.core.map();
@@ -1496,6 +1520,15 @@ impl Session {
             return Ok(None);
         }
         let home = self.core.shared.home(&map);
+        // A plain table's statistics are the home shard's (or, for a
+        // reference table, any shard's): passed through as they are.
+        if kind == 4 {
+            let name = text.trim().trim_end_matches(';').split_whitespace().nth(3).unwrap_or_default();
+            let name = name.strip_prefix('"').and_then(|n| n.strip_suffix('"')).unwrap_or(name);
+            if !self.partitioned(name, home).await {
+                return Ok(None);
+            }
+        }
         let shards: Vec<u32> = map.shards().iter().map(|s| s.id).collect();
         // Every shard asked at once.
         let epoch = map.epoch();
@@ -1549,11 +1582,7 @@ impl Session {
                 let mut out = Vec::new();
                 for row in home_rows {
                     let name = row.first().cloned().flatten().unwrap_or_default();
-                    let probe = format!("SELECT count(*) FROM {}", quote_ident(&name));
-                    let partitioned = matches!(
-                        crate::route::template(&self.core, &self.login.database, rasterizeddb_router::rshard::Source::Shape, &probe, home).await,
-                        Ok(rasterizeddb_router::rshard::RouteTemplate::FanOut { .. })
-                    );
+                    let partitioned = self.partitioned(&name, home).await;
                     let mut merged = row.clone();
                     if partitioned {
                         for c in summed.iter().filter_map(|n| col(n)) {
@@ -1610,8 +1639,13 @@ impl Session {
                             }
                         }
                         seen.iter().sum::<i128>().to_string()
-                    } else if metric == "tables" {
+                    } else if metric == "tables" && kind == 2 {
                         values.iter().filter_map(|(_, v)| v.parse::<i128>().ok()).max().unwrap_or(0).to_string()
+                    } else if kind >= 3
+                        && !NOT_SUMMED.contains(&metric.as_str())
+                        && values.iter().all(|(_, v)| v.parse::<i128>().is_ok())
+                    {
+                        values.iter().filter_map(|(_, v)| v.parse::<i128>().ok()).sum::<i128>().to_string()
                     } else if values.iter().all(|(_, v)| *v == values[0].1) {
                         values.first().map(|(_, v)| v.clone()).unwrap_or_default()
                     } else {
@@ -1622,6 +1656,29 @@ impl Session {
                         r[1] = Some(value);
                     }
                     out.push(r);
+                }
+                // Ratios over the sums, not any one shard's.
+                if kind >= 3 {
+                    let int = |out: &Vec<Vec<Option<String>>>, m: &str| {
+                        out.iter()
+                            .find(|r| r.first().cloned().flatten().as_deref() == Some(m))
+                            .and_then(|r| r.get(1).cloned().flatten())
+                            .and_then(|v| v.parse::<i128>().ok())
+                    };
+                    let (data, slots, dead) = (int(&out, "data_bytes"), int(&out, "row_slots"), int(&out, "reclaimable_bytes"));
+                    for r in out.iter_mut() {
+                        let m = r.first().cloned().flatten().unwrap_or_default();
+                        let v = match (m.as_str(), data, slots, dead) {
+                            ("avg_row_bytes", Some(d), Some(s), _) if s > 0 => Some((d / s).to_string()),
+                            ("dead_ratio", Some(d), _, Some(x)) if d > 0 => Some(format!("{:.1}%", x as f64 * 100.0 / d as f64)),
+                            _ => None,
+                        };
+                        if let Some(v) = v
+                            && r.len() > 1
+                        {
+                            r[1] = Some(v);
+                        }
+                    }
                 }
                 let mut cols = columns.clone();
                 if !cols.is_empty() {
@@ -1644,6 +1701,16 @@ impl Session {
         pg::command_complete(&mut self.out, &format!("SHOW {}", rows.len()));
         pg::ready(&mut self.out, b'I');
         Ok(Some(Outcome::Done { error: false }))
+    }
+
+    /// Whether `table` is spread over the shards (its reads fan out), as
+    /// the home shard's routing template says.
+    async fn partitioned(&mut self, table: &str, home: u32) -> bool {
+        let probe = format!("SELECT count(*) FROM {}", quote_ident(table));
+        matches!(
+            crate::route::template(&self.core, &self.login.database, rasterizeddb_router::rshard::Source::Shape, &probe, home).await,
+            Ok(rasterizeddb_router::rshard::RouteTemplate::FanOut { .. })
+        )
     }
 
     fn partial(&mut self, code: &str, message: &str, applied: &[u32]) -> Outcome {
@@ -1807,6 +1874,14 @@ struct OneStatement {
 }
 
 /// One plain batch's whole reply on `shard`, every chunk fetched.
+/// `SHOW DATABASE STATS` / `SHOW TABLE STATS` metrics that are the same
+/// figure on every shard, or a position rather than an amount: never summed.
+const NOT_SUMMED: &[&str] = &[
+    "tables", "columns", "map_epoch", "route_v", "partitions_declared", "fixed_row_width", "nullable_columns", "dropped_columns",
+    "last_row_id", "next_transaction_id", "oldest_active_transaction", "forgotten_below", "check_constraints", "generated_columns",
+    "default_expressions", "path_indexes", "foreign_keys", "unique_constraints", "unique_indexes", "json_columns", "avg_row_bytes",
+];
+
 pub(crate) async fn collect_pg(core: Rc<Core>, shard: u32, id: u64, req: Vec<u8>) -> Result<Vec<u8>, (String, String)> {
     let link = core.link(shard).map_err(|e| ("08006".to_string(), e))?;
     let mut resp = link.call(&core, &req).await;
