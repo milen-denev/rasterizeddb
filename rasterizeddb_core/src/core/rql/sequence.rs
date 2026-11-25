@@ -487,11 +487,63 @@ pub fn max_of_column(
                 .map(i64::from_le_bytes),
             _ => None,
         };
+        // On a shard, this shard's values carry its id above bit 40
+        // ([`shard_serial`]); the counter is the bits below. A row moved in
+        // from another shard carries that shard's id and says nothing about
+        // this counter.
+        let value = match (value, shard_prefix()) {
+            (Some(v), Some(prefix)) => (v >> SHARD_SERIAL_BITS == prefix as i64).then_some(v & SHARD_SERIAL_MASK),
+            (v, None) => v,
+            (None, _) => None,
+        };
         if let Some(value) = value {
             max = Some(max.map_or(value, |m: i64| m.max(value)));
         }
     }
     max
+}
+
+/// Bits of a sharded `BIGSERIAL` value its counter fills; the shard id is
+/// above them (sharding-plan.md B1a.9): 2⁴⁰ values per shard, and shard ids
+/// up to 2²³ keep every value positive.
+pub const SHARD_SERIAL_BITS: u32 = 40;
+const SHARD_SERIAL_MASK: i64 = (1 << SHARD_SERIAL_BITS) - 1;
+
+/// This node's shard id, when it runs as a shard.
+#[cfg(feature = "sharding")]
+fn shard_prefix() -> Option<u32> {
+    crate::core::shard::map_state::current().map(|s| s.shard_id)
+}
+
+#[cfg(not(feature = "sharding"))]
+fn shard_prefix() -> Option<u32> {
+    None
+}
+
+/// A `SERIAL`-family default's value for a column of `db_type`, from its
+/// counter's `next`. On a plain node, the counter itself. On a shard, every
+/// shard draws from its own counter, so values must not collide across
+/// shards: a `BIGSERIAL` (int8) value is `(shard_id << 40) | counter`, and a
+/// `SERIAL`/`SMALLSERIAL` (int4/int2) column is refused, having no room for
+/// the shard id. Explicit `CREATE SEQUENCE` sequences live on the home shard
+/// and are not prefixed.
+pub fn shard_serial(next: i64, db_type: &crate::core::db_type::DbType) -> Result<i64, String> {
+    use crate::core::db_type::DbType;
+    let Some(shard) = shard_prefix() else {
+        return Ok(next);
+    };
+    if *db_type != DbType::I64 {
+        return Err(format!(
+            "0A000: a {db_type} SERIAL column cannot draw values on a shard: each shard counts on its own, \
+             so values need the shard id in them; use BIGSERIAL or a UUID key"
+        ));
+    }
+    if !(0..=SHARD_SERIAL_MASK).contains(&next) || shard >= (1 << 23) {
+        return Err(format!(
+            "22003: shard {shard}'s BIGSERIAL counter reached {next}, past the {SHARD_SERIAL_BITS}-bit space a shard draws from"
+        ));
+    }
+    Ok(((shard as i64) << SHARD_SERIAL_BITS) | next)
 }
 
 // ---------------------------------------------------------------------------

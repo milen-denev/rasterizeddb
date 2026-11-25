@@ -1,0 +1,55 @@
+[package]
+name = "rasterizeddb_server"
+version = "1.0.0"
+edition = "2024"
+description = "The RasterizedDB server built with its enterprise features (sharding-plan.md §10): the same main as rasterizeddb_core's binary, plus the licensed hooks"
+repository = "https://github.com/milen-denev/rasterizeddb"
+license = "GPL-3.0-only"
+authors = ["Milen Denev"]
+publish = false
+
+# The plain server stays `rasterizeddb_core`'s own binary, built as it always
+# was. This crate compiles the very same main.rs into a second binary that,
+# with `enterprise`, links the licensed crate (LICENSE-POLYFORM-SB) and
+# installs its hooks from `--enterprise-config`.
+[[bin]]
+name = "rasterizeddb_core_enterprise"
+path = "../rasterizeddb_core/src/main.rs"
+
+[dependencies]
+rasterizeddb_core = { path = "../rasterizeddb_core", version = "1.0.0", default-features = false }
+rasterizeddb_enterprise = { path = "../rasterizeddb_enterprise", version = "1.0.0", optional = true }
+# main.rs names it directly when Raft is on.
+rasterizeddb_raft = { path = "../rasterizeddb_raft", version = "1.0.0", optional = true }
+rastcp = { path = "../rastcp", version = "1.0.0" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4.6", features = ["derive"] }
+log = { version = "0.4", features = ["release_max_level_debug"] }
+env_logger = "0.11"
+libmimalloc-sys = "0.1"
+futures = "0.3"
+rclite = "0.4.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["enterprise", "memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3", "query_stats", "kv_cache", "persistent_indexes", "mysql_wire", "mssql_wire", "db_branching", "storage_compression", "sharding"]
+enterprise = ["dep:rasterizeddb_enterprise", "sharding"]
+memory_pool_reuse = ["rasterizeddb_core/memory_pool_reuse"]
+replication_compression = ["rasterizeddb_core/replication_compression"]
+s3_backup = ["rasterizeddb_core/s3_backup"]
+pg_import = ["rasterizeddb_core/pg_import"]
+storage_pools = ["rasterizeddb_core/storage_pools"]
+kv_storage = ["rasterizeddb_core/kv_storage"]
+kv_storage_s3 = ["rasterizeddb_core/kv_storage_s3"]
+query_stats = ["rasterizeddb_core/query_stats"]
+kv_cache = ["rasterizeddb_core/kv_cache"]
+persistent_indexes = ["rasterizeddb_core/persistent_indexes"]
+mysql_wire = ["rasterizeddb_core/mysql_wire"]
+mssql_wire = ["rasterizeddb_core/mssql_wire"]
+db_branching = ["rasterizeddb_core/db_branching"]
+storage_compression = ["rasterizeddb_core/storage_compression"]
+sharding = ["rasterizeddb_core/sharding"]
+sharding_raft = ["rasterizeddb_core/sharding_raft", "dep:rasterizeddb_raft"]
+sharding_2pc = ["rasterizeddb_core/sharding_2pc"]

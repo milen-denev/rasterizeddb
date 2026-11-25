@@ -1,0 +1,23 @@
+[package]
+name = "rasterizeddb_enterprise"
+version = "1.0.0"
+edition = "2024"
+description = "RasterizedDB enterprise features: strict tenant isolation for database-as-a-service and policy-driven data segregation"
+repository = "https://github.com/milen-denev/rasterizeddb"
+# The RasterizedDB Enterprise License 1.0 (PolyForm Small Business 1.0.0's
+# structure with the D10 limits and a GPLv3 §7 combination permission): see LICENSE.
+license-file = "LICENSE"
+authors = ["Milen Denev"]
+# Not published until the licence text is final.
+publish = false
+
+[dependencies]
+rasterizeddb_core = { path = "../rasterizeddb_core", version = "1.0.0", default-features = false, features = ["sharding"] }
+log = "0.4"
+
+[features]
+default = ["tenant_isolation", "segregation_policies"]
+# Strict tenant mode, T1-T10 (docs/sharding-plan.md §4.10).
+tenant_isolation = []
+# Placement policies over shard labels (§4.10, "Enterprise segregation").
+segregation_policies = []

@@ -94,7 +94,9 @@ impl Routine {
 /// A routine statement, parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutineStatement {
-    Create { routine: Routine, or_replace: bool },
+    /// `security_definer`: `SECURITY DEFINER`, kept as an ACL marker
+    /// (`privileges::DEFINER`) rather than in the routine's row.
+    Create { routine: Routine, or_replace: bool, security_definer: bool },
     Drop { kind: RoutineKind, targets: Vec<(String, Option<usize>)>, if_exists: bool },
     Call { name: String, args: Vec<String> },
 }
@@ -261,6 +263,7 @@ fn parse_create(text: &str, kind: RoutineKind, or_replace: bool) -> Result<Routi
 
     let mut return_type = String::new();
     let mut returns_set = false;
+    let mut security_definer = false;
     let mut language: Option<String> = None;
     let mut body: Option<String> = None;
     while !tail.is_empty() {
@@ -327,7 +330,8 @@ fn parse_create(text: &str, kind: RoutineKind, or_replace: bool) -> Result<Routi
             "NOT" if upper.starts_with("NOT LEAKPROOF") => tail = tail["NOT LEAKPROOF".len()..].trim_start(),
             "CALLED" if upper.starts_with("CALLED ON NULL INPUT") => tail = tail["CALLED ON NULL INPUT".len()..].trim_start(),
             "SECURITY" => {
-                let skip = if upper.starts_with("SECURITY DEFINER") { "SECURITY DEFINER" } else { "SECURITY INVOKER" };
+                security_definer = upper.starts_with("SECURITY DEFINER");
+                let skip = if security_definer { "SECURITY DEFINER" } else { "SECURITY INVOKER" };
                 tail = tail[skip.len().min(tail.len())..].trim_start();
             }
             "PARALLEL" | "COST" | "ROWS" => {
@@ -358,7 +362,7 @@ fn parse_create(text: &str, kind: RoutineKind, or_replace: bool) -> Result<Routi
         language,
         body: body.trim().to_string(),
     };
-    Ok(RoutineStatement::Create { routine, or_replace })
+    Ok(RoutineStatement::Create { routine, or_replace, security_definer })
 }
 
 fn parse_drop(text: &str, kind: RoutineKind) -> Result<RoutineStatement, Refusal> {
@@ -541,6 +545,15 @@ struct Call {
 /// Every `name(…)` in `sql` outside literals, quoted identifiers and
 /// comments, whose name is one of `names` and which is not qualified by
 /// another relation (`t.f(…)` is no call here).
+/// The names of the routines of `database` that `sql` calls.
+pub fn called_routines(database: &Database, sql: &str) -> Vec<String> {
+    let known = |n: &str| database.functions.names.contains_key(n);
+    let mut out: Vec<String> = calls_in(sql, &known).into_iter().map(|c| c.name).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn calls_in(sql: &str, names: &dyn Fn(&str) -> bool) -> Vec<Call> {
     let bytes = sql.as_bytes();
     let mut out = Vec::new();
@@ -755,10 +768,26 @@ fn call_text(routine: &Routine, args: &[String], in_from: bool, alias: &str) -> 
 
 /// `sql` with every call of a routine of `database` inlined, recursively;
 /// `Ok(None)` when it calls none. See the module comment.
-pub async fn inline_calls(database: &Arc<Database>, sql: &str, tx: Option<TxId>) -> Result<Option<String>, Refusal> {
+///
+/// `role`, when given, must hold EXECUTE on each function called (R2;
+/// `privileges::may_execute`); `None` checks nothing (a superuser, a
+/// describe that runs nothing).
+///
+/// `invokers_only` leaves a `SECURITY DEFINER` function's call as written:
+/// the caller's privileges are checked on the text before those are put in
+/// (`privilege_statements::definer_refusal` checks their bodies as their
+/// owners), so their bodies are inlined after, by a second call.
+pub async fn inline_calls(
+    database: &Arc<Database>,
+    sql: &str,
+    tx: Option<TxId>,
+    role: Option<&str>,
+    invokers_only: bool,
+) -> Result<Option<String>, Refusal> {
     if !may_call_a_routine(database, sql).await {
         return Ok(None);
     }
+    let mut acl: Option<std::sync::Arc<Vec<crate::core::rql::privileges::AclRow>>> = None;
     let mut cache: std::collections::HashMap<String, Vec<Routine>> = std::collections::HashMap::new();
     let mut text = sql.to_string();
     let mut changed = false;
@@ -794,6 +823,22 @@ pub async fn inline_calls(database: &Arc<Database>, sql: &str, tx: Option<TxId>)
             else {
                 continue;
             };
+            if role.is_some() || invokers_only {
+                if acl.is_none() {
+                    acl = Some(crate::core::rql::privileges::load_shared(database, tx).await.map_err(|e| ("XX000", e))?);
+                }
+            }
+            let key = format!("@function:{}", routine.name);
+            if invokers_only
+                && acl.as_deref().is_some_and(|rows| crate::core::rql::privileges::is_definer(rows, &key))
+            {
+                continue;
+            }
+            if let Some(role) = role {
+                if !crate::core::rql::privileges::may_execute(acl.as_deref().map(Vec::as_slice).unwrap_or_default(), role, &key) {
+                    return Err(("42501", format!("permission denied for function {}", routine.name)));
+                }
+            }
             let from = from_items.iter().find(|(start, _)| *start == call.span.start);
             let text_for = match from {
                 Some((_, aliased)) => {

@@ -460,11 +460,10 @@ async fn a_merge_applies_what_the_branch_did() {
     );
     // The table the merge created is the merging role's, not an internal
     // session's that no role is.
-    assert_eq!(
-        prod.rows("SELECT grantee FROM __rdb_acl WHERE relation = 'tags' AND privilege = 'OWNER'")
-            .await,
-        vec![vec!["tester".to_string()]]
-    );
+    // (Read through the engine: no client statement reaches __rdb_acl.)
+    let prod_db = fx.catalog.get("prod").expect("prod");
+    let acl = crate::core::rql::privileges::load_shared(&prod_db, None).await.unwrap();
+    assert_eq!(crate::core::rql::privileges::owner_of(&acl, "tags"), Some("tester"));
 
     // Merged once: nothing is offered again.
     let again = admin.rows("SHOW BRANCH DIFF dev").await;
@@ -609,9 +608,11 @@ async fn refusals_name_the_problem() {
     assert!(e.1.contains("no merge base"), "{e:?}");
     let e = admin.try_exec("MERGE BRANCH prod").await.unwrap_err();
     assert_eq!(e.0, "42704", "{e:?}");
+    // From the branch itself: refused before anything else, as a session of
+    // a database that is not the operator's administers no branch (R1).
     let mut dev = fx.client("dev");
     let e = dev.try_exec("RESET BRANCH dev").await.unwrap_err();
-    assert!(e.1.contains("connected"), "{e:?}");
+    assert!(e.0 == "42501" || e.1.contains("connected"), "{e:?}");
     admin.exec("BEGIN").await;
     let e = admin
         .try_exec("CREATE BRANCH other FROM prod")
@@ -961,7 +962,11 @@ async fn a_table_on_a_second_disk_comes_over_as_the_branchs_own() {
     let disk = tempfile::tempdir().unwrap();
     let disk_path = disk.path().to_string_lossy().into_owned();
     let mut prod = fx.client("prod");
-    prod.exec(&format!("STORAGE ADD LOCATION '{disk_path}'")).await;
+    // Adding a location is the operator's, from the default database, and
+    // reaches that database's pool only: registered on prod's through the
+    // engine, which is what this test is about.
+    let prod_db = fx.catalog.get("prod").expect("prod");
+    crate::core::storage::sql::execute(&format!("STORAGE ADD LOCATION '{disk_path}'"), &prod_db).await.unwrap();
     prod.exec(&format!("STORAGE PLACE TABLE far AT '{disk_path}'")).await;
     prod.exec("CREATE TABLE far (id INT PRIMARY KEY, what TEXT)").await;
     let rows: Vec<String> = (0..50).map(|i| format!("({i}, 'f{i}')")).collect();
@@ -1061,11 +1066,18 @@ async fn a_table_on_a_store_comes_over_as_the_branchs_own() {
     let fx = seeded("kv").await;
     let kv = fx.root.join("kvstore");
     let mut prod = fx.client("prod");
-    prod.exec(&format!(
-        "STORAGE ADD STORE scratch DIRECTORY WITH (PATH = '{}', PREFIX = 'scratch', CHUNK_SIZE = '16KiB', PAGE_SIZE = '4KiB')",
-        kv.display()
-    ))
-    .await;
+    // A store is the server's (the operator's to add): added through the
+    // engine, as the location test does.
+    let prod_db = fx.catalog.get("prod").expect("prod");
+    crate::core::storage::sql::execute(
+        &format!(
+            "STORAGE ADD STORE scratch DIRECTORY WITH (PATH = '{}', PREFIX = 'scratch', CHUNK_SIZE = '16KiB', PAGE_SIZE = '4KiB')",
+            kv.display()
+        ),
+        &prod_db,
+    )
+    .await
+    .unwrap();
     prod.exec("STORAGE PLACE TABLE events AT 'kv:scratch'").await;
     prod.exec("CREATE TABLE events (id INT PRIMARY KEY, what TEXT)").await;
     for i in 0..50 {

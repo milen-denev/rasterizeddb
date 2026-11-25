@@ -20,7 +20,7 @@ where
     let read_only = state.transaction.as_ref().map(|t| t.read_only).unwrap_or(state.default_read_only);
     let tx = state.current_tx();
     match statement {
-        RoutineStatement::Create { routine, or_replace } => {
+        RoutineStatement::Create { routine, or_replace, security_definer } => {
             let verb = if routine.kind == RoutineKind::Function { "CREATE FUNCTION" } else { "CREATE PROCEDURE" };
             if read_only {
                 return fail_statement(state, stream, "25006", &read_only_message(verb)).await;
@@ -53,6 +53,31 @@ where
                 }
             }
             if let Err(e) = functions::store(database, &routine, existing.is_some(), tx).await {
+                return fail_statement(state, stream, sqlstate_for(&e), &e).await;
+            }
+            // SECURITY DEFINER as a marker beside its owner; a replacement
+            // without it runs as its callers again.
+            let kind = if routine.kind == RoutineKind::Procedure { "procedure" } else { "function" };
+            let key = format!("@{kind}:{}", routine.name);
+            // Held by no role (`-`): a role's DROP or DROP OWNED would
+            // otherwise take it away and change what the function does.
+            let marker = crate::core::rql::privileges::AclRow {
+                relation: key.clone(),
+                grantee: "-".to_string(),
+                privilege: crate::core::rql::privileges::DEFINER.to_string(),
+                grantor: state.principal.name.clone(),
+                grantable: false,
+            };
+            let filter = format!(
+                "relation = {} AND privilege = {}",
+                crate::auth::quote(&key),
+                crate::auth::quote(crate::core::rql::privileges::DEFINER)
+            );
+            let mut written = crate::core::rql::privileges::delete_where(database, &filter, tx).await;
+            if security_definer && written.is_ok() {
+                written = crate::core::rql::privileges::put(database, &marker, tx).await;
+            }
+            if let Err(e) = written {
                 return fail_statement(state, stream, sqlstate_for(&e), &e).await;
             }
             send_command_complete(stream, verb).await
@@ -106,6 +131,13 @@ where
                     if let Err(e) = functions::remove(database, routine, tx).await {
                         return fail_statement(state, stream, sqlstate_for(&e), &e).await;
                     }
+                    // Its owner, grants and PUBLIC marker go with it: kept, a
+                    // routine made later under the name had them all.
+                    let kind = if routine.kind == RoutineKind::Procedure { "procedure" } else { "function" };
+                    let filter = format!("relation = {}", crate::auth::quote(&format!("@{kind}:{}", routine.name)));
+                    if let Err(e) = crate::core::rql::privileges::delete_where(database, &filter, tx).await {
+                        return fail_statement(state, stream, sqlstate_for(&e), &e).await;
+                    }
                 }
             }
             send_command_complete(stream, verb).await
@@ -116,6 +148,15 @@ where
             else {
                 return fail_statement(state, stream, "42883", &format!("procedure {name}() does not exist")).await;
             };
+            if !state.principal.may_administer() && !state.view_internal {
+                // Unreadable, refused: no checks are skipped (R0).
+                let allowed = crate::core::rql::privileges::load_shared(database, tx).await.is_ok_and(|rows| {
+                    crate::core::rql::privileges::may_execute(&rows, &state.principal.name, &format!("@procedure:{}", routine.name))
+                });
+                if !allowed {
+                    return fail_statement(state, stream, "42501", &format!("permission denied for procedure {}", routine.name)).await;
+                }
+            }
             let statements = match functions::procedure_statements(&routine, &args) {
                 Ok(statements) => statements,
                 Err((code, message)) => return fail_statement(state, stream, code, &message).await,

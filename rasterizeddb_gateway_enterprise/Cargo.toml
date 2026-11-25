@@ -1,0 +1,36 @@
+[package]
+name = "rasterizeddb_gateway_enterprise"
+version = "1.0.0"
+edition = "2024"
+description = "RasterizedDB gateway enterprise features: per-user shards (G11) for database-as-a-service"
+repository = "https://github.com/milen-denev/rasterizeddb"
+# The RasterizedDB Enterprise License 1.0 (PolyForm Small Business 1.0.0's
+# structure with the D10 limits and a GPLv3 §7 combination permission): see LICENSE.
+license-file = "LICENSE"
+authors = ["Milen Denev"]
+publish = false
+
+[[bin]]
+name = "rasterizeddb_gateway_enterprise"
+path = "src/main.rs"
+
+[dependencies]
+rasterizeddb_gateway = { path = "../rasterizeddb_gateway", version = "1.0.0" }
+env_logger = "0.11"
+log = "0.4"
+tokio = { version = "1.54", features = ["rt", "sync", "time", "macros"] }
+serde_json = "1"
+# The statistics' history, kept in an embedded engine (client_stats_embedded).
+rasterizeddb_embedded = { path = "../rasterizeddb_embedded", optional = true }
+rasterizeddb_client = { path = "../rasterizeddb_client", default-features = false }
+
+[features]
+default = ["user_routing", "client_stats", "client_stats_embedded"]
+# Per-user shards (G11): a login locked to its shard.
+user_routing = []
+# Per-client statistics: latency, errors, client traffic and shard traffic
+# before and after compression (SHOW CLIENT STATS, the metrics endpoint).
+client_stats = []
+# Their history, in intervals, kept in an embedded RasterizedDB
+# (--client-stats-dir; SHOW CLIENT STATS HISTORY).
+client_stats_embedded = ["client_stats", "dep:rasterizeddb_embedded"]

@@ -558,10 +558,33 @@ async fn handshake(
         shared.config.auth
     };
     let principal = match method {
-        MsAuth::Trust => ProxiedLogin {
+        // As the named role, with its attributes (`auth::trust_login`).
+        MsAuth::Trust => match crate::auth::trust_login(&database, &login.user, Some(&shared.config.bootstrap_user)).await {
+            Ok(superuser) => ProxiedLogin {
+                user: login.user.clone(),
+                superuser,
+                authenticated: false,
+                database: database_name.clone(),
+                verifier: None,
+                bootstrap_user: Some(shared.config.bootstrap_user.clone()),
+                upstream_password: None,
+            },
+            Err(_) => {
+                refuse(wire, 18456, &format!("Login failed for user '{}'.", login.user));
+                wire.send(tds::PT_REPLY).await?;
+                return Ok(None);
+            }
+        },
+        // A front-end node (B4.7) holds no roles: the login's password goes
+        // to the gateway, which checks it.
+        MsAuth::Password if crate::pgwire::proxied::upstream().is_some() => ProxiedLogin {
             user: login.user.clone(),
             superuser: false,
-            authenticated: false,
+            authenticated: true,
+            database: database_name.clone(),
+            verifier: None,
+            bootstrap_user: None,
+            upstream_password: Some(crate::pgwire::proxied::Secret(login.password.clone())),
         },
         MsAuth::Password => {
             let role = crate::auth::lookup_role(&database, &login.user).await;
@@ -579,10 +602,16 @@ async fn handshake(
                 wire.send(tds::PT_REPLY).await?;
                 return Ok(None);
             }
+            // RD3: an md5 verifier's login is warned about.
+            crate::auth::warn_if_md5_login(Some(&verifier), &login.user, &database_name, "tds");
             ProxiedLogin {
                 user: login.user.clone(),
-                superuser: role.map(|r| r.is_superuser).unwrap_or(false),
+                superuser: role.as_ref().map(|r| r.is_superuser).unwrap_or(false),
                 authenticated: true,
+                database: database_name.clone(),
+                verifier: role.and_then(|r| r.verifier).map(|v| v.to_stored()),
+                bootstrap_user: None,
+                upstream_password: None,
             }
         }
     };
@@ -648,14 +677,16 @@ impl Env for Scope<'_> {
         Some(self.s.shared.catalog.default_name().to_string())
     }
     fn databases(&self) -> Vec<String> {
+        let ctx = crate::core::policy_hooks::SessionContext {
+            role: &self.s.login.user,
+            database: self.database_name(),
+            protocol: "tds",
+            superuser: self.s.login.superuser,
+        };
+        let visible = crate::core::policy_hooks::visible_databases(&ctx, self.s.shared.catalog.names());
+        // Each as it was declared (`CREATE DATABASE [MyApp]`).
         let shown = self.s.shared.database_names.lock();
-        self.s
-            .shared
-            .catalog
-            .names()
-            .into_iter()
-            .map(|n| shown.as_ref().and_then(|m| m.get(&n).cloned()).unwrap_or(n))
-            .collect()
+        visible.into_iter().map(|n| shown.as_ref().and_then(|m| m.get(&n).cloned()).unwrap_or(n)).collect()
     }
     fn variable(&self, name: &str) -> Option<Value> {
         self.s.vars.get(name).map(|v| v.value.clone())
@@ -748,7 +779,7 @@ impl Env for Scope<'_> {
             "ERROR_PROCEDURE" => Value::Null,
             "XACT_STATE" => Value::Int((s.trancount > 0) as i64),
             "IS_SRVROLEMEMBER" | "IS_MEMBER" => {
-                Value::Int((!s.login.authenticated || s.login.superuser) as i64)
+                Value::Int(s.login.superuser as i64)
             }
             "HAS_DBACCESS" => Value::Int(1),
             "SESSIONPROPERTY" => Value::Int(1),
@@ -991,6 +1022,9 @@ impl Session {
         let options = self.bridge_options(database);
         match PgBridge::open(self.shared.catalog.clone(), database, options).await {
             Ok(b) => {
+                // What this database made of the login (its own role's
+                // attributes), for this front end's own checks.
+                self.login = b.login.clone();
                 if let Some(old) = self.bridge.replace(b) {
                     old.terminate().await;
                 }
@@ -1006,6 +1040,14 @@ impl Session {
                 922,
                 format!(
                     "Database '{database}' is being recovered. Waiting until recovery is finished."
+                ),
+            )),
+            Err(OpenRefused::Denied(why)) => Err(TsqlError::new(
+                916,
+                format!(
+                    "The server principal \"{}\" is not able to access the database \"{database}\" under the current \
+                     security context: {why}",
+                    self.login.user
                 ),
             )),
             Err(OpenRefused::Io(e)) => Err(TsqlError::new(50000, e.to_string())),
@@ -1163,8 +1205,20 @@ impl Session {
     // -----------------------------------------------------------------------
 
     async fn silent(&mut self, sql: &str) -> Result<String, PgNotice> {
+        self.silent_as(sql, false).await
+    }
+
+    /// [`Self::silent`], or with `system` this front end's own statement on
+    /// its catalogue (`__rdb_routines`), announced so the session's
+    /// catalogue guard lets it through (`PgBridge::system_query`). Never
+    /// `system` for a client's text.
+    async fn silent_as(&mut self, sql: &str, system: bool) -> Result<String, PgNotice> {
         let b = self.bridge();
-        b.query(sql);
+        if system {
+            b.system_query(sql);
+        } else {
+            b.query(sql);
+        }
         let mut error = None;
         let mut tag = String::new();
         loop {
@@ -1215,8 +1269,22 @@ impl Session {
         sql: &str,
         params: &[(i16, Option<Vec<u8>>, u32)],
     ) -> Result<(Vec<PgField>, Vec<Vec<Option<String>>>, String), PgNotice> {
+        self.query_bound_as(sql, params, false).await
+    }
+
+    /// [`Self::query_bound`]; with `system`, as [`Self::silent_as`] says,
+    /// and with no parameters (the announcement covers a simple query).
+    async fn query_bound_as(
+        &mut self,
+        sql: &str,
+        params: &[(i16, Option<Vec<u8>>, u32)],
+        system: bool,
+    ) -> Result<(Vec<PgField>, Vec<Vec<Option<String>>>, String), PgNotice> {
         let b = self.bridge();
-        if params.is_empty() {
+        if system {
+            debug_assert!(params.is_empty(), "a catalogue statement carries its values as literals");
+            b.system_query(sql);
+        } else if params.is_empty() {
             b.query(sql);
         } else {
             let oids: Vec<u32> = params.iter().map(|p| p.2).collect();
@@ -2106,7 +2174,27 @@ impl Session {
                 return Ok(Ok(Flow::Next));
             }
         }
+        // Logins, users, roles and permissions, as the engine's role
+        // statements (`accounts`).
+        let account = match head.as_str() {
+            "CREATE" | "ALTER" | "DROP" | "GRANT" | "REVOKE" | "DENY" => super::accounts::translate(tokens),
+            _ => None,
+        };
         let r: Result<Flow, TsqlError> = match head.as_str() {
+            _ if account.is_some() => match account.expect("checked just above") {
+                Ok(statements) => {
+                    let mut out = Ok(Flow::Next);
+                    for sql in statements {
+                        if let Err(e) = self.silent(&sql).await {
+                            out = Err(error_from_engine(&e));
+                            break;
+                        }
+                    }
+                    self.statement_done(0, 0, 0);
+                    out
+                }
+                Err(e) => Err(e),
+            },
             "INSERT" if next == "BULK" => self.insert_bulk(tokens),
             "DECLARE" => self.declare(tokens, params).await,
             "DROP" if matches!(next.as_str(), "PROC" | "PROCEDURE") => {
@@ -3319,10 +3407,6 @@ fn procedure_name(raw: &str) -> String {
         .unwrap_or_else(|| raw.to_lowercase())
 }
 
-fn text_param(v: &str) -> (i16, Option<Vec<u8>>, u32) {
-    (0, Some(v.as_bytes().to_vec()), 25)
-}
-
 const ROUTINE_SAVEPOINT: &str = "rdb_tds_routine";
 
 /// Procedures, table variables, cursors and the scopes they live in.
@@ -3460,17 +3544,43 @@ impl Session {
         r
     }
 
-    async fn fetch_guarded(
+    /// [`Self::silent_guarded`] for this front end's own statement on its
+    /// catalogue ([`Self::silent_as`]).
+    async fn system_guarded(&mut self, sql: &str) -> Result<String, PgNotice> {
+        let guard = self.bridge().in_block();
+        if guard {
+            self.silent(&format!("SAVEPOINT {ROUTINE_SAVEPOINT}"))
+                .await?;
+        }
+        let r = self.silent_as(sql, true).await;
+        if guard {
+            if r.is_err() {
+                let _ = self
+                    .silent(&format!("ROLLBACK TO SAVEPOINT {ROUTINE_SAVEPOINT}"))
+                    .await;
+            }
+            let _ = self
+                .silent(&format!("RELEASE SAVEPOINT {ROUTINE_SAVEPOINT}"))
+                .await;
+        }
+        r
+    }
+
+    /// A savepoint-guarded query (as [`Self::silent_guarded`]) for this front end's own read or write of its
+    /// catalogue ([`Self::silent_as`]): its values written into `sql`.
+    async fn system_fetch_guarded(
         &mut self,
         sql: &str,
-        params: &[(i16, Option<Vec<u8>>, u32)],
     ) -> Result<(Vec<u32>, Vec<Vec<Option<String>>>), PgNotice> {
         let guard = self.bridge().in_block();
         if guard {
             self.silent(&format!("SAVEPOINT {ROUTINE_SAVEPOINT}"))
                 .await?;
         }
-        let r = self.fetch(sql, params).await;
+        let r = self
+            .query_bound_as(sql, &[], true)
+            .await
+            .map(|(fields, rows, _)| (fields.iter().map(|f| f.type_oid).collect(), rows));
         if guard {
             if r.is_err() {
                 let _ = self
@@ -3772,9 +3882,8 @@ impl Session {
         let mut found = Vec::new();
         if self.has_routine_table() {
             if let Ok((_, rows)) = self
-                .fetch_guarded(
+                .system_fetch_guarded(
                     "SELECT name, definition FROM __rdb_routines WHERE dialect = 'tsql' ORDER BY name",
-                    &[],
                 )
                 .await
             {
@@ -3795,10 +3904,10 @@ impl Session {
             return Ok(None);
         }
         let (_, rows) = self
-            .fetch_guarded(
-                "SELECT definition FROM __rdb_routines WHERE name = $1 AND dialect = 'tsql'",
-                &[text_param(name)],
-            )
+            .system_fetch_guarded(&format!(
+                "SELECT definition FROM __rdb_routines WHERE name = {} AND dialect = 'tsql'",
+                crate::sqlcompat::string_sql(name.as_bytes())
+            ))
             .await
             .map_err(|e| self.engine_error(&e))?;
         Ok(rows
@@ -3848,15 +3957,15 @@ impl Session {
             return Err(taken());
         }
         if !self.has_routine_table() {
-            self.silent_guarded(routines::CREATE_ROUTINE_TABLE)
+            self.system_guarded(routines::CREATE_ROUTINE_TABLE)
                 .await
                 .map_err(|e| self.engine_error(&e))?;
         }
         let (_, rows) = self
-            .fetch_guarded(
-                "SELECT dialect FROM __rdb_routines WHERE name = $1",
-                &[text_param(&def.name)],
-            )
+            .system_fetch_guarded(&format!(
+                "SELECT dialect FROM __rdb_routines WHERE name = {}",
+                crate::sqlcompat::string_sql(def.name.as_bytes())
+            ))
             .await
             .map_err(|e| self.engine_error(&e))?;
         let existing = rows
@@ -3874,12 +3983,17 @@ impl Session {
             }
             _ => {}
         }
+        let lit = |v: &str| crate::sqlcompat::string_sql(v.as_bytes());
         let sql = if existing.is_some() {
-            "UPDATE __rdb_routines SET definition = $2 WHERE name = $1"
+            format!("UPDATE __rdb_routines SET definition = {} WHERE name = {}", lit(&definition), lit(&def.name))
         } else {
-            "INSERT INTO __rdb_routines (name, dialect, definition) VALUES ($1, 'tsql', $2)"
+            format!(
+                "INSERT INTO __rdb_routines (name, dialect, definition) VALUES ({}, 'tsql', {})",
+                lit(&def.name),
+                lit(&definition)
+            )
         };
-        self.fetch_guarded(sql, &[text_param(&def.name), text_param(&definition)])
+        self.system_fetch_guarded(&sql)
             .await
             .map_err(|e| self.engine_error(&e))?;
         self.routine_cache = None;
@@ -3904,7 +4018,7 @@ impl Session {
         for name in names {
             let removed = if self.has_routine_table() {
                 let tag = self
-                    .silent_guarded(&format!(
+                    .system_guarded(&format!(
                         "DELETE FROM __rdb_routines WHERE name = {} AND dialect = 'tsql'",
                         crate::sqlcompat::string_sql(name.as_bytes())
                     ))

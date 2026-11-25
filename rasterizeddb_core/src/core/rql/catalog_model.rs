@@ -461,6 +461,11 @@ pub(crate) struct Rel {
     /// compresses its row tails (`core::compression`); empty otherwise, which
     /// is listed as NULL, as PostgreSQL lists a table with no options.
     pub options: Vec<String>,
+    /// `pg_class.relacl` as aclitem text (`alice=arw/owner`); empty, listed
+    /// as NULL, while the relation has its owner's default rights only.
+    pub acl: Vec<String>,
+    /// Row-level security on, and forced on its owner (R3).
+    pub rls: (bool, bool),
 }
 
 /// A role, as `pg_roles` lists it.
@@ -470,6 +475,127 @@ pub(crate) struct RoleRow {
     pub name: String,
     pub superuser: bool,
     pub login: bool,
+    pub create_role: bool,
+    pub create_db: bool,
+    /// `-1`: no limit.
+    pub conn_limit: i64,
+    pub valid_until_us: Option<i64>,
+    /// `ALTER ROLE … SET` values, `param=value`.
+    pub config: Vec<String>,
+    pub bypass_rls: bool,
+}
+
+/// One privilege one role holds on one object.
+#[derive(Debug, Clone)]
+pub(crate) struct GrantRow {
+    pub grantor: String,
+    pub grantee: String,
+    pub object: String,
+    /// `TABLE`, `SEQUENCE`, `FUNCTION` or `PROCEDURE`.
+    pub kind: &'static str,
+    pub privilege: String,
+    pub grantable: bool,
+}
+
+/// The grants on the relations `rels` lists and on routines, with each
+/// owner's own privileges first (held with their grant option, as an
+/// owner's are).
+fn grants(acl: &[crate::core::rql::privileges::AclRow], rels: &[Rel]) -> Vec<GrantRow> {
+    use crate::core::rql::privileges::{ROUTINE_PRIVILEGES, SEQUENCE_PRIVILEGES, TABLE_PRIVILEGES};
+    let kind_of = |object: &str| -> Option<(&'static str, &'static [&'static str], String)> {
+        if let Some(name) = object.strip_prefix("@function:") {
+            return Some(("FUNCTION", ROUTINE_PRIVILEGES, name.to_string()));
+        }
+        if let Some(name) = object.strip_prefix("@procedure:") {
+            return Some(("PROCEDURE", ROUTINE_PRIVILEGES, name.to_string()));
+        }
+        let rel = rels.iter().find(|r| r.name == object)?;
+        Some(if rel.kind == "S" { ("SEQUENCE", SEQUENCE_PRIVILEGES, rel.name.clone()) } else { ("TABLE", TABLE_PRIVILEGES, rel.name.clone()) })
+    };
+    let mut out = Vec::new();
+    for owner in acl.iter().filter(|a| a.privilege == "OWNER") {
+        let Some((kind, all, object)) = kind_of(&owner.relation) else { continue };
+        for p in all {
+            out.push(GrantRow {
+                grantor: owner.grantee.clone(),
+                grantee: owner.grantee.clone(),
+                object: object.clone(),
+                kind,
+                privilege: p.to_string(),
+                grantable: true,
+            });
+        }
+    }
+    for a in acl.iter().filter(|a| a.privilege != "OWNER" && acl_letter(&a.privilege).is_some()) {
+        let Some((kind, all, object)) = kind_of(&a.relation) else { continue };
+        if !all.contains(&a.privilege.as_str()) {
+            continue;
+        }
+        out.push(GrantRow {
+            grantor: a.grantor.clone(),
+            grantee: if a.grantee == "public" { "PUBLIC".to_string() } else { a.grantee.clone() },
+            object,
+            kind,
+            privilege: a.privilege.clone(),
+            grantable: a.grantable,
+        });
+    }
+    out
+}
+
+/// Each role's default privileges per kind (`@default:role[:kind]`), as
+/// aclitems, PUBLIC's EXECUTE taken away where a marker says so.
+fn default_acls(acl: &[crate::core::rql::privileges::AclRow], roles: &[RoleRow]) -> Vec<(i64, &'static str, Vec<String>)> {
+    use crate::core::rql::privileges::{DefaultKind, NOEXECUTE};
+    let mut out = Vec::new();
+    for role in roles {
+        for (kind, letter) in [(DefaultKind::Tables, "r"), (DefaultKind::Sequences, "S"), (DefaultKind::Functions, "f")] {
+            let key = kind.relation(&role.name);
+            let rows: Vec<&crate::core::rql::privileges::AclRow> = acl.iter().filter(|a| a.relation == key).collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let mut items: Vec<String> = Vec::new();
+            let mut by_grantee: Vec<(&str, String)> = Vec::new();
+            for r in rows.iter().filter(|r| r.privilege != NOEXECUTE) {
+                let Some(letter) = acl_letter(&r.privilege) else { continue };
+                match by_grantee.iter_mut().find(|(g, _)| *g == r.grantee) {
+                    Some((_, l)) => l.push(letter),
+                    None => by_grantee.push((r.grantee.as_str(), letter.to_string())),
+                }
+            }
+            // A function's defaults name PUBLIC's EXECUTE only by taking it
+            // away: listed, as PostgreSQL lists them, with the owner's own.
+            if kind == DefaultKind::Functions && rows.iter().any(|r| r.privilege == NOEXECUTE) {
+                items.push(format!("{}=X/{}", acl_name(&role.name), acl_name(&role.name)));
+            }
+            for (grantee, letters) in by_grantee {
+                let grantee = if grantee == "public" { String::new() } else { acl_name(grantee) };
+                items.push(format!("{grantee}={letters}/{}", acl_name(&role.name)));
+            }
+            out.push((role.oid, letter, items));
+        }
+    }
+    out
+}
+
+/// Where `pg_auth_members` row oids start: above the fixed catalogue oids,
+/// below the hashed oids of user objects' usual range.
+const AUTH_MEMBERS_OID_BASE: i64 = 60_000;
+/// Where `pg_policy` row oids start.
+const POLICY_OID_BASE: i64 = 64_000;
+/// Where `pg_default_acl` row oids start.
+const DEFAULT_ACL_OID_BASE: i64 = 62_000;
+
+/// One role membership (`GRANT role TO member`), with its options (R2).
+#[derive(Debug, Clone)]
+pub(crate) struct MemberRow {
+    pub roleid: i64,
+    pub member: i64,
+    pub grantor: i64,
+    pub admin: bool,
+    pub inherit: bool,
+    pub set: bool,
 }
 
 /// A user's function or procedure, as `pg_proc` lists it.
@@ -507,6 +633,16 @@ pub(crate) struct Model {
     pub database: String,
     pub rels: Vec<Rel>,
     pub roles: Vec<RoleRow>,
+    /// Role memberships, as `pg_auth_members` lists them.
+    pub memberships: Vec<MemberRow>,
+    /// Every privilege held on a table, view, sequence or routine, the
+    /// owners' own included: the `information_schema` privilege views.
+    pub grants: Vec<GrantRow>,
+    /// Row-level security policies, as `pg_policy` lists them.
+    pub policies: Vec<crate::core::rql::policies::Policy>,
+    /// Default privileges, as `pg_default_acl` lists them: (owner oid,
+    /// object type letter, aclitems).
+    pub default_acls: Vec<(i64, &'static str, Vec<String>)>,
     pub procs: Vec<ProcRow>,
     /// The enum types (`user_types`).
     pub enums: Vec<crate::core::rql::user_types::EnumType>,
@@ -1073,7 +1209,7 @@ pub(crate) async fn build_model(
     } else {
         Vec::new()
     };
-    let roles = roles(database).await;
+    let roles = roles(database, &acl).await;
     let owner = |relation: &str| {
         crate::core::rql::privileges::owner_of(&acl, relation)
             .and_then(|o| roles.iter().find(|r| r.name == o).map(|r| r.oid))
@@ -1086,10 +1222,15 @@ pub(crate) async fn build_model(
         .filter(|v| v.kind == crate::core::rql::views::ViewKind::Materialized)
         .map(|v| v.name.as_str())
         .collect();
+    // Not the role catalogue: a system catalogue, as `pg_authid` is to
+    // PostgreSQL, which no client statement may read whole
+    // (`privileges::catalog_refusal`). Listed here, `pg_dump` dumped it with
+    // a `COPY` that the guard refuses, and every dump failed.
     for name in gathered
         .tables
         .iter()
         .map(String::as_str)
+        .filter(|name| *name != crate::auth::ROLE_TABLE)
         .chain(materialized.iter().copied())
     {
         let Some(relation) = database.relation(name) else {
@@ -1119,6 +1260,8 @@ pub(crate) async fn build_model(
             Relation::Plain(_) => Vec::new(),
         };
         rels.push(Rel {
+            acl: Vec::new(),
+            rls: (false, false),
             oid: oid_of(name),
             name: name.to_string(),
             kind: if materialized.contains(&name) {
@@ -1199,6 +1342,8 @@ pub(crate) async fn build_model(
             })
             .collect();
         rels.push(Rel {
+            acl: Vec::new(),
+            rls: (false, false),
             oid: oid_of(&view.name),
             name: view.name.clone(),
             kind: "v",
@@ -1219,6 +1364,8 @@ pub(crate) async fn build_model(
             kind: "S",
             partition_key: Vec::new(),
             options: Vec::new(),
+            acl: Vec::new(),
+            rls: (false, false),
             owner: owner(name),
             columns: Vec::new(),
             indexes: Vec::new(),
@@ -1228,14 +1375,118 @@ pub(crate) async fn build_model(
         });
     }
     let procs = procs(database, tx).await;
+    // Boxed: inline, the model future grew past what the Send check of a
+    // caller that spawns it can follow.
+    let policies = Box::pin(crate::core::rql::policies::load(database, None, tx)).await.unwrap_or_default();
     let enums = crate::core::rql::user_types::load(database, None, tx).await.unwrap_or_default();
-    Model { database: database.name.clone(), rels, roles, procs, enums }
+    // Grouped once, so each relation reads its own rows and not the whole
+    // ACL (`aclitems` needs only those: the owner's row has the same key).
+    let mut by_relation: HashMap<&str, Vec<crate::core::rql::privileges::AclRow>> = HashMap::new();
+    for a in &acl {
+        by_relation.entry(a.relation.as_str()).or_default().push(a.clone());
+    }
+    for rel in &mut rels {
+        if let Some(rows) = by_relation.get(rel.name.as_str()) {
+            rel.acl = aclitems(rows, &rel.name);
+            rel.rls = crate::core::rql::policies::rls_state(rows, &rel.name);
+        }
+    }
+    let memberships = memberships(&acl, &roles);
+    let grants = grants(&acl, &rels);
+    let default_acls = default_acls(&acl, &roles);
+    Model { database: database.name.clone(), rels, roles, memberships, grants, default_acls, policies, procs, enums }
+}
+
+/// PostgreSQL's letter for a privilege in an aclitem.
+fn acl_letter(privilege: &str) -> Option<char> {
+    Some(match privilege {
+        "SELECT" => 'r',
+        "INSERT" => 'a',
+        "UPDATE" => 'w',
+        "DELETE" => 'd',
+        "TRUNCATE" => 'D',
+        "REFERENCES" => 'x',
+        "TRIGGER" => 't',
+        "MAINTAIN" => 'm',
+        "EXECUTE" => 'X',
+        "USAGE" => 'U',
+        "CREATE" => 'C',
+        "CONNECT" => 'c',
+        "TEMPORARY" | "TEMP" => 'T',
+        _ => return None,
+    })
+}
+
+/// The aclitems of the object kept under `key`, as PostgreSQL prints them
+/// (`grantee=privs/grantor`, `*` after a privilege held with its grant
+/// option, an empty grantee for PUBLIC), the owner's own item first. Empty
+/// while no one but the owner holds anything, which is NULL there too.
+pub(crate) fn aclitems(acl: &[crate::core::rql::privileges::AclRow], key: &str) -> Vec<String> {
+    let grants: Vec<&crate::core::rql::privileges::AclRow> =
+        acl.iter().filter(|a| a.relation == key && acl_letter(&a.privilege).is_some()).collect();
+    if grants.is_empty() {
+        return Vec::new();
+    }
+    let owner = crate::core::rql::privileges::owner_of(acl, key).unwrap_or("postgres");
+    let mut out = vec![format!("{}=arwdDxtm/{}", acl_name(owner), acl_name(owner))];
+    let mut groups: Vec<((&str, &str), String)> = Vec::new();
+    for g in grants {
+        let who = (g.grantee.as_str(), g.grantor.as_str());
+        let letters = match groups.iter_mut().find(|(k, _)| *k == who) {
+            Some((_, letters)) => letters,
+            None => {
+                groups.push((who, String::new()));
+                &mut groups.last_mut().expect("pushed just above").1
+            }
+        };
+        letters.push(acl_letter(&g.privilege).expect("filtered above"));
+        if g.grantable {
+            letters.push('*');
+        }
+    }
+    for ((grantee, grantor), letters) in groups {
+        let grantee = if grantee == "public" { String::new() } else { acl_name(grantee) };
+        out.push(format!("{grantee}={letters}/{}", acl_name(grantor)));
+    }
+    out
+}
+
+/// A role name inside an aclitem: double-quoted unless plain.
+fn acl_name(name: &str) -> String {
+    if name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') && !name.is_empty() {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+}
+
+/// The memberships the ACL holds, between roles that exist.
+fn memberships(acl: &[crate::core::rql::privileges::AclRow], roles: &[RoleRow]) -> Vec<MemberRow> {
+    use crate::core::rql::privileges::{NOINHERIT, NOSET};
+    let oid = |name: &str| roles.iter().find(|r| r.name == name).map(|r| r.oid);
+    acl.iter()
+        .filter(|a| a.privilege == "MEMBER")
+        .filter_map(|a| {
+            let role = a.relation.strip_prefix("@role:")?;
+            let off = |companion: &str| {
+                acl.iter().any(|x| x.privilege == companion && x.relation == a.relation && x.grantee == a.grantee)
+            };
+            Some(MemberRow {
+                roleid: oid(role)?,
+                member: oid(&a.grantee)?,
+                grantor: oid(&a.grantor).unwrap_or(BOOTSTRAP_ROLE),
+                admin: a.grantable,
+                inherit: !off(NOINHERIT),
+                set: !off(NOSET),
+            })
+        })
+        .collect()
 }
 
 /// The roles `rdb_roles` holds, with the bootstrap superuser's oid given to
 /// the first superuser; one `postgres` superuser when there is no catalogue
 /// (a server without authentication).
-async fn roles(database: &Arc<Database>) -> Vec<RoleRow> {
+async fn roles(database: &Arc<Database>, acl: &[crate::core::rql::privileges::AclRow]) -> Vec<RoleRow> {
     use crate::core::rql::{executor, lexer_s1::recognize_query_purpose};
     let mut out: Vec<RoleRow> = Vec::new();
     if database.has_table(crate::auth::ROLE_TABLE) {
@@ -1270,6 +1521,12 @@ async fn roles(database: &Arc<Database>) -> Vec<RoleRow> {
                         name,
                         login: flag(1),
                         superuser: flag(2),
+                        create_role: false,
+                        create_db: false,
+                        conn_limit: -1,
+                        valid_until_us: None,
+                        config: Vec::new(),
+                        bypass_rls: false,
                     });
                 }
             }
@@ -1284,8 +1541,30 @@ async fn roles(database: &Arc<Database>) -> Vec<RoleRow> {
                 name: "postgres".to_string(),
                 superuser: true,
                 login: true,
+                create_role: true,
+                create_db: true,
+                conn_limit: -1,
+                valid_until_us: None,
+                config: Vec::new(),
+                bypass_rls: true,
             },
         ),
+    }
+    // The attributes kept beside the role catalogue (`auth::RoleAttrs`).
+    for a in acl.iter().filter(|a| a.relation == crate::auth::ROLE_ATTR_RELATION) {
+        let Some(r) = out.iter_mut().find(|r| r.name == a.grantee) else { continue };
+        match a.privilege.as_str() {
+            "CREATEDB" => r.create_db = true,
+            "CREATEROLE" => r.create_role = true,
+            "BYPASSRLS" => r.bypass_rls = true,
+            "CONNECTION LIMIT" => r.conn_limit = a.grantor.parse().unwrap_or(-1),
+            "VALID UNTIL" => r.valid_until_us = a.grantor.parse().ok(),
+            p => {
+                if let Some(param) = p.strip_prefix("SET:") {
+                    r.config.push(format!("{param}={}", a.grantor));
+                }
+            }
+        }
     }
     out
 }
@@ -1499,6 +1778,9 @@ pub(crate) const NEW_VIEWS: &[&str] = &[
     "pg_constraint",
     "pg_am",
     "pg_roles",
+    "pg_authid",
+    "pg_auth_members",
+    "pg_default_acl",
     "pg_user",
     "pg_collation",
     "pg_description",
@@ -1515,6 +1797,10 @@ pub(crate) const NEW_VIEWS: &[&str] = &[
     // `information_schema`'s constraint views, built from `pg_constraint`'s
     // rows: what an ORM's schema reader joins to find the keys.
     "table_constraints",
+    "table_privileges",
+    "role_table_grants",
+    "usage_privileges",
+    "routine_privileges",
     "key_column_usage",
     "referential_constraints",
 ];
@@ -1616,6 +1902,38 @@ pub(crate) fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]
             ("adnum", I16),
             ("adbin", STRING),
         ],
+        "table_privileges" | "role_table_grants" => &[
+            ("grantor", STRING),
+            ("grantee", STRING),
+            ("table_catalog", STRING),
+            ("table_schema", STRING),
+            ("table_name", STRING),
+            ("privilege_type", STRING),
+            ("is_grantable", STRING),
+            ("with_hierarchy", STRING),
+        ],
+        "usage_privileges" => &[
+            ("grantor", STRING),
+            ("grantee", STRING),
+            ("object_catalog", STRING),
+            ("object_schema", STRING),
+            ("object_name", STRING),
+            ("object_type", STRING),
+            ("privilege_type", STRING),
+            ("is_grantable", STRING),
+        ],
+        "routine_privileges" => &[
+            ("grantor", STRING),
+            ("grantee", STRING),
+            ("specific_catalog", STRING),
+            ("specific_schema", STRING),
+            ("specific_name", STRING),
+            ("routine_catalog", STRING),
+            ("routine_schema", STRING),
+            ("routine_name", STRING),
+            ("privilege_type", STRING),
+            ("is_grantable", STRING),
+        ],
         "table_constraints" => &[
             ("constraint_catalog", STRING),
             ("constraint_schema", STRING),
@@ -1694,6 +2012,39 @@ pub(crate) fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]
             ("rolbypassrls", BOOL),
             ("rolconfig", ARRAY),
             ("oid", I64),
+        ],
+        // A superuser's alone (`privilege_statements::check`). `rolpassword`
+        // is NULL through SQL whoever asks: the verifiers stay in the role
+        // catalogue no statement reads.
+        "pg_authid" => &[
+            ("oid", I64),
+            ("rolname", STRING),
+            ("rolsuper", BOOL),
+            ("rolinherit", BOOL),
+            ("rolcreaterole", BOOL),
+            ("rolcreatedb", BOOL),
+            ("rolcanlogin", BOOL),
+            ("rolreplication", BOOL),
+            ("rolbypassrls", BOOL),
+            ("rolconnlimit", I32),
+            ("rolpassword", STRING),
+            ("rolvaliduntil", DATETIME),
+        ],
+        "pg_default_acl" => &[
+            ("oid", I64),
+            ("defaclrole", I64),
+            ("defaclnamespace", I64),
+            ("defaclobjtype", STRING),
+            ("defaclacl", ARRAY),
+        ],
+        "pg_auth_members" => &[
+            ("oid", I64),
+            ("roleid", I64),
+            ("member", I64),
+            ("grantor", I64),
+            ("admin_option", BOOL),
+            ("inherit_option", BOOL),
+            ("set_option", BOOL),
         ],
         "pg_user" => &[
             ("usename", STRING),
@@ -2046,6 +2397,61 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                 })
             })
             .collect(),
+        "table_privileges" | "role_table_grants" => model
+            .grants
+            .iter()
+            .filter(|g| g.kind == "TABLE")
+            .map(|g| {
+                vec![
+                    t(&g.grantor),
+                    t(&g.grantee),
+                    t(&model.database),
+                    t("public"),
+                    t(&g.object),
+                    t(&g.privilege),
+                    t(if g.grantable { "YES" } else { "NO" }),
+                    t(if g.privilege == "SELECT" { "YES" } else { "NO" }),
+                ]
+            })
+            .collect(),
+        // USAGE on sequences, as PostgreSQL lists it there; their SELECT
+        // and UPDATE are in no information_schema view.
+        "usage_privileges" => model
+            .grants
+            .iter()
+            .filter(|g| g.kind == "SEQUENCE" && g.privilege == "USAGE")
+            .map(|g| {
+                vec![
+                    t(&g.grantor),
+                    t(&g.grantee),
+                    t(&model.database),
+                    t("public"),
+                    t(&g.object),
+                    t("SEQUENCE"),
+                    t("USAGE"),
+                    t(if g.grantable { "YES" } else { "NO" }),
+                ]
+            })
+            .collect(),
+        "routine_privileges" => model
+            .grants
+            .iter()
+            .filter(|g| matches!(g.kind, "FUNCTION" | "PROCEDURE"))
+            .map(|g| {
+                vec![
+                    t(&g.grantor),
+                    t(&g.grantee),
+                    t(&model.database),
+                    t("public"),
+                    t(&g.object),
+                    t(&model.database),
+                    t("public"),
+                    t(&g.object),
+                    t("EXECUTE"),
+                    t(if g.grantable { "YES" } else { "NO" }),
+                ]
+            })
+            .collect(),
         "table_constraints" => {
             let mut rows = Vec::new();
             for rel in model.rels.iter().filter(|r| matches!(r.kind, "r" | "p")) {
@@ -2199,16 +2605,60 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                     t(&r.name),
                     V::B(r.superuser),
                     V::B(true),
-                    V::B(r.superuser),
-                    V::B(r.superuser),
+                    V::B(r.superuser || r.create_role),
+                    V::B(r.superuser || r.create_db),
                     V::B(r.login),
                     V::B(r.superuser),
-                    V::I(-1),
+                    V::I(r.conn_limit),
                     t("********"),
-                    V::N,
-                    V::B(r.superuser),
-                    V::N,
+                    r.valid_until_us.map_or(V::N, |us| t(crate::core::value_codec::format_timestamp_us(us))),
+                    V::B(r.superuser || r.bypass_rls),
+                    if r.config.is_empty() { V::N } else { V::TA(r.config.clone()) },
                     V::I(r.oid),
+                ]
+            })
+            .collect(),
+        "pg_authid" => model
+            .roles
+            .iter()
+            .map(|r| {
+                vec![
+                    V::I(r.oid),
+                    t(&r.name),
+                    V::B(r.superuser),
+                    V::B(true),
+                    V::B(r.superuser || r.create_role),
+                    V::B(r.superuser || r.create_db),
+                    V::B(r.login),
+                    V::B(r.superuser),
+                    V::B(r.superuser || r.bypass_rls),
+                    V::I(r.conn_limit),
+                    V::N,
+                    r.valid_until_us.map_or(V::N, |us| t(crate::core::value_codec::format_timestamp_us(us))),
+                ]
+            })
+            .collect(),
+        "pg_default_acl" => model
+            .default_acls
+            .iter()
+            .enumerate()
+            .map(|(i, (role, kind, items))| {
+                vec![V::I(DEFAULT_ACL_OID_BASE + i as i64), V::I(*role), V::I(0), t(*kind), V::TA(items.clone())]
+            })
+            .collect(),
+        "pg_auth_members" => model
+            .memberships
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                vec![
+                    V::I(AUTH_MEMBERS_OID_BASE + i as i64),
+                    V::I(m.roleid),
+                    V::I(m.member),
+                    V::I(m.grantor),
+                    V::B(m.admin),
+                    V::B(m.inherit),
+                    V::B(m.set),
                 ]
             })
             .collect(),
@@ -2220,12 +2670,12 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                 vec![
                     t(&r.name),
                     V::I(r.oid),
-                    V::B(r.superuser),
+                    V::B(r.superuser || r.create_db),
                     V::B(r.superuser),
                     V::B(r.superuser),
                     V::B(r.superuser),
                     t("********"),
-                    V::N,
+                    r.valid_until_us.map_or(V::N, |us| t(crate::core::value_codec::format_timestamp_us(us))),
                     V::N,
                 ]
             })
@@ -2298,12 +2748,12 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                     V::B(false),
                     V::B(false),
                     V::B(false),
-                    V::B(false),
-                    V::B(false),
+                    V::B(rel.rls.0),
+                    V::B(rel.rls.1),
                     V::B(true),
                     t(if matches!(rel.kind, "r" | "p") { "d" } else { "n" }),
                     V::B(false),
-                    V::N,
+                    if rel.acl.is_empty() { V::N } else { V::TA(rel.acl.clone()) },
                     if rel.options.is_empty() { V::N } else { V::TA(rel.options.clone()) },
                     V::N,
                 ]);
@@ -2410,8 +2860,34 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
         // extended statistics, publications, rewrite rules, dependencies or
         // extensions. Present so a query that joins them gets its answer
         // rather than an error.
+        // `polroles` as PostgreSQL prints the array of role oids, here
+        // the names (`{public}` for PUBLIC); `polcmd` its letter.
+        "pg_policy" => model
+            .policies
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let relid = model.rels.iter().find(|r| r.name == p.table).map_or(0, |r| r.oid);
+                let cmd = match p.command.as_str() {
+                    "SELECT" => "r",
+                    "INSERT" => "a",
+                    "UPDATE" => "w",
+                    "DELETE" => "d",
+                    _ => "*",
+                };
+                vec![
+                    V::I(POLICY_OID_BASE + i as i64),
+                    t(&p.name),
+                    V::I(relid),
+                    t(cmd),
+                    V::B(p.permissive),
+                    t(format!("{{{}}}", p.roles.join(","))),
+                    p.using.as_ref().map_or(V::N, t),
+                    p.check.as_ref().map_or(V::N, t),
+                ]
+            })
+            .collect(),
         "pg_description"
-        | "pg_policy"
         | "pg_statistic_ext"
         | "pg_publication"
         | "pg_publication_rel"
@@ -2515,5 +2991,39 @@ mod tests {
         oids.sort();
         oids.dedup();
         assert_eq!(oids.len(), rows.len());
+    }
+}
+
+#[cfg(test)]
+mod r2r3_acl_tests {
+    use crate::core::rql::privileges::AclRow;
+
+    fn row(relation: &str, grantee: &str, privilege: &str, grantor: &str, grantable: bool) -> AclRow {
+        AclRow { relation: relation.into(), grantee: grantee.into(), privilege: privilege.into(), grantor: grantor.into(), grantable }
+    }
+
+    #[test]
+    fn r2r3_aclitems_print_as_postgresql_prints_them() {
+        let only_owner = vec![row("t", "own", "OWNER", "own", false)];
+        assert!(super::aclitems(&only_owner, "t").is_empty(), "the owner's defaults alone are NULL");
+        let acl = vec![
+            row("t", "own", "OWNER", "own", false),
+            row("t", "alice", "SELECT", "own", true),
+            row("t", "alice", "UPDATE", "own", false),
+            row("t", "public", "SELECT", "own", false),
+            row("t", "Mixed", "INSERT", "own", false),
+            // A column grant and a marker are no table privilege.
+            row("t", "bob", "SELECT:a", "own", false),
+            row("t", "-", "RLS", "own", false),
+        ];
+        assert_eq!(
+            super::aclitems(&acl, "t"),
+            vec![
+                "own=arwdDxtm/own".to_string(),
+                "alice=r*w/own".to_string(),
+                "=r/own".to_string(),
+                "\"Mixed\"=a/own".to_string(),
+            ]
+        );
     }
 }

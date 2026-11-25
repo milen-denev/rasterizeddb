@@ -1177,6 +1177,23 @@ pub fn is_row_count_only(plan: &AggregatePlan) -> bool {
         })
 }
 
+/// Whether this session's next fold takes part in a cluster fan-out
+/// (sharding-plan.md B1c), so a shortcut that skips the fold must not run.
+pub fn cluster_fold_pending() -> bool {
+    #[cfg(feature = "sharding")]
+    {
+        use crate::core::cancel::Fold;
+        if let Some(session) = crate::pgwire::current_session_cancel() {
+            return match &*session.fold.lock().unwrap_or_else(|e| e.into_inner()) {
+                Fold::Normal => false,
+                Fold::Partial(out) => out.is_none(),
+                Fold::Coordinator { consumed, .. } => !consumed,
+            };
+        }
+    }
+    false
+}
+
 /// The answer to a plan [`is_row_count_only`] admits, given how many rows
 /// matched: [`row_count_result`] when every item is a bare count, and
 /// otherwise the fold's own emit over accumulators that each hold the
@@ -3706,6 +3723,70 @@ impl<'p> Folder<'p> {
         }
     }
 
+    /// This folder's groups as a partial for a coordinator shard
+    /// (`core::shard::merge`, sharding-plan.md B1c): each group's key, what
+    /// it shows, and its accumulators' running state, unfinished.
+    #[cfg(feature = "sharding")]
+    pub fn export_partial(&self) -> Vec<u8> {
+        use crate::core::shard::merge::{PARTIAL_V1, encode_acc, put_bytes, put_opt_bytes, put_u32};
+        let mut out = Vec::with_capacity(16 + self.accs.len() * 24);
+        out.push(PARTIAL_V1);
+        put_u32(&mut out, self.stride as u32);
+        put_u32(&mut out, self.keys.len() as u32);
+        for (g, key) in self.keys.iter().enumerate() {
+            put_bytes(&mut out, key);
+            put_opt_bytes(&mut out, self.shown.as_ref().map(|s| &*s[g]));
+            for acc in &self.accs[g * self.stride..(g + 1) * self.stride] {
+                encode_acc(acc, &mut out);
+            }
+        }
+        out
+    }
+
+    /// Adds a shard's [`Self::export_partial`] into this folder, as
+    /// [`Self::merge`] adds another folder's groups: each accumulator is
+    /// rebuilt from this folder's own template (the coordinator's plan) and
+    /// merged. A partial made under another plan is refused (`XX000`).
+    #[cfg(feature = "sharding")]
+    pub fn merge_partial(&mut self, partial: &[u8]) -> Result<(), String> {
+        use crate::core::shard::merge::{PARTIAL_V1, Reader, decode_acc};
+        let mut r = Reader::new(partial);
+        if r.u8()? != PARTIAL_V1 {
+            return Err("XX000: a shard's partial aggregate has a layout this build does not know".to_string());
+        }
+        if r.u32()? as usize != self.stride {
+            return Err("XX000: a shard's partial aggregate has another number of aggregates than this plan".to_string());
+        }
+        let groups = r.u32()?;
+        for _ in 0..groups {
+            let key = r.bytes()?;
+            let shown = r.opt_bytes()?;
+            if shown.is_some() != self.shown.is_some() {
+                return Err("XX000: a shard's partial aggregate keys its groups another way than this plan".to_string());
+            }
+            let mut theirs = Vec::with_capacity(self.stride);
+            for t in &self.template {
+                theirs.push(decode_acc(t, &mut r)?);
+            }
+            self.key.clear();
+            self.key.extend_from_slice(&key);
+            if let Some(shown) = shown {
+                self.plain.clear();
+                self.plain.extend_from_slice(&shown);
+            }
+            let byte_cell = self.byte_slot.and_then(|_| one_byte_cell(&key));
+            let at = self.group_for_key(byte_cell);
+            let ours = &mut self.accs[at * self.stride..(at + 1) * self.stride];
+            for (acc, their) in ours.iter_mut().zip(&theirs) {
+                acc.merge(their);
+            }
+        }
+        if !r.done() {
+            return Err("XX000: a shard's partial aggregate has trailing bytes".to_string());
+        }
+        Ok(())
+    }
+
     /// [`Folder::finish`], serialized onto `out`.
     ///
     /// Without an `ORDER BY` each group's row is built, serialized and dropped,
@@ -3713,6 +3794,10 @@ impl<'p> Folder<'p> {
     /// 100k-group result was 156 MB of `Row` for 10 MB of answer. With one, the
     /// rows have to exist together to be sorted, and `finish` builds them.
     pub fn finish_into(mut self, out: &mut Vec<u8>) -> Result<(), String> {
+        #[cfg(feature = "sharding")]
+        if self.cluster_fold()? {
+            return Ok(());
+        }
         let plan = self.plan;
         if !plan.order_by.is_empty() {
             for row in self.finish()? {
@@ -3750,8 +3835,48 @@ impl<'p> Folder<'p> {
         Ok(())
     }
 
+    /// A cluster fan-out's part in this fold (sharding-plan.md B1c), as the
+    /// session's [`crate::core::cancel::Fold`] says: on a peer, the partial is
+    /// handed over and `true` returned (nothing to emit); on the coordinator,
+    /// the peers' partials are merged in and the fold finishes as usual. Only
+    /// the session's first fold takes part: the mode is taken when read.
+    #[cfg(feature = "sharding")]
+    fn cluster_fold(&mut self) -> Result<bool, String> {
+        use crate::core::cancel::Fold;
+        let Some(session) = crate::pgwire::current_session_cancel() else {
+            return Ok(false);
+        };
+        let mut slot = session.fold.lock().unwrap_or_else(|e| e.into_inner());
+        match &mut *slot {
+            Fold::Normal => Ok(false),
+            Fold::Partial(out) => {
+                if out.is_none() {
+                    *out = Some(self.export_partial());
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            Fold::Coordinator { partials, consumed } => {
+                if *consumed {
+                    return Ok(false);
+                }
+                let parts = std::mem::take(partials);
+                *consumed = true;
+                drop(slot);
+                for p in &parts {
+                    self.merge_partial(p)?;
+                }
+                Ok(false)
+            }
+        }
+    }
+
     /// Emits the groups: HAVING, the select list, ORDER BY, OFFSET, LIMIT.
     pub fn finish(mut self) -> Result<Vec<Row>, String> {
+        #[cfg(feature = "sharding")]
+        if self.cluster_fold()? {
+            return Ok(Vec::new());
+        }
         let plan = self.plan;
         // A bare aggregate over an empty table still produces one row —
         // `COUNT(*)` of nothing is 0, not "no rows".

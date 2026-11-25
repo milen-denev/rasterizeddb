@@ -84,7 +84,7 @@ filter alone); there is one transaction manager per database
 | Restriction | Why | Migration path | Lifted |
 |---|---|---|---|
 | A sharded table needs a `PRIMARY KEY` containing the partition key | Follower apply and moves address rows by it (§9.4, §10). Today a composite `PRIMARY KEY` is recorded as a plain unique key (§8.1), so this needs a phase 0 change | `PRIMARY KEY (tenant_id, id)` | Never; load-bearing |
-| `COPY` and multi-row `INSERT` spanning shards refused unless the session opts into a per-shard, non-atomic split | Same as above | `SET rdb.split_bulk_writes = on` in autocommit (§8.5) | Phase 5, opt-in |
+| A `COPY` or multi-row `INSERT` spanning shards is split atomically only under the gateway's `two_phase = on` (§3.2); without it a `COPY` needs the session's opt-in to a per-shard, non-atomic split | Same as above | `two_phase = on`; or `SET rdb.split_bulk_writes = on` in autocommit for `COPY` (§8.5) | Phase 5, opt-in |
 | `SERIAL` (int4) refused on sharded tables | 2³¹ values cannot be split disjointly across shards | `BIGSERIAL` (§8.2) or `UUID` | Never |
 | Writes reaching several shards refused | No atomic commit before 2PC; Vitess's default `MULTI` commits these partially, this engine's characteristic bug | Add the tenant predicate, or `EXECUTE ON EACH SHARD` | Phase 5, opt-in |
 | Subqueries must repeat the tenant predicate | The node checks every table reference (§5.2) | `WHERE tenant_id = 42` in the subquery | Phase 4: correlated key propagation |
@@ -220,7 +220,7 @@ relations and `IN (SELECT …)`, it computes `route()` and a shard set.
 |---|---|---|
 | Single-shard | every sharded reference routes to shard s; unsharded ones only if s is their home | `Exec{Single}` to s |
 | Fan-out read | a `SELECT` reaching several shards, autocommit or `BEGIN READ ONLY`, READ COMMITTED, supported shape (§5.3) | scatter `Exec{Part{ranges}}`, merge |
-| Multi-shard write | any write reaching several shards | **0A000 before anything runs** (opt-in bulk split: §8.5) |
+| Multi-shard write | any write reaching several shards | under `two_phase = on`, one two-phase transaction over them (§3.2); without it **0A000 before anything runs** (opt-in bulk split: §8.5) |
 | No table reference | `SELECT nextval('s')`, `currval`, `lastval`, constants | `nextval` to the gateway's co-located shard, else a fixed shard per sequence: values are disjoint by construction (§8.2), so they may come from another shard's space; `currval`/`lastval` are gateway session state; `setval` on a sharded sequence refused |
 | Unknown shape | any construct the classifier does not enumerate | **refuse**, fail-closed |
 | DDL / session commands / `pg_catalog` | | §8.4 / kept at the gateway, applied lazily / answered from shells and `STATS` |
@@ -255,6 +255,68 @@ synchronous_commit, txn_start_time}`; the last is a new executor input, so
   READ transaction could read tenant 42 on shard A, then again on B under a
   snapshot B never gave it.
 - Fan-out inside a write, REPEATABLE READ or SERIALIZABLE transaction is refused.
+- **Under the gateway's `two_phase = on`** (as built) a block's statements
+  route on their own, and the block ends in a two-phase commit over every
+  shard it reached. There:
+  - a fan-out read inside the block first joins every shard to it (each gets
+    the block's BEGIN, its global id and its SET LOCALs), so it sees the
+    block's own writes on every shard;
+  - a write with no route key (`UPDATE t SET … WHERE <no key>`, `DELETE`)
+    runs on every shard inside the block, or, in autocommit, inside a
+    two-phase transaction of the gateway's own: every shard's rows change or
+    none do. It needs `unrouted = fan_out`, as a fan-out read does; a
+    reference table's write needs nothing;
+  - a multi-row `INSERT … VALUES (…), (…)` is split by the shard each row
+    goes to, and each shard's rows are sent to it as one INSERT, in the same
+    transaction: a duplicate key in one row inserts none. `RETURNING` rows
+    come back grouped by shard, not in VALUES order. A prepared one (`[Parse]
+    Bind [Describe] Execute Sync`) is split the same way: each row routed by
+    its own key parameter, each shard sent its own Parse/Bind/Execute with
+    the parameters renumbered and the client's types and formats kept, and
+    the client answered for its own messages;
+  - an aggregate runs in a block wherever the block has run: the gateway
+    takes every other shard's partial fold on the block's session there and
+    sends them to the home shard (`Coordinate`, rshard 0x13), which merges
+    them into its own fold on its session in the block, so the answer counts
+    the block's own writes on every shard. A top-N (`ORDER BY` with literal
+    `LIMIT`/`OFFSET`, or none) or a `SELECT DISTINCT` in a block that ran
+    beyond the home shard is merged on the gateway.
+  Without `two_phase` a block's writes stay on its first shard (as built):
+  each statement is routed on its own, a plain read whose key or tables are
+  elsewhere runs there outside the block (its ReadyForQuery reports the
+  block's status), a statement naming no table (`SAVEPOINT`, `SELECT 1`)
+  stays with the block, and a write or locking read reaching another shard is
+  refused `0A000` naming `two_phase`. A fan-out inside such a block is
+  refused; a join that gathers runs on the home shard, the block's shard
+  reading its part inside the block.
+- **`COPY t FROM STDIN` into a sharded table** (as built) is answered by the
+  gateway: it finds the key column from the one-row INSERT of the COPY's
+  columns, hashes each row's key as every router does, and streams each
+  shard's rows to a COPY of its own (text and CSV with their options; not
+  binary). Under `two_phase` the load is one transaction; without it, only
+  after `SET rdb.split_bulk_writes = on`, each shard's part committed alone.
+- **A join that gathers** (a sharded table joined with one that is not)
+  also runs prepared (the client's statement, tables renamed, its
+  parameters and formats kept) and inside a transaction, its parts read
+  where the transaction sees its own writes.
+- **`unrouted_writes = each_shard`** relays each shard's RETURNING rows and,
+  for a prepared statement, the acknowledgements and description.
+- **A statement without a route key may come prepared** (the extended
+  protocol, as every driver sends it), alone in its batch: `[Parse] Bind
+  [Describe] Execute Sync`. The gateway makes the batch self-contained (the
+  statement parsed under the unnamed name in it) and fans it out as it would
+  the simple Query: rows concatenated, counts summed, aggregates and GROUP BY
+  folded on the coordinator (whose fold works the same for an extended
+  statement), writes under `two_phase`, all in the client's result formats.
+  A top-N (`ORDER BY` with `LIMIT`/`OFFSET`, literal or bound, or none) runs
+  on each shard rewritten: every `ORDER BY` key appended to the select list
+  as a hidden column fetched as text, `LIMIT limit + offset`, no `OFFSET`,
+  parameters renumbered. The coordinator merges by those keys, and the
+  hidden columns are cut from each row and from the description, so the
+  client's own columns come back in the formats it asked for. A key may be a
+  column the select list does not show, as in PostgreSQL. A prepared
+  `SELECT DISTINCT` is deduplicated by each row's bytes, which are the same
+  on every shard in the client's formats.
 - **`synchronous_commit = off`** in cluster mode skips only the replica's local
   outcome fsync, which phase 3 takes off the critical path anyway; the reply
   still follows quorum and apply (§9.2), so a session always reads its own
@@ -554,9 +616,37 @@ columns run on the leader and replicate as values.
 
 ### 8.3 Unsharded tables
 
-They live on a **home shard** (shard 0 by default), with stubs elsewhere.
-Joining one with a sharded table waits for phase 4's gather. Reference tables,
-copied everywhere and written by 2PC, are phase 5.
+They live on a **home shard**: the gateway's `home_shard`, or the lowest
+shard id. Every other shard holds the table, created by the DDL fan-out, but
+none of its rows.
+
+A statement that names one beside a sharded table is **refused**
+(`0A000`, "needs a route key"). Routing it by the sharded table's key would
+reach a shard where the unsharded table is empty, so a join would come back
+short without an error. Phase 4's gather would answer such a statement; it is
+not built.
+
+**Reference tables** are the exception. A reference table is an unsharded
+table that every shard holds whole:
+
+```sql
+-- sent to every shard, as DDL is: rdb-shard ddl "SHARD REFERENCE TABLE countries"
+SHARD REFERENCE TABLE countries;
+SHARD UNREFERENCE TABLE countries;
+```
+
+- **Records.** Each shard keeps its own list, in `shard_reference_tables`
+  beside its state. Rows already in the table are not copied by the
+  statement; copy them to every shard first.
+- **Reads.** A reference table may be named with sharded tables. A keyed
+  statement joins it on whichever shard the key picks.
+- **Writes.** A write to a reference table goes to every shard, and the
+  reply carries one shard's row count. Under the gateway's `two_phase`,
+  the write runs as one two-phase transaction across every shard: each
+  copy changes or none does, with no opt-in needed. Without `two_phase`, it
+  is a fan-out write: it needs `SET rdb.unrouted_writes = each_shard`, runs
+  outside a transaction block, and a shard that fails leaves its copy
+  behind, which the error says.
 
 ### 8.4 DDL: a cluster schema epoch
 
@@ -920,7 +1010,34 @@ and a gateway that loaded an old static map would agree on the old generation.
 The shard is down about 27 minutes for 1.62 TB at 1 GB/s (test: restart the old
 copy after relocation; it refuses to open).
 
+### 10.1b Compressed links (as built)
+
+A gateway set to `shard_compression = zstd[:LEVEL]` asks each shard, after
+Hello, to compress that connection (rshard `Compression`, 0x14); a shard
+started with `--shard-peer-compression zstd[:LEVEL]` asks its peers the same
+for a coordinator's parts. A compressed frame is `RZ`, the codec (1 = zstd),
+the plain length (u32 LE), then the zstd bytes; either side unwraps what it
+gets, and sends a frame compressed only when it is at least the threshold
+long and comes out smaller. Off by default.
+
 ### 10.2 Range moves between shards
+
+**As built (`rdb-shard`).** `move-tenant`, `rebalance --apply` and `split`
+run a move with `--fenced` or `--online`; at the hand-off the new map goes to
+the two shards in the move, then to every other shard (a shard left on the old
+map routes and coordinates as if nothing moved; one that cannot be reached is
+named and the command fails after the move). The tool speaks the native
+protocol: where the map's addresses are the shards' rshard listeners, give
+`--native ID=HOST:PORT` for each (and `--new-native` for `split`'s new shard).
+A new shard starts with the old map and an id it does not name yet: it owns
+nothing, refuses every keyed statement, and lays out each partitioned table as
+one `FOREIGN` partition until `split` adds it to the map and moves a range to
+it. A move's statements select rows by `rdb_route_block(TYPE, key) >= lo AND
+< hi`, which the planner routes to the partitions over those blocks (on the
+first key level, when TYPE hashes as that level does), so they read only the
+moving range and never reach another shard's span. During the last, fenced
+round a gateway holds an autocommit statement refused `57P03 … fenced for a
+move` and retries it (up to `retries`, 200 ms apart) instead of failing it.
 
 **Offline (phase 2), after the span edits of §5.2 exist.**
 

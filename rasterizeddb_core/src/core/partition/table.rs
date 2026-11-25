@@ -157,6 +157,13 @@ struct Slot {
     /// committed row, and which reads the flag after taking that snapshot,
     /// finds it set.
     materialized: AtomicBool,
+    /// A `FOREIGN` partition (`log::PartState::foreign`): a range of the map
+    /// this shard does not own. Fixed for the slot's life (a span changing
+    /// hands starts a new map epoch, whose slots are built again). Every
+    /// open and every plan refuses it ([`Slot::refuse_foreign`]): it holds
+    /// no rows here, but answering as if its range were empty would answer
+    /// for another shard's rows.
+    foreign: bool,
     /// Everything else, built on the partition's first use: a declared
     /// partition nobody has written, routed to or opened holds only the
     /// three fields above. A table of 2^20 declared partitions held each
@@ -271,12 +278,25 @@ impl KeptSizes {
 }
 
 impl Slot {
-    fn new(pid: u32, range: PointRange, materialized: bool, place: Option<Place>) -> Self {
-        let slot = Slot { pid, range, materialized: AtomicBool::new(materialized), live: OnceLock::new() };
+    fn new(pid: u32, range: PointRange, materialized: bool, foreign: bool, place: Option<Place>) -> Self {
+        let slot = Slot { pid, range, materialized: AtomicBool::new(materialized), foreign, live: OnceLock::new() };
         if let Some(place) = place {
             slot.set_place(place);
         }
         slot
+    }
+
+    /// `Err` for a `FOREIGN` partition of table `table`: the one check every
+    /// path that would open, materialize or plan it makes first.
+    fn refuse_foreign(&self, table: &str) -> io::Result<()> {
+        if self.foreign {
+            return Err(io::Error::other(format!(
+                "RDB02: statement reaches ranges not on this shard: partition {} of \"{table}\" covers [{:#018x}, {:#x}), which this shard does not own (FOREIGN): \
+                 the statement reached another shard's rows",
+                self.pid, self.range.lo, self.range.hi
+            )));
+        }
+        Ok(())
     }
 
     /// The slot's state, built now if this is its first use.
@@ -899,7 +919,7 @@ async fn slots_of(
         *index
             .get_mut(pid as usize)
             .ok_or_else(|| format!("live partition {pid} is past the map's next pid {n}"))? = j as u32;
-        slots.push(Slot::new(pid, range, materialized, place));
+        slots.push(Slot::new(pid, range, materialized, part.foreign, place));
     }
     Ok((slots.into_boxed_slice(), index.into_boxed_slice(), counts))
 }
@@ -1050,9 +1070,41 @@ pub(crate) fn any_broken() -> bool {
     ANY_BROKEN.load(Ordering::Acquire)
 }
 
+/// A new table's map, and the pids of the spans it must record `FOREIGN`:
+/// `RangeMap::initial(n)` on a plain node; on a shard, `n` partitions inside
+/// the ranges it owns (at least one per range) plus one per gap
+/// (`RangeMap::within`).
+fn initial_layout(n: u32) -> io::Result<(RangeMap, Vec<u32>)> {
+    let bad = |e: String| io::Error::new(io::ErrorKind::InvalidInput, e);
+    #[cfg(feature = "sharding")]
+    if let Some(own) = crate::core::shard::ownership::current() {
+        let owned: Vec<(u64, u64)> = own.owned.iter().chain(&own.incoming).copied().collect();
+        let mut sorted = owned;
+        sorted.sort_unstable();
+        let n = n.max(sorted.len() as u32);
+        return RangeMap::within(&sorted, n).map_err(bad);
+    }
+    Ok((RangeMap::initial(n).map_err(bad)?, Vec::new()))
+}
+
+/// Whether the running statement is one shard's part of a fan-out
+/// (`cancel::SessionCancel::fan_out_part`).
+fn fan_out_part() -> bool {
+    #[cfg(feature = "sharding")]
+    {
+        crate::pgwire::current_session_cancel()
+            .is_some_and(|s| s.fan_out_part.load(std::sync::atomic::Ordering::Acquire))
+    }
+    #[cfg(not(feature = "sharding"))]
+    {
+        false
+    }
+}
+
 impl PartitionedTable {
     /// Writes a new table's map log (`HEADER`, `LOCATIONS` with the root,
-    /// `PLACE` of `RangeMap::initial(n)`) and its ids file, synced through the
+    /// `PLACE` of [`initial_layout`], and on a shard a `RELEASE_SPAN` per
+    /// gap) and its ids file, synced through the
     /// log's last record.
     ///
     /// The caller has already made the parent files with
@@ -1074,7 +1126,7 @@ impl PartitionedTable {
             .to_str()
             .ok_or_else(|| invalid(format!("the root {} is not UTF-8", root.display())))?
             .to_string();
-        let map = RangeMap::initial(n).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let (map, foreign) = initial_layout(n)?;
         let header = MapHeader {
             uid,
             route_v: ROUTE_V1,
@@ -1086,13 +1138,24 @@ impl PartitionedTable {
 
         files::require_existing(&root, &[files::map_file(uid, 0), files::ids_file(uid)])?;
         let log = MapLogFile::create(StdArc::new(seed.create_new(files::map_file(uid, 0)).await)).await?;
-        // One transaction, one sync, for all three.
-        log.append_all_durable(&[
+        let mut records = vec![
             Record::Header(header),
             Record::Locations(vec![root_str]),
             Record::Place { hi: SPACE_END, entries: map.entries().to_vec() },
-        ])
-        .await?;
+        ];
+        // On a shard, the spans between its owned ranges are another shard's:
+        // each is released to a fresh FOREIGN pid at once, so no statement
+        // here ever writes or reads them (B1a.4).
+        let mut next_pid = map.len() as u32;
+        for pid in foreign {
+            let range = map
+                .range_of(pid)
+                .ok_or_else(|| invalid(format!("internal error: the shard layout has no partition {pid}")))?;
+            records.push(Record::ReleaseSpan { hi: range.hi, entries: vec![(range.lo, next_pid)] });
+            next_pid += 1;
+        }
+        // One transaction, one sync, for all of them.
+        log.append_all_durable(&records).await?;
         IdSource::create(Arc::new(seed.create_new(files::ids_file(uid)).await)).await?;
         Ok(())
     }
@@ -1454,7 +1517,12 @@ impl PartitionedTable {
                             continue;
                         }
                         let table = next.parts.open_instance(new, false).await.map_err(|err| format!("partition {}: {err}", new.pid))?;
-                        let token = next.parts.budget.enter(StdArc::downgrade(&next.parts), self.uid, new.pid);
+                        let token = next.parts.budget.enter(
+                            StdArc::downgrade(&next.parts),
+                            self.uid,
+                            new.pid,
+                            table.resident_estimate(),
+                        );
                         #[cfg(test)]
                         instance_count::reopened(&self.root, self.uid, new.pid);
                         new.put(table, token, old_slot.referenced_now());
@@ -1720,6 +1788,27 @@ impl PartitionedTable {
             return Ok(Route::All);
         }
         let schema = &self.shell.schema;
+        // `rdb_route_block('<type>', <key>) >= lo AND … < hi`, the block range
+        // a shard move selects: routed to the partitions over those blocks
+        // (the moving range, which source and destination both hold), not
+        // every partition, when `<key>` is the first key level and `<type>`
+        // hashes as that level does.
+        if let Some((lo, hi)) = route_block_range(where_clause).and_then(|(family, column, lo, hi)| {
+                let level = live.spec.levels().first()?;
+                let field = schema.fields.iter().find(|f| f.write_order == u64::from(level.write_order))?;
+                (field.name.eq_ignore_ascii_case(&column) && family == level.family).then_some((lo, hi))
+            })
+        {
+            const BLOCKS: u64 = 1 << 48;
+            let hi = hi.min(BLOCKS);
+            return Ok(if lo >= hi {
+                Route::Zero
+            } else if lo == 0 && hi == BLOCKS {
+                Route::All
+            } else {
+                Route::Points(vec![PointRange { lo: lo << 16, hi: (hi as u128) << 16 }])
+            });
+        }
         let Ok(tokens) = crate::core::tokenizer::query_tokenizer::try_tokenize(where_clause, &schema.fields) else {
             return Ok(Route::All);
         };
@@ -1817,6 +1906,16 @@ impl PartitionedTable {
         let mut out = Planned::new();
         for pid in route.pids(&epoch.map) {
             let slot = Self::slot(live, pid)?;
+            // On a shard, a fan-out's part reads the rows this shard owns
+            // (the gateway or a coordinator sends it to every shard and
+            // combines the answers), keyed or not: an `IN` list's keys on
+            // other shards are answered there. Any other statement whose
+            // key reaches another shard's range is refused before anything
+            // is read (B1a.4).
+            if slot.foreign && fan_out_part() {
+                continue;
+            }
+            slot.refuse_foreign(&self.name)?;
             if let Some(table) = slot.open_now() {
                 out.push((pid, Some(table)));
             } else if slot.materialized.load(Ordering::SeqCst) {
@@ -1851,6 +1950,26 @@ impl PartitionedTable {
     pub async fn open_part_scan(&self, pid: u32) -> io::Result<Arc<Table<DbStorageProvider>>> {
         let live = self.live()?;
         live.parts.open(pid, false).await
+    }
+
+    /// Records this shard taking (`ACQUIRE_SPAN`) or giving up
+    /// (`RELEASE_SPAN`) a span of the table's map, durably
+    /// (`PinBoard::record_span`). The open instance keeps serving the epoch
+    /// it opened at; the caller reopens the table, under the ownership
+    /// fence, to serve the new one.
+    /// The records [`super::log::MapState::span_records`] gives for points
+    /// `[lo, hi)` under the map as its log holds it now.
+    #[cfg(feature = "sharding")]
+    pub async fn span_records(&self, lo: u64, hi: u128, take: bool) -> io::Result<Vec<super::log::Record>> {
+        let live = self.live()?;
+        let state = live.parts.board.state.lock().await;
+        state.span_records(lo, hi, take).map_err(invalid)
+    }
+
+    #[cfg(feature = "sharding")]
+    pub async fn record_span(&self, rec: &super::log::Record) -> io::Result<()> {
+        let live = self.live()?;
+        live.parts.board.record_span(rec).await
     }
 
     /// Closes partition `pid` exclusively (§7.2 point 2): only while nothing
@@ -1916,6 +2035,7 @@ impl PartitionedTable {
         };
         let live = self.live()?;
         let slot = Self::slot(live, pid)?;
+        slot.refuse_foreign(&self.name)?;
         let mut out = Planned::new();
         if let Some(table) = slot.open_now() {
             table.ensure_full();
@@ -2825,6 +2945,7 @@ impl Parts {
     /// fan-out's open leaves it clear (`partition::budget`).
     pub(crate) async fn open(&self, pid: u32, routed: bool) -> io::Result<Arc<Table<DbStorageProvider>>> {
         let slot = self.slot_at(pid)?;
+        slot.refuse_foreign(&self.name)?;
         if routed {
             slot.touch();
         }
@@ -2873,6 +2994,7 @@ impl Parts {
     /// (§3.2) if it never was, then open it. A failure leaves the slot
     /// closed and fails the caller, never handing back a stand-in.
     async fn open_slow(&self, slot: &Slot, materialize: bool, routed: bool) -> io::Result<Arc<Table<DbStorageProvider>>> {
+        slot.refuse_foreign(&self.name)?;
         let lock = self.board.lifecycle(slot.pid)?;
         let _life = lock.lock().await;
         if let Some(table) = slot.open_now() {
@@ -2920,7 +3042,8 @@ impl Parts {
         };
         #[cfg(test)]
         instance_count::opened(&self.root, self.uid, slot.pid);
-        slot.put(table.clone(), self.budget.enter(self.me.clone(), self.uid, slot.pid), routed);
+        let bytes = table.resident_estimate();
+        slot.put(table.clone(), self.budget.enter(self.me.clone(), self.uid, slot.pid, bytes), routed);
         // Again once it is in its slot: a `SET CONFIG vacuum` that stored
         // its value after `open_instance` read it walked the slots before
         // this one was there (both sides store, then read the other's).
@@ -2935,6 +3058,8 @@ impl Parts {
     /// at a time; the flag is set once the record is durable and before the
     /// first row reaches the partition.
     async fn materialize(&self, slot: &Slot) -> io::Result<()> {
+        // A FOREIGN range is never given files here.
+        slot.refuse_foreign(&self.name)?;
         // A mirror added after CREATE stops new partitions rather than let
         // them go unmirrored.
         refuse_mirrored((self.mirrored)())?;
@@ -3563,5 +3688,90 @@ pub(crate) mod lifecycle_hooks {
 
     pub(super) async fn closing(root: &Path, pid: u32) {
         hit(&CLOSES, root, pid).await
+    }
+}
+
+/// `rdb_route_block('<type>', <column>) >= LO AND rdb_route_block('<type>',
+/// <column>) < HI` exactly (as `rdb-shard` writes a block range; spaces and
+/// case free, the column optionally quoted): the type's key family, the
+/// column, `LO` and `HI`. `None` for anything else.
+fn route_block_range(clause: &str) -> Option<(super::key::KeyFamily, String, u64, u64)> {
+    use super::key::KeyFamily;
+    // The function calls arrive lifted for the expression evaluator: read
+    // them back as text first.
+    let unlifted;
+    let clause = if clause.as_bytes().contains(&crate::core::tokenizer::predicate_rewrite::LIFTED_OPEN) {
+        let mut out = String::with_capacity(clause.len());
+        let mut i = 0;
+        while i < clause.len() {
+            if let Some((text, end)) = crate::core::tokenizer::predicate_rewrite::read_lifted(clause, i) {
+                out.push_str(&text);
+                i = end;
+                continue;
+            }
+            let ch = clause[i..].chars().next()?;
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        unlifted = out;
+        unlifted.as_str()
+    } else {
+        clause
+    };
+    fn call(part: &str) -> Option<(String, String, &str)> {
+        let p = part.trim();
+        p.get(..16).filter(|h| h.eq_ignore_ascii_case("rdb_route_block("))?;
+        let inner_end = p.find(')')?;
+        let inner = &p[16..inner_end];
+        let (t, c) = inner.split_once(',')?;
+        let t = t.trim().strip_prefix('\'')?.strip_suffix('\'')?.to_ascii_lowercase();
+        let c = c.trim();
+        let c = c.strip_prefix('"').and_then(|c| c.strip_suffix('"')).map(str::to_string).unwrap_or_else(|| c.to_ascii_lowercase());
+        if c.is_empty() || c.contains(['"', '\'', '(', ')', ' ']) {
+            return None;
+        }
+        Some((t, c, p[inner_end + 1..].trim()))
+    }
+    let upper = clause.to_ascii_uppercase();
+    let at = upper.find(" AND ")?;
+    if upper[at + 5..].contains(" AND ") || upper.contains(" OR ") {
+        return None;
+    }
+    let (t1, c1, op1) = call(&clause[..at])?;
+    let (t2, c2, op2) = call(&clause[at + 5..])?;
+    if t1 != t2 || c1 != c2 {
+        return None;
+    }
+    let lo: u64 = op1.strip_prefix(">=")?.trim().parse().ok()?;
+    let hi: u64 = op2.strip_prefix('<').filter(|r| !r.starts_with('='))?.trim().parse().ok()?;
+    let family = match t1.as_str() {
+        "smallint" | "int2" | "integer" | "int" | "int4" | "bigint" | "int8" | "tinyint" | "int1" => KeyFamily::Integer,
+        "text" | "varchar" | "character varying" | "string" => KeyFamily::Text,
+        "uuid" => KeyFamily::Uuid,
+        _ => return None,
+    };
+    Some((family, c1, lo, hi))
+}
+
+#[cfg(test)]
+mod route_block_range_tests {
+    use super::route_block_range;
+    use super::super::key::KeyFamily;
+
+    #[test]
+    fn a_move_selection_is_read_and_nothing_else() {
+        assert_eq!(
+            route_block_range("rdb_route_block('int', \"id\") >= 100 AND rdb_route_block('int', \"id\") < 200"),
+            Some((KeyFamily::Integer, "id".to_string(), 100, 200))
+        );
+        assert_eq!(
+            route_block_range("RDB_ROUTE_BLOCK('text', Tenant) >= 0 and rdb_route_block('text', tenant) < 5"),
+            Some((KeyFamily::Text, "tenant".to_string(), 0, 5))
+        );
+        assert_eq!(route_block_range("rdb_route_block('int', id) >= 1 AND rdb_route_block('int', other) < 2"), None);
+        assert_eq!(route_block_range("rdb_route_block('int', id) >= 1 AND rdb_route_block('int', id) <= 2"), None);
+        assert_eq!(route_block_range("rdb_route_block('int', id) >= 1 AND rdb_route_block('int', id) < 2 AND v = 3"), None);
+        assert_eq!(route_block_range("rdb_route_block('int', id) >= 1 OR rdb_route_block('int', id) < 2"), None);
+        assert_eq!(route_block_range("id = 4"), None);
     }
 }

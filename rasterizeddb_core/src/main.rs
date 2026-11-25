@@ -65,6 +65,7 @@ mod pg_import_args;
 /// Redis-compatible key/value store flags.
 #[cfg(feature = "kv_cache")]
 mod kv_args;
+mod shard_args;
 
 #[derive(Clone, Debug, ValueEnum)]
 enum PgTlsMode {
@@ -595,6 +596,15 @@ struct Args {
     #[arg(long = "socket-group", value_name = "GROUP")]
     socket_group: Option<String>,
 
+    /// Run as a front-end node (B4.7): MySQL and SQL Server clients' sessions
+    /// go to this gateway (`host:port` of its PostgreSQL listener), logged in
+    /// as each client's own role; this server keeps only a copy of the
+    /// cluster's schema (`rdb-shard ddl --frontend`). MySQL logins then need
+    /// TLS.
+    #[cfg(any(feature = "mysql_wire", feature = "mssql_wire"))]
+    #[arg(long = "frontend-upstream", value_name = "HOST:PORT")]
+    frontend_upstream: Option<String>,
+
     // --- MySQL / MariaDB protocol ------------------------------------------
     /// Also serve the MySQL / MariaDB client protocol on this TCP port (3306
     /// is MySQL's), beside whichever other listeners run, on the same
@@ -890,6 +900,17 @@ struct Args {
     #[cfg(feature = "kv_cache")]
     #[command(flatten)]
     kv: kv_args::KvArgs,
+
+    // --- sharding (docs/sharding-plan.md) ---------------------------------
+    #[command(flatten)]
+    shard: shard_args::ShardArgs,
+
+    /// The enterprise build's configuration (strict tenant mode, placement
+    /// policies, per-user-shard roles): `rasterizeddb_enterprise`'s file
+    /// format. Only in the `rasterizeddb_core_enterprise` binary.
+    #[cfg(feature = "enterprise")]
+    #[arg(long = "enterprise-config", value_name = "FILE")]
+    enterprise_config: Option<std::path::PathBuf>,
 }
 
 /// Applies `--storage-location`, `--storage-policy` and `--storage-min-free`
@@ -1440,6 +1461,13 @@ fn main() -> std::io::Result<()> {
 
     // Parse command line arguments with clap
     let mut args = Args::parse();
+    #[cfg(any(feature = "mysql_wire", feature = "mssql_wire"))]
+    if let Some(gateway) = args.frontend_upstream.clone()
+        && let Err(e) = rasterizeddb_core::pgwire::set_frontend_upstream(gateway)
+    {
+        eprintln!("{e}");
+        std::process::exit(2);
+    }
     // The descriptors the partitions' open budget is derived from: a stock
     // systemd unit's soft limit of 1,024 would leave a budget of 16 open
     // partitions; raised toward the hard limit, as far as the largest
@@ -1524,6 +1552,45 @@ fn main() -> std::io::Result<()> {
                 );
                 std::process::exit(2);
             }
+        }
+    }
+
+    // The licensed hooks, before anything can open a session.
+    #[cfg(feature = "enterprise")]
+    if let Some(path) = &args.enterprise_config {
+        if let Err(e) = rasterizeddb_enterprise::install(path) {
+            eprintln!("--enterprise-config: {e}");
+            std::process::exit(2);
+        }
+        // T6: strict tenant mode refuses to start where any login would be
+        // let in without a credential.
+        if rasterizeddb_core::core::policy_hooks::installed() && args.pg_auth.eq_ignore_ascii_case("trust") {
+            eprintln!("strict tenant mode needs password authentication: --pg-auth trust is refused");
+            std::process::exit(2);
+        }
+    }
+
+    // Before the database opens: a shard's directory is marked, its map
+    // epoch checked and its ownership installed, so no statement ever runs
+    // unguarded.
+    let shard_location = if args.in_memory { None } else { args.location.clone() };
+    match args.shard.start(shard_location.as_deref()) {
+        Ok(Some(started)) => {
+            #[cfg(feature = "sharding")]
+            eprintln!(
+                "shard {} of cluster {:032x}, map epoch {} ({} ranges owned)",
+                started.shard_id,
+                started.map.cluster_id(),
+                started.map.epoch(),
+                started.map.ranges_of(started.shard_id).len()
+            );
+            #[cfg(not(feature = "sharding"))]
+            let () = started;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
         }
     }
 
@@ -1690,6 +1757,14 @@ fn main() -> std::io::Result<()> {
     }
 
     if let Some(v) = args.json_shadow_tables {
+        // Shadow tables are plain tables keyed by a per-row reference, not by
+        // the document's shard key, so a shard cannot keep them with their
+        // rows (sharding-plan.md B1a.11).
+        #[cfg(feature = "sharding")]
+        if v && rasterizeddb_core::core::shard::map_state::current().is_some() {
+            eprintln!("--json-shadow-tables is not supported on a shard (--role shard)");
+            std::process::exit(2);
+        }
         let _ = rasterizeddb_core::JSON_SHADOW_TABLES.set(v);
         if v {
             log::info!(
@@ -1865,6 +1940,69 @@ fn main() -> std::io::Result<()> {
                     eprintln!("{e}");
                     std::process::exit(2);
                 }
+            }
+        }
+
+        // The shard's Raft group (sharding-plan.md B3): its store, its
+        // runtime, the apply into the catalogue, and the peers' listener.
+        #[cfg(feature = "sharding_raft")]
+        match args.shard.raft() {
+            Ok(Some((id, net))) => {
+                use rasterizeddb_core::core::shard::{raft_apply, raft_group, raft_net, raft_store};
+                let dir = std::path::Path::new(args.location.as_deref().unwrap_or(".")).join("raft");
+                let (store, restored) = match raft_store::RaftStore::open(&dir) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("the raft store: {e}");
+                        std::process::exit(2);
+                    }
+                };
+                let voters = std::iter::once(id).chain(net.peers.keys().copied());
+                let group = raft_group::Group::start(
+                    id,
+                    store,
+                    restored,
+                    rasterizeddb_raft::Config::new(voters),
+                    rasterizeddb_raft::Timing::default(),
+                    Box::new(raft_apply::ShardMachine::new(catalog.clone(), id)),
+                    std::sync::Arc::new(raft_net::Sender(raft_net::RastcpTransport::new(net.clone()))),
+                );
+                raft_apply::install(group.clone(), id, catalog.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = raft_net::serve(net, group).await {
+                        log::error!("the raft listener stopped: {e}");
+                    }
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
+
+        // The gateways' endpoint on a shard (rshard, mTLS), on the catalogue
+        // so a virtual session can attach to any database.
+        #[cfg(feature = "sharding")]
+        match args.shard.listener() {
+            Ok(Some(config)) => {
+                let catalog = catalog.clone();
+                tokio::spawn(async move {
+                    // A shard the gateways cannot reach only looks alive: its
+                    // own pgwire answers, every routed statement fails. Its
+                    // listener failing (a port in use, a bad certificate)
+                    // ends the process, for the supervisor to see.
+                    if let Err(e) = rasterizeddb_core::core::shard::rshard::serve(catalog, config).await {
+                        log::error!("the rshard listener stopped: {e}; a shard cannot run without it, exiting");
+                        eprintln!("the rshard listener stopped: {e}; a shard cannot run without it, exiting");
+                        std::process::exit(2);
+                    }
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
             }
         }
 

@@ -52,27 +52,40 @@ pub const COMPRESSED_VALUES_V1: &str = "compressed_values_v1";
 /// something different, without an error.
 pub const COMPOSITE_FOREIGN_KEY_V1: &str = "composite_foreign_key_v1";
 
+/// The directory is a shard's (`--role shard`, sharding-plan.md B1a.3): it
+/// holds only the level-0 ranges the cluster map gives it. A build without
+/// the `sharding` feature would open it as a plain database answering for
+/// every range, so it refuses it.
+pub const SHARD_V1: &str = "shard_v1";
+
 /// Every flag any build has defined, with what it means, for the refusal
-/// message. Not the set this build supports: that is [`KNOWN`].
+/// message. Not the set this build supports: that is [`known`].
 const DESCRIBED: &[(&str, &str)] = &[
     (INDEX_STORE_V1, "persistent index snapshots (Cargo feature `persistent_indexes`)"),
     (NUMERIC_OWN_SCALE_V1, "unconstrained NUMERIC columns that keep each value's own scale"),
     (COMPRESSED_VALUES_V1, "compressed column values (Cargo feature `storage_compression`)"),
     (COMPOSITE_FOREIGN_KEY_V1, "foreign keys over several columns"),
+    (SHARD_V1, "a shard's data directory (Cargo feature `sharding`)"),
 ];
 
-/// The flags this build understands.
-#[cfg(all(feature = "persistent_indexes", feature = "storage_compression"))]
-const KNOWN: &[&str] = &[INDEX_STORE_V1, NUMERIC_OWN_SCALE_V1, COMPOSITE_FOREIGN_KEY_V1, COMPRESSED_VALUES_V1];
-/// The flags this build understands.
-#[cfg(all(feature = "persistent_indexes", not(feature = "storage_compression")))]
-const KNOWN: &[&str] = &[INDEX_STORE_V1, NUMERIC_OWN_SCALE_V1, COMPOSITE_FOREIGN_KEY_V1];
-/// The flags this build understands.
-#[cfg(all(not(feature = "persistent_indexes"), feature = "storage_compression"))]
-const KNOWN: &[&str] = &[NUMERIC_OWN_SCALE_V1, COMPOSITE_FOREIGN_KEY_V1, COMPRESSED_VALUES_V1];
-/// The flags this build understands.
-#[cfg(all(not(feature = "persistent_indexes"), not(feature = "storage_compression")))]
-const KNOWN: &[&str] = &[NUMERIC_OWN_SCALE_V1, COMPOSITE_FOREIGN_KEY_V1];
+/// The flags this build understands, by its features.
+fn known() -> &'static [&'static str] {
+    static KNOWN: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    KNOWN.get_or_init(|| {
+        let mut k = Vec::with_capacity(5);
+        if cfg!(feature = "persistent_indexes") {
+            k.push(INDEX_STORE_V1);
+        }
+        k.extend([NUMERIC_OWN_SCALE_V1, COMPOSITE_FOREIGN_KEY_V1]);
+        if cfg!(feature = "storage_compression") {
+            k.push(COMPRESSED_VALUES_V1);
+        }
+        if cfg!(feature = "sharding") {
+            k.push(SHARD_V1);
+        }
+        k
+    })
+}
 
 /// Serialises [`require`] within the process: two first writers in one
 /// directory would otherwise race on the temporary file.
@@ -132,7 +145,7 @@ pub fn flags(dir: &Path) -> Result<Vec<String>, String> {
 ///
 /// Called before anything in the directory is opened, replayed or created.
 pub fn check(dir: &Path) -> Result<(), String> {
-    refusal(&flags(dir)?, KNOWN)
+    refusal(&flags(dir)?, known())
 }
 
 /// Sets `flag` in `dir`, durably, before the caller creates the first file
@@ -142,7 +155,7 @@ pub fn check(dir: &Path) -> Result<(), String> {
 /// directory synced, so a crash leaves the old set or the new, never a torn
 /// one.
 pub fn require(dir: &Path, flag: &str) -> io::Result<()> {
-    if !KNOWN.contains(&flag) {
+    if !known().contains(&flag) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{flag} is not an on-disk feature this build supports"),
@@ -306,7 +319,7 @@ pub fn fence_restored_directory(dir: &Path) -> io::Result<()> {
     }
     // A build without the feature cannot set this flag, nor open what needs
     // it; it is set by one that can.
-    if KNOWN.contains(&COMPRESSED_VALUES_V1) {
+    if known().contains(&COMPRESSED_VALUES_V1) {
         for database in directories_needing_compressed_values(dir)? {
             require(&database, COMPRESSED_VALUES_V1)?;
         }

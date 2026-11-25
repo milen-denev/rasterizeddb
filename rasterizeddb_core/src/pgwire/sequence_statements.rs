@@ -164,15 +164,54 @@ pub(super) async fn prepare_statement(
     database: &Arc<Database>,
     tx: Option<TxId>,
     stmt: &str,
+    role: Option<&str>,
 ) -> Result<Option<String>, (&'static str, String)> {
     if database.has_table(sequence_catalog::SEQUENCE_TABLE) {
         sequence_catalog::ensure_loaded(database).await.map_err(|e| ("XX000", e))?;
     }
     // A sequence read as a relation (`SELECT last_value FROM s`), as its row.
     match sequence_catalog::relations_as_rows(database, stmt)? {
-        Some(rows) => Ok(Some(prepare_calls(database, tx, &rows).await?.unwrap_or(rows))),
-        None => prepare_calls(database, tx, stmt).await,
+        Some(rows) => Ok(Some(prepare_calls(database, tx, &rows, role).await?.unwrap_or(rows))),
+        None => prepare_calls(database, tx, stmt, role).await,
     }
+}
+
+/// The refusal when `role` may not make the sequence calls `stmt` makes
+/// (R2), as PostgreSQL checks them: `nextval` needs USAGE or UPDATE,
+/// `currval` USAGE or SELECT, `setval` UPDATE. A SERIAL or identity
+/// column's sequence, which has no ACL of its own here, is its table's: a
+/// write to the table lets it advance, a read lets it be read.
+async fn sequence_refusal(database: &Arc<Database>, tx: Option<TxId>, stmt: &str, role: &str) -> Option<(&'static str, String)> {
+    use crate::core::rql::privileges;
+    let calls = sequence_catalog::calls_in(stmt);
+    if calls.is_empty() {
+        return None;
+    }
+    let Ok(rows) = privileges::load_shared(database, tx).await else {
+        return Some(("42501", "permission denied: the privileges could not be read".to_string()));
+    };
+    let mut implicit = None;
+    for (func, name) in calls {
+        let explicit = privileges::owner_of(&rows, &name).is_some();
+        let (relation, needs): (String, &[&str]) = if explicit {
+            (name.clone(), match func {
+                "nextval" => &["USAGE", "UPDATE"],
+                "currval" => &["USAGE", "SELECT"],
+                _ => &["UPDATE"],
+            })
+        } else {
+            let all = implicit.get_or_insert_with(|| sequence_catalog::implicit_sequences(database));
+            match all.iter().find(|(s, _, _)| *s == name) {
+                Some((_, table, _)) => (table.clone(), if func == "currval" { &["SELECT"] } else { &["INSERT", "UPDATE"] }),
+                // Neither owned nor a column's: a superuser's alone.
+                None => (name.clone(), &["USAGE"]),
+            }
+        };
+        if !needs.iter().any(|p| privileges::allows(&rows, role, &relation, p)) {
+            return Some(("42501", format!("permission denied for sequence {name}")));
+        }
+    }
+    None
 }
 
 /// [`prepare_statement`] for the calls a statement makes.
@@ -180,6 +219,7 @@ async fn prepare_calls(
     database: &Arc<Database>,
     tx: Option<TxId>,
     stmt: &str,
+    role: Option<&str>,
 ) -> Result<Option<String>, (&'static str, String)> {
     let lower_has = |needle: &[u8]| crate::core::sql_scan::contains_ignore_ascii_case(stmt, needle);
     if !(lower_has(b"val(") || lower_has(b"val (") || lower_has(b"pg_get_serial_sequence")) {
@@ -189,6 +229,11 @@ async fn prepare_calls(
         if !sequence_catalog::exists(database, &name, tx).await {
             return Err(("42P01", format!("relation \"{name}\" does not exist")));
         }
+    }
+    if let Some(role) = role
+        && let Some(refusal) = sequence_refusal(database, tx, stmt, role).await
+    {
+        return Err(refusal);
     }
     // `'s'::regclass`, as pg_dump and ORMs write a sequence argument: the
     // name it reads is the text's (`sequence::sequence_name_of`).

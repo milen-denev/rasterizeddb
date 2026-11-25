@@ -4,9 +4,10 @@
 //!
 //! # Framing
 //!
-//! `len:u32 LE ‖ crc32:u32 LE ‖ kind:u8 ‖ payload`. `len` counts `kind ‖
-//! payload` (1 to [`MAX_RECORD_LEN`]) and the CRC (IEEE, `crc32fast`) covers
-//! the same bytes. Every payload opens with its layout version, [`LAYOUT_V1`].
+//! `len:u32 LE ‖ crc32:u32 LE ‖ kind:u8 ‖ payload`, framed by
+//! `core::framed_log` ([`FORMAT`]). `len` counts `kind ‖ payload` (1 to
+//! [`MAX_RECORD_LEN`]) and the CRC (IEEE) covers the same bytes. Every
+//! payload opens with its layout version, [`LAYOUT_V1`].
 //! Integers are little-endian. `opt(T)` is a flag byte (0 or 1) then `T`,
 //! which must be zero when the flag is 0, so every field has a fixed width.
 //!
@@ -24,8 +25,16 @@
 //! | 0x0A | RESHAPE_ABORT | id u64 |
 //! | 0x0B | RETIRED_GONE | n u32, n × pid u32 |
 //! | 0x0C | DROPPED | none |
-//! | 0x0D | SNAPSHOT | epoch u64, next_pid u64, last_reshape u64, n u32, n × (lo u64, pid u32), p u32, p × (pid u32, retired u8, opt(loc u32), opt(pin u64), opt(rows u64, bytes u64)), r u32, r × RESHAPE_BEGIN's fields |
+//! | 0x0D | SNAPSHOT | epoch u64, next_pid u64, last_reshape u64, n u32, n × (lo u64, pid u32), p u32, p × (pid u32, state u8, opt(loc u32), opt(pin u64), opt(rows u64, bytes u64)), r u32, r × RESHAPE_BEGIN's fields |
 //! | 0x0E | SEALED | none |
+//! | 0x0F | ACQUIRE_SPAN | hi u128, n u32, n × (lo u64, pid u32) |
+//! | 0x10 | RELEASE_SPAN | hi u128, n u32, n × (lo u64, pid u32) |
+//!
+//! A `SNAPSHOT` partition's `state` byte is 0 live, 1 retired, 2 `FOREIGN`.
+//! Only a shard's map (feature `sharding`) ever writes 2 or the two span
+//! kinds; every build decodes them, so there is one format, and a build that
+//! predates them refuses such a log as "written by a newer binary" rather
+//! than serving a span it does not own.
 //!
 //! # What each record does to the state
 //!
@@ -63,15 +72,33 @@
 //! - `SNAPSHOT` sets the whole state, and only opens a generation: it must
 //!   follow `HEADER` and `LOCATIONS` with no `PLACE` before it.
 //! - `SEALED` marks a compacted generation complete; once only.
+//! - `ACQUIRE_SPAN { hi, entries }` is how a shard takes ownership of
+//!   `[entries[0].lo, hi)` (sharding-plan.md B0.4): every entry it replaces
+//!   must be `FOREIGN`, and the new pids are fresh, live and unmaterialized,
+//!   as `PLACE`'s are. Both ends must be partition boundaries.
+//! - `RELEASE_SPAN { hi, entries }` gives the span up: every entry it
+//!   replaces must be live, not `FOREIGN` and no open reshape's source, and
+//!   the new pids are fresh and `FOREIGN`. A replaced partition that holds
+//!   files is retired, keeping its location and pin until `RETIRED_GONE` as a
+//!   reshape's source does (its rows are another shard's now, and its files
+//!   are deleted, never read); one with no files leaves the state.
+//!
+//! A **`FOREIGN`** partition is a placed range this shard does not own. It
+//! holds no files, no pin and no stats, is never materialized, retired or a
+//! reshape's source or target, and `PLACE` may not replace it (only
+//! `ACQUIRE_SPAN` may). Every path that opens or plans a partition refuses
+//! it with an error: reading it as empty would answer for another shard's
+//! rows.
 //! - `DROPPED` ends the log: any record after it is an error.
 //!
-//! `PLACE` and `RESHAPE_COMMIT` start a new epoch, and every epoch's map
+//! `PLACE`, `RESHAPE_COMMIT`, `ACQUIRE_SPAN` and `RELEASE_SPAN` start a new
+//! epoch, and every epoch's map
 //! passes [`RangeMap::validate`].
 //!
 //! # Replay
 //!
-//! [`replay`] applies records in order and stops at the first whose framing
-//! fails: too short to hold its header, an implausible length, running past
+//! [`replay`] applies records in order (`framed_log::scan`) and stops at the
+//! first whose framing fails: too short to hold its header, an implausible length, running past
 //! the end, or a CRC mismatch. When no intact record starts anywhere after
 //! it (a partial record, or the zeros of a file a crash extended), that is a
 //! torn tail; [`Replay::torn`] says where, and the caller truncates to
@@ -90,6 +117,8 @@ use std::collections::{BTreeMap, HashSet};
 
 use super::key::{KeyFamily, MAX_ARITY};
 use super::map::{PointRange, RangeMap, SPACE_END};
+use crate::core::framed_log::{self, Format};
+pub use crate::core::framed_log::{FRAME_LEN, TornTail};
 
 /// The only routing version this binary knows (§1.3).
 pub const ROUTE_V1: u16 = 1;
@@ -97,12 +126,17 @@ pub const ROUTE_V1: u16 = 1;
 /// The payload layout every record kind is written in.
 pub const LAYOUT_V1: u8 = 1;
 
-/// `len ‖ crc32`.
-pub const FRAME_LEN: usize = 8;
-
 /// The largest `kind ‖ payload` a record may have. A snapshot of 65,536
 /// partitions is about 3 MB; a larger length is a corrupt one.
 pub const MAX_RECORD_LEN: u32 = 64 << 20;
+
+/// The map log's framing.
+pub const FORMAT: Format = Format {
+    name: "partition map log",
+    max_record_len: MAX_RECORD_LEN,
+    layout: LAYOUT_V1,
+    known_kind: |tag| Kind::from_tag(tag).is_some(),
+};
 
 /// A record's kind byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,10 +156,12 @@ pub enum Kind {
     Dropped = 0x0C,
     Snapshot = 0x0D,
     Sealed = 0x0E,
+    AcquireSpan = 0x0F,
+    ReleaseSpan = 0x10,
 }
 
 impl Kind {
-    const ALL: [Kind; 14] = [
+    const ALL: [Kind; 16] = [
         Kind::Header,
         Kind::Locations,
         Kind::Place,
@@ -140,6 +176,8 @@ impl Kind {
         Kind::Dropped,
         Kind::Snapshot,
         Kind::Sealed,
+        Kind::AcquireSpan,
+        Kind::ReleaseSpan,
     ];
 
     pub fn from_tag(tag: u8) -> Option<Kind> {
@@ -162,6 +200,8 @@ impl Kind {
             Kind::Dropped => "DROPPED",
             Kind::Snapshot => "SNAPSHOT",
             Kind::Sealed => "SEALED",
+            Kind::AcquireSpan => "ACQUIRE_SPAN",
+            Kind::ReleaseSpan => "RELEASE_SPAN",
         }
     }
 }
@@ -264,6 +304,10 @@ pub struct PartState {
     /// clean, or never written.
     pub pin: Option<u64>,
     pub stats: Option<PartStats>,
+    /// A placed range this shard does not own (`RELEASE_SPAN`): no files,
+    /// never opened, and refused by every open path rather than read as
+    /// empty. Never set with `retired`.
+    pub foreign: bool,
 }
 
 /// The whole state, for opening a compacted generation.
@@ -295,6 +339,8 @@ pub enum Record {
     Dropped,
     Snapshot(Snapshot),
     Sealed,
+    AcquireSpan { hi: u128, entries: Vec<(u64, u32)> },
+    ReleaseSpan { hi: u128, entries: Vec<(u64, u32)> },
 }
 
 impl Record {
@@ -314,6 +360,8 @@ impl Record {
             Record::Dropped => Kind::Dropped,
             Record::Snapshot(_) => Kind::Snapshot,
             Record::Sealed => Kind::Sealed,
+            Record::AcquireSpan { .. } => Kind::AcquireSpan,
+            Record::ReleaseSpan { .. } => Kind::ReleaseSpan,
         }
     }
 }
@@ -370,9 +418,7 @@ impl W {
 /// `rec`, framed and ready to append. Refuses a record [`replay`] would read
 /// as torn.
 pub fn encode(rec: &Record) -> Result<Vec<u8>, String> {
-    let mut w = W(vec![0; FRAME_LEN]);
-    w.u8(rec.kind() as u8);
-    w.u8(LAYOUT_V1);
+    let mut w = W(framed_log::begin(rec.kind() as u8, LAYOUT_V1));
     match rec {
         Record::Header(h) => {
             w.u64(h.uid);
@@ -395,7 +441,9 @@ pub fn encode(rec: &Record) -> Result<Vec<u8>, String> {
                 w.0.extend_from_slice(p.as_bytes());
             }
         }
-        Record::Place { hi, entries } => {
+        Record::Place { hi, entries }
+        | Record::AcquireSpan { hi, entries }
+        | Record::ReleaseSpan { hi, entries } => {
             w.u128(*hi);
             w.count(entries.len())?;
             for &(lo, pid) in entries {
@@ -451,7 +499,7 @@ pub fn encode(rec: &Record) -> Result<Vec<u8>, String> {
             w.count(s.parts.len())?;
             for (pid, p) in &s.parts {
                 w.u32(*pid);
-                w.u8(p.retired as u8);
+                w.u8(if p.foreign { 2 } else { p.retired as u8 });
                 w.opt_u32(p.location);
                 w.opt_u64(p.pin);
                 w.u8(p.stats.is_some() as u8);
@@ -465,18 +513,12 @@ pub fn encode(rec: &Record) -> Result<Vec<u8>, String> {
             }
         }
     }
-    let mut buf = w.0;
-    let body = buf.len() - FRAME_LEN;
-    if body > MAX_RECORD_LEN as usize {
-        return Err(format!(
+    framed_log::finish(&FORMAT, w.0).map_err(|body| {
+        format!(
             "a {} record of {body} bytes exceeds the map log's {MAX_RECORD_LEN}-byte limit",
             rec.kind().name()
-        ));
-    }
-    let crc = crc32fast::hash(&buf[FRAME_LEN..]);
-    buf[0..4].copy_from_slice(&(body as u32).to_le_bytes());
-    buf[4..8].copy_from_slice(&crc.to_le_bytes());
-    Ok(buf)
+        )
+    })
 }
 
 // ---------------------------------------------------------------- decoding
@@ -614,14 +656,18 @@ pub fn decode(tag: u8, payload: &[u8]) -> Result<Record, String> {
             }
             Record::Locations(paths)
         }
-        Kind::Place => {
+        Kind::Place | Kind::AcquireSpan | Kind::ReleaseSpan => {
             let hi = r.u128()?;
             let n = r.count(12)?;
             let mut entries = Vec::with_capacity(n);
             for _ in 0..n {
                 entries.push((r.u64()?, r.u32()?));
             }
-            Record::Place { hi, entries }
+            match kind {
+                Kind::Place => Record::Place { hi, entries },
+                Kind::AcquireSpan => Record::AcquireSpan { hi, entries },
+                _ => Record::ReleaseSpan { hi, entries },
+            }
         }
         Kind::Materialize => Record::Materialize {
             pid: r.u32()?,
@@ -672,7 +718,12 @@ pub fn decode(tag: u8, payload: &[u8]) -> Result<Record, String> {
             let mut parts = Vec::with_capacity(p);
             for _ in 0..p {
                 let pid = r.u32()?;
-                let retired = r.flag()?;
+                let (retired, foreign) = match r.u8()? {
+                    0 => (false, false),
+                    1 => (true, false),
+                    2 => (false, true),
+                    b => return Err(format!("snapshot partition {pid} has state byte {b:#04x}")),
+                };
                 let location = r.opt_u32()?;
                 let pin = r.opt_u64()?;
                 let has_stats = r.flag()?;
@@ -687,6 +738,7 @@ pub fn decode(tag: u8, payload: &[u8]) -> Result<Record, String> {
                         location,
                         pin,
                         stats,
+                        foreign,
                     },
                 ));
             }
@@ -707,64 +759,6 @@ pub fn decode(tag: u8, payload: &[u8]) -> Result<Record, String> {
     };
     r.end()?;
     Ok(rec)
-}
-
-enum Frame<'a> {
-    End,
-    Torn(String),
-    Record { tag: u8, payload: &'a [u8], next: usize },
-}
-
-fn read_frame(buf: &[u8], at: usize) -> Frame<'_> {
-    let rest = &buf[at..];
-    if rest.is_empty() {
-        return Frame::End;
-    }
-    if rest.len() < FRAME_LEN {
-        return Frame::Torn(format!("{} bytes, too few for a record header", rest.len()));
-    }
-    let len = u32::from_le_bytes(rest[0..4].try_into().unwrap());
-    let crc = u32::from_le_bytes(rest[4..8].try_into().unwrap());
-    if len == 0 || len > MAX_RECORD_LEN {
-        return Frame::Torn(format!("implausible record length {len}"));
-    }
-    let len = len as usize;
-    if rest.len() - FRAME_LEN < len {
-        return Frame::Torn(format!(
-            "record of {len} bytes runs past the end ({} left)",
-            rest.len() - FRAME_LEN
-        ));
-    }
-    let body = &rest[FRAME_LEN..FRAME_LEN + len];
-    if crc32fast::hash(body) != crc {
-        return Frame::Torn("CRC mismatch".to_string());
-    }
-    Frame::Record {
-        tag: body[0],
-        payload: &body[1..],
-        next: at + FRAME_LEN + len,
-    }
-}
-
-/// The first offset after `at` where an intact record starts: a plausible
-/// length that fits, a known kind, [`LAYOUT_V1`], then the CRC. The cheap
-/// checks come first, and keep a chance CRC match inside a torn record's own
-/// bytes far less likely than real damage.
-fn intact_frame_after(buf: &[u8], at: usize) -> Option<usize> {
-    (at + 1..buf.len()).find(|&y| {
-        let rest = &buf[y..];
-        if rest.len() < FRAME_LEN + 2 {
-            return false;
-        }
-        let len = u32::from_le_bytes(rest[0..4].try_into().unwrap());
-        if len < 2 || len > MAX_RECORD_LEN || rest.len() - FRAME_LEN < len as usize {
-            return false;
-        }
-        let body = &rest[FRAME_LEN..FRAME_LEN + len as usize];
-        Kind::from_tag(body[0]).is_some()
-            && body[1] == LAYOUT_V1
-            && crc32fast::hash(body) == u32::from_le_bytes(rest[4..8].try_into().unwrap())
-    })
 }
 
 // ---------------------------------------------------------------- state
@@ -825,6 +819,9 @@ fn place_span(hi: u128, entries: &[(u64, u32)]) -> Result<PointRange, String> {
 }
 
 fn check_part(pid: u32, p: &PartState, locations: usize) -> Result<(), String> {
+    if p.foreign && (p.retired || p.location.is_some() || p.pin.is_some() || p.stats.is_some()) {
+        return Err(format!("FOREIGN partition {pid} is retired or has files, a pin or stats"));
+    }
     match p.location {
         Some(l) if l as usize >= locations => {
             Err(format!("partition {pid} is at location {l}, but only {locations} are interned"))
@@ -920,6 +917,75 @@ impl MapState {
     pub fn locations(&self) -> &[String] {
         &self.locations
     }
+    /// The records that make points `[lo, hi)` this shard's (`take`) or
+    /// another shard's (`!take`) in this map, and nothing else (sharding-plan.md
+    /// B2, a move's carve and hand-off). Taking splits a FOREIGN partition
+    /// straddling an edge (it holds no files); giving refuses a live one
+    /// straddling an edge, which only a reshape may split. Applying them in order leaves every point of `[lo, hi)`
+    /// live (taken) or FOREIGN (given), and every other point as it was.
+    /// Empty when the span already is.
+    pub fn span_records(&self, lo: u64, hi: u128, take: bool) -> Result<Vec<Record>, String> {
+        if lo as u128 >= hi {
+            return Err(format!("the span [{lo:#x}, {hi:#x}) is empty"));
+        }
+        let mut next_pid = self.next_pid;
+        let mut fresh = || -> Result<u32, String> {
+            let p = u32::try_from(next_pid).map_err(|_| "the table has used every partition id".to_string())?;
+            next_pid += 1;
+            Ok(p)
+        };
+        let mut out = Vec::new();
+        let entries = self.map.entries();
+        for (j, &(a, pid)) in entries.iter().enumerate() {
+            let b: u128 = entries.get(j + 1).map_or(SPACE_END, |&(l, _)| l as u128);
+            if b <= lo as u128 || a as u128 >= hi {
+                continue;
+            }
+            let foreign = self.parts.get(&pid).is_some_and(|p| p.foreign);
+            if foreign != take {
+                continue; // already as wanted
+            }
+            // The entry's pieces: before the span, inside it, after it.
+            let inner_lo = (a as u128).max(lo as u128) as u64;
+            let inner_hi = b.min(hi);
+            let mut pieces: Vec<(u64, u128, bool)> = Vec::new(); // (lo, hi, inside)
+            if (a as u128) < lo as u128 {
+                pieces.push((a, lo as u128, false));
+            }
+            pieces.push((inner_lo, inner_hi, true));
+            if inner_hi < b {
+                pieces.push((inner_hi as u64, b, false));
+            }
+            if take {
+                // Take the whole FOREIGN entry as live pieces, then give the
+                // outside pieces back.
+                let mut placed = Vec::with_capacity(pieces.len());
+                for &(plo, _, _) in &pieces {
+                    placed.push((plo, fresh()?));
+                }
+                out.push(Record::AcquireSpan { hi: b, entries: placed.clone() });
+                for &(plo, phi, inside) in &pieces {
+                    if !inside {
+                        out.push(Record::ReleaseSpan { hi: phi, entries: vec![(plo, fresh()?)] });
+                    }
+                }
+            } else {
+                // A live entry is given away whole. Splitting one would
+                // retire its files with the rows outside the span in them,
+                // which this shard still owns: a straddling partition is
+                // split by a reshape first, which copies its rows.
+                if pieces.len() > 1 {
+                    return Err(format!(
+                        "partition {pid} covers [{a:#x}, {b:#x}), across the span's edge: split it first \
+                         (ALTER TABLE … SPLIT PARTITION) so the span ends on partition boundaries"
+                    ));
+                }
+                out.push(Record::ReleaseSpan { hi: b, entries: vec![(a, fresh()?)] });
+            }
+        }
+        Ok(out)
+    }
+
     pub fn map(&self) -> &RangeMap {
         &self.map
     }
@@ -994,6 +1060,7 @@ impl MapState {
     fn part_mut(&mut self, pid: u32, live: bool) -> Result<&mut PartState, String> {
         match self.parts.get_mut(&pid) {
             Some(p) if live && p.retired => Err(format!("partition {pid} is retired")),
+            Some(p) if p.foreign => Err(format!("partition {pid} is FOREIGN: this shard does not own its span")),
             Some(p) => Ok(p),
             None => Err(format!("no partition {pid}")),
         }
@@ -1060,8 +1127,8 @@ impl MapState {
                 return Err(format!("reshape {} names source {pid} twice", b.id));
             }
             match self.parts.get(&pid) {
-                Some(p) if !p.retired => {}
-                _ => return Err(format!("reshape {} source {pid} is not a live partition", b.id)),
+                Some(p) if !p.retired && !p.foreign => {}
+                _ => return Err(format!("reshape {} source {pid} is not a live, owned partition", b.id)),
             }
             if let Some(other) = self.reshape_source_of(pid) {
                 return Err(format!("partition {pid} is already a source of reshape {other}"));
@@ -1106,6 +1173,8 @@ impl MapState {
             Record::Snapshot(_) => Err("SNAPSHOT after the map was placed; a snapshot only opens a generation".to_string()),
             Record::Locations(paths) => extend_locations(&mut self.locations, paths),
             Record::Place { hi, entries } => self.apply_place(*hi, entries),
+            Record::AcquireSpan { hi, entries } => self.apply_span(*hi, entries, true),
+            Record::ReleaseSpan { hi, entries } => self.apply_span(*hi, entries, false),
             &Record::Materialize { pid, floor, loc } => {
                 if loc as usize >= self.locations.len() {
                     return Err(format!("partition {pid} materialized at unknown location {loc}"));
@@ -1186,6 +1255,9 @@ impl MapState {
         for &pid in &replaced {
             if self.parts.get(&pid).is_some_and(|p| p.location.is_some()) {
                 return Err(format!("PLACE would drop partition {pid}, which holds files; rows move only by reshape"));
+            }
+            if self.parts.get(&pid).is_some_and(|p| p.foreign) {
+                return Err(format!("PLACE would drop FOREIGN partition {pid}; ownership is taken only by ACQUIRE_SPAN"));
             }
             if let Some(id) = self.reshape_source_of(pid) {
                 return Err(format!("PLACE would drop partition {pid}, a source of open reshape {id}"));
@@ -1273,12 +1345,59 @@ impl MapState {
                     location: Some(t.loc),
                     pin,
                     stats: None,
+                    foreign: false,
                 },
             );
         }
         self.map = map;
         self.epoch = epoch;
         self.reshapes.remove(&id);
+        Ok(())
+    }
+
+    /// `ACQUIRE_SPAN` (`acquire`) or `RELEASE_SPAN`: the span's entries,
+    /// all `FOREIGN` (acquire) or all live and owned (release), are replaced
+    /// by fresh pids that are live (acquire) or `FOREIGN` (release). A
+    /// released partition with files is retired until `RETIRED_GONE`.
+    fn apply_span(&mut self, hi: u128, entries: &[(u64, u32)], acquire: bool) -> Result<(), String> {
+        let what = if acquire { "ACQUIRE_SPAN" } else { "RELEASE_SPAN" };
+        let span = place_span(hi, entries).map_err(|e| e.replacen("PLACE", what, 1))?;
+        let (first, end) = self.span_indices(span)?;
+        let replaced: Vec<u32> = self.map.entries()[first..end].iter().map(|&(_, pid)| pid).collect();
+        for &pid in &replaced {
+            let p = self.parts.get(&pid).ok_or_else(|| format!("live partition {pid} has no state"))?;
+            if acquire && !p.foreign {
+                return Err(format!("ACQUIRE_SPAN over partition {pid}, which this shard already owns"));
+            }
+            if !acquire && p.foreign {
+                return Err(format!("RELEASE_SPAN over FOREIGN partition {pid}, which this shard does not own"));
+            }
+            if let Some(id) = self.reshape_source_of(pid) {
+                return Err(format!("{what} would drop partition {pid}, a source of open reshape {id}"));
+            }
+        }
+        let next_pid = self.fresh(entries.iter().map(|&(_, pid)| pid))?;
+        let cur = self.map.entries();
+        let mut next = Vec::with_capacity(cur.len() - (end - first) + entries.len());
+        next.extend_from_slice(&cur[..first]);
+        next.extend_from_slice(entries);
+        next.extend_from_slice(&cur[end..]);
+        let map = RangeMap::new(next)?;
+        let epoch = self.next_epoch()?;
+        for pid in replaced {
+            let p = self.parts.get_mut(&pid).expect("checked above");
+            if p.location.is_some() {
+                p.retired = true;
+            } else {
+                self.parts.remove(&pid);
+            }
+        }
+        for &(_, pid) in entries {
+            self.parts.insert(pid, PartState { foreign: !acquire, ..PartState::default() });
+        }
+        self.map = map;
+        self.next_pid = next_pid;
+        self.epoch = epoch;
         Ok(())
     }
 
@@ -1291,16 +1410,6 @@ impl MapState {
 }
 
 // ---------------------------------------------------------------- replay
-
-/// Where a replay stopped short of the end.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TornTail {
-    /// Byte offset of the record that failed its framing.
-    pub offset: usize,
-    pub reason: String,
-    /// Bytes from `offset` to the end, all ignored.
-    pub trailing: usize,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Replay {
@@ -1353,31 +1462,8 @@ impl Loader {
 /// understood or applied.
 pub fn replay(buf: &[u8]) -> Result<Replay, String> {
     let mut loader = Loader::Empty;
-    let mut at = 0;
-    let mut torn = None;
-    loop {
-        let (tag, payload, next) = match read_frame(buf, at) {
-            Frame::End => break,
-            Frame::Torn(reason) => {
-                if let Some(y) = intact_frame_after(buf, at) {
-                    return Err(format!(
-                        "partition map log: damaged record at byte {at} ({reason}) followed by a valid record at byte {y}; refusing"
-                    ));
-                }
-                torn = Some(TornTail {
-                    offset: at,
-                    reason,
-                    trailing: buf.len() - at,
-                });
-                break;
-            }
-            Frame::Record { tag, payload, next } => (tag, payload, next),
-        };
-        decode(tag, payload)
-            .and_then(|rec| loader.feed(&rec))
-            .map_err(|e| format!("partition map log, record at byte {at}: {e}"))?;
-        at = next;
-    }
+    let end = framed_log::scan(&FORMAT, buf, |_, tag, payload| decode(tag, payload).and_then(|rec| loader.feed(&rec)))?;
+    let (at, torn) = (end.valid_len, end.torn);
     match loader {
         Loader::Mapped(state) => Ok(Replay {
             state,
@@ -1555,13 +1641,15 @@ mod tests {
         });
         records.push(Record::Locations(vec!["/ünïcode/路径".to_string(), String::new()]));
         records.push(Record::ReshapeCommit { id: u64::MAX, pins: vec![] });
+        records.push(Record::AcquireSpan { hi: SPACE_END, entries: vec![(1 << 16, 40), (1 << 32, 41)] });
+        records.push(Record::ReleaseSpan { hi: 1 << 40, entries: vec![(0, u32::MAX)] });
         for kind in Kind::ALL {
             assert!(records.iter().any(|r| r.kind() == kind), "{} not covered", kind.name());
             assert_eq!(Kind::from_tag(kind as u8), Some(kind));
         }
         for r in &records {
             let bytes = encode(r).unwrap();
-            let Frame::Record { tag, payload, next } = read_frame(&bytes, 0) else {
+            let framed_log::Frame::Record { tag, payload, next } = framed_log::read_frame(&FORMAT, &bytes, 0) else {
                 panic!("{} did not frame", r.kind().name());
             };
             assert_eq!(next, bytes.len());
@@ -1599,6 +1687,7 @@ mod tests {
             location: loc,
             pin,
             stats: stats.map(|(rows, bytes)| PartStats { rows, bytes }),
+            foreign: false,
         };
         assert_eq!(part(0), p(Some(1), Some(610), Some((1, 100))));
         assert_eq!(part(1), p(Some(0), Some(620), None));
@@ -1758,7 +1847,7 @@ mod tests {
             log.extend(raw_frame(body));
             replay(&log)
         };
-        assert!(with(&[0x0F, LAYOUT_V1]).unwrap_err().contains("unknown record kind"));
+        assert!(with(&[0x11, LAYOUT_V1]).unwrap_err().contains("unknown record kind"));
         assert!(with(&[0x00]).unwrap_err().contains("unknown record kind"));
         assert!(with(&[Kind::Sealed as u8, 2]).unwrap_err().contains("layout version 2"));
         assert!(with(&[Kind::Sealed as u8]).unwrap_err().contains("ends early"));
@@ -1912,7 +2001,7 @@ mod tests {
         bad("out of order", &|s| s.reshapes[0].id = 0);
         bad("not a spent, unused pid", &|s| s.reshapes[0].targets[0].pid = 13);
         bad("not a spent, unused pid", &|s| s.reshapes[0].targets[0].pid = 16);
-        bad("not a live partition", &|s| s.reshapes[0].sources = vec![3]);
+        bad("not a live, owned partition", &|s| s.reshapes[0].sources = vec![3]);
         bad("already a source of reshape 4", &|s| {
             s.reshapes.insert(
                 0,
@@ -2015,6 +2104,7 @@ mod tests {
                                 location: Some(1),
                                 pin: Some(9),
                                 stats: Some(PartStats { rows: 3, bytes: 4 }),
+                                foreign: false,
                             },
                         ),
                     ],

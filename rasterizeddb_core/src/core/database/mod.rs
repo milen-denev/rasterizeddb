@@ -1,6 +1,8 @@
 pub mod catalog;
 pub mod incompat;
 pub mod index_checkpoint;
+#[cfg(feature = "sharding_2pc")]
+mod prepared;
 #[cfg(test)]
 mod catalogue_present_tests;
 #[cfg(test)]
@@ -2298,6 +2300,19 @@ impl Database {
         self.transactions.check_ids_reserved(tx)?;
         self.sync_other_locations()?;
         let mut family = self.family_of(tx);
+        // A shard's Raft group: the write is proposed and applied by a
+        // quorum before it becomes visible here (sharding-plan.md B3).
+        #[cfg(feature = "sharding_raft")]
+        if crate::core::shard::capture::active() {
+            use crate::core::mvcc::TxOutcome;
+            let members: Vec<(crate::core::mvcc::TxId, bool)> = self
+                .transactions
+                .family_of(tx)
+                .into_iter()
+                .map(|id| (id, self.transactions.outcome(id) != TxOutcome::Aborted))
+                .collect();
+            crate::core::shard::raft_apply::propose_commit(self, &members, tx)?;
+        }
         // The replication record, ahead of the commit: on failure nothing
         // has been committed, and the caller aborts.
         self.prepare_replication(tx, &mut family)?;
@@ -2422,6 +2437,8 @@ impl Database {
 
     /// Ends `tx` without effect and discards what replication buffered for it.
     pub fn abort_transaction(&self, tx: crate::core::mvcc::TxId) {
+        #[cfg(feature = "sharding_raft")]
+        crate::core::shard::capture::discard(self.id, tx);
         // Read before the abort: nothing prunes the parent map today, but
         // relying on that would make this quietly wrong the day something does.
         let family = self.family_of(tx);
@@ -6424,6 +6441,12 @@ pub(crate) struct NativeConnection {
     /// The connection asked for notices
     /// ([`crate::pgwire::NATIVE_NOTICES_PREFIX`]): its answers carry them.
     notices: std::sync::atomic::AtomicBool,
+    /// Its admission, decided at its first statement in its database and
+    /// held for the connection's life: the role's place under its
+    /// CONNECTION LIMIT and VALID UNTIL (R2), and the tenancy policy's
+    /// admit (T7), as a pgwire login is admitted. A refusal is kept and
+    /// answers every request.
+    admission: tokio::sync::OnceCell<Result<crate::auth::RoleSlot, String>>,
 }
 
 impl NativeConnection {
@@ -6529,6 +6552,7 @@ fn open_native_session(
         multiplexed: connection.multiplexed,
         session: std::sync::OnceLock::new(),
         notices: std::sync::atomic::AtomicBool::new(false),
+        admission: tokio::sync::OnceCell::new(),
     }
 }
 
@@ -6596,6 +6620,35 @@ async fn serve_native_request(
         Ok(session) => session,
         Err((_, message)) => return error_response(&message),
     };
+    let admitted = connection
+        .admission
+        .get_or_init(|| async {
+            let database = session.database();
+            // Only a password proves a credential here; a listener without
+            // authentication is held to the limit but not to VALID UNTIL.
+            let slot = crate::auth::admit_role_login(
+                database,
+                &principal.user,
+                principal.superuser,
+                context.authentication_required,
+            )
+            .await
+            .map_err(|(_, message)| message)?;
+            let ctx = crate::core::policy_hooks::SessionContext {
+                role: &principal.user,
+                database: &database.name,
+                protocol: "native",
+                superuser: principal.superuser,
+            };
+            crate::core::policy_hooks::tenancy()
+                .admit(&ctx)
+                .map_err(|e| e.trim_start_matches("28000: ").to_string())?;
+            Ok(slot)
+        })
+        .await;
+    if let Err(message) = admitted {
+        return error_response(message);
+    }
     // Everything below reads the database from the context.
     let context = if Arc::ptr_eq(session.database(), &context.database) {
         context
@@ -6609,6 +6662,26 @@ async fn serve_native_request(
     // answer; any other is answered exactly as before.
     let notices = connection.notices.load(std::sync::atomic::Ordering::Relaxed);
     process_native_request_for(context, principal, Some(session), request_vec, notices).await
+}
+
+/// Whether a native request's caller administers: an authenticated
+/// superuser, or on a listener that asks for no credential, what the
+/// caller's role makes it (`NativeSession::resolve_admin`,
+/// `auth::trust_login`). Not having to authenticate is no longer being an
+/// administrator. A caller without a connection session (the statement
+/// tests' embedding) keeps the listener's word.
+async fn native_admin(
+    context: &NativeContext,
+    principal: &rastcp::session::Principal,
+    session: Option<&crate::pgwire::NativeSession>,
+) -> bool {
+    if context.authentication_required {
+        return principal.superuser;
+    }
+    match session {
+        Some(session) => session.resolve_admin().await,
+        None => true,
+    }
 }
 
 /// One request with no connection session: transaction control is refused.
@@ -6735,18 +6808,16 @@ async fn process_native_request_for(
         return match parsed {
             Err(e) => error_response(&e),
             Ok(statement) => {
-                let verb = match statement {
-                    crate::auth::RoleStatement::Create { .. } => "CREATE ROLE",
-                    crate::auth::RoleStatement::AlterPassword { .. } => "ALTER ROLE",
-                    crate::auth::RoleStatement::Drop { .. } => "DROP ROLE",
-                };
+                let verb = statement.tag();
                 info!("Received {} from {}", verb, principal);
 
-                if context.authentication_required && !principal.superuser {
-                    return error_response(&format!(
-                        "permission denied: {} is not a superuser",
-                        principal
-                    ));
+                if !native_admin(&context, &principal, session).await {
+                    // Its own password, or a CREATEROLE role's (R2).
+                    if let Err(e) =
+                        crate::auth::role_statement_permitted(&context.database, &principal.user, &statement, None).await
+                    {
+                        return error_response(&format!("permission denied: {} is not a superuser ({e})", principal));
+                    }
                 }
 
                 let method = crate::auth::AuthMethod::ScramSha256;
@@ -6776,11 +6847,32 @@ async fn process_native_request_for(
     // needs a superuser, as on pgwire (`pgwire::privileged_statement`). Only
     // the role statements above were gated here, so any authenticated user
     // could restore over the database or reconfigure the process.
-    if context.authentication_required
-        && !principal.superuser
-        && let Some(verb) = crate::pgwire::privileged_statement(&query)
+    if let Some(verb) = crate::pgwire::privileged_statement(&query)
+        && !native_admin(&context, &principal, session).await
     {
         return error_response(&format!("permission denied: {verb} requires superuser ({principal} is not one)"));
+    }
+    if let Some(verb) = crate::pgwire::privileged_statement(&query) {
+        let ctx = crate::core::policy_hooks::SessionContext {
+            role: &principal.user,
+            database: &context.database.name,
+            protocol: "native",
+            superuser: true,
+        };
+        if let Err(e) = crate::core::policy_hooks::check_privileged(&ctx, verb) {
+            return error_response(&e);
+        }
+    }
+    if crate::core::policy_hooks::installed() {
+        let ctx = crate::core::policy_hooks::SessionContext {
+            role: &principal.user,
+            database: &context.database.name,
+            protocol: "native",
+            superuser: principal.superuser,
+        };
+        if let Err(e) = crate::core::policy_hooks::check_show(&ctx, &query) {
+            return error_response(&e);
+        }
     }
 
     // A transaction block needs a session that holds it between requests;
@@ -6802,12 +6894,35 @@ async fn process_native_request_for(
     // through this between restarts, so a killed process loads its
     // snapshots instead of rebuilding every index.
     if let Some(name) = crate::pgwire::parse_index_checkpoint(&query) {
-        if context.authentication_required && !principal.superuser {
+        if !native_admin(&context, &principal, session).await {
             return error_response(&format!(
                 "permission denied: rdb_index_checkpoint requires superuser ({principal} is not one)"
             ));
         }
         return Box::pin(native_index_checkpoint(&context.database, name)).await;
+    }
+
+    // A statement naming one of the engine's catalogues (`rdb_roles`,
+    // `__rdb_*`): pgwire's path refuses it, or reads `rdb_roles` through its
+    // masked projection (`privileges::catalog_refusal`, `mask_role_catalog`).
+    // This path does neither, so it never runs one: any role read every
+    // verifier here and could write itself superuser.
+    if crate::core::rql::privileges::may_name_catalog(&query) {
+        if let Some((_, message)) = crate::core::rql::privileges::catalog_refusal(&query) {
+            return error_response(&message);
+        }
+        if crate::core::rql::privileges::mask_role_catalog(&query).is_some() {
+            return match session {
+                Some(session) => {
+                    let run = Box::pin(session.run_alone(&query));
+                    if notices { crate::pgwire::native_with_notices(run).await } else { run.await }
+                }
+                None => error_response(&format!(
+                    "permission denied: \"{}\" is read through a connection session, which this caller does not have",
+                    crate::auth::ROLE_TABLE
+                )),
+            };
+        }
     }
 
     // A correlated scalar subquery (`SELECT id, (SELECT count(*) FROM p

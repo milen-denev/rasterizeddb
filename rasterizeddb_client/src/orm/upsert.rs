@@ -256,6 +256,7 @@ impl<'a, E: Executor, M: Model> Upsert<'a, E, M> {
 
     /// The statement awaiting it sends.
     pub fn to_sql(&self) -> Result<String> {
+        super::shard_guard(self.db, self.row)?;
         self.row.__rdb_before(super::Write::Upsert)?;
         upsert_statement(&[self.row], self.target.as_deref(), &self.action, true)
     }
@@ -312,6 +313,7 @@ impl<E, M> fmt::Debug for UpsertNothing<'_, E, M> {
 impl<E: Executor, M: Model> UpsertNothing<'_, E, M> {
     /// The statement awaiting it sends.
     pub fn to_sql(&self) -> Result<String> {
+        super::shard_guard(self.db, self.row)?;
         self.row.__rdb_before(super::Write::Insert)?;
         upsert_statement(&[self.row], self.target.as_deref(), &Action::Nothing, false)
     }
@@ -408,6 +410,7 @@ impl<'a, E: Executor, M: Model> InsertMany<'a, E, M> {
             _ => super::Write::Insert,
         };
         for row in self.rows {
+            super::shard_guard(self.db, row)?;
             row.__rdb_before(write)?;
         }
         let Some((target, action)) = &self.conflict else {

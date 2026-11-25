@@ -9,6 +9,10 @@
 // printing min/median wall clock and how far peak RSS grew. Build the binary
 // before and after a change and interleave the runs: this box drifts ~15%.
 
+// As the library and the server set it: the executor's future is deep, and
+// spawning it asks the compiler to follow all of it for Send.
+#![recursion_limit = "256"]
+
 use std::time::Instant;
 
 use rclite::Arc;

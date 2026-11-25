@@ -1,6 +1,7 @@
 pub mod column_iter;
 pub mod common;
 pub mod error;
+pub mod identifying_key;
 pub mod key_locks;
 pub mod logical;
 pub mod point_key;

@@ -290,6 +290,10 @@ struct State {
 pub struct Transaction {
     state: tokio::sync::Mutex<State>,
     connections: Arc<Connections>,
+    /// Set by a router's `begin_for`: the one shard this transaction's rows
+    /// may live on.
+    #[cfg(feature = "sharding")]
+    scope: std::sync::OnceLock<crate::shard::ShardScope>,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -308,7 +312,15 @@ impl Transaction {
                 in_flight: false,
             }),
             connections,
+            #[cfg(feature = "sharding")]
+            scope: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Pins the transaction to a router's shard (once).
+    #[cfg(feature = "sharding")]
+    pub(crate) fn pin_shard(&self, scope: crate::shard::ShardScope) {
+        let _ = self.scope.set(scope);
     }
 
     /// Sends one statement on the transaction's connection and reads its
@@ -461,6 +473,11 @@ impl Transaction {
 impl Executor for Transaction {
     fn send_checked(&self, sql: &str) -> impl Future<Output = Result<Rows>> + Send {
         self.exchange(sql, Step::Statement)
+    }
+
+    #[cfg(feature = "sharding")]
+    fn __shard_scope(&self) -> Option<&crate::shard::ShardScope> {
+        self.scope.get()
     }
 }
 

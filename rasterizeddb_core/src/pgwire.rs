@@ -46,7 +46,7 @@ mod routine_statements;
 mod trigger_exec;
 mod merge_exec;
 mod copy;
-mod notify;
+pub(crate) mod notify;
 mod explain;
 mod temp_tables;
 mod session_values;
@@ -58,6 +58,8 @@ mod prepared_partition_tests;
 mod statement_intern;
 #[cfg(test)]
 mod owner_tests;
+#[cfg(test)]
+mod roles_tests;
 #[cfg(test)]
 mod schema_view_tests;
 #[cfg(test)]
@@ -89,8 +91,17 @@ mod branch_merge;
 pub const KEYMAP_TABLE_NAME: &str = branch_merge::KEYMAP_TABLE;
 #[cfg(all(test, feature = "db_branching"))]
 mod branch_tests;
-#[cfg(any(feature = "mysql_wire", feature = "mssql_wire"))]
+#[cfg(any(feature = "mysql_wire", feature = "mssql_wire", feature = "sharding"))]
 pub(crate) mod proxied;
+
+/// Makes this server a front-end node (sharding-plan.md B4.7): its MySQL and
+/// SQL Server sessions run on the cluster behind `gateway` (`host:port` of
+/// its PostgreSQL listener), logged in as each client's role. Once, at
+/// start.
+#[cfg(any(feature = "mysql_wire", feature = "mssql_wire"))]
+pub fn set_frontend_upstream(gateway: String) -> Result<(), String> {
+    proxied::set_upstream(gateway)
+}
 mod wire_out;
 
 pub(crate) use native_session::{NativeSession, NativeTemplate, NativeTextStep, begins_with_data_verb as native_begins_with_data_verb};
@@ -1132,6 +1143,9 @@ fn field_of<'a>(
 
 async fn seed_roles(database: &Arc<Database>, auth: &AuthConfig) -> Result<(), String> {
     if auth.method == crate::auth::AuthMethod::Trust {
+        // No catalogue is made under trust, but the relations still get
+        // their owner: a role created later is checked against them.
+        crate::auth::prepare_owners(database, &auth.bootstrap_user).await;
         return Ok(());
     }
     crate::auth::ensure_role_catalogue(
@@ -1579,6 +1593,12 @@ tokio::task_local! {
     static SESSION_CANCEL: StdArc<crate::core::cancel::SessionCancel>;
 }
 
+/// The session the running task's statement belongs to, if it runs in one.
+#[cfg(feature = "sharding")]
+pub(crate) fn current_session_cancel() -> Option<StdArc<crate::core::cancel::SessionCancel>> {
+    SESSION_CANCEL.try_with(StdArc::clone).ok()
+}
+
 /// The end of an autocommit statement's reply, held until its table locks are
 /// released (docs/persistent-indexes.md §7, "As built (B3b)").
 ///
@@ -1612,6 +1632,21 @@ tokio::task_local! {
 }
 
 tokio::task_local! {
+    /// Set for the life of a session another protocol's front end opened
+    /// over the in-process pipe (`proxied::serve_proxied`): the one kind of
+    /// session that accepts [`SYSTEM_STATEMENT_TAG`]. A client of the
+    /// PostgreSQL listener can write any message type, so the announcement
+    /// means nothing on its connection.
+    pub(super) static PROXIED_SESSION: ();
+}
+
+/// A frontend message no PostgreSQL client sends: from a front end over its
+/// in-process pipe, it says the `Query` that follows is the front end's own
+/// statement on its catalogue (`__rdb_routines`, `__rdb_mysql_on_update`),
+/// which the catalogue guard then lets through. Its body is empty.
+pub(crate) const SYSTEM_STATEMENT_TAG: u8 = b'!';
+
+tokio::task_local! {
     /// The SELECT whose `RowDescription` is being sent, and its database:
     /// where [`send_row_description`] reads each column's table, number,
     /// type and modifier (`catalog_model::column_origins`). Every column was
@@ -1629,6 +1664,16 @@ async fn describing<F: std::future::Future>(database: &Arc<Database>, sql: &str,
     } else {
         fut.await
     }
+}
+
+/// The catalogue guard (`privileges::catalog_refusal`) for a statement of
+/// this session: `None` for the engine's own sessions and a front end's
+/// announced catalogue statements, which alone may reach the catalogues.
+fn catalogue_guard(state: &SessionState, stmt: &str) -> Option<(&'static str, String)> {
+    if state.system_catalog || state.system_statement {
+        return None;
+    }
+    crate::core::rql::privileges::catalog_refusal(stmt)
 }
 
 /// Runs `fut`, a statement run for another, outside the reply hold.
@@ -2170,9 +2215,11 @@ where
     let principal = match authenticate(database, stream, parameters, auth, context.peer_uid).await {
         Ok(principal) => {
             log::debug!(
-                "authenticated {} via {}",
+                "authenticated {} via {}{}{}",
                 principal.name,
-                auth.method.name()
+                auth.method.name(),
+                if principal.authenticated { "" } else { " (no credential proven)" },
+                if principal.superuser { ", superuser" } else { "" }
             );
             principal
         }
@@ -2193,11 +2240,71 @@ where
         }
         Err(e) => {
             log::info!("authentication refused: {}", e);
-            send_fatal_error_response(stream, "28P01", &e.to_string()).await?;
+            // A `trust` login of a role that cannot log in (no such role,
+            // NOLOGIN) is no wrong password: PostgreSQL's 28000.
+            let code = if e.kind() == io::ErrorKind::NotFound { "28000" } else { "28P01" };
+            send_fatal_error_response(stream, code, &e.to_string()).await?;
             return Ok(());
         }
     };
 
+    // Its role's VALID UNTIL and CONNECTION LIMIT (R2), the slot held for
+    // the session's life.
+    let _role_slot = match crate::auth::admit_role_login(
+        database,
+        &principal.name,
+        principal.superuser,
+        principal.authenticated && !matches!(auth.method, crate::auth::AuthMethod::Peer),
+    )
+    .await
+    {
+        Ok(slot) => slot,
+        Err((code, message)) => {
+            log::info!("login refused for {}: {message}", principal.name);
+            send_fatal_error_response(stream, code, &message).await?;
+            return Ok(());
+        }
+    };
+    // A licensed tenancy policy admits the session and bounds its database
+    // (T7: connections counted only after authentication, a statement
+    // timeout the client cannot start above). Open by default.
+    let tenant_timeout = {
+        let ctx = crate::core::policy_hooks::SessionContext {
+            role: &principal.name,
+            database: &database.name,
+            protocol: "pgwire",
+            superuser: principal.superuser,
+        };
+        let policy = crate::core::policy_hooks::tenancy();
+        if let Err(e) = policy.admit(&ctx) {
+            send_fatal_error_response(stream, "28000", e.trim_start_matches("28000: ")).await?;
+            return Ok(());
+        }
+        // The leader, or a follower serving linearizable reads (B4.1).
+        #[cfg(feature = "sharding_raft")]
+        if let Err(e) = crate::core::shard::raft_apply::admits_session() {
+            send_fatal_error_response(stream, "57P03", e.trim_start_matches("57P03: ")).await?;
+            return Ok(());
+        }
+        let limits = policy.limits(&database.name);
+        if let Some(max) = limits.max_connections {
+            let sessions = catalog.listing().iter().find(|e| e.name == database.name).map_or(0, |e| e.sessions);
+            if sessions > max as u64 {
+                send_fatal_error_response(
+                    stream,
+                    "53300",
+                    &format!("too many connections for database \"{}\" (its limit is {max})", database.name),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+        limits.statement_timeout_ms
+    };
+
+    // The role's ALTER ROLE … SET values, under the client's own (R2).
+    let parameters = with_role_settings(database, &principal.name, parameters).await;
+    let parameters = parameters.as_ref();
     // This session's cancel target: a process id unique among live sessions
     // and a secret key from the cryptographic generator, removed from the
     // registry when the session ends (the guard is dropped).
@@ -2209,7 +2316,11 @@ where
     // session, bounded (if at all) by the idle timeouts instead.
     context.handshake_finished.store(true, Ordering::Release);
     let startup_timeout = (
-        startup_statement_timeout(parameters),
+        match (startup_statement_timeout(parameters), tenant_timeout) {
+            (Some(asked), Some(cap)) if asked > 0 => Some(asked.min(cap)),
+            (_, Some(cap)) => Some(cap),
+            (asked, None) => asked,
+        },
         startup_lock_timeout(parameters),
         startup_shape_change(parameters),
     );
@@ -2306,6 +2417,43 @@ fn startup_lock_timeout(parameters: &HashMap<String, String>) -> Option<u64> {
     startup_time_setting(parameters, "lock_timeout")
 }
 
+/// The settings `ALTER ROLE … SET` takes (R2): the ones a session reads at
+/// its start, where the role's value stands in for one the client did not
+/// send. Any other parameter is refused rather than kept and ignored.
+pub(crate) const ROLE_SETTINGS: &[&str] = &["statement_timeout", "lock_timeout", ShapeChangeMode::SETTING];
+
+/// Whether `value` is one `param` (of [`ROLE_SETTINGS`]) takes.
+pub(crate) fn role_setting_valid(param: &str, value: &str) -> bool {
+    match param {
+        "statement_timeout" | "lock_timeout" => parse_statement_timeout(value).is_some(),
+        p if p == ShapeChangeMode::SETTING => ShapeChangeMode::parse(value).is_some(),
+        _ => false,
+    }
+}
+
+/// The StartupMessage parameters with `role`'s `ALTER ROLE … SET` values
+/// filled in where the client sent none, as PostgreSQL lets a client's own
+/// startup options override the role's. Borrowed unchanged for a role with
+/// none, the usual case.
+async fn with_role_settings<'a>(
+    database: &Arc<Database>,
+    role: &str,
+    parameters: &'a HashMap<String, String>,
+) -> std::borrow::Cow<'a, HashMap<String, String>> {
+    let settings = crate::auth::role_settings(database, role).await;
+    if settings.is_empty() {
+        return std::borrow::Cow::Borrowed(parameters);
+    }
+    let mut merged = parameters.clone();
+    for (param, value) in settings {
+        let in_options = parameters.get("options").is_some_and(|o| o.contains(param.as_str()));
+        if !merged.contains_key(&param) && !in_options {
+            merged.insert(param, value);
+        }
+    }
+    std::borrow::Cow::Owned(merged)
+}
+
 /// A time setting (`name`, milliseconds) from the StartupMessage: the
 /// parameter on its own, or `-c name=value` inside `options`.
 fn startup_time_setting(parameters: &HashMap<String, String>, setting_name: &str) -> Option<u64> {
@@ -2385,10 +2533,10 @@ fn startup_setting<T>(
 ///
 /// `superuser` is a snapshot of the role at login, as PostgreSQL's is for the
 /// life of a session. Under `trust` nobody proves anything, so the name is
-/// whatever the client sent and `authenticated` is false — the native listener
-/// draws the same line in [`crate::core::database::NativeContext`]: a gate
-/// applied to an anonymous principal would refuse the statement that creates
-/// the first account.
+/// whatever the client sent and `authenticated` is false; `superuser` is then
+/// what that role is (`auth::trust_login`), true only for a superuser role,
+/// the bootstrap role, or any name while the database has no roles at all
+/// (so the first account can be created).
 #[derive(Clone, Debug)]
 struct Principal {
     name: String,
@@ -2398,9 +2546,11 @@ struct Principal {
 }
 
 impl Principal {
-    /// Whether this session may run a server-administration statement.
+    /// Whether this session may run a server-administration statement: a
+    /// superuser's alone. Not having authenticated is no longer one: under
+    /// `trust` every session was an administrator.
     fn may_administer(&self) -> bool {
-        !self.authenticated || self.superuser
+        self.superuser
     }
 }
 
@@ -2437,7 +2587,12 @@ pub(crate) fn privileged_statement(stmt: &str) -> Option<&'static str> {
         // rows of the branch, its base and its parent — databases whose
         // accounts this session may not hold — and names their keys.
         ("SHOW", "BRANCH") => Some("SHOW BRANCH DIFF"),
-        ("IMPORT", "DATABASE") => Some("IMPORT DATABASE"),
+        // Every statement the importer takes, by its own predicate
+        // (`migrate::sql::is_import_statement`: the first word is IMPORT),
+        // `DATABASE` being optional to it. Gated on the two words, `IMPORT
+        // FROM POSTGRES …` ran for any role: a database made, and the server
+        // made to connect wherever the statement said.
+        ("IMPORT", _) => Some("IMPORT DATABASE"),
         ("SET", "CONFIG") => Some("SET CONFIG"),
         ("SET", "FILTER") | ("RESET", "FILTER") => Some("SET FILTER"),
         // Reading what ran is not administration, and `SHOW QUERIES` is
@@ -2445,6 +2600,11 @@ pub(crate) fn privileged_statement(stmt: &str) -> Option<&'static str> {
         ("RESET", "QUERY") => Some("RESET QUERY STATS"),
         ("BACKUP", _) => Some("BACKUP"),
         ("RESTORE", _) => Some("RESTORE"),
+        // Placing or moving one of this database's tables onto a location
+        // or store already registered is this database's business; adding
+        // a location (a path the server writes to) or a store is the
+        // server's.
+        ("STORAGE", "PLACE") | ("STORAGE", "MOVE") | ("STORAGE", "SET") | ("STORAGE", "REBALANCE") => Some("STORAGE PLACE"),
         ("STORAGE", _) => Some("STORAGE"),
         ("REPLICATION", _) => Some("REPLICATION"),
         // The key/value store's server-level commands: they change the
@@ -2456,6 +2616,9 @@ pub(crate) fn privileged_statement(stmt: &str) -> Option<&'static str> {
             "GET" => None,
             _ => Some("KV CONFIG"),
         },
+        // A shard's side of a move (sharding-plan.md B2): it changes which
+        // rows this server answers for.
+        ("SHARD", _) => Some("SHARD"),
         _ => None,
     }
 }
@@ -2694,9 +2857,14 @@ where
         // is dropped without a reply.
         ready = match tag[0] {
             b'Q' | b'S' => true,
-            b'P' | b'B' | b'D' | b'E' | b'C' | b'H' => false,
+            b'P' | b'B' | b'D' | b'E' | b'C' | b'H' | SYSTEM_STATEMENT_TAG => false,
             _ => !state.error_in_batch,
         };
+        // The announcement covers the very next message only, and only a
+        // `Query`: anything else between the two cancels it.
+        if tag[0] != b'Q' && tag[0] != SYSTEM_STATEMENT_TAG {
+            state.system_next = false;
+        }
 
         // An error opens a discard window that only `Sync` closes.
         //
@@ -2719,7 +2887,10 @@ where
                 state.error_in_batch = false;
                 state.message_us = crate::core::statement_clock::wall_us();
                 let query = read_cstring(&payload);
-                handle_simple_query(database, state, stream, query).await?;
+                state.system_statement = std::mem::take(&mut state.system_next);
+                let handled = handle_simple_query(database, state, stream, query).await;
+                state.system_statement = false;
+                handled?;
                 state.copy_in_ran = false;
                 // And it closes its own window: it has already answered with
                 // `ReadyForQuery`. A failure inside it (`fail_statement` sets
@@ -2803,6 +2974,11 @@ where
                 stream.flush().await?;
             }
             b'X' => return Ok(()),
+            // A front end's catalogue statement follows (see the tag). No
+            // reply: the `Query` answers for both.
+            SYSTEM_STATEMENT_TAG if PROXIED_SESSION.try_with(|_| ()).is_ok() && payload.is_empty() => {
+                state.system_next = true;
+            }
             _ => {
                 send_error_response(
                     stream,
@@ -2902,6 +3078,9 @@ struct SessionState {
     auth: AuthConfig,
     /// Who this session is, and whether it proved it.
     principal: Principal,
+    /// The session user while `SET ROLE` acts as another role (roles plan
+    /// R2); `RESET ROLE` returns to it.
+    session_user: Option<Principal>,
     // statement name -> info
     statements: HashMap<String, StatementInfo>,
     /// Learned parses of simple-query `SELECT`s, by their text with the
@@ -2998,6 +3177,20 @@ struct SessionState {
     /// materialized view's table DDL, a rename's): the view guards on table
     /// DDL let it through (`rql::views`).
     view_internal: bool,
+    /// A session of the engine's own (a branch merge's [`branch_merge`]
+    /// side): the catalogue guard lets its statements reach the `__rdb_*`
+    /// catalogues and `rdb_roles` (`privileges::catalog_refusal`). Never set
+    /// for a session a client opened; `view_internal` is not this, since a
+    /// trigger's body and a view's query run under that one.
+    system_catalog: bool,
+    /// The statements of the simple query being run were sent by a front
+    /// end (MySQL, SQL Server) for its own catalogue, announced by a
+    /// [`SYSTEM_STATEMENT_TAG`] message just before it: the catalogue guard
+    /// lets them through. Only a proxied session ([`PROXIED_SESSION`])
+    /// accepts the announcement, so no client can send it.
+    system_statement: bool,
+    /// The announcement arrived and the next message is a `Query`.
+    system_next: bool,
     /// The materialized view a `REFRESH` is filling: the one write to a
     /// materialized view expansion lets through.
     refreshing_materialized: Option<String>,
@@ -3410,6 +3603,7 @@ impl SessionState {
             database_name,
             auth,
             principal,
+            session_user: None,
             statements: HashMap::new(),
             text_shapes: HashMap::new(),
             portals: HashMap::new(),
@@ -3428,6 +3622,9 @@ impl SessionState {
             message_us: crate::core::statement_clock::wall_us(),
             statement_error: None,
             view_internal: false,
+            system_catalog: false,
+            system_statement: false,
+            system_next: false,
             refreshing_materialized: None,
             sequence_values: StdArc::default(),
             triggers_suppressed: Vec::new(),
@@ -4315,7 +4512,11 @@ async fn description_now(
         None => {
             // The session's values as it runs them (`session_values`); one
             // that fails is left for `Execute` to report.
-            let with_session = session_rewrite(state, query).ok().flatten();
+            let acl = match session_values::names_privilege_function(query) {
+                true => crate::core::rql::privileges::load_shared(database, state.current_tx()).await.ok(),
+                false => None,
+            };
+            let with_session = session_rewrite(state, query, acl.as_deref().map(Vec::as_slice)).ok().flatten();
             let query = with_session.as_deref().unwrap_or(query);
             // `EXECUTE p(…)` is described as the statement it runs.
             let bound = match sql_prepare::parse(query) {
@@ -5182,7 +5383,7 @@ pub(crate) async fn describe_query(
         };
     }
     let inlined_calls;
-    let stmt = match crate::core::rql::functions::inline_calls(database, stmt, None).await {
+    let stmt = match crate::core::rql::functions::inline_calls(database, stmt, None, None, false).await {
         Ok(Some(text)) => {
             inlined_calls = text;
             inlined_calls.as_str()
@@ -6575,6 +6776,7 @@ where
         DatabaseStatement::Create {
             name,
             if_not_exists,
+            owner,
         } => {
             if if_not_exists && state.catalog.get(&name).is_some() {
                 // PostgreSQL has no `IF NOT EXISTS` here, but every migration
@@ -6582,7 +6784,26 @@ where
                 // does beats failing a script that is already idempotent.
                 return send_command_complete(stream, "CREATE DATABASE").await;
             }
-            match state.catalog.create(&name).await {
+            // RD1: the new database starts with the creating role and its
+            // `OWNER`, from this session's database, not with every account
+            // and verifier of the default database
+            // (`roles.create_database_roles = owner`; `all` keeps that).
+            let session_db = state.catalog.get(&state.database_name);
+            if let (Some(owner), Some(db)) = (&owner, &session_db)
+                && db.has_table(crate::auth::ROLE_TABLE)
+                && crate::auth::lookup_role(db, owner).await.is_none()
+            {
+                return fail_statement(state, stream, "42704", &format!("role \"{owner}\" does not exist")).await;
+            }
+            let roles = match session_db {
+                Some(db) if crate::auth::create_database_roles() == "owner" => {
+                    let mut keep = vec![state.principal.name.clone()];
+                    keep.extend(owner.clone().filter(|o| *o != state.principal.name));
+                    Some((db, keep))
+                }
+                _ => None,
+            };
+            match state.catalog.create_with_roles(&name, roles).await {
                 Ok(database) => {
                     // Replicated when the default database is and its
                     // replication carries the catalogue: the catalogue starts
@@ -6624,7 +6845,28 @@ where
             }
         }
         DatabaseStatement::List => {
-            let listing = state.catalog.listing();
+            // Strict tenant mode: a tenant sees its own database, and no
+            // server path (T3).
+            let ctx = crate::core::policy_hooks::SessionContext {
+                role: &state.principal.name,
+                database: &state.database_name,
+                protocol: "pgwire",
+                superuser: state.principal.superuser,
+            };
+            let policy = crate::core::policy_hooks::tenancy();
+            let admin = policy.is_process_admin(&ctx);
+            let listing: Vec<_> = state
+                .catalog
+                .listing()
+                .into_iter()
+                .filter(|e| policy.may_see_database(&ctx, &e.name))
+                .map(|mut e| {
+                    if !admin && crate::core::policy_hooks::installed() {
+                        e.location = String::new();
+                    }
+                    e
+                })
+                .collect();
             let current = state.database_name.clone();
             let fields = vec![
                 ("database_name".to_string(), DbType::STRING),
@@ -6904,6 +7146,11 @@ where
     // What an error's position counts in (`error_position`).
     state.error_text.clear();
     state.error_text.push_str(stmt);
+    // No client statement reaches the engine's catalogues, on any path a
+    // statement takes from here (a block's deferred DROP included).
+    if let Some((code, message)) = catalogue_guard(state, stmt) {
+        return fail_statement(state, stream, code, &message).await;
+    }
     // Counted as running until it returns, so the idle trimmer
     // (`idle_trim`) never walks the heap under a statement.
     let _running = crate::idle_trim::statement();
@@ -7528,8 +7775,11 @@ where
     // learned before the temporary table was made names the real one. Such a
     // statement runs as text, and nothing is learned or forgotten for it.
     let names_a_temporary = !state.temp_tables.is_empty() && temp_tables::rewrite(&state.temp_tables, query).is_some();
+    // Nor a statement naming a catalogue: the text path guards and masks
+    // it, and a learned parse would do neither.
+    let names_a_catalogue = crate::core::rql::privileges::may_name_catalog(query);
     let step = match watched_slot(state, database, &key, true) {
-        _ if names_a_temporary => WatchStep::Text,
+        _ if names_a_temporary || names_a_catalogue => WatchStep::Text,
         None => WatchStep::Text,
         Some((prepared, sql)) => watch_step(prepared, &sql, generation, &literals, &classes),
     };
@@ -7540,6 +7790,23 @@ where
     // which answers it.
     let step = match step {
         WatchStep::Run(_) if privilege_statements::check(database, state, query).await.is_some() => WatchStep::Text,
+        // Row-level security (R3) puts its predicates in on the text path
+        // too: a parse learned without them would read every row.
+        WatchStep::Run(_)
+            if !state.principal.may_administer()
+                && !matches!(
+                    crate::core::rql::policies::context(
+                        database,
+                        query,
+                        &crate::core::rql::policies::Actor { role: &state.principal.name, superuser: false },
+                        state.current_tx(),
+                    )
+                    .await,
+                    Ok(None)
+                ) =>
+        {
+            WatchStep::Text
+        }
         other => other,
     };
 
@@ -8450,6 +8717,17 @@ where
             }
         }
     }
+    // Its row-level security policies too (R3).
+    if database.has_table(crate::core::rql::policies::POLICY_TABLE)
+        && let crate::core::rql::views::TableDdl::Drop { names, .. } = &ddl
+    {
+        for name in names {
+            if let Err(e) = crate::core::rql::policies::remove(database, name, None, state.current_tx()).await {
+                fail_statement(state, stream, sqlstate_for(&e), &e).await?;
+                return Ok(true);
+            }
+        }
+    }
     if database.has_table(crate::core::rql::triggers::TRIGGER_TABLE)
         && let crate::core::rql::views::TableDdl::Drop { names, .. } = &ddl
     {
@@ -8526,6 +8804,11 @@ async fn execute_single_statement_unscoped<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // A statement run for another (a trigger's body, a view's query, a
+    // `PREPARE`d text) is a client's text too, and meets the guard here.
+    if let Some((code, message)) = catalogue_guard(state, stmt) {
+        return fail_statement(state, stream, code, &message).await;
+    }
     // sqlx's query for where a result's columns come from, answered from the
     // tables with the record array it reads (`column_origins`), as written:
     // the passes below make its `VALUES` list a derived table.
@@ -8612,13 +8895,23 @@ where
     let stmt = rewritten.as_ref();
     // `current_user`, `current_setting(…)` and the other values of this
     // session, as literals (`session_values`).
-    let with_session = match session_rewrite(state, stmt) {
+    // The ACL only for a statement that asks about privileges.
+    let acl = match session_values::names_privilege_function(stmt) {
+        true => crate::core::rql::privileges::load_shared(database, state.current_tx()).await.ok(),
+        false => None,
+    };
+    let with_session = match session_rewrite(state, stmt, acl.as_deref().map(Vec::as_slice)) {
         Ok(text) => text,
         Err((code, message)) => {
             fail_statement(state, stream, code, &message).await?;
             return Ok(());
         }
     };
+    // A privilege answer is baked in as TRUE or FALSE, and a GRANT changes
+    // it: no parse of this text is learned for the original's sake.
+    if acl.is_some() && with_session.is_some() {
+        crate::core::rql::prepared::note_rewritten();
+    }
     let stmt = with_session.as_deref().unwrap_or(stmt);
     // Enum types (`user_types`): a column, a cast and an `ORDER BY` of one
     // in their stored form, read in this statement's transaction so a type
@@ -8665,6 +8958,13 @@ where
     // `pg_dump` writes after each: the privilege statement they are, before
     // the view and sequence statements, which read only their own `ALTER`
     // forms and refused these ("ALTER VIEW supports only RENAME TO here").
+    // Row-level security (R3): policies, and switching it on a table.
+    if (crate::core::sql_scan::contains_ignore_ascii_case(stmt, b"POLICY")
+        || crate::core::sql_scan::contains_ignore_ascii_case(stmt, b"ROW LEVEL SECURITY"))
+        && let Some(parsed) = crate::core::rql::policies::parse_policy_statement(stmt)
+    {
+        return privilege_statements::handle_policy_statement(database, state, stream, parsed).await;
+    }
     if crate::core::sql_scan::contains_ignore_ascii_case(stmt, b" OWNER TO ")
         && {
             let head: Vec<String> = stmt.split_whitespace().take(3).map(str::to_ascii_uppercase).collect();
@@ -8683,6 +8983,11 @@ where
     }
     if let Some(parsed) = crate::core::rql::sequence_catalog::parse_sequence_statement(stmt) {
         return sequence_statements::handle_sequence_statement(database, state, stream, parsed).await;
+    }
+    // Functions, procedures, types, domains and triggers: their owners'
+    // (R1), checked here because they are answered before `check`.
+    if let Some((code, message)) = privilege_statements::object_ddl_gate(database, state, stmt).await {
+        return fail_statement(state, stream, code, &message).await;
     }
     if let Some(parsed) = crate::core::rql::user_types::parse_type_statement(stmt) {
         return type_statements::handle_type_statement(database, state, stream, parsed).await;
@@ -8733,7 +9038,10 @@ where
         return Ok(());
     }
     let prepared_sequences;
-    let stmt = match sequence_statements::prepare_statement(database, state.current_tx(), stmt).await {
+    // Checked as the session's role, unless it administers or this is the
+    // engine's own statement (a view's or a routine's expansion).
+    let sequence_role = (!state.principal.may_administer() && !state.view_internal).then_some(state.principal.name.as_str());
+    let stmt = match sequence_statements::prepare_statement(database, state.current_tx(), stmt, sequence_role).await {
         Ok(None) => stmt,
         Ok(Some(text)) => {
             crate::core::rql::prepared::note_rewritten();
@@ -8748,7 +9056,7 @@ where
     // A call of a `CREATE FUNCTION` function, as its body
     // (`rql::functions`), before views are expanded: a body may read one.
     let inlined_calls;
-    let stmt = match crate::core::rql::functions::inline_calls(database, stmt, state.current_tx()).await {
+    let stmt = match crate::core::rql::functions::inline_calls(database, stmt, state.current_tx(), sequence_role, sequence_role.is_some()).await {
         Ok(None) => stmt,
         Ok(Some(text)) => {
             crate::core::rql::prepared::note_rewritten();
@@ -8776,6 +9084,34 @@ where
         fail_statement(state, stream, code, &message).await?;
         return Ok(());
     }
+    // SECURITY DEFINER functions, left as calls above: checked as their
+    // owners, then put in (R2).
+    let inlined_definers;
+    let stmt = if sequence_role.is_some() {
+        if let Some((code, message)) = privilege_statements::definer_refusal(database, state, stmt).await {
+            fail_statement(state, stream, code, &message).await?;
+            return Ok(());
+        }
+        match crate::core::rql::functions::inline_calls(database, stmt, state.current_tx(), None, false).await {
+            Ok(None) => stmt,
+            Ok(Some(text)) => match rewrite_statement_text(database, &text) {
+                Ok(again) => {
+                    inlined_definers = again.into_owned();
+                    inlined_definers.as_str()
+                }
+                Err((code, message)) => {
+                    fail_statement(state, stream, code, &message).await?;
+                    return Ok(());
+                }
+            },
+            Err((code, message)) => {
+                fail_statement(state, stream, code, &message).await?;
+                return Ok(());
+            }
+        }
+    } else {
+        stmt
+    };
     // `pg_get_viewdef(view)` as the view's query (`views::viewdef_calls`).
     let with_viewdefs = match crate::core::rql::views::viewdef_calls(database, stmt, state.current_tx()).await {
         Ok(text) => text,
@@ -8814,6 +9150,75 @@ where
     } else {
         stmt
     };
+    // Again on what the function bodies and views became: one made before
+    // the guard existed may read a catalogue. Then every read of
+    // `rdb_roles` left is given its masked projection, last, so nothing
+    // after this reads a verifier.
+    if let Some((code, message)) = catalogue_guard(state, stmt) {
+        return fail_statement(state, stream, code, &message).await;
+    }
+    let masked_roles;
+    let stmt = if state.system_catalog || state.system_statement {
+        stmt
+    } else {
+        match crate::core::rql::privileges::mask_role_catalog(stmt) {
+            Some(text) => {
+                crate::core::rql::prepared::note_rewritten();
+                masked_roles = text;
+                masked_roles.as_str()
+            }
+            None => stmt,
+        }
+    };
+    // Row-level security (R3): the policies of the tables it names, as
+    // predicates before the scan; new rows checked as they are stored, a
+    // row at a time.
+    let rls_text;
+    let mut rls_check: Option<(String, String)> = None;
+    let stmt = if sequence_role.is_some() {
+        let role = state.principal.name.clone();
+        let actor = crate::core::rql::policies::Actor { role: &role, superuser: false };
+        let substitute = |pred: &str| -> String {
+            let probe = format!("SELECT {pred}");
+            match session_rewrite(state, &probe, None) {
+                Ok(Some(text)) => text.strip_prefix("SELECT ").map(str::to_string).unwrap_or(text),
+                _ => pred.to_string(),
+            }
+        };
+        let context = match crate::core::rql::policies::context(database, stmt, &actor, state.current_tx()).await {
+            Ok(context) => context,
+            Err((code, message)) => return fail_statement(state, stream, code, &message).await,
+        };
+        let applied = match &context {
+            Some(context) => crate::core::rql::policies::rewrite(context, stmt, &actor, &substitute),
+            None => Ok(crate::core::rql::policies::Applied { text: None, check: None }),
+        };
+        match applied {
+            Ok(applied) => {
+                rls_check = applied.check;
+                match applied.text {
+                    Some(text) => {
+                        crate::core::rql::prepared::note_rewritten();
+                        rls_text = text;
+                        rls_text.as_str()
+                    }
+                    None => stmt,
+                }
+            }
+            Err((code, message)) => return fail_statement(state, stream, code, &message).await,
+        }
+    } else {
+        stmt
+    };
+    if let Some((table, check)) = rls_check {
+        let event = if stmt.trim_start().get(..6).is_some_and(|h| h.eq_ignore_ascii_case("INSERT")) {
+            crate::core::rql::triggers::Event::Insert
+        } else {
+            crate::core::rql::triggers::Event::Update
+        };
+        return trigger_exec::run_triggered_write_checked(database, state, stream, stmt, event, &table, result_formats, omit_description, Some(check))
+            .await;
+    }
     // A write to a table with triggers runs a row at a time
     // (`trigger_exec`).
     if let Some((event, table)) = trigger_exec::triggered_write(database, state, stmt).await {
@@ -9286,11 +9691,53 @@ where
         return Ok(());
     }
 
+    // A cluster DDL is changing a table this touches (B4.6): retryable.
+    #[cfg(feature = "sharding")]
+    if !state.view_internal
+        && let Some(e) = crate::core::shard::ddl::fenced_refusal(stmt)
+    {
+        fail_statement(state, stream, "40001", e.trim_start_matches("40001: ")).await?;
+        return Ok(());
+    }
+    // On a follower of its shard's Raft group (B4.1): a write is refused,
+    // and a read waits for the leader's read point, so it sees every write
+    // committed before it began.
+    #[cfg(feature = "sharding_raft")]
+    if !state.view_internal
+        && let Err(e) = crate::core::shard::raft_apply::statement_barrier(stmt).await
+    {
+        let (code, message) = e.split_once(": ").unwrap_or(("57P03", e.as_str()));
+        let code: &'static str = if code == "25006" { "25006" } else { "57P03" };
+        fail_statement(state, stream, code, message).await?;
+        return Ok(());
+    }
     // Ahead of every dispatch below, so a statement that administers the
     // server is refused before any handler — builtin, role, catalogue or
     // engine — sees it.
     if let Some(verb) = privileged_statement(stmt) {
-        if !state.principal.may_administer() {
+        // A role changes its own password, and a CREATEROLE role manages
+        // the roles that are not superusers (R2): let through to the role
+        // handler, which runs them as anyone's.
+        let delegated = !state.principal.may_administer()
+            && matches!(verb, "CREATE ROLE" | "ALTER ROLE" | "DROP ROLE")
+            && match crate::auth::parse_role_statement(stmt) {
+                Some(Ok(statement)) => {
+                    match crate::auth::role_statement_permitted(database, &state.principal.name, &statement, state.current_tx()).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            fail_statement(state, stream, "42501", &e).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+                _ => false,
+            }
+            // CREATEDB (R2): the creator is copied into the new database as
+            // RD1 says, as the role it is here, no superuser there either.
+            || (!state.principal.may_administer()
+                && verb == "CREATE DATABASE"
+                && crate::auth::role_attrs(database, &state.principal.name, state.current_tx()).await.create_db);
+        if !delegated && !state.principal.may_administer() {
             log::info!(
                 "permission denied: {} attempted {} without superuser",
                 state.principal.name,
@@ -9303,6 +9750,65 @@ where
                 &format!("permission denied: {} requires superuser", verb),
             )
             .await?;
+            return Ok(());
+        }
+        // A superuser of a customer database is not a process administrator
+        // under strict tenant mode (licensed hook; open by default).
+        let ctx = crate::core::policy_hooks::SessionContext {
+            role: &state.principal.name,
+            database: &database.name,
+            protocol: "pgwire",
+            superuser: state.principal.superuser,
+        };
+        if let Err(e) = crate::core::policy_hooks::check_privileged(&ctx, verb) {
+            fail_statement(state, stream, "42501", e.trim_start_matches("42501: ")).await?;
+            return Ok(());
+        }
+    }
+    // Statements a licensed tenancy policy answers itself (CREATE TENANT,
+    // SHOW TENANTS, …): rewritten into ordinary ones, run here in order.
+    if crate::core::policy_hooks::installed() {
+        let ctx = crate::core::policy_hooks::SessionContext {
+            role: &state.principal.name,
+            database: &database.name,
+            protocol: "pgwire",
+            superuser: state.principal.superuser,
+        };
+        match crate::core::policy_hooks::tenancy().rewrite_statement(&ctx, stmt) {
+            None => {}
+            Some(Err(e)) => {
+                fail_statement(state, stream, "42501", e.trim_start_matches("42501: ")).await?;
+                return Ok(());
+            }
+            Some(Ok(statements)) => {
+                for s in statements {
+                    Box::pin(execute_single_statement_unscoped(
+                        database,
+                        state,
+                        stream,
+                        &s,
+                        result_formats,
+                        omit_description,
+                    ))
+                    .await?;
+                    if state.transaction.as_ref().is_some_and(|t| t.failed) {
+                        break;
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+    // Process-wide SHOWs are the operator's under strict tenant mode (T2, T4).
+    if crate::core::policy_hooks::installed() {
+        let ctx = crate::core::policy_hooks::SessionContext {
+            role: &state.principal.name,
+            database: &database.name,
+            protocol: "pgwire",
+            superuser: state.principal.superuser,
+        };
+        if let Err(e) = crate::core::policy_hooks::check_show(&ctx, stmt) {
+            fail_statement(state, stream, "42501", e.trim_start_matches("42501: ")).await?;
             return Ok(());
         }
     }
@@ -9366,11 +9872,7 @@ where
         match parsed {
             Err(e) => fail_statement(state, stream, "42601", &e).await?,
             Ok(statement) => {
-                let tag = match &statement {
-                    crate::auth::RoleStatement::Create { .. } => "CREATE ROLE",
-                    crate::auth::RoleStatement::AlterPassword { .. } => "ALTER ROLE",
-                    crate::auth::RoleStatement::Drop { .. } => "DROP ROLE",
-                };
+                let tag = statement.tag();
                 // In a block, the catalogue write is the block's: a
                 // ROLLBACK takes the role back, as PostgreSQL's does.
                 let tx = state.current_tx();
@@ -9378,7 +9880,7 @@ where
                     .await
                 {
                     Ok(()) => send_command_complete(stream, tag).await?,
-                    Err(e) => fail_statement(state, stream, "42710", &e).await?,
+                    Err(e) => fail_statement(state, stream, crate::auth::role_statement_sqlstate(&e), &e).await?,
                 }
             }
         }
@@ -10789,6 +11291,22 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // branches below. `disk_full` when the disk is, `io_error` otherwise.
     // `cardinality_violation`: a scalar subquery (a correlated one run as a
     // `LATERAL` join included) that gave more than one row.
+    // Sharding's refusals lead with their code (`core::shard`): a range this
+    // shard does not own, a stale map, a fenced move, a statement that
+    // names no route key in cluster mode. Matched on the message's own
+    // prefix, never inside quoted text.
+    for code in ["RDB02", "RDB03", "57P03", "0A000", "22003", "42501", "XX000"] {
+        if message.starts_with(code) && message[code.len()..].starts_with(':') {
+            return code;
+        }
+    }
+    // Wrapped by a caller that names the table or partition first.
+    if has("rdb02: ") {
+        return "RDB02";
+    }
+    if has("rdb03: ") {
+        return "RDB03";
+    }
     if has("more than one row returned by a subquery used as an expression") {
         return "21000";
     }
@@ -11987,6 +12505,214 @@ where
     Ok(())
 }
 
+/// `PREPARE TRANSACTION 'gid'`, `COMMIT PREPARED 'gid'`, `ROLLBACK PREPARED
+/// 'gid'` (`core::database::prepared`); `None` for any other statement.
+#[cfg(feature = "sharding_2pc")]
+async fn two_phase<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    stmt: &str,
+) -> io::Result<Option<bool>>
+where
+    S: AsyncWrite + Unpin,
+{
+    let t = stmt.trim().trim_end_matches(';').trim();
+    let up = t.to_ascii_uppercase();
+    let words: Vec<&str> = up.split_whitespace().collect();
+    let kind = match words.as_slice() {
+        ["PREPARE", "TRANSACTION", ..] => 0,
+        ["COMMIT", "PREPARED", ..] => 1,
+        ["ROLLBACK", "PREPARED", ..] => 2,
+        _ => return Ok(None),
+    };
+    let gid = match (t.find('\''), t.rfind('\'')) {
+        (Some(a), Some(b)) if b > a => t[a + 1..b].replace("''", "'"),
+        _ => {
+            fail_statement(state, stream, "42601", "the transaction identifier is a string literal").await?;
+            return Ok(Some(true));
+        }
+    };
+    let fail = |e: String| {
+        let code = e.get(..5).filter(|c| c.bytes().all(|b| b.is_ascii_alphanumeric()) && e.as_bytes().get(5) == Some(&b':'));
+        (code.map(str::to_string).unwrap_or_else(|| "XX000".to_string()), e.splitn(2, ": ").last().unwrap_or(&e).to_string())
+    };
+    if kind == 0 {
+        let Some(tx) = state.transaction.as_ref() else {
+            fail_statement(state, stream, "25P01", "PREPARE TRANSACTION can only be used in transaction blocks").await?;
+            return Ok(Some(true));
+        };
+        if !database.block_drops_pending(tx.id).is_empty() {
+            fail_statement(state, stream, "0A000", "cannot PREPARE a transaction that has dropped tables").await?;
+            return Ok(Some(true));
+        }
+        let mut t = state.transaction.take().expect("checked above");
+        state.end_block_settings(&t);
+        let notifies = std::mem::take(&mut t.notifies);
+        if t.failed {
+            database.block_ddl_abort(t.id).await;
+            t.abort_unless_aborted(database);
+            t.owner.release();
+            send_command_complete(stream, "ROLLBACK").await?;
+            return Ok(Some(true));
+        }
+        // The block's notifications wait for its outcome: sent by COMMIT
+        // PREPARED, dropped by ROLLBACK PREPARED. (PostgreSQL refuses a
+        // NOTIFY in a prepared transaction; a gateway prepares every
+        // transaction that reached two shards, so here it is kept.) Written
+        // down before the prepare, so a part still prepared across a
+        // restart keeps them.
+        if !notifies.is_empty()
+            && let Err(e) = prepared_notes::save(database, &gid, state.backend_pid, &notifies)
+        {
+            database.block_ddl_abort(t.id).await;
+            database.abort_transaction(t.id);
+            t.owner.release();
+            send_error_response(stream, "58030", &format!("the transaction's notifications could not be kept for its outcome: {e}")).await?;
+            return Ok(Some(true));
+        }
+        if let Err(e) = database.prepare_transaction(t.id, &gid) {
+            prepared_notes::take(database, &gid);
+            database.block_ddl_abort(t.id).await;
+            database.abort_transaction(t.id);
+            t.owner.release();
+            let (code, msg) = fail(e);
+            send_error_response(stream, &code, &msg).await?;
+            return Ok(Some(true));
+        }
+        database.block_ddl_commit(t.id).await;
+        t.owner.release();
+        send_command_complete(stream, "PREPARE TRANSACTION").await?;
+        return Ok(Some(true));
+    }
+    if state.transaction.is_some() {
+        let verb = if kind == 1 { "COMMIT PREPARED" } else { "ROLLBACK PREPARED" };
+        fail_statement(state, stream, "25001", &format!("{verb} cannot run inside a transaction block")).await?;
+        return Ok(Some(true));
+    }
+    match database.finish_prepared(&gid, kind == 1) {
+        Ok(()) => {
+            let held = prepared_notes::take(database, &gid);
+            if kind == 1
+                && let Some((pid, notes)) = held
+            {
+                for (channel, payload) in &notes {
+                    notify::publish(database.id, pid, channel, payload);
+                }
+            }
+            send_command_complete(stream, if kind == 1 { "COMMIT PREPARED" } else { "ROLLBACK PREPARED" }).await?
+        }
+        Err(e) => {
+            let (code, msg) = fail(e);
+            fail_statement(state, stream, &code, &msg).await?;
+        }
+    }
+    Ok(Some(true))
+}
+
+/// The notifications of prepared transactions, by global id: in memory, and
+/// in a synced file under the database's directory
+/// (`prepared_notifies/<hex gid>`), so a transaction still prepared when the
+/// server restarts sends them at its COMMIT PREPARED.
+#[cfg(feature = "sharding_2pc")]
+pub(crate) mod prepared_notes {
+    use std::collections::HashMap;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    use crate::core::database::Database;
+
+    type Notes = Vec<(String, String)>;
+
+    fn held() -> &'static std::sync::Mutex<HashMap<String, (i32, Notes)>> {
+        static HELD: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (i32, Notes)>>> = std::sync::OnceLock::new();
+        HELD.get_or_init(Default::default)
+    }
+
+    fn dir(database: &Database) -> Option<PathBuf> {
+        database.location.as_ref().map(|l| PathBuf::from(l).join("prepared_notifies"))
+    }
+
+    fn file(database: &Database, gid: &str) -> Option<PathBuf> {
+        let name: String = gid.bytes().map(|b| format!("{b:02x}")).collect();
+        dir(database).map(|d| d.join(name))
+    }
+
+    /// Keeps `notes` for `gid`: in memory, and synced to disk where the
+    /// database has a directory.
+    pub fn save(database: &Database, gid: &str, pid: i32, notes: &[(String, String)]) -> std::io::Result<()> {
+        if let Some(path) = file(database, gid) {
+            let dir = path.parent().expect("a file in a directory");
+            std::fs::create_dir_all(dir)?;
+            let mut body = Vec::new();
+            body.extend_from_slice(&pid.to_le_bytes());
+            for (c, p) in notes {
+                for part in [c, p] {
+                    body.extend_from_slice(&(part.len() as u32).to_le_bytes());
+                    body.extend_from_slice(part.as_bytes());
+                }
+            }
+            let tmp = path.with_extension("tmp");
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&body)?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &path)?;
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        held().lock().unwrap_or_else(|e| e.into_inner()).insert(gid.to_string(), (pid, notes.to_vec()));
+        Ok(())
+    }
+
+    /// The notes kept for `gid` (from memory, or from disk after a
+    /// restart), forgotten in both.
+    pub fn take(database: &Database, gid: &str) -> Option<(i32, Notes)> {
+        let mem = held().lock().unwrap_or_else(|e| e.into_inner()).remove(gid);
+        let path = file(database, gid);
+        let disk = path.as_ref().and_then(|p| std::fs::read(p).ok()).and_then(|b| decode(&b));
+        if let Some(p) = path {
+            let _ = std::fs::remove_file(p);
+        }
+        mem.or(disk)
+    }
+
+    fn decode(b: &[u8]) -> Option<(i32, Notes)> {
+        let pid = i32::from_le_bytes(b.get(..4)?.try_into().ok()?);
+        let mut at = 4;
+        let mut part = || -> Option<String> {
+            let n = u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?) as usize;
+            let s = String::from_utf8(b.get(at + 4..at + 4 + n)?.to_vec()).ok()?;
+            at += 4 + n;
+            Some(s)
+        };
+        let mut notes = Vec::new();
+        while let Some(c) = part() {
+            notes.push((c, part()?));
+        }
+        Some((pid, notes))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn notes_outlive_a_restart_and_go_at_the_outcome() {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Database::new_named(&dir.path().to_string_lossy(), false, "n").await;
+            let notes = vec![("jobs".to_string(), "it's done".to_string()), ("audit".to_string(), String::new())];
+            save(&db, "rdb2pc:gw:1", 77, &notes).unwrap();
+            // A restart: memory gone, the file left.
+            held().lock().unwrap().clear();
+            assert_eq!(take(&db, "rdb2pc:gw:1"), Some((77, notes)));
+            // Taken once: the outcome sends them once.
+            assert_eq!(take(&db, "rdb2pc:gw:1"), None);
+            assert!(std::fs::read_dir(dir.path().join("prepared_notifies")).unwrap().next().is_none());
+            drop(db);
+            crate::core::wal::remove_for(&dir.path().to_string_lossy());
+        }
+    }
+}
+
 /// Returns `Ok(true)` when the statement was transaction control.
 async fn handle_transaction_control<S>(
     database: &Arc<Database>,
@@ -11997,6 +12723,11 @@ async fn handle_transaction_control<S>(
 where
     S: AsyncWrite + Unpin,
 {
+    // Two-phase commit, a shard's half (sharding-plan.md B5).
+    #[cfg(feature = "sharding_2pc")]
+    if let Some(answered) = two_phase(database, state, stream, stmt).await? {
+        return Ok(answered);
+    }
     // Every form below opens with one of these words, so any other statement
     // is not transaction control, decided before the lowercased, re-spaced
     // copy every statement used to pay for. It is also what keeps a statement
@@ -12640,17 +13371,49 @@ pub(super) fn schema_verb(stmt: &str) -> bool {
 }
 
 /// `sql` with this session's values in it (`session_values::rewrite`).
-fn session_rewrite(state: &SessionState, sql: &str) -> Result<Option<String>, (&'static str, String)> {
+fn session_rewrite(
+    state: &SessionState,
+    sql: &str,
+    acl: Option<&[crate::core::rql::privileges::AclRow]>,
+) -> Result<Option<String>, (&'static str, String)> {
     let setting = |key: &str| show_parameter(state, key);
     session_values::rewrite(
         sql,
         &session_values::Session {
             user: &state.principal.name,
+            session_user: state.session_user.as_ref().map_or(&state.principal.name, |s| &s.name),
+            superuser: state.principal.may_administer(),
+            acl,
             database: &state.database_name,
             backend_pid: state.backend_pid,
             setting: &setting,
         },
     )
+}
+
+/// `SET [SESSION] ROLE r` → `Some(Some(r))`; `SET ROLE NONE` and `RESET
+/// ROLE` → `Some(None)`; anything else `None`. `SET LOCAL ROLE` is not this
+/// (it is refused as an unknown setting).
+fn set_role_target(lower: &str, original: &str) -> Option<Option<String>> {
+    let l = lower.trim().trim_end_matches(';').trim();
+    if l == "reset role" {
+        return Some(None);
+    }
+    let rest = l.strip_prefix("set session role ").or_else(|| l.strip_prefix("set role "))?;
+    let rest = rest.trim();
+    if rest == "none" {
+        return Some(None);
+    }
+    // The original's case for a quoted name; a bare one folds.
+    let raw = original.trim().trim_end_matches(';').trim();
+    let raw = raw.get(raw.len().saturating_sub(rest.len())..).unwrap_or(rest).trim();
+    Some(Some(if raw.starts_with('"') && raw.ends_with('"') && raw.len() > 1 {
+        raw[1..raw.len() - 1].replace("\"\"", "\"")
+    } else if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() > 1 {
+        raw[1..raw.len() - 1].to_string()
+    } else {
+        rest.to_string()
+    }))
 }
 
 /// A `SET [SESSION | LOCAL] name {TO | =} value` or `RESET name` of a
@@ -13167,6 +13930,84 @@ where
 {
     let s = stmt.trim();
     let s_lower = s.to_ascii_lowercase();
+    // `SET LOCAL rdb.global_txn = 'g'`: the gateway's id for the
+    // multi-shard transaction this block is one part of, so the cluster's
+    // deadlock detector can follow a cycle of waits across shards
+    // (sharding-plan.md B4.2). Only inside a block: it names the block.
+    #[cfg(feature = "sharding")]
+    if let Some(v) = s_lower
+        .trim_end_matches(';')
+        .strip_prefix("set local rdb.global_txn")
+        .map(|r| r.trim_start().trim_start_matches('=').trim_start_matches("to").trim().trim_matches('\''))
+    {
+        if v.is_empty() || v.len() > 128 {
+            return Ok(false);
+        }
+        if let (Some(tx), Some(db)) = (state.current_tx(), state.catalog.get(&state.database_name)) {
+            crate::core::shard::deadlock::tag(&db, tx, v, current_session_cancel().as_ref());
+        }
+        send_command_complete(stream, "SET").await?;
+        return Ok(true);
+    }
+
+
+    // `SET ROLE r`, `SET ROLE NONE`, `RESET ROLE` (roles plan R2): act as a
+    // role the session user is a member of, with that role's rights.
+    if let Some(target) = set_role_target(&s_lower, s) {
+        let base = state.session_user.clone().unwrap_or_else(|| state.principal.clone());
+        match target {
+            None => {
+                if let Some(orig) = state.session_user.take() {
+                    state.principal = orig;
+                }
+                send_command_complete(stream, if s_lower.starts_with("reset") { "RESET" } else { "SET" }).await?;
+                return Ok(true);
+            }
+            Some(role) => {
+                let Some(database) = state.catalog.get(&state.database_name) else {
+                    return Ok(false);
+                };
+                let Some(r) = crate::auth::lookup_role(&database, &role).await else {
+                    send_error_response(stream, "22023", &format!("role \"{role}\" does not exist")).await?;
+                    return Ok(true);
+                };
+                let member = base.superuser
+                    || match crate::core::rql::privileges::load_shared(&database, None).await {
+                        Ok(rows) => crate::core::rql::privileges::settable_roles(&rows, &base.name).iter().any(|g| g == &r.name),
+                        Err(_) => false,
+                    };
+                if !member {
+                    send_error_response(stream, "42501", &format!("permission denied to set role \"{role}\"")).await?;
+                    return Ok(true);
+                }
+                state.session_user.get_or_insert(base.clone());
+                state.principal = Principal { name: r.name.clone(), superuser: r.is_superuser, authenticated: base.authenticated };
+                send_command_complete(stream, "SET").await?;
+                return Ok(true);
+            }
+        }
+    }
+
+    // `SET rdb.shard_part = on|off`: a Track A router's fan-out marks its
+    // statements as one shard's part, so a keyless read may read the ranges
+    // this shard owns (sharding-plan.md B1a.4).
+    #[cfg(feature = "sharding")]
+    if let Some(v) = s_lower
+        .trim_end_matches(';')
+        .strip_prefix("set rdb.shard_part")
+        .map(|r| r.trim_start().trim_start_matches('=').trim_start_matches("to").trim().trim_matches('\''))
+    {
+        let on = match v {
+            "on" | "true" | "1" => true,
+            "off" | "false" | "0" => false,
+            _ => return Ok(false),
+        };
+        if let Some(c) = current_session_cancel() {
+            c.fan_out_part.store(on, std::sync::atomic::Ordering::Release);
+        }
+        send_command_complete(stream, "SET").await?;
+        return Ok(true);
+    }
 
     // `RESET ALL` and `DISCARD`: how a pool clears a connection between
     // borrowers (Npgsql sends `DISCARD ALL`). Both used to fail as a syntax
@@ -15452,10 +16293,16 @@ where
     let user = parameters.get("user").cloned().unwrap_or_default();
 
     if config.method == AuthMethod::Trust {
+        // As the named role, with its attributes; never an administrator by
+        // itself (`auth::trust_login`). Refused as PostgreSQL refuses a
+        // `trust` login of a role that does not exist (28000).
+        let superuser = crate::auth::trust_login(database, &user, Some(&config.bootstrap_user))
+            .await
+            .map_err(|message| io::Error::new(io::ErrorKind::NotFound, message))?;
         send_auth_ok(stream).await?;
         return Ok(Principal {
             name: user,
-            superuser: false,
+            superuser,
             authenticated: false,
         });
     }
@@ -15476,6 +16323,7 @@ where
         .unwrap_or(Verifier::Plain(String::new()));
     let may_login = role.as_ref().map(|r| r.can_login).unwrap_or(false);
     let superuser = role.as_ref().map(|r| r.is_superuser).unwrap_or(false);
+    let md5_verifier = matches!(verifier, Verifier::Md5 { .. });
 
     let denied = || {
         io::Error::new(
@@ -15570,6 +16418,11 @@ where
     }
 
     send_auth_ok(stream).await?;
+    // RD3: md5 is accepted where configured, and every such login is
+    // warned about, in the log and to the client.
+    if md5_verifier && crate::auth::warn_if_md5_login(role.as_ref().and_then(|r| r.verifier.as_ref()), &user, &database.name, "pgwire") {
+        send_notice(stream, "01000", &crate::auth::md5_login_warning(&user)).await?;
+    }
     Ok(Principal {
         name: user,
         superuser,
@@ -16831,7 +17684,7 @@ mod authorization_tests {
     }
 
     #[test]
-    fn only_a_proven_non_superuser_is_refused() {
+    fn only_a_superuser_administers() {
         let trusted = Principal {
             name: "anyone".into(),
             superuser: false,
@@ -16847,7 +17700,9 @@ mod authorization_tests {
             superuser: false,
             authenticated: true,
         };
-        assert!(trusted.may_administer(), "trust has no one to refuse");
+        // Under `trust` a session is what its role is (`auth::trust_login`
+        // sets `superuser`), never an administrator by having proved nothing.
+        assert!(!trusted.may_administer(), "trust is not administration");
         assert!(admin.may_administer());
         assert!(!user.may_administer());
     }
@@ -17359,7 +18214,8 @@ mod cross_dir_commit_order_tests {
         };
         let principal = Principal {
             name: "rasterized".to_string(),
-            superuser: false,
+            // `trust` on a database with no roles: the bootstrap session.
+            superuser: true,
             authenticated: false,
         };
         let mut state = SessionState::new(
@@ -17569,7 +18425,8 @@ mod index_store_wire_tests {
         };
         let principal = Principal {
             name: "rasterized".to_string(),
-            superuser: false,
+            // `trust` on a database with no roles: the bootstrap session.
+            superuser: true,
             authenticated: false,
         };
         // A real loopback socket: the shutdown ends a session through it.
@@ -17630,7 +18487,8 @@ mod index_store_wire_tests {
         };
         let principal = Principal {
             name: "rasterized".to_string(),
-            superuser: false,
+            // `trust` on a database with no roles: the bootstrap session.
+            superuser: true,
             authenticated: false,
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

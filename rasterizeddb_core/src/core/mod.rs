@@ -10,6 +10,15 @@ pub mod notice;
 /// Hash partitioning's routing hash and range map; not wired in yet.
 pub mod partition;
 pub mod sync_audit;
+/// Ownership hooks on every path that stamps a row: no-ops without the
+/// `sharding` feature (sharding-plan.md B0.7).
+pub mod shard_hooks;
+/// The GPL hook traits licensed tenancy and placement plug into; their
+/// defaults are today's behaviour (sharding-plan.md §10).
+pub mod policy_hooks;
+/// A shard's side of sharding; dormant until `--role shard`.
+#[cfg(feature = "sharding")]
+pub mod shard;
 /// Crash images, failpoints and the index twin suites through restarts
 /// and power cuts (persistent-indexes design §11). Public only under the
 /// test-only `index_store_failpoints` feature, for the compat suites.
@@ -21,6 +30,7 @@ mod downgrade_tests;
 pub mod database;
 pub mod db_type;
 pub mod filter;
+pub mod framed_log;
 /// Frozen hashes for anything persisted (in-tree XXH64; rapidhash for GIN items).
 pub mod hash;
 pub mod helpers;

@@ -225,6 +225,7 @@ impl DatabaseCatalog {
     /// that looks like a database is opened with it.
     pub async fn open(root: Option<&str>, default_name: &str) -> Result<Arc<Self>, String> {
         validate_name(default_name)?;
+        crate::core::policy_hooks::set_operator_database(default_name);
 
         let databases = DashMap::with_hasher(ahash::RandomState::new());
 
@@ -407,6 +408,19 @@ impl DatabaseCatalog {
     /// that account should be is the server's configuration rather than the
     /// catalogue's business.
     pub async fn create(&self, name: &str) -> Result<Arc<Database>, String> {
+        self.create_with_roles(name, None).await
+    }
+
+    /// [`Self::create`], the new database starting with only the roles
+    /// `roles` names, copied from the database `roles` gives (the creating
+    /// session's): `CREATE DATABASE` under `roles.create_database_roles =
+    /// owner` (RD1), the creating role and the `OWNER`. `None` copies every
+    /// role of the default database, as before.
+    pub async fn create_with_roles(
+        &self,
+        name: &str,
+        roles: Option<(Arc<Database>, Vec<String>)>,
+    ) -> Result<Arc<Database>, String> {
         // While the default database replicates, the CREATE is owed to the
         // peers from before the database exists until its record is durable:
         // a marker in its directory says so, written first. A crash anywhere
@@ -427,7 +441,7 @@ impl DatabaseCatalog {
                 .map_err(|e| format!("could not create database \"{}\": {}", name, e))?;
             write_marker(&dir.join(PENDING_CREATE)).map_err(|e| format!("could not create database \"{}\": {}", name, e))?;
         }
-        let database = match self.create_unrecorded(name).await {
+        let database = match self.create_unrecorded_with(name, roles).await {
             Ok(database) => database,
             Err(e) => {
                 if announced {
@@ -552,6 +566,16 @@ impl DatabaseCatalog {
     /// [`DatabaseCatalog::create`] without recording it for the peers: what
     /// applying a peer's `CREATE DATABASE` record does.
     pub(crate) async fn create_unrecorded(&self, name: &str) -> Result<Arc<Database>, String> {
+        self.create_unrecorded_with(name, None).await
+    }
+
+    /// [`Self::create_unrecorded`], with the roles to start with as
+    /// [`Self::create_with_roles`] takes them.
+    async fn create_unrecorded_with(
+        &self,
+        name: &str,
+        roles: Option<(Arc<Database>, Vec<String>)>,
+    ) -> Result<Arc<Database>, String> {
         validate_name(name)?;
 
         if self.fixed {
@@ -569,7 +593,17 @@ impl DatabaseCatalog {
                 let path = std::path::Path::new(root).join(name);
                 // An existing directory is adopted rather than refused: it can
                 // only be one this catalogue failed to notice, since the name
-                // is not in the map.
+                // is not in the map. Unless the tenancy policy says otherwise
+                // (T8): then only an empty one, or one this create marked.
+                if !crate::core::policy_hooks::tenancy().may_adopt_directory()
+                    && !path.join(PENDING_CREATE).exists()
+                    && std::fs::read_dir(&path).is_ok_and(|mut entries| entries.next().is_some())
+                {
+                    return Err(format!(
+                        "could not create database \"{name}\": a directory of that name already holds data, \
+                         and a database is never made over one here"
+                    ));
+                }
                 tokio::fs::create_dir_all(&path)
                     .await
                     .map_err(|e| format!("could not create database \"{}\": {}", name, e))?;
@@ -598,7 +632,18 @@ impl DatabaseCatalog {
         // database exists and holds data either way, and reporting the create
         // as failed would be a worse description of what happened than saying
         // its accounts did not come across.
-        if let Some(default) = self
+        if let Some((from, names)) = roles {
+            if let Err(e) = crate::auth::copy_roles(&from, &database, Some(&names)).await {
+                log::error!(
+                    "Database \"{}\" was created but its roles ({}) could not be carried over from \
+                     \"{}\" ({}); no account will be able to connect to it until one is created",
+                    name,
+                    names.join(", "),
+                    from.name,
+                    e
+                );
+            }
+        } else if let Some(default) = self
             .databases
             .get(&self.default_name)
             .map(|e| e.database.clone())
@@ -612,6 +657,14 @@ impl DatabaseCatalog {
                     e
                 );
             }
+        }
+        // Made now, so every relation it gets is owned as it is made: it
+        // needs none of the upgrade a database from before owners gets
+        // (`privileges::assign_owners`), which would grant its relations to
+        // PUBLIC.
+        let owner = crate::auth::database_owner(&database, "").await;
+        if let Err(e) = crate::core::rql::privileges::mark_current(&database, &owner).await {
+            log::warn!("Database \"{}\" was created but could not be marked as having owners: {}", name, e);
         }
 
         self.databases
@@ -1047,6 +1100,10 @@ pub enum DatabaseStatement {
     Create {
         name: String,
         if_not_exists: bool,
+        /// `[WITH] OWNER [=] role`: the role the database is made for. With
+        /// the creating role, the only one it starts with
+        /// (`roles.create_database_roles = owner`, RD1).
+        owner: Option<String>,
     },
     Drop {
         name: String,
@@ -1164,11 +1221,29 @@ pub fn parse_database_statement(sql: &str) -> Option<Result<DatabaseStatement, S
             let Some(name) = tokens.get(index).map(|t| fold(t)) else {
                 return Some(Err("CREATE DATABASE names no database".to_string()));
             };
+            // `[WITH] OWNER [=] role`, read out of the options before the
+            // rest are looked at.
+            let mut tokens = tokens;
+            let mut words_owned: Vec<String> = upper.split_whitespace().map(str::to_string).collect();
+            let mut owner: Option<String> = None;
+            if let Some(at) = words_owned.iter().skip(index + 1).position(|w| w == "OWNER").map(|p| p + index + 1) {
+                let mut end = at + 1;
+                if words_owned.get(end).map(String::as_str) == Some("=") {
+                    end += 1;
+                }
+                let Some(role) = tokens.get(end).map(|t| fold(t)) else {
+                    return Some(Err("CREATE DATABASE … OWNER names no role".to_string()));
+                };
+                owner = Some(role);
+                let start = if at > index + 1 && words_owned[at - 1] == "WITH" { at - 1 } else { at };
+                tokens.drain(start..=end);
+                words_owned.drain(start..=end);
+            }
             // `TEMPLATE db` is a copy: a branch of `db`. `template0` and
             // `template1` are PostgreSQL's empty templates, a plain create.
             #[cfg(feature = "db_branching")]
             {
-                let words: Vec<&str> = upper.split_whitespace().collect();
+                let words: Vec<&str> = words_owned.iter().map(String::as_str).collect();
                 if let Some(template) = branch::template_of(
                     words.get(index + 1..).unwrap_or(&[]),
                     tokens.get(index + 1..).unwrap_or(&[]),
@@ -1178,7 +1253,11 @@ pub fn parse_database_statement(sql: &str) -> Option<Result<DatabaseStatement, S
                         Ok(None) => Ok(DatabaseStatement::Create {
                             name,
                             if_not_exists,
+                            owner,
                         }),
+                        Ok(Some(_)) if owner.is_some() => {
+                            Err("CREATE DATABASE … OWNER … TEMPLATE is not supported; use CREATE BRANCH".to_string())
+                        }
                         Ok(Some(from)) if !if_not_exists => Ok(DatabaseStatement::CreateBranch {
                             name,
                             from: Some(from),
@@ -1203,6 +1282,7 @@ pub fn parse_database_statement(sql: &str) -> Option<Result<DatabaseStatement, S
             Some(Ok(DatabaseStatement::Create {
                 name,
                 if_not_exists,
+                owner,
             }))
         }
         "DROP" => {
@@ -1256,7 +1336,8 @@ mod tests {
                 .unwrap(),
             DatabaseStatement::Create {
                 name: "analytics".to_string(),
-                if_not_exists: false
+                if_not_exists: false,
+                owner: None
             }
         );
         assert_eq!(
@@ -1265,7 +1346,8 @@ mod tests {
                 .unwrap(),
             DatabaseStatement::Create {
                 name: "Analytics".to_string(),
-                if_not_exists: false
+                if_not_exists: false,
+                owner: None
             }
         );
     }
@@ -1287,15 +1369,17 @@ mod tests {
                 .unwrap(),
             DatabaseStatement::Create {
                 name: "staging".to_string(),
-                if_not_exists: true
+                if_not_exists: true,
+                owner: None
             }
         );
     }
 
     #[test]
     fn unsupported_options_are_reported_rather_than_ignored() {
+        // OWNER is taken (the roles work); the rest are still refused.
         assert!(
-            parse_database_statement("CREATE DATABASE x WITH OWNER bob")
+            parse_database_statement("CREATE DATABASE x WITH ENCODING 'LATIN1'")
                 .unwrap()
                 .is_err()
         );

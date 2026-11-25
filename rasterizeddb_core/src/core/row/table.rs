@@ -31,6 +31,13 @@ use crate::core::mvcc::TransactionManager;
 use crate::core::mvcc::Visibility;
 use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX, TxId};
 use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
+
+/// [`Table::resident_estimate`]'s fixed part: an open table's providers,
+/// caches and empty structures.
+const RESIDENT_BASE: u64 = 256 << 10;
+/// [`Table::resident_estimate`]'s per-byte part: one byte resident for every
+/// this many stored.
+const RESIDENT_SHARE: u64 = 8;
 use crate::core::row::schema::SchemaCalculator;
 use crate::core::vacuum::{
     CompactReport, FreeSpace, ReadTicket, ReaderRegistry, VacuumConfig, VacuumReport,
@@ -3148,6 +3155,19 @@ impl<S: StorageIO> Table<S> {
 
     /// Row versions the write path has stamped dead since the table opened.
     /// See the field for what counts.
+    /// What this table is estimated to hold in memory once open, for the
+    /// partition budget's resident-bytes term (sharding-plan.md B0.5): a
+    /// fixed cost per open table plus a share of its stored row bytes, which
+    /// is what its in-memory indexes and filters grow with. An estimate taken
+    /// at open, not a measurement; 0 for a table that cannot be read.
+    pub(crate) fn resident_estimate(&self) -> u64 {
+        let Ok(d) = self.data() else {
+            return 0;
+        };
+        let stored = d.len.load(AtomicOrdering::Relaxed);
+        RESIDENT_BASE + stored / RESIDENT_SHARE
+    }
+
     pub fn dead_stamps(&self) -> u64 {
         self.dead_stamps.load(AtomicOrdering::Relaxed)
     }
@@ -5047,6 +5067,10 @@ impl<S: StorageIO> Table<S> {
         if let Some(guard) = d.guard.as_ref() {
             guard.check_insert(&row_write)?;
         }
+        crate::core::shard_hooks::check_stamp(
+            d.guard.as_ref().map(|g| g.range()),
+            crate::core::shard_hooks::StampOp::Insert,
+        )?;
 
         self.note_write(written_by);
 
@@ -5108,6 +5132,20 @@ impl<S: StorageIO> Table<S> {
             std::io::Error::from(e)
         })?;
         d.vacuum_stats.note_inserted(written_by, 1);
+        // A shard's Raft group carries the new row (B3).
+        #[cfg(feature = "sharding_raft")]
+        if crate::core::shard::capture::active()
+            && let Some(db) = crate::core::shard::capture::database_of_scope(&self.cache_scope)
+        {
+            crate::core::shard::capture::record(
+                db,
+                written_by,
+                crate::core::shard::capture::Op::Insert {
+                    table: self.schema.name.clone(),
+                    row: crate::core::shard::capture::image_of_write(&row_write),
+                },
+            );
+        }
 
         // Index the new slot. The pointer record position IS the slot address
         // (dense fixed-stride file), so no mapping is needed.
@@ -5133,6 +5171,48 @@ impl<S: StorageIO> Table<S> {
         Ok(())
     }
 
+    /// Waits until this table's indexes are ready to answer exact lookups,
+    /// or `timeout` passes (sharding-plan.md B0.6).
+    ///
+    /// Covers both ways indexes become ready: a snapshot load (the gate's
+    /// load barrier) and a rebuild from the rows, which has no barrier and is
+    /// polled. A shard's apply loop and a move address rows by primary key,
+    /// so they call this first and fail on its `Err` rather than fall back to
+    /// a scan that would silently cost a full read per row. A table with no
+    /// indexes has nothing to wait for.
+    // Its callers (a shard's apply loop, a move) arrive with B1a and B2.
+    #[allow(dead_code)]
+    pub(crate) async fn wait_indexes_ready(&self, timeout: std::time::Duration) -> Result<()> {
+        let d = self.data()?;
+        let Some(indexes) = d.indexes.as_ref() else {
+            return Ok(());
+        };
+        let start = std::time::Instant::now();
+        let mut pause = std::time::Duration::from_millis(1);
+        loop {
+            if indexes.is_ready() {
+                return Ok(());
+            }
+            let left = timeout.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "the indexes of '{}' were not ready within {} ms",
+                        self.schema.name,
+                        timeout.as_millis()
+                    ),
+                ));
+            }
+            if self.gate.loads().loading() {
+                self.gate.loads().settled_within(left.min(pause.max(std::time::Duration::from_millis(50)))).await;
+            } else {
+                tokio::time::sleep(left.min(pause)).await;
+            }
+            pause = (pause * 2).min(std::time::Duration::from_millis(100));
+        }
+    }
+
     /// Writes one row version as another instance of this table's file set
     /// held it: created by `xmin` and, unless `xmax` is `NO_TX`, retired by
     /// `xmax`. For an ALTER rewrite (docs/persistent-indexes.md §7, R5), which
@@ -5148,6 +5228,10 @@ impl<S: StorageIO> Table<S> {
     /// insert.
     pub(crate) async fn insert_version(&self, mut row_write: RowWrite, xmin: TxId, xmax: TxId) -> Result<()> {
         let d = self.data()?;
+        crate::core::shard_hooks::check_stamp(
+            d.guard.as_ref().map(|g| g.range()),
+            crate::core::shard_hooks::StampOp::InsertVersion,
+        )?;
         // A rewrite's added column (its DEFAULT) is held to its declared
         // text length as any insert is; the copied columns already hold.
         self.hold_text_lengths(&mut row_write, |_| true, false)
@@ -5847,6 +5931,10 @@ impl<S: StorageIO> Table<S> {
     ) -> Result<u64> {
         let d = self.data()?;
         info!("Deleting rows");
+        crate::core::shard_hooks::check_stamp(
+            d.guard.as_ref().map(|g| g.range()),
+            crate::core::shard_hooks::StampOp::Delete,
+        )?;
 
         self.note_write(deleted_by);
 
@@ -5965,9 +6053,14 @@ impl<S: StorageIO> Table<S> {
                 }
             }
 
-            // The row as it was, for `RETURNING`, read before the tombstone.
+            // The row as it was, for `RETURNING` (and a shard's Raft group,
+            // which carries the old image), read before the tombstone.
+            #[cfg(feature = "sharding_raft")]
+            let capturing = crate::core::shard::capture::active();
+            #[cfg(not(feature = "sharding_raft"))]
+            let capturing = false;
             let before = match collect.as_ref() {
-                Some(_) => {
+                _ if collect.is_some() || capturing => {
                     let mut row = Row::default();
                     let full_fetch = Self::build_full_row_fetch(&self.schema.fields);
                     if let Err(e) = pointer.fetch_row_reuse_async(&*d.io_rows, &full_fetch, &mut row).await {
@@ -5981,7 +6074,7 @@ impl<S: StorageIO> Table<S> {
                     }
                     Some(row)
                 }
-                None => None,
+                _ => None,
             };
 
             if let Err(e) = pointer
@@ -5990,6 +6083,19 @@ impl<S: StorageIO> Table<S> {
             {
                 error!("Failed to delete row pointer {:?}: {}", pointer, e);
                 continue;
+            }
+            #[cfg(feature = "sharding_raft")]
+            if capturing
+                && let (Some(db), Some(row)) = (crate::core::shard::capture::database_of_scope(&self.cache_scope), before.as_ref())
+            {
+                crate::core::shard::capture::record(
+                    db,
+                    deleted_by,
+                    crate::core::shard::capture::Op::Delete {
+                        table: self.schema.name.clone(),
+                        old: crate::core::shard::capture::image_of_row(row),
+                    },
+                );
             }
             if let (Some(collect), Some(row)) = (collect.as_deref_mut(), before) {
                 collect.push(row);
@@ -6221,6 +6327,10 @@ impl<S: StorageIO> Table<S> {
         mut moves: Option<&mut Vec<RowWrite>>,
     ) -> Result<u64> {
         info!("Updating rows");
+        crate::core::shard_hooks::check_stamp(
+            self.data()?.guard.as_ref().map(|g| g.range()),
+            crate::core::shard_hooks::StampOp::Update,
+        )?;
 
         // A statement naming its row by a unique key tries the point path
         // first, which lets updates of different keys run side by side. It
@@ -6768,6 +6878,21 @@ impl<S: StorageIO> Table<S> {
                     if let Some(collect) = collect.as_deref_mut() {
                         collect.push(returned_image.clone().unwrap_or_else(|| row.clone()));
                     }
+                    // The old version leaves this partition; the caller's
+                    // insert of the merged row is captured where it lands.
+                    #[cfg(feature = "sharding_raft")]
+                    if crate::core::shard::capture::active()
+                        && let Some(db) = crate::core::shard::capture::database_of_scope(&self.cache_scope)
+                    {
+                        crate::core::shard::capture::record(
+                            db,
+                            written_by,
+                            crate::core::shard::capture::Op::Delete {
+                                table: self.schema.name.clone(),
+                                old: crate::core::shard::capture::image_of_row(&row),
+                            },
+                        );
+                    }
                     moves.push(row_write);
                     continue;
                 }
@@ -6861,6 +6986,23 @@ impl<S: StorageIO> Table<S> {
                     Some(trimmed) => std::io::Error::new(e.kind(), trimmed.to_string()),
                     None => e,
                 });
+            }
+
+            // A shard's Raft group carries the update, the old image and the
+            // merged new one, whichever branch below writes it (B3).
+            #[cfg(feature = "sharding_raft")]
+            if crate::core::shard::capture::active()
+                && let Some(db) = crate::core::shard::capture::database_of_scope(&self.cache_scope)
+            {
+                crate::core::shard::capture::record(
+                    db,
+                    written_by,
+                    crate::core::shard::capture::Op::Update {
+                        table: self.schema.name.clone(),
+                        old: crate::core::shard::capture::image_of_row(&row),
+                        new: crate::core::shard::capture::image_of_write(&row_write),
+                    },
+                );
             }
 
             // Fast path: when every assigned column is fixed-width, the row's

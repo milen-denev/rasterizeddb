@@ -71,7 +71,10 @@ fn session(db: &Arc<Database>) -> SessionState {
         DatabaseCatalog::single(db.clone()),
         db.name.clone(),
         AuthConfig { method: crate::auth::AuthMethod::Trust, ..AuthConfig::default() },
-        Principal { name: "rasterized".to_string(), superuser: false, authenticated: false },
+        // The tables are made through the engine, owned by no role: the
+        // superuser reads them, as every session did before privileges were
+        // checked. Routing is what these tests are about.
+        Principal { name: "rasterized".to_string(), superuser: true, authenticated: false },
         ConnectionLimits::default(),
     )
 }

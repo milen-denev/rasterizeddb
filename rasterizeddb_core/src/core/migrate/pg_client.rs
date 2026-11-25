@@ -386,6 +386,8 @@ impl PgConnection {
     /// Opens a connection and authenticates.
     pub async fn connect(params: &ConnectParams) -> Result<Self, String> {
         let description = params.redacted();
+        // T9: where the server may connect to is the policy's to say.
+        crate::core::policy_hooks::tenancy().may_connect(&params.host, params.port)?;
         let address = format!("{}:{}", params.host, params.port);
 
         let tcp = tokio::time::timeout(params.connect_timeout, TcpStream::connect(&address))

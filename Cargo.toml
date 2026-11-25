@@ -1,5 +1,5 @@
 [workspace]
-members = [ "rastcp","rasterizeddb_client","rasterizeddb_client_derive","rasterizeddb_core", "rasterizeddb_embedded", "pgo_train", "rasterizeddb_compat", "rasterizeddb_filter_tests", "test_client", "test_db_web", "rdb_studio"]
+members = [ "rastcp","rasterizeddb_router","rasterizeddb_raft","rasterizeddb_gateway","rasterizeddb_enterprise","rasterizeddb_gateway_enterprise","rasterizeddb_server","rasterizeddb_client","rasterizeddb_client_derive","rasterizeddb_core", "rasterizeddb_embedded", "pgo_train", "rasterizeddb_compat", "rasterizeddb_filter_tests", "test_client", "test_db_web", "rdb_studio"]
 resolver = "3"
 
 [profile.release]

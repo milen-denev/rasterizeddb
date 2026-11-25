@@ -14,6 +14,7 @@
 //! The password travels inside TLS (TDS encrypts the whole connection here;
 //! login-only encryption is not offered). Windows authentication is not.
 
+pub(crate) mod accounts;
 pub(crate) mod applock;
 pub(crate) mod conn;
 pub(crate) mod fulltext;

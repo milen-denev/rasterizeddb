@@ -552,24 +552,24 @@ pub(crate) fn live_generation(root: &Path, uid: u64) -> Result<u64, String> {
 /// order before its `SEALED` was synced), but so would a later version's
 /// records this one cannot read: the reaper deletes none of them.
 fn live_generation_and_unreadable(root: &Path, uid: u64) -> Result<(u64, Vec<u64>), String> {
+    use crate::core::framed_log::{GenerationReplay, live_generation};
     let gens = generations_in(root, uid).map_err(|e| format!("{} cannot be listed: {e}", root.display()))?;
-    let mut unreadable = Vec::new();
-    for &g in &gens {
-        if g == 0 {
-            return Ok((0, unreadable));
-        }
+    let (live, unreadable) = live_generation(&gens, |g| {
         let name = map_file(uid, g);
         let buf = std::fs::read(root.join(&name)).map_err(|e| format!("its map log {name} cannot be read: {e}"))?;
-        match log::replay(&buf) {
-            Ok(r) if r.state.sealed() => return Ok((g, unreadable)),
-            Ok(_) => ::log::warn!("map log {name} is an unfinished compaction (no SEALED); the generation before it is live"),
+        Ok(match log::replay(&buf) {
+            Ok(r) if r.state.sealed() => GenerationReplay::Sealed,
+            Ok(_) => {
+                ::log::warn!("map log {name} is an unfinished compaction (no SEALED); the generation before it is live");
+                GenerationReplay::Unsealed
+            }
             Err(e) => {
                 ::log::warn!("map log {name} does not replay ({e}); the generation before it is live");
-                unreadable.push(g);
+                GenerationReplay::Unreadable(e)
             }
-        }
-    }
-    Ok((0, unreadable))
+        })
+    })?;
+    Ok((live, unreadable.into_iter().map(|(g, _)| g).collect()))
 }
 
 /// A live table's map log as the reaper reads it: its live generation

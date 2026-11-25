@@ -372,12 +372,20 @@ pub fn storage_is_durable(kind: &str) -> bool {
     !matches!(kind, "memory" | "kv-memory" | "temporary" | "file-unlogged")
 }
 
-/// A role the server knows: who can log in, and who can do everything.
+/// A role the server knows: who can log in, who can do everything, what
+/// else it may do, and the roles it is a member of.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoleInfo {
     pub name: String,
     pub can_login: bool,
     pub superuser: bool,
+    pub create_db: bool,
+    pub create_role: bool,
+    pub bypass_rls: bool,
+    /// `-1`: no limit.
+    pub conn_limit: i64,
+    pub valid_until: Option<String>,
+    pub member_of: Vec<String>,
 }
 
 /// A column of a table.
@@ -1440,6 +1448,67 @@ impl PeerHealth {
             PeerHealth::Paused => "PAUSED",
             PeerHealth::Down => "DOWN",
         }
+    }
+}
+
+/// One shard of the cluster map, as `SHOW SHARDS` answers it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShardInfo {
+    pub id: u64,
+    /// The shard this connection reached.
+    pub this: bool,
+    pub address: String,
+    pub standbys: Vec<String>,
+    /// How many block ranges it owns, and how many blocks in all.
+    pub ranges: u64,
+    pub blocks: u64,
+}
+
+/// One table's rows on the shard the connection reached, summed over its
+/// partitions (`SHOW SHARD LOAD`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableLoad {
+    pub table: String,
+    pub partitions: u64,
+    pub row_slots: u64,
+    pub bytes: u64,
+}
+
+/// Everything the shards page reads.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ShardsSnapshot {
+    /// Whether the server understood `SHOW SHARDS` (an older build answers
+    /// it as a runtime parameter, a PostgreSQL server refuses it).
+    pub supported: bool,
+    pub shards: Vec<ShardInfo>,
+    pub map_epoch: Option<u64>,
+    pub cluster_id: String,
+    pub map_digest: String,
+    /// `SHOW GATEWAY`'s rows when the connection is to a gateway, else
+    /// empty.
+    pub gateway: Vec<(String, String)>,
+    pub load: Vec<TableLoad>,
+    /// Two-phase parts prepared on the shard the connection reached, by
+    /// global id.
+    pub prepared: Vec<String>,
+}
+
+impl ShardsSnapshot {
+    /// Every block a map can hand out: the hash space is 2^64 points in
+    /// blocks of 2^16.
+    pub const BLOCKS: u64 = 1 << 48;
+
+    pub fn through_gateway(&self) -> bool {
+        !self.gateway.is_empty()
+    }
+
+    pub fn gateway_value(&self, name: &str) -> Option<&str> {
+        self.gateway.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+
+    /// Whether every block of the hash space has an owner.
+    pub fn covered_blocks(&self) -> u64 {
+        self.shards.iter().map(|s| s.blocks).sum()
     }
 }
 

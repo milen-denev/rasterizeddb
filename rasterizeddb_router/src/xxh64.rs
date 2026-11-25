@@ -172,7 +172,7 @@ impl Xxh64 {
 #[cfg(test)]
 mod tests {
     use super::{Xxh64, xxh64};
-    use crate::core::hash::test_buffers::xsum_buffer;
+    use crate::test_buffers::xsum_buffer;
 
     /// xxhsum's sanity buffer: 101 bytes from squaring PRIME32 (`xxhsum.c`,
     /// `BMK_sanityCheck`).

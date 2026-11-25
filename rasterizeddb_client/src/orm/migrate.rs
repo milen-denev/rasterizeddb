@@ -448,6 +448,20 @@ impl Migrator {
         )
     }
 
+    /// A repeatable step of grants, run again whenever they change, so a
+    /// migration carries its permissions:
+    /// `.grants("app grants", &[Grant::privileges(&["SELECT"]).on_table("orders").to("app")])`.
+    /// Its undo revokes them.
+    pub fn grants(self, name: &str, grants: &[crate::admin::Grant]) -> Result<Self> {
+        let up = grants.iter().map(|g| g.to_sql(true)).collect::<Result<Vec<_>>>()?;
+        let down = grants.iter().map(|g| g.to_sql(false)).collect::<Result<Vec<_>>>()?;
+        let mut migrator = self.push(name, Body::Sql(up), true);
+        if let Some(step) = migrator.steps.last_mut() {
+            step.down = Some(Body::Sql(down));
+        }
+        Ok(migrator)
+    }
+
     /// The statements that undo the step added last, for
     /// [`rollback_to`](Self::rollback_to).
     pub fn down(mut self, statements: &[&str]) -> Self {
@@ -738,6 +752,33 @@ impl Migrator {
                 Some(_) => {}
             }
         }
+    }
+
+    /// [`apply`](Self::apply) over a router's every shard: the home shard
+    /// first, then the others in id order, each recording its own ledger in
+    /// its own migration table. A failure stops there and names the shard;
+    /// shards before it are migrated, and the next call resumes from each
+    /// shard's own ledger (DDL is not transactional, so nothing is undone).
+    /// Every model's table is made on every shard, so schemas stay
+    /// identical; a global model's table stays empty off the home shard.
+    #[cfg(feature = "sharding")]
+    pub async fn apply_sharded(
+        &self,
+        router: &crate::shard::Router,
+    ) -> Result<Vec<(crate::shard::ShardId, MigrationReport)>> {
+        let mut out = Vec::new();
+        for id in router.migration_order() {
+            let client = router.for_shard(id)?;
+            let report = self.apply(client).await.map_err(|e| match e {
+                Error::Server(m) => Error::Server(format!(
+                    "migration stopped at shard {id} (the shards before it are migrated; run again to resume): {m}"
+                )),
+                Error::Unsupported(m) => Error::Unsupported(format!("migration stopped at shard {id}: {m}")),
+                other => other,
+            })?;
+            out.push((id, report));
+        }
+        Ok(out)
     }
 
     /// Applies what is pending: steps in order, repeatable steps whose text

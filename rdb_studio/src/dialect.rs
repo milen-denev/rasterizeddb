@@ -35,8 +35,8 @@
 use crate::model::{
     BackupEntry, BranchDiffRow, BranchForm, BranchInfo, BranchPointKind, ColumnInfo,
     ConfigEntry, DatabaseInfo, Flavor, Grid, IndexInfo, IndexOwner, MergePolicy, PartitionInfo,
-    PeerStatus, Relationship, RestoreReport, RestoreTarget, RoleInfo, Stat, StatementRecord,
-    StatementShape, StorageLocation, TableInfo, TablePlacement,
+    PeerStatus, Relationship, RestoreReport, RestoreTarget, RoleInfo, ShardInfo, ShardsSnapshot, Stat,
+    StatementRecord, StatementShape, StorageLocation, TableInfo, TableLoad, TablePlacement,
 };
 
 // ---------------------------------------------------------------------------
@@ -204,16 +204,43 @@ pub fn kv_describe_sql(key: &str) -> String {
 /// and a hash on screen is a hash in a screenshot.
 pub fn roles_sql(flavor: Flavor) -> &'static str {
     match flavor {
+        // `pg_roles`, as on PostgreSQL: the role catalogue itself is no
+        // client's to read (it holds the verifiers), and `pg_roles` has
+        // every attribute.
         Flavor::Rasterized => {
-            "SELECT name, can_login, is_superuser FROM rdb_roles ORDER BY name"
+            "SELECT rolname AS name, rolcanlogin AS can_login, rolsuper AS is_superuser, \
+             rolcreatedb AS create_db, rolcreaterole AS create_role, rolbypassrls AS bypass_rls, \
+             rolconnlimit AS conn_limit, rolvaliduntil AS valid_until FROM pg_roles ORDER BY rolname"
         }
         // The predefined `pg_*` roles are PostgreSQL's own and cannot be
         // dropped or logged in as.
         Flavor::Postgres => {
-            "SELECT rolname AS name, rolcanlogin AS can_login, rolsuper AS is_superuser \
+            "SELECT rolname AS name, rolcanlogin AS can_login, rolsuper AS is_superuser, \
+             rolcreatedb AS create_db, rolcreaterole AS create_role, rolbypassrls AS bypass_rls, \
+             rolconnlimit AS conn_limit, rolvaliduntil AS valid_until \
              FROM pg_roles WHERE rolname NOT LIKE 'pg\\_%' ORDER BY rolname"
         }
     }
+}
+
+/// Every membership, `(member, role)`, on both servers.
+pub fn memberships_sql() -> &'static str {
+    "SELECT m.rolname AS member, g.rolname AS role FROM pg_auth_members a \
+     JOIN pg_roles m ON m.oid = a.member JOIN pg_roles g ON g.oid = a.roleid"
+}
+
+/// `roles` with the memberships [`memberships_sql`] listed filled in.
+pub fn add_memberships(mut roles: Vec<RoleInfo>, grid: &Grid) -> Vec<RoleInfo> {
+    for row in 0..grid.rows.len() {
+        let (Some(member), Some(role)) = (grid.value(row, "member"), grid.value(row, "role")) else { continue };
+        if let Some(r) = roles.iter_mut().find(|r| r.name == member) {
+            r.member_of.push(role.to_string());
+        }
+    }
+    for r in &mut roles {
+        r.member_of.sort();
+    }
+    roles
 }
 
 pub fn parse_roles(grid: &Grid) -> Vec<RoleInfo> {
@@ -223,6 +250,12 @@ pub fn parse_roles(grid: &Grid) -> Vec<RoleInfo> {
                 name: grid.value(row, "name")?.to_string(),
                 can_login: grid.flag(row, "can_login").unwrap_or(false),
                 superuser: grid.flag(row, "is_superuser").unwrap_or(false),
+                create_db: grid.flag(row, "create_db").unwrap_or(false),
+                create_role: grid.flag(row, "create_role").unwrap_or(false),
+                bypass_rls: grid.flag(row, "bypass_rls").unwrap_or(false),
+                conn_limit: grid.value(row, "conn_limit").and_then(|v| v.trim().parse().ok()).unwrap_or(-1),
+                valid_until: grid.value(row, "valid_until").map(str::to_string),
+                member_of: Vec::new(),
             })
         })
         .collect()
@@ -1162,6 +1195,92 @@ pub fn replication_stats_sql(flavor: Flavor) -> &'static str {
         Flavor::Rasterized => "SHOW REPLICATION STATS",
         Flavor::Postgres => PG_REPLICATION_STATS,
     }
+}
+
+/// The cluster map as the connected node serves it: a shard answers from
+/// its map, a gateway passes it to its home shard. PostgreSQL has no such
+/// statement, and the page says so instead of sending one.
+pub fn shards_sql(flavor: Flavor) -> Option<&'static str> {
+    match flavor {
+        Flavor::Rasterized => Some("SHOW SHARDS"),
+        Flavor::Postgres => None,
+    }
+}
+
+/// The gateway's own rows (a shard refuses the statement).
+pub const SHOW_GATEWAY_SQL: &str = "SHOW GATEWAY";
+/// Per-partition load on the shard reached.
+pub const SHOW_SHARD_LOAD_SQL: &str = "SHOW SHARD LOAD";
+/// Two-phase parts prepared on the shard reached.
+pub const SHOW_PREPARED_SQL: &str = "SHOW PREPARED TRANSACTIONS";
+
+/// `SHOW SHARDS` into the page's shards and map identity.
+pub fn parse_shards(grid: &Grid, into: &mut ShardsSnapshot) {
+    into.supported = grid.column_index("shard_id").is_some();
+    into.shards = (0..grid.rows.len())
+        .map(|row| ShardInfo {
+            id: grid.number(row, "shard_id").unwrap_or(0),
+            this: grid.flag(row, "this_shard").unwrap_or(false),
+            address: grid.value(row, "address").unwrap_or_default().to_string(),
+            standbys: grid
+                .value(row, "standbys")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect(),
+            ranges: grid.number(row, "ranges").unwrap_or(0),
+            blocks: grid.number(row, "blocks").unwrap_or(0),
+        })
+        .collect();
+    if !grid.rows.is_empty() {
+        into.map_epoch = grid.number(0, "map_epoch");
+        into.cluster_id = grid.value(0, "cluster_id").unwrap_or_default().to_string();
+        into.map_digest = grid.value(0, "map_digest").unwrap_or_default().to_string();
+    }
+}
+
+/// `SHOW GATEWAY`'s `(name, value)` rows; empty for anything else.
+pub fn parse_gateway(grid: &Grid) -> Vec<(String, String)> {
+    if grid.column_index("name").is_none() || grid.column_index("value").is_none() {
+        return Vec::new();
+    }
+    (0..grid.rows.len())
+        .map(|row| (grid.value(row, "name").unwrap_or_default().to_string(), grid.value(row, "value").unwrap_or_default().to_string()))
+        .collect()
+}
+
+/// `SHOW SHARD LOAD` summed per table, the biggest first.
+pub fn parse_shard_load(grid: &Grid) -> Vec<TableLoad> {
+    if grid.column_index("table_name").is_none() {
+        return Vec::new();
+    }
+    let mut by_table: Vec<TableLoad> = Vec::new();
+    for row in 0..grid.rows.len() {
+        let table = grid.value(row, "table_name").unwrap_or_default();
+        let at = match by_table.iter().position(|t| t.table == table) {
+            Some(i) => i,
+            None => {
+                by_table.push(TableLoad { table: table.to_string(), partitions: 0, row_slots: 0, bytes: 0 });
+                by_table.len() - 1
+            }
+        };
+        let t = &mut by_table[at];
+        t.partitions += 1;
+        t.row_slots += grid.number(row, "row_slots").unwrap_or(0);
+        t.bytes += grid.number(row, "total_bytes").unwrap_or(0);
+    }
+    by_table.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.table.cmp(&b.table)));
+    by_table
+}
+
+/// `SHOW PREPARED TRANSACTIONS`' global ids.
+pub fn parse_prepared(grid: &Grid) -> Vec<String> {
+    if grid.column_index("gid").is_none() {
+        return Vec::new();
+    }
+    (0..grid.rows.len()).filter_map(|row| grid.value(row, "gid").map(String::from)).collect()
 }
 
 /// A row per peer.

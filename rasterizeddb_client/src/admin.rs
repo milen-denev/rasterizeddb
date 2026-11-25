@@ -746,6 +746,11 @@ pub struct Role {
     password: Option<String>,
     login: bool,
     superuser: bool,
+    create_db: bool,
+    create_role: bool,
+    bypass_rls: bool,
+    connection_limit: Option<i64>,
+    valid_until: Option<String>,
 }
 
 impl fmt::Debug for Role {
@@ -755,6 +760,11 @@ impl fmt::Debug for Role {
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("login", &self.login)
             .field("superuser", &self.superuser)
+            .field("create_db", &self.create_db)
+            .field("create_role", &self.create_role)
+            .field("bypass_rls", &self.bypass_rls)
+            .field("connection_limit", &self.connection_limit)
+            .field("valid_until", &self.valid_until)
             .finish()
     }
 }
@@ -762,12 +772,7 @@ impl fmt::Debug for Role {
 impl Role {
     /// A role that can log in (PostgreSQL's `CREATE USER`).
     pub fn user(name: &str) -> Self {
-        Role {
-            name: name.to_string(),
-            password: None,
-            login: true,
-            superuser: false,
-        }
+        Role { login: true, ..Role::group(name) }
     }
 
     /// A role that cannot log in until given LOGIN.
@@ -777,9 +782,251 @@ impl Role {
             password: None,
             login: false,
             superuser: false,
+            create_db: false,
+            create_role: false,
+            bypass_rls: false,
+            connection_limit: None,
+            valid_until: None,
         }
     }
 
+    /// May create databases (`CREATEDB`).
+    pub fn create_db(mut self) -> Self {
+        self.create_db = true;
+        self
+    }
+
+    /// May create, alter and drop roles that are not superusers
+    /// (`CREATEROLE`).
+    pub fn create_role(mut self) -> Self {
+        self.create_role = true;
+        self
+    }
+
+    /// Is held to no row-level security policy (`BYPASSRLS`; a superuser's
+    /// to give).
+    pub fn bypass_rls(mut self) -> Self {
+        self.bypass_rls = true;
+        self
+    }
+
+    /// At most `limit` sessions at once (`CONNECTION LIMIT`; `-1` none).
+    pub fn connection_limit(mut self, limit: i64) -> Self {
+        self.connection_limit = Some(limit);
+        self
+    }
+
+    /// Its password stops working after `timestamp` (`VALID UNTIL`, e.g.
+    /// `2027-01-01 00:00:00+00`, or `infinity`).
+    pub fn valid_until(mut self, timestamp: &str) -> Self {
+        self.valid_until = Some(timestamp.to_string());
+        self
+    }
+
+    /// The attribute clauses after the name, as `CREATE ROLE` takes them.
+    fn options(&self) -> Result<String> {
+        let mut sql = String::new();
+        sql.push_str(if self.login { " LOGIN" } else { " NOLOGIN" });
+        sql.push_str(if self.superuser { " SUPERUSER" } else { " NOSUPERUSER" });
+        if self.create_db {
+            sql.push_str(" CREATEDB");
+        }
+        if self.create_role {
+            sql.push_str(" CREATEROLE");
+        }
+        if self.bypass_rls {
+            sql.push_str(" BYPASSRLS");
+        }
+        if let Some(limit) = self.connection_limit {
+            sql.push_str(&format!(" CONNECTION LIMIT {limit}"));
+        }
+        if let Some(until) = &self.valid_until {
+            sql.push_str(" VALID UNTIL ");
+            push_text(&mut sql, until)?;
+        }
+        if let Some(password) = &self.password {
+            sql.push_str(" PASSWORD ");
+            push_text(&mut sql, password)?;
+        }
+        Ok(sql)
+    }
+}
+
+/// What a [`Grant`] is on.
+#[derive(Debug, Clone)]
+enum GrantTarget {
+    Tables(Vec<String>),
+    AllTables,
+    Sequences(Vec<String>),
+    Functions(Vec<String>),
+}
+
+/// A `GRANT` or `REVOKE` of privileges on objects, for [`Admin::grant`]
+/// and [`Admin::revoke`]:
+/// `Grant::privileges(&["SELECT", "INSERT"]).on_table("orders").to("app")`.
+#[derive(Debug, Clone)]
+pub struct Grant {
+    privileges: Vec<String>,
+    target: Option<GrantTarget>,
+    grantees: Vec<String>,
+    grant_option: bool,
+    cascade: bool,
+}
+
+impl Grant {
+    /// These privileges (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`,
+    /// `REFERENCES`, `TRIGGER`, `USAGE`, `EXECUTE`, or `ALL`).
+    pub fn privileges(privileges: &[&str]) -> Self {
+        Grant {
+            privileges: privileges.iter().map(|p| p.to_ascii_uppercase()).collect(),
+            target: None,
+            grantees: Vec::new(),
+            grant_option: false,
+            cascade: false,
+        }
+    }
+
+    /// `privilege` on these columns only: `SELECT (a, b)`.
+    pub fn columns(privilege: &str, columns: &[&str]) -> Result<Self> {
+        let mut list = String::new();
+        for (i, c) in columns.iter().enumerate() {
+            if i > 0 {
+                list.push_str(", ");
+            }
+            push_ident(&mut list, c)?;
+        }
+        Ok(Grant::privileges(&[&format!("{} ({list})", privilege.to_ascii_uppercase())]))
+    }
+
+    /// On one table or view.
+    pub fn on_table(self, table: &str) -> Self {
+        self.on_tables(&[table])
+    }
+
+    /// On these tables or views.
+    pub fn on_tables(mut self, tables: &[&str]) -> Self {
+        self.target = Some(GrantTarget::Tables(tables.iter().map(|t| t.to_string()).collect()));
+        self
+    }
+
+    /// Every table and view there is now (`ALL TABLES IN SCHEMA public`).
+    pub fn on_all_tables(mut self) -> Self {
+        self.target = Some(GrantTarget::AllTables);
+        self
+    }
+
+    /// On these sequences (USAGE, SELECT, UPDATE).
+    pub fn on_sequences(mut self, sequences: &[&str]) -> Self {
+        self.target = Some(GrantTarget::Sequences(sequences.iter().map(|t| t.to_string()).collect()));
+        self
+    }
+
+    /// On these functions (EXECUTE).
+    pub fn on_functions(mut self, functions: &[&str]) -> Self {
+        self.target = Some(GrantTarget::Functions(functions.iter().map(|t| t.to_string()).collect()));
+        self
+    }
+
+    /// Who receives it, or loses it; `public` for every role.
+    pub fn to(mut self, grantee: &str) -> Self {
+        self.grantees.push(grantee.to_string());
+        self
+    }
+
+    /// The grantees may pass it on (`WITH GRANT OPTION`).
+    pub fn with_grant_option(mut self) -> Self {
+        self.grant_option = true;
+        self
+    }
+
+    /// A revoke also takes back what the grantees passed on (`CASCADE`).
+    pub fn cascade(mut self) -> Self {
+        self.cascade = true;
+        self
+    }
+
+    /// The statement: `GRANT` (`grant`) or `REVOKE`.
+    pub fn to_sql(&self, grant: bool) -> Result<String> {
+        let target = self.target.as_ref().ok_or_else(|| Error::Param("a grant needs an object: on_table, on_sequences, …".into()))?;
+        if self.privileges.is_empty() || self.grantees.is_empty() {
+            return Err(Error::Param("a grant needs privileges and at least one grantee".into()));
+        }
+        let names = |kind: &str, list: &[String]| -> Result<String> {
+            let mut out = format!("{kind} ");
+            for (i, n) in list.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                push_ident(&mut out, n)?;
+            }
+            Ok(out)
+        };
+        let on = match target {
+            GrantTarget::Tables(t) => names("TABLE", t)?,
+            GrantTarget::AllTables => "ALL TABLES IN SCHEMA public".to_string(),
+            GrantTarget::Sequences(t) => names("SEQUENCE", t)?,
+            GrantTarget::Functions(t) => names("FUNCTION", t)?,
+        };
+        let mut grantees = String::new();
+        for (i, g) in self.grantees.iter().enumerate() {
+            if i > 0 {
+                grantees.push_str(", ");
+            }
+            if g.eq_ignore_ascii_case("public") {
+                grantees.push_str("PUBLIC");
+            } else {
+                grantees.push_str(role_name(g)?);
+            }
+        }
+        let privileges = self.privileges.join(", ");
+        Ok(if grant {
+            format!("GRANT {privileges} ON {on} TO {grantees}{}", if self.grant_option { " WITH GRANT OPTION" } else { "" })
+        } else {
+            format!("REVOKE {privileges} ON {on} FROM {grantees}{}", if self.cascade { " CASCADE" } else { "" })
+        })
+    }
+}
+
+/// A role, as [`Admin::roles`] lists it (`pg_roles`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleInfo {
+    /// Its name.
+    pub name: String,
+    /// SUPERUSER.
+    pub superuser: bool,
+    /// LOGIN.
+    pub login: bool,
+    /// CREATEDB.
+    pub create_db: bool,
+    /// CREATEROLE.
+    pub create_role: bool,
+    /// BYPASSRLS.
+    pub bypass_rls: bool,
+    /// `-1`: no limit.
+    pub connection_limit: i64,
+    /// When its password stops working, if ever.
+    pub valid_until: Option<String>,
+    /// `ALTER ROLE … SET` values, `name=value`.
+    pub config: Vec<String>,
+}
+
+/// One privilege on one table, as [`Admin::table_grants`] lists it
+/// (`information_schema.table_privileges`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantInfo {
+    /// Who granted it.
+    pub grantor: String,
+    /// Who holds it; `PUBLIC` for every role.
+    pub grantee: String,
+    /// The table or view.
+    pub table: String,
+    /// `SELECT`, `INSERT`, …
+    pub privilege: String,
+    /// Held with the grant option.
+    pub grantable: bool,
+}
+
+impl Role {
     /// Its password, turned into a SCRAM-SHA-256 verifier by the server.
     pub fn password(mut self, password: &str) -> Self {
         self.password = Some(password.to_string());
@@ -1178,18 +1425,123 @@ impl<'c> Admin<'c> {
     /// `CREATE ROLE`. The password is turned into a SCRAM verifier by the
     /// server and never stored as written.
     pub async fn create_role(&self, role: &Role) -> Result<()> {
-        let mut sql = format!("CREATE ROLE {}", role_name(&role.name)?);
-        sql.push_str(if role.login { " LOGIN" } else { " NOLOGIN" });
-        sql.push_str(if role.superuser {
-            " SUPERUSER"
-        } else {
-            " NOSUPERUSER"
-        });
-        if let Some(password) = &role.password {
-            sql.push_str(" PASSWORD ");
-            push_text(&mut sql, password)?;
+        let sql = format!("CREATE ROLE {}{}", role_name(&role.name)?, role.options()?);
+        self.client.run(&sql).await.map(drop)
+    }
+
+    /// `ALTER ROLE` to every attribute `role` describes (its name picks
+    /// the role).
+    pub async fn alter_role(&self, role: &Role) -> Result<()> {
+        let sql = format!("ALTER ROLE {}{}", role_name(&role.name)?, role.options()?);
+        self.client.run(&sql).await.map(drop)
+    }
+
+    /// `ALTER ROLE from RENAME TO to`. An md5 password is cleared by it, as
+    /// in PostgreSQL; a SCRAM one is kept.
+    pub async fn rename_role(&self, from: &str, to: &str) -> Result<()> {
+        let sql = format!("ALTER ROLE {} RENAME TO {}", role_name(from)?, role_name(to)?);
+        self.client.run(&sql).await.map(drop)
+    }
+
+    /// `ALTER ROLE name SET setting = value`, or `RESET setting` for
+    /// `None`: a value a session of the role starts with (statement_timeout,
+    /// lock_timeout, rdb.shape_change).
+    pub async fn set_role_setting(&self, name: &str, setting: &str, value: Option<&str>) -> Result<()> {
+        let setting = bare_word(setting.trim_start_matches("rdb.").trim(), "setting")
+            .map(|_| setting)?;
+        let mut sql = format!("ALTER ROLE {} ", role_name(name)?);
+        match value {
+            Some(v) => {
+                sql.push_str(&format!("SET {setting} = "));
+                push_text(&mut sql, v)?;
+            }
+            None => sql.push_str(&format!("RESET {setting}")),
         }
         self.client.run(&sql).await.map(drop)
+    }
+
+    /// `GRANT role TO member` (`WITH ADMIN OPTION` when `admin`).
+    pub async fn grant_role(&self, role: &str, member: &str, admin: bool) -> Result<()> {
+        let sql = format!(
+            "GRANT {} TO {}{}",
+            role_name(role)?,
+            role_name(member)?,
+            if admin { " WITH ADMIN OPTION" } else { "" }
+        );
+        self.client.run(&sql).await.map(drop)
+    }
+
+    /// `REVOKE role FROM member`.
+    pub async fn revoke_role(&self, role: &str, member: &str) -> Result<()> {
+        let sql = format!("REVOKE {} FROM {}", role_name(role)?, role_name(member)?);
+        self.client.run(&sql).await.map(drop)
+    }
+
+    /// Runs `grant` as a `GRANT`.
+    pub async fn grant(&self, grant: &Grant) -> Result<()> {
+        self.client.run(&grant.to_sql(true)?).await.map(drop)
+    }
+
+    /// Runs `grant` as a `REVOKE`.
+    pub async fn revoke(&self, grant: &Grant) -> Result<()> {
+        self.client.run(&grant.to_sql(false)?).await.map(drop)
+    }
+
+    /// `REASSIGN OWNED BY from TO to`: what `from` owns becomes `to`'s.
+    pub async fn reassign_owned(&self, from: &str, to: &str) -> Result<()> {
+        let sql = format!("REASSIGN OWNED BY {} TO {}", role_name(from)?, role_name(to)?);
+        self.client.run(&sql).await.map(drop)
+    }
+
+    /// The roles of the database (`pg_roles`).
+    pub async fn roles(&self) -> Result<Vec<RoleInfo>> {
+        let rows = self
+            .client
+            .run(
+                "SELECT rolname, rolsuper, rolcanlogin, rolcreatedb, rolcreaterole, rolbypassrls, rolconnlimit, \
+                 rolvaliduntil::text, array_to_string(rolconfig, ',') FROM pg_catalog.pg_roles ORDER BY rolname",
+            )
+            .await?;
+        rows.iter()
+            .map(|r| {
+                let config: Option<String> = col!(r, 8);
+                Ok(RoleInfo {
+                    name: col!(r, 0),
+                    superuser: col!(r, 1),
+                    login: col!(r, 2),
+                    create_db: col!(r, 3),
+                    create_role: col!(r, 4),
+                    bypass_rls: col!(r, 5),
+                    connection_limit: r.get_i64(6)?,
+                    valid_until: col!(r, 7),
+                    config: config.map(|c| c.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()).unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
+    /// Every privilege held on `table`, its owner's included
+    /// (`information_schema.table_privileges`).
+    pub async fn table_grants(&self, table: &str) -> Result<Vec<GrantInfo>> {
+        let mut sql = String::from(
+            "SELECT grantor, grantee, table_name, privilege_type, is_grantable FROM information_schema.table_privileges \
+             WHERE table_name = ",
+        );
+        push_text(&mut sql, table)?;
+        sql.push_str(" ORDER BY grantee, privilege_type");
+        let rows = self.client.run(&sql).await?;
+        rows.iter()
+            .map(|r| {
+                let grantable: String = col!(r, 4);
+                Ok(GrantInfo {
+                    grantor: col!(r, 0),
+                    grantee: col!(r, 1),
+                    table: col!(r, 2),
+                    privilege: col!(r, 3),
+                    grantable: grantable == "YES",
+                })
+            })
+            .collect()
     }
 
     /// Sets a role's password, or removes it (`None`).

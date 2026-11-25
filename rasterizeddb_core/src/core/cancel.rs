@@ -40,6 +40,9 @@ pub enum CancelReason {
     ClientWentAway,
     /// A `CancelRequest` carrying this session's key arrived.
     UserRequest,
+    /// The cluster found this transaction on a cycle of lock waits across
+    /// shards and chose it to end (sharding-plan.md B4.2).
+    Deadlock,
 }
 
 impl CancelReason {
@@ -49,6 +52,7 @@ impl CancelReason {
             CancelReason::Timeout => EvalError::StatementTimeout,
             CancelReason::ClientWentAway => EvalError::ClientWentAway,
             CancelReason::UserRequest => EvalError::UserCanceled,
+            CancelReason::Deadlock => EvalError::DistributedDeadlock,
         }
     }
 }
@@ -207,6 +211,7 @@ impl StatementCancel {
             CancelReason::Timeout => 1,
             CancelReason::ClientWentAway => 2,
             CancelReason::UserRequest => 3,
+            CancelReason::Deadlock => 4,
         };
         // First writer wins: the first reason is the true one, and a later
         // deadline should not relabel a client that had already gone.
@@ -224,6 +229,7 @@ impl StatementCancel {
             1 => return Some(CancelReason::Timeout),
             2 => return Some(CancelReason::ClientWentAway),
             3 => return Some(CancelReason::UserRequest),
+            4 => return Some(CancelReason::Deadlock),
             _ => {}
         }
         if let Some(at) = self.deadline {
@@ -304,9 +310,47 @@ pub fn lock_timeout() -> crate::core::mvcc::table_locks::LockTimeout {
 pub struct SessionCancel {
     key: [u8; 4],
     current: std::sync::Mutex<Option<Arc<StatementCancel>>>,
+    /// How this session's next aggregate fold ends, for a shard taking part
+    /// in a cluster fan-out (sharding-plan.md B1c). Set by the shard's
+    /// rshard endpoint between statements, read by the fold.
+    #[cfg(feature = "sharding")]
+    pub fold: std::sync::Mutex<Fold>,
+    /// The session is running one shard's part of a fan-out: a keyless read
+    /// may read just the ranges this shard owns. Otherwise such a read fails
+    /// RDB02, since inside a routed statement it would silently miss every
+    /// other shard's rows (sharding-plan.md B1a.4).
+    #[cfg(feature = "sharding")]
+    pub fan_out_part: std::sync::atomic::AtomicBool,
+}
+
+/// See [`SessionCancel::fold`].
+#[cfg(feature = "sharding")]
+#[derive(Debug, Default)]
+pub enum Fold {
+    /// Finish as usual.
+    #[default]
+    Normal,
+    /// Stop before finishing: the folder's partial goes here
+    /// (`Folder::export_partial`) and the statement returns no group.
+    Partial(Option<Vec<u8>>),
+    /// Merge these peers' partials before finishing; emptied (and marked
+    /// consumed) by the fold that merged them.
+    Coordinator { partials: Vec<Vec<u8>>, consumed: bool },
 }
 
 impl SessionCancel {
+    /// Stops the statement running now, if one is, for `reason`. `false`
+    /// when none is running.
+    pub fn flag_current(&self, reason: CancelReason) -> bool {
+        match self.current.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(statement) => {
+                statement.flag(reason);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Makes `statement` the one a `CancelRequest` for this session stops,
     /// until the returned guard is dropped.
     ///
@@ -356,6 +400,12 @@ impl Drop for CancelRegistration {
     }
 }
 
+/// The live session registered under `pid`.
+#[cfg(feature = "sharding")]
+pub fn session_by_pid(pid: i32) -> Option<Arc<SessionCancel>> {
+    registry().lock().unwrap_or_else(|e| e.into_inner()).get(&pid).cloned()
+}
+
 fn registry() -> &'static std::sync::Mutex<std::collections::HashMap<i32, Arc<SessionCancel>>> {
     static REGISTRY: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<i32, Arc<SessionCancel>>>,
@@ -371,6 +421,10 @@ pub fn register_session(key: [u8; 4]) -> CancelRegistration {
     let session = Arc::new(SessionCancel {
         key,
         current: std::sync::Mutex::new(None),
+        #[cfg(feature = "sharding")]
+        fold: std::sync::Mutex::new(Fold::Normal),
+        #[cfg(feature = "sharding")]
+        fan_out_part: std::sync::atomic::AtomicBool::new(false),
     });
     let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
     let pid = loop {
@@ -485,6 +539,10 @@ pub fn register_token(user: &str, token: &str) -> Option<TokenRegistration> {
     let session = Arc::new(SessionCancel {
         key: [0; 4],
         current: std::sync::Mutex::new(None),
+        #[cfg(feature = "sharding")]
+        fold: std::sync::Mutex::new(Fold::Normal),
+        #[cfg(feature = "sharding")]
+        fan_out_part: std::sync::atomic::AtomicBool::new(false),
     });
     map.insert(key.clone(), session.clone());
     Some(TokenRegistration { key, session })

@@ -15,6 +15,10 @@
 //! running the statement, and buys a session whose behaviour cannot drift
 //! from PostgreSQL's.
 
+// Built for the gateway's virtual sessions too (sharding), which use only
+// the bridge's core; the MySQL/TDS helpers are theirs.
+#![cfg_attr(not(any(feature = "mysql_wire", feature = "mssql_wire")), allow(dead_code))]
+
 use super::*;
 
 /// Who a front end authenticated: the session's principal.
@@ -25,6 +29,134 @@ pub(crate) struct ProxiedLogin {
     /// Whether the name was proven with a credential. False under `trust`,
     /// as for a pgwire `trust` login: see [`Principal`].
     pub(crate) authenticated: bool,
+    /// The database the login was checked against: a session in any other
+    /// is checked again there ([`login_for`]), since a role of the same name
+    /// in another database is another account.
+    pub(crate) database: String,
+    /// The role's verifier as stored when it logged in (`Verifier::to_stored`),
+    /// for an authenticated login: the credential it proved. Another
+    /// database admits the login only where its role holds this same one.
+    pub(crate) verifier: Option<String>,
+    /// The bootstrap role a `trust` login is checked with
+    /// (`auth::trust_login`) in another database.
+    pub(crate) bootstrap_user: Option<String>,
+    /// On a front-end node ([`upstream`]), the password the client proved,
+    /// which the bridge logs in to the gateway with. Never logged.
+    pub(crate) upstream_password: Option<Secret>,
+}
+
+/// A password held only to pass on: its `Debug` says nothing of it.
+#[derive(Clone)]
+pub(crate) struct Secret(pub(crate) String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// The gateway a front-end node sends its MySQL and SQL Server sessions to
+/// (sharding-plan.md B4.7, `--frontend-upstream`), or `None` for a server
+/// that runs them itself.
+static UPSTREAM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Makes this server a front-end node for the cluster behind `gateway`
+/// (`host:port` of its PostgreSQL listener). Once, at start.
+pub(crate) fn set_upstream(gateway: String) -> Result<(), String> {
+    UPSTREAM.set(gateway).map_err(|_| "the front-end upstream is already set".to_string())
+}
+
+/// [`set_upstream`]'s gateway, when this is a front-end node.
+pub(crate) fn upstream() -> Option<&'static str> {
+    UPSTREAM.get().map(String::as_str)
+}
+
+/// Cancels the statement of the session `(pid, key)` a bridge runs: here,
+/// or on a front-end node by a CancelRequest to its gateway.
+pub(crate) fn cancel(pid: i32, key: i32) {
+    match upstream() {
+        None => {
+            crate::core::cancel::cancel_request(pid, key);
+        }
+        Some(gateway) => {
+            let gateway = gateway.to_string();
+            tokio::spawn(async move {
+                if let Ok(mut s) = tokio::net::TcpStream::connect(&gateway).await {
+                    let mut m = 16i32.to_be_bytes().to_vec();
+                    m.extend_from_slice(&80877102i32.to_be_bytes());
+                    m.extend_from_slice(&pid.to_be_bytes());
+                    m.extend_from_slice(&key.to_be_bytes());
+                    let _ = s.write_all(&m).await;
+                }
+            });
+        }
+    }
+}
+
+/// A bridge's transport: the in-process session's pipe, or a front-end
+/// node's connection to its gateway.
+enum BridgeIo {
+    Pipe(tokio::io::DuplexStream),
+    Tcp(tokio::net::TcpStream),
+}
+
+impl BridgeIo {
+    async fn write_all(&mut self, b: &[u8]) -> io::Result<()> {
+        match self {
+            BridgeIo::Pipe(p) => p.write_all(b).await,
+            BridgeIo::Tcp(t) => t.write_all(b).await,
+        }
+    }
+
+    async fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+        match self {
+            BridgeIo::Pipe(p) => p.read(b).await,
+            BridgeIo::Tcp(t) => t.read(b).await,
+        }
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        match self {
+            BridgeIo::Pipe(p) => p.shutdown().await,
+            BridgeIo::Tcp(t) => t.shutdown().await,
+        }
+    }
+}
+
+/// `login`, as it stands in database `name` (`database`): the same login
+/// when it is the one it logged in to; otherwise checked again against that
+/// database's roles, with that role's attributes (its `superuser`, not the
+/// first database's). An authenticated login needs the role there to hold
+/// the very credential it proved, which a role copied by `CREATE DATABASE`
+/// does; a `trust` login is what `auth::trust_login` makes it there. Refused
+/// otherwise: MySQL's `USE` and SQL Server's `USE` used to carry a login
+/// into any database, as whatever role held its name there.
+pub(crate) async fn login_for(database: &Arc<Database>, name: &str, login: &ProxiedLogin) -> Result<ProxiedLogin, String> {
+    // A front-end node holds no roles: the gateway checks the login in the
+    // database it names when the session opens there.
+    if upstream().is_some() {
+        return Ok(ProxiedLogin { database: name.to_string(), ..login.clone() });
+    }
+    if login.database == name {
+        return Ok(login.clone());
+    }
+    let superuser = if login.authenticated {
+        let role = crate::auth::lookup_role(database, &login.user).await;
+        let same_credential = role.as_ref().is_some_and(|r| {
+            r.can_login && login.verifier.is_some() && r.verifier.as_ref().map(|v| v.to_stored()) == login.verifier
+        });
+        if !same_credential {
+            return Err(format!(
+                "role \"{}\" cannot use database \"{name}\" without logging in to it: its account there is not \
+                 the one this connection proved; connect to \"{name}\" instead",
+                login.user
+            ));
+        }
+        role.is_some_and(|r| r.is_superuser)
+    } else {
+        crate::auth::trust_login(database, &login.user, login.bootstrap_user.as_deref()).await?
+    };
+    Ok(ProxiedLogin { superuser, database: name.to_string(), ..login.clone() })
 }
 
 /// A watch on a front end's client socket, for a statement to notice the
@@ -57,6 +189,28 @@ where
     let watch = PEER_WATCH.try_with(|w| w.clone()).ok().flatten();
     let mut conn = wire_out::WireStream::new(&mut stream, watch);
 
+    // As `authenticate_and_serve` admits a pgwire login: the role's VALID
+    // UNTIL and CONNECTION LIMIT (R2), then the tenancy policy (T7). Missing
+    // here, a MySQL or TDS login skipped both.
+    let _role_slot = match crate::auth::admit_role_login(&database, &login.user, login.superuser, login.authenticated).await {
+        Ok(slot) => slot,
+        Err((code, message)) => {
+            send_fatal_error_response(&mut conn, code, &message).await?;
+            return Ok(());
+        }
+    };
+    {
+        let ctx = crate::core::policy_hooks::SessionContext {
+            role: &login.user,
+            database: &database.name,
+            protocol: "proxied",
+            superuser: login.superuser,
+        };
+        if let Err(e) = crate::core::policy_hooks::tenancy().admit(&ctx) {
+            send_fatal_error_response(&mut conn, "28000", e.trim_start_matches("28000: ")).await?;
+            return Ok(());
+        }
+    }
     let mut key = [0u8; 4];
     crate::auth::fill_random(&mut key);
     let registration = crate::core::cancel::register_session(key);
@@ -64,6 +218,7 @@ where
     // end reads the same sequence, so the bridge's startup has one shape.
     send_auth_ok(&mut conn).await?;
     send_startup_responses(&mut conn, registration.pid, registration.key).await?;
+    let parameters = with_role_settings(&database, &login.user, &parameters).await.into_owned();
     let startup = (
         startup_statement_timeout(&parameters),
         startup_lock_timeout(&parameters),
@@ -74,8 +229,12 @@ where
         superuser: login.superuser,
         authenticated: login.authenticated,
     };
-    let result = SESSION_CANCEL
+    // The one kind of session that takes a front end's catalogue statements
+    // (`SYSTEM_STATEMENT_TAG`).
+    let result = PROXIED_SESSION
         .scope(
+            (),
+            SESSION_CANCEL.scope(
             registration.session.clone(),
             run_message_loop(
                 catalog,
@@ -86,6 +245,7 @@ where
                 &mut conn,
                 startup,
                 registration.pid,
+            ),
             ),
         )
         .await;
@@ -113,6 +273,8 @@ pub(crate) enum OpenRefused {
     NoDatabase,
     /// The database is being imported.
     Loading,
+    /// The login is not admitted to the database ([`login_for`]).
+    Denied(String),
     Io(io::Error),
 }
 
@@ -234,7 +396,7 @@ pub(crate) fn tag_count(tag: &str) -> Option<u64> {
 
 /// The client end of an in-process session.
 pub(crate) struct PgBridge {
-    io: tokio::io::DuplexStream,
+    io: BridgeIo,
     out: Vec<u8>,
     rbuf: Vec<u8>,
     rpos: usize,
@@ -248,6 +410,9 @@ pub(crate) struct PgBridge {
     /// The database the session is attached to.
     pub(crate) database: Arc<Database>,
     pub(crate) database_name: String,
+    /// The login as this database admits it ([`login_for`]): what the front
+    /// end's own checks (KILL, SHOW GRANTS) read after a `USE`.
+    pub(crate) login: ProxiedLogin,
 }
 
 const BRIDGE_PIPE: usize = 256 * 1024;
@@ -267,7 +432,6 @@ impl PgBridge {
             return Err(OpenRefused::NoDatabase);
         };
         let database = guard.database().clone();
-        let (client, server) = tokio::io::duplex(BRIDGE_PIPE);
         let BridgeOptions {
             login,
             limits,
@@ -275,6 +439,18 @@ impl PgBridge {
             parameters,
             lenient_booleans,
         } = options;
+        // A front-end node (B4.7): the session runs on the cluster, and this
+        // node's database is the copy of its schema the front end reads.
+        if let Some(gateway) = upstream() {
+            let _ = (limits, watch, parameters, lenient_booleans);
+            drop(guard);
+            return Self::open_remote(gateway, database, database_name, login).await;
+        }
+        // A database other than the one the login was checked against
+        // checks it again, before any session exists there.
+        let login = login_for(&database, database_name, &login).await.map_err(OpenRefused::Denied)?;
+        let effective = login.clone();
+        let (client, server) = tokio::io::duplex(BRIDGE_PIPE);
         let session = async move {
             if let Err(e) = serve_proxied(catalog, guard, login, limits, server, parameters).await {
                 log::debug!("proxied session ended: {e}");
@@ -289,7 +465,7 @@ impl PgBridge {
             tokio::spawn(PEER_WATCH.scope(watch, session));
         }
         let mut bridge = PgBridge {
-            io: client,
+            io: BridgeIo::Pipe(client),
             out: Vec::with_capacity(1024),
             rbuf: Vec::with_capacity(8 * 1024),
             rpos: 0,
@@ -298,6 +474,7 @@ impl PgBridge {
             status: b'I',
             database,
             database_name: database_name.to_string(),
+            login: effective,
         };
         loop {
             let frame = bridge.next().await.map_err(OpenRefused::Io)?;
@@ -336,6 +513,16 @@ impl PgBridge {
     /// Queues a simple Query.
     pub(crate) fn query(&mut self, sql: &str) {
         self.message(b'Q', |out| Self::cstr(out, sql));
+    }
+
+    /// Queues a simple Query that is the front end's own statement on its
+    /// catalogue (`__rdb_routines`, `__rdb_mysql_on_update`), announced by
+    /// [`SYSTEM_STATEMENT_TAG`] so the session's catalogue guard lets it
+    /// through. Never for text a client sent: the guard is what keeps a
+    /// client off every catalogue.
+    pub(crate) fn system_query(&mut self, sql: &str) {
+        self.message(SYSTEM_STATEMENT_TAG, |_| {});
+        self.query(sql);
     }
 
     /// Queues a Parse.
@@ -411,6 +598,14 @@ impl PgBridge {
         self.message(b'S', |_| {});
     }
 
+    /// Queues frontend messages exactly as a client sent them: a gateway's
+    /// virtual session relays its client's bytes (`core::shard::rshard`).
+    /// The caller has checked they are whole messages.
+    #[cfg(feature = "sharding")]
+    pub(crate) fn raw(&mut self, bytes: &[u8]) {
+        self.out.extend_from_slice(bytes);
+    }
+
     /// Sends what is queued.
     pub(crate) async fn flush(&mut self) -> io::Result<()> {
         if !self.out.is_empty() {
@@ -481,6 +676,100 @@ impl PgBridge {
                     self.rbuf.truncate(old);
                     return Err(e);
                 }
+            }
+        }
+    }
+
+    /// A front-end node's session (B4.7): a PostgreSQL connection to the
+    /// gateway, logged in as the client's own role with the password it
+    /// proved, so the cluster authenticates and authorizes it as it would
+    /// a PostgreSQL client. `database` is this node's copy of the
+    /// database's schema, which the front ends translate against; its
+    /// rows are on the shards.
+    pub(crate) async fn open_remote(
+        gateway: &str,
+        database: Arc<Database>,
+        database_name: &str,
+        login: ProxiedLogin,
+    ) -> Result<Self, OpenRefused> {
+        let password = login.upstream_password.clone().map(|s| s.0).unwrap_or_default();
+        let tcp = tokio::time::timeout(std::time::Duration::from_secs(10), tokio::net::TcpStream::connect(gateway))
+            .await
+            .map_err(|_| OpenRefused::Denied(format!("the gateway {gateway} did not answer in 10 s")))?
+            .map_err(OpenRefused::Io)?;
+        let _ = tcp.set_nodelay(true);
+        let mut bridge = PgBridge {
+            io: BridgeIo::Tcp(tcp),
+            out: Vec::with_capacity(1024),
+            rbuf: Vec::with_capacity(8 * 1024),
+            rpos: 0,
+            pid: 0,
+            key: 0,
+            status: b'I',
+            database,
+            database_name: database_name.to_string(),
+            login: login.clone(),
+        };
+        // StartupMessage: protocol 3.0, user, database.
+        let mut startup = 196608i32.to_be_bytes().to_vec();
+        for (k, v) in [("user", login.user.as_str()), ("database", database_name), ("client_encoding", "UTF8")] {
+            startup.extend_from_slice(k.as_bytes());
+            startup.push(0);
+            startup.extend_from_slice(v.as_bytes());
+            startup.push(0);
+        }
+        startup.push(0);
+        bridge.out.extend_from_slice(&((startup.len() + 4) as i32).to_be_bytes());
+        bridge.out.extend_from_slice(&startup);
+        let mut scram: Option<crate::auth::ScramClient> = None;
+        loop {
+            let frame = bridge.next().await.map_err(OpenRefused::Io)?;
+            let (tag, body) = (frame.tag, frame.body.to_vec());
+            match tag {
+                b'R' => {
+                    let kind = body.get(0..4).map_or(-1, |b| i32::from_be_bytes(b.try_into().unwrap()));
+                    match kind {
+                        0 => {}
+                        3 => bridge.message(b'p', |b| {
+                            b.extend_from_slice(password.as_bytes());
+                            b.push(0);
+                        }),
+                        10 => {
+                            let (client, first) = crate::auth::ScramClient::start(&login.user, &password, crate::auth::ChannelBinding::None);
+                            scram = Some(client);
+                            bridge.message(b'p', |b| {
+                                b.extend_from_slice(b"SCRAM-SHA-256\0");
+                                b.extend_from_slice(&(first.len() as i32).to_be_bytes());
+                                b.extend_from_slice(first.as_bytes());
+                            });
+                        }
+                        11 => {
+                            let Some(s) = scram.as_mut() else { return Err(OpenRefused::Denied("SASL out of order".into())) };
+                            let server_first = String::from_utf8_lossy(&body[4..]).into_owned();
+                            let fin = s.respond(&server_first).map_err(OpenRefused::Denied)?;
+                            bridge.message(b'p', |b| b.extend_from_slice(fin.as_bytes()));
+                        }
+                        12 => {
+                            let Some(s) = scram.as_ref() else { return Err(OpenRefused::Denied("SASL out of order".into())) };
+                            s.verify(&String::from_utf8_lossy(&body[4..])).map_err(OpenRefused::Denied)?;
+                        }
+                        k => return Err(OpenRefused::Denied(format!("the gateway asked for authentication method {k}, which a front-end node does not speak"))),
+                    }
+                }
+                b'E' => {
+                    let msg = body
+                        .split(|&c| c == 0)
+                        .find(|f| f.first() == Some(&b'M'))
+                        .map(|f| String::from_utf8_lossy(&f[1..]).into_owned())
+                        .unwrap_or_else(|| "refused".into());
+                    return Err(OpenRefused::Denied(msg));
+                }
+                b'K' if body.len() >= 8 => {
+                    bridge.pid = i32::from_be_bytes(body[0..4].try_into().unwrap());
+                    bridge.key = i32::from_be_bytes(body[4..8].try_into().unwrap());
+                }
+                b'Z' => return Ok(bridge),
+                _ => {}
             }
         }
     }

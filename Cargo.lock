@@ -4689,6 +4689,7 @@ dependencies = [
 name = "rasterizeddb_client"
 version = "1.0.1"
 dependencies = [
+ "aws-lc-rs",
  "base64 0.23.1",
  "chrono",
  "futures-core",
@@ -4698,6 +4699,7 @@ dependencies = [
  "pbkdf2",
  "rastcp",
  "rasterizeddb_client_derive",
+ "rasterizeddb_router",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -4746,6 +4748,7 @@ dependencies = [
  "ahash",
  "arc-swap",
  "async-lazy",
+ "aws-lc-rs",
  "base64 0.23.1",
  "branches 0.5.1",
  "byteorder",
@@ -4781,6 +4784,8 @@ dependencies = [
  "rand 0.10.3",
  "rastcp",
  "rasterizeddb_client",
+ "rasterizeddb_raft",
+ "rasterizeddb_router",
  "rclite",
  "regex",
  "rustls",
@@ -4817,6 +4822,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rasterizeddb_enterprise"
+version = "1.0.0"
+dependencies = [
+ "log",
+ "rasterizeddb_core",
+]
+
+[[package]]
 name = "rasterizeddb_filter_tests"
 version = "0.1.0"
 dependencies = [
@@ -4824,6 +4837,64 @@ dependencies = [
  "rasterizeddb_core",
  "rclite",
  "smallvec",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "rasterizeddb_gateway"
+version = "1.0.0"
+dependencies = [
+ "env_logger",
+ "log",
+ "rastcp",
+ "rasterizeddb_client",
+ "rasterizeddb_embedded",
+ "rasterizeddb_router",
+ "rustls",
+ "serde_json",
+ "sha2 0.11.1",
+ "socket2",
+ "tokio",
+ "tokio-rustls",
+ "zstd",
+]
+
+[[package]]
+name = "rasterizeddb_gateway_enterprise"
+version = "1.0.0"
+dependencies = [
+ "env_logger",
+ "log",
+ "rasterizeddb_client",
+ "rasterizeddb_embedded",
+ "rasterizeddb_gateway",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "rasterizeddb_raft"
+version = "1.0.0"
+
+[[package]]
+name = "rasterizeddb_router"
+version = "1.0.0"
+
+[[package]]
+name = "rasterizeddb_server"
+version = "1.0.0"
+dependencies = [
+ "clap",
+ "env_logger",
+ "futures",
+ "libmimalloc-sys",
+ "log",
+ "rastcp",
+ "rasterizeddb_core",
+ "rasterizeddb_enterprise",
+ "rasterizeddb_raft",
+ "rclite",
  "tempfile",
  "tokio",
 ]

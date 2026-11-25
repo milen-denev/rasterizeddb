@@ -61,6 +61,37 @@ pub enum Error {
     /// refused the row: nothing was sent. The text names the table and says
     /// what was wrong.
     Invalid(String),
+    /// A shard a router needs is marked down by its health check, or could
+    /// not be reached. Nothing was sent to it.
+    ShardDown {
+        /// The shard's id in the map.
+        shard: u32,
+        /// What failed.
+        message: String,
+    },
+    /// The router's shard map is older than a shard's: a tenant may have
+    /// moved. Reload the map (`Router::reload`) and retry.
+    MapStale(String),
+    /// A server behind a shard's address is not that shard: its identity
+    /// row names another cluster or shard, or another map at the same
+    /// epoch. Nothing is routed to it.
+    IdentityMismatch(String),
+    /// A write or delete sent to several shards failed on some after
+    /// committing on others: each shard's part commits on its own.
+    FanOutPartial {
+        /// The shards whose part committed.
+        applied: Vec<u32>,
+        /// The shards whose part failed, with why.
+        failed: Vec<(u32, String)>,
+    },
+    /// The call would touch rows on more than one shard, or rows of models
+    /// that do not live on one shard together: refused before anything was
+    /// sent.
+    CrossShard(String),
+    /// A router was given a query with no shard key it can route by: filter
+    /// on the model's shard column, or say `on_shard(key)` or
+    /// `all_shards()`.
+    NeedsRouteKey(String),
 }
 
 impl Error {
@@ -257,6 +288,18 @@ impl fmt::Display for Error {
             }
             Error::Conflict(message) => write!(f, "conflict: {message}"),
             Error::Invalid(message) => write!(f, "invalid: {message}"),
+            Error::ShardDown { shard, message } => write!(f, "shard {shard} is down: {message}"),
+            Error::MapStale(message) => write!(f, "shard map is stale: {message}"),
+            Error::IdentityMismatch(message) => write!(f, "shard identity mismatch: {message}"),
+            Error::FanOutPartial { applied, failed } => {
+                write!(f, "applied on shards {applied:?}; failed on")?;
+                for (shard, why) in failed {
+                    write!(f, " {shard} ({why})")?;
+                }
+                Ok(())
+            }
+            Error::CrossShard(message) => write!(f, "cross-shard: {message}"),
+            Error::NeedsRouteKey(message) => write!(f, "no route key: {message}"),
             Error::RowCount { expected, got } => {
                 write!(
                     f,

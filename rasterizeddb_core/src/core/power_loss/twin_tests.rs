@@ -1446,5 +1446,9 @@ mod pins_crash_tests;
 #[path = "replication_crash_tests.rs"]
 mod replication_crash_tests;
 
+#[cfg(feature = "sharding_raft")]
+#[path = "raft_crash_tests.rs"]
+mod raft_crash_tests;
+
 #[path = "lazy_crash_tests.rs"]
 mod lazy_crash_tests;
