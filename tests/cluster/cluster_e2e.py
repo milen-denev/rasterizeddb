@@ -559,6 +559,22 @@ def main():
     check("after the restart every row is there", psql(GW, "SELECT count(*) FROM orders") == (0, str(rows + 2)),
           psql(GW, "SELECT count(*) FROM orders"))
 
+    # 7b. A prepared transaction's NOTIFY survives its shard's restart and is
+    # sent at COMMIT PREPARED.
+    code, out = psql(PG[2], "BEGIN; NOTIFY jobs, 'survived'; PREPARE TRANSACTION 'rdbtest:notify:1'")
+    if code != 0:
+        check("a prepared NOTIFY across a restart", False, out)
+    else:
+        procs["shard2"].send_signal(signal.SIGKILL)
+        procs["shard2"].wait()
+        start_shard(2, tls, cmap)
+        up(PG[2], "shard 2 again")
+        listener = psql_script_bg(PG[2], "LISTEN jobs;\n\\! sleep 3\nSELECT 1;\n", "listen2")
+        time.sleep(1)
+        done = psql(PG[2], "COMMIT PREPARED 'rdbtest:notify:1'")
+        out, _ = listener.communicate(timeout=60)
+        check("a prepared NOTIFY across a restart", done[0] == 0 and '"survived"' in out, f"{done} / {out}")
+
     if COMPRESS:
         rows_ = dict(l.split("|", 1) for l in psql(GW, "SHOW GATEWAY")[1].splitlines() if "|" in l)
         check("the links to the shards are compressed",

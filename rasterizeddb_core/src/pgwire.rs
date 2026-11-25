@@ -12496,7 +12496,23 @@ where
             send_command_complete(stream, "ROLLBACK").await?;
             return Ok(Some(true));
         }
+        // The block's notifications wait for its outcome: sent by COMMIT
+        // PREPARED, dropped by ROLLBACK PREPARED. (PostgreSQL refuses a
+        // NOTIFY in a prepared transaction; a gateway prepares every
+        // transaction that reached two shards, so here it is kept.) Written
+        // down before the prepare, so a part still prepared across a
+        // restart keeps them.
+        if !notifies.is_empty()
+            && let Err(e) = prepared_notes::save(database, &gid, state.backend_pid, &notifies)
+        {
+            database.block_ddl_abort(t.id).await;
+            database.abort_transaction(t.id);
+            t.owner.release();
+            send_error_response(stream, "58030", &format!("the transaction's notifications could not be kept for its outcome: {e}")).await?;
+            return Ok(Some(true));
+        }
         if let Err(e) = database.prepare_transaction(t.id, &gid) {
+            prepared_notes::take(database, &gid);
             database.block_ddl_abort(t.id).await;
             database.abort_transaction(t.id);
             t.owner.release();
@@ -12506,14 +12522,6 @@ where
         }
         database.block_ddl_commit(t.id).await;
         t.owner.release();
-        // The block's notifications wait for its outcome: sent by COMMIT
-        // PREPARED, dropped by ROLLBACK PREPARED. (PostgreSQL refuses a
-        // NOTIFY in a prepared transaction; a gateway prepares every
-        // transaction that reached two shards, so here it is kept.) Held in
-        // memory: a part still prepared across a restart loses them.
-        if !notifies.is_empty() {
-            prepared_notifies().lock().unwrap_or_else(|e| e.into_inner()).insert(gid.clone(), (database.id, state.backend_pid, notifies));
-        }
         send_command_complete(stream, "PREPARE TRANSACTION").await?;
         return Ok(Some(true));
     }
@@ -12524,12 +12532,12 @@ where
     }
     match database.finish_prepared(&gid, kind == 1) {
         Ok(()) => {
-            let held = prepared_notifies().lock().unwrap_or_else(|e| e.into_inner()).remove(&gid);
+            let held = prepared_notes::take(database, &gid);
             if kind == 1
-                && let Some((db, pid, notes)) = held
+                && let Some((pid, notes)) = held
             {
                 for (channel, payload) in &notes {
-                    notify::publish(db, pid, channel, payload);
+                    notify::publish(database.id, pid, channel, payload);
                 }
             }
             send_command_complete(stream, if kind == 1 { "COMMIT PREPARED" } else { "ROLLBACK PREPARED" }).await?
@@ -12542,13 +12550,107 @@ where
     Ok(Some(true))
 }
 
-/// The notifications of prepared transactions, by global id: the database,
-/// the sending backend and its `(channel, payload)` pairs.
+/// The notifications of prepared transactions, by global id: in memory, and
+/// in a synced file under the database's directory
+/// (`prepared_notifies/<hex gid>`), so a transaction still prepared when the
+/// server restarts sends them at its COMMIT PREPARED.
 #[cfg(feature = "sharding_2pc")]
-#[allow(clippy::type_complexity)]
-fn prepared_notifies() -> &'static std::sync::Mutex<HashMap<String, (u64, i32, Vec<(String, String)>)>> {
-    static HELD: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (u64, i32, Vec<(String, String)>)>>> = std::sync::OnceLock::new();
-    HELD.get_or_init(Default::default)
+pub(crate) mod prepared_notes {
+    use std::collections::HashMap;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    use crate::core::database::Database;
+
+    type Notes = Vec<(String, String)>;
+
+    fn held() -> &'static std::sync::Mutex<HashMap<String, (i32, Notes)>> {
+        static HELD: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (i32, Notes)>>> = std::sync::OnceLock::new();
+        HELD.get_or_init(Default::default)
+    }
+
+    fn dir(database: &Database) -> Option<PathBuf> {
+        database.location.as_ref().map(|l| PathBuf::from(l).join("prepared_notifies"))
+    }
+
+    fn file(database: &Database, gid: &str) -> Option<PathBuf> {
+        let name: String = gid.bytes().map(|b| format!("{b:02x}")).collect();
+        dir(database).map(|d| d.join(name))
+    }
+
+    /// Keeps `notes` for `gid`: in memory, and synced to disk where the
+    /// database has a directory.
+    pub fn save(database: &Database, gid: &str, pid: i32, notes: &[(String, String)]) -> std::io::Result<()> {
+        if let Some(path) = file(database, gid) {
+            let dir = path.parent().expect("a file in a directory");
+            std::fs::create_dir_all(dir)?;
+            let mut body = Vec::new();
+            body.extend_from_slice(&pid.to_le_bytes());
+            for (c, p) in notes {
+                for part in [c, p] {
+                    body.extend_from_slice(&(part.len() as u32).to_le_bytes());
+                    body.extend_from_slice(part.as_bytes());
+                }
+            }
+            let tmp = path.with_extension("tmp");
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&body)?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &path)?;
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        held().lock().unwrap_or_else(|e| e.into_inner()).insert(gid.to_string(), (pid, notes.to_vec()));
+        Ok(())
+    }
+
+    /// The notes kept for `gid` (from memory, or from disk after a
+    /// restart), forgotten in both.
+    pub fn take(database: &Database, gid: &str) -> Option<(i32, Notes)> {
+        let mem = held().lock().unwrap_or_else(|e| e.into_inner()).remove(gid);
+        let path = file(database, gid);
+        let disk = path.as_ref().and_then(|p| std::fs::read(p).ok()).and_then(|b| decode(&b));
+        if let Some(p) = path {
+            let _ = std::fs::remove_file(p);
+        }
+        mem.or(disk)
+    }
+
+    fn decode(b: &[u8]) -> Option<(i32, Notes)> {
+        let pid = i32::from_le_bytes(b.get(..4)?.try_into().ok()?);
+        let mut at = 4;
+        let mut part = || -> Option<String> {
+            let n = u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?) as usize;
+            let s = String::from_utf8(b.get(at + 4..at + 4 + n)?.to_vec()).ok()?;
+            at += 4 + n;
+            Some(s)
+        };
+        let mut notes = Vec::new();
+        while let Some(c) = part() {
+            notes.push((c, part()?));
+        }
+        Some((pid, notes))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn notes_outlive_a_restart_and_go_at_the_outcome() {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Database::new_named(&dir.path().to_string_lossy(), false, "n").await;
+            let notes = vec![("jobs".to_string(), "it's done".to_string()), ("audit".to_string(), String::new())];
+            save(&db, "rdb2pc:gw:1", 77, &notes).unwrap();
+            // A restart: memory gone, the file left.
+            held().lock().unwrap().clear();
+            assert_eq!(take(&db, "rdb2pc:gw:1"), Some((77, notes)));
+            // Taken once: the outcome sends them once.
+            assert_eq!(take(&db, "rdb2pc:gw:1"), None);
+            assert!(std::fs::read_dir(dir.path().join("prepared_notifies")).unwrap().next().is_none());
+            drop(db);
+            crate::core::wal::remove_for(&dir.path().to_string_lossy());
+        }
+    }
 }
 
 /// Returns `Ok(true)` when the statement was transaction control.
