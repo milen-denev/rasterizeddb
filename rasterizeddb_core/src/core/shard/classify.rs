@@ -43,10 +43,43 @@ pub fn classify(database: &Database, source: Source, text: &str) -> RouteTemplat
                     tables.push(w);
                 }
             }
-            if tables.is_empty() { RouteTemplate::NeedsKey } else { RouteTemplate::Gather { tables } }
+            if tables.is_empty() {
+                RouteTemplate::NeedsKey
+            } else {
+                broadcast_of(database, text, &tables).unwrap_or(RouteTemplate::Gather { tables })
+            }
         }
         t => t,
     }
+}
+
+/// A read of one sharded table inner-joined with global tables, and no
+/// subquery: [`RouteTemplate::Broadcast`] of those tables, with the merge the
+/// read would fan out with if they were on every shard. `None` otherwise.
+fn broadcast_of(database: &Database, text: &str, sharded: &[String]) -> Option<RouteTemplate> {
+    let t = text.trim().trim_end_matches(';').trim();
+    if sharded.len() != 1 || first_word(t) != "SELECT" || has_outer_join(t) {
+        return None;
+    }
+    let c = clauses(t);
+    if c.nested_select {
+        return None;
+    }
+    let small = global_named(database, t);
+    if small.is_empty() {
+        return None;
+    }
+    match fan_out_read(t, &c) {
+        RouteTemplate::FanOut { merge, writes: false } => Some(RouteTemplate::Broadcast { small, merge, gather: sharded.to_vec() }),
+        _ => None,
+    }
+}
+
+/// Whether `t` joins with an outer join (or LATERAL). A table every shard
+/// holds whole on the preserved side would bring its unmatched rows once per
+/// shard, so such a join is not answered by a fan-out.
+fn has_outer_join(t: &str) -> bool {
+    words(t).iter().any(|w| matches!(w.as_str(), "left" | "right" | "full" | "outer" | "lateral"))
 }
 
 /// Whether `text` is a read that may be gathered: a SELECT, WITH, TABLE
@@ -224,6 +257,23 @@ fn keyed_placeholder(t: &str, names: &[String]) -> Option<u16> {
     None
 }
 
+/// The global tables (plain, unsharded, not reference tables) `t` names,
+/// each once.
+fn global_named(database: &Database, t: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in words(t) {
+        if matches!(database.relation(&w), Some(Relation::Plain(_)))
+            && !w.starts_with("__")
+            && w != crate::auth::ROLE_TABLE
+            && !super::reference::is_reference(&database.name, &w)
+            && !out.contains(&w)
+        {
+            out.push(w);
+        }
+    }
+    out
+}
+
 /// Whether `t` names a global table (a plain, unsharded one) that is not
 /// a reference table.
 fn mentions_global(database: &Database, t: &str) -> bool {
@@ -395,7 +445,7 @@ fn select(database: &Database, source: Source, t: &str) -> RouteTemplate {
         // every shard): each of its rows joins on its own shard, so the
         // shards' results together are the join's, and it fans out as a
         // read of that table would, not gathered onto one shard.
-        if routed == RouteTemplate::NeedsKey && partitioned_named(database, t) == 1 && !mentions_global(database, t) {
+        if routed == RouteTemplate::NeedsKey && partitioned_named(database, t) == 1 && !mentions_global(database, t) && !has_outer_join(t) {
             return fan_out_read(t, &c);
         }
         return routed;
@@ -827,5 +877,68 @@ mod prepared_shape_tests {
         assert!(matches!(classify(&db, Source::Parse, "SELECT v FROM orders WHERE id = $1"), RouteTemplate::Param { .. }));
         drop(db);
         crate::core::wal::remove_for(&dir.path().to_string_lossy());
+    }
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::*;
+    use crate::core::rql::lexer_s1::recognize_query_purpose;
+    use rasterizeddb_router::rshard::Merge;
+
+    async fn db() -> (tempfile::TempDir, rclite::Arc<Database>) {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = crate::MAX_PERMITS_THREADS.set(4);
+        let _ = crate::BATCH_SIZE.set(512);
+        let db = rclite::Arc::new(Database::new_named(&dir.path().to_string_lossy(), false, "c").await);
+        for sql in [
+            "CREATE TABLE orders (id INT PRIMARY KEY, store INT NOT NULL, v INT NOT NULL) PARTITION BY HASH (id)",
+            "CREATE TABLE stores (id INT PRIMARY KEY, name TEXT NOT NULL)",
+        ] {
+            let out = crate::core::rql::executor::execute(recognize_query_purpose(sql).unwrap(), db.clone()).await;
+            assert!(out.first().is_some_and(|b| *b != 3), "{}", String::from_utf8_lossy(&out));
+        }
+        (dir, db)
+    }
+
+    #[test]
+    fn an_outer_or_lateral_join_is_seen() {
+        assert!(has_outer_join("SELECT * FROM a LEFT JOIN b ON a.id = b.id"));
+        assert!(has_outer_join("select * from a full outer join b on true"));
+        assert!(has_outer_join("SELECT * FROM a, LATERAL (SELECT 1) x"));
+        assert!(!has_outer_join("SELECT * FROM a JOIN b ON a.id = b.id WHERE a.note = 'left'"), "a literal is not a join");
+        assert!(!has_outer_join("SELECT * FROM a INNER JOIN b ON a.id = b.id"));
+    }
+
+    /// An inner join of the sharded table with a global one is a broadcast
+    /// of the global table, merged as the read would be; an outer join, a
+    /// subquery or a second sharded table gathers instead.
+    #[tokio::test]
+    async fn an_inner_join_with_a_global_table_is_a_broadcast() {
+        let (_dir, db) = db().await;
+        let c = |sql: &str| classify(&db, Source::Shape, sql);
+        match c("SELECT count(*) FROM orders o JOIN stores s ON s.id = o.store WHERE s.name = 'x'") {
+            RouteTemplate::Broadcast { small, merge, gather } => {
+                assert_eq!((small, gather), (vec!["stores".to_string()], vec!["orders".to_string()]));
+                assert!(matches!(merge, Merge::CountSum | Merge::Coordinator), "{merge:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            c("SELECT s.name, sum(o.v) FROM orders o JOIN stores s ON s.id = o.store GROUP BY s.name"),
+            RouteTemplate::Broadcast { merge: Merge::Coordinator, .. }
+        ));
+        assert!(matches!(c("SELECT o.id, s.name FROM orders o JOIN stores s ON s.id = o.store"), RouteTemplate::Broadcast { merge: Merge::Concat, .. }));
+        assert_eq!(
+            c("SELECT s.name, count(o.id) FROM stores s LEFT JOIN orders o ON o.store = s.id GROUP BY s.name"),
+            RouteTemplate::Gather { tables: vec!["orders".into()] },
+            "an outer join keeps every store once only where they are gathered"
+        );
+        assert_eq!(
+            c("SELECT count(*) FROM orders o WHERE o.store IN (SELECT id FROM stores)"),
+            RouteTemplate::Gather { tables: vec!["orders".into()] },
+            "a subquery is not broadcast"
+        );
+        assert!(matches!(c("SELECT * FROM orders o JOIN stores s ON s.id = o.store FOR UPDATE"), RouteTemplate::NeedsKey));
     }
 }
