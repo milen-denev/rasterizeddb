@@ -34,6 +34,7 @@ mod kv;
 pub mod native;
 pub mod notify;
 pub mod pg;
+pub mod rebalance;
 pub mod relay;
 pub mod route;
 pub mod scram;

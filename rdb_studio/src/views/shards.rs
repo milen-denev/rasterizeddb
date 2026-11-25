@@ -49,6 +49,7 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
         body = body.push(prepared(snapshot));
     }
     if snapshot.through_gateway() {
+        body = body.push(rebalance(studio, snapshot));
         body = body.push(gateway(studio, snapshot));
     }
     framed("SHARDS", reload(), scrollable(body).height(Fill).style(theme::scroller).into())
@@ -372,6 +373,108 @@ fn prepared(snapshot: &ShardsSnapshot) -> Element<'static, Message> {
 }
 
 // ---------------------------------------------------------------------------
+// Rebalance
+// ---------------------------------------------------------------------------
+
+/// The gateway's rebalance: the planner's moves on request, a run behind a
+/// confirmation, and the run's state and output while it goes (the page
+/// reloads every two seconds then).
+fn rebalance(studio: &Studio, snapshot: &ShardsSnapshot) -> Element<'static, Message> {
+    let mut col = column![].spacing(6);
+    if let Some(why) = &snapshot.rebalance_refused {
+        col = col.push(section_label("REBALANCE"));
+        col = col.push(
+            text(format!(
+                "Not offered on this connection: {why}. The gateway runs a rebalance for the roles its \
+                 rebalance_roles names, with rebalance_tool set to the rdb-shard binary."
+            ))
+            .size(11)
+            .color(theme::TEXT_FAINT),
+        );
+        return container(col).padding(8).width(Fill).style(theme::panel).into();
+    }
+    let running = snapshot.rebalance_running();
+    let state = snapshot.rebalance_state().unwrap_or("idle").to_string();
+    let state_colour = match state.as_str() {
+        "running" => theme::WARN,
+        "failed" => theme::BAD,
+        "done" => theme::OK,
+        _ => theme::TEXT_DIM,
+    };
+    let planned_moves = match &studio.rebalance_plan {
+        Some(Ok(steps)) => steps.iter().filter(|s| s.kind == "move").count(),
+        _ => 0,
+    };
+    col = col.push(
+        row![
+            section_label("REBALANCE"),
+            Space::new().width(Fill),
+            text(state.to_uppercase()).size(11).font(theme::MONO).color(state_colour),
+            small_button("PLAN", (!running).then_some(Message::PlanRebalance)),
+            small_button("REBALANCE…", (!running && planned_moves > 0).then_some(Message::StartRebalance)),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center),
+    );
+    match &studio.rebalance_plan {
+        None => {
+            col = col.push(
+                text("PLAN asks the gateway what the balancer would move: every shard's load from SHOW SHARD LOAD, the same plan rdb-shard rebalance makes.")
+                    .size(11)
+                    .color(theme::TEXT_FAINT),
+            );
+        }
+        Some(Err(e)) => col = col.push(text(format!("The plan failed: {e}")).size(11).color(theme::BAD)),
+        Some(Ok(steps)) => {
+            for s in steps.iter().filter(|s| s.kind == "load") {
+                col = col.push(
+                    text(format!("shard {:>3}   load {:>6}%  →  {:>6}%", s.shard, s.before, s.after)).size(11).font(theme::MONO).color(theme::TEXT_DIM),
+                );
+            }
+            if steps.iter().any(|s| s.kind == "balanced") {
+                col = col.push(text("Balanced: every shard is within the gateway's tolerance of the mean. Nothing to move.").size(11).color(theme::OK));
+            }
+            for s in steps.iter().filter(|s| s.kind == "move") {
+                let size = s.bytes.parse::<u64>().map(bytes).unwrap_or_else(|_| s.bytes.clone());
+                col = col.push(
+                    text(format!("move blocks [{}, {}) from shard {} to shard {} ({size})", s.lo, s.hi, s.shard, s.to_shard))
+                        .size(11)
+                        .font(theme::MONO)
+                        .color(theme::TEXT),
+                );
+            }
+            for s in steps.iter().filter(|s| s.kind == "split") {
+                col = col.push(
+                    text(format!("split [{}, {}) {} before a later round can move part of it", s.lo, s.hi, s.bytes)).size(11).font(theme::MONO).color(theme::TEXT_DIM),
+                );
+            }
+        }
+    }
+    // The last run: when, how it ended, its output.
+    let value = |k: &str| snapshot.rebalance.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default();
+    if state != "idle" {
+        let ended = match value("exit_code").as_str() {
+            "" => "running".to_string(),
+            code => format!("exit {code}"),
+        };
+        col = col.push(text(format!("last run: started {}, {ended}", when(&value("started_at")))).size(11).color(theme::TEXT_DIM));
+        let log: Vec<&String> = snapshot.rebalance.iter().filter(|(n, _)| n == "log").map(|(_, l)| l).collect();
+        let tail = log.len().saturating_sub(14);
+        for line in &log[tail..] {
+            col = col.push(text((*line).clone()).size(10).font(theme::MONO).color(theme::TEXT_FAINT));
+        }
+    }
+    container(col).padding(8).width(Fill).style(theme::panel).into()
+}
+
+/// A unix time as the local clock's `HH:MM:SS`, or as given.
+fn when(secs: &str) -> String {
+    let Ok(s) = secs.parse::<i64>() else { return secs.to_string() };
+    let day = s.rem_euclid(86_400);
+    format!("{:02}:{:02}:{:02} UTC", day / 3600, day % 3600 / 60, day % 60)
+}
+
+// ---------------------------------------------------------------------------
 // The gateway
 // ---------------------------------------------------------------------------
 
@@ -444,11 +547,30 @@ mod tests {
                 gateway: vec![("gateway".into(), "gw".into()), ("draining".into(), "true".into()), ("routed".into(), "12".into())],
                 load: vec![TableLoad { table: "orders".into(), partitions: 2, row_slots: 40, bytes: 4096 }],
                 prepared: vec!["rdb2pc:gw:1".into()],
+                rebalance: vec![("state".into(), "running".into()), ("started_at".into(), "1764000000".into()), ("log".into(), "move 0: orders: 10 rows copied and verified".into())],
+                ..Default::default()
+            }),
+            Some(ShardsSnapshot {
+                supported: true,
+                shards: vec![shard(0, 10)],
+                gateway: vec![("gateway".into(), "gw".into())],
+                rebalance_refused: Some("role \"app\" may not rebalance the cluster".into()),
                 ..Default::default()
             }),
         ] {
             studio.shards = snapshot;
-            let _ = view(&studio);
+            for plan in [
+                None,
+                Some(Err("no".to_string())),
+                Some(Ok(vec![
+                    RebalanceStep { kind: "load".into(), shard: "0".into(), before: "60.00".into(), after: "40.00".into(), ..Default::default() },
+                    RebalanceStep { kind: "move".into(), shard: "0".into(), to_shard: "1".into(), lo: "0x0".into(), hi: "0x10".into(), bytes: "4096".into(), ..Default::default() },
+                    RebalanceStep { kind: "balanced".into(), ..Default::default() },
+                ])),
+            ] {
+                studio.rebalance_plan = plan;
+                let _ = view(&studio);
+            }
         }
     }
 }

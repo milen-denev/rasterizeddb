@@ -35,7 +35,7 @@
 use crate::model::{
     BackupEntry, BranchDiffRow, BranchForm, BranchInfo, BranchPointKind, ColumnInfo,
     ConfigEntry, DatabaseInfo, Flavor, Grid, IndexInfo, IndexOwner, MergePolicy, PartitionInfo,
-    PeerStatus, Relationship, RestoreReport, RestoreTarget, RoleInfo, ShardInfo, ShardsSnapshot, Stat,
+    PeerStatus, Relationship, RestoreReport, RebalanceStep, RestoreTarget, RoleInfo, ShardInfo, ShardsSnapshot, Stat,
     StatementRecord, StatementShape, StorageLocation, TableInfo, TableLoad, TablePlacement,
 };
 
@@ -1213,6 +1213,30 @@ pub const SHOW_GATEWAY_SQL: &str = "SHOW GATEWAY";
 pub const SHOW_SHARD_LOAD_SQL: &str = "SHOW SHARD LOAD";
 /// Two-phase parts prepared on the shard reached.
 pub const SHOW_PREPARED_SQL: &str = "SHOW PREPARED TRANSACTIONS";
+/// A gateway's rebalance: the planner's moves, a run, and the run's state.
+pub const SHOW_REBALANCE_PLAN_SQL: &str = "SHOW REBALANCE PLAN";
+pub const REBALANCE_SQL: &str = "REBALANCE CLUSTER";
+pub const SHOW_REBALANCE_STATUS_SQL: &str = "SHOW REBALANCE STATUS";
+
+/// `SHOW REBALANCE PLAN`'s rows; empty for anything else.
+pub fn parse_rebalance_plan(grid: &Grid) -> Vec<RebalanceStep> {
+    if grid.column_index("kind").is_none() {
+        return Vec::new();
+    }
+    let v = |row: usize, c: &str| grid.value(row, c).unwrap_or_default().to_string();
+    (0..grid.rows.len())
+        .map(|row| RebalanceStep {
+            kind: v(row, "kind"),
+            shard: v(row, "shard"),
+            to_shard: v(row, "to_shard"),
+            lo: v(row, "lo_block"),
+            hi: v(row, "hi_block"),
+            bytes: v(row, "bytes"),
+            before: v(row, "load_before"),
+            after: v(row, "load_after"),
+        })
+        .collect()
+}
 
 /// `SHOW SHARDS` into the page's shards and map identity.
 pub fn parse_shards(grid: &Grid, into: &mut ShardsSnapshot) {
