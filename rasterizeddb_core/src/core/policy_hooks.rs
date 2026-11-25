@@ -136,7 +136,10 @@ pub trait PlacementPolicy: Send + Sync + 'static {
 /// administers only the session's own database (role management).
 pub fn surface_of_verb(verb: &str) -> Option<ProcessSurface> {
     Some(match verb {
-        "CREATE ROLE" | "ALTER ROLE" | "DROP ROLE" => return None,
+        // Role management, and a table placed on a location or store the
+        // server already has (`STORAGE PLACE|MOVE TABLE`), administer only the
+        // session's own database.
+        "CREATE ROLE" | "ALTER ROLE" | "DROP ROLE" | "STORAGE PLACE" => return None,
         "SET CONFIG" | "SET FILTER" | "KV CONFIG" | "KV SAVE" => ProcessSurface::SetConfig,
         "STORAGE" | "BACKUP" | "RESTORE" | "KV FLUSHALL" => ProcessSurface::StoragePaths,
         "IMPORT DATABASE" | "IMPORT" => ProcessSurface::Import,
@@ -189,11 +192,25 @@ pub fn visible_databases(ctx: &SessionContext<'_>, names: Vec<String>) -> Vec<St
     names.into_iter().filter(|n| policy.may_see_database(ctx, n)).collect()
 }
 
-/// The operator's (default) database, set once by the catalogue's open.
-static OPERATOR_DB: OnceLock<String> = OnceLock::new();
+/// The operator's (default) database: each catalogue's open records its
+/// own. A server opens one catalogue; a process that opens several (a test
+/// binary) admits each one's default, rather than whichever opened first.
+static OPERATOR_DB: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
 
 pub fn set_operator_database(name: &str) {
-    let _ = OPERATOR_DB.set(name.to_string());
+    let mut names = OPERATOR_DB.write().unwrap_or_else(|e| e.into_inner());
+    if !names.iter().any(|n| n == name) {
+        names.push(name.to_string());
+    }
+}
+
+fn is_operator_database(name: &str) -> bool {
+    let names = OPERATOR_DB.read().unwrap_or_else(|e| e.into_inner());
+    names.is_empty() || names.iter().any(|n| n == name)
+}
+
+fn operator_database_shown() -> String {
+    OPERATOR_DB.read().unwrap_or_else(|e| e.into_inner()).first().cloned().unwrap_or_else(|| "default".to_string())
 }
 
 /// The GPL default: the roles plan's process-admin rule (R1). Only a
@@ -202,7 +219,7 @@ pub fn set_operator_database(name: &str) {
 struct Open;
 impl TenancyPolicy for Open {
     fn is_process_admin(&self, ctx: &SessionContext<'_>) -> bool {
-        ctx.superuser && OPERATOR_DB.get().is_none_or(|d| d == ctx.database)
+        ctx.superuser && is_operator_database(ctx.database)
     }
 
     fn may_use(&self, ctx: &SessionContext<'_>, surface: ProcessSurface) -> Result<(), String> {
@@ -217,7 +234,7 @@ impl TenancyPolicy for Open {
         }
         Err(format!(
             "42501: permission denied: administering the server needs a superuser of the \"{}\" database",
-            OPERATOR_DB.get().map_or("default", |s| s.as_str())
+            operator_database_shown()
         ))
     }
 }

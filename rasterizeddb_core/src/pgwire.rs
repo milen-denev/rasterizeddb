@@ -2600,6 +2600,11 @@ pub(crate) fn privileged_statement(stmt: &str) -> Option<&'static str> {
         ("RESET", "QUERY") => Some("RESET QUERY STATS"),
         ("BACKUP", _) => Some("BACKUP"),
         ("RESTORE", _) => Some("RESTORE"),
+        // Placing or moving one of this database's tables onto a location
+        // or store already registered is this database's business; adding
+        // a location (a path the server writes to) or a store is the
+        // server's.
+        ("STORAGE", "PLACE") | ("STORAGE", "MOVE") | ("STORAGE", "SET") => Some("STORAGE PLACE"),
         ("STORAGE", _) => Some("STORAGE"),
         ("REPLICATION", _) => Some("REPLICATION"),
         // The key/value store's server-level commands: they change the
