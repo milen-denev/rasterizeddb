@@ -981,6 +981,8 @@ pub(crate) struct Column {
 pub(crate) fn column_type(oid: u32, typmod: i32) -> Option<ColType> {
     Some(match oid {
         16 => ColType::Bit,
+        // The engine's unsigned byte (`db_type::U8_TYPMOD`): a tinyint.
+        20 if typmod == crate::core::db_type::U8_TYPMOD => ColType::Int(1),
         21 => ColType::Int(2),
         23 | 26 => ColType::Int(4),
         20 => ColType::Int(8),

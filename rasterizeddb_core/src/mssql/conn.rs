@@ -85,9 +85,13 @@ struct Var {
 }
 
 /// The parameters of an `sp_executesql` (or prepared) statement.
+/// A declared parameter: its name (without @), whether it is a string, the
+/// engine type sent for it (0: inferred), and whether it is a number.
+type Decl = (String, bool, u32, bool);
+
 struct ParamCtx {
     /// (name without @, string type, engine type)
-    decls: Vec<(String, bool, u32)>,
+    decls: Vec<Decl>,
     values: Vec<ParamValue>,
     /// The declarations the statement being translated used, in `$n` order.
     used: parking_lot::Mutex<Vec<usize>>,
@@ -97,7 +101,7 @@ struct ParamCtx {
 #[derive(Clone)]
 struct Prepared {
     sql: String,
-    decls: Vec<(String, bool, u32)>,
+    decls: Vec<Decl>,
 }
 
 /// What ends with a batch, a piece of dynamic SQL or a procedure.
@@ -209,6 +213,9 @@ struct Session {
     bulk_target: Option<String>,
     /// This connection, as the owner of its `sp_getapplock` locks.
     conn_id: u64,
+    /// Whether each `$n` of the statement being forwarded is declared a
+    /// number (`inline_params` writes those bare, everything else quoted).
+    bound_numbers: Vec<bool>,
     /// The database the login named, as it named it: a pooled connection's
     /// reset goes back to it, as SQL Server's does after a `USE`.
     login_shown: String,
@@ -291,6 +298,7 @@ pub(crate) async fn serve_connection(
         bulk_target: None,
         conn_id,
         login_shown: shown.clone(),
+        bound_numbers: Vec::new(),
     };
     let packet_size = match login_packet.packet_size {
         0 => tds::DEFAULT_PACKET,
@@ -721,7 +729,7 @@ fn value_of(oid: u32, text: Option<String>) -> Value {
 }
 
 /// `@a int, @b nvarchar(10) OUTPUT` as (name, string, oid).
-fn parse_declarations(text: &str) -> Result<Vec<(String, bool, u32)>, TsqlError> {
+fn parse_declarations(text: &str) -> Result<Vec<Decl>, TsqlError> {
     let tokens = lex::lex(text).map_err(|e| TsqlError::syntax(e.0))?;
     let mut out = Vec::new();
     for part in split_commas(&tokens) {
@@ -742,7 +750,11 @@ fn parse_declarations(text: &str) -> Result<Vec<(String, bool, u32)>, TsqlError>
             "VARBINARY" | "BINARY" | "IMAGE" => 17,
             _ => 0,
         };
-        out.push((name.clone(), string, oid));
+        let number = matches!(
+            ty.as_str(),
+            "TINYINT" | "SMALLINT" | "INT" | "BIGINT" | "DECIMAL" | "NUMERIC" | "MONEY" | "SMALLMONEY" | "FLOAT" | "REAL"
+        );
+        out.push((name.clone(), string, oid, number));
     }
     Ok(out)
 }
@@ -1063,6 +1075,10 @@ impl Session {
             }
         }
         let mut columns: Option<Vec<Column>> = None;
+        // A bound SELECT whose rows came with no description: run again
+        // with its values written in (`inline_params`), as nothing has
+        // reached the client yet.
+        let mut undescribed = false;
         // Numeric columns with no declared scale: rows held until their
         // scale is known.
         let mut held: Option<Vec<Vec<Option<Vec<u8>>>>> = None;
@@ -1117,6 +1133,9 @@ impl Session {
                         }
                     }
                     columns = Some(cols);
+                }
+                b'D' if columns.is_none() && !capture && !params.is_empty() => {
+                    undescribed = true;
                 }
                 b'D' => {
                     let cells = data_row_cells(frame.body)?;
@@ -1178,6 +1197,30 @@ impl Session {
                 b'Z' => break,
                 _ => {}
             }
+        }
+        if undescribed && error.is_none() {
+            // The engine described the bound statement as rowless and then
+            // returned rows: a client given rows with no COLMETADATA loses
+            // the connection. The same statement as text is described, so
+            // it runs again that way, once nothing it does can differ:
+            // a plain read, no volatile call. Logged, as each such shape is
+            // a describe gap to close.
+            let rerun = is_plain_select(sql) && !calls_volatile(sql);
+            if let Some(text) = rerun.then(|| inline_params(sql, params, &self.bound_numbers)).flatten() {
+                log::warn!("SQL Server session: a bound SELECT was described as rowless and runs again with its values inlined: {sql}");
+                return Box::pin(self.exchange(&text, &[], capture, extra)).await;
+            }
+            log::warn!("SQL Server session: a bound statement was described as rowless and returned rows: {sql}");
+            return Ok(Outcome::Failed(
+                PgNotice {
+                    code: "0A000".into(),
+                    message: "this statement's result columns could not be described with its parameters bound; \
+                              it is not supported yet with parameters"
+                        .into(),
+                    ..Default::default()
+                },
+                false,
+            ));
         }
         if let (Some(rows), Some(cols)) = (held, columns.as_mut()) {
             // The scale of each undeclared numeric: the most any value has.
@@ -1372,6 +1415,10 @@ impl Session {
                     }
                 })
                 .collect(),
+            None => Vec::new(),
+        };
+        self.bound_numbers = match params {
+            Some(p) => p.used.lock().iter().map(|&k| p.decls[k].3).collect(),
             None => Vec::new(),
         };
         let capture = matches!(forward.kind, Kind::Insert { identity: Some(_) });
@@ -2858,7 +2905,7 @@ impl Session {
     async fn run_rpc_batch(
         &mut self,
         sql: &str,
-        decls: Vec<(String, bool, u32)>,
+        decls: Vec<Decl>,
         values: Vec<ParamValue>,
     ) -> io::Result<Result<(), TsqlError>> {
         let ctx = ParamCtx {
@@ -4159,7 +4206,7 @@ impl Session {
                         {
                             ColType::NVarChar(Some(n as u16))
                         }
-                        _ => match tds::column_type(oid, -1).unwrap_or(ColType::NVarChar(None)) {
+                        _ => match tds::column_type(oid, f.db_type.pg_typmod()).unwrap_or(ColType::NVarChar(None)) {
                             ColType::DateTimeOffset if f.without_time_zone => ColType::DateTime2,
                             other => other,
                         },
@@ -4182,7 +4229,7 @@ impl Session {
 
 /// The values of a call's parameters, in the order of the declarations
 /// (by name, or by position when unnamed).
-fn bind_values(decls: &[(String, bool, u32)], params: &[tds::Param]) -> Vec<ParamValue> {
+fn bind_values(decls: &[Decl], params: &[tds::Param]) -> Vec<ParamValue> {
     let mut out = vec![ParamValue::Null; decls.len()];
     let mut position = 0;
     for p in params {
@@ -4237,4 +4284,196 @@ fn render_value(tokens: &[Token]) -> Option<String> {
 #[allow(dead_code)]
 fn unused(_: &Arc<Database>, _: Ordering, _: Option<usize>) -> Option<usize> {
     find_top(&[], 0, &[])
+}
+
+/// Whether `sql` (engine SQL) only reads: re-running it changes nothing.
+fn is_plain_select(sql: &str) -> bool {
+    let upper = sql.trim_start().to_ascii_uppercase();
+    if !(upper.starts_with("SELECT") || upper.starts_with('(') || upper.starts_with("WITH")) {
+        return false;
+    }
+    // At any depth, outside quotes: a data-modifying CTE or subquery is a
+    // write (`find_keyword` reads the top level only).
+    let bytes = upper.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = crate::core::sql_scan::skip_quoted(bytes, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        if crate::core::sql_scan::is_identifier_byte(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && crate::core::sql_scan::is_identifier_byte(bytes[i]) {
+                i += 1;
+            }
+            let word = &upper[start..i];
+            if matches!(word, "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "INTO" | "SHARE" | "TRUNCATE" | "COPY") {
+                return false;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `sql` with each `$n` (outside quotes) replaced by its bound value as a
+/// typed literal; `None` when a value cannot be written so.
+fn inline_params(sql: &str, params: &[(i16, Option<Vec<u8>>, u32)], numbers: &[bool]) -> Option<String> {
+    let literal = |n: usize| -> Option<String> {
+        let (format, value, oid) = params.get(n)?;
+        let declared_number = numbers.get(n).copied().unwrap_or(false);
+        let Some(v) = value else { return Some("NULL".into()) };
+        if *format == 1 {
+            let hex: String = v.iter().map(|b| format!("{b:02x}")).collect();
+            return Some(format!("'\\x{hex}'::bytea"));
+        }
+        let raw = std::str::from_utf8(v).ok()?;
+        // A NUL has no place in statement text: not written in.
+        if raw.contains('\0') {
+            return None;
+        }
+        // Numbers bare, as LIMIT and OFFSET take only a number.
+        let oid = *oid;
+        // A parameter declared a number (no engine type is sent for one,
+        // which infers it): bare.
+        let number = matches!(oid, 20 | 21 | 23 | 700 | 701 | 1700) || (oid == 0 && declared_number);
+        if number && is_plain_number(raw) {
+            return Some(raw.to_string());
+        }
+        if oid == 16 && matches!(raw, "t" | "f" | "true" | "false") {
+            return Some(if raw.starts_with('t') { "TRUE".into() } else { "FALSE".into() });
+        }
+        let text = raw.replace('\'', "''");
+        let ty = match oid {
+            16 => "boolean",
+            20 => "bigint",
+            21 => "smallint",
+            23 => "integer",
+            25 | 1043 => "text",
+            700 => "real",
+            701 => "double precision",
+            1700 => "numeric",
+            1082 => "date",
+            1083 => "time",
+            1114 => "timestamp",
+            1184 => "timestamptz",
+            2950 => "uuid",
+            17 => "bytea",
+            _ => return Some(format!("'{text}'")),
+        };
+        Some(format!("CAST('{text}' AS {ty})"))
+    };
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 32);
+    let mut i = 0;
+    let mut copied = 0;
+    while i < bytes.len() {
+        if let Some(end) = crate::core::sql_scan::skip_quoted(bytes, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        if bytes[i] == b'$' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)
+            && (i == 0 || !crate::core::sql_scan::is_identifier_byte(bytes[i - 1]))
+        {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            let n: usize = sql[i + 1..j].parse().ok()?;
+            let value = literal(n.checked_sub(1)?)?;
+            out.push_str(&sql[copied..i]);
+            out.push_str(&value);
+            copied = j;
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    out.push_str(&sql[copied..]);
+    Some(out)
+}
+
+/// A number as SQL writes one: `-12`, `3.50`, `1e-3`, nothing else.
+fn is_plain_number(text: &str) -> bool {
+    let body = text.strip_prefix(['-', '+']).unwrap_or(text);
+    let (mantissa, exponent) = match body.find(['e', 'E']) {
+        Some(at) => (&body[..at], Some(&body[at + 1..])),
+        None => (body, None),
+    };
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    (!int.is_empty() || !frac.is_empty())
+        && digits(int)
+        && digits(frac)
+        && exponent.is_none_or(|e| {
+            let e = e.strip_prefix(['-', '+']).unwrap_or(e);
+            !e.is_empty() && digits(e)
+        })
+}
+
+/// Whether `sql` calls a function whose answer differs between runs.
+fn calls_volatile(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    ["nextval", "setval", "random", "gen_random_uuid", "uuidv4", "uuidv7", "uuid_generate", "clock_timestamp", "txid_current"]
+        .iter()
+        .any(|f| lower.contains(f))
+}
+
+#[cfg(test)]
+mod inline_tests {
+    use super::*;
+
+    fn text(v: &str) -> (i16, Option<Vec<u8>>, u32) {
+        (0, Some(v.as_bytes().to_vec()), 0)
+    }
+
+    /// A value is written as a quoted literal whose text is exactly the
+    /// value: a quote doubled, a backslash as itself (standard strings),
+    /// so no value can end the literal and add SQL of its own.
+    #[test]
+    fn values_are_written_as_literals_that_cannot_escape() {
+        let sql = "SELECT a FROM t WHERE b = $1 AND c = $2 AND d = $3 AND e = $4 LIMIT $5";
+        let params = [
+            text("x'); DROP TABLE t; --"),
+            text("Е'\\"),
+            (0, None, 0),
+            (1, Some(vec![0x00, 0xff, b'\'']), 17),
+            text("10"),
+        ];
+        let got = inline_params(sql, &params, &[false, false, false, false, true]).unwrap();
+        assert_eq!(
+            got,
+            "SELECT a FROM t WHERE b = 'x''); DROP TABLE t; --' AND c = 'Е''\\' AND d = NULL AND e = '\\x00ff27'::bytea LIMIT 10"
+        );
+        // A number is bare only when it is one and declared one.
+        assert_eq!(inline_params("SELECT $1", &[text("10")], &[false]).unwrap(), "SELECT '10'");
+        assert_eq!(inline_params("SELECT $1", &[text("1; DROP TABLE t")], &[true]).unwrap(), "SELECT '1; DROP TABLE t'");
+        assert_eq!(inline_params("SELECT $1", &[text("-1.5e3")], &[true]).unwrap(), "SELECT -1.5e3");
+        // A `$1` inside a string or a quoted name is text, not a parameter.
+        assert_eq!(
+            inline_params("SELECT '$1', \"$1\", $1", &[text("v")], &[false]).unwrap(),
+            "SELECT '$1', \"$1\", 'v'"
+        );
+        // A NUL is not written in; a missing parameter is no statement.
+        assert!(inline_params("SELECT $1", &[text("a\0b")], &[false]).is_none());
+        assert!(inline_params("SELECT $2", &[text("a")], &[false]).is_none());
+    }
+
+    #[test]
+    fn only_plain_reads_run_again() {
+        assert!(is_plain_select("SELECT a FROM t"));
+        assert!(!is_plain_select("SELECT a FROM t FOR UPDATE"));
+        assert!(!is_plain_select("INSERT INTO t SELECT 1"));
+        assert!(!is_plain_select("WITH x AS (DELETE FROM t RETURNING a) SELECT a FROM x"));
+        assert!(calls_volatile("SELECT nextval('s'), a FROM t"));
+        assert!(calls_volatile("SELECT gen_random_uuid()"));
+        assert!(!calls_volatile("SELECT a FROM t"));
+        for n in ["0", "-12", "3.50", ".5", "1e-3", "+7"] {
+            assert!(is_plain_number(n), "{n}");
+        }
+        for n in ["", "-", "1e", "0x10", "1 OR 1=1", "NaN", "1.2.3"] {
+            assert!(!is_plain_number(n), "{n}");
+        }
+    }
 }

@@ -562,7 +562,10 @@ pub(crate) fn map_type(tokens: &[Token]) -> Result<String, TsqlError> {
     let max = arg(0).is_some_and(|a| a.eq_ignore_ascii_case("max"));
     Ok(match name.as_str() {
         "BIT" => "boolean".into(),
-        "TINYINT" | "SMALLINT" => "smallint".into(),
+        // 0..=255, as SQL Server's: the engine's unsigned byte, which
+        // the front end sends back as a TDS tinyint (`tds::column_type`).
+        "TINYINT" => "utinyint".into(),
+        "SMALLINT" => "smallint".into(),
         "INT" | "INTEGER" => "integer".into(),
         "BIGINT" => "bigint".into(),
         "DECIMAL" | "NUMERIC" | "DEC" => match (arg(0), arg(1)) {
@@ -965,6 +968,10 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
             if tokens.get(i + 1).is_some_and(|p| p.is_op("("))
                 && !out.last().is_some_and(|p| p.is_op("."))
                 && !is_clause_word(t)
+                // `THEN (SELECT TOP(1) …)`, `AND (SELECT …)`: a keyword
+                // before a subquery, not a call, whose subquery is then
+                // translated (its TOP went to the engine as written).
+                && !kw(&tokens, i + 2, "SELECT")
             {
                 let close = matching_paren(&tokens, i + 1)
                     .ok_or_else(|| TsqlError::syntax("unbalanced parentheses"))?;
@@ -4776,5 +4783,16 @@ mod tests {
         assert!(fitted.len() <= crate::sqlcompat::NAME_BYTES);
         assert_eq!(fitted, crate::sqlcompat::fit_name(long));
         assert_ne!(fitted, crate::sqlcompat::fit_name("é".repeat(101)));
+    }
+
+    #[test]
+    fn a_subquery_after_a_keyword_is_translated() {
+        let e = env();
+        let sql = tr(
+            &e,
+            "SELECT CASE WHEN 1 = 1 THEN (SELECT TOP(1) [x].[a] FROM [t] AS [x]) ELSE (SELECT TOP(1) [y].[a] FROM [t] AS [y]) END FROM [u] WHERE [u].[k] = 1 AND (SELECT TOP(1) [z].[a] FROM [t] AS [z]) = 2",
+        );
+        assert!(!sql.to_ascii_uppercase().contains("TOP"), "{sql}");
+        assert_eq!(sql.matches("LIMIT 1").count(), 3, "{sql}");
     }
 }

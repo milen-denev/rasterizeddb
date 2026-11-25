@@ -2568,10 +2568,12 @@ fn qualify_on_clauses(mut relations: Vec<RelationRef>, schemas: &[SmallVec<[Sche
 /// Whether the text before a word ends in the keyword `AS`: the word is then
 /// a type (`CAST(x AS text)`) or an alias, never a column.
 fn follows_as(before: &str) -> bool {
-    let t = before.trim_end();
+    // By bytes: the text may end in a multibyte character (`… = 'ЩЕ'`),
+    // inside which a `str` slice two bytes from the end panicked.
+    let t = before.trim_end().as_bytes();
     t.len() >= 2
-        && t[t.len() - 2..].eq_ignore_ascii_case("AS")
-        && !t[..t.len() - 2].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        && t[t.len() - 2..].eq_ignore_ascii_case(b"AS")
+        && !t[..t.len() - 2].last().is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
 }
 
 /// A bare name in an `ON` clause that more than one relation in its scope

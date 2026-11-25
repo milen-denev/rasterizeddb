@@ -169,6 +169,10 @@ impl Display for DbType {
     }
 }
 
+/// The type modifier a `DbType::U8` column is described with
+/// ([`DbType::pg_typmod`]).
+pub const U8_TYPMOD: i32 = 1;
+
 impl DbType {
     /// The type the storage layer sees.
     ///
@@ -496,6 +500,11 @@ impl DbType {
     pub fn pg_typmod(&self) -> i32 {
         match self {
             DbType::BPCHAR(n) if *n > 0 => i32::from(*n) + 4,
+            // An unsigned byte, described as `int8` (`pg_oid`): marked, so
+            // a front end that has a byte type (SQL Server's `tinyint`) can
+            // tell it from a `bigint`. PostgreSQL clients ignore an int8's
+            // modifier.
+            DbType::U8 => U8_TYPMOD,
             _ => -1,
         }
     }

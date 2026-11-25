@@ -4880,10 +4880,10 @@ fn lift_comparison(
     // Its `ESCAPE`, which nothing after a lifted operand reads, is folded
     // into the pattern here, in the backslash form the matcher reads: left
     // as written, `a LIKE 'a!%b%' ESCAPE '!'` was refused (42601).
-    let escaped = match &padded {
-        Some(_) => like_without_escape(rest)?,
-        None => None,
-    };
+    // An operand lifted as an expression (`CAST(c AS text) LIKE p ESCAPE
+    // '\\'`, which EF Core writes for a string Contains over a cast) needs
+    // the fold as much: the scan after it reads no ESCAPE (42601).
+    let escaped = like_without_escape(rest)?;
     let rest: &str = escaped.as_deref().unwrap_or(rest);
     let left_text: &str = padded.as_deref().unwrap_or(&body[..at]);
     // `(c = 'a') IS TRUE` over a legacy `CHAR` column: the truth test is of a

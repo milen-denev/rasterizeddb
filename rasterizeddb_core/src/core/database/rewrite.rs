@@ -169,6 +169,17 @@ pub(super) fn write_intent(path: &Path, text: &str) -> io::Result<()> {
 }
 
 /// Removes the intent durably.
+/// [`remove_intent`] without its directory sync: for a caller removing
+/// several in one directory, which syncs it once after.
+pub(super) fn remove_intent_unsynced(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Unlink(path));
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
 pub(super) fn remove_intent(path: &Path) -> io::Result<()> {
     #[cfg(test)]
     crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Unlink(path));

@@ -1289,6 +1289,19 @@ fn pool_forget(pool: &StoragePool, table_name: &str) {
 #[cfg(not(feature = "storage_pools"))]
 fn pool_forget(_pool: &StoragePool, _table_name: &str) {}
 
+/// [`pool_forget`] for several tables, the placements file written once
+/// (each forget rewrote and synced it).
+#[cfg(feature = "storage_pools")]
+fn pool_forget_all(pool: &StoragePool, tables: &[String]) {
+    if tables.is_empty() {
+        return;
+    }
+    pool.forget_where(|t| temp_seed(t).is_none() && tables.iter().any(|n| n == t));
+}
+
+#[cfg(not(feature = "storage_pools"))]
+fn pool_forget_all(_pool: &StoragePool, _tables: &[String]) {}
+
 /// Forgets every statement-scoped relation's placement, once the open has
 /// reaped their files. Builds before `temp_seed` recorded one per CTE, and
 /// [`pool_forget`] skips these names, since nothing records them now, so
@@ -6147,6 +6160,36 @@ pub(super) async fn discard_files_in(
     name: &str,
     suffixes: &[&str],
 ) -> bool {
+    let mut dirs = Vec::new();
+    let discarded = discard_files_unsynced(io_pointers, pool, own, name, suffixes, &mut dirs).await;
+    sync_discarded_dirs(name, &dirs);
+    discarded
+}
+
+/// Syncs each directory [`discard_files_unsynced`] deleted in, once.
+pub(super) fn sync_discarded_dirs(name: &str, dirs: &[String]) {
+    for dir in dirs {
+        let swept = std::path::Path::new(dir).join(format!("{name}{}", RENAMED_SUFFIXES[0]));
+        if let Err(e) = crate::core::wal::sync_parent_dir(&swept) {
+            error!(
+                "Deleted {}'s files in {} but could not sync the directory: {}",
+                name, dir, e
+            );
+        }
+    }
+}
+
+/// [`discard_files_in`] without its directory syncs: each directory it
+/// deleted in is added to `dirs` (once), for a caller discarding many
+/// relations to sync after all of them (a block's COMMIT).
+pub(super) async fn discard_files_unsynced(
+    io_pointers: &Arc<DbStorageProvider>,
+    pool: &StoragePool,
+    own: Option<&str>,
+    name: &str,
+    suffixes: &[&str],
+    dirs: &mut Vec<String>,
+) -> bool {
     if seed_fell_back(pool, io_pointers, name) {
         return unavailable_kept(name);
     }
@@ -6174,12 +6217,8 @@ pub(super) async fn discard_files_in(
         return true;
     }
     for dir in dirs_reached(io_pointers, pool) {
-        let swept = std::path::Path::new(&dir).join(format!("{name}{}", RENAMED_SUFFIXES[0]));
-        if let Err(e) = crate::core::wal::sync_parent_dir(&swept) {
-            error!(
-                "Deleted {}'s files in {} but could not sync the directory: {}",
-                name, dir, e
-            );
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
         }
     }
     true

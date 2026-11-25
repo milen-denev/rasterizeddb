@@ -1124,6 +1124,39 @@ async fn tiberius_ef_core_shapes() {
     batch(&mut c, "DECLARE @r int; EXEC @r = sp_releaseapplock @Resource = '__EFMigrationsLock', @LockOwner = 'Session'; SELECT @r").await.unwrap();
     let r = batch(&mut other, lock).await.unwrap();
     assert_eq!(int(r.last().unwrap()), vec![0]);
+    // tinyint is a TDS tinyint (EF reads a byte?), 0..=255.
+    batch(&mut c, "CREATE TABLE [dbo].[DenevCloud.ERP.Companies] ([Id] int PRIMARY KEY, [N] tinyint NULL)").await.unwrap();
+    batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Companies] VALUES (1, 255), (2, 0), (3, NULL)").await.unwrap();
+    let r = batch(&mut c, "SELECT [N] FROM [dbo].[DenevCloud.ERP.Companies] ORDER BY [Id]").await.unwrap();
+    let bytes: Vec<Option<u8>> = r[0].iter().map(|row| row.get::<u8, _>(0)).collect();
+    assert_eq!(bytes, vec![Some(255), Some(0), None]);
+    assert!(batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Companies] VALUES (4, 256)").await.is_err());
+    // A bound SELECT the engine describes as rowless (a derived table
+    // beside a ROW_NUMBER one) still sends its column metadata: the rows
+    // reached the client without it and the connection broke.
+    let q = "SELECT [d6].[Id], [d6].[c], [d8].[Name] FROM (SELECT TOP(@P1) [d].[Id], (SELECT TOP(1) [x].[Code] \
+             FROM [dbo].[DenevCloud.ERP.Colors] AS [x] WHERE [x].[Id] = [d].[Id]) AS [c] FROM [dbo].[DenevCloud.ERP.Colors] AS [d]) AS [d6] \
+             LEFT JOIN (SELECT [d7].[Name], [d7].[Id] FROM (SELECT [e].[Name], [e].[Id], ROW_NUMBER() OVER(PARTITION BY [e].[Id] ORDER BY [e].[Name]) AS [row] \
+             FROM [dbo].[DenevCloud.ERP.Colors] AS [e]) AS [d7] WHERE [d7].[row] <= 1) AS [d8] ON [d6].[Id] = [d8].[Id] ORDER BY [d6].[Id]";
+    let rows = c.query(q, &[&10i32]).await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(rows.len(), 5, "every color");
+    assert_eq!(rows[0].get::<i32, _>(0), Some(1));
+    assert_eq!(rows[0].get::<&str, _>(2), Some("Red"));
+    // Search terms a user types, bound: what is stored is found, and a value
+    // that looks like SQL is only a value.
+    batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Colors] ([Id], [Name], [Code]) VALUES (20, N'x''); DROP TABLE t; --', N'Е''\\')").await.unwrap();
+    for (term, id) in [("x'); DROP TABLE t; --", 20), ("Е'\\", 20)] {
+        let rows = c
+            .query("SELECT [d].[Id] FROM [dbo].[DenevCloud.ERP.Colors] AS [d] WHERE [d].[Name] = @P1 OR [d].[Code] = @P1", &[&term])
+            .await
+            .unwrap()
+            .into_first_result()
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|r| r.get::<i32, _>(0).unwrap()).collect::<Vec<_>>(), vec![id], "{term}");
+    }
+    let r = batch(&mut c, "SELECT COUNT(*) FROM [dbo].[DenevCloud.ERP.Colors]").await.unwrap();
+    assert_eq!(int(&r[0]), vec![6], "the table is all there");
     // EnsureDeleted's statement before DROP DATABASE.
     drop(other);
     drop(c);

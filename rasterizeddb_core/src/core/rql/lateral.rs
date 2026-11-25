@@ -562,6 +562,173 @@ fn qualified_references(body: &str) -> Vec<(String, String)> {
     out
 }
 
+/// An item reading two outer relations an INNER JOIN before it keys
+/// together (`FROM v d JOIN p d0 ON d.pid = d0.id`, a subquery reading
+/// `d0.id` and `d.id`): each reference to one side's key column is the
+/// other side's, as every joined row has them equal, so the item reads one
+/// relation (EF Core's correlated subqueries over a join). Only keys that
+/// compare by their bytes (no text: a case-insensitive key's two sides may
+/// differ in case), of one type on both sides, from an `ON` term conjoined
+/// at its top level (not under `OR` or `NOT`) of an INNER JOIN (never a
+/// LEFT/RIGHT/FULL one, whose NULL-extended rows break the equality), and
+/// only when every reference to the dropped relation is such a key;
+/// otherwise the item is left as it was (and refused).
+pub(crate) fn fold_inner_join_keys(sql: &str, item: Item, database: &Arc<Database>) -> Item {
+    let outer = items_before(sql, item.start);
+    let inner: Vec<String> = match find_keyword(&item.body, "FROM", 0) {
+        Some(_) => items_before(&item.body, clause_end_of_from(&item.body)).into_iter().map(|(a, _)| a).collect(),
+        None => Vec::new(),
+    };
+    let refs: Vec<(String, String)> = qualified_references(&item.body)
+        .into_iter()
+        .filter(|(q, _)| !inner.iter().any(|a| a.eq_ignore_ascii_case(q)))
+        .filter(|(q, _)| outer.iter().any(|(a, _)| a.eq_ignore_ascii_case(q)))
+        .collect();
+    let mut aliases: Vec<String> = Vec::new();
+    for (q, _) in &refs {
+        if !aliases.iter().any(|a| a.eq_ignore_ascii_case(q)) {
+            aliases.push(q.clone());
+        }
+    }
+    if aliases.len() != 2 {
+        return item;
+    }
+    let equalities = inner_join_equalities(&sql[..item.start]);
+    let relation_of = |alias: &str| outer.iter().find(|(a, _)| a.eq_ignore_ascii_case(alias)).map(|(_, r)| r.clone());
+    // The column's type, when it compares by its bytes (no text).
+    let byte_type = |alias: &str, column: &str| -> Option<crate::core::db_type::DbType> {
+        let name = crate::core::sql_scan::bare_name(&relation_of(alias)?);
+        let view = database.schema_view(&name)?;
+        view.schema()
+            .fields
+            .iter()
+            .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))
+            .filter(|f| !matches!(f.db_type, crate::core::db_type::DbType::STRING | crate::core::db_type::DbType::BPCHAR(_)))
+            .map(|f| f.literal_type())
+    };
+    // Keep one alias; every reference to the other must map through a key.
+    for (keep, drop) in [(0usize, 1usize), (1, 0)] {
+        let (keep, drop) = (&aliases[keep], &aliases[drop]);
+        let mut mapping: Vec<(String, String)> = Vec::new();
+        let mut ok = true;
+        for (q, column) in refs.iter().filter(|(q, _)| q.eq_ignore_ascii_case(drop)) {
+            let partner = equalities.iter().find_map(|((la, lc), (ra, rc))| {
+                if la.eq_ignore_ascii_case(drop) && lc.eq_ignore_ascii_case(column) && ra.eq_ignore_ascii_case(keep) {
+                    Some(rc.clone())
+                } else if ra.eq_ignore_ascii_case(drop) && rc.eq_ignore_ascii_case(column) && la.eq_ignore_ascii_case(keep) {
+                    Some(lc.clone())
+                } else {
+                    None
+                }
+            });
+            match partner {
+                // Both sides one type: an `int = bigint` key would read
+                // the other type in the subquery.
+                Some(p) if byte_type(q, column).is_some() && byte_type(q, column) == byte_type(keep, &p) => {
+                    mapping.push((column.clone(), p))
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok && !mapping.is_empty() {
+            let mut item = item.clone();
+            item.body = replace_qualified(&item.body, drop, keep, &mapping);
+            return item;
+        }
+    }
+    item
+}
+
+/// The `a.x = b.y` terms of the `ON` conditions of the INNER JOINs in
+/// `from_text` (a statement up to an item), each side as (alias, column).
+fn inner_join_equalities(from_text: &str) -> Vec<((String, String), (String, String))> {
+    let upper = from_text.to_ascii_uppercase();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(join) = find_keyword(&upper, "JOIN", at) {
+        at = join + 4;
+        let before = upper[..join].trim_end();
+        if ["LEFT", "RIGHT", "FULL", "CROSS", "OUTER", "NATURAL"].iter().any(|k| before.ends_with(k)) {
+            continue;
+        }
+        let Some(on) = find_keyword(&upper, "ON", at) else { continue };
+        let end = ["JOIN", "WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "INNER", "LEFT", "RIGHT", "FULL", "CROSS"]
+            .iter()
+            .filter_map(|k| find_keyword(&upper, k, on + 2))
+            .min()
+            .unwrap_or(from_text.len());
+        let cond = &from_text[on + 2..end];
+        let cond_upper = cond.to_ascii_uppercase();
+        let mut pieces = Vec::new();
+        let mut from = 0;
+        while let Some(and) = find_keyword(&cond_upper, "AND", from) {
+            pieces.push(&cond[from..and]);
+            from = and + 3;
+        }
+        pieces.push(&cond[from..]);
+        for piece in pieces {
+            let piece = piece.trim().trim_start_matches('(').trim_end_matches(')').trim();
+            let Some((l, r)) = piece.split_once('=') else { continue };
+            if l.ends_with(['<', '>', '!']) || r.starts_with('=') {
+                continue;
+            }
+            let side = |t: &str| -> Option<(String, String)> {
+                let t = t.trim();
+                let (a, c) = t.split_once('.')?;
+                let clean = |x: &str| x.trim().trim_matches('"').to_string();
+                (!a.is_empty() && !c.contains('.') && !c.contains(' ')).then(|| (clean(a), clean(c)))
+            };
+            if let (Some(l), Some(r)) = (side(l), side(r)) {
+                out.push((l, r));
+            }
+        }
+    }
+    out
+}
+
+/// `body` with each `drop.column` (outside quotes, as a whole reference)
+/// written `keep.partner`.
+fn replace_qualified(body: &str, drop: &str, keep: &str, mapping: &[(String, String)]) -> String {
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = crate::core::sql_scan::skip_quoted(bytes, i).filter(|_| bytes[i] == b'\'') {
+            i = end.max(i + 1);
+            continue;
+        }
+        let boundary = i == 0 || !(is_word(bytes[i - 1]) || bytes[i - 1] == b'.');
+        // By bytes: `i` may sit inside a multibyte character (a dotted
+        // name's `․`); a match starts on an ASCII byte of `drop`.
+        if boundary
+            && bytes.len() - i > drop.len()
+            && bytes[i..i + drop.len()].eq_ignore_ascii_case(drop.as_bytes())
+            && bytes.get(i + drop.len()) == Some(&b'.')
+        {
+            let col_start = i + drop.len() + 1;
+            let mut col_end = col_start;
+            while col_end < bytes.len() && is_word(bytes[col_end]) {
+                col_end += 1;
+            }
+            let column = &body[col_start..col_end];
+            if let Some((_, partner)) = mapping.iter().find(|(c, _)| c.eq_ignore_ascii_case(column)) {
+                out.push_str(&body[copied..i]);
+                out.push_str(&format!("{keep}.{partner}"));
+                copied = col_end;
+                i = col_end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&body[copied..]);
+    out
+}
+
 /// The outer item the body reads, and the columns it reads of it: `None`
 /// when it reads none. Refused when it reads two.
 pub(crate) fn outer_references(sql: &str, item: &Item) -> Result<Option<(String, String, Vec<String>)>, String> {
@@ -903,6 +1070,7 @@ pub(crate) async fn materialize(
     for index in 0..16usize {
         let Some(item) = next_item(&current) else { break };
         let item = qualify_outer_columns(&current, &item?, database).await?;
+        let item = fold_inner_join_keys(&current, item, database);
         found = true;
         let outer = outer_references(&current, &item)?;
         if outer.is_some() && selects_star(&current, &item) {
