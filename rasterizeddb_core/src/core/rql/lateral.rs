@@ -1188,12 +1188,23 @@ pub(crate) async fn materialize(
                 // item ran for every row of the outer relation: one customer
                 // of a thousand cost a thousand runs, and an outer table past
                 // `MAX_TUPLES` was refused whatever its WHERE kept.
+                // The filter the probe ran with, when it did: the outer
+                // item's copy below takes it too.
+                let mut pushed: Option<String> = None;
                 let tuples = match outer_only_filter(&current, &item, alias) {
                     Some(filter) => match text_rows(&format!("{key_query} WHERE {filter}"), columns.len(), database, tx).await {
-                        Ok(tuples) => tuples,
+                        Ok(tuples) => {
+                            pushed = Some(filter);
+                            tuples
+                        }
                         // Read as written it failed; every outer row is
                         // still a superset of what the statement keeps.
-                        Err(_) => text_rows(&key_query, columns.len(), database, tx).await?,
+                        Err(e) => {
+                            // Worth a line: the statement then runs its item
+                            // for every outer row.
+                            log::debug!("LATERAL item {}: the narrowed probe failed ({e}); running for every outer value", item.alias);
+                            text_rows(&key_query, columns.len(), database, tx).await?
+                        }
                     },
                     None => text_rows(&key_query, columns.len(), database, tx).await?,
                 };
@@ -1267,6 +1278,19 @@ pub(crate) async fn materialize(
                     let Some((start, end, inner, derived)) = crate::core::rql::cte::next_derived_table(&current) else {
                         break;
                     };
+                    // The outer item, copied to carry its join key: only the
+                    // rows the statement can keep, by the filter its probe
+                    // ran with. Every row was copied: with one product in
+                    // four kept of 10,900 (59 columns each) the copy was
+                    // 4.7 s an item, where the probe took 29 ms.
+                    let inner = match &pushed {
+                        Some(filter) if copies_only(&inner, &derived, alias) => {
+                            #[cfg(test)]
+                            test_hooks::record_narrowed_copy(alias);
+                            format!("{inner} WHERE {filter}")
+                        }
+                        _ => inner,
+                    };
                     let built = crate::core::rql::cte::materialize_query(&inner, &derived, &current, database, tx).await?;
                     temps.push(built.clone());
                     current = format!("{}{} {}{}", &current[..start], built, derived, &current[end..]);
@@ -1275,6 +1299,47 @@ pub(crate) async fn materialize(
         }
     }
     Ok(found.then_some(current))
+}
+
+/// Whether `inner` (a derived table's body, aliased `derived`) is the plain
+/// copy `join_on` makes of the outer item `alias` to carry a join key:
+/// `SELECT … FROM <relation> [AS] alias`, nothing after it. Only such a
+/// copy takes the outer item's filter.
+fn copies_only(inner: &str, derived: &str, alias: &str) -> bool {
+    if !same_name(derived, alias) {
+        return false;
+    }
+    let Some(from) = find_keyword(inner, "FROM", 0) else { return false };
+    let tail = inner[from + "FROM".len()..].trim();
+    if ["WHERE", "JOIN", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "UNION", "INTERSECT", "EXCEPT", "WINDOW"]
+        .iter()
+        .any(|w| find_keyword(tail, w, 0).is_some())
+        || tail.contains(',')
+        || tail.contains('(')
+    {
+        return false;
+    }
+    // `<relation> [AS] <alias>`.
+    let words: Vec<&str> = tail.split_whitespace().collect();
+    match words.as_slice() {
+        [_, a] => same_name(a, alias),
+        [_, kw, a] => kw.eq_ignore_ascii_case("AS") && same_name(a, alias),
+        _ => false,
+    }
+}
+
+/// Whether two spellings name one thing: equal ignoring ASCII case, or one
+/// quoted and the other its plain lower-case name (`"d0"` and `d0`).
+fn same_name(a: &str, b: &str) -> bool {
+    let plain = |n: &str| -> String {
+        let t = n.trim();
+        match t.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+            Some(inner) if inner.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_') => inner.to_string(),
+            Some(_) => t.to_string(),
+            None => t.to_ascii_lowercase(),
+        }
+    };
+    plain(a) == plain(b)
 }
 
 /// The statement's own top-level `WHERE` conjuncts that read nothing but the
@@ -1294,7 +1359,9 @@ pub(crate) async fn materialize(
 /// left out is still decided by the statement's own `WHERE`.
 fn outer_only_filter(sql: &str, item: &Item, alias: &str) -> Option<String> {
     let first = items_before(sql, item.start).into_iter().next()?;
-    if !first.0.eq_ignore_ascii_case(alias) {
+    // `AS "d"` and `d` are one alias (a plain lower-case name quoted): an
+    // ORM's quoted aliases left every correlated subquery unnarrowed.
+    if !same_name(&first.0, alias) {
         return None;
     }
     let from = find_keyword(sql, "FROM", 0)?;
@@ -1431,7 +1498,7 @@ fn exists_reads_only(term: &str, alias: &str) -> bool {
     }
     let binds = |name: &str| {
         let n = name.trim_matches('"').to_ascii_lowercase();
-        n == alias.to_ascii_lowercase() || bound.contains(&n)
+        same_name(name, alias) || bound.contains(&n)
     };
     for (word, quoted, end) in &tokens {
         let next = body[*end..].trim_start();
@@ -1507,7 +1574,7 @@ fn reads_only(term: &str, alias: &str) -> bool {
                 }
                 let word = &term[start..i];
                 if bytes.get(i) == Some(&b'.') {
-                    if !word.eq_ignore_ascii_case(alias) {
+                    if !same_name(word, alias) {
                         return false;
                     }
                     i += 1;
@@ -1757,6 +1824,18 @@ pub(crate) mod test_hooks {
     /// The runs each outer relation's `LATERAL` items took, by relation name.
     static RUNS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
 
+    /// The outer-item copies narrowed by the statement's filter, by alias.
+    static NARROWED: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+    pub(crate) fn record_narrowed_copy(alias: &str) {
+        *NARROWED.lock().unwrap().get_or_insert_with(HashMap::new).entry(alias.to_string()).or_default() += 1;
+    }
+
+    /// The narrowed copies recorded for `alias`, forgotten.
+    pub(crate) fn take_narrowed_copies(alias: &str) -> usize {
+        NARROWED.lock().unwrap().as_mut().and_then(|m| m.remove(alias)).unwrap_or(0)
+    }
+
     pub(crate) fn record_runs(relation: &str, runs: usize) {
         *RUNS.lock().unwrap().get_or_insert_with(HashMap::new).entry(relation.to_string()).or_default() += runs;
     }
@@ -1825,6 +1904,14 @@ mod exists_filter_tests {
                    WHERE d.id = d0.productsid AND d1.content = 'Realme C53')";
         assert!(exists_reads_only(tag, "d"));
         assert!(exists_reads_only("NOT EXISTS (SELECT 1 FROM t x WHERE x.k = d.id AND x.v = '1'::uuid)", "d"));
+        // As it reaches the check after `unquote_plain_qualified`: quoted
+        // relation names (U+2024 dots) and quoted lone aliases.
+        assert!(exists_reads_only(
+            "EXISTS (SELECT 1 FROM \"denevcloud\u{2024}erp\u{2024}producttags\" AS \"d0\" INNER JOIN \"denevcloud\u{2024}erp\u{2024}tags\" AS \"d1\" \
+             ON d0.tagsid = d1.id WHERE d.id = d0.productsid AND d1.content IN ('Samsung Galaxy A14', 'Samsung Galaxy A14 5G'))",
+            "d"
+        ));
+        assert!(exists_reads_only("EXISTS (SELECT 1 FROM t AS \"x\" WHERE x.k = d.id)", "\"d\""));
         // Its select list is not read: the SQL Server front end's `SELECT
         // CAST(1 AS integer)`.
         assert!(exists_reads_only(

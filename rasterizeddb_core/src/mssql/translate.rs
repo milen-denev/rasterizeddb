@@ -185,6 +185,12 @@ pub(crate) struct Forward {
     /// (`__rdb_t7_text`): their names and SQL Server types (`datetime2`,
     /// `datetimeoffset`, `time`), sent as those at scale 7.
     pub(crate) ticks: Vec<(String, &'static str)>,
+    /// This front end's own statements on its catalogue (`NAMES_TABLE`:
+    /// the declared names a DDL records), run after `statements` succeed
+    /// and announced to the session as the front end's
+    /// (`PgBridge::system_query`), which is what lets them past its
+    /// catalogue guard. Never a client's text.
+    pub(crate) system: Vec<String>,
 }
 
 /// A statement of a batch, with T-SQL's control flow.
@@ -4618,6 +4624,7 @@ fn rewrite_insert(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward,
         aliases: Vec::new(),
         database: None,
         ticks: Vec::new(),
+        system: Vec::new(),
     })
 }
 
@@ -4849,6 +4856,7 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
         aliases: Vec::new(),
         database: None,
         ticks: Vec::new(),
+        system: Vec::new(),
     })
 }
 
@@ -4990,6 +4998,7 @@ fn rewrite_delete(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
         aliases: Vec::new(),
         database: None,
         ticks: Vec::new(),
+        system: Vec::new(),
     })
 }
 
@@ -5478,12 +5487,7 @@ pub(crate) fn names_from_script(script: &str, env: &dyn Env) -> Result<Vec<Strin
             ("CREATE", "TABLE") | ("CREATE", "INDEX" | "UNIQUE" | "CLUSTERED" | "NONCLUSTERED") | ("ALTER", "TABLE") => {
                 // What the statement would record, not the statement.
                 if let Ok(f) = translate(&render_text(tokens), tokens.to_vec(), env) {
-                    out.extend(f.statements.into_iter().filter(|s| {
-                        s.contains(NAMES_TABLE)
-                            && (s.starts_with("CREATE TABLE IF NOT EXISTS")
-                                || s.starts_with("INSERT INTO")
-                                || s.starts_with("DELETE FROM"))
-                    }));
+                    out.extend(f.system);
                 }
             }
             ("EXEC" | "EXECUTE", _) => {
@@ -5593,9 +5597,10 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
         defs.join(", ")
     )];
     statements.extend(later);
+    let mut system = Vec::new();
     if !temporary {
         let shown = shown_name_at(&tokens, 2);
-        statements.extend(record_names(&table, shown.as_deref(), &declared, &objects, true));
+        system.extend(record_names(&table, shown.as_deref(), &declared, &objects, true));
     }
     Ok(Forward {
         statements,
@@ -5604,6 +5609,7 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
         aliases: Vec::new(),
         database: None,
         ticks: Vec::new(),
+        system,
     })
 }
 
@@ -5612,6 +5618,8 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
         table_name_at(&tokens, 2).ok_or_else(|| TsqlError::syntax("ALTER TABLE needs a name"))?;
     let t = ident_sql(&table);
     let mut statements = Vec::new();
+    // The declared names it records (`Forward::system`).
+    let mut system: Vec<String> = Vec::new();
     let mut k = after;
     // WITH CHECK / WITH NOCHECK before ADD CONSTRAINT.
     if kw(&tokens, k, "WITH") && (kw(&tokens, k + 1, "CHECK") || kw(&tokens, k + 1, "NOCHECK")) {
@@ -5634,7 +5642,7 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
                     statements.extend(statement);
                     if !table.starts_with('#') {
                         if let Some(object) = constraint_object(&part, &table) {
-                            statements.extend(record_names(&table, None, &[], &[object], false));
+                            system.extend(record_names(&table, None, &[], &[object], false));
                         }
                     }
                 } else {
@@ -5656,7 +5664,7 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
                     }
                     if !table.starts_with('#') {
                         if let Some(name) = p.first().and_then(|x| x.ident()) {
-                            statements.extend(record_names(&table, None, &[name.to_string()], &[], false));
+                            system.extend(record_names(&table, None, &[name.to_string()], &[], false));
                         }
                     }
                 }
@@ -5728,6 +5736,7 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
         aliases: Vec::new(),
         database: None,
         ticks: Vec::new(),
+        system,
     })
 }
 
@@ -5805,16 +5814,17 @@ fn rewrite_create_index(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
             }
         }
     }
-    let mut statements = vec![format!(
+    let statements = vec![format!(
         "CREATE {}INDEX {} ON {} ({})",
         if unique { "UNIQUE " } else { "" },
         ident_sql(&crate::sqlcompat::index_name(&table, name)),
         ident_sql(&table),
         cols.join(", ")
     )];
+    let mut system = Vec::new();
     if !table.starts_with('#') {
         let object = (crate::sqlcompat::index_name(&table, name), name.to_string());
-        statements.extend(record_names(&table, None, &[], &[object], false));
+        system.extend(record_names(&table, None, &[], &[object], false));
     }
     Ok(Forward {
         statements,
@@ -5823,6 +5833,7 @@ fn rewrite_create_index(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
         aliases: Vec::new(),
         database: None,
         ticks: Vec::new(),
+        system,
     })
 }
 
@@ -5893,6 +5904,7 @@ fn rewrite_drop(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
         aliases: Vec::new(),
         database: dropped_database,
         ticks: Vec::new(),
+        system: Vec::new(),
     })
 }
 
@@ -5918,6 +5930,7 @@ fn fulltext_ddl(tokens: Vec<Token>, _cx: &mut Cx) -> Result<Forward, TsqlError> 
         aliases: Vec::new(),
         database: None,
         ticks: Vec::new(),
+        system: Vec::new(),
     };
     if kw(&tokens, 2, "CATALOG") || kw(&tokens, 2, "STOPLIST") {
         // A catalog groups indexes for SQL Server's own administration; there
@@ -5961,6 +5974,7 @@ fn fulltext_ddl(tokens: Vec<Token>, _cx: &mut Cx) -> Result<Forward, TsqlError> 
         aliases: Vec::new(),
         database: None,
         ticks: Vec::new(),
+        system: Vec::new(),
     })
 }
 
@@ -6145,6 +6159,7 @@ fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
         aliases: Vec::new(),
         database: None,
         ticks: Vec::new(),
+        system: Vec::new(),
     })
 }
 
@@ -6188,6 +6203,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
                     aliases: Vec::new(),
                     database: None,
                     ticks: Vec::new(),
+                    system: Vec::new(),
                 });
             }
             Ok(Forward {
@@ -6197,6 +6213,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
                 aliases: Vec::new(),
                 database: None,
                 ticks: Vec::new(),
+                system: Vec::new(),
             })
         }
         _ if tokens.first().is_some_and(|t| t.is_op("(")) => Ok(Forward {
@@ -6206,6 +6223,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
             aliases: Vec::new(),
             database: None,
             ticks: Vec::new(),
+            system: Vec::new(),
         }),
         "WITH" => {
             let main = find_top(&tokens, 1, &["SELECT", "INSERT", "UPDATE", "DELETE"]);
@@ -6220,6 +6238,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
                 aliases: Vec::new(),
                 database: None,
                 ticks: Vec::new(),
+                system: Vec::new(),
             })
         }
         "INSERT" => rewrite_insert(sql, tokens, cx),
@@ -6246,6 +6265,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
                         aliases: Vec::new(),
                         database: Some((name.to_string(), true)),
                         ticks: Vec::new(),
+                        system: Vec::new(),
                     })
                 }
                 "SCHEMA" => {
@@ -6258,6 +6278,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
                             aliases: Vec::new(),
                             database: None,
                             ticks: Vec::new(),
+                            system: Vec::new(),
                         })
                     } else {
                         Err(TsqlError::unsupported("schemas other than dbo"))
@@ -6280,6 +6301,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
                         aliases: Vec::new(),
                         database: None,
                         ticks: Vec::new(),
+                        system: Vec::new(),
                     })
                 }
                 other => Err(TsqlError::unsupported(format!("CREATE {other}"))),
@@ -6310,6 +6332,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
                         aliases: Vec::new(),
                         database: None,
                         ticks: Vec::new(),
+                        system: Vec::new(),
                     })
                 } else {
                     Err(TsqlError::unsupported(format!("ALTER DATABASE … SET {option}")))
@@ -6332,6 +6355,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
                 aliases: Vec::new(),
                 database: None,
                 ticks: Vec::new(),
+                system: Vec::new(),
             })
         }
         _ => Ok(Forward {
@@ -6341,6 +6365,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
             aliases: Vec::new(),
             database: None,
             ticks: Vec::new(),
+            system: Vec::new(),
         }),
     }
 }
@@ -6502,7 +6527,9 @@ mod tests {
     /// As translated, unaliased expressions' blank names (`BLANK_NAME`) kept.
     fn tr_named(e: &TestEnv, sql: &str) -> String {
         let tokens = lex(sql).unwrap();
-        translate(sql, tokens, e).unwrap().statements.join("; ")
+        let f = translate(sql, tokens, e).unwrap();
+        // Its statements, then the front end's own on its catalogue.
+        f.statements.into_iter().chain(f.system).collect::<Vec<_>>().join("; ")
     }
 
     #[test]

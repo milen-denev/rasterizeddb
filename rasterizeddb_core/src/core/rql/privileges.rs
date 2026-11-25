@@ -537,7 +537,19 @@ pub fn parse_privilege_statement(sql: &str) -> Option<Result<PrivilegeStatement,
 /// Names in the catalogue's namespace that are not relations: the alias an
 /// enum sort's rewrite gives its derived table (`user_types`), and the
 /// functions the collation and domain rewrites call.
-const NOT_CATALOGUES: &[&str] = &["__rdb_o", "__rdb_ci_key", "__rdb_ci_ai_key", "__rdb_domain_value"];
+const NOT_CATALOGUES: &[&str] = &[
+    "__rdb_o",
+    "__rdb_ci_key",
+    "__rdb_ci_ai_key",
+    "__rdb_domain_value",
+    // A uniqueidentifier's SQL Server-order key, and the 100 ns digit of a
+    // datetime2(7) (`pg_functions`): the SQL Server front end writes them
+    // into its translated statements.
+    "__rdb_guid_key",
+    "__rdb_t7_digit",
+    "__rdb_t7_text",
+    "__rdb_t7_floor",
+];
 
 /// The prefix of the tables the MySQL and SQL Server front ends make for a
 /// client's temporary tables (`sqlcompat::TEMP_PREFIX`): the client's own
