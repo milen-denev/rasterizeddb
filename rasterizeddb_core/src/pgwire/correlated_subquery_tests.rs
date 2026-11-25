@@ -267,3 +267,47 @@ fn only_the_outer_item_s_own_conjuncts_are_applied_first() {
         assert!(!reads_only(no, "c"), "{no}");
     }
 }
+
+/// A tag-like EXISTS over the outer item narrows its runs, as EF Core's
+/// related-items query filters products by a tag: two select-list scalars
+/// ran for every product (all of one company), 14.5 s, where the EXISTS kept
+/// a handful. Also through a join inside the EXISTS, with an IN list, and
+/// however an earlier pass rewrites the EXISTS (`exists_to_in`).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exists_over_the_outer_item_narrows_its_runs() {
+    const ALIAS_EXISTS: &str = "oex";
+    let db = db().await;
+    let mut s = session(&db);
+    let (customers, orders) = ("cex_customers", "cex_orders");
+    fill(&db, &mut s, customers, orders, false).await;
+    ok(&db, &mut s, "CREATE TABLE cex_tags (id INT PRIMARY KEY, content TEXT)").await;
+    ok(&db, &mut s, "INSERT INTO cex_tags VALUES (1, 'x'), (2, 'y')").await;
+    // The customers with an order of amount 7 (and, joined, tag 'x').
+    let tagged: Vec<i64> = {
+        let mut ids: Vec<i64> = (1..=ORDERS).filter(|o| amount(*o) == 7).map(owner).collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    };
+    let q = |filter: &str| {
+        format!(
+            "SELECT {ALIAS_EXISTS}.id, (SELECT COUNT(*) FROM {orders} o WHERE o.customer_id = {ALIAS_EXISTS}.id), \
+             (SELECT SUM(amount) FROM {orders} o WHERE o.customer_id = {ALIAS_EXISTS}.id) FROM {customers} {ALIAS_EXISTS} \
+             WHERE {ALIAS_EXISTS}.name LIKE 'c%' AND {filter}"
+        )
+    };
+    for filter in [
+        format!("EXISTS (SELECT 1 FROM {orders} t WHERE {ALIAS_EXISTS}.id = t.customer_id AND t.amount = 7)"),
+        format!(
+            "EXISTS (SELECT 1 FROM {orders} t INNER JOIN cex_tags g ON g.id = 1 WHERE {ALIAS_EXISTS}.id = t.customer_id \
+             AND g.content IN ('x', 'z') AND t.amount = 7)"
+        ),
+        // As the SQL Server front end writes EF Core's `SELECT 1`.
+        format!("EXISTS (SELECT CAST(1 AS integer) FROM {orders} AS t WHERE {ALIAS_EXISTS}.id = t.customer_id AND t.amount = 7)"),
+    ] {
+        let sql = q(&filter);
+        let (got, runs) = answers(&db, &mut s, &sql, customers, ALIAS_EXISTS).await;
+        assert_eq!(got, want(tagged.iter().copied()), "{sql}");
+        assert_eq!(runs, 2 * tagged.len(), "{sql}");
+    }
+}
