@@ -114,7 +114,7 @@ pub(crate) use native_session::{
     parse_simple as native_parse_simple,
 };
 pub(crate) use native_session::{
-    DATABASE_PREFIX as NATIVE_DATABASE_PREFIX, MARK as NATIVE_MARK,
+    DATABASE_PREFIX as NATIVE_DATABASE_PREFIX, MARK as NATIVE_MARK, ROLE_PREFIX as NATIVE_ROLE_PREFIX,
     NOTICES_PREFIX as NATIVE_NOTICES_PREFIX, answer_marked as native_answer_marked,
     simple_complete as native_simple_complete, simple_error as native_simple_error,
     engine_notices_answer as native_engine_notices_answer, with_notices as native_with_notices,

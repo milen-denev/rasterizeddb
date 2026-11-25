@@ -77,7 +77,7 @@ raise `timeout` to match.
 |---|---|---|
 | `connections` | 1 | connections shared by every caller; each carries many statements at once |
 | `timeout` | 30 s | how long a statement waits for its answer, plus a 2 s grace (`None`: forever) |
-| `login` | `Trust` | `Trust`, `Peer`, `PeerAs(name)` or `Password { user, password }` (`Login::password`) |
+| `login` | `Trust` | `Trust`, `TrustAs(role)`, `Peer`, `PeerAs(name)` or `Password { user, password }` (`Login::password`). On a trust socket of a database with roles, `Trust` alone is no administrator and reaches only its own tables and what PUBLIC is granted: name a role with `TrustAs("rasterized")` |
 | `database` | `None` | the database every connection uses (`None`: the server's `--pg-default-db`); a password or peer login is checked against that database's roles |
 | `max_message_size` | 8 MiB | the largest answer accepted; a larger one fails whole ([`Error::is_message_too_large`](crate::Error::is_message_too_large)) and closes its connection |
 | `idle_reconnect` | 20 s | reopen a connection idle this long before using it, inside the server's 30 s idle close |

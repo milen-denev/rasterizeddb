@@ -51,10 +51,12 @@
 - **Over the SQL Server protocol, text columns are case-insensitive by default**, as under SQL Server's default `SQL_Latin1_General_CP1_CI_AS`: a `CREATE TABLE` or `ADD COLUMN` without a `COLLATE` gives a text column `rdb_ci`. `--mssql-collation bin` keeps the old byte comparison. Tables made over PostgreSQL, MySQL or the native protocol are unchanged.
 - `tinyint` (the engine's unsigned byte) is sent over the SQL Server protocol as TDS `INTN(1)`, and its PostgreSQL row description gives a type modifier of 1, not -1.
 - A `CREATE UNIQUE INDEX … WHERE …` over the SQL Server protocol ignored its filter and refused rows the filter leaves out; the filter is honoured now.
+- **A native trust connection that names no role is no longer an administrator** (roles plan R0: `trust` authenticates as the named role, never as an administrator by itself). In a database with roles, a `Login::Trust` connection on a `--rdb-socket-auth trust` socket now runs as nobody: role statements (`CREATE`/`ALTER USER`…), the server's administration (`BACKUP`, `STORAGE`, `CREATE DATABASE`…) and every table another role owns are refused; it keeps the tables it created itself and whatever PUBLIC is granted. Before, it was a superuser. A database with no roles at all is unchanged.
 - `STORAGE MOVE … TO 'kv:…'` said the table was no longer covered by backups. A backup copies it as of each snapshot, with no point-in-time replay, and the message now says so.
 
 ### Upgrade notes
 
+- **A native client on a trust socket names its role:** `Login::TrustAs("rasterized")` (rasterizeddb_client 1.0.2) in place of `Login::Trust`, with the role the application should run as; the server checks it exists and may log in, in the database the connection selects. An application whose tables another role owns (on a database opened by an earlier version, unowned tables are given to the bootstrap superuser at start) loses access to them under plain `Login::Trust`: switch to `TrustAs`, or `GRANT` what it needs to PUBLIC.
 - **No downgrade after a compressed value:** the first one adds `compressed_values_v1` to the directory's `incompat_features`, and an older build refuses to open that directory.
 
 ## 1.0.1 (2026-11-24: server, `rasterizeddb_core`, `rasterizeddb_client`) and `rasterizeddb_embedded` 1.1.0

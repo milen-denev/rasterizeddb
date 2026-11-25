@@ -181,6 +181,14 @@ impl AuthCache {
             g.remove(&(database.to_string(), role.to_string()));
         }
     }
+
+    /// Every cached key: a role statement changed some role's credentials
+    /// or attributes, and the next login of each reads them afresh.
+    pub fn clear(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.clear();
+        }
+    }
 }
 
 /// The virtual sessions a client session has open, by shard, for its
