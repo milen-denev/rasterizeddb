@@ -123,6 +123,10 @@
 //! idle for a few seconds ([`Builder::idle_trim`], on by default, glibc
 //! only).
 
+// The engine's statement futures nest deeply: as the core's own crates,
+// a compiler before 1.100 needs more room to normalise them.
+#![recursion_limit = "256"]
+
 mod settings;
 
 use std::io;
