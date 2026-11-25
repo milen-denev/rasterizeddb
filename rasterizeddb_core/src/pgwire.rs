@@ -5326,6 +5326,11 @@ pub(crate) async fn describe_query(
     if let std::borrow::Cow::Owned(text) = crate::core::sql_scan::plain_branch_parentheses(&catalog) {
         catalog = text;
     }
+    // `doc #>> ARRAY[…]`, as `rewrite_statement_text` reads it: with a
+    // placeholder's stand-in in it (`describe_for_wire`), a constant path.
+    if let std::borrow::Cow::Owned(text) = crate::core::sql_scan::json_path_arrays(&catalog) {
+        catalog = text;
+    }
     // `'t'::regclass` and the like, as `rewrite_statement_text` reads them.
     if let Ok(Some(text)) = crate::core::rql::reg_casts::rewrite(
         &catalog,
@@ -5499,6 +5504,8 @@ pub(crate) async fn describe_query(
                 described_all = false;
                 break;
             };
+            // As it runs (`lateral::materialize`).
+            let item = crate::core::rql::lateral::fold_inner_join_keys(&text, item, database);
             let body = match crate::core::rql::lateral::outer_references(&text, &item) {
                 Ok(Some(outer)) => crate::core::rql::lateral::null_body(database, &item, &outer).await.ok(),
                 Ok(None) => Some(item.body.clone()),
@@ -5965,6 +5972,19 @@ fn describe_aggregate_over_derived(stmt: &str) -> Option<Vec<(String, DbType)>> 
 /// describe-time parser cannot read is not a reason to answer "no columns".
 /// Returns `None` when there is no `WHERE` to drop, in which case the failure
 /// was something else and the caller should not pretend otherwise.
+/// `sql` without its top-level WHERE clause, the rest kept (GROUP BY,
+/// HAVING, ORDER BY, LIMIT): what a description reads is the same.
+fn without_where(sql: &str) -> Option<String> {
+    use crate::core::rql::join::find_keyword;
+    let at = find_keyword(sql, "WHERE", 0)?;
+    let end = ["GROUP", "HAVING", "WINDOW", "ORDER", "LIMIT", "OFFSET", "FETCH", "FOR"]
+        .iter()
+        .filter_map(|k| find_keyword(sql, k, at))
+        .min()
+        .unwrap_or(sql.len());
+    Some(format!("{} {}", sql[..at].trim_end(), &sql[end..]).trim_end().to_string())
+}
+
 fn describe_without_predicate(sql: &str) -> Option<String> {
     let at = crate::core::rql::join::find_keyword(sql, "WHERE", 0)?;
     Some(sql[..at].trim_end().to_string())
@@ -6230,8 +6250,17 @@ async fn describe_resolved(
                         .map(|t| t.schema().fields.clone())
                         .or_else(|| crate::core::rql::catalog_views::synthetic_schema(name))
                 };
+                // A WHERE changes no column: one the planner cannot read
+                // (an evaluated UUID comparison, as a LATERAL body's outer
+                // reference becomes `CAST(NULL AS uuid)` here) is described
+                // without it, rather than as rowless.
+                let first = crate::core::rql::join::first_branch(&qr.query);
+                let planned = crate::core::rql::join::plan_statement(&first, &schema_of).or_else(|e| match without_where(&first) {
+                    Some(reduced) => crate::core::rql::join::plan_statement(&reduced, &schema_of),
+                    None => Err(e),
+                });
                 return Ok(
-                    match crate::core::rql::join::plan_statement(&crate::core::rql::join::first_branch(&qr.query), &schema_of) {
+                    match planned {
                         Ok(plan) => Some((
                             join_output_columns(&plan, database)
                                 .into_iter()
@@ -6242,7 +6271,12 @@ async fn describe_resolved(
                                 .collect(),
                             true,
                         )),
-                        Err(_) => None,
+                        Err(e) => {
+                            // Described as rowless while it runs: the client
+                            // then gets rows with no description.
+                            log::debug!("a join could not be described: {e}: {}", qr.query);
+                            None
+                        }
                     },
                 );
             }
@@ -8486,6 +8520,11 @@ pub(crate) fn rewrite_statement_text<'a>(
     // `INSERT INTO t (SELECT …)` and `CREATE TABLE t AS (SELECT …)`: the
     // query in parentheses, the same way (`sql_scan::source_query_parentheses`).
     if let Cow::Owned(text) = crate::core::sql_scan::source_query_parentheses(&stmt) {
+        stmt = Cow::Owned(text);
+    }
+    // `doc #>> ARRAY['a', '0']` as the path literal `doc #>> '{a,0}'`
+    // (`sql_scan::json_path_arrays`), with bound values already in it.
+    if let Cow::Owned(text) = crate::core::sql_scan::json_path_arrays(&stmt) {
         stmt = Cow::Owned(text);
     }
     // `indkey::text` and the other vector columns, spaced as PostgreSQL
@@ -14824,6 +14863,10 @@ fn join_output_columns(
         };
         match database.schema_view(&relation.table) {
             Some(table) => reported_type_of(&item.field, &table.schema().json_columns),
+            // A derived table's relation is gone by the time this runs; its
+            // column still says whether it is a `timestamp`, which the raw
+            // stored type (`timestamptz`) does not.
+            None if fallback == DbType::DATETIME && item.field.without_time_zone => DbType::TIMESTAMP,
             None => fallback,
         }
     };
@@ -16675,6 +16718,9 @@ where
             Some(o) if oid == 25 && matches!(o.type_oid, 1043) => (o.type_oid, o.typmod),
             _ => (oid as i32, db_type.pg_typmod()),
         };
+        // An unsigned byte keeps its mark whatever the catalogue's column
+        // says (`db_type::U8_TYPMOD`): a SQL Server client reads a tinyint.
+        let typmod = if *db_type == DbType::U8 { crate::core::db_type::U8_TYPMOD } else { typmod };
 
         // table_oid
         payload.extend_from_slice(&origin.map_or(0, |o| o.table_oid).to_be_bytes());

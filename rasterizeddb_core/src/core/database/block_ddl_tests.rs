@@ -796,3 +796,40 @@ async fn a_new_step_never_takes_a_live_steps_number() {
     assert_eq!(ids(&db, "other").await, 1);
     shut(db, dir.path());
 }
+
+/// A block's COMMIT discards each step's held-aside copy with a bounded
+/// number of syncs per step, whatever the copy's file count. It opened a
+/// provider on every file only to delete it (a create, a file sync and a
+/// directory sync each), synced the directory per intent and rewrote the
+/// placements per copy: ~30 syncs per CREATE INDEX, so EF Core's
+/// EnsureCreated (92 tables, 128 indexes, one block) committed in 30-75 s
+/// and timed out SqlClient's commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blocks_commit_does_not_sync_per_copied_file() {
+    let dir = tempfile::tempdir().expect("dir");
+    let db = Arc::new(open(dir.path()).await);
+    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT, d INT, e INT, f INT, g INT)").await.expect("create");
+    let root = db.transactions.begin();
+    let statements: Vec<String> = ["a", "b", "c", "d", "e", "f", "g"]
+        .iter()
+        .map(|c| format!("CREATE INDEX t_{c} ON t ({c})"))
+        .collect();
+    let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
+    block_ddl(&db, root, &refs).await;
+    let watch = crate::core::sync_audit::watch(dir.path());
+    let _ = watch.take();
+    let db = end_block(db, root, End::Commit, dir.path()).await;
+    let syncs: Vec<_> = watch.take().into_iter().filter(|(tag, _)| *tag != "unlink").collect();
+    // The commit's own syncs (log, outcome, location) and per step at most
+    // its log barrier; a copy holds ~16 files.
+    assert!(
+        syncs.len() <= 8 + 3 * statements.len(),
+        "{} syncs for {} steps: {:?}",
+        syncs.len(),
+        statements.len(),
+        syncs.iter().map(|(t, _)| *t).collect::<Vec<_>>()
+    );
+    assert_eq!(index_names(&db, "t").len(), 7);
+    assert!(block_leftovers(dir.path()).is_empty(), "left behind: {:?}", block_leftovers(dir.path()));
+    shut(db, dir.path());
+}

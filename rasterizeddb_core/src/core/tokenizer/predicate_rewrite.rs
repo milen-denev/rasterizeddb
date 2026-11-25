@@ -4880,9 +4880,24 @@ fn lift_comparison(
     // Its `ESCAPE`, which nothing after a lifted operand reads, is folded
     // into the pattern here, in the backslash form the matcher reads: left
     // as written, `a LIKE 'a!%b%' ESCAPE '!'` was refused (42601).
-    let escaped = match &padded {
-        Some(_) => like_without_escape(rest)?,
-        None => None,
+    // An operand lifted as an expression (`CAST(c AS text) LIKE p ESCAPE
+    // '\\'`, which EF Core writes for a string Contains over a cast) needs
+    // the fold as much: the scan after it reads no ESCAPE (42601).
+    // Only for a pattern operator, which is all it reads: its lexer refuses
+    // what a pattern never holds (`||`), and called for every lifted
+    // comparison it failed `a IN ('ab' || '  ')` with "unexpected character
+    // '|'" (42601).
+    // A pattern it cannot read (`LIKE 'a' || '%'`) is left as written, as
+    // it was before the fold covered expressions, except under a
+    // `character(n)` operand, which always needed it.
+    let escaped = if !is_pattern_operator(rest) {
+        None
+    } else {
+        match like_without_escape(rest) {
+            Ok(folded) => folded,
+            Err(e) if padded.is_some() => return Err(e),
+            Err(_) => None,
+        }
     };
     let rest: &str = escaped.as_deref().unwrap_or(rest);
     let left_text: &str = padded.as_deref().unwrap_or(&body[..at]);

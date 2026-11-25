@@ -41,17 +41,27 @@ const VERSION_TEXT: &str =
 
 /// SQL Server's system databases are the default database here: a client
 /// connects to `master` to create or drop its own.
-fn resolve_database<'a>(shared: &'a Shared, name: &'a str) -> &'a str {
+fn resolve_database(shared: &Shared, name: &str) -> String {
     if name.is_empty()
         || matches!(
             name.to_ascii_lowercase().as_str(),
             "master" | "model" | "msdb" | "tempdb"
         )
     {
-        shared.catalog.default_name()
-    } else {
-        name
+        return shared.catalog.default_name().to_string();
     }
+    // SQL Server compares database names without case, and `CREATE DATABASE
+    // [DenevColors]` made `denevcolors`: a login naming `DenevColors` must
+    // open it.
+    if shared.catalog.get(name).is_some() {
+        return name.to_string();
+    }
+    shared
+        .catalog
+        .names()
+        .into_iter()
+        .find(|n| n.eq_ignore_ascii_case(name))
+        .unwrap_or_else(|| name.to_string())
 }
 
 /// What a statement leaves the batch doing.
@@ -75,9 +85,69 @@ struct Var {
 }
 
 /// The parameters of an `sp_executesql` (or prepared) statement.
+/// The spellings tables and columns were declared with, read from
+/// `translate::NAMES_TABLE`: per relation its own (`""`) and each column's,
+/// all keyed folded. Read again after this session's DDL, on another
+/// database, or after `NAMES_TTL` (another session's DDL).
+#[derive(Default)]
+struct NameCache {
+    database: usize,
+    read: Option<std::time::Instant>,
+    dirty: bool,
+    relations: HashMap<String, HashMap<String, String>>,
+    /// A column's spelling over every relation, where they agree (`None`
+    /// where two relations spell it differently).
+    columns: HashMap<String, Option<String>>,
+    /// A constraint's or index's spelling, by the engine's name for it.
+    objects: HashMap<String, String>,
+}
+
+/// `translate::NAMES_TABLE`'s `rel` for databases' names, in the default
+/// database.
+const DATABASES_REL: &str = "#databases";
+
+const NAMES_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl NameCache {
+    /// A result column's name as declared: an all-lower-case name the
+    /// engine reports (`SELECT *`, a plain column) shown with the spelling
+    /// every relation declared it with; any other name as it is.
+    fn column_shown(&self, name: &str) -> String {
+        if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            return name.to_string();
+        }
+        match self.columns.get(name) {
+            Some(Some(shown)) => shown.clone(),
+            _ => name.to_string(),
+        }
+    }
+
+    fn shown(&self, relation: &str, column: &str) -> Option<String> {
+        self.relations.get(relation)?.get(column).cloned()
+    }
+
+    /// A relation, constraint or column name an engine message quotes, as
+    /// declared: its dots real ones (`lex::NAME_DOT`).
+    fn table_shown(&self, relation: &str) -> String {
+        self.shown(relation, "").unwrap_or_else(|| lex::decode_dots(relation).into_owned())
+    }
+
+    fn object_shown(&self, name: &str) -> String {
+        self.objects.get(name).cloned().unwrap_or_else(|| lex::decode_dots(name).into_owned())
+    }
+
+    fn column_of(&self, relation: &str, column: &str) -> String {
+        self.shown(relation, column).unwrap_or_else(|| lex::decode_dots(column).into_owned())
+    }
+}
+
+/// A declared parameter: its name (without @), whether it is a string, the
+/// engine type sent for it (0: inferred), and whether it is a number.
+type Decl = (String, bool, u32, bool);
+
 struct ParamCtx {
     /// (name without @, string type, engine type)
-    decls: Vec<(String, bool, u32)>,
+    decls: Vec<Decl>,
     values: Vec<ParamValue>,
     /// The declarations the statement being translated used, in `$n` order.
     used: parking_lot::Mutex<Vec<usize>>,
@@ -87,7 +157,7 @@ struct ParamCtx {
 #[derive(Clone)]
 struct Prepared {
     sql: String,
-    decls: Vec<(String, bool, u32)>,
+    decls: Vec<Decl>,
 }
 
 /// What ends with a batch, a piece of dynamic SQL or a procedure.
@@ -197,6 +267,31 @@ struct Session {
     fmtonly: bool,
     /// The table an `INSERT BULK` named, which the next bulk load fills.
     bulk_target: Option<String>,
+    /// This connection, as the owner of its `sp_getapplock` locks.
+    conn_id: u64,
+    /// Whether each `$n` of the statement being forwarded is declared a
+    /// number (`inline_params` writes those bare, everything else quoted).
+    bound_numbers: Vec<bool>,
+    /// The declared spellings of tables and columns (`translate::NAMES_TABLE`).
+    names: NameCache,
+    /// The statement being forwarded's explicit aliases
+    /// (`Forward::aliases`): kept as typed in its COLMETADATA.
+    aliases: Vec<String>,
+    /// The statement being forwarded's verb (`INSERT`, `UPDATE`, …), as a
+    /// constraint violation's message names it ([`Session::engine_error`]).
+    verb: &'static str,
+    /// The current database's name as CREATE DATABASE declared it
+    /// (`Shared::database_names`); empty until read.
+    database_shown: String,
+    /// The database the login named, as it named it: a pooled connection's
+    /// reset goes back to it, as SQL Server's does after a `USE`.
+    login_shown: String,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        super::applock::release_all(self.conn_id, None);
+    }
 }
 
 pub(crate) async fn serve_connection(
@@ -230,6 +325,7 @@ pub(crate) async fn serve_connection(
     } else {
         login_packet.database.clone()
     };
+    let conn_id = crate::sqlcompat::next_connection_id();
     let mut session = Session {
         wire,
         shared: shared.clone(),
@@ -264,12 +360,16 @@ pub(crate) async fn serve_connection(
         session_temps: Vec::new(),
         routine_cache: None,
         rpc_outputs: Vec::new(),
-        temp_prefix: crate::sqlcompat::temp_table_prefix(
-            "tds",
-            crate::sqlcompat::next_connection_id(),
-        ),
+        temp_prefix: crate::sqlcompat::temp_table_prefix("tds", conn_id),
         fmtonly: false,
         bulk_target: None,
+        conn_id,
+        login_shown: shown.clone(),
+        bound_numbers: Vec::new(),
+        names: NameCache::default(),
+        aliases: Vec::new(),
+        verb: "INSERT",
+        database_shown: String::new(),
     };
     let packet_size = match login_packet.packet_size {
         0 => tds::DEFAULT_PACKET,
@@ -547,11 +647,21 @@ struct Scope<'a> {
 }
 
 impl Env for Scope<'_> {
+    fn shown(&self, relation: &str, column: Option<&str>) -> Option<String> {
+        self.s.names.relations.get(relation)?.get(column.unwrap_or("")).cloned()
+    }
+    fn case_insensitive(&self) -> bool {
+        self.s.shared.config.case_insensitive
+    }
     fn database(&self) -> &Arc<Database> {
         &self.s.bridge.as_ref().unwrap().database
     }
     fn database_name(&self) -> &str {
-        &self.s.bridge.as_ref().unwrap().database_name
+        if self.s.database_shown.is_empty() {
+            &self.s.bridge.as_ref().unwrap().database_name
+        } else {
+            &self.s.database_shown
+        }
     }
     fn user(&self) -> &str {
         &self.s.login.user
@@ -563,7 +673,10 @@ impl Env for Scope<'_> {
             protocol: "tds",
             superuser: self.s.login.superuser,
         };
-        crate::core::policy_hooks::visible_databases(&ctx, self.s.shared.catalog.names())
+        let visible = crate::core::policy_hooks::visible_databases(&ctx, self.s.shared.catalog.names());
+        // Each as it was declared (`CREATE DATABASE [MyApp]`).
+        let shown = self.s.shared.database_names.lock();
+        visible.into_iter().map(|n| shown.as_ref().and_then(|m| m.get(&n).cloned()).unwrap_or(n)).collect()
     }
     fn variable(&self, name: &str) -> Option<Value> {
         self.s.vars.get(name).map(|v| v.value.clone())
@@ -708,6 +821,30 @@ fn error_from_engine(n: &PgNotice) -> TsqlError {
     }
 }
 
+/// The `"…"`-quoted names of an engine message, in order.
+fn quoted_names(message: &str) -> Vec<&str> {
+    message.split('"').skip(1).step_by(2).collect()
+}
+
+/// A duplicate's values from the engine's `…: a = 'x', b = 2` tail, as
+/// SQL Server lists them (`x, 2`).
+fn duplicate_values(message: &str) -> Option<String> {
+    let (_, tail) = message.split_once("): ")?;
+    let tail = tail.split("; the row being updated is").next().unwrap_or(tail);
+    let mut values = Vec::new();
+    for part in tail.split(", ") {
+        let (column, v) = part.split_once(" = ")?;
+        // A case-insensitive key compares its folded companion, whose
+        // value is not the one written: none shown rather than a wrong one.
+        if column.starts_with("__ci_") {
+            return None;
+        }
+        let v = v.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')).unwrap_or(v);
+        values.push(v.replace("''", "'"));
+    }
+    Some(values.join(", "))
+}
+
 fn isolation_words(level: u8) -> Option<&'static str> {
     Some(match level {
         1 => "READ UNCOMMITTED",
@@ -732,7 +869,7 @@ fn value_of(oid: u32, text: Option<String>) -> Value {
 }
 
 /// `@a int, @b nvarchar(10) OUTPUT` as (name, string, oid).
-fn parse_declarations(text: &str) -> Result<Vec<(String, bool, u32)>, TsqlError> {
+fn parse_declarations(text: &str) -> Result<Vec<Decl>, TsqlError> {
     let tokens = lex::lex(text).map_err(|e| TsqlError::syntax(e.0))?;
     let mut out = Vec::new();
     for part in split_commas(&tokens) {
@@ -753,7 +890,11 @@ fn parse_declarations(text: &str) -> Result<Vec<(String, bool, u32)>, TsqlError>
             "VARBINARY" | "BINARY" | "IMAGE" => 17,
             _ => 0,
         };
-        out.push((name.clone(), string, oid));
+        let number = matches!(
+            ty.as_str(),
+            "TINYINT" | "SMALLINT" | "INT" | "BIGINT" | "DECIMAL" | "NUMERIC" | "MONEY" | "SMALLMONEY" | "FLOAT" | "REAL"
+        );
+        out.push((name.clone(), string, oid, number));
     }
     Ok(out)
 }
@@ -763,16 +904,105 @@ impl Session {
         self.bridge.as_mut().expect("an open session has a bridge")
     }
 
-    async fn open(&mut self, database: &str) -> Result<(), TsqlError> {
+    fn bridge_options(&self, database: &str) -> BridgeOptions {
         let mut parameters = HashMap::new();
         parameters.insert("database".to_string(), database.to_string());
-        let options = BridgeOptions {
+        BridgeOptions {
             login: self.login.clone(),
             limits: self.shared.config.limits,
             watch: self.peer_watch.clone(),
             parameters,
             lenient_booleans: false,
+        }
+    }
+
+    /// `writes`, then `read`, on the default database: where databases'
+    /// declared names are kept, whichever this session is in. Over a bridge
+    /// of its own when the session is elsewhere. `None` when it could not
+    /// be reached or the read failed.
+    async fn on_default(&mut self, writes: &[String], read: Option<&str>) -> Option<Vec<Vec<Option<String>>>> {
+        let default = self.shared.catalog.default_name().to_string();
+        let away = self.bridge.as_ref().is_some_and(|b| b.database_name != default);
+        let main = if away {
+            let side = PgBridge::open(self.shared.catalog.clone(), &default, self.bridge_options(&default)).await.ok()?;
+            Some(self.bridge.replace(side))
+        } else {
+            None
         };
+        for w in writes {
+            if let Err(e) = self.silent(w).await {
+                log::warn!("SQL Server session: recording a database's name failed: {}", e.message);
+            }
+        }
+        let rows = match read {
+            Some(sql) => self.fetch(sql, &[]).await.ok().map(|(_, rows)| rows),
+            None => Some(Vec::new()),
+        };
+        if let Some(main) = main {
+            if let Some(side) = std::mem::replace(&mut self.bridge, main) {
+                side.terminate().await;
+            }
+        }
+        rows
+    }
+
+    /// Databases' declared names (`Shared::database_names`), read from the
+    /// default database the first time.
+    async fn database_names(&mut self) -> HashMap<String, String> {
+        if let Some(m) = self.shared.database_names.lock().clone() {
+            return m;
+        }
+        let default = self.shared.catalog.default_name().to_string();
+        let has = self.shared.catalog.get(&default).is_some_and(|d| d.has_table(translate::NAMES_TABLE));
+        let mut map = HashMap::new();
+        if has {
+            let read = format!("SELECT col, shown FROM {} WHERE rel = '{DATABASES_REL}'", translate::NAMES_TABLE);
+            let Some(rows) = self.on_default(&[], Some(&read)).await else {
+                return map;
+            };
+            for row in rows {
+                if let [Some(name), Some(shown)] = [row.first().cloned().flatten(), row.get(1).cloned().flatten()] {
+                    map.insert(name, shown);
+                }
+            }
+        }
+        *self.shared.database_names.lock() = Some(map.clone());
+        map
+    }
+
+    /// A CREATE DATABASE's spelling recorded, or a DROP's forgotten.
+    async fn record_database(&mut self, name: &str, created: bool) {
+        let _ = self.database_names().await;
+        let key = name.to_lowercase();
+        let names = translate::NAMES_TABLE;
+        let writes = if created {
+            vec![
+                format!("CREATE TABLE IF NOT EXISTS {names} (rel text NOT NULL, col text NOT NULL, shown text NOT NULL, PRIMARY KEY (rel, col))"),
+                format!(
+                    "INSERT INTO {names} (rel, col, shown) VALUES ('{DATABASES_REL}', {}, {}) ON CONFLICT (rel, col) DO UPDATE SET shown = excluded.shown",
+                    translate::sql_str(&key),
+                    translate::sql_str(name)
+                ),
+            ]
+        } else if self.shared.catalog.get(self.shared.catalog.default_name()).is_some_and(|d| d.has_table(names)) {
+            vec![format!("DELETE FROM {names} WHERE rel = '{DATABASES_REL}' AND col = {}", translate::sql_str(&key))]
+        } else {
+            Vec::new()
+        };
+        if !writes.is_empty() {
+            let _ = self.on_default(&writes, None).await;
+        }
+        if let Some(m) = self.shared.database_names.lock().as_mut() {
+            if created {
+                m.insert(key, name.to_string());
+            } else {
+                m.remove(&key);
+            }
+        }
+    }
+
+    async fn open(&mut self, database: &str) -> Result<(), TsqlError> {
+        let options = self.bridge_options(database);
         match PgBridge::open(self.shared.catalog.clone(), database, options).await {
             Ok(b) => {
                 // What this database made of the login (its own role's
@@ -857,6 +1087,10 @@ impl Session {
                     self.final_done();
                 }
             }
+            // A transaction's application locks go with it.
+            if self.trancount == 0 && !self.bridge().in_block() {
+                super::applock::release_all(self.conn_id, Some(super::applock::Owner::Transaction));
+            }
             self.wire.send(tds::PT_REPLY).await?;
             // An attention sent while the request ran is answered after it.
             if self.wire.attention_buffered() {
@@ -892,6 +1126,15 @@ impl Session {
         self.error_number = 0;
         if !self.bridge().in_block() {
             let _ = self.silent("RESET ALL").await;
+            let login_db = resolve_database(&self.shared, &self.login_shown);
+            let old = self.bridge().database_name.clone();
+            if old != login_db && self.shared.catalog.get(&login_db).is_some() {
+                self.prepared.clear();
+                if self.open(&login_db).await.is_ok() {
+                    let shown = self.login_shown.clone();
+                    tds::env_change_text(self.wire.reply(), 1, &shown, &old);
+                }
+            }
         }
     }
 
@@ -1098,6 +1341,10 @@ impl Session {
             }
         }
         let mut columns: Option<Vec<Column>> = None;
+        // A bound SELECT whose rows came with no description: run again
+        // with its values written in (`inline_params`), as nothing has
+        // reached the client yet.
+        let mut undescribed = false;
         // Numeric columns with no declared scale: rows held until their
         // scale is known.
         let mut held: Option<Vec<Vec<Option<Vec<u8>>>>> = None;
@@ -1125,6 +1372,11 @@ impl Session {
                                 // unnamed.
                                 name: if f.name == "?column?" {
                                     String::new()
+                                } else if f.table_oid != 0 && !self.aliases.iter().any(|a| *a == f.name) {
+                                    // A table's column read as it is (`SELECT *`, an
+                                    // unaliased column): its declared spelling. Never
+                                    // an alias, which is the client's own.
+                                    self.names.column_shown(&f.name)
                                 } else {
                                     f.name.clone()
                                 },
@@ -1133,6 +1385,7 @@ impl Session {
                                     scale: 0,
                                 }),
                                 oid: f.type_oid,
+                                identity: false,
                             }
                         })
                         .collect();
@@ -1142,6 +1395,7 @@ impl Session {
                             name: name.clone(),
                             ty: ColType::Int(4),
                             oid: 23,
+                            identity: false,
                         });
                     }
                     if !capture {
@@ -1152,6 +1406,9 @@ impl Session {
                         }
                     }
                     columns = Some(cols);
+                }
+                b'D' if columns.is_none() && !capture && !params.is_empty() => {
+                    undescribed = true;
                 }
                 b'D' => {
                     let cells = data_row_cells(frame.body)?;
@@ -1213,6 +1470,30 @@ impl Session {
                 b'Z' => break,
                 _ => {}
             }
+        }
+        if undescribed && error.is_none() {
+            // The engine described the bound statement as rowless and then
+            // returned rows: a client given rows with no COLMETADATA loses
+            // the connection. The same statement as text is described, so
+            // it runs again that way, once nothing it does can differ:
+            // a plain read, no volatile call. Logged, as each such shape is
+            // a describe gap to close.
+            let rerun = is_plain_select(sql) && !calls_volatile(sql);
+            if let Some(text) = rerun.then(|| inline_params(sql, params, &self.bound_numbers)).flatten() {
+                log::warn!("SQL Server session: a bound SELECT was described as rowless and runs again with its values inlined: {sql}");
+                return Box::pin(self.exchange(&text, &[], capture, extra)).await;
+            }
+            log::warn!("SQL Server session: a bound statement was described as rowless and returned rows: {sql}");
+            return Ok(Outcome::Failed(
+                PgNotice {
+                    code: "0A000".into(),
+                    message: "this statement's result columns could not be described with its parameters bound; \
+                              it is not supported yet with parameters"
+                        .into(),
+                    ..Default::default()
+                },
+                false,
+            ));
         }
         if let (Some(rows), Some(cols)) = (held, columns.as_mut()) {
             // The scale of each undeclared numeric: the most any value has.
@@ -1305,7 +1586,7 @@ impl Session {
                 Some(level) => format!("BEGIN ISOLATION LEVEL {level}"),
                 None => "BEGIN".into(),
             };
-            self.silent(&sql).await.map_err(|e| error_from_engine(&e))?;
+            self.silent(&sql).await.map_err(|e| self.engine_error(&e))?;
         }
         self.trancount += 1;
         self.sync_transaction(true);
@@ -1324,7 +1605,7 @@ impl Session {
             let tag = self
                 .silent("COMMIT")
                 .await
-                .map_err(|e| error_from_engine(&e));
+                .map_err(|e| self.engine_error(&e));
             let rolled_back = matches!(&tag, Ok(t) if t == "ROLLBACK");
             self.sync_transaction(!rolled_back);
             tag?;
@@ -1345,7 +1626,7 @@ impl Session {
                 self.savepoints.truncate(pos + 1);
                 self.silent(&format!("ROLLBACK TO SAVEPOINT {}", ident_sql(&lower)))
                     .await
-                    .map_err(|e| error_from_engine(&e))?;
+                    .map_err(|e| self.engine_error(&e))?;
                 return Ok(());
             }
         }
@@ -1358,7 +1639,7 @@ impl Session {
         let r = self
             .silent("ROLLBACK")
             .await
-            .map_err(|e| error_from_engine(&e));
+            .map_err(|e| self.engine_error(&e));
         self.trancount = 0;
         self.sync_transaction(false);
         r.map(|_| ())
@@ -1372,6 +1653,9 @@ impl Session {
         params: Option<&ParamCtx>,
     ) -> io::Result<Result<(), TsqlError>> {
         let ddl = forward.kind == Kind::Ddl;
+        if ddl {
+            self.names.dirty = true;
+        }
         if self.bridge().status == b'E' {
             log::warn!("SQL Server session: a failed transaction was found open; rolling it back");
             let _ = self.silent("ROLLBACK").await;
@@ -1388,7 +1672,7 @@ impl Session {
                 .silent(&format!("SAVEPOINT {STATEMENT_SAVEPOINT}"))
                 .await
             {
-                return Ok(Err(error_from_engine(&e)));
+                return Ok(Err(self.engine_error(&e)));
             }
         }
         let bound: Vec<(i16, Option<Vec<u8>>, u32)> = match params {
@@ -1409,13 +1693,34 @@ impl Session {
                 .collect(),
             None => Vec::new(),
         };
-        let capture = matches!(forward.kind, Kind::Insert { identity: Some(_) });
+        self.bound_numbers = match params {
+            Some(p) => p.used.lock().iter().map(|&k| p.decls[k].3).collect(),
+            None => Vec::new(),
+        };
+        let capture = matches!(forward.kind, Kind::Insert { identity: Some(_), .. });
         let mut last = None;
         let mut affected = 0u64;
+        self.aliases = forward.aliases.clone();
+        // The statement's verb, as SQL Server's messages name it.
+        self.verb = forward
+            .statements
+            .iter()
+            .rev()
+            .find(|s| !s.is_empty())
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|w| ["INSERT", "UPDATE", "DELETE", "MERGE"].into_iter().find(|v| w.eq_ignore_ascii_case(v)))
+            .unwrap_or("INSERT");
         for sql in forward.statements.iter().filter(|s| !s.is_empty()) {
             let outcome = self
                 .exchange(sql, &bound, capture, forward.extra_column.as_ref())
-                .await?;
+                .await;
+            let outcome = match outcome {
+                Ok(o) => o,
+                Err(e) => {
+                    self.aliases.clear();
+                    return Err(e);
+                }
+            };
             let failed = matches!(outcome, Outcome::Failed(..));
             if let Outcome::Done { tag, .. } = &outcome {
                 affected += tag_count(tag).unwrap_or(0);
@@ -1425,13 +1730,14 @@ impl Session {
                 break;
             }
         }
+        self.aliases.clear();
         let outcome = last.unwrap_or(Outcome::Done {
             tag: String::new(),
             identity: None,
         });
         match outcome {
             Outcome::Failed(n, started) => {
-                let mut e = error_from_engine(&n);
+                let mut e = self.engine_error(&n);
                 if started {
                     // The result had begun: it is ended here, with its
                     // error, before anything else is written.
@@ -1480,6 +1786,12 @@ impl Session {
                         .silent(&format!("RELEASE SAVEPOINT {STATEMENT_SAVEPOINT}"))
                         .await;
                 }
+                if let Kind::Insert { written: Some((table, column)), .. } = &forward.kind {
+                    self.advance_identity(table, column).await;
+                }
+                if let Some((name, created)) = &forward.database {
+                    self.record_database(name, *created).await;
+                }
                 if let Some(id) = identity {
                     self.last_identity = Some(id);
                 }
@@ -1513,6 +1825,7 @@ impl Session {
     // -----------------------------------------------------------------------
 
     async fn sql_batch(&mut self, message: &Message) -> io::Result<()> {
+        self.ensure_names().await;
         let mut r = Reader::new(&message.payload);
         if message.payload.len() >= 4 {
             let total = u32::from_le_bytes(message.payload[0..4].try_into().unwrap()) as usize;
@@ -1707,7 +2020,7 @@ impl Session {
         let (_, rows) = self
             .fetch(&sql, &bound)
             .await
-            .map_err(|e| error_from_engine(&e))?;
+            .map_err(|e| self.engine_error(&e))?;
         Ok(rows
             .first()
             .and_then(|r| r.first().cloned().flatten())
@@ -1767,7 +2080,7 @@ impl Session {
         let (oids, rows) = self
             .fetch(&sql, &bound)
             .await
-            .map_err(|e| error_from_engine(&e))?;
+            .map_err(|e| self.engine_error(&e))?;
         Ok(value_of(
             oids.first().copied().unwrap_or(25),
             rows.first().and_then(|r| r.first().cloned()).flatten(),
@@ -1822,6 +2135,7 @@ impl Session {
             return Ok(Ok(Flow::Next));
         }
         if self.fmtonly && head == "SELECT" {
+            self.ensure_names().await;
             if let Some(columns) = self.declared_columns(tokens) {
                 tds::col_metadata(self.wire.reply(), &columns);
                 self.statement_done(if self.nocount { 0 } else { tds::DONE_COUNT }, 0xc1, 0);
@@ -1988,7 +2302,7 @@ impl Session {
                     let r = self
                         .silent(&format!("SAVEPOINT {}", ident_sql(&name)))
                         .await
-                        .map_err(|e| error_from_engine(&e));
+                        .map_err(|e| self.engine_error(&e));
                     if r.is_ok() {
                         self.savepoints.push(name);
                     }
@@ -2178,7 +2492,7 @@ impl Session {
         let (oids, rows) = self
             .fetch(&sql, &bound)
             .await
-            .map_err(|e| error_from_engine(&e))?;
+            .map_err(|e| self.engine_error(&e))?;
         if accumulates && rows.len() > 1 {
             return Err(TsqlError::unsupported(
                 "SELECT @v = … @v … over more than one row (it folds row by row; use STRING_AGG or SUM)",
@@ -2296,6 +2610,7 @@ impl Session {
         if old != db {
             self.prepared.clear();
             self.open(db).await?;
+            self.database_shown = self.database_names().await.get(db).cloned().unwrap_or_default();
         }
         tds::env_change_text(self.wire.reply(), 1, shown, &old);
         self.info_token(5701, &format!("Changed database context to '{shown}'."));
@@ -2329,7 +2644,7 @@ impl Session {
                     "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL {level}"
                 ))
                 .await
-                .map_err(|e| error_from_engine(&e))?;
+                .map_err(|e| self.engine_error(&e))?;
             }
             "LOCK_TIMEOUT" => {
                 let ms: i64 = tokens
@@ -2349,7 +2664,7 @@ impl Session {
                 let value = if ms < 0 { 0 } else { ms.max(1) };
                 self.silent(&format!("SET lock_timeout = {value}"))
                     .await
-                    .map_err(|e| error_from_engine(&e))?;
+                    .map_err(|e| self.engine_error(&e))?;
             }
             "ROWCOUNT" => {
                 let n = render_value(&tokens[2..]).unwrap_or_default();
@@ -2521,11 +2836,14 @@ impl Session {
                     .and_then(|v| v.text())
                     .unwrap_or_default()
                     .to_ascii_uppercase();
-                let parts: Vec<String> = old
-                    .split('.')
-                    .map(|p| p.trim_matches(['[', ']']).to_lowercase())
+                let parts: Vec<String> = lex::name_parts(&old)
+                    .into_iter()
+                    .map(|p| p.to_lowercase())
                     .filter(|p| p != "dbo")
                     .collect();
+                let new = lex::encode_dots(new.trim_matches(['[', ']']).to_string());
+                // The declared spellings follow the rename (`NAMES_TABLE`).
+                let record = translate::rename_records(&parts, &new, &kind);
                 let sql = if kind == "COLUMN" && parts.len() >= 2 {
                     format!(
                         "ALTER TABLE {} RENAME COLUMN {} TO {}",
@@ -2533,8 +2851,16 @@ impl Session {
                         ident_sql(&parts[parts.len() - 1]),
                         ident_sql(&new.to_lowercase())
                     )
+                } else if kind == "INDEX" && parts.len() >= 2 {
+                    // Index names are stored per table (`<table>__<name>`).
+                    let table = &parts[parts.len() - 2];
+                    format!(
+                        "ALTER INDEX {} RENAME TO {}",
+                        ident_sql(&crate::sqlcompat::index_name(table, &parts[parts.len() - 1])),
+                        ident_sql(&crate::sqlcompat::index_name(table, &new))
+                    )
                 } else if kind == "INDEX" {
-                    return Err(TsqlError::unsupported("sp_rename of an index"));
+                    return Err(TsqlError::syntax("sp_rename of an index needs N'table.index'"));
                 } else {
                     format!(
                         "ALTER TABLE {} RENAME TO {}",
@@ -2542,7 +2868,31 @@ impl Session {
                         ident_sql(&new.to_lowercase())
                     )
                 };
-                self.silent(&sql).await.map_err(|e| error_from_engine(&e))?;
+                self.silent(&sql).await.map_err(|e| self.engine_error(&e))?;
+                for r in &record {
+                    // A rename of a table this protocol did not record
+                    // (no names table yet) records it now.
+                    let _ = self.silent(r).await;
+                }
+                self.names.dirty = true;
+                self.statement_done(0, 0, 0);
+                Ok(Flow::Next)
+            }
+            "sp_rdb_record_names" => {
+                // The declared names a script would have recorded, for a
+                // database made before they were (`names_from_script`).
+                let script = values
+                    .first()
+                    .or_else(|| named.iter().find(|(n, _)| n.as_deref() == Some("script")).map(|(_, v)| v))
+                    .and_then(|v| v.text())
+                    .unwrap_or_default();
+                let statements = translate::names_from_script(&script, &Scope { s: self, params: None })?;
+                for sql in &statements {
+                    self.silent(sql).await.map_err(|e| self.engine_error(&e))?;
+                }
+                self.names.dirty = true;
+                let recorded = statements.iter().filter(|s| s.starts_with("INSERT INTO")).count();
+                self.info_token(0, &format!("Declared names recorded from {recorded} statement(s)."));
                 self.statement_done(0, 0, 0);
                 Ok(Flow::Next)
             }
@@ -2557,6 +2907,76 @@ impl Session {
                     })
                     .unwrap_or_default();
                 self.table_collations(&table).await
+            }
+            "sp_getapplock" | "sp_releaseapplock" | "applock_test" => {
+                let arg = |n: &str, at: usize| -> Option<String> {
+                    named
+                        .iter()
+                        .find(|(k, _)| k.as_deref() == Some(n))
+                        .map(|(_, v)| v)
+                        .or_else(|| values.get(at))
+                        .and_then(|v| v.text())
+                };
+                let releasing = name == "sp_releaseapplock";
+                let resource = arg("resource", 0).ok_or_else(|| {
+                    TsqlError::new(201, &format!("Procedure or function '{name}' expects parameter '@Resource', which was not supplied."))
+                })?;
+                let (mode_at, owner_at) = if releasing { (usize::MAX, 1) } else { (1, 2) };
+                let mode = arg("lockmode", mode_at).unwrap_or_default().to_ascii_lowercase();
+                if !releasing && mode.is_empty() {
+                    return Err(TsqlError::new(201, &format!("Procedure or function '{name}' expects parameter '@LockMode', which was not supplied.")));
+                }
+                let owner = match arg("lockowner", owner_at)
+                    .unwrap_or_else(|| "Transaction".into())
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "session" => super::applock::Owner::Session,
+                    "transaction" => super::applock::Owner::Transaction,
+                    other => {
+                        return Err(TsqlError::new(
+                            1222,
+                            &format!("The parameter @LockOwner '{other}' is not valid."),
+                        ));
+                    }
+                };
+                if owner == super::applock::Owner::Transaction
+                    && self.trancount == 0
+                    && !self.bridge().in_block()
+                {
+                    return Err(TsqlError::new(
+                        1223,
+                        &format!(
+                            "Cannot {} the application lock (Database Principal: 'public', Resource: '{resource}') because there is not a current transaction.",
+                            if releasing { "release" } else { "acquire" }
+                        ),
+                    ));
+                }
+                let db = Arc::as_ptr(&self.bridge().database) as usize;
+                let status = if name == "applock_test" {
+                    i32::from(!super::applock::holds(db, &resource, self.conn_id))
+                } else if releasing {
+                    let r = super::applock::release(db, &resource, self.conn_id, owner);
+                    if r < 0 {
+                        return Err(TsqlError::new(
+                            1223,
+                            &format!("Cannot release the application lock (Database Principal: 'public', Resource: '{resource}') because it is not currently held."),
+                        ));
+                    }
+                    r
+                } else {
+                    let timeout = arg("locktimeout", 3)
+                        .and_then(|t| t.trim().parse::<i64>().ok())
+                        .filter(|t| *t >= 0)
+                        .map(|t| std::time::Duration::from_millis(t as u64));
+                    let shared = matches!(mode.as_str(), "shared" | "intentshared");
+                    super::applock::get(db, &resource, self.conn_id, owner, shared, timeout).await
+                };
+                if let Some(var) = status_var {
+                    self.assign(&var, Value::Int(status as i64))?;
+                }
+                self.statement_done(0, 0, 0);
+                Ok(Flow::Next)
             }
             "sp_reset_connection" | "sp_set_session_context" | "sp_setapprole" => {
                 self.statement_done(0, 0, 0);
@@ -2617,6 +3037,7 @@ impl Session {
     // -----------------------------------------------------------------------
 
     async fn rpc(&mut self, message: &Message) -> io::Result<()> {
+        self.ensure_names().await;
         let mut r = Reader::new(&message.payload);
         if message.payload.len() >= 4 {
             let total = u32::from_le_bytes(message.payload[0..4].try_into().unwrap()) as usize;
@@ -2834,7 +3255,7 @@ impl Session {
     async fn run_rpc_batch(
         &mut self,
         sql: &str,
-        decls: Vec<(String, bool, u32)>,
+        decls: Vec<Decl>,
         values: Vec<ParamValue>,
     ) -> io::Result<Result<(), TsqlError>> {
         let ctx = ParamCtx {
@@ -2906,7 +3327,7 @@ impl Session {
                 let res = self
                     .silent(&format!("SAVEPOINT {}", ident_sql(&name)))
                     .await
-                    .map_err(|e| error_from_engine(&e));
+                    .map_err(|e| self.engine_error(&e));
                 if res.is_ok() {
                     self.savepoints.push(name);
                 }
@@ -3064,7 +3485,7 @@ impl Session {
         for sql in forward.statements {
             self.silent_guarded(&sql)
                 .await
-                .map_err(|e| error_from_engine(&e))?;
+                .map_err(|e| self.engine_error(&e))?;
         }
         Ok(())
     }
@@ -3275,7 +3696,7 @@ impl Session {
                 let (fields, rows) = self
                     .fetch_fields(&sql, &bound)
                     .await
-                    .map_err(|e| error_from_engine(&e))?;
+                    .map_err(|e| self.engine_error(&e))?;
                 if let Some(c) = self.cursors.get_mut(&name) {
                     c.open = Some(CursorRows {
                         fields,
@@ -3373,6 +3794,7 @@ impl Session {
                     }
                 }),
                 oid: f.type_oid,
+                identity: false,
             })
             .collect();
         tds::col_metadata(self.wire.reply(), &cols);
@@ -3455,7 +3877,7 @@ impl Session {
                 crate::sqlcompat::string_sql(name.as_bytes())
             ))
             .await
-            .map_err(|e| error_from_engine(&e))?;
+            .map_err(|e| self.engine_error(&e))?;
         Ok(rows
             .into_iter()
             .next()
@@ -3505,7 +3927,7 @@ impl Session {
         if !self.has_routine_table() {
             self.system_guarded(routines::CREATE_ROUTINE_TABLE)
                 .await
-                .map_err(|e| error_from_engine(&e))?;
+                .map_err(|e| self.engine_error(&e))?;
         }
         let (_, rows) = self
             .system_fetch_guarded(&format!(
@@ -3513,7 +3935,7 @@ impl Session {
                 crate::sqlcompat::string_sql(def.name.as_bytes())
             ))
             .await
-            .map_err(|e| error_from_engine(&e))?;
+            .map_err(|e| self.engine_error(&e))?;
         let existing = rows
             .into_iter()
             .next()
@@ -3541,7 +3963,7 @@ impl Session {
         };
         self.system_fetch_guarded(&sql)
             .await
-            .map_err(|e| error_from_engine(&e))?;
+            .map_err(|e| self.engine_error(&e))?;
         self.routine_cache = None;
         Ok(())
     }
@@ -3569,7 +3991,7 @@ impl Session {
                         crate::sqlcompat::string_sql(name.as_bytes())
                     ))
                     .await
-                    .map_err(|e| error_from_engine(&e))?;
+                    .map_err(|e| self.engine_error(&e))?;
                 tag_count(&tag).unwrap_or(0)
             } else {
                 0
@@ -3758,7 +4180,7 @@ impl Session {
             let (f, r, tag) = self
                 .query_bound(&sql, &bound)
                 .await
-                .map_err(|e| error_from_engine(&e))?;
+                .map_err(|e| self.engine_error(&e))?;
             last = (f, r, tag_count(&tag).unwrap_or(0));
         }
         Ok(last)
@@ -3787,7 +4209,7 @@ impl Session {
             "BEGIN"
         })
         .await
-        .map_err(|e| error_from_engine(&e))?;
+        .map_err(|e| self.engine_error(&e))?;
         let r = self.merge_steps(&m, pk.as_deref(), params).await;
         let end = match (&r, outer) {
             (Ok(_), true) => "RELEASE SAVEPOINT rdb_tds_merge",
@@ -3800,7 +4222,7 @@ impl Session {
             let _ = self.silent("RELEASE SAVEPOINT rdb_tds_merge").await;
         }
         let n = r?;
-        ended.map_err(|e| error_from_engine(&e))?;
+        ended.map_err(|e| self.engine_error(&e))?;
         self.rowcount = n as i64;
         self.statement_done(if self.nocount { 0 } else { tds::DONE_COUNT }, 0xc1, n);
         Ok(Flow::Next)
@@ -3888,7 +4310,7 @@ impl Session {
                 let tag = self
                     .silent(&format!("INSERT INTO {table} DEFAULT VALUES"))
                     .await
-                    .map_err(|e| error_from_engine(&e))?;
+                    .map_err(|e| self.engine_error(&e))?;
                 total += tag_count(&tag).unwrap_or(0);
             }
             return Ok(total);
@@ -3954,7 +4376,7 @@ impl Session {
             let (_, _, tag) = self
                 .query_bound(&sql, &bound)
                 .await
-                .map_err(|e| error_from_engine(&e))?;
+                .map_err(|e| self.engine_error(&e))?;
             total += tag_count(&tag).unwrap_or(0);
         }
         Ok(total)
@@ -3984,6 +4406,7 @@ impl Session {
     }
 
     async fn bulk_load(&mut self, message: &Message) -> Result<u64, TsqlError> {
+        self.verb = "INSERT";
         let table = self.bulk_target.take().ok_or_else(|| {
             TsqlError::new(
                 4022,
@@ -4013,7 +4436,7 @@ impl Session {
             "BEGIN"
         })
         .await
-        .map_err(|e| error_from_engine(&e))?;
+        .map_err(|e| self.engine_error(&e))?;
         let mut total = 0u64;
         let mut failed = None;
         for chunk in rows.chunks(per) {
@@ -4055,26 +4478,216 @@ impl Session {
             let _ = self.silent("RELEASE SAVEPOINT rdb_tds_bulk").await;
         }
         if let Some(e) = failed {
-            return Err(error_from_engine(&e));
+            return Err(self.engine_error(&e));
         }
-        ended.map_err(|e| error_from_engine(&e))?;
+        ended.map_err(|e| self.engine_error(&e))?;
+        // SqlBulkCopy with KeepIdentity (and bcp -E) write the identity
+        // column: its counter moves past them, as SQL Server's does.
+        let identity = translate::identity_column(&self.bridge().database, &table);
+        if let Some(column) = identity.filter(|c| columns.iter().any(|b| b.name.eq_ignore_ascii_case(c))) {
+            self.advance_identity(&table, &column).await;
+        }
         Ok(total)
+    }
+
+    /// The declared spellings, read again when stale (`NameCache`).
+    /// A failed statement's error, with a constraint violation worded and
+    /// named as SQL Server's: error 547 for a foreign key (`The INSERT
+    /// statement conflicted with the FOREIGN KEY constraint …`), 2627 for a
+    /// primary or unique key, 2601 for a unique index, every name as it
+    /// was declared. Applications match on the number; tools show the
+    /// text, where the engine's own named `denevcloud․erp․kids`.
+    fn engine_error(&self, n: &PgNotice) -> TsqlError {
+        let verb = self.verb;
+        let mut e = error_from_engine(n);
+        let Some(bridge) = self.bridge.as_ref() else { return e };
+        let database = &bridge.database;
+        let db = if self.database_shown.is_empty() { bridge.database_name.clone() } else { self.database_shown.clone() };
+        let names = &self.names;
+        let quoted = quoted_names(&n.message);
+        let dbo = |t: &str| format!("dbo.{}", names.table_shown(t));
+        let foreign_key = |table: &str, name: &str| {
+            database.schema_view(table).and_then(|v| {
+                v.schema().foreign_keys.iter().find(|f| !f.is_deleted && f.name == name).cloned()
+            })
+        };
+        let message = match n.code.as_str() {
+            "23503" if n.message.starts_with("insert or update on table") && quoted.len() >= 3 => {
+                let (child, fk, parent) = (quoted[0], quoted[1], quoted[quoted.len() - 1]);
+                let column = foreign_key(child, fk)
+                    .and_then(|f| f.parent_columns.first().cloned())
+                    .map(|c| names.column_of(parent, &c));
+                Some(format!(
+                    "The {verb} statement conflicted with the FOREIGN KEY constraint \"{}\". The conflict occurred in database \"{db}\", table \"{}\"{}.",
+                    names.object_shown(fk),
+                    dbo(parent),
+                    column.map(|c| format!(", column '{c}'")).unwrap_or_default()
+                ))
+            }
+            "23503" if n.message.starts_with("update or delete on table") && quoted.len() >= 3 => {
+                let (fk, child) = (quoted[1], quoted[2]);
+                let column = foreign_key(child, fk)
+                    .and_then(|f| f.columns.first().cloned())
+                    .map(|c| names.column_of(child, &c));
+                Some(format!(
+                    "The {verb} statement conflicted with the REFERENCE constraint \"{}\". The conflict occurred in database \"{db}\", table \"{}\"{}.",
+                    names.object_shown(fk),
+                    dbo(child),
+                    column.map(|c| format!(", column '{c}'")).unwrap_or_default()
+                ))
+            }
+            "23505" if n.message.starts_with("duplicate key value violates unique constraint") && !quoted.is_empty() => {
+                let key = quoted[0];
+                // The table holding the key, and whether it is the primary
+                // key, a constraint or an index.
+                let owner = database.table_names().into_iter().find_map(|t| {
+                    let view = database.schema_view(&t)?;
+                    let schema = view.schema();
+                    if crate::core::rql::unique_key::primary_key_of_named(schema, &t).is_some_and(|k| k.name == key) {
+                        return Some((t, Some(true)));
+                    }
+                    let k = schema.unique_keys.iter().find(|k| !k.is_deleted && k.name == key)?;
+                    Some((t, if k.from_index { None } else { Some(false) }))
+                });
+                owner.map(|(table, kind)| {
+                    let values = duplicate_values(&n.message)
+                        .map(|v| format!(" The duplicate key value is ({v})."))
+                        .unwrap_or_default();
+                    match kind {
+                        None => {
+                            e.number = self.shared.config.unique_index_error;
+                            format!(
+                                "Cannot insert duplicate key row in object '{}' with unique index '{}'.{values}",
+                                dbo(&table),
+                                names.object_shown(key)
+                            )
+                        }
+                        Some(primary) => format!(
+                            "Violation of {} constraint '{}'. Cannot insert duplicate key in object '{}'.{values}",
+                            if primary { "PRIMARY KEY" } else { "UNIQUE KEY" },
+                            names.object_shown(key),
+                            dbo(&table)
+                        ),
+                    }
+                })
+            }
+            _ => None,
+        };
+        if let Some(m) = message {
+            e.message = format!("{m} (SQLSTATE {})", n.code);
+        }
+        e
+    }
+
+    async fn ensure_names(&mut self) {
+        let Some(bridge) = self.bridge.as_ref() else { return };
+        let database = Arc::as_ptr(&bridge.database) as usize;
+        let has = bridge.database.has_table(translate::NAMES_TABLE);
+        let fresh = self.names.database == database
+            && !self.names.dirty
+            && self.names.read.is_some_and(|r| r.elapsed() < NAMES_TTL);
+        if fresh {
+            return;
+        }
+        let mut cache = NameCache { database, read: Some(std::time::Instant::now()), ..Default::default() };
+        if has {
+            // Not inside the client's transaction: a read of committed names.
+            if let Ok((_, rows)) = self.fetch(&format!("SELECT rel, col, shown FROM {}", translate::NAMES_TABLE), &[]).await {
+                for row in rows {
+                    let [Some(rel), Some(col), Some(shown)] = [row.first().cloned().flatten(), row.get(1).cloned().flatten(), row.get(2).cloned().flatten()]
+                    else {
+                        continue;
+                    };
+                    if let Some(object) = col.strip_prefix(translate::OBJECT_MARK) {
+                        cache.objects.insert(object.to_string(), shown);
+                        continue;
+                    }
+                    if !col.is_empty() {
+                        cache
+                            .columns
+                            .entry(col.clone())
+                            .and_modify(|e| {
+                                if e.as_deref() != Some(shown.as_str()) {
+                                    *e = None;
+                                }
+                            })
+                            .or_insert_with(|| Some(shown.clone()));
+                    }
+                    cache.relations.entry(rel).or_default().insert(col, shown);
+                }
+            }
+        }
+        self.names = cache;
+        let current = self.bridge.as_ref().map(|b| b.database_name.clone()).unwrap_or_default();
+        self.database_shown = self.database_names().await.get(&current).cloned().unwrap_or_default();
+    }
+
+    /// Moves `table`'s identity counter past the largest value its
+    /// `column` holds, never back: SQL Server's identity after rows were
+    /// written with their own values. Left as it was the next generated id
+    /// was 1, and a copied table failed its inserts on duplicate keys as
+    /// soon as the counter reached the first copied row.
+    async fn advance_identity(&mut self, table: &str, column: &str) {
+        let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let Ok((_, rows)) = self
+            .fetch(&format!("SELECT pg_get_serial_sequence({}, {})", lit(table), lit(column)), &[])
+            .await
+        else {
+            return;
+        };
+        let Some(Some(sequence)) = rows.first().and_then(|r| r.first()).cloned() else { return };
+        let Ok((_, rows)) = self
+            .fetch(&format!("SELECT max({}) FROM {}", ident_sql(column), ident_sql(table)), &[])
+            .await
+        else {
+            return;
+        };
+        let Some(max) = rows.first().and_then(|r| r.first()).cloned().flatten().and_then(|m| m.parse::<i128>().ok()) else {
+            return;
+        };
+        let Ok((_, rows)) = self.fetch(&format!("SELECT nextval({})", lit(&sequence)), &[]).await else { return };
+        let Some(next) = rows.first().and_then(|r| r.first()).cloned().flatten().and_then(|m| m.parse::<i128>().ok()) else {
+            return;
+        };
+        // `nextval` took one value; set the counter to the larger of it and
+        // the column's maximum, so the next call answers past both.
+        let value = max.max(next);
+        if let Err(e) = self.silent(&format!("SELECT setval({}, {value})", lit(&sequence))).await {
+            log::warn!("SQL Server session: could not move the identity of {table}.{column} past {max}: {}", e.message);
+        }
     }
 
     /// sp_tablecollations_100: a row per column, the collation of its text
     /// (none: the engine compares bytes).
     async fn table_collations(&mut self, table: &str) -> Result<Flow, TsqlError> {
+        self.ensure_names().await;
         let view = self
             .bridge()
             .database
             .schema_view(table)
             .ok_or_else(|| TsqlError::new(208, format!("Invalid object name '{table}'.")))?;
-        let names: Vec<String> = view
-            .schema()
+        let schema = view.schema();
+        // Each column as declared, and for text its collation: the 5-byte
+        // TDS collation SqlBulkCopy encodes a varchar/char/text value with,
+        // and its name. Case-insensitive: SQL_Latin1_General_CP1_CI_AS
+        // (LCID 1033, sort id 52); else by the bytes, Latin1_General_BIN2.
+        let names: Vec<(String, Option<(String, String)>)> = schema
             .fields
             .iter()
             .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
-            .map(|f| f.name.clone())
+            .map(|f| {
+                let shown = self.names.shown(table, &f.name).unwrap_or_else(|| f.name.clone());
+                let text = matches!(f.db_type, crate::core::db_type::DbType::STRING | crate::core::db_type::DbType::BPCHAR(_))
+                    && !f.json_text;
+                let collation = text.then(|| {
+                    if crate::core::rql::collation::of(&f.name, &schema.fields).is_binary() {
+                        ("\\x0904000200".to_string(), "Latin1_General_BIN2".to_string())
+                    } else {
+                        ("\\x0904d00034".to_string(), "SQL_Latin1_General_CP1_CI_AS".to_string())
+                    }
+                });
+                (shown, collation)
+            })
             .collect();
         let field = |name: &str, oid: u32| PgField {
             name: name.to_string(),
@@ -4093,7 +4706,13 @@ impl Session {
         let rows = names
             .into_iter()
             .enumerate()
-            .map(|(k, n)| vec![Some((k + 1).to_string()), Some(n), None, None])
+            .map(|(k, (n, collation))| {
+                let (bytes, name) = match collation {
+                    Some((b, c)) => (Some(b), Some(c)),
+                    None => (None, None),
+                };
+                vec![Some((k + 1).to_string()), Some(n), bytes, name]
+            })
             .collect();
         self.send_rows(&fields, rows);
         Ok(Flow::Next)
@@ -4117,6 +4736,7 @@ impl Session {
             table
         };
         let view = self.bridge.as_ref()?.database.schema_view(&table)?;
+        let identity = translate::identity_column(&self.bridge.as_ref()?.database, &table);
         let schema = view.schema();
         let fields: Vec<_> = schema
             .fields
@@ -4161,7 +4781,7 @@ impl Session {
                         {
                             ColType::NVarChar(Some(n as u16))
                         }
-                        _ => match tds::column_type(oid, -1).unwrap_or(ColType::NVarChar(None)) {
+                        _ => match tds::column_type(oid, f.db_type.pg_typmod()).unwrap_or(ColType::NVarChar(None)) {
                             ColType::DateTimeOffset if f.without_time_zone => ColType::DateTime2,
                             other => other,
                         },
@@ -4172,9 +4792,10 @@ impl Session {
                         oid
                     };
                     Column {
-                        name: f.name.clone(),
+                        name: self.names.shown(&table, &f.name).unwrap_or_else(|| f.name.clone()),
                         ty,
                         oid,
+                        identity: identity.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(&f.name)),
                     }
                 })
                 .collect(),
@@ -4184,7 +4805,7 @@ impl Session {
 
 /// The values of a call's parameters, in the order of the declarations
 /// (by name, or by position when unnamed).
-fn bind_values(decls: &[(String, bool, u32)], params: &[tds::Param]) -> Vec<ParamValue> {
+fn bind_values(decls: &[Decl], params: &[tds::Param]) -> Vec<ParamValue> {
     let mut out = vec![ParamValue::Null; decls.len()];
     let mut position = 0;
     for p in params {
@@ -4239,4 +4860,196 @@ fn render_value(tokens: &[Token]) -> Option<String> {
 #[allow(dead_code)]
 fn unused(_: &Arc<Database>, _: Ordering, _: Option<usize>) -> Option<usize> {
     find_top(&[], 0, &[])
+}
+
+/// Whether `sql` (engine SQL) only reads: re-running it changes nothing.
+fn is_plain_select(sql: &str) -> bool {
+    let upper = sql.trim_start().to_ascii_uppercase();
+    if !(upper.starts_with("SELECT") || upper.starts_with('(') || upper.starts_with("WITH")) {
+        return false;
+    }
+    // At any depth, outside quotes: a data-modifying CTE or subquery is a
+    // write (`find_keyword` reads the top level only).
+    let bytes = upper.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = crate::core::sql_scan::skip_quoted(bytes, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        if crate::core::sql_scan::is_identifier_byte(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && crate::core::sql_scan::is_identifier_byte(bytes[i]) {
+                i += 1;
+            }
+            let word = &upper[start..i];
+            if matches!(word, "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "INTO" | "SHARE" | "TRUNCATE" | "COPY") {
+                return false;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `sql` with each `$n` (outside quotes) replaced by its bound value as a
+/// typed literal; `None` when a value cannot be written so.
+fn inline_params(sql: &str, params: &[(i16, Option<Vec<u8>>, u32)], numbers: &[bool]) -> Option<String> {
+    let literal = |n: usize| -> Option<String> {
+        let (format, value, oid) = params.get(n)?;
+        let declared_number = numbers.get(n).copied().unwrap_or(false);
+        let Some(v) = value else { return Some("NULL".into()) };
+        if *format == 1 {
+            let hex: String = v.iter().map(|b| format!("{b:02x}")).collect();
+            return Some(format!("'\\x{hex}'::bytea"));
+        }
+        let raw = std::str::from_utf8(v).ok()?;
+        // A NUL has no place in statement text: not written in.
+        if raw.contains('\0') {
+            return None;
+        }
+        // Numbers bare, as LIMIT and OFFSET take only a number.
+        let oid = *oid;
+        // A parameter declared a number (no engine type is sent for one,
+        // which infers it): bare.
+        let number = matches!(oid, 20 | 21 | 23 | 700 | 701 | 1700) || (oid == 0 && declared_number);
+        if number && is_plain_number(raw) {
+            return Some(raw.to_string());
+        }
+        if oid == 16 && matches!(raw, "t" | "f" | "true" | "false") {
+            return Some(if raw.starts_with('t') { "TRUE".into() } else { "FALSE".into() });
+        }
+        let text = raw.replace('\'', "''");
+        let ty = match oid {
+            16 => "boolean",
+            20 => "bigint",
+            21 => "smallint",
+            23 => "integer",
+            25 | 1043 => "text",
+            700 => "real",
+            701 => "double precision",
+            1700 => "numeric",
+            1082 => "date",
+            1083 => "time",
+            1114 => "timestamp",
+            1184 => "timestamptz",
+            2950 => "uuid",
+            17 => "bytea",
+            _ => return Some(format!("'{text}'")),
+        };
+        Some(format!("CAST('{text}' AS {ty})"))
+    };
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 32);
+    let mut i = 0;
+    let mut copied = 0;
+    while i < bytes.len() {
+        if let Some(end) = crate::core::sql_scan::skip_quoted(bytes, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        if bytes[i] == b'$' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)
+            && (i == 0 || !crate::core::sql_scan::is_identifier_byte(bytes[i - 1]))
+        {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            let n: usize = sql[i + 1..j].parse().ok()?;
+            let value = literal(n.checked_sub(1)?)?;
+            out.push_str(&sql[copied..i]);
+            out.push_str(&value);
+            copied = j;
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    out.push_str(&sql[copied..]);
+    Some(out)
+}
+
+/// A number as SQL writes one: `-12`, `3.50`, `1e-3`, nothing else.
+fn is_plain_number(text: &str) -> bool {
+    let body = text.strip_prefix(['-', '+']).unwrap_or(text);
+    let (mantissa, exponent) = match body.find(['e', 'E']) {
+        Some(at) => (&body[..at], Some(&body[at + 1..])),
+        None => (body, None),
+    };
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    (!int.is_empty() || !frac.is_empty())
+        && digits(int)
+        && digits(frac)
+        && exponent.is_none_or(|e| {
+            let e = e.strip_prefix(['-', '+']).unwrap_or(e);
+            !e.is_empty() && digits(e)
+        })
+}
+
+/// Whether `sql` calls a function whose answer differs between runs.
+fn calls_volatile(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    ["nextval", "setval", "random", "gen_random_uuid", "uuidv4", "uuidv7", "uuid_generate", "clock_timestamp", "txid_current"]
+        .iter()
+        .any(|f| lower.contains(f))
+}
+
+#[cfg(test)]
+mod inline_tests {
+    use super::*;
+
+    fn text(v: &str) -> (i16, Option<Vec<u8>>, u32) {
+        (0, Some(v.as_bytes().to_vec()), 0)
+    }
+
+    /// A value is written as a quoted literal whose text is exactly the
+    /// value: a quote doubled, a backslash as itself (standard strings),
+    /// so no value can end the literal and add SQL of its own.
+    #[test]
+    fn values_are_written_as_literals_that_cannot_escape() {
+        let sql = "SELECT a FROM t WHERE b = $1 AND c = $2 AND d = $3 AND e = $4 LIMIT $5";
+        let params = [
+            text("x'); DROP TABLE t; --"),
+            text("Е'\\"),
+            (0, None, 0),
+            (1, Some(vec![0x00, 0xff, b'\'']), 17),
+            text("10"),
+        ];
+        let got = inline_params(sql, &params, &[false, false, false, false, true]).unwrap();
+        assert_eq!(
+            got,
+            "SELECT a FROM t WHERE b = 'x''); DROP TABLE t; --' AND c = 'Е''\\' AND d = NULL AND e = '\\x00ff27'::bytea LIMIT 10"
+        );
+        // A number is bare only when it is one and declared one.
+        assert_eq!(inline_params("SELECT $1", &[text("10")], &[false]).unwrap(), "SELECT '10'");
+        assert_eq!(inline_params("SELECT $1", &[text("1; DROP TABLE t")], &[true]).unwrap(), "SELECT '1; DROP TABLE t'");
+        assert_eq!(inline_params("SELECT $1", &[text("-1.5e3")], &[true]).unwrap(), "SELECT -1.5e3");
+        // A `$1` inside a string or a quoted name is text, not a parameter.
+        assert_eq!(
+            inline_params("SELECT '$1', \"$1\", $1", &[text("v")], &[false]).unwrap(),
+            "SELECT '$1', \"$1\", 'v'"
+        );
+        // A NUL is not written in; a missing parameter is no statement.
+        assert!(inline_params("SELECT $1", &[text("a\0b")], &[false]).is_none());
+        assert!(inline_params("SELECT $2", &[text("a")], &[false]).is_none());
+    }
+
+    #[test]
+    fn only_plain_reads_run_again() {
+        assert!(is_plain_select("SELECT a FROM t"));
+        assert!(!is_plain_select("SELECT a FROM t FOR UPDATE"));
+        assert!(!is_plain_select("INSERT INTO t SELECT 1"));
+        assert!(!is_plain_select("WITH x AS (DELETE FROM t RETURNING a) SELECT a FROM x"));
+        assert!(calls_volatile("SELECT nextval('s'), a FROM t"));
+        assert!(calls_volatile("SELECT gen_random_uuid()"));
+        assert!(!calls_volatile("SELECT a FROM t"));
+        for n in ["0", "-12", "3.50", ".5", "1e-3", "+7"] {
+            assert!(is_plain_number(n), "{n}");
+        }
+        for n in ["", "-", "1e", "0x10", "1 OR 1=1", "NaN", "1.2.3"] {
+            assert!(!is_plain_number(n), "{n}");
+        }
+    }
 }

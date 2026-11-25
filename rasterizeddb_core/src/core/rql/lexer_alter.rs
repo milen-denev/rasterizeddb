@@ -36,6 +36,10 @@ pub enum AlterAction {
         /// `GENERATED ALWAYS AS (…) STORED`'s expression. Dropped before, so
         /// the column was added and never given a value.
         generated: Option<String>,
+        /// `COMPRESSION zstd(9)`: the level, `None` for none, absent or
+        /// `default`. Not read before, so the clause was accepted and the
+        /// column stored its values uncompressed.
+        compression: Option<i32>,
         /// A declared `character(n)` / `character varying(n)` length
         /// (`type_modifier::TextTypmod`).
         text_typmod: Option<crate::core::rql::type_modifier::TextTypmod>,
@@ -133,13 +137,7 @@ pub struct AlterTable {
 
 /// Strips quoting and any schema qualification from a relation or column name.
 fn bare_name(raw: &str) -> String {
-    raw.trim()
-        .trim_end_matches(&[',', ';'][..])
-        .split('.')
-        .next_back()
-        .unwrap_or(raw)
-        .trim_matches('"')
-        .to_string()
+    crate::core::sql_scan::bare_name(raw.trim().trim_end_matches(&[',', ';'][..]))
 }
 
 /// `ALTER INDEX [IF EXISTS] name RENAME TO new`: the index, whether `IF
@@ -538,6 +536,17 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
             let constraints = rest_upper[i + used..].join(" ");
             let nullable =
                 !(constraints.contains("NOT NULL") || constraints.contains("PRIMARY KEY"));
+            let compression = match crate::core::compression::clause_in(&rest[i + used..]) {
+                Some(Err(reason)) => return Err(reason),
+                Some(Ok(level)) => level,
+                None => None,
+            };
+            if compression.is_some() && db_type.physical() != DbType::STRING {
+                return Err(format!(
+                    "column data type {} does not support compression",
+                    phrase.to_ascii_lowercase()
+                ));
+            }
             let declared = written;
             let text_typmod = match crate::core::rql::type_modifier::parse_text_typmod(&declared)
                 .or_else(|| crate::core::rql::type_modifier::parse_time_precision(&declared))
@@ -570,6 +579,7 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
                 json,
                 modifier,
                 generated,
+                compression,
                 text_typmod,
             }
         }
@@ -961,7 +971,7 @@ pub fn expand_multi_drop(sql: &str) -> Option<Vec<String>> {
     let mut suffix = "";
     for option in ["CASCADE", "RESTRICT"] {
         if rest.len() > option.len()
-            && rest[rest.len() - option.len()..].eq_ignore_ascii_case(option)
+            && rest.as_bytes()[rest.len() - option.len()..].eq_ignore_ascii_case(option.as_bytes())
             && rest[..rest.len() - option.len()].ends_with(char::is_whitespace)
         {
             suffix = option;
@@ -1520,6 +1530,23 @@ mod tests {
         );
     }
 
+    /// `ADD COLUMN … COMPRESSION` is read, not passed over: the clause was
+    /// accepted and the column stored its values uncompressed.
+    #[test]
+    fn add_column_reads_its_compression() {
+        let level = |sql: &str| match parse_alter_table(sql).map(|a| a.action) {
+            Ok(AlterAction::AddColumn { compression, .. }) => Ok(compression),
+            Ok(other) => panic!("{sql}: {other:?}"),
+            Err(e) => Err(e),
+        };
+        assert_eq!(level("ALTER TABLE d ADD COLUMN body TEXT COMPRESSION zstd(9)"), Ok(Some(9)));
+        assert!(matches!(level("ALTER TABLE d ADD COLUMN body TEXT NOT NULL DEFAULT '' COMPRESSION zstd"), Ok(Some(_))));
+        assert_eq!(level("ALTER TABLE d ADD COLUMN body TEXT COMPRESSION none"), Ok(None));
+        assert_eq!(level("ALTER TABLE d ADD COLUMN body TEXT"), Ok(None));
+        assert!(level("ALTER TABLE d ADD COLUMN n INT COMPRESSION zstd").unwrap_err().contains("does not support compression"));
+        assert!(level("ALTER TABLE d ADD COLUMN body TEXT COMPRESSION gzip").is_err());
+    }
+
     #[test]
     fn parses_add_column() {
         let a = parse_alter_table(r#"ALTER TABLE "users" ADD COLUMN "nickname" TEXT"#).unwrap();
@@ -1536,6 +1563,7 @@ mod tests {
                 json: false,
                 modifier: None,
                 generated: None,
+                compression: None,
                 text_typmod: None,
             }
         );

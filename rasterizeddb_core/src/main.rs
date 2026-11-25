@@ -692,6 +692,20 @@ struct Args {
     #[arg(long = "mssql-tls", default_value = "prefer")]
     mssql_tls: String,
 
+    /// The collation text columns made over the SQL Server protocol take
+    /// when they name none: `ci` (SQL Server's default, case-insensitive,
+    /// `SQL_Latin1_General_CP1_CI_AS`) or `bin` (compared by their bytes).
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-collation", default_value = "ci")]
+    mssql_collation: String,
+
+    /// The error number for a duplicate in a unique index over the SQL
+    /// Server protocol: `2601`, SQL Server's own, or `2627` (what a PRIMARY
+    /// KEY or UNIQUE constraint reports) for applications testing only that.
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-unique-index-error", default_value_t = 2601)]
+    mssql_unique_index_error: i32,
+
     /// PEM certificate chain for the SQL Server listener (default:
     /// `--pg-cert`, else a self-signed one made at start-up).
     #[cfg(feature = "mssql_wire")]
@@ -1350,8 +1364,21 @@ fn mssql_config(args: &Args) -> Result<Option<rasterizeddb_core::mssql::MsConfig
             None
         }
     };
+    let case_insensitive = match args.mssql_collation.to_ascii_lowercase().as_str() {
+        "ci" => true,
+        "bin" => false,
+        other => return Err(format!("unknown --mssql-collation {other:?}: expected ci or bin")),
+    };
+    if !matches!(args.mssql_unique_index_error, 2601 | 2627) {
+        return Err(format!(
+            "unknown --mssql-unique-index-error {}: expected 2601 or 2627",
+            args.mssql_unique_index_error
+        ));
+    }
     let (bootstrap_user, bootstrap_password) = bootstrap_role(args);
     Ok(Some(MsConfig {
+        case_insensitive,
+        unique_index_error: args.mssql_unique_index_error,
         tcp: args.mssql_port.map(|port| (args.mssql_addr.clone(), port)),
         socket,
         auth,

@@ -8,6 +8,72 @@
 
 pub(crate) use crate::sqlcompat::{LexError, Tok, Token, matching_paren, split_commas};
 
+/// What a dot inside a quoted name (`[DenevCloud.ERP.Colors]`) is stored as:
+/// U+2024 ONE DOT LEADER, which reads as a dot. The engine reads a dot in a
+/// relation's name as a qualifier in places, so the name keeps none; names
+/// are shown with their dots again (`decode_dots`).
+pub(crate) const NAME_DOT: char = '\u{2024}';
+
+pub(crate) fn encode_dots(name: String) -> String {
+    if name.contains('.') { name.replace('.', "\u{2024}") } else { name }
+}
+
+/// A stored name as SQL Server shows it.
+pub(crate) fn decode_dots(name: &str) -> std::borrow::Cow<'_, str> {
+    if name.contains(NAME_DOT) {
+        std::borrow::Cow::Owned(name.replace(NAME_DOT, "."))
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    }
+}
+
+/// The last part of a name written as text (`N'[dbo].[DenevCloud.ERP.Colors]'`,
+/// `'dbo.t'`), as a quoted name in a statement would be stored.
+pub(crate) fn last_name_part(text: &str) -> String {
+    let parts = name_parts(text);
+    parts.last().cloned().unwrap_or_default()
+}
+
+/// A multi-part name written as text, split at the dots outside brackets
+/// and double quotes; each part unquoted, its own dots encoded.
+pub(crate) fn name_parts(text: &str) -> Vec<String> {
+    let b = text.trim().as_bytes();
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0;
+    let text = text.trim();
+    while i < b.len() {
+        match b[i] {
+            b'[' | b'"' => {
+                let close = if b[i] == b'[' { b']' } else { b'"' };
+                match quoted(b, i, b[i], close) {
+                    Ok((v, e)) => {
+                        cur.push_str(&encode_dots(v));
+                        i = e;
+                    }
+                    Err(_) => {
+                        cur.push_str(&text[i..]);
+                        break;
+                    }
+                }
+            }
+            b'.' => {
+                parts.push(std::mem::take(&mut cur));
+                i += 1;
+            }
+            _ => {
+                let start = i;
+                while i < b.len() && !matches!(b[i], b'.' | b'[' | b'"') {
+                    i += 1;
+                }
+                cur.push_str(text[start..i].trim());
+            }
+        }
+    }
+    parts.push(cur);
+    parts
+}
+
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'@' || b == b'#' || b >= 0x80
 }
@@ -70,12 +136,12 @@ pub(crate) fn lex(sql: &str) -> Result<Vec<Token>, LexError> {
             b'[' => {
                 let (v, e) = quoted(b, i, b'[', b']')?;
                 i = e;
-                Tok::Quoted(v)
+                Tok::Quoted(encode_dots(v))
             }
             b'"' => {
                 let (v, e) = quoted(b, i, b'"', b'"')?;
                 i = e;
-                Tok::Quoted(v)
+                Tok::Quoted(encode_dots(v))
             }
             b'0' if i + 1 < n && (b[i + 1] == b'x' || b[i + 1] == b'X') => {
                 i += 2;

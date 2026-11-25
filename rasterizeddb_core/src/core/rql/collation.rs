@@ -113,6 +113,25 @@ pub fn key(text: &str, strength: Strength) -> String {
     }
 }
 
+/// A stored text value's key under `strength`, as bytes (what its
+/// companion holds). Text that is not UTF-8 keys as itself.
+pub fn key_bytes(value: &[u8], strength: Strength) -> Vec<u8> {
+    match std::str::from_utf8(value) {
+        Ok(text) if !strength.is_binary() => key(text, strength).into_bytes(),
+        _ => value.to_vec(),
+    }
+}
+
+/// Two stored text values in a collation's order: by their keys, then by
+/// their bytes, so values that compare equal still come in one order (as an
+/// `ORDER BY` over the column sorts them).
+pub fn compare(a: &[u8], b: &[u8], strength: Strength) -> std::cmp::Ordering {
+    if strength.is_binary() {
+        return a.cmp(b);
+    }
+    key_bytes(a, strength).cmp(&key_bytes(b, strength)).then_with(|| a.cmp(b))
+}
+
 /// The collation a name means, as `COLLATE <name>` and a column type
 /// (`citext`) write it. `Err` for a name that is no collation (PostgreSQL's
 /// 42704).
@@ -422,8 +441,32 @@ pub fn apply_to_create(
         if declared_column.data_type != DbType::STRING || ct.json_columns.iter().any(|j| j.column.eq_ignore_ascii_case(&name)) {
             return Err(format!("collations are not supported by the type of column \"{name}\""));
         }
-        if ct.foreign_keys.iter().any(|fk| fk.has_column(&name)) {
-            return unsupported(&format!("a foreign key on column \"{name}\""));
+        // A foreign key over such a column matches its parent under the
+        // collation: it pairs the companions, the parent's being the key its
+        // own collation made unique (an `'ABC'` child finds an `'abc'`
+        // parent, as SQL Server's CI key does). The parent's column must
+        // have the same collation (its companion is named for it). An action
+        // that writes the child's key column — SET NULL, SET DEFAULT, ON
+        // UPDATE CASCADE — would write the companion, which only the column
+        // itself may set: refused for now.
+        for fk in ct.foreign_keys.iter_mut().filter(|fk| fk.has_column(&name)) {
+            use crate::core::rql::foreign_key::ReferentialAction as A;
+            let writes_child = |a: &A| matches!(a, A::SetNull | A::SetDefault);
+            if writes_child(&fk.on_delete) || writes_child(&fk.on_update) || matches!(fk.on_update, A::Cascade) {
+                return unsupported(&format!(
+                    "ON DELETE/UPDATE SET NULL, SET DEFAULT or ON UPDATE CASCADE on a foreign key over column \"{name}\""
+                ));
+            }
+            let Some(at) = fk.columns.iter().position(|c| c.eq_ignore_ascii_case(&name)) else { continue };
+            let companion = companion_name(&name, strength).expect("nondeterministic");
+            fk.columns[at] = companion;
+            if let Some(parent) = fk.parent_columns.get_mut(at) {
+                *parent = companion_name(parent, strength).expect("nondeterministic");
+            } else {
+                return unsupported(&format!(
+                    "a foreign key over column \"{name}\" without its referenced column list"
+                ));
+            }
         }
         if ct.checks.iter().any(|c| mentions(&c.expression, &name)) {
             return unsupported(&format!("a CHECK reading column \"{name}\""));
@@ -558,17 +601,14 @@ pub fn plan_single(
     let words = words_of_list(select_list);
     for (k, w) in words.iter().enumerate() {
         let Some(column) = ci(w) else { continue };
-        if distinct {
-            return refuse("SELECT DISTINCT", &column);
-        }
         let before = |n: usize| k.checked_sub(n).and_then(|i| words.get(i)).map(|s| s.to_ascii_uppercase());
-        if matches!(before(1).as_deref(), Some("MIN" | "MAX" | "DISTINCT" | "PARTITION" | "BY")) {
-            return refuse("this aggregate or window", &column);
-        }
-    }
-    if words.iter().any(|w| w.eq_ignore_ascii_case("OVER")) && words.iter().any(|w| ci(w).is_some()) {
-        if let Some(c) = words.iter().find_map(|w| ci(w)) {
-            return refuse("a window function in a statement reading", &c);
+        // `min`, `max` and DISTINCT aggregates compare by the key
+        // (`mark_aggregates`), and a window partitions and sorts by it
+        // (`collate_rewrite::rewrite_windows`); `min`/`max` as a window
+        // function does not yet.
+        let windowed = words.iter().any(|w| w.eq_ignore_ascii_case("OVER"));
+        if windowed && matches!(before(1).as_deref(), Some("MIN" | "MAX")) {
+            return refuse("min/max as a window function", &column);
         }
     }
     let mut out = Vec::with_capacity(order_terms.len());
@@ -577,8 +617,14 @@ pub fn plan_single(
             out.push(term);
             continue;
         };
-        if grouped || distinct {
-            return refuse("ORDER BY in a grouped or DISTINCT query", &column);
+        if distinct {
+            return refuse("ORDER BY in a DISTINCT query", &column);
+        }
+        // A grouped query sorts its output, where the column is the group's
+        // spelling and the sort follows the collation (`aggregate::sort_output`).
+        if grouped {
+            out.push(term);
+            continue;
         }
         let (key, _) = companion(&column, fields).expect("a nondeterministic column has its companion");
         out.push(crate::core::rql::order_by::SortTerm {
@@ -616,6 +662,125 @@ fn words_of_list(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// A grouping over columns with a nondeterministic collation, made to group
+/// by their keys: each such `GROUP BY` column is replaced by its companion,
+/// and a select item echoing it becomes the group's least spelling under the
+/// collation (`min`, marked by [`mark_aggregates`]): SQL Server and
+/// PostgreSQL both answer one of the group's values, and this one is the
+/// same every time. With `as_distinct`, a `SELECT DISTINCT` of plain columns
+/// reading such a column is grouped by every column it selects instead; true
+/// when that was done.
+pub fn group_by_keys(
+    group_by: &mut Vec<SchemaField>,
+    items: &mut [crate::core::rql::aggregate::SelectItem],
+    fields: &[SchemaField],
+    as_distinct: bool,
+) -> bool {
+    use crate::core::rql::aggregate::{AggFunc, SelectItem};
+    if !any(fields) {
+        return false;
+    }
+    let ci = |f: &SchemaField| !of(&f.name, fields).is_binary();
+    let mut converted = false;
+    if as_distinct {
+        let plain = items.iter().all(|i| matches!(i, SelectItem::Column { .. }));
+        let reads_ci = items.iter().any(|i| matches!(i, SelectItem::Column { field, .. } if ci(field)));
+        if plain && reads_ci && group_by.is_empty() {
+            for item in items.iter() {
+                if let SelectItem::Column { field, .. } = item {
+                    if !group_by.iter().any(|g| g.write_order == field.write_order) {
+                        group_by.push(field.clone());
+                    }
+                }
+            }
+            converted = true;
+        }
+    }
+    let keyed: Vec<SchemaField> = group_by.iter().filter(|g| ci(g)).cloned().collect();
+    if keyed.is_empty() {
+        return converted;
+    }
+    for g in group_by.iter_mut() {
+        if let Some((companion, _)) = companion(&g.name, fields).filter(|_| ci(g)) {
+            *g = companion.clone();
+        }
+    }
+    for item in items.iter_mut() {
+        let SelectItem::Column { field, label } = item else { continue };
+        if !keyed.iter().any(|k| k.write_order == field.write_order) {
+            continue;
+        }
+        *item = SelectItem::Aggregate {
+            func: AggFunc::Min,
+            arg: Some(field.clone()),
+            label: label.clone(),
+            filter: None,
+            arg_expr: None,
+            distinct: false,
+            call: None,
+        };
+    }
+    converted
+}
+
+/// Refuses a `HAVING` comparing `min`/`max` of a column with a
+/// nondeterministic collation: the condition compares the aggregate's
+/// bytes. (A grouping column there is moved into the WHERE, where it
+/// compares by its key.)
+pub fn refuse_in_having(having: &str, fields: &[SchemaField]) -> Result<(), String> {
+    if !any(fields) {
+        return Ok(());
+    }
+    let words = words_of_list(having);
+    for (k, w) in words.iter().enumerate() {
+        let bare = w.rsplit('.').next().unwrap_or(w);
+        let ci = fields
+            .iter()
+            .any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(bare) && !of(&f.name, fields).is_binary());
+        let before = k.checked_sub(1).map(|i| words[i].to_ascii_uppercase());
+        if ci && matches!(before.as_deref(), Some("MIN" | "MAX")) {
+            return Err(format!(
+                "HAVING over min/max of column \"{bare}\", which has a case-insensitive collation, is not supported yet"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Tells each aggregate over a column with a nondeterministic collation
+/// which one: `min`/`max` pick by its order, `count(DISTINCT …)` and the
+/// other DISTINCT aggregates keep one value per key.
+pub fn mark_aggregates(items: &mut [crate::core::rql::aggregate::SelectItem], fields: &[SchemaField]) {
+    use crate::core::rql::aggregate::{AggCall, SelectItem};
+    if !any(fields) {
+        return;
+    }
+    let strength_of = |arg: &Option<SchemaField>, expr: bool| -> Option<Strength> {
+        let f = arg.as_ref().filter(|_| !expr)?;
+        Some(of(&f.name, fields)).filter(|s| !s.is_binary())
+    };
+    let mark = |call: &mut Option<Box<AggCall>>, strength: Option<Strength>| {
+        if let Some(strength) = strength {
+            call.get_or_insert_with(Default::default).collation = Some(strength);
+        }
+    };
+    for item in items.iter_mut() {
+        match item {
+            SelectItem::Aggregate { arg, arg_expr, call, .. } => {
+                let strength = strength_of(arg, arg_expr.is_some());
+                mark(call, strength);
+            }
+            SelectItem::Computed { inputs, .. } => {
+                for input in inputs.iter_mut() {
+                    let strength = strength_of(&input.arg, input.arg_expr.is_some());
+                    mark(&mut input.call, strength);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Refuses a multi-table query that compares a column with a
@@ -665,7 +830,10 @@ pub fn refuse_in_join(
     for (k, w) in words.iter().enumerate() {
         let Some(c) = ci(w) else { continue };
         let before = k.checked_sub(1).map(|i| words[i].to_ascii_uppercase());
-        if distinct || window || matches!(before.as_deref(), Some("MIN" | "MAX" | "DISTINCT" | "BY")) {
+        // `min`, `max` and DISTINCT aggregates compare by the key, and a
+        // window partitions and sorts by it; a DISTINCT over more than plain
+        // columns and `min`/`max` as a window function do not yet.
+        if distinct || window && matches!(before.as_deref(), Some("MIN" | "MAX")) {
             return refuse(c);
         }
     }
@@ -718,6 +886,347 @@ pub fn refuse_in_set_op(
         }
     }
     Ok(())
+}
+
+/// `ALTER TABLE t ADD [COLUMN] [IF NOT EXISTS] c <text type> COLLATE <ci>
+/// [NOT NULL] [DEFAULT …] [UNIQUE]` as the statements that make such a
+/// column, as `CREATE TABLE` makes one (`apply_to_create`): the column
+/// without its collation, its key companion as a stored generated column
+/// (filled for the rows already there), and a `UNIQUE` on the companion.
+/// `None` for any other statement, which a caller refuses if it declares
+/// one (`declares_nondeterministic`).
+pub fn add_column_statements(sql: &str) -> Option<Result<Vec<String>, String>> {
+    let sql = sql.trim().trim_end_matches(';').trim_end();
+    let bytes = sql.as_bytes();
+    // Words outside quotes, with their spans; a top-level comma means
+    // several actions, which this does not split.
+    let mut words: Vec<(usize, usize)> = Vec::new();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                let end = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+                words.push((i, end));
+                i = end;
+            }
+            b'"' => {
+                let start = i;
+                let mut end = crate::core::sql_scan::quoted_end(bytes, i, b'"');
+                // `"a"."b"`
+                while end < bytes.len() && bytes[end] == b'.' {
+                    end = if bytes.get(end + 1) == Some(&b'"') {
+                        crate::core::sql_scan::quoted_end(bytes, end + 1, b'"')
+                    } else {
+                        let mut e = end + 1;
+                        while e < bytes.len() && crate::core::sql_scan::is_identifier_byte(bytes[e]) {
+                            e += 1;
+                        }
+                        e
+                    };
+                }
+                words.push((start, end));
+                i = end;
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            b',' if depth == 0 => return None,
+            b if b.is_ascii_whitespace() => i += 1,
+            _ => {
+                let start = i;
+                while i < bytes.len()
+                    && !bytes[i].is_ascii_whitespace()
+                    && !matches!(bytes[i], b'(' | b')' | b',' | b'\'')
+                {
+                    i += 1;
+                }
+                words.push((start, i));
+            }
+        }
+    }
+    let word = |k: usize| words.get(k).map(|&(a, b)| &sql[a..b]);
+    let is = |k: usize, w: &str| word(k).is_some_and(|x| x.eq_ignore_ascii_case(w));
+    if !(is(0, "ALTER") && is(1, "TABLE")) {
+        return None;
+    }
+    let mut k = 2;
+    if is(k, "IF") && is(k + 1, "EXISTS") {
+        k += 2;
+    }
+    if is(k, "ONLY") {
+        k += 1;
+    }
+    let table = word(k)?.to_string();
+    k += 1;
+    if !is(k, "ADD") {
+        return None;
+    }
+    k += 1;
+    if is(k, "COLUMN") {
+        k += 1;
+    }
+    let mut if_not_exists = false;
+    if is(k, "IF") && is(k + 1, "NOT") && is(k + 2, "EXISTS") {
+        if_not_exists = true;
+        k += 3;
+    }
+    let column_word = word(k)?;
+    let column = unquote(column_word);
+    let collate_at = (k..words.len()).find(|&j| is(j, "COLLATE"))?;
+    let name = word(collate_at + 1)?;
+    let strength = match resolve(name.rsplit('.').next().unwrap_or(name)) {
+        Ok(s) => s,
+        Err(e) => return Some(Err(e)),
+    };
+    if strength.is_binary() {
+        return None;
+    }
+    let refuse = |what: &str| Some(Err(format!("{what} is not supported with a case-insensitive collation yet")));
+    if (k..words.len()).any(|j| is(j, "PRIMARY") || is(j, "REFERENCES") || is(j, "CHECK") || is(j, "GENERATED")) {
+        return refuse("ALTER TABLE ADD COLUMN with a PRIMARY KEY, REFERENCES, CHECK or GENERATED clause");
+    }
+    let unique_at = (k..words.len()).find(|&j| is(j, "UNIQUE"));
+    // The column, without the collation (and its UNIQUE, which goes on the
+    // key).
+    let mut cut: Vec<(usize, usize)> = vec![(words[collate_at].0, words[collate_at + 1].1)];
+    if let Some(u) = unique_at {
+        cut.push(words[u]);
+    }
+    cut.sort();
+    let mut plain = String::with_capacity(sql.len());
+    let mut at = 0;
+    for (a, b) in cut {
+        plain.push_str(&sql[at..a]);
+        at = b;
+    }
+    plain.push_str(&sql[at..]);
+    let companion = companion_name(&column, strength).expect("nondeterministic");
+    if companion.len() > 128 || crate::core::rql::nullable::flag_column_name(&companion).len() > 128 {
+        return Some(Err(format!("column name \"{column}\" is too long for a case-insensitive collation")));
+    }
+    let mut out = vec![
+        plain,
+        format!(
+            "ALTER TABLE {table} ADD COLUMN {}{} text GENERATED ALWAYS AS ({}) STORED",
+            if if_not_exists { "IF NOT EXISTS " } else { "" },
+            ident(&companion),
+            companion_expression(&column, strength).expect("nondeterministic")
+        ),
+    ];
+    if unique_at.is_some() {
+        let bare = crate::core::sql_scan::bare_name(&table);
+        out.push(format!(
+            "ALTER TABLE {table} ADD CONSTRAINT {} UNIQUE ({})",
+            ident(&crate::core::rql::unique_key::implicit_key_name(&bare, &column)),
+            ident(&companion)
+        ));
+    }
+    Some(Ok(out))
+}
+
+/// An added constraint (`[CONSTRAINT n] UNIQUE (…)`, `FOREIGN KEY (…)
+/// REFERENCES p (…)`) over columns with a nondeterministic collation, on
+/// their companions: a UNIQUE keys them, a foreign key pairs the child's
+/// with the parent's (which must have the same collation). `None` when it
+/// names no such column.
+pub fn constraint_on_keys(
+    description: &str,
+    fields: &[SchemaField],
+    fields_of: &dyn Fn(&str) -> Option<Vec<SchemaField>>,
+) -> Result<Option<String>, String> {
+    let upper = description.to_ascii_uppercase();
+    let find = |kw: &str, from: usize| crate::core::rql::join::find_keyword(&upper, kw, from);
+    // The column list in the parentheses after `at`: its span inside them.
+    let list_after = |at: usize| -> Option<(usize, usize)> {
+        let open = at + description[at..].find('(')?;
+        let close = crate::core::rql::expr::matching_paren(description, open)?;
+        Some((open + 1, close))
+    };
+    let names = |(a, b): (usize, usize)| -> Vec<String> {
+        crate::core::sql_scan::split_top_level(&description[a..b], b',')
+            .iter()
+            .map(|c| crate::core::sql_scan::bare_name(c.split_whitespace().next().unwrap_or("")))
+            .collect()
+    };
+    let render = |cols: &[String]| cols.iter().map(|c| ident(c)).collect::<Vec<_>>().join(", ");
+    if let Some(fk) = find("FOREIGN", 0) {
+        let Some(child_span) = list_after(fk) else { return Ok(None) };
+        let Some(refs) = find("REFERENCES", child_span.1) else { return Ok(None) };
+        let mut child = names(child_span);
+        if !child.iter().any(|c| !of(c, fields).is_binary()) {
+            return Ok(None);
+        }
+        let after = description[refs + "REFERENCES".len()..].trim_start();
+        let parent_name_len = after.find(|c: char| c == '(' || c.is_whitespace()).unwrap_or(after.len());
+        let parent_table = crate::core::sql_scan::bare_name(&after[..parent_name_len]);
+        let parent_fields = fields_of(&parent_table).unwrap_or_default();
+        let Some(parent_span) = list_after(refs) else {
+            return Err("a foreign key over a case-insensitive column needs its referenced column list".to_string());
+        };
+        let mut parent = names(parent_span);
+        let tail = &upper[parent_span.1..];
+        if tail.contains("SET NULL") || tail.contains("SET DEFAULT") || find("UPDATE", parent_span.1).is_some_and(|u| upper[u..].trim_start_matches("UPDATE").trim_start().starts_with("CASCADE")) {
+            return Err("ON DELETE/UPDATE SET NULL, SET DEFAULT or ON UPDATE CASCADE on a foreign key over a column with a case-insensitive collation is not supported yet".to_string());
+        }
+        for (k, c) in child.iter_mut().enumerate() {
+            let strength = of(c, fields);
+            if strength.is_binary() {
+                continue;
+            }
+            let Some(p) = parent.get_mut(k) else { continue };
+            if of(p, &parent_fields) != strength {
+                return Err(format!(
+                    "foreign key column \"{c}\" and referenced column \"{p}\" have different collations"
+                ));
+            }
+            *c = companion_name(c, strength).expect("nondeterministic");
+            *p = companion_name(p, strength).expect("nondeterministic");
+        }
+        let mut out = String::with_capacity(description.len() + 16);
+        out.push_str(&description[..child_span.0]);
+        out.push_str(&render(&child));
+        out.push_str(&description[child_span.1..parent_span.0]);
+        out.push_str(&render(&parent));
+        out.push_str(&description[parent_span.1..]);
+        return Ok(Some(out));
+    }
+    if let Some(u) = find("UNIQUE", 0) {
+        let Some(span) = list_after(u) else { return Ok(None) };
+        let mut cols = names(span);
+        let mut changed = false;
+        for c in cols.iter_mut() {
+            let strength = of(c, fields);
+            if !strength.is_binary() {
+                *c = companion_name(c, strength).expect("nondeterministic");
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(None);
+        }
+        return Ok(Some(format!("{}{}{}", &description[..span.0], render(&cols), &description[span.1..])));
+    }
+    Ok(None)
+}
+
+/// Each output column's nondeterministic collation in a set operation
+/// (`UNION`, `INTERSECT`, `EXCEPT`), read from its branches: a column a
+/// branch selects (`t.c`, `c`, through the branch's relations and their
+/// aliases) with one. Rows are then told apart by its key, as SQL Server's
+/// `EXCEPT` compares under the column's collation. A `*` over such a column
+/// is refused (its positions are not read here); two collations at one
+/// position are 42P22's conflict.
+pub fn set_op_collations(
+    branches: &[String],
+    table_fields: &dyn Fn(&str) -> Option<Vec<SchemaField>>,
+) -> Result<Vec<Option<Strength>>, String> {
+    use crate::core::rql::join::find_keyword;
+    let mut out: Vec<Option<Strength>> = Vec::new();
+    for branch in branches {
+        let branch = crate::core::sql_scan::without_outer_parentheses(branch.trim());
+        let upper = branch.to_ascii_uppercase();
+        let Some(select) = find_keyword(&upper, "SELECT", 0) else { continue };
+        let Some(from) = find_keyword(&upper, "FROM", select) else { continue };
+        let end = ["WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "WINDOW"]
+            .iter()
+            .filter_map(|k| find_keyword(&upper, k, from))
+            .min()
+            .unwrap_or(branch.len());
+        // The relations: `table [AS] alias`, between commas and JOINs.
+        let mut relations: Vec<(String, String, Vec<SchemaField>)> = Vec::new();
+        let from_text = &branch[from + 4..end];
+        let from_upper = from_text.to_ascii_uppercase();
+        let mut cuts = vec![0usize];
+        let mut at = 0;
+        while let Some(j) = find_keyword(&from_upper, "JOIN", at) {
+            cuts.push(j + 4);
+            at = j + 4;
+        }
+        cuts.push(from_text.len());
+        for w in cuts.windows(2) {
+            let piece = &from_text[w[0]..w[1]];
+            let pu = piece.to_ascii_uppercase();
+            let piece_end = ["ON", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "USING"]
+                .iter()
+                .filter_map(|k| find_keyword(&pu, k, 0))
+                .min()
+                .unwrap_or(piece.len());
+            for rel in crate::core::sql_scan::split_top_level(&piece[..piece_end], b',') {
+                let words: Vec<&str> = rel.split_whitespace().filter(|w| !w.eq_ignore_ascii_case("AS")).collect();
+                let Some(first) = words.first() else { continue };
+                if first.starts_with('(') {
+                    continue;
+                }
+                let table = crate::core::sql_scan::bare_name(first);
+                let alias = words.get(1).map(|a| crate::core::sql_scan::bare_name(a)).unwrap_or_else(|| table.clone());
+                if let Some(fields) = table_fields(&table) {
+                    relations.push((table, alias, fields));
+                }
+            }
+        }
+        let mut list = branch[select + 6..from].trim();
+        for kw in ["DISTINCT", "ALL"] {
+            if let Some(rest) = crate::core::rql::lexer_query::leading_word(list, kw) {
+                list = rest;
+            }
+        }
+        for (position, item) in crate::core::sql_scan::split_top_level(list, b',').iter().enumerate() {
+            let item = item.trim();
+            let expr = match crate::core::rql::join::find_keyword(&item.to_ascii_uppercase(), "AS", 0) {
+                Some(a) => item[..a].trim(),
+                None => item,
+            };
+            let expr = expr.split_whitespace().next().unwrap_or(expr);
+            let strength = if expr == "*" || expr.ends_with(".*") {
+                let ci = relations.iter().any(|(_, alias, fields)| {
+                    (expr == "*" || crate::core::sql_scan::bare_name(&expr[..expr.len() - 2]).eq_ignore_ascii_case(alias))
+                        && fields.iter().any(|f| !f.is_deleted && !is_companion(&f.name) && !of(&f.name, fields).is_binary())
+                });
+                if ci {
+                    return Err(
+                        "UNION, INTERSECT or EXCEPT of * over a column with a case-insensitive collation is not supported yet; name the columns".to_string()
+                    );
+                }
+                None
+            } else {
+                let (qualifier, column) = match crate::core::sql_scan::last_name_segment(expr).len() < expr.len() {
+                    true => {
+                        let col = crate::core::sql_scan::bare_name(expr);
+                        let q = &expr[..expr.len() - crate::core::sql_scan::last_name_segment(expr).len() - 1];
+                        (Some(crate::core::sql_scan::bare_name(q)), col)
+                    }
+                    false => (None, crate::core::sql_scan::bare_name(expr)),
+                };
+                relations
+                    .iter()
+                    .filter(|(_, alias, _)| qualifier.as_deref().is_none_or(|q| q.eq_ignore_ascii_case(alias)))
+                    .find_map(|(_, _, fields)| {
+                        fields
+                            .iter()
+                            .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&column))
+                            .map(|f| of(&f.name, fields))
+                    })
+                    .filter(|s| !s.is_binary())
+            };
+            if out.len() <= position {
+                out.resize(position + 1, None);
+            }
+            match (out[position], strength) {
+                (Some(a), Some(b)) if a != b => {
+                    return Err("could not determine which collation to use for string comparison".to_string());
+                }
+                (None, Some(b)) => out[position] = Some(b),
+                _ => {}
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Whether `sql` declares a nondeterministic collation anywhere: a

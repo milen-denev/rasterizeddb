@@ -140,3 +140,43 @@ async fn repeatable_read_still_fails_with_40001() {
     let _ = b.execute("ROLLBACK").await;
     assert_eq!(row(&pool, 1).await, Some((105, 0)));
 }
+
+/// Several writers queued behind one holder all apply, as PostgreSQL's do.
+/// When the holder ended, one waiter won the row and finished first; the
+/// others' next replay met that finished writer, a "blind" retry, and the
+/// budget for those was counted from the first conflict, wait included. After
+/// a hold past 1.5 s it was already spent: 40001 at READ COMMITTED with three
+/// or more writers on one row (pms's parallel case loads, "could not
+/// serialize access due to concurrent update of row … got there first").
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn writers_queued_behind_a_long_holder_all_apply() {
+    let server = TestServer::start().await.expect("server");
+    let pool = sqlx::postgres::PgPoolOptions::new().max_connections(8).connect(&server.url()).await.expect("pool");
+    pool.execute("CREATE TABLE q (id INT PRIMARY KEY, v INT NOT NULL)").await.expect("create");
+    pool.execute("INSERT INTO q VALUES (1, 0)").await.expect("insert");
+    for round in 0..3 {
+        sqlx::query("UPDATE q SET v = 0").execute(&pool).await.expect("reset");
+        let mut holder = pool.acquire().await.expect("holder");
+        holder.execute("BEGIN").await.expect("begin");
+        sqlx::query("UPDATE q SET v = v + 1 WHERE id = $1").bind(1).execute(&mut *holder).await.expect("hold");
+        let mut waiters = Vec::new();
+        for add in [10, 100, 1000, 10000] {
+            let p = pool.clone();
+            waiters.push(tokio::spawn(async move {
+                let mut c = p.acquire().await.expect("waiter");
+                c.execute("BEGIN").await.expect("begin");
+                sqlx::query("UPDATE q SET v = v + $2 WHERE id = $1").bind(1).bind(add).execute(&mut *c).await.map_err(|e| e.to_string())?;
+                c.execute("COMMIT").await.map(|_| ()).map_err(|e| e.to_string())
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        holder.execute("COMMIT").await.expect("commit");
+        drop(holder);
+        for w in waiters {
+            let outcome = tokio::time::timeout(Duration::from_secs(30), w).await.expect("a waiter ends").expect("join");
+            assert_eq!(outcome, Ok(()), "round {round}: a READ COMMITTED writer failed");
+        }
+        let v: i32 = sqlx::query_scalar("SELECT v FROM q WHERE id = 1").fetch_one(&pool).await.expect("read");
+        assert_eq!(v, 11111, "round {round}: every writer's change applies");
+    }
+}

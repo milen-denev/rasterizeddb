@@ -705,7 +705,9 @@ pub fn split_clause(definition: &str) -> (String, Option<String>) {
     let after_upper = &upper[at + "DEFAULT".len()..];
 
     // Where the expression ends: the next constraint keyword at the top level.
-    const TERMINATORS: [&str; 7] = [
+    // `COMPRESSION`, which may follow a DEFAULT in either order: it was read
+    // as part of the expression (`DEFAULT '' COMPRESSION zstd`).
+    const TERMINATORS: [&str; 8] = [
         "NOT NULL",
         "NULL",
         "PRIMARY KEY",
@@ -713,6 +715,7 @@ pub fn split_clause(definition: &str) -> (String, Option<String>) {
         "REFERENCES",
         "CHECK",
         "GENERATED",
+        "COMPRESSION",
     ];
     let mut end = after.len();
     let mut depth = 0usize;

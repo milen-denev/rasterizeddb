@@ -35,6 +35,18 @@ impl Drop for Servers {
 }
 
 fn start() -> Servers {
+    start_with(false)
+}
+
+/// A server whose text columns are case-insensitive by default
+/// (`MsConfig::case_insensitive`, `--mssql-collation ci`).
+fn start_with(case_insensitive: bool) -> Servers {
+    start_config(case_insensitive, 2601)
+}
+
+/// [`start_with`], a duplicate in a unique index reported as
+/// `unique_index_error` (`--mssql-unique-index-error`).
+fn start_config(case_insensitive: bool, unique_index_error: i32) -> Servers {
     let _ = env_logger::builder().is_test(true).try_init();
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     // A socket path must fit sun_path: kept short, under /tmp.
@@ -69,6 +81,11 @@ fn start() -> Servers {
                     bootstrap_user: "rasterized".into(),
                     bootstrap_password: Some(PASSWORD.into()),
                     limits: ConnectionLimits::default(),
+                    // Most tests pin the byte-compared answers they were
+                    // written against; `start_with(true)` is SQL Server's
+                    // case-insensitive default.
+                    case_insensitive,
+                    unique_index_error,
                 };
                 let listener = rasterizeddb_core::mssql::bind(config).await.unwrap();
                 let port = listener.local_addr().unwrap().port();
@@ -113,7 +130,12 @@ fn config(s: &Servers, password: &str, encryption: EncryptionLevel) -> Config {
 }
 
 async fn connect(s: &Servers) -> Client<Compat<tokio::net::TcpStream>> {
-    let c = config(s, PASSWORD, EncryptionLevel::Required);
+    connect_to(s, "postgres").await
+}
+
+async fn connect_to(s: &Servers, database: &str) -> Client<Compat<tokio::net::TcpStream>> {
+    let mut c = config(s, PASSWORD, EncryptionLevel::Required);
+    c.database(database);
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", s.port))
         .await
         .unwrap();
@@ -998,4 +1020,444 @@ async fn tiberius_column_collations() {
     assert_eq!(ids(&r), vec![2]);
     let e = batch(&mut c, "INSERT INTO Accounts VALUES (3, N'admin', NULL, NULL)").await.expect_err("duplicate");
     assert_eq!(number(&e), Some(2627), "{e}");
+}
+
+fn int(rows: &[tiberius::Row]) -> Vec<i32> {
+    rows.iter().map(|r| r.get::<i32, _>(0).unwrap()).collect()
+}
+
+fn texts(rows: &[tiberius::Row]) -> Vec<Option<String>> {
+    rows.iter().map(|r| r.get::<&str, _>(0).map(str::to_string)).collect()
+}
+
+/// What EF Core 10 contexts named like DenevCloud's send: a mixed-case
+/// database, `[dbo].[DenevCloud.ERP.Colors]` tables, filtered unique keys,
+/// sp_rename of an index, the DropColumn script's catalogue join, the
+/// migration lock, APPLY, and text that compares without case as under
+/// SQL Server's default collation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_ef_core_shapes() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(&mut c, "CREATE DATABASE [DenevColors]").await.unwrap();
+    drop(c);
+    // The database is found without case, however the login spells it.
+    let _ = connect_to(&s, "DENEVCOLORS").await;
+    let mut c = connect_to(&s, "DenevColors").await;
+    batch(
+        &mut c,
+        "CREATE TABLE [dbo].[DenevCloud.ERP.Colors] ([Id] int NOT NULL, [Name] nvarchar(50) NOT NULL, \
+         [Code] nvarchar(20) NULL, [Deleted] bit NOT NULL DEFAULT 0, CONSTRAINT [PK_DenevCloud.ERP.Colors] PRIMARY KEY ([Id]))",
+    )
+    .await
+    .unwrap();
+    batch(
+        &mut c,
+        "INSERT INTO [dbo].[DenevCloud.ERP.Colors] ([Id], [Name], [Code]) VALUES (1, N'Red', N'R1'), (2, N'blue', NULL), (3, N'RED', NULL)",
+    )
+    .await
+    .unwrap();
+    // Every statement reads the dotted name as one table: UPDATE and
+    // DELETE once answered 0 rows, a SELECT a relation named 'colors'.
+    let r = batch(&mut c, "UPDATE [d] SET [d].[Code] = N'B1' FROM [dbo].[DenevCloud.ERP.Colors] AS [d] WHERE [d].[Id] = 2; SELECT @@ROWCOUNT")
+        .await
+        .unwrap();
+    assert_eq!(int(r.last().unwrap()), vec![1]);
+    let r = batch(&mut c, "SELECT [d].[Id] FROM [dbo].[DenevCloud.ERP.Colors] AS [d] WHERE [d].[Code] = N'b1'").await.unwrap();
+    assert_eq!(int(&r[0]), vec![2], "text compares without case");
+    let r = batch(&mut c, "SELECT COUNT(*) FROM [dbo].[DenevCloud.ERP.Colors] WHERE [Name] = N'red'").await.unwrap();
+    assert_eq!(int(&r[0]), vec![2]);
+    let r = batch(&mut c, "SELECT [Name] FROM [dbo].[DenevCloud.ERP.Colors] GROUP BY [Name] ORDER BY [Name]").await.unwrap();
+    assert_eq!(texts(&r[0]), vec![Some("blue".into()), Some("RED".into())]);
+    let r = batch(
+        &mut c,
+        "SELECT [Name] FROM [dbo].[DenevCloud.ERP.Colors] EXCEPT SELECT N'RED' ORDER BY [Name]",
+    )
+    .await
+    .unwrap();
+    assert_eq!(texts(&r[0]), vec![Some("blue".into())]);
+    let r = batch(
+        &mut c,
+        "SELECT CASE WHEN OBJECT_ID(N'[dbo].[DenevCloud.ERP.Colors]') IS NULL THEN 0 ELSE 1 END; SELECT [name] FROM sys.tables",
+    )
+    .await
+    .unwrap();
+    assert_eq!(int(&r[0]), vec![1]);
+    // Shown as declared (SqlBulkCopy matches names exactly), found without case.
+    assert!(texts(&r[1]).contains(&Some("DenevCloud.ERP.Colors".into())), "{:?}", texts(&r[1]));
+    // OUTER APPLY, as EF writes FirstOrDefault in a projection.
+    let r = batch(
+        &mut c,
+        "SELECT [d].[Id], [x].[Name] FROM [dbo].[DenevCloud.ERP.Colors] AS [d] OUTER APPLY (SELECT TOP(1) [e].[Name] \
+         FROM [dbo].[DenevCloud.ERP.Colors] AS [e] WHERE [e].[Id] > [d].[Id] ORDER BY [e].[Id]) AS [x] ORDER BY [d].[Id]",
+    )
+    .await
+    .unwrap();
+    assert_eq!(r[0].len(), 3);
+    let names: Vec<Option<String>> = r[0].iter().map(|row| row.get::<&str, _>(1).map(str::to_string)).collect();
+    assert_eq!(names, vec![Some("blue".into()), Some("RED".into()), None]);
+    // A unique index filtered by `IS NOT NULL` is the key, under the
+    // collation; NULLs repeat. Any other filter on a unique index is
+    // refused (it was once built whole).
+    batch(&mut c, "CREATE UNIQUE INDEX [IX_DenevCloud.ERP.Colors_Code] ON [dbo].[DenevCloud.ERP.Colors] ([Code]) WHERE [Code] IS NOT NULL")
+        .await
+        .unwrap();
+    let e = batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Colors] ([Id], [Name], [Code]) VALUES (4, N'x', N'r1')").await.unwrap_err();
+    assert!(matches!(number(&e), Some(2601 | 2627)), "{e:?}");
+    batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Colors] ([Id], [Name], [Code]) VALUES (5, N'y', NULL)").await.unwrap();
+    assert!(batch(&mut c, "CREATE UNIQUE INDEX [IX_D] ON [dbo].[DenevCloud.ERP.Colors] ([Name]) WHERE [Deleted] = 0").await.is_err());
+    // sp_rename of an index, then DROP INDEX by the new name.
+    batch(&mut c, "EXEC sp_rename N'[DenevCloud.ERP.Colors].[IX_DenevCloud.ERP.Colors_Code]', N'IX_Code', 'INDEX'").await.unwrap();
+    batch(&mut c, "DROP INDEX [IX_Code] ON [dbo].[DenevCloud.ERP.Colors]").await.unwrap();
+    batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Colors] ([Id], [Name], [Code]) VALUES (6, N'z', N'r1')").await.unwrap();
+    // EF Core's DropColumn script: the join has the columns it reads.
+    batch(
+        &mut c,
+        "DECLARE @var sysname; SELECT @var = [d].[name] FROM [sys].[default_constraints] [d] \
+         INNER JOIN [sys].[columns] [c] ON [d].[parent_column_id] = [c].[column_id] AND [d].[parent_object_id] = [c].[object_id] \
+         WHERE ([d].[parent_object_id] = OBJECT_ID(N'[DenevCloud.ERP.Colors]') AND [c].[name] = N'Deleted'); \
+         IF @var IS NOT NULL EXEC(N'ALTER TABLE [DenevCloud.ERP.Colors] DROP CONSTRAINT [' + @var + '];'); \
+         ALTER TABLE [DenevCloud.ERP.Colors] DROP COLUMN [Deleted];",
+    )
+    .await
+    .unwrap();
+    // The migration lock: held by one connection, refused to another
+    // within its timeout, free again once released.
+    let lock = "DECLARE @r int; EXEC @r = sp_getapplock @Resource = '__EFMigrationsLock', @LockOwner = 'Session', @LockMode = 'Exclusive', @LockTimeout = 0; SELECT @r";
+    let r = batch(&mut c, lock).await.unwrap();
+    assert_eq!(int(r.last().unwrap()), vec![0]);
+    let mut other = connect_to(&s, "denevcolors").await;
+    let r = batch(&mut other, lock).await.unwrap();
+    assert_eq!(int(r.last().unwrap()), vec![-1]);
+    batch(&mut c, "DECLARE @r int; EXEC @r = sp_releaseapplock @Resource = '__EFMigrationsLock', @LockOwner = 'Session'; SELECT @r").await.unwrap();
+    let r = batch(&mut other, lock).await.unwrap();
+    assert_eq!(int(r.last().unwrap()), vec![0]);
+    // tinyint is a TDS tinyint (EF reads a byte?), 0..=255.
+    batch(&mut c, "CREATE TABLE [dbo].[DenevCloud.ERP.Companies] ([Id] int PRIMARY KEY, [N] tinyint NULL)").await.unwrap();
+    batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Companies] VALUES (1, 255), (2, 0), (3, NULL)").await.unwrap();
+    let r = batch(&mut c, "SELECT [N] FROM [dbo].[DenevCloud.ERP.Companies] ORDER BY [Id]").await.unwrap();
+    let bytes: Vec<Option<u8>> = r[0].iter().map(|row| row.get::<u8, _>(0)).collect();
+    assert_eq!(bytes, vec![Some(255), Some(0), None]);
+    assert!(batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Companies] VALUES (4, 256)").await.is_err());
+    // A bound SELECT the engine describes as rowless (a derived table
+    // beside a ROW_NUMBER one) still sends its column metadata: the rows
+    // reached the client without it and the connection broke.
+    let q = "SELECT [d6].[Id], [d6].[c], [d8].[Name] FROM (SELECT TOP(@P1) [d].[Id], (SELECT TOP(1) [x].[Code] \
+             FROM [dbo].[DenevCloud.ERP.Colors] AS [x] WHERE [x].[Id] = [d].[Id]) AS [c] FROM [dbo].[DenevCloud.ERP.Colors] AS [d]) AS [d6] \
+             LEFT JOIN (SELECT [d7].[Name], [d7].[Id] FROM (SELECT [e].[Name], [e].[Id], ROW_NUMBER() OVER(PARTITION BY [e].[Id] ORDER BY [e].[Name]) AS [row] \
+             FROM [dbo].[DenevCloud.ERP.Colors] AS [e]) AS [d7] WHERE [d7].[row] <= 1) AS [d8] ON [d6].[Id] = [d8].[Id] ORDER BY [d6].[Id]";
+    let rows = c.query(q, &[&10i32]).await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(rows.len(), 5, "every color");
+    assert_eq!(rows[0].get::<i32, _>(0), Some(1));
+    assert_eq!(rows[0].get::<&str, _>(2), Some("Red"));
+    // Search terms a user types, bound: what is stored is found, and a value
+    // that looks like SQL is only a value.
+    batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Colors] ([Id], [Name], [Code]) VALUES (20, N'x''); DROP TABLE t; --', N'Е''\\')").await.unwrap();
+    for (term, id) in [("x'); DROP TABLE t; --", 20), ("Е'\\", 20)] {
+        let rows = c
+            .query("SELECT [d].[Id] FROM [dbo].[DenevCloud.ERP.Colors] AS [d] WHERE [d].[Name] = @P1 OR [d].[Code] = @P1", &[&term])
+            .await
+            .unwrap()
+            .into_first_result()
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().map(|r| r.get::<i32, _>(0).unwrap()).collect::<Vec<_>>(), vec![id], "{term}");
+    }
+    let r = batch(&mut c, "SELECT COUNT(*) FROM [dbo].[DenevCloud.ERP.Colors]").await.unwrap();
+    assert_eq!(int(&r[0]), vec![6], "the table is all there");
+    // Rows written with their own identity values (IDENTITY_INSERT, EF
+    // seeding, a copy's KeepIdentity) move the counter past them: the next
+    // generated id was 1, a duplicate key once it reached a copied row.
+    batch(&mut c, "CREATE TABLE [dbo].[DenevCloud.ERP.Seeded] ([Id] int IDENTITY(1,1) NOT NULL PRIMARY KEY, [Name] nvarchar(20))").await.unwrap();
+    batch(
+        &mut c,
+        "SET IDENTITY_INSERT [dbo].[DenevCloud.ERP.Seeded] ON; INSERT INTO [dbo].[DenevCloud.ERP.Seeded] ([Id], [Name]) VALUES (5, N'a'), (100, N'b'), (7, N'c'); SET IDENTITY_INSERT [dbo].[DenevCloud.ERP.Seeded] OFF",
+    )
+    .await
+    .unwrap();
+    let r = batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Seeded] ([Name]) VALUES (N'd'); SELECT CAST(SCOPE_IDENTITY() AS int)").await.unwrap();
+    assert!(int(r.last().unwrap())[0] > 100, "{:?}", int(r.last().unwrap()));
+    // SqlBulkCopy reads the identity column from FMTONLY's metadata
+    // (fIdentity) to leave it out unless KeepIdentity.
+    let r = batch(&mut c, "SET FMTONLY ON; SELECT * FROM [dbo].[DenevCloud.ERP.Seeded]; SET FMTONLY OFF").await.unwrap();
+    assert_eq!(r.iter().map(|x| x.len()).sum::<usize>(), 0, "FMTONLY answers no rows");
+    // EnsureDeleted's statement before DROP DATABASE.
+    drop(other);
+    drop(c);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "IF SERVERPROPERTY('EngineEdition') <> 5 BEGIN ALTER DATABASE [DenevColors] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; END; DROP DATABASE [DenevColors];",
+    )
+    .await
+    .unwrap();
+}
+
+/// Names keep the case they were declared in, as SQL Server shows them:
+/// SqlBulkCopy maps columns by case-sensitive name and copied nothing
+/// when `SELECT *` and sp_tablecollations answered `id`, `companyid`. An
+/// unaliased expression has no name (SqlBulkCopy and Dapper read `''`, not
+/// `count_big`), an alias stays as typed beside a column spelt otherwise,
+/// and the catalogue finds a name however a lookup spells it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_declared_names() {
+    async fn check(c: &mut Client<Compat<tokio::net::TcpStream>>, sql: &str, want: &[&str]) {
+        let mut q = c.simple_query(sql).await.unwrap();
+        let got: Vec<String> = q.columns().await.unwrap().unwrap_or_default().iter().map(|c| c.name().to_string()).collect();
+        q.into_results().await.unwrap();
+        assert_eq!(got, want, "{sql}");
+    }
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [dbo].[DenevCloud.ERP.Categories] ([Id] int IDENTITY(1,1) NOT NULL PRIMARY KEY, \
+         [CompanyId] uniqueidentifier NOT NULL, [Code] nvarchar(20) NULL, [N] int NULL); \
+         ALTER TABLE [dbo].[DenevCloud.ERP.Categories] ADD [SortOrder] int NULL; \
+         INSERT INTO [dbo].[DenevCloud.ERP.Categories] ([CompanyId], [Code], [N]) VALUES (NEWID(), N'AB-1', 1)",
+    )
+    .await
+    .unwrap();
+    check(&mut c, "SELECT * FROM [dbo].[DenevCloud.ERP.Categories]", &["Id", "CompanyId", "Code", "N", "SortOrder"]).await;
+    check(&mut c, "SELECT [c].[code], [c].[Code] AS [code2] FROM [dbo].[DenevCloud.ERP.Categories] AS [c]", &["Code", "code2"]).await;
+    check(&mut c, "SELECT COUNT_BIG(*), [n] AS [n] FROM [dbo].[DenevCloud.ERP.Categories] GROUP BY [n]", &["", "n"]).await;
+
+    let r = batch(&mut c, "EXEC sp_tablecollations_100 N'[dbo].[DenevCloud.ERP.Categories]'").await.unwrap();
+    let got: Vec<(String, Option<String>)> = r[0]
+        .iter()
+        .map(|r| (r.get::<&str, _>(1).unwrap().to_string(), r.get::<&str, _>(3).map(str::to_string)))
+        .collect();
+    assert_eq!(got.iter().map(|g| g.0.as_str()).collect::<Vec<_>>(), ["Id", "CompanyId", "Code", "N", "SortOrder"]);
+    assert_eq!(got[2].1.as_deref(), Some("SQL_Latin1_General_CP1_CI_AS"));
+
+    // The catalogue shows declared names and finds them without case.
+    let r = batch(&mut c, "SELECT name FROM sys.tables WHERE name = N'denevcloud.erp.categories'").await.unwrap();
+    assert_eq!(texts(&r[0]), [Some("DenevCloud.ERP.Categories".to_string())]);
+    let r = batch(&mut c, "SELECT t.name FROM sys.tables AS t WHERE t.name LIKE N'DENEVCLOUD.ERP.CAT%'").await.unwrap();
+    assert_eq!(texts(&r[0]), [Some("DenevCloud.ERP.Categories".to_string())]);
+    let r = c
+        .query(
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @P1 ORDER BY ORDINAL_POSITION",
+            &[&"denevcloud.erp.CATEGORIES"],
+        )
+        .await
+        .unwrap()
+        .into_first_result()
+        .await
+        .unwrap();
+    assert_eq!(texts(&r).into_iter().flatten().collect::<Vec<_>>(), ["Id", "CompanyId", "Code", "N", "SortOrder"]);
+    let r = batch(&mut c, "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[DenevCloud.ERP.Categories]') AND name <> N'id'")
+        .await
+        .unwrap();
+    assert_eq!(texts(&r[0]).into_iter().flatten().collect::<Vec<_>>(), ["CompanyId", "Code", "N", "SortOrder"]);
+
+    // Recorded, not remembered by the session: a new connection shows them.
+    drop(c);
+    let mut c = connect(&s).await;
+    check(&mut c, "SELECT * FROM [dbo].[DenevCloud.ERP.Categories]", &["Id", "CompanyId", "Code", "N", "SortOrder"]).await;
+    // A table dropped and created again shows its new spelling only.
+    batch(&mut c, "DROP TABLE [dbo].[DenevCloud.ERP.Categories]; CREATE TABLE [DENEVCLOUD.ERP.CATEGORIES] ([ID] int PRIMARY KEY)").await.unwrap();
+    let r = batch(&mut c, "SELECT name FROM sys.tables WHERE name LIKE N'denevcloud%'; SELECT name FROM sys.columns WHERE object_id = OBJECT_ID(N'[denevcloud.erp.categories]')")
+        .await
+        .unwrap();
+    assert_eq!(texts(&r[0]), [Some("DENEVCLOUD.ERP.CATEGORIES".to_string())]);
+    assert_eq!(texts(&r[1]), [Some("ID".to_string())]);
+}
+
+/// Constraint violations come back as SQL Server's: error 547 for a
+/// foreign key, 2627 for a primary or unique key, 2601 for a unique index,
+/// worded as its messages and naming everything as declared (the engine's
+/// read `"denevcloud․erp․kids"`). And sp_rename keeps the declared names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_constraint_errors() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [dbo].[DenevCloud.ERP.Companies] ([Id] int NOT NULL, [Code] nvarchar(20) NOT NULL, [Tax] nvarchar(20) NULL, \
+         CONSTRAINT [PK_DenevCloud.ERP.Companies] PRIMARY KEY ([Id]), CONSTRAINT [AK_Companies_Tax] UNIQUE ([Tax])); \
+         CREATE UNIQUE INDEX [IX_DenevCloud.ERP.Companies_Code] ON [dbo].[DenevCloud.ERP.Companies] ([Code]); \
+         CREATE TABLE [dbo].[DenevCloud.ERP.ClientSpecifics] ([Id] int NOT NULL PRIMARY KEY, [CompanyId] int NOT NULL, \
+         CONSTRAINT [FK_DenevCloud.ERP.ClientSpecifics_DenevCloud.ERP.Companies_CompanyId] FOREIGN KEY ([CompanyId]) \
+         REFERENCES [dbo].[DenevCloud.ERP.Companies] ([Id])); \
+         INSERT INTO [dbo].[DenevCloud.ERP.Companies] ([Id], [Code], [Tax]) VALUES (1, N'C1', N'T1'); \
+         INSERT INTO [dbo].[DenevCloud.ERP.ClientSpecifics] ([Id], [CompanyId]) VALUES (10, 1)",
+    )
+    .await
+    .unwrap();
+    let fails = |e: Result<Vec<Vec<tiberius::Row>>, tiberius::error::Error>| -> (u32, String) {
+        let e = e.err().expect("refused");
+        let tiberius::error::Error::Server(t) = &e else { panic!("{e}") };
+        (t.code(), t.message().to_string())
+    };
+    let (n, m) = fails(batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.ClientSpecifics] ([Id], [CompanyId]) VALUES (11, 99)").await);
+    assert_eq!(n, 547, "{m}");
+    assert!(
+        m.starts_with(
+            "The INSERT statement conflicted with the FOREIGN KEY constraint \"FK_DenevCloud.ERP.ClientSpecifics_DenevCloud.ERP.Companies_CompanyId\". \
+             The conflict occurred in database \"postgres\", table \"dbo.DenevCloud.ERP.Companies\", column 'Id'."
+        ),
+        "{m}"
+    );
+    assert!(m.contains("\"FK_DenevCloud.ERP.ClientSpecifics_DenevCloud.ERP.Companies_CompanyId\""), "{m}");
+    assert!(!m.contains('\u{2024}'), "{m}");
+    let (n, m) = fails(batch(&mut c, "DELETE FROM [dbo].[DenevCloud.ERP.Companies] WHERE [Id] = 1").await);
+    assert_eq!(n, 547, "{m}");
+    assert!(
+        m.starts_with("The DELETE statement conflicted with the REFERENCE constraint \"FK_DenevCloud.ERP.ClientSpecifics_DenevCloud.ERP.Companies_CompanyId\".")
+            && m.contains("table \"dbo.DenevCloud.ERP.ClientSpecifics\", column 'CompanyId'."),
+        "{m}"
+    );
+    let (n, m) = fails(batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Companies] ([Id], [Code]) VALUES (1, N'C9')").await);
+    assert_eq!(n, 2627, "{m}");
+    assert!(
+        m.starts_with("Violation of PRIMARY KEY constraint 'PK_DenevCloud.ERP.Companies'. Cannot insert duplicate key in object 'dbo.DenevCloud.ERP.Companies'."),
+        "{m}"
+    );
+    let (n, m) = fails(batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Companies] ([Id], [Code], [Tax]) VALUES (2, N'C2', N'T1')").await);
+    assert_eq!(n, 2627, "{m}");
+    assert!(m.starts_with("Violation of UNIQUE KEY constraint 'AK_Companies_Tax'."), "{m}");
+    let (n, m) = fails(batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Companies] ([Id], [Code]) VALUES (3, N'c1')").await);
+    assert_eq!(n, 2601, "{m}");
+    assert!(
+        m.starts_with("Cannot insert duplicate key row in object 'dbo.DenevCloud.ERP.Companies' with unique index 'IX_DenevCloud.ERP.Companies_Code'."),
+        "{m}"
+    );
+
+    // sp_rename: the new spellings show, a column's and an index's.
+    batch(&mut c, "EXEC sp_rename N'[dbo].[DenevCloud.ERP.Companies].[Tax]', N'TaxNumber', 'COLUMN'").await.unwrap();
+    batch(&mut c, "EXEC sp_rename N'[DenevCloud.ERP.Companies].[IX_DenevCloud.ERP.Companies_Code]', N'IX_Code', 'INDEX'").await.unwrap();
+    let mut q = c.simple_query("SELECT * FROM [dbo].[DenevCloud.ERP.Companies]").await.unwrap();
+    let got: Vec<String> = q.columns().await.unwrap().unwrap_or_default().iter().map(|c| c.name().to_string()).collect();
+    q.into_results().await.unwrap();
+    assert_eq!(got, ["Id", "Code", "TaxNumber"]);
+    let (n, m) = fails(batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Companies] ([Id], [Code]) VALUES (3, N'C1')").await);
+    assert_eq!(n, 2601, "{m}");
+    assert!(m.contains("with unique index 'IX_Code'"), "{m}");
+    // A table renamed keeps its columns' spellings.
+    batch(&mut c, "EXEC sp_rename N'[dbo].[DenevCloud.ERP.ClientSpecifics]', N'DenevCloud.ERP.Clients'").await.unwrap();
+    let r = batch(&mut c, "SELECT name FROM sys.tables WHERE name LIKE N'%clients'; SELECT * FROM [DenevCloud.ERP.Clients]").await.unwrap();
+    assert_eq!(texts(&r[0]), [Some("DenevCloud.ERP.Clients".to_string())]);
+    let cols: Vec<&str> = r[1][0].columns().iter().map(|c| c.name()).collect();
+    assert_eq!(cols, ["Id", "CompanyId"]);
+}
+
+/// T-SQL's TRY_CAST / TRY_CONVERT are NULL where the conversion fails, as
+/// SQL Server's: they were plain casts, and the statement failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_try_cast() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(&mut c, "CREATE TABLE [Raw] ([Id] int PRIMARY KEY, [V] nvarchar(40) NULL); \
+                   INSERT INTO [Raw] VALUES (1, N'12'), (2, N'x1'), (3, NULL), (4, N'2024-02-29'), (5, N'99999999999')")
+        .await
+        .unwrap();
+    let r = batch(&mut c, "SELECT TRY_CAST([V] AS int) FROM [Raw] ORDER BY [Id]").await.unwrap();
+    let got: Vec<Option<i32>> = r[0].iter().map(|r| r.get::<i32, _>(0)).collect();
+    assert_eq!(got, [Some(12), None, None, None, None]);
+    let r = batch(&mut c, "SELECT [Id] FROM [Raw] WHERE TRY_CONVERT(int, [V]) IS NOT NULL").await.unwrap();
+    assert_eq!(int(&r[0]), [1]);
+    let r = batch(&mut c, "SELECT [Id] FROM [Raw] WHERE TRY_CAST([V] AS date) IS NOT NULL").await.unwrap();
+    assert_eq!(int(&r[0]), [4]);
+    let r = batch(&mut c, "SELECT TRY_CAST(N'abc' AS bigint), TRY_CAST(N'7' AS bigint), TRY_CONVERT(uniqueidentifier, N'nope')").await.unwrap();
+    assert_eq!(r[0][0].get::<i64, _>(0), None);
+    assert_eq!(r[0][0].get::<i64, _>(1), Some(7));
+    assert_eq!(r[0][0].get::<uuid::Uuid, _>(2), None);
+}
+
+/// A database shows the name CREATE DATABASE gave it (`DB_NAME()`,
+/// sys.databases, an error's "in database"), where the engine folds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_database_name_case() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(&mut c, "CREATE DATABASE [DenevCloudERP]").await.unwrap();
+    let r = batch(&mut c, "SELECT name FROM sys.databases WHERE name = N'denevclouderp'").await.unwrap();
+    assert_eq!(texts(&r[0]), [Some("DenevCloudERP".to_string())]);
+    // From inside it, after USE and on a login naming it.
+    let r = batch(&mut c, "USE [DENEVCLOUDERP]; SELECT DB_NAME()").await.unwrap();
+    assert_eq!(texts(r.last().unwrap()), [Some("DenevCloudERP".to_string())]);
+    drop(c);
+    let mut c = connect_to(&s, "denevclouderp").await;
+    let r = batch(&mut c, "SELECT DB_NAME()").await.unwrap();
+    assert_eq!(texts(&r[0]), [Some("DenevCloudERP".to_string())]);
+    batch(&mut c, "CREATE TABLE [P] ([Id] int PRIMARY KEY); CREATE TABLE [K] ([Id] int PRIMARY KEY, [PId] int NOT NULL, \
+                   CONSTRAINT [FK_K_P] FOREIGN KEY ([PId]) REFERENCES [P] ([Id]))")
+        .await
+        .unwrap();
+    let e = batch(&mut c, "INSERT INTO [K] VALUES (1, 9)").await.err().expect("refused");
+    assert!(e.to_string().contains("in database \"DenevCloudERP\""), "{e}");
+    drop(c);
+    // Dropped, it is gone from the list.
+    let mut c = connect(&s).await;
+    batch(&mut c, "DROP DATABASE [DenevCloudERP]").await.unwrap();
+    let r = batch(&mut c, "SELECT name FROM sys.databases WHERE name = N'denevclouderp'").await.unwrap();
+    assert!(r[0].is_empty());
+}
+
+/// `--mssql-unique-index-error 2627`: a unique index's duplicate reported
+/// as a constraint's, for applications that test that number only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_unique_index_error_setting() {
+    let s = start_config(true, 2627);
+    let mut c = connect(&s).await;
+    batch(&mut c, "CREATE TABLE [U] ([Id] int PRIMARY KEY, [Code] nvarchar(9) NOT NULL); CREATE UNIQUE INDEX [IX_U_Code] ON [U] ([Code]); \
+                   INSERT INTO [U] VALUES (1, N'a')")
+        .await
+        .unwrap();
+    let e = batch(&mut c, "INSERT INTO [U] VALUES (2, N'A')").await.err().expect("refused");
+    let tiberius::error::Error::Server(t) = &e else { panic!("{e}") };
+    assert_eq!(t.code(), 2627, "{e}");
+    assert!(t.message().contains("with unique index 'IX_U_Code'"), "{e}");
+}
+
+/// A database made before names were recorded: sp_rdb_record_names reads
+/// the script that made it (EF Core's idempotent one: IF … BEGIN … END,
+/// EXEC(N'…'), sp_rename, GO) and records the names without running it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_record_names_from_a_script() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    let script = "IF NOT EXISTS (SELECT * FROM [__EFMigrationsHistory] WHERE [MigrationId] = N'1')
+BEGIN
+    CREATE TABLE [DenevCloud.ERP.Units] ([Id] int NOT NULL IDENTITY, [ShortName] nvarchar(10) NOT NULL, [Old] int NULL,
+        CONSTRAINT [PK_DenevCloud.ERP.Units] PRIMARY KEY ([Id]));
+END;
+GO
+IF NOT EXISTS (SELECT * FROM [__EFMigrationsHistory] WHERE [MigrationId] = N'2')
+BEGIN
+    EXEC sp_rename N'[DenevCloud.ERP.Units].[Old]', N'Factor', 'COLUMN';
+    ALTER TABLE [DenevCloud.ERP.Units] ADD [Code] nvarchar(5) NULL;
+    EXEC(N'CREATE UNIQUE INDEX [IX_DenevCloud.ERP.Units_Code] ON [DenevCloud.ERP.Units] ([Code]) WHERE [Code] IS NOT NULL');
+END;
+GO";
+    // The database as an older build left it: made, its names not kept.
+    batch(
+        &mut c,
+        "CREATE TABLE [DenevCloud.ERP.Units] ([Id] int NOT NULL IDENTITY, [ShortName] nvarchar(10) NOT NULL, [Old] int NULL, \
+         CONSTRAINT [PK_DenevCloud.ERP.Units] PRIMARY KEY ([Id])); \
+         EXEC sp_rename N'[DenevCloud.ERP.Units].[Old]', N'Factor', 'COLUMN'; \
+         ALTER TABLE [DenevCloud.ERP.Units] ADD [Code] nvarchar(5) NULL; \
+         CREATE UNIQUE INDEX [IX_DenevCloud.ERP.Units_Code] ON [DenevCloud.ERP.Units] ([Code]) WHERE [Code] IS NOT NULL; \
+         INSERT INTO [DenevCloud.ERP.Units] ([ShortName], [Code]) VALUES (N'kg', N'K'); \
+         DELETE FROM __rdb_tds_names",
+    )
+    .await
+    .unwrap();
+    async fn names(c: &mut Client<Compat<tokio::net::TcpStream>>) -> Vec<String> {
+        let mut q = c.simple_query("SELECT * FROM [DenevCloud.ERP.Units]").await.unwrap();
+        let got = q.columns().await.unwrap().unwrap_or_default().iter().map(|c| c.name().to_string()).collect();
+        q.into_results().await.unwrap();
+        got
+    }
+    assert_eq!(names(&mut c).await, ["id", "shortname", "factor", "code"]);
+    // Nothing in the script runs: no table, no history row.
+    let q = format!("EXEC sp_rdb_record_names @script = N'{}'", script.replace('\'', "''"));
+    batch(&mut c, &q).await.unwrap();
+    assert_eq!(names(&mut c).await, ["Id", "ShortName", "Factor", "Code"]);
+    let r = batch(&mut c, "SELECT name FROM sys.tables WHERE name LIKE N'denevcloud%'; SELECT COUNT(*) FROM [DenevCloud.ERP.Units]").await.unwrap();
+    assert_eq!(texts(&r[0]), [Some("DenevCloud.ERP.Units".to_string())]);
+    assert_eq!(int(&r[1]), [1]);
+    let e = batch(&mut c, "INSERT INTO [DenevCloud.ERP.Units] ([ShortName], [Code]) VALUES (N'g', N'k')").await.err().expect("refused");
+    assert!(e.to_string().contains("with unique index 'IX_DenevCloud.ERP.Units_Code'"), "{e}");
 }

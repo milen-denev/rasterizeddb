@@ -542,6 +542,9 @@ fn modal_view<'a>(modal: &'a Modal, studio: &'a Studio) -> Element<'a, Message> 
                 )),
             ]
             .spacing(16),
+            field("Compression (zstd, zstd(1) to zstd(22); empty for none)", &col.compression, |v| {
+                Message::ModalField(crate::app::ModalField::Compression, v)
+            }),
             text(format!("Will be written as:  {}", col.data_type()))
                 .size(11)
                 .font(theme::MONO)
@@ -612,6 +615,9 @@ fn modal_view<'a>(modal: &'a Modal, studio: &'a Studio) -> Element<'a, Message> 
                 crate::app::ModalField::Nullable,
                 v
             )),
+            field("Compression (zstd, zstd(1) to zstd(22), none; empty is the default)", &edit.compression, |v| {
+                Message::ModalField(crate::app::ModalField::Compression, v)
+            }),
             text(match edit.statements(table) {
                 Ok(sql) => format!("Will run:\n{}", sql),
                 Err(why) => why,
@@ -621,7 +627,44 @@ fn modal_view<'a>(modal: &'a Modal, studio: &'a Studio) -> Element<'a, Message> 
             .color(theme::TEXT_FAINT),
             text(
                 "A type change rewrites every row, and is refused if a value does not convert. \
-                 Setting NOT NULL is refused while a row holds NULL."
+                 Setting NOT NULL is refused while a row holds NULL. A compression change \
+                 applies to values written from now on; RECOMPRESS rewrites the rest."
+            )
+            .size(11)
+            .color(theme::TEXT_DIM),
+            error_line(error),
+            dialog_actions("APPLY", pending),
+        ]
+        .spacing(12)
+        .width(560)
+        .into(),
+
+        Modal::RowCompression { table, edit, error } => column![
+            dialog_title(format!("Row compression of {}", table)),
+            text(format!(
+                "Now: {}. Row compression stores each row's text, JSON, bytea and array values \
+                 together as one zstd frame; per-column compression is set on each column.",
+                edit.original
+            ))
+            .size(11)
+            .color(theme::TEXT_DIM),
+            field("Row compression (zstd, zstd(1) to zstd(22), or none)", &edit.setting, |v| {
+                Message::ModalField(crate::app::ModalField::Compression, v)
+            }),
+            toggle("Rewrite existing rows now (RECOMPRESS)", edit.recompress, |v| Message::ModalToggle(
+                crate::app::ModalField::Recompress,
+                v
+            )),
+            text(match edit.statements(table) {
+                Ok(sql) => format!("Will run:\n{}", sql),
+                Err(why) => why,
+            })
+            .size(11)
+            .font(theme::MONO)
+            .color(theme::TEXT_FAINT),
+            text(
+                "A new setting applies to rows written from now on. RECOMPRESS rewrites every \
+                 row and trains a dictionary, which takes a while on a large table."
             )
             .size(11)
             .color(theme::TEXT_DIM),

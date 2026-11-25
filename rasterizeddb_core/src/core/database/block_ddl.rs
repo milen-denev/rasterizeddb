@@ -262,11 +262,7 @@ pub(crate) fn rename_target(sql: &str) -> Option<(String, String)> {
         return None;
     }
     let unquote = |raw: &str| -> Option<String> {
-        let part = raw.rsplit('.').next()?;
-        let name = match part.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
-            Some(inner) => inner.replace("\"\"", "\""),
-            None => part.to_string(),
-        };
+        let name = crate::core::sql_scan::bare_name(raw);
         (!name.is_empty()).then_some(name)
     };
     Some((unquote(words[i])?, unquote(words[i + 3])?))
@@ -284,13 +280,9 @@ pub(crate) fn targets(database: &Database, sql: &str) -> Option<(Vec<(String, Fi
     let name_at = |i: usize| -> Option<String> {
         let raw = words.get(i)?.trim_end_matches([';', '(']);
         let raw = raw.split('(').next()?;
-        let part = raw.rsplit('.').next()?;
         // Names arrive folded at the wire's entry; a quoted one keeps its
-        // case, its doubled quotes one.
-        let name = match part.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
-            Some(inner) => inner.replace("\"\"", "\""),
-            None => part.to_string(),
-        };
+        // case, its doubled quotes one, its dots its own.
+        let name = crate::core::sql_scan::bare_name(raw);
         (!name.is_empty()).then_some(name)
     };
     match (upper(0).as_str(), upper(1).as_str()) {
@@ -352,15 +344,11 @@ pub(crate) fn targets(database: &Database, sql: &str) -> Option<(Vec<(String, Fi
             for raw in rest.split(',') {
                 let mut raw = raw.trim();
                 for tail in [" CASCADE", " RESTRICT"] {
-                    if raw.len() > tail.len() && raw[raw.len() - tail.len()..].eq_ignore_ascii_case(tail) {
+                    if raw.len() > tail.len() && raw.as_bytes()[raw.len() - tail.len()..].eq_ignore_ascii_case(tail.as_bytes()) {
                         raw = raw[..raw.len() - tail.len()].trim_end();
                     }
                 }
-                let part = raw.rsplit('.').next().unwrap_or(raw);
-                let index = match part.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
-                    Some(inner) => inner.replace("\"\"", "\""),
-                    None => part.to_string(),
-                };
+                let index = crate::core::sql_scan::bare_name(raw);
                 if let Some(table) = database.index_owner(&index) {
                     if !existing.iter().any(|(t, _)| *t == table) {
                         existing.push((table, FileSet::Schema));
@@ -800,21 +788,54 @@ impl Database {
             crate::core::database::catalog::branch::block_ended(dir, u64::from(root), true);
         }
         let Some((_, steps)) = self.block_ddl.remove(&root) else { return };
+        // The intents first, each directory synced once after all of them:
+        // a migration's few hundred statements synced it a few hundred
+        // times. An intent a crash brings back belongs to a transaction that
+        // committed, which the next open reads as such and discards.
+        let mut kept = Vec::with_capacity(steps.len());
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
         for step in steps {
             if let Some(path) = &step.intent {
-                if let Err(e) = super::rewrite::remove_intent(path) {
+                if let Err(e) = super::rewrite::remove_intent_unsynced(path) {
                     // Left for the next open, which reads the outcome as
                     // committed and discards.
                     warn!("Could not remove a committed block's DDL intent {}: {}", path.display(), e);
                     continue;
                 }
+                if let Some(parent) = path.parent()
+                    && !dirs.iter().any(|d| d == parent)
+                {
+                    dirs.push(parent.to_path_buf());
+                }
             }
+            kept.push(step);
+        }
+        for dir in &dirs {
+            if let Err(e) = crate::core::wal::sync_parent_dir(&dir.join("intent")) {
+                warn!("Could not sync {} after removing a committed block's DDL intents: {}", dir.display(), e);
+            }
+        }
+        // The copies, every directory they were in synced once after.
+        let mut copy_dirs: Vec<String> = Vec::new();
+        let mut last_copy = String::new();
+        let mut forgotten: Vec<String> = Vec::new();
+        for step in kept {
             match &step.undo {
                 Undo::Restore { copy, .. } => {
                     let seed = self.seed_of(copy).await;
-                    if discard_files_in(&seed, &self.storage, self.location.as_deref(), copy, RENAMED_SUFFIXES).await {
-                        super::pool_forget(&self.storage, copy);
+                    if super::discard_files_unsynced(
+                        &seed,
+                        &self.storage,
+                        self.location.as_deref(),
+                        copy,
+                        RENAMED_SUFFIXES,
+                        &mut copy_dirs,
+                    )
+                    .await
+                    {
+                        forgotten.push(copy.clone());
                     }
+                    last_copy.clone_from(copy);
                 }
                 // The rewrite is the table's for good: the old uid's files
                 // go, as the rewrite outside a block deletes them at once.
@@ -824,6 +845,8 @@ impl Database {
                 _ => {}
             }
         }
+        super::sync_discarded_dirs(&last_copy, &copy_dirs);
+        super::pool_forget_all(&self.storage, &forgotten);
     }
 
     /// Block `root` is aborting: its DDL undone, newest first, under the

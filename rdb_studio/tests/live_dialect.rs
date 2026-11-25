@@ -537,7 +537,7 @@ async fn exercise_writes(session: &Session) {
     .into_iter()
     .find(|c| c.name == "qty")
     .expect("the qty column");
-    let mut edit = rdb_studio::app::ColumnEdit::of(&info);
+    let mut edit = rdb_studio::app::ColumnEdit::of(&info, "");
     edit.name = "quantity".into();
     edit.data_type = "BIGINT".into();
     edit.nullable = false;

@@ -1489,7 +1489,7 @@ fn decides_the_where(sql: &str, at: usize) -> bool {
             || head.ends_with('(')
             || ["AND", "OR"].iter().any(|k| {
                 head.len() >= k.len()
-                    && head[head.len() - k.len()..].eq_ignore_ascii_case(k)
+                    && head.as_bytes()[head.len() - k.len()..].eq_ignore_ascii_case(k.as_bytes())
                     && head[..head.len() - k.len()].ends_with(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             })
     };
@@ -7101,10 +7101,18 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
     // Rows told apart by a column with a nondeterministic collation are
     // refused (`collation::refuse_in_set_op`).
     let compares = parts.ops.iter().any(|op| !(op.all && op.kind == crate::core::rql::join::SetKind::Union));
+    // Rows are told apart under each column's collation
+    // (`collation::set_op_collations`): 'Abc' and 'abc' are one row of a
+    // case-insensitive column.
     let fields = |table: &str| database.schema_view(table).map(|v| v.schema().fields.to_vec());
-    if let Err(e) = crate::core::rql::collation::refuse_in_set_op(&parts.branches, compares, &fields) {
-        return ddl_error(&e);
-    }
+    let collations = if compares {
+        match crate::core::rql::collation::set_op_collations(&parts.branches, &fields) {
+            Ok(c) => c,
+            Err(e) => return ddl_error(&e),
+        }
+    } else {
+        Vec::new()
+    };
 
     // A document column compares by value, so `{"a":1}` and `{"a":1.0}` are
     // one row. A position is a document column when any branch says so
@@ -7140,6 +7148,7 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
         Ok(combined) => combined,
         Err(e) => return ddl_error(&e),
     };
+    combined.set_collations(collations);
     // A NUMERIC column whose branches keep different scales: each cell at
     // its own (`set_ops::union_decimal_scales`).
     {
@@ -13793,8 +13802,16 @@ async fn add_foreign_key(
         Err(e) => return ddl_error(&e),
     };
     let visible = crate::core::rql::nullable::visible_fields(&schema.fields);
-    if let Some(missing) =
-        fk.columns.iter().find(|c| !visible.iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(c)))
+    // A case-insensitive column's key is its companion
+    // (`collation::constraint_on_keys`), hidden as it is.
+    let companion = |c: &str| {
+        crate::core::rql::collation::is_companion(c)
+            && schema.fields.iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(c))
+    };
+    if let Some(missing) = fk
+        .columns
+        .iter()
+        .find(|c| !companion(c) && !visible.iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(c)))
     {
         return ddl_error(&format!("column \"{}\" referenced in foreign key constraint does not exist", missing));
     }
@@ -16515,6 +16532,18 @@ async fn existing_rows_break_unique(
     Ok(None)
 }
 
+/// Whether an `ALTER COLUMN … TYPE` keeps the column text (`varchar(n)`,
+/// `text`, `character varying`, `bpchar`): its case-insensitive key
+/// companion reads it the same way after, so the retype keeps it.
+fn retypes_to_text(detail: &str) -> bool {
+    let upper = detail.trim().to_ascii_uppercase();
+    let Some(at) = upper.find("TYPE") else { return false };
+    let ty = upper[at + 4..].trim_start();
+    ["TEXT", "VARCHAR", "CHARACTER VARYING", "NVARCHAR", "CITEXT"]
+        .iter()
+        .any(|t| ty.starts_with(t) && !ty[t.len()..].trim_start().starts_with("[]"))
+}
+
 /// Applies every action in an `ALTER TABLE`.
 ///
 /// A statement may carry a comma-separated action list, and each action is
@@ -16526,22 +16555,57 @@ async fn execute_alter_table(sql: &str, database: &Arc<Database>, tx: TxId) -> V
     // A column given a nondeterministic collation here would compare by its
     // bytes: refused until ALTER can make its key companion.
     if crate::core::rql::collation::declares_nondeterministic(sql) {
-        return ddl_error("ALTER TABLE giving a column a case-insensitive collation is not supported yet; declare it in CREATE TABLE");
+        // `ADD COLUMN c text COLLATE <ci>`: the column, then its key
+        // companion (`collation::add_column_statements`).
+        return match crate::core::rql::collation::add_column_statements(sql) {
+            Some(Ok(statements)) => {
+                let mut last = Vec::new();
+                for statement in statements {
+                    last = Box::pin(execute_alter_table(&statement, database, tx)).await;
+                    // A status-0 frame is success; anything else ends it.
+                    if last.first() != Some(&0) {
+                        return last;
+                    }
+                }
+                last
+            }
+            Some(Err(e)) => ddl_error(&e),
+            None => ddl_error(
+                "ALTER TABLE giving a column a case-insensitive collation is not supported yet, other than \
+                 ADD COLUMN; declare it in CREATE TABLE",
+            ),
+        };
     }
 
-    let plans = match lexer_alter::parse_alter_table_actions_tagged(sql) {
+    let mut plans = match lexer_alter::parse_alter_table_actions_tagged(sql) {
         Ok(p) => p,
         Err(e) => {
             error!("Cannot parse ALTER TABLE: {}", e);
             return ddl_error(&e);
         }
     };
+    // A UNIQUE or FOREIGN KEY added over a column with a nondeterministic
+    // collation keys its companion, as one declared in CREATE TABLE does
+    // (`collation::constraint_on_keys`).
+    for (plan, _) in plans.iter_mut() {
+        if let lexer_alter::AlterAction::ConstraintClause { drop: false, description } = &mut plan.action
+            && let Some(view) = database.schema_view(&plan.table_name)
+        {
+            let fields_of = |table: &str| database.schema_view(table).map(|v| v.schema().fields.to_vec());
+            match crate::core::rql::collation::constraint_on_keys(description, &view.schema().fields, &fields_of) {
+                Ok(Some(rewritten)) => *description = rewritten,
+                Ok(None) => {}
+                Err(e) => return ddl_error(&e),
+            }
+        }
+    }
 
     // Retyping a column with a nondeterministic collation would rebuild it
     // without its key companion, comparing by its bytes after: refused.
     for (plan, _) in &plans {
         if let lexer_alter::AlterAction::AlterColumn { name, detail } = &plan.action
             && detail.to_ascii_uppercase().contains("TYPE")
+            && !retypes_to_text(detail)
             && database
                 .schema_view(&plan.table_name)
                 .is_some_and(|v| !crate::core::rql::collation::of(name, &v.schema().fields).is_binary())
@@ -17652,7 +17716,15 @@ fn sequences_named_elsewhere(
 /// `UPDATE t SET g = DEFAULT`, which recomputes it from each row exactly as an
 /// UPDATE of its inputs would.
 async fn compute_generated_column(database: &Arc<Database>, table_name: &str, column: &str, tx: TxId) -> Vec<u8> {
-    let sql = format!("UPDATE {} SET {} = DEFAULT", table_name, column);
+    // A case-insensitive column's key companion is hidden, so no statement
+    // names it: writing its column recomputes it.
+    let sql = match crate::core::rql::collation::companion_of(column) {
+        Some((base, _)) => {
+            let base = crate::core::rql::collation::ident(base);
+            format!("UPDATE {} SET {base} = {base}", table_name)
+        }
+        None => format!("UPDATE {} SET {} = DEFAULT", table_name, column),
+    };
     let Some(purpose) = recognize_query_purpose(&sql) else {
         return ddl_error(&format!("could not compute the generated column \"{}\"", column));
     };
@@ -18171,9 +18243,19 @@ async fn execute_alter_table_action(
             json,
             modifier,
             generated,
+            compression,
             text_typmod,
         } => {
-            if nullable::is_hidden(&name) {
+            // A case-insensitive column's key companion, as
+            // `collation::add_column_statements` adds it: its expression is
+            // the key of its column, and nothing else may take the name.
+            let companion = crate::core::rql::collation::companion_of(&name).is_some_and(|(base, strength)| {
+                generated.as_deref().is_some_and(|g| {
+                    crate::core::rql::collation::companion_expression(base, strength)
+                        .is_some_and(|e| e.eq_ignore_ascii_case(g.trim()))
+                })
+            });
+            if nullable::is_hidden(&name) && !companion {
                 return ddl_error("column names beginning with __null_ are reserved");
             }
             // A dropped column keeps its slot in the row layout but is no
@@ -18293,6 +18375,21 @@ async fn execute_alter_table_action(
                 Err(e) => return ddl_error(&e),
             }
 
+            // `COMPRESSION zstd(9)`: the column's marker, with the column, on either path (a
+            // populated table's rewrite, or the reload below), fenced first as `SET COMPRESSION` fences it. A
+            // build that cannot compress accepts the clause, as at CREATE.
+            let compression_record = match compression.filter(|_| crate::core::compression::ENABLED) {
+                Some(level) => {
+                    if let Err(e) = database.require_compressed_values() {
+                        return ddl_error(&format!(
+                            "the database could not be marked for compressed values ({}): {e}",
+                            crate::core::database::incompat::COMPRESSED_VALUES_V1
+                        ));
+                    }
+                    Some(crate::core::rql::type_modifier::compression_marker(&name, Some(level)))
+                }
+                None => None,
+            };
             if row_count > 0 {
                 if !is_nullable && !fills_existing {
                     // The existing rows have no value to put there. PostgreSQL
@@ -18372,6 +18469,7 @@ async fn execute_alter_table_action(
                             text_typmod,
                             &schema.type_modifiers,
                         ))
+                        .chain(compression_record.clone())
                         .collect(),
                     new_generated.into_iter().collect(),
                     tx,
@@ -18474,6 +18572,10 @@ async fn execute_alter_table_action(
                         if !record.is_deleted {
                             schema.type_modifiers.push(record);
                         }
+                    }
+                    if let Some(record) = &compression_record {
+                        crate::core::rql::type_modifier::stage(&*io_schema, &mut writes, record)
+                            .map_err(|e| e.to_string())?;
                     }
                     if let Some(entry) = &new_generated {
                         crate::core::rql::generated::stage(&*io_schema, &mut writes, entry)

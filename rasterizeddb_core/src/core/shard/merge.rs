@@ -97,7 +97,9 @@ pub(crate) fn encode_acc(acc: &Acc, out: &mut Vec<u8>) {
             put_u64(out, sx.to_bits());
             put_u64(out, sxx.to_bits());
         }
-        Acc::Extreme { best, ty, want_max } => {
+        // `collation` is configuration, as `ty` is: the coordinator's template
+        // carries it.
+        Acc::Extreme { best, ty, want_max, collation: _ } => {
             out.push(T_EXTREME);
             // `ty` and `want_max` are configuration, checked against the
             // template on decode.
@@ -105,7 +107,9 @@ pub(crate) fn encode_acc(acc: &Acc, out: &mut Vec<u8>) {
             out.push(*want_max as u8);
             put_opt_bytes(out, best.as_deref());
         }
-        Acc::Distinct { seen, template, ty, null } => {
+        // Under a collation `seen` holds one spelling per key; the keys are
+        // derived from it again on decode, so they are not sent.
+        Acc::Distinct { seen, template, ty, null, collation: _, keys: _ } => {
             out.push(T_DISTINCT);
             out.push(ty.to_byte());
             out.push(*null as u8);
@@ -219,7 +223,7 @@ pub(crate) fn decode_acc(template: &Acc, r: &mut Reader<'_>) -> Result<Acc, Stri
             *sx = f64::from_bits(r.u64()?);
             *sxx = f64::from_bits(r.u64()?);
         }
-        Acc::Extreme { best, ty, want_max } => {
+        Acc::Extreme { best, ty, want_max, collation: _ } => {
             expect(tag, T_EXTREME)?;
             let their_ty = r.u8()?;
             let their_max = r.bool()?;
@@ -228,7 +232,7 @@ pub(crate) fn decode_acc(template: &Acc, r: &mut Reader<'_>) -> Result<Acc, Stri
             }
             *best = r.opt_bytes()?;
         }
-        Acc::Distinct { seen, template: _, ty, null } => {
+        Acc::Distinct { seen, template: _, ty, null, collation, keys } => {
             expect(tag, T_DISTINCT)?;
             if r.u8()? != ty.to_byte() {
                 return Err(mismatch("a DISTINCT aggregate is over another type"));
@@ -239,6 +243,10 @@ pub(crate) fn decode_acc(template: &Acc, r: &mut Reader<'_>) -> Result<Acc, Stri
             seen.reserve(n.min(1 << 16));
             for _ in 0..n {
                 seen.insert(r.bytes()?);
+            }
+            keys.clear();
+            if let Some(strength) = collation {
+                keys.extend(seen.iter().map(|v| crate::core::rql::collation::key_bytes(v, *strength)));
             }
         }
         Acc::Collect { values, order, by_value_descending: _, elem: _, delimiter: _, held, limit } => {

@@ -27,25 +27,198 @@ use crate::core::row::schema::SchemaField;
 /// The clause with each comparison over a nondeterministic column on its
 /// key; unchanged when the table has none.
 pub(crate) fn rewrite(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Result<String, String> {
-    if !collation::any(schema) || clause.trim().is_empty() {
+    if !collation::any(schema) {
+        return Ok(clause.to_string());
+    }
+    rewrite_with(clause, schema)
+}
+
+/// [`rewrite`] over the columns `columns` resolves: one table's, or the
+/// relations of a join ([`Relations`]).
+pub(crate) fn rewrite_with(clause: &str, columns: &dyn Columns) -> Result<String, String> {
+    if clause.trim().is_empty() {
         return Ok(clause.to_string());
     }
     let toks = lex(clause)?;
-    let out = condition(&toks, schema)?;
+    let out = condition(&toks, columns)?;
     Ok(out.join(" "))
 }
 
+/// Each window's `PARTITION BY` and `ORDER BY` (`… OVER (…)` in a select
+/// list) over a column with a nondeterministic collation, on its key: a
+/// partition key becomes the companion, a sort key the companion and then
+/// the column (as `ORDER BY` sorts one, `collation::plan_single`). `None`
+/// when nothing changed.
+pub(crate) fn rewrite_windows(select_list: &str, columns: &dyn Columns) -> Option<String> {
+    let bytes = select_list.as_bytes();
+    let mut out = String::with_capacity(select_list.len() + 16);
+    let mut changed = false;
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = crate::core::sql_scan::skip_quoted(bytes, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        let word_start = i == 0 || !crate::core::sql_scan::is_identifier_byte(bytes[i - 1]);
+        if word_start && bytes[i..].len() >= 4 && bytes[i..i + 4].eq_ignore_ascii_case(b"OVER") {
+            let mut j = i + 4;
+            if j < bytes.len() && crate::core::sql_scan::is_identifier_byte(bytes[j]) {
+                i += 1;
+                continue;
+            }
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if bytes.get(j) == Some(&b'(') {
+                let Some(close) = matching_close(bytes, j) else { return None };
+                if let Some(body) = window_body(&select_list[j + 1..close], columns) {
+                    out.push_str(&select_list[copied..j + 1]);
+                    out.push_str(&body);
+                    copied = close;
+                    changed = true;
+                }
+                i = close + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if !changed {
+        return None;
+    }
+    out.push_str(&select_list[copied..]);
+    Some(out)
+}
+
+fn matching_close(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < bytes.len() {
+        if let Some(end) = crate::core::sql_scan::skip_quoted(bytes, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// One window's body, rewritten; `None` when it reads no such column.
+fn window_body(body: &str, columns: &dyn Columns) -> Option<String> {
+    let upper = body.to_ascii_uppercase();
+    let find = |kw: &str| crate::core::rql::join::find_keyword(&upper, kw, 0);
+    let partition = find("PARTITION");
+    let order = find("ORDER");
+    let frame = ["ROWS", "RANGE", "GROUPS"].iter().filter_map(|k| find(k)).min();
+    let mut cuts: Vec<usize> = [partition, order, frame].into_iter().flatten().collect();
+    cuts.push(body.len());
+    cuts.sort();
+    let mut out = String::new();
+    let mut changed = false;
+    let head = cuts[0];
+    out.push_str(&body[..head]);
+    for w in cuts.windows(2) {
+        let (start, end) = (w[0], w[1]);
+        let piece = &body[start..end];
+        let is_partition = Some(start) == partition;
+        let is_order = Some(start) == order;
+        if !(is_partition || is_order) {
+            out.push_str(piece);
+            continue;
+        }
+        // `PARTITION BY` / `ORDER BY`, then the list.
+        let by = crate::core::rql::join::find_keyword(&piece.to_ascii_uppercase(), "BY", 0).map(|b| b + 2);
+        let Some(by) = by else {
+            out.push_str(piece);
+            continue;
+        };
+        out.push_str(&piece[..by]);
+        out.push(' ');
+        let mut items = Vec::new();
+        for item in crate::core::sql_scan::split_top_level(&piece[by..], b',') {
+            let item = item.trim();
+            // The key and what follows it (`DESC NULLS LAST`).
+            let key_end = item.find(char::is_whitespace).unwrap_or(item.len());
+            let (key, rest) = item.split_at(key_end);
+            match columns.ci(key) {
+                Some((companion, _)) => {
+                    changed = true;
+                    if is_partition {
+                        items.push(companion);
+                    } else {
+                        items.push(format!("{companion}{rest}"));
+                        items.push(item.to_string());
+                    }
+                }
+                None => items.push(item.to_string()),
+            }
+        }
+        out.push_str(&items.join(", "));
+        out.push(' ');
+    }
+    changed.then_some(out)
+}
+
+/// Where a comparison's column operands come from.
+pub(crate) trait Columns {
+    /// A column operand as written (`name`, `t.name`): the companion it
+    /// reads instead, and the collation; `None` when it is no column with a
+    /// nondeterministic one.
+    fn ci(&self, raw: &str) -> Option<(String, Strength)>;
+}
+
+impl Columns for SmallVec<[SchemaField; 20]> {
+    fn ci(&self, raw: &str) -> Option<(String, Strength)> {
+        let name = resolve_column(raw, self)?;
+        let (companion, strength) = collation::companion(&name, self)?;
+        // Keep a qualifier as written: `t.name` reads `t.__ci_name`.
+        let qualifier = match raw.rfind('.') {
+            Some(at) if !raw.trim_matches('"').eq_ignore_ascii_case(&name) => &raw[..=at],
+            _ => "",
+        };
+        Some((format!("{qualifier}{}", collation::ident(&companion.name)), strength))
+    }
+}
+
+/// The relations of a join, each by the label its columns are qualified
+/// with. A bare column is the one relation's that has it.
+pub(crate) struct Relations<'a>(pub Vec<(&'a str, &'a [SchemaField])>);
+
+impl Columns for Relations<'_> {
+    fn ci(&self, raw: &str) -> Option<(String, Strength)> {
+        let (qualifier, column) = match raw.rsplit_once('.') {
+            Some((q, c)) => (Some(q.trim_matches('"')), c.trim_matches('"')),
+            None => (None, raw.trim_matches('"')),
+        };
+        let mut found = self.0.iter().filter(|(label, fields)| {
+            qualifier.is_none_or(|q| q.eq_ignore_ascii_case(label))
+                && fields.iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))
+        });
+        let (label, fields) = found.next()?;
+        if qualifier.is_none() && found.next().is_some() {
+            return None;
+        }
+        let field = fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))?;
+        let (companion, strength) = collation::companion(&field.name, fields)?;
+        Some((format!("{}.{}", collation::ident(label), collation::ident(&companion.name)), strength))
+    }
+}
+
 /// A column operand: the companion it reads instead, and the collation.
-fn ci_column(toks: &[Tok], schema: &SmallVec<[SchemaField; 20]>) -> Option<(String, Strength)> {
+fn ci_column(toks: &[Tok], schema: &dyn Columns) -> Option<(String, Strength)> {
     let [Tok::Word(raw)] = toks else { return None };
-    let name = resolve_column(raw, schema)?;
-    let (companion, strength) = collation::companion(&name, schema)?;
-    // Keep a qualifier as written: `t.name` reads `t.__ci_name`.
-    let qualifier = match raw.rfind('.') {
-        Some(at) if !raw.trim_matches('"').eq_ignore_ascii_case(&name) => &raw[..=at],
-        _ => "",
-    };
-    Some((format!("{qualifier}{}", collation::ident(&companion.name)), strength))
+    schema.ci(raw)
 }
 
 fn depth_split<'a>(toks: &'a [Tok], at_word: &dyn Fn(&Tok, &[Tok], usize) -> bool) -> Vec<(usize, usize)> {
@@ -68,7 +241,7 @@ fn depth_split<'a>(toks: &'a [Tok], at_word: &dyn Fn(&Tok, &[Tok], usize) -> boo
 }
 
 /// A boolean condition: its `AND`/`OR` terms, each rewritten.
-fn condition(toks: &[Tok], schema: &SmallVec<[SchemaField; 20]>) -> Result<Vec<String>, String> {
+fn condition(toks: &[Tok], schema: &dyn Columns) -> Result<Vec<String>, String> {
     // The `AND` of a `BETWEEN … AND …` is not a connective.
     let mut between_open = vec![false; toks.len()];
     {
@@ -100,7 +273,7 @@ fn condition(toks: &[Tok], schema: &SmallVec<[SchemaField; 20]>) -> Result<Vec<S
 }
 
 /// One term: `NOT`s, a parenthesised condition, or a comparison.
-fn term(toks: &[Tok], schema: &SmallVec<[SchemaField; 20]>) -> Result<Vec<String>, String> {
+fn term(toks: &[Tok], schema: &dyn Columns) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut i = 0;
     while toks.get(i).is_some_and(|t| t.is_keyword("not")) {
@@ -143,11 +316,11 @@ fn render(toks: &[Tok]) -> Vec<String> {
 }
 
 /// Whether `toks` read a nondeterministic column anywhere, as a word.
-fn reads_ci(toks: &[Tok], schema: &SmallVec<[SchemaField; 20]>) -> bool {
+fn reads_ci(toks: &[Tok], schema: &dyn Columns) -> bool {
     toks.iter().enumerate().any(|(i, t)| match t {
         Tok::Word(w) => {
             !matches!(toks.get(i + 1), Some(Tok::LPar))
-                && resolve_column(w, schema).is_some_and(|c| !collation::of(&c, schema).is_binary())
+                && schema.ci(w).is_some()
         }
         _ => false,
     })
@@ -219,7 +392,7 @@ fn folded(toks: &[Tok], strength: Strength) -> Vec<String> {
 }
 
 /// One comparison, on keys when an operand is a nondeterministic column.
-fn comparison(toks: &[Tok], schema: &SmallVec<[SchemaField; 20]>) -> Result<Vec<String>, String> {
+fn comparison(toks: &[Tok], schema: &dyn Columns) -> Result<Vec<String>, String> {
     // A regular expression over such a column, as `lower_regex_operators`
     // spelled it.
     for (i, t) in toks.iter().enumerate() {
@@ -280,8 +453,43 @@ fn other_side(right: &[Tok], op: &str, strength: Strength) -> Result<Vec<String>
                 _ => return Ok(folded(right, strength)),
             };
             let inner = &right[1..close];
-            if inner.first().is_some_and(|t| t.is_keyword("select") || t.is_keyword("with")) {
-                return Err("IN (SELECT …) over a column with a case-insensitive collation is not supported yet".to_string());
+            if inner.first().is_some_and(|t| t.is_keyword("with")) {
+                return Err("IN (WITH …) over a column with a case-insensitive collation is not supported yet".to_string());
+            }
+            // `IN (SELECT [DISTINCT] x FROM …)`: the subquery's value through
+            // the key function, compared with the column's key.
+            if inner.first().is_some_and(|t| t.is_keyword("select")) {
+                let mut start = 1;
+                if inner.get(1).is_some_and(|t| t.is_keyword("distinct") || t.is_keyword("all")) {
+                    start = 2;
+                }
+                let from = depth_split(inner, &|t, _, _| t.is_keyword("from"))
+                    .first()
+                    .map(|&(_, e)| e)
+                    .filter(|&e| e < inner.len())
+                    .ok_or("IN (SELECT …) over a column with a case-insensitive collation needs a FROM")?;
+                let item = &inner[start..from];
+                if depth_split(item, &|t, _, _| matches!(t, Tok::Comma)).len() != 1
+                    || depth_split(&inner[from..], &|t, _, _| {
+                        t.is_keyword("union") || t.is_keyword("intersect") || t.is_keyword("except")
+                    })
+                    .len()
+                        != 1
+                {
+                    return Err("IN (SELECT …) over a column with a case-insensitive collation takes one plain SELECT".to_string());
+                }
+                // `x AS a`: the expression alone.
+                let item = match item.iter().rposition(|t| t.is_keyword("as")) {
+                    Some(at) if at > 0 => &item[..at],
+                    _ => item,
+                };
+                let mut out = vec!["(".to_string()];
+                out.extend(render(&inner[..start]));
+                out.extend(folded(item, strength));
+                out.extend(render(&inner[from..]));
+                out.push(")".to_string());
+                out.extend(render(&right[close + 1..]));
+                return Ok(out);
             }
             let mut out = vec!["(".to_string()];
             for (k, (s, e)) in depth_split(inner, &|t, _, _| matches!(t, Tok::Comma)).into_iter().enumerate() {
@@ -378,7 +586,11 @@ mod tests {
         // `name ~ 'b'` arrives as the `regexp_like` comparison
         // `check::lower_regex_operators` makes of it.
         assert!(rewrite("regexp_like(name, 'b') = TRUE", &s).unwrap_err().contains("regular expressions"));
-        assert!(rewrite("name IN (SELECT n FROM t)", &s).unwrap_err().contains("IN (SELECT"));
+        assert!(rewrite("name IN (SELECT a, b FROM t)", &s).unwrap_err().contains("IN (SELECT"));
+        assert_eq!(
+            rewrite("name NOT IN (SELECT DISTINCT u.n AS x FROM t u WHERE u.k = 1)", &s).unwrap(),
+            "__ci_name NOT IN ( SELECT DISTINCT __rdb_ci_key( u.n ) FROM t u WHERE u.k = 1 )"
+        );
         assert!(rewrite("name = tag", &s).unwrap_err().contains("could not determine which collation"));
     }
 }

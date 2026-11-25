@@ -32,6 +32,7 @@ impl DbStorageProvider {
         match self {
             #[cfg(feature = "kv_storage")]
             Self::KeyValue(kv) => kv.drop_name(&name).await,
+            Self::File(p) => p.drop_named(&name),
             _ => self.create_new(name).await.drop_io(),
         }
     }

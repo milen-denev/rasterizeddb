@@ -901,3 +901,37 @@ async fn without_the_feature_clauses_are_accepted_and_ignored() {
     ok(&db, "ALTER TABLE d RECOMPRESS").await;
     assert_eq!(bodies(&db, "d").await, vec![(1, document(1))]);
 }
+
+/// `ALTER TABLE … ADD COLUMN … COMPRESSION` takes effect, on an empty table
+/// and on one with rows (whose add rewrites the table), with the clause
+/// before or after a `DEFAULT`. It was accepted and dropped: the column
+/// stored its values uncompressed and no catalogue said otherwise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_column_takes_its_compression() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = open(dir.path()).await;
+    ok(&database, "CREATE TABLE full_t (id INT PRIMARY KEY)").await;
+    ok(&database, "INSERT INTO full_t VALUES (1)").await;
+    ok(&database, "ALTER TABLE full_t ADD COLUMN body TEXT DEFAULT '' COMPRESSION zstd(9)").await;
+    ok(&database, "ALTER TABLE full_t ADD COLUMN memo TEXT COMPRESSION zstd DEFAULT 'x'").await;
+    ok(&database, "CREATE TABLE empty_t (id INT PRIMARY KEY)").await;
+    ok(&database, "ALTER TABLE empty_t ADD COLUMN body TEXT COMPRESSION zstd(4)").await;
+    assert!(refused(&database, "ALTER TABLE empty_t ADD COLUMN n INT COMPRESSION zstd").await.contains("does not support compression"));
+
+    let full = stats(&database, "full_t").await;
+    let listed = stat(&full, "compressed_columns").unwrap_or_default().to_string();
+    assert!(listed.contains("body=zstd(9)") && listed.contains("memo=zstd"), "{listed}");
+    assert_eq!(stat(&stats(&database, "empty_t").await, "compressed_columns"), Some("body=zstd(4)"));
+
+    // A value written now is stored compressed, and reads back as written.
+    let body = "abc".repeat(400);
+    ok(&database, &format!("INSERT INTO full_t (id, body) VALUES (2, '{body}')")).await;
+    let after = stats(&database, "full_t").await;
+    assert_eq!(stat(&after, "compressed_values"), Some("1"), "{after:?}");
+    assert_eq!(bodies_of(&database).await, vec![(1, String::new()), (2, body)]);
+}
+
+async fn bodies_of(database: &Arc<Database>) -> Vec<(i64, String)> {
+    let rows = rows(database, "SELECT id, body FROM full_t ORDER BY id").await;
+    rows.iter().map(|r| (int(r, 0), text(r, 1))).collect()
+}

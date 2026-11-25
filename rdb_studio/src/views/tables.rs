@@ -172,6 +172,7 @@ fn detail(studio: &Studio) -> Element<'_, Message> {
         _ => super::SortKey::text(&info.name),
     });
 
+    let compressions = crate::app::column_compressions(&studio.table_stats);
     let mut column_rows = column![].spacing(0);
     for (index, info) in infos.into_iter().enumerate() {
         let mut flags = row![].spacing(4);
@@ -192,6 +193,9 @@ fn detail(studio: &Studio) -> Element<'_, Message> {
         }
         if let Some(at) = partition_key.iter().position(|k| k.eq_ignore_ascii_case(&info.name)) {
             flags = flags.push(super::pill(format!("PART {}", at + 1), theme::RUST));
+        }
+        if let Some((_, method)) = compressions.iter().find(|(column, _)| column == &info.name) {
+            flags = flags.push(super::pill(method.to_ascii_uppercase(), theme::OK));
         }
 
         let line = super::grid_row(
@@ -254,6 +258,24 @@ fn detail(studio: &Studio) -> Element<'_, Message> {
     .spacing(6);
     if studio.flavor() == crate::model::Flavor::Rasterized {
         actions = actions.push(small_button("CHECK INDEXES", Some(Message::CheckIndexes)));
+        actions = actions.push(small_button(
+            "COMPRESSION",
+            Some(Message::OpenModal(ModalKind::RowCompression)),
+        ));
+        actions = actions.push(small_button(
+            "RECOMPRESS",
+            Some(confirm(
+                "Recompress table",
+                format!(
+                    "This rewrites every row of `{}` under its current compression settings and \
+                     trains a dictionary for each compressed column. It takes a while on a large \
+                     table, and the table is locked against writes meanwhile.",
+                    name
+                ),
+                format!("ALTER TABLE {} RECOMPRESS", crate::dialect::quote_ident(&name)),
+                Refresh::CurrentTable,
+            )),
+        ));
     }
     let actions = actions.push(row![
         small_button("BROWSE", Some(Message::SelectTab(crate::app::Tab::Data))),
@@ -285,6 +307,9 @@ fn detail(studio: &Studio) -> Element<'_, Message> {
     }
     if let Some(note) = amplification_note(&studio.table_stats) {
         body = body.push(text(note).size(11).color(theme::WARN));
+    }
+    if let Some(line) = compression_line(&studio.table_stats) {
+        body = body.push(text(line).size(11).color(theme::TEXT_DIM));
     }
     let body = body
         .push(section_label("COLUMNS"))
@@ -330,6 +355,41 @@ fn amplification_note(stats: &[Stat]) -> Option<String> {
         "{ratio:.0} row slots per live row{counts}: every scan walks the dead versions too. \
          VACUUM FULL compacts the table back toward one slot per row."
     ))
+}
+
+/// A line on what a table's compression asks and gets, from `SHOW TABLE
+/// STATS` (RasterizedDB reports it only for a table that asked for some):
+/// "Compressed: body zstd(9), note zstd · rows zstd(6) · 1,204 values, 88
+/// row tails, 12.0 MB stored as 3.1 MB (3.9×) since the table opened".
+fn compression_line(stats: &[Stat]) -> Option<String> {
+    let find = |metric: &str| stats.iter().find(|s| s.metric == metric).map(|s| s.value.trim());
+    let row = find("row_compression")?;
+    let columns = crate::app::column_compressions(stats);
+    let mut parts = Vec::new();
+    if !columns.is_empty() {
+        parts.push(
+            columns.iter().map(|(column, method)| format!("{column} {method}")).collect::<Vec<_>>().join(", "),
+        );
+    }
+    if row != "none" {
+        parts.push(format!("rows {row}"));
+    }
+    let number = |metric: &str| find(metric).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let (values, tails) = (number("compressed_values"), number("compressed_row_tails"));
+    let (raw, stored) = (number("compression_raw_bytes"), number("compression_stored_bytes"));
+    if values + tails > 0 && stored > 0 {
+        parts.push(format!(
+            "{} values, {} row tails, {} stored as {} ({:.1}×) since the table opened",
+            count(values),
+            count(tails),
+            bytes(raw),
+            bytes(stored),
+            raw as f64 / stored as f64
+        ));
+    } else {
+        parts.push("nothing written compressed since the table opened".to_string());
+    }
+    Some(format!("Compressed: {}", parts.join(" · ")))
 }
 
 fn stat<'a>(studio: &'a Studio, metric: &str) -> &'a str {
@@ -891,6 +951,34 @@ mod tests {
 
     /// The heartbeat table: one live row over thousands of slots is the case
     /// this note exists for, and it names both counts.
+    /// A table that asked for compression says what it asked and what it
+    /// got; one that did not (no `row_compression` row) says nothing; and the
+    /// pane renders with the compressed columns tagged.
+    #[test]
+    fn compression_is_summarised_and_tagged() {
+        let asked = stats(&[
+            ("compressed_columns", "body=zstd(9) +dictionary"),
+            ("row_compression", "zstd(6)"),
+            ("compressed_values", "1204"),
+            ("compressed_row_tails", "88"),
+            ("compression_raw_bytes", "12000000"),
+            ("compression_stored_bytes", "3000000"),
+        ]);
+        let line = compression_line(&asked).expect("a line");
+        assert!(line.starts_with("Compressed: body zstd(9) · rows zstd(6) · "), "{line}");
+        assert!(line.contains("(4.0×)"), "{line}");
+        let nothing_yet = stats(&[("compressed_columns", "note=zstd"), ("row_compression", "none")]);
+        assert_eq!(
+            compression_line(&nothing_yet).as_deref(),
+            Some("Compressed: note zstd · nothing written compressed since the table opened")
+        );
+        assert_eq!(compression_line(&stats(&[("live_rows", "5")])), None);
+
+        let mut studio = studio_with_tables();
+        studio.table_stats = asked;
+        let _ = view(&studio);
+    }
+
     #[test]
     fn an_amplified_table_is_pointed_out_with_its_counts() {
         let note = super::amplification_note(&stats(&[

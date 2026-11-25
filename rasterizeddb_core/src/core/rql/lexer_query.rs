@@ -2189,6 +2189,14 @@ fn parse_select_query(
         (columns_part, false)
     };
 
+    // A window over a column with a nondeterministic collation partitions
+    // and sorts by its key (`collate_rewrite::rewrite_windows`).
+    let windowed_ci = if crate::core::rql::collation::any(schema) {
+        crate::core::tokenizer::collate_rewrite::rewrite_windows(columns_part, schema)
+    } else {
+        None
+    };
+    let columns_part = windowed_ci.as_deref().unwrap_or(columns_part);
     let mut select_items = parse_select_items(columns_part, schema)?;
 
     // `DISTINCT ON (k, …)`: each key a select item it names or an expression
@@ -2424,6 +2432,27 @@ fn parse_select_query(
     // `GROUP BY city HAVING count(*) > 1`. Both used to be rejected. The fold
     // needs no special case: it already emits the grouping key for a plain
     // column, so a plan whose items are all keys yields one row per group.
+    // Grouping by a column with a nondeterministic collation groups by its
+    // key (`collation::group_by_keys`); a `SELECT DISTINCT` of plain columns
+    // over one is that grouping.
+    let as_distinct = distinct && !has_aggregate && group_by.is_empty() && distinct_on.is_empty();
+    let grouped_distinct =
+        crate::core::rql::collation::group_by_keys(&mut group_by, &mut select_items, schema, as_distinct);
+    let distinct = distinct && !grouped_distinct;
+    // A DISTINCT left over a plain column with a nondeterministic collation
+    // (beside an expression, which compares by its bytes) would tell its
+    // spellings apart.
+    if distinct
+        && let Some(f) = select_items.iter().find_map(|i| match i {
+            SelectItem::Column { field, .. } if !crate::core::rql::collation::of(&field.name, schema).is_binary() => Some(field),
+            _ => None,
+        })
+    {
+        return Err(format!(
+            "SELECT DISTINCT over column \"{}\" beside an expression, which has a case-insensitive collation, is not supported yet",
+            f.name
+        ));
+    }
     let is_grouped = has_aggregate || !group_by.is_empty();
     // A key naming an output column sorts by that column's value
     // (`output_item_named`). A plain column item sorts by its source column,
@@ -2449,11 +2478,15 @@ fn parse_select_query(
     // would compare them by their bytes is refused (`collation::plan_single`).
     let order_terms =
         crate::core::rql::collation::plan_single(columns_part, schema, order_terms, &group_by, is_grouped, distinct)?;
+    crate::core::rql::collation::mark_aggregates(&mut select_items, schema);
 
     // HAVING with nothing to group by is the whole table as one group, which
     // only means something if there is an aggregate to test.
     if having_raw.is_some() && !is_grouped {
         return Err("HAVING requires an aggregate in the SELECT list".to_string());
+    }
+    if let Some(text) = having_raw.as_deref() {
+        crate::core::rql::collation::refuse_in_having(text, schema)?;
     }
 
     // Every non-aggregate select item of a grouped query must be a grouping

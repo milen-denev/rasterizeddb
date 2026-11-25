@@ -33,7 +33,9 @@ impl Database {
             fields: ct
                 .columns
                 .iter()
-                .filter(|c| !crate::core::rql::nullable::is_hidden(&c.name))
+                .filter(|c| {
+                    !crate::core::rql::nullable::is_hidden(&c.name) || crate::core::rql::collation::is_companion(&c.name)
+                })
                 .map(|c| (c.name.as_str(), false, ct.unique_columns.iter().any(|u| u.eq_ignore_ascii_case(&c.name))))
                 .collect(),
             primary_key: ct.primary_key.as_deref(),
@@ -50,7 +52,13 @@ impl Database {
             if let Some(missing) = fk.columns.iter().find(|column| {
                 !ct.columns
                     .iter()
-                    .any(|c| !crate::core::rql::nullable::is_hidden(&c.name) && c.name.eq_ignore_ascii_case(column))
+                    // A key over a case-insensitive column pairs its companion
+                    // (`collation::apply_to_create`), hidden as it is.
+                    .any(|c| {
+                        (!crate::core::rql::nullable::is_hidden(&c.name)
+                            || crate::core::rql::collation::is_companion(&c.name))
+                            && c.name.eq_ignore_ascii_case(column)
+                    })
             }) {
                 return Some(format!("column \"{}\" referenced in foreign key constraint does not exist", missing));
             }

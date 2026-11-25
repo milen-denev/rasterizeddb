@@ -741,7 +741,7 @@ fn checked_cast(
         // `CAST(x AS d)`: from `CAST` to its closing parenthesis.
         let Some(open) = unmatched_open_before(sql, cast_at) else { return Ok(None) };
         let head = sql[..open].trim_end();
-        if !(head.len() >= 4 && head[head.len() - 4..].eq_ignore_ascii_case("CAST")) {
+        if !(head.len() >= 4 && head.as_bytes()[head.len() - 4..].eq_ignore_ascii_case(b"CAST")) {
             return Ok(None);
         }
         let Some(close) = sql[type_end..].find(')').map(|p| type_end + p) else { return Ok(None) };

@@ -974,6 +974,9 @@ pub(crate) struct Column {
     pub(crate) ty: ColType,
     /// The engine's type, for reading its text.
     pub(crate) oid: u32,
+    /// A table's identity column (COLMETADATA's fIdentity): SqlBulkCopy
+    /// leaves it out unless KeepIdentity, as SQL Server generates it.
+    pub(crate) identity: bool,
 }
 
 /// The column an engine column is sent as. Numeric with no declared scale
@@ -981,6 +984,8 @@ pub(crate) struct Column {
 pub(crate) fn column_type(oid: u32, typmod: i32) -> Option<ColType> {
     Some(match oid {
         16 => ColType::Bit,
+        // The engine's unsigned byte (`db_type::U8_TYPMOD`): a tinyint.
+        20 if typmod == crate::core::db_type::U8_TYPMOD => ColType::Int(1),
         21 => ColType::Int(2),
         23 | 26 => ColType::Int(4),
         20 => ColType::Int(8),
@@ -1012,9 +1017,12 @@ pub(crate) fn col_metadata(out: &mut Vec<u8>, columns: &[Column]) {
     out.extend_from_slice(&(columns.len() as u16).to_le_bytes());
     for c in columns {
         out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&0x0009u16.to_le_bytes());
+        // fNullable | read/write; an identity column fIdentity, not null.
+        let flags: u16 = if c.identity { 0x0018 } else { 0x0009 };
+        out.extend_from_slice(&flags.to_le_bytes());
         type_info(out, &c.ty);
-        put_b_varchar(out, &c.name);
+        // A bracketed alias keeps its dots (`lex::NAME_DOT`).
+        put_b_varchar(out, &super::lex::decode_dots(&c.name));
     }
 }
 

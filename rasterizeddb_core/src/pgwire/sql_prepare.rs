@@ -130,6 +130,12 @@ pub(crate) fn bind(name: &str, prepared: &Prepared, args: &[String]) -> Result<S
                     // A row count reads a bare number: `LIMIT CAST(8 AS
                     // bigint)` was cut at its first space and refused.
                     Some(_) if after_row_count_keyword(&out) && is_integer_literal(arg) => out.push_str(arg.trim()),
+                    // A string for a text parameter is that text as written:
+                    // an untyped string resolves to text anyway, and an
+                    // operand such as a JSON key (`doc -> $1 ->> 'k'`) reads
+                    // a literal, not `CAST('0' AS text)`, which it refused as
+                    // "neither a column nor a value".
+                    Some(ty) if is_text_type(ty) && is_string_literal(arg) => out.push_str(arg.trim()),
                     Some(ty) => out.push_str(&format!("CAST({arg} AS {ty})")),
                     None => out.push_str(&format!("({arg})")),
                 }
@@ -153,7 +159,7 @@ fn after_row_count_keyword(text: &str) -> bool {
     }
     ["LIMIT", "OFFSET"].iter().any(|kw| {
         trimmed.len() >= kw.len()
-            && trimmed[trimmed.len() - kw.len()..].eq_ignore_ascii_case(kw)
+            && trimmed.as_bytes()[trimmed.len() - kw.len()..].eq_ignore_ascii_case(kw.as_bytes())
             && trimmed[..trimmed.len() - kw.len()]
                 .bytes()
                 .last()
@@ -162,6 +168,21 @@ fn after_row_count_keyword(text: &str) -> bool {
 }
 
 /// A plain non-negative integer, as `EXECUTE p (8)` passes one.
+/// `text`, `varchar`/`character varying` without a length (a length would
+/// cut the value): the types an untyped string becomes as it is.
+fn is_text_type(ty: &str) -> bool {
+    let ty = ty.trim().to_ascii_lowercase();
+    matches!(ty.as_str(), "text" | "varchar" | "character varying" | "pg_catalog.text")
+}
+
+/// One complete `'…'` string, doubled quotes inside.
+fn is_string_literal(arg: &str) -> bool {
+    let arg = arg.trim();
+    arg.len() >= 2
+        && arg.starts_with('\'')
+        && crate::core::sql_scan::quoted_end(arg.as_bytes(), 0, b'\'') == arg.len()
+}
+
 fn is_integer_literal(arg: &str) -> bool {
     let arg = arg.trim();
     !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_digit())
@@ -209,7 +230,15 @@ mod tests {
     #[test]
     fn arguments_go_in_for_their_parameters() {
         let p = Prepared { types: vec!["int".into(), "text".into()], body: "SELECT $1 + 1, '$1', $2".into() };
-        assert_eq!(bind("p", &p, &["4".into(), "'x'".into()]).unwrap(), "SELECT CAST(4 AS int) + 1, '$1', CAST('x' AS text)");
+        assert_eq!(bind("p", &p, &["4".into(), "'x'".into()]).unwrap(), "SELECT CAST(4 AS int) + 1, '$1', 'x'");
+        // A string for a text parameter goes in as written, so an operand
+        // that reads a literal (a JSON key) takes it; anything else is cast.
+        let key = Prepared { types: vec!["text".into(), "varchar(2)".into()], body: "SELECT d -> $1 ->> 'k', $2".into() };
+        assert_eq!(
+            bind("k", &key, &["'0'".into(), "'abc'".into()]).unwrap(),
+            "SELECT d -> '0' ->> 'k', CAST('abc' AS varchar(2))"
+        );
+        assert_eq!(bind("k", &key, &["upper('a')".into(), "'x'".into()]).unwrap(), "SELECT d -> CAST(upper('a') AS text) ->> 'k', CAST('x' AS varchar(2))");
         assert_eq!(bind("p", &p, &["4".into()]).unwrap_err().0, "42601");
         let untyped = Prepared { types: vec![], body: "SELECT $2".into() };
         assert_eq!(bind("u", &untyped, &["1".into()]).unwrap_err().0, "42P02");

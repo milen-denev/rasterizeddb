@@ -370,12 +370,13 @@ fn unqualify_write_target(sql: &str, skip: usize) -> String {
 fn normalize_table_name(raw: &str) -> String {
     let raw = raw.trim().trim_end_matches(|c| c == ',' || c == ';');
     let raw = raw.split('(').next().unwrap_or(raw);
-    raw.split('.')
-        .next_back()
-        .unwrap_or(raw)
-        .trim()
-        .trim_matches('"')
-        .to_string()
+    // The last segment outside double quotes: `"a.b.c"` is one name, its
+    // dots its own (SQL Server's `[DenevCloud.ERP.Colors]` arrives so).
+    let last = crate::core::sql_scan::last_name_segment(raw.trim()).trim();
+    match last.strip_prefix('"').and_then(|l| l.strip_suffix('"')) {
+        Some(inner) => inner.replace("\"\"", "\""),
+        None => last.to_string(),
+    }
 }
 
 /// Recognizes common PostgreSQL SQL and returns a QueryPurpose with the query string.
