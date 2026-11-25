@@ -4853,6 +4853,7 @@ dependencies = [
  "socket2",
  "tokio",
  "tokio-rustls",
+ "zstd",
 ]
 
 [[package]]
