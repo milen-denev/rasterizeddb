@@ -1076,7 +1076,8 @@ async fn tiberius_ef_core_shapes() {
     .await
     .unwrap();
     assert_eq!(int(&r[0]), vec![1]);
-    assert!(texts(&r[1]).contains(&Some("denevcloud.erp.colors".into())), "{:?}", texts(&r[1]));
+    // Shown as declared (SqlBulkCopy matches names exactly), found without case.
+    assert!(texts(&r[1]).contains(&Some("DenevCloud.ERP.Colors".into())), "{:?}", texts(&r[1]));
     // OUTER APPLY, as EF writes FirstOrDefault in a projection.
     let r = batch(
         &mut c,
@@ -1183,4 +1184,75 @@ async fn tiberius_ef_core_shapes() {
     )
     .await
     .unwrap();
+}
+
+/// Names keep the case they were declared in, as SQL Server shows them:
+/// SqlBulkCopy maps columns by case-sensitive name and copied nothing
+/// when `SELECT *` and sp_tablecollations answered `id`, `companyid`. An
+/// unaliased expression has no name (SqlBulkCopy and Dapper read `''`, not
+/// `count_big`), an alias stays as typed beside a column spelt otherwise,
+/// and the catalogue finds a name however a lookup spells it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_declared_names() {
+    async fn check(c: &mut Client<Compat<tokio::net::TcpStream>>, sql: &str, want: &[&str]) {
+        let mut q = c.simple_query(sql).await.unwrap();
+        let got: Vec<String> = q.columns().await.unwrap().unwrap_or_default().iter().map(|c| c.name().to_string()).collect();
+        q.into_results().await.unwrap();
+        assert_eq!(got, want, "{sql}");
+    }
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [dbo].[DenevCloud.ERP.Categories] ([Id] int IDENTITY(1,1) NOT NULL PRIMARY KEY, \
+         [CompanyId] uniqueidentifier NOT NULL, [Code] nvarchar(20) NULL, [N] int NULL); \
+         ALTER TABLE [dbo].[DenevCloud.ERP.Categories] ADD [SortOrder] int NULL; \
+         INSERT INTO [dbo].[DenevCloud.ERP.Categories] ([CompanyId], [Code], [N]) VALUES (NEWID(), N'AB-1', 1)",
+    )
+    .await
+    .unwrap();
+    check(&mut c, "SELECT * FROM [dbo].[DenevCloud.ERP.Categories]", &["Id", "CompanyId", "Code", "N", "SortOrder"]).await;
+    check(&mut c, "SELECT [c].[code], [c].[Code] AS [code2] FROM [dbo].[DenevCloud.ERP.Categories] AS [c]", &["Code", "code2"]).await;
+    check(&mut c, "SELECT COUNT_BIG(*), [n] AS [n] FROM [dbo].[DenevCloud.ERP.Categories] GROUP BY [n]", &["", "n"]).await;
+
+    let r = batch(&mut c, "EXEC sp_tablecollations_100 N'[dbo].[DenevCloud.ERP.Categories]'").await.unwrap();
+    let got: Vec<(String, Option<String>)> = r[0]
+        .iter()
+        .map(|r| (r.get::<&str, _>(1).unwrap().to_string(), r.get::<&str, _>(3).map(str::to_string)))
+        .collect();
+    assert_eq!(got.iter().map(|g| g.0.as_str()).collect::<Vec<_>>(), ["Id", "CompanyId", "Code", "N", "SortOrder"]);
+    assert_eq!(got[2].1.as_deref(), Some("SQL_Latin1_General_CP1_CI_AS"));
+
+    // The catalogue shows declared names and finds them without case.
+    let r = batch(&mut c, "SELECT name FROM sys.tables WHERE name = N'denevcloud.erp.categories'").await.unwrap();
+    assert_eq!(texts(&r[0]), [Some("DenevCloud.ERP.Categories".to_string())]);
+    let r = batch(&mut c, "SELECT t.name FROM sys.tables AS t WHERE t.name LIKE N'DENEVCLOUD.ERP.CAT%'").await.unwrap();
+    assert_eq!(texts(&r[0]), [Some("DenevCloud.ERP.Categories".to_string())]);
+    let r = c
+        .query(
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @P1 ORDER BY ORDINAL_POSITION",
+            &[&"denevcloud.erp.CATEGORIES"],
+        )
+        .await
+        .unwrap()
+        .into_first_result()
+        .await
+        .unwrap();
+    assert_eq!(texts(&r).into_iter().flatten().collect::<Vec<_>>(), ["Id", "CompanyId", "Code", "N", "SortOrder"]);
+    let r = batch(&mut c, "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[DenevCloud.ERP.Categories]') AND name <> N'id'")
+        .await
+        .unwrap();
+    assert_eq!(texts(&r[0]).into_iter().flatten().collect::<Vec<_>>(), ["CompanyId", "Code", "N", "SortOrder"]);
+
+    // Recorded, not remembered by the session: a new connection shows them.
+    drop(c);
+    let mut c = connect(&s).await;
+    check(&mut c, "SELECT * FROM [dbo].[DenevCloud.ERP.Categories]", &["Id", "CompanyId", "Code", "N", "SortOrder"]).await;
+    // A table dropped and created again shows its new spelling only.
+    batch(&mut c, "DROP TABLE [dbo].[DenevCloud.ERP.Categories]; CREATE TABLE [DENEVCLOUD.ERP.CATEGORIES] ([ID] int PRIMARY KEY)").await.unwrap();
+    let r = batch(&mut c, "SELECT name FROM sys.tables WHERE name LIKE N'denevcloud%'; SELECT name FROM sys.columns WHERE object_id = OBJECT_ID(N'[denevcloud.erp.categories]')")
+        .await
+        .unwrap();
+    assert_eq!(texts(&r[0]), [Some("DENEVCLOUD.ERP.CATEGORIES".to_string())]);
+    assert_eq!(texts(&r[1]), [Some("ID".to_string())]);
 }

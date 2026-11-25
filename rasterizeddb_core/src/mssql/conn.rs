@@ -85,6 +85,42 @@ struct Var {
 }
 
 /// The parameters of an `sp_executesql` (or prepared) statement.
+/// The spellings tables and columns were declared with, read from
+/// `translate::NAMES_TABLE`: per relation its own (`""`) and each column's,
+/// all keyed folded. Read again after this session's DDL, on another
+/// database, or after `NAMES_TTL` (another session's DDL).
+#[derive(Default)]
+struct NameCache {
+    database: usize,
+    read: Option<std::time::Instant>,
+    dirty: bool,
+    relations: HashMap<String, HashMap<String, String>>,
+    /// A column's spelling over every relation, where they agree (`None`
+    /// where two relations spell it differently).
+    columns: HashMap<String, Option<String>>,
+}
+
+const NAMES_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl NameCache {
+    /// A result column's name as declared: an all-lower-case name the
+    /// engine reports (`SELECT *`, a plain column) shown with the spelling
+    /// every relation declared it with; any other name as it is.
+    fn column_shown(&self, name: &str) -> String {
+        if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            return name.to_string();
+        }
+        match self.columns.get(name) {
+            Some(Some(shown)) => shown.clone(),
+            _ => name.to_string(),
+        }
+    }
+
+    fn shown(&self, relation: &str, column: &str) -> Option<String> {
+        self.relations.get(relation)?.get(column).cloned()
+    }
+}
+
 /// A declared parameter: its name (without @), whether it is a string, the
 /// engine type sent for it (0: inferred), and whether it is a number.
 type Decl = (String, bool, u32, bool);
@@ -216,6 +252,11 @@ struct Session {
     /// Whether each `$n` of the statement being forwarded is declared a
     /// number (`inline_params` writes those bare, everything else quoted).
     bound_numbers: Vec<bool>,
+    /// The declared spellings of tables and columns (`translate::NAMES_TABLE`).
+    names: NameCache,
+    /// The statement being forwarded's explicit aliases
+    /// (`Forward::aliases`): kept as typed in its COLMETADATA.
+    aliases: Vec<String>,
     /// The database the login named, as it named it: a pooled connection's
     /// reset goes back to it, as SQL Server's does after a `USE`.
     login_shown: String,
@@ -299,6 +340,8 @@ pub(crate) async fn serve_connection(
         conn_id,
         login_shown: shown.clone(),
         bound_numbers: Vec::new(),
+        names: NameCache::default(),
+        aliases: Vec::new(),
     };
     let packet_size = match login_packet.packet_size {
         0 => tds::DEFAULT_PACKET,
@@ -547,6 +590,9 @@ struct Scope<'a> {
 }
 
 impl Env for Scope<'_> {
+    fn shown(&self, relation: &str, column: Option<&str>) -> Option<String> {
+        self.s.names.relations.get(relation)?.get(column.unwrap_or("")).cloned()
+    }
     fn case_insensitive(&self) -> bool {
         self.s.shared.config.case_insensitive
     }
@@ -1106,6 +1152,11 @@ impl Session {
                                 // unnamed.
                                 name: if f.name == "?column?" {
                                     String::new()
+                                } else if f.table_oid != 0 && !self.aliases.iter().any(|a| *a == f.name) {
+                                    // A table's column read as it is (`SELECT *`, an
+                                    // unaliased column): its declared spelling. Never
+                                    // an alias, which is the client's own.
+                                    self.names.column_shown(&f.name)
                                 } else {
                                     f.name.clone()
                                 },
@@ -1382,6 +1433,9 @@ impl Session {
         params: Option<&ParamCtx>,
     ) -> io::Result<Result<(), TsqlError>> {
         let ddl = forward.kind == Kind::Ddl;
+        if ddl {
+            self.names.dirty = true;
+        }
         if self.bridge().status == b'E' {
             log::warn!("SQL Server session: a failed transaction was found open; rolling it back");
             let _ = self.silent("ROLLBACK").await;
@@ -1426,10 +1480,18 @@ impl Session {
         let capture = matches!(forward.kind, Kind::Insert { identity: Some(_), .. });
         let mut last = None;
         let mut affected = 0u64;
+        self.aliases = forward.aliases.clone();
         for sql in forward.statements.iter().filter(|s| !s.is_empty()) {
             let outcome = self
                 .exchange(sql, &bound, capture, forward.extra_column.as_ref())
-                .await?;
+                .await;
+            let outcome = match outcome {
+                Ok(o) => o,
+                Err(e) => {
+                    self.aliases.clear();
+                    return Err(e);
+                }
+            };
             let failed = matches!(outcome, Outcome::Failed(..));
             if let Outcome::Done { tag, .. } = &outcome {
                 affected += tag_count(tag).unwrap_or(0);
@@ -1439,6 +1501,7 @@ impl Session {
                 break;
             }
         }
+        self.aliases.clear();
         let outcome = last.unwrap_or(Outcome::Done {
             tag: String::new(),
             identity: None,
@@ -1530,6 +1593,7 @@ impl Session {
     // -----------------------------------------------------------------------
 
     async fn sql_batch(&mut self, message: &Message) -> io::Result<()> {
+        self.ensure_names().await;
         let mut r = Reader::new(&message.payload);
         if message.payload.len() >= 4 {
             let total = u32::from_le_bytes(message.payload[0..4].try_into().unwrap()) as usize;
@@ -1839,6 +1903,7 @@ impl Session {
             return Ok(Ok(Flow::Next));
         }
         if self.fmtonly && head == "SELECT" {
+            self.ensure_names().await;
             if let Some(columns) = self.declared_columns(tokens) {
                 tds::col_metadata(self.wire.reply(), &columns);
                 self.statement_done(if self.nocount { 0 } else { tds::DONE_COUNT }, 0xc1, 0);
@@ -2693,6 +2758,7 @@ impl Session {
     // -----------------------------------------------------------------------
 
     async fn rpc(&mut self, message: &Message) -> io::Result<()> {
+        self.ensure_names().await;
         let mut r = Reader::new(&message.payload);
         if message.payload.len() >= 4 {
             let total = u32::from_le_bytes(message.payload[0..4].try_into().unwrap()) as usize;
@@ -4118,6 +4184,44 @@ impl Session {
         Ok(total)
     }
 
+    /// The declared spellings, read again when stale (`NameCache`).
+    async fn ensure_names(&mut self) {
+        let Some(bridge) = self.bridge.as_ref() else { return };
+        let database = Arc::as_ptr(&bridge.database) as usize;
+        let has = bridge.database.has_table(translate::NAMES_TABLE);
+        let fresh = self.names.database == database
+            && !self.names.dirty
+            && self.names.read.is_some_and(|r| r.elapsed() < NAMES_TTL);
+        if fresh {
+            return;
+        }
+        let mut cache = NameCache { database, read: Some(std::time::Instant::now()), ..Default::default() };
+        if has {
+            // Not inside the client's transaction: a read of committed names.
+            if let Ok((_, rows)) = self.fetch(&format!("SELECT rel, col, shown FROM {}", translate::NAMES_TABLE), &[]).await {
+                for row in rows {
+                    let [Some(rel), Some(col), Some(shown)] = [row.first().cloned().flatten(), row.get(1).cloned().flatten(), row.get(2).cloned().flatten()]
+                    else {
+                        continue;
+                    };
+                    if !col.is_empty() {
+                        cache
+                            .columns
+                            .entry(col.clone())
+                            .and_modify(|e| {
+                                if e.as_deref() != Some(shown.as_str()) {
+                                    *e = None;
+                                }
+                            })
+                            .or_insert_with(|| Some(shown.clone()));
+                    }
+                    cache.relations.entry(rel).or_default().insert(col, shown);
+                }
+            }
+        }
+        self.names = cache;
+    }
+
     /// Moves `table`'s identity counter past the largest value its
     /// `column` holds, never back: SQL Server's identity after rows were
     /// written with their own values. Left as it was the next generated id
@@ -4156,17 +4260,34 @@ impl Session {
     /// sp_tablecollations_100: a row per column, the collation of its text
     /// (none: the engine compares bytes).
     async fn table_collations(&mut self, table: &str) -> Result<Flow, TsqlError> {
+        self.ensure_names().await;
         let view = self
             .bridge()
             .database
             .schema_view(table)
             .ok_or_else(|| TsqlError::new(208, format!("Invalid object name '{table}'.")))?;
-        let names: Vec<String> = view
-            .schema()
+        let schema = view.schema();
+        // Each column as declared, and for text its collation: the 5-byte
+        // TDS collation SqlBulkCopy encodes a varchar/char/text value with,
+        // and its name. Case-insensitive: SQL_Latin1_General_CP1_CI_AS
+        // (LCID 1033, sort id 52); else by the bytes, Latin1_General_BIN2.
+        let names: Vec<(String, Option<(String, String)>)> = schema
             .fields
             .iter()
             .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
-            .map(|f| f.name.clone())
+            .map(|f| {
+                let shown = self.names.shown(table, &f.name).unwrap_or_else(|| f.name.clone());
+                let text = matches!(f.db_type, crate::core::db_type::DbType::STRING | crate::core::db_type::DbType::BPCHAR(_))
+                    && !f.json_text;
+                let collation = text.then(|| {
+                    if crate::core::rql::collation::of(&f.name, &schema.fields).is_binary() {
+                        ("\\x0904000200".to_string(), "Latin1_General_BIN2".to_string())
+                    } else {
+                        ("\\x0904d00034".to_string(), "SQL_Latin1_General_CP1_CI_AS".to_string())
+                    }
+                });
+                (shown, collation)
+            })
             .collect();
         let field = |name: &str, oid: u32| PgField {
             name: name.to_string(),
@@ -4185,7 +4306,13 @@ impl Session {
         let rows = names
             .into_iter()
             .enumerate()
-            .map(|(k, n)| vec![Some((k + 1).to_string()), Some(n), None, None])
+            .map(|(k, (n, collation))| {
+                let (bytes, name) = match collation {
+                    Some((b, c)) => (Some(b), Some(c)),
+                    None => (None, None),
+                };
+                vec![Some((k + 1).to_string()), Some(n), bytes, name]
+            })
             .collect();
         self.send_rows(&fields, rows);
         Ok(Flow::Next)
@@ -4265,7 +4392,7 @@ impl Session {
                         oid
                     };
                     Column {
-                        name: f.name.clone(),
+                        name: self.names.shown(&table, &f.name).unwrap_or_else(|| f.name.clone()),
                         ty,
                         oid,
                         identity: identity.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(&f.name)),
