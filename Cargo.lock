@@ -4660,7 +4660,7 @@ checksum = "a611d15b50743feb4c76b7d03edcb0e64f399c26961e4efe6975bc398be6aa3d"
 
 [[package]]
 name = "rastcp"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bincode",
  "bytes",
@@ -4687,7 +4687,7 @@ dependencies = [
 
 [[package]]
 name = "rasterizeddb_client"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -4707,7 +4707,7 @@ dependencies = [
 
 [[package]]
 name = "rasterizeddb_client_derive"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4741,7 +4741,7 @@ dependencies = [
 
 [[package]]
 name = "rasterizeddb_core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -4805,7 +4805,7 @@ dependencies = [
 
 [[package]]
 name = "rasterizeddb_embedded"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "log",
  "rasterizeddb_client",

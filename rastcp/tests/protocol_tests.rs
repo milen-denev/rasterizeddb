@@ -265,7 +265,7 @@ async fn test_client_send_returns_timeout_instead_of_panicking() {
     let (listener, server_addr) = loopback();
     let server = TcpServerBuilder::from_listener(listener)
         .unwrap()
-        .request_timeout(Duration::from_secs(1))
+        .request_timeout(Duration::from_secs(10))
         .build()
         .await
         .unwrap();
@@ -273,7 +273,7 @@ async fn test_client_send_returns_timeout_instead_of_panicking() {
     let server_handle = tokio::spawn(async move {
         server
             .run(|data| async move {
-                sleep(Duration::from_millis(250)).await;
+                sleep(Duration::from_secs(4)).await;
                 data
             })
             .await
@@ -282,8 +282,11 @@ async fn test_client_send_returns_timeout_instead_of_panicking() {
 
     sleep(Duration::from_millis(100)).await;
 
+    // The timeout bounds the lazy connect's TLS handshake too, which a
+    // loaded Windows runner can take longer than 50 ms over: the answer is
+    // made far slower than a handshake instead.
     let mut client = TcpClientBuilder::new(&server_addr)
-        .timeout(Duration::from_millis(50))
+        .timeout(Duration::from_secs(1))
         .build()
         .await
         .unwrap();

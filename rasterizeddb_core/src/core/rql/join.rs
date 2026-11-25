@@ -5530,6 +5530,11 @@ fn build_aggregate_stage(
     let mut ci_keys: Vec<(usize, u64)> = Vec::new();
     if let Some(list) = group_by_clause {
         for raw in list.split(',') {
+            // `GROUP BY 1` and `GROUP BY k` (an output name) stand for a
+            // select-list item; read that item instead. The number was looked
+            // up as a column named `1`.
+            let key = select_item_for_group_key(select_list, raw.trim(), |name| resolve(name).is_ok())?;
+            let raw = key.as_str();
             let name = raw.trim().split_whitespace().next().unwrap_or("");
             if name.is_empty() {
                 continue;
@@ -5537,7 +5542,7 @@ fn build_aggregate_stage(
             // A computed key (`a.doc->>'k'`, `upper(a.s)`) is not grouped
             // over a join. Resolved as a name, it was reported as a missing
             // column of whatever preceded its last dot.
-            if !is_column_reference(raw.trim()) && name.parse::<usize>().is_err() {
+            if !is_column_reference(raw.trim()) {
                 return Err(format!(
                     "GROUP BY {} over a join is not supported yet; group by a column, or by \
                      the expression's value in a derived table",
@@ -6099,6 +6104,38 @@ fn split_top_level(list: &str) -> Vec<String> {
         out.push(rest.to_string());
     }
     out
+}
+
+/// The text a `GROUP BY` key of a join stands for: a position (`1`) names
+/// that select-list item, and a name that is no column but is a select item's
+/// output name (`k` of `t.x AS k`) names that item, as in PostgreSQL, where a
+/// column wins over an output name. Anything else is returned as written.
+fn select_item_for_group_key(
+    select_list: &str,
+    key: &str,
+    is_column: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    let items = split_top_level_commas(select_list);
+    if let Ok(position) = key.parse::<usize>() {
+        if position == 0 || position > items.len() {
+            return Err(format!(
+                "GROUP BY position {} is not in the select list, which has {} item(s)",
+                position,
+                items.len()
+            ));
+        }
+        return Ok(select_entry(items[position - 1].trim()).0);
+    }
+    if is_column_reference(key) && !is_column(key) {
+        let wanted = key.trim_matches('"');
+        for item in &items {
+            let (expression, alias) = select_entry(item.trim());
+            if alias.is_some_and(|a| a.trim_matches('"').eq_ignore_ascii_case(wanted)) {
+                return Ok(expression);
+            }
+        }
+    }
+    Ok(key.to_string())
 }
 
 /// Separates a select item from its output name.
@@ -6697,6 +6734,27 @@ fn relations_referenced(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `GROUP BY 1` and `GROUP BY k` stand for select-list items; a column of
+    /// that name wins over an output name, and a position past the list is an
+    /// error, not a column named `3`.
+    #[test]
+    fn a_group_by_position_or_output_name_reads_its_select_item() {
+        let list = "t.system_key AS k, count(*), upper(t.s) u";
+        let none = |_: &str| false;
+        assert_eq!(select_item_for_group_key(list, "1", none).unwrap(), "t.system_key");
+        assert_eq!(select_item_for_group_key(list, "2", none).unwrap(), "count(*)");
+        assert_eq!(select_item_for_group_key(list, "3", none).unwrap(), "upper(t.s)");
+        assert_eq!(select_item_for_group_key(list, "k", none).unwrap(), "t.system_key");
+        assert_eq!(select_item_for_group_key(list, "\"K\"", none).unwrap(), "t.system_key");
+        // A real column named like an output name is that column.
+        assert_eq!(select_item_for_group_key(list, "k", |n| n == "k").unwrap(), "k");
+        assert_eq!(select_item_for_group_key(list, "t.x", none).unwrap(), "t.x");
+        for bad in ["0", "4"] {
+            let e = select_item_for_group_key(list, bad, none).unwrap_err();
+            assert!(e.contains("is not in the select list, which has 3 item(s)"), "{e}");
+        }
+    }
 
     /// The join budget is read once: the value in effect can be set again
     /// (two engines in a process asking for the same), another cannot, and

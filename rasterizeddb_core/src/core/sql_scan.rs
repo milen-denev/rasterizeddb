@@ -2802,6 +2802,164 @@ pub fn split_top_level(list: &str, delimiter: u8) -> Vec<&str> {
     out
 }
 
+/// `doc #>> ARRAY['a', '0']` and `doc #> ARRAY[…]` as the path literal
+/// `doc #>> '{a,0}'`, which every path reader here takes. A path written as an
+/// `ARRAY[…]` constructor failed in each of them: "unexpected character '['"
+/// in a `WHERE`, "Column '… #>> ARRAY[…]' not found" in a select list, and
+/// "function '' is not supported" once a driver's parameters were in it.
+///
+/// Only a constructor whose every element is a constant is rewritten: a
+/// string or an integer, optionally cast (`'a'::text`, `CAST('a' AS text)`,
+/// as SQL `EXECUTE` and parameter inlining write them). A path element that
+/// is a column or an expression, or `NULL`, is left as written. Not a `->`
+/// chain: in a path, `'0'` indexes into an array, where `-> '0'` would not.
+pub fn json_path_arrays(sql: &str) -> Cow<'_, str> {
+    if !sql.contains('#') || !contains_ignore_ascii_case(sql, b"ARRAY") {
+        return Cow::Borrowed(sql);
+    }
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' || b == b'"' {
+            i = quoted_end(bytes, i, b).max(i + 1);
+            continue;
+        }
+        if b == b'$' && !(i > 0 && is_identifier_byte(bytes[i - 1])) {
+            if let Some(end) = dollar_quote_end(bytes, i) {
+                i = end.max(i + 1);
+                continue;
+            }
+        }
+        if b == b'#' && bytes.get(i + 1) == Some(&b'>') {
+            let operator_end = if bytes.get(i + 2) == Some(&b'>') { i + 3 } else { i + 2 };
+            let mut at = operator_end;
+            while bytes.get(at).is_some_and(|c| c.is_ascii_whitespace()) {
+                at += 1;
+            }
+            let keyword = at + 5;
+            if sql.get(at..keyword).is_some_and(|w| w.eq_ignore_ascii_case("ARRAY")) {
+                let mut open = keyword;
+                while bytes.get(open).is_some_and(|c| c.is_ascii_whitespace()) {
+                    open += 1;
+                }
+                if bytes.get(open) == Some(&b'[')
+                    && let Some(close) = matching_close(sql, open)
+                    && let Some(path) = constant_path(&sql[open + 1..close])
+                {
+                    out.push_str(&sql[copied..operator_end]);
+                    out.push(' ');
+                    out.push_str(&path);
+                    copied = close + 1;
+                    i = close + 1;
+                    continue;
+                }
+            }
+            i = operator_end;
+            continue;
+        }
+        i += 1;
+    }
+    if copied == 0 {
+        return Cow::Borrowed(sql);
+    }
+    out.push_str(&sql[copied..]);
+    Cow::Owned(out)
+}
+
+/// The path literal (`'{a,"b c",0}'`) for an `ARRAY[…]`'s elements, or `None`
+/// when one is not a constant.
+fn constant_path(elements: &str) -> Option<String> {
+    let mut keys = Vec::new();
+    for element in split_top_level(elements, b',') {
+        keys.push(constant_key(element)?);
+    }
+    if keys.is_empty() {
+        return None;
+    }
+    let quoted: Vec<String> = keys
+        .iter()
+        .map(|k| {
+            let plain = !k.is_empty()
+                && !k.eq_ignore_ascii_case("NULL")
+                && !k.bytes().any(|c| c.is_ascii_whitespace() || matches!(c, b',' | b'{' | b'}' | b'"' | b'\\'));
+            if plain { k.clone() } else { format!("\"{}\"", k.replace('\\', "\\\\").replace('"', "\\\"")) }
+        })
+        .collect();
+    Some(format!("'{{{}}}'", quoted.join(",").replace('\'', "''")))
+}
+
+/// One path element's value: a string or integer constant, without the
+/// casts a driver or SQL `EXECUTE` wraps it in.
+fn constant_key(element: &str) -> Option<String> {
+    let mut e = element.trim();
+    loop {
+        // `( … )` around the whole element.
+        if e.starts_with('(') && matching_close(e, 0) == Some(e.len() - 1) {
+            e = e[1..e.len() - 1].trim();
+            continue;
+        }
+        // `CAST(x AS type)`.
+        if e.len() > 5 && e[..4].eq_ignore_ascii_case("CAST") && e[4..].trim_start().starts_with('(') {
+            let open = e.len() - e[4..].trim_start().len();
+            if matching_close(e, open) == Some(e.len() - 1) {
+                let inner = &e[open + 1..e.len() - 1];
+                let upper = inner.to_ascii_uppercase();
+                let mut cut = None;
+                let ib = inner.as_bytes();
+                let mut k = 0usize;
+                while k < ib.len() {
+                    if ib[k] == b'\'' || ib[k] == b'"' {
+                        k = quoted_end(ib, k, ib[k]).max(k + 1);
+                        continue;
+                    }
+                    if upper[k..].starts_with(" AS ") {
+                        cut = Some(k);
+                    }
+                    k += 1;
+                }
+                e = inner[..cut?].trim();
+                continue;
+            }
+        }
+        // `x::type`, the last cast outside quotes.
+        let eb = e.as_bytes();
+        let mut k = 0usize;
+        let mut cast = None;
+        while k + 1 < eb.len() {
+            if eb[k] == b'\'' || eb[k] == b'"' {
+                k = quoted_end(eb, k, eb[k]).max(k + 1);
+                continue;
+            }
+            if eb[k] == b':' && eb[k + 1] == b':' {
+                cast = Some(k);
+                k += 2;
+                continue;
+            }
+            k += 1;
+        }
+        if let Some(at) = cast {
+            let ty = e[at + 2..].trim();
+            if ty.is_empty() || !ty.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b' ' | b'(' | b')')) {
+                return None;
+            }
+            e = e[..at].trim();
+            continue;
+        }
+        break;
+    }
+    if e.len() >= 2 && e.starts_with('\'') && quoted_end(e.as_bytes(), 0, b'\'') == e.len() {
+        return Some(e[1..e.len() - 1].replace("''", "'"));
+    }
+    let digits = e.strip_prefix('-').or_else(|| e.strip_prefix('+')).unwrap_or(e);
+    if !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()) {
+        return Some(e.trim_start_matches('+').to_string());
+    }
+    None
+}
+
 /// Index of the bracket closing the one at `open` (`(` or `[`), skipping
 /// quoted runs and comments; `None` when it never closes.
 pub fn matching_close(text: &str, open: usize) -> Option<usize> {
@@ -3683,6 +3841,33 @@ mod tests {
     }
 
     use super::*;
+
+    /// `#>> ARRAY[…]` and `#> ARRAY[…]` of constants read as path literals;
+    /// anything that is not a constant path stays as written.
+    #[test]
+    fn a_json_path_array_of_constants_is_a_path_literal() {
+        let r = |s: &str| json_path_arrays(s).into_owned();
+        assert_eq!(r("SELECT data #>> ARRAY['0','related_row_id'] FROM t"), "SELECT data #>> '{0,related_row_id}' FROM t");
+        assert_eq!(r("SELECT d #> array[ 'a' , 1 ] FROM t"), "SELECT d #> '{a,1}' FROM t");
+        assert_eq!(
+            r("SELECT 1 FROM t WHERE d#>>ARRAY[CAST('0' AS text), 'k'::text] IN ('x') AND d #>> ARRAY[('b')::varchar] = 'y'"),
+            "SELECT 1 FROM t WHERE d#>> '{0,k}' IN ('x') AND d #>> '{b}' = 'y'"
+        );
+        // Keys that need quoting inside the array literal, and a quote.
+        assert_eq!(r(r#"SELECT d #>> ARRAY['a b', 'c,d', 'it''s', '', 'x"y'] FROM t"#), r#"SELECT d #>> '{"a b","c,d",it''s,"","x\"y"}' FROM t"#);
+        // Not constants, or not this operator: unchanged.
+        for sql in [
+            "SELECT d #>> ARRAY[k, 'a'] FROM t",
+            "SELECT d #>> ARRAY[$1, 'a'] FROM t",
+            "SELECT d #>> ARRAY[NULL, 'a'] FROM t",
+            "SELECT d #>> '{a,b}' FROM t",
+            "SELECT ARRAY['a'] FROM t",
+            "SELECT '#>> ARRAY[''a'']' FROM t",
+            "SELECT d #- ARRAY['a'] FROM t",
+        ] {
+            assert_eq!(r(sql), sql, "{sql}");
+        }
+    }
 
     #[test]
     fn unquoted_words_fold_and_quoted_text_keeps_its_case() {

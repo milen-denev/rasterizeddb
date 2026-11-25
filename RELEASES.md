@@ -1,6 +1,31 @@
 # Releases
 
-## 1.0.1 (server, `rasterizeddb_core`, `rasterizeddb_client`) and `rasterizeddb_embedded` 1.1.0 (unreleased)
+## Unreleased
+
+### Statements that failed, now answered
+
+- A JSON path written as an array constructor, `data #>> ARRAY['0', 'k']` or `#> ARRAY[…]`, failed ("unexpected character '['" in a `WHERE`, "Column … not found" in a select list, and no columns described once a driver's parameter was in it). A path of constants is now read as the path literal `'{0,k}'`; an element that is a column or an expression is still unsupported.
+- SQL-level `PREPARE p(text) AS … WHERE data -> $1 ->> 'k' = …` then `EXECUTE p('0')` failed ("is neither a column nor a value"): a string for a text parameter now goes in as written, not as `CAST('0' AS text)`.
+- A statement with more than 32,767 bound parameters (a 1,000-row `INSERT … VALUES` of 39 columns) dropped its connection with nothing in the server's log; the client read "expected to read 5 bytes, got 0 bytes at EOF". Parse and Bind now read their counts unsigned, as PostgreSQL does, up to 65,535 parameters. A Parse or Bind the server cannot read is answered with FATAL 08P01 naming it, and logged, before the connection closes.
+- `GROUP BY 1` over a join failed with "Column '1' not found in schema", and so did `GROUP BY k` naming an output column (`t.system_key AS k`). Both now group by that select-list item, a real column of the same name winning, as in PostgreSQL; a position past the select list fails with 42P10. On one table both already worked.
+
+### New features
+
+- SQL Server front end: EF Core 10 runs unchanged, its Identity schema, migrations and `__EFMigrationsLock` included. Added: `CROSS/OUTER APPLY`, `TOP` in a derived table, a unique index filtered by `key IS NOT NULL`, `sp_getapplock`/`sp_releaseapplock`/`APPLOCK_TEST`, `sp_rename … 'INDEX'`, `ALTER DATABASE … SET SINGLE_USER`, and bracketed table names holding dots (`[dbo].[DenevCloud.ERP.Colors]`). Database names are matched without case, and a pooled connection's reset goes back to the login's database.
+- Case-insensitive text columns (the engine's `rdb_ci` collation) group, deduplicate, join, sort in windows, and take `min`/`max`, foreign keys, `ALTER TABLE ADD COLUMN` and `ALTER COLUMN TYPE` by key.
+- Opt-in zstd compression (`storage_compression`, a default feature): a column takes `COMPRESSION zstd(n)` and a table `WITH (row_compression = …)`, levels 1–22. Nothing is compressed unless asked, and fixed-width values stay raw. `ALTER TABLE … RECOMPRESS` and `VACUUM (FULL, RECOMPRESS)` rewrite rows and train dictionaries. The client's ORM takes `#[rdb(compression)]` and `#[rdb(row_compression)]`. See `docs/compression.md`.
+
+### Behaviour changes
+
+- **Over the SQL Server protocol, text columns are case-insensitive by default**, as under SQL Server's default `SQL_Latin1_General_CP1_CI_AS`: a `CREATE TABLE` or `ADD COLUMN` without a `COLLATE` gives a text column `rdb_ci`. `--mssql-collation bin` keeps the old byte comparison. Tables made over PostgreSQL, MySQL or the native protocol are unchanged.
+- A `CREATE UNIQUE INDEX … WHERE …` over the SQL Server protocol ignored its filter and refused rows the filter leaves out; the filter is honoured now.
+- `STORAGE MOVE … TO 'kv:…'` said the table was no longer covered by backups. A backup copies it as of each snapshot, with no point-in-time replay, and the message now says so.
+
+### Upgrade notes
+
+- **No downgrade after a compressed value:** the first one adds `compressed_values_v1` to the directory's `incompat_features`, and an older build refuses to open that directory.
+
+## 1.0.1 (2026-11-24: server, `rasterizeddb_core`, `rasterizeddb_client`) and `rasterizeddb_embedded` 1.1.0
 
 ### Silent wrong answers fixed
 
@@ -44,6 +69,7 @@ Each was met migrating an application onto 1.0.0.
 
 ### Crashes fixed
 
+- A scheduled backup failed ("db_storage.cfg.tmp was listed for the snapshot and is gone") when it listed the directory while the server rewrote `db_storage.cfg`, `db_kv.cfg` or `db_kv_secrets.cfg`.
 - A multibyte character (`Δ`, `😀`) next to a parenthesis or a keyword in a `WHERE` (`ΔANY(…)`, `Δ(b) > 5`) or a `JOIN LATERAL` (`t😀 AS l`) panicked the statement's handler.
 
 ### New features

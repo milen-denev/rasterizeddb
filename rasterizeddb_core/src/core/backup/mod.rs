@@ -189,8 +189,15 @@ fn excluded_file(name: &str) -> bool {
 /// None has anything a restore could use, and each is routinely gone by the
 /// time a copy reaches it: a new database's first scheduled snapshot runs
 /// while start-up creates its catalogue tables and failed on two of them.
+///
+/// The configuration files' rewrites (`db_storage.cfg.tmp`, `db_kv.cfg.tmp`,
+/// `db_kv_secrets.cfg.tmp`) and the status log's sidecar
+/// (`….settled.tmp`) are the same, under `.tmp`: a first snapshot racing
+/// start-up's `db_storage.cfg` rewrite failed on it ("listed for the
+/// snapshot and is gone"). Not every `.tmp`: a table's `t.db.tmp` holds
+/// staged rows a restore needs.
 fn staging_copy(name: &str) -> bool {
-    name.ends_with(".partial")
+    name.ends_with(".partial") || name.ends_with(".cfg.tmp") || name.ends_with(".settled.tmp")
 }
 
 /// A DDL intent (`__create_….intent`, `__rewrite_….intent`, `__rename.intent`,
@@ -3641,10 +3648,14 @@ mod tests {
             "rasterized.wal.floors.partial",
             "rasterized.wal.lsn.partial",
             "rasterized.wal.txn.partial",
+            "db_storage.cfg.tmp",
+            "db_kv.cfg.tmp",
+            "db_kv_secrets.cfg.tmp",
+            "tx.status.settled.tmp",
         ] {
             assert!(excluded_file(name), "{name} would be backed up");
         }
-        for name in ["t.db", "__create_1.intent", "t.partial.db", "t.db.tmp", "rasterized.wal.lsn"] {
+        for name in ["t.db", "__create_1.intent", "t.partial.db", "t.db.tmp", "rasterized.wal.lsn", "db_storage.cfg", "t_pointers.db.tmp"] {
             assert!(!excluded_file(name), "{name} would be left out");
         }
 
