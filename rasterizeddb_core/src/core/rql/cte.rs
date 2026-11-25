@@ -798,7 +798,14 @@ async fn relation_columns(
             None => "TEXT".to_string(),
         };
         let sql_type = match collations.get(index).copied().flatten() {
-            Some(name) if matches!(declared, Some(DbType::STRING)) => format!("{sql_type} COLLATE {name}"),
+            // A text column's collation, and a `uuid`'s SQL Server order
+            // (`rdb_guid_order`): its copy sorted by the bytes.
+            Some(name)
+                if matches!(declared, Some(DbType::STRING))
+                    || (matches!(declared, Some(DbType::UUID)) && name == crate::core::rql::collation::GUID_NAME) =>
+            {
+                format!("{sql_type} COLLATE {name}")
+            }
             _ => sql_type,
         };
         columns.push(RelationColumn {
@@ -2133,14 +2140,33 @@ fn declared_fields_among(
     if name.is_empty() || name.contains('(') {
         return none;
     }
+    // Each output's column: by its label, or the column an alias names
+    // (`g AS d`), whose collation the copy keeps (a uniqueidentifier sorted
+    // through `FROM (SELECT g AS d …)` sorted by its bytes).
+    let items: Vec<String> = select_list_of(query)
+        .map(|list| crate::core::sql_scan::split_top_level(list, b',').iter().map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
     let types_in = |fields: &[SchemaField]| -> Vec<Option<SchemaField>> {
         labels
             .iter()
-            .map(|label| {
-                fields
-                    .iter()
-                    .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(label))
-                    .cloned()
+            .enumerate()
+            .map(|(k, label)| {
+                let named = |n: &str| fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(n)).cloned();
+                named(label).or_else(|| {
+                    let item = items.get(k).filter(|_| items.len() == labels.len())?;
+                    let (expr, alias) = crate::core::rql::join::split_expr_alias(item);
+                    alias?;
+                    // The list's `DISTINCT` / `ALL` before its first item.
+                    let expr = expr.trim();
+                    let expr = ["DISTINCT ", "ALL "]
+                        .iter()
+                        .find_map(|w| expr.get(..w.len()).filter(|h| h.eq_ignore_ascii_case(w)).map(|_| expr[w.len()..].trim()))
+                        .unwrap_or(expr);
+                    let column = expr.rsplit('.').next()?.trim_matches('"');
+                    (!column.is_empty() && column.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80))
+                        .then(|| named(column))
+                        .flatten()
+                })
             })
             .collect()
     };

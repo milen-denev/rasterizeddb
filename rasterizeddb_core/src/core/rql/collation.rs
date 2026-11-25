@@ -871,6 +871,61 @@ pub fn group_by_keys(
     converted
 }
 
+/// A grouped (or DISTINCT) query sorting by a `uuid` in SQL Server's order
+/// ([`Strength::GuidOrder`]): the group's echo of the column becomes its
+/// `min`, which [`mark_aggregates`] marks so the output sorts by the order
+/// (`aggregate::sort_output`; one value per group, so the same value). A
+/// `SELECT DISTINCT` of plain columns is that grouping. It sorted by the
+/// bytes. True when a DISTINCT was made a grouping.
+pub fn guid_group_order(
+    group_by: &mut Vec<SchemaField>,
+    items: &mut [crate::core::rql::aggregate::SelectItem],
+    fields: &[SchemaField],
+    as_distinct: bool,
+    order_terms: &[crate::core::rql::order_by::SortTerm],
+) -> bool {
+    use crate::core::rql::aggregate::{AggFunc, SelectItem};
+    let guid = |f: &SchemaField| order_of(&f.name, fields).orders_only();
+    let sorts_by_guid = order_terms.iter().any(|t| {
+        let bare = t.token.rsplit('.').next().unwrap_or(&t.token).trim_matches('"');
+        fields.iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(bare) && guid(f))
+            || items.iter().any(|i| matches!(i, SelectItem::Column { field, label } if guid(field) && label.eq_ignore_ascii_case(bare)))
+    });
+    if !sorts_by_guid {
+        return false;
+    }
+    let mut converted = false;
+    if as_distinct && group_by.is_empty() && items.iter().all(|i| matches!(i, SelectItem::Column { .. })) {
+        for item in items.iter() {
+            if let SelectItem::Column { field, .. } = item {
+                if !group_by.iter().any(|g| g.write_order == field.write_order) {
+                    group_by.push(field.clone());
+                }
+            }
+        }
+        converted = true;
+    }
+    if group_by.is_empty() {
+        return converted;
+    }
+    for item in items.iter_mut() {
+        let SelectItem::Column { field, label } = item else { continue };
+        if !guid(field) || !group_by.iter().any(|g| g.write_order == field.write_order) {
+            continue;
+        }
+        *item = SelectItem::Aggregate {
+            func: AggFunc::Min,
+            arg: Some(field.clone()),
+            label: label.clone(),
+            filter: None,
+            arg_expr: None,
+            distinct: false,
+            call: None,
+        };
+    }
+    converted
+}
+
 /// Refuses a `HAVING` comparing `min`/`max` of a column with a
 /// nondeterministic collation: the condition compares the aggregate's
 /// bytes. (A grouping column there is moved into the WHERE, where it

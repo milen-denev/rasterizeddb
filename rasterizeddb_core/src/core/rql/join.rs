@@ -3782,6 +3782,16 @@ pub fn plan(
             || split_top_level(select_list).iter().any(|item| {
                 !crate::core::rql::lexer_query::find_aggregate_calls(split_expr_alias(item.trim()).0).is_empty()
             });
+        // A grouped join's output sorts by the values: a `uuid` in SQL
+        // Server's order would sort by its bytes, refused instead.
+        if grouped {
+            if let Some(term) = order_by.iter().find(|t| columns.ci(t.token.trim()).is_some_and(|(_, s)| s.orders_only())) {
+                return Err(format!(
+                    "ORDER BY \"{}\", a uniqueidentifier in SQL Server's order, in a grouped or DISTINCT join is not supported yet",
+                    term.token.trim()
+                ));
+            }
+        }
         if !grouped {
             let mut keyed = Vec::with_capacity(order_by.len());
             for term in order_by {
@@ -6150,7 +6160,7 @@ fn select_item_for_group_key(
 /// the last `)`: `COALESCE(a.n, -1) + b.m AS s` kept `AS s` in the
 /// expression, and the item was refused as "'b__m AS s' is neither a column
 /// nor a value".
-fn split_expr_alias(entry: &str) -> (&str, Option<String>) {
+pub(crate) fn split_expr_alias(entry: &str) -> (&str, Option<String>) {
     crate::core::rql::lexer_query::split_alias(entry)
 }
 

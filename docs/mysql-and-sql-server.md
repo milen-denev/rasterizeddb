@@ -225,8 +225,8 @@ takes the engine's `rdb_guid_order` ([collations](collations.md)): `ORDER
 BY`, `<`, `>`, `BETWEEN`, `min`/`max` and window `ORDER BY` follow it
 (keyset paging by a GUID pages as on SQL Server), through a hidden key
 column beside it; equality, joins, keys, foreign keys and indexes stay on
-the column itself. A `DISTINCT` or grouped query ordered by such a column
-still sorts by its bytes. `--mssql-guid-order binary` makes such columns
+the column itself. Grouped and DISTINCT queries, derived tables and CTE copies keep the order
+(a grouped or DISTINCT join ordered by one is refused). `--mssql-guid-order binary` makes such columns
 order by their bytes instead. Tables made before this build order by bytes
 until made again.
 
@@ -235,15 +235,29 @@ precision they declare: 0 to 6 are the engine's `timestamp(p)` /
 `timestamptz(p)` / `time(p)`, rounded as SQL Server rounds; 7, theirs when
 none is written (EF Core's `DateTime`), keeps its seventh digit in a hidden
 `__t7_<column>` beside the column: how far the value lies from the
-microsecond the column holds (-5 to 5). Writes (INSERT VALUES, EF Core's
-MERGE, UPDATE SET, SqlBulkCopy) fill it, a select list reads the column
-whole (as `datetime2(7)`, through `*`, aliases, joins and derived tables),
-and `=`, `<>`, `<`, `<=`, `>`, `>=` and ORDER BY on the column compare it
-too, so `WHERE Created = @value` finds the value an application wrote.
-`IN`, `BETWEEN`, expressions over the column and UPDATE/DELETE conditions
-compare to the microsecond; PostgreSQL clients read microseconds. Every
-time column is sent at scale 7. Tables made before this build keep
-microseconds until made again.
+microsecond the column holds, worked out by the engine's own parser
+(`__rdb_t7_digit`). Every way a statement reads such a column gives SQL
+Server's answer or is refused (0A000), never one to the microsecond:
+- exact: the column read whole (as `datetime2(7)`, through `*`, aliases,
+  joins, derived tables, set-op branches); `=`, `<>`, `<`, `<=`, `>`, `>=`
+  with the value on either side, `IN`, `NOT IN`, `BETWEEN`, `IS NULL`,
+  CASE, join conditions, UPDATE/DELETE conditions; ORDER BY, GROUP BY,
+  `min`/`max`, `DATEADD` in a select list, `CAST`/`CONVERT` to text (styles
+  121, 126 included); `YEAR`, `MONTH`, `DAY`, `EOMONTH`, `DATEPART`,
+  `DATENAME`, `DATEDIFF` of a microsecond or more and `CAST(… AS date)`,
+  read from the value's own microsecond (the year's last 100 ns is still
+  that year); writes by INSERT VALUES, EF Core's MERGE, UPDATE SET (also
+  from another such column or a `DATEADD` of one) and SqlBulkCopy;
+- refused: `COUNT(DISTINCT c)` (`SELECT COUNT(*) FROM (SELECT DISTINCT c
+  …)`, EF Core's form, is exact), `ISNULL`/`COALESCE` and other expressions
+  over the column, the column in an `IN (SELECT …)`, INSERT … SELECT into
+  one, nanosecond date parts.
+PostgreSQL clients read the microsecond. Every time column is sent at
+scale 7. Tables made before this build keep microseconds until made again.
+
+**NULLs sort as SQL Server's**: first ascending, last descending (NULL is
+its least value), in ORDER BY, windows and `WITHIN GROUP`; a key that
+cannot be NULL is sent as written, and keeps the scan's own sort.
 
 **TRY_CAST / TRY_CONVERT** are NULL where the value's text does not read as
 the type (`pg_input_is_valid`). A value of another type is judged by its

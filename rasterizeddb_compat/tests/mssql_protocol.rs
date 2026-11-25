@@ -1754,3 +1754,159 @@ async fn tiberius_hundred_nanoseconds() {
     let got = r[0][0].get::<chrono::DateTime<chrono::FixedOffset>, _>(0).unwrap();
     assert_eq!(got.naive_utc(), at(123_456_700));
 }
+
+/// Every way a statement reads a `datetime2(7)` column gives SQL Server's
+/// answer, or is refused: `=` reading the seventh digit while IN, BETWEEN
+/// or an UPDATE's WHERE compared to the microsecond would be two answers to
+/// one question. Values 1-3 share their microsecond; 4 is a year's last
+/// 100 ns, which the engine's microsecond rounds into the next year.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_hundred_nanoseconds_everywhere() {
+    use chrono::{NaiveDate, NaiveDateTime};
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [E] ([Id] int PRIMARY KEY, [At] datetime2 NOT NULL, [Copy] datetime2 NULL); \
+         INSERT INTO [E] ([Id], [At]) VALUES (1, '2026-03-23 15:03:07.0429169'), (2, '2026-03-23 15:03:07.0429165'), \
+         (3, '2026-03-23 15:03:07.0429161'), (4, '2026-12-31 23:59:59.9999999')",
+    )
+    .await
+    .unwrap();
+    let at = |nanos: u32| -> NaiveDateTime { NaiveDate::from_ymd_opt(2026, 3, 23).unwrap().and_hms_nano_opt(15, 3, 7, nanos).unwrap() };
+    let ids = |r: &[tiberius::Row]| int(r);
+    async fn q(c: &mut Client<Compat<tokio::net::TcpStream>>, sql: &str, p: Vec<NaiveDateTime>) -> Vec<tiberius::Row> {
+        let params: Vec<&dyn tiberius::ToSql> = p.iter().map(|v| v as &dyn tiberius::ToSql).collect();
+        c.query(sql, &params).await.unwrap().into_first_result().await.unwrap()
+    }
+    let (v1, v2, v3) = (at(42_916_900), at(42_916_500), at(42_916_100));
+    assert_eq!(ids(&q(&mut c, "SELECT [Id] FROM [E] WHERE [At] IN (@P1, @P2) ORDER BY [Id]", vec![v1, v3]).await), [1, 3]);
+    assert_eq!(ids(&q(&mut c, "SELECT [Id] FROM [E] WHERE [At] NOT IN (@P1) AND [Id] < 4 ORDER BY [Id]", vec![v2]).await), [1, 3]);
+    assert_eq!(ids(&q(&mut c, "SELECT [Id] FROM [E] WHERE [At] BETWEEN @P1 AND @P2 ORDER BY [Id]", vec![v3, v2]).await), [2, 3]);
+    assert_eq!(ids(&q(&mut c, "SELECT [Id] FROM [E] WHERE @P1 = [At]", vec![v2]).await), [2]);
+    assert_eq!(ids(&q(&mut c, "SELECT [Id] FROM [E] WHERE @P1 < [At] AND [Id] < 4", vec![v2]).await), [1]);
+    let r = q(&mut c, "SELECT CASE WHEN [At] = @P1 THEN 1 ELSE 0 END FROM [E] ORDER BY [Id]", vec![v2]).await;
+    assert_eq!(ids(&r), [0, 1, 0, 0]);
+    // EF's tracked UPDATE/DELETE and ExecuteUpdate/ExecuteDelete.
+    c.execute("UPDATE [E] SET [Copy] = [At] WHERE [At] = @P1", &[&v2]).await.unwrap();
+    c.execute("DELETE FROM [E] WHERE [At] = @P1", &[&v3]).await.unwrap();
+    let r = batch(&mut c, "SELECT [Id] FROM [E] WHERE [Copy] IS NOT NULL; SELECT COUNT(*) FROM [E]").await.unwrap();
+    assert_eq!(ids(&r[0]), [2]);
+    assert_eq!(int(&r[1]), [3]);
+    let r = batch(&mut c, "SELECT [Copy] FROM [E] WHERE [Id] = 2").await.unwrap();
+    assert_eq!(r[0][0].get::<NaiveDateTime, _>(0), Some(v2));
+    // What reads a coarser unit reads the value's own: the year's last
+    // 100 ns is still that year, that day.
+    let r = batch(
+        &mut c,
+        "SELECT YEAR([At]), DATEPART(second, [At]), CONVERT(varchar(10), CAST([At] AS date), 23) FROM [E] WHERE [Id] = 4; \
+         SELECT CAST([At] AS varchar(30)), CONVERT(varchar(30), [At], 126) FROM [E] WHERE [Id] = 1; \
+         SELECT MAX([At]), MIN([At]) FROM [E] WHERE [Id] < 4; \
+         SELECT DATEADD(day, 1, [At]) FROM [E] WHERE [Id] = 4; \
+         SELECT COUNT(*) FROM (SELECT DISTINCT [At] FROM [E]) AS [t]; \
+         SELECT [At], COUNT(*) FROM [E] GROUP BY [At] ORDER BY [At]",
+    )
+    .await
+    .unwrap();
+    assert_eq!(r[0][0].get::<i32, _>(0), Some(2026));
+    assert_eq!(r[0][0].get::<i32, _>(1), Some(59));
+    assert_eq!(r[0][0].get::<&str, _>(2), Some("2026-12-31"));
+    assert_eq!(r[1][0].get::<&str, _>(0), Some("2026-03-23 15:03:07.0429169"));
+    assert_eq!(r[1][0].get::<&str, _>(1), Some("2026-03-23T15:03:07.0429169"));
+    assert_eq!(r[2][0].get::<NaiveDateTime, _>(0), Some(v1));
+    assert_eq!(r[2][0].get::<NaiveDateTime, _>(1), Some(v2));
+    let next = NaiveDate::from_ymd_opt(2027, 1, 1).unwrap().and_hms_nano_opt(23, 59, 59, 999_999_900).unwrap();
+    assert_eq!(r[3][0].get::<NaiveDateTime, _>(0), Some(next));
+    assert_eq!(int(&r[4]), [3]);
+    assert_eq!(r[5].len(), 3);
+    assert_eq!(r[5][0].get::<NaiveDateTime, _>(0), Some(v2));
+    // What cannot read the digit yet is refused, not answered to the
+    // microsecond.
+    for sql in [
+        "SELECT ISNULL([At], [Copy]) FROM [E]",
+        "SELECT [Id] FROM [E] WHERE DATEADD(day, 1, [At]) > SYSDATETIME()",
+        "INSERT INTO [E] ([Id], [At]) SELECT 9, [At] FROM [E] WHERE [Id] = 1",
+        "SELECT [Id] FROM [E] WHERE [At] IN (SELECT [Copy] FROM [E])",
+        "SELECT DATEDIFF(nanosecond, [At], [Copy]) FROM [E]",
+        "SELECT COUNT(DISTINCT [At]) FROM [E]",
+    ] {
+        let e = batch(&mut c, sql).await.err().unwrap_or_else(|| panic!("{sql} was answered"));
+        let tiberius::error::Error::Server(t) = &e else { panic!("{e}") };
+        assert!(t.message().contains("seventh digit"), "{sql}: {e}");
+    }
+}
+
+/// A grouped or DISTINCT query sorted by a uniqueidentifier sorts in SQL
+/// Server's order too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_guid_order_grouped() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    // In SQL Server's order: b < a.
+    let (a, b) = ("00000000-0000-0000-0000-000000000001", "01000000-0000-0000-0000-000000000000");
+    batch(
+        &mut c,
+        &format!(
+            "CREATE TABLE [L] ([Id] int PRIMARY KEY, [G] uniqueidentifier NOT NULL); \
+             INSERT INTO [L] VALUES (1, '{a}'), (2, '{b}'), (3, '{a}')"
+        ),
+    )
+    .await
+    .unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT [G], COUNT(*) FROM [L] GROUP BY [G] ORDER BY [G]; \
+         SELECT DISTINCT [G] FROM [L] ORDER BY [G]",
+    )
+    .await
+    .unwrap();
+    let grouped: Vec<(String, i32)> = r[0].iter().map(|r| (r.get::<uuid::Uuid, _>(0).unwrap().to_string(), r.get::<i32, _>(1).unwrap())).collect();
+    assert_eq!(grouped, [(b.to_string(), 1), (a.to_string(), 2)]);
+    let g: Vec<String> = r[1].iter().map(|r| r.get::<uuid::Uuid, _>(0).unwrap().to_string()).collect();
+    assert_eq!(g, [b, a]);
+    // A nullable one: NULL first, then SQL Server's order, through the
+    // engine's DISTINCT-then-sort and a derived table's alias.
+    batch(&mut c, &format!("CREATE TABLE [N] ([Id] int PRIMARY KEY, [G] uniqueidentifier NULL); INSERT INTO [N] VALUES (1, '{a}'), (2, '{b}'), (3, NULL)"))
+        .await
+        .unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT DISTINCT [G] FROM [N] ORDER BY [G]; SELECT [x].[K] FROM (SELECT [G] AS [K] FROM [N]) AS [x] ORDER BY [x].[K] DESC",
+    )
+    .await
+    .unwrap();
+    let g = |r: &[tiberius::Row]| -> Vec<Option<String>> { r.iter().map(|r| r.get::<uuid::Uuid, _>(0).map(|u| u.to_string())).collect() };
+    assert_eq!(g(&r[0]), [None, Some(b.to_string()), Some(a.to_string())]);
+    assert_eq!(g(&r[1]), [Some(a.to_string()), Some(b.to_string()), None]);
+}
+
+/// NULLs sort first ascending and last descending, as SQL Server's (NULL is
+/// its least value); the engine put them last ascending. And a sort by a
+/// nullable `datetime2(7)` then a uniqueidentifier with TOP took the server
+/// down: the GUID's key term shifted the sort keys' positions past the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_null_order_and_mixed_keys() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [Ord] ([Id] uniqueidentifier NOT NULL PRIMARY KEY, [Created] datetime2 NULL, [N] int NULL); \
+         INSERT INTO [Ord] ([Id], [Created], [N]) VALUES \
+         ('00000000-0000-0000-0000-000000000003', NULL, 3), ('00000000-0000-0000-0000-000000000002', '2026-01-01 10:00:00.1234567', 2), \
+         ('00000000-0000-0000-0000-000000000001', NULL, NULL), ('01000000-0000-0000-0000-000000000000', '2026-01-01 10:00:00.1234561', 1)",
+    )
+    .await
+    .unwrap();
+    let ids = |r: &[tiberius::Row]| -> Vec<String> { r.iter().map(|r| r.get::<uuid::Uuid, _>(0).unwrap().to_string()[..8].to_string() + &r.get::<uuid::Uuid, _>(0).unwrap().to_string()[34..]).collect() };
+    let r = batch(&mut c, "SELECT TOP(10) [Id], [Created] FROM [Ord] ORDER BY [Created], [Id]").await.unwrap();
+    // NULL first (then by Id in SQL Server's order), then the two by their
+    // seventh digit.
+    assert_eq!(ids(&r[0]), ["0000000001", "0000000003", "0100000000", "0000000002"]);
+    let r = batch(&mut c, "SELECT [N] FROM [Ord] ORDER BY [N]; SELECT [N] FROM [Ord] ORDER BY [N] DESC").await.unwrap();
+    let ns = |r: &[tiberius::Row]| -> Vec<Option<i32>> { r.iter().map(|r| r.get::<i32, _>(0)).collect() };
+    assert_eq!(ns(&r[0]), [None, Some(1), Some(2), Some(3)]);
+    assert_eq!(ns(&r[1]), [Some(3), Some(2), Some(1), None]);
+    let r = batch(&mut c, "SELECT [N], ROW_NUMBER() OVER (ORDER BY [N]) FROM [Ord] ORDER BY [N]").await.unwrap();
+    assert_eq!(r[0][0].get::<i64, _>(1), Some(1));
+    assert_eq!(r[0][0].get::<i32, _>(0), None);
+}

@@ -855,6 +855,17 @@ pub(crate) fn input_is_valid(text: &str, target: &str) -> Result<bool, String> {
     Ok(eval(&cast, &Row::default(), &[]).is_ok())
 }
 
+/// The microseconds `text` cast to `target` (a timestamp, timestamptz or
+/// time) is read as, by the cast a statement makes.
+pub(crate) fn cast_text_micros(text: &str, target: &str) -> Option<i64> {
+    let literal = Expr::Literal { bytes: text.as_bytes().to_vec(), db_type: DbType::STRING };
+    match eval(&cast_to(literal, target).ok()?, &Row::default(), &[]).ok()? {
+        Value::Data { bytes, db_type: DbType::TIME } => Some(i64::from_be_bytes(bytes.get(..8)?.try_into().ok()?)),
+        Value::Data { bytes, .. } => Some(i64::from_le_bytes(bytes.get(..8)?.try_into().ok()?)),
+        Value::Null => None,
+    }
+}
+
 /// Position of a top-level `::`, if the expression ends in a cast.
 fn top_level_cast(text: &str) -> Option<usize> {
     let bytes = text.as_bytes();

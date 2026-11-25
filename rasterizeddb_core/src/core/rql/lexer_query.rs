@@ -2438,6 +2438,16 @@ fn parse_select_query(
     let as_distinct = distinct && !has_aggregate && group_by.is_empty() && distinct_on.is_empty();
     let grouped_distinct =
         crate::core::rql::collation::group_by_keys(&mut group_by, &mut select_items, schema, as_distinct);
+    // Sorted by a `uuid` in SQL Server's order: the groups sort by it.
+    let grouped_distinct = grouped_distinct
+        || (crate::core::rql::collation::any_order(schema)
+            && crate::core::rql::collation::guid_group_order(
+                &mut group_by,
+                &mut select_items,
+                schema,
+                as_distinct && !grouped_distinct,
+                &order_terms,
+            ));
     let distinct = distinct && !grouped_distinct;
     // A DISTINCT left over a plain column with a nondeterministic collation
     // (beside an expression, which compares by its bytes) would tell its
@@ -2476,8 +2486,29 @@ fn parse_select_query(
     let by_output = output_exprs.iter().any(Option::is_some) || output_windows.iter().any(Option::is_some);
     // Columns with a nondeterministic collation sort by their key; what
     // would compare them by their bytes is refused (`collation::plan_single`).
+    let original: Vec<String> = order_terms.iter().map(|t| t.token.clone()).collect();
     let order_terms =
         crate::core::rql::collation::plan_single(columns_part, schema, order_terms, &group_by, is_grouped, distinct)?;
+    // A collation's key term goes in before the term it sorts (each term
+    // kept, in order): what each original term reads moves with it, and
+    // a key term reads its column. Indexed by the old positions, a key
+    // term took the next term's output, and the last ran past the end.
+    if order_terms.len() != original.len() {
+        let (mut exprs, mut windows) = (Vec::with_capacity(order_terms.len()), Vec::with_capacity(order_terms.len()));
+        let mut at = 0;
+        for term in &order_terms {
+            if original.get(at) == Some(&term.token) {
+                exprs.push(output_exprs[at].take());
+                windows.push(output_windows[at]);
+                at += 1;
+            } else {
+                exprs.push(None);
+                windows.push(None);
+            }
+        }
+        output_exprs = exprs;
+        output_windows = windows;
+    }
     crate::core::rql::collation::mark_aggregates(&mut select_items, schema);
 
     // HAVING with nothing to group by is the whole table as one group, which

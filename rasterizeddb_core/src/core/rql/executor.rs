@@ -13035,6 +13035,23 @@ fn substitute_columns(expression: &str, values: &[(String, String)]) -> Result<S
             out.push_str(&expression[start..i]);
             continue;
         }
+        // A quoted name (`"K"`, a relation copy's column) is one name: its
+        // quotes were copied and the word inside them substituted, leaving
+        // `"('…')"`, which named nothing.
+        if bytes[i] == b'"' {
+            let end = crate::core::sql_scan::quoted_end(bytes, i, b'"');
+            let name = expression[i + 1..end.saturating_sub(1).max(i + 1)].replace("\"\"", "\"");
+            match values.iter().find(|(n, _)| *n == name || n.eq_ignore_ascii_case(&name)) {
+                Some((_, literal)) => {
+                    out.push('(');
+                    out.push_str(literal.trim());
+                    out.push(')');
+                }
+                None => out.push_str(&expression[i..end]),
+            }
+            i = end;
+            continue;
+        }
         if !is_word_byte(bytes[i]) {
             out.push(bytes[i] as char);
             i += 1;

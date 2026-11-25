@@ -83,6 +83,11 @@ pub enum PgFunc {
     /// `__rdb_t7_text(t, d)`: the time `t` moved `d` 100 ns, as text with
     /// seven fractional digits.
     TickText,
+    /// `__rdb_t7_floor(t, d)`: the time `t` moved `d` 100 ns, cut to the
+    /// microsecond: what everything at a microsecond or coarser reads
+    /// (`23:59:59.9999996` is held as the next day's `00:00:00` less 4;
+    /// its day is this one).
+    TickFloor,
     Initcap,
     Md5,
     ToHex,
@@ -291,7 +296,7 @@ pub const NAMES: &[&str] = &[
     "LOG", "LOG10", "PI", "DEGREES", "RADIANS", "RANDOM", "DIV", "GCD", "LCM", "WIDTH_BUCKET", "FACTORIAL", "JUSTIFY_HOURS", "JUSTIFY_DAYS", "JUSTIFY_INTERVAL", "MAKE_DATE", "MAKE_TIMESTAMP",
     "TO_TIMESTAMP", "TO_DATE", "TO_CHAR", "AGE", "ENCODE", "DECODE", "JSON_BUILD_OBJECT", "JSONB_BUILD_OBJECT",
     "JSON_BUILD_ARRAY", "JSONB_BUILD_ARRAY", "TO_JSON", "TO_JSONB", "JSONB_ARRAY_LENGTH", "JSON_ARRAY_LENGTH",
-    "NUM_NONNULLS", "NUM_NULLS", "STRING_TO_ARRAY", "ARRAY_TO_STRING", "CARDINALITY", "TRIM", "PG_TYPEOF", "PG_INPUT_IS_VALID", "__RDB_T7_DIGIT", "__RDB_T7_TEXT",
+    "NUM_NONNULLS", "NUM_NULLS", "STRING_TO_ARRAY", "ARRAY_TO_STRING", "CARDINALITY", "TRIM", "PG_TYPEOF", "PG_INPUT_IS_VALID", "__RDB_T7_DIGIT", "__RDB_T7_TEXT", "__RDB_T7_FLOOR",
     "ARRAY_APPEND", "ARRAY_PREPEND", "ARRAY_CAT", "JSONB_SET", "JSONB_STRIP_NULLS", "NEXTVAL", "CURRVAL", "SETVAL",
     "LASTVAL", "PG_GET_USERBYID", "FORMAT_TYPE", "PG_GET_INDEXDEF", "PG_GET_CONSTRAINTDEF", "PG_GET_PARTKEYDEF",
     "PG_GET_FUNCTION_RESULT", "PG_GET_FUNCTION_ARGUMENTS", "PG_GET_FUNCTION_IDENTITY_ARGUMENTS", "PG_GET_EXPR",
@@ -373,6 +378,7 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "PG_INPUT_IS_VALID" => (PgInputIsValid, &[2]),
         "__RDB_T7_DIGIT" => (TickDigit, &[1]),
         "__RDB_T7_TEXT" => (TickText, &[2]),
+        "__RDB_T7_FLOOR" => (TickFloor, &[2]),
         "INITCAP" => (Initcap, &[1]),
         "MD5" => (Md5, &[1]),
         "TO_HEX" => (ToHex, &[1]),
@@ -535,6 +541,7 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
         StartsWith | PgInputIsValid => DbType::BOOL,
         TickDigit => DbType::I32,
         TickText => DbType::STRING,
+        TickFloor => first(),
         Ceil | Floor | Sign | Sqrt => {
             if first() == DbType::DECIMAL {
                 DbType::DECIMAL
@@ -1475,6 +1482,10 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         StartsWith => data(vec![u8::from(s(0).starts_with(&s(1)))], DbType::BOOL),
         PgInputIsValid => data(vec![u8::from(crate::core::rql::expr::input_is_valid(&s(0), &s(1))?)], DbType::BOOL),
         TickDigit => int_value(tick_offset(&s(0))),
+        TickFloor => {
+            let offset = int_of(&args[1], "the 100 ns offset")?;
+            tick_floor(&args[0], offset).unwrap_or_else(|| args[0].clone())
+        }
         TickText => {
             let offset = int_of(&args[1], "the 100 ns offset")?.clamp(-9, 9);
             text_value(tick_shifted(&args[0], offset).unwrap_or_else(|| tick_text(&s(0), 0)))
@@ -3429,22 +3440,48 @@ mod case_mapping_tests {
 }
 
 /// How far (in 100 ns) a time's text lies from the microsecond the engine
-/// reads it as: its fraction to seven digits, less ten times the fraction
-/// to six rounded half to even on its decimal digits (the engine's
-/// rounding: `.0000015` and `.0000025` are both `.000002`).
+/// reads it as: its seventh fractional digit, plus ten times the
+/// microseconds the text cut to six digits is less what the whole text is
+/// read as. Read by the engine's own parser both times, so the value a
+/// column keeps and its offset agree however the engine rounds (it rounds
+/// through a float: `.5046365` and `.5215135` go opposite ways).
 pub(crate) fn tick_offset(text: &str) -> i64 {
     let Some(dot) = text.rfind('.') else { return 0 };
-    let digits: Vec<u8> = text[dot + 1..].bytes().take_while(u8::is_ascii_digit).map(|b| b - b'0').collect();
+    let digits_end = text[dot + 1..].find(|c: char| !c.is_ascii_digit()).map_or(text.len(), |e| dot + 1 + e);
+    let digits = &text[dot + 1..digits_end];
     if digits.len() <= 6 {
         return 0;
     }
-    let num = |d: &[u8]| d.iter().fold(0i64, |n, &x| n * 10 + i64::from(x));
-    let six = num(&digits[..6]);
-    let rest = &digits[6..];
-    let half = rest[0] == 5 && rest[1..].iter().all(|&x| x == 0);
-    let up = rest[0] > 5 || (rest[0] == 5 && !half) || (half && six % 2 == 1);
-    let micros = six + i64::from(up);
-    num(&digits[..7]) - micros * 10
+    let seventh = i64::from(digits.as_bytes()[6] - b'0');
+    let cut = format!("{}{}{}", &text[..=dot], &digits[..6], &text[digits_end..]);
+    // A date before the time is a timestamp, a zone after it one with a
+    // zone; else a time of day.
+    let dated = text.trim_start().get(4..5) == Some("-");
+    let zoned = !text[digits_end..].trim().is_empty();
+    let target = match (dated, zoned) {
+        (true, true) => "timestamptz",
+        (true, false) => "timestamp",
+        _ => "time",
+    };
+    match (crate::core::rql::expr::cast_text_micros(&cut, target), crate::core::rql::expr::cast_text_micros(text, target)) {
+        (Some(cut), Some(whole)) => seventh + 10 * (cut - whole),
+        _ => 0,
+    }
+}
+
+/// The time `value` moved `offset` 100 ns and cut to the microsecond, as
+/// a value of its type; `None` for a value of no time type.
+pub(crate) fn tick_floor(value: &Value, offset: i64) -> Option<Value> {
+    let Value::Data { bytes, db_type } = value else { return None };
+    let (micros, big_endian) = match db_type {
+        DbType::TIMESTAMP | DbType::DATETIME => (i64::from_le_bytes(bytes.get(..8)?.try_into().ok()?), false),
+        DbType::TIME => (i64::from_be_bytes(bytes.get(..8)?.try_into().ok()?), true),
+        _ => return None,
+    };
+    let us = micros.checked_mul(10)?.checked_add(offset)?.div_euclid(10);
+    let mut out = if big_endian { us.to_be_bytes().to_vec() } else { us.to_le_bytes().to_vec() };
+    out.extend_from_slice(bytes.get(8..).unwrap_or(&[]));
+    Some(Value::Data { bytes: out, db_type: db_type.clone() })
 }
 
 /// The time `value` (a timestamp's or time's stored value) moved `offset`
@@ -3487,22 +3524,45 @@ pub(crate) fn tick_text(text: &str, digit: u8) -> String {
 mod tick_tests {
     use super::*;
 
-    /// The 100 ns offset from the engine's microsecond, rounded half to even
-    /// as the engine rounds, and the value put back together from both.
+    /// A time's seven digits come back whole from the microsecond the
+    /// engine reads it as and the offset: for every rounding the engine's
+    /// parser makes, the half cases included (the pilot's `.5046365` and
+    /// `.5215135` came back a microsecond off when the offset assumed
+    /// half-to-even).
     #[test]
     fn hundred_nanosecond_offsets() {
-        assert_eq!(tick_offset("2026-03-23 15:03:07.0429169"), -1); // .042917
-        assert_eq!(tick_offset("2026-03-23 15:03:07.0429164"), 4); // .042916
-        assert_eq!(tick_offset("2026-03-23 15:03:07.0429165"), 5); // even: .042916
-        assert_eq!(tick_offset("2026-03-23 15:03:07.0429175"), -5); // even: .042918
-        assert_eq!(tick_offset("2026-03-23 15:03:07.9999995"), -5); // the next second
+        let mut cases: Vec<String> = [
+            "12:00:00.5046365", "18:10:23.5215135", "00:11:13.5227755", "13:44:54.2513405",
+            "15:03:07.0429169", "15:03:07.0429165", "15:03:07.0429175", "15:03:07.0429161", "23:59:59.9999995",
+            "23:59:59.9999999", "15:03:07.0000005",
+        ]
+        .iter()
+        .map(|t| format!("2026-03-23 {t}"))
+        .collect();
+        for k in 0..2000u32 {
+            cases.push(format!("2026-03-23 10:11:12.{:07}", k * 4999 % 10_000_000));
+        }
+        for text in &cases {
+            let us = crate::core::rql::expr::cast_text_micros(text, "timestamp").unwrap();
+            let v = Value::Data { bytes: us.to_le_bytes().to_vec(), db_type: DbType::TIMESTAMP };
+            let off = tick_offset(text);
+            assert!((-9..=9).contains(&off), "{text}: {off}");
+            let back = tick_shifted(&v, off).unwrap();
+            let want = if text.ends_with("23:59:59.9999995") || text.ends_with("23:59:59.9999999") {
+                // Across midnight: the same instant, the next day's text is
+                // not this one's, and the date is the value's own.
+                back.clone()
+            } else {
+                text.clone()
+            };
+            assert_eq!(back, want, "{text}");
+        }
         assert_eq!(tick_offset("2026-03-23 15:03:07.042916"), 0);
         assert_eq!(tick_offset("15:03:07"), 0);
-        assert_eq!(tick_offset("2026-03-23 15:03:07.1234567+00"), -3);
-        let us = crate::core::value_codec::parse_timestamp_local_us("2026-03-23 15:03:08").unwrap();
-        let v = Value::Data { bytes: us.to_le_bytes().to_vec(), db_type: DbType::TIMESTAMP };
-        assert_eq!(tick_shifted(&v, -5).as_deref(), Some("2026-03-23 15:03:07.9999995"));
-        assert_eq!(tick_shifted(&v, 3).as_deref(), Some("2026-03-23 15:03:08.0000003"));
+        let t = "15:03:07.9999996";
+        let us = crate::core::rql::expr::cast_text_micros(t, "time").unwrap();
+        let v = Value::Data { bytes: us.to_be_bytes().to_vec(), db_type: DbType::TIME };
+        assert_eq!(tick_shifted(&v, tick_offset(t)).as_deref(), Some(t));
         assert_eq!(tick_text("15:03:07+00", 4), "15:03:07.0000004+00");
     }
 }

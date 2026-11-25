@@ -1328,7 +1328,7 @@ impl Session {
                             Column {
                                 // SQL Server leaves an unaliased expression
                                 // unnamed.
-                                name: if f.name == "?column?" {
+                                name: if f.name.starts_with("?column?") {
                                     String::new()
                                 } else if f.table_oid != 0 && !self.aliases.iter().any(|a| *a == f.name) {
                                     // A table's column read as it is (`SELECT *`, an
