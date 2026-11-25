@@ -1382,6 +1382,11 @@ fn exists_reads_only(term: &str, alias: &str) -> bool {
     if !body.trim_start().to_ascii_uppercase().starts_with("SELECT") {
         return false;
     }
+    // From its FROM on: an EXISTS's select list decides nothing (the SQL
+    // Server front end writes EF Core's `SELECT 1` as `SELECT CAST(1 AS
+    // integer)`, whose call refused the whole term).
+    let Some(from) = find_keyword(body, "FROM", 0) else { return false };
+    let body = &body[from..];
     // Words and quoted names, in order.
     let bytes = body.as_bytes();
     let mut tokens: Vec<(String, bool, usize)> = Vec::new(); // (text, quoted, end)
@@ -1820,6 +1825,12 @@ mod exists_filter_tests {
                    WHERE d.id = d0.productsid AND d1.content = 'Realme C53')";
         assert!(exists_reads_only(tag, "d"));
         assert!(exists_reads_only("NOT EXISTS (SELECT 1 FROM t x WHERE x.k = d.id AND x.v = '1'::uuid)", "d"));
+        // Its select list is not read: the SQL Server front end's `SELECT
+        // CAST(1 AS integer)`.
+        assert!(exists_reads_only(
+            "EXISTS (SELECT CAST(1 AS integer) FROM \"tags\" AS d0 INNER JOIN \"t\" AS d1 ON d0.tid = d1.id WHERE d.id = d0.pid AND d1.content IN ('a', 'b'))",
+            "d"
+        ));
         // Another item's column, a call, a nested subquery, a parameter, a
         // bare word that could be any column.
         assert!(!exists_reads_only("EXISTS (SELECT 1 FROM t x WHERE x.k = e.id)", "d"));
