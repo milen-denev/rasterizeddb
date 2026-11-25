@@ -277,6 +277,9 @@ struct Session {
     /// The statement being forwarded's explicit aliases
     /// (`Forward::aliases`): kept as typed in its COLMETADATA.
     aliases: Vec<String>,
+    /// The statement being forwarded's columns read with their 100 ns
+    /// digit (`Forward::ticks`): sent as their SQL Server time type.
+    ticks: Vec<(String, &'static str)>,
     /// The statement being forwarded's verb (`INSERT`, `UPDATE`, …), as a
     /// constraint violation's message names it ([`Session::engine_error`]).
     verb: &'static str,
@@ -368,6 +371,7 @@ pub(crate) async fn serve_connection(
         bound_numbers: Vec::new(),
         names: NameCache::default(),
         aliases: Vec::new(),
+        ticks: Vec::new(),
         verb: "INSERT",
         database_shown: String::new(),
     };
@@ -818,6 +822,13 @@ fn duplicate_values(message: &str) -> Option<String> {
         values.push(v.replace("''", "'"));
     }
     Some(values.join(", "))
+}
+
+/// A time parameter's type as bound: none (read as its text, as a literal
+/// is), where `timestamp` rounded a `datetime2(7)` value to microseconds
+/// before its seventh digit could be kept (`__rdb_t7_digit`).
+fn untyped_time(oid: u32) -> u32 {
+    if matches!(oid, 1114 | 1184 | 1083) { 0 } else { oid }
 }
 
 fn isolation_words(level: u8) -> Option<&'static str> {
@@ -1301,7 +1312,16 @@ impl Session {
                     let cols: Vec<Column> = fields
                         .iter()
                         .map(|f| {
-                            let ty = tds::column_type(f.type_oid, f.type_modifier);
+                            // A time read with its 100 ns digit, as text.
+                            let tick = (f.type_oid == 25)
+                                .then(|| self.ticks.iter().find(|(n, _)| *n == f.name).map(|(_, t)| *t))
+                                .flatten();
+                            let ty = match tick {
+                                Some("datetimeoffset") => Some(tds::ColType::DateTimeOffset),
+                                Some("time") => Some(tds::ColType::Time),
+                                Some(_) => Some(tds::ColType::DateTime2),
+                                None => tds::column_type(f.type_oid, f.type_modifier),
+                            };
                             if ty.is_none() {
                                 unknown = true;
                             }
@@ -1623,7 +1643,7 @@ impl Session {
                     match p.values.get(k).cloned().unwrap_or(ParamValue::Null) {
                         ParamValue::Null => (0, None, oid),
                         ParamValue::Text(t) => {
-                            (0, Some(t.into_bytes()), if oid == 17 { 0 } else { oid })
+                            (0, Some(t.into_bytes()), if oid == 17 { 0 } else { untyped_time(oid) })
                         }
                         ParamValue::Bytes(b) => (1, Some(b), 17),
                     }
@@ -1639,6 +1659,7 @@ impl Session {
         let mut last = None;
         let mut affected = 0u64;
         self.aliases = forward.aliases.clone();
+        self.ticks = forward.ticks.clone();
         // The statement's verb, as SQL Server's messages name it.
         self.verb = forward
             .statements
@@ -1656,6 +1677,7 @@ impl Session {
                 Ok(o) => o,
                 Err(e) => {
                     self.aliases.clear();
+                    self.ticks.clear();
                     return Err(e);
                 }
             };
@@ -1669,6 +1691,7 @@ impl Session {
             }
         }
         self.aliases.clear();
+        self.ticks.clear();
         let outcome = last.unwrap_or(Outcome::Done {
             tag: String::new(),
             identity: None,
@@ -4314,11 +4337,6 @@ impl Session {
         if rows.is_empty() {
             return Ok(0);
         }
-        let cols = columns
-            .iter()
-            .map(|c| ident_sql(&c.name.to_lowercase()))
-            .collect::<Vec<_>>()
-            .join(", ");
         let per = (30_000 / columns.len().max(1)).max(1);
         // One transaction, as SQL Server's batch is (BatchSize 0).
         let outer = self.bridge().in_block();
@@ -4339,13 +4357,19 @@ impl Session {
                 for (value, oid) in row {
                     bound.push(match value {
                         ParamValue::Null => (0i16, None, 0u32),
-                        ParamValue::Text(t) => (0, Some(t.clone().into_bytes()), *oid),
+                        ParamValue::Text(t) => (0, Some(t.clone().into_bytes()), untyped_time(*oid)),
                         ParamValue::Bytes(b) => (1, Some(b.clone()), 17),
                     });
                     slots.push(format!("${}", bound.len()));
                 }
-                values.push(format!("({})", slots.join(", ")));
+                values.push(slots);
             }
+            // A column keeping a 100 ns digit: its values split into the
+            // column's and the digit's (`translate::with_ticks`).
+            let names: Vec<String> = columns.iter().map(|c| ident_sql(&c.name.to_lowercase())).collect();
+            let (names, values) = translate::with_ticks(&Scope { s: self, params: None }, &table, &names, values);
+            let values: Vec<String> = values.iter().map(|r| format!("({})", r.join(", "))).collect();
+            let cols = names.join(", ");
             let sql = format!(
                 "INSERT INTO {} ({cols}) VALUES {}",
                 ident_sql(&table),

@@ -181,6 +181,10 @@ pub(crate) struct Forward {
     /// A CREATE (`true`) or DROP DATABASE's name as written: its spelling
     /// is kept, as SQL Server shows it (`DB_NAME()`, sys.databases).
     pub(crate) database: Option<(String, bool)>,
+    /// Result columns that are a time with its 100 ns digit, as text
+    /// (`__rdb_t7_text`): their names and SQL Server types (`datetime2`,
+    /// `datetimeoffset`, `time`), sent as those at scale 7.
+    pub(crate) ticks: Vec<(String, &'static str)>,
 }
 
 /// A statement of a batch, with T-SQL's control flow.
@@ -668,6 +672,11 @@ pub(crate) struct Cx<'a> {
     collations: bool,
     /// The top-level select list's explicit aliases ([`Forward::aliases`]).
     top_aliases: Vec<String>,
+    /// The SELECT being rewritten is a derived table's (its rows are read,
+    /// not compared): a column keeping a 100 ns digit is read whole there.
+    project_ticks: bool,
+    /// Output columns read whole with their 100 ns digit ([`Forward::ticks`]).
+    tick_outputs: Vec<(String, &'static str)>,
 }
 
 impl<'a> Cx<'a> {
@@ -680,6 +689,8 @@ impl<'a> Cx<'a> {
             xml_value: false,
             collations: false,
             top_aliases: Vec::new(),
+            project_ticks: false,
+            tick_outputs: Vec::new(),
         }
     }
 }
@@ -974,7 +985,11 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
                 && tokens.get(close + 2).is_some_and(|w| w.is_word("value"))
                 && tokens.get(close + 3).is_some_and(|o| o.is_op("("));
             let outer_xml = std::mem::replace(&mut cx.xml_value, value_call);
+            // A derived table's rows are read as they are: its columns
+            // keeping a 100 ns digit whole (`project_ticks`).
+            cx.project_ticks = out.last().is_some_and(|p| p.is_word("FROM") || p.is_word("JOIN") || p.is_word("APPLY"));
             let inner = rewrite_select("", tokens[i + 1..close].to_vec(), cx, false);
+            cx.project_ticks = false;
             cx.xml_value = outer_xml;
             out.push(t.clone());
             out.extend(inner?);
@@ -2909,7 +2924,11 @@ fn rewrite_select_inner(
         ],
     )
     .unwrap_or(tokens.len());
-    let items = split_commas(&tokens[i..end]);
+    let project = std::mem::take(&mut cx.project_ticks) || name_items;
+    let mut items = split_commas(&tokens[i..end]);
+    if project {
+        items = read_ticks_whole(items, &tokens, end, cx);
+    }
     let mut prepared = Vec::new();
     for item in items {
         // T-SQL's `alias = expr`.
@@ -2975,6 +2994,9 @@ fn rewrite_select_inner(
     }
     cx.aliases = saved;
     let mut rest: Vec<Token> = tokens[end..].to_vec();
+    // Comparisons and sorts over a column keeping a 100 ns digit read it.
+    let relations = from_relations(&rest, 0);
+    rest = compare_ticks(rest, &relations, cx);
     if let Some(order) = find_top(&rest, 0, &["ORDER"]) {
         if kw(&rest, order + 1, "BY") && !item_texts.is_empty() {
             let stop = find_top(
@@ -3048,6 +3070,8 @@ fn rewrite_select_inner(
         let tail = rewrite_expr(rest[..j].to_vec(), cx);
         cx.past_select_list = outer;
         out.extend(tail?);
+        // A branch reads its columns as the first one does.
+        cx.project_ticks = project;
         out.extend(rewrite_select(sql, rest[j..].to_vec(), cx, false)?);
         cx.aliases.clear();
         return Ok(out);
@@ -3302,6 +3326,375 @@ fn output_clause(
     Ok(out)
 }
 
+/// The relations a SELECT's FROM clause (from `at`, its FROM) reads: each
+/// one's label (alias, else name) and, for a table, its name; a derived
+/// table's or a function's is `None`.
+fn from_relations(tokens: &[Token], at: usize) -> Vec<(String, Option<String>)> {
+    if !kw(tokens, at, "FROM") {
+        return Vec::new();
+    }
+    let end = find_top(tokens, at + 1, &["WHERE", "GROUP", "HAVING", "ORDER", "UNION", "EXCEPT", "INTERSECT", "OPTION", "FOR", "OFFSET", "WINDOW"])
+        .unwrap_or(tokens.len());
+    let from = &tokens[at + 1..end];
+    let mut out = Vec::new();
+    let mut k = 0;
+    while k < from.len() {
+        // Past joins' words and conditions to the next relation.
+        let t = &from[k];
+        if t.is_op(",") || t.is_word("JOIN") || t.is_word("APPLY") {
+            k += 1;
+            continue;
+        }
+        if t.is_word("ON") {
+            k = find_top(from, k + 1, &["JOIN", "CROSS", "OUTER", "INNER", "LEFT", "RIGHT", "FULL"])
+                .or_else(|| (k + 1..from.len()).find(|&j| from[j].is_op(",")))
+                .unwrap_or(from.len());
+            continue;
+        }
+        if matches!(t.upper().as_deref(), Some("INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS" | "OUTER" | "LATERAL")) {
+            k += 1;
+            continue;
+        }
+        let (table, after) = if t.is_op("(") {
+            let Some(close) = matching_paren(from, k) else { break };
+            (None, close + 1)
+        } else if let Some((name, after)) = table_name_at(from, k) {
+            if from.get(after).is_some_and(|p| p.is_op("(")) {
+                // A function: `f(…) AS x`.
+                let close = matching_paren(from, after).unwrap_or(from.len() - 1);
+                (None, close + 1)
+            } else {
+                (Some(name), after)
+            }
+        } else {
+            k += 1;
+            continue;
+        };
+        let mut j = after;
+        if kw(from, j, "WITH") && from.get(j + 1).is_some_and(|p| p.is_op("(")) {
+            j = matching_paren(from, j + 1).map_or(from.len(), |c| c + 1);
+        }
+        if kw(from, j, "AS") {
+            j += 1;
+        }
+        let alias = from.get(j).filter(|a| a.ident().is_some() && !is_clause_word(a) && !a.is_word("ON")).and_then(|a| a.ident());
+        let label = alias.map(str::to_lowercase).or_else(|| table.clone()).unwrap_or_default();
+        out.push((label, table));
+        k = if alias.is_some() { j + 1 } else { j };
+    }
+    out
+}
+
+/// A select list's items with each column keeping a 100 ns digit read
+/// whole: `q.c` as `__rdb_t7_text(q.c, q.__t7_c)` under its name, which
+/// the session sends as `datetime2(7)` ([`Forward::ticks`]); a `*` over
+/// such a table spelled out. Unchanged where nothing reads one.
+fn read_ticks_whole(items: Vec<Vec<Token>>, tokens: &[Token], from: usize, cx: &mut Cx) -> Vec<Vec<Token>> {
+    let relations = from_relations(tokens, from);
+    let ticks: Vec<(String, Vec<(String, &'static str)>)> = relations
+        .iter()
+        .filter_map(|(label, table)| Some((label.clone(), tick_columns(cx.env, table.as_ref()?))))
+        .filter(|(_, t)| !t.is_empty())
+        .collect();
+    if ticks.is_empty() {
+        return items;
+    }
+    let sql_server = |ty: &str| match ty {
+        "timestamptz" => "datetimeoffset",
+        "time" => "time",
+        _ => "datetime2",
+    };
+    // `*`, `q.*`: the relation's columns spelled out, when every relation
+    // it covers is a table, then read as any column is.
+    let mut expanded: Vec<Vec<Token>> = Vec::with_capacity(items.len());
+    for item in items {
+        let star = item.last().is_some_and(|t| t.is_op("*"));
+        if star {
+            let qualifier = (item.len() == 3).then(|| item[0].ident().map(str::to_lowercase)).flatten();
+            let covered: Vec<&(String, Option<String>)> = relations
+                .iter()
+                .filter(|(l, _)| qualifier.as_ref().is_none_or(|q| q == l))
+                .collect();
+            if covered.iter().any(|(_, t)| t.is_none()) || covered.iter().all(|(l, _)| !ticks.iter().any(|(tl, _)| tl == l)) {
+                expanded.push(item);
+                continue;
+            }
+            for (label, table) in covered {
+                let Some(view) = cx.env.database().schema_view(&name_key(table.as_deref().unwrap_or(""))) else { continue };
+                for f in view.schema().fields.iter().filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name)) {
+                    expanded.push(vec![Token::new(Tok::Quoted(label.clone())), Token::op("."), Token::new(Tok::Quoted(f.name.clone()))]);
+                }
+            }
+            continue;
+        }
+        expanded.push(item);
+    }
+    let mut out = Vec::with_capacity(expanded.len());
+    for item in expanded {
+        let (expr, alias) = split_alias(&item);
+        let column = (is_column_reference(&expr) && expr.len() <= 3).then(|| {
+            let name = expr.last()?.ident()?.to_lowercase();
+            let qualifier = (expr.len() == 3).then(|| expr[0].ident().map(str::to_lowercase)).flatten();
+            let mut found = ticks.iter().filter(|(l, _)| qualifier.as_ref().is_none_or(|q| q == l)).filter_map(|(l, cols)| {
+                cols.iter().find(|(c, _)| *c == name).map(|(c, ty)| (l.clone(), c.clone(), *ty))
+            });
+            let hit = found.next()?;
+            // A bare name two relations have is not resolved here.
+            (qualifier.is_some() || found.next().is_none()).then_some(hit)
+        }).flatten();
+        let Some((label, column, ty)) = column else {
+            out.push(item);
+            continue;
+        };
+        let shown = alias.clone().unwrap_or_else(|| {
+            let table = relations.iter().find(|(l, _)| *l == label).and_then(|(_, t)| t.clone()).unwrap_or_default();
+            cx.env.shown(&table, Some(&column)).unwrap_or_else(|| expr.last().and_then(|t| t.ident()).unwrap_or(&column).to_string())
+        });
+        let q = if expr.len() == 3 { format!("{}.", ident_sql(&label)) } else { String::new() };
+        cx.tick_outputs.push((shown.clone(), sql_server(ty)));
+        out.push(vec![
+            Token::raw(format!("__rdb_t7_text({q}{}, {q}{})", ident_sql(&column), ident_sql(&tick_column(&column)))),
+            Token::word("AS"),
+            Token::new(Tok::Quoted(shown)),
+        ]);
+    }
+    out
+}
+
+/// A column operand at `at` (`c`, `q.c`) that keeps a 100 ns digit, among
+/// `relations`: (its tokens' end, the relation's label as written or none,
+/// the column, its engine type).
+fn tick_operand(
+    tokens: &[Token],
+    at: usize,
+    relations: &[(String, Vec<(String, &'static str)>)],
+) -> Option<(usize, Option<String>, String, &'static str)> {
+    let first = tokens.get(at)?;
+    first.ident()?;
+    if first.upper().is_some_and(|w| matches!(w.as_str(), "NULL" | "AND" | "OR" | "NOT")) {
+        return None;
+    }
+    let (qualifier, name, end) = if tokens.get(at + 1).is_some_and(|d| d.is_op(".")) {
+        (Some(first.ident()?.to_lowercase()), tokens.get(at + 2)?.ident()?.to_lowercase(), at + 3)
+    } else {
+        (None, first.ident()?.to_lowercase(), at + 1)
+    };
+    // Not a call, and not the middle of a longer name.
+    if tokens.get(end).is_some_and(|t| t.is_op("(") || t.is_op(".")) || (at > 0 && tokens[at - 1].is_op(".")) {
+        return None;
+    }
+    let mut found = relations
+        .iter()
+        .filter(|(l, _)| qualifier.as_ref().is_none_or(|q| q == l))
+        .filter_map(|(l, cols)| cols.iter().find(|(c, _)| *c == name).map(|(c, ty)| (l.clone(), c.clone(), *ty)));
+    let (label, column, ty) = found.next()?;
+    if qualifier.is_none() && found.next().is_some() {
+        return None;
+    }
+    Some((end, qualifier.map(|_| label), column, ty))
+}
+
+/// The end of the operand starting at `at`: one token, a call, or a
+/// parenthesised expression.
+fn tick_value_end(tokens: &[Token], at: usize) -> Option<usize> {
+    let t = tokens.get(at)?;
+    if t.is_op("(") {
+        return matching_paren(tokens, at).map(|c| c + 1);
+    }
+    if t.is_word("CAST") || t.ident().is_some() && tokens.get(at + 1).is_some_and(|p| p.is_op("(")) {
+        let open = at + 1;
+        return matching_paren(tokens, open).map(|c| c + 1);
+    }
+    // `q.c`, `@p`, a literal.
+    let mut end = at + 1;
+    while tokens.get(end).is_some_and(|d| d.is_op(".")) && tokens.get(end + 1).is_some_and(|n| n.ident().is_some()) {
+        end += 2;
+    }
+    Some(end)
+}
+
+/// A FROM-and-after part's comparisons and sorts over a column keeping a
+/// 100 ns digit (`relations`, from [`from_relations`]) made to read it:
+/// `c = v` compares the column with `v` as before and the digits after
+/// (`__rdb_t7_digit(v)`), `<`/`>` the digits past equal microseconds, and
+/// ORDER BY `c` sorts by the digit next. A subquery is its own SELECT's;
+/// a comparison left as written (IN, BETWEEN) compares to the
+/// microsecond.
+fn compare_ticks(rest: Vec<Token>, relations: &[(String, Option<String>)], cx: &mut Cx) -> Vec<Token> {
+    let ticks: Vec<(String, Vec<(String, &'static str)>)> = relations
+        .iter()
+        .filter_map(|(label, table)| Some((label.clone(), tick_columns(cx.env, table.as_ref()?))))
+        .filter(|(_, t)| !t.is_empty())
+        .collect();
+    if ticks.is_empty() {
+        return rest;
+    }
+    let column_sql = |q: &Option<String>, c: &str| match q {
+        Some(q) => format!("{}.{}", ident_sql(q), ident_sql(c)),
+        None => ident_sql(c),
+    };
+    let order_at = find_top(&rest, 0, &["ORDER"]).filter(|&o| kw(&rest, o + 1, "BY"));
+    let mut out: Vec<Token> = Vec::with_capacity(rest.len() + 8);
+    let mut i = 0;
+    while i < rest.len() {
+        // A subquery: rewritten as its own SELECT.
+        if rest[i].is_op("(") && kw(&rest, i + 1, "SELECT") {
+            let close = matching_paren(&rest, i).unwrap_or(rest.len() - 1);
+            out.extend(rest[i..=close].iter().cloned());
+            i = close + 1;
+            continue;
+        }
+        let in_order = order_at.is_some_and(|o| i > o + 1);
+        let Some((end, q, column, ty)) = tick_operand(&rest, i, &ticks) else {
+            out.push(rest[i].clone());
+            i += 1;
+            continue;
+        };
+        let digit = column_sql(&q, &tick_column(&column));
+        let col = column_sql(&q, &column);
+        if in_order {
+            // `ORDER BY c [ASC|DESC]`: the digit next, the same way.
+            let after_dir = if kw(&rest, end, "ASC") || kw(&rest, end, "DESC") { end + 1 } else { end };
+            let term_ends = rest.get(after_dir).is_none_or(|t| t.is_op(",") || is_clause_word(t));
+            out.extend(rest[i..after_dir].iter().cloned());
+            if term_ends {
+                let dir = if kw(&rest, end, "DESC") { " DESC" } else { "" };
+                out.push(Token::op(","));
+                out.push(Token::raw(format!("coalesce({digit}, 0){dir}")));
+            }
+            i = after_dir;
+            continue;
+        }
+        let op = rest.get(end).and_then(|t| match &t.tok {
+            Tok::Op(o) if matches!(o.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") => Some(o.clone()),
+            _ => None,
+        });
+        let (Some(op), Some(v_end)) = (op, tick_value_end(&rest, end + 1)) else {
+            out.extend(rest[i..end].iter().cloned());
+            i = end;
+            continue;
+        };
+        let v = rest[end + 1..v_end].to_vec();
+        // The other side's value and digit: another such column's own, else
+        // its text cut and its seventh digit.
+        let (value, other_digit) = match tick_operand(&rest, end + 1, &ticks).filter(|(e, ..)| *e == v_end) {
+            Some((_, q2, c2, _)) => (vec![Token::raw(column_sql(&q2, &c2))], format!("coalesce({}, 0)", column_sql(&q2, &tick_column(&c2)))),
+            None => {
+                let _ = ty;
+                let cut = v.clone();
+                let mut d = vec![Token::raw("coalesce(__rdb_t7_digit("), Token::op("(")];
+                d.extend(v.iter().cloned());
+                d.push(Token::op(")"));
+                d.push(Token::raw("), 0)"));
+                (cut, render_text(&rewrite_expr(d, cx).unwrap_or_default()))
+            }
+        };
+        let value = render_text(&rewrite_expr(value, cx).unwrap_or_default());
+        let mine = format!("coalesce({digit}, 0)");
+        let sql = match op.as_str() {
+            "=" => format!("({col} = {value} AND {mine} = {other_digit})"),
+            "<>" | "!=" => format!("(NOT ({col} = {value} AND {mine} = {other_digit}))"),
+            o => {
+                let strict = &o[..1];
+                format!("({col} {strict} {value} OR ({col} = {value} AND {mine} {o} {other_digit}))")
+            }
+        };
+        out.push(Token::raw(sql));
+        i = v_end;
+    }
+    out
+}
+
+/// Whether a column type keeps SQL Server's seventh fractional digit:
+/// `datetime2`, `datetimeoffset` or `time` with precision 7, which is
+/// theirs when none is written. The column gets a hidden 100 ns digit
+/// beside it (`nullable::TICK_DIGIT_PREFIX`).
+fn keeps_ticks(ty: &[Token]) -> bool {
+    let Some(name) = ty.first().and_then(|t| t.upper()) else { return false };
+    if !matches!(name.as_str(), "DATETIME2" | "DATETIMEOFFSET" | "TIME") {
+        return false;
+    }
+    match ty.get(1) {
+        Some(open) if open.is_op("(") => matches!(ty.get(2).map(|t| &t.tok), Some(Tok::Num(n)) if n == "7"),
+        _ => true,
+    }
+}
+
+/// A time column's 100 ns digit companion.
+fn tick_column(column: &str) -> String {
+    format!("{}{}", crate::core::rql::nullable::TICK_DIGIT_PREFIX, column)
+}
+
+/// The columns of `table` keeping a 100 ns digit, by their engine names,
+/// with their engine type (for the cast of a value written to one).
+pub(crate) fn tick_columns(env: &dyn Env, table: &str) -> Vec<(String, &'static str)> {
+    use crate::core::db_type::DbType as D;
+    let Some(view) = env.database().schema_view(&name_key(table)) else { return Vec::new() };
+    let fields = &view.schema().fields;
+    fields
+        .iter()
+        .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+        .filter(|f| fields.iter().any(|g| !g.is_deleted && g.name == tick_column(&f.name)))
+        .filter_map(|f| {
+            let ty = match f.db_type {
+                D::TIMESTAMP => "timestamp",
+                D::DATETIME if f.without_time_zone => "timestamp",
+                D::DATETIME => "timestamptz",
+                D::TIME => "time",
+                _ => return None,
+            };
+            Some((f.name.clone(), ty))
+        })
+        .collect()
+}
+
+/// A value written to a column keeping a 100 ns digit (`v`, as the engine
+/// reads it): the column's (the value, which the engine keeps to the
+/// microsecond) and its digit's (how far it lies from that microsecond,
+/// `__rdb_t7_digit`).
+fn tick_value(v: &str, _ty: &str) -> (String, String) {
+    if v.trim().eq_ignore_ascii_case("DEFAULT") {
+        return (v.to_string(), "DEFAULT".to_string());
+    }
+    (v.to_string(), format!("CAST(__rdb_t7_digit({v}) AS smallint)"))
+}
+
+/// Rows of rendered values for `columns` of `table`, with each column
+/// keeping a 100 ns digit written as [`tick_value`] and its digit's column
+/// added at the end: the column list and rows to write.
+pub(crate) fn with_ticks(env: &dyn Env, table: &str, columns: &[String], rows: Vec<Vec<String>>) -> (Vec<String>, Vec<Vec<String>>) {
+    let ticks = tick_columns(env, table);
+    let at: Vec<(usize, &'static str, String)> = columns
+        .iter()
+        .enumerate()
+        .filter_map(|(k, c)| {
+            let bare = c.trim_matches('"');
+            ticks.iter().find(|(t, _)| t.eq_ignore_ascii_case(bare)).map(|(t, ty)| (k, *ty, tick_column(t)))
+        })
+        .collect();
+    if at.is_empty() {
+        return (columns.to_vec(), rows);
+    }
+    let mut cols = columns.to_vec();
+    cols.extend(at.iter().map(|(_, _, d)| ident_sql(d)));
+    let rows = rows
+        .into_iter()
+        .map(|mut row| {
+            let mut digits = Vec::new();
+            for (k, ty, _) in &at {
+                if let Some(v) = row.get_mut(*k) {
+                    let (value, digit) = tick_value(v, ty);
+                    *v = value;
+                    digits.push(digit);
+                }
+            }
+            row.extend(digits);
+            row
+        })
+        .collect();
+    (cols, rows)
+}
+
 fn rewrite_insert(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
     let mut i = 1usize;
     if kw(&tokens, i, "TOP") {
@@ -3318,6 +3711,7 @@ fn rewrite_insert(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward,
         Token::raw(ident_sql(&table)),
     ];
     let mut explicit_columns: Vec<String> = Vec::new();
+    let mut column_list_at: Option<usize> = None;
     if kw(&tokens, j, "WITH") && tokens.get(j + 1).is_some_and(|t| t.is_op("(")) {
         j = matching_paren(&tokens, j + 1).ok_or_else(|| TsqlError::syntax("unbalanced hint"))? + 1;
     }
@@ -3331,6 +3725,7 @@ fn rewrite_insert(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward,
                 .collect();
             out.push(Token::raw(format!("({})", names.join(", "))));
             explicit_columns = names;
+            column_list_at = Some(out.len() - 1);
             j = close + 1;
         }
     }
@@ -3347,6 +3742,25 @@ fn rewrite_insert(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward,
     }
     if kw(&tokens, j, "DEFAULT") && kw(&tokens, j + 1, "VALUES") {
         out.push(Token::raw("DEFAULT VALUES"));
+    } else if kw(&tokens, j, "VALUES") && column_list_at.is_some() && !tick_columns(cx.env, &table).is_empty() {
+        // Rows written to a column keeping a 100 ns digit: each value split
+        // into the column's and its digit's (`with_ticks`).
+        let mut rows = Vec::new();
+        for row in split_commas(&tokens[j + 1..]) {
+            if !(row.first().is_some_and(|t| t.is_op("(")) && row.last().is_some_and(|t| t.is_op(")"))) {
+                return Err(TsqlError::syntax("VALUES needs parenthesised rows"));
+            }
+            let mut vals = Vec::new();
+            for v in split_commas(&row[1..row.len() - 1]) {
+                vals.push(render_text(&rewrite_expr(v, cx)?));
+            }
+            rows.push(vals);
+        }
+        let (cols, rows) = with_ticks(cx.env, &table, &explicit_columns, rows);
+        out[column_list_at.unwrap()] = Token::raw(format!("({})", cols.join(", ")));
+        out.push(Token::word("VALUES"));
+        let rendered: Vec<String> = rows.iter().map(|r| format!("({})", r.join(", "))).collect();
+        out.push(Token::raw(rendered.join(", ")));
     } else if kw(&tokens, j, "VALUES") {
         out.push(Token::word("VALUES"));
         out.extend(rewrite_expr(tokens[j + 1..].to_vec(), cx)?);
@@ -3388,6 +3802,7 @@ fn rewrite_insert(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward,
         extra_column: None,
         aliases: Vec::new(),
         database: None,
+        ticks: Vec::new(),
     })
 }
 
@@ -3521,6 +3936,17 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
         if n > 0 {
             out.push(Token::op(","));
         }
+        // A column keeping a 100 ns digit: the value split into its own and
+        // the digit's (`tick_value`).
+        let tick = (part[eq].is_op("="))
+            .then(|| tick_columns(cx.env, &table).into_iter().find(|(c, _)| c.eq_ignore_ascii_case(name)))
+            .flatten();
+        if let Some((column, ty)) = tick {
+            let v = render_text(&rewrite_expr(part[eq + 1..].to_vec(), cx)?);
+            let (value, digit) = tick_value(&v, ty);
+            out.push(Token::raw(format!("{} = {value}, {} = {digit}", ident_sql(name), ident_sql(&tick_column(&column)))));
+            continue;
+        }
         out.push(Token::raw(ident_sql(name)));
         out.push(Token::op("="));
         if part[eq].is_op("+=") || part[eq].is_op("-=") {
@@ -3575,6 +4001,7 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
         extra_column: None,
         aliases: Vec::new(),
         database: None,
+        ticks: Vec::new(),
     })
 }
 
@@ -3698,6 +4125,7 @@ fn rewrite_delete(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
         extra_column: None,
         aliases: Vec::new(),
         database: None,
+        ticks: Vec::new(),
     })
 }
 
@@ -4286,6 +4714,12 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
                 declared.push(name.to_string());
             }
             defs.push(column_definition(&part, cx)?);
+            // SQL Server's seventh fractional digit, beside the column.
+            if !temporary && part.len() > 1 && keeps_ticks(&part[1..]) {
+                if let Some(name) = part.first().and_then(|t| t.ident()) {
+                    defs.push(format!("{} smallint NULL", ident_sql(&tick_column(&name.to_lowercase()))));
+                }
+            }
         }
     }
     let mut statements = vec![format!(
@@ -4305,6 +4739,7 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
         extra_column: None,
         aliases: Vec::new(),
         database: None,
+        ticks: Vec::new(),
     })
 }
 
@@ -4347,6 +4782,14 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
                         "ALTER TABLE {t} ADD COLUMN {}",
                         column_definition(&p, cx)?
                     ));
+                    if !table.starts_with('#') && p.len() > 1 && keeps_ticks(&p[1..]) {
+                        if let Some(name) = p.first().and_then(|x| x.ident()) {
+                            statements.push(format!(
+                                "ALTER TABLE {t} ADD COLUMN {} smallint NULL",
+                                ident_sql(&tick_column(&name.to_lowercase()))
+                            ));
+                        }
+                    }
                     if !table.starts_with('#') {
                         if let Some(name) = p.first().and_then(|x| x.ident()) {
                             statements.extend(record_names(&table, None, &[name.to_string()], &[], false));
@@ -4420,6 +4863,7 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
         extra_column: None,
         aliases: Vec::new(),
         database: None,
+        ticks: Vec::new(),
     })
 }
 
@@ -4514,6 +4958,7 @@ fn rewrite_create_index(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
         extra_column: None,
         aliases: Vec::new(),
         database: None,
+        ticks: Vec::new(),
     })
 }
 
@@ -4583,6 +5028,7 @@ fn rewrite_drop(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
         extra_column: None,
         aliases: Vec::new(),
         database: dropped_database,
+        ticks: Vec::new(),
     })
 }
 
@@ -4607,6 +5053,7 @@ fn fulltext_ddl(tokens: Vec<Token>, _cx: &mut Cx) -> Result<Forward, TsqlError> 
         extra_column: None,
         aliases: Vec::new(),
         database: None,
+        ticks: Vec::new(),
     };
     if kw(&tokens, 2, "CATALOG") || kw(&tokens, 2, "STOPLIST") {
         // A catalog groups indexes for SQL Server's own administration; there
@@ -4649,6 +5096,7 @@ fn fulltext_ddl(tokens: Vec<Token>, _cx: &mut Cx) -> Result<Forward, TsqlError> 
         extra_column: None,
         aliases: Vec::new(),
         database: None,
+        ticks: Vec::new(),
     })
 }
 
@@ -4790,7 +5238,7 @@ fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
             returning.push(format!("{} AS {}", ident_sql(&col), quote_ident(&written)));
         }
     }
-    let mut row_sql = Vec::new();
+    let mut value_rows = Vec::new();
     let mut positions = Vec::new();
     for row in &rows {
         let mut vals = Vec::new();
@@ -4798,20 +5246,19 @@ fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
             let v = row.get(p).cloned().ok_or_else(merge_refused)?;
             vals.push(render_text(&rewrite_expr(v, cx)?));
         }
-        row_sql.push(format!("({})", vals.join(", ")));
+        value_rows.push(vals);
         if let Some((_, at)) = &extra {
             let v = row.get(*at).cloned().ok_or_else(merge_refused)?;
             positions.push(render_text(&rewrite_expr(v, cx)?));
         }
     }
+    let target: Vec<String> = target_cols.iter().map(|c| ident_sql(c)).collect();
+    let (target, value_rows) = with_ticks(cx.env, &table, &target, value_rows);
+    let row_sql: Vec<String> = value_rows.iter().map(|r| format!("({})", r.join(", "))).collect();
     let sql = format!(
         "INSERT INTO {} ({}) VALUES {}{}",
         ident_sql(&table),
-        target_cols
-            .iter()
-            .map(|c| ident_sql(c))
-            .collect::<Vec<_>>()
-            .join(", "),
+        target.join(", "),
         row_sql.join(", "),
         if returning.is_empty() {
             String::new()
@@ -4829,6 +5276,7 @@ fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
         extra_column: extra.map(|(name, _)| (name, positions)),
         aliases: Vec::new(),
         database: None,
+        ticks: Vec::new(),
     })
 }
 
@@ -4841,6 +5289,7 @@ pub(crate) fn translate(
     let mut cx = Cx::new(env);
     let mut forward = translate_in(sql, tokens, &mut cx)?;
     forward.aliases = std::mem::take(&mut cx.top_aliases);
+    forward.ticks = std::mem::take(&mut cx.tick_outputs);
     Ok(forward)
 }
 
@@ -4870,6 +5319,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
                     extra_column: None,
                     aliases: Vec::new(),
                     database: None,
+                    ticks: Vec::new(),
                 });
             }
             Ok(Forward {
@@ -4878,6 +5328,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
                 extra_column: None,
                 aliases: Vec::new(),
                 database: None,
+                ticks: Vec::new(),
             })
         }
         _ if tokens.first().is_some_and(|t| t.is_op("(")) => Ok(Forward {
@@ -4886,6 +5337,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
             extra_column: None,
             aliases: Vec::new(),
             database: None,
+            ticks: Vec::new(),
         }),
         "WITH" => {
             let main = find_top(&tokens, 1, &["SELECT", "INSERT", "UPDATE", "DELETE"]);
@@ -4899,6 +5351,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
                 extra_column: None,
                 aliases: Vec::new(),
                 database: None,
+                ticks: Vec::new(),
             })
         }
         "INSERT" => rewrite_insert(sql, tokens, cx),
@@ -4924,6 +5377,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
                         extra_column: None,
                         aliases: Vec::new(),
                         database: Some((name.to_string(), true)),
+                        ticks: Vec::new(),
                     })
                 }
                 "SCHEMA" => {
@@ -4935,6 +5389,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
                             extra_column: None,
                             aliases: Vec::new(),
                             database: None,
+                            ticks: Vec::new(),
                         })
                     } else {
                         Err(TsqlError::unsupported("schemas other than dbo"))
@@ -4956,6 +5411,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
                         extra_column: None,
                         aliases: Vec::new(),
                         database: None,
+                        ticks: Vec::new(),
                     })
                 }
                 other => Err(TsqlError::unsupported(format!("CREATE {other}"))),
@@ -4985,6 +5441,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
                         extra_column: None,
                         aliases: Vec::new(),
                         database: None,
+                        ticks: Vec::new(),
                     })
                 } else {
                     Err(TsqlError::unsupported(format!("ALTER DATABASE … SET {option}")))
@@ -5006,6 +5463,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
                 extra_column: None,
                 aliases: Vec::new(),
                 database: None,
+                ticks: Vec::new(),
             })
         }
         _ => Ok(Forward {
@@ -5014,6 +5472,7 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
             extra_column: None,
             aliases: Vec::new(),
             database: None,
+            ticks: Vec::new(),
         }),
     }
 }
@@ -5336,7 +5795,7 @@ mod tests {
         assert_eq!(
             all.split("; CREATE TABLE IF NOT EXISTS __rdb_tds_names").next().unwrap(),
             "CREATE TABLE blogs (id serial NOT NULL, url text NULL, rating numeric(18,2) NOT NULL DEFAULT 0, \
-             created timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP, active boolean NOT NULL DEFAULT CAST(1 AS boolean), \
+             created timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP, __t7_created smallint NULL, active boolean NOT NULL DEFAULT CAST(1 AS boolean), \
              CONSTRAINT pk_blogs PRIMARY KEY (id))"
         );
         let index = tr(&e, "CREATE NONCLUSTERED INDEX [IX_Posts_BlogId] ON [Posts] ([BlogId] ASC) WITH (ONLINE = ON)");

@@ -380,7 +380,9 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                 return None;
             }
 
-            if crate::core::rql::nullable::is_hidden(&name) {
+            // A time column's 100 ns digit (`__t7_`) is declared, by the
+            // SQL Server front end.
+            if crate::core::rql::nullable::is_hidden(&name) && !crate::core::rql::nullable::is_tick_digit(&name) {
                 rejection.replace(format!(
                     "column names beginning with __null_ are reserved: '{}'",
                     name

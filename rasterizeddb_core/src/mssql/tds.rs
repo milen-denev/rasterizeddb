@@ -1048,9 +1048,12 @@ pub(crate) fn type_info(out: &mut Vec<u8>, ty: &ColType) {
             out.extend_from_slice(&0xffffu16.to_le_bytes());
         }
         ColType::Date => out.push(0x28),
-        ColType::DateTime2 => out.extend_from_slice(&[0x2a, 6]),
-        ColType::DateTimeOffset => out.extend_from_slice(&[0x2b, 6]),
-        ColType::Time => out.extend_from_slice(&[0x29, 6]),
+        // Scale 7, SQL Server's default: 100 ns units, which a
+        // `datetime2(7)`'s kept seventh digit fills (`__rdb_t7_text`); the
+        // engine's six digits have a 0 there.
+        ColType::DateTime2 => out.extend_from_slice(&[0x2a, 7]),
+        ColType::DateTimeOffset => out.extend_from_slice(&[0x2b, 7]),
+        ColType::Time => out.extend_from_slice(&[0x29, 7]),
         ColType::Guid => out.extend_from_slice(&[0x24, 16]),
     }
 }
@@ -1097,6 +1100,8 @@ fn parse_date(s: &str) -> Option<(i64, u32, u32)> {
 }
 
 /// `HH:MM:SS[.ffffff]` as microseconds.
+/// A time's text as 100 ns units since midnight (seven fractional
+/// digits; more are cut).
 fn parse_time_micros(s: &str) -> Option<u64> {
     let mut parts = s.splitn(3, ':');
     let h: u64 = parts.next()?.parse().ok()?;
@@ -1107,14 +1112,14 @@ fn parse_time_micros(s: &str) -> Option<u64> {
     let digits: String = frac
         .chars()
         .take_while(|c| c.is_ascii_digit())
-        .take(6)
+        .take(7)
         .collect();
-    let micros: u64 = if digits.is_empty() {
+    let ticks: u64 = if digits.is_empty() {
         0
     } else {
-        format!("{:0<6}", digits).parse().ok()?
+        format!("{:0<7}", digits).parse().ok()?
     };
-    Some(((h * 60 + m) * 60 + sec) * 1_000_000 + micros)
+    Some(((h * 60 + m) * 60 + sec) * 10_000_000 + ticks)
 }
 
 /// A time zone suffix (`+02`, `-05:30`) split off a time.
@@ -1167,9 +1172,9 @@ pub(crate) fn decimal_shape(text: &str) -> (usize, usize) {
     (int.trim_start_matches('0').len().max(1), frac.len())
 }
 
-fn put_time(out: &mut Vec<u8>, micros: u64) {
-    // Scale 6: units of microseconds, five bytes.
-    out.extend_from_slice(&micros.to_le_bytes()[..5]);
+fn put_time(out: &mut Vec<u8>, ticks: u64) {
+    // Scale 7: units of 100 ns, five bytes.
+    out.extend_from_slice(&ticks.to_le_bytes()[..5]);
 }
 
 fn put_days(out: &mut Vec<u8>, days: i64) {
@@ -1297,8 +1302,8 @@ pub(crate) fn put_value(
             let local = parse_time_micros(time).ok_or_else(|| bad("the time"))? as i64;
             // Stored in UTC, with the offset beside it.
             let mut days = tds_days(y, m, d);
-            let mut utc = local - offset as i64 * 60_000_000;
-            const DAY: i64 = 86_400_000_000;
+            let mut utc = local - offset as i64 * 600_000_000;
+            const DAY: i64 = 864_000_000_000;
             while utc < 0 {
                 utc += DAY;
                 days -= 1;

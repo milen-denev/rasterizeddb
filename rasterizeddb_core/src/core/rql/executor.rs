@@ -18254,7 +18254,7 @@ async fn execute_alter_table_action(
                         .is_some_and(|e| e.eq_ignore_ascii_case(g.trim()))
                 })
             });
-            if nullable::is_hidden(&name) && !companion {
+            if nullable::is_hidden(&name) && !companion && !nullable::is_tick_digit(&name) {
                 return ddl_error("column names beginning with __null_ are reserved");
             }
             // A dropped column keeps its slot in the row layout but is no

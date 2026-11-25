@@ -230,6 +230,21 @@ still sorts by its bytes. `--mssql-guid-order binary` makes such columns
 order by their bytes instead. Tables made before this build order by bytes
 until made again.
 
+**Time to 100 ns.** `datetime2`, `datetimeoffset` and `time` keep the
+precision they declare: 0 to 6 are the engine's `timestamp(p)` /
+`timestamptz(p)` / `time(p)`, rounded as SQL Server rounds; 7, theirs when
+none is written (EF Core's `DateTime`), keeps its seventh digit in a hidden
+`__t7_<column>` beside the column: how far the value lies from the
+microsecond the column holds (-5 to 5). Writes (INSERT VALUES, EF Core's
+MERGE, UPDATE SET, SqlBulkCopy) fill it, a select list reads the column
+whole (as `datetime2(7)`, through `*`, aliases, joins and derived tables),
+and `=`, `<>`, `<`, `<=`, `>`, `>=` and ORDER BY on the column compare it
+too, so `WHERE Created = @value` finds the value an application wrote.
+`IN`, `BETWEEN`, expressions over the column and UPDATE/DELETE conditions
+compare to the microsecond; PostgreSQL clients read microseconds. Every
+time column is sent at scale 7. Tables made before this build keep
+microseconds until made again.
+
 **TRY_CAST / TRY_CONVERT** are NULL where the value's text does not read as
 the type (`pg_input_is_valid`). A value of another type is judged by its
 text: `TRY_CAST(1.5 AS int)` is NULL, where SQL Server answers 1.

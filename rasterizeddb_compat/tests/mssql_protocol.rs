@@ -1665,3 +1665,92 @@ async fn tiberius_time_precision() {
     let got: Vec<(String, Option<i32>)> = r[2].iter().map(|r| (r.get::<&str, _>(0).unwrap().to_string(), r.get::<i32, _>(1))).collect();
     assert_eq!(got, [("A".into(), Some(3)), ("B".into(), Some(2)), ("C".into(), Some(0)), ("D".into(), Some(6))]);
 }
+
+/// `datetime2(7)` (EF Core's DateTime), `datetimeoffset(7)`, `time(7)` keep
+/// their seventh fractional digit (100 ns): the engine keeps microseconds,
+/// and a value copied or written by an application came back a digit short,
+/// so `WHERE Created = @value` with the value it had written matched
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_hundred_nanoseconds() {
+    use chrono::{NaiveDate, NaiveDateTime};
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [O] ([Id] int PRIMARY KEY, [Created] datetime2 NOT NULL, [T] time(7) NULL, [Six] datetime2(6) NULL)",
+    )
+    .await
+    .unwrap();
+    let at = |nanos: u32| -> NaiveDateTime { NaiveDate::from_ymd_opt(2026, 3, 23).unwrap().and_hms_nano_opt(15, 3, 7, nanos).unwrap() };
+    // A literal, a parameter, and EF Core's batched MERGE.
+    batch(&mut c, "INSERT INTO [O] ([Id], [Created], [T], [Six]) VALUES (1, '2026-03-23 15:03:07.0429169', '15:03:07.9999999', '2026-03-23 15:03:07.0429169')")
+        .await
+        .unwrap();
+    c.execute("INSERT INTO [O] ([Id], [Created]) VALUES (@P1, @P2)", &[&2i32, &at(42_916_500)]).await.unwrap();
+    batch(
+        &mut c,
+        "MERGE [O] USING (VALUES (3, '2026-03-23 15:03:07.0429161', 0), (4, '2026-03-23 15:03:07.9999995', 1)) AS i ([Id], [Created], _Position) ON 1=0 \
+         WHEN NOT MATCHED THEN INSERT ([Id], [Created]) VALUES (i.[Id], i.[Created]) OUTPUT INSERTED.[Id], i._Position;",
+    )
+    .await
+    .unwrap();
+    let created = |r: &[tiberius::Row]| -> Vec<NaiveDateTime> { r.iter().map(|r| r.get::<NaiveDateTime, _>(0).unwrap()).collect() };
+    let r = batch(&mut c, "SELECT [Created] FROM [O] ORDER BY [Id]").await.unwrap();
+    assert_eq!(created(&r[0]), [at(42_916_900), at(42_916_500), at(42_916_100), at(999_999_500)]);
+    // SELECT *, an alias, a derived table, a join.
+    let r = batch(
+        &mut c,
+        "SELECT * FROM [O] WHERE [Id] = 1; \
+         SELECT [o].[Created] AS [When] FROM [O] AS [o] WHERE [o].[Id] = 1; \
+         SELECT [x].[Created] FROM (SELECT TOP 1 [o].[Created] FROM [O] AS [o] ORDER BY [o].[Id]) AS [x]; \
+         SELECT [b].[Created] FROM [O] AS [a] JOIN [O] AS [b] ON [a].[Id] = [b].[Id] WHERE [a].[Id] = 1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(r[0][0].get::<NaiveDateTime, _>(1), Some(at(42_916_900)));
+    assert_eq!(r[0][0].get::<chrono::NaiveTime, _>(2), Some(chrono::NaiveTime::from_hms_nano_opt(15, 3, 7, 999_999_900).unwrap()));
+    // datetime2(6) keeps six, as declared.
+    assert_eq!(r[0][0].get::<NaiveDateTime, _>(3), Some(at(42_917_000)));
+    assert_eq!(r[1][0].columns()[0].name(), "When");
+    assert_eq!(created(&r[1]), [at(42_916_900)]);
+    assert_eq!(created(&r[2]), [at(42_916_900)]);
+    assert_eq!(created(&r[3]), [at(42_916_900)]);
+    // Equality with the value written finds it, and only it: ids 1-3 share
+    // their microsecond.
+    let ids = |r: &[tiberius::Row]| int(r);
+    for (nanos, want) in [(42_916_900u32, vec![1]), (42_916_500, vec![2]), (42_916_100, vec![3]), (42_916_200, vec![])] {
+        let r = c
+            .query("SELECT [Id] FROM [O] WHERE [Created] = @P1 ORDER BY [Id]", &[&at(nanos)])
+            .await
+            .unwrap()
+            .into_first_result()
+            .await
+            .unwrap();
+        assert_eq!(ids(&r), want, "{nanos}");
+    }
+    let r = c.query("SELECT [Id] FROM [O] WHERE [Created] > @P1 ORDER BY [Created]", &[&at(42_916_500)]).await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(ids(&r), [1, 4]);
+    let r = c.query("SELECT [Id] FROM [O] WHERE [Created] <= @P1 ORDER BY [Created] DESC", &[&at(42_916_500)]).await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(ids(&r), [2, 3]);
+    let r = batch(&mut c, "SELECT [Id] FROM [O] ORDER BY [Created], [Id]").await.unwrap();
+    assert_eq!(ids(&r[0]), [3, 2, 1, 4]);
+    // An UPDATE writes the digit too.
+    c.execute("UPDATE [O] SET [Created] = @P1 WHERE [Id] = 4", &[&at(42_916_300)]).await.unwrap();
+    let r = batch(&mut c, "SELECT [Created] FROM [O] WHERE [Id] = 4").await.unwrap();
+    assert_eq!(created(&r[0]), [at(42_916_300)]);
+    // The digit stays out of sight.
+    let r = batch(&mut c, "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = N'O'").await.unwrap();
+    assert_eq!(int(&r[0]), [4]);
+    // datetimeoffset(7) too, its value in UTC.
+    batch(
+        &mut c,
+        "CREATE TABLE [Z] ([Id] int PRIMARY KEY, [At] datetimeoffset NOT NULL); \
+         INSERT INTO [Z] ([Id], [At]) VALUES (1, '2026-03-23 15:03:07.1234567 +00:00')",
+    )
+    .await
+    .unwrap();
+    let r = batch(&mut c, "SELECT [At] FROM [Z]").await.unwrap();
+    let got = r[0][0].get::<chrono::DateTime<chrono::FixedOffset>, _>(0).unwrap();
+    assert_eq!(got.naive_utc(), at(123_456_700));
+}
