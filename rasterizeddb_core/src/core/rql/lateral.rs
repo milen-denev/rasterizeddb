@@ -1154,6 +1154,7 @@ pub(crate) async fn materialize(
                     &temp,
                     labels.as_deref(),
                     &runs,
+                    columns.len(),
                     &item.alias,
                     database,
                     tx,

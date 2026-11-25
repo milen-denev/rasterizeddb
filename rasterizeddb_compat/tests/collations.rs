@@ -321,3 +321,39 @@ async fn set_operations_follow_the_collation() {
     assert_eq!(union[1].to_lowercase(), "q");
     assert_eq!(code(&pool, "SELECT * FROM f UNION SELECT * FROM f").await, "0A000");
 }
+
+/// A relation copied from a table (a derived table, a CTE, the outer table
+/// a correlated subquery's LATERAL copies to carry its key) keeps a column's
+/// collation. Copied as plain text, `WHERE slang = 'SEED0-SLANG'` over it
+/// compared bytes: one correlated subquery lost the row (no error), two
+/// failed with "Column '__lat_k1' not found".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copied_relation_keeps_the_collation() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    exec(&pool, "CREATE TABLE ar (id int PRIMARY KEY, slang text COLLATE rdb_ci)").await;
+    exec(&pool, "CREATE TABLE co (id int PRIMARY KEY, aid int, title text)").await;
+    exec(&pool, "INSERT INTO ar VALUES (1, 'Seed0-Slang-Ще'), (2, 'Seed1-Slang-Ще')").await;
+    exec(&pool, "INSERT INTO co VALUES (10, 1, 'T1'), (20, 2, 'T2')").await;
+    let one: Vec<String> = sqlx::query_scalar(
+        "SELECT (SELECT c.title FROM co c WHERE d.id = c.aid LIMIT 1) FROM ar d WHERE d.slang = 'SEED0-SLANG-ЩЕ'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(one, ["T1"]);
+    let two: Vec<(String, i32)> = sqlx::query_as(
+        "SELECT (SELECT c.title FROM co c WHERE d.id = c.aid LIMIT 1), (SELECT c.id FROM co c WHERE d.id = c.aid LIMIT 1) \
+         FROM ar d WHERE d.slang = 'seed0-slang-ще'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(two, vec![("T1".to_string(), 10)]);
+    let derived: Vec<String> =
+        sqlx::query_scalar("SELECT x.slang FROM (SELECT slang FROM ar) x WHERE x.slang = 'SEED1-SLANG-ЩЕ'").fetch_all(&pool).await.unwrap();
+    assert_eq!(derived, ["Seed1-Slang-Ще"]);
+    let cte: Vec<i32> =
+        sqlx::query_scalar("WITH c AS (SELECT id, slang FROM ar) SELECT id FROM c WHERE slang = 'SEED1-SLANG-ЩЕ'").fetch_all(&pool).await.unwrap();
+    assert_eq!(cte, [2]);
+}

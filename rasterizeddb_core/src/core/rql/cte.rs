@@ -691,6 +691,21 @@ async fn relation_columns(
     // it compares blank-padded with a `character(n)` one there as it does in
     // its table; declared TEXT, `WHERE a = b` over a CTE compared exactly.
     let declared_fields = declared_fields_among(query, labels, database, &[]);
+    // A text column with a nondeterministic collation keeps it in the
+    // relation: copied as plain TEXT, `WHERE name = 'BOB'` over the copy
+    // compared bytes, and a LATERAL over a CI-filtered table (its outer
+    // table is copied to carry the join key) silently lost the row.
+    let collations: Vec<Option<&'static str>> = {
+        let source = source_relation_fields(query, database);
+        declared_fields
+            .iter()
+            .map(|f| {
+                let (f, fields) = (f.as_ref()?, source.as_deref()?);
+                let strength = crate::core::rql::collation::of(&f.name, fields);
+                (!strength.is_binary()).then(|| strength.name())
+            })
+            .collect()
+    };
     let varying: Vec<Option<u32>> = {
         use crate::core::rql::type_modifier::TextTypmod;
         declared_fields
@@ -781,6 +796,10 @@ async fn relation_columns(
             }
             Some(t) => sql_type_of(t).ok_or(index)?.to_string(),
             None => "TEXT".to_string(),
+        };
+        let sql_type = match collations.get(index).copied().flatten() {
+            Some(name) if matches!(declared, Some(DbType::STRING)) => format!("{sql_type} COLLATE {name}"),
+            _ => sql_type,
         };
         columns.push(RelationColumn {
             sql_type,
@@ -1114,6 +1133,10 @@ pub(crate) async fn build_keyed_relation(
     temp: &str,
     labels: Option<&[String]>,
     runs: &[(String, Vec<String>)],
+    // How many key columns each run carries: known with no run at all (an
+    // outer relation whose WHERE keeps no row), when the relation still
+    // needs them for the join back.
+    key_count: usize,
     alias: &str,
     database: &Arc<Database>,
     tx: crate::core::mvcc::transaction::TxId,
@@ -1147,7 +1170,7 @@ pub(crate) async fn build_keyed_relation(
     // are copied out.
     let mut nested_temps: Vec<String> = Vec::new();
     let filled = fill_keyed_relation(
-        runs, width, &own, &mut names, described, temp, &subject, &mut nested_temps, database, tx, temps,
+        runs, key_count, width, &own, &mut names, described, temp, &subject, &mut nested_temps, database, tx, temps,
     )
     .await;
     drop_temps(database, &nested_temps, tx).await;
@@ -1159,6 +1182,7 @@ pub(crate) async fn build_keyed_relation(
 #[allow(clippy::too_many_arguments)]
 async fn fill_keyed_relation(
     runs: &[(String, Vec<String>)],
+    key_count: usize,
     width: usize,
     own: &[String],
     names: &mut Vec<String>,
@@ -1170,7 +1194,9 @@ async fn fill_keyed_relation(
     tx: crate::core::mvcc::transaction::TxId,
     temps: &mut Vec<String>,
 ) -> Result<(), String> {
-    let key_count = runs.first().map_or(0, |(_, keys)| keys.len());
+    // With no run there are no keys to count; an empty relation still has
+    // its key columns (`Column '__lat_k1' not found` otherwise).
+    let key_count = runs.first().map_or(key_count, |(_, keys)| keys.len());
     let mut rows: Vec<crate::core::row::row::Row> = Vec::new();
     let mut scales: Option<Vec<u32>> = None;
     for (body, keys) in runs {
@@ -2062,6 +2088,26 @@ pub(crate) fn blank_padded_columns(query: &str, database: &Arc<Database>) -> Vec
 }
 
 /// [`declared_types_among`]'s fields.
+/// The fields of the one table `query` selects from (no join, no derived
+/// table), as [`declared_fields_among`] finds it.
+fn source_relation_fields(query: &str, database: &Arc<Database>) -> Option<Vec<SchemaField>> {
+    if crate::core::rql::join::statement_has_join(query) {
+        return None;
+    }
+    let at = crate::core::rql::join::find_keyword(query, "FROM", 0)?;
+    let rest = query[at + "FROM".len()..].trim_start();
+    let name = rest
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(|c: char| c == ';' || c == ',')
+        .trim_matches('"');
+    if name.is_empty() || name.contains('(') {
+        return None;
+    }
+    Some(database.schema_view(name)?.schema().fields.to_vec())
+}
+
 fn declared_fields_among(
     query: &str,
     labels: &[String],

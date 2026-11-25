@@ -117,3 +117,31 @@ async fn a_subquery_reading_two_joined_relations() {
     .await;
     assert!(or.is_err(), "an OR'd key was substituted: {or:?}");
 }
+
+/// A correlated subquery over an outer WHERE that keeps no row is an
+/// empty result: the LATERAL relation built for no outer value had no key
+/// column, and the statement failed with "Column '__lat_k1' not found".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_correlated_subquery_over_no_outer_row() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    exec(&pool, "CREATE TABLE ar (id int PRIMARY KEY, n int)").await;
+    exec(&pool, "CREATE TABLE co (id int PRIMARY KEY, aid int, title text)").await;
+    exec(&pool, "INSERT INTO ar VALUES (1, 1)").await;
+    exec(&pool, "INSERT INTO co VALUES (10, 1, 'T1')").await;
+    let none = texts(&pool, "SELECT (SELECT c.title FROM co c WHERE d.id = c.aid LIMIT 1) FROM ar d WHERE d.n = 2").await;
+    assert!(none.is_empty());
+    assert_eq!(
+        ids(&pool, "SELECT d.id FROM ar d LEFT JOIN LATERAL (SELECT c.title FROM co c WHERE c.aid = d.id) x ON true WHERE d.id <> 1").await,
+        Vec::<i32>::new()
+    );
+    let two: Vec<(i32, Option<String>, Option<i32>)> = sqlx::query_as(
+        "SELECT d.id, (SELECT c.title FROM co c WHERE d.id = c.aid LIMIT 1), (SELECT c.id FROM co c WHERE d.id = c.aid LIMIT 1) \
+         FROM ar d WHERE d.id <> 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(two.is_empty());
+    assert_eq!(texts(&pool, "SELECT (SELECT c.title FROM co c WHERE d.id = c.aid LIMIT 1) FROM ar d WHERE d.n = 1").await, vec![Some("T1".to_string())]);
+}
