@@ -181,6 +181,10 @@ const ALLOWLIST: &[(&str, &str)] = &[
          seed or table file",
     ),
     ("forget_seed", "drops cached seeds by name; a partitioned table has none"),
+    (
+        "shard_span",
+        "resolves the name as a partitioned table first (a shard's span lives only in one) and does nothing for any other",
+    ),
     ("drop_table", "delegates to drop_table_to_depth, which dispatches"),
     ("forget_in_catalogue", "the row tombstone both drop paths share, after their dispatch"),
     ("forget_dropped_files", "the WAL barrier for the plain table drop_table_to_depth already resolved and removed"),

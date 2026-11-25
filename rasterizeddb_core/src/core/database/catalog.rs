@@ -1377,8 +1377,9 @@ mod tests {
 
     #[test]
     fn unsupported_options_are_reported_rather_than_ignored() {
+        // OWNER is taken (the roles work); the rest are still refused.
         assert!(
-            parse_database_statement("CREATE DATABASE x WITH OWNER bob")
+            parse_database_statement("CREATE DATABASE x WITH ENCODING 'LATIN1'")
                 .unwrap()
                 .is_err()
         );
