@@ -12,7 +12,7 @@ Each check prints PASS or FAIL with what it saw; the exit code is the
 number of failures. Every process is killed at the end, and the workdir is
 left for the logs (`shard<N>.log`, `gateway.log`).
 """
-import os, signal, subprocess, sys, time
+import hashlib, os, signal, socket, ssl, struct, subprocess, sys, time
 
 CORE, GATEWAY, WORK = sys.argv[1], sys.argv[2], sys.argv[3]
 RDB_SHARD = sys.argv[4] if len(sys.argv) > 4 else None
@@ -23,6 +23,7 @@ PG = {n: BASE + n for n in ALL}                # each shard's own pgwire
 RDB = {n: BASE + 10 + n for n in ALL}          # native (rdb-shard's way in)
 RSHARD = {n: BASE + 20 + n for n in ALL}       # rshard (the gateway's links)
 GW = BASE + 30                                 # the gateway's pgwire
+FE_PG, FE_MY, FE_RDB = BASE + 40, BASE + 41, BASE + 42  # the front-end node (B4.7)
 CLUSTER = "0123456789abcdef0123456789abcdef"
 BLOCKS = 1 << 48
 ENV = dict(os.environ, PGPASSWORD="pw", PGSSLMODE="prefer")
@@ -135,6 +136,101 @@ def up(port, what, secs=90):
         last = out
         time.sleep(0.5)
     sys.exit(f"{what} did not come up ({last}); see {WORK}")
+
+
+class MySQL:
+    """Just enough of the MySQL client protocol for the front-end node:
+    TLS, caching_sha2_password full authentication, COM_QUERY with text
+    results (rows as tuples of str/None, or the affected-row count)."""
+
+    def __init__(self, port, user, password, database):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=30)
+        self.seq = 0
+        greeting = self.read()
+        if greeting[0] != 10:
+            raise RuntimeError(f"not a MySQL greeting: {greeting[:16]!r}")
+        CLIENT_LONG_PASSWORD, CONNECT_WITH_DB, PROTOCOL_41, SSL = 1, 8, 0x200, 0x800
+        TRANSACTIONS, SECURE, PLUGIN_AUTH = 0x2000, 0x8000, 0x80000
+        caps = CLIENT_LONG_PASSWORD | CONNECT_WITH_DB | PROTOCOL_41 | SSL | TRANSACTIONS | SECURE | PLUGIN_AUTH
+        head = struct.pack("<IIB", caps, 1 << 24, 33) + b"\0" * 23
+        self.write(head)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        self.sock = ctx.wrap_socket(self.sock)
+        self.write(head + user.encode() + b"\0" + b"\0" + database.encode() + b"\0" + b"caching_sha2_password\0")
+        while True:
+            p = self.read()
+            if p[:2] == b"\x01\x04":          # perform full authentication
+                self.write(password.encode() + b"\0")
+            elif p[:2] == b"\x01\x03":        # fast auth done; OK follows
+                continue
+            elif p[0] == 0x00:
+                return
+            elif p[0] == 0xff:
+                raise RuntimeError(f"login refused: {p[9:].decode(errors='replace')}")
+            else:
+                raise RuntimeError(f"unexpected login packet {p[:16]!r}")
+
+    def read(self):
+        h = self.recv(4)
+        n = h[0] | h[1] << 8 | h[2] << 16
+        self.seq = (h[3] + 1) & 0xff
+        return self.recv(n)
+
+    def recv(self, n):
+        b = b""
+        while len(b) < n:
+            c = self.sock.recv(n - len(b))
+            if not c:
+                raise RuntimeError("the connection closed")
+            b += c
+        return b
+
+    def write(self, payload):
+        self.sock.sendall(struct.pack("<I", len(payload))[:3] + bytes([self.seq]) + payload)
+        self.seq = (self.seq + 1) & 0xff
+
+    @staticmethod
+    def lenenc(b, at):
+        f = b[at]
+        if f < 0xfb:
+            return f, at + 1
+        if f == 0xfb:
+            return None, at + 1
+        n = {0xfc: 2, 0xfd: 3, 0xfe: 8}[f]
+        return int.from_bytes(b[at + 1:at + 1 + n], "little"), at + 1 + n
+
+    def query(self, sql):
+        """Rows, or ("ok", affected); raises on an error packet."""
+        self.seq = 0
+        self.write(b"\x03" + sql.encode())
+        p = self.read()
+        if p[0] == 0x00:
+            return ("ok", self.lenenc(p, 1)[0])
+        if p[0] == 0xff:
+            raise RuntimeError(p[9:].decode(errors="replace"))
+        ncols, _ = self.lenenc(p, 0)
+        for _ in range(ncols):
+            self.read()
+        if self.read()[0] != 0xfe:
+            raise RuntimeError("no EOF after the columns")
+        rows = []
+        while True:
+            p = self.read()
+            if p[0] == 0xfe and len(p) < 9:
+                return rows
+            if p[0] == 0xff:
+                raise RuntimeError(p[9:].decode(errors="replace"))
+            at, row = 0, []
+            for _ in range(ncols):
+                n, at = self.lenenc(p, at)
+                if n is None:
+                    row.append(None)
+                else:
+                    row.append(p[at:at + n].decode())
+                    at += n
+            rows.append(tuple(row))
 
 
 def check(name, ok, detail=""):
@@ -336,6 +432,7 @@ def main():
     check("after the restart every row is there", psql(GW, "SELECT count(*) FROM orders") == (0, str(rows + 2)),
           psql(GW, "SELECT count(*) FROM orders"))
 
+    frontend(tls)
     if RDB_SHARD:
         split_online(tls, cmap)
     if os.environ.get("CLUSTER_SERVE") == "after":
@@ -376,6 +473,47 @@ def split_online(tls, cmap):
     check("  ...every row once, through the gateway", total == (0, str(before + landed)), f"{total}, want {before + landed}")
     keyed = [k for k in range(1, 300, 7) if psql(GW, f"SELECT v FROM orders WHERE id = {k}") != (0, str(k))]
     check("  ...keyed reads after the split", not keyed, f"wrong for {keyed[:5]}")
+
+
+def frontend(tls):
+    """A front-end node (B4.7): MySQL clients on it, their statements run on
+    the cluster behind the gateway, logged in as their own role."""
+    log = open(f"{WORK}/frontend.log", "ab")
+    procs["frontend"] = subprocess.Popen(
+        [CORE, "--location", f"{WORK}/fe", "--protocol", "pgwire", "--pg-port", str(FE_PG), "--pg-password", "pw",
+         "--pg-tls", "prefer", "--pg-cert", f"{tls}/gateway.pem", "--pg-key", f"{tls}/gateway.key",
+         "--rdb-port", str(FE_RDB), "--mysql-port", str(FE_MY), "--mysql-tls", "prefer",
+         "--frontend-upstream", f"127.0.0.1:{GW}", "--log-level", "info"],
+        stdout=log, stderr=log)
+    up(FE_PG, "the front-end node")
+    # Its copy of the schema, as `rdb-shard ddl --frontend` keeps it.
+    for ddl in ["CREATE TABLE orders (id INT PRIMARY KEY, store INT NOT NULL, v INT NOT NULL)",
+                "CREATE TABLE stores (id INT PRIMARY KEY, name TEXT NOT NULL)"]:
+        psql(FE_PG, ddl)
+    try:
+        my = MySQL(FE_MY, "rasterized", "pw", "postgres")
+    except Exception as e:
+        check("a MySQL login on the front-end node", False, repr(e))
+        return
+    check("a MySQL login on the front-end node", True)
+    try:
+        got = my.query("SELECT v FROM orders WHERE id = 42")
+        check("  ...a keyed read reaches the cluster", got == [("42",)], got)
+        got = my.query("SELECT count(*) FROM orders")
+        want = psql(GW, "SELECT count(*) FROM orders")[1]
+        check("  ...a count over every shard", got == [(want,)], f"{got} vs {want}")
+        got = my.query("INSERT INTO orders (id, store, v) VALUES (7001, 1, 1), (7002, 2, 2), (7003, 3, 3)")
+        check("  ...a multi-row INSERT across shards", got == ("ok", 3), got)
+        check("  ...seen through the gateway", psql(GW, "SELECT count(*) FROM orders WHERE id > 7000") == (0, "3"),
+              psql(GW, "SELECT count(*) FROM orders WHERE id > 7000"))
+        my.query("DELETE FROM orders WHERE id > 7000")
+    except Exception as e:
+        check("  ...statements through the front-end node", False, repr(e))
+    try:
+        MySQL(FE_MY, "rasterized", "wrong", "postgres")
+        check("  ...a wrong password is refused", False, "it logged in")
+    except Exception as e:
+        check("  ...a wrong password is refused", "refused" in str(e) or "password" in str(e).lower(), repr(e))
 
 
 def on_every_shard_of(ids, sql):
