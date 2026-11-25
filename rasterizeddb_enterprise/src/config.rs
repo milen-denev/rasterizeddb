@@ -9,13 +9,16 @@
 //! shard_labels 3 region=eu-west tier=dedicated
 //! policy eu_dedicated 0x0 0x800000000000 require region=eu-west exclusive
 //! pinned_role acme alice
+//! pinned_roles_file /var/lib/rasterizeddb/rdb_pinned_roles
 //! tenants_file /var/lib/rasterizeddb/rdb_tenants
 //! ```
 //!
 //! `#` starts a comment. A `policy` names a range of level-0 blocks, the
 //! labels a shard must carry to hold it, and `exclusive` when no other
 //! policy's range may share its shards. `pinned_role` lists the
-//! per-user-shard roles this shard hosts.
+//! per-user-shard roles this shard hosts; `pinned_roles_file` keeps more,
+//! one `database role` a line, added and dropped at run time by `SHARD
+//! HOST|UNHOST ROLE` (what the enterprise gateway's customers API sends).
 
 use std::collections::BTreeMap;
 
@@ -29,6 +32,7 @@ pub struct EnterpriseConfig {
     pub shard_labels: BTreeMap<u32, Vec<String>>,
     pub policies: Vec<Policy>,
     pub pinned_roles: Vec<(String, String)>,
+    pub pinned_roles_file: Option<std::path::PathBuf>,
     /// Where `CREATE TENANT` keeps the tenant directory.
     pub tenants_file: Option<std::path::PathBuf>,
     /// T9: the hosts the server may connect out to (`host`, `host:port`,
@@ -100,6 +104,7 @@ impl EnterpriseConfig {
                 }
                 ["pinned_role", db, role] => c.pinned_roles.push((db.to_string(), role.to_string())),
                 ["tenants_file", path] => c.tenants_file = Some(path.into()),
+                ["pinned_roles_file", path] => c.pinned_roles_file = Some(path.into()),
                 ["outbound_hosts", hosts @ ..] => {
                     c.outbound_hosts.get_or_insert_with(Vec::new).extend(hosts.iter().map(|h| h.to_ascii_lowercase()));
                 }

@@ -27,6 +27,10 @@ pub struct EnterpriseApi {
     pub shard_role: String,
     #[cfg(feature = "client_stats")]
     pub stats: Option<Arc<crate::stats::ClientStats>>,
+    /// The client statistics' history interval and retention, kept in the
+    /// configuration store once it opens.
+    #[cfg(feature = "client_stats_embedded")]
+    pub history: Option<(std::time::Duration, std::time::Duration)>,
 }
 
 const ROUTES_TABLE: &str =
@@ -47,6 +51,17 @@ fn pin_json(p: &Pin) -> Value {
 /// A name a customer's database or role may have: letters, digits and `_`,
 /// starting with a letter, at most 63 bytes. Anything else would need
 /// quoting rules on every protocol; refusing it is simpler and safe.
+/// A route the gateway would not act on: `user_routing` is off, so every
+/// login goes to the home shard whatever is stored.
+fn routing_off(ctx: &ApiContext) -> Option<Reply> {
+    (ctx.shared.cfg.user_routing == rasterizeddb_gateway::config::UserRoutingMode::Off).then(|| {
+        (
+            409,
+            json!({ "error": "user_routing is off in this gateway's configuration, so a route would not be acted on: set user_routing = prefer or require (PUT /v1/settings/user_routing) and restart the gateway" }),
+        )
+    })
+}
+
 fn plain_name(s: &str) -> bool {
     !s.is_empty() && s.len() <= 63 && s.as_bytes()[0].is_ascii_alphabetic() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
@@ -89,6 +104,15 @@ impl EnterpriseApi {
 impl ApiExtension for EnterpriseApi {
     fn schema(&self) -> Vec<String> {
         vec![ROUTES_TABLE.to_string()]
+    }
+
+    #[cfg(feature = "client_stats_embedded")]
+    fn store_ready(&self, store: Arc<rasterizeddb_client::Client>, rt: tokio::runtime::Handle) {
+        let (Some(stats), Some((flush, retention))) = (&self.stats, self.history) else { return };
+        let h = crate::stats::History::start_on(store, &rt, flush, retention, Arc::downgrade(stats));
+        if stats.set_history(h) {
+            log::info!("client statistics history kept in the configuration store, an interval every {} s", flush.as_secs());
+        }
     }
 
     fn load<'a>(&'a self, store: &'a rasterizeddb_client::Client) -> BoxFuture<'a, Result<(), String>> {
@@ -139,6 +163,9 @@ impl ApiExtension for EnterpriseApi {
                     if self.routes.from_file() {
                         return (409, json!({ "error": "routes come from the --user-routes file; edit it there" }));
                     }
+                    if let Some(r) = routing_off(ctx) {
+                        return r;
+                    }
                     let pin = match Self::pin_of(ctx, body) {
                         Ok(p) => p,
                         Err(e) => return (400, json!({ "error": e })),
@@ -170,6 +197,9 @@ impl ApiExtension for EnterpriseApi {
                 if self.routes.from_file() {
                     return (409, json!({ "error": "routes come from the --user-routes file; a customer's route cannot be stored" }));
                 }
+                if let Some(r) = routing_off(ctx) {
+                    return r;
+                }
                 let text = |k: &str| body.get(k).and_then(Value::as_str).map(str::to_string);
                 let (Some(db), Some(role), Some(password)) = (text("database"), text("role"), text("password")) else {
                     return (400, json!({ "error": "the body is {\"database\", \"role\", \"password\", \"shard\"}" }));
@@ -198,6 +228,13 @@ impl ApiExtension for EnterpriseApi {
                 ];
                 if let Err(e) = rasterizeddb_gateway::api::shard_statements(&ctx.shared, pin, &db, &self.shard_role, &statements).await {
                     return (500, json!({ "error": format!("the database {db} was made on shard {pin}, its role was not: {e}") }));
+                }
+                // The shard admits the role's pinned sessions from now on: a
+                // server administration statement, so in the operator
+                // database, as CREATE DATABASE.
+                let host = format!("SHARD HOST ROLE {} {}", sql_text(&db), sql_text(&role));
+                if let Err(e) = rasterizeddb_gateway::api::shard_statements(&ctx.shared, pin, "postgres", &self.shard_role, &[host]).await {
+                    return (500, json!({ "error": format!("{db} and {role} were made on shard {pin}, but the shard does not host the role yet (needs the enterprise server with pinned_roles_file): {e}") }));
                 }
                 match self.put_route(ctx, &db, &role, Pin::Shard(pin)).await {
                     Ok(()) => (201, json!({ "database": db, "role": role, "shard": pin })),

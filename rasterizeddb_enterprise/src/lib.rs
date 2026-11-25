@@ -31,6 +31,6 @@ pub fn install(path: &std::path::Path) -> Result<(), String> {
         log::info!("strict tenant mode: process administration only in \"{}\"", cfg.operator_database);
     }
     #[cfg(feature = "segregation_policies")]
-    rasterizeddb_core::core::policy_hooks::install_placement(Box::new(placement::LabelPlacement::new(&cfg)))?;
+    rasterizeddb_core::core::policy_hooks::install_placement(Box::new(placement::LabelPlacement::open(&cfg)?))?;
     Ok(())
 }

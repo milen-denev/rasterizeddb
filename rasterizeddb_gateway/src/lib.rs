@@ -91,7 +91,11 @@ pub fn run_with(cfg: Config, hooks: Hooks) -> Result<(), String> {
                 }
                 side.block_on(x.load(&client))?;
             }
-            Some((db, Arc::new(client)))
+            let client = Arc::new(client);
+            if let Some(x) = &hooks.api {
+                x.store_ready(client.clone(), side.handle().clone());
+            }
+            Some((db, client))
         }
         None => None,
     };

@@ -427,6 +427,25 @@ pub(crate) fn decision(gid: &str) -> Result<Option<bool>, String> {
     Ok(None)
 }
 
+/// The owner of holds made by SQL (`SHARD HOLD COMMITS`): one, shared by
+/// every session, as a backup's cut is one at a time.
+const ADMIN_HOLD: usize = usize::MAX;
+
+/// `SHARD HOLD COMMITS <ms>`: commit decisions here wait until released or
+/// `ms` pass (capped at 5 s, so a tool that dies cannot hold them for good).
+pub(crate) fn hold_commits_admin(ms: u32) {
+    commit_hold::hold(ADMIN_HOLD, ms);
+}
+
+pub(crate) fn release_commits_admin() {
+    commit_hold::release(ADMIN_HOLD);
+}
+
+/// Waits out every hold in force.
+pub(crate) async fn wait_commit_hold() {
+    commit_hold::wait().await;
+}
+
 pub(crate) fn decide(gid: &str, commit: bool) -> Result<(), String> {
     use std::io::Write;
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

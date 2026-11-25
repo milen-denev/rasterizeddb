@@ -121,6 +121,15 @@ pub enum ShardAdmin {
     MapInstall { text: String, signature: Option<String> },
     /// `SHARD REFERENCE TABLE t` / `SHARD UNREFERENCE TABLE t` (B5).
     Reference { table: String, on: bool },
+    /// `SHARD HOLD COMMITS <ms>`: commit decisions on this (anchor) shard
+    /// wait until `SHARD RELEASE COMMITS` or `ms` (at most 5000) pass; sent
+    /// again before then, it extends the hold. For a consistent cut of the
+    /// cluster (`rdb-shard backup`).
+    HoldCommits { ms: u32 },
+    ReleaseCommits,
+    /// `SHARD HOST ROLE 'db' 'role'` / `SHARD UNHOST ROLE 'db' 'role'`: the
+    /// placement hook's list of per-user-shard roles this shard admits.
+    HostRole { database: String, role: String, on: bool },
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +207,34 @@ fn parse_shard_admin(trimmed: &str, words: &[&str], original: &[&str]) -> Result
             };
             ShardAdmin::MapInstall { text, signature }
         }
-        _ => return Err("SHARD takes TAKE, GIVE, FENCE or UNFENCE RANGE, or MAP INSTALL".to_string()),
+        Some("HOLD") if words.get(2).copied() == Some("COMMITS") && original.len() == 4 => {
+            let ms: u32 = original[3].trim_end_matches(';').parse().map_err(|_| "the statement is `SHARD HOLD COMMITS <ms>`".to_string())?;
+            if ms == 0 || ms > 5_000 {
+                return Err("SHARD HOLD COMMITS takes 1 to 5000 ms; send it again to hold longer".to_string());
+            }
+            ShardAdmin::HoldCommits { ms }
+        }
+        Some("RELEASE") if words.get(2).copied() == Some("COMMITS") && words.len() == 3 => ShardAdmin::ReleaseCommits,
+        Some(kind @ ("HOST" | "UNHOST")) if words.get(2).copied() == Some("ROLE") => {
+            let usage = || format!("the statement is `SHARD {kind} ROLE '<database>' '<role>'`");
+            let b = trimmed.as_bytes();
+            let mut names = Vec::new();
+            let mut at = 0;
+            while let Some(off) = trimmed[at..].find('\'') {
+                let start = at + off;
+                let end = crate::core::sql_scan::string_literal_end(b, start, false);
+                if end > b.len() || end < start + 2 || b[end - 1] != b'\'' {
+                    return Err(usage());
+                }
+                names.push(trimmed[start + 1..end - 1].replace("''", "'"));
+                at = end;
+            }
+            if names.len() != 2 || names.iter().any(|n| n.is_empty()) || !trimmed[at..].trim().trim_end_matches(';').trim().is_empty() {
+                return Err(usage());
+            }
+            ShardAdmin::HostRole { database: names[0].clone(), role: names[1].clone(), on: kind == "HOST" }
+        }
+        _ => return Err("SHARD takes TAKE, GIVE, FENCE or UNFENCE RANGE, MAP INSTALL, DECIDE, HOLD COMMITS or RELEASE COMMITS".to_string()),
     };
     Ok(Introspect::ShardAdmin(admin))
 }
@@ -1932,8 +1968,25 @@ async fn shard_admin(database: &Arc<Database>, admin: &ShardAdmin) -> Result<Str
             ))
         }
         ShardAdmin::Decide { ref gid, commit } => {
+            // A commit decision waits out a hold, as one from a gateway does:
+            // a consistent cut must not see it land mid-way.
+            if commit {
+                crate::core::shard::rshard::wait_commit_hold().await;
+            }
             crate::core::shard::rshard::decide(gid, commit)?;
             Ok(format!("{gid} decided {}", if commit { "commit" } else { "abort" }))
+        }
+        ShardAdmin::HoldCommits { ms } => {
+            crate::core::shard::rshard::hold_commits_admin(ms);
+            Ok(format!("commit decisions held for {ms} ms, or until SHARD RELEASE COMMITS"))
+        }
+        ShardAdmin::ReleaseCommits => {
+            crate::core::shard::rshard::release_commits_admin();
+            Ok("commit decisions released".to_string())
+        }
+        ShardAdmin::HostRole { ref database, ref role, on } => {
+            crate::core::policy_hooks::placement().host_role(database, role, on)?;
+            Ok(format!("role \"{role}\" of \"{database}\" {} this shard", if on { "is hosted on" } else { "is no longer hosted on" }))
         }
         ShardAdmin::Fence { lo, hi } => {
             ownership::fence(lo, hi)?;
@@ -4689,5 +4742,46 @@ mod tests {
             let fields = result_fields(&statement).expect("described");
             assert!(!fields.is_empty(), "{:?} describes no columns", statement);
         }
+    }
+}
+
+#[cfg(test)]
+mod shard_hold_tests {
+    use super::*;
+
+    fn admin(sql: &str) -> Result<ShardAdmin, String> {
+        match parse(sql).expect("an introspection statement") {
+            Ok(Introspect::ShardAdmin(a)) => Ok(a),
+            Ok(other) => panic!("{sql}: {other:?}"),
+            Err(e) => Err(e),
+        }
+    }
+
+    #[test]
+    fn hold_and_release_commits_are_read() {
+        assert_eq!(admin("SHARD HOLD COMMITS 3000"), Ok(ShardAdmin::HoldCommits { ms: 3000 }));
+        assert_eq!(admin("shard hold commits 5000;"), Ok(ShardAdmin::HoldCommits { ms: 5000 }));
+        assert_eq!(admin("SHARD RELEASE COMMITS"), Ok(ShardAdmin::ReleaseCommits));
+        // Capped: a tool that dies must not hold decisions for long.
+        assert!(admin("SHARD HOLD COMMITS 5001").is_err());
+        assert!(admin("SHARD HOLD COMMITS 0").is_err());
+        assert!(admin("SHARD HOLD COMMITS").is_err());
+        assert!(admin("SHARD HOLD COMMITS soon").is_err());
+    }
+
+    #[test]
+    fn host_role_is_read() {
+        assert_eq!(
+            admin("SHARD HOST ROLE 'acme' 'acme_app'"),
+            Ok(ShardAdmin::HostRole { database: "acme".into(), role: "acme_app".into(), on: true })
+        );
+        assert_eq!(
+            admin("shard unhost role 'it''s' 'r';"),
+            Ok(ShardAdmin::HostRole { database: "it's".into(), role: "r".into(), on: false })
+        );
+        assert!(admin("SHARD HOST ROLE 'acme'").is_err());
+        assert!(admin("SHARD HOST ROLE 'acme' 'a' 'b'").is_err());
+        assert!(admin("SHARD HOST ROLE '' 'a'").is_err());
+        assert!(admin("SHARD HOST ROLE 'acme' 'a' extra").is_err());
     }
 }

@@ -57,6 +57,10 @@ pub trait ApiExtension: Send + Sync {
         Box::pin(async { Ok(()) })
     }
     fn handle<'a>(&'a self, ctx: &'a ApiContext, method: &'a str, path: &'a str, query: &'a str, body: &'a Value) -> Option<BoxFuture<'a, Reply>>;
+    /// The store, once open, with the runtime the API runs on: for an
+    /// extension that keeps more in it (the embedded engine is one per
+    /// process, so it must not open one of its own).
+    fn store_ready(&self, _store: Arc<rasterizeddb_client::Client>, _rt: tokio::runtime::Handle) {}
 }
 
 /// A string as an SQL literal.

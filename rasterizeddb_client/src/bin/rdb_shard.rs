@@ -15,6 +15,8 @@
 //! rdb-shard split       --map MAP --shard HOT --new-id N --new-addr HOST:PORT [--at BLOCK]
 //!                       --fenced|--online --out NEW_MAP --state-dir DIR --table TABLE:COLUMN:TYPE [--table …]
 //! rdb-shard exec        --map MAP --sql SQL
+//! rdb-shard backup      --map MAP --out MANIFEST [--snapshot] [--home SHARD]
+//! rdb-shard restore     --manifest MANIFEST [--map MAP]
 //! rdb-shard resolve     --map MAP [--home SHARD] [--grace SECS]
 //! rdb-shard keygen      --key FILE
 //! rdb-shard sign        --map MAP --key FILE
@@ -37,6 +39,29 @@
 //! falls in the moved blocks (`rdb_route_block(TYPE, COLUMN)`) are copied at
 //! one snapshot, verified, and handed off one map epoch up, with a state file
 //! per move in DIR that `rollback` and `retire` take like a tenant move's.
+//!
+//! `backup` takes a consistent cut of the whole cluster in every shard's own
+//! S3 archive (each shard started with its `--s3-*` flags) and writes a
+//! manifest naming each shard's restore point. With `--snapshot` each shard
+//! first takes a full snapshot. Then each shard's archive is flushed
+//! (`BACKUP WAL`) to drain the backlog, and, with commit decisions held on the
+//! anchor shard (`SHARD HOLD COMMITS`) and every decided two-phase commit
+//! finished everywhere, each shard's log is flushed again: that flush is the
+//! shard's point. The hold lasts until every shard's clock has left the
+//! second of its point, so no later flush can share it, and is then released.
+//! No two-phase transaction is committed on one shard at its point and not on
+//! another; one prepared and undecided is rolled back at the restore (`rdb-shard
+//! resolve`). Single-shard transactions are not held: each shard's point is
+//! exact for it, as a restore point is in other distributed databases, so two
+//! separate transactions on two shards are not ordered by the cut.
+//!
+//! `restore` checks every shard's archive still holds its point and prints
+//! what to run: every shard stopped; each restored into a new directory with
+//! its usual `--s3-*` flags and `--restore-to <dir> --restore-at-time '<its
+//! point>'`; each started on that directory with a new `--s3-prefix` (the
+//! restored database is a new timeline, and its old prefix also holds what
+//! came after the point, so the server refuses to archive there); then
+//! `rdb-shard resolve`. It cannot stop the processes itself.
 //!
 //! Every command that writes a map signs it with `--key FILE` (the
 //! authority's key, `keygen`), writing `MAP.sig` beside it; shards started
@@ -100,7 +125,7 @@ impl Args {
             let Some(name) = a.strip_prefix("--") else {
                 return Err(format!("unexpected argument {a:?}\n{}", usage()));
             };
-            if matches!(name, "fenced" | "online" | "force" | "accept-any" | "apply" | "frontend-only") {
+            if matches!(name, "fenced" | "online" | "force" | "accept-any" | "apply" | "frontend-only" | "snapshot") {
                 switches.push(name.to_string());
             } else {
                 let v = it.next().ok_or_else(|| format!("--{name} needs a value"))?;
@@ -172,6 +197,8 @@ async fn run(args: &Args) -> std::result::Result<(), String> {
         "ddl" => cluster_ddl(args, &options).await,
         "keygen" => keygen(args),
         "resolve" => resolve(args, &options).await,
+        "backup" => cluster_backup(args, &options).await,
+        "restore" => cluster_restore(args, &options).await,
         "exec" => exec_each(args, &options).await,
         "sign" => {
             let path = args.one("map")?;
@@ -1392,6 +1419,183 @@ async fn rebalance_forever(args: &Args, options: &Options) -> std::result::Resul
 /// says commit, rolled back when it says abort, and, with no decision and
 /// older than `--grace` seconds (300), decided abort on the anchor first
 /// (presumed abort), so a late gateway cannot commit it, then rolled back.
+/// `SHOW BACKUPS`' rows.
+type BackupRow = (String, String, String, i64, i64, i64, i64, String);
+
+/// The newest log flush a shard's archive holds: (its time, RFC 3339, as the
+/// shard's clock wrote it; its last LSN).
+async fn newest_flush(c: &Client, id: ShardId) -> std::result::Result<Option<(String, i64)>, String> {
+    let rows: Vec<BackupRow> = c.fetch_all("SHOW BACKUPS", &[]).await.map_err(|e| format!("shard {id}: SHOW BACKUPS: {e}"))?;
+    Ok(rows.into_iter().find(|r| r.0 == "wal").map(|r| (r.2, r.4)))
+}
+
+async fn cluster_backup(args: &Args, options: &Options) -> std::result::Result<(), String> {
+    use std::time::{Duration, Instant};
+    let map_path = args.one("map")?;
+    let map = read_map(map_path)?;
+    let out = args.one("out")?;
+    let home: ShardId = match args.opt("home") {
+        Some(h) => h.parse().map_err(|_| "--home takes a shard id".to_string())?,
+        None => map.shards().first().map(|s| s.id).ok_or("the map has no shards")?,
+    };
+    let mut shards = Vec::new();
+    for info in map.shards() {
+        shards.push((info.id, connect(&map, info.id, options).await?));
+    }
+    // A connection of its own: the hold is renewed while the others work.
+    let anchor = connect(&map, home, options).await?;
+    if args.has("snapshot") {
+        for (id, c) in &shards {
+            c.run("BACKUP DATABASE").await.map_err(|e| format!("shard {id}: BACKUP DATABASE: {e}"))?;
+            println!("shard {id}: snapshot taken");
+        }
+    }
+    // The backlog first, without holding anything, so the flushes under the
+    // hold are short.
+    for (id, c) in &shards {
+        c.run("BACKUP WAL").await.map_err(|e| format!("shard {id}: BACKUP WAL: {e}"))?;
+    }
+    const HOLD_MS: u64 = 5_000;
+    anchor.run(&format!("SHARD HOLD COMMITS {HOLD_MS}")).await.map_err(|e| format!("anchor shard {home}: {e}"))?;
+    let mut held_at = Instant::now();
+    let cut = async {
+        // Renewed well before it lapses; a lapse means a decision may have
+        // landed between two shards' points, and the cut is refused.
+        let renew = async |held_at: &mut Instant| -> std::result::Result<(), String> {
+            if held_at.elapsed() >= Duration::from_millis(HOLD_MS) {
+                return Err("the commit hold lapsed while the shards were flushed; run the backup again".to_string());
+            }
+            if held_at.elapsed() >= Duration::from_millis(1_500) {
+                anchor.run(&format!("SHARD HOLD COMMITS {HOLD_MS}")).await.map_err(|e| format!("anchor shard {home}: {e}"))?;
+                *held_at = Instant::now();
+            }
+            Ok(())
+        };
+        // Every commit already decided, finished on every shard.
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            let mut in_flight = Vec::new();
+            for (id, c) in &shards {
+                let prepared: Vec<(String, i64)> =
+                    c.fetch_all("SHOW PREPARED TRANSACTIONS", &[]).await.map_err(|e| format!("shard {id}: {e}"))?;
+                for (gid, _) in prepared {
+                    let quoted = gid.replace('\'', "''");
+                    let decided: Vec<(String,)> = anchor
+                        .fetch_all(&format!("SHOW SHARD DECISION '{quoted}'"), &[])
+                        .await
+                        .map_err(|e| format!("anchor shard {home}: {e}"))?;
+                    if decided.first().is_some_and(|(d,)| d == "commit") {
+                        in_flight.push(format!("{gid} on shard {id}"));
+                    }
+                }
+            }
+            if in_flight.is_empty() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("decided commits did not finish on every shard: {}; run the backup again", in_flight.join(", ")));
+            }
+            renew(&mut held_at).await?;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut points = Vec::new();
+        for (id, c) in &shards {
+            renew(&mut held_at).await?;
+            c.run("BACKUP WAL").await.map_err(|e| format!("shard {id}: BACKUP WAL: {e}"))?;
+            let Some(point) = newest_flush(c, *id).await? else {
+                return Err(format!("shard {id}'s archive holds no log flush: is it started with --s3-bucket?"));
+            };
+            points.push((*id, point));
+        }
+        renew(&mut held_at).await?;
+        // Out of the second of every point before letting decisions go: a
+        // restore to a time takes every flush at or before it.
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        renew(&mut held_at).await?;
+        Ok::<_, String>(points)
+    }
+    .await;
+    let _ = anchor.run("SHARD RELEASE COMMITS").await;
+    let points = cut?;
+    let map_copy = format!("{out}.map");
+    std::fs::write(&map_copy, map.to_text()).map_err(|e| format!("{map_copy}: {e}"))?;
+    let created = points.iter().map(|(_, (at, _))| at.as_str()).max().unwrap_or("");
+    let mut text = format!(
+        "# rdb-shard cluster backup: restore with `rdb-shard restore --manifest {out}`\nformat = rdb-cluster-backup 1\ncluster = {:032x}\nmap_epoch = {}\nmap = {map_copy}\nanchor = {home}\ncreated = {created}\n",
+        map.cluster_id(),
+        map.epoch()
+    );
+    for (id, (at, lsn)) in &points {
+        text.push_str(&format!("shard {id} = {at} lsn {lsn}\n"));
+        println!("shard {id}: point {at} (lsn {lsn})");
+    }
+    let tmp = format!("{out}.tmp");
+    std::fs::write(&tmp, &text).map_err(|e| format!("{tmp}: {e}"))?;
+    std::fs::rename(&tmp, out).map_err(|e| format!("{out}: {e}"))?;
+    println!("cluster backup written to {out}");
+    Ok(())
+}
+
+/// A manifest `backup` wrote: the map's path, and each shard's point.
+fn read_manifest(path: &str) -> std::result::Result<(String, Vec<(ShardId, String)>), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut map = None;
+    let mut points = Vec::new();
+    let mut format_ok = false;
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let (k, v) = line.split_once('=').map(|(k, v)| (k.trim(), v.trim())).ok_or_else(|| format!("{path}: {line:?} is not key = value"))?;
+        match k {
+            "format" => format_ok = v == "rdb-cluster-backup 1",
+            "map" => map = Some(v.to_string()),
+            _ if k.starts_with("shard ") => {
+                let id: ShardId = k[6..].trim().parse().map_err(|_| format!("{path}: {k:?} is not a shard id"))?;
+                let at = v.split_whitespace().next().ok_or_else(|| format!("{path}: shard {id} has no point"))?;
+                points.push((id, at.to_string()));
+            }
+            _ => {}
+        }
+    }
+    if !format_ok {
+        return Err(format!("{path} is not an rdb-shard cluster backup manifest"));
+    }
+    Ok((map.ok_or_else(|| format!("{path} names no map"))?, points))
+}
+
+async fn cluster_restore(args: &Args, options: &Options) -> std::result::Result<(), String> {
+    let manifest = args.one("manifest")?;
+    let (map_path, points) = read_manifest(manifest)?;
+    let map_path = args.opt("map").map(str::to_string).unwrap_or(map_path);
+    let map = read_map(&map_path)?;
+    // Each shard's archive must still hold its point; checked while they run.
+    let mut missing = Vec::new();
+    for (id, at) in &points {
+        let c = connect(&map, *id, options).await?;
+        let rows: Vec<BackupRow> = c.fetch_all("SHOW BACKUPS", &[]).await.map_err(|e| format!("shard {id}: SHOW BACKUPS: {e}"))?;
+        let flushed = rows.iter().any(|r| r.0 == "wal" && r.2 == *at);
+        let snapshot_before = rows.iter().any(|r| r.0 == "snapshot" && r.2.as_str() <= at.as_str());
+        if !flushed || !snapshot_before {
+            missing.push(format!(
+                "shard {id}: {}",
+                if !flushed { format!("no log flush at {at} (pruned, or another prefix?)") } else { format!("no snapshot at or before {at}") }
+            ));
+        }
+    }
+    if !missing.is_empty() {
+        return Err(format!("the archives cannot restore this backup:\n  {}", missing.join("\n  ")));
+    }
+    println!("Every shard's archive holds its point. To restore the cluster to it:");
+    println!("  1. Stop every gateway, then every shard.");
+    println!("  2. Restore each shard into a new directory, with its usual --s3-* flags (its current prefix) and:");
+    for (id, at) in &points {
+        println!("       shard {id}: --restore-to <new dir> --restore-at-time '{at}'");
+    }
+    println!("  3. Start each shard on its new directory (--location) with a NEW --s3-prefix: the restore is a new");
+    println!("     timeline, and the old prefix also holds what came after the point.");
+    println!("  4. Roll back what was prepared and undecided at the cut: rdb-shard resolve --map {map_path} --grace 0");
+    println!("  5. Start the gateways.");
+    Ok(())
+}
+
 async fn resolve(args: &Args, options: &Options) -> std::result::Result<(), String> {
     let map = read_map(args.one("map")?)?;
     let home: ShardId = match args.opt("home") {

@@ -129,6 +129,13 @@ pub trait PlacementPolicy: Send + Sync + 'static {
     fn hosts_pinned_role(&self, _database: &str, _role: &str) -> bool {
         false
     }
+
+    /// `SHARD HOST ROLE 'db' 'role'` (`on`) / `SHARD UNHOST ROLE`: adds a
+    /// per-user-shard role to this shard's list, or drops it, and keeps the
+    /// list. What a provisioning API sends once it has made the role here.
+    fn host_role(&self, _database: &str, _role: &str, _on: bool) -> Result<(), String> {
+        Err("hosting a per-user-shard role needs the enterprise server (rasterizeddb_core_enterprise) with pinned_roles_file in its configuration".to_string())
+    }
 }
 
 /// The process-wide surface an admin-only statement's verb

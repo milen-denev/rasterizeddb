@@ -135,7 +135,9 @@ impl Agg {
         self.latency_max_us
     }
 
-    /// What happened since `before` (an earlier copy of this one).
+    /// What happened since `before` (an earlier copy of this one): an
+    /// interval of the history.
+    #[cfg(any(test, feature = "client_stats_embedded"))]
     fn since(&self, before: &Agg) -> Agg {
         let mut latency = Box::new([0u64; BUCKETS]);
         for (i, l) in latency.iter_mut().enumerate() {
@@ -188,8 +190,10 @@ pub struct ClientStats {
     shards: Vec<Mutex<HashMap<Key, Agg>>>,
     tracked: AtomicUsize,
     settings: Settings,
+    /// Set once: at start from `--client-stats-dir`, or when the gateway's
+    /// configuration store opens (the history is kept there then).
     #[cfg(feature = "client_stats_embedded")]
-    history: Option<History>,
+    history: std::sync::OnceLock<History>,
 }
 
 const SHARDS: usize = 16;
@@ -201,15 +205,21 @@ impl ClientStats {
             tracked: AtomicUsize::new(0),
             settings,
             #[cfg(feature = "client_stats_embedded")]
-            history: None,
+            history: std::sync::OnceLock::new(),
         }
     }
 
     /// Keeps intervals in `history` from now on.
     #[cfg(feature = "client_stats_embedded")]
-    pub fn with_history(mut self, history: History) -> ClientStats {
-        self.history = Some(history);
+    pub fn with_history(self, history: History) -> ClientStats {
+        let _ = self.history.set(history);
         self
+    }
+
+    /// Keeps intervals in `history` from now on, if none is kept yet.
+    #[cfg(feature = "client_stats_embedded")]
+    pub fn set_history(&self, history: History) -> bool {
+        self.history.set(history).is_ok()
     }
 
     fn shard_of(key: &Key) -> usize {
@@ -404,7 +414,7 @@ impl Observer for ClientStats {
                     Ok((vec!["reset".to_string()], vec![vec![Some("ok".to_string())]]))
                 }
                 #[cfg(feature = "client_stats_embedded")]
-                Ours::History(minutes) => match &self.history {
+                Ours::History(minutes) => match self.history.get() {
                     Some(h) => h.read(minutes).await,
                     None => Err("55000: no history is kept: start the gateway with --client-stats-dir".to_string()),
                 },
@@ -512,32 +522,12 @@ impl History {
                             return;
                         }
                     };
-                    let create = "CREATE TABLE IF NOT EXISTS client_stats (at BIGINT NOT NULL, database TEXT NOT NULL, role TEXT NOT NULL, \
-                                  client TEXT NOT NULL, application TEXT NOT NULL, statements BIGINT, errors BIGINT, p50_us BIGINT, \
-                                  p95_us BIGINT, p99_us BIGINT, client_bytes_in BIGINT, client_bytes_out BIGINT, shard_calls BIGINT, \
-                                  shard_bytes_out BIGINT, shard_bytes_out_wire BIGINT, shard_bytes_in BIGINT, shard_bytes_in_wire BIGINT)";
-                    if let Err(e) = client.run(create).await {
+                    if let Err(e) = client.run(HISTORY_TABLE).await {
                         let _ = ready_tx.send(Err(e.to_string()));
                         return;
                     }
                     let _ = ready_tx.send(Ok(()));
-                    let mut last: HashMap<Key, Agg> = HashMap::new();
-                    let mut tick = tokio::time::interval(flush);
-                    tick.tick().await;
-                    loop {
-                        tokio::select! {
-                            _ = tick.tick() => {
-                                let Some(stats) = stats.upgrade() else { break };
-                                if let Err(e) = flush_interval(&client, &stats, &mut last, retention).await {
-                                    log::warn!("client statistics history: {e}");
-                                }
-                            }
-                            asked = ask_rx.recv() => {
-                                let Some((minutes, reply)) = asked else { break };
-                                let _ = reply.send(read_history(&client, minutes).await);
-                            }
-                        }
-                    }
+                    keep_history(&client, &mut ask_rx, flush, retention, &stats).await;
                     let _ = db.shutdown().await;
                 });
             })
@@ -546,10 +536,66 @@ impl History {
         Ok(History { ask: ask_tx })
     }
 
+    /// The history kept in a store already open (the gateway's
+    /// configuration store, `config_dir`): its table made there and its
+    /// interval task run on `rt`. One embedded engine runs per process.
+    pub fn start_on(
+        store: std::sync::Arc<rasterizeddb_client::Client>,
+        rt: &tokio::runtime::Handle,
+        flush: std::time::Duration,
+        retention: std::time::Duration,
+        stats: std::sync::Weak<ClientStats>,
+    ) -> History {
+        let (ask_tx, mut ask_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, tokio::sync::oneshot::Sender<Answer>)>();
+        rt.spawn(async move {
+            if let Err(e) = store.run(HISTORY_TABLE).await {
+                log::error!("client statistics history not kept in the configuration store: {e}");
+                return;
+            }
+            keep_history(&store, &mut ask_rx, flush, retention, &stats).await;
+        });
+        History { ask: ask_tx }
+    }
+
     async fn read(&self, minutes: u64) -> Answer {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.ask.send((minutes, tx)).map_err(|_| "XX000: the history thread has ended".to_string())?;
         rx.await.map_err(|_| "XX000: the history thread has ended".to_string())?
+    }
+}
+
+#[cfg(feature = "client_stats_embedded")]
+const HISTORY_TABLE: &str = "CREATE TABLE IF NOT EXISTS client_stats (at BIGINT NOT NULL, database TEXT NOT NULL, role TEXT NOT NULL, \
+    client TEXT NOT NULL, application TEXT NOT NULL, statements BIGINT, errors BIGINT, p50_us BIGINT, \
+    p95_us BIGINT, p99_us BIGINT, client_bytes_in BIGINT, client_bytes_out BIGINT, shard_calls BIGINT, \
+    shard_bytes_out BIGINT, shard_bytes_out_wire BIGINT, shard_bytes_in BIGINT, shard_bytes_in_wire BIGINT)";
+
+/// Writes an interval every `flush` and answers history reads, until the
+/// aggregate or every asker is gone.
+#[cfg(feature = "client_stats_embedded")]
+async fn keep_history(
+    client: &rasterizeddb_client::Client,
+    ask_rx: &mut tokio::sync::mpsc::UnboundedReceiver<(u64, tokio::sync::oneshot::Sender<Answer>)>,
+    flush: std::time::Duration,
+    retention: std::time::Duration,
+    stats: &std::sync::Weak<ClientStats>,
+) {
+    let mut last: HashMap<Key, Agg> = HashMap::new();
+    let mut tick = tokio::time::interval(flush);
+    tick.tick().await;
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                let Some(stats) = stats.upgrade() else { break };
+                if let Err(e) = flush_interval(client, &stats, &mut last, retention).await {
+                    log::warn!("client statistics history: {e}");
+                }
+            }
+            asked = ask_rx.recv() => {
+                let Some((minutes, reply)) = asked else { break };
+                let _ = reply.send(read_history(client, minutes).await);
+            }
+        }
     }
 }
 

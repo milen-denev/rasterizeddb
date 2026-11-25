@@ -86,7 +86,18 @@ fn main() {
     #[cfg(feature = "client_stats")]
     let mut stats_handle = None;
     if stats_on {
-        let o = client_stats(stats_roles, max_clients, stats_dir, flush_secs, retention_hours);
+        // One embedded engine per process: with a configuration store the
+        // history is kept there (EnterpriseApi::store_ready), not in a
+        // second engine on --client-stats-dir.
+        let own_dir = if cfg.config_dir.is_some() {
+            if let Some(d) = &stats_dir {
+                log::warn!("--client-stats-dir {d} is not used: the history is kept in the configuration store (config_dir)");
+            }
+            None
+        } else {
+            stats_dir.clone()
+        };
+        let o = client_stats(stats_roles, max_clients, own_dir, flush_secs, retention_hours);
         #[cfg(feature = "client_stats")]
         {
             stats_handle = Some(o.clone());
@@ -101,6 +112,8 @@ fn main() {
             shard_role,
             #[cfg(feature = "client_stats")]
             stats: stats_handle,
+            #[cfg(feature = "client_stats_embedded")]
+            history: stats_on.then(|| (std::time::Duration::from_secs(flush_secs), std::time::Duration::from_secs(retention_hours * 3600))),
         }));
     }
     if let Err(e) = rasterizeddb_gateway::run_with(cfg, hooks) {

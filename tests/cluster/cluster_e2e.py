@@ -34,6 +34,10 @@ COMPRESS = os.environ.get("CLUSTER_COMPRESSION") == "1"
 # The enterprise gateway in place of the GPL one, with per-client statistics
 # (and their history in an embedded RasterizedDB).
 ENTERPRISE = os.environ.get("CLUSTER_ENTERPRISE")
+# The enterprise server (rasterizeddb_core_enterprise) for the shards: needed
+# for a customer the configuration API provisions to log in (the shard keeps
+# the roles it hosts, pinned_roles_file).
+ENTERPRISE_CORE = os.environ.get("CLUSTER_ENTERPRISE_CORE")
 procs = {}
 failures = 0
 
@@ -69,19 +73,146 @@ def write_map():
     return path
 
 
-def start_shard(n, tls, cmap):
+S3_PORT = BASE + 51                            # the fake S3 the backup checks archive to
+S3_SHARDS = False                              # shards started from now on archive there
+S3_GEN = 1                                     # a restored cluster archives to a new generation
+LOCATION = {}                                  # a shard's directory, when not s<n>
+
+
+def s3_args(n, gen=None):
+    if not S3_SHARDS:
+        return []
+    return ["--s3-bucket", "rdb", "--s3-endpoint", f"http://127.0.0.1:{S3_PORT}", "--s3-path-style", "--s3-region", "us-east-1",
+            "--s3-prefix", f"cluster/shard{n}/g{gen or S3_GEN}", "--s3-access-key", "e2e", "--s3-secret-key", "e2e",
+            "--s3-wal-flush-secs", "3600", "--s3-snapshot-interval-secs", "86400"]
+
+
+def start_fake_s3():
+    """A minimal S3 on a thread of this process, as core's fake_s3.rs: path
+    style, whole-object PUT/GET (ranges), ListObjectsV2, batch delete and
+    multipart. Signatures are not checked."""
+    import threading, http.server, urllib.parse, re
+    objects, uploads, lock = {}, {}, threading.Lock()
+    esc = lambda t: t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    unesc = lambda t: t.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def reply(self, code, body=b"", headers=()):
+            body = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            for k, v in headers:
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def handle_any(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n) if n else b""
+            path, _, q = self.path.partition("?")
+            query = dict(urllib.parse.parse_qsl(q, keep_blank_values=True))
+            path = urllib.parse.unquote(path.lstrip("/"))
+            bucket, _, key = path.partition("/")
+            full, m = f"{bucket}/{key}", self.command
+            with lock:
+                if m == "GET" and not key and "uploads" in query:
+                    xml = "".join(f"<Upload><Key>{esc(o.split('/', 1)[1])}</Key><UploadId>{i}</UploadId></Upload>"
+                                  for i, (o, _) in uploads.items() if o.startswith(bucket + "/"))
+                    return self.reply(200, f"<ListMultipartUploadsResult>{xml}</ListMultipartUploadsResult>")
+                if m == "GET" and not key:
+                    prefix, after = query.get("prefix", ""), query.get("continuation-token")
+                    names = sorted(k[len(bucket) + 1:] for k in objects if k.startswith(f"{bucket}/{prefix}"))
+                    if after:
+                        names = [x for x in names if x > after]
+                    page, more = names[:1000], len(names) > 1000
+                    xml = "".join(f"<Contents><Key>{esc(x)}</Key><Size>{len(objects[bucket + '/' + x])}</Size></Contents>" for x in page)
+                    xml += f"<IsTruncated>{'true' if more else 'false'}</IsTruncated>"
+                    if more:
+                        xml += f"<NextContinuationToken>{esc(page[-1])}</NextContinuationToken>"
+                    return self.reply(200, f"<ListBucketResult>{xml}</ListBucketResult>")
+                if m == "POST" and not key and "delete" in query:
+                    for k in re.findall(r"<Key>(.*?)</Key>", body.decode()):
+                        objects.pop(f"{bucket}/{unesc(k)}", None)
+                    return self.reply(200, "<DeleteResult></DeleteResult>")
+                if m == "POST" and "uploads" in query:
+                    uid = f"upload{len(uploads) + 1}-{time.time_ns()}"
+                    uploads[uid] = (full, {})
+                    return self.reply(200, f"<InitiateMultipartUploadResult><UploadId>{uid}</UploadId></InitiateMultipartUploadResult>")
+                if m == "PUT" and "uploadId" in query:
+                    up = uploads.get(query["uploadId"])
+                    if up is None:
+                        return self.reply(404, "<Error><Code>NoSuchUpload</Code></Error>")
+                    num = int(query.get("partNumber", "0"))
+                    up[1][num] = body
+                    return self.reply(200, b"", [("ETag", f'"part{num}"')])
+                if m == "POST" and "uploadId" in query:
+                    up = uploads.pop(query["uploadId"], None)
+                    if up is None:
+                        return self.reply(404, "<Error><Code>NoSuchUpload</Code></Error>")
+                    objects[up[0]] = b"".join(up[1][int(x)] for x in re.findall(r"<PartNumber>(\d+)</PartNumber>", body.decode()))
+                    return self.reply(200, "<CompleteMultipartUploadResult></CompleteMultipartUploadResult>")
+                if m == "DELETE" and "uploadId" in query:
+                    return self.reply(204 if uploads.pop(query["uploadId"], None) else 404)
+                if m == "PUT":
+                    objects[full] = body
+                    return self.reply(200, b"", [("ETag", '"fake"')])
+                if m in ("GET", "HEAD"):
+                    if full not in objects:
+                        return self.reply(404, f"<Error><Code>NoSuchKey</Code><Key>{esc(key)}</Key></Error>")
+                    data, rng = objects[full], self.headers.get("Range")
+                    if rng and rng.startswith("bytes="):
+                        a, _, b = rng[6:].partition("-")
+                        start = int(a or 0)
+                        if start >= len(data):
+                            return self.reply(416)
+                        end = min(int(b) + 1, len(data)) if b else len(data)
+                        return self.reply(206, data[start:end])
+                    return self.reply(200, data)
+                if m == "DELETE":
+                    objects.pop(full, None)
+                    return self.reply(204)
+            return self.reply(400, f"<Error><Code>Unsupported</Code><Message>{m} {self.path}</Message></Error>")
+
+        do_GET = do_PUT = do_POST = do_DELETE = do_HEAD = handle_any
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", S3_PORT), H)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return objects
+
+
+def start_shard(n, tls, cmap, extra=()):
     log = open(f"{WORK}/shard{n}.log", "ab")
+    enterprise = []
+    if ENTERPRISE_CORE:
+        conf = f"{WORK}/enterprise{n}.conf"
+        with open(conf, "w") as f:
+            f.write(f"pinned_roles_file {WORK}/shard{n}.hosted_roles\n")
+        enterprise = ["--enterprise-config", conf]
     procs[f"shard{n}"] = subprocess.Popen(
-        [CORE, "--location", f"{WORK}/s{n}", "--protocol", "all", "--pg-port", str(PG[n]), "--pg-password", "pw", "--pg-tls", "prefer",
+        [ENTERPRISE_CORE or CORE, *enterprise, "--location", LOCATION.get(n, f"{WORK}/s{n}"), "--protocol", "all", "--pg-port", str(PG[n]), "--pg-password", "pw", "--pg-tls", "prefer",
          "--rdb-port", str(RDB[n]), "--role", "shard", "--cluster-map", cmap, "--shard-id", str(n),
          "--cluster-id", CLUSTER, "--shard-listen", f"127.0.0.1:{RSHARD[n]}",
          "--shard-cert", f"{tls}/shard{n}.pem", "--shard-key", f"{tls}/shard{n}.key",
          "--gateway-ca", f"{tls}/ca.pem", "--peer-ca", f"{tls}/ca.pem", "--log-level", "info"]
-        + (["--shard-peer-compression", "zstd:3"] if COMPRESS else []),
+        + (["--shard-peer-compression", "zstd:3"] if COMPRESS else []) + s3_args(n) + list(extra),
         stdout=log, stderr=log)
 
 
+API = BASE + 50                                # the gateway's configuration API
+API_TOKEN = "e2e-" + base64.b16encode(os.urandom(16)).decode().lower()
+
+
 def start_gateway(tls, cmap):
+    with open(f"{WORK}/api.token", "w") as f:
+        f.write(API_TOKEN + "\n")
+    os.chmod(f"{WORK}/api.token", 0o600)
     conf = f"{WORK}/gateway.conf"
     with open(conf, "w") as f:
         f.write(f"""listen = 127.0.0.1:{GW}
@@ -95,7 +226,10 @@ auth = scram
 unrouted = fan_out
 two_phase = on
 retries = 10
-""" + ("shard_compression = zstd:3\nshard_compression_min_bytes = 64\n" if COMPRESS else ""))
+api_listen = 127.0.0.1:{API}
+api_token_file = {WORK}/api.token
+config_dir = {WORK}/gateway_config
+""" + ("user_routing = prefer\n" if ENTERPRISE else "") + ("shard_compression = zstd:3\nshard_compression_min_bytes = 64\n" if COMPRESS else ""))
     log = open(f"{WORK}/gateway.log", "ab")
     if ENTERPRISE:
         cmd = [ENTERPRISE, "--config", conf, "--client-stats-roles", "rasterized", "--client-stats-dir", f"{WORK}/stats",
@@ -845,13 +979,231 @@ def main():
               {k: v for k, v in rows_.items() if "compress" in k})
     if ENTERPRISE:
         client_stats()
+    config_api(tls, cmap)
     frontend(tls)
     if RDB_SHARD:
+        cluster_backup(tls, cmap)
         split_online(tls, cmap)
     if os.environ.get("CLUSTER_SERVE") == "after":
         print(f"serving after the checks: gateway {GW}, shards {PG}", flush=True)
         while True:
             time.sleep(3600)
+
+
+def api(method, path, body=None, token=None):
+    """One request to the configuration API: (status, JSON body)."""
+    import json, urllib.request, urllib.error
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(f"http://127.0.0.1:{API}{path}", data=data, method=method)
+    if token is not False:
+        req.add_header("Authorization", f"Bearer {token or API_TOKEN}")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, json.loads(r.read() or b"null")
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, json.loads(raw or b"null")
+        except ValueError:
+            return e.code, raw.decode(errors="replace")
+    except Exception as e:  # refused, reset: the API is not up
+        return 0, str(e)
+
+
+def restart_gateway(tls, cmap):
+    procs["gateway"].terminate()
+    try:
+        procs["gateway"].wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        procs["gateway"].kill()
+        procs["gateway"].wait()
+    start_gateway(tls, cmap)
+    up(GW, "the gateway after a restart")
+    end = time.time() + 30
+    while time.time() < end and api("GET", "/v1/health")[0] != 200:
+        time.sleep(0.3)
+
+
+def config_api(tls, cmap):
+    """The configuration API end to end: the token, every read, a setting
+    stored, applied at the next start and kept across it, its removal, the
+    audit log; with the enterprise gateway, routes and a customer."""
+    # The token: none, a wrong one, and nothing changes without it.
+    code, _ = api("GET", "/v1/health", token=False)
+    check("config API: no token is refused", code == 401, code)
+    code, _ = api("PUT", "/v1/settings/unrouted", {"value": "refuse"}, token="not-the-token")
+    check("  ...a wrong token is refused", code == 401, code)
+    code, body = api("GET", "/v1/settings")
+    check("  ...and changed nothing", code == 200 and not any(x["name"] == "unrouted" for x in body["settings"]), body)
+    # Reads.
+    check("  ...health", api("GET", "/v1/health") == (200, {"ok": True}), api("GET", "/v1/health"))
+    code, body = api("GET", "/v1/map")
+    check("  ...the map: its shards and epoch", code == 200 and sorted(s["id"] for s in body["shards"]) == sorted(SHARDS) and body["epoch"] >= 1, body)
+    code, body = api("GET", "/v1/gateway")
+    check("  ...SHOW GATEWAY as an object", code == 200 and isinstance(body, dict) and len(body) > 5, body)
+    code, body = api("GET", "/v1/no/such/path")
+    check("  ...an unknown path is 404", code == 404, (code, body))
+    # A setting that does not read as a config line is refused, not stored.
+    code, body = api("PUT", "/v1/settings/unrouted", {"value": "sideways"})
+    check("  ...a bad value is refused", code == 400, (code, body))
+    code, body = api("PUT", "/v1/settings/no_such_setting", {"value": "1"})
+    check("  ...an unknown setting is refused", code == 400, (code, body))
+    # Stored, then applied at the next start, and kept.
+    check("  ...the session default before", psql(GW, "SHOW rdb.unrouted") == (0, "fan_out"), psql(GW, "SHOW rdb.unrouted"))
+    code, body = api("PUT", "/v1/settings/unrouted", {"value": "refuse"})
+    check("  ...a setting is stored", code == 200 and body.get("value") == "refuse", (code, body))
+    check("  ...but not applied before a restart", psql(GW, "SHOW rdb.unrouted") == (0, "fan_out"), psql(GW, "SHOW rdb.unrouted"))
+    restart_gateway(tls, cmap)
+    check("  ...applied after a restart, over the config file", psql(GW, "SHOW rdb.unrouted") == (0, "refuse"), psql(GW, "SHOW rdb.unrouted"))
+    code, out = psql(GW, "SELECT count(*) FROM orders")
+    check("  ...and acted on: a keyless read is refused", code != 0, out)
+    code, body = api("GET", "/v1/settings")
+    check("  ...kept in the local store across the restart",
+          code == 200 and {"name": "unrouted", "value": "refuse"} in body["settings"], body)
+    code, body = api("DELETE", "/v1/settings/unrouted")
+    check("  ...forgotten on DELETE", code == 200, (code, body))
+    code, body = api("DELETE", "/v1/settings/unrouted")
+    check("  ...a second DELETE is 404", code == 404, (code, body))
+    restart_gateway(tls, cmap)
+    check("  ...and the config file's value is back", psql(GW, "SHOW rdb.unrouted") == (0, "fan_out"), psql(GW, "SHOW rdb.unrouted"))
+    # The audit log: each change, newest first; refused requests too.
+    code, body = api("GET", "/v1/audit?limit=50")
+    seen = [(a["method"], a["path"], a["status"]) for a in body.get("audit", [])] if code == 200 else []
+    check("  ...the audit log has the PUT and the DELETE",
+          ("PUT", "/v1/settings/unrouted", 200) in seen and ("DELETE", "/v1/settings/unrouted", 200) in seen, seen)
+    check("  ...and the refused change", ("PUT", "/v1/settings/unrouted", 400) in seen, seen)
+    if not ENTERPRISE:
+        return
+    # Routes: a role pinned to a shard, live at its next login.
+    code, body = api("PUT", "/v1/routes/postgres/nobody_yet", {"shard": 99})
+    check("enterprise API: a route to a shard not in the map is refused", code == 400, (code, body))
+    code, body = api("POST", "/v1/customers", {"database": "acme", "role": "acme_app", "password": "acme-password-123", "shard": 1})
+    check("  ...a customer is made on its shard", code == 201 and body.get("shard") == 1, (code, body))
+    code, body = api("GET", "/v1/routes")
+    check("  ...its route is listed", code == 200 and {"database": "acme", "role": "acme_app", "shard": 1} in body["routes"], body)
+    if not ENTERPRISE_CORE:
+        print("SKIP   ...the customer's logins: set CLUSTER_ENTERPRISE_CORE to the enterprise server binary", flush=True)
+        return
+    env = dict(ENV, PGPASSWORD="acme-password-123")
+    def as_customer(sql):
+        r = subprocess.run(["psql", "-h", "127.0.0.1", "-p", str(GW), "-U", "acme_app", "-d", "acme", "-At", "-v", "ON_ERROR_STOP=1",
+                            "-c", sql], env=env, capture_output=True, text=True, timeout=60)
+        return r.returncode, (r.stdout.strip() if r.returncode == 0 else r.stderr.strip())
+    code, out = as_customer("CREATE TABLE notes (id INT PRIMARY KEY, body TEXT NOT NULL)")
+    check("  ...the customer logs in through the gateway and makes a table", code == 0, out)
+    as_customer("INSERT INTO notes (id, body) VALUES (1, 'hello')")
+    check("  ...reads its own row back", as_customer("SELECT body FROM notes WHERE id = 1") == (0, "hello"), as_customer("SELECT body FROM notes"))
+    on_shard = {n: subprocess.run(["psql", "-h", "127.0.0.1", "-p", str(PG[n]), "-U", "rasterized", "-d", "acme", "-At", "-c",
+                                   "SELECT count(*) FROM notes"], env=ENV, capture_output=True, text=True, timeout=30) for n in SHARDS}
+    check("  ...and the table is on shard 1 only",
+          on_shard[1].returncode == 0 and on_shard[1].stdout.strip() == "1" and all(on_shard[n].returncode != 0 for n in SHARDS if n != 1),
+          {n: (r.returncode, (r.stdout or r.stderr).strip()[:80]) for n, r in on_shard.items()})
+    code, body = api("PUT", "/v1/routes/acme/acme_app", {"refuse": True})
+    check("  ...a route set to refuse", code == 200, (code, body))
+    code, out = as_customer("SELECT 1")
+    check("  ...refuses the next login", code != 0 and "may not log in" in out, out)
+    restart_gateway(tls, cmap)
+    code, out = as_customer("SELECT 1")
+    # Without cached keys the refused role is not proven against any shard:
+    # refused either way.
+    check("  ...and still after a restart (kept in the store)", code != 0 and ("may not log in" in out or "authentication failed" in out), out)
+    code, body = api("DELETE", "/v1/routes/acme/acme_app")
+    check("  ...a route removed", code == 200, (code, body))
+
+
+def stop(name):
+    p = procs[name]
+    if p.poll() is None:
+        p.terminate()
+        try:
+            p.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+
+
+def rdb_shard(*args, timeout=600):
+    full = [RDB_SHARD, *args, "--user", "rasterized", "--database", "postgres"]
+    for n in SHARDS:
+        full += ["--native", f"{n}=127.0.0.1:{RDB[n]}"]
+    return subprocess.run(full, env=dict(ENV, RDB_PASSWORD="pw"), capture_output=True, text=True, timeout=timeout)
+
+
+def cluster_backup(tls, cmap):
+    """A consistent backup of the whole cluster, then an in-place restore of
+    every shard to its point: the cluster comes back exactly as it was at the
+    cut, a two-phase transaction on both sides or on neither."""
+    global S3_SHARDS, S3_GEN
+    start_fake_s3()
+    S3_SHARDS = True
+    stop("gateway")
+    for n in SHARDS:
+        stop(f"shard{n}")
+        start_shard(n, tls, cmap)
+    for n in SHARDS:
+        up(PG[n], f"shard {n} with backups")
+    start_gateway(tls, cmap)
+    up(GW, "the gateway")
+    keys = [k for k in range(7000, 7400)]
+    psql(GW, "DELETE FROM orders WHERE id >= 7000 AND id < 7400")
+    # Before the cut: rows on every shard, and one two-phase transaction.
+    psql_script(GW, "".join(f"INSERT INTO orders (id, store, v) VALUES ({k}, 2, {k});\n" for k in range(7000, 7100)))
+    code, out = psql(GW, "BEGIN; INSERT INTO orders (id, store, v) VALUES (7100, 1, 1); INSERT INTO orders (id, store, v) VALUES (7101, 1, 1); "
+                         "INSERT INTO orders (id, store, v) VALUES (7102, 1, 1); INSERT INTO orders (id, store, v) VALUES (7103, 1, 1); COMMIT")
+    check("cluster backup: a two-phase transaction before the cut", code == 0, out)
+    want = psql(GW, "SELECT count(*), sum(v) FROM orders")
+    r = rdb_shard("backup", "--map", cmap, "--out", f"{WORK}/backup.manifest", "--snapshot")
+    check("  ...rdb-shard backup --snapshot", r.returncode == 0, r.stdout + r.stderr)
+    manifest = open(f"{WORK}/backup.manifest").read() if r.returncode == 0 else ""
+    check("  ...a manifest with every shard's point",
+          all(f"shard {n} = " in manifest for n in SHARDS) and "format = rdb-cluster-backup 1" in manifest, manifest)
+    # After the cut: writes, deletes, updates, another two-phase transaction.
+    psql_script(GW, "".join(f"INSERT INTO orders (id, store, v) VALUES ({k}, 3, {k});\n" for k in range(7200, 7300)))
+    psql(GW, "DELETE FROM orders WHERE id >= 7000 AND id < 7010")
+    psql(GW, "UPDATE orders SET v = v + 1000 WHERE id >= 7010 AND id < 7020")
+    psql(GW, "BEGIN; INSERT INTO orders (id, store, v) VALUES (7300, 1, 1); INSERT INTO orders (id, store, v) VALUES (7301, 1, 1); "
+             "INSERT INTO orders (id, store, v) VALUES (7302, 1, 1); INSERT INTO orders (id, store, v) VALUES (7303, 1, 1); COMMIT")
+    changed = psql(GW, "SELECT count(*), sum(v) FROM orders")
+    check("  ...the cluster changed after the cut", changed != want, (want, changed))
+    r = rdb_shard("restore", "--manifest", f"{WORK}/backup.manifest")
+    check("  ...rdb-shard restore finds every point in the archives", r.returncode == 0, r.stdout + r.stderr)
+    import re as _re
+    points = {int(n): at for n, at in _re.findall(r"shard (\d+): --restore-to <new dir> --restore-at-time '([^']+)'", r.stdout)}
+    check("  ...and names each shard's restore point", sorted(points) == sorted(SHARDS), r.stdout)
+    if sorted(points) != sorted(SHARDS):
+        return
+    # The restore, as printed: everything stopped, each shard started once
+    # with its point.
+    stop("gateway")
+    for n in SHARDS:
+        stop(f"shard{n}")
+    for n in SHARDS:
+        target = f"{WORK}/s{n}.restored"
+        r = subprocess.run([CORE, *s3_args(n), "--restore-to", target, "--restore-at-time", points[n]],
+                           capture_output=True, text=True, timeout=600)
+        check(f"  ...shard {n} restored to {points[n]}", r.returncode == 0 and os.path.isdir(target), (r.stdout + r.stderr)[-600:])
+        LOCATION[n] = target
+    S3_GEN += 1
+    for n in SHARDS:
+        start_shard(n, tls, cmap)
+    for n in SHARDS:
+        up(PG[n], f"shard {n} restored", secs=180)
+    r = rdb_shard("resolve", "--map", cmap, "--grace", "0")
+    check("  ...rdb-shard resolve after the restore", r.returncode == 0, r.stdout + r.stderr)
+    start_gateway(tls, cmap)
+    up(GW, "the gateway after the restore")
+    got = psql(GW, "SELECT count(*), sum(v) FROM orders")
+    check("  ...the cluster is as it was at the cut", got == want, (got, want))
+    check("  ...rows deleted after the cut are back", psql(GW, "SELECT count(*) FROM orders WHERE id >= 7000 AND id < 7010") == (0, "10"),
+          psql(GW, "SELECT count(*) FROM orders WHERE id >= 7000 AND id < 7010"))
+    check("  ...rows written after it are gone", psql(GW, "SELECT count(*) FROM orders WHERE id >= 7200 AND id < 7400") == (0, "0"),
+          psql(GW, "SELECT count(*) FROM orders WHERE id >= 7200 AND id < 7400"))
+    per = [psql(PG[n], "SET rdb.shard_part = on; SELECT count(*) FROM orders WHERE id >= 7100 AND id < 7104")[1].splitlines()[-1] for n in SHARDS]
+    check("  ...the two-phase transaction before the cut is whole, on more than one shard",
+          sum(int(x) for x in per) == 4 and sum(1 for x in per if x != "0") >= 2, per)
+    psql(GW, "DELETE FROM orders WHERE id >= 7000 AND id < 7400")
 
 
 def split_online(tls, cmap):
