@@ -754,8 +754,11 @@ fn a_restore_resumes_transaction_ids_past_every_one_the_window_issued() {
     let manager = TransactionManager::new(status);
     manager.set_reservation_block(8);
     // Past the block the open reserved at full size, so the window below
-    // crosses several small ones.
-    while manager.next_id() < manager.reserved_ids_below() {
+    // crosses several small ones. Drained to within one small block: the
+    // mark is raised early, half a block ahead, so draining until it is
+    // reached never ends (it ended only when a raise failed, and the flush
+    // below then reported that failure).
+    while manager.reserved_ids_below() - manager.next_id() > 8 {
         let id = manager.begin();
         manager.abort(id);
     }
