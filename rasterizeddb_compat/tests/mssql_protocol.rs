@@ -1256,3 +1256,81 @@ async fn tiberius_declared_names() {
     assert_eq!(texts(&r[0]), [Some("DENEVCLOUD.ERP.CATEGORIES".to_string())]);
     assert_eq!(texts(&r[1]), [Some("ID".to_string())]);
 }
+
+/// Constraint violations come back as SQL Server's: error 547 for a
+/// foreign key, 2627 for a primary or unique key, 2601 for a unique index,
+/// worded as its messages and naming everything as declared (the engine's
+/// read `"denevcloud․erp․kids"`). And sp_rename keeps the declared names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_constraint_errors() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [dbo].[DenevCloud.ERP.Companies] ([Id] int NOT NULL, [Code] nvarchar(20) NOT NULL, [Tax] nvarchar(20) NULL, \
+         CONSTRAINT [PK_DenevCloud.ERP.Companies] PRIMARY KEY ([Id]), CONSTRAINT [AK_Companies_Tax] UNIQUE ([Tax])); \
+         CREATE UNIQUE INDEX [IX_DenevCloud.ERP.Companies_Code] ON [dbo].[DenevCloud.ERP.Companies] ([Code]); \
+         CREATE TABLE [dbo].[DenevCloud.ERP.ClientSpecifics] ([Id] int NOT NULL PRIMARY KEY, [CompanyId] int NOT NULL, \
+         CONSTRAINT [FK_DenevCloud.ERP.ClientSpecifics_DenevCloud.ERP.Companies_CompanyId] FOREIGN KEY ([CompanyId]) \
+         REFERENCES [dbo].[DenevCloud.ERP.Companies] ([Id])); \
+         INSERT INTO [dbo].[DenevCloud.ERP.Companies] ([Id], [Code], [Tax]) VALUES (1, N'C1', N'T1'); \
+         INSERT INTO [dbo].[DenevCloud.ERP.ClientSpecifics] ([Id], [CompanyId]) VALUES (10, 1)",
+    )
+    .await
+    .unwrap();
+    let fails = |e: Result<Vec<Vec<tiberius::Row>>, tiberius::error::Error>| -> (u32, String) {
+        let e = e.err().expect("refused");
+        let tiberius::error::Error::Server(t) = &e else { panic!("{e}") };
+        (t.code(), t.message().to_string())
+    };
+    let (n, m) = fails(batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.ClientSpecifics] ([Id], [CompanyId]) VALUES (11, 99)").await);
+    assert_eq!(n, 547, "{m}");
+    assert!(
+        m.starts_with(
+            "The INSERT statement conflicted with the FOREIGN KEY constraint \"FK_DenevCloud.ERP.ClientSpecifics_DenevCloud.ERP.Companies_CompanyId\". \
+             The conflict occurred in database \"postgres\", table \"dbo.DenevCloud.ERP.Companies\", column 'Id'."
+        ),
+        "{m}"
+    );
+    assert!(m.contains("\"FK_DenevCloud.ERP.ClientSpecifics_DenevCloud.ERP.Companies_CompanyId\""), "{m}");
+    assert!(!m.contains('\u{2024}'), "{m}");
+    let (n, m) = fails(batch(&mut c, "DELETE FROM [dbo].[DenevCloud.ERP.Companies] WHERE [Id] = 1").await);
+    assert_eq!(n, 547, "{m}");
+    assert!(
+        m.starts_with("The DELETE statement conflicted with the REFERENCE constraint \"FK_DenevCloud.ERP.ClientSpecifics_DenevCloud.ERP.Companies_CompanyId\".")
+            && m.contains("table \"dbo.DenevCloud.ERP.ClientSpecifics\", column 'CompanyId'."),
+        "{m}"
+    );
+    let (n, m) = fails(batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Companies] ([Id], [Code]) VALUES (1, N'C9')").await);
+    assert_eq!(n, 2627, "{m}");
+    assert!(
+        m.starts_with("Violation of PRIMARY KEY constraint 'PK_DenevCloud.ERP.Companies'. Cannot insert duplicate key in object 'dbo.DenevCloud.ERP.Companies'."),
+        "{m}"
+    );
+    let (n, m) = fails(batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Companies] ([Id], [Code], [Tax]) VALUES (2, N'C2', N'T1')").await);
+    assert_eq!(n, 2627, "{m}");
+    assert!(m.starts_with("Violation of UNIQUE KEY constraint 'AK_Companies_Tax'."), "{m}");
+    let (n, m) = fails(batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Companies] ([Id], [Code]) VALUES (3, N'c1')").await);
+    assert_eq!(n, 2601, "{m}");
+    assert!(
+        m.starts_with("Cannot insert duplicate key row in object 'dbo.DenevCloud.ERP.Companies' with unique index 'IX_DenevCloud.ERP.Companies_Code'."),
+        "{m}"
+    );
+
+    // sp_rename: the new spellings show, a column's and an index's.
+    batch(&mut c, "EXEC sp_rename N'[dbo].[DenevCloud.ERP.Companies].[Tax]', N'TaxNumber', 'COLUMN'").await.unwrap();
+    batch(&mut c, "EXEC sp_rename N'[DenevCloud.ERP.Companies].[IX_DenevCloud.ERP.Companies_Code]', N'IX_Code', 'INDEX'").await.unwrap();
+    let mut q = c.simple_query("SELECT * FROM [dbo].[DenevCloud.ERP.Companies]").await.unwrap();
+    let got: Vec<String> = q.columns().await.unwrap().unwrap_or_default().iter().map(|c| c.name().to_string()).collect();
+    q.into_results().await.unwrap();
+    assert_eq!(got, ["Id", "Code", "TaxNumber"]);
+    let (n, m) = fails(batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Companies] ([Id], [Code]) VALUES (3, N'C1')").await);
+    assert_eq!(n, 2601, "{m}");
+    assert!(m.contains("with unique index 'IX_Code'"), "{m}");
+    // A table renamed keeps its columns' spellings.
+    batch(&mut c, "EXEC sp_rename N'[dbo].[DenevCloud.ERP.ClientSpecifics]', N'DenevCloud.ERP.Clients'").await.unwrap();
+    let r = batch(&mut c, "SELECT name FROM sys.tables WHERE name LIKE N'%clients'; SELECT * FROM [DenevCloud.ERP.Clients]").await.unwrap();
+    assert_eq!(texts(&r[0]), [Some("DenevCloud.ERP.Clients".to_string())]);
+    let cols: Vec<&str> = r[1][0].columns().iter().map(|c| c.name()).collect();
+    assert_eq!(cols, ["Id", "CompanyId"]);
+}

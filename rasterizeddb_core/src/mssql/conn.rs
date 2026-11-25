@@ -98,6 +98,8 @@ struct NameCache {
     /// A column's spelling over every relation, where they agree (`None`
     /// where two relations spell it differently).
     columns: HashMap<String, Option<String>>,
+    /// A constraint's or index's spelling, by the engine's name for it.
+    objects: HashMap<String, String>,
 }
 
 const NAMES_TTL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -118,6 +120,20 @@ impl NameCache {
 
     fn shown(&self, relation: &str, column: &str) -> Option<String> {
         self.relations.get(relation)?.get(column).cloned()
+    }
+
+    /// A relation, constraint or column name an engine message quotes, as
+    /// declared: its dots real ones (`lex::NAME_DOT`).
+    fn table_shown(&self, relation: &str) -> String {
+        self.shown(relation, "").unwrap_or_else(|| lex::decode_dots(relation).into_owned())
+    }
+
+    fn object_shown(&self, name: &str) -> String {
+        self.objects.get(name).cloned().unwrap_or_else(|| lex::decode_dots(name).into_owned())
+    }
+
+    fn column_of(&self, relation: &str, column: &str) -> String {
+        self.shown(relation, column).unwrap_or_else(|| lex::decode_dots(column).into_owned())
     }
 }
 
@@ -257,6 +273,9 @@ struct Session {
     /// The statement being forwarded's explicit aliases
     /// (`Forward::aliases`): kept as typed in its COLMETADATA.
     aliases: Vec<String>,
+    /// The statement being forwarded's verb (`INSERT`, `UPDATE`, …), as a
+    /// constraint violation's message names it ([`Session::engine_error`]).
+    verb: &'static str,
     /// The database the login named, as it named it: a pooled connection's
     /// reset goes back to it, as SQL Server's does after a `USE`.
     login_shown: String,
@@ -342,6 +361,7 @@ pub(crate) async fn serve_connection(
         bound_numbers: Vec::new(),
         names: NameCache::default(),
         aliases: Vec::new(),
+        verb: "INSERT",
     };
     let packet_size = match login_packet.packet_size {
         0 => tds::DEFAULT_PACKET,
@@ -749,6 +769,30 @@ fn error_from_engine(n: &PgNotice) -> TsqlError {
         state: 1,
         message,
     }
+}
+
+/// The `"…"`-quoted names of an engine message, in order.
+fn quoted_names(message: &str) -> Vec<&str> {
+    message.split('"').skip(1).step_by(2).collect()
+}
+
+/// A duplicate's values from the engine's `…: a = 'x', b = 2` tail, as
+/// SQL Server lists them (`x, 2`).
+fn duplicate_values(message: &str) -> Option<String> {
+    let (_, tail) = message.split_once("): ")?;
+    let tail = tail.split("; the row being updated is").next().unwrap_or(tail);
+    let mut values = Vec::new();
+    for part in tail.split(", ") {
+        let (column, v) = part.split_once(" = ")?;
+        // A case-insensitive key compares its folded companion, whose
+        // value is not the one written: none shown rather than a wrong one.
+        if column.starts_with("__ci_") {
+            return None;
+        }
+        let v = v.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')).unwrap_or(v);
+        values.push(v.replace("''", "'"));
+    }
+    Some(values.join(", "))
 }
 
 fn isolation_words(level: u8) -> Option<&'static str> {
@@ -1366,7 +1410,7 @@ impl Session {
                 Some(level) => format!("BEGIN ISOLATION LEVEL {level}"),
                 None => "BEGIN".into(),
             };
-            self.silent(&sql).await.map_err(|e| error_from_engine(&e))?;
+            self.silent(&sql).await.map_err(|e| self.engine_error(&e))?;
         }
         self.trancount += 1;
         self.sync_transaction(true);
@@ -1385,7 +1429,7 @@ impl Session {
             let tag = self
                 .silent("COMMIT")
                 .await
-                .map_err(|e| error_from_engine(&e));
+                .map_err(|e| self.engine_error(&e));
             let rolled_back = matches!(&tag, Ok(t) if t == "ROLLBACK");
             self.sync_transaction(!rolled_back);
             tag?;
@@ -1406,7 +1450,7 @@ impl Session {
                 self.savepoints.truncate(pos + 1);
                 self.silent(&format!("ROLLBACK TO SAVEPOINT {}", ident_sql(&lower)))
                     .await
-                    .map_err(|e| error_from_engine(&e))?;
+                    .map_err(|e| self.engine_error(&e))?;
                 return Ok(());
             }
         }
@@ -1419,7 +1463,7 @@ impl Session {
         let r = self
             .silent("ROLLBACK")
             .await
-            .map_err(|e| error_from_engine(&e));
+            .map_err(|e| self.engine_error(&e));
         self.trancount = 0;
         self.sync_transaction(false);
         r.map(|_| ())
@@ -1452,7 +1496,7 @@ impl Session {
                 .silent(&format!("SAVEPOINT {STATEMENT_SAVEPOINT}"))
                 .await
             {
-                return Ok(Err(error_from_engine(&e)));
+                return Ok(Err(self.engine_error(&e)));
             }
         }
         let bound: Vec<(i16, Option<Vec<u8>>, u32)> = match params {
@@ -1481,6 +1525,15 @@ impl Session {
         let mut last = None;
         let mut affected = 0u64;
         self.aliases = forward.aliases.clone();
+        // The statement's verb, as SQL Server's messages name it.
+        self.verb = forward
+            .statements
+            .iter()
+            .rev()
+            .find(|s| !s.is_empty())
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|w| ["INSERT", "UPDATE", "DELETE", "MERGE"].into_iter().find(|v| w.eq_ignore_ascii_case(v)))
+            .unwrap_or("INSERT");
         for sql in forward.statements.iter().filter(|s| !s.is_empty()) {
             let outcome = self
                 .exchange(sql, &bound, capture, forward.extra_column.as_ref())
@@ -1508,7 +1561,7 @@ impl Session {
         });
         match outcome {
             Outcome::Failed(n, started) => {
-                let mut e = error_from_engine(&n);
+                let mut e = self.engine_error(&n);
                 if started {
                     // The result had begun: it is ended here, with its
                     // error, before anything else is written.
@@ -1788,7 +1841,7 @@ impl Session {
         let (_, rows) = self
             .fetch(&sql, &bound)
             .await
-            .map_err(|e| error_from_engine(&e))?;
+            .map_err(|e| self.engine_error(&e))?;
         Ok(rows
             .first()
             .and_then(|r| r.first().cloned().flatten())
@@ -1848,7 +1901,7 @@ impl Session {
         let (oids, rows) = self
             .fetch(&sql, &bound)
             .await
-            .map_err(|e| error_from_engine(&e))?;
+            .map_err(|e| self.engine_error(&e))?;
         Ok(value_of(
             oids.first().copied().unwrap_or(25),
             rows.first().and_then(|r| r.first().cloned()).flatten(),
@@ -2050,7 +2103,7 @@ impl Session {
                     let r = self
                         .silent(&format!("SAVEPOINT {}", ident_sql(&name)))
                         .await
-                        .map_err(|e| error_from_engine(&e));
+                        .map_err(|e| self.engine_error(&e));
                     if r.is_ok() {
                         self.savepoints.push(name);
                     }
@@ -2240,7 +2293,7 @@ impl Session {
         let (oids, rows) = self
             .fetch(&sql, &bound)
             .await
-            .map_err(|e| error_from_engine(&e))?;
+            .map_err(|e| self.engine_error(&e))?;
         if accumulates && rows.len() > 1 {
             return Err(TsqlError::unsupported(
                 "SELECT @v = … @v … over more than one row (it folds row by row; use STRING_AGG or SUM)",
@@ -2391,7 +2444,7 @@ impl Session {
                     "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL {level}"
                 ))
                 .await
-                .map_err(|e| error_from_engine(&e))?;
+                .map_err(|e| self.engine_error(&e))?;
             }
             "LOCK_TIMEOUT" => {
                 let ms: i64 = tokens
@@ -2411,7 +2464,7 @@ impl Session {
                 let value = if ms < 0 { 0 } else { ms.max(1) };
                 self.silent(&format!("SET lock_timeout = {value}"))
                     .await
-                    .map_err(|e| error_from_engine(&e))?;
+                    .map_err(|e| self.engine_error(&e))?;
             }
             "ROWCOUNT" => {
                 let n = render_value(&tokens[2..]).unwrap_or_default();
@@ -2589,6 +2642,37 @@ impl Session {
                     .filter(|p| p != "dbo")
                     .collect();
                 let new = lex::encode_dots(new.trim_matches(['[', ']']).to_string());
+                // The declared spellings follow the rename (`NAMES_TABLE`).
+                let names = translate::NAMES_TABLE;
+                let record: Vec<String> = if kind == "COLUMN" && parts.len() >= 2 {
+                    let table = &parts[parts.len() - 2];
+                    // The old spelling goes first: a rename in case only
+                    // keeps its key.
+                    let mut r = translate::record_names(table, None, &[], &[], false);
+                    r.push(format!(
+                        "DELETE FROM {names} WHERE rel = {} AND col = {}",
+                        translate::sql_str(table),
+                        translate::sql_str(&parts[parts.len() - 1])
+                    ));
+                    r.extend(translate::record_names(table, None, &[new.clone()], &[], false));
+                    r
+                } else if kind == "INDEX" && parts.len() >= 2 {
+                    let table = &parts[parts.len() - 2];
+                    let object = (crate::sqlcompat::index_name(table, &new), new.clone());
+                    translate::record_names(table, None, &[], &[object], false)
+                } else if kind.is_empty() || kind == "OBJECT" {
+                    let old = parts.last().cloned().unwrap_or_default();
+                    let mut r = translate::record_names(&new, None, &[], &[], false);
+                    r.push(format!(
+                        "UPDATE {names} SET rel = {} WHERE rel = {}",
+                        translate::sql_str(&new.to_lowercase()),
+                        translate::sql_str(&old)
+                    ));
+                    r.extend(translate::record_names(&new, Some(&new), &[], &[], false));
+                    r
+                } else {
+                    Vec::new()
+                };
                 let sql = if kind == "COLUMN" && parts.len() >= 2 {
                     format!(
                         "ALTER TABLE {} RENAME COLUMN {} TO {}",
@@ -2613,7 +2697,13 @@ impl Session {
                         ident_sql(&new.to_lowercase())
                     )
                 };
-                self.silent(&sql).await.map_err(|e| error_from_engine(&e))?;
+                self.silent(&sql).await.map_err(|e| self.engine_error(&e))?;
+                for r in &record {
+                    // A rename of a table this protocol did not record
+                    // (no names table yet) records it now.
+                    let _ = self.silent(r).await;
+                }
+                self.names.dirty = true;
                 self.statement_done(0, 0, 0);
                 Ok(Flow::Next)
             }
@@ -3048,7 +3138,7 @@ impl Session {
                 let res = self
                     .silent(&format!("SAVEPOINT {}", ident_sql(&name)))
                     .await
-                    .map_err(|e| error_from_engine(&e));
+                    .map_err(|e| self.engine_error(&e));
                 if res.is_ok() {
                     self.savepoints.push(name);
                 }
@@ -3210,7 +3300,7 @@ impl Session {
         for sql in forward.statements {
             self.silent_guarded(&sql)
                 .await
-                .map_err(|e| error_from_engine(&e))?;
+                .map_err(|e| self.engine_error(&e))?;
         }
         Ok(())
     }
@@ -3395,7 +3485,7 @@ impl Session {
                 let (fields, rows) = self
                     .fetch_fields(&sql, &bound)
                     .await
-                    .map_err(|e| error_from_engine(&e))?;
+                    .map_err(|e| self.engine_error(&e))?;
                 if let Some(c) = self.cursors.get_mut(&name) {
                     c.open = Some(CursorRows {
                         fields,
@@ -3577,7 +3667,7 @@ impl Session {
                 &[text_param(name)],
             )
             .await
-            .map_err(|e| error_from_engine(&e))?;
+            .map_err(|e| self.engine_error(&e))?;
         Ok(rows
             .into_iter()
             .next()
@@ -3627,7 +3717,7 @@ impl Session {
         if !self.has_routine_table() {
             self.silent_guarded(routines::CREATE_ROUTINE_TABLE)
                 .await
-                .map_err(|e| error_from_engine(&e))?;
+                .map_err(|e| self.engine_error(&e))?;
         }
         let (_, rows) = self
             .fetch_guarded(
@@ -3635,7 +3725,7 @@ impl Session {
                 &[text_param(&def.name)],
             )
             .await
-            .map_err(|e| error_from_engine(&e))?;
+            .map_err(|e| self.engine_error(&e))?;
         let existing = rows
             .into_iter()
             .next()
@@ -3658,7 +3748,7 @@ impl Session {
         };
         self.fetch_guarded(sql, &[text_param(&def.name), text_param(&definition)])
             .await
-            .map_err(|e| error_from_engine(&e))?;
+            .map_err(|e| self.engine_error(&e))?;
         self.routine_cache = None;
         Ok(())
     }
@@ -3686,7 +3776,7 @@ impl Session {
                         crate::sqlcompat::string_sql(name.as_bytes())
                     ))
                     .await
-                    .map_err(|e| error_from_engine(&e))?;
+                    .map_err(|e| self.engine_error(&e))?;
                 tag_count(&tag).unwrap_or(0)
             } else {
                 0
@@ -3875,7 +3965,7 @@ impl Session {
             let (f, r, tag) = self
                 .query_bound(&sql, &bound)
                 .await
-                .map_err(|e| error_from_engine(&e))?;
+                .map_err(|e| self.engine_error(&e))?;
             last = (f, r, tag_count(&tag).unwrap_or(0));
         }
         Ok(last)
@@ -3904,7 +3994,7 @@ impl Session {
             "BEGIN"
         })
         .await
-        .map_err(|e| error_from_engine(&e))?;
+        .map_err(|e| self.engine_error(&e))?;
         let r = self.merge_steps(&m, pk.as_deref(), params).await;
         let end = match (&r, outer) {
             (Ok(_), true) => "RELEASE SAVEPOINT rdb_tds_merge",
@@ -3917,7 +4007,7 @@ impl Session {
             let _ = self.silent("RELEASE SAVEPOINT rdb_tds_merge").await;
         }
         let n = r?;
-        ended.map_err(|e| error_from_engine(&e))?;
+        ended.map_err(|e| self.engine_error(&e))?;
         self.rowcount = n as i64;
         self.statement_done(if self.nocount { 0 } else { tds::DONE_COUNT }, 0xc1, n);
         Ok(Flow::Next)
@@ -4005,7 +4095,7 @@ impl Session {
                 let tag = self
                     .silent(&format!("INSERT INTO {table} DEFAULT VALUES"))
                     .await
-                    .map_err(|e| error_from_engine(&e))?;
+                    .map_err(|e| self.engine_error(&e))?;
                 total += tag_count(&tag).unwrap_or(0);
             }
             return Ok(total);
@@ -4071,7 +4161,7 @@ impl Session {
             let (_, _, tag) = self
                 .query_bound(&sql, &bound)
                 .await
-                .map_err(|e| error_from_engine(&e))?;
+                .map_err(|e| self.engine_error(&e))?;
             total += tag_count(&tag).unwrap_or(0);
         }
         Ok(total)
@@ -4101,6 +4191,7 @@ impl Session {
     }
 
     async fn bulk_load(&mut self, message: &Message) -> Result<u64, TsqlError> {
+        self.verb = "INSERT";
         let table = self.bulk_target.take().ok_or_else(|| {
             TsqlError::new(
                 4022,
@@ -4130,7 +4221,7 @@ impl Session {
             "BEGIN"
         })
         .await
-        .map_err(|e| error_from_engine(&e))?;
+        .map_err(|e| self.engine_error(&e))?;
         let mut total = 0u64;
         let mut failed = None;
         for chunk in rows.chunks(per) {
@@ -4172,9 +4263,9 @@ impl Session {
             let _ = self.silent("RELEASE SAVEPOINT rdb_tds_bulk").await;
         }
         if let Some(e) = failed {
-            return Err(error_from_engine(&e));
+            return Err(self.engine_error(&e));
         }
-        ended.map_err(|e| error_from_engine(&e))?;
+        ended.map_err(|e| self.engine_error(&e))?;
         // SqlBulkCopy with KeepIdentity (and bcp -E) write the identity
         // column: its counter moves past them, as SQL Server's does.
         let identity = translate::identity_column(&self.bridge().database, &table);
@@ -4185,6 +4276,94 @@ impl Session {
     }
 
     /// The declared spellings, read again when stale (`NameCache`).
+    /// A failed statement's error, with a constraint violation worded and
+    /// named as SQL Server's: error 547 for a foreign key (`The INSERT
+    /// statement conflicted with the FOREIGN KEY constraint …`), 2627 for a
+    /// primary or unique key, 2601 for a unique index, every name as it
+    /// was declared. Applications match on the number; tools show the
+    /// text, where the engine's own named `denevcloud․erp․kids`.
+    fn engine_error(&self, n: &PgNotice) -> TsqlError {
+        let verb = self.verb;
+        let mut e = error_from_engine(n);
+        let Some(bridge) = self.bridge.as_ref() else { return e };
+        let database = &bridge.database;
+        let db = bridge.database_name.clone();
+        let names = &self.names;
+        let quoted = quoted_names(&n.message);
+        let dbo = |t: &str| format!("dbo.{}", names.table_shown(t));
+        let foreign_key = |table: &str, name: &str| {
+            database.schema_view(table).and_then(|v| {
+                v.schema().foreign_keys.iter().find(|f| !f.is_deleted && f.name == name).cloned()
+            })
+        };
+        let message = match n.code.as_str() {
+            "23503" if n.message.starts_with("insert or update on table") && quoted.len() >= 3 => {
+                let (child, fk, parent) = (quoted[0], quoted[1], quoted[quoted.len() - 1]);
+                let column = foreign_key(child, fk)
+                    .and_then(|f| f.parent_columns.first().cloned())
+                    .map(|c| names.column_of(parent, &c));
+                Some(format!(
+                    "The {verb} statement conflicted with the FOREIGN KEY constraint \"{}\". The conflict occurred in database \"{db}\", table \"{}\"{}.",
+                    names.object_shown(fk),
+                    dbo(parent),
+                    column.map(|c| format!(", column '{c}'")).unwrap_or_default()
+                ))
+            }
+            "23503" if n.message.starts_with("update or delete on table") && quoted.len() >= 3 => {
+                let (fk, child) = (quoted[1], quoted[2]);
+                let column = foreign_key(child, fk)
+                    .and_then(|f| f.columns.first().cloned())
+                    .map(|c| names.column_of(child, &c));
+                Some(format!(
+                    "The {verb} statement conflicted with the REFERENCE constraint \"{}\". The conflict occurred in database \"{db}\", table \"{}\"{}.",
+                    names.object_shown(fk),
+                    dbo(child),
+                    column.map(|c| format!(", column '{c}'")).unwrap_or_default()
+                ))
+            }
+            "23505" if n.message.starts_with("duplicate key value violates unique constraint") && !quoted.is_empty() => {
+                let key = quoted[0];
+                // The table holding the key, and whether it is the primary
+                // key, a constraint or an index.
+                let owner = database.table_names().into_iter().find_map(|t| {
+                    let view = database.schema_view(&t)?;
+                    let schema = view.schema();
+                    if crate::core::rql::unique_key::primary_key_of_named(schema, &t).is_some_and(|k| k.name == key) {
+                        return Some((t, Some(true)));
+                    }
+                    let k = schema.unique_keys.iter().find(|k| !k.is_deleted && k.name == key)?;
+                    Some((t, if k.from_index { None } else { Some(false) }))
+                });
+                owner.map(|(table, kind)| {
+                    let values = duplicate_values(&n.message)
+                        .map(|v| format!(" The duplicate key value is ({v})."))
+                        .unwrap_or_default();
+                    match kind {
+                        None => {
+                            e.number = 2601;
+                            format!(
+                                "Cannot insert duplicate key row in object '{}' with unique index '{}'.{values}",
+                                dbo(&table),
+                                names.object_shown(key)
+                            )
+                        }
+                        Some(primary) => format!(
+                            "Violation of {} constraint '{}'. Cannot insert duplicate key in object '{}'.{values}",
+                            if primary { "PRIMARY KEY" } else { "UNIQUE KEY" },
+                            names.object_shown(key),
+                            dbo(&table)
+                        ),
+                    }
+                })
+            }
+            _ => None,
+        };
+        if let Some(m) = message {
+            e.message = format!("{m} (SQLSTATE {})", n.code);
+        }
+        e
+    }
+
     async fn ensure_names(&mut self) {
         let Some(bridge) = self.bridge.as_ref() else { return };
         let database = Arc::as_ptr(&bridge.database) as usize;
@@ -4204,6 +4383,10 @@ impl Session {
                     else {
                         continue;
                     };
+                    if let Some(object) = col.strip_prefix(translate::OBJECT_MARK) {
+                        cache.objects.insert(object.to_string(), shown);
+                        continue;
+                    }
                     if !col.is_empty() {
                         cache
                             .columns

@@ -1810,7 +1810,7 @@ pub(crate) fn server_property(name: &str) -> Value {
 // Catalogue views
 // ---------------------------------------------------------------------------
 
-fn sql_str(s: &str) -> String {
+pub(crate) fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
@@ -3851,15 +3851,27 @@ fn name_key(name: &str) -> String {
 /// The statements recording `relation`'s declared spellings: its own
 /// (`shown`, when given) and its columns'. With `replace`, what was
 /// recorded for the relation before goes first (a CREATE TABLE).
-fn record_names(relation: &str, shown: Option<&str>, columns: &[String], replace: bool) -> Vec<String> {
+pub(crate) fn record_names(
+    relation: &str,
+    shown: Option<&str>,
+    columns: &[String],
+    objects: &[(String, String)],
+    replace: bool,
+) -> Vec<String> {
     let lit = |s: &str| sql_str(&super::lex::decode_dots(s));
     let key = |s: &str| sql_str(s);
+    let relation = &name_key(relation);
     let mut rows: Vec<String> = Vec::new();
     if let Some(shown) = shown {
         rows.push(format!("({}, '', {})", key(relation), lit(shown)));
     }
     for c in columns {
         rows.push(format!("({}, {}, {})", key(relation), key(&name_key(c)), lit(c)));
+    }
+    // Constraints and indexes, by the name the engine holds them under
+    // (`OBJECT_MARK` + it): the names its errors quote.
+    for (engine, shown) in objects {
+        rows.push(format!("({}, {}, {})", key(relation), key(&format!("{OBJECT_MARK}{}", name_key(engine))), lit(shown)));
     }
     let mut out = vec![format!(
         "CREATE TABLE IF NOT EXISTS {NAMES_TABLE} (rel text NOT NULL, col text NOT NULL, shown text NOT NULL, PRIMARY KEY (rel, col))"
@@ -3874,6 +3886,23 @@ fn record_names(relation: &str, shown: Option<&str>, columns: &[String], replace
         ));
     }
     out
+}
+
+/// Marks a recorded constraint's or index's name in `NAMES_TABLE`'s `col`.
+pub(crate) const OBJECT_MARK: char = '#';
+
+/// A table constraint's or inline index's name: the engine's and as
+/// written.
+fn constraint_object(part: &[Token], table: &str) -> Option<(String, String)> {
+    if part.first()?.is_word("CONSTRAINT") {
+        let name = part.get(1)?.ident()?;
+        return Some((name.to_string(), name.to_string()));
+    }
+    if part.first()?.is_word("INDEX") {
+        let name = part.get(1)?.ident()?;
+        return Some((crate::sqlcompat::index_name(table, name), name.to_string()));
+    }
+    None
 }
 
 /// The last part of the name at `i`, as written.
@@ -3906,11 +3935,13 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
     let mut defs = Vec::new();
     let mut later = Vec::new();
     let mut declared: Vec<String> = Vec::new();
+    let mut objects: Vec<(String, String)> = Vec::new();
     for part in split_commas(&tokens[after + 1..close]) {
         if part.is_empty() {
             continue;
         }
         if is_constraint_start(&part) {
+            objects.extend(constraint_object(&part, &table));
             let (def, statement) = table_constraint(&part, &table, cx)?;
             defs.extend(def);
             later.extend(statement);
@@ -3930,7 +3961,7 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
     statements.extend(later);
     if !temporary {
         let shown = shown_name_at(&tokens, 2);
-        statements.extend(record_names(&table, shown.as_deref(), &declared, true));
+        statements.extend(record_names(&table, shown.as_deref(), &declared, &objects, true));
     }
     Ok(Forward {
         statements,
@@ -3965,6 +3996,11 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
                         statements.push(format!("ALTER TABLE {t} ADD {d}"));
                     }
                     statements.extend(statement);
+                    if !table.starts_with('#') {
+                        if let Some(object) = constraint_object(&part, &table) {
+                            statements.extend(record_names(&table, None, &[], &[object], false));
+                        }
+                    }
                 } else {
                     let mut p = part;
                     if p.first().is_some_and(|x| x.is_word("COLUMN")) {
@@ -3976,7 +4012,7 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
                     ));
                     if !table.starts_with('#') {
                         if let Some(name) = p.first().and_then(|x| x.ident()) {
-                            statements.extend(record_names(&table, None, &[name.to_string()], false));
+                            statements.extend(record_names(&table, None, &[name.to_string()], &[], false));
                         }
                     }
                 }
@@ -4123,14 +4159,19 @@ fn rewrite_create_index(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
             }
         }
     }
+    let mut statements = vec![format!(
+        "CREATE {}INDEX {} ON {} ({})",
+        if unique { "UNIQUE " } else { "" },
+        ident_sql(&crate::sqlcompat::index_name(&table, name)),
+        ident_sql(&table),
+        cols.join(", ")
+    )];
+    if !table.starts_with('#') {
+        let object = (crate::sqlcompat::index_name(&table, name), name.to_string());
+        statements.extend(record_names(&table, None, &[], &[object], false));
+    }
     Ok(Forward {
-        statements: vec![format!(
-            "CREATE {}INDEX {} ON {} ({})",
-            if unique { "UNIQUE " } else { "" },
-            ident_sql(&crate::sqlcompat::index_name(&table, name)),
-            ident_sql(&table),
-            cols.join(", ")
-        )],
+        statements,
         kind: Kind::Ddl,
         extra_column: None,
         aliases: Vec::new(),
@@ -4771,6 +4812,11 @@ mod tests {
         tr_named(e, sql).replace(r#" AS "?column?""#, "")
     }
 
+    /// The statements before the declared names are recorded.
+    fn before_names(sql: String) -> String {
+        sql.split("; CREATE TABLE IF NOT EXISTS __rdb_tds_names").next().unwrap().to_string()
+    }
+
     /// As translated, unaliased expressions' blank names (`BLANK_NAME`) kept.
     fn tr_named(e: &TestEnv, sql: &str) -> String {
         let tokens = lex(sql).unwrap();
@@ -4938,13 +4984,10 @@ mod tests {
              created timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP, active boolean NOT NULL DEFAULT CAST(1 AS boolean), \
              CONSTRAINT pk_blogs PRIMARY KEY (id))"
         );
-        assert_eq!(
-            tr(
-                &e,
-                "CREATE NONCLUSTERED INDEX [IX_Posts_BlogId] ON [Posts] ([BlogId] ASC) WITH (ONLINE = ON)"
-            ),
-            "CREATE INDEX posts__ix_posts_blogid ON posts (blogid)"
-        );
+        let index = tr(&e, "CREATE NONCLUSTERED INDEX [IX_Posts_BlogId] ON [Posts] ([BlogId] ASC) WITH (ONLINE = ON)");
+        assert_eq!(before_names(index.clone()), "CREATE INDEX posts__ix_posts_blogid ON posts (blogid)");
+        // Its name as declared, keyed by the engine's: what errors quote.
+        assert!(index.contains("('posts', '#posts__ix_posts_blogid', 'IX_Posts_BlogId')"), "{index}");
         assert_eq!(
             tr(&e, "ALTER TABLE [t] ADD [c] int NULL").split("; CREATE TABLE IF NOT EXISTS __rdb_tds_names").next().unwrap(),
             "ALTER TABLE t ADD COLUMN c integer NULL"
@@ -4986,15 +5029,15 @@ mod tests {
     fn a_not_null_filter_on_a_unique_key_is_the_key() {
         let e = env();
         assert_eq!(
-            tr(&e, "CREATE UNIQUE INDEX [IX_U] ON [AspNetUsers] ([NormalizedUserName]) WHERE [NormalizedUserName] IS NOT NULL"),
+            before_names(tr(&e, "CREATE UNIQUE INDEX [IX_U] ON [AspNetUsers] ([NormalizedUserName]) WHERE [NormalizedUserName] IS NOT NULL")),
             "CREATE UNIQUE INDEX aspnetusers__ix_u ON aspnetusers (normalizedusername)"
         );
         assert_eq!(
-            tr(&e, "CREATE UNIQUE INDEX [IX_P] ON [P] ([Sku], [Name]) WHERE ([Sku] IS NOT NULL AND [Name] IS NOT NULL)"),
+            before_names(tr(&e, "CREATE UNIQUE INDEX [IX_P] ON [P] ([Sku], [Name]) WHERE ([Sku] IS NOT NULL AND [Name] IS NOT NULL)")),
             "CREATE UNIQUE INDEX p__ix_p ON p (sku, name)"
         );
         // Not unique: the index over every row answers the same.
-        assert_eq!(tr(&e, "CREATE INDEX [IX_D] ON [P] ([Sku]) WHERE [Deleted] = 0"), "CREATE INDEX p__ix_d ON p (sku)");
+        assert_eq!(before_names(tr(&e, "CREATE INDEX [IX_D] ON [P] ([Sku]) WHERE [Deleted] = 0")), "CREATE INDEX p__ix_d ON p (sku)");
         for sql in [
             "CREATE UNIQUE INDEX [IX_D] ON [P] ([Sku]) WHERE [Deleted] = 0",
             "CREATE UNIQUE INDEX [IX_D] ON [P] ([Sku]) WHERE [Other] IS NOT NULL",
