@@ -11,7 +11,7 @@
 ### Statements that failed, now answered
 
 - `x [NOT] LIKE|ILIKE ANY|SOME|ALL (array)` failed ("unexpected LPar", "function 'ANY' is not supported yet"), with the array bound as a parameter (a driver's `text[]`), written as `'{…}'` or `ARRAY[…]`. It now matches each pattern (`ANY` any of them, `ALL` every one), with empty and `NULL` arrays answered as in PostgreSQL. Patterns read from a column or a subquery are still unsupported.
-- `ORDER BY "t"."c"` (a quoted, table-qualified column, as SeaORM writes it) over a join, on a column not in the select list, failed: the quotes were trimmed from the whole term.
+- `ORDER BY "t"."c"` (a quoted, table-qualified column, as SeaORM writes it) over a join, on a column not in the select list, failed: the quotes were trimmed from the whole term, and on a column both joined tables have (`updated_at`, `id`) the quoted term was never matched to its table's column.
 - At READ COMMITTED, three or more transactions updating one row failed with 40001 ("could not serialize access due to concurrent update") when the first held the row for more than 1.5 s: a waiter that lost the race after the holder committed gave up instead of waiting its turn. Every writer now waits and applies, as in PostgreSQL; REPEATABLE READ still refuses.
 - A correlated subquery over an outer query that keeps no row failed with "Column '__lat_k1' not found" instead of returning no rows.
 - `x LIKE p ESCAPE e` over an expression (`CAST(c AS text)`, `upper(c)`) was a syntax error.
@@ -34,6 +34,8 @@
 
 ### New features
 
+- `percentile_cont`, `percentile_disc` and `mode() WITHIN GROUP (ORDER BY …)`, as PostgreSQL answers them (interpolated, discrete, most frequent; NULLs skipped; one sort key).
+- A JSON path whose elements are columns or expressions (`data #>> ARRAY[slot, 'k']`), and `jsonb_extract_path[_text]` / `json_extract_path[_text]`; an element that reads as an integer indexes an array, as in PostgreSQL.
 - SQL Server front end: tables, columns, constraints, indexes and databases show the names they were declared with, and catalogue lookups ignore case (SqlBulkCopy maps columns by exact name). Constraint violations read as SQL Server words them, numbered 547, 2627, and 2601 for a unique index (`--mssql-unique-index-error 2601|2627`). `TRY_CAST`/`TRY_CONVERT` return NULL where the conversion fails, through the engine's new `pg_input_is_valid(text, type)`. `EXEC sp_rdb_record_names @script = N'…'` records the declared names an EF Core script would make, for databases created before names were recorded.
 - rdb_studio: compression. The column list tags compressed columns, the table pane summarises what compression asks and achieves (raw against stored bytes), the column dialogs take a compression method, and a table's row compression and `RECOMPRESS` are a button away.
 - SQL Server front end: EF Core 10 runs unchanged, its Identity schema, migrations and `__EFMigrationsLock` included. Added: `CROSS/OUTER APPLY`, `TOP` in a derived table, a unique index filtered by `key IS NOT NULL`, `sp_getapplock`/`sp_releaseapplock`/`APPLOCK_TEST`, `sp_rename … 'INDEX'`, `ALTER DATABASE … SET SINGLE_USER`, and bracketed table names holding dots (`[dbo].[DenevCloud.ERP.Colors]`). Database names are matched without case, and a pooled connection's reset goes back to the login's database.

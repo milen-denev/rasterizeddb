@@ -174,6 +174,18 @@ pub enum Expr {
         steps: Vec<crate::core::jsonb::Step>,
         as_text: bool,
     },
+    /// `doc #> ARRAY[k1, k2]` / `#>>` with path elements that are not
+    /// constants (columns, parameters already bound, expressions): each
+    /// element's text is a `#>` step, an object's key or an array's position
+    /// as the container decides (`jsonb::Step::Either`), as in PostgreSQL. A
+    /// NULL element makes the result NULL. A path of constants is rewritten
+    /// to a literal path before parsing (`sql_scan::json_path_arrays`); this
+    /// is the rest, which failed to parse.
+    DynamicPath {
+        base: Box<Expr>,
+        keys: Vec<Expr>,
+        as_text: bool,
+    },
 }
 
 /// The modifier of a cast the evaluator applies ([`Expr::TypmodCast`]).
@@ -985,6 +997,7 @@ pub const FUNCTIONS: &[&str] = &[
     "REGEXP_LIKE", "SIMILAR_TO_ESCAPE", "__CHECK_REGEXP_LIKE", "__CHECK_REGEXP_UNCERTAIN",
     "TO_TSVECTOR", "TO_TSQUERY", "PLAINTO_TSQUERY", "PHRASETO_TSQUERY", "WEBSEARCH_TO_TSQUERY", "TS_MATCH_VQ",
     "TS_MATCH_TQ", "TS_MATCH_TT", "TS_RANK",
+    "JSONB_EXTRACT_PATH", "JSONB_EXTRACT_PATH_TEXT", "JSON_EXTRACT_PATH", "JSON_EXTRACT_PATH_TEXT",
 ];
 
 /// Whether `name` (any case) is a function this evaluator calls: one of
@@ -1545,6 +1558,21 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     // `'{"a":1}'::jsonb->'a'`, `to_jsonb(x)->>0`. `::` binds tighter than
     // `->`, so the cast is the operand rather than the arrow being part of
     // its type name.
+    if let Some((lhs, as_text, elements)) = dynamic_path(text) {
+        let base = parse(lhs, schema)?;
+        if !yields_json_text(&base) && static_type(&base) != DbType::JSONB {
+            return Err(format!(
+                "operator does not exist: {} {} text[]",
+                pg_operand_type_name(&base),
+                if as_text { "#>>" } else { "#>" }
+            ));
+        }
+        let keys = crate::core::sql_scan::split_top_level(elements, b',')
+            .into_iter()
+            .map(|k| parse(k, schema))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(Expr::DynamicPath { base: Box::new(base), keys, as_text });
+    }
     if let Some((base, path)) = path_over_expression(text) {
         let base = parse(base, schema)?;
         let json_text = yields_json_text(&base);
@@ -2022,6 +2050,27 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
             };
 
             let upper_name = name.to_ascii_uppercase();
+            // `jsonb_extract_path(doc, k1, k2)` / `_text`: `doc #> ARRAY[k1,
+            // k2]` / `#>>`, each key a `#>` step.
+            if let Some(as_text) = match upper_name.as_str() {
+                "JSONB_EXTRACT_PATH" | "JSON_EXTRACT_PATH" => Some(false),
+                "JSONB_EXTRACT_PATH_TEXT" | "JSON_EXTRACT_PATH_TEXT" => Some(true),
+                _ => None,
+            } {
+                let mut args = args;
+                if args.len() < 2 {
+                    return Err(format!("function {}() needs a document and at least one path element", name.to_ascii_lowercase()));
+                }
+                let base = args.remove(0);
+                if !yields_json_text(&base) && static_type(&base) != DbType::JSONB {
+                    return Err(format!(
+                        "function {}({}, …) does not exist",
+                        name.to_ascii_lowercase(),
+                        pg_operand_type_name(&base)
+                    ));
+                }
+                return Ok(Expr::DynamicPath { base: Box::new(base), keys: args, as_text });
+            }
             let mut args = args;
             if matches!(
                 upper_name.as_str(),
@@ -3729,6 +3778,12 @@ pub fn columns_of(expr: &Expr) -> Vec<SchemaField> {
                 }
             }
             Expr::PathOf { base, .. } => walk(base, out),
+            Expr::DynamicPath { base, keys, .. } => {
+                walk(base, out);
+                for key in keys {
+                    walk(key, out);
+                }
+            }
             Expr::Concat(a, b) => {
                 walk(a, out);
                 walk(b, out);
@@ -3852,7 +3907,7 @@ pub fn static_type(expr: &Expr) -> DbType {
         }
         // As a column's path: `->>` text, `->` the base's own kind, a `json`
         // one travelling as text (`yields_json_text`).
-        Expr::PathOf { base, as_text, .. } => {
+        Expr::PathOf { base, as_text, .. } | Expr::DynamicPath { base, as_text, .. } => {
             if *as_text || yields_json_text(base) {
                 DbType::STRING
             } else {
@@ -4583,6 +4638,29 @@ pub(crate) fn pg_integer_text(text: &str) -> Option<i128> {
         value = value.checked_mul(radix)?.checked_add(c.to_digit(radix as u32)? as i128)?;
     }
     Some(if negative { -value } else { value })
+}
+
+/// `lhs #> ARRAY[…]` / `#>>` at the top level, the array closing the text:
+/// the operand, whether text is wanted, and the elements' text.
+fn dynamic_path(text: &str) -> Option<(&str, bool, &str)> {
+    let nesting = Nesting::of(text);
+    let bytes = text.as_bytes();
+    let at = (0..bytes.len().saturating_sub(1)).find(|&i| bytes[i] == b'#' && bytes[i + 1] == b'>' && nesting.top_level(i))?;
+    let as_text = bytes.get(at + 2) == Some(&b'>');
+    let rest = text[at + if as_text { 3 } else { 2 }..].trim_start();
+    if rest.len() < 6 || !rest[..5].eq_ignore_ascii_case("ARRAY") {
+        return None;
+    }
+    let after = rest[5..].trim_start();
+    if !after.starts_with('[') {
+        return None;
+    }
+    let close = crate::core::sql_scan::matching_close(after, 0)?;
+    if !after[close + 1..].trim().is_empty() {
+        return None;
+    }
+    let lhs = text[..at].trim();
+    (!lhs.is_empty()).then_some((lhs, as_text, &after[1..close]))
 }
 
 pub(crate) fn as_text(value: &Value) -> String {
@@ -6528,7 +6606,13 @@ fn numeric_product_or_quotient(expr: &Expr) -> bool {
             whens.iter().any(|(_, r)| numeric_product_or_quotient(r))
                 || otherwise.as_deref().is_some_and(numeric_product_or_quotient)
         }
-        Expr::Column(_) | Expr::Literal { .. } | Expr::Null | Expr::Scalar(_) | Expr::JsonPath { .. } | Expr::PathOf { .. } => false,
+        Expr::Column(_)
+        | Expr::Literal { .. }
+        | Expr::Null
+        | Expr::Scalar(_)
+        | Expr::JsonPath { .. }
+        | Expr::PathOf { .. }
+        | Expr::DynamicPath { .. } => false,
     }
 }
 
@@ -6545,7 +6629,7 @@ fn reads_wide_decimal(expr: &Expr, schema: &[SchemaField]) -> bool {
                 f.db_type == DbType::DECIMAL && f.scale.is_some_and(|s| s > crate::core::value_codec::DECIMAL_SCALE)
             }
             Expr::Literal { .. } => is_wide_literal(expr),
-            Expr::Null | Expr::Scalar(_) | Expr::JsonPath { .. } | Expr::PathOf { .. } => false,
+            Expr::Null | Expr::Scalar(_) | Expr::JsonPath { .. } | Expr::PathOf { .. } | Expr::DynamicPath { .. } => false,
             Expr::Concat(a, b) | Expr::NullIf(a, b) | Expr::Mod(a, b) | Expr::Arith(a, _, b) => wide(a) || wide(b),
             Expr::Call(_, args) | Expr::Coalesce(args) | Expr::Least(args) | Expr::Greatest(args) => args.iter().any(wide),
             Expr::Cast(inner, _) => wide(inner),
@@ -7803,7 +7887,7 @@ pub(crate) fn yields_json_text(expr: &Expr) -> bool {
     match expr {
         Expr::Column(field) => field.json_text,
         Expr::JsonPath { column, as_text, .. } => column.json_text && !as_text,
-        Expr::PathOf { base, as_text, .. } => yields_json_text(base) && !as_text,
+        Expr::PathOf { base, as_text, .. } | Expr::DynamicPath { base, as_text, .. } => yields_json_text(base) && !as_text,
         Expr::Cast(_, DbType::JSONTEXT) => true,
         Expr::Call(TextFunc::Pg(func), _) => crate::core::rql::pg_functions::yields_json_text(*func),
         _ => false,
@@ -8382,6 +8466,22 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                 Value::Null => return Ok(Value::Null),
             };
             path_value(&document, steps, *as_text, column.json_text)?
+        }
+        Expr::DynamicPath { base, keys, as_text: wants_text } => {
+            let json_text = yields_json_text(base);
+            let document = match eval(base, row, schema)? {
+                Value::Null => return Ok(Value::Null),
+                Value::Data { bytes, .. } if json_text => bytes,
+                value => as_jsonb(value)?,
+            };
+            let mut steps = Vec::with_capacity(keys.len());
+            for key in keys {
+                match eval(key, row, schema)? {
+                    Value::Null => return Ok(Value::Null),
+                    value => steps.push(crate::core::jsonb::Step::Either(as_text(&value))),
+                }
+            }
+            path_value(&document, &steps, *wants_text, json_text)?
         }
         Expr::PathOf { base, steps, as_text } => {
             let json_text = yields_json_text(base);

@@ -2802,6 +2802,111 @@ pub fn split_top_level(list: &str, delimiter: u8) -> Vec<&str> {
     out
 }
 
+/// `percentile_cont(f) WITHIN GROUP (ORDER BY x [DESC])`, and
+/// `percentile_disc`, as the ordered aggregate call the aggregate path reads:
+/// `percentile_cont(x, f ORDER BY x [DESC])`, the fraction where
+/// `string_agg`'s delimiter goes (`aggregate::AggFunc::PercentileCont`).
+/// Refused before as an unsupported function.
+pub fn within_group(sql: &str) -> Cow<'_, str> {
+    if !contains_ignore_ascii_case(sql, b"WITHIN") {
+        return Cow::Borrowed(sql);
+    }
+    let mut text = sql.to_string();
+    let mut from = 0usize;
+    let mut changed = false;
+    while let Some((start, end, replacement)) = next_within_group(&text, from) {
+        from = start + replacement.len();
+        text.replace_range(start..end, &replacement);
+        changed = true;
+    }
+    if changed { Cow::Owned(text) } else { Cow::Borrowed(sql) }
+}
+
+fn next_within_group(sql: &str, from: usize) -> Option<(usize, usize, String)> {
+    let bytes = sql.as_bytes();
+    let skip_ws = |mut i: usize| {
+        while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+            i += 1;
+        }
+        i
+    };
+    let word_at = |i: usize, w: &str| {
+        sql.get(i..i + w.len()).is_some_and(|t| t.eq_ignore_ascii_case(w))
+            && (i == 0 || !is_identifier_byte(bytes[i - 1]))
+            && bytes.get(i + w.len()).is_none_or(|b| !is_identifier_byte(*b))
+    };
+    let mut i = from;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' || b == b'"' {
+            i = quoted_end(bytes, i, b).max(i + 1);
+            continue;
+        }
+        let name = ["percentile_cont", "percentile_disc", "mode"].into_iter().find(|n| word_at(i, n));
+        let Some(name) = name else {
+            i += 1;
+            continue;
+        };
+        let open = skip_ws(i + name.len());
+        if bytes.get(open) != Some(&b'(') {
+            i += name.len();
+            continue;
+        }
+        let close = matching_close(sql, open)?;
+        let within = skip_ws(close + 1);
+        if !word_at(within, "WITHIN") {
+            i = close + 1;
+            continue;
+        }
+        let group = skip_ws(within + "WITHIN".len());
+        if !word_at(group, "GROUP") {
+            i = close + 1;
+            continue;
+        }
+        let order_open = skip_ws(group + "GROUP".len());
+        if bytes.get(order_open) != Some(&b'(') {
+            i = close + 1;
+            continue;
+        }
+        let order_close = matching_close(sql, order_open)?;
+        let order = sql[order_open + 1..order_close].trim();
+        let Some(keys) = order.get(..5).filter(|w| w.eq_ignore_ascii_case("ORDER")).map(|_| order[5..].trim_start()) else {
+            i = close + 1;
+            continue;
+        };
+        let Some(keys) = keys.get(..2).filter(|w| w.eq_ignore_ascii_case("BY")).map(|_| keys[2..].trim()) else {
+            i = close + 1;
+            continue;
+        };
+        // One sort key, as PostgreSQL requires of these; its expression is
+        // the aggregate's argument, without ASC/DESC/NULLS.
+        if split_top_level(keys, b',').len() != 1 {
+            i = close + 1;
+            continue;
+        }
+        let mut argument = keys;
+        loop {
+            let upper = argument.to_ascii_uppercase();
+            let cut = ["NULLS FIRST", "NULLS LAST", "DESC", "ASC"]
+                .into_iter()
+                .find(|w| upper.ends_with(w) && upper[..upper.len() - w.len()].ends_with(char::is_whitespace));
+            match cut {
+                Some(w) => argument = argument[..argument.len() - w.len()].trim_end(),
+                None => break,
+            }
+        }
+        let fraction = sql[open + 1..close].trim();
+        // `mode()` takes no direct argument.
+        let replacement = if fraction.is_empty() {
+            format!("{}({argument} ORDER BY {keys})", &sql[i..i + name.len()])
+        } else {
+            format!("{}({argument}, {fraction} ORDER BY {keys})", &sql[i..i + name.len()])
+        };
+        return Some((i, order_close + 1, replacement));
+    }
+    None
+}
+
 /// `x [NOT] LIKE|ILIKE ANY|SOME|ALL (array)` as the `OR` (`ANY`) or `AND`
 /// (`ALL`) of one comparison per element, as PostgreSQL means it:
 /// `title ILIKE ANY ('{"%a%","%b%"}')` is `(title ILIKE '%a%' OR title ILIKE
@@ -3073,14 +3178,31 @@ pub fn json_path_arrays(sql: &str) -> Cow<'_, str> {
                 }
                 if bytes.get(open) == Some(&b'[')
                     && let Some(close) = matching_close(sql, open)
-                    && let Some(path) = constant_path(&sql[open + 1..close])
                 {
-                    out.push_str(&sql[copied..operator_end]);
-                    out.push(' ');
-                    out.push_str(&path);
-                    copied = close + 1;
-                    i = close + 1;
-                    continue;
+                    if let Some(path) = constant_path(&sql[open + 1..close]) {
+                        out.push_str(&sql[copied..operator_end]);
+                        out.push(' ');
+                        out.push_str(&path);
+                        copied = close + 1;
+                        i = close + 1;
+                        continue;
+                    }
+                    // Elements that are not constants (a column, an
+                    // expression): the function the operator stands for,
+                    // `jsonb_extract_path[_text](doc, k1, …)`, which every
+                    // clause reads as a call. A WHERE refused the `[`.
+                    if let Some(operand_from) = operand_start(sql, i).filter(|&f| f >= copied) {
+                        let function = if operator_end == i + 3 { "jsonb_extract_path_text" } else { "jsonb_extract_path" };
+                        out.push_str(&sql[copied..operand_from]);
+                        out.push_str(&format!(
+                            "{function}({}, {})",
+                            sql[operand_from..i].trim(),
+                            sql[open + 1..close].trim()
+                        ));
+                        copied = close + 1;
+                        i = close + 1;
+                        continue;
+                    }
                 }
             }
             i = operator_end;
@@ -4068,6 +4190,28 @@ mod tests {
 
     use super::*;
 
+    /// `percentile_cont(f) WITHIN GROUP (ORDER BY x)` as the ordered call.
+    #[test]
+    fn within_group_is_the_ordered_call() {
+        let r = |s: &str| within_group(s).into_owned();
+        assert_eq!(
+            r("SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY t.v DESC NULLS LAST) AS m FROM t"),
+            "SELECT percentile_cont(t.v, 0.5 ORDER BY t.v DESC NULLS LAST) AS m FROM t"
+        );
+        assert_eq!(
+            r("SELECT g, PERCENTILE_DISC(0.9) within group (order by v) FROM t GROUP BY g"),
+            "SELECT g, PERCENTILE_DISC(v, 0.9 ORDER BY v) FROM t GROUP BY g"
+        );
+        assert_eq!(r("SELECT mode() WITHIN GROUP (ORDER BY k) FROM t"), "SELECT mode(k ORDER BY k) FROM t");
+        for sql in [
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a, b) FROM t",
+            "SELECT string_agg(s, ',') WITHIN GROUP (ORDER BY s) FROM t",
+            "SELECT 'percentile_cont(0.5) WITHIN GROUP (ORDER BY v)' FROM t",
+        ] {
+            assert_eq!(r(sql), sql, "{sql}");
+        }
+    }
+
     /// `x LIKE ANY (array)` spelled out as one match per pattern, `ALL` as
     /// their AND, the empty and NULL arrays as PostgreSQL answers them.
     #[test]
@@ -4113,10 +4257,12 @@ mod tests {
         // Keys that need quoting inside the array literal, and a quote.
         assert_eq!(r(r#"SELECT d #>> ARRAY['a b', 'c,d', 'it''s', '', 'x"y'] FROM t"#), r#"SELECT d #>> '{"a b","c,d",it''s,"","x\"y"}' FROM t"#);
         // Not constants, or not this operator: unchanged.
+        // Elements that are not constants: the function the operator stands for.
+        assert_eq!(r("SELECT d #>> ARRAY[k, 'a'] FROM t"), "SELECT jsonb_extract_path_text(d, k, 'a') FROM t");
+        assert_eq!(r("SELECT 1 FROM t WHERE t.d #> ARRAY[(id-1)::text] = x"), "SELECT 1 FROM t WHERE jsonb_extract_path(t.d, (id-1)::text) = x");
+        assert_eq!(r("SELECT d #>> ARRAY[NULL, 'a'] FROM t"), "SELECT jsonb_extract_path_text(d, NULL, 'a') FROM t");
+        assert_eq!(r("SELECT d #>> ARRAY[$1, 'a'] FROM t"), "SELECT jsonb_extract_path_text(d, $1, 'a') FROM t");
         for sql in [
-            "SELECT d #>> ARRAY[k, 'a'] FROM t",
-            "SELECT d #>> ARRAY[$1, 'a'] FROM t",
-            "SELECT d #>> ARRAY[NULL, 'a'] FROM t",
             "SELECT d #>> '{a,b}' FROM t",
             "SELECT ARRAY['a'] FROM t",
             "SELECT '#>> ARRAY[''a'']' FROM t",
