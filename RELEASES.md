@@ -4,10 +4,22 @@
 
 ### Statements that failed, now answered
 
+- `x LIKE p ESCAPE e` over an expression (`CAST(c AS text)`, `upper(c)`) was a syntax error.
+- A correlated subquery reading two outer relations that an `INNER JOIN` keys together on one non-text column was refused.
+- `UNION`, `INTERSECT` and `EXCEPT` over case-insensitive columns were refused; they now compare by key.
 - A JSON path written as an array constructor, `data #>> ARRAY['0', 'k']` or `#> ARRAY[…]`, failed ("unexpected character '['" in a `WHERE`, "Column … not found" in a select list, and no columns described once a driver's parameter was in it). A path of constants is now read as the path literal `'{0,k}'`; an element that is a column or an expression is still unsupported.
 - SQL-level `PREPARE p(text) AS … WHERE data -> $1 ->> 'k' = …` then `EXECUTE p('0')` failed ("is neither a column nor a value"): a string for a text parameter now goes in as written, not as `CAST('0' AS text)`.
 - A statement with more than 32,767 bound parameters (a 1,000-row `INSERT … VALUES` of 39 columns) dropped its connection with nothing in the server's log; the client read "expected to read 5 bytes, got 0 bytes at EOF". Parse and Bind now read their counts unsigned, as PostgreSQL does, up to 65,535 parameters. A Parse or Bind the server cannot read is answered with FATAL 08P01 naming it, and logged, before the connection closes.
 - `GROUP BY 1` over a join failed with "Column '1' not found in schema", and so did `GROUP BY k` naming an output column (`t.system_key AS k`). Both now group by that select-list item, a real column of the same name winning, as in PostgreSQL; a position past the select list fails with 42P10. On one table both already worked.
+
+### Crashes fixed
+
+- A join over text ending in a multibyte character (`'…ЩЕ'`) panicked the statement's handler and closed the connection.
+- Over the SQL Server protocol, a bound `SELECT` holding a correlated subquery with a `JOIN` was described as returning no rows, and SqlClient lost the connection when rows came.
+
+### Speed
+
+- A transaction block's `COMMIT` synced about 55 times per DDL statement in it. EF Core's `EnsureCreated` (92 tables, 128 indexes) committed in 30–75 s and now takes under a second.
 
 ### New features
 
@@ -18,6 +30,7 @@
 ### Behaviour changes
 
 - **Over the SQL Server protocol, text columns are case-insensitive by default**, as under SQL Server's default `SQL_Latin1_General_CP1_CI_AS`: a `CREATE TABLE` or `ADD COLUMN` without a `COLLATE` gives a text column `rdb_ci`. `--mssql-collation bin` keeps the old byte comparison. Tables made over PostgreSQL, MySQL or the native protocol are unchanged.
+- `tinyint` (the engine's unsigned byte) is sent over the SQL Server protocol as TDS `INTN(1)`, and its PostgreSQL row description gives a type modifier of 1, not -1.
 - A `CREATE UNIQUE INDEX … WHERE …` over the SQL Server protocol ignored its filter and refused rows the filter leaves out; the filter is honoured now.
 - `STORAGE MOVE … TO 'kv:…'` said the table was no longer covered by backups. A backup copies it as of each snapshot, with no point-in-time replay, and the message now says so.
 
