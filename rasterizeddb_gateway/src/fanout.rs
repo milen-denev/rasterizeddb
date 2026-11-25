@@ -427,14 +427,29 @@ impl Session {
         if spans && ms > 0 && self.core.shared.cfg.two_phase {
             push_query(&mut opening, &format!("SET LOCAL lock_timeout = {ms}"));
         }
-        for &s in shards {
-            if self.txn.shards.contains(&s) || self.txn.shard == Some(s) {
-                continue;
+        // Every shard not yet in the transaction opens its part at once.
+        let new: Vec<(u32, Vec<u8>)> = shards
+            .iter()
+            .filter(|s| !self.txn.shards.contains(s) && self.txn.shard != Some(**s))
+            .map(|&s| (s, opening.clone()))
+            .collect();
+        let mut failure = None;
+        for (s, r) in self.send_each(&new).await {
+            match r {
+                Ok(None) => {
+                    self.txn.shards.push(s);
+                    self.txn.shard.get_or_insert(s);
+                }
+                Ok(Some((c, m))) => {
+                    failure.get_or_insert((c, format!("shard {s}: {m}")));
+                }
+                Err(e) => {
+                    failure.get_or_insert(("08006".to_string(), format!("shard {s}: {e}")));
+                }
             }
-            self.ensure_vs(s).await.map_err(|(c, m)| (c, format!("shard {s}: {m}")))?;
-            self.send_checked(s, &opening).await.map_err(|(c, m)| (c, format!("shard {s}: {m}")))?;
-            self.txn.shards.push(s);
-            self.txn.shard.get_or_insert(s);
+        }
+        if let Some(f) = failure {
+            return Err(f);
         }
         self.txn.pending.clear();
         self.txn.pending_queries = 0;
@@ -1186,7 +1201,7 @@ struct OneStatement {
 }
 
 /// One plain batch's whole reply on `shard`, every chunk fetched.
-async fn collect_pg(core: Rc<Core>, shard: u32, id: u64, req: Vec<u8>) -> Result<Vec<u8>, (String, String)> {
+pub(crate) async fn collect_pg(core: Rc<Core>, shard: u32, id: u64, req: Vec<u8>) -> Result<Vec<u8>, (String, String)> {
     let link = core.link(shard).map_err(|e| ("08006".to_string(), e))?;
     let mut resp = link.call(&core, &req).await;
     let mut out = Vec::new();

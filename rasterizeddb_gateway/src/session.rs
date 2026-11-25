@@ -982,34 +982,61 @@ impl Session {
         }
     }
 
-    /// Sends messages on `shard`'s virtual session; the reply's first error,
-    /// read across every chunk, is the result.
-    pub(crate) async fn send_checked(&mut self, shard: u32, msgs: &[u8]) -> Result<(), (String, String)> {
-        let id = self.vs.get(&shard).map(|v| v.id).ok_or(("08006".to_string(), "no virtual session".to_string()))?;
-        let link = self.core.link(shard).map_err(|e| ("08006".to_string(), e))?;
-        let mut req = Vec::new();
-        Request::encode_pg(&mut req, id, self.core.map().epoch(), msgs);
-        let lost = |e: CallError| ("08006".to_string(), format!("{e:?}"));
-        let mut resp = link.call(&self.core, &req).await.map_err(lost)?;
-        let mut error = None;
-        loop {
-            match resp {
-                Response::PgReply { more, bytes, .. } => {
-                    if error.is_none()
-                        && let Some((_, m)) = pg::messages(&bytes).find(|(t, _)| *t == b'E')
-                    {
-                        error = Some((pg::error_sqlstate(m).unwrap_or("XX000").to_string(), pg::error_message(m).unwrap_or_default()));
-                    }
-                    if !more {
-                        return error.map_or(Ok(()), Err);
-                    }
-                    resp = link.call(&self.core, &Request::Continue { session: id }.encode()).await.map_err(lost)?;
+    /// Each `(shard, messages)` sent at once on this session's virtual
+    /// session there: each shard's first error (`Ok(Some)`), none
+    /// (`Ok(None)`), or why it could not be asked (`Err`), in the order given.
+    #[allow(clippy::type_complexity)]
+    pub(crate) async fn send_each(&mut self, work: &[(u32, Vec<u8>)]) -> Vec<(u32, Result<Option<(String, String)>, String>)> {
+        enum Asked {
+            Sent(tokio::task::JoinHandle<Result<Vec<u8>, (String, String)>>),
+            Not(String),
+        }
+        let epoch = self.core.map().epoch();
+        let mut asked = Vec::with_capacity(work.len());
+        for (s, msgs) in work {
+            match self.ensure_vs(*s).await {
+                Ok(id) => {
+                    let mut req = Vec::new();
+                    Request::encode_pg(&mut req, id, epoch, msgs);
+                    let call = crate::fanout::collect_pg(self.core.clone(), *s, id, req);
+                    asked.push((*s, Asked::Sent(tokio::task::spawn_local(crate::meter::carry(call)))));
                 }
-                Response::Refused(r) => return Err((r.sqlstate_str().to_string(), r.message)),
-                other => return Err(("XX000".into(), format!("unexpected reply kind {:#04x}", other.kind()))),
+                Err((c, m)) => asked.push((*s, Asked::Not(format!("{c}: {m}")))),
             }
         }
+        let mut out = Vec::with_capacity(asked.len());
+        for (s, a) in asked {
+            let r = match a {
+                Asked::Not(e) => Err(e),
+                Asked::Sent(h) => match h.await {
+                    Ok(Ok(bytes)) => Ok(pg::messages(&bytes)
+                        .find(|(t, _)| *t == b'E')
+                        .map(|(_, m)| (pg::error_sqlstate(m).unwrap_or("XX000").to_string(), pg::error_message(m).unwrap_or_default()))),
+                    Ok(Err((c, m))) => Err(format!("{c}: {m}")),
+                    Err(_) => Err("the call panicked".to_string()),
+                },
+            };
+            out.push((s, r));
+        }
+        out
     }
+
+    /// [`Self::send_each`] with one simple query per shard.
+    #[allow(clippy::type_complexity)]
+    pub(crate) async fn quiet_each(&mut self, work: &[(u32, String)]) -> Vec<(u32, Result<Option<(String, String)>, String>)> {
+        let msgs: Vec<(u32, Vec<u8>)> = work
+            .iter()
+            .map(|(s, sql)| {
+                let mut q = vec![b'Q'];
+                q.extend_from_slice(&((sql.len() + 5) as i32).to_be_bytes());
+                q.extend_from_slice(sql.as_bytes());
+                q.push(0);
+                (*s, q)
+            })
+            .collect();
+        self.send_each(&msgs).await
+    }
+
 
     /// Sends messages on `shard`'s virtual session and drops the reply.
     async fn send_discarding(&mut self, shard: u32, msgs: &[u8]) -> Result<(), String> {
@@ -1320,9 +1347,8 @@ impl Session {
     pub(crate) async fn end_two_phase_tagged(&mut self, commit: bool, tag: Option<String>) -> Outcome {
         let shards = self.txn.shards.clone();
         if !commit {
-            for s in &shards {
-                let _ = self.quiet_query(*s, "ROLLBACK").await;
-            }
+            let work: Vec<(u32, String)> = shards.iter().map(|s| (*s, "ROLLBACK".to_string())).collect();
+            let _ = self.quiet_each(&work).await;
             self.end_txn();
             pg::command_complete(&mut self.out, "ROLLBACK");
             pg::ready(&mut self.out, b'I');
@@ -1338,18 +1364,18 @@ impl Session {
             self.core.shared.cfg.gateway_name.replace(['\'', ':'], "_"),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
+        // Every part prepares at once: one round trip, not one per shard.
         let mut prepared = Vec::new();
         let mut failure: Option<(String, String)> = None;
-        for s in &shards {
-            match self.quiet_query(*s, &format!("PREPARE TRANSACTION '{gid}'")).await {
-                Ok((_, None)) => prepared.push(*s),
-                Ok((_, Some(e))) => {
-                    failure = Some((e.0, format!("shard {s} could not prepare: {}", e.1)));
-                    break;
+        let work: Vec<(u32, String)> = shards.iter().map(|s| (*s, format!("PREPARE TRANSACTION '{gid}'"))).collect();
+        for (s, r) in self.quiet_each(&work).await {
+            match r {
+                Ok(None) => prepared.push(s),
+                Ok(Some(e)) => {
+                    failure.get_or_insert((e.0, format!("shard {s} could not prepare: {}", e.1)));
                 }
                 Err(e) => {
-                    failure = Some(("08006".into(), format!("shard {s} could not prepare: {e}")));
-                    break;
+                    failure.get_or_insert(("08006".into(), format!("shard {s} could not prepare: {e}")));
                 }
             }
         }
@@ -1372,23 +1398,20 @@ impl Session {
         }
         if let Some((code, msg)) = failure {
             crate::fanout::committing::end(&gid);
-            for s in &shards {
-                if prepared.contains(s) {
-                    let _ = self.quiet_query(*s, &format!("ROLLBACK PREPARED '{gid}'")).await;
-                } else {
-                    let _ = self.quiet_query(*s, "ROLLBACK").await;
-                }
-            }
+            let work: Vec<(u32, String)> = shards
+                .iter()
+                .map(|s| (*s, if prepared.contains(s) { format!("ROLLBACK PREPARED '{gid}'") } else { "ROLLBACK".to_string() }))
+                .collect();
+            let _ = self.quiet_each(&work).await;
             self.end_txn();
             self.error_ready(&code, &msg);
             return Outcome::Done { error: true };
         }
-        for s in &shards {
-            match self.quiet_query(*s, &format!("COMMIT PREPARED '{gid}'")).await {
-                Ok((_, None)) => {}
-                other => log::warn!(
-                    "transaction {gid} is decided commit but shard {s} did not finish it ({other:?}); rdb-shard resolve completes it"
-                ),
+        // The decision is recorded: every part commits at once.
+        let work: Vec<(u32, String)> = shards.iter().map(|s| (*s, format!("COMMIT PREPARED '{gid}'"))).collect();
+        for (s, r) in self.quiet_each(&work).await {
+            if !matches!(r, Ok(None)) {
+                log::warn!("transaction {gid} is decided commit but shard {s} did not finish it ({r:?}); rdb-shard resolve completes it");
             }
         }
         crate::fanout::committing::end(&gid);
