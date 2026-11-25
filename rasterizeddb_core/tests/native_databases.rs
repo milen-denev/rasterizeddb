@@ -135,6 +135,11 @@ impl Harness {
         Client::connect(&self.socket, options(Login::Trust, database)).await
     }
 
+    /// A trust connection running as `role` (`Login::TrustAs`).
+    async fn trust_as(&self, role: &str, database: Option<&str>) -> rasterizeddb_client::Result<Client> {
+        Client::connect(&self.socket, options(Login::TrustAs(role.to_string()), database)).await
+    }
+
     async fn password(
         &self,
         user: &str,
@@ -321,8 +326,10 @@ async fn a_password_login_is_checked_against_the_named_databases_roles() {
 
         // kopa's `rasterized` gets a password of its own, and kopa gets a role
         // the default database does not have. The trust socket asks no
-        // password, so it can change kopa's roles.
-        let admin = server.trust(Some("kopa")).await.unwrap();
+        // password; a trust connection runs as the role it names, so it names
+        // kopa's superuser to change kopa's roles (an unnamed one is no
+        // administrator: roles plan R0).
+        let admin = server.trust_as("rasterized", Some("kopa")).await.unwrap();
         admin.execute("ALTER USER rasterized PASSWORD 'kopa-pw'", &[]).await.unwrap();
         admin.execute("CREATE USER waiter PASSWORD 'tray'", &[]).await.unwrap();
         admin.execute("CREATE TABLE menu (id INT)", &[]).await.unwrap();
@@ -421,6 +428,52 @@ async fn a_native_connection_counts_among_its_databases_sessions() {
         }
         let n: i64 = kopa_row[sessions].as_deref().unwrap().parse().unwrap();
         assert!(n >= 1, "kopa's native connection is not counted: {rows:?}");
+    })
+    .await;
+}
+
+/// What a trust connection may do, by the role it names (roles plan R0:
+/// `trust` authenticates as the named role, never as an administrator by
+/// itself). Unnamed: no role statement, no table another role owns, only
+/// what it made itself or PUBLIC is granted. Named: that role, superuser
+/// or not. A role that does not exist is refused at connect.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trust_connection_is_the_role_it_names() {
+    bounded(async {
+        let server = Harness::start().await;
+        let admin = server.trust_as("rasterized", None).await.expect("the superuser names itself");
+        admin.execute("CREATE TABLE menu (id INT)", &[]).await.unwrap();
+        admin.execute("INSERT INTO menu (id) VALUES (1)", &[]).await.unwrap();
+        admin.execute("CREATE USER waiter PASSWORD 'tray'", &[]).await.unwrap();
+
+        // Unnamed: no administrator, and not the owner of menu.
+        let anonymous = server.trust(None).await.expect("an unnamed trust connection still connects");
+        let refused = anonymous.execute("ALTER USER rasterized PASSWORD 'x'", &[]).await;
+        assert!(refused.is_err(), "an unnamed trust connection changed a role");
+        let read = count(&anonymous, "menu").await;
+        assert!(read.is_err(), "an unnamed trust connection read a table it does not own: {read:?}");
+        // What PUBLIC is granted it has; what it makes it owns.
+        admin.execute("GRANT SELECT ON menu TO PUBLIC", &[]).await.unwrap();
+        assert_eq!(count(&anonymous, "menu").await.unwrap(), 1);
+        anonymous.execute("CREATE TABLE scratch (n INT)", &[]).await.expect("it makes its own tables");
+        anonymous.execute("INSERT INTO scratch (n) VALUES (1)", &[]).await.expect("and writes them");
+
+        // Named, not a superuser: that role's privileges, no more.
+        let waiter = server.trust_as("waiter", None).await.expect("waiter names itself");
+        assert!(waiter.execute("ALTER USER rasterized PASSWORD 'x'", &[]).await.is_err());
+        assert_eq!(count(&waiter, "menu").await.unwrap(), 1, "PUBLIC's grant");
+        // The superuser, named, administers.
+        admin.execute("ALTER USER waiter PASSWORD 'tray2'", &[]).await.expect("the named superuser administers");
+
+        // A role that does not exist, or may not log in, is refused at once.
+        let nobody = server.trust_as("nobody", None).await.err().expect("an unknown role is refused");
+        assert!(nobody.to_string().contains("does not exist"), "{nobody}");
+        // With a database: the role is checked against that database's roles.
+        admin.execute("CREATE DATABASE kitchen", &[]).await.unwrap();
+        let elsewhere = server.trust_as("waiter", Some("kitchen")).await.err().expect("waiter is not kitchen's");
+        assert!(elsewhere.to_string().contains("does not exist"), "{elsewhere}");
+        let kitchen = server.trust_as("rasterized", Some("kitchen")).await.expect("kitchen's superuser");
+        assert_eq!(current_database(&kitchen).await, "kitchen");
     })
     .await;
 }
