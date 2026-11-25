@@ -148,6 +148,12 @@ pub fn guid_bytes(text: &str) -> Option<[u8; 16]> {
 /// The key of `text` under `strength`: equal keys are equal text, and the
 /// keys' bytes are the order.
 pub fn key(text: &str, strength: Strength) -> String {
+    // ASCII: decomposition and composition change nothing, there are no
+    // marks to drop, and its lower case is its ASCII lower case. Most text
+    // is, and normalising it was a tenth of a bulk copy.
+    if text.is_ascii() && matches!(strength, Strength::CaseInsensitive | Strength::CaseAccentInsensitive) {
+        return text.to_ascii_lowercase();
+    }
     match strength {
         Strength::Binary => text.to_string(),
         Strength::CaseInsensitive => text.nfd().collect::<String>().to_lowercase().nfc().collect(),
@@ -313,6 +319,23 @@ mod tests {
         assert_ne!(key("straße", ci), key("strasse", ci));
         assert!(key("apple", ci) < key("Banana", ci));
         assert_eq!(key("ÅNGSTRÖM", ai), "angstrom");
+    }
+
+    /// The ASCII fast path is the normalised key it skips.
+    #[test]
+    fn ascii_keys_are_the_normalised_ones() {
+        let slow_ci = |t: &str| -> String { t.nfd().collect::<String>().to_lowercase().nfc().collect() };
+        let slow_ai = |t: &str| -> String {
+            t.nfd().collect::<String>().to_lowercase().nfd().filter(|c| !unicode_normalization::char::is_combining_mark(*c)).collect()
+        };
+        let mut samples: Vec<String> = vec!["".into(), "Bob".into(), "ABC def_123 !@#$%^&*()'\"\\\t\n".into()];
+        for k in 0u32..2000 {
+            samples.push((0..(k % 40)).map(|i| char::from_u32(32 + (k * 7 + i * 13) % 95).unwrap()).collect());
+        }
+        for t in &samples {
+            assert_eq!(key(t, Strength::CaseInsensitive), slow_ci(t), "{t:?}");
+            assert_eq!(key(t, Strength::CaseAccentInsensitive), slow_ai(t), "{t:?}");
+        }
     }
 
     #[test]

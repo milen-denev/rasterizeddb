@@ -12467,6 +12467,15 @@ fn supply_generated_values(
 
     let mut computed: Vec<(String, String)> = Vec::with_capacity(generated.len());
     for g in &generated {
+        // A collation's key companion (`__ci_x = __rdb_ci_key(x)`, its GUID
+        // order's, …): the key of the column's value, made directly. Each
+        // row's value was written into the expression's text and the text
+        // parsed again, which over long text was most of a bulk copy into a
+        // case-insensitive table.
+        if let Some(literal) = companion_key_literal(&g.column, &g.expression, &values) {
+            computed.push((g.column.clone(), literal));
+            continue;
+        }
         let substituted = match substitute_columns(&g.expression, &values) {
             Ok(text) => text,
             Err(reason) => return Some(Err(reason)),
@@ -13005,6 +13014,74 @@ fn expression_columns(
 /// `tax_amount` had the shorter name substituted inside the longer one, leaving
 /// arithmetic over a fragment — the same prefix-matching mistake that once
 /// deleted a column and a predicate elsewhere in this parser.
+/// The literal of a collation key companion's value (`column` generated as
+/// `expression`), computed from its base column's literal in `values` as
+/// the expression would (`collation::key`, quoted as a text value is);
+/// `None` when `column` is no companion, the expression is not its own, or
+/// the base's literal is not a plain quoted text or NULL (then it is
+/// computed the general way).
+fn companion_key_literal(column: &str, expression: &str, values: &[(String, String)]) -> Option<String> {
+    let (base, strength) = crate::core::rql::collation::companion_of(column)?;
+    let own = crate::core::rql::collation::companion_expression(base, strength)?;
+    if !own.eq_ignore_ascii_case(expression.trim()) {
+        return None;
+    }
+    let (_, literal) = values.iter().find(|(name, _)| name.eq_ignore_ascii_case(base))?;
+    let literal = literal.trim();
+    if literal.eq_ignore_ascii_case("NULL") {
+        return Some("NULL".to_string());
+    }
+    // Exactly one quoted string: `'a' || 'b'` also begins and ends with a
+    // quote, and keyed as the text `a' || 'b` it was a wrong key where the
+    // general way evaluates it. And quoted the one way a text is (its
+    // quotes doubled), so the text read back is the value.
+    if literal.len() < 2
+        || !literal.starts_with('\'')
+        || crate::core::sql_scan::quoted_end(literal.as_bytes(), 0, b'\'') != literal.len()
+    {
+        return None;
+    }
+    let text = crate::core::value_codec::unquote_sql(literal);
+    if crate::core::value_codec::quote_sql(&text) != literal {
+        return None;
+    }
+    Some(crate::core::value_codec::quote_sql(&crate::core::rql::collation::key(&text, strength)))
+}
+
+#[cfg(test)]
+mod companion_key_literal_tests {
+    use super::companion_key_literal;
+
+    /// A companion's literal made directly is the one the general way makes
+    /// (`__rdb_ci_key` evaluated, the text quoted).
+    #[test]
+    fn a_companion_key_is_the_expressions_value() {
+        let values = vec![("name".to_string(), "'O''Brien ÉTÉ'".to_string()), ("n".to_string(), "NULL".to_string())];
+        assert_eq!(companion_key_literal("__ci_name", "__rdb_ci_key(name)", &values).as_deref(), Some("'o''brien été'"));
+        assert_eq!(companion_key_literal("__cia_name", "__rdb_ci_ai_key(name)", &values).as_deref(), Some("'o''brien ete'"));
+        assert_eq!(companion_key_literal("__ci_n", "__rdb_ci_key(n)", &values).as_deref(), Some("NULL"));
+        // Not a companion's own expression, or not a plain literal: the
+        // general way.
+        assert_eq!(companion_key_literal("__ci_name", "__rdb_ci_key(n)", &values), None);
+        assert_eq!(companion_key_literal("total", "price * 2", &values), None);
+        let cast = vec![("name".to_string(), "'x'::text".to_string())];
+        assert_eq!(companion_key_literal("__ci_name", "__rdb_ci_key(name)", &cast), None);
+        // Quoted at both ends but not one string: an expression, or an
+        // unterminated run.
+        for text in ["'a' || 'b'", "'a' || name || 'b'", "'a''", "'it''s' || 'x'"] {
+            let v = vec![("name".to_string(), text.to_string())];
+            assert_eq!(companion_key_literal("__ci_name", "__rdb_ci_key(name)", &v), None, "{text}");
+        }
+        let escaped = vec![("name".to_string(), "'It''S'".to_string())];
+        assert_eq!(companion_key_literal("__ci_name", "__rdb_ci_key(name)", &escaped).as_deref(), Some("'it''s'"));
+        let g = vec![("g".to_string(), "'01000000-0000-0000-0000-000000000000'".to_string())];
+        assert_eq!(
+            companion_key_literal("__gs_g", "__rdb_guid_key(g)", &g).as_deref(),
+            Some("'00000000000000000000000000000001'")
+        );
+    }
+}
+
 fn substitute_columns(expression: &str, values: &[(String, String)]) -> Result<String, String> {
     // A byte of a multi-byte character is part of a name, so `naïve` is found
     // whole. It was not, and each of its bytes outside a word was pushed as a

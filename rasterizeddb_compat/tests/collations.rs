@@ -357,3 +357,19 @@ async fn a_copied_relation_keeps_the_collation() {
         sqlx::query_scalar("WITH c AS (SELECT id, slang FROM ar) SELECT id FROM c WHERE slang = 'SEED1-SLANG-ЩЕ'").fetch_all(&pool).await.unwrap();
     assert_eq!(cte, [2]);
 }
+
+/// A case-insensitive column written from an expression of quoted strings
+/// (`'Ab' || 'C'`) keys the expression's value: the key companion's fast
+/// path once took any value that began and ended with a quote for one
+/// string, and keyed the text `Ab' || 'C`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_is_made_from_an_expressions_value() {
+    let (_server, pool) = server().await;
+    exec(&pool, "CREATE TABLE ke (id int PRIMARY KEY, name text COLLATE rdb_ci)").await;
+    exec(&pool, "INSERT INTO ke VALUES (1, 'Ab' || 'C'), (2, 'It''S'), (3, 'x' || 'Y' || 'z')").await;
+    assert_eq!(ids(&pool, "SELECT id FROM ke WHERE name = 'abc'").await, vec![1]);
+    assert_eq!(ids(&pool, "SELECT id FROM ke WHERE name = 'IT''s'").await, vec![2]);
+    assert_eq!(ids(&pool, "SELECT id FROM ke WHERE name = 'XYZ'").await, vec![3]);
+    exec(&pool, "UPDATE ke SET name = 'Q' || 'r' WHERE id = 1").await;
+    assert_eq!(ids(&pool, "SELECT id FROM ke WHERE name = 'qR'").await, vec![1]);
+}
