@@ -680,6 +680,9 @@ pub(crate) struct Cx<'a> {
     /// The one table an INFORMATION_SCHEMA view is read for (`WHERE
     /// TABLE_NAME = @t`, ANDed): only its rows are built.
     catalog_table: Option<String>,
+    /// The FROM relations of the SELECT whose list is being rewritten
+    /// (`from_relations`): what types an aggregate's column argument.
+    relations: Vec<(String, Option<String>)>,
 }
 
 impl<'a> Cx<'a> {
@@ -695,6 +698,7 @@ impl<'a> Cx<'a> {
             project_ticks: false,
             tick_outputs: Vec::new(),
             catalog_table: None,
+            relations: Vec::new(),
         }
     }
 }
@@ -1431,7 +1435,10 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
     Ok(Some(match upper.as_str() {
         // SQL Server's COUNT is an int; COUNT_BIG is the bigint. A window
         // (COUNT(*) OVER …) is left as it is: the cast cannot sit between.
-        "COUNT" if !cx.window_next && !cx.past_select_list => {
+        // `COUNT(DISTINCT x)` is left a bigint (the engine refuses a
+        // DISTINCT aggregate inside a cast), and the session sends it as
+        // SQL Server's int (`Forward::ticks`, `int`): see `read_ticks_whole`.
+        "COUNT" if !cx.window_next && !cx.past_select_list && !kw(inner, 0, "DISTINCT") => {
             let mut inner_tokens = vec![Token::raw("count"), Token::op("(")];
             inner_tokens[1].space = false;
             inner_tokens.extend(rewrite_expr(inner.to_vec(), cx)?);
@@ -1439,6 +1446,22 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
             let mut out = wrap(inner_tokens);
             out.push(Token::raw("::integer"));
             wrap(out)
+        }
+        // SQL Server's SUM of an int, smallint or tinyint is an int, and its
+        // AVG one too, cut toward zero (AVG of 1 and 2 is 1): the engine's
+        // are a bigint and an exact average, which EF Core's GetInt32
+        // refuses or which answered 1.5.
+        // A bigint's are a bigint (the engine's SUM of one is a numeric).
+        "SUM" | "AVG" if !cx.window_next && integer_column_type(inner, cx).is_some() => {
+            let ty = integer_column_type(inner, cx).unwrap_or("integer");
+            let mut call = vec![Token::raw(upper.to_lowercase()), Token::op("(")];
+            call[1].space = false;
+            call.extend(rewrite_expr(inner.to_vec(), cx)?);
+            call.push(Token::op(")"));
+            let mut out = vec![Token::raw(if upper == "AVG" { "(trunc(" } else { "((" })];
+            out.extend(call);
+            out.push(Token::raw(format!("))::{ty}")));
+            out
         }
         "COUNT_BIG" => {
             let mut out = vec![Token::raw("count"), Token::op("(")];
@@ -2050,7 +2073,11 @@ fn catalog_view_stored(schema: &str, view: &str, cx: &Cx) -> Result<Option<Strin
                     (true, Some(crate::core::rql::type_modifier::TextTypmod::Bpchar(n))) if n > 0 => format!("nchar({n})"),
                     _ => tsql_type_name(&f.db_type, f.without_time_zone, f.json_text),
                 };
-                (f.name.clone(), ty, !pk, default, identity)
+                // Nullable when the column keeps a NULL flag (`__null_x`):
+                // every column but the key read YES, NOT NULL ones too.
+                let nullable = !pk
+                    && schema.fields.iter().any(|g| !g.is_deleted && g.name == crate::core::rql::nullable::flag_column_name(&f.name));
+                (f.name.clone(), ty, nullable, default, identity)
             })
             .collect()
     };
@@ -2985,10 +3012,18 @@ fn rewrite_select_inner(
     }
     let saved = std::mem::take(&mut cx.aliases);
     let item_relations = from_relations(&tokens, end);
+    let outer_relations = std::mem::replace(&mut cx.relations, item_relations.clone());
     // Each item's rewritten text and alias: an ORDER BY of the same
     // expression is sent as the alias, which the engine resolves where it
     // would refuse a grouped expression it does not see in the list.
     let mut item_texts: Vec<(String, String)> = Vec::new();
+    // A grouped query sorts by its output, where even a column is named by
+    // its alias; any other sorts by the column itself.
+    let grouped = find_top(&tokens, end, &["GROUP"]).is_some()
+        || tokens[..end].iter().enumerate().any(|(k, t)| {
+            t.upper().is_some_and(|w| matches!(w.as_str(), "COUNT" | "COUNT_BIG" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG"))
+                && tokens.get(k + 1).is_some_and(|p| p.is_op("("))
+        });
     for (k, (expr, name)) in prepared.into_iter().enumerate() {
         if k > 0 {
             out.push(Token::op(","));
@@ -2998,12 +3033,44 @@ fn rewrite_select_inner(
         let int_literal = matches!(&expr[..], [t] if matches!(&t.tok, Tok::Num(n)
             if n.parse::<i32>().is_ok()));
         let env = cx.env;
+        // A decimal expression typed as SQL Server types it (not by its
+        // values): `COALESCE(price, 0.0)` keeps the column's scale.
+        let plain_column = is_column_reference(&expr);
+        let typed = if plain_column { None } else { decimal_type(&expr, cx) };
+        // A select item `COUNT(DISTINCT x)`: an int, as SQL Server's COUNT,
+        // sent so by the session (its value is the engine's bigint).
+        let count_distinct = !cx.past_select_list
+            && expr.len() > 3
+            && expr[0].is_word("COUNT")
+            && expr[1].is_op("(")
+            && kw(&expr, 2, "DISTINCT")
+            && matching_paren(&expr, 1) == Some(expr.len() - 1);
+        let name = match (count_distinct, name) {
+            (true, n) => {
+                let shown = match n {
+                    Some(n) if n != BLANK_NAME => n,
+                    _ => format!("{BLANK_NAME}{}", cx.tick_outputs.len()),
+                };
+                cx.tick_outputs.push((shown.clone(), "int"));
+                Some(shown)
+            }
+            (false, n) => n,
+        };
         let mut rewritten = rewrite_expr(sql_server_null_order(expr, &|key: &[Token]| key_not_null(key, &item_relations, env)), cx)?;
+        if let Some((p, sc)) = typed {
+            let mut cast = vec![Token::raw("CAST(")];
+            cast.extend(rewritten);
+            cast.push(Token::raw(format!("AS numeric({p},{sc}))")));
+            rewritten = cast;
+        }
         if int_literal {
             let n = render_text(&rewritten);
             rewritten = vec![Token::raw(format!("CAST({n} AS integer)"))];
         }
-        if let Some(n) = name.as_ref().filter(|n| *n != BLANK_NAME) {
+        // An expression only: a column is sorted by as itself. Sent as the
+        // output's alias, `ORDER BY [d].[Id]` over a join lost the column's
+        // collation (a uniqueidentifier sorted by its bytes there).
+        if let Some(n) = name.as_ref().filter(|n| *n != BLANK_NAME && (!plain_column || grouped)) {
             item_texts.push((render_text(&rewritten), n.clone()));
         }
         out.extend(rewritten);
@@ -3013,6 +3080,7 @@ fn rewrite_select_inner(
         }
     }
     cx.aliases = saved;
+    cx.relations = outer_relations;
     let mut rest: Vec<Token> = tokens[end..].to_vec();
     // Comparisons and sorts over a column keeping a 100 ns digit read it.
     let relations = from_relations(&rest, 0);
@@ -3493,6 +3561,244 @@ fn sql_server_null_order(tokens: Vec<Token>, not_null: &dyn Fn(&[Token]) -> bool
         i = j;
     }
     out
+}
+
+/// SQL Server's decimal result type of an expression over decimals, by its
+/// rules: COALESCE / ISNULL / CASE / IIF take precision max(s) + max(p - s)
+/// and scale max(s); `+` and `-` one digit more; `*` p1 + p2 + 1 and
+/// s1 + s2; SUM (38, s); AVG (38, max(s, 6)); CAST its declared type; a
+/// literal its own digits (`0.0` is numeric(1,1)); a column its declared
+/// type; integers as decimals of their width. Past 38 digits the scale
+/// gives way, not below 6. `None` for what this does not type (division,
+/// floats, text, an undeclared numeric), and for what has no fraction.
+/// The engine types `COALESCE(c, 0.0)` by its values: a decimal(18,6) 0
+/// went to the client as 0.0 where SQL Server sends 0.000000.
+fn decimal_type(expr: &[Token], cx: &Cx) -> Option<(u32, u32)> {
+    let t = decimal_type_of(expr, cx)?;
+    (t.1 > 0 || expr.iter().any(|x| x.is_word("CAST") || x.is_word("CONVERT"))).then_some(t)
+}
+
+fn decimal_type_of(expr: &[Token], cx: &Cx) -> Option<(u32, u32)> {
+    use crate::core::db_type::DbType as D;
+    let fit = |p: u32, s: u32| -> (u32, u32) {
+        if p <= 38 {
+            (p.max(1), s)
+        } else {
+            let int = p - s;
+            (38, (38u32.saturating_sub(int)).max(s.min(6)).min(s))
+        }
+    };
+    let union = |a: (u32, u32), b: (u32, u32)| -> (u32, u32) {
+        let s = a.1.max(b.1);
+        fit(s + (a.0 - a.1).max(b.0 - b.1), s)
+    };
+    // Parentheses around the whole.
+    if expr.first().is_some_and(|t| t.is_op("(")) && matching_paren(expr, 0) == Some(expr.len() - 1) {
+        return decimal_type_of(&expr[1..expr.len() - 1], cx);
+    }
+    // `a + b`, `a - b`, `a * b` at the top level (the last one binds
+    // loosest; a lone leading sign is the operand's).
+    let mut depth = 0i32;
+    let mut split: Option<(usize, String)> = None;
+    for (k, t) in expr.iter().enumerate() {
+        if t.is_op("(") {
+            depth += 1;
+        } else if t.is_op(")") {
+            depth -= 1;
+        } else if depth == 0 && k > 0 {
+            if let Tok::Op(o) = &t.tok {
+                if matches!(o.as_str(), "+" | "-") && !matches!(&expr[k - 1].tok, Tok::Op(_)) {
+                    split = Some((k, o.clone()));
+                } else if matches!(o.as_str(), "*" | "/" | "%") && split.as_ref().is_none_or(|(_, so)| !matches!(so.as_str(), "+" | "-")) {
+                    split = Some((k, o.clone()));
+                }
+            }
+        }
+    }
+    if let Some((k, op)) = split {
+        let (a, b) = (decimal_type_of(&expr[..k], cx)?, decimal_type_of(&expr[k + 1..], cx)?);
+        return match op.as_str() {
+            "+" | "-" => {
+                let s = a.1.max(b.1);
+                Some(fit(s + (a.0 - a.1).max(b.0 - b.1) + 1, s))
+            }
+            "*" => Some(fit(a.0 + b.0 + 1, a.1 + b.1)),
+            _ => None,
+        };
+    }
+    if let [sign, rest @ ..] = expr {
+        if sign.is_op("-") || sign.is_op("+") {
+            return decimal_type_of(rest, cx);
+        }
+    }
+    match expr {
+        [t] => match &t.tok {
+            Tok::Num(n) => {
+                let n = n.trim_start_matches(['+', '-']);
+                if n.contains(['e', 'E']) {
+                    return None;
+                }
+                let (int, frac) = n.split_once('.').unwrap_or((n, ""));
+                let int = int.trim_start_matches('0');
+                let s = frac.len() as u32;
+                Some(fit(((int.len() as u32) + s).max(s).max(1), s))
+            }
+            Tok::Word(w) if w.eq_ignore_ascii_case("NULL") => None,
+            _ => column_decimal_type(expr, cx),
+        },
+        [_, d, _] if d.is_op(".") => column_decimal_type(expr, cx),
+        [name, open, ..] if open.is_op("(") && matching_paren(expr, 1) == Some(expr.len() - 1) => {
+            let f = name.upper()?;
+            let inner = &expr[2..expr.len() - 1];
+            match f.as_str() {
+                "COALESCE" | "ISNULL" => {
+                    let mut acc: Option<(u32, u32)> = None;
+                    for a in split_commas(inner) {
+                        if a.len() == 1 && a[0].is_word("NULL") {
+                            continue;
+                        }
+                        let t = decimal_type_of(&a, cx)?;
+                        acc = Some(acc.map_or(t, |x| union(x, t)));
+                    }
+                    acc
+                }
+                "IIF" => {
+                    let args = split_commas(inner);
+                    let [_, a, b] = args.as_slice() else { return None };
+                    Some(union(decimal_type_of(a, cx)?, decimal_type_of(b, cx)?))
+                }
+                // Over an integer column an int (`integer_column`), not a
+                // decimal.
+                "SUM" | "AVG" if integer_column(inner, cx) => None,
+                "SUM" => decimal_type_of(inner, cx).map(|(_, s)| (38, s)),
+                "AVG" => decimal_type_of(inner, cx).map(|(_, s)| (38, s.max(6))),
+                "MIN" | "MAX" | "ABS" => decimal_type_of(inner, cx),
+                "CAST" => {
+                    let at = find_top(inner, 0, &["AS"])?;
+                    declared_decimal(&inner[at + 1..])
+                }
+                "CONVERT" => declared_decimal(split_commas(inner).first()?),
+                _ => None,
+            }
+        }
+        [case, ..] if case.is_word("CASE") && expr.last().is_some_and(|t| t.is_word("END")) => {
+            // Each THEN's and the ELSE's value.
+            let mut acc: Option<(u32, u32)> = None;
+            let mut depth = 0i32;
+            let mut start: Option<usize> = None;
+            for (k, t) in expr.iter().enumerate() {
+                if t.is_op("(") {
+                    depth += 1;
+                } else if t.is_op(")") {
+                    depth -= 1;
+                }
+                if depth != 0 {
+                    continue;
+                }
+                let ends = t.is_word("WHEN") || t.is_word("ELSE") || t.is_word("END");
+                if let (true, Some(st)) = (ends, start) {
+                    let value = &expr[st..k];
+                    if !(value.len() == 1 && value[0].is_word("NULL")) {
+                        let v = decimal_type_of(value, cx)?;
+                        acc = Some(acc.map_or(v, |x| union(x, v)));
+                    }
+                    start = None;
+                }
+                if t.is_word("THEN") || t.is_word("ELSE") {
+                    start = Some(k + 1);
+                }
+            }
+            acc
+        }
+        _ => None,
+    }
+    .filter(|_| true)
+    .or_else(|| {
+        let _ = D::DECIMAL;
+        None
+    })
+}
+
+/// A written decimal type (`decimal(18,6)`, `numeric(10)`, `money`): its
+/// precision and scale.
+fn declared_decimal(ty: &[Token]) -> Option<(u32, u32)> {
+    let name = ty.first()?.upper()?;
+    let args: Vec<u32> = if ty.get(1).is_some_and(|t| t.is_op("(")) {
+        let close = matching_paren(ty, 1)?;
+        split_commas(&ty[2..close])
+            .iter()
+            .map(|a| render_text(a).trim().parse::<u32>().ok())
+            .collect::<Option<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    match name.as_str() {
+        "DECIMAL" | "NUMERIC" | "DEC" => Some((*args.first().unwrap_or(&18), *args.get(1).unwrap_or(&0))),
+        "MONEY" => Some((19, 4)),
+        "SMALLMONEY" => Some((10, 4)),
+        _ => None,
+    }
+}
+
+/// A column operand's decimal type among the current SELECT's relations:
+/// a declared numeric's, or an integer's as a decimal of its width.
+fn column_decimal_type(arg: &[Token], cx: &Cx) -> Option<(u32, u32)> {
+    use crate::core::db_type::DbType as D;
+    let (qualifier, name) = match arg {
+        [c] => (None, c.ident()),
+        [q, d, c] if d.is_op(".") => (q.ident().map(str::to_lowercase), c.ident()),
+        _ => return None,
+    };
+    let name = name?.to_lowercase();
+    let mut found = cx.relations.iter().filter(|(l, _)| qualifier.as_ref().is_none_or(|q| q == l)).filter_map(|(_, t)| {
+        let view = cx.env.database().schema_view(&name_key(t.as_deref()?))?;
+        let schema = view.schema();
+        let f = schema.fields.iter().find(|f| !f.is_deleted && f.name == name)?;
+        Some(match f.db_type {
+            D::DECIMAL => {
+                let p = crate::core::rql::type_modifier::precision_of(&name, &schema.type_modifiers)?;
+                (p, f.scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE))
+            }
+            D::I8 | D::U8 => (3, 0),
+            D::I16 => (5, 0),
+            D::I32 | D::U16 => (10, 0),
+            D::I64 | D::U32 => (19, 0),
+            _ => return None,
+        })
+    });
+    match (found.next(), found.next()) {
+        (Some(t), None) => Some(t),
+        _ => None,
+    }
+}
+
+/// Whether `arg` (an aggregate's argument) is one column of the current
+/// SELECT's relations (`Cx::relations`) of an integer type SQL Server sums
+/// and averages as an int: tinyint, smallint, int.
+fn integer_column(arg: &[Token], cx: &Cx) -> bool {
+    integer_column_type(arg, cx).is_some()
+}
+
+/// The SQL Server result type of SUM / AVG over `arg` when it is one
+/// integer column: `integer` for tinyint, smallint and int, `bigint` for a
+/// bigint.
+fn integer_column_type(arg: &[Token], cx: &Cx) -> Option<&'static str> {
+    use crate::core::db_type::DbType as D;
+    let (qualifier, name) = match arg {
+        [c] => (None, c.ident()),
+        [q, d, c] if d.is_op(".") => (q.ident().map(str::to_lowercase), c.ident()),
+        _ => return None,
+    };
+    let name = name?.to_lowercase();
+    let mut found = cx.relations.iter().filter(|(l, _)| qualifier.as_ref().is_none_or(|q| q == l)).filter_map(|(_, t)| {
+        let view = cx.env.database().schema_view(&name_key(t.as_deref()?))?;
+        view.schema().fields.iter().find(|f| !f.is_deleted && f.name == name).map(|f| f.db_type.clone())
+    });
+    match (found.next(), found.next()) {
+        (Some(D::I8 | D::I16 | D::I32 | D::U8 | D::U16), None) => Some("integer"),
+        (Some(D::I64 | D::U32), None) => Some("bigint"),
+        _ => None,
+    }
 }
 
 /// The relations a SELECT's FROM clause (from `at`, its FROM) reads: each
@@ -6231,7 +6537,7 @@ mod tests {
                 &e,
                 "SELECT TOP (5) [Name] FROM [dbo].[Users] WITH (NOLOCK) ORDER BY [Name]"
             ),
-            r#"SELECT name AS "Name" FROM users ORDER BY "Name" NULLS FIRST LIMIT 5"#
+            r#"SELECT name AS "Name" FROM users ORDER BY name NULLS FIRST LIMIT 5"#
         );
         assert_eq!(
             tr(
@@ -6375,7 +6681,7 @@ mod tests {
         let e = env();
         assert_eq!(
             tr(&e, "SELECT [b].[Url], [p0].[Title] FROM [Blogs] AS [b] OUTER APPLY (SELECT TOP(1) [p].[Title] FROM [Posts] AS [p] WHERE [b].[Id] = [p].[BlogId] ORDER BY [p].[Title]) AS [p0] ORDER BY [b].[Url]"),
-            r#"SELECT b.url AS "Url", p0.title AS "Title" FROM blogs AS b LEFT JOIN LATERAL (SELECT p.title FROM posts AS p WHERE b.id = p.blogid ORDER BY p.title NULLS FIRST LIMIT 1) AS p0 ON 1 = 1 ORDER BY "Url" NULLS FIRST"#
+            r#"SELECT b.url AS "Url", p0.title AS "Title" FROM blogs AS b LEFT JOIN LATERAL (SELECT p.title FROM posts AS p WHERE b.id = p.blogid ORDER BY p.title NULLS FIRST LIMIT 1) AS p0 ON 1 = 1 ORDER BY b.url NULLS FIRST"#
         );
         assert_eq!(
             tr(&e, "SELECT b.id, x.n FROM b CROSS APPLY (SELECT TOP 2 p.n FROM p WHERE p.b = b.id) x"),

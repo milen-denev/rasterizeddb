@@ -1878,6 +1878,21 @@ async fn tiberius_guid_order_grouped() {
     let g = |r: &[tiberius::Row]| -> Vec<Option<String>> { r.iter().map(|r| r.get::<uuid::Uuid, _>(0).map(|u| u.to_string())).collect() };
     assert_eq!(g(&r[0]), [None, Some(b.to_string()), Some(a.to_string())]);
     assert_eq!(g(&r[1]), [Some(a.to_string()), Some(b.to_string()), None]);
+    // Over a join, grouped and DISTINCT: refused before, as their output
+    // sorted by the bytes.
+    batch(&mut c, "CREATE TABLE [Line] ([Id] int PRIMARY KEY, [LId] int NOT NULL, [Qty] int NOT NULL); INSERT INTO [Line] VALUES (1, 1, 5), (2, 2, 7), (3, 3, 1), (4, 1, 2)")
+        .await
+        .unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT [l].[G], SUM([x].[Qty]) FROM [L] AS [l] INNER JOIN [Line] AS [x] ON [l].[Id] = [x].[LId] GROUP BY [l].[G] ORDER BY [l].[G]; \
+         SELECT DISTINCT [l].[G] FROM [L] AS [l] INNER JOIN [Line] AS [x] ON [l].[Id] = [x].[LId] ORDER BY [l].[G] DESC",
+    )
+    .await
+    .unwrap();
+    let grouped: Vec<(String, i32)> = r[0].iter().map(|r| (r.get::<uuid::Uuid, _>(0).unwrap().to_string(), r.get::<i32, _>(1).unwrap())).collect();
+    assert_eq!(grouped, [(b.to_string(), 7), (a.to_string(), 8)]);
+    assert_eq!(g(&r[1]), [Some(a.to_string()), Some(b.to_string())]);
 }
 
 /// NULLs sort first ascending and last descending, as SQL Server's (NULL is
@@ -1952,4 +1967,153 @@ async fn tiberius_catalogue_lookup_for_one_table() {
     assert_eq!(int(&r[0]), [6]);
     assert_eq!(int(&r[1]), [60]);
     assert_eq!(int(&r[2]), [60]);
+}
+
+/// SUM and AVG of an int column are ints, as SQL Server's (AVG cut toward
+/// zero): the engine answered a bigint, which EF Core's GetInt32 refuses,
+/// and an exact average (3.5 where SQL Server says 3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_int_sum_and_avg() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [Q] ([Id] int PRIMARY KEY, [G] int NOT NULL, [N] int NOT NULL, [S] smallint NOT NULL, [B] bigint NOT NULL, [D] decimal(10,2) NOT NULL); \
+         INSERT INTO [Q] VALUES (1, 1, 5, 5, 5, 1.25), (2, 1, 2, 2, 2, 2.50), (3, 2, -3, -3, -3, 0), (4, 2, -2, -2, -2, 0)",
+    )
+    .await
+    .unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT [G], SUM([N]), AVG([N]), SUM([S]), AVG([S]) FROM [Q] GROUP BY [G] ORDER BY [G]; \
+         SELECT SUM([B]), SUM([D]) FROM [Q]",
+    )
+    .await
+    .unwrap();
+    let row = |k: usize| -> (i32, i32, i32, i32) {
+        let r = &r[0][k];
+        (r.get::<i32, _>(1).unwrap(), r.get::<i32, _>(2).unwrap(), r.get::<i32, _>(3).unwrap(), r.get::<i32, _>(4).unwrap())
+    };
+    assert_eq!(row(0), (7, 3, 7, 3));
+    // Toward zero: -2.5 is -2.
+    assert_eq!(row(1), (-5, -2, -5, -2));
+    // A bigint's SUM stays a bigint, a decimal's a decimal.
+    assert_eq!(r[1][0].get::<i64, _>(0), Some(2));
+    assert_eq!(r[1][0].get::<rust_decimal::Decimal, _>(1).map(|d| d.to_string()), Some("3.75".to_string()));
+}
+
+/// A decimal expression has SQL Server's type, not one its values suggest:
+/// EF Core's `COALESCE([WholePrice], 0.0)` over a decimal(19,6) column,
+/// sent with typed parameters, came back with scale 1 (0.0 for 0.000000).
+/// And `COUNT(DISTINCT x)` is an int: it was refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_decimal_types_and_count_distinct() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [Pr] ([Id] int PRIMARY KEY, [ProductId] uniqueidentifier NOT NULL, [PriceType] int NOT NULL, \
+         [WholePrice] decimal(19,6) NULL, [Qty] int NOT NULL); \
+         INSERT INTO [Pr] VALUES (1, '3e84a183-b6c9-41da-951f-c2d3bb610290', 100, 0, -3), \
+         (2, '3e84a183-b6c9-41da-951f-c2d3bb610290', 200, 12.5, 4), (3, '00000000-0000-0000-0000-000000000001', 100, NULL, 2)",
+    )
+    .await
+    .unwrap();
+    let product = uuid::Uuid::parse_str("3e84a183-b6c9-41da-951f-c2d3bb610290").unwrap();
+    let r = c
+        .query(
+            "SELECT TOP(1) COALESCE([d].[WholePrice], 0.0), [d].[WholePrice] + 1, [d].[WholePrice] * 2, SUM([d].[WholePrice]) OVER () \
+             FROM [Pr] AS [d] WHERE [d].[ProductId] = @P1 AND [d].[PriceType] = @P2",
+            &[&product, &100i32],
+        )
+        .await
+        .unwrap()
+        .into_first_result()
+        .await
+        .unwrap();
+    let dec = |k: usize| r[0].get::<rust_decimal::Decimal, _>(k).map(|d| d.to_string());
+    assert_eq!(dec(0), Some("0.000000".to_string()));
+    assert_eq!(dec(1), Some("1.000000".to_string()));
+    // SQL Server's product type: p1 + p2 + 1 digits, s1 + s2 places (19,6 * 1,0).
+    assert_eq!(dec(2), Some("0.000000".to_string()));
+    let r = batch(
+        &mut c,
+        "SELECT COALESCE([WholePrice], 0.0) FROM [Pr] WHERE [Id] = 3; \
+         SELECT COUNT(DISTINCT [ProductId]), COUNT(DISTINCT [PriceType]) AS [Types] FROM [Pr]; \
+         SELECT SUM([Qty]), MIN([Qty]) FROM [Pr]",
+    )
+    .await
+    .unwrap();
+    assert_eq!(r[0][0].get::<rust_decimal::Decimal, _>(0).map(|d| d.to_string()), Some("0.000000".to_string()));
+    assert_eq!(r[1][0].get::<i32, _>(0), Some(2));
+    assert_eq!(r[1][0].get::<i32, _>(1), Some(2));
+    assert_eq!(r[1][0].columns()[0].name(), "");
+    assert_eq!(r[1][0].columns()[1].name(), "Types");
+    // A negative literal in VALUES (written `- 3`, refused).
+    assert_eq!(r[2][0].get::<i32, _>(0), Some(3));
+    assert_eq!(r[2][0].get::<i32, _>(1), Some(-3));
+}
+
+/// Rows tied on a first key are ordered by a uniqueidentifier second key in
+/// SQL Server's order, also through a LEFT JOIN and with the first key also
+/// selected through a CAST (the product page's variant list differed from
+/// Azure's in 11 places).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_guid_tiebreak_through_a_left_join() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    // In SQL Server's order: b < cc < a < d.
+    let (a, b, cc, d) = (
+        "00000000-0000-0000-0000-000000000001",
+        "01000000-0000-0000-0000-000000000000",
+        "00000000-0000-0000-0001-000000000000",
+        "00000000-0000-0000-0000-010000000000",
+    );
+    batch(
+        &mut c,
+        &format!(
+            "CREATE TABLE [VT] ([Id] uniqueidentifier NOT NULL PRIMARY KEY, [PublicName] nvarchar(20) NULL); \
+             CREATE TABLE [V] ([Id] uniqueidentifier NOT NULL, [VariantTypeId] uniqueidentifier NULL, [ListingOrder] tinyint NOT NULL, \
+             [Hidden] bit NOT NULL, [N] int NOT NULL, CONSTRAINT [PK_V] PRIMARY KEY ([Id])); \
+             INSERT INTO [VT] VALUES ('{a}', N'Colour'); \
+             INSERT INTO [V] VALUES ('{a}', '{a}', 1, 0, 1), ('{b}', NULL, 1, 0, 2), ('{cc}', '{a}', 1, 0, 3), ('{d}', NULL, 0, 0, 4)"
+        ),
+    )
+    .await
+    .unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT [d0].[PublicName] AS [TypeName], CAST([d].[ListingOrder] AS int) AS [VariantListingOrder], [d].[N] \
+         FROM [V] AS [d] LEFT JOIN [VT] AS [d0] ON [d].[VariantTypeId] = [d0].[Id] \
+         WHERE [d].[Hidden] = CAST(0 AS bit) ORDER BY [d].[ListingOrder], [d].[Id]",
+    )
+    .await
+    .unwrap();
+    let ns: Vec<i32> = r[0].iter().map(|r| r.get::<i32, _>(2).unwrap()).collect();
+    // ListingOrder 0 first (d), then the three tied at 1 by Id: b, cc, a.
+    assert_eq!(ns, [4, 2, 3, 1]);
+    // With the sort key also selected (`[d].[Id]` in the list): the ORDER BY
+    // went out as the output's name, which the join's sort could not trace
+    // to the column's order.
+    let r = batch(
+        &mut c,
+        "SELECT CAST([d].[ListingOrder] AS int) AS [VariantListingOrder], [d].[Id], [d].[N] \
+         FROM [V] AS [d] LEFT JOIN [VT] AS [d0] ON [d].[VariantTypeId] = [d0].[Id] ORDER BY [d].[ListingOrder], [d].[Id]",
+    )
+    .await
+    .unwrap();
+    assert_eq!(r[0].iter().map(|r| r.get::<i32, _>(2).unwrap()).collect::<Vec<_>>(), [4, 2, 3, 1]);
+    // The same filtered to the tied rows, as the product page reads them.
+    let r = batch(
+        &mut c,
+        "SELECT [d].[N] FROM [V] AS [d] LEFT JOIN [VT] AS [d0] ON [d].[VariantTypeId] = [d0].[Id] \
+         WHERE [d].[ListingOrder] = 1 ORDER BY [d].[ListingOrder], [d].[Id]; \
+         SELECT IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = N'V' AND COLUMN_NAME = N'ListingOrder'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(r[0].iter().map(|r| r.get::<i32, _>(0).unwrap()).collect::<Vec<_>>(), [2, 3, 1]);
+    // NOT NULL, reported as such (every column but the key read YES).
+    assert_eq!(texts(&r[1]), [Some("NO".to_string())]);
+    assert!(batch(&mut c, "INSERT INTO [V] ([Id], [ListingOrder], [Hidden], [N]) VALUES (NEWID(), NULL, 0, 9)").await.is_err());
 }

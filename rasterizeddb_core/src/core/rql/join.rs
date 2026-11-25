@@ -3761,9 +3761,12 @@ pub fn plan(
                 let (expr, _) = split_expr_alias(item.trim());
                 is_column_reference(expr)
             })
-            && split_top_level(list)
+            && (split_top_level(list)
                 .iter()
                 .any(|item| columns.ci(split_expr_alias(item.trim()).0).is_some_and(|(_, s)| !s.orders_only()))
+                // Sorted by a uuid in SQL Server's order: the grouping's
+                // output sorts by its key (`min`, marked by the order).
+                || order_by.iter().any(|t| columns.ci(t.token.trim()).is_some_and(|(_, s)| s.orders_only())))
         {
             ci_group = split_top_level(list)
                 .iter()
@@ -3782,16 +3785,6 @@ pub fn plan(
             || split_top_level(select_list).iter().any(|item| {
                 !crate::core::rql::lexer_query::find_aggregate_calls(split_expr_alias(item.trim()).0).is_empty()
             });
-        // A grouped join's output sorts by the values: a `uuid` in SQL
-        // Server's order would sort by its bytes, refused instead.
-        if grouped {
-            if let Some(term) = order_by.iter().find(|t| columns.ci(t.token.trim()).is_some_and(|(_, s)| s.orders_only())) {
-                return Err(format!(
-                    "ORDER BY \"{}\", a uniqueidentifier in SQL Server's order, in a grouped or DISTINCT join is not supported yet",
-                    term.token.trim()
-                ));
-            }
-        }
         if !grouped {
             let mut keyed = Vec::with_capacity(order_by.len());
             for term in order_by {
@@ -5913,7 +5906,9 @@ fn build_aggregate_stage(
             let (rel, field) = resolve(expr)?;
             let label = alias.unwrap_or_else(|| field.name.clone());
             if ci_keys.contains(&(rel, field.write_order)) {
-                let strength = crate::core::rql::collation::of(&field.name, &schemas[rel]);
+                // Its order's view: a uuid in SQL Server's order is binary
+                // to equality, and its groups sorted by their bytes.
+                let strength = crate::core::rql::collation::order_of(&field.name, &schemas[rel]);
                 let arg = positional(rel, field, items);
                 fold_items.push(SelectItem::Aggregate {
                     distinct: false,
