@@ -4,10 +4,12 @@
 
 ### Silent wrong answers fixed
 
+- `ALTER TABLE … ADD COLUMN … COMPRESSION zstd(…)` was accepted and ignored: the column stored its values uncompressed. A `DEFAULT` written before the clause also took it into its expression. Both now take effect, on an empty table and on one with rows.
 - A derived table, a CTE, or the outer copy a correlated subquery reads, made from a case-insensitive column, compared that column's bytes: `SELECT (SELECT …) FROM t d WHERE d.slang = 'SEED0-SLANG'` dropped the row holding `'Seed0-Slang'`, with no error.
 
 ### Statements that failed, now answered
 
+- At READ COMMITTED, three or more transactions updating one row failed with 40001 ("could not serialize access due to concurrent update") when the first held the row for more than 1.5 s: a waiter that lost the race after the holder committed gave up instead of waiting its turn. Every writer now waits and applies, as in PostgreSQL; REPEATABLE READ still refuses.
 - A correlated subquery over an outer query that keeps no row failed with "Column '__lat_k1' not found" instead of returning no rows.
 - `x LIKE p ESCAPE e` over an expression (`CAST(c AS text)`, `upper(c)`) was a syntax error.
 - A correlated subquery reading two outer relations that an `INNER JOIN` keys together on one non-text column was refused.
@@ -28,6 +30,7 @@
 
 ### New features
 
+- rdb_studio: compression. The column list tags compressed columns, the table pane summarises what compression asks and achieves (raw against stored bytes), the column dialogs take a compression method, and a table's row compression and `RECOMPRESS` are a button away.
 - SQL Server front end: EF Core 10 runs unchanged, its Identity schema, migrations and `__EFMigrationsLock` included. Added: `CROSS/OUTER APPLY`, `TOP` in a derived table, a unique index filtered by `key IS NOT NULL`, `sp_getapplock`/`sp_releaseapplock`/`APPLOCK_TEST`, `sp_rename … 'INDEX'`, `ALTER DATABASE … SET SINGLE_USER`, and bracketed table names holding dots (`[dbo].[DenevCloud.ERP.Colors]`). Database names are matched without case, and a pooled connection's reset goes back to the login's database.
 - Case-insensitive text columns (the engine's `rdb_ci` collation) group, deduplicate, join, sort in windows, and take `min`/`max`, foreign keys, `ALTER TABLE ADD COLUMN` and `ALTER COLUMN TYPE` by key.
 - Opt-in zstd compression (`storage_compression`, a default feature): a column takes `COMPRESSION zstd(n)` and a table `WITH (row_compression = …)`, levels 1–22. Nothing is compressed unless asked, and fixed-width values stay raw. `ALTER TABLE … RECOMPRESS` and `VACUUM (FULL, RECOMPRESS)` rewrite rows and train dictionaries. The client's ORM takes `#[rdb(compression)]` and `#[rdb(row_compression)]`. See `docs/compression.md`.

@@ -381,6 +381,9 @@ pub enum Modal {
     Confirm { title: String, body: String, statement: String, refresh: Refresh },
     /// Renaming a column, changing its type, or whether it takes NULL.
     EditColumn { table: String, edit: ColumnEdit, error: Option<String> },
+    /// A table's row compression (RasterizedDB): every row's variable-width
+    /// values stored as one zstd frame.
+    RowCompression { table: String, edit: RowCompressionEdit, error: Option<String> },
     CreateRole {
         name: String,
         password: String,
@@ -415,10 +418,16 @@ pub struct ColumnEdit {
     /// included.
     pub data_type: String,
     pub nullable: bool,
+    /// What `SHOW TABLE STATS` says the column is compressed with (`zstd(9)`),
+    /// empty for none or when the server does not say.
+    pub original_compression: String,
+    pub compression: String,
 }
 
 impl ColumnEdit {
-    pub fn of(column: &ColumnInfo) -> Self {
+    /// `compression`: the column's current method, as `SHOW TABLE STATS`'
+    /// `compressed_columns` names it, or empty.
+    pub fn of(column: &ColumnInfo, compression: &str) -> Self {
         ColumnEdit {
             original: column.name.clone(),
             original_type: column.data_type.clone(),
@@ -426,6 +435,8 @@ impl ColumnEdit {
             name: column.name.clone(),
             data_type: column.data_type.clone(),
             nullable: column.nullable,
+            original_compression: compression.to_string(),
+            compression: compression.to_string(),
         }
     }
 
@@ -459,6 +470,18 @@ impl ColumnEdit {
                 if self.nullable { "DROP" } else { "SET" }
             ));
         }
+        // New values only, as in PostgreSQL: rows already written keep what
+        // they have until the table is recompressed.
+        if !self.compression.trim().eq_ignore_ascii_case(self.original_compression.trim()) {
+            let method = if self.compression.trim().is_empty() {
+                "default".to_string()
+            } else {
+                compression_method(&self.compression)?
+            };
+            statements.push(format!(
+                "ALTER TABLE {table} ALTER COLUMN {column} SET COMPRESSION {method}"
+            ));
+        }
         if name != self.original {
             statements.push(format!(
                 "ALTER TABLE {table} RENAME COLUMN {column} TO {}",
@@ -489,6 +512,8 @@ pub struct NewColumn {
     pub primary_key: bool,
     pub unique: bool,
     pub default: String,
+    /// `COMPRESSION …`, empty for the server's default (none).
+    pub compression: String,
 }
 
 impl NewColumn {
@@ -506,6 +531,7 @@ impl NewColumn {
             primary_key: false,
             unique: false,
             default: String::new(),
+            compression: String::new(),
         }
     }
 
@@ -524,6 +550,7 @@ impl NewColumn {
             primary_key: true,
             unique: false,
             default: String::new(),
+            compression: String::new(),
         }
     }
 
@@ -1153,10 +1180,16 @@ pub enum ModalKind {
     CreateDatabase,
     AddColumn,
     CreateIndex,
+    /// A table's `row_compression`, and a rewrite of its rows under it.
+    RowCompression,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalField {
+    /// A compression method: `zstd`, `zstd(9)`, `none`, `default`.
+    Compression,
+    /// Whether to rewrite the existing rows (`ALTER TABLE … RECOMPRESS`).
+    Recompress,
     Name,
     Length,
     Precision,
@@ -3033,6 +3066,13 @@ impl Studio {
                         column: NewColumn::new(self.flavor()),
                         error: None,
                     },
+                    ModalKind::RowCompression => Modal::RowCompression {
+                        table: self.selected_table.clone().unwrap_or_default(),
+                        edit: RowCompressionEdit::of(
+                            &stat_value(&self.table_stats, "row_compression").unwrap_or_default(),
+                        ),
+                        error: None,
+                    },
                     ModalKind::CreateIndex => Modal::CreateIndex {
                         table: self.selected_table.clone().unwrap_or_default(),
                         index: NewIndex::new(
@@ -3178,9 +3218,14 @@ impl Studio {
                 ) else {
                     return Task::none();
                 };
+                let compression = column_compressions(&self.table_stats)
+                    .into_iter()
+                    .find(|(column, _)| column == &name)
+                    .map(|(_, method)| method)
+                    .unwrap_or_default();
                 self.modal = Some(Modal::EditColumn {
                     table,
-                    edit: ColumnEdit::of(info),
+                    edit: ColumnEdit::of(info, &compression),
                     error: None,
                 });
                 self.modal_pending = false;
@@ -4233,14 +4278,19 @@ impl Studio {
             Some(Modal::EditColumn { edit, .. }) => match field {
                 ModalField::Name => edit.name = value,
                 ModalField::DataType => edit.data_type = value,
+                ModalField::Compression => edit.compression = value,
                 _ => {}
             },
+            Some(Modal::RowCompression { edit, .. }) if field == ModalField::Compression => {
+                edit.setting = value
+            }
             Some(Modal::AddColumn { column, .. }) => match field {
                 ModalField::Name => column.rename(value, flavor),
                 ModalField::Length => column.length = digits(&value),
                 ModalField::Precision => column.precision = digits(&value),
                 ModalField::Scale => column.scale = digits(&value),
                 ModalField::Default => column.default = value,
+                ModalField::Compression => column.compression = value,
                 _ => {}
             },
             _ => {}
@@ -4259,6 +4309,11 @@ impl Studio {
             && field == ModalField::Nullable
         {
             edit.nullable = value;
+        }
+        if let Some(Modal::RowCompression { edit, .. }) = &mut self.modal
+            && field == ModalField::Recompress
+        {
+            edit.recompress = value;
         }
         if let Some(Modal::AddColumn { column, .. }) = &mut self.modal {
             match field {
@@ -4402,6 +4457,18 @@ impl Studio {
                 }
             },
 
+            Modal::RowCompression { table, edit, .. } => match edit.statements(&table) {
+                Ok(sql) => self.modal_statement(
+                    Modal::RowCompression { table, edit, error: None },
+                    sql,
+                    Refresh::CurrentTable,
+                ),
+                Err(e) => {
+                    self.modal = Some(Modal::RowCompression { table, edit, error: Some(e) });
+                    Task::none()
+                }
+            },
+
             Modal::AddColumn { table, column, .. } => match add_column_sql(&table, &column) {
                 Ok(sql) => self.modal_statement(
                     Modal::AddColumn { table, column, error: None },
@@ -4458,6 +4525,7 @@ impl Studio {
             | Modal::CreateDatabase { error, .. }
             | Modal::AddColumn { error, .. }
             | Modal::EditColumn { error, .. }
+            | Modal::RowCompression { error, .. }
             | Modal::CreateRole { error, .. }
             | Modal::RolePassword { error, .. }
             | Modal::CreateIndex { error, .. },
@@ -4765,7 +4833,95 @@ pub fn add_column_sql(table: &str, column: &NewColumn) -> Result<String, String>
     if !column.default.trim().is_empty() {
         sql.push_str(&format!(" DEFAULT {}", column.default.trim()));
     }
+    if !column.compression.trim().is_empty() {
+        sql.push_str(&format!(" COMPRESSION {}", compression_method(&column.compression)?));
+    }
     Ok(sql)
+}
+
+/// One `SHOW TABLE STATS` row's value, by metric.
+pub fn stat_value(stats: &[Stat], metric: &str) -> Option<String> {
+    stats.iter().find(|s| s.metric == metric).map(|s| s.value.trim().to_string())
+}
+
+/// `SHOW TABLE STATS`' `compressed_columns` (RasterizedDB), as (column,
+/// method): `body=zstd(9) +dictionary, note=zstd` gives `("body", "zstd(9)")`
+/// and `("note", "zstd")`. Empty for a table with none, or a server that
+/// does not report it.
+pub fn column_compressions(stats: &[Stat]) -> Vec<(String, String)> {
+    let Some(list) = stat_value(stats, "compressed_columns") else { return Vec::new() };
+    list.split(", ")
+        .filter_map(|item| {
+            let (column, method) = item.trim().split_once('=')?;
+            let method = method.split_whitespace().next()?;
+            Some((column.to_string(), method.to_string()))
+        })
+        .collect()
+}
+
+/// A compression method as the server takes it, lower-cased: `zstd`,
+/// `zstd(1)` to `zstd(22)` (1 fastest, 22 smallest), `none`, `default`, and
+/// PostgreSQL's `lz4` and `pglz`. Anything else is refused here, so the
+/// dialog says so before a statement is sent.
+pub fn compression_method(text: &str) -> Result<String, String> {
+    let method = text.trim().to_ascii_lowercase().replace(' ', "");
+    if matches!(method.as_str(), "zstd" | "none" | "default" | "lz4" | "pglz") {
+        return Ok(method);
+    }
+    if let Some(level) = method.strip_prefix("zstd(").and_then(|r| r.strip_suffix(')'))
+        && let Ok(n) = level.parse::<u8>()
+        && (1..=22).contains(&n)
+    {
+        return Ok(format!("zstd({n})"));
+    }
+    Err(format!(
+        "`{}` is not a compression method: zstd, zstd(1) to zstd(22), none or default",
+        text.trim()
+    ))
+}
+
+/// A table's row compression being changed in a dialog.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowCompressionEdit {
+    /// What `SHOW TABLE STATS`' `row_compression` says (`zstd(6)`), `none`
+    /// when off.
+    pub original: String,
+    /// Empty or `none` turns it off.
+    pub setting: String,
+    /// Rewrite the rows already there under the new setting.
+    pub recompress: bool,
+}
+
+impl RowCompressionEdit {
+    pub fn of(current: &str) -> Self {
+        let current = current.split_whitespace().next().unwrap_or("none").to_string();
+        RowCompressionEdit { setting: current.clone(), original: current, recompress: false }
+    }
+
+    /// The statements, as one script: the setting (if it changed), then the
+    /// rewrite (if asked for).
+    pub fn statements(&self, table: &str) -> Result<String, String> {
+        let table = dialect::quote_ident(table.trim());
+        let wanted = if self.setting.trim().is_empty() { "none".to_string() } else { compression_method(&self.setting)? };
+        if matches!(wanted.as_str(), "lz4" | "pglz" | "default") {
+            return Err("row compression is zstd or zstd(1) to zstd(22), or none to turn it off".to_string());
+        }
+        let mut statements = Vec::new();
+        if !wanted.eq_ignore_ascii_case(self.original.trim()) {
+            statements.push(if wanted == "none" {
+                format!("ALTER TABLE {table} RESET (row_compression)")
+            } else {
+                format!("ALTER TABLE {table} SET (row_compression = '{wanted}')")
+            });
+        }
+        if self.recompress {
+            statements.push(format!("ALTER TABLE {table} RECOMPRESS"));
+        }
+        if statements.is_empty() {
+            return Err("nothing is changed".to_string());
+        }
+        Ok(statements.join(";\n"))
+    }
 }
 
 /// How many keys a scan asks for at a time.
@@ -4868,7 +5024,7 @@ mod tests {
             nullable: true,
             ..ColumnInfo::default()
         };
-        let mut edit = ColumnEdit::of(&info);
+        let mut edit = ColumnEdit::of(&info, "");
         assert_eq!(edit.statements("t"), Err("nothing is changed".to_string()));
         edit.data_type = " numeric(12,1) ".into();
         assert_eq!(edit.statements("t"), Err("nothing is changed".to_string()));
@@ -4881,17 +5037,76 @@ mod tests {
              ALTER TABLE \"t\" ALTER COLUMN \"amt\" SET NOT NULL;\n\
              ALTER TABLE \"t\" RENAME COLUMN \"amt\" TO \"amount\""
         );
-        let mut only_null = ColumnEdit::of(&ColumnInfo { nullable: false, ..info.clone() });
+        let mut only_null = ColumnEdit::of(&ColumnInfo { nullable: false, ..info.clone() }, "");
         only_null.nullable = true;
         assert_eq!(
             only_null.statements("t").unwrap(),
             "ALTER TABLE \"t\" ALTER COLUMN \"amt\" DROP NOT NULL"
         );
         for bad in ["BIGINT; DROP TABLE t", "BIGINT -- x", "", "  "] {
-            let mut edit = ColumnEdit::of(&info);
+            let mut edit = ColumnEdit::of(&info, "");
             edit.data_type = bad.into();
             assert!(edit.statements("t").is_err(), "{bad}");
         }
+    }
+
+    /// Compression in the dialogs: what each takes, the statement it makes,
+    /// and what it refuses before anything is sent.
+    #[test]
+    fn compression_reaches_the_column_and_table_statements() {
+        assert_eq!(compression_method(" ZSTD ( 9 ) ").unwrap(), "zstd(9)");
+        for ok in ["zstd", "none", "default", "lz4", "pglz", "zstd(1)", "zstd(22)"] {
+            assert!(compression_method(ok).is_ok(), "{ok}");
+        }
+        for bad in ["zstd(0)", "zstd(23)", "gzip", "zstd(9); DROP TABLE t", ""] {
+            assert!(compression_method(bad).is_err(), "{bad}");
+        }
+
+        // A new column.
+        let mut c = column("body", "TEXT");
+        c.compression = "zstd(9)".into();
+        assert_eq!(add_column_sql("docs", &c).unwrap(), "ALTER TABLE \"docs\" ADD COLUMN \"body\" TEXT COMPRESSION zstd(9)");
+        c.compression = "brotli".into();
+        assert!(add_column_sql("docs", &c).is_err());
+
+        // An existing column: only a change makes a statement, before a rename.
+        let info = ColumnInfo { name: "note".into(), data_type: "TEXT".into(), nullable: true, ..ColumnInfo::default() };
+        let mut edit = ColumnEdit::of(&info, "zstd");
+        assert_eq!(edit.statements("docs").unwrap_err(), "nothing is changed");
+        edit.compression = "zstd(19)".into();
+        edit.name = "memo".into();
+        assert_eq!(
+            edit.statements("docs").unwrap(),
+            "ALTER TABLE \"docs\" ALTER COLUMN \"note\" SET COMPRESSION zstd(19);\nALTER TABLE \"docs\" RENAME COLUMN \"note\" TO \"memo\""
+        );
+        edit.name = "note".into();
+        edit.compression = String::new();
+        assert_eq!(edit.statements("docs").unwrap(), "ALTER TABLE \"docs\" ALTER COLUMN \"note\" SET COMPRESSION default");
+
+        // A table's row compression, and the rewrite.
+        let mut row = RowCompressionEdit::of("zstd(6) +dictionary");
+        assert_eq!(row.original, "zstd(6)");
+        assert_eq!(row.statements("events").unwrap_err(), "nothing is changed");
+        row.recompress = true;
+        assert_eq!(row.statements("events").unwrap(), "ALTER TABLE \"events\" RECOMPRESS");
+        row.setting = "none".into();
+        assert_eq!(row.statements("events").unwrap(), "ALTER TABLE \"events\" RESET (row_compression);\nALTER TABLE \"events\" RECOMPRESS");
+        let mut off = RowCompressionEdit::of("none");
+        off.setting = "zstd".into();
+        assert_eq!(off.statements("events").unwrap(), "ALTER TABLE \"events\" SET (row_compression = 'zstd')");
+        off.setting = "lz4".into();
+        assert!(off.statements("events").is_err(), "row compression is zstd only");
+
+        // What SHOW TABLE STATS says, read back.
+        let stats = vec![
+            Stat { metric: "compressed_columns".into(), value: "body=zstd(9) +dictionary, note=zstd".into(), detail: String::new() },
+            Stat { metric: "row_compression".into(), value: "none".into(), detail: String::new() },
+        ];
+        assert_eq!(
+            column_compressions(&stats),
+            vec![("body".to_string(), "zstd(9)".to_string()), ("note".to_string(), "zstd".to_string())]
+        );
+        assert!(column_compressions(&[]).is_empty());
     }
 
     fn column(name: &str, ty: &str) -> NewColumn {
