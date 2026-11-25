@@ -225,6 +225,17 @@ impl ShardMap {
     /// A copy with `[lo, hi)` reassigned to shard `to`, adjacent entries of
     /// one shard merged, and the epoch raised by one: the edit a tenant move
     /// publishes.
+    /// This map with shard `info` added, owning nothing yet, one epoch up:
+    /// a split's first step (B6.2).
+    pub fn with_shard(&self, info: ShardInfo) -> Result<ShardMap, String> {
+        if self.shard(info.id).is_some() {
+            return Err(format!("shard {} is in the map already", info.id));
+        }
+        let mut shards = self.shards.clone();
+        shards.push(info);
+        ShardMap::new(self.cluster_id, self.epoch + 1, self.entries.clone(), shards)
+    }
+
     pub fn reassign(&self, lo: u64, hi: u64, to: u32) -> Result<ShardMap, String> {
         if lo >= hi || hi > BLOCKS {
             return Err(format!("block range [{lo:#x}, {hi:#x}) is empty or past the end"));
@@ -608,6 +619,21 @@ mod tests {
         assert!(ShardMap::new(1, 1, vec![(0, 0), (5, 1), (9, 0)], s).is_ok());
         assert!(ShardMap::from_text("nope").is_err());
         assert!(ShardMap::from_text(&format!("{TEXT_MAGIC}\nepoch 1\n")).is_err(), "no cluster");
+    }
+
+    #[test]
+    fn b62_a_split_adds_a_shard_then_moves_half_a_range_to_it() {
+        let m = ShardMap::initial(1, shards(2)).unwrap();
+        let grown = m.with_shard(ShardInfo { id: 7, addr: "x:1".into(), standbys: vec![] }).unwrap();
+        assert_eq!(grown.epoch(), m.epoch() + 1);
+        assert!(grown.ranges_of(7).is_empty(), "joins owning nothing");
+        assert_eq!(grown.entries(), m.entries());
+        assert!(grown.with_shard(ShardInfo { id: 7, addr: "y:1".into(), standbys: vec![] }).is_err());
+        let (lo, hi) = grown.ranges_of(0)[0];
+        let mid = lo + (hi - lo) / 2;
+        let split = grown.reassign(mid, hi, 7).unwrap();
+        assert_eq!(split.ranges_of(7), vec![(mid, hi)]);
+        assert_eq!(split.ranges_of(0), vec![(lo, mid)]);
     }
 
     #[test]

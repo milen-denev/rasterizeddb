@@ -12,6 +12,8 @@
 //!                       [--pin LO:HI …] [--exclude SHARD …]
 //!                       [--apply --fenced|--online --out NEW_MAP --state-dir DIR
 //!                        --table TABLE:COLUMN:TYPE [--table …]] [--every SECS]
+//! rdb-shard split       --map MAP --shard HOT --new-id N --new-addr HOST:PORT [--at BLOCK]
+//!                       --fenced|--online --out NEW_MAP --state-dir DIR --table TABLE:COLUMN:TYPE [--table …]
 //! rdb-shard exec        --map MAP --sql SQL
 //! rdb-shard resolve     --map MAP [--home SHARD] [--grace SECS]
 //! rdb-shard keygen      --key FILE
@@ -156,6 +158,7 @@ async fn run(args: &Args) -> std::result::Result<(), String> {
         "retire" => retire(args, &options).await,
         "rebalance" if args.opt("every").is_some() => rebalance_forever(args, &options).await,
         "rebalance" => rebalance(args, &options).await,
+        "split" => split(args, &options).await,
         "ddl" => cluster_ddl(args, &options).await,
         "keygen" => keygen(args),
         "resolve" => resolve(args, &options).await,
@@ -833,6 +836,61 @@ async fn rebalance(args: &Args, options: &Options) -> std::result::Result<(), St
         println!("(plan only; --apply --fenced runs it)");
         return Ok(());
     }
+    apply_moves(args, options, &map, &plan.moves).await
+}
+
+/// `split` (B6.2): a hot shard's range split onto a new shard. The new
+/// node, already running as a shard, joins the map one epoch up; then the
+/// upper half of the range (or from `--at`) moves there as any move does,
+/// online with `--online`.
+async fn split(args: &Args, options: &Options) -> std::result::Result<(), String> {
+    let map = read_map(args.one("map")?)?;
+    let hot: ShardId = args.one("shard")?.parse().map_err(|_| "--shard takes the hot shard's id".to_string())?;
+    let new_id: ShardId = args.one("new-id")?.parse().map_err(|_| "--new-id takes a shard id".to_string())?;
+    let new_addr = args.one("new-addr")?.to_string();
+    if map.shard(new_id).is_some() {
+        return Err(format!("shard {new_id} is in the map already"));
+    }
+    // The hot shard's largest range, split in half unless --at says where.
+    let (lo, hi) = map
+        .ranges_of(hot)
+        .into_iter()
+        .max_by_key(|(lo, hi)| hi - lo)
+        .ok_or_else(|| format!("shard {hot} owns no range"))?;
+    let at = match args.opt("at") {
+        Some(a) => parse_block(a)?,
+        None => lo + (hi - lo) / 2,
+    };
+    if at <= lo || at >= hi {
+        return Err(format!("--at {at:#x} is not inside shard {hot}'s range [{lo:#x}, {hi:#x})"));
+    }
+    let grown = map.with_shard(rasterizeddb_router::shard_map::ShardInfo { id: new_id, addr: new_addr.clone(), standbys: Vec::new() })?;
+    let dst = Client::connect(&new_addr, options.clone()).await.map_err(|e| format!("the new shard {new_addr}: {e}"))?;
+    if !is_shard(&dst).await {
+        return Err(format!("{new_addr} is not running as a shard (start it with --role shard)"));
+    }
+    Identity::of(&grown, new_id).write(&dst).await.map_err(|e| format!("shard {new_id}: {e}"))?;
+    // Every shard learns of the new one before any range moves to it.
+    let text = grown.to_text().replace('\'', "''");
+    let sig = write_signed(args, &format!("{}.grown", args.one("out")?), &grown)?;
+    let signed = sig.as_deref().map(|s| format!(" SIGNATURE '{s}'")).unwrap_or_default();
+    for info in grown.shards() {
+        let c = connect(&grown, info.id, options).await?;
+        c.run(&format!("SHARD MAP INSTALL '{text}'{signed}")).await.map_err(|e| format!("shard {}: installing the grown map: {e}", info.id))?;
+    }
+    println!("shard {new_id} ({new_addr}) joined at map epoch {}; moving [{at:#x}, {hi:#x}) to it", grown.epoch());
+    let mv = rasterizeddb_router::balance::Move { lo: at, hi, from: hot, to: new_id, bytes: 0 };
+    apply_moves(args, options, &grown, &[mv]).await
+}
+
+/// Runs `moves` from `map` (rebalance --apply, split): each copied,
+/// verified and handed off in turn, the map one epoch up after each.
+async fn apply_moves(
+    args: &Args,
+    options: &Options,
+    map: &ShardMap,
+    moves: &[rasterizeddb_router::balance::Move],
+) -> std::result::Result<(), String> {
     let out = args.one("out")?;
     let dir = args.one("state-dir")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{dir}: {e}"))?;
@@ -853,7 +911,7 @@ async fn rebalance(args: &Args, options: &Options) -> std::result::Result<(), St
         })
         .collect::<std::result::Result<_, String>>()?;
     let mut current = map.clone();
-    for (n, mv) in plan.moves.iter().enumerate() {
+    for (n, mv) in moves.iter().enumerate() {
         let src = connect(&current, mv.from, options).await?;
         let dst = connect(&current, mv.to, options).await?;
         let engine = begin_move(args, &src, &dst, mv.lo, mv.hi).await?;
@@ -908,7 +966,7 @@ async fn rebalance(args: &Args, options: &Options) -> std::result::Result<(), St
     println!(
         "{} moves applied; map epoch {} written to {out}. Reload every router, then lift the fence. \
          The source rows stay until `rdb-shard retire` of each state file in {dir}.",
-        plan.moves.len(),
+        moves.len(),
         current.epoch()
     );
     Ok(())
