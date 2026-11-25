@@ -190,6 +190,9 @@ pub struct Studio {
     pub merge_policy: MergePolicy,
     pub merge_allow_drop: bool,
 
+    // --- shards
+    pub shards: Option<ShardsSnapshot>,
+
     // --- replication
     pub replication: Option<ReplicationSnapshot>,
     pub peer_name: String,
@@ -257,6 +260,7 @@ pub enum Tab {
     Branches,
     Storage,
     Replication,
+    Shards,
     Migrate,
     Keys,
     Roles,
@@ -264,7 +268,7 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 16] = [
+    pub const ALL: [Tab; 17] = [
         Tab::Dashboard,
         Tab::Overview,
         Tab::Tables,
@@ -288,6 +292,9 @@ impl Tab {
         // opening one usually wants the other.
         Tab::Storage,
         Tab::Replication,
+        // After REPLICATION: both are about the other nodes, one holding
+        // copies of this one's rows, the other holding the rest of them.
+        Tab::Shards,
         Tab::Migrate,
         // The key/value store: data, but not tables.
         Tab::Keys,
@@ -310,6 +317,7 @@ impl Tab {
             Tab::Branches => "BRANCHES",
             Tab::Storage => "STORAGE",
             Tab::Replication => "REPLICATION",
+            Tab::Shards => "SHARDS",
             Tab::Migrate => "MIGRATE",
             Tab::Keys => "KEYS",
             Tab::Roles => "ROLES",
@@ -863,6 +871,10 @@ pub enum Message {
     PromoteBranch(String),
     DropBranch(String),
 
+    // --- shards
+    ReloadShards,
+    ShardsLoaded(Box<ShardsSnapshot>),
+
     // --- replication
     ReloadReplication,
     ReplicationLoaded(Box<ReplicationSnapshot>),
@@ -1293,6 +1305,7 @@ impl Studio {
             branch_diff: None,
             merge_policy: MergePolicy::Fail,
             merge_allow_drop: false,
+            shards: None,
             replication: None,
             peer_name: String::new(),
             peer_address: String::new(),
@@ -1658,6 +1671,7 @@ impl Studio {
                 self.backup = None;
                 self.activity = None;
                 self.replication = None;
+                self.shards = None;
                 self.storage = None;
                 self.storage_report.clear();
                 self.tables.clear();
@@ -1694,6 +1708,8 @@ impl Studio {
                     // Same reasoning as the backup catalogue: a stale answer on
                     // this page is worse than a slow one.
                     Tab::Replication => self.load_replication(),
+                    // A map changes when a shard is added or a range moves.
+                    Tab::Shards => self.load_shards(),
                     // And again: free space is the figure this page exists to
                     // report, and a cached one is worse than useless.
                     Tab::Storage => self.load_storage(),
@@ -2334,6 +2350,11 @@ impl Studio {
                 Task::none()
             }
 
+            Message::ReloadShards => self.load_shards(),
+            Message::ShardsLoaded(snapshot) => {
+                self.shards = Some(*snapshot);
+                Task::none()
+            }
             Message::ReloadReplication => self.load_replication(),
             Message::ReplicationLoaded(snapshot) => {
                 self.replication = Some(*snapshot);
@@ -3418,6 +3439,39 @@ impl Studio {
     /// The database this console is connected to.
     pub fn current_database(&self) -> String {
         self.session.as_ref().map(|s| s.database.clone()).unwrap_or_default()
+    }
+
+    /// Reads the cluster map, the gateway's rows (when the connection is to
+    /// one), this shard's load and its prepared two-phase parts, in one task.
+    /// Each statement a node does not answer leaves its part empty: a shard
+    /// refuses `SHOW GATEWAY`, and a plain node answers `SHOW SHARDS` with no
+    /// rows.
+    fn load_shards(&self) -> Task<Message> {
+        let Some(session) = self.session.clone() else { return Task::none() };
+        let Some(shards_sql) = dialect::shards_sql(session.flavor) else {
+            return Task::done(Message::ShardsLoaded(Box::default()));
+        };
+        Task::perform(
+            async move {
+                let mut snapshot = ShardsSnapshot::default();
+                if let Ok(grid) = session.query(shards_sql).await {
+                    dialect::parse_shards(&grid, &mut snapshot);
+                }
+                if let Ok(grid) = session.query(dialect::SHOW_GATEWAY_SQL).await {
+                    snapshot.gateway = dialect::parse_gateway(&grid);
+                }
+                if snapshot.supported {
+                    if let Ok(grid) = session.query(dialect::SHOW_SHARD_LOAD_SQL).await {
+                        snapshot.load = dialect::parse_shard_load(&grid);
+                    }
+                    if let Ok(grid) = session.query(dialect::SHOW_PREPARED_SQL).await {
+                        snapshot.prepared = dialect::parse_prepared(&grid);
+                    }
+                }
+                Box::new(snapshot)
+            },
+            Message::ShardsLoaded,
+        )
     }
 
     fn load_replication(&self) -> Task<Message> {

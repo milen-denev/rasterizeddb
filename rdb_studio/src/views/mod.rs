@@ -21,6 +21,7 @@ pub mod query;
 pub mod replication;
 pub mod roles;
 pub mod schema;
+pub mod shards;
 pub mod storage;
 pub mod tables;
 
@@ -182,7 +183,7 @@ fn tabs(studio: &Studio) -> Element<'_, Message> {
     let strip = scrollable(tabs)
         .id(tab_strip_id())
         .direction(scrollable::Direction::Horizontal(
-            scrollable::Scrollbar::new().width(3).scroller_width(3),
+            scrollable::Scrollbar::new().width(6).scroller_width(6).spacing(2),
         ))
         .style(theme::scroller)
         .width(Fill);
@@ -223,6 +224,7 @@ fn pane(studio: &Studio) -> Element<'_, Message> {
         Tab::Storage => storage::view(studio),
         Tab::Branches => branches::view(studio),
         Tab::Replication => replication::view(studio),
+        Tab::Shards => shards::view(studio),
         Tab::Migrate => migrate::view(studio),
         Tab::Keys => keys::view(studio),
         Tab::Roles => roles::view(studio),
