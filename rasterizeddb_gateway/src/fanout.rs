@@ -352,6 +352,159 @@ impl Session {
         outcome
     }
 
+    /// A read joining one sharded table with global tables (inner joins,
+    /// `RouteTemplate::Broadcast`): the global tables' rows read from the
+    /// home shard and loaded into temporary tables on every shard, the read
+    /// fanned out there with `merge` (each shard joining its own rows), the
+    /// copies dropped. Tables larger than `broadcast_max_bytes` are not
+    /// copied: the sharded table is gathered instead (`gather_run`).
+    ///
+    /// Outside a transaction block only (`decide` sends a block's to the
+    /// gather, which reads what the block can see).
+    pub(crate) async fn broadcast_run<S: AsyncWrite + Unpin>(
+        &mut self,
+        conn: &mut S,
+        text: &str,
+        small: &[String],
+        merge: Merge,
+        gather: &[String],
+        prepared: Option<&OneStatement>,
+    ) -> io::Result<Outcome> {
+        let map = self.core.map();
+        let shards: Vec<u32> = map.shards().iter().map(|s| s.id).collect();
+        let home = self.core.shared.home(&map);
+        let cap = self.core.shared.cfg.broadcast_max_bytes;
+        // Each table's columns and rows, from the home shard.
+        let mut copies: Vec<(String, Vec<String>, Vec<Vec<u8>>)> = Vec::new();
+        let mut used = 0usize;
+        for table in small {
+            let q = query_message(&format!("SELECT * FROM {}", quote_ident(table)));
+            let parts = match self.collect_parts(&[home], &q, cap.saturating_sub(used)).await {
+                Ok(p) => p,
+                // Too large to copy: gathered, as before broadcasting.
+                Err((code, _)) if code == "54000" => {
+                    self.core.counters.borrow_mut().broadcasts_too_large += 1;
+                    return self.gather_run_with(conn, text, gather, prepared).await;
+                }
+                Err((code, m)) => {
+                    self.error_ready(&code, &m);
+                    return Ok(Outcome::Done { error: true });
+                }
+            };
+            let Some((_, part)) = parts.into_iter().next() else {
+                return self.gather_run_with(conn, text, gather, prepared).await;
+            };
+            used += part.rows.iter().map(|(_, r)| r.len()).sum::<usize>();
+            let Some(columns) = row_columns(&part.head) else {
+                self.error_ready("XX000", &format!("copying {table}: no row description"));
+                return Ok(Outcome::Done { error: true });
+            };
+            let defs = columns.iter().map(|(name, oid)| format!("{} {}", quote_ident(name), type_name(*oid))).collect();
+            copies.push((table.clone(), defs, part.rows.into_iter().map(|(_, r)| r).collect()));
+        }
+        self.core.counters.borrow_mut().broadcasts += 1;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut renames: Vec<(String, String)> = Vec::new();
+        let mut failure = None;
+        'copy: for (table, defs, rows) in &copies {
+            let temp = format!("rdb_bcast_{n}_{}", table.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').collect::<String>());
+            renames.push((table.clone(), temp.clone()));
+            let create = format!("CREATE TEMP TABLE {} ({})", quote_ident(&temp), defs.join(", "));
+            let refs: Vec<&Vec<u8>> = rows.iter().collect();
+            for &s in &shards {
+                match self.quiet_query(s, &create).await {
+                    Ok((_, None)) => {}
+                    Ok((_, Some((code, m)))) => {
+                        failure = Some((code, format!("copying {table} to shard {s}: {m}")));
+                        break 'copy;
+                    }
+                    Err(e) => {
+                        failure = Some(("08006".to_string(), format!("copying {table} to shard {s}: {e}")));
+                        break 'copy;
+                    }
+                }
+                if let Err((code, m)) = self.copy_rows_into(s, &temp, &refs).await {
+                    failure = Some((code, format!("copying {table} to shard {s}: {m}")));
+                    break 'copy;
+                }
+            }
+        }
+        let outcome = match failure {
+            Some((code, m)) => {
+                self.error_ready(&code, &m);
+                Ok(Outcome::Done { error: true })
+            }
+            None => {
+                let rewritten = rename_tables(text, &renames);
+                let built = match prepared {
+                    None => query_message(&rewritten),
+                    Some(one) => {
+                        let mut b = Vec::with_capacity(rewritten.len() + 64);
+                        pg::encode_parse(&mut b, "", &rewritten, &one.types);
+                        pg::encode_bind(&mut b, &pg::BindAll { portal: String::new(), statement: String::new(), ..one.bind.clone() });
+                        if let Some(kind) = one.describe {
+                            pg::encode_describe(&mut b, kind);
+                        }
+                        pg::encode_execute(&mut b);
+                        pg::encode_sync(&mut b);
+                        for vs in self.vs.values_mut() {
+                            vs.parsed.remove("");
+                        }
+                        b
+                    }
+                };
+                // An aggregate's partials are collected here, through the
+                // sessions that hold the copies.
+                if merge == Merge::Coordinator {
+                    self.core.counters.borrow_mut().fan_outs += 1;
+                    self.coordinate_here(&built, home, false).await
+                } else {
+                    self.fan_out(conn, &built, merge, false).await
+                }
+            }
+        };
+        for &s in &shards {
+            self.drop_temps(s, &renames).await;
+        }
+        outcome
+    }
+
+    /// [`Self::broadcast_run`] for a prepared statement alone in its batch.
+    pub(crate) async fn broadcast_extended<S: AsyncWrite + Unpin>(
+        &mut self,
+        conn: &mut S,
+        batch: &[u8],
+        small: &[String],
+        merge: Merge,
+        gather: &[String],
+    ) -> io::Result<Option<Outcome>> {
+        let Some(one) = self.one_statement(batch) else {
+            return Ok(None);
+        };
+        let start = self.out.len();
+        let outcome = self.broadcast_run(conn, &one.text.clone(), small, merge, gather, Some(&one)).await?;
+        if one.parse.is_none() {
+            // The client sent no Parse: drop the ParseComplete.
+            let mut at = start;
+            while at + 5 <= self.out.len() {
+                let len = i32::from_be_bytes(self.out[at + 1..at + 5].try_into().unwrap()) as usize;
+                if self.out[at] == b'1' {
+                    self.out.drain(at..at + 1 + len);
+                    break;
+                }
+                at += 1 + len;
+            }
+        } else if let Some(p) = &one.parse
+            && let Some((name, text)) = pg::parse_parse(p)
+        {
+            self.generation += 1;
+            let generation = self.generation;
+            self.statements.insert(name.to_string(), crate::session::Stmt { text: text.to_string(), parse: p.clone(), generation });
+        }
+        Ok(Some(outcome))
+    }
+
     /// A prepared statement that gathers (module docs of `gather_run`).
     /// `None` when the batch is not one extended statement.
     pub(crate) async fn gather_extended<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, batch: &[u8], tables: &[String]) -> io::Result<Option<Outcome>> {
@@ -841,9 +994,21 @@ impl Session {
     /// runs the statement on its own session in the transaction with those
     /// partials merged into its fold (`Request::Coordinate`).
     async fn in_txn_coordinate(&mut self, msg: &[u8], home: u32) -> io::Result<Outcome> {
+        self.coordinate_here(msg, home, true).await
+    }
+
+    /// An aggregate whose partials the gateway collects itself, each run in
+    /// this session's own virtual session on its shard, and merges on the
+    /// home shard's (Coordinate with the partials given). Inside a
+    /// transaction (`join`) every shard joins it first; a broadcast's
+    /// statement (outside one) needs it because its temporary tables live in
+    /// those sessions, where the home shard's own peer links would not see
+    /// them.
+    async fn coordinate_here(&mut self, msg: &[u8], home: u32, join: bool) -> io::Result<Outcome> {
         let shards: Vec<u32> = self.core.map().shards().iter().map(|s| s.id).collect();
         let others: Vec<u32> = shards.iter().copied().filter(|&s| s != home).collect();
-        let gathered = match self.join_txn(&shards).await {
+        let joined = if join { self.join_txn(&shards).await } else { Ok(()) };
+        let gathered = match joined {
             Ok(()) => self.run_parts(&others, &Merge::Coordinator, msg).await,
             Err(e) => Err(e),
         };
@@ -1784,6 +1949,80 @@ impl Session {
         Ok(Some(Outcome::Done { error: false }))
     }
 
+    /// A role or privilege statement (`CREATE`/`ALTER`/`DROP ROLE`, `USER`
+    /// or `GROUP`, `GRANT`, `REVOKE`, `ALTER DEFAULT PRIVILEGES`, `COMMENT ON
+    /// ROLE`), run on every shard: each shard checks its sessions against its
+    /// own roles and privileges, so a role made on one alone could log in
+    /// (the home shard proves logins) and then do nothing on the others.
+    ///
+    /// The home shard first: refused there, it is refused, changing nothing.
+    /// Then each other shard in id order; one refusing it after others took
+    /// it is reported with the shards that did (a role statement is not
+    /// atomic across shards: run it again, or fix that shard). A `GRANT` or
+    /// `REVOKE` on a table only the home shard holds is skipped where the
+    /// table does not exist. Outside a transaction block only. The gateway's
+    /// cached login keys are dropped, so a new password counts at once.
+    pub(crate) async fn role_stmt<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, text: &str) -> io::Result<Option<Outcome>> {
+        let _ = conn;
+        let Some(kind) = role_statement_kind(text) else {
+            return Ok(None);
+        };
+        if self.login.pinned.is_some() {
+            return Ok(None);
+        }
+        if self.txn.status != b'I' {
+            self.error_ready(
+                "25001",
+                "through the gateway a role or privilege statement is applied on every shard, outside a transaction block: run it on its own",
+            );
+            return Ok(Some(Outcome::Done { error: true }));
+        }
+        let map = self.core.map();
+        let home = self.core.shared.home(&map);
+        let mut order: Vec<u32> = map.shards().iter().map(|s| s.id).filter(|&s| s != home).collect();
+        order.insert(0, home);
+        let statement = text.trim().trim_end_matches(';');
+        let mut applied: Vec<u32> = Vec::new();
+        let mut tag = String::new();
+        for s in order {
+            match self.tagged_query(s, statement).await {
+                Ok((_, None, t)) => {
+                    if s == home {
+                        tag = t.unwrap_or_default();
+                    }
+                    applied.push(s);
+                }
+                // A privilege on a table the home shard alone holds.
+                Ok((_, Some((code, _)), _)) if s != home && kind == RoleKind::Privilege && matches!(code.as_str(), "42P01" | "3F000") => {}
+                Ok((_, Some((code, m)), _)) => {
+                    self.core.shared.auth.clear();
+                    let msg = if applied.is_empty() {
+                        m
+                    } else {
+                        format!("shard {s}: {m}; the statement took effect on shards {applied:?} already (role statements are applied shard by shard: run it again once shard {s} takes it)")
+                    };
+                    self.error_ready(&code, &msg);
+                    return Ok(Some(Outcome::Done { error: true }));
+                }
+                Err(e) => {
+                    self.core.shared.auth.clear();
+                    let msg = if applied.is_empty() {
+                        format!("shard {s}: {e}")
+                    } else {
+                        format!("shard {s}: {e}; the statement took effect on shards {applied:?} already")
+                    };
+                    self.error_ready("08006", &msg);
+                    return Ok(Some(Outcome::Done { error: true }));
+                }
+            }
+        }
+        self.core.shared.auth.clear();
+        self.core.counters.borrow_mut().role_statements += 1;
+        pg::command_complete(&mut self.out, if tag.is_empty() { "OK" } else { &tag });
+        pg::ready(&mut self.out, b'I');
+        Ok(Some(Outcome::Done { error: false }))
+    }
+
     /// Whether `table` is spread over the shards (its reads fan out), as
     /// the home shard's routing template says.
     async fn partitioned(&mut self, table: &str, home: u32) -> bool {
@@ -1944,7 +2183,7 @@ fn push_query(out: &mut Vec<u8>, sql: &str) {
 }
 
 /// One extended-protocol statement of a client's batch.
-struct OneStatement {
+pub(crate) struct OneStatement {
     /// The batch's own Parse message, if it had one.
     parse: Option<Vec<u8>>,
     bind: pg::BindAll,
@@ -1954,7 +2193,33 @@ struct OneStatement {
     types: Vec<u32>,
 }
 
-/// One plain batch's whole reply on `shard`, every chunk fetched.
+/// Which of the statements `role_stmt` applies on every shard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RoleKind {
+    /// CREATE / ALTER / DROP ROLE, USER, GROUP; COMMENT ON ROLE.
+    Role,
+    /// GRANT, REVOKE, ALTER DEFAULT PRIVILEGES.
+    Privilege,
+}
+
+/// Whether `text` is one role or privilege statement the gateway applies on
+/// every shard (`role_stmt`).
+pub(crate) fn role_statement_kind(text: &str) -> Option<RoleKind> {
+    let t = text.trim().trim_end_matches(';').trim();
+    if t.contains(';') {
+        return None;
+    }
+    let up: Vec<String> = t.split_whitespace().take(4).map(|w| w.to_ascii_uppercase()).collect();
+    let w = |i: usize| up.get(i).map(String::as_str).unwrap_or("");
+    match (w(0), w(1)) {
+        ("CREATE" | "ALTER" | "DROP", "ROLE" | "USER" | "GROUP") => Some(RoleKind::Role),
+        ("COMMENT", "ON") if w(2) == "ROLE" => Some(RoleKind::Role),
+        ("GRANT" | "REVOKE", _) => Some(RoleKind::Privilege),
+        ("ALTER", "DEFAULT") if w(2) == "PRIVILEGES" => Some(RoleKind::Privilege),
+        _ => None,
+    }
+}
+
 /// One shard's answer to a query: its id, column names and rows as text.
 pub(crate) type ShardAnswer = (u32, Vec<String>, Vec<Vec<Option<String>>>);
 
@@ -1966,6 +2231,7 @@ const NOT_SUMMED: &[&str] = &[
     "default_expressions", "path_indexes", "foreign_keys", "unique_constraints", "unique_indexes", "json_columns", "avg_row_bytes",
 ];
 
+/// One plain batch's whole reply on `shard`, every chunk fetched.
 pub(crate) async fn collect_pg(core: Rc<Core>, shard: u32, id: u64, req: Vec<u8>) -> Result<Vec<u8>, (String, String)> {
     let link = core.link(shard).map_err(|e| ("08006".to_string(), e))?;
     let mut resp = link.call(&core, &req).await;
@@ -2428,6 +2694,33 @@ pub(crate) mod committing {
             begin("stuck");
             assert!(!settle(Duration::from_millis(20)).await, "bounded");
             end("stuck");
+        }
+    }
+}
+
+#[cfg(test)]
+mod role_statement_tests {
+    use super::*;
+
+    #[test]
+    fn role_and_privilege_statements_are_known() {
+        for (sql, kind) in [
+            ("CREATE ROLE app LOGIN PASSWORD 'x'", Some(RoleKind::Role)),
+            ("create user app with password 'x';", Some(RoleKind::Role)),
+            ("ALTER ROLE app PASSWORD 'y'", Some(RoleKind::Role)),
+            ("DROP ROLE IF EXISTS app", Some(RoleKind::Role)),
+            ("DROP GROUP g", Some(RoleKind::Role)),
+            ("COMMENT ON ROLE app IS 'the app'", Some(RoleKind::Role)),
+            ("GRANT SELECT ON orders TO app", Some(RoleKind::Privilege)),
+            ("REVOKE ALL ON orders FROM app", Some(RoleKind::Privilege)),
+            ("GRANT admin TO app", Some(RoleKind::Privilege)),
+            ("ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO app", Some(RoleKind::Privilege)),
+            ("ALTER TABLE orders ADD COLUMN x INT", None),
+            ("CREATE TABLE roles (id INT)", None),
+            ("SELECT 'GRANT'", None),
+            ("GRANT SELECT ON a TO b; DROP TABLE a", None),
+        ] {
+            assert_eq!(role_statement_kind(sql), kind, "{sql}");
         }
     }
 }

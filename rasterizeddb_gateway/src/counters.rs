@@ -15,6 +15,12 @@ pub struct Counters {
     pub statements: u64,
     pub routed: u64,
     pub fan_outs: u64,
+    /// Joins answered by copying their global tables to every shard, and
+    /// those whose tables were too large to copy (gathered instead).
+    pub broadcasts: u64,
+    pub broadcasts_too_large: u64,
+    /// Role and privilege statements applied on every shard.
+    pub role_statements: u64,
     pub template_hits: u64,
     pub template_misses: u64,
     pub template_refuted: u64,
@@ -52,7 +58,7 @@ impl Counters {
             ($($f:ident),*) => {$( self.$f += o.$f; )*};
         }
         sum!(
-            statements, routed, fan_outs, template_hits, template_misses, template_refuted, classify_errors, retries,
+            statements, routed, fan_outs, broadcasts, broadcasts_too_large, role_statements, template_hits, template_misses, template_refuted, classify_errors, retries,
             lost_08007, down_08006, refused_no_key, refused_cross_shard, refusals_other, bytes_in, bytes_out,
             sessions_opened, sessions_closed, virtual_sessions, auth_failures, panics, map_refreshes, compressed_out,
             compressed_in, compression_saved_bytes
@@ -86,6 +92,9 @@ impl Counters {
             ("statements", self.statements.to_string()),
             ("routed", self.routed.to_string()),
             ("fan_outs", self.fan_outs.to_string()),
+            ("broadcasts", self.broadcasts.to_string()),
+            ("broadcasts_too_large", self.broadcasts_too_large.to_string()),
+            ("role_statements", self.role_statements.to_string()),
             ("template_hits", self.template_hits.to_string()),
             ("template_misses", self.template_misses.to_string()),
             ("route_template_refuted", self.template_refuted.to_string()),

@@ -26,6 +26,9 @@ pub(crate) enum Target {
     Refuse { sqlstate: &'static str, message: String },
     /// Gather these sharded tables onto the home shard and run there (B4.5).
     Gather { tables: Vec<String> },
+    /// Copy these global tables to every shard and fan out with `merge`, or
+    /// gather `gather` when they are too large to copy.
+    Broadcast { small: Vec<String>, merge: Merge, gather: Vec<String> },
 }
 
 /// What a run on a shard came to.
@@ -162,6 +165,8 @@ pub struct Session {
     pub(crate) pending_fanout: Option<(Merge, bool)>,
     /// Set by `decide_extended` when the batch's statement gathers.
     pub(crate) pending_gather: Option<Vec<String>>,
+    /// A broadcast the extended batch being decided asks for.
+    pub(crate) pending_broadcast: Option<(Vec<String>, Merge, Vec<String>)>,
     /// Who this session is, for an observer (`hooks::Observer`).
     pub client: crate::hooks::ClientInfo,
     /// Bytes written to the client so far, and the first error's SQLSTATE
@@ -306,6 +311,7 @@ impl Session {
             listener: None,
             pending_fanout: None,
             pending_gather: None,
+            pending_broadcast: None,
             client: crate::hooks::ClientInfo {
                 session: 0,
                 database: String::new(),
@@ -577,6 +583,10 @@ impl Session {
         }
         // The rebalance statements (the studio's Shards tab).
         if let Some(outcome) = self.rebalance_stmt(conn, &text).await? {
+            return Ok(outcome);
+        }
+        // Roles and privileges: on every shard, the home shard first.
+        if let Some(outcome) = self.role_stmt(conn, &text).await? {
             return Ok(outcome);
         }
         match local_of(&text) {
@@ -889,6 +899,7 @@ impl Session {
                 // client unanswered.
                 Target::FanOut { merge, writes } => self.fan_out(conn, msg, merge, writes).await?,
                 Target::Gather { tables } => self.gather_run(conn, text, &tables).await?,
+                Target::Broadcast { small, merge, gather } => self.broadcast_run(conn, text, &small, merge, &gather, None).await?,
                 Target::Shard(s) => {
                     self.core.counters.borrow_mut().routed += 1;
                     self.run_on(conn, s, msg, Vec::new(), tkey.as_ref().map(|t| (Source::Shape, t.as_str()))).await?
@@ -985,6 +996,17 @@ impl Session {
                     Target::Gather { tables }
                 } else {
                     needs_key()
+                }
+            }
+            // Inside a block the gather keeps what the block can see; outside
+            // one the small tables are copied to the shards.
+            RouteTemplate::Broadcast { small, merge, gather } => {
+                if !self.core.shared.cfg.gather || self.login.pinned.is_some() {
+                    needs_key()
+                } else if self.txn.status == b'I' && self.core.shared.cfg.broadcast_max_bytes > 0 {
+                    Target::Broadcast { small, merge, gather }
+                } else {
+                    Target::Gather { tables: gather }
                 }
             }
         }
@@ -1415,7 +1437,7 @@ impl Session {
     }
 
     /// [`Self::quiet_query`], with the statement's command tag.
-    async fn tagged_query(&mut self, shard: u32, sql: &str) -> Result<(u8, Option<(String, String)>, Option<String>), String> {
+    pub(crate) async fn tagged_query(&mut self, shard: u32, sql: &str) -> Result<(u8, Option<(String, String)>, Option<String>), String> {
         let vs_id = self.ensure_vs(shard).await.map_err(|(c, m)| format!("{c}: {m}"))?;
         let link = self.core.link(shard)?;
         let mut q = vec![b'Q'];
@@ -1582,9 +1604,17 @@ impl Session {
             let map = self.core.map();
             self.pending_fanout = None;
             self.pending_gather = None;
+            self.pending_broadcast = None;
             let (target, needs, tkey) = match self.decide_extended(&map, batch).await {
                 Ok(v) => v,
                 Err((code, msg)) => {
+                    // A join with small global tables, copied to the shards.
+                    if let Some((small, merge, gather)) = self.pending_broadcast.take()
+                        && sync
+                        && let Some(outcome) = self.broadcast_extended(conn, batch, &small, merge, &gather).await?
+                    {
+                        return Ok(outcome);
+                    }
                     // A join with a table on other shards, gathered.
                     if let Some(tables) = self.pending_gather.take()
                         && sync
@@ -1691,6 +1721,14 @@ impl Session {
                         RouteTemplate::Home => home,
                         RouteTemplate::Gather { tables } if self.core.shared.cfg.gather && self.login.pinned.is_none() => {
                             self.pending_gather = Some(tables);
+                            return Err(("0A000", "a statement that gathers runs alone in its batch: Parse, Bind, Describe, Execute, Sync".into()));
+                        }
+                        RouteTemplate::Broadcast { small, merge, gather } if self.core.shared.cfg.gather && self.login.pinned.is_none() => {
+                            if self.txn.status == b'I' && self.core.shared.cfg.broadcast_max_bytes > 0 {
+                                self.pending_broadcast = Some((small, merge, gather));
+                            } else {
+                                self.pending_gather = Some(gather);
+                            }
                             return Err(("0A000", "a statement that gathers runs alone in its batch: Parse, Bind, Describe, Execute, Sync".into()));
                         }
                         RouteTemplate::FanOut { merge, writes } => {
