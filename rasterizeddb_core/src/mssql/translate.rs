@@ -606,9 +606,23 @@ pub(crate) fn map_type(tokens: &[Token]) -> Result<String, TsqlError> {
         },
         "REAL" => "real".into(),
         "DATE" => "date".into(),
-        "DATETIME" | "DATETIME2" | "SMALLDATETIME" => "timestamp".into(),
-        "DATETIMEOFFSET" => "timestamptz".into(),
-        "TIME" => "time".into(),
+        // A declared precision rounds as SQL Server's does: `datetime2(3)`
+        // keeps three digits (half away from zero), where every precision
+        // kept six. Seven is SQL Server's default; the engine keeps six.
+        "DATETIME2" | "DATETIMEOFFSET" | "TIME" => {
+            let base = match name.as_str() {
+                "DATETIME2" => "timestamp",
+                "DATETIMEOFFSET" => "timestamptz",
+                _ => "time",
+            };
+            match arg(0).and_then(|p| p.parse::<u32>().ok()) {
+                Some(p) if p < 6 => format!("{base}({p})"),
+                _ => base.into(),
+            }
+        }
+        // `datetime` keeps 1/300 s: three digits is the nearest.
+        "DATETIME" => "timestamp(3)".into(),
+        "SMALLDATETIME" => "timestamp(0)".into(),
         "CHAR" | "NCHAR" | "VARCHAR" | "NVARCHAR" | "CHARACTER" => {
             if max || arg(0).is_none() && matches!(name.as_str(), "VARCHAR" | "NVARCHAR") {
                 "text".into()
@@ -2243,6 +2257,8 @@ fn tsql_type_name(t: &crate::core::db_type::DbType, without_tz: bool, json: bool
         D::DATETIME => "datetimeoffset".into(),
         D::TIMESTAMP => "datetime2".into(),
         D::UUID => "uniqueidentifier".into(),
+        D::DATE => "date".into(),
+        D::TIME => "time".into(),
         D::BYTEA => "varbinary(max)".into(),
         D::STRING if json => "nvarchar(max)".into(),
         _ => "nvarchar(max)".into(),
@@ -2261,6 +2277,8 @@ fn type_ids(ty: &str) -> (i32, i32) {
         "decimal" => (106, 17),
         "datetime2" => (42, 8),
         "datetimeoffset" => (43, 10),
+        "date" => (40, 3),
+        "time" => (41, 5),
         "uniqueidentifier" => (36, 16),
         "varbinary" => (165, -1),
         "nchar" => (239, -1),

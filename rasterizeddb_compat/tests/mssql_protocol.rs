@@ -1636,3 +1636,32 @@ async fn tiberius_guid_order() {
     let tiberius::error::Error::Server(t) = &e else { panic!("{e}") };
     assert_eq!(t.code(), 2627, "{e}");
 }
+
+/// A declared fractional-second precision rounds as SQL Server's does
+/// (half away from zero): `datetime2(3)`, `datetimeoffset(2)`, `time(0)`
+/// kept six digits whatever was declared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_time_precision() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [T] ([Id] int PRIMARY KEY, [A] datetime2(3) NOT NULL, [B] datetimeoffset(2) NOT NULL, [C] time(0) NOT NULL, [D] datetime2 NOT NULL); \
+         INSERT INTO [T] VALUES (1, '2026-03-23 15:03:07.0429169', '2026-03-23 15:03:07.0451 +00:00', '15:03:07.5', '2026-03-23 15:03:07.0429169')",
+    )
+    .await
+    .unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT CONVERT(varchar(30), [A], 121), CAST([C] AS varchar(20)) FROM [T]; \
+         SELECT COUNT(*) FROM [T] WHERE [A] = '2026-03-23 15:03:07.043' AND [B] = '2026-03-23 15:03:07.05 +00:00' AND [C] = '15:03:08'; \
+         SELECT COLUMN_NAME, DATETIME_PRECISION FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = N'T' AND DATETIME_PRECISION IS NOT NULL ORDER BY ORDINAL_POSITION",
+    )
+    .await
+    .unwrap();
+    assert_eq!(r[0][0].get::<&str, _>(0), Some("2026-03-23 15:03:07.043"));
+    assert!(r[0][0].get::<&str, _>(1).is_some_and(|t| t.starts_with("15:03:08")), "{:?}", r[0][0].get::<&str, _>(1));
+    assert_eq!(int(&r[1]), [1]);
+    let got: Vec<(String, Option<i32>)> = r[2].iter().map(|r| (r.get::<&str, _>(0).unwrap().to_string(), r.get::<i32, _>(1))).collect();
+    assert_eq!(got, [("A".into(), Some(3)), ("B".into(), Some(2)), ("C".into(), Some(0)), ("D".into(), Some(6))]);
+}
