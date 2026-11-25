@@ -1488,7 +1488,7 @@ fn decides_the_where(sql: &str, at: usize) -> bool {
             || head.ends_with('(')
             || ["AND", "OR"].iter().any(|k| {
                 head.len() >= k.len()
-                    && head[head.len() - k.len()..].eq_ignore_ascii_case(k)
+                    && head.as_bytes()[head.len() - k.len()..].eq_ignore_ascii_case(k.as_bytes())
                     && head[..head.len() - k.len()].ends_with(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             })
     };

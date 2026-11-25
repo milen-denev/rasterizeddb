@@ -159,7 +159,7 @@ fn after_row_count_keyword(text: &str) -> bool {
     }
     ["LIMIT", "OFFSET"].iter().any(|kw| {
         trimmed.len() >= kw.len()
-            && trimmed[trimmed.len() - kw.len()..].eq_ignore_ascii_case(kw)
+            && trimmed.as_bytes()[trimmed.len() - kw.len()..].eq_ignore_ascii_case(kw.as_bytes())
             && trimmed[..trimmed.len() - kw.len()]
                 .bytes()
                 .last()

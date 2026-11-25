@@ -130,6 +130,11 @@ pub(crate) trait Env {
     fn case_insensitive(&self) -> bool {
         false
     }
+    /// The spelling a relation (`column` None) or its column was declared
+    /// with over this protocol (`NAMES_TABLE`); `None` when unknown.
+    fn shown(&self, _relation: &str, _column: Option<&str>) -> Option<String> {
+        None
+    }
 }
 
 /// What a statement answers with.
@@ -140,6 +145,10 @@ pub(crate) enum Kind {
     /// captured (a RETURNING the client does not see).
     Insert {
         identity: Option<String>,
+        /// `(table, column)` when the statement writes the identity column
+        /// itself (`SET IDENTITY_INSERT … ON`, EF Core's seeding): the
+        /// counter then moves past the values written, as SQL Server's does.
+        written: Option<(String, String)>,
     },
     /// UPDATE / DELETE, and an INSERT whose OUTPUT returns rows (`Query`
     /// then).
@@ -156,6 +165,13 @@ pub(crate) struct Forward {
     /// position, which an INSERT's RETURNING cannot name): its name and
     /// each row's value.
     pub(crate) extra_column: Option<(String, Vec<String>)>,
+    /// The top-level select list's explicit aliases, exactly as written:
+    /// shown as typed, where a column read as it is shows its declared
+    /// spelling (`[n] AS [n]` over a column `[N]` is `n`).
+    pub(crate) aliases: Vec<String>,
+    /// A CREATE (`true`) or DROP DATABASE's name as written: its spelling
+    /// is kept, as SQL Server shows it (`DB_NAME()`, sys.databases).
+    pub(crate) database: Option<(String, bool)>,
 }
 
 /// A statement of a batch, with T-SQL's control flow.
@@ -627,6 +643,8 @@ pub(crate) struct Cx<'a> {
     /// A CREATE TABLE's column `COLLATE` is honoured ([`engine_collation`]);
     /// elsewhere it is dropped, as before.
     collations: bool,
+    /// The top-level select list's explicit aliases ([`Forward::aliases`]).
+    top_aliases: Vec<String>,
 }
 
 impl<'a> Cx<'a> {
@@ -638,6 +656,7 @@ impl<'a> Cx<'a> {
             past_select_list: false,
             xml_value: false,
             collations: false,
+            top_aliases: Vec::new(),
         }
     }
 }
@@ -1224,6 +1243,18 @@ fn fulltext_index_columns(database: &Database, table: &str) -> Option<Vec<String
         .collect()
 }
 
+/// `TRY_CAST(v AS t)` / `TRY_CONVERT(t, v)`: NULL where the cast would
+/// fail. Guarded by whether `v`'s text reads as a `t`
+/// (`pg_input_is_valid`), so a value converted from another type is judged
+/// by its text: `TRY_CAST(1.5 AS int)` is NULL here, 1 in SQL Server.
+fn try_cast(value: &[Token], target: &str) -> Vec<Token> {
+    let v = render_text(value);
+    vec![Token::raw(format!(
+        "CASE WHEN pg_input_is_valid(CAST(({v}) AS text), {}) THEN CAST(({v}) AS {target}) END",
+        sql_str(target)
+    ))]
+}
+
 fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<Token>>, TsqlError> {
     let upper = name.to_ascii_uppercase();
     if matches!(upper.as_str(), "CONTAINS" | "FREETEXT") {
@@ -1593,11 +1624,15 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
                 find_top(inner, 0, &["AS"]).ok_or_else(|| TsqlError::syntax("CAST needs AS"))?;
             let value = rewrite_expr(inner[..at].to_vec(), cx)?;
             let target = map_type(&inner[at + 1..])?;
-            let mut out = vec![Token::raw("CAST"), Token::op("(")];
-            out[1].space = false;
-            out.extend(value);
-            out.push(Token::raw(format!("AS {target})")));
-            out
+            if upper == "TRY_CAST" {
+                try_cast(&value, &target)
+            } else {
+                let mut out = vec![Token::raw("CAST"), Token::op("(")];
+                out[1].space = false;
+                out.extend(value);
+                out.push(Token::raw(format!("AS {target})")));
+                out
+            }
         }
         "CONVERT" | "TRY_CONVERT" => {
             let r = raw();
@@ -1632,6 +1667,8 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
                 let mut ts = wrap(value);
                 ts.push(Token::raw("::timestamp"));
                 call("to_char", vec![ts, vec![literal_str(p)]])
+            } else if upper == "TRY_CONVERT" {
+                try_cast(&value, &target)
             } else {
                 let mut out = vec![Token::raw("CAST"), Token::op("(")];
                 out[1].space = false;
@@ -1794,7 +1831,7 @@ pub(crate) fn server_property(name: &str) -> Value {
 // Catalogue views
 // ---------------------------------------------------------------------------
 
-fn sql_str(s: &str) -> String {
+pub(crate) fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
@@ -1824,6 +1861,9 @@ fn catalog_view_stored(schema: &str, view: &str, cx: &Cx) -> Result<Option<Strin
         .collect();
     tables.sort();
     let db = cx.env.database_name().to_string();
+    // Names as they were declared over this protocol (`NAMES_TABLE`).
+    let shown_table = |t: &str| cx.env.shown(t, None).unwrap_or_else(|| t.to_string());
+    let shown_column = |t: &str, c: &str| cx.env.shown(t, Some(c)).unwrap_or_else(|| c.to_string());
     let empty = |cols: &[&str]| -> String {
         format!(
             "(SELECT {} WHERE 1 = 0)",
@@ -1878,7 +1918,7 @@ fn catalog_view_stored(schema: &str, view: &str, cx: &Cx) -> Result<Option<Strin
             let cols = ["name", "object_id", "principal_id", "schema_id", "parent_object_id", "type", "type_desc", "create_date", "modify_date", "is_ms_shipped"];
             let mut rows: Vec<String> = Vec::new();
             if view != "procedures" {
-                rows.extend(tables.iter().map(|t| format!("({}, {}, NULL::integer, 1, 0, 'U', 'USER_TABLE', localtimestamp, localtimestamp, false)", sql_str(t), object_id(t))));
+                rows.extend(tables.iter().map(|t| format!("({}, {}, NULL::integer, 1, 0, 'U', 'USER_TABLE', localtimestamp, localtimestamp, false)", sql_str(&shown_table(t)), object_id(t))));
             }
             if view != "tables" {
                 rows.extend(cx.env.routines().iter().map(|(n, _)| format!("({}, {}, NULL::integer, 1, 0, 'P', 'SQL_STORED_PROCEDURE', localtimestamp, localtimestamp, false)", sql_str(n), object_id(n))));
@@ -1910,7 +1950,7 @@ fn catalog_view_stored(schema: &str, view: &str, cx: &Cx) -> Result<Option<Strin
                     rows.push(format!(
                         "({}, {}, {}, {type_id}, {type_id}, {max_len}, 0, 0, {nullable}, {identity}, false)",
                         object_id(t),
-                        sql_str(&name),
+                        sql_str(&shown_column(t, &name)),
                         k + 1
                     ));
                 }
@@ -1985,7 +2025,7 @@ fn catalog_view_stored(schema: &str, view: &str, cx: &Cx) -> Result<Option<Strin
         }
         ("information_schema", "tables") => {
             let cols = ["table_catalog", "table_schema", "table_name", "table_type"];
-            let rows = tables.iter().map(|t| format!("({}, 'dbo', {}, 'BASE TABLE')", sql_str(&db), sql_str(t))).collect();
+            let rows = tables.iter().map(|t| format!("({}, 'dbo', {}, 'BASE TABLE')", sql_str(&db), sql_str(&shown_table(t)))).collect();
             values(rows, &cols, empty(&cols))
         }
         ("information_schema", "columns") => {
@@ -1998,8 +2038,8 @@ fn catalog_view_stored(schema: &str, view: &str, cx: &Cx) -> Result<Option<Strin
                     rows.push(format!(
                         "({}, 'dbo', {}, {}, {}, {}, {}, {}, {})",
                         sql_str(&db),
-                        sql_str(t),
-                        sql_str(&name),
+                        sql_str(&shown_table(t)),
+                        sql_str(&shown_column(t, &name)),
                         k + 1,
                         default.map(|d| sql_str(&d)).unwrap_or_else(|| "CAST(NULL AS text)".into()),
                         sql_str(if nullable { "YES" } else { "NO" }),
@@ -2086,7 +2126,7 @@ fn table_name_at(tokens: &[Token], i: usize) -> Option<(String, usize)> {
     Some((name.to_lowercase(), j + 1))
 }
 
-fn identity_column(database: &Database, table: &str) -> Option<String> {
+pub(crate) fn identity_column(database: &Database, table: &str) -> Option<String> {
     let view = database.schema_view(table)?;
     view.schema()
         .defaults
@@ -2706,7 +2746,11 @@ fn rewrite_select_inner(
         };
         if let Some(a) = &alias {
             cx.aliases.push(a.clone());
+            if name_items {
+                cx.top_aliases.push(a.clone());
+            }
         }
+        let blank = name_items && alias.is_none() && !is_column_reference(&expr);
         let name = alias.or_else(|| {
             if name_items {
                 implicit_name(sql, &expr)
@@ -2714,6 +2758,10 @@ fn rewrite_select_inner(
                 None
             }
         });
+        // SQL Server leaves an unaliased expression's column unnamed
+        // (`SELECT COUNT_BIG(*)`), as tools keyed on names expect; the
+        // engine would label it `count`. `?column?` is sent as no name.
+        let name = name.or_else(|| blank.then(|| BLANK_NAME.to_string()));
         prepared.push((expr, name));
     }
     let saved = std::mem::take(&mut cx.aliases);
@@ -2734,7 +2782,7 @@ fn rewrite_select_inner(
             let n = render_text(&rewritten);
             rewritten = vec![Token::raw(format!("CAST({n} AS integer)"))];
         }
-        if let Some(n) = &name {
+        if let Some(n) = name.as_ref().filter(|n| *n != BLANK_NAME) {
             item_texts.push((render_text(&rewritten), n.clone()));
         }
         out.extend(rewritten);
@@ -2828,6 +2876,7 @@ fn rewrite_select_inner(
             return Err(TsqlError::unsupported("FOR JSON / FOR XML"));
         }
     }
+    let rest = if reads_catalog(&rest) { fold_catalog_names(rest) } else { rest };
     let outer = std::mem::replace(&mut cx.past_select_list, true);
     let tail = rewrite_expr(rest, cx);
     cx.past_select_list = outer;
@@ -2887,6 +2936,113 @@ fn split_alias(item: &[Token]) -> (Vec<Token>, Option<String>) {
         }
     }
     (item.to_vec(), None)
+}
+
+/// Whether `tokens` read a catalogue view (`sys.x`, `INFORMATION_SCHEMA.x`).
+fn reads_catalog(tokens: &[Token]) -> bool {
+    tokens.windows(2).any(|w| {
+        w[1].is_op(".")
+            && w[0].ident().is_some_and(|n| n.eq_ignore_ascii_case("sys") || n.eq_ignore_ascii_case("INFORMATION_SCHEMA"))
+    })
+}
+
+/// A catalogue view's name column compared with one value (`name =
+/// N'orders'`, `TABLE_NAME = @t`, `name LIKE …`), compared without case, as
+/// SQL Server's catalogue compares under the database's collation: the views
+/// list names as they were declared (`NAMES_TABLE`), and a lookup spelled
+/// otherwise found nothing.
+fn fold_catalog_names(tokens: Vec<Token>) -> Vec<Token> {
+    const NAMES: &[&str] = &[
+        "name", "table_name", "column_name", "constraint_name", "routine_name", "specific_name", "type_desc",
+    ];
+    let is_name = |t: &Token| t.ident().is_some_and(|n| NAMES.iter().any(|k| n.eq_ignore_ascii_case(k)));
+    let single = |t: &Token| matches!(t.tok, Tok::Str(_) | Tok::UserVar(_) | Tok::Param(_));
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len() + 8);
+    let mut i = 0;
+    while i < tokens.len() {
+        // `[q.]name <op> value`
+        let (start, end) = if is_name(&tokens[i]) {
+            (i, i + 1)
+        } else {
+            out.push(tokens[i].clone());
+            i += 1;
+            continue;
+        };
+        let qualified = out.last().is_some_and(|t| t.is_op(".")) && out.len() >= 2;
+        let op = tokens.get(end);
+        let compares = op.is_some_and(|o| o.is_op("=") || o.is_op("<>") || o.is_op("!=") || o.is_word("LIKE"));
+        let like = op.is_some_and(|o| o.is_word("LIKE"));
+        let literal = tokens.get(end + 1).is_some_and(|t| matches!(t.tok, Tok::Str(_)));
+        // LIKE takes no call on its pattern side: only a literal pattern,
+        // lowercased here, folds.
+        if compares
+            && (literal || !like)
+            && tokens.get(end + 1).is_some_and(single)
+            && !tokens.get(end + 2).is_some_and(|t| t.is_op("."))
+        {
+            // The qualifier already written goes inside the call.
+            let mut left: Vec<Token> = Vec::new();
+            if qualified {
+                let dot = out.pop().unwrap();
+                let q = out.pop().unwrap();
+                left.push(q);
+                left.push(dot);
+            }
+            left.extend(tokens[start..end].iter().cloned());
+            let mut call = Token::raw("lower");
+            call.space = left.first().is_some_and(|t| t.space);
+            out.push(call);
+            let mut open = Token::op("(");
+            open.space = false;
+            out.push(open);
+            for (k, t) in left.into_iter().enumerate() {
+                let mut t = t;
+                if k == 0 {
+                    t.space = false;
+                }
+                out.push(t);
+            }
+            out.push(Token::op(")"));
+            out.push(tokens[end].clone());
+            let mut value = tokens[end + 1].clone();
+            if let Tok::Str(text) = &mut value.tok {
+                *text = String::from_utf8_lossy(text).to_lowercase().into_bytes();
+                out.push(value);
+            } else {
+                out.push(Token::raw("lower"));
+                let mut open = Token::op("(");
+                open.space = false;
+                out.push(open);
+                value.space = false;
+                out.push(value);
+                out.push(Token::op(")"));
+            }
+            i = end + 2;
+            continue;
+        }
+        out.push(tokens[i].clone());
+        i += 1;
+    }
+    out
+}
+
+/// The name an unaliased expression item is given, which the front end
+/// sends as none (`conn::exchange`).
+const BLANK_NAME: &str = "?column?";
+
+/// Whether a select item is a (qualified) column, or a `*`.
+fn is_column_reference(item: &[Token]) -> bool {
+    if item.last().is_some_and(|t| t.is_op("*")) {
+        return true;
+    }
+    item.len() % 2 == 1
+        && item.iter().enumerate().all(|(k, t)| {
+            if k % 2 == 1 {
+                t.is_op(".")
+            } else {
+                matches!(t.tok, Tok::Word(_) | Tok::Quoted(_)) && !t.is_word("NULL") && !t.is_word("TRUE") && !t.is_word("FALSE")
+            }
+        })
 }
 
 fn implicit_name(_sql: &str, item: &[Token]) -> Option<String> {
@@ -2979,6 +3135,7 @@ fn rewrite_insert(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward,
         Token::word("INTO"),
         Token::raw(ident_sql(&table)),
     ];
+    let mut explicit_columns: Vec<String> = Vec::new();
     if kw(&tokens, j, "WITH") && tokens.get(j + 1).is_some_and(|t| t.is_op("(")) {
         j = matching_paren(&tokens, j + 1).ok_or_else(|| TsqlError::syntax("unbalanced hint"))? + 1;
     }
@@ -2991,6 +3148,7 @@ fn rewrite_insert(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward,
                 .filter_map(|p| p.last().and_then(|t| t.ident()).map(ident_sql))
                 .collect();
             out.push(Token::raw(format!("({})", names.join(", "))));
+            explicit_columns = names;
             j = close + 1;
         }
     }
@@ -3026,15 +3184,28 @@ fn rewrite_insert(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward,
                 out.push(Token::raw(format!("RETURNING {}", ident_sql(&col))));
                 Kind::Insert {
                     identity: Some(col),
+                    written: None,
                 }
             }
-            None => Kind::Insert { identity: None },
+            None => Kind::Insert { identity: None, written: None },
         },
+    };
+    let kind = match kind {
+        Kind::Insert { identity: Some(col), .. } => {
+            let written = explicit_columns
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(&ident_sql(&col)))
+                .then(|| (table.clone(), col.clone()));
+            Kind::Insert { identity: Some(col), written }
+        }
+        other => other,
     };
     Ok(Forward {
         statements: vec![render_text(&out)],
         kind,
         extra_column: None,
+        aliases: Vec::new(),
+        database: None,
     })
 }
 
@@ -3220,6 +3391,8 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
         statements: vec![render_text(&out)],
         kind,
         extra_column: None,
+        aliases: Vec::new(),
+        database: None,
     })
 }
 
@@ -3341,6 +3514,8 @@ fn rewrite_delete(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
         statements: vec![render_text(&out)],
         kind,
         extra_column: None,
+        aliases: Vec::new(),
+        database: None,
     })
 }
 
@@ -3685,6 +3860,216 @@ pub(crate) fn engine_collation(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Where the SQL Server front end keeps the spellings tables and columns
+/// were declared with: names are folded to lower case for the engine (SQL
+/// Server compares them without case), and shown as declared, which
+/// SqlBulkCopy's column mappings match exactly.
+pub(crate) const NAMES_TABLE: &str = "__rdb_tds_names";
+
+/// The engine's key for a declared name: folded and fitted as `ident_sql`
+/// stores it.
+fn name_key(name: &str) -> String {
+    crate::sqlcompat::fit_name(name.to_lowercase())
+}
+
+/// The statements recording `relation`'s declared spellings: its own
+/// (`shown`, when given) and its columns'. With `replace`, what was
+/// recorded for the relation before goes first (a CREATE TABLE).
+pub(crate) fn record_names(
+    relation: &str,
+    shown: Option<&str>,
+    columns: &[String],
+    objects: &[(String, String)],
+    replace: bool,
+) -> Vec<String> {
+    let lit = |s: &str| sql_str(&super::lex::decode_dots(s));
+    let key = |s: &str| sql_str(s);
+    let relation = &name_key(relation);
+    let mut rows: Vec<String> = Vec::new();
+    if let Some(shown) = shown {
+        rows.push(format!("({}, '', {})", key(relation), lit(shown)));
+    }
+    for c in columns {
+        rows.push(format!("({}, {}, {})", key(relation), key(&name_key(c)), lit(c)));
+    }
+    // Constraints and indexes, by the name the engine holds them under
+    // (`OBJECT_MARK` + it): the names its errors quote.
+    for (engine, shown) in objects {
+        rows.push(format!("({}, {}, {})", key(relation), key(&format!("{OBJECT_MARK}{}", name_key(engine))), lit(shown)));
+    }
+    let mut out = vec![format!(
+        "CREATE TABLE IF NOT EXISTS {NAMES_TABLE} (rel text NOT NULL, col text NOT NULL, shown text NOT NULL, PRIMARY KEY (rel, col))"
+    )];
+    if replace {
+        out.push(format!("DELETE FROM {NAMES_TABLE} WHERE rel = {}", key(relation)));
+    }
+    if !rows.is_empty() {
+        out.push(format!(
+            "INSERT INTO {NAMES_TABLE} (rel, col, shown) VALUES {} ON CONFLICT (rel, col) DO UPDATE SET shown = excluded.shown",
+            rows.join(", ")
+        ));
+    }
+    out
+}
+
+/// The statements keeping `NAMES_TABLE` in step with an sp_rename of
+/// `parts` (the old name's parts, folded, `dbo` left out) to `new` (dots
+/// encoded): a column's, an index's or a table's (`kind` empty or OBJECT).
+pub(crate) fn rename_records(parts: &[String], new: &str, kind: &str) -> Vec<String> {
+    let names = NAMES_TABLE;
+    if kind == "COLUMN" && parts.len() >= 2 {
+        let table = &parts[parts.len() - 2];
+        // The old spelling goes first: a rename in case only
+        // keeps its key.
+        let mut r = record_names(table, None, &[], &[], false);
+        r.push(format!(
+            "DELETE FROM {names} WHERE rel = {} AND col = {}",
+            sql_str(table),
+            sql_str(&parts[parts.len() - 1])
+        ));
+        r.extend(record_names(table, None, &[new.to_string()], &[], false));
+        r
+    } else if kind == "INDEX" && parts.len() >= 2 {
+        let table = &parts[parts.len() - 2];
+        let object = (crate::sqlcompat::index_name(table, new), new.to_string());
+        record_names(table, None, &[], &[object], false)
+    } else if kind.is_empty() || kind == "OBJECT" {
+        let old = parts.last().cloned().unwrap_or_default();
+        let mut r = record_names(new, None, &[], &[], false);
+        r.push(format!(
+            "UPDATE {names} SET rel = {} WHERE rel = {}",
+            sql_str(&name_key(new)),
+            sql_str(&old)
+        ));
+        r.extend(record_names(new, Some(new), &[], &[], false));
+        r
+    } else {
+        Vec::new()
+    }
+}
+
+/// The statements recording the declared names a T-SQL script would make
+/// (`EXEC sp_rdb_record_names @script = N'…'`), none of its statements
+/// run: for databases made before names were recorded, from the script
+/// that made them (`dotnet ef migrations script --idempotent`). Its CREATE
+/// TABLE, ALTER TABLE … ADD, CREATE INDEX and sp_rename, in order, also
+/// inside IF / BEGIN … END and `EXEC(N'…')`.
+pub(crate) fn names_from_script(script: &str, env: &dyn Env) -> Result<Vec<String>, TsqlError> {
+    // `GO` separates a script's batches for its client.
+    let text: String = script
+        .lines()
+        .filter(|l| !l.trim().eq_ignore_ascii_case("GO"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tokens = super::lex::lex(&text).map_err(|e| TsqlError::syntax(e.0))?;
+    let mut out = Vec::new();
+    fn walk(stmts: &[Stmt], env: &dyn Env, out: &mut Vec<String>) -> Result<(), TsqlError> {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Simple(tokens) => simple(tokens, env, out)?,
+                Stmt::Block(b) => walk(b, env, out)?,
+                Stmt::If { then, otherwise, .. } => {
+                    walk(std::slice::from_ref(then.as_ref()), env, out)?;
+                    if let Some(o) = otherwise {
+                        walk(std::slice::from_ref(o.as_ref()), env, out)?;
+                    }
+                }
+                Stmt::While { body, .. } => walk(std::slice::from_ref(body.as_ref()), env, out)?,
+                Stmt::Try { body, catch } => {
+                    walk(body, env, out)?;
+                    walk(catch, env, out)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn simple(tokens: &[Token], env: &dyn Env, out: &mut Vec<String>) -> Result<(), TsqlError> {
+        let head = tokens.first().and_then(|t| t.upper()).unwrap_or_default();
+        let second = tokens.get(1).and_then(|t| t.upper()).unwrap_or_default();
+        let strings = |from: usize| -> Vec<String> {
+            tokens[from..]
+                .iter()
+                .filter_map(|t| match &t.tok {
+                    Tok::Str(b) => Some(String::from_utf8_lossy(b).into_owned()),
+                    _ => None,
+                })
+                .collect()
+        };
+        match (head.as_str(), second.as_str()) {
+            ("CREATE", "TABLE") | ("CREATE", "INDEX" | "UNIQUE" | "CLUSTERED" | "NONCLUSTERED") | ("ALTER", "TABLE") => {
+                // What the statement would record, not the statement.
+                if let Ok(f) = translate(&render_text(tokens), tokens.to_vec(), env) {
+                    out.extend(f.statements.into_iter().filter(|s| {
+                        s.contains(NAMES_TABLE)
+                            && (s.starts_with("CREATE TABLE IF NOT EXISTS")
+                                || s.starts_with("INSERT INTO")
+                                || s.starts_with("DELETE FROM"))
+                    }));
+                }
+            }
+            ("EXEC" | "EXECUTE", _) => {
+                let name = tokens.get(1).and_then(|t| t.ident()).unwrap_or("").to_ascii_lowercase();
+                if name == "sp_rename" {
+                    let args = strings(2);
+                    if args.len() >= 2 {
+                        let parts: Vec<String> = super::lex::name_parts(&args[0])
+                            .into_iter()
+                            .map(|p| p.to_lowercase())
+                            .filter(|p| p != "dbo")
+                            .collect();
+                        let new = super::lex::encode_dots(args[1].trim_matches(['[', ']']).to_string());
+                        let kind = args.get(2).map(|k| k.to_ascii_uppercase()).unwrap_or_default();
+                        out.extend(rename_records(&parts, &new, &kind));
+                    }
+                } else if name.is_empty() || name == "sp_executesql" {
+                    // `EXEC(N'…')`, `EXEC sp_executesql N'…'`: the text run.
+                    if let Some(inner) = strings(1).into_iter().next() {
+                        let inner_tokens = super::lex::lex(&inner).map_err(|e| TsqlError::syntax(e.0))?;
+                        walk(&parse_batch(&inner_tokens)?, env, out)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    walk(&parse_batch(&tokens)?, env, &mut out)?;
+    Ok(out)
+}
+
+/// Marks a recorded constraint's or index's name in `NAMES_TABLE`'s `col`.
+pub(crate) const OBJECT_MARK: char = '#';
+
+/// A table constraint's or inline index's name: the engine's and as
+/// written.
+fn constraint_object(part: &[Token], table: &str) -> Option<(String, String)> {
+    if part.first()?.is_word("CONSTRAINT") {
+        let name = part.get(1)?.ident()?;
+        return Some((name.to_string(), name.to_string()));
+    }
+    if part.first()?.is_word("INDEX") {
+        let name = part.get(1)?.ident()?;
+        return Some((crate::sqlcompat::index_name(table, name), name.to_string()));
+    }
+    None
+}
+
+/// The last part of the name at `i`, as written.
+fn shown_name_at(tokens: &[Token], i: usize) -> Option<String> {
+    let mut j = i;
+    let mut name = tokens.get(j)?.ident()?.to_string();
+    while tokens.get(j + 1).is_some_and(|t| t.is_op(".")) {
+        match tokens.get(j + 2).and_then(|t| t.ident()) {
+            Some(next) => {
+                name = next.to_string();
+                j += 2;
+            }
+            None => j += 1,
+        }
+    }
+    Some(name)
+}
+
 fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
     cx.collations = true;
     let (table, after) =
@@ -3698,15 +4083,21 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
     strip_storage(&tokens[close + 1..])?;
     let mut defs = Vec::new();
     let mut later = Vec::new();
+    let mut declared: Vec<String> = Vec::new();
+    let mut objects: Vec<(String, String)> = Vec::new();
     for part in split_commas(&tokens[after + 1..close]) {
         if part.is_empty() {
             continue;
         }
         if is_constraint_start(&part) {
+            objects.extend(constraint_object(&part, &table));
             let (def, statement) = table_constraint(&part, &table, cx)?;
             defs.extend(def);
             later.extend(statement);
         } else {
+            if let Some(name) = part.first().and_then(|t| t.ident()) {
+                declared.push(name.to_string());
+            }
             defs.push(column_definition(&part, cx)?);
         }
     }
@@ -3717,10 +4108,16 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
         defs.join(", ")
     )];
     statements.extend(later);
+    if !temporary {
+        let shown = shown_name_at(&tokens, 2);
+        statements.extend(record_names(&table, shown.as_deref(), &declared, &objects, true));
+    }
     Ok(Forward {
         statements,
         kind: Kind::Ddl,
         extra_column: None,
+        aliases: Vec::new(),
+        database: None,
     })
 }
 
@@ -3749,6 +4146,11 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
                         statements.push(format!("ALTER TABLE {t} ADD {d}"));
                     }
                     statements.extend(statement);
+                    if !table.starts_with('#') {
+                        if let Some(object) = constraint_object(&part, &table) {
+                            statements.extend(record_names(&table, None, &[], &[object], false));
+                        }
+                    }
                 } else {
                     let mut p = part;
                     if p.first().is_some_and(|x| x.is_word("COLUMN")) {
@@ -3758,6 +4160,11 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
                         "ALTER TABLE {t} ADD COLUMN {}",
                         column_definition(&p, cx)?
                     ));
+                    if !table.starts_with('#') {
+                        if let Some(name) = p.first().and_then(|x| x.ident()) {
+                            statements.extend(record_names(&table, None, &[name.to_string()], &[], false));
+                        }
+                    }
                 }
             }
         }
@@ -3824,6 +4231,8 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
         statements,
         kind: Kind::Ddl,
         extra_column: None,
+        aliases: Vec::new(),
+        database: None,
     })
 }
 
@@ -3901,20 +4310,28 @@ fn rewrite_create_index(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
             }
         }
     }
+    let mut statements = vec![format!(
+        "CREATE {}INDEX {} ON {} ({})",
+        if unique { "UNIQUE " } else { "" },
+        ident_sql(&crate::sqlcompat::index_name(&table, name)),
+        ident_sql(&table),
+        cols.join(", ")
+    )];
+    if !table.starts_with('#') {
+        let object = (crate::sqlcompat::index_name(&table, name), name.to_string());
+        statements.extend(record_names(&table, None, &[], &[object], false));
+    }
     Ok(Forward {
-        statements: vec![format!(
-            "CREATE {}INDEX {} ON {} ({})",
-            if unique { "UNIQUE " } else { "" },
-            ident_sql(&crate::sqlcompat::index_name(&table, name)),
-            ident_sql(&table),
-            cols.join(", ")
-        )],
+        statements,
         kind: Kind::Ddl,
         extra_column: None,
+        aliases: Vec::new(),
+        database: None,
     })
 }
 
 fn rewrite_drop(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
+    let mut dropped_database = None;
     let what = tokens.get(1).and_then(|t| t.upper()).unwrap_or_default();
     let mut i = 2;
     let mut if_exists = false;
@@ -3967,6 +4384,7 @@ fn rewrite_drop(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
                 .get(i)
                 .and_then(|t| t.ident())
                 .ok_or_else(|| TsqlError::syntax("a database name was expected"))?;
+            dropped_database = Some((name.to_string(), false));
             vec![format!("DROP DATABASE {ie}{}", ident_sql(name))]
         }
         "VIEW" => vec![render_text(&rewrite_expr(tokens, cx)?)],
@@ -3976,6 +4394,8 @@ fn rewrite_drop(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
         statements,
         kind: Kind::Ddl,
         extra_column: None,
+        aliases: Vec::new(),
+        database: dropped_database,
     })
 }
 
@@ -3998,6 +4418,8 @@ fn fulltext_ddl(tokens: Vec<Token>, _cx: &mut Cx) -> Result<Forward, TsqlError> 
         statements: vec![String::new()],
         kind: Kind::Ddl,
         extra_column: None,
+        aliases: Vec::new(),
+        database: None,
     };
     if kw(&tokens, 2, "CATALOG") || kw(&tokens, 2, "STOPLIST") {
         // A catalog groups indexes for SQL Server's own administration; there
@@ -4038,6 +4460,8 @@ fn fulltext_ddl(tokens: Vec<Token>, _cx: &mut Cx) -> Result<Forward, TsqlError> 
         statements,
         kind: Kind::Ddl,
         extra_column: None,
+        aliases: Vec::new(),
+        database: None,
     })
 }
 
@@ -4211,11 +4635,13 @@ fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
     Ok(Forward {
         statements: vec![sql],
         kind: if returning.is_empty() && extra.is_none() {
-            Kind::Insert { identity: None }
+            Kind::Insert { identity: None, written: None }
         } else {
             Kind::Query
         },
         extra_column: extra.map(|(name, _)| (name, positions)),
+        aliases: Vec::new(),
+        database: None,
     })
 }
 
@@ -4226,6 +4652,12 @@ pub(crate) fn translate(
     env: &dyn Env,
 ) -> Result<Forward, TsqlError> {
     let mut cx = Cx::new(env);
+    let mut forward = translate_in(sql, tokens, &mut cx)?;
+    forward.aliases = std::mem::take(&mut cx.top_aliases);
+    Ok(forward)
+}
+
+fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
     let head = tokens.first().and_then(|t| t.upper()).unwrap_or_default();
     match head.as_str() {
         "SELECT" => {
@@ -4235,7 +4667,7 @@ pub(crate) fn translate(
                     .ok_or_else(|| TsqlError::syntax("INTO needs a table"))?;
                 let mut select = tokens[..into].to_vec();
                 select.extend(tokens[after..].iter().cloned());
-                let body = rewrite_select(sql, select, &mut cx, false)?;
+                let body = rewrite_select(sql, select, cx, false)?;
                 return Ok(Forward {
                     statements: vec![format!(
                         "CREATE {}TABLE {} AS {}",
@@ -4249,18 +4681,24 @@ pub(crate) fn translate(
                     )],
                     kind: Kind::Write,
                     extra_column: None,
+                    aliases: Vec::new(),
+                    database: None,
                 });
             }
             Ok(Forward {
-                statements: vec![render_text(&rewrite_select(sql, tokens, &mut cx, true)?)],
+                statements: vec![render_text(&rewrite_select(sql, tokens, cx, true)?)],
                 kind: Kind::Query,
                 extra_column: None,
+                aliases: Vec::new(),
+                database: None,
             })
         }
         _ if tokens.first().is_some_and(|t| t.is_op("(")) => Ok(Forward {
-            statements: vec![render_text(&rewrite_select(sql, tokens, &mut cx, true)?)],
+            statements: vec![render_text(&rewrite_select(sql, tokens, cx, true)?)],
             kind: Kind::Query,
             extra_column: None,
+            aliases: Vec::new(),
+            database: None,
         }),
         "WITH" => {
             let main = find_top(&tokens, 1, &["SELECT", "INSERT", "UPDATE", "DELETE"]);
@@ -4269,22 +4707,24 @@ pub(crate) fn translate(
                 _ => Kind::Write,
             };
             Ok(Forward {
-                statements: vec![render_text(&rewrite_expr(tokens, &mut cx)?)],
+                statements: vec![render_text(&rewrite_expr(tokens, cx)?)],
                 kind,
                 extra_column: None,
+                aliases: Vec::new(),
+                database: None,
             })
         }
-        "INSERT" => rewrite_insert(sql, tokens, &mut cx),
-        "UPDATE" => rewrite_update(tokens, &mut cx),
-        "DELETE" => rewrite_delete(tokens, &mut cx),
-        "MERGE" => rewrite_merge_insert(tokens, &mut cx),
-        "CREATE" | "DROP" | "ALTER" if kw(&tokens, 1, "FULLTEXT") => fulltext_ddl(tokens, &mut cx),
+        "INSERT" => rewrite_insert(sql, tokens, cx),
+        "UPDATE" => rewrite_update(tokens, cx),
+        "DELETE" => rewrite_delete(tokens, cx),
+        "MERGE" => rewrite_merge_insert(tokens, cx),
+        "CREATE" | "DROP" | "ALTER" if kw(&tokens, 1, "FULLTEXT") => fulltext_ddl(tokens, cx),
         "CREATE" => {
             let second = tokens.get(1).and_then(|t| t.upper()).unwrap_or_default();
             match second.as_str() {
-                "TABLE" => rewrite_create_table(tokens, &mut cx),
+                "TABLE" => rewrite_create_table(tokens, cx),
                 "INDEX" | "UNIQUE" | "CLUSTERED" | "NONCLUSTERED" => {
-                    rewrite_create_index(tokens, &mut cx)
+                    rewrite_create_index(tokens, cx)
                 }
                 "DATABASE" => {
                     let name = tokens
@@ -4295,6 +4735,8 @@ pub(crate) fn translate(
                         statements: vec![format!("CREATE DATABASE {}", ident_sql(name))],
                         kind: Kind::Ddl,
                         extra_column: None,
+                        aliases: Vec::new(),
+                        database: Some((name.to_string(), true)),
                     })
                 }
                 "SCHEMA" => {
@@ -4304,6 +4746,8 @@ pub(crate) fn translate(
                             statements: vec![String::new()],
                             kind: Kind::Ddl,
                             extra_column: None,
+                            aliases: Vec::new(),
+                            database: None,
                         })
                     } else {
                         Err(TsqlError::unsupported("schemas other than dbo"))
@@ -4312,17 +4756,19 @@ pub(crate) fn translate(
                 "VIEW" | "OR" => {
                     let at = find_top(&tokens, 2, &["AS"])
                         .ok_or_else(|| TsqlError::syntax("CREATE VIEW needs AS"))?;
-                    let mut out = rewrite_expr(tokens[..=at].to_vec(), &mut cx)?;
+                    let mut out = rewrite_expr(tokens[..=at].to_vec(), cx)?;
                     out.extend(rewrite_select(
                         sql,
                         tokens[at + 1..].to_vec(),
-                        &mut cx,
+                        cx,
                         false,
                     )?);
                     Ok(Forward {
                         statements: vec![render_text(&out)],
                         kind: Kind::Ddl,
                         extra_column: None,
+                        aliases: Vec::new(),
+                        database: None,
                     })
                 }
                 other => Err(TsqlError::unsupported(format!("CREATE {other}"))),
@@ -4330,7 +4776,7 @@ pub(crate) fn translate(
         }
         "ALTER" => {
             if kw(&tokens, 1, "TABLE") {
-                rewrite_alter_table(tokens, &mut cx)
+                rewrite_alter_table(tokens, cx)
             } else if kw(&tokens, 1, "DATABASE") && kw(&tokens, 3, "SET") {
                 // Options that tune SQL Server itself, which change no answer
                 // here: user access (EnsureDeleted's SINGLE_USER WITH
@@ -4350,6 +4796,8 @@ pub(crate) fn translate(
                         statements: vec![String::new()],
                         kind: Kind::Ddl,
                         extra_column: None,
+                        aliases: Vec::new(),
+                        database: None,
                     })
                 } else {
                     Err(TsqlError::unsupported(format!("ALTER DATABASE … SET {option}")))
@@ -4361,7 +4809,7 @@ pub(crate) fn translate(
                 )))
             }
         }
-        "DROP" => rewrite_drop(tokens, &mut cx),
+        "DROP" => rewrite_drop(tokens, cx),
         "TRUNCATE" => {
             let (table, _) = table_name_at(&tokens, 2)
                 .ok_or_else(|| TsqlError::syntax("TRUNCATE TABLE needs a table"))?;
@@ -4369,12 +4817,16 @@ pub(crate) fn translate(
                 statements: vec![format!("TRUNCATE TABLE {}", ident_sql(&table))],
                 kind: Kind::Ddl,
                 extra_column: None,
+                aliases: Vec::new(),
+                database: None,
             })
         }
         _ => Ok(Forward {
-            statements: vec![render_text(&rewrite_expr(tokens, &mut cx)?)],
+            statements: vec![render_text(&rewrite_expr(tokens, cx)?)],
             kind: Kind::Other,
             extra_column: None,
+            aliases: Vec::new(),
+            database: None,
         }),
     }
 }
@@ -4525,6 +4977,16 @@ mod tests {
     }
 
     fn tr(e: &TestEnv, sql: &str) -> String {
+        tr_named(e, sql).replace(r#" AS "?column?""#, "")
+    }
+
+    /// The statements before the declared names are recorded.
+    fn before_names(sql: String) -> String {
+        sql.split("; CREATE TABLE IF NOT EXISTS __rdb_tds_names").next().unwrap().to_string()
+    }
+
+    /// As translated, unaliased expressions' blank names (`BLANK_NAME`) kept.
+    fn tr_named(e: &TestEnv, sql: &str) -> String {
         let tokens = lex(sql).unwrap();
         translate(sql, tokens, e).unwrap().statements.join("; ")
     }
@@ -4677,21 +5139,25 @@ mod tests {
             [Active] bit NOT NULL DEFAULT CAST(1 AS bit),
             CONSTRAINT [PK_Blogs] PRIMARY KEY CLUSTERED ([Id] ASC)
         ) ON [PRIMARY]";
+        // The statement, then the spellings it was declared with
+        // (`record_names`).
+        let all = tr(&e, sql);
+        assert!(
+            all.contains("('blogs', '', 'Blogs'), ('blogs', 'id', 'Id'), ('blogs', 'url', 'Url')"),
+            "{all}"
+        );
         assert_eq!(
-            tr(&e, sql),
+            all.split("; CREATE TABLE IF NOT EXISTS __rdb_tds_names").next().unwrap(),
             "CREATE TABLE blogs (id serial NOT NULL, url text NULL, rating numeric(18,2) NOT NULL DEFAULT 0, \
              created timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP, active boolean NOT NULL DEFAULT CAST(1 AS boolean), \
              CONSTRAINT pk_blogs PRIMARY KEY (id))"
         );
+        let index = tr(&e, "CREATE NONCLUSTERED INDEX [IX_Posts_BlogId] ON [Posts] ([BlogId] ASC) WITH (ONLINE = ON)");
+        assert_eq!(before_names(index.clone()), "CREATE INDEX posts__ix_posts_blogid ON posts (blogid)");
+        // Its name as declared, keyed by the engine's: what errors quote.
+        assert!(index.contains("('posts', '#posts__ix_posts_blogid', 'IX_Posts_BlogId')"), "{index}");
         assert_eq!(
-            tr(
-                &e,
-                "CREATE NONCLUSTERED INDEX [IX_Posts_BlogId] ON [Posts] ([BlogId] ASC) WITH (ONLINE = ON)"
-            ),
-            "CREATE INDEX posts__ix_posts_blogid ON posts (blogid)"
-        );
-        assert_eq!(
-            tr(&e, "ALTER TABLE [t] ADD [c] int NULL"),
+            tr(&e, "ALTER TABLE [t] ADD [c] int NULL").split("; CREATE TABLE IF NOT EXISTS __rdb_tds_names").next().unwrap(),
             "ALTER TABLE t ADD COLUMN c integer NULL"
         );
     }
@@ -4728,18 +5194,30 @@ mod tests {
     }
 
     #[test]
+    fn names_are_read_from_a_script() {
+        let e = env();
+        let script = "IF NOT EXISTS (SELECT * FROM [__EFMigrationsHistory] WHERE [MigrationId] = N'1')\nBEGIN\n    CREATE TABLE [DenevCloud.ERP.Units] ([Id] int NOT NULL IDENTITY, [Old] int NULL, CONSTRAINT [PK_U] PRIMARY KEY ([Id]));\nEND;\nGO\nIF NOT EXISTS (SELECT 1)\nBEGIN\n    EXEC sp_rename N'[DenevCloud.ERP.Units].[Old]', N'Factor', 'COLUMN';\n    EXEC(N'CREATE UNIQUE INDEX [IX_Code] ON [DenevCloud.ERP.Units] ([Factor]) WHERE [Factor] IS NOT NULL');\nEND;\nGO";
+        let all = names_from_script(script, &e).unwrap().join(";\n");
+        // Recorded, nothing else: no CREATE TABLE of the relation itself.
+        assert!(!all.contains("CREATE TABLE \""), "{all}");
+        for want in ["'Id'", "'PK_U'", "'Factor'", "'IX_Code'", "'DenevCloud.ERP.Units'"] {
+            assert!(all.contains(want), "{want}: {all}");
+        }
+    }
+
+    #[test]
     fn a_not_null_filter_on_a_unique_key_is_the_key() {
         let e = env();
         assert_eq!(
-            tr(&e, "CREATE UNIQUE INDEX [IX_U] ON [AspNetUsers] ([NormalizedUserName]) WHERE [NormalizedUserName] IS NOT NULL"),
+            before_names(tr(&e, "CREATE UNIQUE INDEX [IX_U] ON [AspNetUsers] ([NormalizedUserName]) WHERE [NormalizedUserName] IS NOT NULL")),
             "CREATE UNIQUE INDEX aspnetusers__ix_u ON aspnetusers (normalizedusername)"
         );
         assert_eq!(
-            tr(&e, "CREATE UNIQUE INDEX [IX_P] ON [P] ([Sku], [Name]) WHERE ([Sku] IS NOT NULL AND [Name] IS NOT NULL)"),
+            before_names(tr(&e, "CREATE UNIQUE INDEX [IX_P] ON [P] ([Sku], [Name]) WHERE ([Sku] IS NOT NULL AND [Name] IS NOT NULL)")),
             "CREATE UNIQUE INDEX p__ix_p ON p (sku, name)"
         );
         // Not unique: the index over every row answers the same.
-        assert_eq!(tr(&e, "CREATE INDEX [IX_D] ON [P] ([Sku]) WHERE [Deleted] = 0"), "CREATE INDEX p__ix_d ON p (sku)");
+        assert_eq!(before_names(tr(&e, "CREATE INDEX [IX_D] ON [P] ([Sku]) WHERE [Deleted] = 0")), "CREATE INDEX p__ix_d ON p (sku)");
         for sql in [
             "CREATE UNIQUE INDEX [IX_D] ON [P] ([Sku]) WHERE [Deleted] = 0",
             "CREATE UNIQUE INDEX [IX_D] ON [P] ([Sku]) WHERE [Other] IS NOT NULL",
@@ -4794,5 +5272,17 @@ mod tests {
         );
         assert!(!sql.to_ascii_uppercase().contains("TOP"), "{sql}");
         assert_eq!(sql.matches("LIMIT 1").count(), 3, "{sql}");
+    }
+
+    #[test]
+    fn an_unaliased_expression_goes_unnamed() {
+        let e = env();
+        assert_eq!(
+            tr_named(&e, "SELECT COUNT_BIG(*), [a], [t].[b], 1 + 2, [c] AS [n] FROM [t]"),
+            r#"SELECT count(*) AS "?column?", a, t.b, 1 + 2 AS "?column?", c AS "n" FROM t"#
+        );
+        // Not inside a subquery or a derived table, whose names the outer
+        // query reads.
+        assert!(!tr_named(&e, "SELECT x.n FROM (SELECT COUNT(*) AS n FROM t) AS x WHERE EXISTS (SELECT 1 FROM u)").contains("?column?"));
     }
 }

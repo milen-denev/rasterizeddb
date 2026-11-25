@@ -69,6 +69,10 @@ pub enum PgFunc {
     Ascii,
     Chr,
     StartsWith,
+    /// `pg_input_is_valid(text, type)`: whether the text reads as a value
+    /// of the type, as a cast to it would (PostgreSQL 16): what T-SQL's
+    /// `TRY_CAST` is translated over.
+    PgInputIsValid,
     Initcap,
     Md5,
     ToHex,
@@ -277,7 +281,7 @@ pub const NAMES: &[&str] = &[
     "LOG", "LOG10", "PI", "DEGREES", "RADIANS", "RANDOM", "DIV", "GCD", "LCM", "WIDTH_BUCKET", "FACTORIAL", "JUSTIFY_HOURS", "JUSTIFY_DAYS", "JUSTIFY_INTERVAL", "MAKE_DATE", "MAKE_TIMESTAMP",
     "TO_TIMESTAMP", "TO_DATE", "TO_CHAR", "AGE", "ENCODE", "DECODE", "JSON_BUILD_OBJECT", "JSONB_BUILD_OBJECT",
     "JSON_BUILD_ARRAY", "JSONB_BUILD_ARRAY", "TO_JSON", "TO_JSONB", "JSONB_ARRAY_LENGTH", "JSON_ARRAY_LENGTH",
-    "NUM_NONNULLS", "NUM_NULLS", "STRING_TO_ARRAY", "ARRAY_TO_STRING", "CARDINALITY", "TRIM", "PG_TYPEOF",
+    "NUM_NONNULLS", "NUM_NULLS", "STRING_TO_ARRAY", "ARRAY_TO_STRING", "CARDINALITY", "TRIM", "PG_TYPEOF", "PG_INPUT_IS_VALID",
     "ARRAY_APPEND", "ARRAY_PREPEND", "ARRAY_CAT", "JSONB_SET", "JSONB_STRIP_NULLS", "NEXTVAL", "CURRVAL", "SETVAL",
     "LASTVAL", "PG_GET_USERBYID", "FORMAT_TYPE", "PG_GET_INDEXDEF", "PG_GET_CONSTRAINTDEF", "PG_GET_PARTKEYDEF",
     "PG_GET_FUNCTION_RESULT", "PG_GET_FUNCTION_ARGUMENTS", "PG_GET_FUNCTION_IDENTITY_ARGUMENTS", "PG_GET_EXPR",
@@ -356,6 +360,7 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "ASCII" => (Ascii, &[1]),
         "CHR" => (Chr, &[1]),
         "STARTS_WITH" => (StartsWith, &[2]),
+        "PG_INPUT_IS_VALID" => (PgInputIsValid, &[2]),
         "INITCAP" => (Initcap, &[1]),
         "MD5" => (Md5, &[1]),
         "TO_HEX" => (ToHex, &[1]),
@@ -515,7 +520,7 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
     match func {
         Strpos | Ascii | JsonbArrayLength | NumNonnulls | NumNulls | Cardinality | WidthBucket => DbType::I32,
         Factorial => DbType::DECIMAL,
-        StartsWith => DbType::BOOL,
+        StartsWith | PgInputIsValid => DbType::BOOL,
         Ceil | Floor | Sign | Sqrt => {
             if first() == DbType::DECIMAL {
                 DbType::DECIMAL
@@ -1454,6 +1459,7 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             text_value(c.to_string())
         }
         StartsWith => data(vec![u8::from(s(0).starts_with(&s(1)))], DbType::BOOL),
+        PgInputIsValid => data(vec![u8::from(crate::core::rql::expr::input_is_valid(&s(0), &s(1))?)], DbType::BOOL),
         Initcap => {
             let mut out = String::new();
             let mut in_word = false;

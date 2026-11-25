@@ -199,6 +199,29 @@ Database names are found without case (`CREATE DATABASE [DenevColors]`
 makes `denevcolors`, which a login naming `DenevColors` opens), and a
 pooled connection's reset returns to the login's database after a `USE`.
 
+**Names show as declared.** The engine folds identifiers to lower case;
+the front end records each table's, column's, constraint's, index's and
+database's spelling (CREATE TABLE, ALTER … ADD, CREATE INDEX, CREATE
+DATABASE, sp_rename) in `__rdb_tds_names` and shows it in result columns,
+`FMTONLY`, `sp_tablecollations`, `sys.*`, `INFORMATION_SCHEMA`, `DB_NAME()`
+and error messages. Catalogue lookups (`TABLE_NAME = @t`) ignore case. A
+database made before a build recorded names shows folded names; run the
+script that made it through `EXEC sp_rdb_record_names @script = N'…'`
+(for EF Core, `dotnet ef migrations script --idempotent`): its CREATE
+TABLE, ALTER TABLE … ADD, CREATE INDEX and sp_rename statements, also
+inside `IF … BEGIN … END` and `EXEC(N'…')`, are read for their names and
+not run.
+
+**Errors** carry SQL Server's numbers and wording: 547 for a foreign key
+(`The INSERT statement conflicted with the FOREIGN KEY constraint …`),
+2627 for a PRIMARY KEY or UNIQUE constraint, and 2601 for a unique index
+(`--mssql-unique-index-error 2627` reports those as 2627 for applications
+testing only that number).
+
+**TRY_CAST / TRY_CONVERT** are NULL where the value's text does not read as
+the type (`pg_input_is_valid`). A value of another type is judged by its
+text: `TRY_CAST(1.5 AS int)` is NULL, where SQL Server answers 1.
+
 **Text is case-insensitive by default**, as under SQL Server's default
 collation: a text column a `CREATE TABLE` or `ADD COLUMN` makes without a
 `COLLATE` takes the engine's `rdb_ci` ([collations](collations.md)), so

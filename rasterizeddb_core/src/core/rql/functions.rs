@@ -371,7 +371,7 @@ fn parse_drop(text: &str, kind: RoutineKind) -> Result<RoutineStatement, Refusal
         rest = rest[9..].trim();
     }
     for suffix in ["CASCADE", "RESTRICT"] {
-        if rest.len() >= suffix.len() && rest[rest.len() - suffix.len()..].eq_ignore_ascii_case(suffix) {
+        if rest.len() >= suffix.len() && rest.as_bytes()[rest.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes()) {
             rest = rest[..rest.len() - suffix.len()].trim();
         }
     }
