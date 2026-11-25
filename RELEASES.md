@@ -2,8 +2,13 @@
 
 ## Unreleased
 
+### Silent wrong answers fixed
+
+- A derived table, a CTE, or the outer copy a correlated subquery reads, made from a case-insensitive column, compared that column's bytes: `SELECT (SELECT …) FROM t d WHERE d.slang = 'SEED0-SLANG'` dropped the row holding `'Seed0-Slang'`, with no error.
+
 ### Statements that failed, now answered
 
+- A correlated subquery over an outer query that keeps no row failed with "Column '__lat_k1' not found" instead of returning no rows.
 - `x LIKE p ESCAPE e` over an expression (`CAST(c AS text)`, `upper(c)`) was a syntax error.
 - A correlated subquery reading two outer relations that an `INNER JOIN` keys together on one non-text column was refused.
 - `UNION`, `INTERSECT` and `EXCEPT` over case-insensitive columns were refused; they now compare by key.

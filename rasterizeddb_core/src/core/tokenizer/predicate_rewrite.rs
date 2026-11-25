@@ -4883,7 +4883,22 @@ fn lift_comparison(
     // An operand lifted as an expression (`CAST(c AS text) LIKE p ESCAPE
     // '\\'`, which EF Core writes for a string Contains over a cast) needs
     // the fold as much: the scan after it reads no ESCAPE (42601).
-    let escaped = like_without_escape(rest)?;
+    // Only for a pattern operator, which is all it reads: its lexer refuses
+    // what a pattern never holds (`||`), and called for every lifted
+    // comparison it failed `a IN ('ab' || '  ')` with "unexpected character
+    // '|'" (42601).
+    // A pattern it cannot read (`LIKE 'a' || '%'`) is left as written, as
+    // it was before the fold covered expressions, except under a
+    // `character(n)` operand, which always needed it.
+    let escaped = if !is_pattern_operator(rest) {
+        None
+    } else {
+        match like_without_escape(rest) {
+            Ok(folded) => folded,
+            Err(e) if padded.is_some() => return Err(e),
+            Err(_) => None,
+        }
+    };
     let rest: &str = escaped.as_deref().unwrap_or(rest);
     let left_text: &str = padded.as_deref().unwrap_or(&body[..at]);
     // `(c = 'a') IS TRUE` over a legacy `CHAR` column: the truth test is of a
