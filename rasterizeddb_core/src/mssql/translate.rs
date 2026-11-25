@@ -108,6 +108,10 @@ pub(crate) trait Env {
     fn databases(&self) -> Vec<String> {
         vec![self.database_name().to_string()]
     }
+    /// The catalogue's default database: SQL Server's `master` here.
+    fn default_database(&self) -> Option<String> {
+        None
+    }
     fn variable(&self, name: &str) -> Option<Value>;
     fn param(&self, name: &str) -> Option<ParamSlot>;
     fn system(&self, name: &str) -> Option<Value>;
@@ -1243,6 +1247,46 @@ fn fulltext_index_columns(database: &Database, table: &str) -> Option<Vec<String
         .collect()
 }
 
+/// SQL Server's system databases and their ids. The catalogue's default
+/// database answers for all of them (`resolve_database`): it is `master`.
+const SYSTEM_DATABASES: &[(&str, i64)] = &[("master", 1), ("tempdb", 2), ("model", 3), ("msdb", 4)];
+
+/// A database's id (`DB_ID`, `sys.databases.database_id`): the system
+/// databases' own, the default database `master`'s, and otherwise one made
+/// from its folded name, so it is the same in every session, after a
+/// restart, and whatever other databases come and go. It was the
+/// database's place in the list, and `DB_ID(x)` was 5 for any `x`.
+pub(crate) fn database_id(name: &str, default: Option<&str>) -> i64 {
+    let folded = name.to_lowercase();
+    if let Some(&(_, id)) = SYSTEM_DATABASES.iter().find(|(n, _)| *n == folded) {
+        return id;
+    }
+    if default.is_some_and(|d| d.eq_ignore_ascii_case(&folded)) {
+        return 1;
+    }
+    // FNV-1a over the folded name, past the system ids, within an `int`.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in folded.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    5 + (h % 2_000_000_000) as i64
+}
+
+/// Every database a session can name, with its id: the system databases,
+/// then the catalogue's others (the default one is `master`).
+fn database_ids(env: &dyn Env) -> Vec<(String, i64)> {
+    let default = env.default_database();
+    let mut out: Vec<(String, i64)> = SYSTEM_DATABASES.iter().map(|(n, id)| (n.to_string(), *id)).collect();
+    for name in env.databases() {
+        let id = database_id(&name, default.as_deref());
+        if id > 4 {
+            out.push((name, id));
+        }
+    }
+    out
+}
+
 /// `TRY_CAST(v AS t)` / `TRY_CONVERT(t, v)`: NULL where the cast would
 /// fail. Guarded by whether `v`'s text reads as a `t`
 /// (`pg_input_is_valid`), so a value converted from another type is judged
@@ -1742,8 +1786,29 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
             }]
         }
         "SCHEMA_NAME" => vec![literal_str("dbo")],
+        // An id per database, the same in every session and across
+        // restarts (`database_id`); NULL for a name or id no database has.
+        "DB_NAME" if !inner.is_empty() => {
+            let id = render_text(&rewrite_expr(inner.to_vec(), cx)?);
+            let arms: String = database_ids(cx.env)
+                .into_iter()
+                .map(|(name, id)| format!(" WHEN {id} THEN {}", sql_str(&name)))
+                .collect();
+            vec![Token::raw(format!("CAST(CASE ({id}){arms} END AS text)"))]
+        }
         "DB_NAME" => vec![literal_str(cx.env.database_name())],
-        "DB_ID" => vec![Token::new(Tok::Num("5".into()))],
+        "DB_ID" if !inner.is_empty() => {
+            let name = render_text(&rewrite_expr(inner.to_vec(), cx)?);
+            let arms: String = database_ids(cx.env)
+                .into_iter()
+                .map(|(n, id)| format!(" WHEN {} THEN {id}", sql_str(&n.to_lowercase())))
+                .collect();
+            vec![Token::raw(format!("CAST(CASE lower({name}){arms} END AS integer)"))]
+        }
+        "DB_ID" => {
+            let id = database_id(cx.env.database_name(), cx.env.default_database().as_deref());
+            vec![Token::raw(format!("CAST({id} AS integer)"))]
+        }
         "USER_NAME" | "SUSER_NAME" | "SUSER_SNAME" | "ORIGINAL_LOGIN" | "USER_ID"
             if inner.is_empty() || upper != "USER_ID" =>
         {
@@ -1935,9 +2000,9 @@ fn catalog_view_stored(schema: &str, view: &str, cx: &Cx) -> Result<Option<Strin
         }
         ("sys", "schemas") => "(SELECT * FROM (VALUES ('dbo', 1, 1), ('sys', 4, 4), ('INFORMATION_SCHEMA', 3, 4)) AS v(name, schema_id, principal_id))".into(),
         ("sys", "databases") => {
-            let mut rows = vec!["('master', 1, 'Latin1_General_BIN2', 0, 'ONLINE', 160)".to_string()];
-            for (k, name) in cx.env.databases().iter().enumerate() {
-                rows.push(format!("({}, {}, 'Latin1_General_BIN2', 0, 'ONLINE', 160)", sql_str(name), k + 5));
+            let mut rows = Vec::new();
+            for (name, id) in database_ids(cx.env) {
+                rows.push(format!("({}, {id}, 'Latin1_General_BIN2', 0, 'ONLINE', 160)", sql_str(&name)));
             }
             format!("(SELECT * FROM (VALUES {}) AS v(name, database_id, collation_name, state, state_desc, compatibility_level))", rows.join(", "))
         }

@@ -637,6 +637,9 @@ impl Env for Scope<'_> {
     fn user(&self) -> &str {
         &self.s.login.user
     }
+    fn default_database(&self) -> Option<String> {
+        Some(self.s.shared.catalog.default_name().to_string())
+    }
     fn databases(&self) -> Vec<String> {
         let shown = self.s.shared.database_names.lock();
         self.s

@@ -1371,12 +1371,41 @@ async fn tiberius_try_cast() {
 async fn tiberius_database_name_case() {
     let s = start_with(true);
     let mut c = connect(&s).await;
-    batch(&mut c, "CREATE DATABASE [DenevCloudERP]").await.unwrap();
+    // `IF DB_ID(N'x') IS NULL CREATE DATABASE [x]`: DB_ID was 5 for any
+    // name, and the CREATE was skipped.
+    batch(&mut c, "IF DB_ID(N'DenevCloudERP') IS NULL CREATE DATABASE [DenevCloudERP]").await.unwrap();
     let r = batch(&mut c, "SELECT name FROM sys.databases WHERE name = N'denevclouderp'").await.unwrap();
     assert_eq!(texts(&r[0]), [Some("DenevCloudERP".to_string())]);
+    batch(&mut c, "IF DB_ID(N'DenevCloudERP') IS NULL CREATE DATABASE [DenevCloudERP]").await.unwrap();
+    batch(&mut c, "CREATE DATABASE [Other]").await.unwrap();
+    let ids = |r: &[tiberius::Row]| -> Vec<Option<i32>> { r.iter().map(|r| r.get::<i32, _>(0)).collect() };
+    let r = batch(
+        &mut c,
+        "SELECT DB_ID(N'DoesNotExist42'); SELECT DB_ID(N'master'); SELECT DB_ID(); SELECT DB_ID(N'denevCLOUDerp'); \
+         SELECT DB_ID(N'Other'); SELECT database_id FROM sys.databases WHERE name = N'DenevCloudERP'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&r[0]), [None]);
+    assert_eq!(ids(&r[1]), [Some(1)]);
+    assert_eq!(ids(&r[2]), [Some(1)], "connected to the default database, which is master");
+    let erp = ids(&r[3])[0].expect("an id");
+    assert!(erp > 4);
+    assert_ne!(ids(&r[4])[0], Some(erp));
+    assert_eq!(ids(&r[5]), [Some(erp)]);
+    // A parameter, and DB_NAME of the id.
+    let r = c.query("SELECT DB_ID(@P1), DB_NAME(@P2), DB_NAME(1), DB_NAME(424242)", &[&"DenevCloudERP", &erp]).await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(r[0].get::<i32, _>(0), Some(erp));
+    assert_eq!(r[0].get::<&str, _>(1), Some("DenevCloudERP"));
+    assert_eq!(r[0].get::<&str, _>(2), Some("master"));
+    assert_eq!(r[0].get::<&str, _>(3), None);
+    // The same id from inside the database, after dropping another.
+    batch(&mut c, "DROP DATABASE [Other]").await.unwrap();
     // From inside it, after USE and on a login naming it.
     let r = batch(&mut c, "USE [DENEVCLOUDERP]; SELECT DB_NAME()").await.unwrap();
     assert_eq!(texts(r.last().unwrap()), [Some("DenevCloudERP".to_string())]);
+    let r = batch(&mut c, "SELECT DB_ID()").await.unwrap();
+    assert_eq!(ids(&r[0]), [Some(erp)]);
     drop(c);
     let mut c = connect_to(&s, "denevclouderp").await;
     let r = batch(&mut c, "SELECT DB_NAME()").await.unwrap();
