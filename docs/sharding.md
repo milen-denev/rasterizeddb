@@ -255,6 +255,29 @@ synchronous_commit, txn_start_time}`; the last is a new executor input, so
   READ transaction could read tenant 42 on shard A, then again on B under a
   snapshot B never gave it.
 - Fan-out inside a write, REPEATABLE READ or SERIALIZABLE transaction is refused.
+- **Under the gateway's `two_phase = on`** (as built) a block's statements
+  route on their own, and the block ends in a two-phase commit over every
+  shard it reached. There:
+  - a fan-out read inside the block first joins every shard to it (each gets
+    the block's BEGIN, its global id and its SET LOCALs), so it sees the
+    block's own writes on every shard;
+  - a write with no route key (`UPDATE t SET … WHERE <no key>`, `DELETE`)
+    runs on every shard inside the block, or, in autocommit, inside a
+    two-phase transaction of the gateway's own: every shard's rows change or
+    none do. It needs `unrouted = fan_out`, as a fan-out read does; a
+    reference table's write needs nothing;
+  - a multi-row `INSERT … VALUES (…), (…)` is split by the shard each row
+    goes to, and each shard's rows are sent to it as one INSERT, in the same
+    transaction: a duplicate key in one row inserts none. `RETURNING` rows
+    come back grouped by shard, not in VALUES order. Only a simple Query is
+    split; a prepared multi-row INSERT with parameters still needs its rows
+    on one shard;
+  - an aggregate the home shard coordinates runs in a block only while the
+    block has run on no other shard (the other shards' parts run outside
+    it); a top-N (`ORDER BY` with literal `LIMIT`/`OFFSET`, or none) or a
+    `SELECT DISTINCT` in such a block is merged on the gateway instead.
+  Without `two_phase` a block stays on its first shard, and a fan-out inside
+  it is refused.
 - **`synchronous_commit = off`** in cluster mode skips only the replica's local
   outcome fsync, which phase 3 takes off the critical path anyway; the reply
   still follows quorum and apply (§9.2), so a session always reads its own

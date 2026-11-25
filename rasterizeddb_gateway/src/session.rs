@@ -704,6 +704,13 @@ impl Session {
             let (target, tkey) = self.decide_simple(&map, text).await;
             let outcome = match target {
                 Target::Refuse { sqlstate, message } => {
+                    // A multi-row INSERT is split by the shard each row
+                    // goes to.
+                    if sqlstate == "0A000"
+                        && let Some(outcome) = self.split_insert(conn, msg, text).await?
+                    {
+                        return Ok(outcome);
+                    }
                     if sqlstate == "0A000" {
                         self.core.counters.borrow_mut().refused_no_key += 1;
                     }
@@ -734,7 +741,7 @@ impl Session {
 
     /// The target of a simple query, and the template text it was decided
     /// by (for refutation).
-    async fn decide_simple(&mut self, map: &ShardMap, text: &str) -> (Target, Option<String>) {
+    pub(crate) async fn decide_simple(&mut self, map: &ShardMap, text: &str) -> (Target, Option<String>) {
         if let Some(s) = self.target_known() {
             return (Target::Shard(s), None);
         }

@@ -209,6 +209,16 @@ def main():
     for k in (a, b):
         psql(GW, f"INSERT INTO orders (id, store, v) VALUES ({k}, 1, 1)")
 
+    # 4c. A multi-row INSERT across shards: split by row, all or nothing.
+    code, out = psql(GW, "INSERT INTO orders (id, store, v) VALUES (3001, 1, 1), (3002, 2, 2), (3003, 3, 3), (3004, 4, 4)")
+    check("a multi-row INSERT across shards", (code, out) == (0, "INSERT 0 4"), out)
+    code, out = psql(GW, "INSERT INTO orders (id, store, v) VALUES (3005, 1, 5), (3006, 2, 6) RETURNING id")
+    check("  ...with RETURNING", code == 0 and sorted(out.split()[:2]) == ["3005", "3006"], out)
+    code, out = psql(GW, "INSERT INTO orders (id, store, v) VALUES (3007, 1, 7), (3008, 2, 8), (3001, 9, 9)")
+    got = psql(GW, "SELECT count(*) FROM orders WHERE id IN (3007, 3008)")
+    check("  ...a duplicate in one row inserts none", code != 0 and got == (0, "0"), f"{out} / {got}")
+    psql(GW, "DELETE FROM orders WHERE id >= 3001")
+
     # 5. The DDL fence: a fenced table refuses with a retryable 40001.
     on_every_shard("SET CONFIG shard.ddl_fence = 'orders'")
     code, out = psql(GW, "SELECT v FROM orders WHERE id = 5")

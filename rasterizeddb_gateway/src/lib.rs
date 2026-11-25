@@ -34,6 +34,7 @@ pub mod relay;
 pub mod route;
 pub mod scram;
 pub mod session;
+pub mod split;
 pub mod state;
 
 use std::rc::Rc;

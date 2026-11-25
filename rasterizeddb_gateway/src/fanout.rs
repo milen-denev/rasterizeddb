@@ -475,41 +475,61 @@ impl Session {
     /// reference table, whose every shard holds the same rows).
     async fn fan_write<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, msg: &[u8], merge: Merge, shards: &[u32]) -> io::Result<Outcome> {
         let _ = conn;
-        let implicit = self.txn.status == b'I';
-        if implicit {
-            self.txn.opening.clear();
-            push_query(&mut self.txn.opening, "BEGIN");
-            push_query(
-                &mut self.txn.opening,
-                &format!("SET LOCAL rdb.global_txn = '{}'", crate::session::next_global_txn(&self.core.shared.cfg.gateway_name)),
-            );
-            self.txn.opening_queries = 2;
-            self.txn.status = b'T';
-        }
+        let implicit = self.begin_implicit();
         let ran = match self.join_txn(shards).await {
             Ok(()) => self.run_parts(shards, &merge, msg).await,
             Err(e) => Err(e),
         };
         let parts = match ran {
             Ok(p) => p,
-            Err((code, m)) => {
-                if implicit {
-                    for s in self.txn.shards.clone() {
-                        let _ = self.quiet_query(s, "ROLLBACK").await;
-                    }
-                    self.end_txn();
-                }
-                self.error_ready(&code, &m);
-                return Ok(Outcome::Done { error: true });
-            }
+            Err((code, m)) => return Ok(self.write_failed(implicit, &code, &m).await),
         };
         let mut out = Vec::new();
         merge_parts(&mut out, &merge, &parts);
+        Ok(self.write_done(implicit, out).await)
+    }
+
+    /// Under two-phase commit, a write outside a block runs in a
+    /// transaction of the gateway's own (tagged like a client's): opened
+    /// here, `true` returned, ended by [`Self::write_done`] or
+    /// [`Self::write_failed`].
+    fn begin_implicit(&mut self) -> bool {
+        if self.txn.status != b'I' {
+            return false;
+        }
+        self.txn.opening.clear();
+        push_query(&mut self.txn.opening, "BEGIN");
+        push_query(
+            &mut self.txn.opening,
+            &format!("SET LOCAL rdb.global_txn = '{}'", crate::session::next_global_txn(&self.core.shared.cfg.gateway_name)),
+        );
+        self.txn.opening_queries = 2;
+        self.txn.status = b'T';
+        true
+    }
+
+    /// A multi-shard write failed: the gateway's own transaction rolled
+    /// back on every shard it reached; a client's left failed.
+    async fn write_failed(&mut self, implicit: bool, code: &str, m: &str) -> Outcome {
+        if implicit {
+            for s in self.txn.shards.clone() {
+                let _ = self.quiet_query(s, "ROLLBACK").await;
+            }
+            self.end_txn();
+        }
+        self.error_ready(code, m);
+        Outcome::Done { error: true }
+    }
+
+    /// A multi-shard write's merged reply `out` (rows, then its tag): in a
+    /// client's block, relayed; in the gateway's own transaction, the rows
+    /// relayed and the tag the two-phase commit's answer.
+    async fn write_done(&mut self, implicit: bool, out: Vec<u8>) -> Outcome {
         if !implicit {
             self.out.extend_from_slice(&out);
             let status = self.txn.status;
             pg::ready(&mut self.out, status);
-            return Ok(Outcome::Done { error: false });
+            return Outcome::Done { error: false };
         }
         // Rows (RETURNING) go out now; the count is the commit's answer.
         let mut tag = None;
@@ -520,7 +540,106 @@ impl Session {
                 self.out.extend_from_slice(m);
             }
         }
-        Ok(self.end_two_phase_tagged(true, tag).await)
+        self.end_two_phase_tagged(true, tag).await
+    }
+
+    /// A multi-row INSERT whose rows go to several shards (module docs of
+    /// [`crate::split`]): `None` when it is not one (a row with no route
+    /// key of its own), for the caller to answer as it would have.
+    pub(crate) async fn split_insert<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, msg: &[u8], text: &str) -> io::Result<Option<Outcome>> {
+        let Some(rows) = crate::split::split(text) else {
+            return Ok(None);
+        };
+        let map = self.core.map();
+        let mut groups: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
+        for i in 0..rows.rows.len() {
+            match self.decide_simple(&map, &rows.statement(&[i])).await.0 {
+                crate::session::Target::Shard(s) => groups.entry(s).or_default().push(i),
+                _ => return Ok(None),
+            }
+        }
+        if groups.len() == 1 {
+            let s = *groups.keys().next().expect("one group");
+            return self.run_on(conn, s, msg, Vec::new(), None).await.map(Some);
+        }
+        if !self.core.shared.cfg.two_phase {
+            self.error_ready(
+                "0A000",
+                "this INSERT's rows go to several shards, which needs two_phase = on in the gateway; or send one INSERT per shard",
+            );
+            return Ok(Some(Outcome::Done { error: true }));
+        }
+        if self.txn.status == b'E' {
+            self.error_ready("25P02", "current transaction is aborted, commands ignored until end of transaction block");
+            return Ok(Some(Outcome::Done { error: true }));
+        }
+        self.core.counters.borrow_mut().fan_outs += 1;
+        let shards: Vec<u32> = groups.keys().copied().collect();
+        let implicit = self.begin_implicit();
+        if let Err((code, m)) = self.join_txn(&shards).await {
+            return Ok(Some(self.write_failed(implicit, &code, &m).await));
+        }
+        // Every shard's INSERT at once, each a plain statement there (not
+        // a part: a row the shard does not own is refused, never skipped).
+        let epoch = map.epoch();
+        let mut handles = Vec::with_capacity(groups.len());
+        for (s, idx) in &groups {
+            let id = match self.ensure_vs(*s).await {
+                Ok(id) => id,
+                Err((code, m)) => return Ok(Some(self.write_failed(implicit, &code, &format!("shard {s}: {m}")).await)),
+            };
+            let mut req = Vec::new();
+            Request::encode_pg(&mut req, id, epoch, &query_message(&rows.statement(idx)));
+            handles.push((*s, tokio::task::spawn_local(collect_pg(self.core.clone(), *s, id, req))));
+        }
+        let mut replies = Vec::with_capacity(handles.len());
+        let mut failure = None;
+        for (s, h) in handles {
+            match h.await {
+                Ok(Ok(bytes)) => {
+                    if failure.is_none()
+                        && let Some((_, m)) = pg::messages(&bytes).find(|(t, _)| *t == b'E')
+                    {
+                        failure = Some((pg::error_sqlstate(m).unwrap_or("XX000").to_string(), format!("shard {s}: {}", pg::error_message(m).unwrap_or_default())));
+                    }
+                    replies.push(bytes);
+                }
+                Ok(Err(e)) => {
+                    failure.get_or_insert(e);
+                }
+                Err(_) => {
+                    failure.get_or_insert(("XX000".into(), format!("the part on shard {s} panicked")));
+                }
+            }
+        }
+        if let Some((code, m)) = failure {
+            return Ok(Some(self.write_failed(implicit, &code, &m).await));
+        }
+        // One RowDescription (RETURNING), every row, the counts summed.
+        let mut out = Vec::new();
+        let mut described = false;
+        let mut total = 0u64;
+        let mut head = "INSERT 0".to_string();
+        for bytes in &replies {
+            for (t, m) in pg::messages(bytes) {
+                match t {
+                    b'T' if !described => {
+                        out.extend_from_slice(m);
+                        described = true;
+                    }
+                    b'D' => out.extend_from_slice(m),
+                    b'C' => {
+                        if let Some((h, n)) = pg::tag_count(m) {
+                            head = h;
+                            total += n;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        pg::command_complete(&mut out, &format!("{head} {total}"));
+        Ok(Some(self.write_done(implicit, out).await))
     }
 
     /// A read merged here from parts run inside the session's transaction
@@ -658,6 +777,28 @@ fn push_query(out: &mut Vec<u8>, sql: &str) {
     out.extend_from_slice(&((sql.len() + 5) as i32).to_be_bytes());
     out.extend_from_slice(sql.as_bytes());
     out.push(0);
+}
+
+/// One plain batch's whole reply on `shard`, every chunk fetched.
+async fn collect_pg(core: Rc<Core>, shard: u32, id: u64, req: Vec<u8>) -> Result<Vec<u8>, (String, String)> {
+    let link = core.link(shard).map_err(|e| ("08006".to_string(), e))?;
+    let mut resp = link.call(&core, &req).await;
+    let mut out = Vec::new();
+    loop {
+        match resp {
+            Ok(Response::PgReply { more, bytes, .. }) => {
+                out.extend_from_slice(&bytes);
+                if !more {
+                    return Ok(out);
+                }
+                resp = link.call(&core, &Request::Continue { session: id }.encode()).await;
+            }
+            Ok(Response::Refused(r)) => return Err((r.sqlstate_str().to_string(), format!("shard {shard}: {}", r.message))),
+            Ok(other) => return Err(("XX000".into(), format!("shard {shard} answered with kind {:#04x}", other.kind()))),
+            Err(CallError::Down(e)) => return Err(("08006".into(), e)),
+            Err(CallError::Lost(e)) | Err(CallError::Bad(e)) => return Err(("08007".into(), format!("shard {shard}'s outcome is unknown: {e}"))),
+        }
+    }
 }
 
 /// One shard's part, every chunk fetched, within `cap` bytes.
