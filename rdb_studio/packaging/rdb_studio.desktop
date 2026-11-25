@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=RasterizedDB Studio
+GenericName=Database Console
+Comment=A database console for RasterizedDB and PostgreSQL
+Exec=rdb-studio
+Icon=rdb_studio
+Terminal=false
+Categories=Development;Database;
+StartupWMClass=rdb_studio

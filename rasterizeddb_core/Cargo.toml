@@ -101,6 +101,10 @@ zstd = { version = "0.14", optional = true, features = ["zstdmt"] }
 # has no other use for.
 webpki-roots = { version = "1", optional = true }
 
+[build-dependencies]
+# The icon and version resource of the Windows executable (build.rs).
+winresource = "0.1.34"
+
 [dev-dependencies]
 criterion = { version = "0.8" }
 tempfile = "3"
