@@ -11,7 +11,8 @@
 //! rdb-shard rebalance   --map MAP [--tolerance 0.10] [--max-moves 4] [--max-bytes N]
 //!                       [--pin LO:HI …] [--exclude SHARD …]
 //!                       [--apply --fenced|--online --out NEW_MAP --state-dir DIR
-//!                        --table TABLE:COLUMN:TYPE [--table …]] [--every SECS]
+//!                        [--table TABLE:COLUMN:TYPE …]] [--every SECS]
+//!                       (no --table: every partitioned table, by its key)
 //! rdb-shard split       --map MAP --shard HOT --new-id N --new-addr HOST:PORT [--at BLOCK]
 //!                       --fenced|--online --out NEW_MAP --state-dir DIR --table TABLE:COLUMN:TYPE [--table …]
 //! rdb-shard exec        --map MAP --sql SQL
@@ -945,10 +946,20 @@ async fn apply_moves(
     let out = args.one("out")?;
     let dir = args.one("state-dir")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{dir}: {e}"))?;
-    let tables: Vec<(String, String, String)> = args
-        .flags
-        .get("table")
-        .ok_or("--table TABLE:COLUMN:TYPE is required (once per sharded table)")?
+    let tables: Vec<(String, String, String)> = match args.flags.get("table") {
+        // Without --table, every partitioned table a shard holds.
+        None => {
+            let first = map.shards().first().map(|s| s.id).ok_or("the map has no shards")?;
+            let found = sharded_tables(&connect(map, first, options).await?).await.map_err(|e| format!("shard {first}: {e}"))?;
+            if found.is_empty() {
+                return Err("no partitioned table to move; name them with --table TABLE:COLUMN:TYPE".to_string());
+            }
+            for (t, c, k) in &found {
+                println!("moving {t} by {c} ({k})");
+            }
+            found
+        }
+        Some(given) => given
         .iter()
         .map(|t| {
             let mut it = t.splitn(3, ':');
@@ -960,7 +971,8 @@ async fn apply_moves(
                 _ => Err(format!("--table {t:?}: write TABLE:COLUMN:TYPE")),
             }
         })
-        .collect::<std::result::Result<_, String>>()?;
+        .collect::<std::result::Result<_, String>>()?,
+    };
     let mut current = map.clone();
     for (n, mv) in moves.iter().enumerate() {
         let src = connect(&current, mv.from, options).await?;
@@ -1022,6 +1034,58 @@ async fn apply_moves(
         current.epoch()
     );
     Ok(())
+}
+
+/// Every partitioned table `c`'s database holds, with its key column and the
+/// key's family (`int`, `text`, `uuid`): what a move copies when no `--table`
+/// names them. A key of several columns is refused: name such tables.
+async fn sharded_tables(c: &Client) -> std::result::Result<Vec<(String, String, String)>, String> {
+    let names = c.run("SHOW TABLES").await.map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in names.iter() {
+        let table: String = r.get(0).map_err(|e| e.to_string())?;
+        // System catalogues: never partitioned, and not ours to read.
+        if table.starts_with("__") || table == "rdb_roles" {
+            continue;
+        }
+        let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+        let stats = match c.run(&format!("SHOW TABLE STATS {quoted}")).await {
+            Ok(s) => s,
+            Err(e) => {
+                println!("{table}: not moved, its statistics cannot be read ({e}); name it with --table if it is sharded");
+                continue;
+            }
+        };
+        let key = stats.iter().find_map(|m| {
+            let metric: String = m.get(0).ok()?;
+            (metric == "partition_key").then(|| m.get::<String>(1).ok()).flatten()
+        });
+        let Some(key) = key else { continue };
+        if key.contains(',') {
+            return Err(format!("{table} is partitioned by {key}; name it with --table TABLE:COLUMN:TYPE"));
+        }
+        let columns = c.run(&format!("SHOW COLUMNS FROM {quoted}")).await.map_err(|e| format!("{table}: {e}"))?;
+        let ty = columns
+            .iter()
+            .find_map(|col| {
+                let name: String = col.get(1).ok()?;
+                name.eq_ignore_ascii_case(key.trim()).then(|| col.get::<String>(2).ok()).flatten()
+            })
+            .ok_or_else(|| format!("{table}: no column {key}"))?
+            .to_ascii_uppercase();
+        let family = if ty.contains("UUID") {
+            "uuid"
+        } else if ty.contains("TEXT") || ty.contains("STRING") || ty.contains("CHAR") {
+            "text"
+        } else if ty.contains("INT") || ty.contains("SERIAL") || ((ty.starts_with('I') || ty.starts_with('U')) && ty.len() > 1 && ty[1..].chars().all(|ch| ch.is_ascii_digit())) {
+            // INTEGER, BIGINT, SMALLINT, INT8, SERIAL, or the engine's I32, U64.
+            "int"
+        } else {
+            return Err(format!("{table}: its key {key} is {ty}, which no move routes by; name it with --table"));
+        };
+        out.push((table, key.trim().to_string(), family.to_string()));
+    }
+    Ok(out)
 }
 
 /// `ddl` (module docs).

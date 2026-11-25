@@ -1529,48 +1529,13 @@ impl Session {
                 return Ok(None);
             }
         }
-        let shards: Vec<u32> = map.shards().iter().map(|s| s.id).collect();
-        // Every shard asked at once.
-        let epoch = map.epoch();
-        let mut handles = Vec::with_capacity(shards.len());
-        for &s in &shards {
-            let id = match self.ensure_vs(s).await {
-                Ok(id) => id,
-                Err((c, m)) => {
-                    self.error_ready(&c, &format!("shard {s}: {m}"));
-                    return Ok(Some(Outcome::Done { error: true }));
-                }
-            };
-            let mut req = Vec::new();
-            Request::encode_pg(&mut req, id, epoch, &query_message(text));
-            handles.push((s, tokio::task::spawn_local(crate::meter::carry(collect_pg(self.core.clone(), s, id, req)))));
-        }
-        // Each shard's answer: its column names and rows.
-        let mut answers: Vec<(u32, Vec<String>, Vec<Vec<Option<String>>>)> = Vec::new();
-        for (s, h) in handles {
-            let bytes = match h.await {
-                Ok(Ok(b)) => b,
-                Ok(Err((c, m))) => {
-                    self.error_ready(&c, &m);
-                    return Ok(Some(Outcome::Done { error: true }));
-                }
-                Err(_) => {
-                    self.error_ready("XX000", &format!("the call to shard {s} panicked"));
-                    return Ok(Some(Outcome::Done { error: true }));
-                }
-            };
-            if let Some((_, m)) = pg::messages(&bytes).find(|(t, _)| *t == b'E') {
-                let code = pg::error_sqlstate(m).unwrap_or("XX000").to_string();
-                self.error_ready(&code, &format!("shard {s}: {}", pg::error_message(m).unwrap_or_default()));
+        let answers = match self.ask_every_shard(text).await {
+            Ok(a) => a,
+            Err((code, msg)) => {
+                self.error_ready(&code, &msg);
                 return Ok(Some(Outcome::Done { error: true }));
             }
-            let columns: Vec<String> = row_columns(&bytes).unwrap_or_default().into_iter().map(|(n, _)| n).collect();
-            let rows = pg::messages(&bytes)
-                .filter(|(t, _)| *t == b'D')
-                .map(|(_, m)| row_cells(&m.to_vec()).into_iter().map(|c| c.map(|v| String::from_utf8_lossy(&v).into_owned())).collect())
-                .collect();
-            answers.push((s, columns, rows));
-        }
+        };
         let Some((_, columns, _)) = answers.iter().find(|(s, _, _)| *s == home).or(answers.first()).cloned() else {
             return Ok(None);
         };
@@ -1699,6 +1664,122 @@ impl Session {
             pg::data_row(&mut self.out, &cells);
         }
         pg::command_complete(&mut self.out, &format!("SHOW {}", rows.len()));
+        pg::ready(&mut self.out, b'I');
+        Ok(Some(Outcome::Done { error: false }))
+    }
+
+    /// `sql` (one simple query) on every shard at once: each shard's
+    /// column names and rows, as text. The first error, named by shard.
+    pub(crate) async fn ask_every_shard(&mut self, sql: &str) -> Result<Vec<ShardAnswer>, (String, String)> {
+        let map = self.core.map();
+        let shards: Vec<u32> = map.shards().iter().map(|s| s.id).collect();
+        let epoch = map.epoch();
+        let mut handles = Vec::with_capacity(shards.len());
+        for &s in &shards {
+            let id = self.ensure_vs(s).await.map_err(|(c, m)| (c, format!("shard {s}: {m}")))?;
+            let mut req = Vec::new();
+            Request::encode_pg(&mut req, id, epoch, &query_message(sql));
+            handles.push((s, tokio::task::spawn_local(crate::meter::carry(collect_pg(self.core.clone(), s, id, req)))));
+        }
+        let mut answers = Vec::with_capacity(handles.len());
+        for (s, h) in handles {
+            let bytes = match h.await {
+                Ok(r) => r?,
+                Err(_) => return Err(("XX000".to_string(), format!("the call to shard {s} panicked"))),
+            };
+            if let Some((_, m)) = pg::messages(&bytes).find(|(t, _)| *t == b'E') {
+                let code = pg::error_sqlstate(m).unwrap_or("XX000").to_string();
+                return Err((code, format!("shard {s}: {}", pg::error_message(m).unwrap_or_default())));
+            }
+            let columns: Vec<String> = row_columns(&bytes).unwrap_or_default().into_iter().map(|(n, _)| n).collect();
+            let rows = pg::messages(&bytes)
+                .filter(|(t, _)| *t == b'D')
+                .map(|(_, m)| row_cells(&m.to_vec()).into_iter().map(|c| c.map(|v| String::from_utf8_lossy(&v).into_owned())).collect())
+                .collect();
+            answers.push((s, columns, rows));
+        }
+        Ok(answers)
+    }
+
+    /// The rebalance statements (the studio's Shards tab), answered here:
+    /// `SHOW REBALANCE PLAN` (every shard's load and the planner's moves,
+    /// as `rdb-shard rebalance` plans them), `REBALANCE CLUSTER [MAX MOVES
+    /// n]` (runs `rdb-shard rebalance --apply --online` in the background,
+    /// [`crate::rebalance`]), `SHOW REBALANCE STATUS`. `None` for anything
+    /// else. Only roles named in `rebalance_roles` may run them.
+    pub(crate) async fn rebalance_stmt<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, text: &str) -> io::Result<Option<Outcome>> {
+        let _ = conn;
+        let up = text.trim().trim_end_matches(';').trim().to_ascii_uppercase();
+        let words: Vec<&str> = up.split_whitespace().collect();
+        let max_moves = match words.as_slice() {
+            ["SHOW", "REBALANCE", "PLAN"] | ["SHOW", "REBALANCE", "STATUS"] | ["REBALANCE", "CLUSTER"] => None,
+            ["REBALANCE", "CLUSTER", "MAX", "MOVES", n] => match n.parse::<usize>() {
+                Ok(n) if n > 0 => Some(n),
+                _ => {
+                    self.error_ready("22023", "REBALANCE CLUSTER MAX MOVES takes a positive number");
+                    return Ok(Some(Outcome::Done { error: true }));
+                }
+            },
+            _ => return Ok(None),
+        };
+        let cfg = &self.core.shared.cfg;
+        if !cfg.rebalance_roles.iter().any(|r| *r == self.login.role) {
+            let msg = format!("role \"{}\" may not rebalance the cluster: the gateway's rebalance_roles does not name it", self.login.role);
+            self.error_ready("42501", &msg);
+            return Ok(Some(Outcome::Done { error: true }));
+        }
+        if self.txn.status != b'I' {
+            self.error_ready("25001", "the rebalance statements run outside a transaction block");
+            return Ok(Some(Outcome::Done { error: true }));
+        }
+        match words.as_slice() {
+            ["SHOW", "REBALANCE", "STATUS"] => {
+                let rows = crate::rebalance::status_rows();
+                pg::row_description(&mut self.out, &["name", "value"]);
+                for (k, v) in &rows {
+                    pg::data_row(&mut self.out, &[Some(k), Some(v)]);
+                }
+                pg::command_complete(&mut self.out, &format!("SHOW {}", rows.len()));
+            }
+            ["REBALANCE", ..] => {
+                let cfg = self.core.shared.cfg.clone();
+                let current = self.core.map();
+                match crate::rebalance::start(&cfg, &current, max_moves) {
+                    Ok(line) => {
+                        pg::notice(&mut self.out, &line);
+                        pg::command_complete(&mut self.out, "REBALANCE");
+                    }
+                    Err(e) => {
+                        self.error_ready("55000", &e);
+                        return Ok(Some(Outcome::Done { error: true }));
+                    }
+                }
+            }
+            _ => {
+                let answers = match self.ask_every_shard("SHOW SHARD LOAD").await {
+                    Ok(a) => a,
+                    Err((code, msg)) => {
+                        self.error_ready(&code, &msg);
+                        return Ok(Some(Outcome::Done { error: true }));
+                    }
+                };
+                let map = self.core.map();
+                match crate::rebalance::plan_rows(&map, &self.core.shared.cfg, &answers) {
+                    Ok(rows) => {
+                        pg::row_description(&mut self.out, &crate::rebalance::PLAN_COLUMNS);
+                        for r in &rows {
+                            let cells: Vec<Option<&str>> = r.iter().map(|c| c.as_deref()).collect();
+                            pg::data_row(&mut self.out, &cells);
+                        }
+                        pg::command_complete(&mut self.out, &format!("SHOW {}", rows.len()));
+                    }
+                    Err(e) => {
+                        self.error_ready("XX000", &e);
+                        return Ok(Some(Outcome::Done { error: true }));
+                    }
+                }
+            }
+        }
         pg::ready(&mut self.out, b'I');
         Ok(Some(Outcome::Done { error: false }))
     }
@@ -1874,6 +1955,9 @@ struct OneStatement {
 }
 
 /// One plain batch's whole reply on `shard`, every chunk fetched.
+/// One shard's answer to a query: its id, column names and rows as text.
+pub(crate) type ShardAnswer = (u32, Vec<String>, Vec<Vec<Option<String>>>);
+
 /// `SHOW DATABASE STATS` / `SHOW TABLE STATS` metrics that are the same
 /// figure on every shard, or a position rather than an amount: never summed.
 const NOT_SUMMED: &[&str] = &[

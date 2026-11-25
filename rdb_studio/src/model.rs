@@ -1491,6 +1491,28 @@ pub struct ShardsSnapshot {
     /// Two-phase parts prepared on the shard the connection reached, by
     /// global id.
     pub prepared: Vec<String>,
+    /// A gateway's `SHOW REBALANCE STATUS` rows, `(name, value)`, the
+    /// tool's output as `log` rows; empty when not through a gateway.
+    pub rebalance: Vec<(String, String)>,
+    /// Why the rebalance controls are not offered: the gateway refused the
+    /// status (this role is not in its rebalance_roles, an older gateway).
+    pub rebalance_refused: Option<String>,
+}
+
+/// One row of a gateway's `SHOW REBALANCE PLAN`: a `load` row per shard
+/// (its share of the load before and after, in percent), a `move` of blocks
+/// `[lo, hi)` from `shard` to `to_shard`, a `split` to make first, or one
+/// `balanced` row.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RebalanceStep {
+    pub kind: String,
+    pub shard: String,
+    pub to_shard: String,
+    pub lo: String,
+    pub hi: String,
+    pub bytes: String,
+    pub before: String,
+    pub after: String,
 }
 
 impl ShardsSnapshot {
@@ -1509,6 +1531,16 @@ impl ShardsSnapshot {
     /// Whether every block of the hash space has an owner.
     pub fn covered_blocks(&self) -> u64 {
         self.shards.iter().map(|s| s.blocks).sum()
+    }
+
+    /// The rebalance's state as the gateway reports it: `idle`, `running`,
+    /// `done` or `failed`; `None` when not reported.
+    pub fn rebalance_state(&self) -> Option<&str> {
+        self.rebalance.iter().find(|(k, _)| k == "state").map(|(_, v)| v.as_str())
+    }
+
+    pub fn rebalance_running(&self) -> bool {
+        self.rebalance_state() == Some("running")
     }
 }
 

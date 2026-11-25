@@ -575,6 +575,10 @@ impl Session {
         if let Some(outcome) = self.cluster_show(conn, &text).await? {
             return Ok(outcome);
         }
+        // The rebalance statements (the studio's Shards tab).
+        if let Some(outcome) = self.rebalance_stmt(conn, &text).await? {
+            return Ok(outcome);
+        }
         match local_of(&text) {
             Local::ShowGateway => {
                 let rows = crate::admin::show_gateway(&self.core.shared);

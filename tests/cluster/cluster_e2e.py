@@ -28,6 +28,8 @@ FE_PG, FE_MY, FE_RDB, FE_MS = BASE + 40, BASE + 41, BASE + 42, BASE + 43  # the 
 CLUSTER = "0123456789abcdef0123456789abcdef"
 BLOCKS = 1 << 48
 ENV = dict(os.environ, PGPASSWORD="pw", PGSSLMODE="prefer")
+# The gateway's rebalance logs in to the shards with this (rebalance_password_env).
+os.environ["RDB_E2E_PASSWORD"] = "pw"
 # Every link compressed (gateway to shards, shard to shard), with a low
 # threshold so nearly every frame is.
 COMPRESS = os.environ.get("CLUSTER_COMPRESSION") == "1"
@@ -229,7 +231,13 @@ retries = 10
 api_listen = 127.0.0.1:{API}
 api_token_file = {WORK}/api.token
 config_dir = {WORK}/gateway_config
-""" + ("user_routing = prefer\n" if ENTERPRISE else "") + ("shard_compression = zstd:3\nshard_compression_min_bytes = 64\n" if COMPRESS else ""))
+""" + (f"""rebalance_tool = {RDB_SHARD}
+rebalance_roles = rasterized
+rebalance_user = rasterized
+rebalance_password_env = RDB_E2E_PASSWORD
+rebalance_native = {", ".join(f"{n}=127.0.0.1:{RDB[n]}" for n in ALL)}
+rebalance_extra = --database postgres
+""" if RDB_SHARD else "") + ("user_routing = prefer\n" if ENTERPRISE else "") + ("shard_compression = zstd:3\nshard_compression_min_bytes = 64\n" if COMPRESS else ""))
     log = open(f"{WORK}/gateway.log", "ab")
     if ENTERPRISE:
         cmd = [ENTERPRISE, "--config", conf, "--client-stats-roles", "rasterized", "--client-stats-dir", f"{WORK}/stats",
@@ -984,6 +992,7 @@ def main():
     if RDB_SHARD:
         cluster_backup(tls, cmap)
         split_online(tls, cmap)
+        cluster_rebalance()
     if os.environ.get("CLUSTER_SERVE") == "after":
         print(f"serving after the checks: gateway {GW}, shards {PG}", flush=True)
         while True:
@@ -1106,9 +1115,9 @@ def config_api(tls, cmap):
     check("  ...refuses the next login", code != 0 and "may not log in" in out, out)
     restart_gateway(tls, cmap)
     code, out = as_customer("SELECT 1")
-    # Without cached keys the refused role is not proven against any shard:
-    # refused either way.
-    check("  ...and still after a restart (kept in the store)", code != 0 and ("may not log in" in out or "authentication failed" in out), out)
+    # No keys cached after the restart: the refused role's keys are found
+    # on whichever shard has it, so the refusal says why.
+    check("  ...and still after a restart (kept in the store), saying why", code != 0 and "may not log in" in out, out)
     code, body = api("DELETE", "/v1/routes/acme/acme_app")
     check("  ...a route removed", code == 200, (code, body))
 
@@ -1204,6 +1213,52 @@ def cluster_backup(tls, cmap):
     check("  ...the two-phase transaction before the cut is whole, on more than one shard",
           sum(int(x) for x in per) == 4 and sum(1 for x in per if x != "0") >= 2, per)
     psql(GW, "DELETE FROM orders WHERE id >= 7000 AND id < 7400")
+
+
+def gateway_value(name):
+    rows = dict(l.split("|", 1) for l in psql(GW, "SHOW GATEWAY")[1].splitlines() if "|" in l)
+    return rows.get(name)
+
+
+def cluster_rebalance():
+    """The gateway's rebalance (the studio's Shards tab): after the split
+    shard 3 and shard 1 hold a sixth of the blocks each and the others a
+    third, so the planner moves ranges; a run moves them online and loses
+    nothing."""
+    code, out = psql(GW2, "SHOW REBALANCE STATUS")
+    check("rebalance: refused where rebalance_roles does not name the role", code != 0 and "rebalance_roles" in out, out)
+    check("  ...idle before any run", psql(GW, "SHOW REBALANCE STATUS") == (0, "state|idle"), psql(GW, "SHOW REBALANCE STATUS"))
+    before = psql(GW, "SELECT count(*), sum(v) FROM orders")
+    epoch_before = int(gateway_value("map_epoch") or 0)
+    code, out = psql(GW, "SHOW REBALANCE PLAN")
+    moves = [l for l in out.splitlines() if l.startswith("move|")]
+    loads = [l for l in out.splitlines() if l.startswith("load|")]
+    check("  ...a plan: every shard's load and the moves", code == 0 and len(loads) == len(ALL) and moves, out)
+    code, out = psql(GW, "REBALANCE CLUSTER MAX MOVES 1")
+    check("  ...a run starts", code == 0, out)
+    status = dict(l.split("|", 1) for l in psql(GW, "SHOW REBALANCE STATUS")[1].splitlines() if l.startswith("state|"))
+    if status.get("state") == "running":
+        code, out = psql(GW, "REBALANCE CLUSTER")
+        check("  ...a second run is refused while one runs", code != 0 and "still running" in out, out)
+    state, out = "running", ""
+    end = time.time() + 600
+    while time.time() < end:
+        out = psql(GW, "SHOW REBALANCE STATUS")[1]
+        state = dict(l.split("|", 1) for l in out.splitlines() if l.startswith("state|")).get("state", "?")
+        if state != "running":
+            break
+        time.sleep(1)
+    check("  ...the run finishes", state == "done", out[-3000:])
+    end = time.time() + 30
+    while time.time() < end and int(gateway_value("map_epoch") or 0) <= epoch_before:
+        psql(GW, "SELECT count(*) FROM orders")
+        time.sleep(0.5)
+    check("  ...the gateway follows the moved map", int(gateway_value("map_epoch") or 0) > epoch_before,
+          (epoch_before, gateway_value("map_epoch")))
+    after = psql(GW, "SELECT count(*), sum(v) FROM orders")
+    check("  ...every row once, through the gateway", after == before, (before, after))
+    check("  ...keyed reads after the move", all(psql(GW, f"SELECT count(*) FROM orders WHERE id = {k}") == (0, "1") for k in (1, 150, 300)),
+          [psql(GW, f"SELECT count(*) FROM orders WHERE id = {k}") for k in (1, 150, 300)])
 
 
 def split_online(tls, cmap):

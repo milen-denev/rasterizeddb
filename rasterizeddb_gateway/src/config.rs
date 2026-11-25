@@ -89,6 +89,19 @@ pub struct Config {
     pub api_listen: Option<SocketAddr>,
     pub api_token_file: Option<std::path::PathBuf>,
     pub config_dir: Option<std::path::PathBuf>,
+    /// Rebalancing from a client (`crate::rebalance`): the `rdb-shard`
+    /// binary, the roles that may plan and run it, its login on the shards
+    /// (the password in the environment variable named), each shard's native
+    /// address when the map names rshard listeners, more flags for it, and
+    /// the planner's tolerance and moves per run.
+    pub rebalance_tool: Option<String>,
+    pub rebalance_roles: Vec<String>,
+    pub rebalance_user: String,
+    pub rebalance_password_env: String,
+    pub rebalance_native: Vec<String>,
+    pub rebalance_extra: Vec<String>,
+    pub rebalance_tolerance: f64,
+    pub rebalance_max_moves: usize,
     pub native_listen: Option<SocketAddr>,
     /// The Redis protocol, routed by key (`kv`): where it listens, and each
     /// shard's Redis address.
@@ -148,6 +161,14 @@ impl Default for Config {
             api_listen: None,
             api_token_file: None,
             config_dir: None,
+            rebalance_tool: None,
+            rebalance_roles: Vec::new(),
+            rebalance_user: String::new(),
+            rebalance_password_env: "RDB_PASSWORD".to_string(),
+            rebalance_native: Vec::new(),
+            rebalance_extra: Vec::new(),
+            rebalance_tolerance: 0.10,
+            rebalance_max_moves: 4,
             native_listen: None,
             kv_listen: None,
             kv_shards: BTreeMap::new(),
@@ -233,6 +254,8 @@ impl Config {
     pub fn set(&mut self, k: &str, v: &str) -> Result<(), String> {
         let num = |v: &str| v.parse::<u64>().map_err(|_| format!("{v:?} is not a number"));
         let opt = |v: &str| (!v.is_empty() && v != "off" && v != "none").then(|| v.to_string());
+        // A comma- or space-separated list.
+        let list = |v: &str| v.split([',', ' ']).map(str::trim).filter(|x| !x.is_empty()).map(str::to_string).collect::<Vec<String>>();
         match k {
             "listen" => {
                 self.listen = v
@@ -349,6 +372,22 @@ impl Config {
             "api_listen" => self.api_listen = opt(v).map(|a| a.parse()).transpose().map_err(|_| "not host:port")?,
             "api_token_file" => self.api_token_file = opt(v).map(std::path::PathBuf::from),
             "config_dir" => self.config_dir = opt(v).map(std::path::PathBuf::from),
+            "rebalance_tool" => self.rebalance_tool = opt(v),
+            "rebalance_roles" => self.rebalance_roles = list(v),
+            "rebalance_user" => self.rebalance_user = v.trim().to_string(),
+            "rebalance_password_env" => self.rebalance_password_env = v.trim().to_string(),
+            "rebalance_native" => {
+                let specs = list(v);
+                if let Some(bad) = specs.iter().find(|s| s.split_once('=').is_none_or(|(id, addr)| id.parse::<u32>().is_err() || addr.is_empty())) {
+                    return Err(format!("{bad:?}: write ID=HOST:PORT"));
+                }
+                self.rebalance_native = specs;
+            }
+            "rebalance_extra" => self.rebalance_extra = v.split_whitespace().map(str::to_string).collect(),
+            "rebalance_tolerance" => {
+                self.rebalance_tolerance = v.trim().parse::<f64>().ok().filter(|t| *t > 0.0 && *t < 1.0).ok_or("a fraction between 0 and 1")?
+            }
+            "rebalance_max_moves" => self.rebalance_max_moves = num(v)?.max(1) as usize,
             _ => return Err("unknown key".into()),
         }
         Ok(())

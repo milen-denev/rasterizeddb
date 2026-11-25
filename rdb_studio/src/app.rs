@@ -192,6 +192,8 @@ pub struct Studio {
 
     // --- shards
     pub shards: Option<ShardsSnapshot>,
+    /// The last `SHOW REBALANCE PLAN` on the shards page, or why it failed.
+    pub rebalance_plan: Option<Result<Vec<RebalanceStep>, String>>,
 
     // --- replication
     pub replication: Option<ReplicationSnapshot>,
@@ -758,6 +760,8 @@ pub enum Refresh {
     /// A branch was made, reset, swapped, merged or dropped: the branch list,
     /// and the databases, which branches are.
     Branches,
+    /// A rebalance was started: the shards page and its status.
+    Shards,
 }
 
 #[derive(Debug, Clone)]
@@ -901,6 +905,11 @@ pub enum Message {
     // --- shards
     ReloadShards,
     ShardsLoaded(Box<ShardsSnapshot>),
+    /// Asks the gateway for the planner's moves.
+    PlanRebalance,
+    RebalancePlanned(Result<Vec<RebalanceStep>, String>),
+    /// Confirms, then starts a rebalance on the gateway.
+    StartRebalance,
 
     // --- replication
     ReloadReplication,
@@ -1339,6 +1348,7 @@ impl Studio {
             merge_policy: MergePolicy::Fail,
             merge_allow_drop: false,
             shards: None,
+            rebalance_plan: None,
             replication: None,
             peer_name: String::new(),
             peer_address: String::new(),
@@ -1397,6 +1407,10 @@ impl Studio {
     /// nobody is looking at.
     pub fn subscription(&self) -> Subscription<Message> {
         let mut subscriptions = Vec::new();
+        // A rebalance running: its status every two seconds.
+        if self.session.is_some() && self.tab == Tab::Shards && self.shards.as_ref().is_some_and(ShardsSnapshot::rebalance_running) {
+            subscriptions.push(iced::time::every(Duration::from_secs(2)).map(|_| Message::ReloadShards));
+        }
         if self.session.is_some() && self.live && self.tab == Tab::Dashboard {
             subscriptions.push(
                 iced::time::every(Duration::from_secs(self.interval.max(1))).map(|_| Message::Tick),
@@ -1705,6 +1719,7 @@ impl Studio {
                 self.activity = None;
                 self.replication = None;
                 self.shards = None;
+                self.rebalance_plan = None;
                 self.storage = None;
                 self.storage_report.clear();
                 self.tables.clear();
@@ -2386,6 +2401,37 @@ impl Studio {
             Message::ReloadShards => self.load_shards(),
             Message::ShardsLoaded(snapshot) => {
                 self.shards = Some(*snapshot);
+                Task::none()
+            }
+            Message::PlanRebalance => {
+                let Some(session) = self.session.clone() else { return Task::none() };
+                self.rebalance_plan = None;
+                Task::perform(
+                    async move { session.query(dialect::SHOW_REBALANCE_PLAN_SQL).await.map(|g| dialect::parse_rebalance_plan(&g)) },
+                    Message::RebalancePlanned,
+                )
+            }
+            Message::RebalancePlanned(plan) => {
+                self.rebalance_plan = Some(plan);
+                Task::none()
+            }
+            Message::StartRebalance => {
+                let moves = match &self.rebalance_plan {
+                    Some(Ok(steps)) => steps.iter().filter(|s| s.kind == "move").count(),
+                    _ => 0,
+                };
+                self.modal = Some(Modal::Confirm {
+                    title: "Rebalance the cluster".to_string(),
+                    body: format!(
+                        "The gateway runs rdb-shard rebalance --apply --online: each planned range \
+                         ({moves} in the last plan) is copied to its new shard at one snapshot, \
+                         verified, and handed off one map epoch up, while writes go on. Each move \
+                         copies its rows across the network and the disks; the source rows stay until \
+                         `rdb-shard retire`. Progress shows on this page."
+                    ),
+                    statement: dialect::REBALANCE_SQL.to_string(),
+                    refresh: Refresh::Shards,
+                });
                 Task::none()
             }
             Message::ReloadReplication => self.load_replication(),
@@ -3282,6 +3328,7 @@ impl Studio {
                     ]),
                     Refresh::Backups => self.load_backups(),
                     Refresh::Replication => self.load_replication(),
+                    Refresh::Shards => self.load_shards(),
                     Refresh::Storage => self.load_storage(),
                     Refresh::Activity => self.load_activity(),
                     Refresh::Branches => {
@@ -3504,6 +3551,14 @@ impl Studio {
                 }
                 if let Ok(grid) = session.query(dialect::SHOW_GATEWAY_SQL).await {
                     snapshot.gateway = dialect::parse_gateway(&grid);
+                }
+                // Through a gateway, its rebalance: refused for a role it does
+                // not name, which the page then says instead of the controls.
+                if !snapshot.gateway.is_empty() {
+                    match session.query(dialect::SHOW_REBALANCE_STATUS_SQL).await {
+                        Ok(grid) => snapshot.rebalance = dialect::parse_gateway(&grid),
+                        Err(e) => snapshot.rebalance_refused = Some(e),
+                    }
                 }
                 if snapshot.supported {
                     if let Ok(grid) = session.query(dialect::SHOW_SHARD_LOAD_SQL).await {

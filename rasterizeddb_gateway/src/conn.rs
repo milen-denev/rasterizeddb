@@ -158,10 +158,14 @@ async fn login<S: AsyncRead + AsyncWrite + Unpin>(
     // roles: its database may live nowhere else. The pin is acted on (a
     // refusal included) only after the proof.
     let keys_from = match shared.cfg.user_routing {
-        UserRoutingMode::Off => None,
+        UserRoutingMode::Off => KeysFrom::Home,
         _ => match shared.hooks.user_routing.pin(&database, &role) {
-            UserPin::Shard(id) => Some(id),
-            _ => None,
+            UserPin::Shard(id) => KeysFrom::Shard(id),
+            // A refused role's shard is not known here: its keys are looked
+            // for on every shard, so a right password hears the refusal and
+            // not "password authentication failed".
+            UserPin::Refuse(_) => KeysFrom::AnyShard,
+            UserPin::None => KeysFrom::Home,
         },
     };
     if shared.cfg.auth == AuthMode::Scram {
@@ -248,7 +252,7 @@ async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
     database: &str,
     role: &str,
     cbind: Option<&[u8; 32]>,
-    keys_from: Option<u32>,
+    keys_from: KeysFrom,
 ) -> io::Result<Result<(), String>> {
     let shared = &core.shared;
     let keys = match shared.auth.get(database, role) {
@@ -333,9 +337,39 @@ async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-async fn fetch_keys(core: &Core, database: &str, role: &str, from: Option<u32>) -> Result<AuthKeys, String> {
+/// Where a login's keys are read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeysFrom {
+    /// The home shard's roles.
+    Home,
+    /// The shard the login is pinned to.
+    Shard(u32),
+    /// The first shard, home first, that has the role (a refused pin).
+    AnyShard,
+}
+
+async fn fetch_keys(core: &Core, database: &str, role: &str, from: KeysFrom) -> Result<AuthKeys, String> {
     let map = core.map();
-    let home = from.unwrap_or_else(|| core.shared.home(&map));
+    let home = core.shared.home(&map);
+    match from {
+        KeysFrom::Home => fetch_keys_on(core, database, role, home).await,
+        KeysFrom::Shard(id) => fetch_keys_on(core, database, role, id).await,
+        KeysFrom::AnyShard => {
+            let mut order: Vec<u32> = map.shards().iter().map(|s| s.id).filter(|&id| id != home).collect();
+            order.insert(0, home);
+            let mut last = None;
+            for id in order {
+                match fetch_keys_on(core, database, role, id).await {
+                    Ok(k) if k.found => return Ok(k),
+                    other => last = Some(other),
+                }
+            }
+            last.unwrap_or_else(|| Err("the map has no shards".to_string()))
+        }
+    }
+}
+
+async fn fetch_keys_on(core: &Core, database: &str, role: &str, home: u32) -> Result<AuthKeys, String> {
     let link = core.link(home)?;
     let req = Request::AuthFetch { database: database.to_string(), role: role.to_string() }.encode();
     match link.call(core, &req).await {
