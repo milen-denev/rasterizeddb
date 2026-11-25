@@ -1513,3 +1513,65 @@ GO";
     let e = batch(&mut c, "INSERT INTO [DenevCloud.ERP.Units] ([ShortName], [Code]) VALUES (N'g', N'k')").await.err().expect("refused");
     assert!(e.to_string().contains("with unique index 'IX_DenevCloud.ERP.Units_Code'"), "{e}");
 }
+
+/// INFORMATION_SCHEMA.COLUMNS has SQL Server's columns: tools build a
+/// column's type as `DATA_TYPE + ISNULL('(' + CAST(DATETIME_PRECISION AS
+/// varchar) + ')', '')`, which failed for want of DATETIME_PRECISION. And
+/// a CAST to a character type without a length keeps 30 characters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_information_schema_columns() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [DenevCloud.ERP.Orders] ([Id] int NOT NULL PRIMARY KEY, [Total] decimal(18,2) NOT NULL, \
+         [Created] datetime2 NOT NULL, [Note] nvarchar(40) NULL, [Body] nvarchar(max) NULL, [Code] varchar(10) COLLATE Latin1_General_BIN2 NULL)",
+    )
+    .await
+    .unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT DATA_TYPE + ISNULL('(' + CAST(DATETIME_PRECISION AS varchar) + ')','') FROM INFORMATION_SCHEMA.COLUMNS \
+         WHERE TABLE_NAME='DenevCloud.ERP.Orders' AND COLUMN_NAME='Created'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(texts(&r[0]), [Some("datetime2(6)".to_string())]);
+    let r = batch(
+        &mut c,
+        "SELECT COLUMN_NAME, NUMERIC_PRECISION, NUMERIC_SCALE, CHARACTER_MAXIMUM_LENGTH, CHARACTER_OCTET_LENGTH, COLLATION_NAME \
+         FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = N'DenevCloud.ERP.Orders' ORDER BY ORDINAL_POSITION",
+    )
+    .await
+    .unwrap();
+    let got: Vec<(String, Option<i32>, Option<i32>, Option<i32>, Option<i32>, Option<String>)> = r[0]
+        .iter()
+        .map(|r| {
+            (
+                r.get::<&str, _>(0).unwrap().to_string(),
+                r.get::<i32, _>(1),
+                r.get::<i32, _>(2),
+                r.get::<i32, _>(3),
+                r.get::<i32, _>(4),
+                r.get::<&str, _>(5).map(str::to_string),
+            )
+        })
+        .collect();
+    let ci = Some("SQL_Latin1_General_CP1_CI_AS".to_string());
+    assert_eq!(
+        got,
+        [
+            ("Id".into(), Some(10), Some(0), None, None, None),
+            ("Total".into(), Some(18), Some(2), None, None, None),
+            ("Created".into(), None, None, None, None, None),
+            ("Note".into(), None, None, Some(40), Some(80), ci.clone()),
+            ("Body".into(), None, None, Some(-1), Some(-1), ci),
+            ("Code".into(), None, None, Some(10), Some(20), Some("Latin1_General_BIN2".to_string())),
+        ]
+    );
+    let long = "x".repeat(40);
+    let r = batch(&mut c, &format!("SELECT CAST(N'{long}' AS nvarchar), CONVERT(varchar, N'{long}'), CAST(N'{long}' AS nvarchar(max))")).await.unwrap();
+    assert_eq!(r[0][0].get::<&str, _>(0).map(str::len), Some(30));
+    assert_eq!(r[0][0].get::<&str, _>(1).map(str::len), Some(30));
+    assert_eq!(r[0][0].get::<&str, _>(2).map(str::len), Some(40));
+}

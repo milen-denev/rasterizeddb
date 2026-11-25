@@ -1287,6 +1287,18 @@ fn database_ids(env: &dyn Env) -> Vec<(String, i64)> {
     out
 }
 
+/// A CAST's or CONVERT's target type: a character type without a length
+/// is 30 long there, as SQL Server's (`CAST(x AS varchar)` keeps 30
+/// characters), where a column declared so is 1.
+fn cast_type(ty: &[Token]) -> Vec<Token> {
+    match ty {
+        [t] if t.upper().is_some_and(|w| matches!(w.as_str(), "VARCHAR" | "NVARCHAR" | "CHAR" | "NCHAR")) => {
+            vec![t.clone(), Token::op("("), Token::new(Tok::Num("30".into())), Token::op(")")]
+        }
+        _ => ty.to_vec(),
+    }
+}
+
 /// `TRY_CAST(v AS t)` / `TRY_CONVERT(t, v)`: NULL where the cast would
 /// fail. Guarded by whether `v`'s text reads as a `t`
 /// (`pg_input_is_valid`), so a value converted from another type is judged
@@ -1667,7 +1679,7 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
             let at =
                 find_top(inner, 0, &["AS"]).ok_or_else(|| TsqlError::syntax("CAST needs AS"))?;
             let value = rewrite_expr(inner[..at].to_vec(), cx)?;
-            let target = map_type(&inner[at + 1..])?;
+            let target = map_type(&cast_type(&inner[at + 1..]))?;
             if upper == "TRY_CAST" {
                 try_cast(&value, &target)
             } else {
@@ -1686,7 +1698,7 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
                     "The CONVERT function requires at least 2 argument(s).",
                 ));
             }
-            let target = map_type(&r[0])?;
+            let target = map_type(&cast_type(&r[0]))?;
             let value = rewrite_expr(r[1].clone(), cx)?;
             let style = r.get(2).and_then(|s| render_text(s).parse::<u32>().ok());
             let pattern = match (style, target.as_str()) {
@@ -1976,7 +1988,14 @@ fn catalog_view_stored(schema: &str, view: &str, cx: &Cx) -> Result<Option<Strin
                     .as_deref()
                     .is_some_and(|d| d.to_ascii_lowercase().starts_with("nextval("));
                 let pk = schema.primary_key.as_deref() == Some(f.name.as_str());
-                let ty = tsql_type_name(&f.db_type, f.without_time_zone, f.json_text);
+                // A declared length: `nvarchar(40)`, `nchar(3)` (both kinds
+                // of text are the engine's one: shown as SQL Server's
+                // Unicode ones).
+                let ty = match (f.db_type == crate::core::db_type::DbType::STRING && !f.json_text, f.text_typmod()) {
+                    (true, Some(crate::core::rql::type_modifier::TextTypmod::Varchar(n))) if n > 0 => format!("nvarchar({n})"),
+                    (true, Some(crate::core::rql::type_modifier::TextTypmod::Bpchar(n))) if n > 0 => format!("nchar({n})"),
+                    _ => tsql_type_name(&f.db_type, f.without_time_zone, f.json_text),
+                };
                 (f.name.clone(), ty, !pk, default, identity)
             })
             .collect()
@@ -2015,6 +2034,12 @@ fn catalog_view_stored(schema: &str, view: &str, cx: &Cx) -> Result<Option<Strin
             for t in &tables {
                 for (k, (name, ty, nullable, _, identity)) in columns_of(t).into_iter().enumerate() {
                     let (type_id, max_len) = type_ids(&ty);
+                    // A declared length, in bytes as SQL Server counts
+                    // them (two per character of nvarchar / nchar).
+                    let max_len = ty
+                        .split_once('(')
+                        .and_then(|(_, r)| r.trim_end_matches(')').parse::<i32>().ok())
+                        .map_or(max_len, |n| n * 2);
                     rows.push(format!(
                         "({}, {}, {}, {type_id}, {type_id}, {max_len}, 0, 0, {nullable}, {identity}, false)",
                         object_id(t),
@@ -2097,14 +2122,65 @@ fn catalog_view_stored(schema: &str, view: &str, cx: &Cx) -> Result<Option<Strin
             values(rows, &cols, empty(&cols))
         }
         ("information_schema", "columns") => {
-            let cols = ["table_catalog", "table_schema", "table_name", "column_name", "ordinal_position", "column_default", "is_nullable", "data_type", "character_maximum_length"];
+            // SQL Server's columns, in its order: tools read the numeric,
+            // datetime and collation ones (`DATA_TYPE + '(' +
+            // CAST(DATETIME_PRECISION …)`), and a name it lacked failed.
+            let cols = [
+                "table_catalog", "table_schema", "table_name", "column_name", "ordinal_position", "column_default",
+                "is_nullable", "data_type", "character_maximum_length", "character_octet_length", "numeric_precision",
+                "numeric_precision_radix", "numeric_scale", "datetime_precision", "character_set_catalog",
+                "character_set_schema", "character_set_name", "collation_catalog", "collation_schema", "collation_name",
+                "domain_catalog", "domain_schema", "domain_name",
+            ];
+            let int = |v: Option<i64>| v.map(|v| v.to_string()).unwrap_or_else(|| "CAST(NULL AS integer)".into());
+            let text = |v: Option<&str>| v.map(sql_str).unwrap_or_else(|| "CAST(NULL AS text)".into());
             let mut rows = Vec::new();
             for t in &tables {
+                let view = database.schema_view(t);
+                let schema = view.as_ref().map(|v| v.schema());
                 for (k, (name, ty, nullable, default, _)) in columns_of(t).into_iter().enumerate() {
                     let base = ty.split('(').next().unwrap_or(&ty).to_string();
                     let len = ty.split_once('(').and_then(|(_, r)| r.trim_end_matches(')').parse::<i64>().ok());
+                    let field = schema.and_then(|s| s.fields.iter().find(|f| !f.is_deleted && f.name == name));
+                    let is_text = base.starts_with("nvarchar") || base.starts_with("varchar") || base.starts_with("nchar");
+                    let max_len = len.or_else(|| (ty.ends_with("(max)")).then_some(-1));
+                    let octets = match max_len {
+                        Some(-1) => Some(-1),
+                        Some(n) if is_text => Some(n * 2),
+                        other => other,
+                    };
+                    let (precision, radix, scale) = match base.as_str() {
+                        "tinyint" => (Some(3), Some(10), Some(0)),
+                        "smallint" => (Some(5), Some(10), Some(0)),
+                        "int" => (Some(10), Some(10), Some(0)),
+                        "bigint" => (Some(19), Some(10), Some(0)),
+                        "real" => (Some(24), Some(2), None),
+                        "float" => (Some(53), Some(2), None),
+                        "decimal" => {
+                            let mods = schema.map(|s| &s.type_modifiers[..]).unwrap_or(&[]);
+                            let p = crate::core::rql::type_modifier::precision_of(&name, mods).unwrap_or(38);
+                            let sc = field.and_then(|f| f.scale).unwrap_or(crate::core::value_codec::DECIMAL_SCALE);
+                            (Some(i64::from(p)), Some(10), Some(i64::from(sc)))
+                        }
+                        _ => (None, None, None),
+                    };
+                    // The fractional digits the column keeps: a declared
+                    // precision, else the engine's microseconds.
+                    let datetime = matches!(base.as_str(), "datetime2" | "datetimeoffset" | "time" | "date").then(|| {
+                        if base == "date" {
+                            return 0;
+                        }
+                        match field.and_then(|f| f.text_typmod()) {
+                            Some(crate::core::rql::type_modifier::TextTypmod::Precision(p)) => i64::from(p),
+                            _ => 6,
+                        }
+                    });
+                    let collation = is_text.then(|| {
+                        let binary = schema.is_some_and(|s| crate::core::rql::collation::of(&name, &s.fields).is_binary());
+                        if binary { "Latin1_General_BIN2" } else { "SQL_Latin1_General_CP1_CI_AS" }
+                    });
                     rows.push(format!(
-                        "({}, 'dbo', {}, {}, {}, {}, {}, {}, {})",
+                        "({}, 'dbo', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                         sql_str(&db),
                         sql_str(&shown_table(t)),
                         sql_str(&shown_column(t, &name)),
@@ -2112,7 +2188,21 @@ fn catalog_view_stored(schema: &str, view: &str, cx: &Cx) -> Result<Option<Strin
                         default.map(|d| sql_str(&d)).unwrap_or_else(|| "CAST(NULL AS text)".into()),
                         sql_str(if nullable { "YES" } else { "NO" }),
                         sql_str(&base),
-                        len.map(|l| l.to_string()).unwrap_or_else(|| if ty.ends_with("(max)") { "-1".into() } else { "CAST(NULL AS integer)".into() })
+                        int(max_len),
+                        int(octets),
+                        int(precision),
+                        int(radix),
+                        int(scale),
+                        int(datetime),
+                        text(None),
+                        text(None),
+                        text(is_text.then_some("UNICODE")),
+                        text(None),
+                        text(None),
+                        text(collation),
+                        text(None),
+                        text(None),
+                        text(None),
                     ));
                 }
             }
@@ -2168,6 +2258,7 @@ fn type_ids(ty: &str) -> (i32, i32) {
         "datetimeoffset" => (43, 10),
         "uniqueidentifier" => (36, 16),
         "varbinary" => (165, -1),
+        "nchar" => (239, -1),
         _ => (231, -1),
     }
 }
@@ -5259,6 +5350,17 @@ mod tests {
     fn an_integer_literal_item_is_an_int() {
         let e = env();
         assert_eq!(tr(&e, "SELECT 1 AS [c], 5000000000 AS d"), r#"SELECT CAST(1 AS integer) AS "c", 5000000000 AS "d""#);
+    }
+
+    #[test]
+    fn plus_over_a_function_result_concatenates() {
+        let e = env();
+        assert_eq!(
+            tr(&e, "SELECT DATA_TYPE + ISNULL('(' + CAST(DATETIME_PRECISION AS varchar) + ')','') FROM t"),
+            "SELECT DATA_TYPE || coalesce('(' || CAST(DATETIME_PRECISION AS varchar(30)) || ')', '') FROM t"
+        );
+        assert_eq!(tr(&e, "SELECT CONVERT(nvarchar, 5)"), "SELECT CAST(5 AS varchar(30))");
+        assert_eq!(tr(&e, "SELECT CAST(x AS nvarchar(max)) FROM t"), "SELECT CAST(x AS text) FROM t");
     }
 
     #[test]
