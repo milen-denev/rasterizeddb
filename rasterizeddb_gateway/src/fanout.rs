@@ -234,11 +234,48 @@ impl Session {
     /// `gather_max_bytes` across every table; the temporaries are dropped
     /// after.
     pub(crate) async fn gather_run<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, text: &str, tables: &[String]) -> io::Result<Outcome> {
+        self.gather_run_with(conn, text, tables, None).await
+    }
+
+    /// [`Self::gather_run`] for `text`, the final statement sent as a simple
+    /// Query or, given `prepared`, as the client's own extended statement
+    /// with the tables renamed (its parameters and formats kept).
+    ///
+    /// Inside a transaction the parts are read where the transaction can see
+    /// its own writes: under two-phase commit every shard joins it first;
+    /// without it the block lives on one shard, which becomes the target
+    /// (its part read inside the block, the others' committed rows read as
+    /// READ COMMITTED reads them).
+    async fn gather_run_with<S: AsyncWrite + Unpin>(
+        &mut self,
+        conn: &mut S,
+        text: &str,
+        tables: &[String],
+        prepared: Option<&OneStatement>,
+    ) -> io::Result<Outcome> {
         self.core.counters.borrow_mut().fan_outs += 1;
-        committing::settle(std::time::Duration::from_secs(5)).await;
+        if self.txn.status == b'E' {
+            self.error_ready("25P02", "current transaction is aborted, commands ignored until end of transaction block");
+            return Ok(Outcome::Done { error: true });
+        }
         let map = self.core.map();
-        let home = self.core.shared.home(&map);
         let shards: Vec<u32> = map.shards().iter().map(|s| s.id).collect();
+        let in_txn = self.txn.status != b'I';
+        // The statement's other tables (not gathered) live on the home
+        // shard: it runs there. Under two-phase commit every shard joins the
+        // block first; without it the block's own shard reads its part inside
+        // the block, and the home shard runs the join outside it, as READ
+        // COMMITTED reads elsewhere (`Session::within_block`).
+        let home = self.core.shared.home(&map);
+        if in_txn && (self.core.shared.cfg.two_phase || self.txn.shard.is_none()) {
+            let join: Vec<u32> = if self.core.shared.cfg.two_phase { shards.clone() } else { vec![home] };
+            if let Err((code, m)) = self.join_txn(&join).await {
+                self.error_ready(&code, &m);
+                return Ok(Outcome::Done { error: true });
+            }
+        } else {
+            committing::settle(std::time::Duration::from_secs(5)).await;
+        }
         let cap = self.core.shared.cfg.gather_max_bytes;
         let mut used = 0usize;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -313,13 +350,59 @@ impl Session {
             }
         }
         let rewritten = rename_tables(text, &renames);
-        let mut q = vec![b'Q'];
-        q.extend_from_slice(&((rewritten.len() + 5) as i32).to_be_bytes());
-        q.extend_from_slice(rewritten.as_bytes());
-        q.push(0);
+        let q = match prepared {
+            None => query_message(&rewritten),
+            Some(one) => {
+                let mut b = Vec::with_capacity(rewritten.len() + 64);
+                pg::encode_parse(&mut b, "", &rewritten, &one.types);
+                pg::encode_bind(&mut b, &pg::BindAll { portal: String::new(), statement: String::new(), ..one.bind.clone() });
+                if let Some(kind) = one.describe {
+                    pg::encode_describe(&mut b, kind);
+                }
+                pg::encode_execute(&mut b);
+                pg::encode_sync(&mut b);
+                if let Some(vs) = self.vs.get_mut(&home) {
+                    vs.parsed.remove("");
+                }
+                b
+            }
+        };
         let outcome = self.run_on(conn, home, &q, Vec::new(), None).await;
-        self.drop_temps(home, &renames).await;
+        // A failed statement failed the block: its temporary tables go
+        // with the block's rollback, or with the session.
+        if self.txn.status != b'E' {
+            self.drop_temps(home, &renames).await;
+        }
         outcome
+    }
+
+    /// A prepared statement that gathers (module docs of `gather_run`).
+    /// `None` when the batch is not one extended statement.
+    pub(crate) async fn gather_extended<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, batch: &[u8], tables: &[String]) -> io::Result<Option<Outcome>> {
+        let Some(one) = self.one_statement(batch) else {
+            return Ok(None);
+        };
+        let start = self.out.len();
+        let outcome = self.gather_run_with(conn, &one.text.clone(), tables, Some(&one)).await?;
+        if one.parse.is_none() {
+            // The client sent no Parse: drop the ParseComplete.
+            let mut at = start;
+            while at + 5 <= self.out.len() {
+                let len = i32::from_be_bytes(self.out[at + 1..at + 5].try_into().unwrap()) as usize;
+                if self.out[at] == b'1' {
+                    self.out.drain(at..at + 1 + len);
+                    break;
+                }
+                at += 1 + len;
+            }
+        } else if let Some(p) = &one.parse
+            && let Some((name, text)) = pg::parse_parse(p)
+        {
+            self.generation += 1;
+            let generation = self.generation;
+            self.statements.insert(name.to_string(), crate::session::Stmt { text: text.to_string(), parse: p.clone(), generation });
+        }
+        Ok(Some(outcome))
     }
 
     async fn drop_temps(&mut self, home: u32, renames: &[(String, String)]) {
@@ -361,6 +444,11 @@ impl Session {
         let mut applied: Vec<u32> = Vec::new();
         let mut total = 0u64;
         let mut tag_head = String::new();
+        // The first shard's head (its description, and for a prepared
+        // statement its Parse/Bind acknowledgements) and every shard's rows
+        // (RETURNING).
+        let mut first_head: Option<Vec<u8>> = None;
+        let mut rows: Vec<u8> = Vec::new();
         for &s in shards {
             let id = match self.ensure_vs(s).await {
                 Ok(id) => id,
@@ -378,6 +466,12 @@ impl Session {
             loop {
                 match resp {
                     Ok(Response::PartReply(p)) => {
+                        if first_head.is_none() && !p.head.is_empty() {
+                            first_head = Some(p.head.clone());
+                        }
+                        for (_, r) in &p.rows {
+                            rows.extend_from_slice(r);
+                        }
                         bytes.extend_from_slice(&p.tail);
                         if p.more {
                             resp = link.call(&self.core, &Request::Continue { session: id }.encode()).await;
@@ -405,6 +499,10 @@ impl Session {
             }
             applied.push(s);
         }
+        if let Some(h) = first_head {
+            self.out.extend_from_slice(&h);
+        }
+        self.out.extend_from_slice(&rows);
         pg::command_complete(&mut self.out, &format!("{} {total}", if tag_head.is_empty() { "UPDATE" } else { &tag_head }));
         pg::ready(&mut self.out, b'I');
         Ok(Outcome::Done { error: false })
@@ -784,12 +882,9 @@ impl Session {
     /// Execute, Sync), so every shard runs the same thing in the client's
     /// formats, and the ParseComplete the client did not ask for dropped.
     pub(crate) async fn fan_out_extended<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, batch: &[u8], merge: Merge, writes: bool) -> io::Result<Option<Outcome>> {
-        // Without two-phase commit a write runs shard after shard with a
-        // reply of its own making, which has no place for the extended
-        // protocol's acknowledgements.
-        if writes && !self.core.shared.cfg.two_phase {
-            return Ok(None);
-        }
+        // Without two-phase commit a write runs shard after shard
+        // (`unrouted_writes = each_shard`): its reply carries the first
+        // shard's acknowledgements and description, as a fan-out's does.
         let Some(one) = self.one_statement(batch) else {
             return Ok(None);
         };

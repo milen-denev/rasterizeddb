@@ -84,7 +84,7 @@ filter alone); there is one transaction manager per database
 | Restriction | Why | Migration path | Lifted |
 |---|---|---|---|
 | A sharded table needs a `PRIMARY KEY` containing the partition key | Follower apply and moves address rows by it (§9.4, §10). Today a composite `PRIMARY KEY` is recorded as a plain unique key (§8.1), so this needs a phase 0 change | `PRIMARY KEY (tenant_id, id)` | Never; load-bearing |
-| `COPY` spanning shards refused unless the session opts into a per-shard, non-atomic split; a multi-row `INSERT` spanning shards needs the gateway's `two_phase = on` (§3.2), which splits it atomically | Same as above | `two_phase = on`; for `COPY`, `SET rdb.split_bulk_writes = on` in autocommit (§8.5) | Phase 5, opt-in |
+| A `COPY` or multi-row `INSERT` spanning shards is split atomically only under the gateway's `two_phase = on` (§3.2); without it a `COPY` needs the session's opt-in to a per-shard, non-atomic split | Same as above | `two_phase = on`; or `SET rdb.split_bulk_writes = on` in autocommit for `COPY` (§8.5) | Phase 5, opt-in |
 | `SERIAL` (int4) refused on sharded tables | 2³¹ values cannot be split disjointly across shards | `BIGSERIAL` (§8.2) or `UUID` | Never |
 | Writes reaching several shards refused | No atomic commit before 2PC; Vitess's default `MULTI` commits these partially, this engine's characteristic bug | Add the tenant predicate, or `EXECUTE ON EACH SHARD` | Phase 5, opt-in |
 | Subqueries must repeat the tenant predicate | The node checks every table reference (§5.2) | `WHERE tenant_id = 42` in the subquery | Phase 4: correlated key propagation |
@@ -281,8 +281,26 @@ synchronous_commit, txn_start_time}`; the last is a new executor input, so
     the block's own writes on every shard. A top-N (`ORDER BY` with literal
     `LIMIT`/`OFFSET`, or none) or a `SELECT DISTINCT` in a block that ran
     beyond the home shard is merged on the gateway.
-  Without `two_phase` a block stays on its first shard, and a fan-out inside
-  it is refused.
+  Without `two_phase` a block's writes stay on its first shard (as built):
+  each statement is routed on its own, a plain read whose key or tables are
+  elsewhere runs there outside the block (its ReadyForQuery reports the
+  block's status), a statement naming no table (`SAVEPOINT`, `SELECT 1`)
+  stays with the block, and a write or locking read reaching another shard is
+  refused `0A000` naming `two_phase`. A fan-out inside such a block is
+  refused; a join that gathers runs on the home shard, the block's shard
+  reading its part inside the block.
+- **`COPY t FROM STDIN` into a sharded table** (as built) is answered by the
+  gateway: it finds the key column from the one-row INSERT of the COPY's
+  columns, hashes each row's key as every router does, and streams each
+  shard's rows to a COPY of its own (text and CSV with their options; not
+  binary). Under `two_phase` the load is one transaction; without it, only
+  after `SET rdb.split_bulk_writes = on`, each shard's part committed alone.
+- **A join that gathers** (a sharded table joined with one that is not)
+  also runs prepared (the client's statement, tables renamed, its
+  parameters and formats kept) and inside a transaction, its parts read
+  where the transaction sees its own writes.
+- **`unrouted_writes = each_shard`** relays each shard's RETURNING rows and,
+  for a prepared statement, the acknowledgements and description.
 - **A statement without a route key may come prepared** (the extended
   protocol, as every driver sends it), alone in its batch: `[Parse] Bind
   [Describe] Execute Sync`. The gateway makes the batch self-contained (the

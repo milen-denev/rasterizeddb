@@ -23,6 +23,7 @@ PG = {n: BASE + n for n in ALL}                # each shard's own pgwire
 RDB = {n: BASE + 10 + n for n in ALL}          # native (rdb-shard's way in)
 RSHARD = {n: BASE + 20 + n for n in ALL}       # rshard (the gateway's links)
 GW = BASE + 30                                 # the gateway's pgwire
+GW2 = BASE + 31                                # a second gateway, two_phase off
 FE_PG, FE_MY, FE_RDB, FE_MS = BASE + 40, BASE + 41, BASE + 42, BASE + 43  # the front-end node (B4.7)
 CLUSTER = "0123456789abcdef0123456789abcdef"
 BLOCKS = 1 << 48
@@ -102,6 +103,62 @@ retries = 10
     else:
         cmd = [GATEWAY, "--config", conf]
     procs["gateway"] = subprocess.Popen(cmd, stdout=log, stderr=log)
+
+
+def start_gateway_plain(tls, cmap):
+    """A second gateway on the same shards, without two-phase commit."""
+    conf = f"{WORK}/gateway2.conf"
+    with open(conf, "w") as f:
+        f.write(f"""listen = 127.0.0.1:{GW2}
+workers = 1
+map = {cmap}
+home_shard = 0
+gateway_name = plain_gateway
+shard_trust = ca:{tls}/ca.pem
+shard_cert = {tls}/gateway.pem
+shard_key = {tls}/gateway.key
+auth = scram
+unrouted = fan_out
+""")
+    log = open(f"{WORK}/gateway2.log", "ab")
+    procs["gateway2"] = subprocess.Popen([GATEWAY, "--config", conf], stdout=log, stderr=log)
+
+
+def without_two_phase(tls, cmap):
+    start_gateway_plain(tls, cmap)
+    up(GW2, "the plain gateway")
+    code, out = psql_script(GW2, "SET rdb.unrouted_writes = each_shard;\n"
+                                 "UPDATE orders SET v = v + 0 WHERE store = $1 \\bind 4 \\g\n")
+    check("without two_phase: a prepared keyless write, shard by shard", code == 0 and out.splitlines()[-1] == "UPDATE 60", out)
+    code, out = psql(GW2, "SET rdb.unrouted_writes = each_shard; UPDATE orders SET v = v WHERE id > 297 RETURNING id")
+    check("  ...its RETURNING rows from every shard", code == 0 and sorted(out.splitlines()[1:6]) == ["1001", "1002", "298", "299", "300"], out)
+    code, out = psql(GW2, "BEGIN; SELECT count(*) FROM orders o JOIN stores s ON s.id = o.store WHERE s.name = 'store3'; ROLLBACK")
+    check("  ...a gathered join in a block", code == 0 and "60" in out.split(), out)
+    # A block that wrote on some shard: the join runs on the home shard (its
+    # other table is there), the block's own row counted.
+    code, out = psql(GW2, "BEGIN; INSERT INTO orders (id, store, v) VALUES (6002, 3, 1); "
+                          "SELECT count(*) FROM orders o JOIN stores s ON s.id = o.store WHERE s.name = 'store3'; ROLLBACK")
+    check("  ...after a write in the block, its own row counted", code == 0 and "61" in out.split(), out)
+    # A table that lives on the home shard, read in a block that wrote
+    # elsewhere: read there, not as the empty copy on the block's shard.
+    want = psql(GW2, "SELECT count(*) FROM stores")[1]
+    found = None
+    for k in range(6003, 6010):
+        code, out = psql(GW2, f"BEGIN; INSERT INTO orders (id, store, v) VALUES ({k}, 1, 1); SELECT count(*) FROM stores; ROLLBACK")
+        found = (code, out)
+        if code != 0 or want not in out.split():
+            break
+    check("  ...a home table read in a block that wrote on any shard", found[0] == 0 and want in found[1].split(), f"{found} want {want}")
+    code, out = psql(GW2, "BEGIN; INSERT INTO orders (id, store, v) VALUES (6010, 1, 1); INSERT INTO orders (id, store, v) VALUES (6011, 1, 1); "
+                          "INSERT INTO orders (id, store, v) VALUES (6012, 1, 1); INSERT INTO orders (id, store, v) VALUES (6013, 1, 1); ROLLBACK")
+    check("  ...a second shard's write in the block is refused by name", code != 0 and "two_phase" in out, out)
+    with open(f"{WORK}/plain.tsv", "w") as f:
+        f.write("".join(f"{k}\t1\t1\n" for k in range(9500, 9520)))
+    code, out = psql_script(GW2, f"\\copy orders (id, store, v) FROM '{WORK}/plain.tsv'\n")
+    check("  ...a COPY across shards is refused without the opt-in", code != 0 and "split_bulk_writes" in out, out)
+    code, out = psql_script(GW2, f"SET rdb.split_bulk_writes = on;\n\\copy orders (id, store, v) FROM '{WORK}/plain.tsv'\n")
+    check("  ...and split with SET rdb.split_bulk_writes = on", code == 0 and out.splitlines()[-1] == "COPY 20", out)
+    psql(GW, "DELETE FROM orders WHERE id >= 9500")
 
 
 def psql(port, sql, timeout=60):
@@ -552,6 +609,13 @@ def main():
         psql(GW, f"INSERT INTO stores (id, name) VALUES ({s}, 'store{s}')")
     code, out = psql(GW, "SELECT count(*) FROM orders o JOIN stores s ON s.id = o.store WHERE s.name = 'store3'")
     check("a gathered join", (code, out) == (0, str(rows // 5)), out)
+    code, out = psql_script(GW, "SELECT count(*) FROM orders o JOIN stores s ON s.id = o.store WHERE s.name = $1 \\bind store3 \\g\n")
+    check("a gathered join, prepared", (code, out) == (0, str(rows // 5)), out)
+    code, out = psql(GW, "BEGIN; INSERT INTO orders (id, store, v) VALUES (6001, 3, 1); "
+                         "SELECT count(*) FROM orders o JOIN stores s ON s.id = o.store WHERE s.name = 'store3'; ROLLBACK")
+    check("a gathered join in a transaction sees its own write", code == 0 and str(rows // 5 + 1) in out.split(), out)
+    check("  ...and the rollback undid it", psql(GW, "SELECT count(*) FROM orders WHERE id = 6001") == (0, "0"),
+          psql(GW, "SELECT count(*) FROM orders WHERE id = 6001"))
     code, out = psql(GW, "SELECT max(r) FROM (SELECT row_number() OVER (ORDER BY id) AS r FROM orders) w")
     check("a window over a sharded table", (code, out) == (0, str(rows)), out)
 
@@ -712,6 +776,9 @@ def main():
     winners = [o for o in (o1, o2) if o.strip().endswith("COMMIT") and "ERROR" not in o]
     check("a cross-shard deadlock is broken", len(victims) == 1 and len(winners) == 1 and took < 60,
           f"{took:.1f}s\n--- 1:\n{o1}\n--- 2:\n{o2}")
+
+    # 4k. The same cluster through a gateway without two-phase commit.
+    without_two_phase(tls, cmap)
 
     # 5. The DDL fence: a fenced table refuses with a retryable 40001.
     on_every_shard("SET CONFIG shard.ddl_fence = 'orders'")

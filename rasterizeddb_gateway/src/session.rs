@@ -157,6 +157,8 @@ pub struct Session {
     /// Set by `decide_extended` when the batch's statement fans out: how it
     /// merges, and whether it writes.
     pub(crate) pending_fanout: Option<(Merge, bool)>,
+    /// Set by `decide_extended` when the batch's statement gathers.
+    pub(crate) pending_gather: Option<Vec<String>>,
     /// Who this session is, for an observer (`hooks::Observer`).
     pub client: crate::hooks::ClientInfo,
     /// Bytes written to the client so far, and the first error's SQLSTATE
@@ -300,6 +302,7 @@ impl Session {
             discard_until_sync: false,
             listener: None,
             pending_fanout: None,
+            pending_gather: None,
             client: crate::hooks::ClientInfo {
                 session: 0,
                 database: String::new(),
@@ -791,13 +794,8 @@ impl Session {
         if let Some(p) = self.login.pinned {
             return Some(p);
         }
-        // Under two-phase commit a transaction's statements route on their
-        // own; otherwise the transaction stays on its first shard.
-        if let Some(s) = self.txn.shard
-            && !self.core.shared.cfg.two_phase
-        {
-            return Some(s);
-        }
+        // A transaction's statements route on their own; without two-phase
+        // commit, `within_block` then keeps its writes on its first shard.
         let map = self.core.map();
         if let Some(k) = self.local_key.as_ref().or(self.route_key.as_ref()) {
             return Some(map.shard_of_block(k.block()));
@@ -907,7 +905,48 @@ impl Session {
                 );
             }
         };
-        let target = match template {
+        let target = self.within_block_target(self.decided(map, template, &slots, home), text);
+        (target, Some(shape))
+    }
+
+    /// Without two-phase commit a block runs on its first shard. A plain
+    /// read whose key or tables are elsewhere runs there, outside the block,
+    /// as READ COMMITTED allows (sharding.md §3.2): a table that lives only
+    /// on the home shard read on the block's shard would read as empty. A
+    /// statement that names no table (SAVEPOINT, `SELECT 1`) stays with the
+    /// block; a write or a locking read reaching another shard is refused.
+    fn within_block(&self, shard: u32, text: &str) -> Result<u32, (&'static str, String)> {
+        if self.txn.status == b'I' || self.core.shared.cfg.two_phase || self.login.pinned.is_some() {
+            return Ok(shard);
+        }
+        let Some(own) = self.txn.shard else { return Ok(shard) };
+        if shard == own || !names_a_table(text) {
+            return Ok(own);
+        }
+        if is_plain_read(text) {
+            return Ok(shard);
+        }
+        Err((
+            "0A000",
+            format!(
+                "this transaction writes on shard {own}, and this statement writes (or locks rows) on shard {shard}: a transaction over two shards needs the gateway's two_phase = on"
+            ),
+        ))
+    }
+
+    fn within_block_target(&self, target: Target, text: &str) -> Target {
+        match target {
+            Target::Shard(s) => match self.within_block(s, text) {
+                Ok(s) => Target::Shard(s),
+                Err((sqlstate, message)) => Target::Refuse { sqlstate, message },
+            },
+            other => other,
+        }
+    }
+
+    /// The target a template gives, before the block's rule.
+    fn decided(&self, map: &ShardMap, template: RouteTemplate, slots: &[rasterizeddb_router::literals::Literal], home: u32) -> Target {
+        match template {
             RouteTemplate::Slot { index, family } => match slots.get(index as usize).and_then(|l| route::literal_block(l, family)) {
                 Some(b) => Target::Shard(map.shard_of_block(b)),
                 None => needs_key(),
@@ -918,14 +957,13 @@ impl Session {
             RouteTemplate::FanOut { merge, writes } => self.unrouted_target(merge, writes),
             RouteTemplate::NeedsKey => needs_key(),
             RouteTemplate::Gather { tables } => {
-                if self.core.shared.cfg.gather && self.txn.status == b'I' && self.login.pinned.is_none() {
+                if self.core.shared.cfg.gather && self.login.pinned.is_none() {
                     Target::Gather { tables }
                 } else {
                     needs_key()
                 }
             }
-        };
-        (target, Some(shape))
+        }
     }
 
     /// B1b: a statement whose shape can fan out, decided by `unrouted`.
@@ -1220,6 +1258,10 @@ impl Session {
         let mut error = false;
         let mut last_type = 0u8;
         let mut refuted = false;
+        // A read run outside the block, on another shard (`within_block`):
+        // its ReadyForQuery says the block's status, and it changes none of
+        // the block's bookkeeping.
+        let outside = self.txn.status != b'I' && !self.core.shared.cfg.two_phase && self.txn.shard.is_some_and(|t| t != shard);
         loop {
             match resp {
                 Response::PgReply { more, status, bytes, .. } => {
@@ -1232,7 +1274,19 @@ impl Session {
                             }
                         }
                     }
+                    let before = self.out.len();
                     filter.apply(&bytes, &mut self.out);
+                    if outside && !more {
+                        let block_status = if error { b'E' } else { self.txn.status };
+                        let mut at = before;
+                        while at + 5 <= self.out.len() {
+                            let len = i32::from_be_bytes(self.out[at + 1..at + 5].try_into().unwrap()) as usize;
+                            if self.out[at] == b'Z' && len == 5 {
+                                self.out[at + 5] = block_status;
+                            }
+                            at += 1 + len;
+                        }
+                    }
                     self.flush(conn).await?;
                     if more {
                         resp = match link.call(&self.core, &Request::Continue { session: vs_id }.encode()).await {
@@ -1253,6 +1307,13 @@ impl Session {
                         }
                     }
                     self.copy_shard = (last_type == b'G').then_some(shard);
+                    if outside {
+                        if error {
+                            self.txn.status = b'E';
+                        }
+                        self.last_shard = Some(shard);
+                        return Ok(Outcome::Done { error });
+                    }
                     match status {
                         b'T' | b'E' => {
                             self.txn.shard.get_or_insert(shard);
@@ -1489,9 +1550,17 @@ impl Session {
             self.core.refresh_if_stale().await;
             let map = self.core.map();
             self.pending_fanout = None;
+            self.pending_gather = None;
             let (target, needs, tkey) = match self.decide_extended(&map, batch).await {
                 Ok(v) => v,
                 Err((code, msg)) => {
+                    // A join with a table on other shards, gathered.
+                    if let Some(tables) = self.pending_gather.take()
+                        && sync
+                        && let Some(outcome) = self.gather_extended(conn, batch, &tables).await?
+                    {
+                        return Ok(outcome);
+                    }
                     // A statement without a route key, alone in its batch:
                     // fanned out as a simple query would be.
                     if let Some((merge, writes)) = self.pending_fanout.take()
@@ -1589,6 +1658,10 @@ impl Session {
                         }
                         RouteTemplate::Fixed { block } => map.shard_of_block(block),
                         RouteTemplate::Home => home,
+                        RouteTemplate::Gather { tables } if self.core.shared.cfg.gather && self.login.pinned.is_none() => {
+                            self.pending_gather = Some(tables);
+                            return Err(("0A000", "a statement that gathers runs alone in its batch: Parse, Bind, Describe, Execute, Sync".into()));
+                        }
                         RouteTemplate::FanOut { merge, writes } => {
                             return match self.unrouted_target(merge, writes) {
                                 Target::FanOut { merge, writes } => {
@@ -1619,8 +1692,16 @@ impl Session {
         if let Some(s) = known {
             return Ok((s, needs, None));
         }
+        // The block's rule, statement by statement (`within_block`).
+        let routes: Vec<(u32, String)> = routes
+            .into_iter()
+            .map(|(s, text)| self.within_block(s, &text).map(|s| (s, text)))
+            .collect::<Result<_, _>>()?;
         let Some((first, text)) = routes.first().cloned() else {
-            return Ok((self.last_shard.unwrap_or(home), needs, None));
+            // A batch that only parses or describes: the block's shard, or
+            // where the last statement went.
+            let block = if self.txn.status != b'I' && !self.core.shared.cfg.two_phase { self.txn.shard } else { None };
+            return Ok((block.or(self.last_shard).unwrap_or(home), needs, None));
         };
         if routes.iter().any(|(s, _)| *s != first) {
             self.core.counters.borrow_mut().refused_cross_shard += 1;
@@ -1694,6 +1775,28 @@ fn fenced_for_a_move(reply: &[u8]) -> bool {
     error
 }
 
+/// Whether `text` names a table (reads or writes one): a word FROM, INTO,
+/// UPDATE, JOIN or TABLE outside quotes. `SAVEPOINT a`, `SELECT 1` and
+/// `SELECT now()` do not.
+fn names_a_table(text: &str) -> bool {
+    let up = text.to_ascii_uppercase();
+    up.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|w| matches!(w, "FROM" | "INTO" | "UPDATE" | "JOIN" | "TABLE"))
+}
+
+/// A read that takes no lock and changes nothing: SELECT, WITH, TABLE,
+/// VALUES or SHOW, with no FOR UPDATE/SHARE and no data-changing word.
+fn is_plain_read(text: &str) -> bool {
+    let up = text.trim_start().to_ascii_uppercase();
+    let words: Vec<&str> = up.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).collect();
+    let Some(first) = words.first() else { return false };
+    if !matches!(*first, "SELECT" | "WITH" | "TABLE" | "VALUES" | "SHOW") {
+        return false;
+    }
+    let locks = words.windows(2).any(|w| w[0] == "FOR" && matches!(w[1], "UPDATE" | "SHARE" | "NO" | "KEY"));
+    let changes = words.iter().any(|w| matches!(*w, "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "TRUNCATE"));
+    !locks && !changes
+}
+
 pub(crate) fn next_global_txn(gateway: &str) -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1723,6 +1826,18 @@ fn push_close(out: &mut Vec<u8>, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_and_table_statements_are_told_apart() {
+        for read in ["SELECT * FROM stores", "with x as (select 1) select * from x", "TABLE t", "SHOW x"] {
+            assert!(is_plain_read(read), "{read}");
+        }
+        for not in ["SELECT * FROM t FOR UPDATE", "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d", "INSERT INTO t VALUES (1)", "SAVEPOINT a"] {
+            assert!(!is_plain_read(not), "{not}");
+        }
+        assert!(names_a_table("SELECT * FROM t") && names_a_table("INSERT INTO t VALUES (1)") && names_a_table("update t set a = 1"));
+        assert!(!names_a_table("SAVEPOINT a") && !names_a_table("SELECT 1") && !names_a_table("SELECT now()"));
+    }
 
     #[test]
     fn gateway_local_statements_are_told_apart() {
