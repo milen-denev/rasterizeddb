@@ -41,6 +41,12 @@ fn start() -> Servers {
 /// A server whose text columns are case-insensitive by default
 /// (`MsConfig::case_insensitive`, `--mssql-collation ci`).
 fn start_with(case_insensitive: bool) -> Servers {
+    start_config(case_insensitive, 2601)
+}
+
+/// [`start_with`], a duplicate in a unique index reported as
+/// `unique_index_error` (`--mssql-unique-index-error`).
+fn start_config(case_insensitive: bool, unique_index_error: i32) -> Servers {
     let _ = env_logger::builder().is_test(true).try_init();
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     // A socket path must fit sun_path: kept short, under /tmp.
@@ -79,6 +85,7 @@ fn start_with(case_insensitive: bool) -> Servers {
                     // written against; `start_with(true)` is SQL Server's
                     // case-insensitive default.
                     case_insensitive,
+                    unique_index_error,
                 };
                 let listener = rasterizeddb_core::mssql::bind(config).await.unwrap();
                 let port = listener.local_addr().unwrap().port();
@@ -1333,4 +1340,124 @@ async fn tiberius_constraint_errors() {
     assert_eq!(texts(&r[0]), [Some("DenevCloud.ERP.Clients".to_string())]);
     let cols: Vec<&str> = r[1][0].columns().iter().map(|c| c.name()).collect();
     assert_eq!(cols, ["Id", "CompanyId"]);
+}
+
+/// T-SQL's TRY_CAST / TRY_CONVERT are NULL where the conversion fails, as
+/// SQL Server's: they were plain casts, and the statement failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_try_cast() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(&mut c, "CREATE TABLE [Raw] ([Id] int PRIMARY KEY, [V] nvarchar(40) NULL); \
+                   INSERT INTO [Raw] VALUES (1, N'12'), (2, N'x1'), (3, NULL), (4, N'2024-02-29'), (5, N'99999999999')")
+        .await
+        .unwrap();
+    let r = batch(&mut c, "SELECT TRY_CAST([V] AS int) FROM [Raw] ORDER BY [Id]").await.unwrap();
+    let got: Vec<Option<i32>> = r[0].iter().map(|r| r.get::<i32, _>(0)).collect();
+    assert_eq!(got, [Some(12), None, None, None, None]);
+    let r = batch(&mut c, "SELECT [Id] FROM [Raw] WHERE TRY_CONVERT(int, [V]) IS NOT NULL").await.unwrap();
+    assert_eq!(int(&r[0]), [1]);
+    let r = batch(&mut c, "SELECT [Id] FROM [Raw] WHERE TRY_CAST([V] AS date) IS NOT NULL").await.unwrap();
+    assert_eq!(int(&r[0]), [4]);
+    let r = batch(&mut c, "SELECT TRY_CAST(N'abc' AS bigint), TRY_CAST(N'7' AS bigint), TRY_CONVERT(uniqueidentifier, N'nope')").await.unwrap();
+    assert_eq!(r[0][0].get::<i64, _>(0), None);
+    assert_eq!(r[0][0].get::<i64, _>(1), Some(7));
+    assert_eq!(r[0][0].get::<uuid::Uuid, _>(2), None);
+}
+
+/// A database shows the name CREATE DATABASE gave it (`DB_NAME()`,
+/// sys.databases, an error's "in database"), where the engine folds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_database_name_case() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(&mut c, "CREATE DATABASE [DenevCloudERP]").await.unwrap();
+    let r = batch(&mut c, "SELECT name FROM sys.databases WHERE name = N'denevclouderp'").await.unwrap();
+    assert_eq!(texts(&r[0]), [Some("DenevCloudERP".to_string())]);
+    // From inside it, after USE and on a login naming it.
+    let r = batch(&mut c, "USE [DENEVCLOUDERP]; SELECT DB_NAME()").await.unwrap();
+    assert_eq!(texts(r.last().unwrap()), [Some("DenevCloudERP".to_string())]);
+    drop(c);
+    let mut c = connect_to(&s, "denevclouderp").await;
+    let r = batch(&mut c, "SELECT DB_NAME()").await.unwrap();
+    assert_eq!(texts(&r[0]), [Some("DenevCloudERP".to_string())]);
+    batch(&mut c, "CREATE TABLE [P] ([Id] int PRIMARY KEY); CREATE TABLE [K] ([Id] int PRIMARY KEY, [PId] int NOT NULL, \
+                   CONSTRAINT [FK_K_P] FOREIGN KEY ([PId]) REFERENCES [P] ([Id]))")
+        .await
+        .unwrap();
+    let e = batch(&mut c, "INSERT INTO [K] VALUES (1, 9)").await.err().expect("refused");
+    assert!(e.to_string().contains("in database \"DenevCloudERP\""), "{e}");
+    drop(c);
+    // Dropped, it is gone from the list.
+    let mut c = connect(&s).await;
+    batch(&mut c, "DROP DATABASE [DenevCloudERP]").await.unwrap();
+    let r = batch(&mut c, "SELECT name FROM sys.databases WHERE name = N'denevclouderp'").await.unwrap();
+    assert!(r[0].is_empty());
+}
+
+/// `--mssql-unique-index-error 2627`: a unique index's duplicate reported
+/// as a constraint's, for applications that test that number only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_unique_index_error_setting() {
+    let s = start_config(true, 2627);
+    let mut c = connect(&s).await;
+    batch(&mut c, "CREATE TABLE [U] ([Id] int PRIMARY KEY, [Code] nvarchar(9) NOT NULL); CREATE UNIQUE INDEX [IX_U_Code] ON [U] ([Code]); \
+                   INSERT INTO [U] VALUES (1, N'a')")
+        .await
+        .unwrap();
+    let e = batch(&mut c, "INSERT INTO [U] VALUES (2, N'A')").await.err().expect("refused");
+    let tiberius::error::Error::Server(t) = &e else { panic!("{e}") };
+    assert_eq!(t.code(), 2627, "{e}");
+    assert!(t.message().contains("with unique index 'IX_U_Code'"), "{e}");
+}
+
+/// A database made before names were recorded: sp_rdb_record_names reads
+/// the script that made it (EF Core's idempotent one: IF … BEGIN … END,
+/// EXEC(N'…'), sp_rename, GO) and records the names without running it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_record_names_from_a_script() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    let script = "IF NOT EXISTS (SELECT * FROM [__EFMigrationsHistory] WHERE [MigrationId] = N'1')
+BEGIN
+    CREATE TABLE [DenevCloud.ERP.Units] ([Id] int NOT NULL IDENTITY, [ShortName] nvarchar(10) NOT NULL, [Old] int NULL,
+        CONSTRAINT [PK_DenevCloud.ERP.Units] PRIMARY KEY ([Id]));
+END;
+GO
+IF NOT EXISTS (SELECT * FROM [__EFMigrationsHistory] WHERE [MigrationId] = N'2')
+BEGIN
+    EXEC sp_rename N'[DenevCloud.ERP.Units].[Old]', N'Factor', 'COLUMN';
+    ALTER TABLE [DenevCloud.ERP.Units] ADD [Code] nvarchar(5) NULL;
+    EXEC(N'CREATE UNIQUE INDEX [IX_DenevCloud.ERP.Units_Code] ON [DenevCloud.ERP.Units] ([Code]) WHERE [Code] IS NOT NULL');
+END;
+GO";
+    // The database as an older build left it: made, its names not kept.
+    batch(
+        &mut c,
+        "CREATE TABLE [DenevCloud.ERP.Units] ([Id] int NOT NULL IDENTITY, [ShortName] nvarchar(10) NOT NULL, [Old] int NULL, \
+         CONSTRAINT [PK_DenevCloud.ERP.Units] PRIMARY KEY ([Id])); \
+         EXEC sp_rename N'[DenevCloud.ERP.Units].[Old]', N'Factor', 'COLUMN'; \
+         ALTER TABLE [DenevCloud.ERP.Units] ADD [Code] nvarchar(5) NULL; \
+         CREATE UNIQUE INDEX [IX_DenevCloud.ERP.Units_Code] ON [DenevCloud.ERP.Units] ([Code]) WHERE [Code] IS NOT NULL; \
+         INSERT INTO [DenevCloud.ERP.Units] ([ShortName], [Code]) VALUES (N'kg', N'K'); \
+         DELETE FROM __rdb_tds_names",
+    )
+    .await
+    .unwrap();
+    async fn names(c: &mut Client<Compat<tokio::net::TcpStream>>) -> Vec<String> {
+        let mut q = c.simple_query("SELECT * FROM [DenevCloud.ERP.Units]").await.unwrap();
+        let got = q.columns().await.unwrap().unwrap_or_default().iter().map(|c| c.name().to_string()).collect();
+        q.into_results().await.unwrap();
+        got
+    }
+    assert_eq!(names(&mut c).await, ["id", "shortname", "factor", "code"]);
+    // Nothing in the script runs: no table, no history row.
+    let q = format!("EXEC sp_rdb_record_names @script = N'{}'", script.replace('\'', "''"));
+    batch(&mut c, &q).await.unwrap();
+    assert_eq!(names(&mut c).await, ["Id", "ShortName", "Factor", "Code"]);
+    let r = batch(&mut c, "SELECT name FROM sys.tables WHERE name LIKE N'denevcloud%'; SELECT COUNT(*) FROM [DenevCloud.ERP.Units]").await.unwrap();
+    assert_eq!(texts(&r[0]), [Some("DenevCloud.ERP.Units".to_string())]);
+    assert_eq!(int(&r[1]), [1]);
+    let e = batch(&mut c, "INSERT INTO [DenevCloud.ERP.Units] ([ShortName], [Code]) VALUES (N'g', N'k')").await.err().expect("refused");
+    assert!(e.to_string().contains("with unique index 'IX_DenevCloud.ERP.Units_Code'"), "{e}");
 }

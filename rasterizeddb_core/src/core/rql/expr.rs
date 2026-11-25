@@ -843,6 +843,15 @@ fn cast_to(inner: Expr, target: &str) -> Result<Expr, String> {
     Ok(cast)
 }
 
+/// Whether `text` reads as a value of `target` (`pg_input_is_valid`): the
+/// cast a `CAST(text AS target)` makes, made; an unknown type is an error,
+/// as PostgreSQL's is.
+pub(crate) fn input_is_valid(text: &str, target: &str) -> Result<bool, String> {
+    let literal = Expr::Literal { bytes: text.as_bytes().to_vec(), db_type: DbType::STRING };
+    let cast = cast_to(literal, target)?;
+    Ok(eval(&cast, &Row::default(), &[]).is_ok())
+}
+
 /// Position of a top-level `::`, if the expression ends in a cast.
 fn top_level_cast(text: &str) -> Option<usize> {
     let bytes = text.as_bytes();

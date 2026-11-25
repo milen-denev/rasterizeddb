@@ -102,6 +102,10 @@ struct NameCache {
     objects: HashMap<String, String>,
 }
 
+/// `translate::NAMES_TABLE`'s `rel` for databases' names, in the default
+/// database.
+const DATABASES_REL: &str = "#databases";
+
 const NAMES_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl NameCache {
@@ -276,6 +280,9 @@ struct Session {
     /// The statement being forwarded's verb (`INSERT`, `UPDATE`, …), as a
     /// constraint violation's message names it ([`Session::engine_error`]).
     verb: &'static str,
+    /// The current database's name as CREATE DATABASE declared it
+    /// (`Shared::database_names`); empty until read.
+    database_shown: String,
     /// The database the login named, as it named it: a pooled connection's
     /// reset goes back to it, as SQL Server's does after a `USE`.
     login_shown: String,
@@ -362,6 +369,7 @@ pub(crate) async fn serve_connection(
         names: NameCache::default(),
         aliases: Vec::new(),
         verb: "INSERT",
+        database_shown: String::new(),
     };
     let packet_size = match login_packet.packet_size {
         0 => tds::DEFAULT_PACKET,
@@ -620,13 +628,24 @@ impl Env for Scope<'_> {
         &self.s.bridge.as_ref().unwrap().database
     }
     fn database_name(&self) -> &str {
-        &self.s.bridge.as_ref().unwrap().database_name
+        if self.s.database_shown.is_empty() {
+            &self.s.bridge.as_ref().unwrap().database_name
+        } else {
+            &self.s.database_shown
+        }
     }
     fn user(&self) -> &str {
         &self.s.login.user
     }
     fn databases(&self) -> Vec<String> {
-        self.s.shared.catalog.names()
+        let shown = self.s.shared.database_names.lock();
+        self.s
+            .shared
+            .catalog
+            .names()
+            .into_iter()
+            .map(|n| shown.as_ref().and_then(|m| m.get(&n).cloned()).unwrap_or(n))
+            .collect()
     }
     fn variable(&self, name: &str) -> Option<Value> {
         self.s.vars.get(name).map(|v| v.value.clone())
@@ -854,16 +873,105 @@ impl Session {
         self.bridge.as_mut().expect("an open session has a bridge")
     }
 
-    async fn open(&mut self, database: &str) -> Result<(), TsqlError> {
+    fn bridge_options(&self, database: &str) -> BridgeOptions {
         let mut parameters = HashMap::new();
         parameters.insert("database".to_string(), database.to_string());
-        let options = BridgeOptions {
+        BridgeOptions {
             login: self.login.clone(),
             limits: self.shared.config.limits,
             watch: self.peer_watch.clone(),
             parameters,
             lenient_booleans: false,
+        }
+    }
+
+    /// `writes`, then `read`, on the default database: where databases'
+    /// declared names are kept, whichever this session is in. Over a bridge
+    /// of its own when the session is elsewhere. `None` when it could not
+    /// be reached or the read failed.
+    async fn on_default(&mut self, writes: &[String], read: Option<&str>) -> Option<Vec<Vec<Option<String>>>> {
+        let default = self.shared.catalog.default_name().to_string();
+        let away = self.bridge.as_ref().is_some_and(|b| b.database_name != default);
+        let main = if away {
+            let side = PgBridge::open(self.shared.catalog.clone(), &default, self.bridge_options(&default)).await.ok()?;
+            Some(self.bridge.replace(side))
+        } else {
+            None
         };
+        for w in writes {
+            if let Err(e) = self.silent(w).await {
+                log::warn!("SQL Server session: recording a database's name failed: {}", e.message);
+            }
+        }
+        let rows = match read {
+            Some(sql) => self.fetch(sql, &[]).await.ok().map(|(_, rows)| rows),
+            None => Some(Vec::new()),
+        };
+        if let Some(main) = main {
+            if let Some(side) = std::mem::replace(&mut self.bridge, main) {
+                side.terminate().await;
+            }
+        }
+        rows
+    }
+
+    /// Databases' declared names (`Shared::database_names`), read from the
+    /// default database the first time.
+    async fn database_names(&mut self) -> HashMap<String, String> {
+        if let Some(m) = self.shared.database_names.lock().clone() {
+            return m;
+        }
+        let default = self.shared.catalog.default_name().to_string();
+        let has = self.shared.catalog.get(&default).is_some_and(|d| d.has_table(translate::NAMES_TABLE));
+        let mut map = HashMap::new();
+        if has {
+            let read = format!("SELECT col, shown FROM {} WHERE rel = '{DATABASES_REL}'", translate::NAMES_TABLE);
+            let Some(rows) = self.on_default(&[], Some(&read)).await else {
+                return map;
+            };
+            for row in rows {
+                if let [Some(name), Some(shown)] = [row.first().cloned().flatten(), row.get(1).cloned().flatten()] {
+                    map.insert(name, shown);
+                }
+            }
+        }
+        *self.shared.database_names.lock() = Some(map.clone());
+        map
+    }
+
+    /// A CREATE DATABASE's spelling recorded, or a DROP's forgotten.
+    async fn record_database(&mut self, name: &str, created: bool) {
+        let _ = self.database_names().await;
+        let key = name.to_lowercase();
+        let names = translate::NAMES_TABLE;
+        let writes = if created {
+            vec![
+                format!("CREATE TABLE IF NOT EXISTS {names} (rel text NOT NULL, col text NOT NULL, shown text NOT NULL, PRIMARY KEY (rel, col))"),
+                format!(
+                    "INSERT INTO {names} (rel, col, shown) VALUES ('{DATABASES_REL}', {}, {}) ON CONFLICT (rel, col) DO UPDATE SET shown = excluded.shown",
+                    translate::sql_str(&key),
+                    translate::sql_str(name)
+                ),
+            ]
+        } else if self.shared.catalog.get(self.shared.catalog.default_name()).is_some_and(|d| d.has_table(names)) {
+            vec![format!("DELETE FROM {names} WHERE rel = '{DATABASES_REL}' AND col = {}", translate::sql_str(&key))]
+        } else {
+            Vec::new()
+        };
+        if !writes.is_empty() {
+            let _ = self.on_default(&writes, None).await;
+        }
+        if let Some(m) = self.shared.database_names.lock().as_mut() {
+            if created {
+                m.insert(key, name.to_string());
+            } else {
+                m.remove(&key);
+            }
+        }
+    }
+
+    async fn open(&mut self, database: &str) -> Result<(), TsqlError> {
+        let options = self.bridge_options(database);
         match PgBridge::open(self.shared.catalog.clone(), database, options).await {
             Ok(b) => {
                 if let Some(old) = self.bridge.replace(b) {
@@ -1612,6 +1720,9 @@ impl Session {
                 }
                 if let Kind::Insert { written: Some((table, column)), .. } = &forward.kind {
                     self.advance_identity(table, column).await;
+                }
+                if let Some((name, created)) = &forward.database {
+                    self.record_database(name, *created).await;
                 }
                 if let Some(id) = identity {
                     self.last_identity = Some(id);
@@ -2411,6 +2522,7 @@ impl Session {
         if old != db {
             self.prepared.clear();
             self.open(db).await?;
+            self.database_shown = self.database_names().await.get(db).cloned().unwrap_or_default();
         }
         tds::env_change_text(self.wire.reply(), 1, shown, &old);
         self.info_token(5701, &format!("Changed database context to '{shown}'."));
@@ -2643,36 +2755,7 @@ impl Session {
                     .collect();
                 let new = lex::encode_dots(new.trim_matches(['[', ']']).to_string());
                 // The declared spellings follow the rename (`NAMES_TABLE`).
-                let names = translate::NAMES_TABLE;
-                let record: Vec<String> = if kind == "COLUMN" && parts.len() >= 2 {
-                    let table = &parts[parts.len() - 2];
-                    // The old spelling goes first: a rename in case only
-                    // keeps its key.
-                    let mut r = translate::record_names(table, None, &[], &[], false);
-                    r.push(format!(
-                        "DELETE FROM {names} WHERE rel = {} AND col = {}",
-                        translate::sql_str(table),
-                        translate::sql_str(&parts[parts.len() - 1])
-                    ));
-                    r.extend(translate::record_names(table, None, &[new.clone()], &[], false));
-                    r
-                } else if kind == "INDEX" && parts.len() >= 2 {
-                    let table = &parts[parts.len() - 2];
-                    let object = (crate::sqlcompat::index_name(table, &new), new.clone());
-                    translate::record_names(table, None, &[], &[object], false)
-                } else if kind.is_empty() || kind == "OBJECT" {
-                    let old = parts.last().cloned().unwrap_or_default();
-                    let mut r = translate::record_names(&new, None, &[], &[], false);
-                    r.push(format!(
-                        "UPDATE {names} SET rel = {} WHERE rel = {}",
-                        translate::sql_str(&new.to_lowercase()),
-                        translate::sql_str(&old)
-                    ));
-                    r.extend(translate::record_names(&new, Some(&new), &[], &[], false));
-                    r
-                } else {
-                    Vec::new()
-                };
+                let record = translate::rename_records(&parts, &new, &kind);
                 let sql = if kind == "COLUMN" && parts.len() >= 2 {
                     format!(
                         "ALTER TABLE {} RENAME COLUMN {} TO {}",
@@ -2704,6 +2787,24 @@ impl Session {
                     let _ = self.silent(r).await;
                 }
                 self.names.dirty = true;
+                self.statement_done(0, 0, 0);
+                Ok(Flow::Next)
+            }
+            "sp_rdb_record_names" => {
+                // The declared names a script would have recorded, for a
+                // database made before they were (`names_from_script`).
+                let script = values
+                    .first()
+                    .or_else(|| named.iter().find(|(n, _)| n.as_deref() == Some("script")).map(|(_, v)| v))
+                    .and_then(|v| v.text())
+                    .unwrap_or_default();
+                let statements = translate::names_from_script(&script, &Scope { s: self, params: None })?;
+                for sql in &statements {
+                    self.silent(sql).await.map_err(|e| self.engine_error(&e))?;
+                }
+                self.names.dirty = true;
+                let recorded = statements.iter().filter(|s| s.starts_with("INSERT INTO")).count();
+                self.info_token(0, &format!("Declared names recorded from {recorded} statement(s)."));
                 self.statement_done(0, 0, 0);
                 Ok(Flow::Next)
             }
@@ -4287,7 +4388,7 @@ impl Session {
         let mut e = error_from_engine(n);
         let Some(bridge) = self.bridge.as_ref() else { return e };
         let database = &bridge.database;
-        let db = bridge.database_name.clone();
+        let db = if self.database_shown.is_empty() { bridge.database_name.clone() } else { self.database_shown.clone() };
         let names = &self.names;
         let quoted = quoted_names(&n.message);
         let dbo = |t: &str| format!("dbo.{}", names.table_shown(t));
@@ -4340,7 +4441,7 @@ impl Session {
                         .unwrap_or_default();
                     match kind {
                         None => {
-                            e.number = 2601;
+                            e.number = self.shared.config.unique_index_error;
                             format!(
                                 "Cannot insert duplicate key row in object '{}' with unique index '{}'.{values}",
                                 dbo(&table),
@@ -4403,6 +4504,8 @@ impl Session {
             }
         }
         self.names = cache;
+        let current = self.bridge.as_ref().map(|b| b.database_name.clone()).unwrap_or_default();
+        self.database_shown = self.database_names().await.get(&current).cloned().unwrap_or_default();
     }
 
     /// Moves `table`'s identity counter past the largest value its
