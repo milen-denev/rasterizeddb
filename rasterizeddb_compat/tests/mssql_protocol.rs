@@ -1485,18 +1485,25 @@ BEGIN
 END;
 GO";
     // The database as an older build left it: made, its names not kept.
-    batch(
-        &mut c,
-        "CREATE TABLE [DenevCloud.ERP.Units] ([Id] int NOT NULL IDENTITY, [ShortName] nvarchar(10) NOT NULL, [Old] int NULL, \
-         CONSTRAINT [PK_DenevCloud.ERP.Units] PRIMARY KEY ([Id])); \
-         EXEC sp_rename N'[DenevCloud.ERP.Units].[Old]', N'Factor', 'COLUMN'; \
-         ALTER TABLE [DenevCloud.ERP.Units] ADD [Code] nvarchar(5) NULL; \
-         CREATE UNIQUE INDEX [IX_DenevCloud.ERP.Units_Code] ON [DenevCloud.ERP.Units] ([Code]) WHERE [Code] IS NOT NULL; \
-         INSERT INTO [DenevCloud.ERP.Units] ([ShortName], [Code]) VALUES (N'kg', N'K'); \
-         DELETE FROM __rdb_tds_names",
+    // Made over PostgreSQL, which records none (the names catalogue is the
+    // front end's own: a client cannot empty it).
+    let (pg, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={} user=rasterized password={PASSWORD} dbname=postgres", s.pg_port),
+        tokio_postgres::NoTls,
     )
     .await
     .unwrap();
+    tokio::spawn(conn);
+    pg.batch_execute(
+        "CREATE TABLE \"denevcloud\u{2024}erp\u{2024}units\" (id serial NOT NULL, shortname varchar(10) COLLATE rdb_ci NOT NULL, factor integer NULL, \
+         code varchar(5) COLLATE rdb_ci NULL, CONSTRAINT \"pk_denevcloud\u{2024}erp\u{2024}units\" PRIMARY KEY (id)); \
+         CREATE UNIQUE INDEX \"denevcloud\u{2024}erp\u{2024}units__ix_denevcloud\u{2024}erp\u{2024}units_code\" ON \"denevcloud\u{2024}erp\u{2024}units\" (code); \
+         INSERT INTO \"denevcloud\u{2024}erp\u{2024}units\" (shortname, code) VALUES ('kg', 'K')",
+    )
+    .await
+    .unwrap();
+    // A client reads and writes no catalogue of the front end's.
+    assert!(batch(&mut c, "DELETE FROM __rdb_tds_names").await.is_err());
     async fn names(c: &mut Client<Compat<tokio::net::TcpStream>>) -> Vec<String> {
         let mut q = c.simple_query("SELECT * FROM [DenevCloud.ERP.Units]").await.unwrap();
         let got = q.columns().await.unwrap().unwrap_or_default().iter().map(|c| c.name().to_string()).collect();

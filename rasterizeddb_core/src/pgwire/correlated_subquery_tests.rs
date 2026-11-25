@@ -304,10 +304,98 @@ async fn an_exists_over_the_outer_item_narrows_its_runs() {
         ),
         // As the SQL Server front end writes EF Core's `SELECT 1`.
         format!("EXISTS (SELECT CAST(1 AS integer) FROM {orders} AS t WHERE {ALIAS_EXISTS}.id = t.customer_id AND t.amount = 7)"),
+        // An ORM's quoted names and aliases.
+        format!(
+            "EXISTS (SELECT 1 FROM \"{orders}\" AS \"t\" INNER JOIN \"cex_tags\" AS \"g\" ON \"g\".\"id\" = 1 \
+             WHERE \"{ALIAS_EXISTS}\".\"id\" = \"t\".\"customer_id\" AND \"t\".\"amount\" = 7)"
+        ),
     ] {
         let sql = q(&filter);
         let (got, runs) = answers(&db, &mut s, &sql, customers, ALIAS_EXISTS).await;
         assert_eq!(got, want(tagged.iter().copied()), "{sql}");
         assert_eq!(runs, 2 * tagged.len(), "{sql}");
     }
+    // The outer item's alias quoted too (`FROM t AS "oex"`).
+    let sql = format!(
+        "SELECT \"{ALIAS_EXISTS}\".\"id\", (SELECT COUNT(*) FROM {orders} o WHERE o.customer_id = \"{ALIAS_EXISTS}\".\"id\"), \
+         (SELECT SUM(amount) FROM {orders} o WHERE o.customer_id = \"{ALIAS_EXISTS}\".\"id\") FROM \"{customers}\" AS \"{ALIAS_EXISTS}\" \
+         WHERE EXISTS (SELECT 1 FROM \"{orders}\" AS \"t\" WHERE \"{ALIAS_EXISTS}\".\"id\" = \"t\".\"customer_id\" AND \"t\".\"amount\" = 7)"
+    );
+    let (got, runs) = answers(&db, &mut s, &sql, customers, ALIAS_EXISTS).await;
+    assert_eq!(got, want(tagged.iter().copied()), "{sql}");
+    assert_eq!(runs, 2 * tagged.len(), "{sql}");
+}
+
+
+/// EF Core's related-items statement as the SQL Server front end sends it
+/// (the pilot's ERP #13): uniqueidentifier keys in SQL Server's order, a
+/// case-insensitive tag, dotted quoted names, two select-list subqueries
+/// (one over a join), a tag EXISTS, ORDER BY and a limit. Its subqueries
+/// run for the products the EXISTS keeps, not for every product.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_related_items_statement_runs_its_subqueries_for_the_tagged() {
+    const ALIAS_RI: &str = "dri";
+    let db = db().await;
+    let mut s = session(&db);
+    let (p, pr, pt, t) = ("\"ri\u{2024}erp\u{2024}products\"", "\"ri\u{2024}erp\u{2024}prices\"", "\"ri\u{2024}erp\u{2024}producttags\"", "\"ri\u{2024}erp\u{2024}tags\"");
+    ok(&db, &mut s, &format!("CREATE TABLE {p} (id uuid COLLATE rdb_guid_order NOT NULL PRIMARY KEY, companyid uuid COLLATE rdb_guid_order NOT NULL, state integer NOT NULL, status integer NOT NULL, processed boolean NULL, name text COLLATE rdb_ci NULL, n integer NOT NULL)")).await;
+    ok(&db, &mut s, &format!("CREATE TABLE {pr} (id integer NOT NULL PRIMARY KEY, productid uuid COLLATE rdb_guid_order NOT NULL, pricetype integer NOT NULL, countryid text COLLATE rdb_ci NULL, price numeric(19,6) NOT NULL)")).await;
+    ok(&db, &mut s, &format!("CREATE TABLE {pt} (id integer NOT NULL PRIMARY KEY, productsid uuid COLLATE rdb_guid_order NOT NULL, tagsid uuid COLLATE rdb_guid_order NOT NULL)")).await;
+    ok(&db, &mut s, &format!("CREATE TABLE {t} (id uuid COLLATE rdb_guid_order NOT NULL PRIMARY KEY, content text COLLATE rdb_ci NOT NULL)")).await;
+    let company = "4f914341-68b3-40a3-3ad8-08da6c2740bf";
+    let pid = |k: i64| format!("00000000-0000-0000-0000-{k:012}");
+    const PRODUCTS: i64 = 200;
+    let rows: Vec<String> = (1..=PRODUCTS).map(|k| format!("('{}', '{company}', 100, 1, true, 'P{k}', {k})", pid(k))).collect();
+    ok(&db, &mut s, &format!("INSERT INTO {p} (id, companyid, state, status, processed, name, n) VALUES {}", rows.join(", "))).await;
+    let rows: Vec<String> = (1..=PRODUCTS).map(|k| format!("({k}, '{}', 100, NULL, {k}.5)", pid(k))).collect();
+    ok(&db, &mut s, &format!("INSERT INTO {pr} (id, productid, pricetype, countryid, price) VALUES {}", rows.join(", "))).await;
+    ok(&db, &mut s, &format!("INSERT INTO {t} (id, content) VALUES ('11111111-0000-0000-0000-000000000001', 'Realme C53'), ('11111111-0000-0000-0000-000000000002', 'Other')")).await;
+    // Products 3, 77 and 150 carry the tag; every product carries 'Other'.
+    let mut rows: Vec<String> = (1..=PRODUCTS).map(|k| format!("({k}, '{}', '11111111-0000-0000-0000-000000000002')", pid(k))).collect();
+    for (n, k) in [3i64, 77, 150].iter().enumerate() {
+        rows.push(format!("({}, '{}', '11111111-0000-0000-0000-000000000001')", 1000 + n, pid(*k)));
+    }
+    ok(&db, &mut s, &format!("INSERT INTO {pt} (id, productsid, tagsid) VALUES {}", rows.join(", "))).await;
+    let sql = format!(
+        "SELECT {ALIAS_RI}.n AS \"N\", (SELECT d2.price FROM {pr} AS d2 WHERE {ALIAS_RI}.id = d2.productid AND d2.pricetype = 100 \
+         ORDER BY CASE WHEN d2.countryid IS NULL THEN CAST(1 AS boolean) ELSE CAST(0 AS boolean) END DESC NULLS LAST LIMIT 1) AS \"Price\", \
+         (SELECT d4.content FROM {pt} AS d3 INNER JOIN {t} AS d4 ON d3.tagsid = d4.id WHERE {ALIAS_RI}.id = d3.productsid \
+         ORDER BY d4.id LIMIT 1) AS \"Tag\" \
+         FROM {p} AS {ALIAS_RI} WHERE {ALIAS_RI}.companyid = '{company}' AND {ALIAS_RI}.state NOT IN (140, 160) AND {ALIAS_RI}.status = 1 \
+         AND COALESCE({ALIAS_RI}.processed, CAST(0 AS boolean)) = CAST(1 AS boolean) AND {ALIAS_RI}.id <> '{}' \
+         AND EXISTS (SELECT CAST(1 AS integer) FROM {pt} AS d0 INNER JOIN {t} AS d1 ON d0.tagsid = d1.id \
+         WHERE {ALIAS_RI}.id = d0.productsid AND d1.content IN ('realme c53', 'nothing')) ORDER BY {ALIAS_RI}.id LIMIT 10",
+        pid(77)
+    );
+    take_runs("ri\u{2024}erp\u{2024}products", ALIAS_RI);
+    crate::core::rql::lateral::test_hooks::take_narrowed_copies(ALIAS_RI);
+    let rows = pg_rows(&db, &mut s, &sql).await;
+    let runs = take_runs("ri\u{2024}erp\u{2024}products", ALIAS_RI);
+    let narrowed_copies = crate::core::rql::lateral::test_hooks::take_narrowed_copies(ALIAS_RI);
+    let ns: Vec<String> = rows.iter().map(|r| r[0].clone().unwrap_or_default()).collect();
+    assert_eq!(ns, ["3", "150"], "{rows:?}");
+    assert_eq!(rows[0][1].as_deref(), Some("3.500000"));
+    assert!(rows.iter().all(|r| r[2].is_some()), "{rows:?}");
+    // Two items, each for the two products kept (not for all 200).
+    assert!(runs <= 2 * 3, "the subqueries ran {runs} times");
+    // And the outer item's copy (made to carry each item's join key) holds
+    // the kept products only: both copies took the filter.
+    assert_eq!(narrowed_copies, 2);
+    // Native answers the same.
+    let native = native_rows(&db, &sql).await;
+    assert_eq!(native.iter().map(|r| r[0].clone().unwrap_or_default()).collect::<Vec<_>>(), ["3", "150"]);
+    // (Native narrowed its two copies as well.)
+    assert_eq!(crate::core::rql::lateral::test_hooks::take_narrowed_copies(ALIAS_RI), 2);
+
+    // A statement whose WHERE keeps an outer row the filter alone would
+    // not decide (an OR with another item is left to the statement): the
+    // copy is whole, the answer the same as without the subqueries.
+    let all = format!(
+        "SELECT {ALIAS_RI}.n, (SELECT d2.price FROM {pr} AS d2 WHERE {ALIAS_RI}.id = d2.productid LIMIT 1) FROM {p} AS {ALIAS_RI} \
+         WHERE abs({ALIAS_RI}.n) < 4 ORDER BY {ALIAS_RI}.n"
+    );
+    let rows = pg_rows(&db, &mut s, &all).await;
+    assert_eq!(rows.iter().map(|r| r[0].clone().unwrap_or_default()).collect::<Vec<_>>(), ["1", "2", "3"]);
+    assert_eq!(rows[2][1].as_deref(), Some("3.500000"));
+    assert_eq!(crate::core::rql::lateral::test_hooks::take_narrowed_copies(ALIAS_RI), 0);
 }
