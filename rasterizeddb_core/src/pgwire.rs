@@ -12486,8 +12486,9 @@ where
             fail_statement(state, stream, "0A000", "cannot PREPARE a transaction that has dropped tables").await?;
             return Ok(Some(true));
         }
-        let t = state.transaction.take().expect("checked above");
+        let mut t = state.transaction.take().expect("checked above");
         state.end_block_settings(&t);
+        let notifies = std::mem::take(&mut t.notifies);
         if t.failed {
             database.block_ddl_abort(t.id).await;
             t.abort_unless_aborted(database);
@@ -12505,6 +12506,14 @@ where
         }
         database.block_ddl_commit(t.id).await;
         t.owner.release();
+        // The block's notifications wait for its outcome: sent by COMMIT
+        // PREPARED, dropped by ROLLBACK PREPARED. (PostgreSQL refuses a
+        // NOTIFY in a prepared transaction; a gateway prepares every
+        // transaction that reached two shards, so here it is kept.) Held in
+        // memory: a part still prepared across a restart loses them.
+        if !notifies.is_empty() {
+            prepared_notifies().lock().unwrap_or_else(|e| e.into_inner()).insert(gid.clone(), (database.id, state.backend_pid, notifies));
+        }
         send_command_complete(stream, "PREPARE TRANSACTION").await?;
         return Ok(Some(true));
     }
@@ -12514,13 +12523,32 @@ where
         return Ok(Some(true));
     }
     match database.finish_prepared(&gid, kind == 1) {
-        Ok(()) => send_command_complete(stream, if kind == 1 { "COMMIT PREPARED" } else { "ROLLBACK PREPARED" }).await?,
+        Ok(()) => {
+            let held = prepared_notifies().lock().unwrap_or_else(|e| e.into_inner()).remove(&gid);
+            if kind == 1
+                && let Some((db, pid, notes)) = held
+            {
+                for (channel, payload) in &notes {
+                    notify::publish(db, pid, channel, payload);
+                }
+            }
+            send_command_complete(stream, if kind == 1 { "COMMIT PREPARED" } else { "ROLLBACK PREPARED" }).await?
+        }
         Err(e) => {
             let (code, msg) = fail(e);
             fail_statement(state, stream, &code, &msg).await?;
         }
     }
     Ok(Some(true))
+}
+
+/// The notifications of prepared transactions, by global id: the database,
+/// the sending backend and its `(channel, payload)` pairs.
+#[cfg(feature = "sharding_2pc")]
+#[allow(clippy::type_complexity)]
+fn prepared_notifies() -> &'static std::sync::Mutex<HashMap<String, (u64, i32, Vec<(String, String)>)>> {
+    static HELD: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (u64, i32, Vec<(String, String)>)>>> = std::sync::OnceLock::new();
+    HELD.get_or_init(Default::default)
 }
 
 /// Returns `Ok(true)` when the statement was transaction control.

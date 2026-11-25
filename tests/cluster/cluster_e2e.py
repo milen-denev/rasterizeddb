@@ -107,6 +107,15 @@ def psql_script(port, script, timeout=60):
     return r.returncode, (r.stdout.strip() if r.returncode == 0 else r.stderr.strip())
 
 
+def psql_script_bg(port, script, name):
+    """`script` started by psql -f in the background; `.communicate()` it."""
+    path = f"{WORK}/{name}.sql"
+    with open(path, "w") as f:
+        f.write(script)
+    return subprocess.Popen(["psql", "-h", "127.0.0.1", "-p", str(port), "-U", "rasterized", "-d", "postgres",
+                             "-At", "-f", path], env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
 def up(port, what, secs=90):
     end = time.time() + secs
     last = ""
@@ -270,6 +279,30 @@ def main():
     check("an aggregate in a transaction sees its own writes on every shard", code == 0 and want in out.split(), out)
     check("  ...and the rollback undid them", psql(GW, "SELECT count(*) FROM orders WHERE id > 5000") == (0, "0"),
           psql(GW, "SELECT count(*) FROM orders WHERE id > 5000"))
+
+    # 4g. LISTEN on one session, NOTIFY from another: the gateway's hub
+    # carries it whatever shard the NOTIFY ran on.
+    listener = psql_script_bg(GW, "LISTEN jobs;\n\\! sleep 3\nSELECT 1;\n", "listen")
+    time.sleep(1)
+    psql(GW, "NOTIFY jobs, 'hello'")
+    psql(GW, f"BEGIN; UPDATE orders SET v = v WHERE id = {b}; NOTIFY jobs, 'at commit'; COMMIT")
+    out, _ = listener.communicate(timeout=60)
+    check("LISTEN/NOTIFY through the gateway", '"hello"' in out and '"at commit"' in out, out)
+
+    # 4h. Two transactions locking two shards' rows in opposite orders: the
+    # cluster's deadlock detector picks one, the other finishes.
+    s1 = psql_script_bg(GW, f"BEGIN;\nUPDATE orders SET v = v WHERE id = {a};\n\\! sleep 2\n"
+                            f"UPDATE orders SET v = v WHERE id = {b};\nCOMMIT;\n", "dl1")
+    s2 = psql_script_bg(GW, f"BEGIN;\nUPDATE orders SET v = v WHERE id = {b};\n\\! sleep 2\n"
+                            f"UPDATE orders SET v = v WHERE id = {a};\nCOMMIT;\n", "dl2")
+    started = time.time()
+    o1, _ = s1.communicate(timeout=120)
+    o2, _ = s2.communicate(timeout=120)
+    took = time.time() - started
+    victims = [o for o in (o1, o2) if "40P01" in o or "deadlock" in o]
+    winners = [o for o in (o1, o2) if o.strip().endswith("COMMIT") and "ERROR" not in o]
+    check("a cross-shard deadlock is broken", len(victims) == 1 and len(winners) == 1 and took < 60,
+          f"{took:.1f}s\n--- 1:\n{o1}\n--- 2:\n{o2}")
 
     # 5. The DDL fence: a fenced table refuses with a retryable 40001.
     on_every_shard("SET CONFIG shard.ddl_fence = 'orders'")
