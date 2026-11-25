@@ -4889,6 +4889,16 @@ pub fn plan(
                     continue;
                 }
                 Some(item) => format!("{}.{}", out_relations[item.rel].label, item.field.name),
+                // A quoted qualified column, `"case"."updated_at"` (SeaORM's
+                // spelling), unquoted so the renames below meet it: kept
+                // quoted, a column two relations share was never renamed to
+                // the layout's and read as nothing.
+                None if term.token.contains('"') && is_column_reference(&term.token) && term.token.contains('.') => {
+                    match split_qualified(&term.token) {
+                        (Some(q), c) => format!("{q}.{c}"),
+                        (None, c) => c,
+                    }
+                }
                 None => term.token.clone(),
             };
             let mut rewritten = written;

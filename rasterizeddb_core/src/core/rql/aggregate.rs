@@ -59,6 +59,19 @@ pub enum AggFunc {
     BoolAnd,
     BoolOr,
     Every,
+    /// `percentile_cont(f) WITHIN GROUP (ORDER BY x)`: the value at fraction
+    /// `f` of the ordered non-NULL values, interpolated between the two
+    /// around it, as `double precision`. Read as
+    /// `percentile_cont(x, f ORDER BY x)` (`sql_scan::within_group`), the
+    /// fraction in [`AggCall::delimiter`]'s place.
+    PercentileCont,
+    /// `percentile_disc(f) WITHIN GROUP (ORDER BY x)`: the first ordered
+    /// value whose position reaches fraction `f`, of `x`'s own type.
+    PercentileDisc,
+    /// `mode() WITHIN GROUP (ORDER BY x)`: the most frequent non-NULL value,
+    /// the first in the order among equally frequent ones, as PostgreSQL
+    /// picks. Read as `mode(x ORDER BY x)`.
+    Mode,
 }
 
 impl AggFunc {
@@ -76,6 +89,9 @@ impl AggFunc {
             "VAR_SAMP" => AggFunc::VarSamp,
             "VAR_POP" => AggFunc::VarPop,
             "STRING_AGG" => AggFunc::StringAgg,
+            "PERCENTILE_CONT" => AggFunc::PercentileCont,
+            "PERCENTILE_DISC" => AggFunc::PercentileDisc,
+            "MODE" => AggFunc::Mode,
             "ARRAY_AGG" => AggFunc::ArrayAgg,
             "JSON_AGG" => AggFunc::JsonAgg,
             "JSONB_AGG" => AggFunc::JsonbAgg,
@@ -102,7 +118,16 @@ impl AggFunc {
     /// done ([`Acc::Collect`]); the only ones an `ORDER BY` inside the call
     /// changes.
     pub fn collects(&self) -> bool {
-        matches!(self, AggFunc::StringAgg | AggFunc::ArrayAgg | AggFunc::JsonAgg | AggFunc::JsonbAgg)
+        matches!(
+            self,
+            AggFunc::StringAgg
+                | AggFunc::ArrayAgg
+                | AggFunc::JsonAgg
+                | AggFunc::JsonbAgg
+                | AggFunc::PercentileCont
+                | AggFunc::PercentileDisc
+                | AggFunc::Mode
+        )
     }
 
     /// Refuses an aggregate over a type PostgreSQL has no such aggregate
@@ -118,6 +143,17 @@ impl AggFunc {
             match self {
                 AggFunc::StringAgg if !matches!(f.db_type, DbType::STRING | DbType::CHAR) => {
                     return Err(format!("function string_agg({}, unknown) does not exist", shown()));
+                }
+                // Interpolation needs a number (PostgreSQL also takes an
+                // interval, which this does not).
+                AggFunc::PercentileCont
+                    if !matches!(
+                        f.db_type,
+                        DbType::I8 | DbType::U8 | DbType::I16 | DbType::U16 | DbType::I32 | DbType::U32 | DbType::I64
+                            | DbType::U64 | DbType::F32 | DbType::F64 | DbType::DECIMAL
+                    ) =>
+                {
+                    return Err(format!("function percentile_cont(double precision ORDER BY {}) does not exist", shown()));
                 }
                 AggFunc::BoolAnd | AggFunc::BoolOr | AggFunc::Every if f.db_type != DbType::BOOL => {
                     return Err(format!("function {}({}) does not exist", self.name(), shown()));
@@ -201,6 +237,9 @@ impl AggFunc {
             AggFunc::VarSamp => "var_samp",
             AggFunc::VarPop => "var_pop",
             AggFunc::StringAgg => "string_agg",
+            AggFunc::PercentileCont => "percentile_cont",
+            AggFunc::PercentileDisc => "percentile_disc",
+            AggFunc::Mode => "mode",
             AggFunc::ArrayAgg => "array_agg",
             AggFunc::JsonAgg => "json_agg",
             AggFunc::JsonbAgg => "jsonb_agg",
@@ -258,6 +297,8 @@ impl AggFunc {
                 _ => DbType::DECIMAL,
             },
             AggFunc::StringAgg => DbType::STRING,
+            AggFunc::PercentileCont => DbType::F64,
+            AggFunc::PercentileDisc | AggFunc::Mode => arg.cloned().unwrap_or(DbType::F64),
             // One array type here, described as `text[]`; its text is
             // PostgreSQL's whatever the element type.
             AggFunc::ArrayAgg => DbType::ARRAY,
@@ -413,6 +454,21 @@ pub(crate) fn build_call(
     parse_key: &mut dyn FnMut(&str) -> Result<(crate::core::rql::expr::Expr, Vec<SchemaField>), String>,
 ) -> Result<Option<Box<AggCall>>, String> {
     let delimiter = match (func, second) {
+        (AggFunc::PercentileCont | AggFunc::PercentileDisc, None) => {
+            return Err(format!("{}(…) needs WITHIN GROUP (ORDER BY …)", func.name()));
+        }
+        // The fraction, a constant between 0 and 1, kept as its text.
+        (AggFunc::PercentileCont | AggFunc::PercentileDisc, Some(text)) => {
+            let fraction: f64 = text
+                .trim()
+                .trim_matches('\'')
+                .parse()
+                .map_err(|_| format!("{} with the fraction {text}, not a constant number, is not supported yet", func.name()))?;
+            if !(0.0..=1.0).contains(&fraction) {
+                return Err(format!("percentile value {fraction} is not between 0 and 1"));
+            }
+            Some(fraction.to_string())
+        }
         (AggFunc::StringAgg, None) => return Err("function string_agg(text) does not exist".to_string()),
         (AggFunc::StringAgg, Some(text)) => {
             if text.eq_ignore_ascii_case("NULL") {
@@ -1333,7 +1389,13 @@ impl Acc {
     pub(crate) fn new(func: AggFunc, arg: Option<&SchemaField>) -> Self {
         match func {
             AggFunc::Count => Acc::Count(0),
-            AggFunc::StringAgg | AggFunc::ArrayAgg | AggFunc::JsonAgg | AggFunc::JsonbAgg => Acc::Collect {
+            AggFunc::StringAgg
+            | AggFunc::ArrayAgg
+            | AggFunc::JsonAgg
+            | AggFunc::JsonbAgg
+            | AggFunc::PercentileCont
+            | AggFunc::PercentileDisc
+            | AggFunc::Mode => Acc::Collect {
                 values: Vec::new(),
                 order: Vec::new(),
                 by_value_descending: None,
@@ -1984,6 +2046,51 @@ impl Acc {
                 .ok_or_else(|| format!("a {} value could not be rendered for {}", crate::core::value_codec::pg_input_type_name(&ty), func.name()))
         };
         match func {
+            // The longest run of equal values in the call's order (equal
+            // values sort together); a tie goes to the run met first.
+            AggFunc::Mode => {
+                let present: Vec<&Vec<u8>> = values.iter().filter_map(|(_, v)| v.as_ref()).collect();
+                let mut best: Option<(&Vec<u8>, usize)> = None;
+                let mut i = 0;
+                while i < present.len() {
+                    let mut j = i + 1;
+                    while j < present.len() && present[j] == present[i] {
+                        j += 1;
+                    }
+                    if best.is_none_or(|(_, n)| j - i > n) {
+                        best = Some((present[i], j - i));
+                    }
+                    i = j;
+                }
+                Ok(best.map(|(v, _)| v.clone()))
+            }
+            // Over the non-NULL values, in the call's order: NULL when there
+            // are none, as in PostgreSQL.
+            AggFunc::PercentileCont | AggFunc::PercentileDisc => {
+                let present: Vec<&Vec<u8>> = values.iter().filter_map(|(_, v)| v.as_ref()).collect();
+                if present.is_empty() {
+                    return Ok(None);
+                }
+                let fraction: f64 = delimiter.as_deref().unwrap_or("0").parse().unwrap_or(0.0);
+                let n = present.len();
+                if func == AggFunc::PercentileDisc {
+                    // The first value whose cumulative share reaches the
+                    // fraction: position ceil(f * n), 1-based, at least 1.
+                    let at = ((fraction * n as f64).ceil() as usize).clamp(1, n) - 1;
+                    return Ok(Some(present[at].clone()));
+                }
+                let number = |bytes: &[u8]| -> Result<f64, String> {
+                    element(bytes)?
+                        .trim()
+                        .parse::<f64>()
+                        .map_err(|e| format!("percentile_cont could not read a value as a number: {e}"))
+                };
+                let position = fraction * (n - 1) as f64;
+                let (lo, hi) = (position.floor() as usize, position.ceil() as usize);
+                let low = number(present[lo])?;
+                let value = if lo == hi { low } else { low + (position - lo as f64) * (number(present[hi])? - low) };
+                Ok(Some(value.to_le_bytes().to_vec()))
+            }
             AggFunc::StringAgg => {
                 let present: Vec<&Vec<u8>> = values.iter().filter_map(|(_, v)| v.as_ref()).collect();
                 if present.is_empty() {

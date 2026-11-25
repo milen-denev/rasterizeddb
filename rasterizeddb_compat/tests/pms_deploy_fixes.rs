@@ -379,3 +379,130 @@ async fn a_json_path_written_as_an_array_is_read() {
         .collect();
     assert_eq!(got, vec![3]);
 }
+
+/// pms's chat router and global search: `title ILIKE ANY($1)` with the
+/// patterns bound as a `text[]`, which failed on every chat message
+/// ("unexpected LPar", "function 'ANY' is not supported yet"); and SeaORM's
+/// `ORDER BY "case"."updated_at"` over a join on a column not selected,
+/// whose quotes were trimmed into `case"."updated_at`.
+#[tokio::test]
+async fn like_any_over_a_bound_array_and_a_quoted_order_by_over_a_join() {
+    let (_s, pool) = server().await;
+    // `updated_at` on both sides, as pms has it: a column two relations
+    // share is renamed in the join's layout, which a quoted term missed.
+    run(&pool, "CREATE TABLE case_model (id int PRIMARY KEY, domain_id int, updated_at int)").await;
+    run(&pool, r#"CREATE TABLE "case" (id int PRIMARY KEY, title text, case_model_id int, updated_at int)"#).await;
+    run(&pool, "INSERT INTO case_model VALUES (1, 7, 5), (2, 8, 6)").await;
+    run(&pool, r#"INSERT INTO "case" VALUES (1, 'Please help', 1, 10), (2, 'test case', 1, 30), (3, 'other', 1, 20), (4, 'Please too', 2, 40)"#).await;
+
+    let patterns = vec!["%please%".to_string(), "%test%".to_string()];
+    let titles: Vec<String> = sqlx::query_scalar(
+        r#"SELECT "case"."title" FROM "case" INNER JOIN "case_model" ON "case"."case_model_id" = "case_model"."id" WHERE "case_model"."domain_id" = $1 AND ("case"."title" ILIKE ANY($2)) ORDER BY "case"."updated_at" DESC LIMIT 16"#,
+    )
+    .bind(7)
+    .bind(&patterns)
+    .fetch_all(&pool)
+    .await
+    .expect("ILIKE ANY over a bound text[]");
+    assert_eq!(titles, vec!["test case".to_string(), "Please help".to_string()]);
+
+    // `NOT … ALL`, `LIKE ANY (ARRAY[…])`, and the empty and NULL arrays.
+    assert_eq!(ids(&pool, r#"SELECT id FROM "case" WHERE title NOT ILIKE ALL(ARRAY['%please%','%test%']) ORDER BY id"#).await, vec![3]);
+    assert_eq!(ids(&pool, r#"SELECT id FROM "case" WHERE title LIKE ANY(ARRAY['%test%','oth%']) ORDER BY id"#).await, vec![2, 3]);
+    assert_eq!(ids(&pool, r#"SELECT id FROM "case" WHERE title ILIKE ANY('{}') ORDER BY id"#).await, Vec::<i32>::new());
+    assert_eq!(ids(&pool, r#"SELECT id FROM "case" WHERE title ILIKE ALL('{}') ORDER BY id"#).await, vec![1, 2, 3, 4]);
+    let empty: Vec<String> = Vec::new();
+    let none: Vec<i32> = sqlx::query_scalar(r#"SELECT id FROM "case" WHERE "case"."title"::text ILIKE ANY($1)"#)
+        .bind(&empty)
+        .fetch_all(&pool)
+        .await
+        .expect("an empty bound array");
+    assert!(none.is_empty());
+
+    // The quoted, qualified ORDER BY over a join, not selected.
+    assert_eq!(
+        ids(&pool, r#"SELECT "case"."id" FROM "case" INNER JOIN "case_model" ON "case"."case_model_id" = "case_model"."id" ORDER BY "case"."updated_at" DESC LIMIT 2"#).await,
+        vec![4, 2]
+    );
+}
+
+/// A JSON path whose elements are columns or expressions, `data #>>
+/// ARRAY[slot, 'rid']`, and the functions it stands for,
+/// `jsonb_extract_path[_text]`. Only a path of constants was read before. As
+/// in PostgreSQL, an element that reads as an integer indexes an array and is
+/// a key of an object, and a NULL element gives NULL.
+#[tokio::test]
+async fn a_json_path_of_columns_and_expressions_is_read() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE zz_dyn (id int PRIMARY KEY, data jsonb, slot text)").await;
+    run(
+        &pool,
+        r#"INSERT INTO zz_dyn VALUES (1, '[{"rid": "a1"}, {"rid": "a2"}]', '1'), (2, '{"0": {"rid": "k0"}, "x": {"rid": "kx"}}', 'x'), (3, '[{"rid": "n"}]', NULL)"#,
+    )
+    .await;
+    let texts = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(AssertSqlSafe(sql))
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"))
+                .iter()
+                .map(|r| r.get::<Option<String>, _>(0))
+                .collect::<Vec<_>>()
+        }
+    };
+    let s = |v: &str| Some(v.to_string());
+    assert_eq!(texts("SELECT data #>> ARRAY[slot, 'rid'] FROM zz_dyn ORDER BY id").await, vec![s("a2"), s("kx"), None]);
+    assert_eq!(texts("SELECT data #>> ARRAY[(id - 1)::text, 'rid'] FROM zz_dyn ORDER BY id").await, vec![s("a1"), None, None]);
+    assert_eq!(texts("SELECT jsonb_extract_path_text(data, '0', 'rid') FROM zz_dyn ORDER BY id").await, vec![s("a1"), s("k0"), s("n")]);
+    assert_eq!(ids(&pool, "SELECT id FROM zz_dyn WHERE data #>> ARRAY[slot, 'rid'] = 'kx'").await, vec![2]);
+    let found: Vec<i32> = sqlx::query_scalar("SELECT id FROM zz_dyn WHERE data #>> ARRAY[$1, 'rid'] = $2")
+        .bind("1")
+        .bind("a2")
+        .fetch_all(&pool)
+        .await
+        .expect("a bound element");
+    assert_eq!(found, vec![1]);
+}
+
+/// `percentile_cont` / `percentile_disc … WITHIN GROUP (ORDER BY …)`, as
+/// PostgreSQL answers them: interpolated, or the first value reaching the
+/// fraction, over the ordered non-NULL values; NULL over none.
+#[tokio::test]
+async fn percentiles_within_group() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE zz_pct (id int PRIMARY KEY, g text, v int)").await;
+    run(&pool, "INSERT INTO zz_pct VALUES (1,'a',1),(2,'a',2),(3,'a',3),(4,'a',4),(5,'b',10),(6,'b',NULL),(7,'c',NULL)").await;
+    let row = sqlx::query(
+        "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v), percentile_cont(0.25) WITHIN GROUP (ORDER BY v DESC), \
+         percentile_disc(0.5) WITHIN GROUP (ORDER BY v) FROM zz_pct WHERE g = 'a'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("percentiles");
+    assert_eq!(row.get::<f64, _>(0), 2.5);
+    assert_eq!(row.get::<f64, _>(1), 3.25);
+    assert_eq!(row.get::<i32, _>(2), 2);
+    let medians: Vec<(String, Option<f64>)> = sqlx::query_as(
+        "SELECT g, percentile_cont(0.5) WITHIN GROUP (ORDER BY v) FROM zz_pct GROUP BY g ORDER BY g",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("grouped");
+    assert_eq!(medians, vec![("a".into(), Some(2.5)), ("b".into(), Some(10.0)), ("c".into(), None)]);
+    let e = sqlx::query("SELECT percentile_cont(1.5) WITHIN GROUP (ORDER BY v) FROM zz_pct")
+        .fetch_all(&pool)
+        .await
+        .expect_err("a fraction past 1");
+    assert!(e.to_string().contains("not between 0 and 1"), "{e}");
+
+    // `mode()`: the most frequent value, the first in the order on a tie.
+    run(&pool, "CREATE TABLE zz_mode (id int PRIMARY KEY, k text)").await;
+    run(&pool, "INSERT INTO zz_mode VALUES (1,'x'),(2,'y'),(3,'y'),(4,'x'),(5,NULL)").await;
+    let row = sqlx::query("SELECT mode() WITHIN GROUP (ORDER BY k), mode() WITHIN GROUP (ORDER BY k DESC) FROM zz_mode")
+        .fetch_one(&pool)
+        .await
+        .expect("mode");
+    assert_eq!((row.get::<String, _>(0), row.get::<String, _>(1)), ("x".to_string(), "y".to_string()));
+}

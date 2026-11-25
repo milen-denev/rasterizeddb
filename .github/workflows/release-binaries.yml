@@ -319,6 +319,36 @@ jobs:
             org.opencontainers.image.version=${{ steps.tags.outputs.version }}
             org.opencontainers.image.licenses=GPL-3.0-only
 
+  # Docker Hub's Overview tab: docs/docker.md (tags, running, flags,
+  # compose, the RustFS image), its links to other docs made absolute so they
+  # resolve there. For a full release only, after its images are pushed; a
+  # pre-release leaves the page on the last release's text. GHCR reads the
+  # images' org.opencontainers labels instead and needs nothing here.
+  #
+  # Docker Hub accepts a description only from a token with the Read, Write,
+  # Delete scope (a push-only token is refused). A refusal does not fail the
+  # release: the images are already pushed by then.
+  dockerhub-overview:
+    name: Docker Hub overview
+    needs: docker
+    if: github.event_name == 'push' && vars.DOCKERHUB_USERNAME != '' && !contains(github.ref_name, '-')
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: The overview, its links absolute
+        run: |
+          sed -E 's#\]\(([A-Za-z0-9_./-]+\.md)(\#[^)]*)?\)#](https://github.com/${{ github.repository }}/blob/main/docs/\1\2)#g' \
+            docs/docker.md > "$RUNNER_TEMP/dockerhub-overview.md"
+          grep -n '](' "$RUNNER_TEMP/dockerhub-overview.md" | grep -v -E '\]\((https?://|#)' && exit 1 || true
+      - uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ vars.DOCKERHUB_USERNAME }}/rasterizeddb
+          short-description: "SQL database in Rust: PostgreSQL, MySQL, SQL Server and native wire protocols"
+          readme-filepath: ${{ runner.temp }}/dockerhub-overview.md
+
   # The Arch Linux / CachyOS package, rasterizeddb-bin, built with makepkg in
   # an Arch container from packaging/arch and the linux-x86_64 archive, then
   # installed there and run. The release gets the .pkg.tar.zst and an AUR

@@ -5135,6 +5135,12 @@ pub(crate) async fn describe_query(
     if let std::borrow::Cow::Owned(text) = crate::core::sql_scan::json_path_arrays(&catalog) {
         catalog = text;
     }
+    if let std::borrow::Cow::Owned(text) = crate::core::sql_scan::like_quantified_arrays(&catalog) {
+        catalog = text;
+    }
+    if let std::borrow::Cow::Owned(text) = crate::core::sql_scan::within_group(&catalog) {
+        catalog = text;
+    }
     // `'t'::regclass` and the like, as `rewrite_statement_text` reads them.
     if let Ok(Some(text)) = crate::core::rql::reg_casts::rewrite(
         &catalog,
@@ -8263,6 +8269,16 @@ pub(crate) fn rewrite_statement_text<'a>(
     // `doc #>> ARRAY['a', '0']` as the path literal `doc #>> '{a,0}'`
     // (`sql_scan::json_path_arrays`), with bound values already in it.
     if let Cow::Owned(text) = crate::core::sql_scan::json_path_arrays(&stmt) {
+        stmt = Cow::Owned(text);
+    }
+    // `x ILIKE ANY ('{…}')` as an OR of one match per pattern
+    // (`sql_scan::like_quantified_arrays`).
+    if let Cow::Owned(text) = crate::core::sql_scan::like_quantified_arrays(&stmt) {
+        stmt = Cow::Owned(text);
+    }
+    // `percentile_cont(f) WITHIN GROUP (ORDER BY x)` as the ordered call
+    // (`sql_scan::within_group`).
+    if let Cow::Owned(text) = crate::core::sql_scan::within_group(&stmt) {
         stmt = Cow::Owned(text);
     }
     // `indkey::text` and the other vector columns, spaced as PostgreSQL
