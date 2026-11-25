@@ -31,7 +31,7 @@
 ### Speed
 
 - Every statement could stall for tens of seconds behind one slow disk sync: starting a transaction made the next block of transaction ids durable while holding the lock every new transaction needs, so one `fsync` on a busy disk froze reads and writes alike (seen on a production node as 31–47 s stalls with all waiting writes finishing in the same millisecond). The next block is now reserved early, half a block ahead and outside that lock; an id is still never handed out before its reservation is durable.
-- SQL Server front end: a `SqlBulkCopy` or parameterised insert into a `datetime2(7)` column no longer evaluates an expression per row (20,000 rows: 36 s → 13 s), and an `INFORMATION_SCHEMA` lookup naming one table builds only that table's rows (it took ~12 s on a database of ~100 tables, past EF Core's 30 s command timeout under load).
+- SQL Server front end: a `SqlBulkCopy` or parameterised insert into a `datetime2(7)` column no longer evaluates an expression per row (20,000 rows: 36 s → 13 s), and a case-insensitive column's key is computed from its value instead of re-parsing an expression per row (long text in a bulk copy: about 45 s of 20,000 rows was spent there), and an `INFORMATION_SCHEMA` lookup naming one table builds only that table's rows (it took ~12 s on a database of ~100 tables, past EF Core's 30 s command timeout under load).
 - A transaction block's `COMMIT` synced about 55 times per DDL statement in it. EF Core's `EnsureCreated` (92 tables, 128 indexes) committed in 30–75 s and now takes under a second.
 
 ### New features
