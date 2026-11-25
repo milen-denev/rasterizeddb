@@ -42,6 +42,7 @@
 //! | 0x08 | Classify | database str, schema_epoch u64, source u8 (0 simple shape, 1 Parse text), text str |
 //! | 0x09 | ExecPart | session u64, map_epoch u64, merge [`Merge`], bytes (pgwire frontend messages) |
 //! | 0x0A | Cancel | backend_key u64 |
+//! | 0x13 | Coordinate | session u64, map_epoch u64, partials list(bytes), bytes (one simple Query) |
 //! | 0x0B | Native | database str, role str, map_epoch u64, bytes (one native-protocol request) |
 //!
 //! | kind | response | body |
@@ -246,6 +247,12 @@ pub enum Request {
     HoldCommits { ms: u32 },
     /// Ends this connection's `HoldCommits`. Answered `Done`.
     ReleaseCommits,
+    /// Runs an aggregate as the coordinator on virtual session `session`,
+    /// with the other shards' partial folds already gathered (each the one
+    /// row of an `ExecPart` under [`Merge::Coordinator`]): what a gateway
+    /// sends inside a transaction, where every part must run on the
+    /// transaction's own sessions. Answered like `Pg`.
+    Coordinate { session: u64, map_epoch: u64, partials: Vec<Vec<u8>>, bytes: Vec<u8> },
 }
 
 /// Where a classified text came from.
@@ -561,6 +568,7 @@ impl Request {
             Request::Notifications { .. } => 0x10,
             Request::HoldCommits { .. } => 0x11,
             Request::ReleaseCommits => 0x12,
+            Request::Coordinate { .. } => 0x13,
         }
     }
 
@@ -619,6 +627,13 @@ impl Request {
                 w.u32(*ms);
             }
             Request::ReleaseCommits => {}
+            Request::Coordinate { session, map_epoch, partials, bytes } => {
+                w.u64(*session).u64(*map_epoch).u32(partials.len() as u32);
+                for p in partials {
+                    w.bytes(p);
+                }
+                w.bytes(bytes);
+            }
         }
         w.buf
     }
@@ -689,6 +704,16 @@ impl Request {
             0x10 => Request::Notifications { database: r.str()?, since: r.u64()? },
             0x11 => Request::HoldCommits { ms: r.u32()? },
             0x12 => Request::ReleaseCommits,
+            0x13 => {
+                let session = r.u64()?;
+                let map_epoch = r.u64()?;
+                let n = r.count(4)?;
+                let mut partials = Vec::with_capacity(n);
+                for _ in 0..n {
+                    partials.push(r.bytes()?.to_vec());
+                }
+                Request::Coordinate { session, map_epoch, partials, bytes: r.bytes()?.to_vec() }
+            }
             k => return Err(format!("rshard request kind {k:#04x} is unknown")),
         };
         r.end()?;

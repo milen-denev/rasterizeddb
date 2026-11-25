@@ -233,6 +233,12 @@ async fn handle(conn: &Conn, data: &[u8]) -> Response {
             }
             pg(conn, session, &bytes).await
         }
+        Request::Coordinate { session, map_epoch, partials, bytes } => {
+            if let Some(r) = epoch_refusal(map_epoch, served.map.epoch()) {
+                return r;
+            }
+            coordinate_given(conn, session, partials, &bytes).await
+        }
         Request::Continue { session } => continue_reply(conn, session).await,
         Request::CloseSession { session } => {
             let gone = conn.sessions.lock().unwrap().remove(&session);
@@ -945,11 +951,9 @@ async fn peer_part(id: u32, database: &str, role: &str, bytes: &[u8], merge: Mer
 /// statement was answered some other way) fails the statement `XX000`
 /// rather than answer from this shard's rows alone.
 async fn coordinate(session: u64, s: &mut VSession, bytes: &[u8]) -> Response {
-    use crate::core::cancel::Fold;
-    let Some(served) = served() else {
+    if served().is_none() {
         return refuse(PROTOCOL, true, "this node is not a shard");
-    };
-    let _ = &served;
+    }
     let mut partials = Vec::new();
     for (id, part) in peer_parts(&s.database, &s.role, bytes, Merge::Coordinator).await {
         match partial_of(id, part) {
@@ -966,6 +970,30 @@ async fn coordinate(session: u64, s: &mut VSession, bytes: &[u8]) -> Response {
             }
         }
     }
+    merge_partials(session, s, partials, bytes).await
+}
+
+/// `Request::Coordinate`: the aggregate run on the gateway's session
+/// `session` with the other shards' partials it gathered itself, inside the
+/// transaction their parts ran in.
+async fn coordinate_given(conn: &Conn, session: u64, partials: Vec<Vec<u8>>, bytes: &[u8]) -> Response {
+    if served().is_none() {
+        return refuse(PROTOCOL, true, "this node is not a shard");
+    }
+    if simple_query_text(bytes).is_none() {
+        return refuse(PROTOCOL, true, "a Coordinate request carries one simple Query");
+    }
+    let Some(s) = session_of(conn, session) else {
+        return refuse(SESSION_GONE, true, format!("session {session} is gone"));
+    };
+    let mut s = s.lock().await;
+    s.finished = true;
+    merge_partials(session, &mut s, partials, bytes).await
+}
+
+/// Runs `bytes` on `s` as the coordinator, `partials` merged into its fold.
+async fn merge_partials(session: u64, s: &mut VSession, partials: Vec<Vec<u8>>, bytes: &[u8]) -> Response {
+    use crate::core::cancel::Fold;
     let Some(cancel) = crate::core::cancel::session_by_pid(s.bridge.pid) else {
         return refuse(*b"XX000", true, "the coordinating session is not registered");
     };

@@ -204,6 +204,118 @@ impl<'a> Bind<'a> {
     }
 }
 
+/// A Bind message whole: every parameter with its format code, and the
+/// result format codes as sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindAll {
+    pub portal: String,
+    pub statement: String,
+    pub params: Vec<(i16, Option<Vec<u8>>)>,
+    pub results: Vec<i16>,
+}
+
+pub fn parse_bind_all(msg: &[u8]) -> Option<BindAll> {
+    let (portal, rest) = cstr(body(msg))?;
+    let (statement, rest) = cstr(rest)?;
+    let i16_at = |b: &[u8], at: usize| b.get(at..at + 2).map(|x| i16::from_be_bytes([x[0], x[1]]));
+    let nformats = i16_at(rest, 0)? as usize;
+    let mut formats = Vec::with_capacity(nformats);
+    for k in 0..nformats {
+        formats.push(i16_at(rest, 2 + 2 * k)?);
+    }
+    let mut at = 2 + 2 * nformats;
+    let nparams = i16_at(rest, at)? as usize;
+    at += 2;
+    let mut params = Vec::with_capacity(nparams);
+    for k in 0..nparams {
+        let len = i32::from_be_bytes(rest.get(at..at + 4)?.try_into().ok()?);
+        at += 4;
+        let value = if len < 0 {
+            None
+        } else {
+            let v = rest.get(at..at + len as usize)?.to_vec();
+            at += len as usize;
+            Some(v)
+        };
+        let fmt = match nformats {
+            0 => 0,
+            1 => formats[0],
+            _ => *formats.get(k)?,
+        };
+        params.push((fmt, value));
+    }
+    let nresults = i16_at(rest, at)? as usize;
+    at += 2;
+    let mut results = Vec::with_capacity(nresults);
+    for k in 0..nresults {
+        results.push(i16_at(rest, at + 2 * k)?);
+    }
+    Some(BindAll { portal: portal.to_string(), statement: statement.to_string(), params, results })
+}
+
+/// A Bind message for `bind`, each parameter's format code written out.
+pub fn encode_bind(out: &mut Vec<u8>, bind: &BindAll) {
+    let mut b = Vec::new();
+    b.extend_from_slice(bind.portal.as_bytes());
+    b.push(0);
+    b.extend_from_slice(bind.statement.as_bytes());
+    b.push(0);
+    b.extend_from_slice(&(bind.params.len() as i16).to_be_bytes());
+    for (f, _) in &bind.params {
+        b.extend_from_slice(&f.to_be_bytes());
+    }
+    b.extend_from_slice(&(bind.params.len() as i16).to_be_bytes());
+    for (_, v) in &bind.params {
+        match v {
+            Some(v) => {
+                b.extend_from_slice(&(v.len() as i32).to_be_bytes());
+                b.extend_from_slice(v);
+            }
+            None => b.extend_from_slice(&(-1i32).to_be_bytes()),
+        }
+    }
+    b.extend_from_slice(&(bind.results.len() as i16).to_be_bytes());
+    for r in &bind.results {
+        b.extend_from_slice(&r.to_be_bytes());
+    }
+    put(out, b'B', &b);
+}
+
+/// A Parse message's parameter type OIDs (0 where unspecified).
+pub fn parse_types(msg: &[u8]) -> Option<Vec<u32>> {
+    let (_, rest) = cstr(body(msg))?;
+    let (_, rest) = cstr(rest)?;
+    let n = rest.get(0..2).map(|x| i16::from_be_bytes([x[0], x[1]]))? as usize;
+    (0..n).map(|k| rest.get(2 + 4 * k..6 + 4 * k).map(|x| u32::from_be_bytes([x[0], x[1], x[2], x[3]]))).collect()
+}
+
+pub fn encode_parse(out: &mut Vec<u8>, name: &str, query: &str, types: &[u32]) {
+    let mut b = Vec::with_capacity(query.len() + name.len() + 4 + 4 * types.len());
+    b.extend_from_slice(name.as_bytes());
+    b.push(0);
+    b.extend_from_slice(query.as_bytes());
+    b.push(0);
+    b.extend_from_slice(&(types.len() as i16).to_be_bytes());
+    for t in types {
+        b.extend_from_slice(&t.to_be_bytes());
+    }
+    put(out, b'P', &b);
+}
+
+/// Describe (`b'S'` statement or `b'P'` portal), Execute (no row limit)
+/// and Sync, for the unnamed statement and portal.
+pub fn encode_describe(out: &mut Vec<u8>, kind: u8) {
+    put(out, b'D', &[kind, 0]);
+}
+
+pub fn encode_execute(out: &mut Vec<u8>) {
+    put(out, b'E', &[0, 0, 0, 0, 0]);
+}
+
+pub fn encode_sync(out: &mut Vec<u8>) {
+    put(out, b'S', &[]);
+}
+
 /// A Close message: `(b'S' or b'P', name)`.
 pub fn parse_close(msg: &[u8]) -> Option<(u8, &str)> {
     let b = body(msg);

@@ -96,6 +96,17 @@ def psql(port, sql, timeout=60):
     return r.returncode, (r.stdout.strip() if r.returncode == 0 else r.stderr.strip())
 
 
+def psql_script(port, script, timeout=60):
+    """`script` run by psql -f in one session: for meta-commands (\\bind,
+    \\parse, \\bind_named), which send the extended protocol."""
+    path = f"{WORK}/script.sql"
+    with open(path, "w") as f:
+        f.write(script)
+    r = subprocess.run(["psql", "-h", "127.0.0.1", "-p", str(port), "-U", "rasterized", "-d", "postgres",
+                        "-At", "-v", "ON_ERROR_STOP=1", "-f", path], env=ENV, capture_output=True, text=True, timeout=timeout)
+    return r.returncode, (r.stdout.strip() if r.returncode == 0 else r.stderr.strip())
+
+
 def up(port, what, secs=90):
     end = time.time() + secs
     last = ""
@@ -218,6 +229,31 @@ def main():
     got = psql(GW, "SELECT count(*) FROM orders WHERE id IN (3007, 3008)")
     check("  ...a duplicate in one row inserts none", code != 0 and got == (0, "0"), f"{out} / {got}")
     psql(GW, "DELETE FROM orders WHERE id >= 3001")
+
+    # 4d. The same, prepared: parameters bound, each row routed by its own.
+    code, out = psql_script(GW, "INSERT INTO orders (id, store, v) VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9) RETURNING id, v "
+                                "\\bind 4001 1 11 4002 2 12 4003 3 13 \\g\n")
+    check("a prepared multi-row INSERT across shards", code == 0 and sorted(l for l in out.split("\n") if "|" in l) == ["4001|11", "4002|12", "4003|13"]
+          and out.split("\n")[-1] == "INSERT 0 3", out)
+    code, out = psql_script(GW, "INSERT INTO orders (id, store, v) VALUES ($1, 1, $2), ($3, 2, $4) \\parse ins2\n"
+                                "\\bind_named ins2 4004 14 4005 15 \\g\n"
+                                "\\bind_named ins2 4006 16 4007 17 \\g\n")
+    got = psql(GW, "SELECT count(*) FROM orders WHERE id BETWEEN 4004 AND 4007")
+    check("  ...a named one, run twice", code == 0 and got == (0, "4"), f"{out} / {got}")
+    code, out = psql_script(GW, "INSERT INTO orders (id, store, v) VALUES ($1, 1, 1), ($2, 1, 1), ($3, 1, 1) \\bind 4008 4009 4001 \\g\n")
+    got = psql(GW, "SELECT count(*) FROM orders WHERE id IN (4008, 4009)")
+    check("  ...a duplicate in one row inserts none", code != 0 and got == (0, "0"), f"{out} / {got}")
+    psql(GW, "DELETE FROM orders WHERE id >= 4001")
+
+    # 4e. An aggregate in a transaction that already wrote on other shards
+    # sees those writes.
+    code, out = psql(GW, "BEGIN; INSERT INTO orders (id, store, v) VALUES (5001, 1, 100000); "
+                         "INSERT INTO orders (id, store, v) VALUES (5002, 2, 100000); "
+                         "SELECT count(*), max(v) FROM orders; ROLLBACK")
+    want = f"{rows + 4}|100000"
+    check("an aggregate in a transaction sees its own writes on every shard", code == 0 and want in out.split(), out)
+    check("  ...and the rollback undid them", psql(GW, "SELECT count(*) FROM orders WHERE id > 5000") == (0, "0"),
+          psql(GW, "SELECT count(*) FROM orders WHERE id > 5000"))
 
     # 5. The DDL fence: a fenced table refuses with a retryable 40001.
     on_every_shard("SET CONFIG shard.ddl_fence = 'orders'")

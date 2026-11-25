@@ -1308,6 +1308,13 @@ impl Session {
             let (target, needs, tkey) = match self.decide_extended(&map, batch).await {
                 Ok(v) => v,
                 Err((code, msg)) => {
+                    // A prepared multi-row INSERT is split by row.
+                    if code == "0A000"
+                        && sync
+                        && let Some(outcome) = self.split_extended(conn, batch).await?
+                    {
+                        return Ok(outcome);
+                    }
                     if code == "0A000" {
                         self.core.counters.borrow_mut().refused_no_key += 1;
                     }

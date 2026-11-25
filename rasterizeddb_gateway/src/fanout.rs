@@ -57,11 +57,10 @@ impl Session {
                             return self.in_txn_merge(msg, Merge::Concat, true).await;
                         }
                     }
-                    self.error_ready(
-                        "0A000",
-                        "an aggregate over every shard cannot run in a transaction that already ran on a shard other than the home shard; run it before the transaction's first keyed statement, or outside it",
-                    );
-                    return Ok(Outcome::Done { error: true });
+                    // A fold: every other shard's partial gathered here,
+                    // inside the transaction, and merged on the home
+                    // shard's session in it.
+                    return self.in_txn_coordinate(msg, home).await;
                 }
                 // Joined first: the shard coordinates only a statement that
                 // comes alone, not behind a deferred BEGIN.
@@ -669,6 +668,274 @@ impl Session {
         let status = self.txn.status;
         pg::ready(&mut self.out, status);
         Ok(Outcome::Done { error: false })
+    }
+
+    /// An aggregate inside a transaction that already ran beyond the home
+    /// shard: every shard joined; each other shard's partial fold taken by
+    /// an `ExecPart` on the transaction's session there; the home shard then
+    /// runs the statement on its own session in the transaction with those
+    /// partials merged into its fold (`Request::Coordinate`).
+    async fn in_txn_coordinate(&mut self, msg: &[u8], home: u32) -> io::Result<Outcome> {
+        let shards: Vec<u32> = self.core.map().shards().iter().map(|s| s.id).collect();
+        let others: Vec<u32> = shards.iter().copied().filter(|&s| s != home).collect();
+        let gathered = match self.join_txn(&shards).await {
+            Ok(()) => self.run_parts(&others, &Merge::Coordinator, msg).await,
+            Err(e) => Err(e),
+        };
+        let parts = match gathered {
+            Ok(p) => p,
+            Err((code, m)) => {
+                self.error_ready(&code, &m);
+                return Ok(Outcome::Done { error: true });
+            }
+        };
+        let mut partials = Vec::with_capacity(parts.len());
+        for (s, p) in parts {
+            match p.rows.into_iter().next() {
+                Some((_, partial)) => partials.push(partial),
+                None => {
+                    self.error_ready("XX000", &format!("shard {s} returned no partial for the aggregate"));
+                    return Ok(Outcome::Done { error: true });
+                }
+            }
+        }
+        let id = match self.ensure_vs(home).await {
+            Ok(id) => id,
+            Err((code, m)) => {
+                self.error_ready(&code, &format!("shard {home}: {m}"));
+                return Ok(Outcome::Done { error: true });
+            }
+        };
+        let req = Request::Coordinate { session: id, map_epoch: self.core.map().epoch(), partials, bytes: msg.to_vec() }.encode();
+        match collect_pg(self.core.clone(), home, id, req).await {
+            Ok(bytes) => {
+                // The reply ends in the home session's ReadyForQuery, which
+                // says whether the statement failed the transaction.
+                if let Some((_, z)) = pg::messages(&bytes).filter(|(t, _)| *t == b'Z').last()
+                    && let Some(&st) = pg::body(z).first()
+                {
+                    self.txn.status = st;
+                }
+                let error = pg::messages(&bytes).any(|(t, _)| t == b'E');
+                self.out.extend_from_slice(&bytes);
+                Ok(Outcome::Done { error })
+            }
+            Err((code, m)) => {
+                self.error_ready(&code, &m);
+                Ok(Outcome::Done { error: true })
+            }
+        }
+    }
+
+    /// A prepared multi-row INSERT whose rows go to several shards: a
+    /// batch of `[Parse] Bind [Describe] Execute Sync` for one statement
+    /// that [`crate::split::split`] cuts. Each row is routed by its own key
+    /// parameter; each shard gets its rows as its own Parse/Bind/Execute
+    /// (parameters renumbered, the client's types and formats kept), inside
+    /// the client's block or a two-phase transaction of the gateway's own.
+    /// The client gets the replies its own messages ask for. `None` when the
+    /// batch is not one of these, for the caller to answer as before.
+    pub(crate) async fn split_extended<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, batch: &[u8]) -> io::Result<Option<Outcome>> {
+        let msgs: Vec<(u8, &[u8])> = pg::messages(batch).collect();
+        let tags: Vec<u8> = msgs.iter().map(|(t, _)| *t).collect();
+        let shape_ok = matches!(tags.as_slice(), [b'P', b'B', b'E', b'S'] | [b'P', b'B', b'D', b'E', b'S'] | [b'B', b'E', b'S'] | [b'B', b'D', b'E', b'S']);
+        if !shape_ok {
+            return Ok(None);
+        }
+        let parse = msgs.iter().find(|(t, _)| *t == b'P').map(|(_, m)| *m);
+        let Some(bind) = msgs.iter().find(|(t, _)| *t == b'B').and_then(|(_, m)| pg::parse_bind_all(m)) else {
+            return Ok(None);
+        };
+        let describe = msgs.iter().find(|(t, _)| *t == b'D').and_then(|(_, m)| pg::body(m).first().copied());
+        // The statement's text and parameter types: the batch's own Parse, or
+        // the one the client made earlier.
+        let (text, parse_msg) = match parse {
+            Some(p) => match pg::parse_parse(p) {
+                Some((name, text)) if name == bind.statement => (text.to_string(), p.to_vec()),
+                _ => return Ok(None),
+            },
+            None => match self.statements.get(&bind.statement) {
+                Some(st) => (st.text.clone(), st.parse.clone()),
+                None => return Ok(None),
+            },
+        };
+        let types = pg::parse_types(&parse_msg).unwrap_or_default();
+        let Some(rows) = crate::split::split(&text) else {
+            return Ok(None);
+        };
+
+        // Each row's shard, from its own key parameter.
+        let map = self.core.map();
+        let home = self.core.shared.home(&map);
+        let mut groups: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
+        for i in 0..rows.rows.len() {
+            let Some((one, orig)) = crate::split::renumber(&rows.statement(&[i])) else {
+                return Ok(None);
+            };
+            let template = match crate::route::template(&self.core, &self.login.database, rasterizeddb_router::rshard::Source::Parse, &one, home).await {
+                Ok(t) => t,
+                Err(_) => return Ok(None),
+            };
+            let shard = match template {
+                rasterizeddb_router::rshard::RouteTemplate::Param { index, family } => {
+                    let Some(&n) = orig.get(index as usize) else { return Ok(None) };
+                    let Some((fmt, value)) = bind.params.get(n - 1) else { return Ok(None) };
+                    match crate::route::param_block(*fmt == 1, value.as_deref(), family) {
+                        Some(b) => map.shard_of_block(b),
+                        None => return Ok(None),
+                    }
+                }
+                rasterizeddb_router::rshard::RouteTemplate::Fixed { block } => map.shard_of_block(block),
+                rasterizeddb_router::rshard::RouteTemplate::Home => home,
+                _ => return Ok(None),
+            };
+            groups.entry(shard).or_default().push(i);
+        }
+        if groups.len() > 1 && !self.core.shared.cfg.two_phase {
+            self.error_ready("0A000", "this INSERT's rows go to several shards, which needs two_phase = on in the gateway; or send one INSERT per shard");
+            return Ok(Some(Outcome::Done { error: true }));
+        }
+        if self.txn.status == b'E' {
+            self.error_ready("25P02", "current transaction is aborted, commands ignored until end of transaction block");
+            return Ok(Some(Outcome::Done { error: true }));
+        }
+        let _ = conn;
+        self.core.counters.borrow_mut().fan_outs += 1;
+        let shards: Vec<u32> = groups.keys().copied().collect();
+        // One shard outside a block: one INSERT is atomic there by itself.
+        let implicit = if shards.len() > 1 { self.begin_implicit() } else { false };
+        if (implicit || self.txn.status != b'I')
+            && let Err((code, m)) = self.join_txn(&shards).await
+        {
+            return Ok(Some(self.write_failed(implicit, &code, &m).await));
+        }
+
+        // What Describe answers, from the whole statement on the first
+        // shard (Parse and Describe only: nothing runs).
+        let mut described = Vec::new();
+        if let Some(kind) = describe {
+            let first = shards[0];
+            let id = match self.ensure_vs(first).await {
+                Ok(id) => id,
+                Err((code, m)) => return Ok(Some(self.write_failed(implicit, &code, &format!("shard {first}: {m}")).await)),
+            };
+            let mut d = Vec::new();
+            pg::encode_parse(&mut d, "", &text, &types);
+            if kind == b'P' {
+                pg::encode_bind(&mut d, &pg::BindAll { portal: String::new(), statement: String::new(), ..bind.clone() });
+            }
+            pg::encode_describe(&mut d, kind);
+            pg::encode_sync(&mut d);
+            let mut req = Vec::new();
+            Request::encode_pg(&mut req, id, map.epoch(), &d);
+            match collect_pg(self.core.clone(), first, id, req).await {
+                Ok(bytes) => {
+                    if let Some((_, m)) = pg::messages(&bytes).find(|(t, _)| *t == b'E') {
+                        let (code, msg) = (pg::error_sqlstate(m).unwrap_or("XX000").to_string(), pg::error_message(m).unwrap_or_default());
+                        return Ok(Some(self.write_failed(implicit, &code, &msg).await));
+                    }
+                    for (t, m) in pg::messages(&bytes) {
+                        if matches!(t, b't' | b'T' | b'n') {
+                            described.extend_from_slice(m);
+                        }
+                    }
+                }
+                Err((code, m)) => return Ok(Some(self.write_failed(implicit, &code, &m).await)),
+            }
+        }
+
+        // Every shard's rows at once.
+        let mut handles = Vec::with_capacity(groups.len());
+        for (s, idx) in &groups {
+            let Some((part_text, orig)) = crate::split::renumber(&rows.statement(idx)) else {
+                return Ok(Some(self.write_failed(implicit, "08P01", "a parameter number past 65535").await));
+            };
+            let part_types: Vec<u32> = orig.iter().map(|&n| types.get(n - 1).copied().unwrap_or(0)).collect();
+            let part_bind = pg::BindAll {
+                portal: String::new(),
+                statement: String::new(),
+                params: orig.iter().map(|&n| bind.params.get(n - 1).cloned().unwrap_or((0, None))).collect(),
+                results: bind.results.clone(),
+            };
+            let mut b = Vec::new();
+            pg::encode_parse(&mut b, "", &part_text, &part_types);
+            pg::encode_bind(&mut b, &part_bind);
+            pg::encode_execute(&mut b);
+            pg::encode_sync(&mut b);
+            let id = match self.ensure_vs(*s).await {
+                Ok(id) => id,
+                Err((code, m)) => return Ok(Some(self.write_failed(implicit, &code, &format!("shard {s}: {m}")).await)),
+            };
+            // The unnamed statement there is this one now.
+            if let Some(vs) = self.vs.get_mut(s) {
+                vs.parsed.remove("");
+            }
+            let mut req = Vec::new();
+            Request::encode_pg(&mut req, id, map.epoch(), &b);
+            handles.push((*s, tokio::task::spawn_local(collect_pg(self.core.clone(), *s, id, req))));
+        }
+        let mut replies = Vec::with_capacity(handles.len());
+        let mut failure = None;
+        for (s, h) in handles {
+            match h.await {
+                Ok(Ok(bytes)) => {
+                    if failure.is_none()
+                        && let Some((_, m)) = pg::messages(&bytes).find(|(t, _)| *t == b'E')
+                    {
+                        failure = Some((pg::error_sqlstate(m).unwrap_or("XX000").to_string(), format!("shard {s}: {}", pg::error_message(m).unwrap_or_default())));
+                    }
+                    replies.push(bytes);
+                }
+                Ok(Err(e)) => {
+                    failure.get_or_insert(e);
+                }
+                Err(_) => {
+                    failure.get_or_insert(("XX000".into(), format!("the part on shard {s} panicked")));
+                }
+            }
+        }
+        if let Some((code, m)) = failure {
+            return Ok(Some(self.write_failed(implicit, &code, &m).await));
+        }
+        // The client's statement is known here from now on; no shard has it
+        // under its name, so a later Bind parses it again where it goes.
+        if let Some(p) = parse
+            && let Some((name, text)) = pg::parse_parse(p)
+        {
+            self.generation += 1;
+            let generation = self.generation;
+            self.statements.insert(name.to_string(), crate::session::Stmt { text: text.to_string(), parse: p.to_vec(), generation });
+        }
+
+        let mut out = Vec::new();
+        if parse.is_some() {
+            pg::put(&mut out, b'1', &[]);
+        }
+        pg::put(&mut out, b'2', &[]);
+        out.extend_from_slice(&described);
+        let (mut total, mut head) = (0u64, "INSERT 0".to_string());
+        for bytes in &replies {
+            for (t, m) in pg::messages(bytes) {
+                match t {
+                    b'D' => out.extend_from_slice(m),
+                    b'C' => {
+                        if let Some((h, n)) = pg::tag_count(m) {
+                            head = h;
+                            total += n;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        pg::command_complete(&mut out, &format!("{head} {total}"));
+        if !implicit && self.txn.status == b'I' {
+            // One shard, autocommit: done there already.
+            self.out.extend_from_slice(&out);
+            pg::ready(&mut self.out, b'I');
+            return Ok(Some(Outcome::Done { error: false }));
+        }
+        Ok(Some(self.write_done(implicit, out).await))
     }
 
     fn partial(&mut self, code: &str, message: &str, applied: &[u32]) -> Outcome {

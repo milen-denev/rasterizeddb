@@ -269,13 +269,18 @@ synchronous_commit, txn_start_time}`; the last is a new executor input, so
   - a multi-row `INSERT … VALUES (…), (…)` is split by the shard each row
     goes to, and each shard's rows are sent to it as one INSERT, in the same
     transaction: a duplicate key in one row inserts none. `RETURNING` rows
-    come back grouped by shard, not in VALUES order. Only a simple Query is
-    split; a prepared multi-row INSERT with parameters still needs its rows
-    on one shard;
-  - an aggregate the home shard coordinates runs in a block only while the
-    block has run on no other shard (the other shards' parts run outside
-    it); a top-N (`ORDER BY` with literal `LIMIT`/`OFFSET`, or none) or a
-    `SELECT DISTINCT` in such a block is merged on the gateway instead.
+    come back grouped by shard, not in VALUES order. A prepared one (`[Parse]
+    Bind [Describe] Execute Sync`) is split the same way: each row routed by
+    its own key parameter, each shard sent its own Parse/Bind/Execute with
+    the parameters renumbered and the client's types and formats kept, and
+    the client answered for its own messages;
+  - an aggregate runs in a block wherever the block has run: the gateway
+    takes every other shard's partial fold on the block's session there and
+    sends them to the home shard (`Coordinate`, rshard 0x13), which merges
+    them into its own fold on its session in the block, so the answer counts
+    the block's own writes on every shard. A top-N (`ORDER BY` with literal
+    `LIMIT`/`OFFSET`, or none) or a `SELECT DISTINCT` in a block that ran
+    beyond the home shard is merged on the gateway.
   Without `two_phase` a block stays on its first shard, and a fan-out inside
   it is refused.
 - **`synchronous_commit = off`** in cluster mode skips only the replica's local

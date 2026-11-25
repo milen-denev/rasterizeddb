@@ -201,9 +201,59 @@ pub fn split(sql: &str) -> Option<Rows<'_>> {
     (rows.len() > 1).then_some(Rows { head, rows, tail: &t[i..] })
 }
 
+/// `sql` with its parameters (`$n` outside quotes and comments) numbered
+/// `$1, $2, …` in order of first use, and the original number of each new
+/// one: `orig[k]` is what `$k+1` was. `None` for a parameter number past
+/// 65535 or text that is not whole.
+pub fn renumber(sql: &str) -> Option<(String, Vec<usize>)> {
+    let b = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut orig: Vec<usize> = Vec::new();
+    let (mut i, mut copied) = (0usize, 0usize);
+    while i < b.len() {
+        if let Some(end) = skip(b, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        if b[i] == b'$' && (i == 0 || !ident(b[i - 1])) && b.get(i + 1).is_some_and(u8::is_ascii_digit) {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            let n: usize = sql[i + 1..j].parse().ok().filter(|&n| (1..=65535).contains(&n))?;
+            let k = match orig.iter().position(|&o| o == n) {
+                Some(k) => k,
+                None => {
+                    orig.push(n);
+                    orig.len() - 1
+                }
+            };
+            out.push_str(&sql[copied..i]);
+            out.push('$');
+            out.push_str(&(k + 1).to_string());
+            copied = j;
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    out.push_str(&sql[copied..]);
+    Some((out, orig))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parameters_are_renumbered_in_order_of_use() {
+        let (t, o) = renumber("INSERT INTO t VALUES ($4, $5, '$1', $6) ON CONFLICT (a) DO UPDATE SET b = $4 -- $9").unwrap();
+        assert_eq!(t, "INSERT INTO t VALUES ($1, $2, '$1', $3) ON CONFLICT (a) DO UPDATE SET b = $1 -- $9");
+        assert_eq!(o, vec![4, 5, 6]);
+        let (t, o) = renumber("SELECT $$ $2 $$, a$1, $10").unwrap();
+        assert_eq!(t, "SELECT $$ $2 $$, a$1, $1");
+        assert_eq!(o, vec![10]);
+    }
 
     #[test]
     fn rows_are_cut_at_top_level_only() {
