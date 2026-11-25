@@ -1114,6 +1114,7 @@ impl Session {
                                     scale: 0,
                                 }),
                                 oid: f.type_oid,
+                                identity: false,
                             }
                         })
                         .collect();
@@ -1123,6 +1124,7 @@ impl Session {
                             name: name.clone(),
                             ty: ColType::Int(4),
                             oid: 23,
+                            identity: false,
                         });
                     }
                     if !capture {
@@ -1421,7 +1423,7 @@ impl Session {
             Some(p) => p.used.lock().iter().map(|&k| p.decls[k].3).collect(),
             None => Vec::new(),
         };
-        let capture = matches!(forward.kind, Kind::Insert { identity: Some(_) });
+        let capture = matches!(forward.kind, Kind::Insert { identity: Some(_), .. });
         let mut last = None;
         let mut affected = 0u64;
         for sql in forward.statements.iter().filter(|s| !s.is_empty()) {
@@ -1491,6 +1493,9 @@ impl Session {
                     let _ = self
                         .silent(&format!("RELEASE SAVEPOINT {STATEMENT_SAVEPOINT}"))
                         .await;
+                }
+                if let Kind::Insert { written: Some((table, column)), .. } = &forward.kind {
+                    self.advance_identity(table, column).await;
                 }
                 if let Some(id) = identity {
                     self.last_identity = Some(id);
@@ -3422,6 +3427,7 @@ impl Session {
                     }
                 }),
                 oid: f.type_oid,
+                identity: false,
             })
             .collect();
         tds::col_metadata(self.wire.reply(), &cols);
@@ -4103,7 +4109,48 @@ impl Session {
             return Err(error_from_engine(&e));
         }
         ended.map_err(|e| error_from_engine(&e))?;
+        // SqlBulkCopy with KeepIdentity (and bcp -E) write the identity
+        // column: its counter moves past them, as SQL Server's does.
+        let identity = translate::identity_column(&self.bridge().database, &table);
+        if let Some(column) = identity.filter(|c| columns.iter().any(|b| b.name.eq_ignore_ascii_case(c))) {
+            self.advance_identity(&table, &column).await;
+        }
         Ok(total)
+    }
+
+    /// Moves `table`'s identity counter past the largest value its
+    /// `column` holds, never back: SQL Server's identity after rows were
+    /// written with their own values. Left as it was the next generated id
+    /// was 1, and a copied table failed its inserts on duplicate keys as
+    /// soon as the counter reached the first copied row.
+    async fn advance_identity(&mut self, table: &str, column: &str) {
+        let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let Ok((_, rows)) = self
+            .fetch(&format!("SELECT pg_get_serial_sequence({}, {})", lit(table), lit(column)), &[])
+            .await
+        else {
+            return;
+        };
+        let Some(Some(sequence)) = rows.first().and_then(|r| r.first()).cloned() else { return };
+        let Ok((_, rows)) = self
+            .fetch(&format!("SELECT max({}) FROM {}", ident_sql(column), ident_sql(table)), &[])
+            .await
+        else {
+            return;
+        };
+        let Some(max) = rows.first().and_then(|r| r.first()).cloned().flatten().and_then(|m| m.parse::<i128>().ok()) else {
+            return;
+        };
+        let Ok((_, rows)) = self.fetch(&format!("SELECT nextval({})", lit(&sequence)), &[]).await else { return };
+        let Some(next) = rows.first().and_then(|r| r.first()).cloned().flatten().and_then(|m| m.parse::<i128>().ok()) else {
+            return;
+        };
+        // `nextval` took one value; set the counter to the larger of it and
+        // the column's maximum, so the next call answers past both.
+        let value = max.max(next);
+        if let Err(e) = self.silent(&format!("SELECT setval({}, {value})", lit(&sequence))).await {
+            log::warn!("SQL Server session: could not move the identity of {table}.{column} past {max}: {}", e.message);
+        }
     }
 
     /// sp_tablecollations_100: a row per column, the collation of its text
@@ -4162,6 +4209,7 @@ impl Session {
             table
         };
         let view = self.bridge.as_ref()?.database.schema_view(&table)?;
+        let identity = translate::identity_column(&self.bridge.as_ref()?.database, &table);
         let schema = view.schema();
         let fields: Vec<_> = schema
             .fields
@@ -4220,6 +4268,7 @@ impl Session {
                         name: f.name.clone(),
                         ty,
                         oid,
+                        identity: identity.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(&f.name)),
                     }
                 })
                 .collect(),

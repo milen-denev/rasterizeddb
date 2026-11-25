@@ -344,7 +344,7 @@ pub(crate) fn targets(database: &Database, sql: &str) -> Option<(Vec<(String, Fi
             for raw in rest.split(',') {
                 let mut raw = raw.trim();
                 for tail in [" CASCADE", " RESTRICT"] {
-                    if raw.len() > tail.len() && raw[raw.len() - tail.len()..].eq_ignore_ascii_case(tail) {
+                    if raw.len() > tail.len() && raw.as_bytes()[raw.len() - tail.len()..].eq_ignore_ascii_case(tail.as_bytes()) {
                         raw = raw[..raw.len() - tail.len()].trim_end();
                     }
                 }

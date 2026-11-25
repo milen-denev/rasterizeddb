@@ -140,6 +140,10 @@ pub(crate) enum Kind {
     /// captured (a RETURNING the client does not see).
     Insert {
         identity: Option<String>,
+        /// `(table, column)` when the statement writes the identity column
+        /// itself (`SET IDENTITY_INSERT … ON`, EF Core's seeding): the
+        /// counter then moves past the values written, as SQL Server's does.
+        written: Option<(String, String)>,
     },
     /// UPDATE / DELETE, and an INSERT whose OUTPUT returns rows (`Query`
     /// then).
@@ -2086,7 +2090,7 @@ fn table_name_at(tokens: &[Token], i: usize) -> Option<(String, usize)> {
     Some((name.to_lowercase(), j + 1))
 }
 
-fn identity_column(database: &Database, table: &str) -> Option<String> {
+pub(crate) fn identity_column(database: &Database, table: &str) -> Option<String> {
     let view = database.schema_view(table)?;
     view.schema()
         .defaults
@@ -2979,6 +2983,7 @@ fn rewrite_insert(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward,
         Token::word("INTO"),
         Token::raw(ident_sql(&table)),
     ];
+    let mut explicit_columns: Vec<String> = Vec::new();
     if kw(&tokens, j, "WITH") && tokens.get(j + 1).is_some_and(|t| t.is_op("(")) {
         j = matching_paren(&tokens, j + 1).ok_or_else(|| TsqlError::syntax("unbalanced hint"))? + 1;
     }
@@ -2991,6 +2996,7 @@ fn rewrite_insert(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward,
                 .filter_map(|p| p.last().and_then(|t| t.ident()).map(ident_sql))
                 .collect();
             out.push(Token::raw(format!("({})", names.join(", "))));
+            explicit_columns = names;
             j = close + 1;
         }
     }
@@ -3026,10 +3032,21 @@ fn rewrite_insert(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward,
                 out.push(Token::raw(format!("RETURNING {}", ident_sql(&col))));
                 Kind::Insert {
                     identity: Some(col),
+                    written: None,
                 }
             }
-            None => Kind::Insert { identity: None },
+            None => Kind::Insert { identity: None, written: None },
         },
+    };
+    let kind = match kind {
+        Kind::Insert { identity: Some(col), .. } => {
+            let written = explicit_columns
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(&ident_sql(&col)))
+                .then(|| (table.clone(), col.clone()));
+            Kind::Insert { identity: Some(col), written }
+        }
+        other => other,
     };
     Ok(Forward {
         statements: vec![render_text(&out)],
@@ -4211,7 +4228,7 @@ fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
     Ok(Forward {
         statements: vec![sql],
         kind: if returning.is_empty() && extra.is_none() {
-            Kind::Insert { identity: None }
+            Kind::Insert { identity: None, written: None }
         } else {
             Kind::Query
         },

@@ -268,7 +268,7 @@ fn replace_bare(sql: &str, merged: &[(String, String)]) -> String {
             let after_as = {
                 let before = sql[..start].trim_end();
                 before.len() >= 2
-                    && before[before.len() - 2..].eq_ignore_ascii_case("AS")
+                    && before.as_bytes()[before.len() - 2..].eq_ignore_ascii_case(b"AS")
                     && !before[..before.len() - 2]
                         .ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
             };

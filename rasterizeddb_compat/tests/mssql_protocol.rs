@@ -1157,6 +1157,22 @@ async fn tiberius_ef_core_shapes() {
     }
     let r = batch(&mut c, "SELECT COUNT(*) FROM [dbo].[DenevCloud.ERP.Colors]").await.unwrap();
     assert_eq!(int(&r[0]), vec![6], "the table is all there");
+    // Rows written with their own identity values (IDENTITY_INSERT, EF
+    // seeding, a copy's KeepIdentity) move the counter past them: the next
+    // generated id was 1, a duplicate key once it reached a copied row.
+    batch(&mut c, "CREATE TABLE [dbo].[DenevCloud.ERP.Seeded] ([Id] int IDENTITY(1,1) NOT NULL PRIMARY KEY, [Name] nvarchar(20))").await.unwrap();
+    batch(
+        &mut c,
+        "SET IDENTITY_INSERT [dbo].[DenevCloud.ERP.Seeded] ON; INSERT INTO [dbo].[DenevCloud.ERP.Seeded] ([Id], [Name]) VALUES (5, N'a'), (100, N'b'), (7, N'c'); SET IDENTITY_INSERT [dbo].[DenevCloud.ERP.Seeded] OFF",
+    )
+    .await
+    .unwrap();
+    let r = batch(&mut c, "INSERT INTO [dbo].[DenevCloud.ERP.Seeded] ([Name]) VALUES (N'd'); SELECT CAST(SCOPE_IDENTITY() AS int)").await.unwrap();
+    assert!(int(r.last().unwrap())[0] > 100, "{:?}", int(r.last().unwrap()));
+    // SqlBulkCopy reads the identity column from FMTONLY's metadata
+    // (fIdentity) to leave it out unless KeepIdentity.
+    let r = batch(&mut c, "SET FMTONLY ON; SELECT * FROM [dbo].[DenevCloud.ERP.Seeded]; SET FMTONLY OFF").await.unwrap();
+    assert_eq!(r.iter().map(|x| x.len()).sum::<usize>(), 0, "FMTONLY answers no rows");
     // EnsureDeleted's statement before DROP DATABASE.
     drop(other);
     drop(c);

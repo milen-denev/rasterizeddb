@@ -955,7 +955,7 @@ pub fn expand_multi_drop(sql: &str) -> Option<Vec<String>> {
     let mut suffix = "";
     for option in ["CASCADE", "RESTRICT"] {
         if rest.len() > option.len()
-            && rest[rest.len() - option.len()..].eq_ignore_ascii_case(option)
+            && rest.as_bytes()[rest.len() - option.len()..].eq_ignore_ascii_case(option.as_bytes())
             && rest[..rest.len() - option.len()].ends_with(char::is_whitespace)
         {
             suffix = option;
