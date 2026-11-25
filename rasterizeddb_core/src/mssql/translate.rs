@@ -4106,7 +4106,31 @@ fn tick_value(v: &str, _ty: &str) -> (String, String) {
 /// Rows of rendered values for `columns` of `table`, with each column
 /// keeping a 100 ns digit written as [`tick_value`] and its digit's column
 /// added at the end: the column list and rows to write.
-pub(crate) fn with_ticks(env: &dyn Env, table: &str, columns: &[String], rows: Vec<Vec<String>>) -> (Vec<String>, Vec<Vec<String>>) {
+/// A value's text as written, where it is one a statement can know:
+/// `Some(Some(text))` a literal or a bound parameter's, `Some(None)` a
+/// NULL, `None` an expression.
+pub(crate) type KnownText = Option<Option<String>>;
+
+/// The known text of a value written as `v` ([`KnownText`]).
+fn known_text(v: &[Token], env: &dyn Env) -> KnownText {
+    match v {
+        [t] => match &t.tok {
+            Tok::Str(b) => Some(Some(String::from_utf8_lossy(b).into_owned())),
+            Tok::Word(w) if w.eq_ignore_ascii_case("NULL") => Some(None),
+            Tok::UserVar(n) => env.param_text(n),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+pub(crate) fn with_ticks(
+    env: &dyn Env,
+    table: &str,
+    columns: &[String],
+    rows: Vec<Vec<String>>,
+    texts: &[Vec<KnownText>],
+) -> (Vec<String>, Vec<Vec<String>>) {
     let ticks = tick_columns(env, table);
     let at: Vec<(usize, &'static str, String)> = columns
         .iter()
@@ -4123,12 +4147,20 @@ pub(crate) fn with_ticks(env: &dyn Env, table: &str, columns: &[String], rows: V
     cols.extend(at.iter().map(|(_, _, d)| ident_sql(d)));
     let rows = rows
         .into_iter()
-        .map(|mut row| {
+        .enumerate()
+        .map(|(r, mut row)| {
             let mut digits = Vec::new();
             for (k, ty, _) in &at {
                 if let Some(v) = row.get_mut(*k) {
-                    let (value, digit) = tick_value(v, ty);
-                    *v = value;
+                    // A value whose text is known: its digit worked out
+                    // here, by the same reading (`tick_offset`), so the
+                    // statement stays one of plain values (an expression a
+                    // row made a bulk copy half as fast).
+                    let digit = match texts.get(r).and_then(|t| t.get(*k)) {
+                        Some(Some(Some(text))) => crate::core::rql::pg_functions::tick_offset(text).to_string(),
+                        Some(Some(None)) => "NULL".to_string(),
+                        _ => tick_value(v, ty).1,
+                    };
                     digits.push(digit);
                 }
             }
@@ -4209,17 +4241,21 @@ fn rewrite_insert(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward,
         // Rows written to a column keeping a 100 ns digit: each value split
         // into the column's and its digit's (`with_ticks`).
         let mut rows = Vec::new();
+        let mut texts = Vec::new();
         for row in split_commas(&tokens[j + 1..]) {
             if !(row.first().is_some_and(|t| t.is_op("(")) && row.last().is_some_and(|t| t.is_op(")"))) {
                 return Err(TsqlError::syntax("VALUES needs parenthesised rows"));
             }
             let mut vals = Vec::new();
+            let mut known = Vec::new();
             for v in split_commas(&row[1..row.len() - 1]) {
+                known.push(known_text(&v, cx.env));
                 vals.push(render_text(&rewrite_expr(v, cx)?));
             }
             rows.push(vals);
+            texts.push(known);
         }
-        let (cols, rows) = with_ticks(cx.env, &table, &explicit_columns, rows);
+        let (cols, rows) = with_ticks(cx.env, &table, &explicit_columns, rows, &texts);
         out[column_list_at.unwrap()] = Token::raw(format!("({})", cols.join(", ")));
         out.push(Token::word("VALUES"));
         let rendered: Vec<String> = rows.iter().map(|r| format!("({})", r.join(", "))).collect();
@@ -5761,21 +5797,25 @@ fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
         }
     }
     let mut value_rows = Vec::new();
+    let mut value_texts = Vec::new();
     let mut positions = Vec::new();
     for row in &rows {
         let mut vals = Vec::new();
+        let mut known = Vec::new();
         for &p in &picks {
             let v = row.get(p).cloned().ok_or_else(merge_refused)?;
+            known.push(known_text(&v, cx.env));
             vals.push(render_text(&rewrite_expr(v, cx)?));
         }
         value_rows.push(vals);
+        value_texts.push(known);
         if let Some((_, at)) = &extra {
             let v = row.get(*at).cloned().ok_or_else(merge_refused)?;
             positions.push(render_text(&rewrite_expr(v, cx)?));
         }
     }
     let target: Vec<String> = target_cols.iter().map(|c| ident_sql(c)).collect();
-    let (target, value_rows) = with_ticks(cx.env, &table, &target, value_rows);
+    let (target, value_rows) = with_ticks(cx.env, &table, &target, value_rows, &value_texts);
     let row_sql: Vec<String> = value_rows.iter().map(|r| format!("({})", r.join(", "))).collect();
     let sql = format!(
         "INSERT INTO {} ({}) VALUES {}{}",

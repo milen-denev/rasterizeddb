@@ -4367,7 +4367,19 @@ impl Session {
             // A column keeping a 100 ns digit: its values split into the
             // column's and the digit's (`translate::with_ticks`).
             let names: Vec<String> = columns.iter().map(|c| ident_sql(&c.name.to_lowercase())).collect();
-            let (names, values) = translate::with_ticks(&Scope { s: self, params: None }, &table, &names, values);
+            let texts: Vec<Vec<translate::KnownText>> = chunk
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|(v, _)| match v {
+                            ParamValue::Null => Some(None),
+                            ParamValue::Text(t) => Some(Some(t.clone())),
+                            ParamValue::Bytes(_) => None,
+                        })
+                        .collect()
+                })
+                .collect();
+            let (names, values) = translate::with_ticks(&Scope { s: self, params: None }, &table, &names, values, &texts);
             let values: Vec<String> = values.iter().map(|r| format!("({})", r.join(", "))).collect();
             let cols = names.join(", ");
             let sql = format!(
