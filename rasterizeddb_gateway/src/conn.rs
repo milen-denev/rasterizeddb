@@ -57,6 +57,7 @@ pub async fn handle(core: Rc<Core>, stream: TcpStream, shutdown: tokio::sync::wa
 }
 
 async fn startup(core: Rc<Core>, mut stream: TcpStream, shutdown: tokio::sync::watch::Receiver<bool>) -> io::Result<()> {
+    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     let mut reader = MsgReader::new(8 << 10, core.shared.cfg.max_message_bytes);
     loop {
         let (code, rest) = reader.startup(&mut stream).await?;
@@ -73,7 +74,7 @@ async fn startup(core: Rc<Core>, mut stream: TcpStream, shutdown: tokio::sync::w
                     let end_point = tls.end_point;
                     let tls_stream = tls.acceptor.accept(stream).await?;
                     let mut s = tls_stream;
-                    return after_tls(core, &mut s, Some(end_point), shutdown).await;
+                    return after_tls(core, &mut s, Some(end_point), shutdown, peer).await;
                 }
                 pg::write_all(&mut stream, b"N").await?;
             }
@@ -86,7 +87,7 @@ async fn startup(core: Rc<Core>, mut stream: TcpStream, shutdown: tokio::sync::w
                 }
                 return Ok(());
             }
-            pg::PROTOCOL_3 => return login(core, &mut stream, reader, rest, None, shutdown).await,
+            pg::PROTOCOL_3 => return login(core, &mut stream, reader, rest, None, shutdown, peer).await,
             other => {
                 let mut out = Vec::new();
                 pg::error(&mut out, "FATAL", "08P01", &format!("unsupported frontend protocol {}.{}", other >> 16, other & 0xFFFF));
@@ -103,12 +104,13 @@ async fn after_tls<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut S,
     cbind: Option<[u8; 32]>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    peer: String,
 ) -> io::Result<()> {
     let mut reader = MsgReader::new(8 << 10, core.shared.cfg.max_message_bytes);
     loop {
         let (code, rest) = reader.startup(s).await?;
         match code {
-            pg::PROTOCOL_3 => return login(core, s, reader, rest, cbind, shutdown).await,
+            pg::PROTOCOL_3 => return login(core, s, reader, rest, cbind, shutdown, peer.clone()).await,
             pg::GSSENC_REQUEST | pg::SSL_REQUEST => pg::write_all(s, b"N").await?,
             _ => return Err(pg::protocol("unexpected startup packet after TLS")),
         }
@@ -132,6 +134,7 @@ async fn login<S: AsyncRead + AsyncWrite + Unpin>(
     rest: Vec<u8>,
     cbind: Option<[u8; 32]>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    peer: String,
 ) -> io::Result<()> {
     let shared = core.shared.clone();
     let mut out = Vec::new();
@@ -207,7 +210,10 @@ async fn login<S: AsyncRead + AsyncWrite + Unpin>(
     let cancel = shared.cancels.register((pid, secret));
     let params: Vec<(String, String)> =
         all.into_iter().filter(|(k, _)| k != "user" && k != "database").collect();
+    let application = params.iter().find(|(k, _)| k == "application_name").map(|(_, v)| v.clone()).unwrap_or_default();
+    let client = crate::hooks::ClientInfo { session: pid, database: database.clone(), role: role.clone(), address: peer, application };
     let mut session = Session::new(core.clone(), Login { database, role, params, pinned, cancel });
+    session.client = client;
     let result = CatchUnwind(Box::pin(session.serve(s, &mut reader, shutdown))).await;
     shared.cancels.remove((pid, secret));
     match result {

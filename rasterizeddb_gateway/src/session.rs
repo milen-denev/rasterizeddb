@@ -151,6 +151,12 @@ pub struct Session {
     /// Set by `decide_extended` when the batch's statement fans out: how it
     /// merges, and whether it writes.
     pub(crate) pending_fanout: Option<(Merge, bool)>,
+    /// Who this session is, for an observer (`hooks::Observer`).
+    pub client: crate::hooks::ClientInfo,
+    /// Bytes written to the client so far, and the first error's SQLSTATE
+    /// in the statement being answered (taken only while observed).
+    out_total: u64,
+    stmt_error: Option<String>,
     pub(crate) out: Vec<u8>,
 }
 
@@ -284,6 +290,15 @@ impl Session {
             discard_until_sync: false,
             listener: None,
             pending_fanout: None,
+            client: crate::hooks::ClientInfo {
+                session: 0,
+                database: String::new(),
+                role: String::new(),
+                address: String::new(),
+                application: String::new(),
+            },
+            out_total: 0,
+            stmt_error: None,
             out: Vec::with_capacity(8 << 10),
         }
     }
@@ -291,6 +306,13 @@ impl Session {
     pub(crate) async fn flush<S: AsyncWrite + Unpin>(&mut self, conn: &mut S) -> io::Result<()> {
         if !self.out.is_empty() {
             self.core.counters.borrow_mut().bytes_out += self.out.len() as u64;
+            self.out_total += self.out.len() as u64;
+            if self.stmt_error.is_none()
+                && self.core.shared.hooks.observer.is_some()
+                && let Some((_, m)) = pg::messages(&self.out).find(|(t, _)| *t == b'E')
+            {
+                self.stmt_error = Some(pg::error_sqlstate(m).unwrap_or("XX000").to_string());
+            }
             pg::write_all(conn, &self.out).await?;
             self.out.clear();
             if self.out.capacity() > 256 << 10 {
@@ -318,6 +340,12 @@ impl Session {
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> io::Result<()> {
         let mut batch: Vec<u8> = self.core.buffer();
+        let observer = self.core.shared.hooks.observer.clone();
+        if let Some(o) = &observer {
+            o.session_opened(&self.client);
+        }
+        // When the batch being collected began, for its latency.
+        let mut batch_started: Option<std::time::Instant> = None;
         let result = loop {
             reader.trim();
             let idle = self.txn.status == b'I' && batch.is_empty();
@@ -365,11 +393,28 @@ impl Session {
             let flow = match t {
                 b'Q' => {
                     self.core.counters.borrow_mut().statements += 1;
-                    let r = self.query(conn, &msg).await;
-                    self.flush(conn).await?;
+                    let r = match &observer {
+                        None => {
+                            let r = self.query(conn, &msg).await;
+                            self.flush(conn).await?;
+                            r
+                        }
+                        Some(o) => {
+                            let start = (std::time::Instant::now(), self.out_total);
+                            self.stmt_error = None;
+                            let meter = std::rc::Rc::new(crate::meter::Meter::default());
+                            let r = crate::meter::scoped(meter.clone(), self.query(conn, &msg)).await;
+                            self.flush(conn).await?;
+                            o.statement(&self.client, &self.statement_stats(start, msg.len() as u64, &meter));
+                            r
+                        }
+                    };
                     r?
                 }
                 b'P' | b'B' | b'D' | b'E' | b'C' => {
+                    if batch.is_empty() {
+                        batch_started = Some(std::time::Instant::now());
+                    }
                     batch.extend_from_slice(&msg);
                     if batch.len() > self.core.shared.cfg.max_batch_bytes {
                         pg::error(&mut self.out, "FATAL", "54000", "pipelined batch without Sync exceeds max_batch_bytes");
@@ -382,10 +427,24 @@ impl Session {
                     batch.extend_from_slice(&msg);
                     self.core.counters.borrow_mut().statements += 1;
                     let b = std::mem::take(&mut batch);
-                    let r = self.extended(conn, &b, t == b'S').await;
+                    let r = match &observer {
+                        None => {
+                            let r = self.extended(conn, &b, t == b'S').await;
+                            self.flush(conn).await?;
+                            r
+                        }
+                        Some(o) => {
+                            let start = (batch_started.take().unwrap_or_else(std::time::Instant::now), self.out_total);
+                            self.stmt_error = None;
+                            let meter = std::rc::Rc::new(crate::meter::Meter::default());
+                            let r = crate::meter::scoped(meter.clone(), self.extended(conn, &b, t == b'S')).await;
+                            self.flush(conn).await?;
+                            o.statement(&self.client, &self.statement_stats(start, b.len() as u64, &meter));
+                            r
+                        }
+                    };
                     batch = b;
                     batch.clear();
-                    self.flush(conn).await?;
                     r?
                 }
                 b'd' | b'c' | b'f' => {
@@ -422,7 +481,26 @@ impl Session {
         };
         self.core.give_back(batch);
         self.close_all().await;
+        if let Some(o) = &observer {
+            o.session_closed(&self.client);
+        }
         result
+    }
+
+    /// One observed statement's measures: from `start` (when it began, and
+    /// the bytes written to the client by then), `bytes_in` read, `meter`.
+    fn statement_stats(&self, start: (std::time::Instant, u64), bytes_in: u64, meter: &crate::meter::Meter) -> crate::hooks::StatementStats {
+        crate::hooks::StatementStats {
+            latency_us: start.0.elapsed().as_micros() as u64,
+            sqlstate: self.stmt_error.clone(),
+            client_bytes_in: bytes_in,
+            client_bytes_out: self.out_total - start.1,
+            shard_calls: meter.calls.get(),
+            shard_bytes_out_plain: meter.out_plain.get(),
+            shard_bytes_out_wire: meter.out_wire.get(),
+            shard_bytes_in_plain: meter.in_plain.get(),
+            shard_bytes_in_wire: meter.in_wire.get(),
+        }
     }
 
     /// Closes every virtual session (best effort: a shard also closes a
@@ -443,6 +521,34 @@ impl Session {
             return Ok(Outcome::Done { error: true });
         };
         let text = text.to_string();
+        // A statement an observer answers itself (`SHOW CLIENT STATS`).
+        if let Some(o) = self.core.shared.hooks.observer.clone() {
+            let client = self.client.clone();
+            if let Some(answer) = o.answer(&client, &text) {
+                match answer.await {
+                    Ok((columns, rows)) => {
+                        let names: Vec<&str> = columns.iter().map(String::as_str).collect();
+                        pg::row_description(&mut self.out, &names);
+                        for row in &rows {
+                            let cells: Vec<Option<&str>> = row.iter().map(|c| c.as_deref()).collect();
+                            pg::data_row(&mut self.out, &cells);
+                        }
+                        pg::command_complete(&mut self.out, &format!("SHOW {}", rows.len()));
+                        let status = self.txn.status;
+                        pg::ready(&mut self.out, status);
+                        return Ok(Outcome::Done { error: false });
+                    }
+                    Err(e) => {
+                        let (code, msg) = match e.split_once(": ") {
+                            Some((c, m)) if c.len() == 5 => (c.to_string(), m.to_string()),
+                            _ => ("XX000".to_string(), e),
+                        };
+                        self.error_ready(&code, &msg);
+                        return Ok(Outcome::Done { error: true });
+                    }
+                }
+            }
+        }
         match local_of(&text) {
             Local::ShowGateway => {
                 let rows = crate::admin::show_gateway(&self.core.shared);

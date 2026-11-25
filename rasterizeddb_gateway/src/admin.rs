@@ -77,6 +77,10 @@ pub async fn serve(shared: Arc<Shared>, addr: std::net::SocketAddr) {
                     body.push_str(&format!("{k}\t{v}\n"));
                 }
             }
+            // An observer's own lines (per-client statistics).
+            if metrics && let Some(o) = &shared.hooks.observer {
+                body.push_str(&o.metrics());
+            }
             let resp = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/plain; version=0.0.4\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()

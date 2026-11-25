@@ -50,6 +50,59 @@ impl UserRouting for NoUserRouting {
     }
 }
 
+/// Who a session is, for an [`Observer`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientInfo {
+    /// The session's backend id (its cancel key's pid).
+    pub session: i32,
+    pub database: String,
+    pub role: String,
+    /// The client's address, `ip:port`.
+    pub address: String,
+    /// Its `application_name` startup parameter.
+    pub application: String,
+}
+
+/// One statement's measures, as the gateway took them: from its first
+/// message read to its last reply byte written.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StatementStats {
+    pub latency_us: u64,
+    /// The first error's SQLSTATE, if the statement failed.
+    pub sqlstate: Option<String>,
+    /// Bytes read from the client and written to it.
+    pub client_bytes_in: u64,
+    pub client_bytes_out: u64,
+    /// Calls to shards, and the bytes exchanged with them: as framed
+    /// (`plain`) and as sent on the wire (`wire`, after compression when
+    /// the link compresses).
+    pub shard_calls: u32,
+    pub shard_bytes_out_plain: u64,
+    pub shard_bytes_out_wire: u64,
+    pub shard_bytes_in_plain: u64,
+    pub shard_bytes_in_wire: u64,
+}
+
+/// A table an observer answers a statement with: column names and rows.
+pub type Answer = Result<(Vec<String>, Vec<Vec<Option<String>>>), String>;
+
+/// Sees every session and statement (per-client statistics, audit). Called
+/// on the gateway's cores, after the reply is written: keep it short.
+pub trait Observer: Send + Sync {
+    fn session_opened(&self, _client: &ClientInfo) {}
+    fn statement(&self, client: &ClientInfo, stats: &StatementStats);
+    fn session_closed(&self, _client: &ClientInfo) {}
+    /// A statement the observer answers itself (`SHOW CLIENT STATS`), asked
+    /// by `client`; `None` for every other.
+    fn answer<'a>(&'a self, _client: &'a ClientInfo, _sql: &'a str) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = Answer> + Send + 'a>>> {
+        None
+    }
+    /// Lines appended to the metrics endpoint (Prometheus text).
+    fn metrics(&self) -> String {
+        String::new()
+    }
+}
+
 /// Everything a hook crate can install.
 #[derive(Clone)]
 pub struct Hooks {
@@ -57,10 +110,12 @@ pub struct Hooks {
     /// False for [`NoUserRouting`]: a configuration asking for per-user
     /// shards from a build without an implementation is refused at start.
     pub has_user_routing: bool,
+    /// `None`: nothing is measured per statement beyond the counters.
+    pub observer: Option<Arc<dyn Observer>>,
 }
 
 impl Default for Hooks {
     fn default() -> Self {
-        Hooks { user_routing: Arc::new(NoUserRouting), has_user_routing: false }
+        Hooks { user_routing: Arc::new(NoUserRouting), has_user_routing: false, observer: None }
     }
 }

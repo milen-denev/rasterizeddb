@@ -134,7 +134,7 @@ impl Session {
         for (s, id) in sessions {
             let core = self.core.clone();
             let req = Request::ExecPart { session: id, map_epoch: epoch, merge: merge.clone(), bytes: msg.to_vec() }.encode();
-            handles.push((s, tokio::task::spawn_local(gather(core, s, id, req, cap))));
+            handles.push((s, tokio::task::spawn_local(crate::meter::carry(gather(core, s, id, req, cap)))));
         }
         let mut parts: Vec<(u32, PartReply)> = Vec::with_capacity(handles.len());
         let mut failure: Option<(String, String)> = None;
@@ -340,7 +340,7 @@ impl Session {
         let mut handles = Vec::with_capacity(sessions.len());
         for (s, id) in sessions {
             let req = Request::ExecPart { session: id, map_epoch: epoch, merge: Merge::Concat, bytes: msg.to_vec() }.encode();
-            handles.push((s, tokio::task::spawn_local(gather(self.core.clone(), s, id, req, cap))));
+            handles.push((s, tokio::task::spawn_local(crate::meter::carry(gather(self.core.clone(), s, id, req, cap)))));
         }
         let mut parts = Vec::with_capacity(handles.len());
         for (s, h) in handles {
@@ -455,7 +455,7 @@ impl Session {
         let mut handles = Vec::with_capacity(sessions.len());
         for (s, id) in sessions {
             let req = Request::ExecPart { session: id, map_epoch: epoch, merge: merge.clone(), bytes: msg.to_vec() }.encode();
-            handles.push((s, tokio::task::spawn_local(gather(self.core.clone(), s, id, req, cap))));
+            handles.push((s, tokio::task::spawn_local(crate::meter::carry(gather(self.core.clone(), s, id, req, cap)))));
         }
         let mut parts = Vec::with_capacity(handles.len());
         let mut failure = None;
@@ -599,7 +599,7 @@ impl Session {
             };
             let mut req = Vec::new();
             Request::encode_pg(&mut req, id, epoch, &query_message(&rows.statement(idx)));
-            handles.push((*s, tokio::task::spawn_local(collect_pg(self.core.clone(), *s, id, req))));
+            handles.push((*s, tokio::task::spawn_local(crate::meter::carry(collect_pg(self.core.clone(), *s, id, req)))));
         }
         let mut replies = Vec::with_capacity(handles.len());
         let mut failure = None;
@@ -959,7 +959,7 @@ impl Session {
             }
             let mut req = Vec::new();
             Request::encode_pg(&mut req, id, map.epoch(), &b);
-            handles.push((*s, tokio::task::spawn_local(collect_pg(self.core.clone(), *s, id, req))));
+            handles.push((*s, tokio::task::spawn_local(crate::meter::carry(collect_pg(self.core.clone(), *s, id, req)))));
         }
         let mut replies = Vec::with_capacity(handles.len());
         let mut failure = None;

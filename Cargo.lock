@@ -4862,7 +4862,10 @@ version = "1.0.0"
 dependencies = [
  "env_logger",
  "log",
+ "rasterizeddb_client",
+ "rasterizeddb_embedded",
  "rasterizeddb_gateway",
+ "tokio",
 ]
 
 [[package]]

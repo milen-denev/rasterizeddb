@@ -3,6 +3,9 @@
 //! mapped to one shard and its whole session is locked there; the GPL
 //! gateway enforces the lock (`rasterizeddb_gateway::hooks`).
 
+#[cfg(feature = "client_stats")]
+pub mod stats;
+
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 

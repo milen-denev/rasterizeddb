@@ -87,7 +87,9 @@ impl Link {
         };
         core.counters.borrow_mut().hop(started.elapsed().as_micros() as u64);
         self.circuit.set(Circuit::Up);
-        let mut resp = Response::decode(&self.unpack_counted(core, &bytes).map_err(CallError::Bad)?).map_err(CallError::Bad)?;
+        let plain_reply = self.unpack_counted(core, &bytes).map_err(CallError::Bad)?;
+        crate::meter::record(req.len(), packed.as_ref().map_or(req.len(), Vec::len), plain_reply.len(), bytes.len());
+        let mut resp = Response::decode(&plain_reply).map_err(CallError::Bad)?;
         // The mux reconnected under this request, and the new connection
         // has had no Hello: the shard refused it before effect. Hello and
         // send once more.

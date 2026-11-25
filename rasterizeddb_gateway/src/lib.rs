@@ -25,6 +25,7 @@ pub mod core;
 pub mod counters;
 pub mod fanout;
 pub mod hooks;
+pub mod meter;
 mod kv;
 #[cfg(feature = "native")]
 pub mod native;

@@ -18,8 +18,18 @@ path = "src/main.rs"
 rasterizeddb_gateway = { path = "../rasterizeddb_gateway", version = "1.0.0" }
 env_logger = "0.11"
 log = "0.4"
+tokio = { version = "1.54", features = ["rt", "sync", "time", "macros"] }
+# The statistics' history, kept in an embedded engine (client_stats_embedded).
+rasterizeddb_embedded = { path = "../rasterizeddb_embedded", optional = true }
+rasterizeddb_client = { path = "../rasterizeddb_client", optional = true, default-features = false }
 
 [features]
-default = ["user_routing"]
+default = ["user_routing", "client_stats", "client_stats_embedded"]
 # Per-user shards (G11): a login locked to its shard.
 user_routing = []
+# Per-client statistics: latency, errors, client traffic and shard traffic
+# before and after compression (SHOW CLIENT STATS, the metrics endpoint).
+client_stats = []
+# Their history, in intervals, kept in an embedded RasterizedDB
+# (--client-stats-dir; SHOW CLIENT STATS HISTORY).
+client_stats_embedded = ["client_stats", "dep:rasterizeddb_embedded", "dep:rasterizeddb_client"]
