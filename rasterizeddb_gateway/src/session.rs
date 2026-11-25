@@ -58,6 +58,9 @@ pub(crate) struct Txn {
 /// A virtual session on one shard.
 pub(crate) struct VSession {
     pub id: u64,
+    /// The link's connection the session was opened on
+    /// ([`crate::core::Link::connection`]).
+    pub connection: u64,
     /// Statement name → the generation parsed there.
     pub parsed: HashMap<String, u64>,
 }
@@ -336,6 +339,12 @@ impl Session {
     }
 
     pub(crate) fn error_ready(&mut self, sqlstate: &str, message: &str) {
+        // A shard forgot one of this session's virtual sessions: outside a
+        // transaction every one is reopened on next use, so the error is not
+        // repeated on each statement that reaches that shard.
+        if sqlstate.as_bytes() == rshard::SESSION_GONE && self.txn.status == b'I' {
+            self.vs.clear();
+        }
         pg::error(&mut self.out, "ERROR", sqlstate, message);
         let status = if self.txn.status == b'I' { b'I' } else { b'E' };
         if self.txn.status != b'I' {
@@ -561,6 +570,10 @@ impl Session {
                     }
                 }
             }
+        }
+        // A SHOW about tables and storage, answered for every shard.
+        if let Some(outcome) = self.cluster_show(conn, &text).await? {
+            return Ok(outcome);
         }
         match local_of(&text) {
             Local::ShowGateway => {
@@ -1009,10 +1022,17 @@ impl Session {
     /// The virtual session on `shard`, opened (and the session SETs
     /// replayed) on first use.
     pub(crate) async fn ensure_vs(&mut self, shard: u32) -> Result<u64, (String, String)> {
-        if let Some(v) = self.vs.get(&shard) {
-            return Ok(v.id);
-        }
         let link = self.core.link(shard).map_err(|e| ("08006".to_string(), e))?;
+        if let Some(v) = self.vs.get(&shard) {
+            // Opened on a connection the link has since replaced: the shard
+            // dropped it with that connection. Outside a transaction a new
+            // one stands in; inside one the transaction's work is gone, and
+            // the shard's "session is gone" says so.
+            if v.connection == link.connection.get() || self.txn.status != b'I' {
+                return Ok(v.id);
+            }
+            self.vs.remove(&shard);
+        }
         let id = self.core.session_id();
         let req = Request::OpenSession {
             session: id,
@@ -1025,7 +1045,7 @@ impl Session {
         .encode();
         match link.call(&self.core, &req).await {
             Ok(Response::SessionOpened { backend_key, .. }) => {
-                self.vs.insert(shard, VSession { id, parsed: HashMap::new() });
+                self.vs.insert(shard, VSession { id, connection: link.connection.get(), parsed: HashMap::new() });
                 if let Ok(mut t) = self.login.cancel.lock() {
                     t.push((shard, backend_key));
                 }

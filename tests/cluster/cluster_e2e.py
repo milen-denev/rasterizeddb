@@ -619,6 +619,17 @@ def main():
     code, out = psql(GW, "SELECT max(r) FROM (SELECT row_number() OVER (ORDER BY id) AS r FROM orders) w")
     check("a window over a sharded table", (code, out) == (0, str(rows)), out)
 
+    # 3b. The node's SHOWs about tables and storage, for the whole cluster.
+    code, out = psql(GW, "SHOW TABLES")
+    slots = [int(l.split("|")[2]) for l in out.splitlines() if l.split("|")[0] == "orders"] if code == 0 else []
+    check("SHOW TABLES counts a partitioned table's rows on every shard", slots and slots[0] >= rows, out)
+    code, out = psql(GW, "SHOW STORAGE LOCATIONS")
+    shards_seen = sorted({l.split("|")[-1] for l in out.splitlines()}) if code == 0 else []
+    want_shards = sorted(psql(GW, "SELECT 1")[0] == 0 and [l.split("|")[0] for l in psql(GW, "SHOW SHARDS")[1].splitlines()] or [])
+    check("SHOW STORAGE LOCATIONS lists every shard's", shards_seen == want_shards, f"{out} want {want_shards}")
+    code, out = psql(GW, "SHOW STORAGE STATS")
+    check("SHOW STORAGE STATS answers for the cluster", code == 0 and f"shards|{len(want_shards)}" in out, out)
+
     # 4. Two-phase commit across shards: both or neither.
     # Keys 1001 and 1002 land on different shards in this map; the
     # check below holds whether they do or not.

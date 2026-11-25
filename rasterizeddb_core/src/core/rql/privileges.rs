@@ -669,6 +669,12 @@ pub fn mask_role_catalog(sql: &str) -> Option<String> {
     if !crate::core::sql_scan::contains_ignore_ascii_case(sql, role.as_bytes()) {
         return None;
     }
+    // `SHOW COLUMNS FROM rdb_roles` and its kin read the catalogue's shape,
+    // not its rows: a derived table there is not a relation the statement
+    // can name ("SHOW COLUMNS FROM __cte_rdb_roles_… rdb_roles").
+    if sql.trim_start().get(..5).is_some_and(|w| w.eq_ignore_ascii_case("SHOW ")) {
+        return None;
+    }
     let reads: Vec<_> = crate::core::rql::lock_set::relation_references(sql)
         .into_iter()
         .filter(|r| r.mode == TableMode::AccessShare)
@@ -1160,6 +1166,15 @@ pub fn may_grant(rows: &[AclRow], role: &str, relation: &str, privilege: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_role_mask_leaves_show_columns_alone() {
+        // The studio's Roles page asked this and the shard was sent
+        // `SHOW COLUMNS FROM __cte_rdb_roles_… rdb_roles`.
+        assert_eq!(mask_role_catalog("SHOW COLUMNS FROM rdb_roles"), None);
+        assert_eq!(mask_role_catalog("  show columns from \"rdb_roles\""), None);
+        assert!(mask_role_catalog("SELECT * FROM rdb_roles").is_some());
+    }
 
     #[test]
     fn privilege_statements_are_read() {

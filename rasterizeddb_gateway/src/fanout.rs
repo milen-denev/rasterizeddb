@@ -318,35 +318,11 @@ impl Session {
                 }
             }
             renames.push((table.clone(), temp.clone()));
-            // The rows, a few hundred to a statement.
-            let mut batch: Vec<String> = Vec::new();
+            // The rows, in one COPY: the parts' cells are text already.
             let all_rows: Vec<&Vec<u8>> = parts.iter().flat_map(|(_, p)| p.rows.iter().map(|(_, r)| r)).collect();
-            for (i, row) in all_rows.iter().enumerate() {
-                let cells = row_cells(row);
-                let vals: Vec<String> = cells
-                    .iter()
-                    .zip(&columns)
-                    .map(|(c, (_, oid))| match c {
-                        None => "NULL".to_string(),
-                        Some(v) => format!("'{}'::{}", String::from_utf8_lossy(v).replace('\'', "''"), type_name(*oid)),
-                    })
-                    .collect();
-                batch.push(format!("({})", vals.join(", ")));
-                if batch.len() == 256 || i + 1 == all_rows.len() {
-                    let insert = format!("INSERT INTO {} VALUES {}", quote_ident(&temp), batch.join(", "));
-                    batch.clear();
-                    match self.quiet_query(home, &insert).await {
-                        Ok((_, None)) => {}
-                        Ok((_, Some((code, m)))) => {
-                            self.drop_temps(home, &renames).await;
-                            return Ok(fail(self, code.as_str(), format!("gathering {table}: {m}")));
-                        }
-                        Err(e) => {
-                            self.drop_temps(home, &renames).await;
-                            return Ok(fail(self, "08006", format!("gathering {table}: {e}")));
-                        }
-                    }
-                }
+            if let Err((code, m)) = self.copy_rows_into(home, &temp, &all_rows).await {
+                self.drop_temps(home, &renames).await;
+                return Ok(fail(self, code.as_str(), format!("gathering {table}: {m}")));
             }
         }
         let rewritten = rename_tables(text, &renames);
@@ -403,6 +379,72 @@ impl Session {
             self.statements.insert(name.to_string(), crate::session::Stmt { text: text.to_string(), parse: p.clone(), generation });
         }
         Ok(Some(outcome))
+    }
+
+    /// Loads `rows` (DataRows in text format) into `table` on shard
+    /// `shard`'s session with one COPY, in CopyData of about 1 MiB.
+    async fn copy_rows_into(&mut self, shard: u32, table: &str, rows: &[&Vec<u8>]) -> Result<(), (String, String)> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let id = self.ensure_vs(shard).await.map_err(|(c, m)| (c, format!("shard {shard}: {m}")))?;
+        let epoch = self.core.map().epoch();
+        let send = |me: &Self, msgs: Vec<u8>| {
+            let mut req = Vec::new();
+            Request::encode_pg(&mut req, id, epoch, &msgs);
+            collect_pg(me.core.clone(), shard, id, req)
+        };
+        let first_error = |bytes: &[u8]| {
+            pg::messages(bytes)
+                .find(|(t, _)| *t == b'E')
+                .map(|(_, m)| (pg::error_sqlstate(m).unwrap_or("XX000").to_string(), pg::error_message(m).unwrap_or_default()))
+        };
+        let started = send(self, query_message(&format!("COPY {} FROM STDIN", quote_ident(table)))).await?;
+        if let Some(e) = first_error(&started) {
+            return Err(e);
+        }
+        let mut buf: Vec<u8> = Vec::with_capacity(1 << 20);
+        let flush = |me: &Self, buf: &mut Vec<u8>| {
+            let mut d = Vec::with_capacity(buf.len() + 5);
+            pg::put(&mut d, b'd', buf);
+            buf.clear();
+            send(me, d)
+        };
+        for row in rows {
+            for (i, cell) in row_cells(row).iter().enumerate() {
+                if i > 0 {
+                    buf.push(b'\t');
+                }
+                match cell {
+                    None => buf.extend_from_slice(b"\\N"),
+                    Some(v) => {
+                        for &b in v.iter() {
+                            match b {
+                                b'\\' => buf.extend_from_slice(b"\\\\"),
+                                b'\t' => buf.extend_from_slice(b"\\t"),
+                                b'\n' => buf.extend_from_slice(b"\\n"),
+                                b'\r' => buf.extend_from_slice(b"\\r"),
+                                other => buf.push(other),
+                            }
+                        }
+                    }
+                }
+            }
+            buf.push(b'\n');
+            if buf.len() >= 1 << 20 {
+                flush(self, &mut buf).await?;
+            }
+        }
+        if !buf.is_empty() {
+            flush(self, &mut buf).await?;
+        }
+        let mut done = Vec::new();
+        pg::put(&mut done, b'c', &[]);
+        let ended = send(self, done).await?;
+        match first_error(&ended) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     async fn drop_temps(&mut self, home: u32, renames: &[(String, String)]) {
@@ -1424,6 +1466,184 @@ impl Session {
         }
         self.error_ready(code, msg);
         Outcome::Done { error: true }
+    }
+
+    /// A `SHOW` about this node's tables and storage, asked of every shard
+    /// and answered for the cluster (the studio's pages read them): `None`
+    /// for any other statement, inside a transaction, for a session pinned
+    /// to its shard, or with one shard.
+    ///
+    /// - `SHOW TABLES`: a partitioned table's sizes and row counts summed
+    ///   over the shards; a plain one (on the home shard, or a reference
+    ///   table every shard copies) as the home shard has it.
+    /// - `SHOW STORAGE LOCATIONS` / `PLACEMENTS`: every shard's rows, with a
+    ///   `shard` column.
+    /// - `SHOW STORAGE STATS`: counts summed, settings shown once (or each
+    ///   shard's when they differ), free space counted once per value (shards
+    ///   on one filesystem report the same).
+    pub(crate) async fn cluster_show<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, text: &str) -> io::Result<Option<Outcome>> {
+        let _ = conn;
+        let up = text.trim().trim_end_matches(';').trim().to_ascii_uppercase();
+        let up = up.split_whitespace().collect::<Vec<_>>().join(" ");
+        let kind = match up.as_str() {
+            "SHOW TABLES" => 0,
+            "SHOW STORAGE LOCATIONS" | "SHOW STORAGE PLACEMENTS" | "SHOW SHARD LOAD" => 1,
+            "SHOW STORAGE STATS" => 2,
+            _ => return Ok(None),
+        };
+        let map = self.core.map();
+        if self.txn.status != b'I' || self.login.pinned.is_some() || map.shards().len() < 2 {
+            return Ok(None);
+        }
+        let home = self.core.shared.home(&map);
+        let shards: Vec<u32> = map.shards().iter().map(|s| s.id).collect();
+        // Every shard asked at once.
+        let epoch = map.epoch();
+        let mut handles = Vec::with_capacity(shards.len());
+        for &s in &shards {
+            let id = match self.ensure_vs(s).await {
+                Ok(id) => id,
+                Err((c, m)) => {
+                    self.error_ready(&c, &format!("shard {s}: {m}"));
+                    return Ok(Some(Outcome::Done { error: true }));
+                }
+            };
+            let mut req = Vec::new();
+            Request::encode_pg(&mut req, id, epoch, &query_message(text));
+            handles.push((s, tokio::task::spawn_local(crate::meter::carry(collect_pg(self.core.clone(), s, id, req)))));
+        }
+        // Each shard's answer: its column names and rows.
+        let mut answers: Vec<(u32, Vec<String>, Vec<Vec<Option<String>>>)> = Vec::new();
+        for (s, h) in handles {
+            let bytes = match h.await {
+                Ok(Ok(b)) => b,
+                Ok(Err((c, m))) => {
+                    self.error_ready(&c, &m);
+                    return Ok(Some(Outcome::Done { error: true }));
+                }
+                Err(_) => {
+                    self.error_ready("XX000", &format!("the call to shard {s} panicked"));
+                    return Ok(Some(Outcome::Done { error: true }));
+                }
+            };
+            if let Some((_, m)) = pg::messages(&bytes).find(|(t, _)| *t == b'E') {
+                let code = pg::error_sqlstate(m).unwrap_or("XX000").to_string();
+                self.error_ready(&code, &format!("shard {s}: {}", pg::error_message(m).unwrap_or_default()));
+                return Ok(Some(Outcome::Done { error: true }));
+            }
+            let columns: Vec<String> = row_columns(&bytes).unwrap_or_default().into_iter().map(|(n, _)| n).collect();
+            let rows = pg::messages(&bytes)
+                .filter(|(t, _)| *t == b'D')
+                .map(|(_, m)| row_cells(&m.to_vec()).into_iter().map(|c| c.map(|v| String::from_utf8_lossy(&v).into_owned())).collect())
+                .collect();
+            answers.push((s, columns, rows));
+        }
+        let Some((_, columns, _)) = answers.iter().find(|(s, _, _)| *s == home).or(answers.first()).cloned() else {
+            return Ok(None);
+        };
+        let (columns, rows): (Vec<String>, Vec<Vec<Option<String>>>) = match kind {
+            0 => {
+                let col = |name: &str| columns.iter().position(|c| c == name);
+                let summed = ["row_slots", "data_bytes", "pointer_bytes", "index_bytes", "total_bytes", "reclaimable_bytes"];
+                let home_rows = &answers.iter().find(|(s, _, _)| *s == home).expect("home answered").2;
+                let mut out = Vec::new();
+                for row in home_rows {
+                    let name = row.first().cloned().flatten().unwrap_or_default();
+                    let probe = format!("SELECT count(*) FROM {}", quote_ident(&name));
+                    let partitioned = matches!(
+                        crate::route::template(&self.core, &self.login.database, rasterizeddb_router::rshard::Source::Shape, &probe, home).await,
+                        Ok(rasterizeddb_router::rshard::RouteTemplate::FanOut { .. })
+                    );
+                    let mut merged = row.clone();
+                    if partitioned {
+                        for c in summed.iter().filter_map(|n| col(n)) {
+                            let total: i128 = answers
+                                .iter()
+                                .filter_map(|(_, cols, rows)| {
+                                    let i = cols.iter().position(|x| *x == columns[c])?;
+                                    let r = rows.iter().find(|r| r.first().cloned().flatten().as_deref() == Some(name.as_str()))?;
+                                    r.get(i)?.as_deref()?.parse::<i128>().ok()
+                                })
+                                .sum();
+                            merged[c] = Some(total.to_string());
+                        }
+                    }
+                    out.push(merged);
+                }
+                (columns, out)
+            }
+            1 => {
+                let mut cols = columns.clone();
+                cols.push("shard".to_string());
+                let mut out = Vec::new();
+                for (s, _, rows) in &answers {
+                    for r in rows {
+                        let mut r = r.clone();
+                        r.push(Some(s.to_string()));
+                        out.push(r);
+                    }
+                }
+                (cols, out)
+            }
+            _ => {
+                // metric, value, detail
+                let counts = ["locations", "primaries", "backups", "disabled", "locations_below_floor"];
+                let home_rows = &answers.iter().find(|(s, _, _)| *s == home).expect("home answered").2;
+                let mut out = Vec::new();
+                for row in home_rows {
+                    let metric = row.first().cloned().flatten().unwrap_or_default();
+                    let values: Vec<(u32, String)> = answers
+                        .iter()
+                        .filter_map(|(s, _, rows)| {
+                            let r = rows.iter().find(|r| r.first().cloned().flatten().as_deref() == Some(metric.as_str()))?;
+                            Some((*s, r.get(1)?.clone().unwrap_or_default()))
+                        })
+                        .collect();
+                    let value = if counts.contains(&metric.as_str()) {
+                        values.iter().filter_map(|(_, v)| v.parse::<i128>().ok()).sum::<i128>().to_string()
+                    } else if metric == "free_bytes" {
+                        let mut seen: Vec<i128> = Vec::new();
+                        for v in values.iter().filter_map(|(_, v)| v.parse::<i128>().ok()) {
+                            // Within 1%: the same filesystem, read moments apart.
+                            if !seen.iter().any(|x| (x - v).abs() * 100 <= (*x).max(1)) {
+                                seen.push(v);
+                            }
+                        }
+                        seen.iter().sum::<i128>().to_string()
+                    } else if metric == "tables" {
+                        values.iter().filter_map(|(_, v)| v.parse::<i128>().ok()).max().unwrap_or(0).to_string()
+                    } else if values.iter().all(|(_, v)| *v == values[0].1) {
+                        values.first().map(|(_, v)| v.clone()).unwrap_or_default()
+                    } else {
+                        values.iter().map(|(s, v)| format!("shard {s}: {v}")).collect::<Vec<_>>().join(", ")
+                    };
+                    let mut r = row.clone();
+                    if r.len() > 1 {
+                        r[1] = Some(value);
+                    }
+                    out.push(r);
+                }
+                let mut cols = columns.clone();
+                if !cols.is_empty() {
+                    out.push({
+                        let mut r = vec![Some("shards".to_string()), Some(answers.len().to_string())];
+                        r.resize(cols.len(), Some("shards answering for this cluster".to_string()));
+                        r
+                    });
+                }
+                cols.truncate(cols.len());
+                (cols, out)
+            }
+        };
+        let names: Vec<&str> = columns.iter().map(String::as_str).collect();
+        pg::row_description(&mut self.out, &names);
+        for r in &rows {
+            let cells: Vec<Option<&str>> = r.iter().map(|c| c.as_deref()).collect();
+            pg::data_row(&mut self.out, &cells);
+        }
+        pg::command_complete(&mut self.out, &format!("SHOW {}", rows.len()));
+        pg::ready(&mut self.out, b'I');
+        Ok(Some(Outcome::Done { error: false }))
     }
 
     fn partial(&mut self, code: &str, message: &str, applied: &[u32]) -> Outcome {

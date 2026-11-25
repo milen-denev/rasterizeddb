@@ -51,6 +51,9 @@ pub struct Link {
     compress: Cell<Option<i32>>,
     /// The shard's id as it said in Hello, checked against the map.
     pub schema_epoch: Cell<u64>,
+    /// Raised at each Hello: a new connection, on which the shard holds
+    /// none of the sessions opened on an earlier one.
+    pub connection: Cell<u64>,
 }
 
 impl Link {
@@ -155,6 +158,7 @@ impl Link {
     }
 
     async fn hello(&self, core: &Core) -> Result<(), CallError> {
+        self.connection.set(self.connection.get() + 1);
         let map = core.map();
         let req = Request::Hello {
             cluster_id: map.cluster_id(),
@@ -354,6 +358,7 @@ impl Core {
             hello: Cell::new(false),
             compress: Cell::new(None),
             schema_epoch: Cell::new(0),
+            connection: Cell::new(0),
         });
         self.links.borrow_mut().insert(shard, link.clone());
         Ok(link)

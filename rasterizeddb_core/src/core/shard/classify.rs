@@ -240,6 +240,17 @@ fn writes_reference(database: &Database, table: &str) -> bool {
     matches!(database.relation(table), Some(Relation::Plain(_))) && super::reference::is_reference(&database.name, table)
 }
 
+/// How many partitioned relations the statement names (each once).
+fn partitioned_named(database: &Database, t: &str) -> usize {
+    let mut seen: Vec<String> = Vec::new();
+    for w in words(t) {
+        if matches!(database.relation(&w), Some(Relation::Partitioned(_))) && !seen.contains(&w) {
+            seen.push(w);
+        }
+    }
+    seen.len()
+}
+
 /// Whether any identifier outside quotes names a partitioned relation.
 fn mentions_partitioned(database: &Database, t: &str) -> bool {
     words(t).into_iter().any(|w| matches!(database.relation(&w), Some(Relation::Partitioned(_))))
@@ -379,7 +390,15 @@ fn select(database: &Database, source: Source, t: &str) -> RouteTemplate {
         return complex(database, t);
     }
     let Some(table) = between(t, &c, "FROM").and_then(single_table) else {
-        return complex(database, t);
+        let routed = complex(database, t);
+        // One sharded table joined only with reference tables (copies on
+        // every shard): each of its rows joins on its own shard, so the
+        // shards' results together are the join's, and it fans out as a
+        // read of that table would, not gathered onto one shard.
+        if routed == RouteTemplate::NeedsKey && partitioned_named(database, t) == 1 && !mentions_global(database, t) {
+            return fan_out_read(t, &c);
+        }
+        return routed;
     };
     let Some(Relation::Partitioned(pt)) = database.relation(&table) else {
         return if mentions_partitioned(database, t) { RouteTemplate::NeedsKey } else { RouteTemplate::Home };
