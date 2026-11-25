@@ -10,6 +10,8 @@
 
 ### Statements that failed, now answered
 
+- `x [NOT] LIKE|ILIKE ANY|SOME|ALL (array)` failed ("unexpected LPar", "function 'ANY' is not supported yet"), with the array bound as a parameter (a driver's `text[]`), written as `'{…}'` or `ARRAY[…]`. It now matches each pattern (`ANY` any of them, `ALL` every one), with empty and `NULL` arrays answered as in PostgreSQL. Patterns read from a column or a subquery are still unsupported.
+- `ORDER BY "t"."c"` (a quoted, table-qualified column, as SeaORM writes it) over a join, on a column not in the select list, failed: the quotes were trimmed from the whole term.
 - At READ COMMITTED, three or more transactions updating one row failed with 40001 ("could not serialize access due to concurrent update") when the first held the row for more than 1.5 s: a waiter that lost the race after the holder committed gave up instead of waiting its turn. Every writer now waits and applies, as in PostgreSQL; REPEATABLE READ still refuses.
 - A correlated subquery over an outer query that keeps no row failed with "Column '__lat_k1' not found" instead of returning no rows.
 - `x LIKE p ESCAPE e` over an expression (`CAST(c AS text)`, `upper(c)`) was a syntax error.

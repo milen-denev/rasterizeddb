@@ -379,3 +379,47 @@ async fn a_json_path_written_as_an_array_is_read() {
         .collect();
     assert_eq!(got, vec![3]);
 }
+
+/// pms's chat router and global search: `title ILIKE ANY($1)` with the
+/// patterns bound as a `text[]`, which failed on every chat message
+/// ("unexpected LPar", "function 'ANY' is not supported yet"); and SeaORM's
+/// `ORDER BY "case"."updated_at"` over a join on a column not selected,
+/// whose quotes were trimmed into `case"."updated_at`.
+#[tokio::test]
+async fn like_any_over_a_bound_array_and_a_quoted_order_by_over_a_join() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE case_model (id int PRIMARY KEY, domain_id int)").await;
+    run(&pool, r#"CREATE TABLE "case" (id int PRIMARY KEY, title text, case_model_id int, updated_at int)"#).await;
+    run(&pool, "INSERT INTO case_model VALUES (1, 7), (2, 8)").await;
+    run(&pool, r#"INSERT INTO "case" VALUES (1, 'Please help', 1, 10), (2, 'test case', 1, 30), (3, 'other', 1, 20), (4, 'Please too', 2, 40)"#).await;
+
+    let patterns = vec!["%please%".to_string(), "%test%".to_string()];
+    let titles: Vec<String> = sqlx::query_scalar(
+        r#"SELECT "case"."title" FROM "case" INNER JOIN "case_model" ON "case"."case_model_id" = "case_model"."id" WHERE "case_model"."domain_id" = $1 AND ("case"."title" ILIKE ANY($2)) ORDER BY "case"."updated_at" DESC LIMIT 16"#,
+    )
+    .bind(7)
+    .bind(&patterns)
+    .fetch_all(&pool)
+    .await
+    .expect("ILIKE ANY over a bound text[]");
+    assert_eq!(titles, vec!["test case".to_string(), "Please help".to_string()]);
+
+    // `NOT … ALL`, `LIKE ANY (ARRAY[…])`, and the empty and NULL arrays.
+    assert_eq!(ids(&pool, r#"SELECT id FROM "case" WHERE title NOT ILIKE ALL(ARRAY['%please%','%test%']) ORDER BY id"#).await, vec![3]);
+    assert_eq!(ids(&pool, r#"SELECT id FROM "case" WHERE title LIKE ANY(ARRAY['%test%','oth%']) ORDER BY id"#).await, vec![2, 3]);
+    assert_eq!(ids(&pool, r#"SELECT id FROM "case" WHERE title ILIKE ANY('{}') ORDER BY id"#).await, Vec::<i32>::new());
+    assert_eq!(ids(&pool, r#"SELECT id FROM "case" WHERE title ILIKE ALL('{}') ORDER BY id"#).await, vec![1, 2, 3, 4]);
+    let empty: Vec<String> = Vec::new();
+    let none: Vec<i32> = sqlx::query_scalar(r#"SELECT id FROM "case" WHERE "case"."title"::text ILIKE ANY($1)"#)
+        .bind(&empty)
+        .fetch_all(&pool)
+        .await
+        .expect("an empty bound array");
+    assert!(none.is_empty());
+
+    // The quoted, qualified ORDER BY over a join, not selected.
+    assert_eq!(
+        ids(&pool, r#"SELECT "case"."id" FROM "case" INNER JOIN "case_model" ON "case"."case_model_id" = "case_model"."id" ORDER BY "case"."updated_at" DESC LIMIT 2"#).await,
+        vec![4, 2]
+    );
+}
