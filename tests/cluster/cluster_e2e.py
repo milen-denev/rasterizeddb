@@ -30,6 +30,9 @@ ENV = dict(os.environ, PGPASSWORD="pw", PGSSLMODE="prefer")
 # Every link compressed (gateway to shards, shard to shard), with a low
 # threshold so nearly every frame is.
 COMPRESS = os.environ.get("CLUSTER_COMPRESSION") == "1"
+# The enterprise gateway in place of the GPL one, with per-client statistics
+# (and their history in an embedded RasterizedDB).
+ENTERPRISE = os.environ.get("CLUSTER_ENTERPRISE")
 procs = {}
 failures = 0
 
@@ -93,7 +96,12 @@ two_phase = on
 retries = 10
 """ + ("shard_compression = zstd:3\nshard_compression_min_bytes = 64\n" if COMPRESS else ""))
     log = open(f"{WORK}/gateway.log", "ab")
-    procs["gateway"] = subprocess.Popen([GATEWAY, "--config", conf], stdout=log, stderr=log)
+    if ENTERPRISE:
+        cmd = [ENTERPRISE, "--config", conf, "--client-stats-roles", "rasterized", "--client-stats-dir", f"{WORK}/stats",
+               "--client-stats-flush-secs", "2"]
+    else:
+        cmd = [GATEWAY, "--config", conf]
+    procs["gateway"] = subprocess.Popen(cmd, stdout=log, stderr=log)
 
 
 def psql(port, sql, timeout=60):
@@ -725,6 +733,8 @@ def main():
         check("the links to the shards are compressed",
               int(rows_.get("shard_frames_compressed_in", "0")) > 0 and int(rows_.get("shard_compression_saved_bytes", "0")) > 0,
               {k: v for k, v in rows_.items() if "compress" in k})
+    if ENTERPRISE:
+        client_stats()
     frontend(tls)
     if RDB_SHARD:
         split_online(tls, cmap)
@@ -837,6 +847,31 @@ def frontend_tds():
         check("  ...a wrong password is refused (TDS)", False, "it logged in")
     except Exception as e:
         check("  ...a wrong password is refused (TDS)", "refused" in str(e) or "failed" in str(e).lower(), repr(e))
+
+
+def client_stats():
+    """The enterprise gateway's per-client statistics, live and kept."""
+    code, out = psql(GW, "SHOW CLIENT STATS")
+    rows = [l.split("|") for l in out.splitlines()] if code == 0 else []
+    mine = [r for r in rows if r[1] == "rasterized" and r[2] == "127.0.0.1"]
+    ok = code == 0 and len(mine) >= 1 and sum(int(r[6]) for r in mine) > 300 and sum(int(r[15]) for r in mine) > 0
+    check("SHOW CLIENT STATS counts this client's statements and shard calls", ok, out[:600])
+    if ok and COMPRESS:
+        plain = sum(int(r[16]) + int(r[18]) for r in mine)
+        wire = sum(int(r[17]) + int(r[19]) for r in mine)
+        check("  ...shard traffic after compression is smaller", 0 < wire < plain, f"plain {plain}, wire {wire}")
+    if ok:
+        errors = sum(int(r[7]) for r in mine)
+        check("  ...and its errors", errors > 0, f"{errors} errors")
+    time.sleep(5)
+    code, out = psql(GW, "SHOW CLIENT STATS HISTORY 10")
+    check("SHOW CLIENT STATS HISTORY reads the embedded store", code == 0 and len(out.splitlines()) >= 1, out[:400])
+    # A role not listed may not read them.
+    # Roles are made on every shard (the gateway runs no role statement).
+    on_every_shard_of(SHARDS, "CREATE ROLE peeker LOGIN PASSWORD 'pw'")
+    r = subprocess.run(["psql", "-h", "127.0.0.1", "-p", str(GW), "-U", "peeker", "-d", "postgres", "-At", "-c", "SHOW CLIENT STATS"],
+                       env=ENV, capture_output=True, text=True, timeout=30)
+    check("  ...not for a role --client-stats-roles does not list", r.returncode != 0 and "client-stats-roles" in r.stderr, r.stderr[:300])
 
 
 def on_every_shard_of(ids, sql):
