@@ -1251,6 +1251,29 @@ async fn tiberius_declared_names() {
         .unwrap();
     assert_eq!(texts(&r[0]).into_iter().flatten().collect::<Vec<_>>(), ["CompanyId", "Code", "N", "SortOrder"]);
 
+    // A table named `__…` is the client's when it made it (EF Core's
+    // history table): listed, where every `__` name was taken for the
+    // engine's own and hidden. The engine's own stay hidden.
+    batch(
+        &mut c,
+        "IF OBJECT_ID(N'[__EFMigrationsHistory]') IS NULL BEGIN CREATE TABLE [__EFMigrationsHistory] \
+         ([MigrationId] nvarchar(150) NOT NULL, [ProductVersion] nvarchar(32) NOT NULL, \
+         CONSTRAINT [PK___EFMigrationsHistory] PRIMARY KEY ([MigrationId])); END;",
+    )
+    .await
+    .unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT name FROM sys.tables WHERE name = N'__EFMigrationsHistory'; \
+         SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = N'__EFMigrationsHistory' ORDER BY ORDINAL_POSITION; \
+         SELECT COUNT(*) FROM sys.objects WHERE name LIKE N'[_][_]rdb%'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(texts(&r[0]), [Some("__EFMigrationsHistory".to_string())]);
+    assert_eq!(texts(&r[1]).into_iter().flatten().collect::<Vec<_>>(), ["MigrationId", "ProductVersion"]);
+    assert_eq!(int(&r[2]), [0], "the engine's own relations are listed");
+
     // Recorded, not remembered by the session: a new connection shows them.
     drop(c);
     let mut c = connect(&s).await;

@@ -1919,7 +1919,10 @@ fn catalog_view_stored(schema: &str, view: &str, cx: &Cx) -> Result<Option<Strin
         .table_names()
         .into_iter()
         .filter(|n| {
-            !n.starts_with("__")
+            // `__` marks the engine's own relations; a table this front
+            // end made under such a name (EF Core's `__EFMigrationsHistory`)
+            // is the client's, known by its recorded declared name.
+            (!n.starts_with("__") || cx.env.shown(n, None).is_some())
                 && n != crate::auth::ROLE_TABLE
                 && !n.starts_with(crate::core::rql::json_map::SHADOW_TABLE_PREFIX)
         })
