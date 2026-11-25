@@ -37,7 +37,9 @@ def draw(px):
 
 sizes = [16, 24, 32, 48, 64, 128, 256]
 images = [draw(p) for p in sizes]
-images[-1].save("branding/rasterizeddb.ico", sizes=[(p, p) for p in sizes], append_images=images[:-1])
+for path in ("branding/rasterizeddb.ico", "rasterizeddb_core/assets/rasterizeddb.ico", "rdb_studio/assets/rasterizeddb.ico"):
+    # the crates carry their own copy: a crate packaged for crates.io holds only its own files
+    images[-1].save(path, sizes=[(p, p) for p in sizes], append_images=images[:-1])
 for p in (64, 128, 256, 512):
     draw(p).save(f"branding/rasterizeddb-{p}.png")
 print("ok")
