@@ -290,8 +290,15 @@ synchronous_commit, txn_start_time}`; the last is a new executor input, so
   the simple Query: rows concatenated, counts summed, aggregates and GROUP BY
   folded on the coordinator (whose fold works the same for an extended
   statement), writes under `two_phase`, all in the client's result formats.
-  A prepared `ORDER BY … LIMIT` or `SELECT DISTINCT` over every shard is
-  refused `0A000` in this version: send it unprepared, or give it a key.
+  A top-N (`ORDER BY` with `LIMIT`/`OFFSET`, literal or bound, or none) runs
+  on each shard rewritten: every `ORDER BY` key appended to the select list
+  as a hidden column fetched as text, `LIMIT limit + offset`, no `OFFSET`,
+  parameters renumbered. The coordinator merges by those keys, and the
+  hidden columns are cut from each row and from the description, so the
+  client's own columns come back in the formats it asked for. A key may be a
+  column the select list does not show, as in PostgreSQL. A prepared
+  `SELECT DISTINCT` is deduplicated by each row's bytes, which are the same
+  on every shard in the client's formats.
 - **`synchronous_commit = off`** in cluster mode skips only the replica's local
   outcome fsync, which phase 3 takes off the critical path anyway; the reply
   still follows quorum and apply (§9.2), so a session always reads its own

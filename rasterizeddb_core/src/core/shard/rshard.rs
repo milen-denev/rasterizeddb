@@ -534,24 +534,43 @@ async fn pg(conn: &Conn, session: u64, bytes: &[u8]) -> Response {
         drop(guard);
         if template == (rshard::RouteTemplate::FanOut { merge: Merge::Coordinator, writes: false }) {
             // A fold, a top-N or a DISTINCT: the classifier sends all three.
-            if extended && !may_aggregate_fold(&sql) {
+            if extended
+                && !may_aggregate_fold(&sql)
+                && let Some(st) = super::topn_ext::statement(bytes)
+            {
+                if is_plain_distinct(&sql) {
+                    return coordinate_distinct_ext(session, &mut s, bytes).await;
+                }
                 let status = s.bridge.status;
-                let msg = "an ORDER BY or DISTINCT over every shard is merged only for a simple query in this version: send it unprepared, or give it a route key";
-                return Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes: error_reply("0A000", msg, status) };
+                return match super::topn_ext::plan(&st) {
+                    Some(Ok(plan)) => coordinate_topn_ext(session, &mut s, &st, plan, bytes).await,
+                    Some(Err(e)) => {
+                        let (code, msg) = split_code(&e);
+                        Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes: error_reply(code, msg, status) }
+                    }
+                    None => {
+                        let msg = "this ORDER BY or DISTINCT is not one a merge across shards handles: give it a route key";
+                        Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes: error_reply("0A000", msg, status) }
+                    }
+                };
             }
             if !may_aggregate_fold(&sql) && is_plain_distinct(&sql) {
                 return coordinate_distinct(session, &mut s, &sql).await;
             }
-            if !may_aggregate_fold(&sql)
-                && let Some(parsed) = super::topn::parse(&sql)
-            {
-                return match parsed {
-                    Ok(topn) => coordinate_topn(session, &mut s, topn).await,
-                    Err(e) => {
-                        let status = s.bridge.status;
-                        Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes: error_reply("0A000", e.trim_start_matches("0A000: "), status) }
-                    }
-                };
+            // A top-N runs as a prepared one does: its keys fetched as extra
+            // columns, so an ORDER BY column the list does not show sorts too.
+            if !may_aggregate_fold(&sql) {
+                let st = super::topn_ext::Statement::simple(&sql);
+                if let Some(planned) = super::topn_ext::plan(&st) {
+                    return match planned {
+                        Ok(plan) => coordinate_topn_ext(session, &mut s, &st, plan, bytes).await,
+                        Err(e) => {
+                            let status = s.bridge.status;
+                            let (code, msg) = split_code(&e);
+                            Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes: error_reply(code, msg, status) }
+                        }
+                    };
+                }
             }
             return coordinate(session, &mut s, bytes).await;
         }
@@ -661,6 +680,219 @@ struct TopPart {
     error: Option<Vec<u8>>,
 }
 
+/// `"XXXXX: message"` as its SQLSTATE and message (`XX000` when it has none).
+fn split_code(e: &str) -> (&str, &str) {
+    match e.split_once(": ") {
+        Some((c, m)) if c.len() == 5 && c.bytes().all(|b| b.is_ascii_alphanumeric()) => (c, m),
+        _ => ("XX000", e),
+    }
+}
+
+/// Runs an extended statement's top-N `plan` on session `s` (module docs of
+/// `topn_ext`): its rows keyed by the appended columns, which are cut from
+/// every row and from the description it returns.
+async fn ext_top_part(s: &mut VSession, st: &super::topn_ext::Statement, plan: &super::topn_ext::Plan) -> Result<TopPart, String> {
+    use super::topn_ext as x;
+    let _part = PartGuard::on(s);
+    // The client's formats need the column count written out.
+    let formats = if x::needs_count(&st.results) {
+        let mut d = Vec::new();
+        x::parse_msg(&mut d, &plan.sql, &plan.types);
+        x::describe_msg(&mut d, b'S');
+        d.extend_from_slice(&[b'S', 0, 0, 0, 4]);
+        s.bridge.raw(&d);
+        let mut total = None;
+        let mut error = None;
+        loop {
+            let frame = s.bridge.next().await.map_err(|e| format!("the session ended: {e}"))?;
+            match frame.tag {
+                b'T' => total = super::topn::fields_of(frame.body).map(|f| f.len()),
+                b'E' => error = Some(message(b'E', frame.body)),
+                b'Z' => break,
+                _ => {}
+            }
+        }
+        if let Some(e) = error {
+            return Ok(TopPart { fields: None, rows: Vec::new(), error: Some(e) });
+        }
+        x::result_formats(&st.results, total.ok_or("the rewritten statement returns no rows")?, plan.extras)
+    } else {
+        Vec::new()
+    };
+    let mut b = Vec::new();
+    x::parse_msg(&mut b, &plan.sql, &plan.types);
+    x::bind_msg(&mut b, &plan.params, &formats);
+    x::describe_msg(&mut b, b'P');
+    x::execute_sync(&mut b);
+    s.bridge.raw(&b);
+    let mut part = TopPart { fields: None, rows: Vec::new(), error: None };
+    let mut index: Option<(Vec<usize>, Vec<(String, u32)>, usize)> = None;
+    loop {
+        let frame = s.bridge.next().await.map_err(|e| format!("the session ended: {e}"))?;
+        match frame.tag {
+            b'T' => {
+                let fields = super::topn::fields_of(frame.body).ok_or("a malformed RowDescription")?;
+                let idx = super::topn::resolve(&plan.keys, &fields)?;
+                let own = fields.len() - plan.extras;
+                part.fields = Some(x::strip_description(frame.body, own).ok_or("a malformed RowDescription")?);
+                index = Some((idx, fields, own));
+            }
+            b'D' => {
+                let (idx, fields, own) = index.as_ref().ok_or("rows before their description")?;
+                let cells = super::topn::cells_of(frame.body).ok_or("a malformed DataRow")?;
+                let key = super::topn::sort_key(&plan.keys, idx, fields, &cells)?;
+                let row = x::strip_row(frame.body, *own).ok_or("a malformed DataRow")?;
+                part.rows.push((key, message(b'D', &row)));
+            }
+            b'E' => part.error = Some(message(b'E', frame.body)),
+            b'Z' => break,
+            _ => {}
+        }
+    }
+    Ok(part)
+}
+
+/// The acknowledgements an extended statement's reply opens with: Parse
+/// and Bind complete, and its description when the batch asked for one.
+fn ext_head(st: &super::topn_ext::Statement, fields: &Option<Vec<u8>>) -> Vec<u8> {
+    let mut head = if st.simple { Vec::new() } else { vec![b'1', 0, 0, 0, 4, b'2', 0, 0, 0, 4] };
+    if st.describe {
+        match fields {
+            Some(f) => head.extend(message(b'T', f)),
+            None => head.extend_from_slice(&[b'n', 0, 0, 0, 4]),
+        }
+    }
+    head
+}
+
+/// A prepared top-N over every shard, coordinated here: this shard's part
+/// and every peer's (each from `bytes`, the client's statement) merged by
+/// key, `offset` skipped, `limit` kept, answered as the client's batch asks.
+async fn coordinate_topn_ext(session: u64, s: &mut VSession, st: &super::topn_ext::Statement, plan: super::topn_ext::Plan, bytes: &[u8]) -> Response {
+    let (database, role) = (s.database.clone(), s.role.clone());
+    let merge = Merge::TopN { limit: plan.limit.saturating_add(plan.offset), offset: 0 };
+    let (mine, peers) = tokio::join!(ext_top_part(s, st, &plan), peer_parts(&database, &role, bytes, merge));
+    let status = s.bridge.status;
+    let fail = |code: &str, msg: &str| Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes: error_reply(code, msg, status) };
+    let mine = match mine {
+        Ok(p) => p,
+        Err(e) => return fail("XX000", &e),
+    };
+    if let Some(err) = mine.error {
+        let mut bytes = err;
+        bytes.extend_from_slice(&[b'Z', 0, 0, 0, 5, status]);
+        return Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes };
+    }
+    let mut rows = mine.rows;
+    let mut size = rows.iter().map(|(k, r)| k.len() + r.len()).sum::<usize>();
+    for (id, part) in peers {
+        match part {
+            Ok(p) => {
+                if let Some((_, m)) = first_error(&p.tail) {
+                    let mut bytes = message(b'E', &m);
+                    bytes.extend_from_slice(&[b'Z', 0, 0, 0, 5, status]);
+                    return Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes };
+                }
+                size += p.rows.iter().map(|(k, r)| k.len() + r.len()).sum::<usize>();
+                if size > COORDINATED_MAX_BYTES {
+                    return fail("54000", "a coordinated result passed 256 MiB");
+                }
+                rows.extend(p.rows);
+            }
+            Err(e) => return fail("XX000", &format!("the coordinator could not gather shard {id}'s part: {e}")),
+        }
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let kept: Vec<&Vec<u8>> = rows.iter().skip(plan.offset as usize).take(plan.limit as usize).map(|(_, r)| r).collect();
+    let mut bytes = ext_head(st, &mine.fields);
+    for r in &kept {
+        bytes.extend_from_slice(r);
+    }
+    let mut tag = format!("SELECT {}", kept.len()).into_bytes();
+    tag.push(0);
+    bytes.extend(message(b'C', &tag));
+    bytes.extend_from_slice(&[b'Z', 0, 0, 0, 5, status]);
+    Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes }
+}
+
+/// A prepared `SELECT DISTINCT` over every shard: this shard's rows and
+/// every peer's, each row kept once by its bytes (in the client's formats,
+/// the same on every shard).
+async fn coordinate_distinct_ext(session: u64, s: &mut VSession, bytes: &[u8]) -> Response {
+    let (database, role) = (s.database.clone(), s.role.clone());
+    let local = async {
+        let _part = PartGuard::on(s);
+        s.bridge.raw(bytes);
+        let (mut head, mut rows, mut error) = (Vec::new(), Vec::new(), None);
+        loop {
+            let frame = match s.bridge.next().await {
+                Ok(f) => f,
+                Err(e) => return Err(format!("the session ended: {e}")),
+            };
+            match frame.tag {
+                b'D' => rows.push(message(b'D', frame.body)),
+                b'E' => error = Some(message(b'E', frame.body)),
+                b'Z' => break,
+                b'C' => {}
+                t if rows.is_empty() => head.extend(message(t, frame.body)),
+                _ => {}
+            }
+        }
+        Ok((head, rows, error))
+    };
+    let (mine, peers) = tokio::join!(local, peer_parts(&database, &role, bytes, Merge::Concat));
+    let status = s.bridge.status;
+    let fail = |code: &str, msg: &str| Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes: error_reply(code, msg, status) };
+    let (head, mine, error) = match mine {
+        Ok(v) => v,
+        Err(e) => return fail("XX000", &e),
+    };
+    if let Some(err) = error {
+        let mut bytes = err;
+        bytes.extend_from_slice(&[b'Z', 0, 0, 0, 5, status]);
+        return Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes };
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut rows: Vec<Vec<u8>> = Vec::new();
+    let mut size = 0usize;
+    for r in mine {
+        if seen.insert(r.clone()) {
+            size += r.len();
+            rows.push(r);
+        }
+    }
+    for (id, part) in peers {
+        match part {
+            Ok(p) => {
+                if let Some((_, m)) = first_error(&p.tail) {
+                    let mut bytes = message(b'E', &m);
+                    bytes.extend_from_slice(&[b'Z', 0, 0, 0, 5, status]);
+                    return Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes };
+                }
+                for (_, r) in p.rows {
+                    if seen.insert(r.clone()) {
+                        size += r.len();
+                        rows.push(r);
+                    }
+                }
+                if size > COORDINATED_MAX_BYTES {
+                    return fail("54000", "a coordinated result passed 256 MiB");
+                }
+            }
+            Err(e) => return fail("XX000", &format!("the coordinator could not gather shard {id}'s part: {e}")),
+        }
+    }
+    let mut out = head;
+    for r in &rows {
+        out.extend_from_slice(r);
+    }
+    let mut tag = format!("SELECT {}", rows.len()).into_bytes();
+    tag.push(0);
+    out.extend(message(b'C', &tag));
+    out.extend_from_slice(&[b'Z', 0, 0, 0, 5, status]);
+    Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes: out }
+}
+
 /// Runs `topn.part_sql` on this shard's session `s` and keys its rows.
 async fn top_part(s: &mut VSession, topn: &super::topn::TopN) -> Result<TopPart, String> {
     let _part = PartGuard::on(s);
@@ -690,71 +922,6 @@ async fn top_part(s: &mut VSession, topn: &super::topn::TopN) -> Result<TopPart,
     Ok(part)
 }
 
-/// Coordinates a top-N (module docs of `topn`): every shard's first
-/// `limit + offset` rows by sort key, merged here, `offset` skipped, `limit`
-/// kept, answered as one result.
-async fn coordinate_topn(session: u64, s: &mut VSession, topn: super::topn::TopN) -> Response {
-    let Some(served) = served() else {
-        return refuse(PROTOCOL, true, "this node is not a shard");
-    };
-    let fail = |s: &VSession, code: &str, msg: &str| {
-        let status = s.bridge.status;
-        Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes: error_reply(code, msg, status) }
-    };
-    let request = query_message(&topn.part_sql);
-    let (database, role) = (s.database.clone(), s.role.clone());
-    let peer_merge = Merge::TopN { limit: topn.limit.saturating_add(topn.offset), offset: 0 };
-    let (mine, peers) = tokio::join!(top_part(s, &topn), peer_parts(&database, &role, &request, peer_merge));
-    let mine = match mine {
-        Ok(p) => p,
-        Err(e) => return fail(s, "XX000", &e),
-    };
-    if let Some(err) = mine.error {
-        let status = s.bridge.status;
-        let mut bytes = err;
-        bytes.extend_from_slice(&[b'Z', 0, 0, 0, 5, status]);
-        return Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes };
-    }
-    let mut rows = mine.rows;
-    let fields = mine.fields;
-    let _ = &served;
-    let mut size = rows.iter().map(|(k, r)| k.len() + r.len()).sum::<usize>();
-    for (id, part) in peers {
-        match part {
-            Ok(p) => {
-                if let Some((_, m)) = crate::core::shard::rshard::first_error(&p.tail) {
-                    let status = s.bridge.status;
-                    let mut bytes = message(b'E', &m);
-                    bytes.extend_from_slice(&[b'Z', 0, 0, 0, 5, status]);
-                    return Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes };
-                }
-                size += p.rows.iter().map(|(k, r)| k.len() + r.len()).sum::<usize>();
-                if size > COORDINATED_MAX_BYTES {
-                    return fail(s, "54000", "a coordinated result passed 256 MiB");
-                }
-                rows.extend(p.rows);
-            }
-            Err(e) => return fail(s, "XX000", &format!("the coordinator could not gather shard {id}'s part: {e}")),
-        }
-    }
-    // Stable: equal keys keep shard order, as PostgreSQL leaves ties
-    // unordered anyway.
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-    let kept: Vec<&Vec<u8>> = rows.iter().skip(topn.offset as usize).take(topn.limit as usize).map(|(_, r)| r).collect();
-    let mut bytes = Vec::new();
-    if let Some(f) = &fields {
-        bytes.extend(message(b'T', f));
-    }
-    for r in &kept {
-        bytes.extend_from_slice(r);
-    }
-    let mut tag = format!("SELECT {}", kept.len()).into_bytes();
-    tag.push(0);
-    bytes.extend(message(b'C', &tag));
-    let status = s.bridge.status;
-    bytes.extend_from_slice(&[b'Z', 0, 0, 0, 5, status]);
-    Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes }
-}
 
 /// `SELECT DISTINCT …` (not `DISTINCT ON`).
 fn is_plain_distinct(sql: &str) -> bool {
@@ -1121,11 +1288,18 @@ async fn read_chunk(session: u64, s: &mut VSession) -> Response {
 /// DataRows split out for the gateway to concatenate or sum.
 async fn exec_part(conn: &Conn, session: u64, merge: Merge, bytes: &[u8]) -> Response {
     if let Merge::TopN { .. } = merge {
-        let Some(sql) = simple_query_text(bytes) else {
-            return refuse(PROTOCOL, true, "a top-N part is one simple Query");
+        // A top-N's part: the statement rewritten so its keys come back in
+        // text whatever formats the client asked for (module docs of
+        // `topn_ext`); a simple Query the same way, in text.
+        let st = match simple_query_text(bytes) {
+            Some(sql) => super::topn_ext::Statement::simple(&sql),
+            None => match super::topn_ext::statement(bytes) {
+                Some(st) => st,
+                None => return refuse(PROTOCOL, true, "a top-N part is one statement: a simple Query, or Parse, Bind, Describe, Execute, Sync"),
+            },
         };
-        let topn = match super::topn::parse(&sql) {
-            Some(Ok(t)) => t,
+        let plan = match super::topn_ext::plan(&st) {
+            Some(Ok(p)) => p,
             Some(Err(e)) => return refuse(*b"0A000", true, e),
             None => return refuse(*b"0A000", true, "not a top-N statement"),
         };
@@ -1133,11 +1307,9 @@ async fn exec_part(conn: &Conn, session: u64, merge: Merge, bytes: &[u8]) -> Res
             return refuse(SESSION_GONE, true, format!("session {session} is gone"));
         };
         let mut s = s.lock().await;
-        // The part as sent is already limited; run it as is.
-        let topn = super::topn::TopN { part_sql: sql.clone(), ..topn };
-        return match top_part(&mut s, &topn).await {
+        return match ext_top_part(&mut s, &st, &plan).await {
             Ok(p) => {
-                let head = p.fields.map(|f| message(b'T', &f)).unwrap_or_default();
+                let head = ext_head(&st, &p.fields);
                 let status = s.bridge.status;
                 let mut tail = p.error.unwrap_or_default();
                 tail.extend_from_slice(&[b'Z', 0, 0, 0, 5, status]);

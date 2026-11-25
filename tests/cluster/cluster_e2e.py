@@ -12,7 +12,7 @@ Each check prints PASS or FAIL with what it saw; the exit code is the
 number of failures. Every process is killed at the end, and the workdir is
 left for the logs (`shard<N>.log`, `gateway.log`).
 """
-import hashlib, os, signal, socket, ssl, struct, subprocess, sys, time
+import base64, hashlib, hmac, os, signal, socket, ssl, struct, subprocess, sys, time
 
 CORE, GATEWAY, WORK = sys.argv[1], sys.argv[2], sys.argv[3]
 RDB_SHARD = sys.argv[4] if len(sys.argv) > 4 else None
@@ -136,6 +136,104 @@ def up(port, what, secs=90):
         last = out
         time.sleep(0.5)
     sys.exit(f"{what} did not come up ({last}); see {WORK}")
+
+
+class PgClient:
+    """A PostgreSQL client of just one feature psql lacks: the extended
+    protocol with binary results, as Npgsql and sqlx ask for them."""
+
+    def __init__(self, port, user, password, database):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=30)
+        body = struct.pack("!I", 196608) + b"user\0" + user.encode() + b"\0database\0" + database.encode() + b"\0\0"
+        self.sock.sendall(struct.pack("!I", len(body) + 4) + body)
+        nonce = base64.b64encode(os.urandom(18)).decode()
+        first_bare = f"n=,r={nonce}"
+        salted = None
+        while True:
+            t, b = self.read()
+            if t == b"R":
+                kind = struct.unpack("!I", b[:4])[0]
+                if kind == 10:      # SASL: SCRAM-SHA-256
+                    init = ("n,," + first_bare).encode()
+                    msg = b"SCRAM-SHA-256\0" + struct.pack("!I", len(init)) + init
+                    self.send(b"p", msg)
+                elif kind == 11:    # SASL continue
+                    server_first = b[4:].decode()
+                    f = dict(x.split("=", 1) for x in server_first.split(","))
+                    salted = hashlib.pbkdf2_hmac("sha256", password.encode(), base64.b64decode(f["s"]), int(f["i"]))
+                    client_key = hmac.new(salted, b"Client Key", "sha256").digest()
+                    without_proof = f"c=biws,r={f['r']}"
+                    auth = f"{first_bare},{server_first},{without_proof}".encode()
+                    sig = hmac.new(hashlib.sha256(client_key).digest(), auth, "sha256").digest()
+                    proof = bytes(a ^ b for a, b in zip(client_key, sig))
+                    self.send(b"p", f"{without_proof},p={base64.b64encode(proof).decode()}".encode())
+                elif kind in (0, 12):
+                    continue
+                else:
+                    raise RuntimeError(f"auth kind {kind}")
+            elif t == b"E":
+                raise RuntimeError(self.error(b))
+            elif t == b"Z":
+                return
+
+    def send(self, t, body):
+        self.sock.sendall(t + struct.pack("!I", len(body) + 4) + body)
+
+    def read(self):
+        h = b""
+        while len(h) < 5:
+            c = self.sock.recv(5 - len(h))
+            if not c:
+                raise RuntimeError("the connection closed")
+            h += c
+        n = struct.unpack("!I", h[1:5])[0] - 4
+        b = b""
+        while len(b) < n:
+            c = self.sock.recv(n - len(b))
+            if not c:
+                raise RuntimeError("the connection closed")
+            b += c
+        return h[:1], b
+
+    @staticmethod
+    def error(b):
+        fields = dict((f[:1], f[1:].decode(errors="replace")) for f in b.split(b"\0") if f)
+        return f"{fields.get(b'C', '')}: {fields.get(b'M', '')}"
+
+    def execute(self, sql, params, binary=True):
+        """Parse/Bind/Describe/Execute/Sync with text parameters; rows as
+        lists of raw cell bytes (None for NULL), in binary when `binary`."""
+        self.send(b"P", b"\0" + sql.encode() + b"\0" + struct.pack("!h", 0))
+        bind = b"\0\0" + struct.pack("!h", 0) + struct.pack("!h", len(params))
+        for p in params:
+            v = str(p).encode()
+            bind += struct.pack("!i", len(v)) + v
+        bind += struct.pack("!hh", 1, 1 if binary else 0)
+        self.send(b"B", bind)
+        self.send(b"D", b"P\0")
+        self.send(b"E", b"\0" + struct.pack("!i", 0))
+        self.send(b"S", b"")
+        rows, error, described = [], None, None
+        while True:
+            t, b = self.read()
+            if t == b"T":
+                described = struct.unpack("!h", b[:2])[0]
+            elif t == b"D":
+                n = struct.unpack("!h", b[:2])[0]
+                at, row = 2, []
+                for _ in range(n):
+                    ln = struct.unpack("!i", b[at:at + 4])[0]
+                    at += 4
+                    row.append(None if ln < 0 else b[at:at + ln])
+                    at += max(ln, 0)
+                rows.append(row)
+            elif t == b"E":
+                error = self.error(b)
+            elif t == b"Z":
+                break
+        if error:
+            raise RuntimeError(error)
+        return described, rows
 
 
 class MySQL:
@@ -374,6 +472,31 @@ def main():
     check("a keyless write over the extended protocol", (code, out) == (0, f"UPDATE {rows // 5}"), out)
     check("a plain DISTINCT across shards", sorted(psql(GW, "SELECT DISTINCT store FROM orders")[1].split()) == ["0", "1", "2", "3", "4"],
           psql(GW, "SELECT DISTINCT store FROM orders"))
+
+    # 4i. A prepared top-N and DISTINCT over every shard: text and binary.
+    code, out = psql_script(GW, "SELECT id, v FROM orders WHERE v > $1 ORDER BY v DESC, id LIMIT $2 OFFSET $3 \\bind 0 3 1 \\g\n"
+                                "SELECT DISTINCT store FROM orders WHERE id < $1 \\bind 1000 \\g\n")
+    lines = [l for l in out.split("\n") if l]
+    check("a prepared top-N across shards (text)", code == 0 and lines[:3] == ["299|299", "298|298", "297|297"], out)
+    code, out = psql(GW, "SELECT id FROM orders ORDER BY v DESC, id LIMIT 2")
+    check("a top-N by a column the select list does not show", (code, out.split()) == (0, ["300", "299"]), out)
+    check("a prepared DISTINCT across shards (text)", code == 0 and sorted(lines[3:]) == ["0", "1", "2", "3", "4"], out)
+    try:
+        pg = PgClient(GW, "rasterized", "pw", "postgres")
+        cols, got = pg.execute("SELECT id, v FROM orders ORDER BY id DESC LIMIT $1", [2])
+        ok = cols == 2 and [[struct.unpack("!i", c)[0] for c in r] for r in got] == [[b, 1], [a, 1]]
+        check("a prepared top-N across shards (binary results)", ok, f"{cols} {got}")
+        cols, got = pg.execute("SELECT DISTINCT store FROM orders", [], binary=True)
+        check("a prepared DISTINCT across shards (binary results)",
+              sorted(struct.unpack("!i", r[0])[0] for r in got) == [0, 1, 2, 3, 4], got)
+        cols, got = pg.execute("SELECT count(*) FROM orders", [], binary=True)
+        check("a prepared count across shards (binary results)", struct.unpack("!q", got[0][0])[0] == rows + 2, got)
+    except Exception as e:
+        check("prepared statements with binary results", False, repr(e))
+    code, out = psql_script(GW, "BEGIN;\nINSERT INTO orders (id, store, v) VALUES (5001, 1, 100000);\n"
+                                "INSERT INTO orders (id, store, v) VALUES (5002, 2, 99999);\n"
+                                "SELECT id FROM orders ORDER BY v DESC LIMIT $1 \\bind 2 \\g\nROLLBACK;\n")
+    check("a prepared top-N in a transaction that wrote on two shards", code == 0 and "5001\n5002" in out, out)
 
     # 4e. An aggregate in a transaction that already wrote on other shards
     # sees those writes.

@@ -56,6 +56,16 @@ impl Session {
                         if is_plain_distinct(&text) {
                             return self.in_txn_merge(msg, Merge::Concat, true).await;
                         }
+                    } else if let Some((text, bind)) = extended_statement(msg) {
+                        // Prepared: each shard rewrites its own part (keys
+                        // in text, the client's formats kept); the gateway
+                        // needs only the bound LIMIT and OFFSET.
+                        if let Some((_, limit, offset)) = bind_tail(&text, &bind).and_then(|t| gateway_top_n(&t)) {
+                            return self.in_txn_merge(msg, Merge::TopN { limit, offset }, false).await;
+                        }
+                        if is_plain_distinct(&text) {
+                            return self.in_txn_merge(msg, Merge::Concat, true).await;
+                        }
                     }
                     // A fold: every other shard's partial gathered here,
                     // inside the transaction, and merged on the home
@@ -1036,6 +1046,47 @@ fn part_error(parts: &[(u32, PartReply)]) -> Result<(), (String, String)> {
         }
     }
     Ok(())
+}
+
+/// The statement text and Bind of a normalised extended batch (`Parse Bind
+/// [Describe] Execute Sync`).
+fn extended_statement(msg: &[u8]) -> Option<(String, pg::BindAll)> {
+    let mut text = None;
+    let mut bind = None;
+    for (t, m) in pg::messages(msg) {
+        match t {
+            b'P' => text = pg::parse_parse(m).map(|(_, q)| q.to_string()),
+            b'B' => bind = pg::parse_bind_all(m),
+            _ => {}
+        }
+    }
+    Some((text?, bind?))
+}
+
+/// `text` with `LIMIT $n` / `OFFSET $m` in its tail replaced by their bound
+/// values, for [`gateway_top_n`]; `None` for a bound value that is not a
+/// whole number.
+fn bind_tail(text: &str, bind: &pg::BindAll) -> Option<String> {
+    let t = text.trim().trim_end_matches(';').trim_end();
+    let (_, words) = tail_words(t)?;
+    let mut out = t.to_string();
+    for w in words.windows(2).rev() {
+        let ((kw, _), (tok, at)) = (&w[0], &w[1]);
+        if kw != "LIMIT" && kw != "OFFSET" {
+            continue;
+        }
+        let Some(n) = tok.strip_prefix('$').and_then(|d| d.parse::<usize>().ok()) else { continue };
+        let (fmt, value) = bind.params.get(n.checked_sub(1)?)?;
+        let v: u64 = match (fmt, value.as_deref()?) {
+            (0, b) => std::str::from_utf8(b).ok()?.trim().parse().ok()?,
+            (_, b) if b.len() == 8 => u64::try_from(i64::from_be_bytes(b.try_into().ok()?)).ok()?,
+            (_, b) if b.len() == 4 => u64::try_from(i32::from_be_bytes(b.try_into().ok()?)).ok()?,
+            (_, b) if b.len() == 2 => u64::try_from(i16::from_be_bytes(b.try_into().ok()?)).ok()?,
+            _ => return None,
+        };
+        out.replace_range(*at..*at + tok.len(), &v.to_string());
+    }
+    Some(out)
 }
 
 /// A simple Query message for `sql`.

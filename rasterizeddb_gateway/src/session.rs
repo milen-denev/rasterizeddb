@@ -1524,7 +1524,9 @@ fn fenced_for_a_move(reply: &[u8]) -> bool {
     let mut error = false;
     for (t, m) in pg::messages(reply) {
         match t {
-            b'E' if pg::error_sqlstate(m) == Some("57P03") && pg::error_message(m).is_some_and(|e| e.contains("fenced for a move")) => error = true,
+            // The shard's message leads with its code; the code field may
+            // carry it or not, depending on the path the error took.
+            b'E' if pg::error_message(m).is_some_and(|e| e.contains("fenced for a move; retry after it")) => error = true,
             b'Z' | b'N' | b'S' => {}
             _ => return false,
         }

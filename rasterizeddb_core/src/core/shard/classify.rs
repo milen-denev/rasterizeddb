@@ -434,7 +434,7 @@ fn fan_out_read(t: &str, c: &Clauses) -> RouteTemplate {
     // sort keys (B1c top-N; with no LIMIT, every row in order).
     if !aggregate && !has("GROUP") && !has("HAVING") && !list_upper.trim_start().starts_with("DISTINCT")
         && has("ORDER")
-        && matches!(super::topn::parse(t), Some(Ok(_)))
+        && super::topn::is_top_n_shape(t)
     {
         return RouteTemplate::FanOut { merge: Merge::Coordinator, writes: false };
     }
@@ -767,5 +767,46 @@ mod b45_tests {
         assert!(!gatherable("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"), "a write in a CTE");
         assert!(!gatherable("SELECT nextval('s'), * FROM t"), "a sequence call writes");
         assert!(!gatherable("UPDATE t SET a = 1"));
+    }
+}
+
+#[cfg(test)]
+mod prepared_shape_tests {
+    use super::*;
+    use crate::core::rql::lexer_s1::recognize_query_purpose;
+    use rasterizeddb_router::rshard::Merge;
+
+    async fn db() -> (tempfile::TempDir, rclite::Arc<Database>) {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = crate::MAX_PERMITS_THREADS.set(4);
+        let _ = crate::BATCH_SIZE.set(512);
+        let db = rclite::Arc::new(Database::new_named(&dir.path().to_string_lossy(), false, "c").await);
+        let sql = "CREATE TABLE orders (id INT PRIMARY KEY, store INT NOT NULL, v INT NOT NULL) PARTITION BY HASH (id)";
+        let out = crate::core::rql::executor::execute(recognize_query_purpose(sql).unwrap(), db.clone()).await;
+        assert!(out.first().is_some_and(|b| *b != 3), "{}", String::from_utf8_lossy(&out));
+        (dir, db)
+    }
+
+    /// What a driver prepares fans out as the same text with literals does.
+    #[tokio::test]
+    async fn prepared_reads_fan_out_like_literal_ones() {
+        let (dir, db) = db().await;
+        let coord = RouteTemplate::FanOut { merge: Merge::Coordinator, writes: false };
+        for sql in [
+            "SELECT id, v FROM orders WHERE v > $1 ORDER BY v DESC, id LIMIT $2 OFFSET $3",
+            "SELECT id FROM orders ORDER BY id LIMIT $1",
+            "SELECT DISTINCT store FROM orders WHERE id < $1",
+            "SELECT DISTINCT store FROM orders",
+            "SELECT store, count(*) FROM orders WHERE v > $1 GROUP BY store",
+        ] {
+            assert_eq!(classify(&db, Source::Parse, sql), coord, "{sql}");
+        }
+        assert_eq!(
+            classify(&db, Source::Parse, "SELECT id FROM orders WHERE v > $1"),
+            RouteTemplate::FanOut { merge: Merge::Concat, writes: false }
+        );
+        assert!(matches!(classify(&db, Source::Parse, "SELECT v FROM orders WHERE id = $1"), RouteTemplate::Param { .. }));
+        drop(db);
+        crate::core::wal::remove_for(&dir.path().to_string_lossy());
     }
 }

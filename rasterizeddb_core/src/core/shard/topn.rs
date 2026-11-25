@@ -41,12 +41,12 @@ pub struct TopN {
     pub part_sql: String,
 }
 
-fn is_ident_byte(b: u8) -> bool {
+pub(crate) fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// Top-level keyword offsets (outside quotes, comments, parentheses).
-fn top_level_words(t: &str) -> Vec<(String, usize)> {
+pub(crate) fn top_level_words(t: &str) -> Vec<(String, usize)> {
     use crate::core::sql_scan::{skip_comment, skip_quoted};
     let b = t.as_bytes();
     let mut out = Vec::new();
@@ -174,6 +174,33 @@ fn parse_keys(keys_text: &str) -> Result<Vec<Key>, String> {
         keys.push(Key { column, desc, nulls_first });
     }
     Ok(keys)
+}
+
+/// Whether `sql` is a top-N a merge across shards handles, a parameter
+/// `LIMIT $n` / `OFFSET $m` taken as some number (a prepared statement's
+/// shape: its values come with each Bind, `topn_ext`).
+pub fn is_top_n_shape(sql: &str) -> bool {
+    let t = sql.trim().trim_end_matches(';').trim();
+    let words = top_level_words(t);
+    let Some(order) = words.iter().position(|(w, _)| w == "ORDER") else {
+        return false;
+    };
+    let mut out = t.to_string();
+    for (w, at) in words[order..].iter().rev() {
+        if w != "LIMIT" && w != "OFFSET" {
+            continue;
+        }
+        let after = at + w.len();
+        let rest = &t[after..];
+        let lead = rest.len() - rest.trim_start().len();
+        if let Some(d) = rest[lead..].strip_prefix('$') {
+            let len = d.bytes().take_while(u8::is_ascii_digit).count();
+            if len > 0 {
+                out.replace_range(after + lead..after + lead + 1 + len, "1");
+            }
+        }
+    }
+    matches!(parse(&out), Some(Ok(_)))
 }
 
 /// The columns a RowDescription names, with their type OIDs.
