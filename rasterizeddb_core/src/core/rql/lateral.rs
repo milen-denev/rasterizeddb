@@ -1310,7 +1310,10 @@ fn outer_only_filter(sql: &str, item: &Item, alias: &str) -> Option<String> {
         }
     }
     let clause = sql[body..end].trim().trim_end_matches(';');
-    let terms: Vec<String> = conjuncts(clause).into_iter().filter(|t| !t.is_empty() && reads_only(t, alias)).collect();
+    let terms: Vec<String> = conjuncts(clause)
+        .into_iter()
+        .filter(|t| !t.is_empty() && (reads_only(t, alias) || exists_reads_only(t, alias)))
+        .collect();
     (!terms.is_empty()).then(|| terms.join(" AND "))
 }
 
@@ -1350,6 +1353,115 @@ pub(crate) fn reads_only_for_tests(term: &str, alias: &str) -> bool {
 
 /// Whether `term` reads only `alias`'s columns, by [`outer_only_filter`]'s
 /// rule.
+/// Whether `term` is `[NOT] EXISTS (SELECT …)` reading nothing but the
+/// outer item `alias` and the relations it names in its own FROM and JOINs:
+/// as deterministic as the statement's own WHERE, so the outer values it
+/// refuses need no run. EF Core's filter of a product by a tag
+/// (`EXISTS (SELECT 1 FROM tags t … WHERE p.id = t.product …)`) is most
+/// of what its `WHERE` keeps out; left out of the filter, a correlated
+/// subquery in the select list ran for every product of the table.
+///
+/// Refused when unsure: a call of any kind, a `$` parameter, a `;`, a
+/// nested subquery, a qualifier the body does not bind and is not
+/// `alias`, and an unqualified word that is neither a keyword nor a FROM
+/// item's name or alias (it could be another item's column).
+fn exists_reads_only(term: &str, alias: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IS", "NULL", "IN", "BETWEEN", "LIKE", "ILIKE", "TRUE",
+        "FALSE", "DISTINCT", "JOIN", "INNER", "LEFT", "OUTER", "ON", "AS", "CROSS", "LIMIT", "TOP",
+    ];
+    let t = term.trim();
+    let upper = t.to_ascii_uppercase();
+    let rest = upper.strip_prefix("NOT ").map(str::trim_start).unwrap_or(&upper);
+    let Some(after) = rest.strip_prefix("EXISTS") else { return false };
+    let open = t.len() - after.trim_start().len();
+    if !t[open..].starts_with('(') || matching_paren(t, open) != Some(t.len() - 1) {
+        return false;
+    }
+    let body = &t[open + 1..t.len() - 1];
+    if !body.trim_start().to_ascii_uppercase().starts_with("SELECT") {
+        return false;
+    }
+    // Words and quoted names, in order.
+    let bytes = body.as_bytes();
+    let mut tokens: Vec<(String, bool, usize)> = Vec::new(); // (text, quoted, end)
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\'' => i = crate::core::sql_scan::quoted_end(bytes, i, b'\''),
+            b'"' => {
+                let end = crate::core::sql_scan::quoted_end(bytes, i, b'"');
+                tokens.push((body[i..end].to_string(), true, end));
+                i = end;
+            }
+            b'$' | b';' => return false,
+            _ if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 => {
+                let start = i;
+                while i < bytes.len() && (is_word(bytes[i]) || bytes[i] >= 0x80) {
+                    i += 1;
+                }
+                tokens.push((body[start..i].to_string(), false, i));
+            }
+            _ => i += 1,
+        }
+    }
+    // The names the body binds: each FROM / JOIN item's name and alias.
+    let mut bound: Vec<String> = Vec::new();
+    for (k, (word, quoted, _)) in tokens.iter().enumerate() {
+        if !quoted && (word.eq_ignore_ascii_case("FROM") || word.eq_ignore_ascii_case("JOIN")) {
+            if let Some((name, _, _)) = tokens.get(k + 1) {
+                bound.push(name.trim_matches('"').to_ascii_lowercase());
+                let mut j = k + 2;
+                if tokens.get(j).is_some_and(|(w, q, _)| !q && w.eq_ignore_ascii_case("AS")) {
+                    j += 1;
+                }
+                if let Some((a, q, _)) = tokens.get(j) {
+                    if *q || !KEYWORDS.iter().any(|kw| kw.eq_ignore_ascii_case(a)) {
+                        bound.push(a.trim_matches('"').to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+    }
+    let binds = |name: &str| {
+        let n = name.trim_matches('"').to_ascii_lowercase();
+        n == alias.to_ascii_lowercase() || bound.contains(&n)
+    };
+    for (word, quoted, end) in &tokens {
+        let next = body[*end..].trim_start();
+        if next.starts_with('(') {
+            // `x IN ('a', 'b')`, a list of values; `IN (SELECT …)` and any
+            // call are not vouched for.
+            let list = next[1..].trim_start().to_ascii_uppercase();
+            if !quoted && word.eq_ignore_ascii_case("IN") && !list.starts_with("SELECT") && !list.starts_with("WITH") {
+                continue;
+            }
+            return false;
+        }
+        // A qualifier: the outer alias or a name the body binds.
+        if next.starts_with('.') {
+            if !binds(word) {
+                return false;
+            }
+            continue;
+        }
+        // A qualified column's name (after a `.`), or a cast's type
+        // (after `::`).
+        let before = body[..*end - word.len()].trim_end();
+        if before.ends_with('.') || before.ends_with("::") {
+            continue;
+        }
+        if *quoted || KEYWORDS.iter().any(|kw| kw.eq_ignore_ascii_case(word)) {
+            continue;
+        }
+        if !binds(word) {
+            return false;
+        }
+    }
+    true
+}
+
 fn reads_only(term: &str, alias: &str) -> bool {
     const WORDS: &[&str] =
         &["AND", "OR", "NOT", "IS", "NULL", "IN", "BETWEEN", "LIKE", "ILIKE", "TRUE", "FALSE", "DISTINCT", "FROM"];
@@ -1693,5 +1805,31 @@ mod unquote_plain_qualified_tests {
         assert_eq!(u(r#"'"d"."id"' || "d"."id""#), r#"'"d"."id"' || d.id"#);
         assert_eq!(u(r#""s"."t"."c" + "denevcloud․erp․x"."c""#), r#""s"."t"."c" + "denevcloud․erp․x".c"#);
         assert_eq!(u("no quotes at all"), "no quotes at all");
+    }
+}
+
+#[cfg(test)]
+mod exists_filter_tests {
+    use super::exists_reads_only;
+
+    /// An EXISTS over the outer item and its own relations filters which
+    /// outer values run; anything it cannot vouch for does not.
+    #[test]
+    fn an_exists_over_its_own_relations_filters() {
+        let tag = "EXISTS (SELECT 1 FROM \"producttags\" AS d0 INNER JOIN \"tags\" AS d1 ON d0.tagsid = d1.id \
+                   WHERE d.id = d0.productsid AND d1.content = 'Realme C53')";
+        assert!(exists_reads_only(tag, "d"));
+        assert!(exists_reads_only("NOT EXISTS (SELECT 1 FROM t x WHERE x.k = d.id AND x.v = '1'::uuid)", "d"));
+        // Another item's column, a call, a nested subquery, a parameter, a
+        // bare word that could be any column.
+        assert!(!exists_reads_only("EXISTS (SELECT 1 FROM t x WHERE x.k = e.id)", "d"));
+        assert!(!exists_reads_only("EXISTS (SELECT 1 FROM t x WHERE x.k = d.id AND random() > 0.5)", "d"));
+        assert!(!exists_reads_only("EXISTS (SELECT 1 FROM t x WHERE x.k IN (SELECT y.k FROM u y))", "d"));
+        // A list of values is as decided as `=`.
+        assert!(exists_reads_only("EXISTS (SELECT 1 FROM t x WHERE x.k = d.id AND x.v IN ('a', 'b'))", "d"));
+        assert!(!exists_reads_only("EXISTS (SELECT 1 FROM t x WHERE x.k = $1)", "d"));
+        assert!(!exists_reads_only("EXISTS (SELECT 1 FROM t x WHERE x.k = id)", "d"));
+        assert!(!exists_reads_only("EXISTS (SELECT 1 FROM t x) OR d.id = 1", "d"));
+        assert!(!exists_reads_only("d.id = 1", "d"));
     }
 }

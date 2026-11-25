@@ -1312,11 +1312,14 @@ impl Session {
                     let cols: Vec<Column> = fields
                         .iter()
                         .map(|f| {
-                            // A time read with its 100 ns digit, as text.
-                            let tick = (f.type_oid == 25)
+                            // A time read with its 100 ns digit, as text;
+                            // a COUNT(DISTINCT …) as SQL Server's int.
+                            let tick = matches!(f.type_oid, 25 | 20)
                                 .then(|| self.ticks.iter().find(|(n, _)| *n == f.name).map(|(_, t)| *t))
-                                .flatten();
+                                .flatten()
+                                .filter(|t| (*t == "int") == (f.type_oid == 20));
                             let ty = match tick {
+                                Some("int") => Some(tds::ColType::Int(4)),
                                 Some("datetimeoffset") => Some(tds::ColType::DateTimeOffset),
                                 Some("time") => Some(tds::ColType::Time),
                                 Some(_) => Some(tds::ColType::DateTime2),
