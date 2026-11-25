@@ -97,6 +97,11 @@ pub struct MsConfig {
     /// 2601, as SQL Server's (a PRIMARY KEY or UNIQUE constraint is 2627),
     /// or 2627 for applications that only test for that one.
     pub unique_index_error: i32,
+    /// `uniqueidentifier` columns a `CREATE TABLE` / `ADD COLUMN` makes
+    /// order as SQL Server's (the engine's `rdb_guid_order`: ORDER BY,
+    /// `<`, `>`, BETWEEN, min/max follow its last six bytes first). Off,
+    /// they order by their bytes, as PostgreSQL's `uuid`.
+    pub guid_order: bool,
 }
 
 pub(crate) struct Shared {

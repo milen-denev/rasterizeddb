@@ -637,6 +637,9 @@ impl Env for Scope<'_> {
     fn user(&self) -> &str {
         &self.s.login.user
     }
+    fn guid_order(&self) -> bool {
+        self.s.shared.config.guid_order
+    }
     fn default_database(&self) -> Option<String> {
         Some(self.s.shared.catalog.default_name().to_string())
     }

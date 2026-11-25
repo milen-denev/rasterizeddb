@@ -218,6 +218,18 @@ not run.
 (`--mssql-unique-index-error 2627` reports those as 2627 for applications
 testing only that number).
 
+**uniqueidentifier orders as SQL Server's**: its last six bytes first,
+then bytes 8-9, 7-6, 5-4 and 3-0, where PostgreSQL's `uuid` orders by its
+bytes. A `uniqueidentifier` column a `CREATE TABLE` or `ADD COLUMN` makes
+takes the engine's `rdb_guid_order` ([collations](collations.md)): `ORDER
+BY`, `<`, `>`, `BETWEEN`, `min`/`max` and window `ORDER BY` follow it
+(keyset paging by a GUID pages as on SQL Server), through a hidden key
+column beside it; equality, joins, keys, foreign keys and indexes stay on
+the column itself. A `DISTINCT` or grouped query ordered by such a column
+still sorts by its bytes. `--mssql-guid-order binary` makes such columns
+order by their bytes instead. Tables made before this build order by bytes
+until made again.
+
 **TRY_CAST / TRY_CONVERT** are NULL where the value's text does not read as
 the type (`pg_input_is_valid`). A value of another type is judged by its
 text: `TRY_CAST(1.5 AS int)` is NULL, where SQL Server answers 1.

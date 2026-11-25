@@ -108,6 +108,11 @@ pub(crate) trait Env {
     fn databases(&self) -> Vec<String> {
         vec![self.database_name().to_string()]
     }
+    /// `uniqueidentifier` columns made here order as SQL Server's
+    /// (`MsConfig::guid_order`).
+    fn guid_order(&self) -> bool {
+        false
+    }
     /// The catalogue's default database: SQL Server's `master` here.
     fn default_database(&self) -> Option<String> {
         None
@@ -3832,6 +3837,11 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<String, TsqlError> {
                 )));
             }
         }
+    }
+    // A `uniqueidentifier` orders as SQL Server's does (its last six bytes
+    // first): the engine's `rdb_guid_order` (`MsConfig::guid_order`).
+    if cx.collations && cx.env.guid_order() && ty == "uuid" {
+        attrs.insert(0, format!("COLLATE {}", crate::core::rql::collation::GUID_NAME));
     }
     // SQL Server's default collation compares text without case: a text
     // column that names no collation is given the engine's.

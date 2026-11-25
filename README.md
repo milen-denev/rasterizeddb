@@ -193,6 +193,7 @@ A MySQL "database" and a SQL Server database are the engine's databases;
 | `--mysql-socket-auth`, `--mssql-socket-auth` | the TCP method | Authentication on the socket |
 | `--mysql-tls`, `--mssql-tls` | `prefer` | `disable`, `prefer` or `require` |
 | `--mssql-collation` | `ci` | Text columns made over the SQL Server protocol: `ci` case-insensitive (SQL Server's default), `bin` by their bytes |
+| `--mssql-guid-order` | `sqlserver` | `uniqueidentifier` columns made over the SQL Server protocol: `sqlserver` orders them as SQL Server (last six bytes first; a hidden key column each), `binary` by their bytes |
 | `--mssql-unique-index-error` | `2601` | Error number for a duplicate in a unique index over the SQL Server protocol: `2601` (SQL Server's) or `2627` (what PRIMARY KEY/UNIQUE constraints report) |
 | `--mysql-cert`/`--mysql-key`, `--mssql-cert`/`--mssql-key` | `--pg-cert`/`--pg-key`, else self-signed | TLS certificate |
 

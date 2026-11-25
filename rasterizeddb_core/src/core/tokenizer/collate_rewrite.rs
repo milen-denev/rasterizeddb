@@ -27,7 +27,7 @@ use crate::core::row::schema::SchemaField;
 /// The clause with each comparison over a nondeterministic column on its
 /// key; unchanged when the table has none.
 pub(crate) fn rewrite(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Result<String, String> {
-    if !collation::any(schema) {
+    if !collation::any_order(schema) {
         return Ok(clause.to_string());
     }
     rewrite_with(clause, schema)
@@ -152,6 +152,8 @@ fn window_body(body: &str, columns: &dyn Columns) -> Option<String> {
             let key_end = item.find(char::is_whitespace).unwrap_or(item.len());
             let (key, rest) = item.split_at(key_end);
             match columns.ci(key) {
+                // A `uuid` in SQL Server's order partitions by its value.
+                Some((_, strength)) if strength.orders_only() && is_partition => items.push(item.to_string()),
                 Some((companion, _)) => {
                     changed = true;
                     if is_partition {
@@ -415,7 +417,14 @@ fn comparison(toks: &[Tok], schema: &dyn Columns) -> Result<Vec<String>, String>
         }
         return Ok(render(toks));
     }
-    if op == "~" || op == "similar" {
+    // A `uuid` in SQL Server's order changes only what orders it: its
+    // equality, IN, DISTINCT FROM stay on the column (and its index).
+    let orders_only = l.as_ref().or(r.as_ref()).is_some_and(|(_, s)| s.orders_only());
+    if orders_only {
+        if !matches!(op.as_str(), "<" | "<=" | ">" | ">=" | "between") {
+            return Ok(render(toks));
+        }
+    } else if op == "~" || op == "similar" {
         return Err(regex_refused());
     }
     let mut out = Vec::new();
@@ -553,6 +562,8 @@ mod tests {
             ("__ci_name", DbType::STRING),
             ("tag", DbType::STRING),
             ("__cia_tag", DbType::STRING),
+            ("g", DbType::UUID),
+            ("__gs_g", DbType::STRING),
         ]
         .into_iter()
         .enumerate()
@@ -578,6 +589,21 @@ mod tests {
         assert_eq!(r("name IS NOT DISTINCT FROM 'X'"), "__ci_name IS NOT DISTINCT FROM 'x'");
         assert_eq!(r("name IS NULL"), "name IS NULL");
         assert_eq!(r("upper(name) = 'BOB'"), "upper ( name ) = 'BOB'");
+    }
+
+    /// A `uuid` in SQL Server's order is keyed only where it is ordered:
+    /// its equality stays on the column (and its index).
+    #[test]
+    fn a_guid_order_keys_only_ordering_comparisons() {
+        let k = |t: &str| collation::key(t, Strength::GuidOrder);
+        let a = "01000000-0000-0000-0000-000000000000";
+        assert_eq!(r(&format!("g = '{a}'")), format!("g = '{a}'"));
+        assert_eq!(r(&format!("g IN ('{a}', $1)")), format!("g IN ( '{a}' , $1 )"));
+        assert_eq!(r("g <> $1"), "g <> $1");
+        assert_eq!(r(&format!("g > '{a}'")), format!("__gs_g > '{}'", k(a)));
+        assert_eq!(r("t.g <= $2"), "t.__gs_g <= __rdb_guid_key( $2 )");
+        assert_eq!(r(&format!("g BETWEEN '{a}' AND $1")), format!("__gs_g BETWEEN '{}' AND __rdb_guid_key( $1 )", k(a)));
+        assert_eq!(r("g IS NULL"), "g IS NULL");
     }
 
     #[test]

@@ -701,7 +701,7 @@ async fn relation_columns(
             .iter()
             .map(|f| {
                 let (f, fields) = (f.as_ref()?, source.as_deref()?);
-                let strength = crate::core::rql::collation::of(&f.name, fields);
+                let strength = crate::core::rql::collation::order_of(&f.name, fields);
                 (!strength.is_binary()).then(|| strength.name())
             })
             .collect()

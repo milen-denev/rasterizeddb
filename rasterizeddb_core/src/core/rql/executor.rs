@@ -20037,7 +20037,8 @@ async fn execute_create_index(sql: &str, database: &Arc<Database>) -> Vec<u8> {
                 // calls equal and ordered (`collation`). Not a full-text
                 // index, whose lexemes have no case.
                 Some(f) => match crate::core::rql::collation::companion(&f.name, &table.schema.fields) {
-                    Some((key, _)) if !statement.method.is_some_and(|m| m.is_gin()) => {
+                    // A `uuid` in SQL Server's order is found by its value.
+                    Some((key, strength)) if !strength.orders_only() && !statement.method.is_some_and(|m| m.is_gin()) => {
                         columns.push(key.write_order as u32);
                         types.push(key.db_type.clone());
                     }

@@ -3721,7 +3721,7 @@ pub fn plan(
     let mut group_by_clause = group_by_clause;
     let mut select_list = select_list;
     let mut order_by = order_by;
-    if schemas.iter().any(|s| crate::core::rql::collation::any(s)) {
+    if schemas.iter().any(|s| crate::core::rql::collation::any_order(s)) {
         let labelled: Vec<(String, SmallVec<[SchemaField; 20]>)> =
             relations.iter().zip(&schemas).map(|(r, s)| (r.label.clone(), s.clone())).collect();
         let columns = crate::core::tokenizer::collate_rewrite::Relations(
@@ -3732,6 +3732,9 @@ pub fn plan(
             let Some(j) = r.join.as_mut() else { continue };
             if !j.left_qualified.is_empty() {
                 match (columns.ci(&j.left_qualified), columns.ci(&j.right_qualified)) {
+                    // `uuid`s in SQL Server's order join on their values.
+                    (Some((_, a)), Some((_, b))) if a == b && a.orders_only() => {}
+                    (Some((_, a)), None) | (None, Some((_, a))) if a.orders_only() => {}
                     (Some((l, a)), Some((rr, b))) if a == b => {
                         j.left_qualified = l;
                         j.right_qualified = rr;
@@ -3758,7 +3761,9 @@ pub fn plan(
                 let (expr, _) = split_expr_alias(item.trim());
                 is_column_reference(expr)
             })
-            && split_top_level(list).iter().any(|item| columns.ci(split_expr_alias(item.trim()).0).is_some())
+            && split_top_level(list)
+                .iter()
+                .any(|item| columns.ci(split_expr_alias(item.trim()).0).is_some_and(|(_, s)| !s.orders_only()))
         {
             ci_group = split_top_level(list)
                 .iter()
@@ -6034,7 +6039,7 @@ fn build_aggregate_stage(
             if !item.reads_column() {
                 return None;
             }
-            Some(crate::core::rql::collation::of(&item.field.name, schemas.get(item.rel)?)).filter(|s| !s.is_binary())
+            Some(crate::core::rql::collation::order_of(&item.field.name, schemas.get(item.rel)?)).filter(|s| !s.is_binary())
         };
         let mark = |call: &mut Option<Box<crate::core::rql::aggregate::AggCall>>, strength| {
             if let Some(strength) = strength {

@@ -86,6 +86,7 @@ fn start_config(case_insensitive: bool, unique_index_error: i32) -> Servers {
                     // case-insensitive default.
                     case_insensitive,
                     unique_index_error,
+                    guid_order: case_insensitive,
                 };
                 let listener = rasterizeddb_core::mssql::bind(config).await.unwrap();
                 let port = listener.local_addr().unwrap().port();
@@ -1574,4 +1575,64 @@ async fn tiberius_information_schema_columns() {
     assert_eq!(r[0][0].get::<&str, _>(0).map(str::len), Some(30));
     assert_eq!(r[0][0].get::<&str, _>(1).map(str::len), Some(30));
     assert_eq!(r[0][0].get::<&str, _>(2).map(str::len), Some(40));
+}
+
+/// A `uniqueidentifier` orders as SQL Server's: its last six bytes first,
+/// then bytes 8-9, 7-6, 5-4, 3-0 (`--mssql-guid-order sqlserver`). It
+/// ordered by its bytes, and ORDER BY, keyset paging, min/max came out in
+/// another order than SQL Server's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_guid_order() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    // In SQL Server's order: b < c < a < d (byte 10 outranks byte 15, which
+    // outranks byte 9, which outranks byte 0).
+    let (a, b, cc, d) = (
+        "00000000-0000-0000-0000-000000000001",
+        "01000000-0000-0000-0000-000000000000",
+        "00000000-0000-0000-0001-000000000000",
+        "00000000-0000-0000-0000-010000000000",
+    );
+    batch(
+        &mut c,
+        &format!(
+            "CREATE TABLE [G] ([Id] uniqueidentifier NOT NULL PRIMARY KEY, [ParentId] uniqueidentifier NULL, [N] int NOT NULL); \
+             CREATE INDEX [IX_G_ParentId] ON [G] ([ParentId]); \
+             INSERT INTO [G] VALUES ('{a}', NULL, 1), ('{b}', '{a}', 2), ('{cc}', '{a}', 3), ('{d}', NULL, 4)"
+        ),
+    )
+    .await
+    .unwrap();
+    let order = |r: &[tiberius::Row]| int(r);
+    let r = batch(&mut c, "SELECT [N] FROM [G] ORDER BY [Id]").await.unwrap();
+    assert_eq!(order(&r[0]), [2, 3, 1, 4]);
+    let r = batch(&mut c, "SELECT [N] FROM [G] ORDER BY [Id] DESC").await.unwrap();
+    assert_eq!(order(&r[0]), [4, 1, 3, 2]);
+    // Keyset paging: the page after b.
+    let r = c
+        .query("SELECT TOP 2 [N] FROM [G] WHERE [Id] > @P1 ORDER BY [Id]", &[&uuid::Uuid::parse_str(b).unwrap()])
+        .await
+        .unwrap()
+        .into_first_result()
+        .await
+        .unwrap();
+    assert_eq!(order(&r), [3, 1]);
+    let r = batch(&mut c, &format!("SELECT [N] FROM [G] WHERE [Id] BETWEEN '{cc}' AND '{d}' ORDER BY [Id]")).await.unwrap();
+    assert_eq!(order(&r[0]), [3, 1, 4]);
+    let r = batch(&mut c, "SELECT CAST(MIN([Id]) AS nvarchar(36)), CAST(MAX([Id]) AS nvarchar(36)) FROM [G]").await.unwrap();
+    assert_eq!(r[0][0].get::<&str, _>(0), Some(b));
+    assert_eq!(r[0][0].get::<&str, _>(1), Some(d));
+    // Equality, joins, foreign-key shapes and SELECT * are the value's.
+    let r = batch(&mut c, &format!("SELECT [N] FROM [G] WHERE [Id] = '{cc}'; SELECT [N] FROM [G] WHERE [ParentId] = '{a}' ORDER BY [Id]")).await.unwrap();
+    assert_eq!(order(&r[0]), [3]);
+    assert_eq!(order(&r[1]), [2, 3]);
+    let r = batch(&mut c, "SELECT k.[N] FROM [G] k JOIN [G] p ON k.[ParentId] = p.[Id] ORDER BY k.[Id] DESC").await.unwrap();
+    assert_eq!(order(&r[0]), [3, 2]);
+    let mut q = c.simple_query("SELECT * FROM [G]").await.unwrap();
+    let cols: Vec<String> = q.columns().await.unwrap().unwrap_or_default().iter().map(|c| c.name().to_string()).collect();
+    q.into_results().await.unwrap();
+    assert_eq!(cols, ["Id", "ParentId", "N"]);
+    let e = batch(&mut c, &format!("INSERT INTO [G] VALUES ('{a}', NULL, 9)")).await.err().expect("a duplicate");
+    let tiberius::error::Error::Server(t) = &e else { panic!("{e}") };
+    assert_eq!(t.code(), 2627, "{e}");
 }

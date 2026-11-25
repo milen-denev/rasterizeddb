@@ -2191,7 +2191,7 @@ fn parse_select_query(
 
     // A window over a column with a nondeterministic collation partitions
     // and sorts by its key (`collate_rewrite::rewrite_windows`).
-    let windowed_ci = if crate::core::rql::collation::any(schema) {
+    let windowed_ci = if crate::core::rql::collation::any_order(schema) {
         crate::core::tokenizer::collate_rewrite::rewrite_windows(columns_part, schema)
     } else {
         None

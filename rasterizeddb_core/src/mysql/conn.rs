@@ -2627,7 +2627,7 @@ impl Session {
                 ""
             };
             let collation = match crate::core::rql::collation::of(&column, &schema.fields) {
-                crate::core::rql::collation::Strength::Binary => "utf8mb4_bin",
+                crate::core::rql::collation::Strength::Binary | crate::core::rql::collation::Strength::GuidOrder => "utf8mb4_bin",
                 crate::core::rql::collation::Strength::CaseInsensitive => "utf8mb4_0900_as_ci",
                 crate::core::rql::collation::Strength::CaseAccentInsensitive => "utf8mb4_0900_ai_ci",
             };

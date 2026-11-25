@@ -412,6 +412,9 @@ pub enum TextFunc {
     /// read; `CiAiKey` for case and accents.
     CiKey,
     CiAiKey,
+    /// `__rdb_guid_key(uuid)`: a `uuid`'s key in SQL Server's order
+    /// (`collation::Strength::GuidOrder`).
+    GuidKey,
     /// `date_trunc('minute', ts)` — an instant floored to a unit.
     DateTrunc,
     /// `to_tsvector(config, document)` — a document reduced to its lexemes.
@@ -2064,7 +2067,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                     blank_pad_text_branches(args.iter_mut());
                     Ok(Expr::Greatest(args))
                 }
-                "QUOTE_IDENT" | "LOWER" | "UPPER" | "__RDB_CI_KEY" | "__RDB_CI_AI_KEY" => {
+                "QUOTE_IDENT" | "LOWER" | "UPPER" | "__RDB_CI_KEY" | "__RDB_CI_AI_KEY" | "__RDB_GUID_KEY" => {
                     if args.len() != 1 {
                         return Err(format!("{} takes exactly one argument", upper_name));
                     }
@@ -2115,6 +2118,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         "LOWER" => TextFunc::Lower,
                         "__RDB_CI_KEY" => TextFunc::CiKey,
                         "__RDB_CI_AI_KEY" => TextFunc::CiAiKey,
+                        "__RDB_GUID_KEY" => TextFunc::GuidKey,
                         _ => TextFunc::Upper,
                     };
                     Ok(Expr::Call(func, args))
@@ -4636,6 +4640,7 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             | TextFunc::Upper
             | TextFunc::CiKey
             | TextFunc::CiAiKey
+            | TextFunc::GuidKey
             | TextFunc::QuoteIdent
             | TextFunc::ToTsVector
             | TextFunc::ToTsQuery
@@ -4868,6 +4873,10 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
         TextFunc::CiAiKey => string(crate::core::rql::collation::key(
             &as_text(&args[0]),
             crate::core::rql::collation::Strength::CaseAccentInsensitive,
+        )),
+        TextFunc::GuidKey => string(crate::core::rql::collation::key(
+            &as_text(&args[0]),
+            crate::core::rql::collation::Strength::GuidOrder,
         )),
         TextFunc::Upper => string(crate::core::rql::pg_functions::pg_upper(&as_text(&args[0]))),
 

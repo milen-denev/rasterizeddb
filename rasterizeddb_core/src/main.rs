@@ -696,6 +696,14 @@ struct Args {
     #[arg(long = "mssql-unique-index-error", default_value_t = 2601)]
     mssql_unique_index_error: i32,
 
+    /// How `uniqueidentifier` columns made over the SQL Server protocol
+    /// order: `sqlserver` (its last six bytes first, as SQL Server sorts
+    /// them; each such column keeps a hidden key column) or `binary` (by
+    /// their bytes, as PostgreSQL's `uuid`).
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-guid-order", default_value = "sqlserver")]
+    mssql_guid_order: String,
+
     /// PEM certificate chain for the SQL Server listener (default:
     /// `--pg-cert`, else a self-signed one made at start-up).
     #[cfg(feature = "mssql_wire")]
@@ -1358,6 +1366,11 @@ fn mssql_config(args: &Args) -> Result<Option<rasterizeddb_core::mssql::MsConfig
     Ok(Some(MsConfig {
         case_insensitive,
         unique_index_error: args.mssql_unique_index_error,
+        guid_order: match args.mssql_guid_order.to_ascii_lowercase().as_str() {
+            "sqlserver" => true,
+            "binary" => false,
+            other => return Err(format!("unknown --mssql-guid-order {other:?}: expected sqlserver or binary")),
+        },
         tcp: args.mssql_port.map(|port| (args.mssql_addr.clone(), port)),
         socket,
         auth,
