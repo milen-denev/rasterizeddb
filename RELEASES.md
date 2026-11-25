@@ -4,6 +4,7 @@
 
 ### Silent wrong answers fixed
 
+- SQL Server front end: rows written with their own identity values (`SET IDENTITY_INSERT`, EF Core seeding, SqlBulkCopy `KeepIdentity`) left the identity counter where it was, so the next generated id collided with a copied row. The counter now moves past the largest value written. SqlBulkCopy without `KeepIdentity` stored the source's ids; the identity column is now generated, as SQL Server does.
 - `ALTER TABLE … ADD COLUMN … COMPRESSION zstd(…)` was accepted and ignored: the column stored its values uncompressed. A `DEFAULT` written before the clause also took it into its expression. Both now take effect, on an empty table and on one with rows.
 - A derived table, a CTE, or the outer copy a correlated subquery reads, made from a case-insensitive column, compared that column's bytes: `SELECT (SELECT …) FROM t d WHERE d.slang = 'SEED0-SLANG'` dropped the row holding `'Seed0-Slang'`, with no error.
 
@@ -21,6 +22,7 @@
 
 ### Crashes fixed
 
+- `DROP TABLE` of a SQL Server table whose name holds dots, and six other places that compared a keyword at the end of a name, panicked inside a multibyte character.
 - A join over text ending in a multibyte character (`'…ЩЕ'`) panicked the statement's handler and closed the connection.
 - Over the SQL Server protocol, a bound `SELECT` holding a correlated subquery with a `JOIN` was described as returning no rows, and SqlClient lost the connection when rows came.
 
@@ -30,6 +32,7 @@
 
 ### New features
 
+- SQL Server front end: tables, columns, constraints, indexes and databases show the names they were declared with, and catalogue lookups ignore case (SqlBulkCopy maps columns by exact name). Constraint violations read as SQL Server words them, numbered 547, 2627, and 2601 for a unique index (`--mssql-unique-index-error 2601|2627`). `TRY_CAST`/`TRY_CONVERT` return NULL where the conversion fails, through the engine's new `pg_input_is_valid(text, type)`. `EXEC sp_rdb_record_names @script = N'…'` records the declared names an EF Core script would make, for databases created before names were recorded.
 - rdb_studio: compression. The column list tags compressed columns, the table pane summarises what compression asks and achieves (raw against stored bytes), the column dialogs take a compression method, and a table's row compression and `RECOMPRESS` are a button away.
 - SQL Server front end: EF Core 10 runs unchanged, its Identity schema, migrations and `__EFMigrationsLock` included. Added: `CROSS/OUTER APPLY`, `TOP` in a derived table, a unique index filtered by `key IS NOT NULL`, `sp_getapplock`/`sp_releaseapplock`/`APPLOCK_TEST`, `sp_rename … 'INDEX'`, `ALTER DATABASE … SET SINGLE_USER`, and bracketed table names holding dots (`[dbo].[DenevCloud.ERP.Colors]`). Database names are matched without case, and a pooled connection's reset goes back to the login's database.
 - Case-insensitive text columns (the engine's `rdb_ci` collation) group, deduplicate, join, sort in windows, and take `min`/`max`, foreign keys, `ALTER TABLE ADD COLUMN` and `ALTER COLUMN TYPE` by key.
