@@ -1077,6 +1077,7 @@ pub fn read_reservation(status_path: &Path) -> Option<TxId> {
 /// Monotonic in every path: each write carries a larger value than the last,
 /// replay applies records in order, and a log is replayed and emptied at open
 /// before the mark is read.
+#[derive(Clone)]
 pub struct IdReservation {
     /// `None` for an in-memory log: nothing outlives the process.
     path: Option<PathBuf>,
@@ -1153,6 +1154,24 @@ impl IdReservation {
         self.path.as_deref()
     }
 
+    /// Ids per raise.
+    pub fn block(&self) -> u64 {
+        self.block
+    }
+
+    /// Persists `mark` (see [`Self::cover`]); the in-memory mark is not
+    /// changed: [`Self::raised_to`] does that once the write is durable.
+    pub fn write_mark(&self, mark: TxId, log: Option<&std::sync::Arc<Wal>>) -> io::Result<()> {
+        self.write(mark, log)
+    }
+
+    /// Records that `mark` is durable: ids below it may be handed out.
+    pub fn raised_to(&mut self, mark: TxId) {
+        if mark > self.reserved {
+            self.reserved = mark;
+        }
+    }
+
     #[cfg(test)]
     pub fn set_block(&mut self, ids: u64) {
         self.block = ids.max(1);
@@ -1168,13 +1187,20 @@ impl IdReservation {
     /// mark, hands the id out again, and its new owner would adopt the rows.
     /// The next `begin` past the mark tries again.
     pub fn cover(&mut self, id: TxId, log: Option<&std::sync::Arc<Wal>>) -> io::Result<()> {
+        self.cover_via(id, |r, mark| r.write(mark, log).map(|()| mark))
+    }
+
+    /// [`Self::cover`] with the write made by `write`, which persists at
+    /// least the mark it is given and returns the mark now on disk (higher
+    /// when an earlier raise already wrote past it).
+    pub fn cover_via(&mut self, id: TxId, write: impl FnOnce(&IdReservation, TxId) -> io::Result<TxId>) -> io::Result<()> {
         if id < self.reserved {
             return Ok(());
         }
         let mark = id.saturating_add(self.block);
-        match self.write(mark, log) {
-            Ok(()) => {
-                self.reserved = mark;
+        match write(self, mark) {
+            Ok(durable) => {
+                self.reserved = durable.max(mark);
                 if self.failing {
                     log::info!("transaction id reservation is being written again");
                     self.failing = false;
@@ -1200,6 +1226,8 @@ impl IdReservation {
         let Some(path) = self.path.as_deref() else {
             return Ok(());
         };
+        #[cfg(test)]
+        reservation_test_hooks::wait_if_parked(path);
         #[cfg(test)]
         if reservation_test_hooks::fails(path) {
             // What a full disk answers: ENOSPC on Unix. Built from the kind on
@@ -1272,6 +1300,47 @@ pub(crate) mod reservation_test_hooks {
             return false;
         };
         FAILING.lock().iter().any(|d| d == dir)
+    }
+
+    /// Directories whose reservation writes wait, as a sync on a busy disk
+    /// does, until [`unpark`]; and how many writes are waiting.
+    static PARKED: parking_lot::Mutex<(Vec<PathBuf>, usize)> = parking_lot::Mutex::new((Vec::new(), 0));
+    static PARKED_CHANGED: parking_lot::Condvar = parking_lot::Condvar::new();
+
+    /// Every reservation write in `dir` waits from now until [`unpark`].
+    pub(crate) fn park_in(dir: &Path) {
+        PARKED.lock().0.push(dir.to_path_buf());
+    }
+
+    pub(crate) fn unpark(dir: &Path) {
+        PARKED.lock().0.retain(|d| d != dir);
+        PARKED_CHANGED.notify_all();
+    }
+
+    /// Waits until a write is parked, up to `limit`; whether one is.
+    pub(crate) fn wait_for_parked(limit: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        let mut g = PARKED.lock();
+        while g.1 == 0 {
+            if PARKED_CHANGED.wait_until(&mut g, deadline).timed_out() {
+                return g.1 > 0;
+            }
+        }
+        true
+    }
+
+    pub(super) fn wait_if_parked(path: &Path) {
+        let Some(dir) = path.parent() else { return };
+        let mut g = PARKED.lock();
+        if !g.0.iter().any(|d| d == dir) {
+            return;
+        }
+        g.1 += 1;
+        PARKED_CHANGED.notify_all();
+        while g.0.iter().any(|d| d == dir) {
+            PARKED_CHANGED.wait(&mut g);
+        }
+        g.1 -= 1;
     }
 }
 

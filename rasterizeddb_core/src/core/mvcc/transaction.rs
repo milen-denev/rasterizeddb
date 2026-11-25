@@ -388,6 +388,13 @@ pub struct TransactionManager {
     unreserved_from: AtomicU64,
     /// Why the last raise failed, for the error a refused commit reports.
     reservation_failure: parking_lot::Mutex<Option<ReservationFailure>>,
+    /// The highest mark written durably. Every write of a mark happens
+    /// under it, so marks reach the log in increasing order whichever raise
+    /// (early or exhausted) writes them: replay keeps the last, the highest.
+    reservation_written: parking_lot::Mutex<TxId>,
+    /// An early raise is being written (by the `begin` that started it, after
+    /// it released every lock).
+    reservation_raising: std::sync::atomic::AtomicBool,
     /// Woken when a transaction ends, for a conflict retry waiting on the
     /// transaction it met (slice B6, finding L1; `rql::conflict_wait`).
     /// Signalled only while `end_watchers` is non-zero, so a commit with
@@ -749,6 +756,8 @@ impl TransactionManager {
             settle_window: AtomicU64::new(super::status::DEFAULT_SETTLE_WINDOW),
             settling: std::sync::atomic::AtomicBool::new(false),
             forget: Arc::new(ForgetRegistry::default()),
+            reservation_written: parking_lot::Mutex::new(if reservation.is_durable() { reservation.reserved() } else { 0 }),
+            reservation_raising: std::sync::atomic::AtomicBool::new(false),
             reservation: parking_lot::Mutex::new(reservation),
             unreserved_from: AtomicU64::new(unreserved_from),
             reservation_failure: parking_lot::Mutex::new(failure),
@@ -1287,7 +1296,40 @@ impl TransactionManager {
     /// same critical section — so no observer of `inner` can see an
     /// autocommit transaction running but not yet statement-scoped, and the
     /// begin takes the write lock once rather than twice.
+    /// Writes a reservation mark of at least `target` durably, in mark
+    /// order with every other raise; returns the mark on disk.
+    fn write_reservation(&self, writer: &IdReservation, target: TxId) -> std::io::Result<TxId> {
+        let mut written = self.reservation_written.lock();
+        if *written >= target {
+            return Ok(*written);
+        }
+        writer.write_mark(target, self.status.wal().as_ref())?;
+        *written = target;
+        Ok(target)
+    }
+
+    /// Raises the reservation a block past the current mark, with no lock a
+    /// `begin` needs held: started once half a block is left, so the sync
+    /// lands before the ids run out and no `begin` waits on the disk. A
+    /// failure leaves the mark where it is; the `begin` that reaches it
+    /// raises it itself, and reports.
+    fn raise_reservation_early(&self, writer: IdReservation) {
+        let target = writer.reserved().saturating_add(writer.block());
+        if let Ok(mark) = self.write_reservation(&writer, target) {
+            self.reservation.lock().raised_to(mark);
+        }
+        self.reservation_raising.store(false, Ordering::Release);
+    }
+
     fn begin_inner(&self, statement_scoped: bool, owner_only: bool) -> TxId {
+        let (id, early) = self.begin_locked(statement_scoped, owner_only);
+        if let Some(writer) = early {
+            self.raise_reservation_early(writer);
+        }
+        id
+    }
+
+    fn begin_locked(&self, statement_scoped: bool, owner_only: bool) -> (TxId, Option<IdReservation>) {
         let mut in_place = lock(&self.in_place);
         while *in_place > 0 {
             in_place = self
@@ -1308,10 +1350,19 @@ impl TransactionManager {
         let next = self.next_id.load(Ordering::Acquire);
         if next >= reservation.reserved() {
             // Retried by every `begin` while it fails: the mark stays below
-            // `next` until one succeeds.
-            let covered = reservation.cover(next, self.status.wal().as_ref());
+            // `next` until one succeeds. Only here does a `begin` wait on the
+            // disk: when an early raise did not land in time, or failed.
+            let covered = reservation.cover_via(next, |r, mark| self.write_reservation(r, mark));
             self.note_reservation(&reservation, covered);
         }
+        // Fewer than half a block left once this id is out: this `begin`
+        // raises the mark after it has let go of every lock (one at a time;
+        // not while raising fails, which the path above owns).
+        let early = (reservation.is_durable()
+            && reservation.reserved().saturating_sub(next + 1) < reservation.block() / 2
+            && self.unreserved_from.load(Ordering::Acquire) == TxId::MAX
+            && !self.reservation_raising.swap(true, Ordering::AcqRel))
+        .then(|| reservation.clone());
 
         let mut inner = self.inner.write();
         let id = inner.next_id;
@@ -1326,7 +1377,7 @@ impl TransactionManager {
         }
         self.next_id.store(inner.next_id, Ordering::Release);
         self.status.record(id, TxOutcome::InProgress);
-        id
+        (id, early)
     }
 
     /// Running transactions that are not statement-scoped. Test-only: the
@@ -2466,9 +2517,11 @@ mod id_reservation {
         let path = status_path(dir.path());
         let m = TransactionManager::new(StatusLog::open(&path).expect("open"));
         m.set_reservation_block(8);
-        // Use up the block the open reserved at full size.
         assert!(read_reservation(&path).expect("reserved at open") > m.next_id());
-        while m.next_id() < m.reserved_ids_below() {
+        // Use up the block the open reserved at full size, down to one
+        // small block (the mark is raised early from there on, so it is
+        // never reached).
+        while m.reserved_ids_below() - m.next_id() > 8 {
             let id = m.begin();
             m.abort(id);
         }
@@ -2546,6 +2599,145 @@ mod id_reservation {
                 }
             }
         }
+    }
+
+    /// The mark is raised early, by the `begin` that leaves half a block,
+    /// after it lets go of the locks: no `begin` finds the ids used up and
+    /// waits on the disk with every other `begin` queued behind it (a shard
+    /// stopped for seconds whenever that sync was slow).
+    #[test]
+    fn the_mark_stays_half_a_block_ahead() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = status_path(dir.path());
+        let m = TransactionManager::new(StatusLog::open(&path).expect("open"));
+        m.set_reservation_block(8);
+        // Use up the block the open reserved at full size, down to one
+        // small block (the mark is raised early from there on, so it is
+        // never reached).
+        while m.reserved_ids_below() - m.next_id() > 8 {
+            let id = m.begin();
+            m.abort(id);
+        }
+        for _ in 0..200 {
+            let id = m.begin();
+            let mark = read_reservation(&path).expect("a valid mark");
+            assert!(id < mark, "id {id} was handed out with only {mark} reserved on disk");
+            assert!(mark - m.next_id() >= 4, "only {} ids left below the mark {mark}", mark - m.next_id());
+            m.abort(id);
+        }
+    }
+
+    /// A reservation sync that hangs (a busy disk) holds up only the `begin`
+    /// that started it. Before, `begin` wrote and synced the next block
+    /// while holding the lock every `begin` takes, so one slow sync stopped
+    /// every statement on the node for as long as it took.
+    #[test]
+    fn a_slow_reservation_sync_does_not_stop_other_begins() {
+        use crate::core::mvcc::status::reservation_test_hooks as hooks;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = status_path(dir.path());
+        let m = Arc::new(TransactionManager::new(StatusLog::open(&path).expect("open")));
+        m.set_reservation_block(8);
+        while m.reserved_ids_below() - m.next_id() > 8 {
+            let id = m.begin();
+            m.abort(id);
+        }
+        hooks::park_in(dir.path());
+        // Begins until one of them is stuck in a reservation write.
+        let raiser = {
+            let m = m.clone();
+            std::thread::spawn(move || {
+                for _ in 0..64 {
+                    let id = m.begin();
+                    m.abort(id);
+                }
+            })
+        };
+        assert!(hooks::wait_for_parked(Duration::from_secs(10)), "no reservation write was made");
+        // Another begin, while that sync hangs.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = {
+            let m = m.clone();
+            std::thread::spawn(move || {
+                let id = m.begin();
+                let _ = tx.send(id);
+                m.abort(id);
+            })
+        };
+        let got = rx.recv_timeout(Duration::from_secs(5));
+        hooks::unpark(dir.path());
+        other.join().expect("the other begin");
+        raiser.join().expect("the raising begins");
+        let id = got.expect("a begin waited on another begin's reservation sync");
+        assert!(id < read_reservation(&path).expect("a valid mark"), "id {id} is not reserved on disk");
+    }
+
+    /// An early raise that fails (a full disk) leaves the mark where it was,
+    /// in memory and on disk, and does not switch early raises off: once
+    /// the disk takes writes again, the next `begin` raises it.
+    #[test]
+    fn a_failed_early_raise_moves_nothing_and_is_retried() {
+        use crate::core::mvcc::status::reservation_test_hooks as hooks;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = status_path(dir.path());
+        let m = TransactionManager::new(StatusLog::open(&path).expect("open"));
+        m.set_reservation_block(8);
+        while m.reserved_ids_below() - m.next_id() > 8 {
+            let id = m.begin();
+            m.abort(id);
+        }
+        let mark = read_reservation(&path).expect("a valid mark");
+        assert_eq!(m.reserved_ids_below(), mark);
+        hooks::fail_in(dir.path());
+        // Down to one id left: every one of these begins tried an early
+        // raise, and each failed.
+        while m.reserved_ids_below() - m.next_id() > 1 {
+            let id = m.begin();
+            assert!(id < mark, "id {id} handed out past the durable mark {mark}");
+            m.abort(id);
+        }
+        assert_eq!(read_reservation(&path).expect("a valid mark"), mark, "a failed raise moved the mark on disk");
+        assert_eq!(m.reserved_ids_below(), mark, "a failed raise moved the mark in memory");
+        hooks::heal(dir.path());
+        let id = m.begin();
+        m.abort(id);
+        let raised = read_reservation(&path).expect("a valid mark");
+        assert!(raised > mark, "no raise after the disk healed: the mark stayed {raised}");
+        assert_eq!(m.reserved_ids_below(), raised);
+        assert!(id < raised);
+    }
+
+    /// A stop after an early raise's write and before anything else: the
+    /// next run resumes at or above the highest mark the log holds, past
+    /// every id the last run handed out.
+    #[test]
+    fn a_stop_after_an_early_raise_resumes_past_its_mark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = status_path(dir.path());
+        let mut issued = Vec::new();
+        let mark;
+        {
+            let m = TransactionManager::new(StatusLog::open(&path).expect("open"));
+            m.set_reservation_block(8);
+            while m.reserved_ids_below() - m.next_id() > 8 {
+                let id = m.begin();
+                m.abort(id);
+            }
+            let before = read_reservation(&path).expect("a valid mark");
+            // Until an early raise has written a higher mark; the ids stay
+            // open, as a run stopped mid-statement leaves them.
+            while read_reservation(&path).expect("a valid mark") == before {
+                issued.push(m.begin());
+            }
+            mark = read_reservation(&path).expect("a valid mark");
+            assert!(issued.iter().all(|id| *id < mark));
+        }
+        let m = TransactionManager::new(StatusLog::open(&path).expect("reopen"));
+        let next = m.begin();
+        let highest = *issued.iter().max().expect("ids were issued");
+        assert!(next >= mark, "resumed at {next}, below the mark {mark} the log holds");
+        assert!(next > highest, "id {next} reissued (had {highest})");
     }
 
     /// Concurrent `begin`s never share an id and never get ahead of the mark.

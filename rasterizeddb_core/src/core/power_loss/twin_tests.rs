@@ -1196,7 +1196,7 @@ async fn reservation_run(run_seed: u64, seeds: u64) -> ReservationTally {
     // The open reserved a full block. Used up, so every mark from here on is
     // a small block above the last and the workload crosses many.
     db.transactions.set_reservation_block(RESERVATION_BLOCK);
-    while db.transactions.next_id() < db.transactions.reserved_ids_below() {
+    while db.transactions.reserved_ids_below() - db.transactions.next_id() > RESERVATION_BLOCK {
         let id = db.transactions.begin();
         db.abort_transaction(id);
     }
