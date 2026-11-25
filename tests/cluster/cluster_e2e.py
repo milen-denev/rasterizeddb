@@ -27,6 +27,9 @@ FE_PG, FE_MY, FE_RDB = BASE + 40, BASE + 41, BASE + 42  # the front-end node (B4
 CLUSTER = "0123456789abcdef0123456789abcdef"
 BLOCKS = 1 << 48
 ENV = dict(os.environ, PGPASSWORD="pw", PGSSLMODE="prefer")
+# Every link compressed (gateway to shards, shard to shard), with a low
+# threshold so nearly every frame is.
+COMPRESS = os.environ.get("CLUSTER_COMPRESSION") == "1"
 procs = {}
 failures = 0
 
@@ -69,7 +72,8 @@ def start_shard(n, tls, cmap):
          "--rdb-port", str(RDB[n]), "--role", "shard", "--cluster-map", cmap, "--shard-id", str(n),
          "--cluster-id", CLUSTER, "--shard-listen", f"127.0.0.1:{RSHARD[n]}",
          "--shard-cert", f"{tls}/shard{n}.pem", "--shard-key", f"{tls}/shard{n}.key",
-         "--gateway-ca", f"{tls}/ca.pem", "--peer-ca", f"{tls}/ca.pem", "--log-level", "info"],
+         "--gateway-ca", f"{tls}/ca.pem", "--peer-ca", f"{tls}/ca.pem", "--log-level", "info"]
+        + (["--shard-peer-compression", "zstd:3"] if COMPRESS else []),
         stdout=log, stderr=log)
 
 
@@ -87,7 +91,7 @@ auth = scram
 unrouted = fan_out
 two_phase = on
 retries = 10
-""")
+""" + ("shard_compression = zstd:3\nshard_compression_min_bytes = 64\n" if COMPRESS else ""))
     log = open(f"{WORK}/gateway.log", "ab")
     procs["gateway"] = subprocess.Popen([GATEWAY, "--config", conf], stdout=log, stderr=log)
 
@@ -555,6 +559,11 @@ def main():
     check("after the restart every row is there", psql(GW, "SELECT count(*) FROM orders") == (0, str(rows + 2)),
           psql(GW, "SELECT count(*) FROM orders"))
 
+    if COMPRESS:
+        rows_ = dict(l.split("|", 1) for l in psql(GW, "SHOW GATEWAY")[1].splitlines() if "|" in l)
+        check("the links to the shards are compressed",
+              int(rows_.get("shard_frames_compressed_in", "0")) > 0 and int(rows_.get("shard_compression_saved_bytes", "0")) > 0,
+              {k: v for k, v in rows_.items() if "compress" in k})
     frontend(tls)
     if RDB_SHARD:
         split_online(tls, cmap)

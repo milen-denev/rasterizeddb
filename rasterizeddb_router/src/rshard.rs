@@ -42,6 +42,7 @@
 //! | 0x08 | Classify | database str, schema_epoch u64, source u8 (0 simple shape, 1 Parse text), text str |
 //! | 0x09 | ExecPart | session u64, map_epoch u64, merge [`Merge`], bytes (pgwire frontend messages) |
 //! | 0x0A | Cancel | backend_key u64 |
+//! | 0x14 | Compression | codec u8 (1 zstd), level i32, min_bytes u32: frames from now on may be [`compressed_frame`]s |
 //! | 0x13 | Coordinate | session u64, map_epoch u64, partials list(bytes), bytes (one simple Query) |
 //! | 0x0B | Native | database str, role str, map_epoch u64, bytes (one native-protocol request) |
 //!
@@ -253,6 +254,38 @@ pub enum Request {
     /// sends inside a transaction, where every part must run on the
     /// transaction's own sessions. Answered like `Pg`.
     Coordinate { session: u64, map_epoch: u64, partials: Vec<Vec<u8>>, bytes: Vec<u8> },
+    /// From now on this connection's frames of at least `min_bytes` may be
+    /// compressed with `codec` (see [`compressed_frame`]), in both
+    /// directions, each only when that makes it smaller. Answered `Done`; a
+    /// shard that does not know the request refuses it, and the link stays
+    /// uncompressed.
+    Compression { codec: u8, level: i32, min_bytes: u32 },
+}
+
+/// The first bytes of a compressed frame (a request's or a response's).
+pub const ZMAGIC: [u8; 2] = *b"RZ";
+/// zstd, the one codec in rshard version 1.
+pub const CODEC_ZSTD: u8 = 1;
+
+/// A compressed frame: [`ZMAGIC`], the codec, the plain frame's length (u32
+/// LE), then the compressed bytes.
+pub fn compressed_frame(codec: u8, plain_len: usize, compressed: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(compressed.len() + 7);
+    out.extend_from_slice(&ZMAGIC);
+    out.push(codec);
+    out.extend_from_slice(&(plain_len as u32).to_le_bytes());
+    out.extend_from_slice(compressed);
+    out
+}
+
+/// A compressed frame's codec, plain length and compressed bytes; `None`
+/// for a plain frame (one that starts with the rshard magic).
+pub fn split_compressed(frame: &[u8]) -> Option<(u8, usize, &[u8])> {
+    if frame.get(..2) != Some(&ZMAGIC[..]) || frame.len() < 7 {
+        return None;
+    }
+    let len = u32::from_le_bytes(frame[3..7].try_into().ok()?) as usize;
+    Some((frame[2], len, &frame[7..]))
 }
 
 /// Where a classified text came from.
@@ -569,6 +602,7 @@ impl Request {
             Request::HoldCommits { .. } => 0x11,
             Request::ReleaseCommits => 0x12,
             Request::Coordinate { .. } => 0x13,
+            Request::Compression { .. } => 0x14,
         }
     }
 
@@ -633,6 +667,9 @@ impl Request {
                     w.bytes(p);
                 }
                 w.bytes(bytes);
+            }
+            Request::Compression { codec, level, min_bytes } => {
+                w.u8(*codec).u32(*level as u32).u32(*min_bytes);
             }
         }
         w.buf
@@ -714,6 +751,7 @@ impl Request {
                 }
                 Request::Coordinate { session, map_epoch, partials, bytes: r.bytes()?.to_vec() }
             }
+            0x14 => Request::Compression { codec: r.u8()?, level: r.u32()? as i32, min_bytes: r.u32()? },
             k => return Err(format!("rshard request kind {k:#04x} is unknown")),
         };
         r.end()?;
@@ -966,4 +1004,18 @@ pub fn parse_native_text_route(value: &str) -> Option<Vec<u8>> {
         return None;
     }
     (0..rest.len() / 2).map(|i| u8::from_str_radix(rest.get(2 * i..2 * i + 2)?, 16).ok()).collect()
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use super::*;
+
+    #[test]
+    fn compression_round_trips_and_frames_tell_themselves_apart() {
+        let r = Request::Compression { codec: CODEC_ZSTD, level: -3, min_bytes: 1024 };
+        assert_eq!(Request::decode(&r.encode()).unwrap(), r);
+        let f = compressed_frame(CODEC_ZSTD, 5000, b"xyz");
+        assert_eq!(split_compressed(&f), Some((CODEC_ZSTD, 5000, &b"xyz"[..])));
+        assert_eq!(split_compressed(&r.encode()), None);
+    }
 }

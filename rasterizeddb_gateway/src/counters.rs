@@ -33,6 +33,11 @@ pub struct Counters {
     pub auth_failures: u64,
     pub panics: u64,
     pub map_refreshes: u64,
+    /// Frames sent to shards compressed, and received compressed, with
+    /// the bytes each saved on the wire.
+    pub compressed_out: u64,
+    pub compressed_in: u64,
+    pub compression_saved_bytes: u64,
     pub hop_us: [u64; BUCKETS],
 }
 
@@ -49,7 +54,8 @@ impl Counters {
         sum!(
             statements, routed, fan_outs, template_hits, template_misses, template_refuted, classify_errors, retries,
             lost_08007, down_08006, refused_no_key, refused_cross_shard, refusals_other, bytes_in, bytes_out,
-            sessions_opened, sessions_closed, virtual_sessions, auth_failures, panics, map_refreshes
+            sessions_opened, sessions_closed, virtual_sessions, auth_failures, panics, map_refreshes, compressed_out,
+            compressed_in, compression_saved_bytes
         );
         for i in 0..BUCKETS {
             self.hop_us[i] += o.hop_us[i];
@@ -98,6 +104,9 @@ impl Counters {
             ("auth_failures", self.auth_failures.to_string()),
             ("session_panics", self.panics.to_string()),
             ("map_refreshes", self.map_refreshes.to_string()),
+            ("shard_frames_compressed_out", self.compressed_out.to_string()),
+            ("shard_frames_compressed_in", self.compressed_in.to_string()),
+            ("shard_compression_saved_bytes", self.compression_saved_bytes.to_string()),
             ("hop_p50_us", self.hop_quantile(0.5).to_string()),
             ("hop_p99_us", self.hop_quantile(0.99).to_string()),
         ]

@@ -992,6 +992,16 @@ and a gateway that loaded an old static map would agree on the old generation.
 The shard is down about 27 minutes for 1.62 TB at 1 GB/s (test: restart the old
 copy after relocation; it refuses to open).
 
+### 10.1b Compressed links (as built)
+
+A gateway set to `shard_compression = zstd[:LEVEL]` asks each shard, after
+Hello, to compress that connection (rshard `Compression`, 0x14); a shard
+started with `--shard-peer-compression zstd[:LEVEL]` asks its peers the same
+for a coordinator's parts. A compressed frame is `RZ`, the codec (1 = zstd),
+the plain length (u32 LE), then the zstd bytes; either side unwraps what it
+gets, and sends a frame compressed only when it is at least the threshold
+long and comes out smaller. Off by default.
+
 ### 10.2 Range moves between shards
 
 **As built (`rdb-shard`).** `move-tenant`, `rebalance --apply` and `split`

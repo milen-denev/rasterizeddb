@@ -195,7 +195,7 @@ enable_long_row = []
 # format; a build without the feature has none of the rest, and its stamping
 # hooks compile to nothing. No crate of its own: routing is
 # `rasterizeddb_router`'s.
-sharding = ["dep:aws-lc-rs"]
+sharding = ["dep:aws-lc-rs", "dep:zstd"]
 
 # Per-shard Raft over row images (sharding-plan.md B3): each shard a
 # replicated group with automatic failover. Off until phase 3 meets its

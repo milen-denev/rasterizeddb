@@ -28,9 +28,14 @@ sha2 = "0.11"
 socket2 = { version = "0.6", features = ["all"] }
 log = "0.4"
 env_logger = "0.11"
+# The links to the shards, compressed when `shard_compression` says so.
+zstd = { version = "0.14", optional = true }
 
 [features]
-default = ["tls", "native", "fanout"]
+default = ["tls", "native", "fanout", "shard_compression"]
+# zstd on the links to the shards, turned on per gateway by the
+# `shard_compression` setting (off unless set).
+shard_compression = ["dep:zstd"]
 # TLS for clients (the gateway terminates it, so SCRAM channel binding works).
 tls = ["dep:tokio-rustls"]
 # The native (rastcp) front end, routed by the request's `route=` option.

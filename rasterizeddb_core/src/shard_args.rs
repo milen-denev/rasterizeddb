@@ -49,6 +49,11 @@ pub struct ShardArgs {
     /// keyless aggregates across shards; `--gateway-ca` when not given.
     #[arg(long = "peer-ca", value_name = "PEM")]
     pub peer_ca: Option<String>,
+    /// Compress this shard's links to the other shards (a coordinator's
+    /// parts): `off` (the default), `zstd` or `zstd:LEVEL`. Gateways ask for
+    /// compression on their own links (`shard_compression`).
+    #[arg(long = "shard-peer-compression", value_name = "off|zstd[:LEVEL]", default_value = "off")]
+    pub shard_peer_compression: String,
 
     /// This replica's id in its shard's Raft group (sharding-plan.md B3;
     /// a build with `sharding_raft`). Unique within the group, non-zero.
@@ -143,6 +148,8 @@ impl ShardArgs {
             gateway_ca: self.gateway_ca.clone(),
             gateway_pins: self.gateway_pin.clone(),
             peer_ca: self.peer_ca.clone(),
+            peer_compression: rasterizeddb_core::core::shard::rshard::parse_compression(&self.shard_peer_compression)
+                .map_err(|e| format!("--shard-peer-compression: {e}"))?,
         }))
     }
 

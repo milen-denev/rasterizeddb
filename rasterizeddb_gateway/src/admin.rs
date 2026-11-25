@@ -31,6 +31,13 @@ pub fn show_gateway(shared: &Shared) -> Vec<(String, String)> {
             },
         ),
         ("fanout_built".into(), cfg!(feature = "fanout").to_string()),
+        (
+            "shard_compression".into(),
+            match shared.cfg.shard_compression {
+                Some(level) => format!("zstd:{level} (frames of {} bytes or more)", shared.cfg.shard_compression_min_bytes),
+                None => "off".into(),
+            },
+        ),
         ("user_routing_built".into(), shared.hooks.has_user_routing.to_string()),
     ];
     for (k, v) in c.rows() {

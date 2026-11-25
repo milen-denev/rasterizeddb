@@ -68,6 +68,55 @@ pub struct RshardConfig {
     /// coordinator's connections to its peers (B1c); `gateway_ca` when
     /// unset.
     pub peer_ca: Option<String>,
+    /// zstd level for the links to the other shards; `None`: uncompressed.
+    pub peer_compression: Option<i32>,
+}
+
+/// `off`, `zstd` or `zstd:LEVEL` (1 to 22, or negative for the fast
+/// levels): the zstd level, `None` for off.
+pub fn parse_compression(v: &str) -> Result<Option<i32>, String> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" | "off" | "none" => Ok(None),
+        "zstd" => Ok(Some(3)),
+        other => match other.strip_prefix("zstd:").map(|l| l.parse::<i32>()) {
+            Some(Ok(l)) if (-7..=22).contains(&l) && l != 0 => Ok(Some(l)),
+            _ => Err(format!("{v:?} is not off, zstd or zstd:LEVEL (-7 to 22, not 0)")),
+        },
+    }
+}
+
+/// Frames at least this long are compressed on a link that asked for it.
+pub const COMPRESS_MIN_BYTES: u32 = 1024;
+
+/// A received frame, decompressed when it came compressed. A declared length
+/// past the largest frame, or one the bytes do not hold, is refused.
+pub fn unwrap_frame(frame: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+    let Some((codec, len, body)) = rshard::split_compressed(frame) else {
+        return Ok(std::borrow::Cow::Borrowed(frame));
+    };
+    if codec != rshard::CODEC_ZSTD {
+        return Err(format!("rshard: compression codec {codec} is unknown"));
+    }
+    if len > rshard::MAX_FIELD + 64 {
+        return Err(format!("rshard: a compressed frame of {len} bytes is past the limit"));
+    }
+    let plain = zstd::bulk::decompress(body, len).map_err(|e| format!("rshard: a compressed frame does not decompress: {e}"))?;
+    if plain.len() != len {
+        return Err("rshard: a compressed frame's length is not what it says".to_string());
+    }
+    Ok(std::borrow::Cow::Owned(plain))
+}
+
+/// `frame` compressed at `level` when it is at least `min` bytes and that
+/// makes it smaller; else as it is.
+pub fn wrap_frame(frame: Vec<u8>, level: i32, min: u32) -> Vec<u8> {
+    if frame.len() < min as usize {
+        return frame;
+    }
+    match zstd::bulk::compress(&frame, level) {
+        Ok(z) if z.len() + 7 < frame.len() => rshard::compressed_frame(rshard::CODEC_ZSTD, frame.len(), &z),
+        _ => frame,
+    }
 }
 
 /// What a coordinator needs to reach its peers: its own certificate as the
@@ -76,10 +125,33 @@ struct PeerConfig {
     cert: String,
     key: String,
     ca: Option<String>,
+    compression: Option<i32>,
 }
 
 static PEERS: std::sync::OnceLock<PeerConfig> = std::sync::OnceLock::new();
-static PEER_CLIENTS: std::sync::Mutex<Option<HashMap<u32, StdArc<rastcp::mux::MuxClient>>>> = std::sync::Mutex::new(None);
+static PEER_CLIENTS: std::sync::Mutex<Option<HashMap<u32, StdArc<PeerLink>>>> = std::sync::Mutex::new(None);
+
+/// A coordinator's link to one peer shard: frames compressed both ways
+/// once the peer agreed to it (`--shard-peer-compression`).
+struct PeerLink {
+    client: rastcp::mux::MuxClient,
+    compress: Option<i32>,
+}
+
+impl PeerLink {
+    async fn send(&self, req: &[u8]) -> Result<Vec<u8>, rastcp::error::RastcpError> {
+        let reply = match self.compress {
+            Some(level) => self.client.send(&wrap_frame(req.to_vec(), level, COMPRESS_MIN_BYTES)).await?,
+            None => self.client.send(req).await?,
+        };
+        match unwrap_frame(&reply) {
+            Ok(std::borrow::Cow::Borrowed(_)) => Ok(reply),
+            Ok(std::borrow::Cow::Owned(plain)) => Ok(plain),
+            // Undecodable: let the caller's decode say so.
+            Err(_) => Ok(reply),
+        }
+    }
+}
 static NEXT_PEER_SESSION: AtomicU64 = AtomicU64::new(1 << 62);
 
 /// One mux connection's state.
@@ -87,6 +159,9 @@ pub struct Conn {
     catalog: Arc<DatabaseCatalog>,
     hello: std::sync::Mutex<Hello>,
     sessions: std::sync::Mutex<HashMap<u64, StdArc<Mutex<VSession>>>>,
+    /// The zstd level and threshold this connection's replies are
+    /// compressed with, once it asked (`Request::Compression`).
+    compress: std::sync::Mutex<Option<(i32, u32)>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -133,6 +208,7 @@ pub async fn serve(catalog: Arc<DatabaseCatalog>, config: RshardConfig) -> std::
         cert: config.cert.clone(),
         key: config.key.clone(),
         ca: config.peer_ca.clone().or_else(|| config.gateway_ca.clone()),
+        compression: config.peer_compression,
     });
     let server = rastcp::server::TcpServerBuilder::new(&config.addr, config.port)
         .client_auth(client_auth)
@@ -150,8 +226,18 @@ pub async fn serve(catalog: Arc<DatabaseCatalog>, config: RshardConfig) -> std::
                 catalog: catalog.clone(),
                 hello: std::sync::Mutex::new(Hello::None),
                 sessions: std::sync::Mutex::new(HashMap::new()),
+                compress: std::sync::Mutex::new(None),
             },
-            |_catalog, _principal, conn: StdArc<Conn>, data: Vec<u8>| async move { handle(&conn, &data).await.encode() },
+            |_catalog, _principal, conn: StdArc<Conn>, data: Vec<u8>| async move {
+                let reply = match unwrap_frame(&data) {
+                    Ok(plain) => handle(&conn, &plain).await.encode(),
+                    Err(e) => refuse(PROTOCOL, true, e).encode(),
+                };
+                match *conn.compress.lock().unwrap() {
+                    Some((level, min)) => wrap_frame(reply, level, min),
+                    None => reply,
+                }
+            },
         )
         .await
         .map_err(io)
@@ -273,6 +359,14 @@ async fn handle(conn: &Conn, data: &[u8]) -> Response {
         }
         Request::HoldCommits { ms } => {
             commit_hold::hold(conn as *const Conn as usize, ms);
+            Response::Done
+        }
+        Request::Compression { codec, level, min_bytes } => {
+            if codec != rshard::CODEC_ZSTD {
+                return refuse(*b"0A000", true, format!("compression codec {codec} is not spoken here"));
+            }
+            let level = if level == 0 { 3 } else { level.clamp(-7, 22) };
+            *conn.compress.lock().unwrap() = Some((level, min_bytes.max(64)));
             Response::Done
         }
         Request::ReleaseCommits => {
@@ -1052,7 +1146,7 @@ fn error_reply(code: &str, message: &str, status: u8) -> Vec<u8> {
 
 /// A mux client to peer shard `id` at its map address, with this shard's
 /// certificate, said Hello to once.
-async fn peer_client(id: u32) -> Result<StdArc<rastcp::mux::MuxClient>, String> {
+async fn peer_client(id: u32) -> Result<StdArc<PeerLink>, String> {
     if let Some(c) = PEER_CLIENTS.lock().unwrap().get_or_insert_with(HashMap::new).get(&id) {
         return Ok(c.clone());
     }
@@ -1068,7 +1162,6 @@ async fn peer_client(id: u32) -> Result<StdArc<rastcp::mux::MuxClient>, String> 
         .build_multiplexed()
         .await
         .map_err(e)?;
-    let client = StdArc::new(client);
     let hello = Request::Hello {
         cluster_id: served.map.cluster_id(),
         gateway: format!("shard {}", served.shard_id),
@@ -1080,6 +1173,16 @@ async fn peer_client(id: u32) -> Result<StdArc<rastcp::mux::MuxClient>, String> 
         Response::Refused(r) => return Err(format!("shard {id} refused: {}", r.message)),
         other => return Err(format!("shard {id} answered Hello with {other:?}")),
     }
+    // Compression, when this shard asks for it and the peer agrees.
+    let mut compress = None;
+    if let Some(level) = peers.compression {
+        let ask = Request::Compression { codec: rshard::CODEC_ZSTD, level, min_bytes: COMPRESS_MIN_BYTES };
+        match client.send(&ask.encode()).await.map_err(e).and_then(|b| Response::decode(&b)) {
+            Ok(Response::Done) => compress = Some(level),
+            other => log::warn!("shard {id} does not compress its link: {other:?}"),
+        }
+    }
+    let client = StdArc::new(PeerLink { client, compress });
     PEER_CLIENTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(id, client.clone());
     Ok(client)
 }

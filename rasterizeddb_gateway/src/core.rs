@@ -46,6 +46,9 @@ pub struct Link {
     circuit: Cell<Circuit>,
     /// Hello has been exchanged on the current connection.
     hello: Cell<bool>,
+    /// The zstd level this connection's frames are compressed with, once
+    /// the shard agreed (`shard_compression`).
+    compress: Cell<Option<i32>>,
     /// The shard's id as it said in Hello, checked against the map.
     pub schema_epoch: Cell<u64>,
 }
@@ -71,7 +74,8 @@ impl Link {
             self.hello(core).await?;
         }
         let started = Instant::now();
-        let bytes = match self.client.send(req).await {
+        let packed = self.pack(core, req);
+        let bytes = match self.client.send(packed.as_deref().unwrap_or(req)).await {
             Ok(b) => b,
             Err(e) => {
                 self.hello.set(false);
@@ -83,7 +87,7 @@ impl Link {
         };
         core.counters.borrow_mut().hop(started.elapsed().as_micros() as u64);
         self.circuit.set(Circuit::Up);
-        let mut resp = Response::decode(&bytes).map_err(CallError::Bad)?;
+        let mut resp = Response::decode(&self.unpack_counted(core, &bytes).map_err(CallError::Bad)?).map_err(CallError::Bad)?;
         // The mux reconnected under this request, and the new connection
         // has had no Hello: the shard refused it before effect. Hello and
         // send once more.
@@ -93,16 +97,59 @@ impl Link {
         {
             self.hello.set(false);
             self.hello(core).await?;
-            let bytes = self.client.send(req).await.map_err(|e| {
+            let packed = self.pack(core, req);
+            let bytes = self.client.send(packed.as_deref().unwrap_or(req)).await.map_err(|e| {
                 self.hello.set(false);
                 CallError::Lost(format!("shard {} at {}: {e}", self.shard, self.addr))
             })?;
-            resp = Response::decode(&bytes).map_err(CallError::Bad)?;
+            resp = Response::decode(&self.unpack_counted(core, &bytes).map_err(CallError::Bad)?).map_err(CallError::Bad)?;
         }
         if let Some(e) = resp.map_epoch() {
             core.observe_epoch(self.shard, e);
         }
         Ok(resp)
+    }
+
+    /// `req` compressed, when this link compresses and that makes it
+    /// smaller; `None` to send it as it is.
+    fn pack(&self, core: &Core, req: &[u8]) -> Option<Vec<u8>> {
+        #[cfg(feature = "shard_compression")]
+        if let Some(level) = self.compress.get()
+            && req.len() >= core.shared.cfg.shard_compression_min_bytes as usize
+            && let Ok(z) = zstd::bulk::compress(req, level)
+            && z.len() + 7 < req.len()
+        {
+            let mut c = core.counters.borrow_mut();
+            c.compressed_out += 1;
+            c.compression_saved_bytes += (req.len() - z.len() - 7) as u64;
+            return Some(rshard::compressed_frame(rshard::CODEC_ZSTD, req.len(), &z));
+        }
+        let _ = (core, req);
+        None
+    }
+
+    /// [`unpack`], counted.
+    fn unpack_counted<'b>(&self, core: &Core, bytes: &'b [u8]) -> Result<std::borrow::Cow<'b, [u8]>, String> {
+        let plain = unpack(bytes)?;
+        if let std::borrow::Cow::Owned(p) = &plain {
+            let mut c = core.counters.borrow_mut();
+            c.compressed_in += 1;
+            c.compression_saved_bytes += p.len().saturating_sub(bytes.len()) as u64;
+        }
+        Ok(plain)
+    }
+
+    /// After Hello: asks the shard to compress this connection when the
+    /// gateway is set to. A shard that does not know the request (or
+    /// refuses it) leaves the link uncompressed.
+    async fn negotiate(&self, core: &Core) {
+        self.compress.set(None);
+        let Some(level) = core.shared.cfg.shard_compression else { return };
+        let ask = Request::Compression { codec: rshard::CODEC_ZSTD, level, min_bytes: core.shared.cfg.shard_compression_min_bytes }.encode();
+        match self.client.send(&ask).await.map(|b| Response::decode(&b)) {
+            Ok(Ok(Response::Done)) => self.compress.set(Some(level)),
+            other => log::warn!("shard {} at {} does not compress its link: {other:?}", self.shard, self.addr),
+        }
     }
 
     async fn hello(&self, core: &Core) -> Result<(), CallError> {
@@ -141,6 +188,7 @@ impl Link {
                 core.shared.note_schema_epoch(schema_epoch);
                 core.observe_epoch(self.shard, map_epoch);
                 self.hello.set(true);
+                self.negotiate(core).await;
                 Ok(())
             }
             Response::Refused(r) => Err(CallError::Down(format!("shard {} refused hello: {} {}", self.shard, r.sqlstate_str(), r.message))),
@@ -302,6 +350,7 @@ impl Core {
             client,
             circuit: Cell::new(Circuit::Up),
             hello: Cell::new(false),
+            compress: Cell::new(None),
             schema_epoch: Cell::new(0),
         });
         self.links.borrow_mut().insert(shard, link.clone());
@@ -363,5 +412,31 @@ fn poll_once<F: std::future::Future>(f: F) -> Option<F::Output> {
     match f.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
         Poll::Ready(v) => Some(v),
         Poll::Pending => None,
+    }
+}
+
+/// A shard's reply, decompressed when it came compressed.
+fn unpack(frame: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+    let Some((codec, len, body)) = rshard::split_compressed(frame) else {
+        return Ok(std::borrow::Cow::Borrowed(frame));
+    };
+    #[cfg(feature = "shard_compression")]
+    {
+        if codec != rshard::CODEC_ZSTD {
+            return Err(format!("a reply compressed with codec {codec}, which this gateway does not speak"));
+        }
+        if len > rshard::MAX_FIELD + 64 {
+            return Err(format!("a compressed reply of {len} bytes is past the limit"));
+        }
+        let plain = zstd::bulk::decompress(body, len).map_err(|e| format!("a compressed reply does not decompress: {e}"))?;
+        if plain.len() != len {
+            return Err("a compressed reply's length is not what it says".to_string());
+        }
+        Ok(std::borrow::Cow::Owned(plain))
+    }
+    #[cfg(not(feature = "shard_compression"))]
+    {
+        let _ = (codec, len, body);
+        Err("a compressed reply, and this gateway was built without shard_compression".to_string())
     }
 }

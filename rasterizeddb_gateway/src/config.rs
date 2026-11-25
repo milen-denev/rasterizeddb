@@ -104,6 +104,11 @@ pub struct Config {
     pub shard_timeout: Option<Duration>,
     pub server_version: String,
     pub retries: u32,
+    /// zstd level for the links to the shards (`shard_compression = zstd` or
+    /// `zstd:LEVEL`); `None`: uncompressed, the default.
+    pub shard_compression: Option<i32>,
+    /// Frames shorter than this go uncompressed.
+    pub shard_compression_min_bytes: u32,
 }
 
 impl Default for Config {
@@ -147,6 +152,8 @@ impl Default for Config {
             shard_timeout: None,
             server_version: "17.0".to_string(),
             retries: 3,
+            shard_compression: None,
+            shard_compression_min_bytes: 1024,
         }
     }
 }
@@ -314,6 +321,20 @@ impl Config {
             }
             "server_version" => self.server_version = v.to_string(),
             "retries" => self.retries = num(v)?.min(10) as u32,
+            "shard_compression" => {
+                self.shard_compression = match v.trim().to_ascii_lowercase().as_str() {
+                    "off" | "none" | "" => None,
+                    "zstd" => Some(3),
+                    other => match other.strip_prefix("zstd:").map(|l| l.parse::<i32>()) {
+                        Some(Ok(l)) if (-7..=22).contains(&l) && l != 0 => Some(l),
+                        _ => return Err("off, zstd or zstd:LEVEL (-7 to 22, not 0)".into()),
+                    },
+                };
+                if self.shard_compression.is_some() && !cfg!(feature = "shard_compression") {
+                    return Err("this gateway was built without the shard_compression feature".into());
+                }
+            }
+            "shard_compression_min_bytes" => self.shard_compression_min_bytes = num(v)?.clamp(64, u32::MAX as u64) as u32,
             _ => return Err("unknown key".into()),
         }
         Ok(())

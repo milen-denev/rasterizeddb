@@ -42,6 +42,8 @@ the file. A dash in a key means the same as an underscore.
 | `max_in_flight` | `4096` | Requests in flight per mux connection. |
 | `max_message_bytes` | 64 MiB | The largest client message. A larger one ends the connection with `08P01`. |
 | `max_batch_bytes` | 16 MiB | Pipelined extended messages without a Sync. A larger batch ends the connection with `54000`. |
+| `shard_compression` | `off` | `zstd` or `zstd:LEVEL` (-7 to 22): after Hello each link to a shard asks it to compress (rshard `Compression`, 0x14), and from then on frames of at least `shard_compression_min_bytes` go compressed both ways, each only when that makes it smaller. A shard too old to know the request leaves that link uncompressed (logged). Worth it on links between machines: fan-out rows, partials and RETURNING rows compress well; on one host it costs CPU for nothing. `SHOW GATEWAY` reports it, with `shard_frames_compressed_in`/`_out` and `shard_compression_saved_bytes`. Built with the default `shard_compression` feature. |
+| `shard_compression_min_bytes` | 1024 | Frames shorter than this are sent as they are. |
 | `gather_max_bytes` | 256 MiB | A fan-out's gathered result. Past it the statement fails with `54000`; it is never truncated. |
 | `template_cache_per_core`, `template_cache_shared` | 4096, 65536 | Sizes of the route-template caches. |
 | `auth_cache_secs` | `60` | How long role keys fetched from the home shard are cached. |
