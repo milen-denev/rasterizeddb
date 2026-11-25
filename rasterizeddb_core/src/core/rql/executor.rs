@@ -18242,6 +18242,7 @@ async fn execute_alter_table_action(
             json,
             modifier,
             generated,
+            compression,
             text_typmod,
         } => {
             // A case-insensitive column's key companion, as
@@ -18373,6 +18374,21 @@ async fn execute_alter_table_action(
                 Err(e) => return ddl_error(&e),
             }
 
+            // `COMPRESSION zstd(9)`: the column's marker, with the column, on either path (a
+            // populated table's rewrite, or the reload below), fenced first as `SET COMPRESSION` fences it. A
+            // build that cannot compress accepts the clause, as at CREATE.
+            let compression_record = match compression.filter(|_| crate::core::compression::ENABLED) {
+                Some(level) => {
+                    if let Err(e) = database.require_compressed_values() {
+                        return ddl_error(&format!(
+                            "the database could not be marked for compressed values ({}): {e}",
+                            crate::core::database::incompat::COMPRESSED_VALUES_V1
+                        ));
+                    }
+                    Some(crate::core::rql::type_modifier::compression_marker(&name, Some(level)))
+                }
+                None => None,
+            };
             if row_count > 0 {
                 if !is_nullable && !fills_existing {
                     // The existing rows have no value to put there. PostgreSQL
@@ -18452,6 +18468,7 @@ async fn execute_alter_table_action(
                             text_typmod,
                             &schema.type_modifiers,
                         ))
+                        .chain(compression_record.clone())
                         .collect(),
                     new_generated.into_iter().collect(),
                     tx,
@@ -18554,6 +18571,10 @@ async fn execute_alter_table_action(
                         if !record.is_deleted {
                             schema.type_modifiers.push(record);
                         }
+                    }
+                    if let Some(record) = &compression_record {
+                        crate::core::rql::type_modifier::stage(&*io_schema, &mut writes, record)
+                            .map_err(|e| e.to_string())?;
                     }
                     if let Some(entry) = &new_generated {
                         crate::core::rql::generated::stage(&*io_schema, &mut writes, entry)
