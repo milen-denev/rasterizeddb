@@ -408,6 +408,12 @@ impl Session {
             if let Outcome::Close = flow {
                 break Ok(());
             }
+            // A retry that found no loop to take it: answered, never left
+            // for the client to wait on.
+            if let Outcome::Retry = flow {
+                self.error_ready("57P03", "the statement was refused while the cluster's map changes; try again");
+                self.flush(conn).await?;
+            }
             if self.core.shared.draining.load(std::sync::atomic::Ordering::Relaxed) && self.txn.status == b'I' && batch.is_empty() {
                 pg::error(&mut self.out, "FATAL", "57P01", "terminating connection: the gateway is shutting down");
                 let _ = self.flush(conn).await;
@@ -721,8 +727,12 @@ impl Session {
                     self.error_ready(sqlstate, &message);
                     return Ok(Outcome::Done { error: true });
                 }
-                Target::FanOut { merge, writes } => return self.fan_out(conn, msg, merge, writes).await,
-                Target::Gather { tables } => return self.gather_run(conn, text, &tables).await,
+                // Through the retry loop below, as a routed statement: a part
+                // refused before effect (a moving range, a shard a map epoch
+                // behind) comes back as Retry, which must never reach the
+                // client unanswered.
+                Target::FanOut { merge, writes } => self.fan_out(conn, msg, merge, writes).await?,
+                Target::Gather { tables } => self.gather_run(conn, text, &tables).await?,
                 Target::Shard(s) => {
                     self.core.counters.borrow_mut().routed += 1;
                     self.run_on(conn, s, msg, Vec::new(), tkey.as_ref().map(|t| (Source::Shape, t.as_str()))).await?
@@ -1034,6 +1044,18 @@ impl Session {
             }
         };
 
+        // A statement refused because its range is fenced for a move's last
+        // round wrote nothing (the fence refuses before the write): outside
+        // a transaction it is retried after the round, as the error asks.
+        if let Response::PgReply { more: false, bytes, .. } = &resp
+            && self.txn.status == b'I'
+            && self.txn.shard.is_none()
+            && self.login.pinned.is_none()
+            && fenced_for_a_move(bytes)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            return Ok(Outcome::Retry);
+        }
         let mut error = false;
         let mut last_type = 0u8;
         let mut refuted = false;
@@ -1496,6 +1518,20 @@ impl Session {
 
 /// A new global transaction id, `gateway-pid-n`: unique across gateways,
 /// numbered in order so the deadlock detector can tell the youngest.
+/// A reply that is only a `57P03` "fenced for a move" error (and its
+/// ReadyForQuery): the statement was refused before it did anything.
+fn fenced_for_a_move(reply: &[u8]) -> bool {
+    let mut error = false;
+    for (t, m) in pg::messages(reply) {
+        match t {
+            b'E' if pg::error_sqlstate(m) == Some("57P03") && pg::error_message(m).is_some_and(|e| e.contains("fenced for a move")) => error = true,
+            b'Z' | b'N' | b'S' => {}
+            _ => return false,
+        }
+    }
+    error
+}
+
 pub(crate) fn next_global_txn(gateway: &str) -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

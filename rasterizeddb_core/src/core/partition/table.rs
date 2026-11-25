@@ -1788,6 +1788,27 @@ impl PartitionedTable {
             return Ok(Route::All);
         }
         let schema = &self.shell.schema;
+        // `rdb_route_block('<type>', <key>) >= lo AND … < hi`, the block range
+        // a shard move selects: routed to the partitions over those blocks
+        // (the moving range, which source and destination both hold), not
+        // every partition, when `<key>` is the first key level and `<type>`
+        // hashes as that level does.
+        if let Some((lo, hi)) = route_block_range(where_clause).and_then(|(family, column, lo, hi)| {
+                let level = live.spec.levels().first()?;
+                let field = schema.fields.iter().find(|f| f.write_order == u64::from(level.write_order))?;
+                (field.name.eq_ignore_ascii_case(&column) && family == level.family).then_some((lo, hi))
+            })
+        {
+            const BLOCKS: u64 = 1 << 48;
+            let hi = hi.min(BLOCKS);
+            return Ok(if lo >= hi {
+                Route::Zero
+            } else if lo == 0 && hi == BLOCKS {
+                Route::All
+            } else {
+                Route::Points(vec![PointRange { lo: lo << 16, hi: (hi as u128) << 16 }])
+            });
+        }
         let Ok(tokens) = crate::core::tokenizer::query_tokenizer::try_tokenize(where_clause, &schema.fields) else {
             return Ok(Route::All);
         };
@@ -3667,5 +3688,90 @@ pub(crate) mod lifecycle_hooks {
 
     pub(super) async fn closing(root: &Path, pid: u32) {
         hit(&CLOSES, root, pid).await
+    }
+}
+
+/// `rdb_route_block('<type>', <column>) >= LO AND rdb_route_block('<type>',
+/// <column>) < HI` exactly (as `rdb-shard` writes a block range; spaces and
+/// case free, the column optionally quoted): the type's key family, the
+/// column, `LO` and `HI`. `None` for anything else.
+fn route_block_range(clause: &str) -> Option<(super::key::KeyFamily, String, u64, u64)> {
+    use super::key::KeyFamily;
+    // The function calls arrive lifted for the expression evaluator: read
+    // them back as text first.
+    let unlifted;
+    let clause = if clause.as_bytes().contains(&crate::core::tokenizer::predicate_rewrite::LIFTED_OPEN) {
+        let mut out = String::with_capacity(clause.len());
+        let mut i = 0;
+        while i < clause.len() {
+            if let Some((text, end)) = crate::core::tokenizer::predicate_rewrite::read_lifted(clause, i) {
+                out.push_str(&text);
+                i = end;
+                continue;
+            }
+            let ch = clause[i..].chars().next()?;
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        unlifted = out;
+        unlifted.as_str()
+    } else {
+        clause
+    };
+    fn call(part: &str) -> Option<(String, String, &str)> {
+        let p = part.trim();
+        p.get(..16).filter(|h| h.eq_ignore_ascii_case("rdb_route_block("))?;
+        let inner_end = p.find(')')?;
+        let inner = &p[16..inner_end];
+        let (t, c) = inner.split_once(',')?;
+        let t = t.trim().strip_prefix('\'')?.strip_suffix('\'')?.to_ascii_lowercase();
+        let c = c.trim();
+        let c = c.strip_prefix('"').and_then(|c| c.strip_suffix('"')).map(str::to_string).unwrap_or_else(|| c.to_ascii_lowercase());
+        if c.is_empty() || c.contains(['"', '\'', '(', ')', ' ']) {
+            return None;
+        }
+        Some((t, c, p[inner_end + 1..].trim()))
+    }
+    let upper = clause.to_ascii_uppercase();
+    let at = upper.find(" AND ")?;
+    if upper[at + 5..].contains(" AND ") || upper.contains(" OR ") {
+        return None;
+    }
+    let (t1, c1, op1) = call(&clause[..at])?;
+    let (t2, c2, op2) = call(&clause[at + 5..])?;
+    if t1 != t2 || c1 != c2 {
+        return None;
+    }
+    let lo: u64 = op1.strip_prefix(">=")?.trim().parse().ok()?;
+    let hi: u64 = op2.strip_prefix('<').filter(|r| !r.starts_with('='))?.trim().parse().ok()?;
+    let family = match t1.as_str() {
+        "smallint" | "int2" | "integer" | "int" | "int4" | "bigint" | "int8" | "tinyint" | "int1" => KeyFamily::Integer,
+        "text" | "varchar" | "character varying" | "string" => KeyFamily::Text,
+        "uuid" => KeyFamily::Uuid,
+        _ => return None,
+    };
+    Some((family, c1, lo, hi))
+}
+
+#[cfg(test)]
+mod route_block_range_tests {
+    use super::route_block_range;
+    use super::super::key::KeyFamily;
+
+    #[test]
+    fn a_move_selection_is_read_and_nothing_else() {
+        assert_eq!(
+            route_block_range("rdb_route_block('int', \"id\") >= 100 AND rdb_route_block('int', \"id\") < 200"),
+            Some((KeyFamily::Integer, "id".to_string(), 100, 200))
+        );
+        assert_eq!(
+            route_block_range("RDB_ROUTE_BLOCK('text', Tenant) >= 0 and rdb_route_block('text', tenant) < 5"),
+            Some((KeyFamily::Text, "tenant".to_string(), 0, 5))
+        );
+        assert_eq!(route_block_range("rdb_route_block('int', id) >= 1 AND rdb_route_block('int', other) < 2"), None);
+        assert_eq!(route_block_range("rdb_route_block('int', id) >= 1 AND rdb_route_block('int', id) <= 2"), None);
+        assert_eq!(route_block_range("rdb_route_block('int', id) >= 1 AND rdb_route_block('int', id) < 2 AND v = 3"), None);
+        assert_eq!(route_block_range("rdb_route_block('int', id) >= 1 OR rdb_route_block('int', id) < 2"), None);
+        assert_eq!(route_block_range("id = 4"), None);
     }
 }

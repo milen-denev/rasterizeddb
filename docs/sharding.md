@@ -84,7 +84,7 @@ filter alone); there is one transaction manager per database
 | Restriction | Why | Migration path | Lifted |
 |---|---|---|---|
 | A sharded table needs a `PRIMARY KEY` containing the partition key | Follower apply and moves address rows by it (§9.4, §10). Today a composite `PRIMARY KEY` is recorded as a plain unique key (§8.1), so this needs a phase 0 change | `PRIMARY KEY (tenant_id, id)` | Never; load-bearing |
-| `COPY` and multi-row `INSERT` spanning shards refused unless the session opts into a per-shard, non-atomic split | Same as above | `SET rdb.split_bulk_writes = on` in autocommit (§8.5) | Phase 5, opt-in |
+| `COPY` spanning shards refused unless the session opts into a per-shard, non-atomic split; a multi-row `INSERT` spanning shards needs the gateway's `two_phase = on` (§3.2), which splits it atomically | Same as above | `two_phase = on`; for `COPY`, `SET rdb.split_bulk_writes = on` in autocommit (§8.5) | Phase 5, opt-in |
 | `SERIAL` (int4) refused on sharded tables | 2³¹ values cannot be split disjointly across shards | `BIGSERIAL` (§8.2) or `UUID` | Never |
 | Writes reaching several shards refused | No atomic commit before 2PC; Vitess's default `MULTI` commits these partially, this engine's characteristic bug | Add the tenant predicate, or `EXECUTE ON EACH SHARD` | Phase 5, opt-in |
 | Subqueries must repeat the tenant predicate | The node checks every table reference (§5.2) | `WHERE tenant_id = 42` in the subquery | Phase 4: correlated key propagation |
@@ -220,7 +220,7 @@ relations and `IN (SELECT …)`, it computes `route()` and a shard set.
 |---|---|---|
 | Single-shard | every sharded reference routes to shard s; unsharded ones only if s is their home | `Exec{Single}` to s |
 | Fan-out read | a `SELECT` reaching several shards, autocommit or `BEGIN READ ONLY`, READ COMMITTED, supported shape (§5.3) | scatter `Exec{Part{ranges}}`, merge |
-| Multi-shard write | any write reaching several shards | **0A000 before anything runs** (opt-in bulk split: §8.5) |
+| Multi-shard write | any write reaching several shards | under `two_phase = on`, one two-phase transaction over them (§3.2); without it **0A000 before anything runs** (opt-in bulk split: §8.5) |
 | No table reference | `SELECT nextval('s')`, `currval`, `lastval`, constants | `nextval` to the gateway's co-located shard, else a fixed shard per sequence: values are disjoint by construction (§8.2), so they may come from another shard's space; `currval`/`lastval` are gateway session state; `setval` on a sharded sequence refused |
 | Unknown shape | any construct the classifier does not enumerate | **refuse**, fail-closed |
 | DDL / session commands / `pg_catalog` | | §8.4 / kept at the gateway, applied lazily / answered from shells and `STATS` |
@@ -986,6 +986,23 @@ The shard is down about 27 minutes for 1.62 TB at 1 GB/s (test: restart the old
 copy after relocation; it refuses to open).
 
 ### 10.2 Range moves between shards
+
+**As built (`rdb-shard`).** `move-tenant`, `rebalance --apply` and `split`
+run a move with `--fenced` or `--online`; at the hand-off the new map goes to
+the two shards in the move, then to every other shard (a shard left on the old
+map routes and coordinates as if nothing moved; one that cannot be reached is
+named and the command fails after the move). The tool speaks the native
+protocol: where the map's addresses are the shards' rshard listeners, give
+`--native ID=HOST:PORT` for each (and `--new-native` for `split`'s new shard).
+A new shard starts with the old map and an id it does not name yet: it owns
+nothing, refuses every keyed statement, and lays out each partitioned table as
+one `FOREIGN` partition until `split` adds it to the map and moves a range to
+it. A move's statements select rows by `rdb_route_block(TYPE, key) >= lo AND
+< hi`, which the planner routes to the partitions over those blocks (on the
+first key level, when TYPE hashes as that level does), so they read only the
+moving range and never reach another shard's span. During the last, fenced
+round a gateway holds an autocommit statement refused `57P03 … fenced for a
+move` and retries it (up to `retries`, 200 ms apart) instead of failing it.
 
 **Offline (phase 2), after the span edits of §5.2 exist.**
 

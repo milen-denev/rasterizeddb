@@ -1847,7 +1847,7 @@ mod tests {
             log.extend(raw_frame(body));
             replay(&log)
         };
-        assert!(with(&[0x0F, LAYOUT_V1]).unwrap_err().contains("unknown record kind"));
+        assert!(with(&[0x11, LAYOUT_V1]).unwrap_err().contains("unknown record kind"));
         assert!(with(&[0x00]).unwrap_err().contains("unknown record kind"));
         assert!(with(&[Kind::Sealed as u8, 2]).unwrap_err().contains("layout version 2"));
         assert!(with(&[Kind::Sealed as u8]).unwrap_err().contains("ends early"));
@@ -2001,7 +2001,7 @@ mod tests {
         bad("out of order", &|s| s.reshapes[0].id = 0);
         bad("not a spent, unused pid", &|s| s.reshapes[0].targets[0].pid = 13);
         bad("not a spent, unused pid", &|s| s.reshapes[0].targets[0].pid = 16);
-        bad("not a live partition", &|s| s.reshapes[0].sources = vec![3]);
+        bad("not a live, owned partition", &|s| s.reshapes[0].sources = vec![3]);
         bad("already a source of reshape 4", &|s| {
             s.reshapes.insert(
                 0,

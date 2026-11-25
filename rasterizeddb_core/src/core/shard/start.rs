@@ -126,8 +126,16 @@ pub fn start(config: &ShardConfig) -> Result<ShardStarted, String> {
             map.cluster_id()
         ));
     }
+    // A shard id the map does not name yet is a node joining the cluster
+    // (`rdb-shard split` adds it to the map, then moves a range to it). It
+    // owns nothing until then: every partition is another shard's, so it
+    // refuses every keyed statement rather than hold rows of its own.
     if map.shard(config.shard_id).is_none() {
-        return Err(format!("the cluster map has no shard {}", config.shard_id));
+        log::warn!(
+            "the cluster map (epoch {}) has no shard {}: starting as a joining shard that owns no range until a map naming it is installed",
+            map.epoch(),
+            config.shard_id
+        );
     }
     for (lo, hi) in map.ranges_of(config.shard_id) {
         crate::core::policy_hooks::placement().may_place(lo, hi, config.shard_id, &[])?;

@@ -44,7 +44,10 @@
 //!
 //! Every command also takes `--user U` (with the password in
 //! `RDB_PASSWORD`), `--ca PEM`, `--pin SHA256` or `--accept-any` (the
-//! default), and `--database NAME`.
+//! default), and `--database NAME`. The tool speaks the native protocol to
+//! each shard: at the map's address, or where `--native ID=HOST:PORT`
+//! (repeatable; `split`: `--new-native HOST:PORT`) says, when the map's
+//! addresses are the shards' rshard listeners.
 //!
 //! A move is offline. Between shards (`--role shard`) the engine fences it:
 //! the source refuses writes to the moved blocks (`SHARD FENCE`), the
@@ -97,7 +100,7 @@ impl Args {
             let Some(name) = a.strip_prefix("--") else {
                 return Err(format!("unexpected argument {a:?}\n{}", usage()));
             };
-            if matches!(name, "fenced" | "force" | "accept-any" | "apply") {
+            if matches!(name, "fenced" | "online" | "force" | "accept-any" | "apply" | "frontend-only") {
                 switches.push(name.to_string());
             } else {
                 let v = it.next().ok_or_else(|| format!("--{name} needs a value"))?;
@@ -150,6 +153,13 @@ fn main() -> ExitCode {
 
 async fn run(args: &Args) -> std::result::Result<(), String> {
     let options = options(args)?;
+    let mut native = BTreeMap::new();
+    for spec in args.flags.get("native").into_iter().flatten() {
+        let (id, addr) = spec.split_once('=').ok_or_else(|| format!("--native {spec:?}: write ID=HOST:PORT"))?;
+        let id: ShardId = id.trim().parse().map_err(|_| format!("--native {spec:?}: {id:?} is not a shard id"))?;
+        native.insert(id, addr.trim().to_string());
+    }
+    *NATIVE.lock().unwrap_or_else(|e| e.into_inner()) = native;
     match args.command.as_str() {
         "init" => init(&read_map(args.one("map")?)?, &options).await,
         "show" => show(&read_map(args.one("map")?)?, &options).await,
@@ -272,11 +282,19 @@ fn keygen(args: &Args) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// `--native ID=HOST:PORT`: where shard ID's native endpoint is, when the
+/// map's address is its rshard listener (the gateways' mTLS link), which
+/// this tool does not speak.
+static NATIVE: std::sync::Mutex<BTreeMap<ShardId, String>> = std::sync::Mutex::new(BTreeMap::new());
+
+fn native_addr(id: ShardId, map_addr: &str) -> String {
+    NATIVE.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned().unwrap_or_else(|| map_addr.to_string())
+}
+
 async fn connect(map: &ShardMap, id: ShardId, options: &Options) -> std::result::Result<Client, String> {
     let info = map.shard(id).ok_or_else(|| format!("shard {id} is not in the map"))?;
-    Client::connect(&info.addr, options.clone())
-        .await
-        .map_err(|e| format!("shard {id} ({}): {e}", info.addr))
+    let addr = native_addr(id, &info.addr);
+    Client::connect(&addr, options.clone()).await.map_err(|e| format!("shard {id} ({addr}): {e}"))
 }
 
 async fn init(map: &ShardMap, options: &Options) -> std::result::Result<(), String> {
@@ -678,6 +696,7 @@ async fn move_tenant(args: &Args, options: &Options) -> std::result::Result<(), 
     let sig = write_signed(args, out, &next)?;
     if engine {
         finish_move(&src, &dst, &next, sig.as_deref(), block, block + 1).await?;
+        install_on_the_rest(&next, sig.as_deref(), options, &[from, to]).await?;
         println!(
             "moved to shard {to}; map epoch {} installed on both shards and written to {out}. Reload every router \
              and gateway; the source's rows stay unread until it is restarted or retired.",
@@ -865,7 +884,12 @@ async fn split(args: &Args, options: &Options) -> std::result::Result<(), String
         return Err(format!("--at {at:#x} is not inside shard {hot}'s range [{lo:#x}, {hi:#x})"));
     }
     let grown = map.with_shard(rasterizeddb_router::shard_map::ShardInfo { id: new_id, addr: new_addr.clone(), standbys: Vec::new() })?;
-    let dst = Client::connect(&new_addr, options.clone()).await.map_err(|e| format!("the new shard {new_addr}: {e}"))?;
+    // `--new-native`: the new shard's native endpoint, when `--new-addr` (its
+    // map address) is its rshard listener.
+    let new_native = args.opt("new-native").map(str::to_string).unwrap_or_else(|| native_addr(new_id, &new_addr));
+    // Every later connection to the new shard goes there too.
+    NATIVE.lock().unwrap_or_else(|e| e.into_inner()).insert(new_id, new_native.clone());
+    let dst = Client::connect(&new_native, options.clone()).await.map_err(|e| format!("the new shard {new_native}: {e}"))?;
     if !is_shard(&dst).await {
         return Err(format!("{new_addr} is not running as a shard (start it with --role shard)"));
     }
@@ -960,6 +984,7 @@ async fn apply_moves(
         let sig = write_signed(args, out, &next)?;
         if engine {
             finish_move(&src, &dst, &next, sig.as_deref(), mv.lo, mv.hi).await?;
+            install_on_the_rest(&next, sig.as_deref(), options, &[mv.from, mv.to]).await?;
         }
         current = next;
     }
@@ -1280,6 +1305,34 @@ async fn finish_move(
     src.run(&format!("SHARD GIVE RANGE {lo:#x} {hi:#x}")).await.map_err(|e| format!("giving up the source's span: {e}"))?;
     src.run(&format!("SHARD UNFENCE RANGE {lo:#x} {hi:#x}")).await.map_err(|e| format!("unfencing the source: {e}"))?;
     Ok(())
+}
+
+/// After a move, the new map on every shard but the two that took part
+/// (which [`finish_move`] gave it): a shard on the old map routes the moved
+/// range, and coordinates, as if nothing had moved, and a gateway whose home
+/// it is learns nothing from it. One that cannot be reached is named, not
+/// skipped: the move is done, and the map must still reach it.
+async fn install_on_the_rest(next: &ShardMap, signature: Option<&str>, options: &Options, done: &[ShardId]) -> std::result::Result<(), String> {
+    let text = next.to_text().replace('\'', "''");
+    let signed = signature.map(|s| format!(" SIGNATURE '{s}'")).unwrap_or_default();
+    let mut missed = Vec::new();
+    for info in next.shards().iter().filter(|i| !done.contains(&i.id)) {
+        let installed = match connect(next, info.id, options).await {
+            Ok(c) => c.run(&format!("SHARD MAP INSTALL '{text}'{signed}")).await.map(drop).map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = installed {
+            missed.push(format!("shard {}: {e}", info.id));
+        }
+    }
+    if missed.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "the move is done, but map epoch {} did not reach every shard ({}); install it there (rdb-shard show lists each shard's epoch)",
+        next.epoch(),
+        missed.join("; ")
+    ))
 }
 
 /// `exec` (EXECUTE ON EACH SHARD, sharding-plan.md B2): the statement on

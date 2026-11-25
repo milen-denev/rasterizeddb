@@ -97,8 +97,11 @@ impl RangeMap {
                 _ => ranges.push((lo, hi)),
             }
         }
+        // A shard that owns nothing yet (one joining the cluster): one
+        // partition over the whole space, another shard's until a move
+        // brings a range here.
         if ranges.is_empty() {
-            return Err("a shard that owns no blocks has no partitions to lay out".to_string());
+            return Ok((Self::new(vec![(0, 0)])?, vec![0]));
         }
         let total: u128 = ranges.iter().map(|&(lo, hi)| (hi - lo) as u128).sum();
         if (n as usize) < ranges.len() || n as u128 > total || n > MAX_INITIAL {
@@ -251,6 +254,15 @@ impl RangeMap {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_shard_owning_nothing_has_one_foreign_partition() {
+        let (map, foreign) = RangeMap::within(&[], 8).unwrap();
+        map.validate().unwrap();
+        assert_eq!(foreign, vec![0]);
+        assert_eq!(map.entries.len(), 1);
+    }
+
     use super::*;
 
     #[test]

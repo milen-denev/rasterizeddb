@@ -3,7 +3,10 @@
 gateway, driven through the gateway with psql and checked against what was
 written (sharding-plan.md, the cluster test bar).
 
-  cluster_e2e.py <rasterizeddb_core binary> <rasterizeddb_gateway binary> <workdir>
+  cluster_e2e.py <rasterizeddb_core binary> <rasterizeddb_gateway binary> <workdir> [<rdb-shard binary>]
+
+With rdb-shard, a fourth shard joins at the end: half of shard 1's range
+moves onto it online (`rdb-shard split --online`) while a writer runs.
 
 Each check prints PASS or FAIL with what it saw; the exit code is the
 number of failures. Every process is killed at the end, and the workdir is
@@ -12,11 +15,13 @@ left for the logs (`shard<N>.log`, `gateway.log`).
 import os, signal, subprocess, sys, time
 
 CORE, GATEWAY, WORK = sys.argv[1], sys.argv[2], sys.argv[3]
+RDB_SHARD = sys.argv[4] if len(sys.argv) > 4 else None
 BASE = int(os.environ.get("CLUSTER_BASE_PORT", "57100"))
 SHARDS = [0, 1, 2]
-PG = {n: BASE + n for n in SHARDS}             # each shard's own pgwire
-RDB = {n: BASE + 10 + n for n in SHARDS}       # native, unused but distinct
-RSHARD = {n: BASE + 20 + n for n in SHARDS}    # rshard (the gateway's links)
+ALL = SHARDS + [3]                             # 3 joins by a split
+PG = {n: BASE + n for n in ALL}                # each shard's own pgwire
+RDB = {n: BASE + 10 + n for n in ALL}          # native (rdb-shard's way in)
+RSHARD = {n: BASE + 20 + n for n in ALL}       # rshard (the gateway's links)
 GW = BASE + 30                                 # the gateway's pgwire
 CLUSTER = "0123456789abcdef0123456789abcdef"
 BLOCKS = 1 << 48
@@ -35,7 +40,7 @@ def certs():
     d = f"{WORK}/tls"
     os.makedirs(d, exist_ok=True)
     sh(f"openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=rdb-test-ca -keyout {d}/ca.key -out {d}/ca.pem")
-    for name in [f"shard{n}" for n in SHARDS] + ["gateway"]:
+    for name in [f"shard{n}" for n in ALL] + ["gateway"]:
         ext = f"{d}/{name}.ext"
         with open(ext, "w") as f:
             f.write("subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\n"
@@ -59,7 +64,7 @@ def write_map():
 def start_shard(n, tls, cmap):
     log = open(f"{WORK}/shard{n}.log", "ab")
     procs[f"shard{n}"] = subprocess.Popen(
-        [CORE, "--location", f"{WORK}/s{n}", "--protocol", "pgwire", "--pg-port", str(PG[n]), "--pg-password", "pw", "--pg-tls", "prefer",
+        [CORE, "--location", f"{WORK}/s{n}", "--protocol", "all", "--pg-port", str(PG[n]), "--pg-password", "pw", "--pg-tls", "prefer",
          "--rdb-port", str(RDB[n]), "--role", "shard", "--cluster-map", cmap, "--shard-id", str(n),
          "--cluster-id", CLUSTER, "--shard-listen", f"127.0.0.1:{RSHARD[n]}",
          "--shard-cert", f"{tls}/shard{n}.pem", "--shard-key", f"{tls}/shard{n}.key",
@@ -80,6 +85,7 @@ shard_key = {tls}/gateway.key
 auth = scram
 unrouted = fan_out
 two_phase = on
+retries = 10
 """)
     log = open(f"{WORK}/gateway.log", "ab")
     procs["gateway"] = subprocess.Popen([GATEWAY, "--config", conf], stdout=log, stderr=log)
@@ -91,8 +97,11 @@ def psql(port, sql, timeout=60):
     args = []
     for stmt in [x.strip() for x in sql.split(";") if x.strip()]:
         args += ["-c", stmt]
-    r = subprocess.run(["psql", "-h", "127.0.0.1", "-p", str(port), "-U", "rasterized", "-d", "postgres",
-                        "-At", "-v", "ON_ERROR_STOP=1"] + args, env=ENV, capture_output=True, text=True, timeout=timeout)
+    try:
+        r = subprocess.run(["psql", "-h", "127.0.0.1", "-p", str(port), "-U", "rasterized", "-d", "postgres",
+                            "-At", "-v", "ON_ERROR_STOP=1"] + args, env=ENV, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 124, f"no answer in {timeout}s: {sql}"
     return r.returncode, (r.stdout.strip() if r.returncode == 0 else r.stderr.strip())
 
 
@@ -155,7 +164,7 @@ def main():
     on_every_shard("CREATE TABLE stores (id INT PRIMARY KEY, name TEXT NOT NULL)")
     start_gateway(tls, cmap)
     up(GW, "the gateway")
-    if os.environ.get("CLUSTER_SERVE"):
+    if os.environ.get("CLUSTER_SERVE") == "1":
         # Up and left running for poking at by hand, until killed.
         print(f"serving: gateway {GW}, shards {PG}", flush=True)
         while True:
@@ -326,6 +335,54 @@ def main():
     time.sleep(2)
     check("after the restart every row is there", psql(GW, "SELECT count(*) FROM orders") == (0, str(rows + 2)),
           psql(GW, "SELECT count(*) FROM orders"))
+
+    if RDB_SHARD:
+        split_online(tls, cmap)
+    if os.environ.get("CLUSTER_SERVE") == "after":
+        print(f"serving after the checks: gateway {GW}, shards {PG}", flush=True)
+        while True:
+            time.sleep(3600)
+
+
+def split_online(tls, cmap):
+    """Shard 3 joins; the upper half of shard 1's range moves to it online
+    while a writer keeps inserting through the gateway."""
+    start_shard(3, tls, cmap)
+    up(PG[3], "shard 3")
+    on_every_shard_of([3], "CREATE TABLE orders (id INT PRIMARY KEY, store INT NOT NULL, v INT NOT NULL) PARTITION BY HASH (id)")
+    on_every_shard_of([3], "CREATE TABLE stores (id INT PRIMARY KEY, name TEXT NOT NULL)")
+    before = int(psql(GW, "SELECT count(*) FROM orders")[1])
+    writer = psql_script_bg(GW, "".join(f"INSERT INTO orders (id, store, v) VALUES ({k}, 1, 1);\n" for k in range(6000, 6200)), "writer")
+    args = [RDB_SHARD, "split", "--map", cmap, "--shard", "1", "--new-id", "3", "--new-addr", f"127.0.0.1:{RSHARD[3]}",
+            "--new-native", f"127.0.0.1:{RDB[3]}", "--online", "--out", f"{WORK}/split.map", "--state-dir", f"{WORK}/split",
+            "--table", "orders:id:int", "--user", "rasterized", "--database", "postgres"]
+    for n in SHARDS:
+        args += ["--native", f"{n}=127.0.0.1:{RDB[n]}"]
+    r = subprocess.run(args, env=dict(ENV, RDB_PASSWORD="pw"), capture_output=True, text=True, timeout=600)
+    check("rdb-shard split --online", r.returncode == 0, r.stdout + r.stderr)
+    wout, _ = writer.communicate(timeout=300)
+    failed = [l for l in wout.splitlines() if "ERROR" in l]
+    # A writer may see a retryable refusal at the hand-off; every other
+    # insert lands.
+    got = psql(GW, "SELECT count(*) FROM orders WHERE id >= 6000")
+    landed = int(got[1]) if got[0] == 0 else -1
+    if landed < 0:
+        check("  ...a count after the split", False, got)
+    check("  ...the writer kept writing", landed + len(failed) == 200 and len(failed) <= 5, f"{landed} landed, {failed[:3]}")
+    code, out = psql(PG[3], "SET rdb.shard_part = on; SELECT count(*) FROM orders")
+    on3 = int(out.splitlines()[-1]) if code == 0 else -1
+    check("  ...shard 3 holds rows", on3 > 0, out)
+    total = psql(GW, "SELECT count(*) FROM orders")
+    check("  ...every row once, through the gateway", total == (0, str(before + landed)), f"{total}, want {before + landed}")
+    keyed = [k for k in range(1, 300, 7) if psql(GW, f"SELECT v FROM orders WHERE id = {k}") != (0, str(k))]
+    check("  ...keyed reads after the split", not keyed, f"wrong for {keyed[:5]}")
+
+
+def on_every_shard_of(ids, sql):
+    for n in ids:
+        code, out = psql(PG[n], sql)
+        if code != 0 and "already exists" not in out:
+            sys.exit(f"shard {n}: {sql}: {out}")
 
 
 try:
