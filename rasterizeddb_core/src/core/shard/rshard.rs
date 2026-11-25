@@ -107,6 +107,10 @@ struct VSession {
     /// The reply ended (`ReadyForQuery` or CopyInResponse); Continue has
     /// nothing to read.
     finished: bool,
+    /// ReadyForQuery messages still owed to the batch being read: one per
+    /// Query or Sync it carried (a deferred `BEGIN` before the statement is
+    /// two), so the reply is not cut at the first.
+    ready_left: usize,
 }
 
 /// Starts the listener; runs until the process ends.
@@ -452,6 +456,7 @@ async fn open_session(conn: &Conn, session: u64, database: &str, role: &str, par
             role: r.name.clone(),
             pending: Vec::new(),
             finished: true,
+            ready_left: 0,
         })),
     );
     if previous.is_some() {
@@ -465,6 +470,21 @@ fn session_of(conn: &Conn, session: u64) -> Option<StdArc<Mutex<VSession>>> {
 }
 
 /// The tag of the last whole frontend message in `bytes`, if they are whole.
+/// How many ReadyForQuery messages the whole frontend messages `bytes` are
+/// answered with: one per Query and one per Sync.
+fn ready_owed(bytes: &[u8]) -> usize {
+    let mut i = 0;
+    let mut n = 0;
+    while i + 5 <= bytes.len() {
+        if matches!(bytes[i], b'Q' | b'S') {
+            n += 1;
+        }
+        let len = i32::from_be_bytes(bytes[i + 1..i + 5].try_into().unwrap()).max(4) as usize;
+        i += 1 + len;
+    }
+    n
+}
+
 fn last_tag(bytes: &[u8]) -> Option<u8> {
     let mut i = 0;
     let mut last = None;
@@ -520,9 +540,14 @@ async fn pg(conn: &Conn, session: u64, bytes: &[u8]) -> Response {
     }
     s.bridge.raw(bytes);
     s.finished = false;
+    s.ready_left = ready_owed(bytes).max(1);
     s.pending.clear();
     read_chunk(session, &mut s).await
 }
+
+/// The most a coordinator gathers for one statement before it refuses it
+/// `54000`, rather than hold every shard's rows without bound.
+const COORDINATED_MAX_BYTES: usize = 256 << 20;
 
 /// A cheap first look: only text that could be an aggregate is classified,
 /// so ordinary statements pay nothing for the coordinator.
@@ -626,7 +651,11 @@ async fn coordinate_topn(session: u64, s: &mut VSession, topn: super::topn::TopN
         let status = s.bridge.status;
         Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes: error_reply(code, msg, status) }
     };
-    let mine = match top_part(s, &topn).await {
+    let request = query_message(&topn.part_sql);
+    let (database, role) = (s.database.clone(), s.role.clone());
+    let peer_merge = Merge::TopN { limit: topn.limit.saturating_add(topn.offset), offset: 0 };
+    let (mine, peers) = tokio::join!(top_part(s, &topn), peer_parts(&database, &role, &request, peer_merge));
+    let mine = match mine {
         Ok(p) => p,
         Err(e) => return fail(s, "XX000", &e),
     };
@@ -638,9 +667,10 @@ async fn coordinate_topn(session: u64, s: &mut VSession, topn: super::topn::TopN
     }
     let mut rows = mine.rows;
     let fields = mine.fields;
-    let request = query_message(&topn.part_sql);
-    for info in served.map.shards().iter().filter(|i| i.id != served.shard_id) {
-        match peer_part(info.id, &s.database, &s.role, &request, Merge::TopN { limit: topn.limit.saturating_add(topn.offset), offset: 0 }).await {
+    let _ = &served;
+    let mut size = rows.iter().map(|(k, r)| k.len() + r.len()).sum::<usize>();
+    for (id, part) in peers {
+        match part {
             Ok(p) => {
                 if let Some((_, m)) = crate::core::shard::rshard::first_error(&p.tail) {
                     let status = s.bridge.status;
@@ -648,9 +678,13 @@ async fn coordinate_topn(session: u64, s: &mut VSession, topn: super::topn::TopN
                     bytes.extend_from_slice(&[b'Z', 0, 0, 0, 5, status]);
                     return Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes };
                 }
+                size += p.rows.iter().map(|(k, r)| k.len() + r.len()).sum::<usize>();
+                if size > COORDINATED_MAX_BYTES {
+                    return fail(s, "54000", "a coordinated result passed 256 MiB");
+                }
                 rows.extend(p.rows);
             }
-            Err(e) => return fail(s, "XX000", &format!("the coordinator could not gather shard {}'s part: {e}", info.id)),
+            Err(e) => return fail(s, "XX000", &format!("the coordinator could not gather shard {id}'s part: {e}")),
         }
     }
     // Stable: equal keys keep shard order, as PostgreSQL leaves ties
@@ -689,7 +723,10 @@ async fn coordinate_distinct(session: u64, s: &mut VSession, sql: &str) -> Respo
     let status_of = |s: &VSession| s.bridge.status;
     // Keys are not needed: a top-N with no keys and no limit is the plain run.
     let plain = super::topn::TopN { keys: Vec::new(), limit: u64::MAX, offset: 0, part_sql: sql.to_string() };
-    let mine = match top_part(s, &plain).await {
+    let request = query_message(sql);
+    let (database, role) = (s.database.clone(), s.role.clone());
+    let (mine, peers) = tokio::join!(top_part(s, &plain), peer_parts(&database, &role, &request, Merge::Concat));
+    let mine = match mine {
         Ok(p) => p,
         Err(e) => {
             let st = status_of(s);
@@ -709,9 +746,10 @@ async fn coordinate_distinct(session: u64, s: &mut VSession, sql: &str) -> Respo
             rows.push(r);
         }
     }
-    let request = query_message(sql);
-    for info in served.map.shards().iter().filter(|i| i.id != served.shard_id) {
-        match peer_part(info.id, &s.database, &s.role, &request, Merge::Concat).await {
+    let _ = &served;
+    let mut size = rows.iter().map(Vec::len).sum::<usize>();
+    for (id, part) in peers {
+        match part {
             Ok(p) => {
                 if let Some((_, m)) = first_error(&p.tail) {
                     let st = status_of(s);
@@ -721,13 +759,18 @@ async fn coordinate_distinct(session: u64, s: &mut VSession, sql: &str) -> Respo
                 }
                 for (_, r) in p.rows {
                     if seen.insert(r.clone()) {
+                        size += r.len();
                         rows.push(r);
                     }
+                }
+                if size > COORDINATED_MAX_BYTES {
+                    let st = status_of(s);
+                    return Response::PgReply { session, map_epoch: epoch(), more: false, status: st, bytes: error_reply("54000", "a coordinated result passed 256 MiB", st) };
                 }
             }
             Err(e) => {
                 let st = status_of(s);
-                let msg = format!("the coordinator could not gather shard {}'s part: {e}", info.id);
+                let msg = format!("the coordinator could not gather shard {id}'s part: {e}");
                 return Response::PgReply { session, map_epoch: epoch(), more: false, status: st, bytes: error_reply("XX000", &msg, st) };
             }
         }
@@ -824,19 +867,37 @@ async fn peer_client(id: u32) -> Result<StdArc<rastcp::mux::MuxClient>, String> 
     Ok(client)
 }
 
-/// One peer's partial for `bytes` (a simple Query), run as `role` in
-/// `database` on its own virtual session there.
-async fn peer_partial(id: u32, database: &str, role: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let p = peer_part(id, database, role, bytes, Merge::Coordinator).await?;
+/// One peer's partial from its part's reply.
+///
+/// `Err(Ok(body))` is the peer's own ErrorResponse body, which answers for
+/// the statement as it is (its SQLSTATE kept); `Err(Err(text))` is a failure
+/// to get the part at all.
+fn partial_of(id: u32, part: Result<PartReply, String>) -> Result<Vec<u8>, Result<Vec<u8>, String>> {
+    let p = part.map_err(Err)?;
     if let Some((_, m)) = first_error(&p.tail) {
-        return Err(String::from_utf8_lossy(&m).to_string());
+        return Err(Ok(m));
     }
-    p.rows.into_iter().next().map(|(_, partial)| partial).ok_or_else(|| format!("shard {id} returned no partial"))
+    p.rows.into_iter().next().map(|(_, partial)| partial).ok_or_else(|| Err(format!("shard {id} returned no partial")))
+}
+
+/// Every other shard's part of `bytes` under `merge`, asked for at once
+/// (one round trip of latency, not one per shard), in map order.
+async fn peer_parts(database: &str, role: &str, bytes: &[u8], merge: Merge) -> Vec<(u32, Result<PartReply, String>)> {
+    let Some(served) = served() else {
+        return Vec::new();
+    };
+    let ids: Vec<u32> = served.map.shards().iter().map(|i| i.id).filter(|&id| id != served.shard_id).collect();
+    let asks = ids.iter().map(|&id| peer_part(id, database, role, bytes, merge.clone()));
+    ids.iter().copied().zip(futures::future::join_all(asks).await).collect()
 }
 
 /// One peer's part of a coordinated statement, under `merge`.
+///
+/// The link is cached; a peer that restarted since it was made has lost
+/// its Hello (or the connection), and opening the session says so before
+/// anything ran there, so the link is made afresh and the open tried once
+/// more.
 async fn peer_part(id: u32, database: &str, role: &str, bytes: &[u8], merge: Merge) -> Result<PartReply, String> {
-    let client = peer_client(id).await?;
     let session = NEXT_PEER_SESSION.fetch_add(1, Ordering::Relaxed);
     let e = |x: rastcp::error::RastcpError| x.to_string();
     let open = Request::OpenSession {
@@ -847,10 +908,26 @@ async fn peer_part(id: u32, database: &str, role: &str, bytes: &[u8], merge: Mer
         gateway: "coordinator".to_string(),
         pinned: false,
     };
-    match Response::decode(&client.send(&open.encode()).await.map_err(e)?)? {
-        Response::SessionOpened { .. } => {}
-        Response::Refused(r) => return Err(format!("shard {id}: {}", r.message)),
-        other => return Err(format!("shard {id} answered OpenSession with {other:?}")),
+    let mut client = peer_client(id).await?;
+    for attempt in 0..2 {
+        let stale: Result<(), String> = match client.send(&open.encode()).await {
+            Err(x) => Err(e(x)),
+            Ok(reply) => match Response::decode(&reply)? {
+                Response::SessionOpened { .. } => break,
+                Response::Refused(r) if r.sqlstate == HELLO_FIRST => Err(format!("shard {id}: {}", r.message)),
+                Response::Refused(r) => return Err(format!("shard {id}: {}", r.message)),
+                other => return Err(format!("shard {id} answered OpenSession with {other:?}")),
+            },
+        };
+        if let Err(why) = stale {
+            if let Some(m) = PEER_CLIENTS.lock().unwrap().as_mut() {
+                m.remove(&id);
+            }
+            if attempt == 1 {
+                return Err(why);
+            }
+            client = peer_client(id).await?;
+        }
     }
     let req = Request::ExecPart { session, map_epoch: epoch(), merge, bytes: bytes.to_vec() };
     let answer = Response::decode(&client.send(&req.encode()).await.map_err(e)?);
@@ -872,12 +949,19 @@ async fn coordinate(session: u64, s: &mut VSession, bytes: &[u8]) -> Response {
     let Some(served) = served() else {
         return refuse(PROTOCOL, true, "this node is not a shard");
     };
+    let _ = &served;
     let mut partials = Vec::new();
-    for info in served.map.shards().iter().filter(|i| i.id != served.shard_id) {
-        match peer_partial(info.id, &s.database, &s.role, bytes).await {
+    for (id, part) in peer_parts(&s.database, &s.role, bytes, Merge::Coordinator).await {
+        match partial_of(id, part) {
             Ok(p) => partials.push(p),
-            Err(e) => {
-                let msg = format!("the coordinator could not gather shard {}'s part: {e}", info.id);
+            Err(Ok(body)) => {
+                let status = s.bridge.status;
+                let mut bytes = message(b'E', &body);
+                bytes.extend_from_slice(&[b'Z', 0, 0, 0, 5, status]);
+                return Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes };
+            }
+            Err(Err(e)) => {
+                let msg = format!("the coordinator could not gather shard {id}'s part: {e}");
                 return Response::PgReply { session, map_epoch: epoch(), more: false, status: s.bridge.status, bytes: error_reply("XX000", &msg, s.bridge.status) };
             }
         }
@@ -910,7 +994,7 @@ async fn coordinate(session: u64, s: &mut VSession, bytes: &[u8]) -> Response {
     s.finished = true;
     let status = s.bridge.status;
     if !consumed && !reply_has_error(&out) {
-        let msg = "the statement was not answered by a fold the coordinator could merge the other shards into;                    it is refused rather than answered from one shard";
+        let msg = "the statement was not answered by a fold the coordinator could merge the other shards into; it is refused rather than answered from one shard";
         return Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes: error_reply("XX000", msg, status) };
     }
     Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes: out }
@@ -950,8 +1034,11 @@ async fn read_chunk(session: u64, s: &mut VSession) -> Response {
         out.push(tag);
         out.extend_from_slice(&((frame.body.len() + 4) as i32).to_be_bytes());
         out.extend_from_slice(frame.body);
-        if tag == b'Z' || tag == b'G' {
+        if tag == b'G' {
             s.finished = true;
+        } else if tag == b'Z' {
+            s.ready_left = s.ready_left.saturating_sub(1);
+            s.finished = s.ready_left == 0;
         }
     }
     let status = if s.finished && out.len() >= 6 && out[out.len() - 6] == b'Z' { out[out.len() - 1] } else { 0 };

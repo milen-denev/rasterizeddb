@@ -710,13 +710,6 @@ impl Session {
                     self.error_ready(sqlstate, &message);
                     return Ok(Outcome::Done { error: true });
                 }
-                // A reference table's write under two-phase commit: every
-                // copy or none (B5.1).
-                Target::FanOut { merge: Merge::Any, writes: true } if self.core.shared.cfg.two_phase => {
-                    let outcome = self.reference_write(text).await;
-                    self.flush(conn).await?;
-                    return Ok(outcome);
-                }
                 Target::FanOut { merge, writes } => return self.fan_out(conn, msg, merge, writes).await,
                 Target::Gather { tables } => return self.gather_run(conn, text, &tables).await,
                 Target::Shard(s) => {
@@ -788,15 +781,22 @@ impl Session {
         if self.login.pinned.is_some() {
             return needs_key();
         }
-        if self.txn.status != b'I' {
+        let two_phase = self.core.shared.cfg.two_phase;
+        // Inside a transaction a fan-out joins every shard to it, which only
+        // two-phase commit can end; an aggregate the home shard coordinates
+        // joins only the home shard (`fan_out` refuses it once the
+        // transaction ran elsewhere).
+        if self.txn.status != b'I' && !two_phase && merge != Merge::Coordinator {
             return Target::Refuse {
                 sqlstate: "0A000",
-                message: "a statement without a route key cannot fan out inside a transaction block".into(),
+                message: "a statement without a route key cannot fan out inside a transaction block unless the gateway runs two_phase = on".into(),
             };
         }
         // A reference table's write is atomic under two-phase commit
-        // (B5.1), so it needs no each_shard opt-in.
-        if writes && merge == Merge::Any && self.core.shared.cfg.two_phase {
+        // (B5.1), so it needs no each_shard opt-in; nor does a sharded
+        // table's, which changes every shard's rows or none there, once
+        // fan-out is allowed at all.
+        if writes && two_phase && (merge == Merge::Any || matches!(self.unrouted, Unrouted::FanOut)) {
             return Target::FanOut { merge, writes: true };
         }
         if writes {
@@ -852,6 +852,35 @@ impl Session {
                 Err(("08006".into(), e))
             }
             Err(CallError::Lost(e)) | Err(CallError::Bad(e)) => Err(("08006".into(), e)),
+        }
+    }
+
+    /// Sends messages on `shard`'s virtual session; the reply's first error,
+    /// read across every chunk, is the result.
+    pub(crate) async fn send_checked(&mut self, shard: u32, msgs: &[u8]) -> Result<(), (String, String)> {
+        let id = self.vs.get(&shard).map(|v| v.id).ok_or(("08006".to_string(), "no virtual session".to_string()))?;
+        let link = self.core.link(shard).map_err(|e| ("08006".to_string(), e))?;
+        let mut req = Vec::new();
+        Request::encode_pg(&mut req, id, self.core.map().epoch(), msgs);
+        let lost = |e: CallError| ("08006".to_string(), format!("{e:?}"));
+        let mut resp = link.call(&self.core, &req).await.map_err(lost)?;
+        let mut error = None;
+        loop {
+            match resp {
+                Response::PgReply { more, bytes, .. } => {
+                    if error.is_none()
+                        && let Some((_, m)) = pg::messages(&bytes).find(|(t, _)| *t == b'E')
+                    {
+                        error = Some((pg::error_sqlstate(m).unwrap_or("XX000").to_string(), pg::error_message(m).unwrap_or_default()));
+                    }
+                    if !more {
+                        return error.map_or(Ok(()), Err);
+                    }
+                    resp = link.call(&self.core, &Request::Continue { session: id }.encode()).await.map_err(lost)?;
+                }
+                Response::Refused(r) => return Err((r.sqlstate_str().to_string(), r.message)),
+                other => return Err(("XX000".into(), format!("unexpected reply kind {:#04x}", other.kind()))),
+            }
         }
     }
 
@@ -1149,7 +1178,7 @@ impl Session {
 
     /// [`Self::end_two_phase`], answered with `tag` instead of COMMIT: a
     /// statement the gateway ran as its own two-phase transaction.
-    async fn end_two_phase_tagged(&mut self, commit: bool, tag: Option<String>) -> Outcome {
+    pub(crate) async fn end_two_phase_tagged(&mut self, commit: bool, tag: Option<String>) -> Outcome {
         let shards = self.txn.shards.clone();
         if !commit {
             for s in &shards {
@@ -1228,44 +1257,6 @@ impl Session {
         pg::command_complete(&mut self.out, tag.as_deref().unwrap_or("COMMIT"));
         pg::ready(&mut self.out, b'I');
         Outcome::Done { error: false }
-    }
-
-    /// A write to a reference table, outside a block (B5.1): run on every
-    /// shard as one two-phase transaction, so each copy changes or none
-    /// does. Answered with one shard's command tag, since every shard holds
-    /// the same rows.
-    async fn reference_write(&mut self, text: &str) -> Outcome {
-        let shards: Vec<u32> = self.core.map().shards().iter().map(|s| s.id).collect();
-        let mut tag = None;
-        let mut failure: Option<(String, String)> = None;
-        for &s in &shards {
-            match self.tagged_query(s, "BEGIN").await {
-                Ok((_, None, _)) => self.txn.shards.push(s),
-                Ok((_, Some(e), _)) => failure = Some(e),
-                Err(e) => failure = Some(("08006".into(), format!("shard {s}: {e}"))),
-            }
-            if failure.is_some() {
-                break;
-            }
-            match self.tagged_query(s, text).await {
-                Ok((_, None, t)) => tag = tag.or(t),
-                Ok((_, Some(e), _)) => failure = Some(e),
-                Err(e) => failure = Some(("08006".into(), format!("shard {s}: {e}"))),
-            }
-            if failure.is_some() {
-                break;
-            }
-        }
-        if let Some((code, msg)) = failure {
-            for s in self.txn.shards.clone() {
-                let _ = self.quiet_query(s, "ROLLBACK").await;
-            }
-            self.end_txn();
-            self.error_ready(&code, &msg);
-            return Outcome::Done { error: true };
-        }
-        self.txn.status = b'T';
-        self.end_two_phase_tagged(true, tag).await
     }
 
     /// A shard's refusal: retried when nothing took effect and the
@@ -1471,7 +1462,7 @@ impl Session {
 
 /// A new global transaction id, `gateway-pid-n`: unique across gateways,
 /// numbered in order so the deadlock detector can tell the youngest.
-fn next_global_txn(gateway: &str) -> String {
+pub(crate) fn next_global_txn(gateway: &str) -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name: String = gateway.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(40).collect();

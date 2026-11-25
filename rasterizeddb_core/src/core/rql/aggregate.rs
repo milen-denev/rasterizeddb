@@ -1117,6 +1117,23 @@ pub fn is_row_count_only(plan: &AggregatePlan) -> bool {
         })
 }
 
+/// Whether this session's next fold takes part in a cluster fan-out
+/// (sharding-plan.md B1c), so a shortcut that skips the fold must not run.
+pub fn cluster_fold_pending() -> bool {
+    #[cfg(feature = "sharding")]
+    {
+        use crate::core::cancel::Fold;
+        if let Some(session) = crate::pgwire::current_session_cancel() {
+            return match &*session.fold.lock().unwrap_or_else(|e| e.into_inner()) {
+                Fold::Normal => false,
+                Fold::Partial(out) => out.is_none(),
+                Fold::Coordinator { consumed, .. } => !consumed,
+            };
+        }
+    }
+    false
+}
+
 /// The answer to a plan [`is_row_count_only`] admits, given how many rows
 /// matched: [`row_count_result`] when every item is a bare count, and
 /// otherwise the fold's own emit over accumulators that each hold the

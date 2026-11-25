@@ -430,11 +430,10 @@ fn fan_out_read(t: &str, c: &Clauses) -> RouteTemplate {
     {
         return RouteTemplate::FanOut { merge: Merge::Coordinator, writes: false };
     }
-    // ORDER BY … LIMIT over output columns: merged on the coordinator by
-    // sort keys (B1c top-N).
+    // ORDER BY (… LIMIT) over output columns: merged on the coordinator by
+    // sort keys (B1c top-N; with no LIMIT, every row in order).
     if !aggregate && !has("GROUP") && !has("HAVING") && !list_upper.trim_start().starts_with("DISTINCT")
         && has("ORDER")
-        && has("LIMIT")
         && matches!(super::topn::parse(t), Some(Ok(_)))
     {
         return RouteTemplate::FanOut { merge: Merge::Coordinator, writes: false };

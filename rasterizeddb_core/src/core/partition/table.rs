@@ -1885,11 +1885,13 @@ impl PartitionedTable {
         let mut out = Planned::new();
         for pid in route.pids(&epoch.map) {
             let slot = Self::slot(live, pid)?;
-            // On a shard, a statement with no route key reads the rows this
-            // shard owns (a gateway's fan-out sends it to every shard and
-            // combines the answers); one whose key reaches another shard's
-            // range is refused before anything is read (B1a.4).
-            if slot.foreign && matches!(route, Route::All) && fan_out_part() {
+            // On a shard, a fan-out's part reads the rows this shard owns
+            // (the gateway or a coordinator sends it to every shard and
+            // combines the answers), keyed or not: an `IN` list's keys on
+            // other shards are answered there. Any other statement whose
+            // key reaches another shard's range is refused before anything
+            // is read (B1a.4).
+            if slot.foreign && fan_out_part() {
                 continue;
             }
             slot.refuse_foreign(&self.name)?;

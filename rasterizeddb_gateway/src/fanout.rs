@@ -6,9 +6,13 @@
 //! BY) is [`Merge::Coordinator`]: forwarded to the home shard, which
 //! scatters and merges with the engine's own code.
 //!
-//! Reads run in autocommit only, each shard at its own snapshot; writes
-//! (`unrouted_writes = each_shard`) run one shard after another, each its
-//! own transaction, and a failure names the shards that already applied.
+//! Outside a transaction, reads run each shard at its own snapshot. Under
+//! two-phase commit a fan-out also runs inside a transaction (every shard
+//! joined to it first), and a write runs on every shard as one two-phase
+//! transaction: the client's, or the gateway's own in autocommit. Without
+//! it, writes (`unrouted_writes = each_shard`) run one shard after another,
+//! each its own transaction, and a failure names the shards that already
+//! applied.
 
 use std::io;
 use std::rc::Rc;
@@ -30,19 +34,73 @@ impl Session {
     ) -> io::Result<Outcome> {
         self.core.counters.borrow_mut().fan_outs += 1;
         let map = self.core.map();
+        if self.txn.status == b'E' {
+            self.error_ready("25P02", "current transaction is aborted, commands ignored until end of transaction block");
+            return Ok(Outcome::Done { error: true });
+        }
+        let in_txn = self.txn.status != b'I';
         if let Merge::Coordinator = merge {
             let home = self.core.shared.home(&map);
+            if in_txn {
+                // The home shard coordinates with the others outside this
+                // transaction: right only while it has run nowhere else, so
+                // no other shard holds a change of its own it would miss.
+                if self.txn.shards.iter().chain(self.txn.shard.iter()).any(|&s| s != home) {
+                    // A top-N or a DISTINCT merges here instead, over parts
+                    // run inside the transaction on every shard.
+                    if let Some(text) = pg::query_text(msg) {
+                        if let Some((part_sql, limit, offset)) = gateway_top_n(&text) {
+                            let part = query_message(&part_sql);
+                            return self.in_txn_merge(&part, Merge::TopN { limit, offset }, false).await;
+                        }
+                        if is_plain_distinct(&text) {
+                            return self.in_txn_merge(msg, Merge::Concat, true).await;
+                        }
+                    }
+                    self.error_ready(
+                        "0A000",
+                        "an aggregate over every shard cannot run in a transaction that already ran on a shard other than the home shard; run it before the transaction's first keyed statement, or outside it",
+                    );
+                    return Ok(Outcome::Done { error: true });
+                }
+                // Joined first: the shard coordinates only a statement that
+                // comes alone, not behind a deferred BEGIN.
+                if let Err((code, m)) = self.join_txn(&[home]).await {
+                    self.error_ready(&code, &m);
+                    return Ok(Outcome::Done { error: true });
+                }
+            }
             return self.run_on(conn, home, msg, Vec::new(), None).await;
         }
         let shards: Vec<u32> = map.shards().iter().map(|s| s.id).collect();
         if writes {
+            if self.core.shared.cfg.two_phase {
+                return self.fan_write(conn, msg, merge, &shards).await;
+            }
             return self.each_shard(conn, msg, &shards).await;
+        }
+        if in_txn {
+            if let Err((code, m)) = self.join_txn(&shards).await {
+                self.error_ready(&code, &m);
+                return Ok(Outcome::Done { error: true });
+            }
+            let parts = match self.run_parts(&shards, &merge, msg).await {
+                Ok(p) => p,
+                Err((code, m)) => {
+                    self.error_ready(&code, &m);
+                    return Ok(Outcome::Done { error: true });
+                }
+            };
+            merge_parts(&mut self.out, &merge, &parts);
+            let status = self.txn.status;
+            pg::ready(&mut self.out, status);
+            return Ok(Outcome::Done { error: false });
         }
         // A commit decided and mid-flight would show here half done (B5.2).
         committing::settle(std::time::Duration::from_secs(5)).await;
         // One snapshot across the shards (B6.1): every multi-shard commit
         // wholly in or wholly out.
-        let consistent = self.consistent_fanout && self.txn.status == b'I';
+        let consistent = self.consistent_fanout;
         if consistent && let Err((code, m)) = self.consistent_snapshots(&shards).await {
             for &s in &shards {
                 let _ = self.quiet_query(s, "ROLLBACK").await;
@@ -87,12 +145,14 @@ impl Session {
             return Ok(Outcome::Done { error: true });
         }
         // A part's own error (in its tail) answers for the statement.
-        for (s, p) in &parts {
-            if let Some((_, m)) = pg::messages(&p.tail).find(|(t, _)| *t == b'E') {
-                let code = pg::error_sqlstate(m).unwrap_or("XX000").to_string();
-                self.error_ready(&code, &format!("shard {s} failed its part of the statement"));
-                return Ok(Outcome::Done { error: true });
+        if let Err((code, m)) = part_error(&parts) {
+            if consistent {
+                for &s in &shards {
+                    let _ = self.quiet_query(s, "ROLLBACK").await;
+                }
             }
+            self.error_ready(&code, &m);
+            return Ok(Outcome::Done { error: true });
         }
         if consistent {
             for &s in &shards {
@@ -301,15 +361,16 @@ impl Session {
                 Ok(l) => l,
                 Err(e) => return Ok(self.partial("08006", &e, &applied)),
             };
-            let mut req = Vec::new();
-            Request::encode_pg(&mut req, id, self.core.map().epoch(), msg);
+            // A part, so the shard writes the rows it owns and skips the
+            // ranges it does not.
+            let req = Request::ExecPart { session: id, map_epoch: self.core.map().epoch(), merge: Merge::Concat, bytes: msg.to_vec() }.encode();
             let mut bytes = Vec::new();
             let mut resp = link.call(&self.core, &req).await;
             loop {
                 match resp {
-                    Ok(Response::PgReply { more, bytes: b, .. }) => {
-                        bytes.extend_from_slice(&b);
-                        if more {
+                    Ok(Response::PartReply(p)) => {
+                        bytes.extend_from_slice(&p.tail);
+                        if p.more {
                             resp = link.call(&self.core, &Request::Continue { session: id }.encode()).await;
                             continue;
                         }
@@ -325,7 +386,7 @@ impl Session {
             }
             if let Some((_, m)) = pg::messages(&bytes).find(|(t, _)| *t == b'E') {
                 let code = pg::error_sqlstate(m).unwrap_or("XX000").to_string();
-                return Ok(self.partial(&code, &format!("shard {s} failed"), &applied));
+                return Ok(self.partial(&code, &format!("shard {s}: {}", pg::error_message(m).unwrap_or_default()), &applied));
             }
             if let Some((_, m)) = pg::messages(&bytes).filter(|(t, _)| *t == b'C').last()
                 && let Some((head, n)) = pg::tag_count(m)
@@ -340,6 +401,157 @@ impl Session {
         Ok(Outcome::Done { error: false })
     }
 
+    /// Joins every one of `shards` the session's open transaction has not
+    /// reached yet: each gets the transaction's opening messages (its BEGIN,
+    /// the global id it is tagged with, its SET LOCALs) and, when the
+    /// transaction then spans shards, the multi-shard lock timeout.
+    pub(crate) async fn join_txn(&mut self, shards: &[u32]) -> Result<(), (String, String)> {
+        let mut opening = self.txn.opening.clone();
+        if opening.is_empty() {
+            opening = self.txn.pending.clone();
+        }
+        if opening.is_empty() {
+            push_query(&mut opening, "BEGIN");
+        }
+        let ms = self.core.shared.cfg.two_phase_lock_timeout_ms;
+        let spans = shards.len() > 1 || self.txn.shards.iter().chain(self.txn.shard.iter()).any(|s| !shards.contains(s));
+        if spans && ms > 0 && self.core.shared.cfg.two_phase {
+            push_query(&mut opening, &format!("SET LOCAL lock_timeout = {ms}"));
+        }
+        for &s in shards {
+            if self.txn.shards.contains(&s) || self.txn.shard == Some(s) {
+                continue;
+            }
+            self.ensure_vs(s).await.map_err(|(c, m)| (c, format!("shard {s}: {m}")))?;
+            self.send_checked(s, &opening).await.map_err(|(c, m)| (c, format!("shard {s}: {m}")))?;
+            self.txn.shards.push(s);
+            self.txn.shard.get_or_insert(s);
+        }
+        self.txn.pending.clear();
+        self.txn.pending_queries = 0;
+        Ok(())
+    }
+
+    /// Runs `msg` as a part on each of `shards` at once (inside the
+    /// session's transaction there, if one is open), every part's reply in
+    /// shard order. A part's own error fails the whole.
+    async fn run_parts(&mut self, shards: &[u32], merge: &Merge, msg: &[u8]) -> Result<Vec<(u32, PartReply)>, (String, String)> {
+        let mut sessions = Vec::with_capacity(shards.len());
+        for &s in shards {
+            let id = self.ensure_vs(s).await.map_err(|(c, m)| (c, format!("shard {s}: {m}")))?;
+            sessions.push((s, id));
+        }
+        let cap = self.core.shared.cfg.gather_max_bytes;
+        let epoch = self.core.map().epoch();
+        let mut handles = Vec::with_capacity(sessions.len());
+        for (s, id) in sessions {
+            let req = Request::ExecPart { session: id, map_epoch: epoch, merge: merge.clone(), bytes: msg.to_vec() }.encode();
+            handles.push((s, tokio::task::spawn_local(gather(self.core.clone(), s, id, req, cap))));
+        }
+        let mut parts = Vec::with_capacity(handles.len());
+        let mut failure = None;
+        for (s, h) in handles {
+            match h.await {
+                Ok(Ok(p)) => parts.push((s, p)),
+                Ok(Err(e)) => {
+                    failure.get_or_insert(e);
+                }
+                Err(_) => {
+                    failure.get_or_insert(("XX000".into(), format!("the part on shard {s} panicked")));
+                }
+            }
+        }
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        part_error(&parts)?;
+        Ok(parts)
+    }
+
+    /// A write without a route key under two-phase commit: run on every
+    /// shard inside one transaction (the client's, or one of the gateway's
+    /// own that commits it in two phases), so it changes every shard's rows
+    /// or none. Answered with the shards' counts summed (one shard's for a
+    /// reference table, whose every shard holds the same rows).
+    async fn fan_write<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, msg: &[u8], merge: Merge, shards: &[u32]) -> io::Result<Outcome> {
+        let _ = conn;
+        let implicit = self.txn.status == b'I';
+        if implicit {
+            self.txn.opening.clear();
+            push_query(&mut self.txn.opening, "BEGIN");
+            push_query(
+                &mut self.txn.opening,
+                &format!("SET LOCAL rdb.global_txn = '{}'", crate::session::next_global_txn(&self.core.shared.cfg.gateway_name)),
+            );
+            self.txn.opening_queries = 2;
+            self.txn.status = b'T';
+        }
+        let ran = match self.join_txn(shards).await {
+            Ok(()) => self.run_parts(shards, &merge, msg).await,
+            Err(e) => Err(e),
+        };
+        let parts = match ran {
+            Ok(p) => p,
+            Err((code, m)) => {
+                if implicit {
+                    for s in self.txn.shards.clone() {
+                        let _ = self.quiet_query(s, "ROLLBACK").await;
+                    }
+                    self.end_txn();
+                }
+                self.error_ready(&code, &m);
+                return Ok(Outcome::Done { error: true });
+            }
+        };
+        let mut out = Vec::new();
+        merge_parts(&mut out, &merge, &parts);
+        if !implicit {
+            self.out.extend_from_slice(&out);
+            let status = self.txn.status;
+            pg::ready(&mut self.out, status);
+            return Ok(Outcome::Done { error: false });
+        }
+        // Rows (RETURNING) go out now; the count is the commit's answer.
+        let mut tag = None;
+        for (t, m) in pg::messages(&out) {
+            if t == b'C' {
+                tag = pg::cstr(pg::body(m)).map(|(c, _)| c.to_string());
+            } else {
+                self.out.extend_from_slice(m);
+            }
+        }
+        Ok(self.end_two_phase_tagged(true, tag).await)
+    }
+
+    /// A read merged here from parts run inside the session's transaction
+    /// on every shard (every shard joined to it first); `distinct` drops
+    /// rows another part already returned.
+    async fn in_txn_merge(&mut self, msg: &[u8], merge: Merge, distinct: bool) -> io::Result<Outcome> {
+        let shards: Vec<u32> = self.core.map().shards().iter().map(|s| s.id).collect();
+        let joined = self.join_txn(&shards).await;
+        let ran = match joined {
+            Ok(()) => self.run_parts(&shards, &merge, msg).await,
+            Err(e) => Err(e),
+        };
+        let mut parts = match ran {
+            Ok(p) => p,
+            Err((code, m)) => {
+                self.error_ready(&code, &m);
+                return Ok(Outcome::Done { error: true });
+            }
+        };
+        if distinct {
+            let mut seen = std::collections::HashSet::new();
+            for (_, p) in parts.iter_mut() {
+                p.rows.retain(|(_, row)| seen.insert(row.clone()));
+            }
+        }
+        merge_parts(&mut self.out, &merge, &parts);
+        let status = self.txn.status;
+        pg::ready(&mut self.out, status);
+        Ok(Outcome::Done { error: false })
+    }
+
     fn partial(&mut self, code: &str, message: &str, applied: &[u32]) -> Outcome {
         let msg = if applied.is_empty() {
             message.to_string()
@@ -349,6 +561,103 @@ impl Session {
         self.error_ready(code, &msg);
         Outcome::Done { error: true }
     }
+}
+
+/// The first part whose reply holds an error, as that error, the shard
+/// named.
+fn part_error(parts: &[(u32, PartReply)]) -> Result<(), (String, String)> {
+    for (s, p) in parts {
+        if let Some((_, m)) = pg::messages(&p.tail).find(|(t, _)| *t == b'E') {
+            let code = pg::error_sqlstate(m).unwrap_or("XX000").to_string();
+            return Err((code, format!("shard {s}: {}", pg::error_message(m).unwrap_or_default())));
+        }
+    }
+    Ok(())
+}
+
+/// A simple Query message for `sql`.
+fn query_message(sql: &str) -> Vec<u8> {
+    let mut m = Vec::with_capacity(sql.len() + 6);
+    push_query(&mut m, sql);
+    m
+}
+
+/// The statement's trailing words, upper-cased, after its last closing
+/// parenthesis or quote: only there can a top-level LIMIT or OFFSET be told
+/// apart without a parser.
+fn tail_words(t: &str) -> Option<(usize, Vec<(String, usize)>)> {
+    let start = t.rfind([')', '\'', '"']).map_or(0, |i| i + 1);
+    let mut words = Vec::new();
+    let mut at = start;
+    for w in t[start..].split_whitespace() {
+        let p = t[at..].find(w)? + at;
+        words.push((w.to_ascii_uppercase(), p));
+        at = p + w.len();
+    }
+    Some((start, words))
+}
+
+/// A top-N the gateway merges itself (inside a transaction, where the home
+/// shard cannot coordinate): the part each shard runs (`LIMIT limit +
+/// offset`, no OFFSET), `limit` and `offset`. `None` unless the statement
+/// has a top-level ORDER BY and ends in literal LIMIT/OFFSET clauses (or
+/// none: every row, in order). The shards check the keys are output
+/// columns.
+fn gateway_top_n(sql: &str) -> Option<(String, u64, u64)> {
+    let t = sql.trim().trim_end_matches(';').trim_end();
+    if !t.to_ascii_uppercase().contains("ORDER BY") {
+        return None;
+    }
+    // This statement's ORDER BY, not a subquery's: after the last ')'.
+    let upper = t.to_ascii_uppercase();
+    if upper.rfind("ORDER BY")? < t.rfind(')').unwrap_or(0) {
+        return None;
+    }
+    let (_, words) = tail_words(t)?;
+    let n = words.len();
+    let num = |i: usize| words.get(i).and_then(|(w, _)| w.parse::<u64>().ok());
+    let (mut limit, mut offset, mut cut) = (u64::MAX, 0u64, t.len());
+    let mut i = n;
+    // Up to two trailing clauses, LIMIT n and OFFSET m, in either order.
+    for _ in 0..2 {
+        if i >= 2 {
+            match (words[i - 2].0.as_str(), num(i - 1)) {
+                ("LIMIT", Some(_)) if limit != u64::MAX => return None,
+                ("OFFSET", Some(_)) if cut != t.len() && limit == u64::MAX => return None,
+                ("LIMIT", Some(v)) => limit = v,
+                ("OFFSET", Some(v)) => offset = v,
+                ("LIMIT" | "OFFSET", None) => return None,
+                _ => break,
+            }
+            cut = words[i - 2].1;
+            i -= 2;
+        }
+    }
+    // Nothing else after the ORDER BY: no parameter LIMIT, no FETCH, no
+    // locking clause, no second LIMIT.
+    let order_at = upper.rfind("ORDER BY")?;
+    if upper[order_at..cut].split(|c: char| !c.is_ascii_alphanumeric() && c != '_').any(|w| matches!(w, "LIMIT" | "OFFSET" | "FETCH" | "FOR")) {
+        return None;
+    }
+    let head = t[..cut].trim_end();
+    let part = if limit == u64::MAX { head.to_string() } else { format!("{head} LIMIT {}", limit.saturating_add(offset)) };
+    Some((part, limit, offset))
+}
+
+/// `SELECT DISTINCT …` (not DISTINCT ON) with no ORDER BY, LIMIT or OFFSET.
+fn is_plain_distinct(sql: &str) -> bool {
+    let up = sql.trim_start().to_ascii_uppercase();
+    let Some(rest) = up.strip_prefix("SELECT") else { return false };
+    let rest = rest.trim_start();
+    rest.starts_with("DISTINCT") && !rest.starts_with("DISTINCT ON") && !up.contains(" ORDER BY ") && !up.contains(" LIMIT ") && !up.contains(" OFFSET ")
+}
+
+/// Appends a simple Query message for `sql`.
+fn push_query(out: &mut Vec<u8>, sql: &str) {
+    out.push(b'Q');
+    out.extend_from_slice(&((sql.len() + 5) as i32).to_be_bytes());
+    out.extend_from_slice(sql.as_bytes());
+    out.push(0);
 }
 
 /// One shard's part, every chunk fetched, within `cap` bytes.
@@ -498,6 +807,22 @@ fn merge_parts(out: &mut Vec<u8>, merge: &Merge, parts: &[(u32, PartReply)]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gateway_top_n_reads_only_trailing_literal_clauses() {
+        use super::gateway_top_n as g;
+        assert_eq!(g("SELECT id FROM t ORDER BY id DESC LIMIT 3"), Some(("SELECT id FROM t ORDER BY id DESC LIMIT 3".into(), 3, 0)));
+        assert_eq!(g("SELECT id FROM t ORDER BY id LIMIT 3 OFFSET 2;"), Some(("SELECT id FROM t ORDER BY id LIMIT 5".into(), 3, 2)));
+        assert_eq!(g("SELECT id FROM t ORDER BY id OFFSET 2 LIMIT 3"), Some(("SELECT id FROM t ORDER BY id LIMIT 5".into(), 3, 2)));
+        assert_eq!(g("SELECT id FROM t ORDER BY id"), Some(("SELECT id FROM t ORDER BY id".into(), u64::MAX, 0)));
+        assert_eq!(g("SELECT id FROM t ORDER BY id OFFSET 4"), Some(("SELECT id FROM t ORDER BY id".into(), u64::MAX, 4)));
+        // Not literal, not this statement's, or not a plain tail.
+        assert_eq!(g("SELECT id FROM t ORDER BY id LIMIT $1"), None);
+        assert_eq!(g("SELECT * FROM (SELECT id FROM t ORDER BY id LIMIT 3) s"), None);
+        assert_eq!(g("SELECT id FROM t"), None);
+        assert_eq!(g("SELECT id FROM t ORDER BY id FOR UPDATE"), None);
+        assert_eq!(g("SELECT id FROM t ORDER BY id LIMIT 2 LIMIT 3"), None);
+    }
+
     use super::*;
 
     fn part(head: Vec<u8>, rows: Vec<(Vec<u8>, Vec<u8>)>, tag: &str) -> PartReply {

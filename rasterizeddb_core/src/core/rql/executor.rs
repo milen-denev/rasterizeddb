@@ -25348,7 +25348,10 @@ async fn execute_query_rows_body(
         // it rejects `COUNT(*) FILTER (WHERE …)`, whose `arg` is `None`
         // exactly like a bare `COUNT(*)` and which would otherwise be
         // answered with the unfiltered count.
-        if crate::core::rql::aggregate::is_row_count_only(&plan) {
+        // A cluster fan-out's part (or its coordinator) needs the fold
+        // itself: the count path never reaches it, so no partial is
+        // handed over or merged.
+        if crate::core::rql::aggregate::is_row_count_only(&plan) && !crate::core::rql::aggregate::cluster_fold_pending() {
             match source
                 .count(
                     &query_row.where_clause,

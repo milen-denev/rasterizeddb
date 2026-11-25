@@ -89,14 +89,30 @@ pub fn parse(sql: &str) -> Option<Result<TopN, String>> {
     if words.get(order + 1).map(|(w, _)| w.as_str()) != Some("BY") {
         return None;
     }
-    let limit_at = words.iter().position(|(w, _)| w == "LIMIT")?;
-    if limit_at < order {
-        return None;
-    }
     if words.iter().any(|(w, _)| matches!(w.as_str(), "FOR" | "FETCH" | "UNION" | "INTERSECT" | "EXCEPT")) {
         return Some(Err("0A000: this top-N shape is not merged across shards".to_string()));
     }
     let by_end = words[order + 1].1 + 2;
+    let Some(limit_at) = words.iter().position(|(w, _)| w == "LIMIT") else {
+        // ORDER BY with no LIMIT: every row, merged by the same keys (an
+        // OFFSET, if any, applied after the merge).
+        let offset_at = words.iter().position(|(w, _)| w == "OFFSET").filter(|&o| o > order);
+        let (keys_end, offset) = match offset_at {
+            Some(o) => match t[words[o].1 + 6..].trim().parse::<u64>() {
+                Ok(v) => (words[o].1, v),
+                Err(_) => return Some(Err("0A000: an ORDER BY merged across shards needs a literal OFFSET".to_string())),
+            },
+            None => (t.len(), 0),
+        };
+        let keys = match parse_keys(&t[by_end..keys_end]) {
+            Ok(k) => k,
+            Err(e) => return Some(Err(e)),
+        };
+        return Some(Ok(TopN { keys, limit: u64::MAX, offset, part_sql: t[..keys_end].trim_end().to_string() }));
+    };
+    if limit_at < order {
+        return None;
+    }
     let keys_text = &t[by_end..words[limit_at].1];
     let after_limit = &t[words[limit_at].1 + 5..];
     let (limit_text, offset_text) = match words.iter().position(|(w, _)| w == "OFFSET") {
@@ -115,16 +131,27 @@ pub fn parse(sql: &str) -> Option<Result<TopN, String>> {
         },
         None => 0,
     };
+    let keys = match parse_keys(keys_text) {
+        Ok(k) => k,
+        Err(e) => return Some(Err(e)),
+    };
+    let part_sql = format!("{} LIMIT {}", t[..words[limit_at].1].trim_end(), limit.saturating_add(offset));
+    Some(Ok(TopN { keys, limit, offset, part_sql }))
+}
+
+/// The ORDER BY keys of `keys_text` (the text between `BY` and what ends
+/// the list).
+fn parse_keys(keys_text: &str) -> Result<Vec<Key>, String> {
     let mut keys = Vec::new();
     for item in keys_text.split(',') {
         let w: Vec<&str> = item.split_whitespace().collect();
         if w.is_empty() {
-            return Some(Err("an empty ORDER BY key".to_string()));
+            return Err("an empty ORDER BY key".to_string());
         }
         let col = w[0];
         let column = if let Ok(n) = col.parse::<usize>() {
             if n == 0 {
-                return Some(Err("ORDER BY position 0 is not in select list".to_string()));
+                return Err("ORDER BY position 0 is not in select list".to_string());
             }
             KeyRef::Ordinal(n)
         } else if col.bytes().all(|b| is_ident_byte(b) || b == b'.') {
@@ -132,7 +159,7 @@ pub fn parse(sql: &str) -> Option<Result<TopN, String>> {
         } else if col.starts_with('"') && col.ends_with('"') && col.len() > 1 {
             KeyRef::Name(col[1..col.len() - 1].to_string())
         } else {
-            return Some(Err(format!("0A000: ORDER BY {col} is an expression, which a merge across shards does not order by")));
+            return Err(format!("0A000: ORDER BY {col} is an expression, which a merge across shards does not order by"));
         };
         let rest: Vec<String> = w[1..].iter().map(|s| s.to_ascii_uppercase()).collect();
         let desc = rest.iter().any(|s| s == "DESC");
@@ -142,12 +169,11 @@ pub fn parse(sql: &str) -> Option<Result<TopN, String>> {
             None => desc,
         };
         if rest.iter().any(|s| !matches!(s.as_str(), "ASC" | "DESC" | "NULLS" | "FIRST" | "LAST")) {
-            return Some(Err(format!("0A000: ORDER BY {} has a clause a merge across shards does not handle", item.trim())));
+            return Err(format!("0A000: ORDER BY {} has a clause a merge across shards does not handle", item.trim()));
         }
         keys.push(Key { column, desc, nulls_first });
     }
-    let part_sql = format!("{} LIMIT {}", t[..words[limit_at].1].trim_end(), limit.saturating_add(offset));
-    Some(Ok(TopN { keys, limit, offset, part_sql }))
+    Ok(keys)
 }
 
 /// The columns a RowDescription names, with their type OIDs.

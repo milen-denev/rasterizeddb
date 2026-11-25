@@ -112,6 +112,16 @@ pub fn protocol(msg: &str) -> io::Error {
 }
 
 /// A message's body (after type and length).
+/// The SQL of a batch that is exactly one simple Query message.
+pub fn query_text(msg: &[u8]) -> Option<String> {
+    let mut it = messages(msg);
+    let (t, m) = it.next()?;
+    if t != b'Q' || it.next().is_some() {
+        return None;
+    }
+    cstr(body(m)).map(|(s, _)| s.to_string())
+}
+
 pub fn body(msg: &[u8]) -> &[u8] {
     &msg[5..]
 }
