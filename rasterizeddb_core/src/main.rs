@@ -1948,8 +1948,14 @@ fn main() -> std::io::Result<()> {
             Ok(Some(config)) => {
                 let catalog = catalog.clone();
                 tokio::spawn(async move {
+                    // A shard the gateways cannot reach only looks alive: its
+                    // own pgwire answers, every routed statement fails. Its
+                    // listener failing (a port in use, a bad certificate)
+                    // ends the process, for the supervisor to see.
                     if let Err(e) = rasterizeddb_core::core::shard::rshard::serve(catalog, config).await {
-                        log::error!("the rshard listener stopped: {e}");
+                        log::error!("the rshard listener stopped: {e}; a shard cannot run without it, exiting");
+                        eprintln!("the rshard listener stopped: {e}; a shard cannot run without it, exiting");
+                        std::process::exit(2);
                     }
                 });
             }

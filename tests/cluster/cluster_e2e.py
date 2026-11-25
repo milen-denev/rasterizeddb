@@ -245,6 +245,22 @@ def main():
     check("  ...a duplicate in one row inserts none", code != 0 and got == (0, "0"), f"{out} / {got}")
     psql(GW, "DELETE FROM orders WHERE id >= 4001")
 
+    # 4f. Keyless statements over the extended protocol, as drivers send them.
+    code, out = psql_script(GW, "SELECT count(*) FROM orders \\bind \\g\n"
+                                "SELECT sum(v) FROM orders WHERE store = $1 \\bind 3 \\g\n"
+                                "SELECT store, count(*) FROM orders GROUP BY store ORDER BY store \\bind \\g\n"
+                                "SELECT id FROM orders WHERE v > $1 \\parse big\n"
+                                "\\bind_named big 297 \\g\n")
+    lines = [l for l in out.split("\n") if l]
+    want_sum = sum(k for k in range(1, rows + 1) if k % 5 == 3)
+    ok = (code == 0 and lines[0] == str(rows + 2) and lines[1] == str(want_sum) and lines[2:7] == [f"{s}|{rows // 5 + (2 if s == 1 else 0)}" for s in range(5)]
+          and sorted(lines[7:]) == ["298", "299", "300"])
+    check("keyless reads over the extended protocol", ok, out)
+    code, out = psql_script(GW, "UPDATE orders SET v = v + 0 WHERE store = $1 \\bind 4 \\g\n")
+    check("a keyless write over the extended protocol", (code, out) == (0, f"UPDATE {rows // 5}"), out)
+    check("a plain DISTINCT across shards", sorted(psql(GW, "SELECT DISTINCT store FROM orders")[1].split()) == ["0", "1", "2", "3", "4"],
+          psql(GW, "SELECT DISTINCT store FROM orders"))
+
     # 4e. An aggregate in a transaction that already wrote on other shards
     # sees those writes.
     code, out = psql(GW, "BEGIN; INSERT INTO orders (id, store, v) VALUES (5001, 1, 100000); "

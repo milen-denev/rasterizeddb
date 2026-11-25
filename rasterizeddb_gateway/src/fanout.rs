@@ -727,6 +727,83 @@ impl Session {
         }
     }
 
+    /// One extended-protocol statement (`[Parse] Bind [Describe] Execute
+    /// Sync`), as any shard can run it: the client's statement under the
+    /// unnamed name, parsed in the batch itself. `None` for any other batch.
+    fn one_statement(&self, batch: &[u8]) -> Option<OneStatement> {
+        let msgs: Vec<(u8, &[u8])> = pg::messages(batch).collect();
+        let tags: Vec<u8> = msgs.iter().map(|(t, _)| *t).collect();
+        if !matches!(tags.as_slice(), [b'P', b'B', b'E', b'S'] | [b'P', b'B', b'D', b'E', b'S'] | [b'B', b'E', b'S'] | [b'B', b'D', b'E', b'S']) {
+            return None;
+        }
+        let parse = msgs.iter().find(|(t, _)| *t == b'P').map(|(_, m)| m.to_vec());
+        let bind = msgs.iter().find(|(t, _)| *t == b'B').and_then(|(_, m)| pg::parse_bind_all(m))?;
+        let describe = msgs.iter().find(|(t, _)| *t == b'D').and_then(|(_, m)| pg::body(m).first().copied());
+        let (text, parse_msg) = match &parse {
+            Some(p) => match pg::parse_parse(p) {
+                Some((name, text)) if name == bind.statement => (text.to_string(), p.clone()),
+                _ => return None,
+            },
+            None => {
+                let st = self.statements.get(&bind.statement)?;
+                (st.text.clone(), st.parse.clone())
+            }
+        };
+        let types = pg::parse_types(&parse_msg).unwrap_or_default();
+        Some(OneStatement { parse, bind, describe, text, types })
+    }
+
+    /// A statement without a route key sent with the extended protocol,
+    /// fanned out like the simple Query of [`Self::fan_out`]: the batch made
+    /// self-contained (Parse under the unnamed name, then Bind, Describe,
+    /// Execute, Sync), so every shard runs the same thing in the client's
+    /// formats, and the ParseComplete the client did not ask for dropped.
+    pub(crate) async fn fan_out_extended<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, batch: &[u8], merge: Merge, writes: bool) -> io::Result<Option<Outcome>> {
+        // Without two-phase commit a write runs shard after shard with a
+        // reply of its own making, which has no place for the extended
+        // protocol's acknowledgements.
+        if writes && !self.core.shared.cfg.two_phase {
+            return Ok(None);
+        }
+        let Some(one) = self.one_statement(batch) else {
+            return Ok(None);
+        };
+        let mut norm = Vec::with_capacity(batch.len() + one.text.len() + 32);
+        pg::encode_parse(&mut norm, "", &one.text, &one.types);
+        pg::encode_bind(&mut norm, &pg::BindAll { portal: String::new(), statement: String::new(), ..one.bind.clone() });
+        if let Some(kind) = one.describe {
+            pg::encode_describe(&mut norm, kind);
+        }
+        pg::encode_execute(&mut norm);
+        pg::encode_sync(&mut norm);
+        // The unnamed statement on every shard is this one now.
+        for vs in self.vs.values_mut() {
+            vs.parsed.remove("");
+        }
+        let start = self.out.len();
+        let outcome = self.fan_out(conn, &norm, merge, writes).await?;
+        if one.parse.is_none() {
+            // The client sent no Parse: drop the first ParseComplete.
+            let mut at = start;
+            while at + 5 <= self.out.len() {
+                let len = i32::from_be_bytes(self.out[at + 1..at + 5].try_into().unwrap()) as usize;
+                if self.out[at] == b'1' {
+                    self.out.drain(at..at + 1 + len);
+                    break;
+                }
+                at += 1 + len;
+            }
+        } else if let Some(p) = &one.parse
+            && let Some((name, text)) = pg::parse_parse(p)
+        {
+            // Known here from now on; a later Bind re-parses it where it goes.
+            self.generation += 1;
+            let generation = self.generation;
+            self.statements.insert(name.to_string(), crate::session::Stmt { text: text.to_string(), parse: p.clone(), generation });
+        }
+        Ok(Some(outcome))
+    }
+
     /// A prepared multi-row INSERT whose rows go to several shards: a
     /// batch of `[Parse] Bind [Describe] Execute Sync` for one statement
     /// that [`crate::split::split`] cuts. Each row is routed by its own key
@@ -1044,6 +1121,17 @@ fn push_query(out: &mut Vec<u8>, sql: &str) {
     out.extend_from_slice(&((sql.len() + 5) as i32).to_be_bytes());
     out.extend_from_slice(sql.as_bytes());
     out.push(0);
+}
+
+/// One extended-protocol statement of a client's batch.
+struct OneStatement {
+    /// The batch's own Parse message, if it had one.
+    parse: Option<Vec<u8>>,
+    bind: pg::BindAll,
+    /// `b'S'` or `b'P'`.
+    describe: Option<u8>,
+    text: String,
+    types: Vec<u32>,
 }
 
 /// One plain batch's whole reply on `shard`, every chunk fetched.

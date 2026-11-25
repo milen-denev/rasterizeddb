@@ -283,6 +283,15 @@ synchronous_commit, txn_start_time}`; the last is a new executor input, so
     beyond the home shard is merged on the gateway.
   Without `two_phase` a block stays on its first shard, and a fan-out inside
   it is refused.
+- **A statement without a route key may come prepared** (the extended
+  protocol, as every driver sends it), alone in its batch: `[Parse] Bind
+  [Describe] Execute Sync`. The gateway makes the batch self-contained (the
+  statement parsed under the unnamed name in it) and fans it out as it would
+  the simple Query: rows concatenated, counts summed, aggregates and GROUP BY
+  folded on the coordinator (whose fold works the same for an extended
+  statement), writes under `two_phase`, all in the client's result formats.
+  A prepared `ORDER BY … LIMIT` or `SELECT DISTINCT` over every shard is
+  refused `0A000` in this version: send it unprepared, or give it a key.
 - **`synchronous_commit = off`** in cluster mode skips only the replica's local
   outcome fsync, which phase 3 takes off the critical path anyway; the reply
   still follows quorum and apply (§9.2), so a session always reads its own

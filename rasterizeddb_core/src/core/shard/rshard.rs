@@ -518,15 +518,27 @@ async fn pg(conn: &Conn, session: u64, bytes: &[u8]) -> Response {
         Some(b'H') => return refuse(*b"0A000", true, "a batch ending in Flush is not in rshard version 1; end it with Sync"),
         Some(_) => {}
     }
-    // A keyless aggregate the gateway sent here to coordinate (B1c).
-    if let Some(sql) = simple_query_text(bytes)
-        && may_aggregate(&sql)
+    // A keyless aggregate, top-N or DISTINCT the gateway sent here to
+    // coordinate (B1c): a simple Query, or one extended-protocol statement
+    // (Parse, Bind, Describe, Execute, Sync), whose fold works the same.
+    let (sql, extended) = match simple_query_text(bytes) {
+        Some(sql) => (Some(sql), false),
+        None => (extended_statement_text(bytes), true),
+    };
+    if let Some(sql) = sql
+        && may_coordinate(&sql)
         && let Some(guard) = conn.catalog.connect(&s.database)
     {
-        let template = super::classify::classify(guard.database(), rshard::Source::Shape, &sql);
+        let source = if extended { rshard::Source::Parse } else { rshard::Source::Shape };
+        let template = super::classify::classify(guard.database(), source, &sql);
         drop(guard);
         if template == (rshard::RouteTemplate::FanOut { merge: Merge::Coordinator, writes: false }) {
             // A fold, a top-N or a DISTINCT: the classifier sends all three.
+            if extended && !may_aggregate_fold(&sql) {
+                let status = s.bridge.status;
+                let msg = "an ORDER BY or DISTINCT over every shard is merged only for a simple query in this version: send it unprepared, or give it a route key";
+                return Response::PgReply { session, map_epoch: epoch(), more: false, status, bytes: error_reply("0A000", msg, status) };
+            }
             if !may_aggregate_fold(&sql) && is_plain_distinct(&sql) {
                 return coordinate_distinct(session, &mut s, &sql).await;
             }
@@ -554,6 +566,38 @@ async fn pg(conn: &Conn, session: u64, bytes: &[u8]) -> Response {
 /// The most a coordinator gathers for one statement before it refuses it
 /// `54000`, rather than hold every shard's rows without bound.
 const COORDINATED_MAX_BYTES: usize = 256 << 20;
+
+/// A cheap first look: only text that could be an aggregate, a top-N or a
+/// DISTINCT is classified, so ordinary statements pay nothing for the
+/// coordinator.
+fn may_coordinate(sql: &str) -> bool {
+    if may_aggregate(sql) {
+        return true;
+    }
+    let up = sql.to_ascii_uppercase();
+    up.contains("DISTINCT") || up.contains("ORDER")
+}
+
+/// The SQL of a batch that is one extended-protocol statement: `Parse`,
+/// `Bind`, an optional `Describe`, `Execute`, `Sync`, in that order.
+fn extended_statement_text(bytes: &[u8]) -> Option<String> {
+    let mut tags = Vec::new();
+    let mut text = None;
+    let mut i = 0;
+    while i + 5 <= bytes.len() {
+        let len = i32::from_be_bytes(bytes[i + 1..i + 5].try_into().ok()?) as usize;
+        let body = bytes.get(i + 5..i + 1 + len)?;
+        tags.push(bytes[i]);
+        if bytes[i] == b'P' {
+            let name_end = body.iter().position(|&b| b == 0)?;
+            let rest = &body[name_end + 1..];
+            let q_end = rest.iter().position(|&b| b == 0)?;
+            text = Some(String::from_utf8(rest[..q_end].to_vec()).ok()?);
+        }
+        i += 1 + len;
+    }
+    matches!(tags.as_slice(), [b'P', b'B', b'E', b'S'] | [b'P', b'B', b'D', b'E', b'S']).then_some(text).flatten()
+}
 
 /// A cheap first look: only text that could be an aggregate is classified,
 /// so ordinary statements pay nothing for the coordinator.
@@ -980,8 +1024,8 @@ async fn coordinate_given(conn: &Conn, session: u64, partials: Vec<Vec<u8>>, byt
     if served().is_none() {
         return refuse(PROTOCOL, true, "this node is not a shard");
     }
-    if simple_query_text(bytes).is_none() {
-        return refuse(PROTOCOL, true, "a Coordinate request carries one simple Query");
+    if simple_query_text(bytes).is_none() && extended_statement_text(bytes).is_none() {
+        return refuse(PROTOCOL, true, "a Coordinate request carries one statement: a simple Query, or Parse, Bind, Describe, Execute, Sync");
     }
     let Some(s) = session_of(conn, session) else {
         return refuse(SESSION_GONE, true, format!("session {session} is gone"));

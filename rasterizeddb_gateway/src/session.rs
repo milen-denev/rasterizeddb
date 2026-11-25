@@ -148,6 +148,9 @@ pub struct Session {
     pub(crate) discard_until_sync: bool,
     /// The channels this session listens on, once it has (B4.3).
     pub(crate) listener: Option<crate::notify::Listener>,
+    /// Set by `decide_extended` when the batch's statement fans out: how it
+    /// merges, and whether it writes.
+    pub(crate) pending_fanout: Option<(Merge, bool)>,
     pub(crate) out: Vec<u8>,
 }
 
@@ -280,6 +283,7 @@ impl Session {
             copy_shard: None,
             discard_until_sync: false,
             listener: None,
+            pending_fanout: None,
             out: Vec::with_capacity(8 << 10),
         }
     }
@@ -1305,9 +1309,18 @@ impl Session {
         for attempt in 0..=retries {
             self.core.refresh_if_stale().await;
             let map = self.core.map();
+            self.pending_fanout = None;
             let (target, needs, tkey) = match self.decide_extended(&map, batch).await {
                 Ok(v) => v,
                 Err((code, msg)) => {
+                    // A statement without a route key, alone in its batch:
+                    // fanned out as a simple query would be.
+                    if let Some((merge, writes)) = self.pending_fanout.take()
+                        && sync
+                        && let Some(outcome) = self.fan_out_extended(conn, batch, merge, writes).await?
+                    {
+                        return Ok(outcome);
+                    }
                     // A prepared multi-row INSERT is split by row.
                     if code == "0A000"
                         && sync
@@ -1397,8 +1410,15 @@ impl Session {
                         }
                         RouteTemplate::Fixed { block } => map.shard_of_block(block),
                         RouteTemplate::Home => home,
-                        RouteTemplate::FanOut { .. } if !matches!(self.unrouted, Unrouted::Refuse) => {
-                            return Err(("0A000", "a statement without a route key fans out only as a simple query in this version".into()));
+                        RouteTemplate::FanOut { merge, writes } => {
+                            return match self.unrouted_target(merge, writes) {
+                                Target::FanOut { merge, writes } => {
+                                    self.pending_fanout = Some((merge, writes));
+                                    Err(("0A000", "a statement without a route key fans out only alone in its batch: Parse, Bind, Describe, Execute, Sync".into()))
+                                }
+                                Target::Refuse { sqlstate, message } => Err((sqlstate, message)),
+                                _ => Err(no_key()),
+                            };
                         }
                         _ => return Err(no_key()),
                     };
