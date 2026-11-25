@@ -8,6 +8,19 @@ cargo run -p rdb_studio                # pick a connection
 cargo run -p rdb_studio -- studio-demo # open a saved profile straight away
 ```
 
+## Installing the icon on Linux
+
+The window carries the RasterizedDB icon on Windows and on X11. A Wayland
+desktop (KDE Plasma, GNOME) takes a window's taskbar icon and name from the
+`.desktop` file that matches its application id, `rdb_studio`, so install the
+two files that come in the Linux archive once:
+
+```sh
+install -Dm644 rdb_studio.desktop ~/.local/share/applications/rdb_studio.desktop
+install -Dm644 rdb_studio.svg ~/.local/share/icons/hicolor/scalable/apps/rdb_studio.svg
+install -Dm755 rdb-studio ~/.local/bin/rdb-studio      # the desktop file runs `rdb-studio`
+```
+
 ## What it does
 
 | Screen | What it answers |

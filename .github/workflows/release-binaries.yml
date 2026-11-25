@@ -161,6 +161,7 @@ jobs:
           mkdir -p "dist/$server"
           cp "target/${{ matrix.target }}/release/rasterizeddb_core$ext" "dist/$server/rasterizeddb$ext"
           cp README.md LICENSE-GPL "dist/$server/"
+          cp branding/rasterizeddb.svg "dist/$server/rasterizeddb.svg"
           cd dist
           echo "server=$(pack "$server")" >> "$GITHUB_OUTPUT"
           if [ "${{ matrix.studio }}" = true ]; then
@@ -169,6 +170,10 @@ jobs:
             cp "../target/${{ matrix.target }}/release/rdb_studio$ext" "$studio/rdb-studio$ext"
             cp ../rdb_studio/README.md "$studio/README.md"
             cp ../LICENSE-GPL "$studio/"
+            # The icon, and on Linux the desktop entry that shows it in menus
+            # and the taskbar (Wayland takes it from there, by application id).
+            cp ../branding/rasterizeddb.svg "$studio/rdb_studio.svg"
+            case "${{ matrix.target }}" in *linux*) cp ../rdb_studio/packaging/rdb_studio.desktop "$studio/" ;; esac
             echo "studio=$(pack "$studio")" >> "$GITHUB_OUTPUT"
           fi
 
