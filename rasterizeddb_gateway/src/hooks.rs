@@ -112,10 +112,19 @@ pub struct Hooks {
     pub has_user_routing: bool,
     /// `None`: nothing is measured per statement beyond the counters.
     pub observer: Option<Arc<dyn Observer>>,
+    /// Paths of the configuration API a hook crate serves.
+    #[cfg(feature = "config_api")]
+    pub api: Option<Arc<dyn crate::api::ApiExtension>>,
 }
 
 impl Default for Hooks {
     fn default() -> Self {
-        Hooks { user_routing: Arc::new(NoUserRouting), has_user_routing: false, observer: None }
+        Hooks {
+            user_routing: Arc::new(NoUserRouting),
+            has_user_routing: false,
+            observer: None,
+            #[cfg(feature = "config_api")]
+            api: None,
+        }
     }
 }

@@ -83,6 +83,12 @@ pub struct Config {
     pub template_cache_shared: usize,
     pub auth_cache_secs: u64,
     pub admin: Option<SocketAddr>,
+    /// The configuration API (`api`): where it listens, the file holding
+    /// its bearer token, and the directory of the local store it keeps the
+    /// configuration in.
+    pub api_listen: Option<SocketAddr>,
+    pub api_token_file: Option<std::path::PathBuf>,
+    pub config_dir: Option<std::path::PathBuf>,
     pub native_listen: Option<SocketAddr>,
     /// The Redis protocol, routed by key (`kv`): where it listens, and each
     /// shard's Redis address.
@@ -139,6 +145,9 @@ impl Default for Config {
             template_cache_shared: 65_536,
             auth_cache_secs: 60,
             admin: None,
+            api_listen: None,
+            api_token_file: None,
+            config_dir: None,
             native_listen: None,
             kv_listen: None,
             kv_shards: BTreeMap::new(),
@@ -219,7 +228,9 @@ impl Config {
         Ok(c)
     }
 
-    fn set(&mut self, k: &str, v: &str) -> Result<(), String> {
+    /// Sets `k` to `v` as a config file line does (the API's settings use
+    /// it too, so a value it stores is one the gateway reads).
+    pub fn set(&mut self, k: &str, v: &str) -> Result<(), String> {
         let num = |v: &str| v.parse::<u64>().map_err(|_| format!("{v:?} is not a number"));
         let opt = |v: &str| (!v.is_empty() && v != "off" && v != "none").then(|| v.to_string());
         match k {
@@ -335,6 +346,9 @@ impl Config {
                 }
             }
             "shard_compression_min_bytes" => self.shard_compression_min_bytes = num(v)?.clamp(64, u32::MAX as u64) as u32,
+            "api_listen" => self.api_listen = opt(v).map(|a| a.parse()).transpose().map_err(|_| "not host:port")?,
+            "api_token_file" => self.api_token_file = opt(v).map(std::path::PathBuf::from),
+            "config_dir" => self.config_dir = opt(v).map(std::path::PathBuf::from),
             _ => return Err("unknown key".into()),
         }
         Ok(())

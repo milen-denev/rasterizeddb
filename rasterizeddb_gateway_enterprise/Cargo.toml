@@ -19,9 +19,10 @@ rasterizeddb_gateway = { path = "../rasterizeddb_gateway", version = "1.0.0" }
 env_logger = "0.11"
 log = "0.4"
 tokio = { version = "1.54", features = ["rt", "sync", "time", "macros"] }
+serde_json = "1"
 # The statistics' history, kept in an embedded engine (client_stats_embedded).
 rasterizeddb_embedded = { path = "../rasterizeddb_embedded", optional = true }
-rasterizeddb_client = { path = "../rasterizeddb_client", optional = true, default-features = false }
+rasterizeddb_client = { path = "../rasterizeddb_client", default-features = false }
 
 [features]
 default = ["user_routing", "client_stats", "client_stats_embedded"]
@@ -32,4 +33,4 @@ user_routing = []
 client_stats = []
 # Their history, in intervals, kept in an embedded RasterizedDB
 # (--client-stats-dir; SHOW CLIENT STATS HISTORY).
-client_stats_embedded = ["client_stats", "dep:rasterizeddb_embedded", "dep:rasterizeddb_client"]
+client_stats_embedded = ["client_stats", "dep:rasterizeddb_embedded"]

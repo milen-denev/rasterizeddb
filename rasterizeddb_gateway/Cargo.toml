@@ -30,9 +30,18 @@ log = "0.4"
 env_logger = "0.11"
 # The links to the shards, compressed when `shard_compression` says so.
 zstd = { version = "0.14", optional = true }
+# The configuration API's local store (an embedded RasterizedDB, low-memory)
+# and its JSON.
+rasterizeddb_embedded = { path = "../rasterizeddb_embedded", optional = true }
+rasterizeddb_client = { path = "../rasterizeddb_client", optional = true, default-features = false }
+serde_json = { version = "1", optional = true }
 
 [features]
-default = ["tls", "native", "fanout", "shard_compression"]
+default = ["tls", "native", "fanout", "shard_compression", "config_api"]
+# An HTTP API (bearer token) to read and change the gateway's configuration,
+# kept in a local embedded RasterizedDB in low-memory mode (`api_listen`,
+# `api_token_file`, `config_dir`).
+config_api = ["dep:rasterizeddb_embedded", "dep:rasterizeddb_client", "dep:serde_json"]
 # zstd on the links to the shards, turned on per gateway by the
 # `shard_compression` setting (off unless set).
 shard_compression = ["dep:zstd"]

@@ -19,6 +19,8 @@
 #![forbid(unsafe_code)]
 
 pub mod admin;
+#[cfg(feature = "config_api")]
+pub mod api;
 pub mod config;
 pub mod conn;
 pub mod copysplit;
@@ -59,7 +61,48 @@ pub fn run(cfg: Config) -> Result<(), String> {
 
 /// Runs the gateway until SIGTERM or SIGINT, then drains (R10).
 pub fn run_with(cfg: Config, hooks: Hooks) -> Result<(), String> {
+    #[allow(unused_mut)]
+    let mut cfg = cfg;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    // The admin endpoint, the configuration API, the native front end and
+    // the signal watcher share one small runtime of their own, off the
+    // cores' paths.
+    let side = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    // The local configuration store: its settings are applied over the
+    // config file's, before anything reads them.
+    #[cfg(feature = "config_api")]
+    let store = match cfg.config_dir.clone() {
+        Some(dir) => {
+            let (db, client) = side.block_on(api::open_store(&dir))?;
+            let stored = side.block_on(api::stored_settings(&client))?;
+            for (k, v) in &stored {
+                cfg.set(k, v).map_err(|e| format!("the configuration store's {k} = {v}: {e}"))?;
+            }
+            if !stored.is_empty() {
+                log::info!("{} setting(s) applied from the configuration store in {}", stored.len(), dir.display());
+            }
+            if let Some(x) = &hooks.api {
+                for sql in x.schema() {
+                    side.block_on(client.run(&sql)).map_err(|e| format!("the configuration store: {e}"))?;
+                }
+                side.block_on(x.load(&client))?;
+            }
+            Some((db, Arc::new(client)))
+        }
+        None => None,
+    };
+    #[cfg(feature = "config_api")]
+    if cfg.api_listen.is_some() && (store.is_none() || cfg.api_token_file.is_none()) {
+        return Err("api_listen needs config_dir (the store) and api_token_file (the bearer token)".into());
+    }
+    #[cfg(not(feature = "config_api"))]
+    if cfg.api_listen.is_some() || cfg.config_dir.is_some() {
+        return Err("api_listen and config_dir need a build with config_api".into());
+    }
     if let Relay::Tcp(addr) = &cfg.relay {
         return relay::run(&cfg, addr.clone());
     }
@@ -118,13 +161,11 @@ pub fn run_with(cfg: Config, hooks: Hooks) -> Result<(), String> {
         );
     }
 
-    // The admin endpoint, the native front end and the signal watcher share
-    // one small runtime of their own, off the cores' paths.
-    let side = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
+    #[cfg(feature = "config_api")]
+    if let (Some(addr), Some((_, client))) = (shared.cfg.api_listen, &store) {
+        let token = api::read_token(shared.cfg.api_token_file.as_ref().expect("checked above"))?;
+        side.spawn(api::serve(shared.clone(), addr, token, client.clone(), shared.hooks.api.clone()));
+    }
     if let Some(addr) = shared.cfg.admin {
         side.spawn(admin::serve(shared.clone(), addr));
     }

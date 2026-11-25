@@ -497,7 +497,8 @@ impl History {
                     }
                 };
                 rt.block_on(async move {
-                    let db = match rasterizeddb_embedded::Builder::open(&dir).start().await {
+                    // Low-memory mode, always: it keeps a few rows a minute.
+                    let db = match rasterizeddb_embedded::Builder::open(&dir).low_memory().start().await {
                         Ok(db) => db,
                         Err(e) => {
                             let _ = ready_tx.send(Err(format!("{}: {e}", dir.display())));

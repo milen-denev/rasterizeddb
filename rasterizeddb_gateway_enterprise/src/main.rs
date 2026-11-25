@@ -23,6 +23,7 @@ fn main() {
     let mut stats_roles: Vec<String> = Vec::new();
     let mut max_clients: usize = 4096;
     let mut stats_dir: Option<String> = None;
+    let mut shard_role = "rasterized".to_string();
     let mut flush_secs: u64 = 60;
     let mut retention_hours: u64 = 168;
     let mut rest = Vec::new();
@@ -52,6 +53,7 @@ fn main() {
             "--client-stats-dir" => stats_dir = args.next(),
             "--client-stats-flush-secs" => flush_secs = num("--client-stats-flush-secs", args.next()).max(1),
             "--client-stats-retention-hours" => retention_hours = num("--client-stats-retention-hours", args.next()).max(1),
+            "--api-shard-role" => shard_role = args.next().unwrap_or_else(|| fail("--api-shard-role takes a role".into())),
             _ => rest.push(a),
         }
     }
@@ -60,21 +62,46 @@ fn main() {
         Err(e) => fail(e.to_string()),
     };
     let mut hooks = rasterizeddb_gateway::hooks::Hooks::default();
-    if let Some(path) = routes_path {
+    // Per-user routes: from a file, or kept by the configuration API in the
+    // local store (config_dir).
+    let routes = if let Some(path) = routes_path {
         let routes = match rasterizeddb_gateway_enterprise::Routes::open(std::path::Path::new(&path), require) {
             Ok(r) => Arc::new(r),
             Err(e) => fail(e),
         };
         watch_routes(routes.clone(), std::path::PathBuf::from(&path));
-        hooks.user_routing = routes;
+        Some(routes)
+    } else if cfg.config_dir.is_some() {
+        Some(Arc::new(rasterizeddb_gateway_enterprise::Routes::held(require)))
+    } else {
+        if require {
+            fail("--user-routes-require needs --user-routes FILE or a config_dir".into());
+        }
+        None
+    };
+    if let Some(r) = &routes {
+        hooks.user_routing = r.clone();
         hooks.has_user_routing = true;
-    } else if require {
-        fail("--user-routes-require needs --user-routes FILE".into());
     }
+    #[cfg(feature = "client_stats")]
+    let mut stats_handle = None;
     if stats_on {
-        hooks.observer = Some(client_stats(stats_roles, max_clients, stats_dir, flush_secs, retention_hours));
+        let o = client_stats(stats_roles, max_clients, stats_dir, flush_secs, retention_hours);
+        #[cfg(feature = "client_stats")]
+        {
+            stats_handle = Some(o.clone());
+        }
+        hooks.observer = Some(o);
     } else if stats_dir.is_some() {
         fail("--client-stats-dir needs the client statistics on".into());
+    }
+    if let Some(routes) = routes.clone().filter(|_| cfg.config_dir.is_some()) {
+        hooks.api = Some(Arc::new(rasterizeddb_gateway_enterprise::api::EnterpriseApi {
+            routes,
+            shard_role,
+            #[cfg(feature = "client_stats")]
+            stats: stats_handle,
+        }));
     }
     if let Err(e) = rasterizeddb_gateway::run_with(cfg, hooks) {
         eprintln!("rasterizeddb_gateway_enterprise: {e}");
@@ -107,7 +134,7 @@ fn client_stats(
     dir: Option<String>,
     flush_secs: u64,
     retention_hours: u64,
-) -> Arc<dyn rasterizeddb_gateway::hooks::Observer> {
+) -> Arc<rasterizeddb_gateway_enterprise::stats::ClientStats> {
     use rasterizeddb_gateway_enterprise::stats::{ClientStats, Settings};
     if roles.is_empty() {
         log::warn!("client statistics are kept, but no role may read them: name some with --client-stats-roles");

@@ -154,8 +154,18 @@ async fn login<S: AsyncRead + AsyncWrite + Unpin>(
         return pg::write_all(s, &out).await;
     }
 
+    // A login pinned to its shard (G11) proves itself against that shard's
+    // roles: its database may live nowhere else. The pin is acted on (a
+    // refusal included) only after the proof.
+    let keys_from = match shared.cfg.user_routing {
+        UserRoutingMode::Off => None,
+        _ => match shared.hooks.user_routing.pin(&database, &role) {
+            UserPin::Shard(id) => Some(id),
+            _ => None,
+        },
+    };
     if shared.cfg.auth == AuthMode::Scram {
-        match authenticate(&core, s, &mut reader, &database, &role, cbind.as_ref()).await? {
+        match authenticate(&core, s, &mut reader, &database, &role, cbind.as_ref(), keys_from).await? {
             Ok(()) => {}
             Err(msg) => {
                 core.counters.borrow_mut().auth_failures += 1;
@@ -238,11 +248,12 @@ async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
     database: &str,
     role: &str,
     cbind: Option<&[u8; 32]>,
+    keys_from: Option<u32>,
 ) -> io::Result<Result<(), String>> {
     let shared = &core.shared;
     let keys = match shared.auth.get(database, role) {
         Some(k) => k,
-        None => match fetch_keys(core, database, role).await {
+        None => match fetch_keys(core, database, role, keys_from).await {
             Ok(k) => {
                 shared.auth.put(database, role, k.clone());
                 k
@@ -322,9 +333,9 @@ async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-async fn fetch_keys(core: &Core, database: &str, role: &str) -> Result<AuthKeys, String> {
+async fn fetch_keys(core: &Core, database: &str, role: &str, from: Option<u32>) -> Result<AuthKeys, String> {
     let map = core.map();
-    let home = core.shared.home(&map);
+    let home = from.unwrap_or_else(|| core.shared.home(&map));
     let link = core.link(home)?;
     let req = Request::AuthFetch { database: database.to_string(), role: role.to_string() }.encode();
     match link.call(core, &req).await {
