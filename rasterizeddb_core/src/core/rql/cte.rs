@@ -3023,6 +3023,13 @@ async fn materialize_derived_inner(
         found_any = true;
         crate::owner_probe!(crate::core::mvcc::owner::probe::Site::Derived, tx, database);
 
+        // Built for the rows the statement can use: the keys of a relation
+        // it joins that is built already, and its own WHERE over literals
+        // (`derived_pushdown`).
+        let inner = match crate::core::rql::derived_pushdown::narrowed(&current, start, end, &inner, &alias, temps, database, tx).await {
+            Some(narrowed) => narrowed,
+            None => inner,
+        };
         let temp = materialize_query(&inner, &alias, &current, database, tx).await?;
         temps.push(temp.clone());
         current = format!("{}{} {}{}", &current[..start], temp, alias, &current[end..]);

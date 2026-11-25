@@ -456,7 +456,7 @@ pub(crate) async fn qualify_outer_columns(sql: &str, item: &Item, database: &Arc
 
 /// The `FROM` items before `upto`: each alias (or bare relation name) and the
 /// relation text it names.
-fn items_before(sql: &str, upto: usize) -> Vec<(String, String)> {
+pub(crate) fn items_before(sql: &str, upto: usize) -> Vec<(String, String)> {
     let Some(from) = find_keyword(&sql[..upto], "FROM", 0) else {
         return Vec::new();
     };
@@ -1625,7 +1625,7 @@ async fn fill_one_null_row(relation: &str, database: &Arc<Database>, tx: TxId) -
 
 /// The first `width` cells of each row `query` returns, as text: it selects
 /// `::text` values only. `None` for a NULL.
-async fn text_rows(query: &str, width: usize, database: &Arc<Database>, tx: TxId) -> Result<Vec<Vec<Option<String>>>, String> {
+pub(crate) async fn text_rows(query: &str, width: usize, database: &Arc<Database>, tx: TxId) -> Result<Vec<Vec<Option<String>>>, String> {
     let (rows, _) = crate::core::rql::executor::run_query_rows_scaled(query, database, tx).await?;
     Ok(rows
         .iter()
