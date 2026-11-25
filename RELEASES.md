@@ -10,6 +10,7 @@
 
 ### Statements that failed, now answered
 
+- Quoted table aliases, as EF Core (Npgsql), SeaORM and most ORMs write them (`"d"."id"`), failed in three places: a correlated `EXISTS` whose subquery joins two tables (`column "d0" does not exist`), an expression over a join on a column both tables have (`COALESCE("d"."c", 0)`: "neither a column nor a value"), and a correlated subquery in the select list (`missing FROM-clause entry for table "d"`).
 - `x [NOT] LIKE|ILIKE ANY|SOME|ALL (array)` failed ("unexpected LPar", "function 'ANY' is not supported yet"), with the array bound as a parameter (a driver's `text[]`), written as `'{…}'` or `ARRAY[…]`. It now matches each pattern (`ANY` any of them, `ALL` every one), with empty and `NULL` arrays answered as in PostgreSQL. Patterns read from a column or a subquery are still unsupported.
 - `ORDER BY "t"."c"` (a quoted, table-qualified column, as SeaORM writes it) over a join, on a column not in the select list, failed: the quotes were trimmed from the whole term, and on a column both joined tables have (`updated_at`, `id`) the quoted term was never matched to its table's column.
 - At READ COMMITTED, three or more transactions updating one row failed with 40001 ("could not serialize access due to concurrent update") when the first held the row for more than 1.5 s: a waiter that lost the race after the holder committed gave up instead of waiting its turn. Every writer now waits and applies, as in PostgreSQL; REPEATABLE READ still refuses.
@@ -30,6 +31,7 @@
 
 ### Speed
 
+- A correlated subquery in the select list is computed only for the rows that pass an `EXISTS` filter on the same query, instead of for every row before it: a related-products query over 9,900 products, of which 2 matched, took 14.5 s.
 - Every statement could stall for tens of seconds behind one slow disk sync: starting a transaction made the next block of transaction ids durable while holding the lock every new transaction needs, so one `fsync` on a busy disk froze reads and writes alike (seen on a production node as 31–47 s stalls with all waiting writes finishing in the same millisecond). The next block is now reserved early, half a block ahead and outside that lock; an id is still never handed out before its reservation is durable.
 - SQL Server front end: a `SqlBulkCopy` or parameterised insert into a `datetime2(7)` column no longer evaluates an expression per row (20,000 rows: 36 s → 13 s), and a case-insensitive column's key is computed from its value instead of re-parsing an expression per row (long text in a bulk copy: about 45 s of 20,000 rows was spent there), and an `INFORMATION_SCHEMA` lookup naming one table builds only that table's rows (it took ~12 s on a database of ~100 tables, past EF Core's 30 s command timeout under load).
 - A transaction block's `COMMIT` synced about 55 times per DDL statement in it. EF Core's `EnsureCreated` (92 tables, 128 indexes) committed in 30–75 s and now takes under a second.
