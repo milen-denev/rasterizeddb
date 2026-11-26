@@ -50,6 +50,8 @@ const EXCHANGE: &str = "amq.mqtt";
 const RETAINED: &str = "$mqtt.retained";
 const HDR_QOS: &[u8] = b"mqtt-q";
 const HDR_PROPS: &[u8] = b"mqtt-p";
+/// Marks a retained copy put on a session's queue at subscribe time.
+const HDR_RETAIN: &[u8] = b"mqtt-r";
 
 #[derive(Clone, Debug)]
 pub enum MqttAuth {
@@ -953,12 +955,23 @@ impl Conn {
         }
         ack.extend_from_slice(&codes);
         packet(out, SUBACK << 4, &ack);
-        for (t, msg, granted) in retained_out {
-            let q = msg.qos.min(granted);
-            // Retained messages go straight out; a QoS 1/2 one is not
-            // tracked, since it is a copy of the retained store.
-            let _ = q;
-            self.write_publish(out, &t, 0, true, false, 0, &msg.props, &msg.payload);
+        // Retained messages go onto the session's own queue, marked, so they
+        // are delivered (and, at QoS 1/2, acknowledged) like any other.
+        if !retained_out.is_empty() {
+            if let Some(topic) = broker.topic(&queue) {
+                for (t, msg, _granted) in retained_out {
+                    let mut headers: Vec<(&[u8], &[u8])> =
+                        vec![(HDR_QOS, std::slice::from_ref(&msg.qos)), (HDR_RETAIN, b"1")];
+                    if !msg.props.is_empty() {
+                        headers.push((HDR_PROPS, &msg.props));
+                    }
+                    let mut b = BatchBuilder::with_capacity(msg.payload.len() + 128);
+                    let _ = b.push(Some(t.as_bytes()), &msg.payload, &headers);
+                    if let Err(e) = broker.produce(&topic, 0, &mut b.finish(), false) {
+                        log::warn!("mqtt: retained message for {t} not queued: {e}");
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1087,8 +1100,9 @@ impl Conn {
                 let published = rec.header(HDR_QOS).and_then(|q| q.first().copied()).unwrap_or(0);
                 let qos = published.min(granted);
                 let props = rec.header(HDR_PROPS).unwrap_or(&[]);
+                let retain = rec.header(HDR_RETAIN).is_some();
                 if qos == 0 {
-                    self.write_publish(out, topic, 0, false, false, 0, props, rec.value);
+                    self.write_publish(out, topic, 0, retain, false, 0, props, rec.value);
                     done.push(range);
                     credit += 1;
                     continue;
@@ -1097,7 +1111,7 @@ impl Conn {
                 // A record delivered before (unacked at the last disconnect)
                 // carries DUP. The subscription does not say, so the first
                 // delivery after a resume is marked when it was in flight.
-                self.write_publish(out, topic, qos, false, false, id, props, rec.value);
+                self.write_publish(out, topic, qos, retain, false, id, props, rec.value);
                 self.outgoing.insert(id, Outgoing { sub: sub.clone(), range, qos, released: false });
             }
         }

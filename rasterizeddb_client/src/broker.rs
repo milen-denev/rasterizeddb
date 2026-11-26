@@ -169,9 +169,28 @@ impl Fetched {
 
 type Reply = std::result::Result<Vec<u8>, BrokerError>;
 
+/// A request waiting for its reply. A SUBSCRIBE also carries its
+/// subscription's channel, which the read loop registers under the handle
+/// the reply names before it reads the next frame: the server's first
+/// deliveries can follow the reply in the same read.
+enum Pending {
+    Call(oneshot::Sender<Reply>),
+    Subscribe(oneshot::Sender<Reply>, mpsc::UnboundedSender<Push>),
+}
+
+impl Pending {
+    fn reply(self, r: Reply) {
+        match self {
+            Pending::Call(tx) | Pending::Subscribe(tx, _) => {
+                let _ = tx.send(r);
+            }
+        }
+    }
+}
+
 struct Inner {
     tx: mpsc::UnboundedSender<Vec<u8>>,
-    pending: parking_mutex::Mutex<HashMap<u32, oneshot::Sender<Reply>>>,
+    pending: parking_mutex::Mutex<HashMap<u32, Pending>>,
     subs: parking_mutex::Mutex<HashMap<u32, mpsc::UnboundedSender<Push>>>,
     next: AtomicU32,
     closed: AtomicBool,
@@ -289,7 +308,11 @@ impl Broker {
 
     async fn call_frame(&self, corr: u32, frame: Vec<u8>) -> Result<Vec<u8>> {
         let (tx, rx) = oneshot::channel();
-        self.inner.pending.lock().insert(corr, tx);
+        self.call_pending(corr, frame, Pending::Call(tx), rx).await
+    }
+
+    async fn call_pending(&self, corr: u32, frame: Vec<u8>, pending: Pending, rx: oneshot::Receiver<Reply>) -> Result<Vec<u8>> {
+        self.inner.pending.lock().insert(corr, pending);
         if let Err(e) = self.send_frame(frame) {
             self.inner.pending.lock().remove(&corr);
             return Err(e);
@@ -419,7 +442,7 @@ impl Broker {
             w.raw(batch)
         });
         let (tx, rx) = oneshot::channel();
-        self.inner.pending.lock().insert(corr, tx);
+        self.inner.pending.lock().insert(corr, Pending::Call(tx));
         if let Err(e) = self.send_frame(frame) {
             self.inner.pending.lock().remove(&corr);
             return Err(e);
@@ -486,7 +509,11 @@ impl Broker {
         wire::frame(&mut frame, op::SUBSCRIBE, 0, corr, |w| {
             wire::Subscribe { topic: topic.id, name: name.to_string(), config, credits }.encode(w)
         });
-        let r = self.call_frame(corr, frame).await?;
+        // The channel goes in with the request; the read loop files it under
+        // the handle as it routes the reply (see `Pending`).
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let r = self.call_pending(corr, frame, Pending::Subscribe(reply_tx, tx), reply_rx).await?;
         let mut r = Reader::new(&r);
         let handle = r.u32()?;
         let n = r.u32()? as usize;
@@ -494,8 +521,6 @@ impl Broker {
         for _ in 0..n {
             assigned.push(r.u32()?);
         }
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.inner.subs.lock().insert(handle, tx);
         Ok(Subscription { broker: self.clone(), handle, rx, assigned, window: credits.max(1), consumed: 0 })
     }
 
@@ -702,8 +727,14 @@ fn route(inner: &Inner, h: wire::Header, body: &[u8]) {
     } else {
         Ok(body.to_vec())
     };
-    if let Some(tx) = inner.pending.lock().remove(&h.corr) {
-        let _ = tx.send(reply);
+    let pending = inner.pending.lock().remove(&h.corr);
+    if let Some(p) = pending {
+        if let (Pending::Subscribe(_, sub_tx), Ok(body)) = (&p, &reply) {
+            if let Ok(handle) = Reader::new(body).u32() {
+                inner.subs.lock().insert(handle, sub_tx.clone());
+            }
+        }
+        p.reply(reply);
     } else if let Err(e) = reply {
         // A fire-and-forget frame (an ack, a credit) that failed: tell its
         // subscription, if the server named one.
@@ -715,8 +746,8 @@ fn route(inner: &Inner, h: wire::Header, body: &[u8]) {
 
 fn fail_all(inner: &Inner) {
     inner.closed.store(true, Ordering::Release);
-    for (_, tx) in inner.pending.lock().drain() {
-        let _ = tx.send(Err(BrokerError::closed()));
+    for (_, p) in inner.pending.lock().drain() {
+        p.reply(Err(BrokerError::closed()));
     }
     for (_, tx) in inner.subs.lock().drain() {
         let _ = tx.send(Push::Closed(BrokerError::closed()));

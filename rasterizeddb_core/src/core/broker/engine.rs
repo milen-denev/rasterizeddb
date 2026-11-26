@@ -469,7 +469,8 @@ impl Broker {
             };
             partitions.push(part);
         }
-        if create {
+        // A memory topic has no directory to make durable.
+        if create && t.config.durability != Durability::Memory {
             if let Some(d) = &dir {
                 crate::core::sync_path::sync_dir(d)?;
                 if let Some(parent) = d.parent() {
@@ -628,6 +629,22 @@ impl Broker {
     /// Declares a queue: a one-partition topic and a shared subscription of
     /// the same name.
     pub fn declare_queue(&self, name: &str, q: QueueConfig, if_not_exists: bool) -> Result<Arc<Topic>, BrokerError> {
+        // Declaring a queue that exists with other settings is refused, as
+        // RabbitMQ refuses an inequivalent declare: returning the old queue
+        // silently left a consumer with an ack timeout it never asked for.
+        if let Some(existing) = self.topic(name).and_then(|t| t.queue.clone()) {
+            let mut q_eff = q.clone();
+            if self.dir.is_none() {
+                q_eff.durability = Durability::Memory;
+            }
+            let differs = queue_differences(&existing, &q_eff);
+            if !differs.is_empty() {
+                return Err(BrokerError::new(
+                    Code::Mismatch,
+                    format!("queue \"{name}\" exists with other settings: {}", differs.join(", ")),
+                ));
+            }
+        }
         let config = TopicConfig {
             partitions: 1,
             durability: q.durability,
@@ -960,6 +977,30 @@ impl Broker {
             }
         }
     }
+}
+
+/// The settings in which two queue declarations differ, as `name: have vs asked`.
+fn queue_differences(have: &QueueConfig, asked: &QueueConfig) -> Vec<String> {
+    let mut d = Vec::new();
+    if have.durability != asked.durability {
+        d.push(format!("durability {} vs {}", have.durability.name(), asked.durability.name()));
+    }
+    if have.ack_timeout_ms != asked.ack_timeout_ms {
+        d.push(format!("ack_timeout_ms {} vs {}", have.ack_timeout_ms, asked.ack_timeout_ms));
+    }
+    if have.max_deliveries != asked.max_deliveries {
+        d.push(format!("max_deliveries {} vs {}", have.max_deliveries, asked.max_deliveries));
+    }
+    if have.dead_letter != asked.dead_letter {
+        d.push(format!("dead_letter {:?} vs {:?}", have.dead_letter, asked.dead_letter));
+    }
+    if have.message_ttl_ms != asked.message_ttl_ms {
+        d.push(format!("message_ttl_ms {} vs {}", have.message_ttl_ms, asked.message_ttl_ms));
+    }
+    if have.max_length != asked.max_length {
+        d.push(format!("max_length {} vs {}", have.max_length, asked.max_length));
+    }
+    d
 }
 
 /// `publish`'s partition choice: the first record's key, else round robin.

@@ -109,3 +109,7 @@ required-features = ["sharding"]
 [[example]]
 name = "broker_bench"
 required-features = ["broker"]
+
+[[example]]
+name = "broker_crash"
+required-features = ["broker"]

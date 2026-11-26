@@ -504,3 +504,111 @@ fn the_wildcard_trie_is_shared_by_mqtt_filters() {
     assert_eq!(hit, [1]);
     let _ = Arc::new(());
 }
+
+#[test]
+fn memory_topics_live_beside_file_topics() {
+    // A broker on disk still makes memory topics (AMQP transient queues,
+    // MQTT clean sessions): no directory, nothing synced.
+    let dir = tempfile::tempdir().unwrap();
+    let b = Broker::open(Some(dir.path()), "t").unwrap();
+    let t = b.create_topic("eph", config(2, Durability::Memory), false).unwrap();
+    b.produce(&t, 0, &mut batch(&["x"]), true).unwrap();
+    b.declare_queue("transient", QueueConfig { durability: Durability::Memory, ..Default::default() }, false).unwrap();
+    assert!(b.queue("transient").is_ok());
+    b.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_producers_and_competing_consumers_lose_nothing() {
+    const PRODUCERS: usize = 8;
+    const EACH: usize = 3000;
+    let dir = tempfile::tempdir().unwrap();
+    let b = Broker::open(Some(dir.path()), "t").unwrap();
+    let t = b.create_topic("busy", config(4, Durability::Sync), false).unwrap();
+    let sub = b.subscription(&t, "workers", SubConfig::default()).unwrap();
+    let rt = tokio::runtime::Handle::current();
+
+    // Four members acking everything they get, recording what they saw.
+    let seen = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::<(u32, u64), usize>::new()));
+    let mut consumers = Vec::new();
+    for m in 0..4u32 {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (member, _) = sub.join(m + 1, 64, tx, &rt).unwrap();
+        let (sub, seen) = (sub.clone(), seen.clone());
+        consumers.push(tokio::spawn(async move {
+            loop {
+                let got = drain(&mut rx, 1, Duration::from_secs(3)).await;
+                if got.is_empty() {
+                    return;
+                }
+                let ranges: Vec<Range> = got.iter().map(|x| one(x.0, x.1)).collect();
+                for x in &got {
+                    *seen.lock().entry((x.0, x.1)).or_default() += 1;
+                }
+                sub.ack(&ranges).unwrap();
+                sub.credit(member, got.len() as u32);
+            }
+        }));
+    }
+    // Producers on their own threads, all at once.
+    let mut producers = Vec::new();
+    for p in 0..PRODUCERS {
+        let (b, t) = (b.clone(), t.clone());
+        producers.push(std::thread::spawn(move || {
+            for i in 0..EACH / 10 {
+                let vals: Vec<String> = (0..10).map(|k| format!("{p}-{}", i * 10 + k)).collect();
+                let refs: Vec<&str> = vals.iter().map(String::as_str).collect();
+                b.produce(&t, wire::ANY_PARTITION, &mut batch(&refs), true).unwrap();
+            }
+        }));
+    }
+    for p in producers {
+        p.join().unwrap();
+    }
+    for c in consumers {
+        c.await.unwrap();
+    }
+    let seen = seen.lock();
+    let total: u64 = t.partitions.iter().map(|p| p.next_offset()).sum();
+    assert_eq!(total as usize, PRODUCERS * EACH);
+    assert_eq!(seen.len(), PRODUCERS * EACH, "every record delivered");
+    assert!(seen.values().all(|n| *n == 1), "none delivered twice");
+    assert_eq!(sub.backlog(), 0);
+    // Offsets are dense per partition: nothing skipped, nothing doubled.
+    for p in &t.partitions {
+        let got = values(p, 0);
+        assert_eq!(got.len() as u64, p.next_offset());
+        assert!(got.iter().enumerate().all(|(i, (o, _))| *o == i as u64));
+    }
+    b.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_amqp_style_member_keeps_its_inflight_until_settled() {
+    let b = Broker::open(None, "t").unwrap();
+    let t = b.declare_queue("q", QueueConfig { durability: Durability::Memory, ..Default::default() }, false).unwrap();
+    let (_, sub) = b.queue("q").unwrap();
+    b.produce(&t, 0, &mut batch(&["a", "b"]), true).unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (m, _) = sub.join(1, 10, tx, &tokio::runtime::Handle::current()).unwrap();
+    let got = drain(&mut rx, 2, Duration::from_secs(3)).await;
+    assert_eq!(got.len(), 2);
+    sub.leave_keeping_inflight(m);
+    assert_eq!(sub.inflight(), 2, "still the channel's to settle");
+    sub.ack(&[one(0, got[0].1)]).unwrap();
+    sub.nack(&[one(0, got[1].1)], 0).unwrap();
+    assert_eq!(sub.inflight(), 0);
+    assert_eq!(sub.take(5, true, 0).unwrap().len(), 1, "the nacked one is back");
+}
+
+#[test]
+fn a_queue_redeclared_with_other_settings_is_refused() {
+    let b = Broker::open(None, "t").unwrap();
+    let q = QueueConfig { durability: Durability::Memory, ack_timeout_ms: 300_000, ..Default::default() };
+    b.declare_queue("jobs", q.clone(), true).unwrap();
+    assert!(b.declare_queue("jobs", q.clone(), true).is_ok(), "the same settings declare again");
+    let other = QueueConfig { ack_timeout_ms: 5_000, ..q };
+    let e = b.declare_queue("jobs", other, true).unwrap_err();
+    assert_eq!(e.code, Code::Mismatch);
+    assert!(e.message.contains("ack_timeout_ms 300000 vs 5000"), "{}", e.message);
+}

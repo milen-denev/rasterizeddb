@@ -509,6 +509,21 @@ impl Subscription {
         self.wake.notify_one();
     }
 
+    /// Removes a member and leaves its in-flight records in flight: they are
+    /// still acked, nacked or rejected by whoever holds them, and go back at
+    /// their ack timeout otherwise (AMQP's `basic.cancel`, after which the
+    /// channel still settles what it was given).
+    pub fn leave_keeping_inflight(&self, member: u64) {
+        let mut m = self.members.lock();
+        let Some(i) = m.list.iter().position(|x| x.id == member) else { return };
+        m.list.remove(i);
+        if self.config.mode == SubMode::Ordered {
+            self.rebalance(&mut *m);
+        }
+        drop(m);
+        self.wake.notify_one();
+    }
+
     /// Shares the partitions out again: `p → members[p % n]`. A partition that
     /// moves starts at its committed offset with its new owner.
     fn rebalance(&self, m: &mut Members) {

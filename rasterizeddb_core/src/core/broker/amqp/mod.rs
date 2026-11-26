@@ -215,6 +215,9 @@ struct Conn {
     heartbeat: u16,
     channels: HashMap<u16, Channel>,
     consumers: HashMap<u32, Consumer>,
+    /// Cancelled consumers' subscriptions: a delivery already on its way to
+    /// one goes straight back to its queue.
+    retired: HashMap<u32, Arc<Subscription>>,
     next_handle: u32,
     push_tx: mpsc::UnboundedSender<Vec<u8>>,
     push_rx: mpsc::UnboundedReceiver<Vec<u8>>,
@@ -241,6 +244,7 @@ impl Conn {
             heartbeat: 0,
             channels: HashMap::new(),
             consumers: HashMap::new(),
+            retired: HashMap::new(),
             next_handle: 1,
             push_tx,
             push_rx,
@@ -403,9 +407,13 @@ impl Conn {
         self.parked.retain(|p| p.channel != ch);
     }
 
+    /// The consumer stops receiving. What it was given and has not settled
+    /// stays with the channel, as in RabbitMQ: still ackable, and requeued
+    /// when the channel closes.
     fn cancel_consumer(&mut self, handle: u32) {
         if let Some(c) = self.consumers.remove(&handle) {
-            c.sub.leave(c.member);
+            c.sub.leave_keeping_inflight(c.member);
+            self.retired.insert(handle, c.sub.clone());
             if self.auto_delete.contains(&c.queue) && c.sub.member_count() == 0 {
                 let _ = self.shared.broker.delete_topic(&c.queue, true);
                 self.auto_delete.retain(|q| *q != c.queue);
@@ -1173,7 +1181,18 @@ impl Conn {
     fn push(&mut self, frame: &[u8], out: &mut Vec<u8>) {
         let Ok(Some(h)) = wire::parse_header(frame) else { return };
         let body = &frame[wire::FRAME_HEADER..wire::FRAME_HEADER + h.body_len];
-        let Some(c) = self.consumers.get(&h.corr) else { return };
+        let Some(c) = self.consumers.get(&h.corr) else {
+            // Sent before the cancel took effect: back to the queue.
+            if let (Some(sub), wire::op::DELIVER) = (self.retired.get(&h.corr), h.op) {
+                let mut r = wire::Reader::new(body);
+                if r.u32().is_ok() {
+                    if let Ok(ranges) = wire::decode_ranges(&mut r, 1 << 20) {
+                        let _ = sub.nack(&ranges, 0);
+                    }
+                }
+            }
+            return;
+        };
         let ch = c.channel;
         if h.op == wire::op::CLOSED {
             let tag = c.tag.clone();

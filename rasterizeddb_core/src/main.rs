@@ -2204,122 +2204,6 @@ fn main() -> std::io::Result<()> {
             }
         }
 
-        // The broker's native protocol, beside the SQL ports. Bound here for
-        // the same reason as the Redis port above.
-        #[cfg(feature = "broker")]
-        {
-            if let Err(e) = args.broker.apply() {
-                eprintln!("{e}");
-                std::process::exit(2);
-            }
-            let (socket_mode, socket_group) = socket_permissions(&args);
-            match args.broker.native(socket_mode, socket_group, args.pg_cert.as_deref(), args.pg_key.as_deref()) {
-                Ok(Some(config)) => match rasterizeddb_core::core::broker::net::bind(&config).await {
-                    Ok(listeners) => {
-                        // Opened before the port answers, so a damaged log
-                        // stops the start-up with its reason.
-                        if let Err(e) = arc_database.broker.get() {
-                            eprintln!("could not open the broker: {e}");
-                            std::process::exit(2);
-                        }
-                        let database = arc_database.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = rasterizeddb_core::core::broker::net::serve(listeners, database, config).await {
-                                log::error!("broker: the native listener stopped: {e}");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        eprintln!("could not start the broker's native listener: {e}");
-                        std::process::exit(2);
-                    }
-                },
-                Ok(None) => {}
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(2);
-                }
-            }
-            #[cfg(feature = "broker_kafka")]
-            match args.kafka.config(&args.broker, args.pg_cert.as_deref(), args.pg_key.as_deref()) {
-                Ok(Some(config)) => match rasterizeddb_core::core::broker::kafka::bind(&config).await {
-                    Ok(listeners) => {
-                        if let Err(e) = arc_database.broker.get() {
-                            eprintln!("could not open the broker: {e}");
-                            std::process::exit(2);
-                        }
-                        let database = arc_database.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = rasterizeddb_core::core::broker::kafka::serve(listeners, database, config).await {
-                                log::error!("broker: the Kafka listener stopped: {e}");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        eprintln!("could not start the Kafka listener: {e}");
-                        std::process::exit(2);
-                    }
-                },
-                Ok(None) => {}
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(2);
-                }
-            }
-            #[cfg(feature = "broker_amqp")]
-            match args.amqp.config(&args.broker, args.pg_cert.as_deref(), args.pg_key.as_deref()) {
-                Ok(Some(config)) => match rasterizeddb_core::core::broker::amqp::bind(&config).await {
-                    Ok(listeners) => {
-                        if let Err(e) = arc_database.broker.get() {
-                            eprintln!("could not open the broker: {e}");
-                            std::process::exit(2);
-                        }
-                        let database = arc_database.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = rasterizeddb_core::core::broker::amqp::serve(listeners, database, config).await {
-                                log::error!("broker: the AMQP listener stopped: {e}");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        eprintln!("could not start the AMQP listener: {e}");
-                        std::process::exit(2);
-                    }
-                },
-                Ok(None) => {}
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(2);
-                }
-            }
-            #[cfg(feature = "broker_mqtt")]
-            match args.mqtt.config(&args.broker, args.pg_cert.as_deref(), args.pg_key.as_deref()) {
-                Ok(Some(config)) => match rasterizeddb_core::core::broker::mqtt::bind(&config).await {
-                    Ok(listeners) => {
-                        if let Err(e) = arc_database.broker.get() {
-                            eprintln!("could not open the broker: {e}");
-                            std::process::exit(2);
-                        }
-                        let database = arc_database.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = rasterizeddb_core::core::broker::mqtt::serve(listeners, database, config).await {
-                                log::error!("broker: the MQTT listener stopped: {e}");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        eprintln!("could not start the MQTT listener: {e}");
-                        std::process::exit(2);
-                    }
-                },
-                Ok(None) => {}
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(2);
-                }
-            }
-        }
-
         let serves_native = matches!(args.protocol, Protocol::Rastcp | Protocol::Both);
         let serves_pgwire = matches!(args.protocol, Protocol::Pgwire | Protocol::Both);
 
@@ -2569,6 +2453,152 @@ fn main() -> std::io::Result<()> {
                 std::process::exit(2);
             }
         }
+
+        // The broker's ports, beside the SQL ones. They open only once the
+        // role catalogue exists, so a broker client's first login on a new
+        // database finds its role: the SQL listeners seed it as they start,
+        // which is after this, so it is seeded here the way they would.
+        #[cfg(feature = "broker")]
+        {
+            match (&native, &pgwire) {
+                (_, Some((_, _, auth, _))) => {
+                    if let Err(e) = rasterizeddb_core::pgwire::seed_catalogue_roles(&catalog, auth).await {
+                        eprintln!("could not prepare the role catalogue: {e}");
+                        rasterizeddb_core::shutdown::finalize();
+                        std::process::exit(2);
+                    }
+                }
+                (Some((auth, _)), None) => {
+                    let can_log_in = auth.bootstrap_password.is_some()
+                        || rasterizeddb_core::auth::has_login_role(&arc_database).await;
+                    if auth.authenticates() && can_log_in {
+                        if let Err(e) = rasterizeddb_core::native_auth::seed_roles(&arc_database, auth).await {
+                            eprintln!("could not prepare the role catalogue: {e}");
+                            rasterizeddb_core::shutdown::finalize();
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+
+        // The broker's native protocol, beside the SQL ports. Bound here for
+        // the same reason as the Redis port above.
+        #[cfg(feature = "broker")]
+        {
+            if let Err(e) = args.broker.apply() {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+            let (socket_mode, socket_group) = socket_permissions(&args);
+            match args.broker.native(socket_mode, socket_group, args.pg_cert.as_deref(), args.pg_key.as_deref()) {
+                Ok(Some(config)) => match rasterizeddb_core::core::broker::net::bind(&config).await {
+                    Ok(listeners) => {
+                        // Opened before the port answers, so a damaged log
+                        // stops the start-up with its reason.
+                        if let Err(e) = arc_database.broker.get() {
+                            eprintln!("could not open the broker: {e}");
+                            std::process::exit(2);
+                        }
+                        let database = arc_database.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = rasterizeddb_core::core::broker::net::serve(listeners, database, config).await {
+                                log::error!("broker: the native listener stopped: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("could not start the broker's native listener: {e}");
+                        std::process::exit(2);
+                    }
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
+            #[cfg(feature = "broker_kafka")]
+            match args.kafka.config(&args.broker, args.pg_cert.as_deref(), args.pg_key.as_deref()) {
+                Ok(Some(config)) => match rasterizeddb_core::core::broker::kafka::bind(&config).await {
+                    Ok(listeners) => {
+                        if let Err(e) = arc_database.broker.get() {
+                            eprintln!("could not open the broker: {e}");
+                            std::process::exit(2);
+                        }
+                        let database = arc_database.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = rasterizeddb_core::core::broker::kafka::serve(listeners, database, config).await {
+                                log::error!("broker: the Kafka listener stopped: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("could not start the Kafka listener: {e}");
+                        std::process::exit(2);
+                    }
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
+            #[cfg(feature = "broker_amqp")]
+            match args.amqp.config(&args.broker, args.pg_cert.as_deref(), args.pg_key.as_deref()) {
+                Ok(Some(config)) => match rasterizeddb_core::core::broker::amqp::bind(&config).await {
+                    Ok(listeners) => {
+                        if let Err(e) = arc_database.broker.get() {
+                            eprintln!("could not open the broker: {e}");
+                            std::process::exit(2);
+                        }
+                        let database = arc_database.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = rasterizeddb_core::core::broker::amqp::serve(listeners, database, config).await {
+                                log::error!("broker: the AMQP listener stopped: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("could not start the AMQP listener: {e}");
+                        std::process::exit(2);
+                    }
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
+            #[cfg(feature = "broker_mqtt")]
+            match args.mqtt.config(&args.broker, args.pg_cert.as_deref(), args.pg_key.as_deref()) {
+                Ok(Some(config)) => match rasterizeddb_core::core::broker::mqtt::bind(&config).await {
+                    Ok(listeners) => {
+                        if let Err(e) = arc_database.broker.get() {
+                            eprintln!("could not open the broker: {e}");
+                            std::process::exit(2);
+                        }
+                        let database = arc_database.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = rasterizeddb_core::core::broker::mqtt::serve(listeners, database, config).await {
+                                log::error!("broker: the MQTT listener stopped: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("could not start the MQTT listener: {e}");
+                        std::process::exit(2);
+                    }
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+
 
         // A listener returns an error only when it could not start — the port
         // taken, the certificate unreadable — since a failed accept is retried
