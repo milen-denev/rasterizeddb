@@ -943,8 +943,46 @@ fn apply_to_lateral(tokens: Vec<Token>) -> Result<Vec<Token>, TsqlError> {
     Ok(out)
 }
 
+/// `~CAST(x AS bit)`, SQL Server's NOT of the bit a number makes (1 for any
+/// non-zero), as the comparison it is: `((x) = 0)`. EF Core writes equality
+/// of two computed integers this way (`~CAST(a ^ b AS bit)`, a date's month
+/// against today's). The engine's `~` is an integer's, and a boolean has no
+/// bitwise NOT there. NULL stays NULL.
+fn bit_not_as_comparison(tokens: Vec<Token>) -> Vec<Token> {
+    if !tokens.iter().any(|t| t.is_op("~")) {
+        return tokens;
+    }
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len() + 8);
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let cast = tokens[i].is_op("~")
+            && tokens.get(i + 1).is_some_and(|t| t.is_word("CAST"))
+            && tokens.get(i + 2).is_some_and(|t| t.is_op("("));
+        let close = if cast { crate::sqlcompat::matching_paren(&tokens, i + 2) } else { None };
+        match close {
+            Some(close) if close >= i + 6 && tokens[close - 1].is_word("bit") && tokens[close - 2].is_word("AS") => {
+                let mut open = Token::op("(");
+                open.space = tokens[i].space;
+                out.push(open);
+                out.push(Token::op("("));
+                out.extend(bit_not_as_comparison(tokens[i + 3..close - 2].to_vec()));
+                out.push(Token::op(")"));
+                out.push(Token::op("="));
+                out.push(Token::raw("0"));
+                out.push(Token::op(")"));
+                i = close + 1;
+            }
+            _ => {
+                out.push(tokens[i].clone());
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>, TsqlError> {
-    let tokens = apply_to_lateral(tokens)?;
+    let tokens = bit_not_as_comparison(apply_to_lateral(tokens)?);
     let mut out: Vec<Token> = Vec::with_capacity(tokens.len() + 4);
     let mut i = 0usize;
     let n = tokens.len();
@@ -1114,6 +1152,13 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
                 } else {
                     out.push(t.clone());
                 }
+            }
+            // SQL Server's `^` is bitwise exclusive OR, PostgreSQL's `#`
+            // (there `^` is a power).
+            Tok::Op(o) if o == "^" => {
+                let mut xor = Token::op("#");
+                xor.space = t.space;
+                out.push(xor);
             }
             Tok::Op(o) if o == "!<" => out.push(Token::op(">=")),
             Tok::Op(o) if o == "!>" => out.push(Token::op("<=")),

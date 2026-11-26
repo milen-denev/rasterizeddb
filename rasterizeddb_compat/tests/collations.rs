@@ -429,3 +429,22 @@ async fn concatenation_in_a_where() {
     assert_eq!(ids(&pool, "SELECT id FROM plain_notes WHERE note NOT LIKE 'a' || '%'").await, [2, 3]);
     assert_eq!(ids(&pool, "SELECT id FROM plain_notes WHERE note = 'a' || 'bc'").await, [1]);
 }
+
+/// An integer cast to a boolean is true for any non-zero value, as
+/// PostgreSQL's `5::boolean` (and SQL Server's `CAST(5 AS bit)`): only 0 and
+/// 1 were values ("invalid input syntax for type boolean"). Text keeps
+/// PostgreSQL's input: '5' is not a boolean.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_integer_cast_to_a_boolean() {
+    let (_server, pool) = server().await;
+    let row = sqlx::raw_sql("SELECT CAST(5 AS boolean), CAST(0 AS boolean), CAST(-1 AS boolean), (6 # 6)::boolean, NOT CAST(6 # 5 AS boolean)")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let cells: Vec<String> = (0..5).map(|i| row.try_get_unchecked::<String, _>(i).unwrap()).collect();
+    assert_eq!(cells, ["t", "f", "t", "f", "f"]);
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE CAST(id # 1 AS boolean)").await, [2, 3, 4]);
+    assert_eq!(ids(&pool, "SELECT id FROM people WHERE CASE WHEN note IS NOT NULL THEN ((id # 4) = 0) ELSE CAST(0 AS boolean) END = CAST(1 AS boolean)").await, [4]);
+    assert_eq!(code(&pool, "SELECT CAST('5' AS boolean)").await, "22P02");
+}
+

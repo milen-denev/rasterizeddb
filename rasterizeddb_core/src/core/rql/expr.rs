@@ -9423,6 +9423,20 @@ pub fn cast(value: Value, target: &DbType) -> Result<Value, String> {
         bytes,
         db_type: db_type.clone(),
     };
+    // An integer to a boolean: zero is false, anything else true, as
+    // PostgreSQL casts one (`5::boolean` is true) and as SQL Server makes a
+    // bit. Through its text below, only 0 and 1 were values ("invalid input
+    // syntax for type boolean: \"5\"").
+    if *target == DbType::BOOL
+        && matches!(
+            db_type,
+            DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64
+        )
+    {
+        if let Some(n) = as_i64(&value) {
+            return Ok(Value::Data { bytes: vec![u8::from(n != 0)], db_type: DbType::BOOL });
+        }
+    }
     if let Some(n) = as_i64(&value) {
         // A narrowing that does not fit is PostgreSQL's `integer out of range`,
         // never the low bytes: `3000000000::bigint::int` was -1294967296.
