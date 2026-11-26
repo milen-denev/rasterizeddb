@@ -3220,6 +3220,28 @@ async fn materialize_derived_inner(
         found_any = true;
     }
 
+    // A window over a join, as the window over the join's derived table
+    // (`rql::window_join`). The top level rewrites its own here too, and a
+    // derived table's or a CTE's body never passed there either: EF Core's
+    // `ROW_NUMBER() OVER (PARTITION BY … ORDER BY …)` over joined
+    // navigations inside `FROM (…) AS s WHERE s.row <= 1` failed with "could
+    // not be read as an expression over this join".
+    let columns_of = |name: &str| -> Option<Vec<String>> {
+        let view = database.schema_view(name)?;
+        Some(
+            view.schema()
+                .fields
+                .iter()
+                .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+                .map(|f| f.name.clone())
+                .collect(),
+        )
+    };
+    if let Some(rewritten) = crate::core::rql::window_join::rewrite_statement(&current, &columns_of) {
+        current = rewritten;
+        found_any = true;
+    }
+
     // `SELECT generate_series(1, 3)`: the `FROM` form it means.
     if let Some(form) = crate::core::rql::table_functions::select_list_form(&current) {
         current = form;

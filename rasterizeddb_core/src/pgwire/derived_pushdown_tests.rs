@@ -341,3 +341,57 @@ async fn a_body_of_several_relations_keeps_its_collations() {
     let sql = format!("SELECT MIN(dj.id), MAX(dj.id) FROM {joined}");
     assert_eq!(pg_rows(&db, &mut s, &sql).await, vec![vec![cell(id(1)), cell(id(N))]], "{sql}");
 }
+
+/// A window over a join inside a derived table or a CTE: the top level
+/// rewrites one as the window over the join's derived table
+/// (`rql::window_join`), and a body never passed there ("could not be read
+/// as an expression over this join"). EF Core numbers joined navigations
+/// this way and keeps `row <= 1`. Ordered by keys of both relations, in SQL
+/// Server's uniqueidentifier order where the keys are that.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_window_over_a_join_inside_a_derived_table() {
+    let db = crate::replication::test_support::in_memory_database().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE wj_a (id uuid COLLATE rdb_guid_order NOT NULL PRIMARY KEY, product uuid COLLATE rdb_guid_order NOT NULL, n INT NOT NULL)")
+        .await;
+    ok(&db, &mut s, "CREATE TABLE wj_b (id uuid COLLATE rdb_guid_order NOT NULL PRIMARY KEY, a_id uuid COLLATE rdb_guid_order NOT NULL, m INT NOT NULL)")
+        .await;
+    // Ascending `k` is SQL Server's order and descending by the bytes.
+    let id = |k: i64| format!("{:08x}-0000-0000-0000-{k:012}", 0xff00 - k);
+    // Product 91 has a-rows 1 and 2, product 92 has 3; b-rows 11 and 14 are
+    // of 1, 12 of 2, 13 of 3.
+    ok(&db, &mut s, &format!("INSERT INTO wj_a VALUES ('{}', '{}', 1), ('{}', '{}', 2), ('{}', '{}', 3)", id(1), id(91), id(2), id(91), id(3), id(92)))
+        .await;
+    ok(
+        &db,
+        &mut s,
+        &format!(
+            "INSERT INTO wj_b VALUES ('{}', '{}', 10), ('{}', '{}', 20), ('{}', '{}', 30), ('{}', '{}', 40)",
+            id(11), id(1), id(12), id(2), id(13), id(3), id(14), id(1)
+        ),
+    )
+    .await;
+    let numbered = "SELECT d7.n, d8.m, ROW_NUMBER() OVER (PARTITION BY d7.product ORDER BY d7.id, d8.id) AS rn \
+                    FROM wj_a AS d7 INNER JOIN wj_b AS d8 ON d7.id = d8.a_id";
+    let rows = |rows: Rows| -> Vec<(i64, i64, i64)> {
+        let int = |c: &Option<String>| c.as_deref().unwrap().parse::<i64>().unwrap();
+        rows.iter().map(|r| (int(&r[0]), int(&r[1]), int(&r[2]))).collect()
+    };
+    // (n, m): product 91 is (1,10), (1,40), (2,20) in key order; 92 is (3,30).
+    let all = vec![(1, 10, 1), (1, 40, 2), (2, 20, 3), (3, 30, 1)];
+    let sql = format!("SELECT s.n, s.m, s.rn FROM ({numbered}) AS s ORDER BY s.n, s.rn");
+    assert_eq!(rows(pg_rows(&db, &mut s, &sql).await), all, "{sql}");
+    let sql = format!("SELECT s.n, s.m, s.rn FROM ({numbered}) AS s WHERE s.rn <= 1 ORDER BY s.n");
+    assert_eq!(rows(pg_rows(&db, &mut s, &sql).await), vec![(1, 10, 1), (3, 30, 1)], "{sql}");
+    let sql = format!("WITH w AS ({numbered}) SELECT w.n, w.m, w.rn FROM w WHERE w.rn = 2");
+    assert_eq!(rows(pg_rows(&db, &mut s, &sql).await), vec![(1, 40, 2)], "{sql}");
+    // Descending, and the same answer as the statement gives at the top.
+    let top = format!("{} ORDER BY 1, 3", numbered.replace("d7.id, d8.id", "d7.id DESC, d8.id DESC"));
+    let inside = format!("SELECT s.n, s.m, s.rn FROM ({}) AS s ORDER BY s.n, s.rn", numbered.replace("d7.id, d8.id", "d7.id DESC, d8.id DESC"));
+    let want = vec![(1, 40, 2), (1, 10, 3), (2, 20, 1), (3, 30, 1)];
+    assert_eq!(rows(pg_rows(&db, &mut s, &inside).await), want, "{inside}");
+    let mut at_top = rows(pg_rows(&db, &mut s, &top).await);
+    at_top.sort_by_key(|r| (r.0, r.2));
+    assert_eq!(at_top, want, "{top}");
+}
+
