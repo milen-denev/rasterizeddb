@@ -353,13 +353,14 @@ fn show(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<Led
     for (table, _) in &req.tables {
         let p = g.policy(table)?;
         lines.push(format!(
-            "{}: {} id {:032x}, retention {} s, drop after {} s idle, hash {}{}{}{}",
+            "{}: {} id {:032x}, retention {} s, drop after {} s idle, hash {}{}{}{}{}",
             table.name,
             if p.kind == SpecialTable::Vault { "vault" } else { "ledger" },
             p.id,
             p.retention_us / 1_000_000,
             p.drop_idle_us / 1_000_000,
             p.hash.name(),
+            if p.versioned { ", versioned" } else { "" },
             if p.anchors.is_empty() { String::new() } else { format!(", anchors {}", p.anchors.join(" ")) },
             if p.holds.is_empty() {
                 String::new()

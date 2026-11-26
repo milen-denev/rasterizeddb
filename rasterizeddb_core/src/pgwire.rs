@@ -6287,8 +6287,10 @@ async fn describe_resolved(
         QueryPurpose::Broker(sql) => {
             return Ok(Some((crate::core::broker::sql::result_fields(sql), true)));
         }
+        // One text column of answer lines, named for what they are (it was
+        // "replication", whose arm this was copied from).
         QueryPurpose::Ledger(_) => {
-            return Ok(Some((crate::replication::sql::result_fields(), true)));
+            return Ok(Some((vec![("ledger".to_string(), DbType::STRING)], true)));
         }
         QueryPurpose::Replication(sql) => {
             return Ok(Some((
@@ -10348,7 +10350,7 @@ pub(crate) fn result_description(
             crate::replication::sql::structured_fields(sql)
                 .unwrap_or_else(crate::replication::sql::result_fields),
         ),
-        QueryPurpose::Ledger(_) => Some(crate::replication::sql::result_fields()),
+        QueryPurpose::Ledger(_) => Some(vec![("ledger".to_string(), DbType::STRING)]),
         // Likewise for the storage surface: its rows describe directories, not
         // a relation, so nothing can derive their names from a schema.
         #[cfg(feature = "storage_pools")]

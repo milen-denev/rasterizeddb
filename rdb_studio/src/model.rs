@@ -388,6 +388,57 @@ pub struct RoleInfo {
     pub member_of: Vec<String>,
 }
 
+/// What each role may reach beyond its attributes, for the ROLES tab:
+/// table grants, default privileges and row-level security policies.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RoleAccess {
+    /// Grants on tables (vaults and ledger tables among them), one entry per
+    /// (grantee, table). An owner's implicit privileges are in `owned`.
+    pub grants: Vec<TableGrant>,
+    /// `(owner, table)`: the tables each role owns.
+    pub owned: Vec<(String, String)>,
+    pub defaults: Vec<DefaultPrivilege>,
+    pub policies: Vec<PolicyInfo>,
+    /// Tables with row-level security enabled.
+    pub rls_tables: Vec<String>,
+    /// Which parts the server answered: a server without policies still
+    /// shows its grants.
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TableGrant {
+    pub grantee: String,
+    pub table: String,
+    pub privileges: Vec<String>,
+    /// The privileges held WITH GRANT OPTION.
+    pub grantable: Vec<String>,
+}
+
+/// One `ALTER DEFAULT PRIVILEGES` entry: what `grantee` gets on objects of
+/// `kind` that `owner` creates from now on.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DefaultPrivilege {
+    pub owner: String,
+    /// `TABLES`, `SEQUENCES`, `FUNCTIONS`, `TYPES` or `SCHEMAS`.
+    pub kind: String,
+    pub grantee: String,
+    pub privileges: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PolicyInfo {
+    pub name: String,
+    pub table: String,
+    /// `ALL`, `SELECT`, `INSERT`, `UPDATE` or `DELETE`.
+    pub command: String,
+    pub permissive: bool,
+    /// The roles it applies to; `public` for every role.
+    pub roles: Vec<String>,
+    pub using: String,
+    pub check: String,
+}
+
 /// A column of a table.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ColumnInfo {

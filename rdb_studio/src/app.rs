@@ -136,6 +136,12 @@ pub struct Studio {
     pub query_notices: Vec<String>,
     /// The server's roles, for the ROLES tab.
     pub roles: Vec<RoleInfo>,
+    /// What each role may reach: grants, default privileges, policies.
+    pub role_access: crate::model::RoleAccess,
+    /// The role whose detail the ROLES tab shows.
+    pub role_selected: Option<String>,
+    /// The ROLES tab's form inputs, by key; reset when another role is chosen.
+    pub role_inputs: std::collections::BTreeMap<String, String>,
     /// What Ctrl+Space offered for the word before the editor's cursor.
     pub completions: Vec<String>,
     /// The KEYS tab.
@@ -801,6 +807,10 @@ pub enum Refresh {
     /// A topic, queue, subscription, exchange or binding was made or
     /// dropped, or a message published: the broker page.
     Broker,
+    /// A ledger table or vault changed (a confirmed hold, release, delete,
+    /// purge or key rotation): the LEDGER page.
+    #[cfg(feature = "enterprise")]
+    Ledger,
 }
 
 #[derive(Debug, Clone)]
@@ -857,6 +867,13 @@ pub enum Message {
     SchemaLoaded(Result<SchemaGraph, String>),
     ConfigLoaded(Result<Vec<ConfigEntry>, String>),
     RolesLoaded(Result<Vec<RoleInfo>, String>),
+    RoleAccessLoaded(Box<crate::model::RoleAccess>),
+    /// Show (or, with `None`, close) one role's detail.
+    RoleManage(Option<String>),
+    /// A ROLES form input changed: (key, value).
+    RoleInput(String, String),
+    /// Run a statement the ROLES detail built, then reload the tab.
+    RoleRun(String),
     /// The KEYS tab's pattern box.
     KvPattern(String),
     /// Scan from the start (`false`) or on from the last page (`true`).
@@ -993,6 +1010,9 @@ pub enum Message {
     /// A LEDGER page input changed: (key, value).
     #[cfg(feature = "enterprise")]
     LedgerInput(String, String),
+    /// Open a ledger table on the DATA tab.
+    #[cfg(feature = "enterprise")]
+    LedgerOpenTable(String),
     ShardsLoaded(Box<ShardsSnapshot>),
     /// Asks the gateway for the planner's moves.
     PlanRebalance,
@@ -1414,6 +1434,9 @@ impl Studio {
             row_limit: RowLimit::default(),
             query_notices: Vec::new(),
             roles: Vec::new(),
+            role_access: crate::model::RoleAccess::default(),
+            role_selected: None,
+            role_inputs: std::collections::BTreeMap::new(),
             completions: Vec::new(),
             kv: KvBrowser::default(),
             editor_transaction: None,
@@ -1830,6 +1853,14 @@ impl Studio {
             // ---- navigation ------------------------------------------------
             Message::SelectTab(tab) => {
                 self.tab = tab;
+                // A revealed vault value does not outlive the page it was
+                // revealed on.
+                #[cfg(feature = "enterprise")]
+                if tab != Tab::Ledger {
+                    if let Some(page) = self.ledger.as_mut() {
+                        page.hide();
+                    }
+                }
                 match tab {
                     // Sampled on arrival so the page is not blank for a tick.
                     Tab::Dashboard if self.live => self.sample(),
@@ -2041,7 +2072,48 @@ impl Studio {
             }),
             Message::RolesLoaded(result) => self.absorb(result, |studio, roles| {
                 studio.roles = roles;
+                if studio.role_selected.as_ref().is_some_and(|r| !studio.roles.iter().any(|x| &x.name == r)) {
+                    studio.role_selected = None;
+                }
             }),
+            Message::RoleAccessLoaded(access) => {
+                self.role_access = *access;
+                Task::none()
+            }
+            Message::RoleManage(role) => {
+                self.role_inputs.clear();
+                if let Some(r) = role.as_ref().and_then(|n| self.roles.iter().find(|r| &r.name == n)) {
+                    // The attribute form starts from what the role has.
+                    for (k, on) in [
+                        ("login", r.can_login),
+                        ("superuser", r.superuser),
+                        ("createdb", r.create_db),
+                        ("createrole", r.create_role),
+                        ("bypassrls", r.bypass_rls),
+                    ] {
+                        self.role_inputs.insert(k.to_string(), on.to_string());
+                    }
+                    if r.conn_limit >= 0 {
+                        self.role_inputs.insert("connlimit".into(), r.conn_limit.to_string());
+                    }
+                    if let Some(v) = &r.valid_until {
+                        self.role_inputs.insert("validuntil".into(), v.clone());
+                    }
+                }
+                self.role_selected = role;
+                Task::none()
+            }
+            Message::RoleInput(key, value) => {
+                self.role_inputs.insert(key, value);
+                Task::none()
+            }
+            Message::RoleRun(sql) => {
+                // A form's text is spent once sent; the attribute toggles stay.
+                for k in ["password", "rename", "grant_table", "policy_name", "policy_using", "policy_check", "member"] {
+                    self.role_inputs.remove(k);
+                }
+                self.statement(sql, Refresh::Roles)
+            }
             Message::ConfigLoaded(result) => self.absorb(result, |studio, config| {
                 studio.config = config;
                 studio.config_edits.clear();
@@ -2706,13 +2778,14 @@ impl Studio {
             #[cfg(feature = "enterprise")]
             Message::LedgerInput(key, value) => {
                 if let Some(page) = self.ledger.as_mut() {
-                    if key == "__hide" {
-                        page.hide();
-                    } else {
-                        page.inputs.insert(key, value);
-                    }
+                    page.input(key, value);
                 }
                 Task::none()
+            }
+            #[cfg(feature = "enterprise")]
+            Message::LedgerOpenTable(name) => {
+                let select = self.update(Message::SelectTable(name));
+                Task::batch([select, self.update(Message::SelectTab(Tab::Data))])
             }
             #[cfg(feature = "enterprise")]
             Message::VerifyLedger => {
@@ -3688,6 +3761,8 @@ impl Studio {
                     Refresh::Storage => self.load_storage(),
                     Refresh::Activity => self.load_activity(),
                     Refresh::Broker => self.load_broker(),
+                    #[cfg(feature = "enterprise")]
+                    Refresh::Ledger => self.load_ledger(),
                     Refresh::Branches => {
                         // A merge changed what a diff would say.
                         self.branch_diff = None;
@@ -3950,6 +4025,13 @@ impl Studio {
                     Err(e) => page.error = Some(e),
                     Ok(grid) => {
                         page.show = first_column(&grid);
+                        for name in rdb_studio_enterprise::LedgerPage::ledger_names(&page.show) {
+                            if let Ok(grid) = session.query(&rdb_studio_enterprise::count_sql(&name)).await {
+                                if let Some(n) = first_column(&grid).first().and_then(|c| c.trim().parse().ok()) {
+                                    page.counts.insert(name, n);
+                                }
+                            }
+                        }
                         for name in rdb_studio_enterprise::LedgerPage::vault_names(&page.show) {
                             let secrets = match session.query(&rdb_studio_enterprise::list_sql(&name)).await {
                                 Ok(grid) => first_column(&grid),
@@ -4481,6 +4563,38 @@ impl Studio {
     }
 
     fn load_roles(&self) -> Task<Message> {
+        Task::batch([self.load_role_list(), self.load_role_access()])
+    }
+
+    /// Grants, default privileges and policies. Each part a server refuses
+    /// is left empty and named in `errors`; the rest still shows.
+    fn load_role_access(&self) -> Task<Message> {
+        let Some(session) = self.session.clone() else { return Task::none() };
+        Task::perform(
+            async move {
+                let mut access = crate::model::RoleAccess::default();
+                match session.query(dialect::table_grants_sql()).await {
+                    Ok(g) => (access.grants, access.owned) = dialect::parse_table_grants(&g),
+                    Err(e) => access.errors.push(format!("table grants: {e}")),
+                }
+                match session.query(dialect::default_privileges_sql()).await {
+                    Ok(g) => access.defaults = dialect::parse_default_privileges(&g),
+                    Err(e) => access.errors.push(format!("default privileges: {e}")),
+                }
+                match session.query(dialect::policies_sql(session.flavor)).await {
+                    Ok(g) => access.policies = dialect::parse_policies(&g),
+                    Err(e) => access.errors.push(format!("policies: {e}")),
+                }
+                if let Ok(g) = session.query(dialect::rls_tables_sql()).await {
+                    access.rls_tables = (0..g.rows.len()).filter_map(|r| g.value(r, "name").map(str::to_string)).collect();
+                }
+                Box::new(access)
+            },
+            Message::RoleAccessLoaded,
+        )
+    }
+
+    fn load_role_list(&self) -> Task<Message> {
         let Some(session) = self.session.clone() else { return Task::none() };
         let sql = dialect::roles_sql(session.flavor);
         Task::perform(
