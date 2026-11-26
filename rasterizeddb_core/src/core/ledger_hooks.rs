@@ -257,19 +257,24 @@ pub fn statement(store: &str, request: LedgerRequest<'_>) -> Result<LedgerReply,
     }
 }
 
-/// Whether `sql` is a ledger statement core routes to [`statement`].
+/// Whether `sql` is a ledger statement core routes to [`statement`]. Read
+/// on every statement's way in (the native path asks it of each), so it
+/// looks at the first words in place and allocates nothing.
 pub fn is_ledger_statement(sql: &str) -> bool {
-    let words: Vec<String> = sql.split_whitespace().take(3).map(|w| w.to_ascii_uppercase()).collect();
-    let w: Vec<&str> = words.iter().map(String::as_str).collect();
-    matches!(
-        w.as_slice(),
-        ["VERIFY", "LEDGER", ..]
-            | ["SHOW", "LEDGER", ..]
-            | ["SHOW", "LEDGERS", ..]
-            | ["ALTER", "LEDGER", "TABLE"]
-            | ["ACKNOWLEDGE", "LEDGER", ..]
-            | ["VAULT", ..]
-    )
+    let mut w = sql.split_ascii_whitespace();
+    let is = |word: Option<&str>, want: &str| word.is_some_and(|x| x.trim_end_matches(';').eq_ignore_ascii_case(want));
+    let first = w.next();
+    if is(first, "VAULT") {
+        return true;
+    }
+    let second = w.next();
+    if is(first, "VERIFY") || is(first, "ACKNOWLEDGE") {
+        return is(second, "LEDGER");
+    }
+    if is(first, "SHOW") {
+        return is(second, "LEDGER") || is(second, "LEDGERS");
+    }
+    is(first, "ALTER") && is(second, "LEDGER") && is(w.next(), "TABLE")
 }
 
 /// The hidden column every ledger table carries: the row's trusted insert
@@ -414,6 +419,17 @@ mod tests {
         let mut s = TableSchema::new("t".into(), false);
         s.special = kind;
         s
+    }
+
+    #[test]
+    fn ledger_statements_are_recognised_in_place() {
+        for yes in ["VERIFY LEDGER", "verify ledger pay", "SHOW LEDGER;", "SHOW LEDGERS", "ALTER LEDGER TABLE t SET RETENTION 1 DAY",
+            "ACKNOWLEDGE LEDGER ROLLBACK 'x'", "VAULT v GET SECRET 'a'", "  vault v LIST"] {
+            assert!(is_ledger_statement(yes), "{yes}");
+        }
+        for no in ["SELECT 1", "SHOW TABLES", "ALTER TABLE t ADD COLUMN x INT", "VERIFY", "VAULTED", "ALTER LEDGER t", ""] {
+            assert!(!is_ledger_statement(no), "{no}");
+        }
     }
 
     #[test]

@@ -156,6 +156,25 @@ fn valid_name(n: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `s` as a JSON string literal.
+fn json_str(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
 fn sql_text(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
@@ -426,6 +445,40 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
             audit(store_key, vault, &format!("SET {} '{name}' v{version} by {role}", table.name))?;
             let b64 = base64::engine::general_purpose::STANDARD.encode(sealed);
             Ok(reply(vec![format!("{name} version {version}")], vec![insert(&name, version, &b64, "active", &ct, nb, exp, &tags)]))
+        }
+        // Every active, current secret at once (an application loading its
+        // configuration): one row each, `{"name":…,"version":…,"value":…}`,
+        // each read audited as a GET of its own. Keys (`key:…`) are not
+        // secrets and are left out.
+        "GET" if at(3) == "ALL" => {
+            let prefix = match at(4) {
+                "PREFIX" => Some(quoted(w.get(5), "a name prefix")?),
+                "" => None,
+                other => return Err(format!("42601: unexpected {other} in VAULT GET ALL")),
+            };
+            let now = clock::now_micros();
+            let provider = provider(policy.key_provider.as_deref().ok_or("XX001: the vault has no key provider")?)?;
+            let ring = keyring(store_key, vault)?;
+            let mut out = Vec::new();
+            for (name, (newest, state)) in &secrets {
+                if name.starts_with("key:") || state != "active" || prefix.as_ref().is_some_and(|p| !name.starts_with(p.as_str())) {
+                    continue;
+                }
+                let Some(row) = newest else { continue };
+                if (row.expires_at != 0 && now >= row.expires_at) || (row.not_before != 0 && now < row.not_before) {
+                    continue;
+                }
+                let Some(wrapped) = ring.lock().keys.get(&(name.clone(), row.version)).cloned() else { continue };
+                let dek = provider.unwrap(&wrapped)?;
+                let sealed = base64::engine::general_purpose::STANDARD
+                    .decode(row.value.as_bytes())
+                    .map_err(|_| "XX001: a sealed value is not base64".to_string())?;
+                let plain = crypto::open(&dek, &sealed, &aad(vault, name, row.version))?;
+                let text = String::from_utf8(plain.to_vec()).map_err(|_| format!("22021: secret '{name}' is not UTF-8 text"))?;
+                audit(store_key, vault, &format!("GET {} '{name}' v{} by {role} (GET ALL)", table.name, row.version))?;
+                out.push(format!("{{\"name\":{},\"version\":{},\"value\":{}}}", json_str(name), row.version, json_str(&text)));
+            }
+            Ok(reply(out, Vec::new()))
         }
         "GET" => {
             if at(3) != "SECRET" {
@@ -706,6 +759,11 @@ mod tests {
             words("VAULT v SET SECRET 'db' = 'p''w=1' EXPIRES '2027-01-01'"),
             vec!["VAULT", "v", "SET", "SECRET", "'db", "=", "'p'w=1", "EXPIRES", "'2027-01-01"]
         );
+    }
+
+    #[test]
+    fn json_strings_escape() {
+        assert_eq!(json_str("a\"b\\c\nd\u{1}"), "\"a\\\"b\\\\c\\nd\\u0001\"");
     }
 
     #[test]

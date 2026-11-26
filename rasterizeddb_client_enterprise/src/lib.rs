@@ -68,6 +68,37 @@ async fn lines(client: &Client, sql: &str) -> Result<Vec<String>> {
     rows.iter().map(|r| r.get::<String>(0)).collect()
 }
 
+/// `{"name":…,"version":…,"value":…}` as `VAULT … GET ALL` writes it:
+/// (name, value). Only the escapes that writer produces are read.
+fn parse_secret_json(l: &str) -> Option<(String, String)> {
+    fn string(s: &str) -> Option<(String, &str)> {
+        let mut out = String::new();
+        let mut chars = s.strip_prefix('"')?.char_indices();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '"' => return Some((out, &s[i + 2..])),
+                '\\' => match chars.next()?.1 {
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    'u' => {
+                        let hex: String = (0..4).filter_map(|_| chars.next().map(|x| x.1)).collect();
+                        out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+                    }
+                    other => out.push(other),
+                },
+                c => out.push(c),
+            }
+        }
+        None
+    }
+    let rest = l.strip_prefix("{\"name\":")?;
+    let (name, rest) = string(rest)?;
+    let at = rest.find(",\"value\":")?;
+    let (value, _) = string(&rest[at + ",\"value\":".len()..])?;
+    Some((name, value))
+}
+
 /// A secret's metadata, as `VAULT … LIST` gives it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecretInfo {
@@ -147,6 +178,23 @@ impl<'c> Vault<'c> {
         let rows = self.client.run(sql).await?;
         let row = rows.get(0).ok_or_else(|| Error::Protocol("VAULT GET returned no row".to_string()))?;
         Ok(SecretString::new(row.get::<String>(0)?))
+    }
+
+    /// Every active, current secret (names starting `prefix`, if given) with
+    /// its value, in one round trip: an application loading its
+    /// configuration. Each value read is audited on the server.
+    pub async fn get_all(&self, prefix: Option<&str>) -> Result<Vec<(String, SecretString)>> {
+        let mut sql = format!("{} ALL", self.head("GET")?);
+        if let Some(p) = prefix {
+            sql.push_str(&format!(" PREFIX {}", quote(p)));
+        }
+        let rows = Zeroizing::new(lines(self.client, &sql).await?);
+        rows.iter()
+            .map(|l| {
+                let (name, value) = parse_secret_json(l).ok_or_else(|| Error::Protocol(format!("unexpected VAULT GET ALL row {:?}", l.get(..40))))?;
+                Ok((name, SecretString::new(value)))
+            })
+            .collect()
     }
 
     pub async fn list(&self) -> Result<Vec<SecretInfo>> {
@@ -467,6 +515,13 @@ impl LedgerModelExt for Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_all_rows_parse() {
+        let (n, v) = parse_secret_json(r#"{"name":"a/b","version":3,"value":"x\"y\\z\nw\u0001"}"#).unwrap();
+        assert_eq!(n, "a/b");
+        assert_eq!(v, "x\"y\\z\nw\u{1}");
+    }
 
     #[test]
     fn secrets_do_not_print() {

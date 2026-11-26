@@ -245,7 +245,7 @@ impl LedgerHooks for LedgerGuard {
 
     fn database_opened(&self, store_key: &str) {
         // Reading the chain raises the trusted clock past every stamp in it.
-        if let Err(e) = store::chain(store_key) {
+        if let Err(e) = store::reopen(store_key) {
             log::error!("ledger chain of {store_key}: {e}");
         }
     }

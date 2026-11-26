@@ -6794,6 +6794,33 @@ mod tests {
         f.statements.into_iter().chain(f.system).collect::<Vec<_>>().join("; ")
     }
 
+    /// A vault or ledger statement from SqlClient reaches the engine as
+    /// written (docs/ledger-and-vault-plan.md §4): the T-SQL rewrite leaves
+    /// its words, quoted values and `=` alone, and the batch splitter keeps
+    /// it one statement.
+    #[test]
+    fn vault_and_ledger_statements_pass_through() {
+        let e = env();
+        for sql in [
+            "VAULT app_secrets SET SECRET 'db/pw' = 'it''s = x' EXPIRES '2027-01-01'",
+            "VAULT app_secrets GET SECRET 'db/pw'",
+            "VAULT app_secrets GET ALL PREFIX 'db/'",
+            "VAULT app_secrets ENCRYPT KEY 'k' VALUE 'a b'",
+            "VERIFY LEDGER pay",
+            "SHOW LEDGER RECEIPT pay 1764100000000000",
+            "ALTER LEDGER TABLE pay SET LEGAL HOLD 'case1'",
+        ] {
+            assert_eq!(parse_batch(&lex(sql).unwrap()).unwrap().len(), 1, "{sql}");
+            let out = tr(&e, sql);
+            assert!(
+                crate::core::ledger_hooks::is_ledger_statement(&out),
+                "{sql} became {out}"
+            );
+            let squash = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert_eq!(squash(&out), squash(sql), "{sql} became {out}");
+        }
+    }
+
     #[test]
     fn batches_split_without_semicolons() {
         let sql = "SET NOCOUNT ON SELECT 1 INSERT INTO t (a) SELECT b FROM u UPDATE t SET a = 1 WHERE a = 2 IF @n > 1 BEGIN SELECT 2 END ELSE SELECT 3";

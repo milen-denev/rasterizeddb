@@ -34,3 +34,7 @@ enterprise = ["dep:rasterizeddb_enterprise"]
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tempfile = "3"
+
+[[test]]
+name = "ledger_enterprise"
+required-features = ["enterprise"]

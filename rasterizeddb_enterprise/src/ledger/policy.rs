@@ -144,7 +144,13 @@ fn payloads(bytes: &[u8]) -> Result<Vec<&str>, String> {
         }
         let len = u32::from_le_bytes(rest[4..8].try_into().unwrap()) as usize;
         let Some(frame) = rest.get(8..8 + len + 4) else {
-            break; // torn tail
+            // A torn last append, unless another record follows: then the
+            // length was altered, and dropping the records after it (a hold,
+            // a raised retention) would loosen the policy unnoticed.
+            if rest[4..].windows(MAGIC.len()).any(|w| w == MAGIC) {
+                return Err(format!("a ledger policy record at byte {at} runs past the end, with records after it"));
+            }
+            break;
         };
         let (body, crc) = frame.split_at(len);
         if crc32c(body) != u32::from_le_bytes(crc.try_into().unwrap()) {

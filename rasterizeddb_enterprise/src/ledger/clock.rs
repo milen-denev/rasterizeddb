@@ -47,11 +47,8 @@ pub fn raise_high_water(micros: i64) {
 
 /// The trusted time now, in microseconds since the epoch.
 pub fn now_micros() -> i64 {
-    let mut now = wall_micros();
-    if let Some((at, when)) = *WITNESS.lock() {
-        let bound = at.saturating_add(when.elapsed().min(Duration::from_secs(1 << 40)).as_micros() as i64);
-        now = now.min(bound);
-    }
+    let witness = WITNESS.lock().map(|(at, when)| (at, when.elapsed()));
+    let now = bounded(wall_micros(), witness);
     // Strictly later than every time handed out before: a stamp also names
     // its row (`__ledger_ts`), so two rows never share one.
     let mut previous = HIGH_WATER.load(Ordering::Acquire);
@@ -61,6 +58,15 @@ pub fn now_micros() -> i64 {
             Ok(_) => return next,
             Err(seen) => previous = seen,
         }
+    }
+}
+
+/// The wall clock `wall`, capped by a witness that reported `at` some
+/// `elapsed` ago.
+fn bounded(wall: i64, witness: Option<(i64, Duration)>) -> i64 {
+    match witness {
+        Some((at, elapsed)) => wall.min(at.saturating_add(elapsed.min(Duration::from_secs(1 << 40)).as_micros() as i64)),
+        None => wall,
     }
 }
 
@@ -136,9 +142,12 @@ mod tests {
     fn a_witness_caps_a_clock_moved_forward() {
         // A witness an hour behind the wall clock: retention measured from a
         // row inserted at the witness time does not see the extra hour.
-        let wall = wall_micros();
-        witness(wall - 3_600_000_000);
-        assert!(!retention_passed(wall - 3_600_000_000, 1_800_000_000));
-        *WITNESS.lock() = None;
+        // The bound itself; `now_micros` also never goes below times it has
+        // already handed out, which other tests here raise.
+        let wall = 10_000_000_000i64;
+        let witnessed = wall - 3_600_000_000;
+        assert_eq!(bounded(wall, Some((witnessed, Duration::from_secs(60)))), witnessed + 60_000_000);
+        assert_eq!(bounded(wall, None), wall);
+        assert_eq!(bounded(wall, Some((wall + 5, Duration::ZERO))), wall);
     }
 }

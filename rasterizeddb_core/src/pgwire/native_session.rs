@@ -740,6 +740,12 @@ impl NativeSession {
     pub(crate) async fn needs_session_path(&self, query: &str) -> bool {
         let database = &self.database;
         let stmt = query.trim();
+        // Ledger and vault statements: the session path says who runs them
+        // (`ledger_hooks::with_session`), which their privileges and a
+        // vault's audit need.
+        if crate::core::ledger_hooks::is_ledger_statement(stmt) {
+            return true;
+        }
         // The schema-object statements below each begin with CREATE, DROP,
         // ALTER, CALL, MERGE, GRANT or REVOKE, so a statement that begins
         // with a reading or writing verb is none of them. Each parser

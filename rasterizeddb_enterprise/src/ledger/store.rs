@@ -194,7 +194,15 @@ pub fn read(bytes: &[u8]) -> ChainRead {
         }
         let len = u32::from_le_bytes(rest[4..8].try_into().unwrap()) as usize;
         let Some(frame) = rest.get(8..8 + len + 32) else {
-            out.torn_tail = true;
+            // Past the end: the last append cut short by a crash, if nothing
+            // after it looks like another entry. With another entry's frame
+            // after it, the length was altered: truncating there would
+            // throw away every later entry and hide the edit.
+            if rest[4..].windows(MAGIC.len()).any(|w| w == MAGIC) {
+                out.broken = Some((expect_seq, format!("entry {expect_seq}'s length runs past the end, with entries after it")));
+            } else {
+                out.torn_tail = true;
+            }
             break;
         };
         let (payload, stored) = frame.split_at(len);
@@ -402,6 +410,16 @@ pub fn chain(store: &str) -> Result<Arc<Mutex<Chain>>, String> {
     Ok(c)
 }
 
+/// Reads `store`'s chain from disk again, replacing any copy this process
+/// held: a database opened (again) must check the file as it is now, not
+/// trust a head from before it closed.
+pub fn reopen(store: &str) -> Result<Arc<Mutex<Chain>>, String> {
+    if let Some(chains) = CHAINS.get() {
+        chains.lock().remove(store);
+    }
+    chain(store)
+}
+
 /// The newest stamp inserted under `ledger` in any open chain.
 pub fn last_insert(ledger: u128) -> Option<i64> {
     let chains = CHAINS.get()?;
@@ -435,6 +453,21 @@ mod tests {
         let first_len = 8 + 28 + 2 * ITEM_LEN + 32;
         let without_first = c.memory[first_len..].to_vec();
         assert!(read(&without_first).broken.is_some(), "a dropped entry breaks the chain");
+    }
+
+    #[test]
+    fn an_altered_length_is_not_taken_for_a_torn_tail() {
+        let mut c = Chain::open("memory:len").unwrap();
+        c.append(1, &[item(1)]).unwrap();
+        c.append(2, &[item(2)]).unwrap();
+        let mut bytes = c.memory.clone();
+        bytes[5] = 0x7f; // the first entry's length, now far past the end
+        let r = read(&bytes);
+        assert!(r.broken.is_some() && !r.torn_tail, "{r:?}");
+        // A genuinely torn last append is still dropped.
+        let cut = c.memory[..c.memory.len() - 10].to_vec();
+        let r = read(&cut);
+        assert!(r.broken.is_none() && r.torn_tail && r.entries.len() == 1);
     }
 
     #[test]

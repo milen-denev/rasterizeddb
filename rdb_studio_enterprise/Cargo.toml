@@ -11,4 +11,4 @@ publish = false
 
 # Linked only by rdb_studio's `enterprise` feature (sharding-plan.md §10, L8).
 [dependencies]
-iced = { version = "0.14.0", default-features = false }
+iced = "0.14.0"
