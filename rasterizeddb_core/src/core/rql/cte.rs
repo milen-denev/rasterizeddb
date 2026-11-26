@@ -1220,12 +1220,19 @@ pub(crate) fn whole_rows_with_hidden(body: &str, database: &Database) -> Option<
 /// NULL of its type) describes it, so the relation has its columns' types
 /// even when no run returns a row. `labels` renames the item's columns.
 /// The temporary is named in `temps` as soon as it exists.
+///
+/// `batch` is the item as one query for every outer value
+/// (`lateral::batched_body`): its own columns, then the outer value a row is
+/// for, as text; and the most rows it may return. The first row of each
+/// value is that value's row. When it cannot be run, or returns more, the
+/// runs are made instead. Returns whether the batch filled the relation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_keyed_relation(
     described: &str,
     temp: &str,
     labels: Option<&[String]>,
     runs: &[(String, Vec<String>)],
+    batch: Option<(&str, usize)>,
     // How many key columns each run carries: known with no run at all (an
     // outer relation whose WHERE keeps no row), when the relation still
     // needs them for the join back.
@@ -1234,7 +1241,7 @@ pub(crate) async fn build_keyed_relation(
     database: &Arc<Database>,
     tx: crate::core::mvcc::transaction::TxId,
     temps: &mut Vec<String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let subject = format!("the LATERAL item '{alias}'");
     let own = match select_labels(described, database).await {
         Some(own) => own,
@@ -1263,7 +1270,7 @@ pub(crate) async fn build_keyed_relation(
     // are copied out.
     let mut nested_temps: Vec<String> = Vec::new();
     let filled = fill_keyed_relation(
-        runs, key_count, width, &own, &mut names, described, temp, &subject, &mut nested_temps, database, tx, temps,
+        runs, batch, key_count, width, &own, &mut names, described, temp, &subject, &mut nested_temps, database, tx, temps,
     )
     .await;
     drop_temps(database, &nested_temps, tx).await;
@@ -1275,6 +1282,7 @@ pub(crate) async fn build_keyed_relation(
 #[allow(clippy::too_many_arguments)]
 async fn fill_keyed_relation(
     runs: &[(String, Vec<String>)],
+    batch: Option<(&str, usize)>,
     key_count: usize,
     width: usize,
     own: &[String],
@@ -1286,13 +1294,56 @@ async fn fill_keyed_relation(
     database: &Arc<Database>,
     tx: crate::core::mvcc::transaction::TxId,
     temps: &mut Vec<String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     // With no run there are no keys to count; an empty relation still has
     // its key columns (`Column '__lat_k1' not found` otherwise).
     let key_count = runs.first().map_or(key_count, |(_, keys)| keys.len());
     let mut rows: Vec<crate::core::row::row::Row> = Vec::new();
     let mut scales: Option<Vec<u32>> = None;
-    for (body, keys) in runs {
+    // Every outer value's rows at once, the first of each kept. Refused,
+    // failed or past its cap, the item is run a value at a time below.
+    let mut batched = false;
+    if let Some((body, cap)) = batch.filter(|_| key_count == 1) {
+        let nested = Box::pin(materialize_derived(body, database, tx)).await.ok().flatten();
+        let text = match &nested {
+            Some(m) => m.rewritten.as_str(),
+            None => body,
+        };
+        let got = crate::core::rql::executor::run_query_rows_scaled(text, database, tx).await;
+        if let Some(m) = nested {
+            nested_temps.extend(m.temps);
+        }
+        match got {
+            Ok((got, got_scales)) if got.len() <= cap && got.iter().all(|row| row.columns.len() == width + 1) => {
+                let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::with_capacity(got.len());
+                for mut row in got {
+                    let Some(key) = row.columns.pop() else { continue };
+                    // A NULL in the item's column joins no outer value.
+                    if key.column_type == DbType::NULL {
+                        continue;
+                    }
+                    let mut text = Vec::with_capacity(key.data.into_slice().len() + 1);
+                    text.push(b'v');
+                    text.extend_from_slice(key.data.into_slice());
+                    if !seen.insert(text.clone()) {
+                        continue;
+                    }
+                    let mut block = crate::memory_pool::MEMORY_POOL.acquire(text.len());
+                    block.into_slice_mut().copy_from_slice(&text);
+                    row.columns.push(crate::core::row::row::Column { schema_id: 0, data: block, column_type: DbType::STRING });
+                    rows.push(row);
+                }
+                scales = got_scales.map(|mut scales| {
+                    scales.truncate(width);
+                    scales
+                });
+                batched = true;
+            }
+            Ok(_) => {}
+            Err(e) => log::debug!("{subject}: asked for every outer value at once it failed ({e}); run for each"),
+        }
+    }
+    for (body, keys) in runs.iter().filter(|_| !batched) {
         let nested = Box::pin(materialize_derived(body, database, tx)).await?;
         let text = match nested {
             Some(m) => {
@@ -1368,7 +1419,7 @@ async fn fill_keyed_relation(
         .await
         .map_err(|e| format!("could not fill {subject}: {e}"))?;
     }
-    Ok(())
+    Ok(batched)
 }
 
 fn temp_name(cte: &str, statement: &str, index: usize) -> String {

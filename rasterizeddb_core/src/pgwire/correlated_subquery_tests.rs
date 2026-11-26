@@ -934,6 +934,136 @@ fn the_rows_a_limit_keeps_are_the_join_s_to_decide() {
     }
 }
 
+/// A select-list subquery that is the first row of its rows for the outer
+/// row (`… ORDER BY … LIMIT 1`, EF Core's `TOP(1)`) is asked once for every
+/// outer row the statement keeps, not once a row (`lateral::batched_body`):
+/// EF Core's related-items statement, ten products with a first price and a
+/// first tag each, ran twenty statements for its two subqueries, half of
+/// them joins. The answers are the ones each run gives: the first row by
+/// the subquery's own order, NULL where it has no row; over a join in the
+/// subquery; and a subquery this is not for, or whose rows are too many,
+/// run a row at a time as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_row_subquery_is_asked_once_for_every_outer_row() {
+    use crate::core::rql::lateral::test_hooks::take_batched;
+    const A: &str = "obat";
+    let db = db().await;
+    let mut s = session(&db);
+    let (customers, orders, kinds) = ("bat_customers", "bat_orders", "bat_kinds");
+    fill(&db, &mut s, customers, orders, false).await;
+    ok(&db, &mut s, &format!("CREATE TABLE {kinds} (id INT NOT NULL PRIMARY KEY, label TEXT)")).await;
+    let values: Vec<String> = (0..50).map(|k| format!("({k}, 'k{k}')")).collect();
+    ok(&db, &mut s, &format!("INSERT INTO {kinds} (id, label) VALUES {}", values.join(", "))).await;
+    // A customer's orders, and the first by amount (largest first, then id).
+    let of = |c: i64| -> Vec<i64> { (1..=ORDERS).filter(|o| owner(*o) == c).collect() };
+    let first = |c: i64| -> Option<i64> { of(c).into_iter().min_by_key(|o| (std::cmp::Reverse(amount(*o)), *o)) };
+    let cell = |v: i64| Some(v.to_string());
+    let top = format!("(SELECT o.amount FROM {orders} o WHERE o.customer_id = {A}.id ORDER BY o.amount DESC, o.id LIMIT 1)");
+    let top_id = format!("(SELECT o.id FROM {orders} o WHERE {A}.id = o.customer_id AND o.amount >= 0 ORDER BY o.amount DESC, o.id LIMIT 1)");
+    // Over a join: the label of the kind (its amount) of its first order.
+    let joined = format!(
+        "(SELECT k.label FROM {orders} o INNER JOIN {kinds} k ON k.id = o.amount WHERE o.customer_id = {A}.id ORDER BY o.amount DESC, o.id LIMIT 1)"
+    );
+    // Customers 285..=295: the last five of them have no orders.
+    let ids: Vec<i64> = (285..=295).collect();
+    let rest = format!("FROM {customers} {A} WHERE {A}.id BETWEEN 285 AND 295 ORDER BY {A}.id");
+    let sql = format!("SELECT {A}.id, {top} AS a, {top_id} AS o FROM {customers} {A} WHERE {A}.id BETWEEN 285 AND 295 ORDER BY {A}.id");
+    take_batched(A);
+    take_runs(customers, A);
+    let got = pg_rows(&db, &mut s, &sql).await;
+    let want: Vec<Vec<Option<String>>> = ids.iter().map(|c| vec![cell(*c), first(*c).map(|o| amount(o).to_string()), first(*c).map(|o| o.to_string())]).collect();
+    assert!(want.iter().any(|row| row[1].is_none()) && want.iter().any(|row| row[1].is_some()));
+    assert_eq!(got, want, "{sql}");
+    assert_eq!(take_batched(A), 2, "{sql}");
+    assert_eq!(native_rows(&db, &sql).await, want, "{sql}");
+    assert_eq!(take_batched(A), 2, "{sql}");
+    let sql = format!("SELECT {A}.id, {joined} AS l {rest}");
+    let got = pg_rows(&db, &mut s, &sql).await;
+    let want: Vec<Vec<Option<String>>> = ids.iter().map(|c| vec![cell(*c), first(*c).map(|o| format!("k{}", amount(o)))]).collect();
+    assert_eq!(got, want, "{sql}");
+    assert_eq!(take_batched(A), 1, "{sql}");
+    // With a LIMIT on the statement: the rows it keeps are cut first, and
+    // the subquery asked once for those.
+    let sql = format!("SELECT {A}.id, {top} AS a FROM {customers} {A} WHERE {A}.id > 100 ORDER BY {A}.id LIMIT 7");
+    let got = pg_rows(&db, &mut s, &sql).await;
+    let want: Vec<Vec<Option<String>>> = (101..=107).map(|c| vec![cell(c), first(c).map(|o| amount(o).to_string())]).collect();
+    assert_eq!(got, want, "{sql}");
+    assert_eq!(take_batched(A), 1, "{sql}");
+
+    // Not for it, and answered the same a row at a time: an aggregate, no
+    // LIMIT 1, the outer row read twice, a comparison that is not equality.
+    let all = expected();
+    for (item, value) in [
+        (format!("(SELECT COUNT(*) FROM {orders} o WHERE o.customer_id = {A}.id)"), Box::new(|c: i64| Some(all[&c].0.to_string())) as Box<dyn Fn(i64) -> Option<String>>),
+        (
+            format!("(SELECT o.amount FROM {orders} o WHERE o.customer_id = {A}.id AND o.id > {A}.id ORDER BY o.amount DESC, o.id LIMIT 1)"),
+            Box::new(|c: i64| of(c).into_iter().filter(|o| *o > c).min_by_key(|o| (std::cmp::Reverse(amount(*o)), *o)).map(|o| amount(o).to_string())),
+        ),
+    ] {
+        let sql = format!("SELECT {A}.id, {item} AS v {rest}");
+        let got = pg_rows(&db, &mut s, &sql).await;
+        let want: Vec<Vec<Option<String>>> = ids.iter().map(|c| vec![cell(*c), value(*c)]).collect();
+        assert_eq!(got, want, "{sql}");
+        assert_eq!(take_batched(A), 0, "{sql}");
+    }
+    // More rows than the batch may return: two customers of a table with
+    // 1,300 rows each. Run a row at a time, the same answer.
+    let many = "bat_many";
+    ok(&db, &mut s, &format!("CREATE TABLE {many} (id INT NOT NULL PRIMARY KEY, customer_id INT NOT NULL, amount INT NOT NULL)")).await;
+    let values: Vec<String> = (1..=2600i64).map(|n| format!("({n}, {}, {})", 285 + n % 2, (n * 37) % 1000)).collect();
+    ok(&db, &mut s, &format!("INSERT INTO {many} (id, customer_id, amount) VALUES {}", values.join(", "))).await;
+    let sql = format!(
+        "SELECT {A}.id, (SELECT m.amount FROM {many} m WHERE m.customer_id = {A}.id ORDER BY m.amount DESC, m.id LIMIT 1) AS a \
+         FROM {customers} {A} WHERE {A}.id IN (285, 286) ORDER BY {A}.id"
+    );
+    let best = |c: i64| (1..=2600i64).filter(|n| 285 + n % 2 == c).map(|n| (n * 37) % 1000).max().unwrap();
+    assert_eq!(pg_rows(&db, &mut s, &sql).await, vec![vec![cell(285), cell(best(285))], vec![cell(286), cell(best(286))]], "{sql}");
+    assert_eq!(take_batched(A), 0, "{sql}");
+}
+
+/// [`a_first_row_subquery_is_asked_once_for_every_outer_row`], the item and
+/// its one query as text, and the items left as they are.
+#[test]
+fn a_first_row_item_is_one_query_for_every_outer_value() {
+    use crate::core::rql::lateral::batched_body_for_tests as batched;
+    let values = vec!["'a'".to_string(), "'b'".to_string()];
+    assert_eq!(
+        batched("SELECT p.price AS __v FROM prices p WHERE d.id = p.product_id AND p.kind = 1 AND (p.c = 'x' OR p.c IS NULL) ORDER BY CASE WHEN p.c IS NULL THEN 1 ELSE 0 END DESC LIMIT 1", "d", "id", &values, 1024).as_deref(),
+        Some(
+            "SELECT p.price AS __v, p.product_id::text AS __lat_bk FROM prices p WHERE p.product_id IN ('a', 'b') AND p.kind = 1 AND (p.c = 'x' OR p.c IS NULL) \
+             ORDER BY CASE WHEN p.c IS NULL THEN 1 ELSE 0 END DESC LIMIT 1025"
+        )
+    );
+    // Over a join, the equality the other way round, no ORDER BY.
+    assert_eq!(
+        batched("SELECT t.content AS __v FROM pt AS x INNER JOIN tags t ON x.tag_id = t.id WHERE x.product_id = d.id LIMIT 1", "d", "id", &values, 9).as_deref(),
+        Some("SELECT t.content AS __v, x.product_id::text AS __lat_bk FROM pt AS x INNER JOIN tags t ON x.tag_id = t.id WHERE x.product_id IN ('a', 'b') LIMIT 10")
+    );
+    for left in [
+        // Not the first row of its rows.
+        "SELECT p.price AS __v FROM prices p WHERE d.id = p.product_id ORDER BY p.rank",
+        "SELECT p.price AS __v FROM prices p WHERE d.id = p.product_id ORDER BY p.rank LIMIT 2",
+        "SELECT p.price AS __v FROM prices p WHERE d.id = p.product_id ORDER BY p.rank LIMIT 1 OFFSET 1",
+        "SELECT max(p.price) AS __v FROM prices p WHERE d.id = p.product_id LIMIT 1",
+        "SELECT count(*) AS __v FROM prices p WHERE d.id = p.product_id",
+        "SELECT DISTINCT p.price AS __v FROM prices p WHERE d.id = p.product_id LIMIT 1",
+        "SELECT p.price AS __v FROM prices p WHERE d.id = p.product_id GROUP BY p.price LIMIT 1",
+        // The outer row read twice, in an OR, by another comparison, by
+        // another column, against a value that is not a column, in the list.
+        "SELECT p.price AS __v FROM prices p WHERE d.id = p.product_id AND p.rank > d.id LIMIT 1",
+        "SELECT p.price AS __v FROM prices p WHERE (d.id = p.product_id OR p.all = 1) LIMIT 1",
+        "SELECT p.price AS __v FROM prices p WHERE d.id <= p.product_id LIMIT 1",
+        "SELECT p.price AS __v FROM prices p WHERE d.other = p.product_id LIMIT 1",
+        "SELECT p.price AS __v FROM prices p WHERE d.id = p.product_id + 1 LIMIT 1",
+        "SELECT p.price + d.id AS __v FROM prices p WHERE p.kind = 1 LIMIT 1",
+        // The item's side a derived table's column, or no table's.
+        "SELECT p.price AS __v FROM (SELECT * FROM prices) p WHERE d.id = p.product_id LIMIT 1",
+        "SELECT p.price AS __v FROM prices p WHERE d.id = q.product_id LIMIT 1",
+    ] {
+        assert_eq!(batched(left, "d", "id", &values, 1024), None, "{left}");
+    }
+}
+
 /// The copy of the outer item made to carry an item's join key holds the
 /// columns the statement names, not every column: EF Core's related-items
 /// query read four columns of a table of 59, and typing and filling a copy

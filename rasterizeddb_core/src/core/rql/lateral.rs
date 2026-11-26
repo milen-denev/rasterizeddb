@@ -1024,6 +1024,178 @@ fn key_of(text: Option<&str>) -> String {
 }
 
 /// The SQL type a column of `relation` has, as a cast can name it.
+/// The most outer values an item is asked for at once ([`batched_body`]): an
+/// `IN` list of them.
+const BATCH_TUPLES: usize = 512;
+
+/// [`batched_body`] for an item over `relation`'s `column`, when the join is
+/// one this can ask at once: both columns integers or UUIDs of one type,
+/// whose text is one value's and no other's (the keys the rows are matched
+/// by). The query, and the most rows it may return before the item is run
+/// a value at a time instead.
+fn batched(
+    body: &str,
+    alias: &str,
+    relation: &str,
+    column: &str,
+    tuples: &[Vec<Option<String>>],
+    database: &Arc<Database>,
+) -> Option<(String, usize)> {
+    use crate::core::db_type::DbType;
+    let type_of = |relation: &str, column: &str| -> Option<DbType> {
+        let view = database.schema_view(relation.trim().trim_matches('"'))?;
+        let fields = &view.schema().fields;
+        let field = fields.iter().find(|f| !f.is_deleted && f.name == column).or_else(|| fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column)))?;
+        Some(field.db_type.clone())
+    };
+    let outer = type_of(relation, column)?;
+    if !(is_integer(&outer) || outer == DbType::UUID) {
+        return None;
+    }
+    // As a client writes them: a number bare, a UUID quoted. (A list of
+    // casts is not one an index is read by.)
+    let mut constants: Vec<String> = Vec::with_capacity(tuples.len());
+    for value in tuples.iter().filter_map(|t| t.first()?.as_ref()) {
+        if is_integer(&outer) {
+            value.parse::<i128>().ok()?;
+            constants.push(value.clone());
+        } else {
+            constants.push(quote(value));
+        }
+    }
+    if constants.is_empty() {
+        return None;
+    }
+    let cap = (tuples.len() * 64).clamp(1024, 20_000);
+    let (sql, inner_relation, inner_column) = batched_body(body, alias, column, &constants, cap)?;
+    (type_of(&inner_relation, &inner_column)? == outer).then_some((sql, cap))
+}
+
+fn is_integer(ty: &crate::core::db_type::DbType) -> bool {
+    use crate::core::db_type::DbType;
+    matches!(ty, DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64)
+}
+
+/// A correlated item that is the first row of its rows for an outer value,
+/// as one query of those rows for every outer value:
+///
+/// ```text
+/// SELECT p.price AS __v FROM prices p WHERE d.id = p.product_id AND p.kind = 1 ORDER BY p.rank DESC LIMIT 1
+/// SELECT p.price AS __v, p.product_id::text AS __lat_bk FROM prices p
+///  WHERE p.product_id IN (<the outer values>) AND p.kind = 1 ORDER BY p.rank DESC LIMIT <cap + 1>
+/// ```
+///
+/// Its rows come in the item's own order, so the first row with an outer
+/// value's key is the row the item is for that value, and a value with no
+/// row has none, as its own run has none. The item ran once for each outer
+/// value: ten products with two such subqueries each were twenty statements
+/// (and half of them joins), two thirds of the statement's time.
+///
+/// `None` unless it is that: one `SELECT` ending in `LIMIT 1`, no `DISTINCT`,
+/// aggregate, window, grouping, set operation or `OFFSET`; the outer item
+/// named once in it, in a `WHERE` term of its own that is `outer.column =
+/// item.column` (either way round) over a table of the item's `FROM`. Also
+/// returned: that table and column, whose type the caller checks.
+fn batched_body(body: &str, alias: &str, column: &str, constants: &[String], cap: usize) -> Option<(String, String, String)> {
+    let body = body.trim().trim_end_matches(';').trim_end();
+    let lead = "SELECT".len();
+    if !word_at(body, 0, "SELECT") || body.as_bytes().get(lead).is_some_and(|b| is_word(*b)) {
+        return None;
+    }
+    if ["GROUP", "HAVING", "WINDOW", "FETCH", "FOR", "UNION", "INTERSECT", "EXCEPT", "OFFSET", "LATERAL"].iter().any(|w| find_keyword(body, w, 0).is_some()) {
+        return None;
+    }
+    let from = find_keyword(body, "FROM", 0)?;
+    let list = body[lead..from].trim();
+    if ["DISTINCT", "ALL"].iter().any(|w| word_at(list, 0, w) && list.as_bytes().get(w.len()).is_some_and(|b| !is_word(*b)))
+        || find_keyword(list, "OVER", 0).is_some()
+        || crate::core::rql::distinct_on::calls_an_aggregate(list)
+        || names_word(list, "SELECT")
+    {
+        return None;
+    }
+    let from_end = clause_end_of_from(body);
+    let where_at = find_keyword(body, "WHERE", 0).filter(|at| *at == from_end)?;
+    let limit_at = find_keyword(body, "LIMIT", where_at)?;
+    if !body[limit_at..].split_whitespace().map(str::to_ascii_uppercase).eq(["LIMIT".to_string(), "1".to_string()]) {
+        return None;
+    }
+    let order_at = find_keyword(body, "ORDER", where_at).filter(|at| *at < limit_at);
+    let clause = body[where_at + "WHERE".len()..order_at.unwrap_or(limit_at)].trim();
+    let order = order_at.map(|at| body[at..limit_at].trim()).unwrap_or_default();
+    // The outer item, named once: in the term that joins the item to it.
+    let named = {
+        let (bytes, name) = (body.as_bytes(), alias.as_bytes());
+        let mut count = 0usize;
+        let mut at = 0usize;
+        while at + name.len() <= bytes.len() {
+            if bytes[at] == b'\'' {
+                at = crate::core::sql_scan::quoted_end(bytes, at, b'\'').max(at + 1);
+                continue;
+            }
+            if bytes[at..at + name.len()].eq_ignore_ascii_case(name)
+                && (at == 0 || !(is_word(bytes[at - 1]) || bytes[at - 1] == b'.' || bytes[at - 1] >= 0x80))
+                && bytes.get(at + name.len()).is_none_or(|b| !(is_word(*b) || *b >= 0x80))
+            {
+                count += 1;
+            }
+            at += 1;
+        }
+        count
+    };
+    if named != 1 {
+        return None;
+    }
+    let mut terms = conjuncts(clause);
+    let plain = |text: &str| -> Option<(String, String)> {
+        let (qualifier, name) = text.trim().split_once('.')?;
+        let word = |t: &str| !t.is_empty() && t.bytes().all(is_word) && !t.as_bytes()[0].is_ascii_digit();
+        (word(qualifier) && word(name)).then(|| (qualifier.to_string(), name.to_string()))
+    };
+    let mut joined: Option<(usize, String, String)> = None;
+    for (index, term) in terms.iter().enumerate() {
+        if !names_word(term, alias) {
+            continue;
+        }
+        let (left, right) = term.split_once('=')?;
+        if right.contains('=') || left.ends_with(['<', '>', '!']) {
+            return None;
+        }
+        let (left, right) = (plain(left)?, plain(right)?);
+        let is_outer = |side: &(String, String)| same_name(&side.0, alias) && side.1.eq_ignore_ascii_case(column);
+        let inner = match (is_outer(&left), is_outer(&right)) {
+            (true, false) => right,
+            (false, true) => left,
+            _ => return None,
+        };
+        joined = Some((index, inner.0, inner.1));
+    }
+    let (index, qualifier, inner_column) = joined?;
+    // The table that column is of.
+    let (_, inner_relation) = items_before(body, from_end).into_iter().find(|(name, _)| same_name(name, &qualifier))?;
+    if inner_relation.trim_start().starts_with('(') {
+        return None;
+    }
+    terms[index] = format!("{qualifier}.{inner_column} IN ({})", constants.join(", "));
+    let mut sql = format!(
+        "SELECT {list}, {qualifier}.{inner_column}::text AS __lat_bk {} WHERE {}",
+        body[from..from_end].trim(),
+        terms.join(" AND ")
+    );
+    if !order.is_empty() {
+        sql.push(' ');
+        sql.push_str(order);
+    }
+    sql.push_str(&format!(" LIMIT {}", cap + 1));
+    Some((sql, inner_relation, inner_column))
+}
+
+/// [`batched_body`] for tests.
+#[cfg(test)]
+pub(crate) fn batched_body_for_tests(body: &str, alias: &str, column: &str, constants: &[String], cap: usize) -> Option<String> {
+    batched_body(body, alias, column, constants, cap).map(|(sql, _, _)| sql)
+}
+
 /// The probes one statement's items made of its outer item, by their text:
 /// the outer values ([`text_rows`]) and the outer columns' types
 /// ([`column_types`]). Within a statement the outer item's rows are the same
@@ -1417,6 +1589,15 @@ pub(crate) async fn materialize(
                     continue;
                 }
                 let described = null_body(database, &item, outer).await?;
+                // A first-row item (`… ORDER BY … LIMIT 1`) joined to the
+                // outer item on one column: asked once for every outer
+                // value (`batched_body`), not once a value.
+                let batch = (item.alias.starts_with(crate::core::rql::correlated::ALIAS_PREFIX)
+                    && item.columns.is_none()
+                    && columns.len() == 1
+                    && (2..=BATCH_TUPLES).contains(&tuples.len()))
+                .then(|| batched(&item.body, alias, relation, &columns[0], &tuples, database))
+                .flatten();
                 let mut runs = Vec::with_capacity(tuples.len());
                 for tuple in &tuples {
                     let constants: Vec<String> = tuple
@@ -1432,11 +1613,12 @@ pub(crate) async fn materialize(
                     runs.push((body, keys));
                 }
                 let labels = item.columns.clone();
-                crate::core::rql::cte::build_keyed_relation(
+                let batched = crate::core::rql::cte::build_keyed_relation(
                     &described,
                     &temp,
                     labels.as_deref(),
                     &runs,
+                    batch.as_ref().map(|(body, cap)| (body.as_str(), *cap)),
                     columns.len(),
                     &item.alias,
                     database,
@@ -1444,6 +1626,12 @@ pub(crate) async fn materialize(
                     temps,
                 )
                 .await?;
+                #[cfg(test)]
+                if batched {
+                    test_hooks::record_batched(alias);
+                }
+                #[cfg(not(test))]
+                let _ = batched;
                 // A correlated scalar subquery's item (`rql::correlated`): one
                 // row at most per outer value, or PostgreSQL's 21000.
                 if item.alias.starts_with(crate::core::rql::correlated::ALIAS_PREFIX) {
@@ -2736,6 +2924,19 @@ pub(crate) mod test_hooks {
     /// The constant items recorded for `alias`, forgotten.
     pub(crate) fn take_constants(alias: &str) -> usize {
         CONSTANTS.lock().unwrap().as_mut().and_then(|m| m.remove(alias)).unwrap_or(0)
+    }
+
+    /// The items asked once for every outer value (`batched_body`), by
+    /// outer alias.
+    static BATCHED: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+    pub(crate) fn record_batched(alias: &str) {
+        *BATCHED.lock().unwrap().get_or_insert_with(HashMap::new).entry(alias.to_string()).or_default() += 1;
+    }
+
+    /// The batched items recorded for `alias`, forgotten.
+    pub(crate) fn take_batched(alias: &str) -> usize {
+        BATCHED.lock().unwrap().as_mut().and_then(|m| m.remove(alias)).unwrap_or(0)
     }
 
     /// The statements whose outer rows were cut to their LIMIT first
