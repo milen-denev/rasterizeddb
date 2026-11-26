@@ -144,6 +144,11 @@ pub(crate) trait Env {
     fn shown(&self, _relation: &str, _column: Option<&str>) -> Option<String> {
         None
     }
+    /// A constraint's or index's name as it was declared, by the name the
+    /// engine holds it under.
+    fn shown_object(&self, _name: &str) -> Option<String> {
+        None
+    }
 }
 
 /// What a statement answers with.
@@ -2198,44 +2203,158 @@ fn catalog_view_stored(schema: &str, view: &str, cx: &Cx) -> Result<Option<Strin
             .collect();
             values(rows, &["name", "system_type_id", "user_type_id", "schema_id", "is_user_defined"], String::new())
         }
-        ("sys", "indexes") => {
-            let cols = ["object_id", "name", "index_id", "type", "type_desc", "is_unique", "is_primary_key", "is_unique_constraint"];
-            let mut rows = Vec::new();
-            for t in &tables {
-                let Some(view) = database.schema_view(t) else { continue };
+        // One list for both views, so an index has the same `index_id` in
+        // each: the primary key first (clustered), then the unique keys and
+        // the indexes. Names as declared (`shown_object`), else without the
+        // table prefix this front end gives an index.
+        ("sys", view @ ("indexes" | "index_columns")) => {
+            struct Index {
+                name: String,
+                columns: Vec<String>,
+                unique: bool,
+                primary: bool,
+                constraint: bool,
+                filter: Option<String>,
+            }
+            let indexes_of = |t: &str| -> Vec<Index> {
+                let Some(view) = database.schema_view(t) else { return Vec::new() };
                 let schema = view.schema();
-                let mut id = 1;
-                if schema.primary_key.is_some() {
-                    rows.push(format!("({}, {}, 1, 1, 'CLUSTERED', true, true, false)", object_id(t), sql_str(&format!("PK_{t}"))));
-                    id += 1;
+                let named = |engine: &str| {
+                    cx.env
+                        .shown_object(&name_key(engine))
+                        .unwrap_or_else(|| super::lex::decode_dots(crate::sqlcompat::plain_index_name(t, engine)).into_owned())
+                };
+                // A key over a column's collation key (`__ci_name`) is the
+                // column's, to a reader of the catalogue.
+                let base = |column: &str| -> String {
+                    match crate::core::rql::collation::companion_of(column) {
+                        Some((base, _)) => base.to_string(),
+                        None => column.to_string(),
+                    }
+                };
+                let mut out: Vec<Index> = Vec::new();
+                let primary = schema.unique_keys.iter().find(|k| !k.is_deleted && k.primary);
+                match (primary, schema.primary_key.as_deref()) {
+                    (Some(k), _) => out.push(Index {
+                        name: named(&k.name),
+                        columns: k.columns.iter().map(|c| base(c)).collect(),
+                        unique: true,
+                        primary: true,
+                        constraint: false,
+                        filter: None,
+                    }),
+                    (None, Some(column)) => out.push(Index {
+                        name: cx.env.shown_object(&name_key(&format!("pk_{t}"))).unwrap_or_else(|| format!("PK_{}", shown_table(t))),
+                        columns: vec![column.to_string()],
+                        unique: true,
+                        primary: true,
+                        constraint: false,
+                        filter: None,
+                    }),
+                    (None, None) => {}
                 }
-                for k in schema.unique_keys.iter().filter(|k| !k.is_deleted) {
-                    rows.push(format!("({}, {}, {id}, 2, 'NONCLUSTERED', true, false, true)", object_id(t), sql_str(&k.name)));
-                    id += 1;
+                let key_columns: Option<Vec<String>> = out.first().map(|k| k.columns.clone());
+                for k in schema.unique_keys.iter().filter(|k| !k.is_deleted && !k.primary) {
+                    let columns: Vec<String> = k.columns.iter().map(|c| base(c)).collect();
+                    // The primary key's own record under another mark (a
+                    // table made before the mark was kept): once.
+                    if key_columns.as_ref().is_some_and(|pk| *pk == columns)
+                        && (k.name.eq_ignore_ascii_case(&format!("pk_{t}")) || k.name.eq_ignore_ascii_case(&format!("{t}_pkey")))
+                    {
+                        continue;
+                    }
+                    out.push(Index {
+                        name: named(&k.name),
+                        columns,
+                        unique: true,
+                        primary: false,
+                        constraint: !k.from_index,
+                        filter: k.predicate.as_ref().map(|p| format!("({p})")),
+                    });
                 }
                 for x in schema.secondary_indexes.iter().filter(|x| !x.is_deleted) {
-                    rows.push(format!(
-                        "({}, {}, {id}, 2, 'NONCLUSTERED', {}, false, false)",
-                        object_id(t),
-                        sql_str(crate::sqlcompat::plain_index_name(t, &x.name)),
-                        x.unique
-                    ));
-                    id += 1;
+                    let columns: Vec<String> = x
+                        .columns
+                        .iter()
+                        .filter_map(|wo| schema.fields.iter().find(|f| !f.is_deleted && f.write_order == u64::from(*wo)).map(|f| base(&f.name)))
+                        .collect();
+                    // An index the engine keeps for a key listed above.
+                    if out.iter().any(|i| i.unique && x.unique && i.columns == columns) {
+                        continue;
+                    }
+                    out.push(Index { name: named(&x.name), columns, unique: x.unique, primary: false, constraint: false, filter: None });
                 }
+                out
+            };
+            if view == "indexes" {
+                let cols = ["object_id", "name", "index_id", "type", "type_desc", "is_unique", "is_primary_key", "is_unique_constraint", "has_filter", "filter_definition"];
+                let mut rows = Vec::new();
+                for t in &tables {
+                    for (k, index) in indexes_of(t).iter().enumerate() {
+                        rows.push(format!(
+                            "({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                            object_id(t),
+                            sql_str(&index.name),
+                            k + 1,
+                            if index.primary { 1 } else { 2 },
+                            if index.primary { "'CLUSTERED'" } else { "'NONCLUSTERED'" },
+                            index.unique,
+                            index.primary,
+                            index.constraint,
+                            index.filter.is_some(),
+                            index.filter.as_deref().map_or_else(|| "NULL::text".to_string(), sql_str)
+                        ));
+                    }
+                }
+                let fallback = format!(
+                    "(SELECT {} WHERE 1 = 0)",
+                    cols.iter()
+                        .map(|c| {
+                            let ty = match *c {
+                                "name" | "type_desc" | "filter_definition" => "text",
+                                c if c.starts_with("is_") || c == "has_filter" => "boolean",
+                                _ => "integer",
+                            };
+                            format!("CAST(NULL AS {ty}) AS {}", ident_sql(c))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                values(rows, &cols, fallback)
+            } else {
+                let cols = ["object_id", "index_id", "index_column_id", "column_id", "key_ordinal", "partition_ordinal", "is_descending_key", "is_included_column"];
+                let mut rows = Vec::new();
+                for t in &tables {
+                    let columns: Vec<String> = columns_of(t).into_iter().map(|c| c.0).collect();
+                    for (k, index) in indexes_of(t).iter().enumerate() {
+                        for (n, column) in index.columns.iter().enumerate() {
+                            // A column the table no longer shows (a key over
+                            // a hidden companion) has no `column_id`.
+                            let Some(at) = columns.iter().position(|c| c.eq_ignore_ascii_case(column)) else { continue };
+                            rows.push(format!("({}, {}, {}, {}, {}, 0, false, false)", object_id(t), k + 1, n + 1, at + 1, n + 1));
+                        }
+                    }
+                }
+                let fallback = format!(
+                    "(SELECT {} WHERE 1 = 0)",
+                    cols.iter()
+                        .map(|c| format!("CAST(NULL AS {}) AS {}", if c.starts_with("is_") { "boolean" } else { "integer" }, ident_sql(c)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                values(rows, &cols, fallback)
             }
-            values(rows, &cols, empty(&cols))
         }
         // No rows (the engine's defaults, checks and keys are not named
         // objects a script can drop one by one), but each with the columns
         // scripts read: EF Core's DropColumn / AlterColumn joins
         // `default_constraints` to `columns` on `parent_column_id`.
-        ("sys", view @ ("foreign_keys" | "key_constraints" | "check_constraints" | "default_constraints" | "index_columns" | "foreign_key_columns" | "extended_properties")) => {
+        ("sys", view @ ("foreign_keys" | "key_constraints" | "check_constraints" | "default_constraints" | "foreign_key_columns" | "extended_properties")) => {
             let cols: &[&str] = match view {
                 "default_constraints" => &["object_id", "name", "parent_object_id", "parent_column_id", "definition", "type", "type_desc", "is_system_named", "schema_id"],
                 "check_constraints" => &["object_id", "name", "parent_object_id", "parent_column_id", "definition", "type", "type_desc", "is_disabled", "schema_id"],
                 "key_constraints" => &["object_id", "name", "parent_object_id", "type", "type_desc", "unique_index_id", "schema_id"],
                 "foreign_keys" => &["object_id", "name", "parent_object_id", "referenced_object_id", "key_index_id", "delete_referential_action", "update_referential_action", "type", "type_desc", "is_disabled", "schema_id"],
-                "index_columns" => &["object_id", "index_id", "index_column_id", "column_id", "key_ordinal", "partition_ordinal", "is_descending_key", "is_included_column"],
                 "foreign_key_columns" => &["constraint_object_id", "constraint_column_id", "parent_object_id", "parent_column_id", "referenced_object_id", "referenced_column_id"],
                 _ => &["class", "class_desc", "major_id", "minor_id", "name", "value"],
             };
@@ -5368,6 +5487,55 @@ fn is_constraint_start(part: &[Token]) -> bool {
     })
 }
 
+/// The engine's `PARTITION BY HASH (columns) [PARTITIONS n]` among the
+/// clauses after a table's column list (or after `ALTER TABLE t`), in the
+/// engine's spelling, and the clauses without it. `None` when there is no
+/// `PARTITION`. Any other partitioning is refused: dropped with the storage
+/// clauses, `CREATE TABLE … PARTITION BY HASH (…)` made a plain table and
+/// reported success.
+fn partition_clause(tokens: &[Token]) -> Result<(Option<String>, Vec<Token>), TsqlError> {
+    let mut depth = 0i32;
+    let mut at = None;
+    for (k, t) in tokens.iter().enumerate() {
+        if t.is_op("(") {
+            depth += 1;
+        } else if t.is_op(")") {
+            depth -= 1;
+        } else if depth == 0 && t.is_word("PARTITION") {
+            at = Some(k);
+            break;
+        }
+    }
+    let Some(at) = at else { return Ok((None, tokens.to_vec())) };
+    let hash = kw(tokens, at + 1, "BY") && kw(tokens, at + 2, "HASH") && tokens.get(at + 3).is_some_and(|t| t.is_op("("));
+    if !hash {
+        return Err(TsqlError::unsupported("PARTITION BY RANGE or LIST; RasterizedDB partitions tables only by HASH (columns)"));
+    }
+    let close = matching_paren(tokens, at + 3).ok_or_else(|| TsqlError::syntax("unbalanced PARTITION BY HASH"))?;
+    let mut columns = Vec::new();
+    for part in split_commas(&tokens[at + 4..close]) {
+        match part.as_slice() {
+            [column] if column.ident().is_some() => columns.push(ident_sql(&column.ident().expect("checked").to_lowercase())),
+            _ => return Err(TsqlError::syntax("PARTITION BY HASH takes column names")),
+        }
+    }
+    if columns.is_empty() {
+        return Err(TsqlError::syntax("PARTITION BY HASH takes column names"));
+    }
+    let mut clause = format!("PARTITION BY HASH ({})", columns.join(", "));
+    let mut end = close + 1;
+    if kw(tokens, end, "PARTITIONS") {
+        match tokens.get(end + 1).map(|t| &t.tok) {
+            Some(Tok::Num(n)) if n.bytes().all(|b| b.is_ascii_digit()) => clause.push_str(&format!(" PARTITIONS {n}")),
+            _ => return Err(TsqlError::syntax("PARTITIONS takes a number")),
+        }
+        end += 2;
+    }
+    let mut rest = tokens[..at].to_vec();
+    rest.extend(tokens[end..].iter().cloned());
+    Ok((Some(clause), rest))
+}
+
 /// Storage clauses after a table or index: `ON [PRIMARY]`, `WITH (…)`,
 /// `TEXTIMAGE_ON …`, dropped.
 fn strip_storage(tokens: &[Token]) -> Result<(), TsqlError> {
@@ -5375,6 +5543,13 @@ fn strip_storage(tokens: &[Token]) -> Result<(), TsqlError> {
     while k < tokens.len() {
         let w = tokens[k].upper().unwrap_or_default();
         match w.as_str() {
+            // `ON scheme(column)`: a partition scheme, which there is none
+            // of (CREATE PARTITION SCHEME is refused). Dropped with the
+            // filegroup clauses, the table was made unpartitioned and the
+            // statement reported success.
+            "ON" if tokens.get(k + 2).is_some_and(|t| t.is_op("(")) => {
+                return Err(TsqlError::unsupported("ON <partition scheme>(column); partition a table with PARTITION BY HASH (columns)"));
+            }
             "ON" | "TEXTIMAGE_ON" | "FILESTREAM_ON" => k += 2,
             "WITH" => {
                 if tokens.get(k + 1).is_some_and(|t| t.is_op("(")) {
@@ -5626,7 +5801,8 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
     }
     let close = matching_paren(&tokens, after)
         .ok_or_else(|| TsqlError::syntax("unbalanced column list"))?;
-    strip_storage(&tokens[close + 1..])?;
+    let (partition, storage) = partition_clause(&tokens[close + 1..])?;
+    strip_storage(&storage)?;
     let mut defs = Vec::new();
     let mut later = Vec::new();
     let mut declared: Vec<String> = Vec::new();
@@ -5660,6 +5836,13 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
         defs.join(", ")
     )];
     statements.extend(later);
+    // Partitioned by converting the table just made, which is empty: the
+    // engine's CREATE refuses a partitioned table with a collated column
+    // (every text and uniqueidentifier column here has one), and its
+    // conversion carries them.
+    if let Some(clause) = partition {
+        statements.push(format!("ALTER TABLE {} {clause}", ident_sql(&table)));
+    }
     let mut system = Vec::new();
     if !temporary {
         let shown = shown_name_at(&tokens, 2);
@@ -5690,6 +5873,15 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
     }
     let verb = tokens.get(k).and_then(|x| x.upper()).unwrap_or_default();
     match verb.as_str() {
+        // The engine's conversion of a table to a partitioned one, which
+        // SQL Server has no statement for.
+        "PARTITION" => {
+            let (partition, rest) = partition_clause(&tokens[k..])?;
+            if let Some(extra) = rest.first() {
+                return Err(TsqlError::syntax(format!("unexpected {} after PARTITION BY HASH", render_text(std::slice::from_ref(extra)))));
+            }
+            statements.push(format!("ALTER TABLE {t} {}", partition.expect("PARTITION was read")));
+        }
         "ADD" => {
             // A column added takes collations as a created one does.
             cx.collations = true;
