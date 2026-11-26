@@ -534,6 +534,14 @@ impl Conn {
                 let ranges = wire::decode_ranges(&mut r, 1 << 16).map_err(proto)?;
                 sub.nack(&ranges, delay)?;
             }
+            op::RENEW => {
+                let mut r = Reader::new(body);
+                let (sub, _) = self.sub(r.u32().map_err(proto)?)?;
+                let extend = r.u32().map_err(proto)?;
+                let ranges = wire::decode_ranges(&mut r, 1 << 16).map_err(proto)?;
+                let n = sub.renew(&ranges, extend);
+                wire::frame(out, op::RENEW, F_REPLY, corr, |w| w.u64(n));
+            }
             op::COMMIT => {
                 let mut r = Reader::new(body);
                 let (sub, _) = self.sub(r.u32().map_err(proto)?)?;

@@ -25,11 +25,17 @@
 //! Nothing is opened until the first use. A database that never touches the
 //! broker carries one empty `OnceLock`.
 
+#[cfg(feature = "broker_amqp")]
+pub mod amqp;
 pub mod chunk;
 pub mod engine;
 pub mod exchange;
 pub mod flog;
 pub mod flush;
+#[cfg(feature = "broker_kafka")]
+pub mod kafka;
+#[cfg(feature = "broker_mqtt")]
+pub mod mqtt;
 pub mod net;
 pub mod partition;
 pub mod segment;

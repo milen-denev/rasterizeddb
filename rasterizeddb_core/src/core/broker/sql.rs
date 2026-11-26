@@ -595,7 +595,7 @@ fn run(broker: &Broker, toks: Vec<Tok>, superuser: bool) -> Result<Vec<Vec<Cell>
             }
             None => broker.queue(&name).map_err(err)?.1,
         };
-        let taken = sub.take(limit as usize).map_err(err)?;
+        let taken = sub.take(limit as usize, true, 0).map_err(err)?;
         let mut out = Vec::with_capacity(taken.len());
         for t in &taken {
             let headers: Vec<(&[u8], &[u8])> = t.headers.iter().map(|(n, v)| (n.as_slice(), v.as_slice())).collect();

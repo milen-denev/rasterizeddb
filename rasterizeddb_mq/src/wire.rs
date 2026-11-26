@@ -50,6 +50,9 @@ pub mod op {
     pub const UNSUBSCRIBE: u8 = 35;
     pub const SUB_DELETE: u8 = 36;
     pub const SUB_LIST: u8 = 37;
+    /// Pushes in-flight records' ack deadlines out (a lock renewal): handle
+    /// u32, extend_ms u32 (0 = the subscription's ack timeout), ranges.
+    pub const RENEW: u8 = 38;
     pub const EXCHANGE_DECLARE: u8 = 40;
     pub const EXCHANGE_DELETE: u8 = 41;
     pub const BIND: u8 = 42;
@@ -717,6 +720,16 @@ impl Ack {
             _ => return None,
         })
     }
+}
+
+/// A record header that holds a record back from shared subscriptions until
+/// its value, an `i64` of µs since the epoch in little-endian (scheduled
+/// delivery). Ordered and broadcast subscriptions ignore it.
+pub const DELIVER_AT_HEADER: &[u8] = b"rdb-deliver-at";
+
+/// [`DELIVER_AT_HEADER`]'s value for `time_us`.
+pub fn deliver_at(time_us: i64) -> [u8; 8] {
+    time_us.to_le_bytes()
 }
 
 /// `PRODUCE`'s partition meaning "by the first record's key".

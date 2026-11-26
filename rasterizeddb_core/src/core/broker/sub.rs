@@ -618,6 +618,78 @@ impl Subscription {
         Ok(acked)
     }
 
+    /// Gives records up without delivering them again: dead-lettered when the
+    /// subscription has a dead-letter topic, then acked (AMQP's reject and
+    /// nack without requeue).
+    pub fn reject(&self, ranges: &[Range]) {
+        for r in ranges {
+            let offs: Vec<u64> = (r.offset..r.offset + r.count as u64).collect();
+            self.bury(r.partition, &offs, true);
+        }
+        self.wake.notify_one();
+    }
+
+    /// Drops every record not in flight (AMQP's `queue.purge`): the floor
+    /// moves to the end of each partition. Returns how many went.
+    pub fn purge(&self) -> u64 {
+        let mut n = 0;
+        for (i, p) in self.parts.iter().enumerate() {
+            let next = self.topic.partitions[i].next_offset();
+            let mut st = p.lock();
+            let inflight: Vec<u64> = st.inflight.keys().copied().collect();
+            let before = next.saturating_sub(st.floor).saturating_sub(st.acked_above_floor());
+            let low = inflight.iter().copied().min().unwrap_or(next);
+            // Everything below the lowest in-flight record goes at once, the
+            // rest one by one around the ones in flight.
+            st.raise_floor(low);
+            for o in low..next {
+                if !st.inflight.contains_key(&o) {
+                    st.set_acked(o);
+                }
+            }
+            st.cursor = st.cursor.max(next);
+            st.redeliver.clear();
+            st.delayed.clear();
+            let after = next.saturating_sub(st.floor).saturating_sub(st.acked_above_floor());
+            n += before.saturating_sub(after);
+            let floor = st.floor;
+            let runs = st.acked_runs();
+            drop(st);
+            self.log_record(S_FLOOR, |w| {
+                w.u32(i as u32);
+                w.u64(floor)
+            });
+            for (off, c) in runs {
+                self.log_record(S_ACK, |w| {
+                    w.u32(i as u32);
+                    w.u64(off);
+                    w.u32(c)
+                });
+            }
+        }
+        n
+    }
+
+    /// Pushes in-flight records' ack deadlines `extend_ms` from now (0: the
+    /// subscription's ack timeout): a lock renewal. Returns how many were in
+    /// flight.
+    pub fn renew(&self, ranges: &[Range], extend_ms: u32) -> u64 {
+        let ms = if extend_ms == 0 { self.config.ack_timeout_ms } else { extend_ms };
+        let deadline = Instant::now() + Duration::from_millis(ms.max(1) as u64);
+        let mut n = 0;
+        for r in ranges {
+            let Some(p) = self.parts.get(r.partition as usize) else { continue };
+            let mut st = p.lock();
+            for off in r.offset..r.offset + r.count as u64 {
+                if let Some(f) = st.inflight.get_mut(&off) {
+                    f.deadline = deadline;
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
     /// Hands records back. Shared only: they are delivered again after
     /// `delay_ms`.
     pub fn nack(&self, ranges: &[Range], delay_ms: u32) -> Result<(), BrokerError> {
@@ -686,10 +758,12 @@ impl Subscription {
         }
     }
 
-    /// Takes up to `max` records from a shared subscription and acks them at
-    /// once: `BROKER POP`, at most once. Redeliveries go first, then new
-    /// records, partition by partition.
-    pub fn take(&self, max: usize) -> Result<Vec<Taken>, BrokerError> {
+    /// Takes up to `max` records from a shared subscription. With `ack`, they
+    /// are acked at once (`BROKER POP`, at most once); without, they are in
+    /// flight for `member` until acked, nacked or timed out (AMQP's
+    /// `basic.get`). Redeliveries go first, then new records, partition by
+    /// partition.
+    pub fn take(&self, max: usize, ack: bool, member: u64) -> Result<Vec<Taken>, BrokerError> {
         if self.config.mode != SubMode::Shared {
             return Err(BrokerError::invalid("POP takes from a queue or a shared subscription"));
         }
@@ -741,6 +815,15 @@ impl Subscription {
                 }
             }
             let mut acked = Vec::new();
+            if !ack {
+                let deadline = Instant::now() + Duration::from_millis(self.config.ack_timeout_ms.max(1) as u64);
+                for t in out.iter().filter(|t| t.partition == pi as u32) {
+                    st.inflight.insert(t.offset, Inflight { member, deadline });
+                    *st.deliveries.entry(t.offset).or_insert(0) += 1;
+                }
+                drop(st);
+                continue;
+            }
             for t in out.iter().filter(|t| t.partition == pi as u32) {
                 if st.set_acked(t.offset) {
                     acked.push(t.offset);
@@ -1113,16 +1196,30 @@ impl Subscription {
                     continue;
                 }
                 let raw = b.codec() == rasterizeddb_mq::batch::CODEC_NONE;
-                if ttl_us >= 0 && raw {
+                let headers = b.flags() & rasterizeddb_mq::batch::F_HEADERS != 0;
+                if raw && (ttl_us >= 0 || headers) {
                     for r in b.records() {
-                        if r.offset < from || st.is_acked(r.offset) {
+                        if r.offset < from || st.is_acked(r.offset) || st.inflight.contains_key(&r.offset) {
                             continue;
                         }
-                        if r.time_us + ttl_us < now_us {
+                        if ttl_us >= 0 && r.time_us + ttl_us < now_us {
                             expired.push(r.offset);
-                        } else {
-                            offs.push(r.offset);
+                            continue;
                         }
+                        // Scheduled delivery: held back until its time, in
+                        // memory; after a restart it is read and held again.
+                        if let Some(at) = r.header(wire::DELIVER_AT_HEADER).and_then(|v| <[u8; 8]>::try_from(v).ok()) {
+                            let at = i64::from_le_bytes(at);
+                            if at > now_us {
+                                let due = Instant::now() + Duration::from_micros((at - now_us) as u64);
+                                st.delayed.push(std::cmp::Reverse((due, r.offset)));
+                                // Not delivered yet: its first delivery is
+                                // not a redelivery against max_deliveries.
+                                st.deliveries.insert(r.offset, 0);
+                                continue;
+                            }
+                        }
+                        offs.push(r.offset);
                     }
                 } else {
                     for o in b.base_offset().max(from)..b.next_offset() {
@@ -1178,26 +1275,37 @@ impl Subscription {
         let part = &self.topic.partitions[p as usize];
         if !self.config.dead_letter.is_empty() {
             if let Some(broker) = self.broker.upgrade() {
-                if let Some(dlq) = broker.topic(&self.config.dead_letter) {
-                    let reason: &[u8] = if max_deliveries { b"delivery_limit" } else { b"expired" };
-                    let mut builder = BatchBuilder::new();
-                    for &o in offsets {
-                        let Ok(r) = part.read(o, 1) else { continue };
-                        for b in Batches::trusted(&r.bytes).flatten() {
-                            for rec in b.records().filter(|x| x.offset == o) {
-                                let mut headers: Vec<(&[u8], &[u8])> = rec.headers().collect();
-                                headers.push((b"x-death-reason", reason));
-                                headers.push((b"x-death-topic", self.topic.name.as_bytes()));
-                                headers.push((b"x-death-subscription", self.name.as_bytes()));
-                                let _ = builder.push(rec.key, rec.value, &headers);
-                            }
+                let reason: &[u8] = if max_deliveries { b"delivery_limit" } else { b"expired" };
+                let mut builder = BatchBuilder::new();
+                for &o in offsets {
+                    let Ok(r) = part.read(o, 1) else { continue };
+                    for b in Batches::trusted(&r.bytes).flatten() {
+                        for rec in b.records().filter(|x| x.offset == o) {
+                            let mut headers: Vec<(&[u8], &[u8])> = rec.headers().collect();
+                            headers.push((b"x-death-reason", reason));
+                            headers.push((b"x-death-topic", self.topic.name.as_bytes()));
+                            headers.push((b"x-death-subscription", self.name.as_bytes()));
+                            let _ = builder.push(rec.key, rec.value, &headers);
                         }
                     }
-                    if !builder.is_empty() {
-                        let mut bytes = builder.finish();
-                        if let Err(e) = broker.produce(&dlq, wire::BY_KEY, &mut bytes, false) {
-                            log::warn!("broker: dead-lettering to \"{}\" failed: {e}", self.config.dead_letter);
+                }
+                if !builder.is_empty() {
+                    let mut bytes = builder.finish();
+                    // `@x:<exchange>:<routing key>` dead-letters through an
+                    // exchange (AMQP's x-dead-letter-exchange); anything
+                    // else names a topic.
+                    let r = match self.config.dead_letter.strip_prefix("@x:") {
+                        Some(rest) => {
+                            let (x, key) = rest.split_once(':').unwrap_or((rest, ""));
+                            broker.publish(x, key, &mut bytes, false).map(|_| ())
                         }
+                        None => match broker.topic(&self.config.dead_letter) {
+                            Some(dlq) => broker.produce(&dlq, wire::BY_KEY, &mut bytes, false).map(|_| ()),
+                            None => Ok(()),
+                        },
+                    };
+                    if let Err(e) = r {
+                        log::warn!("broker: dead-lettering to \"{}\" failed: {e}", self.config.dead_letter);
                     }
                 }
             }

@@ -984,3 +984,9 @@ fn start_housekeeping(broker: &Arc<Broker>) {
         log::error!("broker: could not start housekeeping: {e}");
     }
 }
+
+impl std::fmt::Debug for Topic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Topic").field("id", &self.id).field("name", &self.name).field("partitions", &self.partitions.len()).finish()
+    }
+}

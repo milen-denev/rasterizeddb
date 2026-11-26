@@ -72,8 +72,10 @@ impl LogFile {
         let (live, unreadable) = framed_log::live_generation(&gens, |g| {
             let bytes = std::fs::read(dir.join(name(stem, g))).map_err(|e| e.to_string())?;
             let mut sealed = false;
+            // A compacted generation is sealed once its SEALED record is in;
+            // the records appended after it are the log carrying on.
             match framed_log::scan(&format, &bytes, |_, kind, _| {
-                sealed = kind == SEALED;
+                sealed |= kind == SEALED;
                 Ok(())
             }) {
                 Err(e) => Ok(GenerationReplay::Unreadable(e)),

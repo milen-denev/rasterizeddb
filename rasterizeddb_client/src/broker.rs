@@ -36,6 +36,7 @@ use std::time::Duration;
 
 pub use rasterizeddb_mq::batch::{BatchBuilder, BatchView, Batches, RecordView};
 pub use rasterizeddb_mq::wire::{
+    DELIVER_AT_HEADER, deliver_at,
     ANY_PARTITION, Ack, BY_KEY, Binding, Code, Durability, EARLIEST, ExchangeKind, LATEST, QueueConfig, Range, Start,
     SubConfig, SubMode, TopicConfig, XMatch,
 };
@@ -836,6 +837,20 @@ impl Subscription {
 
     pub fn ack_delivery(&self, d: &Delivery) -> Result<()> {
         self.ack(&d.ranges)
+    }
+
+    /// Keeps records in flight `extend` longer (zero: the subscription's ack
+    /// timeout), as a lock renewal does. Returns how many were in flight.
+    pub async fn renew(&self, ranges: &[Range], extend: Duration) -> Result<u64> {
+        let r = self
+            .broker
+            .call(op::RENEW, |w| {
+                w.u32(self.handle);
+                w.u32(extend.as_millis().min(u32::MAX as u128) as u32);
+                wire::encode_ranges(w, ranges)
+            })
+            .await?;
+        Ok(Reader::new(&r).u64()?)
     }
 
     /// Hands records back to be delivered again after `delay` (shared).

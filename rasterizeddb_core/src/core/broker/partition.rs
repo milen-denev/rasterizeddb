@@ -627,9 +627,9 @@ impl Partition {
                 let s = st.segments.front().expect("non-empty");
                 let old = retention_ms >= 0 && s.max_time != i64::MIN && now - s.max_time > retention_ms.saturating_mul(1000);
                 let big = retention_bytes >= 0 && total > retention_bytes as u64;
-                // A segment still in a chunk is not removed under a reader.
-                let in_chunk = st.chunks.front().is_some_and(|c| c.segment_base == s.base);
-                if !(old || big) || in_chunk || s.written < s.len {
+                // Only a segment wholly written goes: its chunks, if any are
+                // still held, are flushed, and go with it below.
+                if !(old || big) || s.written < s.len {
                     break;
                 }
                 let s = st.segments.pop_front().expect("non-empty");
@@ -639,6 +639,16 @@ impl Partition {
             if !removed.is_empty() {
                 let start = st.segments.front().map_or(self.next.load(Ordering::Relaxed), |s| s.base);
                 self.start.store(start, Ordering::Release);
+                let gone: Vec<u64> = removed.iter().map(|(b, _)| *b).collect();
+                let mut freed = 0;
+                st.chunks.retain(|c| {
+                    let keep = !gone.contains(&c.segment_base);
+                    if !keep {
+                        freed += c.capacity();
+                    }
+                    keep
+                });
+                st.chunk_bytes -= freed;
             }
         }
         let mut bytes = 0;
@@ -711,4 +721,16 @@ pub(super) struct WriteRound {
     pub upto: u64,
     /// A directory whose new entries need a sync.
     pub dir: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for Partition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Partition")
+            .field("topic", &self.topic)
+            .field("index", &self.index)
+            .field("start", &self.log_start())
+            .field("next", &self.next_offset())
+            .field("durable", &self.durable_offset())
+            .finish()
+    }
 }
