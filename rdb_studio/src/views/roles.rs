@@ -70,10 +70,10 @@ fn section<'a>(label: impl Into<String>, body: Element<'a, Message>) -> Element<
         .into()
 }
 
-fn input<'a>(studio: &'a Studio, key: &'static str, label: &str, width: f32) -> Element<'a, Message> {
+fn input<'a>(studio: &'a Studio, key: &'static str, label: &str, placeholder: &str, width: f32) -> Element<'a, Message> {
     column![
         text(label.to_string()).size(11).font(theme::MONO).color(theme::TEXT_DIM),
-        iced::widget::text_input("", studio.role_inputs.get(key).map(String::as_str).unwrap_or(""))
+        iced::widget::text_input(placeholder, studio.role_inputs.get(key).map(String::as_str).unwrap_or(""))
             .on_input(move |v| Message::RoleInput(key.to_string(), v))
             .padding([5, 8])
             .size(12)
@@ -312,18 +312,24 @@ fn attributes<'a>(studio: &'a Studio, role: &'a RoleInfo) -> Element<'a, Message
             ]
             .spacing(16),
             row![
-                input(studio, "connlimit", "Connection limit (empty: none)", 120.0),
-                input(studio, "validuntil", "Password valid until (empty: always)", 220.0),
+                input(studio, "connlimit", "Connection limit", "empty: no limit", 120.0),
+                {
+                    let until = input(studio, "validuntil", "Password valid until", "empty: always, or YYYY-MM-DD", 220.0);
+                    match dialect::date_problem(studio.role_inputs.get("validuntil").map(String::as_str).unwrap_or("")) {
+                        Some(p) => column![until, text(p).size(11).color(theme::BAD)].spacing(2).into(),
+                        None => until,
+                    }
+                },
                 lowered(super::primary_button("APPLY", apply)),
                 Space::new().width(24),
-                input(studio, "rename", "Rename to", 180.0),
+                input(studio, "rename", "Rename to", "e.g. app_reader", 180.0),
                 lowered(small_button(
                     "RENAME",
                     rename_sql.clone().map(|s| confirm("Rename role", format!("`{}` will log in under the new name only.", role.name), s, Refresh::Roles))
                 )),
             ]
             .spacing(8)
-            .align_y(iced::alignment::Vertical::Bottom),
+            .align_y(iced::alignment::Vertical::Top),
             preview(&sql),
             text(note).size(10).color(theme::TEXT_FAINT),
         ]
@@ -590,15 +596,15 @@ fn policies<'a>(studio: &'a Studio, name: &'a str) -> Element<'a, Message> {
     col = col.push(
         column![
             row![
-                input(studio, "policy_name", "New policy", 160.0),
+                input(studio, "policy_name", "Policy name", "e.g. own_rows", 160.0),
                 picker(studio, "policy_table", "On table", tables, 200.0),
                 column![text("For").size(11).font(theme::MONO).color(theme::TEXT_DIM), commands].spacing(4),
             ]
             .spacing(8)
             .align_y(iced::alignment::Vertical::Bottom),
             row![
-                input(studio, "policy_using", "USING (rows it may see, update, delete)", 320.0),
-                input(studio, "policy_check", "WITH CHECK (rows it may write)", 320.0),
+                input(studio, "policy_using", "USING: rows it may see, update, delete", "e.g. owner = current_user", 320.0),
+                input(studio, "policy_check", "WITH CHECK: rows it may write", "e.g. amount < 10000", 320.0),
                 lowered(super::primary_button("CREATE POLICY", sql.as_ref().ok().map(|s| Message::RoleRun(s.clone())))),
             ]
             .spacing(8)

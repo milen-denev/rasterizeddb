@@ -427,16 +427,27 @@ impl LedgerPage {
                 let (n, at) = (self.columns(), value.parse::<usize>().unwrap_or(usize::MAX));
                 if n > 1 && at < n {
                     for i in at..n - 1 {
-                        for f in ["name", "type"] {
-                            let next = self.get(&format!("new:ledger:col:{}:{f}", i + 1)).to_string();
-                            self.inputs.insert(format!("new:ledger:col:{i}:{f}"), next);
+                        for f in COLUMN_FIELDS {
+                            match self.inputs.get(&format!("new:ledger:col:{}:{f}", i + 1)).cloned() {
+                                Some(next) => self.inputs.insert(format!("new:ledger:col:{i}:{f}"), next),
+                                None => self.inputs.remove(&format!("new:ledger:col:{i}:{f}")),
+                            };
                         }
                     }
-                    for f in ["name", "type"] {
+                    for f in COLUMN_FIELDS {
                         self.inputs.remove(&format!("new:ledger:col:{}:{f}", n - 1));
                     }
                     self.inputs.insert("new:ledger:ncols".into(), (n - 1).to_string());
                 }
+            }
+            // Another type: its size boxes start empty (their placeholders
+            // show the usual values).
+            k if k.starts_with("new:ledger:col:") && k.ends_with(":type") => {
+                let row = k.trim_end_matches(":type").to_string();
+                for f in ["len", "prec", "scale"] {
+                    self.inputs.remove(&format!("{row}:{f}"));
+                }
+                self.inputs.insert(key, value);
             }
             _ => {
                 self.inputs.insert(key, value);
@@ -446,7 +457,55 @@ impl LedgerPage {
 
     /// How many rows the new table's column list has.
     pub fn columns(&self) -> usize {
-        self.get("new:ledger:ncols").parse().unwrap_or(2).max(1)
+        self.get("new:ledger:ncols").parse().unwrap_or(1).max(1)
+    }
+
+    /// What a fresh page's forms start with: one column, `id BIGINT NOT
+    /// NULL`, and seven years.
+    pub fn prefill(&mut self) {
+        for (k, v) in [
+            ("new:ledger:col:0:name", "id"),
+            ("new:ledger:col:0:type", "BIGINT"),
+            ("new:ledger:col:0:notnull", "true"),
+            ("new:ledger:keep", "7"),
+        ] {
+            self.inputs.entry(k.to_string()).or_insert_with(|| v.to_string());
+        }
+    }
+
+    /// Column `i` of the new table as DDL, `Ok(None)` for an empty row.
+    fn column_sql(&self, i: usize) -> Result<Option<String>, String> {
+        let f = |n: &str| self.get(&format!("new:ledger:col:{i}:{n}")).trim().to_string();
+        let (name, ty) = (f("name"), f("type"));
+        if name.is_empty() && ty.is_empty() {
+            return Ok(None);
+        }
+        if !ident_ok(&name) {
+            return Err(format!("Column {}: a name is letters, digits and underscores, not starting with a digit.", i + 1));
+        }
+        if ty.is_empty() {
+            return Err(format!("Column {name}: choose its type."));
+        }
+        if !ty.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '_') {
+            return Err(format!("Column {name}: choose its type from the list."));
+        }
+        let num = |n: &str, what: &str| -> Result<Option<u32>, String> {
+            let v = f(n);
+            if v.is_empty() {
+                return Ok(None);
+            }
+            v.parse::<u32>().ok().filter(|x| *x > 0 || n == "scale").map(Some).ok_or(format!("Column {name}: {what} is a whole number."))
+        };
+        let size = match (num("len", "its length")?, num("prec", "its precision")?, num("scale", "its scale")?) {
+            (Some(l), _, _) => format!("({l})"),
+            (None, Some(p), Some(sc)) if sc > p => return Err(format!("Column {name}: the scale ({sc}) cannot exceed the precision ({p}).")),
+            (None, Some(p), Some(sc)) => format!("({p}, {sc})"),
+            (None, Some(p), None) => format!("({p})"),
+            (None, None, Some(_)) => return Err(format!("Column {name}: a scale needs a precision.")),
+            (None, None, None) => String::new(),
+        };
+        let not_null = if self.on(&format!("new:ledger:col:{i}:notnull")) { " NOT NULL" } else { "" };
+        Ok(Some(format!("{name} {ty}{size}{not_null}")))
     }
 
     pub fn get(&self, key: &str) -> &str {
@@ -471,25 +530,16 @@ impl LedgerPage {
         }
         let mut cols = Vec::new();
         for i in 0..self.columns() {
-            let (c, t) = (self.get(&format!("new:ledger:col:{i}:name")).trim(), self.get(&format!("new:ledger:col:{i}:type")).trim());
-            if c.is_empty() && t.is_empty() {
-                continue;
+            if let Some(c) = self.column_sql(i)? {
+                cols.push(c);
             }
-            if !ident_ok(c) {
-                return Err(format!("Column {} needs a name.", i + 1));
-            }
-            let t = if t.is_empty() { "TEXT" } else { t };
-            if t.contains([';', '\'', '(', ')']) && !t.to_ascii_uppercase().starts_with("NUMERIC(") && !t.to_ascii_uppercase().starts_with("VARCHAR(") {
-                return Err(format!("Column {c}: type {t:?} is not a type name."));
-            }
-            cols.push(format!("{c} {t}"));
         }
         if cols.is_empty() {
             return Err("Give it at least one column.".into());
         }
         let n = self.get("new:ledger:keep").trim();
         if n.parse::<u64>().map_or(true, |n| n == 0) {
-            return Err("How long must a row stay undeletable? A whole number.".into());
+            return Err("How long must each row be kept before it may be deleted? A whole number of the unit.".into());
         }
         let unit = unit_or(self.get("new:ledger:keep_unit"), "YEARS");
         let mut sql = format!("CREATE LEDGER TABLE {name} ({}) NO DELETE UNTIL {n} {unit} AFTER INSERT", cols.join(", "));
@@ -516,11 +566,8 @@ impl LedgerPage {
         if !ident_ok(name) {
             return Err("Name the vault: letters, digits and underscores.".into());
         }
-        let provider = self.get("new:vault:provider").trim();
-        if !["file:", "pkcs11:", "mlkem:", "tpm:"].iter().any(|p| provider.starts_with(p)) {
-            return Err("Choose where its key lives: pkcs11:…, tpm:…, mlkem:… or file:….".into());
-        }
-        let mut sql = format!("CREATE VAULT {name} KEY PROVIDER {}", q(provider));
+        let provider = self.provider_spec("new:vault:provider")?.ok_or("Choose where its key lives.")?;
+        let mut sql = format!("CREATE VAULT {name} KEY PROVIDER {}", q(&provider));
         let n = self.get("new:vault:retain").trim();
         if !n.is_empty() {
             if n.parse::<u64>().is_err() {
@@ -529,6 +576,62 @@ impl LedgerPage {
             sql.push_str(&format!(" RETAIN DELETED {n} {}", unit_or(self.get("new:vault:retain_unit"), "DAYS")));
         }
         Ok(sql)
+    }
+
+    /// The key provider spec the provider form under `prefix` describes:
+    /// `Ok(None)` when no kind is chosen, `Err` when a field it needs is
+    /// empty or holds a `;` (the spec's separator).
+    pub fn provider_spec(&self, prefix: &str) -> Result<Option<String>, String> {
+        let f = |n: &str| self.get(&format!("{prefix}:{n}")).trim().to_string();
+        let kind = f("kind");
+        let path = f("path");
+        let fields = [f("path"), f("module"), f("token"), f("keylabel"), f("pin"), f("tcti")];
+        if fields.iter().any(|v| v.contains(';')) {
+            return Err("A field holds a ';', which separates the provider's attributes.".into());
+        }
+        let need_path = |what: &str| if path.is_empty() { Err(format!("Give the {what}.")) } else { Ok(()) };
+        let create = self.on(&format!("{prefix}:create"));
+        Ok(Some(match kind.as_str() {
+            "" | "same" => return Ok(None),
+            "file" => {
+                need_path("key file's path")?;
+                format!("file:{path}")
+            }
+            "tpm" => {
+                need_path("sealed key file's path")?;
+                let mut s = format!("tpm:{path}");
+                let tcti = f("tcti");
+                if !tcti.is_empty() {
+                    s.push_str(&format!(";tcti={tcti}"));
+                }
+                if create {
+                    s.push_str(";create");
+                }
+                s
+            }
+            "mlkem" => {
+                need_path("key pair file's path")?;
+                format!("mlkem:{path}{}", if create { ";create" } else { "" })
+            }
+            "pkcs11" => {
+                let (module, token, key) = (f("module"), f("token"), f("keylabel"));
+                if module.is_empty() || token.is_empty() || key.is_empty() {
+                    return Err("Give the PKCS#11 module, the token's label and the key's label.".into());
+                }
+                let mut s = format!("pkcs11:module={module};token={token};key={key}");
+                let pin = f("pin");
+                if !pin.is_empty() {
+                    let attr = if self.get(&format!("{prefix}:pin_kind")) == "file" { "pin-source" } else { "pin-env" };
+                    s.push_str(&format!(";{attr}={pin}"));
+                }
+                match self.get(&format!("{prefix}:mechanism")) {
+                    m @ ("kwp" | "cbc") => s.push_str(&format!(";mechanism={m}")),
+                    _ => {}
+                }
+                s
+            }
+            other => return Err(format!("Unknown key provider {other:?}.")),
+        }))
     }
 
     /// The `VAULT … SET SECRET` the form describes. The value is in it, so
@@ -549,6 +652,9 @@ impl LedgerPage {
             sql.push_str(&format!(" CONTENT TYPE {}", q(ct)));
         }
         let ex = self.get(&k("expires")).trim();
+        if let Some(p) = date_problem(ex) {
+            return Err(format!("Expires: {p}"));
+        }
         if !ex.is_empty() {
             sql.push_str(&format!(" EXPIRES {}", q(ex)));
         }
@@ -575,6 +681,9 @@ impl LedgerPage {
 fn ident_ok(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !s.starts_with(|c: char| c.is_ascii_digit())
 }
+
+/// A column row's inputs: `new:ledger:col:<i>:<field>`.
+const COLUMN_FIELDS: [&str; 6] = ["name", "type", "len", "prec", "scale", "notnull"];
 
 const UNITS: [&str; 7] = ["SECONDS", "MINUTES", "HOURS", "DAYS", "WEEKS", "MONTHS", "YEARS"];
 
@@ -656,12 +765,34 @@ pub trait Kit<'a, M: Clone + 'a> {
     fn row_button(&self, label: &str, on: Option<M>, destructive: bool) -> Element<'a, M>;
     fn primary_button(&self, label: &str, on: Option<M>) -> Element<'a, M>;
     fn choice(&self, label: &str, selected: bool, on: M) -> Element<'a, M>;
-    fn field(&self, label: String, value: &'a str, secret: bool, width: f32, on: Box<dyn Fn(String) -> M + 'a>) -> Element<'a, M>;
+    /// A drop-down of `options` (shown labels); `on` gets the chosen one.
+    fn pick(&self, label: String, options: Vec<String>, selected: Option<String>, width: f32, on: Box<dyn Fn(String) -> M + 'a>) -> Element<'a, M>;
+    fn field(&self, label: String, placeholder: &str, value: &'a str, secret: bool, width: f32, on: Box<dyn Fn(String) -> M + 'a>) -> Element<'a, M>;
+    /// The column types the server accepts, for the column editor.
+    fn column_types(&self) -> Vec<ColumnType>;
     fn toggle(&self, label: String, value: bool, on: Box<dyn Fn(bool) -> M + 'a>) -> Element<'a, M>;
     fn tile(&self, label: String, value: String, note: Option<String>) -> Element<'a, M>;
     fn pill(&self, label: String, tone: Tone) -> Element<'a, M>;
     /// A sortable grid with resizable columns, at most `max_height` tall.
     fn grid(&self, scope: &str, cols: Vec<Col>, rows: Vec<GridRow<'a, M>>, max_height: f32) -> Element<'a, M>;
+}
+
+/// A column type the server accepts: its name as written in DDL, what it
+/// takes after the name, and a line about it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnType {
+    pub name: String,
+    pub params: TypeParams,
+    pub help: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeParams {
+    None,
+    /// `VARCHAR(n)`, with the usual `n`.
+    Length(u32),
+    /// `NUMERIC(p, s)`, with the usual `p` and `s`.
+    PrecisionScale(u32, u32),
 }
 
 /// The messages the page sends back to Studio.
@@ -910,10 +1041,62 @@ fn tables_grid<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'
     k.section("LEDGER TABLES".into(), None, k.grid("ledger-tables", cols, rows, 320.0))
 }
 
-fn field<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage, key: String, label: &str, secret: bool, width: f32) -> Element<'a, M> {
+fn field<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage, key: String, label: &str, placeholder: &str, secret: bool, width: f32) -> Element<'a, M> {
     let input = a.input;
     let value = page.inputs.get(&key).map(String::as_str).unwrap_or("");
-    k.field(label.to_string(), value, secret, width, Box::new(move |v| input(key.clone(), v)))
+    k.field(label.to_string(), placeholder, value, secret, width, Box::new(move |v| input(key.clone(), v)))
+}
+
+/// [`field`] with what is wrong with its value, if anything, under it.
+fn checked<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, field: Element<'a, M>, problem: Option<String>) -> Element<'a, M> {
+    match problem {
+        Some(p) => column![field, k.text(p, Tone::Bad)].spacing(2).into(),
+        None => field,
+    }
+}
+
+/// `Err` with why, when `s` is neither empty nor a date (`YYYY-MM-DD`,
+/// optionally ` HH:MM[:SS]`, optionally a zone or `Z`).
+pub fn date_problem(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let bad = || Some("Write a date as YYYY-MM-DD, or YYYY-MM-DD HH:MM.".to_string());
+    let (date, time) = match s.split_once([' ', 'T']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let parts: Vec<&str> = date.split('-').collect();
+    let [y, m, d] = parts.as_slice() else { return bad() };
+    if y.len() != 4 {
+        return bad();
+    }
+    let (Ok(y), Ok(m), Ok(d)) = (y.parse::<i32>(), m.parse::<u32>(), d.parse::<u32>()) else { return bad() };
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return Some(format!("There is no month {m}.")),
+    };
+    if d == 0 || d > days {
+        return Some(format!("{date} has no day {d}."));
+    }
+    if let Some(t) = time {
+        let t = t.trim_end_matches('Z');
+        let t = t.split(['+']).next().unwrap_or(t);
+        let hms: Vec<&str> = t.split(':').collect();
+        let ok = matches!(hms.len(), 2 | 3)
+            && hms[0].parse::<u32>().is_ok_and(|h| h < 24)
+            && hms[1].parse::<u32>().is_ok_and(|m| m < 60)
+            && hms.get(2).is_none_or(|s| s.split('.').next().unwrap_or("").parse::<u32>().is_ok_and(|s| s < 60));
+        if !ok {
+            return Some("Write a time as HH:MM or HH:MM:SS (24-hour).".to_string());
+        }
+    }
+    None
 }
 
 /// A unit picker: one choice per unit, the chosen one lit.
@@ -971,7 +1154,7 @@ fn table_detail<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &
     let body = column![
         holds,
         row![
-            field(k, a, page, key("hold"), "New legal hold (case name)", false, 220.0),
+            field(k, a, page, key("hold"), "New legal hold", "e.g. case-2026-117", false, 220.0),
             lowered(k.small_button(
                 "PLACE HOLD",
                 place.map(|sql| (a.confirm)(
@@ -981,7 +1164,11 @@ fn table_detail<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &
                 ))
             )),
             Space::new().width(24),
-            field(k, a, page, key("retention"), "Raise retention to", false, 90.0),
+            checked(
+                k,
+                field(k, a, page, key("retention"), "Raise retention to", "e.g. 10", false, 90.0),
+                (!n.is_empty() && !n.parse::<u64>().is_ok_and(|n| n > 0)).then(|| "A whole number above 0.".to_string())
+            ),
             units(k, a, page, &key("retention_unit"), "YEARS", &["DAYS", "MONTHS", "YEARS"]),
             lowered(k.small_button(
                 "SET RETENTION",
@@ -993,17 +1180,21 @@ fn table_detail<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &
             )),
         ]
         .spacing(8)
-        .align_y(iced::alignment::Vertical::Bottom),
+        .align_y(iced::alignment::Vertical::Top),
         row![
-            field(k, a, page, key("stamp"), "Row (__ledger_ts)", false, 200.0),
+            checked(
+                k,
+                field(k, a, page, key("stamp"), "Row stamp (__ledger_ts)", "e.g. 1795729719594470", false, 200.0),
+                (!stamp.is_empty() && !stamp_ok).then(|| "A whole number: SELECT __ledger_ts, * FROM the table.".to_string())
+            ),
             lowered(k.small_button("HISTORY", stamp_ok.then(|| (a.run)(format!("SHOW LEDGER HISTORY {name} {stamp}"))))),
             lowered(k.small_button("RECEIPT", stamp_ok.then(|| (a.run)(format!("SHOW LEDGER RECEIPT {name} {stamp}"))))),
             Space::new().width(24),
-            field(k, a, page, key("anchor"), "Add an anchor (dir:/path, s3://bucket/prefix)", false, 300.0),
+            field(k, a, page, key("anchor"), "Add an anchor", "dir:/mnt/anchors or s3://bucket/prefix", false, 300.0),
             lowered(k.small_button("ADD ANCHOR", (!anchor.is_empty()).then(|| (a.run)(format!("ALTER LEDGER TABLE {name} ADD ANCHOR {}", q(&anchor)))))),
         ]
         .spacing(8)
-        .align_y(iced::alignment::Vertical::Bottom),
+        .align_y(iced::alignment::Vertical::Top),
         k.text(
             format!(
                 "{} · hash {} · {}. Find a row's __ledger_ts with SELECT __ledger_ts, * FROM {name}.",
@@ -1021,43 +1212,78 @@ fn table_detail<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &
 fn create_ledger_form<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage) -> Element<'a, M> {
     let sql = page.create_ledger_sql();
     let input = a.input;
-    let mut cols = column![k.text("Columns".into(), Tone::Dim)].spacing(4);
+    let types = k.column_types();
+    let names: Vec<String> = types.iter().map(|t| t.name.clone()).collect();
+    // Labels once, over the rows, at the rows' widths.
+    let header = row![
+        iced::widget::container(k.text("Column name".into(), Tone::Dim)).width(180),
+        iced::widget::container(k.text("Type".into(), Tone::Dim)).width(200),
+        iced::widget::container(k.text("Size".into(), Tone::Dim)).width(150),
+        k.text("Not null".into(), Tone::Dim),
+    ]
+    .spacing(8);
+    let mut cols = column![header].spacing(4);
     let n = page.columns();
     for i in 0..n {
-        let (kn, kt) = (format!("new:ledger:col:{i}:name"), format!("new:ledger:col:{i}:type"));
-        let (vn, vt) = (page.inputs.get(&kn).map(String::as_str).unwrap_or(""), page.inputs.get(&kt).map(String::as_str).unwrap_or(""));
-        let (kn2, kt2) = (kn.clone(), kt.clone());
+        let key = |f: &str| format!("new:ledger:col:{i}:{f}");
+        let ty = page.get(&key("type")).to_string();
+        let chosen = types.iter().find(|t| t.name == ty);
+        let name_key = key("name");
+        let name = k.field(String::new(), "e.g. amount", page.inputs.get(&name_key).map(String::as_str).unwrap_or(""), false, 180.0, Box::new(move |v| input(name_key.clone(), v)));
+        let type_key = key("type");
+        let pick = k.pick(String::new(), names.clone(), (!ty.is_empty()).then(|| ty.clone()), 200.0, Box::new(move |v| input(type_key.clone(), v)));
+        let small = |f: &str, hint: String| {
+            let fk = key(f);
+            k.field(String::new(), &hint, page.inputs.get(&fk).map(String::as_str).unwrap_or(""), false, 70.0, Box::new(move |v| input(fk.clone(), v)))
+        };
+        let size: Element<'a, M> = match chosen.map(|t| t.params) {
+            Some(TypeParams::Length(l)) => row![small("len", format!("{l}"))].into(),
+            Some(TypeParams::PrecisionScale(p, sc)) => row![small("prec", format!("p {p}")), small("scale", format!("s {sc}"))].spacing(4).into(),
+            _ => k.text("—".into(), Tone::Faint),
+        };
+        let nn_key = key("notnull");
+        let not_null = k.toggle(String::new(), page.get(&nn_key) == "true", Box::new(move |v| input(nn_key.clone(), v.to_string())));
+        let help = chosen.map(|t| t.help.clone()).unwrap_or_default();
         cols = cols.push(
             row![
-                k.field(String::new(), vn, false, 160.0, Box::new(move |v| input(kn2.clone(), v))),
-                k.field(String::new(), vt, false, 160.0, Box::new(move |v| input(kt2.clone(), v))),
-                k.row_button("REMOVE", (n > 1).then(|| input(DROP_COLUMN.into(), i.to_string())), false),
+                name,
+                pick,
+                iced::widget::container(size).width(150),
+                iced::widget::container(not_null).width(60),
+                k.row_button("×", (n > 1).then(|| input(DROP_COLUMN.into(), i.to_string())), true),
+                k.text(help, Tone::Faint),
             ]
-            .spacing(6)
+            .spacing(8)
             .align_y(iced::alignment::Vertical::Center),
         );
     }
-    cols = cols.push(row![k.row_button("ADD COLUMN", Some(input(ADD_COLUMN.into(), String::new())), false), k.text("name, then type (BIGINT, TEXT, NUMERIC(12,2), TIMESTAMP …; empty: TEXT)".into(), Tone::Faint)].spacing(8).align_y(iced::alignment::Vertical::Center));
+    cols = cols.push(k.row_button("+ ADD COLUMN", Some(input(ADD_COLUMN.into(), String::new())), false));
     let versioned = page.get("new:ledger:versioned") == "true";
     let body = column![
         row![
-            field(k, a, page, "new:ledger:name".into(), "Name", false, 200.0),
-            field(k, a, page, "new:ledger:keep".into(), "No delete until (after insert)", false, 120.0),
+            field(k, a, page, "new:ledger:name".into(), "Table name", "e.g. payments", false, 200.0),
+            field(k, a, page, "new:ledger:keep".into(), "Rows kept at least", "e.g. 7", false, 120.0),
             units(k, a, page, "new:ledger:keep_unit", "YEARS", &["HOURS", "DAYS", "MONTHS", "YEARS"]),
-            lowered(k.toggle("Versioned (rows may be updated, every version kept)".into(), versioned, Box::new(move |on| input("new:ledger:versioned".into(), on.to_string())))),
+            lowered(k.toggle("Versioned: rows may be updated, every version kept".into(), versioned, Box::new(move |on| input("new:ledger:versioned".into(), on.to_string())))),
         ]
         .spacing(10)
         .align_y(iced::alignment::Vertical::Bottom),
         cols,
         row![
-            field(k, a, page, "new:ledger:idle".into(), "No drop until idle for (optional)", false, 120.0),
+            field(k, a, page, "new:ledger:idle".into(), "Not droppable until idle for", "optional, e.g. 30", false, 160.0),
             units(k, a, page, "new:ledger:idle_unit", "DAYS", &["DAYS", "MONTHS", "YEARS"]),
-            field(k, a, page, "new:ledger:anchor".into(), "Anchor to (optional: dir:/path, s3://bucket/prefix)", false, 300.0),
+            field(k, a, page, "new:ledger:anchor".into(), "Anchor to", "optional: dir:/path or s3://bucket/prefix", false, 300.0),
             lowered(k.primary_button("CREATE LEDGER TABLE", sql.as_ref().ok().map(|s| (a.run)(s.clone())))),
         ]
         .spacing(10)
         .align_y(iced::alignment::Vertical::Bottom),
         preview(k, &sql),
+        k.text(
+            "A row can be added, never changed (unless versioned), and not deleted until it is as old as the period. \
+             An idle period keeps the whole table from being dropped while rows keep arriving."
+                .into(),
+            Tone::Faint
+        ),
     ]
     .spacing(8);
     k.form("NEW LEDGER TABLE".into(), body.into())
@@ -1070,7 +1296,7 @@ fn rollback_form<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: 
         "AFTER A RESTORE".into(),
         column![
             row![
-                field(k, a, page, "ack:reason".into(), "Why the ledger is behind its anchors", false, 360.0),
+                field(k, a, page, "ack:reason".into(), "Why the ledger is behind its anchors", "e.g. restored the 2026-11-20 backup after disk loss", false, 360.0),
                 lowered(k.small_button(
                     "ACKNOWLEDGE ROLLBACK",
                     sql.map(|s| (a.confirm)(
@@ -1233,7 +1459,7 @@ fn vault<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a Ledg
         })
         .collect();
     let header = row![
-        field(k, a, page, filter_key.clone(), "Filter by name", false, 260.0),
+        field(k, a, page, filter_key.clone(), "Filter by name", "e.g. db/ or api-key", false, 260.0),
         lowered(k.text(format!("{} of {}", shown.len(), secrets.len()), Tone::Faint)),
     ]
     .spacing(8)
@@ -1250,7 +1476,7 @@ fn vault<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a Ledg
     col = col.push(k.section(format!("SECRETS IN {}", name.to_uppercase()), None, list.into()));
 
     col = col.push(set_secret_form(k, a, page, &name));
-    col = col.push(keys_form(k, a, page, &name));
+    col = col.push(keys_form(k, a, page, v));
     col = col.push(audit(k, a, v));
     k.section(format!("VAULT {}", name.to_uppercase()), None, col.into())
 }
@@ -1262,14 +1488,14 @@ fn set_secret_form<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page
         "SET A SECRET".into(),
         column![
             row![
-                field(k, a, page, key("name"), "Name", false, 220.0),
-                field(k, a, page, key("value"), "Value", true, 260.0),
-                field(k, a, page, key("type"), "Content type (optional)", false, 160.0),
-                field(k, a, page, key("expires"), "Expires (optional, YYYY-MM-DD)", false, 170.0),
+                field(k, a, page, key("name"), "Secret name", "e.g. db/password", false, 220.0),
+                field(k, a, page, key("value"), "Value", "the secret (hidden as you type)", true, 260.0),
+                field(k, a, page, key("type"), "Content type", "optional, e.g. text/plain", false, 160.0),
+                checked(k, field(k, a, page, key("expires"), "Expires", "optional, YYYY-MM-DD", false, 170.0), date_problem(page.get(&key("expires")))),
                 lowered(k.primary_button("SET SECRET", sql.as_ref().ok().map(|s| (a.run)(s.clone())))),
             ]
             .spacing(8)
-            .align_y(iced::alignment::Vertical::Bottom),
+            .align_y(iced::alignment::Vertical::Top),
             preview(k, &page.set_secret_preview(vault)),
             k.text("An existing name gets a new version; the old ones stay readable by VERSION n until purged.".into(), Tone::Faint),
         ]
@@ -1278,67 +1504,100 @@ fn set_secret_form<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page
     )
 }
 
-fn keys_form<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage, vault: &str) -> Element<'a, M> {
-    let key = |f: &str| format!("vault:{vault}:{f}");
-    let (kn, kp, ks, to) = (
-        page.get(&key("key")).trim().to_string(),
-        page.get(&key("plain")).to_string(),
-        page.get(&key("sig")).trim().to_string(),
-        page.get(&key("rotate")).trim().to_string(),
-    );
+fn keys_form<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage, vault: &'a VaultView) -> Element<'a, M> {
+    let v = vault.name.clone();
+    let key = |f: &str| format!("vault:{v}:{f}");
+    let input = a.input;
+    // A new key.
+    let new_name = page.get(&key("newkey")).trim().to_string();
     let kind = match page.get(&key("keytype")) {
         "" => "aes256-gcm".to_string(),
         t => t.to_string(),
     };
-    let input = a.input;
     let mut kinds = row![].spacing(2);
-    for t in ["aes256-gcm", "mldsa65", "hsm-aes256-gcm", "hsm-ecdsa-p256"] {
-        kinds = kinds.push(k.choice(t, kind == t, input(key("keytype"), t.to_string())));
+    for (t, label) in [("aes256-gcm", "AES-256-GCM"), ("mldsa65", "ML-DSA-65 signing"), ("hsm-aes256-gcm", "AES in the HSM"), ("hsm-ecdsa-p256", "ECDSA P-256 in the HSM")] {
+        kinds = kinds.push(k.choice(label, kind == t, input(key("keytype"), t.to_string())));
     }
-    let v = vault.to_string();
-    let with = |verb: &str| (!kn.is_empty() && !kp.is_empty()).then(|| (a.run)(format!("VAULT {v} {verb} KEY {} VALUE {}", q(&kn), q(&kp))));
-    let rotate_sql = if to.is_empty() { format!("VAULT {v} ROTATE KEY") } else { format!("VAULT {v} ROTATE KEY TO {}", q(&to)) };
+    let name_problem = (!new_name.is_empty() && !new_name.chars().all(|c| c.is_ascii_alphanumeric() || "_-./".contains(c)))
+        .then(|| "Letters, digits and _ - . / only.".to_string());
+    let create = (!new_name.is_empty() && name_problem.is_none())
+        .then(|| (a.run)(format!("VAULT {v} CREATE KEY {} TYPE {}", q(&new_name), q(&kind))));
+
+    // Using one: the vault's keys, and what each kind does.
+    let keys: Vec<Secret> = vault.secrets.iter().filter_map(|l| Secret::parse(l)).filter(|s| s.is_key() && s.state == "active").collect();
+    let names: Vec<String> = keys.iter().map(|s| s.name.trim_start_matches("key:").to_string()).collect();
+    let chosen = page.get(&key("key")).to_string();
+    let chosen_kind = keys.iter().find(|s| s.name.trim_start_matches("key:") == chosen).map(|s| s.content_type.clone()).unwrap_or_default();
+    let (kp, ks) = (page.get(&key("plain")).to_string(), page.get(&key("sig")).trim().to_string());
+    let encrypts = chosen_kind.ends_with("aes256-gcm");
+    let signs = matches!(chosen_kind.as_str(), "mldsa65" | "hsm-ecdsa-p256");
+    let with = |verb: &str| (!kp.is_empty()).then(|| (a.run)(format!("VAULT {v} {verb} KEY {} VALUE {}", q(&chosen), q(&kp))));
+    let mut ops = row![].spacing(4);
+    if encrypts {
+        ops = ops.push(k.small_button("ENCRYPT", with("ENCRYPT"))).push(k.small_button("DECRYPT", with("DECRYPT")));
+    }
+    if signs {
+        ops = ops
+            .push(k.small_button("SIGN", with("SIGN")))
+            .push(k.small_button(
+                "VERIFY",
+                (!kp.is_empty() && !ks.is_empty()).then(|| (a.run)(format!("VAULT {v} VERIFY KEY {} VALUE {} SIGNATURE {}", q(&chosen), q(&kp), q(&ks)))),
+            ))
+            .push(k.small_button("PUBLIC KEY", Some((a.run)(format!("VAULT {v} PUBLIC KEY {}", q(&chosen))))));
+    }
+    let key_pick = k.pick("Key".into(), names.clone(), (!chosen.is_empty()).then(|| chosen.clone()), 200.0, Box::new({
+        let kk = key("key");
+        move |c| input(kk.clone(), c)
+    }));
+    let mut use_row = row![key_pick].spacing(8).align_y(iced::alignment::Vertical::Bottom);
+    if encrypts || signs {
+        use_row = use_row.push(field(k, a, page, key("plain"), "Input", if encrypts { "text to encrypt, or ciphertext to decrypt" } else { "the message" }, true, 280.0));
+        if signs {
+            use_row = use_row.push(field(k, a, page, key("sig"), "Signature", "hex, for VERIFY", false, 200.0));
+        }
+        use_row = use_row.push(lowered(ops.into()));
+    }
+    let use_why = if names.is_empty() {
+        "This vault has no key yet: create one above."
+    } else if chosen.is_empty() {
+        "Choose a key: what it can do follows from its type."
+    } else if kp.is_empty() {
+        "Type the input. Output appears in RESULT (a decrypted value in the revealed box)."
+    } else {
+        ""
+    };
+
+    let rotate_sql = match page.provider_spec(&key("rotate")) {
+        Ok(None) => Ok(format!("VAULT {v} ROTATE KEY")),
+        Ok(Some(spec)) => Ok(format!("VAULT {v} ROTATE KEY TO {}", q(&spec))),
+        Err(e) => Err(e),
+    };
     k.form(
         "KEYS USED IN PLACE".into(),
         column![
             row![
-                field(k, a, page, key("key"), "Key name", false, 180.0),
+                checked(k, field(k, a, page, key("newkey"), "New key name", "e.g. invoices", false, 200.0), name_problem),
                 column![k.text("Type".into(), Tone::Dim), kinds].spacing(4),
-                lowered(k.small_button("CREATE KEY", (!kn.is_empty()).then(|| (a.run)(format!("VAULT {v} CREATE KEY {} TYPE {}", q(&kn), q(&kind)))))),
+                lowered(k.small_button("CREATE KEY", create)),
             ]
             .spacing(8)
-            .align_y(iced::alignment::Vertical::Bottom),
+            .align_y(iced::alignment::Vertical::Top),
+            use_row,
+            k.text(use_why.into(), Tone::Faint),
+            provider_form(k, a, page, &key("rotate"), "Rotate the vault key to", Some("A new key, same provider")),
             row![
-                field(k, a, page, key("plain"), "Text, ciphertext or message", true, 260.0),
-                field(k, a, page, key("sig"), "Signature (for VERIFY)", false, 200.0),
-                lowered(row![
-                    k.small_button("ENCRYPT", with("ENCRYPT")),
-                    k.small_button("DECRYPT", with("DECRYPT")),
-                    k.small_button("SIGN", with("SIGN")),
-                    k.small_button(
-                        "VERIFY",
-                        (!kn.is_empty() && !kp.is_empty() && !ks.is_empty())
-                            .then(|| (a.run)(format!("VAULT {v} VERIFY KEY {} VALUE {} SIGNATURE {}", q(&kn), q(&kp), q(&ks))))
-                    ),
-                ]
-                .spacing(4)
-                .into()),
-            ]
-            .spacing(8)
-            .align_y(iced::alignment::Vertical::Bottom),
-            row![
-                field(k, a, page, key("rotate"), "Rotate the vault key to (empty: a new key, same provider)", false, 360.0),
-                lowered(k.small_button(
+                k.small_button(
                     "ROTATE KEY",
-                    Some((a.confirm)(
+                    rotate_sql.as_ref().ok().map(|sql| (a.confirm)(
                         format!("Rotate the key of {v}?"),
                         "Every data key is re-wrapped under the new key-encryption key. Values are not re-encrypted.".into(),
-                        rotate_sql
+                        sql.clone()
                     ))
-                )),
+                ),
+                preview(k, &rotate_sql),
             ]
             .spacing(8)
-            .align_y(iced::alignment::Vertical::Bottom),
+            .align_y(iced::alignment::Vertical::Center),
         ]
         .spacing(8)
         .into(),
@@ -1371,28 +1630,117 @@ fn audit<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, v: &'a VaultVi
     k.section(format!("AUDIT TRAIL · {} EVENTS, NEWEST FIRST", lines.len()), Some(load), k.grid(&format!("ledger-audit-{}", v.name), cols, rows, 360.0))
 }
 
+/// The key provider kinds a vault's key can live in: (value, shown label).
+const PROVIDERS: [(&str, &str); 4] = [
+    ("pkcs11", "PKCS#11 HSM (key never leaves it)"),
+    ("tpm", "TPM 2.0 (sealed to this machine)"),
+    ("mlkem", "ML-KEM-768 + X25519 (post-quantum)"),
+    ("file", "Key file (development only)"),
+];
+
+/// A key provider chosen from a drop-down, with only the fields its kind
+/// needs and its hint beneath them. `same`, when given, is a first choice
+/// that keeps the current provider.
+fn provider_form<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage, prefix: &str, label: &str, same: Option<&str>) -> Element<'a, M> {
+    let key = |f: &str| format!("{prefix}:{f}");
+    let mut options: Vec<(&str, &str)> = Vec::new();
+    if let Some(s) = same {
+        options.push(("same", s));
+    }
+    options.extend(PROVIDERS);
+    let kind = page.get(&key("kind"));
+    let shown = options.iter().find(|(v, _)| *v == kind).map(|(_, l)| l.to_string());
+    let input = a.input;
+    let kind_key = key("kind");
+    let labels: Vec<(String, String)> = options.iter().map(|(v, l)| (v.to_string(), l.to_string())).collect();
+    let pick = k.pick(
+        label.to_string(),
+        labels.iter().map(|(_, l)| l.clone()).collect(),
+        shown,
+        300.0,
+        Box::new(move |chosen| {
+            let v = labels.iter().find(|(_, l)| *l == chosen).map(|(v, _)| v.clone()).unwrap_or_default();
+            input(kind_key.clone(), v)
+        }),
+    );
+    let mut fields = row![pick].spacing(8).align_y(iced::alignment::Vertical::Bottom);
+    let create_toggle = |what: &str| {
+        let ck = key("create");
+        let on = page.get(&ck) == "true";
+        lowered(k.toggle(format!("Create {what} if missing"), on, Box::new(move |v| input(ck.clone(), v.to_string()))))
+    };
+    let hint = match kind {
+        "file" => {
+            fields = fields.push(field(k, a, page, key("path"), "Key file", "/etc/rasterizeddb/vault.key", false, 320.0));
+            "The key sits on the database host beside the data: for tests and development only. The server must run with RDB_VAULT_ALLOW_FILE_KEY=1, and the file must be on a filesystem that keeps Unix permissions."
+        }
+        "pkcs11" => {
+            let pin_kind = page.get(&key("pin_kind"));
+            let mut kinds = row![].spacing(2);
+            for (v, l) in [("env", "env var"), ("file", "file")] {
+                let selected = pin_kind == v || (pin_kind.is_empty() && v == "env");
+                kinds = kinds.push(k.choice(l, selected, input(key("pin_kind"), v.to_string())));
+            }
+            let mech = page.get(&key("mechanism"));
+            let mut mechs = row![].spacing(2);
+            for (v, l) in [("", "AES-GCM"), ("kwp", "KWP"), ("cbc", "CBC")] {
+                mechs = mechs.push(k.choice(l, mech == v, input(key("mechanism"), v.to_string())));
+            }
+            fields = fields
+                .push(field(k, a, page, key("module"), "PKCS#11 module", "/usr/lib/softhsm/libsofthsm2.so", false, 260.0))
+                .push(field(k, a, page, key("token"), "Token label", "e.g. rdb", false, 140.0))
+                .push(field(k, a, page, key("keylabel"), "Key label", "e.g. vault-kek", false, 140.0));
+            let more = row![
+                field(k, a, page, key("pin"), if pin_kind == "file" { "PIN file" } else { "PIN environment variable" }, if pin_kind == "file" { "/etc/rasterizeddb/hsm.pin" } else { "e.g. HSM_PIN" }, false, 180.0),
+                column![k.text("PIN from".into(), Tone::Dim), kinds].spacing(4),
+                column![k.text("Wrapping".into(), Tone::Dim), mechs].spacing(4),
+            ]
+            .spacing(8)
+            .align_y(iced::alignment::Vertical::Bottom);
+            return column![
+                fields,
+                more,
+                k.text(
+                    "The key-encryption key is made and kept inside the HSM (SoftHSM, a network HSM, a cloud HSM, or a TPM through tpm2-pkcs11); data keys are wrapped and unwrapped there. AES-GCM unless the token lacks it."
+                        .into(),
+                    Tone::Faint
+                ),
+            ]
+            .spacing(6)
+            .into();
+        }
+        "tpm" => {
+            fields = fields
+                .push(field(k, a, page, key("path"), "Sealed key file", "/etc/rasterizeddb/vault.tpmkey", false, 300.0))
+                .push(field(k, a, page, key("tcti"), "TPM connection (TCTI)", "device:/dev/tpmrm0", false, 220.0))
+                .push(create_toggle("and seal one"));
+            "Sealed by this machine's TPM: the file is useless on any other machine or after the storage hierarchy is cleared. The server's user needs the tss group for /dev/tpmrm0."
+        }
+        "mlkem" => {
+            fields = fields.push(field(k, a, page, key("path"), "Key pair file", "/etc/rasterizeddb/vault.mlkem", false, 320.0)).push(create_toggle("the key pair"));
+            "Data keys are wrapped with a hybrid ML-KEM-768 + X25519 key pair, sound against a quantum computer. Not offered in FIPS mode."
+        }
+        "same" => "A new key-encryption key from the same provider; every data key is re-wrapped under it.",
+        _ => "Where the vault's key-encryption key lives. An HSM keeps it out of the server's memory altogether.",
+    };
+    column![fields, k.text(hint.into(), Tone::Faint)].spacing(6).into()
+}
+
 fn create_vault_form<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, page: &'a LedgerPage) -> Element<'a, M> {
     let sql = page.create_vault_sql();
     k.form(
         "NEW VAULT".into(),
         column![
             row![
-                field(k, a, page, "new:vault:name".into(), "Name", false, 180.0),
-                field(k, a, page, "new:vault:provider".into(), "Key provider", false, 380.0),
-                field(k, a, page, "new:vault:retain".into(), "Keep deleted secrets for", false, 90.0),
+                field(k, a, page, "new:vault:name".into(), "Vault name", "e.g. app_secrets", false, 180.0),
+                field(k, a, page, "new:vault:retain".into(), "Keep deleted secrets", "e.g. 90", false, 90.0),
                 units(k, a, page, "new:vault:retain_unit", "DAYS", &["DAYS", "MONTHS", "YEARS"]),
                 lowered(k.primary_button("CREATE VAULT", sql.as_ref().ok().map(|s| (a.run)(s.clone())))),
             ]
             .spacing(8)
             .align_y(iced::alignment::Vertical::Bottom),
+            provider_form(k, a, page, "new:vault:provider", "Key provider", None),
             preview(k, &sql),
-            k.text(
-                "pkcs11:module=<lib>;token=<label>;key=<label>;pin-env=VAR (an HSM; the key never leaves it) · \
-                 tpm:/path/vault.tpmkey;create (sealed by this machine's TPM) · mlkem:/path (post-quantum) · \
-                 file:/path (development only; the server must run with RDB_VAULT_ALLOW_FILE_KEY=1)"
-                    .into(),
-                Tone::Faint
-            ),
         ]
         .spacing(6)
         .into(),
@@ -1475,36 +1823,84 @@ mod tests {
     fn the_create_forms_build_their_statements() {
         let mut p = LedgerPage::default();
         assert!(p.create_ledger_sql().is_err());
+        p.prefill();
+        p.input(ADD_COLUMN.into(), String::new());
         for (k, v) in [
             ("new:ledger:name", "payments"),
-            ("new:ledger:col:0:name", "id"),
-            ("new:ledger:col:0:type", "BIGINT"),
             ("new:ledger:col:1:name", "amount"),
-            ("new:ledger:col:1:type", "NUMERIC(12,2)"),
-            ("new:ledger:keep", "7"),
+            ("new:ledger:col:1:type", "NUMERIC"),
+            ("new:ledger:col:1:prec", "12"),
+            ("new:ledger:col:1:scale", "2"),
             ("new:ledger:versioned", "true"),
         ] {
             p.input(k.into(), v.into());
         }
         assert_eq!(
             p.create_ledger_sql().unwrap(),
-            "CREATE LEDGER TABLE payments (id BIGINT, amount NUMERIC(12,2)) NO DELETE UNTIL 7 YEARS AFTER INSERT VERSIONED"
+            "CREATE LEDGER TABLE payments (id BIGINT NOT NULL, amount NUMERIC(12, 2)) NO DELETE UNTIL 7 YEARS AFTER INSERT VERSIONED"
         );
+        // A row with a name and no type, a scale past the precision, and a
+        // changed type's stale size each say what is wrong.
         p.input(ADD_COLUMN.into(), String::new());
         p.input("new:ledger:col:2:name".into(), "memo".into());
+        assert_eq!(p.create_ledger_sql().unwrap_err(), "Column memo: choose its type.");
+        p.input("new:ledger:col:2:type".into(), "VARCHAR".into());
+        p.input("new:ledger:col:2:len".into(), "80".into());
+        p.input("new:ledger:col:1:scale".into(), "14".into());
+        assert!(p.create_ledger_sql().unwrap_err().contains("cannot exceed the precision"));
+        p.input("new:ledger:col:1:scale".into(), "2".into());
         p.input(DROP_COLUMN.into(), "0".into());
         assert_eq!(p.columns(), 2);
-        assert!(p.create_ledger_sql().unwrap().contains("(amount NUMERIC(12,2), memo TEXT)"));
+        assert!(p.create_ledger_sql().unwrap().contains("(amount NUMERIC(12, 2), memo VARCHAR(80))"), "{:?}", p.create_ledger_sql());
+        p.input("new:ledger:col:1:type".into(), "TEXT".into());
+        assert!(p.create_ledger_sql().unwrap().contains("memo TEXT)"), "a new type drops the old size");
         p.input("new:ledger:col:0:type".into(), "INT); DROP TABLE x; --".into());
         assert!(p.create_ledger_sql().is_err());
+        assert_eq!(date_problem("2027-06-31").unwrap(), "2027-06-31 has no day 31.");
+        assert_eq!(date_problem(""), None);
+        assert_eq!(date_problem("2027-06-30 18:00"), None);
+        p.input("vault:app:expires".into(), "next week".into());
 
-        for (k, v) in [("new:vault:name", "app"), ("new:vault:provider", "tpm:/k;create"), ("new:vault:retain", "90")] {
+        for (k, v) in [
+            ("new:vault:name", "app"),
+            ("new:vault:provider:kind", "tpm"),
+            ("new:vault:provider:path", "/k"),
+            ("new:vault:provider:create", "true"),
+            ("new:vault:retain", "90"),
+        ] {
             p.input(k.into(), v.into());
         }
         assert_eq!(p.create_vault_sql().unwrap(), "CREATE VAULT app KEY PROVIDER 'tpm:/k;create' RETAIN DELETED 90 DAYS");
+        // Each kind builds its spec from its own fields.
+        let mut h = LedgerPage::default();
+        assert_eq!(h.provider_spec("x"), Ok(None));
+        for (k, v) in [("x:kind", "pkcs11"), ("x:module", "/usr/lib/softhsm/libsofthsm2.so"), ("x:token", "rdb")] {
+            h.input(k.into(), v.into());
+        }
+        assert!(h.provider_spec("x").is_err(), "the key label is missing");
+        h.input("x:keylabel".into(), "kek".into());
+        h.input("x:pin".into(), "HSM_PIN".into());
+        assert_eq!(
+            h.provider_spec("x").unwrap().unwrap(),
+            "pkcs11:module=/usr/lib/softhsm/libsofthsm2.so;token=rdb;key=kek;pin-env=HSM_PIN"
+        );
+        h.input("x:pin_kind".into(), "file".into());
+        h.input("x:mechanism".into(), "kwp".into());
+        assert!(h.provider_spec("x").unwrap().unwrap().ends_with(";pin-source=HSM_PIN;mechanism=kwp"));
+        h.input("x:token".into(), "a;b".into());
+        assert!(h.provider_spec("x").is_err(), "a ';' would split the spec");
+        let mut m = LedgerPage::default();
+        m.input("y:kind".into(), "mlkem".into());
+        assert!(m.provider_spec("y").is_err());
+        m.input("y:path".into(), "/keys/pq".into());
+        assert_eq!(m.provider_spec("y").unwrap().unwrap(), "mlkem:/keys/pq");
+        m.input("y:kind".into(), "same".into());
+        assert_eq!(m.provider_spec("y"), Ok(None));
 
         p.input("vault:app:name".into(), "db/pw".into());
         p.input("vault:app:value".into(), "s3cr'et".into());
+        assert!(p.set_secret_sql("app").unwrap_err().starts_with("Expires: "), "a bad date is refused, saying why");
+        p.input("vault:app:expires".into(), String::new());
         assert_eq!(p.set_secret_sql("app").unwrap(), "VAULT app SET SECRET 'db/pw' = 's3cr''et'");
         assert!(!p.set_secret_preview("app").unwrap().contains("s3cr"), "the preview never shows the value");
     }

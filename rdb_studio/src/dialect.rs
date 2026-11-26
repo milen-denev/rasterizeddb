@@ -491,6 +491,9 @@ pub fn alter_role_sql(
         parts.push(format!("CONNECTION LIMIT {limit}"));
     }
     let until = valid_until.trim();
+    if let Some(p) = date_problem(until) {
+        return Err(format!("valid until: {p}"));
+    }
     if until != role.valid_until.as_deref().unwrap_or("").trim() {
         parts.push(format!("VALID UNTIL {}", quote_literal(if until.is_empty() { "infinity" } else { until })));
     }
@@ -498,6 +501,50 @@ pub fn alter_role_sql(
         return Err("nothing changed".to_string());
     }
     Ok(format!("ALTER ROLE {} {}", quote_ident(&role.name), parts.join(" ")))
+}
+
+/// What is wrong with `s` as a date (`YYYY-MM-DD`, optionally ` HH:MM[:SS]`
+/// and a zone); `None` when it is one, or empty.
+pub fn date_problem(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("infinity") {
+        return None;
+    }
+    let bad = || Some("Write a date as YYYY-MM-DD, or YYYY-MM-DD HH:MM.".to_string());
+    let (date, time) = match s.split_once([' ', 'T']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let parts: Vec<&str> = date.split('-').collect();
+    let [y, m, d] = parts.as_slice() else { return bad() };
+    if y.len() != 4 {
+        return bad();
+    }
+    let (Ok(y), Ok(m), Ok(d)) = (y.parse::<i32>(), m.parse::<u32>(), d.parse::<u32>()) else { return bad() };
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return Some(format!("There is no month {m}.")),
+    };
+    if d == 0 || d > days {
+        return Some(format!("{date} has no day {d}."));
+    }
+    if let Some(t) = time {
+        let t = t.trim_end_matches('Z');
+        let t = t.split(['+']).next().unwrap_or(t);
+        let hms: Vec<&str> = t.split(':').collect();
+        let ok = matches!(hms.len(), 2 | 3)
+            && hms[0].parse::<u32>().is_ok_and(|h| h < 24)
+            && hms[1].parse::<u32>().is_ok_and(|m| m < 60)
+            && hms.get(2).is_none_or(|s| s.split('.').next().unwrap_or("").parse::<u32>().is_ok_and(|s| s < 60));
+        if !ok {
+            return Some("Write a time as HH:MM or HH:MM:SS (24-hour).".to_string());
+        }
+    }
+    None
 }
 
 /// `GRANT <privileges> ON <table> TO <role>`.
@@ -3569,6 +3616,11 @@ mod tests {
             "ALTER ROLE \"app\" NOLOGIN CREATEDB CONNECTION LIMIT 5 VALID UNTIL '2027-01-01'"
         );
         assert!(alter_role_sql(&role, true, false, false, false, false, "x", "").is_err());
+        assert!(alter_role_sql(&role, true, false, false, false, false, "", "2027-02-30").is_err());
+        assert_eq!(date_problem("2027-02-30").unwrap(), "2027-02-30 has no day 30.");
+        assert_eq!(date_problem("2028-02-29 23:59"), None);
+        assert!(date_problem("27-1-1").is_some());
+        assert!(date_problem("2027-01-01 25:00").is_some());
         assert_eq!(
             grant_table_sql("sec", &["SELECT"], "app", true).unwrap(),
             "GRANT SELECT ON \"sec\" TO \"app\" WITH GRANT OPTION"

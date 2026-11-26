@@ -2747,8 +2747,9 @@ impl Studio {
             #[cfg(feature = "enterprise")]
             Message::LedgerLoaded(page) => {
                 let mut page = *page;
-                if let Some(old) = self.ledger.take() {
-                    page.carry_over(old);
+                match self.ledger.take() {
+                    Some(old) => page.carry_over(old),
+                    None => page.prefill(),
                 }
                 self.ledger = Some(page);
                 Task::none()
