@@ -9,9 +9,12 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+#[cfg(not(feature = "fips"))]
 use hmac::{Hmac, KeyInit, Mac};
+#[cfg(not(feature = "fips"))]
 use sha2::{Digest, Sha256};
 
+#[cfg(not(feature = "fips"))]
 type HmacSha256 = Hmac<Sha256>;
 
 /// Iteration counts below this are refused.
@@ -222,6 +225,8 @@ fn field(message: &str, key: char) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "fips")]
+    use sha2::{Digest, Sha256};
     use super::*;
 
     #[test]
