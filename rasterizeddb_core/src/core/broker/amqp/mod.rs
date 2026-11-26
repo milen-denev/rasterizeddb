@@ -602,6 +602,9 @@ impl Conn {
                 Ok(())
             }
             (10, 50) => {
+                // Exclusive queues go, and unacked messages go back, before the
+                // close-ok: a client that reconnects at once must not find them.
+                self.cleanup();
                 codec::method(out, 0, 10, 51, |_| {});
                 Err(())
             }
