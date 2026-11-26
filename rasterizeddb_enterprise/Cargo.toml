@@ -14,10 +14,59 @@ publish = false
 [dependencies]
 rasterizeddb_core = { path = "../rasterizeddb_core", version = "1.0.0", default-features = false, features = ["sharding"] }
 log = "0.4"
+parking_lot = "0.13"
+# The ledger chain's hash and ids (both already in the tree).
+sha2 = { version = "0.11", optional = true }
+fastrand = { version = "2.5", optional = true }
+# Encryption (plan §4): AES-256-GCM, keys zeroized, secure memory.
+aes-gcm = { version = "0.10", optional = true }
+zeroize = { version = "1", optional = true }
+libc = { version = "0.2", optional = true }
+base64 = { version = "0.23", optional = true }
+# Hardware key providers through PKCS#11 (HSMs, cloud HSMs, TPM 2.0 via
+# tpm2-pkcs11). The module is loaded at run time: no C library at link time.
+cryptoki = { version = "0.10", optional = true }
+# Post-quantum (feature `pqc`): ML-KEM-768 (FIPS 203) hybrid with X25519 for
+# wrapping data keys.
+ml-kem = { version = "0.2", features = ["deterministic"], optional = true }
+x25519-dalek = { version = "3", features = ["static_secrets"], optional = true }
+# ML-DSA-65 (FIPS 204) signatures on ledger anchors.
+ml-dsa = { version = "0.1", optional = true }
+# FIPS 140-3 (feature `fips`): AES-256-GCM, SHA-256 and the DRBG from the
+# AWS-LC FIPS module, as the core's `fips` feature uses it.
+aws-lc-rs = { version = "1.19", optional = true }
+# S3 anchors run the core's S3 client on a small runtime of their own.
+tokio = { version = "1", features = ["rt", "net", "time"], optional = true }
 
 [features]
-default = ["tenant_isolation", "segregation_policies"]
+default = ["tenant_isolation", "segregation_policies", "ledger", "ledger_s3", "encryption", "pkcs11", "vault", "pqc"]
 # Strict tenant mode, T1-T10 (docs/sharding-plan.md §4.10).
 tenant_isolation = []
 # Placement policies over shard labels (§4.10, "Enterprise segregation").
 segregation_policies = []
+# Ledger tables (docs/ledger-and-vault-plan.md §3): append-only under a
+# retention lock, the guard behind `ledger_hooks`, the hash chain. Its
+# crates (sha2, fastrand) are already in the tree.
+ledger = ["dep:sha2", "dep:fastrand"]
+# S3 Object Lock anchors (plan §3.4): the core's S3 client, which is the
+# `s3_backup` feature's.
+ledger_s3 = ["ledger", "rasterizeddb_core/s3_backup", "dep:tokio"]
+# Envelope encryption: AES-256-GCM data keys wrapped by a key-encryption
+# key from a provider (plan §4.4); secure memory for keys and secrets.
+encryption = ["dep:aes-gcm", "dep:zeroize", "dep:libc", "dep:base64"]
+# The PKCS#11 key provider: HSMs, cloud HSMs, TPM 2.0 (tpm2-pkcs11).
+pkcs11 = ["encryption", "dep:cryptoki"]
+# FIPS 140-3 mode: the ledger's hashes and the vault's AES-256-GCM and
+# randomness through the AWS-LC FIPS module; ML-KEM and ML-DSA (not inside it)
+# refused. Needs the core's `fips` (and its build tools: CMake, Go, Perl).
+fips = ["encryption", "dep:aws-lc-rs", "aws-lc-rs/fips", "rasterizeddb_core/fips"]
+# Secret vaults (plan §4): a Key Vault replacement on ledger tables.
+vault = ["ledger", "encryption"]
+# Post-quantum options: the hybrid ML-KEM-768 + X25519 key provider
+# (`mlkem:<key file>`) and ML-DSA-65 anchor signatures (plan §4.5).
+pqc = ["encryption", "dep:ml-kem", "dep:ml-dsa", "dep:x25519-dalek", "dep:sha2"]
+
+[[bin]]
+name = "rdb-ledger-verify"
+path = "src/bin/rdb-ledger-verify.rs"
+required-features = ["ledger"]

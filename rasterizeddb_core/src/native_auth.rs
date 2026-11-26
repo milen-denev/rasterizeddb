@@ -133,6 +133,11 @@ impl NativeAuthConfig {
     fn validate_method(method: AuthMethod) -> Result<(), String> {
         match method {
             AuthMethod::Trust | AuthMethod::ScramSha256 | AuthMethod::Peer => Ok(()),
+            AuthMethod::Cert => Err(
+                "certificate login is offered on the PostgreSQL listener (--pg-auth cert); the native \
+                 protocol does not offer it yet"
+                    .to_string(),
+            ),
             AuthMethod::Md5 | AuthMethod::Password => Err(format!(
                 "the native protocol does not offer {}: it exists in the PostgreSQL listener \
                  only for drivers that speak nothing else. Use scram-sha-256.",

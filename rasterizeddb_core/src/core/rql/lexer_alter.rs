@@ -186,6 +186,31 @@ fn token_at(s: &str, from: usize) -> Option<(&str, usize)> {
 /// or inside a quoted identifier or default expression is data, not a
 /// separator, which is why `split_definitions` does the work rather than
 /// `split(',')`.
+impl AlterAction {
+    /// The clause as a ledger policy is asked about it
+    /// (`ledger_hooks::WriteKind::Alter`). An `ADD COLUMN` says whether the
+    /// column is nullable with no default, the only kind that leaves every
+    /// existing row's digest as it was.
+    pub fn ledger_label(&self) -> &'static str {
+        match self {
+            AlterAction::AddColumn { nullable: true, default: None, generated: None, .. } => "ADD COLUMN NULL",
+            AlterAction::AddColumn { .. } => "ADD COLUMN",
+            AlterAction::DropColumn { .. } => "DROP COLUMN",
+            AlterAction::RenameColumn { .. } => "RENAME COLUMN",
+            AlterAction::ConstraintClause { .. } => "CONSTRAINT",
+            AlterAction::RenameTable { .. } => "RENAME",
+            AlterAction::AlterColumn { .. } => "ALTER COLUMN",
+            AlterAction::SetDefault { .. } => "SET DEFAULT",
+            AlterAction::ValidateConstraint { .. } => "VALIDATE CONSTRAINT",
+            AlterAction::RenameConstraint { .. } => "RENAME CONSTRAINT",
+            AlterAction::RenameIndex { .. } => "RENAME INDEX",
+            AlterAction::SetRowCompression { .. } => "SET COMPRESSION",
+            AlterAction::Recompress => "RECOMPRESS",
+            AlterAction::NoOp { .. } => "NO-OP",
+        }
+    }
+}
+
 pub fn parse_alter_table_actions(sql: &str) -> Result<Vec<AlterTable>, String> {
     Ok(parse_alter_table_actions_tagged(sql)?.into_iter().map(|(action, _)| action).collect())
 }

@@ -229,6 +229,19 @@ fn pane(studio: &Studio) -> Element<'_, Message> {
         Tab::Keys => keys::view(studio),
         Tab::Roles => roles::view(studio),
         Tab::Config => config::view(studio),
+        #[cfg(feature = "enterprise")]
+        Tab::Ledger => framed(
+            "LEDGER",
+            None,
+            rdb_studio_enterprise::view(
+                studio.ledger.as_ref(),
+                rdb_studio_enterprise::Actions {
+                    reload: Message::ReloadLedger,
+                    verify: Message::VerifyLedger,
+                    audit: Message::LedgerAudit,
+                },
+            ),
+        ),
     };
     container(inner).width(Fill).height(Fill).padding(12).into()
 }

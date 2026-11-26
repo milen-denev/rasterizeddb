@@ -49,6 +49,8 @@ pub(super) fn acct(name: &str) -> CreateTable {
         table_name: name.to_string(),
         columns: vec![col("tenant_id", DbType::I64), col("n", DbType::I32), col("label", DbType::STRING)],
         is_immutable: false,
+        special: crate::core::row::schema::SpecialTable::None,
+        ledger_policy: Vec::new(),
         foreign_keys: Vec::new(),
         defaults: Vec::new(),
         json_columns: Vec::new(),

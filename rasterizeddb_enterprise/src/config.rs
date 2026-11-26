@@ -38,6 +38,14 @@ pub struct EnterpriseConfig {
     /// T9: the hosts the server may connect out to (`host`, `host:port`,
     /// `*.suffix`), under strict tenant mode. Unset, nothing is held back.
     pub outbound_hosts: Option<Vec<String>>,
+    /// Where ledger chains live (`ledger_dir /mnt/disk2/ledger`): another
+    /// disk than the data.
+    pub ledger_dir: Option<std::path::PathBuf>,
+    /// Anchor sinks every ledger chain is anchored to (`ledger_anchor
+    /// s3://bucket/prefix`, `ledger_anchor dir:/mnt/worm`).
+    pub ledger_anchors: Vec<String>,
+    /// Vault key providers by name (`vault_key name provider-uri`).
+    pub vault_keys: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -108,6 +116,9 @@ impl EnterpriseConfig {
                 ["outbound_hosts", hosts @ ..] => {
                     c.outbound_hosts.get_or_insert_with(Vec::new).extend(hosts.iter().map(|h| h.to_ascii_lowercase()));
                 }
+                ["ledger_dir", dir] => c.ledger_dir = Some(std::path::PathBuf::from(dir)),
+                ["ledger_anchor", sink] => c.ledger_anchors.push(sink.to_string()),
+                ["vault_key", name, provider] => c.vault_keys.push((name.to_string(), provider.to_string())),
                 _ => return Err(bad("unknown setting")),
             }
         }

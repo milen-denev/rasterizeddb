@@ -53,3 +53,6 @@ storage_compression = ["rasterizeddb_core/storage_compression"]
 sharding = ["rasterizeddb_core/sharding"]
 sharding_raft = ["rasterizeddb_core/sharding_raft", "dep:rasterizeddb_raft"]
 sharding_2pc = ["rasterizeddb_core/sharding_2pc"]
+# FIPS 140-3 mode (rasterizeddb_core/src/core/fips.rs), and the enterprise
+# crate's ledger and vault crypto through the same module.
+fips = ["rasterizeddb_core/fips", "rasterizeddb_enterprise?/fips"]

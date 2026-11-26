@@ -4675,6 +4675,8 @@ fn rewrite_definition(
             })
             .collect(),
         is_immutable: false,
+        special: crate::core::row::schema::SpecialTable::None,
+        ledger_policy: Vec::new(),
         if_not_exists: false,
         foreign_keys: table_schema.foreign_keys.iter().cloned().collect(),
         defaults: table_schema.defaults.iter().cloned().collect(),
@@ -10396,6 +10398,143 @@ async fn execute_lock_table(
     ddl_ok(0)
 }
 
+/// A ledger statement (`ledger_hooks::is_ledger_statement`): the special
+/// tables it names (or every one), their visible rows for `VERIFY` and the
+/// vault statements, handed to the installed hooks; the policy records they
+/// return appended to each table's sidecar and the rows they return
+/// inserted in this statement's transaction, before the reply goes out.
+///
+/// Who may run what: `VERIFY` and `SHOW` anyone who may read the table;
+/// `ALTER LEDGER TABLE` its owner or a superuser; `ACKNOWLEDGE LEDGER
+/// ROLLBACK` a superuser; a vault's reads `SELECT` on it, its writes
+/// `INSERT`, and `PURGE`, `ROTATE KEY` and `AUDIT` its owner or a
+/// superuser. A statement whose role the front end did not say is refused
+/// all but `VERIFY` and `SHOW`.
+#[inline(never)]
+async fn execute_ledger_statement(sql: &str, database: &Arc<Database>, depth: usize, tx: TxId) -> Result<Vec<String>, String> {
+    use crate::core::database::relation::Relation;
+    let words: Vec<&str> = sql.trim().trim_end_matches(';').split_whitespace().collect();
+    let up = |i: usize| words.get(i).map(|w| w.to_ascii_uppercase()).unwrap_or_default();
+    let (verb, op) = (up(0), up(2));
+    let reads_rows = verb == "VERIFY" || verb == "VAULT";
+    let named: Option<&str> = match verb.as_str() {
+        // `SHOW LEDGER RECEIPT <table> <row stamp>`.
+        "SHOW" if op == "RECEIPT" => Some(*words.get(3).ok_or("42601: SHOW LEDGER RECEIPT needs a table and a row stamp")?),
+        "VERIFY" | "SHOW" => words.get(2).copied().filter(|w| !matches!(w.to_ascii_uppercase().as_str(), "FULL" | "SINCE")),
+        "ALTER" => Some(*words.get(3).ok_or("42601: ALTER LEDGER TABLE needs a table name")?),
+        "VAULT" => Some(*words.get(1).ok_or("42601: VAULT needs a vault name")?),
+        _ => None,
+    };
+    let session = crate::core::ledger_hooks::session();
+    let (role, superuser) = session.clone().unwrap_or_default();
+    // The privilege each statement needs, checked before anything is read.
+    let needs: Option<&str> = match (verb.as_str(), op.as_str()) {
+        ("VERIFY", _) | ("SHOW", _) => None,
+        ("VAULT", "GET" | "LIST" | "VERSIONS" | "ENCRYPT" | "DECRYPT" | "SIGN" | "VERIFY" | "PUBLIC") => Some("SELECT"),
+        ("VAULT", "SET" | "DISABLE" | "ENABLE" | "DELETE" | "RECOVER") => Some("INSERT"),
+        _ => Some("OWNER"),
+    };
+    if needs.is_some() && session.is_none() {
+        return Err("42501: this statement needs a session whose role is known".to_string());
+    }
+    if verb == "ACKNOWLEDGE" && !superuser {
+        return Err("42501: ACKNOWLEDGE LEDGER ROLLBACK needs a superuser".to_string());
+    }
+    let names: Vec<String> = match named {
+        Some(n) => vec![database.resolve_key(n).ok_or_else(|| format!("42P01: relation \"{n}\" does not exist"))?],
+        None => database
+            .relation_names()
+            .into_iter()
+            .filter(|n| database.relation(n).is_some_and(|r| r.schema().special.is_special()))
+            .collect(),
+    };
+    if let (Some(privilege), false) = (needs, superuser) {
+        let acl = crate::core::rql::privileges::load(database, Some(tx)).await?;
+        for name in &names {
+            let ok = match privilege {
+                "OWNER" => crate::core::rql::privileges::owns(&acl, &role, name),
+                p => crate::core::rql::privileges::allows(&acl, &role, name, p),
+            };
+            if !ok {
+                return Err(format!(
+                    "42501: permission denied for {} \"{name}\"{}",
+                    if verb == "VAULT" { "vault" } else { "ledger table" },
+                    if privilege == "OWNER" { " (needs its owner or a superuser)".to_string() } else { format!(" ({privilege})") }
+                ));
+            }
+        }
+    }
+    let mut held = Vec::new();
+    for name in &names {
+        let Some(relation) = database.relation(name) else { continue };
+        let kind = relation.schema().special;
+        if !kind.is_special() || (verb == "VAULT" && kind != crate::core::row::schema::SpecialTable::Vault) {
+            return Err(format!(
+                "42809: \"{name}\" is not a {}",
+                if verb == "VAULT" { "vault" } else { "ledger table or vault" }
+            ));
+        }
+        let rows = match (&relation, reads_rows) {
+            (_, false) => Vec::new(),
+            (Relation::Plain(table), true) => table.ledger_rows().await.map_err(|e| e.to_string())?,
+            (Relation::Partitioned(_), true) => {
+                return Err(format!("0A000: \"{name}\" is partitioned; ledger statements on partitioned tables are not supported yet"));
+            }
+        };
+        held.push((relation, rows));
+    }
+    let request = crate::core::ledger_hooks::LedgerRequest {
+        sql,
+        tables: held.iter().map(|(r, rows)| (r.schema(), rows.clone())).collect(),
+        role: &role,
+        superuser,
+    };
+    let reply = crate::core::ledger_hooks::statement(&database.ledger_store(), request)?;
+    for insert in &reply.inserts {
+        let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(insert)
+            .ok_or_else(|| "XX000: a vault write could not be read back as an INSERT".to_string())?;
+        let result = crate::core::ledger_hooks::as_vault_write(Box::pin(execute_with_context(
+            purpose,
+            database.clone(),
+            depth + 1,
+            tx,
+        )))
+        .await;
+        if result.first() == Some(&3) {
+            return Err(String::from_utf8_lossy(&result[1..]).into_owned());
+        }
+    }
+    for (name, record) in &reply.records {
+        let Some((Relation::Plain(table), _)) = held.iter().find(|(r, _)| &r.schema().name == name) else {
+            return Err(format!("0A000: a policy record for \"{name}\" has no plain table to go to"));
+        };
+        let mut writes = crate::core::torn_tail::SidecarWrites::default();
+        crate::core::ledger_hooks::policy_sidecar::stage(&*table.io_schema, &mut writes, record);
+        writes.commit(&*table.io_schema).await.map_err(|e| e.to_string())?;
+    }
+    Ok(reply.lines)
+}
+
+/// A `CREATE LEDGER TABLE` or `CREATE VAULT` (`ledger_ddl`) as the plain
+/// `CREATE TABLE` to run, with the kind and first policy record its table
+/// gets; any other statement as it came. The policy comes from the installed
+/// ledger hooks, so a build without them refuses here, before anything is
+/// locked or written.
+#[inline(never)]
+fn special_create(
+    query: QueryPurpose,
+) -> Result<(QueryPurpose, Option<(crate::core::row::schema::SpecialTable, Vec<u8>)>), String> {
+    let QueryPurpose::CreateTable(sql) = &query else {
+        return Ok((query, None));
+    };
+    let Some(split) = crate::core::rql::ledger_ddl::split(sql) else {
+        return Ok((query, None));
+    };
+    let split = split?;
+    let policy = crate::core::ledger_hooks::create_policy(split.kind, &split.name, &split.clauses)?;
+    Ok((QueryPurpose::CreateTable(split.create_sql), Some((split.kind, policy))))
+}
+
 /// `TRUNCATE` (`rql::truncate`): every named table's rows deleted, as one
 /// statement of transaction `tx`, under ACCESS EXCLUSIVE on each.
 ///
@@ -10450,6 +10589,16 @@ async fn execute_truncate(database: &Arc<Database>, sql: &str, depth: usize, tx:
             tables.push(child);
         }
         at += 1;
+    }
+    // A ledger table or vault, named or reached by CASCADE, is truncated
+    // only if its policy admits it (`ledger_hooks`), before anything is
+    // locked or deleted.
+    for name in &tables {
+        if let Some(relation) = database.relation(name) {
+            if let Err(e) = crate::core::ledger_hooks::admit(relation.schema(), crate::core::ledger_hooks::WriteKind::Truncate) {
+                return ddl_error(&e);
+            }
+        }
     }
     for table in &tables {
         if let Err(e) = Box::pin(database.relation_for(table, owner(), TableMode::AccessExclusive)).await {
@@ -18128,6 +18277,14 @@ async fn execute_alter_table_action(
         // from it, because `Table` owns its schema by value.
         (table.schema.clone(), table.io_schema.clone(), row_count)
     };
+    // A ledger table or vault takes only the ALTERs its policy admits
+    // (`ledger_hooks`), before anything is locked or written.
+    if let Err(e) = crate::core::ledger_hooks::admit(
+        &schema,
+        crate::core::ledger_hooks::WriteKind::Alter(plan.action.ledger_label()),
+    ) {
+        return ddl_error(&e);
+    }
 
     // The rest of the action's complete lock set (§7 step 1, finding L11):
     // the RENAME target, the FK children whose sidecars it rewrites, the
@@ -20494,6 +20651,9 @@ pub(crate) fn replication_of(query: &QueryPurpose) -> Replicated {
             Replicated::Local("a filter setting is this node's own; run it on each node that should have it")
         }
         QueryPurpose::Replication(_) => Replicated::Local("replication settings are each node's own"),
+        // A ledger's chain and policy records are each node's own; a replica
+        // verifies its own copy.
+        QueryPurpose::Ledger(_) => Replicated::Local("a ledger statement acts on this node's ledger; run it on each node"),
         #[cfg(feature = "kv_cache")]
         // Its writes travel on the same stream, as the store's own effects
         // (`core::kv_cache::repl`) rather than as this statement's text.
@@ -20533,7 +20693,7 @@ fn query_sql(query: &QueryPurpose) -> String {
         | QueryPurpose::DropColumn(s)
         | QueryPurpose::RenameColumn(s) => s.clone(),
         QueryPurpose::Vacuum(_) => String::new(),
-        QueryPurpose::FilterControl(sql) | QueryPurpose::Replication(sql) => sql.clone(),
+        QueryPurpose::FilterControl(sql) | QueryPurpose::Replication(sql) | QueryPurpose::Ledger(sql) => sql.clone(),
         #[cfg(feature = "storage_pools")]
         QueryPurpose::Storage(sql) => sql.clone(),
         QueryPurpose::Introspect(_) => String::new(),
@@ -23549,6 +23709,15 @@ pub(crate) async fn execute_with_need(
         // rest of this match keeps its table-oriented shape.
         // Cluster control, like the filter statements above: no table, no
         // transaction, and a result set of text rather than rows of a relation.
+        QueryPurpose::Ledger(sql) => {
+            return match Box::pin(execute_ledger_statement(sql, &database, depth, tx)).await {
+                Ok(lines) => crate::replication::sql::text_result(&lines),
+                Err(e) => {
+                    error!("ledger statement failed: {}", e);
+                    ddl_error(&e)
+                }
+            };
+        }
         QueryPurpose::Replication(sql) => {
             // The structured forms return rows rather than lines; everything
             // else in this surface is text meant to be read.
@@ -23631,9 +23800,19 @@ pub(crate) async fn execute_with_need(
                     return Box::pin(execute_create_table_as(&database, statement, tx)).await;
                 }
             }
+            // `CREATE LEDGER TABLE` / `CREATE VAULT`: the plain create they
+            // stand for, and the kind and policy its header and sidecar get.
+            let (query, special) = match special_create(query) {
+                Ok(split) => split,
+                Err(e) => return ddl_error(&e),
+            };
             // Handle create table
-            let (parsed, partition, rejection) =
+            let (mut parsed, partition, rejection) =
                 crate::core::rql::lexer_ct::create_table_with_partition(&query);
+            if let (Some(ct), Some((kind, policy))) = (parsed.as_mut(), special) {
+                ct.special = kind;
+                ct.ledger_policy = policy;
+            }
             if let Some(reason) = rejection {
                 error!("Cannot create table: {}", reason);
                 return ddl_error(&reason);

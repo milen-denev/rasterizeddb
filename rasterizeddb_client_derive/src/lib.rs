@@ -667,6 +667,9 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             "row_compression",
             "shard_by",
             "shard",
+            "ledger",
+            "ledger_drop_idle",
+            "ledger_anchor",
         ],
     )?;
     let setting = |key: &str| {
@@ -986,6 +989,37 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
     } else {
         quote!(const COLUMN_COMPRESSION: &'static [(&'static str, &'static str)] = &[#(#column_compression),*];)
     };
+    // A ledger table (`#[rdb(ledger = "7 years")]`): plain data the client
+    // reads to create it and to refuse what it never takes. Its rows never
+    // change, so a model that tracks changes to them cannot be one.
+    let ledger = match setting("ledger") {
+        None => quote!(),
+        Some(retention) => {
+            if retention.is_empty() {
+                return Err(syn::Error::new(input.span(), "#[rdb(ledger = \"<n> <unit>\")] names the retention, e.g. \"7 years\""));
+            }
+            if let Some(role) = roles.iter().find(|r| matches!(**r, "version" | "updated_at" | "soft_delete")) {
+                return Err(syn::Error::new(
+                    input.span(),
+                    format!("a ledger model's rows are never updated: #[rdb({role})] has no place on one"),
+                ));
+            }
+            if setting("row_compression").is_some() || setting("partition_by").is_some() {
+                return Err(syn::Error::new(input.span(), "a ledger model takes neither row_compression nor partition_by yet"));
+            }
+            let drop_idle = match setting("ledger_drop_idle") {
+                Some(d) => quote!(::core::option::Option::Some(#d)),
+                None => quote!(::core::option::Option::None),
+            };
+            let anchors: Vec<String> = struct_settings.iter().filter(|(k, _)| k == "ledger_anchor").map(|(_, v)| v.clone()).collect();
+            quote!(const LEDGER: ::core::option::Option<::rasterizeddb_client::orm::LedgerSpec> =
+                ::core::option::Option::Some(::rasterizeddb_client::orm::LedgerSpec {
+                    retention: #retention,
+                    drop_idle: #drop_idle,
+                    anchors: &[#(#anchors),*],
+                });)
+        }
+    };
     let from_row = from_row_impl(input, &fields, named);
     let hook_methods = if hooks {
         quote! {
@@ -1007,6 +1041,7 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             const PARTITION: ::core::option::Option<::rasterizeddb_client::orm::Partitioning> = #partition;
             #row_compression
             #column_compression
+            #ledger
             #shard_const
             #shard_key_fn
 

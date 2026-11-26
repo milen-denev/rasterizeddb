@@ -1142,7 +1142,10 @@ struct AcceptAnyServer {
 impl AcceptAnyServer {
     fn new() -> Self {
         Self {
-            provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+            // The process's provider: the FIPS one in a `fips` build.
+            provider: rustls::crypto::CryptoProvider::get_default()
+                .cloned()
+                .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider())),
         }
     }
 }

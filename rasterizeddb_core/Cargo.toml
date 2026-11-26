@@ -209,6 +209,12 @@ enable_long_row = []
 # `rasterizeddb_router`'s.
 sharding = ["dep:aws-lc-rs", "dep:zstd"]
 
+# FIPS 140-3 mode (src/core/fips.rs): TLS through rustls's FIPS provider and
+# every security hash, MAC and KDF through the AWS-LC FIPS module; md5 logins
+# refused; the server refuses to start unless the module reports FIPS mode.
+# Off by default: AWS-LC's FIPS build needs CMake, Go and Perl.
+fips = ["dep:aws-lc-rs", "aws-lc-rs/fips", "rustls/fips"]
+
 # Per-shard Raft over row images (sharding-plan.md B3): each shard a
 # replicated group with automatic failover. Off until phase 3 meets its
 # gate (the deterministic simulation and the power-loss harness).

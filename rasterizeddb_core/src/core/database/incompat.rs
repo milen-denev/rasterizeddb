@@ -58,6 +58,44 @@ pub const COMPOSITE_FOREIGN_KEY_V1: &str = "composite_foreign_key_v1";
 /// every range, so it refuses it.
 pub const SHARD_V1: &str = "shard_v1";
 
+/// A table in the directory is a ledger table (docs/ledger-and-vault-plan.md
+/// §3): append-only under a retention lock, its rows chained by digest. The
+/// guard lives in a licensed crate, so a build that has not installed it
+/// would let `UPDATE` and `DELETE` through. Known only once
+/// [`crate::core::ledger_hooks::install`] has registered it.
+pub const LEDGER_V1: &str = "ledger_v1";
+
+/// A table in the directory has columns encrypted under wrapped keys
+/// (plan §4). Known only once the licensed cipher is installed: a build
+/// without it would read ciphertext as values.
+pub const ENCRYPTED_VALUES_V1: &str = "encrypted_values_v1";
+
+/// The directory holds a secret vault (plan §4). Known only once the licensed
+/// vault is installed.
+pub const VAULT_V1: &str = "vault_v1";
+
+/// The flags a licensed crate may make known at run time, through
+/// [`register_licensed`]. Every other flag is decided by this build's
+/// features alone.
+const LICENSED: &[&str] = &[LEDGER_V1, ENCRYPTED_VALUES_V1, VAULT_V1];
+
+/// The licensed flags installed hooks have registered.
+static REGISTERED: parking_lot::RwLock<Vec<&'static str>> = parking_lot::RwLock::new(Vec::new());
+
+/// Makes `flag`, one of the licensed flags, known to this process. Called by
+/// the licensed crate's installer before any catalogue opens; a directory
+/// opened before is refused, which fails closed.
+pub fn register_licensed(flag: &str) -> Result<(), String> {
+    let Some(&flag) = LICENSED.iter().find(|f| **f == flag) else {
+        return Err(format!("{flag} is not a flag a licensed crate may register"));
+    };
+    let mut set = REGISTERED.write();
+    if !set.contains(&flag) {
+        set.push(flag);
+    }
+    Ok(())
+}
+
 /// Every flag any build has defined, with what it means, for the refusal
 /// message. Not the set this build supports: that is [`known`].
 const DESCRIBED: &[(&str, &str)] = &[
@@ -66,10 +104,21 @@ const DESCRIBED: &[(&str, &str)] = &[
     (COMPRESSED_VALUES_V1, "compressed column values (Cargo feature `storage_compression`)"),
     (COMPOSITE_FOREIGN_KEY_V1, "foreign keys over several columns"),
     (SHARD_V1, "a shard's data directory (Cargo feature `sharding`)"),
+    (LEDGER_V1, "ledger tables (the enterprise build, feature `ledger`)"),
+    (ENCRYPTED_VALUES_V1, "encrypted columns (the enterprise build, feature `encryption`)"),
+    (VAULT_V1, "secret vaults (the enterprise build, feature `vault`)"),
 ];
 
-/// The flags this build understands, by its features.
-fn known() -> &'static [&'static str] {
+/// The flags this build understands: those its features decide, and the
+/// licensed ones installed hooks registered.
+fn known() -> Vec<&'static str> {
+    let mut k = built_in().to_vec();
+    k.extend(REGISTERED.read().iter().copied());
+    k
+}
+
+/// The flags this build's features decide.
+fn built_in() -> &'static [&'static str] {
     static KNOWN: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     KNOWN.get_or_init(|| {
         let mut k = Vec::with_capacity(5);
@@ -145,7 +194,7 @@ pub fn flags(dir: &Path) -> Result<Vec<String>, String> {
 ///
 /// Called before anything in the directory is opened, replayed or created.
 pub fn check(dir: &Path) -> Result<(), String> {
-    refusal(&flags(dir)?, known())
+    refusal(&flags(dir)?, &known())
 }
 
 /// Sets `flag` in `dir`, durably, before the caller creates the first file

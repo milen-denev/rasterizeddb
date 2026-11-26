@@ -90,6 +90,7 @@ const CALLED_ON_SHELL: &[&str] = &[
     "reserve_insert_id",
     "neutralize_aborted_now",
     "vacuum_now",
+    "ledger_rows",
     "compact",
     "vacuum_stats",
     "reclaimable_bytes",
@@ -464,6 +465,7 @@ async fn a_shell_refuses_every_data_method() {
     expect("reserve_insert_id", unit(shell.reserve_insert_id().await));
     expect("neutralize_aborted_now", unit(shell.neutralize_aborted_now().await));
     expect("vacuum_now", unit(shell.vacuum_now().await));
+    expect("ledger_rows", unit(shell.ledger_rows().await));
     expect("compact", unit(shell.compact().await));
     expect("vacuum_stats", unit(shell.vacuum_stats()));
     expect("reclaimable_bytes", unit(shell.reclaimable_bytes()));

@@ -1325,6 +1325,19 @@ async fn plan_model(
             }
         }
     }
+    // A ledger table takes only what adds: new nullable columns and indexes.
+    // Anything else would be refused by the server halfway through an apply,
+    // so it is reported here instead, and the engine's hidden insert-time
+    // column is never a difference.
+    if storage.ledger.is_some() {
+        drift.retain(|d| !d.contains("__ledger_ts"));
+        let (keep, blocked): (Vec<String>, Vec<String>) = changes.into_iter().filter(|c| !c.contains("__ledger_ts")).partition(|c| {
+            let u = c.to_ascii_uppercase();
+            u.starts_with("CREATE ") || (u.contains(" ADD COLUMN ") && !u.contains("NOT NULL") && !u.contains(" DEFAULT "))
+        });
+        changes = keep;
+        drift.extend(blocked.into_iter().map(|c| format!("blocked on ledger table {}: {c}", model.table)));
+    }
     Ok(ModelSync {
         changes,
         ensure,

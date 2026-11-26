@@ -1,0 +1,30 @@
+[package]
+name = "rasterizeddb_client_enterprise"
+version = "1.0.0"
+edition = "2024"
+description = "RasterizedDB enterprise client features: secret vaults and ledger tables over rasterizeddb_client"
+repository = "https://github.com/milen-denev/rasterizeddb"
+# The RasterizedDB Enterprise License 1.0, as rasterizeddb_enterprise's: see LICENSE.
+license-file = "LICENSE"
+authors = ["Milen Denev"]
+# Not published until the licence text is final.
+publish = false
+
+# Built on the GPL client's public API and its plain-data `Model::LEDGER`;
+# nothing in the GPL crates depends on this one (sharding-plan.md §10).
+[dependencies]
+rasterizeddb_client = { path = "../rasterizeddb_client", version = "1.0.1", default-features = false }
+zeroize = "1"
+# Checking a ledger receipt on the client, against no one's word.
+sha2 = "0.11"
+
+[features]
+default = ["vault", "ledger"]
+# `Vault`: VAULT statements, values as zeroizing `SecretString`.
+vault = []
+# `LedgerAdmin` and `LedgerModelExt`: VERIFY / SHOW / ALTER LEDGER, delete
+# past retention.
+ledger = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

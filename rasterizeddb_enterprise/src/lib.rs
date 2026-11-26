@@ -16,9 +16,26 @@ pub mod tenancy;
 #[cfg(feature = "tenant_isolation")]
 pub mod tenants;
 
+#[cfg(feature = "ledger")]
+pub mod ledger;
+#[cfg(feature = "encryption")]
+pub mod crypto;
+#[cfg(feature = "vault")]
+pub mod vault;
+
 mod config;
 
 pub use config::EnterpriseConfig;
+
+/// Installs the hooks that hold whatever the configuration says: the ledger
+/// guard. Called before the first catalogue opens, with or without an
+/// enterprise configuration file, so a ledger table is never opened
+/// unguarded by an enterprise build.
+pub fn install_always() -> Result<(), String> {
+    #[cfg(feature = "ledger")]
+    ledger::install()?;
+    Ok(())
+}
 
 /// Installs the enterprise hooks described by the configuration file at
 /// `path` (see [`EnterpriseConfig::parse`]).
@@ -29,6 +46,15 @@ pub fn install(path: &std::path::Path) -> Result<(), String> {
     if cfg.tenant_mode_strict {
         rasterizeddb_core::core::policy_hooks::install_tenancy(Box::new(tenancy::StrictTenancy::new(&cfg)?))?;
         log::info!("strict tenant mode: process administration only in \"{}\"", cfg.operator_database);
+    }
+    #[cfg(feature = "ledger")]
+    {
+        if let Some(dir) = &cfg.ledger_dir {
+            ledger::store::set_ledger_dir(dir.clone());
+        }
+        for sink in &cfg.ledger_anchors {
+            ledger::anchor::add_global_sink(sink.clone());
+        }
     }
     #[cfg(feature = "segregation_policies")]
     rasterizeddb_core::core::policy_hooks::install_placement(Box::new(placement::LabelPlacement::open(&cfg)?))?;

@@ -59,6 +59,10 @@ pub(crate) fn upsert_statement<M: Model>(
     if rows.is_empty() {
         return Err(Error::Param("an insert needs at least one row".to_string()));
     }
+    // `ON CONFLICT DO NOTHING` only adds rows; any update arm changes one.
+    if !matches!(action, Action::Nothing) {
+        super::refuse_on_ledger::<M>("an upsert that updates")?;
+    }
     let key: Vec<&'static str> = primary_key::<M>()?
         .into_iter()
         .map(|i| M::COLUMNS[i].name)

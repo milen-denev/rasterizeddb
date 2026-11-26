@@ -2046,9 +2046,19 @@ async fn handle_connection_inner(
                                 io::Error::new(io::ErrorKind::ConnectionAborted, e.to_string())
                             })?;
                             // After TLS handshake, client sends a fresh StartupMessage.
-                            let result =
-                                run_session_after_ssl(catalog, &mut tls_stream, &auth, context)
-                                    .await;
+                            // The client's certificate, if it sent one the CA
+                            // signed, for `cert` authentication.
+                            let cert = tls_stream
+                                .get_ref()
+                                .1
+                                .peer_certificates()
+                                .and_then(|c| c.first())
+                                .map(|c| c.as_ref().to_vec());
+                            let result = client_cert::scoped(
+                                cert,
+                                run_session_after_ssl(catalog, &mut tls_stream, &auth, context),
+                            )
+                            .await;
 
                             // Close the TLS session before dropping it. Dropping
                             // the stream closes the socket without sending
@@ -6225,6 +6235,9 @@ async fn describe_resolved(
         QueryPurpose::Broker(sql) => {
             return Ok(Some((crate::core::broker::sql::result_fields(sql), true)));
         }
+        QueryPurpose::Ledger(_) => {
+            return Ok(Some((crate::replication::sql::result_fields(), true)));
+        }
         QueryPurpose::Replication(sql) => {
             return Ok(Some((
                 crate::replication::sql::structured_fields(sql)
@@ -8807,12 +8820,19 @@ where
         database: database.id,
         values: state.sequence_values.clone(),
     };
-    let ran = crate::core::rql::sequence::session::scoped(
-        scope,
-        describing(
-            database,
-            stmt,
-            Box::pin(execute_single_statement_unscoped(database, state, stream, stmt, result_formats, omit_description)),
+    // Who runs it, for the ledger's statements and a vault's read audit
+    // (`ledger_hooks::session`).
+    let who = (state.principal.name.clone(), state.principal.superuser);
+    let ran = crate::core::ledger_hooks::with_session(
+        who.0,
+        who.1,
+        crate::core::rql::sequence::session::scoped(
+            scope,
+            describing(
+                database,
+                stmt,
+                Box::pin(execute_single_statement_unscoped(database, state, stream, stmt, result_formats, omit_description)),
+            ),
         ),
     )
     .await;
@@ -10269,6 +10289,7 @@ pub(crate) fn result_description(
             crate::replication::sql::structured_fields(sql)
                 .unwrap_or_else(crate::replication::sql::result_fields),
         ),
+        QueryPurpose::Ledger(_) => Some(crate::replication::sql::result_fields()),
         // Likewise for the storage surface: its rows describe directories, not
         // a relation, so nothing can derive their names from a schema.
         #[cfg(feature = "storage_pools")]
@@ -11339,7 +11360,10 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // shard does not own, a stale map, a fenced move, a statement that
     // names no route key in cluster mode. Matched on the message's own
     // prefix, never inside quoted text.
-    for code in ["RDB02", "RDB03", "57P03", "0A000", "22003", "42501", "XX000"] {
+    // Ledger tables and vaults (`ledger_hooks`) lead with theirs too: a
+    // retention lock or hold (55000), a policy that does not verify (XX001),
+    // a clause that does not parse (42601).
+    for code in ["RDB02", "RDB03", "57P03", "0A000", "22003", "42501", "XX000", "55000", "XX001", "42601"] {
         if message.starts_with(code) && message[code.len()..].starts_with(':') {
             return code;
         }
@@ -16399,6 +16423,19 @@ where
     match config.method {
         AuthMethod::Trust => unreachable!("handled above"),
 
+        // The role a verified TLS client certificate names, with no password
+        // asked for (`AuthMethod::Cert`). Without TLS, or without a
+        // certificate the CA signed, there is no one to name.
+        AuthMethod::Cert => {
+            let named = client_cert::current().is_some_and(|der| client_cert::names(&der, &user));
+            if !named || !may_login {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("certificate authentication failed for user \"{}\"", user),
+                ));
+            }
+        }
+
         // The role named after the operating-system user the kernel says
         // connected, with no password asked for. Only a caller on the unix
         // socket has such a user; over TCP it would be the caller's word, so
@@ -17171,6 +17208,11 @@ fn ensure_crypto_provider() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         // Already installed by another component is not a failure.
+        // In a `fips` build, the FIPS provider: approved suites and key
+        // exchanges only, from the validated module.
+        #[cfg(feature = "fips")]
+        let _ = rustls::crypto::default_fips_provider().install_default();
+        #[cfg(not(feature = "fips"))]
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
 }
@@ -17203,8 +17245,28 @@ fn build_tls_acceptor(tls: &TlsConfig) -> io::Result<TlsAcceptor> {
         }
     };
 
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
+    // With `--pg-client-ca`, a client may present a certificate, which is
+    // verified against it; one that presents none still connects, and
+    // authenticates as its method says. `cert` authentication then needs one.
+    let builder = rustls::ServerConfig::builder();
+    let builder = match client_cert::ca() {
+        None => builder.with_no_client_auth(),
+        Some(ca_path) => {
+            let mut roots = rustls::RootCertStore::empty();
+            let pem = std::fs::read(ca_path)?;
+            for cert in rustls_pemfile::certs(&mut BufReader::new(pem.as_slice())) {
+                roots
+                    .add(cert?)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("--pg-client-ca: {e}")))?;
+            }
+            let verifier = rustls::server::WebPkiClientVerifier::builder(StdArc::new(roots))
+                .allow_unauthenticated()
+                .build()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("--pg-client-ca: {e}")))?;
+            builder.with_client_cert_verifier(verifier)
+        }
+    };
+    let config = builder
         .with_single_cert(certs, key)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
@@ -18712,5 +18774,88 @@ mod wire_count_tests {
         let e = io::Error::new(io::ErrorKind::BrokenPipe, "gone");
         assert_eq!(malformed_message(&mut out, "Parse", e).await.kind(), io::ErrorKind::BrokenPipe);
         assert!(out.is_empty());
+    }
+}
+
+/// TLS client certificates for `cert` authentication (`AuthMethod::Cert`).
+pub mod client_cert {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    static CA: OnceLock<String> = OnceLock::new();
+    static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+    tokio::task_local! {
+        static CERT: Option<Vec<u8>>;
+    }
+
+    /// `--pg-client-ca`: the CA client certificates are verified against.
+    pub fn set_ca(path: String) {
+        let _ = CA.set(path);
+    }
+
+    pub fn ca() -> Option<&'static str> {
+        CA.get().map(String::as_str)
+    }
+
+    /// `--pg-cert-map`: lines `<sha256 fingerprint hex> <role>`.
+    pub fn load_map(path: &str) -> Result<(), String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        let mut map = HashMap::new();
+        for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            let mut w = line.split_whitespace();
+            let (Some(fp), Some(role)) = (w.next(), w.next()) else {
+                return Err(format!("{path}: expected `<fingerprint> <role>`: {line:?}"));
+            };
+            map.insert(fp.replace(':', "").to_ascii_lowercase(), role.to_string());
+        }
+        let _ = MAP.set(map);
+        Ok(())
+    }
+
+    /// Runs `f` with the session's verified client certificate.
+    pub async fn scoped<F: std::future::Future>(cert: Option<Vec<u8>>, f: F) -> F::Output {
+        CERT.scope(cert, f).await
+    }
+
+    /// The session's verified client certificate (DER), if it presented one.
+    pub fn current() -> Option<Vec<u8>> {
+        CERT.try_with(|c| c.clone()).ok().flatten()
+    }
+
+    fn fingerprint(der: &[u8]) -> String {
+        crate::core::fips::sha256(der).iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The subject's common name: the last `CN` attribute in the certificate
+    /// (the issuer's comes first in the TBS structure, the subject's after).
+    pub fn common_name(der: &[u8]) -> Option<String> {
+        const OID_CN: [u8; 5] = [0x06, 0x03, 0x55, 0x04, 0x03];
+        let mut found = None;
+        let mut i = 0;
+        while i + OID_CN.len() + 2 <= der.len() {
+            if der[i..i + OID_CN.len()] == OID_CN {
+                let at = i + OID_CN.len();
+                let tag = der[at];
+                let len = der[at + 1] as usize;
+                // UTF8String, PrintableString, IA5String; short-form lengths.
+                if matches!(tag, 0x0c | 0x13 | 0x16) && len < 0x80 && at + 2 + len <= der.len() {
+                    if let Ok(s) = std::str::from_utf8(&der[at + 2..at + 2 + len]) {
+                        found = Some(s.to_string());
+                    }
+                }
+                i = at;
+            }
+            i += 1;
+        }
+        found
+    }
+
+    /// Whether `der` names `role`: by the fingerprint map, else by its CN.
+    pub fn names(der: &[u8], role: &str) -> bool {
+        if let Some(mapped) = MAP.get().and_then(|m| m.get(&fingerprint(der))) {
+            return mapped == role;
+        }
+        common_name(der).as_deref() == Some(role)
     }
 }

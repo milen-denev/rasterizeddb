@@ -460,6 +460,18 @@ struct Args {
     #[arg(long = "pg-key", value_name = "PATH")]
     pg_key: Option<String>,
 
+    /// PEM CA certificates that client certificates are verified against.
+    /// Set, a client may log in with a certificate (`--pg-auth cert`): as
+    /// the role its subject common name names, or the role `--pg-cert-map`
+    /// gives its fingerprint.
+    #[arg(long = "pg-client-ca", value_name = "PATH")]
+    pg_client_ca: Option<String>,
+
+    /// Lines `<sha256 fingerprint hex> <role>`: which role each client
+    /// certificate logs in as under `--pg-auth cert`, ahead of its CN.
+    #[arg(long = "pg-cert-map", value_name = "PATH")]
+    pg_cert_map: Option<String>,
+
     /// How pgwire connections authenticate: trust, password, md5 or
     /// scram-sha-256 (default).
     #[arg(long = "pg-auth", default_value = "scram-sha-256")]
@@ -1586,7 +1598,24 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    // The licensed hooks, before anything can open a session.
+    // FIPS mode, before any TLS or crypto is used: the module's self-tests
+    // pass and the FIPS TLS provider is the process's, or nothing starts.
+    if rasterizeddb_core::core::fips::ENABLED {
+        if let Err(e) = rasterizeddb_core::core::fips::self_check() {
+            eprintln!("FIPS: {e}");
+            std::process::exit(2);
+        }
+        rasterizeddb_core::core::fips::install_tls_provider();
+        log::info!("FIPS 140-3 mode: cryptography through the AWS-LC FIPS module");
+    }
+
+    // The licensed hooks, before anything can open a session. The ledger
+    // guard first and always: a ledger table must not open unguarded.
+    #[cfg(feature = "enterprise")]
+    if let Err(e) = rasterizeddb_enterprise::install_always() {
+        eprintln!("enterprise hooks: {e}");
+        std::process::exit(2);
+    }
     #[cfg(feature = "enterprise")]
     if let Some(path) = &args.enterprise_config {
         if let Err(e) = rasterizeddb_enterprise::install(path) {
@@ -2321,6 +2350,15 @@ fn main() -> std::io::Result<()> {
                     PgTlsMode::Require => rasterizeddb_core::pgwire::TlsMode::Require,
                 };
 
+                if let Some(ca) = &args.pg_client_ca {
+                    rasterizeddb_core::pgwire::client_cert::set_ca(ca.clone());
+                }
+                if let Some(map) = &args.pg_cert_map {
+                    if let Err(e) = rasterizeddb_core::pgwire::client_cert::load_map(map) {
+                        eprintln!("--pg-cert-map: {e}");
+                        std::process::exit(2);
+                    }
+                }
                 let tls = rasterizeddb_core::pgwire::TlsConfig {
                     mode: tls_mode,
                     // With neither path given a self-signed certificate is
@@ -2337,6 +2375,19 @@ fn main() -> std::io::Result<()> {
                     );
                     std::process::exit(2);
                 };
+                if let Err(e) = rasterizeddb_core::core::fips::check_auth_method(method) {
+                    eprintln!("--pg-auth: {e}");
+                    std::process::exit(2);
+                }
+                if method == rasterizeddb_core::auth::AuthMethod::Cert
+                    && (args.pg_client_ca.is_none() || matches!(args.pg_tls, PgTlsMode::Disable))
+                {
+                    eprintln!(
+                        "--pg-auth cert needs TLS and --pg-client-ca: a certificate is only a \
+                         login once a CA you trust has signed it"
+                    );
+                    std::process::exit(2);
+                }
                 if method == rasterizeddb_core::auth::AuthMethod::Peer {
                     eprintln!(
                         "--pg-auth peer is not offered: over TCP the user would be the caller's \

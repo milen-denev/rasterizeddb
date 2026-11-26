@@ -49,6 +49,9 @@ pub enum QueryPurpose {
     /// `REPLICATION ...` / `SHOW REPLICATION ...` — running the cluster from
     /// SQL. Parsed and executed by [`crate::replication::sql`].
     Replication(String),
+    /// `VERIFY LEDGER`, `SHOW LEDGER`, `ALTER LEDGER TABLE`, `ACKNOWLEDGE
+    /// LEDGER ROLLBACK` — ledger tables and vaults (`ledger_hooks`).
+    Ledger(String),
     /// `STORAGE ...` / `SHOW STORAGE ...` — the directories this database may
     /// write into, and where each table's files are. Parsed and executed by
     /// [`crate::core::storage::sql`].
@@ -533,6 +536,11 @@ fn recognize_surface_statement(query_trimmed: &str) -> Option<QueryPurpose> {
         return Some(Replication(query_trimmed.to_string()));
     }
 
+    // `LEDGER` is no statement keyword anywhere else either.
+    if crate::core::ledger_hooks::is_ledger_statement(query_trimmed) {
+        return Some(Ledger(query_trimmed.to_string()));
+    }
+
     // Alongside the two above and for the same reason: `STORAGE` is not a
     // statement keyword anywhere else, and `SHOW STORAGE` must not be read as a
     // `SHOW` of a thing called `STORAGE`.
@@ -632,7 +640,11 @@ fn recognize_core_statement(query_trimmed: &str, query_bytes: &[u8]) -> Option<Q
         Some(CreateIndex(query_trimmed.to_string()))
     } else if simd_compare_strings(query_bytes, b"DROP INDEX", &StartsWith) {
         Some(DropIndex(query_trimmed.to_string()))
-    } else if simd_compare_strings(query_bytes, b"CREATE TABLE", &StartsWith) {
+    } else if simd_compare_strings(query_bytes, b"CREATE TABLE", &StartsWith)
+        || crate::core::rql::ledger_ddl::split(query_trimmed).is_some()
+    {
+        // `CREATE LEDGER TABLE` and `CREATE VAULT` too: the executor turns
+        // them into the plain create they stand for (`ledger_ddl`).
         Some(CreateTable(query_trimmed.to_string()))
     } else if simd_compare_strings(query_bytes, b"DROP TABLE", &StartsWith) {
         Some(DropTable(query_trimmed.to_string()))

@@ -115,6 +115,9 @@ pub fn statement_bounded(sql: &str, max_chars: usize) -> String {
 /// rather than in the store's module because that module is behind a feature
 /// and this must not be.
 fn kv_command(sql: &str) -> Option<String> {
+    if let Some(kept) = vault_command(sql) {
+        return Some(kept);
+    }
     let t = sql.trim_start();
     let b = t.as_bytes();
     if b.len() < 3 || !b[..2].eq_ignore_ascii_case(b"KV") || !b[2].is_ascii_whitespace() {
@@ -129,6 +132,23 @@ fn kv_command(sql: &str) -> Option<String> {
     } else {
         format!("KV {command}")
     })
+}
+
+/// A `VAULT …` statement (secret vaults, `ledger_hooks`) reduced to the
+/// vault and its verb: `VAULT app_secrets SET <redacted>`. Every argument a
+/// vault statement takes may be a secret or a plaintext (`SET`'s value,
+/// `ENCRYPT`'s and `DECRYPT`'s input), so none is kept. `None` for anything
+/// else.
+fn vault_command(sql: &str) -> Option<String> {
+    let mut words = sql.trim_start().split_whitespace();
+    let first = words.next()?;
+    if !first.eq_ignore_ascii_case("VAULT") {
+        return None;
+    }
+    let vault = words.next().map(|w| w.trim_end_matches(';')).unwrap_or("");
+    let verb = words.next().map(|w| w.trim_end_matches(';')).unwrap_or("");
+    let more = words.next().is_some();
+    Some(format!("VAULT {vault} {verb}{}", if more { " <redacted>" } else { "" }).trim_end().to_string())
 }
 
 /// `text` kept to its first `max_chars` characters, `…` marking a cut.
@@ -314,6 +334,15 @@ const fn is_ident_byte(b: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_vault_statement_keeps_only_its_vault_and_verb() {
+        assert_eq!(statement("VAULT app SET SECRET 'db' = 'hunter2'"), "VAULT app SET <redacted>");
+        assert_eq!(statement("vault app ENCRYPT KEY 'k' VALUE 'plain'"), "VAULT app ENCRYPT <redacted>");
+        assert_eq!(statement("VAULT app LIST"), "VAULT app LIST");
+        assert!(!statement_bounded("VAULT app DECRYPT KEY 'k' VALUE 'x'", 8).contains('x'));
+    }
+
     use super::*;
 
     #[test]

@@ -26,15 +26,12 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hmac::{Hmac, KeyInit, Mac};
 use parking_lot::Mutex;
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use super::timeutil;
 
-type HmacSha256 = Hmac<Sha256>;
 
 /// Value that tells S3 to accept a body it has not hashed.
 ///
@@ -336,6 +333,25 @@ impl S3Client {
             .unwrap_or_default()
             .trim_matches('"')
             .to_string())
+    }
+
+    /// Uploads a whole object under S3 Object Lock in COMPLIANCE mode until
+    /// `retain_until` (RFC 3339, UTC): no one, the bucket's owner included,
+    /// can overwrite or delete that version before then. The bucket must
+    /// have Object Lock enabled, and S3 requires an integrity checksum on
+    /// such a PUT, so the body's SHA-256 is sent. Returns the server's
+    /// `Date` header (an outside clock, which ledger tables use as a witness).
+    pub async fn put_object_locked(&self, key: &str, body: &[u8], retain_until: &str) -> io::Result<Option<String>> {
+        use base64::Engine as _;
+        let checksum = base64::engine::general_purpose::STANDARD.encode(crate::core::fips::sha256(body));
+        let headers = [
+            ("x-amz-object-lock-mode", "COMPLIANCE"),
+            ("x-amz-object-lock-retain-until-date", retain_until),
+            ("x-amz-checksum-sha256", checksum.as_str()),
+        ];
+        let response = self.send("PUT", key, &[], &headers, body, None).await?;
+        expect_ok(&response, "PUT", key)?;
+        Ok(response.header("date").map(|d| d.to_string()))
     }
 
     /// Fetches a whole object.
@@ -1034,7 +1050,7 @@ impl S3Client {
             "AWS4-HMAC-SHA256\n{}\n{}\n{}",
             amz_date,
             scope,
-            hex(&Sha256::digest(canonical.as_bytes()))
+            hex(&crate::core::fips::sha256(canonical.as_bytes()))
         );
 
         let signature = hex(&hmac(&self.signing_key(&date), string_to_sign.as_bytes()));
@@ -1403,10 +1419,9 @@ fn truncate(text: &str, max: usize) -> &str {
     }
 }
 
+// Through `core::fips`: the AWS-LC FIPS module in a `fips` build.
 fn hmac(key: &[u8], message: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(message);
-    mac.finalize().into_bytes().into()
+    crate::core::fips::hmac_sha256(key, message)
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -1477,6 +1477,8 @@ impl TransactionManager {
     /// no snapshot will ever see them.
     pub fn abort(&self, tx: TxId) {
         self.status.record(tx, TxOutcome::Aborted);
+        // A ledger table's rows this transaction wrote are never chained.
+        crate::core::ledger_hooks::discard(tx);
         self.retire_family(tx);
         self.signal_ended();
         self.maybe_settle();

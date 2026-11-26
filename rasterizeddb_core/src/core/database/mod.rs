@@ -471,6 +471,9 @@ pub(crate) const RENAMED_SUFFIXES: &[&str] = &[
     // Compression dictionaries (`core::compression::sidecar`): a value
     // compressed with one cannot be read without it.
     "_schema_ZD.db",
+    // A ledger table's or vault's policy records (`ledger_hooks::policy_sidecar`):
+    // a table that says it is one refuses to open without them.
+    "_schema_LEDGER.db",
     // Derived: the filter rebuilds from the pointers and the sequence from
     // `load_id_sequence`, so a failure to copy either is recoverable. They are
     // copied anyway because copying is cheaper than rebuilding.
@@ -1958,6 +1961,17 @@ impl Database {
                 );
                 continue;
             }
+            // A ledger table or vault this process cannot guard stays closed:
+            // opened, its writes would run unguarded (`ledger_hooks`). One
+            // that opens has its chain read first, so the trusted clock is
+            // past every stamp the chain holds before a new row is stamped.
+            if let Err(e) = crate::core::ledger_hooks::check_open(&table.schema) {
+                error!("table '{}' is left unopened: {}", table_name, e);
+                continue;
+            }
+            if table.schema.special.is_special() && !in_memory {
+                crate::core::ledger_hooks::database_opened(location);
+            }
             // A seventeen-byte NUMERIC field in a directory without its
             // fence (a point-in-time restore brings the field records and not
             // the flag): fenced before anything touches the table, so an
@@ -2325,10 +2339,39 @@ impl Database {
                 .collect();
             crate::core::shard::raft_apply::propose_commit(self, &members, tx)?;
         }
+        // A ledger table's chain entry, ahead of the commit and of the
+        // replication record: on failure nothing has been committed.
+        self.ledger_prepare(tx)?;
         // The replication record, ahead of the commit: on failure nothing
         // has been committed, and the caller aborts.
         self.prepare_replication(tx, &mut family)?;
         Ok(self.commit_family(tx, family))
+    }
+
+    /// Where this database's ledger lives, as the ledger hooks key it: its
+    /// directory, or its id for one in memory.
+    pub fn ledger_store(&self) -> String {
+        match self.location.as_deref() {
+            Some(location) => location.to_string(),
+            None => format!("memory:{}", self.id),
+        }
+    }
+
+    /// Chains `tx`'s family's ledger rows before it commits
+    /// (`ledger_hooks::prepare_commit`). Nothing without installed hooks,
+    /// and nothing for a family that wrote no ledger table.
+    fn ledger_prepare(&self, tx: crate::core::mvcc::TxId) -> std::io::Result<()> {
+        if !crate::core::ledger_hooks::installed() {
+            return Ok(());
+        }
+        use crate::core::mvcc::TxOutcome;
+        let members: Vec<(crate::core::mvcc::TxId, bool)> = self
+            .transactions
+            .family_of(tx)
+            .into_iter()
+            .map(|id| (id, self.transactions.outcome(id) != TxOutcome::Aborted))
+            .collect();
+        crate::core::ledger_hooks::prepare_commit(&self.ledger_store(), &members).map_err(std::io::Error::other)
     }
 
     /// Commits a transaction with nothing to make durable first.
@@ -2342,6 +2385,12 @@ impl Database {
         // asking afterwards would depend on the manager keeping its parent map
         // past the commit, which it happens to do and is not obliged to.
         let mut family = self.family_of(tx);
+        // A ledger write should not reach here (it commits through
+        // `commit_written_transaction`); if one does, its entry is still
+        // written, and a failure said as loudly as a replication one.
+        if let Err(e) = self.ledger_prepare(tx) {
+            error!("A transaction committed without its ledger entry ({e}); VERIFY LEDGER will report its rows");
+        }
         if let Err(e) = self.prepare_replication(tx, &mut family) {
             self.replication.note_capture_failure(format!(
                 "A transaction committed but could not be written to the replication log ({}); \
@@ -2680,6 +2729,14 @@ impl Database {
         // map is touched: taking the entry out and putting it back would let
         // a concurrent statement see no table, or a concurrent CREATE of the
         // same name slip in between.
+        // A ledger table or vault is dropped only when its policy admits it
+        // (`ledger_hooks`: its drop-idle time has passed). A JSON shadow
+        // table is its parent's, dropped with it once the parent was admitted.
+        if depth == 0 {
+            if let Some(relation) = self.relation(table_name) {
+                crate::core::ledger_hooks::admit_io(relation.schema(), crate::core::ledger_hooks::WriteKind::Drop)?;
+            }
+        }
         match self.relation(table_name) {
             Some(Relation::Partitioned(_)) => return self.drop_partitioned(table_name).await,
             Some(Relation::Plain(table)) => {
@@ -3050,6 +3107,9 @@ impl Database {
             .or_else(|| SchemaChanged::unless_internal(&self.schema_generation, new_name));
         if old_name == new_name {
             return Ok(());
+        }
+        if let Some(relation) = self.relation(old_name) {
+            crate::core::ledger_hooks::admit_io(relation.schema(), crate::core::ledger_hooks::WriteKind::Alter("RENAME"))?;
         }
         // §7: under ACCESS EXCLUSIVE on both names, taken in name order by
         // the statement before anything here ran.
@@ -4439,6 +4499,8 @@ impl Database {
         {
             self.require_composite_foreign_keys()?;
         }
+        // A ledger table or vault: the directory is fenced first.
+        self.require_special(create_table.special)?;
         let table_name = &create_table.table_name;
         let columns = std::mem::take(&mut create_table.columns);
 
@@ -4597,6 +4659,22 @@ impl Database {
     pub(crate) fn require_composite_foreign_keys(&self) -> io::Result<()> {
         match self.location.as_deref() {
             Some(root) => incompat::require(std::path::Path::new(root), incompat::COMPOSITE_FOREIGN_KEY_V1),
+            None => Ok(()),
+        }
+    }
+
+    /// Marks the directory as holding a ledger table or vault before the
+    /// first one's files exist (`incompat::LEDGER_V1`/`VAULT_V1`), so a build
+    /// without the guard refuses the directory.
+    pub(crate) fn require_special(&self, kind: crate::core::row::schema::SpecialTable) -> io::Result<()> {
+        use crate::core::row::schema::SpecialTable;
+        let flag = match kind {
+            SpecialTable::None => return Ok(()),
+            SpecialTable::Ledger => incompat::LEDGER_V1,
+            SpecialTable::Vault => incompat::VAULT_V1,
+        };
+        match self.location.as_deref() {
+            Some(root) => incompat::require(std::path::Path::new(root), flag),
             None => Ok(()),
         }
     }
@@ -5282,11 +5360,27 @@ async fn write_schema_sidecars(
         }
         schema.json_columns.push(entry.clone());
     }
+    // A ledger table's or vault's policy, with the other records.
+    if ct.special.is_special() {
+        if ct.ledger_policy.is_empty() {
+            return Err(io::Error::other(format!("{}: a special table needs its policy record", schema.name)));
+        }
+        crate::core::ledger_hooks::policy_sidecar::stage(&*io_schema, &mut writes, &ct.ledger_policy);
+    }
     // Every record above as one transaction, one log sync: after a cut all
     // of them or none (`torn_tail::SidecarWrites`).
     if let Err(e) = writes.commit(&*io_schema).await {
         error!("Failed to persist the constraints of {}: {}", schema.name, e);
         return Err(e);
+    }
+    // Then the header says what kind of table this is. Still before the
+    // catalogue row that commits the CREATE: a cut before it leaves files no
+    // catalogue names, and one after leaves a header whose policy is on
+    // disk. Never a ledger table that opens as a plain one.
+    if ct.special.is_special() {
+        schema.special = ct.special;
+        schema.ledger_policy = ct.ledger_policy.clone();
+        schema.rewrite_header(io_schema.clone()).await?;
     }
     Ok(())
 }

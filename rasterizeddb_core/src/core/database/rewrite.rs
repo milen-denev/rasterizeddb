@@ -453,7 +453,15 @@ impl Database {
         self.reload_plain_with_instance(table_name, |old| ungated(Ungated::SchemaRewrite, async move {
             // After the lock and the retirement: every committed write is in
             // the files, and nothing writes them now.
-            let (create, plan) = read(old).await?;
+            // A ledger table or vault stays one: the rewrite's definition is
+            // built from the columns, and would otherwise create a plain
+            // table under the guarded one's name.
+            let kept = (old.schema.special, old.schema.ledger_policy.clone());
+            let (mut create, plan) = read(old).await?;
+            if kept.0.is_special() {
+                create.special = kept.0;
+                create.ledger_policy = kept.1;
+            }
             if create.table_name != table_name {
                 return Err(format!(
                     "internal error: a rewrite of \"{table_name}\" defined \"{}\"",

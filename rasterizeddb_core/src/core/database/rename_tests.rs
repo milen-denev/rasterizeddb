@@ -30,6 +30,8 @@ async fn create(db: &Database, name: &str) {
         primary_key: None,
         if_not_exists: false,
         is_immutable: false,
+        special: crate::core::row::schema::SpecialTable::None,
+        ledger_policy: Vec::new(),
     };
     db.add_table(create).await.expect("create table");
 }
@@ -474,6 +476,8 @@ async fn dropping_a_table_takes_its_json_shadow_tables_with_it() {
         primary_key: None,
         if_not_exists: false,
         is_immutable: false,
+        special: crate::core::row::schema::SpecialTable::None,
+        ledger_policy: Vec::new(),
     };
     create_owner.json_columns.push(json_map::JsonColumn {
         column: "doc".to_string(),
@@ -754,6 +758,8 @@ async fn a_rename_whose_intent_stays_holds_both_names() {
         primary_key: None,
         if_not_exists: false,
         is_immutable: false,
+        special: crate::core::row::schema::SpecialTable::None,
+        ledger_policy: Vec::new(),
     };
     assert!(db.add_table(create_old).await.is_err(), "a table was created under a name the kept intent names");
     // The next open finishes the rename and frees the name.

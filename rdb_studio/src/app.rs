@@ -192,6 +192,9 @@ pub struct Studio {
 
     // --- shards
     pub shards: Option<ShardsSnapshot>,
+    // --- ledger (enterprise)
+    #[cfg(feature = "enterprise")]
+    pub ledger: Option<rdb_studio_enterprise::LedgerPage>,
     /// The last `SHOW REBALANCE PLAN` on the shards page, or why it failed.
     pub rebalance_plan: Option<Result<Vec<RebalanceStep>, String>>,
 
@@ -267,10 +270,26 @@ pub enum Tab {
     Keys,
     Roles,
     Config,
+    /// Ledger tables and secret vaults (the enterprise build).
+    #[cfg(feature = "enterprise")]
+    Ledger,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 17] = [
+    #[cfg(feature = "enterprise")]
+    pub const ALL: [Tab; 18] = {
+        let mut all = [Tab::Ledger; 18];
+        let mut i = 0;
+        while i < 17 {
+            all[i] = Self::GPL[i];
+            i += 1;
+        }
+        all
+    };
+    #[cfg(not(feature = "enterprise"))]
+    pub const ALL: [Tab; 17] = Self::GPL;
+
+    const GPL: [Tab; 17] = [
         Tab::Dashboard,
         Tab::Overview,
         Tab::Tables,
@@ -324,6 +343,8 @@ impl Tab {
             Tab::Keys => "KEYS",
             Tab::Roles => "ROLES",
             Tab::Config => "CONFIG",
+            #[cfg(feature = "enterprise")]
+            Tab::Ledger => "LEDGER",
         }
     }
 }
@@ -904,6 +925,19 @@ pub enum Message {
 
     // --- shards
     ReloadShards,
+    // --- ledger (enterprise)
+    #[cfg(feature = "enterprise")]
+    ReloadLedger,
+    #[cfg(feature = "enterprise")]
+    LedgerLoaded(Box<rdb_studio_enterprise::LedgerPage>),
+    #[cfg(feature = "enterprise")]
+    VerifyLedger,
+    #[cfg(feature = "enterprise")]
+    LedgerVerified(Vec<String>),
+    #[cfg(feature = "enterprise")]
+    LedgerAudit(String),
+    #[cfg(feature = "enterprise")]
+    LedgerAuditLoaded(String, Vec<String>),
     ShardsLoaded(Box<ShardsSnapshot>),
     /// Asks the gateway for the planner's moves.
     PlanRebalance,
@@ -1348,6 +1382,8 @@ impl Studio {
             merge_policy: MergePolicy::Fail,
             merge_allow_drop: false,
             shards: None,
+            #[cfg(feature = "enterprise")]
+            ledger: None,
             rebalance_plan: None,
             replication: None,
             peer_name: String::new(),
@@ -1758,6 +1794,8 @@ impl Studio {
                     Tab::Replication => self.load_replication(),
                     // A map changes when a shard is added or a range moves.
                     Tab::Shards => self.load_shards(),
+                    #[cfg(feature = "enterprise")]
+                    Tab::Ledger => self.load_ledger(),
                     // And again: free space is the figure this page exists to
                     // report, and a cached one is worse than useless.
                     Tab::Storage => self.load_storage(),
@@ -2399,6 +2437,54 @@ impl Studio {
             }
 
             Message::ReloadShards => self.load_shards(),
+            #[cfg(feature = "enterprise")]
+            Message::ReloadLedger => self.load_ledger(),
+            #[cfg(feature = "enterprise")]
+            Message::LedgerLoaded(page) => {
+                self.ledger = Some(*page);
+                Task::none()
+            }
+            #[cfg(feature = "enterprise")]
+            Message::VerifyLedger => {
+                let Some(session) = self.session.clone() else { return Task::none() };
+                Task::perform(
+                    async move {
+                        match session.query(rdb_studio_enterprise::VERIFY_SQL).await {
+                            Ok(grid) => first_column(&grid),
+                            Err(e) => vec![format!("UNKNOWN   {e}")],
+                        }
+                    },
+                    Message::LedgerVerified,
+                )
+            }
+            #[cfg(feature = "enterprise")]
+            Message::LedgerVerified(lines) => {
+                if let Some(page) = self.ledger.as_mut() {
+                    page.verify = Some(lines);
+                }
+                Task::none()
+            }
+            #[cfg(feature = "enterprise")]
+            Message::LedgerAudit(vault) => {
+                let Some(session) = self.session.clone() else { return Task::none() };
+                Task::perform(
+                    async move {
+                        let lines = match session.query(&rdb_studio_enterprise::audit_sql(&vault)).await {
+                            Ok(grid) => first_column(&grid),
+                            Err(e) => vec![e],
+                        };
+                        (vault, lines)
+                    },
+                    |(vault, lines)| Message::LedgerAuditLoaded(vault, lines),
+                )
+            }
+            #[cfg(feature = "enterprise")]
+            Message::LedgerAuditLoaded(vault, lines) => {
+                if let Some(v) = self.ledger.as_mut().and_then(|p| p.vaults.iter_mut().find(|v| v.name == vault)) {
+                    v.audit = Some(lines);
+                }
+                Task::none()
+            }
             Message::ShardsLoaded(snapshot) => {
                 self.shards = Some(*snapshot);
                 Task::none()
@@ -3538,6 +3624,31 @@ impl Studio {
     /// Each statement a node does not answer leaves its part empty: a shard
     /// refuses `SHOW GATEWAY`, and a plain node answers `SHOW SHARDS` with no
     /// rows.
+    #[cfg(feature = "enterprise")]
+    fn load_ledger(&self) -> Task<Message> {
+        let Some(session) = self.session.clone() else { return Task::none() };
+        Task::perform(
+            async move {
+                let mut page = rdb_studio_enterprise::LedgerPage::default();
+                match session.query(rdb_studio_enterprise::SHOW_SQL).await {
+                    Err(e) => page.error = Some(e),
+                    Ok(grid) => {
+                        page.show = first_column(&grid);
+                        for name in rdb_studio_enterprise::LedgerPage::vault_names(&page.show) {
+                            let secrets = match session.query(&rdb_studio_enterprise::list_sql(&name)).await {
+                                Ok(grid) => first_column(&grid),
+                                Err(e) => vec![e],
+                            };
+                            page.vaults.push(rdb_studio_enterprise::VaultView { name, secrets, audit: None });
+                        }
+                    }
+                }
+                Box::new(page)
+            },
+            Message::LedgerLoaded,
+        )
+    }
+
     fn load_shards(&self) -> Task<Message> {
         let Some(session) = self.session.clone() else { return Task::none() };
         let Some(shards_sql) = dialect::shards_sql(session.flavor) else {
@@ -5742,4 +5853,11 @@ mod tests {
         assert!(NewColumn::key(Flavor::Postgres).primary_key);
         assert!(!NewColumn::key(Flavor::Postgres).nullable);
     }
+}
+
+/// Each row's first cell, as text: the answer of a statement that returns
+/// lines (`SHOW LEDGER`, `VERIFY LEDGER`, `VAULT … LIST`).
+#[cfg(feature = "enterprise")]
+fn first_column(grid: &Grid) -> Vec<String> {
+    grid.rows.iter().map(|r| r.first().cloned().flatten().unwrap_or_default()).collect()
 }

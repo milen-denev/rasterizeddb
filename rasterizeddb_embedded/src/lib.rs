@@ -762,6 +762,13 @@ fn engine_thread(
             for (key, value) in &deferred.before_open {
                 set_config_at_start(None, key, value).await.map_err(|e| refused(key, value, e))?;
             }
+            // The licensed guard before the first catalogue: a ledger table
+            // must not open unguarded. One engine per process, but a second
+            // open after a close finds it installed, which is fine.
+            #[cfg(feature = "enterprise")]
+            if !rasterizeddb_core::core::ledger_hooks::installed() {
+                rasterizeddb_enterprise::install_always().map_err(io::Error::other)?;
+            }
             let catalog = DatabaseCatalog::open(root.as_deref(), DEFAULT_DATABASE_NAME)
                 .await
                 .map_err(|e| io::Error::other(format!("could not open the database: {e}")))?;

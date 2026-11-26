@@ -14,11 +14,9 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use subtle::ConstantTimeEq;
 
-type HmacSha256 = Hmac<Sha256>;
 
 /// Iteration count for new verifiers. PostgreSQL's own default.
 pub const SCRAM_DEFAULT_ITERATIONS: u32 = 4096;
@@ -43,6 +41,12 @@ pub enum AuthMethod {
     /// socket, where that answer comes from the kernel rather than from the
     /// caller. A password, if a role has one, is stored as for SCRAM.
     Peer,
+    /// The caller is whoever its TLS client certificate says, verified
+    /// against `--pg-client-ca`: a role may log in without a password if its
+    /// name is the certificate's subject common name, or the role
+    /// `--pg-cert-map` gives the certificate's SHA-256 fingerprint. Only over
+    /// TLS, and only with a certificate the CA signed.
+    Cert,
 }
 
 impl AuthMethod {
@@ -54,6 +58,7 @@ impl AuthMethod {
                 "md5" => AuthMethod::Md5,
                 "scram" | "scramsha256" => AuthMethod::ScramSha256,
                 "peer" => AuthMethod::Peer,
+                "cert" | "certificate" => AuthMethod::Cert,
                 _ => return None,
             },
         )
@@ -66,6 +71,7 @@ impl AuthMethod {
             AuthMethod::Md5 => "md5",
             AuthMethod::ScramSha256 => "scram-sha-256",
             AuthMethod::Peer => "peer",
+            AuthMethod::Cert => "cert",
         }
     }
 }
@@ -139,22 +145,19 @@ fn parse_scram_verifier(rest: &str) -> Option<Verifier> {
     })
 }
 
+// Through `core::fips`: the AWS-LC FIPS module in a `fips` build.
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
+    crate::core::fips::hmac_sha256(key, data).to_vec()
 }
 
 fn sha256(data: &[u8]) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hasher.finalize().to_vec()
+    crate::core::fips::sha256(data).to_vec()
 }
 
 /// Derives the SCRAM keys from a password and salt.
 pub fn scram_keys(password: &str, salt: &[u8], iterations: u32) -> (Vec<u8>, Vec<u8>) {
     let mut salted = [0u8; 32];
-    pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, iterations, &mut salted);
+    crate::core::fips::pbkdf2_sha256(password.as_bytes(), salt, iterations, &mut salted);
 
     let client_key = hmac(&salted, b"Client Key");
     let stored_key = sha256(&client_key);
@@ -549,7 +552,7 @@ impl ScramClient {
         }
 
         let mut salted = [0u8; 32];
-        pbkdf2::pbkdf2_hmac::<Sha256>(self.password.as_bytes(), &salt, iterations, &mut salted);
+        crate::core::fips::pbkdf2_sha256(self.password.as_bytes(), &salt, iterations, &mut salted);
         let client_key = hmac(&salted, b"Client Key");
         let stored_key = sha256(&client_key);
         let server_key = hmac(&salted, b"Server Key");
@@ -2523,7 +2526,7 @@ mod tests {
         nonce: &str,
     ) -> String {
         let mut salted = [0u8; 32];
-        pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, iterations, &mut salted);
+        crate::core::fips::pbkdf2_sha256(password.as_bytes(), salt, iterations, &mut salted);
         let client_key = hmac(&salted, b"Client Key");
         let stored_key = sha256(&client_key);
 

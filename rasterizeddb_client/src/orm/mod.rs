@@ -223,6 +223,11 @@ pub trait Model: FromRow + Sized {
     /// `partition_by` column, else global). Plain data: hashing happens only
     /// in a `shard::Router` (feature `sharding`).
     const SHARD: Sharding = Sharding::Global;
+    /// The model is a ledger table (`#[rdb(ledger = "7 years")]`): created
+    /// with `CREATE LEDGER TABLE`, and never updated, upserted, restored or
+    /// dropped through this client, which refuses those before sending.
+    /// Plain data; the server's guard is what holds (docs/ledger-and-vault-plan.md).
+    const LEDGER: Option<LedgerSpec> = None;
 
     /// This row's shard key value: `None` for a model that is not sharded.
     /// Never hashed here.
@@ -645,6 +650,7 @@ pub fn upsert_sql<M: Model>(m: &M) -> Result<String> {
 /// `#[rdb(version)]` column, `version = version + 1 … AND version = <the
 /// struct's>`.
 pub fn update_sql<M: Model>(m: &M) -> Result<String> {
+    refuse_on_ledger::<M>("UPDATE")?;
     let mut sets = Vec::new();
     for (i, column) in M::COLUMNS.iter().enumerate() {
         if column.primary_key || column.serial {
@@ -715,6 +721,7 @@ pub fn force_delete_sql<M: Model>(m: &M) -> Result<String> {
 /// `UPDATE t SET deleted_at = NULL … WHERE <key> [AND version = …]
 /// RETURNING …`: what [`ModelExt::restore`] sends.
 pub fn restore_sql<M: Model>(m: &M) -> Result<String> {
+    refuse_on_ledger::<M>("restore")?;
     let column = soft_delete_column::<M>().ok_or_else(|| {
         Error::Unsupported(format!(
             "{} has no #[rdb(soft_delete)] column: there is nothing to restore",
@@ -830,6 +837,53 @@ pub fn create_table_sql<M: Model>() -> Result<Vec<String>> {
     TableSchema::of::<M>().create_sql_with(&Storage::of::<M>())
 }
 
+/// A ledger table's policy as a model declares it (`#[rdb(ledger = …,
+/// ledger_drop_idle = …, ledger_anchor = …)]`): the clauses its
+/// `CREATE LEDGER TABLE` is written with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerSpec {
+    /// `NO DELETE UNTIL <retention> AFTER INSERT`, e.g. `"7 years"`.
+    pub retention: &'static str,
+    /// `NO DROP UNTIL <drop_idle> IDLE`.
+    pub drop_idle: Option<&'static str>,
+    /// `ANCHOR TO '<sink>', …`.
+    pub anchors: &'static [&'static str],
+}
+
+impl LedgerSpec {
+    /// The clauses after the column list.
+    pub fn clauses(&self) -> Result<String> {
+        let unit = |v: &str| -> Result<()> {
+            let ok = v.split_whitespace().count() == 2
+                && v.split_whitespace().next().is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
+                && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b' ');
+            if ok { Ok(()) } else { Err(Error::Unsupported(format!("{v:?} is not a duration like \"7 years\""))) }
+        };
+        unit(self.retention)?;
+        let mut c = format!("NO DELETE UNTIL {} AFTER INSERT", self.retention);
+        if let Some(d) = self.drop_idle {
+            unit(d)?;
+            c.push_str(&format!(" NO DROP UNTIL {d} IDLE"));
+        }
+        if !self.anchors.is_empty() {
+            let quoted: Vec<String> = self.anchors.iter().map(|a| format!("'{}'", a.replace('\'', "''"))).collect();
+            c.push_str(&format!(" ANCHOR TO {}", quoted.join(", ")));
+        }
+        Ok(c)
+    }
+}
+
+/// Refuses `what` on a ledger model before anything is sent.
+pub(crate) fn refuse_on_ledger<M: Model>(what: &str) -> Result<()> {
+    if M::LEDGER.is_some() {
+        return Err(Error::Unsupported(format!(
+            "{} is a ledger table: {what} is not allowed on it; it is append-only",
+            M::TABLE
+        )));
+    }
+    Ok(())
+}
+
 /// A model's table as data: what a [`Migrator`] keeps for each model it
 /// syncs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -851,6 +905,7 @@ pub struct TableSchema {
 pub(crate) struct Storage {
     pub(crate) row: Option<&'static str>,
     pub(crate) columns: &'static [(&'static str, &'static str)],
+    pub(crate) ledger: Option<LedgerSpec>,
 }
 
 impl Storage {
@@ -858,6 +913,7 @@ impl Storage {
         Storage {
             row: M::ROW_COMPRESSION,
             columns: M::COLUMN_COMPRESSION,
+            ledger: M::LEDGER,
         }
     }
 
@@ -992,10 +1048,21 @@ impl TableSchema {
             lines.push(format!("PRIMARY KEY ({})", key.join(", ")));
         }
         let mut create = format!(
-            "CREATE TABLE IF NOT EXISTS {} ({})",
+            "CREATE {}TABLE IF NOT EXISTS {} ({})",
+            if storage.ledger.is_some() { "LEDGER " } else { "" },
             ident(self.table)?,
             lines.join(", ")
         );
+        if let Some(ledger) = &storage.ledger {
+            if self.partition.is_some() || storage.row.is_some() {
+                return Err(Error::Unsupported(format!(
+                    "{} is a ledger table: partitioning and row compression are not supported on one yet",
+                    self.table
+                )));
+            }
+            create.push(' ');
+            create.push_str(&ledger.clauses()?);
+        }
         if let Some(partition) = &self.partition {
             for column in partition.columns {
                 if !self.columns.iter().any(|c| c.name == *column) {
@@ -1069,7 +1136,8 @@ pub trait ModelExt: Executor {
 
     /// `DROP TABLE IF EXISTS`.
     fn drop_table<M: Model>(&self) -> impl Future<Output = Result<()>> + Send {
-        let sql = ident(M::TABLE).map(|t| format!("DROP TABLE IF EXISTS {t}"));
+        let sql = refuse_on_ledger::<M>("DROP TABLE through the ORM")
+            .and_then(|()| ident(M::TABLE).map(|t| format!("DROP TABLE IF EXISTS {t}")));
         async move { self.run(&sql?).await.map(drop) }
     }
 

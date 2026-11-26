@@ -4,6 +4,7 @@ pub(crate) mod no_from;
 
 // Create Table
 pub mod lexer_ct;
+pub mod ledger_ddl;
 
 /// Drop Table
 pub mod lexer_dt;

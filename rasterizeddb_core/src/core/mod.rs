@@ -16,6 +16,8 @@ pub mod shard_hooks;
 /// The GPL hook traits licensed tenancy and placement plug into; their
 /// defaults are today's behaviour (sharding-plan.md §10).
 pub mod policy_hooks;
+pub mod ledger_hooks;
+pub mod fips;
 /// A shard's side of sharding; dormant until `--role shard`.
 #[cfg(feature = "sharding")]
 pub mod shard;

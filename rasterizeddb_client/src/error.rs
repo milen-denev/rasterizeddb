@@ -166,6 +166,20 @@ impl Error {
         matches!(self, Error::Transport(RastcpError::MessageTooLarge { .. }))
     }
 
+    /// Whether a ledger table or vault refused the statement because a
+    /// row is still within its retention, a legal hold stands, or a vault
+    /// secret is disabled, expired or purge-protected (SQLSTATE 55000).
+    pub fn is_ledger_locked(&self) -> bool {
+        self.sqlstate() == Some("55000")
+    }
+
+    /// Whether a ledger table, a vault, or the ledger's chain failed its own
+    /// checks: a policy, a keyring or a sealed value that does not verify
+    /// (SQLSTATE XX001, `data_corrupted`). Not a statement to retry.
+    pub fn is_ledger_tampered(&self) -> bool {
+        self.sqlstate() == Some("XX001")
+    }
+
     /// Whether the connection closed or broke under the statement, rather
     /// than timing out or being refused: the server restarted or dropped
     /// it, or another request's failure ended the connection they shared.

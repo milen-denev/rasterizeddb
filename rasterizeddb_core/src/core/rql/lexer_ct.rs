@@ -48,6 +48,14 @@ pub struct CreateTable {
     pub table_name: String,
     pub columns: Vec<CreateColumnData>,
     pub is_immutable: bool,
+    /// `CREATE LEDGER TABLE` / `CREATE VAULT`: the licensed kind the new
+    /// table's header records (`ledger_hooks`). Plain for every other
+    /// `CREATE TABLE`.
+    pub special: crate::core::row::schema::SpecialTable,
+    /// The policy sidecar's first record for a special table, built by the
+    /// installed ledger hooks from the statement's ledger clauses
+    /// (`ledger_hooks::LedgerHooks::create_policy`). Empty for a plain table.
+    pub ledger_policy: Vec<u8>,
     /// Foreign keys declared in the body, either as table-level constraints or
     /// inline on a column.
     pub foreign_keys: Vec<crate::core::rql::foreign_key::ForeignKey>,
@@ -795,6 +803,8 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
             table_name,
             columns,
             is_immutable: false,
+            special: crate::core::row::schema::SpecialTable::None,
+            ledger_policy: Vec::new(),
             foreign_keys,
             defaults,
             json_columns,

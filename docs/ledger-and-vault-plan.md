@@ -31,7 +31,8 @@ Both are **dual-licensed** and live in the licensed crates
 | Q3 | Encryption | Column-level AEAD (AES-256-GCM, hardware AES via AES-NI or ARMv8-CE). Key providers: `file` (dev/test only), `pkcs11` (HSM, cloud HSM, TPM 2.0 through tpm2-pkcs11). KMS and Vault-transit come later |
 | Q4 | Multi-primary | A ledger table or vault has one writer origin. Replicas apply the origin's ledger metadata and verify the chain as they go |
 | Q5 | Release | 1.1.0, enterprise build only |
-| Q6 | Certificate login (mTLS) | GPL core, as part of the authentication floor like R0. Not licensed. **To confirm** |
+| Q6 | Certificate login (mTLS) | GPL core, as part of the authentication floor like R0. Not licensed. **Confirmed by the owner 2026-11-26** |
+| Q7 | Post-quantum | An option (feature `pqc`, in the enterprise default): hybrid ML-KEM-768 + X25519 key wrapping. AES-256 and SHA-256 already keep a ~128-bit margin against Grover's search |
 
 ## 2. Crates and features
 
@@ -192,6 +193,62 @@ What that requires:
 
 **AES** runs on AES-NI or ARMv8 Crypto Extensions (via `aes-gcm`).
 
+## 4.5 Post-quantum (feature `pqc`)
+
+Quantum computers threaten public-key cryptography, not symmetric ciphers
+or hashes. AES-256 (values, keyrings) and SHA-256 (leaves, chain) are
+unchanged.
+
+**Built:**
+- `KEY PROVIDER 'mlkem:<key file>'` wraps each data key with a hybrid KEM:
+  ML-KEM-768 (FIPS 203) and X25519, the wrapping key derived from both
+  shared secrets. Breaking it needs breaking both.
+- `mlkem:<path>;create` makes the key file (0600).
+- `VAULT v ROTATE KEY TO 'mlkem:…'` moves an existing vault onto it
+  without re-encrypting a single value.
+
+**Not built yet:**
+- (built since) ML-DSA-65 (FIPS 204) signatures on anchors: `RDB_LEDGER_SIGNING_KEY` (seed file), `RDB_LEDGER_VERIFY_KEY` (public key for auditors).
+- A SHA-512 chain option.
+- Post-quantum TLS (rustls X25519MLKEM768), which belongs to the GPL
+  listener.
+
+## 4.6 FIPS 140-3 (feature `fips`, off by default)
+
+In a `fips` build, every cryptographic function the server relies on for
+security runs inside **AWS-LC's FIPS module** (`aws-lc-rs` with `fips`).
+aws-lc-rs is already rustls's provider here.
+
+**Core (GPL):**
+- TLS uses rustls's FIPS provider, so only approved suites and groups are
+  offered.
+- SCRAM-SHA-256 (SHA-256, HMAC, PBKDF2), S3 SigV4, and the S3 Object Lock
+  checksum go through `core::fips`.
+- `md5` logins are refused.
+- The server runs `aws_lc_rs::try_fips_mode()` (the power-on self-tests) and
+  refuses to start if it fails.
+- `rasterizeddb_server --features fips` turns all of this on.
+- The client's SCRAM: `rasterizeddb_client --features fips` (its TLS follows the process's rustls provider).
+
+**Enterprise:**
+- The ledger's leaf and chain hashes, the vault's AES-256-GCM, and its
+  random numbers come from the module.
+- `mlkem:` providers, `mldsa65` keys and ML-DSA anchor signatures are
+  refused. The ML-KEM and ML-DSA code here is RustCrypto, not the validated
+  module.
+- In FIPS mode, keys belong in a FIPS 140-3 validated HSM through
+  `pkcs11:`.
+
+**Build and certification:**
+- AWS-LC's FIPS build needs CMake, Go and Perl. This development box has no
+  Go, so the `fips` build is checked on CI.
+- A certified deployment must pin an AWS-LC FIPS version named on a current
+  CMVP certificate. That is a release decision.
+
+**Not covered:**
+- Non-security hashes (CRC32C and xxHash for integrity and routing, and the
+  `md5()` SQL function) stay as they are.
+
 ## 5. Client
 
 `rasterizeddb_client_enterprise`:
@@ -206,6 +263,52 @@ let cached = vault.cached(Duration::from_secs(60));       // mlock'ed cache
 The ledger side covers `LedgerModel`, receipts, proofs and `verify` (the
 2026-11-23 plan). The derive emits only the plain-data constant
 `Model::LEDGER`.
+
+## 5.5 Status (2026-11-26)
+
+Written on `wip/ledger`, `cargo check` pending, **no tests run yet**:
+
+- **L0:** core hooks; runtime incompat flags; header kind; fail-closed open.
+- **L1:** `CREATE LEDGER TABLE`, `CREATE VAULT`, the policy sidecar,
+  retention, legal holds, the `__ledger_ts` stamp, and the per-row DELETE
+  check.
+- **L2:** the chain store, `VERIFY LEDGER` and `SHOW LEDGER`.
+- **L3:** `dir:` and `s3:` anchors with Object Lock, sync/async mode, the
+  failure policy, and `ACKNOWLEDGE LEDGER ROLLBACK`.
+- **E1:** AES-256-GCM envelope encryption and the `file` provider.
+- **E2:** the PKCS#11 provider.
+- **PQC:** the `mlkem` hybrid provider.
+- **V1–V3:** the VAULT statements, the keyring, purge as crypto-shredding,
+  the audit trail, secure memory, and vault inserts only through VAULT
+  statements.
+- **C1:** `Model::LEDGER`, the derive, the client refusals, the migrator
+  filter, the error helpers, and `rasterizeddb_client_enterprise` (`Vault`,
+  `CachedVault`, `LedgerAdmin`, `LedgerModelExt`).
+- **S1:** `rdb_studio_enterprise` and Studio's LEDGER tab.
+- **A1:** `--pg-auth cert`, `--pg-client-ca` and `--pg-cert-map`.
+
+**Not built yet:**
+- row-level offline verification (the `rdb-ledger-verify` binary checks the chain and anchors)
+- (built since) receipts: `SHOW LEDGER RECEIPT <table> <stamp>` and `rasterizeddb_client_enterprise::verify_receipt`, which checks one against a head the caller read from an anchor; the chain hashes payload digests, so a proof is 32 bytes per later entry
+- Ed25519 anchor signing (ML-DSA-65 is built, under `pqc`)
+- transparent `ENCRYPTED` columns on ordinary ledger tables (vault values
+  are encrypted; other columns are not)
+- `VERSIONED` mode
+- (built since) vault keys: `VAULT v CREATE KEY 'k' TYPE 'aes256-gcm'|'mldsa65'`, `ENCRYPT`/`DECRYPT`/`SIGN`/`VERIFY`/`PUBLIC KEY`; the material is a wrapped data key that never leaves the server. Keys inside the HSM itself (CKM operations on token objects) are not built
+- TPM-sealed keys and attested key release
+- KMS and Vault-transit providers
+- replication single-writer enforcement, and ledger metadata in the
+  replication payload
+- branch and PITR rollback checks
+- partitioned ledger tables
+- cert login on the native protocol
+- persisting the clock's high-water mark (the chain re-raises it at open)
+
+**Known limits:**
+- A plain `SELECT` on a vault shows ciphertext and metadata.
+- `VERIFY` reads every row into memory.
+- The audit of a GET refused by the privilege check happens in core,
+  before the hook, so it is not recorded.
 
 ## 6. Phases (implement all first with `cargo check`, then test in one go)
 

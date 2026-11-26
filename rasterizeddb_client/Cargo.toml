@@ -63,6 +63,10 @@ aws-lc-rs = { version = "1.19", optional = true }
 default = ["derive", "sharding", "broker"]
 # `#[derive(Model)]`, `#[derive(FromRow)]` and `#[derive(SqlEnum)]`.
 derive = ["dep:rasterizeddb_client_derive"]
+# FIPS 140-3: SCRAM's SHA-256, HMAC and PBKDF2 through the AWS-LC FIPS module
+# (needs CMake, Go and Perl to build). TLS follows the process's rustls
+# provider: install rustls's FIPS provider before connecting.
+fips = ["dep:aws-lc-rs", "aws-lc-rs/fips"]
 # Client-side sharding: `shard::Router` over N servers, the ORM routed by
 # `#[rdb(shard_by)]`, fan-out reads, and the `rdb-shard` tool
 # (docs/sharding-client.md). Dormant until a `Router` is built.
