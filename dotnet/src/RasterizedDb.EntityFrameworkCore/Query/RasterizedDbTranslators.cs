@@ -18,6 +18,7 @@ public class RasterizedDbMethodCallTranslatorProvider : RelationalMethodCallTran
             new RasterizedDbStringMethodTranslator(sql),
             new RasterizedDbMathTranslator(sql),
             new RasterizedDbMiscMethodTranslator(sql, dependencies.RelationalTypeMappingSource),
+            new RasterizedDbArrayTranslator(sql),
         ]);
     }
 }
@@ -27,7 +28,7 @@ public class RasterizedDbMemberTranslatorProvider : RelationalMemberTranslatorPr
     public RasterizedDbMemberTranslatorProvider(RelationalMemberTranslatorProviderDependencies dependencies)
         : base(dependencies)
     {
-        AddTranslators([new RasterizedDbMemberTranslator(dependencies.SqlExpressionFactory)]);
+        AddTranslators([new RasterizedDbMemberTranslator(dependencies.SqlExpressionFactory), new RasterizedDbArrayTranslator(dependencies.SqlExpressionFactory)]);
     }
 }
 

@@ -38,6 +38,7 @@ public static class RasterizedDbServiceCollectionExtensions
             .TryAdd<IUpdateSqlGenerator, RasterizedDbUpdateSqlGenerator>()
             .TryAdd<IModificationCommandBatchFactory, RasterizedDbModificationCommandBatchFactory>()
             .TryAdd<IQuerySqlGeneratorFactory, RasterizedDbQuerySqlGeneratorFactory>()
+            .TryAdd<IRelationalSqlTranslatingExpressionVisitorFactory, RasterizedDbSqlTranslatingExpressionVisitorFactory>()
             .TryAdd<IMethodCallTranslatorProvider, RasterizedDbMethodCallTranslatorProvider>()
             .TryAdd<IMemberTranslatorProvider, RasterizedDbMemberTranslatorProvider>()
             .TryAddCoreServices();

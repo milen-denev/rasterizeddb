@@ -73,6 +73,29 @@ public class SqlGenerationTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public void Array_columns_translate()
+    {
+        using var context = Context();
+        var tag = "x";
+        Assert.Contains("'x' = ANY(b.\"Tags\")", Sql(context.Blogs.Where(b => b.Tags.Contains("x"))));
+        Assert.Contains("= ANY(b.\"Tags\")", Sql(context.Blogs.Where(b => b.Tags.Contains(tag))));
+        Assert.Contains("3 = ANY(b.\"Scores\")", Sql(context.Blogs.Where(b => b.Scores.Contains(3))));
+        Assert.Contains("cardinality(b.\"Tags\")", Sql(context.Blogs.Where(b => b.Tags.Length > 1)));
+        Assert.Contains("cardinality(b.\"Scores\")", Sql(context.Blogs.Where(b => b.Scores.Count > 1)));
+        Assert.Contains("cardinality(b.\"Scores\")", Sql(context.Blogs.Where(b => b.Scores.Any())));
+    }
+
+    [Fact]
+    public void Json_columns_translate()
+    {
+        using var context = Context();
+        Assert.Contains("CAST((b.\"Details\" ->> 'Stars') AS integer)) > 3", Sql(context.Blogs.Where(b => b.Details.Stars > 3)));
+        Assert.Contains("(b.\"Details\" -> 'Address' ->> 'City')) = 'Sofia'", Sql(context.Blogs.Where(b => b.Details.Address.City == "Sofia")));
+        Assert.Contains("CAST((b.\"Details\" ->> 'Verified') AS boolean)", Sql(context.Blogs.Where(b => b.Details.Verified)));
+        Assert.Contains("(b.\"Details\" ->> 'Author')", Sql(context.Blogs.Select(b => b.Details.Author)));
+    }
+
+    [Fact]
     public void A_create_script_is_postgresql_ddl()
     {
         using var context = Context();
@@ -89,5 +112,8 @@ public class SqlGenerationTests(ITestOutputHelper output)
         Assert.Contains("\"Score\" double precision NOT NULL", script);
         Assert.Contains("\"IsPublic\" boolean NOT NULL", script);
         Assert.Contains("REFERENCES \"Blogs\" (\"Id\")", script);
+        Assert.Contains("\"Tags\" text[] NOT NULL", script);
+        Assert.Contains("\"Scores\" integer[] NOT NULL", script);
+        Assert.Contains("\"Details\" jsonb NOT NULL", script);
     }
 }

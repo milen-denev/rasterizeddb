@@ -15,7 +15,7 @@ namespace RasterizedDb.Data;
 /// Every argument is sent as hex (<c>x'…'</c>) and values come back as bytes (<c>KV BINARY</c>), so any
 /// byte string is a key or a value. A key or value given as a <see cref="string"/> is its UTF-8. No
 /// command here is atomic with another: the native protocol has no <c>MULTI</c>. Where a call takes two
-/// commands it says so. <see cref="Map{TKey,TValue}"/> is a typed map under a key prefix.
+/// commands it says so. <c>Map</c> is a typed map under a key prefix.
 /// </remarks>
 public readonly struct RasterizedDbKv
 {

@@ -1,6 +1,7 @@
 using System.Data;
 using System.Globalization;
 using System.Text;
+using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Storage;
 
 namespace RasterizedDb.EntityFrameworkCore.Storage;
@@ -269,7 +270,7 @@ public class RasterizedDbStringTypeMapping : StringTypeMapping
     public RasterizedDbStringTypeMapping(string storeType, int? size = null, bool fixedLength = false)
         : base(
             new RelationalTypeMappingParameters(
-                new CoreTypeMappingParameters(typeof(string)),
+                new CoreTypeMappingParameters(typeof(string), jsonValueReaderWriter: Microsoft.EntityFrameworkCore.Storage.Json.JsonStringReaderWriter.Instance),
                 storeType,
                 size is null ? StoreTypePostfix.None : StoreTypePostfix.Size,
                 System.Data.DbType.String,
@@ -303,7 +304,7 @@ public class RasterizedDbDecimalTypeMapping : DecimalTypeMapping
     public RasterizedDbDecimalTypeMapping(int? precision = null, int? scale = null)
         : base(
             new RelationalTypeMappingParameters(
-                new CoreTypeMappingParameters(typeof(decimal)),
+                new CoreTypeMappingParameters(typeof(decimal), jsonValueReaderWriter: Microsoft.EntityFrameworkCore.Storage.Json.JsonDecimalReaderWriter.Instance),
                 "numeric",
                 precision is null ? StoreTypePostfix.None : StoreTypePostfix.PrecisionAndScale,
                 System.Data.DbType.Decimal,
@@ -419,16 +420,43 @@ public class RasterizedDbTypeMappingSource : RelationalTypeMappingSource
     {
     }
 
+    private static readonly RasterizedDbJsonTypeMapping JsonContainer = new();
+
     private static string StoreBase(string storeType)
     {
         var paren = storeType.IndexOf('(');
         return (paren < 0 ? storeType : storeType[..paren]).Trim();
     }
 
+    /// <summary>
+    /// The mapping of a value in a query (a parameter, a constant). A list there is one EF Core expands
+    /// into its elements, so it is told what an element is.
+    /// </summary>
+    public override RelationalTypeMapping? FindMapping(Type type, IModel model, CoreTypeMapping? elementMapping = null)
+    {
+        if (RasterizedDbArrayTypeMapping.ElementType(type) is { } elementType
+            && (elementMapping as RelationalTypeMapping ?? FindMapping(elementType, model)) is { } element)
+        {
+            return new RasterizedDbArrayTypeMapping(type, element, queryable: true);
+        }
+
+        return base.FindMapping(type, model, elementMapping);
+    }
+
     protected override RelationalTypeMapping? FindMapping(in RelationalTypeMappingInfo mappingInfo)
     {
         var clrType = mappingInfo.ClrType;
         var storeType = mappingInfo.StoreTypeName;
+        // The column an owned type mapped with ToJson() lives in.
+#if EF10
+        if (clrType == typeof(JsonTypePlaceholder) || clrType == typeof(System.Text.Json.JsonElement))
+#else
+        if (clrType == typeof(System.Text.Json.JsonElement))
+#endif
+        {
+            return storeType is null || storeType.Equals("jsonb", StringComparison.OrdinalIgnoreCase) ? JsonContainer : new RasterizedDbJsonTypeMapping(storeType);
+        }
+
         if (storeType is not null && storeType.EndsWith("[]", StringComparison.Ordinal))
         {
             // integer[], text[]: the element's mapping, as an array of it.

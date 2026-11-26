@@ -75,6 +75,48 @@ public class RasterizedDbQuerySqlGenerator(QuerySqlGeneratorDependencies depende
         return outerApplyExpression;
     }
 
+    /// <summary>
+    /// A value inside a JSON column: <c>(col -> 'a' -> 0 ->> 'b')</c>, cast to the value's type when it is
+    /// not text. <c>-></c> steps into a document; the last step of a scalar is <c>->></c>, which gives
+    /// its text.
+    /// </summary>
+    protected override Expression VisitJsonScalar(JsonScalarExpression jsonScalarExpression)
+    {
+        var path = jsonScalarExpression.Path;
+        if (path.Count == 0)
+        {
+            Visit(jsonScalarExpression.Json);
+            return jsonScalarExpression;
+        }
+
+        var scalar = jsonScalarExpression.TypeMapping is not JsonTypeMapping;
+        var type = Nullable.GetUnderlyingType(jsonScalarExpression.Type) ?? jsonScalarExpression.Type;
+        var cast = scalar && type != typeof(string) && jsonScalarExpression.TypeMapping is not null;
+        Sql.Append(cast ? "CAST((" : "(");
+        Visit(jsonScalarExpression.Json);
+        for (var i = 0; i < path.Count; i++)
+        {
+            Sql.Append(scalar && i == path.Count - 1 ? " ->> " : " -> ");
+            var segment = path[i];
+            if (segment.PropertyName is { } property)
+            {
+                Sql.Append("'").Append(property.Replace("'", "''")).Append("'");
+            }
+            else
+            {
+                Visit(segment.ArrayIndex!);
+            }
+        }
+
+        Sql.Append(")");
+        if (cast)
+        {
+            Sql.Append(" AS ").Append(jsonScalarExpression.TypeMapping!.StoreType).Append(")");
+        }
+
+        return jsonScalarExpression;
+    }
+
     protected override void GenerateSetOperationOperand(SetOperationBase setOperation, SelectExpression operand)
     {
         // An operand with its own ORDER BY or LIMIT has to stand in parentheses.

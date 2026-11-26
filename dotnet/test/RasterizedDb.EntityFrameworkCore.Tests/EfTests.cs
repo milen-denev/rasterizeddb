@@ -15,7 +15,31 @@ public class Blog
     public bool IsPublic { get; set; }
     public DateTime CreatedAt { get; set; }
     public int Version { get; set; }
+    public string[] Tags { get; set; } = [];
+    public List<int> Scores { get; set; } = [];
+    public BlogDetails Details { get; set; } = new();
     public List<Post> Posts { get; set; } = [];
+}
+
+public class BlogDetails
+{
+    public string Author { get; set; } = "";
+    public int Stars { get; set; }
+    public bool Verified { get; set; }
+    public Address Address { get; set; } = new();
+    public List<Link> Links { get; set; } = [];
+}
+
+public class Address
+{
+    public string City { get; set; } = "";
+    public string? Zip { get; set; }
+}
+
+public class Link
+{
+    public string Url { get; set; } = "";
+    public int Clicks { get; set; }
 }
 
 public class Post
@@ -49,6 +73,12 @@ public class BloggingContext(DbContextOptions<BloggingContext> options) : DbCont
             b.Property(x => x.Title).HasMaxLength(200);
             b.Property(x => x.Rating).HasPrecision(10, 2);
             b.Property(x => x.Version).IsConcurrencyToken();
+            b.OwnsOne(x => x.Details, d =>
+            {
+                d.ToJson();
+                d.OwnsOne(x => x.Address);
+                d.OwnsMany(x => x.Links);
+            });
         });
         modelBuilder.Entity<Post>(p => p.HasOne(x => x.Blog).WithMany(x => x.Posts).HasForeignKey(x => x.BlogId));
     }
@@ -109,6 +139,16 @@ public sealed class BloggingFixture : IDisposable
                 Rating = i * 1.25m,
                 IsPublic = i != 3,
                 CreatedAt = day.AddDays(i),
+                Tags = i % 2 == 0 ? ["even", $"n{i}"] : ["odd", $"n{i}", "it's"],
+                Scores = Enumerable.Range(1, i).ToList(),
+                Details = new BlogDetails
+                {
+                    Author = $"author {i}",
+                    Stars = i * 10,
+                    Verified = i > 3,
+                    Address = new Address { City = i < 3 ? "Sofia" : "Plovdiv", Zip = i == 1 ? null : $"{1000 + i}" },
+                    Links = Enumerable.Range(1, i % 3).Select(n => new Link { Url = $"https://example.com/{i}/{n}", Clicks = n }).ToList(),
+                },
             };
             for (var p = 1; p <= i; p++)
             {
@@ -301,7 +341,7 @@ public class EfTests(BloggingFixture fixture) : IClassFixture<BloggingFixture>
 
         var title = "Blog 2";
         var blogs = await context.Blogs
-            .FromSql($"""SELECT "Version", "Title", "Id", "Subtitle", "Rating", "IsPublic", "CreatedAt" FROM "Blogs" WHERE "Title" = {title}""")
+            .FromSql($"""SELECT "Version", "Title", "Id", "Subtitle", "Rating", "IsPublic", "CreatedAt", "Tags", "Scores", "Details" FROM "Blogs" WHERE "Title" = {title}""")
             .AsNoTracking()
             .ToListAsync();
         Assert.Equal("Blog 2", Assert.Single(blogs).Title);
@@ -311,7 +351,8 @@ public class EfTests(BloggingFixture fixture) : IClassFixture<BloggingFixture>
         Assert.Equal(["Blog 5"], titles);
 
         var marker = Guid.NewGuid().ToString("N");
-        Assert.Equal(1, await context.Database.ExecuteSqlAsync($"""INSERT INTO "Blogs" ("Title", "Rating", "IsPublic", "CreatedAt", "Version") VALUES ({marker}, 0, FALSE, now(), 0)"""));
+        var none = "{}";
+        Assert.Equal(1, await context.Database.ExecuteSqlAsync($"""INSERT INTO "Blogs" ("Title", "Rating", "IsPublic", "CreatedAt", "Version", "Tags", "Scores", "Details") VALUES ({marker}, 0, FALSE, now(), 0, {none}, {none}, {none})"""));
         Assert.Equal(1, await context.Blogs.Where(b => b.Title == marker).ExecuteDeleteAsync());
     }
 
@@ -330,6 +371,125 @@ public class EfTests(BloggingFixture fixture) : IClassFixture<BloggingFixture>
         Assert.Equal(3, await context.Blogs.Where(b => b.Title == marker).ExecuteUpdateAsync(s => s.SetProperty(b => b.IsPublic, true)));
         Assert.Equal(3, await context.Blogs.CountAsync(b => b.Title == marker && b.IsPublic));
         Assert.Equal(3, await context.Blogs.Where(b => b.Title == marker).ExecuteDeleteAsync());
+    }
+
+    [Fact]
+    public async Task Array_columns_round_trip_and_filter()
+    {
+        await using var context = fixture.Context();
+        if (context is null)
+        {
+            return;
+        }
+
+        var first = await context.Blogs.AsNoTracking().SingleAsync(b => b.Title == "Blog 1");
+        Assert.Equal(["odd", "n1", "it's"], first.Tags);
+        Assert.Equal([1], first.Scores);
+
+        Assert.Equal(2, await context.Blogs.CountAsync(b => b.Tags.Contains("even") && b.Title.StartsWith("Blog ")));
+        var tag = "n3";
+        Assert.Equal("Blog 3", (await context.Blogs.SingleAsync(b => b.Tags.Contains(tag))).Title);
+        Assert.Equal(3, await context.Blogs.CountAsync(b => b.Tags.Length == 3 && b.Title.StartsWith("Blog ")));
+        Assert.Equal(2, await context.Blogs.CountAsync(b => b.Scores.Count >= 4 && b.Title.StartsWith("Blog ")));
+        Assert.Equal(3, await context.Blogs.CountAsync(b => b.Scores.Contains(3) && b.Title.StartsWith("Blog ")));
+
+        var blog = new Blog { Title = "arrays", CreatedAt = DateTime.UtcNow, Tags = ["a"], Scores = [5] };
+        context.Blogs.Add(blog);
+        await context.SaveChangesAsync();
+        blog.Tags = ["a", "b \"quoted\"", ""];
+        blog.Scores.Add(6);
+        await context.SaveChangesAsync();
+        context.ChangeTracker.Clear();
+        var again = await context.Blogs.SingleAsync(b => b.Id == blog.Id);
+        Assert.Equal(["a", "b \"quoted\"", ""], again.Tags);
+        Assert.Equal([5, 6], again.Scores);
+        context.Remove(again);
+        await context.SaveChangesAsync();
+    }
+
+    [Fact]
+    public async Task Json_columns_load_filter_and_update_in_place()
+    {
+        await using var context = fixture.Context();
+        if (context is null)
+        {
+            return;
+        }
+
+        var second = await context.Blogs.AsNoTracking().SingleAsync(b => b.Title == "Blog 2");
+        Assert.Equal("author 2", second.Details.Author);
+        Assert.Equal(20, second.Details.Stars);
+        Assert.Equal("Sofia", second.Details.Address.City);
+        Assert.Equal("1002", second.Details.Address.Zip);
+        Assert.Equal(2, second.Details.Links.Count);
+        Assert.Equal("https://example.com/2/2", second.Details.Links[1].Url);
+
+        Assert.Equal(2, await context.Blogs.CountAsync(b => b.Details.Stars > 30 && b.Title.StartsWith("Blog ")));
+        Assert.Equal(2, await context.Blogs.CountAsync(b => b.Details.Address.City == "Sofia" && b.Title.StartsWith("Blog ")));
+        Assert.Equal(2, await context.Blogs.CountAsync(b => b.Details.Verified && b.Title.StartsWith("Blog ")));
+        var authors = await context.Blogs.Where(b => b.Title.StartsWith("Blog ")).OrderBy(b => b.Details.Stars).Select(b => b.Details.Author).ToListAsync();
+        Assert.Equal("author 1", authors[0]);
+        Assert.Equal(5, authors.Count);
+
+        var blog = new Blog
+        {
+            Title = "json",
+            CreatedAt = DateTime.UtcNow,
+            Details = new BlogDetails { Author = "o'neil", Stars = 1, Address = new Address { City = "Varna" }, Links = [new Link { Url = "u", Clicks = 1 }] },
+        };
+        context.Blogs.Add(blog);
+        await context.SaveChangesAsync();
+
+        // One scalar inside the document, then a nested one, then the collection.
+        blog.Details.Stars = 2;
+        await context.SaveChangesAsync();
+        blog.Details.Address.City = "Burgas \"quoted\"";
+        await context.SaveChangesAsync();
+        blog.Details.Links.Add(new Link { Url = "v", Clicks = 7 });
+        blog.Details.Author = "changed";
+        await context.SaveChangesAsync();
+
+        context.ChangeTracker.Clear();
+        var again = await context.Blogs.SingleAsync(b => b.Id == blog.Id);
+        Assert.Equal(2, again.Details.Stars);
+        Assert.Equal("Burgas \"quoted\"", again.Details.Address.City);
+        Assert.Equal("changed", again.Details.Author);
+        Assert.Equal([1, 7], again.Details.Links.Select(l => l.Clicks));
+        context.Remove(again);
+        await context.SaveChangesAsync();
+    }
+
+    [Fact]
+    public void An_existing_database_scaffolds()
+    {
+        using var context = fixture.Context();
+        if (context is null)
+        {
+            return;
+        }
+
+        var factory = new RasterizedDb.EntityFrameworkCore.Scaffolding.RasterizedDbDatabaseModelFactory();
+        var model = factory.Create(context.Database.GetConnectionString()!, new Microsoft.EntityFrameworkCore.Scaffolding.DatabaseModelFactoryOptions());
+        var blogs = model.Tables.Single(t => t.Name == "Blogs");
+        var posts = model.Tables.Single(t => t.Name == "Posts");
+        Assert.Equal(["Id"], blogs.PrimaryKey!.Columns.Select(c => c.Name));
+        Assert.Equal(Microsoft.EntityFrameworkCore.Metadata.ValueGenerated.OnAdd, blogs.Columns.Single(c => c.Name == "Id").ValueGenerated);
+        Assert.Equal("character varying(200)", blogs.Columns.Single(c => c.Name == "Title").StoreType);
+        Assert.Equal("numeric(10,2)", blogs.Columns.Single(c => c.Name == "Rating").StoreType);
+        Assert.True(blogs.Columns.Single(c => c.Name == "Subtitle").IsNullable);
+        Assert.False(blogs.Columns.Single(c => c.Name == "Title").IsNullable);
+        Assert.Equal("jsonb", blogs.Columns.Single(c => c.Name == "Details").StoreType);
+        Assert.Equal("text[]", blogs.Columns.Single(c => c.Name == "Tags").StoreType);
+        Assert.Equal("uuid", posts.Columns.Single(c => c.Name == "Token").StoreType);
+        var foreignKey = Assert.Single(posts.ForeignKeys);
+        Assert.Equal("Blogs", foreignKey.PrincipalTable.Name);
+        Assert.Equal(["BlogId"], foreignKey.Columns.Select(c => c.Name));
+        Assert.Equal(["Id"], foreignKey.PrincipalColumns.Select(c => c.Name));
+        Assert.Equal(Microsoft.EntityFrameworkCore.Migrations.ReferentialAction.Cascade, foreignKey.OnDelete);
+        Assert.Contains(posts.Indexes, i => i.Columns.Select(c => c.Name).SequenceEqual(["BlogId"]));
+
+        var only = factory.Create(context.Database.GetConnectionString()!, new Microsoft.EntityFrameworkCore.Scaffolding.DatabaseModelFactoryOptions(["Posts"]));
+        Assert.Equal(["Posts"], only.Tables.Select(t => t.Name));
     }
 
     [Fact]

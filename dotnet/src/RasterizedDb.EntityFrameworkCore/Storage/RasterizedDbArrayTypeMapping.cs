@@ -11,20 +11,35 @@ namespace RasterizedDb.EntityFrameworkCore.Storage;
 /// </summary>
 public class RasterizedDbArrayTypeMapping : RelationalTypeMapping
 {
-    public RasterizedDbArrayTypeMapping(Type clrType, RelationalTypeMapping elementMapping)
+    /// <param name="clrType">The array or list type.</param>
+    /// <param name="elementMapping">The mapping of one element.</param>
+    /// <param name="queryable">
+    /// Whether EF Core is told the element mapping. True for a list in a query's parameter, which EF
+    /// Core then expands into <c>IN (…)</c>; false for a column (see <see cref="Element"/>).
+    /// </param>
+    public RasterizedDbArrayTypeMapping(Type clrType, RelationalTypeMapping elementMapping, bool queryable = false)
         : base(
             new RelationalTypeMappingParameters(
-                new CoreTypeMappingParameters(clrType, comparer: Comparer(clrType, elementMapping), elementMapping: elementMapping),
+                new CoreTypeMappingParameters(clrType, comparer: ListComparer(clrType, elementMapping), elementMapping: queryable ? elementMapping : null),
                 elementMapping.StoreType + "[]"))
     {
+        Element = elementMapping;
     }
 
-    protected RasterizedDbArrayTypeMapping(RelationalTypeMappingParameters parameters)
+    protected RasterizedDbArrayTypeMapping(RelationalTypeMappingParameters parameters, RelationalTypeMapping elementMapping)
         : base(parameters)
     {
+        Element = elementMapping;
     }
 
-    protected override RelationalTypeMapping Clone(RelationalTypeMappingParameters parameters) => new RasterizedDbArrayTypeMapping(parameters);
+    /// <summary>
+    /// The mapping of one element. Kept here and not as EF Core's element mapping: with that, EF Core
+    /// treats the column as a queryable collection it would have to expand into rows, where an array
+    /// column answers <c>Contains</c> and <c>Count</c> directly (<c>= ANY</c>, <c>cardinality</c>).
+    /// </summary>
+    public virtual RelationalTypeMapping Element { get; }
+
+    protected override RelationalTypeMapping Clone(RelationalTypeMappingParameters parameters) => new RasterizedDbArrayTypeMapping(parameters, Element);
 
     /// <summary>The element type of an array or list type this mapping can hold; null for anything else.</summary>
     public static Type? ElementType(Type type)
@@ -47,7 +62,7 @@ public class RasterizedDbArrayTypeMapping : RelationalTypeMapping
         return null;
     }
 
-    private static ValueComparer? Comparer(Type clrType, RelationalTypeMapping elementMapping)
+    private static ValueComparer? ListComparer(Type clrType, RelationalTypeMapping elementMapping)
     {
         var element = ElementType(clrType)!;
         var underlying = Nullable.GetUnderlyingType(element);
@@ -69,7 +84,7 @@ public class RasterizedDbArrayTypeMapping : RelationalTypeMapping
 
     protected override string GenerateNonNullSqlLiteral(object value)
     {
-        var element = (RelationalTypeMapping)ElementTypeMapping!;
+        var element = Element;
         var body = new StringBuilder("{");
         var first = true;
         foreach (var item in (IEnumerable)value)

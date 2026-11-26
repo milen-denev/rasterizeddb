@@ -129,8 +129,18 @@ options.UseRasterizedDb(connectionString, o => o.EnableRetryOnFailure());
 - Translated: comparisons, paging, joins, `Include`, grouping and aggregates, `Contains` over a list,
   the common `string`, `Math` and `DateTime` members, `EF.Functions.Like` and `EF.Functions.ILike`,
   `ExecuteUpdate` / `ExecuteDelete`.
-- Not there yet: JSON columns (`ToJson`), primitive collections as arrays, scaffolding from an
-  existing database, spatial types.
+- **Array columns.** A `T[]` or `List<T>` property of a mapped type is an array column (`text[]`,
+  `integer[]`). `tags.Contains(x)` is `x = ANY (tags)`; `Length`, `Count` and `Any()` are
+  `cardinality(tags)`.
+- **JSON columns.** An owned type mapped with `ToJson()` lives in one `jsonb` column, nested owned
+  types and collections included. A member in a query is a path into it
+  (`CAST((b."Details" ->> 'Stars') AS integer)`), and a change to part of a document is written in
+  place with `jsonb_set`.
+- **Scaffolding.** `dotnet ef dbcontext scaffold "<connection string>" RasterizedDb.EntityFrameworkCore`
+  reads tables, columns, primary and unique keys, foreign keys and indexes from `information_schema`
+  and `pg_indexes`.
+- Not there yet: LINQ composed over a JSON collection or over an array's elements (`SelectMany`, a
+  `Where` inside the array), indexing into an array, spatial types.
 
 ## Tests
 
