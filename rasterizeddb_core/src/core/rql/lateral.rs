@@ -1024,6 +1024,38 @@ fn key_of(text: Option<&str>) -> String {
 }
 
 /// The SQL type a column of `relation` has, as a cast can name it.
+/// The probes one statement's items made of its outer item, by their text:
+/// the outer values ([`text_rows`]) and the outer columns' types
+/// ([`column_types`]). Within a statement the outer item's rows are the same
+/// for each item, and each item of a select list reads the same columns of
+/// it more often than not.
+#[derive(Default)]
+struct Probes {
+    rows: std::collections::HashMap<String, Vec<Vec<Option<String>>>>,
+    types: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl Probes {
+    async fn rows(&mut self, query: &str, width: usize, database: &Arc<Database>, tx: TxId) -> Result<Vec<Vec<Option<String>>>, String> {
+        if let Some(known) = self.rows.get(query) {
+            return Ok(known.clone());
+        }
+        let rows = text_rows(query, width, database, tx).await?;
+        self.rows.insert(query.to_string(), rows.clone());
+        Ok(rows)
+    }
+
+    async fn types(&mut self, database: &Arc<Database>, alias: &str, relation: &str, columns: &[String]) -> Result<Vec<String>, String> {
+        let key = format!("{relation}\u{1}{alias}\u{1}{}", columns.join("\u{1}"));
+        if let Some(known) = self.types.get(&key) {
+            return Ok(known.clone());
+        }
+        let types = column_types(database, alias, relation, columns).await?;
+        self.types.insert(key, types.clone());
+        Ok(types)
+    }
+}
+
 async fn column_types(
     database: &Arc<Database>,
     alias: &str,
@@ -1186,6 +1218,10 @@ pub(crate) async fn materialize(
     // Whether the outer rows were cut to the statement's LIMIT already
     // (`limited_outer`): once.
     let mut limited = false;
+    // What the statement's items asked of its outer item already: a page's
+    // lookup of one row with three subqueries asked which row three times,
+    // and typed the same column three times.
+    let mut probes: Probes = Probes::default();
     for index in 0..16usize {
         let Some(item) = next_item(&current) else { break };
         let item = qualify_outer_columns(&current, &item?, database).await?;
@@ -1233,13 +1269,13 @@ pub(crate) async fn materialize(
                 // (`limited_outer`): the probe would run the filter, each
                 // item's copy of the outer rows again, and the statement
                 // once more.
-                if !limited {
-                    if let Some(cut) = limited_outer(&current, alias, relation, usize::MAX).filter(|cut| cut.subquery) {
-                        limited = true;
-                        if let Some(cut) = cut_outer(cut, &current, alias, relation, database, temps, tx).await? {
-                            current = cut;
-                            continue;
-                        }
+                // (Read once an item: whether it can be cut, and to what.)
+                let mut cut = if limited { None } else { limited_outer(&current, alias, relation, usize::MAX) };
+                if let Some(first) = cut.take_if(|cut| cut.subquery) {
+                    limited = true;
+                    if let Some(cut) = cut_outer(first, &current, alias, relation, database, temps, tx).await? {
+                        current = cut;
+                        continue;
                     }
                 }
                 // Only the outer rows the statement can keep need a run. The
@@ -1258,9 +1294,7 @@ pub(crate) async fn materialize(
                 // more than it keeps, and those are every row: the values.
                 let mut known: Option<Vec<Vec<Option<String>>>> = None;
                 if !limited {
-                    let cut = limited_outer(&current, alias, relation, usize::MAX)
-                        .and_then(|cut| cut.kept.filter(|kept| *kept < MAX_TUPLES).map(|kept| (cut, kept)));
-                    if let Some((cut, kept)) = cut {
+                    if let Some(kept) = cut.as_ref().and_then(|cut| cut.kept).filter(|kept| *kept < MAX_TUPLES) {
                         let capped = format!(
                             "SELECT {} FROM {relation} {alias}{} LIMIT {}",
                             columns.iter().map(|c| format!("{alias}.{c}::text")).collect::<Vec<_>>().join(", "),
@@ -1268,12 +1302,14 @@ pub(crate) async fn materialize(
                             kept + 1
                         );
                         // (Failed: asked again below, as it always was.)
-                        if let Ok(rows) = text_rows(&capped, columns.len(), database, tx).await {
+                        if let Ok(rows) = probes.rows(&capped, columns.len(), database, tx).await {
                             if rows.len() > kept {
                                 limited = true;
-                                if let Some(cut) = cut_outer(cut, &current, alias, relation, database, temps, tx).await? {
-                                    current = cut;
-                                    continue;
+                                if let Some(first) = cut.take() {
+                                    if let Some(cut) = cut_outer(first, &current, alias, relation, database, temps, tx).await? {
+                                        current = cut;
+                                        continue;
+                                    }
                                 }
                             } else {
                                 let mut distinct: Vec<Vec<Option<String>>> = Vec::with_capacity(rows.len());
@@ -1293,7 +1329,7 @@ pub(crate) async fn materialize(
                         pushed = filter;
                         tuples
                     }
-                    (None, Some(filter)) => match text_rows(&format!("{key_query} WHERE {filter}"), columns.len(), database, tx).await {
+                    (None, Some(filter)) => match probes.rows(&format!("{key_query} WHERE {filter}"), columns.len(), database, tx).await {
                         Ok(tuples) => {
                             pushed = Some(filter);
                             tuples
@@ -1304,18 +1340,18 @@ pub(crate) async fn materialize(
                             // Worth a line: the statement then runs its item
                             // for every outer row.
                             log::debug!("LATERAL item {}: the narrowed probe failed ({e}); running for every outer value", item.alias);
-                            text_rows(&key_query, columns.len(), database, tx).await?
+                            probes.rows(&key_query, columns.len(), database, tx).await?
                         }
                     },
-                    (None, None) => text_rows(&key_query, columns.len(), database, tx).await?,
+                    (None, None) => probes.rows(&key_query, columns.len(), database, tx).await?,
                 };
                 // More outer values than the statement's LIMIT keeps rows:
                 // the rows it keeps first, the items for those (the item is
                 // read again, over them).
                 if !limited {
-                    if let Some(cut) = limited_outer(&current, alias, relation, tuples.len()) {
+                    if let Some(first) = cut.take_if(|cut| cut.kept.is_some_and(|kept| tuples.len() > kept)) {
                         limited = true;
-                        if let Some(cut) = cut_outer(cut, &current, alias, relation, database, temps, tx).await? {
+                        if let Some(cut) = cut_outer(first, &current, alias, relation, database, temps, tx).await? {
                             current = cut;
                             continue;
                         }
@@ -1331,7 +1367,7 @@ pub(crate) async fn materialize(
                         tuples.len()
                     ));
                 }
-                let types = column_types(database, alias, relation, columns).await?;
+                let types = probes.types(database, alias, relation, columns).await?;
                 // One distinct tuple of the outer values it reads: every
                 // outer row the statement can keep has it, so the item is
                 // the same rows for each: a constant, built once and joined
