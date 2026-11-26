@@ -25,13 +25,12 @@ namespace RasterizedDb.Data.Internal;
 internal static class Tls
 {
     public const int BindingLength = 32;
-    private const string Alpn = "rastcp/1";
     private const string ExporterLabel = "EXPORTER-Channel-Binding";
 
     /// <summary>What an exchange on a unix socket binds itself to, in place of the exporter a socket does not have.</summary>
     public static ReadOnlySpan<byte> UnixBinding => "rastcp unix socket: no exporter."u8;
 
-    public static async ValueTask<(Stream Stream, byte[]? Binding)> Open(Socket socket, ConnectionSettings settings, bool needBinding, bool async, CancellationToken cancellation)
+    public static async ValueTask<(Stream Stream, byte[]? Binding)> Open(Socket socket, ConnectionSettings settings, string protocol, bool needBinding, bool async, CancellationToken cancellation)
     {
         var engine = settings.TlsEngine;
         if (engine == RasterizedDbTlsEngine.Auto)
@@ -39,9 +38,23 @@ internal static class Tls
             engine = needBinding && !PlatformExporter.IsSupported ? RasterizedDbTlsEngine.Managed : RasterizedDbTlsEngine.Platform;
         }
 
+        if (settings.ClientCertificate is not null)
+        {
+            // Presenting a certificate is the platform TLS's; the managed one here is a client without one.
+            if (settings.TlsEngine == RasterizedDbTlsEngine.Managed || (engine == RasterizedDbTlsEngine.Managed && needBinding))
+            {
+                throw new RasterizedDbException(
+                    RasterizedDbErrorKind.Unsupported,
+                    "a client certificate needs the platform's TLS, and on this platform a password login needs the managed one: " +
+                    "use a client certificate with a trust login, or a password login without a client certificate");
+            }
+
+            engine = RasterizedDbTlsEngine.Platform;
+        }
+
         if (engine == RasterizedDbTlsEngine.Managed)
         {
-            var managed = new ManagedTlsStream(new NetworkStream(socket, ownsSocket: true), settings);
+            var managed = new ManagedTlsStream(new NetworkStream(socket, ownsSocket: true), settings, protocol);
             try
             {
                 await managed.Handshake(async, cancellation).ConfigureAwait(false);
@@ -61,7 +74,7 @@ internal static class Tls
             var options = new SslClientAuthenticationOptions
             {
                 TargetHost = settings.Host,
-                ApplicationProtocols = [new SslApplicationProtocol(Alpn)],
+                ApplicationProtocols = [new SslApplicationProtocol(protocol)],
                 EnabledSslProtocols = SslProtocols.Tls13,
                 CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
                 RemoteCertificateValidationCallback = (_, certificate, chain, errors) => Check(settings, certificate, chain, errors),
@@ -69,6 +82,13 @@ internal static class Tls
             if (settings.Trust == RasterizedDbTrust.RootCa)
             {
                 options.CertificateChainPolicy = RootPolicy(settings);
+            }
+
+            if (settings.ClientCertificate is { } clientCertificate)
+            {
+                options.ClientCertificates = [clientCertificate];
+                // Presented whatever authorities the server names: one that pins client certificates names none.
+                options.LocalCertificateSelectionCallback = (_, _, _, _, _) => clientCertificate;
             }
 
             if (async)
@@ -80,9 +100,9 @@ internal static class Tls
                 ssl.AuthenticateAsClient(options);
             }
 
-            if (ssl.NegotiatedApplicationProtocol != new SslApplicationProtocol(Alpn))
+            if (ssl.NegotiatedApplicationProtocol != new SslApplicationProtocol(protocol))
             {
-                throw new RasterizedDbException(RasterizedDbErrorKind.Protocol, "the server did not agree to speak rastcp/1: it is not a RasterizedDB native listener");
+                throw new RasterizedDbException(RasterizedDbErrorKind.Protocol, $"the server did not agree to speak {protocol}: it is not a RasterizedDB native listener");
             }
 
             byte[]? binding = null;
@@ -300,7 +320,7 @@ internal static class Tls
     /// TLS 1.3 by BouncyCastle's non-blocking engine, driven over the socket here so reads and writes
     /// stay asynchronous.
     /// </summary>
-    private sealed class ManagedTlsStream(Stream inner, ConnectionSettings settings) : Stream
+    private sealed class ManagedTlsStream(Stream inner, ConnectionSettings settings, string protocol) : Stream
     {
         private readonly TlsClientProtocol _protocol = new();
         private readonly byte[] _net = new byte[16 * 1024 + 512];
@@ -311,7 +331,7 @@ internal static class Tls
 
         public async ValueTask Handshake(bool async, CancellationToken cancellation)
         {
-            _client = new Client(settings);
+            _client = new Client(settings, protocol);
             _protocol.Connect(_client);
             while (true)
             {
@@ -329,9 +349,9 @@ internal static class Tls
                 throw new RasterizedDbException(RasterizedDbErrorKind.Authentication, "this connection exports no channel binding");
             }
 
-            if (_client.Protocol != Alpn)
+            if (_client.Protocol != protocol)
             {
-                throw new RasterizedDbException(RasterizedDbErrorKind.Protocol, "the server did not agree to speak rastcp/1: it is not a RasterizedDB native listener");
+                throw new RasterizedDbException(RasterizedDbErrorKind.Protocol, $"the server did not agree to speak {protocol}: it is not a RasterizedDB native listener");
             }
         }
 
@@ -471,14 +491,14 @@ internal static class Tls
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
         public override void SetLength(long value) => throw new NotSupportedException();
 
-        private sealed class Client(ConnectionSettings settings) : DefaultTlsClient(new BcTlsCrypto())
+        private sealed class Client(ConnectionSettings settings, string protocol) : DefaultTlsClient(new BcTlsCrypto())
         {
             public byte[]? Binding;
             public string? Protocol;
 
             protected override ProtocolVersion[] GetSupportedVersions() => ProtocolVersion.TLSv13.Only();
 
-            protected override IList<ProtocolName> GetProtocolNames() => [ProtocolName.AsUtf8Encoding(Alpn)];
+            protected override IList<ProtocolName> GetProtocolNames() => [ProtocolName.AsUtf8Encoding(protocol)];
 
             protected override IList<ServerName>? GetSniServerNames() =>
                 IPAddress.TryParse(settings.Host, out _) ? null : [new ServerName(NameType.host_name, System.Text.Encoding.ASCII.GetBytes(settings.Host!))];

@@ -52,6 +52,57 @@ public sealed class RasterizedDbDataSource : DbDataSource
 
     protected override DbConnection CreateDbConnection() => new RasterizedDbConnection(this);
 
+    /// <summary>
+    /// A command with no connection: it runs on a connection every such command of this data source
+    /// shares, many statements in flight at once (<c>rastcp/2</c>). The cheapest way to run statements
+    /// that each commit on their own; one that needs a transaction, a temporary table or a sequence's
+    /// <c>currval</c> takes a <see cref="RasterizedDbConnection"/>.
+    /// </summary>
+    public new RasterizedDbCommand CreateCommand(string? commandText = null) => new(commandText ?? string.Empty) { DataSource = this };
+
+    protected override DbCommand CreateDbCommand(string? commandText = null) => CreateCommand(commandText);
+
+    private MuxConnector? _mux;
+    private readonly SemaphoreSlim _muxGate = new(1, 1);
+
+    private bool Usable(MuxConnector mux) =>
+        !mux.Broken && (Settings.IdleReconnectMs == 0 || mux.InFlight > 0 || Environment.TickCount64 - mux.LastUsed < Settings.IdleReconnectMs);
+
+    /// <summary>
+    /// The shared connection, opened on first use and reopened when it has failed or gone quiet (the
+    /// server closes one idle for 30 s). One with a statement in flight is never reopened under it.
+    /// </summary>
+    internal ValueTask<MuxConnector> Mux(CancellationToken cancellation)
+    {
+        var mux = _mux;
+        return mux is not null && Usable(mux) ? new ValueTask<MuxConnector>(mux) : OpenMux(cancellation);
+    }
+
+    private async ValueTask<MuxConnector> OpenMux(CancellationToken cancellation)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        await _muxGate.WaitAsync(cancellation).ConfigureAwait(false);
+        try
+        {
+            var mux = _mux;
+            if (mux is not null && Usable(mux))
+            {
+                return mux;
+            }
+
+            var fresh = await MuxConnector.Open(Settings, cancellation).ConfigureAwait(false);
+            _mux = fresh;
+            // Callers that sent on the old one in the instant before have their answers failed, which
+            // is what a connection the server was closing would have given them.
+            mux?.Dispose();
+            return fresh;
+        }
+        finally
+        {
+            _muxGate.Release();
+        }
+    }
+
     public new RasterizedDbConnection CreateConnection() => new(this);
 
     public new RasterizedDbConnection OpenConnection()
@@ -147,6 +198,87 @@ public sealed class RasterizedDbDataSource : DbDataSource
     internal bool? ExecSupported => _exec switch { ExecYes => true, ExecNo => false, _ => null };
 
     internal void SetExecSupported(bool supported) => _exec = supported ? ExecYes : ExecNo;
+
+    // ----------------------------------------------------------------- describe
+
+    private readonly ConcurrentDictionary<ParsedSql, string[]> _columnNames = new();
+    private volatile bool _describeUnsupported;
+
+    /// <summary>
+    /// The names of a statement's result columns, for a binary-format answer, which carries none. Asked
+    /// of the server once per statement text (<c>\x01DESCRIBE;</c>, which runs nothing) and kept. Empty
+    /// when the server does not know the request, or cannot describe the statement.
+    /// </summary>
+    internal string[] ColumnNames(ParsedSql parsed, RasterizedDbConnection? connection)
+    {
+        if (_describeUnsupported || parsed.Utf8.Length == 0)
+        {
+            return [];
+        }
+
+        if (_columnNames.TryGetValue(parsed, out var known))
+        {
+            return known;
+        }
+
+        string[] names = [];
+        try
+        {
+            Response response;
+            if (connection is { State: System.Data.ConnectionState.Open })
+            {
+                var connector = connection.Ready(false, default).GetAwaiter().GetResult();
+                connector.BeginRequest();
+                connector.Writer.Write("\u0001DESCRIBE;"u8);
+                connector.Writer.Write(parsed.Utf8);
+                response = connector.Exchange(false, 30, default).GetAwaiter().GetResult();
+            }
+            else
+            {
+                var mux = Mux(default).AsTask().GetAwaiter().GetResult();
+                using var writer = new ByteWriter(parsed.Utf8.Length + 32);
+                writer.GetSpan(MuxConnector.Header);
+                writer.Advance(MuxConnector.Header);
+                writer.Write("\u0001DESCRIBE;"u8);
+                writer.Write(parsed.Utf8);
+                response = mux.Exchange(writer, 30, default).AsTask().GetAwaiter().GetResult();
+            }
+
+            try
+            {
+                var answer = response.Span;
+                if (answer.Length == 0 || answer[0] != Answer.Simple)
+                {
+                    // A server before marked requests refuses the text as two statements.
+                    _describeUnsupported = true;
+                    return [];
+                }
+
+                names = SimpleAnswer.ColumnNames(answer[1..], out var error);
+                if (error is { SqlState: "0A000" })
+                {
+                    _describeUnsupported = true;
+                    return [];
+                }
+            }
+            finally
+            {
+                response.Return();
+            }
+        }
+        catch (RasterizedDbException)
+        {
+            // Names are a convenience here; the rows themselves have been read.
+            return [];
+        }
+
+        if (_columnNames.Count < 4096)
+        {
+            _columnNames.TryAdd(parsed, names);
+        }
+
+        return names;
+    }
 
     // --------------------------------------------------------------------- pool
 
@@ -387,6 +519,7 @@ public sealed class RasterizedDbDataSource : DbDataSource
             }
 
             Clear();
+            Interlocked.Exchange(ref _mux, null)?.Dispose();
         }
     }
 

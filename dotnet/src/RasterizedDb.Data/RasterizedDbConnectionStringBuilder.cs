@@ -20,6 +20,7 @@ namespace RasterizedDb.Data;
 /// <item><term>Login</term><description><c>Auto</c> (password when one is given, else trust), <c>Trust</c>, <c>Peer</c>, <c>Password</c>.</description></item>
 /// <item><term>Role</term><description>On a trust connection, the role its statements run as.</description></item>
 /// <item><term>Trust</term><description><c>AcceptAny</c>, <c>WebPki</c>, <c>RootCa</c> (with <c>Root Certificate</c>), <c>Pinned</c> (with <c>Certificate Fingerprint</c>).</description></item>
+/// <item><term>Client Certificate, Client Key</term><description>PEM files of a certificate to present to a server that asks for one.</description></item>
 /// <item><term>Result Format</term><description><c>Text</c> (names, schema, several statements) or <c>Binary</c> (native cells by position).</description></item>
 /// <item><term>Timeout, Command Timeout</term><description>Seconds to connect, and for a statement's answer (30; 0 waits indefinitely).</description></item>
 /// <item><term>Pooling, Maximum Pool Size, Minimum Pool Size, Connection Idle Lifetime, Keepalive</term><description>The pool.</description></item>
@@ -53,6 +54,8 @@ public sealed class RasterizedDbConnectionStringBuilder : DbConnectionStringBuil
         ["Trust"] = "Trust", ["Server Trust"] = "Trust",
         ["Root Certificate"] = "Root Certificate", ["RootCertificate"] = "Root Certificate",
         ["Certificate Fingerprint"] = "Certificate Fingerprint", ["CertificateFingerprint"] = "Certificate Fingerprint",
+        ["Client Certificate"] = "Client Certificate", ["ClientCertificate"] = "Client Certificate",
+        ["Client Key"] = "Client Key", ["ClientKey"] = "Client Key",
         ["Tls Engine"] = "Tls Engine", ["TlsEngine"] = "Tls Engine",
         ["Result Format"] = "Result Format", ["ResultFormat"] = "Result Format",
         ["Timeout"] = "Timeout", ["Connect Timeout"] = "Timeout", ["Connection Timeout"] = "Timeout",
@@ -177,6 +180,15 @@ public sealed class RasterizedDbConnectionStringBuilder : DbConnectionStringBuil
 
     /// <summary>The server certificate's SHA-256 fingerprint in hex (<c>openssl x509 -fingerprint -sha256</c>), for <see cref="RasterizedDbTrust.Pinned"/>. Several are separated by commas.</summary>
     public string? CertificateFingerprint { get => Text("Certificate Fingerprint"); set => Set("Certificate Fingerprint", value); }
+
+    /// <summary>
+    /// A PEM certificate this side presents to a server that asks for one (<c>--rdb-client-ca</c> or
+    /// pinned client certificates), with <see cref="ClientKey"/>, its private key's PEM file. Leave the
+    /// key out when the certificate file holds it too.
+    /// </summary>
+    public string? ClientCertificate { get => Text("Client Certificate"); set => Set("Client Certificate", value); }
+
+    public string? ClientKey { get => Text("Client Key"); set => Set("Client Key", value); }
 
     public RasterizedDbTlsEngine TlsEngine { get => Enumeration("Tls Engine", RasterizedDbTlsEngine.Auto); set => Set("Tls Engine", value); }
 

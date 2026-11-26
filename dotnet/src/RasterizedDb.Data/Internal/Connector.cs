@@ -64,6 +64,20 @@ internal sealed class Connector : IDisposable
     private CancellationTokenSource _timeoutSource = new();
     private int _socketTimeoutMs = -2;
     private long _cancelSequence;
+
+    /// <summary>
+    /// Whether the connection speaks <c>rastcp/2</c>, whose frames carry an id and a kind after the
+    /// length. Here every frame has id 0 and is answered before the next is sent: this is how a
+    /// multiplexed connection logs in and is set up, before the multiplexer takes it over.
+    /// </summary>
+    private readonly bool _tagged;
+
+    private int HeaderSize => _tagged ? 9 : 4;
+
+    /// <summary>The bytes a request's frame starts with, which <see cref="Exchange"/> fills in.</summary>
+    public int FrameHeader => HeaderSize;
+
+    internal Stream Stream => _stream;
     private bool _disposed;
 
     public bool Broken { get; private set; }
@@ -85,8 +99,9 @@ internal sealed class Connector : IDisposable
     /// <summary>Where this connection's notices go; set by whoever holds it.</summary>
     public Action<RasterizedDbNotice>? NoticeSink;
 
-    private Connector(ConnectionSettings settings, Socket socket, Stream stream)
+    private Connector(ConnectionSettings settings, Socket socket, Stream stream, bool tagged)
     {
+        _tagged = tagged;
         Settings = settings;
         _socket = socket;
         _stream = stream;
@@ -98,8 +113,9 @@ internal sealed class Connector : IDisposable
 
     // ------------------------------------------------------------------ opening
 
-    public static async ValueTask<Connector> Open(ConnectionSettings settings, bool async, CancellationToken cancellation)
+    public static async ValueTask<Connector> Open(ConnectionSettings settings, bool async, CancellationToken cancellation, bool multiplexed = false)
     {
+        var protocol = multiplexed ? "rastcp/2" : "rastcp/1";
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         if (settings.ConnectTimeoutMs != Timeout.Infinite)
         {
@@ -119,7 +135,7 @@ internal sealed class Connector : IDisposable
                 await Connect(socket, new UnixDomainSocketEndPoint(settings.SocketPath!), async, token).ConfigureAwait(false);
                 stream = new NetworkStream(socket, ownsSocket: true);
                 // The protocol's name, which a TLS handshake would have carried in ALPN.
-                var preamble = "rastcp/1"u8.ToArray();
+                var preamble = Encoding.ASCII.GetBytes(protocol);
                 if (async)
                 {
                     await stream.WriteAsync(preamble, token).ConfigureAwait(false);
@@ -137,10 +153,10 @@ internal sealed class Connector : IDisposable
                 // Small request/response exchanges over a long-lived connection otherwise meet the
                 // delayed-ACK timer between turns.
                 socket.NoDelay = true;
-                (stream, binding) = await Tls.Open(socket, settings, settings.Login == RasterizedDbLogin.Password, async, token).ConfigureAwait(false);
+                (stream, binding) = await Tls.Open(socket, settings, protocol, settings.Login == RasterizedDbLogin.Password, async, token).ConfigureAwait(false);
             }
 
-            connector = new Connector(settings, socket, stream);
+            connector = new Connector(settings, socket, stream, multiplexed);
             await connector.Authenticate(binding, async, token).ConfigureAwait(false);
             await connector.SetUp(async, token).ConfigureAwait(false);
             connector.LastUsed = Environment.TickCount64;
@@ -246,7 +262,7 @@ internal sealed class Connector : IDisposable
             throw AuthFailed("the user or database name is too long");
         }
 
-        BeginRequest();
+        BeginAuth();
         Writer.WriteByte(ClientHello);
         Writer.WriteByte(database is null ? (byte)1 : (byte)2);
         Writer.WriteUInt16((ushort)user.Length);
@@ -257,7 +273,7 @@ internal sealed class Connector : IDisposable
             Writer.Write(database);
         }
 
-        await Send(async, token).ConfigureAwait(false);
+        await SendAuth(async, token).ConfigureAwait(false);
         byte tag;
         string text;
         try
@@ -300,10 +316,10 @@ internal sealed class Connector : IDisposable
         }
 
         var scram = new ScramClient(settings.Username!, settings.Password!, binding ?? throw AuthFailed("this connection has no channel binding"));
-        BeginRequest();
+        BeginAuth();
         Writer.WriteByte(ClientSaslInitial);
         Writer.WriteUtf8(scram.ClientFirst);
-        await Send(async, token).ConfigureAwait(false);
+        await SendAuth(async, token).ConfigureAwait(false);
 
         (tag, text) = await AuthReply(async, token).ConfigureAwait(false);
         if (tag != ServerContinue)
@@ -314,10 +330,10 @@ internal sealed class Connector : IDisposable
         // PBKDF2 over up to a million rounds: off the caller's thread pool turn when it can be.
         var serverFirst = text;
         var clientFinal = async ? await Task.Run(() => scram.Respond(serverFirst), token).ConfigureAwait(false) : scram.Respond(serverFirst);
-        BeginRequest();
+        BeginAuth();
         Writer.WriteByte(ClientSaslFinal);
         Writer.WriteUtf8(clientFinal);
-        await Send(async, token).ConfigureAwait(false);
+        await SendAuth(async, token).ConfigureAwait(false);
 
         (tag, text) = await AuthReply(async, token).ConfigureAwait(false);
         if (tag != ServerOk)
@@ -330,7 +346,7 @@ internal sealed class Connector : IDisposable
 
     private async ValueTask<(byte Tag, string Text)> AuthReply(bool async, CancellationToken token)
     {
-        var reply = await ReadFrame(async, MaxAuthMessage, token).ConfigureAwait(false);
+        var reply = await ReadFrame(async, MaxAuthMessage, token, plain: true).ConfigureAwait(false);
         try
         {
             if (reply.Length == 0)
@@ -403,7 +419,29 @@ internal sealed class Connector : IDisposable
     public void BeginRequest()
     {
         Writer.Clear();
+        Writer.GetSpan(HeaderSize);
+        Writer.Advance(HeaderSize);
+    }
+
+    /// <summary>A message of the login exchange: a plain frame whatever the protocol, since it comes before any request.</summary>
+    private void BeginAuth()
+    {
+        Writer.Clear();
+        Writer.GetSpan(4);
         Writer.Advance(4);
+    }
+
+    private async ValueTask SendAuth(bool async, CancellationToken token)
+    {
+        Writer.PatchUInt32(0, (uint)(Writer.Length - 4));
+        if (async)
+        {
+            await _stream.WriteAsync(Writer.WrittenMemory, token).ConfigureAwait(false);
+        }
+        else
+        {
+            _stream.Write(Writer.WrittenSpan);
+        }
     }
 
     /// <summary>A token unique to this request, for <c>\x01SIMPLE:cancel=…</c> and the CANCEL that names it.</summary>
@@ -412,8 +450,14 @@ internal sealed class Connector : IDisposable
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     private async ValueTask Send(bool async, CancellationToken token)
     {
-        var length = Writer.Length - 4;
+        var length = Writer.Length - HeaderSize;
         Writer.PatchUInt32(0, (uint)length);
+        if (_tagged)
+        {
+            // Id 0, kind 0 (a request).
+            Writer.PatchUInt32(4, 0);
+            Writer.UnderlyingArray[8] = 0;
+        }
         if (async)
         {
             await _stream.WriteAsync(Writer.WrittenMemory, token).ConfigureAwait(false);
@@ -425,16 +469,17 @@ internal sealed class Connector : IDisposable
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    private async ValueTask<Response> ReadFrame(bool async, int maxMessageSize, CancellationToken token)
+    private async ValueTask<Response> ReadFrame(bool async, int maxMessageSize, CancellationToken token, bool plain = false)
     {
+        var header = plain ? 4 : HeaderSize;
         // One read usually brings the prefix and the whole of a small answer.
         var buffer = _readBuffer;
         int have;
         try
         {
             have = async
-                ? await _stream.ReadAtLeastAsync(buffer.AsMemory(0, ReadAhead), 4, throwOnEndOfStream: true, token).ConfigureAwait(false)
-                : _stream.ReadAtLeast(buffer.AsSpan(0, ReadAhead), 4, throwOnEndOfStream: true);
+                ? await _stream.ReadAtLeastAsync(buffer.AsMemory(0, ReadAhead), header, throwOnEndOfStream: true, token).ConfigureAwait(false)
+                : _stream.ReadAtLeast(buffer.AsSpan(0, ReadAhead), header, throwOnEndOfStream: true);
         }
         catch (EndOfStreamException e)
         {
@@ -449,8 +494,15 @@ internal sealed class Connector : IDisposable
                 $"the answer is {length} bytes, past the limit of {maxMessageSize} (Max Message Size in the connection string); raise it, or page the read");
         }
 
+        if (header == 9 && buffer[8] != 0)
+        {
+            throw new RasterizedDbException(
+                RasterizedDbErrorKind.Protocol,
+                buffer[8] == 1 ? "the server's handler timed out on a setup request" : "the server could not answer a setup request");
+        }
+
         var size = (int)length;
-        have -= 4;
+        have -= header;
         if (have > size)
         {
             throw new RasterizedDbException(RasterizedDbErrorKind.Protocol, "the server sent more than one answer to a request");
@@ -459,7 +511,7 @@ internal sealed class Connector : IDisposable
         var body = ArrayPool<byte>.Shared.Rent(Math.Max(size, 16));
         try
         {
-            Unsafe.CopyBlockUnaligned(ref body[0], ref buffer[4], (uint)have);
+            Unsafe.CopyBlockUnaligned(ref body[0], ref buffer[header], (uint)have);
             if (have < size)
             {
                 if (async)

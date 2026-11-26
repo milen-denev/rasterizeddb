@@ -1,6 +1,8 @@
 using System.Text;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Storage;
+using RasterizedDb.EntityFrameworkCore.Storage;
 using Microsoft.EntityFrameworkCore.Update;
 
 namespace RasterizedDb.EntityFrameworkCore.Update;
@@ -89,10 +91,34 @@ public class RasterizedDbUpdateSqlGenerator(UpdateSqlGeneratorDependencies depen
 }
 
 /// <summary>
-/// One statement per request: the native protocol runs one statement per request, so each command of a
-/// <c>SaveChanges</c> is its own round trip, inside one transaction when there are several.
+/// The commands of a <c>SaveChanges</c>, sent together: up to <c>MaxBatchSize</c> statements (100) in
+/// one round trip, as one simple query, each answering with the rows its <c>RETURNING</c> gives.
 /// </summary>
-public class RasterizedDbModificationCommandBatchFactory(ModificationCommandBatchFactoryDependencies dependencies) : IModificationCommandBatchFactory
+public class RasterizedDbModificationCommandBatchFactory(ModificationCommandBatchFactoryDependencies dependencies, IDbContextOptions options)
+    : IModificationCommandBatchFactory
 {
-    public virtual ModificationCommandBatch Create() => new SingularModificationCommandBatch(dependencies);
+    private const int DefaultBatchSize = 100;
+
+    private readonly int _maxBatchSize = RelationalOptionsExtension.Extract(options).MaxBatchSize ?? DefaultBatchSize;
+
+    public virtual ModificationCommandBatch Create() => new RasterizedDbModificationCommandBatch(dependencies, _maxBatchSize);
+}
+
+public class RasterizedDbModificationCommandBatch(ModificationCommandBatchFactoryDependencies dependencies, int maxBatchSize)
+    : AffectedCountModificationCommandBatch(dependencies, maxBatchSize)
+{
+    public override void Complete(bool moreBatchesExpected)
+    {
+        // One statement runs on the native path. Several are one request only as a simple query, which
+        // is the text format; they then run as one implicit transaction.
+        if (ModificationCommands.Count > 1)
+        {
+            using var _ = RasterizedDbCommandFormat.UseText();
+            base.Complete(moreBatchesExpected);
+        }
+        else
+        {
+            base.Complete(moreBatchesExpected);
+        }
+    }
 }

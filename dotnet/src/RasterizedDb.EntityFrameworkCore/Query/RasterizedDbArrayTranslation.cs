@@ -12,7 +12,7 @@ namespace RasterizedDb.EntityFrameworkCore.Query;
 /// <summary>
 /// LINQ over an array column: <c>tags.Contains(x)</c> is <c>x = ANY (tags)</c>, <c>tags.Length</c>,
 /// <c>Count</c> and <c>Count()</c> are <c>cardinality(tags)</c>, and <c>tags.Any()</c> asks whether that
-/// is above zero.
+/// is above zero. One element is <c>tags[i + 1]</c>: SQL counts from 1.
 /// </summary>
 /// <remarks>
 /// A list held in a parameter needs none of this: EF Core expands it into <c>IN (…)</c> itself.
@@ -24,6 +24,13 @@ public class RasterizedDbArrayTranslator(ISqlExpressionFactory sql) : IMethodCal
 
     internal static SqlExpression Cardinality(ISqlExpressionFactory sql, SqlExpression array) =>
         sql.Convert(sql.Function("cardinality", [array], nullable: true, argumentsPropagateNullability: [true], typeof(long)), typeof(int));
+
+    internal static SqlExpression Element(ISqlExpressionFactory sql, SqlExpression array, SqlExpression zeroBasedIndex, Type type) =>
+        new RasterizedDbArrayIndexExpression(
+            array,
+            sql.ApplyDefaultTypeMapping(zeroBasedIndex is SqlConstantExpression { Value: int constant } ? sql.Constant(constant + 1) : sql.Add(zeroBasedIndex, sql.Constant(1)))!,
+            type,
+            ((RasterizedDbArrayTypeMapping)array.TypeMapping!).Element);
 
     private SqlExpression Any(SqlExpression item, SqlExpression array)
     {
@@ -44,6 +51,10 @@ public class RasterizedDbArrayTranslator(ISqlExpressionFactory sql) : IMethodCal
             {
                 case nameof(Enumerable.Contains) when arguments.Count == 2:
                     return Any(arguments[1], arguments[0]);
+                case nameof(Enumerable.ElementAt) or nameof(Enumerable.ElementAtOrDefault) when arguments.Count == 2 && arguments[1].Type == typeof(int):
+                    return Element(sql, arguments[0], arguments[1], method.ReturnType);
+                case nameof(Enumerable.First) or nameof(Enumerable.FirstOrDefault) when arguments.Count == 1:
+                    return Element(sql, arguments[0], sql.Constant(0), method.ReturnType);
                 case nameof(Enumerable.Count) when arguments.Count == 1:
                     return Cardinality(sql, arguments[0]);
                 case nameof(Enumerable.LongCount) when arguments.Count == 1:
@@ -53,6 +64,12 @@ public class RasterizedDbArrayTranslator(ISqlExpressionFactory sql) : IMethodCal
             }
 
             return null;
+        }
+
+        // list[i]: SQL counts from 1.
+        if (instance is not null && IsArrayColumn(instance) && method.Name == "get_Item" && arguments.Count == 1 && arguments[0].Type == typeof(int))
+        {
+            return Element(sql, instance, arguments[0], method.ReturnType);
         }
 
         // List<T>.Contains, ICollection<T>.Contains.
@@ -99,5 +116,18 @@ public class RasterizedDbSqlTranslatingExpressionVisitor(
         }
 
         return base.VisitUnary(unaryExpression);
+    }
+
+    protected override Expression VisitBinary(BinaryExpression binaryExpression)
+    {
+        // array[i]
+        if (binaryExpression.NodeType == ExpressionType.ArrayIndex && binaryExpression.Left.Type != typeof(byte[])
+            && Visit(binaryExpression.Left) is SqlExpression array && RasterizedDbArrayTranslator.IsArrayColumn(array)
+            && Visit(binaryExpression.Right) is SqlExpression index)
+        {
+            return RasterizedDbArrayTranslator.Element(Dependencies.SqlExpressionFactory, array, index, binaryExpression.Type);
+        }
+
+        return base.VisitBinary(binaryExpression);
     }
 }

@@ -592,6 +592,17 @@ public readonly struct RasterizedDbKv
         where TKey : notnull =>
         new(this, prefix, jsonOptions, null);
 
+    /// <summary>
+    /// Objects of <typeparamref name="T"/> stored as hashes, one field per public property, under
+    /// <c>&lt;prefix&gt;:&lt;key&gt;</c>: a field can be read or changed without the rest.
+    /// </summary>
+    /// <param name="key">The property that identifies an object.</param>
+    /// <param name="prefix">The key prefix; the type's name in lower case when left out.</param>
+    public RasterizedDbKvRepository<T, TKey> Repository<T, TKey>(Func<T, TKey> key, string? prefix = null)
+        where T : class, new()
+        where TKey : notnull =>
+        new(this, key, prefix ?? typeof(T).Name.ToLowerInvariant());
+
     /// <summary><see cref="Map{TKey,TValue}(string,JsonSerializerOptions?)"/> with source-generated JSON metadata, for trimmed and AOT applications.</summary>
     public RasterizedDbKvMap<TKey, TValue> Map<TKey, TValue>(string prefix, JsonTypeInfo<TValue> jsonTypeInfo)
         where TKey : notnull =>
@@ -614,6 +625,15 @@ public readonly struct RasterizedDbKvMap<TKey, TValue>
         _options = options;
         _typeInfo = typeInfo;
     }
+
+    internal RasterizedDbKv Kv => _kv;
+
+    internal byte[] Prefix => _prefix;
+
+    internal TValue DecodeValue(byte[] bytes) => Decode(bytes);
+
+    /// <summary>A query over the map's entries: by key prefix or glob, filtered here by key or by entry.</summary>
+    public RasterizedDbKvQuery<TKey, TValue> Query() => new(this);
 
     /// <summary>The key as stored: the prefix, a colon, and the key's text.</summary>
     public byte[] FullKey(TKey key)
@@ -813,4 +833,326 @@ internal static class KvCodec
             }
         }
     }
+}
+
+/// <summary>
+/// A query over a typed map: the keys are found by <c>SCAN</c> (the pattern is matched by the server),
+/// the values fetched 500 at a time, and the filters run here. Not a snapshot: an entry removed between
+/// the scan and its fetch is simply not returned.
+/// </summary>
+public sealed class RasterizedDbKvQuery<TKey, TValue>
+    where TKey : notnull
+{
+    private readonly RasterizedDbKvMap<TKey, TValue> _map;
+    private byte[] _suffix = [];
+    private Func<TKey, bool>? _keyFilter;
+    private Func<TKey, TValue, bool>? _filter;
+    private int? _limit;
+    private bool _lenient;
+
+    internal RasterizedDbKvQuery(RasterizedDbKvMap<TKey, TValue> map) => _map = map;
+
+    private static byte[] GlobEscape(ReadOnlySpan<byte> bytes)
+    {
+        var escaped = new List<byte>(bytes.Length + 2);
+        foreach (var b in bytes)
+        {
+            if (b is (byte)'*' or (byte)'?' or (byte)'[' or (byte)']' or (byte)'\\')
+            {
+                escaped.Add((byte)'\\');
+            }
+
+            escaped.Add(b);
+        }
+
+        return [.. escaped];
+    }
+
+    /// <summary>Only keys starting with <paramref name="prefix"/> (after the map's own prefix).</summary>
+    public RasterizedDbKvQuery<TKey, TValue> Prefix(string prefix)
+    {
+        _suffix = [.. GlobEscape(Encoding.UTF8.GetBytes(prefix)), (byte)'*'];
+        return this;
+    }
+
+    /// <summary>Only keys matching a glob (<c>*</c>, <c>?</c>, <c>[a-z]</c>), after the map's own prefix.</summary>
+    public RasterizedDbKvQuery<TKey, TValue> Pattern(string glob)
+    {
+        _suffix = Encoding.UTF8.GetBytes(glob);
+        return this;
+    }
+
+    /// <summary>Keeps the keys <paramref name="keep"/> accepts, before any value is fetched.</summary>
+    public RasterizedDbKvQuery<TKey, TValue> WhereKey(Func<TKey, bool> keep)
+    {
+        _keyFilter = keep;
+        return this;
+    }
+
+    public RasterizedDbKvQuery<TKey, TValue> Where(Func<TKey, TValue, bool> keep)
+    {
+        _filter = keep;
+        return this;
+    }
+
+    public RasterizedDbKvQuery<TKey, TValue> Take(int count)
+    {
+        _limit = count;
+        return this;
+    }
+
+    /// <summary>Skips keys and values that do not read as the query's types, where the default is an error naming one.</summary>
+    public RasterizedDbKvQuery<TKey, TValue> Lenient()
+    {
+        _lenient = true;
+        return this;
+    }
+
+    private async Task<List<(byte[] Full, TKey Key)>> MatchingKeys(CancellationToken cancellation)
+    {
+        var prefix = _map.Prefix;
+        byte[] pattern = [.. GlobEscape(prefix), .. _suffix.Length == 0 ? "*"u8.ToArray() : _suffix];
+        var matches = new List<(byte[], TKey)>();
+        foreach (var full in await _map.Kv.KeysAsync(pattern, cancellation).ConfigureAwait(false))
+        {
+            TKey key;
+            try
+            {
+                key = ValueReader.Read<TKey>(Tag.String, full.AsSpan(Math.Min(prefix.Length, full.Length)));
+            }
+            catch (Exception e) when (e is InvalidCastException or FormatException or OverflowException)
+            {
+                if (_lenient)
+                {
+                    continue;
+                }
+
+                throw new InvalidCastException($"key \"{Encoding.UTF8.GetString(full)}\" does not read as {typeof(TKey).Name} ({e.Message}); Lenient() skips such keys", e);
+            }
+
+            if (_keyFilter is null || _keyFilter(key))
+            {
+                matches.Add((full, key));
+            }
+        }
+
+        return matches;
+    }
+
+    /// <summary>The matching entries.</summary>
+    public async Task<List<KeyValuePair<TKey, TValue>>> ToListAsync(CancellationToken cancellationToken = default)
+    {
+        var entries = new List<KeyValuePair<TKey, TValue>>();
+        var keys = await MatchingKeys(cancellationToken).ConfigureAwait(false);
+        for (var at = 0; at < keys.Count; at += 500)
+        {
+            var chunk = keys.GetRange(at, Math.Min(500, keys.Count - at));
+            var values = await _map.Kv.GetManyAsync(chunk.ConvertAll(k => k.Full), cancellationToken).ConfigureAwait(false);
+            for (var i = 0; i < chunk.Count && i < values.Count; i++)
+            {
+                // Deleted since the scan, or not a string value (a hash, a list): not an entry of this map.
+                if (values[i] is not { } bytes)
+                {
+                    continue;
+                }
+
+                TValue value;
+                try
+                {
+                    value = _map.DecodeValue(bytes);
+                }
+                catch (Exception e) when (e is InvalidCastException or FormatException or OverflowException or JsonException)
+                {
+                    if (_lenient)
+                    {
+                        continue;
+                    }
+
+                    throw new InvalidCastException(
+                        $"the value at \"{Encoding.UTF8.GetString(chunk[i].Full)}\" does not read as {typeof(TValue).Name} ({e.Message}); Lenient() skips such entries", e);
+                }
+
+                if (_filter is null || _filter(chunk[i].Key, value))
+                {
+                    entries.Add(new(chunk[i].Key, value));
+                    if (entries.Count >= _limit)
+                    {
+                        return entries;
+                    }
+                }
+            }
+        }
+
+        return entries;
+    }
+
+    /// <summary>The matching keys; no value is fetched unless an entry filter needs it.</summary>
+    public async Task<List<TKey>> KeysAsync(CancellationToken cancellationToken = default)
+    {
+        if (_filter is not null)
+        {
+            return (await ToListAsync(cancellationToken).ConfigureAwait(false)).ConvertAll(e => e.Key);
+        }
+
+        var keys = (await MatchingKeys(cancellationToken).ConfigureAwait(false)).ConvertAll(k => k.Key);
+        return _limit is { } limit && keys.Count > limit ? keys.GetRange(0, limit) : keys;
+    }
+
+    public async Task<int> CountAsync(CancellationToken cancellationToken = default) =>
+        _filter is null && _limit is null
+            ? (await MatchingKeys(cancellationToken).ConfigureAwait(false)).Count
+            : (await ToListAsync(cancellationToken).ConfigureAwait(false)).Count;
+
+    /// <summary>Removes the matching entries (a <c>DEL</c> per 500 keys; not atomic). Returns how many were removed.</summary>
+    public async Task<long> RemoveAsync(CancellationToken cancellationToken = default)
+    {
+        List<byte[]> keys;
+        if (_filter is null && _limit is null)
+        {
+            keys = (await MatchingKeys(cancellationToken).ConfigureAwait(false)).ConvertAll(k => k.Full);
+        }
+        else
+        {
+            keys = (await ToListAsync(cancellationToken).ConfigureAwait(false)).ConvertAll(e => _map.FullKey(e.Key));
+        }
+
+        long removed = 0;
+        for (var at = 0; at < keys.Count; at += 500)
+        {
+            removed += await _map.Kv.DeleteAsync(keys.GetRange(at, Math.Min(500, keys.Count - at)), cancellationToken).ConfigureAwait(false);
+        }
+
+        return removed;
+    }
+}
+
+/// <summary>
+/// Objects stored as hashes: one field per public read-write property, each as its text (a property
+/// that is not a scalar as JSON). See <see cref="RasterizedDbKv.Repository{T,TKey}"/>.
+/// </summary>
+public sealed class RasterizedDbKvRepository<T, TKey>
+    where T : class, new()
+    where TKey : notnull
+{
+    private static readonly System.Reflection.PropertyInfo[] Properties =
+        [.. typeof(T).GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance).Where(p => p is { CanRead: true, CanWrite: true } && p.GetIndexParameters().Length == 0)];
+
+    private readonly RasterizedDbKv _kv;
+    private readonly Func<T, TKey> _key;
+    private readonly byte[] _prefix;
+
+    internal RasterizedDbKvRepository(RasterizedDbKv kv, Func<T, TKey> key, string prefix)
+    {
+        _kv = kv;
+        _key = key;
+        _prefix = Encoding.UTF8.GetBytes(prefix + ":");
+    }
+
+    private byte[] FullKey(TKey key)
+    {
+        using var writer = new ByteWriter(64);
+        writer.Write(_prefix);
+        KvCodec.WriteText(writer, key);
+        return writer.WrittenSpan.ToArray();
+    }
+
+    private static bool Scalar(Type type)
+    {
+        type = Nullable.GetUnderlyingType(type) ?? type;
+        return type.IsPrimitive || type.IsEnum || type == typeof(string) || type == typeof(decimal) || type == typeof(Guid) || type == typeof(byte[])
+               || type == typeof(DateTime) || type == typeof(DateTimeOffset) || type == typeof(DateOnly) || type == typeof(TimeOnly) || type == typeof(TimeSpan);
+    }
+
+    private static byte[] FieldValue(System.Reflection.PropertyInfo property, object value)
+    {
+        if (!Scalar(property.PropertyType))
+        {
+            return JsonSerializer.SerializeToUtf8Bytes(value, property.PropertyType);
+        }
+
+        using var writer = new ByteWriter(64);
+        KvCodec.WriteText(writer, value);
+        return writer.WrittenSpan.ToArray();
+    }
+
+    /// <summary>
+    /// Writes every property as a field. A null property's field is removed, so a reader sees it as
+    /// null. Two commands when a TTL is given or a property is null; not atomic.
+    /// </summary>
+    public async Task SaveAsync(T item, TimeSpan? ttl = null, CancellationToken cancellationToken = default)
+    {
+        var key = FullKey(_key(item));
+        var fields = new List<KeyValuePair<byte[], byte[]>>(Properties.Length);
+        List<byte[]>? cleared = null;
+        foreach (var property in Properties)
+        {
+            var name = Encoding.UTF8.GetBytes(property.Name);
+            if (property.GetValue(item) is { } value)
+            {
+                fields.Add(new(name, FieldValue(property, value)));
+            }
+            else
+            {
+                (cleared ??= []).Add(name);
+            }
+        }
+
+        await _kv.HashSetAsync(key, fields, cancellationToken).ConfigureAwait(false);
+        if (cleared is not null)
+        {
+            await _kv.HashDeleteAsync(key, cleared, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (ttl is { } time)
+        {
+            await _kv.ExpireAsync(key, time, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>The object stored under <paramref name="key"/>, or null when there is none.</summary>
+    public async Task<T?> GetAsync(TKey key, CancellationToken cancellationToken = default)
+    {
+        var fields = await _kv.HashGetAllAsync(FullKey(key), cancellationToken).ConfigureAwait(false);
+        if (fields.Count == 0)
+        {
+            return null;
+        }
+
+        var item = new T();
+        foreach (var (name, bytes) in fields)
+        {
+            var property = Array.Find(Properties, p => Encoding.UTF8.GetString(name) == p.Name);
+            if (property is null)
+            {
+                // A field of a newer or older shape of the type.
+                continue;
+            }
+
+            property.SetValue(
+                item,
+                Scalar(property.PropertyType)
+                    ? ValueReader.ReadBoxed(property.PropertyType, Tag.String, bytes)
+                    : JsonSerializer.Deserialize(bytes, property.PropertyType));
+        }
+
+        return item;
+    }
+
+    /// <summary>Changes one field, leaving the others as they are.</summary>
+    public Task SetFieldAsync(TKey key, string property, object value, CancellationToken cancellationToken = default)
+    {
+        var info = Array.Find(Properties, p => p.Name == property) ?? throw new ArgumentException($"{typeof(T).Name} has no property \"{property}\"");
+        return _kv.HashSetAsync(FullKey(key), [new(Encoding.UTF8.GetBytes(property), FieldValue(info, value))], cancellationToken);
+    }
+
+    /// <summary>Adds to a numeric field in place (<c>HINCRBY</c>) and returns its new value.</summary>
+    public Task<long> IncrementAsync(TKey key, string property, long by = 1, CancellationToken cancellationToken = default) =>
+        _kv.HashIncrementAsync(FullKey(key), Encoding.UTF8.GetBytes(property), by, cancellationToken);
+
+    public async Task<bool> RemoveAsync(TKey key, CancellationToken cancellationToken = default) =>
+        await _kv.DeleteAsync(FullKey(key), cancellationToken).ConfigureAwait(false) > 0;
+
+    public Task<bool> ContainsAsync(TKey key, CancellationToken cancellationToken = default) => _kv.ExistsAsync(FullKey(key), cancellationToken);
+
+    public Task<bool> ExpireAsync(TKey key, TimeSpan ttl, CancellationToken cancellationToken = default) => _kv.ExpireAsync(FullKey(key), ttl, cancellationToken);
 }

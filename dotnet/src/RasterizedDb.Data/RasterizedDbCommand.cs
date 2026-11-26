@@ -63,7 +63,7 @@ public sealed class RasterizedDbCommand : DbCommand
     /// <summary>Seconds to wait for the answer; the connection string's <c>Command Timeout</c> unless set. 0 waits indefinitely.</summary>
     public override int CommandTimeout
     {
-        get => _timeout ?? _connection?.DefaultCommandTimeout ?? 30;
+        get => _timeout ?? _connection?.DefaultCommandTimeout ?? DataSource?.Settings.CommandTimeoutSeconds ?? 30;
         set => _timeout = value >= 0 ? value : throw new ArgumentOutOfRangeException(nameof(value));
     }
 
@@ -117,13 +117,20 @@ public sealed class RasterizedDbCommand : DbCommand
     /// A statement the driver built itself, already UTF-8 and with nothing to scan or fill in (a KV
     /// command): sent as it is, on the native path, in place of <see cref="CommandText"/>.
     /// </summary>
+    /// <summary>The data source a command with no connection runs on (<see cref="RasterizedDbDataSource.CreateCommand"/>).</summary>
+    internal RasterizedDbDataSource? DataSource;
+
     internal ReadOnlyMemory<byte> RawStatement;
+
+    /// <summary>Whether <see cref="RawStatement"/> is a simple query (several statements, text answer) and not one native statement.</summary>
+    internal bool RawIsText;
 
     // ------------------------------------------------------------------ request
 
-    private RasterizedDbParameter ParameterFor(ParsedSql parsed, int index)
+    private RasterizedDbParameter ParameterFor(ParsedSql parsed, int index) => ParameterFor(parsed, index, _parameters?.Items);
+
+    internal static RasterizedDbParameter ParameterFor(ParsedSql parsed, int index, List<RasterizedDbParameter>? items)
     {
-        var items = _parameters?.Items;
         if (parsed.Names is { } names)
         {
             var name = names[index];
@@ -156,14 +163,16 @@ public sealed class RasterizedDbCommand : DbCommand
     }
 
     /// <summary>The statement as text, each placeholder replaced by its value's literal.</summary>
-    private void WriteRendered(ByteWriter writer, ParsedSql parsed)
+    private void WriteRendered(ByteWriter writer, ParsedSql parsed) => WriteRendered(writer, parsed, _parameters?.Items);
+
+    internal static void WriteRendered(ByteWriter writer, ParsedSql parsed, List<RasterizedDbParameter>? items)
     {
         var sql = parsed.Utf8.AsSpan();
         var copied = 0;
         foreach (ref readonly var span in parsed.Spans.AsSpan())
         {
             writer.Write(sql[copied..span.Start]);
-            ParameterFor(parsed, span.Parameter).WriteLiteral(writer);
+            ParameterFor(parsed, span.Parameter, items).WriteLiteral(writer);
             copied = span.End;
         }
 
@@ -233,10 +242,16 @@ public sealed class RasterizedDbCommand : DbCommand
         $"the text holds more than one statement (a second one starts after the ';' at byte {parsed.SecondStatementAt}), and the binary " +
         "result format runs one statement per command. Send each on its own, or run the command with ResultFormat = Text, which takes several.");
 
-    private async ValueTask Build(Connector connector, RasterizedDbDataSource source, ParsedSql parsed, bool text, bool async, CancellationToken cancellation)
+    /// <summary>
+    /// Writes the request after the <paramref name="header"/> bytes its frame starts with: the simple-query
+    /// form for the text format; for the binary one the statement alone, the EXEC form when the server
+    /// knows it (<paramref name="exec"/>), or the statement with its values written in.
+    /// </summary>
+    private void BuildInto(ByteWriter writer, int header, bool? exec, ParsedSql parsed, bool text, Connector connector)
     {
-        var writer = connector.Writer;
-        connector.BeginRequest();
+        writer.Clear();
+        writer.GetSpan(header);
+        writer.Advance(header);
         if (text)
         {
             // \x01SIMPLE:cancel=<token>;<statements>
@@ -247,7 +262,15 @@ public sealed class RasterizedDbCommand : DbCommand
             writer.WriteByte((byte)'-');
             writer.WriteInt64Text(_cancelSequence);
             writer.WriteByte((byte)';');
-            WriteRendered(writer, parsed);
+            if (RawStatement.IsEmpty)
+            {
+                WriteRendered(writer, parsed);
+            }
+            else
+            {
+                writer.Write(RawStatement.Span);
+            }
+
             return;
         }
 
@@ -268,13 +291,6 @@ public sealed class RasterizedDbCommand : DbCommand
             return;
         }
 
-        var exec = source.ExecSupported;
-        if (exec is null && !connector.InBlock)
-        {
-            exec = await Probe(connector, source, async, cancellation).ConfigureAwait(false);
-            connector.BeginRequest();
-        }
-
         if (exec == true)
         {
             if (TryWriteExec(writer, parsed))
@@ -282,10 +298,37 @@ public sealed class RasterizedDbCommand : DbCommand
                 return;
             }
 
-            connector.BeginRequest();
+            writer.Clear();
+            writer.Advance(header);
         }
 
         WriteRendered(writer, parsed);
+    }
+
+    /// <summary>Whether this statement's request depends on knowing if the server takes the EXEC form.</summary>
+    private bool NeedsExecAnswer(ParsedSql parsed, bool text) => !text && RawStatement.IsEmpty && parsed.Spans.Length > 0 && !parsed.MultipleStatements;
+
+    private static void WriteProbe(ByteWriter writer, int header)
+    {
+        writer.Clear();
+        writer.GetSpan(header);
+        writer.Advance(header);
+        writer.Write("\u0001EXEC;"u8);
+        writer.WriteUInt32(8);
+        writer.Write("SELECT 1"u8);
+        writer.WriteUInt16(0);
+        writer.WriteUInt16(0);
+    }
+
+    private async ValueTask Build(Connector connector, RasterizedDbDataSource source, ParsedSql parsed, bool text, bool async, CancellationToken cancellation)
+    {
+        var exec = source.ExecSupported;
+        if (exec is null && !connector.InBlock && NeedsExecAnswer(parsed, text))
+        {
+            exec = await Probe(connector, source, async, cancellation).ConfigureAwait(false);
+        }
+
+        BuildInto(connector.Writer, connector.FrameHeader, exec, parsed, text, connector);
     }
 
     /// <summary>
@@ -294,13 +337,7 @@ public sealed class RasterizedDbCommand : DbCommand
     /// </summary>
     private static async ValueTask<bool> Probe(Connector connector, RasterizedDbDataSource source, bool async, CancellationToken cancellation)
     {
-        var writer = connector.Writer;
-        connector.BeginRequest();
-        writer.Write("\u0001EXEC;"u8);
-        writer.WriteUInt32(8);
-        writer.Write("SELECT 1"u8);
-        writer.WriteUInt16(0);
-        writer.WriteUInt16(0);
+        WriteProbe(connector.Writer, connector.FrameHeader);
         var response = await connector.Exchange(async, 30, cancellation).ConfigureAwait(false);
         var span = response.Span;
         var at = connector.TakeNotices(span);
@@ -340,13 +377,18 @@ public sealed class RasterizedDbCommand : DbCommand
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     private async ValueTask<Outcome> Run(bool async, Mode mode, CommandBehavior behavior, CancellationToken cancellation)
     {
+        if (_connection is null && DataSource is { } shared)
+        {
+            return await RunShared(shared, mode, behavior, cancellation).ConfigureAwait(false);
+        }
+
         var connection = RequireConnection();
         var connector = await connection.Ready(async, cancellation).ConfigureAwait(false);
         var source = connection.Source!;
         var raw = !RawStatement.IsEmpty;
         var parsed = raw ? ParsedSql.Raw : Parsed();
         var format = ResultFormat == RasterizedDbResultFormat.Default ? connection.DefaultResultFormat : ResultFormat;
-        var text = !raw && format == RasterizedDbResultFormat.Text;
+        var text = raw ? RawIsText : format == RasterizedDbResultFormat.Text;
         var wasInBlock = connector.InBlock;
 
         try
@@ -395,7 +437,73 @@ public sealed class RasterizedDbCommand : DbCommand
         }
     }
 
-    private static Outcome ReadBinary(RasterizedDbConnection connection, Connector connector, ParsedSql parsed, ref Response response, Mode mode, CommandBehavior behavior)
+    /// <summary>
+    /// A command with no connection of its own: sent on the data source's shared multiplexed
+    /// connection, where it is in flight beside every other caller's. It commits on its own;
+    /// transaction control is refused there, and a transaction takes a <see cref="RasterizedDbConnection"/>.
+    /// </summary>
+    private async ValueTask<Outcome> RunShared(RasterizedDbDataSource source, Mode mode, CommandBehavior behavior, CancellationToken cancellation)
+    {
+        var raw = !RawStatement.IsEmpty;
+        if (_text.Length == 0 && !raw)
+        {
+            throw new InvalidOperationException("the command has no text");
+        }
+
+        var parsed = raw ? ParsedSql.Raw : Parsed();
+        var format = ResultFormat == RasterizedDbResultFormat.Default ? source.Settings.ResultFormat : ResultFormat;
+        var text = raw ? RawIsText : format == RasterizedDbResultFormat.Text;
+        if (parsed.Verb != TransactionVerb.None)
+        {
+            throw new RasterizedDbException(
+                RasterizedDbErrorKind.Unsupported,
+                "transaction control needs a connection of its own: a data source's commands share one multiplexed connection. " +
+                "Open a RasterizedDbConnection and use BeginTransaction.");
+        }
+
+        var mux = await source.Mux(cancellation).ConfigureAwait(false);
+        var timeout = _timeout ?? source.Settings.CommandTimeoutSeconds;
+        Response response;
+        var writer = new ByteWriter(512);
+        try
+        {
+            var exec = source.ExecSupported;
+            if (exec is null && NeedsExecAnswer(parsed, text))
+            {
+                WriteProbe(writer, MuxConnector.Header);
+                var probe = await mux.Exchange(writer, 30, cancellation).ConfigureAwait(false);
+                var answer = probe.Span;
+                var at = mux.Connector.TakeNotices(answer);
+                exec = answer.Length > at && answer[at] == Answer.Rows;
+                probe.Return();
+                source.SetExecSupported(exec.Value);
+            }
+
+            BuildInto(writer, MuxConnector.Header, exec, parsed, text, mux.Connector);
+            response = await mux.Exchange(writer, timeout, cancellation).ConfigureAwait(false);
+        }
+        finally
+        {
+            writer.Dispose();
+            _cancelSequence = 0;
+        }
+
+        try
+        {
+            return text
+                ? ReadText(null, mux.Connector, ref response, mode, behavior)
+                : ReadBinary(null, mux.Connector, parsed, ref response, mode, behavior, source);
+        }
+        catch
+        {
+            response.Return();
+            throw;
+        }
+    }
+
+    private static RasterizedDbDataReader NewReader(RasterizedDbConnection? connection) => connection?.TakeReader() ?? new RasterizedDbDataReader();
+
+    private static Outcome ReadBinary(RasterizedDbConnection? connection, Connector connector, ParsedSql parsed, ref Response response, Mode mode, CommandBehavior behavior, RasterizedDbDataSource? source = null)
     {
         var span = response.Span;
         var at = connector.TakeNotices(span);
@@ -450,8 +558,8 @@ public sealed class RasterizedDbCommand : DbCommand
                 break;
             case Answer.Rows:
             {
-                var reader = connection.TakeReader();
-                reader.InitBinary(connection, behavior, response, at + 1, -1);
+                var reader = NewReader(connection);
+                reader.InitBinary(connection, behavior, response, at + 1, -1, parsed, source);
                 response = default;
                 if (mode == Mode.Reader)
                 {
@@ -493,7 +601,7 @@ public sealed class RasterizedDbCommand : DbCommand
         response.Return();
         if (mode == Mode.Reader)
         {
-            var reader = connection.TakeReader();
+            var reader = NewReader(connection);
             reader.InitEmpty(connection, behavior, outcome.Affected);
             outcome.Reader = reader;
         }
@@ -501,7 +609,7 @@ public sealed class RasterizedDbCommand : DbCommand
         return outcome;
     }
 
-    private static Outcome ReadText(RasterizedDbConnection connection, Connector connector, ref Response response, Mode mode, CommandBehavior behavior)
+    private static Outcome ReadText(RasterizedDbConnection? connection, Connector connector, ref Response response, Mode mode, CommandBehavior behavior)
     {
         var span = response.Span;
         if (span.Length == 0)
@@ -521,7 +629,7 @@ public sealed class RasterizedDbCommand : DbCommand
                 : new RasterizedDbException(RasterizedDbErrorKind.Protocol, $"a simple query was answered with tag {span[0]}, not as a simple query");
         }
 
-        var reader = connection.TakeReader();
+        var reader = NewReader(connection);
         // Shifted by one: the scan's offsets are into the messages, which start after the tag byte.
         var messages = span[1..];
         var results = reader.TextResults;
@@ -581,19 +689,30 @@ public sealed class RasterizedDbCommand : DbCommand
 
     private static int Clamp(long affected) => affected > int.MaxValue ? int.MaxValue : (int)affected;
 
-    public override int ExecuteNonQuery() => Clamp(Run(false, Mode.NonQuery, CommandBehavior.Default, default).GetAwaiter().GetResult().Affected);
+    /// <summary>
+    /// The synchronous calls. On a connection every step under them is synchronous, so the result is
+    /// there when the call returns; a data source's command shares a connection other callers are
+    /// reading, so there the call waits for its answer.
+    /// </summary>
+    private Outcome RunSync(Mode mode, CommandBehavior behavior)
+    {
+        var run = Run(false, mode, behavior, default);
+        return run.IsCompleted ? run.GetAwaiter().GetResult() : run.AsTask().GetAwaiter().GetResult();
+    }
+
+    public override int ExecuteNonQuery() => Clamp(RunSync(Mode.NonQuery, CommandBehavior.Default).Affected);
 
     public override async Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken) =>
         Clamp((await Run(true, Mode.NonQuery, CommandBehavior.Default, cancellationToken).ConfigureAwait(false)).Affected);
 
-    public override object? ExecuteScalar() => Run(false, Mode.Scalar, CommandBehavior.Default, default).GetAwaiter().GetResult().Scalar;
+    public override object? ExecuteScalar() => RunSync(Mode.Scalar, CommandBehavior.Default).Scalar;
 
     public override async Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken) =>
         (await Run(true, Mode.Scalar, CommandBehavior.Default, cancellationToken).ConfigureAwait(false)).Scalar;
 
     public new RasterizedDbDataReader ExecuteReader() => ExecuteReader(CommandBehavior.Default);
 
-    public new RasterizedDbDataReader ExecuteReader(CommandBehavior behavior) => Run(false, Mode.Reader, behavior, default).GetAwaiter().GetResult().Reader!;
+    public new RasterizedDbDataReader ExecuteReader(CommandBehavior behavior) => RunSync(Mode.Reader, behavior).Reader!;
 
     public new Task<RasterizedDbDataReader> ExecuteReaderAsync(CancellationToken cancellationToken = default) =>
         ExecuteReaderAsync(CommandBehavior.Default, cancellationToken);
@@ -615,7 +734,7 @@ public sealed class RasterizedDbCommand : DbCommand
     public override void Cancel()
     {
         var sequence = _cancelSequence;
-        var source = _connection?.Source;
+        var source = _connection?.Source ?? DataSource;
         if (sequence == 0 || source is null)
         {
             return;

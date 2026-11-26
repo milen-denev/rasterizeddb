@@ -94,16 +94,23 @@ public class RasterizedDbDatabaseModelFactory : DatabaseModelFactory
         var tables = new Dictionary<string, DatabaseTable>(StringComparer.Ordinal);
         foreach (var row in Rows(
                      connection,
-                     $"SELECT table_name FROM information_schema.tables WHERE table_schema = '{Schema}' AND table_type = 'BASE TABLE' ORDER BY table_name"))
+                     $"SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = '{Schema}' ORDER BY table_name"))
         {
             var name = row[0]!;
+            var view = string.Equals(row[1], "VIEW", StringComparison.OrdinalIgnoreCase);
+            if (!view && !string.Equals(row[1], "BASE TABLE", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
             // The migrations history table, and the server's own catalogue tables, are not the application's.
             if (name == HistoryRepository.DefaultTableName || name.StartsWith("__rdb_", StringComparison.Ordinal) || (wanted.Count > 0 && !wanted.Contains(name)))
             {
                 continue;
             }
 
-            var table = new DatabaseTable { Database = model, Name = name, Schema = Schema };
+            // A view scaffolds as a keyless entity over it.
+            var table = view ? new DatabaseView { Database = model, Name = name, Schema = Schema } : new DatabaseTable { Database = model, Name = name, Schema = Schema };
             tables[name] = table;
             model.Tables.Add(table);
         }

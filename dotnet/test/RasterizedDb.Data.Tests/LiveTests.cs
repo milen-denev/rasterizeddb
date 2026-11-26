@@ -506,6 +506,258 @@ public class LiveTests(ServerFixture servers)
         Assert.Equal(2499, reader.GetInt64(2));
     }
 
+    private sealed class Visitor
+    {
+        public Guid Id { get; set; }
+        public string Name { get; set; } = "";
+        public long Visits { get; set; }
+        public DateTime? LastSeen { get; set; }
+        public List<string> Roles { get; set; } = [];
+    }
+
+    [Fact]
+    public async Task Key_value_queries_and_hash_repositories()
+    {
+        await using var connection = await Open();
+        if (connection is null)
+        {
+            return;
+        }
+
+        var kv = connection.Kv;
+        var scores = kv.Map<string, int>($"scores{Guid.NewGuid():N}");
+        foreach (var (name, score) in new[] { ("ann", 10), ("bob", 25), ("amy", 40), ("a*b", 7) })
+        {
+            await scores.SetAsync(name, score);
+        }
+
+        Assert.Equal(4, await scores.Query().CountAsync());
+        Assert.Equal(["a*b", "amy", "ann"], (await scores.Query().Prefix("a").KeysAsync()).Order());
+        Assert.Equal(["a*b"], await scores.Query().Prefix("a*").KeysAsync());
+        Assert.Equal(["amy", "bob"], (await scores.Query().Where((_, score) => score > 20).ToListAsync()).Select(e => e.Key).Order());
+        Assert.Single(await scores.Query().WhereKey(k => k.Length == 3).Take(1).ToListAsync());
+        Assert.Equal(2, await scores.Query().Where((_, score) => score <= 10).RemoveAsync());
+        Assert.Equal(2, await scores.Query().CountAsync());
+
+        var visitors = kv.Repository<Visitor, Guid>(v => v.Id, $"visitors{Guid.NewGuid():N}");
+        var id = Guid.NewGuid();
+        Assert.Null(await visitors.GetAsync(id));
+        var seen = new DateTime(2024, 5, 6, 7, 8, 9, DateTimeKind.Utc);
+        await visitors.SaveAsync(new Visitor { Id = id, Name = "o'neil", Visits = 3, LastSeen = seen, Roles = ["admin", "dev"] }, TimeSpan.FromMinutes(5));
+        var loaded = await visitors.GetAsync(id);
+        Assert.NotNull(loaded);
+        Assert.Equal((id, "o'neil", 3L), (loaded.Id, loaded.Name, loaded.Visits));
+        Assert.Equal(seen, loaded.LastSeen!.Value);
+        Assert.Equal(["admin", "dev"], loaded.Roles);
+        Assert.Equal(5, await visitors.IncrementAsync(id, nameof(Visitor.Visits), 2));
+        await visitors.SetFieldAsync(id, nameof(Visitor.Name), "renamed");
+        loaded!.LastSeen = null;
+        loaded.Name = "saved";
+        loaded.Visits = 5;
+        await visitors.SaveAsync(loaded);
+        var again = await visitors.GetAsync(id);
+        Assert.Equal(("saved", 5L, null), (again!.Name, again.Visits, again.LastSeen));
+        Assert.True(await visitors.RemoveAsync(id));
+        Assert.False(await visitors.ContainsAsync(id));
+    }
+
+    [Fact]
+    public async Task The_migrator_applies_verifies_and_rolls_back()
+    {
+        await using var connection = await Open();
+        if (connection is null)
+        {
+            return;
+        }
+
+        var table = Table("migrated");
+        var history = Table("history");
+        var first = new RasterizedDbMigrator().HistoryTable(history)
+            .Step("001_create", $"CREATE TABLE {table} (id INTEGER NOT NULL, PRIMARY KEY (id))")
+            .Down($"DROP TABLE {table}");
+        Assert.Equal(["001_create"], (await first.StatusAsync(connection)).Pending);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => first.VerifyAsync(connection));
+        Assert.Equal(["001_create"], (await first.ApplyAsync(connection)).Applied);
+        Assert.Empty((await first.ApplyAsync(connection)).Applied);
+        await first.VerifyAsync(connection);
+
+        var second = new RasterizedDbMigrator().HistoryTable(history)
+            .Step("001_create", $"CREATE TABLE {table} (id INTEGER NOT NULL, PRIMARY KEY (id))")
+            .Down($"DROP TABLE {table}")
+            .Step("002_fill", $"ALTER TABLE {table} ADD COLUMN name TEXT", $"INSERT INTO {table} (id, name) VALUES (1, 'a')")
+            .Down($"DELETE FROM {table}", $"ALTER TABLE {table} DROP COLUMN name");
+        Assert.Equal(["002_fill"], (await second.ApplyAsync(connection)).Applied);
+        Assert.Equal("a", await new RasterizedDbCommand($"SELECT name FROM {table} WHERE id = 1", connection).ExecuteScalarAsync());
+
+        // An applied step whose text changed, a step that fails (and leaves nothing behind), a string of two statements.
+        var edited = new RasterizedDbMigrator().HistoryTable(history).Step("001_create", $"CREATE TABLE {table} (id BIGINT NOT NULL, PRIMARY KEY (id))");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => edited.StatusAsync(connection));
+        var failing = new RasterizedDbMigrator().HistoryTable(Table("history"))
+            .Step("001", $"CREATE TABLE {table}_x (id INTEGER NOT NULL, PRIMARY KEY (id))", "INSERT INTO no_such_table_here VALUES (1)");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => failing.ApplyAsync(connection));
+        Assert.False(connection.InTransaction);
+        Assert.Equal(["001"], (await failing.StatusAsync(connection)).Pending);
+        Assert.Throws<ArgumentException>(() => new RasterizedDbMigrator().Step("x", "SELECT 1; SELECT 2"));
+        Assert.Throws<ArgumentException>(() => new RasterizedDbMigrator().Step("x", "COMMIT"));
+
+        Assert.Equal(["002_fill", "001_create"], await second.RollbackAsync(connection, steps: 2));
+        Assert.Equal(2, (await second.StatusAsync(connection)).Pending.Count);
+    }
+
+    [Fact]
+    public async Task A_batch_sends_its_statements_in_one_request()
+    {
+        await using var connection = await Open();
+        if (connection is null)
+        {
+            return;
+        }
+
+        var table = Table("batched");
+        await Run(connection, $"CREATE TABLE {table} (id INTEGER NOT NULL, name TEXT, PRIMARY KEY (id))");
+        await using var batch = connection.CreateBatch();
+        for (var i = 1; i <= 3; i++)
+        {
+            var insert = batch.BatchCommands.Add($"INSERT INTO {table} (id, name) VALUES (@id, @name)");
+            insert.Parameters.Add("id", i);
+            insert.Parameters.AddWithValue("name", $"row; {i} 'quoted'");
+        }
+
+        batch.BatchCommands.Add($"SELECT id, name FROM {table} WHERE id > $1 ORDER BY id").Parameters.AddWithValue(1);
+        batch.BatchCommands.Add($"SELECT count(*) AS total FROM {table}");
+        await using (var reader = await batch.ExecuteReaderAsync())
+        {
+            Assert.Equal(3, reader.RecordsAffected);
+            Assert.True(reader.Read());
+            Assert.Equal((2, "row; 2 'quoted'"), (reader.GetInt32(0), reader.GetString(1)));
+            Assert.True(reader.NextResult());
+            Assert.True(reader.Read());
+            Assert.Equal(3L, reader["total"]);
+        }
+
+        // One implicit transaction: the second statement's failure undoes the first.
+        await using var failing = connection.CreateBatch();
+        failing.BatchCommands.Add($"INSERT INTO {table} (id) VALUES (10)");
+        failing.BatchCommands.Add($"INSERT INTO {table} (id) VALUES (1)");
+        await Assert.ThrowsAsync<RasterizedDbException>(() => failing.ExecuteNonQueryAsync());
+        Assert.Equal(3L, await new RasterizedDbCommand($"SELECT count(*) FROM {table}", connection).ExecuteScalarAsync());
+        Assert.False(await connection.Admin.DropStoreIfExistsAsync("no_such_store"));
+    }
+
+    [Fact]
+    public async Task Data_source_commands_share_one_multiplexed_connection()
+    {
+        if (servers.Trust() is not { } connectionString)
+        {
+            return;
+        }
+
+        await using var source = new RasterizedDbDataSource(connectionString);
+        var table = Table("shared");
+        await using (var create = source.CreateCommand($"CREATE TABLE {table} (id INTEGER NOT NULL, v TEXT, PRIMARY KEY (id))"))
+        {
+            await create.ExecuteNonQueryAsync();
+        }
+
+        // 200 statements in flight at once on the one connection, answered in any order.
+        var written = await Task.WhenAll(Enumerable.Range(0, 200).Select(async i =>
+        {
+            await using var insert = source.CreateCommand($"INSERT INTO {table} VALUES ($1, $2)");
+            insert.ResultFormat = RasterizedDbResultFormat.Binary;
+            insert.Parameters.Add("id", i);
+            insert.Parameters.Add("v", $"row {i}");
+            return await insert.ExecuteNonQueryAsync();
+        }));
+        Assert.Equal(200, written.Sum());
+
+        var read = await Task.WhenAll(Enumerable.Range(0, 200).Select(async i =>
+        {
+            await using var select = source.CreateCommand($"SELECT v FROM {table} WHERE id = @id");
+            select.ResultFormat = i % 2 == 0 ? RasterizedDbResultFormat.Binary : RasterizedDbResultFormat.Text;
+            select.Parameters.Add("id", i);
+            return (string?)await select.ExecuteScalarAsync();
+        }));
+        Assert.Equal(Enumerable.Range(0, 200).Select(i => $"row {i}"), read);
+
+        await using (var named = source.CreateCommand($"SELECT id, v FROM {table} WHERE id < 2 ORDER BY id"))
+        await using (var reader = await named.ExecuteReaderAsync())
+        {
+            Assert.Equal("v", reader.GetName(1));
+            Assert.True(reader.Read());
+        }
+
+        // An error on one request leaves the others, and the connection, alone.
+        await using (var bad = source.CreateCommand("SELECT * FROM no_such_table_here"))
+        {
+            await Assert.ThrowsAsync<RasterizedDbException>(() => bad.ExecuteScalarAsync());
+        }
+
+        await using (var begin = source.CreateCommand("BEGIN"))
+        {
+            Assert.Equal(RasterizedDbErrorKind.Unsupported, (await Assert.ThrowsAsync<RasterizedDbException>(() => begin.ExecuteNonQueryAsync())).Kind);
+        }
+
+        using var sync = source.CreateCommand($"SELECT count(*) FROM {table}");
+        sync.ResultFormat = RasterizedDbResultFormat.Binary;
+        Assert.Equal(200L, sync.ExecuteScalar());
+    }
+
+    [Fact]
+    public async Task Binary_results_get_their_column_names_from_a_describe()
+    {
+        await using var connection = await Open();
+        if (connection is null)
+        {
+            return;
+        }
+
+        var table = Table("described_binary");
+        await Run(connection, $"CREATE TABLE {table} (id INTEGER NOT NULL, \"Label\" TEXT, price NUMERIC(10,2), PRIMARY KEY (id))");
+        await Run(connection, $"INSERT INTO {table} VALUES (1, 'one', 1.50)");
+        await using var command = new RasterizedDbCommand($"SELECT id, \"Label\", price AS cost FROM {table} WHERE id = @id", connection) { ResultFormat = RasterizedDbResultFormat.Binary };
+        command.Parameters.Add("id", 1);
+        for (var round = 0; round < 2; round++)
+        {
+            await using var reader = await command.ExecuteReaderAsync();
+            Assert.True(reader.Read());
+            Assert.Equal(["id", "Label", "cost"], [reader.GetName(0), reader.GetName(1), reader.GetName(2)]);
+            Assert.Equal(2, reader.GetOrdinal("cost"));
+            Assert.Equal("one", reader["Label"]);
+            Assert.Equal(1.50m, reader["cost"]);
+        }
+
+        // A write with RETURNING is described, never run a second time.
+        await using (var insert = new RasterizedDbCommand($"INSERT INTO {table} (id, \"Label\") VALUES (2, 'two') RETURNING id AS new_id", connection) { ResultFormat = RasterizedDbResultFormat.Binary })
+        await using (var reader = await insert.ExecuteReaderAsync())
+        {
+            Assert.True(reader.Read());
+            Assert.Equal("new_id", reader.GetName(0));
+        }
+
+        Assert.Equal(2L, await new RasterizedDbCommand($"SELECT count(*) FROM {table}", connection) { ResultFormat = RasterizedDbResultFormat.Binary }.ExecuteScalarAsync());
+
+        // Inside a failed block the names still come, and the block is left as it was.
+        await using var transaction = await connection.BeginTransactionAsync();
+        await using (var select = new RasterizedDbCommand($"SELECT id AS first, price FROM {table} ORDER BY id", connection) { ResultFormat = RasterizedDbResultFormat.Binary })
+        await using (var reader = await select.ExecuteReaderAsync())
+        {
+            await Assert.ThrowsAsync<RasterizedDbException>(() => Run(connection, "SELECT * FROM no_such_table_here"));
+            Assert.Equal("first", reader.GetName(0));
+            Assert.True(connection.InTransaction);
+        }
+
+        await transaction.RollbackAsync();
+        var loaded = new DataTable();
+        await using (var all = new RasterizedDbCommand($"SELECT id, \"Label\" FROM {table} ORDER BY id", connection) { ResultFormat = RasterizedDbResultFormat.Binary })
+        await using (var rows = await all.ExecuteReaderAsync())
+        {
+            loaded.Load(rows);
+        }
+
+        Assert.Equal("Label", loaded.Columns[1].ColumnName);
+        Assert.Equal(2, loaded.Rows.Count);
+    }
+
     [Fact]
     public void The_synchronous_calls_work_too()
     {

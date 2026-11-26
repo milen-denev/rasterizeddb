@@ -65,6 +65,11 @@ public sealed class RasterizedDbDataReader : DbDataReader
     private int _resultIndex;
     private Column[]? _columns;
 
+    // Binary format: the statement, to ask the server for its column names if anyone wants them.
+    private ParsedSql? _statement;
+    private RasterizedDbDataSource? _source;
+    private string[]? _names;
+
     internal RasterizedDbDataReader()
     {
     }
@@ -72,9 +77,11 @@ public sealed class RasterizedDbDataReader : DbDataReader
     // ------------------------------------------------------------------- set up
 
     /// <summary>A native answer's rows (<paramref name="start"/> is just past the answer's tag byte).</summary>
-    internal void InitBinary(RasterizedDbConnection connection, CommandBehavior behavior, Response response, int start, long recordsAffected)
+    internal void InitBinary(RasterizedDbConnection? connection, CommandBehavior behavior, Response response, int start, long recordsAffected, ParsedSql? statement = null, RasterizedDbDataSource? source = null)
     {
         Init(connection, behavior, response);
+        _statement = statement;
+        _source = source ?? connection?.Source;
         _text = false;
         _position = start;
         _end = response.Length;
@@ -93,7 +100,7 @@ public sealed class RasterizedDbDataReader : DbDataReader
     }
 
     /// <summary>An answer with no rows at all: a write's count, or an acknowledgement.</summary>
-    internal void InitEmpty(RasterizedDbConnection connection, CommandBehavior behavior, long recordsAffected)
+    internal void InitEmpty(RasterizedDbConnection? connection, CommandBehavior behavior, long recordsAffected)
     {
         Init(connection, behavior, default);
         _text = false;
@@ -104,7 +111,7 @@ public sealed class RasterizedDbDataReader : DbDataReader
     }
 
     /// <summary>A simple-query answer, already scanned into <see cref="TextResults"/>.</summary>
-    internal void InitText(RasterizedDbConnection connection, CommandBehavior behavior, Response response, long recordsAffected)
+    internal void InitText(RasterizedDbConnection? connection, CommandBehavior behavior, Response response, long recordsAffected)
     {
         Init(connection, behavior, response);
         _text = true;
@@ -129,7 +136,7 @@ public sealed class RasterizedDbDataReader : DbDataReader
         }
     }
 
-    private void Init(RasterizedDbConnection connection, CommandBehavior behavior, Response response)
+    private void Init(RasterizedDbConnection? connection, CommandBehavior behavior, Response response)
     {
         _connection = connection;
         _behavior = behavior;
@@ -138,6 +145,9 @@ public sealed class RasterizedDbDataReader : DbDataReader
         _closed = false;
         _onRow = false;
         _columns = null;
+        _statement = null;
+        _source = null;
+        _names = null;
     }
 
     private void EnsureCells(int count)
@@ -669,32 +679,56 @@ public sealed class RasterizedDbDataReader : DbDataReader
             ThrowOrdinal(ordinal);
         }
 
-        return _columns is { } columns ? columns[ordinal].Name : "?column?";
+        return _columns is { } columns ? columns[ordinal].Name : BinaryNames()[ordinal];
+    }
+
+    /// <summary>
+    /// The binary format's answer carries no names, so they are asked for (once per statement text,
+    /// with a request that runs nothing) the first time something wants one. <c>?column?</c> when the
+    /// server cannot say.
+    /// </summary>
+    private string[] BinaryNames()
+    {
+        if (_names is { } names)
+        {
+            return names;
+        }
+
+        var described = _statement is { } statement && _source is { } source ? source.ColumnNames(statement, _connection) : [];
+        if (described.Length != _fieldCount)
+        {
+            described = new string[_fieldCount];
+            Array.Fill(described, "?column?");
+        }
+
+        return _names = described;
     }
 
     public override int GetOrdinal(string name)
     {
-        if (_columns is not { } columns)
+        var names = _columns is { } columns ? null : BinaryNames();
+        var count = _fieldCount;
+        for (var i = 0; i < count; i++)
+        {
+            if (string.Equals(names is null ? _columns![i].Name : names[i], name, StringComparison.Ordinal))
+            {
+                return i;
+            }
+        }
+
+        for (var i = 0; i < count; i++)
+        {
+            if (string.Equals(names is null ? _columns![i].Name : names[i], name, StringComparison.OrdinalIgnoreCase))
+            {
+                return i;
+            }
+        }
+
+        if (names is not null && count > 0 && names[0] == "?column?" && Array.TrueForAll(names, n => n == "?column?"))
         {
             throw new IndexOutOfRangeException(
-                $"column \"{name}\" cannot be looked up: the binary result format carries no column names. Read by position, " +
-                "or run the command with ResultFormat = Text (the connection string's Result Format).");
-        }
-
-        for (var i = 0; i < columns.Length; i++)
-        {
-            if (string.Equals(columns[i].Name, name, StringComparison.Ordinal))
-            {
-                return i;
-            }
-        }
-
-        for (var i = 0; i < columns.Length; i++)
-        {
-            if (string.Equals(columns[i].Name, name, StringComparison.OrdinalIgnoreCase))
-            {
-                return i;
-            }
+                $"column \"{name}\" cannot be looked up: the binary result format carries no column names and this server could not describe the " +
+                "statement. Read by position, or run the command with ResultFormat = Text.");
         }
 
         throw new IndexOutOfRangeException($"the result has no column named \"{name}\"");
@@ -792,6 +826,9 @@ public sealed class RasterizedDbDataReader : DbDataReader
         _fieldCount = 0;
         _buffer = [];
         _columns = null;
+        _statement = null;
+        _source = null;
+        _names = null;
         _results.Clear();
         _response.Return();
         var connection = _connection;

@@ -263,10 +263,9 @@ public class EfTests(BloggingFixture fixture) : IClassFixture<BloggingFixture>
         Assert.Equal(2.5, grouped.Best);
     }
 
-    // The server refuses a correlated subquery in a select list when the outer column it names is a
-    // quoted mixed-case identifier (b."Id"; b.id works): "missing FROM-clause entry for table "b"".
-    // The SQL is right, and this runs again once the server reads it.
-    [Fact(Skip = "server: a select-list subquery correlated on a quoted mixed-case column fails (missing FROM-clause entry)")]
+    // What EF Core writes for this is a select-list subquery correlated on a quoted mixed-case column
+    // ("b"."Id"), which the server refused until its LATERAL pass learned to read one.
+    [Fact]
     public async Task A_count_of_children_in_a_projection()
     {
         await using var context = fixture.Context();
@@ -406,6 +405,10 @@ public class EfTests(BloggingFixture fixture) : IClassFixture<BloggingFixture>
         Assert.Equal(3, await context.Blogs.CountAsync(b => b.Tags.Length == 3 && b.Title.StartsWith("Blog ")));
         Assert.Equal(2, await context.Blogs.CountAsync(b => b.Scores.Count >= 4 && b.Title.StartsWith("Blog ")));
         Assert.Equal(3, await context.Blogs.CountAsync(b => b.Scores.Contains(3) && b.Title.StartsWith("Blog ")));
+        Assert.Equal(2, await context.Blogs.CountAsync(b => b.Tags[0] == "even" && b.Title.StartsWith("Blog ")));
+        var second = 1;
+        Assert.Equal(4, await context.Blogs.CountAsync(b => b.Scores[second] == 2 && b.Title.StartsWith("Blog ")));
+        Assert.Equal(["n1", "n2"], await context.Blogs.Where(b => b.Title.StartsWith("Blog ")).OrderBy(b => b.Id).Take(2).Select(b => b.Tags[1]).ToListAsync());
 
         var blog = new Blog { Title = "arrays", CreatedAt = DateTime.UtcNow, Tags = ["a"], Scores = [5] };
         context.Blogs.Add(blog);
@@ -504,6 +507,118 @@ public class EfTests(BloggingFixture fixture) : IClassFixture<BloggingFixture>
 
         var only = factory.Create(context.Database.GetConnectionString()!, new Microsoft.EntityFrameworkCore.Scaffolding.DatabaseModelFactoryOptions(["Posts"]));
         Assert.Equal(["Posts"], only.Tables.Select(t => t.Name));
+    }
+
+    [Fact]
+    public async Task Many_changes_save_in_few_round_trips()
+    {
+        await using var context = fixture.Context();
+        if (context is null)
+        {
+            return;
+        }
+
+        var marker = "batch " + Guid.NewGuid().ToString("N");
+        var blogs = Enumerable.Range(0, 30).Select(i => new Blog { Title = marker, Rating = i, CreatedAt = DateTime.UtcNow, Tags = [$"t{i}"] }).ToList();
+        context.Blogs.AddRange(blogs);
+        int before;
+        lock (fixture.Sql)
+        {
+            before = fixture.Sql.Count;
+        }
+
+        Assert.Equal(30, await context.SaveChangesAsync());
+        int statements;
+        lock (fixture.Sql)
+        {
+            statements = fixture.Sql.Count - before;
+        }
+
+        // 30 inserts as one request (plus the transaction around them), not 30.
+        Assert.InRange(statements, 1, 3);
+        Assert.Equal(30, blogs.Select(b => b.Id).Distinct().Count());
+        Assert.All(blogs, b => Assert.True(b.Id > 0));
+
+        foreach (var blog in blogs.Take(10))
+        {
+            blog.Rating += 100;
+        }
+
+        context.RemoveRange(blogs.Skip(20));
+        Assert.Equal(20, await context.SaveChangesAsync());
+        Assert.Equal(10, await context.Blogs.CountAsync(b => b.Title == marker && b.Rating >= 100));
+        Assert.Equal(20, await context.Blogs.CountAsync(b => b.Title == marker));
+
+        // A conflict inside a batch is still seen, and nothing of the batch is kept.
+        await using (var other = fixture.Context()!)
+        {
+            Assert.Equal(1, await other.Blogs.Where(b => b.Id == blogs[5].Id).ExecuteUpdateAsync(s => s.SetProperty(b => b.Version, 9)));
+        }
+
+        blogs[4].Subtitle = "kept?";
+        blogs[5].Subtitle = "conflict";
+        await Assert.ThrowsAsync<DbUpdateConcurrencyException>(() => context.SaveChangesAsync());
+        Assert.Equal(0, await context.Blogs.CountAsync(b => b.Title == marker && b.Subtitle != null));
+        Assert.Equal(20, await context.Blogs.Where(b => b.Title == marker).ExecuteDeleteAsync());
+    }
+
+    [Fact]
+    public async Task Dates_translate_and_savepoints_hold()
+    {
+        await using var context = fixture.Context();
+        if (context is null)
+        {
+            return;
+        }
+
+        var day = new DateTime(2024, 1, 4, 0, 0, 0, DateTimeKind.Utc);
+        var seeded = context.Blogs.Where(b => b.Title.StartsWith("Blog "));
+        Assert.Equal(4, await seeded.CountAsync(b => b.CreatedAt.AddDays(1) > day));
+        var shift = 2;
+        Assert.Equal(5, await seeded.CountAsync(b => b.CreatedAt.AddDays(shift) > day));
+        Assert.Equal(1, await seeded.CountAsync(b => b.CreatedAt.Date == day));
+        Assert.Equal(5, await seeded.CountAsync(b => b.CreatedAt.Year == 2024 && b.CreatedAt.Hour == 12));
+        Assert.Equal("000Blog 1", await seeded.OrderBy(b => b.Id).Select(b => b.Title.PadLeft(9, '0')).FirstAsync());
+
+        await using var transaction = await context.Database.BeginTransactionAsync();
+        var marker = "savepoint " + Guid.NewGuid().ToString("N");
+        context.Blogs.Add(new Blog { Title = marker, CreatedAt = DateTime.UtcNow });
+        await context.SaveChangesAsync();
+        await transaction.CreateSavepointAsync("after_first");
+        context.Blogs.Add(new Blog { Title = marker, CreatedAt = DateTime.UtcNow });
+        await context.SaveChangesAsync();
+        await transaction.RollbackToSavepointAsync("after_first");
+        await transaction.CommitAsync();
+        context.ChangeTracker.Clear();
+        Assert.Equal(1, await context.Blogs.Where(b => b.Title == marker).ExecuteDeleteAsync());
+    }
+
+    [Fact]
+    public async Task The_migrations_lock_and_history_table_work()
+    {
+        await using var context = fixture.Context();
+        if (context is null)
+        {
+            return;
+        }
+
+        var history = context.GetService<IHistoryRepository>();
+        await using (await history.AcquireDatabaseLockAsync())
+        {
+            await history.CreateIfNotExistsAsync();
+            Assert.True(await history.ExistsAsync());
+            Assert.Empty(await history.GetAppliedMigrationsAsync());
+        }
+
+        // Released: taken again at once.
+        using (history.AcquireDatabaseLock())
+        {
+        }
+
+        Assert.Contains("IF NOT EXISTS(SELECT 1 FROM \"__EFMigrationsHistory\" WHERE \"MigrationId\" = 'm1') THEN", history.GetBeginIfNotExistsScript("m1"));
+        var strategy = new RasterizedDb.EntityFrameworkCore.Storage.RasterizedDbRetryingExecutionStrategy(context);
+        Assert.True(strategy.RetriesOnFailure);
+        await context.Database.ExecuteSqlRawAsync("DROP TABLE \"__EFMigrationsHistory\"");
     }
 
     [Fact]

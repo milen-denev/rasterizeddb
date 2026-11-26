@@ -121,7 +121,11 @@ public sealed class RasterizedDbConnection : DbConnection
         }
     }
 
-    public override bool CanCreateBatch => false;
+    public override bool CanCreateBatch => true;
+
+    protected override DbBatch CreateDbBatch() => new RasterizedDbBatch { Connection = this };
+
+    public new RasterizedDbBatch CreateBatch() => new() { Connection = this };
 
     protected override DbProviderFactory DbProviderFactory => RasterizedDbFactory.Instance;
 

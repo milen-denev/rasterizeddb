@@ -187,6 +187,48 @@ internal static class SimpleAnswer
         return scan;
     }
 
+    /// <summary>
+    /// The column names of the first RowDescription in an answer; empty when it describes no rows.
+    /// </summary>
+    public static string[] ColumnNames(ReadOnlySpan<byte> messages, out ServerError? error)
+    {
+        error = null;
+        var at = 0;
+        while (at < messages.Length)
+        {
+            var kind = Next(messages, ref at, out var bodyAt, out var bodyLength);
+            var body = messages.Slice(bodyAt, bodyLength);
+            if (kind == (byte)'E')
+            {
+                error = ErrorFields(body);
+                return [];
+            }
+
+            if (kind != (byte)'T' || body.Length < 2)
+            {
+                continue;
+            }
+
+            var names = new string[BinaryPrimitives.ReadInt16BigEndian(body)];
+            var p = 2;
+            for (var i = 0; i < names.Length; i++)
+            {
+                var end = body[p..].IndexOf((byte)0);
+                if (end < 0 || body.Length - p - end - 1 < 18)
+                {
+                    throw Damaged("a column description is cut short");
+                }
+
+                names[i] = Encoding.UTF8.GetString(body.Slice(p, end));
+                p += end + 1 + 18;
+            }
+
+            return names;
+        }
+
+        return [];
+    }
+
     /// <summary>The count a write's command tag ends with (<c>INSERT 0 3</c>, <c>UPDATE 2</c>).</summary>
     private static bool TagCount(ReadOnlySpan<byte> tag, out long count)
     {

@@ -83,6 +83,10 @@ public class SqlGenerationTests(ITestOutputHelper output)
         Assert.Contains("cardinality(b.\"Tags\")", Sql(context.Blogs.Where(b => b.Tags.Length > 1)));
         Assert.Contains("cardinality(b.\"Scores\")", Sql(context.Blogs.Where(b => b.Scores.Count > 1)));
         Assert.Contains("cardinality(b.\"Scores\")", Sql(context.Blogs.Where(b => b.Scores.Any())));
+        var at = 1;
+        Assert.Contains("b.\"Tags\"[1] = 'x'", Sql(context.Blogs.Where(b => b.Tags[0] == "x")));
+        Assert.Contains("b.\"Scores\"[@at + 1] > 3", Sql(context.Blogs.Where(b => b.Scores[at] > 3)));
+        Assert.Contains("b.\"Tags\"[1]", Sql(context.Blogs.Select(b => b.Tags.First())));
     }
 
     [Fact]
@@ -93,6 +97,21 @@ public class SqlGenerationTests(ITestOutputHelper output)
         Assert.Contains("(b.\"Details\" -> 'Address' ->> 'City')) = 'Sofia'", Sql(context.Blogs.Where(b => b.Details.Address.City == "Sofia")));
         Assert.Contains("CAST((b.\"Details\" ->> 'Verified') AS boolean)", Sql(context.Blogs.Where(b => b.Details.Verified)));
         Assert.Contains("(b.\"Details\" ->> 'Author')", Sql(context.Blogs.Select(b => b.Details.Author)));
+    }
+
+    [Fact]
+    public void Dates_and_padding_translate()
+    {
+        using var context = Context();
+        var days = 3;
+        var day = new DateTime(2024, 1, 2, 0, 0, 0, DateTimeKind.Utc);
+        Assert.Contains("b.\"CreatedAt\" + INTERVAL '7 days'", Sql(context.Blogs.Where(b => b.CreatedAt.AddDays(7) > day)));
+        Assert.Contains("b.\"CreatedAt\" + (@p * INTERVAL '1 day')", Sql(context.Blogs.Where(b => b.CreatedAt.AddDays(days) > day)));
+        Assert.Contains("b.\"CreatedAt\" + INTERVAL '-2 months'", Sql(context.Blogs.Where(b => b.CreatedAt.AddMonths(-2) > day)));
+        Assert.Contains("date_trunc('day', b.\"CreatedAt\")", Sql(context.Blogs.Where(b => b.CreatedAt.Date == day)));
+        Assert.Contains("date_part('dow', b.\"CreatedAt\")", Sql(context.Blogs.Select(b => (int)b.CreatedAt.DayOfWeek)));
+        Assert.Contains("date_part('month', p.\"PublishedOn\")", Sql(context.Posts.Where(p => p.PublishedOn!.Value.Month == 2)));
+        Assert.Contains("lpad(b.\"Title\", 10, '0')", Sql(context.Blogs.Select(b => b.Title.PadLeft(10, '0'))));
     }
 
     [Fact]

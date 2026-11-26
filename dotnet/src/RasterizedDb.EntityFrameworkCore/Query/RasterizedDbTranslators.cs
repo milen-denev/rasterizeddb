@@ -19,6 +19,7 @@ public class RasterizedDbMethodCallTranslatorProvider : RelationalMethodCallTran
             new RasterizedDbMathTranslator(sql),
             new RasterizedDbMiscMethodTranslator(sql, dependencies.RelationalTypeMappingSource),
             new RasterizedDbArrayTranslator(sql),
+            new RasterizedDbDateTimeMethodTranslator(sql, dependencies.RelationalTypeMappingSource),
         ]);
     }
 }
@@ -87,6 +88,23 @@ public class RasterizedDbStringMethodTranslator(ISqlExpressionFactory sql) : IMe
                 return sql.Function("ltrim", [instance], true, [true], typeof(string), mapping);
             case nameof(string.TrimEnd) when arguments.Count == 0:
                 return sql.Function("rtrim", [instance], true, [true], typeof(string), mapping);
+            case nameof(string.PadLeft) or nameof(string.PadRight) when arguments.Count is 1 or 2 && arguments[0].Type == typeof(int):
+            {
+                var name = method.Name == nameof(string.PadLeft) ? "lpad" : "rpad";
+                // Padding never shortens in .NET; lpad cuts a longer value, so a longer one is kept as it is.
+                var padded = arguments.Count == 1
+                    ? sql.Function(name, [instance, arguments[0]], true, [true, true], typeof(string), mapping)
+                    : sql.Function(
+                        name,
+                        [instance, arguments[0], arguments[1] is SqlConstantExpression { Value: char pad } ? sql.Constant(pad.ToString()) : sql.Convert(arguments[1], typeof(string))],
+                        true,
+                        [true, true, true],
+                        typeof(string),
+                        mapping);
+                return sql.Case(
+                    [new CaseWhenClause(sql.GreaterThanOrEqual(Function("length", typeof(int), instance), arguments[0]), instance)],
+                    padded);
+            }
             case nameof(string.Replace) when arguments.Count == 2 && arguments[0].Type == typeof(string):
             {
                 var from = sql.ApplyTypeMapping(arguments[0], mapping);
@@ -224,6 +242,9 @@ public class RasterizedDbMiscMethodTranslator(ISqlExpressionFactory sql, IRelati
 
 public class RasterizedDbMemberTranslator(ISqlExpressionFactory sql) : IMemberTranslator
 {
+    private SqlExpression Part(string part, SqlExpression instance) =>
+        sql.Convert(sql.Function("date_part", [sql.Constant(part), instance], true, [false, true], typeof(double)), typeof(int));
+
     public virtual SqlExpression? Translate(
         SqlExpression? instance,
         MemberInfo member,
@@ -243,10 +264,25 @@ public class RasterizedDbMemberTranslator(ISqlExpressionFactory sql) : IMemberTr
                 return member.Name switch
                 {
                     nameof(DateTime.Now) or nameof(DateTime.UtcNow) => sql.Function("now", [], nullable: false, argumentsPropagateNullability: [], returnType),
+                    nameof(DateTime.Today) => sql.Function(
+                        "date_trunc", [sql.Constant("day"), sql.Function("now", [], false, [], returnType)], false, [false, false], returnType),
                     _ => null,
                 };
             }
 
+            switch (member.Name)
+            {
+                case nameof(DateTime.Date):
+                    return sql.Function("date_trunc", [sql.Constant("day"), instance], true, [false, true], returnType, instance.TypeMapping);
+                case nameof(DateTime.DayOfYear):
+                    return Part("doy", instance);
+                case nameof(DateTime.DayOfWeek):
+                    return Part("dow", instance);
+            }
+        }
+
+        if (instance is not null && (declaring == typeof(DateTime) || declaring == typeof(DateTimeOffset) || declaring == typeof(DateOnly) || declaring == typeof(TimeOnly)))
+        {
             var part = member.Name switch
             {
                 nameof(DateTime.Year) => "year",
@@ -255,16 +291,77 @@ public class RasterizedDbMemberTranslator(ISqlExpressionFactory sql) : IMemberTr
                 nameof(DateTime.Hour) => "hour",
                 nameof(DateTime.Minute) => "minute",
                 nameof(DateTime.Second) => "second",
+                nameof(DateOnly.DayOfYear) => "doy",
                 _ => null,
             };
             if (part is not null)
             {
-                return sql.Convert(
-                    sql.Function("date_part", [sql.Constant(part), instance], true, [false, true], typeof(double)),
-                    typeof(int));
+                return Part(part, instance);
             }
         }
 
+        if (instance is not null && declaring == typeof(TimeSpan))
+        {
+            // An interval's length in seconds is its epoch.
+            SqlExpression Epoch() => sql.Function("date_part", [sql.Constant("epoch"), instance], true, [false, true], typeof(double));
+            return member.Name switch
+            {
+                nameof(TimeSpan.TotalSeconds) => Epoch(),
+                nameof(TimeSpan.TotalMinutes) => sql.Divide(Epoch(), sql.Constant(60.0)),
+                nameof(TimeSpan.TotalHours) => sql.Divide(Epoch(), sql.Constant(3600.0)),
+                nameof(TimeSpan.TotalDays) => sql.Divide(Epoch(), sql.Constant(86400.0)),
+                nameof(TimeSpan.TotalMilliseconds) => sql.Multiply(Epoch(), sql.Constant(1000.0)),
+                _ => null,
+            };
+        }
+
         return null;
+    }
+}
+
+/// <summary>
+/// <c>AddDays</c> and the rest as interval arithmetic: <c>x + INTERVAL '3 days'</c> for a constant
+/// amount, <c>x + n * INTERVAL '1 day'</c> otherwise.
+/// </summary>
+public class RasterizedDbDateTimeMethodTranslator(ISqlExpressionFactory sql, IRelationalTypeMappingSource typeMappingSource) : IMethodCallTranslator
+{
+    private static readonly Dictionary<string, string> Units = new()
+    {
+        [nameof(DateTime.AddYears)] = "year",
+        [nameof(DateTime.AddMonths)] = "month",
+        [nameof(DateTime.AddDays)] = "day",
+        [nameof(DateTime.AddHours)] = "hour",
+        [nameof(DateTime.AddMinutes)] = "minute",
+        [nameof(DateTime.AddSeconds)] = "second",
+        [nameof(DateTime.AddMilliseconds)] = "millisecond",
+    };
+
+    public virtual SqlExpression? Translate(
+        SqlExpression? instance,
+        MethodInfo method,
+        IReadOnlyList<SqlExpression> arguments,
+        IDiagnosticsLogger<DbLoggerCategory.Query> logger)
+    {
+        if (instance is null || arguments.Count != 1
+            || (method.DeclaringType != typeof(DateTime) && method.DeclaringType != typeof(DateTimeOffset) && method.DeclaringType != typeof(DateOnly))
+            || !Units.TryGetValue(method.Name, out var unit))
+        {
+            return null;
+        }
+
+        var interval = typeMappingSource.FindMapping(typeof(TimeSpan));
+        SqlExpression amount;
+        if (arguments[0] is SqlConstantExpression { Value: not null } constant)
+        {
+            var value = Convert.ToDecimal(constant.Value, System.Globalization.CultureInfo.InvariantCulture);
+            amount = sql.Fragment($"INTERVAL '{value.ToString(System.Globalization.CultureInfo.InvariantCulture)} {unit}s'");
+        }
+        else
+        {
+            amount = new SqlBinaryExpression(
+                System.Linq.Expressions.ExpressionType.Multiply, sql.ApplyDefaultTypeMapping(arguments[0])!, sql.Fragment($"INTERVAL '1 {unit}'"), typeof(TimeSpan), interval);
+        }
+
+        return new SqlBinaryExpression(System.Linq.Expressions.ExpressionType.Add, instance, amount, instance.Type, instance.TypeMapping);
     }
 }

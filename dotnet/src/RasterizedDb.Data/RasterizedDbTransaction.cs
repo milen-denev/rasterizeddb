@@ -160,5 +160,9 @@ public sealed class RasterizedDbFactory : DbProviderFactory
 
     public override DbDataSource CreateDataSource(string connectionString) => new RasterizedDbDataSource(connectionString);
 
-    public override bool CanCreateBatch => false;
+    public override bool CanCreateBatch => true;
+
+    public override DbBatch CreateBatch() => new RasterizedDbBatch();
+
+    public override DbBatchCommand CreateBatchCommand() => new RasterizedDbBatchCommand();
 }

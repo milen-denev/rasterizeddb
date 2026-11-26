@@ -43,6 +43,7 @@ services.AddDbContext<ShopContext>(o => o.UseRasterizedDb("Host=db.example.com;U
 | `Idle Reconnect` | 20 | A connection quiet this long is replaced before the next statement (0: never). |
 | `Connection Idle Lifetime` | 300 | Seconds an unused pooled connection is kept. |
 | `Max Message Size` | 8 MiB | The largest answer accepted. |
+| `Client Certificate`, `Client Key` | | PEM files of a certificate to present to a server that asks for one. |
 | `Tls Engine` | `Auto` | `Platform` (SslStream) or `Managed` (BouncyCastle). |
 
 **Over a network you do not control, do not keep `Trust=AcceptAny`.** A password login stays safe from
@@ -100,6 +101,37 @@ values travel apart, so the text is the same bytes every time.
 after a serialization failure or a deadlock (`DbException.IsTransient`), and never repeats a COMMIT
 whose outcome is unknown (`RasterizedDbException.CommitOutcomeUnknown`).
 
+## Commands without a connection
+
+```csharp
+await using var command = dataSource.CreateCommand("SELECT name FROM users WHERE id = $1");
+command.Parameters.AddWithValue(42);
+var name = await command.ExecuteScalarAsync();
+```
+
+A command made by the data source runs on one connection all such commands share, with any number of
+statements in flight at once. It is the cheapest way to run statements that each commit on their own.
+Transaction control is refused there; a transaction, a temporary table or a sequence's `currval` needs
+a `RasterizedDbConnection`.
+
+## Batches
+
+`connection.CreateBatch()` sends several statements in one round trip, as one simple query: the server
+runs them as one implicit transaction, and the reader has a result per row-returning statement.
+
+## Migrations without an ORM
+
+```csharp
+var migrator = new RasterizedDbMigrator()
+    .Step("001_users", "CREATE TABLE users (id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL)")
+    .Step("002_unique_email", "ALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE (email)")
+    .Down("ALTER TABLE users DROP CONSTRAINT users_email_key");
+await migrator.ApplyAsync(dataSource);   // or VerifyAsync: refuse to start with anything pending
+```
+
+Each step runs in a transaction with the row that records it. Every statement is checked before
+anything runs; an applied step whose text changed is an error.
+
 ## Administration and key/value
 
 ```csharp
@@ -112,6 +144,10 @@ var kv = connection.Kv;
 await kv.SetAsync("greeting", "hello", TimeSpan.FromMinutes(5));
 var sessions = kv.Map<Guid, Session>("sessions");     // scalars as text, anything else as JSON
 await sessions.SetAsync(id, session, TimeSpan.FromHours(1));
+var busy = await sessions.Query().Where((_, s) => s.Requests > 100).ToListAsync();
+
+var visitors = kv.Repository<Visitor, Guid>(v => v.Id);   // an object as a hash, a field per property
+await visitors.IncrementAsync(id, nameof(Visitor.Visits));
 ```
 
 ## Entity Framework Core
@@ -122,25 +158,26 @@ options.UseRasterizedDb(connectionString, o => o.EnableRetryOnFailure());
 
 - Integer keys generated on insert are `serial` / `bigserial` columns; generated values come back with
   `RETURNING`.
-- `SaveChanges` sends one statement per request (the native protocol runs one per request), inside a
-  transaction when there are several.
-- Migrations emit PostgreSQL DDL. No lock is taken while migrating: run migrations from one place at a
-  time. Idempotent scripts (`--idempotent`) are not generated.
+- `SaveChanges` sends its commands together, up to `MaxBatchSize` (100) per round trip.
+- Migrations emit PostgreSQL DDL. While migrating, a row in `__EFMigrationsLock` is the lock (the
+  server has no advisory locks); a migration that died holding it leaves the row, and the error says
+  how to clear it. Idempotent scripts wrap each migration in a `DO` block.
 - Translated: comparisons, paging, joins, `Include`, grouping and aggregates, `Contains` over a list,
-  the common `string`, `Math` and `DateTime` members, `EF.Functions.Like` and `EF.Functions.ILike`,
-  `ExecuteUpdate` / `ExecuteDelete`.
+  the common `string` members (with `PadLeft`/`PadRight`), `Math`, date parts, `Date`, `AddDays` and
+  its siblings, `TimeSpan.Total…`, `EF.Functions.Like` and `EF.Functions.ILike`, `ExecuteUpdate` /
+  `ExecuteDelete`.
 - **Array columns.** A `T[]` or `List<T>` property of a mapped type is an array column (`text[]`,
   `integer[]`). `tags.Contains(x)` is `x = ANY (tags)`; `Length`, `Count` and `Any()` are
-  `cardinality(tags)`.
+  `cardinality(tags)`; `tags[0]`, `First()` and `ElementAt(i)` are `tags[1]` and so on.
 - **JSON columns.** An owned type mapped with `ToJson()` lives in one `jsonb` column, nested owned
   types and collections included. A member in a query is a path into it
   (`CAST((b."Details" ->> 'Stars') AS integer)`), and a change to part of a document is written in
   place with `jsonb_set`.
 - **Scaffolding.** `dotnet ef dbcontext scaffold "<connection string>" RasterizedDb.EntityFrameworkCore`
-  reads tables, columns, primary and unique keys, foreign keys and indexes from `information_schema`
-  and `pg_indexes`.
+  reads tables, views, columns, primary and unique keys, foreign keys and indexes from
+  `information_schema` and `pg_indexes` (the `public` schema).
 - Not there yet: LINQ composed over a JSON collection or over an array's elements (`SelectMany`, a
-  `Where` inside the array), indexing into an array, spatial types.
+  `Where` inside the array), regular expressions, spatial types.
 
 ## Tests
 

@@ -20,6 +20,7 @@ internal sealed class ConnectionSettings
     public readonly RasterizedDbTrust Trust;
     public readonly X509Certificate2Collection? RootCertificates;
     public readonly byte[][] Fingerprints;
+    public readonly X509Certificate2? ClientCertificate;
     public readonly RasterizedDbTlsEngine TlsEngine;
     public readonly RasterizedDbResultFormat ResultFormat;
     public readonly int ConnectTimeoutMs;
@@ -175,6 +176,15 @@ internal sealed class ConnectionSettings
         }
 
         Fingerprints ??= [];
+        if (b.ClientCertificate is { Length: > 0 } certificatePath)
+        {
+            if (IsUnix)
+            {
+                throw new ArgumentException("a unix socket carries no TLS: a client certificate cannot be presented over one");
+            }
+
+            ClientCertificate = X509Certificate2.CreateFromPemFile(certificatePath, string.IsNullOrEmpty(b.ClientKey) ? null : b.ClientKey);
+        }
 
         if (Login == RasterizedDbLogin.Trust)
         {

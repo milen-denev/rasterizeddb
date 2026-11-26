@@ -117,6 +117,20 @@ public class RasterizedDbQuerySqlGenerator(QuerySqlGeneratorDependencies depende
         return jsonScalarExpression;
     }
 
+    protected override Expression VisitExtension(Expression extensionExpression)
+    {
+        if (extensionExpression is RasterizedDbArrayIndexExpression element)
+        {
+            Visit(element.Array);
+            Sql.Append("[");
+            Visit(element.Index);
+            Sql.Append("]");
+            return element;
+        }
+
+        return base.VisitExtension(extensionExpression);
+    }
+
     protected override void GenerateSetOperationOperand(SetOperationBase setOperation, SelectExpression operand)
     {
         // An operand with its own ORDER BY or LIMIT has to stand in parentheses.

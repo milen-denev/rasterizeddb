@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Migrations;
@@ -246,12 +247,41 @@ public class RasterizedDbHistoryRepository(HistoryRepositoryDependencies depende
 {
     public override LockReleaseBehavior LockReleaseBehavior => LockReleaseBehavior.Explicit;
 
-    protected override string ExistsSql =>
-        "SELECT COUNT(*) FROM pg_tables WHERE tablename = "
-        + Dependencies.TypeMappingSource.GetMapping(typeof(string)).GenerateSqlLiteral(TableName);
+    // The server keeps names that start with "__" out of its catalogue views (they are where it keeps
+    // its own tables), so the table is not looked up there: it is read, and a refusal naming an
+    // undefined table (42P01) is the answer "no".
+    protected override string ExistsSql => $"SELECT COUNT(*) FROM {SqlGenerationHelper.DelimitIdentifier(TableName, TableSchema)}";
 
-    protected override bool InterpretExistsResult(object? value) =>
-        value is not null and not DBNull && Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture) > 0;
+    protected override bool InterpretExistsResult(object? value) => value is not null and not DBNull;
+
+    private static bool Undefined(RasterizedDb.Data.RasterizedDbException e) =>
+        e.SqlState == "42P01" || (e.SqlState is null && e.Message.Contains("not found", StringComparison.OrdinalIgnoreCase));
+
+    public override bool Exists()
+    {
+        try
+        {
+            Dependencies.RawSqlCommandBuilder.Build(ExistsSql).ExecuteScalar(Parameters);
+            return true;
+        }
+        catch (RasterizedDb.Data.RasterizedDbException e) when (Undefined(e))
+        {
+            return false;
+        }
+    }
+
+    public override async Task<bool> ExistsAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            await Dependencies.RawSqlCommandBuilder.Build(ExistsSql).ExecuteScalarAsync(Parameters, cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (RasterizedDb.Data.RasterizedDbException e) when (Undefined(e))
+        {
+            return false;
+        }
+    }
 
     public override string GetCreateIfNotExistsScript()
     {
@@ -261,32 +291,105 @@ public class RasterizedDbHistoryRepository(HistoryRepositoryDependencies depende
         return at < 0 ? script : script.Insert(at + create.Length, "IF NOT EXISTS ");
     }
 
-    public override string GetBeginIfNotExistsScript(string migrationId) =>
-        throw new NotSupportedException("idempotent migration scripts need procedural SQL, which this provider does not generate");
+    // An idempotent script wraps each migration in a DO block that looks in the history table first.
+    private string IfHistory(string migrationId, bool exists) =>
+        $"""
 
-    public override string GetBeginIfExistsScript(string migrationId) =>
-        throw new NotSupportedException("idempotent migration scripts need procedural SQL, which this provider does not generate");
+        DO $EF$
+        BEGIN
+            IF {(exists ? "" : "NOT ")}EXISTS(SELECT 1 FROM {SqlGenerationHelper.DelimitIdentifier(TableName, TableSchema)} WHERE {SqlGenerationHelper.DelimitIdentifier(MigrationIdColumnName)} = {Dependencies.TypeMappingSource.GetMapping(typeof(string)).GenerateSqlLiteral(migrationId)}) THEN
+        """;
+
+    public override string GetBeginIfNotExistsScript(string migrationId) => IfHistory(migrationId, exists: false);
+
+    public override string GetBeginIfExistsScript(string migrationId) => IfHistory(migrationId, exists: true);
 
     public override string GetEndIfScript() =>
-        throw new NotSupportedException("idempotent migration scripts need procedural SQL, which this provider does not generate");
+        """
+            END IF;
+        END $EF$;
+        """;
+
+    private const string LockTable = "__EFMigrationsLock";
+
+    private RelationalCommandParameterObject Parameters =>
+        new(Dependencies.Connection, null, null, Dependencies.CurrentContext.Context, Dependencies.CommandLogger, CommandSource.Migrations);
+
+    private string LockName => SqlGenerationHelper.DelimitIdentifier(LockTable);
+
+    private string CreateLockSql => $"CREATE TABLE IF NOT EXISTS {LockName} (\"Id\" integer NOT NULL, \"Timestamp\" text NOT NULL, PRIMARY KEY (\"Id\"))";
+
+    private string TakeLockSql => $"INSERT INTO {LockName} (\"Id\", \"Timestamp\") VALUES (1, '{DateTimeOffset.UtcNow:O}')";
+
+    private static readonly TimeSpan LockWait = TimeSpan.FromMinutes(2);
+
+    private InvalidOperationException LockHeld() =>
+        new($"another migration holds the lock (a row in {LockTable}) and did not release it within {LockWait.TotalSeconds:0} s; " +
+            $"if no migration is running, it was left by one that died: DELETE FROM {LockName}");
 
     /// <summary>
-    /// No lock is taken: run migrations from one place at a time. (The server has no advisory locks to
-    /// take one with.)
+    /// The server has no advisory locks, so the lock is a row: whoever inserts row 1 of
+    /// <c>__EFMigrationsLock</c> holds it (its primary key refuses a second), and deletes it when done.
     /// </summary>
-    public override IMigrationsDatabaseLock AcquireDatabaseLock() => new NoLock(this);
-
-    public override Task<IMigrationsDatabaseLock> AcquireDatabaseLockAsync(CancellationToken cancellationToken = default) =>
-        Task.FromResult<IMigrationsDatabaseLock>(new NoLock(this));
-
-    private sealed class NoLock(IHistoryRepository historyRepository) : IMigrationsDatabaseLock
+    public override IMigrationsDatabaseLock AcquireDatabaseLock()
     {
-        public IHistoryRepository HistoryRepository => historyRepository;
-
-        public void Dispose()
+        Dependencies.RawSqlCommandBuilder.Build(CreateLockSql).ExecuteNonQuery(Parameters);
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        var delay = 100;
+        while (true)
         {
-        }
+            try
+            {
+                Dependencies.RawSqlCommandBuilder.Build(TakeLockSql).ExecuteNonQuery(Parameters);
+                return new RowLock(this);
+            }
+            catch (RasterizedDb.Data.RasterizedDbException e) when (e.IsUniqueViolation)
+            {
+                if (waited.Elapsed > LockWait)
+                {
+                    throw LockHeld();
+                }
+            }
 
-        public ValueTask DisposeAsync() => default;
+            Thread.Sleep(delay);
+            delay = Math.Min(delay * 2, 2000);
+        }
+    }
+
+    public override async Task<IMigrationsDatabaseLock> AcquireDatabaseLockAsync(CancellationToken cancellationToken = default)
+    {
+        await Dependencies.RawSqlCommandBuilder.Build(CreateLockSql).ExecuteNonQueryAsync(Parameters, cancellationToken).ConfigureAwait(false);
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        var delay = 100;
+        while (true)
+        {
+            try
+            {
+                await Dependencies.RawSqlCommandBuilder.Build(TakeLockSql).ExecuteNonQueryAsync(Parameters, cancellationToken).ConfigureAwait(false);
+                return new RowLock(this);
+            }
+            catch (RasterizedDb.Data.RasterizedDbException e) when (e.IsUniqueViolation)
+            {
+                if (waited.Elapsed > LockWait)
+                {
+                    throw LockHeld();
+                }
+            }
+
+            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+            delay = Math.Min(delay * 2, 2000);
+        }
+    }
+
+    private sealed class RowLock(RasterizedDbHistoryRepository repository) : IMigrationsDatabaseLock
+    {
+        public IHistoryRepository HistoryRepository => repository;
+
+        public void Dispose() =>
+            repository.Dependencies.RawSqlCommandBuilder.Build($"DELETE FROM {repository.LockName}").ExecuteNonQuery(repository.Parameters);
+
+        public async ValueTask DisposeAsync() =>
+            await repository.Dependencies.RawSqlCommandBuilder.Build($"DELETE FROM {repository.LockName}")
+                .ExecuteNonQueryAsync(repository.Parameters).ConfigureAwait(false);
     }
 }

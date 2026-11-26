@@ -1402,6 +1402,21 @@ internal static class ValueReader
         return (T)Enum.ToObject(typeof(T), number);
     }
 
+    // --------------------------------------------------------------------- boxed
+
+    private delegate object? BoxedReader(byte tag, ReadOnlySpan<byte> raw);
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, BoxedReader> BoxedReaders = new();
+
+    /// <summary>A cell as a type known only at run time (a property found by reflection).</summary>
+    public static object? ReadBoxed(Type type, byte tag, ReadOnlySpan<byte> raw) =>
+        BoxedReaders.GetOrAdd(
+            type,
+            static t => (BoxedReader)typeof(ValueReader).GetMethod(nameof(Boxed), BindingFlags.NonPublic | BindingFlags.Static)!
+                .MakeGenericMethod(t).CreateDelegate(typeof(BoxedReader)))(tag, raw);
+
+    private static object? Boxed<T>(byte tag, ReadOnlySpan<byte> raw) => Read<T>(tag, raw);
+
     // -------------------------------------------------------------------- object
 
     /// <summary>

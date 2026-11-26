@@ -137,6 +137,18 @@ public readonly struct RasterizedDbAdmin
     public Task<List<string>> DropStoreAsync(string name, CancellationToken cancellationToken = default) =>
         Lines($"STORAGE DROP STORE {BareWord(name, "a store name")}", cancellationToken);
 
+    /// <summary>Drops a store if it is registered; whether it was. Two statements: the listing, then the drop.</summary>
+    public async Task<bool> DropStoreIfExistsAsync(string name, CancellationToken cancellationToken = default)
+    {
+        if (await StoreAsync(name, cancellationToken).ConfigureAwait(false) is null)
+        {
+            return false;
+        }
+
+        await DropStoreAsync(name, cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
     public Task<List<RasterizedDbStoreInfo>> StoresAsync(CancellationToken cancellationToken = default) =>
         Query(
             "SHOW STORAGE STORES",
@@ -515,6 +527,16 @@ public sealed class RasterizedDbStore
     public RasterizedDbStore CacheBytes(ulong bytes) => Option("CACHE_BYTES", bytes.ToString(CultureInfo.InvariantCulture));
 
     public RasterizedDbStore SpillBytes(ulong bytes) => Option("SPILL_BYTES", bytes.ToString(CultureInfo.InvariantCulture));
+
+    public RasterizedDbStore CompactChunkBytes(ulong bytes) => Option("COMPACT_CHUNK_BYTES", bytes.ToString(CultureInfo.InvariantCulture));
+
+    public RasterizedDbStore ChunkFetchPages(ulong pages) => Option("CHUNK_FETCH_PAGES", pages.ToString(CultureInfo.InvariantCulture));
+
+    public RasterizedDbStore ReadaheadChunks(ulong chunks) => Option("READAHEAD_CHUNKS", chunks.ToString(CultureInfo.InvariantCulture));
+
+    public RasterizedDbStore MaxDeltas(ulong deltas) => Option("MAX_DELTAS", deltas.ToString(CultureInfo.InvariantCulture));
+
+    public RasterizedDbStore FlushIntervalMs(ulong milliseconds) => Option("FLUSH_INTERVAL_MS", milliseconds.ToString(CultureInfo.InvariantCulture));
 
     public RasterizedDbStore IfNotExists()
     {
