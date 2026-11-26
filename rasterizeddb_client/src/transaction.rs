@@ -120,6 +120,9 @@ pub(crate) struct Dial {
     /// ([`crate::Options::database`]).
     pub(crate) setup: Option<Arc<dyn rastcp::session::ConnectionSetup>>,
     pub(crate) trust: crate::Trust,
+    /// The client certificate of a certificate login
+    /// ([`crate::Client::connect_with_certificate`]).
+    pub(crate) identity: Option<Arc<rastcp::tls::ClientIdentity>>,
     /// The client's notice handler ([`crate::Client::set_notice_handler`]).
     pub(crate) notices: Arc<crate::notice::NoticeHook>,
 }
@@ -160,6 +163,9 @@ impl Connections {
             Some(timeout) => builder.timeout(timeout),
             None => builder.no_timeout(),
         };
+        if let Some(identity) = &self.dial.identity {
+            builder = builder.identity(crate::client::clone_identity(identity));
+        }
         if let Some(authenticator) = &self.dial.authenticator {
             builder = builder.authenticator(authenticator.clone());
         }

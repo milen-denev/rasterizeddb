@@ -299,7 +299,7 @@ async fn a_taken_port_is_an_error_naming_the_way_out() {
         port,
         ..NativeListen::default()
     };
-    let error = match bind_native_listener(&listen, None).await {
+    let error = match bind_native_listener(&listen, None, None).await {
         Ok(_) => panic!("bound a port another listener holds"),
         Err(e) => e,
     };

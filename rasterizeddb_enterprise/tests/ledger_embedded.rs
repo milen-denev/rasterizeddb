@@ -94,6 +94,25 @@ async fn ledger_tables_and_vaults() {
     let show = lines(&c, "SHOW LEDGER pay").await;
     assert!(show.iter().any(|l| l.starts_with("pay: ledger")), "{show:#?}");
 
+    // A versioned ledger table takes updates, chains each version, keeps
+    // them all, and never lets the row's identity be assigned.
+    c.execute("CREATE LEDGER TABLE acct (id BIGINT, bal BIGINT) VERSIONED NO DELETE UNTIL 1 DAY AFTER INSERT", &[])
+        .await
+        .unwrap();
+    c.execute("INSERT INTO acct (id, bal) VALUES (1, 10)", &[]).await.unwrap();
+    assert_eq!(c.execute("UPDATE acct SET bal = 20 WHERE id = 1", &[]).await.unwrap(), 1);
+    assert_eq!(c.execute("UPDATE acct SET bal = 30 WHERE id = 1", &[]).await.unwrap(), 1);
+    assert!(refused(&c, "UPDATE acct SET __ledger_ts = 1 WHERE id = 1").await.contains("identity"));
+    let report = lines(&c, "VERIFY LEDGER acct").await;
+    assert!(report.iter().any(|l| l.starts_with("OK        acct: 1 row(s)")), "{report:#?}");
+    let ts: i64 = c.query("SELECT __ledger_ts FROM acct", &[]).await.unwrap().iter().next().unwrap().get(0).unwrap();
+    let history = lines(&c, &format!("SHOW LEDGER HISTORY acct {ts}")).await;
+    assert_eq!(history.len(), 3, "{history:#?}");
+    assert!(history.iter().all(|l| l.contains("chained ")), "{history:#?}");
+    assert!(history[0].contains("bal=10") && history[2].contains("bal=30"), "{history:#?}");
+    // An append-only table still refuses UPDATE.
+    assert!(refused(&c, "UPDATE pay SET amount = 1 WHERE id = 2").await.contains("append-only"));
+
     // A plain table is untouched by all of this.
     c.execute("CREATE TABLE plain (id BIGINT)", &[]).await.unwrap();
     c.execute("INSERT INTO plain VALUES (1)", &[]).await.unwrap();

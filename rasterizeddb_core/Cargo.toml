@@ -128,6 +128,9 @@ tempfile = "3"
 # that talk to a listener this crate starts. The server itself carries no
 # client.
 rasterizeddb_client = { path = "../rasterizeddb_client", default-features = false }
+# Client certificates signed at test time (tests/native_cert_login.rs);
+# already in the tree as rastcp's certificate generator.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 # The write gate's source test parses `src/` (core/index_store/gate_source_tests.rs).
 syn = { version = "3", features = ["full", "visit"] }
 proc-macro2 = "1"

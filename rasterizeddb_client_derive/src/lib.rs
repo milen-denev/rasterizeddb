@@ -670,6 +670,7 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             "ledger",
             "ledger_drop_idle",
             "ledger_anchor",
+            "ledger_versioned",
         ],
     )?;
     let setting = |key: &str| {
@@ -998,7 +999,12 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             if retention.is_empty() {
                 return Err(syn::Error::new(input.span(), "#[rdb(ledger = \"<n> <unit>\")] names the retention, e.g. \"7 years\""));
             }
-            if let Some(role) = roles.iter().find(|r| matches!(**r, "version" | "updated_at" | "soft_delete")) {
+            let versioned = struct_settings.iter().any(|(k, _)| k == "ledger_versioned");
+            // A versioned ledger table takes updates, so `version` and
+            // `updated_at` fit it; a soft delete never does (a row is
+            // deleted past its retention, or kept).
+            let refused: &[&str] = if versioned { &["soft_delete"] } else { &["version", "updated_at", "soft_delete"] };
+            if let Some(role) = roles.iter().find(|r| refused.contains(r)) {
                 return Err(syn::Error::new(
                     input.span(),
                     format!("a ledger model's rows are never updated: #[rdb({role})] has no place on one"),
@@ -1017,6 +1023,7 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
                     retention: #retention,
                     drop_idle: #drop_idle,
                     anchors: &[#(#anchors),*],
+                    versioned: #versioned,
                 });)
         }
     };

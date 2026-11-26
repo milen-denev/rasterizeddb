@@ -10420,6 +10420,7 @@ async fn execute_ledger_statement(sql: &str, database: &Arc<Database>, depth: us
     let named: Option<&str> = match verb.as_str() {
         // `SHOW LEDGER RECEIPT <table> <row stamp>`.
         "SHOW" if op == "RECEIPT" => Some(*words.get(3).ok_or("42601: SHOW LEDGER RECEIPT needs a table and a row stamp")?),
+        "SHOW" if op == "HISTORY" => Some(*words.get(3).ok_or("42601: SHOW LEDGER HISTORY needs a table and a row stamp")?),
         "VERIFY" | "SHOW" => words.get(2).copied().filter(|w| !matches!(w.to_ascii_uppercase().as_str(), "FULL" | "SINCE")),
         "ALTER" => Some(*words.get(3).ok_or("42601: ALTER LEDGER TABLE needs a table name")?),
         "VAULT" => Some(*words.get(1).ok_or("42601: VAULT needs a vault name")?),
@@ -10483,9 +10484,18 @@ async fn execute_ledger_statement(sql: &str, database: &Arc<Database>, depth: us
         };
         held.push((relation, rows));
     }
+    // `SHOW LEDGER HISTORY <table> <stamp>`: every version of one row.
+    let mut versions = Vec::new();
+    if verb == "SHOW" && op == "HISTORY" {
+        let ts: i64 = words.get(4).and_then(|w| w.parse().ok()).ok_or("42601: SHOW LEDGER HISTORY <table> <row stamp>")?;
+        if let Some((Relation::Plain(table), _)) = held.first() {
+            versions = table.ledger_versions(ts).await.map_err(|e| e.to_string())?;
+        }
+    }
     let request = crate::core::ledger_hooks::LedgerRequest {
         sql,
         tables: held.iter().map(|(r, rows)| (r.schema(), rows.clone())).collect(),
+        versions,
         role: &role,
         superuser,
     };

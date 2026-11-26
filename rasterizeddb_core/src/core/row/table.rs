@@ -5928,6 +5928,62 @@ impl<S: StorageIO> Table<S> {
         Ok(())
     }
 
+    /// Admits one row's update of a versioned ledger table and notes its new
+    /// version for the chain.
+    fn ledger_note_update(&self, row_write: &RowWrite, updates: &[ColumnWritePayload], written_by: TxId) -> Result<()> {
+        Self::ledger_needs_transaction(&self.schema, written_by)?;
+        let order = self.ledger_ts_field()?.write_order as u32;
+        if updates.iter().any(|u| u.write_order == order) {
+            return Err(std::io::Error::other(format!(
+                "0A000: {} is a ledger row's identity and is never assigned",
+                crate::core::ledger_hooks::LEDGER_TS
+            )));
+        }
+        let ts = row_write
+            .columns_writing_data
+            .iter()
+            .find(|c| c.write_order == order)
+            .and_then(|c| <[u8; 8]>::try_from(c.data.into_slice()).ok())
+            .map(i64::from_le_bytes)
+            .ok_or_else(|| std::io::Error::other("XX001: a ledger row has no readable insert time"))?;
+        crate::core::ledger_hooks::admit_row_update(&self.schema, ts).map_err(std::io::Error::other)?;
+        let cells: Vec<(u32, &[u8])> =
+            row_write.columns_writing_data.iter().map(|c| (c.write_order, c.data.into_slice())).collect();
+        crate::core::ledger_hooks::on_update(&self.schema, written_by, ts, &cells);
+        Ok(())
+    }
+
+    /// Every version of the row stamped `ts` still on disk, oldest first:
+    /// `(xmin, xmax, stored cells by write order)`. For `SHOW LEDGER
+    /// HISTORY` on a versioned ledger table, whose retired versions are never
+    /// reclaimed.
+    pub async fn ledger_versions(&self, ts: i64) -> Result<Vec<(u64, u64, Vec<(u32, Vec<u8>)>)>> {
+        let d = self.data()?;
+        let ts_order = self.ledger_ts_field()?.write_order as u32;
+        let fetch = Self::build_full_row_fetch(&self.schema.fields);
+        let mut iterator = RowPointerIterator::new(d.io_pointers.clone()).await?;
+        let mut out = Vec::new();
+        let mut row = Row::default();
+        while let Some(pointer) = iterator.next_row_pointer().await? {
+            if pointer.deleted {
+                continue;
+            }
+            pointer.fetch_row_reuse_async(&*d.io_rows, &fetch, &mut row).await?;
+            let cells: Vec<(u32, Vec<u8>)> =
+                row.columns.iter().map(|c| (c.schema_id, c.data.into_slice().to_vec())).collect();
+            let stamp = cells
+                .iter()
+                .find(|(o, _)| *o == ts_order)
+                .and_then(|(_, b)| <[u8; 8]>::try_from(b.as_slice()).ok())
+                .map(i64::from_le_bytes);
+            if stamp == Some(ts) {
+                out.push((pointer.xmin, pointer.xmax, cells));
+            }
+        }
+        out.sort_by_key(|(xmin, _, _)| *xmin);
+        Ok(out)
+    }
+
     /// Every row of this ledger table visible now: its stamp and its stored
     /// cells by write order, for `VERIFY LEDGER` (`ledger_hooks`).
     pub async fn ledger_rows(&self) -> Result<Vec<(i64, Vec<(u32, Vec<u8>)>)>> {
@@ -6989,6 +7045,16 @@ impl<S: StorageIO> Table<S> {
                     return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e).into());
                 }
             }
+            // A versioned ledger table's update (`ledger_hooks`): admitted row
+            // by row, never to its hidden insert time (the row's identity),
+            // and the new version's cells joined to the transaction's chain
+            // entry. Aborted with the statement, the pending item goes too.
+            if self.schema.special.is_special() {
+                if let Err(e) = self.ledger_note_update(&row_write, updates, written_by) {
+                    d.io_pointers.abort_txn(txn).await;
+                    return Err(e);
+                }
+            }
 
             // The range guard (§4.5), on the merged row and ahead of every
             // write branch below. Two of them never relocate (the fixed-width
@@ -7153,9 +7219,12 @@ impl<S: StorageIO> Table<S> {
             //
             // The filter is fed the same full `row_write` either way, so this
             // needs nothing from it that the general path does not.
+            // Never on a ledger table: an overwrite keeps no prior version,
+            // which a versioned ledger's history is made of.
             if !updates.is_empty()
                 && !may_fail_after_write
                 && !assigns_key
+                && !self.schema.special.is_special()
                 && updates.iter().all(|u| u.column_type != DbType::STRING)
                 && self
                     .write_columns_in_place(d, &pointer, updates, txn, written_by)

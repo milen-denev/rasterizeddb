@@ -25,7 +25,7 @@ use rasterizeddb_core::core::mvcc::TxId;
 use rasterizeddb_core::core::row::schema::{SpecialTable, TableSchema};
 
 use policy::LedgerPolicy;
-use store::{Item, OP_DELETE, OP_INSERT};
+use store::{Item, OP_DELETE, OP_INSERT, OP_UPDATE};
 
 /// The installed guard and its state.
 pub struct LedgerGuard {
@@ -134,6 +134,13 @@ impl LedgerHooks for LedgerGuard {
                 "0A000: \"{}\" is a secret vault: write it with VAULT {} SET SECRET …",
                 table.name, table.name
             )),
+            // A versioned table's history is its retired versions: nothing
+            // that reclaims them runs on it.
+            WriteKind::Maintenance if policy.versioned => Err(format!(
+                "0A000: \"{}\" is a versioned ledger table: its row versions are its history and are never reclaimed",
+                table.name
+            )),
+            WriteKind::Update if policy.versioned => Ok(()),
             WriteKind::Insert | WriteKind::RawVersion | WriteKind::Maintenance | WriteKind::Move => Ok(()),
             // Row by row, against retention and holds (`admit_row_delete`). A
             // vault's versions are never deleted: a purge shreds their key.
@@ -196,6 +203,24 @@ impl LedgerHooks for LedgerGuard {
             .entry(tx)
             .or_default()
             .push(Item { op: OP_DELETE, ledger: policy.id, row_ts: ts, width: 0, leaf: [0; 32] });
+    }
+
+    fn admit_row_update(&self, table: &TableSchema, _ts: i64) -> Result<(), String> {
+        let policy = self.policy(table)?;
+        if !policy.versioned {
+            return Err(format!("0A000: \"{}\" is {}: UPDATE is not allowed on it; it is append-only", table.name, what(table)));
+        }
+        Ok(())
+    }
+
+    fn on_update(&self, table: &TableSchema, tx: TxId, ts: i64, cells: &[(u32, &[u8])]) {
+        let Ok(policy) = self.policy(table) else { return };
+        let (width, leaf) = store::leaf(policy.id, ts, cells);
+        self.pending.lock().entry(tx).or_default().push(Item { op: OP_UPDATE, ledger: policy.id, row_ts: ts, width, leaf });
+    }
+
+    fn keeps_versions(&self, table: &TableSchema) -> bool {
+        self.policy(table).is_ok_and(|p| p.versioned)
     }
 
     fn has_pending(&self, ids: &[TxId]) -> bool {

@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use rasterizeddb_core::core::ledger_hooks::{LedgerReply, LedgerRequest};
 use rasterizeddb_core::core::row::schema::SpecialTable;
 
-use super::store::{self, Item, OP_DELETE, OP_EVENT, OP_INSERT};
+use super::store::{self, Item, OP_DELETE, OP_EVENT, OP_INSERT, OP_UPDATE};
 use super::{LedgerGuard, anchor, clauses, clock, policy};
 
 /// Words, with quoted strings kept whole: `'…'` stays one word starting
@@ -115,6 +115,9 @@ fn verify(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<L
             for i in e.items.iter().filter(|i| i.ledger == policy.id) {
                 match i.op {
                     OP_INSERT => {
+                        chained.insert(i.row_ts, (i.width, i.leaf, false));
+                    }
+                    OP_UPDATE => {
                         chained.insert(i.row_ts, (i.width, i.leaf, false));
                     }
                     OP_DELETE => {
@@ -231,8 +234,103 @@ fn receipt(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>, ts: i64) -
     Ok(LedgerReply { lines, records: Vec::new(), inserts: Vec::new() })
 }
 
+/// A cell as text, by its column's type: integers and floats as numbers,
+/// text as quoted text, anything else as hex.
+fn cell_text(ty: Option<&rasterizeddb_core::core::db_type::DbType>, b: &[u8]) -> String {
+    use rasterizeddb_core::core::db_type::DbType as T;
+    let int = |n: usize| -> Option<i128> {
+        let s = b.get(..n)?;
+        let mut w = [0u8; 16];
+        w[..n].copy_from_slice(s);
+        // Sign-extend.
+        if s[n - 1] & 0x80 != 0 {
+            for x in &mut w[n..] {
+                *x = 0xff;
+            }
+        }
+        Some(i128::from_le_bytes(w))
+    };
+    let uint = |n: usize| -> Option<u128> {
+        let mut w = [0u8; 16];
+        w[..n].copy_from_slice(b.get(..n)?);
+        Some(u128::from_le_bytes(w))
+    };
+    let shown = match ty {
+        Some(T::I8) => int(1).map(|v| v.to_string()),
+        Some(T::I16) => int(2).map(|v| v.to_string()),
+        Some(T::I32) => int(4).map(|v| v.to_string()),
+        Some(T::I64) => int(8).map(|v| v.to_string()),
+        Some(T::I128) => int(16).map(|v| v.to_string()),
+        Some(T::U8) => uint(1).map(|v| v.to_string()),
+        Some(T::U16) => uint(2).map(|v| v.to_string()),
+        Some(T::U32) => uint(4).map(|v| v.to_string()),
+        Some(T::U64) => uint(8).map(|v| v.to_string()),
+        Some(T::U128) => uint(16).map(|v| v.to_string()),
+        Some(T::F64) => b.get(..8).map(|x| f64::from_le_bytes(x.try_into().unwrap()).to_string()),
+        Some(T::F32) => b.get(..4).map(|x| f32::from_le_bytes(x.try_into().unwrap()).to_string()),
+        Some(T::BOOL) => b.first().map(|x| (*x != 0).to_string()),
+        Some(T::STRING | T::CHAR) => {
+            let end = b.iter().rposition(|x| *x != 0).map_or(0, |i| i + 1);
+            Some(format!("'{}'", String::from_utf8_lossy(&b[..end])))
+        }
+        _ => None,
+    };
+    shown.unwrap_or_else(|| format!("0x{}", store::hex(b)))
+}
+
+/// `SHOW LEDGER HISTORY <table> <stamp>`: every version of one row still on
+/// disk, oldest first, each with whether the chain holds its digest.
+fn history(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<LedgerReply, String> {
+    let Some((table, _)) = req.tables.first() else {
+        return Err("42P01: SHOW LEDGER HISTORY names no ledger table".to_string());
+    };
+    let policy = g.policy(table)?;
+    let ts: i64 = req.sql.split_whitespace().nth(4).and_then(|x| x.trim_end_matches(';').parse().ok()).ok_or("42601: SHOW LEDGER HISTORY <table> <row stamp>")?;
+    let chain = store::chain(store_key)?;
+    let read = chain.lock().reread()?;
+    let chained: Vec<(u32, store::Hash)> = read
+        .entries
+        .iter()
+        .flat_map(|e| e.items.iter())
+        .filter(|i| i.ledger == policy.id && i.row_ts == ts && (i.op == OP_INSERT || i.op == OP_UPDATE))
+        .map(|i| (i.width, i.leaf))
+        .collect();
+    let names: std::collections::HashMap<u32, (&str, &rasterizeddb_core::core::db_type::DbType)> =
+        table.fields.iter().map(|f| (f.write_order as u32, (f.name.as_str(), &f.db_type))).collect();
+    let mut lines = Vec::new();
+    for (n, (xmin, xmax, cells)) in req.versions.iter().enumerate() {
+        let refs: Vec<(u32, &[u8])> = cells.iter().map(|(o, b)| (*o, b.as_slice())).collect();
+        let ok = chained.iter().any(|(w, leaf)| store::leaf_upto(policy.id, ts, *w, &refs) == *leaf);
+        let values: Vec<String> = cells
+            .iter()
+            .filter(|(o, _)| names.get(o).is_some_and(|(n, _)| !n.starts_with("__")))
+            .map(|(o, b)| {
+                let (n, ty) = names.get(o).map_or(("?", None), |(n, t)| (*n, Some(*t)));
+                format!("{n}={}", cell_text(ty, b))
+            })
+            .collect();
+        lines.push(format!(
+            "v{} {} xmin {xmin}{} {}",
+            n + 1,
+            if ok { "chained  " } else { "UNCHAINED" },
+            if *xmax == 0 { String::new() } else { format!(" xmax {xmax}") },
+            values.join(" ")
+        ));
+    }
+    if lines.is_empty() {
+        lines.push(format!("no version of the row stamped {ts} is on disk"));
+    }
+    if !policy.versioned {
+        lines.push("note: an append-only table's row has one version; VERSIONED tables keep every one".to_string());
+    }
+    Ok(LedgerReply { lines, records: Vec::new(), inserts: Vec::new() })
+}
+
 fn show(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<LedgerReply, String> {
     let w: Vec<String> = req.sql.split_whitespace().map(|x| x.trim_end_matches(';').to_string()).collect();
+    if w.get(2).is_some_and(|x| x.eq_ignore_ascii_case("HISTORY")) {
+        return history(g, store_key, req);
+    }
     if w.get(2).is_some_and(|x| x.eq_ignore_ascii_case("RECEIPT")) {
         let ts: i64 = w.get(4).and_then(|x| x.parse().ok()).ok_or("42601: SHOW LEDGER RECEIPT <table> <row stamp>")?;
         return receipt(g, store_key, req, ts);

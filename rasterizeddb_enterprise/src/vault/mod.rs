@@ -306,6 +306,14 @@ fn provider(uri: &str) -> Result<Arc<dyn KeyProvider>, String> {
     Ok(p)
 }
 
+/// What the keyring records for a key that lives in the HSM.
+const HSM_MARKER: &[u8] = b"hsm";
+
+/// The label of a vault's key on the token.
+fn hsm_label(vault: u128, name: &str) -> String {
+    format!("rdb:{vault:032x}:{name}")
+}
+
 fn aad(vault: u128, name: &str, version: i64) -> Vec<u8> {
     let mut a = b"rdb-vault-v1".to_vec();
     a.extend_from_slice(&vault.to_le_bytes());
@@ -628,6 +636,11 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
             let mut ring = ring.lock();
             let mut rewrapped = BTreeMap::new();
             for (k, wrapped) in &ring.keys {
+                // A key inside the HSM is not wrapped by the provider: it stays.
+                if wrapped.as_slice() == HSM_MARKER {
+                    rewrapped.insert(k.clone(), wrapped.clone());
+                    continue;
+                }
                 let dek = old.unwrap(wrapped)?;
                 rewrapped.insert(k.clone(), new.wrap(&dek)?);
             }
@@ -679,8 +692,11 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
                 ("TYPE", Some(t)) => t.to_ascii_lowercase(),
                 _ => "aes256-gcm".to_string(),
             };
-            if !matches!(kind.as_str(), "aes256-gcm" | "mldsa65") {
-                return Err(format!("22023: key type {kind:?}: aes256-gcm or mldsa65 (feature `pqc`)"));
+            if !matches!(kind.as_str(), "aes256-gcm" | "mldsa65" | "hsm-aes256-gcm" | "hsm-ecdsa-p256") {
+                return Err(format!(
+                    "22023: key type {kind:?}: aes256-gcm, mldsa65 (feature `pqc`), or inside the vault's HSM: \
+                     hsm-aes256-gcm, hsm-ecdsa-p256"
+                ));
             }
             if cfg!(feature = "fips") && kind == "mldsa65" {
                 return Err("0A000: mldsa65 keys are not offered in FIPS mode: this ML-DSA is not the validated module's".to_string());
@@ -694,6 +710,16 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
                 return Err(format!("42710: key '{name}' exists"));
             }
             let provider = provider(policy.key_provider.as_deref().ok_or("XX001: the vault has no key provider")?)?;
+            if kind.starts_with("hsm-") {
+                // Made inside the token and used there; the keyring only
+                // records that it exists.
+                let hsm = provider.hsm().ok_or("0A000: hsm-… keys need a vault whose KEY PROVIDER is pkcs11:")?;
+                let label = hsm_label(vault, &name);
+                if kind == "hsm-aes256-gcm" { hsm.generate_aes(&label)? } else { hsm.generate_ec(&label)? }
+                keyring(store_key, vault)?.lock().add(&full, 1, HSM_MARKER.to_vec())?;
+                audit(store_key, vault, &format!("CREATE KEY {} '{name}' {kind} by {role}", table.name))?;
+                return Ok(reply(vec![format!("key {name} ({kind}, inside the HSM)")], vec![insert(&full, 1, "", "active", &kind, 0, 0, "")]));
+            }
             let material = crypto::new_dek()?;
             keyring(store_key, vault)?.lock().add(&full, 1, provider.wrap(&material)?)?;
             audit(store_key, vault, &format!("CREATE KEY {} '{name}' {kind} by {role}", table.name))?;
@@ -716,9 +742,36 @@ pub fn run(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<
                 .cloned()
                 .ok_or_else(|| format!("55000: key '{name}' was purged"))?;
             let provider = provider(policy.key_provider.as_deref().ok_or("XX001: the vault has no key provider")?)?;
-            let material = provider.unwrap(&wrapped)?;
             let value = || quoted(w.get(6), "a value").map(|v| (v, at(5) == "VALUE"));
             let aad_k = aad(vault, &full, 1);
+            if kind.starts_with("hsm-") {
+                let hsm = provider.hsm().ok_or("0A000: the vault's key provider has no HSM")?;
+                let label = hsm_label(vault, &name);
+                let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+                let out = match (op, kind.as_str()) {
+                    ("ENCRYPT", "hsm-aes256-gcm") => base64::engine::general_purpose::STANDARD.encode(hsm.aes_encrypt(&label, value()?.0.as_bytes(), &aad_k)?),
+                    ("DECRYPT", "hsm-aes256-gcm") => {
+                        let sealed = base64::engine::general_purpose::STANDARD
+                            .decode(value()?.0.trim().as_bytes())
+                            .map_err(|_| "22023: DECRYPT takes base64 from ENCRYPT".to_string())?;
+                        String::from_utf8(hsm.aes_decrypt(&label, &sealed, &aad_k)?.to_vec())
+                            .map_err(|_| "22021: the plaintext is not UTF-8 text".to_string())?
+                    }
+                    ("SIGN", "hsm-ecdsa-p256") => hex(&hsm.ec_sign(&label, value()?.0.as_bytes())?),
+                    ("VERIFY", "hsm-ecdsa-p256") => {
+                        let sig = match (at(7), w.get(8).and_then(|x| x.strip_prefix('\''))) {
+                            ("SIGNATURE", Some(sig)) => unhex(sig).ok_or("22023: SIGNATURE is hex")?,
+                            _ => return Err("42601: VAULT v VERIFY KEY 'k' VALUE '…' SIGNATURE '<hex>'".to_string()),
+                        };
+                        hsm.ec_verify(&label, value()?.0.as_bytes(), &sig)?.to_string()
+                    }
+                    ("PUBLIC", "hsm-ecdsa-p256") => hex(&hsm.ec_public(&label)?),
+                    (op, kind) => return Err(format!("0A000: {op} does not apply to a {kind} key")),
+                };
+                audit(store_key, vault, &format!("{op} KEY {} '{name}' by {role} (in the HSM)", table.name))?;
+                return Ok(reply(vec![out], Vec::new()));
+            }
+            let material = provider.unwrap(&wrapped)?;
             let out = match (op, kind.as_str()) {
                 ("ENCRYPT", "aes256-gcm") => {
                     let (v, _) = value()?;

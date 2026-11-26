@@ -938,6 +938,14 @@ pub enum Message {
     LedgerAudit(String),
     #[cfg(feature = "enterprise")]
     LedgerAuditLoaded(String, Vec<String>),
+    /// Runs a statement the LEDGER page built, then reloads the page.
+    #[cfg(feature = "enterprise")]
+    LedgerRun(String),
+    #[cfg(feature = "enterprise")]
+    LedgerRan(Box<(String, Result<Vec<String>, String>)>),
+    /// A LEDGER page input changed: (key, value).
+    #[cfg(feature = "enterprise")]
+    LedgerInput(String, String),
     ShardsLoaded(Box<ShardsSnapshot>),
     /// Asks the gateway for the planner's moves.
     PlanRebalance,
@@ -2441,7 +2449,44 @@ impl Studio {
             Message::ReloadLedger => self.load_ledger(),
             #[cfg(feature = "enterprise")]
             Message::LedgerLoaded(page) => {
-                self.ledger = Some(*page);
+                let mut page = *page;
+                if let Some(old) = self.ledger.take() {
+                    page.carry_over(old);
+                }
+                self.ledger = Some(page);
+                Task::none()
+            }
+            #[cfg(feature = "enterprise")]
+            Message::LedgerRun(sql) => {
+                let Some(session) = self.session.clone() else { return Task::none() };
+                Task::perform(
+                    async move {
+                        let result = session.query(&sql).await.map(|grid| first_column(&grid));
+                        Box::new((sql, result))
+                    },
+                    Message::LedgerRan,
+                )
+            }
+            #[cfg(feature = "enterprise")]
+            Message::LedgerRan(answer) => {
+                let (sql, result) = *answer;
+                if let Some(page) = self.ledger.as_mut() {
+                    page.ran(&sql, result);
+                }
+                // A reveal keeps the page as it is; anything else may have
+                // changed what it shows.
+                let reveal = sql.split_whitespace().nth(2).is_some_and(|w| w.eq_ignore_ascii_case("GET"));
+                if reveal { Task::none() } else { self.load_ledger() }
+            }
+            #[cfg(feature = "enterprise")]
+            Message::LedgerInput(key, value) => {
+                if let Some(page) = self.ledger.as_mut() {
+                    if key == "__hide" {
+                        page.hide();
+                    } else {
+                        page.inputs.insert(key, value);
+                    }
+                }
                 Task::none()
             }
             #[cfg(feature = "enterprise")]

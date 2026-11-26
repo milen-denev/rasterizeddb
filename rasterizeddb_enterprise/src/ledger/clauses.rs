@@ -8,6 +8,7 @@
 //! ANCHOR TO '<sink>' [, '<sink>' …]
 //! RETAIN DELETED <n> <unit>                   -- vault: purge protection
 //! KEY PROVIDER '<uri>'                        -- vault: required
+//! VERSIONED                                   -- ledger: rows may be updated; every version kept
 //! ```
 //!
 //! Units count long rather than short, so a retention never ends early: a
@@ -160,6 +161,8 @@ pub fn parse(kind: SpecialTable, clauses: &str) -> Result<LedgerPolicy, String> 
             } else {
                 return Err(format!("expected DELETE or DROP after NO, at {}", c.here()));
             }
+        } else if !vault && c.word("VERSIONED") {
+            p.versioned = true;
         } else if c.word("HASHING") {
             c.expect("USING")?;
             p.hash = match c.quoted()?.to_ascii_lowercase().as_str() {
@@ -187,7 +190,7 @@ pub fn parse(kind: SpecialTable, clauses: &str) -> Result<LedgerPolicy, String> 
         } else if vault && c.word("KEY") {
             c.expect("PROVIDER")?;
             let k = c.quoted()?;
-            if !(k.starts_with("file:") || k.starts_with("pkcs11:") || k.starts_with("mlkem:")) {
+            if !(k.starts_with("file:") || k.starts_with("pkcs11:") || k.starts_with("mlkem:") || k.starts_with("tpm:")) {
                 return Err(format!(
                     "'{k}': a key provider is file:<path>, pkcs11:<attributes> or mlkem:<path> (post-quantum)"
                 ));

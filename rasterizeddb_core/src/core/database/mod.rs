@@ -295,6 +295,7 @@ impl fmt::Display for NativeListen {
 async fn bind_native_listener(
     listen: &NativeListen,
     authenticator: Option<StdArc<dyn rastcp::session::ServerAuthenticator>>,
+    client_ca: Option<Vec<rustls::pki_types::CertificateDer<'static>>>,
 ) -> std::io::Result<TcpServer> {
     const BIND_ATTEMPTS: u32 = 5;
     const BIND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
@@ -321,6 +322,11 @@ async fn bind_native_listener(
         }
         if let Some(authenticator) = authenticator.clone() {
             builder = builder.authenticator(authenticator);
+        }
+        // Certificate login: every caller presents a certificate the client
+        // CA signed, verified in the handshake.
+        if let Some(ca) = client_ca.clone() {
+            builder = builder.client_auth(rastcp::tls::ClientAuth::RequireCa(ca));
         }
 
         match builder.build().await {
@@ -1971,6 +1977,10 @@ impl Database {
             }
             if table.schema.special.is_special() && !in_memory {
                 crate::core::ledger_hooks::database_opened(location);
+            }
+            // A versioned ledger table keeps every version it ever wrote.
+            if crate::core::ledger_hooks::keeps_versions(&table.schema) {
+                let _ = table.set_vacuum_enabled(false);
             }
             // A seventeen-byte NUMERIC field in a directory without its
             // fence (a point-in-time restore brings the field records and not
@@ -4565,6 +4575,10 @@ impl Database {
             self.abandon_create(table_name, Some(table), intent, pinned).await;
             return Err(e);
         }
+        // A versioned ledger table keeps every version it ever wrote.
+        if crate::core::ledger_hooks::keeps_versions(&table.schema) {
+            let _ = table.set_vacuum_enabled(false);
+        }
         // Every file durable before the catalogue names the table: an image
         // holding any byte of the row then holds them all.
         if durable && let Err(e) = self.sync_durable() {
@@ -4985,7 +4999,10 @@ impl Database {
         let credential_exists =
             auth.bootstrap_password.is_some() || crate::auth::has_login_role(&database).await;
 
-        let authenticator = if auth.authenticates() && credential_exists {
+        // Certificate login needs no password anywhere: the certificate is
+        // the credential.
+        let cert_login = auth.method == crate::auth::AuthMethod::Cert;
+        let authenticator = if auth.authenticates() && (credential_exists || cert_login) {
             if let Err(e) = crate::native_auth::seed_roles(&database, &auth).await {
                 return Err(io::Error::other(format!(
                     "could not prepare the role catalogue: {}",
@@ -5058,7 +5075,18 @@ impl Database {
         };
 
         let server = if listen.tcp {
-            let server = Arc::new(bind_native_listener(&listen, authenticator).await?);
+            let client_ca = if cert_login {
+                let path = crate::pgwire::client_cert::ca().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--rdb-auth cert needs --pg-client-ca: the CA client certificates are verified against",
+                    )
+                })?;
+                Some(rastcp::tls::load_certificates(path).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?)
+            } else {
+                None
+            };
+            let server = Arc::new(bind_native_listener(&listen, authenticator, client_ca).await?);
 
             // Ctrl+C and SIGTERM stop the accept loop and let in-flight queries
             // finish, rather than dropping every connection where it stands.

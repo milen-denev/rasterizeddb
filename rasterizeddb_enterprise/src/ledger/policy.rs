@@ -71,6 +71,9 @@ pub struct LedgerPolicy {
     pub anchors: Vec<String>,
     /// Holds in force, by name, with the time each was placed.
     pub holds: BTreeMap<String, i64>,
+    /// `VERSIONED`: rows may be updated, every version is kept and chained.
+    /// Fixed at creation.
+    pub versioned: bool,
     /// A vault's key provider (`file:…`, `pkcs11:…`). Fixed at creation;
     /// rotating the key wraps the same data keys under a new one.
     pub key_provider: Option<String>,
@@ -88,6 +91,7 @@ impl LedgerPolicy {
             anchors: Vec::new(),
             holds: BTreeMap::new(),
             key_provider: None,
+            versioned: false,
         }
     }
 
@@ -108,6 +112,9 @@ impl LedgerPolicy {
             p.push_str("anchor ");
             p.push_str(a);
             p.push('\n');
+        }
+        if self.versioned {
+            p.push_str("mode versioned\n");
         }
         if let Some(k) = &self.key_provider {
             p.push_str("key_provider ");
@@ -218,6 +225,7 @@ pub fn fold(bytes: &[u8], kind: SpecialTable) -> Result<LedgerPolicy, String> {
                 // Set at creation; a later record moves the vault to another
                 // provider (`VAULT … ROTATE KEY TO`), never to none.
                 (["key_provider", k], Some(p)) => p.key_provider = Some(k.to_string()),
+                (["mode", "versioned"], Some(p)) if i == 0 => p.versioned = true,
                 (["hold", name, "set", at], Some(p)) => {
                     let at: i64 = at.parse().map_err(|_| bad(line))?;
                     p.holds.entry(name.to_string()).or_insert(at);
