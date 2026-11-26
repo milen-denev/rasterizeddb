@@ -77,6 +77,8 @@ mod engine_bug_tests;
 #[cfg(test)]
 mod correlated_subquery_tests;
 #[cfg(test)]
+mod derived_pushdown_tests;
+#[cfg(test)]
 mod vacuum_snapshot_tests;
 #[cfg(test)]
 mod shape_repair_tests;

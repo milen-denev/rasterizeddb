@@ -33,7 +33,7 @@ async fn disk_db(dir: &std::path::Path, name: &str) -> Arc<Database> {
 }
 
 /// A statement's rows over pgwire, each cell as text.
-async fn pg_rows(db: &Arc<Database>, s: &mut Session, sql: &str) -> Vec<Vec<Option<String>>> {
+pub(super) async fn pg_rows(db: &Arc<Database>, s: &mut Session, sql: &str) -> Vec<Vec<Option<String>>> {
     Box::pin(execute_recorded(db, &mut s.state, &mut s.server, sql, &[], false, None))
         .await
         .unwrap_or_else(|e| panic!("{sql}: {e}"));
