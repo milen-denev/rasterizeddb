@@ -1666,9 +1666,41 @@ pub(crate) fn extract_where_columns(
     // author never wrote.
     let is_word_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
 
-    // Check each schema field to see if it appears in the WHERE clause.
+    // A name made of word bytes alone is in the clause exactly when one of
+    // the clause's words (its maximal runs of word bytes) is that name: one
+    // pass over the clause, each word looked up. Every field was searched
+    // for at every byte of the clause instead, and a field the clause does
+    // not name was searched for to its end: with an `IN` list of 4,000
+    // keys (160 KB) over a table of 75 stored fields that was twelve million
+    // comparisons a parse, and more than half the time of the statement.
+    let plain_name = |name: &str| !name.is_empty() && name.bytes().all(is_word_byte);
+    let names: std::collections::HashSet<&[u8]> =
+        schema.iter().filter(|f| !f.is_deleted && plain_name(&f.name)).map(|f| f.name.as_bytes()).collect();
+    if !names.is_empty() {
+        let mut found = 0usize;
+        let mut i = 0usize;
+        while i < where_bytes.len() && found < names.len() {
+            if !is_word_byte(where_bytes[i]) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < where_bytes.len() && is_word_byte(where_bytes[i]) {
+                i += 1;
+            }
+            if let Some(name) = names.get(&where_bytes[start..i]) {
+                // (Word bytes are ASCII: the name is valid UTF-8 as it was.)
+                if where_columns.insert(String::from_utf8_lossy(name).into_owned()) {
+                    found += 1;
+                }
+            }
+        }
+    }
+
+    // Any other name (one holding a space, a dot, a letter outside ASCII) is
+    // looked for where it stands, between bytes that are not a word's.
     // Tombstones are skipped: a dropped column cannot be referenced.
-    for field in schema.iter().filter(|f| !f.is_deleted) {
+    for field in schema.iter().filter(|f| !f.is_deleted && !plain_name(&f.name)) {
         let field_bytes = field.name.as_bytes();
         if field_bytes.len() > where_bytes.len() {
             continue;
@@ -1692,6 +1724,81 @@ pub(crate) fn extract_where_columns(
     }
 
     where_columns
+}
+
+#[cfg(test)]
+mod extract_where_columns_tests {
+    use super::*;
+    use crate::core::db_type::DbType;
+
+    /// What the function answered before it read the clause once: every
+    /// field searched for at every byte.
+    fn reference(where_clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        let bytes = where_clause.as_bytes();
+        let is_word_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        for field in schema.iter().filter(|f| !f.is_deleted) {
+            let name = field.name.as_bytes();
+            if where_clause.is_empty() || name.len() > bytes.len() {
+                continue;
+            }
+            for i in 0..=bytes.len() - name.len() {
+                if &bytes[i..i + name.len()] == name
+                    && (i == 0 || !is_word_byte(bytes[i - 1]))
+                    && (i + name.len() == bytes.len() || !is_word_byte(bytes[i + name.len()]))
+                {
+                    out.insert(field.name.clone());
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn schema(names: &[&str]) -> SmallVec<[SchemaField; 20]> {
+        let mut s = SmallVec::new();
+        for (i, name) in names.iter().enumerate() {
+            s.push(SchemaField::new((*name).into(), DbType::STRING, 8, 0, i as u64, false));
+        }
+        s
+    }
+
+    /// The names a clause holds are the ones the byte-by-byte search found:
+    /// a name that is a prefix or a suffix of another, one at either end of
+    /// the clause, one in quotes or in a string, one that is not a word, a
+    /// dropped one, and a long list of keys.
+    #[test]
+    fn the_names_in_a_clause_are_the_ones_searched_for_byte_by_byte() {
+        let mut fields = schema(&["id", "foo", "foo_id", "context", "context_id", "name", "__ci_name", "a", "x1", "Mixed", "sale date", "tür", "d.e", "gone"]);
+        fields.last_mut().unwrap().is_deleted = true;
+        let keys: Vec<String> = (0..500).map(|k| format!("'{k:08x}-0000-4000-8000-{k:012x}'")).collect();
+        let long = format!("id IN ({}) AND context_id = 3", keys.join(", "));
+        let clauses = [
+            "",
+            "id",
+            "foo_id = 1",
+            "foo = 1 AND context_id > 2",
+            "x.context = y.foo_id",
+            "\"name\" = 'a' OR __ci_name = 'x1'",
+            "name='id'",
+            "a=1",
+            "(a)",
+            "mixed = 1 AND Mixed = 2",
+            "\"sale date\" > '2026-01-01' AND tür = 1 AND t.d.e = 2",
+            "sale dates = 1 OR xtür = 2 OR tür_ = 3",
+            "gone = 1 AND id2 = 2 AND _id = 3 AND id_ = 4",
+            "name",
+            "x1 = name",
+            long.as_str(),
+        ];
+        for clause in clauses {
+            assert_eq!(extract_where_columns(clause, &fields), reference(clause, &fields), "{}", &clause[..clause.len().min(80)]);
+        }
+        assert_eq!(
+            extract_where_columns(&long, &fields).into_iter().collect::<Vec<_>>(),
+            ["context_id".to_string(), "id".to_string()]
+        );
+    }
 }
 
 /// Parses a QueryPurpose::QueryRows variant and returns QueryRows with separate RowFetch structures
