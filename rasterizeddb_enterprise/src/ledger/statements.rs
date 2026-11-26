@@ -350,6 +350,8 @@ fn show(g: &LedgerGuard, store_key: &str, req: &LedgerRequest<'_>) -> Result<Led
         lines.push("WARNING: the chain is on the same device as the data".to_string());
     }
     lines.extend(anchor::show_lines(store_key));
+    #[cfg(feature = "vault")]
+    lines.extend(crate::columns::show_lines(store_key));
     for (table, _) in &req.tables {
         let p = g.policy(table)?;
         lines.push(format!(

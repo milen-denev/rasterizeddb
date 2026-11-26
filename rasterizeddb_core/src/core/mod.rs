@@ -17,6 +17,7 @@ pub mod shard_hooks;
 /// defaults are today's behaviour (sharding-plan.md §10).
 pub mod policy_hooks;
 pub mod ledger_hooks;
+pub mod column_crypto;
 pub mod fips;
 /// A shard's side of sharding; dormant until `--role shard`.
 #[cfg(feature = "sharding")]
