@@ -135,9 +135,9 @@ impl Harness {
         Client::connect(&self.socket, options(Login::Trust, database)).await
     }
 
-    /// A trust connection running as `role` (`Login::TrustAs`).
+    /// A trust connection running as `role` (`Client::connect_as_role`).
     async fn trust_as(&self, role: &str, database: Option<&str>) -> rasterizeddb_client::Result<Client> {
-        Client::connect(&self.socket, options(Login::TrustAs(role.to_string()), database)).await
+        Client::connect_as_role(&self.socket, options(Login::Trust, database), role).await
     }
 
     async fn password(
