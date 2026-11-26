@@ -324,9 +324,24 @@ Other members of the group have the rest.
 2. The Kafka adapter.
 3. The AMQP 0-9-1 adapter.
 4. The MQTT adapter.
-5. Replication (a `FLAG_BROKER` record on the table-data stream, as
-   `FLAG_KV`), transactional publish (`BROKER PUBLISH` inside a SQL
-   transaction is appended at commit) and reading a topic with `SELECT`.
+5. Replication: **done**. Effects ride the key/value cache's `FLAG_KV` records
+   as `BROKER_FORMAT_V1` chunks (`broker/repl.rs`): DDL by name, stamped
+   batches at their offsets, subscription records. A partition is written on
+   one node at a time; memory topics and retention stay local. Still to do:
+   transactional publish (`BROKER PUBLISH` inside a SQL transaction is
+   appended at commit) and reading a topic with `SELECT`.
 6. Tests and benchmarks, run against each protocol's own load tool: native,
    then `kafka-producer-perf-test`/`rpk`, `rabbitmq-perf-test` and
    `emqtt-bench`, compared with Redpanda, RabbitMQ and EMQX.
+
+## 10. Verification
+
+`.claude/reviews/broker/`: `run.sh` drives real clients (librdkafka, pika,
+paho-mqtt, the native client) against a release build: Kafka, AMQP, MQTT,
+native, restart, fuzz and TLS suites. `crash.sh` SIGKILLs the server three
+times mid-produce and checks every durable ack. `repl.sh` checks that two
+replicating nodes converge. `bench.sh` compares Apache Kafka 4.1 with the
+Kafka port and the native protocol. In `src/core/broker/tests.rs`, power loss
+is modelled by `core::power_loss`: the broker's syncs are noted as
+`broker.file` and `broker.dir`, and cuts inside them are imaged with unsynced
+pages kept, dropped and torn.
