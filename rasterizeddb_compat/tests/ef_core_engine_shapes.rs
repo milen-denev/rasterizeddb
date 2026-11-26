@@ -145,3 +145,74 @@ async fn a_correlated_subquery_over_no_outer_row() {
     assert!(two.is_empty());
     assert_eq!(texts(&pool, "SELECT (SELECT c.title FROM co c WHERE d.id = c.aid LIMIT 1) FROM ar d WHERE d.n = 1").await, vec![Some("T1".to_string())]);
 }
+
+/// A subquery correlated on a quoted mixed-case column, as EF Core writes
+/// one for a PascalCase property (`b.Posts.Count` in a projection). The
+/// reference was left quoted, where no scan of the LATERAL pass saw it, so
+/// the subquery ran as an uncorrelated one: "missing FROM-clause entry for
+/// table "b"".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subquery_correlated_on_a_mixed_case_column() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    exec(&pool, r#"CREATE TABLE "Bl" ("Id" int PRIMARY KEY, "Title" text NOT NULL)"#).await;
+    exec(&pool, r#"CREATE TABLE "Po" ("Id" int PRIMARY KEY, "BlogId" int NOT NULL, "Score" int)"#).await;
+    exec(&pool, r#"INSERT INTO "Bl" VALUES (1, 'a'), (2, 'b'), (3, 'c')"#).await;
+    exec(&pool, r#"INSERT INTO "Po" VALUES (10, 1, 5), (11, 1, 7), (12, 2, NULL)"#).await;
+
+    let counts: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT "b"."Title", (SELECT COUNT(*) FROM "Po" AS "p" WHERE "b"."Id" = "p"."BlogId") AS "Posts" FROM "Bl" AS "b" ORDER BY "b"."Id""#,
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("a count per blog");
+    assert_eq!(counts, vec![("a".to_string(), 2), ("b".to_string(), 1), ("c".to_string(), 0)]);
+
+    // The unquoted alias, the comparison the other way round, and an
+    // aggregate that is NULL where no row matches or every value is NULL.
+    let best: Vec<(i32, Option<i32>)> = sqlx::query_as(
+        r#"SELECT b."Id", (SELECT MAX(p."Score") FROM "Po" AS p WHERE p."BlogId" = b."Id") FROM "Bl" AS b ORDER BY b."Id" DESC"#,
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("a maximum per blog");
+    assert_eq!(best, vec![(3, None), (2, None), (1, Some(7))]);
+
+    // No alias at all: the mixed-case table names are the qualifiers.
+    let unaliased: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT "Bl"."Title", (SELECT COUNT(*) FROM "Po" WHERE "Po"."BlogId" = "Bl"."Id") AS posts FROM "Bl" ORDER BY "Bl"."Id""#,
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("a count per blog, by table name");
+    assert_eq!(unaliased, vec![("a".to_string(), 2), ("b".to_string(), 1), ("c".to_string(), 0)]);
+
+    // In a WHERE, where the same reference decides which rows are kept.
+    assert_eq!(
+        ids(&pool, r#"SELECT "b"."Id" FROM "Bl" AS "b" WHERE (SELECT COUNT(*) FROM "Po" AS "p" WHERE "p"."BlogId" = "b"."Id") > 1"#).await,
+        vec![1]
+    );
+}
+
+/// Two outer columns that differ only in case are two columns; the LATERAL
+/// pass tells outer columns apart without regard to case, so it refuses the
+/// pair rather than answer with one's value for the other.
+#[tokio::test(flavor = "multi_thread")]
+async fn outer_columns_differing_only_in_case_are_refused_not_confused() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    exec(&pool, r#"CREATE TABLE cs (id int PRIMARY KEY, val int, "Val" int)"#).await;
+    exec(&pool, "CREATE TABLE cp (id int PRIMARY KEY, a int, b int)").await;
+    exec(&pool, "INSERT INTO cs VALUES (1, 10, 20)").await;
+    exec(&pool, "INSERT INTO cp VALUES (1, 10, 20), (2, 20, 10)").await;
+    let answer: Result<Vec<(i32, i64)>, _> = sqlx::query_as(
+        r#"SELECT o.id, (SELECT COUNT(*) FROM cp p WHERE p.a = o.val AND p.b = o."Val") FROM cs o"#,
+    )
+    .fetch_all(&pool)
+    .await;
+    match answer {
+        // The right answer, should the pair ever be supported.
+        Ok(rows) => assert_eq!(rows, vec![(1, 1)]),
+        Err(e) => assert!(e.to_string().contains("differ only"), "{e}"),
+    }
+}

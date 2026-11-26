@@ -1517,3 +1517,68 @@ async fn an_exec_request_answers_as_its_rendered_text() {
     assert_eq!(answer.first(), Some(&3), "a malformed EXEC request was answered");
     assert_eq!(n_of(&rows(&context, "SELECT n FROM ex WHERE k = 4").await), [0], "a malformed request wrote k = 4");
 }
+
+/// `\x01DESCRIBE;` names a statement's result columns without running it: the
+/// `RowDescription` pgwire would send, then `ReadyForQuery`. A client reading
+/// native answers, which carry no names, has nothing else to read them from.
+///
+/// Mutation: run the statement to describe it (the INSERT below then writes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_describe_request_names_the_columns_and_runs_nothing() {
+    let (_dir, database) = database().await;
+    let context = context(&database, false);
+    let session = crate::pgwire::NativeSession::new(database.clone(), "svc", true, false, true);
+    let made = simple(&context, Some(&session), "CREATE TABLE desc_t (id BIGINT NOT NULL PRIMARY KEY, \"Label\" TEXT, price NUMERIC(10,2))").await;
+    assert!(made.errors.is_empty(), "{made:?}");
+
+    async fn describe(context: &NativeContext, session: &crate::pgwire::NativeSession, sql: &str) -> Vec<u8> {
+        let mut request = b"\x01DESCRIBE;".to_vec();
+        request.extend_from_slice(sql.as_bytes());
+        process_native_request(
+            context.clone(),
+            std::sync::Arc::new(rastcp::session::Principal::new("svc", true)),
+            Some(session),
+            request,
+        )
+        .await
+    }
+    let has = |answer: &[u8], needle: &[u8]| answer.windows(needle.len()).any(|w| w == needle);
+    let idle: &[u8] = &[b'Z', 0, 0, 0, 5, b'I'];
+
+    // Placeholders as written: no values are needed to name columns.
+    let answer = describe(&context, &session, "SELECT id, \"Label\", price AS cost FROM desc_t WHERE id = $1").await;
+    assert_eq!((answer[0], answer[1]), (crate::pgwire::NativeSession::SIMPLE_ANSWER_FOR_TESTS, b'T'), "{answer:?}");
+    assert_eq!(i16::from_be_bytes([answer[6], answer[7]]), 3, "three columns");
+    for name in [&b"id\0"[..], b"Label\0", b"cost\0"] {
+        assert!(has(&answer, name), "{:?} in {answer:?}", String::from_utf8_lossy(name));
+    }
+    assert!(answer.ends_with(idle));
+    assert!(!has(&answer, b"D\0"), "a described statement sends no rows");
+
+    // A write with RETURNING is described, not run.
+    let answer = describe(&context, &session, "INSERT INTO desc_t (id, \"Label\") VALUES (9, 'x') RETURNING id").await;
+    assert_eq!(answer[1], b'T', "{answer:?}");
+    let count = simple(&context, Some(&session), "SELECT count(*) FROM desc_t").await;
+    assert_eq!(count.results[0].1[0][0].as_deref(), Some("0"), "{count:?}");
+
+    // No rows to describe, and a statement that cannot be read.
+    let answer = describe(&context, &session, "DELETE FROM desc_t WHERE id = 1").await;
+    assert_eq!(answer[1], b'C', "{answer:?}");
+    assert!(has(&answer, b"DESCRIBE\0"));
+    // A statement that cannot be described has no description; the error is the statement's own,
+    // when it is run.
+    let answer = describe(&context, &session, "SELECT nope FROM no_such_table_here").await;
+    assert_ne!(answer[1], b'T', "{answer:?}");
+    assert!(answer.ends_with(idle));
+
+    // Every form of RETURNING names its columns.
+    for (sql, name) in [
+        ("INSERT INTO desc_t (id, \"Label\") VALUES ($1, $2) RETURNING id, \"Label\" AS l", &b"l\0"[..]),
+        ("UPDATE desc_t SET price = 1 WHERE id = $1 RETURNING id", b"id\0"),
+        ("DELETE FROM desc_t WHERE id = 1 RETURNING *", b"price\0"),
+    ] {
+        let answer = describe(&context, &session, sql).await;
+        assert_eq!(answer[1], b'T', "{sql}: {answer:?}");
+        assert!(has(&answer, name), "{sql}: {answer:?}");
+    }
+}

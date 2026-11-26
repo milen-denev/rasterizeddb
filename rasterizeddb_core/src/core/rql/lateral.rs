@@ -524,7 +524,10 @@ pub(crate) fn items_before(sql: &str, upto: usize) -> Vec<(String, String)> {
 }
 
 /// The qualified references `X.col` in `body` (outside quotes, not a call,
-/// not `X.*`), in order of first appearance, each once.
+/// not `X.*`), in order of first appearance, each once. Two spellings of a
+/// column that differ in case are both listed: after
+/// [`unquote_plain_qualified`] they may be two columns (`o.val`, `o.Val`),
+/// which is for [`outer_references`] to refuse, not for this to merge.
 fn qualified_references(body: &str) -> Vec<(String, String)> {
     let bytes = body.as_bytes();
     let mut out: Vec<(String, String)> = Vec::new();
@@ -549,7 +552,7 @@ fn qualified_references(body: &str) -> Vec<(String, String)> {
                     let called = body[c1..].trim_start().starts_with('(');
                     let column = &body[c0..c1];
                     if !called
-                        && !out.iter().any(|(q, c)| q.eq_ignore_ascii_case(qualifier) && c.eq_ignore_ascii_case(column))
+                        && !out.iter().any(|(q, c)| q.eq_ignore_ascii_case(qualifier) && c == column)
                     {
                         out.push((qualifier.to_string(), column.to_string()));
                     }
@@ -739,6 +742,17 @@ pub(crate) fn outer_references(sql: &str, item: &Item) -> Result<Option<(String,
         Some(_) => items_before(&item.body, clause_end_of_from(&item.body)).into_iter().map(|(a, _)| a).collect(),
         None => Vec::new(),
     };
+    // Two items whose names differ only in case (`"Blog"` beside `blog`) are
+    // two relations, and a qualifier is matched to its item without regard to
+    // case: a reference to one would read the other.
+    let names: Vec<&String> = outer.iter().map(|(a, _)| a).chain(inner.iter()).collect();
+    for (n, a) in names.iter().enumerate() {
+        if let Some(b) = names[n + 1..].iter().find(|b| b.eq_ignore_ascii_case(a) && b != &a) {
+            return Err(format!(
+                "a LATERAL item beside {a} and {b}, two FROM items whose names differ only in case, is not supported yet"
+            ));
+        }
+    }
     let mut found: Option<(String, String, Vec<String>)> = None;
     // An outer alias the body names as a bare word may be bound again in a
     // nested subquery (`(SELECT … FROM u c WHERE c.n …)`), where `c.n` is
@@ -765,6 +779,16 @@ pub(crate) fn outer_references(sql: &str, item: &Item) -> Result<Option<(String,
         match &mut found {
             None => found = Some((alias.clone(), relation.clone(), vec![column])),
             Some((a, _, columns)) if a.eq_ignore_ascii_case(alias) => {
+                // Two columns that differ only in case (`d."Date"` beside
+                // `d.date`) are two columns, and everything from here on
+                // tells an outer column from another without regard to case:
+                // one's value would be substituted for the other's.
+                if let Some(other) = columns.iter().find(|c| c.eq_ignore_ascii_case(&column) && **c != column) {
+                    return Err(format!(
+                        "a LATERAL item reading {alias}.{other} and {alias}.{column}, two columns that differ only \
+                         in case, is not supported yet"
+                    ));
+                }
                 if !columns.iter().any(|c| c.eq_ignore_ascii_case(&column)) {
                     columns.push(column);
                 }
@@ -858,15 +882,32 @@ pub(crate) fn clause_end_of_from(body: &str) -> usize {
 /// `sql` with every quoted part of a qualified reference (`"d"."id"`,
 /// `"d".id`, `d."id"`) unquoted where quoting changes nothing: a plain
 /// lower-case identifier, which PostgreSQL reads the same either way. A part
-/// that needs its quotes (upper case, a space, a dot, `""`) keeps them, and so
-/// does a lone quoted name (`AS "d"`, a quoted column); string literals are
-/// copied as they are.
+/// that needs its quotes (a space, a dot, `""`) keeps them, and so does a
+/// lone quoted name (`AS "d"`, a quoted column); string literals are copied
+/// as they are.
+///
+/// A part in mixed case (`d."Id"`, `"Blog"."Id"`: what EF Core writes for a
+/// PascalCase property or table) is unquoted too. PostgreSQL would fold a
+/// bare `Id`, but this text is past the fold (`sql_scan::fold_core_statement`
+/// runs on the client's statement, before any rewrite) and nothing folds it
+/// again, so `d.Id` names the column `Id` as `d."Id"` did: a name resolves by
+/// its exact spelling first. Left quoted, the reference was invisible to
+/// every scan here: a subquery correlated on it was run as an uncorrelated
+/// one, and failed with "missing FROM-clause entry for table d". A reserved
+/// word keeps its quotes (`d."Order"`): bare, the clause scans would read it
+/// as the keyword. Names that then differ only in case are told apart
+/// nowhere below, so `outer_references` refuses them.
 pub(crate) fn unquote_plain_qualified(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let plain = |name: &str| {
+        let lower = |c: char| c.is_ascii_lowercase() || c == '_';
         let mut chars = name.chars();
-        chars.next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
-            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        if chars.clone().all(|c| lower(c) || c.is_ascii_digit()) {
+            return chars.next().is_some_and(lower);
+        }
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !crate::core::sql_scan::RESERVED_WORDS.iter().any(|w| w.eq_ignore_ascii_case(name))
     };
     // One part at `i`: its end, its text as it may be written, and whether it
     // was quoted.
@@ -2419,7 +2460,11 @@ mod unquote_plain_qualified_tests {
         assert_eq!(u(r#"SELECT "d"."id", (SELECT "p"."x" FROM pt AS "p" WHERE "d"."id" = "p"."tagsid") FROM tags AS "d""#),
             r#"SELECT d.id, (SELECT p.x FROM pt AS "p" WHERE d.id = p.tagsid) FROM tags AS "d""#);
         assert_eq!(u(r#""d".id + d."id" + d.id"#), "d.id + d.id + d.id");
-        assert_eq!(u(r#""D"."id" + "d"."Id" + "d"."a b""#), r#""D".id + d."Id" + d."a b""#);
+        // A part in mixed case is unquoted; a reserved word and a name with
+        // a space keep their quotes.
+        assert_eq!(u(r#""D"."id" + "d"."Id" + "d"."a b""#), r#"D.id + d.Id + d."a b""#);
+        assert_eq!(u(r#""Blog"."Id" = "Po"."BlogId" AND "Order"."Id" = 1"#), r#"Blog.Id = Po.BlogId AND "Order".Id = 1"#);
+        assert_eq!(u(r#"b."BlogId" = "p"."Id" AND b."Order" > b."Id2" AND b."2x" = 1"#), r#"b.BlogId = p.Id AND b."Order" > b.Id2 AND b."2x" = 1"#);
         assert_eq!(u(r#"'"d"."id"' || "d"."id""#), r#"'"d"."id"' || d.id"#);
         assert_eq!(u(r#""s"."t"."c" + "denevcloud․erp․x"."c""#), r#""s"."t"."c" + "denevcloud․erp․x".c"#);
         assert_eq!(u("no quotes at all"), "no quotes at all");
