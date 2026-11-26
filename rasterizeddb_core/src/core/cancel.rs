@@ -282,6 +282,30 @@ pub fn tripped() -> Option<CancelReason> {
     STATEMENT_CANCEL.try_with(|c| c.tripped()).ok().flatten()
 }
 
+/// Waits `span` without holding a runtime worker (`pg_sleep`), and stops
+/// early with the reason's error when the current statement is cancelled:
+/// `statement_timeout`, a `CancelRequest`, the client leaving. The signal is
+/// polled, as a scan polls it, every [`SLEEP_SLICE`] at most.
+pub async fn sleep(span: std::time::Duration) -> Result<(), EvalError> {
+    let end = Instant::now().checked_add(span);
+    loop {
+        if let Some(reason) = tripped() {
+            return Err(reason.eval_error());
+        }
+        let left = match end {
+            Some(end) => end.saturating_duration_since(Instant::now()),
+            None => SLEEP_SLICE,
+        };
+        if left.is_zero() {
+            return Ok(());
+        }
+        tokio::time::sleep(left.min(SLEEP_SLICE)).await;
+    }
+}
+
+/// How often [`sleep`] looks at the statement's cancel signal.
+pub const SLEEP_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Runs `fut` as a statement whose table-lock waits are bounded by
 /// `lock_timeout = ms`, for tests driving the engine below the wire.
 #[cfg(any(test, feature = "test_tokens"))]

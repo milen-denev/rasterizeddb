@@ -570,6 +570,23 @@ fn infer_placed(database: &Database, sql: &str, declared: &[i32], scratch: &Scra
             set(n, Some(INT8), &mut oids);
             continue;
         }
+        // The one argument of the `pg_sleep` family: `pg_sleep($1)` is
+        // seconds as `float8`, `pg_sleep_for($1)` an `interval`,
+        // `pg_sleep_until($1)` a `timestamptz`, as PostgreSQL declares them.
+        if prev(1) == Some(&Tok::Open) && toks.get(i + 1) == Some(&Tok::Close) {
+            if let Some(Tok::Ident(None, f)) = prev(2) {
+                let oid = match f.to_ascii_lowercase().as_str() {
+                    "pg_sleep" => Some(701),
+                    "pg_sleep_for" => Some(1186),
+                    "pg_sleep_until" => Some(1184),
+                    _ => None,
+                };
+                if oid.is_some() {
+                    set(n, oid, &mut oids);
+                    continue;
+                }
+            }
+        }
         // A parameter alone in parentheses stands where they do:
         // `SET v = ($1)`, `WHERE v = (($1))` (not a call's argument, `f($1)`).
         let (mut lo, mut hi) = (i, i);

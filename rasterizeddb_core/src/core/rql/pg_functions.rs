@@ -267,6 +267,14 @@ pub enum PgFunc {
     /// to a domain with constraints (`domains::checked_cast`): the value,
     /// or the error of the first constraint it violates.
     DomainValue,
+    /// `pg_sleep(seconds)`, `pg_sleep_for(interval)`, `pg_sleep_until(timestamptz)`:
+    /// a wait, made by the async caller of a `SELECT` with no `FROM`
+    /// (`no_from::NoFrom::wait`) before it evaluates the row. Evaluated
+    /// anywhere else it is refused ([`call`]): a synchronous evaluator could
+    /// only wait by blocking its runtime worker.
+    PgSleep,
+    PgSleepFor,
+    PgSleepUntil,
 }
 
 /// The range type a constructor builds.
@@ -318,6 +326,7 @@ pub const NAMES: &[&str] = &[
     "SCALE", "MIN_SCALE", "TRIM_SCALE", "OVERLAY", "JSONB_PRETTY", "JSONB_INSERT",
     "ISEMPTY", "LOWER_INC", "UPPER_INC", "LOWER_INF", "UPPER_INF", "RANGE_MERGE", "INT4RANGE", "INT8RANGE",
     "NUMRANGE", "DATERANGE", "TSRANGE", "TSTZRANGE", "__RDB_DOMAIN_VALUE",
+    "PG_SLEEP", "PG_SLEEP_FOR", "PG_SLEEP_UNTIL",
 ];
 
 /// `a ~ b`, `a ~* b`, `a !~ b`, `a !~* b` (one, at the top level) as the
@@ -519,6 +528,9 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "TSRANGE" => (TsRange, &[2, 3]),
         "TSTZRANGE" => (TstzRange, &[2, 3]),
         "__RDB_DOMAIN_VALUE" => (DomainValue, &[]),
+        "PG_SLEEP" => (PgSleep, &[1]),
+        "PG_SLEEP_FOR" => (PgSleepFor, &[1]),
+        "PG_SLEEP_UNTIL" => (PgSleepUntil, &[1]),
         _ => return None,
     };
     let variadic_ok = match func {
@@ -539,6 +551,45 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         }));
     }
     Some(Ok(func))
+}
+
+/// How long a call of the `pg_sleep` family over `arg` waits, as PostgreSQL
+/// reads it: seconds (fractions allowed), an interval (a month as thirty
+/// days), or an instant (a zone-less text as UTC). A NULL, a negative span or
+/// an instant already past waits nothing. `None` for any other function.
+pub fn sleep_span(func: PgFunc, arg: &Value) -> Option<Result<std::time::Duration, String>> {
+    use std::time::Duration;
+    let micros = |m: i128| Duration::from_micros(m.clamp(0, u64::MAX as i128) as u64);
+    if arg.is_null() && matches!(func, PgFunc::PgSleep | PgFunc::PgSleepFor | PgFunc::PgSleepUntil) {
+        return Some(Ok(Duration::ZERO));
+    }
+    Some(match func {
+        PgFunc::PgSleep => float_of(arg).map(|secs| {
+            // NaN and negatives wait nothing; past `Duration`'s range, its end.
+            Duration::try_from_secs_f64(if secs > 0.0 { secs } else { 0.0 }).unwrap_or(Duration::MAX)
+        }),
+        PgFunc::PgSleepFor => match arg {
+            Value::Data { bytes, db_type: DbType::INTERVAL } => crate::core::pg_types::decode_interval(bytes)
+                .ok_or_else(|| "an interval could not be read".to_string()),
+            other => crate::core::pg_types::parse_interval(&text_of(other))
+                .ok_or_else(|| format!("invalid input syntax for type interval: \"{}\"", text_of(other))),
+        }
+        .map(|iv| micros(crate::core::pg_types::interval_sort_key(iv))),
+        PgFunc::PgSleepUntil => {
+            let at = match arg {
+                Value::Data { db_type: DbType::DATE | DbType::DATETIME | DbType::TIMESTAMP, .. } => timestamp_of(arg),
+                other => crate::core::value_codec::parse_timestamp_us(&text_of(other))
+                    .ok_or_else(|| format!("invalid input syntax for type timestamp with time zone: \"{}\"", text_of(other))),
+            };
+            at.map(|at| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_micros() as i128);
+                micros(at as i128 - now)
+            })
+        }
+        _ => return None,
+    })
 }
 
 /// What a call to `func` over `args` evaluates to, as PostgreSQL types it:
@@ -1467,6 +1518,14 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         return Ok(args[0].clone());
     }
     Ok(match func {
+        PgSleep | PgSleepFor | PgSleepUntil => {
+            let name = match func {
+                PgSleep => "pg_sleep",
+                PgSleepFor => "pg_sleep_for",
+                _ => "pg_sleep_until",
+            };
+            return Err(format!("0A000: {name}() is supported only as an item of a SELECT with no FROM"));
+        }
         Left | Right => {
             let chars: Vec<char> = s(0).chars().collect();
             let n = int_of(&args[1], "the length")?;
