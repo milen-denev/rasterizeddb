@@ -472,6 +472,16 @@ pub enum TextFunc {
     Round,
     /// `trunc(x [, places])`: [`TextFunc::Round`] toward zero.
     Trunc,
+    /// `__rdb_round_kept(x, places)`: SQL Server's `ROUND`, which rounds the
+    /// value and keeps its type: a `decimal(19,6)` stays one (7.99 is
+    /// 7.990000, where `round(x, 2)` is a numeric of two places), a float
+    /// stays a float (PostgreSQL has no `round(double precision, integer)`)
+    /// and an integer an integer (`ROUND(12345, -2)` is 12300). Half away
+    /// from zero in each. `mssql::translate` writes it.
+    RoundKept,
+    /// `__rdb_trunc_kept(x, places)`: [`TextFunc::RoundKept`] toward zero,
+    /// SQL Server's `ROUND(x, places, 1)`.
+    TruncKept,
     /// `EXTRACT(field FROM x)`: a `numeric`, as PostgreSQL 14 and later
     /// return it, at the field's display scale (six places for `SECOND` and
     /// `EPOCH`, three for `MILLISECONDS`, none otherwise).
@@ -1007,7 +1017,7 @@ pub(crate) fn case_block_end(text: &str) -> Option<usize> {
 pub const FUNCTIONS: &[&str] = &[
     "COALESCE", "NULLIF", "LEAST", "GREATEST", "QUOTE_IDENT", "LOWER", "UPPER", "LENGTH", "CHAR_LENGTH",
     "CHARACTER_LENGTH", "OCTET_LENGTH", "DATE_TRUNC", "REPLACE", "ARRAY_LENGTH", "ARRAY_NDIMS",
-    "UUID_EXTRACT_TIMESTAMP", "UUID_EXTRACT_VERSION", "ABS", "ROUND", "TRUNC", "DATE_PART", "MOD", "BTRIM", "LTRIM", "RTRIM", "RPAD", "LPAD", "JSONB_TYPEOF",
+    "UUID_EXTRACT_TIMESTAMP", "UUID_EXTRACT_VERSION", "ABS", "ROUND", "TRUNC", "__RDB_ROUND_KEPT", "__RDB_TRUNC_KEPT", "DATE_PART", "MOD", "BTRIM", "LTRIM", "RTRIM", "RPAD", "LPAD", "JSONB_TYPEOF",
     "REGEXP_LIKE", "SIMILAR_TO_ESCAPE", "__CHECK_REGEXP_LIKE", "__CHECK_REGEXP_UNCERTAIN",
     "TO_TSVECTOR", "TO_TSQUERY", "PLAINTO_TSQUERY", "PHRASETO_TSQUERY", "WEBSEARCH_TO_TSQUERY", "TS_MATCH_VQ",
     "TS_MATCH_TQ", "TS_MATCH_TT", "TS_RANK",
@@ -2341,6 +2351,37 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         return Err("abs takes exactly one argument".to_string());
                     }
                     Ok(Expr::Call(TextFunc::Abs, args))
+                }
+                "__RDB_ROUND_KEPT" | "__RDB_TRUNC_KEPT" => {
+                    let mut args = args;
+                    let func = if upper_name == "__RDB_TRUNC_KEPT" { TextFunc::TruncKept } else { TextFunc::RoundKept };
+                    if args.len() != 2 {
+                        return Err("round takes a number and the places".to_string());
+                    }
+                    if matches!(&args[0], Expr::Null) {
+                        return Ok(Expr::Null);
+                    }
+                    // An untyped string constant is a numeric one.
+                    if matches!(&args[0], Expr::Literal { db_type: DbType::STRING, .. }) {
+                        let literal = args.remove(0);
+                        args.insert(0, Expr::Cast(Box::new(literal), DbType::DECIMAL));
+                    }
+                    let ty = static_type(&args[0]);
+                    if !(matches!(ty, DbType::DECIMAL | DbType::F32 | DbType::F64) || is_integer_type(&ty)) {
+                        return Err(format!("argument data type {} is invalid for argument 1 of round function", ty.to_string().to_lowercase()));
+                    }
+                    if columns_of(&args[1]).is_empty() {
+                        args[1] = match eval(&args[1], &Row::default(), &[])? {
+                            Value::Null => Expr::Null,
+                            value => {
+                                let p = as_i64(&value).ok_or_else(|| "the places of round must be an integer".to_string())?;
+                                Expr::Literal { bytes: (p.clamp(-1000, 1000) as i32).to_le_bytes().to_vec(), db_type: DbType::I32 }
+                            }
+                        };
+                    } else if !is_integer_type(&static_type(&args[1])) {
+                        return Err("the places of round must be an integer".to_string());
+                    }
+                    Ok(Expr::Call(func, args))
                 }
                 "ROUND" | "TRUNC" => {
                     let mut args = args;
@@ -3975,6 +4016,8 @@ pub fn static_type(expr: &Expr) -> DbType {
         Expr::Call(TextFunc::TsRank, _) => DbType::F32,
         // The argument's own type, as PostgreSQL's `abs` family returns.
         Expr::Call(TextFunc::Abs, args) => args.first().map(static_type).unwrap_or(DbType::I32),
+        // The argument's own type: what SQL Server's `ROUND` returns.
+        Expr::Call(TextFunc::RoundKept | TextFunc::TruncKept, args) => args.first().map(static_type).unwrap_or(DbType::DECIMAL),
         // `round(numeric)` and `round(…, places)` are NUMERIC; `round` of an
         // integer or a float alone is `double precision`.
         Expr::Call(TextFunc::Round | TextFunc::Trunc, args) => {
@@ -4153,6 +4196,8 @@ pub fn display_scale(expr: &Expr) -> Option<u32> {
             None => Some(0),
             Some(places) => round_places(places).map(|p| p.max(0) as u32).filter(|s| *s <= DECIMAL_SCALE),
         },
+        // The places the argument is shown at: its type is kept.
+        Expr::Call(TextFunc::RoundKept | TextFunc::TruncKept, args) => args.first().and_then(display_scale),
         Expr::NumericCast { scale, .. } => Some(*scale),
         // A cast to plain `numeric` keeps the places of an exact value.
         Expr::Cast(inner, DbType::DECIMAL)
@@ -5182,6 +5227,51 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
                     bytes: (v.m as f64 / 10f64.powi(v.s as i32)).to_le_bytes().to_vec(),
                     db_type: DbType::F64,
                 },
+            }
+        }
+        TextFunc::RoundKept | TextFunc::TruncKept => {
+            let toward_zero = func == TextFunc::TruncKept;
+            let Value::Data { bytes, db_type } = &args[0] else {
+                return Ok(Value::Null);
+            };
+            let places = match args.get(1) {
+                None | Some(Value::Null) => return Ok(Value::Null),
+                Some(p) => as_i64(p).ok_or_else(|| "the places must be an integer".to_string())?.clamp(-1000, 1000) as i32,
+            };
+            match db_type {
+                DbType::DECIMAL => {
+                    let v = decimal_value_as_pgnum(bytes)?;
+                    let r = if toward_zero { v.trunc_places(places) } else { v.round_places(places) }
+                        .and_then(|r| r.round_to(v.s))
+                        .ok_or_else(|| PAST_38_DIGITS.to_string())?;
+                    pgnum_as_decimal_value(r)
+                }
+                DbType::F32 | DbType::F64 => {
+                    let f = as_f64(&args[0]).ok_or_else(|| format!("round is not defined for {}", db_type))?;
+                    // Past the digits a float holds there is nothing to round.
+                    let unit = 10f64.powi(places.clamp(-400, 400));
+                    let scaled = f * unit;
+                    let r = if !scaled.is_finite() || unit == 0.0 {
+                        if unit == 0.0 { 0.0 } else { f }
+                    } else if toward_zero {
+                        scaled.trunc() / unit
+                    } else {
+                        scaled.round() / unit
+                    };
+                    cast(Value::Data { bytes: r.to_le_bytes().to_vec(), db_type: DbType::F64 }, db_type)?
+                }
+                t if is_integer_type(t) => {
+                    if places >= 0 {
+                        return Ok(args[0].clone());
+                    }
+                    let v = as_i64(&args[0]).map(|v| crate::core::rql::pg_numeric::PgNum::int(v as i128)).ok_or_else(|| format!("round is not defined for {}", db_type))?;
+                    let r = if toward_zero { v.trunc_places(places) } else { v.round_places(places) }
+                        .and_then(|r| r.units_at(0))
+                        .and_then(|units| i64::try_from(units).ok())
+                        .ok_or_else(|| "arithmetic overflow error converting expression to data type int".to_string())?;
+                    cast(Value::Data { bytes: r.to_le_bytes().to_vec(), db_type: DbType::I64 }, db_type)?
+                }
+                other => return Err(format!("round is not defined for {}", other)),
             }
         }
         TextFunc::Round | TextFunc::Trunc => {
@@ -6507,6 +6597,25 @@ pub(crate) fn pg_numeric(
         Expr::Call(TextFunc::ExtractField, args) if args.len() == 2 => {
             let field = args.first().and_then(field_literal).ok_or("EXTRACT lost its field")?;
             Some(date_field_value(field, &eval(&args[1], row, schema)?)?)
+        }
+        // The value rounded, at the places it had.
+        Expr::Call(func @ (TextFunc::RoundKept | TextFunc::TruncKept), args) if static_type(expr) == DbType::DECIMAL => {
+            let places = match args.get(1) {
+                None | Some(Expr::Null) => None,
+                Some(places) => match round_places(places) {
+                    Some(p) => Some(p),
+                    None => as_i64(&eval(places, row, schema)?).map(|p| p.clamp(-1000, 1000) as i32),
+                },
+            };
+            match (pg_numeric(&args[0], row, schema)?, places) {
+                (None, _) => None,
+                (Some(None), _) | (_, None) => Some(None),
+                (Some(Some(v)), Some(p)) => Some(Some(
+                    if *func == TextFunc::TruncKept { v.trunc_places(p) } else { v.round_places(p) }
+                        .and_then(|r| r.round_to(v.s))
+                        .ok_or_else(|| PAST_38_DIGITS.to_string())?,
+                )),
+            }
         }
         Expr::Call(func @ (TextFunc::Round | TextFunc::Trunc), args) if static_type(expr) == DbType::DECIMAL => {
             let places = match args.get(1) {

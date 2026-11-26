@@ -549,6 +549,9 @@ const NOT_CATALOGUES: &[&str] = &[
     "__rdb_t7_digit",
     "__rdb_t7_text",
     "__rdb_t7_floor",
+    // SQL Server's ROUND, which keeps its argument's type (`expr`).
+    "__rdb_round_kept",
+    "__rdb_trunc_kept",
 ];
 
 /// The prefix of the tables the MySQL and SQL Server front ends make for a

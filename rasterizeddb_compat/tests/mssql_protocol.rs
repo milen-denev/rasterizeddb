@@ -2714,3 +2714,76 @@ async fn tiberius_top_before_a_subquery_through_a_join() {
         assert_eq!(got, want, "TOP {top}");
     }
 }
+
+/// SQL Server's `ROUND` rounds the value and keeps its type: over a
+/// `decimal(19,6)` the answer is still one (7.99 comes back 7.990000),
+/// where PostgreSQL's `round(x, 2)` is a numeric of two places, and the
+/// application read a price of another scale than SQL Server sent. A float
+/// stays a float (the statement was refused: PostgreSQL has no
+/// `round(double precision, integer)`), an integer an integer. Half away
+/// from zero; a third argument that is not 0 truncates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_round_keeps_the_type() {
+    let s = start();
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [Rnd] ([Id] int PRIMARY KEY, [Price] decimal(19,6) NULL, [P2] decimal(18,2) NULL, [F] float NULL, [N] int NULL, [B] bigint NULL); \
+         INSERT INTO [Rnd] VALUES (1, 7.99, 7.99, 7.987, 12345, 9876543210), (2, NULL, NULL, NULL, NULL, NULL), \
+             (3, 1.234567, 1.23, -2.5, -12355, -15), (4, 2.5, 0.05, 0.125, 7, 5)",
+    )
+    .await
+    .unwrap();
+    let dec = |r: &tiberius::Row, i: usize| r.get::<tiberius::numeric::Numeric, _>(i).map(|n| (n.value(), n.scale()));
+    // Decimals: the column's scale whatever the places, NULL kept, and a
+    // COALESCE under it (EF Core's `ROUND(COALESCE([d].[Price], 0.0), 2)`).
+    let r = batch(
+        &mut c,
+        "SELECT ROUND([Price], 2), ROUND([Price], 0), ROUND([Price], -1), ROUND([P2], 1), ROUND([P2], 4), ROUND([Price], 2, 1), \
+             ROUND(COALESCE([Price], 0.0), 2) FROM [Rnd] ORDER BY [Id]",
+    )
+    .await
+    .unwrap();
+    let got: Vec<Vec<Option<(i128, u8)>>> = r[0].iter().map(|r| (0..7).map(|i| dec(r, i)).collect()).collect();
+    let six = |units: i128| Some((units, 6u8));
+    let two = |units: i128| Some((units, 2u8));
+    assert_eq!(
+        got,
+        [
+            vec![six(7_990_000), six(8_000_000), six(10_000_000), two(800), two(799), six(7_990_000), six(7_990_000)],
+            vec![None, None, None, None, None, None, six(0)],
+            vec![six(1_230_000), six(1_000_000), six(0), two(120), two(123), six(1_230_000), six(1_230_000)],
+            vec![six(2_500_000), six(3_000_000), six(0), two(10), two(5), six(2_500_000), six(2_500_000)],
+        ]
+    );
+    // Floats and integers, each in its own type.
+    let r = batch(
+        &mut c,
+        "SELECT ROUND([F], 2), ROUND([F], 0), ROUND([F], 1, 1), ROUND([N], -2), ROUND([N], 1), ROUND([B], -1) FROM [Rnd] ORDER BY [Id]",
+    )
+    .await
+    .unwrap();
+    let got: Vec<_> = r[0]
+        .iter()
+        .map(|r| (r.get::<f64, _>(0), r.get::<f64, _>(1), r.get::<f64, _>(2), r.get::<i32, _>(3), r.get::<i32, _>(4), r.get::<i64, _>(5)))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (Some(7.99), Some(8.0), Some(7.9), Some(12300), Some(12345), Some(9_876_543_210)),
+            (None, None, None, None, None, None),
+            (Some(-2.5), Some(-3.0), Some(-2.5), Some(-12400), Some(-12355), Some(-20)),
+            (Some(0.13), Some(0.0), Some(0.1), Some(0), Some(7), Some(10)),
+        ]
+    );
+    // Through a join, in its WHERE and its ORDER BY, over a computed value.
+    let r = batch(
+        &mut c,
+        "SELECT [a].[Id], ROUND([a].[Price] * 2, 2), ROUND([b].[P2], 0) FROM [Rnd] AS [a] INNER JOIN [Rnd] AS [b] ON [a].[Id] = [b].[Id] \
+         WHERE ROUND([a].[P2], 1) <> 1.2 ORDER BY ROUND([b].[Price], 0) DESC, [a].[Id]",
+    )
+    .await
+    .unwrap();
+    let got: Vec<_> = r[0].iter().map(|r| (r.get::<i32, _>(0).unwrap(), dec(r, 1), dec(r, 2))).collect();
+    assert_eq!(got, [(1, six(15_980_000), two(800)), (4, six(5_000_000), two(0))]);
+}
