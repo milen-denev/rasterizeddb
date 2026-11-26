@@ -5480,6 +5480,8 @@ pub(crate) async fn describe_query(
     let stmt = join_on.as_deref().unwrap_or(stmt);
     let distinct_on = crate::core::rql::distinct_on::rewrite_statement(stmt);
     let stmt = distinct_on.as_deref().unwrap_or(stmt);
+    let grouped_order = crate::core::rql::distinct_on::rewrite_grouped_order(stmt);
+    let stmt = grouped_order.as_deref().unwrap_or(stmt);
     // A `WITH` prefix is stripped and the statement it introduces is described
     // instead — but the outer query usually reads a CTE *as its source
     // relation*, and that name is not in `database.tables`. Describing the
@@ -8659,6 +8661,10 @@ pub(crate) fn rewrite_statement_text<'a>(
     // (`core::rql::distinct_on`).
     let distinct_on = crate::core::rql::distinct_on::rewrite_statement(&stmt);
     take(&mut stmt, distinct_on);
+    // A grouped query sorted by an aggregate or a key that is no select
+    // item, over a derived table that computes it (same module).
+    let grouped_order = crate::core::rql::distinct_on::rewrite_grouped_order(&stmt);
+    take(&mut stmt, grouped_order);
 
     // A quoted identifier holding a quote (`"a""b"`) is refused before
     // anything reads it: every reader below dropped the name at the first

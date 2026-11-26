@@ -57,6 +57,78 @@ pub(crate) fn rewrite_statement(sql: &str) -> Option<String> {
     rewrite_select(trimmed)
 }
 
+/// A grouped `SELECT` sorted by something that is not in its select list
+/// (an aggregate, a grouping key), over a derived table that computes the
+/// sort term beside the items:
+///
+/// ```sql
+/// SELECT k FROM t GROUP BY k ORDER BY count(*) DESC LIMIT 1
+/// SELECT __don_c0 AS "k" FROM (SELECT k AS __don_c0, count(*) AS __don_k0 FROM t GROUP BY k) __don
+///  ORDER BY __don_k0 DESC LIMIT 1
+/// ```
+///
+/// PostgreSQL and SQL Server both sort a grouped query by any expression
+/// over its groups; the fold here sorts by what it produced, and such a
+/// statement was refused ("ORDER BY term 'count(*)' is not in the SELECT
+/// list", 42601). EF Core writes it for `GroupBy(…).OrderByDescending(g =>
+/// g.Count()).Select(g => g.Key)`.
+///
+/// `None` unless it is that: a `GROUP BY`, an `ORDER BY` with a term no
+/// select item is, no `DISTINCT`, window, `*`, set operation or row lock.
+/// A statement every sort term of which is an item is left as it is.
+pub(crate) fn rewrite_grouped_order(sql: &str) -> Option<String> {
+    let has = |word: &[u8]| sql.as_bytes().windows(word.len()).any(|w| w.eq_ignore_ascii_case(word));
+    if !has(b"GROUP") || !has(b"ORDER") {
+        return None;
+    }
+    let trimmed = sql.trim().trim_end_matches(';').trim_end();
+    if crate::core::rql::cte::has_with_clause(trimmed) {
+        let (_, outer) = crate::core::rql::cte::split_with(trimmed).ok()??;
+        let outer = outer.trim();
+        if outer.is_empty() || !trimmed.ends_with(outer) {
+            return None;
+        }
+        let prefix = &trimmed[..trimmed.len() - outer.len()];
+        return Some(format!("{prefix}{}", grouped_order_select(outer)?));
+    }
+    grouped_order_select(trimmed)
+}
+
+fn grouped_order_select(sql: &str) -> Option<String> {
+    let after_select = strip_word(sql, "SELECT")?;
+    if strip_word(after_select, "DISTINCT").is_some() || strip_word(after_select, "ALL").is_some() {
+        return None;
+    }
+    let list_at = sql.len() - after_select.len();
+    let from_at = find_keyword(sql, "FROM", list_at)?;
+    let list = sql[list_at..from_at].trim();
+    for word in ["UNION", "INTERSECT", "EXCEPT", "FOR", "WINDOW"] {
+        if find_keyword(sql, word, from_at).is_some() {
+            return None;
+        }
+    }
+    find_phrase(sql, &["GROUP", "BY"], from_at)?;
+    let order_at = find_phrase(sql, &["ORDER", "BY"], from_at)?;
+    let after_order = phrase_end(sql, order_at, &["ORDER", "BY"]);
+    let tail_at =
+        ["LIMIT", "OFFSET", "FETCH"].iter().filter_map(|w| find_keyword(sql, w, after_order)).min().unwrap_or(sql.len());
+    let (body, order_text, tail) = (&sql[from_at..order_at], &sql[after_order..tail_at], sql[tail_at..].trim());
+    if has_word(list, "OVER") || has_word(order_text, "OVER") {
+        return None;
+    }
+    let mut columns = select_columns(list)?;
+    let mut order = Vec::new();
+    for raw in crate::core::rql::lexer_ct::split_definitions(order_text) {
+        let (expr, modifiers) = sort_term(&raw)?;
+        order.push(format!("{}{modifiers}", columns.resolve(expr)?));
+    }
+    // Every term an item: the fold sorts by it as it is.
+    if columns.extra.is_empty() {
+        return None;
+    }
+    Some(assemble("SELECT", "SELECT", &columns, body, &order, tail))
+}
+
 fn mentions_distinct(sql: &str) -> bool {
     sql.as_bytes().windows(8).any(|w| w.eq_ignore_ascii_case(b"DISTINCT"))
 }
