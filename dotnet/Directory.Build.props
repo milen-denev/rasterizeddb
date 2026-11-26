@@ -1,0 +1,16 @@
+<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <Version>1.0.1</Version>
+    <Authors>Milen Denev</Authors>
+    <RepositoryUrl>https://github.com/milen-denev/rasterizeddb</RepositoryUrl>
+    <PackageLicenseExpression>GPL-3.0-only</PackageLicenseExpression>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <!-- Tiered PGO is on by default from .NET 8; the hot paths are written so it can devirtualise them. -->
+    <TieredPGO>true</TieredPGO>
+  </PropertyGroup>
+</Project>

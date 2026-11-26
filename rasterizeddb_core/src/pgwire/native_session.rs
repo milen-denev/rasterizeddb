@@ -99,6 +99,21 @@ pub(crate) const ROLE_PREFIX: &[u8] = b"\x01ROLE;";
 /// marked requests (0A000), two statements on one before them.
 pub(crate) const NOTICES_PREFIX: &[u8] = b"\x01NOTICES;";
 
+/// Asks for a statement's result columns without running it:
+/// `\x01DESCRIBE;<statement>`, the statement with its `$n` placeholders as
+/// written (no values are needed to name columns). Answered in the
+/// simple-query form with the `RowDescription` pgwire would send for the same
+/// statement (names, type OIDs, modifiers) and no rows; a statement that
+/// returns no rows answers `DESCRIBE`, with no description.
+///
+/// For a client that reads native (binary) answers, which carry no column
+/// names: it describes a statement once and keeps the names. Nothing runs, so
+/// a statement with side effects is as safe to describe as any other, and a
+/// failed transaction block is neither read nor changed. Two statements to a
+/// server before marked requests, and an unknown marked request (0A000) to one
+/// without this: a client then has no names, as before.
+pub(crate) const DESCRIBE_PREFIX: &[u8] = b"\x01DESCRIBE;";
+
 /// The first byte of an answer that carries notices: a `u32` count (little
 /// endian), then each notice as three NUL-terminated strings (severity,
 /// SQLSTATE, message), then the answer itself, whose first byte is one of
@@ -307,6 +322,19 @@ pub(crate) async fn answer_marked(
         let stopped = crate::core::cancel::cancel_token(user, &token);
         log::debug!("native CANCEL for a query of {user}: {stopped}");
         return simple_complete(if stopped { "CANCEL 1" } else { "CANCEL 0" });
+    }
+    if let Some(text) = request.strip_prefix(DESCRIBE_PREFIX) {
+        let Ok(text) = std::str::from_utf8(text) else {
+            return simple_error("22021", "the statement is not valid UTF-8", b'I');
+        };
+        return match session {
+            Some(session) => Box::pin(session.describe(text)).await,
+            None => simple_error(
+                "0A000",
+                "describing a statement needs a connection session, which this caller does not have",
+                b'I',
+            ),
+        };
     }
     let Some(parsed) = parse_simple(request) else {
         return simple_error(
@@ -888,6 +916,46 @@ impl NativeSession {
     }
 
     /// [`SIMPLE_ANSWER`], for the native statement tests.
+    /// A [`DESCRIBE_PREFIX`] request: the columns `query` answers with, as
+    /// pgwire describes a prepared statement (`describe_for_wire`), and the
+    /// transaction status the connection is in. Nothing is run, and the
+    /// connection's block, if one is open, is left exactly as it was.
+    pub(crate) async fn describe(&self, query: &str) -> Vec<u8> {
+        let status = if self.poisoned.load(Ordering::Acquire) {
+            b'E'
+        } else if self.in_block.load(Ordering::Acquire) {
+            b'T'
+        } else {
+            b'I'
+        };
+        match describe_for_wire(&self.database, query).await {
+            // A statement that is no SELECT and still answers with rows (a write with RETURNING)
+            // is described by the columns it names, where it names any.
+            Ok(Some((fields, _))) if !fields.is_empty() => {
+                let mut answer = vec![SIMPLE_ANSWER];
+                // Into the answer's own bytes: a `Vec<u8>` takes every write whole.
+                if let Err(e) = describing(&self.database, query, send_row_description(&mut answer, &fields, &[])).await {
+                    return simple_error("XX000", &e.to_string(), status);
+                }
+                answer.push(b'Z');
+                answer.extend_from_slice(&5i32.to_be_bytes());
+                answer.push(status);
+                answer
+            }
+            Ok(_) => {
+                let mut answer = simple_complete("DESCRIBE");
+                if let Some(last) = answer.last_mut() {
+                    *last = status;
+                }
+                answer
+            }
+            Err(e) => {
+                let message = e.to_string();
+                simple_error(sqlstate_for(&message), &message, status)
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) const SIMPLE_ANSWER_FOR_TESTS: u8 = SIMPLE_ANSWER;
 

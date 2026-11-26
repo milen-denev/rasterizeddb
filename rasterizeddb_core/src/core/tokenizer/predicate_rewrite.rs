@@ -3654,8 +3654,10 @@ fn needs_evaluator(text: &str) -> bool {
             // (`expr::parse_subscript`). Not `ARRAY[…]`, whose `= ANY` form
             // the rewrite above reads itself.
             // `[]` is a type's array suffix (`::text[]`), never a subscript.
+            // After a quoted name too, `b."Tags"[1]`, as EF Core writes every
+            // PascalCase column: it read as "unexpected character '['".
             b'[' if i > 0
-                && (is_word(bytes[i - 1]) || bytes[i - 1] == b')')
+                && (is_word(bytes[i - 1]) || bytes[i - 1] == b')' || bytes[i - 1] == b'"')
                 && bytes.get(i + 1) != Some(&b']')
                 && {
                     let word_start = text[..i]
@@ -8987,6 +8989,21 @@ mod lifted_operand_tests {
         assert!(lift_evaluated_operands(&deep(10), &schema()).is_ok());
         let e = lift_evaluated_operands(&deep(100_000), &schema()).unwrap_err();
         assert!(e.contains("nested more than"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod quoted_subscript_tests {
+    use super::needs_evaluator;
+
+    /// A subscript after a quoted column needs the evaluator, as one after a
+    /// bare column or a group does; a quoted column with no subscript does not.
+    #[test]
+    fn a_subscript_after_a_quoted_column_is_lifted() {
+        for text in [r#"b."Tags"[1] = 'even'"#, r#""Scores"[$1 + 1] > 3"#, "b.tags[1] = 'even'", "(a)[2] = 1"] {
+            assert!(needs_evaluator(text), "{text}");
+        }
+        assert!(!needs_evaluator(r#"b."Tags" = c"#));
     }
 }
 
