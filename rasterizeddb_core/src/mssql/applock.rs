@@ -104,6 +104,11 @@ pub(crate) fn holds(database: usize, resource: &str, conn: u64) -> bool {
         .is_some_and(|l| l.holders.keys().any(|(c, _)| *c == conn))
 }
 
+/// Whether `conn` holds any lock under `owner`.
+pub(crate) fn holds_any(conn: u64, owner: Owner) -> bool {
+    LOCKS.lock().values().any(|l| l.holders.keys().any(|(c, o)| *c == conn && *o == owner))
+}
+
 /// Everything a connection holds under `owner` (or under any owner) goes.
 pub(crate) fn release_all(conn: u64, owner: Option<Owner>) {
     let mut locks = LOCKS.lock();
