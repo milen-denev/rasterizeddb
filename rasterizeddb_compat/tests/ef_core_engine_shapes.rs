@@ -216,3 +216,34 @@ async fn outer_columns_differing_only_in_case_are_refused_not_confused() {
         Err(e) => assert!(e.to_string().contains("differ only"), "{e}"),
     }
 }
+
+/// A join over schema-qualified tables, as EF Core writes every table of a
+/// model with a default schema (`HasDefaultSchema("public")`, which its
+/// scaffolder emits). Each table read alone was found; joined, the first
+/// failed "relation 'public"."jc' does not exist".
+///
+/// Mutation: trim the quotes off the whole qualified name
+/// (`join::split_relation_alias`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_over_schema_qualified_tables() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    exec(&pool, "CREATE TABLE jc (id int PRIMARY KEY, name text)").await;
+    exec(&pool, r#"CREATE TABLE "Jo" (id int PRIMARY KEY, customer_id int, total int)"#).await;
+    exec(&pool, "INSERT INTO jc VALUES (1, 'a'), (2, 'b')").await;
+    exec(&pool, r#"INSERT INTO "Jo" VALUES (10, 1, 5), (11, 1, 7), (12, 2, 9)"#).await;
+
+    for sql in [
+        r#"SELECT "o"."id" FROM "public"."jc" AS "c" LEFT JOIN "public"."Jo" AS "o" ON "c"."id" = "o"."customer_id" ORDER BY "c"."id", "o"."id""#,
+        r#"SELECT o.id FROM public.jc AS c INNER JOIN public."Jo" AS o ON c.id = o.customer_id ORDER BY c.id, o.id"#,
+        r#"SELECT "Jo".id FROM public.jc JOIN "public"."Jo" ON jc.id = "Jo".customer_id ORDER BY jc.id, "Jo".id"#,
+        r#"SELECT o.id FROM "public"."jc" c, "public"."Jo" o WHERE c.id = o.customer_id ORDER BY o.id"#,
+    ] {
+        assert_eq!(ids(&pool, sql).await, vec![10, 11, 12], "{sql}");
+    }
+    // The qualifier names nothing else: a table that is not there is still not there.
+    let missing = sqlx::query(r#"SELECT 1 FROM "public"."jc" AS c JOIN "public"."nope" AS n ON c.id = n.id"#)
+        .fetch_all(&pool)
+        .await;
+    assert!(missing.is_err());
+}

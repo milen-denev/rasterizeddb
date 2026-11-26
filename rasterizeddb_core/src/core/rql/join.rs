@@ -2510,11 +2510,21 @@ pub fn parse_from_clause(from_clause: &str) -> Result<Vec<RelationRef>, String> 
 
 fn split_relation_alias(text: &str) -> Result<(String, String), String> {
     let mut parts = text.split_whitespace();
-    let table = parts
+    // The last segment outside double quotes, as a one-table read names its
+    // relation (`lexer_s1::normalize_table_name`): the catalogue has one
+    // namespace. Trimming the quotes off the whole of `"public"."t"` left
+    // `public"."t`, and `public.t` was looked up under that name, so a join
+    // over schema-qualified tables (an ORM with a default schema writes every
+    // one so) failed "relation does not exist" where the same tables, read
+    // one at a time, were found.
+    let written = parts
         .next()
-        .ok_or_else(|| "FROM clause names no relation".to_string())?
-        .trim_matches('"')
-        .to_string();
+        .ok_or_else(|| "FROM clause names no relation".to_string())?;
+    let last = crate::core::sql_scan::last_name_segment(written);
+    let table = match last.strip_prefix('"').and_then(|l| l.strip_suffix('"')) {
+        Some(inner) if !inner.is_empty() => inner.replace("\"\"", "\""),
+        _ => last.trim_matches('"').to_string(),
+    };
 
     let alias = match parts.next() {
         None => None,
