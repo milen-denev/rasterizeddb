@@ -1208,8 +1208,51 @@ pub(crate) async fn materialize(
                 // The filter the probe ran with, when it did: the outer
                 // item's copy below takes it too.
                 let mut pushed: Option<String> = None;
-                let tuples = match outer_only_filter(&current, &item, alias) {
-                    Some(filter) => match text_rows(&format!("{key_query} WHERE {filter}"), columns.len(), database, tx).await {
+                let filter = outer_only_filter(&current, &item, alias);
+                // A statement its LIMIT may cut (`limited_outer`) is asked
+                // for the rows the limit keeps and one more, not for every
+                // outer value: more than it keeps is all the cut needs to
+                // know, and the probe of a category's two thousand products
+                // was half the statement's time once the cut was made. No
+                // more than it keeps, and those are every row: the values.
+                let mut known: Option<Vec<Vec<Option<String>>>> = None;
+                if !limited {
+                    let cut = limited_outer(&current, alias, relation, usize::MAX)
+                        .and_then(|cut| cut.kept.filter(|kept| *kept < MAX_TUPLES).map(|kept| (cut, kept)));
+                    if let Some((cut, kept)) = cut {
+                        let capped = format!(
+                            "SELECT {} FROM {relation} {alias}{} LIMIT {}",
+                            columns.iter().map(|c| format!("{alias}.{c}::text")).collect::<Vec<_>>().join(", "),
+                            filter.as_ref().map(|filter| format!(" WHERE {filter}")).unwrap_or_default(),
+                            kept + 1
+                        );
+                        // (Failed: asked again below, as it always was.)
+                        if let Ok(rows) = text_rows(&capped, columns.len(), database, tx).await {
+                            if rows.len() > kept {
+                                limited = true;
+                                if let Some(cut) = cut_outer(cut, &current, alias, relation, database, temps, tx).await? {
+                                    current = cut;
+                                    continue;
+                                }
+                            } else {
+                                let mut distinct: Vec<Vec<Option<String>>> = Vec::with_capacity(rows.len());
+                                let mut seen = std::collections::HashSet::with_capacity(rows.len());
+                                for row in rows {
+                                    if seen.insert(row.clone()) {
+                                        distinct.push(row);
+                                    }
+                                }
+                                known = Some(distinct);
+                            }
+                        }
+                    }
+                }
+                let tuples = match (known, filter) {
+                    (Some(tuples), filter) => {
+                        pushed = filter;
+                        tuples
+                    }
+                    (None, Some(filter)) => match text_rows(&format!("{key_query} WHERE {filter}"), columns.len(), database, tx).await {
                         Ok(tuples) => {
                             pushed = Some(filter);
                             tuples
@@ -1223,7 +1266,7 @@ pub(crate) async fn materialize(
                             text_rows(&key_query, columns.len(), database, tx).await?
                         }
                     },
-                    None => text_rows(&key_query, columns.len(), database, tx).await?,
+                    (None, None) => text_rows(&key_query, columns.len(), database, tx).await?,
                 };
                 // More outer values than the statement's LIMIT keeps rows:
                 // the rows it keeps first, the items for those (the item is
@@ -1618,6 +1661,8 @@ struct LimitedOuter {
     written: String,
     /// Whether the statement's `WHERE` holds a subquery.
     subquery: bool,
+    /// The rows its `LIMIT` and `OFFSET` keep, when it has a limit.
+    kept: Option<usize>,
     before: String,
     after: String,
     /// The relations joined to the outer item, each alias and its table:
@@ -1851,7 +1896,7 @@ fn limited_outer(sql: &str, alias: &str, relation: &str, tuples: usize) -> Optio
         after.push(' ');
         after.push_str(order);
     }
-    Some(LimitedOuter { body, written: written.to_string(), before: sql[..head_at].to_string(), after, subquery, joined })
+    Some(LimitedOuter { body, written: written.to_string(), before: sql[..head_at].to_string(), after, subquery, joined, kept })
 }
 
 /// Whether `text` (a statement, or the parts of one) could read a column of
