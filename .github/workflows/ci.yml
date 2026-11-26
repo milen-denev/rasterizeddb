@@ -242,7 +242,13 @@ jobs:
             server="$client"
           fi
           echo "baselines: $client (client crates, rastcp), $server (embedded SDK)"
-          cargo semver-checks --baseline-rev "$client" -p rastcp -p rasterizeddb_client -p rasterizeddb_client_derive
+          cargo semver-checks --baseline-rev "$client" -p rastcp -p rasterizeddb_client_derive
+          # The client's features but `fips`: semver-checks builds every
+          # feature by default, and `fips` builds the AWS-LC FIPS module,
+          # which needs Go and CMake this runner does not carry. `fips` adds
+          # no API of its own (it swaps SCRAM's hash implementation).
+          cargo semver-checks --baseline-rev "$client" -p rasterizeddb_client \
+            --default-features --features chrono --features uuid --features serde_json
           cargo semver-checks --baseline-rev "$server" -p rasterizeddb_embedded
 
   package:
