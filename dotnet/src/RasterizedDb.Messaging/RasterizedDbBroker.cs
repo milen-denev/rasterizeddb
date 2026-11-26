@@ -15,8 +15,8 @@ namespace RasterizedDb.Messaging;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Pre-production.</b> The protocol is pinned to the broker at commit <c>ee960c71</c> and is not
-/// frozen; the broker itself has no tests yet.
+/// <b>Pre-production.</b> The protocol is pinned to the broker at commit <c>5ffbb7b6</c> and is not
+/// frozen. This client has been tested against a stand-in that speaks the frames, not the broker.
 /// </para>
 /// <para>
 /// A frame is <c>[u32 length][u8 op][u8 flags][u16 reserved][u32 corr][body]</c>, the length counting
@@ -56,6 +56,7 @@ public sealed class RasterizedDbBroker : IAsyncDisposable
         public const byte Commit = 34;
         public const byte Unsubscribe = 35;
         public const byte SubDelete = 36;
+        public const byte Renew = 38;
         public const byte ExchangeDeclare = 40;
         public const byte ExchangeDelete = 41;
         public const byte Bind = 42;
@@ -669,9 +670,17 @@ public sealed class RasterizedDbBroker : IAsyncDisposable
         IReadOnlyList<BrokerHeader>? headers = null,
         ReadOnlyMemory<byte>? key = null,
         BrokerAck ack = BrokerAck.Durable,
+        DateTime? deliverAt = null,
         CancellationToken cancellationToken = default)
     {
         var resolved = await ResolveAsync(topic, cancellationToken).ConfigureAwait(false);
+        if (deliverAt is { } at)
+        {
+            // Scheduled delivery is a header the broker reads: shared subscriptions (queues) hold the
+            // message until then; ordered and broadcast ones ignore it.
+            headers = headers is null ? [BrokerHeader.DeliverAt(at)] : [.. headers, BrokerHeader.DeliverAt(at)];
+        }
+
         using var builder = new BrokerBatchBuilder();
         builder.Add(value.Span, key is { } k ? k.Span : default, key is not null, headers);
         // A message without a key has no partition of its own: the broker chooses.
@@ -1036,6 +1045,36 @@ public sealed class BrokerSubscription : IAsyncEnumerable<BrokerMessage>, IAsync
 
     public void Nack(IEnumerable<BrokerMessage> messages, TimeSpan delay = default) =>
         Settle(RasterizedDbBroker.Op.Nack, (uint)Math.Min(delay.TotalMilliseconds, uint.MaxValue), Ranges(messages));
+
+    private async Task<ulong> Renew(TimeSpan extend, IReadOnlyList<(uint Partition, ulong Offset, uint Count)> ranges, CancellationToken cancellation)
+    {
+        var reply = await _broker.Call(RasterizedDbBroker.Op.Renew, w =>
+        {
+            w.UInt32(Handle);
+            w.UInt32((uint)Math.Clamp(extend.TotalMilliseconds, 0, uint.MaxValue));
+            w.UInt32((uint)ranges.Count);
+            foreach (var (partition, offset, count) in ranges)
+            {
+                w.UInt32(partition);
+                w.UInt64(offset);
+                w.UInt32(count);
+            }
+        }, cancellation).ConfigureAwait(false);
+        return new RasterizedDbBroker.BodyReader(reply).UInt64();
+    }
+
+    /// <summary>
+    /// Keeps a delivered message this consumer's for <paramref name="extend"/> longer (zero: the
+    /// subscription's acknowledgement timeout again), for work that outlasts the timeout. Returns
+    /// whether the message was still in flight: false means its deadline had passed and the broker
+    /// has given, or will give, it to someone else.
+    /// </summary>
+    public async Task<bool> RenewAsync(BrokerMessage message, TimeSpan extend = default, CancellationToken cancellationToken = default) =>
+        await Renew(extend, [(message.Partition, message.Offset, 1)], cancellationToken).ConfigureAwait(false) == 1;
+
+    /// <summary>Renews several messages in one request; returns how many were still in flight.</summary>
+    public Task<ulong> RenewAsync(IEnumerable<BrokerMessage> messages, TimeSpan extend = default, CancellationToken cancellationToken = default) =>
+        Renew(extend, Ranges(messages), cancellationToken);
 
     /// <summary>For an ordered subscription: records that everything before <paramref name="offset"/> in a partition is done.</summary>
     public async Task CommitAsync(uint partition, ulong offset, CancellationToken cancellationToken = default) =>

@@ -1,12 +1,13 @@
 # RasterizedDB for .NET
 
-Two packages that talk to a RasterizedDB server over its native protocol (rastcp), the one
-`rasterizeddb_client` speaks in Rust:
+Packages that talk to a RasterizedDB server over its native protocol (rastcp), the one
+`rasterizeddb_client` speaks in Rust, and one for its message broker:
 
 | package | what |
 |---|---|
 | `RasterizedDb.Data` | An ADO.NET driver (`DbConnection`, `DbCommand`, `DbDataReader`, `DbDataSource`), plus the server's administration statements and key/value cache as typed calls. .NET 8, 9 and 10. |
 | `RasterizedDb.EntityFrameworkCore` | An Entity Framework Core provider on top of it. EF Core 10 on .NET 10; EF Core 9 on .NET 8 and 9. |
+| `RasterizedDb.Messaging` | A client for the message broker (`rdbmq/1`): queues, topics, subscriptions. Pre-production, see [below](#messaging). .NET 8, 9 and 10. |
 
 ```csharp
 // ADO.NET
@@ -67,11 +68,24 @@ names. That is the fast path, and it suits code that knows what it selected. Cod
 | column names, `GetOrdinal`, schema | no (`?column?`) | yes |
 | cells | typed binary, decoded in place | PostgreSQL's text, parsed on read |
 | server path | native; repeated statements are answered from a learned parse | the PostgreSQL path |
-| `DbCommand.Cancel` | not interrupted | stops the statement (57014) |
+| cancelling | when asked for (below) | always |
 
 Set it per connection string (`Result Format=Binary`) or per command (`command.ResultFormat`). The EF
 Core provider picks for you: the SQL it generates runs in `Binary`; raw SQL (`FromSql`, `SqlQuery`,
 `ExecuteSql`) and migrations run in `Text`.
+
+## Cancelling a statement
+
+A statement run with a `CancellationToken` that can be cancelled is sent with a cancel token of its
+own. Cancel it and the driver asks the server to stop the statement, waits for it to say so (SQLSTATE
+57014) and throws `OperationCanceledException`: the connection stays open, and so does a transaction
+it holds, to be rolled back. Only if the server does not answer within five seconds is the connection
+closed instead. A command on a data source (below) stops waiting at once and tells the server.
+
+`DbCommand.Cancel()` from another thread stops a text-format statement, and a binary-format one when
+`command.Cancelable = true` (a synchronous call has no token to say so). Against a server that predates
+cancelable requests, a binary-format statement is not interrupted: a cancelled token closes its
+connection, as it did before.
 
 ## Parameters
 
@@ -150,6 +164,9 @@ var visitors = kv.Repository<Visitor, Guid>(v => v.Id);   // an object as a hash
 await visitors.IncrementAsync(id, nameof(Visitor.Visits));
 ```
 
+Every call has a synchronous twin without the `Async` (`admin.Tables()`, `kv.Set(…)`,
+`sessions.TryGet(id)`), which sends with blocking I/O on the calling thread.
+
 ## Entity Framework Core
 
 ```csharp
@@ -165,7 +182,12 @@ options.UseRasterizedDb(connectionString, o => o.EnableRetryOnFailure());
 - Translated: comparisons, paging, joins, `Include`, grouping and aggregates, `Contains` over a list,
   the common `string` members (with `PadLeft`/`PadRight`), `Math`, date parts, `Date`, `AddDays` and
   its siblings, `TimeSpan.Total…`, `EF.Functions.Like` and `EF.Functions.ILike`, `ExecuteUpdate` /
-  `ExecuteDelete`.
+  `ExecuteDelete`. `Regex.IsMatch(text, pattern)` is `text ~ pattern` (`~*` with
+  `RegexOptions.IgnoreCase`; other options are not translated): the pattern is read by the server, in
+  PostgreSQL's syntax.
+- **HiLo keys.** `builder.Property(x => x.Id).UseHiLo("order_ids")` takes keys from a sequence a block
+  at a time (ten, or the sequence's `IncrementsBy`): the key is set when the entity is added, and one
+  `nextval` serves a block of inserts. The sequence is part of the model, so migrations create it.
 - **Array columns.** A `T[]` or `List<T>` property of a mapped type is an array column (`text[]`,
   `integer[]`). `tags.Contains(x)` is `x = ANY (tags)`; `Length`, `Count` and `Any()` are
   `cardinality(tags)`; `tags[0]`, `First()` and `ElementAt(i)` are `tags[1]` and so on.
@@ -175,9 +197,47 @@ options.UseRasterizedDb(connectionString, o => o.EnableRetryOnFailure());
   place with `jsonb_set`.
 - **Scaffolding.** `dotnet ef dbcontext scaffold "<connection string>" RasterizedDb.EntityFrameworkCore`
   reads tables, views, columns, primary and unique keys, foreign keys and indexes from
-  `information_schema` and `pg_indexes` (the `public` schema).
+  `information_schema` and `pg_indexes` (the `public` schema). `test/scaffold-e2e.sh` runs the tool
+  against a real server and uses the code it writes.
 - Not there yet: LINQ composed over a JSON collection or over an array's elements (`SelectMany`, a
-  `Where` inside the array), regular expressions, spatial types.
+  `Where` inside the array), spatial types.
+
+## Messaging
+
+`RasterizedDb.Messaging` is a client for the server's message broker. **Pre-production**: it is written
+against a broker whose protocol (`rdbmq/1`) is not frozen, and has been tested against a stand-in that
+speaks the frames, not against the broker.
+
+```csharp
+await using var broker = await RasterizedDbBroker.ConnectAsync("Host=mq.example.com;Port=7171;Username=app;Password=secret");
+await broker.DeclareQueueAsync("jobs", new BrokerQueueConfig { AckTimeout = TimeSpan.FromMinutes(1), MaxDeliveries = 5, DeadLetter = "jobs.dead" });
+await broker.ProduceAsync("jobs", payload, [new BrokerHeader("kind", "email")]);       // durable when it returns
+
+await using var jobs = await broker.ConsumeAsync("jobs", credits: 64);
+await foreach (var message in jobs)
+{
+    try
+    {
+        Handle(message.Value.Span, message.Header("kind"));
+        jobs.Ack(message);
+    }
+    catch (TransientException)
+    {
+        jobs.Nack(message, TimeSpan.FromSeconds(30));      // delivered again, after the delay
+    }
+}
+```
+
+One connection carries every request and subscription and is safe to share. A subscription holds about
+`credits` messages unread and asks for more as they are taken. The connection does not reconnect by
+itself: when it is lost, pending calls and subscriptions end with a `BrokerException` whose `Code` is
+null, `ConnectionLost` is raised, and the application connects and consumes again (the broker delivers
+unacknowledged messages again). Topics with partitions and ordered or broadcast subscriptions
+(`CreateTopicAsync`, `SubscribeAsync`), batches (`BrokerBatchBuilder`), `FetchAsync` and exchanges
+(`DeclareExchangeAsync`, `BindAsync`, `PublishAsync`) are there too. `ProduceAsync(…, deliverAt: time)`
+holds a message back from a queue's consumers until then, and `jobs.RenewAsync(message, extend)` keeps
+a delivered message yours for longer when the work outlasts the acknowledgement timeout. Not yet:
+compressed batches.
 
 ## Tests
 

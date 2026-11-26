@@ -358,6 +358,10 @@ internal sealed class FakeBroker : IAsyncDisposable
             case 35:
                 await Reply(op, corr, []);
                 break;
+            case 38:
+                // Every record named is said to be in flight.
+                await Reply(op, corr, Body(w => w.Write((ulong)BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(body.Length - 4)))));
+                break;
         }
     }
 
@@ -475,6 +479,35 @@ public class BrokerClientTests
 
         await subscription.CloseAsync();
         Assert.Equal(9u, BinaryPrimitives.ReadUInt32LittleEndian(fake.Next(35).Body));
+    }
+
+    [Fact]
+    public async Task A_message_is_scheduled_by_a_header_and_renewed_by_a_request()
+    {
+        await using var fake = new FakeBroker();
+        await using var broker = await RasterizedDbBroker.ConnectAsync(fake.ConnectionString);
+        await broker.DeclareQueueAsync("jobs");
+        var due = new DateTime(2030, 1, 2, 3, 4, 5, DateTimeKind.Utc).AddTicks(70);
+        await broker.ProduceAsync("jobs", "later"u8.ToArray(), [new BrokerHeader("kind", "x")], deliverAt: due);
+
+        await using var subscription = await broker.ConsumeAsync("jobs");
+        var message = (await Take(subscription, 1))[0];
+        Assert.Equal("x", message.Header("kind"));
+        Assert.Equal(due, message.DeliverAt);
+        var header = message.Headers.Single(h => h.Name == "rdb-deliver-at");
+        Assert.Equal((due.Ticks - DateTime.UnixEpoch.Ticks) / 10, BinaryPrimitives.ReadInt64LittleEndian(header.Value.Span));
+
+        Assert.True(await subscription.RenewAsync(message, TimeSpan.FromSeconds(90)));
+        var renew = fake.Next(38).Body;
+        Assert.Equal(28, renew.Length);
+        Assert.Equal(9u, BinaryPrimitives.ReadUInt32LittleEndian(renew));
+        Assert.Equal(90_000u, BinaryPrimitives.ReadUInt32LittleEndian(renew.AsSpan(4)));
+        Assert.Equal(1u, BinaryPrimitives.ReadUInt32LittleEndian(renew.AsSpan(8)));
+        Assert.Equal(message.Offset, BinaryPrimitives.ReadUInt64LittleEndian(renew.AsSpan(16)));
+
+        // Zero asks for the subscription's own timeout again.
+        Assert.Equal(1ul, await subscription.RenewAsync([message]));
+        Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(fake.Next(38).Body.AsSpan(4)));
     }
 
     [Fact]

@@ -61,10 +61,18 @@ public enum PostKind
     Article,
 }
 
+/// <summary>Keyed from a sequence a block at a time (<c>UseHiLo</c>).</summary>
+public class Ticket
+{
+    public long Id { get; set; }
+    public string Subject { get; set; } = "";
+}
+
 public class BloggingContext(DbContextOptions<BloggingContext> options) : DbContext(options)
 {
     public DbSet<Blog> Blogs => Set<Blog>();
     public DbSet<Post> Posts => Set<Post>();
+    public DbSet<Ticket> Tickets => Set<Ticket>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -81,6 +89,7 @@ public class BloggingContext(DbContextOptions<BloggingContext> options) : DbCont
             });
         });
         modelBuilder.Entity<Post>(p => p.HasOne(x => x.Blog).WithMany(x => x.Posts).HasForeignKey(x => x.BlogId));
+        modelBuilder.Entity<Ticket>().Property(x => x.Id).UseHiLo("ticket_ids");
     }
 }
 
@@ -643,5 +652,64 @@ public class EfTests(BloggingFixture fixture) : IClassFixture<BloggingFixture>
         var history = context.GetService<IHistoryRepository>();
         Assert.False(history.Exists());
         Assert.Contains("CREATE TABLE IF NOT EXISTS \"__EFMigrationsHistory\"", history.GetCreateIfNotExistsScript());
+    }
+
+    [Fact]
+    public async Task A_regular_expression_filters_on_the_server()
+    {
+        await using var context = fixture.Context();
+        if (context is null)
+        {
+            return;
+        }
+
+        Assert.Equal(2, await context.Blogs.CountAsync(b => System.Text.RegularExpressions.Regex.IsMatch(b.Title, "^Blog [24]$")));
+        Assert.Equal(5, await context.Blogs.CountAsync(b => System.Text.RegularExpressions.Regex.IsMatch(b.Title, "^blog", System.Text.RegularExpressions.RegexOptions.IgnoreCase)));
+        Assert.Equal(0, await context.Blogs.CountAsync(b => System.Text.RegularExpressions.Regex.IsMatch(b.Title, "^blog")));
+        var pattern = "[135]$";
+        Assert.Equal(2, await context.Blogs.CountAsync(b => !System.Text.RegularExpressions.Regex.IsMatch(b.Title, pattern)));
+        // A NULL subtitle matches nothing, and is not counted by the negation either.
+        Assert.Equal(3, await context.Blogs.CountAsync(b => System.Text.RegularExpressions.Regex.IsMatch(b.Subtitle!, "about")));
+    }
+
+    [Fact]
+    public async Task HiLo_keys_are_known_before_the_save_and_cost_one_round_trip_per_block()
+    {
+        await using var context = fixture.Context();
+        await using var second = fixture.Context();
+        if (context is null || second is null)
+        {
+            return;
+        }
+
+        int Asked()
+        {
+            lock (fixture.Sql)
+            {
+                return fixture.Sql.Count(s => s.Contains("nextval('ticket_ids')") || s.Contains("nextval('\"ticket_ids\"')"));
+            }
+        }
+
+        var before = Asked();
+        var tickets = Enumerable.Range(0, 12).Select(i => new Ticket { Subject = $"hilo {i}" }).ToList();
+        foreach (var ticket in tickets)
+        {
+            // The two contexts share the blocks: no key is handed out twice.
+            (ticket.Subject.EndsWith('1') ? second : context).Tickets.Add(ticket);
+            Assert.True(ticket.Id > 0, "the key is set when the entity is added");
+        }
+
+        await context.Tickets.AddAsync(new Ticket { Subject = "hilo async" });
+        Assert.Equal(13 - 2, await context.SaveChangesAsync());
+        Assert.Equal(2, await second.SaveChangesAsync());
+        Assert.Equal(12, tickets.Select(t => t.Id).Distinct().Count());
+        // Thirteen keys in blocks of ten.
+        Assert.InRange(Asked() - before, 1, 2);
+
+        context.ChangeTracker.Clear();
+        var stored = await context.Tickets.Where(t => t.Subject.StartsWith("hilo")).OrderBy(t => t.Id).ToListAsync();
+        Assert.Equal(13, stored.Count);
+        Assert.Equal(tickets.Select(t => t.Id).Order(), stored.Where(t => t.Subject != "hilo async").Select(t => t.Id));
+        Assert.Equal(13, await context.Tickets.Where(t => t.Subject.StartsWith("hilo")).ExecuteDeleteAsync());
     }
 }

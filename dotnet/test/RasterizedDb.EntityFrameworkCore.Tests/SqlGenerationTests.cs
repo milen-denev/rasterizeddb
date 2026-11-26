@@ -115,11 +115,27 @@ public class SqlGenerationTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public void A_regular_expression_is_the_match_operator()
+    {
+        using var context = Context();
+        Assert.Contains("WHERE (b.\"Title\" ~ '^Blog [0-9]+$')", Sql(context.Blogs.Where(b => System.Text.RegularExpressions.Regex.IsMatch(b.Title, "^Blog [0-9]+$"))));
+        Assert.Contains("(b.\"Title\" ~* '^blog')", Sql(context.Blogs.Where(b => System.Text.RegularExpressions.Regex.IsMatch(b.Title, "^blog", System.Text.RegularExpressions.RegexOptions.IgnoreCase))));
+        var pattern = "x";
+        Assert.Contains("NOT ((b.\"Title\" ~ @", Sql(context.Blogs.Where(b => !System.Text.RegularExpressions.Regex.IsMatch(b.Title, pattern))));
+        // An option with no operator is not guessed at.
+        Assert.Throws<InvalidOperationException>(() => Sql(context.Blogs.Where(b => System.Text.RegularExpressions.Regex.IsMatch(b.Title, "^a", System.Text.RegularExpressions.RegexOptions.Multiline))));
+    }
+
+    [Fact]
     public void A_create_script_is_postgresql_ddl()
     {
         using var context = Context();
         var script = context.Database.GenerateCreateScript();
         output.WriteLine(script);
+        // A HiLo key is a plain column fed by a sequence the script creates.
+        Assert.Contains("CREATE SEQUENCE ticket_ids", script.Replace("\"ticket_ids\"", "ticket_ids"));
+        Assert.Contains("INCREMENT BY 10", script);
+        Assert.Contains("\"Id\" bigint NOT NULL", script);
         Assert.Contains("\"Id\" serial NOT NULL", script);
         Assert.Contains("\"Id\" bigserial NOT NULL", script);
         Assert.Contains("\"Title\" character varying(200) NOT NULL", script);

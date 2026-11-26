@@ -46,7 +46,10 @@ public class RasterizedDbArrayIndexExpression : SqlExpression
     public override int GetHashCode() => HashCode.Combine(base.GetHashCode(), Array, Index);
 }
 
-/// <summary>Tells EF Core's NULL reasoning about <see cref="RasterizedDbArrayIndexExpression"/>: an element may be NULL.</summary>
+/// <summary>
+/// Tells EF Core's NULL reasoning about the provider's own expressions: an array element may be NULL,
+/// and a regular-expression match is NULL when either side is.
+/// </summary>
 public class RasterizedDbSqlNullabilityProcessor(
     RelationalParameterBasedSqlProcessorDependencies dependencies,
     RelationalParameterBasedSqlProcessorParameters parameters)
@@ -61,6 +64,14 @@ public class RasterizedDbSqlNullabilityProcessor(
             // Past the array's end, or a NULL element.
             nullable = true;
             return index.Update(array, position);
+        }
+
+        if (sqlExpression is RasterizedDbRegexMatchExpression regex)
+        {
+            var match = Visit(regex.Match, out var matchNullable);
+            var pattern = Visit(regex.Pattern, out var patternNullable);
+            nullable = matchNullable || patternNullable;
+            return regex.Update(match, pattern);
         }
 
         return base.VisitCustomSqlExpression(sqlExpression, allowOptimizedExpansion, out nullable);

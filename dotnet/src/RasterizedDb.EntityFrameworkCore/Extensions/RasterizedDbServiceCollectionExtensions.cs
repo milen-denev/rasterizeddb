@@ -11,6 +11,9 @@ using RasterizedDb.EntityFrameworkCore.Migrations;
 using RasterizedDb.EntityFrameworkCore.Query;
 using RasterizedDb.EntityFrameworkCore.Storage;
 using RasterizedDb.EntityFrameworkCore.Update;
+using RasterizedDb.EntityFrameworkCore.ValueGeneration;
+using Microsoft.EntityFrameworkCore.ValueGeneration;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Microsoft.Extensions.DependencyInjection;
 
@@ -42,6 +45,8 @@ public static class RasterizedDbServiceCollectionExtensions
             .TryAdd<IRelationalParameterBasedSqlProcessorFactory, RasterizedDbParameterBasedSqlProcessorFactory>()
             .TryAdd<IMethodCallTranslatorProvider, RasterizedDbMethodCallTranslatorProvider>()
             .TryAdd<IMemberTranslatorProvider, RasterizedDbMemberTranslatorProvider>()
+            .TryAdd<IValueGeneratorSelector, RasterizedDbValueGeneratorSelector>()
+            .TryAddProviderSpecificServices(services => services.TryAddSingleton<RasterizedDbHiLoStates, RasterizedDbHiLoStates>())
             .TryAddCoreServices();
         return serviceCollection;
     }

@@ -14,6 +14,11 @@ public static class RasterizedDbAnnotationNames
 {
     /// <summary>On a column: its values come from a sequence of its own (<c>serial</c>, <c>bigserial</c>, <c>smallserial</c>).</summary>
     public const string Serial = "RasterizedDb:Serial";
+
+    /// <summary>On a property: the sequence its keys are taken from a block at a time (<c>UseHiLo</c>).</summary>
+    public const string HiLoSequence = "RasterizedDb:HiLoSequence";
+
+    public const string HiLoSequenceSchema = "RasterizedDb:HiLoSequenceSchema";
 }
 
 /// <summary>Marks integer columns generated on insert as <c>serial</c>, so migrations create them that way.</summary>
@@ -33,6 +38,7 @@ public class RasterizedDbAnnotationProvider(RelationalAnnotationProviderDependen
             if (property.ValueGenerated == ValueGenerated.OnAdd
                 && (type == typeof(int) || type == typeof(long) || type == typeof(short))
                 && property.GetDefaultValueSql() is null
+                && property[RasterizedDbAnnotationNames.HiLoSequence] is null
                 && !property.TryGetDefaultValue(out _)
                 && property.GetComputedColumnSql() is null
                 && property.FindContainingPrimaryKey() is not null

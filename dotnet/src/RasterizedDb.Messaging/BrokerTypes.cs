@@ -153,6 +153,20 @@ public readonly record struct BrokerHeader(string Name, ReadOnlyMemory<byte> Val
     }
 
     public string ValueAsString => System.Text.Encoding.UTF8.GetString(Value.Span);
+
+    /// <summary>The header the broker reads for scheduled delivery.</summary>
+    public const string DeliverAtName = "rdb-deliver-at";
+
+    /// <summary>
+    /// Holds a message back from a queue's consumers until <paramref name="time"/>: microseconds since
+    /// the Unix epoch, eight bytes little endian. Ordered and broadcast subscriptions ignore it.
+    /// </summary>
+    public static BrokerHeader DeliverAt(DateTime time)
+    {
+        var value = new byte[8];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(value, (time.ToUniversalTime().Ticks - DateTime.UnixEpoch.Ticks) / 10);
+        return new BrokerHeader(DeliverAtName, value);
+    }
 }
 
 /// <summary>
@@ -195,6 +209,23 @@ public sealed class BrokerMessage
     /// <c>x-death-topic</c> and <c>x-death-subscription</c>.
     /// </summary>
     public IReadOnlyList<BrokerHeader> Headers => _parsed ??= BrokerBatch.ParseHeaders(_headers, _headerCount);
+
+    /// <summary>When the message was scheduled for (<see cref="BrokerHeader.DeliverAt"/>), in UTC; null when it was not.</summary>
+    public DateTime? DeliverAt
+    {
+        get
+        {
+            foreach (var header in Headers)
+            {
+                if (header.Name == BrokerHeader.DeliverAtName && header.Value.Length == 8)
+                {
+                    return DateTime.UnixEpoch.AddTicks(System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(header.Value.Span) * 10);
+                }
+            }
+
+            return null;
+        }
+    }
 
     /// <summary>The value of the first header named <paramref name="name"/>, as text; null when there is none.</summary>
     public string? Header(string name)
