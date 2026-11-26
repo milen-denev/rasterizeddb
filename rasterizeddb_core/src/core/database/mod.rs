@@ -6783,6 +6783,42 @@ async fn process_native_request_for(
     request_vec: Vec<u8>,
     notices: bool,
 ) -> Vec<u8> {
+    // A cancelable request (`pgwire::native_session::CANCELABLE_PREFIX`): the
+    // request it wraps, run under a token a `CANCEL` can name. Ahead of
+    // everything, EXEC's decoding included, since it may wrap one. The token
+    // is held until the answer is built, so a `CANCEL` finds the statement
+    // for exactly that long; a second request under a token still running is
+    // refused, never run uncancelable.
+    if let Some(split) = crate::pgwire::native_split_cancelable(&request_vec) {
+        let (token, inner) = match split {
+            Ok(parts) => parts,
+            Err(e) => return error_response(&format!("{e} (SQLSTATE 22023)")),
+        };
+        let Some(registration) = crate::core::cancel::register_token(&principal.user, token) else {
+            return error_response(
+                "another statement of this user is still running under the same cancel token: \
+                 choose a fresh token for each statement (SQLSTATE 08P01)",
+            );
+        };
+        let inner = inner.to_vec();
+        return Box::pin(crate::pgwire::with_session_cancel(
+            registration.session(),
+            process_native_request_plain(context, principal, session, inner, notices),
+        ))
+        .await;
+    }
+    process_native_request_plain(context, principal, session, request_vec, notices).await
+}
+
+/// [`process_native_request_for`], past the cancelable form: the request as
+/// it stands.
+async fn process_native_request_plain(
+    context: NativeContext,
+    principal: StdArc<rastcp::session::Principal>,
+    session: Option<&crate::pgwire::NativeSession>,
+    request_vec: Vec<u8>,
+    notices: bool,
+) -> Vec<u8> {
     // Counted as running until it is answered, as pgwire counts its own
     // (`execute_recorded`): the idle trimmer trims after a quiet tick that
     // follows a finished statement, and never under one. Uncounted, a
@@ -7066,18 +7102,22 @@ fn statement_signal(
     StdArc::new(if notices { signal.collecting_notices() } else { signal })
 }
 
-/// `response` saying it was stopped at the statement timeout, with the
-/// SQLSTATE a native error otherwise lacks, when it was.
+/// `response` saying it was stopped at the statement timeout, or by a
+/// `CANCEL`, with the SQLSTATE a native error otherwise lacks, when it was.
 fn timed_out_answer(
     mut response: Vec<u8>,
     signal: &crate::core::cancel::StatementCancel,
 ) -> Vec<u8> {
+    let said: &[u8] = match signal.tripped() {
+        Some(crate::core::cancel::CancelReason::Timeout) => b"statement timeout",
+        Some(crate::core::cancel::CancelReason::UserRequest) => b"user request",
+        _ => return response,
+    };
     if response.first() == Some(&3)
-        && signal.tripped() == Some(crate::core::cancel::CancelReason::Timeout)
         && !response.ends_with(b")")
         && crate::core::sql_scan::contains_ignore_ascii_case(
             std::str::from_utf8(&response[1..]).unwrap_or(""),
-            b"statement timeout",
+            said,
         )
     {
         response.extend_from_slice(b" (SQLSTATE 57014)");
@@ -7155,6 +7195,11 @@ async fn run_native_query_in(
             // it: moved into a scope by value, the statement's future (tens
             // of kilobytes) was copied on every request.
             let signal = statement_signal(statement_timeout, notices);
+            // For a cancelable request: the statement a `CANCEL` carrying its
+            // token stops, for as long as it runs and no longer (the guard
+            // clears the slot on every way out).
+            let _published =
+                crate::pgwire::current_session_cancel().map(|session| session.publish(signal.clone()));
             let response = crate::core::rql::sequence::session::scoped(
                 session.sequence_scope(),
                 crate::core::cancel::STATEMENT_CANCEL.scope(

@@ -86,7 +86,8 @@ supported" and carries on as before.
 | `\x01NOTICES;` | simple-query form | From here on, an answer that has notices carries them (answer 5). |
 | `\x01EXEC;…` | as a statement | A statement's text and its values apart (below). |
 | `\x01SIMPLE[:options];<statements>` | answer 4 | The simple-query form (below). |
-| `\x01CANCEL;<token>` | simple-query form, tag `CANCEL 1` or `CANCEL 0` | Stops the statement a simple query sent with `cancel=<token>` is running, for the same user. |
+| `\x01CANCEL;<token>` | simple-query form, tag `CANCEL 1` or `CANCEL 0` | Stops the statement running under `<token>` (a simple query's `cancel=<token>`, or a cancelable request's), for the same user. |
+| `\x01CANCELABLE:<token>;<request>` | as the request it wraps | A statement, or its `EXEC` form, that a `CANCEL` can stop (below). |
 | `\x01DESCRIBE;<statement>` | simple-query form | Names a statement's result columns without running it (below). |
 
 Setup requests (`DATABASE` or `ROLE`, then `NOTICES`) go out after the login and before anything else,
@@ -121,6 +122,26 @@ know refuses the request.
 On `rastcp/1` a block opened here, or by a native `BEGIN`, lasts until it is ended: native statements
 and simple queries on the connection all run inside it. On `rastcp/2` a block must end in the request
 that began it.
+
+### `\x01CANCELABLE:` — a native statement that can be stopped
+
+```
+request:  \x01CANCELABLE:<token>;SELECT …          or   \x01CANCELABLE:<token>;\x01EXEC;…
+answer:   what the wrapped request answers alone
+cancel:   \x01CANCEL;<token>      on another connection (or another id of a rastcp/2 one), same user
+```
+
+The token is the simple query's: 1 to 64 of `[A-Za-z0-9_-]`, unique among the user's running
+statements (a second request under a token still running is refused, `08P01`, and not run). It names
+the statement from the moment the server starts it until it has answered. A `CANCEL` in that window
+answers `CANCEL 1` and the statement ends with answer 3, its message ending in ` (SQLSTATE 57014)`;
+the connection, and a transaction block it holds, go on (the block as after any failed statement). A
+`CANCEL` before the statement has started, or after it has answered, answers `CANCEL 0` and stops
+nothing, so a client that wants a statement stopped asks again until it is answered. A malformed token
+is refused with `22023`.
+
+A client asks once whether the server knows the form (`\x01CANCELABLE:<token>;SELECT 1` answers 2);
+a server without it refuses the request as it refuses any marked request it does not know.
 
 ### `\x01DESCRIBE;` — column names for a native answer
 
