@@ -1243,7 +1243,8 @@ pub(crate) fn correlated_in_as_exists(sql: &str) -> Option<String> {
         let outer = outer_relation_names(&current);
         let reads_outer = subquery::outer_refs(inner)
             .iter()
-            .any(|(qualifier, _)| outer.iter().any(|o| o.eq_ignore_ascii_case(qualifier)));
+            .any(|(qualifier, _)| outer.iter().any(|o| o.eq_ignore_ascii_case(qualifier)))
+            || subquery::from_list_reads_outer(inner, &outer);
         if !reads_outer {
             continue;
         }
@@ -1316,9 +1317,15 @@ pub(crate) fn correlated_in_as_exists(sql: &str) -> Option<String> {
         // Every pair equal; and no pair definitely unequal (each equal, or
         // either side NULL) — what makes a row comparison not false.
         let all_equal = pairs.iter().map(|(i, c)| format!("{i} = {c}")).collect::<Vec<_>>().join(" AND ");
+        // A constant on the left is never NULL, and `'x' IS NULL` is no
+        // condition a subquery's WHERE takes.
+        let constant = |c: &str| {
+            let v = c.trim().trim_start_matches('(').trim_end_matches(')').trim();
+            (v.starts_with('\'') && v.ends_with('\'')) || v.parse::<f64>().is_ok()
+        };
         let maybe_equal = pairs
             .iter()
-            .map(|(i, c)| format!("({i} = {c} OR {i} IS NULL OR {c} IS NULL)"))
+            .map(|(i, c)| if constant(c) { format!("({i} = {c} OR {i} IS NULL)") } else { format!("({i} = {c} OR {i} IS NULL OR {c} IS NULL)") })
             .collect::<Vec<_>>()
             .join(" AND ");
         let rest = &inner[from_at..];
@@ -1374,10 +1381,37 @@ fn left_operand_start(text: &str) -> Option<usize> {
             b'(' => depth -= 1,
             b',' if depth == 0 => break,
             b'+' | b'-' | b'*' | b'/' | b'%' | b',' => {}
+            // A string constant, back to the quote that opens it (`''` inside
+            // it is one quote): `'a' IN (SELECT …)` had no left side here,
+            // and its correlated subquery was run on its own.
+            b'\'' => {
+                let mut j = i - 1;
+                loop {
+                    while j > 0 && bytes[j - 1] != b'\'' {
+                        j -= 1;
+                    }
+                    if j == 0 {
+                        return None;
+                    }
+                    j -= 1;
+                    if j > 0 && bytes[j - 1] == b'\'' {
+                        j -= 1;
+                        continue;
+                    }
+                    break;
+                }
+                i = j;
+                start = Some(j);
+                continue;
+            }
             _ if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'"') => {
                 let end = i;
                 let mut j = i;
                 while j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || matches!(bytes[j - 1], b'_' | b'.' | b'"')) {
+                    j -= 1;
+                }
+                // `$1`: a parameter.
+                if j > 0 && bytes[j - 1] == b'$' && text[j..end].bytes().all(|b| b.is_ascii_digit()) {
                     j -= 1;
                 }
                 if depth == 0 && BOUNDARIES.iter().any(|k| text[j..end].eq_ignore_ascii_case(k)) {
@@ -1435,6 +1469,13 @@ fn qualify_bare_columns(text: &str, alias: impl Fn() -> Option<String>) -> Optio
                 out.push(bytes[i] as char);
                 i += 1;
             }
+            continue;
+        }
+        // A string constant is no column, whatever words it holds.
+        if c == b'\'' {
+            let end = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+            out.push_str(&text[i..end]);
+            i = end;
             continue;
         }
         out.push(c as char);
@@ -1542,6 +1583,80 @@ fn single_outer_alias(sql: &str) -> Option<String> {
     Some(name.trim_matches('"').to_string())
 }
 
+/// `sql` with the bare column names in the arguments of a function that
+/// opens a subquery's `FROM` qualified by the statement's one outer
+/// relation: `EXISTS (SELECT 1 FROM jsonb_array_elements(tags) e …)` over
+/// `t` as `… jsonb_array_elements(t.tags) e …`. `None` when nothing changes.
+///
+/// Such a function has nothing before it in its own `FROM` to read a column
+/// of, so a bare name there is the outer row's, as PostgreSQL resolves it.
+/// The passes that run a subquery for each outer row find that row's columns
+/// by their qualifier; bare, the subquery was run alone ("column "tags" does
+/// not exist"). Only with one outer relation, where the qualifier is not a
+/// guess, and not inside the statement's own `FROM` list.
+pub(crate) fn qualify_outer_function_args(sql: &str) -> Option<String> {
+    use crate::core::rql::join::find_keyword;
+    if !crate::core::sql_scan::contains_ignore_ascii_case(sql, b"(select") && !crate::core::sql_scan::contains_ignore_ascii_case(sql, b"( select") {
+        return None;
+    }
+    let alias = single_outer_alias(sql)?;
+    // The statement's own FROM list: a derived table there is no subquery
+    // of a row.
+    let own_from = find_keyword(sql, "FROM", 0).map(|from| {
+        let end = ["WHERE", "GROUP", "HAVING", "WINDOW", "ORDER", "LIMIT", "OFFSET", "FETCH", "RETURNING", "UNION", "INTERSECT", "EXCEPT"]
+            .iter()
+            .filter_map(|kw| find_keyword(sql, kw, from + 4))
+            .min()
+            .unwrap_or(sql.len());
+        from..end
+    });
+    let bytes = sql.as_bytes();
+    let mut inserts: Vec<usize> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, bytes[i]);
+                continue;
+            }
+            b'(' if !own_from.as_ref().is_some_and(|r| r.contains(&i)) => {
+                let inner_at = i + 1 + (sql[i + 1..].len() - sql[i + 1..].trim_start().len());
+                if crate::core::sql_scan::starts_with_keyword(&sql[inner_at..], "SELECT") {
+                    if let Some(close) = crate::core::rql::expr::matching_paren(sql, i) {
+                        let inner = &sql[inner_at..close];
+                        // `FROM name(args)`: the function opening the list.
+                        if let Some(from) = find_keyword(inner, "FROM", 0) {
+                            let rest = &inner[from + 4..];
+                            let name_at = rest.len() - rest.trim_start().len();
+                            let name_len = rest[name_at..].bytes().take_while(|b| b.is_ascii_alphanumeric() || *b == b'_').count();
+                            let open = name_at + name_len + (rest[name_at + name_len..].len() - rest[name_at + name_len..].trim_start().len());
+                            if name_len > 0 && rest.as_bytes().get(open) == Some(&b'(') && !rest[name_at..name_at + name_len].eq_ignore_ascii_case("VALUES") {
+                                if let Some(args_close) = crate::core::rql::expr::matching_paren(rest, open) {
+                                    let base = inner_at + from + 4 + open + 1;
+                                    for (_, at) in crate::core::rql::lateral::bare_names(&rest[open + 1..args_close]) {
+                                        inserts.push(base + at);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if inserts.is_empty() {
+        return None;
+    }
+    let mut out = sql.to_string();
+    inserts.sort_unstable();
+    for at in inserts.into_iter().rev() {
+        out.insert_str(at, &format!("{alias}."));
+    }
+    Some(out)
+}
+
 /// `sql` with each `[NOT] EXISTS (…)` that compares an outer column by
 /// anything but `=` written as the count it asks about: `(SELECT count(*)
 /// FROM … WHERE …) > 0`, or `= 0`. `None` when it has none.
@@ -1579,11 +1694,19 @@ pub(crate) fn exists_as_counts(sql: &str) -> Option<String> {
         // `IN` can stand in for: as the count, a number the cast and the
         // arithmetic read. It was refused ("a correlated EXISTS used as a
         // value … is not supported").
+        // A function in its FROM over the outer row's column
+        // (`EXISTS (SELECT 1 FROM jsonb_array_elements(t.doc) e WHERE …)`)
+        // reads that row whatever the WHERE compares, and no `IN` runs a
+        // function once for every row: counted, it is a LATERAL item, which
+        // does. It was taken for uncorrelated and run on its own ("missing
+        // FROM-clause entry for table t").
+        let function_over_outer = subquery::from_list_reads_outer(body.inner_sql.trim(), &outer);
         let goes = bounds.limit != Some(0)
             && bounds.offset == 0
-            && subquery::uncorrelated_exists(&body, &outer).is_none()
-            && (exists_used_as_value(&current, clause.start, clause.end)
-                || subquery::exists_to_in(&body, &outer).is_err_and(|e| only_equalities_refusal(&e)));
+            && (function_over_outer
+                || (subquery::uncorrelated_exists(&body, &outer).is_none()
+                    && (exists_used_as_value(&current, clause.start, clause.end)
+                        || subquery::exists_to_in(&body, &outer).is_err_and(|e| only_equalities_refusal(&e)))));
         if !goes {
             continue;
         }
@@ -1612,6 +1735,8 @@ pub(crate) fn exists_as_counts(sql: &str) -> Option<String> {
 /// subquery, after an `EXISTS` that compares the row by anything but `=` is
 /// counted (`exists_as_counts`); `None` when it holds none.
 fn correlated_write_where(sql: &str, database: &Arc<Database>, delete: bool) -> Option<Result<WriteWhere, String>> {
+    let qualified = qualify_outer_function_args(sql);
+    let sql = qualified.as_deref().unwrap_or(sql);
     let split = exists_over_set_operation(sql);
     let sql = split.as_deref().unwrap_or(sql);
     let as_exists = correlated_in_as_exists(sql).or(split.clone());

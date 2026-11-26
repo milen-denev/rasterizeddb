@@ -6445,7 +6445,7 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
 /// the ones it does. First, so every later step sees only those:
 ///
 /// - a lone name in parentheses, `(n) > 5`, `(t) = 'a'`, `(n) IS NULL`, is
-///   the name: read as an expression it was an operand with nothing after
+///   the name (and a lone column's path, `(doc -> 'a') @> '…'`, the path): read as an expression it was an operand with nothing after
 ///   it ("unexpected Op(">")"), a syntax error at `IS`, or an integer;
 /// - `x [NOT] IN (n / 10, 2)`, a list holding an expression, is the
 ///   comparisons it means ([`expand_expression_in_lists`]).
@@ -6514,7 +6514,29 @@ fn unwrap_lone_names(clause: &str) -> String {
                 .iter()
                 .any(|k| word.eq_ignore_ascii_case(k));
                 let attached = before.ends_with(')') || (!word.is_empty() && !keyword_before);
-                if is_lone_name(inner) && !syntax && !attached {
+                // A lone column's path, `(doc -> 'a') @> '…'`, `(doc #>> '{}')
+                // = 'x'`: the path. As a group it was read as a condition,
+                // its NULL guard put inside it ("expected comparison operator,
+                // got RPar"). Only where nothing binds to its left as tightly
+                // as the path does: `'x' || (doc ->> 'a')` without its
+                // parentheses is `('x' || doc) ->> 'a'`.
+                let lone_path = || {
+                    let loose_before = match before.as_bytes() {
+                        [] | [.., b'(' | b',' | b'='] => true,
+                        [.., p, b'>'] => !matches!(p, b'-' | b'#' | b'@' | b'>'),
+                        [b'>'] => true,
+                        [.., p, b'<'] => *p != b'<',
+                        [b'<'] => true,
+                        _ => keyword_before,
+                    };
+                    // A cast after it is the group's: `(doc ->> 'n')::int`
+                    // unwrapped would cast the key.
+                    loose_before
+                        && !clause[close + 1..].trim_start().starts_with("::")
+                        && (crate::core::jsonb::parse_path_expression_any(inner).is_some()
+                            || crate::core::jsonb::parse_qualified_path_expression(inner).is_some())
+                };
+                if (is_lone_name(inner) || lone_path()) && !syntax && !attached {
                     out.push_str(&clause[copied..i]);
                     out.push(' ');
                     out.push_str(inner.trim());

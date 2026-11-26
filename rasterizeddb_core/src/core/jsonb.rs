@@ -3492,6 +3492,19 @@ impl PathExpr {
 /// Returns `None` for anything that is not a path expression, which is the
 /// common case — this runs against arbitrary SQL fragments looking for one.
 pub fn parse_path_expression(expr: &str) -> Option<PathExpr> {
+    parse_path(expr, false)
+}
+
+/// [`parse_path_expression`], reading the empty path too: `doc #> '{}'` is
+/// the document itself and `doc #>> '{}'` its text (a string's own, NULL for
+/// a JSON null), as PostgreSQL gives them. For an expression a statement
+/// evaluates; an index or a declaration is over a path that leads somewhere,
+/// and keeps the strict reading.
+pub fn parse_path_expression_any(expr: &str) -> Option<PathExpr> {
+    parse_path(expr, true)
+}
+
+fn parse_path(expr: &str, allow_empty: bool) -> Option<PathExpr> {
     let text = expr.trim();
     // A whole expression may be parenthesised, as it must be in `CREATE INDEX
     // ON t ((doc->>'k'))`.
@@ -3504,6 +3517,8 @@ pub fn parse_path_expression(expr: &str) -> Option<PathExpr> {
 
     let mut steps = Vec::new();
     let mut as_text = false;
+    // An empty `#>` path was read: no step, and still a path.
+    let mut read_empty = false;
     loop {
         let trimmed = rest.trim_start();
         if trimmed.is_empty() {
@@ -3531,8 +3546,13 @@ pub fn parse_path_expression(expr: &str) -> Option<PathExpr> {
 
         if operator.starts_with('#') {
             let (literal, after) = take_quoted(after.trim_start())?;
-            for part in parse_brace_array(&literal)? {
-                steps.push(step_from_text(&part));
+            let empty = literal.trim().strip_prefix('{').and_then(|l| l.strip_suffix('}')).is_some_and(|inner| inner.trim().is_empty());
+            if empty && allow_empty {
+                read_empty = true;
+            } else {
+                for part in parse_brace_array(&literal)? {
+                    steps.push(step_from_text(&part));
+                }
             }
             rest = after;
         } else {
@@ -3549,7 +3569,7 @@ pub fn parse_path_expression(expr: &str) -> Option<PathExpr> {
         }
     }
 
-    if steps.is_empty() {
+    if steps.is_empty() && !read_empty {
         return None;
     }
     Some(PathExpr {
@@ -3636,7 +3656,7 @@ pub fn parse_qualified_path_expression(expr: &str) -> Option<(String, PathExpr)>
     if rest.starts_with(char::is_whitespace) {
         return None;
     }
-    Some((qualifier, parse_path_expression(rest)?))
+    Some((qualifier, parse_path_expression_any(rest)?))
 }
 
 fn take_identifier(text: &str) -> Option<(String, &str)> {
@@ -3677,7 +3697,9 @@ fn take_quoted(text: &str) -> Option<(String, &str)> {
 
 fn take_integer(text: &str) -> Option<(i64, &str)> {
     let negative = text.starts_with('-');
-    let digits_at = if negative { 1 } else { 0 };
+    // Spaces may follow the sign: a WHERE's negative constant is rewritten
+    // `- 1` before it is read here (`predicate_rewrite`).
+    let digits_at = if negative { 1 + text[1..].len() - text[1..].trim_start().len() } else { 0 };
     let end = text[digits_at..]
         .find(|c: char| !c.is_ascii_digit())
         .map(|i| i + digits_at)
@@ -3685,7 +3707,8 @@ fn take_integer(text: &str) -> Option<(i64, &str)> {
     if end == digits_at {
         return None;
     }
-    Some((text[..end].parse().ok()?, &text[end..]))
+    let value: i64 = text[digits_at..end].parse().ok()?;
+    Some((if negative { -value } else { value }, &text[end..]))
 }
 
 /// `{a,b,2}` as its parts — PostgreSQL's text form of a path array.

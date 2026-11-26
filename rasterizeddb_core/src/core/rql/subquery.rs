@@ -944,6 +944,78 @@ pub fn uncorrelated_exists(clause: &ExistsClause, outer_relations: &[String]) ->
     }
 }
 
+/// Whether the `FROM` list of `inner` (a SELECT) calls a function over a
+/// column of an outer relation: `FROM jsonb_array_elements(t.doc) e`,
+/// `FROM generate_series(1, t.n) g`, `FROM unnest(ARRAY[t.a, t.b]) u`.
+///
+/// Such a subquery reads the outer row whatever its `WHERE` says, which the
+/// tests that look for a correlation in the `WHERE` do not see: it was run
+/// once, on its own, where the outer relation is unbound ("missing
+/// FROM-clause entry for table t").
+pub(crate) fn from_list_reads_outer(inner: &str, outer_relations: &[String]) -> bool {
+    use crate::core::rql::join::find_keyword;
+    let Some(from) = find_keyword(inner, "FROM", 0) else { return false };
+    let start = from + "FROM".len();
+    let end = ["WHERE", "GROUP", "HAVING", "WINDOW", "ORDER", "LIMIT", "OFFSET", "FETCH", "UNION", "INTERSECT", "EXCEPT"]
+        .iter()
+        .filter_map(|kw| find_keyword(inner, kw, start))
+        .min()
+        .unwrap_or(inner.len());
+    let list = &inner[start..end];
+    // A call opening an item only: the word after FROM, a comma, JOIN or
+    // LATERAL, with its parenthesis. `ON (u.k = t.k)` and an alias's column
+    // list `e(value)` are parentheses too, and name nothing a function reads.
+    let bytes = list.as_bytes();
+    let (mut depth, mut i, mut item_start) = (0usize, 0usize, true);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+                item_start = false;
+                continue;
+            }
+            b'(' => {
+                depth += 1;
+                item_start = false;
+            }
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => item_start = true,
+            c if depth == 0 && (c.is_ascii_alphabetic() || c == b'_') => {
+                let word_at = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'.')) {
+                    i += 1;
+                }
+                let word = &list[word_at..i];
+                if word.eq_ignore_ascii_case("JOIN") || word.eq_ignore_ascii_case("LATERAL") {
+                    item_start = true;
+                    continue;
+                }
+                let open = i + list[i..].len() - list[i..].trim_start().len();
+                if item_start && bytes.get(open) == Some(&b'(') {
+                    if let Some(close) = crate::core::rql::expr::matching_paren(list, open) {
+                        let args = &list[open + 1..close];
+                        let qualified = qualified_names(args).iter().any(|q| outer_relations.iter().any(|o| o.eq_ignore_ascii_case(q)));
+                        // A bare name can only be a column, and a function
+                        // opening a FROM list has nothing before it to be a
+                        // column of: the outer row's, as PostgreSQL reads it.
+                        let bare = list[..word_at].trim().is_empty() && !crate::core::rql::lateral::bare_names(args).is_empty();
+                        if qualified || bare {
+                            return true;
+                        }
+                        i = close + 1;
+                    }
+                }
+                item_start = false;
+                continue;
+            }
+            c if !c.is_ascii_whitespace() => item_start = false,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Every qualifier `q` written as `q.column` in `text`, outside quotes.
 fn qualified_names(text: &str) -> Vec<String> {
     let bytes = text.as_bytes();
