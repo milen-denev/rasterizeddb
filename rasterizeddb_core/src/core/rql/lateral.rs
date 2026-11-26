@@ -352,7 +352,7 @@ fn parse_item(sql: &str, at: usize) -> Result<Item, String> {
 /// only be columns: bare words outside quotes, not qualified (`x.c`) or a
 /// qualifier, not a call (`f(`), not a cast's or a typed literal's type
 /// (`::int`, `AS int`, `DATE '…'`), not a keyword. Each with its offset.
-fn bare_names(args: &str) -> Vec<(String, usize)> {
+pub(crate) fn bare_names(args: &str) -> Vec<(String, usize)> {
     const KEYWORDS: &[&str] = &[
         "AND", "OR", "NOT", "NULL", "TRUE", "FALSE", "IS", "IN", "AS", "CASE", "WHEN", "THEN", "ELSE", "END", "ARRAY",
         "CAST", "DISTINCT", "BETWEEN", "LIKE", "ILIKE", "SIMILAR", "ESCAPE", "ANY", "ALL", "SOME", "VALUES", "WITH",

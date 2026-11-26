@@ -436,7 +436,8 @@ fn json_path_extent(bytes: &[u8], from: usize) -> Option<usize> {
                 k += 1;
             }
         } else {
-            let digits_at = if bytes[k] == b'-' { k + 1 } else { k };
+            // `-> - 1`: a negative index as `predicate_rewrite` spaces it.
+            let digits_at = if bytes[k] == b'-' { digits_after_sign(bytes, k) } else { k };
             let mut d = digits_at;
             while d < bytes.len() && bytes[d].is_ascii_digit() {
                 d += 1;
@@ -704,7 +705,7 @@ fn tokenize_inner<'a>(
                     // and a future index resolve the same text to.
                     if let Some(end) = json_path_extent(bytes, i) {
                         let text = unsafe { std::str::from_utf8_unchecked(&bytes[start..end]) };
-                        if let Some(path) = crate::core::jsonb::parse_path_expression(text) {
+                        if let Some(path) = crate::core::jsonb::parse_path_expression_any(text) {
                             // On a column holding no document: PostgreSQL's
                             // `text ->> unknown`. Compiled, the text was read
                             // as an encoded document, matched nothing, and
