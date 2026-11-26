@@ -37,8 +37,8 @@ use std::time::Duration;
 pub use rasterizeddb_mq::batch::{BatchBuilder, BatchView, Batches, RecordView};
 pub use rasterizeddb_mq::wire::{
     DELIVER_AT_HEADER, deliver_at,
-    ANY_PARTITION, Ack, BY_KEY, Binding, Code, Durability, EARLIEST, ExchangeKind, LATEST, QueueConfig, Range, Start,
-    SubConfig, SubMode, TopicConfig, XMatch,
+    ANY_PARTITION, Ack, BY_KEY, Binding, Code, DeliveryCount, Durability, EARLIEST, ExchangeKind, LATEST, QueueConfig,
+    Range, Start, SubConfig, SubMode, TopicConfig, XMatch,
 };
 use rasterizeddb_mq::wire::{self, ErrorBody, F_ERROR, F_PUSH, F_REPLY, Fetched as FetchedHead, Produced, Reader, Writer, op};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -537,7 +537,9 @@ impl Broker {
         let corr = self.corr();
         let mut frame = Vec::new();
         wire::frame(&mut frame, op::SUBSCRIBE, 0, corr, |w| {
-            wire::Subscribe { topic: topic.id, name: name.to_string(), config, credits }.encode(w)
+            // Delivery counts are always asked for: a server that predates them
+            // ignores the option, and frames without them read as before.
+            wire::Subscribe { topic: topic.id, name: name.to_string(), config, credits, options: wire::SUB_DELIVERY_COUNTS }.encode(w)
         });
         // The channel goes in with the request; the read loop files it under
         // the handle as it routes the reply (see `Pending`).
@@ -731,7 +733,7 @@ async fn read_loop<R: AsyncRead + Unpin>(mut rd: R, inner: std::sync::Weak<Inner
 fn route(inner: &Inner, h: wire::Header, body: &[u8]) {
     if h.flags & F_PUSH != 0 {
         let push = match h.op {
-            op::DELIVER => match Delivery::parse(body) {
+            op::DELIVER => match Delivery::parse(body, h.flags) {
                 Ok(d) => Push::Deliver(d),
                 Err(e) => Push::Closed(e),
             },
@@ -823,15 +825,29 @@ pub enum Push {
 pub struct Delivery {
     pub partition: u32,
     pub ranges: Vec<Range>,
+    /// Records on their second or later delivery (shared subscriptions).
+    pub counts: Vec<DeliveryCount>,
     data: Vec<u8>,
 }
 
 impl Delivery {
-    fn parse(body: &[u8]) -> Result<Delivery> {
+    fn parse(body: &[u8], flags: u8) -> Result<Delivery> {
         let mut r = Reader::new(body);
         let partition = r.u32()?;
         let ranges = wire::decode_ranges(&mut r, 1 << 20)?;
-        Ok(Delivery { partition, ranges, data: r.rest().to_vec() })
+        let counts = if flags & wire::F_COUNTS != 0 { wire::decode_counts(&mut r, 1 << 20)? } else { Vec::new() };
+        Ok(Delivery { partition, ranges, counts, data: r.rest().to_vec() })
+    }
+
+    /// Which delivery of the record at `offset` this is: 1 for the first.
+    /// Equal to the queue's `max_deliveries`, it is the last before the
+    /// server dead-letters it. Counts start again from 1 after a server
+    /// restart.
+    pub fn delivery_count(&self, partition: u32, offset: u64) -> u32 {
+        self.counts
+            .iter()
+            .find(|c| c.partition == partition && c.offset == offset)
+            .map_or(1, |c| c.deliveries)
     }
 
     /// The records delivered, in order.

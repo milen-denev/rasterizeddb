@@ -512,7 +512,7 @@ impl Conn {
                 let sub = self.broker.subscription(&topic, &req.name, req.config.clone())?;
                 let handle = self.next_handle;
                 self.next_handle += 1;
-                let (member, assigned) = sub.join(handle, req.credits, self.push_tx.clone(), &self.main)?;
+                let (member, assigned) = sub.join_with(handle, req.credits, req.options, self.push_tx.clone(), &self.main)?;
                 self.subs.insert(handle, (sub, member));
                 wire::frame(out, op::SUBSCRIBE, F_REPLY, corr, |w| {
                     w.u32(handle);

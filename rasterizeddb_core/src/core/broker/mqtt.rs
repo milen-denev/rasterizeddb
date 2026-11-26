@@ -795,7 +795,7 @@ impl Conn {
         let (_, sub) = self.shared.broker.queue(queue)?;
         let handle = self.next_handle;
         self.next_handle += 1;
-        let (member, _) = sub.join(handle, self.receive_max as u32, self.push_tx.clone(), &self.shared.main)?;
+        let (member, _) = sub.join_with(handle, self.receive_max as u32, wire::SUB_DELIVERY_COUNTS, self.push_tx.clone(), &self.shared.main)?;
         self.consumers.insert(handle, Consumer { sub, member, queue: queue.to_string() });
         Ok(())
     }
@@ -1087,6 +1087,12 @@ impl Conn {
         let mut r = wire::Reader::new(body);
         let Ok(partition) = r.u32() else { return false };
         let Ok(ranges) = wire::decode_ranges(&mut r, 1 << 20) else { return false };
+        let counts = if h.flags & wire::F_COUNTS != 0 {
+            let Ok(c) = wire::decode_counts(&mut r, 1 << 20) else { return false };
+            c
+        } else {
+            Vec::new()
+        };
         let now = super::now_us();
         let mut done = Vec::new();
         let mut credit = 0u32;
@@ -1117,10 +1123,10 @@ impl Conn {
                     continue;
                 }
                 let id = self.packet_id();
-                // A record delivered before (unacked at the last disconnect)
-                // carries DUP. The subscription does not say, so the first
-                // delivery after a resume is marked when it was in flight.
-                self.write_publish(out, topic, qos, retain, false, id, props, rec.value);
+                // A record delivered before (unacked at a disconnect, or past
+                // its ack timeout) carries DUP.
+                let dup = counts.iter().any(|c| c.offset == rec.offset && c.deliveries > 1);
+                self.write_publish(out, topic, qos, retain, dup, id, props, rec.value);
                 self.outgoing.insert(id, Outgoing { sub: sub.clone(), range, qos, released: false });
             }
         }

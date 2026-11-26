@@ -853,7 +853,7 @@ impl Conn {
                 let credit_on_delivery = no_ack || prefetch == 0;
                 let credits = if prefetch == 0 { 1024 } else { prefetch as u32 };
                 let (member, _) = sub
-                    .join(handle, credits, self.push_tx.clone(), &self.shared.main)
+                    .join_with(handle, credits, wire::SUB_DELIVERY_COUNTS, self.push_tx.clone(), &self.shared.main)
                     .map_err(|e| (INTERNAL_ERROR, e.message))?;
                 self.consumers.insert(handle, Consumer { channel: ch, tag: tag.clone(), sub, member, no_ack, credit_on_delivery, queue });
                 if !no_wait {
@@ -1219,6 +1219,12 @@ impl Conn {
         let mut r = wire::Reader::new(body);
         let Ok(partition) = r.u32() else { return };
         let Ok(ranges) = wire::decode_ranges(&mut r, 1 << 20) else { return };
+        let counts = if h.flags & wire::F_COUNTS != 0 {
+            let Ok(c) = wire::decode_counts(&mut r, 1 << 20) else { return };
+            c
+        } else {
+            Vec::new()
+        };
         let data = r.rest();
         let (tag, sub, no_ack, credit_on_delivery, member, queue) =
             (c.tag.clone(), c.sub.clone(), c.no_ack, c.credit_on_delivery, c.member, c.queue.clone());
@@ -1239,10 +1245,11 @@ impl Conn {
                 }
                 let exchange = rec.header(HDR_EXCHANGE).map(|v| String::from_utf8_lossy(v).into_owned()).unwrap_or_default();
                 let key = rec.header(HDR_KEY).map(|v| String::from_utf8_lossy(v).into_owned()).unwrap_or_else(|| queue.clone());
+                let redelivered = counts.iter().any(|c| c.offset == rec.offset && c.deliveries > 1);
                 codec::method(out, ch, 60, 60, |w| {
                     w.shortstr(&tag);
                     w.u64(dtag);
-                    w.bit(false);
+                    w.bit(redelivered);
                     w.shortstr(&exchange);
                     w.shortstr(&key);
                 });

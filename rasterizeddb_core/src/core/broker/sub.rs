@@ -283,6 +283,9 @@ struct Member {
     assigned: Vec<u32>,
     /// Ordered and broadcast: the next offset to push, per partition.
     positions: HashMap<u32, u64>,
+    /// Asked for delivery counts on its `DELIVER` frames
+    /// (`wire::SUB_DELIVERY_COUNTS`).
+    counts: bool,
 }
 
 #[derive(Default)]
@@ -502,6 +505,19 @@ impl Subscription {
     /// grants more. Returns its id and (ordered) its partitions. The
     /// dispatcher is started on `rt` if it is not running.
     pub fn join(&self, handle: u32, credits: u32, out: Outbox, rt: &tokio::runtime::Handle) -> Result<(u64, Vec<u32>), BrokerError> {
+        self.join_with(handle, credits, 0, out, rt)
+    }
+
+    /// [`Subscription::join`] with `SUBSCRIBE`'s options
+    /// (`wire::SUB_DELIVERY_COUNTS`).
+    pub fn join_with(
+        &self,
+        handle: u32,
+        credits: u32,
+        options: u32,
+        out: Outbox,
+        rt: &tokio::runtime::Handle,
+    ) -> Result<(u64, Vec<u32>), BrokerError> {
         if self.is_closed() {
             return Err(BrokerError::new(Code::NoSubscription, format!("subscription \"{}\" is closed", self.name)));
         }
@@ -511,7 +527,15 @@ impl Subscription {
             if self.config.mode == SubMode::Broadcast && !m.list.is_empty() {
                 return Err(BrokerError::invalid("a broadcast subscription has one member"));
             }
-            let mut member = Member { id, handle, out, credits: credits as u64, assigned: Vec::new(), positions: HashMap::new() };
+            let mut member = Member {
+                id,
+                handle,
+                out,
+                credits: credits as u64,
+                assigned: Vec::new(),
+                positions: HashMap::new(),
+                counts: options & wire::SUB_DELIVERY_COUNTS != 0,
+            };
             if self.config.mode == SubMode::Broadcast {
                 member.assigned = (0..self.topic.partition_count()).collect();
                 for p in &member.assigned {
@@ -1240,7 +1264,17 @@ impl Subscription {
                 let take = (member.credits as usize).min(left.len());
                 let mine: Vec<u64> = left.drain(..take).collect();
                 let ranges = runs(p, &mine);
-                if !send_deliver(member, p, &ranges, &bytes) {
+                // This delivery's number: one past those already made (a
+                // scheduled record's entry is 0: its first).
+                let counts: Vec<wire::DeliveryCount> = if member.counts {
+                    mine.iter()
+                        .map(|o| wire::DeliveryCount { partition: p, offset: *o, deliveries: st.deliveries.get(o).copied().unwrap_or(1) + 1 })
+                        .filter(|c| c.deliveries > 1)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                if !send_deliver(member, p, &ranges, &counts, &bytes) {
                     for o in mine.into_iter().rev() {
                         st.redeliver.push_front(o);
                     }
@@ -1336,7 +1370,7 @@ impl Subscription {
                 let take = (member.credits as usize).min(total - handed);
                 let mine = &offs[handed..handed + take];
                 let ranges = runs(p, mine);
-                if !send_deliver(member, p, &ranges, &bytes) {
+                if !send_deliver(member, p, &ranges, &[], &bytes) {
                     member.credits = 0;
                     continue;
                 }
@@ -1455,9 +1489,10 @@ fn runs(p: u32, offs: &[u64]) -> Vec<Range> {
     out
 }
 
-fn send_deliver(member: &Member, p: u32, ranges: &[Range], batches: &[u8]) -> bool {
-    let mut frame = Vec::with_capacity(wire::FRAME_HEADER + 8 + ranges.len() * 16 + batches.len());
-    let start = wire::begin_frame(&mut frame, op::DELIVER, wire::F_PUSH, member.handle);
+fn send_deliver(member: &Member, p: u32, ranges: &[Range], counts: &[wire::DeliveryCount], batches: &[u8]) -> bool {
+    let mut frame = Vec::with_capacity(wire::FRAME_HEADER + 12 + ranges.len() * 16 + counts.len() * 16 + batches.len());
+    let flags = if counts.is_empty() { wire::F_PUSH } else { wire::F_PUSH | wire::F_COUNTS };
+    let start = wire::begin_frame(&mut frame, op::DELIVER, flags, member.handle);
     {
         let mut w = Writer(&mut frame);
         w.u32(p);
@@ -1466,6 +1501,9 @@ fn send_deliver(member: &Member, p: u32, ranges: &[Range], batches: &[u8]) -> bo
             w.u32(r.partition);
             w.u64(r.offset);
             w.u32(r.count);
+        }
+        if !counts.is_empty() {
+            wire::encode_counts(&mut w, counts);
         }
         w.raw(batches);
     }
