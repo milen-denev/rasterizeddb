@@ -10874,6 +10874,15 @@ fn fold_constants_in_predicate(text: &str) -> String {
 /// Otherwise (the `SET` of one conflict's update) it is computed once here.
 fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>, per_row: bool) -> String {
     fn fold_operand(operand: &str, refused: &mut Option<String>, per_row: bool) -> String {
+        fold_operand_as(operand, refused, per_row, false)
+    }
+
+    /// [`fold_operand`]; `pattern`: the operand is a `LIKE` pattern, which
+    /// is text whatever it is made of, so strings concatenated there are one
+    /// string. A comparison's operand is not folded so: `d <> 'x' || ''` is
+    /// a date against text (PostgreSQL's 42883), where the literal `'x'`
+    /// alone would be read as a date.
+    fn fold_operand_as(operand: &str, refused: &mut Option<String>, per_row: bool, pattern: bool) -> String {
         // The statement's own `;` is not part of its last operand: left on
         // it, `id <= 5 + 100;` (as pgbench and many drivers send it) and
         // `ts < NOW();` were never folded.
@@ -10921,7 +10930,8 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>, pe
         // Strings concatenated (`'%' || 'x' || '%'`, as a string `+` of an
         // inlined parameter arrives): it opens with a quote, which
         // `needs_evaluation` takes for one literal.
-        let concatenation = trimmed.starts_with('\'')
+        let concatenation = pattern
+            && trimmed.starts_with('\'')
             && trimmed.contains("||")
             && crate::core::sql_scan::quoted_end(trimmed.as_bytes(), 0, b'\'') != trimmed.len();
         if trimmed.is_empty()
@@ -11130,7 +11140,7 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>, pe
                         match pattern {
                             Some(start) => {
                                 let end = crate::core::rql::join::find_keyword(term, "ESCAPE", start).unwrap_or(term.len());
-                                let folded = fold_operand(&term[start..end], refused, per_row);
+                                let folded = fold_operand_as(&term[start..end], refused, per_row, true);
                                 let body = folded.trim_end();
                                 let folded = match body.strip_suffix("::text") {
                                     Some(bare) if bare.ends_with('\'') => format!("{bare}{}", &folded[body.len()..]),
