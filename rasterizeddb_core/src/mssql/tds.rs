@@ -440,6 +440,17 @@ impl Wire {
         }
     }
 
+    /// Gives the reply's last token, a DONE of some kind still unsent, its
+    /// MORE bit, so that tokens may follow it; `false` when it is not there.
+    pub(crate) fn reopen_last_done(&mut self) -> bool {
+        let Some(at) = self.reply.len().checked_sub(13) else { return false };
+        if !matches!(self.reply[at], TOKEN_DONE | TOKEN_DONEPROC | TOKEN_DONEINPROC) {
+            return false;
+        }
+        self.reply[at + 1] |= DONE_MORE as u8;
+        true
+    }
+
     async fn fill(&mut self, want: usize) -> io::Result<()> {
         while self.rbuf.len() - self.rpos < want {
             if self.rpos > 0 {
@@ -791,6 +802,104 @@ pub(crate) struct Login {
     pub(crate) integrated: bool,
     pub(crate) wants_features: bool,
     pub(crate) read_only_intent: bool,
+    /// The client asked for session recovery (FEATUREEXT 0x01): `Some`,
+    /// holding what a reconnecting client says the session was.
+    pub(crate) recovery: Option<Recovery>,
+}
+
+/// SESSIONRECOVERY's feature id in FEATUREEXT and FEATUREEXTACK.
+pub(crate) const FEATURE_SESSION_RECOVERY: u8 = 0x01;
+
+/// The one session state this server keeps on the client ([`session_state`]):
+/// its id, under SqlClient's limit of 71.
+pub(crate) const STATE_OPTIONS: u8 = 70;
+
+/// What a client reconnecting a broken connection says its session was
+/// (SESSIONRECOVERY's data in LOGIN7); empty on a first login.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Recovery {
+    /// The database the session was in, when not the login's.
+    pub(crate) database: Option<String>,
+    /// [`STATE_OPTIONS`] as last told.
+    pub(crate) options: Option<u8>,
+}
+
+/// LOGIN7's FEATUREEXT block, read for session recovery; `None` when the
+/// client did not ask for it. Anything malformed reads as a first login.
+fn login_recovery(p: &[u8]) -> Option<Recovery> {
+    let u16_at = |at: usize| p.get(at..at + 2).map(|b| u16::from_le_bytes(b.try_into().unwrap()) as usize);
+    let u32_at = |at: usize| p.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
+    // ibExtension points at a DWORD: where the feature list starts.
+    let mut at = u32_at(u16_at(56)?)?;
+    loop {
+        let id = *p.get(at)?;
+        if id == 0xff {
+            return None;
+        }
+        let len = u32_at(at + 1)?;
+        let data = p.get(at + 5..at + 5 + len)?;
+        if id == FEATURE_SESSION_RECOVERY {
+            return Some(recovery_data(data).unwrap_or_default());
+        }
+        at += 5 + len;
+    }
+}
+
+/// `InitSessionRecoveryData` then `SessionRecoveryDataToBe`: each a length,
+/// a database, a collation, a language and the states.
+fn recovery_data(data: &[u8]) -> Option<Recovery> {
+    if data.is_empty() {
+        return Some(Recovery::default());
+    }
+    let mut out = Recovery::default();
+    let mut r = Reader::new(data);
+    for current in [false, true] {
+        let len = r.u32().ok()? as usize;
+        let mut block = Reader::new(r.bytes(len).ok()?);
+        let chars = block.u8().ok()? as usize;
+        let database = block.utf16(chars).ok()?;
+        let collation = block.u8().ok()? as usize;
+        block.bytes(collation).ok()?;
+        let language = block.u8().ok()? as usize;
+        block.bytes(language * 2).ok()?;
+        // The database it started in, then the one it moved to.
+        if !database.is_empty() {
+            out.database = Some(database);
+        }
+        while block.remaining() > 0 {
+            let id = block.u8().ok()?;
+            let len = match block.u8().ok()? {
+                0xff => block.u32().ok()? as usize,
+                n => n as usize,
+            };
+            let value = block.bytes(len).ok()?;
+            if id == STATE_OPTIONS && current {
+                out.options = value.first().copied();
+            }
+        }
+    }
+    Some(out)
+}
+
+/// FEATUREEXTACK: session recovery acknowledged (with no state of the
+/// server's to begin from), or nothing.
+pub(crate) fn feature_ext_ack(out: &mut Vec<u8>, recovery: bool) {
+    out.push(0xae);
+    if recovery {
+        out.push(FEATURE_SESSION_RECOVERY);
+        out.extend_from_slice(&0u32.to_le_bytes());
+    }
+    out.push(0xff);
+}
+
+/// SESSIONSTATE: [`STATE_OPTIONS`] as it now is, and whether the session
+/// could be made again from it on a new connection.
+pub(crate) fn session_state(out: &mut Vec<u8>, seq: u32, recoverable: bool, options: u8) {
+    out.push(0xe4);
+    out.extend_from_slice(&8u32.to_le_bytes());
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.push(u8::from(recoverable));
+    out.extend_from_slice(&[STATE_OPTIONS, 1, options]);
 }
 
 pub(crate) fn parse_login7(p: &[u8]) -> io::Result<Login> {
@@ -839,6 +948,7 @@ pub(crate) fn parse_login7(p: &[u8]) -> io::Result<Login> {
         integrated: flags2 & 0x80 != 0,
         wants_features: flags3 & 0x10 != 0,
         read_only_intent: type_flags & 0x20 != 0,
+        recovery: if flags3 & 0x10 != 0 { login_recovery(p) } else { None },
     })
 }
 
@@ -2011,6 +2121,47 @@ pub(crate) fn read_params(r: &mut Reader<'_>) -> io::Result<Vec<Param>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_recovery_data_is_read() {
+        let name = |s: &str| {
+            let mut out = vec![s.encode_utf16().count() as u8];
+            out.extend(s.encode_utf16().flat_map(|u| u.to_le_bytes()));
+            out
+        };
+        // A first login: the feature asked for, with nothing to recover.
+        assert_eq!(recovery_data(&[]), Some(Recovery::default()));
+        // A reconnect: started in `app` with one state, moved to `Other`
+        // with the options state set.
+        let mut initial = name("app");
+        initial.extend([5, 9, 4, 0, 2, 0]);
+        initial.extend(name("us_english"));
+        initial.extend([3, 2, 0xaa, 0xbb]);
+        let mut current = name("Other");
+        current.push(0);
+        current.push(0);
+        current.extend([STATE_OPTIONS, 1, 0b101]);
+        let mut data = Vec::new();
+        for block in [&initial, &current] {
+            data.extend((block.len() as u32).to_le_bytes());
+            data.extend(block.iter());
+        }
+        assert_eq!(recovery_data(&data), Some(Recovery { database: Some("Other".into()), options: Some(0b101) }));
+        // Still in the database it started in.
+        let mut current = vec![0u8, 0, 0];
+        current.extend([STATE_OPTIONS, 1, 1]);
+        let mut data = Vec::new();
+        for block in [&initial, &current] {
+            data.extend((block.len() as u32).to_le_bytes());
+            data.extend(block.iter());
+        }
+        assert_eq!(recovery_data(&data), Some(Recovery { database: Some("app".into()), options: Some(1) }));
+        // Cut short: read as a first login by the caller.
+        assert_eq!(recovery_data(&data[..data.len() - 2]), None);
+        let mut out = Vec::new();
+        session_state(&mut out, 3, false, 0b10);
+        assert_eq!(out, [0xe4, 8, 0, 0, 0, 3, 0, 0, 0, 0, STATE_OPTIONS, 1, 0b10]);
+    }
+
     use super::*;
 
     #[test]

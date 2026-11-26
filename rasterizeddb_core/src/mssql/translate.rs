@@ -894,6 +894,54 @@ pub(crate) fn object_id(name: &str) -> i64 {
     (h & 0x3fff_ffff) as i64 + 1000
 }
 
+/// `COL_LENGTH`: a column's length in bytes as SQL Server counts it, `None`
+/// for no such table or column. Text is the engine's one kind, shown as
+/// SQL Server's Unicode one, so a declared length counts two bytes a
+/// character (a column declared `varchar(n)` reads 2n, not n); text with no
+/// declared length, and binary, are `max`: -1.
+fn col_length(table: &str, column: &str, env: &dyn Env) -> Option<i64> {
+    use crate::core::db_type::DbType as D;
+    use crate::core::rql::type_modifier::TextTypmod;
+    let mut table = object_name_in(table);
+    if table.starts_with('#') {
+        table = env.temp_name(&table);
+    }
+    let column = super::lex::last_name_part(column);
+    let view = env.database().schema_view(&table)?;
+    let schema = view.schema();
+    let field = schema.fields.iter().find(|f| {
+        !f.is_deleted
+            && !crate::core::rql::nullable::is_hidden(&f.name)
+            && (f.name.eq_ignore_ascii_case(&column)
+                || env.shown(&table, Some(&f.name)).is_some_and(|s| s.eq_ignore_ascii_case(&column)))
+    })?;
+    // The bytes a fractional-second precision adds to a time.
+    let fraction = |base: i64| match field.text_typmod() {
+        Some(TextTypmod::Precision(p)) if p <= 2 => base,
+        Some(TextTypmod::Precision(p)) if p <= 4 => base + 1,
+        _ => base + 2,
+    };
+    Some(match &field.db_type {
+        D::STRING if !field.json_text => match field.text_typmod() {
+            Some(TextTypmod::Varchar(n) | TextTypmod::Bpchar(n)) if n > 0 => i64::from(n) * 2,
+            _ => -1,
+        },
+        D::DECIMAL | D::I128 | D::U64 | D::U128 => {
+            match crate::core::rql::type_modifier::precision_of(&field.name, &schema.type_modifiers).unwrap_or(38) {
+                0..=9 => 5,
+                10..=19 => 9,
+                20..=28 => 13,
+                _ => 17,
+            }
+        }
+        D::TIME => fraction(3),
+        D::TIMESTAMP => fraction(6),
+        D::DATETIME if field.without_time_zone => fraction(6),
+        D::DATETIME => fraction(8),
+        other => i64::from(type_ids(&tsql_type_name(other, field.without_time_zone, field.json_text)).1),
+    })
+}
+
 /// `[dbo].[t]`, `dbo.t`, `t` written in a string (OBJECT_ID's argument).
 fn object_name_in(text: &str) -> String {
     super::lex::last_name_part(text).to_lowercase()
@@ -1984,6 +2032,30 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
             if inner.is_empty() || upper != "USER_ID" =>
         {
             vec![literal_str(cx.env.user())]
+        }
+        // COL_LENGTH('table', 'column'): the column's length in bytes, NULL
+        // for a table or a column there is none of. Migration scripts guard
+        // an ADD or a DROP COLUMN with it.
+        "COL_LENGTH" => {
+            let r = raw();
+            arity(&r, &[2])?;
+            let known = |a: &[Token]| -> Result<Option<String>, TsqlError> {
+                match known_text(a, cx.env) {
+                    Some(text) => Ok(text),
+                    None => match a {
+                        [Token { tok: Tok::UserVar(v), .. }] => Ok(cx.env.variable(v).and_then(|v| v.text())),
+                        _ => Err(TsqlError::unsupported("COL_LENGTH of an expression")),
+                    },
+                }
+            };
+            let length = match (known(&r[0])?, known(&r[1])?) {
+                (Some(table), Some(column)) => col_length(&table, &column, cx.env),
+                _ => None,
+            };
+            vec![match length {
+                Some(n) => Token::raw(format!("CAST({n} AS smallint)")),
+                None => Token::raw("CAST(NULL AS smallint)"),
+            }]
         }
         "COLUMNPROPERTY" | "OBJECTPROPERTY" | "OBJECTPROPERTYEX" | "INDEXPROPERTY"
         | "COLLATIONPROPERTY" => vec![Token::raw("CAST(NULL AS integer)")],
@@ -7052,7 +7124,7 @@ mod tests {
             r#"SELECT b.id, x.n FROM b CROSS JOIN LATERAL (SELECT p.n FROM p WHERE p.b = b.id LIMIT 2) x"#
         );
         // An APPLY of a function is not a subquery.
-        let tokens = lex("SELECT * FROM t CROSS APPLY OPENJSON(t.j) AS o").unwrap();
+        let tokens = lex("SELECT * FROM t CROSS APPLY STRING_SPLIT(t.j, ',') AS o").unwrap();
         assert!(translate("", tokens, &e).is_err());
     }
 
@@ -7209,6 +7281,38 @@ mod tests {
         // JSON that is not, and JSON read from a row.
         let fails = |sql: &str| translate(sql, lex(sql).unwrap(), &e).unwrap_err().number;
         assert_eq!(fails("SELECT * FROM OPENJSON('[1,') AS o"), 13609);
-        assert_eq!(fails("SELECT * FROM t CROSS APPLY OPENJSON(t.j) AS o"), 40000);
+        assert_eq!(fails("SELECT t.a FROM t INNER JOIN OPENJSON(t.j) AS o ON 1 = 1"), 40000);
+        // An object's members in the order written.
+        assert_eq!(
+            tr(&e, r#"SELECT [key] FROM OPENJSON(N'{"zeta": 1, "alpha": {"y": 1, "b": 2}}') AS o"#),
+            r#"SELECT key FROM (VALUES (CAST('zeta' AS text), CAST('1' AS text), CAST(2 AS integer)), (CAST('alpha' AS text), CAST('{"y":1,"b":2}' AS text), CAST(5 AS integer))) AS o(key, value, type)"#
+        );
+        // JSON read from a row: a LATERAL join over its elements, a counted
+        // subquery under EXISTS and IN.
+        for (sql, want) in [
+            (
+                "SELECT [t].[a], [o].[value] FROM [t] CROSS APPLY OPENJSON([t].[j]) WITH ([value] int '$') AS [o]",
+                "SELECT t.a, o.value FROM t CROSS JOIN LATERAL (SELECT CAST(e.value AS integer) AS value FROM jsonb_array_elements_text(CAST( t.j  AS jsonb)) AS e(value)) AS o",
+            ),
+            (
+                "SELECT t.a, o.[key], o.n FROM t OUTER APPLY OPENJSON(t.j, '$.rows') WITH ([key] nvarchar(5) '$.k[0]', n nvarchar(max) '$.\"a b\"' AS JSON, w int '$') o",
+                "SELECT t.a, o.key, o.n FROM t LEFT JOIN LATERAL (SELECT CAST(e.value #>> '{k,0}' AS varchar(5)) AS key, CAST(e.value #> '{\"a b\"}' AS text) AS n, CAST(jsonb_build_array(e.value) ->> 0 AS integer) AS w FROM jsonb_array_elements(CAST( t.j  AS jsonb) #> '{rows}') AS e(value)) AS o ON 1 = 1",
+            ),
+            (
+                "SELECT t.a FROM t CROSS APPLY OPENJSON(t.j) AS o",
+                "SELECT t.a FROM t CROSS JOIN LATERAL (SELECT CAST(e.n - 1 AS text) AS key, jsonb_build_array(e.value) ->> 0 AS value, CASE jsonb_typeof(e.value) WHEN 'null' THEN 0 WHEN 'string' THEN 1 WHEN 'number' THEN 2 WHEN 'boolean' THEN 3 WHEN 'array' THEN 4 ELSE 5 END AS type FROM jsonb_array_elements(CAST( t.j  AS jsonb)) WITH ORDINALITY AS e(value, n)) AS o",
+            ),
+            (
+                "SELECT [t].[a] FROM [t] WHERE N'x' IN (SELECT [o].[value] FROM OPENJSON([t].[j]) WITH ([value] nvarchar(max) '$') AS [o])",
+                "SELECT t.a FROM t WHERE ((SELECT COUNT(*) FROM (SELECT CAST(e.value AS text) AS value FROM jsonb_array_elements_text(CAST( t.j  AS jsonb)) AS e(value)) AS o WHERE o.value = 'x' ) > 0)",
+            ),
+            (
+                "SELECT [t].[a] FROM [t] WHERE NOT EXISTS (SELECT 1 FROM OPENJSON([t].[j]) WITH ([n] int) AS [o] WHERE [o].[n] > 2)",
+                "SELECT t.a FROM t WHERE NOT ((SELECT COUNT(*) FROM (SELECT CAST(e.value #>> '{n}' AS integer) AS n FROM jsonb_array_elements(CAST( t.j  AS jsonb)) AS e(value)) AS o WHERE o.n > 2 ) > 0)",
+            ),
+        ] {
+            assert_eq!(tr(&e, sql), want, "{sql}");
+        }
+        assert_eq!(fails("SELECT t.a FROM t WHERE 'x' NOT IN (SELECT o.value FROM OPENJSON(t.j) WITH (value int '$') AS o)"), 40000);
     }
 }

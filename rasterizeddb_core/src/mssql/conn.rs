@@ -241,6 +241,11 @@ struct Session {
     /// Where the status of the last DONE written is, to clear its MORE bit
     /// when it turns out to be the batch's last.
     last_done: Option<usize>,
+    /// The client asked for session recovery ([`Session::tell_session_state`]).
+    recovery: bool,
+    /// What the client was last told: (recoverable, options).
+    state_told: (bool, u8),
+    state_seq: u32,
     try_depth: usize,
     peer_watch: Option<StdArc<crate::pgwire::PeerWatch>>,
     /// @@NESTLEVEL: how deep in procedure calls.
@@ -322,12 +327,19 @@ pub(crate) async fn serve_connection(
         Ok(Err(e)) => return Err(e),
         Err(_) => return Ok(()),
     };
-    let database = resolve_database(&shared, &login_packet.database).to_string();
-    let shown = if login_packet.database.is_empty() {
-        database.clone()
-    } else {
-        login_packet.database.clone()
-    };
+    // The database a recovered session was in, else the login's.
+    let asked = login_packet
+        .recovery
+        .as_ref()
+        .and_then(|r| r.database.clone())
+        .filter(|d| shared.catalog.get(&resolve_database(&shared, d)).is_some())
+        .unwrap_or_else(|| login_packet.database.clone());
+    let database = resolve_database(&shared, &asked).to_string();
+    let shown = if asked.is_empty() { database.clone() } else { asked.clone() };
+    // The database a pooled connection's reset returns to is the login's,
+    // not the one a recovered session had moved to.
+    let login_database = resolve_database(&shared, &login_packet.database).to_string();
+    let login_shown = if login_packet.database.is_empty() { login_database } else { login_packet.database.clone() };
     let conn_id = crate::sqlcompat::next_connection_id();
     let mut session = Session {
         wire,
@@ -367,14 +379,24 @@ pub(crate) async fn serve_connection(
         fmtonly: false,
         bulk_target: None,
         conn_id,
-        login_shown: shown.clone(),
+        login_shown,
         bound_numbers: Vec::new(),
         names: NameCache::default(),
         aliases: Vec::new(),
         ticks: Vec::new(),
         verb: "INSERT",
         database_shown: String::new(),
+        recovery: login_packet.recovery.is_some(),
+        state_told: (true, 0),
+        state_seq: 0,
     };
+    // A client reconnecting a connection that broke (a server restart under
+    // a pool) says what its session was: the options are set again here.
+    if let Some(options) = login_packet.recovery.as_ref().and_then(|r| r.options) {
+        session.nocount = options & 1 != 0;
+        session.xact_abort = options & 2 != 0;
+        session.implicit_transactions = options & 4 != 0;
+    }
     let packet_size = match login_packet.packet_size {
         0 => tds::DEFAULT_PACKET,
         n => (n as usize).clamp(512, tds::MAX_PACKET),
@@ -403,8 +425,7 @@ pub(crate) async fn serve_connection(
                 &tds::DEFAULT_PACKET.to_string(),
             );
             if login_packet.wants_features {
-                // FEATUREEXTACK: no feature acknowledged.
-                out.extend_from_slice(&[0xae, 0xff]);
+                tds::feature_ext_ack(out, session.recovery);
             }
             tds::done(out, tds::TOKEN_DONE, 0, 0, 0);
             session.wire.send(tds::PT_REPLY).await?;
@@ -1113,6 +1134,7 @@ impl Session {
             if self.trancount == 0 && !self.bridge().in_block() {
                 super::applock::release_all(self.conn_id, Some(super::applock::Owner::Transaction));
             }
+            self.tell_session_state(message.status & (tds::ST_RESET_CONNECTION | tds::ST_RESET_CONNECTION_SKIP_TRAN) != 0);
             self.wire.send(tds::PT_REPLY).await?;
             // An attention sent while the request ran is answered after it.
             if self.wire.attention_buffered() {
@@ -1193,6 +1215,45 @@ impl Session {
         let at = self.wire.mark() + 1;
         tds::done(self.wire.reply(), token, status, command, rows);
         self.last_done = Some(at);
+    }
+
+    /// Session recovery: tells a client that asked for it what a new
+    /// connection would need to carry this session on, and whether one could.
+    ///
+    /// SqlClient keeps a pool, and after a server restart every connection
+    /// in it is dead. It finds that out before a command only for a server
+    /// that acknowledged session recovery, and then reconnects by itself;
+    /// otherwise the command fails (error 0, class 20) and the application
+    /// has to clear the pool. What a new connection can be given is the
+    /// database (the client knows it) and the SET options kept here; a
+    /// transaction, a `#table`, a cursor or a session application lock
+    /// cannot, and while one exists the session is told to be unrecoverable,
+    /// so that the client reports the break instead of running the next
+    /// statement without it.
+    ///
+    /// Sent only when it changes, after the reply's last DONE (which then
+    /// says MORE) and before one more. `reset`: the request reset the
+    /// connection, on which the client forgets what it was told.
+    fn tell_session_state(&mut self, reset: bool) {
+        if !self.recovery {
+            return;
+        }
+        if reset {
+            self.state_told = (true, 0);
+        }
+        let options = u8::from(self.nocount) | u8::from(self.xact_abort) << 1 | u8::from(self.implicit_transactions) << 2;
+        let recoverable = self.trancount == 0
+            && !self.bridge().in_block()
+            && self.session_temps.is_empty()
+            && self.cursors.is_empty()
+            && !super::applock::holds_any(self.conn_id, super::applock::Owner::Session);
+        if self.state_told == (recoverable, options) || !self.wire.reopen_last_done() {
+            return;
+        }
+        self.state_seq += 1;
+        tds::session_state(self.wire.reply(), self.state_seq, recoverable, options);
+        tds::done(self.wire.reply(), tds::TOKEN_DONE, 0, 0, 0);
+        self.state_told = (recoverable, options);
     }
 
     /// Ends a batch: its last DONE loses MORE, or a final one is added.

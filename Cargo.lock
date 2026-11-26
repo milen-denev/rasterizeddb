@@ -5378,10 +5378,12 @@ dependencies = [
  "rastcp",
  "rasterizeddb_core",
  "rasterizeddb_enterprise",
+ "rasterizeddb_mq",
  "rasterizeddb_raft",
  "rclite",
  "tempfile",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

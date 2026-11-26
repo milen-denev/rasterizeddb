@@ -40,8 +40,16 @@ native_path() {
   if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi
 }
 
-WORK="$PWD/target/pgo-$TARGET"
-BIN="target/$TARGET/release/rasterizeddb_core$EXE"
+# Which server: the GPL one (rasterizeddb_core's binary) unless the caller
+# names another, as the enterprise build does (PGO_PACKAGE=rasterizeddb_server,
+# PGO_BIN=rasterizeddb_core_enterprise). PGO_FEATURES: extra cargo features,
+# comma-separated, on top of the package's defaults.
+PGO_PACKAGE="${PGO_PACKAGE:-rasterizeddb_core}"
+PGO_BIN="${PGO_BIN:-rasterizeddb_core}"
+PGO_FEATURES="${PGO_FEATURES:-}"
+
+WORK="$PWD/target/pgo-$TARGET-$PGO_BIN"
+BIN="target/$TARGET/release/$PGO_BIN$EXE"
 rm -rf "$WORK"
 mkdir -p "$WORK/profiles"
 
@@ -55,7 +63,8 @@ if [ ! -f "$PROFDATA" ]; then
 fi
 
 build_server() {
-  cargo build --locked --release --target "$TARGET" -p rasterizeddb_core --bin rasterizeddb_core \
+  cargo build --locked --release --target "$TARGET" -p "$PGO_PACKAGE" --bin "$PGO_BIN" \
+    ${PGO_FEATURES:+--features "$PGO_FEATURES"} \
     --config "target.$TARGET.rustflags=[$1]"
 }
 

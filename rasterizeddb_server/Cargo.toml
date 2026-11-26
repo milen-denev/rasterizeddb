@@ -23,6 +23,9 @@ rasterizeddb_enterprise = { path = "../rasterizeddb_enterprise", version = "1.0.
 rasterizeddb_raft = { path = "../rasterizeddb_raft", version = "1.0.0", optional = true }
 rastcp = { path = "../rastcp", version = "1.0.0" }
 tokio = { version = "1", features = ["full"] }
+# main.rs's broker flags (broker_args.rs) name these directly.
+rasterizeddb_mq = { path = "../rasterizeddb_mq", version = "1.0.1", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
 clap = { version = "4.6", features = ["derive"] }
 log = { version = "0.4", features = ["release_max_level_debug"] }
 env_logger = "0.11"
@@ -34,7 +37,7 @@ rclite = "0.4.2"
 tempfile = "3"
 
 [features]
-default = ["enterprise", "memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3", "query_stats", "kv_cache", "persistent_indexes", "mysql_wire", "mssql_wire", "db_branching", "storage_compression", "sharding"]
+default = ["enterprise", "memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3", "query_stats", "kv_cache", "persistent_indexes", "mysql_wire", "mssql_wire", "db_branching", "storage_compression", "sharding", "broker", "broker_kafka", "broker_amqp", "broker_mqtt"]
 enterprise = ["dep:rasterizeddb_enterprise", "sharding"]
 memory_pool_reuse = ["rasterizeddb_core/memory_pool_reuse"]
 replication_compression = ["rasterizeddb_core/replication_compression"]
@@ -56,3 +59,9 @@ sharding_2pc = ["rasterizeddb_core/sharding_2pc"]
 # FIPS 140-3 mode (rasterizeddb_core/src/core/fips.rs), and the enterprise
 # crate's ledger and vault crypto through the same module.
 fips = ["rasterizeddb_core/fips", "rasterizeddb_enterprise?/fips"]
+# The message broker (docs/broker.md), as rasterizeddb_core's defaults have it:
+# without these the enterprise server had no broker at all.
+broker = ["rasterizeddb_core/broker", "dep:rasterizeddb_mq", "dep:tokio-rustls"]
+broker_kafka = ["rasterizeddb_core/broker_kafka"]
+broker_amqp = ["rasterizeddb_core/broker_amqp"]
+broker_mqtt = ["rasterizeddb_core/broker_mqtt"]

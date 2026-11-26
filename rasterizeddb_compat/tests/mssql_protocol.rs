@@ -2924,9 +2924,126 @@ async fn tiberius_tinyint_cast_and_openjson() {
     let got: Vec<(i32, Option<String>)> = r[0].iter().map(|r| (r.get::<i32, _>(0).unwrap(), r.get::<&str, _>(1).map(str::to_string))).collect();
     assert_eq!(got, [(2, Some("x".to_string())), (5, None)]);
 
-    // Not JSON, and JSON read from a row: said, not answered.
+    // Not JSON, and JSON read from a row beside it in a plain join: said, not answered.
     let e = c.query("SELECT [value] FROM OPENJSON(@P1)", &[&"[1,"]).await.err().expect("malformed JSON");
     assert_eq!(number(&e), Some(13609), "{e}");
-    let e = batch(&mut c, "SELECT o.[value] FROM [Product] AS [d] CROSS APPLY OPENJSON([d].[Name]) AS o").await.unwrap_err();
+    let e = batch(&mut c, "SELECT o.[value] FROM [Product] AS [d] INNER JOIN OPENJSON([d].[Name]) AS o ON 1 = 1").await.unwrap_err();
+    assert_eq!(number(&e), Some(40000), "{e}");
+}
+
+/// `COL_LENGTH('table', 'column')`, which migration scripts guard a column
+/// change with: its bytes as SQL Server counts them, NULL for none such.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_col_length() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [dbo].[Widths] ([Id] int PRIMARY KEY, [Name] nvarchar(40) NOT NULL, [Code] nchar(3) NULL, [Body] nvarchar(max) NULL, \
+         [Flag] bit NOT NULL, [Tiny] tinyint NULL, [Small] smallint NULL, [Big] bigint NULL, [Price] decimal(18,2) NULL, [Few] decimal(9,2) NULL, \
+         [Wide] decimal(38,4) NULL, [Key] uniqueidentifier NULL, [Day] date NULL, [At] datetime2 NULL, [At3] datetime2(3) NULL, \
+         [Offset] datetimeoffset NULL, [R] real NULL, [F] float NULL, [Blob] varbinary(max) NULL)",
+    )
+    .await
+    .unwrap();
+    let length = async |c: &mut Client<Compat<tokio::net::TcpStream>>, table: &str, column: &str| -> Option<i16> {
+        let r = batch(c, &format!("SELECT COL_LENGTH(N'{table}', N'{column}')")).await.unwrap();
+        r[0][0].get::<i16, _>(0)
+    };
+    for (column, want) in [
+        ("Id", 4), ("Name", 80), ("Code", 6), ("Body", -1), ("Flag", 1), ("Tiny", 1), ("Small", 2), ("Big", 8), ("Price", 9), ("Few", 5),
+        ("Wide", 17), ("Key", 16), ("Day", 3), ("At", 8), ("At3", 7), ("Offset", 10), ("R", 4), ("F", 8), ("Blob", -1),
+    ] {
+        assert_eq!(length(&mut c, "dbo.Widths", column).await, Some(want), "{column}");
+    }
+    // The name however it is written, and nothing for what is not there.
+    assert_eq!(length(&mut c, "[dbo].[Widths]", "[name]").await, Some(80));
+    assert_eq!(length(&mut c, "widths", "NAME").await, Some(80));
+    assert_eq!(length(&mut c, "Widths", "Missing").await, None);
+    assert_eq!(length(&mut c, "Nowhere", "Id").await, None);
+    // As a migration script reads it.
+    let r = batch(
+        &mut c,
+        "IF COL_LENGTH('dbo.Widths', 'Added') IS NULL ALTER TABLE [dbo].[Widths] ADD [Added] nvarchar(10) NULL; \
+         IF COL_LENGTH('dbo.Widths', 'Added') IS NULL ALTER TABLE [dbo].[Widths] ADD [Added] nvarchar(10) NULL; \
+         DECLARE @t nvarchar(50) = N'dbo.Widths'; SELECT COL_LENGTH(@t, 'Added'), COL_LENGTH(NULL, 'Added')",
+    )
+    .await
+    .unwrap();
+    let last = r.last().unwrap();
+    assert_eq!((last[0].get::<i16, _>(0), last[0].get::<i16, _>(1)), (Some(20), None));
+    let r = c.query("SELECT COL_LENGTH(@P1, @P2)", &[&"Widths", &"Code"]).await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(r[0].get::<i16, _>(0), Some(6));
+}
+
+/// OPENJSON over a row's JSON, as EF Core writes it for a collection kept in
+/// a column: after an APPLY, as a subquery's relation, under EXISTS and IN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_openjson_over_a_column() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        r#"CREATE TABLE [Blog] ([Id] int PRIMARY KEY, [Tags] nvarchar(max) NULL, [Posts] nvarchar(max) NULL);
+           INSERT INTO [Blog] VALUES
+             (1, N'["a","b","c"]', N'[{"Id": 10, "Title": "x", "Meta": {"Likes": 3}, "Refs": [1,2]}, {"Id": 11, "Title": null}]'),
+             (2, N'[]', N'[]'),
+             (3, NULL, NULL),
+             (4, N'["c", 5, true, null]', N'[{"Id": 12, "Title": "y", "Meta": {"Likes": 9}}]')"#,
+    )
+    .await
+    .unwrap();
+    let pairs = |rows: &[tiberius::Row]| -> Vec<(i32, Option<String>)> { rows.iter().map(|r| (r.get::<i32, _>(0).unwrap(), r.get::<&str, _>(1).map(str::to_string))).collect() };
+    let some = |id: i32, v: &str| (id, Some(v.to_string()));
+
+    // CROSS APPLY: a row for each element; OUTER APPLY keeps a blog with none.
+    let r = batch(&mut c, "SELECT [b].[Id], [t].[value] FROM [Blog] AS [b] CROSS APPLY OPENJSON([b].[Tags]) WITH ([value] nvarchar(max) '$') AS [t] ORDER BY [b].[Id], [t].[value]").await.unwrap();
+    assert_eq!(pairs(&r[0]), [some(1, "a"), some(1, "b"), some(1, "c"), (4, None), some(4, "5"), some(4, "c"), some(4, "true")]);
+    let r = batch(&mut c, "SELECT [b].[Id], [t].[value] FROM [Blog] AS [b] OUTER APPLY OPENJSON([b].[Tags]) WITH ([value] nvarchar(max) '$') AS [t] WHERE [b].[Id] < 4 ORDER BY [b].[Id], [t].[value]").await.unwrap();
+    assert_eq!(pairs(&r[0]), [some(1, "a"), some(1, "b"), some(1, "c"), (2, None), (3, None)]);
+    // Columns by path, typed; an object as its text.
+    let r = batch(
+        &mut c,
+        "SELECT [p].[Id], [p].[Title], [p].[Likes], [p].[Refs] FROM [Blog] AS [b] \
+         CROSS APPLY OPENJSON([b].[Posts]) WITH ([Id] int, [Title] nvarchar(20), [Likes] int '$.Meta.Likes', [Refs] nvarchar(max) AS JSON) AS [p] ORDER BY [p].[Id]",
+    )
+    .await
+    .unwrap();
+    let got: Vec<(i32, Option<String>, Option<i32>, Option<String>)> =
+        r[0].iter().map(|r| (r.get::<i32, _>(0).unwrap(), r.get::<&str, _>(1).map(str::to_string), r.get::<i32, _>(2), r.get::<&str, _>(3).map(str::to_string))).collect();
+    assert_eq!(
+        got,
+        [(10, Some("x".to_string()), Some(3), Some("[1, 2]".to_string())), (11, None, None, None), (12, Some("y".to_string()), Some(9), None)]
+    );
+    // The bare form: key, value, type, in the array's order.
+    let r = batch(&mut c, "SELECT [t].[key], [t].[value], [t].[type] FROM [Blog] AS [b] CROSS APPLY OPENJSON([b].[Tags]) AS [t] WHERE [b].[Id] = 4 ORDER BY CAST([t].[key] AS int)").await.unwrap();
+    let got: Vec<(String, Option<String>, i32)> = r[0].iter().map(|r| (r.get::<&str, _>(0).unwrap().to_string(), r.get::<&str, _>(1).map(str::to_string), r.get::<i32, _>(2).unwrap())).collect();
+    let row = |k: &str, v: Option<&str>, t: i32| (k.to_string(), v.map(str::to_string), t);
+    assert_eq!(got, [row("0", Some("c"), 1), row("1", Some("5"), 2), row("2", Some("true"), 3), row("3", None, 0)]);
+
+    // `b.Tags.Contains(x)`, with a literal and with a parameter.
+    let ids = |rows: Vec<tiberius::Row>| rows.iter().map(|r| r.get::<i32, _>(0).unwrap()).collect::<Vec<_>>();
+    let contains = "SELECT [b].[Id] FROM [Blog] AS [b] WHERE @P1 IN (SELECT [t].[value] FROM OPENJSON([b].[Tags]) WITH ([value] nvarchar(max) '$') AS [t]) ORDER BY [b].[Id]";
+    let r = c.query(contains, &[&"c"]).await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(ids(r), [1, 4]);
+    let r = c.query(contains, &[&"it's"]).await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(ids(r), [] as [i32; 0]);
+    let r = batch(&mut c, "SELECT [b].[Id] FROM [Blog] AS [b] WHERE N'b' IN (SELECT [t].[value] FROM OPENJSON([b].[Tags]) WITH ([value] nvarchar(max) '$') AS [t])").await.unwrap();
+    assert_eq!(int(&r[0]), [1]);
+    // `b.Posts.Any(p => p.Likes > n)`, and its negation (a blog with no posts has none such).
+    let any = "SELECT [b].[Id] FROM [Blog] AS [b] WHERE EXISTS (SELECT 1 FROM OPENJSON([b].[Posts]) WITH ([Likes] int '$.Meta.Likes') AS [p] WHERE [p].[Likes] > @P1) ORDER BY [b].[Id]";
+    let r = c.query(any, &[&2i32]).await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(ids(r), [1, 4]);
+    let r = c.query(any, &[&5i32]).await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(ids(r), [4]);
+    let r = batch(&mut c, "SELECT [b].[Id] FROM [Blog] AS [b] WHERE NOT EXISTS (SELECT 1 FROM OPENJSON([b].[Tags]) AS [t]) ORDER BY [b].[Id]").await.unwrap();
+    assert_eq!(int(&r[0]), [2, 3]);
+    // `b.Tags.Count`, in the list and in the filter.
+    let r = batch(&mut c, "SELECT [b].[Id], (SELECT COUNT(*) FROM OPENJSON([b].[Tags]) AS [t]) FROM [Blog] AS [b] WHERE (SELECT COUNT(*) FROM OPENJSON([b].[Tags]) AS [t]) > 0 ORDER BY [b].[Id]").await.unwrap();
+    let got: Vec<(i32, i32)> = r[0].iter().map(|r| (r.get::<i32, _>(0).unwrap(), r.get::<i32, _>(1).unwrap())).collect();
+    assert_eq!(got, [(1, 3), (4, 4)]);
+
+    // NOT IN is not a count (a NULL element makes it unknown): refused.
+    let e = batch(&mut c, "SELECT [b].[Id] FROM [Blog] AS [b] WHERE N'c' NOT IN (SELECT [t].[value] FROM OPENJSON([b].[Tags]) WITH ([value] nvarchar(max) '$') AS [t])").await.unwrap_err();
     assert_eq!(number(&e), Some(40000), "{e}");
 }

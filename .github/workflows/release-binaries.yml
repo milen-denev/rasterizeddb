@@ -59,15 +59,27 @@ env:
 
 jobs:
   build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.edition }} ${{ matrix.p.name }}
+    runs-on: ${{ matrix.p.runner }}
     # Three release builds with fat LTO (instrumented, optimised, plus the
     # training driver) and two training runs.
     timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
-        include:
+        # Both editions on every platform, built side by side:
+        #   gpl         the server (rasterizeddb_core), the gateway, Studio
+        #   enterprise  the enterprise server (rasterizeddb_server's
+        #               rasterizeddb_core_enterprise) and gateway
+        #               (rasterizeddb_gateway_enterprise), under
+        #               LICENSE-POLYFORM-SB
+        # Each with every feature that belongs in a release: the defaults
+        # plus sharding_raft and sharding_2pc. Never enable_long_row (a
+        # different on-disk row pointer: existing databases would not open)
+        # or enable_data_verification, nor the test-only test_tokens and
+        # index_store_failpoints (a server refuses to start with them).
+        edition: [gpl, enterprise]
+        p:
           - { name: linux-x86_64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, archive: tar.gz, studio: true }
           - { name: linux-arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, archive: tar.gz, studio: true }
           - { name: windows-x86_64, runner: windows-2025, target: x86_64-pc-windows-msvc, archive: zip, studio: true }
@@ -80,17 +92,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
         with:
-          target: ${{ matrix.target }}
+          target: ${{ matrix.p.target }}
 
       # aws-lc, ring, zstd and mimalloc compile C for the target: musl's gcc
       # wrapper on the native runner of each architecture.
       - name: musl C toolchain
-        if: contains(matrix.target, 'musl')
+        if: contains(matrix.p.target, 'musl')
         shell: bash
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q musl-tools
-          triple="$(echo '${{ matrix.target }}' | tr '-' '_')"
+          triple="$(echo '${{ matrix.p.target }}' | tr '-' '_')"
           echo "CC_$triple=musl-gcc" >> "$GITHUB_ENV"
 
       # A pre-release tag (v1.0.0-rc.1) matches the version without its
@@ -116,30 +128,54 @@ jobs:
             echo "LLVM_BOLT=$(command -v llvm-bolt-20 || echo /usr/lib/llvm-20/bin/llvm-bolt)" >> "$GITHUB_ENV"
           fi
 
+      # Which server this edition builds, and with which features.
+      - name: The edition's server
+        shell: bash
+        run: |
+          if [ "${{ matrix.edition }}" = enterprise ]; then
+            echo "PGO_PACKAGE=rasterizeddb_server" >> "$GITHUB_ENV"
+            echo "PGO_BIN=rasterizeddb_core_enterprise" >> "$GITHUB_ENV"
+          else
+            echo "PGO_PACKAGE=rasterizeddb_core" >> "$GITHUB_ENV"
+            echo "PGO_BIN=rasterizeddb_core" >> "$GITHUB_ENV"
+          fi
+          echo "PGO_FEATURES=sharding_raft,sharding_2pc" >> "$GITHUB_ENV"
+
       - name: Build (release profile, fat LTO, PGO; BOLT on Linux)
         if: github.event_name != 'workflow_dispatch' || inputs.pgo
         shell: bash
-        run: bash .github/scripts/pgo-build.sh ${{ matrix.target }}
+        run: bash .github/scripts/pgo-build.sh ${{ matrix.p.target }}
 
       - name: Build (release profile, fat LTO, no PGO)
         if: github.event_name == 'workflow_dispatch' && !inputs.pgo
-        run: cargo build --locked --release --target ${{ matrix.target }} -p rasterizeddb_core --bin rasterizeddb_core
+        shell: bash
+        run: cargo build --locked --release --target ${{ matrix.p.target }} -p "$PGO_PACKAGE" --bin "$PGO_BIN" --features "$PGO_FEATURES"
+
+      # The gateway: every feature (all are its defaults), no PGO.
+      - name: Build the gateway (release profile)
+        shell: bash
+        run: |
+          if [ "${{ matrix.edition }}" = enterprise ]; then
+            cargo build --locked --release --target ${{ matrix.p.target }} -p rasterizeddb_gateway_enterprise --bin rasterizeddb_gateway_enterprise --all-features
+          else
+            cargo build --locked --release --target ${{ matrix.p.target }} -p rasterizeddb_gateway --bin rasterizeddb_gateway --all-features
+          fi
 
       - name: Smoke test the release binary
         shell: bash
         run: |
-          cargo build --locked --target ${{ matrix.target }} -p rasterizeddb_client --example quickstart
+          cargo build --locked --target ${{ matrix.p.target }} -p rasterizeddb_client --example quickstart
           ext="${{ runner.os == 'Windows' && '.exe' || '' }}"
           bash .github/scripts/smoke.sh \
-            "target/${{ matrix.target }}/release/rasterizeddb_core$ext" \
-            "target/${{ matrix.target }}/debug/examples/quickstart$ext"
+            "target/${{ matrix.p.target }}/release/$PGO_BIN$ext" \
+            "target/${{ matrix.p.target }}/debug/examples/quickstart$ext"
 
       # Studio: the release profile, no PGO (its time goes to the GPU and the
       # network, not to code a training run would cover). Built, not run: it
       # opens a window at start.
       - name: Build RasterizedDB Studio (release profile)
-        if: matrix.studio
-        run: cargo build --locked --release --target ${{ matrix.target }} -p rdb_studio
+        if: matrix.p.studio && matrix.edition == 'gpl'
+        run: cargo build --locked --release --target ${{ matrix.p.target }} -p rdb_studio
 
       - name: Package
         id: package
@@ -149,7 +185,7 @@ jobs:
           ext="${{ runner.os == 'Windows' && '.exe' || '' }}"
           # pack <name>: archives dist/<name> as the matrix says, prints the file.
           pack() {
-            if [ "${{ matrix.archive }}" = zip ]; then
+            if [ "${{ matrix.p.archive }}" = zip ]; then
               pwsh -NoProfile -Command "Compress-Archive -Path '$1' -DestinationPath '$1.zip'" >/dev/null
               echo "dist/$1.zip"
             else
@@ -157,31 +193,53 @@ jobs:
               echo "dist/$1.tar.gz"
             fi
           }
-          server="rasterizeddb-server-$version-${{ matrix.name }}"
+          rel="target/${{ matrix.p.target }}/release"
+          if [ "${{ matrix.edition }}" = enterprise ]; then
+            # One archive: the enterprise server and gateway, under the
+            # enterprise licence.
+            server="rasterizeddb-enterprise-$version-${{ matrix.p.name }}"
+            mkdir -p "dist/$server"
+            cp "$rel/rasterizeddb_core_enterprise$ext" "dist/$server/rasterizeddb-enterprise$ext"
+            cp "$rel/rasterizeddb_gateway_enterprise$ext" "dist/$server/rasterizeddb-gateway-enterprise$ext"
+            cp README.md LICENSE-POLYFORM-SB "dist/$server/"
+            cp branding/rasterizeddb.svg "dist/$server/rasterizeddb.svg"
+            cd dist
+            echo "server=$(pack "$server")" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          server="rasterizeddb-server-$version-${{ matrix.p.name }}"
           mkdir -p "dist/$server"
-          cp "target/${{ matrix.target }}/release/rasterizeddb_core$ext" "dist/$server/rasterizeddb$ext"
+          cp "$rel/rasterizeddb_core$ext" "dist/$server/rasterizeddb$ext"
           cp README.md LICENSE-GPL "dist/$server/"
           cp branding/rasterizeddb.svg "dist/$server/rasterizeddb.svg"
+          gateway="rasterizeddb-gateway-$version-${{ matrix.p.name }}"
+          mkdir -p "dist/$gateway"
+          cp "$rel/rasterizeddb_gateway$ext" "dist/$gateway/rasterizeddb-gateway$ext"
+          cp README.md LICENSE-GPL "dist/$gateway/"
           cd dist
           echo "server=$(pack "$server")" >> "$GITHUB_OUTPUT"
-          if [ "${{ matrix.studio }}" = true ]; then
-            studio="rdb-studio-$version-${{ matrix.name }}"
+          echo "gateway=$(pack "$gateway")" >> "$GITHUB_OUTPUT"
+          if [ "${{ matrix.p.studio }}" = true ]; then
+            studio="rdb-studio-$version-${{ matrix.p.name }}"
             mkdir -p "$studio"
-            cp "../target/${{ matrix.target }}/release/rdb_studio$ext" "$studio/rdb-studio$ext"
+            cp "../target/${{ matrix.p.target }}/release/rdb_studio$ext" "$studio/rdb-studio$ext"
             cp ../rdb_studio/README.md "$studio/README.md"
             cp ../LICENSE-GPL "$studio/"
             # The icon, and on Linux the desktop entry that shows it in menus
             # and the taskbar (Wayland takes it from there, by application id).
             cp ../branding/rasterizeddb.svg "$studio/rdb_studio.svg"
-            case "${{ matrix.target }}" in *linux*) cp ../rdb_studio/packaging/rdb_studio.desktop "$studio/" ;; esac
+            case "${{ matrix.p.target }}" in *linux*) cp ../rdb_studio/packaging/rdb_studio.desktop "$studio/" ;; esac
             echo "studio=$(pack "$studio")" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
+          # The GPL edition keeps the platform's name: the docker and pacman
+          # jobs download it by that name.
+          name: ${{ matrix.edition == 'enterprise' && format('enterprise-{0}', matrix.p.name) || matrix.p.name }}
           path: |
             ${{ steps.package.outputs.server }}
+            ${{ steps.package.outputs.gateway }}
             ${{ steps.package.outputs.studio }}
           if-no-files-found: error
 
@@ -412,7 +470,7 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Checksums
-        run: cd dist && sha256sum rasterizeddb-server-* rdb-studio-* rasterizeddb-bin-* > SHA256SUMS && cat SHA256SUMS
+        run: cd dist && sha256sum rasterizeddb-server-* rasterizeddb-gateway-* rasterizeddb-enterprise-* rdb-studio-* rasterizeddb-bin-* > SHA256SUMS && cat SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           name: "RasterizedDB ${{ github.ref_name }}"
@@ -420,6 +478,8 @@ jobs:
           generate_release_notes: true
           files: |
             dist/rasterizeddb-server-*
+            dist/rasterizeddb-gateway-*
+            dist/rasterizeddb-enterprise-*
             dist/rdb-studio-*
             dist/rasterizeddb-bin-*
             dist/SHA256SUMS
@@ -440,5 +500,11 @@ jobs:
             **Container images** (linux/amd64 and linux/arm64), on Docker Hub as `${{ vars.DOCKERHUB_USERNAME }}/rasterizeddb` and on `ghcr.io/${{ github.repository_owner }}/rasterizeddb`: `<version>` on Ubuntu 24.04 (also `<version>-ubuntu24.04`), `<version>-ubuntu26.04`, `<version>-alpine`, and `<version>-rustfs`, which runs RustFS beside the server for its backups and S3-backed tables. Run with `docker run -e RASTERIZEDDB_PG_PASSWORD=<password> -p 5432:5432 -p 61170:61170 -v rasterizeddb:/var/lib/rasterizeddb ${{ vars.DOCKERHUB_USERNAME }}/rasterizeddb:<version>`; see docs/docker.md.
 
             **Arch Linux / CachyOS** (x86-64-v3): `sudo pacman -U rasterizeddb-bin-*.pkg.tar.zst`, set the password in `/etc/rasterizeddb/rasterizeddb.env`, then `sudo systemctl enable --now rasterizeddb`. `rasterizeddb-bin-aur-*.tar.gz` holds the same PKGBUILD for the AUR.
+
+            **The gateway** (`rasterizeddb-gateway-*`), which routes clients across shards, on the same six platforms.
+
+            **Enterprise edition** (`rasterizeddb-enterprise-*`), under `LICENSE-POLYFORM-SB`: the enterprise server (`rasterizeddb-enterprise`) and gateway (`rasterizeddb-gateway-enterprise`) in one archive per platform, with every feature: tenant isolation, segregation policies, per-user routing and client statistics, on top of everything in the GPL server.
+
+            Every server is built with all its release features: the broker (native, Kafka, AMQP, MQTT), sharding with Raft and two-phase commit, branching, storage pools and compression, key/value storage and cache, persistent indexes, the MySQL and SQL Server front ends, S3 backups and the PostgreSQL importer.
 
             **RasterizedDB Studio** (`rdb-studio-*`), the desktop console for RasterizedDB and PostgreSQL, is in the same four builds: dashboard, tables and schema, data editing, queries, activity, benchmarks, backups, branches, replication, migration, key/value browsing, roles and configuration. Run `rdb-studio` (`rdb-studio.exe` on Windows). It needs a desktop session: on Linux a Wayland or X11 session with a Vulkan or OpenGL driver, glibc 2.39+; the x86-64 builds need an AVX2 CPU like the server. Saved passwords go to the OS credential store (the Secret Service on Linux, Credential Manager on Windows).
