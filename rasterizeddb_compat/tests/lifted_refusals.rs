@@ -182,12 +182,17 @@ async fn distinct_on_over_joins_and_aggregates_matches_postgresql() {
     let sql = "SELECT DISTINCT ON (u.tier) u.tier FROM ev e JOIN users u ON e.user_id = u.uid ORDER BY e.id";
     let e = c.simple_query(sql).await.expect_err(sql);
     assert_eq!(e.code().map(|c| c.code()), Some("42P10"), "{e}");
+    // A window over the join under the DISTINCT ON: computed over every
+    // joined row (six), before one row a tier is kept. It was refused here
+    // while a window over a join alone was answered: the derived table the
+    // DISTINCT ON becomes was not read for one (`cte`, the window-over-a-join
+    // rewrite on a derived table's body).
+    let sql = "SELECT DISTINCT ON (u.tier) u.tier, count(*) OVER () FROM ev e JOIN users u ON e.user_id = u.uid ORDER BY u.tier";
+    assert_eq!(rows(&c, sql).await, ["gold|6", "silver|6"], "{sql}");
     // Still refused, never answered wrong: `*` (its columns are not named
-    // here), an ambiguous output name (PostgreSQL's 42702), and a window over
-    // a join (refused without DISTINCT ON too).
+    // here) and an ambiguous output name (PostgreSQL's 42702).
     for sql in [
         "SELECT DISTINCT ON (u.tier) * FROM ev e JOIN users u ON e.user_id = u.uid ORDER BY u.tier",
-        "SELECT DISTINCT ON (u.tier) u.tier, count(*) OVER () FROM ev e JOIN users u ON e.user_id = u.uid ORDER BY u.tier",
         "SELECT DISTINCT ON (id) u.uid AS id, e.id FROM ev e JOIN users u ON e.user_id = u.uid ORDER BY id",
     ] {
         assert!(c.simple_query(sql).await.is_err(), "{sql}");

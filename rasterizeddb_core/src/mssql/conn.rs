@@ -654,6 +654,9 @@ impl Env for Scope<'_> {
     fn shown(&self, relation: &str, column: Option<&str>) -> Option<String> {
         self.s.names.relations.get(relation)?.get(column.unwrap_or("")).cloned()
     }
+    fn shown_object(&self, name: &str) -> Option<String> {
+        self.s.names.objects.get(name).cloned()
+    }
     fn case_insensitive(&self) -> bool {
         self.s.shared.config.case_insensitive
     }

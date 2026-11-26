@@ -47,6 +47,12 @@ fn start_with(case_insensitive: bool) -> Servers {
 /// [`start_with`], a duplicate in a unique index reported as
 /// `unique_index_error` (`--mssql-unique-index-error`).
 fn start_config(case_insensitive: bool, unique_index_error: i32) -> Servers {
+    start_at(case_insensitive, unique_index_error, None)
+}
+
+/// [`start_config`], the databases kept in `root` (on disk) when given: a
+/// partitioned table is not made in memory.
+fn start_at(case_insensitive: bool, unique_index_error: i32, root: Option<std::path::PathBuf>) -> Servers {
     let _ = env_logger::builder().is_test(true).try_init();
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     // A socket path must fit sun_path: kept short, under /tmp.
@@ -68,7 +74,8 @@ fn start_config(case_insensitive: bool, unique_index_error: i32) -> Servers {
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                let catalog: Arc<DatabaseCatalog> = DatabaseCatalog::open(None, "postgres").await.unwrap();
+                let catalog: Arc<DatabaseCatalog> =
+                    DatabaseCatalog::open(root.as_deref().and_then(|p| p.to_str()), "postgres").await.unwrap();
                 let config = MsConfig {
                     tcp: Some(("127.0.0.1".into(), 0)),
                     // No unix socket where the platform has none: `bind` refuses one
@@ -2148,6 +2155,167 @@ async fn tiberius_application_findings() {
         let e = batch(&mut c, sql).await.err().unwrap_or_else(|| panic!("{sql} was answered"));
         assert_eq!(number(&e), Some(207), "{sql}: {e}");
     }
+}
+
+/// The engine's `PARTITION BY HASH` through this front end: on CREATE TABLE
+/// (it was dropped with the storage clauses, and a plain table reported as
+/// made), and as `ALTER TABLE … PARTITION BY HASH` for a table that has
+/// rows. A uniqueidentifier key partitions (its SQL Server order is only an
+/// order). What there is no such thing as here is refused, not ignored: a
+/// partition scheme, RANGE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_partition_by_hash() {
+    // On disk, and bounded: removed when the test is done.
+    let dir = std::env::temp_dir().join(format!("rdb_tds_partition_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    struct Remove(std::path::PathBuf);
+    impl Drop for Remove {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let s = start_at(true, 2601, Some(dir.clone()));
+    let _remove = Remove(dir);
+    let mut c = connect(&s).await;
+    let (pg, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={} user=rasterized password={PASSWORD} dbname=postgres", s.pg_port),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(conn);
+    let partitions = |rows: Vec<tokio_postgres::SimpleQueryMessage>| rows.iter().filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_))).count();
+    batch(
+        &mut c,
+        "CREATE TABLE [PtNew] ([Id] uniqueidentifier NOT NULL, [CompanyId] uniqueidentifier NOT NULL, [Name] nvarchar(50) NULL, [At] datetime2(7) NULL, \
+             CONSTRAINT [PK_PtNew] PRIMARY KEY ([Id], [CompanyId])) PARTITION BY HASH ([CompanyId]) PARTITIONS 4; \
+         CREATE TABLE [PtOld] ([Id] uniqueidentifier NOT NULL, [CompanyId] uniqueidentifier NOT NULL, [Name] nvarchar(50) NULL, [N] int NOT NULL, \
+             CONSTRAINT [PK_PtOld] PRIMARY KEY ([Id], [CompanyId])) ON [PRIMARY]",
+    )
+    .await
+    .unwrap();
+    assert_eq!(partitions(pg.simple_query("SHOW PARTITIONS ptnew").await.unwrap()), 4);
+    assert!(pg.simple_query("SHOW PARTITIONS ptold").await.is_err(), "a plain table");
+    let (a, b) = ("11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222");
+    for table in ["PtNew", "PtOld"] {
+        let extra = if table == "PtNew" { "'2026-01-02 03:04:05.1234567'" } else { "7" };
+        batch(
+            &mut c,
+            &format!(
+                "INSERT INTO [{table}] VALUES ('00000000-0000-0000-0000-000000000001', '{a}', N'Alpha', {extra}), \
+                 ('00000000-0000-0000-0000-000000000002', '{a}', N'beta', {extra}), ('01000000-0000-0000-0000-000000000000', '{b}', N'Gamma', {extra})"
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    // A table with rows, converted in place.
+    batch(&mut c, "ALTER TABLE [PtOld] PARTITION BY HASH ([CompanyId]) PARTITIONS 8").await.unwrap();
+    assert_eq!(partitions(pg.simple_query("SHOW PARTITIONS ptold").await.unwrap()), 8);
+    for table in ["PtNew", "PtOld"] {
+        let r = batch(
+            &mut c,
+            &format!(
+                "SELECT [Name] FROM [{table}] WHERE [CompanyId] = '{a}' AND [Name] = N'ALPHA'; \
+                 SELECT [Name] FROM [{table}] ORDER BY [Id]; \
+                 SELECT COUNT(*) FROM [{table}]"
+            ),
+        )
+        .await
+        .unwrap();
+        let names = |rows: &[tiberius::Row]| -> Vec<String> { rows.iter().map(|r| r.get::<&str, _>(0).unwrap().to_string()).collect() };
+        assert_eq!(names(&r[0]), ["Alpha"], "{table}");
+        // SQL Server's uniqueidentifier order, across partitions.
+        assert_eq!(names(&r[1]), ["Gamma", "Alpha", "beta"], "{table}");
+        assert_eq!(r[2][0].get::<i32, _>(0), Some(3), "{table}");
+    }
+    let at = batch(&mut c, "SELECT [At] FROM [PtNew] WHERE [CompanyId] = '11111111-1111-1111-1111-111111111111' AND [Name] = N'beta'").await.unwrap();
+    assert_eq!(
+        at[0][0].get::<chrono::NaiveDateTime, _>(0),
+        Some(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap().and_hms_nano_opt(3, 4, 5, 123_456_700).unwrap())
+    );
+    for (sql, what) in [
+        ("CREATE TABLE [PtR] ([Id] int NOT NULL PRIMARY KEY, [At] datetime2 NOT NULL) PARTITION BY RANGE ([At])", "only by HASH"),
+        ("CREATE TABLE [PtS] ([Id] int NOT NULL PRIMARY KEY, [At] datetime2 NOT NULL) ON psMonth([At])", "partition scheme"),
+        ("ALTER TABLE [PtOld] PARTITION BY LIST ([CompanyId])", "only by HASH"),
+    ] {
+        let e = batch(&mut c, sql).await.err().unwrap_or_else(|| panic!("{sql} was accepted"));
+        let tiberius::error::Error::Server(t) = &e else { panic!("{e}") };
+        assert!(t.message().contains(what), "{sql}: {e}");
+    }
+}
+
+/// A grouped query sorted by an aggregate that is not in its select list
+/// (EF Core's `GroupBy(…).OrderByDescending(g => g.Count()).Select(g =>
+/// g.Key)`): refused as "ORDER BY term 'count(*)' is not in the SELECT
+/// list". And what SQL Server's index catalogue says of a table: its
+/// indexes once each under the names they were declared with, and their
+/// columns (`sys.index_columns` was empty, `filter_definition` unknown, the
+/// primary key listed twice).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_grouped_order_and_index_catalogue() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [Note] ([Id] int NOT NULL, [UserId] nvarchar(40) NOT NULL, [Kind] int NOT NULL, [Email] nvarchar(60) NULL, CONSTRAINT [PK_Note] PRIMARY KEY ([Id])); \
+         CREATE INDEX [IX_Note_UserId_Kind] ON [Note] ([UserId], [Kind]); \
+         CREATE UNIQUE INDEX [EmailIndex] ON [Note] ([Email]) WHERE [Email] IS NOT NULL; \
+         INSERT INTO [Note] VALUES (1, N'ann', 1, N'a@x'), (2, N'Bob', 1, NULL), (3, N'bob', 2, N'b@x'), (4, N'BOB', 2, NULL), (5, N'cy', 1, NULL), (6, N'ann', 3, NULL)",
+    )
+    .await
+    .unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT TOP(1) [UserId] FROM [Note] GROUP BY [UserId] ORDER BY COUNT(*) DESC; \
+         SELECT [UserId] FROM [Note] GROUP BY [UserId] ORDER BY COUNT(*) DESC, [UserId]; \
+         SELECT [n].[Kind], COUNT(*) AS [c] FROM [Note] AS [n] GROUP BY [n].[Kind] ORDER BY MAX([n].[Id]) DESC; \
+         SELECT COUNT(*) FROM [Note] GROUP BY [Kind] ORDER BY [Kind] DESC",
+    )
+    .await
+    .unwrap();
+    let text = |rows: &[tiberius::Row]| -> Vec<String> { rows.iter().map(|r| r.get::<&str, _>(0).unwrap().to_lowercase()).collect() };
+    assert_eq!(text(&r[0]), ["bob"]);
+    assert_eq!(text(&r[1]), ["bob", "ann", "cy"]);
+    let kinds: Vec<(i32, i32)> = r[2].iter().map(|r| (r.get::<i32, _>(0).unwrap(), r.get::<i32, _>(1).unwrap())).collect();
+    assert_eq!(kinds, [(3, 1), (1, 3), (2, 2)]);
+    assert_eq!(r[3].iter().map(|r| r.get::<i32, _>(0).unwrap()).collect::<Vec<_>>(), [1, 2, 3]);
+
+    let r = batch(
+        &mut c,
+        "SELECT [i].[name], [i].[type_desc], [i].[is_unique], [i].[is_primary_key], [i].[filter_definition] FROM [sys].[indexes] AS [i] \
+             WHERE [i].[object_id] = OBJECT_ID(N'Note') ORDER BY [i].[index_id]; \
+         SELECT [i].[name], [c].[name], [ic].[key_ordinal], [ic].[is_included_column] FROM [sys].[indexes] AS [i] \
+             INNER JOIN [sys].[index_columns] AS [ic] ON [i].[object_id] = [ic].[object_id] AND [i].[index_id] = [ic].[index_id] \
+             INNER JOIN [sys].[columns] AS [c] ON [ic].[object_id] = [c].[object_id] AND [ic].[column_id] = [c].[column_id] \
+             WHERE [i].[object_id] = OBJECT_ID(N'Note') ORDER BY [i].[index_id], [ic].[key_ordinal]",
+    )
+    .await
+    .unwrap();
+    let indexes: Vec<(String, String, bool, bool)> = r[0]
+        .iter()
+        .map(|r| (r.get::<&str, _>(0).unwrap().to_string(), r.get::<&str, _>(1).unwrap().to_string(), r.get::<bool, _>(2).unwrap(), r.get::<bool, _>(3).unwrap()))
+        .collect();
+    assert_eq!(
+        indexes,
+        [
+            ("PK_Note".to_string(), "CLUSTERED".to_string(), true, true),
+            ("EmailIndex".to_string(), "NONCLUSTERED".to_string(), true, false),
+            ("IX_Note_UserId_Kind".to_string(), "NONCLUSTERED".to_string(), false, false),
+        ]
+    );
+    let columns: Vec<(String, String, i32)> =
+        r[1].iter().map(|r| (r.get::<&str, _>(0).unwrap().to_string(), r.get::<&str, _>(1).unwrap().to_string(), r.get::<i32, _>(2).unwrap())).collect();
+    assert_eq!(
+        columns,
+        [
+            ("PK_Note".to_string(), "Id".to_string(), 1),
+            ("EmailIndex".to_string(), "Email".to_string(), 1),
+            ("IX_Note_UserId_Kind".to_string(), "UserId".to_string(), 1),
+            ("IX_Note_UserId_Kind".to_string(), "Kind".to_string(), 2),
+        ]
+    );
 }
 
 /// NULLs sort first ascending and last descending, as SQL Server's (NULL is
