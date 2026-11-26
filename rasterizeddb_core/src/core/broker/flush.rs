@@ -204,7 +204,7 @@ fn round(f: &Flusher, batch: Vec<Weak<dyn Flushable>>, unsynced: &mut Vec<Arc<Fi
     f.syncs.fetch_add((files.len() + dirs.len()) as u64, Ordering::Relaxed);
     let failed = sync_all(&files);
     for d in &dirs {
-        if let Err(e) = crate::core::sync_path::sync_dir(d) {
+        if let Err(e) = super::sync_dir(d) {
             log::warn!("broker: could not sync directory {}: {e}", d.display());
         }
     }
@@ -222,14 +222,14 @@ fn round(f: &Flusher, batch: Vec<Weak<dyn Flushable>>, unsynced: &mut Vec<Arc<Fi
 fn sync_all(files: &[Arc<File>]) -> Option<io::Error> {
     match files.len() {
         0 => None,
-        1 => files[0].sync_data().err(),
+        1 => super::sync_file(&files[0]).err(),
         n => {
             let threads = n.min(8);
             let per = n.div_ceil(threads);
             let errors: Vec<io::Error> = std::thread::scope(|s| {
                 let handles: Vec<_> = files
                     .chunks(per)
-                    .map(|group| s.spawn(move || group.iter().find_map(|f| f.sync_data().err())))
+                    .map(|group| s.spawn(move || group.iter().find_map(|f| super::sync_file(f).err())))
                     .collect();
                 handles.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
             });

@@ -66,7 +66,14 @@ impl LogFile {
         format: Format,
         mut apply: impl FnMut(u8, &[u8]) -> Result<(), String>,
     ) -> io::Result<LogFile> {
-        std::fs::create_dir_all(dir)?;
+        // A directory made here is made durable in its parent too: a power cut
+        // must not take the whole broker (or a topic's logs) with it.
+        if !dir.exists() {
+            std::fs::create_dir_all(dir)?;
+            if let Some(parent) = dir.parent() {
+                super::sync_dir(parent)?;
+            }
+        }
         let gens = generations(dir, stem)?;
         let bad = |e: String| io::Error::new(io::ErrorKind::InvalidData, e);
         let (live, unreadable) = framed_log::live_generation(&gens, |g| {
@@ -101,6 +108,9 @@ impl LogFile {
             apply(kind, body)
         })
         .map_err(bad)?;
+        if !path.exists() {
+            super::announce_create(&path);
+        }
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
         if let Some(t) = &end.torn {
             log::warn!(
@@ -111,16 +121,18 @@ impl LogFile {
                 t.trailing
             );
             file.set_len(end.valid_len as u64)?;
-            file.sync_data()?;
+            super::sync_file(&file)?;
         }
         if bytes.is_empty() {
-            crate::core::sync_path::sync_dir(dir)?;
+            super::sync_dir(dir)?;
         }
         // Lower generations, and higher ones that are only unfinished
         // compactions, are dead.
         for g in gens {
             if g != live && !unreadable.iter().any(|(u, _)| *u == g) {
-                let _ = std::fs::remove_file(dir.join(name(stem, g)));
+                let dead = dir.join(name(stem, g));
+                super::announce_unlink(&dead);
+                let _ = std::fs::remove_file(dead);
             }
         }
         Ok(LogFile { dir: dir.to_path_buf(), stem: stem.to_string(), format, generation: live, file: Arc::new(file), len: end.valid_len as u64 })
@@ -147,11 +159,11 @@ impl LogFile {
     pub fn append_sync(&mut self, kind: u8, body: &[u8]) -> io::Result<()> {
         let framed = self.frame(kind, body)?;
         self.append_raw(&framed)?;
-        self.file.sync_data()
+        super::sync_file(&self.file)
     }
 
     pub fn sync(&self) -> io::Result<()> {
-        self.file.sync_data()
+        super::sync_file(&self.file)
     }
 
     pub fn len(&self) -> u64 {
@@ -180,14 +192,16 @@ impl LogFile {
             buf.extend_from_slice(&self.frame(*kind, body)?);
         }
         buf.extend_from_slice(&self.frame(SEALED, &[])?);
+        super::announce_create(&path);
         let mut f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path)?;
         f.write_all(&buf)?;
-        f.sync_data()?;
-        crate::core::sync_path::sync_dir(&self.dir)?;
+        super::sync_file(&f)?;
+        super::sync_dir(&self.dir)?;
         let old = self.dir.join(name(&self.stem, self.generation));
         self.file = Arc::new(f);
         self.len = buf.len() as u64;
         self.generation = next;
+        super::announce_unlink(&old);
         let _ = std::fs::remove_file(old);
         Ok(())
     }
@@ -196,7 +210,9 @@ impl LogFile {
     pub fn remove(dir: &Path, stem: &str) {
         if let Ok(gens) = generations(dir, stem) {
             for g in gens {
-                let _ = std::fs::remove_file(dir.join(name(stem, g)));
+                let dead = dir.join(name(stem, g));
+                super::announce_unlink(&dead);
+                let _ = std::fs::remove_file(dead);
             }
         }
     }

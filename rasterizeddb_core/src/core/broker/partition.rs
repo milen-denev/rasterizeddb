@@ -55,6 +55,30 @@ pub const TAIL_BYTES: usize = 8 << 20;
 /// Batches an idempotent producer's history keeps, as Kafka's five.
 const PRODUCER_HISTORY: usize = 5;
 
+/// What a partition is told about where it lives: its topic's name, and the
+/// broker's replication hook.
+#[derive(Clone)]
+pub struct Context {
+    pub topic_name: Arc<str>,
+    pub hook: Arc<std::sync::OnceLock<Arc<crate::replication::Replication>>>,
+}
+
+impl Default for Context {
+    fn default() -> Self {
+        Context { topic_name: Arc::from(""), hook: Arc::new(std::sync::OnceLock::new()) }
+    }
+}
+
+/// What [`Partition::append_replicated`] did with a peer's batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Replicated {
+    Applied,
+    /// This node has its offsets already.
+    Duplicate,
+    /// It starts past this node's end, which is `next`.
+    Gap { next: u64 },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Appended {
     pub base_offset: u64,
@@ -115,6 +139,10 @@ pub struct Partition {
     pending: AtomicUsize,
     /// Itself, for the flusher's dirty list.
     me: std::sync::Weak<Partition>,
+    /// Its topic's name, which replication names it by.
+    pub(super) topic_name: Arc<str>,
+    /// The database's replication, once attached (`repl`).
+    pub(super) hook: Arc<std::sync::OnceLock<Arc<crate::replication::Replication>>>,
 }
 
 impl Partition {
@@ -125,8 +153,9 @@ impl Partition {
         dir: Option<PathBuf>,
         config: &rasterizeddb_mq::wire::TopicConfig,
         flusher: Option<Arc<super::flush::Flusher>>,
+        ctx: &Context,
     ) -> Arc<Partition> {
-        Self::with_state(topic, index, dir, config, flusher, VecDeque::new(), HashMap::new(), 0, 0)
+        Self::with_state(topic, index, dir, config, flusher, ctx, VecDeque::new(), HashMap::new(), 0, 0)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -136,6 +165,7 @@ impl Partition {
         dir: Option<PathBuf>,
         config: &rasterizeddb_mq::wire::TopicConfig,
         flusher: Option<Arc<super::flush::Flusher>>,
+        ctx: &Context,
         segments: VecDeque<Segment>,
         producers: HashMap<u64, ProducerState>,
         start: u64,
@@ -170,6 +200,8 @@ impl Partition {
             flusher: if memory { None } else { flusher },
             pending: AtomicUsize::new(0),
             me: me.clone(),
+            topic_name: ctx.topic_name.clone(),
+            hook: ctx.hook.clone(),
         })
     }
 
@@ -186,6 +218,7 @@ impl Partition {
         dir: PathBuf,
         config: &rasterizeddb_mq::wire::TopicConfig,
         flusher: Option<Arc<super::flush::Flusher>>,
+        ctx: &Context,
     ) -> io::Result<Arc<Partition>> {
         if config.durability == Durability::Memory {
             // A memory topic keeps nothing across a restart; clear what a
@@ -193,7 +226,7 @@ impl Partition {
             for base in segment::list(&dir)? {
                 segment::remove(&dir, base);
             }
-            return Ok(Self::create(topic, index, Some(dir), config, flusher));
+            return Ok(Self::create(topic, index, Some(dir), config, flusher, ctx));
         }
         let bases = segment::list(&dir)?;
         let mut segments = VecDeque::with_capacity(bases.len());
@@ -229,7 +262,7 @@ impl Partition {
         // A segment emptied by a cut, other than the newest, holds nothing.
         let start = segments.front().map_or(0, |s| s.base);
         let next = segments.back().map_or(0, |s| s.next);
-        Ok(Self::with_state(topic, index, Some(dir), config, flusher, segments, producers, start, next))
+        Ok(Self::with_state(topic, index, Some(dir), config, flusher, ctx, segments, producers, start, next))
     }
 
     #[inline]
@@ -261,7 +294,6 @@ impl Partition {
         if self.poisoned.load(Ordering::Relaxed) {
             return Err(BrokerError::new(Code::Storage, "partition stopped after a write error; see the server log"));
         }
-        let len = batch.len();
         let now = now_us();
         let mut st = self.state.lock();
         let base = self.next.load(Ordering::Relaxed);
@@ -273,10 +305,54 @@ impl Partition {
             }
         }
         let stamped = batch::stamp_trusted(batch, base, now);
+        // Captured under the lock, so this partition's batches reach the
+        // stream in offset order (`repl`).
+        if self.dir.is_some() {
+            if let Some(r) = super::repl::capturing(self.hook.get()) {
+                super::repl::append(r, &self.topic_name, self.index, batch);
+            }
+        }
+        let next = self.place(st, batch, base, stamped);
+        Ok(Appended { base_offset: base, next_offset: next, duplicate: false })
+    }
+
+    /// Appends a batch a peer stamped, at the offset it carries
+    /// (`repl`): the same bytes at the same offset on every node.
+    pub fn append_replicated(&self, batch: &[u8]) -> Result<Replicated, BrokerError> {
+        if self.poisoned.load(Ordering::Relaxed) {
+            return Err(BrokerError::new(Code::Storage, "partition stopped after a write error; see the server log"));
+        }
+        let st = self.state.lock();
+        let next = self.next.load(Ordering::Relaxed);
+        let view = BatchView::trusted(batch);
+        let base = view.base_offset();
+        if base < next {
+            return Ok(Replicated::Duplicate);
+        }
+        if base > next {
+            return Ok(Replicated::Gap { next });
+        }
+        let stamped = batch::Stamped {
+            count: view.count(),
+            max_time: view.max_time(),
+            producer_id: view.producer_id(),
+            epoch: view.epoch(),
+            base_sequence: view.base_sequence(),
+        };
+        self.place(st, batch, base, stamped);
+        Ok(Replicated::Applied)
+    }
+
+    /// Puts a stamped batch at `base`: the segment, the chunk, the index, the
+    /// producer's history, the watermarks. Takes the locked state and
+    /// releases it before waking anyone. Returns the next offset.
+    fn place(&self, mut st: parking_lot::MutexGuard<'_, State>, batch: &[u8], base: u64, stamped: batch::Stamped) -> u64 {
+        let len = batch.len();
         let count = stamped.count;
         let next = base + count as u64;
         let base_time = BatchView::trusted(batch).base_time();
         let memory = self.dir.is_none();
+        let producer = stamped.producer_id;
 
         if !memory {
             let roll = match st.segments.back() {
@@ -323,10 +399,6 @@ impl Partition {
         } else {
             self.bytes.fetch_add(len as u64, Ordering::Relaxed);
             self.pending.fetch_add(len, Ordering::Relaxed);
-            if self.durability == Durability::Async {
-                // Durable for an async topic means written; the flusher still
-                // writes it, and syncs on its own clock.
-            }
             if !self.dirty.swap(true, Ordering::AcqRel) {
                 if let Some(f) = &self.flusher {
                     f.mark_dirty(self);
@@ -334,7 +406,7 @@ impl Partition {
             }
         }
         self.appended_tx.send_replace(next);
-        Ok(Appended { base_offset: base, next_offset: next, duplicate: false })
+        next
     }
 
     /// Drops the oldest chunks past the budget: once written, for a file

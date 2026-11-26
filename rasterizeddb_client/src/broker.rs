@@ -100,11 +100,14 @@ pub struct Options {
     pub client_name: String,
     /// How long a request may wait for its reply.
     pub timeout: Duration,
+    /// TLS to the broker port (`--broker-tls on`), believing the server as
+    /// this says. `None`: plain TCP (or a unix socket, which takes none).
+    pub tls: Option<rastcp::tls::Trust>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { user: None, password: None, client_name: "rasterizeddb_client".into(), timeout: Duration::from_secs(30) }
+        Options { user: None, password: None, client_name: "rasterizeddb_client".into(), timeout: Duration::from_secs(30), tls: None }
     }
 }
 
@@ -116,6 +119,13 @@ impl Options {
     /// No login: a server started with `--broker-auth trust`.
     pub fn trust() -> Self {
         Self::default()
+    }
+
+    /// TLS, believing the server as `trust` says (`Trust::Pinned` or
+    /// `Trust::RootCa` for a server's own certificate).
+    pub fn with_tls(mut self, trust: rastcp::tls::Trust) -> Self {
+        self.tls = Some(trust);
+        self
     }
 }
 
@@ -138,6 +148,16 @@ pub struct TopicInfo {
     pub queue: bool,
     pub messages: u64,
     pub bytes: u64,
+}
+
+/// A row of [`Broker::list_subscriptions`].
+#[derive(Clone, Debug)]
+pub struct SubInfo {
+    pub name: String,
+    pub config: SubConfig,
+    pub members: u32,
+    pub backlog: u64,
+    pub inflight: u64,
 }
 
 /// What [`Broker::fetch`] returned: whole stored batches.
@@ -237,7 +257,17 @@ impl Broker {
         } else {
             let s = tokio::net::TcpStream::connect(addr).await?;
             let _ = s.set_nodelay(true);
-            Box::new(s)
+            match &options.tls {
+                None => Box::new(s),
+                Some(trust) => {
+                    let config = rastcp::client::tls_client_config(trust).map_err(|e| BrokerError::local(e.to_string()))?;
+                    let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h).trim_start_matches('[').trim_end_matches(']');
+                    let name = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())
+                        .map_err(|_| BrokerError::local(format!("{host:?} is not a server name")))?;
+                    let tls = tokio_rustls::TlsConnector::from(Arc::new(config)).connect(name, s).await?;
+                    Box::new(tls)
+                }
+            }
         };
         let (rd, wr) = tokio::io::split(stream);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -529,6 +559,25 @@ impl Broker {
         let t = self.topic(queue).await?;
         let config = SubConfig { mode: SubMode::Shared, ..Default::default() };
         self.subscribe(&t, queue, config, credits).await
+    }
+
+    /// The subscriptions on `topic`: name, settings, members, backlog
+    /// (records not yet acked or committed past) and records in flight.
+    pub async fn list_subscriptions(&self, topic: &TopicRef) -> Result<Vec<SubInfo>> {
+        let r = self.call(op::SUB_LIST, |w| w.u32(topic.id)).await?;
+        let mut r = Reader::new(&r);
+        let n = r.u32()? as usize;
+        let mut out = Vec::with_capacity(n.min(4096));
+        for _ in 0..n {
+            out.push(SubInfo {
+                name: r.string()?,
+                config: SubConfig::decode(&mut r)?,
+                members: r.u32()?,
+                backlog: r.u64()?,
+                inflight: r.u64()?,
+            });
+        }
+        Ok(out)
     }
 
     pub async fn delete_subscription(&self, topic: &TopicRef, name: &str, if_exists: bool) -> Result<bool> {

@@ -1489,6 +1489,14 @@ impl Replication {
     /// the buffer was empty, a wake-up. No sync, no log write, no number:
     /// those are the flusher's, a moment later, for many effects at once.
     pub fn kv_append(self: &Arc<Self>, entry: &[u8]) {
+        self.effect_append(super::protocol::KV_FORMAT_V1, entry);
+    }
+
+    /// [`Replication::kv_append`] for a chunk encoding of another component's
+    /// (the message broker's, `core::broker::repl`): its effects share the
+    /// buffer, the flusher and the `FLAG_KV` records, in chunks of their own,
+    /// and a peer routes each chunk by its first byte.
+    pub fn effect_append(self: &Arc<Self>, format: u8, entry: &[u8]) {
         let wake = {
             let mut buffer = self.kv_buffer.lock();
             let was_empty = buffer.bytes == 0;
@@ -1496,12 +1504,12 @@ impl Replication {
             let fits = buffer
                 .chunks
                 .last()
-                .is_some_and(|chunk| chunk.len() + entry.len() <= KV_RECORD_TARGET);
+                .is_some_and(|chunk| chunk.first() == Some(&format) && chunk.len() + entry.len() <= KV_RECORD_TARGET);
             if fits {
                 buffer.chunks.last_mut().expect("checked").extend_from_slice(entry);
             } else {
                 let mut chunk = Vec::with_capacity((entry.len() + 1).max(KV_RECORD_TARGET.min(64 * 1024)));
-                chunk.push(super::protocol::KV_FORMAT_V1);
+                chunk.push(format);
                 chunk.extend_from_slice(entry);
                 buffer.chunks.push(chunk);
             }

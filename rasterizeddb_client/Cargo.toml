@@ -52,6 +52,9 @@ rasterizeddb_router = { path = "../rasterizeddb_router", version = "1.0.0", opti
 # The message broker's batch format and wire protocol (feature `broker`):
 # the same crate the server lays batches out with.
 rasterizeddb_mq = { path = "../rasterizeddb_mq", version = "1.0.1", optional = true }
+# TLS for the broker's native port (feature `broker`); rastcp brings it
+# already, with the certificate trust this reuses.
+tokio-rustls = { version = "0.26", optional = true, default-features = false }
 # Ed25519 for signing cluster maps in `rdb-shard` (sharding-plan.md B2);
 # already in the tree as rustls's crypto provider.
 aws-lc-rs = { version = "1.19", optional = true }
@@ -66,7 +69,7 @@ derive = ["dep:rasterizeddb_client_derive"]
 sharding = ["dep:rasterizeddb_router", "dep:aws-lc-rs"]
 # The message broker's native client (`broker::Broker`, docs/broker.md):
 # topics, queues, exchanges, a batching producer and push subscriptions.
-broker = ["dep:rasterizeddb_mq", "tokio/io-util"]
+broker = ["dep:rasterizeddb_mq", "dep:tokio-rustls", "tokio/io-util"]
 # ToSql/FromSql for chrono's DateTime<Utc>, NaiveDateTime, NaiveDate, NaiveTime.
 chrono = ["dep:chrono"]
 # ToSql/FromSql for uuid::Uuid.
@@ -112,4 +115,8 @@ required-features = ["broker"]
 
 [[example]]
 name = "broker_crash"
+required-features = ["broker"]
+
+[[example]]
+name = "broker_repl"
 required-features = ["broker"]

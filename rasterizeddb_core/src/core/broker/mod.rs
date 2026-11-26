@@ -38,6 +38,7 @@ pub mod kafka;
 pub mod mqtt;
 pub mod net;
 pub mod partition;
+pub mod repl;
 pub mod segment;
 pub mod sql;
 pub mod sub;
@@ -98,6 +99,41 @@ pub fn ddl_policy() -> DdlPolicy {
 
 pub fn set_ddl_policy(p: DdlPolicy) {
     DDL.store(p as u8, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// Syncs, as the power-loss harness sees them
+// ---------------------------------------------------------------------------
+
+/// `fdatasync`s a broker file (a segment or a log), noted for
+/// `sync_audit` so the power-loss harness (`core::power_loss`) models it.
+pub(crate) fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
+    let _noted = crate::core::sync_audit::note_file("broker.file", file);
+    file.sync_data()
+}
+
+/// Syncs a directory's entries (a file created or removed in it), noted for
+/// the harness only when a handle could be had, as `wal::sync_parent_dir`.
+pub(crate) fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    if let Some(handle) = crate::core::sync_path::open_dir(dir)? {
+        let _noted = crate::core::sync_audit::note("broker.dir", dir);
+        crate::core::sync_path::flush_dir(&handle)?;
+    }
+    Ok(())
+}
+
+/// Announces a file about to be created, for the harness's crash images.
+#[inline]
+pub(crate) fn announce_create(_path: &std::path::Path) {
+    #[cfg(any(test, feature = "index_store_failpoints"))]
+    crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Create(_path));
+}
+
+/// Announces a file about to be removed.
+#[inline]
+pub(crate) fn announce_unlink(_path: &std::path::Path) {
+    #[cfg(any(test, feature = "index_store_failpoints"))]
+    crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Unlink(_path));
 }
 
 /// Microseconds since the epoch.
@@ -192,6 +228,7 @@ struct HandleInner {
     name: String,
     broker: OnceLock<Result<Arc<Broker>, BrokerError>>,
     open_lock: parking_lot::Mutex<()>,
+    replication: OnceLock<Arc<crate::replication::Replication>>,
 }
 
 impl BrokerHandle {
@@ -202,6 +239,7 @@ impl BrokerHandle {
                 name: name.to_string(),
                 broker: OnceLock::new(),
                 open_lock: parking_lot::Mutex::new(()),
+                replication: OnceLock::new(),
             }),
         }
     }
@@ -221,12 +259,24 @@ impl BrokerHandle {
             e
         });
         if let Ok(b) = &r {
+            if let Some(rep) = self.inner.replication.get() {
+                b.attach_replication(rep.clone());
+            }
             let mut all = ALL.lock();
             all.retain(|w| w.strong_count() > 0);
             all.push(Arc::downgrade(b));
         }
         let _ = self.inner.broker.set(r.clone());
         r
+    }
+
+    /// Records the broker's effects on the database's replication stream
+    /// (`repl`), from the time it opens.
+    pub fn attach_replication(&self, replication: Arc<crate::replication::Replication>) {
+        let _ = self.inner.replication.set(replication.clone());
+        if let Some(b) = self.existing() {
+            b.attach_replication(replication);
+        }
     }
 
     /// The broker if something has already opened it.

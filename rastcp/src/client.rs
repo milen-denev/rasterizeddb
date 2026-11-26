@@ -28,6 +28,30 @@ const DEFAULT_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// connection limit still fit.
 const DEFAULT_MAX_IN_FLIGHT: usize = 128;
 
+/// A TLS 1.3 client configuration that believes the server as `trust` says,
+/// for protocols other than rastcp's own that ride the same certificates (the
+/// message broker's native port): the same verifiers the rastcp dialer uses,
+/// no client certificate, no early data.
+pub fn tls_client_config(trust: &Trust) -> Result<ClientConfig, RastcpError> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let builder = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13]);
+    let wants_client_cert = match crate::tls::server_verifier(trust)? {
+        Some(verifier) => builder.dangerous().with_custom_certificate_verifier(verifier),
+        None => match trust {
+            Trust::WebPki => builder.with_webpki_roots(),
+            Trust::RootCa(_) => {
+                let roots = crate::tls::trust_roots(trust)?.expect("RootCa always yields a root store");
+                builder.with_root_certificates(roots)
+            }
+            Trust::AcceptAny => builder.dangerous().with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate)),
+            Trust::Pinned(_) => unreachable!("pinning always builds a verifier"),
+        },
+    };
+    let mut config = wants_client_cert.with_no_client_auth();
+    config.enable_early_data = false;
+    Ok(config)
+}
+
 // A certificate verifier that accepts any certificate
 #[derive(Debug)]
 #[allow(dead_code)]

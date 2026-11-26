@@ -365,6 +365,9 @@ pub struct Broker {
     stopped: AtomicBool,
     pub(super) next_ephemeral: std::sync::atomic::AtomicU32,
     me: std::sync::Weak<Broker>,
+    /// The database's replication, once attached; shared with every
+    /// partition (`repl`).
+    pub(super) replication: Arc<std::sync::OnceLock<Arc<crate::replication::Replication>>>,
 }
 
 impl Broker {
@@ -384,6 +387,7 @@ impl Broker {
         };
         let broker = Arc::new_cyclic(|me| Broker {
             me: me.clone(),
+            replication: Arc::new(std::sync::OnceLock::new()),
             db_name: db_name.to_string(),
             dir: dir.map(Path::to_path_buf),
             meta: Mutex::new(Meta { log: None, state: MetaState::default() }),
@@ -431,6 +435,11 @@ impl Broker {
         Ok(broker)
     }
 
+    /// Records this broker's effects on `replication` from now on.
+    pub fn attach_replication(&self, replication: Arc<crate::replication::Replication>) {
+        let _ = self.replication.set(replication);
+    }
+
     pub(super) fn weak(&self) -> std::sync::Weak<Broker> {
         self.me.clone()
     }
@@ -445,6 +454,7 @@ impl Broker {
 
     fn open_topic(&self, id: u32, t: &TopicMeta, create: bool) -> io::Result<Arc<Topic>> {
         let dir = self.topic_dir(id);
+        let ctx = super::partition::Context { topic_name: Arc::from(t.name.as_str()), hook: self.replication.clone() };
         let mut partitions = Vec::with_capacity(t.config.partitions as usize);
         for p in 0..t.config.partitions {
             let pdir = dir.as_ref().map(|d| d.join(format!("p{p}")));
@@ -452,29 +462,29 @@ impl Broker {
                 Some(pd) if t.config.durability != Durability::Memory => {
                     if create {
                         std::fs::create_dir_all(pd)?;
-                        Partition::create(id, p, Some(pd.clone()), &t.config, self.flusher.clone())
+                        Partition::create(id, p, Some(pd.clone()), &t.config, self.flusher.clone(), &ctx)
                     } else {
                         std::fs::create_dir_all(pd)?;
-                        Partition::open(id, p, pd.clone(), &t.config, self.flusher.clone())?
+                        Partition::open(id, p, pd.clone(), &t.config, self.flusher.clone(), &ctx)?
                     }
                 }
                 Some(pd) => {
                     if !create {
                         // Clears what an earlier durability left.
-                        let _ = Partition::open(id, p, pd.clone(), &t.config, None)?;
+                        let _ = Partition::open(id, p, pd.clone(), &t.config, None, &ctx)?;
                     }
-                    Partition::create(id, p, None, &t.config, None)
+                    Partition::create(id, p, None, &t.config, None, &ctx)
                 }
-                None => Partition::create(id, p, None, &t.config, None),
+                None => Partition::create(id, p, None, &t.config, None, &ctx),
             };
             partitions.push(part);
         }
         // A memory topic has no directory to make durable.
         if create && t.config.durability != Durability::Memory {
             if let Some(d) = &dir {
-                crate::core::sync_path::sync_dir(d)?;
+                super::sync_dir(d)?;
                 if let Some(parent) = d.parent() {
-                    crate::core::sync_path::sync_dir(parent)?;
+                    super::sync_dir(parent)?;
                 }
             }
         }
@@ -563,9 +573,14 @@ impl Broker {
         let tm = TopicMeta { name: name.to_string(), config, queue, created_us: super::now_us() };
         let topic = self.open_topic(id, &tm, true).map_err(BrokerError::io)?;
         meta.record(K_TOPIC, topic_record(id, &tm))?;
-        let mut topics = self.topics.write();
-        topics.by_name.insert(name.to_string(), topic.clone());
-        topics.by_id.insert(id, topic.clone());
+        {
+            let mut topics = self.topics.write();
+            topics.by_name.insert(name.to_string(), topic.clone());
+            topics.by_id.insert(id, topic.clone());
+        }
+        if let Some(r) = super::repl::capturing(self.replication.get()) {
+            super::repl::topic(r, name, &tm.config, tm.queue.as_ref());
+        }
         Ok(topic)
     }
 
@@ -577,6 +592,9 @@ impl Broker {
             return if if_exists { Ok(false) } else { Err(BrokerError::no_topic(name)) };
         };
         meta.record(K_TOPIC_DROP, enc(|w| w.u32(topic.id)))?;
+        if let Some(r) = super::repl::capturing(self.replication.get()) {
+            super::repl::topic_drop(r, name);
+        }
         {
             let mut topics = self.topics.write();
             topics.by_name.remove(name);
@@ -619,6 +637,9 @@ impl Broker {
             new.encode(w)
         }))?;
         *topic.config.write() = new.clone();
+        if let Some(r) = super::repl::capturing(self.replication.get()) {
+            super::repl::topic_alter(r, name, &new);
+        }
         Ok(new)
     }
 
@@ -714,6 +735,9 @@ impl Broker {
             config.encode(w)
         }))?;
         topic.subs.write().insert(name.to_string(), sub.clone());
+        if let Some(r) = super::repl::capturing(self.replication.get()) {
+            super::repl::sub(r, &topic.name, name, &config);
+        }
         Ok(sub)
     }
 
@@ -728,6 +752,9 @@ impl Broker {
             };
         };
         meta.record(K_SUB_DROP, enc(|w| w.u32(sub.id)))?;
+        if let Some(r) = super::repl::capturing(self.replication.get()) {
+            super::repl::sub_drop(r, &topic.name, name);
+        }
         topic.subs.write().remove(name);
         sub.close("it was deleted");
         sub.remove_files();
@@ -848,6 +875,9 @@ impl Broker {
         if durable {
             let xm = ExchangeMeta { kind, alternate: alternate.unwrap_or("").to_string() };
             meta.record(K_EXCHANGE, exchange_record(name, &xm))?;
+            if let Some(r) = super::repl::capturing(self.replication.get()) {
+                super::repl::exchange(r, name, kind, alternate);
+            }
         }
         xs.insert(name.to_string(), Exchange::new(name, kind, alternate.map(str::to_string), durable));
         Ok(())
@@ -869,6 +899,9 @@ impl Broker {
         };
         if x.durable {
             meta.record(K_EXCHANGE_DROP, enc(|w| w.str(name)))?;
+            if let Some(r) = super::repl::capturing(self.replication.get()) {
+                super::repl::exchange_drop(r, name);
+            }
         }
         Ok(true)
     }
@@ -905,6 +938,9 @@ impl Broker {
                 x.unbind(&b, topic.id);
                 return Err(e);
             }
+            if let Some(r) = super::repl::capturing(self.replication.get()) {
+                super::repl::bind(r, &b, false);
+            }
         }
         Ok(true)
     }
@@ -920,6 +956,9 @@ impl Broker {
         }
         if x.durable {
             meta.record(K_UNBIND, enc(|w| b.encode(w)))?;
+            if let Some(r) = super::repl::capturing(self.replication.get()) {
+                super::repl::bind(r, b, true);
+            }
         }
         Ok(true)
     }
@@ -944,7 +983,7 @@ impl Broker {
             }
             for p in &t.partitions {
                 if let Ok(Some(r)) = p.write_pending() {
-                    let ok = r.files.iter().all(|f| f.sync_data().is_ok());
+                    let ok = r.files.iter().all(|f| super::sync_file(f).is_ok());
                     if ok {
                         p.mark_durable(r.upto);
                     }

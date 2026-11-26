@@ -9,7 +9,6 @@ use rasterizeddb_mq::batch::{BatchBuilder, Batches};
 use rasterizeddb_mq::wire::{
     self, Binding, Code, Durability, ExchangeKind, QueueConfig, Range, Start, SubConfig, SubMode, TopicConfig, XMatch,
 };
-use tokio::sync::mpsc;
 
 use super::*;
 
@@ -186,7 +185,7 @@ fn an_idempotent_producer_is_stored_once() {
 
 /// The records of every `DELIVER` frame waiting in `rx`, as `(offset, value)`,
 /// waiting up to `wait` for at least `want`.
-async fn drain(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>, want: usize, wait: Duration) -> Vec<(u32, u64, String)> {
+async fn drain(rx: &mut sub::OutboxRx, want: usize, wait: Duration) -> Vec<(u32, u64, String)> {
     let mut out = Vec::new();
     let deadline = tokio::time::Instant::now() + wait;
     while out.len() < want {
@@ -224,8 +223,8 @@ async fn a_shared_subscription_hands_each_record_to_one_member() {
         b.produce(&t, 0, &mut x, true).unwrap();
     }
     let rt = tokio::runtime::Handle::current();
-    let (tx1, mut rx1) = mpsc::unbounded_channel();
-    let (tx2, mut rx2) = mpsc::unbounded_channel();
+    let (tx1, mut rx1) = sub::outbox();
+    let (tx2, mut rx2) = sub::outbox();
     let (m1, _) = sub.join(1, 3, tx1, &rt).unwrap();
     let (_m2, _) = sub.join(2, 3, tx2, &rt).unwrap();
     let a = drain(&mut rx1, 3, Duration::from_secs(5)).await;
@@ -264,7 +263,7 @@ async fn a_record_past_its_deliveries_goes_to_the_dead_letter_topic() {
     let (_, sub) = b.queue("work").unwrap();
     let mut x = batch(&["poison"]);
     b.produce(&t, 0, &mut x, true).unwrap();
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = sub::outbox();
     let (_m, _) = sub.join(1, 10, tx, &tokio::runtime::Handle::current()).unwrap();
     for _ in 0..2 {
         let got = drain(&mut rx, 1, Duration::from_secs(5)).await;
@@ -292,7 +291,7 @@ async fn scheduled_records_wait_for_their_time() {
     bb.push(None, b"soon", &[(wire::DELIVER_AT_HEADER, &wire::deliver_at(at))]).unwrap();
     bb.push(None, b"now", &[]).unwrap();
     b.produce(&t, 0, &mut bb.finish(), true).unwrap();
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = sub::outbox();
     let _ = sub.join(1, 10, tx, &tokio::runtime::Handle::current()).unwrap();
     let first = drain(&mut rx, 2, Duration::from_millis(300)).await;
     assert_eq!(first.iter().map(|x| x.2.as_str()).collect::<Vec<_>>(), ["now"]);
@@ -330,7 +329,7 @@ async fn ordered_commits_survive_a_restart_and_shared_acks_too() {
     assert_eq!(s.backlog(), 4, "the unacked ones are owed again after a restart");
     // A partition's members follow join order: two members split two partitions.
     let rt = tokio::runtime::Handle::current();
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = sub::outbox();
     let (_, p1) = o.join(1, 10, tx.clone(), &rt).unwrap();
     assert_eq!(p1, vec![0, 1]);
     let (_, p2) = o.join(2, 10, tx, &rt).unwrap();
@@ -532,7 +531,7 @@ async fn concurrent_producers_and_competing_consumers_lose_nothing() {
     let seen = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::<(u32, u64), usize>::new()));
     let mut consumers = Vec::new();
     for m in 0..4u32 {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = sub::outbox();
         let (member, _) = sub.join(m + 1, 64, tx, &rt).unwrap();
         let (sub, seen) = (sub.clone(), seen.clone());
         consumers.push(tokio::spawn(async move {
@@ -589,7 +588,7 @@ async fn a_cancelled_amqp_style_member_keeps_its_inflight_until_settled() {
     let t = b.declare_queue("q", QueueConfig { durability: Durability::Memory, ..Default::default() }, false).unwrap();
     let (_, sub) = b.queue("q").unwrap();
     b.produce(&t, 0, &mut batch(&["a", "b"]), true).unwrap();
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = sub::outbox();
     let (m, _) = sub.join(1, 10, tx, &tokio::runtime::Handle::current()).unwrap();
     let got = drain(&mut rx, 2, Duration::from_secs(3)).await;
     assert_eq!(got.len(), 2);
@@ -611,4 +610,109 @@ fn a_queue_redeclared_with_other_settings_is_refused() {
     let e = b.declare_queue("jobs", other, true).unwrap_err();
     assert_eq!(e.code, Code::Mismatch);
     assert!(e.message.contains("ack_timeout_ms 300000 vs 5000"), "{}", e.message);
+}
+
+/// Power loss, modelled by `core::power_loss`: cuts inside the broker's own
+/// file and directory syncs, imaged with unsynced pages kept, dropped and
+/// torn. Every image opens, and every record acked durable before its cut is
+/// there with its value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acked_records_survive_power_loss() {
+    use crate::core::power_loss::failpoint;
+    use crate::core::power_loss::image::{CrashPoint, Recorder};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let base = tempfile::tempdir().unwrap();
+    let rec_dir = base.path().join("rec");
+    let bdir = rec_dir.join("broker");
+    std::fs::create_dir_all(&rec_dir).unwrap();
+    let b = Broker::open(Some(&bdir), "t").unwrap();
+    let t = b.create_topic("pl", config(2, Durability::Sync), false).unwrap();
+    b.produce(&t, 0, &mut batch(&["before"]), true).unwrap();
+    settle(t.partition(0).unwrap());
+
+    let rec = Recorder::start(&rec_dir);
+    // (topic, partition, offset, value) of every record acked durable.
+    let acked: Arc<parking_lot::Mutex<Vec<(String, u32, u64, String)>>> = Arc::new(parking_lot::Mutex::new(vec![(
+        "pl".into(),
+        0,
+        0,
+        "before".into(),
+    )]));
+    let count = Arc::new(AtomicUsize::new(1));
+    let sink: Arc<parking_lot::Mutex<Vec<(usize, Result<CrashPoint, String>)>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let mut guards = Vec::new();
+    for (site, n) in [("sync:broker.file", 24u64), ("sync:broker.dir", 4)] {
+        for nth in 1..=n {
+            let (rec, count, sink) = (rec.clone(), count.clone(), sink.clone());
+            let action: failpoint::Action = Arc::new(move |hit: &failpoint::Hit<'_>| {
+                // What was acked before this sync was issued must survive it.
+                let n = count.load(Ordering::SeqCst);
+                let label = format!("{} #{} on {}", hit.name, hit.nth, hit.path.display());
+                sink.lock().push((n, rec.cut_in_sync(label)));
+                failpoint::Outcome::Continue
+            });
+            guards.push(failpoint::arm(site, &rec_dir, nth, action));
+        }
+    }
+    let record = |topic: &str, p: &partition::Partition, off: u64, v: &str| {
+        acked.lock().push((topic.to_string(), p.index, off, v.to_string()));
+        count.store(acked.lock().len(), Ordering::SeqCst);
+    };
+    for i in 0..16u64 {
+        let v = format!("v{i}");
+        let (p, a) = b.produce(&t, (i % 2) as u32, &mut batch(&[&v]), true).unwrap();
+        settle(&p);
+        record("pl", &p, a.base_offset, &v);
+        if i == 6 {
+            // A topic made mid-way: its directories and the metadata log.
+            let t2 = b.create_topic("late", config(1, Durability::Sync), false).unwrap();
+            let (p2, a2) = b.produce(&t2, 0, &mut batch(&["late-0"]), true).unwrap();
+            settle(&p2);
+            record("late", &p2, a2.base_offset, "late-0");
+        }
+    }
+    let end_count = count.load(Ordering::SeqCst);
+    sink.lock().push((end_count, rec.cut_quiescent("after the last ack")));
+    drop(guards);
+    b.shutdown();
+    drop(b);
+    drop(rec);
+
+    let points: Vec<(usize, CrashPoint)> =
+        sink.lock().drain(..).filter_map(|(n, p)| p.map_err(|why| eprintln!("{why}")).ok().map(|p| (n, p))).collect();
+    assert!(points.len() >= 6, "too few cuts survived: {}", points.len());
+    let acked = acked.lock().clone();
+    let img_dir = base.path().join("img");
+    let mut problems = Vec::new();
+    let mut images = 0;
+    for (n, point) in &points {
+        for seed in 0..5 {
+            let _ = std::fs::remove_dir_all(&img_dir);
+            point.write_image(seed, &img_dir);
+            images += 1;
+            let label = format!("{} seed {seed} ({n} acked)", point.label);
+            let opened = Broker::open(Some(&img_dir.join("broker")), "img");
+            let ib = match opened {
+                Ok(ib) => ib,
+                Err(e) => {
+                    problems.push(format!("{label}: does not open: {e}"));
+                    continue;
+                }
+            };
+            for (topic, p, off, v) in &acked[..*n] {
+                let Some(it) = ib.topic(topic) else {
+                    problems.push(format!("{label}: topic {topic} is gone"));
+                    break;
+                };
+                let got = values(it.partition(*p).unwrap(), *off).into_iter().find(|(o, _)| o == off);
+                if got.as_ref().map(|(_, x)| x.as_str()) != Some(v.as_str()) {
+                    problems.push(format!("{label}: {topic}/{p}@{off} should be {v:?}, is {got:?}"));
+                }
+            }
+            ib.shutdown();
+        }
+    }
+    assert!(problems.is_empty(), "{} of {images} images lost acked records:\n{}", problems.len(), problems.join("\n"));
+    eprintln!("{} cuts, {images} images, every acked record intact", points.len());
 }

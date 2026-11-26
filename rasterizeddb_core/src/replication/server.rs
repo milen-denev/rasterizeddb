@@ -1255,6 +1255,24 @@ fn apply_kv(database: &Arc<Database>, replication: &StdArc<Replication>, record:
                 continue;
             }
         };
+        // The message broker's chunks, by their first byte.
+        if bytes.first() == Some(&protocol::BROKER_FORMAT_V1) {
+            #[cfg(feature = "broker")]
+            {
+                let report = crate::core::broker::repl::apply_chunk(&database.broker, &bytes);
+                stats.kv_applied.fetch_add(report.applied, Ordering::Relaxed);
+                errors += report.errors;
+                if first_error.is_none() {
+                    first_error = report.first_error;
+                }
+            }
+            #[cfg(not(feature = "broker"))]
+            {
+                errors += 1;
+                first_error.get_or_insert_with(|| "this build has no message broker".to_string());
+            }
+            continue;
+        }
         #[cfg(feature = "kv_cache")]
         {
             let report = crate::core::kv_cache::repl::apply_chunk(&database.kv_cache, &bytes);

@@ -38,7 +38,7 @@ use parking_lot::Mutex;
 use rasterizeddb_mq::batch::{BatchBuilder, Batches};
 use rasterizeddb_mq::wire::{self, Binding, Durability, QueueConfig, Range, TopicConfig, XMatch};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 use super::partition::Partition;
 use super::sub::Subscription;
@@ -47,6 +47,10 @@ use crate::core::database::Database;
 use crate::core::listen::{self, Listeners, Sock, SocketSpec};
 
 const EXCHANGE: &str = "amq.mqtt";
+/// Topic aliases a client may set (CONNACK's Topic Alias Maximum).
+const TOPIC_ALIAS_MAX: u16 = 64;
+/// The largest packet before CONNECT has been accepted.
+const PRE_CONNECT_PACKET: usize = 1 << 20;
 const RETAINED: &str = "$mqtt.retained";
 const HDR_QOS: &[u8] = b"mqtt-q";
 const HDR_PROPS: &[u8] = b"mqtt-p";
@@ -106,7 +110,7 @@ struct Shared {
     retained: Mutex<BTreeMap<String, Retained>>,
     /// The live connection of each client id, told to go when another takes
     /// the id over.
-    live: Mutex<HashMap<String, (u64, mpsc::UnboundedSender<Vec<u8>>)>>,
+    live: Mutex<HashMap<String, (u64, crate::core::broker::sub::Outbox)>>,
     next_conn: std::sync::atomic::AtomicU64,
 }
 
@@ -442,8 +446,8 @@ struct Conn {
     shared_groups: Vec<(String, String, u8)>,
     consumers: HashMap<u32, Consumer>,
     next_handle: u32,
-    push_tx: mpsc::UnboundedSender<Vec<u8>>,
-    push_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    push_tx: super::sub::Outbox,
+    push_rx: crate::core::broker::sub::OutboxRx,
     /// Inbound QoS 2 packet ids awaiting PUBREL.
     qos2_in: std::collections::HashSet<u16>,
     outgoing: HashMap<u16, Outgoing>,
@@ -456,7 +460,7 @@ struct Conn {
 
 impl Conn {
     fn new(shared: Arc<Shared>) -> Conn {
-        let (push_tx, push_rx) = mpsc::unbounded_channel();
+        let (push_tx, push_rx) = crate::core::broker::sub::outbox();
         let id = shared.next_conn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Conn {
             shared,
@@ -492,7 +496,8 @@ impl Conn {
         loop {
             let mut at = 0;
             loop {
-                let p = match parse_packet(&buf[at..], self.shared.config.max_packet) {
+                let max = if self.connected { self.shared.config.max_packet } else { PRE_CONNECT_PACKET };
+                let p = match parse_packet(&buf[at..], max) {
                     Ok(Some(p)) => p,
                     Ok(None) => break,
                     Err(e) => {
@@ -771,7 +776,8 @@ impl Conn {
             }
             props.extend_from_slice(&[0x21]);
             props.extend_from_slice(&1024u16.to_be_bytes());
-            props.extend_from_slice(&[0x22, 0, 0]); // topic alias maximum 0: never sent
+            props.push(0x22); // topic alias maximum the client may use
+            props.extend_from_slice(&TOPIC_ALIAS_MAX.to_be_bytes());
             props.extend_from_slice(&[0x29, 0]); // no subscription identifiers
             put_varint(&mut ack, props.len());
             ack.extend_from_slice(&props);
@@ -812,6 +818,9 @@ impl Conn {
             props = kept;
             expiry = exp;
             if let Some(a) = alias {
+                if a == 0 || a > TOPIC_ALIAS_MAX {
+                    return Err(End::Protocol("topic alias out of range"));
+                }
                 if topic.is_empty() {
                     topic = self.aliases.get(&a).cloned().ok_or(End::Protocol("unknown topic alias"))?;
                 } else {

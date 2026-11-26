@@ -64,8 +64,54 @@ pub const DELIVER_BYTES: usize = 1 << 20;
 /// one record no one acks must not grow the bitmap without bound.
 const MAX_WINDOW: u64 = 1 << 24;
 
-/// Frames to one connection.
-pub type Outbox = mpsc::UnboundedSender<Vec<u8>>;
+/// Bytes of frames a member's connection may have queued and not yet taken
+/// before it is treated as out of credit: a client that grants credit and
+/// stops reading must not grow the server's memory without bound.
+pub const OUTBOX_BYTES: usize = 16 << 20;
+
+/// Frames to one connection, with the bytes queued and not yet taken.
+#[derive(Clone)]
+pub struct Outbox {
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// A connection's end of its [`Outbox`].
+pub struct OutboxRx {
+    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// A connection's outbox and its receiving end.
+pub fn outbox() -> (Outbox, OutboxRx) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    (Outbox { tx, queued: queued.clone() }, OutboxRx { rx, queued })
+}
+
+impl Outbox {
+    pub fn send(&self, frame: Vec<u8>) -> Result<(), ()> {
+        self.queued.fetch_add(frame.len(), Ordering::Relaxed);
+        self.tx.send(frame).map_err(|_| ())
+    }
+    /// Past [`OUTBOX_BYTES`]: deliveries wait until the connection catches up.
+    pub fn is_full(&self) -> bool {
+        self.queued.load(Ordering::Relaxed) > OUTBOX_BYTES
+    }
+}
+
+impl OutboxRx {
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        let f = self.rx.recv().await?;
+        self.queued.fetch_sub(f.len(), Ordering::Relaxed);
+        Some(f)
+    }
+    pub fn try_recv(&mut self) -> Result<Vec<u8>, mpsc::error::TryRecvError> {
+        let f = self.rx.try_recv()?;
+        self.queued.fetch_sub(f.len(), Ordering::Relaxed);
+        Ok(f)
+    }
+}
 
 struct Inflight {
     member: u64,
@@ -751,6 +797,39 @@ impl Subscription {
         Ok(())
     }
 
+    /// Applies a record a peer's subscription of this name logged
+    /// (`repl`): a commit, acks or dead letters, a floor. Logged here too.
+    pub fn apply_record(&self, kind: u8, body: &[u8]) -> Result<(), BrokerError> {
+        let mut r = wire::Reader::new(body);
+        let bad = |e: wire::DecodeError| BrokerError::new(Code::Protocol, e.to_string());
+        let p = r.u32().map_err(bad)? as usize;
+        let Some(part) = self.parts.get(p) else {
+            return Err(BrokerError::new(Code::NoPartition, format!("no partition {p}")));
+        };
+        {
+            let mut st = part.lock();
+            match kind {
+                S_COMMIT => st.committed = Some(r.u64().map_err(bad)?),
+                S_FLOOR => {
+                    let f = r.u64().map_err(bad)?;
+                    st.raise_floor(f);
+                }
+                S_ACK | S_DEAD => {
+                    let off = r.u64().map_err(bad)?;
+                    let n = r.u32().map_err(bad)?;
+                    for o in off..off + n as u64 {
+                        st.inflight.remove(&o);
+                        st.set_acked(o);
+                    }
+                }
+                other => return Err(BrokerError::new(Code::Protocol, format!("unknown subscription record {other}"))),
+            }
+        }
+        let body = body.to_vec();
+        self.log_record(kind, |w| w.raw(&body));
+        Ok(())
+    }
+
     /// Ends the subscription for its members, telling each why.
     pub fn close(&self, why: &str) {
         self.closed.store(true, Ordering::Release);
@@ -864,6 +943,11 @@ impl Subscription {
     fn log_record(&self, kind: u8, body: impl FnOnce(&mut Writer<'_>)) {
         let Some(log) = &self.log else { return };
         let bytes = rec(body);
+        if let Some(b) = self.broker.upgrade() {
+            if let Some(r) = super::repl::capturing(b.replication.get()) {
+                super::repl::sub_record(r, &self.topic.name, &self.name, kind, &bytes);
+            }
+        }
         {
             let mut l = log.lock();
             match l.file.frame(kind, &bytes) {
@@ -883,7 +967,7 @@ impl Subscription {
     pub fn flush_now(&self) {
         if let Ok(Some(r)) = super::flush::Flushable::write_pending(self) {
             for f in r.files {
-                let _ = f.sync_data();
+                let _ = super::sync_file(&f);
             }
         }
     }
@@ -1037,7 +1121,7 @@ impl Subscription {
         let mut any = false;
         for member in m.list.iter_mut() {
             for &p in member.assigned.clone().iter() {
-                if member.credits == 0 {
+                if member.credits == 0 || member.out.is_full() {
                     break;
                 }
                 let part = &self.topic.partitions[p as usize];
@@ -1089,7 +1173,7 @@ impl Subscription {
     fn dispatch_shared(&self, p: u32) -> bool {
         let part = &self.topic.partitions[p as usize];
         let mut m = self.members.lock();
-        if m.list.iter().all(|x| x.credits == 0) {
+        if m.list.iter().all(|x| x.credits == 0 || x.out.is_full()) {
             return false;
         }
         let mut st = self.parts[p as usize].lock();
@@ -1102,7 +1186,7 @@ impl Subscription {
 
         // Redeliveries, batch by batch.
         while let Some(&first) = st.redeliver.front() {
-            if m.list.iter().all(|x| x.credits == 0) {
+            if m.list.iter().all(|x| x.credits == 0 || x.out.is_full()) {
                 break;
             }
             if st.is_acked(first) || first < part.log_start() {
@@ -1177,7 +1261,7 @@ impl Subscription {
 
         // New records.
         loop {
-            if m.list.iter().all(|x| x.credits == 0) {
+            if m.list.iter().all(|x| x.credits == 0 || x.out.is_full()) {
                 break;
             }
             let start = part.log_start();
@@ -1351,7 +1435,7 @@ fn next_member(m: &mut Members) -> Option<usize> {
     let n = m.list.len();
     for k in 0..n {
         let i = (m.rr + k) % n;
-        if m.list[i].credits > 0 {
+        if m.list[i].credits > 0 && !m.list[i].out.is_full() {
             m.rr = (i + 1) % n;
             return Some(i);
         }

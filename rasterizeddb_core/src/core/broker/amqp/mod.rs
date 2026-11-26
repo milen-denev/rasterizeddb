@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use rasterizeddb_mq::batch::{BatchBuilder, Batches};
 use rasterizeddb_mq::wire::{self, Binding, Code, Durability, ExchangeKind, QueueConfig, Range, XMatch};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 use self::codec::{In, Value};
 use super::partition::Partition;
@@ -58,6 +58,8 @@ const CHANNEL_ERROR: u16 = 504;
 const NOT_IMPLEMENTED: u16 = 540;
 const INTERNAL_ERROR: u16 = 541;
 const FRAME_ERROR: u16 = 501;
+/// Channels a connection may open (proposed in connection.tune).
+const CHANNEL_MAX: u16 = 2047;
 
 #[derive(Clone, Debug)]
 pub enum AmqpAuth {
@@ -219,8 +221,8 @@ struct Conn {
     /// one goes straight back to its queue.
     retired: HashMap<u32, Arc<Subscription>>,
     next_handle: u32,
-    push_tx: mpsc::UnboundedSender<Vec<u8>>,
-    push_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    push_tx: crate::core::broker::sub::Outbox,
+    push_rx: crate::core::broker::sub::OutboxRx,
     /// Queues this connection declared exclusive: deleted when it closes.
     exclusive: Vec<String>,
     /// Queues declared auto-delete: deleted once their last consumer goes.
@@ -234,7 +236,7 @@ type Flow = Result<(), ()>;
 
 impl Conn {
     fn new(shared: Arc<Shared>) -> Conn {
-        let (push_tx, push_rx) = mpsc::unbounded_channel();
+        let (push_tx, push_rx) = crate::core::broker::sub::outbox();
         let frame_max = shared.config.frame_max as usize;
         Conn {
             shared,
@@ -492,7 +494,9 @@ impl Conn {
                     self.connection_close(out, FRAME_ERROR, "message larger than 512 MiB", 0, 0);
                     return Err(());
                 }
-                inc.body.reserve(inc.size as usize);
+                // Grown as the body arrives past this: a size a client claims
+                // is not allocated before its bytes are sent.
+                inc.body.reserve((inc.size as usize).min(1 << 20));
                 if inc.size == 0 {
                     self.message_complete(ch, out);
                 }
@@ -578,7 +582,7 @@ impl Conn {
                 let frame_max = self.shared.config.frame_max;
                 let heartbeat = self.shared.config.heartbeat;
                 codec::method(out, 0, 10, 30, |w| {
-                    w.u16(2047);
+                    w.u16(CHANNEL_MAX);
                     w.u32(frame_max);
                     w.u16(heartbeat);
                 });
@@ -628,6 +632,9 @@ impl Conn {
         let mut r = In::new(args);
         let broker = self.shared.broker.clone();
         if class == 20 && method == 10 {
+            if ch > CHANNEL_MAX {
+                return Err((CHANNEL_ERROR, format!("channel {ch} is above channel_max {CHANNEL_MAX}")));
+            }
             if self.channels.contains_key(&ch) {
                 return Err((CHANNEL_ERROR, format!("channel {ch} is already open")));
             }

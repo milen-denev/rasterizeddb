@@ -133,7 +133,11 @@ impl Segment {
         if let Some(f) = &self.file {
             return Ok(f.clone());
         }
-        let f = Arc::new(OpenOptions::new().read(true).write(true).create(true).truncate(false).open(self.path())?);
+        let path = self.path();
+        if !path.exists() {
+            super::announce_create(&path);
+        }
+        let f = Arc::new(OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?);
         self.file = Some(f.clone());
         Ok(f)
     }
@@ -294,7 +298,7 @@ pub fn open(dir: &Path, base: u64, scan_tail: bool) -> io::Result<Opened> {
             seg.path().display()
         );
         file.set_len(pos)?;
-        file.sync_data()?;
+        super::sync_file(&file)?;
     }
     seg.written = seg.len;
     // The index is rewritten from what was rebuilt, so the next open trusts
@@ -369,6 +373,8 @@ pub fn list(dir: &Path) -> io::Result<Vec<u64>> {
 
 /// Removes a segment's files.
 pub fn remove(dir: &Path, base: u64) {
-    let _ = std::fs::remove_file(dir.join(seg_name(base)));
-    let _ = std::fs::remove_file(dir.join(idx_name(base)));
+    for path in [dir.join(seg_name(base)), dir.join(idx_name(base))] {
+        super::announce_unlink(&path);
+        let _ = std::fs::remove_file(path);
+    }
 }

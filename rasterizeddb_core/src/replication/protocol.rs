@@ -138,6 +138,11 @@ pub const FLAG_KV: u8 = 1 << 2;
 /// as an apply error and moves on rather than misreading it.
 pub const KV_FORMAT_V1: u8 = 1;
 
+/// The first byte of a chunk of message-broker effects
+/// (`core::broker::repl`), carried in `FLAG_KV` records beside the key/value
+/// cache's chunks.
+pub const BROKER_FORMAT_V1: u8 = 0x42;
+
 #[derive(Debug)]
 pub enum ProtocolError {
     /// The first bytes were not a replication frame at all.

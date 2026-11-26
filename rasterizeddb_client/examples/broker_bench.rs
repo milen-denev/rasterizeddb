@@ -41,7 +41,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "memory" => Durability::Memory,
         _ => Durability::Async,
     };
-    let broker = Broker::connect(&addr, Options::password(&user, &pw)).await?;
+    let mut options = Options::password(&user, &pw);
+    if arg(&args, "tls", 0u8) == 1 {
+        // The server's own (self-signed) certificate: believed as it comes.
+        options = options.with_tls(rastcp::tls::Trust::AcceptAny);
+    }
+    let broker = Broker::connect(&addr, options).await?;
     let name = format!("bench-{}", std::process::id());
     let topic = broker
         .create_topic(&name, &TopicConfig { partitions, durability, ..Default::default() }, false)

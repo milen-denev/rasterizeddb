@@ -270,8 +270,13 @@ fn decode_batch(b: &[u8], max_bytes: usize) -> Result<(Vec<u8>, KafkaBatchInfo),
             &decompressed
         }
     };
+    // Every record takes at least 7 bytes once decompressed, so a count those
+    // bytes cannot hold is forged; checked before it sizes anything.
+    if info.count as usize > records.len() {
+        return Err(bad(2, "record count larger than the batch can hold"));
+    }
     let log_append = attributes & 0x8 != 0;
-    let mut builder = BatchBuilder::with_capacity(records.len() + 64 * info.count as usize + 64);
+    let mut builder = BatchBuilder::with_capacity((records.len() + 24 * (info.count as usize).min(records.len())).min(max_bytes) + 128);
     builder.set_limit(max_bytes);
     if info.producer_id >= 0 && info.base_sequence >= 0 {
         builder.set_producer((info.producer_id as u64).max(1), info.producer_epoch as u16, info.base_sequence as u32);

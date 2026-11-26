@@ -178,6 +178,12 @@ struct Shared {
 /// Serves the Kafka protocol until a listener fails.
 pub async fn serve(listeners: Listeners, database: rclite::Arc<Database>, config: KafkaConfig) -> io::Result<()> {
     let broker = database.broker.get().map_err(|e| io::Error::other(e.to_string()))?;
+    if matches!(config.auth, KafkaAuth::Sasl) && config.tls.is_none() && !listen::is_loopback(&config.addr) {
+        log::warn!(
+            "kafka: SASL PLAIN on {} without --kafka-tls on: passwords cross the network in the clear",
+            config.addr
+        );
+    }
     let port = config.advertised_port.or_else(|| listeners.tcp_port()).unwrap_or(9092);
     log::info!(
         "broker: Kafka protocol on {}:{} (advertised as {}:{port}, {})",

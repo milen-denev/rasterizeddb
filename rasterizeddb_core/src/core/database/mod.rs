@@ -2085,7 +2085,12 @@ impl Database {
                 handle
             },
             #[cfg(feature = "broker")]
-            broker: crate::core::broker::BrokerHandle::new((!in_memory).then_some(location), name),
+            broker: {
+                let handle = crate::core::broker::BrokerHandle::new((!in_memory).then_some(location), name);
+                // Its effects travel on this database's replication stream.
+                handle.attach_replication(replication.clone());
+                handle
+            },
         };
         database.open_partitioned_rows(partitioned_rows, &unfinished).await;
         drop(startup_forget_pause);

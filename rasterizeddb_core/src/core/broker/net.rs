@@ -21,7 +21,7 @@ use rasterizeddb_mq::wire::{
     QueueConfig, Reader, Subscribe, TopicConfig, Writer, op,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 use super::partition::Partition;
 use super::sub::Subscription;
@@ -64,6 +64,8 @@ impl std::fmt::Debug for NativeConfig {
 
 /// A frame before `AUTH` may be at most this big.
 const UNAUTH_FRAME: usize = 64 * 1024;
+/// The most a read buffer grows by at once for a frame still arriving.
+const RESERVE_STEP: usize = 8 << 20;
 /// Output past this is written mid-batch rather than buffered further.
 const FLUSH_AT: usize = 1 << 20;
 /// The most a single fetch returns.
@@ -168,8 +170,8 @@ pub(crate) struct Conn {
     user: String,
     subs: HashMap<u32, (Arc<Subscription>, u64)>,
     next_handle: u32,
-    push_tx: mpsc::UnboundedSender<Vec<u8>>,
-    push_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    push_tx: super::sub::Outbox,
+    push_rx: crate::core::broker::sub::OutboxRx,
     parked: Vec<Parked>,
 }
 
@@ -181,7 +183,7 @@ impl Conn {
         trust: bool,
     ) -> Result<Conn, BrokerError> {
         let broker = handle.get()?;
-        let (push_tx, push_rx) = mpsc::unbounded_channel();
+        let (push_tx, push_rx) = crate::core::broker::sub::outbox();
         Ok(Conn {
             database,
             broker,
@@ -243,13 +245,17 @@ impl Conn {
                 sock.write_all(&out).await?;
                 out.clear();
             }
-            // A frame larger than the buffer's room: make room for all of it.
+            // A frame larger than the buffer's room: make room for it, in steps,
+            // so a length a client claims is never allocated before its bytes
+            // arrive; and none past the unauthenticated limit before AUTH.
             if let Some(need) = wire::frame_need(&inbuf) {
-                if need > wire::MAX_FRAME {
+                let limit = if self.authed { wire::MAX_FRAME } else { UNAUTH_FRAME + wire::FRAME_HEADER };
+                if need > limit {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
                 }
                 if need > inbuf.capacity() {
-                    inbuf.reserve(need - inbuf.len());
+                    let step = (need - inbuf.len()).min(RESERVE_STEP);
+                    inbuf.reserve(step);
                 }
             }
             if inbuf.capacity() - inbuf.len() < 16 * 1024 {
