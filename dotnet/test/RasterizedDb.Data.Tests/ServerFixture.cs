@@ -80,13 +80,20 @@ public sealed class ServerFixture : IDisposable
 
         Directory.CreateDirectory(Path.Combine(directory, "db"));
         var socket = Path.Combine(directory, "s.sock");
-        var start = new ProcessStartInfo(ServerBinary!)
+        // Through a shell that watches this process: a test host that is killed (a closed pipe, a
+        // timeout) runs no Dispose, and the server and its directory would be left behind.
+        var start = new ProcessStartInfo("/bin/bash")
         {
             RedirectStandardOutput = true,
             RedirectStandardError = false,
             UseShellExecute = false,
         };
-        foreach (var argument in (string[])["--location", Path.Combine(directory, "db"), "--rdb-socket", socket, "--socket-mode", "600", "--log-level", "warn", .. arguments])
+        const string Watch =
+            "\"$@\" & server=$!; " +
+            "while kill -0 $PPID 2>/dev/null && kill -0 $server 2>/dev/null; do sleep 1; done; " +
+            "if kill -0 $server 2>/dev/null; then kill $server; wait $server; rm -rf \"$RDB_TEST_DIRECTORY\"; exit 0; fi; wait $server";
+        start.Environment["RDB_TEST_DIRECTORY"] = directory;
+        foreach (var argument in (string[])["-c", Watch, "server", ServerBinary!, "--location", Path.Combine(directory, "db"), "--rdb-socket", socket, "--socket-mode", "600", "--log-level", "warn", .. arguments])
         {
             start.ArgumentList.Add(argument);
         }

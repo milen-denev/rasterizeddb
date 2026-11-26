@@ -84,7 +84,9 @@ public class RasterizedDbDatabaseModelFactory : DatabaseModelFactory
 
     private static DatabaseModel Read(RasterizedDbConnection connection, DatabaseModelFactoryOptions options)
     {
-        var model = new DatabaseModel { DatabaseName = connection.Database, DefaultSchema = Schema };
+        // No schema on the model or its tables: the server has the one, and a scaffolded context that
+        // named it (HasDefaultSchema("public")) would qualify every table in every statement for nothing.
+        var model = new DatabaseModel { DatabaseName = connection.Database };
         var wanted = new HashSet<string>(options.Tables.Select(t => t[(t.LastIndexOf('.') + 1)..].Trim('"')), StringComparer.Ordinal);
         if (options.Schemas.Any() && !options.Schemas.Contains(Schema))
         {
@@ -110,7 +112,7 @@ public class RasterizedDbDatabaseModelFactory : DatabaseModelFactory
             }
 
             // A view scaffolds as a keyless entity over it.
-            var table = view ? new DatabaseView { Database = model, Name = name, Schema = Schema } : new DatabaseTable { Database = model, Name = name, Schema = Schema };
+            var table = view ? new DatabaseView { Database = model, Name = name } : new DatabaseTable { Database = model, Name = name };
             tables[name] = table;
             model.Tables.Add(table);
         }
