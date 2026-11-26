@@ -50,7 +50,7 @@ let db = Builder::open("./data")
 | Area | Methods |
 |---|---|
 | Memory | `low_memory` (a preset: 4 arenas, indexes on disk, 256 MiB a join), `malloc_arenas`, `idle_trim`, `tune_allocator`, `index_residency`, `index_cache_mb`, `index_delta_mb`, `join_memory_mb`, `batch_size`, `query_cache`, `query_cache_entries`, `kv_max_memory`, `kv_eviction` |
-| Durability | `synchronous_commit`, `wal_writer_delay`, `wal_checkpoint_bytes`, `wal_prealloc_kb`, `kv_persist`, `kv_save_interval` |
+| Durability | `synchronous_commit`, `wal_writer_delay`, `wal_checkpoint_bytes`, `wal_prealloc_kb`, `wal_truncate_damaged` (this start only), `kv_persist`, `kv_save_interval` |
 | Threads and CPU | `worker_threads`, `query_threads`, `simd`, `scan_prefilter` |
 | Storage | `index_storage`, `auto_compact`, `json_shadow_tables`, `settle_status`, `partition_open_budget`, `raise_descriptor_limit` |
 | Everything else | `config(key, value)`: any key `SHOW CONFIG KEYS` lists (`filter.*`, `auto_compact.*`, `index_snapshot.*`, `partition.*`, `query_stats.*`, `vacuum.enabled`, …) |

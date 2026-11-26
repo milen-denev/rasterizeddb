@@ -458,13 +458,17 @@ impl DecisionLog {
                 _ => {}
             }
         }
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(io)?;
         if whole < raw.len() {
             // The cut line is taken off: left there, the next line would
             // join it, and ended with a newline it would read as a decision.
-            file.set_len(whole as u64).map_err(io)?;
-            file.sync_all().map_err(io)?;
+            // Through a handle of its own opened for writing: an append-only
+            // handle may not truncate on Windows (no FILE_WRITE_DATA, so
+            // SetEndOfFile is "Access is denied").
+            let cut = std::fs::OpenOptions::new().write(true).open(&path).map_err(io)?;
+            cut.set_len(whole as u64).map_err(io)?;
+            cut.sync_all().map_err(io)?;
         }
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(io)?;
         if !existed {
             crate::core::sync_path::sync_dir(dir).map_err(io)?;
         }
