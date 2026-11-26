@@ -608,3 +608,102 @@ fn the_rows_a_limit_keeps_are_the_outer_item_s_to_decide() {
         assert_eq!(cut(&left, "a", "t", 1000), None, "{left}");
     }
 }
+
+/// The copy of the outer item made to carry an item's join key holds the
+/// columns the statement names, not every column: EF Core's related-items
+/// query read four columns of a table of 59, and typing and filling a copy
+/// of all of them, once an item, was a third of its time. The answers are
+/// the same, pruned or not.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_outer_copy_holds_the_columns_the_statement_names() {
+    use crate::core::rql::lateral::test_hooks::take_pruned_copies;
+    const ALIAS_PRN: &str = "oprn";
+    let db = db().await;
+    let mut s = session(&db);
+    let (wide, orders) = ("prn_wide", "prn_orders");
+    ok(&db, &mut s, &format!("CREATE TABLE {wide} (id INT NOT NULL PRIMARY KEY, name TEXT COLLATE rdb_ci, qty INT, note TEXT, price NUMERIC(10,2), seen TIMESTAMP, flag BOOLEAN)"))
+        .await;
+    ok(&db, &mut s, &format!("CREATE TABLE {orders} (id INT NOT NULL PRIMARY KEY, customer_id INT NOT NULL, amount INT)")).await;
+    let values: Vec<String> = (1..=40).map(|c| format!("({c}, 'Name{c}', {}, 'b{c}', {c}.25, '2026-01-01 00:00:00', {})", c * 2, c % 2 == 0)).collect();
+    ok(&db, &mut s, &format!("INSERT INTO {wide} (id, name, qty, note, price, seen, flag) VALUES {}", values.join(", "))).await;
+    let values: Vec<String> = (1..=120).map(|o| format!("({o}, {}, {})", o % 30 + 1, o % 7)).collect();
+    ok(&db, &mut s, &format!("INSERT INTO {orders} (id, customer_id, amount) VALUES {}", values.join(", "))).await;
+    let count = |c: i64| (1..=120).filter(|o| o % 30 + 1 == c).count() as i64;
+    let sum = |c: i64| -> Option<i64> {
+        let amounts: Vec<i64> = (1..=120).filter(|o| o % 30 + 1 == c).map(|o| o % 7).collect();
+        (!amounts.is_empty()).then(|| amounts.iter().sum())
+    };
+    let items = format!(
+        "(SELECT COUNT(*) FROM {orders} o WHERE o.customer_id = {ALIAS_PRN}.id) AS n, \
+         (SELECT SUM(o.amount) FROM {orders} o WHERE o.customer_id = {ALIAS_PRN}.id) AS total"
+    );
+    let cell = |v: i64| Some(v.to_string());
+    // Two columns named of seven: the first item's copy is made of those
+    // (and its key), and the second item's is a copy of that one, with
+    // nothing more to leave out.
+    let sql = format!("SELECT {ALIAS_PRN}.id, {ALIAS_PRN}.price, {items} FROM {wide} {ALIAS_PRN} WHERE {ALIAS_PRN}.id IN (5, 29, 35) ORDER BY {ALIAS_PRN}.id");
+    take_pruned_copies(ALIAS_PRN);
+    let got = pg_rows(&db, &mut s, &sql).await;
+    assert_eq!(take_pruned_copies(ALIAS_PRN), 1, "{sql}");
+    let want: Vec<Vec<Option<String>>> =
+        [5i64, 29, 35].iter().map(|c| vec![cell(*c), Some(format!("{c}.25")), cell(count(*c)), sum(*c).map(|v| v.to_string())]).collect();
+    assert_eq!(got, want, "{sql}");
+    assert_eq!(native_rows(&db, &sql).await, want, "{sql}");
+    take_pruned_copies(ALIAS_PRN);
+    // A column read only by the WHERE and the ORDER BY is kept for them,
+    // with its collation: 'NAME5' finds 'Name5', and the names sort.
+    let sql = format!(
+        "SELECT {ALIAS_PRN}.id, {items} FROM {wide} {ALIAS_PRN} WHERE {ALIAS_PRN}.name IN ('NAME5', 'name29', 'Name36') ORDER BY {ALIAS_PRN}.name DESC"
+    );
+    let got = pg_rows(&db, &mut s, &sql).await;
+    assert_eq!(take_pruned_copies(ALIAS_PRN), 1, "{sql}");
+    let want: Vec<Vec<Option<String>>> = [5i64, 36, 29].iter().map(|c| vec![cell(*c), cell(count(*c)), sum(*c).map(|v| v.to_string())]).collect();
+    assert_eq!(got, want, "{sql}");
+    // Every column named: nothing to leave out.
+    let sql = format!(
+        "SELECT {ALIAS_PRN}.id, {ALIAS_PRN}.name, {ALIAS_PRN}.qty, {ALIAS_PRN}.note, {ALIAS_PRN}.price, {ALIAS_PRN}.seen, {ALIAS_PRN}.flag, {items} FROM {wide} {ALIAS_PRN} \
+         WHERE {ALIAS_PRN}.id IN (5, 29) ORDER BY {ALIAS_PRN}.id"
+    );
+    let got = pg_rows(&db, &mut s, &sql).await;
+    assert_eq!(take_pruned_copies(ALIAS_PRN), 0, "{sql}");
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[1][..5], [cell(29), Some("Name29".to_string()), cell(58), Some("b29".to_string()), Some("29.25".to_string())], "{sql}");
+    assert_eq!(got[1][7..], [cell(count(29)), sum(29).map(|v| v.to_string())], "{sql}");
+}
+
+/// [`the_outer_copy_holds_the_columns_the_statement_names`], as text: what
+/// a copy keeps, and the statements whose copy is left whole because they
+/// could read a column without naming it.
+#[test]
+fn a_copy_is_pruned_to_the_columns_named() {
+    use crate::core::rql::lateral::pruned_copy_for_tests as pruned;
+    let copy = "SELECT \"id\", \"name\", \"note\", \"at\", CAST(d.\"__t7_at\" AS smallint) AS \"__t7_at\", d.id::text AS __j0 FROM t d";
+    let after = " LEFT JOIN k __cs0 ON __cs0.__lat_k1 = d.__j0 LEFT JOIN LATERAL (SELECT count(*) AS __v FROM u WHERE u.k = d.id) __cs1 ON true WHERE d.id > 3";
+    // The key stays whatever names it; `note` and the time column go.
+    assert_eq!(
+        pruned(copy, "d", "SELECT d.id, d.Name * 2, __cs0.__v FROM ", after).as_deref(),
+        Some("SELECT \"id\", \"name\", d.id::text AS __j0 FROM t d")
+    );
+    // A time column named keeps its hidden digit only when that is named.
+    assert_eq!(
+        pruned(copy, "d", "SELECT \"d\".\"at\", __rdb_t7_text(d.at, d.__t7_at) FROM ", after).as_deref(),
+        Some("SELECT \"id\", \"at\", CAST(d.\"__t7_at\" AS smallint) AS \"__t7_at\", d.id::text AS __j0 FROM t d")
+    );
+    // Every column named: as it is.
+    assert_eq!(pruned(copy, "d", "SELECT d.id, d.name, d.note, d.at, d.__t7_at FROM ", after), None);
+    for before in [
+        // A star that could be the item's, the item whole, a NATURAL join.
+        "SELECT d.*, __cs0.__v FROM ",
+        "SELECT *, __cs0.__v FROM ",
+        "SELECT DISTINCT * FROM ",
+        "SELECT d.id, to_json(d) FROM ",
+        "SELECT d.id, (SELECT x.* FROM x NATURAL JOIN y) FROM ",
+        "SELECT d.id, (SELECT 1 FROM x d WHERE true) FROM ",
+    ] {
+        assert_eq!(pruned(copy, "d", before, after), None, "{before}");
+    }
+    // Another item's star, a string's and a multiplication are not the
+    // item's.
+    assert!(pruned(copy, "d", "SELECT d.id, x.*, 'a * b', d.id * 2 FROM ", after).is_some());
+}
+

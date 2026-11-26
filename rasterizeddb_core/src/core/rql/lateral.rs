@@ -1217,7 +1217,16 @@ pub(crate) async fn materialize(
                 if !limited {
                     if let Some(cut) = limited_outer(&current, alias, relation, tuples.len()) {
                         limited = true;
-                        let body = crate::core::rql::cte::whole_rows_with_hidden(&cut.body, database).unwrap_or(cut.body);
+                        // The columns the statement goes on to read, where
+                        // that can be told; whole rows otherwise.
+                        // (Without the alias the copy is given, which is
+                        // not a read of it.)
+                        let after = cut.after.trim_start();
+                        let outside = format!("{} {}", cut.before, after.strip_prefix(cut.written.as_str()).unwrap_or(after));
+                        let body = match needed_columns(relation, alias, &outside, database) {
+                            Some(list) => cut.body.replacen(&format!("SELECT {}.*", cut.written), &format!("SELECT {list}"), 1),
+                            None => crate::core::rql::cte::whole_rows_with_hidden(&cut.body, database).unwrap_or(cut.body),
+                        };
                         let built = crate::core::rql::cte::materialize_query(&body, alias, &current, database, tx).await?;
                         temps.push(built.clone());
                         #[cfg(test)]
@@ -1351,8 +1360,21 @@ pub(crate) async fn materialize(
                     // ran with. Every row was copied: with one product in
                     // four kept of 10,900 (59 columns each) the copy was
                     // 4.7 s an item, where the probe took 29 ms.
+                    // And only the columns the statement reads: a table of
+                    // 59 columns was copied whole to answer four of them,
+                    // once an item, and typing and filling that copy was a
+                    // third of the statement's time.
+                    let copy = copies_only(&inner, &derived, alias);
+                    let inner = match copy.then(|| pruned_copy(&inner, alias, &current[..start], &current[end..])).flatten() {
+                        Some(pruned) => {
+                            #[cfg(test)]
+                            test_hooks::record_pruned_copy(alias);
+                            pruned
+                        }
+                        None => inner,
+                    };
                     let inner = match &pushed {
-                        Some(filter) if copies_only(&inner, &derived, alias) => {
+                        Some(filter) if copy => {
                             #[cfg(test)]
                             test_hooks::record_narrowed_copy(alias);
                             format!("{inner} WHERE {filter}")
@@ -1373,7 +1395,10 @@ pub(crate) async fn materialize(
 /// query of those rows, and the statement around the relation they are
 /// copied to (`before`, the relation's name, `after`).
 struct LimitedOuter {
+    /// `SELECT <written>.* FROM …`.
     body: String,
+    /// The outer item's alias as the statement spells it.
+    written: String,
     before: String,
     after: String,
 }
@@ -1539,7 +1564,176 @@ fn limited_outer(sql: &str, alias: &str, relation: &str, tuples: usize) -> Optio
         after.push(' ');
         after.push_str(order);
     }
-    Some(LimitedOuter { body, before: sql[..head_at].to_string(), after })
+    Some(LimitedOuter { body, written: written.to_string(), before: sql[..head_at].to_string(), after })
+}
+
+/// Whether `text` (a statement, or the parts of one) could read a column of
+/// the item `alias` without naming it: a `*`, the item named whole (`alias`
+/// not followed by `.`: a whole-row reference, or a second item of the same
+/// name), or a `NATURAL` join, whose columns are not written. A string
+/// holding one of them reads as it would outside: said to be so, a column is
+/// kept that was not needed, never dropped that was.
+fn may_read_unnamed(text: &str, alias: &str) -> bool {
+    // (At any depth: a subquery's NATURAL join may be to the item.)
+    if star_reads(text, alias) || names_word(text, "NATURAL") {
+        return true;
+    }
+    let (bytes, name) = (text.as_bytes(), alias.as_bytes());
+    if name.is_empty() {
+        return true;
+    }
+    let mut at = 0usize;
+    while at + name.len() <= bytes.len() {
+        let here = bytes[at..at + name.len()].eq_ignore_ascii_case(name)
+            && (at == 0 || !(is_word(bytes[at - 1]) || bytes[at - 1] >= 0x80))
+            && bytes.get(at + name.len()).is_none_or(|b| !(is_word(*b) || *b >= 0x80));
+        if here {
+            // `alias.`, `"alias".`: a column of it. Anything else names it
+            // whole.
+            let mut next = at + name.len();
+            if bytes.get(next) == Some(&b'"') {
+                next += 1;
+            }
+            if bytes.get(next) != Some(&b'.') {
+                return true;
+            }
+            at = next;
+        } else {
+            at += 1;
+        }
+    }
+    false
+}
+
+/// Whether a `*` of `text` could stand for columns of `alias`: `alias.*`,
+/// or a bare `*` in a select list (after `SELECT`, `DISTINCT`, `ALL` or a
+/// comma), wherever it is. Not `count(*)`, another item's `x.*`, or a
+/// multiplication; anything this cannot tell apart is said to be one.
+fn star_reads(text: &str, alias: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            q @ (b'\'' | b'"') => {
+                at = crate::core::sql_scan::quoted_end(bytes, at, q);
+                continue;
+            }
+            b'*' => {
+                let before = text[..at].trim_end();
+                let after = text[at + 1..].trim_start();
+                let last = before.as_bytes().last().copied();
+                match last {
+                    Some(b'(') if after.starts_with(')') => {}
+                    Some(b'.') => {
+                        let qualifier = before[..before.len() - 1].trim_end();
+                        let start = qualifier
+                            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '"' || !c.is_ascii()))
+                            .map_or(0, |p| p + 1);
+                        if same_name(&qualifier[start..], alias) || qualifier[start..].is_empty() {
+                            return true;
+                        }
+                    }
+                    Some(b) if is_word(b) => {
+                        let start = before.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |p| p + 1);
+                        if ["SELECT", "DISTINCT", "ALL"].iter().any(|w| before[start..].eq_ignore_ascii_case(w)) {
+                            return true;
+                        }
+                    }
+                    // An operand before it: a multiplication.
+                    Some(b')' | b'\'' | b'"') => {}
+                    _ => return true,
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    false
+}
+
+/// Whether `text` holds `name` as a word, in any case: a column the text
+/// may read. A name that is not a plain word is looked for as it is.
+fn names_word(text: &str, name: &str) -> bool {
+    let (bytes, word) = (text.as_bytes(), name.as_bytes());
+    if word.is_empty() || !word.iter().all(|b| is_word(*b)) {
+        return text.contains(name);
+    }
+    let mut at = 0usize;
+    while at + word.len() <= bytes.len() {
+        if bytes[at..at + word.len()].eq_ignore_ascii_case(word)
+            && (at == 0 || !is_word(bytes[at - 1]))
+            && bytes.get(at + word.len()).is_none_or(|b| !is_word(*b))
+        {
+            return true;
+        }
+        at += 1;
+    }
+    false
+}
+
+/// The select list of a copy of `relation` (the outer item `alias`) holding
+/// only the columns `outside`, the statement around it, names: each as
+/// `alias."column"`, a hidden one the copy carries read as a value
+/// (`cte::carried_hidden_columns`). `None` when the statement could read a
+/// column without naming it ([`may_read_unnamed`]), the relation is not
+/// known, or it names every column.
+fn needed_columns(relation: &str, alias: &str, outside: &str, database: &Arc<Database>) -> Option<String> {
+    if may_read_unnamed(outside, alias) {
+        return None;
+    }
+    let all = crate::core::rql::cte::relation_labels_carried(relation, database)?;
+    let quoted = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    let kept: Vec<String> = all
+        .iter()
+        .filter(|c| names_word(outside, c))
+        .map(|c| {
+            if crate::core::rql::nullable::is_hidden(c) {
+                format!("CAST({}.{} AS smallint) AS {}", quoted(alias), quoted(c), quoted(c))
+            } else {
+                format!("{}.{}", quoted(alias), quoted(c))
+            }
+        })
+        .collect();
+    (!kept.is_empty() && kept.len() < all.len()).then(|| kept.join(", "))
+}
+
+/// `inner`, the copy `join_on` makes of the outer item `alias` to carry a
+/// join key ([`copies_only`]), without the columns the statement around it
+/// (`before`, `after`) does not name: its plain columns (`"c"`) and the
+/// hidden ones it carries (`CAST(… AS smallint) AS "__t7_c"`). The key and
+/// anything else stays. `None` when nothing can be left out
+/// ([`may_read_unnamed`]) or nothing is.
+fn pruned_copy(inner: &str, alias: &str, before: &str, after: &str) -> Option<String> {
+    let outside = format!("{before} {after}");
+    if may_read_unnamed(&outside, alias) {
+        return None;
+    }
+    let from = find_keyword(inner, "FROM", 0)?;
+    let lead = inner.len() - inner.trim_start().len();
+    if !word_at(inner, lead, "SELECT") {
+        return None;
+    }
+    let list = &inner[lead + "SELECT".len()..from];
+    let items = crate::core::sql_scan::split_top_level(list, b',');
+    let plain = |item: &str| -> Option<String> {
+        let name = item.strip_prefix('"')?.strip_suffix('"')?;
+        (!name.contains('"')).then(|| name.to_string())
+    };
+    let carried = |item: &str| -> Option<String> {
+        let rest = item.strip_prefix("CAST(")?;
+        let (_, name) = rest.rsplit_once(" AS smallint) AS ")?;
+        let name = plain(name.trim())?;
+        crate::core::rql::nullable::is_hidden(&name).then_some(name)
+    };
+    let kept: Vec<&str> = items
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| match plain(item).or_else(|| carried(item)) {
+            Some(name) => names_word(&outside, &name),
+            None => true,
+        })
+        .collect();
+    (kept.len() < items.len() && !kept.is_empty()).then(|| format!("{}SELECT {} {}", &inner[..lead], kept.join(", "), &inner[from..]))
 }
 
 /// Whether `inner` (a derived table's body, aliased `derived`) is the plain
@@ -1659,6 +1853,12 @@ fn conjuncts(clause: &str) -> Vec<String> {
 #[cfg(test)]
 pub(crate) fn limited_outer_for_tests(sql: &str, alias: &str, relation: &str, tuples: usize) -> Option<(String, String)> {
     limited_outer(sql, alias, relation, tuples).map(|cut| (cut.body, format!("{}<copy>{}", cut.before, cut.after)))
+}
+
+/// [`pruned_copy`] for tests.
+#[cfg(test)]
+pub(crate) fn pruned_copy_for_tests(inner: &str, alias: &str, before: &str, after: &str) -> Option<String> {
+    pruned_copy(inner, alias, before, after)
 }
 
 #[cfg(test)]
@@ -2116,6 +2316,19 @@ pub(crate) mod test_hooks {
     /// The cuts recorded for `alias`, forgotten.
     pub(crate) fn take_limited(alias: &str) -> usize {
         LIMITED.lock().unwrap().as_mut().and_then(|m| m.remove(alias)).unwrap_or(0)
+    }
+
+    /// The outer-item copies made of the columns the statement names only
+    /// (`pruned_copy`), by alias.
+    static PRUNED: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+    pub(crate) fn record_pruned_copy(alias: &str) {
+        *PRUNED.lock().unwrap().get_or_insert_with(HashMap::new).entry(alias.to_string()).or_default() += 1;
+    }
+
+    /// The pruned copies recorded for `alias`, forgotten.
+    pub(crate) fn take_pruned_copies(alias: &str) -> usize {
+        PRUNED.lock().unwrap().as_mut().and_then(|m| m.remove(alias)).unwrap_or(0)
     }
 
     pub(crate) fn record_runs(relation: &str, runs: usize) {
