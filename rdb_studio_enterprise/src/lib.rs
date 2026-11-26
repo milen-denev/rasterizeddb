@@ -442,12 +442,27 @@ impl LedgerPage {
             }
             // Another type: its size boxes start empty (their placeholders
             // show the usual values).
+            // Another type: its size boxes start at the type's usual size
+            // (`TYPE\u{1}len` or `TYPE\u{1}precision\u{1}scale`), which the
+            // statement then carries, and can be edited or cleared.
             k if k.starts_with("new:ledger:col:") && k.ends_with(":type") => {
                 let row = k.trim_end_matches(":type").to_string();
                 for f in ["len", "prec", "scale"] {
                     self.inputs.remove(&format!("{row}:{f}"));
                 }
-                self.inputs.insert(key, value);
+                let mut parts = value.split('\u{1}');
+                let ty = parts.next().unwrap_or("").to_string();
+                match (parts.next(), parts.next()) {
+                    (Some(l), None) => {
+                        self.inputs.insert(format!("{row}:len"), l.to_string());
+                    }
+                    (Some(p), Some(sc)) => {
+                        self.inputs.insert(format!("{row}:prec"), p.to_string());
+                        self.inputs.insert(format!("{row}:scale"), sc.to_string());
+                    }
+                    _ => {}
+                }
+                self.inputs.insert(key, ty);
             }
             _ => {
                 self.inputs.insert(key, value);
@@ -1231,14 +1246,28 @@ fn create_ledger_form<'a, M: Clone + 'a, K: Kit<'a, M>>(k: &K, a: &Actions<M>, p
         let name_key = key("name");
         let name = k.field(String::new(), "e.g. amount", page.inputs.get(&name_key).map(String::as_str).unwrap_or(""), false, 180.0, Box::new(move |v| input(name_key.clone(), v)));
         let type_key = key("type");
-        let pick = k.pick(String::new(), names.clone(), (!ty.is_empty()).then(|| ty.clone()), 200.0, Box::new(move |v| input(type_key.clone(), v)));
+        let sized: Vec<(String, TypeParams)> = types.iter().map(|t| (t.name.clone(), t.params)).collect();
+        let pick = k.pick(
+            String::new(),
+            names.clone(),
+            (!ty.is_empty()).then(|| ty.clone()),
+            200.0,
+            Box::new(move |v| {
+                let with_size = match sized.iter().find(|(n, _)| *n == v).map(|(_, p)| *p) {
+                    Some(TypeParams::Length(l)) => format!("{v}\u{1}{l}"),
+                    Some(TypeParams::PrecisionScale(p, s)) => format!("{v}\u{1}{p}\u{1}{s}"),
+                    _ => v,
+                };
+                input(type_key.clone(), with_size)
+            }),
+        );
         let small = |f: &str, hint: String| {
             let fk = key(f);
             k.field(String::new(), &hint, page.inputs.get(&fk).map(String::as_str).unwrap_or(""), false, 70.0, Box::new(move |v| input(fk.clone(), v)))
         };
         let size: Element<'a, M> = match chosen.map(|t| t.params) {
-            Some(TypeParams::Length(l)) => row![small("len", format!("{l}"))].into(),
-            Some(TypeParams::PrecisionScale(p, sc)) => row![small("prec", format!("p {p}")), small("scale", format!("s {sc}"))].spacing(4).into(),
+            Some(TypeParams::Length(_)) => row![small("len", "none".to_string())].into(),
+            Some(TypeParams::PrecisionScale(..)) => row![small("prec", "prec.".to_string()), small("scale", "scale".to_string())].spacing(4).into(),
             _ => k.text("—".into(), Tone::Faint),
         };
         let nn_key = key("notnull");
@@ -1854,6 +1883,12 @@ mod tests {
         assert!(p.create_ledger_sql().unwrap().contains("(amount NUMERIC(12, 2), memo VARCHAR(80))"), "{:?}", p.create_ledger_sql());
         p.input("new:ledger:col:1:type".into(), "TEXT".into());
         assert!(p.create_ledger_sql().unwrap().contains("memo TEXT)"), "a new type drops the old size");
+        // Picking a sized type fills in its usual size, which the statement carries.
+        p.input("new:ledger:col:1:type".into(), "VARCHAR\u{1}255".into());
+        assert!(p.create_ledger_sql().unwrap().contains("memo VARCHAR(255))"), "{:?}", p.create_ledger_sql());
+        p.input("new:ledger:col:0:type".into(), "NUMERIC\u{1}12\u{1}2".into());
+        assert!(p.create_ledger_sql().unwrap().contains("(amount NUMERIC(12, 2), memo VARCHAR(255))"), "{:?}", p.create_ledger_sql());
+        assert_eq!(p.get("new:ledger:col:0:type"), "NUMERIC");
         p.input("new:ledger:col:0:type".into(), "INT); DROP TABLE x; --".into());
         assert!(p.create_ledger_sql().is_err());
         assert_eq!(date_problem("2027-06-31").unwrap(), "2027-06-31 has no day 31.");
