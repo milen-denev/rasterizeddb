@@ -2496,3 +2496,202 @@ impl Default for BranchForm {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Broker
+// ---------------------------------------------------------------------------
+
+/// One row of `BROKER SHOW TOPICS` (queues are topics too, `queue` set).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrokerTopic {
+    pub name: String,
+    pub partitions: u64,
+    pub durability: String,
+    pub queue: bool,
+    pub messages: u64,
+    pub bytes: u64,
+    /// 0: kept until a size retention or forever.
+    pub retention_ms: u64,
+}
+
+/// One row of `BROKER SHOW QUEUES`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrokerQueue {
+    pub name: String,
+    pub messages: u64,
+    pub ready: u64,
+    pub unacked: u64,
+    pub consumers: u64,
+}
+
+/// One row of `BROKER SHOW SUBSCRIPTIONS`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrokerSubscription {
+    pub topic: String,
+    pub name: String,
+    pub mode: String,
+    pub members: u64,
+    pub backlog: u64,
+    pub inflight: u64,
+    pub delivered: u64,
+    pub acked: u64,
+    pub dead: u64,
+}
+
+/// One row of `BROKER SHOW EXCHANGES`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrokerExchange {
+    pub name: String,
+    pub kind: String,
+    pub durable: bool,
+    pub bindings: u64,
+}
+
+/// One row of `BROKER SHOW BINDINGS`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrokerBinding {
+    pub exchange: String,
+    pub topic: String,
+    pub key: String,
+}
+
+/// Everything the broker page reads.
+#[derive(Debug, Clone, Default)]
+pub struct BrokerSnapshot {
+    /// Whether the server answered `BROKER SHOW TOPICS` at all: a server
+    /// without the broker (or a PostgreSQL one) refuses it.
+    pub supported: bool,
+    /// Why it was refused, shown on the page.
+    pub refusal: String,
+    pub topics: Vec<BrokerTopic>,
+    pub queues: Vec<BrokerQueue>,
+    pub subscriptions: Vec<BrokerSubscription>,
+    pub exchanges: Vec<BrokerExchange>,
+    pub bindings: Vec<BrokerBinding>,
+}
+
+/// What the create form makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BrokerCreateKind {
+    #[default]
+    Topic,
+    Queue,
+    Exchange,
+    Subscription,
+    Binding,
+}
+
+impl BrokerCreateKind {
+    pub const ALL: [BrokerCreateKind; 5] = [
+        BrokerCreateKind::Topic,
+        BrokerCreateKind::Queue,
+        BrokerCreateKind::Exchange,
+        BrokerCreateKind::Subscription,
+        BrokerCreateKind::Binding,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BrokerCreateKind::Topic => "TOPIC",
+            BrokerCreateKind::Queue => "QUEUE",
+            BrokerCreateKind::Exchange => "EXCHANGE",
+            BrokerCreateKind::Subscription => "SUBSCRIPTION",
+            BrokerCreateKind::Binding => "BINDING",
+        }
+    }
+}
+
+/// The create form. Empty fields are left out of the statement, so the
+/// server's defaults apply.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrokerForm {
+    pub kind: BrokerCreateKind,
+    /// The topic, queue, exchange or subscription name; a binding's exchange.
+    pub name: String,
+    /// A topic's partition count.
+    pub partitions: String,
+    /// `sync`, `async` or `memory` (topic, queue).
+    pub durability: String,
+    /// A topic's retention (`7d`, `12h`) or a queue's message TTL.
+    pub retention: String,
+    /// A topic's retention by size (`10GB`).
+    pub retention_bytes: String,
+    /// Queue, subscription: redeliveries before the dead letter.
+    pub max_deliveries: String,
+    /// Queue, subscription: where a message goes after `max_deliveries`.
+    pub dead_letter: String,
+    /// Queue, subscription: how long a delivery waits for its ack (`30s`).
+    pub ack_timeout: String,
+    /// An exchange's type: direct, fanout, topic or headers.
+    pub exchange_type: String,
+    /// A subscription's topic; a binding's topic or queue.
+    pub target: String,
+    /// A subscription's mode: ordered or shared.
+    pub mode: String,
+    /// A subscription's start: EARLIEST, LATEST or an offset.
+    pub from: String,
+    /// A binding's key.
+    pub key: String,
+}
+
+impl Default for BrokerForm {
+    fn default() -> Self {
+        Self {
+            kind: BrokerCreateKind::Topic,
+            name: String::new(),
+            partitions: String::new(),
+            durability: String::new(),
+            retention: String::new(),
+            retention_bytes: String::new(),
+            max_deliveries: String::new(),
+            dead_letter: String::new(),
+            ack_timeout: String::new(),
+            exchange_type: "direct".to_string(),
+            target: String::new(),
+            mode: "shared".to_string(),
+            from: String::new(),
+            key: String::new(),
+        }
+    }
+}
+
+/// The publish form: to a topic or queue, or through an exchange with a
+/// routing key.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrokerPublishForm {
+    /// A topic or queue; with `routing_key` set, an exchange.
+    pub target: String,
+    pub via_exchange: bool,
+    pub routing_key: String,
+    pub value: String,
+    /// The record's key (topics: picks the partition).
+    pub key: String,
+    pub header_name: String,
+    pub header_value: String,
+}
+
+/// What the message panel shows: a topic's records, a queue's popped
+/// messages, or a topic's partitions.
+#[derive(Debug, Clone)]
+pub struct BrokerBrowse {
+    pub title: String,
+    pub statement: String,
+    /// `None` while it loads.
+    pub result: Option<Result<Grid, String>>,
+}
+
+/// The read controls of the message panel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrokerReadForm {
+    /// Empty: every partition.
+    pub partition: String,
+    /// EARLIEST, LATEST, or an offset.
+    pub from: String,
+    pub limit: String,
+}
+
+impl Default for BrokerReadForm {
+    fn default() -> Self {
+        Self { partition: String::new(), from: "EARLIEST".to_string(), limit: "100".to_string() }
+    }
+}

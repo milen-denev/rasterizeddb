@@ -914,6 +914,21 @@ fn apply_to_lateral(tokens: Vec<Token>) -> Result<Vec<Token>, TsqlError> {
         let t = &tokens[i];
         let outer = t.is_word("OUTER");
         if (outer || t.is_word("CROSS")) && kw(&tokens, i + 1, "APPLY") {
+            // An OPENJSON already read into its rows (`openjson::pass`): a
+            // relation with its alias, which reads nothing of the row beside
+            // it, so the APPLY is a plain join.
+            if tokens.get(i + 2).is_some_and(|p| matches!(&p.tok, Tok::Raw(r) if r.starts_with("(VALUES ") || r.starts_with("(SELECT * FROM (VALUES "))) {
+                let mut first = Token::word(if outer { "LEFT" } else { "CROSS" });
+                first.space = t.space;
+                out.push(first);
+                out.push(Token::word("JOIN"));
+                out.push(tokens[i + 2].clone());
+                if outer {
+                    out.push(Token::raw("ON 1 = 1"));
+                }
+                i += 3;
+                continue;
+            }
             if !tokens.get(i + 2).is_some_and(|p| p.is_op("(")) {
                 return Err(TsqlError::unsupported("APPLY of a table-valued function"));
             }
@@ -994,6 +1009,7 @@ fn bit_not_as_comparison(tokens: Vec<Token>) -> Vec<Token> {
 }
 
 pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>, TsqlError> {
+    let tokens = super::openjson::pass(tokens, cx.env)?;
     let tokens = bit_not_as_comparison(apply_to_lateral(tokens)?);
     let mut out: Vec<Token> = Vec::with_capacity(tokens.len() + 4);
     let mut i = 0usize;
@@ -1253,7 +1269,7 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
     Ok(out)
 }
 
-fn is_clause_word(t: &Token) -> bool {
+pub(crate) fn is_clause_word(t: &Token) -> bool {
     t.upper().is_some_and(|w| {
         matches!(
             w.as_str(),
@@ -6464,6 +6480,14 @@ fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, T
         });
     }
     let head = tokens.first().and_then(|t| t.upper()).unwrap_or_default();
+    // An OPENJSON is read into the statement before anything looks at its
+    // FROM list (`openjson`). Not in a definition, whose body is translated
+    // when it runs, with its parameters.
+    let tokens = if matches!(head.as_str(), "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "WITH") {
+        super::openjson::pass(tokens, cx.env)?
+    } else {
+        tokens
+    };
     match head.as_str() {
         "SELECT" => {
             // SELECT … INTO t FROM …
@@ -7149,5 +7173,42 @@ mod tests {
         // Not inside a subquery or a derived table, whose names the outer
         // query reads.
         assert!(!tr_named(&e, "SELECT x.n FROM (SELECT COUNT(*) AS n FROM t) AS x WHERE EXISTS (SELECT 1 FROM u)").contains("?column?"));
+    }
+    #[test]
+    fn openjson_is_read_into_the_statement() {
+        let e = env();
+        // EF Core's `list.Contains(x)`: the list itself.
+        assert_eq!(
+            tr(&e, "SELECT [d].[Id] FROM [dbo].[D] AS [d] WHERE [d].[Id] IN (SELECT [p].[value] FROM OPENJSON(N'[3, 1, null]') WITH ([value] int '$') AS [p])"),
+            "SELECT d.id AS \"Id\" FROM d AS d WHERE d.id IN (3, 1, NULL)"
+        );
+        assert_eq!(
+            tr(&e, "SELECT [d].[Id] FROM [D] AS [d] WHERE [d].[K] IN (SELECT [p].[value] FROM OPENJSON(N'[\"6f9619ff-8b86-d011-b42d-00c04fc964ff\"]') WITH ([value] uniqueidentifier '$') AS [p])"),
+            "SELECT d.id AS \"Id\" FROM d AS d WHERE d.k IN ('6f9619ff-8b86-d011-b42d-00c04fc964ff')"
+        );
+        // No rows is no list: the relation, empty.
+        assert_eq!(
+            tr(&e, "SELECT [d].[Id] FROM [D] AS [d] WHERE [d].[Id] NOT IN (SELECT [p].[value] FROM OPENJSON(N'[]') WITH ([value] int '$') AS [p])"),
+            "SELECT d.id AS \"Id\" FROM d AS d WHERE d.id NOT IN (SELECT p.value FROM (SELECT * FROM (VALUES (CAST(NULL AS integer))) AS openjson_none(value) WHERE 1 = 0) AS p)"
+        );
+        // The bare form: key, value, type.
+        assert_eq!(
+            tr(&e, "SELECT [p].[key], [p].[value] FROM OPENJSON(N'[\"a\", 2, null, true]') AS [p]"),
+            "SELECT p.key, p.value FROM (VALUES (CAST('0' AS text), CAST('a' AS text), CAST(1 AS integer)), (CAST('1' AS text), CAST('2' AS text), CAST(2 AS integer)), (CAST('2' AS text), CAST(NULL AS text), CAST(0 AS integer)), (CAST('3' AS text), CAST('true' AS text), CAST(3 AS integer))) AS p(key, value, type)"
+        );
+        // Columns by path, an object as its text, and a path into the document.
+        assert_eq!(
+            tr(&e, "SELECT o.a, o.t, o.j FROM OPENJSON(N'{\"rows\": [{\"a\": 1, \"b\": {\"t\": \"x\"}, \"j\": [1]}, {\"a\": true}]}', '$.rows') WITH (a tinyint, t nvarchar(10) '$.b.t', j nvarchar(max) AS JSON) o"),
+            "SELECT o.a, o.t, o.j FROM (VALUES (CAST(1 AS utinyint), CAST('x' AS varchar(10)), CAST('[1]' AS text)), (CAST(1 AS utinyint), CAST(NULL AS varchar(10)), CAST(NULL AS text))) AS o(a, t, j)"
+        );
+        // Beside a table: a plain join, since it reads nothing of the row.
+        assert_eq!(
+            tr(&e, "SELECT t.a, o.value FROM t CROSS APPLY OPENJSON('[1]') WITH (value int '$') AS o"),
+            "SELECT t.a, o.value FROM t CROSS JOIN (VALUES (CAST(1 AS integer))) AS o(value)"
+        );
+        // JSON that is not, and JSON read from a row.
+        let fails = |sql: &str| translate(sql, lex(sql).unwrap(), &e).unwrap_err().number;
+        assert_eq!(fails("SELECT * FROM OPENJSON('[1,') AS o"), 13609);
+        assert_eq!(fails("SELECT * FROM t CROSS APPLY OPENJSON(t.j) AS o"), 40000);
     }
 }
