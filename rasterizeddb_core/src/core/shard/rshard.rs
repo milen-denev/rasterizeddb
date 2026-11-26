@@ -313,11 +313,11 @@ async fn handle(conn: &Conn, data: &[u8]) -> Response {
             }
             open_session(conn, session, &database, &role, params).await
         }
-        Request::Pg { session, map_epoch, bytes } => {
+        Request::Pg { session, map_epoch, bytes, routed } => {
             if let Some(r) = epoch_refusal(map_epoch, served.map.epoch()) {
                 return r;
             }
-            pg(conn, session, &bytes).await
+            pg(conn, session, &bytes, routed).await
         }
         Request::Coordinate { session, map_epoch, partials, bytes } => {
             if let Some(r) = epoch_refusal(map_epoch, served.map.epoch()) {
@@ -326,6 +326,7 @@ async fn handle(conn: &Conn, data: &[u8]) -> Response {
             coordinate_given(conn, session, partials, &bytes).await
         }
         Request::Continue { session } => continue_reply(conn, session).await,
+        Request::ResetSession { session } => reset_session(conn, session).await,
         Request::CloseSession { session } => {
             let gone = conn.sessions.lock().unwrap().remove(&session);
             if let Some(s) = gone
@@ -373,6 +374,10 @@ async fn handle(conn: &Conn, data: &[u8]) -> Response {
             commit_hold::release(conn as *const Conn as usize);
             Response::Done
         }
+        Request::Forget { gid } => match forget(&gid) {
+            Ok(()) => Response::Done,
+            Err(e) => refuse(*b"58030", false, e),
+        },
         Request::Decision { gid } => match decision(&gid) {
             Ok(commit) => Response::Decided { commit },
             Err(e) => refuse(*b"58030", true, e),
@@ -409,22 +414,143 @@ fn epoch_refusal(theirs: u64, mine: u64) -> Option<Response> {
 /// recorded for a gid is the decision; a later contrary one is refused.
 const DECISIONS: &str = "rdb_2pc_decisions";
 
-pub(crate) fn decision(gid: &str) -> Result<Option<bool>, String> {
-    let dir = super::ownership::data_dir().ok_or("this shard has no data directory")?;
-    let path = dir.join(DECISIONS);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
-    for line in text.lines() {
-        if let Some((verb, g)) = line.split_once(' ')
-            && g == gid
-        {
-            return Ok(Some(verb == "commit"));
+/// The decision log in memory: every decision not yet forgotten, and the
+/// file they are appended to. Read from the file once, so a decision costs
+/// one append and one sync, however many came before it.
+struct DecisionLog {
+    known: HashMap<String, bool>,
+    file: std::fs::File,
+    /// Lines in the file, the forgotten ones included: what a compaction
+    /// is decided by.
+    lines: usize,
+}
+
+static DECISION_LOG: std::sync::Mutex<Option<DecisionLog>> = std::sync::Mutex::new(None);
+
+impl DecisionLog {
+    fn open(dir: &std::path::Path) -> Result<DecisionLog, String> {
+        let path = dir.join(DECISIONS);
+        let io = |e: std::io::Error| format!("{}: {e}", path.display());
+        let (raw, existed) = match std::fs::read(&path) {
+            Ok(t) => (t, true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), false),
+            Err(e) => return Err(io(e)),
+        };
+        // Only whole lines count: one cut short by a crash was never
+        // synced, so never answered.
+        let whole = raw.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let text = String::from_utf8_lossy(&raw[..whole]);
+        let mut known = HashMap::new();
+        let mut lines = 0;
+        for line in text.lines() {
+            lines += 1;
+            match line.split_once(' ') {
+                // The first decision recorded for a gid is the decision.
+                Some(("commit", g)) => {
+                    known.entry(g.to_string()).or_insert(true);
+                }
+                Some(("abort", g)) => {
+                    known.entry(g.to_string()).or_insert(false);
+                }
+                Some(("forget", g)) => {
+                    known.remove(g);
+                }
+                _ => {}
+            }
         }
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(io)?;
+        if whole < raw.len() {
+            // The cut line is taken off: left there, the next line would
+            // join it, and ended with a newline it would read as a decision.
+            file.set_len(whole as u64).map_err(io)?;
+            file.sync_all().map_err(io)?;
+        }
+        if !existed {
+            crate::core::sync_path::sync_dir(dir).map_err(io)?;
+        }
+        Ok(DecisionLog { known, file, lines })
     }
-    Ok(None)
+
+    fn decide(&mut self, gid: &str, commit: bool) -> Result<(), String> {
+        use std::io::Write;
+        match self.known.get(gid) {
+            Some(c) if *c == commit => return Ok(()),
+            Some(c) => return Err(format!("{gid} is already decided {}", if *c { "commit" } else { "abort" })),
+            None => {}
+        }
+        let io = |e: std::io::Error| format!("{DECISIONS}: {e}");
+        self.file.write_all(format!("{} {gid}\n", if commit { "commit" } else { "abort" }).as_bytes()).map_err(io)?;
+        // Known as soon as it is in the file, synced or not: a line whose
+        // sync failed may still reach the disk, and a contrary decision
+        // must not be written after it.
+        self.lines += 1;
+        self.known.insert(gid.to_string(), commit);
+        // The decision is the appended line: its data, and the length that
+        // makes it readable, are what must reach the disk.
+        self.file.sync_data().map_err(io)?;
+        Ok(())
+    }
+
+    fn forget(&mut self, gid: &str, dir: &std::path::Path) -> Result<(), String> {
+        use std::io::Write;
+        if self.known.remove(gid).is_none() {
+            return Ok(());
+        }
+        self.file.write_all(format!("forget {gid}\n").as_bytes()).map_err(|e| format!("{DECISIONS}: {e}"))?;
+        self.lines += 1;
+        self.compact(dir)
+    }
+
+    /// Rewrites the file with the decisions still known, once most of its
+    /// lines are of forgotten ones.
+    fn compact(&mut self, dir: &std::path::Path) -> Result<(), String> {
+        use std::io::Write;
+        if self.lines < 1024 || self.lines < 4 * self.known.len() {
+            return Ok(());
+        }
+        let path = dir.join(DECISIONS);
+        let tmp = dir.join(format!("{DECISIONS}.tmp"));
+        let io = |e: std::io::Error| format!("{}: {e}", path.display());
+        let mut text = String::new();
+        for (gid, commit) in &self.known {
+            text.push_str(if *commit { "commit " } else { "abort " });
+            text.push_str(gid);
+            text.push('\n');
+        }
+        let mut f = std::fs::File::create(&tmp).map_err(io)?;
+        f.write_all(text.as_bytes()).map_err(io)?;
+        f.sync_all().map_err(io)?;
+        drop(f);
+        std::fs::rename(&tmp, &path).map_err(io)?;
+        crate::core::sync_path::sync_dir(dir).map_err(io)?;
+        self.file = std::fs::OpenOptions::new().append(true).open(&path).map_err(io)?;
+        self.lines = self.known.len();
+        Ok(())
+    }
+}
+
+/// Runs `f` on the decision log, opened on first use.
+fn with_decisions<R>(f: impl FnOnce(&mut DecisionLog, &std::path::Path) -> Result<R, String>) -> Result<R, String> {
+    let dir = super::ownership::data_dir().ok_or("this shard has no data directory")?;
+    let mut held = DECISION_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if held.is_none() {
+        *held = Some(DecisionLog::open(dir)?);
+    }
+    f(held.as_mut().expect("opened above"), dir)
+}
+
+pub(crate) fn decision(gid: &str) -> Result<Option<bool>, String> {
+    with_decisions(|log, _| Ok(log.known.get(gid).copied()))
+}
+
+/// Drops the decision for `gid`: every part has been told it
+/// (`Request::Forget`). Not synced: a forgetting lost to a crash leaves a
+/// decision nobody asks for, until the next one is forgotten.
+pub(crate) fn forget(gid: &str) -> Result<(), String> {
+    if gid.is_empty() || gid.contains('\n') {
+        return Err("a malformed global transaction id".to_string());
+    }
+    with_decisions(|log, dir| log.forget(gid, dir))
 }
 
 /// The owner of holds made by SQL (`SHARD HOLD COMMITS`): one, shared by
@@ -447,25 +573,10 @@ pub(crate) async fn wait_commit_hold() {
 }
 
 pub(crate) fn decide(gid: &str, commit: bool) -> Result<(), String> {
-    use std::io::Write;
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _held = LOCK.lock().unwrap();
     if gid.is_empty() || gid.contains('\n') {
         return Err("a malformed global transaction id".to_string());
     }
-    match decision(gid)? {
-        Some(c) if c == commit => return Ok(()),
-        Some(c) => return Err(format!("{gid} is already decided {}", if c { "commit" } else { "abort" })),
-        None => {}
-    }
-    let dir = super::ownership::data_dir().ok_or("this shard has no data directory")?;
-    let path = dir.join(DECISIONS);
-    let io = |e: std::io::Error| format!("{}: {e}", path.display());
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(io)?;
-    f.write_all(format!("{} {gid}\n", if commit { "commit" } else { "abort" }).as_bytes()).map_err(io)?;
-    f.sync_all().map_err(io)?;
-    crate::core::sync_path::sync_dir(dir).map_err(io)?;
-    Ok(())
+    with_decisions(|log, _| log.decide(gid, commit))
 }
 
 /// What SCRAM needs, from `role` in `database`; never a password. An
@@ -634,7 +745,7 @@ fn last_tag(bytes: &[u8]) -> Option<u8> {
     (i == bytes.len()).then_some(last).flatten()
 }
 
-async fn pg(conn: &Conn, session: u64, bytes: &[u8]) -> Response {
+async fn pg(conn: &Conn, session: u64, bytes: &[u8], routed: bool) -> Response {
     let Some(s) = session_of(conn, session) else {
         return refuse(SESSION_GONE, true, format!("session {session} is gone"));
     };
@@ -647,7 +758,10 @@ async fn pg(conn: &Conn, session: u64, bytes: &[u8]) -> Response {
     // A keyless aggregate, top-N or DISTINCT the gateway sent here to
     // coordinate (B1c): a simple Query, or one extended-protocol statement
     // (Parse, Bind, Describe, Execute, Sync), whose fold works the same.
+    // A statement the gateway routed here by its template is none of
+    // these: its text is not read, nor classified, a second time.
     let (sql, extended) = match simple_query_text(bytes) {
+        _ if routed => (None, false),
         Some(sql) => (Some(sql), false),
         None => (extended_statement_text(bytes), true),
     };
@@ -1393,6 +1507,57 @@ fn reply_has_error(bytes: &[u8]) -> bool {
     false
 }
 
+/// Puts a session back as it was when opened (`Request::ResetSession`).
+///
+/// Answered `Done` only when the session was between statements and
+/// outside a transaction, and its reply to the reset is exactly the two
+/// statements' own: anything else in it would be what an earlier statement
+/// left unread, which the next client must never be sent.
+async fn reset_session(conn: &Conn, session: u64) -> Response {
+    let Some(s) = session_of(conn, session) else {
+        return refuse(SESSION_GONE, true, format!("session {session} is gone"));
+    };
+    let mut s = s.lock().await;
+    if !s.finished || s.bridge.status != b'I' {
+        return refuse(*b"25001", true, "the session is in a statement or a transaction: it is not reused");
+    }
+    let mut ask = query_message("RESET ROLE");
+    ask.extend_from_slice(&query_message("DISCARD ALL"));
+    s.bridge.raw(&ask);
+    s.finished = false;
+    s.ready_left = 2;
+    s.pending.clear();
+    let mut reply = Vec::new();
+    loop {
+        match read_chunk(session, &mut s).await {
+            Response::PgReply { more, bytes, .. } => {
+                reply.extend_from_slice(&bytes);
+                if !more {
+                    break;
+                }
+            }
+            other => return other,
+        }
+    }
+    // CommandComplete, ReadyForQuery (idle), twice, and nothing else but
+    // what a server may say at any time (a notice, a parameter's status).
+    let mut shape = Vec::new();
+    let mut i = 0;
+    while i + 5 <= reply.len() {
+        let len = i32::from_be_bytes(reply[i + 1..i + 5].try_into().unwrap()).max(4) as usize;
+        match reply[i] {
+            b'N' | b'S' => {}
+            b'Z' => shape.push(if reply.get(i + 5) == Some(&b'I') { b'Z' } else { b'?' }),
+            t => shape.push(t),
+        }
+        i += 1 + len;
+    }
+    if shape != [b'C', b'Z', b'C', b'Z'] || i != reply.len() {
+        return refuse(*b"25001", false, "the session did not reset cleanly: it is not reused");
+    }
+    Response::Done
+}
+
 async fn continue_reply(conn: &Conn, session: u64) -> Response {
     let Some(s) = session_of(conn, session) else {
         return refuse(SESSION_GONE, true, format!("session {session} is gone"));
@@ -1572,5 +1737,72 @@ mod commit_hold {
             wait().await;
             assert!(start.elapsed() < Duration::from_secs(1), "an expired hold ends the wait");
         }
+    }
+}
+
+#[cfg(test)]
+mod decision_log_tests {
+    use super::*;
+
+    #[test]
+    fn decisions_are_kept_forgotten_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = DecisionLog::open(dir.path()).unwrap();
+        log.decide("g1", true).unwrap();
+        log.decide("g2", false).unwrap();
+        // The first decision is the decision: the same again is accepted,
+        // the contrary refused.
+        log.decide("g1", true).unwrap();
+        assert!(log.decide("g1", false).is_err());
+        assert!(log.decide("g2", true).is_err());
+        log.forget("g2", dir.path()).unwrap();
+        log.forget("never decided", dir.path()).unwrap();
+        assert_eq!(log.known.get("g1"), Some(&true));
+        assert_eq!(log.known.get("g2"), None);
+        drop(log);
+
+        // A restart reads the same; a forgotten gid may be decided anew.
+        let mut log = DecisionLog::open(dir.path()).unwrap();
+        assert_eq!(log.known.len(), 1);
+        assert_eq!(log.known.get("g1"), Some(&true));
+        log.decide("g2", true).unwrap();
+        drop(log);
+
+        // A line a crash cut short was never answered: it is not a
+        // decision, and the next line does not join it.
+        let path = dir.path().join(DECISIONS);
+        let mut text = std::fs::read(&path).unwrap();
+        text.extend_from_slice(b"commit g3-cut");
+        std::fs::write(&path, &text).unwrap();
+        let mut log = DecisionLog::open(dir.path()).unwrap();
+        assert_eq!(log.known.get("g3-cut"), None);
+        log.decide("g4", false).unwrap();
+        drop(log);
+        let log = DecisionLog::open(dir.path()).unwrap();
+        assert_eq!(log.known.get("g4"), Some(&false));
+        assert_eq!(log.known.get("g2"), Some(&true));
+        assert_eq!(log.known.len(), 3);
+    }
+
+    #[test]
+    fn a_log_of_forgotten_decisions_is_compacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = DecisionLog::open(dir.path()).unwrap();
+        log.decide("kept", true).unwrap();
+        for n in 0..600 {
+            let gid = format!("g{n}");
+            log.decide(&gid, n % 2 == 0).unwrap();
+            log.forget(&gid, dir.path()).unwrap();
+        }
+        // 1201 lines were written; the file holds the one decision left.
+        assert_eq!(log.lines, 1 + (1200 - 1024));
+        log.decide("after", false).unwrap();
+        drop(log);
+        let text = std::fs::read_to_string(dir.path().join(DECISIONS)).unwrap();
+        assert!(text.lines().count() < 200, "{} lines", text.lines().count());
+        let log = DecisionLog::open(dir.path()).unwrap();
+        assert_eq!(log.known.get("kept"), Some(&true));
+        assert_eq!(log.known.get("after"), Some(&false));
+        assert_eq!(log.known.len(), 2);
     }
 }

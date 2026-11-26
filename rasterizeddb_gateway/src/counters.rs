@@ -36,6 +36,8 @@ pub struct Counters {
     pub sessions_opened: u64,
     pub sessions_closed: u64,
     pub virtual_sessions: u64,
+    /// Shard sessions taken from the idle pool instead of opened.
+    pub virtual_sessions_reused: u64,
     pub auth_failures: u64,
     pub panics: u64,
     pub map_refreshes: u64,
@@ -60,7 +62,7 @@ impl Counters {
         sum!(
             statements, routed, fan_outs, broadcasts, broadcasts_too_large, role_statements, template_hits, template_misses, template_refuted, classify_errors, retries,
             lost_08007, down_08006, refused_no_key, refused_cross_shard, refusals_other, bytes_in, bytes_out,
-            sessions_opened, sessions_closed, virtual_sessions, auth_failures, panics, map_refreshes, compressed_out,
+            sessions_opened, sessions_closed, virtual_sessions, virtual_sessions_reused, auth_failures, panics, map_refreshes, compressed_out,
             compressed_in, compression_saved_bytes
         );
         for i in 0..BUCKETS {
@@ -110,6 +112,7 @@ impl Counters {
             ("sessions_opened", self.sessions_opened.to_string()),
             ("sessions_open", self.sessions_opened.saturating_sub(self.sessions_closed).to_string()),
             ("virtual_sessions_opened", self.virtual_sessions.to_string()),
+            ("virtual_sessions_reused", self.virtual_sessions_reused.to_string()),
             ("auth_failures", self.auth_failures.to_string()),
             ("session_panics", self.panics.to_string()),
             ("map_refreshes", self.map_refreshes.to_string()),

@@ -154,5 +154,6 @@ pub fn refute(core: &Core, database: &str, source: Source, text: &str) {
     let parse = source == Source::Parse;
     core.templates.borrow_mut().remove(database, parse, text);
     core.shared.templates.remove(database, parse, text);
+    core.refuted.set(core.refuted.get() + 1);
     core.counters.borrow_mut().template_refuted += 1;
 }

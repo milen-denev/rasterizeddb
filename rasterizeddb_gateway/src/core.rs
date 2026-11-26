@@ -215,6 +215,27 @@ impl Link {
     }
 }
 
+/// Whose shard session an idle one may become: the shard, and everything a
+/// session is opened with.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SessionKey {
+    pub shard: u32,
+    pub database: String,
+    pub role: String,
+    pub pinned: bool,
+    pub params: Vec<(String, String)>,
+}
+
+/// A shard session no client holds, reset and kept for the next one
+/// (`session_pool`).
+pub struct IdleSession {
+    pub id: u64,
+    /// The link's connection it was opened on: gone with that connection.
+    pub connection: u64,
+    pub backend_key: u64,
+    since: Instant,
+}
+
 /// A core's route-template cache: `database → shapes / parse texts`.
 #[derive(Default)]
 pub struct CoreTemplates {
@@ -265,6 +286,13 @@ pub struct Core {
     next_session: Cell<u64>,
     /// A shard reported a map epoch above ours: fetch before routing more.
     stale_from: Cell<Option<(u32, u64)>>,
+    /// Idle shard sessions (`session_pool`), and how many.
+    idle: RefCell<HashMap<SessionKey, Vec<IdleSession>>>,
+    idle_count: Cell<usize>,
+    /// Raised each time a shard refutes a route template on this core: a
+    /// template kept with a prepared statement is valid only under the
+    /// count it was taken at.
+    pub refuted: Cell<u64>,
 }
 
 impl Core {
@@ -280,6 +308,9 @@ impl Core {
             pool: RefCell::new(Vec::new()),
             next_session: Cell::new(1),
             stale_from: Cell::new(None),
+            refuted: Cell::new(0),
+            idle: RefCell::new(HashMap::new()),
+            idle_count: Cell::new(0),
         }
     }
 
@@ -349,7 +380,9 @@ impl Core {
         if info.addr.is_empty() {
             return Err(format!("the map gives shard {shard} no address"));
         }
-        let client = build_client(&self.shared, &info.addr)?;
+        // A core's links are used only by its own sessions, all tasks of
+        // its `LocalSet`: the connection's task runs there with them.
+        let client = build_client_with(&self.shared, &info.addr, true)?;
         let link = Rc::new(Link {
             shard,
             addr: info.addr.clone(),
@@ -380,6 +413,58 @@ impl Core {
         }
     }
 
+    /// An idle session for `key`, on the link's current `connection`. One
+    /// opened on an earlier connection went with it, and is dropped here.
+    pub fn take_idle(&self, key: &SessionKey, connection: u64) -> Option<IdleSession> {
+        let mut idle = self.idle.borrow_mut();
+        let list = idle.get_mut(key)?;
+        let mut found = None;
+        while let Some(s) = list.pop() {
+            self.idle_count.set(self.idle_count.get() - 1);
+            if s.connection == connection {
+                found = Some(s);
+                break;
+            }
+        }
+        if list.is_empty() {
+            idle.remove(key);
+        }
+        found
+    }
+
+    /// Keeps a reset session for the next client; `false` when the pool is
+    /// full (the caller closes it).
+    pub fn keep_idle(&self, key: SessionKey, id: u64, connection: u64, backend_key: u64) -> bool {
+        if self.idle_count.get() >= self.shared.cfg.session_pool {
+            return false;
+        }
+        self.idle.borrow_mut().entry(key).or_default().push(IdleSession { id, connection, backend_key, since: Instant::now() });
+        self.idle_count.set(self.idle_count.get() + 1);
+        true
+    }
+
+    /// The idle sessions kept past `session_pool_idle`, taken out: the
+    /// caller closes them on their shards.
+    pub fn expired_idle(&self) -> Vec<(u32, u64)> {
+        if self.idle_count.get() == 0 {
+            return Vec::new();
+        }
+        let ttl = self.shared.cfg.session_pool_idle;
+        let mut out = Vec::new();
+        self.idle.borrow_mut().retain(|key, list| {
+            list.retain(|s| {
+                let keep = s.since.elapsed() < ttl;
+                if !keep {
+                    out.push((key.shard, s.id));
+                }
+                keep
+            });
+            !list.is_empty()
+        });
+        self.idle_count.set(self.idle_count.get() - out.len());
+        out
+    }
+
     pub fn publish(&self) {
         self.shared.board.publish(self.id, &self.counters.borrow());
     }
@@ -388,8 +473,14 @@ impl Core {
 /// A mux client to a shard, with the gateway's mTLS identity and the
 /// configured trust.
 pub fn build_client(shared: &Shared, addr: &str) -> Result<MuxClient, String> {
+    build_client_with(shared, addr, false)
+}
+
+/// [`build_client`]; `local`: its connection task runs on the caller's
+/// `LocalSet` (`TcpClientBuilder::local_driver`).
+fn build_client_with(shared: &Shared, addr: &str, local: bool) -> Result<MuxClient, String> {
     let cfg = &shared.cfg;
-    let mut b = TcpClientBuilder::new(addr).max_in_flight(cfg.max_in_flight);
+    let mut b = TcpClientBuilder::new(addr).max_in_flight(cfg.max_in_flight).local_driver(local);
     b = match cfg.shard_timeout {
         Some(t) => b.timeout(t),
         // A statement may run as long as the client lets it: the

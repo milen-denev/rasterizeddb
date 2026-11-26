@@ -56,6 +56,8 @@ pub(crate) struct Txn {
     pub shards: Vec<u32>,
     pub opening: Vec<u8>,
     pub opening_queries: usize,
+    /// Counted in `Shared::tagged_txns` (it was given a global id).
+    pub tagged: bool,
 }
 
 /// A virtual session on one shard.
@@ -66,13 +68,56 @@ pub(crate) struct VSession {
     pub connection: u64,
     /// Statement name → the generation parsed there.
     pub parsed: HashMap<String, u64>,
+    /// What a CancelRequest is sent with.
+    pub backend_key: u64,
 }
 
 /// A prepared statement as the client defined it.
 pub(crate) struct Stmt {
-    pub text: String,
+    pub text: Rc<str>,
     pub parse: Vec<u8>,
     pub generation: u64,
+    /// Where the statement's key is, once a Bind asked: looked up by the
+    /// statement's text once, not at every execution.
+    route: Option<StmtRoute>,
+}
+
+/// A statement's route template and what it was valid under.
+struct StmtRoute {
+    template: RouteTemplate,
+    schema_epoch: u64,
+    /// [`Core::refuted`] when it was taken: a template a shard refuted
+    /// since is looked up again.
+    refuted: u64,
+}
+
+impl Stmt {
+    pub(crate) fn new(text: &str, parse: Vec<u8>, generation: u64) -> Stmt {
+        Stmt { text: text.into(), parse, generation, route: None }
+    }
+}
+
+/// A statement's text in a batch: the batch's own Parse, or the one the
+/// client made earlier.
+enum BatchText<'a> {
+    Parsed(&'a str),
+    Stored(Rc<str>),
+}
+
+impl BatchText<'_> {
+    fn as_str(&self) -> &str {
+        match self {
+            BatchText::Parsed(t) => t,
+            BatchText::Stored(t) => t,
+        }
+    }
+
+    fn into_rc(self) -> Rc<str> {
+        match self {
+            BatchText::Parsed(t) => t.into(),
+            BatchText::Stored(t) => t,
+        }
+    }
 }
 
 pub struct Login {
@@ -126,6 +171,27 @@ impl ReplyFilter {
             }
             out.extend_from_slice(m);
         }
+    }
+}
+
+/// A session dropped with shard sessions still open (a panic caught in
+/// it): they are closed on their shards, which would otherwise keep them
+/// for as long as the gateway's connection lives.
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.untag_txn();
+        if self.vs.is_empty() {
+            return;
+        }
+        let core = self.core.clone();
+        let open: Vec<(u32, u64)> = self.vs.drain().map(|(shard, vs)| (shard, vs.id)).collect();
+        tokio::task::spawn_local(async move {
+            for (shard, id) in open {
+                if let Ok(link) = core.link(shard) {
+                    let _ = link.call(&core, &Request::CloseSession { session: id }.encode()).await;
+                }
+            }
+        });
     }
 }
 
@@ -210,7 +276,23 @@ fn channel_of(raw: &str) -> Option<String> {
         .then(|| t.to_ascii_lowercase())
 }
 
+/// Whether `text` begins, after white space, with one of `words` (lower
+/// case) as a whole word, in any case. What decides, without copying the
+/// statement, that it is none of the few the gateway answers itself.
+pub(crate) fn begins_with_word(text: &str, words: &[&str]) -> bool {
+    let t = text.trim_start().as_bytes();
+    let n = t.iter().position(|b| !b.is_ascii_alphabetic()).unwrap_or(t.len());
+    words.iter().any(|w| w.len() == n && t[..n].eq_ignore_ascii_case(w.as_bytes()))
+}
+
+/// The first words of every statement [`local_of`] tells apart.
+const LOCAL_HEADS: &[&str] =
+    &["show", "begin", "start", "commit", "end", "rollback", "abort", "discard", "reset", "listen", "unlisten", "set"];
+
 fn local_of(text: &str) -> Local {
+    if !begins_with_word(text, LOCAL_HEADS) {
+        return Local::Routed;
+    }
     let t = text.trim().trim_end_matches(';').trim();
     // One statement only: anything with another `;` is forwarded whole.
     if t.contains(';') {
@@ -301,6 +383,7 @@ impl Session {
                 shards: Vec::new(),
                 opening: Vec::new(),
                 opening_queries: 0,
+                tagged: false,
             },
             session_sets: Vec::new(),
             statements: HashMap::new(),
@@ -365,13 +448,30 @@ impl Session {
         &mut self,
         conn: &mut S,
         reader: &mut MsgReader,
-        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> io::Result<()> {
-        let mut batch: Vec<u8> = self.core.buffer();
         let observer = self.core.shared.hooks.observer.clone();
         if let Some(o) = &observer {
             o.session_opened(&self.client);
         }
+        // However the loop ends, a failed write to the client included, the
+        // shards' sessions are closed and the observer is told.
+        let result = self.serve_loop(conn, reader, shutdown).await;
+        self.close_all().await;
+        if let Some(o) = &observer {
+            o.session_closed(&self.client);
+        }
+        result
+    }
+
+    async fn serve_loop<S: AsyncRead + AsyncWrite + Unpin>(
+        &mut self,
+        conn: &mut S,
+        reader: &mut MsgReader,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> io::Result<()> {
+        let mut batch: Vec<u8> = self.core.buffer();
+        let observer = self.core.shared.hooks.observer.clone();
         // When the batch being collected began, for its latency.
         let mut batch_started: Option<std::time::Instant> = None;
         let result = loop {
@@ -392,14 +492,26 @@ impl Session {
                     }
                     continue;
                 }
-                r = reader.next(conn) => r.map(|(t, m)| (t, m.to_vec())),
+                // A message of a batch goes straight into the batch: it is
+                // copied once, and nothing is allocated for it.
+                r = reader.next(conn) => r.map(|(t, m)| {
+                    if matches!(t, b'P' | b'B' | b'D' | b'E' | b'C' | b'S' | b'H') && !self.discard_until_sync {
+                        if batch.is_empty() {
+                            batch_started = Some(std::time::Instant::now());
+                        }
+                        batch.extend_from_slice(m);
+                        (t, m.len(), Vec::new())
+                    } else {
+                        (t, m.len(), m.to_vec())
+                    }
+                }),
                 _ = shutdown.changed(), if self.txn.status == b'I' && batch.is_empty() => {
                     pg::error(&mut self.out, "FATAL", "57P01", "terminating connection: the gateway is shutting down");
                     let _ = self.flush(conn).await;
                     break Ok(());
                 }
             };
-            let (t, msg) = match next {
+            let (t, msg_len, msg) = match next {
                 Ok(v) => v,
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break Ok(()),
                 Err(e) => {
@@ -408,7 +520,7 @@ impl Session {
                     break Err(e);
                 }
             };
-            self.core.counters.borrow_mut().bytes_in += msg.len() as u64;
+            self.core.counters.borrow_mut().bytes_in += msg_len as u64;
             if self.discard_until_sync {
                 if t == b'S' {
                     self.discard_until_sync = false;
@@ -440,10 +552,6 @@ impl Session {
                     r?
                 }
                 b'P' | b'B' | b'D' | b'E' | b'C' => {
-                    if batch.is_empty() {
-                        batch_started = Some(std::time::Instant::now());
-                    }
-                    batch.extend_from_slice(&msg);
                     if batch.len() > self.core.shared.cfg.max_batch_bytes {
                         pg::error(&mut self.out, "FATAL", "54000", "pipelined batch without Sync exceeds max_batch_bytes");
                         let _ = self.flush(conn).await;
@@ -452,7 +560,6 @@ impl Session {
                     Outcome::Done { error: false }
                 }
                 b'S' | b'H' => {
-                    batch.extend_from_slice(&msg);
                     self.core.counters.borrow_mut().statements += 1;
                     let b = std::mem::take(&mut batch);
                     let r = match &observer {
@@ -508,10 +615,6 @@ impl Session {
             }
         };
         self.core.give_back(batch);
-        self.close_all().await;
-        if let Some(o) = &observer {
-            o.session_closed(&self.client);
-        }
         result
     }
 
@@ -533,11 +636,37 @@ impl Session {
 
     /// Closes every virtual session (best effort: a shard also closes a
     /// session whose connection is lost).
+    ///
+    /// With `session_pool` set, a session that is between statements and
+    /// outside a transaction is reset and kept for the next client instead;
+    /// the shard refuses the reset of one that is not, and it is closed.
     pub(crate) async fn close_all(&mut self) {
-        for (shard, vs) in self.vs.drain() {
-            if let Ok(link) = self.core.link(shard) {
-                let _ = link.call(&self.core, &Request::CloseSession { session: vs.id }.encode()).await;
+        let pool = self.core.shared.cfg.session_pool > 0
+            && self.txn.status == b'I'
+            && self.copy_shard.is_none()
+            && self.copy_split.is_none();
+        let all: Vec<(u32, VSession)> = self.vs.drain().collect();
+        for (shard, vs) in all {
+            let Ok(link) = self.core.link(shard) else { continue };
+            if pool
+                && vs.connection == link.connection.get()
+                && matches!(link.call(&self.core, &Request::ResetSession { session: vs.id }.encode()).await, Ok(Response::Done))
+                && self.core.keep_idle(self.session_key(shard), vs.id, vs.connection, vs.backend_key)
+            {
+                continue;
             }
+            let _ = link.call(&self.core, &Request::CloseSession { session: vs.id }.encode()).await;
+        }
+    }
+
+    /// What a session on `shard` is opened with (`core::SessionKey`).
+    fn session_key(&self, shard: u32) -> crate::core::SessionKey {
+        crate::core::SessionKey {
+            shard,
+            database: self.login.database.clone(),
+            role: self.login.role.clone(),
+            pinned: self.login.pinned.is_some(),
+            params: self.login.params.clone(),
         }
     }
 
@@ -548,11 +677,10 @@ impl Session {
             self.error_ready("08P01", "malformed Query message");
             return Ok(Outcome::Done { error: true });
         };
-        let text = text.to_string();
         // A statement an observer answers itself (`SHOW CLIENT STATS`).
         if let Some(o) = self.core.shared.hooks.observer.clone() {
             let client = self.client.clone();
-            if let Some(answer) = o.answer(&client, &text) {
+            if let Some(answer) = o.answer(&client, text) {
                 match answer.await {
                     Ok((columns, rows)) => {
                         let names: Vec<&str> = columns.iter().map(String::as_str).collect();
@@ -578,18 +706,18 @@ impl Session {
             }
         }
         // A SHOW about tables and storage, answered for every shard.
-        if let Some(outcome) = self.cluster_show(conn, &text).await? {
+        if let Some(outcome) = self.cluster_show(conn, text).await? {
             return Ok(outcome);
         }
         // The rebalance statements (the studio's Shards tab).
-        if let Some(outcome) = self.rebalance_stmt(conn, &text).await? {
+        if let Some(outcome) = self.rebalance_stmt(conn, text).await? {
             return Ok(outcome);
         }
         // Roles and privileges: on every shard, the home shard first.
-        if let Some(outcome) = self.role_stmt(conn, &text).await? {
+        if let Some(outcome) = self.role_stmt(conn, text).await? {
             return Ok(outcome);
         }
-        match local_of(&text) {
+        match local_of(text) {
             Local::ShowGateway => {
                 let rows = crate::admin::show_gateway(&self.core.shared);
                 pg::row_description(&mut self.out, &["name", "value"]);
@@ -646,7 +774,7 @@ impl Session {
                 } else {
                     self.route_key = key;
                 }
-                pg::command_complete(&mut self.out, if value_is_reset(&text) { "RESET" } else { "SET" });
+                pg::command_complete(&mut self.out, if value_is_reset(text) { "RESET" } else { "SET" });
                 pg::ready(&mut self.out, self.txn.status);
                 return Ok(Outcome::Done { error: false });
             }
@@ -721,7 +849,7 @@ impl Session {
                 // one id, so the deadlock detector can follow a cycle of waits
                 // across shards (B4.2).
                 if self.core.shared.cfg.two_phase {
-                    let sql = format!("SET LOCAL rdb.global_txn = '{}'", next_global_txn(&self.core.shared.cfg.gateway_name));
+                    let sql = format!("SET LOCAL rdb.global_txn = '{}'", self.tag_txn());
                     let mut q = Vec::with_capacity(sql.len() + 6);
                     q.push(b'Q');
                     q.extend_from_slice(&((sql.len() + 5) as i32).to_be_bytes());
@@ -766,7 +894,7 @@ impl Session {
                 return self.everywhere(conn, msg, true).await;
             }
             Local::SessionSet | Local::Discard if self.txn.status == b'I' => {
-                return self.everywhere(conn, msg, matches!(local_of(&text), Local::Discard)).await;
+                return self.everywhere(conn, msg, matches!(local_of(text), Local::Discard)).await;
             }
             Local::Refused(what) => {
                 self.error_ready("0A000", &format!("{what} is not supported through the gateway; connect to a shard directly"));
@@ -794,7 +922,7 @@ impl Session {
             }
             _ => {}
         }
-        self.route_simple(conn, msg, &text).await
+        self.route_simple(conn, msg, text).await
     }
 
     fn show_one(&mut self, name: &str, v: &str) {
@@ -813,6 +941,24 @@ impl Session {
         self.txn.opening.clear();
         self.txn.opening_queries = 0;
         self.local_key = None;
+        self.untag_txn();
+    }
+
+    /// A new global id for the transaction now opening, which is counted
+    /// as open under one until [`Self::end_txn`] (or the session's end).
+    pub(crate) fn tag_txn(&mut self) -> String {
+        if !self.txn.tagged {
+            self.txn.tagged = true;
+            self.core.shared.tagged_txns.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        next_global_txn(&self.core.shared.cfg.gateway_name)
+    }
+
+    fn untag_txn(&mut self) {
+        if self.txn.tagged {
+            self.txn.tagged = false;
+            self.core.shared.tagged_txns.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
     }
 
     /// The shard a statement goes to without looking at it: pinned, the
@@ -1066,6 +1212,24 @@ impl Session {
             }
             self.vs.remove(&shard);
         }
+        // An idle session the last client of this database, role and
+        // parameters left, reset: taken instead of opening one.
+        if self.core.shared.cfg.session_pool > 0
+            && let Some(idle) = self.core.take_idle(&self.session_key(shard), link.connection.get())
+        {
+            self.vs.insert(shard, VSession { id: idle.id, connection: idle.connection, parsed: HashMap::new(), backend_key: idle.backend_key });
+            if let Ok(mut t) = self.login.cancel.lock() {
+                t.push((shard, idle.backend_key));
+            }
+            self.core.counters.borrow_mut().virtual_sessions_reused += 1;
+            if !self.session_sets.is_empty() {
+                let sets = self.session_sets.clone();
+                if let Err(e) = self.send_discarding(shard, &sets).await {
+                    log::warn!("session SETs could not be replayed on shard {shard}: {e}");
+                }
+            }
+            return Ok(idle.id);
+        }
         let id = self.core.session_id();
         let req = Request::OpenSession {
             session: id,
@@ -1078,7 +1242,7 @@ impl Session {
         .encode();
         match link.call(&self.core, &req).await {
             Ok(Response::SessionOpened { backend_key, .. }) => {
-                self.vs.insert(shard, VSession { id, connection: link.connection.get(), parsed: HashMap::new() });
+                self.vs.insert(shard, VSession { id, connection: link.connection.get(), parsed: HashMap::new(), backend_key });
                 if let Ok(mut t) = self.login.cancel.lock() {
                     t.push((shard, backend_key));
                 }
@@ -1106,6 +1270,11 @@ impl Session {
     /// (`Ok(None)`), or why it could not be asked (`Err`), in the order given.
     #[allow(clippy::type_complexity)]
     pub(crate) async fn send_each(&mut self, work: &[(u32, Vec<u8>)]) -> Vec<(u32, Result<Option<(String, String)>, String>)> {
+        self.send_each_replies(work).await.into_iter().map(|(s, r)| (s, r.map(|bytes| first_error(&bytes)))).collect()
+    }
+
+    /// [`Self::send_each`], with each shard's whole reply.
+    pub(crate) async fn send_each_replies(&mut self, work: &[(u32, Vec<u8>)]) -> Vec<(u32, Result<Vec<u8>, String>)> {
         enum Asked {
             Sent(tokio::task::JoinHandle<Result<Vec<u8>, (String, String)>>),
             Not(String),
@@ -1128,9 +1297,7 @@ impl Session {
             let r = match a {
                 Asked::Not(e) => Err(e),
                 Asked::Sent(h) => match h.await {
-                    Ok(Ok(bytes)) => Ok(pg::messages(&bytes)
-                        .find(|(t, _)| *t == b'E')
-                        .map(|(_, m)| (pg::error_sqlstate(m).unwrap_or("XX000").to_string(), pg::error_message(m).unwrap_or_default()))),
+                    Ok(Ok(bytes)) => Ok(bytes),
                     Ok(Err((c, m))) => Err(format!("{c}: {m}")),
                     Err(_) => Err("the call panicked".to_string()),
                 },
@@ -1143,17 +1310,7 @@ impl Session {
     /// [`Self::send_each`] with one simple query per shard.
     #[allow(clippy::type_complexity)]
     pub(crate) async fn quiet_each(&mut self, work: &[(u32, String)]) -> Vec<(u32, Result<Option<(String, String)>, String>)> {
-        let msgs: Vec<(u32, Vec<u8>)> = work
-            .iter()
-            .map(|(s, sql)| {
-                let mut q = vec![b'Q'];
-                q.extend_from_slice(&((sql.len() + 5) as i32).to_be_bytes());
-                q.extend_from_slice(sql.as_bytes());
-                q.push(0);
-                (*s, q)
-            })
-            .collect();
-        self.send_each(&msgs).await
+        self.send_each(&query_each(work)).await
     }
 
 
@@ -1217,7 +1374,10 @@ impl Session {
         };
 
         // The payload: a pending BEGIN, lazy re-Parses, then the client's.
+        // `tkey`: a template named this shard, so the shard need not ask
+        // whether the statement is one to coordinate.
         let mut payload = self.core.buffer();
+        Request::begin_pg(&mut payload, tkey.is_some(), vs_id, self.core.map().epoch());
         let mut filter = ReplyFilter::none();
         let first_of_txn = self.txn.status != b'I' && self.txn.shard.is_none();
         if first_of_txn && !self.txn.pending.is_empty() {
@@ -1270,9 +1430,8 @@ impl Session {
             }
         }
         payload.extend_from_slice(msgs);
-        let mut req = self.core.buffer();
-        Request::encode_pg(&mut req, vs_id, self.core.map().epoch(), &payload);
-        self.core.give_back(payload);
+        Request::finish_pg(&mut payload);
+        let req = payload;
         let first = link.call(&self.core, &req).await;
         self.core.give_back(req);
 
@@ -1340,9 +1499,16 @@ impl Session {
                             at += 1 + len;
                         }
                     }
-                    self.flush(conn).await?;
                     if more {
-                        resp = match link.call(&self.core, &Request::Continue { session: vs_id }.encode()).await {
+                        // The next chunk is asked for while this one is
+                        // written to the client: the shard and the client
+                        // are waited on together, and the gateway holds at
+                        // most one chunk the client has not taken.
+                        let core = self.core.clone();
+                        let ask = Request::Continue { session: vs_id }.encode();
+                        let (flushed, next) = tokio::join!(self.flush(conn), link.call(&core, &ask));
+                        flushed?;
+                        resp = match next {
                             Ok(r) => r,
                             Err(e) => {
                                 self.core.counters.borrow_mut().lost_08007 += 1;
@@ -1353,6 +1519,7 @@ impl Session {
                         };
                         continue;
                     }
+                    self.flush(conn).await?;
                     // Done: the bookkeeping that follows the reply.
                     if let Some(vs) = self.vs.get_mut(&shard) {
                         for (n, g) in parsed_now {
@@ -1506,14 +1673,19 @@ impl Session {
             self.core.shared.cfg.gateway_name.replace(['\'', ':'], "_"),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        // Every part prepares at once: one round trip, not one per shard.
+        // Every part prepares at once: one round trip, not one per shard. A
+        // part that changed nothing and holds no row lock ends at once
+        // instead (`OR COMMIT READ ONLY`): it has no outcome to wait for,
+        // so it is in neither the decision nor the second phase.
         let mut prepared = Vec::new();
+        let mut ended = Vec::new();
         let mut failure: Option<(String, String)> = None;
-        let work: Vec<(u32, String)> = shards.iter().map(|s| (*s, format!("PREPARE TRANSACTION '{gid}'"))).collect();
-        for (s, r) in self.quiet_each(&work).await {
-            match r {
-                Ok(None) => prepared.push(s),
-                Ok(Some(e)) => {
+        let work: Vec<(u32, String)> = shards.iter().map(|s| (*s, format!("PREPARE TRANSACTION '{gid}' OR COMMIT READ ONLY"))).collect();
+        for (s, r) in self.send_each_replies(&query_each(&work)).await {
+            match r.map(|reply| (first_error(&reply), has_tag(&reply, "COMMIT READ ONLY"))) {
+                Ok((None, true)) => ended.push(s),
+                Ok((None, false)) => prepared.push(s),
+                Ok((Some(e), _)) => {
                     failure.get_or_insert((e.0, format!("shard {s} could not prepare: {}", e.1)));
                 }
                 Err(e) => {
@@ -1521,17 +1693,27 @@ impl Session {
                 }
             }
         }
+        // Nothing was changed anywhere: every part has ended, and there is
+        // nothing to decide.
+        if failure.is_none() && prepared.is_empty() {
+            self.end_txn();
+            pg::command_complete(&mut self.out, tag.as_deref().unwrap_or("COMMIT"));
+            pg::ready(&mut self.out, b'I');
+            return Outcome::Done { error: false };
+        }
         let home = self.core.shared.home(&self.core.map());
         // Marked before the decision exists, cleared once every part is
         // told: reads across shards wait for it (B5.2).
         crate::fanout::committing::begin(&gid);
+        let mut decided = false;
         if failure.is_none() {
-            let decided = match self.core.link(home) {
+            decided = true;
+            let recorded = match self.core.link(home) {
                 Ok(link) => link.call(&self.core, &Request::Decide { gid: gid.clone(), commit: true }.encode()).await,
                 Err(e) => Err(CallError::Down(e)),
             };
-            if !matches!(decided, Ok(Response::Done)) {
-                failure = Some(("40001".into(), format!("the commit decision could not be recorded on shard {home}: {decided:?}")));
+            if !matches!(recorded, Ok(Response::Done)) {
+                failure = Some(("40001".into(), format!("the commit decision could not be recorded on shard {home}: {recorded:?}")));
                 // Recorded or not, an abort may still be recorded first.
                 if let Ok(link) = self.core.link(home) {
                     let _ = link.call(&self.core, &Request::Decide { gid: gid.clone(), commit: false }.encode()).await;
@@ -1540,27 +1722,51 @@ impl Session {
         }
         if let Some((code, msg)) = failure {
             crate::fanout::committing::end(&gid);
+            // A part that ended read-only has nothing to roll back.
             let work: Vec<(u32, String)> = shards
                 .iter()
+                .filter(|s| !ended.contains(s))
                 .map(|s| (*s, if prepared.contains(s) { format!("ROLLBACK PREPARED '{gid}'") } else { "ROLLBACK".to_string() }))
                 .collect();
-            let _ = self.quiet_each(&work).await;
+            let undone = self.quiet_each(&work).await;
+            if decided && undone.iter().all(|(_, r)| matches!(r, Ok(None))) {
+                self.forget_decision(home, &gid);
+            }
             self.end_txn();
             self.error_ready(&code, &msg);
             return Outcome::Done { error: true };
         }
-        // The decision is recorded: every part commits at once.
-        let work: Vec<(u32, String)> = shards.iter().map(|s| (*s, format!("COMMIT PREPARED '{gid}'"))).collect();
+        // The decision is recorded: every prepared part commits at once.
+        let work: Vec<(u32, String)> = prepared.iter().map(|s| (*s, format!("COMMIT PREPARED '{gid}'"))).collect();
+        let mut finished = true;
         for (s, r) in self.quiet_each(&work).await {
             if !matches!(r, Ok(None)) {
+                finished = false;
                 log::warn!("transaction {gid} is decided commit but shard {s} did not finish it ({r:?}); rdb-shard resolve completes it");
             }
         }
         crate::fanout::committing::end(&gid);
+        // Every part is told: nothing will ask for the decision again.
+        if finished {
+            self.forget_decision(home, &gid);
+        }
         self.end_txn();
         pg::command_complete(&mut self.out, tag.as_deref().unwrap_or("COMMIT"));
         pg::ready(&mut self.out, b'I');
         Outcome::Done { error: false }
+    }
+
+    /// Tells the anchor shard to drop its decision for `gid`, once every
+    /// part has been told its outcome. Not waited for: the client's answer
+    /// does not depend on it, and a forgetting that is lost leaves only a
+    /// line in the anchor's log.
+    fn forget_decision(&self, home: u32, gid: &str) {
+        let Ok(link) = self.core.link(home) else { return };
+        let core = self.core.clone();
+        let req = Request::Forget { gid: gid.to_string() }.encode();
+        tokio::task::spawn_local(async move {
+            let _ = link.call(&core, &req).await;
+        });
     }
 
     /// A shard's refusal: retried when nothing took effect and the
@@ -1570,7 +1776,9 @@ impl Session {
         let movable = self.txn.shard.is_none() && self.login.pinned.is_none();
         if r.sqlstate == rshard::SESSION_GONE {
             self.vs.remove(&shard);
-            if movable && r.before_effect {
+            // A new session stands in, on the same shard for a role locked
+            // to it: nothing ran, and no transaction was on the old one.
+            if self.txn.shard.is_none() && r.before_effect {
                 return Outcome::Retry;
             }
         }
@@ -1654,7 +1862,7 @@ impl Session {
                 }
             };
             self.core.counters.borrow_mut().routed += 1;
-            let outcome = self.run_on(conn, target, batch, needs, tkey.as_ref().map(|t| (Source::Parse, t.as_str()))).await?;
+            let outcome = self.run_on(conn, target, batch, needs, tkey.as_deref().map(|t| (Source::Parse, t))).await?;
             if let Outcome::Retry = outcome {
                 if attempt < retries {
                     self.core.counters.borrow_mut().retries += 1;
@@ -1676,11 +1884,12 @@ impl Session {
         &mut self,
         map: &ShardMap,
         batch: &[u8],
-    ) -> Result<(u32, Vec<(String, bool)>, Option<String>), (&'static str, String)> {
-        // Statement texts as of each point in the batch.
-        let mut in_batch: HashMap<String, String> = HashMap::new();
+    ) -> Result<(u32, Vec<(String, bool)>, Option<Rc<str>>), (&'static str, String)> {
+        // Statement texts as of each point in the batch: the last Parse of
+        // a name is the one a later Bind means.
+        let mut in_batch: Vec<(&str, &str)> = Vec::new();
         let mut needs: Vec<(String, bool)> = Vec::new();
-        let mut routes: Vec<(u32, String)> = Vec::new();
+        let mut routes: Vec<(u32, BatchText)> = Vec::new();
         let known = self.target_known();
         let home = self.core.shared.home(map);
         for (t, m) in pg::messages(batch) {
@@ -1688,27 +1897,33 @@ impl Session {
                 b'P' => {
                     let (name, text) = pg::parse_parse(m).ok_or(("08P01", "malformed Parse message".to_string()))?;
                     needs.push((name.to_string(), true));
-                    in_batch.insert(name.to_string(), text.to_string());
+                    in_batch.push((name, text));
                 }
                 b'B' => {
                     let bind = pg::parse_bind(m).ok_or(("08P01", "malformed Bind message".to_string()))?;
-                    let name = bind.statement.to_string();
-                    let text = match in_batch.get(&name) {
-                        Some(t) => t.clone(),
-                        None => {
-                            needs.push((name.clone(), false));
-                            match self.statements.get(&name) {
-                                Some(s) => s.text.clone(),
-                                None => return Err(("26000", format!("prepared statement \"{name}\" does not exist"))),
-                            }
+                    let name = bind.statement;
+                    let parsed = in_batch.iter().rev().find(|(n, _)| *n == name).map(|(_, t)| *t);
+                    if parsed.is_none() {
+                        needs.push((name.to_string(), false));
+                        if !self.statements.contains_key(name) {
+                            return Err(("26000", format!("prepared statement \"{name}\" does not exist")));
                         }
-                    };
+                    }
                     if known.is_some() {
                         continue;
                     }
-                    let template = route::template(&self.core, &self.login.database, Source::Parse, &text, home)
-                        .await
-                        .map_err(|e| ("08006", format!("the statement could not be classified: {e}")))?;
+                    let (text, template) = match parsed {
+                        Some(t) => {
+                            let template = route::template(&self.core, &self.login.database, Source::Parse, t, home)
+                                .await
+                                .map_err(|e| ("08006", format!("the statement could not be classified: {e}")))?;
+                            (BatchText::Parsed(t), template)
+                        }
+                        None => {
+                            let (text, template) = self.stored_template(name, home).await?;
+                            (BatchText::Stored(text), template)
+                        }
+                    };
                     let shard = match template {
                         RouteTemplate::Param { index, family } => {
                             let block = bind.param(index as usize).and_then(|(bin, v)| route::param_block(bin, v, family));
@@ -1749,7 +1964,7 @@ impl Session {
                     let b = pg::body(m);
                     if b.first() == Some(&b'S')
                         && let Some((name, _)) = pg::cstr(&b[1..])
-                        && !in_batch.contains_key(name)
+                        && !in_batch.iter().any(|(n, _)| *n == name)
                         && t == b'D'
                     {
                         needs.push((name.to_string(), false));
@@ -1762,11 +1977,10 @@ impl Session {
             return Ok((s, needs, None));
         }
         // The block's rule, statement by statement (`within_block`).
-        let routes: Vec<(u32, String)> = routes
-            .into_iter()
-            .map(|(s, text)| self.within_block(s, &text).map(|s| (s, text)))
-            .collect::<Result<_, _>>()?;
-        let Some((first, text)) = routes.first().cloned() else {
+        for (s, text) in routes.iter_mut() {
+            *s = self.within_block(*s, text.as_str())?;
+        }
+        let Some(first) = routes.first().map(|(s, _)| *s) else {
             // A batch that only parses or describes: the block's shard, or
             // where the last statement went.
             let block = if self.txn.status != b'I' && !self.core.shared.cfg.two_phase { self.txn.shard } else { None };
@@ -1776,7 +1990,40 @@ impl Session {
             self.core.counters.borrow_mut().refused_cross_shard += 1;
             return Err(("0A000", "the statements of one batch reach different shards; send a Sync between them".into()));
         }
+        let text = routes.swap_remove(0).1.into_rc();
         Ok((first, needs, Some(text)))
+    }
+
+    /// The text and route template of a statement the client prepared
+    /// earlier. The template is kept with the statement, so an execution
+    /// neither copies nor hashes the text; it is looked up again after a
+    /// schema change, or after a shard refuted a template on this core.
+    async fn stored_template(&mut self, name: &str, home: u32) -> Result<(Rc<str>, RouteTemplate), (&'static str, String)> {
+        let schema_epoch = self.core.shared.schema_epoch.load(std::sync::atomic::Ordering::Acquire);
+        let refuted = self.core.refuted.get();
+        let Some(stmt) = self.statements.get(name) else {
+            return Err(("26000", format!("prepared statement \"{name}\" does not exist")));
+        };
+        if let Some(r) = &stmt.route
+            && r.schema_epoch >= schema_epoch
+            && r.refuted == refuted
+        {
+            self.core.counters.borrow_mut().template_hits += 1;
+            return Ok((stmt.text.clone(), r.template.clone()));
+        }
+        let text = stmt.text.clone();
+        let generation = stmt.generation;
+        let template = route::template(&self.core, &self.login.database, Source::Parse, &text, home)
+            .await
+            .map_err(|e| ("08006", format!("the statement could not be classified: {e}")))?;
+        // The epoch read before the lookup: a template classified under a
+        // newer one is only looked up once more than it need be.
+        if let Some(stmt) = self.statements.get_mut(name)
+            && stmt.generation == generation
+        {
+            stmt.route = Some(StmtRoute { template: template.clone(), schema_epoch, refuted });
+        }
+        Ok((text, template))
     }
 
     /// The gateway's record of the client's statements after a batch ran.
@@ -1787,7 +2034,7 @@ impl Session {
                     if let Some((name, text)) = pg::parse_parse(m) {
                         self.generation += 1;
                         let g = self.generation;
-                        self.statements.insert(name.to_string(), Stmt { text: text.to_string(), parse: m.to_vec(), generation: g });
+                        self.statements.insert(name.to_string(), Stmt::new(text, m.to_vec(), g));
                         if let Some(vs) = self.vs.get_mut(&shard) {
                             vs.parsed.insert(name.to_string(), g);
                         }
@@ -1824,6 +2071,31 @@ impl Session {
         }
         Ok(outcome)
     }
+}
+
+/// One simple Query message per `(shard, sql)`.
+fn query_each(work: &[(u32, String)]) -> Vec<(u32, Vec<u8>)> {
+    work.iter()
+        .map(|(s, sql)| {
+            let mut q = vec![b'Q'];
+            q.extend_from_slice(&((sql.len() + 5) as i32).to_be_bytes());
+            q.extend_from_slice(sql.as_bytes());
+            q.push(0);
+            (*s, q)
+        })
+        .collect()
+}
+
+/// The first error in a reply: its SQLSTATE and message.
+fn first_error(reply: &[u8]) -> Option<(String, String)> {
+    pg::messages(reply)
+        .find(|(t, _)| *t == b'E')
+        .map(|(_, m)| (pg::error_sqlstate(m).unwrap_or("XX000").to_string(), pg::error_message(m).unwrap_or_default()))
+}
+
+/// Whether a reply carries a CommandComplete with exactly `tag`.
+fn has_tag(reply: &[u8], tag: &str) -> bool {
+    pg::messages(reply).any(|(t, m)| t == b'C' && pg::cstr(pg::body(m)).is_some_and(|(c, _)| c == tag))
 }
 
 /// A new global transaction id, `gateway-pid-n`: unique across gateways,

@@ -405,7 +405,11 @@ impl Shared {
         let epoch = state.epoch;
         drop(state);
 
-        tokio::spawn(drive(self.clone(), stream, epoch));
+        if self.dialer.local_driver {
+            tokio::task::spawn_local(drive(self.clone(), stream, epoch));
+        } else {
+            tokio::spawn(drive(self.clone(), stream, epoch));
+        }
 
         Ok(())
     }
