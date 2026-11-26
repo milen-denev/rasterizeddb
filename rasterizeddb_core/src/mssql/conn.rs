@@ -1470,6 +1470,7 @@ impl Session {
                     }
                     let cols = columns.as_deref().unwrap_or(&[]);
                     let at = self.wire.reply_len();
+                    let mut frame = self.wire.frame();
                     let out = self.wire.reply();
                     out.push(0xd1);
                     let mut all: Vec<Option<&[u8]>> = cells.iter().copied().collect();
@@ -1481,11 +1482,15 @@ impl Session {
                             .get(k)
                             .map(|c| c.ty.clone())
                             .unwrap_or(ColType::NVarChar(None));
-                        if let Err(e) = tds::put_value(out, &ty, *cell) {
+                        if let Err(e) = tds::put_value(out, &ty, *cell, &mut frame) {
                             out.truncate(at);
                             encode_error = Some(e);
                             break;
                         }
+                    }
+                    // (A row taken back out asked nothing of the packets.)
+                    if encode_error.is_none() {
+                        self.wire.commit(frame);
                     }
                     if self.wire.reply_len() > 64 * 1024 {
                         self.wire.flush_partial(tds::PT_REPLY).await?;
@@ -1558,6 +1563,7 @@ impl Session {
             }
             tds::col_metadata(self.wire.reply(), cols);
             for r in rows {
+                let mut frame = self.wire.frame();
                 let out = self.wire.reply();
                 let at = out.len();
                 out.push(0xd1);
@@ -1566,7 +1572,7 @@ impl Session {
                         .get(k)
                         .map(|c| c.ty.clone())
                         .unwrap_or(ColType::NVarChar(None));
-                    if let Err(e) = tds::put_value(out, &ty, cell.as_deref()) {
+                    if let Err(e) = tds::put_value(out, &ty, cell.as_deref(), &mut frame) {
                         out.truncate(at);
                         encode_error = Some(e);
                         break;
@@ -1575,6 +1581,7 @@ impl Session {
                 if encode_error.is_some() {
                     break;
                 }
+                self.wire.commit(frame);
             }
         }
         let started = columns.is_some() && !capture;
@@ -3135,7 +3142,9 @@ impl Session {
                     Value::Bytes(b) => Some(b),
                     other => other.text().map(String::into_bytes),
                 };
-                tds::return_value(self.wire.reply(), ordinal, &name, oid, bytes.as_deref());
+                let mut frame = self.wire.frame();
+                tds::return_value(self.wire.reply(), ordinal, &name, oid, bytes.as_deref(), &mut frame);
+                self.wire.commit(frame);
             }
             let mut done = if failed { tds::DONE_ERROR } else { 0 };
             if more {
@@ -3847,6 +3856,8 @@ impl Session {
             .collect();
         tds::col_metadata(self.wire.reply(), &cols);
         for r in &rows {
+            let mut frame = self.wire.frame();
+            let mut written = true;
             let out = self.wire.reply();
             let at = out.len();
             out.push(0xd1);
@@ -3855,10 +3866,14 @@ impl Session {
                     .get(k)
                     .map(|c| c.ty.clone())
                     .unwrap_or(ColType::NVarChar(None));
-                if tds::put_value(out, &ty, cell.as_deref().map(str::as_bytes)).is_err() {
+                if tds::put_value(out, &ty, cell.as_deref().map(str::as_bytes), &mut frame).is_err() {
                     out.truncate(at);
+                    written = false;
                     break;
                 }
+            }
+            if written {
+                self.wire.commit(frame);
             }
         }
         self.rowcount = rows.len() as i64;

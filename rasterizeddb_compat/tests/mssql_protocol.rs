@@ -2318,6 +2318,80 @@ async fn tiberius_grouped_order_and_index_catalogue() {
     );
 }
 
+/// A result of many rows with large `nvarchar(max)` and `varbinary(max)`
+/// values, several a row, read whole with TLS and without: every value as
+/// it was written. The values cross packets, and each `max` value goes out
+/// in chunks that end with their packet (`tds::put_plp`): sent as one chunk
+/// across packets, Microsoft.Data.SqlClient failed on a `SELECT *` over
+/// such a table after a few hundred rows or waited for ever (it is its
+/// reader that the chunking is for; this client reads either).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_large_max_values_stream() {
+    let s = start();
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [Big] ([Id] int NOT NULL PRIMARY KEY, [A] nvarchar(max) NULL, [N] int NOT NULL, [B] nvarchar(max) NULL, [Raw] varbinary(max) NULL, [C] nvarchar(max) NOT NULL)",
+    )
+    .await
+    .unwrap();
+    const ROWS: i32 = 240;
+    // Lengths around a packet's payload and far past it, an empty string, a
+    // NULL, and text outside ASCII (two and four bytes of UTF-16 a letter).
+    let text = |k: i32, salt: u32| -> String {
+        let len = match k % 8 {
+            0 => 0,
+            1 => 1,
+            2 => 3990 + k as usize,
+            3 => 4096,
+            4 => 9000 + 7 * k as usize,
+            5 => 20_001,
+            6 => 131,
+            _ => 4000 - k as usize,
+        };
+        (0..len).map(|i| ['a', 'ж', 'é', '😀', 'z'][(i + salt as usize + k as usize) % 5]).collect()
+    };
+    let raw = |k: i32| -> Option<Vec<u8>> { (k % 5 != 0).then(|| (0..(k as usize * 97) % 11_000).map(|i| (i * 31 + k as usize) as u8).collect()) };
+    for chunk in (1..=ROWS).collect::<Vec<_>>().chunks(8) {
+        for &k in chunk {
+            let a = (k % 7 != 0).then(|| text(k, 1));
+            let b = (k % 3 != 0).then(|| text(k + 3, 2));
+            c.execute(
+                "INSERT INTO [Big] ([Id], [A], [N], [B], [Raw], [C]) VALUES (@P1, @P2, @P3, @P4, @P5, @P6)",
+                &[&k, &a, &(k * 3), &b, &raw(k), &text(k + 5, 3)],
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let check = |rows: &[tiberius::Row]| {
+        assert_eq!(rows.len(), ROWS as usize);
+        for (row, k) in rows.iter().zip(1..=ROWS) {
+            assert_eq!(row.get::<i32, _>(0), Some(k));
+            assert_eq!(row.get::<&str, _>(1).map(str::to_string), (k % 7 != 0).then(|| text(k, 1)), "A of {k}");
+            assert_eq!(row.get::<i32, _>(2), Some(k * 3));
+            assert_eq!(row.get::<&str, _>(3).map(str::to_string), (k % 3 != 0).then(|| text(k + 3, 2)), "B of {k}");
+            assert_eq!(row.get::<&[u8], _>(4).map(<[u8]>::to_vec), raw(k), "Raw of {k}");
+            assert_eq!(row.get::<&str, _>(5), Some(text(k + 5, 3).as_str()), "C of {k}");
+        }
+    };
+    // Under TLS (each packet its own record).
+    let r = batch(&mut c, "SELECT * FROM [Big] ORDER BY [Id]").await.unwrap();
+    check(&r[0]);
+    // And without: the packets back to back on the socket.
+    let mut plain = config(&s, PASSWORD, EncryptionLevel::NotSupported);
+    plain.database("postgres");
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", s.port)).await.unwrap();
+    tcp.set_nodelay(true).unwrap();
+    let mut p = Client::connect(plain, tcp.compat_write()).await.expect("a connection without TLS");
+    let r = batch(&mut p, "SELECT * FROM [Big] ORDER BY [Id]").await.unwrap();
+    check(&r[0]);
+    let r = batch(&mut p, "SELECT [C], [Id] FROM [Big] WHERE [Id] % 8 = 5 ORDER BY [Id] DESC; SELECT COUNT(*) FROM [Big]").await.unwrap();
+    assert_eq!(r[0].len(), 30);
+    assert!(r[0].iter().all(|row| row.get::<&str, _>(0).is_some_and(|c| c.chars().count() == text(row.get::<i32, _>(1).unwrap() + 5, 3).chars().count())));
+    assert_eq!(r[1][0].get::<i32, _>(0), Some(ROWS));
+}
+
 /// NULLs sort first ascending and last descending, as SQL Server's (NULL is
 /// its least value); the engine put them last ascending. And a sort by a
 /// nullable `datetime2(7)` then a uniqueidentifier with TOP took the server

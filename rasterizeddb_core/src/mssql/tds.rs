@@ -375,6 +375,12 @@ pub(crate) struct Wire {
     pub(crate) spid: u16,
     /// Reply bytes already cut into packets, for [`Wire::mark`].
     sent: usize,
+    /// Where the packet being filled starts, counted over the whole reply:
+    /// packets end every `packet_size - 8` bytes from here.
+    origin: usize,
+    /// Where a packet ends early ([`Wire::commit`]), counted over the whole
+    /// reply, in order.
+    breaks: std::collections::VecDeque<usize>,
     /// The largest message accepted: small until the client has logged in.
     pub(crate) max_message: usize,
 }
@@ -394,8 +400,27 @@ impl Wire {
             packet_id: 1,
             spid: 0,
             sent: 0,
+            origin: 0,
+            breaks: std::collections::VecDeque::new(),
             max_message: MAX_LOGIN_MESSAGE,
         }
+    }
+
+    /// Where the reply buffer's bytes fall in the reply's packets
+    /// ([`Frame`]): for a value written to it now.
+    pub(crate) fn frame(&self) -> Frame {
+        Frame { base: self.sent, origin: self.origin, body: self.packet_size - 8, breaks: Vec::new() }
+    }
+
+    /// Keeps what the values written with `frame` asked of the packets: the
+    /// places one ends early. Not called for values taken back out of the
+    /// reply (a row that could not be encoded).
+    pub(crate) fn commit(&mut self, frame: Frame) {
+        if frame.breaks.is_empty() {
+            return;
+        }
+        self.origin = frame.origin;
+        self.breaks.extend(frame.breaks);
     }
 
     /// Where the next reply byte will be, counted over the whole reply.
@@ -516,18 +541,14 @@ impl Wire {
     }
 
     /// Cuts the reply built so far into packets; `last` marks the end of
-    /// the message. Full packets are always cut; a partial one only at the
-    /// end.
+    /// the message. A packet is cut when it is full or ends early at a break
+    /// ([`Wire::commit`]); a partial one only at the end.
     fn packetize(&mut self, kind: u8, last: bool) {
         let body = self.packet_size - 8;
-        let mut start = 0usize;
         let reply = std::mem::take(&mut self.reply);
-        while reply.len() - start > body
-            || (last && start < reply.len())
-            || (last && reply.is_empty() && start == 0)
-        {
-            let end = (start + body).min(reply.len());
-            let eom = last && end == reply.len();
+        let cuts = packet_cuts(reply.len(), self.sent, body, &mut self.breaks, last);
+        let mut start = 0usize;
+        for (end, eom) in cuts {
             let len = (end - start + 8) as u16;
             self.out
                 .extend_from_slice(&[kind, if eom { ST_EOM } else { 0 }]);
@@ -538,9 +559,6 @@ impl Wire {
             self.packet_id = self.packet_id.wrapping_add(1);
             self.out.extend_from_slice(&reply[start..end]);
             start = end;
-            if eom {
-                break;
-            }
         }
         self.sent += start;
         self.reply = reply[start..].to_vec();
@@ -578,6 +596,8 @@ impl Wire {
     pub(crate) async fn send(&mut self, kind: u8) -> io::Result<()> {
         self.packetize(kind, true);
         self.sent = 0;
+        self.origin = 0;
+        self.breaks.clear();
         self.packet_id = 1;
         self.write_packets().await?;
         if self.out.capacity() > 1024 * 1024 {
@@ -588,6 +608,39 @@ impl Wire {
         }
         self.stream.flush().await
     }
+}
+
+/// Where the packets of a reply buffer of `len` bytes end, and whether each
+/// ends the message: the buffer starts `sent` bytes into the reply, a
+/// packet holds `body` bytes, and `breaks` (over the whole reply, in order;
+/// those used are taken) end one early. Not `last`: only whole packets, a
+/// full one kept back while nothing follows it (it may be the message's
+/// last). `last`: everything, the final packet marked; an empty reply is
+/// one empty packet.
+fn packet_cuts(len: usize, sent: usize, body: usize, breaks: &mut std::collections::VecDeque<usize>, last: bool) -> Vec<(usize, bool)> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    loop {
+        // A break at or before this packet's start ends nothing.
+        while breaks.front().is_some_and(|b| *b <= sent + start) {
+            breaks.pop_front();
+        }
+        let full = start + body;
+        let early = breaks.front().map(|b| b - sent).filter(|b| *b <= len && *b < full);
+        let end = match early {
+            Some(end) => end,
+            None if len - start > body => full,
+            None if last && (start < len || (len == 0 && start == 0)) => len,
+            None => break,
+        };
+        let eom = last && end == len;
+        out.push((end, eom));
+        start = end;
+        if eom {
+            break;
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -919,6 +972,7 @@ pub(crate) fn return_value(
     name: &str,
     oid: u32,
     value: Option<&[u8]>,
+    frame: &mut Frame,
 ) {
     let ty = column_type(oid, -1).unwrap_or_else(|| {
         let (int, frac) = value
@@ -938,9 +992,11 @@ pub(crate) fn return_value(
     out.extend_from_slice(&0u16.to_le_bytes());
     type_info(out, &ty);
     let at = out.len();
-    if put_value(out, &ty, value).is_err() {
+    // (A value that cannot be written is NULL; a `max` one asks for no
+    // packet to end before it fails.)
+    if put_value(out, &ty, value, frame).is_err() {
         out.truncate(at);
-        let _ = put_value(out, &ty, None);
+        let _ = put_value(out, &ty, None, frame);
     }
 }
 
@@ -1181,11 +1237,70 @@ fn put_days(out: &mut Vec<u8>, days: i64) {
     out.extend_from_slice(&(days as u32).to_le_bytes()[..3]);
 }
 
-fn put_plp(out: &mut Vec<u8>, data: &[u8]) {
+/// Where a reply's bytes fall in its packets, for a value written to the
+/// reply buffer: the reply bytes already cut into packets before the buffer
+/// (`base`), where the packet being filled starts (`origin`, counted over
+/// the whole reply), a packet's payload size, and the places the value asks
+/// for a packet to end early (`breaks`, over the whole reply; given to
+/// [`Wire::commit`]). [`Frame::none`] for a value not sent in packets.
+#[derive(Clone, Debug)]
+pub(crate) struct Frame {
+    base: usize,
+    origin: usize,
+    body: usize,
+    breaks: Vec<usize>,
+}
+
+impl Frame {
+    #[cfg(test)]
+    pub(crate) fn none() -> Frame {
+        Frame { base: 0, origin: 0, body: usize::MAX, breaks: Vec::new() }
+    }
+
+    /// The bytes from position `at` of the buffer to the end of the packet
+    /// that position is in: a whole packet's when it opens one.
+    fn room(&self, at: usize) -> usize {
+        if self.body == usize::MAX { usize::MAX } else { self.body - (self.base + at - self.origin) % self.body }
+    }
+
+    /// Ends the packet at position `at` of the buffer: the next one starts
+    /// there.
+    fn break_at(&mut self, at: usize) {
+        self.origin = self.base + at;
+        self.breaks.push(self.origin);
+    }
+}
+
+/// A `max` value (PLP): its length, its data in chunks, a terminator.
+///
+/// Laid out for Microsoft.Data.SqlClient's reader, which fails on two
+/// things that are valid TDS (found by replaying one captured response to
+/// SqlClient 6.1.1 and 7.1.0 in every layout and at every alignment):
+///
+/// - a chunk whose data runs into the next packet: each chunk here ends
+///   where its packet ends;
+/// - a chunk length in the last four bytes of a packet, with its data (or
+///   part of itself) in the next: where fewer than five bytes are left the
+///   packet is ended there, short, and the length opens the next one.
+///
+/// With either, a `SELECT *` over a table with `nvarchar(max)` columns
+/// threw ArgumentOutOfRangeException in `TryReadPlpLength` after a few
+/// hundred rows whenever packets reached the client back to back (without
+/// TLS, where each packet is not a record of its own), or the client
+/// waited for ever. One chunk for the whole value is what this sent.
+fn put_plp(out: &mut Vec<u8>, data: &[u8], frame: &mut Frame) {
     out.extend_from_slice(&(data.len() as u64).to_le_bytes());
-    if !data.is_empty() {
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        out.extend_from_slice(data);
+    let mut rest = data;
+    while !rest.is_empty() {
+        let mut room = frame.room(out.len());
+        if room <= 4 {
+            frame.break_at(out.len());
+            room = frame.room(out.len());
+        }
+        let take = rest.len().min(room - 4).min(u32::MAX as usize);
+        out.extend_from_slice(&(take as u32).to_le_bytes());
+        out.extend_from_slice(&rest[..take]);
+        rest = &rest[take..];
     }
     out.extend_from_slice(&0u32.to_le_bytes());
 }
@@ -1211,6 +1326,7 @@ pub(crate) fn put_value(
     out: &mut Vec<u8>,
     ty: &ColType,
     value: Option<&[u8]>,
+    frame: &mut Frame,
 ) -> Result<(), String> {
     let Some(value) = value else {
         match ty {
@@ -1276,10 +1392,10 @@ pub(crate) fn put_value(
                     out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
                     out.extend_from_slice(&bytes);
                 }
-                None => put_plp(out, &bytes),
+                None => put_plp(out, &bytes, frame),
             }
         }
-        ColType::VarBinaryMax => put_plp(out, &decode_bytea_text(value)),
+        ColType::VarBinaryMax => put_plp(out, &decode_bytea_text(value), frame),
         ColType::Date => {
             let (y, m, d) = parse_date(text()?).ok_or_else(|| bad("the date"))?;
             out.push(3);
@@ -1971,7 +2087,7 @@ mod tests {
     #[test]
     fn values_encode() {
         let mut out = Vec::new();
-        put_value(&mut out, &ColType::Int(4), Some(b"-2")).unwrap();
+        put_value(&mut out, &ColType::Int(4), Some(b"-2"), &mut Frame::none()).unwrap();
         assert_eq!(out, vec![4, 0xfe, 0xff, 0xff, 0xff]);
         let mut out = Vec::new();
         put_value(
@@ -1981,6 +2097,7 @@ mod tests {
                 scale: 2,
             },
             Some(b"19.99"),
+            &mut Frame::none(),
         )
         .unwrap();
         assert_eq!(out, vec![9, 1, 0xcf, 0x07, 0, 0, 0, 0, 0, 0]);
@@ -1989,11 +2106,153 @@ mod tests {
             &mut out,
             &ColType::Guid,
             Some(b"00112233-4455-6677-8899-aabbccddeeff"),
+            &mut Frame::none(),
         )
         .unwrap();
         assert_eq!(
             out[..9],
             [16, 0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66]
         );
+    }
+
+    /// The chunks of the `max` value at `at` of a reply laid out in
+    /// `packets` (the reply offsets each ends at): its data, having checked
+    /// that every chunk's length and data are in one packet together.
+    fn read_plp(reply: &[u8], at: &mut usize, packets: &[usize], what: &str) -> Option<Vec<u8>> {
+        let packet_end = |pos: usize| *packets.iter().find(|end| **end > pos).expect("a packet for every byte");
+        let total = u64::from_le_bytes(reply[*at..*at + 8].try_into().unwrap());
+        *at += 8;
+        if total == u64::MAX {
+            return None;
+        }
+        let mut data = Vec::new();
+        loop {
+            let chunk = u32::from_le_bytes(reply[*at..*at + 4].try_into().unwrap()) as usize;
+            if chunk == 0 {
+                *at += 4;
+                break;
+            }
+            let end = packet_end(*at);
+            assert!(*at + 4 < end, "{what}: a chunk length at {at} ends its packet (which ends at {end})");
+            assert!(*at + 4 + chunk <= end, "{what}: a chunk of {chunk} at {at} runs past its packet (which ends at {end})");
+            data.extend_from_slice(&reply[*at + 4..*at + 4 + chunk]);
+            *at += 4 + chunk;
+        }
+        assert_eq!(data.len() as u64, total, "{what}");
+        Some(data)
+    }
+
+    /// A `max` value's chunks: the value whole when it is not sent in
+    /// packets; in packets, wherever the value starts and whatever its
+    /// length, no chunk's data past the packet it starts in and no chunk
+    /// length alone at a packet's end (the packet ends early instead), the
+    /// chunks together being the value.
+    #[test]
+    fn a_max_value_s_chunks_stay_in_their_packets() {
+        let mut out = Vec::new();
+        put_value(&mut out, &ColType::NVarChar(None), Some(b"ab"), &mut Frame::none()).unwrap();
+        assert_eq!(out, [4, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, b'a', 0, b'b', 0, 0, 0, 0, 0]);
+        let mut out = Vec::new();
+        put_value(&mut out, &ColType::NVarChar(None), Some(b""), &mut Frame::none()).unwrap();
+        assert_eq!(out, [0u8; 12]);
+        let mut out = Vec::new();
+        put_value(&mut out, &ColType::NVarChar(None), None, &mut Frame::none()).unwrap();
+        assert_eq!(out, [0xffu8; 8]);
+
+        for body in [20usize, 61, 504, 4088, 7992] {
+            for start in (0..=24).chain([body - 13, body - 12, body - 11, body - 9, body - 8, body - 5, body - 4, body - 1, body, body + 3]) {
+                for len in [0usize, 1, 2, 3, body / 2 - 6, body / 2 - 5, body - 13, body - 12, body, 2 * body + 1, 5 * body + 3] {
+                    let what = format!("body {body} start {start} len {len}");
+                    let text: String = (0..len).map(|k| char::from(b'a' + (k % 26) as u8)).collect();
+                    let mut frame = Frame { base: 0, origin: 0, body, breaks: Vec::new() };
+                    let mut reply = vec![0xee; start];
+                    put_value(&mut reply, &ColType::NVarChar(None), Some(text.as_bytes()), &mut frame).unwrap();
+                    reply.extend_from_slice(&[0xee; 3]);
+                    let mut breaks: std::collections::VecDeque<usize> = frame.breaks.iter().copied().collect();
+                    let packets: Vec<usize> = packet_cuts(reply.len(), 0, body, &mut breaks, true).iter().map(|(end, _)| *end).collect();
+                    assert_eq!(packets.last(), Some(&reply.len()), "{what}");
+                    let mut from = 0;
+                    for end in &packets {
+                        assert!(end - from <= body && (*end > from || reply.is_empty()), "{what}: a packet of {} bytes", end - from);
+                        from = *end;
+                    }
+                    let mut at = start;
+                    assert_eq!(read_plp(&reply, &mut at, &packets, &what), Some(utf16_bytes(&text)), "{what}");
+                    assert_eq!(at + 3, reply.len(), "{what}");
+                }
+            }
+        }
+    }
+
+    /// A reply of many rows with `max` values, cut into packets as it is
+    /// built (a flush every so often, the last at the end, as `Wire` cuts
+    /// one): the packets together are the reply, none is larger than a
+    /// packet, and every value reads back with its chunks inside packets.
+    #[test]
+    fn a_reply_s_packets_keep_every_max_value_s_chunks_whole() {
+        for body in [61usize, 504, 7992] {
+            for seed in 0..6u64 {
+                // What `Wire` keeps: the buffer, the bytes cut before it,
+                // the packet being filled, the breaks not yet cut.
+                let (mut reply, mut sent, mut origin) = (Vec::<u8>::new(), 0usize, 0usize);
+                let mut breaks = std::collections::VecDeque::new();
+                let mut whole = Vec::<u8>::new();
+                let mut ends = Vec::<usize>::new();
+                let mut values: Vec<(usize, Option<Vec<u8>>)> = Vec::new();
+                let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+                let mut next = |n: u64| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state % n
+                };
+                let mut cut = |reply: &mut Vec<u8>, sent: &mut usize, breaks: &mut std::collections::VecDeque<usize>, whole: &mut Vec<u8>, last: bool| {
+                    let mut from = 0;
+                    for (end, eom) in packet_cuts(reply.len(), *sent, body, breaks, last) {
+                        assert!(end - from <= body);
+                        whole.extend_from_slice(&reply[from..end]);
+                        ends.push(*sent + end);
+                        assert_eq!(eom, last && end == reply.len());
+                        from = end;
+                    }
+                    *sent += from;
+                    reply.drain(..from);
+                };
+                for row in 0..400u64 {
+                    let mut frame = Frame { base: sent, origin, body, breaks: Vec::new() };
+                    reply.push(0xd1);
+                    for column in 0..4 {
+                        // A fixed column of one to nine bytes, then a max one.
+                        let fixed = 1 + next(9) as usize;
+                        reply.extend(std::iter::repeat_n(0xab, fixed));
+                        let value = match next(9) {
+                            0 => None,
+                            1 => Some(String::new()),
+                            2 => Some("x".repeat(next(4) as usize)),
+                            3 | 4 => Some("y".repeat(body / 2 - 8 + next(8) as usize)),
+                            5 => Some("z".repeat(2 * body + next(body as u64) as usize)),
+                            _ => Some("w".repeat(next(60) as usize)),
+                        };
+                        values.push((sent + reply.len(), value.as_ref().map(|v| utf16_bytes(v))));
+                        put_value(&mut reply, &ColType::NVarChar(None), value.as_ref().map(|v| v.as_bytes()), &mut frame).unwrap();
+                        let _ = (row, column);
+                    }
+                    if !frame.breaks.is_empty() {
+                        origin = frame.origin;
+                        breaks.extend(frame.breaks);
+                    }
+                    if reply.len() > 3 * body && next(3) == 0 {
+                        cut(&mut reply, &mut sent, &mut breaks, &mut whole, false);
+                    }
+                }
+                cut(&mut reply, &mut sent, &mut breaks, &mut whole, true);
+                assert!(reply.is_empty() && breaks.is_empty());
+                assert_eq!(ends.last(), Some(&whole.len()));
+                for (at, value) in &values {
+                    let mut at = *at;
+                    assert_eq!(read_plp(&whole, &mut at, &ends, &format!("body {body} seed {seed}")), *value);
+                }
+            }
+        }
     }
 }
