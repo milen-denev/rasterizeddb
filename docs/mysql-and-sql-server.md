@@ -343,14 +343,32 @@ connection or its transaction and released when either ends.
 `OPENJSON(json [, path]) [WITH (column type [path] [AS JSON], …)]` reads JSON
 the statement carries (a literal, a parameter or a variable), which is how EF
 Core passes a list (`ids.Contains(x)`): its rows are written into the
-statement, and `x IN (SELECT value FROM OPENJSON(@ids) WITH (…))` becomes the
-list itself. An object's members come in name order, not as written.
+statement, an object's members in the order written, and
+`x IN (SELECT value FROM OPENJSON(@ids) WITH (…))` becomes the list itself.
+Over a row's JSON (`OPENJSON([t].[Tags])`, EF Core's collections kept in a
+column) it is read by the engine: after `CROSS APPLY` / `OUTER APPLY` as a
+`LATERAL` join, as the relation of a subquery (`(SELECT COUNT(*) FROM
+OPENJSON(col) …)`), and under `EXISTS` and `IN`. That form reads a JSON
+array only (an object is an error) and refuses `NOT IN`.
+
+`COL_LENGTH('table', 'column')` is the column's length in bytes as SQL Server
+counts it, NULL for none such. Text is the engine's one kind, shown as
+`nvarchar`, so a length declared as `varchar(n)` also reads 2n.
+
+**Restarts under a connection pool.** The server acknowledges TDS session
+recovery, so Microsoft.Data.SqlClient (with its default `ConnectRetryCount`)
+finds a connection broken by a server restart before it sends a command and
+reconnects by itself: the session's database and its `SET NOCOUNT`,
+`XACT_ABORT` and `IMPLICIT_TRANSACTIONS` come back. A connection holding
+what cannot come back (an open transaction, a `#table`, a cursor, a session
+application lock) reports the break instead.
+`dotnet/test/tds-reconnect-e2e.sh` runs this against a real SqlClient.
 
 **Refused**: `MERGE … OUTPUT` (other than EF Core's insert form) and a `MERGE`
 that updates a column its `ON` reads, `FOR XML RAW/AUTO/EXPLICIT`, stored
 functions and triggers, `rowversion`, computed columns, unique indexes
-with any other filter, `APPLY` of a table-valued function, `OPENJSON` over
-a column or an expression,
+with any other filter, `APPLY` of a table-valued function other than `OPENJSON`, `OPENJSON` over a
+row's JSON in a plain join,
 `SET ROWCOUNT`, `TOP … PERCENT/WITH TIES`, `OUTPUT … INTO`, `SELECT @v = @v
 + … FROM` over more than one row, and Windows authentication.
 `TRY_CAST`/`TRY_CONVERT` raise the conversion error where SQL Server would
