@@ -1338,3 +1338,52 @@ mod r2r3_tests {
         ));
     }
 }
+
+/// Relations from before owners were recorded (roles plan R0): the first
+/// time a database is prepared they get its owner and, so nothing that
+/// worked before stops working, every table privilege for PUBLIC; once it
+/// has been prepared, a relation found without an owner gets the owner
+/// alone and is closed to the other roles until granted. (The compat suite
+/// could not make such a relation over SQL once user SQL could not write
+/// `__rdb_acl`; this is where it is made now.)
+#[cfg(test)]
+mod legacy_owner_tests {
+    use super::*;
+    use crate::core::rql::{executor, lexer_s1::recognize_query_purpose};
+
+    async fn run(db: &Arc<Database>, sql: &str) {
+        let out = executor::execute(recognize_query_purpose(sql).unwrap(), db.clone()).await;
+        assert!(out.first().is_some_and(|b| *b != 3), "{sql}: {}", String::from_utf8_lossy(&out));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relation_without_an_owner_keeps_its_old_access_once_then_is_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = crate::MAX_PERMITS_THREADS.set(4);
+        let _ = crate::BATCH_SIZE.set(512);
+        let db = Arc::new(Database::new_named(&dir.path().to_string_lossy(), false, "legacy").await);
+        // Made before the database had roles: no owner row.
+        run(&db, "CREATE TABLE legacy_free (a INT)").await;
+        assert!(load(&db, None).await.unwrap_or_default().iter().all(|r| r.relation != "legacy_free"));
+
+        // The first preparation: its owner, and PUBLIC keeps what it had.
+        crate::auth::ensure_role_catalogue(&db, "boss", Some("pw"), crate::auth::AuthMethod::ScramSha256).await.unwrap();
+        crate::auth::prepare_owners(&db, "boss").await;
+        let rows = load(&db, None).await.unwrap();
+        assert_eq!(owner_of(&rows, "legacy_free"), Some("boss"));
+        for privilege in ["SELECT", "INSERT", "UPDATE", "DELETE"] {
+            assert!(allows(&rows, "app", "legacy_free", privilege), "a legacy relation lost {privilege} for other roles");
+        }
+        assert!(!owns(&rows, "app", "legacy_free"), "PUBLIC's grant is not ownership: no ALTER, DROP or GRANT");
+
+        // After it: a relation found without an owner is the owner's alone.
+        run(&db, "CREATE TABLE later (a INT)").await;
+        delete_where(&db, "relation = 'later'", None).await.unwrap();
+        assert_eq!(assign_owners(&db, "boss").await.unwrap(), 1);
+        let rows = load(&db, None).await.unwrap();
+        assert_eq!(owner_of(&rows, "later"), Some("boss"));
+        assert!(!allows(&rows, "app", "later", "SELECT"), "an ownerless relation after the upgrade must be closed");
+        // And the legacy one keeps its grants: the upgrade ran once.
+        assert!(allows(&rows, "app", "legacy_free", "SELECT"));
+    }
+}
