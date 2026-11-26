@@ -136,6 +136,7 @@ pub fn run_with(cfg: Config, hooks: Hooks) -> Result<(), String> {
         schema_epoch: AtomicU64::new(0),
         draining: AtomicBool::new(false),
         sessions: AtomicUsize::new(0),
+        tagged_txns: AtomicUsize::new(0),
         secret: scram::random_bytes::<32>(),
         #[cfg(feature = "tls")]
         tls,
@@ -263,6 +264,12 @@ fn worker(id: usize, shared: Arc<Shared>, listeners: Vec<std::net::TcpListener>,
                 loop {
                     tick.tick().await;
                     core.publish();
+                    // Idle shard sessions kept too long are closed.
+                    for (shard, id) in core.expired_idle() {
+                        if let Ok(link) = core.link(shard) {
+                            let _ = link.call(&core, &Request::CloseSession { session: id }.encode()).await;
+                        }
+                    }
                 }
             });
         }
@@ -373,6 +380,7 @@ fn probe_shared(cfg: Config) -> Shared {
         schema_epoch: AtomicU64::new(0),
         draining: AtomicBool::new(false),
         sessions: AtomicUsize::new(0),
+        tagged_txns: AtomicUsize::new(0),
         secret: [0; 32],
         #[cfg(feature = "tls")]
         tls: None,
@@ -403,6 +411,12 @@ fn client_tls(cfg: &Config) -> Result<Option<state::ClientTls>, String> {
 /// anything to end). A shard that cannot answer is left out this round.
 async fn detect_deadlocks(core: &Rc<core::Core>) {
     use rasterizeddb_router::rshard::{Request, Response};
+    // A cycle this gateway can end has one of its own transactions in it
+    // (every gateway runs its own detector): with none open, no shard is
+    // asked.
+    if core.shared.tagged_txns.load(Ordering::Acquire) == 0 {
+        return;
+    }
     let shards: Vec<u32> = core.shared.map.get().shards().iter().map(|s| s.id).collect();
     let mut edges = Vec::new();
     for &s in &shards {

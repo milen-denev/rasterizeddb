@@ -42,6 +42,9 @@
 //! | 0x08 | Classify | database str, schema_epoch u64, source u8 (0 simple shape, 1 Parse text), text str |
 //! | 0x09 | ExecPart | session u64, map_epoch u64, merge [`Merge`], bytes (pgwire frontend messages) |
 //! | 0x0A | Cancel | backend_key u64 |
+//! | 0x15 | Pg, routed | as 0x05. The gateway sent the statement here by a route template that names one shard (a key, a fixed block, the home shard): the shard runs it as it is, and does not ask itself whether it is a keyless statement to coordinate |
+//! | 0x16 | Forget | gid str: every part of global transaction `gid` has been told its outcome, so the anchor's decision for it is dropped. Answered Done |
+//! | 0x17 | ResetSession | session u64: the session is put back as it was when opened (`RESET ROLE`, `DISCARD ALL`), for another client of the same database, role and parameters. Answered Done; Refused when the session is mid-statement, in a transaction, or did not reset cleanly (the gateway then closes it) |
 //! | 0x14 | Compression | codec u8 (1 zstd), level i32, min_bytes u32: frames from now on may be [`compressed_frame`]s |
 //! | 0x13 | Coordinate | session u64, map_epoch u64, partials list(bytes), bytes (one simple Query) |
 //! | 0x0B | Native | database str, role str, map_epoch u64, bytes (one native-protocol request) |
@@ -223,9 +226,16 @@ pub enum Request {
         gateway: String,
         pinned: bool,
     },
-    Pg { session: u64, map_epoch: u64, bytes: Vec<u8> },
+    /// `routed`: sent by a route template that names this shard (kind
+    /// 0x15), so nothing here is a keyless statement to coordinate.
+    Pg { session: u64, map_epoch: u64, bytes: Vec<u8>, routed: bool },
     Continue { session: u64 },
     CloseSession { session: u64 },
+    /// Puts `session` back as it was when opened, so the gateway can hand
+    /// it to its next client of the same database, role and parameters
+    /// instead of opening one. Answered `Done`, or refused when it cannot
+    /// be reused.
+    ResetSession { session: u64 },
     Classify { database: String, schema_epoch: u64, source: Source, text: String },
     ExecPart { session: u64, map_epoch: u64, merge: Merge, bytes: Vec<u8> },
     Cancel { backend_key: u64 },
@@ -236,6 +246,11 @@ pub enum Request {
     Decide { gid: String, commit: bool },
     /// The decision recorded for `gid`, if any.
     Decision { gid: String },
+    /// Every part of global transaction `gid` has been told its outcome:
+    /// the anchor drops its decision, which nothing can ask for again. What
+    /// keeps the decision log as long as the transactions in doubt, not as
+    /// long as the cluster's history. Answered `Done`.
+    Forget { gid: String },
     /// The waits between the gateway's tagged multi-shard transactions on
     /// this shard (B4.2), answered by [`Response::Waits`].
     Waits,
@@ -617,15 +632,18 @@ impl Request {
             Request::MapFetch => 0x02,
             Request::AuthFetch { .. } => 0x03,
             Request::OpenSession { .. } => 0x04,
-            Request::Pg { .. } => 0x05,
+            Request::Pg { routed: false, .. } => 0x05,
+            Request::Pg { routed: true, .. } => 0x15,
             Request::Continue { .. } => 0x06,
             Request::CloseSession { .. } => 0x07,
+            Request::ResetSession { .. } => 0x17,
             Request::Classify { .. } => 0x08,
             Request::ExecPart { .. } => 0x09,
             Request::Cancel { .. } => 0x0A,
             Request::Native { .. } => 0x0B,
             Request::Decide { .. } => 0x0C,
             Request::Decision { .. } => 0x0D,
+            Request::Forget { .. } => 0x16,
             Request::Waits => 0x0E,
             Request::AbortTxn { .. } => 0x0F,
             Request::Notifications { .. } => 0x10,
@@ -654,10 +672,10 @@ impl Request {
                 }
                 w.str(gateway).u8(*pinned as u8);
             }
-            Request::Pg { session, map_epoch, bytes } => {
+            Request::Pg { session, map_epoch, bytes, .. } => {
                 w.u64(*session).u64(*map_epoch).bytes(bytes);
             }
-            Request::Continue { session } | Request::CloseSession { session } => {
+            Request::Continue { session } | Request::CloseSession { session } | Request::ResetSession { session } => {
                 w.u64(*session);
             }
             Request::Classify { database, schema_epoch, source, text } => {
@@ -677,7 +695,7 @@ impl Request {
             Request::Decide { gid, commit } => {
                 w.str(gid).u8(*commit as u8);
             }
-            Request::Decision { gid } => {
+            Request::Decision { gid } | Request::Forget { gid } => {
                 w.str(gid);
             }
             Request::Waits => {}
@@ -708,15 +726,37 @@ impl Request {
     /// Encodes a [`Request::Pg`] without building one: the hot path's
     /// encoder, which copies the client's bytes once.
     pub fn encode_pg(out: &mut Vec<u8>, session: u64, map_epoch: u64, bytes: &[u8]) {
+        Self::encode_pg_as(out, false, session, map_epoch, bytes);
+    }
+
+    /// [`Self::encode_pg`], `routed` or not (see [`Request::Pg`]).
+    pub fn encode_pg_as(out: &mut Vec<u8>, routed: bool, session: u64, map_epoch: u64, bytes: &[u8]) {
         out.clear();
-        out.reserve(26 + bytes.len());
+        out.reserve(PG_HEAD + bytes.len());
+        Self::begin_pg(out, routed, session, map_epoch);
+        out.extend_from_slice(bytes);
+        Self::finish_pg(out);
+    }
+
+    /// Starts a [`Request::Pg`] in `out` (cleared first): the caller appends
+    /// the frontend messages straight after it, then calls
+    /// [`Self::finish_pg`]. For a request put together from several pieces,
+    /// which are then copied once.
+    pub fn begin_pg(out: &mut Vec<u8>, routed: bool, session: u64, map_epoch: u64) {
+        out.clear();
         out.extend_from_slice(&MAGIC);
         out.push(VERSION);
-        out.push(0x05);
+        out.push(if routed { 0x15 } else { 0x05 });
         out.extend_from_slice(&session.to_le_bytes());
         out.extend_from_slice(&map_epoch.to_le_bytes());
-        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        out.extend_from_slice(bytes);
+        out.extend_from_slice(&0u32.to_le_bytes());
+    }
+
+    /// Ends a request [`Self::begin_pg`] started: writes the length of the
+    /// messages appended since.
+    pub fn finish_pg(out: &mut [u8]) {
+        let n = (out.len() - PG_HEAD) as u32;
+        out[PG_HEAD - 4..PG_HEAD].copy_from_slice(&n.to_le_bytes());
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Request, String> {
@@ -743,9 +783,10 @@ impl Request {
                 }
                 Request::OpenSession { session, database, role, params, gateway: r.str()?, pinned: r.bool()? }
             }
-            0x05 => Request::Pg { session: r.u64()?, map_epoch: r.u64()?, bytes: r.bytes()?.to_vec() },
+            k @ (0x05 | 0x15) => Request::Pg { session: r.u64()?, map_epoch: r.u64()?, bytes: r.bytes()?.to_vec(), routed: k == 0x15 },
             0x06 => Request::Continue { session: r.u64()? },
             0x07 => Request::CloseSession { session: r.u64()? },
+            0x17 => Request::ResetSession { session: r.u64()? },
             0x08 => {
                 let database = r.str()?;
                 let schema_epoch = r.u64()?;
@@ -765,6 +806,7 @@ impl Request {
             0x0A => Request::Cancel { backend_key: r.u64()? },
             0x0B => Request::Native { database: r.str()?, role: r.str()?, map_epoch: r.u64()?, bytes: r.bytes()?.to_vec() },
             0x0C => Request::Decide { gid: r.str()?, commit: r.bool()? },
+            0x16 => Request::Forget { gid: r.str()? },
             0x0D => Request::Decision { gid: r.str()? },
             0x0E => Request::Waits,
             0x0F => Request::AbortTxn { gid: r.str()? },
@@ -788,6 +830,10 @@ impl Request {
         Ok(req)
     }
 }
+
+/// The bytes of a [`Request::Pg`] before its frontend messages: magic,
+/// version, kind, session, map epoch and the messages' length.
+const PG_HEAD: usize = 2 + 1 + 1 + 8 + 8 + 4;
 
 impl Response {
     pub fn kind(&self) -> u8 {
@@ -1039,6 +1085,34 @@ pub fn parse_native_text_route(value: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod compression_tests {
     use super::*;
+
+    #[test]
+    fn a_routed_pg_request_and_one_built_in_pieces_round_trip() {
+        for routed in [false, true] {
+            let r = Request::Pg { session: 7, map_epoch: 3, bytes: b"Q\0\0\0\x05\0".to_vec(), routed };
+            assert_eq!(Request::decode(&r.encode()).unwrap(), r);
+            let mut whole = Vec::new();
+            Request::encode_pg_as(&mut whole, routed, 7, 3, b"Q\0\0\0\x05\0");
+            assert_eq!(whole, r.encode());
+            // Built in pieces: the same bytes, the length written last.
+            let mut pieces = vec![0xFF; 3];
+            Request::begin_pg(&mut pieces, routed, 7, 3);
+            pieces.extend_from_slice(b"Q\0\0");
+            pieces.extend_from_slice(b"\0\x05\0");
+            Request::finish_pg(&mut pieces);
+            assert_eq!(pieces, whole);
+        }
+        let mut plain = Vec::new();
+        Request::encode_pg(&mut plain, 1, 2, b"");
+        assert_eq!(Request::decode(&plain).unwrap(), Request::Pg { session: 1, map_epoch: 2, bytes: Vec::new(), routed: false });
+    }
+
+    #[test]
+    fn forget_and_reset_session_round_trip() {
+        for r in [Request::Forget { gid: "rdb2pc:gw:1a:7".into() }, Request::ResetSession { session: 99 }] {
+            assert_eq!(Request::decode(&r.encode()).unwrap(), r);
+        }
+    }
 
     #[test]
     fn compression_round_trips_and_frames_tell_themselves_apart() {

@@ -53,6 +53,8 @@ the file. A dash in a key means the same as an underscore.
 | `shard_timeout_ms` | `0` (none) | A request timeout towards shards. |
 | `server_version` | `17.0` | What clients see in `server_version`. |
 | `retries` | `3` | How many times a before-effect refusal is retried. |
+| `session_pool` | `0` (off) | How many idle shard sessions each core keeps for its next clients (below). |
+| `session_pool_idle_secs` | `30` | How long an idle shard session is kept before it is closed. |
 
 ### Upgrading without downtime
 
@@ -119,9 +121,28 @@ A session-level `SET` (or `RESET`, `DISCARD ALL`) runs on the home shard
 and on every virtual session that is already open. The gateway also records
 it and replays it on every virtual session that opens later.
 
+### Reusing shard sessions (`session_pool`)
+
+By default a client's sessions on the shards are closed when it
+disconnects, and its next connection opens new ones: one round trip and one
+login on each shard it reaches. With `session_pool = N`, each core keeps up
+to `N` of them instead. This is for clients that connect per request.
+
+- A session is kept only when the client left it between statements and
+  outside a transaction. The shard then puts it back as it was when opened
+  (`RESET ROLE`, `DISCARD ALL`: settings, prepared statements, temporary
+  tables, sequence values). A session that does not reset cleanly is closed.
+- It is given only to a client with the same database, role and startup
+  parameters, on the same core.
+- An idle session is closed after `session_pool_idle_secs`.
+- `SHOW GATEWAY` counts the reuses in `virtual_sessions_reused`.
+
 ### Prepared statements
 
 - Parse, Bind, Describe, Execute and Close are forwarded unchanged.
+- Where a prepared statement's key is, is looked up once and kept with the
+  statement. It is looked up again after a schema change, or after a shard
+  refused a statement the gateway had routed by a template.
 - A statement parsed on one shard is parsed again on another shard the
   first time it routes there. The gateway adds that Parse itself and
   removes its reply.
@@ -253,6 +274,7 @@ the reference for the shard side (`core/shard/rshard.rs`, `backend.rs`,
 `classify.rs`).
 
 Results come back in chunks, never splitting a pgwire message. The gateway
-asks for each next chunk only after writing the previous one to the client.
-So a client that stops reading holds up its own session and nothing else
-(R3).
+asks for the next chunk while it writes the previous one to the client, and
+for no further one until that write is done. So a client that stops reading
+holds up its own session and nothing else, and the gateway holds at most
+one chunk it has not taken (R3).
