@@ -266,7 +266,11 @@ const STARTS: &[&str] = &[
 /// Where the simple statement starting at `start` ends (exclusive).
 fn statement_end(tokens: &[Token], start: usize) -> usize {
     let head = tokens[start].upper().unwrap_or_default();
-    let mut depth = 0i32;
+    // A statement that opens with a parenthesis (a set operation's first
+    // branch, `(SELECT 1 UNION SELECT 2) INTERSECT SELECT 2`) is inside it
+    // from its first token: counted from zero, the branch's SELECT read as
+    // the next statement and the batch was "(" and the rest.
+    let mut depth = i32::from(tokens[start].is_op("("));
     let mut case_depth = 0i32;
     let mut seen_set = false;
     let mut main_verb = head != "WITH";

@@ -1972,6 +1972,26 @@ async fn tiberius_split_query_parent_and_child_agree_on_guid_order() {
     assert_eq!(r[2].iter().map(|r| r.get::<i32, _>(0).unwrap()).collect::<Vec<_>>(), [5]);
 }
 
+/// A set operation's branch in parentheses, and a row assignment mixing an
+/// aggregate with a plain value: the engine rewrites both through a derived
+/// table it names itself. Named `__rdb_…`, the role guard took the alias
+/// for a catalogue and refused the client's statement ("permission denied:
+/// "__rdb_branch0" is a system catalog").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_engine_named_aliases_pass_the_catalogue_guard() {
+    let s = start();
+    let mut c = connect(&s).await;
+    let r = batch(&mut c, "(SELECT 1 UNION SELECT 2) INTERSECT SELECT 2; SELECT 2 INTERSECT (SELECT 1 UNION SELECT 2)").await.unwrap();
+    for rows in &r {
+        assert_eq!(rows.iter().map(|r| r.get::<i32, _>(0).unwrap()).collect::<Vec<_>>(), [2]);
+    }
+    batch(&mut c, "CREATE TABLE [G] ([Id] int PRIMARY KEY, [N] int NULL, [V] nvarchar(20) NULL); INSERT INTO [G] VALUES (1, 5, N'a'), (2, 9, N'b')")
+        .await
+        .unwrap();
+    let r = batch(&mut c, "UPDATE [G] SET [N] = (SELECT MAX([x].[N]) FROM [G] AS [x]) WHERE [Id] = 1; SELECT [N] FROM [G] ORDER BY [Id]").await.unwrap();
+    assert_eq!(r.last().unwrap().iter().map(|r| r.get::<i32, _>(0).unwrap()).collect::<Vec<_>>(), [9, 9]);
+}
+
 /// NULLs sort first ascending and last descending, as SQL Server's (NULL is
 /// its least value); the engine put them last ascending. And a sort by a
 /// nullable `datetime2(7)` then a uniqueidentifier with TOP took the server
