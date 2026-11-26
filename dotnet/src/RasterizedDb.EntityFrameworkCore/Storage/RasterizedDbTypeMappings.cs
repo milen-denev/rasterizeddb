@@ -60,7 +60,7 @@ public class RasterizedDbDoubleTypeMapping : DoubleTypeMapping
 
     protected override RelationalTypeMapping Clone(RelationalTypeMappingParameters parameters) => new RasterizedDbDoubleTypeMapping(parameters);
 
-    protected override string GenerateNonNullSqlLiteral(object value) => Literal((double)value, "double precision");
+    protected override string GenerateNonNullSqlLiteral(object value) => Literal(Convert.ToDouble(value, CultureInfo.InvariantCulture), "double precision");
 
     internal static string Literal(double value, string type)
     {
@@ -100,7 +100,7 @@ public class RasterizedDbFloatTypeMapping : FloatTypeMapping
 
     protected override string GenerateNonNullSqlLiteral(object value)
     {
-        var single = (float)value;
+        var single = Convert.ToSingle(value, CultureInfo.InvariantCulture);
         if (float.IsNaN(single) || float.IsInfinity(single))
         {
             return RasterizedDbDoubleTypeMapping.Literal(single, "real");
@@ -322,7 +322,8 @@ public class RasterizedDbDecimalTypeMapping : DecimalTypeMapping
 
     protected override string GenerateNonNullSqlLiteral(object value)
     {
-        var number = (decimal)value;
+        // A constant EF Core made of another numeric type (the 0 of COALESCE(SUM(x), 0)) arrives as that type.
+        var number = Convert.ToDecimal(value, CultureInfo.InvariantCulture);
         var text = number.ToString(CultureInfo.InvariantCulture);
         return number < 0 ? $"({text})" : text;
     }
