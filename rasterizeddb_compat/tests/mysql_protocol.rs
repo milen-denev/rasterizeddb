@@ -403,8 +403,11 @@ async fn mysql_refuses_a_wrong_password_and_plain_first_login() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mysql_prepared_session_statements_and_catalogue() {
     let s = start(MyAuth::Trust);
+    // A trust login runs as the role it names, which must exist (roles plan
+    // R0, the same rule as pgwire's and the native protocol's): the
+    // bootstrap superuser here.
     let mut c = sqlx::MySqlConnection::connect(&format!(
-        "mysql://anyone@127.0.0.1:{}/postgres?ssl-mode=disabled",
+        "mysql://rasterized@127.0.0.1:{}/postgres?ssl-mode=disabled",
         s.mysql_port
     ))
     .await
@@ -464,8 +467,10 @@ async fn mysql_prepared_session_statements_and_catalogue() {
         .fetch_one(&mut c)
         .await
         .unwrap();
+    // KILL QUERY of another connection's statement: as that role or a
+    // superuser.
     let mut killer = sqlx::MySqlConnection::connect(&format!(
-        "mysql://anyone@127.0.0.1:{}/postgres?ssl-mode=disabled",
+        "mysql://rasterized@127.0.0.1:{}/postgres?ssl-mode=disabled",
         s.mysql_port
     ))
     .await
