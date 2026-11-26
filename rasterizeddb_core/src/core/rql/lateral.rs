@@ -1187,6 +1187,18 @@ pub(crate) async fn materialize(
                     "SELECT DISTINCT {} FROM {relation} {alias}",
                     columns.iter().map(|c| format!("{alias}.{c}::text")).collect::<Vec<_>>().join(", ")
                 );
+                // A statement whose filter holds a subquery (an EXISTS) is
+                // cut to the rows it keeps before anything is probed
+                // (`limited_outer`): the probe would run the filter, each
+                // item's copy of the outer rows again, and the statement
+                // once more.
+                if !limited {
+                    if let Some(cut) = limited_outer(&current, alias, relation, usize::MAX).filter(|cut| cut.subquery) {
+                        limited = true;
+                        current = cut_outer(cut, &current, alias, relation, database, temps, tx).await?;
+                        continue;
+                    }
+                }
                 // Only the outer rows the statement can keep need a run. The
                 // item ran for every row of the outer relation: one customer
                 // of a thousand cost a thousand runs, and an outer table past
@@ -1217,21 +1229,7 @@ pub(crate) async fn materialize(
                 if !limited {
                     if let Some(cut) = limited_outer(&current, alias, relation, tuples.len()) {
                         limited = true;
-                        // The columns the statement goes on to read, where
-                        // that can be told; whole rows otherwise.
-                        // (Without the alias the copy is given, which is
-                        // not a read of it.)
-                        let after = cut.after.trim_start();
-                        let outside = format!("{} {}", cut.before, after.strip_prefix(cut.written.as_str()).unwrap_or(after));
-                        let body = match needed_columns(relation, alias, &outside, database) {
-                            Some(list) => cut.body.replacen(&format!("SELECT {}.*", cut.written), &format!("SELECT {list}"), 1),
-                            None => crate::core::rql::cte::whole_rows_with_hidden(&cut.body, database).unwrap_or(cut.body),
-                        };
-                        let built = crate::core::rql::cte::materialize_query(&body, alias, &current, database, tx).await?;
-                        temps.push(built.clone());
-                        #[cfg(test)]
-                        test_hooks::record_limited(alias);
-                        current = format!("{}{built}{}", cut.before, cut.after);
+                        current = cut_outer(cut, &current, alias, relation, database, temps, tx).await?;
                         continue;
                     }
                 }
@@ -1391,6 +1389,33 @@ pub(crate) async fn materialize(
     Ok(found.then_some(current))
 }
 
+/// The statement `current` with its outer item replaced by a copy of the
+/// rows `cut` keeps, built here and named in `temps`.
+async fn cut_outer(
+    cut: LimitedOuter,
+    current: &str,
+    alias: &str,
+    relation: &str,
+    database: &Arc<Database>,
+    temps: &mut Vec<String>,
+    tx: TxId,
+) -> Result<String, String> {
+    // The columns the statement goes on to read, where that can be told;
+    // whole rows otherwise. (Without the alias the copy is given, which is
+    // not a read of it.)
+    let after = cut.after.trim_start();
+    let outside = format!("{} {}", cut.before, after.strip_prefix(cut.written.as_str()).unwrap_or(after));
+    let body = match needed_columns(relation, alias, &outside, database) {
+        Some(list) => cut.body.replacen(&format!("SELECT {}.*", cut.written), &format!("SELECT {list}"), 1),
+        None => crate::core::rql::cte::whole_rows_with_hidden(&cut.body, database).unwrap_or(cut.body),
+    };
+    let built = crate::core::rql::cte::materialize_query(&body, alias, current, database, tx).await?;
+    temps.push(built.clone());
+    #[cfg(test)]
+    test_hooks::record_limited(alias);
+    Ok(format!("{}{built}{}", cut.before, cut.after))
+}
+
 /// A statement cut to the rows its `LIMIT` keeps ([`limited_outer`]): the
 /// query of those rows, and the statement around the relation they are
 /// copied to (`before`, the relation's name, `after`).
@@ -1399,6 +1424,8 @@ struct LimitedOuter {
     body: String,
     /// The outer item's alias as the statement spells it.
     written: String,
+    /// Whether the statement's `WHERE` holds a subquery.
+    subquery: bool,
     before: String,
     after: String,
 }
@@ -1433,7 +1460,11 @@ struct LimitedOuter {
 ///   and holds no parameter;
 /// - the `ORDER BY` is the outer item's own qualified columns: an output
 ///   name or an ordinal may be an item's value;
-/// - `LIMIT` and `OFFSET` are integers, and `tuples` is more than their sum.
+/// - `LIMIT` and `OFFSET` are integers, and `tuples` is more than their sum;
+///   or the `WHERE` holds a subquery, with a `LIMIT` or without: an
+///   `EXISTS` there was run by each item's probe and again by each item's
+///   copy of the outer rows, where the copy made here runs it once and
+///   everything after reads the rows it kept.
 fn limited_outer(sql: &str, alias: &str, relation: &str, tuples: usize) -> Option<LimitedOuter> {
     use crate::core::rql::correlated::ALIAS_PREFIX;
     let lead = sql.len() - sql.trim_start().len();
@@ -1500,7 +1531,7 @@ fn limited_outer(sql: &str, alias: &str, relation: &str, tuples: usize) -> Optio
     if rest.contains('$') {
         return None;
     }
-    let tail_at = ["LIMIT", "OFFSET"].iter().filter_map(|w| find_keyword(rest, w, 0)).min()?;
+    let tail_at = ["LIMIT", "OFFSET"].iter().filter_map(|w| find_keyword(rest, w, 0)).min().unwrap_or(rest.len());
     let order_at = find_keyword(rest, "ORDER", 0);
     if order_at.is_some_and(|o| o > tail_at) {
         return None;
@@ -1536,16 +1567,24 @@ fn limited_outer(sql: &str, alias: &str, relation: &str, tuples: usize) -> Optio
             }
         }
     }
-    // `LIMIT n [OFFSET m]` or `OFFSET m LIMIT n`, integers.
+    // `LIMIT n [OFFSET m]` or `OFFSET m LIMIT n`, integers; or neither.
     let tail = rest[tail_at..].trim();
     let words: Vec<&str> = tail.split_whitespace().collect();
-    let (limit, offset) = match words.as_slice() {
-        [l, n] if l.eq_ignore_ascii_case("LIMIT") => (n.parse::<usize>().ok()?, 0),
-        [l, n, o, m] if l.eq_ignore_ascii_case("LIMIT") && o.eq_ignore_ascii_case("OFFSET") => (n.parse::<usize>().ok()?, m.parse::<usize>().ok()?),
-        [o, m, l, n] if l.eq_ignore_ascii_case("LIMIT") && o.eq_ignore_ascii_case("OFFSET") => (n.parse::<usize>().ok()?, m.parse::<usize>().ok()?),
+    let kept: Option<usize> = match words.as_slice() {
+        [] => None,
+        [l, n] if l.eq_ignore_ascii_case("LIMIT") => Some(n.parse::<usize>().ok()?),
+        [l, n, o, m] if l.eq_ignore_ascii_case("LIMIT") && o.eq_ignore_ascii_case("OFFSET") => {
+            Some(n.parse::<usize>().ok()?.checked_add(m.parse::<usize>().ok()?)?)
+        }
+        [o, m, l, n] if l.eq_ignore_ascii_case("LIMIT") && o.eq_ignore_ascii_case("OFFSET") => {
+            Some(n.parse::<usize>().ok()?.checked_add(m.parse::<usize>().ok()?)?)
+        }
         _ => return None,
     };
-    if tuples <= limit.checked_add(offset)? {
+    // A filter holding a subquery is run once for the copy, where each
+    // item's probe and each item's copy of the outer rows ran it again.
+    let subquery = names_word(filter, "SELECT");
+    if !subquery && kept.is_none_or(|kept| tuples <= kept) {
         return None;
     }
     let mut body = format!("SELECT {written}.* FROM {head}");
@@ -1564,7 +1603,7 @@ fn limited_outer(sql: &str, alias: &str, relation: &str, tuples: usize) -> Optio
         after.push(' ');
         after.push_str(order);
     }
-    Some(LimitedOuter { body, written: written.to_string(), before: sql[..head_at].to_string(), after })
+    Some(LimitedOuter { body, written: written.to_string(), before: sql[..head_at].to_string(), after, subquery })
 }
 
 /// Whether `text` (a statement, or the parts of one) could read a column of

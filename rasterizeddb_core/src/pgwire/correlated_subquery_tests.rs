@@ -367,25 +367,55 @@ async fn the_related_items_statement_runs_its_subqueries_for_the_tagged() {
          WHERE {ALIAS_RI}.id = d0.productsid AND d1.content IN ('realme c53', 'nothing')) ORDER BY {ALIAS_RI}.id LIMIT 10",
         pid(77)
     );
+    use crate::core::rql::lateral::test_hooks::{take_limited, take_narrowed_copies};
     take_runs("ri\u{2024}erp\u{2024}products", ALIAS_RI);
-    crate::core::rql::lateral::test_hooks::take_narrowed_copies(ALIAS_RI);
+    take_narrowed_copies(ALIAS_RI);
+    take_limited(ALIAS_RI);
     let rows = pg_rows(&db, &mut s, &sql).await;
     let runs = take_runs("ri\u{2024}erp\u{2024}products", ALIAS_RI);
-    let narrowed_copies = crate::core::rql::lateral::test_hooks::take_narrowed_copies(ALIAS_RI);
     let ns: Vec<String> = rows.iter().map(|r| r[0].clone().unwrap_or_default()).collect();
     assert_eq!(ns, ["3", "150"], "{rows:?}");
     assert_eq!(rows[0][1].as_deref(), Some("3.500000"));
     assert!(rows.iter().all(|r| r[2].is_some()), "{rows:?}");
     // Two items, each for the two products kept (not for all 200).
-    assert!(runs <= 2 * 3, "the subqueries ran {runs} times");
-    // And the outer item's copy (made to carry each item's join key) holds
-    // the kept products only: both copies took the filter.
-    assert_eq!(narrowed_copies, 2);
-    // Native answers the same.
+    assert_eq!(runs, 2 * 2, "the subqueries ran {runs} times");
+    // The filter holds a subquery (the EXISTS): the outer rows it keeps are
+    // copied once, before anything is probed, and nothing after runs it
+    // again: no copy needs narrowing.
+    assert_eq!(take_limited(ALIAS_RI), 1);
+    assert_eq!(take_narrowed_copies(ALIAS_RI), 0);
+    // Native answers the same, the same way.
     let native = native_rows(&db, &sql).await;
     assert_eq!(native.iter().map(|r| r[0].clone().unwrap_or_default()).collect::<Vec<_>>(), ["3", "150"]);
-    // (Native narrowed its two copies as well.)
-    assert_eq!(crate::core::rql::lateral::test_hooks::take_narrowed_copies(ALIAS_RI), 2);
+    assert_eq!(take_limited(ALIAS_RI), 1);
+    assert_eq!(take_narrowed_copies(ALIAS_RI), 0);
+    assert_eq!(take_runs("ri\u{2024}erp\u{2024}products", ALIAS_RI), 2 * 2);
+    // Without the LIMIT the same cut is made: the EXISTS is still run once.
+    let unlimited = sql.strip_suffix(" LIMIT 10").expect("the limit").to_string();
+    let rows = pg_rows(&db, &mut s, &unlimited).await;
+    assert_eq!(rows.iter().map(|r| r[0].clone().unwrap_or_default()).collect::<Vec<_>>(), ["3", "150"]);
+    assert_eq!(take_limited(ALIAS_RI), 1);
+    assert_eq!(take_runs("ri\u{2024}erp\u{2024}products", ALIAS_RI), 2 * 2);
+
+    // A filter of the outer item's own columns, no subquery and no LIMIT:
+    // probed, and each item's copy of the outer rows (made to carry its
+    // join key) holds the kept products only: both copies took the filter.
+    let plain = format!(
+        "SELECT {ALIAS_RI}.n, (SELECT d2.price FROM {pr} AS d2 WHERE {ALIAS_RI}.id = d2.productid LIMIT 1), \
+         (SELECT COUNT(*) FROM {pt} AS d3 WHERE {ALIAS_RI}.id = d3.productsid) FROM {p} AS {ALIAS_RI} \
+         WHERE {ALIAS_RI}.companyid = '{company}' AND {ALIAS_RI}.n IN (3, 150) ORDER BY {ALIAS_RI}.id"
+    );
+    let rows = pg_rows(&db, &mut s, &plain).await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("3".to_string()), Some("3.500000".to_string()), Some("2".to_string())],
+            vec![Some("150".to_string()), Some("150.500000".to_string()), Some("2".to_string())]
+        ]
+    );
+    assert_eq!(take_limited(ALIAS_RI), 0);
+    assert_eq!(take_narrowed_copies(ALIAS_RI), 2);
+    assert_eq!(take_runs("ri\u{2024}erp\u{2024}products", ALIAS_RI), 2 * 2);
 
     // A statement whose WHERE keeps an outer row the filter alone would
     // not decide (an OR with another item is left to the statement): the
@@ -397,7 +427,7 @@ async fn the_related_items_statement_runs_its_subqueries_for_the_tagged() {
     let rows = pg_rows(&db, &mut s, &all).await;
     assert_eq!(rows.iter().map(|r| r[0].clone().unwrap_or_default()).collect::<Vec<_>>(), ["1", "2", "3"]);
     assert_eq!(rows[2][1].as_deref(), Some("3.500000"));
-    assert_eq!(crate::core::rql::lateral::test_hooks::take_narrowed_copies(ALIAS_RI), 0);
+    assert_eq!(take_narrowed_copies(ALIAS_RI), 0);
 }
 
 /// One distinct tuple of outer values (a point lookup, or several outer
@@ -580,6 +610,17 @@ fn the_rows_a_limit_keeps_are_the_outer_item_s_to_decide() {
     );
     // No more outer values than rows kept: as written.
     assert_eq!(cut(&sql, "a", "t", 15), None);
+    // Unless the WHERE holds a subquery: cut whatever the count, with a
+    // LIMIT or without.
+    let exists = "WHERE a.g = 1 AND EXISTS (SELECT 1 FROM w WHERE w.k = a.id)";
+    assert_eq!(
+        cut(&format!("SELECT a.x, __cs0.__v FROM t a {item} {exists} ORDER BY a.x LIMIT 10"), "a", "t", 1),
+        Some((format!("SELECT a.* FROM t a {exists} ORDER BY a.x LIMIT 10"), format!("SELECT a.x, __cs0.__v FROM <copy> a {item} ORDER BY a.x")))
+    );
+    assert_eq!(
+        cut(&format!("SELECT a.x, __cs0.__v FROM t a {item} {exists}"), "a", "t", 1),
+        Some((format!("SELECT a.* FROM t a {exists}"), format!("SELECT a.x, __cs0.__v FROM <copy> a {item}")))
+    );
     // No WHERE, no ORDER BY, `AS`.
     assert_eq!(
         cut(&format!("SELECT a.x, __cs0.__v FROM t AS a {item} LIMIT 3"), "a", "t", 4),
