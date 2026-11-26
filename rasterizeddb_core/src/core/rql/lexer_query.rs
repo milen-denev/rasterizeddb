@@ -1842,6 +1842,62 @@ pub struct ParseMemo {
     sql: String,
     fields: SmallVec<[SchemaField; 20]>,
     parsed: Result<QueryRows, String>,
+    /// The last join planned in the scope ([`join_plan_memo`]).
+    join: Option<JoinMemo>,
+}
+
+/// A join's plan, its statement, and each relation's fields as the planner
+/// was told them.
+struct JoinMemo {
+    sql: String,
+    schemas: Vec<(String, Option<SmallVec<[SchemaField; 20]>>)>,
+    plan: Result<crate::core::rql::join::JoinPlan, String>,
+}
+
+/// The plan of the join `sql` made earlier in this [`parse_memo_scope`],
+/// when every relation it asked about still has the fields it was told
+/// (`schema_of`, asked again); `None` otherwise, or outside a scope.
+///
+/// A join is read three times as a single-table SELECT is: to describe its
+/// columns, to find their scales, and to run it, and planning one is all
+/// text. For a point lookup with one select-list subquery (joined to its
+/// row as a constant) the three plans were a third of the statement.
+pub(crate) fn join_plan_memo(
+    sql: &str,
+    schema_of: &dyn Fn(&str) -> Option<SmallVec<[SchemaField; 20]>>,
+) -> Option<Result<crate::core::rql::join::JoinPlan, String>> {
+    PARSE_MEMO
+        .try_with(|memo| {
+            let memo = memo.borrow();
+            let join = memo.as_ref()?.join.as_ref()?;
+            (join.sql == sql && join.schemas.iter().all(|(name, fields)| schema_of(name) == *fields)).then(|| join.plan.clone())
+        })
+        .ok()
+        .flatten()
+}
+
+/// Keeps `plan` for [`join_plan_memo`]: the join `sql`, planned against
+/// `schemas`. Nothing is kept outside a scope.
+pub(crate) fn remember_join_plan(
+    sql: &str,
+    schemas: Vec<(String, Option<SmallVec<[SchemaField; 20]>>)>,
+    plan: &Result<crate::core::rql::join::JoinPlan, String>,
+) {
+    let _ = PARSE_MEMO.try_with(|memo| {
+        let join = Some(JoinMemo { sql: sql.to_string(), schemas, plan: plan.clone() });
+        let mut memo = memo.borrow_mut();
+        match memo.as_mut() {
+            Some(memo) => memo.join = join,
+            None => {
+                *memo = Some(Box::new(ParseMemo {
+                    sql: String::new(),
+                    fields: SmallVec::new(),
+                    parsed: Err(String::new()),
+                    join,
+                }))
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1887,7 +1943,7 @@ pub fn row_fetch_from_select_query(
         .try_with(|memo| {
             memo.borrow()
                 .as_ref()
-                .filter(|m| m.sql == sql && m.fields == *schema)
+                .filter(|m| !m.sql.is_empty() && m.sql == sql && m.fields == *schema)
                 .map(|m| m.parsed.clone())
         })
         .ok()
@@ -1897,10 +1953,14 @@ pub fn row_fetch_from_select_query(
     }
     let parsed = parse_select_query(query_purpose, schema);
     let _ = PARSE_MEMO.try_with(|memo| {
-        *memo.borrow_mut() = Some(Box::new(ParseMemo {
+        let mut memo = memo.borrow_mut();
+        // (The join planned in this scope, if any, stays.)
+        let join = memo.as_mut().and_then(|m| m.join.take());
+        *memo = Some(Box::new(ParseMemo {
             sql: sql.to_string(),
             fields: schema.clone(),
             parsed: parsed.clone(),
+            join,
         }));
     });
     parsed
@@ -3481,6 +3541,57 @@ mod tests {
         row_fetch_from_select_query(&purpose, &schema).unwrap();
         row_fetch_from_select_query(&purpose, &schema).unwrap();
         assert_eq!(parses() - before, 2);
+    }
+
+    /// Inside a memo scope a join planned again against the same relations
+    /// is not planned again (it is read to describe its columns, to find
+    /// their scales and to run); against other fields it is, and a
+    /// single-table parse in between does not lose it.
+    #[test]
+    fn a_memo_plans_a_join_once_per_set_of_fields() {
+        use crate::core::rql::join::{PLANS, plan_statement};
+        let schema = make_schema();
+        let plans = || PLANS.with(std::cell::Cell::get);
+        let sql = "SELECT a.id, b.name FROM users a JOIN users b ON a.id = b.id WHERE a.id = 1";
+        let purpose = QueryPurpose::QueryRows(crate::core::rql::lexer_s1::QueryRowsData {
+            table_name: "users".to_string(),
+            query: "SELECT id, name FROM users WHERE id = 1".to_string(),
+        });
+        let fields = std::cell::RefCell::new(schema.clone());
+        let schema_of = |name: &str| (name == "users").then(|| fields.borrow().clone());
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(parse_memo_scope(async {
+            let before = plans();
+            let first = plan_statement(sql, &schema_of).unwrap();
+            let again = plan_statement(sql, &schema_of).unwrap();
+            assert_eq!(plans() - before, 1, "the second read was planned again");
+            assert_eq!(format!("{first:?}"), format!("{again:?}"));
+            row_fetch_from_select_query(&purpose, &schema).unwrap();
+            plan_statement(sql, &schema_of).unwrap();
+            assert_eq!(plans() - before, 1, "a single-table parse lost the join's plan");
+
+            // Other fields (a DDL between a describe and a run).
+            fields.borrow_mut()[0].db_type = DbType::I32;
+            fields.borrow_mut()[0].size = 4;
+            let other = plan_statement(sql, &schema_of).unwrap();
+            assert_eq!(plans() - before, 2, "other fields must be planned against");
+            assert_ne!(format!("{other:?}"), format!("{first:?}"), "the fields did not reach the plan");
+
+            // A failing one is answered for itself, once.
+            let broken = "SELECT a.nope FROM users a JOIN users b ON a.id = b.id";
+            let e1 = plan_statement(broken, &schema_of).unwrap_err();
+            let e2 = plan_statement(broken, &schema_of).unwrap_err();
+            assert_eq!(e1, e2);
+            assert_eq!(plans() - before, 3);
+            // One plan is kept: the first statement again is planned again.
+            plan_statement(sql, &schema_of).unwrap();
+            assert_eq!(plans() - before, 4);
+        }));
+        // Outside a scope every read plans.
+        let before = plans();
+        plan_statement(sql, &schema_of).unwrap();
+        plan_statement(sql, &schema_of).unwrap();
+        assert_eq!(plans() - before, 2);
     }
 
     #[test]

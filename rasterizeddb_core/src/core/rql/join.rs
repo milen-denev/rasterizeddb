@@ -6539,6 +6539,40 @@ pub fn plan_statement(
     sql: &str,
     schema_of: &dyn Fn(&str) -> Option<SmallVec<[SchemaField; 20]>>,
 ) -> Result<JoinPlan, String> {
+    // The plan made for this statement already, by whichever of its
+    // readers came first (`lexer_query::join_plan_memo`).
+    if let Some(plan) = crate::core::rql::lexer_query::join_plan_memo(sql, schema_of) {
+        return plan;
+    }
+    // Each relation's fields as the planner is told them: what the plan
+    // holds for, and what a later reader checks before taking it.
+    let asked: std::cell::RefCell<Vec<(String, Option<SmallVec<[SchemaField; 20]>>)>> = std::cell::RefCell::new(Vec::new());
+    let recording = |name: &str| {
+        let fields = schema_of(name);
+        let mut asked = asked.borrow_mut();
+        if !asked.iter().any(|(n, _)| n == name) {
+            asked.push((name.to_string(), fields.clone()));
+        }
+        fields
+    };
+    let plan = plan_statement_now(sql, &recording);
+    crate::core::rql::lexer_query::remember_join_plan(sql, asked.into_inner(), &plan);
+    plan
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Joins actually planned on this thread, for the memo's tests.
+    pub(crate) static PLANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`plan_statement`], planned now whatever was planned before.
+fn plan_statement_now(
+    sql: &str,
+    schema_of: &dyn Fn(&str) -> Option<SmallVec<[SchemaField; 20]>>,
+) -> Result<JoinPlan, String> {
+    #[cfg(test)]
+    PLANS.with(|n| n.set(n.get() + 1));
     // Same normalisation the single-table path applies: the clause split below
     // only recognises `LIMIT` and `OFFSET`.
     let sql = crate::core::tokenizer::pagination::normalize_pagination(sql.trim())?;
