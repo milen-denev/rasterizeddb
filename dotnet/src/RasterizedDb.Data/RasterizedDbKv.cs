@@ -17,13 +17,23 @@ namespace RasterizedDb.Data;
 /// command here is atomic with another: the native protocol has no <c>MULTI</c>. Where a call takes two
 /// commands it says so. <c>Map</c> is a typed map under a key prefix.
 /// </remarks>
-public readonly struct RasterizedDbKv
+public readonly partial struct RasterizedDbKv
 {
     private const int MaxScanRounds = 1_000_000;
 
     private readonly RasterizedDbConnection _connection;
 
-    internal RasterizedDbKv(RasterizedDbConnection connection) => _connection = connection;
+    // Set on the copy the synchronous calls run on: its commands are sent with blocking I/O, so the
+    // task of any call on it is complete when it is returned.
+    private readonly bool _sync;
+
+    internal RasterizedDbKv(RasterizedDbConnection connection, bool sync = false)
+    {
+        _connection = connection;
+        _sync = sync;
+    }
+
+    internal RasterizedDbKv Blocking => new(_connection, sync: true);
 
     // ------------------------------------------------------------------ request
 
@@ -112,7 +122,7 @@ public readonly struct RasterizedDbKv
         var command = _connection.KvCommand ??= new RasterizedDbCommand { ResultFormat = RasterizedDbResultFormat.Binary };
         command.Connection = _connection;
         command.RawStatement = _connection.KvScratch!.WrittenMemory;
-        return command.ExecuteReaderAsync(cancellation);
+        return _sync ? Task.FromResult(command.ExecuteReader()) : command.ExecuteReaderAsync(cancellation);
     }
 
     private async Task<long> Int(CancellationToken cancellation, string command)
@@ -610,7 +620,7 @@ public readonly struct RasterizedDbKv
 }
 
 /// <summary>A typed map over the key/value cache. See <see cref="RasterizedDbKv.Map{TKey,TValue}(string,JsonSerializerOptions?)"/>.</summary>
-public readonly struct RasterizedDbKvMap<TKey, TValue>
+public readonly partial struct RasterizedDbKvMap<TKey, TValue>
     where TKey : notnull
 {
     private readonly RasterizedDbKv _kv;
@@ -625,6 +635,16 @@ public readonly struct RasterizedDbKvMap<TKey, TValue>
         _options = options;
         _typeInfo = typeInfo;
     }
+
+    private RasterizedDbKvMap(RasterizedDbKv kv, byte[] prefix, JsonSerializerOptions? options, JsonTypeInfo<TValue>? typeInfo)
+    {
+        _kv = kv;
+        _prefix = prefix;
+        _options = options;
+        _typeInfo = typeInfo;
+    }
+
+    internal RasterizedDbKvMap<TKey, TValue> Blocking => new(_kv.Blocking, _prefix, _options, _typeInfo);
 
     internal RasterizedDbKv Kv => _kv;
 
@@ -840,10 +860,21 @@ internal static class KvCodec
 /// the values fetched 500 at a time, and the filters run here. Not a snapshot: an entry removed between
 /// the scan and its fetch is simply not returned.
 /// </summary>
-public sealed class RasterizedDbKvQuery<TKey, TValue>
+public sealed partial class RasterizedDbKvQuery<TKey, TValue>
     where TKey : notnull
 {
-    private readonly RasterizedDbKvMap<TKey, TValue> _map;
+    private RasterizedDbKvMap<TKey, TValue> _map;
+
+    private RasterizedDbKvQuery<TKey, TValue> Blocking
+    {
+        get
+        {
+            var copy = (RasterizedDbKvQuery<TKey, TValue>)MemberwiseClone();
+            copy._map = _map.Blocking;
+            return copy;
+        }
+    }
+
     private byte[] _suffix = [];
     private Func<TKey, bool>? _keyFilter;
     private Func<TKey, TValue, bool>? _filter;
@@ -1030,16 +1061,26 @@ public sealed class RasterizedDbKvQuery<TKey, TValue>
 /// Objects stored as hashes: one field per public read-write property, each as its text (a property
 /// that is not a scalar as JSON). See <see cref="RasterizedDbKv.Repository{T,TKey}"/>.
 /// </summary>
-public sealed class RasterizedDbKvRepository<T, TKey>
+public sealed partial class RasterizedDbKvRepository<T, TKey>
     where T : class, new()
     where TKey : notnull
 {
     private static readonly System.Reflection.PropertyInfo[] Properties =
         [.. typeof(T).GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance).Where(p => p is { CanRead: true, CanWrite: true } && p.GetIndexParameters().Length == 0)];
 
-    private readonly RasterizedDbKv _kv;
+    private RasterizedDbKv _kv;
     private readonly Func<T, TKey> _key;
     private readonly byte[] _prefix;
+
+    private RasterizedDbKvRepository<T, TKey> Blocking
+    {
+        get
+        {
+            var copy = (RasterizedDbKvRepository<T, TKey>)MemberwiseClone();
+            copy._kv = _kv.Blocking;
+            return copy;
+        }
+    }
 
     internal RasterizedDbKvRepository(RasterizedDbKv kv, Func<T, TKey> key, string prefix)
     {

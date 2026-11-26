@@ -207,7 +207,7 @@ public class RasterizedDbMathTranslator(ISqlExpressionFactory sql) : IMethodCall
     }
 }
 
-/// <summary><c>Guid.NewGuid()</c>, <c>ToString()</c>, and <c>EF.Functions.ILike</c>.</summary>
+/// <summary><c>Guid.NewGuid()</c>, <c>ToString()</c>, <c>EF.Functions.ILike</c>, and <c>Regex.IsMatch</c>.</summary>
 public class RasterizedDbMiscMethodTranslator(ISqlExpressionFactory sql, IRelationalTypeMappingSource typeMappingSource) : IMethodCallTranslator
 {
     public virtual SqlExpression? Translate(
@@ -234,6 +234,31 @@ public class RasterizedDbMiscMethodTranslator(ISqlExpressionFactory sql, IRelati
             var match = sql.Function("lower", [sql.ApplyTypeMapping(arguments[1], mapping)], true, [true], typeof(string), mapping);
             var pattern = sql.Function("lower", [sql.ApplyTypeMapping(arguments[2], mapping)], true, [true], typeof(string), mapping);
             return sql.Like(match, pattern);
+        }
+
+        if (method.DeclaringType == typeof(System.Text.RegularExpressions.Regex) && method.Name == nameof(System.Text.RegularExpressions.Regex.IsMatch)
+            && instance is null && arguments.Count is 2 or 3 && arguments[0].Type == typeof(string) && arguments[1].Type == typeof(string))
+        {
+            // `~` and `~*`. The pattern is the server's to read (PostgreSQL's syntax, which .NET's shares
+            // for the common constructs); only the options that have an operator are translated.
+            var ignoreCase = false;
+            if (arguments.Count == 3)
+            {
+                if (arguments[2] is not SqlConstantExpression { Value: System.Text.RegularExpressions.RegexOptions options }
+                    || (options & ~System.Text.RegularExpressions.RegexOptions.IgnoreCase) != 0)
+                {
+                    return null;
+                }
+
+                ignoreCase = options != 0;
+            }
+
+            var mapping = ExpressionExtensions.InferTypeMapping(arguments[0], arguments[1]) ?? typeMappingSource.FindMapping(typeof(string));
+            return new RasterizedDbRegexMatchExpression(
+                sql.ApplyTypeMapping(arguments[0], mapping),
+                sql.ApplyTypeMapping(arguments[1], mapping),
+                ignoreCase,
+                typeMappingSource.FindMapping(typeof(bool)));
         }
 
         return null;

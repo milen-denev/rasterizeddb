@@ -234,6 +234,35 @@ pub(crate) struct SimpleOptions {
     pub(crate) rows: Option<u64>,
 }
 
+/// A cancelable request: `\x01CANCELABLE:<token>;<request>`, where the request
+/// is a statement's text or its `EXEC` form. The statement runs as it would
+/// have alone, and for as long as it does a `CANCEL` carrying the token (from
+/// the same user, on any connection) stops it: the answer is then an error
+/// with SQLSTATE 57014. What `cancel=<token>` is to a simple query, for a
+/// statement answered with native rows.
+pub(crate) const CANCELABLE_PREFIX: &[u8] = b"\x01CANCELABLE:";
+
+/// Splits a cancelable request into its token and the request it wraps:
+/// `None` when `request` is not one, an error for a token no client may
+/// choose or a request that wraps another cancelable one.
+pub(crate) fn split_cancelable(request: &[u8]) -> Option<Result<(&str, &[u8]), &'static str>> {
+    let rest = request.strip_prefix(CANCELABLE_PREFIX)?;
+    let Some(end) = rest.iter().position(|b| *b == b';') else {
+        return Some(Err("a cancelable request is \\x01CANCELABLE:<token>;<statement>"));
+    };
+    let inner = &rest[end + 1..];
+    Some(match std::str::from_utf8(&rest[..end]) {
+        Ok(token) if valid_token(token) => {
+            if inner.starts_with(CANCELABLE_PREFIX) {
+                Err("a cancelable request cannot wrap another")
+            } else {
+                Ok((token, inner))
+            }
+        }
+        _ => Err("a cancel token is 1 to 64 letters, digits, '_' or '-'"),
+    })
+}
+
 /// A cancel token as a client may choose it: 1 to 64 of `[A-Za-z0-9_-]`.
 fn valid_token(token: &str) -> bool {
     (1..=64).contains(&token.len())

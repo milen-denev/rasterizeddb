@@ -12,11 +12,24 @@ namespace RasterizedDb.Data;
 /// Native rows carry no column names, so each introspection statement is read by position. A server
 /// that adds or reorders a column of one of them needs the matching change here.
 /// </remarks>
-public readonly struct RasterizedDbAdmin
+public readonly partial struct RasterizedDbAdmin
 {
     private readonly RasterizedDbConnection _connection;
 
-    internal RasterizedDbAdmin(RasterizedDbConnection connection) => _connection = connection;
+    // Set on the copy the synchronous calls run on: its statements are sent with blocking I/O, so the
+    // task of any call on it is complete when it is returned.
+    private readonly bool _sync;
+
+    internal RasterizedDbAdmin(RasterizedDbConnection connection, bool sync = false)
+    {
+        _connection = connection;
+        _sync = sync;
+    }
+
+    private RasterizedDbAdmin Blocking => new(_connection, sync: true);
+
+    private Task<RasterizedDbDataReader> Read(RasterizedDbCommand command, CancellationToken cancellation) =>
+        _sync ? Task.FromResult(command.ExecuteReader()) : command.ExecuteReaderAsync(cancellation);
 
     // ------------------------------------------------------------------ helpers
 
@@ -25,14 +38,14 @@ public readonly struct RasterizedDbAdmin
     private async Task<long> Run(string sql, CancellationToken cancellation)
     {
         using var command = Command(sql);
-        await using var reader = await command.ExecuteReaderAsync(cancellation).ConfigureAwait(false);
+        await using var reader = await Read(command, cancellation).ConfigureAwait(false);
         return Math.Max(0, reader.RowsAffected);
     }
 
     private async Task<List<T>> Query<T>(string sql, Func<RasterizedDbDataReader, T> read, CancellationToken cancellation)
     {
         using var command = Command(sql);
-        await using var reader = await command.ExecuteReaderAsync(cancellation).ConfigureAwait(false);
+        await using var reader = await Read(command, cancellation).ConfigureAwait(false);
         var list = new List<T>();
         while (reader.Read())
         {

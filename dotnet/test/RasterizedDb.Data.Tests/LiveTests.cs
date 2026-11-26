@@ -782,4 +782,163 @@ public class LiveTests(ServerFixture servers)
         transaction.Commit();
         Assert.False(connection.InTransaction);
     }
+
+    /// <summary>A table another connection holds an exclusive lock on: a read of it waits until something stops it.</summary>
+    private async Task<(string Table, RasterizedDbConnection Holder)> Locked(RasterizedDbConnection connection)
+    {
+        var table = Table("stop");
+        await Run(connection, $"CREATE TABLE {table} (id BIGINT NOT NULL PRIMARY KEY)");
+        await Run(connection, $"INSERT INTO {table} (id) VALUES (1)");
+        var holder = (await Open())!;
+        await Run(holder, $"BEGIN; LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE", RasterizedDbResultFormat.Text);
+        return (table, holder);
+    }
+
+    [Theory]
+    [InlineData(RasterizedDbResultFormat.Binary)]
+    [InlineData(RasterizedDbResultFormat.Text)]
+    public async Task A_cancelled_token_stops_the_statement_and_keeps_the_connection(RasterizedDbResultFormat format)
+    {
+        await using var connection = await Open();
+        if (connection is null)
+        {
+            return;
+        }
+
+        var (table, holder) = await Locked(connection);
+        await using (holder)
+        {
+            await using var command = new RasterizedDbCommand($"SELECT id FROM {table} WHERE id = $1", connection) { ResultFormat = format };
+            command.Parameters.AddWithValue(1L);
+            using var cancel = new CancellationTokenSource(TimeSpan.FromMilliseconds(400));
+            var started = Environment.TickCount64;
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => command.ExecuteScalarAsync(cancel.Token));
+            Assert.InRange(Environment.TickCount64 - started, 300, 4000);
+
+            // Stopped by the server, not by closing the connection: it answers the next statement.
+            Assert.Equal(ConnectionState.Open, connection.State);
+            await using var next = new RasterizedDbCommand("SELECT 41 + 1", connection) { ResultFormat = format };
+            Assert.Equal(42L, Convert.ToInt64(await next.ExecuteScalarAsync(CancellationToken.None)));
+
+            await Run(holder, "COMMIT", RasterizedDbResultFormat.Text);
+            Assert.Equal(1L, Convert.ToInt64(await command.ExecuteScalarAsync(CancellationToken.None)));
+        }
+    }
+
+    [Fact]
+    public async Task Cancel_from_another_thread_stops_a_cancelable_binary_statement()
+    {
+        await using var connection = await Open();
+        if (connection is null)
+        {
+            return;
+        }
+
+        var (table, holder) = await Locked(connection);
+        await using (holder)
+        {
+            using var command = new RasterizedDbCommand($"SELECT id FROM {table}", connection) { ResultFormat = RasterizedDbResultFormat.Binary, Cancelable = true };
+            var running = Task.Run(() => command.ExecuteScalar());
+            await Task.Delay(400);
+            Assert.False(running.IsCompleted);
+            command.Cancel();
+            var stopped = await Assert.ThrowsAsync<RasterizedDbException>(() => running.WaitAsync(TimeSpan.FromSeconds(8)));
+            Assert.Equal("57014", stopped.SqlState);
+
+            await Run(holder, "COMMIT", RasterizedDbResultFormat.Text);
+            Assert.Equal(1L, Convert.ToInt64(command.ExecuteScalar()));
+        }
+    }
+
+    [Fact]
+    public async Task A_cancelled_statement_inside_a_transaction_leaves_it_to_be_rolled_back()
+    {
+        await using var connection = await Open();
+        if (connection is null)
+        {
+            return;
+        }
+
+        var (table, holder) = await Locked(connection);
+        await using (holder)
+        {
+            await using var transaction = await connection.BeginTransactionAsync();
+            await using var command = new RasterizedDbCommand($"SELECT id FROM {table}", connection) { ResultFormat = RasterizedDbResultFormat.Binary };
+            using var cancel = new CancellationTokenSource(TimeSpan.FromMilliseconds(400));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => command.ExecuteScalarAsync(cancel.Token));
+            Assert.Equal(ConnectionState.Open, connection.State);
+            await transaction.RollbackAsync();
+            await Run(holder, "COMMIT", RasterizedDbResultFormat.Text);
+            Assert.Equal(1L, Convert.ToInt64(await command.ExecuteScalarAsync(CancellationToken.None)));
+        }
+    }
+
+    [Fact]
+    public async Task A_data_source_command_gives_up_at_once_and_tells_the_server()
+    {
+        if (servers.Trust() is not { } connectionString)
+        {
+            return;
+        }
+
+        await using var source = new RasterizedDbDataSource(connectionString);
+        await using var connection = await source.OpenConnectionAsync();
+        var (table, holder) = await Locked(connection);
+        await using (holder)
+        {
+            await using var command = source.CreateCommand($"SELECT id FROM {table}");
+            using var cancel = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+            var started = Environment.TickCount64;
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => command.ExecuteScalarAsync(cancel.Token));
+            Assert.InRange(Environment.TickCount64 - started, 200, 3000);
+
+            // The shared connection goes on for everyone else.
+            await using var other = source.CreateCommand("SELECT 7");
+            Assert.Equal(7L, Convert.ToInt64(await other.ExecuteScalarAsync()));
+            await Run(holder, "COMMIT", RasterizedDbResultFormat.Text);
+        }
+    }
+
+    [Fact]
+    public void Admin_and_key_value_calls_have_synchronous_twins()
+    {
+        if (servers.Trust() is not { } connectionString)
+        {
+            return;
+        }
+
+        using var connection = new RasterizedDbConnection(connectionString);
+        connection.Open();
+        var table = Table("sync");
+        using (var create = connection.CreateCommand($"CREATE TABLE {table} (id BIGINT NOT NULL PRIMARY KEY, label TEXT)"))
+        {
+            create.ExecuteNonQuery();
+        }
+
+        var admin = connection.Admin;
+        Assert.Contains(admin.Tables(), t => t.Name == table);
+        Assert.Equal(["id", "label"], admin.Columns(table).Select(c => c.Name));
+        admin.CreateIndex(new RasterizedDbIndex(table, "label"));
+        Assert.NotEmpty(admin.Config());
+        admin.Vacuum(table);
+
+        var kv = connection.Kv;
+        var key = $"sync:{Guid.NewGuid():N}";
+        kv.Set(key, "one");
+        Assert.Equal("one", kv.GetString(key));
+        Assert.True(kv.Exists(key));
+        Assert.False(kv.SetIfAbsent(key, "two"));
+        Assert.Equal(5, kv.Increment(key + ":n", 5));
+        Assert.Equal(1, kv.Delete(key));
+        Assert.Null(kv.Get(key));
+
+        var map = kv.Map<int, string>($"syncmap:{Guid.NewGuid():N}");
+        map.Set(1, "a");
+        map.Set(2, "b");
+        Assert.Equal((true, "a"), map.TryGet(1));
+        Assert.Equal([1, 2], map.Keys().Order());
+        Assert.Equal(2, map.Query().ToList().Count);
+        Assert.Equal(2, map.Clear());
+        Assert.Equal(1, kv.Delete(key + ":n"));
+    }
 }

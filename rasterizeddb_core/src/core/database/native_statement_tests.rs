@@ -1582,3 +1582,97 @@ async fn a_describe_request_names_the_columns_and_runs_nothing() {
         assert!(has(&answer, name), "{sql}: {answer:?}");
     }
 }
+
+/// A statement sent as `\x01CANCELABLE:<token>;<statement>` is answered with
+/// native rows as it would be alone, and a CANCEL carrying the token stops
+/// it while it runs: until now only a simple query could be stopped, so a
+/// client reading native rows had to drop its connection to give up on one.
+///
+/// Mutations: the statement runs outside the token's scope (CANCEL 0, and
+/// the wait outlasts the bound); the stopped answer loses its SQLSTATE; the
+/// token outlives its statement (the last CANCEL says 1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelable_request_runs_as_its_statement_and_stops_on_cancel() {
+    let (_dir, database) = database().await;
+    let context = context(&database, false);
+    let holder = crate::pgwire::NativeSession::new(database.clone(), "svc", true, false, false);
+    let said = simple(
+        &context,
+        Some(&holder),
+        "CREATE TABLE stop_t (id BIGINT); INSERT INTO stop_t (id) VALUES (1)",
+    )
+    .await;
+    assert!(said.errors.is_empty(), "{said:?}");
+
+    async fn send(
+        context: &NativeContext,
+        session: &crate::pgwire::NativeSession,
+        request: &[u8],
+    ) -> Vec<u8> {
+        process_native_request(
+            context.clone(),
+            std::sync::Arc::new(rastcp::session::Principal::new("svc", true)),
+            Some(session),
+            request.to_vec(),
+        )
+        .await
+    }
+    let session = std::sync::Arc::new(crate::pgwire::NativeSession::new(
+        database.clone(),
+        "svc",
+        true,
+        false,
+        true,
+    ));
+
+    // Wrapped, the statement answers exactly what it answers alone.
+    let alone = send(&context, &session, b"SELECT id FROM stop_t").await;
+    assert_eq!(alone[0], 2, "{alone:?}");
+    let wrapped = send(&context, &session, b"\x01CANCELABLE:t-0;SELECT id FROM stop_t").await;
+    assert_eq!(wrapped, alone);
+    // And so does its EXEC form.
+    let mut exec = b"\x01CANCELABLE:t-0;".to_vec();
+    exec.extend_from_slice(&exec_request("SELECT id FROM stop_t WHERE id = $1", &["1"]));
+    assert_eq!(send(&context, &session, &exec).await, alone);
+
+    // A token no client may choose, and a request that wraps another.
+    for bad in [&b"\x01CANCELABLE:a b;SELECT 1"[..], b"\x01CANCELABLE:;SELECT 1", b"\x01CANCELABLE:t\x01CANCELABLE:u;SELECT 1", b"\x01CANCELABLE:t;\x01CANCELABLE:u;SELECT 1", b"\x01CANCELABLE:t"] {
+        let answer = send(&context, &session, bad).await;
+        assert_eq!(answer[0], 3, "{bad:?}: {answer:?}");
+        assert!(answer.ends_with(b"(SQLSTATE 22023)"), "{bad:?}: {}", String::from_utf8_lossy(&answer));
+    }
+
+    let said = simple(&context, Some(&holder), "BEGIN; LOCK TABLE stop_t IN ACCESS EXCLUSIVE MODE").await;
+    assert!(said.errors.is_empty(), "{said:?}");
+    let started = std::time::Instant::now();
+    let task = {
+        let (context, session) = (context.clone(), session.clone());
+        tokio::spawn(async move { send(&context, &session, b"\x01CANCELABLE:t-1;SELECT id FROM stop_t").await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(!task.is_finished(), "the statement did not wait for the lock");
+
+    // The token is taken while its statement runs.
+    let other = crate::pgwire::NativeSession::new(database.clone(), "svc", true, false, true);
+    let answer = send(&context, &other, b"\x01CANCELABLE:t-1;SELECT 1").await;
+    assert!(answer[0] == 3 && answer.ends_with(b"(SQLSTATE 08P01)"), "{}", String::from_utf8_lossy(&answer));
+
+    let said = marked(&context, "stranger", None, b"\x01CANCEL;t-1").await;
+    assert_eq!(said.results[0].2, "CANCEL 0", "{said:?}");
+    let said = marked(&context, "svc", None, b"\x01CANCEL;t-1").await;
+    assert_eq!(said.results[0].2, "CANCEL 1", "{said:?}");
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("the cancelled statement kept waiting")
+        .unwrap();
+    assert_eq!(answer[0], 3, "{answer:?}");
+    assert!(answer.ends_with(b"(SQLSTATE 57014)"), "{}", String::from_utf8_lossy(&answer));
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+    // The token is free again, and the connection goes on.
+    let said = marked(&context, "svc", None, b"\x01CANCEL;t-1").await;
+    assert_eq!(said.results[0].2, "CANCEL 0", "{said:?}");
+    let said = simple(&context, Some(&holder), "COMMIT").await;
+    assert!(said.errors.is_empty(), "{said:?}");
+    assert_eq!(send(&context, &session, b"\x01CANCELABLE:t-1;SELECT id FROM stop_t").await, alone);
+}

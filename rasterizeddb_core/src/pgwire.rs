@@ -114,6 +114,7 @@ pub(crate) use native_session::{
     parse_simple as native_parse_simple,
 };
 pub(crate) use native_session::{
+    split_cancelable as native_split_cancelable,
     DATABASE_PREFIX as NATIVE_DATABASE_PREFIX, MARK as NATIVE_MARK, ROLE_PREFIX as NATIVE_ROLE_PREFIX,
     NOTICES_PREFIX as NATIVE_NOTICES_PREFIX, answer_marked as native_answer_marked,
     simple_complete as native_simple_complete, simple_error as native_simple_error,
@@ -1595,8 +1596,17 @@ tokio::task_local! {
     static SESSION_CANCEL: StdArc<crate::core::cancel::SessionCancel>;
 }
 
+/// Runs `fut` with `cancel` as the session its statements publish themselves
+/// in: what a cancelable native request (`\x01CANCELABLE:<token>;`) runs its
+/// one statement under, so a `CANCEL` carrying the token finds it.
+pub(crate) async fn with_session_cancel<F: std::future::Future>(
+    cancel: StdArc<crate::core::cancel::SessionCancel>,
+    fut: F,
+) -> F::Output {
+    SESSION_CANCEL.scope(cancel, fut).await
+}
+
 /// The session the running task's statement belongs to, if it runs in one.
-#[cfg(feature = "sharding")]
 pub(crate) fn current_session_cancel() -> Option<StdArc<crate::core::cancel::SessionCancel>> {
     SESSION_CANCEL.try_with(StdArc::clone).ok()
 }

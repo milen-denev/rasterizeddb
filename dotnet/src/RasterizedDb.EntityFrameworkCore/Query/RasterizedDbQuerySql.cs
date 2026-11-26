@@ -128,6 +128,17 @@ public class RasterizedDbQuerySqlGenerator(QuerySqlGeneratorDependencies depende
             return element;
         }
 
+        if (extensionExpression is RasterizedDbRegexMatchExpression regex)
+        {
+            // In parentheses: it may be the operand of anything.
+            Sql.Append("(");
+            Visit(regex.Match);
+            Sql.Append(regex.IgnoreCase ? " ~* " : " ~ ");
+            Visit(regex.Pattern);
+            Sql.Append(")");
+            return regex;
+        }
+
         return base.VisitExtension(extensionExpression);
     }
 

@@ -199,6 +199,13 @@ public sealed class RasterizedDbDataSource : DbDataSource
 
     internal void SetExecSupported(bool supported) => _exec = supported ? ExecYes : ExecNo;
 
+    // 0 unknown, 1 yes, 2 no: whether the server knows cancelable requests (\x01CANCELABLE:<token>;).
+    private volatile int _cancelable;
+
+    internal bool? CancelableSupported => _cancelable switch { 1 => true, 2 => false, _ => null };
+
+    internal void SetCancelableSupported(bool supported) => _cancelable = supported ? 1 : 2;
+
     // ----------------------------------------------------------------- describe
 
     private readonly ConcurrentDictionary<ParsedSql, string[]> _columnNames = new();

@@ -30,9 +30,42 @@ public sealed class RasterizedDbCommand : DbCommand
     private RasterizedDbParameterCollection? _parameters;
     private int? _timeout;
 
-    // The request in flight, for Cancel.
+    // The request in flight, for Cancel: 0 when none is, or when it carries no cancel token.
     private long _cancelConnector;
     private long _cancelSequence;
+
+    /// <summary>
+    /// Part of every cancel token of this process. A token is unique among a user's running
+    /// statements, and connection numbers alone repeat from one process to the next.
+    /// </summary>
+    private static readonly ulong ProcessTag = BitConverter.ToUInt64(System.Security.Cryptography.RandomNumberGenerator.GetBytes(8));
+
+    /// <summary>How long a cancelled statement is given to answer before its connection is closed instead.</summary>
+    private const int CancelGraceMs = 5000;
+
+    /// <summary>
+    /// Whether a binary-format statement is sent so that <see cref="Cancel"/> can stop it. Statements
+    /// run with a <see cref="CancellationToken"/> that can be cancelled, and every text-format
+    /// statement, already are; set this for a synchronous call another thread may want to cancel.
+    /// Needs a server that knows cancelable requests; against an older one it changes nothing.
+    /// </summary>
+    public bool Cancelable { get; set; }
+
+    private static string CancelToken(long connector, long sequence) => $"c{ProcessTag:x}-{connector}-{sequence}";
+
+    /// <summary>Writes the token of the request being built, and remembers it for <see cref="Cancel"/>.</summary>
+    private void WriteCancelToken(ByteWriter writer, Connector connector)
+    {
+        _cancelConnector = connector.Id;
+        var sequence = connector.NextCancelSequence();
+        Volatile.Write(ref _cancelSequence, sequence);
+        writer.WriteByte((byte)'c');
+        writer.WriteFormatted(ProcessTag, "x");
+        writer.WriteByte((byte)'-');
+        writer.WriteInt64Text(_cancelConnector);
+        writer.WriteByte((byte)'-');
+        writer.WriteInt64Text(sequence);
+    }
 
     public RasterizedDbCommand()
     {
@@ -247,7 +280,7 @@ public sealed class RasterizedDbCommand : DbCommand
     /// form for the text format; for the binary one the statement alone, the EXEC form when the server
     /// knows it (<paramref name="exec"/>), or the statement with its values written in.
     /// </summary>
-    private void BuildInto(ByteWriter writer, int header, bool? exec, ParsedSql parsed, bool text, Connector connector)
+    private void BuildInto(ByteWriter writer, int header, bool? exec, ParsedSql parsed, bool text, Connector connector, bool cancelable = false)
     {
         writer.Clear();
         writer.GetSpan(header);
@@ -255,12 +288,8 @@ public sealed class RasterizedDbCommand : DbCommand
         if (text)
         {
             // \x01SIMPLE:cancel=<token>;<statements>
-            _cancelConnector = connector.Id;
-            _cancelSequence = connector.NextCancelSequence();
-            writer.Write("\u0001SIMPLE:cancel=c"u8);
-            writer.WriteInt64Text(_cancelConnector);
-            writer.WriteByte((byte)'-');
-            writer.WriteInt64Text(_cancelSequence);
+            writer.Write("\u0001SIMPLE:cancel="u8);
+            WriteCancelToken(writer, connector);
             writer.WriteByte((byte)';');
             if (RawStatement.IsEmpty)
             {
@@ -274,15 +303,24 @@ public sealed class RasterizedDbCommand : DbCommand
             return;
         }
 
+        if (parsed.MultipleStatements && RawStatement.IsEmpty)
+        {
+            throw SecondStatement(parsed);
+        }
+
+        if (cancelable)
+        {
+            // \x01CANCELABLE:<token>;<the request as it would have been alone>
+            writer.Write("\u0001CANCELABLE:"u8);
+            WriteCancelToken(writer, connector);
+            writer.WriteByte((byte)';');
+        }
+
+        var start = writer.Length;
         if (!RawStatement.IsEmpty)
         {
             writer.Write(RawStatement.Span);
             return;
-        }
-
-        if (parsed.MultipleStatements)
-        {
-            throw SecondStatement(parsed);
         }
 
         if (parsed.Spans.Length == 0)
@@ -298,8 +336,9 @@ public sealed class RasterizedDbCommand : DbCommand
                 return;
             }
 
+            // Past what an EXEC request may render to: sent as text, after the same prefix.
             writer.Clear();
-            writer.Advance(header);
+            writer.Advance(start);
         }
 
         WriteRendered(writer, parsed);
@@ -320,7 +359,8 @@ public sealed class RasterizedDbCommand : DbCommand
         writer.WriteUInt16(0);
     }
 
-    private async ValueTask Build(Connector connector, RasterizedDbDataSource source, ParsedSql parsed, bool text, bool async, CancellationToken cancellation)
+    /// <summary>Builds the request; returns whether it carries a cancel token.</summary>
+    private async ValueTask<bool> Build(Connector connector, RasterizedDbDataSource source, ParsedSql parsed, bool text, bool async, CancellationToken cancellation)
     {
         var exec = source.ExecSupported;
         if (exec is null && !connector.InBlock && NeedsExecAnswer(parsed, text))
@@ -328,8 +368,80 @@ public sealed class RasterizedDbCommand : DbCommand
             exec = await Probe(connector, source, async, cancellation).ConfigureAwait(false);
         }
 
-        BuildInto(connector.Writer, connector.FrameHeader, exec, parsed, text, connector);
+        var cancelable = false;
+        if (!text && (Cancelable || cancellation.CanBeCanceled))
+        {
+            // Asked once per data source, and not inside a block, which a failed probe would not tell
+            // from an old server: there the statement goes uncancelable, as it did before.
+            var known = source.CancelableSupported;
+            if (known is null && !connector.InBlock)
+            {
+                WriteCancelableProbe(connector.Writer, connector.FrameHeader);
+                var response = await connector.Exchange(async, 30, cancellation).ConfigureAwait(false);
+                var span = response.Span;
+                var at = connector.TakeNotices(span);
+                known = span.Length > at && span[at] == Answer.Rows;
+                response.Return();
+                source.SetCancelableSupported(known.Value);
+            }
+
+            cancelable = known == true;
+        }
+
+        BuildInto(connector.Writer, connector.FrameHeader, exec, parsed, text, connector, cancelable);
+        return text || cancelable;
     }
+
+    /// <summary>
+    /// <c>SELECT 1</c> as a cancelable request: a server that knows the form answers its row, one that
+    /// does not refuses the request without running anything.
+    /// </summary>
+    private static void WriteCancelableProbe(ByteWriter writer, int header)
+    {
+        writer.Clear();
+        writer.GetSpan(header);
+        writer.Advance(header);
+        writer.Write("\u0001CANCELABLE:p"u8);
+        writer.WriteFormatted(ProcessTag, "x");
+        writer.WriteByte((byte)'-');
+        writer.WriteInt64Text(Interlocked.Increment(ref _probeSequence));
+        writer.Write(";SELECT 1"u8);
+    }
+
+    private static long _probeSequence;
+
+    /// <summary>
+    /// The caller's token was cancelled while the statement runs on a connection of its own: the server
+    /// is asked to stop it, again while it has not answered (the first ask may arrive before the
+    /// statement has started), and the connection is closed only if it never does.
+    /// </summary>
+    private async Task StopOnServer(RasterizedDbDataSource source, Connector connector, long sequence)
+    {
+        var token = CancelToken(connector.Id, sequence);
+        var started = Environment.TickCount64;
+        var wait = 20;
+        try
+        {
+            while (Volatile.Read(ref _cancelSequence) == sequence && Environment.TickCount64 - started < CancelGraceMs)
+            {
+                await RasterizedDbConnection.SendCancel(source, token, async: true, default).ConfigureAwait(false);
+                await Task.Delay(wait).ConfigureAwait(false);
+                wait = Math.Min(wait * 2, 500);
+            }
+        }
+        catch (Exception)
+        {
+            // The server cannot be asked: the connection is closed below, as before cancel tokens.
+        }
+
+        if (Volatile.Read(ref _cancelSequence) == sequence)
+        {
+            connector.Break();
+        }
+    }
+
+    private static OperationCanceledException Stopped(Exception inner, CancellationToken cancellation) =>
+        new("the statement was cancelled: the server stopped it, and its connection goes on", inner, cancellation);
 
     /// <summary>
     /// Asks the server once whether it knows the EXEC form, with <c>SELECT 1</c>: a server without it
@@ -391,9 +503,10 @@ public sealed class RasterizedDbCommand : DbCommand
         var text = raw ? RawIsText : format == RasterizedDbResultFormat.Text;
         var wasInBlock = connector.InBlock;
 
+        bool stoppable;
         try
         {
-            await Build(connector, source, parsed, text, async, cancellation).ConfigureAwait(false);
+            stoppable = await Build(connector, source, parsed, text, async, cancellation).ConfigureAwait(false) && cancellation.CanBeCanceled;
         }
         catch
         {
@@ -402,9 +515,35 @@ public sealed class RasterizedDbCommand : DbCommand
         }
 
         Response response;
+        // A statement that carries a cancel token is not abandoned when the caller's token is
+        // cancelled: the server is asked to stop it, and its answer (57014) is waited for, so the
+        // connection, and the transaction it may hold, go on.
+        CancellationTokenRegistration stop = default;
+        if (stoppable)
+        {
+            _stopSource = source;
+            _stopConnector = connector;
+            stop = cancellation.UnsafeRegister(
+                static state =>
+                {
+                    var command = (RasterizedDbCommand)state!;
+                    var sequence = command.InFlight();
+                    if (sequence != 0 && command._stopSource is { } source && command._stopConnector is { } connector)
+                    {
+                        _ = Task.Run(() => command.StopOnServer(source, connector, sequence));
+                    }
+                },
+                this);
+        }
+
         try
         {
-            response = await connector.Exchange(async, CommandTimeout, cancellation).ConfigureAwait(false);
+            response = await connector.Exchange(async, CommandTimeout, stoppable ? default : cancellation).ConfigureAwait(false);
+        }
+        catch (RasterizedDbException e) when (stoppable && !wasInBlock && cancellation.IsCancellationRequested && e.Kind == RasterizedDbErrorKind.Transport)
+        {
+            // The server never answered the cancel, and the connection was closed instead.
+            throw new OperationCanceledException("the statement was cancelled; its connection was closed, and whether it ran is unknown", e, cancellation);
         }
         catch (RasterizedDbException e) when (wasInBlock && e.Kind is RasterizedDbErrorKind.Transport or RasterizedDbErrorKind.Timeout)
         {
@@ -421,7 +560,13 @@ public sealed class RasterizedDbCommand : DbCommand
         }
         finally
         {
-            _cancelSequence = 0;
+            Volatile.Write(ref _cancelSequence, 0);
+            if (stoppable)
+            {
+                stop.Dispose();
+                _stopSource = null;
+                _stopConnector = null;
+            }
         }
 
         try
@@ -430,12 +575,22 @@ public sealed class RasterizedDbCommand : DbCommand
                 ? ReadText(connection, connector, ref response, mode, behavior)
                 : ReadBinary(connection, connector, parsed, ref response, mode, behavior);
         }
+        catch (RasterizedDbException e) when (stoppable && e.SqlState == "57014" && cancellation.IsCancellationRequested)
+        {
+            response.Return();
+            throw Stopped(e, cancellation);
+        }
         catch
         {
             response.Return();
             throw;
         }
     }
+
+    private long InFlight() => Volatile.Read(ref _cancelSequence);
+
+    private RasterizedDbDataSource? _stopSource;
+    private Connector? _stopConnector;
 
     /// <summary>
     /// A command with no connection of its own: sent on the data source's shared multiplexed
@@ -479,13 +634,52 @@ public sealed class RasterizedDbCommand : DbCommand
                 source.SetExecSupported(exec.Value);
             }
 
-            BuildInto(writer, MuxConnector.Header, exec, parsed, text, mux.Connector);
-            response = await mux.Exchange(writer, timeout, cancellation).ConfigureAwait(false);
+            var cancelable = false;
+            if (!text && (Cancelable || cancellation.CanBeCanceled))
+            {
+                var known = source.CancelableSupported;
+                if (known is null)
+                {
+                    WriteCancelableProbe(writer, MuxConnector.Header);
+                    var probe = await mux.Exchange(writer, 30, cancellation).ConfigureAwait(false);
+                    var answer = probe.Span;
+                    var at = mux.Connector.TakeNotices(answer);
+                    known = answer.Length > at && answer[at] == Answer.Rows;
+                    probe.Return();
+                    source.SetCancelableSupported(known.Value);
+                }
+
+                cancelable = known == true;
+            }
+
+            BuildInto(writer, MuxConnector.Header, exec, parsed, text, mux.Connector, cancelable);
+            try
+            {
+                response = await mux.Exchange(writer, timeout, cancellation).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when ((text || cancelable) && cancellation.IsCancellationRequested)
+            {
+                // The caller stops waiting at once (the shared connection goes on without it); the
+                // server is told too, so the statement does not run on for nobody.
+                var token = CancelToken(_cancelConnector, Volatile.Read(ref _cancelSequence));
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await RasterizedDbConnection.SendCancel(source, token, async: true, default).ConfigureAwait(false);
+                    }
+                    catch (Exception)
+                    {
+                        // Best effort: the statement then ends at the server's statement timeout.
+                    }
+                });
+                throw;
+            }
         }
         finally
         {
             writer.Dispose();
-            _cancelSequence = 0;
+            Volatile.Write(ref _cancelSequence, 0);
         }
 
         try
@@ -727,13 +921,15 @@ public sealed class RasterizedDbCommand : DbCommand
 
     /// <summary>
     /// Asks the server to stop the statement this command is running, from another thread; it then
-    /// fails with SQLSTATE 57014 and its connection goes on. Works for the text result format, whose
-    /// requests carry a cancel token; a binary-format statement is not interrupted (it ends at the
-    /// server's statement timeout).
+    /// fails with SQLSTATE 57014 and its connection goes on. Works for a statement that carries a
+    /// cancel token: every text-format one, and a binary-format one run with a cancellable
+    /// <see cref="CancellationToken"/> or with <see cref="Cancelable"/> set (against a server that
+    /// knows cancelable requests). Any other is not interrupted: it ends at the server's statement
+    /// timeout.
     /// </summary>
     public override void Cancel()
     {
-        var sequence = _cancelSequence;
+        var sequence = Volatile.Read(ref _cancelSequence);
         var source = _connection?.Source ?? DataSource;
         if (sequence == 0 || source is null)
         {
@@ -742,7 +938,7 @@ public sealed class RasterizedDbCommand : DbCommand
 
         try
         {
-            _ = RasterizedDbConnection.SendCancel(source, $"c{_cancelConnector}-{sequence}", async: false, default).GetAwaiter().GetResult();
+            _ = RasterizedDbConnection.SendCancel(source, CancelToken(_cancelConnector, sequence), async: false, default).GetAwaiter().GetResult();
         }
         catch (Exception)
         {
