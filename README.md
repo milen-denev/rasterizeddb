@@ -1008,6 +1008,8 @@ These are not part of any release:
 #### Clients
 [`rasterizeddb_client`](rasterizeddb_client/README.md) is the Rust SDK for the native protocol, with an ORM and migrations built in. There is no dedicated client for other languages: they connect with any PostgreSQL, MySQL or SQL Server driver.
 
+[`RasterizedDb.Data` and `RasterizedDb.EntityFrameworkCore`](dotnet/README.md) are the .NET driver and Entity Framework Core provider for it. What either client puts on the wire is in [docs/native-protocol.md](docs/native-protocol.md).
+
 #### Stability
 Rasterized DB is at version 1.x. What is stable is the server: its command-line flags, its wire protocols and the SQL it answers, along with the [`rasterizeddb_client`](rasterizeddb_client/README.md) and [`rasterizeddb_embedded`](rasterizeddb_embedded/README.md) crates, which follow semver. The Rust API of `rasterizeddb_core` is the server's internals and may change in any release.
 

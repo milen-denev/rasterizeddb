@@ -3384,7 +3384,7 @@ pub fn fold_core_statement(sql: &str) -> Cow<'_, str> {
 /// would change no name; leaving them keeps the declarations stored as text
 /// (a CHECK, a partial index's predicate, a generated column) reading as
 /// written, `deleted_at IS NULL` rather than `deleted_at is null`.
-const RESERVED_WORDS: &[&str] = &[
+pub(crate) const RESERVED_WORDS: &[&str] = &[
     "ALL", "ANALYSE", "ANALYZE", "AND", "ANY", "ARRAY", "AS", "ASC", "ASYMMETRIC", "BETWEEN", "BOTH", "CASE",
     "CAST", "CHECK", "COLLATE", "COLUMN", "CONSTRAINT", "CREATE", "CROSS", "CURRENT_CATALOG", "CURRENT_DATE",
     "CURRENT_ROLE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "CURRENT_USER", "DEFAULT", "DEFERRABLE", "DESC",
