@@ -78,6 +78,7 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
         summary(snapshot, flavor),
         policy_controls(studio, snapshot, manageable),
         locations(studio, snapshot, flavor, manageable),
+        stores(studio, snapshot),
     ]
     .spacing(10);
 
@@ -181,14 +182,25 @@ fn health(snapshot: &StorageSnapshot, manageable: bool) -> Element<'static, Mess
     if !any && manageable && !snapshot.is_pooled() {
         // Not a fault, and deliberately not coloured as one. It is the state
         // every database starts in, and the page would otherwise look like a
-        // control panel for something that is not switched on.
-        warnings = warnings.push(banner(
-            theme::TEXT_DIM,
-            "ONE DIRECTORY",
+        // control panel for something that is not switched on. Tables on a
+        // key/value store are not in the directory, and saying "everything"
+        // would hide them.
+        let on_stores = snapshot.tables_on_stores();
+        let body = if on_stores > 0 {
+            format!(
+                "Every file-backed table is in the database's own directory; {} more {} on \
+                 key/value {} listed below. Add a directory to spread tables across disks, or \
+                 add one as a backup to keep a mirrored copy of every write.",
+                count(on_stores),
+                if on_stores == 1 { "is" } else { "are" },
+                if snapshot.stores.len() == 1 { "store" } else { "stores" },
+            )
+        } else {
             "Everything this database owns is in its own directory. Add another below to spread \
              tables across disks, or add one as a backup to keep a mirrored copy of every write."
-                .to_string(),
-        ));
+                .to_string()
+        };
+        warnings = warnings.push(banner(theme::TEXT_DIM, "ONE DIRECTORY", body));
         any = true;
     }
 
@@ -259,7 +271,31 @@ fn summary(snapshot: &StorageSnapshot, flavor: Flavor) -> Element<'static, Messa
                     .to_string(),
                 ),
             ),
-            super::tile("TABLES", count(tables), Some("across every directory".to_string())),
+            super::tile(
+                "TABLES",
+                count(tables),
+                Some(
+                    if snapshot.stores.is_empty() {
+                        "across every directory"
+                    } else {
+                        "across every directory and store"
+                    }
+                    .to_string(),
+                ),
+            ),
+            super::tile(
+                "KV STORES",
+                if snapshot.stores.is_empty() {
+                    "none".to_string()
+                } else {
+                    count(snapshot.stores.len() as u64)
+                },
+                Some(if snapshot.stores.is_empty() {
+                    "S3 or key/value stores holding tables".to_string()
+                } else {
+                    format!("holding {} tables", count(snapshot.tables_on_stores()))
+                }),
+            ),
             super::tile(
                 "FREE",
                 if known { bytes(free.unwrap_or(0)) } else { "—".to_string() },
@@ -580,6 +616,112 @@ fn location_actions(location: &StorageLocation) -> Element<'static, Message> {
 }
 
 // ---------------------------------------------------------------------------
+// Key/value stores
+// ---------------------------------------------------------------------------
+
+/// The S3 buckets and local key/value directories this database has
+/// configured. They are not in the pool — no policy places into them and no
+/// backup mirrors them — so they are listed apart from the directories rather
+/// than as rows that would read as if they were.
+fn stores<'a>(studio: &'a Studio, snapshot: &'a StorageSnapshot) -> Element<'a, Message> {
+    if snapshot.stores.is_empty() {
+        return Space::new().into();
+    }
+
+    let layout = super::GridLayout::new(studio, "storage:stores");
+    let columns = vec![
+        super::GridColumn::new("store", "STORE", 160.0),
+        super::GridColumn::new("state", "STATE", 130.0),
+        super::GridColumn::new("kind", "KIND", 60.0),
+        super::GridColumn::new("address", "WHERE", 460.0),
+        super::GridColumn::new("region", "REGION", 90.0),
+        super::GridColumn::new("credentials", "CREDENTIALS", 110.0),
+        super::GridColumn::new("tables", "TABLES", 76.0).right(),
+        super::GridColumn::new("settings", "SETTINGS", 220.0),
+    ];
+    let widths = super::column_widths(&layout, &columns);
+    let total = super::grid_total(&widths);
+
+    let mut stores: Vec<&KvStore> = snapshot.stores.iter().collect();
+    super::sort_rows(&layout, &mut stores, |store, column| match column {
+        "state" => super::SortKey::text(store_state(store).0),
+        "kind" => super::SortKey::text(&store.kind),
+        "address" => super::SortKey::text(&store.endpoint),
+        "region" => super::SortKey::text(&store.region),
+        "credentials" => super::SortKey::text(&store.credentials),
+        "tables" => super::SortKey::number(store.tables as f64),
+        "settings" => super::SortKey::text(&store.settings),
+        _ => super::SortKey::text(&store.name),
+    });
+
+    let mut body = column![].spacing(0);
+    for (index, store) in stores.into_iter().enumerate() {
+        let (label, colour) = store_state(store);
+        let cells = vec![
+            super::grid_cell(store.name.clone(), false, theme::TEXT),
+            container(super::pill(label, colour)).padding([3, 6]).into(),
+            super::grid_cell(store.kind.clone(), false, theme::TEXT_DIM),
+            super::grid_cell(store.address(), false, theme::TEXT_DIM),
+            super::grid_cell(
+                if store.region.is_empty() { "—".into() } else { store.region.clone() },
+                false,
+                theme::TEXT_FAINT,
+            ),
+            super::grid_cell(store.credentials.clone(), false, theme::TEXT_FAINT),
+            super::grid_cell(count(store.tables), true, theme::TEXT_DIM),
+            super::grid_cell(
+                if store.settings.is_empty() { "defaults".into() } else { store.settings.clone() },
+                false,
+                theme::TEXT_FAINT,
+            ),
+        ];
+        body = body.push(super::grid_stripe(
+            index,
+            container(super::grid_row(&widths, cells))
+                .width(Length::Fixed(total))
+                .into(),
+        ));
+    }
+
+    container(
+        column![
+            section_label("KEY/VALUE STORES · S3 AND OTHER STORES HOLDING TABLES"),
+            super::grid_frame(
+                &layout,
+                &widths,
+                super::grid_header(&layout, &columns, &widths),
+                body.into(),
+            ),
+            text(
+                "Tables on a store are outside the pool: the placement policy never picks one, a \
+                 backup directory does not mirror it, and free space is the store's own business. \
+                 NOT CONTACTED means nothing has opened it since the server started, so a wrong \
+                 endpoint or credential has not shown up yet.",
+            )
+            .size(10)
+            .color(theme::TEXT_FAINT),
+        ]
+        .spacing(4),
+    )
+    .width(Fill)
+    .height(Length::Fixed(80.0 + snapshot.stores.len() as f32 * 30.0))
+    .style(theme::panel)
+    .into()
+}
+
+/// A store's state pill. Not contacted is not a fault — the server opens a
+/// store lazily — so it is dim rather than a warning colour.
+fn store_state(store: &KvStore) -> (&'static str, iced::Color) {
+    if !store.supported {
+        ("UNSUPPORTED", theme::BAD)
+    } else if store.opened {
+        ("OPEN", theme::OK)
+    } else {
+        ("NOT CONTACTED", theme::TEXT_DIM)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Adding a location
 // ---------------------------------------------------------------------------
 
@@ -761,7 +903,7 @@ fn placements<'a>(
     let layout = super::GridLayout::new(studio, "storage:placements");
     let mut columns = vec![
         super::GridColumn::new("table_name", "TABLE", 220.0),
-        super::GridColumn::new("location", "DIRECTORY", 420.0),
+        super::GridColumn::new("location", "WHERE", 560.0),
     ];
     if mirroring {
         columns.push(super::GridColumn::new("mirrored", "BACKUP COPY", 120.0));
@@ -780,7 +922,11 @@ fn placements<'a>(
     for (index, placement) in placements.into_iter().enumerate() {
         let mut cells = vec![
             super::grid_cell(placement.table.clone(), false, theme::TEXT),
-            super::grid_cell(placement.location.clone(), false, theme::TEXT_DIM),
+            super::grid_cell(
+                snapshot.describe_location(&placement.location),
+                false,
+                if placement.location.starts_with("kv:") { theme::TEXT } else { theme::TEXT_DIM },
+            ),
         ];
         if mirroring {
             cells.push(
@@ -804,7 +950,7 @@ fn placements<'a>(
     container(
         column![
             section_label(match flavor {
-                Flavor::Rasterized => "TABLES · WHICH DIRECTORY HOLDS EACH",
+                Flavor::Rasterized => "TABLES · WHICH DIRECTORY OR STORE HOLDS EACH",
                 Flavor::Postgres => "TABLES · WHICH TABLESPACE HOLDS EACH",
             }),
             super::grid_frame(
@@ -886,6 +1032,36 @@ mod tests {
                 location("/mnt/c", "primary", false, false),
                 location("/mnt/backup", "backup", true, false),
             ],
+            stores: vec![
+                KvStore {
+                    name: "archive".into(),
+                    kind: "s3".into(),
+                    endpoint: "https://s3.example.com".into(),
+                    region: "de".into(),
+                    bucket: "kv-tables".into(),
+                    prefix: "db1/".into(),
+                    addressing: "path".into(),
+                    settings: String::new(),
+                    credentials: "store".into(),
+                    tables: 1,
+                    opened: true,
+                    supported: true,
+                },
+                KvStore {
+                    name: "local".into(),
+                    kind: "dir".into(),
+                    endpoint: "/srv/kv".into(),
+                    region: String::new(),
+                    bucket: String::new(),
+                    prefix: String::new(),
+                    addressing: String::new(),
+                    settings: "chunk_bytes=65536".into(),
+                    credentials: "environment".into(),
+                    tables: 0,
+                    opened: false,
+                    supported: true,
+                },
+            ],
             placements: vec![
                 TablePlacement {
                     table: "alpha".into(),
@@ -895,6 +1071,11 @@ mod tests {
                 TablePlacement {
                     table: "beta".into(),
                     location: "/mnt/b".into(),
+                    mirrored: false,
+                },
+                TablePlacement {
+                    table: "gamma".into(),
+                    location: "kv:archive".into(),
                     mirrored: false,
                 },
             ],
@@ -913,6 +1094,7 @@ mod tests {
                 stats: Vec::new(),
                 supported: false,
                 locations: Vec::new(),
+                stores: Vec::new(),
                 placements: Vec::new(),
             }),
             Vec::new(),
@@ -925,8 +1107,25 @@ mod tests {
     fn the_page_renders_a_database_with_one_directory() {
         let mut snapshot = full();
         snapshot.locations.truncate(1);
+        snapshot.stores.clear();
         snapshot.placements.retain(|p| p.location == "/root");
         render(Some(snapshot), Vec::new());
+    }
+
+    /// The case that hid S3 tables: one directory, plus a store holding some.
+    #[test]
+    fn the_page_renders_one_directory_and_a_store() {
+        let mut snapshot = full();
+        snapshot.locations.truncate(1);
+        render(Some(snapshot.clone()), Vec::new());
+        assert_eq!(snapshot.tables_on_stores(), 1);
+        assert_eq!(
+            snapshot.describe_location("kv:archive"),
+            "s3 store 'archive' · s3://kv-tables/db1 @ https://s3.example.com"
+        );
+        assert_eq!(snapshot.describe_location("kv:gone"), "key/value store 'gone'");
+        assert_eq!(snapshot.describe_location("memory:"), "in memory");
+        assert_eq!(snapshot.describe_location("/root"), "/root");
     }
 
     #[test]

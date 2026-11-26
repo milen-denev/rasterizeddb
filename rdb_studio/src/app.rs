@@ -3613,6 +3613,7 @@ impl Studio {
         let stats_sql = dialect::storage_stats_sql(flavor).to_string();
         let locations_sql = dialect::storage_locations_sql(flavor).to_string();
         let placements_sql = dialect::storage_placements_sql(flavor).to_string();
+        let stores_sql = dialect::storage_stores_sql(flavor).map(str::to_string);
 
         Task::perform(
             async move {
@@ -3634,7 +3635,19 @@ impl Studio {
                     }
                     _ => Vec::new(),
                 };
-                Box::new(StorageSnapshot { stats, supported, locations, placements })
+                // Not an error when absent: a server built without
+                // `kv_storage` answers an unknown SHOW as a parameter, and one
+                // with it but no stores answers no rows.
+                let stores = match stores_sql {
+                    Some(sql) => match session.query(&sql).await {
+                        Ok(grid) if grid.column_index("store").is_some() => {
+                            dialect::parse_storage_stores(&grid)
+                        }
+                        _ => Vec::new(),
+                    },
+                    None => Vec::new(),
+                };
+                Box::new(StorageSnapshot { stats, supported, locations, stores, placements })
             },
             Message::StorageLoaded,
         )
