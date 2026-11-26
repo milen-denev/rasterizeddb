@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>
+    <RootNamespace>RasterizedDb.Messaging</RootNamespace>
+    <AssemblyName>RasterizedDb.Messaging</AssemblyName>
+    <PackageId>RasterizedDb.Messaging</PackageId>
+    <Description>Client for RasterizedDB's message broker (rdbmq/1): queues, topics, subscriptions with credits and acknowledgements, exchanges. Pre-production: the protocol is not frozen.</Description>
+    <PackageTags>rasterizeddb;messaging;queue;broker</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- CRC-32 (IEEE), the checksum of a batch's header and of its records. -->
+    <PackageReference Include="System.IO.Hashing" Version="8.0.0" />
+    <InternalsVisibleTo Include="RasterizedDb.Messaging.Tests" />
+  </ItemGroup>
+</Project>
