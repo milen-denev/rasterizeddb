@@ -650,7 +650,10 @@ pub fn upsert_sql<M: Model>(m: &M) -> Result<String> {
 /// `#[rdb(version)]` column, `version = version + 1 … AND version = <the
 /// struct's>`.
 pub fn update_sql<M: Model>(m: &M) -> Result<String> {
-    refuse_on_ledger::<M>("UPDATE")?;
+    // A versioned ledger table takes updates (each a new, chained version).
+    if !M::LEDGER.is_some_and(|l| l.versioned) {
+        refuse_on_ledger::<M>("UPDATE")?;
+    }
     let mut sets = Vec::new();
     for (i, column) in M::COLUMNS.iter().enumerate() {
         if column.primary_key || column.serial {
@@ -848,6 +851,8 @@ pub struct LedgerSpec {
     pub drop_idle: Option<&'static str>,
     /// `ANCHOR TO '<sink>', …`.
     pub anchors: &'static [&'static str],
+    /// `VERSIONED`: rows may be updated; the server keeps every version.
+    pub versioned: bool,
 }
 
 impl LedgerSpec {
@@ -860,7 +865,7 @@ impl LedgerSpec {
             if ok { Ok(()) } else { Err(Error::Unsupported(format!("{v:?} is not a duration like \"7 years\""))) }
         };
         unit(self.retention)?;
-        let mut c = format!("NO DELETE UNTIL {} AFTER INSERT", self.retention);
+        let mut c = format!("{}NO DELETE UNTIL {} AFTER INSERT", if self.versioned { "VERSIONED " } else { "" }, self.retention);
         if let Some(d) = self.drop_idle {
             unit(d)?;
             c.push_str(&format!(" NO DROP UNTIL {d} IDLE"));

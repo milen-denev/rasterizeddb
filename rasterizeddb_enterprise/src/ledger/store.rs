@@ -50,6 +50,9 @@ const LEAF_DOMAIN: &[u8] = b"rdb-leaf-v1";
 pub const OP_INSERT: u8 = 1;
 pub const OP_DELETE: u8 = 2;
 pub const OP_EVENT: u8 = 3;
+/// A new version of a row of a versioned ledger table: its stamp, and the
+/// new version's width and leaf.
+pub const OP_UPDATE: u8 = 4;
 
 pub type Hash = [u8; 32];
 

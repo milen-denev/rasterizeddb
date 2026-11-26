@@ -126,6 +126,11 @@ impl NativeAuthConfig {
     pub fn validate_socket_method(method: AuthMethod) -> Result<(), String> {
         match method {
             AuthMethod::Peer => Ok(()),
+            AuthMethod::Cert => Err(
+                "certificate login needs TLS, which a unix socket does not carry; use peer or \
+                 scram-sha-256 on the socket"
+                    .to_string(),
+            ),
             method => Self::validate_method(method),
         }
     }
@@ -133,11 +138,8 @@ impl NativeAuthConfig {
     fn validate_method(method: AuthMethod) -> Result<(), String> {
         match method {
             AuthMethod::Trust | AuthMethod::ScramSha256 | AuthMethod::Peer => Ok(()),
-            AuthMethod::Cert => Err(
-                "certificate login is offered on the PostgreSQL listener (--pg-auth cert); the native \
-                 protocol does not offer it yet"
-                    .to_string(),
-            ),
+            // On TCP only: a unix socket carries no TLS to present one over.
+            AuthMethod::Cert => Ok(()),
             AuthMethod::Md5 | AuthMethod::Password => Err(format!(
                 "the native protocol does not offer {}: it exists in the PostgreSQL listener \
                  only for drivers that speak nothing else. Use scram-sha-256.",
@@ -313,6 +315,22 @@ impl RoleAuthenticator {
         let superuser = role.as_ref().map(|r| r.is_superuser).unwrap_or(false);
 
         if self.method == AuthMethod::Trust {
+            channel.send(&[S_OK]).await?;
+            return Ok(principal(user, superuser));
+        }
+
+        // Who the verified TLS client certificate names (`AuthMethod::Cert`):
+        // its subject common name, or the role `--pg-cert-map` gives its
+        // fingerprint. The listener asked for one signed by the client CA
+        // (`bind_native_listener`), so a certificate here is one the
+        // handshake proved the caller holds the key of.
+        if self.method == AuthMethod::Cert {
+            let named = channel
+                .peer_certificate()
+                .is_some_and(|der| crate::pgwire::client_cert::names(der, &user));
+            if !named || !may_login {
+                return Err(Self::refuse(channel, &user).await);
+            }
             channel.send(&[S_OK]).await?;
             return Ok(principal(user, superuser));
         }

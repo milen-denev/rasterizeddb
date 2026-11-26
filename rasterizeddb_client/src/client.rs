@@ -108,6 +108,11 @@ impl Default for Options {
     }
 }
 
+/// A copy of `identity` for one more connection (a key is not `Clone`).
+pub(crate) fn clone_identity(identity: &rastcp::tls::ClientIdentity) -> rastcp::tls::ClientIdentity {
+    rastcp::tls::ClientIdentity { certs: identity.certs.clone(), key: identity.key.clone_key() }
+}
+
 /// `builder` believing the server as `trust` says. Accepting anything is
 /// left unsaid: rastcp refuses a unix socket that names any trust at all,
 /// since a socket carries no TLS to check, and "accept anything" asks for
@@ -271,7 +276,40 @@ impl Client {
         Self::open(addr, options, Some(role)).await
     }
 
+    /// [`Client::connect`], logging in as `user` with a client certificate:
+    /// the server runs `--rdb-auth cert` and verifies the certificate against
+    /// its client CA in the TLS handshake, then lets `user` in when the
+    /// certificate names it (subject common name, or the server's fingerprint
+    /// map). `cert_path` and `key_path` are PEM files. `options.login` is
+    /// replaced; no password is sent or needed. Set
+    /// [`Options::trust`] to check the server's certificate too.
+    pub async fn connect_with_certificate(
+        addr: &str,
+        mut options: Options,
+        user: &str,
+        cert_path: &str,
+        key_path: &str,
+    ) -> Result<Self> {
+        if user.is_empty() {
+            return Err(crate::Error::Param("connect_with_certificate needs a user name".to_string()));
+        }
+        let identity = rastcp::tls::ClientIdentity::load(cert_path, key_path)?;
+        // The exchange is peer login's: the client names the user, and the
+        // server decides from what it verified (the certificate).
+        options.login = Login::PeerAs(user.to_string());
+        Self::open_with(addr, options, None, Some(std::sync::Arc::new(identity))).await
+    }
+
     async fn open(addr: &str, options: Options, role: Option<&str>) -> Result<Self> {
+        Self::open_with(addr, options, role, None).await
+    }
+
+    async fn open_with(
+        addr: &str,
+        options: Options,
+        role: Option<&str>,
+        identity: Option<std::sync::Arc<rastcp::tls::ClientIdentity>>,
+    ) -> Result<Self> {
         let database = options.database.as_deref();
         let authenticator = options.login.authenticator(database)?;
         let setup = match role {
@@ -283,6 +321,9 @@ impl Client {
             let mut builder =
                 with_trust(TcpClientBuilder::new(addr), &options.trust)
                     .max_message_size(options.max_message_size);
+            if let Some(identity) = &identity {
+                builder = builder.identity(clone_identity(identity));
+            }
             builder = match with_grace(options.timeout) {
                 Some(timeout) => builder.timeout(timeout),
                 None => builder.no_timeout(),
@@ -318,6 +359,7 @@ impl Client {
                 authenticator,
                 setup,
                 trust: options.trust.clone(),
+                identity,
                 notices: notices.clone(),
             }),
             exec: AtomicU8::new(EXEC_UNKNOWN),
@@ -353,6 +395,7 @@ impl Client {
                 authenticator: None,
                 setup: None,
                 trust: crate::Trust::AcceptAny,
+                identity: None,
                 notices: Default::default(),
             }),
             exec: AtomicU8::new(EXEC_NO),

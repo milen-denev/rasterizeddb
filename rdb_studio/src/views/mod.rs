@@ -239,6 +239,8 @@ fn pane(studio: &Studio) -> Element<'_, Message> {
                     reload: Message::ReloadLedger,
                     verify: Message::VerifyLedger,
                     audit: Message::LedgerAudit,
+                    run: Message::LedgerRun,
+                    input: Message::LedgerInput,
                 },
             ),
         ),

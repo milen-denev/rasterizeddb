@@ -120,6 +120,18 @@ pub trait LedgerHooks: Send + Sync + 'static {
     /// retention. Pending as [`Self::on_insert`] is.
     fn on_delete(&self, table: &TableSchema, tx: TxId, ts: i64);
 
+    /// Whether the row stamped `ts` of `table` may be updated now (a
+    /// versioned ledger table; never an append-only one).
+    fn admit_row_update(&self, table: &TableSchema, ts: i64) -> Result<(), String>;
+
+    /// The row stamped `ts` got a new version from `tx`, with these cells.
+    /// Pending as [`Self::on_insert`] is.
+    fn on_update(&self, table: &TableSchema, tx: TxId, ts: i64, cells: &[(u32, &[u8])]);
+
+    /// Whether `table` keeps every row version (a versioned ledger table):
+    /// its retired versions are then never reclaimed.
+    fn keeps_versions(&self, table: &TableSchema) -> bool;
+
     /// The family `members` (each id with whether its writes survive) is
     /// about to commit in the database whose ledger lives under `store`.
     /// Its surviving rows' entries are chained and made durable here; an
@@ -150,6 +162,9 @@ pub struct LedgerRequest<'a> {
     /// Each special table it is about, with every row visible now: its
     /// stamp and its stored cells by write order (read for `VERIFY` only).
     pub tables: Vec<(&'a TableSchema, Vec<(i64, Vec<(u32, Vec<u8>)>)>)>,
+    /// For `SHOW LEDGER HISTORY <table> <stamp>`: every version of that row
+    /// still on disk, oldest first, `(xmin, xmax, stored cells)`.
+    pub versions: Vec<(u64, u64, Vec<(u32, Vec<u8>)>)>,
     /// The role running it, and whether it is a superuser.
     pub role: &'a str,
     pub superuser: bool,
@@ -218,6 +233,26 @@ pub fn on_delete(table: &TableSchema, tx: TxId, ts: i64) {
     if let Some(h) = HOOKS.get() {
         h.on_delete(table, tx, ts);
     }
+}
+
+/// [`LedgerHooks::admit_row_update`], refused without installed hooks.
+pub fn admit_row_update(table: &TableSchema, ts: i64) -> Result<(), String> {
+    match HOOKS.get() {
+        Some(h) => h.admit_row_update(table, ts),
+        None => Err(not_installed(table.special, &table.name)),
+    }
+}
+
+/// [`LedgerHooks::on_update`], for a special table.
+pub fn on_update(table: &TableSchema, tx: TxId, ts: i64, cells: &[(u32, &[u8])]) {
+    if let Some(h) = HOOKS.get() {
+        h.on_update(table, tx, ts, cells);
+    }
+}
+
+/// [`LedgerHooks::keeps_versions`]; false for a plain table.
+pub fn keeps_versions(table: &TableSchema) -> bool {
+    table.special.is_special() && HOOKS.get().is_some_and(|h| h.keeps_versions(table))
 }
 
 /// [`LedgerHooks::prepare_commit`] when anything in `members` is pending;

@@ -146,6 +146,7 @@ pub struct AuthChannel<'a> {
     timeout: Duration,
     binding: ChannelBinding,
     peer: Peer,
+    peer_certificate: Option<Vec<u8>>,
 }
 
 impl<'a> AuthChannel<'a> {
@@ -160,7 +161,23 @@ impl<'a> AuthChannel<'a> {
             timeout,
             binding,
             peer,
+            peer_certificate: None,
         }
+    }
+
+    /// The same channel, carrying the certificate the client presented in the
+    /// TLS handshake (DER), which the server's `client_auth` verified.
+    pub fn with_peer_certificate(mut self, certificate: Option<Vec<u8>>) -> Self {
+        self.peer_certificate = certificate;
+        self
+    }
+
+    /// The client's certificate (DER), when it presented one the server's
+    /// `client_auth` verified: something an exchange may rely on, because
+    /// the TLS handshake proved the caller holds its key. `None` on a unix
+    /// socket and on a server that asks for no certificate.
+    pub fn peer_certificate(&self) -> Option<&[u8]> {
+        self.peer_certificate.as_deref()
     }
 
     /// Reads the next message, failing if the peer takes too long or sends

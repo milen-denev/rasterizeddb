@@ -311,6 +311,36 @@ Written on `wip/ledger`, `cargo check` pending, **no tests run yet**:
 - The audit of a GET refused by the privilege check happens in core,
   before the hook, so it is not recorded.
 
+## 5.6 Second round (wip/ledger-2, 2026-11-26)
+
+**Certificate login over the native protocol.**
+- `--rdb-auth cert` with `--pg-client-ca` (the one CA for every listener) and `--pg-cert-map`.
+- rastcp hands the verified client certificate to the login exchange (`AuthChannel::peer_certificate`, additive).
+- The client logs in with `Client::connect_with_certificate(addr, options, user, cert.pem, key.pem)`.
+- A unix socket refuses `cert` (it carries no TLS).
+
+**Studio.** The LEDGER page manages everything, through two generic Studio messages (run, input); the licensed crate builds every statement:
+- verify (all or one table), receipts, raising retention, legal holds, anchors;
+- creating ledger tables and vaults, acknowledging a rollback;
+- per secret: reveal (explicit, cleared on reload), versions, set, disable/enable, delete/recover, purge;
+- vault-wide: key rotation, audit, keys (create, encrypt, decrypt, sign, verify, public key).
+
+**Offline verifier.** `rdb-ledger-verify --store <served path> --data <copy>` also opens a copy of the data directory and checks every ledger table's rows against the chain.
+
+**VERSIONED ledger tables.** `CREATE LEDGER TABLE … VERSIONED NO DELETE UNTIL …`:
+- UPDATE is allowed. Each update chains the new version's digest (op 4). The hidden `__ledger_ts` is the row's identity and is never assigned.
+- The table never takes the in-place overwrite, vacuum is off, and maintenance is refused, so every version stays on disk.
+- `SHOW LEDGER HISTORY <table> <stamp>` lists them, each marked chained or not.
+- Client: `#[rdb(ledger_versioned)]` (`update` is then allowed), `LedgerAdmin::history`.
+
+**Keys inside the HSM.** `VAULT v CREATE KEY 'k' TYPE 'hsm-aes256-gcm' | 'hsm-ecdsa-p256'` on a `pkcs11:` vault generates the key on the token (sensitive, not extractable). ENCRYPT, DECRYPT, SIGN, VERIFY and PUBLIC KEY run on the token. The keyring only records that the key exists. Tested against SoftHSM.
+
+**TPM-sealed keys** (feature `tpm`, opt-in, links libtss2-esys):
+- `KEY PROVIDER 'tpm:<file>[;tcti=…][;create]'` seals the vault's key-encryption key to this machine's TPM 2.0 storage hierarchy.
+- The file is useless on any other machine. The key is unsealed once at open, over an encrypted HMAC session.
+- PCR-bound sealing (to a measured boot state) is not built.
+- Tested against swtpm.
+
 ## 6. Phases (implement all first with `cargo check`, then test in one go)
 
 | Phase | Contents |

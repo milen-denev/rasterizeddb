@@ -24,6 +24,8 @@ mod pkcs11;
 
 #[cfg(feature = "pqc")]
 pub mod pqc;
+#[cfg(feature = "tpm")]
+pub mod tpm;
 #[cfg(feature = "pqc")]
 pub mod pqc_sign;
 
@@ -41,6 +43,27 @@ pub trait KeyProvider: Send + Sync {
     fn describe(&self) -> String;
     fn wrap(&self, dek: &[u8; 32]) -> Result<Vec<u8>, String>;
     fn unwrap(&self, wrapped: &[u8]) -> Result<Dek, String>;
+    /// Keys that live in the provider's hardware and are used there, when it
+    /// has any (a PKCS#11 token).
+    fn hsm(&self) -> Option<&dyn HsmKeys> {
+        None
+    }
+}
+
+/// Keys generated inside a hardware token, used there and never exported
+/// (`VAULT … CREATE KEY … TYPE 'hsm-aes256-gcm' | 'hsm-ecdsa-p256'`). Each is
+/// found by its label.
+pub trait HsmKeys {
+    fn generate_aes(&self, label: &str) -> Result<(), String>;
+    /// `iv ‖ ciphertext ‖ tag`, AES-256-GCM on the token.
+    fn aes_encrypt(&self, label: &str, plain: &[u8], aad: &[u8]) -> Result<Vec<u8>, String>;
+    fn aes_decrypt(&self, label: &str, sealed: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec<u8>>, String>;
+    fn generate_ec(&self, label: &str) -> Result<(), String>;
+    /// An ECDSA P-256 signature (`r ‖ s`) of SHA-256(`message`), on the token.
+    fn ec_sign(&self, label: &str, message: &[u8]) -> Result<Vec<u8>, String>;
+    fn ec_verify(&self, label: &str, message: &[u8], signature: &[u8]) -> Result<bool, String>;
+    /// The public key, as the token's `CKA_EC_POINT`.
+    fn ec_public(&self, label: &str) -> Result<Vec<u8>, String>;
 }
 
 /// A fresh random data key.
@@ -157,6 +180,15 @@ pub fn provider(uri: &str) -> Result<Box<dyn KeyProvider>, String> {
         return Err("mlkem: keys are not offered in FIPS mode: the ML-KEM here is not the validated module's; \
                     use pkcs11: with a FIPS 140-3 validated HSM"
             .to_string());
+    }
+    if let Some(rest) = uri.strip_prefix("tpm:") {
+        #[cfg(feature = "tpm")]
+        return Ok(Box::new(tpm::TpmKey::open(rest)?));
+        #[cfg(not(feature = "tpm"))]
+        {
+            let _ = rest;
+            return Err("this build has no TPM key provider (feature `tpm`)".to_string());
+        }
     }
     if let Some(rest) = uri.strip_prefix("mlkem:") {
         #[cfg(feature = "pqc")]

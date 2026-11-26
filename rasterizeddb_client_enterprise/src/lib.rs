@@ -456,6 +456,13 @@ impl<'c> LedgerAdmin<'c> {
         lines(self.client, &format!("SHOW LEDGER RECEIPT {} {row_stamp}", ident(table)?)).await
     }
 
+    /// `SHOW LEDGER HISTORY`: every version of one row (by its
+    /// `__ledger_ts`) still on disk, each marked chained or not. A versioned
+    /// table keeps them all.
+    pub async fn history(&self, table: &str, row_stamp: i64) -> Result<Vec<String>> {
+        lines(self.client, &format!("SHOW LEDGER HISTORY {} {row_stamp}", ident(table)?)).await
+    }
+
     /// `SHOW LEDGER [table]`.
     pub async fn show(&self, table: Option<&str>) -> Result<Vec<String>> {
         let sql = match table {

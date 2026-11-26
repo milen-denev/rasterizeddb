@@ -1609,6 +1609,18 @@ fn main() -> std::io::Result<()> {
         log::info!("FIPS 140-3 mode: cryptography through the AWS-LC FIPS module");
     }
 
+    // Client certificates (`--pg-auth cert`, `--rdb-auth cert`): one CA and
+    // one fingerprint map for every listener that offers certificate login.
+    if let Some(ca) = &args.pg_client_ca {
+        rasterizeddb_core::pgwire::client_cert::set_ca(ca.clone());
+    }
+    if let Some(map) = &args.pg_cert_map {
+        if let Err(e) = rasterizeddb_core::pgwire::client_cert::load_map(map) {
+            eprintln!("--pg-cert-map: {e}");
+            std::process::exit(2);
+        }
+    }
+
     // The licensed hooks, before anything can open a session. The ledger
     // guard first and always: a ledger table must not open unguarded.
     #[cfg(feature = "enterprise")]
@@ -2244,7 +2256,7 @@ fn main() -> std::io::Result<()> {
                 let Some(method) = rasterizeddb_core::auth::AuthMethod::parse(&args.rdb_auth)
                 else {
                     eprintln!(
-                        "unknown --rdb-auth {:?}: expected trust or scram-sha-256",
+                        "unknown --rdb-auth {:?}: expected trust, scram-sha-256 or cert (with --pg-client-ca)",
                         args.rdb_auth
                     );
                     std::process::exit(2);
@@ -2350,15 +2362,6 @@ fn main() -> std::io::Result<()> {
                     PgTlsMode::Require => rasterizeddb_core::pgwire::TlsMode::Require,
                 };
 
-                if let Some(ca) = &args.pg_client_ca {
-                    rasterizeddb_core::pgwire::client_cert::set_ca(ca.clone());
-                }
-                if let Some(map) = &args.pg_cert_map {
-                    if let Err(e) = rasterizeddb_core::pgwire::client_cert::load_map(map) {
-                        eprintln!("--pg-cert-map: {e}");
-                        std::process::exit(2);
-                    }
-                }
                 let tls = rasterizeddb_core::pgwire::TlsConfig {
                     mode: tls_mode,
                     // With neither path given a self-signed certificate is
