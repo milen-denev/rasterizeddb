@@ -12533,6 +12533,11 @@ where
             return Ok(Some(true));
         }
     };
+    // `PREPARE TRANSACTION 'gid' OR COMMIT READ ONLY`, a gateway's: a part
+    // that changed nothing and holds no row lock has nothing to prepare, so
+    // it ends here and now, and is left out of the second phase.
+    let or_commit_read_only =
+        kind == 0 && t.rfind('\'').is_some_and(|q| t[q + 1..].split_whitespace().map(str::to_ascii_uppercase).eq(["OR", "COMMIT", "READ", "ONLY"]));
     let fail = |e: String| {
         let code = e.get(..5).filter(|c| c.bytes().all(|b| b.is_ascii_alphanumeric()) && e.as_bytes().get(5) == Some(&b':'));
         (code.map(str::to_string).unwrap_or_else(|| "XX000".to_string()), e.splitn(2, ": ").last().unwrap_or(&e).to_string())
@@ -12554,6 +12559,21 @@ where
             t.abort_unless_aborted(database);
             t.owner.release();
             send_command_complete(stream, "ROLLBACK").await?;
+            return Ok(Some(true));
+        }
+        // A part that only read: committed as a read-only block is, with no
+        // disk write, and answered so (`or_commit_read_only`). One that
+        // holds a row lock (SELECT … FOR UPDATE) keeps it to the outcome,
+        // and one with notifications keeps those: both are prepared.
+        if or_commit_read_only
+            && notifies.is_empty()
+            && !database.transactions.wrote_family(t.id)
+            && !database.row_locks.txn_holds_rows(t.id)
+        {
+            match commit_block(database, state, t).await {
+                Ok(()) => send_command_complete(stream, "COMMIT READ ONLY").await?,
+                Err((code, message)) => send_error_response(stream, code, &message).await?,
+            }
             return Ok(Some(true));
         }
         // The block's notifications wait for its outcome: sent by COMMIT

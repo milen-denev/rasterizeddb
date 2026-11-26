@@ -228,6 +228,7 @@ auth = scram
 unrouted = fan_out
 two_phase = on
 retries = 10
+session_pool = 8
 api_listen = 127.0.0.1:{API}
 api_token_file = {WORK}/api.token
 config_dir = {WORK}/gateway_config
@@ -785,6 +786,26 @@ def main():
     per = [psql(PG[n], "SET rdb.shard_part = on; SELECT id, v FROM orders WHERE v = -7") for n in SHARDS]
     check("a two-shard rollback changes neither", got == (0, "0"), f"{out} / {got} / per shard {per}")
 
+    # 4a. A part that only read ends at the prepare, and is in neither the
+    # decision nor the second phase; the anchor drops a decision once every
+    # part has been told it.
+    code, out = psql(GW, f"BEGIN; UPDATE orders SET v = 2 WHERE id = {a}; SELECT v FROM orders WHERE id = {b}; COMMIT")
+    got = psql(GW, f"SELECT v FROM orders WHERE id = {a}")
+    check("a transaction that wrote on one shard and read on another commits",
+          code == 0 and out.splitlines()[-1] == "COMMIT" and got == (0, "2"), f"{out} / {got}")
+    psql(GW, f"UPDATE orders SET v = 1 WHERE id = {a}")
+    code, out = psql(GW, f"BEGIN; SELECT v FROM orders WHERE id = {a}; SELECT v FROM orders WHERE id = {b}; COMMIT")
+    check("a transaction that only read on two shards commits", code == 0 and out.splitlines()[-1] == "COMMIT", out)
+    code, out = psql(GW, f"BEGIN; UPDATE orders SET v = 3 WHERE id = {a}; SELECT v FROM orders WHERE id = {b}; ROLLBACK")
+    check("  ...and one rolled back changes nothing", psql(GW, f"SELECT v FROM orders WHERE id = {a}") == (0, "1"), out)
+    time.sleep(1)
+    import glob
+    logs = glob.glob(f"{LOCATION.get(0, WORK + '/s0')}/**/rdb_2pc_decisions", recursive=True)
+    lines = open(logs[0]).read().splitlines() if logs else []
+    decided = {l.split(" ", 1)[1] for l in lines if l.startswith(("commit ", "abort "))}
+    forgotten = {l.split(" ", 1)[1] for l in lines if l.startswith("forget ")}
+    check("the anchor forgets a decision every part was told", len(decided) >= 1 and decided <= forgotten, lines[-6:])
+
     # 4b. Statements without a route key under two-phase commit.
     check("a keyed IN list across shards", psql(GW, f"SELECT count(*) FROM orders WHERE id IN ({a}, {b}, 7)") == (0, "3"),
           psql(GW, f"SELECT count(*) FROM orders WHERE id IN ({a}, {b}, 7)"))
@@ -980,6 +1001,9 @@ def main():
         out, _ = listener.communicate(timeout=60)
         check("a prepared NOTIFY across a restart", done[0] == 0 and '"survived"' in out, f"{done} / {out}")
 
+    rows_ = dict(l.split("|", 1) for l in psql(GW, "SHOW GATEWAY")[1].splitlines() if "|" in l)
+    check("shard sessions are reused between clients (session_pool)",
+          int(rows_.get("virtual_sessions_reused", "0")) > 0, {k: v for k, v in rows_.items() if "virtual" in k})
     if COMPRESS:
         rows_ = dict(l.split("|", 1) for l in psql(GW, "SHOW GATEWAY")[1].splitlines() if "|" in l)
         check("the links to the shards are compressed",

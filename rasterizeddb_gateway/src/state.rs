@@ -235,6 +235,10 @@ pub struct Shared {
     pub schema_epoch: AtomicU64,
     pub draining: AtomicBool,
     pub sessions: AtomicUsize,
+    /// Transactions open under a global id (`rdb.global_txn`): the only
+    /// ones the deadlock detector can follow, so it asks the shards
+    /// nothing while there are none.
+    pub tagged_txns: AtomicUsize,
     /// Keys the fake SCRAM salts of unknown roles.
     pub secret: [u8; 32],
     #[cfg(feature = "tls")]

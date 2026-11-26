@@ -128,6 +128,14 @@ pub struct Config {
     pub shard_compression: Option<i32>,
     /// Frames shorter than this go uncompressed.
     pub shard_compression_min_bytes: u32,
+    /// How many idle shard sessions each core keeps for its next clients
+    /// (`session_pool`); 0, the default, keeps none. A client that
+    /// disconnects leaves its shard sessions, reset, to the next client of
+    /// the same database, role and startup parameters, which then opens
+    /// none: for clients that connect per request.
+    pub session_pool: usize,
+    /// How long an idle shard session is kept before it is closed.
+    pub session_pool_idle: Duration,
 }
 
 impl Default for Config {
@@ -184,6 +192,8 @@ impl Default for Config {
             retries: 3,
             shard_compression: None,
             shard_compression_min_bytes: 1024,
+            session_pool: 0,
+            session_pool_idle: Duration::from_secs(30),
         }
     }
 }
@@ -330,6 +340,8 @@ impl Config {
             "native_listen" => self.native_listen = opt(v).map(|a| a.parse()).transpose().map_err(|_| "not host:port")?,
             "two_phase_lock_timeout_ms" => self.two_phase_lock_timeout_ms = num(v)?,
             "deadlock_check_ms" => self.deadlock_check_ms = num(v)?,
+            "session_pool" => self.session_pool = num(v)? as usize,
+            "session_pool_idle_secs" => self.session_pool_idle = Duration::from_secs(num(v)?.max(1)),
             "gather" => self.gather = matches!(v, "on" | "true" | "1"),
             "two_phase" => {
                 self.two_phase = match v.to_ascii_lowercase().as_str() {

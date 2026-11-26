@@ -376,7 +376,7 @@ impl Session {
         {
             self.generation += 1;
             let generation = self.generation;
-            self.statements.insert(name.to_string(), crate::session::Stmt { text: text.to_string(), parse: p.clone(), generation });
+            self.statements.insert(name.to_string(), crate::session::Stmt::new(text, p.clone(), generation));
         }
         Ok(Some(outcome))
     }
@@ -661,12 +661,10 @@ impl Session {
         if self.txn.status != b'I' {
             return false;
         }
+        let tag = self.tag_txn();
         self.txn.opening.clear();
         push_query(&mut self.txn.opening, "BEGIN");
-        push_query(
-            &mut self.txn.opening,
-            &format!("SET LOCAL rdb.global_txn = '{}'", crate::session::next_global_txn(&self.core.shared.cfg.gateway_name)),
-        );
+        push_query(&mut self.txn.opening, &format!("SET LOCAL rdb.global_txn = '{tag}'"));
         self.txn.opening_queries = 2;
         self.txn.status = b'T';
         true
@@ -911,7 +909,7 @@ impl Session {
             },
             None => {
                 let st = self.statements.get(&bind.statement)?;
-                (st.text.clone(), st.parse.clone())
+                (st.text.to_string(), st.parse.clone())
             }
         };
         let types = pg::parse_types(&parse_msg).unwrap_or_default();
@@ -961,7 +959,7 @@ impl Session {
             // Known here from now on; a later Bind re-parses it where it goes.
             self.generation += 1;
             let generation = self.generation;
-            self.statements.insert(name.to_string(), crate::session::Stmt { text: text.to_string(), parse: p.clone(), generation });
+            self.statements.insert(name.to_string(), crate::session::Stmt::new(text, p.clone(), generation));
         }
         Ok(Some(outcome))
     }
@@ -994,7 +992,7 @@ impl Session {
                 _ => return Ok(None),
             },
             None => match self.statements.get(&bind.statement) {
-                Some(st) => (st.text.clone(), st.parse.clone()),
+                Some(st) => (st.text.to_string(), st.parse.clone()),
                 None => return Ok(None),
             },
         };
@@ -1143,7 +1141,7 @@ impl Session {
         {
             self.generation += 1;
             let generation = self.generation;
-            self.statements.insert(name.to_string(), crate::session::Stmt { text: text.to_string(), parse: p.to_vec(), generation });
+            self.statements.insert(name.to_string(), crate::session::Stmt::new(text, p.to_vec(), generation));
         }
 
         let mut out = Vec::new();
@@ -1505,6 +1503,9 @@ impl Session {
     ///   on one filesystem report the same).
     pub(crate) async fn cluster_show<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, text: &str) -> io::Result<Option<Outcome>> {
         let _ = conn;
+        if !crate::session::begins_with_word(text, &["show"]) {
+            return Ok(None);
+        }
         let up = text.trim().trim_end_matches(';').trim().to_ascii_uppercase();
         let up = up.split_whitespace().collect::<Vec<_>>().join(" ");
         let kind = match up.as_str() {
@@ -1709,6 +1710,9 @@ impl Session {
     /// else. Only roles named in `rebalance_roles` may run them.
     pub(crate) async fn rebalance_stmt<S: AsyncWrite + Unpin>(&mut self, conn: &mut S, text: &str) -> io::Result<Option<Outcome>> {
         let _ = conn;
+        if !crate::session::begins_with_word(text, &["show", "rebalance"]) {
+            return Ok(None);
+        }
         let up = text.trim().trim_end_matches(';').trim().to_ascii_uppercase();
         let words: Vec<&str> = up.split_whitespace().collect();
         let max_moves = match words.as_slice() {
