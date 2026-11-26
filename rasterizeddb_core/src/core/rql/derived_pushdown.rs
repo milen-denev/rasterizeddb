@@ -23,7 +23,13 @@
 //!   clause; aggregates only under a `GROUP BY` that groups by the column;
 //!   every window `PARTITION BY` it (a filter on a partition's key removes
 //!   whole partitions, and numbers the rest as before);
-//! - join keys of an exact type only (`uuid`, integers, text), few of them.
+//! - the column must be one whose `IN` inside the body compares as the
+//!   statement compares it outside: a `uuid`, an integer or text of a real
+//!   relation, never `character(n)` (its padded comparison is not text's);
+//!   for a join's keys, both sides of one kind, and text only under one
+//!   collation on both (a case-insensitive key against a binary column
+//!   would be matched by the join and not by the list, or the reverse);
+//! - few keys.
 //!
 //! A row the predicate removes could not have joined (or passed the
 //! `WHERE`), so the statement's own join and `WHERE`, which still run,
@@ -79,30 +85,13 @@ const AFTER_WHERE: &[&str] =
     &["GROUP", "HAVING", "WINDOW", "ORDER", "LIMIT", "OFFSET", "FETCH", "UNION", "INTERSECT", "EXCEPT", "FOR"];
 
 /// The expression the body's output column `column` is, when it is a plain
-/// column of the body's FROM and a predicate on it may go in the body's
-/// WHERE (module docs). `None` otherwise.
-pub(crate) fn pushable_expression(body: &str, column: &str) -> Option<String> {
-    let upper = body.trim_start().to_ascii_uppercase();
-    if !upper.starts_with("SELECT") {
+/// column reference (`c`, `q.c`) and the only output of that name.
+fn output_expression(body: &str, column: &str) -> Option<String> {
+    if !body.trim_start().get(..6).is_some_and(|h| h.eq_ignore_ascii_case("SELECT")) {
         return None;
     }
-    for word in ["LIMIT", "OFFSET", "FETCH", "UNION", "INTERSECT", "EXCEPT", "WINDOW"] {
-        if find_keyword(body, word, 0).is_some() {
-            return None;
-        }
-    }
     let list = crate::core::rql::cte::select_list_of(body)?;
-    let list_trimmed = list.trim_start();
-    let list_body = match list_trimmed.get(..9) {
-        Some(h) if h.eq_ignore_ascii_case("DISTINCT ") => {
-            let rest = list_trimmed[9..].trim_start();
-            if rest.get(..2).is_some_and(|o| o.eq_ignore_ascii_case("ON")) && rest[2..].trim_start().starts_with('(') {
-                return None;
-            }
-            rest
-        }
-        _ => list_trimmed,
-    };
+    let list_body = list_without_distinct(list)?;
     let want = normal(column);
     let mut expression: Option<String> = None;
     for item in crate::core::sql_scan::split_top_level(list_body, b',') {
@@ -121,7 +110,35 @@ pub(crate) fn pushable_expression(body: &str, column: &str) -> Option<String> {
             expression = Some(expr.to_string());
         }
     }
-    let expression = expression.filter(|e| is_column(e))?;
+    expression.filter(|e| is_column(e))
+}
+
+/// A select list past its `DISTINCT`; `None` for `DISTINCT ON (…)`.
+fn list_without_distinct(list: &str) -> Option<&str> {
+    let trimmed = list.trim_start();
+    match trimmed.get(..9) {
+        Some(h) if h.eq_ignore_ascii_case("DISTINCT ") => {
+            let rest = trimmed[9..].trim_start();
+            if rest.get(..2).is_some_and(|o| o.eq_ignore_ascii_case("ON")) && rest[2..].trim_start().starts_with('(') {
+                return None;
+            }
+            Some(rest)
+        }
+        _ => Some(trimmed),
+    }
+}
+
+/// The expression the body's output column `column` is, when it is a plain
+/// column of the body's FROM and a predicate on it may go in the body's
+/// WHERE (module docs). `None` otherwise.
+pub(crate) fn pushable_expression(body: &str, column: &str) -> Option<String> {
+    for word in ["LIMIT", "OFFSET", "FETCH", "UNION", "INTERSECT", "EXCEPT", "WINDOW"] {
+        if find_keyword(body, word, 0).is_some() {
+            return None;
+        }
+    }
+    let expression = output_expression(body, column)?;
+    let list_body = list_without_distinct(crate::core::rql::cte::select_list_of(body)?)?;
     let key = normal(&expression);
     // Grouped: only by the column itself.
     let grouped = clause(body, "GROUP", 0, &["HAVING", "WINDOW", "ORDER"]).map(|(_, _, text)| text.to_string());
@@ -352,6 +369,62 @@ pub(crate) fn join_equalities(statement: &str, start: usize, end: usize, alias: 
     out
 }
 
+/// How a column compares, for deciding whether a predicate moved onto it
+/// compares as it did where it was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Uuid,
+    Integer,
+    /// Text that is not `character(n)`, under its collation's strength.
+    Text(crate::core::rql::collation::Strength),
+}
+
+/// The kind of `field` among its relation's `fields`; `None` for a type a
+/// predicate is not moved onto.
+fn kind_of(field: &crate::core::row::schema::SchemaField, fields: &[crate::core::row::schema::SchemaField]) -> Option<Kind> {
+    use crate::core::rql::type_modifier::TextTypmod;
+    match field.db_type {
+        DbType::UUID => Some(Kind::Uuid),
+        DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 => Some(Kind::Integer),
+        DbType::STRING if !field.json_text && !matches!(field.text_typmod(), Some(TextTypmod::Bpchar(_))) => {
+            Some(Kind::Text(crate::core::rql::collation::of(&field.name, fields)))
+        }
+        _ => None,
+    }
+}
+
+/// The kind of the body's column `expression` (`c`, `q.c`), read from the
+/// relation of the body's FROM it belongs to; `None` when that is not a
+/// relation with a schema (a derived table, a function), or the name is
+/// one two items could have.
+pub(crate) fn body_column_kind(body: &str, expression: &str, database: &Arc<Database>) -> Option<Kind> {
+    let (_, from_end, _) = clause(body, "FROM", 0, &["WHERE", "GROUP", "HAVING", "WINDOW", "ORDER"])?;
+    let items = crate::core::rql::lateral::items_before(body, from_end);
+    let (qualifier, column) = match expression.rsplit_once('.') {
+        Some((q, c)) => (Some(normal(q)), c.trim().trim_matches('"').to_string()),
+        None => (None, expression.trim().trim_matches('"').to_string()),
+    };
+    let relation = match &qualifier {
+        Some(q) => items.iter().find(|(alias, _)| normal(alias) == *q).map(|(_, r)| r.clone())?,
+        None => match items.as_slice() {
+            [(_, only)] => only.clone(),
+            _ => return None,
+        },
+    };
+    // A derived table of the body's own: the kind of the column its output
+    // is, inside it (its copy keeps a plain column's type and collation).
+    let trimmed = relation.trim();
+    if trimmed.starts_with('(') && trimmed.ends_with(')') {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        let expression = output_expression(inner, &column)?;
+        return body_column_kind(inner, &expression, database);
+    }
+    let view = database.schema_view(trimmed.trim_matches('"'))?;
+    let fields = &view.schema().fields;
+    let field = fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&column))?;
+    kind_of(field, fields)
+}
+
 /// A join key's text as the literal it is compared as, for the exact
 /// types whose text reads back as the same value: a quoted `uuid` or text,
 /// an integer's digits. `None` for any other type, or a text that is not
@@ -359,7 +432,7 @@ pub(crate) fn join_equalities(statement: &str, start: usize, end: usize, alias: 
 fn key_literal(ty: &DbType, text: &str) -> Option<String> {
     match ty {
         DbType::UUID | DbType::STRING => Some(crate::core::value_codec::quote_sql(text)),
-        DbType::I16 | DbType::I32 | DbType::I64 => {
+        DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 => {
             let digits = text.strip_prefix('-').unwrap_or(text);
             (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then(|| text.to_string())
         }
@@ -384,13 +457,20 @@ pub(crate) async fn narrowed(
     tx: TxId,
 ) -> Option<String> {
     let mut out: Option<String> = None;
-    let push = |current: &str, column: &str, list: &str| -> Option<String> {
+    // `wanted`: the kind the list's values compare as outside (a join's
+    // key column); `None` for the statement's own literals, which compare
+    // with the column as they did.
+    let push = |current: &str, column: &str, list: &str, wanted: Option<Kind>| -> Option<String> {
         let expression = pushable_expression(current, column)?;
+        let kind = body_column_kind(current, &expression, database)?;
+        if wanted.is_some_and(|w| w != kind) {
+            return None;
+        }
         Some(with_predicate(current, &format!("{expression} IN ({list})")))
     };
     for (column, list) in literal_predicates(statement, end, alias) {
         let current = out.as_deref().unwrap_or(body).to_string();
-        if let Some(next) = push(&current, &column, &list) {
+        if let Some(next) = push(&current, &column, &list, None) {
             #[cfg(test)]
             test_hooks::record(&format!("{alias}:where"), 1);
             out = Some(next);
@@ -406,22 +486,20 @@ pub(crate) async fn narrowed(
                 continue;
             }
             let current = out.as_deref().unwrap_or(body).to_string();
-            // Decided before the keys are read: nothing is, for a body
-            // that cannot take them.
-            if pushable_expression(&current, &own_column).is_none() {
-                continue;
-            }
             let Some(view) = database.schema_view(relation) else { continue };
-            let Some(field) = view
-                .schema()
-                .fields
-                .iter()
-                .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&other_column))
-                .cloned()
+            let key_fields = &view.schema().fields;
+            let Some(field) = key_fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&other_column)).cloned()
             else {
                 continue;
             };
-            if key_literal(&field.db_type, "0").is_none() && !matches!(field.db_type, DbType::UUID | DbType::STRING) {
+            // Decided before the keys are read: nothing is, for a body
+            // that cannot take them, or whose column compares otherwise
+            // than the key does.
+            let Some(key_kind) = kind_of(&field, key_fields) else { continue };
+            let takes = pushable_expression(&current, &own_column)
+                .and_then(|e| body_column_kind(&current, &e, database))
+                .is_some_and(|k| k == key_kind);
+            if !takes {
                 continue;
             }
             let quoted = crate::core::rql::collation::ident(&field.name);
@@ -446,7 +524,7 @@ pub(crate) async fn narrowed(
             let next = if values.is_empty() {
                 Some(with_predicate(&current, "1 = 0"))
             } else {
-                push(&current, &own_column, &values.join(", "))
+                push(&current, &own_column, &values.join(", "), Some(key_kind))
             };
             if let Some(next) = next {
                 #[cfg(test)]

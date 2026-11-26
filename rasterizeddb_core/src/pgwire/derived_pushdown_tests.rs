@@ -173,3 +173,82 @@ async fn a_body_the_keys_would_change_is_built_whole() {
     assert_eq!(got, want, "{sql}");
     assert_eq!(take("dqg"), Some(3));
 }
+
+/// A pushed list compares as the join does, or is not pushed: each
+/// statement here answers as it does with the pushdown off (the body given
+/// a LIMIT, which leaves it whole). Case- and accent-insensitive keys match
+/// their other spellings inside the body as the join matches them;
+/// `character(n)`, a key of another kind than the column, and text under
+/// two collations are built whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pushed_list_compares_as_the_join_does() {
+    let db = crate::replication::test_support::in_memory_database().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE dk_keys (id INT NOT NULL PRIMARY KEY, ci TEXT COLLATE rdb_ci, ai TEXT COLLATE rdb_ci_ai, bin TEXT, \
+                     ch CHARACTER(4), n INT, u TEXT, g UUID)")
+        .await;
+    ok(&db, &mut s, "CREATE TABLE dk_rows (id INT NOT NULL PRIMARY KEY, ci TEXT COLLATE rdb_ci, ai TEXT COLLATE rdb_ci_ai, bin TEXT, \
+                     ch CHARACTER(6), big BIGINT, g UUID, v TEXT)")
+        .await;
+    ok(&db, &mut s, "INSERT INTO dk_keys VALUES (1, 'ABC', 'é', 'Abc', 'ab', 7, '0A000000-0000-0000-0000-00000000000B', '0a000000-0000-0000-0000-00000000000b'), \
+                     (2, 'zzz', 'zzz', 'zzz', 'zz', 8, 'ffffffff-0000-0000-0000-000000000000', NULL)")
+        .await;
+    ok(&db, &mut s, "INSERT INTO dk_rows VALUES (10, 'abc', 'e', 'abc', 'ab', 7, '0a000000-0000-0000-0000-00000000000b', 'hit'), \
+                     (11, 'other', 'x', 'Abc', 'cd', 9, '11111111-0000-0000-0000-000000000000', 'bin'), \
+                     (12, NULL, NULL, NULL, NULL, NULL, NULL, 'nulls')")
+        .await;
+    // (the key column on the built side, the body's column, pushed?, the ids joined to key row 1)
+    let cases: [(&str, &str, bool, &[i64]); 7] = [
+        ("ci", "ci", true, &[10]),
+        ("ai", "ai", true, &[10]),
+        ("bin", "bin", true, &[11]),
+        ("g", "g", true, &[10]),
+        ("n", "big", true, &[10]),
+        // character(n) compares padded: left to the join.
+        ("ch", "ch", false, &[10]),
+        // A binary key against a case-insensitive column (and the reverse)
+        // is the join's to decide.
+        ("bin", "ci", false, &[]),
+    ];
+    for (key, column, pushed, want) in cases {
+        let statement = |limit: &str| {
+            format!(
+                "SELECT k.id, dkj.id FROM (SELECT d.id, d.{key} FROM dk_keys AS d WHERE d.id = 1 ORDER BY d.id LIMIT 5) AS k \
+                 INNER JOIN (SELECT r.id, r.{column} FROM dk_rows AS r{limit}) AS dkj ON k.{key} = dkj.{column} ORDER BY dkj.id"
+            )
+        };
+        take("dkj");
+        let on = super::owner_tests::send(&db, &mut s, &statement("")).await.map(|_| ());
+        let was_pushed = take("dkj").is_some();
+        assert_eq!(was_pushed, pushed, "{key} = {column}");
+        // The same statement, its body left whole.
+        let off = super::owner_tests::send(&db, &mut s, &statement(" ORDER BY r.id LIMIT 1000")).await.map(|_| ());
+        assert_eq!(take("dkj"), None);
+        assert_eq!(on.is_ok(), off.is_ok(), "{key} = {column}: {on:?} / {off:?}");
+        if on.is_ok() {
+            let rows_on = both(&db, &mut s, &statement("")).await;
+            let rows_off = both(&db, &mut s, &statement(" ORDER BY r.id LIMIT 1000")).await;
+            assert_eq!(rows_on, rows_off, "{key} = {column}");
+            if !want.is_empty() || pushed {
+                let ids: Vec<i64> = rows_on.iter().map(|r| r[1].as_deref().unwrap().parse().unwrap()).collect();
+                assert_eq!(ids, want, "{key} = {column}");
+            }
+        }
+    }
+    // A uuid written in another case, held as text, against a uuid column:
+    // two kinds, built whole, answered as the join answers.
+    let statement = |limit: &str| {
+        format!(
+            "SELECT k.id, dku.id FROM (SELECT d.id, d.u FROM dk_keys AS d WHERE d.id = 1 ORDER BY d.id LIMIT 5) AS k \
+             INNER JOIN (SELECT r.id, r.g FROM dk_rows AS r{limit}) AS dku ON k.u = dku.g ORDER BY dku.id"
+        )
+    };
+    take("dku");
+    let on = super::owner_tests::send(&db, &mut s, &statement("")).await.map(|_| ());
+    assert_eq!(take("dku"), None);
+    let off = super::owner_tests::send(&db, &mut s, &statement(" ORDER BY r.id LIMIT 1000")).await.map(|_| ());
+    assert_eq!(on.is_ok(), off.is_ok(), "{on:?} / {off:?}");
+    if on.is_ok() {
+        assert_eq!(both(&db, &mut s, &statement("")).await, both(&db, &mut s, &statement(" ORDER BY r.id LIMIT 1000")).await);
+    }
+}
