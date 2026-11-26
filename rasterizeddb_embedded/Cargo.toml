@@ -21,20 +21,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 # The engine's catalogue handle is an rclite::Arc.
 rclite = "0.4.2"
 log = "0.4"
-# The licensed enterprise crate (sharding-plan.md §10, D12): ledger tables
-# and vaults. Only with feature `enterprise`, never in the default build.
-rasterizeddb_enterprise = { path = "../rasterizeddb_enterprise", version = "1.0.0", optional = true }
-
-[features]
-default = []
-# Links the dual-licensed crate and installs its always-on hooks (the
-# ledger guard) before the engine opens.
-enterprise = ["dep:rasterizeddb_enterprise"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tempfile = "3"
-
-[[test]]
-name = "ledger_enterprise"
-required-features = ["enterprise"]

@@ -66,6 +66,13 @@ vault = ["ledger", "encryption"]
 # (`mlkem:<key file>`) and ML-DSA-65 anchor signatures (plan §4.5).
 pqc = ["encryption", "dep:ml-kem", "dep:ml-dsa", "dep:x25519-dalek", "dep:sha2"]
 
+[dev-dependencies]
+# The end-to-end test (tests/ledger_embedded.rs): the engine in-process, with
+# this crate's hooks installed the way an application installs them.
+rasterizeddb_embedded = { path = "../rasterizeddb_embedded" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tempfile = "3"
+
 [[bin]]
 name = "rdb-ledger-verify"
 path = "src/bin/rdb-ledger-verify.rs"
