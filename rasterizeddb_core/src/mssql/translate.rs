@@ -2081,8 +2081,8 @@ fn catalog_view_stored(schema: &str, view: &str, cx: &Cx) -> Result<Option<Strin
                 };
                 // Nullable when the column keeps a NULL flag (`__null_x`):
                 // every column but the key read YES, NOT NULL ones too.
-                let nullable = !pk
-                    && schema.fields.iter().any(|g| !g.is_deleted && g.name == crate::core::rql::nullable::flag_column_name(&f.name));
+                let flag = crate::core::rql::nullable::flag_column_name(&f.name);
+                let nullable = !pk && schema.fields.iter().any(|g| !g.is_deleted && g.name == flag);
                 (f.name.clone(), ty, nullable, default, identity)
             })
             .collect()
@@ -3487,7 +3487,8 @@ fn key_not_null(key: &[Token], relations: &[(String, Option<String>)], env: &dyn
         let view = env.database().schema_view(&name_key(table.as_deref()?))?;
         let fields = &view.schema().fields;
         fields.iter().find(|f| !f.is_deleted && f.name == name)?;
-        Some(!fields.iter().any(|f| !f.is_deleted && f.name == crate::core::rql::nullable::flag_column_name(&name)))
+        let flag = crate::core::rql::nullable::flag_column_name(&name);
+        Some(!fields.iter().any(|f| !f.is_deleted && f.name == flag))
     });
     match (found.next(), found.next()) {
         (Some(not_null), None) => not_null,
@@ -4387,10 +4388,23 @@ pub(crate) fn tick_columns(env: &dyn Env, table: &str) -> Vec<(String, &'static 
     use crate::core::db_type::DbType as D;
     let Some(view) = env.database().schema_view(&name_key(table)) else { return Vec::new() };
     let fields = &view.schema().fields;
+    // The columns a live digit column names, read off the digit columns:
+    // most tables have none, and this runs for every statement. It asked,
+    // for each field, whether any field was its digit column, writing that
+    // name out each time: 150 stored fields were 22,000 strings a
+    // statement, most of a point lookup's time on the pilot.
+    let prefix = crate::core::rql::nullable::TICK_DIGIT_PREFIX.len();
+    let bases: Vec<&str> = fields
+        .iter()
+        .filter(|f| !f.is_deleted && crate::core::rql::nullable::is_tick_digit(&f.name))
+        .map(|f| &f.name[prefix..])
+        .collect();
+    if bases.is_empty() {
+        return Vec::new();
+    }
     fields
         .iter()
-        .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
-        .filter(|f| fields.iter().any(|g| !g.is_deleted && g.name == tick_column(&f.name)))
+        .filter(|f| !f.is_deleted && bases.iter().any(|b| *b == f.name))
         .filter_map(|f| {
             let ty = match f.db_type {
                 D::TIMESTAMP => "timestamp",
