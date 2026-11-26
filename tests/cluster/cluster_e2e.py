@@ -716,6 +716,12 @@ def main():
     on_every_shard("CREATE TABLE stores (id INT PRIMARY KEY, name TEXT NOT NULL)")
     start_gateway(tls, cmap)
     up(GW, "the gateway")
+    if os.environ.get("CLUSTER_ONLY"):
+        # Only the named phases (ones that need nothing but the running
+        # cluster, comma-separated), e.g. CLUSTER_ONLY=stale_templates.
+        for name in os.environ["CLUSTER_ONLY"].split(","):
+            globals()[name.strip()]()
+        return
     if os.environ.get("CLUSTER_SERVE") == "1":
         # Up and left running for poking at by hand, until killed.
         print(f"serving: gateway {GW}, shards {PG}", flush=True)
@@ -1032,6 +1038,7 @@ def main():
     config_api(tls, cmap)
     cluster_roles()
     broadcast_limits()
+    stale_templates()
     frontend(tls)
     if RDB_SHARD:
         cluster_backup(tls, cmap)
@@ -1121,6 +1128,50 @@ def cluster_roles():
     check("  ...and the read is refused after it", code != 0, out)
     code, out = psql(GW, "DROP ROLE e2e_app")
     check("  ...the role dropped everywhere", code == 0 and on_shards("e2e_app") == ["0"] * len(SHARDS), (out, on_shards("e2e_app")))
+
+
+def stale_templates():
+    """Statements sent through the gateway before their table exists leave
+    templates (Home: no sharded table named) that nothing drops when the
+    table is then created on the shards directly, since that moves no schema
+    epoch. A shape sent before failed afterwards with RDB02 once on each
+    gateway core holding it (an INSERT whose row the home shard does not own,
+    a count(*) the home shard cannot answer alone); the gateway now drops the
+    template and sends the statement again.
+    The report's own schema: BIGINT keys, a composite primary key, a
+    partition column that is not the whole key."""
+    t = "stale_orders"
+    inserts = [f"INSERT INTO {t} VALUES ({s}, 1, {s * 10})" for s in range(1, 31)]
+    reads = {f"SELECT count(*) FROM {t}": "30", f"SELECT sum(total) FROM {t}": "4650",
+             f"SELECT total FROM {t} WHERE store_id = 7": "70"}
+    prepared = f"SELECT total FROM {t} WHERE store_id = $1 \\bind 11 \\g\n"
+    ddl = (f"CREATE TABLE {t} (store_id BIGINT NOT NULL, id BIGINT NOT NULL, total BIGINT, "
+           f"PRIMARY KEY (store_id, id)) PARTITION BY HASH (store_id)")
+    # Before the table exists: every text classified once, and failing.
+    before = [psql(GW, q)[0] for q in inserts + list(reads)] + [psql_script(GW, prepared)[0]]
+    check("stale templates: statements before the table exists fail", all(c != 0 for c in before), before)
+    on_every_shard(ddl)
+    failed = []
+    for q in inserts:
+        code, out = psql(GW, q)
+        if code != 0:
+            failed.append((q, out))
+    check("stale templates: every INSERT sent before the CREATE lands after it", not failed, failed[:3])
+    counts = []
+    for n in SHARDS:
+        code, out = psql(PG[n], f"SET rdb.shard_part = on; SELECT count(*) FROM {t}")
+        counts.append(int(out.splitlines()[-1]) if code == 0 else -1)
+    check("stale templates: each row on one shard, the shards together hold all 30", sum(counts) == 30 and min(counts) > 0, counts)
+    for q, want in reads.items():
+        got = psql(GW, q)
+        check(f"stale templates: {q}", got == (0, want), got)
+    got = psql_script(GW, prepared)
+    check("stale templates: a prepared keyed read", got == (0, "110"), got)
+    # The texts are routed right from now on, not refused and sent again.
+    # Once more: a core that still holds its own stale copy (the per-core
+    # level) refutes it there and sends again, unseen by the client.
+    again = [psql(GW, q) == (0, want) for q, want in reads.items()] + [psql_script(GW, prepared) == (0, "110")]
+    check("stale templates: the reads again", all(again), again)
 
 
 def broadcast_limits():
