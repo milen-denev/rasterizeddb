@@ -5879,14 +5879,16 @@ fn build_aggregate_stage(
                 let slot = inputs.len();
                 let ty = func.result_type(arg.as_ref().map(|f: &SchemaField| &f.db_type));
                 let synth_name = format!("__agg_{}", slot);
-                synth_schema.push(SchemaField::new(
-                    synth_name.clone(),
-                    ty.clone(),
-                    ty.get_size(),
-                    0,
-                    slot as u64,
-                    false,
-                ));
+                let mut synth = SchemaField::new(synth_name.clone(), ty.clone(), ty.get_size(), 0, slot as u64, false);
+                // At the scale the fold produces it at, as `computed_synth_schema`
+                // types it. Left unset, a `NUMERIC(19,6)` sum read through a
+                // cast (`SUM(b.q)::text`, `(SUM(b.q)+0)`, `MAX(b.q)::text`)
+                // was taken at nine places: a thousand times too small, with
+                // no error, over every join.
+                if ty == DbType::DECIMAL {
+                    synth.scale = func.synthetic_scale(arg.as_ref());
+                }
+                synth_schema.push(synth);
                 inputs.push(crate::core::rql::aggregate::ComputedInput { func, arg, arg_expr: None, filter, call: extras });
                 rewritten.push_str(&synth_name);
                 cursor = end;

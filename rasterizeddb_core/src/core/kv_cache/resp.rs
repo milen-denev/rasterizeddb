@@ -82,7 +82,9 @@ impl std::fmt::Debug for RespTls {
 }
 
 pub use crate::core::listen::{Listeners as RespListeners, SocketSpec as RespSocket};
-use crate::core::listen::{Sock, StdSock, TLS_HANDSHAKE, accept_tcp, accept_unix};
+use crate::core::listen::{Sock, StdSock, TLS_HANDSHAKE, accept_tcp};
+#[cfg(unix)]
+use crate::core::listen::accept_unix;
 
 /// Arguments in one frame, and bytes in one argument, before `AUTH`.
 const UNAUTH_ARGS: usize = 10;

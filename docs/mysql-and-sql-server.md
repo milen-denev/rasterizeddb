@@ -340,10 +340,17 @@ it again.
 `APPLOCK_TEST`, per database and in this server only, owned by the
 connection or its transaction and released when either ends.
 
+`OPENJSON(json [, path]) [WITH (column type [path] [AS JSON], …)]` reads JSON
+the statement carries (a literal, a parameter or a variable), which is how EF
+Core passes a list (`ids.Contains(x)`): its rows are written into the
+statement, and `x IN (SELECT value FROM OPENJSON(@ids) WITH (…))` becomes the
+list itself. An object's members come in name order, not as written.
+
 **Refused**: `MERGE … OUTPUT` (other than EF Core's insert form) and a `MERGE`
 that updates a column its `ON` reads, `FOR XML RAW/AUTO/EXPLICIT`, stored
 functions and triggers, `rowversion`, computed columns, unique indexes
-with any other filter, `APPLY` of a table-valued function, `OPENJSON`,
+with any other filter, `APPLY` of a table-valued function, `OPENJSON` over
+a column or an expression,
 `SET ROWCOUNT`, `TOP … PERCENT/WITH TIES`, `OUTPUT … INTO`, `SELECT @v = @v
 + … FROM` over more than one row, and Windows authentication.
 `TRY_CAST`/`TRY_CONVERT` raise the conversion error where SQL Server would

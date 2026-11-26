@@ -25,6 +25,7 @@
 //! Nothing is opened until the first use. A database that never touches the
 //! broker carries one empty `OnceLock`.
 
+pub mod acl;
 #[cfg(feature = "broker_amqp")]
 pub mod amqp;
 pub mod chunk;

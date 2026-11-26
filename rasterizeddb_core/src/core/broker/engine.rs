@@ -54,7 +54,7 @@ pub const MAX_NAME: usize = 255;
 pub const MAX_PARTITIONS: u32 = 4096;
 
 /// Exchanges every broker has, as RabbitMQ predeclares them.
-const BUILTIN_EXCHANGES: &[(&str, ExchangeKind)] = &[
+pub(crate) const BUILTIN_EXCHANGES: &[(&str, ExchangeKind)] = &[
     ("amq.direct", ExchangeKind::Direct),
     ("amq.fanout", ExchangeKind::Fanout),
     ("amq.topic", ExchangeKind::Topic),
@@ -539,6 +539,14 @@ impl Broker {
     /// Creates a topic. With `if_not_exists`, an existing topic of that name
     /// is returned when its settings match, and [`Code::Mismatch`] otherwise.
     pub fn create_topic(&self, name: &str, config: TopicConfig, if_not_exists: bool) -> Result<Arc<Topic>, BrokerError> {
+        Ok(self.create_topic_inner(name, config, None, if_not_exists)?.0)
+    }
+
+    /// [`Self::create_topic`], and whether this call created it (`false`:
+    /// it existed, and `if_not_exists` returned it). Decided under the meta
+    /// lock, so of two racing creators exactly one is told `true`: what the
+    /// front ends record the owner by (`acl::created`).
+    pub fn create_topic_reporting(&self, name: &str, config: TopicConfig, if_not_exists: bool) -> Result<(Arc<Topic>, bool), BrokerError> {
         self.create_topic_inner(name, config, None, if_not_exists)
     }
 
@@ -548,7 +556,7 @@ impl Broker {
         mut config: TopicConfig,
         queue: Option<QueueConfig>,
         if_not_exists: bool,
-    ) -> Result<Arc<Topic>, BrokerError> {
+    ) -> Result<(Arc<Topic>, bool), BrokerError> {
         self.check_running()?;
         check_name("topic", name)?;
         check_config(&config)?;
@@ -567,7 +575,7 @@ impl Broker {
                     format!("topic \"{name}\" exists with other settings ({} partitions, {})", mine.partitions, mine.durability.name()),
                 ));
             }
-            return Ok(t);
+            return Ok((t, false));
         }
         let id = meta.state.next_topic;
         let tm = TopicMeta { name: name.to_string(), config, queue, created_us: super::now_us() };
@@ -581,7 +589,7 @@ impl Broker {
         if let Some(r) = super::repl::capturing(self.replication.get()) {
             super::repl::topic(r, name, &tm.config, tm.queue.as_ref());
         }
-        Ok(topic)
+        Ok((topic, true))
     }
 
     /// Deletes a topic, its subscriptions, its bindings and its files.
@@ -650,6 +658,11 @@ impl Broker {
     /// Declares a queue: a one-partition topic and a shared subscription of
     /// the same name.
     pub fn declare_queue(&self, name: &str, q: QueueConfig, if_not_exists: bool) -> Result<Arc<Topic>, BrokerError> {
+        Ok(self.declare_queue_reporting(name, q, if_not_exists)?.0)
+    }
+
+    /// [`Self::declare_queue`], and whether this call created it.
+    pub fn declare_queue_reporting(&self, name: &str, q: QueueConfig, if_not_exists: bool) -> Result<(Arc<Topic>, bool), BrokerError> {
         // Declaring a queue that exists with other settings is refused, as
         // RabbitMQ refuses an inequivalent declare: returning the old queue
         // silently left a consumer with an ack timeout it never asked for.
@@ -673,7 +686,7 @@ impl Broker {
             retention_bytes: -1,
             ..TopicConfig::default()
         };
-        let topic = self.create_topic_inner(name, config, Some(q.clone()), if_not_exists)?;
+        let (topic, created) = self.create_topic_inner(name, config, Some(q.clone()), if_not_exists)?;
         let sub = SubConfig {
             mode: SubMode::Shared,
             start: rasterizeddb_mq::wire::Start::Earliest,
@@ -682,7 +695,7 @@ impl Broker {
             dead_letter: q.dead_letter.clone(),
         };
         self.subscription(&topic, name, sub)?;
-        Ok(topic)
+        Ok((topic, created))
     }
 
     /// The queue's topic and its shared subscription.
@@ -859,6 +872,17 @@ impl Broker {
         alternate: Option<&str>,
         durable: bool,
     ) -> Result<(), BrokerError> {
+        self.declare_exchange_reporting(name, kind, alternate, durable).map(|_| ())
+    }
+
+    /// [`Self::declare_exchange`], and whether this call created it.
+    pub fn declare_exchange_reporting(
+        &self,
+        name: &str,
+        kind: ExchangeKind,
+        alternate: Option<&str>,
+        durable: bool,
+    ) -> Result<bool, BrokerError> {
         self.check_running()?;
         check_name("exchange", name)?;
         let mut meta = self.meta.lock();
@@ -870,7 +894,7 @@ impl Broker {
                     format!("exchange \"{name}\" exists as {}, not {}", x.kind.name(), kind.name()),
                 ));
             }
-            return Ok(());
+            return Ok(false);
         }
         if durable {
             let xm = ExchangeMeta { kind, alternate: alternate.unwrap_or("").to_string() };
@@ -880,7 +904,7 @@ impl Broker {
             }
         }
         xs.insert(name.to_string(), Exchange::new(name, kind, alternate.map(str::to_string), durable));
-        Ok(())
+        Ok(true)
     }
 
     pub fn delete_exchange(&self, name: &str, if_exists: bool) -> Result<bool, BrokerError> {

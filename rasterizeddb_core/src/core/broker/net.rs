@@ -23,6 +23,7 @@ use rasterizeddb_mq::wire::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
+use super::acl::{self, Access, Kind, Need};
 use super::partition::Partition;
 use super::sub::Subscription;
 use super::{Broker, BrokerError, BrokerHandle, DdlPolicy, ddl_policy};
@@ -166,8 +167,11 @@ pub(crate) struct Conn {
     broker: Arc<Broker>,
     main: tokio::runtime::Handle,
     authed: bool,
-    superuser: bool,
-    user: String,
+    /// Who the connection is and what it may use (`acl`).
+    access: Access,
+    /// Objects this request created (`true`) or deleted: their owner rows
+    /// are written before its reply is sent.
+    acl_effects: Vec<(Kind, String, bool)>,
     subs: HashMap<u32, (Arc<Subscription>, u64)>,
     next_handle: u32,
     push_tx: super::sub::Outbox,
@@ -189,8 +193,8 @@ impl Conn {
             broker,
             main,
             authed: trust,
-            superuser: trust,
-            user: String::new(),
+            access: if trust { Access::unrestricted("") } else { Access::new("", false) },
+            acl_effects: Vec::new(),
             subs: HashMap::new(),
             next_handle: 1,
             push_tx,
@@ -351,7 +355,7 @@ impl Conn {
     }
 
     fn check_ddl(&self) -> Result<(), BrokerError> {
-        if ddl_policy() == DdlPolicy::Superuser && !self.superuser {
+        if ddl_policy() == DdlPolicy::Superuser && !self.access.is_superuser() {
             return Err(BrokerError::new(Code::Permission, "creating and removing broker objects needs a superuser here"));
         }
         Ok(())
@@ -367,14 +371,43 @@ impl Conn {
             wire::error_frame(out, h.op, h.corr, Code::AuthRequired, "authenticate first");
             return Ok(());
         }
+        if !matches!(h.op, op::HELLO | op::AUTH | op::PING)
+            && let Err(e) = self.access.refresh(&self.database, &self.main).await
+        {
+            wire::error_frame(out, h.op, h.corr, e.code, &e.message);
+            return Ok(());
+        }
         let r = match h.op {
             op::AUTH => self.auth(h.corr, body, out).await,
             _ => self.dispatch(h, body, out),
         };
+        // Before the reply leaves: a client that created a topic may use it
+        // the moment it is told so.
+        for (kind, name, created) in std::mem::take(&mut self.acl_effects) {
+            if created {
+                acl::created(&self.database, &self.main, kind, &name, self.access.user()).await;
+            } else {
+                acl::removed(&self.database, &self.main, kind, &name).await;
+            }
+        }
         if let Err(e) = r {
             wire::error_frame(out, h.op, h.corr, e.code, &e.message);
         }
         Ok(())
+    }
+
+    /// `Own` on the topic `name`, when there is one (a missing one is the
+    /// engine's to report, or nothing for `if_exists`).
+    fn own_topic(&mut self, name: &str) -> Result<(), BrokerError> {
+        if self.broker.topic(name).is_some() { self.access.topic(name, Need::Own) } else { Ok(()) }
+    }
+
+    /// The subscription behind `handle`, while the connection may still read
+    /// its topic: a REVOKE stops a consumer at its next credit or ack.
+    fn sub_consuming(&mut self, handle: u32) -> Result<(Arc<Subscription>, u64), BrokerError> {
+        let (sub, member) = self.sub(handle)?;
+        self.access.topic(&sub.topic.name, Need::Consume)?;
+        Ok((sub, member))
     }
 
     async fn auth(&mut self, corr: u32, body: &[u8], out: &mut Vec<u8>) -> Result<(), BrokerError> {
@@ -384,8 +417,7 @@ impl Conn {
         match listen::login(&self.database, &self.main, &user, &password, "broker").await {
             Ok(superuser) => {
                 self.authed = true;
-                self.superuser = superuser;
-                self.user = user;
+                self.access = Access::new(&user, superuser);
                 wire::frame(out, op::AUTH, F_REPLY, corr, |w| w.bool(superuser));
                 Ok(())
             }
@@ -419,6 +451,7 @@ impl Conn {
             op::FETCH => {
                 let req = Fetch::decode(&mut Reader::new(body)).map_err(proto)?;
                 let topic = self.broker.require_topic_id(req.topic)?;
+                self.access.topic(&topic.name, Need::Consume)?;
                 let part = topic.partition(req.partition)?.clone();
                 if req.offset < part.log_start() {
                     return Err(BrokerError::new(
@@ -436,6 +469,7 @@ impl Conn {
             op::LIST_OFFSETS => {
                 let mut r = Reader::new(body);
                 let topic = self.broker.require_topic_id(r.u32().map_err(proto)?)?;
+                self.access.topic(&topic.name, Need::Consume)?;
                 let part = topic.partition(r.u32().map_err(proto)?)?;
                 let at = r.i64().map_err(proto)?;
                 let offset = match at {
@@ -452,6 +486,9 @@ impl Conn {
             op::RESOLVE => {
                 let name = Reader::new(body).string().map_err(proto)?;
                 let t = self.broker.require_topic(&name)?;
+                if !self.access.sees(Kind::Topic, &name) {
+                    return Err(BrokerError::new(Code::Permission, format!("permission denied for topic {name}")));
+                }
                 wire::frame(out, op::RESOLVE, F_REPLY, corr, |w| {
                     w.u32(t.id);
                     w.u32(t.partition_count());
@@ -465,7 +502,10 @@ impl Conn {
                 let name = r.string().map_err(proto)?;
                 let config = TopicConfig::decode(&mut r).map_err(proto)?;
                 let if_not_exists = r.bool().map_err(proto)?;
-                let t = self.broker.create_topic(&name, config, if_not_exists)?;
+                let (t, created) = self.broker.create_topic_reporting(&name, config, if_not_exists)?;
+                if created {
+                    self.acl_effects.push((Kind::Topic, name.clone(), true));
+                }
                 wire::frame(out, op::TOPIC_CREATE, F_REPLY, corr, |w| {
                     w.u32(t.id);
                     w.u32(t.partition_count())
@@ -476,7 +516,11 @@ impl Conn {
                 let mut r = Reader::new(body);
                 let name = r.string().map_err(proto)?;
                 let if_exists = r.bool().map_err(proto)?;
+                self.own_topic(&name)?;
                 let done = self.broker.delete_topic(&name, if_exists)?;
+                if done {
+                    self.acl_effects.push((Kind::Topic, name, false));
+                }
                 wire::frame(out, op::TOPIC_DELETE, F_REPLY, corr, |w| w.bool(done));
             }
             op::TOPIC_ALTER => {
@@ -484,6 +528,7 @@ impl Conn {
                 let mut r = Reader::new(body);
                 let name = r.string().map_err(proto)?;
                 let c = TopicConfig::decode(&mut r).map_err(proto)?;
+                self.own_topic(&name)?;
                 let new = self.broker.alter_topic(&name, |old| {
                     old.retention_ms = c.retention_ms;
                     old.retention_bytes = c.retention_bytes;
@@ -493,7 +538,8 @@ impl Conn {
                 wire::frame(out, op::TOPIC_ALTER, F_REPLY, corr, |w| new.encode(w));
             }
             op::TOPIC_LIST => {
-                let topics = self.broker.topics();
+                let mut topics = self.broker.topics();
+                topics.retain(|t| self.access.sees(Kind::Topic, &t.name));
                 wire::frame(out, op::TOPIC_LIST, F_REPLY, corr, |w| {
                     w.u32(topics.len() as u32);
                     for t in &topics {
@@ -509,6 +555,7 @@ impl Conn {
             op::SUBSCRIBE => {
                 let req = Subscribe::decode(&mut Reader::new(body)).map_err(proto)?;
                 let topic = self.broker.require_topic_id(req.topic)?;
+                self.access.topic(&topic.name, Need::Consume)?;
                 let sub = self.broker.subscription(&topic, &req.name, req.config.clone())?;
                 let handle = self.next_handle;
                 self.next_handle += 1;
@@ -524,25 +571,25 @@ impl Conn {
             }
             op::CREDIT => {
                 let mut r = Reader::new(body);
-                let (sub, member) = self.sub(r.u32().map_err(proto)?)?;
+                let (sub, member) = self.sub_consuming(r.u32().map_err(proto)?)?;
                 sub.credit(member, r.u32().map_err(proto)?);
             }
             op::ACK => {
                 let mut r = Reader::new(body);
-                let (sub, _) = self.sub(r.u32().map_err(proto)?)?;
+                let (sub, _) = self.sub_consuming(r.u32().map_err(proto)?)?;
                 let ranges = wire::decode_ranges(&mut r, 1 << 16).map_err(proto)?;
                 sub.ack(&ranges)?;
             }
             op::NACK => {
                 let mut r = Reader::new(body);
-                let (sub, _) = self.sub(r.u32().map_err(proto)?)?;
+                let (sub, _) = self.sub_consuming(r.u32().map_err(proto)?)?;
                 let delay = r.u32().map_err(proto)?;
                 let ranges = wire::decode_ranges(&mut r, 1 << 16).map_err(proto)?;
                 sub.nack(&ranges, delay)?;
             }
             op::RENEW => {
                 let mut r = Reader::new(body);
-                let (sub, _) = self.sub(r.u32().map_err(proto)?)?;
+                let (sub, _) = self.sub_consuming(r.u32().map_err(proto)?)?;
                 let extend = r.u32().map_err(proto)?;
                 let ranges = wire::decode_ranges(&mut r, 1 << 16).map_err(proto)?;
                 let n = sub.renew(&ranges, extend);
@@ -550,7 +597,7 @@ impl Conn {
             }
             op::COMMIT => {
                 let mut r = Reader::new(body);
-                let (sub, _) = self.sub(r.u32().map_err(proto)?)?;
+                let (sub, _) = self.sub_consuming(r.u32().map_err(proto)?)?;
                 let p = r.u32().map_err(proto)?;
                 let off = r.u64().map_err(proto)?;
                 sub.commit(p, off)?;
@@ -567,6 +614,7 @@ impl Conn {
                 self.check_ddl()?;
                 let mut r = Reader::new(body);
                 let topic = self.broker.require_topic_id(r.u32().map_err(proto)?)?;
+                self.access.topic(&topic.name, Need::Consume)?;
                 let name = r.string().map_err(proto)?;
                 let if_exists = r.bool().map_err(proto)?;
                 let done = self.broker.delete_subscription(&topic, &name, if_exists)?;
@@ -574,6 +622,7 @@ impl Conn {
             }
             op::SUB_LIST => {
                 let topic = self.broker.require_topic_id(Reader::new(body).u32().map_err(proto)?)?;
+                self.access.topic(&topic.name, Need::Consume)?;
                 let subs = topic.subscriptions();
                 wire::frame(out, op::SUB_LIST, F_REPLY, corr, |w| {
                     w.u32(subs.len() as u32);
@@ -594,7 +643,9 @@ impl Conn {
                 let durable = r.bool().map_err(proto)?;
                 let alternate = r.string().map_err(proto)?;
                 let alt = (!alternate.is_empty()).then_some(alternate.as_str());
-                self.broker.declare_exchange(&name, kind, alt, durable)?;
+                if self.broker.declare_exchange_reporting(&name, kind, alt, durable)? {
+                    self.acl_effects.push((Kind::Exchange, name, true));
+                }
                 wire::frame(out, op::EXCHANGE_DECLARE, F_REPLY, corr, |_| {});
             }
             op::EXCHANGE_DELETE => {
@@ -602,12 +653,19 @@ impl Conn {
                 let mut r = Reader::new(body);
                 let name = r.string().map_err(proto)?;
                 let if_exists = r.bool().map_err(proto)?;
+                if self.broker.exchange_kind(&name).is_some() {
+                    self.access.exchange(&name, Need::Own)?;
+                }
                 let done = self.broker.delete_exchange(&name, if_exists)?;
+                if done {
+                    self.acl_effects.push((Kind::Exchange, name, false));
+                }
                 wire::frame(out, op::EXCHANGE_DELETE, F_REPLY, corr, |w| w.bool(done));
             }
             op::BIND | op::UNBIND => {
                 self.check_ddl()?;
                 let b = Binding::decode(&mut Reader::new(body)).map_err(proto)?;
+                self.access.bind(&b.exchange, &b.topic)?;
                 let done = if h.op == op::BIND { self.broker.bind(b)? } else { self.broker.unbind(&b)? };
                 wire::frame(out, h.op, F_REPLY, corr, |w| w.bool(done));
             }
@@ -618,7 +676,10 @@ impl Conn {
                 let name = r.string().map_err(proto)?;
                 let q = QueueConfig::decode(&mut r).map_err(proto)?;
                 let if_not_exists = r.bool().map_err(proto)?;
-                let t = self.broker.declare_queue(&name, q, if_not_exists)?;
+                let (t, created) = self.broker.declare_queue_reporting(&name, q, if_not_exists)?;
+                if created {
+                    self.acl_effects.push((Kind::Topic, name.clone(), true));
+                }
                 wire::frame(out, op::QUEUE_DECLARE, F_REPLY, corr, |w| w.u32(t.id));
             }
             op::QUEUE_DELETE => {
@@ -629,7 +690,11 @@ impl Conn {
                 if self.broker.topic(&name).is_some_and(|t| t.queue.is_none()) {
                     return Err(BrokerError::invalid(format!("\"{name}\" is a topic, not a queue")));
                 }
+                self.own_topic(&name)?;
                 let done = self.broker.delete_topic(&name, if_exists)?;
+                if done {
+                    self.acl_effects.push((Kind::Topic, name, false));
+                }
                 wire::frame(out, op::QUEUE_DELETE, F_REPLY, corr, |w| w.bool(done));
             }
             other => {
@@ -652,6 +717,7 @@ impl Conn {
         }
         let req = Produce::decode(&mut Reader::new(&body[..Produce::LEN])).map_err(proto)?;
         let topic = self.broker.require_topic_id(req.topic)?;
+        self.access.topic(&topic.name, Need::Produce)?;
         let batch = &mut body[Produce::LEN..];
         let (part, a) = self.broker.produce(&topic, req.partition, batch, true)?;
         let reply = |out: &mut Vec<u8>| {
@@ -685,6 +751,7 @@ impl Conn {
             let head = body.len() - r.rest().len();
             (exchange, key, ack, mandatory, head)
         };
+        self.access.publish(&exchange, &key)?;
         let batch = &mut body[head..];
         let routed = self.broker.publish(&exchange, &key, batch, true)?;
         if routed.is_empty() && mandatory {

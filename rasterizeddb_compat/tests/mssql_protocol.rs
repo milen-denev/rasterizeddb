@@ -2787,3 +2787,146 @@ async fn tiberius_round_keeps_the_type() {
     let got: Vec<_> = r[0].iter().map(|r| (r.get::<i32, _>(0).unwrap(), dec(r, 1), dec(r, 2))).collect();
     assert_eq!(got, [(1, six(15_980_000), two(800)), (4, six(5_000_000), two(0))]);
 }
+
+/// What EF Core's SQL Server provider writes for a byte constant and for a
+/// list: `CAST(1 AS tinyint)` ("cast to 'utinyint' is not supported yet")
+/// and `OPENJSON(@list)` ("'OPENJSON' is not supported").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_tinyint_cast_and_openjson() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [State] ([Id] tinyint PRIMARY KEY, [Watermark] bigint NOT NULL); \
+         INSERT INTO [State] VALUES (0, 10), (1, 11), (200, 12), (255, 13); \
+         CREATE TABLE [Product] ([ProductId] uniqueidentifier PRIMARY KEY, [N] int NOT NULL, [Name] nvarchar(20) NULL); \
+         INSERT INTO [Product] VALUES ('00000000-0000-0000-0000-000000000001', 1, N'one'), \
+           ('00000000-0000-0000-0000-000000000002', 2, N'two'), ('00000000-0000-0000-0000-000000000003', 3, NULL)",
+    )
+    .await
+    .unwrap();
+
+    // A byte compared with a constant, as EF Core writes it.
+    let r = batch(&mut c, "SELECT TOP(2) [d].[Id], [d].[Watermark] FROM [dbo].[State] AS [d] WHERE [d].[Id] = CAST(1 AS tinyint)").await.unwrap();
+    assert_eq!(r[0].len(), 1);
+    assert_eq!(r[0][0].get::<u8, _>(0), Some(1));
+    assert_eq!(r[0][0].get::<i64, _>(1), Some(11));
+    let r = batch(&mut c, "SELECT [d].[Watermark] FROM [State] AS [d] WHERE [d].[Id] >= CAST(200 AS tinyint) ORDER BY [d].[Id]").await.unwrap();
+    assert_eq!(r[0].iter().map(|r| r.get::<i64, _>(0).unwrap()).collect::<Vec<_>>(), [12, 13]);
+    // The cast's own value and type, at both ends of the range.
+    let r = batch(&mut c, "SELECT CAST(0 AS tinyint), CAST(255 AS tinyint), CAST(N'7' AS tinyint), CAST(1.6 AS tinyint), CAST(NULL AS tinyint)").await.unwrap();
+    let got: Vec<Option<u8>> = (0..5).map(|k| r[0][0].get::<u8, _>(k)).collect();
+    assert_eq!(got, [Some(0), Some(255), Some(7), Some(2), None]);
+    // Past it: an overflow, never the low byte.
+    for sql in ["SELECT CAST(256 AS tinyint)", "SELECT CAST(-1 AS tinyint)", "SELECT CAST(N'300' AS tinyint)", "SELECT [Id] FROM [State] WHERE [Watermark] = CAST(999 AS tinyint)"] {
+        let e = batch(&mut c, sql).await.expect_err(sql);
+        assert_eq!(number(&e), Some(8115), "{sql}: {e}");
+    }
+
+    // `ids.Contains(p.ProductId)`: the list as a JSON array parameter.
+    let contains = "SELECT [d].[N] FROM [Product] AS [d] WHERE [d].[ProductId] IN (SELECT [p].[value] FROM OPENJSON(@P1) WITH ([value] uniqueidentifier '$') AS [p]) ORDER BY [d].[N]";
+    let ns = |rows: Vec<tiberius::Row>| rows.iter().map(|r| r.get::<i32, _>(0).unwrap()).collect::<Vec<_>>();
+    let list = r#"["00000000-0000-0000-0000-000000000003","00000000-0000-0000-0000-000000000001","00000000-0000-0000-0000-00000000000f"]"#;
+    let r = c.query(contains, &[&list]).await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(ns(r), [1, 3]);
+    // Another list through the same text: nothing of the first is kept.
+    let r = c.query(contains, &[&r#"["00000000-0000-0000-0000-000000000002"]"#]).await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(ns(r), [2]);
+    // An empty list holds nothing, and everything is outside it; so is a NULL one.
+    let r = c.query(contains, &[&"[]"]).await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(ns(r), [] as [i32; 0]);
+    let outside = "SELECT [d].[N] FROM [Product] AS [d] WHERE [d].[N] NOT IN (SELECT [p].[value] FROM OPENJSON(@P1) WITH ([value] int '$') AS [p]) ORDER BY [d].[N]";
+    let r = c.query(outside, &[&"[]"]).await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(ns(r), [1, 2, 3]);
+    let r = c.query(outside, &[&Option::<&str>::None]).await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(ns(r), [1, 2, 3]);
+    let r = c.query(outside, &[&"[2, 9]"]).await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(ns(r), [1, 3]);
+    // A NULL in the list: nothing is known to be outside it.
+    let r = c.query(outside, &[&"[2, null]"]).await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(ns(r), [] as [i32; 0]);
+    // Strings, with a quote, and an integer list beside another parameter.
+    let r = c
+        .query(
+            "SELECT [d].[N] FROM [Product] AS [d] WHERE [d].[Name] IN (SELECT [n].[value] FROM OPENJSON(@P1) WITH ([value] nvarchar(20) '$') AS [n]) AND [d].[N] > @P2 ORDER BY [d].[N]",
+            &[&r#"["one","two","it's"]"#, &1i32],
+        )
+        .await
+        .unwrap()
+        .into_first_result()
+        .await
+        .unwrap();
+    assert_eq!(ns(r), [2]);
+
+    // The relation itself: joined, filtered and counted.
+    let r = c
+        .query(
+            "SELECT [d].[N], [p].[value] FROM [Product] AS [d] INNER JOIN OPENJSON(@P1) WITH ([value] int '$') AS [p] ON [d].[N] = [p].[value] ORDER BY [d].[N]",
+            &[&"[3, 1, 7]"],
+        )
+        .await
+        .unwrap()
+        .into_first_result()
+        .await
+        .unwrap();
+    assert_eq!(r.iter().map(|r| (r.get::<i32, _>(0).unwrap(), r.get::<i32, _>(1).unwrap())).collect::<Vec<_>>(), [(1, 1), (3, 3)]);
+    let r = c.query("SELECT COUNT(*) FROM OPENJSON(@P1) WITH ([value] int '$') AS [p]", &[&"[]"]).await.unwrap().into_first_result().await.unwrap();
+    assert_eq!(r[0].get::<i32, _>(0), Some(0));
+    let r = c
+        .query("SELECT [d].[N] FROM [Product] AS [d] WHERE EXISTS (SELECT 1 FROM OPENJSON(@P1) WITH ([value] int '$') AS [p] WHERE [p].[value] = [d].[N]) ORDER BY [d].[N]", &[&"[2, 3]"])
+        .await
+        .unwrap()
+        .into_first_result()
+        .await
+        .unwrap();
+    assert_eq!(ns(r), [2, 3]);
+
+    // The bare form: key, value and type of each element, or of each member.
+    let r = c
+        .query("SELECT [p].[key], [p].[value], [p].[type] FROM OPENJSON(@P1) AS [p] ORDER BY CAST([p].[key] AS int)", &[&r#"["a", 2.5, null, true, [1], {"k": 1}]"#])
+        .await
+        .unwrap()
+        .into_first_result()
+        .await
+        .unwrap();
+    let got: Vec<(String, Option<String>, i32)> = r
+        .iter()
+        .map(|r| (r.get::<&str, _>(0).unwrap().to_string(), r.get::<&str, _>(1).map(str::to_string), r.get::<i32, _>(2).unwrap()))
+        .collect();
+    let row = |k: &str, v: Option<&str>, t: i32| (k.to_string(), v.map(str::to_string), t);
+    assert_eq!(
+        got,
+        [row("0", Some("a"), 1), row("1", Some("2.5"), 2), row("2", None, 0), row("3", Some("true"), 3), row("4", Some("[1]"), 4), row("5", Some(r#"{"k":1}"#), 5)]
+    );
+    let r = batch(&mut c, r#"SELECT [key], [value] FROM OPENJSON(N'{"b": 1, "a": "x"}') ORDER BY [key]"#).await.unwrap();
+    assert_eq!(texts(&r[0]), [Some("a".to_string()), Some("b".to_string())]);
+    // The bare form as EF Core joins it, in the list's order.
+    let r = c
+        .query(
+            "SELECT [d].[N] FROM OPENJSON(@P1) AS [i] INNER JOIN [Product] AS [d] ON CAST([i].[value] AS int) = [d].[N] ORDER BY CAST([i].[key] AS int)",
+            &[&"[3, 1]"],
+        )
+        .await
+        .unwrap()
+        .into_first_result()
+        .await
+        .unwrap();
+    assert_eq!(ns(r), [3, 1]);
+
+    // Objects by column: a default path, a given one, a missing member.
+    let r = batch(
+        &mut c,
+        r#"DECLARE @j nvarchar(max) = N'[{"Id": 2, "Tag": {"Name": "x"}}, {"Id": 5}]';
+           SELECT o.[Id], o.[Name] FROM OPENJSON(@j) WITH ([Id] int, [Name] nvarchar(10) '$.Tag.Name') AS o ORDER BY o.[Id]"#,
+    )
+    .await
+    .unwrap();
+    let got: Vec<(i32, Option<String>)> = r[0].iter().map(|r| (r.get::<i32, _>(0).unwrap(), r.get::<&str, _>(1).map(str::to_string))).collect();
+    assert_eq!(got, [(2, Some("x".to_string())), (5, None)]);
+
+    // Not JSON, and JSON read from a row: said, not answered.
+    let e = c.query("SELECT [value] FROM OPENJSON(@P1)", &[&"[1,"]).await.err().expect("malformed JSON");
+    assert_eq!(number(&e), Some(13609), "{e}");
+    let e = batch(&mut c, "SELECT o.[value] FROM [Product] AS [d] CROSS APPLY OPENJSON([d].[Name]) AS o").await.unwrap_err();
+    assert_eq!(number(&e), Some(40000), "{e}");
+}

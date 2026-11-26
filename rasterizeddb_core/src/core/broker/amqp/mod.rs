@@ -39,6 +39,7 @@ use tokio::sync::watch;
 use self::codec::{In, Value};
 use super::partition::Partition;
 use super::sub::Subscription;
+use super::acl::{self, Access, Kind, Need};
 use super::{Broker, DdlPolicy, ddl_policy};
 use crate::core::database::Database;
 use crate::core::listen::{self, Listeners, Sock, SocketSpec};
@@ -212,7 +213,11 @@ struct Parked {
 struct Conn {
     shared: Arc<Shared>,
     stage: Stage,
-    superuser: bool,
+    /// Who the connection is and what it may use (`acl`).
+    access: Access,
+    /// Queues and exchanges this frame created (`true`) or deleted: their
+    /// owner rows are written before its reply is sent.
+    acl_effects: Vec<(Kind, String, bool)>,
     frame_max: usize,
     heartbeat: u16,
     channels: HashMap<u16, Channel>,
@@ -241,7 +246,8 @@ impl Conn {
         Conn {
             shared,
             stage: Stage::Start,
-            superuser: false,
+            access: Access::new("", false),
+            acl_effects: Vec::new(),
             frame_max,
             heartbeat: 0,
             channels: HashMap::new(),
@@ -417,7 +423,9 @@ impl Conn {
             c.sub.leave_keeping_inflight(c.member);
             self.retired.insert(handle, c.sub.clone());
             if self.auto_delete.contains(&c.queue) && c.sub.member_count() == 0 {
-                let _ = self.shared.broker.delete_topic(&c.queue, true);
+                if self.shared.broker.delete_topic(&c.queue, true).unwrap_or(false) {
+                    self.acl_effects.push((Kind::Topic, c.queue.clone(), false));
+                }
                 self.auto_delete.retain(|q| *q != c.queue);
             }
         }
@@ -431,6 +439,44 @@ impl Conn {
         for q in std::mem::take(&mut self.exclusive) {
             let _ = self.shared.broker.delete_topic(&q, true);
         }
+        // The connection is going: what its last frames deleted is not
+        // waited for.
+        for (kind, name, created) in std::mem::take(&mut self.acl_effects) {
+            if !created {
+                acl::removed_detached(&self.shared.database, &self.shared.main, kind, &name);
+            }
+        }
+    }
+
+    /// Writes the owner rows of what the last frame created, and removes the
+    /// rows of what it deleted, before its reply leaves.
+    async fn flush_acl(&mut self) {
+        for (kind, name, created) in std::mem::take(&mut self.acl_effects) {
+            if created {
+                acl::created(&self.shared.database, &self.shared.main, kind, &name, self.access.user()).await;
+            } else {
+                acl::removed(&self.shared.database, &self.shared.main, kind, &name).await;
+            }
+        }
+    }
+
+    /// `need` on queue (topic) `name`, as a channel error. An exclusive
+    /// queue this connection declared is its own: it has no owner row (only
+    /// its connection may use it, and it goes when that closes).
+    fn topic_ok(&mut self, name: &str, need: Need) -> Result<(), (u16, String)> {
+        if self.exclusive.iter().any(|q| q == name) {
+            return Ok(());
+        }
+        self.access.topic(name, need).map_err(refused)
+    }
+
+    /// A publish through `exchange` with `key` (`""`: the queue the key
+    /// names).
+    fn publish_ok(&mut self, exchange: &str, key: &str) -> Result<(), (u16, String)> {
+        if exchange.is_empty() {
+            return self.topic_ok(key, Need::Produce);
+        }
+        self.access.exchange(exchange, Need::Publish).map_err(refused)
     }
 
     async fn frame(&mut self, kind: u8, ch: u16, payload: &[u8], out: &mut Vec<u8>) -> Flow {
@@ -464,7 +510,12 @@ impl Conn {
                         return Ok(());
                     }
                 }
+                if let Err(e) = self.access.refresh(&self.shared.database, &self.shared.main).await {
+                    self.connection_close(out, ACCESS_REFUSED, &format!("ACCESS_REFUSED - {}", e.message), class, method);
+                    return Err(());
+                }
                 let r = self.channel_method(ch, class, method, args, out);
+                self.flush_acl().await;
                 if let Err((code, text)) = r {
                     if code >= 500 && code != NOT_IMPLEMENTED {
                         self.connection_close(out, code, &text, class, method);
@@ -560,14 +611,14 @@ impl Conn {
                     _ => None,
                 };
                 match &self.shared.config.auth {
-                    AmqpAuth::Trust => self.superuser = true,
+                    AmqpAuth::Trust => self.access = Access::unrestricted(""),
                     AmqpAuth::Roles => {
                         let Some((user, pass)) = creds else {
                             self.connection_close(out, ACCESS_REFUSED, "unsupported mechanism or malformed credentials", 10, 11);
                             return Err(());
                         };
                         match listen::login(&self.shared.database, &self.shared.main, &user, &pass, "amqp").await {
-                            Ok(su) => self.superuser = su,
+                            Ok(su) => self.access = Access::new(&user, su),
                             Err(listen::LoginError::Denied) => {
                                 self.connection_close(out, ACCESS_REFUSED, "ACCESS_REFUSED - login refused", 10, 11);
                                 return Err(());
@@ -621,7 +672,7 @@ impl Conn {
     }
 
     fn check_ddl(&self) -> Result<(), (u16, String)> {
-        if ddl_policy() == DdlPolicy::Superuser && !self.superuser {
+        if ddl_policy() == DdlPolicy::Superuser && !self.access.is_superuser() {
             return Err((ACCESS_REFUSED, "declaring and deleting needs a superuser here".into()));
         }
         Ok(())
@@ -684,9 +735,12 @@ impl Conn {
                         return Err((ACCESS_REFUSED, format!("ACCESS_REFUSED - exchange name '{name}' contains reserved prefix 'amq.*'")));
                     }
                     let alternate = args.get("alternate-exchange").and_then(|v| v.str().map(str::to_string));
-                    broker
-                        .declare_exchange(&name, k, alternate.as_deref(), durable)
+                    let created = broker
+                        .declare_exchange_reporting(&name, k, alternate.as_deref(), durable)
                         .map_err(|e| (if e.code == Code::Mismatch { PRECONDITION_FAILED } else { INTERNAL_ERROR }, e.message))?;
+                    if created {
+                        self.acl_effects.push((Kind::Exchange, name.clone(), true));
+                    }
                 }
                 if !no_wait {
                     codec::method(out, ch, 40, 11, |_| {});
@@ -699,7 +753,12 @@ impl Conn {
                 let name = r.shortstr().map_err(malformed)?.to_string();
                 let _if_unused = r.bit().map_err(malformed)?;
                 let no_wait = r.bit().map_err(malformed)?;
-                broker.delete_exchange(&name, true).map_err(|e| (ACCESS_REFUSED, e.message))?;
+                if broker.exchange_kind(&name).is_some() {
+                    self.access.exchange(&name, Need::Own).map_err(refused)?;
+                }
+                if broker.delete_exchange(&name, true).map_err(|e| (ACCESS_REFUSED, e.message))? {
+                    self.acl_effects.push((Kind::Exchange, name.clone(), false));
+                }
                 if !no_wait {
                     codec::method(out, ch, 40, 21, |_| {});
                 }
@@ -728,10 +787,15 @@ impl Conn {
                         return Err((PRECONDITION_FAILED, format!("PRECONDITION_FAILED - '{}' is a topic, not a queue", t.name)));
                     }
                     let q = queue_config(&args, durable, &self.shared.config, &name);
-                    broker.declare_queue(&name, q, true).map_err(|e| match e.code {
+                    let (_, created) = broker.declare_queue_reporting(&name, q, true).map_err(|e| match e.code {
                         Code::Mismatch => (PRECONDITION_FAILED, format!("PRECONDITION_FAILED - {}", e.message)),
                         _ => (INTERNAL_ERROR, e.message),
                     })?;
+                    // An exclusive queue is its connection's (`topic_ok`),
+                    // and leaves no rows behind it.
+                    if created && !exclusive {
+                        self.acl_effects.push((Kind::Topic, name.clone(), true));
+                    }
                     if exclusive && !self.exclusive.contains(&name) {
                         self.exclusive.push(name.clone());
                     } else if auto_delete && !self.auto_delete.contains(&name) {
@@ -772,6 +836,8 @@ impl Conn {
                         bargs.push((e.0.to_string(), b));
                     }
                 }
+                self.access.exchange(&exchange, Need::Bind).map_err(refused)?;
+                self.topic_ok(&queue, Need::Produce)?;
                 let b = Binding { exchange, topic: queue, key, x_match, args: bargs };
                 let r = if method == 20 { broker.bind(b) } else { broker.unbind(&b) };
                 r.map_err(|e| (NOT_FOUND, format!("NOT_FOUND - {}", e.message)))?;
@@ -787,6 +853,7 @@ impl Conn {
                 let queue = r.shortstr().map_err(malformed)?.to_string();
                 let no_wait = r.bit().map_err(malformed)?;
                 let (_, sub) = broker.queue(&queue).map_err(|_| (NOT_FOUND, format!("NOT_FOUND - no queue '{queue}'")))?;
+                self.topic_ok(&queue, Need::Consume)?;
                 let n = sub.purge();
                 if !no_wait {
                     codec::method(out, ch, 50, 31, |w| w.u32(n.min(u32::MAX as u64) as u32));
@@ -809,7 +876,10 @@ impl Conn {
                         if if_empty && n > 0 {
                             return Err((PRECONDITION_FAILED, format!("PRECONDITION_FAILED - queue '{queue}' not empty")));
                         }
-                        broker.delete_topic(&queue, true).map_err(|e| (INTERNAL_ERROR, e.message))?;
+                        self.topic_ok(&queue, Need::Own)?;
+                        if broker.delete_topic(&queue, true).map_err(|e| (INTERNAL_ERROR, e.message))? && !self.exclusive.contains(&queue) {
+                            self.acl_effects.push((Kind::Topic, queue.clone(), false));
+                        }
                         n
                     }
                     Err(_) => 0,
@@ -838,6 +908,7 @@ impl Conn {
                 let no_wait = r.bit().map_err(malformed)?;
                 let _args = r.table().map_err(malformed)?;
                 let (_, sub) = broker.queue(&queue).map_err(|_| (NOT_FOUND, format!("NOT_FOUND - no queue '{queue}' in vhost '/'")))?;
+                self.topic_ok(&queue, Need::Consume)?;
                 if exclusive && sub.member_count() > 0 {
                     return Err((RESOURCE_LOCKED, format!("RESOURCE_LOCKED - cannot obtain exclusive access to queue '{queue}'")));
                 }
@@ -879,6 +950,11 @@ impl Conn {
                 let key = r.shortstr().map_err(malformed)?.to_string();
                 let mandatory = r.bit().map_err(malformed)?;
                 let _immediate = r.bit().map_err(malformed)?;
+                // Refused here, the channel closes and the content frames
+                // that follow are dropped with it, as RabbitMQ does.
+                if !exchange.is_empty() && broker.exchange_kind(&exchange).is_some() || exchange.is_empty() && broker.topic(&key).is_some() {
+                    self.publish_ok(&exchange, &key)?;
+                }
                 let c = self.channels.get_mut(&ch).expect("open");
                 c.incoming = Some(Incoming { exchange, key, mandatory, props: Vec::new(), size: 0, body: Vec::new(), have_header: false });
             }
@@ -888,6 +964,7 @@ impl Conn {
                 let queue = r.shortstr().map_err(malformed)?.to_string();
                 let no_ack = r.bit().map_err(malformed)?;
                 let (_, sub) = broker.queue(&queue).map_err(|_| (NOT_FOUND, format!("NOT_FOUND - no queue '{queue}' in vhost '/'")))?;
+                self.topic_ok(&queue, Need::Consume)?;
                 let taken = sub.take(1, no_ack, 0).map_err(|e| (INTERNAL_ERROR, e.message))?;
                 match taken.into_iter().next() {
                     None => codec::method(out, ch, 60, 72, |w| w.shortstr("")),
@@ -1332,3 +1409,7 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// A refusal of the broker's (`acl`) as AMQP's channel error.
+fn refused(e: super::BrokerError) -> (u16, String) {
+    (ACCESS_REFUSED, format!("ACCESS_REFUSED - {}", e.message))
+}
