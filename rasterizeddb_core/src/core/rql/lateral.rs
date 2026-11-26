@@ -1316,7 +1316,9 @@ pub(crate) async fn materialize(
                 // The keys are expressions over the outer item, which a join
                 // takes as a derived column (`join_on`). The executor's own
                 // pass ran before this relation existed.
-                let columns_of = |name: &str| crate::core::rql::cte::relation_labels(name, database);
+                // (With the hidden columns a copy carries: a time column's
+                // 100 ns digit, read by name beside it.)
+                let columns_of = |name: &str| crate::core::rql::cte::relation_labels_carried(name, database);
                 if let Some(joined) = crate::core::rql::join_on::rewrite_statement(&current, &columns_of) {
                     current = joined;
                 }

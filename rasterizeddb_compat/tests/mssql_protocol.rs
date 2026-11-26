@@ -1992,6 +1992,76 @@ async fn tiberius_engine_named_aliases_pass_the_catalogue_guard() {
     assert_eq!(r.last().unwrap().iter().map(|r| r.get::<i32, _>(0).unwrap()).collect::<Vec<_>>(), [9, 9]);
 }
 
+/// A `datetime2(7)` selected beside a correlated subquery over several
+/// rows keeps its seventh digit. The subquery is joined to a copy of the
+/// outer rows, and the copy was made of the visible columns alone: the
+/// statement failed with `column d.__t7_at does not exist`. With TOP, where
+/// the rows the limit keeps are copied first, and without; and through a
+/// join whose operand is computed, which copies its relation the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_datetime2_beside_a_correlated_subquery() {
+    let s = start();
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE [Ev] ([Id] int PRIMARY KEY, [At] datetime2(7) NOT NULL, [Until] datetime2(7) NULL, [Name] nvarchar(20) NOT NULL); \
+         CREATE TABLE [Hit] ([Id] int PRIMARY KEY, [EvId] int NOT NULL, [N] int NOT NULL); \
+         INSERT INTO [Ev] VALUES (1, '2026-01-02 03:04:05.1234567', '2026-02-02 00:00:00.0000001', N'a'), \
+             (2, '2026-01-02 03:04:05.7654321', NULL, N'b'), (3, '2026-01-02 03:04:05.0000009', '2026-03-03 00:00:00.9999999', N'c'); \
+         INSERT INTO [Hit] VALUES (1, 1, 10), (2, 1, 5), (3, 3, 7)",
+    )
+    .await
+    .unwrap();
+    let text = |r: &tiberius::Row, at: usize| r.get::<chrono::NaiveDateTime, _>(at).map(|t| {
+        use chrono::Timelike;
+        format!("{}.{:07}", t.format("%Y-%m-%d %H:%M:%S"), t.nanosecond() / 100)
+    });
+    let want = [
+        (1, Some("2026-01-02 03:04:05.1234567"), Some("2026-02-02 00:00:00.0000001"), Some(15), 2),
+        (2, Some("2026-01-02 03:04:05.7654321"), None, None, 0),
+        (3, Some("2026-01-02 03:04:05.0000009"), Some("2026-03-03 00:00:00.9999999"), Some(7), 1),
+    ];
+    for sql in [
+        "SELECT [d].[Id], [d].[At], [d].[Until], (SELECT SUM([h].[N]) FROM [Hit] AS [h] WHERE [h].[EvId] = [d].[Id]) AS [Total], \
+             (SELECT COUNT(*) FROM [Hit] AS [h] WHERE [h].[EvId] = [d].[Id]) AS [Hits] FROM [Ev] AS [d] ORDER BY [d].[Id]",
+        "SELECT TOP(3) [d].[Id], [d].[At], [d].[Until], (SELECT SUM([h].[N]) FROM [Hit] AS [h] WHERE [h].[EvId] = [d].[Id]) AS [Total], \
+             (SELECT COUNT(*) FROM [Hit] AS [h] WHERE [h].[EvId] = [d].[Id]) AS [Hits] FROM [Ev] AS [d] WHERE [d].[Id] > 0 ORDER BY [d].[Id]",
+    ] {
+        let r = batch(&mut c, sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let got: Vec<_> = r[0]
+            .iter()
+            .map(|r| (r.get::<i32, _>(0).unwrap(), text(r, 1), text(r, 2), r.get::<i32, _>(3), r.get::<i32, _>(4).unwrap()))
+            .collect();
+        let want: Vec<_> = want.iter().map(|(id, at, until, total, hits)| (*id, at.map(str::to_string), until.map(str::to_string), *total, *hits)).collect();
+        assert_eq!(got, want, "{sql}");
+    }
+    // TOP keeps the first two by the time, seventh digit and all.
+    let r = batch(
+        &mut c,
+        "SELECT TOP(2) [d].[Id], [d].[At], (SELECT COUNT(*) FROM [Hit] AS [h] WHERE [h].[EvId] = [d].[Id]) AS [Hits] FROM [Ev] AS [d] ORDER BY [d].[At]",
+    )
+    .await
+    .unwrap();
+    let got: Vec<_> = r[0].iter().map(|r| (r.get::<i32, _>(0).unwrap(), text(r, 1), r.get::<i32, _>(2).unwrap())).collect();
+    assert_eq!(got, [(3, Some("2026-01-02 03:04:05.0000009".to_string()), 1), (1, Some("2026-01-02 03:04:05.1234567".to_string()), 2)]);
+    // A join on a computed operand copies its relation too.
+    let r = batch(
+        &mut c,
+        "SELECT [d].[Id], [d].[At], [h].[N] FROM [Ev] AS [d] INNER JOIN [Hit] AS [h] ON [d].[Id] + 0 = [h].[EvId] ORDER BY [h].[Id]",
+    )
+    .await
+    .unwrap();
+    let got: Vec<_> = r[0].iter().map(|r| (r.get::<i32, _>(0).unwrap(), text(r, 1), r.get::<i32, _>(2).unwrap())).collect();
+    assert_eq!(
+        got,
+        [
+            (1, Some("2026-01-02 03:04:05.1234567".to_string()), 10),
+            (1, Some("2026-01-02 03:04:05.1234567".to_string()), 5),
+            (3, Some("2026-01-02 03:04:05.0000009".to_string()), 7)
+        ]
+    );
+}
+
 /// NULLs sort first ascending and last descending, as SQL Server's (NULL is
 /// its least value); the engine put them last ascending. And a sort by a
 /// nullable `datetime2(7)` then a uniqueidentifier with TOP took the server
