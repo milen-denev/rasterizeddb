@@ -905,6 +905,7 @@ mod tests {
             }],
             supported: true,
             locations,
+            stores: Vec::new(),
             placements: Vec::new(),
         }
     }
@@ -1673,6 +1674,59 @@ pub struct TablePlacement {
     pub mirrored: bool,
 }
 
+/// One key/value store, as `SHOW STORAGE STORES` reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KvStore {
+    pub name: String,
+    /// `s3`, `dir`, or whatever a store this build cannot open calls itself.
+    pub kind: String,
+    /// The endpoint for S3, the directory for a local store.
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    pub prefix: String,
+    pub addressing: String,
+    pub settings: String,
+    /// `store` or `environment` — where the credentials come from, never what
+    /// they are.
+    pub credentials: String,
+    pub tables: u64,
+    /// Whether the server has contacted it yet. A store nothing has opened has
+    /// not proved its endpoint or credentials.
+    pub opened: bool,
+    /// Whether this server build can open it at all.
+    pub supported: bool,
+}
+
+impl KvStore {
+    /// Where the bytes are, in one line: `s3://bucket/prefix @ endpoint` or
+    /// the directory.
+    pub fn address(&self) -> String {
+        let prefix = self.prefix.trim_matches('/');
+        match self.kind.as_str() {
+            "s3" => {
+                let mut out = format!("s3://{}", self.bucket);
+                if !prefix.is_empty() {
+                    out.push('/');
+                    out.push_str(prefix);
+                }
+                if !self.endpoint.is_empty() {
+                    out.push_str(" @ ");
+                    out.push_str(&self.endpoint);
+                }
+                out
+            }
+            _ if prefix.is_empty() => self.endpoint.clone(),
+            _ => format!("{} ({})", self.endpoint, prefix),
+        }
+    }
+
+    /// The placement spec a table on this store carries.
+    pub fn spec(&self) -> String {
+        format!("kv:{}", self.name)
+    }
+}
+
 /// Everything the storage page reads, in one round trip.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StorageSnapshot {
@@ -1687,6 +1741,10 @@ pub struct StorageSnapshot {
     /// directories, which is a different and much more common thing.
     pub supported: bool,
     pub locations: Vec<StorageLocation>,
+    /// Key/value stores (`SHOW STORAGE STORES`): S3 buckets and local KV
+    /// directories that hold tables outside the pool. Empty against
+    /// PostgreSQL and against a server built without `kv_storage`.
+    pub stores: Vec<KvStore>,
     pub placements: Vec<TablePlacement>,
 }
 
@@ -1740,6 +1798,26 @@ impl StorageSnapshot {
             return Vec::new();
         }
         self.placements.iter().filter(|p| !p.mirrored).collect()
+    }
+
+    /// Tables on key/value stores rather than in a directory.
+    pub fn tables_on_stores(&self) -> u64 {
+        self.stores.iter().map(|store| store.tables).sum()
+    }
+
+    /// How a placement's location reads on the page: a directory as itself,
+    /// `kv:<store>` as the store and where it points, `memory:` in words.
+    pub fn describe_location(&self, location: &str) -> String {
+        if let Some(name) = location.strip_prefix("kv:") {
+            return match self.stores.iter().find(|store| store.name == name) {
+                Some(store) => format!("{} store '{}' · {}", store.kind, name, store.address()),
+                None => format!("key/value store '{name}'"),
+            };
+        }
+        if location.eq_ignore_ascii_case("memory:") || location.eq_ignore_ascii_case("memory") {
+            return "in memory".to_string();
+        }
+        location.to_string()
     }
 
     /// Where a table created now would go, as the server worked it out.
