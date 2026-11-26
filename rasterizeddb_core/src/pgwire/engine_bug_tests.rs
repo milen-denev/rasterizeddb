@@ -1806,3 +1806,39 @@ async fn composite_foreign_key_dependencies() {
     .await
     .expect("bounded");
 }
+
+/// denevcloud-df, 2026-11-26: over a join, an aggregate of a `NUMERIC(p,6)`
+/// column read through a cast or an expression (`SUM(b.q)::text`,
+/// `(SUM(b.q)+0)`, `MAX(b.q)::text`) came back a thousand times too small,
+/// with no error: the synthetic column the expression reads was typed at the
+/// engine's nine places, while the fold produced the column's six. A lone
+/// `SUM(b.q)`, the same cast on one table, and the subquery form were right.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aggregate_cast_over_a_join_keeps_the_column_scale() {
+    let db = db().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE sc_o (id INT PRIMARY KEY, v NUMERIC(19,6) NOT NULL)").await;
+    ok(&db, &mut s, "CREATE TABLE sc_b (id INT PRIMARY KEY, oid INT NOT NULL, q NUMERIC(19,6) NOT NULL)").await;
+    ok(&db, &mut s, "INSERT INTO sc_o VALUES (1, 10), (2, 1.5)").await;
+    ok(&db, &mut s, "INSERT INTO sc_b VALUES (1, 1, 2), (2, 1, 3), (3, 2, 0.25)").await;
+    let num = |v: &Option<String>| v.as_deref().unwrap_or("NULL").parse::<f64>().unwrap_or(f64::NAN);
+    let got = one(
+        &db,
+        &mut s,
+        "SELECT SUM(b.q), SUM(b.q)::text, CAST(SUM(b.q) AS text), (SUM(b.q)+0)::text, MAX(b.q)::text, \
+         SUM(o.v)::text, SUM(b.q)::numeric(19,6)::text FROM sc_b b INNER JOIN sc_o o ON o.id = b.oid",
+    )
+    .await;
+    let want = [5.25, 5.25, 5.25, 5.25, 3.0, 21.5, 5.25];
+    let values: Vec<f64> = got[0].iter().map(num).collect();
+    assert_eq!(values, want, "{got:?}");
+
+    let grouped = one(
+        &db,
+        &mut s,
+        "SELECT o.id, SUM(b.q)::text, MAX(o.v)::text FROM sc_b b JOIN sc_o o ON o.id = b.oid GROUP BY o.id ORDER BY o.id",
+    )
+    .await;
+    let grouped: Vec<Vec<f64>> = grouped.iter().map(|r| r.iter().map(num).collect()).collect();
+    assert_eq!(grouped, vec![vec![1.0, 5.0, 10.0], vec![2.0, 0.25, 1.5]]);
+}
