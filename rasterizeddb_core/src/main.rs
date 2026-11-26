@@ -65,6 +65,8 @@ mod pg_import_args;
 /// Redis-compatible key/value store flags.
 #[cfg(feature = "kv_cache")]
 mod kv_args;
+#[cfg(feature = "broker")]
+mod broker_args;
 mod shard_args;
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -913,6 +915,10 @@ struct Args {
     #[cfg(feature = "kv_cache")]
     #[command(flatten)]
     kv: kv_args::KvArgs,
+
+    #[cfg(feature = "broker")]
+    #[command(flatten)]
+    broker: broker_args::BrokerArgs,
 
     // --- sharding (docs/sharding-plan.md) ---------------------------------
     #[command(flatten)]
@@ -2178,6 +2184,44 @@ fn main() -> std::io::Result<()> {
                         }
                     }
                 }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+
+        // The broker's native protocol, beside the SQL ports. Bound here for
+        // the same reason as the Redis port above.
+        #[cfg(feature = "broker")]
+        {
+            if let Err(e) = args.broker.apply() {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+            let (socket_mode, socket_group) = socket_permissions(&args);
+            match args.broker.native(socket_mode, socket_group, args.pg_cert.as_deref(), args.pg_key.as_deref()) {
+                Ok(Some(config)) => match rasterizeddb_core::core::broker::net::bind(&config).await {
+                    Ok(listeners) => {
+                        // Opened before the port answers, so a damaged log
+                        // stops the start-up with its reason.
+                        if let Err(e) = arc_database.broker.get() {
+                            eprintln!("could not open the broker: {e}");
+                            std::process::exit(2);
+                        }
+                        let database = arc_database.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = rasterizeddb_core::core::broker::net::serve(listeners, database, config).await {
+                                log::error!("broker: the native listener stopped: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("could not start the broker's native listener: {e}");
+                        std::process::exit(2);
+                    }
+                },
                 Ok(None) => {}
                 Err(e) => {
                     eprintln!("{e}");

@@ -13,6 +13,9 @@ description = "The RasterizedDB server and engine: a SQL database speaking the P
 # route_v1 (XXH64, key frames, the range map) and the shard map: one copy
 # shared with the client and the gateway.
 rasterizeddb_router = { path = "../rasterizeddb_router", version = "1.0.0" }
+# The message broker's batch format and wire protocol (feature `broker`),
+# shared with the client.
+rasterizeddb_mq = { path = "../rasterizeddb_mq", version = "1.0.1", optional = true }
 # Ed25519 for signed cluster maps (sharding-plan.md B2); already in the tree
 # as rustls's crypto provider.
 aws-lc-rs = { version = "1.19", optional = true }
@@ -187,7 +190,7 @@ name = "kv_table_bench"
 required-features = ["kv_storage"]
 
 [features]
-default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3", "query_stats", "kv_cache", "persistent_indexes", "mysql_wire", "mssql_wire", "db_branching", "storage_compression", "sharding"]
+default = ["memory_pool_reuse", "replication_compression", "s3_backup", "pg_import", "storage_pools", "kv_storage", "kv_storage_s3", "query_stats", "kv_cache", "persistent_indexes", "mysql_wire", "mssql_wire", "db_branching", "storage_compression", "sharding", "broker"]
 enable_long_row = []
 
 # Sharding (docs/sharding-plan.md §4): a shard's ownership of level-0 block
@@ -324,6 +327,12 @@ query_stats = []
 # through `auth`. Nothing is allocated until the first `KV` statement or RESP
 # connection, and the port is closed unless `--kv-port` is given.
 kv_cache = []
+
+# The message broker (docs/broker.md): topics, queues, subscriptions and
+# exchanges inside the database, on `--broker-port` (the native protocol)
+# and `BROKER …` statements. Dormant until a port is given or a statement
+# first uses it.
+broker = ["dep:rasterizeddb_mq"]
 
 # The MySQL / MariaDB client protocol (`--mysql-port`, `--mysql-socket`),
 # beside whichever other listeners run. Each connection is translated onto an

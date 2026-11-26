@@ -69,6 +69,12 @@ pub mod index;
 pub mod index_store;
 #[cfg(feature = "kv_cache")]
 pub mod kv_cache;
+/// Listener plumbing for the ports served beside SQL.
+#[cfg(any(feature = "kv_cache", feature = "broker"))]
+pub mod listen;
+/// The message broker (docs/broker.md).
+#[cfg(feature = "broker")]
+pub mod broker;
 /// Several storage directories for one database, behind the `storage_pools`
 /// feature.
 #[cfg(feature = "storage_pools")]

@@ -127,6 +127,9 @@ mod types;
 mod value;
 
 pub mod admin;
+#[cfg(feature = "broker")]
+#[cfg_attr(docsrs, doc(cfg(feature = "broker")))]
+pub mod broker;
 pub mod kv;
 pub mod notice;
 pub mod orm;

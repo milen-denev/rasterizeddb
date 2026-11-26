@@ -42,6 +42,10 @@ pub enum QueryPurpose {
     /// store. Parsed and executed by [`crate::core::kv_cache::sql`].
     #[cfg(feature = "kv_cache")]
     KvCache(String),
+    /// `BROKER <statement> …`: the message broker's topics, queues and
+    /// exchanges. Parsed and executed by [`crate::core::broker::sql`].
+    #[cfg(feature = "broker")]
+    Broker(String),
     /// `REPLICATION ...` / `SHOW REPLICATION ...` — running the cluster from
     /// SQL. Parsed and executed by [`crate::replication::sql`].
     Replication(String),
@@ -542,6 +546,13 @@ fn recognize_surface_statement(query_trimmed: &str) -> Option<QueryPurpose> {
     #[cfg(feature = "kv_cache")]
     if crate::core::kv_cache::sql::is_kv_statement(query_trimmed) {
         return Some(KvCache(query_trimmed.to_string()));
+    }
+
+    // `BROKER` is not a statement keyword anywhere else either, and what
+    // follows it is the broker's own grammar.
+    #[cfg(feature = "broker")]
+    if crate::core::broker::sql::is_broker_statement(query_trimmed) {
+        return Some(Broker(query_trimmed.to_string()));
     }
 
     // After the three surfaces above, each of which owns a longer `SHOW`

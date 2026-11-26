@@ -20498,6 +20498,10 @@ pub(crate) fn replication_of(query: &QueryPurpose) -> Replicated {
         // Its writes travel on the same stream, as the store's own effects
         // (`core::kv_cache::repl`) rather than as this statement's text.
         QueryPurpose::KvCache(_) => Replicated::NotAWrite,
+        // The broker's logs are this node's own until broker replication
+        // ships (docs/broker.md §9, phase 5).
+        #[cfg(feature = "broker")]
+        QueryPurpose::Broker(_) => Replicated::Local("the broker's topics are this node's own; run it on each node"),
         #[cfg(feature = "storage_pools")]
         QueryPurpose::Storage(_) => {
             Replicated::Local("STORAGE statements place this node's files; run it on each node that should have it")
@@ -20539,6 +20543,9 @@ fn query_sql(query: &QueryPurpose) -> String {
         // token), so the text is not kept.
         #[cfg(feature = "kv_cache")]
         QueryPurpose::KvCache(_) => String::new(),
+        // A published message may be a secret, as a KV value may.
+        #[cfg(feature = "broker")]
+        QueryPurpose::Broker(_) => String::new(),
         #[cfg(feature = "s3_backup")]
         QueryPurpose::Backup(_) => String::new(),
         #[cfg(feature = "s3_backup")]
@@ -23593,6 +23600,12 @@ pub(crate) async fn execute_with_need(
         #[cfg(feature = "kv_cache")]
         QueryPurpose::KvCache(sql) => {
             return crate::core::kv_cache::sql::execute(sql, &database.kv_cache).await;
+        }
+        // The broker: no table, no transaction. Who may run its DDL was
+        // decided by the session's guard (`pgwire::catalogue_guard`).
+        #[cfg(feature = "broker")]
+        QueryPurpose::Broker(sql) => {
+            return crate::core::broker::sql::execute(sql, &database.broker, true).await;
         }
         QueryPurpose::FilterControl(sql) => {
             return match crate::core::filter::sql::execute(sql) {

@@ -133,6 +133,8 @@ pub fn finalize() {
     // not find the process already half gone.
     #[cfg(feature = "kv_cache")]
     crate::core::kv_cache::save_all_on_exit();
+    #[cfg(feature = "broker")]
+    crate::core::broker::shutdown_all();
     match crate::core::wal::checkpoint_all() {
         Ok(()) => info!("WAL checkpointed on shutdown"),
         Err(e) => error!("WAL checkpoint failed during shutdown: {e}"),
