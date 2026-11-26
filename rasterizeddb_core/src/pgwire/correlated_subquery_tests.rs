@@ -461,3 +461,150 @@ async fn one_outer_tuple_is_a_constant_item() {
     let e = super::owner_tests::send(&db, &mut s, &sql).await.expect_err("more than one row");
     assert!(e.contains("more than one row returned by a subquery used as an expression"), "{e}");
 }
+
+/// A LIMIT is taken before the select list's subqueries when they would run
+/// for more outer values than it keeps rows: they are a value per row, so
+/// the rows the limit keeps are the relation's, its WHERE's and its ORDER
+/// BY's to decide (`lateral::limited_outer`). EF Core's related-items query
+/// with a tag most products carry ran its two subqueries for every product
+/// the tag kept, then kept ten. The answers are the ones written, where the
+/// limit goes first, where it must not, and where there is nothing to cut.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_limit_is_taken_before_the_select_list_subqueries() {
+    use crate::core::rql::lateral::test_hooks::take_limited;
+    const ALIAS_LIM: &str = "olim";
+    let db = db().await;
+    let mut s = session(&db);
+    let (customers, orders) = ("lim_customers", "lim_orders");
+    fill(&db, &mut s, customers, orders, false).await;
+    let q = |list_tail: &str, rest: &str| {
+        format!(
+            "SELECT {ALIAS_LIM}.id, (SELECT COUNT(*) FROM {orders} o WHERE o.customer_id = {ALIAS_LIM}.id) AS n, \
+             (SELECT SUM(amount) FROM {orders} o WHERE o.customer_id = {ALIAS_LIM}.id) AS total{list_tail} FROM {customers} {ALIAS_LIM} {rest}"
+        )
+    };
+    let all = expected();
+    let answer = |id: i64| (id, all[&id].0, all[&id].1);
+    let in_order = |rows: Vec<Vec<Option<String>>>| -> Vec<Answer> {
+        let int = |c: &Option<String>| c.as_deref().map(|t| t.parse::<i64>().unwrap());
+        rows.iter().map(|r| (int(&r[0]).unwrap(), int(&r[1]).unwrap_or(0), int(&r[2]))).collect()
+    };
+    // Each: the rows wanted, in order; every customer past 20 passes the
+    // WHERE (280 of them), ten are kept.
+    let cases: Vec<(String, Vec<i64>)> = vec![
+        (format!("WHERE {ALIAS_LIM}.id > 20 ORDER BY {ALIAS_LIM}.id LIMIT 10"), (21..=30).collect()),
+        (format!("WHERE {ALIAS_LIM}.id > 20 ORDER BY {ALIAS_LIM}.id DESC LIMIT 10"), (291..=300).rev().collect()),
+        (format!("WHERE {ALIAS_LIM}.id > 20 ORDER BY {ALIAS_LIM}.id LIMIT 10 OFFSET 5"), (26..=35).collect()),
+        (format!("WHERE {ALIAS_LIM}.name LIKE 'c29%' ORDER BY {ALIAS_LIM}.name DESC NULLS LAST, {ALIAS_LIM}.id LIMIT 3"), vec![299, 298, 297]),
+        (format!("ORDER BY {ALIAS_LIM}.id LIMIT 4"), vec![1, 2, 3, 4]),
+    ];
+    for (rest, ids) in &cases {
+        let sql = q("", rest);
+        take_runs(customers, ALIAS_LIM);
+        take_limited(ALIAS_LIM);
+        let got = in_order(pg_rows(&db, &mut s, &sql).await);
+        assert_eq!(take_limited(ALIAS_LIM), 1, "{sql}");
+        assert_eq!(got, ids.iter().map(|id| answer(*id)).collect::<Vec<_>>(), "{sql}");
+        // Two items, each run for the rows kept.
+        assert_eq!(take_runs(customers, ALIAS_LIM), 2 * ids.len(), "{sql}");
+        // Native answers the same, the same way.
+        assert_eq!(in_order(native_rows(&db, &sql).await), got, "{sql}");
+        assert_eq!(take_limited(ALIAS_LIM), 1, "{sql}");
+        assert_eq!(take_runs(customers, ALIAS_LIM), 2 * ids.len(), "{sql}");
+    }
+    // No ORDER BY: any ten of the rows the WHERE keeps, each with its own
+    // values.
+    let sql = q("", &format!("WHERE {ALIAS_LIM}.id > 20 LIMIT 10"));
+    take_runs(customers, ALIAS_LIM);
+    let got = in_order(pg_rows(&db, &mut s, &sql).await);
+    assert_eq!(got.len(), 10);
+    assert!(got.iter().all(|row| row.0 > 20 && *row == answer(row.0)), "{got:?}");
+    assert_eq!(take_runs(customers, ALIAS_LIM), 2 * 10, "{sql}");
+    assert_eq!(take_limited(ALIAS_LIM), 1, "{sql}");
+
+    // Nothing to cut: no more outer values than the limit keeps (a lookup
+    // of one row, which is a constant item; three rows of ten). No copy.
+    for (rest, ids) in [
+        (format!("WHERE {ALIAS_LIM}.id = 5 ORDER BY {ALIAS_LIM}.id LIMIT 1"), vec![5i64]),
+        (format!("WHERE {ALIAS_LIM}.id BETWEEN 7 AND 9 ORDER BY {ALIAS_LIM}.id LIMIT 10"), vec![7, 8, 9]),
+    ] {
+        let sql = q("", &rest);
+        take_runs(customers, ALIAS_LIM);
+        let got = in_order(pg_rows(&db, &mut s, &sql).await);
+        assert_eq!(got, ids.iter().map(|id| answer(*id)).collect::<Vec<_>>(), "{sql}");
+        assert_eq!(take_limited(ALIAS_LIM), 0, "{sql}");
+        assert_eq!(take_runs(customers, ALIAS_LIM), 2 * ids.len(), "{sql}");
+    }
+
+    // Where the limit does not go first: the rows are ordered by a
+    // subquery's value (an output name, an ordinal), or are not the
+    // relation's (DISTINCT). Every row the WHERE keeps is run, as before.
+    let by_count: Vec<i64> = {
+        let mut ids: Vec<i64> = (281..=300).collect();
+        ids.sort_by_key(|id| (std::cmp::Reverse(all[id].0), *id));
+        ids.truncate(3);
+        ids
+    };
+    for order in ["n DESC", "2 DESC"] {
+        let sql = q("", &format!("WHERE {ALIAS_LIM}.id > 280 ORDER BY {order}, {ALIAS_LIM}.id LIMIT 3"));
+        take_runs(customers, ALIAS_LIM);
+        let got = in_order(pg_rows(&db, &mut s, &sql).await);
+        assert_eq!(got, by_count.iter().map(|id| answer(*id)).collect::<Vec<_>>(), "{sql}");
+        assert_eq!(take_runs(customers, ALIAS_LIM), 2 * 20, "{sql}");
+        assert_eq!(take_limited(ALIAS_LIM), 0, "{sql}");
+    }
+    // The last ten customers have no orders: one distinct (count, sum).
+    let sql = format!(
+        "SELECT DISTINCT (SELECT COUNT(*) FROM {orders} o WHERE o.customer_id = {ALIAS_LIM}.id) AS n FROM {customers} {ALIAS_LIM} \
+         WHERE {ALIAS_LIM}.id > 290 LIMIT 5"
+    );
+    assert_eq!(pg_rows(&db, &mut s, &sql).await, vec![vec![Some("0".to_string())]], "{sql}");
+    assert_eq!(take_limited(ALIAS_LIM), 0, "{sql}");
+}
+
+/// [`a_limit_is_taken_before_the_select_list_subqueries`], the statement
+/// and its cut as text: what moves into the copy, what stays, and what is
+/// left as written.
+#[test]
+fn the_rows_a_limit_keeps_are_the_outer_item_s_to_decide() {
+    use crate::core::rql::lateral::limited_outer_for_tests as cut;
+    let item = "LEFT JOIN LATERAL (SELECT count(*) AS __v FROM u WHERE u.k = a.id) __cs0 ON true";
+    let two = format!("{item} LEFT JOIN LATERAL (SELECT max(v) AS __v FROM u WHERE u.k = a.id) __cs1 ON true");
+    let sql = format!("SELECT a.x, __cs0.__v AS \"n\" FROM t a {two} WHERE a.g = 1 AND a.h IN (2, 3) ORDER BY a.x DESC NULLS LAST, a.id LIMIT 10 OFFSET 5");
+    assert_eq!(
+        cut(&sql, "a", "t", 16),
+        Some((
+            "SELECT a.* FROM t a WHERE a.g = 1 AND a.h IN (2, 3) ORDER BY a.x DESC NULLS LAST, a.id LIMIT 10 OFFSET 5".to_string(),
+            format!("SELECT a.x, __cs0.__v AS \"n\" FROM <copy> a {two} ORDER BY a.x DESC NULLS LAST, a.id"),
+        ))
+    );
+    // No more outer values than rows kept: as written.
+    assert_eq!(cut(&sql, "a", "t", 15), None);
+    // No WHERE, no ORDER BY, `AS`.
+    assert_eq!(
+        cut(&format!("SELECT a.x, __cs0.__v FROM t AS a {item} LIMIT 3"), "a", "t", 4),
+        Some(("SELECT a.* FROM t AS a LIMIT 3".to_string(), format!("SELECT a.x, __cs0.__v FROM <copy> a {item}")))
+    );
+    for left in [
+        // Ordered by an item's value: an output name, an ordinal, the item.
+        format!("SELECT a.x, __cs0.__v AS n FROM t a {item} ORDER BY n LIMIT 3"),
+        format!("SELECT a.x, __cs0.__v AS n FROM t a {item} ORDER BY 2 LIMIT 3"),
+        format!("SELECT a.x, __cs0.__v AS n FROM t a {item} ORDER BY __cs0.__v LIMIT 3"),
+        format!("SELECT a.x, __cs0.__v AS n FROM t a {item} ORDER BY a.x + 1 LIMIT 3"),
+        // Rows that are not the outer item's.
+        format!("SELECT DISTINCT a.x, __cs0.__v FROM t a {item} LIMIT 3"),
+        format!("SELECT count(*), max(__cs0.__v) FROM t a {item} LIMIT 3"),
+        format!("SELECT a.x, row_number() OVER (ORDER BY a.x), __cs0.__v FROM t a {item} LIMIT 3"),
+        format!("SELECT a.x, __cs0.__v FROM t a {item} GROUP BY a.x, __cs0.__v LIMIT 3"),
+        format!("SELECT a.x, __cs0.__v FROM t a JOIN w ON w.id = a.id {item} LIMIT 3"),
+        format!("SELECT a.x, __cs0.__v FROM t a LEFT JOIN LATERAL (SELECT v FROM u WHERE u.k = a.id) r ON true {item} LIMIT 3"),
+        // A WHERE that reads an item, a parameter, a limit that is not a number.
+        format!("SELECT a.x, __cs0.__v FROM t a {two} WHERE __cs1.__v > 0 LIMIT 3"),
+        format!("SELECT a.x, __cs0.__v FROM t a {item} WHERE a.g = $1 LIMIT 3"),
+        format!("SELECT a.x, __cs0.__v FROM t a {item} LIMIT ALL"),
+        format!("SELECT a.x, __cs0.__v FROM t a {item} WHERE a.g = 1"),
+        format!("SELECT a.x, __cs0.__v FROM t a {item} ORDER BY a.x LIMIT 3 FOR UPDATE"),
+    ] {
+        assert_eq!(cut(&left, "a", "t", 1000), None, "{left}");
+    }
+}

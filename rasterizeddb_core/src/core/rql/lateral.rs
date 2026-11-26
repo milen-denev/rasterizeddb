@@ -1142,6 +1142,9 @@ pub(crate) async fn materialize(
     // table d", every correlated scalar subquery an ORM sends).
     let mut current = unquote_plain_qualified(sql);
     let mut found = false;
+    // Whether the outer rows were cut to the statement's LIMIT already
+    // (`limited_outer`): once.
+    let mut limited = false;
     for index in 0..16usize {
         let Some(item) = next_item(&current) else { break };
         let item = qualify_outer_columns(&current, &item?, database).await?;
@@ -1208,6 +1211,21 @@ pub(crate) async fn materialize(
                     },
                     None => text_rows(&key_query, columns.len(), database, tx).await?,
                 };
+                // More outer values than the statement's LIMIT keeps rows:
+                // the rows it keeps first, the items for those (the item is
+                // read again, over them).
+                if !limited {
+                    if let Some(cut) = limited_outer(&current, alias, relation, tuples.len()) {
+                        limited = true;
+                        let body = crate::core::rql::cte::whole_rows_with_hidden(&cut.body, database).unwrap_or(cut.body);
+                        let built = crate::core::rql::cte::materialize_query(&body, alias, &current, database, tx).await?;
+                        temps.push(built.clone());
+                        #[cfg(test)]
+                        test_hooks::record_limited(alias);
+                        current = format!("{}{built}{}", cut.before, cut.after);
+                        continue;
+                    }
+                }
                 #[cfg(test)]
                 test_hooks::record_runs(relation, tuples.len());
                 if tuples.len() > MAX_TUPLES {
@@ -1351,6 +1369,179 @@ pub(crate) async fn materialize(
     Ok(found.then_some(current))
 }
 
+/// A statement cut to the rows its `LIMIT` keeps ([`limited_outer`]): the
+/// query of those rows, and the statement around the relation they are
+/// copied to (`before`, the relation's name, `after`).
+struct LimitedOuter {
+    body: String,
+    before: String,
+    after: String,
+}
+
+/// `sql`, whose select-list subqueries are `LATERAL` items over the outer
+/// item `alias` (`relation`), as the same statement over the rows its
+/// `LIMIT` keeps, when its items would run for more outer values (`tuples`)
+/// than that:
+///
+/// ```text
+/// SELECT a.x, __cs0.__v FROM t a LEFT JOIN LATERAL (…) __cs0 ON true WHERE w ORDER BY a.x LIMIT 10
+/// SELECT a.x, __cs0.__v FROM <copy> a LEFT JOIN LATERAL (…) __cs0 ON true ORDER BY a.x
+///     <copy>: SELECT a.* FROM t a WHERE w ORDER BY a.x LIMIT 10
+/// ```
+///
+/// A correlated scalar subquery's item is a value per outer row: it
+/// neither adds a row nor drops one (one row at most, 21000 otherwise), so
+/// which rows the limit keeps is the outer item's, its `WHERE`'s and its
+/// `ORDER BY`'s to decide. Read as written, the items ran for every outer
+/// value the `WHERE` kept before the limit dropped all but ten: EF Core's
+/// related-items query with a tag most products carry ran its two
+/// subqueries hundreds of times for ten rows (330 ms against SQL Server's
+/// 7). Decided here, by the count, so a lookup of one row pays for no copy.
+///
+/// `None` unless all of this holds:
+/// - the `FROM` is the outer item followed by correlated scalar items only
+///   (`LEFT JOIN LATERAL (…) __csN ON true`): any other join decides rows;
+/// - the select list has no `DISTINCT`, aggregate or window, and the
+///   statement no `GROUP BY`, `HAVING`, `WINDOW`, `FETCH`, locking clause or
+///   set operation: their rows are not the outer item's;
+/// - the `WHERE` reads no item's value (a subquery of its own was made one)
+///   and holds no parameter;
+/// - the `ORDER BY` is the outer item's own qualified columns: an output
+///   name or an ordinal may be an item's value;
+/// - `LIMIT` and `OFFSET` are integers, and `tuples` is more than their sum.
+fn limited_outer(sql: &str, alias: &str, relation: &str, tuples: usize) -> Option<LimitedOuter> {
+    use crate::core::rql::correlated::ALIAS_PREFIX;
+    let lead = sql.len() - sql.trim_start().len();
+    if !word_at(sql, lead, "SELECT") {
+        return None;
+    }
+    if ["GROUP", "HAVING", "WINDOW", "FETCH", "FOR", "UNION", "INTERSECT", "EXCEPT"].iter().any(|w| find_keyword(sql, w, 0).is_some()) {
+        return None;
+    }
+    let from = find_keyword(sql, "FROM", 0)?;
+    let list = sql[lead + "SELECT".len()..from].trim_start();
+    if ["DISTINCT", "ALL"].iter().any(|w| word_at(list, 0, w) && list.as_bytes().get(w.len()).is_some_and(|b| !is_word(*b))) {
+        return None;
+    }
+    if find_keyword(list, "OVER", 0).is_some() || crate::core::rql::distinct_on::calls_an_aggregate(list) {
+        return None;
+    }
+    let from_end = clause_end_of_from(sql);
+    if from_end <= from {
+        return None;
+    }
+    // The outer item, then scalar items only.
+    let source_at = from + "FROM".len();
+    let source = &sql[source_at..from_end];
+    let outer_end = find_keyword(source, "LEFT", 0)?;
+    let head = source[..outer_end].trim();
+    let words: Vec<&str> = head.split_whitespace().filter(|w| !w.eq_ignore_ascii_case("AS")).collect();
+    let written = match words.as_slice() {
+        [name] if same_name(name.trim_matches('"'), relation) && same_name(name.trim_matches('"'), alias) => *name,
+        [name, written] if same_name(name.trim_matches('"'), relation) && same_name(written.trim_matches('"'), alias) => *written,
+        _ => return None,
+    };
+    let mut at = outer_end;
+    while at < source.len() {
+        for word in ["LEFT", "JOIN", "LATERAL"] {
+            at = skip_ws(source, at);
+            if !word_at(source, at, word) {
+                return None;
+            }
+            at += word.len();
+        }
+        at = skip_ws(source, at);
+        if source.as_bytes().get(at) != Some(&b'(') {
+            return None;
+        }
+        at = skip_ws(source, matching_paren(source, at)? + 1);
+        let (name, after) = identifier_at(source, at)?;
+        if !name.starts_with(ALIAS_PREFIX) || !name[ALIAS_PREFIX.len()..].bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        at = after;
+        for word in ["ON", "true"] {
+            at = skip_ws(source, at);
+            if !word_at(source, at, word) || source.as_bytes().get(at + word.len()).is_some_and(|b| is_word(*b)) {
+                return None;
+            }
+            at += word.len();
+        }
+        at = skip_ws(source, at);
+    }
+    // WHERE, ORDER BY, LIMIT / OFFSET: in that order, nothing else.
+    let rest = &sql[from_end..];
+    let rest = rest.trim().trim_end_matches(';').trim_end();
+    if rest.contains('$') {
+        return None;
+    }
+    let tail_at = ["LIMIT", "OFFSET"].iter().filter_map(|w| find_keyword(rest, w, 0)).min()?;
+    let order_at = find_keyword(rest, "ORDER", 0);
+    if order_at.is_some_and(|o| o > tail_at) {
+        return None;
+    }
+    let filter = rest[..order_at.unwrap_or(tail_at)].trim();
+    if !(filter.is_empty() || (word_at(filter, 0, "WHERE") && !filter.contains(ALIAS_PREFIX))) {
+        return None;
+    }
+    let order = order_at.map(|o| rest[o..tail_at].trim()).unwrap_or_default();
+    if !order.is_empty() {
+        let keys = order["ORDER".len()..].trim_start();
+        if !word_at(keys, 0, "BY") {
+            return None;
+        }
+        for key in crate::core::sql_scan::split_top_level(&keys["BY".len()..], b',') {
+            let mut key = key.trim();
+            for suffix in [" NULLS FIRST", " NULLS LAST", " ASC", " DESC"] {
+                if key.len() > suffix.len() && key.is_char_boundary(key.len() - suffix.len()) {
+                    let (head, tail) = key.split_at(key.len() - suffix.len());
+                    if tail.eq_ignore_ascii_case(suffix) {
+                        key = head.trim_end();
+                    }
+                }
+            }
+            let (qualifier, column) = key.split_once('.')?;
+            let plain = |name: &str| {
+                let name = name.trim();
+                let inner = name.strip_prefix('"').and_then(|n| n.strip_suffix('"')).unwrap_or(name);
+                !inner.is_empty() && !inner.contains('"') && (name.starts_with('"') || inner.bytes().all(is_word))
+            };
+            if !same_name(qualifier.trim().trim_matches('"'), alias) || !plain(qualifier) || !plain(column) {
+                return None;
+            }
+        }
+    }
+    // `LIMIT n [OFFSET m]` or `OFFSET m LIMIT n`, integers.
+    let tail = rest[tail_at..].trim();
+    let words: Vec<&str> = tail.split_whitespace().collect();
+    let (limit, offset) = match words.as_slice() {
+        [l, n] if l.eq_ignore_ascii_case("LIMIT") => (n.parse::<usize>().ok()?, 0),
+        [l, n, o, m] if l.eq_ignore_ascii_case("LIMIT") && o.eq_ignore_ascii_case("OFFSET") => (n.parse::<usize>().ok()?, m.parse::<usize>().ok()?),
+        [o, m, l, n] if l.eq_ignore_ascii_case("LIMIT") && o.eq_ignore_ascii_case("OFFSET") => (n.parse::<usize>().ok()?, m.parse::<usize>().ok()?),
+        _ => return None,
+    };
+    if tuples <= limit.checked_add(offset)? {
+        return None;
+    }
+    let mut body = format!("SELECT {written}.* FROM {head}");
+    for part in [filter, order, tail] {
+        if !part.is_empty() {
+            body.push(' ');
+            body.push_str(part);
+        }
+    }
+    // The statement around the copy: its relation's name in place of the
+    // outer item's, the items after it, and the order its rows come in.
+    let head_at = source_at + (source.len() - source.trim_start().len());
+    let after_head = source_at + outer_end;
+    let mut after = format!(" {written} {}", sql[after_head..from_end].trim());
+    if !order.is_empty() {
+        after.push(' ');
+        after.push_str(order);
+    }
+    Some(LimitedOuter { body, before: sql[..head_at].to_string(), after })
+}
+
 /// Whether `inner` (a derived table's body, aliased `derived`) is the plain
 /// copy `join_on` makes of the outer item `alias` to carry a join key:
 /// `SELECT … FROM <relation> [AS] alias`, nothing after it. Only such a
@@ -1461,6 +1652,13 @@ fn conjuncts(clause: &str) -> Vec<String> {
         open = between.is_some_and(|b| find_keyword(last, "AND", b).is_none());
     }
     out
+}
+
+/// [`limited_outer`] for tests: the copy's query, and the statement around
+/// `<copy>`.
+#[cfg(test)]
+pub(crate) fn limited_outer_for_tests(sql: &str, alias: &str, relation: &str, tuples: usize) -> Option<(String, String)> {
+    limited_outer(sql, alias, relation, tuples).map(|cut| (cut.body, format!("{}<copy>{}", cut.before, cut.after)))
 }
 
 #[cfg(test)]
@@ -1905,6 +2103,19 @@ pub(crate) mod test_hooks {
     /// The constant items recorded for `alias`, forgotten.
     pub(crate) fn take_constants(alias: &str) -> usize {
         CONSTANTS.lock().unwrap().as_mut().and_then(|m| m.remove(alias)).unwrap_or(0)
+    }
+
+    /// The statements whose outer rows were cut to their LIMIT first
+    /// (`limited_outer`), by outer alias.
+    static LIMITED: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+    pub(crate) fn record_limited(alias: &str) {
+        *LIMITED.lock().unwrap().get_or_insert_with(HashMap::new).entry(alias.to_string()).or_default() += 1;
+    }
+
+    /// The cuts recorded for `alias`, forgotten.
+    pub(crate) fn take_limited(alias: &str) -> usize {
+        LIMITED.lock().unwrap().as_mut().and_then(|m| m.remove(alias)).unwrap_or(0)
     }
 
     pub(crate) fn record_runs(relation: &str, runs: usize) {
