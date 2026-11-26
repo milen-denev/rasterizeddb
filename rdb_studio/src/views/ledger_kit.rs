@@ -104,15 +104,51 @@ impl<'a> Kit<'a, Message> for StudioKit<'a> {
             .into()
     }
 
+    fn pick(
+        &self,
+        label: String,
+        options: Vec<String>,
+        selected: Option<String>,
+        width: f32,
+        on: Box<dyn Fn(String) -> Message + 'a>,
+    ) -> Element<'a, Message> {
+        let list = iced::widget::pick_list(options, selected, on)
+            .placeholder("choose…")
+            .padding([5, 8])
+            .text_size(12)
+            .width(Length::Fixed(width));
+        if label.is_empty() {
+            return list.into();
+        }
+        column![text(label).size(11).font(theme::MONO).color(theme::TEXT_DIM), list].spacing(4).into()
+    }
+
+    fn column_types(&self) -> Vec<rdb_studio_enterprise::ColumnType> {
+        use crate::types::Params;
+        crate::types::choices(self.studio.flavor())
+            .into_iter()
+            .map(|c| rdb_studio_enterprise::ColumnType {
+                name: c.0.name.to_string(),
+                params: match c.0.params {
+                    Params::None => rdb_studio_enterprise::TypeParams::None,
+                    Params::Length(n) => rdb_studio_enterprise::TypeParams::Length(n),
+                    Params::PrecisionScale(p, s) => rdb_studio_enterprise::TypeParams::PrecisionScale(p, s),
+                },
+                help: c.0.help.to_string(),
+            })
+            .collect()
+    }
+
     fn field(
         &self,
         label: String,
+        placeholder: &str,
         value: &'a str,
         secret: bool,
         width: f32,
         on: Box<dyn Fn(String) -> Message + 'a>,
     ) -> Element<'a, Message> {
-        let input = text_input("", value)
+        let input = text_input(placeholder, value)
             .on_input(on)
             .secure(secret)
             .padding([5, 8])
