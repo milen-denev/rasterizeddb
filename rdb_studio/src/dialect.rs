@@ -34,7 +34,7 @@
 
 use crate::model::{
     BackupEntry, BranchDiffRow, BranchForm, BranchInfo, BranchPointKind, ColumnInfo,
-    ConfigEntry, DatabaseInfo, Flavor, Grid, IndexInfo, IndexOwner, MergePolicy, PartitionInfo,
+    ConfigEntry, DatabaseInfo, Flavor, KvStore, Grid, IndexInfo, IndexOwner, MergePolicy, PartitionInfo,
     PeerStatus, Relationship, RestoreReport, RebalanceStep, RestoreTarget, RoleInfo, ShardInfo, ShardsSnapshot, Stat,
     StatementRecord, StatementShape, StorageLocation, TableInfo, TableLoad, TablePlacement,
 };
@@ -1401,6 +1401,14 @@ pub fn storage_placements_sql(flavor: Flavor) -> &'static str {
     }
 }
 
+/// A row per key/value store. PostgreSQL has nothing that matches.
+pub fn storage_stores_sql(flavor: Flavor) -> Option<&'static str> {
+    match flavor {
+        Flavor::Rasterized => Some("SHOW STORAGE STORES"),
+        Flavor::Postgres => None,
+    }
+}
+
 /// Whether this dialect lets the console change placement from here.
 pub fn storage_is_manageable(flavor: Flavor) -> bool {
     matches!(flavor, Flavor::Rasterized)
@@ -1497,6 +1505,26 @@ pub fn parse_storage_locations(grid: &Grid) -> Vec<StorageLocation> {
             tables: grid.number(row, "tables").unwrap_or(0),
             available_bytes: grid.number(row, "available_bytes").unwrap_or(0),
             total_bytes: grid.number(row, "total_bytes").unwrap_or(0),
+        })
+        .collect()
+}
+
+pub fn parse_storage_stores(grid: &Grid) -> Vec<KvStore> {
+    let text = |row: usize, column: &str| grid.value(row, column).unwrap_or_default().to_string();
+    (0..grid.rows.len())
+        .map(|row| KvStore {
+            name: text(row, "store"),
+            kind: text(row, "kind"),
+            endpoint: text(row, "endpoint"),
+            region: text(row, "region"),
+            bucket: text(row, "bucket"),
+            prefix: text(row, "prefix"),
+            addressing: text(row, "addressing"),
+            settings: text(row, "settings"),
+            credentials: text(row, "credentials"),
+            tables: grid.number(row, "tables").unwrap_or(0),
+            opened: grid.flag(row, "opened").unwrap_or(false),
+            supported: grid.flag(row, "supported").unwrap_or(true),
         })
         .collect()
 }
