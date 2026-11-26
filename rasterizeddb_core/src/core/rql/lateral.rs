@@ -1587,7 +1587,8 @@ fn joined_cut(
         }
         let mut mapping: Vec<(String, String)> = Vec::new();
         for (_, column) in references.iter().filter(|(qualifier, _)| same_name(qualifier, name)) {
-            let real = columns.iter().find(|c| c.eq_ignore_ascii_case(column))?;
+            // By its exact spelling first: two columns may differ in case.
+            let real = columns.iter().find(|c| *c == column).or_else(|| columns.iter().find(|c| c.eq_ignore_ascii_case(column)))?;
             let carried = format!("rdbj{index}_{}", real.to_ascii_lowercase());
             if own.iter().any(|c| c.eq_ignore_ascii_case(&carried)) || mapping.iter().any(|(_, other)| *other == carried) {
                 return None;
