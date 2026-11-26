@@ -399,3 +399,65 @@ async fn the_related_items_statement_runs_its_subqueries_for_the_tagged() {
     assert_eq!(rows[2][1].as_deref(), Some("3.500000"));
     assert_eq!(crate::core::rql::lateral::test_hooks::take_narrowed_copies(ALIAS_RI), 0);
 }
+
+/// One distinct tuple of outer values (a point lookup, or several outer
+/// rows sharing the value the item reads): the item is a constant, built
+/// once and joined as an item that reads nothing outside is, with no keyed
+/// relation and no copy of the outer item. A product page's base query paid
+/// 4 ms an item for those. The answers are the general path's.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_outer_tuple_is_a_constant_item() {
+    use crate::core::rql::lateral::test_hooks::take_constants;
+    const ALIAS_ONE: &str = "oone";
+    let db = db().await;
+    let mut s = session(&db);
+    let (customers, orders) = ("con_customers", "con_orders");
+    fill(&db, &mut s, customers, orders, false).await;
+    let q = |rest: &str| {
+        format!(
+            "SELECT {ALIAS_ONE}.id, (SELECT COUNT(*) FROM {orders} o WHERE o.customer_id = {ALIAS_ONE}.id), \
+             (SELECT SUM(amount) FROM {orders} o WHERE o.customer_id = {ALIAS_ONE}.id) FROM {customers} {ALIAS_ONE} {rest}"
+        )
+    };
+    // A customer with orders, and one with none (a count of 0, a NULL sum:
+    // the row is kept).
+    for id in [5i64, 299] {
+        let sql = q(&format!("WHERE {ALIAS_ONE}.id = {id}"));
+        take_constants(ALIAS_ONE);
+        let pg = parsed(pg_rows(&db, &mut s, &sql).await);
+        assert_eq!(take_constants(ALIAS_ONE), 2, "{sql}");
+        let native = parsed(native_rows(&db, &sql).await);
+        assert_eq!(take_constants(ALIAS_ONE), 2, "{sql}");
+        assert_eq!(pg, want(std::iter::once(id)), "{sql}");
+        assert_eq!(native, pg, "{sql}");
+    }
+    // Two tuples: the general path, as before.
+    let sql = q(&format!("WHERE {ALIAS_ONE}.id IN (5, 6)"));
+    take_constants(ALIAS_ONE);
+    assert_eq!(parsed(pg_rows(&db, &mut s, &sql).await), want([5i64, 6].into_iter()));
+    assert_eq!(take_constants(ALIAS_ONE), 0);
+
+    // Several outer rows, one value read: each row gets the item's row; a
+    // LIMIT 1 item without one (NULL), and with a select list of its own.
+    let orders_of_5: Vec<i64> = (1..=ORDERS).filter(|o| owner(*o) == 5).collect();
+    let sql = format!(
+        "SELECT {ALIAS_ONE}.id, (SELECT c.name FROM {customers} c WHERE c.id = {ALIAS_ONE}.customer_id LIMIT 1), \
+         (SELECT c.name FROM {customers} c WHERE c.id = {ALIAS_ONE}.customer_id AND c.id > 1000 LIMIT 1) \
+         FROM {orders} {ALIAS_ONE} WHERE {ALIAS_ONE}.customer_id = 5 ORDER BY {ALIAS_ONE}.id"
+    );
+    take_constants(ALIAS_ONE);
+    let rows = pg_rows(&db, &mut s, &sql).await;
+    assert_eq!(take_constants(ALIAS_ONE), 2);
+    assert_eq!(rows.len(), orders_of_5.len());
+    for (row, id) in rows.iter().zip(&orders_of_5) {
+        assert_eq!(row, &vec![Some(id.to_string()), Some("c5".to_string()), None], "{sql}");
+    }
+
+    // A scalar subquery of more than one row is still PostgreSQL's 21000.
+    let sql = format!(
+        "SELECT {ALIAS_ONE}.id, (SELECT o.amount FROM {orders} o WHERE o.customer_id = {ALIAS_ONE}.id) FROM {customers} {ALIAS_ONE} \
+         WHERE {ALIAS_ONE}.id = 5"
+    );
+    let e = super::owner_tests::send(&db, &mut s, &sql).await.expect_err("more than one row");
+    assert!(e.contains("more than one row returned by a subquery used as an expression"), "{e}");
+}

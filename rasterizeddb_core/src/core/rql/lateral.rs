@@ -1219,6 +1219,54 @@ pub(crate) async fn materialize(
                     ));
                 }
                 let types = column_types(database, alias, relation, columns).await?;
+                // One distinct tuple of the outer values it reads: every
+                // outer row the statement can keep has it, so the item is
+                // the same rows for each: a constant, built once and joined
+                // as an item that reads nothing outside is. No keyed
+                // relation, no key expression to join on, and so no copy of
+                // the outer item to carry one: a point lookup with a
+                // select-list subquery paid 4 ms for those, where the
+                // lookup and the subquery take 0.14 ms each.
+                if let [tuple] = tuples.as_slice() {
+                    let constants: Vec<String> = tuple
+                        .iter()
+                        .zip(&types)
+                        .map(|(v, t)| match v {
+                            Some(v) => format!("CAST({} AS {t})", quote(v)),
+                            None => format!("CAST(NULL AS {t})"),
+                        })
+                        .collect();
+                    let constant = Item { body: substitute(&item.body, alias, columns, &constants), ..item.clone() };
+                    let built =
+                        crate::core::rql::cte::materialize_query(&constant.body, &constant.alias, &current, database, tx).await?;
+                    temps.push(built.clone());
+                    let renamed = rename_columns(&constant, &built, database, tx).await?;
+                    if renamed != built {
+                        temps.push(renamed.clone());
+                    }
+                    let scalar = item.alias.starts_with(crate::core::rql::correlated::ALIAS_PREFIX);
+                    let cross = as_cross_join(&constant);
+                    // Its rows counted once, for both: a correlated scalar
+                    // subquery's item is one row at most (PostgreSQL's
+                    // 21000), and a `LEFT … ON true` over none keeps the
+                    // outer rows with NULLs.
+                    if scalar || (cross.is_some() && item.form == Form::Left) {
+                        let rows = row_count(&renamed, database, tx).await?;
+                        if scalar && rows > 1 {
+                            return Err("more than one row returned by a subquery used as an expression".to_string());
+                        }
+                        if rows == 0 && cross.is_some() && item.form == Form::Left {
+                            insert_null_row(&renamed, database, tx).await?;
+                        }
+                    }
+                    #[cfg(test)]
+                    test_hooks::record_constant(alias);
+                    current = match cross {
+                        Some(cross) => rewrite(&current, &cross, &renamed, None, &[]),
+                        None => rewrite(&current, &constant, &renamed, None, &[]),
+                    };
+                    continue;
+                }
                 let described = null_body(database, &item, outer).await?;
                 let mut runs = Vec::with_capacity(tuples.len());
                 for tuple in &tuples {
@@ -1603,15 +1651,24 @@ fn reads_only(term: &str, alias: &str) -> bool {
 
 /// A row of NULLs in `relation` when it has no rows.
 async fn fill_one_null_row(relation: &str, database: &Arc<Database>, tx: TxId) -> Result<(), String> {
-    let (rows, _) = crate::core::rql::executor::run_query_rows_scaled(&format!("SELECT count(*) FROM {relation}"), database, tx).await?;
-    let empty = rows
-        .first()
-        .and_then(|r| r.columns.first())
-        .and_then(|c| <[u8; 8]>::try_from(c.data.into_slice()).ok())
-        .is_some_and(|b| i64::from_le_bytes(b) == 0);
-    if !empty {
+    if row_count(relation, database, tx).await? != 0 {
         return Ok(());
     }
+    insert_null_row(relation, database, tx).await
+}
+
+/// The rows `relation` holds.
+async fn row_count(relation: &str, database: &Arc<Database>, tx: TxId) -> Result<i64, String> {
+    let (rows, _) = crate::core::rql::executor::run_query_rows_scaled(&format!("SELECT count(*) FROM {relation}"), database, tx).await?;
+    rows.first()
+        .and_then(|r| r.columns.first())
+        .and_then(|c| <[u8; 8]>::try_from(c.data.into_slice()).ok())
+        .map(i64::from_le_bytes)
+        .ok_or_else(|| format!("LATERAL: {relation} cannot be counted"))
+}
+
+/// One row of NULLs into `relation`.
+async fn insert_null_row(relation: &str, database: &Arc<Database>, tx: TxId) -> Result<(), String> {
     let labels = crate::core::rql::cte::relation_labels(relation, database)
         .ok_or_else(|| format!("LATERAL: {relation} cannot be read"))?;
     let nulls = vec!["NULL"; labels.len()].join(", ");
@@ -1834,6 +1891,18 @@ pub(crate) mod test_hooks {
     /// The narrowed copies recorded for `alias`, forgotten.
     pub(crate) fn take_narrowed_copies(alias: &str) -> usize {
         NARROWED.lock().unwrap().as_mut().and_then(|m| m.remove(alias)).unwrap_or(0)
+    }
+
+    /// The items built as a constant (one outer tuple), by outer alias.
+    static CONSTANTS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+    pub(crate) fn record_constant(alias: &str) {
+        *CONSTANTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(alias.to_string()).or_default() += 1;
+    }
+
+    /// The constant items recorded for `alias`, forgotten.
+    pub(crate) fn take_constants(alias: &str) -> usize {
+        CONSTANTS.lock().unwrap().as_mut().and_then(|m| m.remove(alias)).unwrap_or(0)
     }
 
     pub(crate) fn record_runs(relation: &str, runs: usize) {
