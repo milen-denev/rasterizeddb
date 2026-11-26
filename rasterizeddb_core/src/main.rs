@@ -228,6 +228,19 @@ struct Args {
     #[arg(long = "wal-prealloc-kb", alias = "wal_prealloc_kb", value_name = "KB")]
     wal_prealloc_kb: Option<u64>,
 
+    /// Start past a damaged log, losing what follows the damage (one start; never saved)
+    ///
+    /// A log with a record that fails its checks and whole records after it
+    /// is damage, not the torn tail of a crash, and the start refuses: it
+    /// names the log, the byte and the commits after it. With this flag the
+    /// records before the damage are replayed and everything from it on is
+    /// dropped, and an ERROR says what went. Writes after the damage that had
+    /// reached the data files may survive in part, so the result is not a
+    /// clean point in time: check it. Restore from a backup instead when the
+    /// commits matter; copy the log first.
+    #[arg(long = "wal-truncate-damaged", alias = "wal_truncate_damaged")]
+    wal_truncate_damaged: bool,
+
     /// Logging level off, error, warn, info, debug, trace (default: error)
     #[arg(long = "log-level", alias = "log_level", value_name = "LEVEL")]
     log_level: Option<LevelFilter>,
@@ -1647,6 +1660,10 @@ fn main() -> std::io::Result<()> {
     // Before any database opens too: the first record of each log reads it.
     if let Some(kb) = args.wal_prealloc_kb {
         let _ = rasterizeddb_core::WAL_PREALLOC_BYTES.set(kb.saturating_mul(1024));
+    }
+    // And this, which recovery reads as each log opens.
+    if args.wal_truncate_damaged {
+        rasterizeddb_core::core::wal::set_truncate_damaged(true);
     }
     #[cfg(feature = "query_stats")]
     if let Some(spec) = args.query_stats.as_deref() {

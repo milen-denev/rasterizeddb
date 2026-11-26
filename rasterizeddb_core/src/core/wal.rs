@@ -365,6 +365,10 @@ pub struct RecoveryStats {
     /// kept after recovery must not see these ids handed out again: its
     /// commit markers would mark the new transactions committed.
     pub last_txn: u64,
+    /// Damage past the trusted records that this start dropped, with
+    /// everything after it (`--wal-truncate-damaged`); without the flag such
+    /// a log refuses to replay.
+    pub dropped_after_damage: Option<LogDamage>,
 }
 
 /// Trailing bytes a scan did not validate, given the log's length and how far
@@ -694,6 +698,219 @@ fn only_zeros(path: &Path, from: u64, to: u64) -> io::Result<bool> {
         left -= got as u64;
     }
     Ok(true)
+}
+
+/// A record that fails its checks with whole records after it: damage to
+/// the file, not the torn tail a crash leaves. See [`find_mid_log_damage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogDamage {
+    /// Where the damage starts: the end of the records replay can trust.
+    pub at: u64,
+    /// Where the first whole record after it starts.
+    pub resumes_at: u64,
+    /// Whole records from `resumes_at` on, read up to the next record that
+    /// fails (a second damaged span is not looked past).
+    pub records_after: u64,
+    /// Commit markers among them: the transactions replay would lose.
+    pub committed_after: u64,
+    /// The lowest and highest commit sequence those markers carry.
+    pub lsn_after: Option<(u64, u64)>,
+}
+
+impl LogDamage {
+    /// What the damage would cost, for the refusal and for the ERROR a
+    /// truncating start logs.
+    fn describe(&self, path: &Path) -> String {
+        let lsn = match self.lsn_after {
+            Some((lo, hi)) if lo == hi => format!(", commit sequence {lo}"),
+            Some((lo, hi)) => format!(", commit sequences {lo} to {hi}"),
+            None => String::new(),
+        };
+        format!(
+            "WAL {} is damaged at byte {}: the bytes there are not a whole record, and {} whole record{} \
+             follow from byte {} ({} committed transaction{}{})",
+            path.display(),
+            self.at,
+            self.records_after,
+            if self.records_after == 1 { "" } else { "s" },
+            self.resumes_at,
+            self.committed_after,
+            if self.committed_after == 1 { "" } else { "s" },
+            lsn
+        )
+    }
+}
+
+/// Whether a start may replay a damaged log up to its damage and drop the
+/// rest (`--wal-truncate-damaged`). Off: such a log refuses to open. One
+/// start's decision, never saved.
+static TRUNCATE_DAMAGED: AtomicBool = AtomicBool::new(false);
+
+/// Sets [`TRUNCATE_DAMAGED`]: before any database opens.
+pub fn set_truncate_damaged(on: bool) {
+    TRUNCATE_DAMAGED.store(on, Ordering::Release);
+}
+
+/// The record at `at` if one starts there whole: magic, this build's version,
+/// a plausible length, its payload inside the file and its CRC matching.
+/// Its header and length (header included), else `None`.
+fn record_at(file: &File, at: u64, total: u64) -> io::Result<Option<(RecordHeader, u64)>> {
+    use crate::core::pos_io::FileExt;
+    if at + HEADER_LEN as u64 > total {
+        return Ok(None);
+    }
+    let mut header = [0u8; HEADER_LEN];
+    file.read_exact_at(&mut header, at)?;
+    if u32::from_le_bytes(header[0..4].try_into().unwrap()) != RECORD_MAGIC || header[4] != FORMAT_VERSION {
+        return Ok(None);
+    }
+    let len = u32::from_le_bytes(header[32..36].try_into().unwrap()) as u64;
+    if len as usize > MAX_RECORD_PAYLOAD || at + HEADER_LEN as u64 + len > total {
+        return Ok(None);
+    }
+    let mut payload = vec![0u8; len as usize];
+    file.read_exact_at(&mut payload, at + HEADER_LEN as u64)?;
+    let mut digest = CRC.digest();
+    digest.update(&header[0..HEADER_CRC_LEN]);
+    digest.update(&payload);
+    if digest.finalize() != u32::from_le_bytes(header[HEADER_CRC_LEN..HEADER_LEN].try_into().unwrap()) {
+        return Ok(None);
+    }
+    Ok(Some((
+        RecordHeader {
+            flags: header[5],
+            txn: u64::from_le_bytes(header[8..16].try_into().unwrap()),
+            file_id: u64::from_le_bytes(header[16..24].try_into().unwrap()),
+            offset: u64::from_le_bytes(header[24..32].try_into().unwrap()),
+        },
+        HEADER_LEN as u64 + len,
+    )))
+}
+
+/// The first offset past `from` where a whole record starts, if any.
+fn next_whole_record(file: &File, from: u64, total: u64) -> io::Result<Option<u64>> {
+    use crate::core::pos_io::FileExt;
+    const WINDOW: u64 = 1024 * 1024;
+    let magic = RECORD_MAGIC.to_le_bytes();
+    let mut pos = from + 1;
+    let mut buf = vec![0u8; WINDOW as usize + 3];
+    while pos + HEADER_LEN as u64 <= total {
+        // Three bytes of overlap, so a magic across two windows is seen.
+        let want = (total - pos).min(WINDOW + 3) as usize;
+        file.read_exact_at(&mut buf[..want], pos)?;
+        for i in 0..want.saturating_sub(3) {
+            if buf[i..i + 4] == magic && record_at(file, pos + i as u64, total)?.is_some() {
+                return Ok(Some(pos + i as u64));
+            }
+        }
+        pos += WINDOW;
+    }
+    Ok(None)
+}
+
+/// Whether `[from, to)` reads as a crash left it rather than as damage.
+///
+/// A power cut can keep a later page of the log and drop an earlier one, so a
+/// whole record past a gap is a crash too (see the module docs). But a dropped
+/// page reads back as it was at the last sync, and past the records replay
+/// trusts that is the log's zero padding, or nothing (a file read back
+/// shorter, the length short of the record, is a short read, not this). So a
+/// crash's gap starts with zeros, or holds a whole 512-byte block of them
+/// (a sector: the smallest unit a drive writes). Damage (a flipped bit, a
+/// foreign write) leaves bytes that are neither.
+fn gap_is_a_crash(file: &File, from: u64, to: u64) -> io::Result<bool> {
+    use crate::core::pos_io::FileExt;
+    const SECTOR: u64 = 512;
+    // The bytes from `from` to the end of its sector (or `to`).
+    let head_end = ((from / SECTOR + 1) * SECTOR).min(to);
+    let mut head = vec![0u8; (head_end - from) as usize];
+    file.read_exact_at(&mut head, from)?;
+    if head.iter().all(|b| *b == 0) {
+        return Ok(true);
+    }
+    let mut block = [0u8; SECTOR as usize];
+    let mut at = from.next_multiple_of(SECTOR);
+    while at + SECTOR <= to {
+        file.read_exact_at(&mut block, at)?;
+        if block.iter().all(|b| *b == 0) {
+            return Ok(true);
+        }
+        at += SECTOR;
+    }
+    Ok(false)
+}
+
+/// Damage in the log at `path` past its first `valid` bytes, of `total`: a
+/// record that fails its checks with a whole record after it, in a gap no
+/// crash could have left. `None` for a log that ends at `valid`, or in zeros,
+/// or in the torn tail of a crash: nothing past it then was ever committed
+/// to anyone, and replay drops it as it always has.
+pub(crate) fn find_mid_log_damage(path: &Path, valid: u64, total: u64) -> io::Result<Option<LogDamage>> {
+    if valid >= total || only_zeros(path, valid, total)? {
+        return Ok(None);
+    }
+    let file = File::open(path)?;
+    let Some(resumes_at) = next_whole_record(&file, valid, total)? else {
+        return Ok(None);
+    };
+    if gap_is_a_crash(&file, valid, resumes_at)? {
+        return Ok(None);
+    }
+    let mut damage = LogDamage {
+        at: valid,
+        resumes_at,
+        records_after: 0,
+        committed_after: 0,
+        lsn_after: None,
+    };
+    let mut at = resumes_at;
+    while let Some((header, len)) = record_at(&file, at, total)? {
+        damage.records_after += 1;
+        if header.flags & FLAG_COMMIT != 0 {
+            damage.committed_after += 1;
+            let lsn = header.offset;
+            damage.lsn_after = Some(match damage.lsn_after {
+                Some((lo, hi)) => (lo.min(lsn), hi.max(lsn)),
+                None => (lsn, lsn),
+            });
+        }
+        at += len;
+    }
+    Ok(Some(damage))
+}
+
+/// Refuses replay of a log with [`LogDamage`], unless this start was told to
+/// drop it (`--wal-truncate-damaged`), and then says what it drops.
+fn refuse_mid_log_damage(path: &Path, valid: u64, total: u64) -> io::Result<Option<LogDamage>> {
+    let Some(damage) = find_mid_log_damage(path, valid, total)? else {
+        return Ok(None);
+    };
+    let allowed = TRUNCATE_DAMAGED.load(Ordering::Acquire);
+    #[cfg(test)]
+    let allowed = allowed || test_hooks::TRUNCATE_DAMAGED.with(|f| f.get());
+    if allowed {
+        log::error!(
+            "{}. --wal-truncate-damaged: replaying the records before byte {} and dropping everything from it on, \
+             those transactions included. Writes among them that had reached the data files may survive in part, \
+             so the database is not a clean point in time: check it before relying on it",
+            damage.describe(path),
+            damage.at
+        );
+        return Ok(Some(damage));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{}. A crash cannot leave that: it leaves zeros where a write did not land, or a short file. \
+             Replaying only what comes before it would lose those commits without a word, so no record was \
+             replayed and the log was kept as it is. To recover, restore the database from a backup or a \
+             point-in-time copy. Or copy {} somewhere safe and start once with --wal-truncate-damaged: the records \
+             before the damage replay and the rest is dropped, though writes after it that had reached the data \
+             files may survive in part, so check the data afterwards",
+            damage.describe(path),
+            path.display()
+        ),
+    ))
 }
 
 /// Where the records of the log at `path` end: its length without the zeros
@@ -2874,6 +3091,8 @@ impl Wal {
             }
             valid_bytes = scan.consumed;
         }
+        // Before anything is applied: a refusal leaves the files as they were.
+        stats.dropped_after_damage = refuse_mid_log_damage(path, valid_bytes, total)?;
 
         // Per file, the position of its last committed barrier: its records
         // before that describe a file that was deleted, and the file under
@@ -3199,6 +3418,10 @@ fn write_all_vectored(file: &mut File, mut bufs: &mut [io::IoSlice<'_>]) -> io::
 #[cfg(test)]
 pub(crate) mod test_hooks {
     thread_local! {
+        /// `--wal-truncate-damaged` for recoveries on this thread alone, so
+        /// a test of it does not reach the tests running beside it.
+        pub static TRUNCATE_DAMAGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
         /// Makes the next commit marker written on this thread fail before
         /// touching the file, as a full disk would.
         pub static FAIL_COMMIT_MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -5317,8 +5540,10 @@ mod tests {
         assert_eq!(read_file(&data), b"AAAABBBB");
     }
 
+    /// Damage with a whole record after it (here the damaged record's own
+    /// commit marker) refuses; `--wal-truncate-damaged` replays the prefix.
     #[test]
-    fn stops_at_a_corrupt_record() {
+    fn a_corrupt_record_with_a_whole_one_after_it_refuses() {
         let dir = temp_dir();
         let wal_path = dir.path().join(DEFAULT_WAL_NAME);
         let data = dir.path().join("table.db");
@@ -5336,8 +5561,17 @@ mod tests {
         raw[second_payload] ^= 0xFF;
         std::fs::write(&wal_path, &raw).unwrap();
 
-        let stats = Wal::recover(&wal_path, resolver(data.clone())).unwrap();
+        let e = Wal::recover(&wal_path, resolver(data.clone())).expect_err("the damaged log replayed");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("1 committed transaction"), "{e}");
+        assert!(read_file(&data).is_empty(), "replayed before refusing");
+
+        test_hooks::TRUNCATE_DAMAGED.with(|t| t.set(true));
+        let stats = Wal::recover(&wal_path, resolver(data.clone()));
+        test_hooks::TRUNCATE_DAMAGED.with(|t| t.set(false));
+        let stats = stats.unwrap();
         assert_eq!(stats.applied, 1);
+        assert!(stats.dropped_after_damage.is_some());
         assert_eq!(read_file(&data), b"GOOD");
     }
 
@@ -5358,8 +5592,10 @@ mod tests {
         raw[4] = FORMAT_VERSION.wrapping_add(1);
         std::fs::write(&wal_path, &raw).unwrap();
 
-        let stats = Wal::recover(&wal_path, resolver(data.clone())).unwrap();
-        assert_eq!(stats.applied, 0);
+        // Its commit marker follows whole, so the start refuses rather than
+        // silently applying nothing.
+        let e = Wal::recover(&wal_path, resolver(data.clone())).expect_err("the log replayed");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         assert!(read_file(&data).is_empty());
     }
 
@@ -7681,5 +7917,176 @@ mod prealloc_tests {
         }
         assert!(kept_logs > 0 && discarded_logs > 0, "kept {kept_logs}, discarded {discarded_logs}");
         assert!(partial > 0, "no image kept some unsynced records and lost others");
+    }
+}
+
+/// A record that fails its checks with whole records after it is damage, and
+/// recovery refuses it; at the end of the log it is a torn tail and is
+/// dropped, as always. `--wal-truncate-damaged` replays up to the damage.
+#[cfg(test)]
+mod mid_log_damage_tests {
+    use super::*;
+
+    const CHUNK: u64 = 64 * 1024;
+    /// One `log_and_commit` of four bytes: a record and its marker.
+    const FRAME: u64 = (2 * HEADER_LEN + 4) as u64;
+
+    /// A log of `n` committed frames in `dir`, padded, and its data file.
+    fn log_of(dir: &Path, n: u32) -> (PathBuf, PathBuf, u64) {
+        let path = dir.join(DEFAULT_WAL_NAME);
+        let data = dir.join("t.db");
+        std::fs::write(&data, b"").unwrap();
+        let id = file_id_for_name("t.db");
+        let wal = Wal::open(&path).unwrap();
+        wal.set_prealloc(CHUNK);
+        for i in 0..n {
+            wal.log_and_commit(id, 4 * i as u64, &(i + 1).to_le_bytes()).unwrap();
+        }
+        drop(wal);
+        (path, data, id)
+    }
+
+    /// Frame `i`'s four payload bytes overwritten with 0xFF: damage, as a
+    /// flipped sector or a foreign write leaves it, never zeros.
+    fn damage_frame(path: &Path, i: u32) {
+        use crate::core::pos_io::FileExt;
+        let file = File::options().write(true).open(path).unwrap();
+        file.write_all_at(&[0xFF; 4], i as u64 * FRAME + HEADER_LEN as u64).unwrap();
+    }
+
+    fn replayed(data: &Path) -> Vec<u32> {
+        std::fs::read(data)
+            .unwrap()
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    fn truncating<T>(f: impl FnOnce() -> T) -> T {
+        test_hooks::TRUNCATE_DAMAGED.with(|t| t.set(true));
+        let out = f();
+        test_hooks::TRUNCATE_DAMAGED.with(|t| t.set(false));
+        out
+    }
+
+    #[test]
+    fn damage_followed_by_whole_records_refuses_and_says_what_follows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, data, _) = log_of(dir.path(), 5);
+        damage_frame(&path, 1);
+        let before = std::fs::read(&path).unwrap();
+
+        let e = Wal::recover(&path, |_| Some(data.clone())).expect_err("a damaged log replayed");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        let msg = e.to_string();
+        for want in [
+            path.display().to_string(),
+            format!("damaged at byte {FRAME}"),
+            // The damaged frame's own marker and the three frames after it.
+            "7 whole records".to_string(),
+            "4 committed transactions".to_string(),
+            "--wal-truncate-damaged".to_string(),
+            "backup".to_string(),
+        ] {
+            assert!(msg.contains(&want), "{want:?} missing from: {msg}");
+        }
+        assert!(replayed(&data).is_empty(), "records were replayed before the refusal");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "the refused log was changed");
+
+        // And a start refuses with it: the log is kept for a restore.
+        let e = open_and_recover(&dir.path().to_string_lossy()).err().expect("the start went on");
+        assert!(e.to_string().contains("damaged at byte"), "{e}");
+        remove_for(&dir.path().to_string_lossy());
+        assert_eq!(std::fs::read(&path).unwrap(), before, "a refused start changed the log");
+    }
+
+    #[test]
+    fn the_flag_replays_up_to_the_damage_and_drops_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+        let (path, data, id) = log_of(dir.path(), 5);
+        damage_frame(&path, 2);
+
+        let (wal, stats) = truncating(|| open_and_recover(&dir_str)).expect("the flag did not start it");
+        assert_eq!(replayed(&data), vec![1, 2], "not exactly the records before the damage");
+        let dropped = stats.dropped_after_damage.expect("what was dropped is not reported");
+        assert_eq!((dropped.at, dropped.resumes_at), (2 * FRAME, 2 * FRAME + HEADER_LEN as u64 + 4));
+        assert_eq!((dropped.records_after, dropped.committed_after), (5, 3));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0, "the damaged log was kept");
+
+        // It goes on from there, and the next start is an ordinary one.
+        wal.log_and_commit(id, 0, &9u32.to_le_bytes()).unwrap();
+        remove_for(&dir_str);
+        drop(wal);
+        let (_, stats) = open_and_recover(&dir_str).expect("the next start refused");
+        assert_eq!(stats.dropped_after_damage, None);
+        assert_eq!(replayed(&data)[0], 9);
+        remove_for(&dir_str);
+    }
+
+    #[test]
+    fn a_damaged_last_record_is_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, data, _) = log_of(dir.path(), 3);
+        // The last frame's record; its marker after it then commits nothing
+        // that replay could trust, and nothing whole follows but the marker.
+        // Damaged in the marker itself: nothing whole follows at all.
+        use crate::core::pos_io::FileExt;
+        let file = File::options().write(true).open(&path).unwrap();
+        file.write_all_at(&[0xFF; 4], 3 * FRAME - 8).unwrap();
+        drop(file);
+
+        let stats = Wal::recover(&path, |_| Some(data.clone())).expect("a torn tail refused");
+        assert_eq!(stats.dropped_after_damage, None);
+        assert_eq!(stats.valid_bytes, 3 * FRAME - HEADER_LEN as u64);
+        assert_eq!(replayed(&data), vec![1, 2], "the frames before the tail");
+        assert!(stats.truncated_tail > 0);
+    }
+
+    #[test]
+    fn a_torn_tail_of_garbage_recovers_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, data, _) = log_of(dir.path(), 3);
+        // Half a record's header and some bytes: a write the crash cut.
+        use crate::core::pos_io::FileExt;
+        let file = File::options().write(true).open(&path).unwrap();
+        let mut torn = RECORD_MAGIC.to_le_bytes().to_vec();
+        torn.extend_from_slice(&[FORMAT_VERSION, 0, 0, 0, 7, 7, 7]);
+        file.write_all_at(&torn, 3 * FRAME).unwrap();
+        drop(file);
+
+        let stats = Wal::recover(&path, |_| Some(data.clone())).expect("a torn tail refused");
+        assert_eq!(stats.dropped_after_damage, None);
+        assert_eq!(replayed(&data), vec![1, 2, 3]);
+        assert!(stats.truncated_tail > 0);
+    }
+
+    /// A power cut that dropped the page under a record and kept one after
+    /// it: the gap reads as the zeros it was at the last sync. That is a
+    /// crash, however much is whole past it.
+    #[test]
+    fn a_dropped_page_with_records_past_it_is_still_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        std::fs::write(&data, b"").unwrap();
+        let id = file_id_for_name("t.db");
+        let wal = Wal::open(&path).unwrap();
+        wal.set_prealloc(CHUNK);
+        // Records over 4 KiB, so frames span pages.
+        for i in 0..6u32 {
+            wal.log_and_commit(id, 8192 * i as u64, &vec![i as u8 + 1; 6000]).unwrap();
+        }
+        drop(wal);
+        // The second 4 KiB page back to zeros: frame 0's tail, and so its
+        // record fails, with frames 1.. whole after it.
+        use crate::core::pos_io::FileExt;
+        let file = File::options().write(true).open(&path).unwrap();
+        file.write_all_at(&[0u8; 4096], 4096).unwrap();
+        drop(file);
+
+        let stats = Wal::recover(&path, |_| Some(data.clone())).expect("a crash image refused");
+        assert_eq!(stats.dropped_after_damage, None);
+        assert_eq!(stats.valid_bytes, 0);
     }
 }
