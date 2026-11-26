@@ -845,7 +845,7 @@ fn binds_name(body: &str, name: &str) -> bool {
 }
 
 /// Where the body's top-level `FROM` list ends.
-fn clause_end_of_from(body: &str) -> usize {
+pub(crate) fn clause_end_of_from(body: &str) -> usize {
     let mut end = body.len();
     for word in ["WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "UNION", "INTERSECT", "EXCEPT", "WINDOW", "FETCH"] {
         if let Some(at) = find_keyword(body, word, 0) {

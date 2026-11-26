@@ -695,7 +695,16 @@ async fn relation_columns(
     // relation: copied as plain TEXT, `WHERE name = 'BOB'` over the copy
     // compared bytes, and a LATERAL over a CI-filtered table (its outer
     // table is copied to carry the join key) silently lost the row.
-    let collations: Vec<Option<&'static str>> = {
+    //
+    // A body of several relations keeps them as well, each plain column's
+    // read from the relation it names (`joined_collations`). That is also a
+    // body with a select-list subquery, which is a join by the time it is
+    // copied: left plain, `FROM (SELECT d.id, (SELECT …) …) AS q ORDER BY
+    // q.id` sorted a SQL Server uniqueidentifier by its bytes, while the
+    // same rows through a one-table body sorted in its own order.
+    let collations: Vec<Option<&'static str>> = if crate::core::rql::join::statement_has_join(query) {
+        joined_collations(query, labels, database)
+    } else {
         let source = source_relation_fields(query, database);
         declared_fields
             .iter()
@@ -2113,6 +2122,172 @@ fn source_relation_fields(query: &str, database: &Arc<Database>) -> Option<Vec<S
         return None;
     }
     Some(database.schema_view(name)?.schema().fields.to_vec())
+}
+
+/// The collation of each of `query`'s outputs (`labels`), where it reads
+/// several relations: that of the column an item names (`q.c`, `c`, with or
+/// without `AS`), in the relation of the `FROM` it belongs to, and of each
+/// column a `q.*` or `*` stands for. `None` for anything else: an
+/// expression, a relation with no schema here, a name two relations could
+/// own, a set operation.
+fn joined_collations(query: &str, labels: &[String], database: &Arc<Database>) -> Vec<Option<&'static str>> {
+    use crate::core::rql::join::find_keyword;
+    let none = vec![None; labels.len()];
+    if ["UNION", "INTERSECT", "EXCEPT"].iter().any(|word| find_keyword(query, word, 0).is_some()) {
+        return none;
+    }
+    let Some(list) = select_list_of(query) else {
+        return none;
+    };
+    let items = crate::core::sql_scan::split_top_level(list, b',');
+    let Some(from) = find_keyword(query, "FROM", 0) else {
+        return none;
+    };
+    let from_end = crate::core::rql::lateral::clause_end_of_from(query);
+    if from_end <= from {
+        return none;
+    }
+    // Every item of the FROM, or an unqualified name is not looked for: one
+    // the walk stopped before could own it too.
+    let clause = &query[from + "FROM".len()..from_end];
+    let expected = crate::core::sql_scan::split_top_level(clause, b',').len().max(1) + {
+        let (mut count, mut at) = (0usize, 0usize);
+        while let Some(found) = find_keyword(clause, "JOIN", at) {
+            count += 1;
+            at = found + "JOIN".len();
+        }
+        count
+    };
+    let relations: Vec<(String, Option<Vec<SchemaField>>)> = crate::core::rql::lateral::items_before(query, from_end)
+        .into_iter()
+        .map(|(alias, relation)| {
+            let name = relation.trim();
+            let fields = (!name.starts_with('('))
+                .then(|| database.schema_view(name.trim_matches('"')))
+                .flatten()
+                .map(|view| view.schema().fields.to_vec());
+            (alias, fields)
+        })
+        .collect();
+    let whole = relations.len() == expected && relations.iter().all(|(_, fields)| fields.is_some());
+    let collation_of = |field: &SchemaField, fields: &[SchemaField]| -> Option<&'static str> {
+        let strength = crate::core::rql::collation::order_of(&field.name, fields);
+        (!strength.is_binary()).then(|| strength.name())
+    };
+    let in_fields = |fields: &[SchemaField], column: &str| -> Option<Option<&'static str>> {
+        let field = fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))?;
+        Some(collation_of(field, fields))
+    };
+    let owner = |qualifier: &str| -> Option<&[SchemaField]> {
+        let mut owners = relations.iter().filter(|(alias, _)| alias.eq_ignore_ascii_case(qualifier));
+        let (_, fields) = owners.next()?;
+        if owners.next().is_some() {
+            return None;
+        }
+        fields.as_deref()
+    };
+    // A star's columns: the relation's own, in its order, each under the
+    // name the output has at that place (checked below).
+    let starred = |fields: &[SchemaField], out: &mut Vec<(Option<String>, Option<&'static str>)>| {
+        for field in fields.iter().filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name)) {
+            out.push((Some(field.name.clone()), collation_of(field, fields)));
+        }
+    };
+    // Each output: the name a star's column must have there, and the
+    // collation.
+    let mut out: Vec<(Option<String>, Option<&'static str>)> = Vec::with_capacity(labels.len());
+    for (index, item) in items.iter().enumerate() {
+        let item = item.trim();
+        if item == "*" {
+            if !whole {
+                return none;
+            }
+            for (_, fields) in &relations {
+                starred(fields.as_deref().unwrap_or_default(), &mut out);
+            }
+            continue;
+        }
+        if let Some(qualifier) = item.strip_suffix(".*") {
+            let Some(fields) = plain_reference(qualifier.trim()).filter(|(q, _)| q.is_none()).and_then(|(_, name)| owner(&name)) else {
+                return none;
+            };
+            starred(fields, &mut out);
+            continue;
+        }
+        let (expr, _) = crate::core::rql::join::split_expr_alias(item);
+        let mut expr = expr.trim();
+        if index == 0 {
+            // The list's `DISTINCT` / `ALL` before its first item.
+            for word in ["DISTINCT ", "ALL "] {
+                if expr.get(..word.len()).is_some_and(|head| head.eq_ignore_ascii_case(word)) {
+                    expr = expr[word.len()..].trim();
+                }
+            }
+        }
+        let collation = plain_reference(expr).and_then(|(qualifier, column)| match qualifier {
+            Some(qualifier) => in_fields(owner(&qualifier)?, &column)?,
+            None if whole => {
+                let mut found = relations.iter().filter_map(|(_, fields)| in_fields(fields.as_deref()?, &column));
+                let only = found.next()?;
+                if found.next().is_some() {
+                    return None;
+                }
+                only
+            }
+            None => None,
+        });
+        out.push((None, collation));
+    }
+    if out.len() != labels.len() {
+        return none;
+    }
+    out.into_iter()
+        .zip(labels)
+        .map(|((name, collation), label)| match name {
+            Some(name) if !name.eq_ignore_ascii_case(label) => None,
+            _ => collation,
+        })
+        .collect()
+}
+
+/// `expr` as a column reference and nothing else: `c` or `q.c`, either
+/// part quoted or a plain word. Its qualifier and column, unquoted.
+fn plain_reference(expr: &str) -> Option<(Option<String>, String)> {
+    let bytes = expr.as_bytes();
+    let mut parts: Vec<String> = Vec::new();
+    let mut at = 0usize;
+    loop {
+        match bytes.get(at)? {
+            b'"' => {
+                let end = crate::core::sql_scan::quoted_end(bytes, at, b'"');
+                let inner = expr.get(at + 1..end.checked_sub(1)?)?;
+                if inner.is_empty() || inner.contains('"') {
+                    return None;
+                }
+                parts.push(inner.to_string());
+                at = end;
+            }
+            b if b.is_ascii_alphabetic() || *b == b'_' || *b >= 0x80 => {
+                let start = at;
+                while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_' || bytes[at] >= 0x80) {
+                    at += 1;
+                }
+                parts.push(expr[start..at].to_string());
+            }
+            _ => return None,
+        }
+        match bytes.get(at) {
+            None => break,
+            Some(b'.') => at += 1,
+            Some(_) => return None,
+        }
+    }
+    let column = parts.pop()?;
+    match parts.len() {
+        0 => Some((None, column)),
+        1 => Some((parts.pop(), column)),
+        _ => None,
+    }
 }
 
 fn declared_fields_among(

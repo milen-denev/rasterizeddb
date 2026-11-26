@@ -252,3 +252,92 @@ async fn a_pushed_list_compares_as_the_join_does() {
         assert_eq!(both(&db, &mut s, &statement("")).await, both(&db, &mut s, &statement(" ORDER BY r.id LIMIT 1000")).await);
     }
 }
+
+/// A derived table whose body reads more than one relation (a join, or a
+/// select-list subquery, which is joined as a LATERAL item) keeps each
+/// column's collation in its copy. Copied as a plain `uuid`, EF Core's
+/// parent query (`FROM (SELECT TOP … two subqueries …) AS d6 LEFT JOIN … ORDER
+/// BY d6.Id`) came back in byte order while its split child query, whose
+/// body is one table, came in SQL Server's: EF Core pairs the two by
+/// position, and the children went to the wrong parents. A text column
+/// lost its case-insensitive comparison the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_of_several_relations_keeps_its_collations() {
+    let db = crate::replication::test_support::in_memory_database().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE dc_products (id uuid COLLATE rdb_guid_order NOT NULL PRIMARY KEY, name text COLLATE rdb_ci NOT NULL, n INT NOT NULL)")
+        .await;
+    ok(&db, &mut s, "CREATE TABLE dc_prices (id INT NOT NULL PRIMARY KEY, product_id uuid COLLATE rdb_guid_order NOT NULL, price INT NOT NULL)").await;
+    ok(&db, &mut s, "CREATE TABLE dc_images (id INT NOT NULL PRIMARY KEY, product_id uuid COLLATE rdb_guid_order NOT NULL, ord INT NOT NULL, url TEXT)")
+        .await;
+    // SQL Server orders a uniqueidentifier by its last six bytes first:
+    // ascending `k` here, which is descending by the bytes.
+    const N: i64 = 12;
+    let id = |k: i64| format!("{:08x}-0000-0000-0000-{k:012}", 0xff00 - k);
+    let rows: Vec<String> = (1..=N).map(|k| format!("('{}', 'Name{k}', {k})", id(k))).collect();
+    ok(&db, &mut s, &format!("INSERT INTO dc_products (id, name, n) VALUES {}", rows.join(", "))).await;
+    let rows: Vec<String> = (1..=N).map(|k| format!("({k}, '{}', {})", id(k), k * 10)).collect();
+    ok(&db, &mut s, &format!("INSERT INTO dc_prices (id, product_id, price) VALUES {}", rows.join(", "))).await;
+    let rows: Vec<String> = (1..=N * 2).map(|i| format!("({i}, '{}', {}, 'u{i}')", id((i + 1) / 2), i % 2)).collect();
+    ok(&db, &mut s, &format!("INSERT INTO dc_images (id, product_id, ord, url) VALUES {}", rows.join(", "))).await;
+    let ns = |rows: &Rows, at: usize| -> Vec<i64> { rows.iter().map(|r| r[at].as_deref().unwrap().parse().unwrap()).collect() };
+    let ascending: Vec<i64> = (2..=N).filter(|k| k % 2 == 0).collect();
+
+    // The parent: select-list subqueries inside the derived table.
+    let parent = "SELECT d6.id, d6.n, d6.c, d8.url FROM (SELECT d.id, d.n, (SELECT d3.price FROM dc_prices AS d3 WHERE d.id = d3.product_id \
+                  ORDER BY d3.id LIMIT 1) AS c, (SELECT COUNT(*) FROM dc_images AS d4 WHERE d.id = d4.product_id) AS c0 FROM dc_products AS d \
+                  WHERE d.n % 2 = 0 LIMIT 10) AS d6 LEFT JOIN (SELECT d7.url, d7.product_id FROM (SELECT d2.url, d2.product_id, \
+                  ROW_NUMBER() OVER (PARTITION BY d2.product_id ORDER BY d2.ord) AS rn FROM dc_images AS d2) AS d7 WHERE d7.rn <= 1) AS d8 \
+                  ON d6.id = d8.product_id ORDER BY d6.id";
+    let got = pg_rows(&db, &mut s, parent).await;
+    assert_eq!(ns(&got, 1), ascending, "{got:?}");
+    for row in &got {
+        let k: i64 = row[1].as_deref().unwrap().parse().unwrap();
+        assert_eq!(row[2], cell(k * 10), "{row:?}");
+        assert_eq!(row[3], cell(format!("u{}", k * 2)), "{row:?}");
+    }
+    // Its split child, a body of one table: the same products, in the same
+    // order.
+    let child = "SELECT d11.id, d11.n, d14.id FROM (SELECT d.id, d.n FROM dc_products AS d WHERE d.n % 2 = 0 LIMIT 10) AS d11 INNER JOIN \
+                 (SELECT d10.id, d10.ord, d10.product_id FROM dc_images AS d10) AS d14 ON d11.id = d14.product_id ORDER BY d11.id, d14.ord";
+    let children = pg_rows(&db, &mut s, child).await;
+    let mut parents_of_children = ns(&children, 1);
+    parents_of_children.dedup();
+    assert_eq!(parents_of_children, ascending, "{children:?}");
+    assert_eq!(got.iter().map(|r| r[0].clone()).collect::<Vec<_>>(), {
+        let mut ids: Vec<Option<String>> = children.iter().map(|r| r[0].clone()).collect();
+        ids.dedup();
+        ids
+    });
+
+    // A body that is a join itself, ordered by either side's key, with the
+    // key renamed, and descending.
+    let joined = "(SELECT a.id, b.product_id AS pid, a.n, a.name FROM dc_products AS a INNER JOIN dc_prices AS b ON a.id = b.product_id) AS dj";
+    let all: Vec<i64> = (1..=N).collect();
+    for (order, want) in [
+        ("dj.id", all.clone()),
+        ("dj.pid", all.clone()),
+        ("dj.id DESC", all.iter().rev().copied().collect::<Vec<_>>()),
+    ] {
+        let sql = format!("SELECT dj.n FROM {joined} ORDER BY {order}");
+        assert_eq!(ns(&pg_rows(&db, &mut s, &sql).await, 0), want, "{sql}");
+    }
+    // Its text column compares without case, as the table's does.
+    let sql = format!("SELECT dj.n FROM {joined} WHERE dj.name = 'NAME7'");
+    assert_eq!(ns(&pg_rows(&db, &mut s, &sql).await, 0), [7], "{sql}");
+    // A star's columns keep theirs; an expression named as a column is not
+    // taken for it.
+    let starred = "(SELECT a.*, b.price FROM dc_products AS a INNER JOIN dc_prices AS b ON a.id = b.product_id) AS dj";
+    let sql = format!("SELECT dj.n FROM {starred} WHERE dj.name = 'name3' OR dj.price >= 110 ORDER BY dj.id DESC");
+    assert_eq!(ns(&pg_rows(&db, &mut s, &sql).await, 0), [12, 11, 3], "{sql}");
+    let sql = "SELECT dj.n FROM (SELECT a.n, 'Name' || a.n::text AS name, b.price FROM dc_products AS a INNER JOIN dc_prices AS b \
+               ON a.id = b.product_id) AS dj WHERE dj.name = 'name3' OR dj.name = 'Name4'";
+    assert_eq!(ns(&pg_rows(&db, &mut s, sql).await, 0), [4], "{sql}");
+    // A CTE of a join is copied the same way.
+    let sql = "WITH dw AS (SELECT a.id, a.n, b.price FROM dc_products AS a INNER JOIN dc_prices AS b ON a.id = b.product_id WHERE b.price > 90) \
+               SELECT dw.n FROM dw ORDER BY dw.id";
+    assert_eq!(ns(&pg_rows(&db, &mut s, sql).await, 0), [10, 11, 12], "{sql}");
+    // MIN / MAX over the copy are the order's.
+    let sql = format!("SELECT MIN(dj.id), MAX(dj.id) FROM {joined}");
+    assert_eq!(pg_rows(&db, &mut s, &sql).await, vec![vec![cell(id(1)), cell(id(N))]], "{sql}");
+}

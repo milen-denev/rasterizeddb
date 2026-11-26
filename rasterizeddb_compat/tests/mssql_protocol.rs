@@ -1902,6 +1902,76 @@ async fn tiberius_guid_order_grouped() {
     assert_eq!(g(&r[1]), [Some(a.to_string()), Some(b.to_string())]);
 }
 
+/// EF Core's split query: the parent (a derived table with select-list
+/// subqueries, LEFT JOINed to each product's first image) and its child (the
+/// same products INNER JOINed to their images) come in the same
+/// uniqueidentifier order, SQL Server's. EF Core pairs the two by position.
+/// The parent's derived table lost the column's order in its copy (its
+/// subqueries make its body a join) and came sorted by the bytes: the
+/// children went to the wrong parents, with no error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_split_query_parent_and_child_agree_on_guid_order() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    // SQL Server's order is ascending `k`; the bytes' is descending.
+    let id = |k: u32| format!("{:08x}-0000-0000-0000-{k:012}", 0xff00 - k);
+    batch(
+        &mut c,
+        "CREATE TABLE [P] ([Id] uniqueidentifier NOT NULL PRIMARY KEY, [Name] nvarchar(50) NOT NULL, [N] int NOT NULL); \
+         CREATE TABLE [Price] ([Id] int PRIMARY KEY, [ProductId] uniqueidentifier NOT NULL, [Price] int NOT NULL); \
+         CREATE TABLE [Image] ([Id] int PRIMARY KEY, [ProductId] uniqueidentifier NOT NULL, [ListingOrder] int NOT NULL, [Url] nvarchar(50) NOT NULL)",
+    )
+    .await
+    .unwrap();
+    const N: u32 = 8;
+    let products: Vec<String> = (1..=N).map(|k| format!("('{}', N'Name{k}', {k})", id(k))).collect();
+    let prices: Vec<String> = (1..=N).map(|k| format!("({k}, '{}', {})", id(k), k * 10)).collect();
+    let images: Vec<String> = (1..=N * 2).map(|i| format!("({i}, '{}', {}, N'u{i}')", id((i + 1) / 2), i % 2)).collect();
+    batch(
+        &mut c,
+        &format!(
+            "INSERT INTO [P] VALUES {}; INSERT INTO [Price] VALUES {}; INSERT INTO [Image] VALUES {}",
+            products.join(", "),
+            prices.join(", "),
+            images.join(", ")
+        ),
+    )
+    .await
+    .unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT [d6].[Id], [d6].[N], [d6].[c], [d8].[Url] FROM (\
+             SELECT TOP(10) [d].[Id], [d].[N], (SELECT TOP(1) [d3].[Price] FROM [Price] AS [d3] WHERE [d].[Id] = [d3].[ProductId]) AS [c], \
+             (SELECT COUNT(*) FROM [Image] AS [d4] WHERE [d].[Id] = [d4].[ProductId]) AS [c0] FROM [P] AS [d] WHERE [d].[N] > 2) AS [d6] \
+         LEFT JOIN (SELECT [d7].[Url], [d7].[ProductId] FROM (SELECT [d2].[Url], [d2].[ProductId], \
+             ROW_NUMBER() OVER(PARTITION BY [d2].[ProductId] ORDER BY [d2].[ListingOrder]) AS [row] FROM [Image] AS [d2]) AS [d7] \
+             WHERE [d7].[row] <= 1) AS [d8] ON [d6].[Id] = [d8].[ProductId] ORDER BY [d6].[Id]; \
+         SELECT [d14].[Url], [d11].[Id], [d14].[Id] FROM (SELECT TOP(10) [d].[Id] FROM [P] AS [d] WHERE [d].[N] > 2) AS [d11] \
+         INNER JOIN (SELECT [d10].[Url], [d10].[Id], [d10].[ListingOrder], [d10].[ProductId] FROM [Image] AS [d10]) AS [d14] \
+             ON [d11].[Id] = [d14].[ProductId] ORDER BY [d11].[Id], [d14].[ListingOrder]; \
+         SELECT [q].[N] FROM (SELECT [d].[N], [d].[Name], (SELECT TOP(1) [d3].[Price] FROM [Price] AS [d3] WHERE [d].[Id] = [d3].[ProductId]) AS [c] \
+             FROM [P] AS [d]) AS [q] WHERE [q].[Name] = N'NAME5'",
+    )
+    .await
+    .unwrap();
+    let want: Vec<String> = (3..=N).map(id).collect();
+    let parents: Vec<String> = r[0].iter().map(|r| r.get::<uuid::Uuid, _>(0).unwrap().to_string()).collect();
+    assert_eq!(parents, want);
+    for (row, k) in r[0].iter().zip(3..=N) {
+        assert_eq!(row.get::<i32, _>(1), Some(k as i32));
+        assert_eq!(row.get::<i32, _>(2), Some(k as i32 * 10));
+        assert_eq!(row.get::<&str, _>(3), Some(format!("u{}", k * 2).as_str()));
+    }
+    // The child's parents, in the order they come: the parent's.
+    let mut of_children: Vec<String> = r[1].iter().map(|r| r.get::<uuid::Uuid, _>(1).unwrap().to_string()).collect();
+    assert_eq!(of_children.len(), 2 * want.len());
+    of_children.dedup();
+    assert_eq!(of_children, parents);
+    // And a text column of such a derived table compares as its table's
+    // does (case-insensitively here).
+    assert_eq!(r[2].iter().map(|r| r.get::<i32, _>(0).unwrap()).collect::<Vec<_>>(), [5]);
+}
+
 /// NULLs sort first ascending and last descending, as SQL Server's (NULL is
 /// its least value); the engine put them last ascending. And a sort by a
 /// nullable `datetime2(7)` then a uniqueidentifier with TOP took the server
