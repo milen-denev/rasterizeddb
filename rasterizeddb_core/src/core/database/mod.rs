@@ -1572,6 +1572,11 @@ pub struct Database {
     /// port). Built lazily: a database that never uses it allocates nothing.
     #[cfg(feature = "kv_cache")]
     pub kv_cache: crate::core::kv_cache::KvCacheHandle,
+
+    /// The message broker (`BROKER …` statements and the broker ports).
+    /// Opened lazily: a database that never uses it opens nothing.
+    #[cfg(feature = "broker")]
+    pub broker: crate::core::broker::BrokerHandle,
 }
 
 impl Drop for Database {
@@ -2076,6 +2081,13 @@ impl Database {
                 let handle = crate::core::kv_cache::KvCacheHandle::new((!in_memory).then_some(location));
                 handle.load_snapshot_if_present();
                 // Its writes travel on this database's replication stream.
+                handle.attach_replication(replication.clone());
+                handle
+            },
+            #[cfg(feature = "broker")]
+            broker: {
+                let handle = crate::core::broker::BrokerHandle::new((!in_memory).then_some(location), name);
+                // Its effects travel on this database's replication stream.
                 handle.attach_replication(replication.clone());
                 handle
             },

@@ -1685,6 +1685,13 @@ fn catalogue_guard(state: &SessionState, stmt: &str) -> Option<(&'static str, St
     if state.system_catalog || state.system_statement {
         return None;
     }
+    #[cfg(feature = "broker")]
+    if !state.principal.superuser
+        && crate::core::broker::ddl_policy() == crate::core::broker::DdlPolicy::Superuser
+        && crate::core::broker::sql::is_broker_ddl(stmt)
+    {
+        return Some(("42501", "creating and removing broker objects needs a superuser here".to_string()));
+    }
     crate::core::rql::privileges::catalog_refusal(stmt)
 }
 
@@ -6214,6 +6221,10 @@ async fn describe_resolved(
         QueryPurpose::KvCache(sql) => {
             return Ok(Some((crate::core::kv_cache::sql::result_fields(sql), true)));
         }
+        #[cfg(feature = "broker")]
+        QueryPurpose::Broker(sql) => {
+            return Ok(Some((crate::core::broker::sql::result_fields(sql), true)));
+        }
         QueryPurpose::Replication(sql) => {
             return Ok(Some((
                 crate::replication::sql::structured_fields(sql)
@@ -10272,6 +10283,8 @@ pub(crate) fn result_description(
         // the command.
         #[cfg(feature = "kv_cache")]
         QueryPurpose::KvCache(sql) => Some(crate::core::kv_cache::sql::result_fields(sql)),
+        #[cfg(feature = "broker")]
+        QueryPurpose::Broker(sql) => Some(crate::core::broker::sql::result_fields(sql)),
         // A set operation whose first branch has no FROM: described by that
         // branch's constants (`no_from`), as `describe_query` describes it;
         // its columns are widened with the others below.

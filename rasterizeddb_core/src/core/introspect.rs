@@ -4052,7 +4052,7 @@ fn reset_query_stats() -> Result<String, String> {
 /// Two of these are only ever constructed by the statement-statistics rows, so
 /// a build without that feature has them declared and unused.
 #[cfg_attr(not(feature = "query_stats"), allow(dead_code))]
-enum Cell {
+pub(crate) enum Cell {
     Text(String),
     Number(u64),
     Flag(bool),
@@ -4063,9 +4063,14 @@ enum Cell {
     /// A signed 64-bit integer, for the one figure here that is a hash rather
     /// than a count and so uses the whole range including the negative half.
     Signed(i64),
+    /// Raw bytes, sent as `bytea` (the broker's message keys and values).
+    Bytes(Vec<u8>),
+    Null,
 }
 
-fn row(cells: &[Cell]) -> Row {
+/// One result row of cells; shared with the other surfaces that answer SQL
+/// with rows of their own (the broker's `BROKER` statements).
+pub(crate) fn row(cells: &[Cell]) -> Row {
     let mut columns: crate::core::row::row::RowColumns = SmallVec::new();
     for (index, cell) in cells.iter().enumerate() {
         let (bytes, column_type): (Vec<u8>, DbType) = match cell {
@@ -4077,6 +4082,8 @@ fn row(cells: &[Cell]) -> Row {
             Cell::Flag(b) => (vec![u8::from(*b)], DbType::BOOL),
             Cell::Real(v) => (v.to_le_bytes().to_vec(), DbType::F64),
             Cell::Signed(v) => (v.to_le_bytes().to_vec(), DbType::I64),
+            Cell::Bytes(b) => (b.clone(), DbType::BYTEA),
+            Cell::Null => (Vec::new(), DbType::NULL),
         };
         let mut block = MEMORY_POOL.acquire(bytes.len());
         block.into_slice_mut().copy_from_slice(&bytes);
@@ -4106,7 +4113,7 @@ fn percent(part: u64, whole: u64) -> f64 {
     part as f64 * 100.0 / whole as f64
 }
 
-fn rows(rows: Vec<Row>) -> Vec<u8> {
+pub(crate) fn rows(rows: Vec<Row>) -> Vec<u8> {
     let mut out = vec![2u8];
     for row in &rows {
         row.extend_serialized(&mut out);
@@ -4114,7 +4121,7 @@ fn rows(rows: Vec<Row>) -> Vec<u8> {
     out
 }
 
-fn failure(message: &str) -> Vec<u8> {
+pub(crate) fn failure(message: &str) -> Vec<u8> {
     let mut out = vec![3u8];
     out.extend_from_slice(message.as_bytes());
     out

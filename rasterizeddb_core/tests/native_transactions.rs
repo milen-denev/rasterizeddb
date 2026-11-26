@@ -10,6 +10,9 @@
 
 // The native listener runs on a unix socket.
 #![cfg(unix)]
+// As the library and the server binary: proving this file's server future
+// `Send` runs past the default 128 since the database gained the broker.
+#![recursion_limit = "256"]
 
 use std::future::Future;
 use std::time::Duration;

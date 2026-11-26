@@ -12,6 +12,9 @@
 //! Every wait is bounded, and every test's directory is a `TempDir`.
 
 #![cfg(unix)]
+// As the library and the server binary: proving this file's server future
+// `Send` runs past the default 128 since the database gained the broker.
+#![recursion_limit = "256"]
 
 use std::future::Future;
 use std::sync::{Arc as StdArc, Mutex};
