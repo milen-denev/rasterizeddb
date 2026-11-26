@@ -750,12 +750,13 @@ async fn a_correlated_subquery_in_a_grouped_select_answers_as_postgresql_does() 
         .await
         .expect_err("refused");
     assert_eq!(sqlstate_of(&e), "0A000", "{e}");
-    // Refused, not guessed: ordered by the value without selecting it
-    // (PostgreSQL: 3, NULL, 2, 1), which a grouped join cannot.
-    let e = rows(&db, &mut s, "SELECT k FROM gt GROUP BY k ORDER BY (SELECT max(v) FROM gu WHERE gu.k = gt.k) NULLS FIRST, k")
-        .await
-        .expect_err("refused");
-    assert_eq!(sqlstate_of(&e), "0A000", "{e}");
+    // Ordered by the value without selecting it: computed beside the key
+    // over a derived table (`distinct_on::rewrite_grouped_order`), where a
+    // grouped join alone refused it. PostgreSQL's answer.
+    assert_eq!(
+        one(&db, &mut s, "SELECT k FROM gt GROUP BY k ORDER BY (SELECT max(v) FROM gu WHERE gu.k = gt.k) NULLS FIRST, k").await,
+        vec![r(&[Some("3")]), r(&[None]), r(&[Some("2")]), r(&[Some("1")])]
+    );
     // Refused, not guessed: an aggregate compared with the value in one
     // HAVING term (PostgreSQL: (1,2),(2,1),(3,1),(NULL,1)).
     let e = rows(
