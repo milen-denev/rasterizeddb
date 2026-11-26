@@ -260,10 +260,11 @@ jobs:
       # rasterizeddb_router (the client's `sharding` feature, the engine) and
       # rasterizeddb_raft (the engine's `sharding_raft`) are published too:
       # crates.io resolves optional dependencies as well, so without them the
-      # client and the engine cannot be packaged at all.
-      - name: cargo package (the seven published crates)
+      # client and the engine cannot be packaged at all. rasterizeddb_mq (the
+      # client's and the engine's `broker` feature) for the same reason.
+      - name: cargo package (the eight published crates)
         run: >
           cargo package --locked
-          -p rastcp -p rasterizeddb_router -p rasterizeddb_raft
+          -p rastcp -p rasterizeddb_mq -p rasterizeddb_router -p rasterizeddb_raft
           -p rasterizeddb_client_derive -p rasterizeddb_client
           -p rasterizeddb_core -p rasterizeddb_embedded
