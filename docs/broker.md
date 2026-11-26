@@ -316,8 +316,64 @@ Other members of the group have the rest.
   and `verify_password`. Strict tenant mode applies through
   `policy_hooks::tenancy().admit` with `protocol = "broker"`, `"kafka"`,
   `"amqp"` or `"mqtt"`.
-- Creating, deleting or altering topics, exchanges and bindings needs a
-  superuser, or a role with the `broker_admin` setting.
+- Who may create topics, queues and exchanges is `--broker-ddl`: `any`
+  (the default, any role that logged in) or `superuser`.
+- Using them is the database's own privileges (`broker::acl`, kept in
+  `__rdb_acl` beside the tables'): an object is owned by the role that
+  created it, and everyone else needs a grant.
+
+  ```sql
+  GRANT PRODUCE, CONSUME ON TOPIC orders TO app;
+  GRANT CONSUME ON QUEUE jobs TO worker;          -- a queue is a topic
+  GRANT PUBLISH, BIND ON EXCHANGE events TO app;
+  REVOKE ALL ON ALL TOPICS FROM PUBLIC;
+  ALTER TOPIC orders OWNER TO billing;
+  ```
+
+  | privilege | on | lets a role |
+  |---|---|---|
+  | `PRODUCE` | topic | write to it, directly or through the default exchange |
+  | `CONSUME` | topic | fetch, subscribe, pop, purge, list offsets, commit, manage its subscriptions |
+  | `PUBLISH` | exchange | publish through it |
+  | `BIND` | exchange | bind a topic to it (which also needs `PRODUCE` on the topic) |
+
+  Altering or deleting an object, and granting on it, are its owner's.
+  `BROKER SHOW GRANTS [ON TOPIC|QUEUE|EXCHANGE name]` lists them: columns
+  `object_type` (`topic`, `queue`, `exchange`), `object`, `owner`,
+  `grantee` (a role or `PUBLIC`), `privilege` (`OWNER` for the owner's
+  own row, else `PRODUCE`, `CONSUME`, `PUBLISH` or `BIND`), `grantor`,
+  `grantable`. A grant `ON ALL TOPICS` is made per topic that exists then,
+  as PostgreSQL's `ALL TABLES IN SCHEMA` is, so it shows as theirs.
+  Names are taken verbatim, as `BROKER` statements take them (case and dots
+  kept; quote with `"` or `'`).
+- What each protocol does with a refusal:
+
+  | | refusal |
+  |---|---|
+  | native | `Permission` error on the request; `TOPIC_LIST` leaves out what the role cannot see |
+  | SQL | `permission denied for topic x` / `must be owner of topic x`; `BROKER SHOW` leaves out what the role cannot see |
+  | Kafka | `TOPIC_AUTHORIZATION_FAILED` per topic; metadata leaves out unseen topics, as Kafka does without DESCRIBE |
+  | AMQP | channel closed with 403 `ACCESS_REFUSED` |
+  | MQTT | `PUBLISH` (and a will) needs `PUBLISH` on `amq.mqtt`, `SUBSCRIBE` needs `BIND` on it; refused publish acked `0x87` (5.0) or dropped (3.1.1); refused filter `0x87`/`0x80` |
+
+- Fails closed: an object with no owner row is a superuser's alone, and an
+  ACL that cannot be read refuses. The built-in exchanges (`amq.*`) are the
+  database owner's, with `PUBLISH` and `BIND` granted to PUBLIC (written
+  when the database's relations are given owners), so AMQP and MQTT work
+  for every role until an administrator revokes that.
+- Objects that live and die with one connection have no rows: an AMQP
+  exclusive queue (its connection's alone), an MQTT clean session, and an
+  MQTT `$share` group's queue. A persistent MQTT session is its creator's:
+  another role connecting with its client id is refused (`0x87` / `5`).
+- A connection reads the ACL once and keeps its decisions until the
+  catalogue's generation moves, so a check on the produce path is a hash
+  lookup, and a `GRANT` or `REVOKE` reaches every open connection at its
+  next request. A native subscription is stopped at its next credit, ack or
+  commit; an AMQP or MQTT consumer already delivering keeps its
+  subscription until it reconnects.
+- Not covered yet: grants per MQTT topic filter (a role may publish to all
+  of `amq.mqtt` or none of it), and owners for subscriptions (a role with
+  `CONSUME` on a topic manages all its subscriptions).
 - `--broker-auth trust` is refused on anything but loopback, and on a unix
   socket that admits others (the same rule as `--kv-auth`).
 - TLS uses `pgwire::tls_acceptor`, with the PostgreSQL port's certificate.

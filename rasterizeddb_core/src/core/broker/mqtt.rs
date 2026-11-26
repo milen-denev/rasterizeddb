@@ -40,6 +40,7 @@ use rasterizeddb_mq::wire::{self, Binding, Durability, QueueConfig, Range, Topic
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
+use super::acl::{self, Access, Kind, Need};
 use super::partition::Partition;
 use super::sub::Subscription;
 use super::{Broker, BrokerError};
@@ -456,6 +457,11 @@ struct Conn {
     aliases: HashMap<u16, String>,
     waiting: Vec<Waiting>,
     connected: bool,
+    /// Who the connection is and what it may use (`acl`): publishing needs
+    /// PUBLISH on `amq.mqtt`, subscribing BIND on it, and a persistent
+    /// session is its creator's (another role's CONNECT with its client id
+    /// is refused).
+    access: Access,
 }
 
 impl Conn {
@@ -484,6 +490,7 @@ impl Conn {
             aliases: HashMap::new(),
             waiting: Vec::new(),
             connected: false,
+            access: Access::new("", false),
         }
     }
 
@@ -570,6 +577,13 @@ impl Conn {
         let flags = first & 0x0f;
         if !self.connected && kind != CONNECT {
             return Err(End::Protocol("the first packet must be CONNECT"));
+        }
+        if self.connected && matches!(kind, PUBLISH | SUBSCRIBE) {
+            if let Err(e) = self.access.refresh(&self.shared.database, &self.shared.main).await {
+                log::warn!("mqtt: closing {}'s connection: {}", self.client, e.message);
+                self.disconnect(out, 0x87, "not authorized");
+                return Err(End::Protocol("the privilege catalogue could not be read"));
+            }
         }
         let mut r = In { b: body };
         let m = |e: Malformed| End::Protocol(e.0);
@@ -710,11 +724,25 @@ impl Conn {
                 refuse(out, 4, 0x86, self.version);
                 return Err(End::Protocol("no user name or password"));
             };
-            if let Err(e) = listen::login(&self.shared.database, &self.shared.main, &u, &p, "mqtt").await {
-                let (v3, v5) = if matches!(e, listen::LoginError::Denied) { (4, 0x86) } else { (5, 0x87) };
-                refuse(out, v3, v5, self.version);
-                return Err(End::Protocol("authentication failed"));
+            match listen::login(&self.shared.database, &self.shared.main, &u, &p, "mqtt").await {
+                Ok(superuser) => self.access = Access::new(&u, superuser),
+                Err(e) => {
+                    let (v3, v5) = if matches!(e, listen::LoginError::Denied) { (4, 0x86) } else { (5, 0x87) };
+                    refuse(out, v3, v5, self.version);
+                    return Err(End::Protocol("authentication failed"));
+                }
             }
+        } else {
+            self.access = Access::unrestricted("");
+        }
+        if self.access.refresh(&self.shared.database, &self.shared.main).await.is_err() {
+            refuse(out, 5, 0x87, self.version);
+            return Err(End::Protocol("the privilege catalogue could not be read"));
+        }
+        // A will is a publish, made later on the role's behalf.
+        if self.will.is_some() && !self.access.may(Kind::Exchange, EXCHANGE, Need::Publish) {
+            refuse(out, 5, 0x87, self.version);
+            return Err(End::Protocol("the will may not be published"));
         }
         let mut assigned = None;
         if client.is_empty() {
@@ -724,6 +752,13 @@ impl Conn {
             }
             client = format!("rdb-{}-{}", self.id, super::now_us());
             assigned = Some(client.clone());
+        }
+        // Another role's persistent session is not this one's to take over
+        // (nor to read what waits in it).
+        let queue = queue_name(&client);
+        if self.access.has_owner(Kind::Topic, &queue) && !self.access.may(Kind::Topic, &queue, Need::Own) {
+            refuse(out, 5, 0x87, self.version);
+            return Err(End::Protocol("the client id is another role's session"));
         }
         self.client = client.clone();
         self.persistent = if self.version == 5 { session_expiry > 0 } else { !clean };
@@ -735,24 +770,34 @@ impl Conn {
             }
         }
         let broker = self.shared.broker.clone();
-        let queue = queue_name(&client);
         let existed = broker.queue(&queue).is_ok();
+        let owned = self.access.has_owner(Kind::Topic, &queue);
+        let mut dropped = false;
         if clean && existed {
-            let _ = broker.delete_topic(&queue, true);
+            dropped |= broker.delete_topic(&queue, true).unwrap_or(false);
         }
         let durability = if self.persistent { self.shared.config.durability } else { Durability::Memory };
         let qc = QueueConfig { durability, ack_timeout_ms: u32::MAX, ..QueueConfig::default() };
-        if let Err(e) = broker.declare_queue(&queue, qc, true) {
+        let created = match broker.declare_queue_reporting(&queue, qc, true) {
+            Ok((_, created)) => created,
             // A queue left with another durability (the session changed
             // kind): start it over.
-            if e.code == wire::Code::Mismatch {
-                let _ = broker.delete_topic(&queue, true);
+            Err(e) if e.code == wire::Code::Mismatch => {
+                dropped |= broker.delete_topic(&queue, true).unwrap_or(false);
                 let qc = QueueConfig { durability, ack_timeout_ms: u32::MAX, ..QueueConfig::default() };
-                broker.declare_queue(&queue, qc, true).map_err(|_| End::Protocol("could not open the session"))?;
-            } else {
+                broker.declare_queue_reporting(&queue, qc, true).map_err(|_| End::Protocol("could not open the session"))?.1
+            }
+            Err(_) => {
                 refuse(out, 3, 0x88, self.version);
                 return Err(End::Protocol("could not open the session"));
             }
+        };
+        // A persistent session is its role's; a clean one is gone with its
+        // connection and leaves no rows (one per connection otherwise).
+        if created && self.persistent {
+            acl::created(&self.shared.database, &self.shared.main, Kind::Topic, &queue, self.access.user()).await;
+        } else if dropped && owned {
+            acl::removed(&self.shared.database, &self.shared.main, Kind::Topic, &queue).await;
         }
         let session_present = existed && !clean;
         if session_present {
@@ -832,6 +877,20 @@ impl Conn {
             return Err(End::Protocol("a PUBLISH topic must be a name, not a filter"));
         }
         let payload = r.b;
+        // Not allowed: acknowledged with "not authorized" (v5), and not
+        // stored; MQTT 3.1.1 has no refusal for a publish, so it is
+        // acknowledged and dropped, as brokers' ACLs do.
+        if !self.access.may(Kind::Exchange, EXCHANGE, Need::Publish) {
+            if qos > 0 {
+                let kind = if qos == 1 { PUBACK } else { PUBREC };
+                let mut b = id.to_be_bytes().to_vec();
+                if self.version == 5 {
+                    b.push(0x87);
+                }
+                packet(out, kind << 4, &b);
+            }
+            return Ok(());
+        }
         if qos == 2 && !self.qos2_in.insert(id) {
             // Sent again before PUBREL: stored already.
             packet(out, PUBREC << 4, &id.to_be_bytes());
@@ -917,6 +976,10 @@ impl Conn {
             let retain_handling = (opts >> 4) & 3;
             if !valid_filter(&filter) {
                 codes.push(if self.version == 5 { 0x8F } else { 0x80 });
+                continue;
+            }
+            if !self.access.may(Kind::Exchange, EXCHANGE, Need::Bind) {
+                codes.push(if self.version == 5 { 0x87 } else { 0x80 });
                 continue;
             }
             let granted = if let Some(rest) = filter.strip_prefix("$share/") {
@@ -1192,7 +1255,7 @@ impl Conn {
         }
         if !clean || self.will.is_some() {
             if let Some((topic, qos, retain, payload, props)) = self.will.take() {
-                if !clean || self.version == 5 {
+                if (!clean || self.version == 5) && self.access.may(Kind::Exchange, EXCHANGE, Need::Publish) {
                     self.store(&topic, qos, retain, &props, &payload, None);
                 }
             }

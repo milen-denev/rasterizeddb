@@ -12,6 +12,7 @@
 //! BROKER POP jobs LIMIT 10;                           -- takes and acks
 //! BROKER SHOW TOPICS | QUEUES | SUBSCRIPTIONS | EXCHANGES | BINDINGS;
 //! BROKER SHOW PARTITIONS orders;
+//! BROKER SHOW GRANTS ON TOPIC orders;                -- owner and grants (`acl`)
 //! BROKER DROP TOPIC IF EXISTS orders;
 //! ```
 //!
@@ -26,6 +27,7 @@ use rasterizeddb_mq::wire::{
     ANY_PARTITION, BY_KEY, Binding, Durability, ExchangeKind, QueueConfig, Start, SubConfig, SubMode, TopicConfig, XMatch,
 };
 
+use super::acl::{Access, Kind, Need};
 use super::{Broker, BrokerError, BrokerHandle};
 use crate::core::db_type::DbType;
 use crate::core::introspect::{Cell, failure, row, rows};
@@ -248,6 +250,7 @@ enum Shape {
     Exchanges,
     Bindings,
     Partitions,
+    Grants,
 }
 
 fn shape(toks: &[Tok]) -> Shape {
@@ -272,6 +275,8 @@ fn shape(toks: &[Tok]) -> Shape {
             Shape::Bindings
         } else if p.kw("PARTITIONS") {
             Shape::Partitions
+        } else if p.kw("GRANTS") {
+            Shape::Grants
         } else {
             Shape::Done
         };
@@ -321,20 +326,55 @@ pub fn result_fields(sql: &str) -> Vec<(String, DbType)> {
         Shape::Exchanges => vec![t("name"), t("type"), b("durable"), i("bindings")],
         Shape::Bindings => vec![t("exchange"), t("topic"), t("key")],
         Shape::Partitions => vec![i("partition"), i("start"), i("next"), i("durable"), i("bytes"), i("segments")],
+        Shape::Grants => vec![t("object_type"), t("object"), t("owner"), t("grantee"), t("privilege"), t("grantor"), b("grantable")],
     }
 }
 
 /// Runs a `BROKER` statement and encodes its rows (or its error) the way the
 /// executor's other surfaces do.
+/// The engine's own callers, which are asked nothing.
 pub async fn execute(sql: &str, handle: &BrokerHandle, superuser: bool) -> Vec<u8> {
+    let mut access = if superuser { Access::unrestricted("") } else { Access::new("", false) };
+    execute_as(sql, handle, &mut access).0
+}
+
+/// What a statement did that its session records in the privilege
+/// catalogue: `(kind, name, true)` for an object it created (its session's
+/// role owns it), `false` for one it deleted (its grants go).
+pub type Effects = Vec<(Kind, String, bool)>;
+
+/// [`execute`] as `access` (a SQL session's role, its rows loaded): each
+/// object the statement touches is checked (`acl`), and what it created or
+/// deleted is returned for the caller to record.
+pub fn execute_as(sql: &str, handle: &BrokerHandle, access: &mut Access) -> (Vec<u8>, Effects) {
+    let mut g = Gate { access, effects: Vec::new() };
     let r = (|| -> Result<Vec<Vec<Cell>>, String> {
         let toks = tokenize(sql)?;
         let broker = handle.get().map_err(|e| e.message)?;
-        run(&broker, toks, superuser)
+        run(&broker, toks, &mut g)
     })();
-    match r {
+    let out = match r {
         Ok(cells) => rows(cells.iter().map(|c| row(c)).collect()),
         Err(message) => failure(&message),
+    };
+    (out, g.effects)
+}
+
+/// A statement's standing, and what it did.
+struct Gate<'a> {
+    access: &'a mut Access,
+    effects: Effects,
+}
+
+impl Gate<'_> {
+    fn topic(&mut self, name: &str, need: Need) -> Result<(), String> {
+        self.access.topic(name, need).map_err(err)
+    }
+
+    /// `Own` on the topic `name` when there is one; a missing one is the
+    /// engine's to report (or nothing, for `IF EXISTS`).
+    fn own_topic(&mut self, broker: &Broker, name: &str) -> Result<(), String> {
+        if broker.topic(name).is_some() { self.topic(name, Need::Own) } else { Ok(()) }
     }
 }
 
@@ -353,7 +393,8 @@ fn ddl(superuser: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn run(broker: &Broker, toks: Vec<Tok>, superuser: bool) -> Result<Vec<Vec<Cell>>, String> {
+fn run(broker: &Broker, toks: Vec<Tok>, g: &mut Gate) -> Result<Vec<Vec<Cell>>, String> {
+    let superuser = g.access.is_superuser();
     let mut p = P { toks, at: 0 };
     let binary = p.kw("BINARY");
     if binary && !(p.peek_kw("READ") || p.peek_kw("POP")) {
@@ -362,10 +403,10 @@ fn run(broker: &Broker, toks: Vec<Tok>, superuser: bool) -> Result<Vec<Vec<Cell>
     if p.kw("CREATE") {
         ddl(superuser)?;
         if p.kw("TOPIC") {
-            return create_topic(broker, &mut p);
+            return create_topic(broker, &mut p, g);
         }
         if p.kw("QUEUE") {
-            return create_queue(broker, &mut p);
+            return create_queue(broker, &mut p, g);
         }
         if p.kw("EXCHANGE") {
             let name = p.name("an exchange name")?;
@@ -384,13 +425,16 @@ fn run(broker: &Broker, toks: Vec<Tok>, superuser: bool) -> Result<Vec<Vec<Cell>
                     p.end()?;
                 }
             }
-            broker.declare_exchange(&name, kind, alternate.as_deref(), durable).map_err(err)?;
+            if broker.declare_exchange_reporting(&name, kind, alternate.as_deref(), durable).map_err(err)? {
+                g.effects.push((Kind::Exchange, name.clone(), true));
+            }
             return Ok(done(format!("exchange {name} ({})", kind.name())));
         }
         if p.kw("SUBSCRIPTION") {
             let name = p.name("a subscription name")?;
             p.expect("ON")?;
             let topic = broker.require_topic(&p.name("a topic name")?).map_err(err)?;
+            g.topic(&topic.name, Need::Consume)?;
             let mut config = SubConfig::default();
             while !p.done() {
                 if p.kw("MODE") {
@@ -422,17 +466,31 @@ fn run(broker: &Broker, toks: Vec<Tok>, superuser: bool) -> Result<Vec<Vec<Cell>
         let if_exists = p.kws(&["IF", "EXISTS"]);
         let name = p.name("a name")?;
         let gone = match what.as_str() {
-            "TOPIC" => broker.delete_topic(&name, if_exists).map_err(err)?,
-            "QUEUE" => {
-                if broker.topic(&name).is_some_and(|t| t.queue.is_none()) {
+            "TOPIC" | "QUEUE" => {
+                if what == "QUEUE" && broker.topic(&name).is_some_and(|t| t.queue.is_none()) {
                     return Err(format!("\"{name}\" is a topic, not a queue"));
                 }
-                broker.delete_topic(&name, if_exists).map_err(err)?
+                g.own_topic(broker, &name)?;
+                let gone = broker.delete_topic(&name, if_exists).map_err(err)?;
+                if gone {
+                    g.effects.push((Kind::Topic, name.clone(), false));
+                }
+                gone
             }
-            "EXCHANGE" => broker.delete_exchange(&name, if_exists).map_err(err)?,
+            "EXCHANGE" => {
+                if broker.exchange_kind(&name).is_some() {
+                    g.access.exchange(&name, Need::Own).map_err(err)?;
+                }
+                let gone = broker.delete_exchange(&name, if_exists).map_err(err)?;
+                if gone {
+                    g.effects.push((Kind::Exchange, name.clone(), false));
+                }
+                gone
+            }
             "SUBSCRIPTION" => {
                 p.expect("ON")?;
                 let topic = broker.require_topic(&p.name("a topic name")?).map_err(err)?;
+                g.topic(&topic.name, Need::Consume)?;
                 broker.delete_subscription(&topic, &name, if_exists).map_err(err)?
             }
             other => return Err(format!("BROKER DROP {other}: expected TOPIC, QUEUE, EXCHANGE or SUBSCRIPTION")),
@@ -444,6 +502,7 @@ fn run(broker: &Broker, toks: Vec<Tok>, superuser: bool) -> Result<Vec<Vec<Cell>
         ddl(superuser)?;
         p.expect("TOPIC")?;
         let name = p.name("a topic name")?;
+        g.own_topic(broker, &name)?;
         p.expect("SET")?;
         let mut changes: Vec<Box<dyn FnOnce(&mut TopicConfig)>> = Vec::new();
         while !p.done() {
@@ -495,6 +554,7 @@ fn run(broker: &Broker, toks: Vec<Tok>, superuser: bool) -> Result<Vec<Vec<Cell>
                 p.end()?;
             }
         }
+        g.access.bind(&b.exchange, &b.topic).map_err(err)?;
         let changed = if unbind { broker.unbind(&b).map_err(err)? } else { broker.bind(b.clone()).map_err(err)? };
         return Ok(done(match (unbind, changed) {
             (false, true) => format!("bound {} to {}", b.exchange, b.topic),
@@ -505,6 +565,7 @@ fn run(broker: &Broker, toks: Vec<Tok>, superuser: bool) -> Result<Vec<Vec<Cell>
     }
     if p.kw("PUBLISH") {
         let topic = broker.require_topic(&p.name("a topic or queue name")?).map_err(err)?;
+        g.topic(&topic.name, Need::Produce)?;
         let (bytes, partition) = message(&mut p)?;
         let mut bytes = bytes;
         let (part, a) = broker
@@ -515,6 +576,7 @@ fn run(broker: &Broker, toks: Vec<Tok>, superuser: bool) -> Result<Vec<Vec<Cell>
     if p.kw("SEND") {
         let exchange = p.name("an exchange name")?;
         let key = p.name("a routing key")?;
+        g.access.publish(&exchange, &key).map_err(err)?;
         let (mut bytes, _) = message(&mut p)?;
         let placed = broker.publish(&exchange, &key, &mut bytes, false).map_err(err)?;
         return Ok(placed
@@ -527,6 +589,7 @@ fn run(broker: &Broker, toks: Vec<Tok>, superuser: bool) -> Result<Vec<Vec<Cell>
     }
     if p.kw("READ") {
         let topic = broker.require_topic(&p.name("a topic name")?).map_err(err)?;
+        g.topic(&topic.name, Need::Consume)?;
         let mut partition: Option<u32> = None;
         let mut from = Start::Earliest;
         let mut limit = 100i64;
@@ -588,6 +651,9 @@ fn run(broker: &Broker, toks: Vec<Tok>, superuser: bool) -> Result<Vec<Vec<Cell>
                 p.end()?;
             }
         }
+        if broker.topic(&name).is_some() {
+            g.topic(&name, Need::Consume)?;
+        }
         let sub = match sub_name {
             Some(s) => {
                 let t = broker.require_topic(&name).map_err(err)?;
@@ -604,7 +670,7 @@ fn run(broker: &Broker, toks: Vec<Tok>, superuser: bool) -> Result<Vec<Vec<Cell>
         return Ok(out);
     }
     if p.kw("SHOW") {
-        return show(broker, &mut p);
+        return show(broker, &mut p, g.access);
     }
     Err("unknown BROKER statement: CREATE, DROP, ALTER, BIND, UNBIND, PUBLISH, SEND, READ, POP or SHOW".into())
 }
@@ -687,7 +753,7 @@ fn record_row(
     ])
 }
 
-fn create_topic(broker: &Broker, p: &mut P) -> Result<Vec<Vec<Cell>>, String> {
+fn create_topic(broker: &Broker, p: &mut P, g: &mut Gate) -> Result<Vec<Vec<Cell>>, String> {
     let if_not_exists = p.kws(&["IF", "NOT", "EXISTS"]);
     let name = p.name("a topic name")?;
     let mut c = TopicConfig::default();
@@ -711,11 +777,14 @@ fn create_topic(broker: &Broker, p: &mut P) -> Result<Vec<Vec<Cell>>, String> {
             p.end()?;
         }
     }
-    let t = broker.create_topic(&name, c, if_not_exists).map_err(err)?;
+    let (t, created) = broker.create_topic_reporting(&name, c, if_not_exists).map_err(err)?;
+    if created {
+        g.effects.push((Kind::Topic, name, true));
+    }
     Ok(vec![vec![Cell::Text(t.name.clone()), Cell::Signed(t.id as i64), Cell::Signed(t.partition_count() as i64)]])
 }
 
-fn create_queue(broker: &Broker, p: &mut P) -> Result<Vec<Vec<Cell>>, String> {
+fn create_queue(broker: &Broker, p: &mut P, g: &mut Gate) -> Result<Vec<Vec<Cell>>, String> {
     let if_not_exists = p.kws(&["IF", "NOT", "EXISTS"]);
     let name = p.name("a queue name")?;
     let mut q = QueueConfig::default();
@@ -737,16 +806,25 @@ fn create_queue(broker: &Broker, p: &mut P) -> Result<Vec<Vec<Cell>>, String> {
             p.end()?;
         }
     }
-    let t = broker.declare_queue(&name, q, if_not_exists).map_err(err)?;
+    let (t, created) = broker.declare_queue_reporting(&name, q, if_not_exists).map_err(err)?;
+    if created {
+        g.effects.push((Kind::Topic, name, true));
+    }
     Ok(vec![vec![Cell::Text(t.name.clone()), Cell::Signed(t.id as i64), Cell::Signed(1)]])
 }
 
-fn show(broker: &Broker, p: &mut P) -> Result<Vec<Vec<Cell>>, String> {
+/// What a role sees is what it holds a privilege on (as `TOPIC_LIST` and
+/// Kafka's metadata show it): a session-ish name such as an MQTT client's
+/// `$mqtt.s.<client id>` is not everyone's to read.
+fn show(broker: &Broker, p: &mut P, access: &mut Access) -> Result<Vec<Vec<Cell>>, String> {
     let n = |v: u64| Cell::Signed(v.min(i64::MAX as u64) as i64);
+    let mut topics = broker.topics();
+    topics.retain(|t| access.sees(Kind::Topic, &t.name));
+    let mut exchanges = broker.exchanges();
+    exchanges.retain(|x| access.sees(Kind::Exchange, &x.0));
     if p.kw("TOPICS") {
         p.end()?;
-        return Ok(broker
-            .topics()
+        return Ok(topics
             .iter()
             .map(|t| {
                 let c = t.config();
@@ -766,7 +844,7 @@ fn show(broker: &Broker, p: &mut P) -> Result<Vec<Vec<Cell>>, String> {
     if p.kw("QUEUES") {
         p.end()?;
         let mut out = Vec::new();
-        for t in broker.topics().iter().filter(|t| t.queue.is_some()) {
+        for t in topics.iter().filter(|t| t.queue.is_some()) {
             let sub = t.subscription(&t.name);
             let (ready, unacked, consumers) = sub.as_ref().map_or((0, 0, 0), |s| {
                 let inflight = s.inflight() as u64;
@@ -780,7 +858,7 @@ fn show(broker: &Broker, p: &mut P) -> Result<Vec<Vec<Cell>>, String> {
         let only = if p.kw("ON") { Some(p.name("a topic name")?) } else { None };
         p.end()?;
         let mut out = Vec::new();
-        for t in broker.topics() {
+        for t in &topics {
             if only.as_deref().is_some_and(|o| o != t.name) {
                 continue;
             }
@@ -803,8 +881,7 @@ fn show(broker: &Broker, p: &mut P) -> Result<Vec<Vec<Cell>>, String> {
     }
     if p.kw("EXCHANGES") {
         p.end()?;
-        return Ok(broker
-            .exchanges()
+        return Ok(exchanges
             .into_iter()
             .map(|(name, kind, durable, b)| {
                 vec![Cell::Text(name), Cell::Text(kind.name().into()), Cell::Flag(durable), n(b.len() as u64)]
@@ -814,15 +891,21 @@ fn show(broker: &Broker, p: &mut P) -> Result<Vec<Vec<Cell>>, String> {
     if p.kw("BINDINGS") {
         p.end()?;
         let mut out = Vec::new();
-        for (_, _, _, bindings) in broker.exchanges() {
-            for b in bindings {
+        for (_, _, _, bindings) in exchanges {
+            for b in bindings.into_iter().filter(|b| access.sees(Kind::Topic, &b.topic)) {
                 out.push(vec![Cell::Text(b.exchange), Cell::Text(b.topic), Cell::Text(b.key)]);
             }
         }
         return Ok(out);
     }
+    if p.kw("GRANTS") {
+        return show_grants(broker, p, access, &topics, &exchanges);
+    }
     if p.kw("PARTITIONS") {
         let t = broker.require_topic(&p.name("a topic name")?).map_err(err)?;
+        if !access.sees(Kind::Topic, &t.name) {
+            return Err(format!("permission denied for topic {}", t.name));
+        }
         p.end()?;
         return Ok(t
             .partitions
@@ -856,4 +939,79 @@ mod tests {
         assert_eq!(duration_ms("7d").unwrap(), 7 * 86_400_000);
         assert_eq!(bytes_of("4gb").unwrap(), 4 << 30);
     }
+}
+
+/// `BROKER SHOW GRANTS [ON TOPIC|QUEUE|EXCHANGE name]`: each object's owner
+/// (a row with privilege `OWNER`) and its grants, one row each, of the
+/// objects the session sees (`topics`, `exchanges`: already filtered). An
+/// `ON ALL TOPICS` grant was made per topic, so it shows as theirs.
+fn show_grants(
+    broker: &Broker,
+    p: &mut P,
+    access: &mut Access,
+    topics: &[std::sync::Arc<super::Topic>],
+    exchanges: &[(String, ExchangeKind, bool, Vec<Binding>)],
+) -> Result<Vec<Vec<Cell>>, String> {
+    use crate::core::rql::privileges;
+    let only = if p.kw("ON") {
+        let what = p.name("TOPIC, QUEUE or EXCHANGE")?.to_ascii_uppercase();
+        let kind = match what.as_str() {
+            "TOPIC" | "QUEUE" => Kind::Topic,
+            "EXCHANGE" => Kind::Exchange,
+            other => return Err(format!("BROKER SHOW GRANTS ON {other}: expected TOPIC, QUEUE or EXCHANGE")),
+        };
+        let name = p.name("a name")?;
+        let there = match kind {
+            Kind::Topic => broker.topic(&name).is_some(),
+            Kind::Exchange => broker.exchange_kind(&name).is_some(),
+        };
+        let word = if kind == Kind::Topic { "topic" } else { "exchange" };
+        if !there {
+            return Err(format!("{word} \"{name}\" does not exist"));
+        }
+        if !access.sees(kind, &name) {
+            return Err(format!("permission denied for {word} {name}"));
+        }
+        Some((kind, name))
+    } else {
+        None
+    };
+    p.end()?;
+    let mut objects: Vec<(Kind, &str, &'static str)> = Vec::new();
+    for t in topics {
+        objects.push((Kind::Topic, &t.name, if t.queue.is_some() { "queue" } else { "topic" }));
+    }
+    for x in exchanges {
+        objects.push((Kind::Exchange, &x.0, "exchange"));
+    }
+    let rows = access.rows();
+    let mut out = Vec::new();
+    for (kind, name, label) in objects {
+        if only.as_ref().is_some_and(|(k, n)| *k != kind || n != name) {
+            continue;
+        }
+        let key = kind.key(name);
+        let owner = privileges::owner_of(rows, &key).unwrap_or("").to_string();
+        let mut grants: Vec<&privileges::AclRow> = rows
+            .iter()
+            .filter(|r| r.relation == key && (r.privilege == "OWNER" || kind.privileges().contains(&r.privilege.as_str())))
+            .collect();
+        // The owner first, then by grantee and privilege.
+        grants.sort_by(|a, b| {
+            (a.privilege != "OWNER", &a.grantee, kind.privileges().iter().position(|p| *p == a.privilege))
+                .cmp(&(b.privilege != "OWNER", &b.grantee, kind.privileges().iter().position(|p| *p == b.privilege)))
+        });
+        for g in grants {
+            out.push(vec![
+                Cell::Text(label.into()),
+                Cell::Text(name.to_string()),
+                Cell::Text(owner.clone()),
+                Cell::Text(if g.grantee == "public" { "PUBLIC".into() } else { g.grantee.clone() }),
+                Cell::Text(g.privilege.clone()),
+                Cell::Text(g.grantor.clone()),
+                Cell::Flag(g.grantable),
+            ]);
+        }
+    }
+    Ok(out)
 }

@@ -27,6 +27,10 @@ async fn resolve_target(database: &Arc<Database>, target: Target, tx: Option<TxI
     let pair = |n: String| (n.clone(), n);
     Ok(Some(match target {
         Target::Other(_) => return Ok(None),
+        Target::Topics(names) => broker_target(database, false, Some(names))?,
+        Target::AllTopics => broker_target(database, false, None)?,
+        Target::Exchanges(names) => broker_target(database, true, Some(names))?,
+        Target::AllExchanges => broker_target(database, true, None)?,
         Target::AllTablesInSchema => {
             let mut all: Vec<String> = database.relation_names().into_iter().filter(|n| !n.starts_with("__")).collect();
             all.extend(crate::core::rql::views::load(database, None, tx).await.unwrap_or_default().into_iter().map(|v| v.name));
@@ -80,6 +84,100 @@ async fn resolve_target(database: &Arc<Database>, target: Target, tx: Option<TxI
             Resolved { keys, valid: privileges::ROUTINE_PRIVILEGES, label: "function" }
         }
     }))
+}
+
+/// A GRANT's or REVOKE's broker objects (`TOPIC`, `QUEUE`, `EXCHANGE`, `ALL
+/// TOPICS`, `ALL EXCHANGES`), each checked to exist. `ALL TOPICS` leaves out
+/// the hidden ones (`$…`, the MQTT front end's sessions and retained
+/// messages), which are granted by name if at all.
+fn broker_target(database: &Arc<Database>, exchange: bool, names: Option<Vec<String>>) -> Result<Resolved, (&'static str, String)> {
+    let (valid, label) = if exchange {
+        (privileges::EXCHANGE_PRIVILEGES, "exchange")
+    } else {
+        (privileges::TOPIC_PRIVILEGES, "topic")
+    };
+    #[cfg(feature = "broker")]
+    {
+        let broker = database.broker.get().map_err(|e| ("XX000", e.message))?;
+        let names = match names {
+            Some(names) => {
+                for n in &names {
+                    let there = if exchange { broker.exchange_kind(n).is_some() } else { broker.topic(n).is_some() };
+                    if !there {
+                        return Err(("42704", format!("{label} \"{n}\" does not exist")));
+                    }
+                }
+                names
+            }
+            None if exchange => broker.exchanges().into_iter().map(|x| x.0).collect(),
+            None => broker.topics().iter().map(|t| t.name.clone()).filter(|n| !n.starts_with('$')).collect(),
+        };
+        let keys = names
+            .into_iter()
+            .map(|n| (if exchange { privileges::exchange_key(&n) } else { privileges::topic_key(&n) }, n))
+            .collect();
+        Ok(Resolved { keys, valid, label })
+    }
+    #[cfg(not(feature = "broker"))]
+    {
+        let _ = (database, valid);
+        match names.and_then(|n| n.into_iter().next()) {
+            Some(n) => Err(("42704", format!("{label} \"{n}\" does not exist"))),
+            None => Ok(Resolved { keys: Vec::new(), valid, label }),
+        }
+    }
+}
+
+/// Whether the broker object an ACL key names (`@topic:x`, `@exchange:x`)
+/// exists; `None` for a key that names no broker object.
+fn broker_object_exists(database: &Arc<Database>, key: &str) -> Option<bool> {
+    let (exchange, name) = if let Some(n) = key.strip_prefix("@topic:") {
+        (false, n)
+    } else {
+        (true, key.strip_prefix("@exchange:")?)
+    };
+    #[cfg(feature = "broker")]
+    {
+        let Ok(broker) = database.broker.get() else { return Some(false) };
+        Some(if exchange { broker.exchange_kind(name).is_some() } else { broker.topic(name).is_some() })
+    }
+    #[cfg(not(feature = "broker"))]
+    {
+        let _ = (database, exchange, name);
+        Some(false)
+    }
+}
+
+/// A `BROKER` statement run as this session's role (`broker::acl`): each
+/// topic and exchange it touches is checked, and what it creates is owned
+/// by the role, recorded before the statement's reply. The owner rows are
+/// written outside the session's transaction: a broker object is not
+/// transactional, and a rollback that took its owner row would leave it
+/// to superusers.
+#[cfg(feature = "broker")]
+pub(super) async fn broker_statement(database: &Arc<Database>, state: &SessionState, sql: &str) -> Vec<u8> {
+    use crate::core::broker::acl::{self, Access};
+    let me = state.principal.name.clone();
+    // A superuser is asked nothing, but is given the rows too:
+    // `BROKER SHOW GRANTS` lists them.
+    let mut access = if state.principal.may_administer() { Access::unrestricted(&me) } else { Access::new(&me, false) };
+    match privileges::load_shared(database, state.current_tx()).await {
+        Ok(rows) => access.set_rows(rows, None),
+        Err(e) => {
+            return crate::core::introspect::failure(&format!(
+                "permission denied: the privilege catalogue could not be read ({e})"
+            ));
+        }
+    }
+    let (out, effects) = crate::core::broker::sql::execute_as(sql, &database.broker, &mut access);
+    for (kind, name, created) in effects {
+        if created {
+            acl::record_created(database, kind, &name, &me).await;
+        } else {
+            acl::record_removed(database, kind, &name).await;
+        }
+    }
+    out
 }
 
 /// Whether `me` may grant or revoke membership in `roles` (R2): a
@@ -471,7 +569,16 @@ where
                 Ok("ALTER DEFAULT PRIVILEGES")
             }
             PrivilegeStatement::OwnerTo { relation, owner } => {
-                if !relation_exists(database, &relation, tx).await {
+                let broker_object = broker_object_exists(database, &relation);
+                // `topic orders`, `exchange events`, or `table t`.
+                let shown = match relation.strip_prefix('@').and_then(|k| k.split_once(':')) {
+                    Some((kind, name)) if broker_object.is_some() => format!("{kind} {name}"),
+                    _ => format!("table {relation}"),
+                };
+                if broker_object == Some(false) {
+                    return Err(fail("42704", format!("{shown} does not exist")));
+                }
+                if broker_object.is_none() && !relation_exists(database, &relation, tx).await {
                     return Err(fail("42P01", format!("relation \"{relation}\" does not exist")));
                 }
                 if !role_exists(database, &owner, tx).await || owner == "public" {
@@ -482,7 +589,7 @@ where
                 // role the giver acts as.
                 if !admin {
                     if !privileges::owns(&rows, &me, &relation) {
-                        return Err(fail("42501", format!("must be owner of table {relation}")));
+                        return Err(fail("42501", format!("must be owner of {shown}")));
                     }
                     if !privileges::roles_of(&rows, &me).iter().any(|r| *r == owner) {
                         return Err(fail("42501", format!("must be able to SET ROLE \"{owner}\"")));
@@ -492,7 +599,11 @@ where
                 privileges::delete_where(database, &filter, tx).await.map_err(|e| fail("XX000", e))?;
                 let row = AclRow { relation, grantee: owner, privilege: "OWNER".into(), grantor: me.clone(), grantable: false };
                 privileges::put(database, &row, tx).await.map_err(|e| fail("XX000", e))?;
-                Ok("ALTER TABLE")
+                Ok(match broker_object {
+                    Some(_) if shown.starts_with("exchange") => "ALTER EXCHANGE",
+                    Some(_) => "ALTER TOPIC",
+                    None => "ALTER TABLE",
+                })
             }
             PrivilegeStatement::ReassignOwned { from, to } => {
                 if !role_exists(database, &to, tx).await {
