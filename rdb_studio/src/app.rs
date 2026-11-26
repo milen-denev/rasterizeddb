@@ -187,6 +187,15 @@ pub struct Studio {
     pub branch_form: BranchForm,
     /// The branch whose diff is shown, and the diff: `None` while it loads.
     pub branch_diff: Option<(String, Option<Result<Vec<BranchDiffRow>, String>>)>,
+
+    // --- broker
+    /// Everything the broker page reads, or `None` before the first load.
+    pub broker: Option<BrokerSnapshot>,
+    pub broker_form: BrokerForm,
+    pub broker_publish: BrokerPublishForm,
+    pub broker_read: BrokerReadForm,
+    /// What the message panel shows: a READ, a POP or a topic's partitions.
+    pub broker_browse: Option<BrokerBrowse>,
     pub merge_policy: MergePolicy,
     pub merge_allow_drop: bool,
 
@@ -265,12 +274,13 @@ pub enum Tab {
     Shards,
     Migrate,
     Keys,
+    Broker,
     Roles,
     Config,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 17] = [
+    pub const ALL: [Tab; 18] = [
         Tab::Dashboard,
         Tab::Overview,
         Tab::Tables,
@@ -300,6 +310,9 @@ impl Tab {
         Tab::Migrate,
         // The key/value store: data, but not tables.
         Tab::Keys,
+        // Next to KEYS: the other thing a server holds that is not a table,
+        // messages instead of values.
+        Tab::Broker,
         // Before CONFIG: who may connect, then how the server behaves.
         Tab::Roles,
         Tab::Config,
@@ -322,6 +335,7 @@ impl Tab {
             Tab::Shards => "SHARDS",
             Tab::Migrate => "MIGRATE",
             Tab::Keys => "KEYS",
+            Tab::Broker => "BROKER",
             Tab::Roles => "ROLES",
             Tab::Config => "CONFIG",
         }
@@ -762,6 +776,9 @@ pub enum Refresh {
     Branches,
     /// A rebalance was started: the shards page and its status.
     Shards,
+    /// A topic, queue, subscription, exchange or binding was made or
+    /// dropped, or a message published: the broker page.
+    Broker,
 }
 
 #[derive(Debug, Clone)]
@@ -901,6 +918,27 @@ pub enum Message {
     ResetBranch(String),
     PromoteBranch(String),
     DropBranch(String),
+    // --- broker
+    ReloadBroker,
+    BrokerLoaded(Box<BrokerSnapshot>),
+    BrokerKind(BrokerCreateKind),
+    BrokerField(views::broker::BrokerField, String),
+    BrokerViaExchange(bool),
+    BrokerCreate,
+    BrokerPublish,
+    /// READ a topic (or a queue: it is a topic) into the message panel.
+    BrokerRead(String),
+    /// POP a queue: takes and acknowledges what it shows.
+    BrokerPop(String),
+    BrokerPartitions(String),
+    /// A READ, POP or SHOW PARTITIONS answered: its statement and rows.
+    BrokerBrowseLoaded(String, Result<Grid, String>),
+    BrokerCloseBrowse,
+    /// TOPIC, QUEUE or EXCHANGE, and its name.
+    BrokerDrop(&'static str, String),
+    /// A subscription's topic and name.
+    BrokerDropSubscription(String, String),
+    BrokerUnbind(BrokerBinding),
 
     // --- shards
     ReloadShards,
@@ -1345,6 +1383,11 @@ impl Studio {
             branches: None,
             branch_form: BranchForm::default(),
             branch_diff: None,
+            broker: None,
+            broker_form: BrokerForm::default(),
+            broker_publish: BrokerPublishForm::default(),
+            broker_read: BrokerReadForm::default(),
+            broker_browse: None,
             merge_policy: MergePolicy::Fail,
             merge_allow_drop: false,
             shards: None,
@@ -1763,6 +1806,8 @@ impl Studio {
                     Tab::Storage => self.load_storage(),
                     // A list of databases, which other consoles make and drop.
                     Tab::Branches => self.load_branches(),
+                    // Depths and backlogs move all the time.
+                    Tab::Broker => self.load_broker(),
                     _ => Task::none(),
                 }
             }
@@ -2397,6 +2442,128 @@ impl Studio {
                 });
                 Task::none()
             }
+            Message::ReloadBroker => self.load_broker(),
+            Message::BrokerLoaded(snapshot) => {
+                self.broker = Some(*snapshot);
+                Task::none()
+            }
+            Message::BrokerKind(kind) => {
+                self.broker_form.kind = kind;
+                Task::none()
+            }
+            Message::BrokerField(field, value) => {
+                use views::broker::BrokerField as F;
+                let (f, p, r) = (&mut self.broker_form, &mut self.broker_publish, &mut self.broker_read);
+                match field {
+                    F::Name => f.name = value,
+                    F::Partitions => f.partitions = value,
+                    F::Durability => f.durability = value,
+                    F::Retention => f.retention = value,
+                    F::RetentionBytes => f.retention_bytes = value,
+                    F::MaxDeliveries => f.max_deliveries = value,
+                    F::DeadLetter => f.dead_letter = value,
+                    F::AckTimeout => f.ack_timeout = value,
+                    F::ExchangeType => f.exchange_type = value,
+                    F::Target => f.target = value,
+                    F::Mode => f.mode = value,
+                    F::From => f.from = value,
+                    F::Key => f.key = value,
+                    F::PublishTarget => p.target = value,
+                    F::PublishRoutingKey => p.routing_key = value,
+                    F::PublishValue => p.value = value,
+                    F::PublishKey => p.key = value,
+                    F::PublishHeaderName => p.header_name = value,
+                    F::PublishHeaderValue => p.header_value = value,
+                    F::ReadPartition => r.partition = value,
+                    F::ReadFrom => r.from = value,
+                    F::ReadLimit => r.limit = value,
+                }
+                Task::none()
+            }
+            Message::BrokerViaExchange(via) => {
+                self.broker_publish.via_exchange = via;
+                Task::none()
+            }
+            Message::BrokerCreate => match dialect::broker_create_sql(&self.broker_form) {
+                Ok(sql) => {
+                    // The kind stays: making several of one kind is the usual case.
+                    self.broker_form = BrokerForm { kind: self.broker_form.kind, ..BrokerForm::default() };
+                    self.statement(sql, Refresh::Broker)
+                }
+                Err(e) => {
+                    self.status = Status::Failed(e);
+                    Task::none()
+                }
+            },
+            Message::BrokerPublish => match dialect::broker_publish_sql(&self.broker_publish) {
+                // The form is kept: publishing a few in a row is the usual case.
+                Ok(sql) => self.statement(sql, Refresh::Broker),
+                Err(e) => {
+                    self.status = Status::Failed(e);
+                    Task::none()
+                }
+            },
+            Message::BrokerRead(topic) => match dialect::broker_read_sql(&topic, &self.broker_read) {
+                Ok(sql) => self.broker_browse(format!("{} (READ, nothing taken)", topic.to_uppercase()), sql),
+                Err(e) => {
+                    self.status = Status::Failed(e);
+                    Task::none()
+                }
+            },
+            Message::BrokerPop(queue) => match dialect::broker_pop_sql(&queue, &self.broker_read.limit) {
+                Ok(sql) => self.broker_browse(format!("{} (POPPED: taken and acknowledged)", queue.to_uppercase()), sql),
+                Err(e) => {
+                    self.status = Status::Failed(e);
+                    Task::none()
+                }
+            },
+            Message::BrokerPartitions(topic) => {
+                let sql = dialect::broker_partitions_sql(&topic);
+                self.broker_browse(format!("{} PARTITIONS", topic.to_uppercase()), sql)
+            }
+            Message::BrokerBrowseLoaded(sql, result) => {
+                let popped = sql.starts_with("BROKER POP");
+                // Only for the statement still shown: a slow answer for an
+                // earlier one must not replace it.
+                if let Some(browse) = &mut self.broker_browse
+                    && browse.statement == sql
+                {
+                    browse.result = Some(result);
+                }
+                // A POP changed the queue's depth.
+                if popped { self.load_broker() } else { Task::none() }
+            }
+            Message::BrokerCloseBrowse => {
+                self.broker_browse = None;
+                Task::none()
+            }
+            Message::BrokerDrop(what, name) => {
+                let body = match what {
+                    "TOPIC" => format!("Topic {name} is deleted with every message in it, and its subscriptions with it."),
+                    "QUEUE" => format!("Queue {name} is deleted with every message in it, delivered or not."),
+                    _ => format!("Exchange {name} is deleted with its bindings. The topics and queues it routed to stay."),
+                };
+                self.modal = Some(Modal::Confirm {
+                    title: format!("Drop {} {name}", what.to_lowercase()),
+                    body,
+                    statement: dialect::broker_drop_sql(what, &name),
+                    refresh: Refresh::Broker,
+                });
+                Task::none()
+            }
+            Message::BrokerDropSubscription(topic, name) => {
+                self.modal = Some(Modal::Confirm {
+                    title: format!("Drop subscription {name}"),
+                    body: format!(
+                        "Subscription {name} on {topic} is deleted with its position and its unacknowledged \
+                         deliveries. The topic's messages stay."
+                    ),
+                    statement: dialect::broker_drop_subscription_sql(&topic, &name),
+                    refresh: Refresh::Broker,
+                });
+                Task::none()
+            }
+            Message::BrokerUnbind(binding) => self.statement(dialect::broker_unbind_sql(&binding), Refresh::Broker),
 
             Message::ReloadShards => self.load_shards(),
             Message::ShardsLoaded(snapshot) => {
@@ -3331,6 +3498,7 @@ impl Studio {
                     Refresh::Shards => self.load_shards(),
                     Refresh::Storage => self.load_storage(),
                     Refresh::Activity => self.load_activity(),
+                    Refresh::Broker => self.load_broker(),
                     Refresh::Branches => {
                         // A merge changed what a diff would say.
                         self.branch_diff = None;
@@ -3525,6 +3693,48 @@ impl Studio {
                 }
             },
             Message::BranchesLoaded,
+        )
+    }
+
+    /// Reads the broker's topics, queues, subscriptions, exchanges and
+    /// bindings in one task. A server that refuses the first has no broker.
+    fn load_broker(&self) -> Task<Message> {
+        let Some(session) = self.session.clone() else { return Task::none() };
+        Task::perform(
+            async move {
+                let topics = match session.query(dialect::BROKER_TOPICS_SQL).await {
+                    Ok(grid) => grid,
+                    Err(refusal) => return Box::new(BrokerSnapshot { refusal, ..BrokerSnapshot::default() }),
+                };
+                let read = |grid: Result<Grid, String>| grid.unwrap_or_default();
+                let queues = read(session.query(dialect::BROKER_QUEUES_SQL).await);
+                let subscriptions = read(session.query(dialect::BROKER_SUBSCRIPTIONS_SQL).await);
+                let exchanges = read(session.query(dialect::BROKER_EXCHANGES_SQL).await);
+                let bindings = read(session.query(dialect::BROKER_BINDINGS_SQL).await);
+                Box::new(BrokerSnapshot {
+                    supported: true,
+                    refusal: String::new(),
+                    topics: dialect::parse_broker_topics(&topics),
+                    queues: dialect::parse_broker_queues(&queues),
+                    subscriptions: dialect::parse_broker_subscriptions(&subscriptions),
+                    exchanges: dialect::parse_broker_exchanges(&exchanges),
+                    bindings: dialect::parse_broker_bindings(&bindings),
+                })
+            },
+            Message::BrokerLoaded,
+        )
+    }
+
+    /// Runs a READ, POP or SHOW PARTITIONS into the message panel.
+    fn broker_browse(&mut self, title: String, sql: String) -> Task<Message> {
+        let Some(session) = self.session.clone() else { return Task::none() };
+        self.broker_browse = Some(BrokerBrowse { title, statement: sql.clone(), result: None });
+        Task::perform(
+            async move {
+                let result = session.query(&sql).await;
+                (sql, result)
+            },
+            |(sql, result)| Message::BrokerBrowseLoaded(sql, result),
         )
     }
 

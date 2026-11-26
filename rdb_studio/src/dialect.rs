@@ -33,6 +33,8 @@
 //! come back empty rather than zero.
 
 use crate::model::{
+    BrokerBinding, BrokerCreateKind, BrokerExchange, BrokerForm, BrokerPublishForm, BrokerQueue, BrokerReadForm,
+    BrokerSubscription, BrokerTopic,
     BackupEntry, BranchDiffRow, BranchForm, BranchInfo, BranchPointKind, ColumnInfo,
     ConfigEntry, DatabaseInfo, Flavor, KvStore, Grid, IndexInfo, IndexOwner, MergePolicy, PartitionInfo,
     PeerStatus, Relationship, RestoreReport, RebalanceStep, RestoreTarget, RoleInfo, ShardInfo, ShardsSnapshot, Stat,
@@ -3685,5 +3687,298 @@ mod branch_sql_tests {
         assert_eq!(parsed.len(), 1);
         assert!(parsed[0].parent_exists && parsed[0].mergeable());
         assert_eq!((parsed[0].parent_lsn, parsed[0].sessions), (7, 2));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Broker (`BROKER …` statements, RasterizedDB's message broker)
+// ---------------------------------------------------------------------------
+
+/// A broker argument: always single-quoted (`''` for a quote), which the
+/// broker reads the same as a bare word.
+pub fn broker_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn broker_int(what: &str, value: &str) -> Result<Option<String>, String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Ok(None);
+    }
+    if v.bytes().all(|b| b.is_ascii_digit()) && v.len() <= 18 {
+        Ok(Some(v.to_string()))
+    } else {
+        Err(format!("{what} is a whole number"))
+    }
+}
+
+/// A start position: EARLIEST, LATEST or an offset.
+fn broker_start(value: &str) -> Result<String, String> {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("earliest") || v.eq_ignore_ascii_case("latest") {
+        return Ok(v.to_ascii_uppercase());
+    }
+    broker_int("A start", v)?.ok_or_else(|| "a start is EARLIEST, LATEST or an offset".to_string())
+}
+
+fn broker_name(what: &str, value: &str) -> Result<String, String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Err(format!("{what} is needed"));
+    }
+    Ok(broker_quote(v))
+}
+
+pub const BROKER_TOPICS_SQL: &str = "BROKER SHOW TOPICS";
+pub const BROKER_QUEUES_SQL: &str = "BROKER SHOW QUEUES";
+pub const BROKER_SUBSCRIPTIONS_SQL: &str = "BROKER SHOW SUBSCRIPTIONS";
+pub const BROKER_EXCHANGES_SQL: &str = "BROKER SHOW EXCHANGES";
+pub const BROKER_BINDINGS_SQL: &str = "BROKER SHOW BINDINGS";
+
+/// The create form's statement, or why it cannot be made yet.
+pub fn broker_create_sql(form: &BrokerForm) -> Result<String, String> {
+    let mut sql;
+    let opt = |sql: &mut String, word: &str, value: &str| {
+        if !value.trim().is_empty() {
+            sql.push_str(&format!(" {word} {}", broker_quote(value.trim())));
+        }
+    };
+    match form.kind {
+        BrokerCreateKind::Topic => {
+            sql = format!("BROKER CREATE TOPIC {}", broker_name("A topic name", &form.name)?);
+            if let Some(n) = broker_int("Partitions", &form.partitions)? {
+                sql.push_str(&format!(" PARTITIONS {n}"));
+            }
+            opt(&mut sql, "DURABILITY", &form.durability);
+            opt(&mut sql, "RETENTION", &form.retention);
+            opt(&mut sql, "RETENTION BYTES", &form.retention_bytes);
+        }
+        BrokerCreateKind::Queue => {
+            sql = format!("BROKER CREATE QUEUE {}", broker_name("A queue name", &form.name)?);
+            opt(&mut sql, "DURABILITY", &form.durability);
+            opt(&mut sql, "ACK TIMEOUT", &form.ack_timeout);
+            if let Some(n) = broker_int("Max deliveries", &form.max_deliveries)? {
+                sql.push_str(&format!(" MAX DELIVERIES {n}"));
+            }
+            opt(&mut sql, "DEAD LETTER", &form.dead_letter);
+            opt(&mut sql, "TTL", &form.retention);
+        }
+        BrokerCreateKind::Exchange => {
+            sql = format!("BROKER CREATE EXCHANGE {}", broker_name("An exchange name", &form.name)?);
+            opt(&mut sql, "TYPE", &form.exchange_type);
+        }
+        BrokerCreateKind::Subscription => {
+            sql = format!(
+                "BROKER CREATE SUBSCRIPTION {} ON {}",
+                broker_name("A subscription name", &form.name)?,
+                broker_name("Its topic", &form.target)?
+            );
+            opt(&mut sql, "MODE", &form.mode);
+            if !form.from.trim().is_empty() {
+                sql.push_str(&format!(" FROM {}", broker_start(&form.from)?));
+            }
+            opt(&mut sql, "ACK TIMEOUT", &form.ack_timeout);
+            if let Some(n) = broker_int("Max deliveries", &form.max_deliveries)? {
+                sql.push_str(&format!(" MAX DELIVERIES {n}"));
+            }
+            opt(&mut sql, "DEAD LETTER", &form.dead_letter);
+        }
+        BrokerCreateKind::Binding => {
+            sql = format!(
+                "BROKER BIND {} TO {}",
+                broker_name("An exchange", &form.name)?,
+                broker_name("A topic or queue", &form.target)?
+            );
+            opt(&mut sql, "KEY", &form.key);
+        }
+    }
+    Ok(sql)
+}
+
+/// The publish form's statement, or why it cannot be made yet.
+pub fn broker_publish_sql(form: &BrokerPublishForm) -> Result<String, String> {
+    let mut sql = if form.via_exchange {
+        format!(
+            "BROKER SEND {} {} {}",
+            broker_name("An exchange", &form.target)?,
+            broker_quote(form.routing_key.trim()),
+            broker_quote(&form.value)
+        )
+    } else {
+        format!("BROKER PUBLISH {} {}", broker_name("A topic or queue", &form.target)?, broker_quote(&form.value))
+    };
+    if !form.key.is_empty() {
+        sql.push_str(&format!(" KEY {}", broker_quote(&form.key)));
+    }
+    if !form.header_name.trim().is_empty() {
+        sql.push_str(&format!(
+            " HEADER {} {}",
+            broker_quote(form.header_name.trim()),
+            broker_quote(&form.header_value)
+        ));
+    }
+    Ok(sql)
+}
+
+/// `BROKER READ`: a look at a topic's records that takes nothing.
+pub fn broker_read_sql(topic: &str, form: &BrokerReadForm) -> Result<String, String> {
+    let mut sql = format!("BROKER READ {}", broker_name("A topic", topic)?);
+    if let Some(p) = broker_int("A partition", &form.partition)? {
+        sql.push_str(&format!(" PARTITION {p}"));
+    }
+    if !form.from.trim().is_empty() {
+        sql.push_str(&format!(" FROM {}", broker_start(&form.from)?));
+    }
+    if let Some(n) = broker_int("A limit", &form.limit)? {
+        sql.push_str(&format!(" LIMIT {n}"));
+    }
+    Ok(sql)
+}
+
+/// `BROKER POP`: takes messages off a queue and acknowledges them.
+pub fn broker_pop_sql(queue: &str, limit: &str) -> Result<String, String> {
+    let mut sql = format!("BROKER POP {}", broker_name("A queue", queue)?);
+    if let Some(n) = broker_int("A limit", limit)? {
+        sql.push_str(&format!(" LIMIT {n}"));
+    }
+    Ok(sql)
+}
+
+pub fn broker_partitions_sql(topic: &str) -> String {
+    format!("BROKER SHOW PARTITIONS {}", broker_quote(topic))
+}
+
+/// `what` is TOPIC, QUEUE or EXCHANGE.
+pub fn broker_drop_sql(what: &str, name: &str) -> String {
+    format!("BROKER DROP {what} {}", broker_quote(name))
+}
+
+pub fn broker_drop_subscription_sql(topic: &str, name: &str) -> String {
+    format!("BROKER DROP SUBSCRIPTION {} ON {}", broker_quote(name), broker_quote(topic))
+}
+
+pub fn broker_unbind_sql(b: &BrokerBinding) -> String {
+    let mut sql = format!("BROKER UNBIND {} FROM {}", broker_quote(&b.exchange), broker_quote(&b.topic));
+    if !b.key.is_empty() {
+        sql.push_str(&format!(" KEY {}", broker_quote(&b.key)));
+    }
+    sql
+}
+
+fn broker_flag(grid: &Grid, row: usize, column: &str) -> bool {
+    matches!(grid.value(row, column), Some("t" | "true" | "1" | "TRUE" | "True"))
+}
+
+pub fn parse_broker_topics(grid: &Grid) -> Vec<BrokerTopic> {
+    (0..grid.rows.len())
+        .map(|i| BrokerTopic {
+            name: grid.value(i, "name").unwrap_or("").to_string(),
+            partitions: grid.number(i, "partitions").unwrap_or(0),
+            durability: grid.value(i, "durability").unwrap_or("").to_string(),
+            queue: broker_flag(grid, i, "queue"),
+            messages: grid.number(i, "messages").unwrap_or(0),
+            bytes: grid.number(i, "bytes").unwrap_or(0),
+            retention_ms: grid.number(i, "retention_ms").unwrap_or(0),
+        })
+        .collect()
+}
+
+pub fn parse_broker_queues(grid: &Grid) -> Vec<BrokerQueue> {
+    (0..grid.rows.len())
+        .map(|i| BrokerQueue {
+            name: grid.value(i, "name").unwrap_or("").to_string(),
+            messages: grid.number(i, "messages").unwrap_or(0),
+            ready: grid.number(i, "ready").unwrap_or(0),
+            unacked: grid.number(i, "unacked").unwrap_or(0),
+            consumers: grid.number(i, "consumers").unwrap_or(0),
+        })
+        .collect()
+}
+
+pub fn parse_broker_subscriptions(grid: &Grid) -> Vec<BrokerSubscription> {
+    (0..grid.rows.len())
+        .map(|i| {
+            let n = |c: &str| grid.number(i, c).unwrap_or(0);
+            BrokerSubscription {
+                topic: grid.value(i, "topic").unwrap_or("").to_string(),
+                name: grid.value(i, "name").unwrap_or("").to_string(),
+                mode: grid.value(i, "mode").unwrap_or("").to_string(),
+                members: n("members"),
+                backlog: n("backlog"),
+                inflight: n("inflight"),
+                delivered: n("delivered"),
+                acked: n("acked"),
+                dead: n("dead"),
+            }
+        })
+        .collect()
+}
+
+pub fn parse_broker_exchanges(grid: &Grid) -> Vec<BrokerExchange> {
+    (0..grid.rows.len())
+        .map(|i| BrokerExchange {
+            name: grid.value(i, "name").unwrap_or("").to_string(),
+            kind: grid.value(i, "type").unwrap_or("").to_string(),
+            durable: broker_flag(grid, i, "durable"),
+            bindings: grid.number(i, "bindings").unwrap_or(0),
+        })
+        .collect()
+}
+
+pub fn parse_broker_bindings(grid: &Grid) -> Vec<BrokerBinding> {
+    (0..grid.rows.len())
+        .map(|i| BrokerBinding {
+            exchange: grid.value(i, "exchange").unwrap_or("").to_string(),
+            topic: grid.value(i, "topic").unwrap_or("").to_string(),
+            key: grid.value(i, "key").unwrap_or("").to_string(),
+        })
+        .collect()
+}
+
+/// A retention in milliseconds as the page shows it.
+pub fn broker_retention(ms: u64) -> String {
+    match ms {
+        0 => "—".to_string(),
+        ms if ms % 86_400_000 == 0 => format!("{}d", ms / 86_400_000),
+        ms if ms % 3_600_000 == 0 => format!("{}h", ms / 3_600_000),
+        ms if ms % 60_000 == 0 => format!("{}m", ms / 60_000),
+        ms if ms % 1000 == 0 => format!("{}s", ms / 1000),
+        ms => format!("{ms}ms"),
+    }
+}
+
+#[cfg(test)]
+mod broker_tests {
+    use super::*;
+
+    #[test]
+    fn broker_statements_quote_what_was_typed() {
+        let mut form = BrokerForm { name: "orders".into(), partitions: "4".into(), durability: "sync".into(), retention: "7d".into(), ..BrokerForm::default() };
+        assert_eq!(
+            broker_create_sql(&form).unwrap(),
+            "BROKER CREATE TOPIC 'orders' PARTITIONS 4 DURABILITY 'sync' RETENTION '7d'"
+        );
+        form.partitions = "four".into();
+        assert!(broker_create_sql(&form).is_err());
+        let q = BrokerForm { kind: BrokerCreateKind::Queue, name: "jo'bs".into(), max_deliveries: "5".into(), dead_letter: "dead".into(), ..BrokerForm::default() };
+        assert_eq!(broker_create_sql(&q).unwrap(), "BROKER CREATE QUEUE 'jo''bs' MAX DELIVERIES 5 DEAD LETTER 'dead'");
+        let s = BrokerForm { kind: BrokerCreateKind::Subscription, name: "s".into(), target: "orders".into(), from: "earliest".into(), ..BrokerForm::default() };
+        assert_eq!(broker_create_sql(&s).unwrap(), "BROKER CREATE SUBSCRIPTION 's' ON 'orders' MODE 'shared' FROM EARLIEST");
+        let b = BrokerForm { kind: BrokerCreateKind::Binding, name: "ev".into(), target: "orders".into(), key: "order.*".into(), ..BrokerForm::default() };
+        assert_eq!(broker_create_sql(&b).unwrap(), "BROKER BIND 'ev' TO 'orders' KEY 'order.*'");
+        let p = BrokerPublishForm { target: "orders".into(), value: "it's".into(), key: "c7".into(), ..Default::default() };
+        assert_eq!(broker_publish_sql(&p).unwrap(), "BROKER PUBLISH 'orders' 'it''s' KEY 'c7'");
+        let x = BrokerPublishForm { target: "ev".into(), via_exchange: true, routing_key: "order.new".into(), value: "v".into(), ..Default::default() };
+        assert_eq!(broker_publish_sql(&x).unwrap(), "BROKER SEND 'ev' 'order.new' 'v'");
+        assert_eq!(
+            broker_read_sql("orders", &BrokerReadForm { partition: "0".into(), from: "100".into(), limit: "10".into() }).unwrap(),
+            "BROKER READ 'orders' PARTITION 0 FROM 100 LIMIT 10"
+        );
+        assert_eq!(broker_pop_sql("jobs", "5").unwrap(), "BROKER POP 'jobs' LIMIT 5");
+        assert_eq!(
+            broker_unbind_sql(&BrokerBinding { exchange: "ev".into(), topic: "orders".into(), key: "k".into() }),
+            "BROKER UNBIND 'ev' FROM 'orders' KEY 'k'"
+        );
+        assert_eq!(broker_retention(7 * 86_400_000), "7d");
     }
 }
