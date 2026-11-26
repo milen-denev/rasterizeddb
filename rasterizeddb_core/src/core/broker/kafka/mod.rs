@@ -33,7 +33,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use self::codec::{In, Out};
 use self::group::Groups;
-use super::{Broker, BrokerError};
+use super::acl::{self, Access, Kind, Need};
+use super::{Broker, BrokerError, DdlPolicy, ddl_policy};
 use crate::core::database::Database;
 use crate::core::listen::{self, Listeners, Sock, SocketSpec};
 
@@ -92,6 +93,7 @@ const E_NONE: i16 = 0;
 const E_OFFSET_OUT_OF_RANGE: i16 = 1;
 const E_CORRUPT: i16 = 2;
 const E_UNKNOWN_TOPIC: i16 = 3;
+const E_TOPIC_AUTH: i16 = 29;
 const E_MESSAGE_TOO_LARGE: i16 = 10;
 const E_INVALID_TOPIC: i16 = 17;
 const E_UNSUPPORTED_SASL: i16 = 33;
@@ -242,13 +244,26 @@ const UNAUTH_REQUEST: usize = 64 << 10;
 struct Conn {
     shared: Arc<Shared>,
     authed: bool,
+    /// Who the connection is and what it may use (`acl`).
+    access: Access,
+    /// Topics this request created (`true`) or deleted; recorded before
+    /// its response is sent.
+    acl_effects: Vec<(Kind, String, bool)>,
     /// SaslHandshake v0 was asked: the next frame is a bare SASL token.
     raw_sasl: bool,
     mechanism_ok: bool,
 }
 
 async fn connection(mut sock: Sock, shared: Arc<Shared>) -> io::Result<()> {
-    let mut conn = Conn { authed: matches!(shared.config.auth, KafkaAuth::Trust), shared, raw_sasl: false, mechanism_ok: false };
+    let trust = matches!(shared.config.auth, KafkaAuth::Trust);
+    let mut conn = Conn {
+        authed: trust,
+        access: if trust { Access::unrestricted("") } else { Access::new("", false) },
+        acl_effects: Vec::new(),
+        shared,
+        raw_sasl: false,
+        mechanism_ok: false,
+    };
     let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
     loop {
@@ -307,6 +322,7 @@ fn code_of(e: &BrokerError) -> i16 {
         Code::TopicExists => E_TOPIC_EXISTS,
         Code::Invalid => E_INVALID_REQUEST,
         Code::Storage => E_KAFKA_STORAGE,
+        Code::Permission => E_TOPIC_AUTH,
         _ => E_UNKNOWN,
     }
 }
@@ -364,6 +380,12 @@ impl Conn {
         if !self.authed && !matches!(key, SASL_HANDSHAKE | SASL_AUTHENTICATE) {
             return false;
         }
+        if !matches!(key, SASL_HANDSHAKE | SASL_AUTHENTICATE)
+            && let Err(e) = self.access.refresh(&self.shared.database, &self.shared.main).await
+        {
+            log::warn!("kafka: closing a connection of {}: {}", self.access.user(), e.message);
+            return false;
+        }
         let body = r;
         let at = begin(out, corr);
         let result = match key {
@@ -386,6 +408,15 @@ impl Conn {
             DESCRIBE_CONFIGS => self.describe_configs(version, body, out),
             _ => Err(codec::Malformed("unserved API")),
         };
+        // Before the response leaves: a client told its topic was made may
+        // use it at once.
+        for (kind, name, created) in std::mem::take(&mut self.acl_effects) {
+            if created {
+                acl::created(&self.shared.database, &self.shared.main, kind, &name, self.access.user()).await;
+            } else {
+                acl::removed(&self.shared.database, &self.shared.main, kind, &name).await;
+            }
+        }
         match result {
             Ok(Reply::Send) => {
                 end(out, at);
@@ -411,16 +442,44 @@ impl Conn {
     // Topics
     // -----------------------------------------------------------------------
 
-    fn topic_or_create(&self, name: &str) -> Result<Arc<super::Topic>, BrokerError> {
+    /// The topic, created when the server auto-creates topics and the role
+    /// may create (its creator then owns it).
+    fn topic_or_create(&mut self, name: &str) -> Result<Arc<super::Topic>, BrokerError> {
         match self.shared.broker.topic(name) {
             Some(t) => Ok(t),
-            None if self.shared.config.auto_create => self.shared.broker.create_topic(
-                name,
-                TopicConfig { partitions: self.shared.config.default_partitions.max(1), ..TopicConfig::default() },
-                true,
-            ),
+            None if self.shared.config.auto_create && self.may_create() => {
+                let (t, created) = self.shared.broker.create_topic_reporting(
+                    name,
+                    TopicConfig { partitions: self.shared.config.default_partitions.max(1), ..TopicConfig::default() },
+                    true,
+                )?;
+                if created {
+                    self.acl_effects.push((Kind::Topic, name.to_string(), true));
+                }
+                Ok(t)
+            }
             None => Err(BrokerError::no_topic(name)),
         }
+    }
+
+    /// Whether this role may create topics (`--broker-ddl`).
+    fn may_create(&self) -> bool {
+        ddl_policy() == DdlPolicy::Any || self.access.is_superuser()
+    }
+
+    /// `need` on topic `name`; one this request created is its creator's
+    /// already, before its owner row is written.
+    fn check_topic(&mut self, name: &str, need: Need) -> Result<(), BrokerError> {
+        if self.acl_effects.iter().any(|(k, n, c)| *c && *k == Kind::Topic && n == name) {
+            return Ok(());
+        }
+        self.access.topic(name, need)
+    }
+
+    /// Whether the role may see topic `name` (Kafka's DESCRIBE): any
+    /// privilege on it.
+    fn sees_topic(&mut self, name: &str) -> bool {
+        self.acl_effects.iter().any(|(k, n, c)| *c && *k == Kind::Topic && n == name) || self.access.sees(Kind::Topic, name)
     }
 
     fn metadata(&mut self, v: i16, mut r: In<'_>, out: &mut Vec<u8>) -> codec::R<Reply> {
@@ -437,19 +496,28 @@ impl Conn {
         let allow_create = if v >= 4 { r.bool()? } else { true };
         // v0 asked for every topic with an empty list.
         let names = names.filter(|n| !n.is_empty());
-        let topics: Vec<(String, Result<Arc<super::Topic>, BrokerError>)> = match &names {
-            None => self.shared.broker.topics().into_iter().map(|t| (t.name.clone(), Ok(t))).collect(),
-            Some(list) => list
-                .iter()
-                .map(|n| {
-                    let t = if allow_create {
-                        self.topic_or_create(n)
-                    } else {
-                        self.shared.broker.require_topic(n)
+        // As Kafka answers a role without DESCRIBE: every topic leaves out
+        // those it may not see, and one asked by name is refused.
+        let topics: Vec<(String, Result<Arc<super::Topic>, BrokerError>)> = match names {
+            None => {
+                let mut all = self.shared.broker.topics();
+                all.retain(|t| self.access.sees(Kind::Topic, &t.name));
+                all.into_iter().map(|t| (t.name.clone(), Ok(t))).collect()
+            }
+            Some(list) => {
+                let mut out = Vec::with_capacity(list.len());
+                for n in list {
+                    let t = if allow_create { self.topic_or_create(&n) } else { self.shared.broker.require_topic(&n) };
+                    let t = match t {
+                        Ok(_) if !self.sees_topic(&n) => {
+                            Err(BrokerError::new(Code::Permission, format!("permission denied for topic {n}")))
+                        }
+                        t => t,
                     };
-                    (n.clone(), t)
-                })
-                .collect(),
+                    out.push((n, t));
+                }
+                out
+            }
         };
         let mut w = Out(out);
         if v >= 3 {
@@ -495,7 +563,11 @@ impl Conn {
                     }
                 }
                 Err(e) => {
-                    w.i16(if e.code == Code::Invalid { E_INVALID_TOPIC } else { E_UNKNOWN_TOPIC });
+                    w.i16(match e.code {
+                        Code::Invalid => E_INVALID_TOPIC,
+                        Code::Permission => E_TOPIC_AUTH,
+                        _ => E_UNKNOWN_TOPIC,
+                    });
                     w.str(name);
                     if v >= 1 {
                         w.bool(false);
@@ -554,15 +626,22 @@ impl Conn {
         }
         w.array(asked.len());
         for (name, config) in asked {
-            let (code, message) = if config.partitions == 0 || config.partitions > super::engine::MAX_PARTITIONS {
+            let (code, message) = if !self.may_create() {
+                (E_TOPIC_AUTH, Some("creating topics needs a superuser here".to_string()))
+            } else if config.partitions == 0 || config.partitions > super::engine::MAX_PARTITIONS {
                 (E_INVALID_PARTITIONS, Some(format!("partitions must be 1 to {}", super::engine::MAX_PARTITIONS)))
             } else if self.shared.broker.topic(&name).is_some() {
                 (E_TOPIC_EXISTS, Some(format!("topic \"{name}\" already exists")))
             } else if validate_only {
                 (E_NONE, None)
             } else {
-                match self.shared.broker.create_topic(&name, config, false) {
-                    Ok(_) => (E_NONE, None),
+                match self.shared.broker.create_topic_reporting(&name, config, false) {
+                    Ok((_, created)) => {
+                        if created {
+                            self.acl_effects.push((Kind::Topic, name.clone(), true));
+                        }
+                        (E_NONE, None)
+                    }
                     Err(e) if e.code == Code::Invalid => (E_INVALID_TOPIC, Some(e.message)),
                     Err(e) => (code_of(&e), Some(e.message)),
                 }
@@ -589,9 +668,17 @@ impl Conn {
         }
         w.array(names.len());
         for name in names {
-            let code = match self.shared.broker.delete_topic(&name, false) {
-                Ok(_) => E_NONE,
-                Err(e) => code_of(&e),
+            let allowed = self.shared.broker.topic(&name).is_none() || self.access.topic(&name, Need::Own).is_ok();
+            let code = if !allowed || !self.may_create() {
+                E_TOPIC_AUTH
+            } else {
+                match self.shared.broker.delete_topic(&name, false) {
+                    Ok(_) => {
+                        self.acl_effects.push((Kind::Topic, name.clone(), false));
+                        E_NONE
+                    }
+                    Err(e) => code_of(&e),
+                }
             };
             w.str(&name);
             w.i16(code);
@@ -697,7 +784,7 @@ impl Conn {
         for _ in 0..topics {
             let name = r.str()?.to_string();
             let parts = r.array()?;
-            let topic = self.topic_or_create(&name);
+            let topic = self.topic_or_create(&name).and_then(|t| self.check_topic(&name, Need::Produce).map(|()| t));
             let mut outs = Vec::with_capacity(parts);
             for _ in 0..parts {
                 let index = r.i32()?;
@@ -836,18 +923,21 @@ impl Conn {
         }
         // forgotten_topics_data (v7+) and rack_id (v11) are not needed.
 
-        let resolve = |w: &Want| self.shared.broker.topic(&w.topic);
+        // A topic the role may not read answers TOPIC_AUTHORIZATION_FAILED
+        // and is neither waited on nor read.
+        let allowed: Vec<bool> = wants.iter().map(|w| self.access.topic(&w.topic, Need::Consume).is_ok()).collect();
+        let resolve = |i: usize, w: &Want| if allowed[i] { self.shared.broker.topic(&w.topic) } else { None };
         let has_data = || {
-            wants.iter().any(|w| {
-                resolve(w).is_some_and(|t| {
+            wants.iter().enumerate().any(|(i, w)| {
+                resolve(i, w).is_some_and(|t| {
                     w.parts.iter().any(|(p, off, _)| t.partition(*p as u32).is_ok_and(|x| x.next_offset() as i64 > *off))
                 })
             })
         };
         if !has_data() && max_wait > 0 && min_bytes > 0 {
             let mut rxs = Vec::new();
-            for w in &wants {
-                if let Some(t) = resolve(w) {
+            for (i, w) in wants.iter().enumerate() {
+                if let Some(t) = resolve(i, w) {
                     for (p, _, _) in &w.parts {
                         if let Ok(part) = t.partition(*p as u32) {
                             rxs.push(part.subscribe_appends());
@@ -869,8 +959,8 @@ impl Conn {
         }
         w.array(wants.len());
         let mut budget = (max_bytes.max(1) as usize).min(64 << 20);
-        for want in &wants {
-            let topic = resolve(want);
+        for (i, want) in wants.iter().enumerate() {
+            let topic = resolve(i, want);
             let w = &mut Out(&mut *w.0);
             w.str(&want.topic);
             w.array(want.parts.len());
@@ -878,7 +968,7 @@ impl Conn {
                 w.i32(p);
                 let part = topic.as_ref().and_then(|t| t.partition(p as u32).ok().cloned());
                 let Some(part) = part else {
-                    w.i16(E_UNKNOWN_TOPIC);
+                    w.i16(if allowed[i] { E_UNKNOWN_TOPIC } else { E_TOPIC_AUTH });
                     w.i64(-1);
                     w.i64(-1);
                     if v >= 5 {
@@ -946,7 +1036,8 @@ impl Conn {
         }
         w.array(asked.len());
         for (name, parts) in asked {
-            let topic = self.shared.broker.topic(&name);
+            let allowed = self.access.topic(&name, Need::Consume).is_ok();
+            let topic = self.shared.broker.topic(&name).filter(|_| allowed);
             w.str(&name);
             w.array(parts.len());
             for (p, at) in parts {
@@ -969,7 +1060,7 @@ impl Conn {
                         w.i64(-1);
                     }
                     None => {
-                        w.i16(E_UNKNOWN_TOPIC);
+                        w.i16(if allowed { E_UNKNOWN_TOPIC } else { E_TOPIC_AUTH });
                         w.i64(-1);
                         w.i64(-1);
                     }
@@ -1171,6 +1262,7 @@ impl Conn {
         for _ in 0..n {
             let name = r.str()?.to_string();
             let pn = r.array()?;
+            let allowed = self.access.topic(&name, Need::Consume).is_ok();
             let topic = self.shared.broker.topic(&name);
             let mut parts = Vec::with_capacity(pn);
             for _ in 0..pn {
@@ -1182,6 +1274,8 @@ impl Conn {
                 let _meta = r.nstr()?;
                 let code = if gate != E_NONE {
                     gate
+                } else if !allowed {
+                    E_TOPIC_AUTH
                 } else {
                     match &topic {
                         None => E_UNKNOWN_TOPIC,
@@ -1241,15 +1335,17 @@ impl Conn {
                 .into_iter()
                 .filter(|t| t.subscription(&group).is_some_and(|s| s.config.mode == SubMode::Ordered))
                 .map(|t| (t.name.clone(), (0..t.partition_count() as i32).collect()))
-                .collect()
+                .collect::<Vec<_>>()
         });
+        let asked: Vec<(String, Vec<i32>, bool)> =
+            asked.into_iter().map(|(n, p)| { let ok = self.access.topic(&n, Need::Consume).is_ok(); (n, p, ok) }).collect();
         let mut w = Out(out);
         if v >= 3 {
             w.i32(0);
         }
         w.array(asked.len());
-        for (name, parts) in asked {
-            let topic = self.shared.broker.topic(&name);
+        for (name, parts, allowed) in asked {
+            let topic = self.shared.broker.topic(&name).filter(|_| allowed);
             let sub = topic.as_ref().and_then(|t| self.offsets_sub(t, &group, None));
             w.str(&name);
             w.array(parts.len());
@@ -1261,7 +1357,7 @@ impl Conn {
                     w.i32(-1);
                 }
                 w.nstr(Some(""));
-                w.i16(E_NONE);
+                w.i16(if allowed { E_NONE } else { E_TOPIC_AUTH });
             }
         }
         if v >= 2 {
@@ -1318,8 +1414,9 @@ impl Conn {
         let user = std::str::from_utf8(user).map_err(|_| "user name is not UTF-8")?.to_string();
         let pass = std::str::from_utf8(pass).map_err(|_| "password is not UTF-8")?.to_string();
         match listen::login(&self.shared.database, &self.shared.main, &user, &pass, "kafka").await {
-            Ok(_) => {
+            Ok(superuser) => {
                 self.authed = true;
+                self.access = Access::new(&user, superuser);
                 Ok(())
             }
             Err(listen::LoginError::Denied) => Err("authentication failed".into()),

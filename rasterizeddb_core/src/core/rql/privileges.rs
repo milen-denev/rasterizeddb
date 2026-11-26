@@ -60,6 +60,14 @@ pub enum Target {
     /// `function`, `procedure` or `routine` (either).
     Routines { kind: &'static str, names: Vec<String> },
     AllRoutinesInSchema { kind: &'static str },
+    /// `TOPIC a, b` or `QUEUE a` (a queue is a topic): PRODUCE, CONSUME.
+    Topics(Vec<String>),
+    /// `ALL TOPICS` / `ALL QUEUES`: every topic there is now.
+    AllTopics,
+    /// `EXCHANGE a, b`: PUBLISH, BIND.
+    Exchanges(Vec<String>),
+    /// `ALL EXCHANGES`.
+    AllExchanges,
     /// A schema, database or type: accepted, nothing enforced for it here.
     Other(String),
 }
@@ -97,6 +105,23 @@ impl DefaultKind {
 /// Every ACL relation `role`'s default privileges are kept under.
 pub fn default_relations(role: &str) -> [String; 3] {
     [DefaultKind::Tables.relation(role), DefaultKind::Sequences.relation(role), DefaultKind::Functions.relation(role)]
+}
+
+/// The privileges a broker topic (or queue) takes: writing records to it,
+/// and reading them (fetching, subscribing, popping).
+pub const TOPIC_PRIVILEGES: &[&str] = &["PRODUCE", "CONSUME"];
+/// The privileges a broker exchange takes: publishing through it, and
+/// binding a topic to it (receiving what it routes).
+pub const EXCHANGE_PRIVILEGES: &[&str] = &["PUBLISH", "BIND"];
+
+/// The ACL key a broker topic's owner and grants are kept under.
+pub fn topic_key(name: &str) -> String {
+    format!("@topic:{name}")
+}
+
+/// The ACL key a broker exchange's owner and grants are kept under.
+pub fn exchange_key(name: &str) -> String {
+    format!("@exchange:{name}")
 }
 
 /// The privileges a sequence takes.
@@ -262,6 +287,24 @@ fn name_of(word: &str) -> String {
     ident(crate::core::sql_scan::last_name_segment(word.trim()))
 }
 
+/// A broker object's name as `BROKER` statements take it: verbatim (case
+/// kept, dots kept: `orders.v1` is one name), or quoted with `"` or `'`
+/// (the quote doubled inside).
+fn broker_name(word: &str) -> String {
+    let w = word.trim();
+    for q in ['"', '\''] {
+        if w.len() >= 2 && w.starts_with(q) && w.ends_with(q) {
+            let doubled: String = [q, q].iter().collect();
+            return w[1..w.len() - 1].replace(&doubled, &q.to_string());
+        }
+    }
+    w.to_string()
+}
+
+fn broker_names(list: &str) -> Vec<String> {
+    crate::core::sql_scan::split_top_level(list, b',').into_iter().map(broker_name).filter(|n| !n.is_empty()).collect()
+}
+
 /// The privileges a list names, `ALL [PRIVILEGES]` as every one.
 fn privilege_list(text: &str) -> Result<Vec<String>, Refusal> {
     let upper = text.trim().to_ascii_uppercase();
@@ -336,6 +379,21 @@ fn target_of(text: &str) -> Target {
     };
     if upper.starts_with("SEQUENCE ") {
         return Target::Sequences(names_of(&t[9..]));
+    }
+    // Broker objects. A queue is a topic, so either word names one.
+    if upper == "ALL TOPICS" || upper == "ALL QUEUES" {
+        return Target::AllTopics;
+    }
+    if upper == "ALL EXCHANGES" {
+        return Target::AllExchanges;
+    }
+    for prefix in ["TOPIC ", "QUEUE "] {
+        if upper.starts_with(prefix) {
+            return Target::Topics(broker_names(&t[prefix.len()..]));
+        }
+    }
+    if upper.starts_with("EXCHANGE ") {
+        return Target::Exchanges(broker_names(&t[9..]));
     }
     for (prefix, kind) in [("FUNCTION ", "function"), ("PROCEDURE ", "procedure"), ("ROUTINE ", "routine")] {
         if upper.starts_with(prefix) {
@@ -520,10 +578,16 @@ pub fn parse_privilege_statement(sql: &str) -> Option<Result<PrivilegeStatement,
         }));
     }
     if upper.starts_with("ALTER ") {
-        // `ALTER TABLE|VIEW|MATERIALIZED VIEW|SEQUENCE name OWNER TO role`.
+        // `ALTER TABLE|VIEW|MATERIALIZED VIEW|SEQUENCE name OWNER TO role`,
+        // and a broker object's: `ALTER TOPIC|QUEUE|EXCHANGE name OWNER TO
+        // role`, kept under its ACL key.
         let owner_at = upper.find(" OWNER TO ")?;
         let head = text[..owner_at].split_whitespace().collect::<Vec<_>>();
-        let relation = name_of(head.last()?);
+        let relation = match head.get(1).map(|w| w.to_ascii_uppercase()).as_deref() {
+            Some("TOPIC" | "QUEUE") if head.len() == 3 => topic_key(&broker_name(head[2])),
+            Some("EXCHANGE") if head.len() == 3 => exchange_key(&broker_name(head[2])),
+            _ => name_of(head.last()?),
+        };
         let owner = ident(text[owner_at + 10..].trim());
         return Some(Ok(PrivilegeStatement::OwnerTo { relation, owner }));
     }
@@ -740,6 +804,26 @@ mod cache {
         GEN.get(&db).map_or(0, |g| *g)
     }
 
+    /// The generation, once no writer is pending: what a cache of decisions
+    /// made from the rows may be keyed on. `None` while a transaction that
+    /// wrote the rows is still running (what is committed may change at its
+    /// end); the writers found finished are cleared, and bump the
+    /// generation, since what they wrote is now what every load sees.
+    pub(super) fn settled(db: &crate::core::database::Database) -> Option<u64> {
+        if let Some(mut p) = PENDING.get_mut(&db.id) {
+            let before = p.len();
+            p.retain(|t| db.transactions.outcome(*t) == TxOutcome::InProgress);
+            if p.len() != before {
+                ROWS.remove(&db.id);
+                *GEN.entry(db.id).or_insert(0) += 1;
+            }
+            if !p.is_empty() {
+                return None;
+            }
+        }
+        Some(generation(db.id))
+    }
+
     pub(super) fn wrote(db: u64, tx: Option<TxId>) {
         *GEN.entry(db).or_insert(0) += 1;
         match tx {
@@ -759,16 +843,7 @@ mod cache {
     /// The cached rows, if they may be served: no pending writer is still
     /// running. Finished writers are cleared (and the cache dropped).
     pub(super) fn get(db: &crate::core::database::Database) -> Option<StdArc<Vec<AclRow>>> {
-        if let Some(mut p) = PENDING.get_mut(&db.id) {
-            let before = p.len();
-            p.retain(|t| db.transactions.outcome(*t) == TxOutcome::InProgress);
-            if p.len() != before {
-                ROWS.remove(&db.id);
-            }
-            if !p.is_empty() {
-                return None;
-            }
-        }
+        settled(db)?;
         ROWS.get(&db.id).map(|r| r.clone())
     }
 
@@ -778,6 +853,17 @@ mod cache {
         }
         ROWS.insert(db.id, StdArc::new(rows.to_vec()));
     }
+}
+
+/// The permission catalogue's generation, once the writers found finished
+/// have been counted (see `cache::settled`): equal across two calls, the
+/// committed rows have not changed between them, so a decision made from
+/// them still holds. An uncommitted write bumps it too (harmless: a reload
+/// of the committed rows), and its commit bumps it again when the next call
+/// sees it finished. The broker keys its per-connection decisions on this.
+pub fn settled_generation(database: &Database) -> u64 {
+    let _ = cache::settled(database);
+    cache::generation(database.id)
 }
 
 /// A write to the permission catalogue made outside this module (a
@@ -1189,6 +1275,36 @@ mod tests {
         assert_eq!(mask_role_catalog("SHOW COLUMNS FROM rdb_roles"), None);
         assert_eq!(mask_role_catalog("  show columns from \"rdb_roles\""), None);
         assert!(mask_role_catalog("SELECT * FROM rdb_roles").is_some());
+    }
+
+    #[test]
+    fn broker_objects_are_read_verbatim() {
+        // A topic's name is the broker's: case and dots kept, not folded
+        // and cut to its last segment as a table's would be.
+        let grant = |sql: &str| match parse_privilege_statement(sql).unwrap().unwrap() {
+            PrivilegeStatement::Grant { privileges, target, grantees, .. } => (privileges, target, grantees),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            grant("GRANT PRODUCE, CONSUME ON TOPIC Orders.v1, \"a b\" TO app"),
+            (vec!["PRODUCE".into(), "CONSUME".into()], Target::Topics(vec!["Orders.v1".into(), "a b".into()]), vec!["app".into()])
+        );
+        assert_eq!(grant("GRANT CONSUME ON QUEUE 'jobs''x' TO w").1, Target::Topics(vec!["jobs'x".into()]));
+        assert_eq!(grant("GRANT PUBLISH ON EXCHANGE amq.topic TO PUBLIC").1, Target::Exchanges(vec!["amq.topic".into()]));
+        assert_eq!(grant("GRANT ALL ON ALL TOPICS TO app").1, Target::AllTopics);
+        assert_eq!(grant("GRANT ALL ON ALL QUEUES TO app").1, Target::AllTopics);
+        assert_eq!(grant("GRANT BIND ON ALL EXCHANGES TO app").1, Target::AllExchanges);
+        // ALL is every table privilege until the target's kind maps it.
+        assert_eq!(privileges_for(grant("GRANT ALL ON TOPIC t TO app").0, TOPIC_PRIVILEGES).unwrap(), vec!["PRODUCE", "CONSUME"]);
+        assert_eq!(privileges_for(vec!["SELECT".into()], TOPIC_PRIVILEGES).unwrap_err(), "SELECT");
+        let owner = |sql: &str| match parse_privilege_statement(sql).unwrap().unwrap() {
+            PrivilegeStatement::OwnerTo { relation, owner } => (relation, owner),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(owner("ALTER TOPIC Orders.v1 OWNER TO Billing"), ("@topic:Orders.v1".into(), "billing".into()));
+        assert_eq!(owner("ALTER QUEUE \"j\" OWNER TO b"), ("@topic:j".into(), "b".into()));
+        assert_eq!(owner("ALTER EXCHANGE events OWNER TO b"), ("@exchange:events".into(), "b".into()));
+        assert_eq!(owner("ALTER TABLE public.T OWNER TO b"), ("t".into(), "b".into()), "tables keep their folding");
     }
 
     #[test]

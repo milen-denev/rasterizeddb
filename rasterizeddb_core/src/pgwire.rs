@@ -10250,6 +10250,13 @@ where
     // else until COMMIT. Outside one, `execute` opens and closes a transaction
     // of its own.
     let resp = match state.current_tx() {
+        // A `BROKER` statement runs as the session's role, which the
+        // executor does not know (`privilege_statements::broker_statement`).
+        #[cfg(feature = "broker")]
+        _ if matches!(purpose_exec, QueryPurpose::Broker(_)) => {
+            let QueryPurpose::Broker(sql) = &purpose_exec else { unreachable!() };
+            privilege_statements::broker_statement(database, state, sql).await
+        }
         Some(tx) => {
             crate::core::rql::executor::execute_in_txn(purpose_exec, database.clone(), tx).await
         }
