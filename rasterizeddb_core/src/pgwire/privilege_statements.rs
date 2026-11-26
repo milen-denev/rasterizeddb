@@ -1147,6 +1147,16 @@ pub(super) async fn about_to_create(database: &Arc<Database>, state: &SessionSta
         crate::core::rql::sequence_catalog::parse_sequence_statement(stmt)
     {
         name
+    } else if let Some(Ok(special)) = crate::core::rql::ledger_ddl::split(stmt) {
+        // `CREATE LEDGER TABLE` and `CREATE VAULT`: a table like any other to
+        // own. Without an owner every grant on it is ignored
+        // (`privileges::allows`), so no role but a superuser could read it.
+        crate::core::rql::lexer_ct::create_table_with_partition(&crate::core::rql::lexer_s1::QueryPurpose::CreateTable(
+            special.create_sql,
+        ))
+        .0
+        .map(|ct| ct.table_name)
+        .unwrap_or(special.name)
     } else {
         return None;
     };
