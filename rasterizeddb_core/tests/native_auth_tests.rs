@@ -7,6 +7,11 @@
 //! it fail: a suite of happy paths would pass against an authenticator that
 //! returns `Ok` for everyone.
 
+// The server's future is spawned from here, and proving it `Send` walks every
+// future it holds: as deep as the library's own limit allows, which is past
+// the default.
+#![recursion_limit = "256"]
+
 use std::sync::Arc as StdArc;
 use std::time::Duration;
 
