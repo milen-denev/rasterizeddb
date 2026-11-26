@@ -677,6 +677,82 @@ async fn a_commit_costs_one_put_per_file_it_touched() {
     );
 }
 
+/// pms on S3: a 100-row INSERT into a key/value table took 39 s, because
+/// every row is its own storage transaction and each commit was a put to the
+/// rows file and one to the pointers file. Inside a statement's scope the
+/// commits queue, and settling stores them all: two puts, not two hundred.
+#[tokio::test]
+async fn a_statements_row_commits_are_stored_together() {
+    let store = Arc::new(CountingStore::new());
+    let handle: Arc<dyn KvStore> = store.clone();
+    let family = open_family(handle).await;
+    let rows = open(&family, "t.db").await;
+    let pointers = open(&family, "t_pointers.db").await;
+
+    let before = store.puts();
+    let ((), settled) = super::defer_commits(async {
+        for i in 0..100u8 {
+            let txn = rows.begin_txn();
+            rows.append_data_txn(txn, &vec![i; 300]).await;
+            pointers.append_data_txn(txn, &[i; 64]).await;
+            pointers.commit_durable(txn).await.unwrap();
+        }
+        assert_eq!(store.puts() - before, 0, "a commit inside the scope is queued, not put");
+    })
+    .await;
+    settled.unwrap();
+    assert_eq!(store.puts() - before, 2, "a statement's commits are one object per file");
+
+    // All of them, after a restart.
+    let family = open_family(store.clone() as Arc<dyn KvStore>).await;
+    let rows = open(&family, "t.db").await;
+    let pointers = open(&family, "t_pointers.db").await;
+    assert_eq!(rows.get_len().await, 100 * 300);
+    assert_eq!(pointers.get_len().await, 100 * 64);
+    let mut last = vec![0u8; 64];
+    let mut at = 99 * 64;
+    pointers.read_data_into_buffer(&mut at, &mut last).await.unwrap();
+    assert!(last.iter().all(|&b| b == 99));
+}
+
+/// A queued commit is not stored until the scope settles, so a crash before
+/// that loses the statement whole, never half of it. And an aborted
+/// transaction leaves the queue: settling must not declare it.
+#[tokio::test]
+async fn a_queued_commit_is_stored_only_by_the_settle() {
+    let store = Arc::new(CountingStore::new());
+    let handle: Arc<dyn KvStore> = store.clone();
+    let family = open_family(handle).await;
+    let rows = open(&family, "t.db").await;
+    let pointers = open(&family, "t_pointers.db").await;
+
+    let ((), settled) = super::defer_commits(async {
+        let kept = rows.begin_txn();
+        rows.append_data_txn(kept, &[1u8; 100]).await;
+        pointers.append_data_txn(kept, &[1u8; 64]).await;
+        pointers.commit_durable(kept).await.unwrap();
+
+        // What a crash right now would find: nothing of it.
+        let seen = open_family(store.clone() as Arc<dyn KvStore>).await;
+        assert_eq!(open(&seen, "t_pointers.db").await.get_len().await, 0);
+
+        let dropped = rows.begin_txn();
+        rows.append_data_txn(dropped, &[2u8; 100]).await;
+        pointers.abort_txn(dropped).await;
+    })
+    .await;
+    settled.unwrap();
+
+    let family = open_family(store.clone() as Arc<dyn KvStore>).await;
+    let rows = open(&family, "t.db").await;
+    let pointers = open(&family, "t_pointers.db").await;
+    assert_eq!(pointers.get_len().await, 64);
+    let mut first = vec![0u8; 100];
+    let mut at = 0;
+    rows.read_data_into_buffer(&mut at, &mut first).await.unwrap();
+    assert!(first.iter().all(|&b| b == 1));
+}
+
 #[tokio::test]
 async fn a_commit_spanning_many_chunks_is_still_one_put() {
     let store = Arc::new(CountingStore::new());

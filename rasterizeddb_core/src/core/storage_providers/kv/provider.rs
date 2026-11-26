@@ -697,6 +697,91 @@ impl KvFamily {
         }
     }
 
+    /// [`Self::commit`] for many transactions at once: a statement's deferred
+    /// row commits (see [`defer_commits`]). The same two steps, each taken
+    /// once for all of them instead of once each: every file holding their
+    /// records is flushed, then each declaring file writes one batch naming
+    /// every transaction it declares. So a statement of N rows costs about
+    /// two puts, not 2N — on S3 the difference between 2 ms and 0.3 s a row.
+    ///
+    /// The ordering argument is [`Self::commit`]'s, per transaction: no
+    /// declaration is written until every *other* file holding that
+    /// transaction's records has stored them. A declaring file that holds
+    /// only its own transactions' records skips the first step, as `last`
+    /// does in `commit`; one holding another declarer's records takes both.
+    async fn commit_many(&self, items: Vec<(u64, Arc<KvFile>)>) -> io::Result<()> {
+        let _declaring = self.declaring.read().await;
+        let mut failure: Option<io::Error> = None;
+        let mut live: Vec<(u64, Arc<KvFile>)> = Vec::with_capacity(items.len());
+        for (txn, last) in items {
+            if self.tainted.lock().contains(&txn) {
+                self.abort(txn);
+                failure.get_or_insert_with(|| {
+                    io::Error::other(format!(
+                        "transaction {txn} wrote to a file that could not be opened; nothing of it is committed"
+                    ))
+                });
+            } else {
+                live.push((txn, last));
+            }
+        }
+        if live.is_empty() {
+            return failure.map_or(Ok(()), Err);
+        }
+        let declares = |f: &Arc<KvFile>, txn: u64| live.iter().any(|(t, l)| *t == txn && Arc::ptr_eq(l, f));
+        let first: Vec<Arc<KvFile>> = self
+            .open_files()
+            .into_iter()
+            .chain(self.stand_ins())
+            .filter(|f| live.iter().any(|(t, _)| f.holds(*t) && !declares(f, *t)))
+            .collect();
+        let results = futures::future::join_all(first.iter().map(|f| f.flush(None))).await;
+        for result in results {
+            if let Err(e) = result {
+                // Nothing declared any of them, so all are rolled back.
+                for (txn, _) in &live {
+                    self.abort(*txn);
+                }
+                return Err(e);
+            }
+        }
+        let mut lasts: Vec<(Arc<KvFile>, Vec<u64>)> = Vec::new();
+        for (txn, last) in &live {
+            match lasts.iter_mut().find(|(l, _)| Arc::ptr_eq(l, last)) {
+                Some((_, txns)) => txns.push(*txn),
+                None => lasts.push((last.clone(), vec![*txn])),
+            }
+        }
+        let results =
+            futures::future::join_all(lasts.iter().map(|(last, txns)| last.flush_commit_many(txns))).await;
+        let mut ended: Vec<u64> = Vec::new();
+        for ((_, txns), result) in lasts.iter().zip(results) {
+            match result {
+                Ok(()) => ended.extend_from_slice(txns),
+                Err(CommitFailure { error, rolled_back }) => {
+                    // As in `commit`: rolled back is forgotten, in doubt
+                    // stays open.
+                    if rolled_back {
+                        for txn in txns {
+                            self.abort(*txn);
+                        }
+                    }
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        if !ended.is_empty() {
+            for file in self.open_files() {
+                let mut state = file.state.write();
+                for txn in &ended {
+                    state.open_txns.remove(txn);
+                    state.undo.remove(txn);
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
     /// Rolls `txn` back in every open file. For a transaction nothing has
     /// declared committed, or whose declaration a stored rollback overrides.
     fn abort(&self, txn: u64) {
@@ -1982,18 +2067,25 @@ impl KvFile {
 
     /// As [`Self::flush`], for a caller already holding the flush lock.
     async fn flush_locked(&self, commit: Option<u64>) -> io::Result<()> {
-        self.write_batch(commit).await.map_err(|f| f.error)
+        self.write_batch(commit.as_slice()).await.map_err(|f| f.error)
     }
 
     /// Writes the batch that declares `txn` committed, and says, if it fails,
     /// whether the transaction is now definitely rolled back.
     async fn flush_commit(&self, txn: u64) -> Result<(), CommitFailure> {
         let _serialised = self.flush.lock().await;
-        self.write_batch(Some(txn)).await
+        self.write_batch(&[txn]).await
+    }
+
+    /// As [`Self::flush_commit`], declaring several transactions in one batch:
+    /// a statement's deferred row commits. See [`settle_deferred`].
+    async fn flush_commit_many(&self, txns: &[u64]) -> Result<(), CommitFailure> {
+        let _serialised = self.flush.lock().await;
+        self.write_batch(txns).await
     }
 
     /// The body of [`Self::flush_locked`]. Caller holds the flush lock.
-    async fn write_batch(&self, commit: Option<u64>) -> Result<(), CommitFailure> {
+    async fn write_batch(&self, commits: &[u64]) -> Result<(), CommitFailure> {
         // A dropped file's objects are being swept (`erase`), or are gone. A
         // batch put now would outlive the sweep, and a table later made under
         // the same name would replay it after a restart. Nothing reads a
@@ -2003,7 +2095,7 @@ impl KvFile {
             let mut state = self.state.write();
             // A stand-in for a file that could not be opened: writing to it is
             // an error to report, not a dropped file's writes to discard.
-            if self.poisoned && (commit.is_some() || !state.pending.is_empty() || !state.open_txns.is_empty()) {
+            if self.poisoned && (!commits.is_empty() || !state.pending.is_empty() || !state.open_txns.is_empty()) {
                 state.pending.clear();
                 state.pending_bytes = 0;
                 return Err(CommitFailure {
@@ -2015,20 +2107,23 @@ impl KvFile {
             state.pending_bytes = 0;
             state.committing.clear();
             state.aborting.clear();
-            return match commit {
-                None => Ok(()),
-                Some(txn) => Err(CommitFailure {
-                    error: io::Error::other(format!("{} was dropped; transaction {txn} cannot commit on it", self.name)),
+            return if commits.is_empty() {
+                Ok(())
+            } else {
+                Err(CommitFailure {
+                    error: io::Error::other(format!("{} was dropped; transactions {commits:?} cannot commit on it", self.name)),
                     rolled_back: true,
-                }),
+                })
             };
         }
         let (records, committed, aborted, seq, base_gen, reopen) = {
             let mut state = self.state.write();
-            let mut reopen = None;
-            if let Some(txn) = commit {
+            let mut reopen = Vec::new();
+            for &txn in commits {
                 state.committing.push(txn);
-                reopen = state.open_txns.remove(&txn).map(|low| (txn, low));
+                if let Some(low) = state.open_txns.remove(&txn) {
+                    reopen.push((txn, low));
+                }
             }
             if state.pending.is_empty()
                 && state.committing.is_empty()
@@ -2073,8 +2168,8 @@ impl KvFile {
         // flush lock, so no compaction can freeze the transaction's bytes
         // while it is in neither state.
         let mut rolled_back = false;
-        let put = match (put, commit) {
-            (Err(e), Some(txn)) => match self.resolve_in_doubt(&key, seq, txn, base_gen).await {
+        let put = match (put, commits.is_empty()) {
+            (Err(e), false) => match self.resolve_in_doubt(&key, seq, commits, base_gen).await {
                 InDoubt::Landed => Ok(()),
                 InDoubt::RolledBack => {
                     rolled_back = true;
@@ -2120,7 +2215,7 @@ impl KvFile {
                 let mut aborting = batch.aborted;
                 aborting.append(&mut state.aborting);
                 state.aborting = aborting;
-                if let Some((txn, low)) = reopen {
+                for (txn, low) in reopen {
                     let entry = state.open_txns.entry(txn).or_insert(low);
                     *entry = (*entry).min(low);
                 }
@@ -2140,12 +2235,12 @@ impl KvFile {
     /// lets override the declaration. Only once that is stored is the
     /// transaction definitely rolled back; failing either request leaves it
     /// unknown, and the transaction stays open, as it did before this existed.
-    async fn resolve_in_doubt(&self, key: &str, seq: u64, txn: u64, base_gen: u64) -> InDoubt {
+    async fn resolve_in_doubt(&self, key: &str, seq: u64, txns: &[u64], base_gen: u64) -> InDoubt {
         match self.store.get(key).await {
             Ok(Some(bytes)) => {
                 if let Ok(Some(found)) = DeltaBatch::decode(&bytes)
                     && found.seq == seq
-                    && found.committed.contains(&txn)
+                    && txns.iter().all(|txn| found.committed.contains(txn))
                 {
                     return InDoubt::Landed;
                 }
@@ -2153,7 +2248,7 @@ impl KvFile {
             Ok(None) => {}
             Err(e) => {
                 warn!(
-                    "kv: commit of transaction {txn} on {} is in doubt; it stays open: {e}",
+                    "kv: commit of transactions {txns:?} on {} is in doubt; they stay open: {e}",
                     self.name
                 );
                 return InDoubt::Unknown;
@@ -2165,7 +2260,7 @@ impl KvFile {
             base_gen,
             committed: Vec::new(),
             records: Vec::new(),
-            aborted: vec![(txn, seq)],
+            aborted: txns.iter().map(|&txn| (txn, seq)).collect(),
         };
         match self
             .store
@@ -2180,8 +2275,8 @@ impl KvFile {
             }
             Err(e) => {
                 warn!(
-                    "kv: could not record the rollback of transaction {txn} on {}; it stays \
-                     open: {e}",
+                    "kv: could not record the rollback of transactions {txns:?} on {}; they \
+                     stay open: {e}",
                     self.name
                 );
                 InDoubt::Unknown
@@ -2949,6 +3044,112 @@ fn gcd(a: u64, b: u64) -> u64 {
 /// Cloning is cheap and every clone is the same file, the way two handles onto
 /// one path are — the schema writer opens its own handle and must see what the
 /// table wrote through a different one.
+/// Row commits a statement has made and not yet stored. See [`defer_commits`].
+#[derive(Default)]
+struct DeferredCommits {
+    list: Mutex<Vec<(Arc<KvFamily>, u64, Arc<KvFile>)>>,
+}
+
+impl Drop for DeferredCommits {
+    /// A statement dropped before it settled (its client went away) still
+    /// has commits the engine was told succeeded, and transactions every file
+    /// keeps open — holding compaction off — until they end. Stored rather
+    /// than abandoned: what the engine believes committed is what it reads.
+    fn drop(&mut self) {
+        let items = std::mem::take(&mut *self.list.lock());
+        if items.is_empty() {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if let Err(e) = settle_list(items).await {
+                        warn!("kv: storing an abandoned statement's commits failed: {e}");
+                    }
+                });
+            }
+            Err(_) => warn!("kv: {} deferred commits dropped with no runtime to store them", items.len()),
+        }
+    }
+}
+
+tokio::task_local! {
+    static DEFERRED: Arc<DeferredCommits>;
+}
+
+/// Runs `fut` with this backend's row commits deferred to its end.
+///
+/// Every row an `INSERT`, `UPDATE` or `DELETE` writes is its own storage
+/// transaction, committed by `commit_durable` as the row is written. The file
+/// backend logs each commit and pays one `fdatasync` for the statement
+/// (`Database::sync_durable`); here a commit is a put, so a 100-row statement
+/// was 200 round trips to the store — 39 s on S3. Inside this scope a commit
+/// is queued and [`settle_deferred`] stores all of them in about two puts.
+///
+/// The second value is that settle, run on every path out of `fut`. The
+/// caller must also settle *before* it makes the transaction's outcome
+/// durable (`commit_written_transaction`): rows before outcome, as on disk.
+/// Nested scopes join the outermost, which settles.
+///
+/// Until settled, a queued commit's bytes are in its files' overlays, read
+/// back like any pending write, and its transaction stays open in every file,
+/// so no compaction folds them.
+pub async fn defer_commits<F: std::future::Future>(fut: F) -> (F::Output, io::Result<()>) {
+    if DEFERRED.try_with(|_| ()).is_ok() {
+        return (fut.await, Ok(()));
+    }
+    DEFERRED
+        .scope(Arc::new(DeferredCommits::default()), async move {
+            let out = fut.await;
+            (out, settle_deferred().await)
+        })
+        .await
+}
+
+/// Stores every commit the current [`defer_commits`] scope has queued. A
+/// no-op outside one. An error means some of them are not stored: the
+/// statement has failed and its transaction must not commit.
+pub async fn settle_deferred() -> io::Result<()> {
+    let Ok(items) = DEFERRED.try_with(|d| std::mem::take(&mut *d.list.lock())) else {
+        return Ok(());
+    };
+    settle_list(items).await
+}
+
+async fn settle_list(items: Vec<(Arc<KvFamily>, u64, Arc<KvFile>)>) -> io::Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut families: Vec<(Arc<KvFamily>, Vec<(u64, Arc<KvFile>)>)> = Vec::new();
+    for (family, txn, last) in items {
+        match families.iter_mut().find(|(f, _)| Arc::ptr_eq(f, &family)) {
+            Some((_, list)) => list.push((txn, last)),
+            None => families.push((family, vec![(txn, last)])),
+        }
+    }
+    let mut outcome = Ok(());
+    for (family, list) in families {
+        if let Err(e) = family.commit_many(list).await
+            && outcome.is_ok()
+        {
+            outcome = Err(e);
+        }
+    }
+    outcome
+}
+
+/// Queues `txn` in the current scope, if there is one.
+fn defer(family: &Arc<KvFamily>, txn: u64, last: &Arc<KvFile>) -> bool {
+    DEFERRED
+        .try_with(|d| d.list.lock().push((family.clone(), txn, last.clone())))
+        .is_ok()
+}
+
+/// Takes `txn` out of the current scope's queue: it is being aborted.
+fn undefer(txn: u64) {
+    let _ = DEFERRED.try_with(|d| d.list.lock().retain(|(_, t, _)| *t != txn));
+}
+
 pub struct KvStorageProvider {
     family: Arc<KvFamily>,
     file: Arc<KvFile>,
@@ -3124,7 +3325,9 @@ impl KvStorageProvider {
         }
         let txn = side.begin_txn();
         let token = side.write_data_txn(txn, 0, &bytes).await;
-        side.commit_durable(token).await?;
+        // Stored now, never deferred: the compaction below folds only
+        // committed bytes.
+        side.family.commit(token, &side.file).await?;
         if let Err(e) = side.compact_now().await {
             warn!("kv: the snapshot sidecar {} stays a delta: {e}", side.file.name);
         }
@@ -3154,6 +3357,7 @@ impl KvStorageProvider {
     /// The background service does this on a timer; call it directly before a
     /// clean shutdown, which the trait has no hook for.
     pub async fn flush(&self) -> io::Result<()> {
+        settle_deferred().await?;
         self.file.flush(None).await
     }
 
@@ -3168,6 +3372,9 @@ impl KvStorageProvider {
     }
 
     pub async fn compact_now(&self) -> io::Result<()> {
+        // A queued commit is an open transaction, which a compaction leaves
+        // in the overlay: settled first, so "now" folds the statement's rows.
+        settle_deferred().await?;
         // Detached, so dropping the caller cannot cancel it part way: a put
         // already sent (a local store's runs on a blocking thread) can still
         // land after the guard has let the next compaction or sweep in.
@@ -3346,6 +3553,11 @@ impl StorageIO for KvStorageProvider {
         if token == 0 {
             return Ok(());
         }
+        // Inside a statement's scope: stored with the statement's other
+        // commits when it settles. See `defer_commits`.
+        if defer(&self.family, token, &self.file) {
+            return Ok(());
+        }
         // Not `self.file.flush`: the transaction's other half is in another
         // file, and committing only this one would store a pointer whose row
         // bytes are not there. See [`KvFamily`].
@@ -3354,6 +3566,7 @@ impl StorageIO for KvStorageProvider {
 
     async fn abort_txn(&self, token: u64) {
         if token != 0 {
+            undefer(token);
             self.family.abort(token);
         }
     }
@@ -3416,6 +3629,8 @@ impl StorageIO for KvStorageProvider {
     }
 
     async fn truncate(&self, len: u64) -> IOResult<()> {
+        // Queued commits are stored before anything is cut or rewritten.
+        settle_deferred().await?;
         self.file.truncate_to(len).await
     }
 
@@ -3503,6 +3718,11 @@ impl StorageIO for KvStorageProvider {
     async fn swap_temp(&self, temp_io_sync: &mut Self) {
         if Arc::ptr_eq(&self.file, &temp_io_sync.file) {
             return;
+        }
+        // The scratch generation adopts stored objects: a commit still queued
+        // on it would be left behind.
+        if let Err(e) = settle_deferred().await {
+            error!("kv: storing queued commits before a swap of {} failed: {e}", self.file.name);
         }
         if let Err(e) = self.file.adopt(&temp_io_sync.file).await {
             // No error channel in the trait, and the alternative — swapping the
