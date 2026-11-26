@@ -7,6 +7,9 @@
 //! it fail: a suite of happy paths would pass against an authenticator that
 //! returns `Ok` for everyone.
 
+// As the library and the server binary: proving this file's server future
+// `Send` runs past the default 128 since the database gained the broker.
+#![recursion_limit = "256"]
 use std::sync::Arc as StdArc;
 use std::time::Duration;
 
