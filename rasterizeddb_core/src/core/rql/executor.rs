@@ -22087,8 +22087,32 @@ pub async fn execute_with_sync(
     .await
 }
 
+/// Whether `query` runs with key/value-store row commits deferred to its
+/// end (`defer_kv_commits`): the statements that write rows. Not DDL, whose
+/// files have to be stored before the catalogue names them.
+fn defers_kv_commits(query: &QueryPurpose) -> bool {
+    matches!(
+        query,
+        QueryPurpose::InsertRow(_) | QueryPurpose::UpdateRow(_) | QueryPurpose::DeleteRow(_) | QueryPurpose::QueryRows(_)
+    )
+}
+
 /// [`execute_with_sync`] inside its owner scope.
 async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: bool) -> Vec<u8> {
+    if !defers_kv_commits(&query) {
+        return Box::pin(execute_autocommit_body(query, database, wait)).await;
+    }
+    // The commit settles the queue before the outcome; this settles whatever
+    // a failed or rowless statement left in it.
+    let (response, settled) =
+        crate::core::storage_providers::defer_kv_commits(Box::pin(execute_autocommit_body(query, database, wait))).await;
+    if let Err(e) = settled {
+        error!("A statement's key/value rows could not be stored after it ended: {e}");
+    }
+    response
+}
+
+async fn execute_autocommit_body(query: QueryPurpose, database: Arc<Database>, wait: bool) -> Vec<u8> {
     // Autocommit: a statement arriving outside an explicit transaction still
     // gets one. It has to. A DELETE has to stamp `xmax` with an id that other
     // snapshots can order themselves against, and reclamation reads a bare
@@ -22333,7 +22357,13 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
     // commit, not after: once committed, any session's root flush can carry
     // this outcome to disk, and it must not get there ahead of them. In both
     // `wait` modes — see `Database::commit_written_transaction`.
-    let family = match database.commit_written_transaction(tx) {
+    // A key/value table's rows, which the statement's scope queued, go to
+    // the store first for the same reason (`defer_kv_commits`).
+    let committed = match crate::core::storage_providers::settle_kv_commits().await {
+        Ok(()) => database.commit_written_transaction(tx),
+        Err(e) => Err(e),
+    };
+    let family = match committed {
         Ok(family) => family,
         Err(e) => {
             error!("Could not make the written rows durable: {}", e);
@@ -22607,6 +22637,31 @@ pub async fn execute_in_txn(query: QueryPurpose, database: Arc<Database>, tx: Tx
 }
 
 async fn execute_in_txn_inner(query: QueryPurpose, database: Arc<Database>, tx: TxId) -> Vec<u8> {
+    if !defers_kv_commits(&query) {
+        return Box::pin(execute_in_txn_body(query, database, tx)).await;
+    }
+    // Settled as the statement ends, so a block's COMMIT finds its rows
+    // stored. A failure fails the statement: the block cannot commit rows
+    // the store does not hold.
+    let (response, settled) =
+        crate::core::storage_providers::defer_kv_commits(Box::pin(execute_in_txn_body(query, database, tx))).await;
+    match settled {
+        Ok(()) => response,
+        Err(e) => {
+            error!("A statement's key/value rows could not be stored: {e}");
+            if response.first() == Some(&3) {
+                return response;
+            }
+            let mut failed = vec![3u8];
+            failed.extend_from_slice(
+                format!("could not commit: the rows written could not be made durable ({e})").as_bytes(),
+            );
+            failed
+        }
+    }
+}
+
+async fn execute_in_txn_body(query: QueryPurpose, database: Arc<Database>, tx: TxId) -> Vec<u8> {
     let retry_sql = query_sql(&query);
     // `InsertRow` for the same reason the autocommit path replays it: the
     // uniqueness check runs before the row is written, so a statement it

@@ -20,7 +20,7 @@ pub mod s3_store;
 #[cfg(test)]
 mod tests;
 
-pub use provider::{KvConfig, KvFamily, KvStorageProvider};
+pub use provider::{KvConfig, KvFamily, KvStorageProvider, defer_commits, settle_deferred};
 pub use store::{KvStore, LocalDirStore, MemoryKvStore, ObjectInfo};
 
 #[cfg(all(feature = "kv_storage_s3", feature = "s3_backup"))]

@@ -5,11 +5,18 @@ name: Release - client crates
 #   rastcp (when its version is not on crates.io yet)
 #   rasterizeddb_client_derive
 #   rasterizeddb_client
-# and creates the GitHub release for the tag.
+# and creates the GitHub release for the tag. The .NET driver and EF Core
+# provider (dotnet/: RasterizedDb.Data, RasterizedDb.EntityFrameworkCore) go to
+# nuget.org at the same version, from the `nuget` job.
 #
 # Needs the repository secret CARGO_REGISTRY_TOKEN (a crates.io token with
-# publish-new and publish-update scopes). Run it by hand with dry_run to see
-# what would be published without publishing.
+# publish-new and publish-update scopes), and for NuGet either the secret
+# NUGET_API_KEY (a nuget.org key scoped to push RasterizedDb.*) or nuget.org
+# Trusted Publishing (a policy for this repository, workflow file
+# release-client.yml, environment `nuget`, plus the repository variable
+# NUGET_USER, the nuget.org account that owns the packages). The job runs in
+# the GitHub environment `nuget`, which must exist. Run it by hand with
+# dry_run to see what would be published without publishing.
 
 on:
   push:
@@ -101,3 +108,71 @@ jobs:
             [dependencies]
             rasterizeddb_client = "<version>"  # this tag without the client-v prefix
             ```
+
+  # RasterizedDb.Data and RasterizedDb.EntityFrameworkCore to nuget.org, at the
+  # tag's version (client-v1.2.3 -> 1.2.3), after the crates. nuget.org
+  # Trusted Publishing: NuGet/login exchanges this job's GitHub OIDC token for
+  # a short-lived API key, which needs `id-token: write` and the `nuget`
+  # environment named in the nuget.org policy. A dry run only packs.
+  nuget:
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: nuget
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # Job-level so a step's `if:` can see whether a key is stored.
+      STORED_KEY: ${{ secrets.NUGET_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: Version from the tag
+        id: version
+        shell: bash
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            v="${GITHUB_REF_NAME#client-v}"
+          else
+            v="$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' dotnet/Directory.Build.props | head -1)"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "packing $v"
+
+      - name: Pack
+        run: >
+          dotnet pack dotnet/RasterizedDb.sln -c Release
+          -p:Version=${{ steps.version.outputs.version }}
+          -p:ContinuousIntegrationBuild=true
+          --output nupkgs
+
+      - name: The packages
+        run: ls -l nupkgs
+
+      # A stored key (secret NUGET_API_KEY, scoped to push RasterizedDb.*) is
+      # used when there is one; otherwise Trusted Publishing gives a
+      # short-lived key for this run.
+      - name: NuGet login (Trusted Publishing, when no key is stored)
+        if: (github.event_name == 'push' || !inputs.dry_run) && env.STORED_KEY == ''
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: ${{ vars.NUGET_USER }}
+
+      - name: Push to nuget.org
+        if: github.event_name == 'push' || !inputs.dry_run
+        env:
+          NUGET_KEY: ${{ env.STORED_KEY != '' && env.STORED_KEY || steps.login.outputs.NUGET_API_KEY }}
+        run: >
+          dotnet nuget push "nupkgs/*.nupkg"
+          --api-key "$NUGET_KEY"
+          --source https://api.nuget.org/v3/index.json
+          --skip-duplicate

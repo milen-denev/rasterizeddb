@@ -157,3 +157,30 @@ mod crc_tests {
         }
     }
 }
+
+/// Runs `fut` with key/value-store row commits deferred to its end, and
+/// stores them there: the second value says whether that worked. See
+/// [`kv::defer_commits`]. Without `kv_storage`, just `fut`.
+pub async fn defer_kv_commits<F: std::future::Future>(fut: F) -> (F::Output, std::io::Result<()>) {
+    #[cfg(feature = "kv_storage")]
+    {
+        kv::defer_commits(fut).await
+    }
+    #[cfg(not(feature = "kv_storage"))]
+    {
+        (fut.await, Ok(()))
+    }
+}
+
+/// Stores the commits the current [`defer_kv_commits`] scope has queued, ahead
+/// of a transaction's outcome. A no-op outside one.
+pub async fn settle_kv_commits() -> std::io::Result<()> {
+    #[cfg(feature = "kv_storage")]
+    {
+        kv::settle_deferred().await
+    }
+    #[cfg(not(feature = "kv_storage"))]
+    {
+        Ok(())
+    }
+}

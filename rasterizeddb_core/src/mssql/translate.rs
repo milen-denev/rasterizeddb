@@ -1626,6 +1626,11 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
         }
         "LOG10" => call("log", args(cx)?),
         "RAND" => vec![Token::raw("random()")],
+        // The value rounded and its type kept (`expr::TextFunc::RoundKept`):
+        // `ROUND(price, 2)` over a `decimal(19,6)` is 7.990000, which
+        // PostgreSQL's `round` returns as 7.99, a numeric of two places;
+        // a float stays a float, an integer an integer. A third argument
+        // that is not 0 truncates.
         "ROUND" => {
             let a = args(cx)?;
             if a.len() == 3 {
@@ -1634,10 +1639,12 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
                 let mut a = a;
                 a.truncate(2);
                 if truncate {
-                    call("trunc", a)
+                    call("__rdb_trunc_kept", a)
                 } else {
-                    call("round", a)
+                    call("__rdb_round_kept", a)
                 }
+            } else if a.len() == 2 {
+                call("__rdb_round_kept", a)
             } else {
                 call("round", a)
             }

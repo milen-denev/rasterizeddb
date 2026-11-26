@@ -110,5 +110,13 @@ async fn a_grouped_query_sorts_by_what_it_does_not_select() {
     assert_eq!(rows("WITH w AS (SELECT k, n FROM g WHERE n IS NOT NULL) SELECT k FROM w GROUP BY k ORDER BY sum(n)").await, ["b", "a", "c"]);
     // One whose every sort term is an item is answered as it was.
     assert_eq!(rows("SELECT k, count(*) FROM g GROUP BY k ORDER BY count(*) DESC, k").await, ["b|3", "a|2", "c|1"]);
+    // And so is one sorted by an aggregate the list has under a cast alone
+    // (the Rust ORM's `CAST(SUM(x) AS BIGINT)` selected, `SUM(x)` sorted
+    // by, with a HAVING): left as written, no derived table.
+    assert_eq!(
+        rows("SELECT k, CAST(SUM(n) AS BIGINT) FROM g GROUP BY k HAVING COUNT(*) >= 2 ORDER BY SUM(n) DESC").await,
+        ["a|6", "b|3"]
+    );
+    assert_eq!(rows("SELECT k, sum(n)::bigint AS s FROM g GROUP BY k ORDER BY sum(n) DESC NULLS LAST, k").await, ["c|9", "a|6", "b|3"]);
 }
 
