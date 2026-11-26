@@ -5312,6 +5312,14 @@ fn relation_column_names(database: &Database, name: &str) -> Option<Vec<String>>
     )
 }
 
+/// [`relation_column_names`] and the hidden columns a copy of the relation
+/// carries (`cte::carried_hidden_columns`): what `join_on` copies.
+fn relation_column_names_carried(database: &Database, name: &str) -> Option<Vec<String>> {
+    let mut names = relation_column_names(database, name)?;
+    names.extend(crate::core::rql::cte::carried_hidden_columns(name, database));
+    Some(names)
+}
+
 pub(crate) async fn describe_query(
     database: &Arc<Database>,
     query: &str,
@@ -5468,7 +5476,7 @@ pub(crate) async fn describe_query(
     let stmt = grouping_sets.as_deref().unwrap_or(stmt);
     let window_join = crate::core::rql::window_join::rewrite_statement(stmt, &|name| relation_column_names(database, name));
     let stmt = window_join.as_deref().unwrap_or(stmt);
-    let join_on = crate::core::rql::join_on::rewrite_statement(stmt, &|name| relation_column_names(database, name));
+    let join_on = crate::core::rql::join_on::rewrite_statement(stmt, &|name| relation_column_names_carried(database, name));
     let stmt = join_on.as_deref().unwrap_or(stmt);
     let distinct_on = crate::core::rql::distinct_on::rewrite_statement(stmt);
     let stmt = distinct_on.as_deref().unwrap_or(stmt);
@@ -8639,7 +8647,7 @@ pub(crate) fn rewrite_statement_text<'a>(
     // A join operand that is an expression (`ON a.g = b.id::text`), computed
     // by a derived table standing in for its relation (`core::rql::join_on`).
     // After the window rewrite, whose inner query may hold the join.
-    let join_on = crate::core::rql::join_on::rewrite_statement(&stmt, &|name| relation_column_names(database, name));
+    let join_on = crate::core::rql::join_on::rewrite_statement(&stmt, &|name| relation_column_names_carried(database, name));
     take(&mut stmt, join_on);
     // `DISTINCT ON` over a join or with an aggregate or a window: the same
     // statement over a derived table, before anything reads its table set

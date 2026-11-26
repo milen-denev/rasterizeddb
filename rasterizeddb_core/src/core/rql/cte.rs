@@ -1136,6 +1136,70 @@ pub(crate) fn relation_labels(relation: &str, database: &Arc<Database>) -> Optio
     Some(fields.into_iter().map(|f| f.name).collect())
 }
 
+/// The hidden columns of `relation` that a copy of its rows carries with
+/// them: each time column's 100 ns digit (`nullable::TICK_DIGIT_PREFIX`),
+/// which the SQL Server front end reads beside the column, by name. A copy
+/// made of the visible columns alone (the outer item of a `LATERAL` join,
+/// a relation with a computed join operand) answered `column
+/// d.__t7_saleexpiration does not exist` for a `datetime2` selected beside
+/// a correlated subquery. The other hidden columns are the copy's own to
+/// make: its NULL flags and collation keys.
+pub(crate) fn carried_hidden_columns(relation: &str, database: &Database) -> Vec<String> {
+    let Some(view) = database.schema_view(relation) else {
+        return Vec::new();
+    };
+    let mut fields: Vec<_> =
+        view.schema().fields.iter().filter(|f| !f.is_deleted && crate::core::rql::nullable::is_tick_digit(&f.name)).cloned().collect();
+    fields.sort_by_key(|f| f.write_order);
+    fields.into_iter().map(|f| f.name).collect()
+}
+
+/// [`relation_labels`] and [`carried_hidden_columns`]: every column a copy
+/// of `relation` holds.
+pub(crate) fn relation_labels_carried(relation: &str, database: &Arc<Database>) -> Option<Vec<String>> {
+    let mut labels = relation_labels(relation, database)?;
+    labels.extend(carried_hidden_columns(relation, database));
+    Some(labels)
+}
+
+/// `body`, a derived table that is the whole rows of its one relation
+/// (`SELECT a.* FROM t a …`, `SELECT * FROM t …`), naming the hidden columns
+/// a copy carries ([`carried_hidden_columns`]) after the star; `None` when
+/// it is not that, or the relation has none.
+pub(crate) fn whole_rows_with_hidden(body: &str, database: &Database) -> Option<String> {
+    use crate::core::rql::join::find_keyword;
+    if crate::core::rql::join::statement_has_join(body) {
+        return None;
+    }
+    let star = select_list_of(body)?.trim();
+    let from = find_keyword(body, "FROM", 0)?;
+    let from_end = crate::core::rql::lateral::clause_end_of_from(body);
+    if from_end <= from {
+        return None;
+    }
+    let items = crate::core::rql::lateral::items_before(body, from_end);
+    let [(alias, relation)] = items.as_slice() else {
+        return None;
+    };
+    if relation.trim_start().starts_with('(') {
+        return None;
+    }
+    let qualifier = star.strip_suffix(".*").map(|q| q.trim().trim_matches('"'));
+    if !(star == "*" || qualifier.is_some_and(|q| q == alias)) {
+        return None;
+    }
+    let hidden = carried_hidden_columns(relation.trim().trim_matches('"'), database);
+    if hidden.is_empty() {
+        return None;
+    }
+    let quoted = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    // Read as a value and named as it was: a hidden column is not a select
+    // item by its name ("column d.__t7_at does not exist").
+    let extra: Vec<String> =
+        hidden.iter().map(|c| format!("CAST({}.{} AS smallint) AS {}", quoted(alias), quoted(c), quoted(c))).collect();
+    Some(format!("{}, {} {}", body[..from].trim_end(), extra.join(", "), &body[from..]))
+}
+
 /// A `LATERAL` item's relation (`lateral::materialize`): each of `runs` is the
 /// item with one tuple of outer values substituted and those values' keys;
 /// its rows are written with the keys after its own columns, as
@@ -2189,7 +2253,10 @@ fn joined_collations(query: &str, labels: &[String], database: &Arc<Database>) -
     // A star's columns: the relation's own, in its order, each under the
     // name the output has at that place (checked below).
     let starred = |fields: &[SchemaField], out: &mut Vec<(Option<String>, Option<&'static str>)>| {
-        for field in fields.iter().filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name)) {
+        let mut visible: Vec<&SchemaField> =
+            fields.iter().filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name)).collect();
+        visible.sort_by_key(|f| f.write_order);
+        for field in visible {
             out.push((Some(field.name.clone()), collation_of(field, fields)));
         }
     };
@@ -3205,6 +3272,8 @@ async fn materialize_derived_inner(
             Some(narrowed) => narrowed,
             None => inner,
         };
+        // A copy of whole rows carries the hidden columns read by name.
+        let inner = whole_rows_with_hidden(&inner, database).unwrap_or(inner);
         let temp = materialize_query(&inner, &alias, &current, database, tx).await?;
         temps.push(temp.clone());
         current = format!("{}{} {}{}", &current[..start], temp, alias, &current[end..]);

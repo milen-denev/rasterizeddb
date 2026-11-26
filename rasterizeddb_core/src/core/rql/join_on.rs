@@ -158,7 +158,19 @@ fn rewrite_select(sql: &str, columns_of: &dyn Fn(&str) -> Option<Vec<String>>) -
     for (i, segment) in segments.iter().enumerate() {
         if !computed[i].is_empty() {
             let columns = known[i].1.as_ref()?;
-            let mut items: Vec<String> = columns.iter().map(|c| quote(c)).collect();
+            // A hidden column the copy carries (a time column's 100 ns
+            // digit, `cte::carried_hidden_columns`) is not a select item by
+            // its name: read as a value, and named as it was.
+            let mut items: Vec<String> = columns
+                .iter()
+                .map(|c| {
+                    if crate::core::rql::nullable::is_hidden(c) {
+                        format!("CAST({}.{} AS smallint) AS {}", relations[i].label, quote(c), quote(c))
+                    } else {
+                        quote(c)
+                    }
+                })
+                .collect();
             items.extend(computed[i].iter().cloned());
             let span = &source[segment.relation.0..segment.relation.1];
             out_source.push_str(&source[copied..segment.relation.0]);
@@ -202,7 +214,9 @@ fn rewrite_select(sql: &str, columns_of: &dyn Fn(&str) -> Option<Vec<String>>) -
                 expanded.push(raw.to_string());
                 continue;
             }
-            for c in columns.as_ref()? {
+            // Not the hidden columns the copy carries beside them (a time
+            // column's 100 ns digit): a star never shows those.
+            for c in columns.as_ref()?.iter().filter(|c| !crate::core::rql::nullable::is_hidden(c)) {
                 expanded.push(format!("{label}.{}", quote(c)));
             }
         }
