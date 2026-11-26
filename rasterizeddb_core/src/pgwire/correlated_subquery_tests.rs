@@ -68,7 +68,7 @@ pub(super) async fn pg_rows(db: &Arc<Database>, s: &mut Session, sql: &str) -> V
 }
 
 /// A statement's rows over native, each cell as text.
-async fn native_rows(db: &Arc<Database>, sql: &str) -> Vec<Vec<Option<String>>> {
+pub(super) async fn native_rows(db: &Arc<Database>, sql: &str) -> Vec<Vec<Option<String>>> {
     let out = crate::core::database::run_native_query_for_tests(sql, db.clone()).await;
     assert_eq!(out.first(), Some(&2u8), "{sql}: {}", String::from_utf8_lossy(&out));
     crate::core::row::row::vec_into_rows(&out[1..])

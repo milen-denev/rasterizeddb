@@ -769,6 +769,44 @@ async fn a_correlated_subquery_in_a_grouped_select_answers_as_postgresql_does() 
     assert_eq!(sqlstate_of(&e), "0A000", "{e}");
 }
 
+/// A grouped query sorted by an aggregate its select list has under a cast
+/// alone is answered as written, over both protocols. The Rust ORM selects
+/// `CAST(SUM("amount") AS BIGINT)` (a type the native protocol decodes) and
+/// sorts by the bare `SUM("amount")`; the fold always sorted that by the
+/// item. The rewrite for a sort term the list does not hold
+/// (`distinct_on::rewrite_grouped_order`) judged by whole expressions, made
+/// the statement a derived table, and the native protocol refused the
+/// engine's own text ("WITH (a CTE) and FROM (SELECT …) … are not supported
+/// over the native protocol yet").
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sort_by_an_aggregate_selected_under_a_cast_is_answered_as_written() {
+    use super::correlated_subquery_tests::native_rows;
+    let db = db().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE gsale (id BIGINT NOT NULL PRIMARY KEY, region TEXT NOT NULL, amount BIGINT NOT NULL)").await;
+    ok(&db, &mut s, "INSERT INTO gsale VALUES (1, 'north', 10), (2, 'north', 20), (3, 'east', -3), (4, 'east', 2), (5, 'west', 7), (6, 'south', 1), (7, 'south', 3)")
+        .await;
+    let want = vec![
+        r(&[Some("north"), Some("2"), Some("30")]),
+        r(&[Some("south"), Some("2"), Some("4")]),
+        r(&[Some("east"), Some("2"), Some("-1")]),
+    ];
+    for sql in [
+        "SELECT \"region\", COUNT(*), CAST(SUM(\"amount\") AS BIGINT) FROM \"gsale\" GROUP BY \"region\" HAVING COUNT(*) >= 2 ORDER BY SUM(\"amount\") DESC",
+        "SELECT region, count(*), sum(amount)::bigint AS total FROM gsale GROUP BY region HAVING count(*) >= 2 ORDER BY sum(amount) DESC",
+    ] {
+        assert_eq!(crate::core::rql::distinct_on::rewrite_grouped_order(sql), None, "{sql}");
+        assert_eq!(one(&db, &mut s, sql).await, want, "{sql}");
+        assert_eq!(native_rows(&db, sql).await, want, "{sql}");
+    }
+    // Sorted by an aggregate the list does not hold: computed beside the
+    // items, over pgwire (a derived table, which native does not have).
+    assert_eq!(
+        one(&db, &mut s, "SELECT region FROM gsale GROUP BY region ORDER BY sum(amount) DESC").await,
+        vec![r(&[Some("north")]), r(&[Some("west")]), r(&[Some("south")]), r(&[Some("east")])]
+    );
+}
+
 /// `x [NOT] BETWEEN … AND …` with a constant NULL bound, and `BETWEEN
 /// SYMMETRIC`, answer as PostgreSQL 17 does. A NULL bound reached the planner
 /// as a column named NULL (42703 "unknown identifier 'NULL'") and SYMMETRIC
