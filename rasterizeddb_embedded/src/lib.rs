@@ -476,6 +476,21 @@ impl Builder {
         self.config("wal.prealloc_kb", kib.to_string())
     }
 
+    /// Starts past a damaged log, losing what follows the damage
+    /// (`--wal-truncate-damaged`, default off). A log with a record that
+    /// fails its checks and whole records after it is damage, not the torn
+    /// tail of a crash, and the start refuses, naming the log, the byte and
+    /// the commits after it. With this on, the records before the damage are
+    /// replayed, everything from it on is dropped, and an ERROR says what
+    /// went. Writes after the damage that had reached the data files may
+    /// survive in part, so the result is not a clean point in time: check
+    /// it. Restore from a backup instead when those commits matter, and copy
+    /// the log first. This start only: never saved to the settings file.
+    pub fn wal_truncate_damaged(mut self, on: bool) -> Self {
+        self.settings.wal_truncate_damaged = on;
+        self
+    }
+
     /// Compacts tables and partitions whose pointer slots are mostly dead
     /// without being asked (`--auto-compact`, default on; hot:
     /// `auto_compact.enabled`, and the other `auto_compact.*` keys through
