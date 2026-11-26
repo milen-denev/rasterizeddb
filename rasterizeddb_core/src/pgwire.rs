@@ -5995,7 +5995,7 @@ fn describe_aggregate_over_derived(stmt: &str) -> Option<Vec<(String, DbType)>> 
 /// was something else and the caller should not pretend otherwise.
 /// `sql` without its top-level WHERE clause, the rest kept (GROUP BY,
 /// HAVING, ORDER BY, LIMIT): what a description reads is the same.
-fn without_where(sql: &str) -> Option<String> {
+pub(crate) fn without_where(sql: &str) -> Option<String> {
     use crate::core::rql::join::find_keyword;
     let at = find_keyword(sql, "WHERE", 0)?;
     let end = ["GROUP", "HAVING", "WINDOW", "ORDER", "LIMIT", "OFFSET", "FETCH", "FOR"]

@@ -665,12 +665,25 @@ async fn relation_columns(
     scales: Option<&[u32]>,
     database: &Arc<Database>,
 ) -> Result<Vec<RelationColumn>, usize> {
-    let described: Vec<DbType> = match Box::pin(crate::pgwire::describe_query(database, query)).await {
-        Ok(Some((fields, _))) if fields.len() == labels.len() => {
-            fields.into_iter().map(|(_, ty)| ty).collect()
-        }
-        _ => Vec::new(),
+    // Described without its row filter first: the types are the select
+    // list's and the relations', which a WHERE decides none of, and
+    // describing one runs the subqueries it holds. A copy filtered by an
+    // EXISTS ran that EXISTS once more to learn its columns' types, each
+    // copy. (One SELECT only: a set operation's WHERE is a branch's.)
+    let unfiltered = if ["UNION", "INTERSECT", "EXCEPT"].iter().any(|w| crate::core::rql::join::find_keyword(query, w, 0).is_some()) {
+        None
+    } else {
+        crate::pgwire::without_where(query)
     };
+    let mut described: Vec<DbType> = Vec::new();
+    for text in unfiltered.as_deref().into_iter().chain(std::iter::once(query)) {
+        if let Ok(Some((fields, _))) = Box::pin(crate::pgwire::describe_query(database, text)).await {
+            if fields.len() == labels.len() {
+                described = fields.into_iter().map(|(_, ty)| ty).collect();
+                break;
+            }
+        }
+    }
     // A typed array is described as `DbType::ARRAYOF`, the wire's word for
     // it: here it is the `ARRAY` it is stored as, of that element type. Left
     // as it was, no relation type matched it and the column became `TEXT`,
