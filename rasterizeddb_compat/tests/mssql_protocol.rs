@@ -2614,3 +2614,103 @@ async fn tiberius_guid_tiebreak_through_a_left_join() {
     assert_eq!(texts(&r[1]), [Some("NO".to_string())]);
     assert!(batch(&mut c, "INSERT INTO [V] ([Id], [ListingOrder], [Hidden], [N]) VALUES (NEWID(), NULL, 0, 9)").await.is_err());
 }
+
+/// EF Core's category page: products joined to their category, the first
+/// image a subquery in the select list, `TOP(@p)` over an order of both
+/// tables. The subquery ran for every product the category has before the
+/// TOP kept nine (432 ms against SQL Server's 40); the rows the TOP keeps
+/// are the join's to decide, and are taken first. The answer is the one
+/// written: the case-insensitive filter on the joined table, the order by a
+/// uniqueidentifier, a product with no image, the joined table's
+/// `datetime2(7)` to its seventh digit, and the columns' names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tiberius_top_before_a_subquery_through_a_join() {
+    let s = start_with(true);
+    let mut c = connect(&s).await;
+    let guid = |kind: u8, n: u32| format!("{kind:02x}000000-0000-0000-0000-{n:012x}");
+    batch(
+        &mut c,
+        "CREATE TABLE [Cat] ([Id] uniqueidentifier PRIMARY KEY, [Slang] nvarchar(50) NOT NULL, [Made] datetime2(7) NOT NULL); \
+         CREATE TABLE [Prod] ([Id] uniqueidentifier PRIMARY KEY, [Name] nvarchar(50) NOT NULL, [CategoryId] uniqueidentifier NULL, \
+             [Status] int NOT NULL, [ListingOrder] int NOT NULL, [Price] decimal(18,2) NULL); \
+         CREATE TABLE [Img] ([Id] int PRIMARY KEY, [ProductId] uniqueidentifier NOT NULL, [Url] nvarchar(100) NOT NULL, [ListingOrder] int NOT NULL); \
+         CREATE INDEX [IX_Img_Product] ON [Img] ([ProductId])",
+    )
+    .await
+    .unwrap();
+    batch(
+        &mut c,
+        &format!(
+            "INSERT INTO [Cat] VALUES ('{}', N'phone-cases', '2026-01-02 03:04:05.1234567'), ('{}', N'other', '2026-01-02 03:04:05.7654321')",
+            guid(0xc0, 1),
+            guid(0xc0, 2)
+        ),
+    )
+    .await
+    .unwrap();
+    // Forty products: one in four in the other category, one in ten in
+    // none, one in seven not on sale. Two images for two products of three,
+    // the second listed first.
+    let category = |i: u32| if i % 10 == 0 { None } else { Some(if i % 4 == 0 { 2 } else { 1 }) };
+    let on_sale = |i: u32| i % 7 != 0;
+    let listing = |i: u32| i % 5;
+    let products: Vec<String> = (1..=40u32)
+        .map(|i| {
+            let cat = category(i).map_or("NULL".to_string(), |c| format!("'{}'", guid(0xc0, c)));
+            let price = if i % 9 == 0 { "NULL".to_string() } else { format!("{i}.50") };
+            format!("('{}', N'p{i}', {cat}, {}, {}, {price})", guid(0xa0, i), u8::from(on_sale(i)), listing(i))
+        })
+        .collect();
+    batch(&mut c, &format!("INSERT INTO [Prod] VALUES {}", products.join(", "))).await.unwrap();
+    let images: Vec<String> = (1..=40u32)
+        .filter(|i| i % 3 != 0)
+        .flat_map(|i| [format!("({}, '{}', N'i{i}a', 2)", i * 2, guid(0xa0, i)), format!("({}, '{}', N'i{i}b', 1)", i * 2 + 1, guid(0xa0, i))])
+        .collect();
+    batch(&mut c, &format!("INSERT INTO [Img] VALUES {}", images.join(", "))).await.unwrap();
+
+    let mut kept: Vec<u32> = (1..=40).filter(|i| category(*i) == Some(1) && on_sale(*i)).collect();
+    kept.sort_by_key(|i| (std::cmp::Reverse(listing(*i)), *i));
+    assert!(kept.len() > 9);
+    let sql = "SELECT TOP(@P3) [d].[Name], ROUND(COALESCE([d].[Price], 0.0), 2), \
+               (SELECT TOP(1) [d1].[Url] FROM [Img] AS [d1] WHERE [d].[Id] = [d1].[ProductId] ORDER BY [d1].[ListingOrder]), \
+               [d].[Id], [d0].[Id], [d0].[Made], [d0].[Slang] AS [Category] \
+               FROM [Prod] AS [d] LEFT JOIN [Cat] AS [d0] ON [d].[CategoryId] = [d0].[Id] \
+               WHERE [d].[Status] = @P1 AND [d0].[Slang] = @P2 \
+               ORDER BY [d].[ListingOrder] DESC, [d].[Id], [d0].[Id]";
+    for top in [9i32, 3, 100] {
+        let r = c.query(sql, &[&1i32, &"PHONE-cases", &top]).await.unwrap().into_first_result().await.unwrap();
+        let names: Vec<String> = r[0].columns().iter().map(|c| c.name().to_string()).collect();
+        assert_eq!(names[0], "Name");
+        assert_eq!(names[3..], ["Id", "Id", "Made", "Category"]);
+        let got: Vec<_> = r
+            .iter()
+            .map(|r| {
+                use chrono::Timelike;
+                let made = r.get::<chrono::NaiveDateTime, _>(5).unwrap();
+                (
+                    r.get::<&str, _>(0).unwrap().to_string(),
+                    r.get::<&str, _>(2).map(str::to_string),
+                    r.get::<uuid::Uuid, _>(3).unwrap().to_string(),
+                    r.get::<uuid::Uuid, _>(4).unwrap().to_string(),
+                    format!("{}.{:07}", made.format("%Y-%m-%d %H:%M:%S"), made.nanosecond() / 100),
+                    r.get::<&str, _>(6).unwrap().to_string(),
+                )
+            })
+            .collect();
+        let want: Vec<_> = kept
+            .iter()
+            .take(top as usize)
+            .map(|i| {
+                (
+                    format!("p{i}"),
+                    (i % 3 != 0).then(|| format!("i{i}b")),
+                    guid(0xa0, *i),
+                    guid(0xc0, 1),
+                    "2026-01-02 03:04:05.1234567".to_string(),
+                    "phone-cases".to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(got, want, "TOP {top}");
+    }
+}

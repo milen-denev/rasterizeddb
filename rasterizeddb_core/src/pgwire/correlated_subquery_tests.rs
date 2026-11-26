@@ -637,7 +637,6 @@ fn the_rows_a_limit_keeps_are_the_outer_item_s_to_decide() {
         format!("SELECT count(*), max(__cs0.__v) FROM t a {item} LIMIT 3"),
         format!("SELECT a.x, row_number() OVER (ORDER BY a.x), __cs0.__v FROM t a {item} LIMIT 3"),
         format!("SELECT a.x, __cs0.__v FROM t a {item} GROUP BY a.x, __cs0.__v LIMIT 3"),
-        format!("SELECT a.x, __cs0.__v FROM t a JOIN w ON w.id = a.id {item} LIMIT 3"),
         format!("SELECT a.x, __cs0.__v FROM t a LEFT JOIN LATERAL (SELECT v FROM u WHERE u.k = a.id) r ON true {item} LIMIT 3"),
         // A WHERE that reads an item, a parameter, a limit that is not a number.
         format!("SELECT a.x, __cs0.__v FROM t a {two} WHERE __cs1.__v > 0 LIMIT 3"),
@@ -647,6 +646,291 @@ fn the_rows_a_limit_keeps_are_the_outer_item_s_to_decide() {
         format!("SELECT a.x, __cs0.__v FROM t a {item} ORDER BY a.x LIMIT 3 FOR UPDATE"),
     ] {
         assert_eq!(cut(&left, "a", "t", 1000), None, "{left}");
+    }
+}
+
+/// [`pg_rows`], with the names of the columns.
+async fn pg_named(db: &Arc<Database>, s: &mut Session, sql: &str) -> (Vec<String>, Vec<Vec<Option<String>>>) {
+    Box::pin(execute_recorded(db, &mut s.state, &mut s.server, sql, &[], false, None))
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let (mut names, mut out) = (Vec::new(), Vec::new());
+    loop {
+        let kind = s.client.read_u8().await.unwrap();
+        let len = s.client.read_i32().await.unwrap() as usize;
+        let mut body = vec![0u8; len - 4];
+        s.client.read_exact(&mut body).await.unwrap();
+        match kind {
+            b'T' => {
+                let n = i16::from_be_bytes([body[0], body[1]]) as usize;
+                let mut at = 2;
+                for _ in 0..n {
+                    let end = at + body[at..].iter().position(|b| *b == 0).unwrap();
+                    names.push(String::from_utf8_lossy(&body[at..end]).into_owned());
+                    at = end + 1 + 18;
+                }
+            }
+            b'D' => {
+                let n = i16::from_be_bytes([body[0], body[1]]) as usize;
+                let mut at = 2;
+                let mut row = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let l = i32::from_be_bytes(body[at..at + 4].try_into().unwrap());
+                    at += 4;
+                    if l < 0 {
+                        row.push(None);
+                    } else {
+                        row.push(Some(String::from_utf8_lossy(&body[at..at + l as usize]).into_owned()));
+                        at += l as usize;
+                    }
+                }
+                out.push(row);
+            }
+            b'C' => return (names, out),
+            b'E' => panic!("{sql}: {}", String::from_utf8_lossy(&body)),
+            _ => {}
+        }
+    }
+}
+
+/// A LIMIT is taken before the select list's subqueries through a join to
+/// other tables too (`lateral::joined_cut`): the join and the WHERE decide
+/// the rows, the copy is of the rows the limit keeps with the columns read
+/// of each table, and the subqueries run for those. EF Core's category
+/// page, products joined to their category with a first-image subquery in
+/// the list and `TOP 9`, ran the subquery for every product of the
+/// category. The answers and the column names are the ones written:
+/// inner and left joins, a filter and an order on the joined table (its
+/// collation with it), a row with no partner, two joins, a filter holding
+/// a subquery; and the statements this leaves as they were.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_limit_is_taken_before_the_subqueries_through_a_join() {
+    use crate::core::rql::lateral::test_hooks::take_limited;
+    const A: &str = "ojl";
+    let db = db().await;
+    let mut s = session(&db);
+    let (products, categories, groups, images) = ("jl_products", "jl_categories", "jl_groups", "jl_images");
+    ok(&db, &mut s, &format!("CREATE TABLE {products} (id INT NOT NULL PRIMARY KEY, name TEXT, category_id INT NOT NULL, rank INT NOT NULL, note TEXT)")).await;
+    ok(&db, &mut s, &format!("CREATE TABLE {categories} (id INT NOT NULL PRIMARY KEY, slug TEXT COLLATE rdb_ci, pos INT NOT NULL, grp INT NOT NULL)")).await;
+    ok(&db, &mut s, &format!("CREATE TABLE {groups} (id INT NOT NULL PRIMARY KEY, title TEXT)")).await;
+    ok(&db, &mut s, &format!("CREATE TABLE {images} (id INT NOT NULL PRIMARY KEY, product_id INT NOT NULL, url TEXT, listing INT NOT NULL)")).await;
+    ok(&db, &mut s, &format!("CREATE INDEX {images}_product ON {images} (product_id)")).await;
+    // A product's category is `id % 6`: none for 0. Its rank repeats.
+    let category = |p: i64| p % 6;
+    let rank = |p: i64| (p * 7) % 50;
+    const SLUGS: [&str; 5] = ["b", "A", "c", "D", "e"];
+    let slug = |c: i64| SLUGS[(c - 1) as usize];
+    let pos = |c: i64| 10 - c;
+    let group = |c: i64| c % 2 + 1;
+    // Three images for three products of four; the first by listing, then id.
+    let first_url = |p: i64| -> Option<String> {
+        (p % 4 != 0).then(|| {
+            let k = (0..3i64).min_by_key(|k| ((p + k * 2) % 3, p * 3 + k)).unwrap();
+            format!("u{p}_{k}")
+        })
+    };
+    let values: Vec<String> = (1..=300i64).map(|p| format!("({p}, 'p{p}', {}, {}, 'n{p}')", category(p), rank(p))).collect();
+    ok(&db, &mut s, &format!("INSERT INTO {products} (id, name, category_id, rank, note) VALUES {}", values.join(", "))).await;
+    let values: Vec<String> = (1..=5i64).map(|c| format!("({c}, '{}', {}, {})", slug(c), pos(c), group(c))).collect();
+    ok(&db, &mut s, &format!("INSERT INTO {categories} (id, slug, pos, grp) VALUES {}", values.join(", "))).await;
+    ok(&db, &mut s, &format!("INSERT INTO {groups} (id, title) VALUES (1, 'g1'), (2, 'g2')")).await;
+    let values: Vec<String> = (1..=300i64)
+        .filter(|p| p % 4 != 0)
+        .flat_map(|p| (0..3i64).map(move |k| format!("({}, {p}, 'u{p}_{k}', {})", p * 3 + k, (p + k * 2) % 3)))
+        .collect();
+    ok(&db, &mut s, &format!("INSERT INTO {images} (id, product_id, url, listing) VALUES {}", values.join(", "))).await;
+
+    let q = |list: &str, join: &str, rest: &str| {
+        format!(
+            "SELECT {A}.name, (SELECT i.url FROM {images} i WHERE i.product_id = {A}.id ORDER BY i.listing, i.id LIMIT 1) AS url, {A}.id{list} \
+             FROM {products} {A} {join} {rest}"
+        )
+    };
+    let cell = |v: i64| Some(v.to_string());
+    let text = |v: &str| Some(v.to_string());
+    let head = |p: i64| vec![text(&format!("p{p}")), first_url(p), cell(p)];
+    let left = format!("LEFT JOIN {categories} c ON {A}.category_id = c.id");
+    let inner = format!("JOIN {categories} c ON c.id = {A}.category_id");
+    struct Case {
+        sql: String,
+        names: Vec<&'static str>,
+        want: Vec<Vec<Option<String>>>,
+    }
+    let mut cases: Vec<Case> = Vec::new();
+    // The reported shape: a left join, the filter on the joined table's
+    // case-insensitive column, the order over both, the joined table's
+    // columns as they are.
+    {
+        let mut ids: Vec<i64> = (1..=300).filter(|p| category(*p) == 4 && rank(*p) < 40).collect();
+        ids.sort_by_key(|p| (std::cmp::Reverse(rank(*p)), *p));
+        ids.truncate(9);
+        cases.push(Case {
+            sql: q(", c.id, c.slug", &left, &format!("WHERE {A}.rank < 40 AND c.slug = 'd' ORDER BY {A}.rank DESC, {A}.id, c.id LIMIT 9")),
+            names: vec!["name", "url", "id", "id", "slug"],
+            want: ids.iter().map(|p| [head(*p), vec![cell(4), text("D")]].concat()).collect(),
+        });
+    }
+    // An inner join ordered by the joined table's column, in its collation
+    // ('A' < 'b' < 'c' < 'D'; by bytes 'D' follows 'A'), with an offset.
+    {
+        let by_slug = [2i64, 1, 3, 4, 5];
+        let mut ids: Vec<i64> = Vec::new();
+        for c in by_slug {
+            let mut of: Vec<i64> = (1..=120).filter(|p| category(*p) == c).collect();
+            of.reverse();
+            ids.extend(of);
+        }
+        let ids: Vec<i64> = ids.into_iter().skip(17).take(7).collect();
+        assert_eq!(ids.iter().map(|p| category(*p)).collect::<Vec<_>>(), [2, 2, 2, 1, 1, 1, 1]);
+        cases.push(Case {
+            sql: q(", c.slug AS s", &inner, &format!("WHERE {A}.id <= 120 ORDER BY c.slug, {A}.id DESC LIMIT 7 OFFSET 17")),
+            names: vec!["name", "url", "id", "s"],
+            want: ids.iter().map(|p| [head(*p), vec![text(slug(category(*p)))]].concat()).collect(),
+        });
+    }
+    // A left join's row with no partner: NULLs of the joined table.
+    cases.push(Case {
+        sql: q(", c.slug AS s, c.pos", &left, &format!("WHERE {A}.id > 100 ORDER BY {A}.id LIMIT 12")),
+        names: vec!["name", "url", "id", "s", "pos"],
+        want: (101..=112i64)
+            .map(|p| match category(p) {
+                0 => [head(p), vec![None, None]].concat(),
+                c => [head(p), vec![text(slug(c)), cell(pos(c))]].concat(),
+            })
+            .collect(),
+    });
+    // Two joins, a value computed of both under a name.
+    {
+        let mut ids: Vec<i64> = (1..=300).filter(|p| category(*p) != 0 && group(category(*p)) == 2 && rank(*p) > 10).collect();
+        ids.sort_by_key(|p| (pos(category(*p)), std::cmp::Reverse(*p)));
+        ids.truncate(5);
+        cases.push(Case {
+            sql: q(
+                ", g.title AS t, c.pos + g.id AS x",
+                &format!("{inner} LEFT JOIN {groups} g ON g.id = c.grp"),
+                &format!("WHERE g.title = 'g2' AND {A}.rank > 10 ORDER BY g.id, c.pos, {A}.id DESC LIMIT 5"),
+            ),
+            names: vec!["name", "url", "id", "t", "x"],
+            want: ids.iter().map(|p| [head(*p), vec![text("g2"), cell(pos(category(*p)) + 2)]].concat()).collect(),
+        });
+    }
+    for case in &cases {
+        let Case { sql, names, want } = case;
+        take_runs(products, A);
+        take_limited(A);
+        let (got_names, got) = pg_named(&db, &mut s, sql).await;
+        assert_eq!(take_limited(A), 1, "{sql}");
+        assert_eq!(&got, want, "{sql}");
+        assert_eq!(&got_names, names, "{sql}");
+        // One item, run for the rows kept.
+        assert_eq!(take_runs(products, A), want.len(), "{sql}");
+        assert_eq!(&native_rows(&db, sql).await, want, "{sql}");
+        assert_eq!(take_limited(A), 1, "{sql}");
+        assert_eq!(take_runs(products, A), want.len(), "{sql}");
+    }
+    // A filter holding a subquery, no LIMIT: the rows it keeps are copied
+    // once, before anything is probed.
+    {
+        let ids: Vec<i64> = (1..30).filter(|p| category(*p) > 2 && p % 4 != 0).collect();
+        let sql = q(
+            ", c.pos",
+            &inner,
+            &format!("WHERE c.pos < 8 AND EXISTS (SELECT 1 FROM {images} x WHERE x.product_id = {A}.id) AND {A}.id < 30 ORDER BY {A}.id"),
+        );
+        take_runs(products, A);
+        let got = pg_rows(&db, &mut s, &sql).await;
+        let want: Vec<Vec<Option<String>>> = ids.iter().map(|p| [head(*p), vec![cell(pos(category(*p)))]].concat()).collect();
+        assert_eq!(got, want, "{sql}");
+        assert_eq!(take_limited(A), 1, "{sql}");
+        assert_eq!(take_runs(products, A), ids.len(), "{sql}");
+    }
+    // Left as written, and answered the same: a value computed of the
+    // joined table with no name of its own, and a column of it named bare.
+    let ids: Vec<i64> = (101..=112).collect();
+    for (list, value) in [(", c.pos + 1", 1i64), (", pos", 0)] {
+        let sql = q(list, &inner, &format!("WHERE {A}.id > 100 ORDER BY {A}.id LIMIT 10"));
+        take_runs(products, A);
+        let got = pg_rows(&db, &mut s, &sql).await;
+        let want: Vec<Vec<Option<String>>> =
+            ids.iter().filter(|p| category(**p) != 0).take(10).map(|p| [head(*p), vec![cell(pos(category(*p)) + value)]].concat()).collect();
+        assert_eq!(got, want, "{sql}");
+        assert_eq!(take_limited(A), 0, "{sql}");
+    }
+}
+
+/// [`a_limit_is_taken_before_the_subqueries_through_a_join`], the statement
+/// and its cut as text: the copy's columns and the names they have in it,
+/// the statement reading them of the copy, and what is left as written.
+#[test]
+fn the_rows_a_limit_keeps_are_the_join_s_to_decide() {
+    use crate::core::rql::lateral::joined_cut_for_tests as cut;
+    let tables: &[(&str, &[&str])] = &[("t", &["id", "x", "r", "wide"]), ("w", &["id", "y", "g", "z", "at", "__t7_at"])];
+    let item = |g: &str| format!("LEFT JOIN LATERAL (SELECT max(u.v) AS __v FROM u WHERE u.k = a.id AND u.g = {g}) __cs0 ON true");
+    let sql = format!(
+        "SELECT a.x, b.y, b.z AS \"Z\", __rdb_t7_text(b.at, b.__t7_at) AS at, __cs0.__v AS n FROM t a JOIN w b ON b.id = a.r {} \
+         WHERE b.z = 1 ORDER BY a.x DESC, b.id LIMIT 10",
+        item("b.g")
+    );
+    assert_eq!(
+        cut(&sql, "a", "t", 11, tables),
+        Ok(Some((
+            "SELECT \"a\".\"id\", \"a\".\"x\", \"b\".\"y\" AS \"rdbj0_y\", \"b\".\"z\" AS \"rdbj0_z\", \"b\".\"at\" AS \"rdbj0_at\", \
+             CAST(\"b\".\"__t7_at\" AS smallint) AS \"rdbj0___t7_at\", \"b\".\"g\" AS \"rdbj0_g\", \"b\".\"id\" AS \"rdbj0_id\" \
+             FROM t a JOIN w b ON b.id = a.r WHERE b.z = 1 ORDER BY a.x DESC, b.id LIMIT 10"
+                .to_string(),
+            format!(
+                "SELECT a.x, a.rdbj0_y AS \"y\", a.rdbj0_z AS \"Z\", __rdb_t7_text(a.rdbj0_at, a.rdbj0___t7_at) AS at, __cs0.__v AS n FROM <copy> a {} \
+                 ORDER BY a.x DESC, a.rdbj0_id",
+                item("a.rdbj0_g")
+            ),
+        )))
+    );
+    // No more outer values than rows kept: as written.
+    assert_eq!(cut(&sql, "a", "t", 10, tables), Ok(None));
+    // Two joins, a left one; the second table unaliased.
+    let sql = format!("SELECT a.x, b.y AS y, w2.id AS k, __cs0.__v FROM t AS a LEFT JOIN w AS b ON b.id = a.r INNER JOIN w2 ON w2.id = b.g {} LIMIT 3", item("1"));
+    assert_eq!(
+        cut(&sql, "a", "t", 4, &[tables[0], tables[1], ("w2", &["id"])]),
+        Ok(Some((
+            "SELECT \"a\".\"id\", \"a\".\"x\", \"b\".\"y\" AS \"rdbj0_y\", \"w2\".\"id\" AS \"rdbj1_id\" FROM t AS a LEFT JOIN w AS b ON b.id = a.r INNER JOIN w2 ON w2.id = b.g LIMIT 3"
+                .to_string(),
+            format!("SELECT a.x, a.rdbj0_y AS y, a.rdbj1_id AS k, __cs0.__v FROM <copy> a {}", item("1")),
+        )))
+    );
+    // A read of the joined table that cannot move: the statement is left.
+    for list in [
+        // A value with no name of its own (its name may be its text).
+        "a.x, b.y + 1",
+        // A column of it named bare, a whole row, a star.
+        "a.x, y",
+        "a.x, to_json(b) AS j",
+        "a.x, b.*",
+        // A column that needs its quotes.
+        "a.x, b.\"Mixed\" AS m",
+        // A column it does not have.
+        "a.x, b.missing AS m",
+    ] {
+        let sql = format!("SELECT {list}, __cs0.__v AS n FROM t a JOIN w b ON b.id = a.r {} ORDER BY a.x LIMIT 3", item("1"));
+        assert_eq!(cut(&sql, "a", "t", 1000, tables), Err(()), "{sql}");
+    }
+    // Not cut at all: a join that is not an inner or left join to a table
+    // on a plain condition, and an order that is not by qualified columns.
+    for (join, order) in [
+        ("RIGHT JOIN w b ON b.id = a.r", "a.x"),
+        ("FULL JOIN w b ON b.id = a.r", "a.x"),
+        ("CROSS JOIN w b", "a.x"),
+        ("NATURAL JOIN w b", "a.x"),
+        ("JOIN w b USING (id)", "a.x"),
+        (", w b", "a.x"),
+        ("JOIN (SELECT id, y FROM w) b ON b.id = a.r", "a.x"),
+        ("JOIN w b ON b.id = (SELECT max(id) FROM w)", "a.x"),
+        ("JOIN t a2 ON a2.id = a.r JOIN w a2 ON a2.id = a.r", "a.x"),
+        ("JOIN w b ON b.id = a.r", "y"),
+        ("JOIN w b ON b.id = a.r", "c.y"),
+        ("JOIN w b ON b.id = a.r", "b.y + 1"),
+    ] {
+        let sql = format!("SELECT a.x, __cs0.__v AS n FROM t a {join} {} ORDER BY {order} LIMIT 3", item("1"));
+        assert_eq!(cut(&sql, "a", "t", 1000, tables), Ok(None), "{sql}");
     }
 }
 
