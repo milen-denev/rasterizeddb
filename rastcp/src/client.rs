@@ -91,6 +91,7 @@ pub struct TcpClientBuilder {
     allow_tls12: bool,
     max_message_size: usize,
     max_in_flight: usize,
+    local_driver: bool,
     reconnect_when_idle_closed: bool,
 }
 
@@ -119,6 +120,8 @@ pub(crate) struct Dialer {
     pub(crate) max_message_size: usize,
     /// Only a multiplexed client has more than one request in flight.
     pub(crate) max_in_flight: usize,
+    /// See [`TcpClientBuilder::local_driver`].
+    pub(crate) local_driver: bool,
     /// See [`TcpClientBuilder::reconnect_when_idle_closed`].
     reconnect_when_idle_closed: bool,
 }
@@ -138,6 +141,7 @@ impl TcpClientBuilder {
             allow_tls12: false,
             max_message_size: crate::common::DEFAULT_MAX_MESSAGE_SIZE,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            local_driver: false,
             reconnect_when_idle_closed: false,
         }
     }
@@ -175,6 +179,21 @@ impl TcpClientBuilder {
     /// client built with [`TcpClientBuilder::build`].
     pub fn max_in_flight(mut self, requests: usize) -> Self {
         self.max_in_flight = requests.max(1);
+        self
+    }
+
+    /// Runs a multiplexed client's connection task on the caller's
+    /// [`tokio::task::LocalSet`] (`spawn_local`) instead of on the runtime.
+    ///
+    /// For a client whose every request is sent from tasks of one
+    /// `LocalSet`: the connection task and its callers then wake each other
+    /// inside that set, where a task on the runtime and one in the set take
+    /// a turn of the runtime (and a poll of the I/O driver) for each
+    /// wake-up between them. Every request must then be sent from inside
+    /// that `LocalSet`: one sent from outside it panics when it has to
+    /// open the connection. Off by default.
+    pub fn local_driver(mut self, local: bool) -> Self {
+        self.local_driver = local;
         self
     }
 
@@ -308,6 +327,7 @@ impl TcpClientBuilder {
                 auth_timeout: self.auth_timeout,
                 max_message_size: self.max_message_size,
                 max_in_flight: self.max_in_flight,
+                local_driver: self.local_driver,
                 reconnect_when_idle_closed: self.reconnect_when_idle_closed,
             });
         }
@@ -398,6 +418,7 @@ impl TcpClientBuilder {
             auth_timeout: self.auth_timeout,
             max_message_size: self.max_message_size,
             max_in_flight: self.max_in_flight,
+            local_driver: self.local_driver,
             reconnect_when_idle_closed: self.reconnect_when_idle_closed,
         })
     }

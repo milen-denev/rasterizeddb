@@ -380,7 +380,9 @@ impl Core {
         if info.addr.is_empty() {
             return Err(format!("the map gives shard {shard} no address"));
         }
-        let client = build_client(&self.shared, &info.addr)?;
+        // A core's links are used only by its own sessions, all tasks of
+        // its `LocalSet`: the connection's task runs there with them.
+        let client = build_client_with(&self.shared, &info.addr, true)?;
         let link = Rc::new(Link {
             shard,
             addr: info.addr.clone(),
@@ -471,8 +473,14 @@ impl Core {
 /// A mux client to a shard, with the gateway's mTLS identity and the
 /// configured trust.
 pub fn build_client(shared: &Shared, addr: &str) -> Result<MuxClient, String> {
+    build_client_with(shared, addr, false)
+}
+
+/// [`build_client`]; `local`: its connection task runs on the caller's
+/// `LocalSet` (`TcpClientBuilder::local_driver`).
+fn build_client_with(shared: &Shared, addr: &str, local: bool) -> Result<MuxClient, String> {
     let cfg = &shared.cfg;
-    let mut b = TcpClientBuilder::new(addr).max_in_flight(cfg.max_in_flight);
+    let mut b = TcpClientBuilder::new(addr).max_in_flight(cfg.max_in_flight).local_driver(local);
     b = match cfg.shard_timeout {
         Some(t) => b.timeout(t),
         // A statement may run as long as the client lets it: the
