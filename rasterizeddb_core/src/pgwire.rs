@@ -970,6 +970,8 @@ async fn serve_pgwire(
         // whatever it actually cost. `psql` saw it too, so it was never a
         // client's fault. `rastcp` has had this since it hit the same wall;
         // pgwire was simply missed.
+        // Without unix sockets (Windows) TCP is the only variant.
+        #[allow(irrefutable_let_patterns)]
         if let PgSock::Tcp(stream) = &stream {
             let _ = stream.set_nodelay(true);
 
