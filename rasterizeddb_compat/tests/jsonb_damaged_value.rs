@@ -25,6 +25,19 @@ impl Drop for Root {
     }
 }
 
+/// Drops the stopped server's log and waits until nothing holds it, so the
+/// restart opens the file afresh (see `legacy_char.rs`).
+async fn release_log(root: &str) {
+    let Some(log) = rasterizeddb_core::core::wal::remove_for(root) else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::sync::Arc::strong_count(&log) > 1 {
+        assert!(std::time::Instant::now() < deadline, "the stopped server's log is still held");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 const MARKER: &[u8] = b"DAMAGE-ME-DAMAGE-ME";
 
 /// Every occurrence of `MARKER` under `dir`, each byte replaced by 0xFF.
@@ -66,7 +79,20 @@ async fn a_damaged_jsonb_value_fails_the_statement_instead_of_reading_as_null() 
         ))))
         .await
         .expect("setup");
+        // Into the data files, so only they hold the document: the in-process
+        // server does not checkpoint when it stops (a real one does, in
+        // `shutdown::finalize`), and its log still held the INSERT. Damaged
+        // there too, recovery stopped at that record as a torn tail and lost
+        // the transaction's commit with it: every row read back as absent.
+        // A checkpoint declines while writes are pending, so until it is done.
+        let wal = rasterizeddb_core::core::wal::wal_for(&dir.0).expect("the database's log");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !wal.checkpoint().expect("checkpoint") {
+            assert!(std::time::Instant::now() < deadline, "the log never checkpointed");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
+    release_log(&dir.0).await;
     assert!(damage(std::path::Path::new(&dir.0)) > 0, "the document's bytes were not found to damage");
 
     let server = TestServer::start_file_backed(&dir.0).await.expect("restart");
