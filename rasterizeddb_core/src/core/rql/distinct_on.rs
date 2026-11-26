@@ -121,6 +121,13 @@ fn grouped_order_select(sql: &str) -> Option<String> {
     if has_word(list, "OVER") || has_word(order_text, "OVER") {
         return None;
     }
+    // `t.system_key k` names its output `k`, which `select_columns` (reading
+    // only `AS`) would miss: a sort by `k` became a term to compute, and the
+    // derived table cannot see the output name — "Column 'k' not found" for
+    // a statement the fold answered. Such a list is left as written.
+    if crate::core::rql::lexer_ct::split_definitions(list).iter().any(|item| may_have_bare_alias(item)) {
+        return None;
+    }
     let mut columns = select_columns(list)?;
     let mut order = Vec::new();
     for raw in crate::core::rql::lexer_ct::split_definitions(order_text) {
@@ -261,6 +268,21 @@ fn norm(text: &str) -> String {
         }
     }
     out
+}
+
+/// Whether a select item without `AS` may end in a bare alias
+/// (`t.system_key k`): its last top-level word, after whitespace and outside
+/// quotes, is an identifier. Errs towards yes (`CASE … END`, `x IS NULL`).
+fn may_have_bare_alias(item: &str) -> bool {
+    let (expr, alias) = split_as(item);
+    if alias.is_some() {
+        return false;
+    }
+    let t = expr.trim_end();
+    t.char_indices()
+        .rev()
+        .find(|&(i, c)| c.is_whitespace() && depth_at(t, i) == 0 && !in_quotes(t, i))
+        .is_some_and(|(i, c)| as_identifier(&t[i + c.len_utf8()..]).is_some())
 }
 
 /// PostgreSQL's name for an unaliased item: a window call or a filtered
@@ -455,7 +477,8 @@ fn sort_term(raw: &str) -> Option<(&str, String)> {
 /// it: the text before it and the word, upper-cased.
 fn last_word(text: &str) -> Option<(&str, String)> {
     let t = text.trim_end();
-    let start = t.rfind(|c: char| !c.is_ascii_alphabetic()).map_or(0, |i| i + 1);
+    // Past the whole character: `+ 1` cut a multibyte one ('Δ', '😀').
+    let start = t.char_indices().rev().find(|&(_, c)| !c.is_ascii_alphabetic()).map_or(0, |(i, c)| i + c.len_utf8());
     let word = &t[start..];
     if word.is_empty() || !t[..start].ends_with(char::is_whitespace) {
         return None;
@@ -706,6 +729,28 @@ mod tests {
         ] {
             assert!(rw(sql).is_some_and(|text| text.contains("__don_k0")), "{sql}");
         }
+    }
+
+    /// CI on 8ca6f4e1: `GROUP BY k ORDER BY k` with `k` a bare alias over a
+    /// join failed in the derived table; and a sort term ending in a
+    /// multibyte character panicked.
+    #[test]
+    fn a_bare_alias_and_a_multibyte_term_are_left_alone() {
+        use super::{last_word, may_have_bare_alias, rewrite_grouped_order as rw, sort_term};
+        assert_eq!(
+            rw("SELECT t.system_key k, count(*) FROM zz_utr r JOIN zz_ut t ON t.id = r.table_id GROUP BY k ORDER BY k"),
+            None
+        );
+        assert_eq!(rw("SELECT k kk, count(*) FROM t GROUP BY k ORDER BY max(n)"), None);
+        assert!(may_have_bare_alias("t.system_key k"));
+        assert!(!may_have_bare_alias("t.system_key AS k"));
+        assert!(!may_have_bare_alias("count(*)"));
+        assert!(!may_have_bare_alias("'a b'"));
+        for term in ["'Δ '", "'😀'", "x || 'Δ' DESC", "ñ"] {
+            let _ = sort_term(term);
+            let _ = last_word(term);
+        }
+        assert_eq!(sort_term("x || 'Δ' DESC"), Some(("x || 'Δ'", " DESC".to_string())));
     }
 
     #[test]
