@@ -307,6 +307,13 @@ fn statement_end(tokens: &[Token], start: usize) -> usize {
                     j += 1;
                     continue;
                 }
+                // A vault or ledger statement (`ledger_hooks`) is one
+                // statement to its `;`: its `SET` (`VAULT v SET SECRET …`,
+                // `ALTER LEDGER TABLE t SET …`) is no T-SQL SET.
+                if head == "VAULT" || (head == "ALTER" && kw(tokens, start + 1, "LEDGER")) {
+                    j += 1;
+                    continue;
+                }
                 let continues = match w.as_str() {
                     "SELECT" => {
                         matches!(

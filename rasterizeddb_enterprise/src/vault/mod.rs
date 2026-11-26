@@ -212,6 +212,11 @@ fn keyring(store_key: &str, vault: u128) -> Result<Arc<Mutex<Keyring>>, String> 
         return Ok(k.clone());
     }
     let path = (!store_key.starts_with("memory:")).then(|| store::chain_dir(store_key).join(format!("vault-{vault:032x}.keys")));
+    // The store's directory, which nothing may have made yet: a vault's first
+    // SET can come before any ledger row opened its chain.
+    if let Some(dir) = path.as_ref().and_then(|p| p.parent()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
     let mut keys = BTreeMap::new();
     if let Some(p) = &path {
         match std::fs::read_to_string(p) {
@@ -325,6 +330,10 @@ fn audit(store_key: &str, vault: u128, line: &str) -> Result<(), String> {
     match audit_path(store_key) {
         Some(p) => {
             use std::io::Write;
+            if let Some(dir) = p.parent() {
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| format!("55000: the vault audit could not be written ({e}); nothing is returned"))?;
+            }
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
