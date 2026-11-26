@@ -29,6 +29,12 @@ pub const DEFAULT_PORT: u16 = 7171;
 pub const F_REPLY: u8 = 1;
 pub const F_ERROR: u8 = 2;
 pub const F_PUSH: u8 = 4;
+/// On a `DELIVER`: a counts list follows the ranges (see [`Deliver`]).
+pub const F_COUNTS: u8 = 8;
+
+/// `SUBSCRIBE` option: put delivery counts on this subscription's
+/// `DELIVER` frames.
+pub const SUB_DELIVERY_COUNTS: u32 = 1;
 
 pub mod op {
     pub const HELLO: u8 = 1;
@@ -876,6 +882,10 @@ pub struct Subscribe {
     pub config: SubConfig,
     /// Messages the server may push before the client grants more.
     pub credits: u32,
+    /// [`SUB_DELIVERY_COUNTS`], …: optional on the wire, after `credits`. A
+    /// client that sends none gets `DELIVER` frames as before it existed, and
+    /// a server that predates it ignores it.
+    pub options: u32,
 }
 
 impl Subscribe {
@@ -884,6 +894,9 @@ impl Subscribe {
         w.str(&self.name);
         self.config.encode(w);
         w.u32(self.credits);
+        if self.options != 0 {
+            w.u32(self.options);
+        }
     }
     pub fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
         Ok(Subscribe {
@@ -891,13 +904,51 @@ impl Subscribe {
             name: r.string()?,
             config: SubConfig::decode(r)?,
             credits: r.u32()?,
+            options: if r.is_empty() { 0 } else { r.u32()? },
         })
     }
+}
+
+/// A record on its second or later delivery, in a `DELIVER` frame flagged
+/// [`F_COUNTS`]: `count u32` of these after the ranges, each `partition u32,
+/// offset u64, deliveries u32`. A delivered record not listed is on its
+/// first. `deliveries` equal to the queue's `max_deliveries` is the last
+/// attempt before dead-lettering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeliveryCount {
+    pub partition: u32,
+    pub offset: u64,
+    pub deliveries: u32,
+}
+
+pub fn encode_counts(w: &mut Writer<'_>, counts: &[DeliveryCount]) {
+    w.u32(counts.len() as u32);
+    for c in counts {
+        w.u32(c.partition);
+        w.u64(c.offset);
+        w.u32(c.deliveries);
+    }
+}
+
+pub fn decode_counts(r: &mut Reader<'_>, max: usize) -> Result<Vec<DeliveryCount>, DecodeError> {
+    let n = r.u32()? as usize;
+    if n > max {
+        return Err(DecodeError("too many delivery counts"));
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(DeliveryCount { partition: r.u32()?, offset: r.u64()?, deliveries: r.u32()? });
+    }
+    Ok(out)
 }
 
 /// `DELIVER`'s fixed part: which records of the batches that follow are this
 /// consumer's. Records outside `ranges` belong to another member (shared), or
 /// precede the position (ordered, broadcast), and are skipped.
+///
+/// Layout: `partition u32`, ranges (`count u32` + entries), then, when the
+/// frame's flags have [`F_COUNTS`], the [`DeliveryCount`] list, then the
+/// stored batches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Deliver {
     pub partition: u32,
@@ -931,5 +982,22 @@ mod tests {
         assert_eq!(h.flags, F_REPLY | F_ERROR);
         let e = ErrorBody::decode(&mut Reader::new(&out[FRAME_HEADER..])).unwrap();
         assert_eq!(e.code, Code::NoTopic);
+    }
+}
+
+#[cfg(test)]
+mod subscribe_option_tests {
+    use super::*;
+
+    #[test]
+    fn options_are_optional_on_the_wire() {
+        let base = Subscribe { topic: 1, name: "s".into(), config: SubConfig::default(), credits: 8, options: 0 };
+        let mut old = Vec::new();
+        base.encode(&mut Writer(&mut old));
+        assert_eq!(Subscribe::decode(&mut Reader::new(&old)).unwrap().options, 0);
+        let mut new = Vec::new();
+        Subscribe { options: SUB_DELIVERY_COUNTS, ..base }.encode(&mut Writer(&mut new));
+        assert_eq!(new.len(), old.len() + 4);
+        assert_eq!(Subscribe::decode(&mut Reader::new(&new)).unwrap().options, SUB_DELIVERY_COUNTS);
     }
 }

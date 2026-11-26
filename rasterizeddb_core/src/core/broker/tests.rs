@@ -716,3 +716,27 @@ async fn acked_records_survive_power_loss() {
     assert!(problems.is_empty(), "{} of {images} images lost acked records:\n{}", problems.len(), problems.join("\n"));
     eprintln!("{} cuts, {images} images, every acked record intact", points.len());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redeliveries_carry_their_delivery_count_when_asked() {
+    let b = Broker::open(None, "t").unwrap();
+    let q = QueueConfig { durability: Durability::Memory, max_deliveries: 3, ..Default::default() };
+    let t = b.declare_queue("counted", q, false).unwrap();
+    let (_, sub) = b.queue("counted").unwrap();
+    b.produce(&t, 0, &mut batch(&["m"]), true).unwrap();
+    let (tx, mut rx) = sub::outbox();
+    let _ = sub.join_with(1, 10, wire::SUB_DELIVERY_COUNTS, tx, &tokio::runtime::Handle::current()).unwrap();
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let f = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        let h = wire::parse_header(&f).unwrap().unwrap();
+        let mut r = wire::Reader::new(&f[wire::FRAME_HEADER..]);
+        r.u32().unwrap();
+        let ranges = wire::decode_ranges(&mut r, 16).unwrap();
+        let counts = if h.flags & wire::F_COUNTS != 0 { wire::decode_counts(&mut r, 16).unwrap() } else { Vec::new() };
+        let n = counts.iter().find(|c| c.offset == ranges[0].offset).map_or(1, |c| c.deliveries);
+        seen.push(n);
+        sub.nack(&ranges, 0).unwrap();
+    }
+    assert_eq!(seen, [1, 2, 3], "first unlisted, then 2 and 3 (the last before dead-lettering)");
+}

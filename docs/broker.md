@@ -277,7 +277,14 @@ once. Pushed deliveries carry `corr = subscription handle`.
 | `PING` | — |
 
 Pushed deliveries (`DELIVER`, op 0x80) carry the handle, the partition and
-then stored batches. For `shared` subscriptions they also carry a delivery
+then stored batches. A `SUBSCRIBE` may end with an optional `options u32`.
+Bit 0 asks for delivery counts: the server then flags a `DELIVER` with
+`F_COUNTS` (0x08) when any record in it is on its second or later delivery,
+and puts `(partition u32, offset u64, deliveries u32)` entries for those
+records between the ranges and the batches. `deliveries == max_deliveries`
+is the last attempt before dead-lettering. Counts are kept in memory and
+start again from 1 after a restart. AMQP's `redelivered` bit and MQTT's
+`DUP` come from the same counts. For `shared` subscriptions they also carry a delivery
 bitmap, which tells the client which records in the batch are its to ack.
 Other members of the group have the rest.
 
