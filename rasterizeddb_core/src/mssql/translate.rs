@@ -6446,6 +6446,23 @@ pub(crate) fn translate(
 }
 
 fn translate_in(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
+    // A vault or ledger statement (`ledger_hooks`) is the engine's own, as it
+    // was written: none of the T-SQL rewrites apply, and `ALTER LEDGER
+    // TABLE` is no T-SQL ALTER.
+    let first = tokens.first().and_then(|t| t.upper()).unwrap_or_default();
+    if matches!(first.as_str(), "VAULT" | "VERIFY" | "SHOW" | "ALTER" | "ACKNOWLEDGE")
+        && crate::core::ledger_hooks::is_ledger_statement(&render_text(&tokens))
+    {
+        return Ok(Forward {
+            statements: vec![render_text(&tokens)],
+            kind: Kind::Other,
+            extra_column: None,
+            aliases: Vec::new(),
+            database: None,
+            ticks: Vec::new(),
+            system: Vec::new(),
+        });
+    }
     let head = tokens.first().and_then(|t| t.upper()).unwrap_or_default();
     match head.as_str() {
         "SELECT" => {
