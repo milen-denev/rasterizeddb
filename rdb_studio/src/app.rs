@@ -196,6 +196,7 @@ pub struct Studio {
     pub broker_read: BrokerReadForm,
     /// What the message panel shows: a READ, a POP or a topic's partitions.
     pub broker_browse: Option<BrokerBrowse>,
+    pub broker_perm: BrokerPermForm,
     pub merge_policy: MergePolicy,
     pub merge_allow_drop: bool,
 
@@ -939,6 +940,14 @@ pub enum Message {
     /// A subscription's topic and name.
     BrokerDropSubscription(String, String),
     BrokerUnbind(BrokerBinding),
+    BrokerPermKind(BrokerObjectKind),
+    /// The first (`true`) or second privilege of the kind, on or off.
+    BrokerPermToggle(bool, bool),
+    /// GRANT (`false`) or REVOKE (`true`) what the form says.
+    BrokerGrant(bool),
+    BrokerOwner,
+    /// REVOKE one listed grant.
+    BrokerRevokeRow(BrokerGrant),
 
     // --- shards
     ReloadShards,
@@ -1388,6 +1397,7 @@ impl Studio {
             broker_publish: BrokerPublishForm::default(),
             broker_read: BrokerReadForm::default(),
             broker_browse: None,
+            broker_perm: BrokerPermForm::default(),
             merge_policy: MergePolicy::Fail,
             merge_allow_drop: false,
             shards: None,
@@ -2477,6 +2487,9 @@ impl Studio {
                     F::ReadPartition => r.partition = value,
                     F::ReadFrom => r.from = value,
                     F::ReadLimit => r.limit = value,
+                    F::PermObject => self.broker_perm.object = value,
+                    F::PermGrantee => self.broker_perm.grantee = value,
+                    F::PermOwner => self.broker_perm.owner = value,
                 }
                 Task::none()
             }
@@ -2564,6 +2577,51 @@ impl Studio {
                 Task::none()
             }
             Message::BrokerUnbind(binding) => self.statement(dialect::broker_unbind_sql(&binding), Refresh::Broker),
+            Message::BrokerPermKind(kind) => {
+                if self.broker_perm.kind != kind {
+                    // The privileges are the kind's own.
+                    self.broker_perm.first = false;
+                    self.broker_perm.second = false;
+                }
+                self.broker_perm.kind = kind;
+                Task::none()
+            }
+            Message::BrokerPermToggle(first, on) => {
+                if first {
+                    self.broker_perm.first = on;
+                } else {
+                    self.broker_perm.second = on;
+                }
+                Task::none()
+            }
+            Message::BrokerGrant(revoke) => match dialect::broker_grant_sql(&self.broker_perm, revoke) {
+                Ok(sql) => self.statement(sql, Refresh::Broker),
+                Err(e) => {
+                    self.status = Status::Failed(e);
+                    Task::none()
+                }
+            },
+            Message::BrokerOwner => match dialect::broker_owner_sql(&self.broker_perm) {
+                Ok(sql) => {
+                    let (kind, object, owner) =
+                        (self.broker_perm.kind, self.broker_perm.object.trim().to_string(), self.broker_perm.owner.trim().to_string());
+                    self.modal = Some(Modal::Confirm {
+                        title: format!("Give {} {object} to {owner}", kind.label().to_lowercase()),
+                        body: format!(
+                            "{owner} becomes the owner of {object}: only it (or a superuser) may then alter or drop \
+                             it, or grant on it."
+                        ),
+                        statement: sql,
+                        refresh: Refresh::Broker,
+                    });
+                    Task::none()
+                }
+                Err(e) => {
+                    self.status = Status::Failed(e);
+                    Task::none()
+                }
+            },
+            Message::BrokerRevokeRow(grant) => self.statement(dialect::broker_revoke_row_sql(&grant), Refresh::Broker),
 
             Message::ReloadShards => self.load_shards(),
             Message::ShardsLoaded(snapshot) => {
@@ -3711,6 +3769,8 @@ impl Studio {
                 let subscriptions = read(session.query(dialect::BROKER_SUBSCRIPTIONS_SQL).await);
                 let exchanges = read(session.query(dialect::BROKER_EXCHANGES_SQL).await);
                 let bindings = read(session.query(dialect::BROKER_BINDINGS_SQL).await);
+                // Refused by a server without broker permissions: no grants.
+                let grants = read(session.query(dialect::BROKER_GRANTS_SQL).await);
                 Box::new(BrokerSnapshot {
                     supported: true,
                     refusal: String::new(),
@@ -3719,6 +3779,7 @@ impl Studio {
                     subscriptions: dialect::parse_broker_subscriptions(&subscriptions),
                     exchanges: dialect::parse_broker_exchanges(&exchanges),
                     bindings: dialect::parse_broker_bindings(&bindings),
+                    grants: dialect::parse_broker_grants(&grants),
                 })
             },
             Message::BrokerLoaded,

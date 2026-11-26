@@ -44,6 +44,10 @@ pub enum BrokerField {
     ReadPartition,
     ReadFrom,
     ReadLimit,
+    // The permissions form.
+    PermObject,
+    PermGrantee,
+    PermOwner,
 }
 
 pub fn view(studio: &Studio) -> Element<'_, Message> {
@@ -66,6 +70,7 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
         queues(studio, snapshot),
         subscriptions(studio, snapshot),
         exchanges(studio, snapshot),
+        permissions(studio, snapshot),
     ]
     .spacing(10);
     framed("BROKER", reload, scrollable(body).height(Fill).style(theme::scroller).into())
@@ -524,5 +529,116 @@ fn exchanges<'a>(_studio: &'a Studio, s: &'a BrokerSnapshot) -> Element<'a, Mess
         panel("BINDINGS", "No bindings.", bindings, heads(&B)),
     ]
     .spacing(10)
+    .into()
+}
+
+/// Who may use what: the grants `BROKER SHOW GRANTS` lists, a form to grant
+/// or revoke the kind's two privileges, and an owner change. A server whose
+/// broker has no permissions answers no grants, and the panel says so.
+fn permissions<'a>(studio: &'a Studio, s: &'a BrokerSnapshot) -> Element<'a, Message> {
+    let form = &studio.broker_perm;
+    let [first, second] = form.kind.privileges();
+    let mut kinds = row![].spacing(4);
+    for kind in BrokerObjectKind::ALL {
+        kinds = kinds.push(choice(kind.label(), form.kind == kind, Message::BrokerPermKind(kind)));
+    }
+    let grant = dialect::broker_grant_sql(form, false);
+    let owner = dialect::broker_owner_sql(form);
+    let controls = row![
+        field("Name (empty: all of them)", &form.object, BrokerField::PermObject),
+        field("Role (or PUBLIC)", &form.grantee, BrokerField::PermGrantee),
+        column![
+            Space::new().height(15),
+            row![
+                super::toggle(first, form.first, |on| Message::BrokerPermToggle(true, on)),
+                super::toggle(second, form.second, |on| Message::BrokerPermToggle(false, on)),
+            ]
+            .spacing(10),
+        ],
+        column![
+            Space::new().height(15),
+            row![
+                super::primary_button("GRANT", grant.is_ok().then_some(Message::BrokerGrant(false))),
+                small_button("REVOKE", grant.is_ok().then_some(Message::BrokerGrant(true))),
+            ]
+            .spacing(4),
+        ],
+    ]
+    .spacing(8)
+    .align_y(iced::alignment::Vertical::Bottom);
+    let owner_row = row![
+        field("New owner", &form.owner, BrokerField::PermOwner),
+        column![Space::new().height(15), small_button("CHANGE OWNER", owner.is_ok().then_some(Message::BrokerOwner))],
+    ]
+    .spacing(8)
+    .align_y(iced::alignment::Vertical::Bottom);
+
+    const H: [(&str, f32, bool); 6] = [
+        ("OBJECT", 160.0, false),
+        ("TYPE", 70.0, false),
+        ("GRANTEE", 120.0, false),
+        ("PRIVILEGE", 90.0, false),
+        ("OWNER", 120.0, false),
+        ("GRANTOR", 120.0, false),
+    ];
+    let rows: Vec<Element<'a, Message>> = s
+        .grants
+        .iter()
+        .map(|g| {
+            let action: Element<'a, Message> = if g.privilege.eq_ignore_ascii_case("owner") {
+                Space::new().width(0).into()
+            } else {
+                small_button("REVOKE", Some(Message::BrokerRevokeRow(g.clone())))
+            };
+            cells(
+                vec![
+                    (g.object.clone(), H[0].1, false),
+                    (g.object_type.clone(), H[1].1, false),
+                    (g.grantee.clone(), H[2].1, false),
+                    (g.privilege.clone(), H[3].1, false),
+                    (g.owner.clone(), H[4].1, false),
+                    (g.grantor.clone(), H[5].1, false),
+                ],
+                action,
+            )
+        })
+        .collect();
+    let list: Element<'a, Message> = if rows.is_empty() {
+        text(
+            "No grants listed. Either nothing is granted yet, or this server's broker has no permissions \
+             (BROKER SHOW GRANTS was refused).",
+        )
+        .size(12)
+        .color(theme::TEXT_FAINT)
+        .into()
+    } else {
+        let mut l = column![heads(&H)].spacing(2);
+        for r in rows {
+            l = l.push(r);
+        }
+        scrollable(l).direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default())).into()
+    };
+    container(
+        column![
+            section_label("PERMISSIONS"),
+            kinds,
+            controls,
+            preview(&grant),
+            owner_row,
+            text(
+                "An object belongs to the role that made it; everyone else needs a grant. PRODUCE writes a \
+                 topic or queue, CONSUME reads, subscribes and pops; PUBLISH sends through an exchange, BIND \
+                 binds a topic to it (which also needs PRODUCE on the topic). Granting, altering and dropping \
+                 are the owner's. A grant on all of them covers the ones that exist now."
+            )
+            .size(10)
+            .color(theme::TEXT_FAINT),
+            list,
+        ]
+        .spacing(6),
+    )
+    .padding(8)
+    .width(Fill)
+    .style(theme::panel)
     .into()
 }

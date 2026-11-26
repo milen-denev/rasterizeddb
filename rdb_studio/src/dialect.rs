@@ -3982,3 +3982,102 @@ mod broker_tests {
         assert_eq!(broker_retention(7 * 86_400_000), "7d");
     }
 }
+
+// Broker permissions (GRANT/REVOKE … ON TOPIC|QUEUE|EXCHANGE, ALTER … OWNER TO)
+
+pub const BROKER_GRANTS_SQL: &str = "BROKER SHOW GRANTS";
+
+/// A grantee: PUBLIC as the keyword, a role quoted.
+fn broker_grantee(role: &str) -> Result<String, String> {
+    let r = role.trim();
+    if r.is_empty() {
+        return Err("A role (or PUBLIC) is needed".to_string());
+    }
+    Ok(if r.eq_ignore_ascii_case("public") { "PUBLIC".to_string() } else { quote_ident(r) })
+}
+
+/// `ON TOPIC "x"`, or `ON ALL TOPICS` for an empty name.
+fn broker_on(kind: crate::model::BrokerObjectKind, object: &str) -> String {
+    let o = object.trim();
+    if o.is_empty() {
+        format!("ON ALL {}S", kind.label())
+    } else {
+        format!("ON {} {}", kind.label(), quote_ident(o))
+    }
+}
+
+/// `GRANT …` (or `REVOKE … FROM`) for the permissions form.
+pub fn broker_grant_sql(form: &crate::model::BrokerPermForm, revoke: bool) -> Result<String, String> {
+    let [a, b] = form.kind.privileges();
+    let privileges = match (form.first, form.second) {
+        (true, true) => "ALL".to_string(),
+        (true, false) => a.to_string(),
+        (false, true) => b.to_string(),
+        (false, false) => return Err(format!("Pick {a}, {b} or both")),
+    };
+    let on = broker_on(form.kind, &form.object);
+    let who = broker_grantee(&form.grantee)?;
+    Ok(if revoke {
+        format!("REVOKE {privileges} {on} FROM {who}")
+    } else {
+        format!("GRANT {privileges} {on} TO {who}")
+    })
+}
+
+/// One listed grant taken back.
+pub fn broker_revoke_row_sql(g: &crate::model::BrokerGrant) -> String {
+    let kind = g.object_type.to_ascii_uppercase();
+    let who = if g.grantee.eq_ignore_ascii_case("public") { "PUBLIC".to_string() } else { quote_ident(&g.grantee) };
+    format!("REVOKE {} ON {kind} {} FROM {who}", g.privilege.to_ascii_uppercase(), quote_ident(&g.object))
+}
+
+pub fn broker_owner_sql(form: &crate::model::BrokerPermForm) -> Result<String, String> {
+    let o = form.object.trim();
+    if o.is_empty() {
+        return Err("An object is needed to change its owner".to_string());
+    }
+    let r = form.owner.trim();
+    if r.is_empty() || r.eq_ignore_ascii_case("public") {
+        return Err("A role is needed as the new owner".to_string());
+    }
+    Ok(format!("ALTER {} {} OWNER TO {}", form.kind.label(), quote_ident(o), quote_ident(r)))
+}
+
+pub fn parse_broker_grants(grid: &Grid) -> Vec<crate::model::BrokerGrant> {
+    (0..grid.rows.len())
+        .map(|i| {
+            let t = |c: &str| grid.value(i, c).unwrap_or("").to_string();
+            crate::model::BrokerGrant {
+                object_type: t("object_type"),
+                object: t("object"),
+                owner: t("owner"),
+                grantee: t("grantee"),
+                privilege: t("privilege"),
+                grantor: t("grantor"),
+                grantable: broker_flag(grid, i, "grantable"),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod broker_acl_tests {
+    use super::*;
+    use crate::model::{BrokerGrant, BrokerObjectKind, BrokerPermForm};
+
+    #[test]
+    fn broker_permission_statements() {
+        let mut f = BrokerPermForm { object: "orders".into(), grantee: "app".into(), first: true, second: true, ..Default::default() };
+        assert_eq!(broker_grant_sql(&f, false).unwrap(), "GRANT ALL ON TOPIC \"orders\" TO \"app\"");
+        f.second = false;
+        assert_eq!(broker_grant_sql(&f, true).unwrap(), "REVOKE PRODUCE ON TOPIC \"orders\" FROM \"app\"");
+        f.first = false;
+        assert!(broker_grant_sql(&f, false).is_err());
+        let x = BrokerPermForm { kind: BrokerObjectKind::Exchange, grantee: "public".into(), second: true, ..Default::default() };
+        assert_eq!(broker_grant_sql(&x, false).unwrap(), "GRANT BIND ON ALL EXCHANGES TO PUBLIC");
+        let o = BrokerPermForm { kind: BrokerObjectKind::Queue, object: "jobs".into(), owner: "billing".into(), ..Default::default() };
+        assert_eq!(broker_owner_sql(&o).unwrap(), "ALTER QUEUE \"jobs\" OWNER TO \"billing\"");
+        let g = BrokerGrant { object_type: "topic".into(), object: "a.b".into(), grantee: "PUBLIC".into(), privilege: "CONSUME".into(), ..Default::default() };
+        assert_eq!(broker_revoke_row_sql(&g), "REVOKE CONSUME ON TOPIC \"a.b\" FROM PUBLIC");
+    }
+}
