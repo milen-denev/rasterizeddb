@@ -7548,7 +7548,7 @@ async fn run_native_statement(query: &str, database: Arc<Database>) -> Vec<u8> {
         // evaluated with no columns (`rql::no_from`), as pgwire answers it.
         // The usual liveness probe; it was "Unrecognized query" here.
         return match crate::core::rql::no_from::parse(query) {
-            Some(Ok(select)) => match select.rows() {
+            Some(Ok(select)) => match select.wait().await.and_then(|()| select.rows()) {
                 Ok(rows) => {
                     let mut response = vec![2u8];
                     for row in &rows {

@@ -10111,7 +10111,7 @@ where
             // scalar subqueries were replaced by their values.
             match crate::core::rql::no_from::parse(stmt) {
                 Some(Ok(select)) => {
-                    let rows = match select.rows() {
+                    let rows = match select.wait().await.and_then(|()| select.rows()) {
                         Ok(rows) => rows,
                         Err(e) => {
                             let code = sqlstate_for(&e);
@@ -11409,6 +11409,11 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     }
     if has("rdb03: ") {
         return "RDB03";
+    }
+    // `pg_sleep` evaluated over rows (`pg_functions::call`), wrapped by the
+    // scan that evaluated it: feature_not_supported.
+    if has("() is supported only as an item of a select with no from") {
+        return "0A000";
     }
     if has("more than one row returned by a subquery used as an expression") {
         return "21000";
